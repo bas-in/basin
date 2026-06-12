@@ -29,8 +29,8 @@ use sqlparser::ast::{FunctionArg, FunctionArgExpr,
 
 use crate::types::{
     bit_fixed_len, field_is_bit, field_is_cidr, field_is_inet, field_is_jsonb, field_is_macaddr,
-    field_is_macaddr8, field_is_money, field_is_tsquery, field_is_tsvector, field_is_uuid,
-    field_is_varbit, parse_vector_literal, varbit_max_len,
+    field_is_macaddr8, field_is_money, field_is_range, field_is_tsquery, field_is_tsvector,
+    field_is_uuid, field_is_varbit, parse_vector_literal, varbit_max_len,
 };
 
 /// Above this row count we try the type-specific bulk paths in [`build_array_bulk`]
@@ -233,6 +233,25 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
                 for row in rows {
                     match coerce_tsquery(&row[col_idx], field.name())? {
+                        Some(v) => b.append_value(&v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            // ── Range columns (stored as Utf8 JSON) ───────────────────────
+            // INSERT accepts a PG text literal (`'[1,10)'`) handled by the
+            // generic string path, *and* a range/multirange constructor call
+            // (`int4range(7,42)`), which we fold to the same canonical JSON the
+            // query-time UDF produces. The constructors are pure, so evaluating
+            // them inline here avoids spinning up a query plan per row.
+            DataType::Utf8 if field_is_range(field) => {
+                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 24);
+                for row in rows {
+                    match coerce_range_str(&row[col_idx], field.name())? {
                         Some(v) => b.append_value(&v),
                         None => {
                             check_null_allowed(field)?;
@@ -1600,6 +1619,178 @@ fn parse_wkt_point(s: &str, col: &str) -> Result<[u8; basin_geo::POINT_WKB_LEN]>
         )));
     }
     Ok(basin_geo::encode_point(&basin_geo::Point::new(x, y)))
+}
+
+/// Range / multirange constructor names recognized on the INSERT path.
+const RANGE_CTOR_FNS: &[&str] = &[
+    "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange",
+];
+const MULTIRANGE_CTOR_FNS: &[&str] = &["int4multirange", "int8multirange", "nummultirange"];
+
+/// Coerce an INSERT cell destined for a range column (stored as Utf8 JSON).
+///
+/// Accepts:
+/// - A string literal — PG text form `'[1,10)'` / `'empty'` — stored verbatim
+///   (the read-side UDFs parse PG text on use, same as the existing literal path).
+/// - A `::rangetype` cast wrapper — peeled and recursed.
+/// - A range constructor call `int4range(lo, hi [, '[]'])` — folded to the
+///   canonical JSON the query-time UDF produces. `NULL` bounds → infinite.
+/// - A multirange constructor `int4multirange(int4range(..), ..)` — each inner
+///   range is folded, then assembled into the canonical JSON array.
+/// - `NULL`.
+fn coerce_range_str(expr: &Expr, col: &str) -> Result<Option<String>> {
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::DoubleQuotedString(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::EscapedStringLiteral(s),
+            ..
+        })
+        | Expr::Value(ValueWithSpan {
+            value: Value::NationalStringLiteral(s),
+            ..
+        }) => Ok(Some(s.clone())),
+        Expr::Value(ValueWithSpan {
+            value: Value::Null, ..
+        }) => Ok(None),
+        Expr::Cast { expr: inner, .. } => coerce_range_str(inner.as_ref(), col),
+        Expr::TypedString(TypedString { value, .. }) => match &value.value {
+            Value::SingleQuotedString(s)
+            | Value::DoubleQuotedString(s)
+            | Value::EscapedStringLiteral(s)
+            | Value::NationalStringLiteral(s) => Ok(Some(s.clone())),
+            _ => Err(BasinError::InvalidSchema(format!(
+                "range column {col}: TypedString must wrap a string literal"
+            ))),
+        },
+        Expr::Function(_) => fold_range_ctor(expr, col).map(Some),
+        other => Err(BasinError::InvalidSchema(format!(
+            "range column {col}: expected a range literal (e.g. '[1,10)') or a range \
+             constructor (e.g. int4range(1,10)), got {other}"
+        ))),
+    }
+}
+
+/// Pull the unnamed argument expressions out of a function-call `Expr`.
+fn fn_arg_exprs(f: &sqlparser::ast::Function) -> Vec<Expr> {
+    match &f.args {
+        FunctionArguments::List(list) => list
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
+                FunctionArg::Named {
+                    arg: FunctionArgExpr::Expr(e),
+                    ..
+                } => Some(e.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Evaluate a (multi)range constructor call to its canonical Basin JSON string.
+fn fold_range_ctor(expr: &Expr, col: &str) -> Result<String> {
+    let Expr::Function(f) = expr else {
+        return Err(BasinError::InvalidSchema(format!(
+            "range column {col}: expected a range constructor call"
+        )));
+    };
+    let fname = f
+        .name
+        .0
+        .last()
+        .map(|i| i.id_val().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if RANGE_CTOR_FNS.contains(&fname.as_str()) {
+        let arg_exprs = fn_arg_exprs(f);
+        if arg_exprs.len() < 2 || arg_exprs.len() > 3 {
+            return Err(BasinError::InvalidSchema(format!(
+                "range column {col}: {fname} expects (lower, upper[, bounds]), got {} args",
+                arg_exprs.len()
+            )));
+        }
+        let lower = range_bound_literal(&arg_exprs[0], col)?;
+        let upper = range_bound_literal(&arg_exprs[1], col)?;
+        let bounds = match arg_exprs.get(2) {
+            Some(e) => coerce_string(e)?.unwrap_or_else(|| "[)".to_string()),
+            None => "[)".to_string(),
+        };
+        Ok(crate::range_udf::build_range_json(
+            lower.as_deref(),
+            upper.as_deref(),
+            &bounds,
+        ))
+    } else if MULTIRANGE_CTOR_FNS.contains(&fname.as_str()) {
+        let arg_exprs = fn_arg_exprs(f);
+        let mut inner_jsons = Vec::with_capacity(arg_exprs.len());
+        for e in &arg_exprs {
+            inner_jsons.push(fold_range_ctor(e, col)?);
+        }
+        crate::range_udf::build_multirange_json(&inner_jsons).ok_or_else(|| {
+            BasinError::InvalidSchema(format!(
+                "range column {col}: failed to assemble multirange from {fname}(...)"
+            ))
+        })
+    } else {
+        Err(BasinError::InvalidSchema(format!(
+            "range column {col}: unsupported constructor {fname}(...); expected one of \
+             int4range/int8range/numrange/daterange/tsrange/tstzrange or a *multirange variant"
+        )))
+    }
+}
+
+/// Stringify a single range-bound argument literal. Numeric, string, and NULL
+/// (→ infinite bound, encoded as `None`) literals are accepted. The bound is
+/// kept as a string because `build_range_json` re-parses it for clean numeric
+/// vs. string JSON encoding.
+fn range_bound_literal(expr: &Expr, col: &str) -> Result<Option<String>> {
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::Null, ..
+        }) => Ok(None),
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) => Ok(Some(n.clone())),
+        Expr::Value(ValueWithSpan {
+            value:
+                Value::SingleQuotedString(s)
+                | Value::DoubleQuotedString(s)
+                | Value::EscapedStringLiteral(s)
+                | Value::NationalStringLiteral(s),
+            ..
+        }) => Ok(Some(s.clone())),
+        // Negative literals parse as a unary-minus over a number.
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } => {
+            if let Expr::Value(ValueWithSpan {
+                value: Value::Number(n, _),
+                ..
+            }) = inner.as_ref()
+            {
+                Ok(Some(format!("-{n}")))
+            } else {
+                Err(BasinError::InvalidSchema(format!(
+                    "range column {col}: unsupported negative bound expression"
+                )))
+            }
+        }
+        Expr::Cast { expr: inner, .. } => range_bound_literal(inner.as_ref(), col),
+        other => Err(BasinError::InvalidSchema(format!(
+            "range column {col}: range bound must be a numeric/string literal or NULL, got {other}"
+        ))),
+    }
 }
 
 // ── Network / bit-string coercions ──────────────────────────────────────────

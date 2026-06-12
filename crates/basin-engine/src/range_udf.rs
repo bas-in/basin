@@ -225,6 +225,37 @@ fn parse_range(s: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&json_str).ok()
 }
 
+/// True when the parsed range JSON represents the PG `empty` range.
+///
+/// An empty range is recorded two ways in Basin's JSON form:
+///   1. The explicit sentinel `{"empty":true}` (from the `'empty'` literal or
+///      a set-op that produced an empty result), and
+///   2. A degenerate `[lo,hi)`-style range where the bounds collapse to no
+///      points — e.g. `int4range(5,5)` → `[5,5)`, which contains no integers.
+///
+/// PG semantics: an empty range contains no element, is contained by every
+/// range, overlaps nothing, and is strictly left/right of nothing. Every range
+/// predicate must therefore consult this before its bound arithmetic.
+fn range_is_empty(v: &serde_json::Value) -> bool {
+    if v.get("empty").and_then(|e| e.as_bool()).unwrap_or(false) {
+        return true;
+    }
+    // Degenerate finite range: lower >= upper with the touching bound(s)
+    // excluding the single point. `[5,5)` and `(5,5]` and `(5,5)` are all
+    // empty; `[5,5]` is the single-point range (non-empty).
+    let l = range_bound_f64(v, "l");
+    let u = range_bound_f64(v, "u");
+    match (l, u) {
+        (Some(lo), Some(hi)) => {
+            let li = v.get("li").and_then(|b| b.as_bool()).unwrap_or(true);
+            let ui = v.get("ui").and_then(|b| b.as_bool()).unwrap_or(false);
+            lo > hi || (lo == hi && !(li && ui))
+        }
+        // A bound at infinity is never empty.
+        _ => false,
+    }
+}
+
 /// Format a range value as the canonical JSON string used for storage.
 fn format_range(lower: Option<&str>, upper: Option<&str>, li: bool, ui: bool) -> String {
     let l_val = lower
@@ -261,6 +292,54 @@ fn format_range(lower: Option<&str>, upper: Option<&str>, li: bool, ui: bool) ->
         "ui": ui,
     })
     .to_string()
+}
+
+/// Map a PG bounds spec (`"[)"`, `"[]"`, `"(]"`, `"()"`) to `(lower_inc,
+/// upper_inc)`. Defaults to `[)` (inclusive lower, exclusive upper) for any
+/// unrecognized or absent spec — matching PG's range constructor default.
+pub(crate) fn bounds_text_to_inc(bounds_text: &str) -> (bool, bool) {
+    match bounds_text {
+        "[]" => (true, true),
+        "(]" => (false, true),
+        "()" => (false, false),
+        _ => (true, false),
+    }
+}
+
+/// Evaluate a range constructor (`int4range`/`int8range`/`numrange`/`daterange`/
+/// `tsrange`/`tstzrange`) from already-stringified bounds into the canonical
+/// Basin JSON range string. `None` bounds encode +/-infinity. This is the
+/// folding entry point used by the INSERT path so that
+/// `INSERT INTO t VALUES (int4range(7,42))` stores the same JSON the UDF would
+/// produce at query time.
+pub(crate) fn build_range_json(
+    lower: Option<&str>,
+    upper: Option<&str>,
+    bounds_text: &str,
+) -> String {
+    let (li, ui) = bounds_text_to_inc(bounds_text);
+    format_range(lower, upper, li, ui)
+}
+
+/// Assemble a multirange JSON array string from constituent range JSON strings,
+/// sorted by lower bound (nulls/-inf first) to match the multirange
+/// constructor UDF's canonical ordering.
+pub(crate) fn build_multirange_json(range_jsons: &[String]) -> Option<String> {
+    let mut ranges: Vec<serde_json::Value> = Vec::with_capacity(range_jsons.len());
+    for rj in range_jsons {
+        ranges.push(parse_range(rj)?);
+    }
+    ranges.sort_by(|a, b| {
+        let al = range_bound_f64(a, "l");
+        let bl = range_bound_f64(b, "l");
+        match (al, bl) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, _) => std::cmp::Ordering::Less,
+            (_, None) => std::cmp::Ordering::Greater,
+            (Some(av), Some(bv)) => av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal),
+        }
+    });
+    Some(serde_json::Value::Array(ranges).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -522,21 +601,9 @@ impl ScalarUDFImpl for IsEmptyUdf {
         let range_strs = columnar_to_strings(&args[0], batch_size)?;
         let mut out = Vec::with_capacity(batch_size);
         for rs in &range_strs {
-            let empty = rs.as_deref().map(|s| {
-                parse_range(s)
-                    .map(|v| {
-                        let l = v.get("l").cloned().unwrap_or(serde_json::Value::Null);
-                        let u = v.get("u").cloned().unwrap_or(serde_json::Value::Null);
-                        // Empty when l >= u (both numeric) or either is null (infinite).
-                        match (&l, &u) {
-                            (serde_json::Value::Number(ln), serde_json::Value::Number(un)) => {
-                                ln.as_f64().unwrap_or(0.0) >= un.as_f64().unwrap_or(0.0)
-                            }
-                            _ => false,
-                        }
-                    })
-                    .unwrap_or(false)
-            });
+            let empty = rs
+                .as_deref()
+                .map(|s| parse_range(s).map(|v| range_is_empty(&v)).unwrap_or(false));
             out.push(empty);
         }
         Ok(ColumnarValue::Array(
@@ -651,6 +718,10 @@ impl ScalarUDFImpl for RangeContainsElemUdf {
                 let elem_s = elem_strs[i].as_deref()?;
                 let elem: f64 = elem_s.parse().ok()?;
                 let v = parse_range(rs)?;
+                // PG: an empty range contains no element.
+                if range_is_empty(&v) {
+                    return Some(false);
+                }
                 let li = v.get("li").and_then(|b| b.as_bool()).unwrap_or(true);
                 let ui = v.get("ui").and_then(|b| b.as_bool()).unwrap_or(false);
                 let lower_ok = match v.get("l") {
@@ -729,6 +800,10 @@ impl ScalarUDFImpl for RangeOverlapsUdf {
                 let bs = b_strs[i].as_deref()?;
                 let a = parse_range(as_)?;
                 let b = parse_range(bs)?;
+                // PG: an empty range overlaps nothing.
+                if range_is_empty(&a) || range_is_empty(&b) {
+                    return Some(false);
+                }
                 // Two ranges [a1, a2] and [b1, b2] overlap iff a1 < b2 && b1 < a2
                 // (with bound inclusivity factored in). Simpler: not (a2 <= b1 || b2 <= a1).
                 let a_lo = range_bound_f64(&a, "l");
@@ -820,6 +895,14 @@ impl ScalarUDFImpl for RangeContainsRangeUdf {
                 let is = inner_strs[i].as_deref()?;
                 let outer = parse_range(os)?;
                 let inner = parse_range(is)?;
+                // PG: every range contains the empty range (`x @> empty` = true).
+                // A non-empty range is never contained by the empty range.
+                if range_is_empty(&inner) {
+                    return Some(true);
+                }
+                if range_is_empty(&outer) {
+                    return Some(false);
+                }
                 // outer @> inner iff outer.lo <= inner.lo && inner.hi <= outer.hi
                 // with bound inclusivity respected.
                 let o_lo = range_bound_f64(&outer, "l");
@@ -930,6 +1013,11 @@ impl ScalarUDFImpl for RangeRelationalUdf {
                 let bs = b_strs[i].as_deref()?;
                 let a = parse_range(as_)?;
                 let b = parse_range(bs)?;
+                // PG: positional operators (<<, >>, &<, &>, -|-) are all false
+                // when either operand is the empty range.
+                if range_is_empty(&a) || range_is_empty(&b) {
+                    return Some(false);
+                }
                 let a_hi = range_bound_f64(&a, "u");
                 let a_lo = range_bound_f64(&a, "l");
                 let b_hi = range_bound_f64(&b, "u");
@@ -1844,6 +1932,10 @@ impl ScalarUDFImpl for MultirangeContainsUdf {
                 // Parse as JSON array of range objects.
                 let arr: Vec<serde_json::Value> = serde_json::from_str(ms).ok()?;
                 for range_val in &arr {
+                    // An empty constituent range contains no element.
+                    if range_is_empty(range_val) {
+                        continue;
+                    }
                     let li = range_val
                         .get("li")
                         .and_then(|b| b.as_bool())

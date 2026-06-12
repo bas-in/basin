@@ -87,10 +87,12 @@ pub(crate) fn register_datetime_extras(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(ArraysOverlapUdf {
         signature: Signature::any(2, Volatility::Immutable),
     }));
-    // int4multirange(r1, r2, ...) — builds canonical {[l,u),…} from range args
-    ctx.register_udf(ScalarUDF::from(Int4MultirangeUdf {
-        signature: Signature::variadic_any(Volatility::Immutable),
-    }));
+    // NOTE: `int4multirange` is intentionally NOT registered here. The canonical
+    // multirange representation is the JSON array of range objects produced by
+    // `range_udf::MultirangeConstructorUdf` (consistent with how single ranges
+    // are stored as JSON, and with what `multirange_contains_elem` / the `@>`
+    // operator rewrite consume). A second PG-text `{[l,u),…}` constructor here
+    // would shadow the JSON one (registered earlier) and break containment.
 }
 
 // ── overlaps ─────────────────────────────────────────────────────────────────
@@ -561,6 +563,11 @@ impl ScalarUDFImpl for ArraysOverlapUdf {
 /// Render one range value (stored as the range-UDF JSON form
 /// `{"l":..,"u":..,"li":bool,"ui":bool}`) to PostgreSQL's canonical range text,
 /// e.g. `[1,5)`. Returns `None` if the value is not a parseable range object.
+///
+/// Retained for PG-text rendering (and its unit tests) even though the
+/// `int4multirange` constructor that consumed it now lives in `range_udf` and
+/// emits the canonical JSON array form instead.
+#[cfg_attr(not(test), allow(dead_code))]
 fn render_range_to_pg_text(s: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(s).ok()?;
     let obj = v.as_object()?;
@@ -584,89 +591,9 @@ fn render_range_to_pg_text(s: &str) -> Option<String> {
     Some(format!("{open}{l},{u}{close}"))
 }
 
-/// `int4multirange(r1, r2, ...)` — PG multirange constructor. Builds the
-/// canonical `{[l1,u1),[l2,u2),…}` text from its range arguments. Each argument
-/// is a range value produced by a range constructor (`int4range`, …) stored as
-/// JSON; bounds and inclusivity are preserved per-range. Empty `int4multirange()`
-/// yields `{}`. This is the constructor only — multirange set operations and the
-/// `@>`/`&&` operators over multiranges are Phase 5.24 and not implemented here.
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct Int4MultirangeUdf {
-    signature: Signature,
-}
-
-impl ScalarUDFImpl for Int4MultirangeUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &str {
-        "int4multirange"
-    }
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let args = &args.args;
-        let n = args
-            .iter()
-            .filter_map(|a| match a {
-                ColumnarValue::Array(arr) => Some(arr.len()),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(1);
-
-        // Materialise each range argument as a Utf8 array of its JSON form.
-        let mut cols: Vec<StringArray> = Vec::with_capacity(args.len());
-        for a in args {
-            let arr = a.clone().into_array(n)?;
-            let arr = if arr.data_type() == &DataType::Utf8 {
-                arr
-            } else {
-                datafusion::arrow::compute::cast(&arr, &DataType::Utf8)?
-            };
-            cols.push(
-                arr.as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("cast to Utf8 yields StringArray")
-                    .clone(),
-            );
-        }
-
-        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
-        for row in 0..n {
-            // A multirange is the ordered set of its non-null member ranges.
-            let mut parts: Vec<String> = Vec::with_capacity(cols.len());
-            let mut null_arg = false;
-            for col in &cols {
-                if col.is_null(row) {
-                    null_arg = true;
-                    break;
-                }
-                match render_range_to_pg_text(col.value(row)) {
-                    // `empty` member ranges contribute nothing to the multirange.
-                    Some(t) if t == "empty" => {}
-                    Some(t) => parts.push(t),
-                    None => {
-                        return exec_err!(
-                            "int4multirange: argument {:?} is not a valid range value",
-                            col.value(row)
-                        );
-                    }
-                }
-            }
-            if null_arg {
-                out.push(None);
-            } else {
-                out.push(Some(format!("{{{}}}", parts.join(","))));
-            }
-        }
-        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
-    }
-}
+// `int4multirange` is registered by `range_udf` as the JSON-array constructor;
+// see the NOTE in `register_datetime_extras`. `render_range_to_pg_text` above is
+// retained as a tested PG-text rendering helper for potential future use.
 
 // ── SQL-string rewrite: 'infinity'::timestamp  ───────────────────────────────
 

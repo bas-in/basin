@@ -1113,6 +1113,88 @@ async fn range_intersection_with_empty_is_empty() {
     assert_eq!(is_empty, 1, "intersection with empty range must be empty");
 }
 
+/// PG empty-range containment / overlap / positional semantics, pinned to
+/// PostgreSQL 16:
+///   - `anything @> empty`        → true  (every range contains the empty range)
+///   - `empty @> non-empty`       → false (empty contains nothing)
+///   - `empty @> empty`           → true
+///   - `range_contains_elem(empty, x)` → false (empty contains no element)
+///   - `anything && empty`        → false (empty overlaps nothing)
+///   - `empty << r`, `empty >> r`, `empty -|- r`, `empty &< r`, `empty &> r`
+///                                 → all false
+///
+/// PG references:
+///   `SELECT int4range(1,10) @> 'empty'::int4range;`        => t
+///   `SELECT 'empty'::int4range @> int4range(1,10);`        => f
+///   `SELECT 'empty'::int4range @> 'empty'::int4range;`     => t
+///   `SELECT int4range(1,10) && 'empty'::int4range;`        => f
+///   `SELECT 'empty'::int4range << int4range(1,10);`        => f
+#[tokio::test]
+async fn range_empty_pg_semantics() {
+    let (eng, _dir) = make_engine();
+    let sess = open_session(&eng).await;
+
+    // anything @> empty → true
+    let contains_empty = scalar_bool(
+        &sess,
+        "SELECT range_contains_range(int4range(1, 10), 'empty')",
+    )
+    .await;
+    assert!(contains_empty, "PG: every range contains the empty range (@> empty = t)");
+
+    // empty @> non-empty → false
+    let empty_contains = scalar_bool(
+        &sess,
+        "SELECT range_contains_range('empty', int4range(1, 10))",
+    )
+    .await;
+    assert!(!empty_contains, "PG: empty range contains no non-empty range");
+
+    // empty @> empty → true
+    let empty_contains_empty =
+        scalar_bool(&sess, "SELECT range_contains_range('empty', 'empty')").await;
+    assert!(empty_contains_empty, "PG: empty @> empty = t");
+
+    // range_contains_elem(empty, x) → false
+    let elem_in_empty =
+        scalar_bool(&sess, "SELECT range_contains_elem('empty', 5)").await;
+    assert!(!elem_in_empty, "PG: empty range contains no element");
+
+    // anything && empty → false
+    let overlaps_empty =
+        scalar_bool(&sess, "SELECT range_overlaps(int4range(1, 10), 'empty')").await;
+    assert!(!overlaps_empty, "PG: empty range overlaps nothing (&& empty = f)");
+    let empty_overlaps =
+        scalar_bool(&sess, "SELECT range_overlaps('empty', int4range(1, 10))").await;
+    assert!(!empty_overlaps, "PG: empty && anything = f (symmetric)");
+
+    // Positional operators with an empty operand → all false.
+    for udf in &[
+        "range_strictly_left",
+        "range_strictly_right",
+        "range_adjacent",
+        "range_not_extends_right",
+        "range_not_extends_left",
+    ] {
+        let lhs_empty = scalar_bool(
+            &sess,
+            &format!("SELECT {udf}('empty', int4range(1, 10))"),
+        )
+        .await;
+        assert!(!lhs_empty, "PG: {udf}(empty, r) must be false");
+        let rhs_empty = scalar_bool(
+            &sess,
+            &format!("SELECT {udf}(int4range(1, 10), 'empty')"),
+        )
+        .await;
+        assert!(!rhs_empty, "PG: {udf}(r, empty) must be false");
+    }
+
+    // isempty on a degenerate constructor result: int4range(5,5) → [5,5) is empty.
+    let degenerate_empty = scalar_bool(&sess, "SELECT isempty(int4range(5, 5))").await;
+    assert!(degenerate_empty, "PG: isempty(int4range(5,5)) = t ([5,5) has no points)");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Group 10 — int4multirange construction and @> containment
 // ─────────────────────────────────────────────────────────────────────────────
