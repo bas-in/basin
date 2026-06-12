@@ -87,6 +87,11 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         BasinError::RaftNoQuorum(_) => ("ERROR", "40001"), // serialization_failure
         // Phase 5.28.B: lock_timeout expiry — PostgreSQL raises 55P03.
         BasinError::LockNotAvailable(_) => ("ERROR", "55P03"), // lock_not_available
+        // Advisory-lock deadlock detection — PostgreSQL raises 40P01
+        // (deadlock_detected) the instant it breaks a waiter cycle. Drivers
+        // expose it as a dedicated exception class (psycopg DeadlockDetected)
+        // and applications retry the losing transaction.
+        BasinError::DeadlockDetected(_) => ("ERROR", "40P01"), // deadlock_detected
         // Phase 5.28.C: idle_in_transaction_session_timeout — PostgreSQL
         // terminates the session as FATAL with 25P03.
         BasinError::IdleInTransactionTimeout(_) => ("FATAL", "25P03"), // idle_in_transaction_session_timeout
@@ -180,6 +185,17 @@ mod tests {
         assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
         assert_eq!(er.fields[1], (b'C', "40001".to_owned()));
         assert!(er.fields[2].1.contains("could not reach quorum"));
+    }
+
+    #[test]
+    fn classifies_deadlock_detected() {
+        // Advisory-lock deadlock detection must surface as SQLSTATE 40P01
+        // (deadlock_detected) — the exact code PostgreSQL raises — so drivers
+        // map it to the dedicated DeadlockDetected exception class.
+        let er = error_response(&BasinError::deadlock_detected("advisory lock cycle on key 7"));
+        assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
+        assert_eq!(er.fields[1], (b'C', "40P01".to_owned()));
+        assert!(er.fields[2].1.contains("deadlock detected"));
     }
 
     #[test]

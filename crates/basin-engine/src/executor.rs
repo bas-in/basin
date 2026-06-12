@@ -9448,6 +9448,9 @@ pub(crate) fn map_df_exec_error(e: datafusion::error::DataFusionError) -> BasinE
                 BasinError::LockNotAvailable(msg) => {
                     return BasinError::LockNotAvailable(msg.clone());
                 }
+                BasinError::DeadlockDetected(msg) => {
+                    return BasinError::DeadlockDetected(msg.clone());
+                }
                 other => {
                     return BasinError::internal(format!("execute: {other}"));
                 }
