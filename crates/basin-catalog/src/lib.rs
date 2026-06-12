@@ -27,6 +27,8 @@
 
 /// Phase 6.X.D — heartbeat-reconciled per-project budgets (ADR 0023).
 pub mod budgets;
+/// ADR 0028 Phase 2 — per-project CDC webhook subscriptions + delivery cursor.
+pub mod cdc_webhooks;
 mod domains;
 mod enums;
 mod functions;
@@ -59,6 +61,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use basin_common::{ChangeOp, ProjectId, QualifiedTableName, Result, SchemaName, TableName};
 
+pub use cdc_webhooks::{
+    validate_registration as validate_cdc_webhook, CdcWebhookDef, CdcWebhookError, CdcWebhookRow,
+    CdcWebhookState,
+};
 pub use domains::{DomainDef, DomainError, BASIN_DOMAIN_KEY};
 pub use enums::{EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
 pub use reserved_schema::{resolve_qualified, resolve_schema, ReservedSchema};
@@ -1871,6 +1877,87 @@ pub trait Catalog: Send + Sync {
     async fn list_inbound_webhooks(&self, project: &ProjectId) -> Vec<InboundWebhookDef> {
         let _ = project;
         Vec::new()
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0028 Phase 2 — CDC webhook subscriptions + delivery cursor
+    //
+    // Per-project registered HTTPS endpoints that receive committed change
+    // events over POST. The subscription (`CdcWebhookDef`) is the registration;
+    // the state (`CdcWebhookState`) is the resumable delivery cursor persisted
+    // by the delivery worker on each ack. All methods carry legacy-tolerant
+    // default impls (same posture as the inbound-webhook + compaction-watermark
+    // methods above): a backend / schema that predates this table behaves as
+    // "no webhooks registered", never erroring.
+    // -----------------------------------------------------------------------
+
+    /// Register a CDC webhook subscription. The `def.id` is the caller-minted
+    /// ULID; the initial delivery state is the zero cursor (never delivered).
+    /// Default impl: not implemented (CDC webhooks require a durable backend).
+    async fn register_cdc_webhook(&self, def: cdc_webhooks::CdcWebhookDef) -> Result<()> {
+        let _ = def;
+        Err(basin_common::BasinError::Internal(
+            "register_cdc_webhook not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Drop a registered CDC webhook by `(project, id)`. Returns
+    /// [`basin_common::BasinError::NotFound`] when the id does not resolve.
+    /// Default impl: not implemented.
+    async fn drop_cdc_webhook(&self, project: &ProjectId, id: &str) -> Result<()> {
+        let _ = (project, id);
+        Err(basin_common::BasinError::Internal(
+            "drop_cdc_webhook not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// List every CDC webhook registered for `project`, each bundled with its
+    /// current delivery state (cursor + observability). The delivery worker
+    /// reads this to discover endpoints and their resume points; the GET route
+    /// renders it. Default impl: empty.
+    async fn list_cdc_webhooks(&self, project: &ProjectId) -> Vec<cdc_webhooks::CdcWebhookRow> {
+        let _ = project;
+        Vec::new()
+    }
+
+    /// Persist the delivery cursor for one endpoint after a successful (acked)
+    /// batch: advance `last_seq` (monotonic — never lowered, mirroring the
+    /// compaction-watermark `GREATEST` contract), record the last status, and
+    /// reset `retry_count` to 0. Default impl: durable no-op (cursor lives in
+    /// memory only for ephemeral backends, replayed from `seq=0` on restart).
+    async fn record_cdc_webhook_ack(
+        &self,
+        project: &ProjectId,
+        id: &str,
+        last_seq: u64,
+        last_status: &str,
+    ) -> Result<()> {
+        let _ = (project, id, last_seq, last_status);
+        Ok(())
+    }
+
+    /// Persist a failed delivery attempt: bump `retry_count` and record the
+    /// last status (HTTP code or transport error). Does NOT advance `last_seq`
+    /// (the batch was not acked). Default impl: durable no-op.
+    async fn record_cdc_webhook_failure(
+        &self,
+        project: &ProjectId,
+        id: &str,
+        retry_count: u32,
+        last_status: &str,
+    ) -> Result<()> {
+        let _ = (project, id, retry_count, last_status);
+        Ok(())
+    }
+
+    /// Auto-disable an endpoint that exceeded the max delivery age: clear its
+    /// `active` flag and stamp `disabled_at`. The row (and its cursor) is
+    /// retained for observability. Default impl: not implemented.
+    async fn disable_cdc_webhook(&self, project: &ProjectId, id: &str) -> Result<()> {
+        let _ = (project, id);
+        Err(basin_common::BasinError::Internal(
+            "disable_cdc_webhook not implemented for this catalog backend".into(),
+        ))
     }
 
     // -----------------------------------------------------------------------
