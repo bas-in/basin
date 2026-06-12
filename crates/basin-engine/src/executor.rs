@@ -9034,6 +9034,36 @@ pub(crate) fn map_df_plan_error(
     BasinError::internal(format!("{context}: {e}"))
 }
 
+/// Map a DataFusion error raised during `collect()` (physical execution) back
+/// to a `BasinError`, preserving any typed `BasinError` a UDF surfaced through
+/// `DataFusionError::External`.
+///
+/// The blocking advisory-lock UDFs (`pg_advisory_lock` / `pg_advisory_xact_lock`)
+/// return `BasinError::LockNotAvailable` on lock-wait timeout, wrapped in
+/// `DataFusionError::External`. Without this unwrap the error would collapse to
+/// a generic `Internal` and lose its SQLSTATE 55P03 mapping. We walk
+/// `find_root` so the unwrap also works when DataFusion has nested the External
+/// error inside a `Context`/`ArrowError` shell during execution.
+pub(crate) fn map_df_exec_error(e: datafusion::error::DataFusionError) -> BasinError {
+    use datafusion::error::DataFusionError;
+    if let DataFusionError::External(inner) = e.find_root() {
+        if let Some(be) = inner.downcast_ref::<BasinError>() {
+            // BasinError is not Clone in general; reconstruct the variants we
+            // intentionally surface from UDFs. Anything else falls through to
+            // the generic mapping below with the original message preserved.
+            match be {
+                BasinError::LockNotAvailable(msg) => {
+                    return BasinError::LockNotAvailable(msg.clone());
+                }
+                other => {
+                    return BasinError::internal(format!("execute: {other}"));
+                }
+            }
+        }
+    }
+    BasinError::internal(format!("execute: {e}"))
+}
+
 #[cfg(test)]
 mod df_plan_error_tests {
     use super::map_df_plan_error;
@@ -9588,7 +9618,7 @@ pub(crate) async fn exec_select(
                                         "pg_sleep: interrupted by statement_timeout",
                                     )
                                 } else {
-                                    BasinError::internal(format!("execute: {e}"))
+                                    map_df_exec_error(e)
                                 }
                             }),
                         Err(_) => Ok(None),
@@ -9602,7 +9632,7 @@ pub(crate) async fn exec_select(
                                     "pg_sleep: interrupted by statement_timeout",
                                 )
                             } else {
-                                BasinError::internal(format!("execute: {e}"))
+                                map_df_exec_error(e)
                             }
                         }),
                 }
@@ -9646,7 +9676,7 @@ pub(crate) async fn exec_select(
                                 "pg_sleep: interrupted by statement_timeout",
                             )
                         } else {
-                            BasinError::internal(format!("execute: {e}"))
+                            map_df_exec_error(e)
                         }
                     }),
                     Ok(None) => {
@@ -9675,7 +9705,7 @@ pub(crate) async fn exec_select(
                                 "pg_sleep: interrupted by statement_timeout",
                             )
                         } else {
-                            BasinError::internal(format!("execute: {e}"))
+                            map_df_exec_error(e)
                         }
                     }),
                     None => {
