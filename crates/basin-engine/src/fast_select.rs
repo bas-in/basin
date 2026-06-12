@@ -4777,6 +4777,7 @@ async fn try_topk_late_materialize(
         partition: None,
         limit: None,
         row_group_selection: None,
+        row_selection: None,
         sorted_by: None,
     };
     let phase1_schema = {
@@ -4905,6 +4906,7 @@ async fn try_topk_late_materialize(
         partition: None,
         limit: None,
         row_group_selection: None,
+        row_selection: None,
         sorted_by,
     };
     let phase2_paths: Vec<object_store::path::Path> = live_files
