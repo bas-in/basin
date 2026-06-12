@@ -8,6 +8,24 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-12 — Per-project pgwire connection ceiling (#28b)
+
+### Added
+
+- **Per-project pgwire connection ceiling.** A hard ceiling on simultaneously
+  open pgwire connections per project, enforced at the pgwire startup handler:
+  a new connection is refused with SQLSTATE 53300 (`too many connections for
+  project (ceiling reached)`) once the live count reaches the ceiling.
+  `CatalogConnectionLimitProvider` reads the ceiling from the catalog on every
+  new connect; fail-closed — a project with no stored ceiling gets 25 (the Free
+  tier). The ceiling is persisted (new `project_max_connections` catalog table /
+  in-memory map) and set via the admin route `POST
+  /admin/v1/projects/:id/max-connections` (admin JWT, project_id claim must
+  match the path); `GET` reads it back. It is a CEILING, not a reservation:
+  lowering it never kills existing connections — only new admits are refused
+  once live >= ceiling (a RAII guard decrements the live count on
+  disconnect/drop).
+
 ## 2026-06-12 — Multi-node: quorum-replicated WAL (`BASIN_WAL_MODE=raft`)
 
 ### Added

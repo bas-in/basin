@@ -570,6 +570,19 @@ impl PostgresCatalog {
                     PRIMARY KEY (project_id, partition_id)
                 )"
             ),
+            // Per-project pgwire connection ceiling (issue #28b). Written by
+            // the admin route (POST /admin/v1/projects/:id/max-connections),
+            // read once per new pgwire connection. A legacy catalog without
+            // this table has no rows; `get_project_max_connections` returns
+            // `None` and the connection limiter falls back to the fail-closed
+            // default (25, the Free tier ceiling).
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.project_max_connections (
+                    project_id  TEXT    NOT NULL PRIMARY KEY,
+                    max_conns   INTEGER NOT NULL CHECK (max_conns > 0),
+                    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                )"
+            ),
         ];
         let client = self.client().await?;
         for stmt in stmts {
@@ -4025,6 +4038,54 @@ impl Catalog for PostgresCatalog {
             // Defensive: a negative stored value (impossible via our writer)
             // clamps to 0 rather than wrapping to a huge u64.
             lsn.max(0) as u64
+        }))
+    }
+
+    #[instrument(skip(self), fields(project = %project))]
+    async fn set_project_max_connections(
+        &self,
+        project: &ProjectId,
+        max_connections: u32,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let project_str = project.to_string();
+        let max_conns = max_connections as i32;
+        let client = self.client().await?;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.project_max_connections \
+                       (project_id, max_conns, updated_at) \
+                     VALUES ($1, $2, now()) \
+                     ON CONFLICT (project_id) DO UPDATE \
+                     SET max_conns  = EXCLUDED.max_conns, \
+                         updated_at = now()"
+                ),
+                &[&project_str, &max_conns],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("set_project_max_connections: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project))]
+    async fn get_project_max_connections(&self, project: &ProjectId) -> Result<Option<u32>> {
+        let sch = &self.schema;
+        let project_str = project.to_string();
+        let client = self.client().await?;
+        let row = client
+            .query_opt(
+                &format!(
+                    "SELECT max_conns FROM {sch}.project_max_connections \
+                     WHERE project_id = $1"
+                ),
+                &[&project_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("get_project_max_connections: {e}")))?;
+        Ok(row.map(|r| {
+            let v: i32 = r.get(0);
+            v.max(1) as u32
         }))
     }
 }

@@ -43,6 +43,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use basin_catalog::Catalog;
 use basin_common::ProjectId;
 
 // ─── provider trait ──────────────────────────────────────────────────────────
@@ -326,5 +327,147 @@ mod tests {
         let _gb = lim.try_admit(b).await.expect("admit b");
         assert_eq!(lim.live_count(a), 1);
         assert_eq!(lim.live_count(b), 1);
+    }
+}
+
+// ─── CatalogConnectionLimitProvider ─────────────────────────────────────────
+
+/// The fail-closed default when no ceiling has been pushed by the cloud.
+///
+/// `25` = the Free tier ceiling per the cloud's pricing ladder.
+pub const DEFAULT_PROJECT_MAX_CONNECTIONS: u32 = 25;
+
+/// [`ConnectionLimitProvider`] that reads per-project ceilings from the
+/// [`basin_catalog::Catalog`]. Fail-closed: `None` from catalog → 25.
+pub struct CatalogConnectionLimitProvider {
+    catalog: Arc<dyn Catalog>,
+}
+
+impl CatalogConnectionLimitProvider {
+    pub fn new(catalog: Arc<dyn Catalog>) -> Self {
+        Self { catalog }
+    }
+}
+
+#[async_trait]
+impl ConnectionLimitProvider for CatalogConnectionLimitProvider {
+    async fn limit_for(&self, project: ProjectId) -> Option<u32> {
+        match self.catalog.get_project_max_connections(&project).await {
+            Ok(Some(n)) => Some(n),
+            Ok(None) => Some(DEFAULT_PROJECT_MAX_CONNECTIONS),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    %project,
+                    "get_project_max_connections catalog error; \
+                     applying fail-closed default ({})",
+                    DEFAULT_PROJECT_MAX_CONNECTIONS,
+                );
+                Some(DEFAULT_PROJECT_MAX_CONNECTIONS)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod catalog_limit_provider_tests {
+    use super::*;
+    use basin_catalog::InMemoryCatalog;
+
+    #[tokio::test]
+    async fn unset_returns_fail_closed_default() {
+        let p = CatalogConnectionLimitProvider::new(Arc::new(InMemoryCatalog::new()));
+        let project = ProjectId::new();
+        assert_eq!(
+            p.limit_for(project).await,
+            Some(DEFAULT_PROJECT_MAX_CONNECTIONS)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_ceiling_is_returned() {
+        let cat = Arc::new(InMemoryCatalog::new());
+        let p = CatalogConnectionLimitProvider::new(cat.clone());
+        let project = ProjectId::new();
+        cat.set_project_max_connections(&project, 250).await.unwrap();
+        assert_eq!(p.limit_for(project).await, Some(250));
+    }
+
+    #[tokio::test]
+    async fn concurrent_admission_race() {
+        const K: u32 = 10;
+        const N: u32 = 25;
+        let cat = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        cat.set_project_max_connections(&project, K).await.unwrap();
+        let limiter = Arc::new(ConnectionLimiter::new(Arc::new(
+            CatalogConnectionLimitProvider::new(cat.clone()),
+        )));
+        // Each task RETURNS its guard (Ok) or None (refused) so the admitted
+        // guards stay alive — otherwise a guard dropped at the end of the task
+        // frees the slot before we count, and every attempt "succeeds"
+        // sequentially without ever testing the ceiling.
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let lim = limiter.clone();
+            handles.push(tokio::spawn(async move {
+                lim.try_admit(project).await.ok()
+            }));
+        }
+        let guards: Vec<Option<ConnectionGuard>> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.expect("task panicked"))
+            .collect();
+        let admitted = guards.iter().filter(|g| g.is_some()).count() as u32;
+        let refused = guards.iter().filter(|g| g.is_none()).count() as u32;
+        assert_eq!(admitted, K, "exactly K connections admitted under the ceiling");
+        assert_eq!(refused, N - K, "the rest refused");
+        assert_eq!(limiter.live_count(project), K, "live count == admitted guards");
+        // Guards drop here, freeing all slots.
+        drop(guards);
+        assert_eq!(limiter.live_count(project), 0);
+    }
+
+    #[tokio::test]
+    async fn drop_decrement_frees_slot() {
+        let cat = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        cat.set_project_max_connections(&project, 1).await.unwrap();
+        let limiter = Arc::new(ConnectionLimiter::new(Arc::new(
+            CatalogConnectionLimitProvider::new(cat.clone()),
+        )));
+        let guard = limiter.try_admit(project).await.expect("admit");
+        assert!(limiter.try_admit(project).await.is_err());
+        drop(guard);
+        assert_eq!(limiter.live_count(project), 0);
+        limiter.try_admit(project).await.expect("re-admit");
+    }
+
+    #[tokio::test]
+    async fn ceiling_lower_does_not_kill_existing_connections() {
+        let cat = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        cat.set_project_max_connections(&project, 5).await.unwrap();
+        let limiter = Arc::new(ConnectionLimiter::new(Arc::new(
+            CatalogConnectionLimitProvider::new(cat.clone()),
+        )));
+        let g1 = limiter.try_admit(project).await.expect("1");
+        let g2 = limiter.try_admit(project).await.expect("2");
+        let g3 = limiter.try_admit(project).await.expect("3");
+        assert_eq!(limiter.live_count(project), 3);
+        // Lower ceiling to 2 — existing 3 guards survive (CEILING, not kill).
+        cat.set_project_max_connections(&project, 2).await.unwrap();
+        assert_eq!(limiter.live_count(project), 3, "no kills on ceiling lower");
+        // New attempt refused (live 3 >= 2).
+        assert!(limiter.try_admit(project).await.is_err());
+        // Drop one: at 2 live, still refused.
+        drop(g3);
+        assert!(limiter.try_admit(project).await.is_err());
+        // Drop another: at 1 live, a new admit succeeds (1 < 2).
+        drop(g2);
+        let g4 = limiter.try_admit(project).await.expect("re-admit at 1<2");
+        drop(g1);
+        drop(g4);
     }
 }

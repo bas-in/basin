@@ -202,6 +202,9 @@ pub struct InMemoryCatalog {
     /// Cleared in `drop_namespace`. Implements `set_project_metadata` /
     /// `get_project_metadata` on the `Catalog` trait (T-048).
     project_metadata: Mutex<HashMap<ProjectId, ProjectMetadata>>,
+    /// Per-project pgwire connection ceiling. Written by the admin route;
+    /// read by the pgwire startup handler. Cleared in `drop_namespace`.
+    project_max_connections: Mutex<HashMap<ProjectId, u32>>,
     /// Per-`(project, partition)` compaction watermark — the highest WAL LSN
     /// whose tail batch has been compacted into a catalog-committed cold file.
     /// Mirrors the Postgres `compaction_watermarks` table. Monotonic: writes
@@ -267,6 +270,7 @@ impl InMemoryCatalog {
             inbound_webhooks: Mutex::new(HashMap::new()),
             leases: Mutex::new(HashMap::new()),
             project_metadata: Mutex::new(HashMap::new()),
+            project_max_connections: Mutex::new(HashMap::new()),
             compaction_watermarks: Mutex::new(HashMap::new()),
         }
     }
@@ -593,6 +597,9 @@ impl Catalog for InMemoryCatalog {
         leases.retain(|(t, _), _| t != project);
         let mut pm = self.project_metadata.lock().await;
         pm.remove(project);
+        // Clear per-project connection ceiling.
+        let mut mc = self.project_max_connections.lock().await;
+        mc.remove(project);
         Ok(())
     }
 
@@ -1469,6 +1476,21 @@ impl Catalog for InMemoryCatalog {
     ) -> Result<Option<u64>> {
         let map = self.compaction_watermarks.lock().await;
         Ok(map.get(&(*project, partition_id.to_string())).copied())
+    }
+
+    async fn set_project_max_connections(
+        &self,
+        project: &ProjectId,
+        max_connections: u32,
+    ) -> Result<()> {
+        let mut m = self.project_max_connections.lock().await;
+        m.insert(*project, max_connections);
+        Ok(())
+    }
+
+    async fn get_project_max_connections(&self, project: &ProjectId) -> Result<Option<u32>> {
+        let m = self.project_max_connections.lock().await;
+        Ok(m.get(project).copied())
     }
 
     async fn register_view(&self, def: ViewDef, or_replace: bool) -> Result<()> {

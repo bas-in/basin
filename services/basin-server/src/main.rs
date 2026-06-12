@@ -217,7 +217,10 @@ use basin_common::{
     ProjectId,
 };
 // Base resolver types always needed (pgwire core).
-use basin_router::{ProjectResolver, ServerConfig, StaticProjectResolver, TlsConfig};
+use basin_router::{
+    CatalogConnectionLimitProvider, ConnectionLimiter, ProjectResolver, ServerConfig,
+    StaticProjectResolver, TlsConfig,
+};
 // Auth-gated resolver types — only available when `auth` (and by extension
 // `basin-auth`) is compiled in.
 #[cfg(feature = "auth")]
@@ -661,6 +664,14 @@ async fn main() -> Result<()> {
     // Spawn the pgwire router. The resolver is fully wired with live auth
     // resolvers (when auth is enabled) so JWT / API-key / credential clients
     // work from the very first connection — no deferred slot needed.
+    // Per-project pgwire connection ceiling enforcement (issue #28b).
+    // CatalogConnectionLimitProvider reads the ceiling on every new connect;
+    // the admin route (POST /admin/v1/projects/:id/max-connections) writes it.
+    // Fail-closed: a project with no stored ceiling gets 25 (the Free tier).
+    let connection_limiter = {
+        let provider = CatalogConnectionLimitProvider::new(catalog.clone());
+        Some(Arc::new(ConnectionLimiter::new(Arc::new(provider))))
+    };
     let server_cfg = ServerConfig {
         bind_addr: cfg.bind,
         engine: engine.clone(),
@@ -668,10 +679,7 @@ async fn main() -> Result<()> {
         pool,
         shard_endpoints: None,
         tls,
-        // Pass None for now — unlimited connections. Wire a
-        // ConnectionLimiter here to enforce per-project max_connections
-        // limits sourced from the control plane.
-        connection_limiter: None,
+        connection_limiter,
     };
     let router = basin_router::run_until_bound(server_cfg)
         .await

@@ -44,7 +44,7 @@ use basin_cdc::CdcSseState;
 use crate::errors::ApiError;
 use crate::routes::{
     admin as admin_routes, admin_functions as admin_fn_routes,
-    auth as auth_routes, data as data_routes,
+    admin_projects as admin_projects_routes, auth as auth_routes, data as data_routes,
     fn_handler as fn_handler_routes, inbound as inbound_routes,
     openapi as openapi_routes, rpc as rpc_routes,
     storage as storage_routes, storage_sign as storage_sign_routes,
@@ -371,6 +371,13 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         .route(
             "/admin/v1/projects/:project_id/byo-bucket",
             post(admin_routes::register_byo_bucket),
+        )
+        // issue #28b: per-project pgwire connection ceiling.
+        // POST sets the ceiling (persists + live); GET reads it.
+        .route(
+            "/admin/v1/projects/:project_id/max-connections",
+            post(admin_projects_routes::set_project_max_connections)
+                .get(admin_projects_routes::get_project_max_connections),
         )
         // Feature 3 (5.22.D): pg_dump-compatible project export.
         .route(

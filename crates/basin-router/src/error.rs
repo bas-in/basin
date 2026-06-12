@@ -39,7 +39,7 @@ pub(crate) fn connection_limit_reached_response() -> ErrorResponse {
     let info = ErrorInfo::new(
         "FATAL".to_owned(),
         "53300".to_owned(),
-        "connection limit reached".to_owned(),
+        "too many connections for project (ceiling reached)".to_owned(),
     );
     info.into()
 }
