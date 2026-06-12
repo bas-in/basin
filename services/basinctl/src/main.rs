@@ -1,15 +1,18 @@
 //! `basinctl` — a small administrative CLI for a running Basin pgwire endpoint.
 //!
-//! Six subcommands: `ping`, `projects`, `tables`, `query`, `version`,
-//! `reset-auth`. Connection string is taken from `--url`, else `BASIN_URL`,
-//! else (for `ping`) the positional argument. See
-//! `services/basinctl/README.md` for examples.
+//! Eight subcommands: `ping`, `projects`, `tables`, `query`, `version`,
+//! `reset-auth`, `import-from-postgres`, `fn`. Connection string is taken
+//! from `--url`, else `BASIN_URL`, else (for `ping`) the positional
+//! argument. See `services/basinctl/README.md` for examples.
+
+mod import;
+mod translate;
 
 use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tokio_postgres::NoTls;
 
 #[derive(Debug, Parser)]
@@ -71,6 +74,58 @@ enum Cmd {
         #[arg(long)]
         include_project_creds: bool,
     },
+    /// Migrate schema + data from a running PostgreSQL into Basin.
+    ///
+    /// Enumerates schemas/tables via information_schema, translates the DDL
+    /// into Basin's dialect (serial → BIGINT identity; uuid/jsonb/citext/
+    /// vector pass through; unsupported features are skipped with a loud
+    /// per-object report), creates the tables, then streams data per table
+    /// via binary COPY (CSV fallback for types Basin's binary COPY
+    /// rejects), verifying row counts. See `docs/import.md`.
+    #[command(name = "import-from-postgres")]
+    ImportFromPostgres {
+        /// Source PostgreSQL connection string (postgres://…).
+        #[arg(long)]
+        source: String,
+        /// Target Basin connection string. Falls back to --url / BASIN_URL.
+        #[arg(long)]
+        target: Option<String>,
+        /// Only import these source schemas (repeatable). Default: every
+        /// non-system schema.
+        #[arg(long = "schema")]
+        schemas: Vec<String>,
+        /// Only import these tables, bare or schema-qualified (repeatable).
+        #[arg(long = "table")]
+        tables: Vec<String>,
+        /// Number of tables to copy in parallel (within one FK level).
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+        /// Translate and print the Basin DDL + skip report without
+        /// connecting to the target or writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Create tables only; copy no rows.
+        #[arg(long)]
+        skip_data: bool,
+        /// Data transfer format. `auto` picks binary per table and falls
+        /// back to CSV for column sets Basin's binary COPY rejects.
+        #[arg(long, value_enum, default_value_t = ImportFormat::Auto)]
+        format: ImportFormat,
+    },
+    /// WASM functions toolchain (not built yet — prints the roadmap).
+    #[command(name = "fn")]
+    Fn,
+}
+
+/// `--format` for import-from-postgres.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ImportFormat {
+    /// Binary per table where every column is binary-safe, else CSV.
+    Auto,
+    /// Force binary COPY for every table (rejections fail loudly).
+    Binary,
+    /// Force CSV COPY for every table.
+    Csv,
 }
 
 /// The basin-auth catalog tables, in safe drop order (children before
@@ -163,7 +218,73 @@ async fn run(cli: Cli) -> Result<()> {
             engine_url,
             include_project_creds,
         } => reset_auth(yes, &engine_url, include_project_creds).await,
+        Cmd::ImportFromPostgres {
+            source,
+            target,
+            schemas,
+            tables,
+            jobs,
+            dry_run,
+            skip_data,
+            format,
+        } => {
+            // --target falls back to the global --url / BASIN_URL chain.
+            // For --dry-run no target connection is opened, so the
+            // resolution failure is deferred to a placeholder.
+            let target = match target {
+                Some(t) => t,
+                None => match resolve_url(cli.url.as_deref(), None) {
+                    Ok(u) => u,
+                    Err(e) if dry_run => {
+                        let _ = e; // dry-run never dials the target
+                        String::new()
+                    }
+                    Err(e) => return Err(e.context("--target")),
+                },
+            };
+            import::run(import::ImportArgs {
+                source,
+                target,
+                schemas,
+                tables,
+                jobs,
+                dry_run,
+                skip_data,
+                format,
+            })
+            .await
+        }
+        Cmd::Fn => {
+            print_fn_roadmap();
+            Ok(())
+        }
     }
+}
+
+/// `basinctl fn` — honest placeholder. Basin's functions runtime (Wasm
+/// components under per-project caps — see `docs/functions.md` and ADR
+/// 0019) exists server-side; the CLI toolchain does not yet. Printing the
+/// roadmap keeps the surface discoverable without pretending it works.
+fn print_fn_roadmap() {
+    println!(
+        "basinctl fn — WASM functions toolchain (not built yet)\n\
+         \n\
+         Basin runs WebAssembly functions inside the engine (WASI Preview 2\n\
+         components; TypeScript via Javy / ComponentizeJS — this is Wasm, not a\n\
+         V8 isolate pool; see docs/functions.md and ADR 0019). The CLI verbs\n\
+         planned here:\n\
+         \n\
+           fn deploy <file.wasm|src/>   compile (if source) + upload a component\n\
+           fn list                      list deployed functions + versions\n\
+           fn invoke <name> [--body]    invoke ANY /fn/v1/<name> for testing\n\
+           fn logs <name>               tail invocation logs\n\
+           fn delete <name>             remove a function\n\
+         \n\
+         Until then: deploy via the REST surface described in docs/functions.md.\n\
+         Migrating plpgsql from Postgres? `basinctl import-from-postgres` lists\n\
+         every source function it skipped; each one is a candidate for a Wasm\n\
+         function (request/response) or a reactor (row-change logic)."
+    );
 }
 
 /// Drop every basin-auth catalog table. See `Cmd::ResetAuth` for rationale.
@@ -396,6 +517,91 @@ mod tests {
             .expect_err("should refuse");
         let msg = format!("{err:#}");
         assert!(msg.contains("--yes"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn import_from_postgres_defaults() {
+        let cli = parse(&[
+            "basinctl",
+            "import-from-postgres",
+            "--source",
+            "postgres://u:p@src:5432/app",
+        ]);
+        match cli.cmd {
+            Cmd::ImportFromPostgres {
+                source,
+                target,
+                schemas,
+                tables,
+                jobs,
+                dry_run,
+                skip_data,
+                format,
+            } => {
+                assert_eq!(source, "postgres://u:p@src:5432/app");
+                assert_eq!(target, None);
+                assert!(schemas.is_empty() && tables.is_empty());
+                assert_eq!(jobs, 4);
+                assert!(!dry_run && !skip_data);
+                assert_eq!(format, ImportFormat::Auto);
+            }
+            other => panic!("expected ImportFromPostgres, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_from_postgres_full_flags() {
+        let cli = parse(&[
+            "basinctl",
+            "import-from-postgres",
+            "--source",
+            "postgres://src/app",
+            "--target",
+            "postgres://alice@basin:5433/basin",
+            "--schema",
+            "public",
+            "--schema",
+            "app",
+            "--table",
+            "users",
+            "--jobs",
+            "8",
+            "--dry-run",
+            "--skip-data",
+            "--format",
+            "csv",
+        ]);
+        match cli.cmd {
+            Cmd::ImportFromPostgres {
+                target,
+                schemas,
+                tables,
+                jobs,
+                dry_run,
+                skip_data,
+                format,
+                ..
+            } => {
+                assert_eq!(target.as_deref(), Some("postgres://alice@basin:5433/basin"));
+                assert_eq!(schemas, vec!["public", "app"]);
+                assert_eq!(tables, vec!["users"]);
+                assert_eq!(jobs, 8);
+                assert!(dry_run && skip_data);
+                assert_eq!(format, ImportFormat::Csv);
+            }
+            other => panic!("expected ImportFromPostgres, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_from_postgres_requires_source() {
+        assert!(Cli::try_parse_from(["basinctl", "import-from-postgres"]).is_err());
+    }
+
+    #[test]
+    fn fn_subcommand_parses() {
+        let cli = parse(&["basinctl", "fn"]);
+        assert_eq!(cli.cmd, Cmd::Fn);
     }
 
     #[test]
