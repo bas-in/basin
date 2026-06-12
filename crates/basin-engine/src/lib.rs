@@ -125,6 +125,17 @@ pub(crate) struct EngineInner {
     /// integration tests to prove the promoted read path actually engaged
     /// rather than falling back to the DataFusion / UDF path.
     pub(crate) promoted_fast_select_count: AtomicU64,
+    /// Cumulative number of `WHERE k > $1 ORDER BY k ASC LIMIT n` statements
+    /// served by the keyset per-file-LIMIT branch in `fast_select` (including
+    /// the overlay-tolerant inflated-limit form). Tests assert on this to
+    /// prove the keyset pushdown actually engaged rather than falling back to
+    /// the unbounded full-file read.
+    pub(crate) keyset_fast_select_count: AtomicU64,
+    /// Cumulative number of `LIMIT n` (no ORDER BY) statements served by the
+    /// unordered early-exit branch in `fast_select` (including the
+    /// overlay-tolerant inflated-target form). Test introspection surface,
+    /// mirroring `keyset_fast_select_count`.
+    pub(crate) unordered_limit_fast_select_count: AtomicU64,
     /// Per-project noisy-project detector. Reads its bit when a session is
     /// opened (to choose `target_partitions`) and bumps it after every
     /// successful `ProjectSession::execute`. See `noisy_detector` module
@@ -372,6 +383,8 @@ impl Engine {
             pg_plan_routing_count: AtomicU64::new(0),
             blooms_skipped: AtomicU64::new(0),
             promoted_fast_select_count: AtomicU64::new(0),
+            keyset_fast_select_count: AtomicU64::new(0),
+            unordered_limit_fast_select_count: AtomicU64::new(0),
             noisy_detector: crate::noisy_detector::NoisyDetector::new(),
             project_counters,
             event_sinks: RwLock::new(registry),
@@ -767,6 +780,38 @@ impl Engine {
     /// path).
     pub fn promoted_fast_select_count(&self) -> u64 {
         self.inner.promoted_fast_select_count.load(Ordering::Relaxed)
+    }
+
+    /// Crate-private hook bumped by `fast_select` each time the keyset
+    /// per-file-LIMIT branch serves a `k > $1 ORDER BY k ASC LIMIT n` query.
+    pub(crate) fn note_keyset_fast_select(&self) {
+        self.inner
+            .keyset_fast_select_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative count of statements served by the keyset per-file-LIMIT
+    /// branch since this `Engine` was created. Test introspection: proves the
+    /// keyset pushdown engaged (vs. the unbounded full-file fallback).
+    pub fn keyset_fast_select_count(&self) -> u64 {
+        self.inner.keyset_fast_select_count.load(Ordering::Relaxed)
+    }
+
+    /// Crate-private hook bumped by `fast_select` each time the unordered
+    /// `LIMIT n` early-exit branch serves a query.
+    pub(crate) fn note_unordered_limit_fast_select(&self) {
+        self.inner
+            .unordered_limit_fast_select_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative count of statements served by the unordered-LIMIT early-exit
+    /// branch since this `Engine` was created. Test introspection surface,
+    /// mirroring [`Engine::keyset_fast_select_count`].
+    pub fn unordered_limit_fast_select_count(&self) -> u64 {
+        self.inner
+            .unordered_limit_fast_select_count
+            .load(Ordering::Relaxed)
     }
 
     // ── Phase 5.7 B1: secondary index ────────────────────────────────────────

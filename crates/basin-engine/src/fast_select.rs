@@ -406,8 +406,36 @@ fn probe_memtable(
     // made an entry clean, so the retained copy can be the only visible
     // source of the version this transaction is entitled to. (`Some(w)`
     // yields, per key, the newest version at or before the watermark.)
+    // ── Completeness guard (auto-commit) ────────────────────────────────────
+    // The CALLER treats a non-empty `live_matches` as the WHOLE answer (it
+    // returns the hot rows and skips the cold read entirely). That is only
+    // sound when the predicate set PINS the table's single PK with an Eq atom:
+    // at most one row table-wide can match, and the memtable's version of that
+    // row supersedes the cold image. For every other shape — a non-PK Eq, in
+    // particular — the hot matches are a SUBSET of the answer, and returning
+    // them here HIDES every cold row that also matches (measured: a fast-path
+    // `UPDATE … WHERE id = 41` left a dirty override matching `bucket = 3`,
+    // and the next `SELECT … WHERE bucket = 3 LIMIT 100` returned 2 rows
+    // instead of 100). Those shapes fall through to the cold read, whose
+    // overlay merge surfaces dirty Update rows and suppresses tombstones —
+    // complete AND fresh. This is the dirty-entry twin of the clean-row
+    // under-return fix described below; production INSERT residency is
+    // written CLEAN (`insert_clean`), so no committed row is lost by skipping
+    // the walk.
+    //
+    // Pinned reads (`Some(w)`) keep the historical walk unchanged: the pinned
+    // cold snapshot may predate the flush that retained an entry, so the
+    // retained copy can be the only visible source of an entitled version
+    // (pre-existing behavior, unchanged here).
+    let pk_pinning_eq = meta.pk_columns.len() == 1
+        && predicates
+            .iter()
+            .any(|p| matches!(p, Predicate::Eq(c, _) if c == &meta.pk_columns[0]));
     let snapshot: Vec<(basin_hottier::RowKey, basin_hottier::MemRowValue)> = match hot_watermark {
         None => {
+            if !pk_pinning_eq {
+                return None;
+            }
             if pk_eq_direct_get_missed
                 && entry.memtable.counter_key_rows() == 0
                 && entry.memtable.update_count() == 0
@@ -2173,7 +2201,7 @@ async fn execute_simple_select_inner(
                             meta.schema
                                 .index_of(c)
                                 .map_err(|_| {
-                                    BasinError::InvalidSchema(format!("unknown column {c}"))
+                                    BasinError::UndefinedColumn(c.to_string())
                                 }),
                         ),
                         _ => None,
@@ -2207,7 +2235,7 @@ async fn execute_simple_select_inner(
                     let idx = meta
                         .schema
                         .index_of(c)
-                        .map_err(|_| BasinError::InvalidSchema(format!("unknown column {c}")))?;
+                        .map_err(|_| BasinError::UndefinedColumn(c.to_string()))?;
                     let dt = meta.schema.field(idx).data_type();
                     match dt {
                         arrow_schema::DataType::Int64 | arrow_schema::DataType::Float64 => {}
@@ -2229,7 +2257,7 @@ async fn execute_simple_select_inner(
         for c in cols {
             meta.schema
                 .index_of(c)
-                .map_err(|_| BasinError::InvalidSchema(format!("unknown column {c}")))?;
+                .map_err(|_| BasinError::UndefinedColumn(c.to_string()))?;
         }
     }
 
@@ -2253,27 +2281,45 @@ async fn execute_simple_select_inner(
     // pin: today's behaviour (every committed overlay entry is visible).
     let hot_watermark = pinned.map(|p| p.hot_watermark);
     // Probe the memtable registry for any overlay activity on this
-    // (project, table). Both probes are O(1) HashMap lookups when the overlay
-    // is empty (the common case), so the work is bounded and proportional to
-    // "does the engine have any outstanding fast-path DELETE/UPDATE for this
-    // table". Under a pin the watermark hides post-pin overlays so the
-    // decisions below match what the read will actually merge.
-    let overlay_active = {
+    // (project, table), capturing the snapshots ONCE per statement. Both
+    // probes are O(1) when the overlay is empty (the common case). The same
+    // snapshots are reused (a) to size the overlay SLACK for the keyset /
+    // unordered-LIMIT per-file limits below and (b) by the merge-on-read
+    // suppression + append step after the cold read — so the slack bound and
+    // the overlay actually applied can never diverge mid-statement (an
+    // overlay write landing after this point is simply not part of this
+    // statement's read view, exactly like a cold row landing mid-scan).
+    // Under a pin the watermark hides post-pin overlays so the decisions
+    // below match what the read will actually merge.
+    let (overlay_tombs, overlay_updates) = {
         let registry = sess.engine.memtable_registry();
-        let tombs = crate::hot_tombstone::snapshot_tombstones(
-            registry.as_ref(),
-            &sess.project,
-            &plan.table,
-            hot_watermark,
-        );
-        let updates = crate::hot_tombstone::snapshot_updates(
-            registry.as_ref(),
-            &sess.project,
-            &plan.table,
-            hot_watermark,
-        );
-        !tombs.is_empty() || !updates.is_empty()
+        (
+            crate::hot_tombstone::snapshot_tombstones(
+                registry.as_ref(),
+                &sess.project,
+                &plan.table,
+                hot_watermark,
+            ),
+            crate::hot_tombstone::snapshot_updates(
+                registry.as_ref(),
+                &sess.project,
+                &plan.table,
+                hot_watermark,
+            ),
+        )
     };
+    let overlay_active = !overlay_tombs.is_empty() || !overlay_updates.is_empty();
+    // Number of distinct overlay keys. Merge-on-read can REMOVE a cold row
+    // only when its PK equals an overlay key, and a PK occurs at most once
+    // per cold file (single-PK uniqueness within a file), so this bounds how
+    // many rows suppression can remove from any per-file prefix — the basis
+    // for the keyset / unordered-LIMIT overlay tolerance below.
+    let overlay_slack: usize = overlay_tombs.len() + overlay_updates.len();
+    // The merge-on-read step below only knows how to suppress/append via a
+    // single-column PK; overlay entries are only ever written for such
+    // tables, but gate defensively — a live overlay the merge CANNOT apply
+    // must keep every limit-pushdown path disabled.
+    let overlay_mergeable = meta.pk_columns.len() == 1;
     // Overlay-aware read projection: the merge-on-read suppression below
     // (`apply_tombstone_filter_to_batches` / `apply_update_overlay_to_batches`)
     // encodes each COLD row's PK to decide whether a tombstone or UPDATE
@@ -2336,16 +2382,23 @@ async fn execute_simple_select_inner(
     // it reads files in full and the existing path produces the correct answer
     // (slower, but never wrong).
     //
-    // Correctness guards.  We DISABLE the pushdown whenever `post_read_shrinking`
-    // is set — i.e. there is an IS NULL / IN post-filter, or any live hot-tier
-    // tombstone / UPDATE overlay for this table.  Reason: a tombstone can
-    // suppress a cold row that the per-file LIMIT already admitted, leaving a
-    // shortfall whose backfill lives PAST the per-file cap; an UPDATE overlay
-    // can move a row out of the window.  Rather than reason about a slack
-    // margin, we fall back to the unbounded full-file read (the existing
-    // `apply_order_by_limit` path) which is provably correct.  With NO overlays
-    // and NO post-filter, no cold row can be removed after admission, so a
-    // per-file LIMIT of exactly `query_limit` is sufficient — no slack needed.
+    // Correctness guards.  The pushdown is DISABLED for IS NULL / IN
+    // post-filters (their selectivity is unbounded — no slack covers them).
+    // A live hot-tier tombstone / UPDATE overlay, however, is TOLERATED via
+    // a slack margin instead of declining: merge-on-read can remove at most
+    // ONE cold row per overlay key from any per-file prefix (PKs are unique
+    // within a file), so inflating each file's head LIMIT by
+    // `overlay_slack = |tombstones| + |updates|` guarantees that, after
+    // suppression, each file still contributes at least `limit + offset`
+    // surviving head rows — a superset of its global-top-`(limit+offset)`
+    // contribution. Override rows the overlay APPENDS only add candidates
+    // (they re-enter through `apply_update_overlay_to_batches`, which
+    // re-applies the pushed predicates, and the final
+    // `apply_order_by_limit` sorts them into place), and an override cannot
+    // move a row's keyset position in a way the slack misses: its cold image
+    // is suppressed (covered by the slack) and its new image is appended
+    // globally, independent of any per-file cut. The overlay must be
+    // MERGEABLE (single-column PK) — otherwise we decline as before.
     //
     // RLS / soft-delete / views: the executor gate (`exec_select`) already
     // refuses to call `execute_simple_select` for those, so the keyset path
@@ -2353,7 +2406,7 @@ async fn execute_simple_select_inner(
     let effective_cluster = effective_cluster_col(&meta);
     let keyset_per_file_limit: Option<usize> = match (&plan.order_by, plan.limit) {
         (Some((ob_col, ascending)), Some(limit))
-            if !post_read_shrinking
+            if (!overlay_active || overlay_mergeable)
                 && plan.aggregates.is_none()
                 && plan.is_null_cols.is_empty()
                 && plan.in_list_preds.is_empty()
@@ -2367,18 +2420,40 @@ async fn execute_simple_select_inner(
                 // With an OFFSET, the global top-`(limit+offset)` is needed
                 // before the skip, so each ASC-sorted file's head must supply
                 // `limit + offset` rows (still a superset of its contribution).
-                // `saturating_add` keeps a pathological OFFSET from wrapping;
-                // an over-large per-file cap just reads the whole file (correct,
-                // never wrong).
-                Predicate::Gt(col, _) if *ascending && col == ob_col => {
-                    Some(limit.saturating_add(plan.offset.unwrap_or(0)))
-                }
+                // `overlay_slack` rows are added on top so merge-on-read
+                // suppression cannot leave a shortfall (see the guard note
+                // above). `saturating_add` keeps a pathological OFFSET from
+                // wrapping; an over-large per-file cap just reads the whole
+                // file (correct, never wrong).
+                Predicate::Gt(col, _) if *ascending && col == ob_col => Some(
+                    limit
+                        .saturating_add(plan.offset.unwrap_or(0))
+                        .saturating_add(overlay_slack),
+                ),
                 // DESC + `k < $1` (and every other shape) is not eligible for
                 // the per-file head LIMIT — leave it to the full-file path.
                 _ => None,
             }
         }
         _ => None,
+    };
+    // Unordered-LIMIT early-exit target (the `LIMIT k`, no-ORDER-BY twin of
+    // the keyset slack above): collect `k + overlay_slack` post-pushdown cold
+    // rows so that, after merge-on-read suppression (≤ `overlay_slack` rows
+    // removed), at least `k` survive — `apply_limit` then trims to exactly
+    // `k`. Appended override rows only ADD matching candidates. With no
+    // overlay this degenerates to today's exact-`k` early exit. IS NULL /
+    // IN-list post-filters stay excluded (unbounded selectivity, no slack
+    // covers them), as do non-mergeable overlays.
+    let unordered_limit_target: Option<usize> = if plan.order_by.is_none()
+        && plan.aggregates.is_none()
+        && plan.is_null_cols.is_empty()
+        && plan.in_list_preds.is_empty()
+        && (!overlay_active || overlay_mergeable)
+    {
+        plan.limit.map(|k| k.saturating_add(overlay_slack))
+    } else {
+        None
     };
     // Synthesise bounding-range predicates from IN-list predicates so the
     // Parquet row-group pruner sees a compact `[min, max]` filter rather than
@@ -2469,6 +2544,11 @@ async fn execute_simple_select_inner(
     // Strategy:
     //   1. If the plan has at least one Eq predicate (point lookup), scan the
     //      memtable for this (project, table) and decode + filter all entries.
+    //      In auto-commit the probe only yields matches when an Eq atom PINS
+    //      the single PK (completeness guard inside `probe_memtable`): hot
+    //      matches replace the cold read, which is only sound when at most one
+    //      row table-wide can match. Non-PK Eq shapes fall through to the cold
+    //      read + overlay merge (complete and fresh).
     //   2. Live matches → return them directly (memtable wins; no cold read).
     //   3. Tombstone present (any deleted key) AND no live matches → the cold
     //      tier may have a stale row but the deletion is definitive; still
@@ -2517,7 +2597,7 @@ async fn execute_simple_select_inner(
                                     let i = meta
                                         .schema
                                         .index_of(c)
-                                        .map_err(|_| BasinError::InvalidSchema(format!("unknown column {c}")))?;
+                                        .map_err(|_| BasinError::UndefinedColumn(c.to_string()))?;
                                     idxs.push(i);
                                 }
                                 // Project each decoded memtable batch.
@@ -3120,8 +3200,11 @@ async fn execute_simple_select_inner(
         // Shard correctness mirrors the `had_pk_probe` branch: the top-of-fn
         // `flush_to_parquet()` drained the shard tail to cold files and the
         // engine memtable was probed, so reading `live_paths` directly (instead
-        // of `handle.read`) is sound — and `keyset_per_file_limit` is only
-        // `Some` when there are no live tombstones / UPDATE overlays.
+        // of `handle.read`) is sound. Live tombstone / UPDATE overlays are
+        // handled by the merge-on-read step below the branch — the per-file
+        // limit already carries `overlay_slack` extra rows so suppression
+        // cannot leave a shortfall (see the eligibility guard note above).
+        sess.engine.note_keyset_fast_select();
         use futures::StreamExt;
         let mut keyset_opts = opts.clone();
         keyset_opts.limit = Some(per_file_limit);
@@ -3159,9 +3242,15 @@ async fn execute_simple_select_inner(
         //
         // Hot-tier correctness is untouched: this prunes/short-circuits the
         // COLD file set only. The shard tail was flushed to cold files at the
-        // top of the fn (so those rows ARE in `live_paths`/zone maps), and
-        // `keyset_per_file_limit` is only `Some` when there are no live
-        // tombstone/UPDATE overlays (post_read_shrinking gate above).
+        // top of the fn (so those rows ARE in `live_paths`/zone maps). Live
+        // tombstone/UPDATE overlays are tolerated: `per_file_limit` carries
+        // `overlay_slack` extra rows, so even though the collected `keys`
+        // include rows the merge below may suppress, at least
+        // `limit + offset` of the `per_file_limit` smallest collected keys
+        // survive — the stop test `next_min > kth(per_file_limit)` therefore
+        // still proves no later file can contribute to the surviving
+        // top-`(limit+offset)`. Appended override rows enter the final sort
+        // independent of this traversal.
         let ordered_disjoint: Option<Vec<(object_store::path::Path, i64, i64)>> =
             keyset_zone_maps.as_ref().and_then(|zm| {
                 let mut v: Vec<(object_store::path::Path, i64, i64)> =
@@ -3274,20 +3363,24 @@ async fn execute_simple_select_inner(
             }
             all
         }
-    } else if pushdown_limit.is_some()
+    } else if unordered_limit_target.is_some()
         && !had_pk_probe
         && !shadow_cols_present
         && pinned.is_none()
         && !live_paths.is_empty()
     {
-        // ── Unordered-LIMIT early exit: one file at a time, stop at k rows ───
+        // ── Unordered-LIMIT early exit: one file at a time, stop at target ───
         //
         // Shape: `SELECT … FROM t [WHERE cheap-pushdown-preds] LIMIT k` with NO
-        // ORDER BY. `pushdown_limit` is `Some` only when there is no ORDER BY,
-        // no aggregate, and no post-read shrinking step (no IS NULL / IN-list
-        // post-filter and NO live tombstone / UPDATE overlay for this table) —
-        // so every row the storage read emits is a final result row and the
-        // first `k` of them are a complete, correct answer.
+        // ORDER BY. `unordered_limit_target` is `Some` only when there is no
+        // ORDER BY, no aggregate, and no IS NULL / IN-list post-filter. With
+        // no live overlay the target is exactly `k` and every row the storage
+        // read emits is a final result row. With a live (mergeable) overlay
+        // the target is `k + overlay_slack`: suppression below removes at
+        // most `overlay_slack` of the collected rows (one per overlay key),
+        // so at least `k` survive whenever `k` matching cold rows exist in
+        // the traversed prefix — and the appended override rows only add
+        // matches. `apply_limit` trims the merged result to exactly `k`.
         //
         // Why not the multi-path read below: `read_paths_with_schema` over ALL
         // candidate paths drives its per-file opens through `buffered(4)`, and
@@ -3306,10 +3399,10 @@ async fn execute_simple_select_inner(
         //
         // Correctness gates (ANY doubt ⇒ this branch is skipped and today's
         // path runs unchanged):
-        //   * Overlay: `pushdown_limit` is `None` whenever `overlay_active`
-        //     (live tombstones / UPDATE overrides could suppress an admitted
-        //     row, leaving a shortfall whose backfill lives past the cut) — so
-        //     reaching here proves the cold rows are final.
+        //   * Overlay: tolerated via the `overlay_slack` inflation baked into
+        //     `unordered_limit_target` (see its definition); a NON-mergeable
+        //     overlay (multi-column PK — never produced today) keeps the
+        //     target `None` and skips the branch.
         //   * Hot tail: `shard.flush_to_parquet()` ran at the top of this fn
         //     BEFORE `meta`/`live_files` were loaded, so every pre-statement
         //     tail row is in `live_paths`. Rows arriving mid-statement are
@@ -3317,13 +3410,15 @@ async fn execute_simple_select_inner(
         //     that already read `live_paths` directly instead of `handle.read`.
         //   * Hot memtable: any-Eq point shapes were probed above (a hit
         //     returned early); non-probe shapes never saw memtable rows on
-        //     this path before either (only the overlay merge below, which is
-        //     gated empty here) — no new under-count.
+        //     this path before either (only the overlay merge below, which
+        //     appends/suppresses from the snapshots captured above) — no new
+        //     under-count.
         //   * `had_pk_probe` / `shadow_cols_present` / `pinned` keep their own
         //     dedicated branch below; `LIMIT 0` collects nothing and returns
         //     empty (same answer `apply_limit` would produce).
+        sess.engine.note_unordered_limit_fast_select();
         use futures::StreamExt;
-        let k = pushdown_limit.expect("guard checked pushdown_limit.is_some()");
+        let k = unordered_limit_target.expect("guard checked unordered_limit_target.is_some()");
         let storage = &sess.engine.config().storage;
         let mut all: Vec<RecordBatch> = Vec::new();
         let mut collected: usize = 0;
@@ -3333,7 +3428,8 @@ async fn execute_simple_select_inner(
             }
             // Remaining-limit pushdown: the single-path stream slices its
             // boundary batch to exactly `k - collected` rows and stops, so
-            // `collected` can never overshoot `k`.
+            // `collected` can never overshoot `k` (the slack-inflated target;
+            // `apply_limit` below the overlay merge trims to the user LIMIT).
             let mut file_opts = opts.clone();
             file_opts.limit = Some(k - collected);
             let stream = storage
@@ -3480,27 +3576,21 @@ async fn execute_simple_select_inner(
         batches
     } else if meta.pk_columns.len() == 1 {
         let pk_col = &meta.pk_columns[0];
-        let registry = sess.engine.memtable_registry();
-        let tombs = crate::hot_tombstone::snapshot_tombstones(
-            registry.as_ref(),
-            &sess.project,
-            &plan.table,
-            // Under a pin: drop post-pin tombstones (seq > watermark) so a
-            // concurrent DELETE does NOT suppress this tx's pinned cold row.
-            hot_watermark,
-        );
-        // Merge-on-read UPDATE overlay for the hot-tier fast path: drop cold
-        // rows whose PK has an `Update` override and append the post-SET rows.
-        // Mirrors the `UpdateOverlayExec` wrap on the DataFusion read path so
-        // a fast-path UPDATE is visible to bulk fast-path SELECTs too.
-        let updates = crate::hot_tombstone::snapshot_updates(
-            registry.as_ref(),
-            &sess.project,
-            &plan.table,
-            // Under a pin: drop post-pin overrides (seq > watermark) so a
-            // concurrent UPDATE does NOT override this tx's pinned cold row.
-            hot_watermark,
-        );
+        // Reuse the overlay snapshots captured at the top of the statement
+        // (before the limit-pushdown decisions). This keeps the keyset /
+        // unordered-LIMIT `overlay_slack` bound exact — the merge applied
+        // here can never be LARGER than the snapshot the slack was sized
+        // from — and makes the statement's overlay view a single point in
+        // time (an overlay write landing mid-read is not part of this
+        // statement, exactly like a cold row landing mid-scan). Under a pin
+        // the snapshots were already watermark-filtered (post-pin
+        // tombstones/overrides dropped so a concurrent DELETE/UPDATE does
+        // NOT suppress/override this tx's pinned cold row). The UPDATE
+        // overlay merge mirrors the `UpdateOverlayExec` wrap on the
+        // DataFusion read path so a fast-path UPDATE is visible to bulk
+        // fast-path SELECTs too.
+        let tombs = overlay_tombs;
+        let updates = overlay_updates;
         if tombs.is_empty() && updates.is_empty() {
             batches
         } else if let Ok(pk_idx) = meta.schema.index_of(pk_col) {
@@ -3630,7 +3720,7 @@ async fn execute_simple_select_inner(
                         .iter()
                         .map(|c| {
                             meta.schema.index_of(c).map_err(|_| {
-                                BasinError::InvalidSchema(format!("unknown column {c}"))
+                                BasinError::UndefinedColumn(c.to_string())
                             })
                         })
                         .collect::<Result<_>>()?;
@@ -3721,7 +3811,7 @@ fn build_computed_schema(
             ProjectionItem::Column(c) => {
                 let idx = table_schema
                     .index_of(c)
-                    .map_err(|_| BasinError::InvalidSchema(format!("unknown column {c}")))?;
+                    .map_err(|_| BasinError::UndefinedColumn(c.to_string()))?;
                 fields.push(table_schema.field(idx).clone().into());
             }
             ProjectionItem::Computed {

@@ -24,7 +24,7 @@
 //! |------------------------------------|---------|--------------------------------------|
 //! | `BASIN_OVERLAY_RECONCILE_SECS`     | 5       | tick cadence; `0` disables the task  |
 //! | `BASIN_OVERLAY_RECONCILE_BYTES`    | 8 MiB   | dirty-overlay bytes trigger          |
-//! | `BASIN_OVERLAY_RECONCILE_AGE_SECS` | 60      | oldest-entry age trigger             |
+//! | `BASIN_OVERLAY_RECONCILE_AGE_SECS` | 15      | oldest-entry age trigger             |
 //!
 //! The count trigger is `pending > BASIN_DELTA_UPDATE_MAX_KEYS / 2` (default
 //! 10_000 / 2 — mirrors `dml_mutate::DELTA_UPDATE_MAX_KEYS_DEFAULT`, the cap
@@ -76,7 +76,19 @@ pub const DEFAULT_BYTES_THRESHOLD: u64 = 8 * 1024 * 1024;
 
 /// Default oldest-entry age threshold, seconds.
 /// `BASIN_OVERLAY_RECONCILE_AGE_SECS` overrides.
-pub const DEFAULT_AGE_SECS: u64 = 60;
+///
+/// Lowered 60 → 15 (small-overlay read-tax fix): a small-but-present overlay
+/// (e.g. 10 tombstones from a bounded DELETE) never crosses the bytes/count
+/// triggers, so the age trigger is its ONLY drain path — and while it waits,
+/// every read of the table pays the overlay tax AND the overlay-gated fast
+/// paths (keyset / unordered-LIMIT pushdown, GIN file pruning, posting-probe
+/// short-circuits) stay disabled. Materializing a handful of entries is one
+/// narrowed rewrite (cheap); the worst-case churn is one such rewrite per
+/// 15s+tick per actively-written table, which is comparable to the
+/// background flush cadence. `oldest_row_age` can OVERSTATE the dirty age
+/// (it tracks any resident entry, including clean retained rows) — that only
+/// makes a drain happen sooner, which is wasteful-but-safe (see module docs).
+pub const DEFAULT_AGE_SECS: u64 = 15;
 
 /// Mirrors `dml_mutate::DELTA_UPDATE_MAX_KEYS_DEFAULT` (private to that
 /// module): the delta-UPDATE cardinality cap that sizes the largest

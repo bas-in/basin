@@ -343,12 +343,14 @@ async fn scale_invariants() {
 
     // ── 8. Keyset pagination page ────────────────────────────────────────────
     // Classic OLTP "next page" via WHERE id > cursor ORDER BY id LIMIT N.
-    // The keyset per-file-limit pushdown correctly DISABLES itself when the
-    // table has live hot-tier overlays (an overlay could shadow rows the
-    // truncated per-file read skipped), and by this point `t` carries
-    // overlays from the UPDATE/RMW/DELETE sections above. The invariant is
-    // therefore asserted on a CLEAN second table — the production shape it
-    // guarantees (paginating a table that isn't mid-mutation).
+    // The keyset per-file-limit pushdown now TOLERATES live hot-tier overlays
+    // (the per-file head limit is inflated by the overlay key count, so
+    // merge-on-read suppression cannot leave a shortfall), but `t` carries an
+    // overlay of arbitrary size from the UPDATE/RMW/DELETE sections above,
+    // which would loosen the decode-bound arithmetic below. The invariant is
+    // therefore asserted on a CLEAN second table, where the per-file limit is
+    // exactly the page size — the tight production bound. (Overlay-tolerant
+    // keyset correctness + engagement is pinned in `pagination_residuals`.)
     sess.execute("CREATE TABLE t_keyset (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
         .await
         .unwrap();

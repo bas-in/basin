@@ -822,9 +822,11 @@ impl GinIndexRegistry {
     /// replacement file's entries.
     ///
     /// After rebuilding, `new_file_path` is marked as fully indexed so the
-    /// completeness guard remains valid for file-level pruning.
-    ///
-    /// Silently skips non-JSONB (non-LargeBinary) columns.
+    /// completeness guard remains valid for file-level pruning. A replacement
+    /// file with zero rows (or an all-NULL JSONB column) is marked too: its
+    /// empty posting set is exact, so pruning it on a probe miss is sound.
+    /// Marking is withheld only when rows exist whose column could not be
+    /// processed (absent from the batch schema / non-LargeBinary type).
     pub fn rebuild_file_entries(
         &self,
         project: &ProjectId,
@@ -835,14 +837,29 @@ impl GinIndexRegistry {
         new_file_path: &str,
     ) {
         use arrow_array::Array;
-        let mut indexed_any = false;
+        // Completeness decision: the new file may be marked fully indexed
+        // unless some batch carries ROWS whose JSONB column we could not
+        // process (column absent from the batch schema, or an unexpected
+        // physical type) — claiming coverage there would let the probe prune
+        // a file holding unindexed values (a false negative). Crucially, a
+        // replacement file with ZERO rows, or whose JSONB column is entirely
+        // NULL, IS fully indexed: its (empty) posting set is exact — a probe
+        // for any term correctly never lists it. The old `indexed_any` flag
+        // (set only after downcasting at least one batch's column) left such
+        // files permanently OUT of the completeness set, breaking file-level
+        // pruning for the whole table forever after e.g. a CoW rewrite that
+        // emptied a file.
+        let mut coverage_ok = true;
         for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
             let Ok(col_idx) = batch.schema().index_of(col) else {
+                coverage_ok = false;
                 continue;
             };
             let col_arr = batch.column(col_idx);
             if let Some(arr) = col_arr.as_any().downcast_ref::<arrow_array::LargeBinaryArray>() {
-                indexed_any = true;
                 for row in 0..arr.len() {
                     if arr.is_null(row) {
                         continue;
@@ -858,12 +875,14 @@ impl GinIndexRegistry {
                         row as u64,
                     );
                 }
+            } else {
+                // Rows exist but the column's physical type is not the JSONB
+                // LargeBinary encoding — we indexed nothing for them, so we
+                // cannot claim coverage.
+                coverage_ok = false;
             }
         }
-        // Mark the new file as fully indexed only when the column was found
-        // and processed.  If the column was absent (wrong schema), we cannot
-        // claim coverage and leave the completeness set unchanged.
-        if indexed_any {
+        if coverage_ok {
             self.mark_file_indexed(project, table, col, new_file_path);
         }
     }
@@ -3710,6 +3729,75 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// A replacement file with ZERO rows (empty batch set, or zero-row /
+    /// all-NULL batches) must still be marked fully indexed: its empty
+    /// posting set is exact, so the completeness guard stays valid and
+    /// file-level pruning keeps working for the rest of the table. The old
+    /// `indexed_any` flag left such files permanently un-indexed —
+    /// a permanent completeness break after any CoW rewrite that emptied a
+    /// file's JSONB column. Conversely, a batch with ROWS whose column is
+    /// absent must withhold the mark (coverage cannot be claimed).
+    #[test]
+    fn rebuild_file_entries_zero_row_replacement_is_marked_indexed() {
+        use arrow_array::{Int64Array, LargeBinaryArray, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let registry = GinIndexRegistry::new();
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+
+        // Empty batch set — e.g. a CoW replacement whose every row was
+        // deleted. Must be marked (empty posting set is sound).
+        registry.rebuild_file_entries(
+            &project, &table, "payload", "jsonb_ops", &[], "empty.parquet",
+        );
+        assert!(
+            registry
+                .indexed_files_for(&project, &table, "payload")
+                .contains("empty.parquet"),
+            "zero-batch replacement file must be in the completeness set"
+        );
+
+        // All-NULL JSONB column with rows — also exact (NULLs are never
+        // indexed and never match containment); must be marked.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::LargeBinary,
+            true,
+        )]));
+        let arr = LargeBinaryArray::from_opt_vec(vec![None, None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        registry.rebuild_file_entries(
+            &project, &table, "payload", "jsonb_ops", &[batch], "nulls.parquet",
+        );
+        assert!(
+            registry
+                .indexed_files_for(&project, &table, "payload")
+                .contains("nulls.parquet"),
+            "all-NULL replacement file must be in the completeness set"
+        );
+
+        // Rows present but the JSONB column is MISSING from the batch —
+        // coverage cannot be claimed; the mark must be withheld.
+        let other_schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let ids = Int64Array::from(vec![1i64, 2]);
+        let bad = RecordBatch::try_new(other_schema, vec![Arc::new(ids)]).unwrap();
+        registry.rebuild_file_entries(
+            &project, &table, "payload", "jsonb_ops", &[bad], "uncovered.parquet",
+        );
+        assert!(
+            !registry
+                .indexed_files_for(&project, &table, "payload")
+                .contains("uncovered.parquet"),
+            "a file with rows whose column was not indexed must NOT be marked"
+        );
     }
 
     // ── Capability 1 — row-group GIN prune helper ────────────────────────────

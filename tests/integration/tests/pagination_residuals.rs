@@ -444,6 +444,185 @@ async fn keyset_with_offset_skips_window_prefix() {
     assert_eq!(got, want, "keyset+offset must skip the first 25 of the window");
 }
 
+// ── 4. Small live overlay no longer disables the LIMIT pushdowns ────────────────
+//
+// A handful of hot-tier UPDATE overrides / DELETE tombstones used to flip
+// `post_read_shrinking` and silently demote keyset + unordered-LIMIT to the
+// unbounded full-file read until the overlay drained. The per-file limits now
+// carry `overlay_slack = |tombstones| + |updates|` extra rows instead, so the
+// fast paths stay engaged AND exact. These tests pin both halves: the result
+// is byte-correct under live overlay activity, and the engine counters prove
+// the pushdown branch actually served the query.
+
+/// Build an engine whose background overlay reconciler is DISABLED, so the
+/// overlay planted by the test deterministically survives until the asserts
+/// run (the default age trigger could otherwise drain it mid-test on a slow
+/// box). Env is read once at `Engine::new`, so set/restore tightly around it.
+fn engine_in_no_reconcile(dir: &TempDir) -> Engine {
+    let prev = std::env::var("BASIN_OVERLAY_RECONCILE_SECS").ok();
+    std::env::set_var("BASIN_OVERLAY_RECONCILE_SECS", "0");
+    let eng = engine_in(dir);
+    match prev {
+        Some(v) => std::env::set_var("BASIN_OVERLAY_RECONCILE_SECS", v),
+        None => std::env::remove_var("BASIN_OVERLAY_RECONCILE_SECS"),
+    }
+    eng
+}
+
+/// Overlay entry counts for `paging` — proves the fast-path DELETE/UPDATE
+/// actually parked overlay entries (vs. silently taking the cold path, which
+/// would make these tests vacuous).
+fn paging_overlay_counts(eng: &Engine, project: basin_common::ProjectId) -> (u64, u64) {
+    let table = basin_common::TableName::new("paging").unwrap();
+    match eng.memtable_registry().get(&project, &table) {
+        Some(e) => (e.memtable.update_count(), e.memtable.tombstone_count()),
+        None => (0, 0),
+    }
+}
+
+/// Keyset pagination with LIVE overlay activity (tombstones + UPDATE
+/// overrides inside the window) must stay exact AND keep the per-file-LIMIT
+/// branch engaged (counter proof).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keyset_engages_and_stays_exact_with_live_overlay() {
+    const N: i64 = 50_000;
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in_no_reconcile(&dir);
+    let sess = open(&eng).await;
+    let project = sess.project();
+    seed(&sess, N, N).await;
+
+    // Plant the overlay INSIDE the keyset window: 3 fast-path DELETE
+    // tombstones + 2 fast-path UPDATE overrides right past the cursor.
+    exec(&sess, "DELETE FROM paging WHERE id IN (25001, 25003, 25005)").await;
+    exec(&sess, "UPDATE paging SET bucket = -1 WHERE id = 25002").await;
+    exec(&sess, "UPDATE paging SET label = 'patched' WHERE id = 25004").await;
+    let (upd, tomb) = paging_overlay_counts(&eng, project);
+    assert_eq!(
+        (upd, tomb),
+        (2, 3),
+        "the DELETE/UPDATE statements must ride the hot-tier overlay fast \
+         path (otherwise this test no longer exercises the overlay-tolerant \
+         keyset read)"
+    );
+
+    let before = eng.keyset_fast_select_count();
+    let got = select_id_bucket(
+        &sess,
+        "SELECT id, bucket FROM paging WHERE id > 25000 ORDER BY id ASC LIMIT 10",
+    )
+    .await;
+    // Ground truth: ascending ids > 25000, minus the three deleted, with
+    // id=25002 carrying its overridden bucket (-1); every other row keeps
+    // bucket = id (tie_groups = N).
+    let want: Vec<(i64, i64)> = [25002, 25004, 25006, 25007, 25008, 25009, 25010, 25011, 25012, 25013]
+        .into_iter()
+        .map(|id| (id, if id == 25002 { -1 } else { id }))
+        .collect();
+    assert_eq!(
+        got, want,
+        "keyset page under live overlay must suppress tombstoned rows, \
+         surface the override value, and never under-fill"
+    );
+    assert_eq!(
+        eng.keyset_fast_select_count(),
+        before + 1,
+        "the keyset per-file-LIMIT branch must stay ENGAGED while a small \
+         overlay is live (overlay slack, not a fallback to the full read)"
+    );
+
+    // Page-walk across the overlay zone reconstructs the exact surviving
+    // sequence (no gaps, no repeats, no resurrected tombstones).
+    let mut cursor = 24_990i64;
+    let mut seen: Vec<i64> = Vec::new();
+    for _ in 0..5 {
+        let sql = format!(
+            "SELECT id, bucket FROM paging WHERE id > {cursor} ORDER BY id ASC LIMIT 7"
+        );
+        let page = select_id_bucket(&sess, &sql).await;
+        assert_eq!(page.len(), 7, "every page in this range is full");
+        for w in page.windows(2) {
+            assert!(w[0].0 < w[1].0, "page must be strictly ascending");
+        }
+        cursor = page.last().unwrap().0;
+        seen.extend(page.iter().map(|(id, _)| *id));
+    }
+    let want_walk: Vec<i64> = (24_991..=25_028)
+        .filter(|id| ![25001, 25003, 25005].contains(id))
+        .collect();
+    assert_eq!(
+        seen, want_walk,
+        "page walk across the overlay zone must match the surviving id set"
+    );
+}
+
+/// Unordered `LIMIT k` with LIVE overlay activity that bites inside the
+/// scanned prefix (tombstones on matching rows, an override that LEAVES the
+/// match set, an override that JOINS it) must still return exactly `k`
+/// matching rows — and keep the early-exit branch engaged (counter proof).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limit_no_order_engages_and_stays_exact_with_live_overlay() {
+    const N: i64 = 50_000;
+    const TIE_GROUPS: i64 = 10; // bucket = id % 10; 5_000 matches for bucket=3
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in_no_reconcile(&dir);
+    let sess = open(&eng).await;
+    let project = sess.project();
+    seed(&sess, N, TIE_GROUPS).await;
+
+    // Overlay biting the earliest-id matches (the first file's head):
+    //   * ids 3, 13, 23  (bucket 3)  → tombstoned;
+    //   * id 33          (bucket 3)  → override moves it OUT of the match set;
+    //   * id 41          (bucket 1)  → override moves it INTO the match set;
+    //   * id 43          (bucket 3)  → override keeps it matching (label only).
+    exec(&sess, "DELETE FROM paging WHERE id IN (3, 13, 23)").await;
+    exec(&sess, "UPDATE paging SET bucket = 4 WHERE id = 33").await;
+    exec(&sess, "UPDATE paging SET bucket = 3 WHERE id = 41").await;
+    exec(&sess, "UPDATE paging SET label = 'zz' WHERE id = 43").await;
+    let (upd, tomb) = paging_overlay_counts(&eng, project);
+    assert_eq!(
+        (upd, tomb),
+        (3, 3),
+        "the DELETE/UPDATE statements must ride the hot-tier overlay fast path"
+    );
+
+    let limit = 100usize;
+    let before = eng.unordered_limit_fast_select_count();
+    let got = select_id_bucket(
+        &sess,
+        &format!("SELECT id, bucket FROM paging WHERE bucket = 3 LIMIT {limit}"),
+    )
+    .await;
+    assert_eq!(
+        got.len(),
+        limit,
+        "must return exactly {limit} rows — overlay suppression must never \
+         leave a shortfall while more matches exist"
+    );
+    assert!(
+        got.iter().all(|(_, b)| *b == 3),
+        "every returned row must satisfy bucket = 3 (override re-check included)"
+    );
+    for banned in [3i64, 13, 23, 33] {
+        assert!(
+            !got.iter().any(|(id, _)| *id == banned),
+            "id {banned} was tombstoned / moved out of the match set and must \
+             not appear"
+        );
+    }
+    let mut ids: Vec<i64> = got.iter().map(|(id, _)| *id).collect();
+    let total = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(total, ids.len(), "no duplicate rows under LIMIT with overlay");
+    assert_eq!(
+        eng.unordered_limit_fast_select_count(),
+        before + 1,
+        "the unordered-LIMIT early-exit branch must stay ENGAGED while a \
+         small overlay is live"
+    );
+}
+
 // ── Timing prints (ignored; run explicitly on an idle box) ──────────────────────
 
 const TIMING_N: i64 = 200_000;
