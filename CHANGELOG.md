@@ -8,6 +8,37 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-12 — SQL compat: ALTER ADD UNIQUE, typed timestamptz binds, 42883/42703
+
+### Added
+
+- **`ALTER TABLE … ADD CONSTRAINT <name> UNIQUE (cols)`** — the post-hoc
+  multi-column UNIQUE addition Django's schema editor emits for
+  `unique_together` (previously a 42601 reject). The engine
+  backfill-validates the existing rows with a projection-pushdown distinct
+  scan (duplicates reject the ALTER with SQLSTATE 23505,
+  `could not create unique constraint …`), registers the named
+  `UniqueConstraint` in the catalog, and subsequent INSERT / UPDATE
+  enforcement rides the same machinery as a CREATE-time `UNIQUE (cols)`.
+  Unnamed `ADD UNIQUE (col)` synthesises the PG-convention
+  `<table>_<col>_key` name; `DROP CONSTRAINT` already removed UNIQUE
+  entries and still does.
+- **Typed TIMESTAMPTZ bind parameters** — extended-protocol timestamptz
+  binds (tokio-postgres `SystemTime` / `chrono::DateTime<Utc>`, binary or
+  text format) decode to a dedicated `ScalarParam::Timestamptz`
+  (Unix-epoch micros) and render as a canonical `'…+00'::timestamptz`
+  literal through the bind-direct INSERT fast path, the AST substitution,
+  and the text route — microsecond-lossless on all three.
+
+### Fixed
+
+- **Missing-function / missing-column SQLSTATEs** — planning errors for an
+  unknown function now surface as 42883 (`function <name> does not exist`)
+  and for an unknown column as 42703 (`column "<name>" does not exist`)
+  instead of the XX000 internal bucket, mirroring the existing 42P01
+  missing-relation seam (psycopg/asyncpg raise their dedicated
+  `UndefinedFunction` / `UndefinedColumn` classes on these codes).
+
 ## 2026-06-11 — FTS: GIN-on-tsvector pruning hardened (5.20.E), to_tsquery stemming
 
 ### Added

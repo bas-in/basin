@@ -1668,7 +1668,9 @@ name = "basinctl"
 version = "0.1.9"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
+ "futures",
  "tokio",
  "tokio-postgres",
 ]
