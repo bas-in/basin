@@ -11,16 +11,32 @@
 //! - `array_agg(expr ORDER BY sortkey [ASC|DESC])` — Basin overrides
 //!   DataFusion's builtin `array_agg` with [`PgArrayAggUdaf`], a thin wrapper
 //!   that delegates every path to the builtin **except** the non-DISTINCT
-//!   `ORDER BY` path, which it serves with a vectorized accumulator
-//!   ([`OrderedArrayAggAccumulator`]).  The builtin
-//!   `OrderSensitiveArrayAggAccumulator` materialises one `ScalarValue` per
-//!   row plus a `Vec<ScalarValue>` of sort keys per row and sorts via
-//!   row-at-a-time `compare_rows`; at 1M rows that per-row scalar-tree work
-//!   made `ARRAY_AGG(x ORDER BY y)` ~6.5x slower than Postgres.  The
-//!   replacement buffers whole Arrow array chunks and defers everything to
-//!   evaluation time: `concat` + `lexsort_to_indices` + `take`.  Output
-//!   format (a single-row `List` scalar with a nullable `item` field) is
-//!   identical to the builtin.
+//!   `ORDER BY` path.  The builtin `OrderSensitiveArrayAggAccumulator`
+//!   materialises one `ScalarValue` per row plus a `Vec<ScalarValue>` of sort
+//!   keys per row and sorts via row-at-a-time `compare_rows`; at 1M rows that
+//!   per-row scalar-tree work made `ARRAY_AGG(x ORDER BY y)` ~6.5x slower than
+//!   Postgres.
+//!
+//!   This path is served two ways, both producing the byte-identical output
+//!   (a single-row `List` scalar with a nullable `item` field) and the same
+//!   `[List<item>, List<Struct<ordering>>]` partial state as the builtin:
+//!   * **Grouped scan (the benchmark shape, `GROUP BY ...`)** —
+//!     [`OrderedArrayAggGroupsAccumulator`], a true vectorized
+//!     [`GroupsAccumulator`].  DataFusion would otherwise wrap a per-group
+//!     `Accumulator` in `GroupsAccumulatorAdapter`, which slices every input
+//!     batch once per group and dispatches `update_batch` per group — the
+//!     dominant cost at 1M rows / many groups.  The GroupsAccumulator instead
+//!     buffers whole Arrow chunks plus `(group, row)` entries (O(1) per batch)
+//!     and defers all work to `evaluate`: one global `lexsort_to_indices` keyed
+//!     on `[group_index, sortkeys...]` (rows come out grouped *and* ordered in
+//!     a single vectorized sort), a counting pass for list offsets, and one
+//!     `take`.  `groups_accumulator_supported` returns this path only for
+//!     non-DISTINCT, non-IGNORE-NULLS, non-nested sort keys; everything else
+//!     falls back below.
+//!   * **Single group / no GROUP BY** — [`OrderedArrayAggAccumulator`], the
+//!     equivalent per-group `Accumulator` (`concat` + `lexsort_to_indices` +
+//!     `take` at evaluate).  Also the fallback for exotic shapes the
+//!     GroupsAccumulator opts out of.
 //!
 //! ## Ordered-set aggregates (exact, Postgres-compatible)
 //! - `percentile_disc(f) WITHIN GROUP (ORDER BY expr)` — exact discrete
@@ -45,10 +61,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    new_empty_array, Array, ArrayRef, LargeBinaryArray, ListArray, StringArray, StructArray,
-    UInt32Array,
+    new_empty_array, Array, ArrayRef, BooleanArray, LargeBinaryArray, ListArray, NullBufferBuilder,
+    StringArray, StructArray, UInt32Array,
 };
-use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use datafusion::arrow::compute::{concat, lexsort_to_indices, take, SortColumn, SortOptions};
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields};
@@ -57,7 +73,7 @@ use datafusion::common::{exec_err, plan_err, Result as DFResult};
 use datafusion::functions_aggregate::array_agg::ArrayAgg;
 use datafusion::logical_expr::{
     function::{AccumulatorArgs, StateFieldsArgs},
-    AggregateUDFImpl, ColumnarValue, Signature, Volatility,
+    AggregateUDFImpl, ColumnarValue, EmitTo, GroupsAccumulator, Signature, Volatility,
 };
 use datafusion::scalar::ScalarValue;
 use serde_json::Value as JValue;
@@ -545,7 +561,16 @@ impl AggregateUDFImpl for PgArrayAggUdaf {
         self.inner.supports_null_handling_clause()
     }
 
+    /// The fast `ORDER BY` path supports a true vectorized
+    /// [`GroupsAccumulator`] for the same shapes the per-group
+    /// [`OrderedArrayAggAccumulator`] handles: non-DISTINCT, non-IGNORE-NULLS,
+    /// with non-nested (lexsort-able) sort keys.  For the plain unordered /
+    /// DISTINCT shapes we defer to the builtin's decision (it ships its own
+    /// `ArrayAggGroupsAccumulator` for the unordered case).
     fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
+        if ordered_fast_path_fields(&args).is_some() {
+            return true;
+        }
         self.inner.groups_accumulator_supported(args)
     }
 
@@ -553,6 +578,13 @@ impl AggregateUDFImpl for PgArrayAggUdaf {
         &self,
         args: AccumulatorArgs,
     ) -> DFResult<Box<dyn datafusion::logical_expr::GroupsAccumulator>> {
+        if let Some((ordering_fields, sort_options)) = ordered_fast_path_fields(&args) {
+            return Ok(Box::new(OrderedArrayAggGroupsAccumulator::new(
+                args.expr_fields[0].data_type().clone(),
+                ordering_fields,
+                sort_options,
+            )));
+        }
         self.inner.create_groups_accumulator(args)
     }
 
@@ -561,36 +593,51 @@ impl AggregateUDFImpl for PgArrayAggUdaf {
         args: AccumulatorArgs,
     ) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
         let field = &args.expr_fields[0];
-        let ignore_nulls = args.ignore_nulls && field.is_nullable();
-        if args.is_distinct || args.order_bys.is_empty() || ignore_nulls {
-            // DISTINCT / unordered / IGNORE NULLS: builtin accumulators are
-            // either already vectorized or rare enough not to matter.  The
-            // state layout matches because `state_fields` is delegated too.
-            return self.inner.accumulator(args);
+        match ordered_fast_path_fields(&args) {
+            Some((ordering_fields, sort_options)) => Ok(Box::new(OrderedArrayAggAccumulator::new(
+                field.data_type().clone(),
+                ordering_fields,
+                sort_options,
+            ))),
+            // DISTINCT / unordered / IGNORE NULLS / nested sort keys: builtin
+            // accumulators are either already vectorized or rare enough not to
+            // matter.  The state layout matches because `state_fields` is
+            // delegated too.
+            None => self.inner.accumulator(args),
         }
-
-        let mut sort_options = Vec::with_capacity(args.order_bys.len());
-        let mut ordering_fields: Vec<FieldRef> = Vec::with_capacity(args.order_bys.len());
-        for sort_expr in args.order_bys {
-            let dt = sort_expr.expr.data_type(args.schema)?;
-            if dt.is_nested() {
-                // `lexsort_to_indices` does not support nested sort keys;
-                // the builtin's row-wise comparator does. Rare shape — keep
-                // the builtin behaviour rather than erroring.
-                return self.inner.accumulator(args);
-            }
-            sort_options.push(sort_expr.options);
-            // Field naming must mirror DataFusion's `ordering_fields` helper
-            // (expr.to_string(), nullable) so the emitted state structs match
-            // the schema declared by the delegated `state_fields`.
-            ordering_fields.push(Arc::new(Field::new(sort_expr.expr.to_string(), dt, true)));
-        }
-        Ok(Box::new(OrderedArrayAggAccumulator::new(
-            field.data_type().clone(),
-            ordering_fields,
-            sort_options,
-        )))
     }
+}
+
+/// Returns `Some((ordering_fields, sort_options))` when `args` describes the
+/// fast non-DISTINCT `ORDER BY` `array_agg` path that Basin serves with its
+/// own vectorized accumulators, or `None` to defer to the DataFusion builtin.
+///
+/// `None` is returned for: no ORDER BY, DISTINCT, IGNORE NULLS, or any nested
+/// (`List`/`Struct`/…) sort key — `lexsort_to_indices` cannot order nested
+/// keys, but the builtin's row-wise comparator can.
+///
+/// `ordering_fields` are named exactly like DataFusion's `ordering_fields`
+/// helper (`expr.to_string()`, nullable) so the emitted partial-state struct
+/// columns match the schema declared by the delegated `state_fields`.
+fn ordered_fast_path_fields(
+    args: &AccumulatorArgs,
+) -> Option<(Vec<FieldRef>, Vec<SortOptions>)> {
+    let field = &args.expr_fields[0];
+    let ignore_nulls = args.ignore_nulls && field.is_nullable();
+    if args.is_distinct || args.order_bys.is_empty() || ignore_nulls {
+        return None;
+    }
+    let mut sort_options = Vec::with_capacity(args.order_bys.len());
+    let mut ordering_fields: Vec<FieldRef> = Vec::with_capacity(args.order_bys.len());
+    for sort_expr in args.order_bys {
+        let dt = sort_expr.expr.data_type(args.schema).ok()?;
+        if dt.is_nested() {
+            return None;
+        }
+        sort_options.push(sort_expr.options);
+        ordering_fields.push(Arc::new(Field::new(sort_expr.expr.to_string(), dt, true)));
+    }
+    Some((ordering_fields, sort_options))
 }
 
 /// Build the single-row `List` scalar shape that `array_agg` results and
@@ -807,6 +854,479 @@ impl datafusion::logical_expr::Accumulator for OrderedArrayAggAccumulator {
         }
         Ok(())
     }
+}
+
+/// Vectorized [`GroupsAccumulator`] for `array_agg(expr ORDER BY keys...)` in a
+/// grouped (`GROUP BY`) scan.
+///
+/// # Why this exists
+/// Without a `GroupsAccumulator`, DataFusion serves a grouped ordered
+/// `array_agg` by wrapping [`OrderedArrayAggAccumulator`] in
+/// `GroupsAccumulatorAdapter`.  The adapter, for every input batch, slices the
+/// batch once per group it touches and calls `update_batch` per group — so the
+/// per-row/per-group dispatch cost grows with both row count and group count.
+/// At the 1M-row benchmark shape (`ARRAY_AGG(status ORDER BY created_at DESC)
+/// GROUP BY user_id`) that adapter overhead dominated.
+///
+/// # Strategy (mirrors the builtin `ArrayAggGroupsAccumulator`, plus ordering)
+/// `update_batch` is O(1) Arc clones plus one `(group, row)` entry per row.
+/// All real work is deferred to `evaluate`/`state`:
+/// 1. `interleave` the buffered value column and each ordering column down to
+///    just the rows of the groups being emitted, in entry order, building a
+///    parallel `group_id` column.
+/// 2. one global `lexsort_to_indices` keyed on `[group_id ASC, sortkeys...]`
+///    (NULLS-first defaults for the synthetic group key never matter — group
+///    ids are non-null) — a single vectorized sort yields rows that are both
+///    grouped by `group_id` *and* ordered within each group.
+/// 3. a counting pass over `group_id` builds the `ListArray` offsets + null
+///    buffer (empty groups → SQL NULL, matching PG and the builtin).
+/// 4. one `take` materialises the flat values backing array.
+///
+/// Output and partial-state layouts are byte-identical to
+/// [`OrderedArrayAggAccumulator`] / the builtin: result is `List<item>`;
+/// partial state is `[List<item>, List<Struct<ordering cols>>]` with values in
+/// arrival order (the final phase sorts once after merging).
+#[derive(Debug)]
+struct OrderedArrayAggGroupsAccumulator {
+    /// Element type of the aggregated column.
+    value_type: DataType,
+    /// Struct fields for the ordering columns in the partial state
+    /// (names/types must match the delegated `state_fields` declaration).
+    ordering_fields: Vec<FieldRef>,
+    /// Sort direction / null placement per ordering column.
+    sort_options: Vec<SortOptions>,
+    /// Buffered value chunks, in arrival order.
+    value_chunks: Vec<ArrayRef>,
+    /// Buffered ordering-column chunks; `ordering_chunks[k][j]` is ordering
+    /// column `j` of chunk `k` (same row count as `value_chunks[k]`).
+    ordering_chunks: Vec<Vec<ArrayRef>>,
+    /// `entries[k]` are the `(group_idx, row_idx)` pairs contributed by chunk
+    /// `k` (already filtered for `opt_filter`); the chunk index is implicit.
+    entries: Vec<Vec<(u32, u32)>>,
+    /// Largest `total_num_groups` seen so far.
+    num_groups: usize,
+    /// Incrementally tracked slice memory, for `size()` accounting.
+    approx_bytes: usize,
+}
+
+impl OrderedArrayAggGroupsAccumulator {
+    fn new(
+        value_type: DataType,
+        ordering_fields: Vec<FieldRef>,
+        sort_options: Vec<SortOptions>,
+    ) -> Self {
+        Self {
+            value_type,
+            ordering_fields,
+            sort_options,
+            value_chunks: vec![],
+            ordering_chunks: vec![],
+            entries: vec![],
+            num_groups: 0,
+            approx_bytes: 0,
+        }
+    }
+
+    fn clear_state(&mut self) {
+        // `size()` measures Vec capacity, so allocate fresh buffers rather than
+        // `clear()` so emitted memory is actually released back.
+        self.value_chunks = vec![];
+        self.ordering_chunks = vec![];
+        self.entries = vec![];
+        self.num_groups = 0;
+        self.approx_bytes = 0;
+    }
+
+    /// Record one buffered chunk plus its `(group, row)` entries.
+    fn push_chunk(&mut self, values: ArrayRef, ordering: Vec<ArrayRef>, entries: Vec<(u32, u32)>) {
+        // `get_slice_memory_size` counts only this slice's rows so shared
+        // parent buffers aren't multiply-counted.
+        self.approx_bytes += values.to_data().get_slice_memory_size().unwrap_or(0);
+        for col in &ordering {
+            self.approx_bytes += col.to_data().get_slice_memory_size().unwrap_or(0);
+        }
+        self.approx_bytes += entries.capacity() * std::mem::size_of::<(u32, u32)>();
+        self.value_chunks.push(values);
+        self.ordering_chunks.push(ordering);
+        self.entries.push(entries);
+    }
+
+    /// The empty `List<Struct<ordering>>` partial-state column shape used when
+    /// a group has no rows.
+    fn empty_orderings_list(&self, len: usize) -> DFResult<ArrayRef> {
+        let struct_fields = Fields::from(self.ordering_fields.clone());
+        let field = Arc::new(Field::new_list_field(
+            DataType::Struct(struct_fields),
+            true,
+        ));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32; len + 1]));
+        let empty_cols: Vec<ArrayRef> = self
+            .ordering_fields
+            .iter()
+            .map(|f| new_empty_array(f.data_type()))
+            .collect();
+        let values: ArrayRef = Arc::new(StructArray::try_new(
+            Fields::from(self.ordering_fields.clone()),
+            empty_cols,
+            None,
+        )?);
+        Ok(Arc::new(ListArray::new(field, offsets, values, None)))
+    }
+
+    /// Number of groups to emit, given `emit_to`.
+    fn emit_groups(&self, emit_to: EmitTo) -> usize {
+        match emit_to {
+            EmitTo::All => self.num_groups,
+            EmitTo::First(n) => n.min(self.num_groups),
+        }
+    }
+
+    /// Gather, for the entries belonging to groups `0..emit_groups`, the value
+    /// column, each ordering column, and a parallel `group_id` column — all in
+    /// entry order.  Returns `(group_ids, values, ordering_cols)`.
+    fn gather_emitted(
+        &self,
+        emit_groups: usize,
+    ) -> DFResult<(UInt32Array, ArrayRef, Vec<ArrayRef>)> {
+        let mut group_ids: Vec<u32> = Vec::new();
+        let mut interleave_idx: Vec<(usize, usize)> = Vec::new();
+        for (chunk_idx, ents) in self.entries.iter().enumerate() {
+            for &(g, r) in ents {
+                if (g as usize) < emit_groups {
+                    group_ids.push(g);
+                    interleave_idx.push((chunk_idx, r as usize));
+                }
+            }
+        }
+        let values = self.interleave_chunk_col(&interleave_idx, &self.value_type, |k| {
+            &self.value_chunks[k]
+        })?;
+        let mut ord_cols = Vec::with_capacity(self.sort_options.len());
+        for j in 0..self.sort_options.len() {
+            let col =
+                self.interleave_chunk_col(&interleave_idx, self.ordering_fields[j].data_type(), |k| {
+                    &self.ordering_chunks[k][j]
+                })?;
+            ord_cols.push(col);
+        }
+        Ok((UInt32Array::from(group_ids), values, ord_cols))
+    }
+
+    /// `arrow::compute::interleave` over per-chunk source arrays selected by
+    /// `pick`, using `(chunk_idx, row_idx)` pairs.  When there are no indices,
+    /// returns an empty array of `fallback_type` (used when no chunk exists to
+    /// infer the type from — `interleave` requires ≥1 source array).
+    fn interleave_chunk_col<'a>(
+        &'a self,
+        indices: &[(usize, usize)],
+        fallback_type: &DataType,
+        pick: impl Fn(usize) -> &'a ArrayRef,
+    ) -> DFResult<ArrayRef> {
+        if indices.is_empty() || self.value_chunks.is_empty() {
+            return Ok(new_empty_array(fallback_type));
+        }
+        let sources: Vec<&dyn Array> = (0..self.value_chunks.len())
+            .map(|k| pick(k).as_ref())
+            .collect();
+        Ok(datafusion::arrow::compute::interleave(&sources, indices)?)
+    }
+}
+
+impl GroupsAccumulator for OrderedArrayAggGroupsAccumulator {
+    fn update_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> DFResult<()> {
+        let n_ord = self.sort_options.len();
+        if values.len() < 1 + n_ord {
+            return exec_err!(
+                "array_agg ORDER BY: expected {} input columns, got {}",
+                1 + n_ord,
+                values.len()
+            );
+        }
+        self.num_groups = self.num_groups.max(total_num_groups);
+        let input = &values[0];
+        if input.is_empty() {
+            return Ok(());
+        }
+        // PG semantics: NULL *values* are kept (array_agg does not drop NULLs),
+        // so we never consult the value's null buffer — only `opt_filter`.
+        let mut entries = Vec::with_capacity(group_indices.len());
+        for (row_idx, &group_idx) in group_indices.iter().enumerate() {
+            if let Some(filter) = opt_filter {
+                if filter.is_null(row_idx) || !filter.value(row_idx) {
+                    continue;
+                }
+            }
+            entries.push((group_idx as u32, row_idx as u32));
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.push_chunk(
+            Arc::clone(input),
+            values[1..1 + n_ord].to_vec(),
+            entries,
+        );
+        Ok(())
+    }
+
+    fn evaluate(&mut self, emit_to: EmitTo) -> DFResult<ArrayRef> {
+        let emit_groups = self.emit_groups(emit_to);
+        let (group_ids, values, ord_cols) = self.gather_emitted(emit_groups)?;
+        let total_rows = group_ids.len();
+
+        // Sort all gathered rows by [group_id, sortkeys...] in one shot: rows
+        // come out grouped by group and ordered within each group.
+        let flat_values = if total_rows == 0 {
+            new_empty_array(&self.value_type)
+        } else {
+            let perm = self.lexsort_grouped(&group_ids, &ord_cols)?;
+            take(values.as_ref(), &perm, None)?
+        };
+
+        // Count rows per emitted group (group_ids are unsorted here, which is
+        // fine — counting is order-independent) to build list offsets + nulls.
+        let mut counts = vec![0u32; emit_groups];
+        for i in 0..total_rows {
+            counts[group_ids.value(i) as usize] += 1;
+        }
+        let (offsets, nulls) = build_list_offsets(&counts);
+
+        self.advance_state(emit_to, emit_groups);
+
+        let field = Arc::new(Field::new_list_field(self.value_type.clone(), true));
+        Ok(Arc::new(ListArray::new(field, offsets, flat_values, nulls)))
+    }
+
+    fn state(&mut self, emit_to: EmitTo) -> DFResult<Vec<ArrayRef>> {
+        let emit_groups = self.emit_groups(emit_to);
+        // Partial state emits values in *arrival* order (not sorted): the final
+        // phase's accumulator sorts once after merging.  So we do NOT lexsort
+        // here — we only counting-sort into per-group ranges.
+        let emit_g = emit_groups as u32;
+        let mut counts = vec![0u32; emit_groups];
+        for ents in &self.entries {
+            for &(g, _) in ents {
+                if g < emit_g {
+                    counts[g as usize] += 1;
+                }
+            }
+        }
+        // Prefix sum → per-group write positions (mutated as we scatter).
+        let mut wp = Vec::with_capacity(emit_groups);
+        let mut cur = 0u32;
+        for &c in &counts {
+            wp.push(cur);
+            cur += c;
+        }
+        let total_rows = cur as usize;
+
+        // Scatter entries into group order.
+        let mut interleave_idx = vec![(0usize, 0usize); total_rows];
+        for (chunk_idx, ents) in self.entries.iter().enumerate() {
+            for &(g, r) in ents {
+                if g < emit_g {
+                    let p = wp[g as usize] as usize;
+                    interleave_idx[p] = (chunk_idx, r as usize);
+                    wp[g as usize] += 1;
+                }
+            }
+        }
+
+        let (offsets, nulls) = build_list_offsets(&counts);
+
+        // Values list column.
+        let values_flat = self.interleave_chunk_col(&interleave_idx, &self.value_type, |k| {
+            &self.value_chunks[k]
+        })?;
+        let vfield = Arc::new(Field::new_list_field(self.value_type.clone(), true));
+        let values_list: ArrayRef = Arc::new(ListArray::new(
+            vfield,
+            offsets.clone(),
+            values_flat,
+            nulls.clone(),
+        ));
+
+        // Orderings list column: one Struct row per value, columns in the same
+        // group order; the list null buffer matches the values list so empty
+        // groups become NULL ordering lists too.
+        let orderings_list: ArrayRef = if self.sort_options.is_empty() {
+            self.empty_orderings_list(emit_groups)?
+        } else {
+            let mut struct_cols = Vec::with_capacity(self.sort_options.len());
+            for j in 0..self.sort_options.len() {
+                let col = self.interleave_chunk_col(
+                    &interleave_idx,
+                    self.ordering_fields[j].data_type(),
+                    |k| &self.ordering_chunks[k][j],
+                )?;
+                struct_cols.push(col);
+            }
+            let struct_fields = Fields::from(self.ordering_fields.clone());
+            let struct_arr: ArrayRef =
+                Arc::new(StructArray::try_new(struct_fields.clone(), struct_cols, None)?);
+            let sfield = Arc::new(Field::new_list_field(
+                DataType::Struct(struct_fields),
+                true,
+            ));
+            Arc::new(ListArray::new(sfield, offsets, struct_arr, nulls))
+        };
+
+        self.advance_state(emit_to, emit_groups);
+        Ok(vec![values_list, orderings_list])
+    }
+
+    fn merge_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        _opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> DFResult<()> {
+        if values.len() < 2 {
+            return exec_err!(
+                "array_agg ORDER BY merge: expected 2 state columns, got {}",
+                values.len()
+            );
+        }
+        self.num_groups = self.num_groups.max(total_num_groups);
+        let Some(vals_list) = values[0].as_any().downcast_ref::<ListArray>() else {
+            return exec_err!("array_agg ORDER BY merge: state[0] must be a List array");
+        };
+        let Some(ords_list) = values[1].as_any().downcast_ref::<ListArray>() else {
+            return exec_err!("array_agg ORDER BY merge: state[1] must be a List array");
+        };
+        // Each input row is one partial group.  Its list element holds that
+        // group's buffered values + ordering structs (in arrival order); we
+        // push them as one chunk with entries pointing at the current group.
+        for (row_idx, &group_idx) in group_indices.iter().enumerate() {
+            if vals_list.is_null(row_idx) {
+                continue;
+            }
+            let vals = vals_list.value(row_idx);
+            let len = vals.len();
+            if len == 0 {
+                continue;
+            }
+            let ords = ords_list.value(row_idx);
+            let Some(structs) = ords.as_any().downcast_ref::<StructArray>() else {
+                return exec_err!("array_agg ORDER BY merge: orderings must be Struct rows");
+            };
+            if structs.len() != len {
+                return exec_err!(
+                    "array_agg ORDER BY merge: {} values but {} ordering rows",
+                    len,
+                    structs.len()
+                );
+            }
+            let entries: Vec<(u32, u32)> =
+                (0..len as u32).map(|r| (group_idx as u32, r)).collect();
+            self.push_chunk(vals, structs.columns().to_vec(), entries);
+        }
+        Ok(())
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.approx_bytes
+            + self.value_chunks.capacity() * std::mem::size_of::<ArrayRef>()
+            + self
+                .ordering_chunks
+                .iter()
+                .map(|c| c.capacity() * std::mem::size_of::<ArrayRef>())
+                .sum::<usize>()
+            + self.entries.capacity() * std::mem::size_of::<Vec<(u32, u32)>>()
+    }
+}
+
+impl OrderedArrayAggGroupsAccumulator {
+    /// One global lexsort keyed on `[group_id ASC, sortkeys...]`.  Group ids are
+    /// never null, so the synthetic leading key needs no special null handling;
+    /// the trailing keys honour their per-column `SortOptions` (ASC/DESC,
+    /// NULLS FIRST/LAST), exactly like the per-group accumulator.
+    fn lexsort_grouped(
+        &self,
+        group_ids: &UInt32Array,
+        ord_cols: &[ArrayRef],
+    ) -> DFResult<UInt32Array> {
+        let mut sort_cols: Vec<SortColumn> = Vec::with_capacity(1 + ord_cols.len());
+        sort_cols.push(SortColumn {
+            values: Arc::new(group_ids.clone()) as ArrayRef,
+            options: Some(SortOptions {
+                descending: false,
+                nulls_first: false,
+            }),
+        });
+        for (col, opts) in ord_cols.iter().zip(self.sort_options.iter()) {
+            sort_cols.push(SortColumn {
+                values: Arc::clone(col),
+                options: Some(*opts),
+            });
+        }
+        Ok(lexsort_to_indices(&sort_cols, None)?)
+    }
+
+    /// Release/renumber state after an emit.  `EmitTo::All` resets everything;
+    /// `EmitTo::First(n)` drops emitted groups, renumbers the rest down by `n`,
+    /// and rebuilds chunks so emitted rows no longer pin buffers.
+    fn advance_state(&mut self, emit_to: EmitTo, emit_groups: usize) {
+        match emit_to {
+            EmitTo::All => self.clear_state(),
+            EmitTo::First(_) => {
+                let emit_g = emit_groups as u32;
+                let old_values = std::mem::take(&mut self.value_chunks);
+                let old_orderings = std::mem::take(&mut self.ordering_chunks);
+                let old_entries = std::mem::take(&mut self.entries);
+                self.approx_bytes = 0;
+                for ((vals, ords), ents) in old_values
+                    .into_iter()
+                    .zip(old_orderings)
+                    .zip(old_entries)
+                {
+                    let retained: Vec<(u32, u32)> = ents
+                        .into_iter()
+                        .filter(|(g, _)| *g >= emit_g)
+                        .map(|(g, r)| (g - emit_g, r))
+                        .collect();
+                    if !retained.is_empty() {
+                        // Keep the original (possibly sliced) chunk; entries
+                        // still index into it by row. Chunks fully drained are
+                        // dropped, freeing their buffers.
+                        self.push_chunk(vals, ords, retained);
+                    }
+                }
+                self.num_groups = self.num_groups.saturating_sub(emit_groups);
+            }
+        }
+    }
+}
+
+/// Build `ListArray` offsets + null buffer from per-group counts: a group with
+/// zero rows becomes a NULL list element (PG: `array_agg` over no rows is NULL,
+/// not `'{}'`), a non-empty group a non-null list of that length.
+fn build_list_offsets(counts: &[u32]) -> (OffsetBuffer<i32>, Option<NullBuffer>) {
+    let mut offsets = Vec::<i32>::with_capacity(counts.len() + 1);
+    offsets.push(0);
+    let mut nulls = NullBufferBuilder::new(counts.len());
+    let mut cur = 0i32;
+    for &c in counts {
+        if c == 0 {
+            nulls.append_null();
+        } else {
+            nulls.append_non_null();
+        }
+        cur += c as i32;
+        offsets.push(cur);
+    }
+    (
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        nulls.finish(),
+    )
 }
 
 // ── unit tests ────────────────────────────────────────────────────────────────
@@ -1620,6 +2140,281 @@ mod ordered_array_agg_tests {
                 field.name()
             );
         }
+    }
+
+    // ── GroupsAccumulator (vectorized grouped ORDER BY path) ────────────────
+    //
+    // These pin the new fast path that serves the 1M benchmark shape
+    // (`ARRAY_AGG(status ORDER BY created_at DESC) GROUP BY user_id`).  The
+    // primary correctness oracle is *differential*: the GroupsAccumulator must
+    // produce, for every group, the byte-identical `List` the per-group
+    // `OrderedArrayAggAccumulator` produces for that group's rows.
+
+    use datafusion::arrow::array::BooleanArray as ArrowBooleanArray;
+    // `EmitTo` and `GroupsAccumulator` come in via `use super::*`.
+
+    fn make_groups_acc(value_type: DataType, o: SortOptions) -> OrderedArrayAggGroupsAccumulator {
+        OrderedArrayAggGroupsAccumulator::new(
+            value_type,
+            vec![Arc::new(Field::new("created_at", DataType::Int64, true))],
+            vec![o],
+        )
+    }
+
+    /// Extract per-group `Vec<ScalarValue>` (or `None` for a NULL group) from a
+    /// `List<item>` result array.
+    fn list_groups(arr: &ArrayRef) -> Vec<Option<Vec<ScalarValue>>> {
+        let list = arr.as_any().downcast_ref::<ListArray>().expect("List result");
+        (0..list.len())
+            .map(|i| {
+                if list.is_null(i) {
+                    None
+                } else {
+                    let inner = list.value(i);
+                    Some(
+                        (0..inner.len())
+                            .map(|j| ScalarValue::try_from_array(inner.as_ref(), j).unwrap())
+                            .collect(),
+                    )
+                }
+            })
+            .collect()
+    }
+
+    /// Run the per-group accumulator on one group's rows and return its
+    /// `Vec<ScalarValue>` (or `None` for the zero-row/NULL case).
+    fn ref_group(
+        value_type: DataType,
+        o: SortOptions,
+        vals: ArrayRef,
+        keys: ArrayRef,
+    ) -> Option<Vec<ScalarValue>> {
+        let mut acc = OrderedArrayAggAccumulator::new(
+            value_type,
+            vec![Arc::new(Field::new("created_at", DataType::Int64, true))],
+            vec![o],
+        );
+        if !vals.is_empty() {
+            acc.update_batch(&[vals, keys]).unwrap();
+        }
+        match acc.evaluate().unwrap() {
+            ScalarValue::List(l) => {
+                if l.is_null(0) {
+                    None
+                } else {
+                    let inner = l.value(0);
+                    Some(
+                        (0..inner.len())
+                            .map(|j| ScalarValue::try_from_array(inner.as_ref(), j).unwrap())
+                            .collect(),
+                    )
+                }
+            }
+            other => panic!("unexpected scalar {other:?}"),
+        }
+    }
+
+    /// Differential: one batch, two groups, DESC — GroupsAccumulator output
+    /// must equal the per-group accumulator output for each group.
+    #[test]
+    fn groups_acc_two_groups_differential() {
+        let o = opts(true, true);
+        let mut acc = make_groups_acc(DataType::Utf8, o);
+        // group 0: ("a",2) ("c",1) ; group 1: ("b",4) ("d",3)
+        let vals: ArrayRef =
+            Arc::new(ArrowStringArray::from(vec![Some("a"), Some("b"), Some("c"), Some("d")]));
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![2i64, 4, 1, 3]));
+        acc.update_batch(&[vals, keys], &[0, 1, 0, 1], None, 2).unwrap();
+        let out = acc.evaluate(EmitTo::All).unwrap();
+        let got = list_groups(&out);
+
+        let g0 = ref_group(
+            DataType::Utf8,
+            o,
+            Arc::new(ArrowStringArray::from(vec![Some("a"), Some("c")])),
+            Arc::new(Int64Array::from(vec![2i64, 1])),
+        );
+        let g1 = ref_group(
+            DataType::Utf8,
+            o,
+            Arc::new(ArrowStringArray::from(vec![Some("b"), Some("d")])),
+            Arc::new(Int64Array::from(vec![4i64, 3])),
+        );
+        assert_eq!(got, vec![g0, g1], "grouped output must match per-group oracle");
+    }
+
+    /// NULL *values* are kept (PG semantics) and NULL sort keys honour
+    /// `nulls_first`; differential against the per-group accumulator.
+    #[test]
+    fn groups_acc_nulls_kept() {
+        let o = opts(false, false); // ASC NULLS LAST
+        let mut acc = make_groups_acc(DataType::Utf8, o);
+        // single group 0: ("x",NULL) (NULL,1) ("y",2)
+        let vals: ArrayRef =
+            Arc::new(ArrowStringArray::from(vec![Some("x"), None, Some("y")]));
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(1i64), Some(2)]));
+        acc.update_batch(&[Arc::clone(&vals), Arc::clone(&keys)], &[0, 0, 0], None, 1)
+            .unwrap();
+        let got = list_groups(&acc.evaluate(EmitTo::All).unwrap());
+        let oracle = ref_group(DataType::Utf8, o, vals, keys);
+        assert_eq!(got, vec![oracle]);
+        // The NULL value must still be present in the aggregate.
+        assert!(
+            got[0].as_ref().unwrap().iter().any(|s| matches!(s, ScalarValue::Utf8(None))),
+            "NULL value dropped — violates PG array_agg semantics"
+        );
+    }
+
+    /// An empty group (no rows scattered to it) must emit SQL NULL, not `'{}'`.
+    #[test]
+    fn groups_acc_empty_group_is_null() {
+        let mut acc = make_groups_acc(DataType::Int64, opts(false, false));
+        // total_num_groups=3 but only groups 0 and 2 get rows; group 1 empty.
+        let vals: ArrayRef = Arc::new(Int64Array::from(vec![10i64, 30]));
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 1]));
+        acc.update_batch(&[vals, keys], &[0, 2], None, 3).unwrap();
+        let got = list_groups(&acc.evaluate(EmitTo::All).unwrap());
+        assert_eq!(got.len(), 3);
+        assert!(got[0].is_some());
+        assert_eq!(got[1], None, "empty group 1 must be NULL");
+        assert!(got[2].is_some());
+    }
+
+    /// `opt_filter` skips rows (FILTER (WHERE ...)); Int64 values.
+    #[test]
+    fn groups_acc_opt_filter() {
+        let o = opts(false, false);
+        let mut acc = make_groups_acc(DataType::Int64, o);
+        let vals: ArrayRef = Arc::new(Int64Array::from(vec![10i64, 20, 30, 40]));
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3, 4]));
+        let filter = ArrowBooleanArray::from(vec![true, false, true, false]);
+        acc.update_batch(&[vals, keys], &[0, 0, 0, 0], Some(&filter), 1)
+            .unwrap();
+        let got = list_groups(&acc.evaluate(EmitTo::All).unwrap());
+        // Only rows 0 and 2 survive: values 10, 30 (keys 1, 3 ASC).
+        assert_eq!(
+            got,
+            vec![Some(vec![
+                ScalarValue::Int64(Some(10)),
+                ScalarValue::Int64(Some(30))
+            ])]
+        );
+    }
+
+    /// Multiple update_batch calls (group spans batches) merge into one group.
+    #[test]
+    fn groups_acc_multi_batch() {
+        let o = opts(true, true); // DESC
+        let mut acc = make_groups_acc(DataType::Int64, o);
+        acc.update_batch(
+            &[
+                Arc::new(Int64Array::from(vec![1i64, 2])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1i64, 2])) as ArrayRef,
+            ],
+            &[0, 0],
+            None,
+            1,
+        )
+        .unwrap();
+        acc.update_batch(
+            &[
+                Arc::new(Int64Array::from(vec![3i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![3i64])) as ArrayRef,
+            ],
+            &[0],
+            None,
+            1,
+        )
+        .unwrap();
+        let got = list_groups(&acc.evaluate(EmitTo::All).unwrap());
+        // keys desc 3,2,1 → values 3,2,1
+        assert_eq!(
+            got,
+            vec![Some(vec![
+                ScalarValue::Int64(Some(3)),
+                ScalarValue::Int64(Some(2)),
+                ScalarValue::Int64(Some(1)),
+            ])]
+        );
+    }
+
+    /// Partial-aggregation round trip: `state()` of a partial accumulator fed
+    /// into `merge_batch()` of a final accumulator must reproduce the direct
+    /// result.  Exercises the `[List<item>, List<Struct<ord>>]` state layout.
+    #[test]
+    fn groups_acc_state_merge_roundtrip() {
+        let o = opts(true, true); // DESC
+        // Direct (single-phase) reference.
+        let mut direct = make_groups_acc(DataType::Int64, o);
+        let vals: ArrayRef = Arc::new(Int64Array::from(vec![5i64, 9, 1, 7]));
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![5i64, 9, 1, 7]));
+        direct
+            .update_batch(&[Arc::clone(&vals), Arc::clone(&keys)], &[0, 1, 0, 1], None, 2)
+            .unwrap();
+        let direct_out = list_groups(&direct.evaluate(EmitTo::All).unwrap());
+
+        // Two-phase: partial accumulates, emits state; final merges, evaluates.
+        let mut partial = make_groups_acc(DataType::Int64, o);
+        partial
+            .update_batch(&[vals, keys], &[0, 1, 0, 1], None, 2)
+            .unwrap();
+        let state = partial.state(EmitTo::All).unwrap();
+        assert_eq!(state.len(), 2, "state must be [List<item>, List<Struct>]");
+        let mut final_acc = make_groups_acc(DataType::Int64, o);
+        final_acc
+            .merge_batch(&state, &[0, 1], None, 2)
+            .unwrap();
+        let merged_out = list_groups(&final_acc.evaluate(EmitTo::All).unwrap());
+
+        assert_eq!(merged_out, direct_out, "two-phase result must match single-phase");
+    }
+
+    /// `EmitTo::First(n)` emits the first n groups, renumbers the rest down by
+    /// n, and keeps their state for a later emit.
+    #[test]
+    fn groups_acc_emit_first() {
+        let o = opts(false, false);
+        let mut acc = make_groups_acc(DataType::Int64, o);
+        // groups 0,1,2
+        acc.update_batch(
+            &[
+                Arc::new(Int64Array::from(vec![10i64, 20, 30])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1i64, 1, 1])) as ArrayRef,
+            ],
+            &[0, 1, 2],
+            None,
+            3,
+        )
+        .unwrap();
+        let first = list_groups(&acc.evaluate(EmitTo::First(2)).unwrap());
+        assert_eq!(first.len(), 2, "First(2) emits exactly 2 groups");
+        assert_eq!(first[0], Some(vec![ScalarValue::Int64(Some(10))]));
+        assert_eq!(first[1], Some(vec![ScalarValue::Int64(Some(20))]));
+        // Remaining group (old index 2 → new index 0) survives.
+        let rest = list_groups(&acc.evaluate(EmitTo::All).unwrap());
+        assert_eq!(rest, vec![Some(vec![ScalarValue::Int64(Some(30))])]);
+    }
+
+    /// `size()` must be > 0 after buffering and account for the buffered slice
+    /// memory (so DataFusion's memory accounting/spill thresholds work).
+    #[test]
+    fn groups_acc_size_accounts_buffers() {
+        let mut acc = make_groups_acc(DataType::Int64, opts(false, false));
+        let empty_size = acc.size();
+        acc.update_batch(
+            &[
+                Arc::new(Int64Array::from((0..1000).collect::<Vec<i64>>())) as ArrayRef,
+                Arc::new(Int64Array::from((0..1000).collect::<Vec<i64>>())) as ArrayRef,
+            ],
+            &(0..1000).map(|i| (i % 4) as usize).collect::<Vec<_>>(),
+            None,
+            4,
+        )
+        .unwrap();
+        assert!(
+            acc.size() > empty_size,
+            "size() must grow after buffering 1000 rows"
+        );
     }
 }
 
