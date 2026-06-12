@@ -2,13 +2,14 @@
 //!
 //! ## Status
 //!
-//! v0.2: **single-process simulation, disk-backed log + vote.** A cluster of
-//! `RaftWal` nodes runs inside one tokio runtime; inter-node RPCs
-//! short-circuit through a shared handle map ([`SimCluster`]) instead of
-//! going over the wire. This is enough to validate consensus correctness —
-//! leader election, log replication, quorum commit, snapshot transfer —
-//! without locking in a wire protocol. Cross-process gRPC `RaftNetwork` is a
-//! follow-up; see `crates/basin-wal/RAFT.md` for the integration plan.
+//! v0.3: **cross-process gRPC transport, disk-backed log + vote.** A cluster
+//! of `RaftWal` nodes can now run in separate processes / on separate hosts,
+//! talking over the tonic transport in [`crate::raft_net`] (multi-node commit
+//! 5). The in-process [`SimCluster`] dispatch is retained for the consensus
+//! unit tests and single-process bring-up; [`RaftWal::new`] uses it, while
+//! [`RaftWal::new_with_network`] injects an explicit
+//! [`RaftNetworkFactory`] (the tonic factory in production). See
+//! `crates/basin-wal/RAFT.md` for the integration plan.
 //!
 //! ## Storage
 //!
@@ -20,8 +21,8 @@
 //! snapshot point survives restarts. The applied state machine itself — an
 //! in-memory `HashMap<(ProjectId, PartitionKey), …>` keyed by `Lsn` — is
 //! rebuilt from the snapshot on open and rolled forward from the durable log
-//! by the raft protocol. S3-anchored manifest snapshots are the follow-up
-//! that bounds the local log by the flush window.
+//! by the raft protocol. S3-anchored manifest snapshots (commit 3) bound the
+//! local log by the flush window.
 //!
 //! ## What this module guarantees
 //!
@@ -40,9 +41,6 @@
 //!
 //! ## What this module does **not** do
 //!
-//! - Cross-process networking. The default [`SimNetworkFactory`] dispatches
-//!   directly via in-memory `Raft` handles. A real gRPC factory plugs in
-//!   behind the same trait when the network commit lands.
 //! - Multi-region replication.
 
 use std::collections::{BTreeMap, HashMap};
@@ -299,6 +297,7 @@ impl ClusterStatus {
 /// configured. This marker documents where the network choice plugs in; the
 /// `cluster_status` / leader-fence surface in this file is independent of the
 /// network factory.
+#[allow(dead_code)] // documentation marker: names the seam, intentionally empty.
 pub trait RaftNetworkChoiceMarker {}
 
 // ---------------------------------------------------------------------------
@@ -498,7 +497,8 @@ impl fmt::Debug for RaftWal {
 }
 
 impl RaftWal {
-    /// Bring up a raft node with the given config.
+    /// Bring up a raft node with the given config, using the in-process
+    /// [`SimNetworkFactory`].
     ///
     /// Storage opens (or creates) `config.data_dir` and replays any
     /// persisted raft log / vote / snapshot — a node that restarts against
@@ -508,11 +508,45 @@ impl RaftWal {
     /// one — useful for the single-node / bootstrap case. Multi-node tests
     /// share one [`SimCluster`] across every node so RPC dispatch resolves.
     ///
-    /// On success the node is registered with the cluster's handle map and
-    /// the raft membership is initialised (single-node clusters bootstrap
-    /// immediately; multi-node clusters wait for the caller to bootstrap
-    /// one node and add the rest).
+    /// Cross-process deployments call [`Self::new_with_network`] with a
+    /// [`crate::raft_net::TonicNetworkFactory`] instead.
     pub async fn new(config: RaftWalConfig) -> Result<Self> {
+        // Default path: the in-process simulation network. The factory needs
+        // the resolved `SimCluster` Arc, so build it here, then hand it to the
+        // generic constructor that owns the single `openraft::Raft::new` call.
+        let cluster = config.cluster.clone().unwrap_or_else(SimCluster::new);
+        let network = SimNetworkFactory {
+            source: config.node_id,
+            cluster: cluster.clone(),
+        };
+        Self::new_with_network(config, network).await
+    }
+
+    // -- multi-node commit 5 hook: network-factory injection point ----------
+    //
+    // ANCHOR(raft-net-factory): the seam the real (cross-process) transport
+    // plugs into. `new` injects the in-process `SimNetworkFactory`; a gRPC
+    // deployment injects [`crate::raft_net::TonicNetworkFactory`]. This is the
+    // SINGLE place that calls `openraft::Raft::new` so both transports share
+    // one bring-up path (snapshot/durability bodies — `propose_batch`,
+    // `record_flush_watermark` — and the observability/leader-fence surface are
+    // all factory-independent and live below).
+    /// Bring up a raft node with an explicit [`RaftNetworkFactory`].
+    ///
+    /// [`new`](Self::new) is the in-process-simulation convenience wrapper;
+    /// cross-process deployments call this directly with a
+    /// [`crate::raft_net::TonicNetworkFactory`]. The returned `RaftWal` still
+    /// carries a [`SimCluster`] handle (the [`cluster`](Self::cluster)
+    /// accessor) for test ergonomics; with a real network factory that
+    /// cluster is simply unused for dispatch.
+    ///
+    /// Storage opens (or creates) `config.data_dir` and replays any persisted
+    /// raft log / vote / snapshot — a node that restarts against the same
+    /// directory rejoins with its hard state intact.
+    pub async fn new_with_network<F>(config: RaftWalConfig, network: F) -> Result<Self>
+    where
+        F: RaftNetworkFactory<C>,
+    {
         let cluster = config.cluster.clone().unwrap_or_else(SimCluster::new);
 
         let raft_config = Arc::new(
@@ -535,11 +569,6 @@ impl RaftWal {
         let storage = DiskRaftStorage::open(&config.data_dir)?;
         let (log_store, state_machine) = Adaptor::new(storage.clone());
 
-        let network = SimNetworkFactory {
-            source: config.node_id,
-            cluster: cluster.clone(),
-        };
-
         let raft = openraft::Raft::new(
             config.node_id,
             raft_config,
@@ -551,7 +580,8 @@ impl RaftWal {
         .map_err(|e| BasinError::wal(format!("raft start: {e}")))?;
 
         // Register before initialise so peers can dispatch RPCs to us
-        // during the membership change.
+        // during the membership change. (A no-op for dispatch when a real
+        // network factory is used, but keeps the test-helper accessor live.)
         cluster.register(config.node_id, raft.clone()).await;
 
         Ok(Self {
@@ -616,8 +646,9 @@ impl RaftWal {
         &self.config
     }
 
-    /// Underlying raft handle. Test-only — production code uses the [`Wal`]
-    /// trait. Exposed so multi-node tests can drive elections / membership.
+    /// Underlying raft handle. Exposed so multi-node tests can drive
+    /// elections / membership, and so the network layer can hand it to the
+    /// tonic [`crate::raft_net::RaftTransportService`].
     pub fn raft(&self) -> &RaftHandle {
         &self.raft
     }

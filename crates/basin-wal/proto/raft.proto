@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+// Basin raft transport (multi-node commit 5).
+//
+// PRAGMATIC v1 ENCODING — opaque payloads.
+//
+// Each RPC carries a single `bytes payload` field. The bytes are the
+// serde_json encoding of the corresponding openraft message type
+// (`AppendEntriesRequest<C>`, `VoteRequest`, `InstallSnapshotRequest<C>`,
+// and their responses), where `C = BasinRaftTypeConfig`. serde_json is the
+// SAME codec `raft_storage.rs` already uses to frame the openraft `Entry<C>`
+// body on disk, so the wire and the log agree byte-for-byte on how an entry
+// serialises — no second serialisation contract to keep in sync.
+//
+// Why opaque bytes instead of hand-mapping every openraft struct into proto
+// messages:
+//   * openraft's request/response types are deeply nested generics
+//     (LogId<CommittedLeaderId<NID>>, Membership, EntryPayload, Vote, …).
+//     Hand-mirroring them into proto and keeping the two in lockstep across
+//     openraft upgrades is a large, brittle surface. openraft already derives
+//     serde on all of them (`serde(bound = "")`), so JSON is a correct,
+//     total, version-tracking encoding for free.
+//   * The transport stays a thin pipe; correctness of the consensus payload
+//     is owned by openraft's own (de)serialisation, exercised by the
+//     round-trip tests.
+//
+// COMPATIBILITY IMPLICATIONS (documented honestly):
+//   * Wire compatibility is tied to openraft's serde representation, not to a
+//     stable proto schema. A major openraft bump that changes the JSON shape
+//     of these types is a cluster-wide breaking change: a mixed-version
+//     cluster could fail to deserialise peer payloads. Mitigation: openraft
+//     is pinned `=0.9.24` workspace-wide, and a version bump is already a
+//     coordinated, all-nodes-restart event for the raft log format (the disk
+//     log frames `Entry<C>` with the same codec — see raft_storage.rs).
+//   * This is explicitly a v1 transport. A future revision can add typed
+//     proto fields alongside `payload` (proto3 additive evolution) and
+//     negotiate, without breaking this wire if the bytes field is retained.
+//   * No app-level version tag is sent in v1; the openraft `Vote` carried
+//     inside each payload already fences stale leaders at the protocol layer.
+
+package basin.raft.v1;
+
+// Mirrors openraft RaftNetwork: append_entries, vote, install_snapshot.
+// (full_snapshot's default impl fans out into chunked install_snapshot RPCs,
+// so no separate endpoint is needed — generic-snapshot-data is NOT enabled.)
+service RaftTransport {
+  rpc AppendEntries(RaftRpcRequest) returns (RaftRpcResponse);
+  rpc Vote(RaftRpcRequest) returns (RaftRpcResponse);
+  rpc InstallSnapshot(RaftRpcRequest) returns (RaftRpcResponse);
+}
+
+// serde_json(<openraft request type>).
+message RaftRpcRequest {
+  bytes payload = 1;
+}
+
+// Response envelope. Exactly one of `ok` / `raft_error` is populated.
+//
+//   * ok        = serde_json(<openraft response type>) — the handler ran and
+//                 produced a protocol response. This is a SUCCESS at the
+//                 transport layer even when the response itself reports a
+//                 higher term / rejected vote; that's protocol state, not a
+//                 network fault.
+//   * raft_error = serde_json(RaftError<NID[, InstallSnapshotError]>) — the
+//                 LOCAL raft instance on the peer returned an error
+//                 (Fatal / APIError). The client re-inflates this into an
+//                 openraft RemoteError so liveness logic sees a *remote*
+//                 error, NOT an unreachable/network error. Getting this
+//                 distinction right matters: openraft treats Unreachable /
+//                 NetworkError as "peer might be down → backoff / re-elect",
+//                 whereas RemoteError is "peer answered, but rejected" →
+//                 different handling. Transport-level failures (connect
+//                 refused, timeout, decode error) never travel in this field;
+//                 they surface as a tonic transport error and the client maps
+//                 them to Unreachable / NetworkError.
+message RaftRpcResponse {
+  oneof result {
+    bytes ok = 1;
+    bytes raft_error = 2;
+  }
+}

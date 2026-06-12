@@ -12,6 +12,24 @@ graduate to 1.0 and the standard SemVer guarantees.
 
 ### Added
 
+- **Cross-process raft transport over tonic/gRPC (`raft-net` feature).** With
+  the `raft-net` feature built (`cargo build -p basin-server --features
+  raft-net`; requires `protoc`), `RaftWal` nodes talk over a real wire protocol
+  instead of the in-process simulation, so a cluster runs across separate
+  processes / hosts. Each RPC (append_entries / vote / install_snapshot) carries
+  the openraft message as a serde_json-encoded opaque payload — the same codec
+  the disk log frames entries with, so wire and log agree on entry encoding. The
+  tonic network factory dials lazily, reuses one HTTP/2 channel per peer
+  (evicting on transport failure and on openraft backoff so a peer that
+  restarted at the same address re-resolves), bounds every RPC by
+  `min(openraft hard_ttl, BASIN_RAFT_RPC_TIMEOUT_MS)`, and backs off
+  exponentially. Error mapping is liveness-correct: connect / timeout /
+  unknown-peer become Unreachable, malformed bytes become NetworkError, and a
+  peer that answered with a raft error becomes RemoteError. v1 is plaintext on
+  an assumed-private cluster network; mTLS is the documented production
+  follow-up. `basin-server` selects the tonic factory when `BASIN_RAFT_BIND` /
+  `BASIN_RAFT_PEERS` are configured and starts the transport server on the bind
+  addr; without the feature, raft mode uses the in-process Sim network.
 - **Quorum-replicated WAL durability (`BASIN_WAL_MODE=raft`).** Off by default
   (`local` mode is byte-identical to today). In raft mode the WAL durability
   boundary becomes a **quorum ack** instead of a local fsync: a WAL append

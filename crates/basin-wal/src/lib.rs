@@ -858,6 +858,8 @@ pub(crate) trait WalImpl: Send + Sync {
 
 mod file_wal;
 mod fsync;
+#[cfg(feature = "raft-net")]
+mod raft_net;
 mod raft_storage;
 mod raft_wal;
 mod segment;
@@ -867,4 +869,9 @@ pub use fsync::{DurablePut, FsyncOnPut, FsyncOnPutAll};
 pub use raft_wal::{
     BasinRaftItem, BasinRaftRequest, BasinRaftResponse, ClusterRole, ClusterStatus,
     DurabilityBackend, LocalDurability, RaftDurability, RaftWal, RaftWalConfig, SimCluster, WalMode,
+};
+#[cfg(feature = "raft-net")]
+pub use raft_net::{
+    raft_bind_addr_from_env, serve_raft, serve_raft_on_listener, PeerRegistry,
+    RaftTransportService, StaticPeers, TonicNetworkConfig, TonicNetworkFactory,
 };

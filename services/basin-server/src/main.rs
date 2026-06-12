@@ -984,6 +984,48 @@ async fn build_raft_wal(cfg: &Cfg) -> Result<basin_wal::RaftWal> {
         "raft WAL: opening node"
     );
 
+    // Network selection (multi-node commit 5). With the `raft-net` feature the
+    // node talks to peers over the tonic gRPC transport: build the wal with the
+    // `TonicNetworkFactory` over the static peer registry, then start the
+    // transport server on the bind addr so peers can reach this node. Without
+    // the feature (or in a single-process build) the in-process Sim factory is
+    // used, so raft mode stays observable + leader-fenced without the wire.
+    #[cfg(feature = "raft-net")]
+    let wal = {
+        let peer_spec = rcfg
+            .peers
+            .iter()
+            .map(|p| format!("{}@{}", p.id, p.addr))
+            .collect::<Vec<_>>()
+            .join(",");
+        let peers = std::sync::Arc::new(
+            basin_wal::StaticPeers::parse(&peer_spec)
+                .map_err(|e| anyhow!("parse BASIN_RAFT_PEERS for transport: {e}"))?,
+        );
+        let factory = basin_wal::TonicNetworkFactory::with_shared(
+            peers,
+            basin_wal::TonicNetworkConfig::from_env(),
+        );
+        let wal = basin_wal::RaftWal::new_with_network(wal_cfg, factory)
+            .await
+            .map_err(|e| anyhow!("open RaftWal (tonic transport): {e}"))?;
+
+        let bind_addr: std::net::SocketAddr = rcfg
+            .bind
+            .parse()
+            .with_context(|| format!("BASIN_RAFT_BIND '{}' is not a socket addr", rcfg.bind))?;
+        let svc = basin_wal::RaftTransportService::new(wal.raft().clone());
+        // The server task runs for the lifetime of the process; the join handle
+        // is intentionally detached (the OS reclaims the socket on exit, and
+        // graceful shutdown drops the RaftWal which stops the raft core). The
+        // bound addr is logged for operator confirmation.
+        let (bound, _server) = basin_wal::serve_raft(svc, bind_addr)
+            .await
+            .map_err(|e| anyhow!("start raft transport on {}: {e}", rcfg.bind))?;
+        tracing::info!(bind = %bound, "raft transport server listening (tonic/gRPC)");
+        wal
+    };
+    #[cfg(not(feature = "raft-net"))]
     let wal = basin_wal::RaftWal::new(wal_cfg)
         .await
         .map_err(|e| anyhow!("open RaftWal: {e}"))?;
