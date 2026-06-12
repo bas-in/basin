@@ -3938,6 +3938,55 @@ pub(crate) async fn apply_gin_pruning_for_query(
     // == live_files.len()), we still try row-group prune below — the row-group
     // prune might narrow individual files to fewer row-groups.
 
+    // ── Row-granular GIN tier ─────────────────────────────────────────────────
+    //
+    // The coarse (file) and row-group tiers above are structurally weak for a
+    // needle that appears in EVERY file/row-group but matches few ROWS per file
+    // (the 1M `@>` dense-needle bench): nothing is pruned, every file decodes in
+    // full. The row tier closes that gap — for each candidate file with a sealed
+    // row tier it returns a SUPERSET of the absolute row offsets that may match,
+    // which the storage reader turns into a Parquet `RowSelection` so only those
+    // rows are decoded. Files without a sealed row tier (or with a dense needle
+    // term) decode in full exactly as before. The `jsonb_contains` UDF still
+    // re-checks every emitted row, so the offset list is a pure accelerator and
+    // can never drop a true match.
+    //
+    // The overlay/completeness gate at the top of this function already ensured
+    // the table has no live hot-tier overlay and the candidate files are
+    // coarse-trustworthy; the row tier inherits that gate. Provably-empty files
+    // (`prunable`) are dropped from the candidate set.
+    let row_plan = crate::index_probe::RowSelectionPlan::default();
+    let row_plan = if gin_plan.is_contains {
+        engine.gin_index_registry().probe_row_selection(
+            project,
+            &gin_plan.table,
+            &gin_plan.col,
+            &gin_plan.opclass,
+            &gin_plan.needle,
+            &pruned_paths,
+        )
+    } else {
+        row_plan
+    };
+    // Drop provably-empty files from the candidate set (the row tier proved a
+    // needle term never occurs there). Keep ordering stable for determinism.
+    let candidate_paths: Vec<String> = if row_plan.prunable.is_empty() {
+        pruned_paths.clone()
+    } else {
+        pruned_paths
+            .iter()
+            .filter(|p| !row_plan.prunable.contains(*p))
+            .cloned()
+            .collect()
+    };
+    if candidate_paths.is_empty() {
+        // Row tier proved no file can match — leave the full set registered so
+        // DataFusion computes the (empty) result for aggregate shapes (mirrors
+        // the `pruned_paths.is_empty()` guard above).
+        return Ok(());
+    }
+    let row_selection_map = row_plan.row_offsets;
+
     // C2 — attempt row-group-granular prune using the per-row-group bloom
     // registry.  If the registry has summaries for at least some of the
     // candidate files, narrow further to only the surviving row-groups.
@@ -3950,36 +3999,48 @@ pub(crate) async fn apply_gin_pruning_for_query(
         &gin_plan.col,
         &gin_plan.opclass,
         &gin_plan.needle,
-        &pruned_paths,
+        &candidate_paths,
     );
 
-    if let crate::index_probe::RowGroupPrune::PerFile(rg_map) = rg_prune {
-        // Row-group-level prune available.  Register a custom provider that
-        // drives Basin's native storage reader with `row_group_selection` set,
-        // bypassing DataFusion's ListingTable / ParquetExec path entirely.
+    let rg_map = match rg_prune {
+        crate::index_probe::RowGroupPrune::PerFile(m) => Some(m),
+        _ => None,
+    };
+
+    // Register the native pruned provider when EITHER a row-group prune OR a
+    // row-tier selection is available; both drive the same custom reader (the
+    // row-group allowlist narrows which groups open, the row selection narrows
+    // which rows within them decode). When neither is present, fall back to the
+    // file-level `ListingTable` prune.
+    if rg_map.is_some() || !row_selection_map.is_empty() {
+        // Row-group / row-level prune available.  Register a custom provider
+        // that drives Basin's native storage reader with `row_group_selection`
+        // and/or `row_selection` set, bypassing DataFusion's ListingTable /
+        // ParquetExec path entirely.
         //
-        // Correctness: `rg_map` is a conservative superset (bloom false
-        // positives are fine); `jsonb_contains` UDF re-checks every emitted
-        // row.  Files absent from `rg_map` are NOT in `row_group_selection`
-        // and are therefore read in full (no false negatives).
+        // Correctness: both maps are conservative supersets (bloom false
+        // positives and row-tier raw-bytes containment are fine); the
+        // `jsonb_contains` UDF re-checks every emitted row.  Files absent from
+        // a map are read in full (no false negatives).
         let df_schema = match schema_ws_to_df(&meta.schema) {
             Ok(s) => Arc::new(s),
             Err(_) => {
                 // Schema conversion failed — fall through to file-level prune.
                 return register_pruned_listing_table_if_narrowed(
-                    engine, ctx, &gin_plan.table, &meta, &pruned_paths, &live_files,
+                    engine, ctx, &gin_plan.table, &meta, &candidate_paths, &live_files,
                 )
                 .await;
             }
         };
-        let provider = crate::gin_rowgroup_scan::GinRowGroupPrunedTable::new(
+        let provider = crate::gin_rowgroup_scan::GinRowGroupPrunedTable::new_with_row_selection(
             df_schema,
             engine.config().storage.clone(),
             *project,
             gin_plan.table.clone(),
             meta.file_format,
-            pruned_paths.clone(),
-            rg_map,
+            candidate_paths.clone(),
+            rg_map.unwrap_or_default(),
+            row_selection_map,
         );
         let tref = TableReference::Bare { table: gin_plan.table.as_str().into() };
         let _ = ctx.deregister_table(tref.clone());
@@ -3988,9 +4049,9 @@ pub(crate) async fn apply_gin_pruning_for_query(
         return Ok(());
     }
 
-    // No row-group summaries — fall back to file-level prune (the existing path).
+    // No row-group summaries and no row tier — fall back to file-level prune.
     register_pruned_listing_table_if_narrowed(
-        engine, ctx, &gin_plan.table, &meta, &pruned_paths, &live_files,
+        engine, ctx, &gin_plan.table, &meta, &candidate_paths, &live_files,
     )
     .await
 }

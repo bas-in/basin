@@ -2717,6 +2717,7 @@ impl ShardImpl for InProcessShard {
             partition: opts.partition.clone(),
             limit: opts.limit,
             row_group_selection: opts.row_group_selection.clone(),
+            row_selection: opts.row_selection.clone(),
             sorted_by: opts.sorted_by.clone(),
         };
         let stream = self.cfg.storage.read(project, table, parquet_opts).await?;
@@ -2973,6 +2974,7 @@ impl ProjectHandleImpl for InProcessProjectHandle {
             partition: opts.partition.clone(),
             limit: opts.limit,
             row_group_selection: opts.row_group_selection.clone(),
+            row_selection: opts.row_selection.clone(),
             sorted_by: opts.sorted_by.clone(),
         };
         let stream = self

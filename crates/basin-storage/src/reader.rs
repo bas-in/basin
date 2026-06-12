@@ -2100,6 +2100,116 @@ fn build_page_row_selection(
     Some((selection, total_selected))
 }
 
+/// Build a Parquet [`RowSelection`] for a row-tier GIN allowlist.
+///
+/// `row_offsets` is the ascending, deduplicated list of ABSOLUTE row indices
+/// (file-relative, as the GIN row tier stored them) that may match. `kept` is
+/// the list of surviving row-group ordinals (after the row-group / stats prune)
+/// in ascending order — the exact set passed to `with_row_groups`. The returned
+/// `RowSelection` is expressed in the SAME coordinate space parquet-rs applies
+/// it: the concatenation of the kept row groups' rows, in `kept` order. A row
+/// whose absolute index is NOT in `row_offsets` (or lies in a row group that is
+/// being kept) is skipped; rows outside the kept row groups are implicitly
+/// dropped by `with_row_groups` and never enter this selection.
+///
+/// Correctness: the selection is a SUPERSET filter. `row_offsets` is itself a
+/// superset of true matches (the GIN row tier is raw-bytes containment), and
+/// this routine only ever turns offsets in `row_offsets` into `select` runs —
+/// it never selects a row absent from `row_offsets`, and never skips a row
+/// present in it (within a kept row group). The per-row `RowFilter` re-checks
+/// every surviving row, so any false positive is filtered out and no true
+/// match is ever dropped.
+///
+/// Returns `None` when nothing can be narrowed (empty `kept`, or every kept row
+/// is selected anyway) so the caller skips installing a no-op selection.
+fn build_row_tier_selection(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    kept_row_groups: &[usize],
+    row_offsets: &[u64],
+) -> Option<(RowSelection, u64)> {
+    if kept_row_groups.is_empty() {
+        return None;
+    }
+    // Absolute row offsets of each row group's first row (cumulative sum over
+    // ALL row groups, since the GIN offsets are file-absolute).
+    let all_rgs = metadata.row_groups();
+    let mut rg_start: Vec<u64> = Vec::with_capacity(all_rgs.len());
+    let mut acc = 0u64;
+    for rg in all_rgs {
+        rg_start.push(acc);
+        acc += rg.num_rows() as u64;
+    }
+
+    let mut selectors: Vec<RowSelector> = Vec::new();
+    let mut total_selected: u64 = 0;
+    let mut any_skipped = false;
+    // `row_offsets` is ascending; walk it with a cursor so each kept row group
+    // is matched in O(group_rows + offsets_in_group).
+    let mut oi = 0usize;
+    for &rg_idx in kept_row_groups {
+        let start = rg_start[rg_idx];
+        let n_rows = all_rgs[rg_idx].num_rows() as u64;
+        let end = start + n_rows;
+        // Advance the cursor to the first offset >= start (skip offsets that
+        // fall before this kept row group — they belong to pruned groups and
+        // are not part of the selection coordinate space).
+        while oi < row_offsets.len() && row_offsets[oi] < start {
+            oi += 1;
+        }
+        // Walk the rows of this row group, emitting select/skip runs.
+        let mut pos = start;
+        while pos < end {
+            if oi < row_offsets.len() && row_offsets[oi] < end {
+                let next = row_offsets[oi];
+                if next > pos {
+                    // Skip the gap [pos, next).
+                    let gap = (next - pos) as usize;
+                    selectors.push(RowSelector::skip(gap));
+                    any_skipped = true;
+                    pos = next;
+                }
+                // Coalesce a contiguous run of selected offsets.
+                let run_start = pos;
+                while oi < row_offsets.len()
+                    && row_offsets[oi] < end
+                    && row_offsets[oi] == pos
+                {
+                    pos += 1;
+                    oi += 1;
+                }
+                let run = (pos - run_start) as usize;
+                if run > 0 {
+                    selectors.push(RowSelector::select(run));
+                    total_selected += run as u64;
+                }
+            } else {
+                // No more offsets in this row group — skip the remainder.
+                let gap = (end - pos) as usize;
+                selectors.push(RowSelector::skip(gap));
+                any_skipped = true;
+                pos = end;
+            }
+        }
+    }
+
+    if !any_skipped {
+        // Every kept row was selected — installing a selection is pure
+        // overhead. Behave like the page-selection path's no-op guard.
+        return None;
+    }
+    Some((RowSelection::from(selectors), total_selected))
+}
+
+/// Look up the row-tier offset allowlist for `path` in the read options.
+/// Returns `None` when no row selection is set or the file is absent (a file
+/// without a row-tier entry decodes every surviving row — the safe default).
+fn row_tier_offsets_for_file<'a>(
+    opts: &'a ReadOptions,
+    path: &ObjectPath,
+) -> Option<&'a Vec<u64>> {
+    opts.row_selection.as_ref()?.get(path.as_ref())
+}
+
 /// Decide whether a single data page can be skipped for a given predicate,
 /// using the page-level column index min/max. Returns `true` (skip) only
 /// when the stats **prove** no row in the page can satisfy the predicate.
@@ -2378,8 +2488,25 @@ where
                         .fetch_add(*rows_sel, Ordering::Relaxed);
                 }
 
+                // Row-tier GIN selection (if any) for this file, expressed in
+                // the kept-row-group coordinate space, then intersected with
+                // the page-stats selection so both pruning sources compose.
+                let row_tier_selection = row_tier_offsets_for_file(opts.as_ref(), &path)
+                    .and_then(|offs| build_row_tier_selection(builder.metadata(), &kept, offs));
+                if let Some((_, rows_sel)) = &row_tier_selection {
+                    counters
+                        .rows_selected_by_page_index
+                        .fetch_add(*rows_sel, Ordering::Relaxed);
+                }
+                let combined_selection = match (page_selection, row_tier_selection) {
+                    (Some((p, _)), Some((r, _))) => Some(p.intersection(&r)),
+                    (Some((p, _)), None) => Some(p),
+                    (None, Some((r, _))) => Some(r),
+                    (None, None) => None,
+                };
+
                 let mut builder = builder.with_row_groups(kept);
-                if let Some((sel, _)) = page_selection {
+                if let Some(sel) = combined_selection {
                     builder = builder.with_row_selection(sel);
                 }
 
@@ -2564,8 +2691,24 @@ where
             .fetch_add(*rows_sel, Ordering::Relaxed);
     }
 
+    // Row-tier GIN selection (if any) for this file, intersected with the
+    // page-stats selection (same kept-row-group coordinate space).
+    let row_tier_selection = row_tier_offsets_for_file(opts.as_ref(), &path)
+        .and_then(|offs| build_row_tier_selection(builder.metadata(), &kept, offs));
+    if let Some((_, rows_sel)) = &row_tier_selection {
+        counters
+            .rows_selected_by_page_index
+            .fetch_add(*rows_sel, Ordering::Relaxed);
+    }
+    let combined_selection = match (page_selection, row_tier_selection) {
+        (Some((p, _)), Some((r, _))) => Some(p.intersection(&r)),
+        (Some((p, _)), None) => Some(p),
+        (None, Some((r, _))) => Some(r),
+        (None, None) => None,
+    };
+
     let mut builder = builder.with_row_groups(kept);
-    if let Some((sel, _)) = page_selection {
+    if let Some(sel) = combined_selection {
         builder = builder.with_row_selection(sel);
     }
 
