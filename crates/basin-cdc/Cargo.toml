@@ -10,6 +10,10 @@ publish = false
 basin-common.workspace = true
 basin-storage.workspace = true
 basin-auth.workspace = true
+# Phase 2: the webhook delivery worker reads subscriptions + persists the
+# delivery cursor through the catalog, and the CRUD routes mint webhook rows.
+# basin-catalog depends only on basin-common, so this edge is acyclic.
+basin-catalog.workspace = true
 
 object_store.workspace = true
 tokio.workspace = true
@@ -22,6 +26,15 @@ serde_json.workspace = true
 futures.workspace = true
 bytes.workspace = true
 ulid.workspace = true
+
+# Phase 2 webhook delivery: HTTP client for the outbound POST, HMAC-SHA256
+# request signing, hex encoding of the signature + minted secret, and a CSPRNG
+# for the secret bytes.
+reqwest.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
 
 # Concurrent per-project live-tail broadcast registry. Same major version
 # basin-realtime already pins, so no new lock-file resolution.
