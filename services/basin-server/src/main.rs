@@ -326,6 +326,32 @@ async fn main() -> Result<()> {
         sink
     };
 
+    // --- durable CDC ring sink (ADR 0028 Phase 1) ---------------------------
+    //
+    // Attached as a SECOND post-commit sink alongside realtime, over the same
+    // capture seam (`dispatch_post_commit`). This requires NO executor change:
+    // the post-commit hook already fires for every committed mutation,
+    // including the HTAP hot-tier UPDATE/DELETE fast paths that bypass the WAL.
+    // The writer batches events to a durable per-project object-store ring; the
+    // co-mounted SSE route (GET /v1/cdc/:project/stream) replays from the ring
+    // then live-tails. The time-window flusher and retention GC run as
+    // background tasks for the process lifetime.
+    #[cfg(feature = "realtime")]
+    let cdc_sink = {
+        let sink = basin_cdc::CdcRingWriter::new(engine.config().storage.clone());
+        engine.attach_post_commit_sink(std::sync::Arc::new(sink.clone()));
+        // Background tasks run for the process lifetime. Dropping a tokio
+        // JoinHandle detaches (does not cancel) the task, so the flusher keeps
+        // flushing and the GC keeps sweeping; we deliberately do not retain the
+        // handles. (`spawn_retention_gc` returns a guard whose `abort()` is the
+        // only way to stop the sweep — we want it to run forever here.)
+        let _flusher = sink.spawn_flusher();
+        std::mem::forget(basin_cdc::spawn_retention_gc(sink.clone()));
+        std::mem::forget(_flusher);
+        tracing::info!("basin-cdc post-commit sink attached (durable ring + retention GC)");
+        sink
+    };
+
     // Build the static resolver from `BASIN_PROJECTS`.
     //
     // SECURITY: `StaticProjectResolver` accepts ANY password (its
@@ -520,6 +546,11 @@ async fn main() -> Result<()> {
         })?;
         let rest_cfg = basin_rest::RestConfig::new(cfg.rest_bind, engine.clone(), auth.clone());
         let mut svc = basin_rest::RestService::new(rest_cfg);
+        // fn-persist: wire the live catalog into RestService so handler
+        // function deploys (LANGUAGE wasm/javascript) survive server restarts.
+        // Shares the same Arc<dyn Catalog> the engine + fn_runtime already use;
+        // no extra connection needed.
+        svc.with_fn_catalog(catalog.clone());
         // Feature 2: co-mount realtime SSE + WS on the REST port when both
         // features are compiled in and an auth service is available. The
         // standalone BASIN_REALTIME_BIND / BASIN_REALTIME_WS_BIND ports are
@@ -529,6 +560,15 @@ async fn main() -> Result<()> {
             registry: realtime_sink.registry().clone(),
             auth: auth.clone(),
             replay_rings: Some(realtime_sink.replay_rings().clone()),
+        });
+        // ADR 0028 Phase 1: co-mount the durable CDC SSE stream on the REST
+        // port. Shares the engine Storage (durable replay) + the sink's live
+        // registry (fast-path tail).
+        #[cfg(feature = "realtime")]
+        svc.attach_cdc(basin_rest::CdcCoMount {
+            storage: engine.config().storage.clone(),
+            live: cdc_sink.live().clone(),
+            auth: auth.clone(),
         });
         let running = svc
             .run_until_bound()
