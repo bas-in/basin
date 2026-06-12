@@ -314,6 +314,18 @@ pub struct ReadOptions {
     /// scanned in full; files present are restricted to the listed groups.
     /// `None` = scan every row-group of every file.
     pub row_group_selection: Option<HashMap<String, Vec<u32>>>,
+    /// Optional per-file ROW allowlist: `file → sorted ascending ABSOLUTE row
+    /// offsets` that may match. Populated by the row-granular JSONB GIN probe
+    /// (`basin-engine::index_probe::GinIndexRegistry::probe_row_selection`).
+    /// The reader converts each file's offset list into a Parquet
+    /// `RowSelection` over the row groups it actually keeps (after row-group
+    /// and stats pruning), so only the listed rows are decoded. A file absent
+    /// from this map decodes every (surviving) row — byte-identical to the
+    /// pre-row-tier path. The selection is a SUPERSET filter: the per-row
+    /// predicate / engine filter still re-checks every emitted row, so an
+    /// over-broad offset list is always safe and an offset list NEVER drops a
+    /// true match. `None` = no row selection.
+    pub row_selection: Option<HashMap<String, Vec<u64>>>,
     /// Optional hint naming the single column every cold file is physically
     /// ASC-sorted on (the table's effective cluster / single-PK column). The
     /// engine sets this from `effective_cluster_col(meta)` when it pushes a

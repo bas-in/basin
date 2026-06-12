@@ -1038,6 +1038,7 @@ pub(crate) async fn execute_groupby_low_card(
         partition: None,
         limit: None,
         row_group_selection: None,
+        row_selection: None,
             sorted_by: None,
     };
     let schema_ref = Some(meta.schema.clone());

@@ -2639,6 +2639,7 @@ async fn execute_simple_select_inner(
         partition: None,
         limit: pushdown_limit,
         row_group_selection: None,
+        row_selection: None,
         sorted_by: sorted_by_col,
     };
 

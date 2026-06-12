@@ -101,6 +101,96 @@ const DEFAULT_POSTING_BUDGET: usize = 5_000_000;
 /// above) — enough to keep a small/idle project's index fully resident.
 const DEFAULT_POSTING_FLOOR: usize = 500_000;
 
+// ── Row-granular postings (two-tier) ──────────────────────────────────────────
+//
+// The (term, file) postings above are the always-present COARSE tier: they
+// prune whole files. At 1M rows with a needle that appears in EVERY file, the
+// coarse tier prunes nothing — every file is a candidate, and the read decodes
+// every file in full even though only a handful of rows per file actually
+// match. PG wins this shape because its posting lists are row-granular: it
+// skips straight to the matching rows.
+//
+// The row tier closes that gap WITHIN each candidate file. For a term, in a
+// given file, we optionally keep the SORTED ABSOLUTE ROW INDICES (offsets) at
+// which that term occurs. At probe time the per-term row-offset lists are
+// AND-intersected per file, yielding a sorted row-offset list per file that is
+// a SUPERSET of the true matches (raw-bytes containment, like the coarse tier —
+// the `jsonb_contains` UDF still re-checks every emitted row). The reader turns
+// that offset list into a Parquet `RowSelection` over the kept row groups, so
+// non-matching rows are never decoded.
+//
+// Offsets, not a bitmap: a sorted `Vec<u32>` of row offsets intersects in O(n)
+// and converts directly to a `RowSelection`; it costs ~4 B per matching row and
+// is empty for files where the term is absent. A dense bitmap would cost
+// `file_rows / 8` bytes regardless of selectivity — exactly backwards, since
+// the row tier pays off for SELECTIVE terms within a file. (`u32` row offset
+// caps a single file at ~4.29 B rows, far above any Basin data file.)
+//
+// DENSITY CAP — the inversion. Row postings help when FEW rows in a file match;
+// if MOST of a file's rows match, decoding the whole file is already fine and
+// the offset list is just overhead (and large). So a (term, file) row posting
+// is DROPPED when its matching-row ratio for that file exceeds
+// `BASIN_GIN_ROW_TIER_MAX_RATIO_PCT` (default 60%). A dropped (term, file) row
+// posting means that file falls back to the coarse tier for that term — exactly
+// the behaviour we want for the bench's everywhere-dense needle term: the win
+// there comes from the OTHER, more selective needle terms (and page pruning)
+// narrowing the row set, while a single near-universal term contributes no row
+// posting (its file decode was already unavoidable).
+//
+// MEMORY — row postings are counted against the SAME per-project budget as the
+// coarse tier, with a coarser weight (`ROW_POSTING_WEIGHT_SHIFT`): a block of
+// row offsets costs `1 + (n_offsets >> shift)` budget units, so a file with
+// 64k matching rows for a term costs ~64 budget units, not 64k. Under budget
+// pressure the ROW tier is evicted FIRST (the coarse tier survives longer): the
+// coarse postings are the correctness-preserving must-keep, the row tier is a
+// pure accelerator.
+
+/// Per-(term,file) density cap for the row tier, as a percentage of the file's
+/// indexed (non-null) rows. Above this ratio the row posting is dropped and the
+/// file falls back to coarse-tier decode for that term. Overridable via
+/// `BASIN_GIN_ROW_TIER_MAX_RATIO_PCT`. Default 60.
+const DEFAULT_ROW_TIER_MAX_RATIO_PCT: u64 = 60;
+
+/// Budget weight shift for a row-posting block: a block of `n` row offsets
+/// costs `1 + (n >> ROW_POSTING_WEIGHT_SHIFT)` units against the per-project
+/// budget. Shift 10 ≈ one budget unit per 1024 offsets. This keeps a dense
+/// table's row tier from dwarfing the coarse-tier accounting while still
+/// growing with real memory.
+const ROW_POSTING_WEIGHT_SHIFT: u32 = 10;
+
+/// Read `BASIN_GIN_ROW_TIER_MAX_RATIO_PCT` once. Clamped to 1..=100. A value of
+/// `0` is treated as 1 (never disables the tier entirely via a zero cap — set
+/// `BASIN_GIN_ROW_TIER=0` to disable; see [`row_tier_enabled`]).
+fn row_tier_max_ratio_pct() -> u64 {
+    use std::sync::OnceLock;
+    static PCT: OnceLock<u64> = OnceLock::new();
+    *PCT.get_or_init(|| {
+        std::env::var("BASIN_GIN_ROW_TIER_MAX_RATIO_PCT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.clamp(1, 100))
+            .unwrap_or(DEFAULT_ROW_TIER_MAX_RATIO_PCT)
+    })
+}
+
+/// Whether the row tier is enabled at all (`BASIN_GIN_ROW_TIER`, default on).
+/// Set `BASIN_GIN_ROW_TIER=0` to fall back to pure coarse-tier behaviour
+/// (byte-identical to the pre-row-tier path).
+fn row_tier_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(std::env::var("BASIN_GIN_ROW_TIER").ok().as_deref(), Some("0") | Some("false"))
+    })
+}
+
+/// Budget cost (in per-project budget units) of a row-posting block holding
+/// `n_offsets` row offsets.
+#[inline]
+fn row_block_budget_cost(n_offsets: usize) -> usize {
+    1 + (n_offsets >> ROW_POSTING_WEIGHT_SHIFT)
+}
+
 /// Return the effective GLOBAL posting-entry budget (the process-wide ceiling
 /// shared across every project, table and column).
 ///
@@ -175,6 +265,42 @@ struct TermPostingList {
     /// Set once the first eviction fires, so the operator warning is logged
     /// exactly once per `(table, col)` posting list.
     eviction_warned: bool,
+
+    // ── Row tier (optional, second granularity) ──────────────────────────────
+    /// SEALED row-granular postings: `term → (file → sorted unique row
+    /// offsets)`. Only present for `(term, file)` pairs that (a) were below the
+    /// density cap at seal time and (b) survived row-tier budget eviction. A
+    /// `(term, file)` absent here falls back to the coarse `entries` tier for
+    /// that file — never a false negative.
+    row_entries: HashMap<String, HashMap<Arc<str>, Vec<u32>>>,
+    /// In-progress row-offset accumulation for the file currently being
+    /// indexed, keyed `term → offsets` (appended in `index_row`, finalised in
+    /// `seal_file_row_tier`). One file is sealed at a time on the build path,
+    /// so this is scoped to `building_file`.
+    row_build: HashMap<String, Vec<u32>>,
+    /// The file path `row_build` is accumulating for; cleared on seal.
+    building_file: Option<Arc<str>>,
+    /// Count of indexed (non-null, term-bearing) rows seen for `building_file`,
+    /// used to compute each term's per-file density at seal.
+    building_rows: u64,
+    /// Files that have a SEALED row tier (every term occurring in the file is
+    /// either in `row_entries[term][file]` or was dropped by the density cap —
+    /// in which case the file is recorded in `row_tier_dense_terms` so the
+    /// probe knows the absence is "dense, fall back" not "no posting"). A file
+    /// here is row-tier-trustworthy; a file absent here uses the coarse tier.
+    row_tier_files: HashSet<Arc<str>>,
+    /// `file → set of terms that were DROPPED by the density cap for that file`.
+    /// At probe time, if a needle term is dense for a candidate file, that file
+    /// cannot be row-narrowed (the term offers no row posting) and must be
+    /// decoded in full for that term → the file is emitted with NO row
+    /// selection (coarse decode). Distinguishes "dense, must decode" from
+    /// "term absent → file prunable".
+    row_tier_dense_terms: HashMap<Arc<str>, HashSet<String>>,
+    /// Total row-tier budget cost (sum of `row_block_budget_cost` over every
+    /// block in `row_entries`). Counted against the per-project budget.
+    row_tier_cost: usize,
+    /// FIFO order of `(term, file)` row blocks for row-tier eviction.
+    row_insert_order: Vec<(String, Arc<str>)>,
 }
 
 impl TermPostingList {
@@ -216,6 +342,43 @@ impl TermPostingList {
     /// posting pairs this insert removed (after netting the +1 it may have
     /// added), so the registry can keep its per-project pair accounting exact.
     fn insert(&mut self, term: &str, file: &Arc<str>, budget: usize) -> (HashSet<String>, usize) {
+        self.insert_with_row(term, file, None, budget)
+    }
+
+    /// Coarse-tier insert, plus optional ROW-tier accumulation.
+    ///
+    /// When `row_offset` is `Some(o)`, `o` is the absolute row index of this
+    /// term occurrence within `file`. It is appended to the in-progress
+    /// per-file row builder; the builder is finalised (density cap applied,
+    /// sorted, deduped, moved into `row_entries`) by [`Self::seal_file_row_tier`]
+    /// once every row of the file has been indexed. The coarse tier is updated
+    /// identically whether or not a row offset is supplied — the row tier is
+    /// strictly additive and never affects coarse correctness.
+    fn insert_with_row(
+        &mut self,
+        term: &str,
+        file: &Arc<str>,
+        row_offset: Option<u64>,
+        budget: usize,
+    ) -> (HashSet<String>, usize) {
+        // Row-tier accumulation. The builder is scoped to one file; if a
+        // different file starts indexing without a seal (a logic error on the
+        // build path), drop the stale builder rather than mixing offsets across
+        // files (which would be unsound — offsets are file-relative).
+        if let Some(off) = row_offset {
+            match &self.building_file {
+                Some(cur) if Arc::ptr_eq(cur, file) || cur.as_ref() == file.as_ref() => {}
+                _ => {
+                    self.row_build.clear();
+                    self.building_rows = 0;
+                    self.building_file = Some(file.clone());
+                }
+            }
+            // A `u32` offset caps a file at ~4.29B rows; clamp defensively.
+            let off32 = off.min(u32::MAX as u64) as u32;
+            self.row_build.entry(term.to_string()).or_default().push(off32);
+        }
+
         match self.entries.get_mut(term) {
             Some(set) => {
                 if set.insert(file.clone()) {
@@ -282,8 +445,242 @@ impl TermPostingList {
             }
         }
         self.files.remove(file_path);
+        // Row tier: drop every block referencing this file, free its budget,
+        // and clear its trustworthiness markers. A file that is gone can no
+        // longer be row-narrowed (and must not be: its offsets are stale).
+        let mut row_freed = 0usize;
+        for blocks in self.row_entries.values_mut() {
+            if let Some(offs) = blocks.remove(file_path) {
+                row_freed += row_block_budget_cost(offs.len());
+            }
+        }
+        self.row_entries.retain(|_, blocks| !blocks.is_empty());
+        self.row_tier_cost = self.row_tier_cost.saturating_sub(row_freed);
+        self.row_insert_order.retain(|(_, f)| f.as_ref() != file_path);
+        self.row_tier_files.remove(file_path);
+        self.row_tier_dense_terms.remove(file_path);
         removed
     }
+
+    // ── Row-tier build / probe / evict ───────────────────────────────────────
+
+    /// Record that one indexed (non-null, term-bearing) row was processed for
+    /// the file currently being built. Drives the per-file density denominator.
+    fn note_indexed_row(&mut self, file: &Arc<str>) {
+        match &self.building_file {
+            Some(cur) if cur.as_ref() == file.as_ref() => {}
+            _ => {
+                self.row_build.clear();
+                self.building_rows = 0;
+                self.building_file = Some(file.clone());
+            }
+        }
+        self.building_rows += 1;
+    }
+
+    /// Finalise the row tier for `file`: apply the density cap per term, sort +
+    /// dedup the surviving offset lists, move them into `row_entries`, record
+    /// dropped (dense) terms, and mark the file row-tier-trustworthy. Returns
+    /// the budget cost added (so the registry can fold it into per-project
+    /// accounting). Called exactly once per file, after all its rows have been
+    /// indexed.
+    ///
+    /// `max_ratio_pct` is the density cap (% of the file's indexed rows). A
+    /// `(term, file)` block whose offset count exceeds that ratio is DROPPED —
+    /// the file decodes in full for that term (recorded in
+    /// `row_tier_dense_terms`). The block is also dropped (kept coarse-only)
+    /// when `row_offset` was never supplied for this build (offsets disabled).
+    fn seal_file_row_tier(&mut self, file: &Arc<str>, max_ratio_pct: u64) -> usize {
+        // Only seal the file we actually accumulated. A mismatch means the row
+        // tier was not driven for this file (e.g. offsets disabled) — leave the
+        // file coarse-only (no row_tier_files entry → probe uses coarse tier).
+        let building_matches =
+            matches!(&self.building_file, Some(cur) if cur.as_ref() == file.as_ref());
+        if !building_matches {
+            self.row_build.clear();
+            self.building_rows = 0;
+            self.building_file = None;
+            return 0;
+        }
+        let total_rows = self.building_rows;
+        // Density threshold: floor(total_rows * pct / 100). A block with
+        // strictly more offsets than this is "dense" → dropped (decode in full
+        // for that term). Floor is the conservative choice — it drops a block
+        // slightly sooner, never keeps one it should drop.
+        let dense_threshold = total_rows.saturating_mul(max_ratio_pct) / 100;
+        let mut added_cost = 0usize;
+        let build = std::mem::take(&mut self.row_build);
+        let mut dense: HashSet<String> = HashSet::new();
+        for (term, mut offs) in build {
+            offs.sort_unstable();
+            offs.dedup();
+            let n = offs.len() as u64;
+            if n == 0 {
+                continue;
+            }
+            if n > dense_threshold {
+                // Too dense to be worth a row posting — coarse decode is fine.
+                dense.insert(term);
+                continue;
+            }
+            let cost = row_block_budget_cost(offs.len());
+            self.row_entries
+                .entry(term.clone())
+                .or_default()
+                .insert(file.clone(), offs);
+            self.row_insert_order.push((term, file.clone()));
+            self.row_tier_cost += cost;
+            added_cost += cost;
+        }
+        if !dense.is_empty() {
+            self.row_tier_dense_terms.insert(file.clone(), dense);
+        }
+        self.row_tier_files.insert(file.clone());
+        self.building_file = None;
+        self.building_rows = 0;
+        added_cost
+    }
+
+    /// Evict the oldest row-tier blocks until `row_tier_cost <= budget`.
+    /// Returns the budget cost freed. The COARSE tier is never touched here —
+    /// row postings are pure accelerators and are sacrificed first under
+    /// pressure. A file whose last row block is evicted loses
+    /// `row_tier_files`/`row_tier_dense_terms` membership so the probe cleanly
+    /// falls back to coarse decode for it (never a false negative).
+    fn evict_row_tier_to(&mut self, budget: usize) -> usize {
+        if self.row_tier_cost <= budget {
+            return 0;
+        }
+        let mut freed = 0usize;
+        let mut idx = 0usize;
+        while self.row_tier_cost > budget && idx < self.row_insert_order.len() {
+            let (term, file) = self.row_insert_order[idx].clone();
+            idx += 1;
+            if let Some(blocks) = self.row_entries.get_mut(&term) {
+                if let Some(offs) = blocks.remove(&file) {
+                    let cost = row_block_budget_cost(offs.len());
+                    self.row_tier_cost = self.row_tier_cost.saturating_sub(cost);
+                    freed += cost;
+                    if blocks.is_empty() {
+                        self.row_entries.remove(&term);
+                    }
+                    // If the file has no remaining row blocks AND no dense
+                    // markers, it is no longer row-tier-trustworthy.
+                    let file_has_blocks = self
+                        .row_entries
+                        .values()
+                        .any(|b| b.contains_key(&file));
+                    if !file_has_blocks
+                        && !self.row_tier_dense_terms.contains_key(&file)
+                    {
+                        self.row_tier_files.remove(&file);
+                    }
+                }
+            }
+        }
+        // Compact the consumed prefix of the FIFO order.
+        if idx > 0 {
+            self.row_insert_order.drain(..idx.min(self.row_insert_order.len()));
+        }
+        freed
+    }
+
+    /// `true` when `file` has a sealed, trustworthy row tier.
+    fn file_has_row_tier(&self, file: &str) -> bool {
+        self.row_tier_files.iter().any(|f| f.as_ref() == file)
+    }
+
+    /// For a needle `terms` set and a single `file` that has a sealed row tier,
+    /// compute the AND-intersection of the per-term row-offset lists, returning
+    /// a sorted superset of the matching row offsets.
+    ///
+    /// Returns:
+    /// * `RowProbe::Full` — the file cannot be row-narrowed for this needle
+    ///   (EVERY needle term is DENSE for the file → no row posting offers a
+    ///   constraint): decode the file in full (coarse).
+    /// * `RowProbe::Rows(v)` — `v` is the sorted superset of matching row
+    ///   offsets; the reader decodes only these rows. `v` empty ⇒ no row in the
+    ///   file matches (the file is fully prunable, but the caller already knows
+    ///   the file is a coarse candidate, so an empty row set safely yields zero
+    ///   rows after the UDF recheck).
+    /// * `RowProbe::Absent` — some needle term has NO posting AND is not dense
+    ///   for this file: the term provably never occurs here, so the file holds
+    ///   no match (fully prunable).
+    ///
+    /// A DENSE needle term contributes NO constraint and is SKIPPED — the
+    /// remaining selective terms still bound the row set, and dropping a
+    /// constraint only ever WIDENS the set (keeps the superset invariant). This
+    /// is what lets the bench's everywhere-dense `key:tag` term coexist with a
+    /// selective `kv:tag="rare"` term: the selective term still narrows decode.
+    fn probe_row_offsets(&self, terms: &[String], file: &str) -> RowProbe {
+        let dense_for_file = self
+            .row_tier_dense_terms
+            .iter()
+            .find(|(f, _)| f.as_ref() == file)
+            .map(|(_, s)| s);
+        let mut acc: Option<Vec<u32>> = None;
+        for term in terms {
+            // Dense term for this file → no row posting → no constraint. Skip it
+            // (dropping a conjunct only widens the result, preserving the
+            // superset invariant). The file decodes the surviving rows of the
+            // selective terms; if EVERY term is dense, `acc` stays None → Full.
+            if dense_for_file.is_some_and(|s| s.contains(term)) {
+                continue;
+            }
+            let block = self
+                .row_entries
+                .get(term)
+                .and_then(|blocks| blocks.iter().find(|(f, _)| f.as_ref() == file).map(|(_, v)| v));
+            match block {
+                None => {
+                    // Term has no row block for this file and is not dense:
+                    // it provably never occurs in this (row-tier-sealed) file.
+                    return RowProbe::Absent;
+                }
+                Some(offs) => {
+                    acc = Some(match acc {
+                        None => offs.clone(),
+                        Some(prev) => intersect_sorted(&prev, offs),
+                    });
+                }
+            }
+        }
+        match acc {
+            None => RowProbe::Full,
+            Some(v) => RowProbe::Rows(v),
+        }
+    }
+}
+
+/// Intersection of two ascending-sorted, deduplicated `u32` offset lists.
+/// O(a + b). Result is ascending-sorted and deduplicated.
+fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len().min(b.len()));
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Result of a per-file row-tier probe (see
+/// [`TermPostingList::probe_row_offsets`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowProbe {
+    /// Decode the file in full (a needle term is dense / no row tier to apply).
+    Full,
+    /// Sorted superset of matching row offsets within the file.
+    Rows(Vec<u32>),
+    /// A needle term provably never occurs in this file — fully prunable.
+    Absent,
 }
 
 // ── Term extraction ───────────────────────────────────────────────────────────
@@ -560,10 +957,12 @@ impl GinIndexRegistry {
         opclass: &str,
         jsonb_bytes: &[u8],
         file_path: &str,
-        // Row-group / row are accepted for call-site compatibility but not
-        // stored: posting granularity is the FILE (see TermPostingList).
+        // Row-group is accepted for call-site compatibility but not stored
+        // (coarse granularity is the FILE). `row` is the absolute row index
+        // within `file_path` and drives the optional ROW tier — it maps
+        // directly to the reader's `RowSelection` coordinate space.
         _row_group: u32,
-        _row: u64,
+        row: u64,
     ) {
         let value: Value = match serde_json::from_slice(jsonb_bytes) {
             Ok(v) => v,
@@ -573,6 +972,7 @@ impl GinIndexRegistry {
         if terms.is_empty() {
             return;
         }
+        let want_row_tier = row_tier_enabled();
         // Per-project partition (noisy-neighbour GIN): the eviction trigger is
         // this project's fair share of the global budget, with a floor, NOT the
         // raw global budget. Computing it from the live active-project count
@@ -587,9 +987,16 @@ impl GinIndexRegistry {
         let mut all_evicted_files: HashSet<String> = HashSet::new();
         let mut added_pairs: usize = 0;
         let mut removed_pairs: usize = 0;
+        // Row tier: count this row once for the per-file density denominator,
+        // then feed each term its row offset. Coarse-tier accounting is
+        // unchanged (the row offset is purely additive).
+        if want_row_tier {
+            list.note_indexed_row(&file);
+        }
         for term in &terms {
             let before = list.total_count;
-            let (evicted_files, removed) = list.insert(term, &file, budget);
+            let row_off = if want_row_tier { Some(row) } else { None };
+            let (evicted_files, removed) = list.insert_with_row(term, &file, row_off, budget);
             // `total_count` after = before + (added ∈ {0,1}) - removed. Recover
             // the +added term so the per-project accounting nets exactly:
             // added = after - (before - removed).
@@ -839,8 +1246,98 @@ impl GinIndexRegistry {
     ) {
         let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
         if let Ok(mut map) = self.indexed_files.lock() {
-            map.entry(key).or_default().insert(file_path.to_string());
+            map.entry(key.clone()).or_default().insert(file_path.to_string());
         }
+        // Seal the ROW tier for this file: apply the density cap, finalise the
+        // surviving offset lists, then enforce the per-project row-tier budget
+        // (row blocks are evicted FIRST under pressure — they are accelerators,
+        // the coarse tier is the must-keep). The row-tier budget shares the
+        // same per-project allowance as the coarse pairs; sealing folds its
+        // cost into the per-project accounting so a flood of selective row
+        // postings cannot exceed a project's fair share.
+        if row_tier_enabled() {
+            if let Some(arc) = self.get(project, table, col) {
+                let budget = self.effective_project_budget();
+                let (added, freed) = {
+                    let mut list = arc.lock().expect("TermPostingList lock poisoned");
+                    // `intern_file` returns the canonical Arc the builder used,
+                    // so `seal_file_row_tier`'s `building_file == file` check
+                    // matches (same interned path).
+                    let file = list.intern_file(file_path);
+                    let added = list.seal_file_row_tier(&file, row_tier_max_ratio_pct());
+                    let freed = list.evict_row_tier_to(budget);
+                    (added, freed)
+                };
+                // Row-tier cost is counted in the SAME per-project budget units
+                // as coarse pairs (both are "posting budget"); fold the net so
+                // the partition stays honest.
+                self.adjust_project_pairs(project, added, freed);
+            }
+        }
+    }
+
+    /// Probe the ROW tier for a `@>` needle across the supplied candidate
+    /// files. For each file the registry returns one of:
+    ///   * a sorted superset of matching row offsets (decode only those rows),
+    ///   * "decode in full" (a needle term is dense for the file, or the file
+    ///     has no sealed row tier),
+    ///   * "prunable" (a needle term provably never occurs in the file).
+    ///
+    /// The result is a per-file `RowSelectionPlan`:
+    ///   * `row_offsets`: `file → sorted absolute row offsets` for files that
+    ///     can be row-narrowed (a SUPERSET of true matches — the UDF rechecks);
+    ///   * `prunable`: files provably holding no match (caller may drop them);
+    ///   * files NOT in either set decode in full (coarse tier).
+    ///
+    /// Trustworthiness mirrors the coarse tier exactly: a file is row-narrowed
+    /// ONLY when it has a sealed row tier (`file_has_row_tier`). The caller is
+    /// responsible for the overlay / completeness gate (the same gate the
+    /// coarse path uses) — this method assumes the file set it is handed is
+    /// already overlay-free and complete.
+    pub fn probe_row_selection(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        opclass: &str,
+        needle_bytes: &[u8],
+        candidate_paths: &[String],
+    ) -> RowSelectionPlan {
+        let mut plan = RowSelectionPlan::default();
+        if !row_tier_enabled() {
+            return plan;
+        }
+        let needle: Value = match serde_json::from_slice(needle_bytes) {
+            Ok(v) => v,
+            Err(_) => return plan,
+        };
+        let terms = needle_terms(&needle, opclass);
+        if terms.is_empty() {
+            return plan;
+        }
+        let arc = match self.get(project, table, col) {
+            Some(a) => a,
+            None => return plan,
+        };
+        let list = arc.lock().expect("TermPostingList lock poisoned");
+        for path in candidate_paths {
+            if !list.file_has_row_tier(path) {
+                // No sealed row tier → coarse decode (leave out of both maps).
+                continue;
+            }
+            match list.probe_row_offsets(&terms, path) {
+                RowProbe::Full => { /* coarse decode */ }
+                RowProbe::Absent => {
+                    plan.prunable.insert(path.clone());
+                }
+                RowProbe::Rows(offs) => {
+                    // Convert to u64 for the reader's coordinate space.
+                    let offs64: Vec<u64> = offs.into_iter().map(|o| o as u64).collect();
+                    plan.row_offsets.insert(path.clone(), offs64);
+                }
+            }
+        }
+        plan
     }
 
     /// Return the set of file paths that have been completely indexed for
@@ -1060,6 +1557,29 @@ pub enum GinScanSet {
     /// every needle term.  May equal the live set (no pruning possible) or be
     /// empty (no live file can match).
     ScanFiles(Vec<String>),
+}
+
+/// Result of a ROW-tier probe — see [`GinIndexRegistry::probe_row_selection`].
+///
+/// `row_offsets` carries, per file, the sorted SUPERSET of absolute row offsets
+/// that may match (the reader decodes only these rows; the `jsonb_contains` UDF
+/// re-checks each). `prunable` lists files a needle term provably never touches.
+/// Any candidate file in NEITHER map decodes in full (coarse tier) — that is
+/// the safe default and the only behaviour for files without a sealed row tier.
+#[derive(Debug, Default, Clone)]
+pub struct RowSelectionPlan {
+    /// `file → sorted ascending absolute row offsets` (superset of matches).
+    pub row_offsets: HashMap<String, Vec<u64>>,
+    /// Files provably holding no match for the needle.
+    pub prunable: HashSet<String>,
+}
+
+impl RowSelectionPlan {
+    /// `true` when the plan narrows nothing (no row offsets, no prunable file).
+    /// The caller skips the row-selection delivery entirely in that case.
+    pub fn is_empty(&self) -> bool {
+        self.row_offsets.is_empty() && self.prunable.is_empty()
+    }
 }
 
 // ── Planner detection ─────────────────────────────────────────────────────────
@@ -4306,5 +4826,184 @@ mod tests {
             "B's postings survive A's removal"
         );
         assert_eq!(registry.active_project_count(), 1, "only B remains active");
+    }
+
+    // ── Row-tier unit tests ──────────────────────────────────────────────────
+
+    /// `intersect_sorted` is a sorted set intersection: ascending, deduped,
+    /// keeping only elements present in BOTH inputs.
+    #[test]
+    fn intersect_sorted_keeps_common_offsets() {
+        assert_eq!(intersect_sorted(&[1, 3, 5, 7], &[3, 4, 5, 9]), vec![3, 5]);
+        assert_eq!(intersect_sorted(&[], &[1, 2]), Vec::<u32>::new());
+        assert_eq!(intersect_sorted(&[1, 2, 3], &[1, 2, 3]), vec![1, 2, 3]);
+        assert_eq!(intersect_sorted(&[1, 2], &[3, 4]), Vec::<u32>::new());
+    }
+
+    /// A selective term (few matching rows in a large file) is kept as a row
+    /// block; intersecting two selective needle terms narrows to their common
+    /// rows. The block is a SUPERSET — never drops an offset present for both.
+    #[test]
+    fn row_tier_keeps_selective_term_and_intersects() {
+        let mut pl = TermPostingList::new();
+        let f = pl.intern_file("f.parquet");
+        // Simulate a 100-row file: term "a" at rows {2,40}, "b" at {2,77}.
+        // Density cap 60% of 100 = 60; both terms are well under.
+        pl.note_indexed_row(&f); // bump building_rows to a representative count
+        for _ in 0..99 {
+            pl.note_indexed_row(&f);
+        }
+        let big = 1_000_000usize;
+        pl.insert_with_row("a", &f, Some(2), big);
+        pl.insert_with_row("a", &f, Some(40), big);
+        pl.insert_with_row("b", &f, Some(2), big);
+        pl.insert_with_row("b", &f, Some(77), big);
+        let added = pl.seal_file_row_tier(&f, 60);
+        assert!(added > 0, "selective blocks kept");
+        assert!(pl.file_has_row_tier("f.parquet"));
+        // AND-probe {a,b}: only row 2 is common.
+        match pl.probe_row_offsets(&["a".to_string(), "b".to_string()], "f.parquet") {
+            RowProbe::Rows(v) => assert_eq!(v, vec![2]),
+            other => panic!("expected Rows([2]), got {other:?}"),
+        }
+        // Probe a term that never occurred → file provably prunable.
+        match pl.probe_row_offsets(&["zzz".to_string()], "f.parquet") {
+            RowProbe::Absent => {}
+            other => panic!("expected Absent, got {other:?}"),
+        }
+    }
+
+    /// The density cap drops a near-universal term: a needle that includes a
+    /// dense term forces full decode (`RowProbe::Full`) — the inversion that
+    /// keeps the row tier from bloating on the bench's everywhere-dense needle.
+    #[test]
+    fn row_tier_density_cap_drops_dense_term_to_full_decode() {
+        let mut pl = TermPostingList::new();
+        let f = pl.intern_file("f.parquet");
+        // 10-row file. "dense" occurs in 9/10 rows (90% > 60% cap → dropped).
+        // "rare" occurs in 1/10 rows (kept).
+        for _ in 0..10 {
+            pl.note_indexed_row(&f);
+        }
+        let big = 1_000_000usize;
+        for r in 0..9u64 {
+            pl.insert_with_row("dense", &f, Some(r), big);
+        }
+        pl.insert_with_row("rare", &f, Some(5), big);
+        pl.seal_file_row_tier(&f, 60);
+        assert!(pl.file_has_row_tier("f.parquet"));
+        // A needle whose ONLY term is dense cannot row-narrow → Full.
+        match pl.probe_row_offsets(&["dense".to_string()], "f.parquet") {
+            RowProbe::Full => {}
+            other => panic!("expected Full (only dense), got {other:?}"),
+        }
+        // The rare term alone still narrows.
+        match pl.probe_row_offsets(&["rare".to_string()], "f.parquet") {
+            RowProbe::Rows(v) => assert_eq!(v, vec![5]),
+            other => panic!("expected Rows([5]), got {other:?}"),
+        }
+        // A needle combining dense+rare: the dense term is SKIPPED (no
+        // constraint) and the selective `rare` term still narrows decode to its
+        // rows — the key win for the bench's everywhere-dense needle term.
+        match pl.probe_row_offsets(&["rare".to_string(), "dense".to_string()], "f.parquet") {
+            RowProbe::Rows(v) => assert_eq!(v, vec![5]),
+            other => panic!("expected Rows([5]) (dense skipped), got {other:?}"),
+        }
+    }
+
+    /// Row-tier budget eviction frees the OLDEST blocks first and never touches
+    /// the coarse tier. After eviction below budget, the evicted file falls
+    /// back to coarse decode (no row tier) — never a false negative.
+    #[test]
+    fn row_tier_eviction_frees_oldest_and_preserves_coarse() {
+        let mut pl = TermPostingList::new();
+        let f1 = pl.intern_file("f1.parquet");
+        let big = 1_000_000usize;
+        // Two files, each with one selective term, each costing 1 budget unit.
+        for _ in 0..100 {
+            pl.note_indexed_row(&f1);
+        }
+        pl.insert_with_row("t1", &f1, Some(3), big);
+        pl.seal_file_row_tier(&f1, 60);
+        let f2 = pl.intern_file("f2.parquet");
+        for _ in 0..100 {
+            pl.note_indexed_row(&f2);
+        }
+        pl.insert_with_row("t2", &f2, Some(7), big);
+        pl.seal_file_row_tier(&f2, 60);
+        assert_eq!(pl.row_tier_cost, 2);
+        // Coarse tier still has both files' terms.
+        assert!(pl.probe_term("t1").is_some());
+        assert!(pl.probe_term("t2").is_some());
+        // Evict to budget 1 → the oldest (f1/t1) block goes.
+        let freed = pl.evict_row_tier_to(1);
+        assert!(freed >= 1);
+        assert!(pl.row_tier_cost <= 1);
+        assert!(!pl.file_has_row_tier("f1.parquet"), "f1 row tier evicted");
+        assert!(pl.file_has_row_tier("f2.parquet"), "f2 survives (newer)");
+        // Coarse tier untouched — both files still prunable at file granularity.
+        assert!(pl.probe_term("t1").is_some(), "coarse tier preserved");
+        assert!(pl.probe_term("t2").is_some());
+    }
+
+    /// `remove_file` drops the file's row blocks and frees their budget, so a
+    /// compacted/CoW-replaced file leaves no stale offsets behind.
+    #[test]
+    fn remove_file_drops_row_tier_blocks() {
+        let mut pl = TermPostingList::new();
+        let f = pl.intern_file("f.parquet");
+        let big = 1_000_000usize;
+        for _ in 0..50 {
+            pl.note_indexed_row(&f);
+        }
+        pl.insert_with_row("t", &f, Some(1), big);
+        pl.seal_file_row_tier(&f, 60);
+        assert!(pl.row_tier_cost > 0);
+        pl.remove_file("f.parquet");
+        assert_eq!(pl.row_tier_cost, 0);
+        assert!(!pl.file_has_row_tier("f.parquet"));
+        assert!(pl.row_entries.is_empty());
+    }
+
+    /// End-to-end through the registry: a selective `@>` needle yields a row
+    /// selection that is a superset of the true match; a dense term yields full
+    /// decode for its file; an absent term prunes the file.
+    #[test]
+    fn registry_row_selection_superset_and_prune() {
+        let registry = GinIndexRegistry::new();
+        let table = TableName::new("t").unwrap();
+        let p = ProjectId::new();
+        let opclass = "jsonb_ops";
+        let file = "projects/x/data/f.parquet"; // path string is opaque here
+        // 4 rows. row0 {tag:"x"}, row1 {tag:"y"}, row2 {tag:"x",extra:1},
+        // row3 {tag:"y"}.  Needle {tag:"x"} → rows {0,2}.
+        let docs = [
+            serde_json::json!({"tag":"x"}),
+            serde_json::json!({"tag":"y"}),
+            serde_json::json!({"tag":"x","extra":1}),
+            serde_json::json!({"tag":"y"}),
+        ];
+        for (r, d) in docs.iter().enumerate() {
+            let bytes = serde_json::to_vec(d).unwrap();
+            registry.index_row(&p, &table, "payload", opclass, &bytes, file, 0, r as u64);
+        }
+        registry.mark_file_indexed(&p, &table, "payload", file);
+
+        let needle = serde_json::to_vec(&serde_json::json!({"tag":"x"})).unwrap();
+        let plan = registry.probe_row_selection(
+            &p, &table, "payload", opclass, &needle, &[file.to_string()],
+        );
+        // tag=x is selective (2/4 = 50% <= 60% cap) → row offsets kept.
+        let offs = plan.row_offsets.get(file).expect("row offsets present");
+        assert!(offs.contains(&0) && offs.contains(&2), "superset of true matches {offs:?}");
+        assert!(!offs.contains(&1) && !offs.contains(&3), "non-matching rows excluded");
+        assert!(plan.prunable.is_empty());
+
+        // A needle naming a key that never appears prunes the file.
+        let needle2 = serde_json::to_vec(&serde_json::json!({"absent":true})).unwrap();
+        let plan2 = registry.probe_row_selection(
+            &p, &table, "payload", opclass, &needle2, &[file.to_string()],
+        );
+        assert!(plan2.prunable.contains(file), "absent term prunes file");
     }
 }

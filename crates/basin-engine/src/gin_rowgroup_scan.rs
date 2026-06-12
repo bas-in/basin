@@ -91,6 +91,13 @@ pub(crate) struct GinRowGroupPrunedTable {
     /// `candidate_paths`; values are ascending sorted row-group indices.
     /// A file absent from this map is read in full (conservative fallback).
     row_group_selection: HashMap<String, Vec<u32>>,
+    /// Per-file ROW allowlist from the row-granular GIN tier: `file → sorted
+    /// ascending absolute row offsets` that may match. A file absent from this
+    /// map decodes every surviving row (coarse / row-group behaviour). Always a
+    /// SUPERSET of true matches — the `jsonb_contains` UDF re-checks every
+    /// emitted row. Empty map == row tier inactive (byte-identical to the
+    /// pre-row-tier provider).
+    row_selection: HashMap<String, Vec<u64>>,
 }
 
 impl GinRowGroupPrunedTable {
@@ -103,6 +110,33 @@ impl GinRowGroupPrunedTable {
         candidate_paths: Vec<String>,
         row_group_selection: HashMap<String, Vec<u32>>,
     ) -> Self {
+        Self::new_with_row_selection(
+            schema,
+            storage,
+            project,
+            table,
+            file_format,
+            candidate_paths,
+            row_group_selection,
+            HashMap::new(),
+        )
+    }
+
+    /// Construct with both a row-group allowlist AND a row-tier offset
+    /// allowlist. The row tier narrows decoding to specific rows WITHIN the
+    /// surviving row groups — the structurally weak case for file/row-group
+    /// pruning (a needle present in every file but matching few rows per file).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_row_selection(
+        schema: SchemaRef,
+        storage: Storage,
+        project: ProjectId,
+        table: TableName,
+        file_format: TableFileFormat,
+        candidate_paths: Vec<String>,
+        row_group_selection: HashMap<String, Vec<u32>>,
+        row_selection: HashMap<String, Vec<u64>>,
+    ) -> Self {
         Self {
             schema,
             storage,
@@ -111,6 +145,7 @@ impl GinRowGroupPrunedTable {
             file_format,
             candidate_paths,
             row_group_selection,
+            row_selection,
         }
     }
 }
@@ -164,6 +199,14 @@ impl datafusion::catalog::TableProvider for GinRowGroupPrunedTable {
             projection: proj_names,
             limit,
             row_group_selection: Some(self.row_group_selection.clone()),
+            // Row tier: deliver the per-file offset allowlist when non-empty.
+            // `None` when inactive so the reader's row-selection path is a
+            // strict no-op (byte-identical to before).
+            row_selection: if self.row_selection.is_empty() {
+                None
+            } else {
+                Some(self.row_selection.clone())
+            },
             ..ReadOptions::default()
         };
 
