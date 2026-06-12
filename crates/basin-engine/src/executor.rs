@@ -407,8 +407,10 @@ pub(crate) fn needs_rewrite_pipeline(sql: &str) -> bool {
     //         A trivial point-query has zero `(` so this is a safe trigger.
     let has_symbol_marker = bytes
         .windows(2)
-        .any(|w| matches!(w, b"::" | b"->" | b"<-" | b"<#" | b"<=" | b"B'"))
-        || bytes.iter().any(|&b| matches!(b, b'@' | b'~' | b'?' | b'&' | b'|' | b'#' | b'('));
+        // `<%` — trgm word-similarity operator `a <% b` (2-byte window catches it;
+        // also catches `<->` via the existing `<-` window below).
+        .any(|w| matches!(w, b"::" | b"->" | b"<-" | b"<#" | b"<=" | b"B'" | b"<%"))
+        || bytes.iter().any(|&b| matches!(b, b'@' | b'~' | b'?' | b'&' | b'|' | b'#' | b'(' | b'%'));
     if has_symbol_marker {
         return true;
     }
@@ -655,6 +657,17 @@ async fn run_full_rewrite_pipeline(sess: &ProjectSession, sql: &str) -> Result<S
     let rewritten = crate::range_udf::rewrite_range_operators(&rewritten);
     // Rewrite `'...'::int4range` / `'...'::daterange` etc. to just `'...'`.
     let rewritten = crate::range_udf::rewrite_range_casts(&rewritten);
+    // Rewrite pg_trgm operators (`%`, `<%`, `<->`) to function-call forms.
+    // Runs after `rewrite_vector_operators` so that pgvector `<->` has already
+    // been expanded to `l2_distance`; any remaining `<->` is either a text
+    // trigram distance or a tsquery phrase operator inside a string literal
+    // (quote-aware scan protects the literal case).
+    // `%` / modulo: skipped when both operands are bare numeric literals.
+    let rewritten = crate::trgm_glue::rewrite_trgm_operators(
+        &rewritten,
+        crate::session::session_trgm_similarity_threshold(&sess.state),
+        crate::session::session_trgm_word_similarity_threshold(&sess.state),
+    );
     // Rewrite `SUBSTRING(<expr> FROM '<regex>')` into `substring_regex(...)`.
     let rewritten = crate::regex_udf::rewrite_substring_regex(&rewritten);
     // Route `EXTRACT(SECOND FROM <expr>)` to the Basin UDF.
@@ -2480,6 +2493,39 @@ async fn dispatch_parsed_statement(
                 let on = crate::session::parse_pg_bool(&raw)?;
                 crate::session::set_session_synchronous_commit(&sess.state, on);
                 Ok(ExecResult::Empty { tag: "SET".into() })
+            } else if var_name == "pg_trgm.similarity_threshold" {
+                // SET pg_trgm.similarity_threshold = 0.4
+                // Controls the `a % b` operator threshold for this session.
+                let raw = extract_set_string_value(&values);
+                let trimmed = raw.trim().trim_matches('\'').trim_matches('"').trim();
+                match trimmed.parse::<f32>() {
+                    Ok(v) => {
+                        crate::session::set_session_trgm_similarity_threshold(&sess.state, v);
+                        Ok(ExecResult::Empty { tag: "SET".into() })
+                    }
+                    Err(_) => Err(basin_common::BasinError::InvalidSchema(format!(
+                        "invalid value for pg_trgm.similarity_threshold: {trimmed:?} \
+                         (expected a float in [0.0, 1.0])"
+                    ))),
+                }
+            } else if var_name == "pg_trgm.word_similarity_threshold" {
+                // SET pg_trgm.word_similarity_threshold = 0.5
+                // Controls the `a <% b` operator threshold for this session.
+                let raw = extract_set_string_value(&values);
+                let trimmed = raw.trim().trim_matches('\'').trim_matches('"').trim();
+                match trimmed.parse::<f32>() {
+                    Ok(v) => {
+                        crate::session::set_session_trgm_word_similarity_threshold(
+                            &sess.state,
+                            v,
+                        );
+                        Ok(ExecResult::Empty { tag: "SET".into() })
+                    }
+                    Err(_) => Err(basin_common::BasinError::InvalidSchema(format!(
+                        "invalid value for pg_trgm.word_similarity_threshold: {trimmed:?} \
+                         (expected a float in [0.0, 1.0])"
+                    ))),
+                }
             } else {
                 // Silently accept unknown SET variables.
                 Ok(ExecResult::Empty { tag: "SET".into() })
@@ -3149,6 +3195,22 @@ async fn dispatch_parsed_statement(
                 // arrives as `basin_synchronous_commit`.
                 let val = crate::session::show_synchronous_commit(&sess.state);
                 Ok(make_show_result("basin.synchronous_commit", val))
+            } else if var_name == "pg_trgm_similarity_threshold"
+                || var_name == "pg_trgm.similarity_threshold"
+            {
+                // SHOW pg_trgm.similarity_threshold
+                // sqlparser joins dotted names with `_`, so both forms must match.
+                let v = crate::session::session_trgm_similarity_threshold(&sess.state);
+                Ok(make_show_result("pg_trgm.similarity_threshold", &format!("{v}")))
+            } else if var_name == "pg_trgm_word_similarity_threshold"
+                || var_name == "pg_trgm.word_similarity_threshold"
+            {
+                // SHOW pg_trgm.word_similarity_threshold
+                let v = crate::session::session_trgm_word_similarity_threshold(&sess.state);
+                Ok(make_show_result(
+                    "pg_trgm.word_similarity_threshold",
+                    &format!("{v}"),
+                ))
             } else {
                 // Silently return empty for other SHOW <var> forms so
                 // ORM startup queries don't hard-fail.

@@ -18,6 +18,12 @@ basin-vector.workspace = true
 # basin-geo has no dependency on basin-engine, so this is dependency-cycle-
 # free (basin-geo -> basin-common only).
 basin-geo.workspace = true
+# pg_trgm-compatible fuzzy-text layer. Engine depends on basin-trgm for:
+# - similarity / word_similarity / show_trgm DataFusion UDFs (trgm_glue.rs)
+# - DEFAULT_SIMILARITY_THRESHOLD / DEFAULT_WORD_SIMILARITY_THRESHOLD constants
+#   (initialise per-session pg_trgm GUCs in session.rs)
+# basin-trgm -> basin-common only — dependency-cycle-free.
+basin-trgm.workspace = true
 basin-shard.workspace = true
 basin-wal.workspace = true
 basin-hottier.workspace = true

@@ -1132,6 +1132,7 @@ dependencies = [
  "basin-shard",
  "basin-sketch",
  "basin-storage",
+ "basin-trgm",
  "basin-vector",
  "basin-wal",
  "basin-webhooks",

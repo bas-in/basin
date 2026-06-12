@@ -750,6 +750,32 @@ pub(crate) fn rewrite_vector_operators(sql: &str) -> String {
         let lhs = &s[lhs_start..lhs_end];
         let rhs = &s[rhs_start..rhs_end];
 
+        // pgvector `<->` vs pg_trgm `<->` ownership: `<->` is overloaded as the
+        // pgvector L2-distance operator AND the pg_trgm trigram-distance
+        // operator. l2_distance() rejects a non-bracketed operand, so rewriting
+        // `'word' <-> 'word'` (text, trigram distance) to l2_distance would
+        // surface a spurious "vector literal must be bracketed" error instead of
+        // letting the later trgm rewriter ([`crate::trgm_glue::
+        // rewrite_trgm_operators`]) turn it into `(1.0 - similarity(...))`. So
+        // for `<->` ONLY, skip the vector rewrite when an operand is a plain
+        // (non-vector) text string literal — a quoted string that is NOT a
+        // `'[...]'` vector literal. `<=>` / `<#>` are vector-only (no trgm
+        // twin), so they always rewrite. A surviving text `<->` falls through to
+        // the trgm rewriter; a genuine vector `<->` (bracketed literal or a
+        // vector-typed/`::vector`-cast column — neither is a bare text literal)
+        // still rewrites here.
+        if op == "<->"
+            && (operand_is_nonvector_text_literal(lhs.trim())
+                || operand_is_nonvector_text_literal(rhs.trim()))
+        {
+            // Leave this `<->` for the trgm rewriter; advance past it so the
+            // scan does not re-match the same operator and loop forever.
+            let prefix = s[..op_end].to_string();
+            let tail = rewrite_vector_operators(&s[op_end..]);
+            s = format!("{prefix}{tail}");
+            break;
+        }
+
         let func = match op {
             "<->" => format!("l2_distance({lhs}, {rhs})"),
             "<=>" => format!("cosine_distance({lhs}, {rhs})"),
@@ -760,6 +786,23 @@ pub(crate) fn rewrite_vector_operators(sql: &str) -> String {
         s.replace_range(lhs_start..rhs_end, &func);
     }
     s
+}
+
+/// Return `true` if `expr` is a single-quoted SQL string literal whose content
+/// is NOT a pgvector literal (`'[...]'`). Used to decide that an `<->` operand
+/// is plain text (trigram distance) rather than a vector (L2 distance), so the
+/// vector rewriter defers to the pg_trgm rewriter. A non-literal operand
+/// (identifier / cast / number) returns `false` — only a quoted string that is
+/// clearly text opts a `<->` out of the vector rewrite.
+fn operand_is_nonvector_text_literal(expr: &str) -> bool {
+    let s = expr.trim();
+    if s.len() < 2 || !s.starts_with('\'') || !s.ends_with('\'') {
+        return false;
+    }
+    // Inner content (between the quotes), leading whitespace skipped: a vector
+    // literal starts with `[`. Anything else quoted is plain text.
+    let inner = s[1..s.len() - 1].trim_start();
+    !inner.starts_with('[')
 }
 
 /// Find the first occurrence of any of `<->`, `<#>`, `<=>` OUTSIDE

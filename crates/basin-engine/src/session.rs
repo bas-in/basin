@@ -387,6 +387,10 @@ pub(crate) fn build_stateless_udf_cache() -> StatelessUdfCache {
     // ST_GeomFromWKB). Registered last so case-insensitive lookups
     // resolve to the basin-geo implementation.
     crate::geo_glue::install_udfs(&ctx);
+    // pg_trgm-compatible fuzzy-text UDFs: similarity, word_similarity,
+    // show_trgm. Operators (%, <%, <->) are wired via rewrite_trgm_operators
+    // in the pre-parse pipeline rather than as DataFusion binary operators.
+    crate::trgm_glue::register_trgm_udfs(&ctx);
     let state = ctx.state();
     // Build DataFusion's default optimizer rule list once.  The 27
     // stateless rules are heap-allocated `Arc<dyn OptimizerRule>`; without
@@ -655,6 +659,20 @@ pub(crate) struct SessionState {
     /// needs no ordering relationship with other fields.
     pub(crate) synchronous_commit: std::sync::atomic::AtomicBool,
 
+    // ── pg_trgm session-level GUCs ────────────────────────────────────────────
+
+    /// `SET pg_trgm.similarity_threshold = <float>` per-session threshold for
+    /// the `%` operator.  Defaults to `basin_trgm::DEFAULT_SIMILARITY_THRESHOLD`
+    /// (0.3, matching the PG default).  Stored as an `AtomicU32` holding the
+    /// IEEE 754 bit-pattern of the `f32` value so the rewrite pipeline can read
+    /// it on every statement without a Mutex.
+    pub(crate) trgm_similarity_threshold: std::sync::atomic::AtomicU32,
+
+    /// `SET pg_trgm.word_similarity_threshold = <float>` per-session threshold
+    /// for the `<%` operator.  Defaults to
+    /// `basin_trgm::DEFAULT_WORD_SIMILARITY_THRESHOLD` (0.6).
+    pub(crate) trgm_word_similarity_threshold: std::sync::atomic::AtomicU32,
+
     /// Timestamp of the last statement activity on this session. Updated by
     /// the executor at the start of every `execute()` call; the idle-in-txn
     /// reaper compares this against the current time.
@@ -742,6 +760,12 @@ impl SessionState {
             idle_in_transaction_session_timeout: std::sync::Mutex::new(None),
             synchronous_commit: std::sync::atomic::AtomicBool::new(
                 synchronous_commit_env_default(),
+            ),
+            trgm_similarity_threshold: std::sync::atomic::AtomicU32::new(
+                basin_trgm::DEFAULT_SIMILARITY_THRESHOLD.to_bits(),
+            ),
+            trgm_word_similarity_threshold: std::sync::atomic::AtomicU32::new(
+                basin_trgm::DEFAULT_WORD_SIMILARITY_THRESHOLD.to_bits(),
             ),
             last_active: std::sync::Mutex::new(std::time::Instant::now()),
             listen: std::sync::Mutex::new(ListenState::default()),
@@ -1995,6 +2019,44 @@ pub(crate) fn show_synchronous_commit(state: &SessionState) -> &'static str {
     } else {
         "off"
     }
+}
+
+// ── pg_trgm GUC accessors ────────────────────────────────────────────────────
+
+/// Read the session's `pg_trgm.similarity_threshold` (default 0.3).
+pub(crate) fn session_trgm_similarity_threshold(state: &SessionState) -> f32 {
+    f32::from_bits(
+        state
+            .trgm_similarity_threshold
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Set `pg_trgm.similarity_threshold` for this session.
+/// Clamps the value to `[0.0, 1.0]` per PG semantics.
+pub(crate) fn set_session_trgm_similarity_threshold(state: &SessionState, v: f32) {
+    let clamped = v.clamp(0.0, 1.0);
+    state
+        .trgm_similarity_threshold
+        .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the session's `pg_trgm.word_similarity_threshold` (default 0.6).
+pub(crate) fn session_trgm_word_similarity_threshold(state: &SessionState) -> f32 {
+    f32::from_bits(
+        state
+            .trgm_word_similarity_threshold
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Set `pg_trgm.word_similarity_threshold` for this session.
+/// Clamps to `[0.0, 1.0]`.
+pub(crate) fn set_session_trgm_word_similarity_threshold(state: &SessionState, v: f32) {
+    let clamped = v.clamp(0.0, 1.0);
+    state
+        .trgm_word_similarity_threshold
+        .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
 impl ProjectSession {
