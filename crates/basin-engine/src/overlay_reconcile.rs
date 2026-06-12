@@ -41,6 +41,19 @@
 //! rewrite), never incorrect, and exact dirty-age tracking would need a new
 //! basin-hottier surface this change deliberately avoids.
 //!
+//! ## Per-project round-robin (noisy-neighbour fairness)
+//!
+//! A single pass groups the due tables BY PROJECT and walks them round-robin:
+//! up to [`DEFAULT_PROJECT_QUANTUM`] (`BASIN_OVERLAY_RECONCILE_QUANTUM`) tables
+//! per project per round, cycling through every project before any project gets
+//! a second round. Without this, one project that has parked thousands of dirty
+//! overlays would monopolise the whole tick — every later project's overlays
+//! stay dirty (degraded reads, growing durability exposure) until the flooder
+//! drains. With it, every project with due work makes progress on EVERY tick:
+//! after `ceil(max_due_per_project / quantum)` rounds all projects are drained,
+//! and a project with `quantum` or fewer due tables is fully reconciled in the
+//! first round regardless of how large a sibling's backlog is.
+//!
 //! ## Concurrency story (per-table serialization)
 //!
 //! * **Self-overlap is structurally impossible**: one tokio task, one table
@@ -95,6 +108,14 @@ pub const DEFAULT_AGE_SECS: u64 = 15;
 /// single-statement overlay write. The count trigger fires at half of it.
 const DELTA_UPDATE_MAX_KEYS_DEFAULT: u64 = 10_000;
 
+/// Default per-project work quantum: how many due tables one project may have
+/// reconciled per round-robin round before the pass moves on to the next
+/// project. `BASIN_OVERLAY_RECONCILE_QUANTUM` overrides; `0` is treated as `1`
+/// (a quantum of zero would make no progress). Small by design: the point is
+/// FAIRNESS, not throughput — a flooded project still drains, just without
+/// starving its siblings within a single tick.
+pub const DEFAULT_PROJECT_QUANTUM: usize = 4;
+
 /// Cumulative number of tables the reconciler successfully materialized.
 static RECONCILED_TABLES: AtomicU64 = AtomicU64::new(0);
 /// Cumulative dirty-overlay bytes covered by successful reconciles
@@ -141,6 +162,11 @@ pub(crate) fn spawn(inner: Weak<EngineInner>) {
         DEFAULT_AGE_SECS,
     ));
     let count_threshold = env_u64("BASIN_DELTA_UPDATE_MAX_KEYS", DELTA_UPDATE_MAX_KEYS_DEFAULT) / 2;
+    let quantum = env_u64(
+        "BASIN_OVERLAY_RECONCILE_QUANTUM",
+        DEFAULT_PROJECT_QUANTUM as u64,
+    )
+    .max(1) as usize;
     rt_handle.spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(tick_secs)).await;
@@ -151,26 +177,36 @@ pub(crate) fn spawn(inner: Weak<EngineInner>) {
                 return;
             };
             let engine = crate::Engine { inner: strong };
-            run_tick(&engine, bytes_threshold, age_threshold, count_threshold).await;
+            run_tick(&engine, bytes_threshold, age_threshold, count_threshold, quantum).await;
         }
     });
 }
 
 /// One reconcile pass: select overlay-bearing tables past a threshold and
-/// materialize them. Sequential per table (see the module docs' concurrency
-/// story); errors are logged and retried on a later tick — the overlay stays
-/// dirty until a materialize's catalog commit actually lands.
+/// materialize them, ROUND-ROBIN across projects so one project's huge backlog
+/// cannot starve another's reconciliation within a single tick (see the module
+/// docs' fairness section). Sequential per table (see the concurrency story);
+/// errors are logged and retried on a later tick — the overlay stays dirty
+/// until a materialize's catalog commit actually lands.
 async fn run_tick(
     engine: &crate::Engine,
     bytes_threshold: u64,
     age_threshold: Duration,
     count_threshold: u64,
+    quantum: usize,
 ) {
+    use std::collections::HashMap;
+
     let registry = engine.memtable_registry();
+
+    // Phase 1: collect the DUE tables, grouped by project. The cheap O(1)
+    // presence/threshold gates run here (two-or-three atomic loads per table),
+    // so non-due tables never enter the round-robin schedule. `order` preserves
+    // first-seen project order for a deterministic, fair rotation.
+    let mut by_project: HashMap<basin_common::ProjectId, Vec<(basin_common::TableName, u64)>> =
+        HashMap::new();
+    let mut order: Vec<basin_common::ProjectId> = Vec::new();
     for (project, table, entry) in registry.tables_iter() {
-        // O(1) overlay-presence gate — identical to the materialize prologue,
-        // applied here so empty/INSERT-residency-only tables cost two atomic
-        // loads per tick.
         let pending = entry.memtable.update_count() + entry.memtable.tombstone_count();
         if pending == 0 {
             continue;
@@ -181,31 +217,77 @@ async fn run_tick(
         if !due {
             continue;
         }
-        match crate::dml_mutate::materialize_overlay_for_table(engine, project, &table).await {
-            Ok(()) => {
-                RECONCILED_TABLES.fetch_add(1, Ordering::Relaxed);
-                RECONCILED_BYTES.fetch_add(dirty_bytes, Ordering::Relaxed);
-                tracing::info!(
-                    target: "basin_engine",
-                    project = %project,
-                    table = %table,
-                    pending,
-                    dirty_bytes,
-                    "overlay reconciler materialized table overlay into cold"
-                );
+        let slot = by_project.entry(project).or_insert_with(|| {
+            order.push(project);
+            Vec::new()
+        });
+        slot.push((table, dirty_bytes));
+    }
+    if order.is_empty() {
+        return;
+    }
+
+    // Phase 2: round-robin. Each round materializes up to `quantum` of each
+    // project's remaining due tables, cycling through every project before any
+    // project gets a second round. A cursor per project tracks progress across
+    // rounds. The loop ends when no project has remaining work.
+    let mut cursor: HashMap<basin_common::ProjectId, usize> = HashMap::new();
+    loop {
+        let mut progressed = false;
+        for project in &order {
+            let tables = match by_project.get(project) {
+                Some(t) => t,
+                None => continue,
+            };
+            let start = *cursor.get(project).unwrap_or(&0);
+            if start >= tables.len() {
+                continue;
             }
-            Err(e) => {
-                // CommitConflict (lost an optimistic race to a foreground
-                // mutation) or a transient storage/catalog error: the overlay
-                // is still dirty — no ack ran — so the next tick retries.
-                tracing::debug!(
-                    target: "basin_engine",
-                    project = %project,
-                    table = %table,
-                    error = %e,
-                    "overlay reconcile attempt skipped; will retry next tick"
-                );
+            let end = (start + quantum).min(tables.len());
+            for (table, dirty_bytes) in &tables[start..end] {
+                materialize_one(engine, *project, table, *dirty_bytes).await;
             }
+            cursor.insert(*project, end);
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+}
+
+/// Materialize one table's overlay, recording the success/skip counters. Split
+/// out so the round-robin scheduler reads cleanly; semantics are unchanged from
+/// the pre-round-robin per-table body.
+async fn materialize_one(
+    engine: &crate::Engine,
+    project: basin_common::ProjectId,
+    table: &basin_common::TableName,
+    dirty_bytes: u64,
+) {
+    match crate::dml_mutate::materialize_overlay_for_table(engine, project, table).await {
+        Ok(()) => {
+            RECONCILED_TABLES.fetch_add(1, Ordering::Relaxed);
+            RECONCILED_BYTES.fetch_add(dirty_bytes, Ordering::Relaxed);
+            tracing::info!(
+                target: "basin_engine",
+                project = %project,
+                table = %table,
+                dirty_bytes,
+                "overlay reconciler materialized table overlay into cold"
+            );
+        }
+        Err(e) => {
+            // CommitConflict (lost an optimistic race to a foreground
+            // mutation) or a transient storage/catalog error: the overlay
+            // is still dirty — no ack ran — so the next tick retries.
+            tracing::debug!(
+                target: "basin_engine",
+                project = %project,
+                table = %table,
+                error = %e,
+                "overlay reconcile attempt skipped; will retry next tick"
+            );
         }
     }
 }
