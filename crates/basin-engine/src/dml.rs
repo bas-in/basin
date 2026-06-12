@@ -2606,6 +2606,19 @@ fn coerce_timestamp_micros(expr: &Expr) -> Result<Option<i64>> {
                 | ("transaction_timestamp", true)
                 | ("statement_timestamp", true)
                 | ("clock_timestamp", true) => Ok(Some(chrono::Utc::now().timestamp_micros())),
+                // PG `to_timestamp(double precision)`: a single numeric arg is a
+                // Unix epoch in SECONDS (fractional seconds allowed) → TIMESTAMPTZ.
+                // (The 2-arg `to_timestamp(text, fmt)` form is a string parser,
+                // handled by the string-literal branch / the UDF, not here.)
+                ("to_timestamp", false) => {
+                    let secs = single_numeric_fn_arg(&f.args).ok_or_else(|| {
+                        BasinError::InvalidSchema(
+                            "to_timestamp(epoch): expected a single numeric (epoch seconds) argument"
+                                .into(),
+                        )
+                    })?;
+                    Ok(Some((secs * 1_000_000.0).round() as i64))
+                }
                 _ => Err(BasinError::InvalidSchema(format!(
                     "unsupported TIMESTAMPTZ-producing function: {fname}({})",
                     if args_empty { "" } else { "..." }
@@ -2615,6 +2628,45 @@ fn coerce_timestamp_micros(expr: &Expr) -> Result<Option<i64>> {
         other => Err(BasinError::InvalidSchema(format!(
             "expected TIMESTAMPTZ literal, got {other}"
         ))),
+    }
+}
+
+/// Extract a single numeric (f64) value from a function-call argument list of
+/// the form `f(<number>)` or `f(-<number>)`. Returns `None` for any other
+/// shape (zero/multiple args, non-numeric, named args). Used to read the epoch
+/// seconds out of `to_timestamp(<epoch>)`.
+fn single_numeric_fn_arg(args: &FunctionArguments) -> Option<f64> {
+    let list = match args {
+        FunctionArguments::List(l) => l,
+        _ => return None,
+    };
+    if list.args.len() != 1 {
+        return None;
+    }
+    let expr = match &list.args[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+        _ => return None,
+    };
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) => n.parse::<f64>().ok(),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } => {
+            if let Expr::Value(ValueWithSpan {
+                value: Value::Number(n, _),
+                ..
+            }) = inner.as_ref()
+            {
+                n.parse::<f64>().ok().map(|v| -v)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 

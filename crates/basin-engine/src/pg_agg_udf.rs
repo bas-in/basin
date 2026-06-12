@@ -2184,4 +2184,433 @@ pub(crate) fn register_json_agg_udafs(ctx: &SessionContext) {
     )));
     ctx.register_udaf(AggregateUDF::from(PercentileDiscUdaf::new()));
     ctx.register_udaf(AggregateUDF::from(ModeUdaf::new()));
+    ctx.register_udaf(AggregateUDF::from(FirstAggUdaf::new()));
+    ctx.register_udaf(AggregateUDF::from(LastAggUdaf::new()));
+}
+
+// ── first(value, ts) / last(value, ts) — Timescale-compatible aggregates ─────
+//
+// Timescale semantics:
+//   first(value_col, ts_col) → the value whose ts is the MINIMUM across the group
+//   last(value_col,  ts_col) → the value whose ts is the MAXIMUM across the group
+//
+// NULL ts rows are ignored (Timescale spec). Ties (identical ts values in the
+// same group) are broken by taking the lowest physical row index seen first —
+// i.e. the first occurrence in scan order wins. This is deterministic for any
+// given storage layout and is documented as the tie-breaking rule.
+//
+// State layout: two parallel JSON arrays: the running best_value and best_ts
+// encoded as strings. We use a compact binary layout in state() to support
+// partial aggregation: [best_value_json, best_ts_i64_str].
+//
+// GroupsAccumulator: not implemented. The existing UDAFs in this file (mode,
+// percentile_disc) also do not implement GroupsAccumulator, so this matches
+// the codebase idiom.
+
+/// UDAF for `first(value, ts)` — returns value at minimum ts per group.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FirstAggUdaf {
+    signature: Signature,
+}
+
+/// UDAF for `last(value, ts)` — returns value at maximum ts per group.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct LastAggUdaf {
+    signature: Signature,
+}
+
+impl FirstAggUdaf {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::any(2, Volatility::Immutable),
+        }
+    }
+}
+
+impl LastAggUdaf {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::any(2, Volatility::Immutable),
+        }
+    }
+}
+
+impl AggregateUDFImpl for FirstAggUdaf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "first" }
+    fn signature(&self) -> &Signature { &self.signature }
+
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        // Return type = type of the first (value) argument.
+        Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
+    }
+
+    fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<Arc<Field>>> {
+        // State: two UTF-8 fields — best_value (JSON-encoded) and best_ts (i64 µs as string).
+        Ok(vec![
+            Arc::new(Field::new(format!("{}_val",  args.name), DataType::Utf8, true)),
+            Arc::new(Field::new(format!("{}_ts",   args.name), DataType::Int64, true)),
+        ])
+    }
+
+    fn accumulator(&self, args: AccumulatorArgs) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
+        let value_type = args.expr_fields.first()
+            .map(|f| f.data_type().clone())
+            .unwrap_or(DataType::Null);
+        Ok(Box::new(FirstLastAccumulator {
+            value_type,
+            best_value: None,
+            best_ts: None,
+            want_min: true,
+        }))
+    }
+}
+
+impl AggregateUDFImpl for LastAggUdaf {
+    fn as_any(&self) -> &dyn Any { self }
+    fn name(&self) -> &str { "last" }
+    fn signature(&self) -> &Signature { &self.signature }
+
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
+    }
+
+    fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<Arc<Field>>> {
+        Ok(vec![
+            Arc::new(Field::new(format!("{}_val",  args.name), DataType::Utf8, true)),
+            Arc::new(Field::new(format!("{}_ts",   args.name), DataType::Int64, true)),
+        ])
+    }
+
+    fn accumulator(&self, args: AccumulatorArgs) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
+        let value_type = args.expr_fields.first()
+            .map(|f| f.data_type().clone())
+            .unwrap_or(DataType::Null);
+        Ok(Box::new(FirstLastAccumulator {
+            value_type,
+            best_value: None,
+            best_ts: None,
+            want_min: false,
+        }))
+    }
+}
+
+// ── shared accumulator ────────────────────────────────────────────────────────
+
+/// Shared accumulator backing both `first` and `last`.
+///
+/// `want_min = true`  → keep the value at the **minimum** ts (first).
+/// `want_min = false` → keep the value at the **maximum** ts (last).
+///
+/// Tie-breaking: when two rows share the identical ts µs value we keep the
+/// value already stored (i.e. the first arrival in scan order), since the
+/// comparison uses strict `<` / `>`. This is deterministic and documented.
+#[derive(Debug)]
+struct FirstLastAccumulator {
+    value_type: DataType,
+    /// The running best value, or None if no non-NULL ts row has been seen.
+    best_value: Option<ScalarValue>,
+    /// The running best ts (µs since epoch), or None if no qualifying row seen.
+    best_ts: Option<i64>,
+    /// true → first (min ts); false → last (max ts).
+    want_min: bool,
+}
+
+impl FirstLastAccumulator {
+    /// Extract microseconds since epoch from a single array slot.
+    /// Returns None if the slot is null or the type is unsupported.
+    fn extract_ts_us(arr: &dyn Array, i: usize) -> Option<i64> {
+        use datafusion::arrow::array::*;
+        if arr.is_null(i) { return None; }
+        match arr.data_type() {
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                arr.as_any().downcast_ref::<TimestampMicrosecondArray>()
+                    .map(|a| a.value(i))
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                arr.as_any().downcast_ref::<TimestampNanosecondArray>()
+                    .map(|a| a.value(i) / 1_000)
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                arr.as_any().downcast_ref::<TimestampMillisecondArray>()
+                    .map(|a| a.value(i) * 1_000)
+            }
+            DataType::Timestamp(TimeUnit::Second, _) => {
+                arr.as_any().downcast_ref::<TimestampSecondArray>()
+                    .map(|a| a.value(i) * 1_000_000)
+            }
+            DataType::Int64 => {
+                arr.as_any().downcast_ref::<Int64Array>()
+                    .map(|a| a.value(i))
+            }
+            _ => None,
+        }
+    }
+
+    /// Update the running best from one row.
+    fn consider(&mut self, value: ScalarValue, ts_us: i64) {
+        let is_better = match self.best_ts {
+            None => true,
+            Some(cur) => if self.want_min { ts_us < cur } else { ts_us > cur },
+        };
+        if is_better {
+            self.best_value = Some(value);
+            self.best_ts    = Some(ts_us);
+        }
+    }
+}
+
+impl datafusion::logical_expr::Accumulator for FirstLastAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
+        if values.len() < 2 {
+            return exec_err!("first/last requires 2 arguments (value, ts)");
+        }
+        let val_arr = &values[0];
+        let ts_arr  = &values[1];
+        for i in 0..val_arr.len() {
+            // Ignore rows where ts is NULL (Timescale spec).
+            let Some(ts_us) = Self::extract_ts_us(ts_arr.as_ref(), i) else { continue; };
+            let sv = ScalarValue::try_from_array(val_arr.as_ref(), i)?;
+            self.consider(sv, ts_us);
+        }
+        Ok(())
+    }
+
+    fn evaluate(&mut self) -> DFResult<ScalarValue> {
+        Ok(match &self.best_value {
+            Some(sv) => sv.clone(),
+            None => ScalarValue::try_from(&self.value_type)
+                .unwrap_or(ScalarValue::Null),
+        })
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.best_value.as_ref().map(|sv| sv.size()).unwrap_or(0)
+    }
+
+    fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
+        // State: [value_json_string, ts_i64_micros]
+        let val_str = match &self.best_value {
+            Some(sv) => {
+                let j = scalar_value_to_json_string(sv);
+                ScalarValue::Utf8(Some(j))
+            }
+            None => ScalarValue::Utf8(None),
+        };
+        let ts_sv = ScalarValue::Int64(self.best_ts);
+        Ok(vec![val_str, ts_sv])
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
+        use datafusion::arrow::array::{Int64Array, StringArray as StrArr};
+        // states[0] = Utf8 (JSON-encoded value or NULL)
+        // states[1] = Int64 (ts µs or NULL)
+        if states.len() < 2 {
+            return Ok(());
+        }
+        let val_arr = states[0].as_any().downcast_ref::<StrArr>();
+        let ts_arr  = states[1].as_any().downcast_ref::<Int64Array>();
+        let (Some(val_arr), Some(ts_arr)) = (val_arr, ts_arr) else {
+            return Ok(());
+        };
+        for i in 0..val_arr.len() {
+            if ts_arr.is_null(i) { continue; }
+            let ts_us = ts_arr.value(i);
+            let sv = if val_arr.is_null(i) {
+                ScalarValue::try_from(&self.value_type).unwrap_or(ScalarValue::Null)
+            } else {
+                json_to_scalar_value(val_arr.value(i), &self.value_type)
+            };
+            self.consider(sv, ts_us);
+        }
+        Ok(())
+    }
+}
+
+// ── JSON encode/decode helpers for first/last state ───────────────────────────
+
+// Encode a ScalarValue as a JSON *string* for the first/last UDAF partial
+// state (state column is Utf8). Distinct from `scalar_value_to_json` above,
+// which returns a `serde_json::Value` for the ordered-set aggregates' state.
+fn scalar_value_to_json_string(sv: &ScalarValue) -> String {
+    match sv {
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
+            serde_json::to_string(s).unwrap_or_else(|_| "null".to_string())
+        }
+        ScalarValue::Boolean(Some(b)) => if *b { "true".to_string() } else { "false".to_string() },
+        ScalarValue::Int8(Some(v))   => v.to_string(),
+        ScalarValue::Int16(Some(v))  => v.to_string(),
+        ScalarValue::Int32(Some(v))  => v.to_string(),
+        ScalarValue::Int64(Some(v))  => v.to_string(),
+        ScalarValue::UInt8(Some(v))  => v.to_string(),
+        ScalarValue::UInt16(Some(v)) => v.to_string(),
+        ScalarValue::UInt32(Some(v)) => v.to_string(),
+        ScalarValue::UInt64(Some(v)) => v.to_string(),
+        ScalarValue::Float32(Some(v)) => v.to_string(),
+        ScalarValue::Float64(Some(v)) => v.to_string(),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => v.to_string(),
+        ScalarValue::TimestampNanosecond(Some(v), _)  => v.to_string(),
+        ScalarValue::TimestampMillisecond(Some(v), _) => v.to_string(),
+        ScalarValue::TimestampSecond(Some(v), _)      => v.to_string(),
+        _ => "null".to_string(),
+    }
+}
+
+fn json_to_scalar_value(s: &str, target_type: &DataType) -> ScalarValue {
+    use std::str::FromStr;
+    match target_type {
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            // The JSON string is a quoted string; strip the quotes.
+            let inner = serde_json::from_str::<serde_json::Value>(s)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.to_owned()))
+                .unwrap_or_else(|| s.to_owned());
+            ScalarValue::Utf8(Some(inner))
+        }
+        DataType::Boolean => {
+            ScalarValue::Boolean(Some(s == "true"))
+        }
+        DataType::Int8   => ScalarValue::Int8(s.parse().ok()),
+        DataType::Int16  => ScalarValue::Int16(s.parse().ok()),
+        DataType::Int32  => ScalarValue::Int32(s.parse().ok()),
+        DataType::Int64  => ScalarValue::Int64(s.parse().ok()),
+        DataType::UInt8  => ScalarValue::UInt8(s.parse().ok()),
+        DataType::UInt16 => ScalarValue::UInt16(s.parse().ok()),
+        DataType::UInt32 => ScalarValue::UInt32(s.parse().ok()),
+        DataType::UInt64 => ScalarValue::UInt64(s.parse().ok()),
+        DataType::Float32 => ScalarValue::Float32(s.parse::<f32>().ok()),
+        DataType::Float64 => ScalarValue::Float64(s.parse::<f64>().ok()),
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            ScalarValue::TimestampMicrosecond(s.parse::<i64>().ok(), tz.clone())
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            ScalarValue::TimestampNanosecond(s.parse::<i64>().ok(), tz.clone())
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, tz) => {
+            ScalarValue::TimestampMillisecond(s.parse::<i64>().ok(), tz.clone())
+        }
+        DataType::Timestamp(TimeUnit::Second, tz) => {
+            ScalarValue::TimestampSecond(s.parse::<i64>().ok(), tz.clone())
+        }
+        _ => ScalarValue::try_from(target_type).unwrap_or(ScalarValue::Null),
+    }
+}
+
+// TimeUnit is needed for the DataType::Timestamp pattern matches in
+// FirstLastAccumulator::extract_ts_us and merge_batch.
+use datafusion::arrow::datatypes::TimeUnit;
+
+// ── unit tests: first / last ──────────────────────────────────────────────────
+
+#[cfg(test)]
+mod first_last_tests {
+    use super::*;
+    use datafusion::arrow::array::{Int32Array, TimestampMicrosecondArray};
+    use datafusion::logical_expr::Accumulator;
+    use std::sync::Arc;
+
+    fn make_first_acc(value_type: DataType) -> FirstLastAccumulator {
+        FirstLastAccumulator { value_type, best_value: None, best_ts: None, want_min: true }
+    }
+
+    fn make_last_acc(value_type: DataType) -> FirstLastAccumulator {
+        FirstLastAccumulator { value_type, best_value: None, best_ts: None, want_min: false }
+    }
+
+    /// first() over {(v=10, ts=100), (v=20, ts=50)} → 20 (ts=50 is minimum).
+    #[test]
+    fn first_returns_min_ts_value() {
+        let mut acc = make_first_acc(DataType::Int32);
+        let vals: ArrayRef = Arc::new(Int32Array::from(vec![10i32, 20]));
+        let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![100i64, 50]));
+        acc.update_batch(&[vals, ts]).unwrap();
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int32(Some(20)));
+    }
+
+    /// last() over {(v=10, ts=100), (v=20, ts=50)} → 10 (ts=100 is maximum).
+    #[test]
+    fn last_returns_max_ts_value() {
+        let mut acc = make_last_acc(DataType::Int32);
+        let vals: ArrayRef = Arc::new(Int32Array::from(vec![10i32, 20]));
+        let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![100i64, 50]));
+        acc.update_batch(&[vals, ts]).unwrap();
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int32(Some(10)));
+    }
+
+    /// NULL ts rows are ignored.
+    #[test]
+    fn null_ts_ignored() {
+        let mut acc = make_first_acc(DataType::Int32);
+        let vals: ArrayRef = Arc::new(Int32Array::from(vec![Some(1i32), Some(2), Some(3)]));
+        // Row 0 has NULL ts → should be ignored; min ts is row 1 (ts=10).
+        let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![None, Some(10i64), Some(20)]));
+        acc.update_batch(&[vals, ts]).unwrap();
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int32(Some(2)),
+            "row with NULL ts must be ignored; first = value at ts=10");
+    }
+
+    /// Empty group → NULL.
+    #[test]
+    fn empty_group_returns_null() {
+        let mut acc = make_first_acc(DataType::Int32);
+        let result = acc.evaluate().unwrap();
+        // ScalarValue::try_from(DataType::Int32) = Int32(None) which is NULL.
+        assert_eq!(result, ScalarValue::Int32(None));
+    }
+
+    /// All-NULL ts → NULL result.
+    #[test]
+    fn all_null_ts_returns_null() {
+        let mut acc = make_last_acc(DataType::Int32);
+        let vals: ArrayRef = Arc::new(Int32Array::from(vec![Some(5i32), Some(6)]));
+        let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>, None]));
+        acc.update_batch(&[vals, ts]).unwrap();
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int32(None));
+    }
+
+    /// Tie-breaking: two rows with identical ts — first arrival (lowest index) wins.
+    #[test]
+    fn tie_broken_by_first_arrival() {
+        let mut acc = make_first_acc(DataType::Int32);
+        let vals: ArrayRef = Arc::new(Int32Array::from(vec![99i32, 42]));
+        // Both rows have the same ts; first in batch order (99) should win.
+        let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![1000i64, 1000]));
+        acc.update_batch(&[vals, ts]).unwrap();
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int32(Some(99)),
+            "tie: first arrival (index 0 = 99) must win");
+    }
+
+    /// State/merge round-trip for first().
+    #[test]
+    fn first_state_merge_round_trip() {
+        // Partial 1: (v=5, ts=200)
+        let mut p1 = make_first_acc(DataType::Int32);
+        let v1: ArrayRef = Arc::new(Int32Array::from(vec![5i32]));
+        let t1: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![200i64]));
+        p1.update_batch(&[v1, t1]).unwrap();
+        let state1 = p1.state().unwrap();
+
+        // Partial 2: (v=7, ts=100) — lower ts, should win in first()
+        let mut p2 = make_first_acc(DataType::Int32);
+        let v2: ArrayRef = Arc::new(Int32Array::from(vec![7i32]));
+        let t2: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![100i64]));
+        p2.update_batch(&[v2, t2]).unwrap();
+        let state2 = p2.state().unwrap();
+
+        // Merge states.
+        let val_state: ArrayRef = Arc::new(datafusion::arrow::array::StringArray::from(vec![
+            match &state1[0] { ScalarValue::Utf8(Some(s)) => s.as_str(), _ => "" },
+            match &state2[0] { ScalarValue::Utf8(Some(s)) => s.as_str(), _ => "" },
+        ]));
+        let ts_state: ArrayRef = Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+            match &state1[1] { ScalarValue::Int64(Some(v)) => *v, _ => 0 },
+            match &state2[1] { ScalarValue::Int64(Some(v)) => *v, _ => 0 },
+        ]));
+        let mut merged = make_first_acc(DataType::Int32);
+        merged.merge_batch(&[val_state, ts_state]).unwrap();
+        // first() should pick v=7 (ts=100 is minimum).
+        assert_eq!(merged.evaluate().unwrap(), ScalarValue::Int32(Some(7)),
+            "merge: first should pick the value at minimum ts");
+    }
 }

@@ -1590,6 +1590,11 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         return exec_add_retention_policy(sess, &rp_table, &rp_interval).await;
     }
 
+    // ── Phase 5.29.F: SELECT drop_chunks('table', older_than => INTERVAL/TS) ─
+    if let Some((dc_table, dc_cutoff)) = crate::hypertable::match_drop_chunks(raw_sql) {
+        return exec_drop_chunks(sess, &dc_table, dc_cutoff).await;
+    }
+
     // ── Phase 5.29.D: SELECT run_retention_policy('table') ──────────────────
     if let Some(rp_table) = crate::hypertable::match_run_retention_policy(raw_sql) {
         return exec_run_retention_policy(sess, &rp_table).await;
@@ -12689,6 +12694,111 @@ async fn exec_add_retention_policy(
     Ok(ExecResult::Rows { schema, batches: vec![batch] })
 }
 
+/// Execute `SELECT drop_chunks('table', older_than => INTERVAL/TIMESTAMP)`.
+///
+/// Steps:
+/// 1. Resolve the cutoff to a `DateTime<Utc>`.
+/// 2. Call `HypertableRegistry::drop_chunks_before` to remove chunk metadata
+///    for all chunks whose range_end <= cutoff.
+/// 3. Issue a physical DELETE WHERE ts < cutoff so the base-table rows are
+///    removed (reuses the same retention-delete path).
+/// 4. Return a result row with the number of chunks dropped.
+///
+/// The chunk metadata removal and the physical DELETE are NOT atomic (there is
+/// no 2PC across the catalog and the storage layer).  The safe failure mode is
+/// metadata dropped but rows surviving, which is conservative — a subsequent
+/// SELECT will still return the rows until the DELETE commits.  See APPLY.md
+/// for the full risk note on catalog atomicity.
+async fn exec_drop_chunks(
+    sess: &ProjectSession,
+    table: &str,
+    cutoff_spec: crate::hypertable::DropChunksCutoff,
+) -> Result<ExecResult> {
+    use crate::hypertable::DropChunksCutoff;
+    use chrono::Utc;
+
+    // Resolve the cutoff timestamp.
+    let cutoff: chrono::DateTime<Utc> = match &cutoff_spec {
+        DropChunksCutoff::Interval(iv_text) => {
+            let secs = crate::hypertable::parse_interval_secs(iv_text)
+                .ok_or_else(|| BasinError::InvalidSchema(format!(
+                    "drop_chunks: could not parse interval '{iv_text}'"
+                )))?;
+            Utc::now() - chrono::Duration::seconds(secs as i64)
+        }
+        DropChunksCutoff::Timestamp(ts_text) => {
+            // Accept ISO-8601 / PG-style timestamp strings.
+            parse_cutoff_timestamp(ts_text)
+                .ok_or_else(|| BasinError::InvalidSchema(format!(
+                    "drop_chunks: could not parse timestamp '{ts_text}'"
+                )))?
+        }
+    };
+
+    // Drop chunk metadata and collect the names of dropped chunks.
+    let dropped = sess.engine
+        .hypertable_registry()
+        .drop_chunks_before(&sess.project, table, cutoff)
+        .await
+        .map_err(|e| BasinError::InvalidSchema(e))?;
+
+    if !dropped.is_empty() {
+        // Issue a physical DELETE for rows in the dropped range.
+        if let Some(time_col) = sess.engine.hypertable_registry()
+            .time_column(&sess.project, table)
+            .await
+        {
+            let cutoff_us = cutoff.timestamp_micros();
+            let delete_sql = format!(
+                "DELETE FROM \"{table}\" WHERE \"{time_col}\" < {cutoff_us}"
+            );
+            let _ = exec_retention_delete(sess, &delete_sql).await;
+        }
+    }
+
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("chunks_dropped", arrow_schema::DataType::Int64, false),
+    ]));
+    let n = dropped.len() as i64;
+    let batch = arrow_array::RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(arrow_array::Int64Array::from(vec![n])) as ArrayRef],
+    )
+    .map_err(|e| BasinError::internal(format!("drop_chunks result: {e}")))?;
+    Ok(ExecResult::Rows { schema, batches: vec![batch] })
+}
+
+/// Parse a timestamp string in a variety of formats to `DateTime<Utc>`.
+/// Used by `exec_drop_chunks` for the `older_than => TIMESTAMP '...'` form.
+fn parse_cutoff_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{DateTime, NaiveDateTime, Utc};
+    // Try RFC 3339 first.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    // Try common PG formats.
+    let formats: &[&str] = &[
+        "%Y-%m-%d %H:%M:%S%:z",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+    ];
+    for fmt in formats {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(ndt.and_utc());
+        }
+        // chrono parse_from_str with timezone
+        if let Ok(dt) = DateTime::parse_from_str(s, fmt) {
+            return Some(dt.with_timezone(&Utc));
+        }
+    }
+    // Bare date
+    if let Ok(nd) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(nd.and_hms_opt(0, 0, 0)?.and_utc());
+    }
+    None
+}
+
 /// Execute `SELECT run_retention_policy('table')`.
 /// Drops chunks that fall outside the retention window, then issues a physical
 /// DELETE so the base table's rows are also removed.
@@ -12696,79 +12806,42 @@ async fn exec_run_retention_policy(
     sess: &ProjectSession,
     table: &str,
 ) -> Result<ExecResult> {
-    // Phase 5.29.D: determine the retention window from the registry and
-    // compute the cutoff timestamp.
+    // Read the retention window, compute the cutoff, then delegate to the
+    // shared drop_chunks_before core (same path as exec_drop_chunks).
+    let Some(retention_secs) = get_retention_secs_from_registry(
+        sess.engine.hypertable_registry(),
+        &sess.project,
+        table,
+    ).await else {
+        // No retention policy set — return 0 chunks dropped.
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("chunks_dropped", arrow_schema::DataType::Int64, false),
+        ]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![0i64])) as ArrayRef],
+        )
+        .map_err(|e| BasinError::internal(format!("run_retention_policy result: {e}")))?;
+        return Ok(ExecResult::Rows { schema, batches: vec![batch] });
+    };
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(retention_secs as i64);
+
     let dropped = sess.engine
         .hypertable_registry()
-        .run_retention((&sess.project), table)
+        .drop_chunks_before(&sess.project, table, cutoff)
         .await
         .map_err(|e| BasinError::InvalidSchema(e))?;
 
     if !dropped.is_empty() {
-        // Fetch the hypertable's time column so we can build the DELETE
-        // predicate accurately.  If the time column is unknown (table was
-        // never registered — defensive), fall back to a no-op.
-        //
-        // Implementation note: `run_retention` already removed the chunks
-        // from the registry, but the physical rows are still in the base
-        // table. We issue a DELETE to clean them up.  We compute the cutoff
-        // from the registry's retention_secs before running retention (it
-        // already cleared the chunks), but since the chunks recorded
-        // range_end we need the cutoff derived from retention_secs again.
-        // We re-read retention_secs from the registry.
-        //
-        // Simpler: scan deleted chunks to find the max range_end that was
-        // dropped, then DELETE rows with ts < that value.
-        //
-        // Actually the simplest correct approach: issue a DELETE for rows
-        // whose timestamp falls in chunks older than the cutoff.  We already
-        // ran `run_retention` which told us *which* chunks were removed. We
-        // use the hypertable's retention_secs to compute the cutoff directly.
-        //
-        // We use the catalog approach: look up time_column, build DELETE.
         if let Some(time_col) = sess.engine.hypertable_registry()
             .time_column(&sess.project, table)
             .await
         {
-            // Get retention_secs from the registry (re-read; retention is still set).
-            // We recompute the cutoff as `now() - retention_secs`.
-            // We need retention_secs — it's still in the registry (we only cleared chunks).
-            // Use a workaround: the chunks we dropped all had range_end <= cutoff.
-            // Issue DELETE WHERE ts < (cutoff_timestamp) using NOW() - interval.
-            //
-            // We do this by getting the cutoff from the registry. Since we
-            // can't easily re-read retention_secs without adding a new method,
-            // we'll compute it from the current time: we just ran run_retention
-            // which used `now - retention_secs`. We'll issue DELETE WHERE ts < now().
-            //
-            // For correctness: we only delete rows that were in the dropped chunks.
-            // Since chunks are day-aligned (or interval-aligned), we can use
-            // the max range_end of the dropped chunks as the DELETE cutoff.
-            // But we don't have that info now.
-            //
-            // Best safe approach: DELETE WHERE ts < NOW() - retention_interval.
-            // We compute this by reading the registry's retention_secs once more.
-            // Add a `get_retention_secs` method:
-            let Some(retention_secs) = get_retention_secs_from_registry(
-                sess.engine.hypertable_registry(),
-                &sess.project,
-                table,
-            ).await else {
-                // No retention policy set — nothing to delete physically.
-                return Ok(ExecResult::Empty { tag: "SELECT 1".into() });
-            };
-
-            let cutoff_ts = chrono::Utc::now()
-                - chrono::Duration::seconds(retention_secs as i64);
-            // Use integer microseconds so `as_literal` produces ScalarValue::Int64,
-            // which the storage predicate evaluator compares against Timestamp columns
-            // (Arrow stores Timestamp(Microsecond) as raw i64 µs since epoch).
-            let cutoff_us = cutoff_ts.timestamp_micros();
+            let cutoff_us = cutoff.timestamp_micros();
             let delete_sql = format!(
                 "DELETE FROM \"{table}\" WHERE \"{time_col}\" < {cutoff_us}"
             );
-            // Best-effort DELETE via sqlparser → exec_delete (avoids async
-            // recursion with the outer `execute`).
             let _ = exec_retention_delete(sess, &delete_sql).await;
         }
     }

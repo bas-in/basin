@@ -2302,7 +2302,14 @@ pub(crate) async fn open(
                     project,
                 ),
             );
+            let hypertables_provider: Arc<dyn TableProvider> = Arc::new(
+                crate::hypertable_provider::HypertablesProvider::new(
+                    engine.hypertable_registry().clone(),
+                    project,
+                ),
+            );
             let _ = ts_schema.register_table("chunks".to_string(), chunks_provider);
+            let _ = ts_schema.register_table("hypertables".to_string(), hypertables_provider);
             let _ = df_catalog.register_schema("timescaledb_information", ts_schema);
         }
     }
