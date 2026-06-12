@@ -2685,7 +2685,22 @@ async fn execute_simple_select_inner(
                 let batches = mem_rows;
                 let (projected_schema, batches): (Arc<Schema>, Vec<RecordBatch>) =
                     match &plan.projection {
-                        None => (meta.schema.clone(), batches),
+                        None => {
+                            // `SELECT *`: declared schema is the CURRENT catalog
+                            // schema. A memtable row materialised before an
+                            // `ALTER TABLE ADD COLUMN` carries the pre-ALTER
+                            // column set, so pad each batch up to `meta.schema`
+                            // (missing trailing columns become NULL) — otherwise
+                            // the declared schema and the batch columns disagree
+                            // and any consumer (pgwire encoder, concat) breaks.
+                            let padded: Vec<RecordBatch> = batches
+                                .into_iter()
+                                .map(|b| {
+                                    crate::hot_tombstone::pad_batch_to_schema(b, &meta.schema)
+                                })
+                                .collect::<Result<_>>()?;
+                            (meta.schema.clone(), padded)
+                        }
                         Some(items) => {
                             let has_computed = items
                                 .iter()
@@ -3808,7 +3823,18 @@ async fn execute_simple_select_inner(
     // user-requested output columns and aliases.
     let (projected_schema, batches): (Arc<Schema>, Vec<RecordBatch>) =
         match &plan.projection {
-            None => (meta.schema.clone(), batches),
+            None => {
+                // `SELECT *`: the declared output schema is the CURRENT catalog
+                // schema. Pad each batch up to it so a row read from a data file
+                // (or overlay) written before an `ALTER TABLE ADD COLUMN` gains
+                // the new trailing columns as NULL — the declared schema and the
+                // batch columns must agree for every downstream consumer.
+                let padded: Vec<RecordBatch> = batches
+                    .into_iter()
+                    .map(|b| crate::hot_tombstone::pad_batch_to_schema(b, &meta.schema))
+                    .collect::<Result<_>>()?;
+                (meta.schema.clone(), padded)
+            }
             Some(items) => {
                 // Check whether any item is a Computed variant.
                 let has_computed = items

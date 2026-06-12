@@ -4657,8 +4657,15 @@ async fn read_file_to_batches(
 ) -> Result<Vec<RecordBatch>> {
     let mut stream = storage.read_file(project, path).await?;
     let mut out = Vec::new();
+    let target: arrow_schema::SchemaRef = Arc::new(catalog_schema.clone());
     while let Some(batch) = stream.next().await {
-        out.push(reattach_catalog_metadata(catalog_schema, batch?)?);
+        let b = reattach_catalog_metadata(catalog_schema, batch?)?;
+        // Pad to the current catalog schema so a file written before an
+        // `ALTER TABLE ADD COLUMN` gains the new columns (as NULL) here —
+        // otherwise a `SET <new_col> = …` in the rewrite has no column to
+        // target and the assignment is silently lost.
+        let b = crate::hot_tombstone::pad_batch_to_schema(b, &target)?;
+        out.push(b);
     }
     Ok(out)
 }

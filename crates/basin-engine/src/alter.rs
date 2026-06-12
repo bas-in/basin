@@ -42,8 +42,8 @@ use sqlparser::ast::{
 use std::sync::{Arc, RwLock};
 
 use crate::types::{
-    arrow_data_type, basin_type_marker, is_tsquery_sql, is_tsvector_sql, BASIN_TYPE_JSONB,
-    BASIN_TYPE_KEY, BASIN_TYPE_TSQUERY, BASIN_TYPE_TSVECTOR, BASIN_TYPE_UUID,
+    arrow_data_type, basin_type_marker, is_tsquery_sql, is_tsvector_sql, BASIN_COLUMN_DEFAULT,
+    BASIN_TYPE_JSONB, BASIN_TYPE_KEY, BASIN_TYPE_TSQUERY, BASIN_TYPE_TSVECTOR, BASIN_TYPE_UUID,
 };
 
 /// Custom Basin-specific ALTER TABLE extensions that sqlparser doesn't
@@ -976,6 +976,7 @@ async fn add_column(
     // existing row into a back-fill or rejection, which is out of scope
     // for v0.1 schema evolution.
     let mut nullable = true;
+    let mut default_text: Option<String> = None;
     for opt in &column_def.options {
         match &opt.option {
             ColumnOption::NotNull => {
@@ -986,6 +987,14 @@ async fn add_column(
                 ));
             }
             ColumnOption::Null => nullable = true,
+            // DEFAULT <expr>: store the expression text as column metadata so
+            // the INSERT path (`apply_column_defaults`) stamps it on rows that
+            // don't target the new column — same scheme CREATE TABLE uses
+            // (`ddl::schema_from_columns`). Existing rows read NULL via the
+            // scan-time pad (no eager back-fill in v0.1 schema evolution).
+            ColumnOption::Default(expr) => {
+                default_text = Some(expr.to_string());
+            }
             other => {
                 return Err(BasinError::InvalidSchema(format!(
                     "unsupported column option in ADD COLUMN: {other}"
@@ -1011,6 +1020,9 @@ async fn add_column(
         md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_TSVECTOR.to_string());
     } else if is_tsquery_sql(&column_def.data_type) {
         md.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_TSQUERY.to_string());
+    }
+    if let Some(default_expr) = default_text.as_ref() {
+        md.insert(BASIN_COLUMN_DEFAULT.to_string(), default_expr.clone());
     }
     let mut fields: Vec<Field> = meta.schema.fields().iter().map(|f| (**f).clone()).collect();
     let field = if md.is_empty() {
