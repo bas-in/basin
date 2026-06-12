@@ -528,6 +528,43 @@ pub(crate) enum AggregateFn {
     Max(String),
 }
 
+/// Eligible-shape descriptor for the deep top-K late-materialization branch.
+///
+/// Recognised shape (set by `match_query` only when every gate passes):
+///
+///   `SELECT <cols> FROM t ORDER BY <sort_col> [ASC|DESC] [, <pk> [ASC]]
+///    [WHERE …handled by existing pruning…] LIMIT k`
+///
+/// where `<pk>` is the table's single primary-key column (so a winning row's
+/// identity is exactly its PK), `k` is under the `BASIN_TOPK_LATE_MAX_K` cap,
+/// and there are no joins / aggregates / GROUP BY / OFFSET / computed
+/// projection. The optional `, <pk>` is the deterministic tie-break the deep
+/// top-K benchmark uses (`ORDER BY amount DESC, id`); when absent the PK still
+/// serves as the row identity for phase 2.
+///
+/// Execution (`try_topk_late_materialize`): phase 1 decodes ONLY
+/// `[sort_col, pk]` (+ any WHERE columns) across the live files, file-skipping
+/// any file whose sort-column min/max cannot beat the current k-th bound, and
+/// keeps a bounded top-`k` of `(sort_col, pk)` rows. Phase 2 fetches the full
+/// wide rows for just those ≤ `k` PKs via an `InInt64(pk, winners)` pushdown,
+/// re-sorts by `(sort_col, pk)`, and projects. The wide columns of the
+/// (1M-k) losing rows are never decoded — the cost the full-scan path pays.
+#[derive(Debug, Clone)]
+pub(crate) struct TopKLatePlan {
+    /// The leading ORDER BY column (any sortable Arrow type).
+    pub sort_col: String,
+    /// `true` for ASC (or unspecified), `false` for DESC.
+    pub ascending: bool,
+    /// The single-PK column used as the row identity for phase-2 point-fetch.
+    /// Equal to `sort_col` when the ORDER BY is on the PK itself.
+    pub pk_col: String,
+    /// `true` when the ORDER BY carries an explicit `, <pk> [ASC]` tie-break
+    /// (so the phase-2 re-sort is a two-key lexical sort); `false` when the
+    /// ORDER BY is the single `sort_col` (phase-2 re-sort uses `sort_col`
+    /// alone, with the PK as the implicit stable secondary via the row order).
+    pub pk_tiebreak: bool,
+}
+
 /// Recognised "simple SELECT" plan. When `predicates` is empty the read is
 /// an unfiltered scan; when `limit` is `Some(n)` we truncate the merged
 /// batches to `n` rows total.
@@ -584,6 +621,14 @@ pub(crate) struct SimpleSelectPlan {
     /// or `x <> NULL`). `execute_simple_select` returns an empty row set
     /// immediately without consulting storage or running aggregates.
     pub always_empty: bool,
+    /// `Some` when the statement matches the deep top-K late-materialization
+    /// shape (`ORDER BY k [DESC] [, pk] LIMIT n` over a single-PK table, k
+    /// under `BASIN_TOPK_LATE_MAX_K`). `execute_simple_select_inner` then
+    /// attempts the two-phase narrow-key-scan + PK-fetch path; any runtime
+    /// ineligibility (live overlay, un-flushed tail, missing sort-column
+    /// stats…) Ok-falls through to the existing decode-everything-then-sort
+    /// path. `None` for every other shape and for aggregate queries.
+    pub topk_late: Option<TopKLatePlan>,
 }
 
 /// Recognise the supported "simple SELECT" shape. Returns `None` if any
@@ -636,28 +681,55 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         },
     };
 
-    // Parse an optional single-column ORDER BY. Any ORDER BY that is more
-    // complex (multiple columns, expressions, NULLS FIRST/LAST, WITH FILL)
-    // falls through to DataFusion. `None` here means "no ORDER BY at all".
+    // Parse the ORDER BY. We recognise two row shapes here:
+    //
+    //   * single column  `ORDER BY c [ASC|DESC]` — the historical fast-path
+    //     shape; `order_by = Some((c, asc))`, `topk_second = None`.
+    //   * two columns    `ORDER BY c [ASC|DESC], c2 [ASC]` — the deep top-K
+    //     tie-break shape (`ORDER BY amount DESC, id`). `order_by` carries the
+    //     LEADING key; `topk_second = Some((c2, true))` carries the secondary
+    //     ASC tie-break. This shape is ONLY ever served by the two-phase top-K
+    //     branch (whose runtime gate confirms `c2` is the single PK); if that
+    //     branch declines, the statement falls through to DataFusion — never to
+    //     the single-column `apply_order_by_limit`, which cannot honour the
+    //     secondary key.
+    //
+    // Anything more complex (3+ columns, expressions, a non-ASC second key,
+    // NULLS FIRST/LAST, WITH FILL) falls through to DataFusion so NULL ordering
+    // and multi-key semantics match it exactly. `None` here = "no ORDER BY".
+    let mut topk_second: Option<(String, bool)> = None;
     let order_by: Option<(String, bool)> = match q.order_by.as_ref() {
         None => None,
         Some(ob) => {
             let exprs = ob.ext_exprs();
-            if exprs.len() != 1 {
+            if exprs.is_empty() || exprs.len() > 2 {
                 return None;
             }
-            let e = &exprs[0];
-            // Reject ClickHouse WITH FILL and NULLS FIRST/LAST — leave those
-            // to DataFusion so NULL ordering matches its semantics exactly.
-            if e.with_fill.is_some() || e.options.nulls_first.is_some() {
-                return None;
-            }
-            let col = match &e.expr {
-                Expr::Identifier(id) => id.value.clone(),
-                _ => return None,
+            // Helper: a plain ascending/descending identifier ORDER BY term
+            // with no NULLS / WITH FILL modifiers → `(col, ascending)`.
+            let parse_term = |e: &sqlparser::ast::OrderByExpr| -> Option<(String, bool)> {
+                if e.with_fill.is_some() || e.options.nulls_first.is_some() {
+                    return None;
+                }
+                let col = match &e.expr {
+                    Expr::Identifier(id) => id.value.clone(),
+                    _ => return None,
+                };
+                Some((col, e.options.asc.unwrap_or(true)))
             };
-            let ascending = e.options.asc.unwrap_or(true); // default ASC
-            Some((col, ascending))
+            let (lead_col, lead_asc) = parse_term(&exprs[0])?;
+            if exprs.len() == 2 {
+                // Second key must be a bare ASC identifier (the deterministic
+                // PK tie-break PG uses). A DESC second key is rejected (off the
+                // fast path) — the runtime gate further requires it to be the
+                // single PK column.
+                let (sec_col, sec_asc) = parse_term(&exprs[1])?;
+                if !sec_asc {
+                    return None;
+                }
+                topk_second = Some((sec_col, sec_asc));
+            }
+            Some((lead_col, lead_asc))
         }
     };
 
@@ -811,6 +883,7 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
             offset: None,
             order_by: None,
             always_empty: parsed_where.always_false,
+            topk_late: None,
         });
     }
 
@@ -846,6 +919,20 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         return None;
     }
 
+    // A two-column `ORDER BY c, c2` is ONLY served by the deep top-K branch.
+    // If we cannot build a top-K candidate for it here (no LIMIT, OFFSET
+    // present, k over the cap), bail to DataFusion: the single-column path
+    // below would silently drop the secondary tie-break key.
+    let topk_late = build_topk_late_candidate(
+        order_by.as_ref(),
+        topk_second.as_ref(),
+        limit,
+        offset,
+    );
+    if topk_second.is_some() && topk_late.is_none() {
+        return None;
+    }
+
     Some(SimpleSelectPlan {
         table,
         projection,
@@ -858,6 +945,67 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
         offset,
         order_by,
         always_empty: parsed_where.always_false,
+        topk_late,
+    })
+}
+
+/// Default cap on `k` for the deep top-K late-materialization branch. A query
+/// with a huge `LIMIT` would build a `k`-sized winner heap and a `k`-element
+/// `InInt64` phase-2 fetch; past several thousand rows the narrow-key-scan win
+/// shrinks (phase 2 reopens most files) and the bounded-heap memory grows, so
+/// we cap engagement and let larger limits take the full-scan path. The cap is
+/// a performance safety valve, not a correctness boundary — the two-phase
+/// result is byte-identical to the full scan at any `k` (the differential suite
+/// gates this up to `LIMIT 9000`), so the ceiling only governs WHEN the
+/// optimisation engages. Overridable via `BASIN_TOPK_LATE_MAX_K` (`0` disables).
+const TOPK_LATE_MAX_K_DEFAULT: usize = 10_000;
+
+/// `BASIN_TOPK_LATE_MAX_K` — the inclusive `k` cap for the deep top-K branch.
+/// `0` disables the branch entirely (every top-K falls through to the existing
+/// path). An unparseable value uses the default.
+fn topk_late_max_k() -> usize {
+    match std::env::var("BASIN_TOPK_LATE_MAX_K") {
+        Ok(v) => v.trim().parse::<usize>().unwrap_or(TOPK_LATE_MAX_K_DEFAULT),
+        Err(_) => TOPK_LATE_MAX_K_DEFAULT,
+    }
+}
+
+/// Build the syntactic top-K candidate from the parsed ORDER BY + LIMIT.
+/// Returns `None` (no top-K branch) when: there is no ORDER BY, no LIMIT, an
+/// OFFSET is present (the paginated form keeps the existing two-phase
+/// `apply_order_by_limit`), `k` is `0` or over the env cap, or the optional
+/// second key is anything but a single ascending identifier. The runtime gate
+/// in `execute_simple_select_inner` further confirms the identity column
+/// (`pk_col` / the optional second key) is the table's single PK.
+fn build_topk_late_candidate(
+    order_by: Option<&(String, bool)>,
+    second: Option<&(String, bool)>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Option<TopKLatePlan> {
+    let (sort_col, ascending) = order_by?;
+    let k = limit?;
+    // Paginated top-K (OFFSET) stays on the existing path; the late-material
+    // identity heap is sized for the top window only.
+    if offset.is_some() {
+        return None;
+    }
+    let cap = topk_late_max_k();
+    if k == 0 || k > cap {
+        return None;
+    }
+    // The phase-2 identity column: the explicit second ORDER BY key when
+    // present (the `, id` tie-break), else the leading sort column itself
+    // (ORDER BY on the PK directly). The runtime gate confirms it is the PK.
+    let (pk_col, pk_tiebreak) = match second {
+        Some((c2, _asc)) => (c2.clone(), true),
+        None => (sort_col.clone(), false),
+    };
+    Some(TopKLatePlan {
+        sort_col: sort_col.clone(),
+        ascending: *ascending,
+        pk_col,
+        pk_tiebreak,
     })
 }
 
@@ -1441,9 +1589,13 @@ pub(crate) fn literal_value_pub(e: &Expr) -> Option<ScalarValue> {
     literal_value(e)
 }
 
-/// Recognise the literal forms we can push down: signed integers, strings,
-/// booleans. Anything richer (NULL, casts, vectors, floats) drops us out of
-/// the fast path.
+/// Recognise the literal forms we can push down: signed integers, finite
+/// floats, strings, booleans. Anything richer (NULL, casts, vectors) drops us
+/// out of the fast path. A numeric literal that is not a valid `i64` (it has a
+/// decimal point or an exponent) is parsed as `Float64` — the storage filter
+/// path compares `Float64` predicates natively, so e.g. `WHERE amount > 50000.0`
+/// over a `Float64` column is pushable rather than forcing the whole statement
+/// to DataFusion.
 fn literal_value(e: &Expr) -> Option<ScalarValue> {
     let (negate, inner) = match e {
         Expr::UnaryOp {
@@ -1461,8 +1613,17 @@ fn literal_value(e: &Expr) -> Option<ScalarValue> {
             value: Value::Number(s, _),
             ..
         }) => {
-            let parsed: i64 = s.parse().ok()?;
-            Some(ScalarValue::Int64(if negate { -parsed } else { parsed }))
+            if let Ok(parsed) = s.parse::<i64>() {
+                return Some(ScalarValue::Int64(if negate { -parsed } else { parsed }));
+            }
+            // Not an integer literal → try a finite float (decimal / exponent
+            // forms). NaN / inf never appear as SQL number literals; reject a
+            // non-finite parse defensively so a pushed predicate stays sane.
+            let f: f64 = s.parse().ok()?;
+            if !f.is_finite() {
+                return None;
+            }
+            Some(ScalarValue::Float64(if negate { -f } else { f }))
         }
         Expr::Value(ValueWithSpan {
             value: Value::SingleQuotedString(s),
@@ -3062,6 +3223,41 @@ async fn execute_simple_select_inner(
     // between these uses so one snapshot replay is authoritative for all of them.
     let live_files = meta.live_data_files();
 
+    // ── Deep top-K late materialization ──────────────────────────────────────
+    //
+    // `SELECT … FROM t ORDER BY k [DESC] [, pk] LIMIT n` over a wide single-PK
+    // table. The existing path below decodes EVERY column of EVERY row, then
+    // sorts + limits — paying the full wide-row decode for the (rows − n) losers
+    // that never appear in the result. Instead: phase 1 decodes only
+    // `[k, pk]` (+ WHERE columns) to find the winning n PKs with file-level
+    // min/max skipping, phase 2 fetches the full rows for just those n PKs.
+    //
+    // Eligibility is confirmed inside `try_topk_late_materialize` (the syntactic
+    // shape was recognised in `match_query`); ANY runtime ineligibility — live
+    // overlay, an un-flushed tail to merge, a pinned read, the identity column
+    // not being the single PK, a non-Int64 PK — returns `Ok(None)` and falls
+    // through to the existing decode-everything path UNCHANGED. A two-column
+    // `ORDER BY k, pk` that the branch declines falls through to DataFusion (the
+    // single-column `apply_order_by_limit` below cannot honour the tie-break),
+    // via the gate that set `topk_late` only when the shape is fully handled.
+    if plan.topk_late.is_some() {
+        if let Some(res) = try_topk_late_materialize(
+            sess,
+            &plan,
+            &meta,
+            &live_files,
+            overlay_active,
+            tail_merge_via_shard_read,
+            pinned.is_some(),
+            raw_sql,
+            include_deleted,
+        )
+        .await?
+        {
+            return Ok(res);
+        }
+    }
+
     let pk_probe_paths: Option<Vec<object_store::path::Path>> = if
         // PK row cache hit: the cached batches already answer this point query;
         // skip the zone-map + bloom probe (and its possible Absent early-return)
@@ -4331,6 +4527,705 @@ fn effective_cluster_col(meta: &TableMetadata) -> Option<String> {
         [only] => Some(only.clone()),
         _ => None,
     }
+}
+
+/// 8-byte little-endian `f64` zone-map stat decode — the writer's
+/// `ColumnStats::min_bytes` / `max_bytes` encoding for `Float64` columns
+/// (`vortex_format.rs` and the Parquet writer both emit `f64::to_le_bytes`).
+/// Mirrors `decode_stat_i64` for the floating sort key. Returns `None` for a
+/// missing / wrong-width / NaN stat (NaN ordering is unspecified, so a NaN
+/// bound disables the file skip rather than risk a wrong prune).
+fn decode_stat_f64(b: Option<&[u8]>) -> Option<f64> {
+    let arr: [u8; 8] = b?.try_into().ok()?;
+    let v = f64::from_le_bytes(arr);
+    if v.is_nan() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// `SortOptions` matching PG / DataFusion NULL defaults for a key sorted in
+/// `ascending` direction: NULLS LAST for ASC, NULLS FIRST for DESC (the same
+/// rule `apply_order_by_limit` uses). The PK tie-break key is always ASC.
+fn topk_sort_options(ascending: bool) -> arrow::compute::SortOptions {
+    arrow::compute::SortOptions {
+        descending: !ascending,
+        nulls_first: !ascending,
+    }
+}
+
+/// Build the `(sort_col [, pk]) → row order` `SortColumn` list from the merged
+/// sort-key array and (when `pk_tiebreak`) the merged ascending PK tie-break
+/// array. `ArrayRef` clones are cheap (`Arc`). Used by both the phase-1 narrow
+/// heap-build and the phase-2 winner re-sort so the two orderings are
+/// byte-identical.
+fn topk_sort_columns(
+    sort_arr: &arrow_array::ArrayRef,
+    pk_arr: Option<&arrow_array::ArrayRef>,
+    ascending: bool,
+) -> Vec<arrow::compute::SortColumn> {
+    let mut cols = vec![arrow::compute::SortColumn {
+        values: sort_arr.clone(),
+        options: Some(topk_sort_options(ascending)),
+    }];
+    if let Some(pk) = pk_arr {
+        cols.push(arrow::compute::SortColumn {
+            // PK tie-break: ascending, NULLS LAST (a PK is never NULL, but be
+            // explicit so the ordering is fully specified).
+            values: pk.clone(),
+            options: Some(topk_sort_options(true)),
+        });
+    }
+    cols
+}
+
+/// Deep top-K late materialization.
+///
+/// Two phases over `SELECT … FROM t ORDER BY k [DESC] [, pk] LIMIT n`:
+///
+///   * **Phase 1 — narrow key scan.** Read ONLY `[k, pk]` (+ any WHERE columns)
+///     from the live cold files, applying the same pushed predicates the slow
+///     path would. File-skip any file whose `k` min/max proves it cannot
+///     contribute to the global top-`n` given the current `n`-th bound (Int64 /
+///     Float64 sort keys with catalog `column_stats`; other types skip the
+///     prune and read every file — correct, just less pruned). Lexically
+///     top-`n`-sort the surviving `(k, pk)` rows and collect the winning ≤ `n`
+///     PK values.
+///   * **Phase 2 — wide fetch.** Read the FULL projected rows for just those
+///     PKs via an `InInt64(pk, winners)` pushdown (the existing sorted-key skip
+///     seam), re-sort by `(k, pk)`, and project. The wide columns of the
+///     `rows − n` losers are never decoded.
+///
+/// Returns `Ok(None)` to fall through to the existing decode-everything path
+/// for ANY ineligibility:
+///   * the env cap disabled the branch (`k == 0`);
+///   * a live hot-tier overlay (`overlay_active`) — the merge is complex and an
+///     overlay-updated sort value would need the NEW value; we decline (the
+///     existing path applies the overlay correctly);
+///   * a small un-flushed tail to merge (`tail_merge_via_shard_read`) — a hot
+///     row could win; we decline so the tail-merging path serves it. (An empty
+///     tail or a large tail already flushed to cold leaves every committed row
+///     in `live_files`, so a hot row cannot be missed here.);
+///   * a pinned in-tx read (`pinned`) — keep the existing pinned path;
+///   * the identity column is not the table's single Int64 PK (so the phase-2
+///     `InInt64` point-fetch cannot address the winners);
+///   * `SELECT` carries a computed projection (handled by the existing path).
+///
+/// When a two-column `ORDER BY k, pk` declines here, the caller's `match_query`
+/// gate guaranteed the statement is served ONLY by this branch — so a decline
+/// must reach DataFusion, not the single-column `apply_order_by_limit`. We do
+/// that by re-dispatching to `exec_select` on the decline paths that the
+/// single-column fallback would mishandle (i.e. `pk_tiebreak`).
+#[allow(clippy::too_many_arguments)]
+async fn try_topk_late_materialize(
+    sess: &ProjectSession,
+    plan: &SimpleSelectPlan,
+    meta: &TableMetadata,
+    live_files: &[basin_catalog::DataFileRef],
+    overlay_active: bool,
+    tail_merge_via_shard_read: bool,
+    pinned: bool,
+    raw_sql: &str,
+    include_deleted: bool,
+) -> Result<Option<ExecResult>> {
+    use arrow_array::Array;
+    let Some(tk) = plan.topk_late.as_ref() else {
+        return Ok(None);
+    };
+
+    // Helper: a decline that the single-column fallback path below CANNOT serve
+    // (a two-column `ORDER BY k, pk`) must go to DataFusion; a single-column
+    // decline falls through to the existing `apply_order_by_limit`.
+    async fn decline(
+        sess: &ProjectSession,
+        pk_tiebreak: bool,
+        raw_sql: &str,
+        include_deleted: bool,
+    ) -> Result<Option<ExecResult>> {
+        if pk_tiebreak {
+            // The existing single-column path can't honour the PK tie-break;
+            // route the whole statement to DataFusion, which sorts both keys.
+            let fb = fallback_sql(raw_sql);
+            let res = crate::executor::exec_select(sess, &fb, include_deleted, Some(raw_sql)).await?;
+            Ok(Some(res))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // ── Runtime eligibility gates ────────────────────────────────────────────
+    let limit = match plan.limit {
+        Some(n) if n > 0 => n,
+        // k == 0 (empty result) — let the existing path return empty; no win.
+        _ => return decline(sess, tk.pk_tiebreak, raw_sql, include_deleted).await,
+    };
+    // Env cap disabled or pinned / overlay / tail-merge → decline.
+    if topk_late_max_k() == 0
+        || pinned
+        || overlay_active
+        || tail_merge_via_shard_read
+    {
+        return decline(sess, tk.pk_tiebreak, raw_sql, include_deleted).await;
+    }
+    // Identity must be the single PK column, and (for the phase-2 InInt64
+    // point-fetch) that PK must be an Int64-family column.
+    if meta.pk_columns.len() != 1 || meta.pk_columns[0] != tk.pk_col {
+        return decline(sess, tk.pk_tiebreak, raw_sql, include_deleted).await;
+    }
+    let Ok(pk_idx) = meta.schema.index_of(&tk.pk_col) else {
+        return decline(sess, tk.pk_tiebreak, raw_sql, include_deleted).await;
+    };
+    if !matches!(
+        meta.schema.field(pk_idx).data_type(),
+        arrow_schema::DataType::Int64
+    ) {
+        return decline(sess, tk.pk_tiebreak, raw_sql, include_deleted).await;
+    }
+    // Sort column must exist in the schema.
+    let Ok(sort_idx) = meta.schema.index_of(&tk.sort_col) else {
+        return decline(sess, tk.pk_tiebreak, raw_sql, include_deleted).await;
+    };
+    let sort_dt = meta.schema.field(sort_idx).data_type().clone();
+    // Computed projections are handled by the existing path's rebuild; decline.
+    if let Some(items) = plan.projection.as_ref() {
+        if items
+            .iter()
+            .any(|it| matches!(it, ProjectionItem::Computed { .. }))
+        {
+            return decline(sess, tk.pk_tiebreak, raw_sql, include_deleted).await;
+        }
+    }
+    // `include_deleted` (soft-delete-visibility variant) takes the existing
+    // path so its tombstone visibility is unchanged.
+    if include_deleted {
+        return decline(sess, tk.pk_tiebreak, raw_sql, include_deleted).await;
+    }
+
+    // ── Phase 1: narrow key scan ([sort_col, pk] + WHERE columns) ────────────
+    //
+    // Read only the columns we need to (a) order, (b) identify the winners, and
+    // (c) re-check any WHERE predicate. The WHERE predicates are pushed exactly
+    // as the slow path pushes them (same `filters`), so phase 1's surviving
+    // rows are the same rows the slow path would keep. The PK is unique within
+    // and across files, so the winning PKs uniquely address the winner rows in
+    // phase 2.
+    let mut phase1_cols: Vec<String> = Vec::with_capacity(4);
+    phase1_cols.push(tk.sort_col.clone());
+    if tk.pk_col != tk.sort_col {
+        phase1_cols.push(tk.pk_col.clone());
+    }
+    for p in &plan.predicates {
+        let c = p.column();
+        if !phase1_cols.iter().any(|x| x == c) && meta.schema.index_of(c).is_ok() {
+            phase1_cols.push(c.to_string());
+        }
+    }
+    for (c, _) in &plan.in_list_preds {
+        if !phase1_cols.iter().any(|x| x == c) && meta.schema.index_of(c).is_ok() {
+            phase1_cols.push(c.clone());
+        }
+    }
+    for c in &plan.is_null_cols {
+        if !phase1_cols.iter().any(|x| x == c) && meta.schema.index_of(c).is_ok() {
+            phase1_cols.push(c.clone());
+        }
+    }
+
+    // File-level min/max skip on the sort column. A file can contribute to the
+    // global top-`limit` only if its `sort_col` range overlaps the region the
+    // current `limit`-th bound admits. We do a simpler, always-correct variant:
+    // decode each candidate file's `sort_col` min/max, sort the files by the
+    // bound that matters (max for DESC, min for ASC), and read greedily until
+    // we have `limit` survivors whose worst key already beats every unread
+    // file's best key. Files proven unable to beat the running `limit`-th bound
+    // are skipped entirely. Only Int64 / Float64 sort columns carry decodable
+    // catalog stats; for any other type (or a file missing the stat) we keep
+    // that file unconditionally (correct, just unpruned).
+    //
+    // To stay simple and robust we read ALL surviving files' narrow `[k, pk]`
+    // projection (the per-file skip below only DROPS files the stats prove
+    // irrelevant), then do the global bounded top-`limit` sort once. The narrow
+    // projection makes even the unpruned read cheap (2 columns vs the wide row).
+    // The row-budget file skip is sound only when every row of a file is a
+    // top-K candidate. A WHERE filter makes the per-file SURVIVOR count
+    // unknown (fewer than `row_count` may pass), so the `limit`-th bound built
+    // from raw `row_count` could prune a file that, post-filter, should still
+    // contribute. When any filter is present we therefore keep every file (the
+    // narrow `[k, pk]` read is still cheap; only the file SKIP is forgone).
+    let has_filter = !plan.predicates.is_empty()
+        || !plan.in_list_preds.is_empty()
+        || !plan.is_null_cols.is_empty();
+    let pruned_paths: Vec<object_store::path::Path> = if has_filter {
+        live_files
+            .iter()
+            .map(|f| object_store::path::Path::from(f.path.as_str()))
+            .collect()
+    } else {
+        topk_phase1_file_skip(live_files, &tk.sort_col, &sort_dt, tk.ascending, limit)
+    };
+    if pruned_paths.is_empty() {
+        // No live files (empty table / everything pruned to nothing): the
+        // existing path returns an empty result cheaply. Decline so its empty
+        // handling and schema construction run unchanged.
+        return decline(sess, tk.pk_tiebreak, raw_sql, include_deleted).await;
+    }
+
+    let phase1_opts = ReadOptions {
+        projection: Some(phase1_cols.clone()),
+        filters: plan.predicates.clone(),
+        partition: None,
+        limit: None,
+        row_group_selection: None,
+        sorted_by: None,
+    };
+    let phase1_schema = {
+        let idxs: Vec<usize> = phase1_cols
+            .iter()
+            .map(|c| meta.schema.index_of(c).expect("phase1 col validated"))
+            .collect();
+        Arc::new(
+            meta.schema
+                .project(&idxs)
+                .map_err(|e| BasinError::internal(format!("topk phase1 schema: {e}")))?,
+        )
+    };
+    let phase1_batches: Vec<RecordBatch> = {
+        use futures::StreamExt;
+        let stream = sess
+            .engine
+            .config()
+            .storage
+            .read_paths_with_schema(
+                &sess.project,
+                pruned_paths,
+                phase1_opts,
+                Some(phase1_schema.clone()),
+            )
+            .await?;
+        stream.collect::<Vec<Result<RecordBatch>>>().await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    // Apply the post-read shrinking filters (IS NULL / IN-list) the slow path
+    // applies, so phase 1's surviving rows match the slow path's exactly. These
+    // operate on phase1 batches (which include the referenced columns).
+    let phase1_batches = if plan.is_null_cols.is_empty() {
+        phase1_batches
+    } else {
+        apply_is_null_filter(phase1_batches, &plan.is_null_cols)?
+    };
+    let phase1_batches = if plan.in_list_preds.is_empty() {
+        phase1_batches
+    } else {
+        apply_in_list_filter(phase1_batches, &plan.in_list_preds)?
+    };
+
+    // Bounded top-`limit` over the narrow batches → winning PK values.
+    let p1_sort_i = phase1_schema.index_of(&tk.sort_col).expect("sort col in phase1");
+    let p1_pk_i = phase1_schema.index_of(&tk.pk_col).expect("pk col in phase1");
+    let total_p1: usize = phase1_batches.iter().map(|b| b.num_rows()).sum();
+    if total_p1 == 0 {
+        // Empty after filtering — return an empty result in the output schema
+        // the existing projection would build. Easiest correct answer: decline
+        // and let the existing path produce the empty set.
+        return decline(sess, tk.pk_tiebreak, raw_sql, include_deleted).await;
+    }
+    // Concatenate ONLY the key + pk columns (narrow) for the global sort.
+    let sort_arrays: Vec<&dyn Array> = phase1_batches
+        .iter()
+        .map(|b| b.column(p1_sort_i).as_ref())
+        .collect();
+    let pk_arrays: Vec<&dyn Array> = phase1_batches
+        .iter()
+        .map(|b| b.column(p1_pk_i).as_ref())
+        .collect();
+    let merged_sort = arrow::compute::concat(&sort_arrays)
+        .map_err(|e| BasinError::internal(format!("topk sort concat: {e}")))?;
+    let merged_pk = arrow::compute::concat(&pk_arrays)
+        .map_err(|e| BasinError::internal(format!("topk pk concat: {e}")))?;
+    let sort_cols = topk_sort_columns(
+        &merged_sort,
+        tk.pk_tiebreak.then_some(&merged_pk),
+        tk.ascending,
+    );
+    let indices = arrow::compute::lexsort_to_indices(&sort_cols, Some(limit))
+        .map_err(|e| BasinError::internal(format!("topk lexsort: {e}")))?;
+    // Collect the winning PK values (Int64) in winner order.
+    let merged_pk_i64 = merged_pk
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .ok_or_else(|| BasinError::internal("topk pk not Int64".to_string()))?;
+    let mut winners: Vec<i64> = Vec::with_capacity(indices.len());
+    for i in indices.values().iter() {
+        let row = *i as usize;
+        if merged_pk_i64.is_null(row) {
+            // A NULL PK is impossible (PK is NOT NULL); be defensive and
+            // decline rather than emit a wrong winner set.
+            return decline(sess, tk.pk_tiebreak, raw_sql, include_deleted).await;
+        }
+        winners.push(merged_pk_i64.value(row));
+    }
+    if winners.is_empty() {
+        return decline(sess, tk.pk_tiebreak, raw_sql, include_deleted).await;
+    }
+    // Dedup defensively for the InInt64 fetch (PKs are unique, so this is a
+    // no-op, but a malformed file with duplicate PKs must not fetch twice).
+    let mut winner_set = winners.clone();
+    winner_set.sort_unstable();
+    winner_set.dedup();
+
+    // ── Phase 2: wide fetch for just the winning PKs ─────────────────────────
+    //
+    // `InInt64(pk, winners)` over the live files. The PK column is the table's
+    // effective cluster column, so storage binary-searches each PK-sorted chunk
+    // (the `sorted_by` hint enables the sorted-key skip) and `take`s only the
+    // matching rows — never an O(rows) Arrow filter over the wide columns.
+    let pk_col = tk.pk_col.clone();
+    let phase2_filters = vec![Predicate::InInt64(pk_col.clone(), winner_set.clone())];
+    let sorted_by = effective_cluster_col(meta).filter(|c| c == &pk_col);
+    // Phase-2 read projection. For `SELECT *` (`read_cols == None`) every column
+    // is read. For a column-list projection we must ALSO decode the PK (the
+    // `InInt64` filter + final re-sort tie-break need it) and the sort column
+    // (the re-sort needs it), even if the user did not select them — they are
+    // projected back OUT by `topk_project_batches` below, so they never leak
+    // into the result. Mirrors the overlay-PK augmentation the slow path does.
+    let phase2_projection: Option<Vec<String>> = plan.read_cols.clone().map(|mut cols| {
+        for need in [pk_col.as_str(), tk.sort_col.as_str()] {
+            if !cols.iter().any(|c| c == need) && meta.schema.index_of(need).is_ok() {
+                cols.push(need.to_string());
+            }
+        }
+        cols
+    });
+    let phase2_opts = ReadOptions {
+        projection: phase2_projection,
+        filters: phase2_filters,
+        partition: None,
+        limit: None,
+        row_group_selection: None,
+        sorted_by,
+    };
+    let phase2_paths: Vec<object_store::path::Path> = live_files
+        .iter()
+        .map(|f| object_store::path::Path::from(f.path.as_str()))
+        .collect();
+    let phase2_batches: Vec<RecordBatch> = {
+        use futures::StreamExt;
+        let stream = sess
+            .engine
+            .config()
+            .storage
+            .read_paths_with_schema(
+                &sess.project,
+                phase2_paths,
+                phase2_opts,
+                Some(meta.schema.clone()),
+            )
+            .await?;
+        stream.collect::<Vec<Result<RecordBatch>>>().await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+    };
+    // The InInt64 pushdown is a SUPERSET filter on some encodings; re-apply it
+    // as the source of truth (mirrors the slow path, which always re-checks).
+    let phase2_batches = apply_in_list_filter(
+        phase2_batches,
+        &[(
+            pk_col.clone(),
+            winner_set.iter().map(|v| ScalarValue::Int64(*v)).collect(),
+        )],
+    )?;
+
+    // ── Build the output: project, then re-sort by (sort_col [, pk]) ─────────
+    //
+    // Reuse the existing projection rebuild by routing through the shared
+    // helper shape: the slow path projects AFTER the read using
+    // `plan.projection`; we do the same here on the (≤ limit) winner rows, then
+    // a final two-key sort produces the exact global order.
+    let (out_schema, out_batches) =
+        topk_project_batches(plan, meta, phase2_batches)?;
+
+    // Final re-sort of the ≤ limit winners by (sort_col [, pk]). The output
+    // already contains only the winners (phase-2 fetched exactly them), so this
+    // is a tiny O(k log k) sort over k rows.
+    let result = topk_resort_window(out_batches, &out_schema, &tk.sort_col, tk.ascending, tk.pk_tiebreak.then_some(tk.pk_col.as_str()), limit)?;
+
+    sess.engine.note_topk_late_fast_select();
+    Ok(Some(ExecResult::Rows {
+        schema: out_schema,
+        batches: result,
+    }))
+}
+
+/// Phase-1 file skip for the deep top-K narrow scan. Returns the subset of
+/// `live_files` paths whose `sort_col` min/max cannot be excluded from the
+/// global top-`limit`. Files whose stats prove they cannot beat the best
+/// `limit` keys seen in higher-ranked files are dropped.
+///
+/// Strategy (Int64 / Float64 only; other types keep every file): sort files by
+/// the bound that matters for the direction (max desc for DESC, min asc for
+/// ASC). Walk in best-first order accumulating a row budget; once the
+/// accumulated `row_count` reaches `limit`, every later file whose best key is
+/// strictly worse than the `limit`-th best key already guaranteed cannot
+/// contribute and is dropped. A file missing a decodable stat is kept (read
+/// in full — correct, just unpruned). This is a conservative SUPERSET: the
+/// global sort in phase 1 still produces the exact top-`limit`.
+fn topk_phase1_file_skip(
+    live_files: &[basin_catalog::DataFileRef],
+    sort_col: &str,
+    sort_dt: &arrow_schema::DataType,
+    ascending: bool,
+    limit: usize,
+) -> Vec<object_store::path::Path> {
+    use arrow_schema::DataType;
+    // Whether NULLs in the sort column sort to the WINNING side (the top of the
+    // result). `topk_sort_options` uses `nulls_first = !ascending`, so a DESC
+    // sort places NULLs first — they are the absolute top-`k` winners. A file's
+    // `column_stats` min/max are over NON-NULL values only, so they say nothing
+    // about a file's NULL rows. If NULLs win and a file may contain a NULL
+    // (`null_count > 0`, or unknown), the min/max skip is UNSOUND for that file
+    // (it could drop a file whose NULL rows belong in the top-`k`), so we keep
+    // it unconditionally. When NULLs LOSE (ASC, nulls_last) they can only enter
+    // the top-`k` after every non-NULL key, which the min/max budget already
+    // accounts for, so the skip stays sound.
+    let nulls_win = !ascending;
+    // Decode a file's `sort_col` [min, max] as f64 (Int64 widened). `None` ⇒
+    // stat undecodable (or a NULL-bearing file when NULLs win) ⇒ the file is
+    // kept unconditionally.
+    let to_f = |df: &basin_catalog::DataFileRef| -> Option<(f64, f64)> {
+        let cs = df.column_stats.get(sort_col)?;
+        // NULLs win and this file may hold one → cannot skip on non-null bounds.
+        if nulls_win && cs.null_count.map(|n| n > 0).unwrap_or(true) {
+            return None;
+        }
+        match sort_dt {
+            DataType::Int64 => {
+                let mn = decode_stat_i64(cs.min_bytes.as_deref())? as f64;
+                let mx = decode_stat_i64(cs.max_bytes.as_deref())? as f64;
+                Some((mn, mx))
+            }
+            DataType::Float64 => {
+                let mn = decode_stat_f64(cs.min_bytes.as_deref())?;
+                let mx = decode_stat_f64(cs.max_bytes.as_deref())?;
+                Some((mn, mx))
+            }
+            _ => None,
+        }
+    };
+
+    // Files with a decodable [min,max] participate in the skip; undecodable
+    // ones are always kept.
+    struct FileBound {
+        path: object_store::path::Path,
+        best: f64,
+        worst: f64,
+        rows: u64,
+    }
+    let mut decodable: Vec<FileBound> = Vec::new();
+    let mut always_keep: Vec<object_store::path::Path> = Vec::new();
+    for df in live_files {
+        let path = object_store::path::Path::from(df.path.as_str());
+        match to_f(df) {
+            Some((mn, mx)) => {
+                let (best, worst) = if ascending { (mn, mx) } else { (mx, mn) };
+                decodable.push(FileBound {
+                    path,
+                    best,
+                    worst,
+                    rows: df.row_count,
+                });
+            }
+            None => always_keep.push(path),
+        }
+    }
+    if decodable.is_empty() {
+        return always_keep;
+    }
+    // Order best-first. For ASC best = smallest min; for DESC best = largest
+    // max. Sort so the most promising files come first.
+    decodable.sort_by(|a, b| {
+        if ascending {
+            a.best.partial_cmp(&b.best).unwrap_or(std::cmp::Ordering::Equal)
+        } else {
+            b.best.partial_cmp(&a.best).unwrap_or(std::cmp::Ordering::Equal)
+        }
+    });
+    // The `limit`-th best key bound: walk accumulating rows; the file at which
+    // the cumulative row count first reaches `limit` carries (in its WORST key)
+    // a guaranteed bound — every later file whose BEST key is strictly worse
+    // than that worst key cannot contribute and is dropped. `always_keep`
+    // files (undecodable) prepend to the budget conservatively (counted as if
+    // they all rank ahead) — we simply never skip when any are present, to keep
+    // the bound sound without knowing their keys.
+    let mut kept: Vec<object_store::path::Path> = Vec::with_capacity(decodable.len());
+    if !always_keep.is_empty() {
+        // Undecodable files could hold arbitrary keys; do not skip any decodable
+        // file. Keep everything (still correct; just no pruning this call).
+        kept.extend(always_keep);
+        kept.extend(decodable.into_iter().map(|f| f.path));
+        return kept;
+    }
+    let mut budget: u64 = 0;
+    let mut bound: Option<f64> = None; // the limit-th best file's worst key
+    for f in &decodable {
+        if bound.is_none() {
+            budget = budget.saturating_add(f.rows);
+            if budget >= limit as u64 {
+                bound = Some(f.worst);
+            }
+        }
+    }
+    let cutoff = match bound {
+        // Fewer than `limit` rows total across decodable files: every file is
+        // needed.
+        None => {
+            return decodable.into_iter().map(|f| f.path).collect();
+        }
+        Some(b) => b,
+    };
+    for f in decodable {
+        // A file contributes only if its BEST key can beat the bound. For DESC
+        // (best = max) it must be >= bound; for ASC (best = min) it must be <=
+        // bound. Ties (==) are KEPT (a tie can still displace via the PK
+        // tie-break / equal keys), so we use a non-strict comparison.
+        let keep = if ascending {
+            f.best <= cutoff
+        } else {
+            f.best >= cutoff
+        };
+        if keep {
+            kept.push(f.path);
+        }
+    }
+    kept
+}
+
+/// Project the phase-2 winner batches into the user's SELECT projection,
+/// producing `(output_schema, projected_batches)`. Plain-column projections
+/// only (computed projections were declined upstream); `SELECT *` passes the
+/// full catalog-schema rows through. Normalises each batch to the projected
+/// schema so a later concat/sort never fails on a decode type mismatch (e.g.
+/// Vortex narrowing LargeBinary→Binary), mirroring the slow path.
+fn topk_project_batches(
+    plan: &SimpleSelectPlan,
+    meta: &TableMetadata,
+    batches: Vec<RecordBatch>,
+) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
+    let (schema, batches): (Arc<Schema>, Vec<RecordBatch>) = match &plan.projection {
+        None => (meta.schema.clone(), batches),
+        Some(items) => {
+            let mut idxs = Vec::with_capacity(items.len());
+            for item in items {
+                let c = match item {
+                    ProjectionItem::Column(c) => c,
+                    ProjectionItem::Computed { .. } => {
+                        return Err(BasinError::internal(
+                            "topk computed projection should have declined".to_string(),
+                        ));
+                    }
+                };
+                let i = meta
+                    .schema
+                    .index_of(c)
+                    .map_err(|_| BasinError::UndefinedColumn(c.to_string()))?;
+                idxs.push(i);
+            }
+            let schema = Arc::new(
+                meta.schema
+                    .project(&idxs)
+                    .map_err(|e| BasinError::internal(format!("topk project schema: {e}")))?,
+            );
+            let projected: Vec<RecordBatch> = batches
+                .into_iter()
+                .map(|b| {
+                    b.project(&idxs)
+                        .map_err(|e| BasinError::internal(format!("topk project batch: {e}")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (schema, projected)
+        }
+    };
+    let batches: Vec<RecordBatch> = batches
+        .into_iter()
+        .map(|b| crate::hot_tombstone::normalize_batch_to_schema(b, schema.as_ref()))
+        .collect();
+    Ok((schema, batches))
+}
+
+/// Final re-sort of the ≤ `limit` phase-2 winner rows by `(sort_col [, pk])`
+/// and trim to `limit`. The input already contains only the winners, so this is
+/// O(k log k). Uses `lexsort_to_indices` + `interleave` so the wide columns are
+/// touched once per output row.
+fn topk_resort_window(
+    batches: Vec<RecordBatch>,
+    schema: &Arc<Schema>,
+    sort_col: &str,
+    ascending: bool,
+    pk_col: Option<&str>,
+    limit: usize,
+) -> Result<Vec<RecordBatch>> {
+    use arrow_array::Array;
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sort_i = schema.index_of(sort_col).map_err(|_| {
+        BasinError::InvalidSchema(format!("topk re-sort: column '{sort_col}' not in result"))
+    })?;
+    let pk_i = match pk_col {
+        Some(c) => Some(schema.index_of(c).map_err(|_| {
+            BasinError::InvalidSchema(format!("topk re-sort: pk '{c}' not in result"))
+        })?),
+        None => None,
+    };
+    let sort_arrays: Vec<&dyn Array> = batches.iter().map(|b| b.column(sort_i).as_ref()).collect();
+    let merged_sort = arrow::compute::concat(&sort_arrays)
+        .map_err(|e| BasinError::internal(format!("topk re-sort concat: {e}")))?;
+    let merged_pk = match pk_i {
+        Some(i) => {
+            let a: Vec<&dyn Array> = batches.iter().map(|b| b.column(i).as_ref()).collect();
+            Some(
+                arrow::compute::concat(&a)
+                    .map_err(|e| BasinError::internal(format!("topk re-sort pk concat: {e}")))?,
+            )
+        }
+        None => None,
+    };
+    let sort_cols = topk_sort_columns(&merged_sort, merged_pk.as_ref(), ascending);
+    let indices = arrow::compute::lexsort_to_indices(&sort_cols, Some(limit))
+        .map_err(|e| BasinError::internal(format!("topk re-sort lexsort: {e}")))?;
+    if indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Map each global index → (batch_idx, row_idx) and interleave every column.
+    let mut offsets: Vec<usize> = Vec::with_capacity(batches.len() + 1);
+    let mut acc = 0usize;
+    offsets.push(0);
+    for b in &batches {
+        acc += b.num_rows();
+        offsets.push(acc);
+    }
+    let pairs: Vec<(usize, usize)> = indices
+        .values()
+        .iter()
+        .map(|&g| {
+            let g = g as usize;
+            let bi = offsets.partition_point(|&o| o <= g) - 1;
+            (bi, g - offsets[bi])
+        })
+        .collect();
+    let columns: Vec<arrow_array::ArrayRef> = (0..schema.fields().len())
+        .map(|i| {
+            let per_batch: Vec<&dyn Array> =
+                batches.iter().map(|b| b.column(i).as_ref()).collect();
+            arrow::compute::interleave(&per_batch, &pairs)
+                .map_err(|e| BasinError::internal(format!("topk re-sort interleave {i}: {e}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let out = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| BasinError::internal(format!("topk re-sort batch: {e}")))?;
+    Ok(vec![out])
 }
 
 /// Two-phase global top-k for `ORDER BY <col> {ASC|DESC} LIMIT limit [OFFSET

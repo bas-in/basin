@@ -271,6 +271,12 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
                 // session-level GUC is stored and used by `%` / `<%` rewrites.
                 || after_set.starts_with("PG_TRGM.SIMILARITY_THRESHOLD")
                 || after_set.starts_with("PG_TRGM.WORD_SIMILARITY_THRESHOLD")
+                // basin.read_tier: must reach the real handler so the session
+                // GUC is stored (and a bad value errors) rather than silently
+                // accepted — a silent-accept would leave a non-home session on
+                // the default 'primary' tier and reject its reads unexpectedly.
+                || after_set.starts_with("BASIN.READ_TIER")
+                || after_set.starts_with("BASIN_READ_TIER")
             {
                 None // Let the real executor handler fire.
             } else if upper.starts_with("RESET") {
@@ -301,6 +307,8 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
                 || trimmed == "SHOW SYNCHRONOUS_COMMIT"
                 || trimmed == "SHOW PG_TRGM.SIMILARITY_THRESHOLD"
                 || trimmed == "SHOW PG_TRGM.WORD_SIMILARITY_THRESHOLD"
+                || trimmed == "SHOW BASIN.READ_TIER"
+                || trimmed == "SHOW BASIN_READ_TIER"
             {
                 None
             } else {

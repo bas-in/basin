@@ -77,6 +77,7 @@ fn project_metadata_with_byo_bucket_round_trips() {
             secret_access_key_enc: b"encrypted_blob".to_vec(),
             force_path_style: false,
         }),
+        home_region: None,
     };
     let json = serde_json::to_string(&meta).unwrap();
     let back: ProjectMetadata = serde_json::from_str(&json).unwrap();
@@ -119,6 +120,7 @@ async fn set_then_get_round_trips_in_memory() {
             secret_access_key_enc: vec![0x42, 0x43],
             force_path_style: false,
         }),
+        home_region: None,
     };
     cat.set_project_metadata(&project, meta.clone())
         .await
@@ -140,6 +142,7 @@ async fn set_overwrites_existing_in_memory() {
             secret_access_key_enc: vec![1],
             force_path_style: false,
         }),
+        home_region: None,
     };
     let second = ProjectMetadata {
         byo_bucket: Some(S3Config {
@@ -150,6 +153,7 @@ async fn set_overwrites_existing_in_memory() {
             secret_access_key_enc: vec![2],
             force_path_style: true,
         }),
+        home_region: None,
     };
     cat.set_project_metadata(&project, first).await.unwrap();
     cat.set_project_metadata(&project, second.clone())
@@ -172,6 +176,7 @@ async fn set_none_byo_bucket_clears_it() {
             secret_access_key_enc: vec![],
             force_path_style: false,
         }),
+        home_region: None,
     };
     cat.set_project_metadata(&project, with_byo).await.unwrap();
 
@@ -200,6 +205,7 @@ async fn cross_project_isolation_in_memory() {
             secret_access_key_enc: vec![0xa],
             force_path_style: false,
         }),
+        home_region: None,
     };
     cat.set_project_metadata(&a, meta_a.clone()).await.unwrap();
 
@@ -225,6 +231,7 @@ async fn drop_namespace_clears_project_metadata() {
             secret_access_key_enc: vec![],
             force_path_style: false,
         }),
+        home_region: None,
     };
     cat.create_namespace(&project).await.unwrap();
     cat.set_project_metadata(&project, meta).await.unwrap();

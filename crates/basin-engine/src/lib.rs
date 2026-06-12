@@ -136,6 +136,13 @@ pub(crate) struct EngineInner {
     /// overlay-tolerant inflated-target form). Test introspection surface,
     /// mirroring `keyset_fast_select_count`.
     pub(crate) unordered_limit_fast_select_count: AtomicU64,
+    /// Cumulative number of deep top-K statements
+    /// (`ORDER BY k [DESC] [, pk] LIMIT n`) served by the two-phase
+    /// late-materialization branch in `fast_select`: phase 1 decodes only the
+    /// sort key + PK to find the winning `n` row identities, phase 2 fetches
+    /// the full (wide) rows for just those PKs. Test introspection surface,
+    /// mirroring `keyset_fast_select_count`.
+    pub(crate) topk_late_fast_select_count: AtomicU64,
     /// Per-project noisy-project detector. Reads its bit when a session is
     /// opened (to choose `target_partitions`) and bumps it after every
     /// successful `ProjectSession::execute`. See `noisy_detector` module
@@ -325,6 +332,15 @@ pub(crate) struct EngineInner {
     /// Dual-watermark invalidation (hot_tier_epoch + snapshot_id); see
     /// [`crate::pk_row_cache`].
     pub(crate) pk_row_cache: Arc<crate::pk_row_cache::PkRowCache>,
+
+    /// Multi-region (ADR 0009): optional write forwarder. When a non-home
+    /// write reaches this region and a forwarder is registered, the engine
+    /// delegates to it (the home region executes and returns the result)
+    /// instead of raising `BasinError::WrongRegion`. `None` (the default) is
+    /// the OSS fail-loud behaviour; the cloud-private layer installs the real
+    /// forwarder via `Engine::attach_write_forwarder`. `RwLock` mirrors the
+    /// `event_sinks` attach-after-construction pattern.
+    pub(crate) write_forwarder: RwLock<Option<Arc<dyn crate::region::WriteForwarder>>>,
 }
 
 impl Engine {
@@ -385,6 +401,7 @@ impl Engine {
             promoted_fast_select_count: AtomicU64::new(0),
             keyset_fast_select_count: AtomicU64::new(0),
             unordered_limit_fast_select_count: AtomicU64::new(0),
+            topk_late_fast_select_count: AtomicU64::new(0),
             noisy_detector: crate::noisy_detector::NoisyDetector::new(),
             project_counters,
             event_sinks: RwLock::new(registry),
@@ -438,6 +455,9 @@ impl Engine {
             // Tier 2 bulk-INSERT PK set cache.
             pk_set_cache: Arc::new(crate::constraints::PkSetCache::new()),
             pk_row_cache: Arc::new(crate::pk_row_cache::PkRowCache::from_env()),
+            // Multi-region: no forwarder by default (OSS fail-loud). The
+            // cloud-private layer attaches one at startup.
+            write_forwarder: RwLock::new(None),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -562,6 +582,28 @@ impl Engine {
 
     pub(crate) fn event_sinks(&self) -> &RwLock<EventSinkRegistry> {
         &self.inner.event_sinks
+    }
+
+    /// Register the process-wide [`crate::region::WriteForwarder`]. Once set,
+    /// every non-home write delegates to it instead of raising
+    /// `BasinError::WrongRegion`. Last writer wins (matches the attach-* sinks
+    /// API). Intended to be called once at startup by the cloud-private layer.
+    pub fn attach_write_forwarder(&self, fwd: Arc<dyn crate::region::WriteForwarder>) {
+        *self
+            .inner
+            .write_forwarder
+            .write()
+            .expect("write_forwarder lock poisoned") = Some(fwd);
+    }
+
+    /// The currently-registered write forwarder, if any. Cloned `Arc` so the
+    /// caller can `.await` the forward without holding the lock.
+    pub(crate) fn write_forwarder(&self) -> Option<Arc<dyn crate::region::WriteForwarder>> {
+        self.inner
+            .write_forwarder
+            .read()
+            .expect("write_forwarder lock poisoned")
+            .clone()
     }
 
     /// Allocate the next per-`(project, table)` sequence number. Crate-
@@ -886,6 +928,26 @@ impl Engine {
     pub fn unordered_limit_fast_select_count(&self) -> u64 {
         self.inner
             .unordered_limit_fast_select_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// Crate-private hook bumped by `fast_select` each time the deep top-K
+    /// two-phase late-materialization branch serves an
+    /// `ORDER BY k [DESC] [, pk] LIMIT n` query.
+    pub(crate) fn note_topk_late_fast_select(&self) {
+        self.inner
+            .topk_late_fast_select_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative count of statements served by the deep top-K late-
+    /// materialization branch since this `Engine` was created. Test
+    /// introspection: proves the two-phase path engaged (vs. the full-scan
+    /// decode-everything-then-sort fallback). Mirrors
+    /// [`Engine::keyset_fast_select_count`].
+    pub fn topk_late_fast_select_count(&self) -> u64 {
+        self.inner
+            .topk_late_fast_select_count
             .load(Ordering::Relaxed)
     }
 
@@ -1451,6 +1513,7 @@ impl Drop for ProjectSession {
 }
 
 pub use crate::pk_row_cache::PkRowCacheCountersSnapshot;
+pub use crate::region::{ForwardContext, WriteForwarder};
 pub use crate::prepared::{BoundStatement, ScalarParam, StatementHandle, StatementSchema};
 /// Re-export the secondary B-tree index registry + location type so
 /// integration tests can probe the registry directly (FIX 2 verification).
@@ -1569,6 +1632,7 @@ mod procedure_ddl;
 mod range_udf;
 pub mod reactor_ddl;
 mod reactor_sink;
+pub mod region;
 mod regex_udf;
 mod rls;
 mod schema_ddl;

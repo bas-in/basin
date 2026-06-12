@@ -331,6 +331,7 @@ pub(crate) async fn register_byo_bucket(
             &project,
             ProjectMetadata {
                 byo_bucket: Some(cfg.clone()),
+                home_region: None,
             },
         )
         .await

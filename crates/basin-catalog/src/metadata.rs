@@ -557,10 +557,11 @@ pub struct S3Config {
 
 /// Per-project settings shared across all tables owned by the project.
 ///
-/// `byo_bucket` is the only field today. `#[serde(default)]` on optional
-/// fields and `skip_serializing_if` ensure forward/backward compatibility:
-/// a catalog row that predates this struct deserialises with all fields at
-/// their defaults, preserving the pre-T-048 shared-bucket behaviour.
+/// Every field is optional with `#[serde(default)]` + `skip_serializing_if`,
+/// so a catalog row that predates a given field deserialises with that field
+/// at its default — preserving the prior behaviour. `byo_bucket` gates
+/// customer-bucket routing (T-048); `home_region` pins the project to a
+/// single region for multi-region deployments (ADR 0009).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectMetadata {
     /// When `Some`, reads and writes for this project are routed to the
@@ -568,6 +569,23 @@ pub struct ProjectMetadata {
     /// Basin's shared bucket — back-compat with all existing projects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub byo_bucket: Option<S3Config>,
+
+    /// Multi-region (ADR 0009): the region this project is pinned to. All
+    /// WRITES, and all strongly-consistent (`basin.read_tier = 'primary'`)
+    /// READS, must execute in this region; submitted elsewhere they raise
+    /// `BasinError::WrongRegion` (unless a `WriteForwarder` is registered).
+    /// `'lagging'` reads serve flushed, S3-CRR-replicated data from any region.
+    ///
+    /// `None` (the default, and the value any pre-multi-region catalog row
+    /// deserialises to) means **unpinned**: the project is treated as homed
+    /// in whatever region the serving process runs in, so single-region
+    /// deployments and legacy projects never reject. An operator opts a
+    /// project into pinning by setting this to a concrete region string that
+    /// matches some deployment's `BASIN_REGION`. Stored verbatim; comparison
+    /// against `local_region()` is exact-string (see
+    /// `basin_common::is_home_region`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_region: Option<String>,
 }
 
 impl TableMetadata {
@@ -820,5 +838,46 @@ mod default_cluster_cols_tests {
         let mut m = with_pk(&["id"], &[("id", DataType::Int64)]);
         m.global_sort_order = Some(vec!["id".to_string()]);
         assert!(m.default_cluster_cols().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod project_metadata_region_tests {
+    use super::*;
+
+    /// `home_region` survives a JSON round-trip — the exact path the Postgres
+    /// backend uses (JSONB column = `serde_json::to_value(&meta)`).
+    #[test]
+    fn home_region_json_round_trip() {
+        let meta = ProjectMetadata {
+            byo_bucket: None,
+            home_region: Some("eu-west-1".to_string()),
+        };
+        let v = serde_json::to_value(&meta).unwrap();
+        let back: ProjectMetadata = serde_json::from_value(v).unwrap();
+        assert_eq!(back.home_region.as_deref(), Some("eu-west-1"));
+        assert_eq!(back, meta);
+    }
+
+    /// A legacy JSONB blob written BEFORE `home_region` existed (only
+    /// `byo_bucket`, or `{}`) deserialises with `home_region == None` — the
+    /// additive-field back-compat contract.
+    #[test]
+    fn legacy_blob_without_home_region_defaults_none() {
+        // Empty object: every field defaults.
+        let back: ProjectMetadata = serde_json::from_str("{}").unwrap();
+        assert_eq!(back.home_region, None);
+        assert_eq!(back.byo_bucket, None);
+        assert_eq!(back, ProjectMetadata::default());
+    }
+
+    /// `None` home_region is skipped from the serialized form (so a pinned
+    /// project's blob is minimal and an unpinned project's blob carries no
+    /// region key at all).
+    #[test]
+    fn none_home_region_is_skipped_in_serialization() {
+        let meta = ProjectMetadata::default();
+        let s = serde_json::to_string(&meta).unwrap();
+        assert!(!s.contains("home_region"), "unset field is skipped: {s}");
     }
 }

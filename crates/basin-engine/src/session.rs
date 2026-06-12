@@ -705,6 +705,22 @@ pub(crate) struct SessionState {
     /// `basin_trgm::DEFAULT_WORD_SIMILARITY_THRESHOLD` (0.6).
     pub(crate) trgm_word_similarity_threshold: std::sync::atomic::AtomicU32,
 
+    // ── Multi-region read tier GUC (ADR 0009) ────────────────────────────────
+    /// `SET basin.read_tier = 'primary' | 'lagging'` per-session read-staleness
+    /// mode. Stored as the `u8` discriminant of [`ReadTier`] in an `AtomicU8`
+    /// so the read path can consult it without a Mutex.
+    ///
+    /// * `primary` (default) — today's behaviour: strongly-consistent reads
+    ///   served from the home region's hot tier + WAL tail. A primary read of
+    ///   a project homed in another region is rejected with
+    ///   `BasinError::WrongRegion` (only the home region has the live tail).
+    /// * `lagging` — serve from local S3-CRR-replicated cold data, accepting
+    ///   staleness, WITHOUT requiring the home region. Non-home-region
+    ///   lagging reads see flushed-only state (the hot tier / WAL tail does not
+    ///   exist outside the home region); the durable compaction watermark is
+    ///   the staleness bound.
+    pub(crate) read_tier: std::sync::atomic::AtomicU8,
+
     /// Timestamp of the last statement activity on this session. Updated by
     /// the executor at the start of every `execute()` call; the idle-in-txn
     /// reaper compares this against the current time.
@@ -734,6 +750,56 @@ pub(crate) struct SessionState {
     /// `load_table` clone. Epoch+TTL validated; cleared in lockstep with
     /// `provider_cache`. See [`HeadProbeCache`].
     pub(crate) head_probe_cache: HeadProbeCache,
+}
+
+/// Multi-region read-staleness tier (`basin.read_tier`). `Primary` is the
+/// default and reproduces single-region behaviour; `Lagging` opts into
+/// reading S3-replicated cold data from a non-home region. Repr-`u8` so it
+/// round-trips through the session's `AtomicU8` with no allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ReadTier {
+    /// Strongly-consistent read; must be served from the project's home region.
+    Primary = 0,
+    /// Bounded-staleness read from local S3-replicated cold data; allowed in
+    /// any region.
+    Lagging = 1,
+}
+
+impl ReadTier {
+    /// The default tier a fresh session opens with (matches PG-style
+    /// strongly-consistent reads). Kept as a named const so `new()`, the
+    /// reset, and the test all agree on one source of truth.
+    pub(crate) const DEFAULT: ReadTier = ReadTier::Primary;
+
+    fn from_u8(v: u8) -> ReadTier {
+        match v {
+            1 => ReadTier::Lagging,
+            // 0 and any unexpected value fall back to the safe strong default.
+            _ => ReadTier::Primary,
+        }
+    }
+
+    /// The GUC string `SHOW basin.read_tier` renders.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ReadTier::Primary => "primary",
+            ReadTier::Lagging => "lagging",
+        }
+    }
+
+    /// Parse a `SET basin.read_tier = '<v>'` value (case-insensitive, quotes
+    /// already stripped by the caller). Errors on anything else so a typo'd
+    /// tier does not silently downgrade consistency.
+    pub(crate) fn parse(raw: &str) -> Result<ReadTier> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "primary" | "default" => Ok(ReadTier::Primary),
+            "lagging" | "replica" => Ok(ReadTier::Lagging),
+            other => Err(BasinError::InvalidSchema(format!(
+                "invalid value for basin.read_tier: {other:?} (expected 'primary' or 'lagging')"
+            ))),
+        }
+    }
 }
 
 impl Drop for SessionState {
@@ -799,6 +865,7 @@ impl SessionState {
             trgm_word_similarity_threshold: std::sync::atomic::AtomicU32::new(
                 basin_trgm::DEFAULT_WORD_SIMILARITY_THRESHOLD.to_bits(),
             ),
+            read_tier: std::sync::atomic::AtomicU8::new(ReadTier::DEFAULT as u8),
             last_active: std::sync::Mutex::new(std::time::Instant::now()),
             listen: std::sync::Mutex::new(ListenState::default()),
             table_meta_cache: TableMetaCache::new(),
@@ -838,6 +905,7 @@ impl SessionState {
             trgm_word_similarity_threshold: std::sync::atomic::AtomicU32::new(
                 basin_trgm::DEFAULT_WORD_SIMILARITY_THRESHOLD.to_bits(),
             ),
+            read_tier: std::sync::atomic::AtomicU8::new(ReadTier::DEFAULT as u8),
             last_active: std::sync::Mutex::new(std::time::Instant::now()),
             listen: std::sync::Mutex::new(ListenState::default()),
             table_meta_cache: TableMetaCache::new(),
@@ -905,6 +973,12 @@ impl SessionState {
             basin_trgm::DEFAULT_WORD_SIMILARITY_THRESHOLD.to_bits(),
             Relaxed,
         );
+
+        // basin.read_tier → primary (strongly-consistent default). Reset-by-
+        // construction: the `gucs_reset_to_defaults` test asserts this matches
+        // a fresh SessionState, so a future pooled checkout cannot leak a
+        // 'lagging' tier set by a prior logical client.
+        self.read_tier.store(ReadTier::DEFAULT as u8, Relaxed);
     }
 }
 
@@ -2226,6 +2300,29 @@ pub(crate) fn set_session_trgm_word_similarity_threshold(state: &SessionState, v
     state
         .trgm_word_similarity_threshold
         .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+// ── basin.read_tier accessors (ADR 0009) ─────────────────────────────────────
+
+/// Read the session's `basin.read_tier` (default `Primary`).
+pub(crate) fn session_read_tier(state: &SessionState) -> ReadTier {
+    ReadTier::from_u8(
+        state
+            .read_tier
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Set `basin.read_tier` for this session.
+pub(crate) fn set_session_read_tier(state: &SessionState, tier: ReadTier) {
+    state
+        .read_tier
+        .store(tier as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `SHOW basin.read_tier` rendering.
+pub(crate) fn show_read_tier(state: &SessionState) -> &'static str {
+    session_read_tier(state).as_str()
 }
 
 impl ProjectSession {
@@ -5242,6 +5339,8 @@ mod tests {
         dirty.synchronous_commit.store(flipped, Relaxed);
         set_session_trgm_similarity_threshold(&dirty, 0.95);
         set_session_trgm_word_similarity_threshold(&dirty, 0.95);
+        // Flip read_tier away from its default so the reset is observable.
+        set_session_read_tier(&dirty, ReadTier::Lagging);
 
         dirty.reset_gucs();
 
@@ -5279,6 +5378,11 @@ mod tests {
             session_trgm_word_similarity_threshold(&dirty),
             session_trgm_word_similarity_threshold(&fresh),
             "pg_trgm.word_similarity_threshold not reset"
+        );
+        assert_eq!(
+            session_read_tier(&dirty),
+            session_read_tier(&fresh),
+            "basin.read_tier not reset"
         );
     }
 

@@ -244,6 +244,7 @@ async fn main() -> Result<()> {
         pool_enabled = cfg.pool_enabled,
         lease_mode = ?cfg.lease_mode,
         wal_mode = ?cfg.wal_mode,
+        region = basin_common::local_region(),
         "starting basin-server"
     );
 

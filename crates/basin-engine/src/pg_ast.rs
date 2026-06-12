@@ -172,6 +172,44 @@ pub enum StmtKind {
 }
 
 impl StmtKind {
+    /// True when this statement produces durable state in the LOCAL region —
+    /// i.e. it must execute in the project's home region (multi-region write
+    /// gate, ADR 0009). This is the conservative "write" set: every DML
+    /// mutation plus every DDL that creates / alters / drops / refreshes
+    /// catalog or table state. Pure reads (`SELECT` / `EXPLAIN` / `SHOW` /
+    /// `FETCH` / `MOVE` / `DECLARE CURSOR`), transaction control, prepared/
+    /// cursor lifecycle, `SET`/`RESET`, `DISCARD`, and the syntactic
+    /// accept-only utility statements are NOT writes and are never region-
+    /// gated (a non-home session may still BEGIN/SET/SHOW/cancel; only the
+    /// durable mutation is refused).
+    ///
+    /// `Other` is treated as NON-write: it is the catch-all the executor
+    /// hands to the sqlparser pipeline, and over-rejecting unknown statements
+    /// in a non-home region would be a worse failure than letting them run
+    /// (the actual durable-write seams — INSERT/UPDATE/DELETE/COPY/DDL — are
+    /// all enumerated kinds). COPY-as-write, if it ever lands as a distinct
+    /// kind, should be added here.
+    pub fn is_write_kind(self) -> bool {
+        use StmtKind::*;
+        matches!(
+            self,
+            // DML mutations
+            Insert | Update | Delete | Merge
+            // Table / index DDL
+            | CreateTable | AlterTable | DropTable | CreateIndex | Truncate
+            // Type / domain DDL
+            | CreateType | AlterType | CreateDomain | DropDomain
+            // Materialized view DDL (REFRESH writes data)
+            | CreateMatView | RefreshMatView | DropMatView
+            // Routine DDL
+            | CreateFunction | AlterFunction | AlterFunctionRename | DropFunction
+            | CreateProcedure | DropProcedure
+            // Schema / sequence / policy DDL
+            | AlterSchemaRename | CreateSequence | AlterSequence | DropSequence
+            | CreatePolicy | DropPolicy
+        )
+    }
+
     /// Human-readable name, used in error messages.
     pub fn as_label(&self) -> &'static str {
         match self {

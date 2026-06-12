@@ -171,6 +171,34 @@ pub enum BasinError {
     #[error("raft WAL could not reach quorum: {0}")]
     RaftNoQuorum(String),
 
+    /// Multi-region phase 6 (ADR 0009) — a statement was submitted to a
+    /// Basin process whose region (`BASIN_REGION` / `local_region()`) is NOT
+    /// the home region of the target project, and the operation is one that
+    /// is only allowed at home:
+    ///
+    ///   * any WRITE (DML/DDL) — writes always go to the home region, since
+    ///     each region owns its own single-writer Raft WAL and there is no
+    ///     cross-region quorum or 2PC (both explicit non-goals);
+    ///   * a strongly-consistent READ (`basin.read_tier = 'primary'`, the
+    ///     default) — only the home region has the hot tier / WAL tail, so a
+    ///     primary read elsewhere cannot be linearizable.
+    ///
+    /// `basin.read_tier = 'lagging'` reads are permitted in any region (they
+    /// serve flushed, S3-replicated cold data and accept staleness) and never
+    /// raise this error.
+    ///
+    /// The message names BOTH regions — `project homed in <home>, but this is
+    /// region <local>` — so a region-aware client or pooler can reconnect to
+    /// the home-region endpoint. When a [`WriteForwarder`] is registered the
+    /// engine forwards the write to the home region instead of raising this;
+    /// the bare error is the no-forwarder fail-loud default (ADR 0009: "fails
+    /// loudly with a typed error rather than forwarding" when forwarding is
+    /// disabled). Router maps it to SQLSTATE `08006` (`connection_failure`,
+    /// class 08 = connection_exception) — the connection is to the wrong
+    /// region; reconnect elsewhere.
+    #[error("{0}")]
+    WrongRegion(String),
+
     /// A statement waited for a row or table lock longer than
     /// `lock_timeout` allows. Router maps to SQLSTATE `55P03`
     /// (`lock_not_available`), matching PostgreSQL's behaviour when
@@ -331,6 +359,31 @@ impl BasinError {
     /// write failure (`BASIN_WAL_MODE=raft`). Retryable (SQLSTATE 40001).
     pub fn raft_no_quorum(msg: impl Into<String>) -> Self {
         Self::RaftNoQuorum(msg.into())
+    }
+
+    /// Multi-region phase 6 — typed constructor for the wrong-region refusal.
+    /// Prefer [`Self::wrong_region_for`], which formats the canonical message
+    /// naming both the home and local regions; this raw constructor exists for
+    /// callers that have already built the message.
+    pub fn wrong_region(msg: impl Into<String>) -> Self {
+        Self::WrongRegion(msg.into())
+    }
+
+    /// Build the canonical wrong-region error for `project`, whose home is
+    /// `home_region`, observed from this process's `local`. The message names
+    /// both regions so a region-aware client can reconnect to the home
+    /// endpoint. `op` is a short verb phrase for the rejected operation
+    /// (e.g. `"write"` or `"primary-tier read"`).
+    pub fn wrong_region_for(
+        project: impl std::fmt::Display,
+        op: &str,
+        home_region: &str,
+        local: &str,
+    ) -> Self {
+        Self::WrongRegion(format!(
+            "{op} rejected: project {project} is homed in region \"{home_region}\", \
+             but this is region \"{local}\"; reconnect to the home region"
+        ))
     }
 
     /// Phase 5.28.B — typed constructor for `lock_timeout` expiry.
