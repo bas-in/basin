@@ -860,6 +860,85 @@ async fn error_envelope_relation_not_found() {
     );
 }
 
+/// A missing function must raise SQLSTATE 42883 (undefined_function) with
+/// the PG-shaped message `function <name> does not exist`.
+///
+/// Driver concern: psycopg raises `UndefinedFunction`, asyncpg
+/// `UndefinedFunctionError` — both branch on the code, not the message. The
+/// engine promotes DataFusion's `Invalid function '<name>'` planning error to
+/// `BasinError::UndefinedFunction`, which the router maps to 42883 (mirror of
+/// the 42P01 seam pinned above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn error_envelope_undefined_function() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+
+    client
+        .simple_query("CREATE TABLE wc_fn_t (id BIGINT NOT NULL, v TEXT)")
+        .await
+        .expect("create table");
+
+    let err = client
+        .simple_query("SELECT nosuch_function_xyz_wire_compat(v) FROM wc_fn_t")
+        .await
+        .expect_err("unknown function must fail");
+
+    let dbe = err.as_db_error().expect("must be a DbError");
+    assert_eq!(dbe.severity(), "ERROR", "severity must be 'ERROR'");
+    let code = dbe.code().code();
+    assert_eq!(
+        code, "42883",
+        "missing function must raise SQLSTATE 42883 (undefined_function), got: {code:?} ({:?})",
+        dbe.message()
+    );
+    let msg = dbe.message();
+    assert!(
+        msg.contains("nosuch_function_xyz_wire_compat") && msg.contains("does not exist"),
+        "message must be PG-shaped (`function <name> does not exist`), got: {msg:?}"
+    );
+
+    println!("[error_envelope_undefined_function] code={code:?} msg={msg:?}");
+}
+
+/// A missing column must raise SQLSTATE 42703 (undefined_column) with the
+/// PG-shaped message `column "<name>" does not exist`.
+///
+/// Driver concern: psycopg raises `UndefinedColumn` on this exact code. The
+/// engine promotes DataFusion's `No field named …` / `column '…' not found`
+/// planning errors to `BasinError::UndefinedColumn`, which the router maps to
+/// 42703 (mirror of the 42P01 seam pinned above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn error_envelope_undefined_column() {
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+
+    client
+        .simple_query("CREATE TABLE wc_col_t (id BIGINT NOT NULL, v TEXT)")
+        .await
+        .expect("create table");
+
+    let err = client
+        .simple_query("SELECT nosuch_column_xyz_wire_compat FROM wc_col_t")
+        .await
+        .expect_err("unknown column must fail");
+
+    let dbe = err.as_db_error().expect("must be a DbError");
+    assert_eq!(dbe.severity(), "ERROR", "severity must be 'ERROR'");
+    let code = dbe.code().code();
+    assert_eq!(
+        code, "42703",
+        "missing column must raise SQLSTATE 42703 (undefined_column), got: {code:?} ({:?})",
+        dbe.message()
+    );
+    let msg = dbe.message();
+    assert!(
+        msg.contains("nosuch_column_xyz_wire_compat") && msg.contains("does not exist"),
+        "message must be PG-shaped (`column \"<name>\" does not exist`), got: {msg:?}"
+    );
+
+    println!("[error_envelope_undefined_column] code={code:?} msg={msg:?}");
+}
+
 /// Division by zero must produce a well-formed ErrorResponse.
 /// Driver concern: drivers must be able to parse the error fields without
 /// hitting a panic or garbled message. The exact SQLSTATE (22012 in PG)

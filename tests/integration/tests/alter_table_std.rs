@@ -6,6 +6,7 @@
 //!   * RENAME TO
 //!   * ALTER COLUMN TYPE
 //!   * ADD CONSTRAINT CHECK
+//!   * ADD CONSTRAINT UNIQUE (registered + enforced + backfill-validated)
 //!   * DROP CONSTRAINT
 //!   * VALIDATE CONSTRAINT (textual matcher)
 //!   * ATTACH PARTITION / DETACH PARTITION (no-op accept)
@@ -144,6 +145,165 @@ async fn add_check_constraint_persists_predicate() {
         .unwrap();
     assert_eq!(meta.check_constraints.len(), 1);
     assert_eq!(meta.check_constraints[0].name, "ck");
+}
+
+/// `ALTER TABLE … ADD CONSTRAINT <n> UNIQUE (a, b)` — the exact shape
+/// Django's schema editor emits for `unique_together` (it ALTERs the
+/// constraint on AFTER the bare CREATE TABLE). The constraint must land in
+/// the catalog's `unique_constraints` and be enforced on subsequent INSERTs
+/// by the existing `enforce_unique_on_insert` machinery.
+#[tokio::test]
+async fn add_unique_constraint_registers_and_enforces() {
+    let (_dir, eng, project) = engine();
+    let sess = eng.open_session(project).await.unwrap();
+    sess.execute(
+        "CREATE TABLE django_content_type (id BIGINT NOT NULL PRIMARY KEY, \
+         app_label TEXT NOT NULL, model TEXT NOT NULL)",
+    )
+    .await
+    .unwrap();
+    // Pre-existing distinct rows must pass the backfill validation.
+    sess.execute(
+        "INSERT INTO django_content_type (id, app_label, model) VALUES \
+         (1, 'myapp', 'question'), (2, 'myapp', 'choice')",
+    )
+    .await
+    .unwrap();
+    sess.execute(
+        "ALTER TABLE django_content_type ADD CONSTRAINT \
+         django_content_type_app_label_model_76bd3d3b_uniq UNIQUE (app_label, model)",
+    )
+    .await
+    .unwrap();
+    let meta = eng
+        .config()
+        .catalog
+        .load_table(&project, &TableName::new("django_content_type").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(meta.unique_constraints.len(), 1);
+    assert_eq!(
+        meta.unique_constraints[0].name,
+        "django_content_type_app_label_model_76bd3d3b_uniq"
+    );
+    assert_eq!(
+        meta.unique_constraints[0].columns,
+        vec!["app_label".to_string(), "model".to_string()]
+    );
+    // Enforcement rides the existing INSERT machinery: a duplicate tuple
+    // must now be rejected with the unique-violation error…
+    let err = sess
+        .execute(
+            "INSERT INTO django_content_type (id, app_label, model) VALUES \
+             (3, 'myapp', 'question')",
+        )
+        .await
+        .expect_err("duplicate (app_label, model) must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("django_content_type_app_label_model_76bd3d3b_uniq"),
+        "violation must name the constraint, got: {msg}"
+    );
+    // …while a tuple differing in either column still inserts.
+    sess.execute(
+        "INSERT INTO django_content_type (id, app_label, model) VALUES \
+         (4, 'otherapp', 'question')",
+    )
+    .await
+    .unwrap();
+}
+
+/// ADD CONSTRAINT UNIQUE must validate the EXISTING rows first: if the
+/// table already contains a duplicate tuple the ALTER is rejected (PG
+/// raises 23505 `could not create unique index`) and nothing is registered.
+#[tokio::test]
+async fn add_unique_constraint_rejects_existing_duplicates() {
+    let (_dir, eng, project) = engine();
+    let sess = eng.open_session(project).await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, email TEXT)")
+        .await
+        .unwrap();
+    sess.execute(
+        "INSERT INTO t (id, email) VALUES (1, 'a@x.com'), (2, 'a@x.com'), (3, NULL), (4, NULL)",
+    )
+    .await
+    .unwrap();
+    let err = sess
+        .execute("ALTER TABLE t ADD CONSTRAINT t_email_uniq UNIQUE (email)")
+        .await
+        .expect_err("existing duplicate emails must fail the backfill validation");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("t_email_uniq") && msg.contains("duplicated"),
+        "error must name the constraint and the duplication, got: {msg}"
+    );
+    let meta = eng
+        .config()
+        .catalog
+        .load_table(&project, &TableName::new("t").unwrap())
+        .await
+        .unwrap();
+    assert!(
+        meta.unique_constraints.is_empty(),
+        "failed ALTER must not register the constraint"
+    );
+}
+
+/// Unnamed `ADD UNIQUE (col)` synthesises the PG-convention
+/// `<table>_<col>_key` name (same derivation as CREATE TABLE's
+/// table-level UNIQUE). NULLs stay exempt (PG NULLS-distinct default):
+/// multiple NULL rows pass both the backfill scan and later INSERTs.
+#[tokio::test]
+async fn add_unique_constraint_unnamed_synthesises_pg_name() {
+    let (_dir, eng, project) = engine();
+    let sess = eng.open_session(project).await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, email TEXT)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t (id, email) VALUES (1, NULL), (2, NULL)")
+        .await
+        .unwrap();
+    sess.execute("ALTER TABLE t ADD UNIQUE (email)").await.unwrap();
+    let meta = eng
+        .config()
+        .catalog
+        .load_table(&project, &TableName::new("t").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(meta.unique_constraints.len(), 1);
+    assert_eq!(meta.unique_constraints[0].name, "t_email_key");
+    // A third NULL still inserts (NULLs are distinct under PG's default).
+    sess.execute("INSERT INTO t (id, email) VALUES (3, NULL)")
+        .await
+        .unwrap();
+}
+
+/// A UNIQUE constraint added via ALTER must reference real columns and
+/// must be DROPpable through the existing DROP CONSTRAINT path.
+#[tokio::test]
+async fn add_unique_constraint_unknown_column_errors_and_drop_removes() {
+    let (_dir, eng, project) = engine();
+    let sess = eng.open_session(project).await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, email TEXT)")
+        .await
+        .unwrap();
+    let err = sess
+        .execute("ALTER TABLE t ADD CONSTRAINT u UNIQUE (ghost)")
+        .await
+        .expect_err("UNIQUE over a missing column must fail");
+    assert!(err.to_string().contains("ghost"), "got: {err}");
+
+    sess.execute("ALTER TABLE t ADD CONSTRAINT u UNIQUE (email)")
+        .await
+        .unwrap();
+    sess.execute("ALTER TABLE t DROP CONSTRAINT u").await.unwrap();
+    let meta = eng
+        .config()
+        .catalog
+        .load_table(&project, &TableName::new("t").unwrap())
+        .await
+        .unwrap();
+    assert!(meta.unique_constraints.is_empty());
 }
 
 #[tokio::test]

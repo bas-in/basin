@@ -615,6 +615,83 @@ async fn prepared_insert_jsonb_timestamptz_binary_params() {
 }
 
 // =============================================================================
+// 10b. TIMESTAMPTZ binds via the typed Timestamptz param — both ToSql shapes
+//      real drivers send (std::time::SystemTime and chrono::DateTime<Utc>,
+//      binary wire format) must round-trip exactly through the bind-direct /
+//      AST / text routes, equal a simple-protocol literal control row, and be
+//      usable as a prepared-SELECT predicate.
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_timestamptz_systemtime_and_chrono_binds() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let server = start_server().await;
+    let client = connect(server.addr).await;
+    client
+        .simple_query(
+            "CREATE TABLE ts_binds (id BIGINT NOT NULL PRIMARY KEY, at TIMESTAMPTZ NOT NULL)",
+        )
+        .await
+        .expect("create ts_binds");
+
+    // 2026-01-02 03:04:05.123456 UTC, microsecond precision.
+    let micros = 1_767_323_045_123_456_i64;
+    let at_sys = UNIX_EPOCH + Duration::from_micros(micros as u64);
+    let at_chrono = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros).unwrap();
+
+    let ins = client
+        .prepare("INSERT INTO ts_binds (id, at) VALUES ($1, $2)")
+        .await
+        .expect("prepare insert");
+    // SystemTime bind (tokio-postgres encodes binary timestamptz natively).
+    client
+        .execute(&ins, &[&1_i64, &at_sys])
+        .await
+        .expect("SystemTime bind insert");
+    // chrono::DateTime<Utc> bind (with-chrono-0_4).
+    client
+        .execute(&ins, &[&2_i64, &at_chrono])
+        .await
+        .expect("chrono bind insert");
+    // Control row via the simple protocol with the equivalent literal.
+    client
+        .simple_query(
+            "INSERT INTO ts_binds (id, at) VALUES (3, '2026-01-02 03:04:05.123456+00')",
+        )
+        .await
+        .expect("simple control insert");
+
+    let rows = client
+        .query("SELECT id, at FROM ts_binds ORDER BY id", &[])
+        .await
+        .expect("read back");
+    assert_eq!(rows.len(), 3);
+    let control_at: std::time::SystemTime = rows[2].get(1);
+    for row in &rows[..2] {
+        let got_sys: std::time::SystemTime = row.get(1);
+        assert_eq!(got_sys, at_sys, "TIMESTAMPTZ bind round-trip");
+        assert_eq!(got_sys, control_at, "prepared ts equals simple literal");
+        let got_chrono: chrono::DateTime<chrono::Utc> = row.get(1);
+        assert_eq!(got_chrono, at_chrono, "chrono read-back round-trip");
+    }
+
+    // Prepared SELECT with a timestamptz predicate param — exercises the
+    // WHERE-clause inference (OID 1184) + AST/text substitution of the
+    // typed param outside the bind-direct INSERT path.
+    let sel = client
+        .prepare("SELECT id FROM ts_binds WHERE at = $1 ORDER BY id")
+        .await
+        .expect("prepare select");
+    let rows = client
+        .query(&sel, &[&at_sys])
+        .await
+        .expect("timestamptz predicate query");
+    let ids: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, vec![1, 2, 3], "all three rows share the instant");
+}
+
+// =============================================================================
 // 11. UUID-typed column: the bind-direct builder declines (UUID columns carry
 //     validation outside the fast set), so the prepared INSERT must still work
 //     via the AST/text fallback — with a native binary UUID param.

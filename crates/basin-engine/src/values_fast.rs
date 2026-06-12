@@ -1343,6 +1343,17 @@ fn scalar_param_cell(p: &crate::prepared::ScalarParam) -> Option<Cell<'_>> {
             s: std::borrow::Cow::Borrowed(s.as_str()),
             cast: None,
         },
+        // TIMESTAMPTZ: the text route renders `'…+00'::timestamptz`, so the
+        // equivalent cell is the same literal body carrying the Timestamptz
+        // cast tag. The TsMicros accumulator parses it with the slow path's
+        // `parse_timestamp_string` (lossless round-trip back to the i64
+        // micros); any other destination column declines on the tag —
+        // exactly the mismatch the text route would surface as the
+        // canonical cast error.
+        SP::Timestamptz(us) => Cell::Str {
+            s: std::borrow::Cow::Owned(crate::prepared::timestamptz_micros_to_literal(*us)),
+            cast: Some(CastTag::Timestamptz),
+        },
         // Non-finite floats render as '…'::float8 casts on the text route;
         // bytea / arrays render as '\x…'::bytea / ARRAY[…] — all shapes the
         // literal grammar excludes. Decline → AST/text fallback.
@@ -2030,6 +2041,47 @@ mod tests {
         assert_eq!(a.value(0), 5);
         let strs = r.column(1).as_any().downcast_ref::<StringArray>().unwrap();
         assert!(strs.is_null(0));
+    }
+
+    #[test]
+    fn bind_direct_timestamptz_param_lands_exact_micros() {
+        use crate::prepared::ScalarParam as SP;
+        // 2026-01-02 03:04:05.123456 UTC.
+        let us = 1_767_323_045_123_456_i64;
+        for tz in [None, Some(Arc::<str>::from("UTC"))] {
+            let s = Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("at", DataType::Timestamp(TimeUnit::Microsecond, tz.clone()), true),
+            ]);
+            let cols = vec!["id".to_string(), "at".to_string()];
+            let rows = vec![vec![0usize, 1]];
+            let params = vec![SP::Int8(1), SP::Timestamptz(us)];
+            let b = try_bind_insert_batch(&s, &cols, &rows, &params).expect("builds");
+            let r = &b[0];
+            assert_eq!(r.num_rows(), 1);
+            let at = r
+                .column(1)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            assert_eq!(at.value(0), us, "tz={tz:?}");
+            // The finished column keeps the schema's (tz-bearing) type.
+            assert_eq!(
+                r.column(1).data_type(),
+                &DataType::Timestamp(TimeUnit::Microsecond, tz)
+            );
+        }
+        // A timestamptz bind into a TEXT column must DECLINE (the text route
+        // surfaces the canonical cast error; silently storing the rendered
+        // string would diverge).
+        let s = Schema::new(vec![Field::new("b", DataType::Utf8, true)]);
+        assert!(try_bind_insert_batch(
+            &s,
+            &["b".to_string()],
+            &[vec![0usize]],
+            &[SP::Timestamptz(us)],
+        )
+        .is_none());
     }
 
     #[test]

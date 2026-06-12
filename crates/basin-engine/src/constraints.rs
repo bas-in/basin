@@ -618,6 +618,86 @@ pub(crate) async fn enforce_unique_on_insert(
     Ok(())
 }
 
+/// ALTER-side UNIQUE backfill validation: verify that the rows ALREADY in
+/// the table satisfy a UNIQUE constraint about to be registered
+/// (`ALTER TABLE … ADD CONSTRAINT <name> UNIQUE (cols)`). Same scan shape
+/// as [`enforce_one_unique`]'s existing-table pass — projection-pushdown
+/// read of just the constraint columns over every live data file — but
+/// with no incoming batch: the duplicate check is existing-vs-existing.
+///
+/// NULL handling matches the INSERT-side enforcement (PG default): a row
+/// with NULL in *any* constraint column is exempt from the check.
+///
+/// citext case-folding is derived from the CATALOG schema (`schema`),
+/// which carries the `BASIN_TYPE` field metadata that the Parquet
+/// read-back schema loses (see the metadata note inside
+/// [`enforce_one_unique`]).
+///
+/// The caller (executor's `exec_alter_table`) has already materialized any
+/// hot-tier overlay into the cold tier before the ALTER dispatch, so the
+/// cold-file scan here sees every committed row.
+pub(crate) async fn verify_unique_over_existing(
+    storage: &basin_storage::Storage,
+    project: &ProjectId,
+    table: &TableName,
+    constraint_name: &str,
+    columns: &[String],
+    schema: &Schema,
+) -> Result<()> {
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let citext_positions: std::collections::HashSet<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            schema
+                .field_with_name(c)
+                .map(field_is_citext)
+                .unwrap_or(false)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let read_opts = basin_storage::ReadOptions {
+        projection: Some(columns.to_vec()),
+        ..Default::default()
+    };
+    let mut seen: std::collections::HashSet<Vec<String>> = Default::default();
+    let data_files = storage.list_data_files_with_stats(project, table).await?;
+    for f in &data_files {
+        let mut stream = storage
+            .read_file_with_options(project, &f.path, read_opts.clone())
+            .await?;
+        while let Some(rb) = stream.next().await {
+            let rb = rb?;
+            // A column added via ALTER TABLE ADD COLUMN after this file was
+            // written is physically absent from the file; its value is NULL
+            // for every row here, which exempts those rows from the check
+            // (PG NULLS-distinct default) — skip the batch.
+            let rb_idx: Option<Vec<usize>> = columns
+                .iter()
+                .map(|c| rb.schema().index_of(c).ok())
+                .collect();
+            let Some(rb_idx) = rb_idx else { continue };
+            for row in 0..rb.num_rows() {
+                let Some(k) = pk_tuple_for_row_citext(&rb, &rb_idx, row, &citext_positions)?
+                else {
+                    continue;
+                };
+                if !seen.insert(k.clone()) {
+                    return Err(BasinError::UniqueViolation(format!(
+                        "could not create unique constraint \"{constraint_name}\" on table \
+                         \"{table}\": Key ({})=({}) is duplicated.",
+                        columns.join(", "),
+                        k.join(", ")
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// UPDATE-side UNIQUE enforcement: same as `enforce_unique_on_insert`
 /// but excludes data files in `replaced_paths` from the
 /// existing-table scan (those files are being rewritten in this

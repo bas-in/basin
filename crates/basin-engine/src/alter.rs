@@ -34,7 +34,7 @@
 use crate::pg_ast::ObjectNamePartExt;
 use crate::schema_ddl::SchemaState;
 use arrow_schema::{Field, Schema};
-use basin_catalog::{Catalog, CheckConstraint};
+use basin_catalog::{Catalog, CheckConstraint, UniqueConstraint};
 use basin_common::{BasinError, Result, TableName};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, ColumnDef, ColumnOption, ObjectName, TableConstraint,
@@ -453,6 +453,11 @@ impl BasinAlterExtension {
 ///     swap — existing data is best-effort coerced by the reader)
 ///   * `ADD CONSTRAINT <n> CHECK (<expr>)` (append to
 ///     `check_constraints`)
+///   * `ADD CONSTRAINT <n> UNIQUE (<cols>)` (validate existing rows via a
+///     distinct scan, then append to `unique_constraints`; subsequent
+///     INSERT / UPDATE enforcement rides the existing
+///     `constraints::enforce_unique_on_insert` machinery — the Django
+///     `unique_together` migration shape)
 ///   * `DROP CONSTRAINT <n>` (remove from `check_constraints`)
 ///   * `ATTACH PARTITION <p> FOR VALUES …` / `DETACH PARTITION <p>`
 ///     (no-op accept — declarative partitions are computed from the
@@ -463,6 +468,7 @@ impl BasinAlterExtension {
 /// and never reaches this dispatch.
 pub(crate) async fn apply_standard_alter_table(
     catalog: &Arc<dyn Catalog>,
+    storage: &basin_storage::Storage,
     project: &basin_common::ProjectId,
     name: &ObjectName,
     operations: &[AlterTableOperation],
@@ -532,7 +538,7 @@ pub(crate) async fn apply_standard_alter_table(
                 }
             },
             AlterTableOperation::AddConstraint { constraint, .. } => {
-                add_constraint(catalog, project, &table, constraint).await?;
+                add_constraint(catalog, storage, project, &table, constraint).await?;
             }
             AlterTableOperation::DropConstraint {
                 name, if_exists, ..
@@ -758,14 +764,26 @@ async fn alter_column_type(
     Ok(())
 }
 
-/// Append one CHECK constraint to the table. PRIMARY KEY / UNIQUE /
-/// FOREIGN KEY constraints declared mid-life are out of scope for v0.1
-/// — adding them after-the-fact requires backfill validation that we
-/// don't yet do. CHECK additions are validated by the engine on
-/// subsequent writes only (matching PG's `NOT VALID` semantics, just
-/// without the explicit syntax for that flavour).
+/// Append one CHECK or UNIQUE constraint to the table.
+///
+/// CHECK additions are validated by the engine on subsequent writes only
+/// (matching PG's `NOT VALID` semantics, just without the explicit syntax
+/// for that flavour).
+///
+/// UNIQUE additions (`ADD CONSTRAINT <n> UNIQUE (cols)` — the shape Django
+/// emits for `unique_together` / `Meta.constraints`) first validate that the
+/// EXISTING rows satisfy the constraint via a projection-pushdown distinct
+/// scan (`constraints::verify_unique_over_existing`, same cost shape as one
+/// INSERT-side enforcement pass), then register the `UniqueConstraint` in the
+/// catalog; from that point INSERT / UPDATE enforcement rides the existing
+/// `enforce_unique_on_insert` machinery unchanged.
+///
+/// PRIMARY KEY / FOREIGN KEY additions mid-life remain out of scope for
+/// v0.1 — their backfill validation (NOT NULL rewrite / referenced-row
+/// existence) is still deferred.
 async fn add_constraint(
     catalog: &Arc<dyn Catalog>,
+    storage: &basin_storage::Storage,
     project: &basin_common::ProjectId,
     table: &TableName,
     tc: &TableConstraint,
@@ -802,12 +820,73 @@ async fn add_constraint(
                 )
                 .await?;
         }
-        TableConstraint::Unique(_)
-        | TableConstraint::PrimaryKey(_)
-        | TableConstraint::ForeignKey(_) => {
+        TableConstraint::Unique(sqlparser::ast::UniqueConstraint { name, columns, .. }) => {
+            if columns.is_empty() {
+                return Err(BasinError::InvalidSchema(
+                    "ALTER TABLE ADD CONSTRAINT … UNIQUE: column list cannot be empty".into(),
+                ));
+            }
+            let cols: Vec<String> = columns
+                .iter()
+                .map(crate::pg_ast::index_column_name)
+                .collect();
+            // Mirror the CREATE TABLE path's guards (`ddl::schema_from_columns`):
+            // every column must exist in the schema, and no column may be
+            // listed twice.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for c in &cols {
+                if meta.schema.field_with_name(c).is_err() {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "ALTER TABLE {table}: UNIQUE column {c:?} not in table schema"
+                    )));
+                }
+                if !seen.insert(c.to_ascii_lowercase()) {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "ALTER TABLE {table}: UNIQUE column {c:?} listed twice"
+                    )));
+                }
+            }
+            // Same name derivation as CREATE TABLE's table-level UNIQUE:
+            // user-supplied `CONSTRAINT <name>` wins, else
+            // `<table>_<col1>_<col2>_key` (PG convention).
+            let cname = match name {
+                Some(n) => n.value.clone(),
+                None => format!("{table}_{}_key", cols.join("_")),
+            };
+            if meta
+                .unique_constraints
+                .iter()
+                .any(|u| u.name.eq_ignore_ascii_case(&cname))
+            {
+                return Err(BasinError::InvalidSchema(format!(
+                    "ALTER TABLE {table}: UNIQUE constraint {cname:?} already exists"
+                )));
+            }
+            // Backfill validation: the rows already in the table must satisfy
+            // the constraint, else PG rejects the ALTER with a 23505 — and so
+            // do we (`could not create unique constraint … is duplicated`).
+            crate::constraints::verify_unique_over_existing(
+                storage,
+                project,
+                table,
+                &cname,
+                &cols,
+                meta.schema.as_ref(),
+            )
+            .await?;
+            let mut uniques = meta.unique_constraints.clone();
+            uniques.push(UniqueConstraint {
+                name: cname,
+                columns: cols,
+            });
+            catalog
+                .set_unique_constraints(project, table, uniques)
+                .await?;
+        }
+        TableConstraint::PrimaryKey(_) | TableConstraint::ForeignKey(_) => {
             return Err(BasinError::InvalidSchema(
-                "ALTER TABLE ADD CONSTRAINT: only CHECK is supported in v0.1 (UNIQUE / \
-                 PRIMARY KEY / FOREIGN KEY additions after table creation are deferred)"
+                "ALTER TABLE ADD CONSTRAINT: only CHECK and UNIQUE are supported in v0.1 \
+                 (PRIMARY KEY / FOREIGN KEY additions after table creation are deferred)"
                     .into(),
             ));
         }

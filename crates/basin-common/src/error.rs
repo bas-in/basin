@@ -153,6 +153,23 @@ pub enum BasinError {
     #[error("relation \"{0}\" does not exist")]
     UndefinedTable(String),
 
+    /// Referenced function does not exist at planning time. Router maps to
+    /// SQLSTATE `42883` (`undefined_function`) with the PG-shaped message
+    /// `function <name> does not exist`. PG raises the same code both for an
+    /// unknown function name and for a known name with no matching argument
+    /// types; Basin only detects the former (DataFusion's planner reports
+    /// `Invalid function '<name>'` / `table function '<name>' not found`).
+    /// Drivers (psycopg `UndefinedFunction`, asyncpg) branch on the code.
+    #[error("function {0} does not exist")]
+    UndefinedFunction(String),
+
+    /// Referenced column does not exist at planning time. Router maps to
+    /// SQLSTATE `42703` (`undefined_column`) with the PG-shaped message
+    /// `column "<name>" does not exist` — the code drivers surface as a
+    /// dedicated exception class (psycopg `UndefinedColumn`).
+    #[error("column \"{0}\" does not exist")]
+    UndefinedColumn(String),
+
     /// Catch-all for sources without a dedicated variant.
     #[error("internal: {0}")]
     Internal(String),
@@ -177,6 +194,18 @@ impl BasinError {
     /// message and surfaces as SQLSTATE 42P01.
     pub fn undefined_table(name: impl Into<String>) -> Self {
         Self::UndefinedTable(name.into())
+    }
+    /// Typed constructor for a missing function. `name` is the function name
+    /// as the user wrote it — interpolated into the PG-shaped
+    /// `function <name> does not exist` message and surfaces as SQLSTATE 42883.
+    pub fn undefined_function(name: impl Into<String>) -> Self {
+        Self::UndefinedFunction(name.into())
+    }
+    /// Typed constructor for a missing column. `name` is the column reference
+    /// as the planner reported it — interpolated into the PG-shaped
+    /// `column "<name>" does not exist` message and surfaces as SQLSTATE 42703.
+    pub fn undefined_column(name: impl Into<String>) -> Self {
+        Self::UndefinedColumn(name.into())
     }
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())

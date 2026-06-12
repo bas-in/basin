@@ -1143,6 +1143,15 @@ fn scalar_to_copy_cell(
         ScalarParam::Float8(v) => Some(v.to_string()),
         ScalarParam::Bool(b) => Some(if b { "true" } else { "false" }.to_owned()),
         ScalarParam::Text(s) => Some(s),
+        // TIMESTAMPTZ params decode to typed Unix-epoch micros; render the
+        // same naive-UTC ISO-8601 cell the decoder produced before the typed
+        // variant existed, so the CSV ingest path parses it unchanged.
+        ScalarParam::Timestamptz(us) => {
+            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(us).ok_or_else(
+                || format!("COPY BINARY: timestamptz out of range (column \"{col}\")"),
+            )?;
+            Some(dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+        }
         ScalarParam::Bytea(bytes) => {
             let mut s = String::with_capacity(2 + bytes.len() * 2);
             s.push_str("\\x");

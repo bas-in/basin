@@ -53,6 +53,13 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         // code (Diesel / TypeORM / Django treat it as "tracker table
         // missing → create it"), so it must not collapse into XX000/42704.
         BasinError::UndefinedTable(_) => ("ERROR", "42P01"), // undefined_table
+        // Missing function at planning time. PG raises 42883
+        // (undefined_function); drivers expose it as a dedicated class
+        // (psycopg UndefinedFunction) so it must not collapse into XX000.
+        BasinError::UndefinedFunction(_) => ("ERROR", "42883"), // undefined_function
+        // Missing column at planning time. PG raises 42703
+        // (undefined_column); same driver-class rationale as above.
+        BasinError::UndefinedColumn(_) => ("ERROR", "42703"), // undefined_column
         BasinError::CommitConflict(_) => ("ERROR", "40001"), // serialization_failure
         BasinError::QueryCostExceeded(_) => ("ERROR", "54000"), // program_limit_exceeded
         BasinError::QueryCanceled(_) => ("ERROR", "57014"),     // query_canceled
@@ -113,6 +120,32 @@ mod tests {
         assert_eq!(
             er.fields[2],
             (b'M', "relation \"django_migrations\" does not exist".to_owned())
+        );
+    }
+
+    #[test]
+    fn classifies_undefined_function() {
+        // Missing functions must surface as SQLSTATE 42883 with the
+        // PG message shape `function <name> does not exist`.
+        let er = error_response(&BasinError::UndefinedFunction("nosuch_fn".into()));
+        assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
+        assert_eq!(er.fields[1], (b'C', "42883".to_owned()));
+        assert_eq!(
+            er.fields[2],
+            (b'M', "function nosuch_fn does not exist".to_owned())
+        );
+    }
+
+    #[test]
+    fn classifies_undefined_column() {
+        // Missing columns must surface as SQLSTATE 42703 with the
+        // PG message shape `column "<name>" does not exist`.
+        let er = error_response(&BasinError::UndefinedColumn("nosuch_col".into()));
+        assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
+        assert_eq!(er.fields[1], (b'C', "42703".to_owned()));
+        assert_eq!(
+            er.fields[2],
+            (b'M', "column \"nosuch_col\" does not exist".to_owned())
         );
     }
 

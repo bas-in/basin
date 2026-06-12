@@ -461,6 +461,21 @@ fn render(p: &ScalarParam) -> String {
             out.push('\'');
             out
         }
+        // Same `'…+00'::timestamptz` literal the in-process executor's
+        // `prepared.rs::render_param` produces, so the upstream shard sees
+        // exactly the SQL a local executor would. Out-of-range is
+        // unreachable via the wire decoders (they validate); saturate
+        // rather than panic.
+        ScalarParam::Timestamptz(us) => {
+            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(*us).unwrap_or(
+                if *us < 0 {
+                    chrono::DateTime::<chrono::Utc>::MIN_UTC
+                } else {
+                    chrono::DateTime::<chrono::Utc>::MAX_UTC
+                },
+            );
+            format!("'{}'::timestamptz", dt.format("%Y-%m-%d %H:%M:%S%.6f+00"))
+        }
         ScalarParam::Bytea(bytes) => {
             let mut hex = String::with_capacity(bytes.len() * 2 + 8);
             hex.push_str("'\\x");

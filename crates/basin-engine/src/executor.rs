@@ -4506,25 +4506,53 @@ async fn exec_create_index(
     // On materialize failure the backfill is SKIPPED: leaving every live file
     // un-indexed keeps the probes at NoIndex/incomplete — full scans (correct,
     // unpruned) instead of an index built beside a still-live overlay.
-    let overlay_settled = match crate::dml_mutate::materialize_overlay_for_table(
-        &sess.engine,
-        sess.project,
-        &table,
-    )
-    .await
-    {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!(
-                index = %index_name,
-                table = %table,
-                err = %e,
-                "CREATE INDEX: hot-tier overlay materialize failed; index \
-                 backfill skipped (reads fall back to full scans for this table)"
-            );
-            false
+    //
+    // RETRY (bounded): the settle commits through `replace_data_files`
+    // optimistic concurrency, and the background overlay reconciler
+    // (`overlay_reconcile`) may have a materialize of ITS OWN in flight for
+    // this table — measured live on the 100k compare card, where the
+    // reconciler's commit (snapshotted before a just-landed UPDATE) beat the
+    // DDL settle, the settle returned `CommitConflict`, and the backfill was
+    // skipped for good: the index stayed empty until a re-CREATE INDEX while
+    // every `@>` read fell back to full scans. The conflict is transient —
+    // the loser's overlay entries stay dirty and a fresh attempt reloads the
+    // head snapshot — so retry a few times before giving up. `materialize`
+    // is idempotent (acks land only after a successful commit) and a fully
+    // drained overlay short-circuits O(1), so the retries are cheap.
+    let mut overlay_settled = false;
+    for attempt in 0..3u32 {
+        match crate::dml_mutate::materialize_overlay_for_table(
+            &sess.engine,
+            sess.project,
+            &table,
+        )
+        .await
+        {
+            Ok(()) => {
+                overlay_settled = true;
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    index = %index_name,
+                    table = %table,
+                    attempt,
+                    err = %e,
+                    "CREATE INDEX: hot-tier overlay materialize attempt failed"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)))
+                    .await;
+            }
         }
-    };
+    }
+    if !overlay_settled {
+        tracing::warn!(
+            index = %index_name,
+            table = %table,
+            "CREATE INDEX: hot-tier overlay materialize failed after retries; \
+             index backfill skipped (reads fall back to full scans for this table)"
+        );
+    }
     if overlay_settled && catalog_columns.len() == 1 {
         backfill_index_over_live_files(
             sess,
@@ -8782,16 +8810,29 @@ impl Drop for TargetPartitionsGuard<'_> {
 /// all decide "tracker table missing → create it" on 42P01) — so this must
 /// not collapse into the XX000 internal bucket.
 ///
-/// Deliberately narrow: only the `table '…' not found` pattern is promoted.
-/// Missing *functions* ("Invalid function '…'", `table function '…' not
-/// found` — note the quote does not immediately follow `table `) and missing
-/// *columns* ("column '…' not found", "No field named …") keep the generic
-/// internal mapping until they get their own 42883 / 42703 variants.
+/// Deliberately narrow: only four exact planner-message patterns are
+/// promoted, each to its PG SQLSTATE:
+///   * `table '…' not found`                → 42P01 (`UndefinedTable`)
+///   * `Invalid function '…'`               → 42883 (`UndefinedFunction`)
+///   * `table function '…' not found`       → 42883 (`UndefinedFunction`)
+///   * `No field named …` / `column '…' not found` → 42703 (`UndefinedColumn`)
+/// Anything else keeps the generic internal mapping so unrelated planner
+/// errors are never mis-typed as a missing object.
 pub(crate) fn map_df_plan_error(
     context: &str,
     e: &datafusion::error::DataFusionError,
 ) -> BasinError {
     let msg = e.to_string();
+    // Missing table function in FROM position (`SELECT * FROM nosuch()`):
+    // DataFusion's SessionState reports `table function '<name>' not found`.
+    // Checked before the plain-table pattern for clarity — the two cannot
+    // collide (`table '` requires the quote immediately after `table `).
+    if let Some(start) = msg.find("table function '") {
+        let rest = &msg[start + "table function '".len()..];
+        if let Some(end) = rest.find("' not found") {
+            return BasinError::undefined_function(&rest[..end]);
+        }
+    }
     if let Some(start) = msg.find("table '") {
         let rest = &msg[start + "table '".len()..];
         if let Some(end) = rest.find("' not found") {
@@ -8806,7 +8847,123 @@ pub(crate) fn map_df_plan_error(
             return BasinError::undefined_table(name);
         }
     }
+    // Missing scalar/aggregate function: DataFusion's expression planner
+    // reports `Invalid function '<name>'` (optionally followed by
+    // `.\nDid you mean '…'?`). PG raises SQLSTATE 42883 here.
+    if let Some(start) = msg.find("Invalid function '") {
+        let rest = &msg[start + "Invalid function '".len()..];
+        if let Some(end) = rest.find('\'') {
+            return BasinError::undefined_function(&rest[..end]);
+        }
+    }
+    // Missing column, planner flavour: `column '<name>' not found`
+    // (optionally `… not found in '<relation>'`). PG raises 42703.
+    if let Some(start) = msg.find("column '") {
+        let rest = &msg[start + "column '".len()..];
+        if let Some(end) = rest.find("' not found") {
+            return BasinError::undefined_column(&rest[..end]);
+        }
+    }
+    // Missing column, schema-resolution flavour: `Schema error: No field
+    // named <name>. Valid fields are …` (the `Valid fields` tail is absent
+    // on an empty schema; the name itself may be quoted and/or qualified —
+    // qualified names contain `.` so the terminator must be matched against
+    // the known suffixes, not the first dot).
+    if let Some(start) = msg.find("No field named ") {
+        let rest = &msg[start + "No field named ".len()..];
+        let name_part = match rest.find(". Valid fields") {
+            Some(end) => &rest[..end],
+            None => rest.trim_end().trim_end_matches('.'),
+        };
+        let name = name_part.trim_matches('"');
+        if !name.is_empty() {
+            return BasinError::undefined_column(name);
+        }
+    }
     BasinError::internal(format!("{context}: {e}"))
+}
+
+#[cfg(test)]
+mod df_plan_error_tests {
+    use super::map_df_plan_error;
+    use basin_common::BasinError;
+    use datafusion::error::DataFusionError;
+
+    fn plan_err(msg: &str) -> DataFusionError {
+        DataFusionError::Plan(msg.to_string())
+    }
+
+    #[test]
+    fn missing_table_promotes_to_undefined_table() {
+        let e = plan_err("table 'datafusion.public.users' not found");
+        match map_df_plan_error("plan", &e) {
+            BasinError::UndefinedTable(name) => assert_eq!(name, "users"),
+            other => panic!("expected UndefinedTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_function_promotes_to_undefined_function() {
+        // Both the bare form and the did-you-mean form must extract the name.
+        let e = plan_err("Invalid function 'nosuch_fn'");
+        match map_df_plan_error("plan", &e) {
+            BasinError::UndefinedFunction(name) => assert_eq!(name, "nosuch_fn"),
+            other => panic!("expected UndefinedFunction, got {other:?}"),
+        }
+        let e = plan_err("Invalid function 'lowerr'.\nDid you mean 'lower'?");
+        match map_df_plan_error("plan", &e) {
+            BasinError::UndefinedFunction(name) => assert_eq!(name, "lowerr"),
+            other => panic!("expected UndefinedFunction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_table_function_promotes_to_undefined_function() {
+        // `SELECT * FROM nosuch()` — note the quote does NOT immediately
+        // follow `table `, so this must not be mis-typed as 42P01.
+        let e = plan_err("table function 'nosuch' not found");
+        match map_df_plan_error("plan", &e) {
+            BasinError::UndefinedFunction(name) => assert_eq!(name, "nosuch"),
+            other => panic!("expected UndefinedFunction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_column_patterns_promote_to_undefined_column() {
+        // Planner flavour, bare and with-relation forms.
+        let e = plan_err("column 'ghost' not found");
+        match map_df_plan_error("plan", &e) {
+            BasinError::UndefinedColumn(name) => assert_eq!(name, "ghost"),
+            other => panic!("expected UndefinedColumn, got {other:?}"),
+        }
+        let e = plan_err("column 'ghost' not found in 'users'");
+        match map_df_plan_error("plan", &e) {
+            BasinError::UndefinedColumn(name) => assert_eq!(name, "ghost"),
+            other => panic!("expected UndefinedColumn, got {other:?}"),
+        }
+        // Schema-resolution flavour, with and without the Valid-fields tail;
+        // a qualified name keeps its qualifier (dots inside the name must
+        // not truncate it).
+        let e = plan_err("Schema error: No field named ghost. Valid fields are users.id.");
+        match map_df_plan_error("plan", &e) {
+            BasinError::UndefinedColumn(name) => assert_eq!(name, "ghost"),
+            other => panic!("expected UndefinedColumn, got {other:?}"),
+        }
+        let e = plan_err("Schema error: No field named t1.c0.");
+        match map_df_plan_error("plan", &e) {
+            BasinError::UndefinedColumn(name) => assert_eq!(name, "t1.c0"),
+            other => panic!("expected UndefinedColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unrelated_plan_errors_stay_internal() {
+        let e = plan_err("Projection references non-aggregate values");
+        match map_df_plan_error("plan", &e) {
+            BasinError::Internal(msg) => assert!(msg.contains("plan: ")),
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
 }
 
 // `gin_original_sql`: the original (pre-operator-rewrite) SQL for GIN pruning
@@ -9999,6 +10156,7 @@ async fn exec_alter_table(
     }
     let tag = crate::alter::apply_standard_alter_table(
         &sess.engine.config().catalog,
+        &sess.engine.config().storage,
         &sess.project,
         &name,
         &operations,

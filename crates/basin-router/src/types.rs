@@ -31,8 +31,11 @@ const PG_EPOCH_DAYS_FROM_UNIX: i32 = 10957;
 
 /// Microseconds between Arrow's TIMESTAMP epoch (1970-01-01 UTC) and Postgres's
 /// TIMESTAMPTZ epoch (2000-01-01 UTC). Used by the binary TIMESTAMP[TZ] wire
-/// encoding.
-const PG_EPOCH_MICROS_FROM_UNIX: i64 = (PG_EPOCH_DAYS_FROM_UNIX as i64) * 86_400_000_000;
+/// encoding here and by the matching parameter DECODE in `protocol.rs`
+/// (`decode_param_binary`'s TIMESTAMP / TIMESTAMPTZ arms rebase with the
+/// same constant in the opposite direction).
+pub(crate) const PG_EPOCH_MICROS_FROM_UNIX: i64 =
+    (PG_EPOCH_DAYS_FROM_UNIX as i64) * 86_400_000_000;
 
 /// Field-metadata key that basin-engine uses to mark logical types not
 /// directly representable in Arrow (today: `JSONB`, `UUID`). Kept in sync

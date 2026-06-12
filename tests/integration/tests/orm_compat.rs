@@ -2029,12 +2029,12 @@ async fn orm_compat_corpus() {
         //    contenttypes app's 0001_initial migration.
         Shape::raw(r#"CREATE TABLE "django_content_type" ("id" serial NOT NULL PRIMARY KEY, "app_label" varchar(100) NOT NULL, "model" varchar(100) NOT NULL)"#),
         // 8. …followed by the separate unique-together constraint Django's
-        //    schema editor emits as ALTER TABLE.
-        //    KNOWN GAP: Basin's ALTER TABLE grammar does not yet accept
-        //    `ADD CONSTRAINT … UNIQUE (cols)` — returns a typed 42601.
-        //    Harmless for the rest of the flow (the constraint is advisory
-        //    for Django; it never re-probes it), but post-hoc multi-column
-        //    UNIQUE addition is the named engine gap here.
+        //    schema editor emits as ALTER TABLE. Executes OK: the engine
+        //    backfill-validates the existing rows (distinct scan), registers
+        //    the named UniqueConstraint in the catalog, and subsequent
+        //    INSERTs enforce it through the same machinery as a CREATE-time
+        //    `UNIQUE (cols)` (see alter_table_std.rs
+        //    `add_unique_constraint_registers_and_enforces`).
         Shape::raw(r#"ALTER TABLE "django_content_type" ADD CONSTRAINT "django_content_type_app_label_model_76bd3d3b_uniq" UNIQUE ("app_label", "model")"#),
         // 9. ContentType.objects.get_for_model() cache fill — the content
         //    type lookup virtually every Django app issues on first request.

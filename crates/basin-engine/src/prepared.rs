@@ -143,6 +143,16 @@ pub enum ScalarParam {
     Float8(f64),
     Text(String),
     Bytea(Vec<u8>),
+    /// TIMESTAMPTZ bind value as microseconds since the Unix epoch, UTC.
+    /// The router decodes both wire formats into this variant (binary:
+    /// i64 micros since the PG epoch 2000-01-01, rebased; text: ISO-8601 /
+    /// PG-shaped literals). Substitution renders it as a
+    /// `'…+00'::timestamptz` literal so the text and AST routes coerce it
+    /// exactly like a user-written timestamptz literal; the bind-direct
+    /// INSERT path feeds the same literal through the values_fast
+    /// accumulators (which parse it with the slow path's
+    /// `parse_timestamp_string`).
+    Timestamptz(i64),
     Array(Vec<ScalarParam>),
 }
 
@@ -2128,6 +2138,9 @@ fn render_param(p: &ScalarParam) -> String {
             }
         }
         ScalarParam::Text(s) => quote_string(s),
+        ScalarParam::Timestamptz(us) => {
+            format!("'{}'::timestamptz", timestamptz_micros_to_literal(*us))
+        }
         ScalarParam::Bytea(bytes) => {
             let mut hex = String::with_capacity(bytes.len() * 2 + 4);
             hex.push_str("'\\x");
@@ -2155,6 +2168,26 @@ fn render_param(p: &ScalarParam) -> String {
             out
         }
     }
+}
+
+/// Render a TIMESTAMPTZ bind value (microseconds since the Unix epoch, UTC)
+/// as the PG-shaped literal body `YYYY-MM-DD HH:MM:SS.ffffff+00` — no quotes,
+/// no cast. Shared by [`render_param`] (which wraps it in `'…'::timestamptz`)
+/// and the bind-direct cell mapping in `values_fast` (whose Timestamp
+/// accumulator parses exactly this form via `dml::parse_timestamp_string`'s
+/// `%#z` patterns).
+///
+/// Out-of-chrono-range values cannot be produced by the router's wire
+/// decoders (both validate range with the same chrono check); should one
+/// appear anyway, saturate to chrono's representable bounds rather than
+/// panic in the render path.
+pub(crate) fn timestamptz_micros_to_literal(us: i64) -> String {
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(us).unwrap_or(if us < 0 {
+        chrono::DateTime::<chrono::Utc>::MIN_UTC
+    } else {
+        chrono::DateTime::<chrono::Utc>::MAX_UTC
+    });
+    dt.format("%Y-%m-%d %H:%M:%S%.6f+00").to_string()
 }
 
 /// Wrap a string in single quotes, doubling embedded single quotes. This is
@@ -2486,6 +2519,40 @@ mod tests {
         // Non-INSERT statements never get a plan.
         let stmt = parse_one("SELECT $1");
         assert!(build_bind_insert_plan(&stmt, 1).is_none());
+    }
+
+    #[test]
+    fn render_timestamptz_param_as_pg_literal() {
+        // 2026-01-02 03:04:05.123456 UTC.
+        let us = 1_767_323_045_123_456_i64;
+        let p = ScalarParam::Timestamptz(us);
+        assert_eq!(
+            render_param(&p),
+            "'2026-01-02 03:04:05.123456+00'::timestamptz"
+        );
+        // Text substitution carries the same rendering end-to-end…
+        let sql = substitute("INSERT INTO t (at) VALUES ($1)", &[p.clone()]).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO t (at) VALUES ('2026-01-02 03:04:05.123456+00'::timestamptz)"
+        );
+        // …and the AST substitution parses the literal to a Cast expr.
+        let expr = param_to_expr(&p).expect("param literal must parse");
+        assert!(
+            matches!(expr, Expr::Cast { .. }),
+            "expected a Cast expr, got {expr:?}"
+        );
+        // The literal body round-trips through the slow path's timestamp
+        // parser to the exact micros value (bind-direct relies on this).
+        let micros =
+            crate::dml::parse_timestamp_string(&timestamptz_micros_to_literal(us)).unwrap();
+        assert_eq!(micros, us);
+        // Pre-epoch values keep sub-second precision (euclidean rebase).
+        let neg = -1_500_000_i64; // 1969-12-31 23:59:58.5 UTC
+        assert_eq!(
+            timestamptz_micros_to_literal(neg),
+            "1969-12-31 23:59:58.500000+00"
+        );
     }
 
     #[test]

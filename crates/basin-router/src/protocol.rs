@@ -690,11 +690,56 @@ fn decode_param_text(
                     .collect(),
             ))
         }
+        // TIMESTAMPTZ text format: ISO-8601 / PG-shaped literals, with or
+        // without an explicit zone (JDBC and psycopg2 both send text-format
+        // timestamptz). Parse to the typed Unix-epoch-micros variant so the
+        // engine renders a canonical `'…+00'::timestamptz` literal; a shape
+        // we can't parse falls back to verbatim text (the engine's
+        // coercion then raises its canonical error — exactly the
+        // pre-variant behaviour).
+        Type::TIMESTAMPTZ => match parse_timestamptz_text_to_unix_micros(s) {
+            Some(us) => Ok(ScalarParam::Timestamptz(us)),
+            None => Ok(ScalarParam::Text(s.to_owned())),
+        },
         // JSONB / UUID text format passes through verbatim — the engine's
         // INSERT path parses string literals back to the canonical Arrow
         // representation. Same default as every other unmapped type.
         _ => Ok(ScalarParam::Text(s.to_owned())),
     }
+}
+
+/// Parse a text-format TIMESTAMPTZ parameter into microseconds since the
+/// Unix epoch (UTC). Accepts RFC3339 (`2026-01-02T03:04:05.123456Z`), the
+/// PG-shaped zoned forms (`2026-01-02 03:04:05.123456+00`, `+00:00`,
+/// space- or `T`-separated, with or without fraction), and the naive forms
+/// (assumed UTC — Basin sessions are UTC-only). Returns `None` for anything
+/// else so the caller can degrade to verbatim text.
+fn parse_timestamptz_text_to_unix_micros(s: &str) -> Option<i64> {
+    let t = s.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(t) {
+        return Some(dt.with_timezone(&chrono::Utc).timestamp_micros());
+    }
+    // Zoned, PG-shaped (`%#z` matches `+00`, `+0000`, and `+00:00`).
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f%#z",
+        "%Y-%m-%d %H:%M:%S%#z",
+        "%Y-%m-%dT%H:%M:%S%.f%#z",
+        "%Y-%m-%dT%H:%M:%S%#z",
+    ] {
+        if let Ok(dt) = chrono::DateTime::parse_from_str(t, fmt) {
+            return Some(dt.with_timezone(&chrono::Utc).timestamp_micros());
+        }
+    }
+    // Naive (assume UTC). `%.f` also matches an empty fraction.
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(t, fmt) {
+            return Some(
+                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
+                    .timestamp_micros(),
+            );
+        }
+    }
+    None
 }
 
 /// Parse a PostgreSQL one-dimensional array literal in text form:
@@ -917,24 +962,30 @@ pub(crate) fn decode_param_binary(
         }
         // TIMESTAMP / TIMESTAMPTZ binary wire format: 8-byte big-endian i64
         // microseconds since the Postgres epoch 2000-01-01 00:00:00 UTC
-        // (NOT the Unix epoch 1970-01-01). Render as an ISO-8601 string so
-        // the engine's text-substitution path parses it back correctly.
-        // TIMESTAMPTZ uses the same encoding but always represents UTC.
+        // (NOT the Unix epoch 1970-01-01). The rebase constant is shared
+        // with the encode direction in `types.rs`.
+        //
+        // TIMESTAMPTZ uses the same encoding and always represents UTC; it
+        // decodes to the typed `ScalarParam::Timestamptz` (Unix-epoch
+        // micros) so the engine's bind-direct / AST / text substitution
+        // routes all render it as a `'…+00'::timestamptz` literal. Naive
+        // TIMESTAMP keeps the historical ISO-8601 text rendering (the
+        // engine's text-substitution path parses it back as a naive UTC
+        // timestamp).
         Type::TIMESTAMP | Type::TIMESTAMPTZ => {
             if bytes.len() != 8 {
                 return Err(bad_len(8));
             }
             let pg_usec = i64::from_be_bytes(bytes.try_into().unwrap());
-            // PG epoch: 2000-01-01 00:00:00 UTC
-            // Unix epoch: 1970-01-01 00:00:00 UTC  →  delta = 10957 days
-            const PG_EPOCH_DELTA_USEC: i64 = 10_957 * 86_400 * 1_000_000;
-            let unix_usec = pg_usec.checked_add(PG_EPOCH_DELTA_USEC).ok_or_else(|| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "22P03".to_owned(),
-                    "timestamp binary value overflows i64 microseconds".to_owned(),
-                )))
-            })?;
+            let unix_usec = pg_usec
+                .checked_add(crate::types::PG_EPOCH_MICROS_FROM_UNIX)
+                .ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "22P03".to_owned(),
+                        "timestamp binary value overflows i64 microseconds".to_owned(),
+                    )))
+                })?;
             let secs = unix_usec.div_euclid(1_000_000);
             let nanos = (unix_usec.rem_euclid(1_000_000) * 1_000) as u32;
             let dt = chrono::Utc
@@ -947,8 +998,12 @@ pub(crate) fn decode_param_binary(
                         format!("timestamp binary value out of range: pg_usec={pg_usec}"),
                     )))
                 })?;
-            let s = dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-            Ok(ScalarParam::Text(s))
+            if *declared == Type::TIMESTAMPTZ {
+                Ok(ScalarParam::Timestamptz(unix_usec))
+            } else {
+                let s = dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+                Ok(ScalarParam::Text(s))
+            }
         }
         // NUMERIC binary wire format (#118 — mirror of `encode_numeric_binary`
         // in `types.rs`). Wire body (big-endian, NO outer length prefix here
@@ -3669,6 +3724,10 @@ mod tests {
                     }
                     ScalarParam::Float8(f) => format!("{f}"),
                     ScalarParam::Text(s) => format!("'{}'", s.replace('\'', "''")),
+                    // Mock rendering only — no test asserts on the exact
+                    // timestamptz literal shape here (the engine's
+                    // render_param owns the real one).
+                    ScalarParam::Timestamptz(us) => format!("'{us}'::timestamptz"),
                     ScalarParam::Bytea(b) => format!("'{:?}'", b),
                     // Tests don't exercise array params on the mock router
                     // session today, but the variant must be exhaustive. A
@@ -3952,6 +4011,48 @@ mod tests {
             PgWireError::UserError(info) => assert_eq!(info.code, "22P03"),
             other => panic!("expected UserError, got {other:?}"),
         }
+    }
+
+    // ── TIMESTAMPTZ param decode ─────────────────────────────────────────────
+
+    /// Binary TIMESTAMPTZ = i64 micros since the PG epoch (2000-01-01 UTC);
+    /// decodes to the typed `Timestamptz` variant rebased to Unix-epoch
+    /// micros. Naive TIMESTAMP keeps the historical naive text rendering.
+    #[test]
+    fn decode_param_binary_timestamptz_is_typed_unix_micros() {
+        // 2026-01-02 03:04:05.123456 UTC == 1_767_323_045_123_456 µs Unix.
+        let unix_us = 1_767_323_045_123_456_i64;
+        let pg_us = unix_us - crate::types::PG_EPOCH_MICROS_FROM_UNIX;
+        let wire = pg_us.to_be_bytes();
+        let p = super::decode_param_binary(&wire, &Type::TIMESTAMPTZ).expect("decode");
+        assert_eq!(p, ScalarParam::Timestamptz(unix_us));
+        // Same wire bytes declared as naive TIMESTAMP stay text-rendered.
+        let p = super::decode_param_binary(&wire, &Type::TIMESTAMP).expect("decode");
+        match p {
+            ScalarParam::Text(s) => assert_eq!(s, "2026-01-02 03:04:05.123456"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// Text TIMESTAMPTZ accepts RFC3339 / PG-shaped zoned / naive forms;
+    /// non-UTC offsets normalise to UTC; garbage degrades to verbatim Text.
+    #[test]
+    fn decode_param_text_timestamptz_forms() {
+        let unix_us = 1_767_323_045_123_456_i64; // 2026-01-02 03:04:05.123456Z
+        for s in [
+            "2026-01-02T03:04:05.123456Z",
+            "2026-01-02 03:04:05.123456+00",
+            "2026-01-02 03:04:05.123456+00:00",
+            "2026-01-02T03:04:05.123456+00",
+            "2026-01-02 03:04:05.123456", // naive → UTC
+            "2026-01-02 05:04:05.123456+02",
+        ] {
+            let p = super::decode_param_text(s.as_bytes(), &Type::TIMESTAMPTZ)
+                .unwrap_or_else(|e| panic!("decode {s:?}: {e}"));
+            assert_eq!(p, ScalarParam::Timestamptz(unix_us), "input {s:?}");
+        }
+        let p = super::decode_param_text(b"not-a-timestamp", &Type::TIMESTAMPTZ).expect("decode");
+        assert_eq!(p, ScalarParam::Text("not-a-timestamp".to_owned()));
     }
 
     // ── NUMERIC binary decode (#118) ─────────────────────────────────────────
