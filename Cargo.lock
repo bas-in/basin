@@ -1034,6 +1034,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "basin-cdc"
+version = "0.1.9"
+dependencies = [
+ "async-trait",
+ "axum",
+ "basin-auth",
+ "basin-catalog",
+ "basin-common",
+ "basin-engine",
+ "basin-storage",
+ "bytes",
+ "chrono",
+ "dashmap",
+ "futures",
+ "object_store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "basin-common"
 version = "0.1.9"
 dependencies = [
@@ -1411,6 +1436,7 @@ dependencies = [
  "basin-auth",
  "basin-blob",
  "basin-catalog",
+ "basin-cdc",
  "basin-common",
  "basin-engine",
  "basin-realtime",
@@ -1487,6 +1513,7 @@ dependencies = [
  "base64 0.22.1",
  "basin-auth",
  "basin-catalog",
+ "basin-cdc",
  "basin-common",
  "basin-engine",
  "basin-fn",

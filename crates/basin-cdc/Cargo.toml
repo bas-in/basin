@@ -1,0 +1,39 @@
+[package]
+name = "basin-cdc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+basin-common.workspace = true
+basin-storage.workspace = true
+basin-auth.workspace = true
+
+object_store.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+bytes.workspace = true
+ulid.workspace = true
+
+# Concurrent per-project live-tail broadcast registry. Same major version
+# basin-realtime already pins, so no new lock-file resolution.
+dashmap = "6"
+
+# HTTP stack for the SSE delivery router (GET /cdc/v1/:project/stream).
+# Mirrors basin-realtime's manifest: the `ws` feature is not needed here —
+# Phase 1 is SSE-only — so we pull axum without it.
+axum.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile.workspace = true
+basin-catalog.workspace = true
+basin-engine.workspace = true

@@ -18,6 +18,7 @@ members = [
     "crates/basin-net",
     "crates/basin-webhooks",
     "crates/basin-realtime",
+    "crates/basin-cdc",
     "crates/basin-cv",
     "crates/basin-geo",
     "crates/basin-trgm",
@@ -66,6 +67,7 @@ basin-rest = { path = "crates/basin-rest" }
 basin-net = { path = "crates/basin-net" }
 basin-webhooks = { path = "crates/basin-webhooks" }
 basin-realtime = { path = "crates/basin-realtime" }
+basin-cdc = { path = "crates/basin-cdc" }
 basin-cv = { path = "crates/basin-cv" }
 basin-geo = { path = "crates/basin-geo" }
 basin-trgm = { path = "crates/basin-trgm" }
