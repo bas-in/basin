@@ -774,6 +774,45 @@ impl SessionState {
             head_probe_cache: HeadProbeCache::new(),
         }
     }
+
+    /// Variant of `new()` that accepts a pre-built `schema_state` Arc.
+    /// Used when the schema state must be shared with the info-schema providers
+    /// that are registered before the SessionState is fully assembled — the
+    /// providers hold an Arc clone and read the live user-schema set at scan
+    /// time, while this session's CREATE/DROP SCHEMA handlers mutate it.
+    pub(crate) fn new_with_schema_state(
+        schema_state: Arc<RwLock<crate::schema_ddl::SchemaState>>,
+    ) -> Self {
+        Self {
+            snapshots: Mutex::new(HashMap::new()),
+            prepared: crate::prepared::PreparedRegistry::new(),
+            has_partitioned_table: std::sync::atomic::AtomicBool::new(false),
+            sequence_cache: Arc::new(crate::seq_udf::SessionSequenceCache::default()),
+            cursors: crate::cursor::CursorRegistry::new(),
+            schema_state,
+            pending_overriding: std::sync::Mutex::new(None),
+            tx_state: std::sync::Mutex::new(TxState::default()),
+            advisory: Arc::new(crate::advisory_lock::AdvisorySessionLocks::new()),
+            // -1 means "no per-session override; use process-wide default".
+            statement_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
+            lock_timeout: std::sync::Mutex::new(None),
+            idle_in_transaction_session_timeout: std::sync::Mutex::new(None),
+            synchronous_commit: std::sync::atomic::AtomicBool::new(
+                synchronous_commit_env_default(),
+            ),
+            trgm_similarity_threshold: std::sync::atomic::AtomicU32::new(
+                basin_trgm::DEFAULT_SIMILARITY_THRESHOLD.to_bits(),
+            ),
+            trgm_word_similarity_threshold: std::sync::atomic::AtomicU32::new(
+                basin_trgm::DEFAULT_WORD_SIMILARITY_THRESHOLD.to_bits(),
+            ),
+            last_active: std::sync::Mutex::new(std::time::Instant::now()),
+            listen: std::sync::Mutex::new(ListenState::default()),
+            table_meta_cache: TableMetaCache::new(),
+            provider_cache: ProviderCache::new(),
+            head_probe_cache: HeadProbeCache::new(),
+        }
+    }
 }
 
 // ── Per-session table-metadata cache ────────────────────────────────────────
@@ -2267,12 +2306,20 @@ pub(crate) async fn open(
     // snapshot. The providers hold `Arc<dyn Catalog>` + `ProjectId` only;
     // the heavy resource (the catalog handle) is shared across every
     // session, so per-project cost is O(bytes).
+    // Create the schema_state here so both the info-schema providers and the
+    // SessionState share the same Arc. Providers hold an Arc clone and read the
+    // live user-schema set at scan time; SessionState's CREATE/DROP SCHEMA
+    // handlers mutate it at execute time.
+    let schema_state: Arc<RwLock<crate::schema_ddl::SchemaState>> =
+        Arc::new(RwLock::new(crate::schema_ddl::SchemaState::default()));
+
     crate::info_schema_provider::register_info_schema_providers(
         &ctx,
         engine.config().catalog.clone(),
         project,
         engine.lock_registry().clone(),
         engine.connection_registry().clone(),
+        Arc::clone(&schema_state),
     )
     .map_err(|e| BasinError::internal(format!("info_schema providers: {e}")))?;
 
@@ -2325,7 +2372,7 @@ pub(crate) async fn open(
         tracing::warn!("register_cdc_providers: {e}");
     }
 
-    let state = Arc::new(SessionState::new());
+    let state = Arc::new(SessionState::new_with_schema_state(Arc::clone(&schema_state)));
 
     // Phase 5.28.C: register with the idle-in-txn reaper.
     let (reaper_id, reaped_flag) = engine.reaper_registry().register(state.clone());

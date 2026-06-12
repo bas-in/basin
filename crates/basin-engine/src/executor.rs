@@ -3657,6 +3657,29 @@ async fn exec_create_table(
     // trusted internal subsystems can create tables in reserved schemas.
     if !sess.is_system {
         crate::schema_ddl::guard_reserved_schema_for_user_ddl(&ct.name, "CREATE TABLE")?;
+        // Flat-model schema validation: a user-schema qualifier must name a
+        // schema this session created (`CREATE SCHEMA`), else CREATE TABLE in
+        // it is an error — matching PG, where `CREATE TABLE gone.t` after
+        // `DROP SCHEMA gone` fails. `public` and reserved schemas are always
+        // "known"; the guard above already rejected reserved ones for users.
+        if ct.name.0.len() >= 2 {
+            let schema_q = ct.name.0[0].id_val();
+            let is_reserved =
+                basin_catalog::reserved_schema::ReservedSchema::from_str(schema_q).is_some();
+            if !is_reserved {
+                let known = sess
+                    .state
+                    .schema_state
+                    .read()
+                    .expect("schema_state lock poisoned")
+                    .contains(schema_q);
+                if !known {
+                    return Err(BasinError::NotFound(format!(
+                        "schema {schema_q:?} does not exist"
+                    )));
+                }
+            }
+        }
     }
     let name = single_part_name(&ct.name)?;
     // Phase 5.18.C: for system sessions with a schema qualifier, resolve the

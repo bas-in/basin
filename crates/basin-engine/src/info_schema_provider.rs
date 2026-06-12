@@ -42,6 +42,9 @@
 
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::RwLock;
+
+use basin_catalog::reserved_schema::ReservedSchema;
 
 use arrow_array::{ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -392,6 +395,9 @@ pub(crate) struct PgNamespaceProvider {
     catalog: Arc<dyn Catalog>,
     project: ProjectId,
     schema: DfSchemaRef,
+    /// Session schema state — read at scan time to include user-created
+    /// schemas alongside the reserved set.
+    schema_state: Arc<RwLock<crate::schema_ddl::SchemaState>>,
 }
 
 impl std::fmt::Debug for PgNamespaceProvider {
@@ -403,7 +409,11 @@ impl std::fmt::Debug for PgNamespaceProvider {
 }
 
 impl PgNamespaceProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
+    pub(crate) fn new(
+        catalog: Arc<dyn Catalog>,
+        project: ProjectId,
+        schema_state: Arc<RwLock<crate::schema_ddl::SchemaState>>,
+    ) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::pg_namespace_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -411,6 +421,7 @@ impl PgNamespaceProvider {
             catalog,
             project,
             schema: Arc::new(df_schema),
+            schema_state,
         })
     }
 }
@@ -439,6 +450,23 @@ impl TableProvider for PgNamespaceProvider {
         let ws_batch = InfoSchemaQuery::pg_namespace(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let user_schemas: Vec<String> = {
+            let st = self
+                .schema_state
+                .read()
+                .expect("schema_state lock poisoned");
+            st.schemas
+                .iter()
+                .filter(|s| ReservedSchema::from_str(s).is_none())
+                .cloned()
+                .collect()
+        };
+        let ws_batch = if user_schemas.is_empty() {
+            ws_batch
+        } else {
+            append_user_schemas_to_pg_namespace(ws_batch, &user_schemas, &self.project)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        };
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
@@ -923,6 +951,8 @@ pub(crate) struct InfoSchemaSchemataProvider {
     catalog: Arc<dyn Catalog>,
     project: ProjectId,
     schema: DfSchemaRef,
+    /// Session schema state — read at scan time to include user-created schemas.
+    schema_state: Arc<RwLock<crate::schema_ddl::SchemaState>>,
 }
 
 impl std::fmt::Debug for InfoSchemaSchemataProvider {
@@ -934,7 +964,11 @@ impl std::fmt::Debug for InfoSchemaSchemataProvider {
 }
 
 impl InfoSchemaSchemataProvider {
-    pub(crate) fn new(catalog: Arc<dyn Catalog>, project: ProjectId) -> DfResult<Self> {
+    pub(crate) fn new(
+        catalog: Arc<dyn Catalog>,
+        project: ProjectId,
+        schema_state: Arc<RwLock<crate::schema_ddl::SchemaState>>,
+    ) -> DfResult<Self> {
         let ws_schema = InfoSchemaQuery::schemata_schema();
         let df_schema = schema_ws_to_df(ws_schema.as_ref())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -942,6 +976,7 @@ impl InfoSchemaSchemataProvider {
             catalog,
             project,
             schema: Arc::new(df_schema),
+            schema_state,
         })
     }
 }
@@ -970,6 +1005,23 @@ impl TableProvider for InfoSchemaSchemataProvider {
         let ws_batch = InfoSchemaQuery::schemata(self.catalog.as_ref(), &self.project)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let user_schemas: Vec<String> = {
+            let st = self
+                .schema_state
+                .read()
+                .expect("schema_state lock poisoned");
+            st.schemas
+                .iter()
+                .filter(|s| ReservedSchema::from_str(s).is_none())
+                .cloned()
+                .collect()
+        };
+        let ws_batch = if user_schemas.is_empty() {
+            ws_batch
+        } else {
+            append_user_schemas_to_schemata(ws_batch, &user_schemas)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        };
         let df_batch =
             batch_ws_to_df(&ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partitions = vec![vec![df_batch]];
@@ -2041,6 +2093,7 @@ pub(crate) fn register_info_schema_providers(
     project: ProjectId,
     lock_registry: basin_shard::LockRegistry,
     connection_registry: ConnectionRegistry,
+    schema_state: Arc<RwLock<crate::schema_ddl::SchemaState>>,
 ) -> DfResult<()> {
     use datafusion::catalog::MemorySchemaProvider;
 
@@ -2081,7 +2134,7 @@ pub(crate) fn register_info_schema_providers(
         Arc::new(PgAttributeProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_attribute".to_string(), pg_attribute_provider)?;
     let pg_namespace_provider: Arc<dyn TableProvider> =
-        Arc::new(PgNamespaceProvider::new(catalog.clone(), project)?);
+        Arc::new(PgNamespaceProvider::new(catalog.clone(), project, Arc::clone(&schema_state))?);
     pg_catalog_schema.register_table("pg_namespace".to_string(), pg_namespace_provider)?;
     let pg_proc_provider: Arc<dyn TableProvider> =
         Arc::new(PgProcProvider::new(catalog.clone(), project)?);
@@ -2102,7 +2155,7 @@ pub(crate) fn register_info_schema_providers(
         Arc::new(InfoSchemaViewsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("views".to_string(), views_provider)?;
     let schemata_provider: Arc<dyn TableProvider> =
-        Arc::new(InfoSchemaSchemataProvider::new(catalog.clone(), project)?);
+        Arc::new(InfoSchemaSchemataProvider::new(catalog.clone(), project, Arc::clone(&schema_state))?);
     info_schema.register_table("schemata".to_string(), schemata_provider)?;
 
     // Phase 5.11.M Tier 3 (constraint introspection):
@@ -2425,4 +2478,78 @@ pub(crate) fn register_cdc_providers(
         .register_table("pg_publication_tables".to_string(), pub_tables_provider);
 
     Ok(())
+}
+
+// ─── User-schema append helpers ───────────────────────────────────────────────
+
+/// Append extra rows to a `pg_catalog.pg_namespace` batch for user-created
+/// schemas (those absent from the reserved set).
+fn append_user_schemas_to_pg_namespace(
+    base: arrow_array::RecordBatch,
+    user_schemas: &[String],
+    project: &basin_common::ProjectId,
+) -> basin_common::Result<arrow_array::RecordBatch> {
+    let mut oids: Vec<i64> = Vec::with_capacity(user_schemas.len());
+    let mut nspnames: Vec<String> = Vec::with_capacity(user_schemas.len());
+    let mut nspowners: Vec<i64> = Vec::with_capacity(user_schemas.len());
+    for s in user_schemas {
+        let key = format!("basin.pg_namespace:{project}:{s}");
+        oids.push(user_schema_oid(key.as_bytes()));
+        nspnames.push(s.clone());
+        nspowners.push(0_i64);
+    }
+    let extra = arrow_array::RecordBatch::try_new(
+        base.schema(),
+        vec![
+            Arc::new(arrow_array::Int64Array::from(oids)) as arrow_array::ArrayRef,
+            Arc::new(arrow_array::StringArray::from(nspnames)) as arrow_array::ArrayRef,
+            Arc::new(arrow_array::Int64Array::from(nspowners)) as arrow_array::ArrayRef,
+        ],
+    )
+    .map_err(|e| basin_common::BasinError::internal(format!("pg_namespace user rows: {e}")))?;
+    arrow_select::concat::concat_batches(&base.schema(), &[base, extra])
+        .map_err(|e| basin_common::BasinError::internal(format!("concat pg_namespace: {e}")))
+}
+
+/// Append extra rows to an `information_schema.schemata` batch for
+/// user-created schemas.
+fn append_user_schemas_to_schemata(
+    base: arrow_array::RecordBatch,
+    user_schemas: &[String],
+) -> basin_common::Result<arrow_array::RecordBatch> {
+    let n = user_schemas.len();
+    let catalog_names: Vec<&str> = vec!["basin"; n];
+    let schema_names: Vec<String> = user_schemas.to_vec();
+    let schema_owners: Vec<&str> = vec![""; n];
+    let charset_catalogs: Vec<Option<String>> = vec![None; n];
+    let charset_schemas: Vec<Option<String>> = vec![None; n];
+    let charset_names: Vec<Option<String>> = vec![None; n];
+    let extra = arrow_array::RecordBatch::try_new(
+        base.schema(),
+        vec![
+            Arc::new(arrow_array::StringArray::from(catalog_names)) as arrow_array::ArrayRef,
+            Arc::new(arrow_array::StringArray::from(schema_names)) as arrow_array::ArrayRef,
+            Arc::new(arrow_array::StringArray::from(schema_owners)) as arrow_array::ArrayRef,
+            Arc::new(arrow_array::StringArray::from(charset_catalogs)) as arrow_array::ArrayRef,
+            Arc::new(arrow_array::StringArray::from(charset_schemas)) as arrow_array::ArrayRef,
+            Arc::new(arrow_array::StringArray::from(charset_names)) as arrow_array::ArrayRef,
+        ],
+    )
+    .map_err(|e| basin_common::BasinError::internal(format!("schemata user rows: {e}")))?;
+    arrow_select::concat::concat_batches(&base.schema(), &[base, extra])
+        .map_err(|e| basin_common::BasinError::internal(format!("concat schemata: {e}")))
+}
+
+/// FNV-1a 64-bit → positive i64. Mirrors `fnv1a_64_to_positive_i64` in
+/// `basin-catalog/src/info_schema.rs` (same constants, same bit-mask) so a
+/// user schema's OID is stable and disjoint from the reserved set.
+fn user_schema_oid(bytes: &[u8]) -> i64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h: u64 = FNV_OFFSET;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    (h & 0x7fff_ffff_ffff_ffff) as i64
 }

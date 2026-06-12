@@ -161,6 +161,11 @@ pub enum StmtKind {
     // CREATE TABLE … PARTITION OF — declarative partitioning is a design
     // exclusion (flat-storage model); surface 0A000 per ADR 0012.
     CreateTablePartitionOf,
+    // CREATE DATABASE / DROP DATABASE — Basin is single-database-per-project.
+    // Rejected with SQLSTATE 0A000 + a hint pointing to shadowDatabaseUrl
+    // (the Prisma shadow-database recipe).
+    CreateDatabase,
+    DropDatabase,
     /// Anything we don't yet dispatch on. Routed to the existing
     /// sqlparser pipeline by the executor.
     Other,
@@ -249,6 +254,8 @@ impl StmtKind {
             StmtKind::Reindex => "REINDEX",
             StmtKind::DoBlock => "DO",
             StmtKind::CreateTablePartitionOf => "CREATE TABLE … PARTITION OF",
+            StmtKind::CreateDatabase => "CREATE DATABASE",
+            StmtKind::DropDatabase => "DROP DATABASE",
             StmtKind::Other => "<other>",
         }
     }
@@ -655,6 +662,10 @@ pub fn stmt_kind(node: &Node) -> StmtKind {
 
         NodeEnum::MergeStmt(_) => StmtKind::Merge,
         NodeEnum::ReindexStmt(_) => StmtKind::Reindex,
+
+        // CREATE DATABASE / DROP DATABASE
+        NodeEnum::CreatedbStmt(_) => StmtKind::CreateDatabase,
+        NodeEnum::DropdbStmt(_) => StmtKind::DropDatabase,
 
         // PL/pgSQL anonymous block — ADR 0012 design exclusion
         NodeEnum::DoStmt(_) => StmtKind::DoBlock,
@@ -1299,6 +1310,26 @@ pub fn reject_unsupported(tree: &ParseTree) -> Result<()> {
         let Some(inner) = node.node.as_ref() else {
             continue;
         };
+
+        // CREATE DATABASE / DROP DATABASE — custom error with shadowDatabaseUrl hint.
+        //
+        // Basin is single-database-per-project; CREATE DATABASE is the first
+        // statement `prisma migrate dev` issues for its shadow database comparison.
+        // Since Basin cannot create an independent database, the supported recipe
+        // is to provision a second Basin project and point `shadowDatabaseUrl` in
+        // `prisma.config.ts` at it. `prisma migrate deploy` does NOT issue
+        // CREATE DATABASE and works without this workaround.
+        if matches!(inner, NodeEnum::CreatedbStmt(_) | NodeEnum::DropdbStmt(_)) {
+            return Err(BasinError::FeatureNotSupported(
+                "CREATE DATABASE / DROP DATABASE is not supported (SQLSTATE 0A000). \
+                 Basin is single-database-per-project. \
+                 For `prisma migrate dev` shadow database support: provision a \
+                 second Basin project and set shadowDatabaseUrl in prisma.config.ts \
+                 pointing at that project's connection string. \
+                 `prisma migrate deploy` does NOT require a shadow database."
+                    .into(),
+            ));
+        }
 
         // CREATE TABLE with EXCLUDE constraint — Basin has no GiST / exclusion
         // index support in general. This is a design exclusion (flat-storage
