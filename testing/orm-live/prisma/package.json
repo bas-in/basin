@@ -1,0 +1,16 @@
+{
+  "name": "basin-orm-live-prisma",
+  "private": true,
+  "type": "module",
+  "description": "Live Prisma compatibility suite against a real basin-server (BASIN_DSN)",
+  "scripts": {
+    "suite": "node suite.mjs"
+  },
+  "devDependencies": {
+    "prisma": "^7"
+  },
+  "dependencies": {
+    "@prisma/client": "^7",
+    "@prisma/adapter-pg": "^7"
+  }
+}

@@ -1,0 +1,3 @@
+# Django LTS line + psycopg2 — the classic production pairing.
+Django>=5.2,<6.0
+psycopg2-binary>=2.9

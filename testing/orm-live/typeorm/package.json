@@ -1,0 +1,14 @@
+{
+  "name": "basin-orm-live-typeorm",
+  "private": true,
+  "type": "module",
+  "description": "Live TypeORM compatibility suite against a real basin-server (BASIN_DSN)",
+  "scripts": {
+    "suite": "node suite.mjs"
+  },
+  "dependencies": {
+    "typeorm": "^1",
+    "pg": "^8.21",
+    "reflect-metadata": "^0.2"
+  }
+}

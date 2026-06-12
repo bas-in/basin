@@ -1,0 +1,46 @@
+// Live-ORM harness schema: relations + enum + Json + DateTime — the four
+// type-system features Prisma apps lean on hardest.
+
+generator client {
+  provider = "prisma-client"
+  output   = "./generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Prisma 7: the connection URL lives in prisma.config.ts (datasource.url),
+  // sourced from the BASIN_DSN env var the harness exports.
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  name      String?
+  role      Role     @default(USER)
+  meta      Json?
+  createdAt DateTime @default(now())
+  posts     Post[]
+  profile   Profile?
+}
+
+model Post {
+  id        Int      @id @default(autoincrement())
+  title     String
+  published Boolean  @default(false)
+  views     Int      @default(0)
+  createdAt DateTime @default(now())
+  author    User     @relation(fields: [authorId], references: [id])
+  authorId  Int
+}
+
+model Profile {
+  id     Int    @id @default(autoincrement())
+  bio    String
+  user   User   @relation(fields: [userId], references: [id])
+  userId Int    @unique
+}

@@ -1,0 +1,12 @@
+# toolchain installs
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# generated at run time
+results/
+prisma/generated/
+
+# scratch migration output from `prisma migrate dev` attempts
+prisma/migrations/*_live/

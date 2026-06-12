@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "_note": "Expected outcome per ORM test. 'pass' = must pass (failure is a CI regression). 'xfail' = known Basin gap, named in 'gap' — NEVER a silent skip; when a gap closes the runner reports XPASS and you re-baseline with ./run-all.sh --update-baseline. PROVISIONAL: statuses derived from tests/integration/tests/orm_compat.rs gates (2026-06); true-up against a live basin-server on first run.",
+  "suites": {
+    "prisma": {
+      "migrate-deploy": {
+        "expected": "xfail",
+        "gap": "advisory locks — prisma migrate acquires pg_advisory_lock before applying migrations; Basin returns a typed error for pg_advisory_* (orm_compat.rs sqlx corpus: pg_try_advisory_xact_lock)"
+      },
+      "migrate-dev": {
+        "expected": "xfail",
+        "gap": "shadow database — `prisma migrate dev` issues CREATE DATABASE for the shadow DB; Basin has no CREATE DATABASE"
+      },
+      "connect": { "expected": "pass" },
+      "crud-create": { "expected": "pass" },
+      "crud-find-unique": { "expected": "pass" },
+      "crud-update": { "expected": "pass" },
+      "crud-delete": { "expected": "pass" },
+      "nested-write-include": { "expected": "pass" },
+      "transaction": { "expected": "pass" },
+      "transaction-rollback": { "expected": "pass" },
+      "pagination": { "expected": "pass" }
+    },
+    "drizzle": {
+      "migrate-generate": { "expected": "pass" },
+      "migrate-apply": {
+        "expected": "xfail",
+        "gap": "drizzle-kit migrate bookkeeping — CREATE SCHEMA \"drizzle\" + __drizzle_migrations tracker table; CREATE SCHEMA support unverified on Basin"
+      },
+      "connect": { "expected": "pass" },
+      "insert-returning": { "expected": "pass" },
+      "select-where": { "expected": "pass" },
+      "relational-query": { "expected": "pass" },
+      "upsert-on-conflict": {
+        "expected": "xfail",
+        "gap": "INSERT … ON CONFLICT (col) DO UPDATE SET x = excluded.x — planner does not resolve the EXCLUDED/table alias (orm_compat.rs upsert_on_conflict_do_update)"
+      },
+      "transaction": { "expected": "pass" },
+      "transaction-rollback": { "expected": "pass" },
+      "pagination": { "expected": "pass" },
+      "delete": { "expected": "pass" }
+    },
+    "typeorm": {
+      "connect": { "expected": "pass" },
+      "migrations-run": { "expected": "pass" },
+      "crud-insert": { "expected": "pass" },
+      "crud-find": { "expected": "pass" },
+      "crud-update": { "expected": "pass" },
+      "crud-delete": { "expected": "pass" },
+      "eager-relations": { "expected": "pass" },
+      "queryrunner-tx": { "expected": "pass" },
+      "queryrunner-tx-rollback": { "expected": "pass" }
+    },
+    "django": {
+      "migrate": { "expected": "pass" },
+      "connect": { "expected": "pass" },
+      "crud": { "expected": "pass" },
+      "select-related": { "expected": "pass" },
+      "atomic-commit": { "expected": "pass" },
+      "savepoint-rollback": { "expected": "pass" },
+      "f-update": { "expected": "pass" },
+      "bulk-create": { "expected": "pass" }
+    },
+    "sqlalchemy": {
+      "connect": { "expected": "pass" },
+      "alembic-upgrade": { "expected": "pass" },
+      "crud": { "expected": "pass" },
+      "relationships": { "expected": "pass" },
+      "selectinload": { "expected": "pass" },
+      "session-tx-rollback": { "expected": "pass" },
+      "savepoint": { "expected": "pass" }
+    },
+    "gorm": {
+      "connect": { "expected": "pass" },
+      "automigrate": { "expected": "pass" },
+      "crud-create": { "expected": "pass" },
+      "crud-read-preload": { "expected": "pass" },
+      "batch-create": { "expected": "pass" },
+      "upsert": {
+        "expected": "xfail",
+        "gap": "INSERT … ON CONFLICT (col) DO UPDATE SET x = excluded.x — planner does not resolve the EXCLUDED/table alias (orm_compat.rs upsert_on_conflict_do_update)"
+      },
+      "transaction": { "expected": "pass" },
+      "transaction-rollback": { "expected": "pass" },
+      "delete": { "expected": "pass" }
+    }
+  }
+}

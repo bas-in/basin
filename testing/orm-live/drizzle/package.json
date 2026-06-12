@@ -1,0 +1,16 @@
+{
+  "name": "basin-orm-live-drizzle",
+  "private": true,
+  "type": "module",
+  "description": "Live Drizzle compatibility suite against a real basin-server (BASIN_DSN)",
+  "scripts": {
+    "suite": "node suite.mjs"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.45",
+    "pg": "^8.21"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31"
+  }
+}
