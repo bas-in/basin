@@ -81,6 +81,14 @@ pub enum BasinError {
     #[error("feature not supported: {0}")]
     FeatureNotSupported(String),
 
+    /// Cardinality violation: a statement that must affect each target row at
+    /// most once tried to affect one twice. Raised by `MERGE` when more than
+    /// one source row matches the same target row. Router maps to SQLSTATE
+    /// `21000` (`cardinality_violation`), matching PostgreSQL's
+    /// `MERGE command cannot affect row a second time`.
+    #[error("{0}")]
+    CardinalityViolation(String),
+
     /// PRIMARY KEY (or UNIQUE) violation. Router maps to SQLSTATE
     /// `23505` (`unique_violation`).
     #[error("{0}")]

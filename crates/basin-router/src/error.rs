@@ -64,6 +64,10 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         BasinError::QueryCostExceeded(_) => ("ERROR", "54000"), // program_limit_exceeded
         BasinError::QueryCanceled(_) => ("ERROR", "57014"),     // query_canceled
         BasinError::FeatureNotSupported(_) => ("ERROR", "0A000"), // feature_not_supported
+        // MERGE matched the same target row from two source rows. PostgreSQL
+        // raises 21000 (cardinality_violation) with the message
+        // "MERGE command cannot affect row a second time".
+        BasinError::CardinalityViolation(_) => ("ERROR", "21000"), // cardinality_violation
         BasinError::UniqueViolation(_) => ("ERROR", "23505"), // unique_violation
         BasinError::CheckViolation(_) => ("ERROR", "23514"), // check_violation
         BasinError::ForeignKeyViolation(_) => ("ERROR", "23503"), // foreign_key_violation

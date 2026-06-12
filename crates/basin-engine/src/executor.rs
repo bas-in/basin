@@ -3314,6 +3314,11 @@ async fn dispatch_parsed_statement(
             names,
             ..
         } => exec_drop_table(sess, if_exists, names).await,
+        // PostgreSQL 15+ `MERGE INTO target USING source ON cond WHEN …`.
+        // Compiles each per-row WHEN action to ordinary INSERT/UPDATE/DELETE
+        // driven through the normal statement pipeline (RLS, constraints, fast
+        // paths, atomicity all inherited). See `crate::merge`.
+        Statement::Merge(merge) => crate::merge::exec_merge(sess, merge).await,
         other => Err(BasinError::internal(format!("unsupported in PoC: {other}"))),
     };
 

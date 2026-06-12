@@ -1507,6 +1507,10 @@ mod datetime_more_udf;
 mod ddl;
 mod dml;
 mod dml_mutate;
+/// Phase 5.x — `MERGE INTO` (Postgres 15+) execution. Compiles each per-row
+/// WHEN action to ordinary INSERT/UPDATE/DELETE driven through the normal
+/// statement pipeline, inheriting RLS, constraints, fast paths, and atomicity.
+mod merge;
 pub mod overlay_reconcile;
 mod values_fast;
 mod enum_ordinal;
