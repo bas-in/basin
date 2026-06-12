@@ -68,7 +68,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, LargeBinaryArray, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::PromotedJsonbPath;
 use basin_common::Result;
@@ -188,12 +188,29 @@ pub(crate) fn materialize_promoted_columns(
 /// - JSON string → the inner string content (no quotes).
 /// - JSON number/bool → text form.
 fn extract_promoted_value(arr: &ArrayRef, i: usize, key: &str) -> Option<String> {
-    // Support LargeBinary (canonical JSONB storage) and plain Utf8 (text JSONB).
+    // JSONB is written to Vortex as LargeBinary, but Vortex 0.71 may surface
+    // the on-disk binary column as LargeBinary, Binary, or BinaryView depending
+    // on its internal layout. Accept all three binary variants plus plain Utf8
+    // (text JSONB) so shadow-column materialisation works regardless of which
+    // physical array type the decoder chose.  (Mirrors the same family-tolerant
+    // pattern used by `geo_glue::point_bytes_at` for POINT columns.)
     let bytes: &[u8] = if let Some(lb) = arr.as_any().downcast_ref::<LargeBinaryArray>() {
         if lb.is_null(i) {
             return None;
         }
         lb.value(i)
+    } else if let Some(ba) = arr.as_any().downcast_ref::<BinaryArray>() {
+        // Vortex may decode LargeBinary-on-disk as plain Binary.
+        if ba.is_null(i) {
+            return None;
+        }
+        ba.value(i)
+    } else if let Some(bv) = arr.as_any().downcast_ref::<BinaryViewArray>() {
+        // Vortex may decode LargeBinary-on-disk as BinaryView.
+        if bv.is_null(i) {
+            return None;
+        }
+        bv.value(i)
     } else if let Some(sa) = arr.as_any().downcast_ref::<StringArray>() {
         if sa.is_null(i) {
             return None;

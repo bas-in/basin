@@ -1018,12 +1018,22 @@ pub(crate) fn normalize_batch_to_schema(
 
 /// True iff `have`→`want` is one of the byte-string width/view widenings or
 /// narrowings we treat as a safe read-boundary normalization.
+///
+/// Includes `BinaryView ↔ LargeBinary`: Vortex 0.71 can surface an on-disk
+/// `LargeBinary` column as `BinaryView` depending on its internal layout.
+/// `normalize_batch_to_schema` must coerce it to the catalog `LargeBinary` so
+/// that `extract_promoted_value` (promoted JSONB shadow columns) and any other
+/// engine layer that downcasts to `LargeBinaryArray` works correctly.
 fn is_str_bin_family_pair(have: &DataType, want: &DataType) -> bool {
-    use DataType::{Binary, LargeBinary, LargeUtf8, Utf8, Utf8View};
+    use DataType::{Binary, BinaryView, LargeBinary, LargeUtf8, Utf8, Utf8View};
     matches!(
         (have, want),
         (Binary, LargeBinary)
             | (LargeBinary, Binary)
+            | (BinaryView, LargeBinary)
+            | (LargeBinary, BinaryView)
+            | (BinaryView, Binary)
+            | (Binary, BinaryView)
             | (Utf8, LargeUtf8)
             | (LargeUtf8, Utf8)
             | (Utf8, Utf8View)
