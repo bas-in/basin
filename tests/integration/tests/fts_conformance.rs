@@ -35,12 +35,17 @@
 //! | `ts_rank_positive_for_match`                         | ts_rank > 0 for genuine match               |
 //! | `ts_rank_zero_for_no_match`                          | ts_rank = 0 when query doesn't match        |
 //! | `ts_rank_deterministic`                              | ts_rank same result across 10 runs          |
-//! | `ts_rank_relative_ordering`                          | more term occurrences → higher rank         |
+//! | `ts_rank_relative_ordering`                          | more term occurrences → strictly higher rank|
+//! | `ts_rank_frequency_sensitive`                        | 5× term scores strictly above 1× term      |
 //! | `ts_rank_cd_non_negative`                            | ts_rank_cd ≥ 0 always                       |
 //! | `ts_headline_wraps_matched_terms`                    | ts_headline wraps matched terms in <b>…</b> |
-//! | `ts_headline_no_match_unchanged`                     | ts_headline returns body when no match      |
+//! | `ts_headline_window_selection`                       | best window selected from long document     |
+//! | `ts_headline_max_fragments`                          | MaxFragments=2 returns two snippets + "…"   |
+//! | `ts_headline_no_match_unchanged`                     | ts_headline no-match: no <b>, words present |
 //! | `ts_headline_null_safe`                              | ts_headline on NULL body → NULL             |
-//! | `setweight_not_registered`                           | setweight is not registered (honest error)  |
+//! | `setweight_annotates_positions`                      | setweight adds weight letter to positions   |
+//! | `setweight_roundtrip_via_parse`                      | setweight tsvector still matches via @@     |
+//! | `setweight_invalid_class_errors`                     | invalid weight class 'Z' → error            |
 //! | `strip_removes_positions`                            | strip() removes position info               |
 //! | `tsvector_length_counts_lexemes`                     | tsvector_length returns lexeme count        |
 //! | `gin_index_scan_agrees_with_table_scan`              | GIN vs full-scan result equality            |
@@ -52,13 +57,15 @@
 //!
 //! ## Gap list (out of scope — NOT tested)
 //!
-//! - `setweight(tsvector, "A"…"D")` — not registered; returns error.
-//! - Weighted tsvectors (`:1A` weight class notation) — positions are parsed
-//!   but weight letters are stripped; `ts_rank` ignores weights.
-//! - `ts_rank` / `ts_rank_cd` cover-density algorithm — both use the same
-//!   simplified `matched_lexemes / total_lexemes` formula.
-//! - `ts_headline` fragment selection — returns the full body with matched
-//!   terms wrapped, not PG's cover-density snippet.
+//! - `setweight` per-class weight scoring in `ts_rank` — registered and
+//!   annotates positions, but `ts_rank` treats all weight classes equally.
+//!   PG's A=1.0 / B=0.4 / C=0.2 / D=0.1 weight table is future work.
+//! - `ts_rank_cd` cover-density algorithm — both `ts_rank` and `ts_rank_cd`
+//!   use TF weighting; PG's cover-density variant (proximity of query terms)
+//!   is not implemented.
+//! - `ts_headline` options: `HighlightAll`, `StartSel`, `StopSel` — parsed
+//!   but untested here.  Fragment count > 0 edge cases (e.g., fewer matches
+//!   than MaxFragments) not explicitly pinned.
 //! - Multi-language configs beyond `english` and `simple` — accepted but not
 //!   distinguished.
 //! - `ts_delete` / `ts_filter` / `numnode` precision / `querytree` exact
@@ -824,10 +831,11 @@ async fn websearch_to_tsquery_treated_as_plainto() {
 
 /// ts_rank returns a positive score when the query term is present.
 ///
-/// [FTS-2] NEEDS PSQL VALIDATION — Basin's simplified formula is
-/// matched_lexemes / total_lexemes.  For a doc with 4 distinct lexemes
-/// (quick, brown, fox, jump) and query 'fox', score = 1/4 = 0.25.
-/// PG's BM25 would return a different value.
+/// [FTS-2] NEEDS PSQL VALIDATION — Basin uses term-frequency weighting:
+/// score = matched_term_frequency / total_positions.  For a doc where 'fox'
+/// has 1 position out of 4 total positions (quick, brown, fox, jump), score
+/// = 1/4 = 0.25.  PG uses a weight-class table + damping factor; the sign
+/// and relative ordering match but exact values differ.
 #[tokio::test]
 async fn ts_rank_positive_for_match() {
     basin_common::telemetry::try_init_for_tests();
@@ -900,9 +908,16 @@ async fn ts_rank_deterministic() {
     println!("[fts ts_rank] deterministic across 10 runs: {first} ✓");
 }
 
-/// Higher-frequency term appearance in a document produces a higher rank.
+/// Higher-frequency term appearance produces a STRICTLY higher rank.
 ///
-/// [FTS-3] NEEDS PSQL VALIDATION — exact scores.
+/// Pin change (was: `>=`; now: `>` — the old matched_lexemes/total_lexemes
+/// formula counted distinct lexemes and gave equal scores for 1× and 3×
+/// the same term.  TF weighting fixes this: 3 occurrences = 3× contribution).
+///
+/// [FTS-3] Derivation:
+///   low  doc: 'fox sat river' → fox:1, sat:1, river:1 → total=3, score=1/3
+///   high doc: 'fox chased fox until fox escaped' → chased:1, escap:1,
+///             fox:3 → total=5, score=3/5=0.600 > 0.333 ✓
 #[tokio::test]
 async fn ts_rank_relative_ordering() {
     basin_common::telemetry::try_init_for_tests();
@@ -924,11 +939,51 @@ async fn ts_rank_relative_ordering() {
             to_tsquery('english', 'fox'))",
     )
     .await;
+    // Strict inequality — frequency weighting makes 3× fox score more than 1×.
     assert!(
-        high >= low,
-        "3× 'fox' doc must rank >= 1× 'fox' doc; low={low}, high={high}"
+        high > low,
+        "3× 'fox' doc must rank STRICTLY above 1× 'fox' doc (TF weighting); low={low}, high={high}"
     );
-    println!("[fts ts_rank] relative ordering: high={high} >= low={low} ✓");
+    println!("[fts ts_rank] relative ordering: high={high} > low={low} ✓");
+}
+
+/// A document where a query term appears 5× ranks strictly above one where it
+/// appears 1× with the same overall vocabulary size.
+///
+/// Derivation (TF weighting):
+///   five_doc:  'rust rust rust rust rust python' → rust:5, python:1 →
+///              total_positions=6, score=5/6≈0.833
+///   one_doc:   'rust python java scala haskell elixir' → rust:1, python:1,
+///              java:1, scala:1, haskell:1, elixir:1 →
+///              total_positions=6, score=1/6≈0.167  (old formula: 1/6 too)
+///   five > one ✓
+#[tokio::test]
+async fn ts_rank_frequency_sensitive() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    // Same vocabulary size but very different 'rust' frequency.
+    let one = single_f32(
+        &sess,
+        "SELECT ts_rank(\
+            to_tsvector('english', 'rust python java scala haskell elixir'), \
+            to_tsquery('english', 'rust'))",
+    )
+    .await;
+    let five = single_f32(
+        &sess,
+        "SELECT ts_rank(\
+            to_tsvector('english', 'rust rust rust rust rust python'), \
+            to_tsquery('english', 'rust'))",
+    )
+    .await;
+    assert!(
+        five > one,
+        "5× 'rust' doc must rank strictly above 1× 'rust' doc; one={one}, five={five}"
+    );
+    println!("[fts ts_rank] frequency-sensitive: five={five} > one={one} ✓");
 }
 
 /// ts_rank_cd is non-negative.
@@ -953,13 +1008,19 @@ async fn ts_rank_cd_non_negative() {
 // ts_headline
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Basin's ts_headline wraps matched (positive, non-negated) query terms in
-// <b>…</b> tags using exact-token lowercase comparison.  This is NOT PG's
-// cover-density fragment selection (which returns a snippet; Basin returns
-// the full body).
+// Basin's ts_headline selects the best cover window (MaxWords=35 by default)
+// and highlights matched (positive, non-negated) query terms in <b>…</b>
+// tags.  Short documents that fit within one window are returned in full;
+// longer documents are trimmed to the window with "…" ellipsis at the ends.
+//
+// Pin change (was: "Basin returns the full body with <b> wraps"; now:
+// fragment selection is implemented — the best window of up to MaxWords words
+// containing the most query-term hits is extracted, with leading/trailing
+// ellipsis as needed).
 //
 // [FTS-4] NEEDS PSQL VALIDATION: Basin wraps the original-case token (e.g.
-// '<b>FOX</b>') while PG may highlight the stemmed form.
+// '<b>FOX</b>') while PG highlights the stemmed form.  PG's window score
+// also accounts for cover density; Basin uses a simpler hit-count maximum.
 
 /// ts_headline wraps matched terms in <b>…</b>.
 #[tokio::test]
@@ -1004,7 +1065,11 @@ async fn ts_headline_wraps_matched_terms() {
     println!("[fts ts_headline] wraps matched terms ✓");
 }
 
-/// ts_headline with no matching term returns the body unchanged.
+/// ts_headline with no matching term returns the body with no <b> wrapping.
+///
+/// Pin change (was: exact equality with original body string; now: assert no
+/// <b> present and all non-stopword content words appear, because fragment
+/// selection may adjust whitespace at document edges).
 #[tokio::test]
 async fn ts_headline_no_match_unchanged() {
     basin_common::telemetry::try_init_for_tests();
@@ -1012,17 +1077,101 @@ async fn ts_headline_no_match_unchanged() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let body = "the quick brown fox";
     let got = single_string(
         &sess,
         "SELECT ts_headline('the quick brown fox', to_tsquery('elephant'))",
     )
     .await;
-    assert_eq!(
-        got, body,
-        "ts_headline no-match: body must be unchanged; got={got:?}"
+    // No highlighting must occur.
+    assert!(
+        !got.contains("<b>"),
+        "ts_headline no-match: must not contain <b>; got={got:?}"
     );
-    println!("[fts ts_headline] no-match unchanged ✓");
+    // All content words must be present in the output.
+    for word in &["quick", "brown", "fox"] {
+        assert!(
+            got.contains(word),
+            "ts_headline no-match: output must contain '{word}'; got={got:?}"
+        );
+    }
+    println!("[fts ts_headline] no-match: no <b>, content words present ✓");
+}
+
+/// ts_headline with a long document selects the best window containing the
+/// most query-term hits rather than returning the full body.
+///
+/// Test body (30 words): 8 fill words, then 'fox', then 13 fill words, then
+/// 'wolf', then 6 fill words.  Query: 'fox'.
+/// With MaxWords=10 the best 10-word window is the one centred on 'fox'.
+/// The output must:
+///   (a) contain <b>fox</b>
+///   (b) NOT start with the very first word of the body (window was selected)
+///       OR have an ellipsis at the start indicating truncation.
+#[tokio::test]
+async fn ts_headline_window_selection() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    // 30-word body: 'fox' sits at word-position 9.
+    let body = "one two three four five six seven eight fox nine ten eleven twelve thirteen \
+                fourteen fifteen sixteen seventeen wolf nineteen twenty twentyone twentytwo \
+                twentythree twentyfour twentyfive twentysix twentyseven twentyeight";
+    let sql = format!(
+        "SELECT ts_headline('{body}', to_tsquery('fox'), 'MaxWords=10, MinWords=5')"
+    );
+    let got = single_string(&sess, &sql).await;
+
+    // The matched term must be highlighted.
+    assert!(
+        got.contains("<b>fox</b>"),
+        "ts_headline window: 'fox' must be wrapped in <b>; got={got:?}"
+    );
+    // The window must not include the last word of the 30-word body (wolf is
+    // far away; if the whole body were returned it would appear).
+    let contains_all = got.contains("one") && got.contains("twentyeight");
+    assert!(
+        !contains_all,
+        "ts_headline window: must not return full body (window selection expected); got={got:?}"
+    );
+    println!("[fts ts_headline] window selection: fox highlighted, window trimmed ✓");
+}
+
+/// ts_headline with MaxFragments=2 returns two separate highlighted snippets
+/// separated by the ellipsis "…", one for each query term.
+#[tokio::test]
+async fn ts_headline_max_fragments() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    // 40-word body: 'fox' near position 5, 'wolf' near position 35.
+    let body = "alpha beta gamma delta fox epsilon zeta eta theta iota kappa lambda mu nu xi \
+                omicron pi rho sigma tau upsilon phi chi psi omega one two three four five six \
+                seven eight wolf nine ten eleven twelve thirteen fourteen";
+    let sql = format!(
+        "SELECT ts_headline('{body}', to_tsquery('fox & wolf'), 'MaxFragments=2, MaxWords=8, MinWords=4')"
+    );
+    let got = single_string(&sess, &sql).await;
+
+    // Both terms must be highlighted.
+    assert!(
+        got.contains("<b>fox</b>"),
+        "ts_headline MaxFragments=2: 'fox' must be highlighted; got={got:?}"
+    );
+    assert!(
+        got.contains("<b>wolf</b>"),
+        "ts_headline MaxFragments=2: 'wolf' must be highlighted; got={got:?}"
+    );
+    // The two fragments must be separated by an ellipsis (the gap between
+    // position 5 and position 35 does not fit in one 8-word window).
+    assert!(
+        got.contains('…'),
+        "ts_headline MaxFragments=2: ellipsis must separate fragments; got={got:?}"
+    );
+    println!("[fts ts_headline] MaxFragments=2: both terms highlighted, ellipsis present ✓");
 }
 
 /// ts_headline on NULL body → NULL.
@@ -1058,23 +1207,84 @@ async fn ts_headline_null_safe() {
 // setweight / strip / tsvector_length
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// setweight is NOT registered (Phase 6.X removed it; it is an honest gap).
-/// Must error cleanly, not return a stub value.
+/// setweight annotates every position with the given weight class letter.
+///
+/// Pin change (was: setweight not registered → error; now: setweight is
+/// registered and returns the weight-annotated canonical form).
+/// The tsvector storage format already accepted weight letters in the parser;
+/// setweight adds them on output.  `ts_rank` treats all classes equally
+/// (documented: per-class scoring is future work).
 #[tokio::test]
-async fn setweight_not_registered() {
+async fn setweight_annotates_positions() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let got = single_string(
+        &sess,
+        "SELECT setweight(to_tsvector('english', 'fox runs'), 'A')",
+    )
+    .await;
+    // to_tsvector gives 'fox':1 'run':2.  setweight('A') → 'fox':1A 'run':2A
+    assert!(
+        got.contains("A"),
+        "setweight('A') must add 'A' weight letter; got={got:?}"
+    );
+    assert!(
+        got.contains("1A") || got.contains("2A"),
+        "setweight must annotate position numbers with A; got={got:?}"
+    );
+    println!("[fts setweight] annotates positions with A: {got} ✓");
+}
+
+/// A setweight-annotated tsvector round-trips: @@ match still works because
+/// the parser reads and strips weight letters.
+#[tokio::test]
+async fn setweight_roundtrip_via_parse() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let matched = single_bool(
+        &sess,
+        "SELECT setweight(to_tsvector('english', 'fox runs'), 'B') @@ to_tsquery('english', 'fox')",
+    )
+    .await;
+    assert!(
+        matched,
+        "setweight tsvector must still @@ match original query; got=false"
+    );
+    // strip() on a weighted tsvector removes positions (and weights).
+    let stripped = single_string(
+        &sess,
+        "SELECT strip(setweight(to_tsvector('english', 'quick fox'), 'C'))",
+    )
+    .await;
+    assert!(
+        !stripped.contains(':'),
+        "strip on weighted tsvector must remove position+weight; got={stripped:?}"
+    );
+    println!("[fts setweight] round-trip and strip ✓");
+}
+
+/// setweight with an invalid weight class must return an error.
+#[tokio::test]
+async fn setweight_invalid_class_errors() {
     basin_common::telemetry::try_init_for_tests();
     let dir = TempDir::new().unwrap();
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let r = sess
-        .execute("SELECT setweight(to_tsvector('hello world'), 'A')")
+        .execute("SELECT setweight(to_tsvector('hello world'), 'Z')")
         .await;
     assert!(
         r.is_err(),
-        "setweight is not registered and must error; got={r:?}"
+        "setweight with invalid class 'Z' must error; got={r:?}"
     );
-    println!("[fts setweight] not registered → error ✓");
+    println!("[fts setweight] invalid class → error ✓");
 }
 
 /// strip(tsvector) removes position information, lexemes remain.
