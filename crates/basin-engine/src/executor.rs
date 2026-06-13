@@ -13560,20 +13560,27 @@ fn parse_cutoff_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));
     }
-    // Try common PG formats.
+    // Try common PG formats. `%#z` accepts the colon-less / hours-only
+    // offset forms PG emits (`+00`, `+0000`, `+00:00`); `%:z` only accepts
+    // the colon form, so a bare `+00` literal needs the `%#z` variants.
     let formats: &[&str] = &[
+        "%Y-%m-%d %H:%M:%S%#z",
         "%Y-%m-%d %H:%M:%S%:z",
+        "%Y-%m-%dT%H:%M:%S%#z",
+        "%Y-%m-%dT%H:%M:%S%:z",
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d",
     ];
     for fmt in formats {
-        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
-            return Some(ndt.and_utc());
-        }
-        // chrono parse_from_str with timezone
+        // Offset-aware parse first: `NaiveDateTime::parse_from_str` will happily
+        // consume (and silently discard) a `%#z`/`%:z` offset, yielding a wrong
+        // UTC value, so the timezone-bearing `DateTime` parse must win.
         if let Ok(dt) = DateTime::parse_from_str(s, fmt) {
             return Some(dt.with_timezone(&Utc));
+        }
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(ndt.and_utc());
         }
     }
     // Bare date

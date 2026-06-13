@@ -759,17 +759,26 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));
     }
+    // `%#z` accepts the colon-less / hours-only offset forms (`+00`, `+0000`,
+    // `+00:00`) PG emits; `%:z` only accepts the colon form, so a bare `+00`
+    // literal (e.g. `TIMESTAMP '2024-01-15 10:00:00+00'`) needs `%#z`.
     let formats = &[
+        "%Y-%m-%d %H:%M:%S%#z",
         "%Y-%m-%d %H:%M:%S%:z",
+        "%Y-%m-%dT%H:%M:%S%#z",
+        "%Y-%m-%dT%H:%M:%S%:z",
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S",
     ];
     for fmt in formats {
-        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
-            return Some(ndt.and_utc());
-        }
+        // Offset-aware parse first: `NaiveDateTime::parse_from_str` will happily
+        // consume (and silently discard) a `%#z`/`%:z` offset, yielding a wrong
+        // UTC value, so the timezone-bearing `DateTime` parse must win.
         if let Ok(dt) = DateTime::parse_from_str(s, fmt) {
             return Some(dt.with_timezone(&Utc));
+        }
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(ndt.and_utc());
         }
     }
     if let Ok(nd) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
@@ -933,5 +942,27 @@ mod tests {
             parse_window_bound("TIMESTAMPTZ '2024-01-01 00:00:00+00'"),
             WindowBound::Timestamp("2024-01-01 00:00:00+00".into())
         );
+    }
+
+    #[test]
+    fn parse_ts_accepts_hours_only_offset() {
+        // PG emits a colon-less hours-only offset (`+00`); the bound parser
+        // must accept it as well as the colon and naive forms.
+        let want = chrono::NaiveDate::from_ymd_opt(2024, 1, 15)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap()
+            .and_utc();
+        assert_eq!(parse_ts("2024-01-15 10:00:00+00"), Some(want));
+        assert_eq!(parse_ts("2024-01-15 10:00:00+00:00"), Some(want));
+        assert_eq!(parse_ts("2024-01-15 10:00:00"), Some(want));
+        // A non-zero hours-only offset is normalised to UTC: 10:00 at +02
+        // is 08:00 UTC.
+        let want_offset = chrono::NaiveDate::from_ymd_opt(2024, 1, 15)
+            .unwrap()
+            .and_hms_opt(8, 0, 0)
+            .unwrap()
+            .and_utc();
+        assert_eq!(parse_ts("2024-01-15 10:00:00+02"), Some(want_offset));
     }
 }
