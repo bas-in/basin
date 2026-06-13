@@ -112,6 +112,12 @@ pub struct HnswBuildParams {
     /// `ef_construction` — candidate-list size during build. pgvector default
     /// 64; instant-distance default 100. Consumed by `HnswIndexBuilder`.
     pub ef_construction: Option<u32>,
+    /// `lists` — the IVFFlat coarse-quantiser cell count (pgvector default 100,
+    /// rule-of-thumb `rows / 1000`). Captured here so a `USING ivfflat WITH
+    /// (lists = N)` declaration round-trips through the catalog opclass for
+    /// introspection and feeds `IvfFlatIndexBuilder::build(lists)`. `None` for
+    /// HNSW indexes (the knob is IVFFlat-only).
+    pub lists: Option<u32>,
 }
 
 /// Parse the `WITH (...)` expression list of a `CREATE INDEX … USING hnsw`
@@ -153,10 +159,10 @@ pub fn parse_hnsw_with_params(with: &[Expr]) -> Result<HnswBuildParams> {
             "ef_construction" => {
                 params.ef_construction = Some(parse_positive_param("ef_construction", &value_str)?)
             }
-            // IVFFlat knob — accepted and ignored.
-            "lists" => {
-                let _ = parse_positive_param("lists", &value_str)?;
-            }
+            // IVFFlat coarse-quantiser cell count. Captured (no longer ignored)
+            // so it round-trips through the catalog opclass and drives the
+            // native IVFFlat build.
+            "lists" => params.lists = Some(parse_positive_param("lists", &value_str)?),
             _ => {}
         }
     }
@@ -190,6 +196,9 @@ pub fn encode_vector_opclass(opclass: &str, params: Option<&HnswBuildParams>) ->
         if let Some(ef) = p.ef_construction {
             s.push_str(&format!(";ef_construction={ef}"));
         }
+        if let Some(lists) = p.lists {
+            s.push_str(&format!(";lists={lists}"));
+        }
     }
     s
 }
@@ -213,6 +222,7 @@ pub fn decode_vector_opclass(raw: &str) -> (String, HnswBuildParams) {
         match k.trim() {
             "m" => params.m = v.trim().parse().ok(),
             "ef_construction" => params.ef_construction = v.trim().parse().ok(),
+            "lists" => params.lists = v.trim().parse().ok(),
             _ => {}
         }
     }
@@ -1040,12 +1050,37 @@ mod tests {
         let params = HnswBuildParams {
             m: Some(16),
             ef_construction: Some(64),
+            lists: None,
         };
         let encoded = encode_vector_opclass("vector_cosine_ops", Some(&params));
         assert_eq!(encoded, "vector_cosine_ops;m=16;ef_construction=64");
         let (opclass, decoded) = decode_vector_opclass(&encoded);
         assert_eq!(opclass, "vector_cosine_ops");
         assert_eq!(decoded, params);
+    }
+
+    #[test]
+    fn encode_decode_ivfflat_lists_round_trip() {
+        // The IVFFlat `lists` knob round-trips through the catalog opclass.
+        let params = HnswBuildParams {
+            m: None,
+            ef_construction: None,
+            lists: Some(100),
+        };
+        let encoded = encode_vector_opclass("vector_l2_ops", Some(&params));
+        assert_eq!(encoded, "vector_l2_ops;lists=100");
+        let (opclass, decoded) = decode_vector_opclass(&format!("ivfflat:{encoded}"));
+        assert_eq!(opclass, "vector_l2_ops");
+        assert_eq!(decoded.lists, Some(100));
+    }
+
+    #[test]
+    fn parse_ivfflat_lists_param() {
+        let with = parse_with(
+            "CREATE INDEX i ON t USING ivfflat (embedding vector_l2_ops) WITH (lists = 50)",
+        );
+        let p = parse_hnsw_with_params(&with).unwrap();
+        assert_eq!(p.lists, Some(50));
     }
 
     #[test]
