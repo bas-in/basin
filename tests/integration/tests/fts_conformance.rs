@@ -38,6 +38,12 @@
 //! | `ts_rank_relative_ordering`                          | more term occurrences → strictly higher rank|
 //! | `ts_rank_frequency_sensitive`                        | 5× term scores strictly above 1× term      |
 //! | `ts_rank_cd_non_negative`                            | ts_rank_cd ≥ 0 always                       |
+//! | `ts_rank_cd_cover_density_ordering`                  | tighter cover ranks strictly higher (CD vs TF discriminating)|
+//! | `ts_rank_cd_zero_for_no_match`                       | ts_rank_cd = 0 when query doesn't match     |
+//! | `ts_rank_cd_more_covers_rank_higher`                 | more covers → higher score (accumulation)   |
+//! | `ts_rank_cd_normalization_flag_1_reduces_long_doc`   | norm flag 1: 1+log(doc_len) penalises long docs|
+//! | `ts_rank_cd_normalization_flag_32_saturation`        | norm flag 32: rank/(rank+1) < raw           |
+//! | `ts_rank_cd_phrase_proximity_sensitive`              | adjacent cover > far cover (proximity discriminant)|
 //! | `ts_headline_wraps_matched_terms`                    | ts_headline wraps matched terms in <b>…</b> |
 //! | `ts_headline_window_selection`                       | best window selected from long document     |
 //! | `ts_headline_max_fragments`                          | MaxFragments=2 returns two snippets + "…"   |
@@ -60,9 +66,9 @@
 //! - `setweight` per-class weight scoring in `ts_rank` — registered and
 //!   annotates positions, but `ts_rank` treats all weight classes equally.
 //!   PG's A=1.0 / B=0.4 / C=0.2 / D=0.1 weight table is future work.
-//! - `ts_rank_cd` cover-density algorithm — both `ts_rank` and `ts_rank_cd`
-//!   use TF weighting; PG's cover-density variant (proximity of query terms)
-//!   is not implemented.
+//! - `ts_rank_cd` exact PG damping constant — PG applies an internal 0.1
+//!   per-cover damping; Basin sums 1/cover_length directly.  Relative ordering
+//!   matches; absolute values differ.
 //! - `ts_headline` options: `HighlightAll`, `StartSel`, `StopSel` — parsed
 //!   but untested here.  Fragment count > 0 edge cases (e.g., fewer matches
 //!   than MaxFragments) not explicitly pinned.
@@ -1002,6 +1008,243 @@ async fn ts_rank_cd_non_negative() {
         assert!(s >= 0.0, "ts_rank_cd must be non-negative; got={s} for {sql}");
     }
     println!("[fts ts_rank_cd] non-negative ✓");
+}
+
+/// ts_rank_cd cover-density ordering: a document where the query terms are
+/// CLOSER TOGETHER ranks strictly higher than one where they are farther apart,
+/// even when the TF-rank would give them the same or a reversed score.
+///
+/// Discriminating case (TF would rank them equal; CD disagrees):
+///   tight doc: "fox quick" → fox:1, quick:2 → cover [1,2], length 2 → CD = 1/2 = 0.5
+///   loose doc: "fox one two three four quick" → fox:1, quick:6 → cover [1,6], length 6 → CD = 1/6 ≈ 0.167
+///
+/// TF for both docs with query "fox & quick": each has 1 fox + 1 quick out of
+/// the same total positions → same TF score.  Cover density correctly ranks
+/// the tight doc higher.
+#[tokio::test]
+async fn ts_rank_cd_cover_density_ordering() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    // Tight: fox and quick adjacent (cover length 2).
+    let tight = single_f32(
+        &sess,
+        "SELECT ts_rank_cd(\
+            to_tsvector('english', 'fox quick'), \
+            to_tsquery('english', 'fox & quick'))",
+    )
+    .await;
+
+    // Loose: fox and quick far apart (cover length 6).
+    let loose = single_f32(
+        &sess,
+        "SELECT ts_rank_cd(\
+            to_tsvector('english', 'fox one two three four quick'), \
+            to_tsquery('english', 'fox & quick'))",
+    )
+    .await;
+
+    assert!(
+        tight > loose,
+        "CD: tighter cover [1,2] must rank above loose cover [1,6]; tight={tight}, loose={loose}"
+    );
+    assert!(tight > 0.0, "CD tight score must be positive; got={tight}");
+    assert!(loose > 0.0, "CD loose score must be positive; got={loose}");
+    println!("[fts ts_rank_cd] cover-density ordering: tight={tight} > loose={loose} ✓");
+}
+
+/// ts_rank_cd returns 0 for a non-matching query.
+#[tokio::test]
+async fn ts_rank_cd_zero_for_no_match() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let s = single_f32(
+        &sess,
+        "SELECT ts_rank_cd(\
+            to_tsvector('english', 'quick brown fox'), \
+            to_tsquery('english', 'elephant'))",
+    )
+    .await;
+    assert_eq!(s, 0.0, "ts_rank_cd must be 0 when query doesn't match; got={s}");
+    println!("[fts ts_rank_cd] zero-for-no-match ✓");
+}
+
+/// Multiple covers rank higher than a single cover: a document with MORE
+/// close-together occurrences of the query terms accumulates more 1/cover_len
+/// contributions.
+///
+/// Double: "fox quick fox quick" → covers at [1,2] and [3,4] → CD = 1/2 + 1/2 = 1.0
+/// Single: "fox one quick" → one cover [1,3] length 3 → CD = 1/3 ≈ 0.333
+#[tokio::test]
+async fn ts_rank_cd_more_covers_rank_higher() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let more = single_f32(
+        &sess,
+        "SELECT ts_rank_cd(\
+            to_tsvector('simple', 'fox quick fox quick'), \
+            to_tsquery('simple', 'fox & quick'))",
+    )
+    .await;
+
+    let less = single_f32(
+        &sess,
+        "SELECT ts_rank_cd(\
+            to_tsvector('simple', 'fox one quick'), \
+            to_tsquery('simple', 'fox & quick'))",
+    )
+    .await;
+
+    assert!(
+        more > less,
+        "CD: more covers (double) must rank above single cover; more={more}, less={less}"
+    );
+    println!("[fts ts_rank_cd] more-covers rank higher: more={more} > less={less} ✓");
+}
+
+/// Normalization flag 1 (divide by 1+log(doc_length)) reduces the score for
+/// longer documents.  A longer document with the same cover gets a lower score.
+#[tokio::test]
+async fn ts_rank_cd_normalization_flag_1_reduces_long_doc() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    // Short doc: "fox quick" — 2 positions.
+    let short_unnorm = single_f32(
+        &sess,
+        "SELECT ts_rank_cd(\
+            to_tsvector('simple', 'fox quick'), \
+            to_tsquery('simple', 'fox & quick'), \
+            0::integer)",
+    )
+    .await;
+    let short_norm1 = single_f32(
+        &sess,
+        "SELECT ts_rank_cd(\
+            to_tsvector('simple', 'fox quick'), \
+            to_tsquery('simple', 'fox & quick'), \
+            1::integer)",
+    )
+    .await;
+
+    // Long doc: "fox quick" padded with 20 filler words — same cover density
+    // but much higher doc_length.
+    let long_norm1 = single_f32(
+        &sess,
+        "SELECT ts_rank_cd(\
+            to_tsvector('simple', \
+              'fox quick a b c d e f g h i j k l m n o p q r'), \
+            to_tsquery('simple', 'fox & quick'), \
+            1::integer)",
+    )
+    .await;
+
+    // With flag 1: short_unnorm > short_norm1 (normalization always reduces or equals).
+    assert!(
+        short_unnorm >= short_norm1,
+        "flag 1: normalization must not INCREASE the score; unnorm={short_unnorm}, norm1={short_norm1}"
+    );
+
+    // The long doc has a lower flag-1-normalized score than the short doc with the same cover.
+    assert!(
+        short_norm1 >= long_norm1,
+        "flag 1: shorter doc must score >= longer doc (same cover); short={short_norm1}, long={long_norm1}"
+    );
+
+    println!(
+        "[fts ts_rank_cd] norm flag 1: short_unnorm={short_unnorm}, \
+         short_norm1={short_norm1}, long_norm1={long_norm1} ✓"
+    );
+}
+
+/// Normalization flag 32 (saturation: rank/(rank+1)) produces a score in (0,1)
+/// for any positive raw score and the value is strictly less than the raw.
+#[tokio::test]
+async fn ts_rank_cd_normalization_flag_32_saturation() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let raw = single_f32(
+        &sess,
+        "SELECT ts_rank_cd(\
+            to_tsvector('simple', 'fox quick fox quick fox quick'), \
+            to_tsquery('simple', 'fox & quick'), \
+            0::integer)",
+    )
+    .await;
+    let sat = single_f32(
+        &sess,
+        "SELECT ts_rank_cd(\
+            to_tsvector('simple', 'fox quick fox quick fox quick'), \
+            to_tsquery('simple', 'fox & quick'), \
+            32::integer)",
+    )
+    .await;
+
+    assert!(raw > 0.0, "raw score must be positive; got={raw}");
+    assert!(sat > 0.0, "saturated score must be positive; got={sat}");
+    assert!(
+        sat < raw,
+        "flag 32 (saturation) must produce strictly smaller score; raw={raw}, sat={sat}"
+    );
+    assert!(
+        sat < 1.0,
+        "flag 32 saturation must be < 1.0 for any positive raw; got={sat}"
+    );
+    println!("[fts ts_rank_cd] norm flag 32 saturation: raw={raw}, sat={sat} ✓");
+}
+
+/// ts_rank_cd phrase-proximity: a document where the two query terms are
+/// ADJACENT (cover length 1+1=2) ranks higher than one where they are separated
+/// by multiple words (cover length larger).
+///
+/// This validates that ts_rank_cd is SENSITIVE to term proximity (the defining
+/// property of cover-density vs plain TF ranking).
+#[tokio::test]
+async fn ts_rank_cd_phrase_proximity_sensitive() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    // Adjacent: "dog cat" → dog:1, cat:2 → cover length 2.
+    let adj = single_f32(
+        &sess,
+        "SELECT ts_rank_cd(\
+            to_tsvector('simple', 'dog cat'), \
+            to_tsquery('simple', 'dog & cat'))",
+    )
+    .await;
+
+    // Separated by 5 words: "dog alpha beta gamma delta epsilon cat"
+    // dog:1, cat:7 → cover length 7.
+    let far = single_f32(
+        &sess,
+        "SELECT ts_rank_cd(\
+            to_tsvector('simple', 'dog alpha beta gamma delta epsilon cat'), \
+            to_tsquery('simple', 'dog & cat'))",
+    )
+    .await;
+
+    assert!(
+        adj > far,
+        "CD phrase-proximity: adjacent cover (len 2) must rank above far cover (len 7); adj={adj}, far={far}"
+    );
+    println!(
+        "[fts ts_rank_cd] phrase-proximity: adj={adj} > far={far} ✓"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

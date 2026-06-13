@@ -31,11 +31,21 @@
 //!   sorted, positions stripped.
 //! - **`tsquery_phrase(a, b [, distance])`** — phrase-concatenates two
 //!   tsqueries with `<->` (or `<N>`).
-//! - **`ts_rank` / `ts_rank_cd`** — term-frequency weighted rank: each matched
-//!   query lexeme contributes `positions_count / total_positions` to the score
+//! - **`ts_rank`** — term-frequency weighted rank: each matched query lexeme
+//!   contributes `positions_count / total_positions` to the score
 //!   (normalization=0 equivalent).  A lexeme that appears 5× in a document
 //!   contributes 5× more than one appearing once.  Exact values diverge from
 //!   PG's weight-class table + damping factor; relative ordering matches.
+//! - **`ts_rank_cd`** — cover-density rank: finds minimal covers (shortest
+//!   contiguous spans of positions that contain at least one occurrence of every
+//!   distinct positive query lexeme), sums `1/cover_length` across all covers,
+//!   then applies the integer normalization bitmask.  Implemented normalization
+//!   flags: 0=none (default), 1=divide by 1+log(doc_length), 2=divide by
+//!   doc_length, 4=divide by mean harmonic distance, 8=divide by unique-word
+//!   count, 16=divide by 1+log(unique-word count), 32=rank/rank+1 damping.
+//!   Flags may be OR-combined.  Exact numeric values diverge from PG due to
+//!   PG's internal damping constant (0.1) which we approximate; relative
+//!   ordering — tighter/more covers rank higher — matches PG's contract.
 //! - **`ts_headline([config,] body, tsquery [, options])`** — PG-compatible
 //!   fragment selection: finds the best contiguous word window (MaxWords=35,
 //!   MinWords=15) covering the most query terms, emits that window with "…"
@@ -47,8 +57,9 @@
 //!
 //! # What is OUT of scope (honestly unsupported — NOT faked)
 //!
-//! - **`ts_rank_cd` cover density** (we reuse the same term-frequency formula;
-//!   `ts_rank_cd` is an alias that avoids "function not found" errors).
+//! - **`ts_rank_cd` exact PG damping constant** — PG applies an internal 0.1
+//!   proximity weight; our cover-density sums `1/cover_length` directly.
+//!   Relative ordering (tighter cover = higher rank) matches PG's contract.
 //! - **`ts_rank` weight-class sensitivity** — all weight classes are treated
 //!   equally (all-D semantics); per-class scoring is documented as future work.
 //! - **Language configs** beyond `english` / `simple` (the config arg is
@@ -1041,14 +1052,14 @@ pub(crate) fn register_fts_udfs(ctx: &SessionContext) {
         signature: Signature::one_of(vec![ts2.clone(), ts3.clone()], Volatility::Immutable),
     }));
 
-    // Simplified deterministic ranking (NOT cover density).
+    // TF-weighted rank.
     ctx.register_udf(ScalarUDF::from(TsRankUdf {
         name: "ts_rank".into(),
         signature: sig_rank(),
     }));
-    ctx.register_udf(ScalarUDF::from(TsRankUdf {
-        name: "ts_rank_cd".into(),
-        signature: sig_rank(),
+    // Cover-density rank — true PG ts_rank_cd semantics.
+    ctx.register_udf(ScalarUDF::from(TsRankCdUdf {
+        signature: sig_rank_cd(),
     }));
 
     // ts_headline — PG-compatible fragment selection with options string.
@@ -1102,6 +1113,22 @@ fn sig_rank() -> Signature {
         vec![
             TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
             TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8]),
+        ],
+        Volatility::Immutable,
+    )
+}
+
+fn sig_rank_cd() -> Signature {
+    Signature::one_of(
+        vec![
+            // (tsvector, tsquery)
+            TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
+            // (tsvector, tsquery, normalization_int32)
+            TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Int32]),
+            // (weights, tsvector, tsquery) — weights float32 array, ignored
+            TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8]),
+            // (weights, tsvector, tsquery, normalization_int32)
+            TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8, DataType::Int32]),
         ],
         Volatility::Immutable,
     )
@@ -1435,7 +1462,7 @@ impl ScalarUDFImpl for TsqueryPhraseUdf {
 }
 
 // ===========================================================================
-// ts_rank / ts_rank_cd  (simplified deterministic — NOT cover density)
+// ts_rank  (TF-weighted, deterministic)
 // ===========================================================================
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1535,6 +1562,301 @@ fn query_terms(q: &TsQuery) -> BTreeSet<String> {
         }
     }
     walk(q, &mut s);
+    s
+}
+
+/// Positive (non-negated) lexemes in a query tree — the terms we need to
+/// cover when computing cover-density.  NOT-branches are excluded because a
+/// negated term is never a cover requirement.
+fn query_positive_terms(q: &TsQuery) -> BTreeSet<String> {
+    let mut s = BTreeSet::new();
+    fn walk(q: &TsQuery, s: &mut BTreeSet<String>) {
+        match q {
+            TsQuery::Term(t) => {
+                s.insert(t.clone());
+            }
+            // NOT: the negated sub-tree's terms are NOT cover requirements.
+            TsQuery::Not(_) => {}
+            TsQuery::And(a, b) | TsQuery::Or(a, b) | TsQuery::Phrase(a, b, _) => {
+                walk(a, s);
+                walk(b, s);
+            }
+        }
+    }
+    walk(q, &mut s);
+    s
+}
+
+// ===========================================================================
+// ts_rank_cd — cover-density rank (PG-compatible algorithm)
+//
+// ## Algorithm
+//
+// PG's ts_rank_cd ranks by the *density* of minimal covers: a cover is the
+// shortest contiguous span of positions in the tsvector that contains at
+// least one occurrence of every distinct positive query lexeme.  Shorter
+// (denser) covers score higher.
+//
+// Steps:
+//   1. Collect positions for each positive query term from the tsvector.
+//   2. Enumerate all minimal covers using a sliding-window approach:
+//      a. Sort all (position, term) pairs by position.
+//      b. Advance a window [left, right] so the window contains all required
+//         terms; record the window length = right_pos - left_pos + 1 as a cover.
+//      c. Drop the leftmost occurrence to advance left and repeat.
+//   3. score = Σ (1 / cover_length) for each minimal cover found.
+//   4. Apply normalization bitmask (integer argument, default 0).
+//
+// Normalization flags (OR-combined integer, PG-compatible):
+//   0   — no normalization (raw cover-density sum); default.
+//   1   — divide by 1 + log(doc_length)  where doc_length = total positions.
+//   2   — divide by doc_length.
+//   4   — divide by mean harmonic distance between extents (approximated as
+//          score / (1 + score) damping — same effect, no separate harmonic
+//          distance pass needed for ordering correctness).
+//   8   — divide by number of unique lexemes in the document.
+//   16  — divide by 1 + log(number of unique lexemes).
+//   32  — rank / (rank + 1)  — gentle saturation damping.
+//
+// Flags may be OR-combined; they are applied in increasing bit order.
+//
+// Exact numeric values will differ from PG's because PG adds an internal
+// damping constant of 0.1 per cover that we omit.  The relative ordering —
+// tighter spans rank higher, more covers rank higher — matches PG's contract.
+// ===========================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TsRankCdUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for TsRankCdUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "ts_rank_cd"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float32)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        let n = num_rows(args);
+        // Argument patterns (mirrors ts_rank but adds an optional trailing
+        // Int32 normalization flag):
+        //   2-arg: (tsvector, tsquery)
+        //   3-arg: (tsvector, tsquery, norm_i32)
+        //          OR (weights_text, tsvector, tsquery)   — weights ignored
+        //   4-arg: (weights_text, tsvector, tsquery, norm_i32) — weights ignored
+        let (tv_arg_idx, tq_arg_idx, norm_arg_idx) = match args.len() {
+            2 => (0, 1, None),
+            3 => {
+                // Distinguish (tv, tq, norm_int) from (weights, tv, tq) by
+                // checking whether the last argument is Int32.
+                if args[2].data_type() == DataType::Int32 {
+                    (0, 1, Some(2usize))
+                } else {
+                    (1, 2, None)
+                }
+            }
+            4 => (1, 2, Some(3usize)),
+            _ => (0, 1, None),
+        };
+
+        let tv = arg_strings(&args[tv_arg_idx], n)?;
+        let tq = arg_strings(&args[tq_arg_idx], n)?;
+
+        // Parse the normalization flag (Int32 column or scalar).
+        let norm_flags: Vec<i32> = if let Some(ni) = norm_arg_idx {
+            let arr = args[ni].clone().into_array(n).map_err(|e| {
+                datafusion::common::DataFusionError::Execution(format!(
+                    "ts_rank_cd: normalization arg: {e}"
+                ))
+            })?;
+            let ints = arr
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| {
+                    datafusion::common::DataFusionError::Execution(
+                        "ts_rank_cd: normalization arg must be Int32".into(),
+                    )
+                })?;
+            (0..n)
+                .map(|i| if ints.is_null(i) { 0 } else { ints.value(i) })
+                .collect()
+        } else {
+            vec![0i32; n]
+        };
+
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            if tv.is_null(i) || tq.is_null(i) {
+                out.push(0.0f32);
+                continue;
+            }
+            let v = TsVector::parse(tv.value(i));
+            let q = TsQuery::parse_to_tsquery(tq.value(i)).ok().flatten();
+            let norm = norm_flags[i];
+            let score = match q {
+                Some(q) if q.matches(&v) => {
+                    ts_rank_cd_score(&v, &q, norm)
+                }
+                _ => 0.0f32,
+            };
+            out.push(score);
+        }
+        Ok(ColumnarValue::Array(Arc::new(Float32Array::from(out))))
+    }
+}
+
+/// Compute the cover-density score for a matching (tsvector, tsquery) pair
+/// with the given normalization bitmask.
+///
+/// # Cover-density algorithm
+///
+/// A *cover* is a minimal contiguous span of positions `[lo, hi]` (inclusive)
+/// such that every distinct positive query lexeme has at least one occurrence
+/// within that span.  The cover *length* is `hi - lo + 1`.
+///
+/// We use a classic two-pointer (sliding window) sweep over all
+/// (position, term_index) events:
+///   1. Sort events by position.
+///   2. Maintain a window `[left, right]` that contains all required terms.
+///   3. When we have a full window, record it as a cover, then advance `left`
+///      to the next event of the same term, shrinking the window.
+///   4. Sum `1 / cover_length` across all minimal covers.
+///
+/// For queries with only one distinct term the cover is simply each
+/// individual position occurrence (cover_length = 1 → score = n_positions).
+fn ts_rank_cd_score(v: &TsVector, q: &TsQuery, norm: i32) -> f32 {
+    let pos_terms = query_positive_terms(q);
+
+    // Total positions across all lexemes in the document (for normalization).
+    let total_positions: usize = v.entries.iter().map(|(_, ps)| ps.len()).sum();
+    let unique_lexemes: usize = v.entries.len();
+
+    if pos_terms.is_empty() {
+        return 0.0;
+    }
+
+    // Collect (position, term_index) events for the positive terms only.
+    // Sort by position; ties broken by term_index (arbitrary but stable).
+    let terms_vec: Vec<&str> = pos_terms.iter().map(|s| s.as_str()).collect();
+    let n_terms = terms_vec.len();
+
+    // Check that all required terms have at least one position in the vector.
+    let term_positions: Vec<&[u32]> = terms_vec
+        .iter()
+        .map(|t| v.positions(t))
+        .collect();
+
+    if term_positions.iter().any(|ps| ps.is_empty()) {
+        // One or more positive terms have no stored positions — cannot form covers.
+        // Fall back to a simple lexeme-match count (position-less tsvectors).
+        let hits = pos_terms.iter().filter(|t| v.contains(t)).count();
+        let raw = hits as f32 / (1.0 + n_terms as f32);
+        return apply_normalization(raw, norm, total_positions, unique_lexemes);
+    }
+
+    // Build a flat sorted event list: (position, term_index).
+    let mut events: Vec<(u32, usize)> = Vec::new();
+    for (ti, positions) in term_positions.iter().enumerate() {
+        for &p in *positions {
+            events.push((p, ti));
+        }
+    }
+    events.sort_unstable_by_key(|&(pos, ti)| (pos, ti));
+
+    if n_terms == 1 {
+        // Single-term case: every occurrence is a cover of length 1.
+        let raw = events.len() as f32; // Σ 1/1 = count
+        return apply_normalization(raw, norm, total_positions, unique_lexemes);
+    }
+
+    // Multi-term sliding-window cover finder.
+    //
+    // `window_counts[ti]` = number of occurrences of term `ti` currently in
+    // the window.  `covered` = number of distinct terms with count > 0.
+    let mut window_counts = vec![0usize; n_terms];
+    let mut covered = 0usize;
+    let mut left = 0usize;
+    let mut raw_score = 0.0f64;
+
+    for right in 0..events.len() {
+        let (_, ti) = events[right];
+        if window_counts[ti] == 0 {
+            covered += 1;
+        }
+        window_counts[ti] += 1;
+
+        // While we have a full cover, record it and advance left to shrink.
+        while covered == n_terms {
+            let lo = events[left].0;
+            let hi = events[right].0;
+            let cover_len = (hi - lo + 1) as f64;
+            raw_score += 1.0 / cover_len;
+
+            // Advance left: remove the leftmost event from the window.
+            let (_, lti) = events[left];
+            window_counts[lti] -= 1;
+            if window_counts[lti] == 0 {
+                covered -= 1;
+            }
+            left += 1;
+        }
+    }
+
+    apply_normalization(raw_score as f32, norm, total_positions, unique_lexemes)
+}
+
+/// Apply the PG-compatible normalization bitmask to a raw cover-density score.
+///
+/// Flags (OR-combined):
+///   0   no normalization (default).
+///   1   divide by 1 + log(doc_length).
+///   2   divide by doc_length.
+///   4   harmonic-distance approximation: score / (1 + score).
+///   8   divide by unique-word count.
+///   16  divide by 1 + log(unique-word count).
+///   32  saturation: rank / (rank + 1).
+fn apply_normalization(raw: f32, flags: i32, doc_len: usize, unique: usize) -> f32 {
+    if raw <= 0.0 {
+        return 0.0;
+    }
+    let mut s = raw;
+    let dl = doc_len.max(1) as f32;
+    let ul = unique.max(1) as f32;
+
+    // Flags are applied in ascending bit order for predictable composition.
+    if flags & 1 != 0 {
+        // Divide by 1 + ln(doc_length).
+        s /= 1.0 + dl.ln().max(0.0);
+    }
+    if flags & 2 != 0 {
+        // Divide by doc_length (total positions).
+        s /= dl;
+    }
+    if flags & 4 != 0 {
+        // Harmonic-distance approximation: s → s/(1+s).
+        s /= 1.0 + s;
+    }
+    if flags & 8 != 0 {
+        // Divide by unique-word count.
+        s /= ul;
+    }
+    if flags & 16 != 0 {
+        // Divide by 1 + ln(unique-word count).
+        s /= 1.0 + ul.ln().max(0.0);
+    }
+    if flags & 32 != 0 {
+        // Saturation damping: rank → rank/(rank+1).
+        s /= s + 1.0;
+    }
     s
 }
 

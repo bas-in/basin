@@ -18,9 +18,12 @@
 //! | `gapfill_unbounded_errors`            | no start/finish → typed error                     |
 //! | `gapfill_order_by_bucket`             | ORDER BY bucket yields monotonic grid             |
 //! | `gapfill_empty_input_single_series`   | empty input still fills the full grid w/ NULLs    |
-//! | `gapfill_locf_without_gapfill_errors` | locf alone → typed 0A000                           |
-//! | `gapfill_interpolate_errors`          | interpolate() → typed 0A000                        |
-//! | `gapfill_differential_handcomputed`   | exact expected rows vs hand-computed grid        |
+//! | `gapfill_locf_without_gapfill_errors`         | locf alone → typed 0A000                   |
+//! | `gapfill_interpolate_without_gapfill_errors`  | interpolate alone → typed 0A000            |
+//! | `gapfill_interpolate_mid_gap_linear`          | interpolate: mid-gap linear, trailing NULL |
+//! | `gapfill_interpolate_leading_trailing_null`   | leading/trailing gaps stay NULL            |
+//! | `gapfill_interpolate_and_locf_same_query`     | interpolate + locf coexist per column      |
+//! | `gapfill_differential_handcomputed`           | exact expected rows vs hand-computed grid  |
 
 #![allow(clippy::print_stdout)]
 
@@ -390,31 +393,201 @@ async fn gapfill_locf_without_gapfill_errors() {
     println!("[gapfill locf-alone] typed 0A000 ✓");
 }
 
-/// interpolate() is not supported → typed 0A000.
+/// interpolate() without gapfill → typed 0A000.
 #[tokio::test]
-async fn gapfill_interpolate_errors() {
+async fn gapfill_interpolate_without_gapfill_errors() {
     basin_common::telemetry::try_init_for_tests();
     let dir = TempDir::new().unwrap();
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE gi (ts TIMESTAMPTZ, v DOUBLE PRECISION)").await;
-    exec(&sess, "INSERT INTO gi VALUES ('2024-01-01 00:00:00+00', 1.0)").await;
+    exec(&sess, "CREATE TABLE gi_ng (ts TIMESTAMPTZ, v DOUBLE PRECISION)").await;
+    exec(&sess, "INSERT INTO gi_ng VALUES ('2024-01-01 00:00:00+00', 1.0)").await;
 
+    // interpolate() used without time_bucket_gapfill → error.
     let err = sess
         .execute(
-            "SELECT time_bucket_gapfill('1 hour', ts) AS b, interpolate(AVG(v)) \
-             FROM gi WHERE ts BETWEEN TIMESTAMP '2024-01-01 00:00:00' \
-             AND TIMESTAMP '2024-01-01 02:00:00' GROUP BY b",
+            "SELECT time_bucket('1 hour', ts) AS b, interpolate(AVG(v)) \
+             FROM gi_ng GROUP BY b",
         )
         .await
-        .expect_err("interpolate must error");
+        .expect_err("interpolate without gapfill must error");
     let msg = format!("{err}");
     assert!(
         msg.contains("interpolate"),
-        "expected interpolate-unsupported error, got: {msg}"
+        "expected interpolate-without-gapfill error, got: {msg}"
     );
-    println!("[gapfill interpolate] typed 0A000 ✓");
+    println!("[gapfill interpolate-no-gapfill] typed 0A000 ✓");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// interpolate()
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// interpolate() fills NULL gap-buckets with linear interpolation between the
+/// surrounding non-NULL values.
+///
+/// Hand-computed:
+///   bucket 00:00 → 10.0 (present)
+///   bucket 01:00 → gap → interpolated: 10 + 1/3*(20-10) = 13.333...
+///   bucket 02:00 → gap → interpolated: 10 + 2/3*(20-10) = 16.666...
+///   bucket 03:00 → 20.0 (present)
+///   bucket 04:00 → gap → NULL (trailing: no next value)
+#[tokio::test]
+async fn gapfill_interpolate_mid_gap_linear() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    exec(&sess, "CREATE TABLE ginterp (ts TIMESTAMPTZ, v DOUBLE PRECISION)").await;
+    exec(
+        &sess,
+        "INSERT INTO ginterp VALUES
+         ('2024-01-01 00:10:00+00', 10.0),
+         ('2024-01-01 03:20:00+00', 20.0)",
+    )
+    .await;
+
+    let rows = fetch(
+        &sess,
+        "SELECT time_bucket_gapfill('1 hour', ts) AS b, interpolate(AVG(v)) AS a \
+         FROM ginterp WHERE ts BETWEEN TIMESTAMP '2024-01-01 00:00:00' \
+         AND TIMESTAMP '2024-01-01 04:00:00' GROUP BY b ORDER BY b",
+        false,
+    )
+    .await;
+
+    assert_eq!(rows.bucket_us.len(), 5, "expected 5 buckets (00–04)");
+
+    let vals: Vec<Option<f64>> = rows.agg_f.clone();
+
+    // Bucket 0 (00:00): present → 10.0
+    assert_eq!(vals[0], Some(10.0), "bucket 00:00 must be 10.0");
+
+    // Bucket 3 (03:00): present → 20.0
+    assert_eq!(vals[3], Some(20.0), "bucket 03:00 must be 20.0");
+
+    // Buckets 1 (01:00) and 2 (02:00): interpolated between 10 and 20 over 3 steps.
+    // Step 1/3: 10 + 1/3*(20-10) = 13.333...
+    // Step 2/3: 10 + 2/3*(20-10) = 16.666...
+    let v1 = vals[1].expect("bucket 01:00 must be interpolated (not NULL)");
+    let v2 = vals[2].expect("bucket 02:00 must be interpolated (not NULL)");
+    assert!(
+        (v1 - 10.0 - 10.0 / 3.0).abs() < 1e-6,
+        "bucket 01:00 expected ~13.333, got {v1}"
+    );
+    assert!(
+        (v2 - 10.0 - 20.0 / 3.0).abs() < 1e-6,
+        "bucket 02:00 expected ~16.667, got {v2}"
+    );
+
+    // Bucket 4 (04:00): trailing gap → NULL (no next value).
+    assert_eq!(vals[4], None, "trailing gap bucket 04:00 must be NULL");
+
+    println!(
+        "[gapfill interpolate] mid-gap linear: 10, {:.3}, {:.3}, 20, NULL ✓",
+        v1, v2
+    );
+}
+
+/// interpolate() leading gap stays NULL (no prior observation on the left).
+#[tokio::test]
+async fn gapfill_interpolate_leading_trailing_null() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    exec(&sess, "CREATE TABLE ginterp2 (ts TIMESTAMPTZ, v DOUBLE PRECISION)").await;
+    // Only bucket 02:00 has a value — both the leading and trailing gaps have
+    // no surrounding value on one side.
+    exec(&sess, "INSERT INTO ginterp2 VALUES ('2024-01-01 02:00:00+00', 50.0)").await;
+
+    let rows = fetch(
+        &sess,
+        "SELECT time_bucket_gapfill('1 hour', ts) AS b, interpolate(AVG(v)) AS a \
+         FROM ginterp2 WHERE ts BETWEEN TIMESTAMP '2024-01-01 00:00:00' \
+         AND TIMESTAMP '2024-01-01 03:00:00' GROUP BY b ORDER BY b",
+        false,
+    )
+    .await;
+
+    assert_eq!(rows.bucket_us.len(), 4, "expected 4 buckets (00–03)");
+    let vals: Vec<Option<f64>> = rows.agg_f.clone();
+
+    // Leading: 00:00 and 01:00 → NULL (no left neighbour).
+    assert_eq!(vals[0], None, "leading gap 00:00 must be NULL");
+    assert_eq!(vals[1], None, "leading gap 01:00 must be NULL");
+    // Present: 02:00 → 50.0.
+    assert_eq!(vals[2], Some(50.0), "present 02:00 must be 50.0");
+    // Trailing: 03:00 → NULL (no right neighbour).
+    assert_eq!(vals[3], None, "trailing gap 03:00 must be NULL");
+
+    println!("[gapfill interpolate] leading/trailing NULL ✓");
+}
+
+/// interpolate() and locf() may coexist on different columns in the same query.
+#[tokio::test]
+async fn gapfill_interpolate_and_locf_same_query() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let engine = build_engine(&dir);
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    exec(
+        &sess,
+        "CREATE TABLE ginterp3 (ts TIMESTAMPTZ, a DOUBLE PRECISION, b DOUBLE PRECISION)",
+    )
+    .await;
+    // Values at 00:00 and 02:00; 01:00 is a gap.
+    exec(
+        &sess,
+        "INSERT INTO ginterp3 VALUES
+         ('2024-01-01 00:00:00+00', 0.0, 100.0),
+         ('2024-01-01 02:00:00+00', 20.0, 200.0)",
+    )
+    .await;
+
+    // col a → interpolate; col b → locf.
+    let batches = match sess.execute(
+        "SELECT time_bucket_gapfill('1 hour', ts) AS bkt, \
+         interpolate(AVG(a)) AS ia, locf(AVG(b)) AS lb \
+         FROM ginterp3 WHERE ts BETWEEN TIMESTAMP '2024-01-01 00:00:00' \
+         AND TIMESTAMP '2024-01-01 02:00:00' GROUP BY bkt ORDER BY bkt"
+    ).await {
+        Ok(basin_engine::ExecResult::Rows { batches, .. }) => batches,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    // 3 buckets: 00, 01, 02.
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>().iter().sum();
+    assert_eq!(total_rows, 3, "expected 3 rows");
+
+    // Extract the interpolate(AVG(a)) column (index 1) and locf(AVG(b)) column (index 2).
+    let mut ia_vals: Vec<Option<f64>> = Vec::new();
+    let mut lb_vals: Vec<Option<f64>> = Vec::new();
+    for b in &batches {
+        let ia = b.column(1).as_any().downcast_ref::<Float64Array>();
+        let lb = b.column(2).as_any().downcast_ref::<Float64Array>();
+        for row in 0..b.num_rows() {
+            ia_vals.push(ia.and_then(|a| if a.is_null(row) { None } else { Some(a.value(row)) }));
+            lb_vals.push(lb.and_then(|a| if a.is_null(row) { None } else { Some(a.value(row)) }));
+        }
+    }
+
+    // interpolate(AVG(a)): 0.0 at 00, 10.0 at 01 (mid-point), 20.0 at 02.
+    assert_eq!(ia_vals[0], Some(0.0), "ia bucket 00:00 = 0.0");
+    let ia1 = ia_vals[1].expect("ia bucket 01:00 must be interpolated");
+    assert!((ia1 - 10.0).abs() < 1e-6, "ia bucket 01:00 ≈ 10.0, got {ia1}");
+    assert_eq!(ia_vals[2], Some(20.0), "ia bucket 02:00 = 20.0");
+
+    // locf(AVG(b)): 100.0 at 00, carry 100.0 at 01, 200.0 at 02.
+    assert_eq!(lb_vals[0], Some(100.0), "lb bucket 00:00 = 100.0");
+    assert_eq!(lb_vals[1], Some(100.0), "lb bucket 01:00 = locf 100.0");
+    assert_eq!(lb_vals[2], Some(200.0), "lb bucket 02:00 = 200.0");
+
+    println!("[gapfill interpolate+locf] coexist in same query ✓");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
