@@ -839,6 +839,38 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
                         dim,
                     ))
                 }
+                // pgvector `halfvec(N)` — half-precision (f16) embeddings.
+                // Basin stores halfvec with the SAME f32-backed physical layout
+                // as `vector(N)` (FixedSizeList<Float32>), so every existing
+                // vector path — INSERT coercion (keyed on the Arrow type, not
+                // the keyword), the `<->`/`<=>`/`<#>` distance UDFs, HNSW/IVFFlat
+                // routing, and `vector_dims`/`vector_norm`/`vector_avg` — works
+                // unchanged. PRECISION NOTE: Basin does NOT round-trip through
+                // f16, so it stores full f32 precision rather than truncating to
+                // 10-bit mantissa. Distances are therefore at least as accurate
+                // as pgvector's halfvec (which loses precision on store); the
+                // observable behaviour is identical except Basin never exhibits
+                // f16 rounding artefacts. A native f16 storage form (to halve
+                // on-disk size) is a storage-format-version item, deliberately
+                // deferred to avoid a format break.
+                "HALFVEC" => {
+                    let dim = parse_vector_dim(modifiers)?;
+                    Ok(DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        dim,
+                    ))
+                }
+                // pgvector `sparsevec(N)` — sparse (index,value) embeddings.
+                // Not implemented: the f32-dense `FixedSizeList` layout can't
+                // carry a sparse encoding without a new physical type, and the
+                // distance kernels assume dense slices. Typed 0A000 rather than
+                // a silent dense coercion that would blow up memory on the
+                // high-dimensional sparse vectors sparsevec exists to serve.
+                // Roadmap: a CSR-style child layout + sparse distance kernels.
+                "SPARSEVEC" => Err(BasinError::feature_not_supported(
+                    "sparsevec(N) is not yet implemented; use vector(N) for dense \
+                     embeddings. Sparse storage + distance kernels are roadmap-tracked.",
+                )),
                 // ── Network types ────────────────────────────────────────
                 // INET / CIDR / MACADDR / MACADDR8 take no modifiers.
                 // Arrow physical type: Utf8. Logical type recovered via

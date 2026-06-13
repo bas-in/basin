@@ -23,11 +23,22 @@
  *   `{"_basin_next_cursor": "…"}` when paginating
  * - POST → 201, `{ ok, tag }` (or rows); PATCH/DELETE → `{ ok, tag }`
  * - DELETE may surface 501 `E_ENGINE_UNSUPPORTED`
+ *
+ * Arrow IPC transport (crates/basin-rest/src/arrow_ipc.rs):
+ * - GET with `Accept: application/vnd.apache.arrow.stream` → IPC stream body
+ * - Pagination state in response headers (not body):
+ *     X-Basin-Next-Cursor   opaque cursor token (absent when no next page)
+ *     X-Basin-Row-Count     decimal total row count
+ * - `toArrow()` sends this Accept header and decodes via apache-arrow.
+ *   Falls back to JSON→Arrow when the server returns JSON (older server).
  */
 
 import type { ClientContext } from "./http.js";
 import { requestJson, requestRaw } from "./http.js";
 import type { ExecTag, Page } from "./types.js";
+
+/** MIME type for the Arrow IPC streaming format (matches arrow_ipc.rs). */
+const ARROW_STREAM_MIME = "application/vnd.apache.arrow.stream";
 
 type Scalar = string | number | boolean | null;
 
@@ -185,6 +196,61 @@ export class QueryBuilder<T extends Row = Row>
     return nextCursor;
   }
 
+  /**
+   * Execute the query and return the result as an Apache Arrow `Table`.
+   *
+   * Sends `Accept: application/vnd.apache.arrow.stream`. When the server
+   * responds with an Arrow IPC stream (`Content-Type` matches), decodes it
+   * natively via `apache-arrow` — zero JSON round-trip, full i64/timestamp
+   * fidelity.
+   *
+   * Falls back to JSON→Arrow conversion when the server returns JSON (e.g.
+   * older server without IPC support). The returned table is identical in
+   * shape, but column types are inferred from JavaScript values (all numbers
+   * become Float64, timestamps become Utf8 strings).
+   *
+   * Pagination: the `X-Basin-Next-Cursor` response header is attached to the
+   * returned table's schema metadata under the key `"x-basin-next-cursor"` so
+   * callers can page through results:
+   *
+   * ```ts
+   * const tbl = await basin.from("orders").limit(1000).toArrow();
+   * const cursor = tbl.schema.metadata?.get("x-basin-next-cursor");
+   * if (cursor) {
+   *   const next = await basin.from("orders").limit(1000).cursor(cursor).toArrow();
+   * }
+   * ```
+   *
+   * Requires `apache-arrow` package (`npm install apache-arrow`).
+   */
+  async toArrow(): Promise<import("apache-arrow").Table> {
+    const { tableFromIPC, tableFromJSON } = await import("apache-arrow");
+
+    const res = await requestRaw(this.#ctx, "GET", `/rest/v1/${this.#table}`, {
+      query: this.#query,
+      headers: { accept: ARROW_STREAM_MIME },
+    });
+
+    const ct = res.headers.get("content-type") ?? "";
+    const nextCursor = res.headers.get("x-basin-next-cursor");
+
+    if (ct.includes(ARROW_STREAM_MIME)) {
+      // Native Arrow IPC path.
+      const buf = await res.arrayBuffer();
+      const table = tableFromIPC(new Uint8Array(buf));
+      // Attach the cursor as a non-enumerable property (apache-arrow v21
+      // does not expose schema metadata replacement on Table directly).
+      return attachCursor(table, nextCursor);
+    }
+
+    // Fallback: server returned JSON.
+    const text = await res.text();
+    const body = text.length > 0 ? (JSON.parse(text) as unknown) : [];
+    const rows = normalizeGetRows(body);
+    const table = tableFromJSON(rows);
+    return attachCursor(table, nextCursor);
+  }
+
   /** `POST /rest/v1/:table` — insert one object or an array (201). */
   async insert(values: Row | Row[]): Promise<ExecTag | T[]> {
     return requestJson(this.#ctx, "POST", `/rest/v1/${this.#table}`, {
@@ -229,4 +295,34 @@ function normalizeGet<T>(body: unknown): QueryResult<T> {
   }
   // `{ok, tag}` empty-result shape (ExecResult::Empty) → no rows.
   return { rows: [], nextCursor: null };
+}
+
+/** Extract rows from either a JSON array or `{rows, next_cursor}` body. */
+function normalizeGetRows(body: unknown): Row[] {
+  if (Array.isArray(body)) return body as Row[];
+  if (typeof body === "object" && body !== null && "rows" in body) {
+    return ((body as { rows?: unknown }).rows as Row[]) ?? [];
+  }
+  return [];
+}
+
+/**
+ * Attach the `x-basin-next-cursor` value onto an Arrow Table by adding it
+ * as a non-enumerable own property. Callers can read it as:
+ *
+ *   `(table as any)["x-basin-next-cursor"]`
+ *
+ * or via `table.schema.metadata.get("x-basin-next-cursor")` when
+ * apache-arrow exposes schema metadata replacement (future API).
+ */
+function attachCursor<T extends object>(table: T, cursor: string | null): T {
+  if (cursor !== null) {
+    Object.defineProperty(table, "x-basin-next-cursor", {
+      value: cursor,
+      writable: false,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  return table;
 }

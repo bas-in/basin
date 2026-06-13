@@ -129,6 +129,8 @@ async fn views_lists_materialized_views() {
         refresh_interval_secs: 60,
         last_refreshed_at_unix_ms: None,
         last_bucket_max_unix_ms: None,
+        timescaledb: false,
+        cagg_policy: None,
     };
     cat.set_continuous_aggregate(&t, &name("daily_totals"), Some(cv))
         .await
@@ -259,6 +261,8 @@ async fn cross_project_isolation_views() {
             refresh_interval_secs: 60,
             last_refreshed_at_unix_ms: None,
             last_bucket_max_unix_ms: None,
+            timescaledb: false,
+            cagg_policy: None,
         }),
     )
     .await

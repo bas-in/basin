@@ -30,6 +30,8 @@ fn make_cv(source: &str) -> CvDef {
         refresh_interval_secs: 60,
         last_refreshed_at_unix_ms: None,
         last_bucket_max_unix_ms: None,
+        timescaledb: false,
+        cagg_policy: None,
     }
 }
 

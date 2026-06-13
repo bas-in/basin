@@ -8,6 +8,74 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-13 — PostGIS general 2-D geometry SQL surface
+
+### Added
+
+- **General 2-D geometry types in SQL.** `LINESTRING`, `POLYGON` (with holes),
+  `MULTIPOINT`, `MULTILINESTRING`, `MULTIPOLYGON`, and `GEOMETRYCOLLECTION` are
+  now first-class values across the `ST_*` surface, backed by variable-length
+  WKB/EWKB/WKT/GeoJSON codecs in `basin-geo::geometry` (over `geo_types`).
+  Constructors `ST_GeomFromText` / `ST_GeomFromGeoJSON` / `ST_GeomFromWKB` and
+  output codecs `ST_AsText` / `ST_AsGeoJSON` / `ST_AsEWKB` accept and emit every
+  type. Accessors/measures: `ST_GeometryType`, `ST_NumPoints`,
+  `ST_NumGeometries`, `ST_GeometryN`, `ST_PointN`, `ST_StartPoint`/`ST_EndPoint`/
+  `ST_ExteriorRing`, `ST_Length`/`ST_Area`/`ST_Perimeter` (planar + WGS84
+  `geography` variants), `ST_Centroid`, `ST_Envelope`. Predicates
+  `ST_Intersects` / `ST_Contains` / `ST_Within` use the `geo` crate's exact
+  planar topology traits — not bbox approximations. The fixed-21-byte `POINT`
+  fast path is unchanged; only `POINT` has a native column DDL type and an
+  R-tree index, so general geometries ride as `BYTEA`/WKB values.
+- Conformance: `tests/integration/tests/postgis_conformance.rs` grows a
+  general-geometry group (WKT/GeoJSON/WKB/EWKB round-trips, hand-computed
+  `ST_Length`/`ST_Area`/`ST_Centroid`/`ST_Envelope`, multipart accessors,
+  exact point-in-polygon and segment-intersection truth cases, NULL/empty
+  handling, invalid-WKB typed errors). 58 tests, 0 ignored.
+
+### Fixed
+
+- `ST_AsGeoJSON` emitted object keys alphabetically (`coordinates` before
+  `type`) on the general path because the geometry was round-tripped through a
+  `serde_json::Value` (BTreeMap); the envelope is now assembled type-first to
+  match PostGIS.
+- `ST_NumPoints` resolved to the POINT-only UDF and always returned 1; it now
+  counts every vertex for `LINESTRING`/`POLYGON`/`MULTI*` (a `POINT` still
+  reports 1).
+- `ST_GeometryN` / `ST_PointN` rejected `Int64` index literals (sqlparser's
+  default integer width) with a coercion error; both now accept `Int32` and
+  `Int64`, mirroring `ST_SetSRID` / `ST_Transform`.
+
+## 2026-06-13 — Native IVFFlat, vector_avg aggregate, f32-backed halfvec
+
+### Added
+
+- **Native IVFFlat vector index.** `basin-vector::IvfFlatIndex` implements a
+  real coarse quantiser: deterministic Lloyd k-means partitions vectors into
+  `lists` cells, and a query probes the `probes` nearest cells (default 1,
+  matching pgvector's `ivfflat.probes`) then exact-ranks the gathered
+  candidates. `CREATE INDEX … USING ivfflat (col <opclass>) WITH (lists = N)`
+  is accepted and the `lists` knob round-trips through the catalog opclass.
+  Approximate by design — candidates are exact-ranked so the returned rows are
+  exactly ordered among those retrieved; recall is a quality metric that rises
+  with `probes`, not a correctness gate (same ANN tradeoff as HNSW). Measured
+  recall@10 on a seeded clustered set: probes=1 ≈ 0.90, probes=4 = 1.00,
+  all-cells = 1.00 (exhaustive → exact). Unit-tested in `basin-vector`
+  (`ivfflat::tests`); SQL surface + brute-force equality pinned in
+  `vector_conformance.rs` (group 15).
+- **`vector_avg(v)` aggregate.** Element-wise mean of `vector(N)` values, with
+  PostgreSQL aggregate semantics: NULL inputs skipped, zero non-NULL rows →
+  NULL, dimension mismatch is a hard error. f64 accumulation, f32 result,
+  GROUP BY supported. Registered as `vector_avg` only (not `avg`, which would
+  shadow numeric AVG in DataFusion's name-keyed UDAF registry).
+- **`halfvec(N)` column type (f32-backed).** Accepted and round-trips like
+  `vector(N)`; stored with the same `FixedSizeList<Float32>` layout so every
+  vector path (INSERT coercion, distance ops, HNSW/IVFFlat routing,
+  `vector_dims`/`vector_norm`/`vector_avg`) works unchanged. Precision note:
+  Basin keeps full f32 precision rather than pgvector's f16 truncation, so
+  distances are at least as accurate. Native f16 on-disk storage (to halve
+  segment size) is deferred to avoid a storage-format break. `sparsevec(N)`
+  remains a typed `0A000` (no silent dense coercion).
+
 ## 2026-06-13 — Change events from hot-tier UPDATE/DELETE fast paths (CDC/realtime)
 
 ### Fixed

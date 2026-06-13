@@ -1469,6 +1469,19 @@ impl ProjectSession {
         crate::prepared::execute_bound(self, bound).await
     }
 
+    /// Run a continuous aggregate's refresh policy once, on demand. Refreshes
+    /// the window `[now()-start_offset, now()-end_offset]` declared by
+    /// `add_continuous_aggregate_policy`. Returns `true` if the named cagg has
+    /// a policy that was run, `false` if it has none (or is not a cagg).
+    ///
+    /// This is the deterministic driver the background CV refresher calls per
+    /// tick; exposing it lets ops force a refresh and lets tests trigger a
+    /// policy without waiting on wall-clock scheduling. Mirrors the
+    /// `run_retention_policy` on-demand path for hypertable retention.
+    pub async fn run_continuous_aggregate_policy(&self, cagg: &str) -> Result<bool> {
+        crate::cagg::run_cagg_policy(self, cagg).await
+    }
+
     /// Return the schema cached at [`prepare`](Self::prepare) time.
     pub async fn describe_statement(&self, handle: &StatementHandle) -> Result<StatementSchema> {
         crate::prepared::describe_statement(self, handle).await
@@ -1561,6 +1574,7 @@ mod constraints;
 mod constraint_union;
 mod convert;
 mod cost_check;
+mod cagg;
 mod cron_glue;
 mod cursor;
 mod cv_ddl;

@@ -1721,6 +1721,19 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         return exec_compress_chunk(sess, intent).await;
     }
 
+    // ── Continuous aggregates: refresh_continuous_aggregate(cagg, start, end) ─
+    // Re-runs the cagg's defining query for the window and upserts the
+    // materialised rows. Maps onto the basin.continuous CV engine.
+    if let Some(intent) = crate::cagg::match_refresh_continuous_aggregate(raw_sql) {
+        return crate::cagg::exec_refresh_continuous_aggregate(sess, &intent).await;
+    }
+
+    // ── Continuous aggregates: add_continuous_aggregate_policy(…) ─────────────
+    // Stamps a refresh policy on the cagg's CvDef (mirrors add_retention_policy).
+    if let Some(intent) = crate::cagg::match_add_continuous_aggregate_policy(raw_sql) {
+        return crate::cagg::exec_add_continuous_aggregate_policy(sess, &intent).await;
+    }
+
     // ── Phase 5.29.G: SELECT time_bucket_gapfill(…) [+ locf(…)] ──────────────
     // Detect a gapfill query, run a rewritten (gapfill→time_bucket, locf
     // unwrapped) form through the normal SELECT path, then densify the result
@@ -2434,19 +2447,28 @@ async fn dispatch_parsed_statement(
                 let opts = cv_options.unwrap_or_default();
                 let source_sql = query.to_string();
                 if opts.continuous {
-                    // Continuous-aggregate path: requires refresh_interval.
-                    let interval = opts.refresh_interval_secs.ok_or_else(|| {
-                        BasinError::InvalidSchema(
-                            "CREATE MATERIALIZED VIEW: WITH (basin.continuous) \
-                             requires refresh_interval = '<duration>'"
-                                .into(),
-                        )
-                    })?;
+                    // Continuous-aggregate path. The native `basin.continuous`
+                    // form requires an inline `refresh_interval`; the
+                    // TimescaleDB form (`timescaledb.continuous`) sets the
+                    // cadence separately via add_continuous_aggregate_policy,
+                    // so the interval is optional there (0 = manual/policy).
+                    let interval = match opts.refresh_interval_secs {
+                        Some(s) => s,
+                        None if opts.timescaledb => 0,
+                        None => {
+                            return Err(BasinError::InvalidSchema(
+                                "CREATE MATERIALIZED VIEW: WITH (basin.continuous) \
+                                 requires refresh_interval = '<duration>'"
+                                    .into(),
+                            ));
+                        }
+                    };
                     crate::cv_ddl::exec_create_materialized_view(
                         sess,
                         &view_name,
                         &source_sql,
                         interval,
+                        opts.timescaledb,
                     )
                     .await
                 } else {
@@ -4634,14 +4656,26 @@ async fn exec_create_index(
             None
         };
 
-    // Log IVFFlat fallback notice.
+    // Log IVFFlat acceptance notice.
+    //
+    // ── BASIN IVFFLAT EXECUTOR HUNK (vector index DDL acceptance) ──────────────
+    // Basin ships a native IVFFlat coarse-quantiser (k-means partitioning into
+    // `lists` cells + `probes`-nearest-cell scan) in `basin-vector::IvfFlatIndex`.
+    // The CREATE INDEX declaration is persisted under access_method "hnsw" with
+    // an `ivfflat:`-prefixed opclass so the vector planner routes `ORDER BY <->
+    // LIMIT k` through Basin's ANN fast path; the physical sidecar shares the
+    // ANN-segment substrate with HNSW. Both are approximate by design (recall is
+    // a quality metric, not a correctness gate) and both exact-rank the retrieved
+    // candidates, so returned rows are exactly ordered. The `lists` build knob is
+    // captured in the catalog opclass for introspection + round-trip.
     if access_method_str == "ivfflat" {
         tracing::info!(
             index = %index_name,
             table = %table_name,
-            "CREATE INDEX USING ivfflat accepted; Basin maps IVFFlat to the HNSW \
-             implementation as a documented fallback (Phase 5.26.E). Queries use \
-             the HNSW fast path. A native IVFFlat implementation is roadmap-tracked."
+            "CREATE INDEX USING ivfflat accepted; Basin's native IVFFlat coarse \
+             quantiser (lists cells + ivfflat.probes nearest-cell scan) serves the \
+             ANN fast path. Approximate by design — exact-ranked candidates, recall \
+             rises with probes (pgvector-compatible semantics)."
         );
     }
 
@@ -13760,20 +13794,27 @@ fn parse_cutoff_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));
     }
-    // Try common PG formats.
+    // Try common PG formats. `%#z` accepts the colon-less / hours-only
+    // offset forms PG emits (`+00`, `+0000`, `+00:00`); `%:z` only accepts
+    // the colon form, so a bare `+00` literal needs the `%#z` variants.
     let formats: &[&str] = &[
+        "%Y-%m-%d %H:%M:%S%#z",
         "%Y-%m-%d %H:%M:%S%:z",
+        "%Y-%m-%dT%H:%M:%S%#z",
+        "%Y-%m-%dT%H:%M:%S%:z",
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d",
     ];
     for fmt in formats {
-        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
-            return Some(ndt.and_utc());
-        }
-        // chrono parse_from_str with timezone
+        // Offset-aware parse first: `NaiveDateTime::parse_from_str` will happily
+        // consume (and silently discard) a `%#z`/`%:z` offset, yielding a wrong
+        // UTC value, so the timezone-bearing `DateTime` parse must win.
         if let Ok(dt) = DateTime::parse_from_str(s, fmt) {
             return Some(dt.with_timezone(&Utc));
+        }
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(ndt.and_utc());
         }
     }
     // Bare date

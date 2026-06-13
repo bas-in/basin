@@ -3,8 +3,10 @@
 TypeScript client for [Basin](../../README.md)'s HTTP surfaces: REST data
 API, auth, realtime (WebSocket), functions, and object storage.
 
-- **Zero runtime dependencies** — built on the WHATWG `fetch` and `WebSocket`
-  standards (Node 18+, Deno, Bun, browsers). Both are injectable for tests.
+- **One optional runtime dependency** — `apache-arrow` is a peer dependency
+  required only for `toArrow()` (`npm install apache-arrow`). All other
+  surfaces are built on the WHATWG `fetch` and `WebSocket` standards (Node 18+,
+  Deno, Bun, browsers). Both are injectable for tests.
 - **Derived from the server code, not invented** — every binding cites the
   Rust route it talks to. What isn't bound yet is listed at the bottom.
 
@@ -42,6 +44,15 @@ const channel = await basin.realtime.subscribe(
   { filter: "NEW.status = 'paid'" },
 );
 await channel.unsubscribe();
+
+// Arrow IPC — native columnar transport (requires: npm install apache-arrow)
+const table = await basin.from("events").eq("status", "active").limit(1000).toArrow();
+console.log(table.numRows, table.schema.fields.map((f) => f.name));
+// Paginate via the cursor attached to the table.
+const cursor = (table as any)["x-basin-next-cursor"] as string | undefined;
+if (cursor) {
+  const page2 = await basin.from("events").limit(1000).cursor(cursor).toArrow();
+}
 
 // Storage
 await basin.storage.createBucket("avatars", { public: true });
@@ -207,6 +218,7 @@ await basin.auth.unenrollFactor(factorId);
 | `auth.verifyChallenge` | `POST /auth/v1/factors/:id/challenge/verify` | `server.rs:298` |
 | `auth.unenrollFactor` | `DELETE /auth/v1/factors/:id` | `server.rs:302` |
 | `from(t)` GET (`select/eq/.../order/limit/offset/cursor/stream`) | `GET /rest/v1/:table` | `server.rs:243-249`, grammar `parser.rs` |
+| `from(t).toArrow()` | `GET /rest/v1/:table` with `Accept: application/vnd.apache.arrow.stream` | `crates/basin-rest/src/arrow_ipc.rs` |
 | `from(t).insert` | `POST /rest/v1/:table` (201) | `server.rs:246`, `routes/data.rs` |
 | `from(t).update` | `PATCH /rest/v1/:table?filters` | `server.rs:247` |
 | `from(t).delete` | `DELETE /rest/v1/:table?filters` (may 501) | `server.rs:248`, `data.rs:delete_table` |
@@ -236,6 +248,24 @@ selects, or `Prefer` headers; filters always AND together.
   `unsubscribed`, `error` (`lag` / `invalid_filter`), `gap` (replay-ring
   eviction — cold re-sync needed), `presence_state` / `presence_diff`.
 - Pass `lastEventId` on subscribe to replay events missed while disconnected.
+
+### Arrow IPC details
+
+`toArrow()` sends `Accept: application/vnd.apache.arrow.stream` and decodes
+the IPC response using [`apache-arrow`](https://arrow.apache.org/docs/js/). The
+returned [`Table`](https://arrow.apache.org/docs/js/classes/Apache_Arrow_v18.Table.html)
+exposes typed columnar access.
+
+When the server does not support Arrow IPC (older server or 406 response), the
+method falls back to JSON and converts with `tableFromJSON`. Column types will
+be inferred as Float64/Utf8 instead of the server's native types in the fallback
+path.
+
+Pagination: `X-Basin-Next-Cursor` is attached to the returned table as the
+non-enumerable own property `"x-basin-next-cursor"`. Read it as:
+```ts
+const cursor = (table as any)["x-basin-next-cursor"] as string | undefined;
+```
 
 ## Not bound yet (gap list)
 
