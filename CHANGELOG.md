@@ -89,7 +89,7 @@ that follow. Grouped by area.
 
 The following items from the "what landed this program" brief are **partial or absent** on main at time of writing, and are noted honestly:
 
-- **TimescaleDB `interpolate()`**: `timescale_gapfill.rs` documents `interpolate()` returns typed `0A000` — the gap is tested and honest-rejected, not silently broken.
+- **`gen types` multi-language codegen** lives in the separate `basin-cli` repo (not this checkout) and now covers all 10 SDK languages — noted here for cross-reference. (TimescaleDB `interpolate()` shipped — linear fill between non-NULL buckets, see the Extensions section above.)
 - **CDC pgoutput / logical replication protocol**: `cdc_pgoutput_harness.rs` is a test-first gate; all slices `#[ignore]`-gated. Debezium/Fivetran e2e requires external connectors and is integration-env-gated.
 - **Hypertable auto-partition (5.29.B–F)**: `hypertable_harness.rs` slices are `#[ignore]`-gated; `create_hypertable` DDL is accepted and the basic conformance group (conformance.rs) is live, but the full auto-partition / chunk-exclusion / ORM-compat slices are pending.
 - **`sparsevec(N)` / vector `bit`**: typed `0A000` by design (ADR 0003). Not planned for v0.1.
