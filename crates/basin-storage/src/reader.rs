@@ -224,6 +224,20 @@ pub(crate) async fn list_data_files_with_stats(
     let cache = storage.parquet_meta_cache().clone();
     let stats_cache = storage.data_file_stats_cache().clone();
 
+    // LEVER 1 / A4: catalog-persisted file stats. The catalog already records
+    // `(row_count, column_stats)` per file at write-commit time (A4), in the
+    // same byte shape this function would otherwise extract from the footer.
+    // Seed those in up front so a file the catalog already knows about NEVER
+    // pays the footer GET — the dominant cold-path round-trip on an S3
+    // backend (~10 ms RTT/file). Files the catalog has no stats for (written
+    // pre-A4, or whose `column_stats` is empty) are simply absent from this
+    // map and fall through to the footer path below — a strict optimisation,
+    // never a correctness regression. We also warm the in-RAM stats cache so
+    // a same-process repeat listing of a pre-A4 file (footer-fetched once)
+    // still benefits, and a catalog-known file needs no catalog round-trip on
+    // the warm path either.
+    let catalog_stats = storage.catalog_file_stats(project, table).await;
+
     // Stats-cache fast path. `(row_count, column_stats)` is what every caller
     // of this function actually consumes; once we've extracted it for a file
     // (write-once, immutable) we never need to touch the file's bytes again.
@@ -237,6 +251,15 @@ pub(crate) async fn list_data_files_with_stats(
             let (rows, stats) = cached.as_ref();
             f.row_count = *rows;
             f.column_stats = stats.clone();
+        } else if let Some((rows, stats)) = catalog_stats.get(f.path.as_ref()) {
+            // Catalog already carries this file's stats — skip the footer GET.
+            f.row_count = *rows;
+            f.column_stats = stats.clone();
+            stats_cache.insert(
+                f.path.clone(),
+                f.size_bytes,
+                Arc::new((*rows, stats.clone())),
+            );
         } else {
             needs_stats.push(i);
         }

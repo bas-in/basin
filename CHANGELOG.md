@@ -849,6 +849,17 @@ v0.1.3.
 - **FileMetadataCache wired into RuntimeEnv** — eliminates per-iteration
   footer re-parse.
 - **VortexFooterCache** — skips per-file footer re-parse on hot shapes.
+- **Catalog-stats cold-path footer skip (A4 wiring)** — the cold-path
+  lister (`list_data_files_with_stats`) now seeds each file's
+  `(row_count, column_stats)` from the catalog `DataFileRef` the engine
+  already persists at flush/compact time, and SKIPS the per-file Parquet
+  footer range-GET / Vortex tail-GET entirely when those stats are present.
+  On an S3 backend (~10 ms RTT/file) the footer round-trips dominate cold
+  latency; eliminating them collapses the per-query footer fan-out to an
+  in-RAM catalog lookup. Files written before A4 (empty catalog stats) fall
+  back to the footer path per-file — a strict optimisation, never a
+  correctness regression. The catalog-stats prune is byte-identical to the
+  footer-stats prune (differential-tested in `read_stats_pruning`).
 
 ### Added — Performance fast paths (#161, #162)
 - **Metadata-only aggregate fast path (~30-40×)** — bare COUNT/SUM/MIN/MAX
