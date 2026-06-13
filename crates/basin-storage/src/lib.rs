@@ -990,6 +990,52 @@ impl Storage {
         }
     }
 
+    /// Per-file stats the catalog already persists for `(project, table)`,
+    /// keyed by object path. Phase 5.7 A4 lifted `(row_count, column_stats)`
+    /// up into [`basin_catalog::DataFileRef`] at write-commit time; this
+    /// surfaces them to the cold-path lister so it can SKIP the per-file
+    /// Parquet/Vortex footer GET when the catalog already knows a file's
+    /// stats — the dominant cold-path round-trip on an S3 backend.
+    ///
+    /// Only files whose catalog row carries non-empty `column_stats` are
+    /// returned. A file written before A4 (empty `column_stats`) is omitted,
+    /// so the lister still fetches its footer — a strict optimisation, never
+    /// a correctness regression. The `(row_count, column_stats)` shape is
+    /// byte-identical to what `decode_file_stats` / the Vortex footer reader
+    /// produce, so a catalog-stats prune is the same file set as a
+    /// footer-stats prune (the Vortex⇆Parquet differential harness gates it).
+    ///
+    /// Returns an empty map when no catalog is attached or the table is
+    /// unknown — the lister then falls through to the footer path exactly as
+    /// before.
+    pub(crate) async fn catalog_file_stats(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> std::collections::HashMap<String, (u64, std::collections::BTreeMap<String, ColumnStats>)>
+    {
+        let Some(catalog) = self.inner.catalog.get() else {
+            return std::collections::HashMap::new();
+        };
+        let meta = match catalog.load_table(project, table).await {
+            Ok(m) => m,
+            Err(_) => return std::collections::HashMap::new(),
+        };
+        let mut out = std::collections::HashMap::new();
+        for f in meta.live_data_files() {
+            // A file with no recorded column stats predates A4 (or was
+            // written without stats); omit it so the footer path still runs.
+            // Note: `row_count` alone is not enough to skip the footer for a
+            // file that a predicate query needs to prune by min/max, so we
+            // gate on `column_stats` being present.
+            if f.column_stats.is_empty() {
+                continue;
+            }
+            out.insert(f.path, (f.row_count, f.column_stats));
+        }
+        out
+    }
+
     pub(crate) fn project_counters(
         &self,
         project: &ProjectId,
