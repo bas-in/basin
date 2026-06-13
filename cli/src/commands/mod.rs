@@ -29,7 +29,10 @@ pub mod erd;
 pub mod extensions;
 pub mod functions;
 pub mod gen;
+pub mod explain;
 pub mod help;
+pub mod index_advisor;
+pub mod inbound_webhooks;
 pub mod init;
 pub mod invitations;
 pub mod link;
@@ -47,6 +50,7 @@ pub mod pgwire;
 pub mod projects;
 pub mod queries;
 pub mod realtime;
+pub mod replication_slots;
 pub mod rls;
 pub mod rows;
 pub mod rpc;
@@ -323,6 +327,21 @@ pub fn all() -> Vec<Entry> {
             "oauth-apps",
             "Manage org OAuth applications (clients).",
             oauth_apps::cmd_oauth_apps
+        ),
+        entry!(
+            "explain",
+            "Run EXPLAIN [ANALYZE] on a SQL statement via the cloud proxy.",
+            explain::cmd_explain
+        ),
+        entry!(
+            "index-advisor",
+            "Show JSONB index recommendations for the project's tables.",
+            index_advisor::cmd_index_advisor
+        ),
+        entry!(
+            "replication-slots",
+            "List / create / drop logical replication slots (CDC / Debezium).",
+            replication_slots::cmd_replication_slots
         ),
         entry!(
             "docs",
