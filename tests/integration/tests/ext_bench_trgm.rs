@@ -13,11 +13,14 @@
 //!   * `a <-> b` → `1.0 - similarity(a,b)` (trigram distance; ORDER BY nearest)
 //!   * `SET / SHOW pg_trgm.similarity_threshold`
 //!
-//! Basin has NO trigram-GIN index today: every `%` / `<->` query is a
-//! sequential scan over the column. That is the *point* of the head-to-head:
-//! PG WITH a `gin_trgm_ops` index is the honest gap number that motivates a
-//! future trigram-GIN storage segment, and PG WITHOUT the index is the
-//! apples-to-apples sequential-scan comparison.
+//! Basin now builds a `gin_trgm_ops` trigram GIN index, so `%` filter queries
+//! (T2/T3) are index-backed: the trigram posting list prunes to candidate
+//! files/rows and the `similarity()` predicate rechecks. The card records
+//! `basin_uses_index` (runtime-probed against the live posting registry) so the
+//! head-to-head is honest: PG WITH a `gin_trgm_ops` index vs Basin WITH its
+//! trigram GIN, plus PG WITHOUT the index for the apples-to-apples scan
+//! comparison. `<->` ORDER BY (T4) stays a sequential scan on Basin
+//! (index-assisted trigram kNN is not implemented).
 //!
 //! ## Shapes (cards)
 //!   T1 similarity() projection over N strings (pure scalar throughput)
@@ -186,8 +189,29 @@ async fn ext_bench_trgm() {
     }
     eprintln!("[ext_bench_trgm] basin seed complete");
 
-    // Basin has no trigram-GIN segment; sequential scan throughout.
-    let basin_uses_index = false;
+    // Build the trigram GIN index so `%` queries can be index-backed. CREATE
+    // INDEX backfills the cold files' trigram postings (same extraction as
+    // similarity()). Best-effort: a failure leaves the sequential-scan path.
+    let trgm_index_built = sess
+        .execute("CREATE INDEX people_trgm ON people USING gin (name gin_trgm_ops)")
+        .await
+        .is_ok();
+
+    // Runtime probe: did the index actually ENGAGE? The file-level trigram
+    // posting list seals every live file it backfilled into the registry's
+    // indexed-files set. A non-empty set means the index is resident and the
+    // `%` probe path can prune — record it per shape (PG-style `basin_uses_index`
+    // truth), keeping the sequential-scan fallback honest when it is empty.
+    let basin_uses_index = trgm_index_built && {
+        use basin_common::TableName;
+        let table = TableName::new("people").unwrap();
+        !instance
+            .engine
+            .gin_index_registry_for_test()
+            .indexed_files_for(&instance.project, &table, "name")
+            .is_empty()
+    };
+    eprintln!("[ext_bench_trgm] trgm index built={trgm_index_built} engaged={basin_uses_index}");
 
     // ── SQL shapes ─────────────────────────────────────────────────────────
     let t1_sql = "SELECT count(*) FROM people WHERE similarity(name, 'alice smith') > 0.0";
@@ -420,6 +444,7 @@ async fn ext_bench_trgm() {
             {
                 "label": "T2: % filter — rare needle (low selectivity)",
                 "basin_p50_ms": opt_ms(t2_b),
+                "basin_uses_index": basin_uses_index,
                 "pg_gin_p50_ms": opt_ms(pg_t2.0),
                 "pg_scan_p50_ms": opt_ms(pg_t2.1),
                 "basin_over_pg_gin": ratio(t2_b, pg_t2.0),
@@ -430,6 +455,7 @@ async fn ext_bench_trgm() {
             {
                 "label": "T3: % filter — common needle (high selectivity)",
                 "basin_p50_ms": opt_ms(t3_b),
+                "basin_uses_index": basin_uses_index,
                 "pg_gin_p50_ms": opt_ms(pg_t3.0),
                 "pg_scan_p50_ms": opt_ms(pg_t3.1),
                 "basin_over_pg_gin": ratio(t3_b, pg_t3.0),
@@ -463,11 +489,13 @@ async fn ext_bench_trgm() {
                 "basin_thresh_0_6_hits": t6_hi_count,
             },
         ],
-        "note": "Basin runs every % / <-> / <% as a sequential scan (no trigram-GIN \
-                 segment yet). PG numbers are reported both WITH a gin_trgm_ops index \
-                 and WITHOUT it (sequential scan) so the artifact carries the honest \
-                 indexed gap AND the apples-to-apples scan comparison. The index gap \
-                 motivates a future Basin trigram-GIN storage segment.",
+        "note": "Basin builds a gin_trgm_ops trigram GIN index; the % filter shapes \
+                 (T2/T3) are index-backed (per-shape basin_uses_index reflects the \
+                 runtime-probed posting registry). <-> ORDER BY (T4) and <% (T5) stay \
+                 sequential scans on Basin. PG numbers are reported both WITH a \
+                 gin_trgm_ops index and WITHOUT it (sequential scan) so the artifact \
+                 carries the indexed head-to-head AND the apples-to-apples scan \
+                 comparison.",
     }));
 
     instance.wal.close().await.unwrap();
