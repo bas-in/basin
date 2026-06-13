@@ -11,6 +11,34 @@ into a dated section on release.
 
 ### Added
 
+- **`basin index-advisor`** — JSONB index recommendations via
+  `GET /v1/projects/:ref/index-advisor` (cloud T-125). Returns per-column hints
+  with table/column/reason/ddl/patterns_seen. Table rendering for humans; `--json`
+  returns the raw array; `jq '.[].ddl'` pipes directly to psql. (P0 gap — commit `0229f70`)
+
+- **`basin explain [--analyze]`** — `EXPLAIN [ANALYZE]` proxy via
+  `GET /v1/projects/:ref/explain?sql=<url>&analyze=<bool>`. SQL from positional arg,
+  `--file`, or stdin. No psql connection needed. (P0 gap — commit `7330d94`)
+
+- **`basin replication-slots list/create/drop`** — logical replication slot management
+  via `/v1/projects/:ref/replication-slots`. Default plugin: pgoutput; also accepts
+  wal2json. Covers CDC pipelines (Debezium, River). Equivalent to `neonctl
+  replication-slot`. (P0 gap — commit `54660b8`)
+
+- **`basin webhooks inbound list/create/get/delete/rotate`** — inbound webhook receiver
+  lifecycle (cloud T-094). HMAC-verified receive-and-invoke: external services POST to
+  a `receive_url`; the cloud verifies sha256 and calls a user SQL/Wasm function with the
+  payload. HMAC secret revealed once on create and rotate. (P0 gap — commit `a5e3bc6`)
+
+- **`basin storage policy get/put`** — object-storage access policy document management
+  via `GET/PUT /v1/projects/:ref/storage-objects/policy` (cloud T-135). RLS-style
+  per-(project, bucket, key_prefix) rules. `put` accepts raw JSON or `@file`. (P0 gap —
+  commit `49421a1`)
+
+- **PARITY.md** — full neon/supabase 3-column parity matrix: 60+ capability rows,
+  6 P0 gaps (CLI-only, cloud ready), 3 P1 gaps (local-dev-stack), 3 P2 gaps (platform
+  gaps). Local-dev-stack verdict + backend handoffs for each blocked item.
+
 - **`basin init` / `basin link` / `basin status` / `basin unlink`** — directory-mode
   project context. `basin init` scaffolds `./basin/config.toml`,
   `./basin/migrations/`, and `./basin/seed.sql`. `basin link --project=<ref>` binds
