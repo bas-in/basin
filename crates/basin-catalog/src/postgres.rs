@@ -40,6 +40,7 @@ use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMe
 use tokio_postgres::NoTls;
 use tracing::instrument;
 
+use crate::cdc_webhooks::{CdcWebhookDef, CdcWebhookRow, CdcWebhookState};
 use crate::domains::{self, DomainDef, DomainError, BASIN_DOMAIN_KEY};
 use crate::enums::{self, EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
 use crate::functions::SqlFunctionDef;
@@ -600,6 +601,39 @@ impl PostgresCatalog {
                     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
                 )"
             ),
+            // NOTE: the per-project home region (multi-region placement, ADR
+            // 0009) is the `home_region` field of the `ProjectMetadata` JSONB
+            // blob in `project_metadata` above — NOT a dedicated table. That is
+            // the single source of truth the WrongRegion write gate reads; the
+            // placement admin route read-modify-writes the blob so it preserves
+            // `byo_bucket`.
+            // ADR 0028 Phase 2 — per-project CDC webhook subscriptions and
+            // their delivery cursor. The subscription columns (url, filters,
+            // secret, active) are written at registration; the delivery
+            // columns (last_seq, last_status, retry_count, disabled_at) are
+            // written by the delivery worker on each ack / failure / auto-
+            // disable. `last_seq` advances monotonically (GREATEST upsert) so
+            // a retried ack can never rewind the resume floor. A legacy catalog
+            // that predates this table simply has no rows; `list_cdc_webhooks`
+            // returns empty and the worker delivers nothing for those backends.
+            // Filters are stored as JSONB arrays (NULL ⇒ no filter).
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.cdc_webhooks (
+                    project_id    TEXT NOT NULL,
+                    id            TEXT NOT NULL,
+                    url           TEXT NOT NULL,
+                    tables_json   JSONB,
+                    ops_json      JSONB,
+                    secret_hex    TEXT NOT NULL,
+                    active        BOOLEAN NOT NULL DEFAULT true,
+                    last_seq      BIGINT NOT NULL DEFAULT 0,
+                    last_status   TEXT,
+                    retry_count   INTEGER NOT NULL DEFAULT 0,
+                    disabled_at   TIMESTAMPTZ,
+                    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (project_id, id)
+                )"
+            ),
         ];
         let client = self.client().await?;
         for stmt in stmts {
@@ -1026,6 +1060,15 @@ impl Catalog for PostgresCatalog {
         )
         .await
         .map_err(|e| BasinError::catalog(format!("drop_namespace enum_types: {e}")))?;
+        // ADR 0028 Phase 2: CDC webhook subscriptions + cursors. Guarded so a
+        // legacy catalog (migrated before the table existed) does not fail the
+        // whole drop — the table is created by `migrate()`, but be tolerant.
+        let _ = tx
+            .execute(
+                &format!("DELETE FROM {sch}.cdc_webhooks WHERE project_id = $1"),
+                &[&project.to_string()],
+            )
+            .await;
         tx.execute(
             &format!("DELETE FROM {sch}.domains WHERE project_id = $1"),
             &[&project.to_string()],
@@ -4153,6 +4196,201 @@ impl Catalog for PostgresCatalog {
             let v: i32 = r.get(0);
             v.max(1) as u32
         }))
+    }
+
+    // NOTE: multi-region placement (ADR 0009) — the per-project home region is
+    // the `home_region` field of the `ProjectMetadata` JSONB blob, persisted
+    // via `set_project_metadata` / `get_project_metadata` above. No dedicated
+    // accessor: the placement admin route read-modify-writes `ProjectMetadata`.
+
+    // ---- ADR 0028 Phase 2: CDC webhooks ---------------------------------
+
+    #[instrument(skip(self, def), fields(project = %def.project, id = %def.id))]
+    async fn register_cdc_webhook(&self, def: CdcWebhookDef) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        // Filters serialise to JSONB arrays; None ⇒ SQL NULL.
+        let tables_json = def
+            .tables
+            .as_ref()
+            .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null));
+        let ops_json = def
+            .ops
+            .as_ref()
+            .map(|o| serde_json::to_value(o).unwrap_or(serde_json::Value::Null));
+        let n = client
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.cdc_webhooks \
+                       (project_id, id, url, tables_json, ops_json, secret_hex, active) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                     ON CONFLICT (project_id, id) DO NOTHING"
+                ),
+                &[
+                    &def.project.to_string(),
+                    &def.id,
+                    &def.url,
+                    &tables_json,
+                    &ops_json,
+                    &def.secret_hex,
+                    &def.active,
+                ],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_cdc_webhook: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::Catalog(format!(
+                "cdc webhook {:?} already exists for project {}",
+                def.id, def.project
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project, id = %id))]
+    async fn drop_cdc_webhook(&self, project: &ProjectId, id: &str) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let n = client
+            .execute(
+                &format!("DELETE FROM {sch}.cdc_webhooks WHERE project_id = $1 AND id = $2"),
+                &[&project.to_string(), &id],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_cdc_webhook: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!(
+                "cdc webhook {id:?} does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_cdc_webhooks(&self, project: &ProjectId) -> Vec<CdcWebhookRow> {
+        let sch = &self.schema;
+        let Ok(client) = self.client().await else {
+            return Vec::new();
+        };
+        let rows = match client
+            .query(
+                &format!(
+                    "SELECT id, url, tables_json, ops_json, secret_hex, active, \
+                            last_seq, last_status, retry_count, disabled_at \
+                     FROM {sch}.cdc_webhooks \
+                     WHERE project_id = $1 \
+                     ORDER BY id ASC"
+                ),
+                &[&project.to_string()],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .map(|row| {
+                let tables_json: Option<serde_json::Value> = row.get(2);
+                let ops_json: Option<serde_json::Value> = row.get(3);
+                let disabled_at: Option<DateTime<Utc>> = row.get(9);
+                let last_seq: i64 = row.get(6);
+                let retry_count: i32 = row.get(8);
+                CdcWebhookRow {
+                    def: CdcWebhookDef {
+                        id: row.get(0),
+                        project: *project,
+                        url: row.get(1),
+                        tables: tables_json.and_then(|v| serde_json::from_value(v).ok()),
+                        ops: ops_json.and_then(|v| serde_json::from_value(v).ok()),
+                        secret_hex: row.get(4),
+                        active: row.get(5),
+                    },
+                    state: CdcWebhookState {
+                        last_seq: last_seq.max(0) as u64,
+                        last_status: row.get(7),
+                        retry_count: retry_count.max(0) as u32,
+                        disabled_at: disabled_at.map(|d| d.to_rfc3339()),
+                    },
+                }
+            })
+            .collect()
+    }
+
+    #[instrument(skip(self), fields(project = %project, id = %id))]
+    async fn record_cdc_webhook_ack(
+        &self,
+        project: &ProjectId,
+        id: &str,
+        last_seq: u64,
+        last_status: &str,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let seq_pg = last_seq as i64;
+        // Monotonic cursor: GREATEST so a retried / out-of-order ack can never
+        // rewind the resume floor (mirrors set_compaction_watermark).
+        client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.cdc_webhooks \
+                       SET last_seq = GREATEST(last_seq, $3), \
+                           last_status = $4, \
+                           retry_count = 0 \
+                     WHERE project_id = $1 AND id = $2"
+                ),
+                &[&project.to_string(), &id, &seq_pg, &last_status],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("record_cdc_webhook_ack: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project, id = %id))]
+    async fn record_cdc_webhook_failure(
+        &self,
+        project: &ProjectId,
+        id: &str,
+        retry_count: u32,
+        last_status: &str,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let rc = retry_count as i32;
+        client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.cdc_webhooks \
+                       SET retry_count = $3, last_status = $4 \
+                     WHERE project_id = $1 AND id = $2"
+                ),
+                &[&project.to_string(), &id, &rc, &last_status],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("record_cdc_webhook_failure: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project, id = %id))]
+    async fn disable_cdc_webhook(&self, project: &ProjectId, id: &str) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.cdc_webhooks \
+                       SET active = false, disabled_at = now() \
+                     WHERE project_id = $1 AND id = $2"
+                ),
+                &[&project.to_string(), &id],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("disable_cdc_webhook: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!(
+                "cdc webhook {id:?} does not exist"
+            )));
+        }
+        Ok(())
     }
 }
 

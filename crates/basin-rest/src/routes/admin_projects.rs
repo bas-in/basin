@@ -1,12 +1,13 @@
-//! `/admin/v1/projects/:project_id/max-connections` — per-project pgwire
-//! connection ceiling (issue #28b).
+//! Admin project-scoped control routes.
 //!
 //! ## Surface
 //!
-//! | Verb + Path                                              | Action        | Status |
-//! |----------------------------------------------------------|---------------|--------|
-//! | `POST /admin/v1/projects/:project_id/max-connections`    | set ceiling   | 204    |
-//! | `GET  /admin/v1/projects/:project_id/max-connections`    | read ceiling  | 200    |
+//! | Verb + Path                                              | Action           | Status |
+//! |----------------------------------------------------------|------------------|--------|
+//! | `POST /admin/v1/projects/:project_id/max-connections`    | set conn ceiling | 204    |
+//! | `GET  /admin/v1/projects/:project_id/max-connections`    | read ceiling     | 200    |
+//! | `POST /admin/v1/projects/:project_id/placement`          | set home region  | 204    |
+//! | `GET  /admin/v1/projects/:project_id/placement`          | read home region | 200    |
 //!
 //! ## Auth
 //!
@@ -15,22 +16,22 @@
 //! `:project_id` path segment (same cross-project isolation invariant as
 //! `register_byo_bucket`).
 //!
-//! ## Wire shape
+//! ## max-connections wire shape
 //!
 //! `POST` body:
 //! ```json
 //! { "max_connections": 250 }
 //! ```
-//! → `204 No Content` on success.
+//! -> `204 No Content` on success.
 //!
 //! `GET` response:
 //! ```json
 //! { "project_id": "01H...", "max_connections": 250 }
 //! ```
-//! → `200 OK` on success. When no ceiling has been persisted yet the value
-//! returned is `DEFAULT_PROJECT_MAX_CONNECTIONS` (25 — the Free tier).
+//! -> `200 OK` on success. When no ceiling has been persisted yet the value
+//! returned is `DEFAULT_PROJECT_MAX_CONNECTIONS` (25 -- the Free tier).
 //!
-//! ## Enforcement
+//! ## Enforcement (max-connections)
 //!
 //! The ceiling is both **persisted** (in the catalog) and **applied live**
 //! (into the `ConnectionLimiter` held in the `CatalogConnectionLimitProvider`
@@ -38,12 +39,41 @@
 //! does not kill existing connections; only new connect attempts are refused once
 //! the live count hits the new (lower) number.
 //!
-//! ## Default
+//! ## Default (max-connections)
 //!
 //! A project with no stored ceiling is treated as having
 //! `DEFAULT_PROJECT_MAX_CONNECTIONS` connections by the pgwire startup handler
 //! (fail-closed). The cloud re-pushes on every project-create and every plan
 //! change, so the window where the default applies is bounded.
+//!
+//! ## placement wire shape
+//!
+//! `POST` body (mirrors `basin_auth_client::set_project_home_region`):
+//! ```json
+//! { "home_region": "jnb" }
+//! ```
+//! -> `204 No Content` on success.
+//!
+//! `GET` response:
+//! ```json
+//! { "project_id": "01H...", "home_region": "jnb" }
+//! ```
+//! -> `200 OK` on success. When no home region has been set the response is:
+//! ```json
+//! { "project_id": "01H...", "home_region": null }
+//! ```
+//!
+//! ## Note -- unified with ProjectMetadata (ADR 0009)
+//!
+//! The per-project `home_region` here is a *project-level placement pin*
+//! persisted as the `home_region` field of [`ProjectMetadata`] (alongside
+//! `byo_bucket`). This is the single source of truth the multi-region
+//! WrongRegion write gate reads (`basin-engine` `region.rs` via
+//! `get_project_metadata`), so setting it here actually gates writes. The
+//! `POST` handler does a read-modify-write so persisting the placement pin does
+//! not clobber a previously registered BYO-bucket config. It is distinct from
+//! the per-table `home_region` field on `TableMetadata` (which pins individual
+//! tables).
 
 use std::sync::Arc;
 
@@ -73,7 +103,7 @@ use crate::server::{authorize, Inner};
 pub const DEFAULT_PROJECT_MAX_CONNECTIONS: u32 = 25;
 
 // ---------------------------------------------------------------------------
-// Shared admin gate (mirrors admin.rs — kept local to avoid cross-module
+// Shared admin gate (mirrors admin.rs -- kept local to avoid cross-module
 // dependency on private functions)
 // ---------------------------------------------------------------------------
 
@@ -101,7 +131,7 @@ fn assert_admin_for_path_project(
 }
 
 // ---------------------------------------------------------------------------
-// Request / response types
+// max-connections: request / response types
 // ---------------------------------------------------------------------------
 
 /// `POST /admin/v1/projects/:project_id/max-connections` body.
@@ -150,9 +180,7 @@ pub(crate) async fn set_project_max_connections(
     assert_admin_for_path_project(&claims, &project)?;
 
     if req.max_connections <= 0 {
-        return Err(ApiError::invalid(
-            "max_connections must be > 0",
-        ));
+        return Err(ApiError::invalid("max_connections must be > 0"));
     }
     if req.max_connections > u32::MAX as i64 {
         return Err(ApiError::invalid(format!(
@@ -169,14 +197,7 @@ pub(crate) async fn set_project_max_connections(
         .await
         .map_err(ApiError::from)?;
 
-    // 2. Update the live in-process limiter immediately so ongoing
-    //    connection attempts see the new ceiling without waiting for a
-    //    restart (the catalog-backed provider reads from the catalog on
-    //    every connect, but updating the catalog IS the live update for
-    //    that provider).
-    //
-    //    If the server was wired with a `CatalogConnectionLimitProvider`
-    //    (see main.rs wiring below), its `limit_for` calls `catalog.get_project_max_connections`
+    // 2. The in-process `CatalogConnectionLimitProvider` reads from the catalog
     //    on every new connection, so writing to the catalog IS the live update.
     //    No additional in-memory notification is needed.
 
@@ -226,6 +247,105 @@ pub(crate) async fn get_project_max_connections(
 }
 
 // ---------------------------------------------------------------------------
+// Placement: POST /admin/v1/projects/:project_id/placement
+//            GET  /admin/v1/projects/:project_id/placement
+// ---------------------------------------------------------------------------
+
+/// `POST /admin/v1/projects/:project_id/placement` body.
+///
+/// Mirrors `basin_auth_client::set_project_home_region` wire shape exactly:
+/// the cloud serialises `{ "home_region": "<fly_region_code>" }`. The value
+/// is a Fly.io region code (e.g. `"jnb"`, `"iad"`, `"fra"`).
+#[derive(Debug, Deserialize)]
+pub(crate) struct SetPlacementRequest {
+    pub home_region: String,
+}
+
+/// Set the per-project home region (placement pin).
+///
+/// Persists the region code in the catalog (survives restarts). v0.1 records
+/// the value only; the multi-region router that acts on it is future work
+/// (ADR 0009 / lane F4). The cloud calls this at project-create and on a
+/// placement-move admin action.
+#[axum::debug_handler]
+pub(crate) async fn set_project_placement(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(req): Json<SetPlacementRequest>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    require_admin(&claims)?;
+
+    let project: ProjectId = project_id
+        .parse()
+        .map_err(|e| ApiError::invalid(format!("invalid project_id: {e}")))?;
+    assert_admin_for_path_project(&claims, &project)?;
+
+    if req.home_region.is_empty() {
+        return Err(ApiError::invalid("home_region must not be empty"));
+    }
+
+    let catalog = state.cfg.engine.config().catalog.clone();
+
+    // Read-modify-write: the home region is one field of the unified
+    // `ProjectMetadata` (alongside `byo_bucket`). Load the current metadata
+    // first so setting the placement pin does NOT clobber a previously
+    // registered BYO-bucket config. The WrongRegion write gate reads
+    // `ProjectMetadata::home_region` (see `basin-engine` region.rs), so this is
+    // the single source of truth the gate actually consults.
+    let mut meta = catalog
+        .get_project_metadata(&project)
+        .await
+        .map_err(ApiError::from)?;
+    meta.home_region = Some(req.home_region.clone());
+    catalog
+        .set_project_metadata(&project, meta)
+        .await
+        .map_err(ApiError::from)?;
+
+    tracing::info!(
+        %project,
+        home_region = %req.home_region,
+        "per-project home region updated",
+    );
+
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Read the current per-project home region.
+///
+/// Returns the stored value, or `null` in the `home_region` field when no
+/// placement pin has been pushed.
+#[axum::debug_handler]
+pub(crate) async fn get_project_placement(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    require_admin(&claims)?;
+
+    let project: ProjectId = project_id
+        .parse()
+        .map_err(|e| ApiError::invalid(format!("invalid project_id: {e}")))?;
+    assert_admin_for_path_project(&claims, &project)?;
+
+    let catalog = state.cfg.engine.config().catalog.clone();
+    let region = catalog
+        .get_project_metadata(&project)
+        .await
+        .map_err(ApiError::from)?
+        .home_region;
+
+    Ok(Json(json!({
+        "project_id": project.to_string(),
+        "home_region": region,
+    }))
+    .into_response())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -236,7 +356,7 @@ mod tests {
 
     use basin_catalog::InMemoryCatalog;
 
-    // ── helper: round-trip via catalog directly ────────────────────────────
+    // -- max-connections: catalog round-trips ---------------------------------
 
     /// Verify catalog round-trip for both backends. This is the persistence
     /// contract: set then get returns the same value; unset returns None.
@@ -285,5 +405,118 @@ mod tests {
 
         let v = cat.get_project_max_connections(&p).await.unwrap();
         assert_eq!(v, Some(25), "lowered ceiling must be persisted");
+    }
+
+    // -- placement: catalog round-trips ---------------------------------------
+    //
+    // The placement pin is the `home_region` field of the unified
+    // `ProjectMetadata` (the single source of truth the WrongRegion gate
+    // reads). The route does a read-modify-write so it preserves `byo_bucket`.
+
+    /// Before any push, the metadata home_region is None.
+    #[tokio::test]
+    async fn placement_unset_returns_none() {
+        let cat = Arc::new(InMemoryCatalog::new());
+        let p = ProjectId::new();
+        let v = cat.get_project_metadata(&p).await.unwrap().home_region;
+        assert_eq!(v, None, "unset home_region should return None");
+    }
+
+    /// Set then get returns the pushed value; overwrite replaces it.
+    #[tokio::test]
+    async fn placement_set_get_round_trip() {
+        let cat = Arc::new(InMemoryCatalog::new());
+        let p = ProjectId::new();
+
+        let mut meta = cat.get_project_metadata(&p).await.unwrap();
+        meta.home_region = Some("jnb".to_owned());
+        cat.set_project_metadata(&p, meta).await.unwrap();
+        let v = cat.get_project_metadata(&p).await.unwrap().home_region;
+        assert_eq!(v, Some("jnb".to_owned()));
+
+        // Overwrite with a different region.
+        let mut meta = cat.get_project_metadata(&p).await.unwrap();
+        meta.home_region = Some("iad".to_owned());
+        cat.set_project_metadata(&p, meta).await.unwrap();
+        let v2 = cat.get_project_metadata(&p).await.unwrap().home_region;
+        assert_eq!(v2, Some("iad".to_owned()), "overwrite must persist");
+    }
+
+    /// Different projects maintain independent home regions.
+    #[tokio::test]
+    async fn placement_per_project_isolation() {
+        let cat = Arc::new(InMemoryCatalog::new());
+        let a = ProjectId::new();
+        let b = ProjectId::new();
+
+        let mut meta = cat.get_project_metadata(&a).await.unwrap();
+        meta.home_region = Some("fra".to_owned());
+        cat.set_project_metadata(&a, meta).await.unwrap();
+        // b receives no push.
+        assert_eq!(
+            cat.get_project_metadata(&a).await.unwrap().home_region,
+            Some("fra".to_owned())
+        );
+        assert_eq!(
+            cat.get_project_metadata(&b).await.unwrap().home_region,
+            None,
+            "project b should have no pin"
+        );
+    }
+
+    /// drop_namespace clears the home region.
+    #[tokio::test]
+    async fn placement_cleared_on_drop_namespace() {
+        let cat = Arc::new(InMemoryCatalog::new());
+        let p = ProjectId::new();
+        cat.create_namespace(&p).await.unwrap();
+        let mut meta = cat.get_project_metadata(&p).await.unwrap();
+        meta.home_region = Some("sin".to_owned());
+        cat.set_project_metadata(&p, meta).await.unwrap();
+        cat.drop_namespace(&p).await.unwrap();
+        let v = cat.get_project_metadata(&p).await.unwrap().home_region;
+        assert_eq!(v, None, "home_region must be cleared after drop_namespace");
+    }
+
+    /// Setting the placement pin via read-modify-write must NOT clobber a
+    /// previously registered BYO-bucket config (the unification invariant).
+    #[tokio::test]
+    async fn placement_rmw_preserves_byo_bucket() {
+        use basin_catalog::{ProjectMetadata, S3Config};
+
+        let cat = Arc::new(InMemoryCatalog::new());
+        let p = ProjectId::new();
+
+        // Existing BYO-bucket config (as register_byo_bucket would persist).
+        let cfg = S3Config {
+            endpoint: "https://fly.storage.tigris.dev".to_owned(),
+            bucket: "cust-bucket".to_owned(),
+            region: "auto".to_owned(),
+            access_key_id: "AKIA".to_owned(),
+            secret_access_key_enc: vec![1, 2, 3],
+            force_path_style: false,
+        };
+        cat.set_project_metadata(
+            &p,
+            ProjectMetadata {
+                byo_bucket: Some(cfg.clone()),
+                home_region: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Now set the placement pin the way the route does (read-modify-write).
+        let mut meta = cat.get_project_metadata(&p).await.unwrap();
+        meta.home_region = Some("jnb".to_owned());
+        cat.set_project_metadata(&p, meta).await.unwrap();
+
+        let after = cat.get_project_metadata(&p).await.unwrap();
+        assert_eq!(after.home_region, Some("jnb".to_owned()));
+        assert_eq!(
+            after.byo_bucket,
+            Some(cfg),
+            "placement RMW must preserve the BYO-bucket config"
+        );
     }
 }

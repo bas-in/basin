@@ -17,6 +17,7 @@ use tracing::instrument;
 
 use basin_common::ChangeOp;
 
+use crate::cdc_webhooks::{CdcWebhookDef, CdcWebhookRow, CdcWebhookState};
 use crate::domains::{self, DomainDef, DomainError};
 use crate::enums::{self, EnumError, EnumTypeDef};
 use crate::functions::SqlFunctionDef;
@@ -211,6 +212,11 @@ pub struct InMemoryCatalog {
     /// take `max(existing, new)`. Read by shard cold-start replay to skip
     /// already-committed entries (the commit→truncate crash-window dedup).
     compaction_watermarks: Mutex<HashMap<(ProjectId, String), u64>>,
+    /// ADR 0028 Phase 2 — per-project CDC webhook subscriptions + delivery
+    /// cursor. One shared `HashMap` keyed by `(ProjectId, webhook_id)`; the
+    /// value bundles the subscription `def` with its mutable delivery `state`.
+    /// Per-project cost stays `O(bytes)`. Cleared in `drop_namespace`.
+    cdc_webhooks: Mutex<HashMap<(ProjectId, String), (CdcWebhookDef, CdcWebhookState)>>,
 }
 
 /// In-memory lease row. Mirrors the `partition_leases` Postgres table.
@@ -272,6 +278,7 @@ impl InMemoryCatalog {
             project_metadata: Mutex::new(HashMap::new()),
             project_max_connections: Mutex::new(HashMap::new()),
             compaction_watermarks: Mutex::new(HashMap::new()),
+            cdc_webhooks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -600,6 +607,11 @@ impl Catalog for InMemoryCatalog {
         // Clear per-project connection ceiling.
         let mut mc = self.project_max_connections.lock().await;
         mc.remove(project);
+        // (The per-project home region pin lives in `project_metadata` as
+        // `ProjectMetadata::home_region`, already cleared above.)
+        // Clear per-project CDC webhook subscriptions + cursors.
+        let mut cwh = self.cdc_webhooks.lock().await;
+        cwh.retain(|(t, _), _| t != project);
         Ok(())
     }
 
@@ -1580,6 +1592,99 @@ impl Catalog for InMemoryCatalog {
             .filter(|((t, _), _)| t == project)
             .map(|(_, v)| v.clone())
             .collect()
+    }
+
+    // ---- ADR 0028 Phase 2: CDC webhooks ---------------------------------
+
+    async fn register_cdc_webhook(&self, def: CdcWebhookDef) -> Result<()> {
+        self.bump_epoch();
+        let key = (def.project, def.id.clone());
+        let mut map = self.cdc_webhooks.lock().await;
+        if map.contains_key(&key) {
+            return Err(BasinError::Catalog(format!(
+                "cdc webhook {:?} already exists for project {}",
+                def.id, def.project
+            )));
+        }
+        map.insert(key, (def, CdcWebhookState::default()));
+        Ok(())
+    }
+
+    async fn drop_cdc_webhook(&self, project: &ProjectId, id: &str) -> Result<()> {
+        self.bump_epoch();
+        let key = (*project, id.to_string());
+        let mut map = self.cdc_webhooks.lock().await;
+        if map.remove(&key).is_none() {
+            return Err(BasinError::not_found(format!(
+                "cdc webhook {id:?} does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn list_cdc_webhooks(&self, project: &ProjectId) -> Vec<CdcWebhookRow> {
+        let map = self.cdc_webhooks.lock().await;
+        let mut rows: Vec<CdcWebhookRow> = map
+            .iter()
+            .filter(|((t, _), _)| t == project)
+            .map(|(_, (def, state))| CdcWebhookRow {
+                def: def.clone(),
+                state: state.clone(),
+            })
+            .collect();
+        // Stable order for the GET route / deterministic tests.
+        rows.sort_by(|a, b| a.def.id.cmp(&b.def.id));
+        rows
+    }
+
+    async fn record_cdc_webhook_ack(
+        &self,
+        project: &ProjectId,
+        id: &str,
+        last_seq: u64,
+        last_status: &str,
+    ) -> Result<()> {
+        let key = (*project, id.to_string());
+        let mut map = self.cdc_webhooks.lock().await;
+        if let Some((_, state)) = map.get_mut(&key) {
+            // Monotonic cursor: never rewind (mirrors compaction watermark).
+            state.last_seq = state.last_seq.max(last_seq);
+            state.last_status = Some(last_status.to_string());
+            state.retry_count = 0;
+        }
+        Ok(())
+    }
+
+    async fn record_cdc_webhook_failure(
+        &self,
+        project: &ProjectId,
+        id: &str,
+        retry_count: u32,
+        last_status: &str,
+    ) -> Result<()> {
+        let key = (*project, id.to_string());
+        let mut map = self.cdc_webhooks.lock().await;
+        if let Some((_, state)) = map.get_mut(&key) {
+            state.retry_count = retry_count;
+            state.last_status = Some(last_status.to_string());
+        }
+        Ok(())
+    }
+
+    async fn disable_cdc_webhook(&self, project: &ProjectId, id: &str) -> Result<()> {
+        self.bump_epoch();
+        let key = (*project, id.to_string());
+        let mut map = self.cdc_webhooks.lock().await;
+        match map.get_mut(&key) {
+            Some((def, state)) => {
+                def.active = false;
+                state.disabled_at = Some(chrono::Utc::now().to_rfc3339());
+                Ok(())
+            }
+            None => Err(BasinError::not_found(format!(
+                "cdc webhook {id:?} does not exist"
+            ))),
+        }
     }
 
     // -----------------------------------------------------------------------

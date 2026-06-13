@@ -31,16 +31,26 @@
 //!   sorted, positions stripped.
 //! - **`tsquery_phrase(a, b [, distance])`** — phrase-concatenates two
 //!   tsqueries with `<->` (or `<N>`).
-//! - **`ts_rank` / `ts_rank_cd`** — *simplified deterministic* score:
-//!   matched-distinct-lexemes / vector-length.  This is **NOT** PG's
-//!   cover-density algorithm; it is documented as a simplification.
+//! - **`ts_rank` / `ts_rank_cd`** — term-frequency weighted rank: each matched
+//!   query lexeme contributes `positions_count / total_positions` to the score
+//!   (normalization=0 equivalent).  A lexeme that appears 5× in a document
+//!   contributes 5× more than one appearing once.  Exact values diverge from
+//!   PG's weight-class table + damping factor; relative ordering matches.
+//! - **`ts_headline([config,] body, tsquery [, options])`** — PG-compatible
+//!   fragment selection: finds the best contiguous word window (MaxWords=35,
+//!   MinWords=15) covering the most query terms, emits that window with "…"
+//!   ellipsis padding.  Options string parsed for MaxWords, MinWords,
+//!   MaxFragments, ShortWord, StartSel, StopSel, HighlightAll.
+//! - **`setweight(tsvector, "A"|"B"|"C"|"D")`** — annotates every position
+//!   with the given weight class.  Format: `'fox':1A 'run':2A`.  The parser
+//!   already reads weight letters; `ts_rank` treats all classes equally.
 //!
 //! # What is OUT of scope (honestly unsupported — NOT faked)
 //!
-//! - **`ts_headline`** (returns the body with matched terms wrapped in
-//!   `<b>…</b>` — not PG's cover-density fragment selection).
-//! - **Weighted vectors** (`setweight`, A–D weight classes / `:1A`).
-//! - **`ts_rank_cd` cover density** (we reuse the simplified `ts_rank`).
+//! - **`ts_rank_cd` cover density** (we reuse the same term-frequency formula;
+//!   `ts_rank_cd` is an alias that avoids "function not found" errors).
+//! - **`ts_rank` weight-class sensitivity** — all weight classes are treated
+//!   equally (all-D semantics); per-class scoring is documented as future work.
 //! - **Language configs** beyond `english` / `simple` (the config arg is
 //!   accepted; only `simple` changes behaviour — no stemming, no stopwords).
 //! - **`websearch_to_tsquery`** (best-effort: treated like `plainto`).
@@ -1041,8 +1051,7 @@ pub(crate) fn register_fts_udfs(ctx: &SessionContext) {
         signature: sig_rank(),
     }));
 
-    // ts_headline — minimal highlighting: wraps matched query terms in <b>…</b>
-    // (full body, not PG cover-density fragments). See `headline_highlight`.
+    // ts_headline — PG-compatible fragment selection with options string.
     ctx.register_udf(ScalarUDF::from(TsHeadlineUdf {
         signature: Signature::one_of(
             vec![
@@ -1055,6 +1064,14 @@ pub(crate) fn register_fts_udfs(ctx: &SessionContext) {
                     DataType::Utf8,
                 ]),
             ],
+            Volatility::Immutable,
+        ),
+    }));
+
+    // setweight(tsvector, weight_class) — annotate positions with A/B/C/D.
+    ctx.register_udf(ScalarUDF::from(SetweightUdf {
+        signature: Signature::one_of(
+            vec![TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8])],
             Volatility::Immutable,
         ),
     }));
@@ -1116,6 +1133,22 @@ fn arg_strings(arg: &ColumnarValue, n: usize) -> DFResult<StringArray> {
         .downcast_ref::<StringArray>()
         .expect("cast to Utf8 yields StringArray")
         .clone())
+}
+
+/// First non-null string value of a columnar argument, used to inspect the
+/// SHAPE of an argument that is (in practice) a constant literal across the
+/// batch — e.g. the ts_headline options / config disambiguator.
+fn first_non_null_string(arg: &ColumnarValue, n: usize) -> Option<String> {
+    let arr = arg_strings(arg, n).ok()?;
+    (0..arr.len()).find(|&i| !arr.is_null(i)).map(|i| arr.value(i).to_owned())
+}
+
+/// Heuristic: does this string look like a ts_headline *options* string
+/// (`"MaxWords=10, MinWords=5"`) rather than a regconfig name (`"english"`)?
+/// Options always contain a `key=value` pair; a config never does. Used to
+/// disambiguate the two 3-argument ts_headline overloads.
+fn looks_like_headline_options(s: &str) -> bool {
+    s.contains('=')
 }
 
 // ===========================================================================
@@ -1447,9 +1480,36 @@ impl ScalarUDFImpl for TsRankUdf {
             let q = TsQuery::parse_to_tsquery(tq.value(i)).ok().flatten();
             let score = match q {
                 Some(q) if q.matches(&v) => {
-                    let total = v.entries.len().max(1) as f32;
-                    let hits = query_terms(&q).iter().filter(|t| v.contains(t)).count() as f32;
-                    hits / total
+                    // Term-frequency weighting: each positive query term
+                    // contributes (its position count / total positions in the
+                    // document). A term appearing 3× scores 3× higher than one
+                    // appearing 1×, so a 3×-'fox' doc ranks strictly above a
+                    // 1×-'fox' doc (documented divergence from PG's weight-class
+                    // table; cover density is out of scope — see module docs).
+                    //
+                    // `total_positions` counts every stored position across all
+                    // lexemes. A vector with no stored positions (bare-cast /
+                    // stripped form) has zero counted positions, so we fall back
+                    // to distinct-lexeme counting to keep those inputs scoring.
+                    let total_positions: usize =
+                        v.entries.iter().map(|(_, ps)| ps.len()).sum();
+                    let terms = query_terms(&q);
+                    if total_positions > 0 {
+                        let hit_positions: usize = v
+                            .entries
+                            .iter()
+                            .filter(|(lex, _)| terms.contains(lex))
+                            .map(|(_, ps)| ps.len())
+                            .sum();
+                        hit_positions as f32 / total_positions as f32
+                    } else {
+                        // Position-less vector: fall back to distinct-lexeme
+                        // fraction (the prior behaviour) so cast/stripped
+                        // tsvectors still produce a non-zero matched score.
+                        let total = v.entries.len().max(1) as f32;
+                        let hits = terms.iter().filter(|t| v.contains(t)).count() as f32;
+                        hits / total
+                    }
                 }
                 _ => 0.0,
             };
@@ -1653,8 +1713,10 @@ impl ScalarUDFImpl for QuerytreeUdf {
 }
 
 // ===========================================================================
-// ts_headline — STUB (out of scope): returns the document body unchanged.
+// ts_headline — PG-compatible fragment selection (replaced full-body stub)
 // ===========================================================================
+//
+// (The full design note lives in the module-level doc block above.)
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TsHeadlineUdf {
@@ -1678,11 +1740,35 @@ impl ScalarUDFImpl for TsHeadlineUdf {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let args = &args.args;
         let n = num_rows(args);
-        // 2-arg: (body, tsquery)            → body @0, query @1
-        // 3/4-arg: (config, body, tsquery[, opts]) → body @1, query @2
-        let (body_idx, query_idx) = if args.len() == 2 { (0, 1) } else { (1, 2) };
+        // PG ts_headline overloads (we accept all four by arity, disambiguating
+        // the genuinely-ambiguous 3-arg case by argument SHAPE since every
+        // argument arrives as text here):
+        //   2-arg: (body, tsquery)                  → body@0, query@1, opts=None
+        //   3-arg: (config, body, tsquery)          → body@1, query@2, opts=None
+        //   3-arg: (body, tsquery, opts)            → body@0, query@1, opts@2
+        //   4-arg: (config, body, tsquery, opts)    → body@1, query@2, opts@3
+        //
+        // The two 3-arg forms collide on arity. We disambiguate on content: an
+        // *options* string contains `=` (`MaxWords=10, MinWords=5`); a *config*
+        // (regconfig) never does. So if the LAST 3-arg argument looks like an
+        // options string, it is `(body, query, opts)`; otherwise the FIRST
+        // argument is a config and it is `(config, body, query)`.
+        let (body_idx, query_idx, opts_idx) = match args.len() {
+            2 => (0, 1, None),
+            3 => {
+                let last = first_non_null_string(&args[2], n);
+                if last.as_deref().is_some_and(looks_like_headline_options) {
+                    (0, 1, Some(2usize)) // (body, query, opts)
+                } else {
+                    (1, 2, None) // (config, body, query)
+                }
+            }
+            4 => (1, 2, Some(3usize)),
+            _ => (0, 1, None),
+        };
         let bodies = arg_strings(&args[body_idx], n)?;
         let queries = arg_strings(&args[query_idx], n)?;
+        let opts_arr = opts_idx.map(|idx| arg_strings(&args[idx], n));
 
         let mut out: Vec<Option<String>> = Vec::with_capacity(n);
         for i in 0..n {
@@ -1692,63 +1778,311 @@ impl ScalarUDFImpl for TsHeadlineUdf {
             }
             let body = bodies.value(i);
             let query = if queries.is_null(i) { "" } else { queries.value(i) };
-            out.push(Some(headline_highlight(body, query)));
+            let opts_str: Option<&str> = match &opts_arr {
+                Some(Ok(arr)) if !arr.is_null(i) => Some(arr.value(i)),
+                _ => None,
+            };
+            let opts = HeadlineOptions::parse(opts_str.unwrap_or(""));
+            out.push(Some(headline_fragment(body, query, &opts)));
         }
         Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
     }
 }
 
-/// Minimal `ts_headline` highlighting: wrap every body word whose lowercased
-/// token form matches a positive (non-negated) query term in `<b>…</b>`.
+/// Options for ts_headline (PG-compatible subset).
+#[derive(Debug, Clone)]
+struct HeadlineOptions {
+    max_words: usize,
+    min_words: usize,
+    short_word: usize,
+    max_fragments: usize,
+    start_sel: String,
+    stop_sel: String,
+    highlight_all: bool,
+}
+
+impl Default for HeadlineOptions {
+    fn default() -> Self {
+        HeadlineOptions {
+            max_words: 35,
+            min_words: 15,
+            short_word: 3,
+            max_fragments: 0,
+            start_sel: "<b>".into(),
+            stop_sel: "</b>".into(),
+            highlight_all: false,
+        }
+    }
+}
+
+impl HeadlineOptions {
+    /// Parse a PG-compatible options string, e.g.
+    /// `"MaxWords=20, MinWords=10, MaxFragments=2"`.
+    /// Unknown keys are silently ignored (PG behaviour).
+    fn parse(s: &str) -> Self {
+        let mut opts = HeadlineOptions::default();
+        for kv in s.split(',') {
+            let kv = kv.trim();
+            if kv.is_empty() {
+                continue;
+            }
+            let mut parts = kv.splitn(2, '=');
+            let key = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+            let val = parts.next().unwrap_or("").trim();
+            match key.as_str() {
+                "maxwords" => {
+                    if let Ok(v) = val.parse::<usize>() {
+                        opts.max_words = v.max(1);
+                    }
+                }
+                "minwords" => {
+                    if let Ok(v) = val.parse::<usize>() {
+                        opts.min_words = v;
+                    }
+                }
+                "shortword" => {
+                    if let Ok(v) = val.parse::<usize>() {
+                        opts.short_word = v;
+                    }
+                }
+                "maxfragments" => {
+                    if let Ok(v) = val.parse::<usize>() {
+                        opts.max_fragments = v;
+                    }
+                }
+                "startsel" => opts.start_sel = val.to_string(),
+                "stopsel" => opts.stop_sel = val.to_string(),
+                "highlightall" => {
+                    opts.highlight_all =
+                        matches!(val.to_ascii_lowercase().as_str(), "true" | "on" | "1" | "yes");
+                }
+                _ => {} // unknown key — silently ignored (PG behaviour)
+            }
+        }
+        // Clamp: min_words must not exceed max_words.
+        if opts.min_words > opts.max_words {
+            opts.min_words = opts.max_words;
+        }
+        opts
+    }
+}
+
+/// A word token extracted from the body.
+#[derive(Debug, Clone)]
+struct BodyWord {
+    /// The word as it appears in the body (original case).
+    word: String,
+    /// The inter-token separator that immediately *precedes* this word in the
+    /// body (spaces, punctuation, etc.).  For the very first word this may be
+    /// empty.
+    prefix: String,
+}
+
+/// Tokenise the body into `BodyWord`s, preserving all separators so the
+/// original surface form can be reconstructed.
+fn tokenize_body(body: &str) -> Vec<BodyWord> {
+    let mut words: Vec<BodyWord> = Vec::new();
+    let mut prefix = String::new();
+    let mut word = String::new();
+
+    for ch in body.chars() {
+        if ch.is_alphanumeric() || ch == '\'' {
+            word.push(ch);
+        } else {
+            if !word.is_empty() {
+                words.push(BodyWord {
+                    word: std::mem::take(&mut word),
+                    prefix: std::mem::take(&mut prefix),
+                });
+            }
+            prefix.push(ch);
+        }
+    }
+    if !word.is_empty() {
+        words.push(BodyWord { word, prefix });
+    }
+    words
+}
+
+/// Select the best fragment window(s) and apply highlighting.
 ///
-/// This is *not* PG's cover-density fragment selection — it returns the full
-/// body with matched terms bolded, which is the common, honest behavior most
-/// callers expect (and far better than the previous no-op stub). Stemming is
-/// not applied (consistent with Basin's no-stemming tsvector), so matching is
-/// exact-token on the lowercased word.
-fn headline_highlight(body: &str, query: &str) -> String {
-    // Collect positive query terms (skip negated `!term` branches).
+/// The returned string is:
+///   * The whole body (highlighted) when `HighlightAll=true` or the body is
+///     shorter than `MinWords`.
+///   * A single best window surrounded by "… " / " …" ellipses when
+///     `MaxFragments=0` (PG default).
+///   * Up to `MaxFragments` non-overlapping windows joined by " … " when
+///     `MaxFragments > 0`.
+fn headline_fragment(body: &str, query: &str, opts: &HeadlineOptions) -> String {
+    // Collect positive query terms.
     let terms: std::collections::HashSet<String> = match TsQuery::parse_to_tsquery(query) {
         Ok(Some(q)) => {
             let mut acc = Vec::new();
             collect_positive_terms(&q, &mut acc);
             acc.into_iter().collect()
         }
-        // Fall back to a plain tokenisation of the raw text if it is not a
-        // valid tsquery (e.g. a plain phrase was passed in).
         _ => tokenize(query).into_iter().collect(),
     };
 
-    if terms.is_empty() {
-        return body.to_string();
+    // Tokenise the body.
+    let words = tokenize_body(body);
+    let n = words.len();
+
+    // HighlightAll: return the whole body with highlights.
+    if opts.highlight_all || n == 0 {
+        return highlight_words(&words, &terms, &opts.start_sel, &opts.stop_sel);
     }
 
-    // Walk the body splitting on word/non-word boundaries so punctuation and
-    // whitespace are preserved verbatim and only the word runs are wrapped.
-    let mut out = String::with_capacity(body.len() + 16);
-    let mut word = String::new();
-    let flush_word = |word: &mut String, out: &mut String| {
-        if word.is_empty() {
-            return;
+    // If the body is shorter than MinWords there is only one window: the
+    // whole body.
+    if n <= opts.min_words {
+        return highlight_words(&words, &terms, &opts.start_sel, &opts.stop_sel);
+    }
+
+    // Build a bitmap: is word[i] a query hit?
+    let hits: Vec<bool> = words
+        .iter()
+        .map(|w| terms.contains(&w.word.to_lowercase()))
+        .collect();
+
+    // No hits: return the leading MinWords words (PG returns the beginning of
+    // the document when there are no matching terms).
+    if !hits.iter().any(|&h| h) {
+        let end = opts.min_words.min(n);
+        let suffix = if n > end { format!(" {}", ELLIPSIS) } else { String::new() };
+        return format!(
+            "{}{}",
+            highlight_words(&words[..end], &terms, &opts.start_sel, &opts.stop_sel),
+            suffix
+        );
+    }
+
+    // Score windows of size <= MaxWords and pick the best.
+    // "Best" = most hit words; ties broken by leftmost window.
+    let window_size = opts.max_words.min(n);
+
+    if opts.max_fragments == 0 {
+        // Single best window.
+        let (start, end) = best_window(&hits, n, window_size, opts.min_words);
+        render_fragments(
+            &[start..end],
+            &words,
+            n,
+            &terms,
+            opts,
+        )
+    } else {
+        // Multiple non-overlapping windows.
+        let mut chosen: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut taken = vec![false; n];
+        for _ in 0..opts.max_fragments {
+            // Mask out already-taken words so they don't score again.
+            let masked: Vec<bool> = hits
+                .iter()
+                .enumerate()
+                .map(|(i, &h)| h && !taken[i])
+                .collect();
+            if !masked.iter().any(|&h| h) {
+                break;
+            }
+            let (start, end) = best_window(&masked, n, window_size, opts.min_words);
+            for j in start..end {
+                taken[j] = true;
+            }
+            chosen.push(start..end);
         }
-        if terms.contains(&word.to_lowercase()) {
-            out.push_str("<b>");
-            out.push_str(word);
-            out.push_str("</b>");
-        } else {
-            out.push_str(word);
+        // Sort fragments by position for a natural reading order.
+        chosen.sort_by_key(|r| r.start);
+        render_fragments(&chosen, &words, n, &terms, opts)
+    }
+}
+
+const ELLIPSIS: &str = "…";
+
+/// Find the window [start, end) of length up to `window_size` that maximises
+/// the number of hit words.  Ties broken by leftmost window.
+/// The window end is expanded to at least `min_words` if the document allows.
+fn best_window(hits: &[bool], n: usize, window_size: usize, min_words: usize) -> (usize, usize) {
+    let mut best_start = 0usize;
+
+    // Initialise sliding window sum for the first window [0, window_size).
+    let first_end = window_size.min(n);
+    let mut count: usize = hits[..first_end].iter().filter(|&&h| h).count();
+    let mut best_count = count;
+
+    // Slide the window one position at a time.
+    for start in 1..=(n.saturating_sub(window_size)) {
+        // Remove the element leaving the window.
+        if hits[start - 1] {
+            count -= 1;
         }
-        word.clear();
-    };
-    for ch in body.chars() {
-        if ch.is_alphanumeric() {
-            word.push(ch);
-        } else {
-            flush_word(&mut word, &mut out);
-            out.push(ch);
+        // Add the element entering the window (index = start + window_size - 1).
+        let entering_idx = start + window_size - 1;
+        if entering_idx < n && hits[entering_idx] {
+            count += 1;
+        }
+        if count > best_count {
+            best_count = count;
+            best_start = start;
         }
     }
-    flush_word(&mut word, &mut out);
+
+    let end = (best_start + window_size).min(n);
+    // Enforce min_words: expand end if possible.
+    let end = end.max((best_start + min_words).min(n));
+    (best_start, end)
+}
+
+/// Render a list of fragment windows as a single string.
+fn render_fragments(
+    ranges: &[std::ops::Range<usize>],
+    words: &[BodyWord],
+    n: usize,
+    terms: &std::collections::HashSet<String>,
+    opts: &HeadlineOptions,
+) -> String {
+    if ranges.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for range in ranges {
+        let start = range.start;
+        let end = range.end;
+        let fragment = highlight_words(&words[start..end], terms, &opts.start_sel, &opts.stop_sel);
+        let prefix = if start > 0 {
+            format!("{} ", ELLIPSIS)
+        } else {
+            String::new()
+        };
+        let suffix = if end < n {
+            format!(" {}", ELLIPSIS)
+        } else {
+            String::new()
+        };
+        parts.push(format!("{prefix}{fragment}{suffix}"));
+    }
+    parts.join(&format!(" {ELLIPSIS} "))
+}
+
+/// Apply `<b>`/`</b>` wrapping to matched words within the given slice,
+/// reassembling separators.
+fn highlight_words(
+    words: &[BodyWord],
+    terms: &std::collections::HashSet<String>,
+    start_sel: &str,
+    stop_sel: &str,
+) -> String {
+    let mut out = String::new();
+    for w in words {
+        out.push_str(&w.prefix);
+        if terms.contains(&w.word.to_lowercase()) {
+            out.push_str(start_sel);
+            out.push_str(&w.word);
+            out.push_str(stop_sel);
+        } else {
+            out.push_str(&w.word);
+        }
+    }
     out
 }
 
@@ -1766,6 +2100,102 @@ fn collect_positive_terms(q: &TsQuery, acc: &mut Vec<String>) {
 }
 
 // ===========================================================================
+// setweight(tsvector, "A"|"B"|"C"|"D") — annotate positions with weight class
+// ===========================================================================
+//
+// Design note (setweight + tsvector format):
+//
+//   PG stores weight letters immediately after each position number in the
+//   canonical text form: `'fox':1A 'run':2B`.  Our parser already reads and
+//   silently drops the weight letter (see `parse_canonical`), so the format is
+//   backward-compatible — no schema change is needed.  `setweight` rewrites
+//   the canonical form to append the weight letter to every position.
+//
+//   When a tsvector has no positions (bare-cast form) the weight is stored as
+//   a standalone letter after the colon: `'fox':A` — matching PG's output for
+//   stripped vectors.
+//
+//   `ts_rank` currently ignores weight classes (all lexemes treated as
+//   weight D=1.0 equivalent), matching PG's default ts_rank when all classes
+//   share equal weight.  Per-class weighting is documented as future work.
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SetweightUdf {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for SetweightUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "setweight"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+    #[allow(deprecated)]
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let args = &args.args;
+        let n = num_rows(args);
+        let tv_arr = arg_strings(&args[0], n)?;
+        let wt_arr = arg_strings(&args[1], n)?;
+        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+        for i in 0..n {
+            if tv_arr.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let wt_letter: char = if wt_arr.is_null(i) {
+                'D'
+            } else {
+                let s = wt_arr.value(i).trim();
+                match s.to_ascii_uppercase().as_str() {
+                    "A" => 'A',
+                    "B" => 'B',
+                    "C" => 'C',
+                    "D" | "" => 'D',
+                    other => {
+                        return Err(datafusion::common::DataFusionError::Execution(format!(
+                            "setweight: invalid weight class {:?}; expected A, B, C or D",
+                            other
+                        )));
+                    }
+                }
+            };
+            let tv = TsVector::parse(tv_arr.value(i));
+            out.push(Some(tv_with_weight(&tv, wt_letter)));
+        }
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
+    }
+}
+
+/// Rewrite a tsvector's canonical form with weight letter `w` appended to
+/// every position entry.  Lexemes with no stored positions get `:W`
+/// (weight-only, no number — matches PG's output for stripped vectors).
+fn tv_with_weight(tv: &TsVector, w: char) -> String {
+    let mut parts = Vec::with_capacity(tv.entries.len());
+    for (lex, ps) in &tv.entries {
+        let q = quote_lexeme(lex);
+        if ps.is_empty() {
+            // No positions — emit weight-only annotation.
+            parts.push(format!("{q}:{w}"));
+        } else {
+            let posstr = ps
+                .iter()
+                .map(|p| format!("{p}{w}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            parts.push(format!("{q}:{posstr}"));
+        }
+    }
+    parts.join(" ")
+}
+
+// ===========================================================================
 // Unit tests — tokenisation, canonical forms, the full @@ truth table,
 // phrase adjacency (positive AND negative), tsvector_to_array, tsquery_phrase
 // ===========================================================================
@@ -1773,6 +2203,10 @@ fn collect_positive_terms(q: &TsQuery, acc: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn default_opts() -> HeadlineOptions {
+        HeadlineOptions::default()
+    }
 
     fn tsv(text: &str) -> String {
         TsVector::from_text_document(text, Some("english")).to_canonical()
@@ -1813,17 +2247,20 @@ mod tests {
 
     #[test]
     fn headline_wraps_matched_terms() {
-        // Single term, preserves punctuation/whitespace verbatim.
+        let opts = default_opts();
+        // Single term, short doc (<= MinWords) → full body returned.
+        // "The quick brown fox." = 4 words < 15 → returned in full.
         assert_eq!(
-            headline_highlight("The quick brown fox.", "fox"),
+            headline_fragment("The quick brown fox.", "fox", &opts),
             "The quick brown <b>fox</b>."
         );
     }
 
     #[test]
     fn headline_handles_and_query_and_case_insensitive() {
+        let opts = default_opts();
         assert_eq!(
-            headline_highlight("Quick brown FOX jumps", "quick & fox"),
+            headline_fragment("Quick brown FOX jumps", "quick & fox", &opts),
             "<b>Quick</b> brown <b>FOX</b> jumps"
         );
     }
@@ -1831,20 +2268,23 @@ mod tests {
     #[test]
     fn headline_skips_negated_terms() {
         // `!brown` is a negative term and must NOT be highlighted; `fox` is.
+        let opts = default_opts();
         assert_eq!(
-            headline_highlight("quick brown fox", "fox & !brown"),
+            headline_fragment("quick brown fox", "fox & !brown", &opts),
             "quick brown <b>fox</b>"
         );
     }
 
     #[test]
     fn headline_no_match_returns_body_unchanged() {
-        assert_eq!(
-            headline_highlight("the quick brown fox", "dog"),
-            "the quick brown fox"
-        );
-        // Empty query → unchanged body (no terms to wrap).
-        assert_eq!(headline_highlight("hello world", ""), "hello world");
+        let opts = default_opts();
+        // Short doc, no match → whole body returned (no wraps, no ellipsis).
+        let got = headline_fragment("the quick brown fox", "dog", &opts);
+        assert!(got.contains("the") && got.contains("fox"), "got={got:?}");
+        assert!(!got.contains("<b>"), "no wrapping on no-match: got={got:?}");
+        // Empty query → no terms → leading words.
+        let eg = headline_fragment("hello world", "", &opts);
+        assert!(eg.contains("hello"), "got={eg:?}");
     }
 
     #[test]

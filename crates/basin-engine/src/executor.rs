@@ -1721,6 +1721,21 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         return exec_compress_chunk(sess, intent).await;
     }
 
+    // ── Phase 5.29.G: SELECT time_bucket_gapfill(…) [+ locf(…)] ──────────────
+    // Detect a gapfill query, run a rewritten (gapfill→time_bucket, locf
+    // unwrapped) form through the normal SELECT path, then densify the result
+    // batches against the bucket grid. See `crate::gapfill`.
+    if let Some(req) = crate::gapfill::match_gapfill(raw_sql)? {
+        let inner = Box::pin(execute(sess, &req.rewritten_sql)).await?;
+        return match inner {
+            ExecResult::Rows { schema, batches } => {
+                let dense = crate::gapfill::densify(&schema, &batches, &req)?;
+                Ok(ExecResult::Rows { schema, batches: dense })
+            }
+            other => Ok(other),
+        };
+    }
+
     // Phase 5.14.C5 — ALTER PROJECT <name> SET basin.memtable_hard_cap = <n>.
     if let Some((project_name, hard_cap_bytes)) =
         crate::alter_project::match_alter_project_memtable_cap(sql)?
@@ -4537,10 +4552,16 @@ async fn exec_create_index(
             }
             Some("jsonb_ops") => Some("jsonb_ops".to_string()),
             Some("jsonb_path_ops") => Some("jsonb_path_ops".to_string()),
+            // Trigram GIN: `CREATE INDEX … USING gin (text_col gin_trgm_ops)`.
+            // Indexes a TEXT/VARCHAR column's trigram set so `%` / `<%` / `<->`
+            // similarity predicates can prune to candidate files/rows instead of
+            // a sequential scan.  The build path extracts trigrams via
+            // `basin_trgm` (same padding/case-fold as `similarity()`).
+            Some("gin_trgm_ops") => Some("gin_trgm_ops".to_string()),
             Some(other) => {
                 return Err(BasinError::InvalidSchema(format!(
                     "CREATE INDEX USING gin: unknown operator class {other:?}; \
-                     accepted: jsonb_ops (default), jsonb_path_ops, tsvector_ops"
+                     accepted: jsonb_ops (default), jsonb_path_ops, tsvector_ops, gin_trgm_ops"
                 )));
             }
         }
@@ -5018,9 +5039,12 @@ async fn backfill_index_over_live_files(
 
     // gist and vector indexes are not backfilled here.
     let is_fts_gin = access_method == "gin" && gin_opclass == Some("tsvector_ops");
-    let is_plain_gin = access_method == "gin" && !is_fts_gin;
+    let is_trgm_gin = access_method == "gin" && gin_opclass == Some("gin_trgm_ops");
+    // "plain" GIN here means JSONB containment (jsonb_ops / jsonb_path_ops) —
+    // NOT the FTS or trigram opclasses, which have their own extraction.
+    let is_plain_gin = access_method == "gin" && !is_fts_gin && !is_trgm_gin;
     let is_btree = access_method == "btree";
-    if !is_plain_gin && !is_fts_gin && !is_btree {
+    if !is_plain_gin && !is_fts_gin && !is_trgm_gin && !is_btree {
         return;
     }
 
@@ -5094,6 +5118,10 @@ async fn backfill_index_over_live_files(
                 backfill_gin_batch(
                     sess, table, col_name, opclass, &batch, &f.path, rg_size, file_row_off,
                 );
+            } else if is_trgm_gin {
+                backfill_trgm_batch(
+                    sess, table, col_name, &batch, &f.path, file_row_off,
+                );
             } else if is_fts_gin {
                 backfill_fts_batch(
                     sess, table, col_name, &batch, &f.path, rg_size, file_row_off,
@@ -5110,7 +5138,16 @@ async fn backfill_index_over_live_files(
             continue;
         }
 
-        if is_plain_gin {
+        if is_trgm_gin {
+            // Seal the trigram file-level posting list so the read-path
+            // completeness guard (`indexed_files_for` / probe_trgm_scan_set)
+            // trusts this file. A read error above leaves it un-sealed → forced
+            // full scan for this file (correct, just unpruned). The row tier is
+            // sealed inside `mark_file_indexed` (density cap + budget).
+            sess.engine.gin_index_registry().mark_file_indexed(
+                &project, table, col_name, &f.path,
+            );
+        } else if is_plain_gin {
             // Seal the file in both GIN registries so the read-path
             // completeness guards (`is_file_indexed`) pass for this file.
             sess.engine.gin_rowgroup_registry().mark_file_indexed(
@@ -5279,6 +5316,60 @@ fn backfill_fts_batch(
         fts_registry.index_row(
             &project, table, col_name, tsv_str, file_path, row_group, file_row as u64,
         );
+    }
+}
+
+/// Feed one batch (read from an existing file at `file_row_off` rows into the
+/// file) into the trigram GIN file-level posting list + row tier.  Mirrors
+/// `backfill_fts_batch` but extracts TRIGRAMS via `basin_trgm` (same padding /
+/// case-fold as `similarity()`).  The text column is stored as Utf8, but the
+/// runtime Arrow encoding depends on the source file format — Parquet
+/// round-trips to `StringArray`, the Vortex reader may surface `Utf8View` /
+/// `LargeUtf8`.  Accept all three: a silent downcast failure would leave the
+/// file with no posting entries while the caller seals it as "complete", and
+/// the trigram probe could then prune rows that exist.
+fn backfill_trgm_batch(
+    sess: &ProjectSession,
+    table: &TableName,
+    col_name: &str,
+    batch: &arrow_array::RecordBatch,
+    file_path: &str,
+    file_row_off: usize,
+) {
+    use arrow_array::Array;
+    let Ok(col_idx) = batch.schema().index_of(col_name) else {
+        return;
+    };
+    let col = batch.column(col_idx);
+    enum StrCol<'a> {
+        Small(&'a arrow_array::StringArray),
+        Large(&'a arrow_array::LargeStringArray),
+        View(&'a arrow_array::StringViewArray),
+    }
+    let arr = if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+        StrCol::Small(a)
+    } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+        StrCol::Large(a)
+    } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringViewArray>() {
+        StrCol::View(a)
+    } else {
+        return;
+    };
+    let row_str = |r: usize| -> Option<&str> {
+        match &arr {
+            StrCol::Small(a) => (!a.is_null(r)).then(|| a.value(r)),
+            StrCol::Large(a) => (!a.is_null(r)).then(|| a.value(r)),
+            StrCol::View(a) => (!a.is_null(r)).then(|| a.value(r)),
+        }
+    };
+    let registry = sess.engine.gin_index_registry();
+    let project = sess.project;
+    for row in 0..batch.num_rows() {
+        let Some(text) = row_str(row) else {
+            continue;
+        };
+        let file_row = file_row_off + row;
+        registry.index_text_row(&project, table, col_name, text, file_path, file_row as u64);
     }
 }
 
@@ -9597,6 +9688,9 @@ pub(crate) fn map_df_exec_error(e: datafusion::error::DataFusionError) -> BasinE
                 BasinError::LockNotAvailable(msg) => {
                     return BasinError::LockNotAvailable(msg.clone());
                 }
+                BasinError::DeadlockDetected(msg) => {
+                    return BasinError::DeadlockDetected(msg.clone());
+                }
                 other => {
                     return BasinError::internal(format!("execute: {other}"));
                 }
@@ -9976,6 +10070,25 @@ pub(crate) async fn exec_select(
             &rtree_sql,
         )
         .await?;
+        // Trigram GIN file-level + row-tier pruning (`col % 'needle'`).
+        // Use the original SQL so `%` is still present (before
+        // `rewrite_trgm_operators` lowers it to `similarity(col,'needle') >= t`).
+        // Pass the session's `pg_trgm.similarity_threshold` so the prune bound
+        // matches the threshold baked into the rewritten recheck predicate
+        // (a mismatch could prune tighter than the predicate — never allowed).
+        // Decline inside a transaction (pending files the registry hasn't seen).
+        if !crate::session::tx_is_active(&sess.state) {
+            let trgm_threshold =
+                crate::session::session_trgm_similarity_threshold(&sess.state);
+            crate::session::apply_trgm_pruning_for_query(
+                &sess.engine,
+                &sess.project,
+                &sess.ctx,
+                orig_sql,
+                trgm_threshold,
+            )
+            .await?;
+        }
     }
 
     // View-reference rewriting: replace any reference to a known plain view
@@ -12824,6 +12937,11 @@ async fn maintain_secondary_indexes_on_insert(
                     .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE)
                     .max(1);
                 maintain_gin_fts_index_on_insert(fts_registry, &sess.project, table, col_name, batch, file_path, rg_size);
+            } else if opclass == "gin_trgm_ops" {
+                // Trigram GIN index — populate the file-level trigram posting
+                // list + row tier from the TEXT column. Extraction matches
+                // `similarity()` (basin_trgm padding/case-fold).
+                maintain_gin_trgm_index_on_insert(gin_registry, &sess.project, table, col_name, batch, file_path);
             } else {
                 // Phase 5.19.C: JSONB GIN index — populate JSONB posting list.
                 maintain_gin_index_on_insert(gin_registry, &sess.project, table, col_name, opclass, batch, file_path);
@@ -12903,6 +13021,63 @@ fn maintain_gin_index_on_insert(
         // array — i.e., a real JSONB column in this batch.
         gin_registry.mark_file_indexed(project, table, col_name, file_path);
     }
+}
+
+/// Populate the trigram GIN posting list for a single TEXT column from a newly
+/// written `batch`.  Iterates every non-null row, extracts trigrams via
+/// `basin_trgm` (same padding/case-fold as `similarity()`), and inserts them
+/// into the shared GIN registry (file-level posting list + row tier).
+///
+/// Accepts the string encodings an INSERT batch can carry (Utf8 / LargeUtf8 /
+/// Utf8View).  Only seals the file as complete when a string array was present
+/// — a silent downcast miss must not claim coverage (it would let the probe
+/// prune rows that exist).
+fn maintain_gin_trgm_index_on_insert(
+    gin_registry: &Arc<crate::index_probe::GinIndexRegistry>,
+    project: &basin_common::ProjectId,
+    table: &basin_common::TableName,
+    col_name: &str,
+    batch: &arrow_array::RecordBatch,
+    file_path: &str,
+) {
+    use arrow_array::Array;
+    let Ok(col_idx) = batch.schema().index_of(col_name) else {
+        return;
+    };
+    let col = batch.column(col_idx);
+    enum StrCol<'a> {
+        Small(&'a arrow_array::StringArray),
+        Large(&'a arrow_array::LargeStringArray),
+        View(&'a arrow_array::StringViewArray),
+    }
+    let arr = if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+        StrCol::Small(a)
+    } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+        StrCol::Large(a)
+    } else if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringViewArray>() {
+        StrCol::View(a)
+    } else {
+        return;
+    };
+    let n = match &arr {
+        StrCol::Small(a) => a.len(),
+        StrCol::Large(a) => a.len(),
+        StrCol::View(a) => a.len(),
+    };
+    for row in 0..n {
+        let val = match &arr {
+            StrCol::Small(a) => (!a.is_null(row)).then(|| a.value(row)),
+            StrCol::Large(a) => (!a.is_null(row)).then(|| a.value(row)),
+            StrCol::View(a) => (!a.is_null(row)).then(|| a.value(row)),
+        };
+        if let Some(text) = val {
+            gin_registry.index_text_row(project, table, col_name, text, file_path, row as u64);
+        }
+    }
+    // Seal: every live file must be in the completeness set before the trigram
+    // probe trusts the posting list. This also seals the row tier (density cap
+    // + budget) inside `mark_file_indexed`.
+    gin_registry.mark_file_indexed(project, table, col_name, file_path);
 }
 
 /// C2 — Populate the per-row-group bloom-filter registry for a single JSONB

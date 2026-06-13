@@ -26,8 +26,9 @@
 //!   F7 websearch_to_tsquery end-to-end
 //!   F8 ts_headline projection cost
 //!
-//! ## Excluded as unimplemented
-//!   * `setweight` / weighted tsvectors — not registered (correctness gap).
+//! ## Excluded as separate perf shapes
+//!   * `setweight` — registered; no dedicated perf shape (output is a string
+//!     transformation, cost dominated by to_tsvector ingest).
 //!   * cover-density `ts_rank_cd` distinct algorithm — same formula as ts_rank,
 //!     not a separate perf shape.
 //!

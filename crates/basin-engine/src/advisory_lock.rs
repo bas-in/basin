@@ -15,10 +15,12 @@
 //! Per ADR 0026, Basin uses optimistic concurrency for row writes (conflicts
 //! surface as SQLSTATE 40001 at commit). Advisory locks are the *only*
 //! operations that genuinely block in Basin. This module implements a real
-//! keyed wait queue: a second session requesting a held key spins (using
-//! `basin_shard::lock_wait::bounded_lock_wait_sync`) until the holder
-//! releases or the effective lock timeout fires. On timeout the function
-//! returns `BasinError::LockNotAvailable` → SQLSTATE 55P03.
+//! keyed wait queue: a second session requesting a held key spins (in
+//! [`AdvisorySessionLocks::wait_loop`], a bounded spin-with-backoff) until the
+//! holder releases or the effective lock timeout fires. On timeout the function
+//! returns `BasinError::LockNotAvailable` → SQLSTATE 55P03. A cyclic wait is
+//! broken promptly by the wait-for-graph detector (see "Deadlock detection"
+//! below) with `BasinError::DeadlockDetected` → SQLSTATE 40P01.
 //!
 //! ## Project-scoped keyspace
 //!
@@ -76,24 +78,81 @@
 //!
 //! ## lock_timeout enforcement (ADR 0026)
 //!
-//! The blocking variants use `basin_shard::lock_wait::bounded_lock_wait_sync`
-//! with the *effective* timeout as the deadline. The effective timeout is the
+//! The blocking variants spin in [`AdvisorySessionLocks::wait_loop`] with the
+//! *effective* timeout as the deadline. The effective timeout is the
 //! session's `lock_timeout` GUC if set, else the process default from the
 //! `BASIN_ADVISORY_LOCK_TIMEOUT_SECS` environment variable (default 60s). A
 //! value of `0` for either disables the timeout (wait indefinitely until the
 //! lock is released), matching PG's `lock_timeout = 0` semantics. On expiry
 //! the function returns `BasinError::LockNotAvailable` → SQLSTATE 55P03.
 //!
+//! ## Deadlock detection (wait-for graph)
+//!
+//! Basin builds a process-global **wait-for graph** so cyclic waits are broken
+//! immediately with SQLSTATE 40P01 (`deadlock_detected`) instead of every
+//! member of the cycle stalling until its `lock_timeout` fires (55P03). This
+//! closes the documented divergence from PG's prompt deadlock reporting.
+//!
+//! * **Graph structure.** Nodes are *owner tokens* (one per session). An edge
+//!   `A → B` means "session A is currently blocked waiting for a key that
+//!   session B holds". The edge set is stored as `HashMap<owner, WaitEdge>`
+//!   keyed by the *waiter*: a session executes statements serially, so a given
+//!   session has at most one outstanding `block_lock` and therefore at most one
+//!   out-edge at a time. A single owner can however be the *holder* of many
+//!   keys, so it can be the target of many in-edges. The holder of the waited-on
+//!   key is read live from `LOCK_TABLE` at detection time, so edges track holder
+//!   hand-offs without per-release mutation.
+//! * **Check cadence.** Cycle detection runs (a) once when the wait begins,
+//!   immediately after the first failed acquire, and (b) on every retry tick of
+//!   the wait loop (the `ADVISORY_RETRY_INTERVAL`, 2 ms) — i.e. "periodically
+//!   while waiting". Detection is therefore prompt (sub-10 ms in practice),
+//!   nowhere near the 60 s timeout. The graph is tiny (bounded by the number of
+//!   *currently blocked* sessions), so a plain walk per check is far cheaper
+//!   than any incremental scheme — simplicity over cleverness.
+//! * **Cycle detection.** The wait-for graph is *functional* (each waiter has
+//!   out-degree ≤ 1), so detection is a single linear chase from the waiter:
+//!   follow "waiter → live holder of its key → that holder's own out-edge (if
+//!   it too is waiting)" until the chain reaches a non-waiter (no deadlock) or
+//!   revisits a node already on the path (cycle).
+//! * **Victim policy.** Basin aborts the **newest** waiter in the cycle — the
+//!   one with the highest owner token (owner tokens are minted from a monotonic
+//!   counter, so "highest token" == "most recently opened session among the
+//!   cycle members"). Every waiter in the cycle runs the same walk and computes
+//!   the same max-owner victim deterministically, so exactly one is chosen
+//!   without coordination. This diverges from PostgreSQL, which picks the
+//!   victim by an internal *cost* heuristic (it prefers to abort the
+//!   transaction that has done the least work / is cheapest to roll back).
+//!   Basin has no per-session work accounting at this layer, so it uses the
+//!   simplest deterministic rule that guarantees a single victim; the surviving
+//!   waiters then make progress as the victim's transaction unwinds and releases
+//!   its locks. The victim's `block_lock` returns `BasinError::DeadlockDetected`
+//!   → SQLSTATE 40P01; its already-held locks are released by the normal error
+//!   unwind (xact-end / session-end / explicit unlock paths are unchanged).
+//! * **Edge lifecycle.** An edge is inserted right before the wait loop and
+//!   removed the instant the wait ends — acquired, timed out, *or* aborted as a
+//!   deadlock victim — via a `WaitEdgeGuard` RAII drop. No code path can leave a
+//!   stale edge: even a panic in the wait loop drops the guard.
+//! * **Self-deadlock.** A session waiting on a key it *already holds* is a PG
+//!   no-op: re-entrancy means the acquire succeeds immediately (the owner check
+//!   in `try_acquire` bumps the count), so `block_lock` never enters the wait
+//!   loop and no self-edge is ever created. The walk additionally stops if a
+//!   key's holder is the waiter itself, so a self-cycle is never reported.
+//! * **Shared keyspace.** Session-scoped and xact-scoped acquisitions share the
+//!   same `LOCK_TABLE`, so the wait-for graph covers both uniformly — an xact
+//!   lock held by B is just as much an edge target as a session lock.
+//!
 //! ## Divergence from PostgreSQL
 //!
-//! PG performs true deadlock *detection*: a cycle of waiters is broken
-//! immediately with SQLSTATE 40P01 (`deadlock_detected`), regardless of any
-//! timeout. Basin does **not** build the wait-for graph; instead a cyclic
-//! wait simply runs into the lock-wait timeout and surfaces as SQLSTATE 55P03
-//! (`lock_not_available`). For the single-node job-queue / migration-lock
-//! patterns Basin targets this is sufficient — the generous default timeout
-//! guarantees forward progress — but it is a deliberate, documented divergence
-//! from PG's instantaneous deadlock reporting.
+//! * **Victim selection.** PG breaks a deadlock using a cost-based victim
+//!   choice; Basin always aborts the newest waiter (highest owner token) in the
+//!   cycle. Both guarantee forward progress; only *which* statement loses
+//!   differs. See "Victim policy" above.
+//! * **Granularity.** PG's detector covers all lock types (row, table, advisory)
+//!   under one graph and fires after `deadlock_timeout` (1 s default). Basin's
+//!   graph covers *advisory* locks only — they are the sole operations that
+//!   genuinely block in Basin (ADR 0026; row writes use optimistic concurrency
+//!   and surface 40001 at commit) — and it checks on every 2 ms retry tick, so
+//!   it reports faster than PG's 1 s timer for this lock class.
 //!
 //! ## LockRegistry integration (Phase 5.23.D)
 //!
@@ -121,7 +180,6 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 
 use basin_common::BasinError;
-use basin_shard::lock_wait::bounded_lock_wait_sync;
 
 /// Retry cadence for the blocking variants. 2 ms gives low latency for the
 /// common case (held for < 10 ms) while not hammering the CPU on long waits.
@@ -186,6 +244,113 @@ fn with_table<R>(f: impl FnOnce(&mut HashMap<ScopedKey, LockHolder>) -> R) -> R 
     f(map)
 }
 
+// ---------------------------------------------------------------------------
+// Wait-for graph (deadlock detection).
+//
+// One edge per *currently blocked* waiter, keyed by the waiter's owner token.
+// `WaitEdge::key` is the scoped key the waiter is blocked on; the *holder* of
+// that key is resolved live from LOCK_TABLE during detection so the graph
+// follows holder hand-offs without us mutating edges on every release. `abort`
+// is the victim signal: the wait loop polls it and bails out with
+// DeadlockDetected when the detector elects this waiter as the victim.
+// ---------------------------------------------------------------------------
+
+/// A single wait-for edge: "owner (the map key) is blocked on `key`".
+struct WaitEdge {
+    /// The scoped key this waiter is blocked on. The holder is read live.
+    key: ScopedKey,
+    /// Set to `true` by the detector when this waiter is elected the victim.
+    abort: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Process-global wait-for graph: waiter-owner -> the edge it is blocked on.
+/// Guarded by its own mutex (separate from `LOCK_TABLE`) so detection never
+/// holds the lock-table mutex while doing graph work; the walk briefly locks
+/// `LOCK_TABLE` to resolve each edge's live holder, then releases it. The two
+/// mutexes are never held simultaneously, so there is no lock-ordering hazard.
+static WAIT_GRAPH: Mutex<Option<HashMap<u64, WaitEdge>>> = Mutex::new(None);
+
+fn with_graph<R>(f: impl FnOnce(&mut HashMap<u64, WaitEdge>) -> R) -> R {
+    let mut guard = WAIT_GRAPH.lock().expect("advisory WAIT_GRAPH poisoned");
+    let map = guard.get_or_insert_with(HashMap::new);
+    f(map)
+}
+
+/// Resolve the current holder owner of `key`, if any. Used by detection to walk
+/// from a waiter to the session it is blocked on.
+fn holder_of(key: ScopedKey) -> Option<u64> {
+    with_table(|t| t.get(&key).map(|h| h.owner))
+}
+
+/// RAII guard that removes a waiter's edge from `WAIT_GRAPH` when the wait ends
+/// (acquired, timed out, or aborted as a deadlock victim) — including on panic.
+struct WaitEdgeGuard {
+    owner: u64,
+}
+
+impl Drop for WaitEdgeGuard {
+    fn drop(&mut self) {
+        with_graph(|g| {
+            g.remove(&self.owner);
+        });
+    }
+}
+
+/// Run cycle detection over the wait-for graph and, if a cycle through `start`
+/// exists, return the elected victim (the highest owner token among the
+/// cycle's members — the newest session). Returns `None` when no cycle involves
+/// `start`.
+///
+/// The graph is *functional* (each waiter has out-degree ≤ 1), so a single
+/// linear chase suffices: from each node follow the live holder of the key it
+/// waits on; the chain ends at a non-waiter (no cycle) or revisits a node
+/// already on the path (cycle). A key whose holder is the walker itself
+/// (re-entrant self-hold — which cannot actually happen, but we guard anyway)
+/// ends the chain without reporting a deadlock.
+fn detect_cycle_victim(start: u64) -> Option<u64> {
+    // Snapshot the waiter edges (owner -> waited-on key) under the graph lock,
+    // then resolve holders without holding it, to keep lock ordering simple.
+    let edges: HashMap<u64, ScopedKey> =
+        with_graph(|g| g.iter().map(|(o, e)| (*o, e.key)).collect());
+
+    let mut path: Vec<u64> = Vec::new();
+    let mut on_path: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut cur = start;
+    loop {
+        if !on_path.insert(cur) {
+            // Revisited `cur`: the cycle is the suffix of `path` from the first
+            // occurrence of `cur` onward; the victim is its highest owner token.
+            let from = path.iter().position(|&n| n == cur).unwrap_or(0);
+            return path[from..].iter().copied().max();
+        }
+        path.push(cur);
+
+        // Where is `cur` blocked? If it is not a waiter, the chain ends.
+        let key = match edges.get(&cur) {
+            Some(k) => *k,
+            None => return None,
+        };
+        // Who holds that key right now?
+        let holder = match holder_of(key) {
+            Some(h) => h,
+            None => return None, // key just got released — no deadlock here
+        };
+        if holder == cur {
+            return None; // self-hold (re-entrant) — not a deadlock
+        }
+        cur = holder;
+    }
+}
+
+/// Set the abort flag of `victim`'s wait edge, if it is still waiting.
+fn signal_victim(victim: u64) {
+    with_graph(|g| {
+        if let Some(e) = g.get(&victim) {
+            e.abort.store(true, std::sync::atomic::Ordering::Release);
+        }
+    });
+}
+
 /// Pack a `(classid, objid)` int4 pair into the single i64 keyspace exactly
 /// as PostgreSQL does: high 32 bits = classid, low 32 bits = objid, each
 /// reinterpreted through `u32` first so sign is preserved bit-for-bit.
@@ -243,6 +408,42 @@ fn release_all_of(key: ScopedKey, owner: u64) {
             }
         }
     });
+}
+
+/// Result of [`AdvisorySessionLocks::wait_loop`].
+enum WaitOutcome {
+    /// The lock was acquired.
+    Acquired,
+    /// The effective lock timeout fired before acquisition (→ 55P03).
+    TimedOut,
+    /// This waiter was elected the victim of a detected deadlock (→ 40P01).
+    Deadlock,
+}
+
+impl WaitOutcome {
+    /// Run cycle detection from `owner`. If a cycle exists, signal the elected
+    /// victim's abort flag; if `owner` *is* the victim, return
+    /// [`WaitOutcome::Deadlock`] so the caller exits immediately. Returns `None`
+    /// when no deadlock involves `owner`, or when another cycle member is the
+    /// victim (that member's own loop then observes its abort flag and bails).
+    fn check_deadlock(owner: u64, abort: &std::sync::atomic::AtomicBool) -> Option<WaitOutcome> {
+        match detect_cycle_victim(owner) {
+            Some(victim) if victim == owner => {
+                // We are the victim — abort right here (the flag is set too,
+                // harmlessly).
+                abort.store(true, std::sync::atomic::Ordering::Release);
+                Some(WaitOutcome::Deadlock)
+            }
+            Some(victim) => {
+                // Another waiter in the cycle is the victim — signal it. Its
+                // wait loop polls `abort` each tick and exits with Deadlock,
+                // which frees the lock(s) we are waiting on.
+                signal_victim(victim);
+                None
+            }
+            None => None,
+        }
+    }
 }
 
 /// Per-session advisory-lock bookkeeping. One instance per
@@ -431,15 +632,29 @@ impl AdvisorySessionLocks {
         }
     }
 
-    /// Blocking acquire with effective-timeout enforcement (ADR 0026).
+    /// Blocking acquire with effective-timeout enforcement (ADR 0026) and
+    /// wait-for-graph deadlock detection.
     ///
-    /// Spins via `bounded_lock_wait_sync` until the lock is free or the
-    /// effective timeout elapses. On expiry returns
-    /// `BasinError::LockNotAvailable` → SQLSTATE 55P03.
+    /// Spins in [`Self::wait_loop`] until the lock is free, the effective
+    /// timeout elapses (→ `BasinError::LockNotAvailable` / 55P03), or this
+    /// waiter is elected the victim of a detected deadlock cycle (→
+    /// `BasinError::DeadlockDetected` / 40P01). A re-entrant self-acquire
+    /// returns immediately and never enters the wait loop or the graph.
     ///
     /// The waiter entry (`granted=false`) is registered in `LockRegistry`
     /// before blocking and replaced by `granted=true` on success.
     pub(crate) fn block_lock(&self, key: i64, xact: bool) -> Result<(), BasinError> {
+        let owner = self.owner;
+        let scoped = self.scoped(key);
+
+        // Fast path: an immediate, uncontended acquire (covers the re-entrant
+        // self-lock case too — try_acquire bumps the count for the same owner)
+        // never enters the wait loop and never touches the wait-for graph.
+        if try_acquire(scoped, owner) == AcquireOutcome::Acquired {
+            self.note_acquired(key, xact);
+            return Ok(());
+        }
+
         let pid = self.session_pid.load(std::sync::atomic::Ordering::Relaxed);
         // Register a waiting entry in pg_locks so observers see the contention.
         let _wait_handle: Option<basin_shard::LockHandle> =
@@ -451,24 +666,94 @@ impl AdvisorySessionLocks {
                 _ => None,
             };
 
-        let owner = self.owner;
-        let scoped = self.scoped(key);
-        let acquired = bounded_lock_wait_sync(
-            move || try_acquire(scoped, owner) == AcquireOutcome::Acquired,
-            self.effective_timeout(),
-            ADVISORY_RETRY_INTERVAL,
-        );
+        // Register this waiter's out-edge in the wait-for graph. The guard
+        // removes it the instant the wait ends (any exit path, including panic).
+        let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        with_graph(|g| {
+            g.insert(
+                owner,
+                WaitEdge {
+                    key: scoped,
+                    abort: abort.clone(),
+                },
+            );
+        });
+        let _edge_guard = WaitEdgeGuard { owner };
 
-        // _wait_handle is dropped here — removes the waiting entry from pg_locks.
+        let outcome = self.wait_loop(scoped, owner, &abort);
+
+        // _wait_handle and _edge_guard are dropped here — removes the waiting
+        // entry from pg_locks and the edge from the wait-for graph.
         drop(_wait_handle);
 
-        if acquired {
-            self.note_acquired(key, xact);
-            Ok(())
-        } else {
-            Err(BasinError::LockNotAvailable(format!(
+        match outcome {
+            WaitOutcome::Acquired => {
+                self.note_acquired(key, xact);
+                Ok(())
+            }
+            WaitOutcome::TimedOut => Err(BasinError::LockNotAvailable(format!(
                 "canceling statement due to lock timeout on advisory lock {key}"
-            )))
+            ))),
+            WaitOutcome::Deadlock => Err(BasinError::DeadlockDetected(format!(
+                "deadlock detected waiting for advisory lock {key}"
+            ))),
+        }
+    }
+
+    /// The bounded wait loop with per-tick deadlock detection. Spins on
+    /// `try_acquire` until the lock is free, the effective timeout fires, or the
+    /// detector elects this waiter as a deadlock victim. Runs cycle detection
+    /// once up front (right after the first failed acquire) and again on every
+    /// retry tick — see the module header's "Check cadence".
+    fn wait_loop(
+        &self,
+        scoped: ScopedKey,
+        owner: u64,
+        abort: &std::sync::atomic::AtomicBool,
+    ) -> WaitOutcome {
+        use std::time::Instant;
+        let deadline = self.effective_timeout().map(|d| Instant::now() + d);
+
+        // Check for a deadlock immediately: the edge we just inserted may have
+        // closed a cycle. If so, fire the victim before we even sleep.
+        if let Some(o) = WaitOutcome::check_deadlock(owner, abort) {
+            return o;
+        }
+
+        loop {
+            // Victim signal (set by *another* waiter's detection run, or our own).
+            if abort.load(std::sync::atomic::Ordering::Acquire) {
+                return WaitOutcome::Deadlock;
+            }
+            // Deadline check before sleeping.
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    return WaitOutcome::TimedOut;
+                }
+            }
+
+            let sleep_dur = if let Some(dl) = deadline {
+                dl.saturating_duration_since(Instant::now())
+                    .min(ADVISORY_RETRY_INTERVAL)
+            } else {
+                ADVISORY_RETRY_INTERVAL
+            };
+            std::thread::sleep(sleep_dur);
+
+            if try_acquire(scoped, owner) == AcquireOutcome::Acquired {
+                return WaitOutcome::Acquired;
+            }
+
+            // Per-tick cycle detection.
+            if let Some(o) = WaitOutcome::check_deadlock(owner, abort) {
+                return o;
+            }
+
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    return WaitOutcome::TimedOut;
+                }
+            }
         }
     }
 
@@ -1125,5 +1410,290 @@ mod tests {
         // After p1 releases, p1b can take it.
         assert!(p1b.try_lock(key, false));
         p1b.session_unlock(key);
+    }
+
+    // -----------------------------------------------------------------------
+    // Deadlock detection (wait-for graph).
+    // -----------------------------------------------------------------------
+
+    /// 2-session ABBA deadlock: A holds k1 then blocks on k2; B holds k2 then
+    /// blocks on k1. The detector must abort the newest waiter (higher owner
+    /// token) with DeadlockDetected promptly (far under the timeout). After the
+    /// victim's transaction unwinds — modelled here by releasing its locks, as
+    /// the executor's error path does — the surviving waiter ACQUIRES.
+    ///
+    /// Because the victim is *deterministic* (highest owner token), the test
+    /// knows up front which waiter will lose, joins it first to observe the
+    /// prompt 40P01, sheds its locks, then joins the winner.
+    #[test]
+    fn abba_deadlock_aborts_one_and_lets_other_proceed() {
+        // `a` is minted first, `b` second → b.owner > a.owner → B is the victim.
+        let a = Arc::new(AdvisorySessionLocks::new());
+        let b = Arc::new(AdvisorySessionLocks::new());
+        assert!(b.owner > a.owner, "B must be the newest → the victim");
+        let k1 = 0x1380_1000_i64;
+        let k2 = 0x1380_1001_i64;
+
+        // A holds k1, B holds k2 (no contention yet).
+        assert!(a.try_lock(k1, false));
+        assert!(b.try_lock(k2, false));
+
+        // Generous timeouts so a *timeout* would take 10s — if detection failed
+        // the prompt-detection assertion below catches it as a slow failure.
+        a.set_lock_timeout(Some(Duration::from_secs(10)));
+        b.set_lock_timeout(Some(Duration::from_secs(10)));
+
+        let a2 = a.clone();
+        let b2 = b.clone();
+        let t0 = std::time::Instant::now();
+
+        // A blocks on k2 (held by B); B blocks on k1 (held by A) → ABBA cycle.
+        let ah = std::thread::spawn(move || a2.block_lock(k2, false));
+        let bh = std::thread::spawn(move || b2.block_lock(k1, false));
+
+        // The victim (B) returns promptly with 40P01.
+        let rb = bh.join().unwrap();
+        let victim_elapsed = t0.elapsed();
+        assert!(
+            victim_elapsed < Duration::from_secs(2),
+            "deadlock victim must abort promptly (not via 10s timeout): {victim_elapsed:?}"
+        );
+        assert!(
+            matches!(rb, Err(BasinError::DeadlockDetected(_))),
+            "newest waiter B must be the 40P01 victim: {rb:?}"
+        );
+
+        // B's transaction unwinds → it releases everything it held (k2). The
+        // executor error path does this via xact/session cleanup; we model it
+        // directly here.
+        b.release_all_on_session_end();
+
+        // Now A's wait on k2 can complete: A ACQUIRES.
+        let ra = ah.join().unwrap();
+        assert!(ra.is_ok(), "surviving waiter A must acquire after B aborts: {ra:?}");
+
+        a.release_all_on_session_end();
+    }
+
+    /// 3-session cycle A→B→C→A. The newest waiter (C, minted last) is the sole
+    /// victim and aborts promptly with 40P01; breaking the cycle then lets the
+    /// remaining acyclic chain drain (C aborts → B acquires k3 → A acquires k2)
+    /// as each upstream session's transaction unwinds.
+    #[test]
+    fn three_session_cycle_breaks_with_one_victim() {
+        let a = Arc::new(AdvisorySessionLocks::new());
+        let b = Arc::new(AdvisorySessionLocks::new());
+        let c = Arc::new(AdvisorySessionLocks::new());
+        assert!(
+            c.owner > a.owner && c.owner > b.owner,
+            "C must be the newest → the victim"
+        );
+        let k1 = 0x1380_1010_i64;
+        let k2 = 0x1380_1011_i64;
+        let k3 = 0x1380_1012_i64;
+
+        // A holds k1, B holds k2, C holds k3.
+        assert!(a.try_lock(k1, false));
+        assert!(b.try_lock(k2, false));
+        assert!(c.try_lock(k3, false));
+
+        for s in [&a, &b, &c] {
+            s.set_lock_timeout(Some(Duration::from_secs(10)));
+        }
+
+        let (a2, b2, c2) = (a.clone(), b.clone(), c.clone());
+        let t0 = std::time::Instant::now();
+        // A waits on k2 (B), B waits on k3 (C), C waits on k1 (A): a 3-cycle.
+        let ah = std::thread::spawn(move || a2.block_lock(k2, false));
+        let bh = std::thread::spawn(move || b2.block_lock(k3, false));
+        let ch = std::thread::spawn(move || c2.block_lock(k1, false));
+
+        // C (newest) is the deterministic victim and returns promptly.
+        let rc = ch.join().unwrap();
+        let victim_elapsed = t0.elapsed();
+        assert!(
+            victim_elapsed < Duration::from_secs(3),
+            "3-cycle victim must abort promptly: {victim_elapsed:?}"
+        );
+        assert!(
+            matches!(rc, Err(BasinError::DeadlockDetected(_))),
+            "newest waiter C must be the sole 40P01 victim: {rc:?}"
+        );
+
+        // C's txn unwinds → releases k3. The chain is now acyclic: B→A only.
+        c.release_all_on_session_end();
+        // B was waiting on k3 → now acquires.
+        let rb = bh.join().unwrap();
+        assert!(rb.is_ok(), "B acquires k3 after C aborts: {rb:?}");
+
+        // B's txn unwinds → releases k2 (and k3). A was waiting on k2 → acquires.
+        b.release_all_on_session_end();
+        let ra = ah.join().unwrap();
+        assert!(ra.is_ok(), "A acquires k2 after B unwinds: {ra:?}");
+
+        a.release_all_on_session_end();
+    }
+
+    /// Self-deadlock: a session waiting on a key it already holds is a PG no-op
+    /// (re-entrancy). `block_lock` must return Ok immediately, never enter the
+    /// wait loop, and never create a self-edge.
+    #[test]
+    fn self_lock_is_reentrant_not_a_deadlock() {
+        let a = AdvisorySessionLocks::new();
+        let key = 0x1380_1020_i64;
+        assert!(a.try_lock(key, false));
+
+        let t0 = std::time::Instant::now();
+        // Re-acquire the same key: must succeed immediately via re-entrancy.
+        a.block_lock(key, false)
+            .expect("re-entrant self-acquire must succeed, not deadlock");
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "self-acquire must be immediate"
+        );
+        // No edge was left behind.
+        with_graph(|g| assert!(!g.contains_key(&a.owner), "no self-edge expected"));
+
+        // Two acquisitions outstanding → two unlocks to release.
+        assert!(a.session_unlock(key));
+        assert!(a.session_unlock(key));
+        assert!(!a.session_unlock(key));
+    }
+
+    /// No false positive: a non-cyclic wait *chain* (C waits on B waits on A,
+    /// A holds and never waits) must wait normally and time out, never reporting
+    /// a spurious deadlock.
+    #[test]
+    fn acyclic_chain_does_not_false_positive() {
+        let a = Arc::new(AdvisorySessionLocks::new());
+        let b = Arc::new(AdvisorySessionLocks::new());
+        let c = Arc::new(AdvisorySessionLocks::new());
+        let k1 = 0x1380_1030_i64;
+        let k2 = 0x1380_1031_i64;
+
+        // A holds k1 (terminal — A never waits). B holds k2 and waits on k1.
+        // C waits on k2. Chain: C → B → A. No cycle.
+        assert!(a.try_lock(k1, false));
+        assert!(b.try_lock(k2, false));
+
+        // Short timeouts: B and C should hit 55P03 (lock timeout), NOT 40P01.
+        b.set_lock_timeout(Some(Duration::from_millis(150)));
+        c.set_lock_timeout(Some(Duration::from_millis(150)));
+
+        let b2 = b.clone();
+        let c2 = c.clone();
+        let bh = std::thread::spawn(move || b2.block_lock(k1, false)); // B → A
+        let ch = std::thread::spawn(move || c2.block_lock(k2, false)); // C → B
+
+        let rb = bh.join().unwrap();
+        let rc = ch.join().unwrap();
+
+        assert!(
+            matches!(rb, Err(BasinError::LockNotAvailable(_))),
+            "acyclic waiter B must time out (55P03), not deadlock: {rb:?}"
+        );
+        assert!(
+            matches!(rc, Err(BasinError::LockNotAvailable(_))),
+            "acyclic waiter C must time out (55P03), not deadlock: {rc:?}"
+        );
+
+        a.release_all_on_session_end();
+        b.release_all_on_session_end();
+        c.release_all_on_session_end();
+    }
+
+    /// The victim's *other* locks are released properly after the deadlock
+    /// error: the caller's normal unwind (here `release_all_on_session_end`,
+    /// mirroring session drop) frees everything, so a third session can take
+    /// the victim's keys afterward.
+    #[test]
+    fn victim_other_locks_released_after_error() {
+        // Mint B first, A second, so A is the newest → A is the victim.
+        let b = Arc::new(AdvisorySessionLocks::new());
+        let a = Arc::new(AdvisorySessionLocks::new());
+        assert!(a.owner > b.owner, "A must be newest → the victim");
+        let k1 = 0x1380_1040_i64; // held by B
+        let k2 = 0x1380_1041_i64; // held by A (the soon-to-be victim)
+        let extra = 0x1380_1042_i64; // an *unrelated* lock A also holds
+
+        assert!(b.try_lock(k1, false));
+        assert!(a.try_lock(k2, false));
+        assert!(a.try_lock(extra, false));
+
+        a.set_lock_timeout(Some(Duration::from_secs(10)));
+        b.set_lock_timeout(Some(Duration::from_secs(10)));
+
+        let a2 = a.clone();
+        let b2 = b.clone();
+        // A waits on k1 (B), B waits on k2 (A) → cycle; A (newest) is victim.
+        let ah = std::thread::spawn(move || a2.block_lock(k1, false));
+        let bh = std::thread::spawn(move || b2.block_lock(k2, false));
+
+        // A (newest) is the deterministic victim and returns promptly.
+        let ra = ah.join().unwrap();
+        assert!(
+            matches!(ra, Err(BasinError::DeadlockDetected(_))),
+            "A (newest) must be the victim: {ra:?}"
+        );
+
+        // A's transaction unwinds — session end releases ALL its locks,
+        // including the unrelated `extra` it held before the deadlock, and the
+        // contested k2. That frees B (waiting on k2) to acquire.
+        a.release_all_on_session_end();
+        let rb = bh.join().unwrap();
+        assert!(rb.is_ok(), "B acquires k2 after victim A unwinds: {rb:?}");
+        b.release_all_on_session_end();
+
+        // A third session can now take A's former keys (all released).
+        let c = AdvisorySessionLocks::new();
+        assert!(c.try_lock(k2, false), "victim's k2 must be free");
+        assert!(c.try_lock(extra, false), "victim's unrelated lock must be free");
+        assert!(c.try_lock(k1, false), "B's k1 must be free after its cleanup");
+        c.session_unlock(k2);
+        c.session_unlock(extra);
+        c.session_unlock(k1);
+    }
+
+    /// Stress: N sessions take lock pairs in a strict ascending key order, so by
+    /// construction the wait-for graph is acyclic. The detector must never fire
+    /// a false 40P01 and the run must not hang.
+    #[test]
+    fn stress_acyclic_ordering_no_false_deadlock() {
+        const N: usize = 12;
+        // A pool of keys; every session locks two of them in ascending order,
+        // which is the classic deadlock-avoidance discipline — so no cycle can
+        // form regardless of interleaving.
+        let base = 0x1380_1100_i64;
+
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let lo = base + (i as i64 % 5);
+            let hi = base + 5 + (i as i64 % 5); // strictly greater than `lo`
+            handles.push(std::thread::spawn(move || {
+                let s = AdvisorySessionLocks::new();
+                // Modest timeout: contention is fine, but no wait should be a
+                // deadlock, so any 40P01 here is a false-positive bug.
+                s.set_lock_timeout(Some(Duration::from_secs(5)));
+                let r1 = s.block_lock(lo, false);
+                let r2 = s.block_lock(hi, false);
+                s.release_all_on_session_end();
+                (r1, r2)
+            }));
+        }
+
+        let t0 = std::time::Instant::now();
+        for h in handles {
+            let (r1, r2) = h.join().unwrap();
+            for r in [r1, r2] {
+                assert!(
+                    !matches!(r, Err(BasinError::DeadlockDetected(_))),
+                    "ascending-order locking must never deadlock: {r:?}"
+                );
+            }
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "stress run must not hang"
+        );
     }
 }

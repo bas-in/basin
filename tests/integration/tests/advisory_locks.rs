@@ -18,7 +18,11 @@
 //!     other on the same key);
 //!   * project isolation: the same numeric key in two projects does not contend;
 //!   * disconnect (session drop) releases everything the session held;
-//!   * a lock-wait timeout surfaces `BasinError::LockNotAvailable` (→ 55P03).
+//!   * a lock-wait timeout surfaces `BasinError::LockNotAvailable` (→ 55P03);
+//!   * an ABBA waiter cycle is broken promptly by the wait-for-graph detector:
+//!     one session gets `BasinError::DeadlockDetected` (→ 40P01) and the other
+//!     acquires, well under the lock_timeout;
+//!   * a self-lock is re-entrant (PG semantics), never a self-deadlock.
 
 #![allow(clippy::print_stdout)]
 
@@ -417,4 +421,117 @@ async fn try_xact_lock_false_under_contention() {
     // Now B can take it.
     assert!(scalar_bool(&b, &format!("SELECT pg_try_advisory_xact_lock({key})")).await);
     exec(&b, "COMMIT").await;
+}
+
+// ---------------------------------------------------------------------------
+// 12. ABBA deadlock: one session gets 40P01 promptly, the other acquires
+// ---------------------------------------------------------------------------
+
+// Two sessions form a classic ABBA cycle:
+//   A holds k1, B holds k2; A then blocks on k2 while B blocks on k1.
+// The wait-for-graph detector must abort exactly one waiter with
+// DeadlockDetected (→ SQLSTATE 40P01) promptly — well under the generous
+// 10s lock_timeout. Once the victim's session drops (its transaction aborts
+// and releases the lock the survivor is waiting on, exactly as a driver would
+// on receiving 40P01), the surviving waiter ACQUIRES.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abba_deadlock_detected_promptly() {
+    let (_dir, engine) = open_engine().await;
+    let project = ProjectId::new();
+    let a = engine.open_session(project).await.unwrap();
+    let b = engine.open_session(project).await.unwrap();
+
+    let k1 = 100_070_i64;
+    let k2 = 100_071_i64;
+
+    // A holds k1, B holds k2.
+    assert!(scalar_bool(&a, &format!("SELECT pg_try_advisory_lock({k1})")).await);
+    assert!(scalar_bool(&b, &format!("SELECT pg_try_advisory_lock({k2})")).await);
+
+    // Generous timeouts so a *timeout* (55P03) would take 10s — i.e. if
+    // detection failed this test would clearly fail the <5s prompt assertion.
+    exec(&a, "SET lock_timeout = '10s'").await;
+    exec(&b, "SET lock_timeout = '10s'").await;
+
+    let t0 = std::time::Instant::now();
+
+    // A blocks on k2 (held by B).
+    let mut a_task = tokio::spawn(async move {
+        let r = a.execute(&format!("SELECT pg_advisory_lock({k2})")).await;
+        (a, r)
+    });
+    // B blocks on k1 (held by A) — closes the cycle.
+    let mut b_task = tokio::spawn(async move {
+        let r = b.execute(&format!("SELECT pg_advisory_lock({k1})")).await;
+        (b, r)
+    });
+
+    // Whichever task finishes first is the deadlock victim (it aborts promptly
+    // with 40P01). The other is still blocked on the victim's held lock.
+    let (victim_sess, victim_res, mut winner_task) = tokio::select! {
+        joined = &mut a_task => {
+            let (s, r) = joined.expect("A task panicked");
+            (s, r, b_task)
+        }
+        joined = &mut b_task => {
+            let (s, r) = joined.expect("B task panicked");
+            (s, r, a_task)
+        }
+    };
+    let victim_elapsed = t0.elapsed();
+
+    assert!(
+        victim_elapsed < Duration::from_secs(5),
+        "deadlock must be detected promptly (not via the 10s timeout): {victim_elapsed:?}"
+    );
+    assert!(
+        matches!(victim_res, Err(BasinError::DeadlockDetected(_))),
+        "the first waiter to return must be the 40P01 victim, got: {victim_res:?}"
+    );
+
+    // The victim's transaction unwinds — drop its session, releasing the lock
+    // the survivor is blocked on (this is what a driver does on 40P01).
+    drop(victim_sess);
+
+    // The survivor must now acquire (Ok), not hang.
+    let (winner_sess, winner_res) = tokio::time::timeout(Duration::from_secs(8), &mut winner_task)
+        .await
+        .expect("survivor must acquire once the victim releases — must not hang")
+        .expect("survivor task panicked");
+    assert!(
+        winner_res.is_ok(),
+        "survivor must ACQUIRE after the victim aborts: {winner_res:?}"
+    );
+
+    drop(winner_sess);
+}
+
+// ---------------------------------------------------------------------------
+// 13. self-deadlock is re-entrant, not a deadlock (PG semantics)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_lock_reentrant_not_deadlock() {
+    let (_dir, engine) = open_engine().await;
+    let project = ProjectId::new();
+    let a = engine.open_session(project).await.unwrap();
+
+    let key = 100_080_i64;
+
+    // First acquire.
+    assert!(scalar_bool(&a, &format!("SELECT pg_try_advisory_lock({key})")).await);
+    // Blocking re-acquire of the SAME key by the SAME session must succeed
+    // immediately (re-entrancy) — never a 40P01 self-deadlock.
+    let t0 = std::time::Instant::now();
+    a.execute(&format!("SELECT pg_advisory_lock({key})"))
+        .await
+        .expect("re-entrant self-acquire must succeed, not deadlock");
+    assert!(
+        t0.elapsed() < Duration::from_secs(1),
+        "re-entrant self-acquire must be immediate"
+    );
+
+    // Two acquisitions → two unlocks to release.
+    assert!(scalar_bool(&a, &format!("SELECT pg_advisory_unlock({key})")).await);
+    assert!(scalar_bool(&a, &format!("SELECT pg_advisory_unlock({key})")).await);
 }

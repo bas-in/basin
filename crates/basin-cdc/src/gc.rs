@@ -77,7 +77,9 @@ pub async fn run_once(
 /// segments under the shared store. Uses the un-scoped object-store handle so
 /// it can see across projects (the per-project scoped store would hide other
 /// projects' prefixes); the only keys read are CDC keys, never table data.
-async fn discover_projects(writer: &CdcRingWriter) -> Result<Vec<ProjectId>, object_store::Error> {
+pub(crate) async fn discover_projects(
+    writer: &CdcRingWriter,
+) -> Result<Vec<ProjectId>, object_store::Error> {
     let store = writer.storage().object_store_handle();
     let root = writer.storage().root_prefix_handle();
     let prefix = match &root {

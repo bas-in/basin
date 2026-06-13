@@ -206,6 +206,18 @@ pub enum BasinError {
     #[error("canceling statement due to lock timeout: {0}")]
     LockNotAvailable(String),
 
+    /// A cycle of advisory-lock waiters was detected: session A waits on a key
+    /// held by B while B (directly or transitively) waits on a key held by A.
+    /// Rather than let every member of the cycle run into its `lock_timeout`
+    /// (SQLSTATE 55P03), Basin breaks the cycle immediately by aborting one
+    /// waiter with this error, matching PostgreSQL's prompt deadlock reporting.
+    /// Router maps it to SQLSTATE `40P01` (`deadlock_detected`) — the exact code
+    /// PostgreSQL raises — so drivers surface the dedicated deadlock exception
+    /// class (psycopg `DeadlockDetected`) and applications can retry the losing
+    /// transaction.
+    #[error("deadlock detected: {0}")]
+    DeadlockDetected(String),
+
     /// An idle-in-transaction session exceeded `idle_in_transaction_session_timeout`.
     /// The session is terminated by the reaper; the client sees a connection-
     /// closed error on the next attempt. Router maps to SQLSTATE `25P03`
@@ -396,5 +408,11 @@ impl BasinError {
     /// Produces SQLSTATE 25P03.
     pub fn idle_in_transaction_timeout(msg: impl Into<String>) -> Self {
         Self::IdleInTransactionTimeout(msg.into())
+    }
+
+    /// Typed constructor for advisory-lock deadlock detection.
+    /// Produces SQLSTATE 40P01 (`deadlock_detected`).
+    pub fn deadlock_detected(msg: impl Into<String>) -> Self {
+        Self::DeadlockDetected(msg.into())
     }
 }

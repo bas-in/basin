@@ -12,6 +12,11 @@ pub(crate) mod admin;
 pub(crate) mod admin_functions;
 pub(crate) mod admin_projects;
 pub(crate) mod auth;
+// ADR 0028 Phase 2: CDC webhook subscription CRUD. Gated on the `realtime`
+// feature because it depends on `basin-cdc` (id/secret minting), which is the
+// same optional dep the CDC SSE co-mount uses.
+#[cfg(feature = "realtime")]
+pub(crate) mod cdc_webhooks;
 pub(crate) mod data;
 pub(crate) mod fn_handler;
 pub(crate) mod inbound;
