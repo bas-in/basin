@@ -4628,14 +4628,26 @@ async fn exec_create_index(
             None
         };
 
-    // Log IVFFlat fallback notice.
+    // Log IVFFlat acceptance notice.
+    //
+    // ── BASIN IVFFLAT EXECUTOR HUNK (vector index DDL acceptance) ──────────────
+    // Basin ships a native IVFFlat coarse-quantiser (k-means partitioning into
+    // `lists` cells + `probes`-nearest-cell scan) in `basin-vector::IvfFlatIndex`.
+    // The CREATE INDEX declaration is persisted under access_method "hnsw" with
+    // an `ivfflat:`-prefixed opclass so the vector planner routes `ORDER BY <->
+    // LIMIT k` through Basin's ANN fast path; the physical sidecar shares the
+    // ANN-segment substrate with HNSW. Both are approximate by design (recall is
+    // a quality metric, not a correctness gate) and both exact-rank the retrieved
+    // candidates, so returned rows are exactly ordered. The `lists` build knob is
+    // captured in the catalog opclass for introspection + round-trip.
     if access_method_str == "ivfflat" {
         tracing::info!(
             index = %index_name,
             table = %table_name,
-            "CREATE INDEX USING ivfflat accepted; Basin maps IVFFlat to the HNSW \
-             implementation as a documented fallback (Phase 5.26.E). Queries use \
-             the HNSW fast path. A native IVFFlat implementation is roadmap-tracked."
+            "CREATE INDEX USING ivfflat accepted; Basin's native IVFFlat coarse \
+             quantiser (lists cells + ivfflat.probes nearest-cell scan) serves the \
+             ANN fast path. Approximate by design — exact-ranked candidates, recall \
+             rises with probes (pgvector-compatible semantics)."
         );
     }
 
