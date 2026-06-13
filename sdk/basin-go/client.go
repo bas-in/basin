@@ -25,6 +25,9 @@ type Client struct {
 	Storage *StorageClient
 	// Functions provides /fn/v1/* (Invoke) and /rest/v1/rpc/* (RPC).
 	Functions *FunctionsClient
+	// Realtime provides GET /realtime/v1/ws/:project (WebSocket change streams).
+	// Requires the nhooyr.io/websocket dependency declared in go.mod.
+	Realtime *RealtimeClient
 
 	t                *transport
 	explicitProjectID string
@@ -102,8 +105,10 @@ func New(baseURL, key string, opts ...Option) *Client {
 		Auth:              authClient,
 		Functions:         newFunctionsClient(t),
 	}
-	// Storage needs a reference back to c.resolveProjectID; assign after c is created.
+	// Storage and Realtime need a reference back to c.resolveProjectID; assign
+	// after c is created.
 	c.Storage = newStorageClient(t, c.resolveProjectID)
+	c.Realtime = newRealtimeClient(t, c.resolveProjectID)
 	return c
 }
 
