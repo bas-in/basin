@@ -786,6 +786,61 @@ async fn gate_update_reactor_update_goes_slow() {
     assert_eq!(v, Some(6666), "UPDATE with reactor must still apply the value");
 }
 
+/// DML-flags cache self-heal: a fast-path UPDATE warms the per-session
+/// `dml_flags_cache` with the "no UPDATE reactor" verdict (fast path fires).
+/// Registering an UPDATE reactor afterwards bumps the catalog epoch, so the
+/// cached verdict must be invalidated and the NEXT UPDATE on the same session
+/// must decline to the slow path — proving the cache never serves a stale
+/// "no reactor / no FK" verdict across a catalog mutation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dml_flags_cache_self_heals_on_reactor_register() {
+    let _g = ENV_LOCK.lock().await;
+    let _upd = set_env("BASIN_HOTTIER_UPDATE_FASTPATH");
+
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    let project = sess.project();
+    let table = TableName::new("t").unwrap();
+    seed(&sess, "t", 5).await;
+
+    // First UPDATE: no reactor → fast path fires and warms the flags cache
+    // with `has_update_reactor = false`.
+    exec(&sess, "UPDATE t SET v = 100 WHERE id = 2").await;
+    assert!(
+        registry_has_update(&eng, &project, &table, 2),
+        "with no reactor the first UPDATE must take the overlay fast path"
+    );
+
+    // Register an UPDATE reactor — this is a catalog mutation that bumps the
+    // epoch, which must invalidate the cached "no reactor" verdict.
+    eng.config()
+        .catalog
+        .register_reactor(ReactorDef {
+            project,
+            table: table.clone(),
+            name: "upd_reactor".to_string(),
+            ops: ReactorOps::UPDATE,
+            when_predicate: None,
+            body: "SELECT 1".to_string(),
+        })
+        .await
+        .expect("register_reactor must succeed");
+
+    // Second UPDATE on a DIFFERENT key: the cache must re-fetch the flags (epoch
+    // changed) and now see the reactor → decline to the slow CoW path.
+    exec(&sess, "UPDATE t SET v = 200 WHERE id = 3").await;
+    assert!(
+        !registry_has_update(&eng, &project, &table, 3),
+        "after registering an UPDATE reactor the cached flags must self-heal and \
+         route the next UPDATE to the slow path (no overlay Update entry)"
+    );
+
+    // Functional: both updates applied their values regardless of path.
+    assert_eq!(fetch_v(&sess, "t", 2).await, Some(100));
+    assert_eq!(fetch_v(&sess, "t", 3).await, Some(200));
+}
+
 // ── Gate 8: predicate_not_pk_eq ───────────────────────────────────────────────
 
 /// `DELETE … WHERE other_col = 5` (non-PK predicate) must go slow path.
