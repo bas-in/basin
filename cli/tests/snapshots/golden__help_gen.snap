@@ -8,4 +8,4 @@ USAGE
   basin gen [args]
 
 FLAGS / SUBCOMMANDS
-  types <typescript|go|python>   Generate typed database interfaces.
+  types <lang>   Generate typed database interfaces (ts/go/py/ruby/rust/java/csharp/php/dart/swift).

@@ -20,6 +20,7 @@ pub mod byo;
 pub mod completion;
 pub mod config_cmd;
 pub mod db;
+pub mod dev;
 pub mod docs;
 pub mod domains;
 pub mod dump;
@@ -132,6 +133,16 @@ pub fn all() -> Vec<Entry> {
             projects::cmd_projects
         ),
         entry!(
+            "dev",
+            "Start a local basin-server instance for development.",
+            dev::cmd_dev
+        ),
+        entry!(
+            "stop",
+            "Stop the local basin-server stack (Docker Compose mode).",
+            dev::cmd_stop
+        ),
+        entry!(
             "init",
             "Scaffold a basin project directory (./basin/).",
             init::cmd_init
@@ -219,7 +230,7 @@ pub fn all() -> Vec<Entry> {
         ),
         entry!(
             "gen",
-            "Generate language bindings (typescript / go / python) from schema.",
+            "Generate typed bindings (ts/go/py/ruby/rust/java/csharp/php/dart/swift) from schema.",
             gen::cmd_gen
         ),
         entry!(

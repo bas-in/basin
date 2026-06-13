@@ -2,9 +2,21 @@
 //!
 //! Currently implements:
 //!
-//!   basin gen types <typescript|go|python> [--project=<ref>] [--schema=public]
-//!                                          [--output=<path>] [--package=<name>]
-//!                                          [--watch]
+//!   basin gen types <lang> [--project=<ref>] [--schema=public]
+//!                          [--output=<path>] [--package=<name>]
+//!                          [--watch]
+//!
+//! Supported languages (covers the full Basin SDK matrix):
+//!   typescript | ts       — TypeScript interfaces (supabase-shape Database wrapper)
+//!   go                    — Go structs with json + db tags
+//!   python | py           — Python Pydantic models
+//!   ruby | rb             — Ruby frozen Struct subclasses
+//!   rust | rs             — Rust serde structs (serde_json::Value for JSONB)
+//!   java                  — Java POJOs with Jackson @JsonProperty
+//!   csharp | cs | dotnet  — C# records with System.Text.Json attributes
+//!   php                   — PHP readonly classes with fromArray
+//!   dart                  — Dart classes with fromJson / toJson
+//!   swift                 — Swift Codable structs with CodingKeys
 //!
 //! `--watch` polls `./basin/migrations/*.sql` every 2 s and re-emits whenever
 //! any file's mtime changes or a file is added/removed.  Requires --output=<path>
@@ -15,8 +27,7 @@
 //! platform surface grows.
 //!
 //! gen types queries information_schema.columns via POST /v1/projects/{ref}/sql/query
-//! and emits database.ts / database.go / database.py via a Postgres-type→lang-type
-//! mapping table.
+//! and emits typed bindings via a Postgres-type→lang-type mapping table.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
@@ -42,12 +53,26 @@ use super::help::help_for_command;
 /// usage produces ok=false from map_type rather than a silent wrong mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LangTarget {
-    /// LangTypeScript targets TypeScript; nullable form is `T | null`.
+    /// TypeScript — nullable form is `T | null`.
     TypeScript = 1,
-    /// LangGo targets Go; nullable form is `*T`, JSONB uses `json.RawMessage`.
+    /// Go — nullable form is `*T`, JSONB uses `json.RawMessage`.
     Go = 2,
-    /// LangPython targets Python + Pydantic; nullable form is `Optional[T]`.
+    /// Python + Pydantic — nullable form is `Optional[T]`.
     Python = 3,
+    /// Ruby — frozen Struct subclasses, nullable form is `T?` (comment).
+    Ruby = 4,
+    /// Rust + serde — nullable form is `Option<T>`.
+    Rust = 5,
+    /// Java POJOs with Jackson @JsonProperty — nullable form is `@Nullable T`.
+    Java = 6,
+    /// C# records with System.Text.Json — nullable form is `T?`.
+    CSharp = 7,
+    /// PHP readonly classes with fromArray — nullable form is `?T`.
+    Php = 8,
+    /// Dart classes with fromJson/toJson — nullable form is `T?`.
+    Dart = 9,
+    /// Swift Codable structs with CodingKeys — nullable form is `T?`.
+    Swift = 10,
 }
 
 // ── Type mapping table ────────────────────────────────────────────────────────
@@ -71,28 +96,37 @@ struct PgRow {
     ts: MappedType,
     go: MappedType,
     py: MappedType,
+    rb: MappedType,
+    rs: MappedType,
+    java: MappedType,
+    cs: MappedType,
+    php: MappedType,
+    dart: MappedType,
+    swift: MappedType,
 }
 
 macro_rules! row {
-    (ts: ($t:literal, $n:literal, $i:literal),
-     go: ($gt:literal, $gn:literal, $gi:literal),
-     py: ($pt:literal, $pn:literal, $pi:literal)) => {
+    (ts:    ($t:literal, $tn:literal, $ti:literal),
+     go:    ($gt:literal, $gn:literal, $gi:literal),
+     py:    ($pt:literal, $pn:literal, $pi:literal),
+     rb:    ($rbt:literal, $rbn:literal, $rbi:literal),
+     rs:    ($rst:literal, $rsn:literal, $rsi:literal),
+     java:  ($jt:literal, $jn:literal, $ji:literal),
+     cs:    ($ct:literal, $cn:literal, $ci:literal),
+     php:   ($phpt:literal, $phpn:literal, $phpi:literal),
+     dart:  ($dt:literal, $dn:literal, $di:literal),
+     swift: ($swt:literal, $swn:literal, $swi:literal)) => {
         PgRow {
-            ts: MappedType {
-                typ: $t,
-                nullable: $n,
-                import: $i,
-            },
-            go: MappedType {
-                typ: $gt,
-                nullable: $gn,
-                import: $gi,
-            },
-            py: MappedType {
-                typ: $pt,
-                nullable: $pn,
-                import: $pi,
-            },
+            ts:   MappedType { typ: $t,    nullable: $tn,   import: $ti  },
+            go:   MappedType { typ: $gt,   nullable: $gn,   import: $gi  },
+            py:   MappedType { typ: $pt,   nullable: $pn,   import: $pi  },
+            rb:   MappedType { typ: $rbt,  nullable: $rbn,  import: $rbi },
+            rs:   MappedType { typ: $rst,  nullable: $rsn,  import: $rsi },
+            java: MappedType { typ: $jt,   nullable: $jn,   import: $ji  },
+            cs:   MappedType { typ: $ct,   nullable: $cn,   import: $ci  },
+            php:  MappedType { typ: $phpt, nullable: $phpn, import: $phpi},
+            dart: MappedType { typ: $dt,   nullable: $dn,   import: $di  },
+            swift:MappedType { typ: $swt,  nullable: $swn,  import: $swi },
         }
     };
 }
@@ -101,257 +135,428 @@ fn type_table() -> HashMap<&'static str, PgRow> {
     let mut m: HashMap<&'static str, PgRow> = HashMap::new();
 
     // ── Boolean ──────────────────────────────────────────────────────────────
-    m.insert(
-        "boolean",
-        row!(
-            ts: ("boolean",            "boolean | null",           ""),
-            go: ("bool",               "*bool",                    ""),
-            py: ("bool",               "Optional[bool]",           "from typing import Optional")
-        ),
-    );
-    m.insert(
-        "bool",
-        row!(
-            ts: ("boolean",            "boolean | null",           ""),
-            go: ("bool",               "*bool",                    ""),
-            py: ("bool",               "Optional[bool]",           "from typing import Optional")
-        ),
-    );
+    m.insert("boolean", row!(
+        ts:    ("boolean",                  "boolean | null",                   ""),
+        go:    ("bool",                     "*bool",                            ""),
+        py:    ("bool",                     "Optional[bool]",                   "from typing import Optional"),
+        rb:    ("T::Boolean",               "T::Boolean",                       ""),
+        rs:    ("bool",                     "Option<bool>",                     ""),
+        java:  ("boolean",                  "Boolean",                          ""),
+        cs:    ("bool",                     "bool?",                            ""),
+        php:   ("bool",                     "?bool",                            ""),
+        dart:  ("bool",                     "bool?",                            ""),
+        swift: ("Bool",                     "Bool?",                            "")
+    ));
+    m.insert("bool", row!(
+        ts:    ("boolean",                  "boolean | null",                   ""),
+        go:    ("bool",                     "*bool",                            ""),
+        py:    ("bool",                     "Optional[bool]",                   "from typing import Optional"),
+        rb:    ("T::Boolean",               "T::Boolean",                       ""),
+        rs:    ("bool",                     "Option<bool>",                     ""),
+        java:  ("boolean",                  "Boolean",                          ""),
+        cs:    ("bool",                     "bool?",                            ""),
+        php:   ("bool",                     "?bool",                            ""),
+        dart:  ("bool",                     "bool?",                            ""),
+        swift: ("Bool",                     "Bool?",                            "")
+    ));
 
     // ── Integer family ───────────────────────────────────────────────────────
-    m.insert(
-        "smallint",
-        row!(
-            ts: ("number",             "number | null",            ""),
-            go: ("int16",              "*int16",                   ""),
-            py: ("int",                "Optional[int]",            "from typing import Optional")
-        ),
-    );
-    m.insert(
-        "int2",
-        row!(
-            ts: ("number",             "number | null",            ""),
-            go: ("int16",              "*int16",                   ""),
-            py: ("int",                "Optional[int]",            "from typing import Optional")
-        ),
-    );
-    m.insert(
-        "integer",
-        row!(
-            ts: ("number",             "number | null",            ""),
-            go: ("int32",              "*int32",                   ""),
-            py: ("int",                "Optional[int]",            "from typing import Optional")
-        ),
-    );
-    m.insert(
-        "int4",
-        row!(
-            ts: ("number",             "number | null",            ""),
-            go: ("int32",              "*int32",                   ""),
-            py: ("int",                "Optional[int]",            "from typing import Optional")
-        ),
-    );
-    m.insert(
-        "bigint",
-        row!(
-            ts: ("bigint",             "bigint | null",            ""),
-            go: ("int64",              "*int64",                   ""),
-            py: ("int",                "Optional[int]",            "from typing import Optional")
-        ),
-    );
-    m.insert(
-        "int8",
-        row!(
-            ts: ("bigint",             "bigint | null",            ""),
-            go: ("int64",              "*int64",                   ""),
-            py: ("int",                "Optional[int]",            "from typing import Optional")
-        ),
-    );
+    m.insert("smallint", row!(
+        ts:    ("number",                   "number | null",                    ""),
+        go:    ("int16",                    "*int16",                           ""),
+        py:    ("int",                      "Optional[int]",                    "from typing import Optional"),
+        rb:    ("Integer",                  "Integer",                          ""),
+        rs:    ("i16",                      "Option<i16>",                      ""),
+        java:  ("short",                    "Short",                            ""),
+        cs:    ("short",                    "short?",                           ""),
+        php:   ("int",                      "?int",                             ""),
+        dart:  ("int",                      "int?",                             ""),
+        swift: ("Int16",                    "Int16?",                           "")
+    ));
+    m.insert("int2", row!(
+        ts:    ("number",                   "number | null",                    ""),
+        go:    ("int16",                    "*int16",                           ""),
+        py:    ("int",                      "Optional[int]",                    "from typing import Optional"),
+        rb:    ("Integer",                  "Integer",                          ""),
+        rs:    ("i16",                      "Option<i16>",                      ""),
+        java:  ("short",                    "Short",                            ""),
+        cs:    ("short",                    "short?",                           ""),
+        php:   ("int",                      "?int",                             ""),
+        dart:  ("int",                      "int?",                             ""),
+        swift: ("Int16",                    "Int16?",                           "")
+    ));
+    m.insert("integer", row!(
+        ts:    ("number",                   "number | null",                    ""),
+        go:    ("int32",                    "*int32",                           ""),
+        py:    ("int",                      "Optional[int]",                    "from typing import Optional"),
+        rb:    ("Integer",                  "Integer",                          ""),
+        rs:    ("i32",                      "Option<i32>",                      ""),
+        java:  ("int",                      "Integer",                          ""),
+        cs:    ("int",                      "int?",                             ""),
+        php:   ("int",                      "?int",                             ""),
+        dart:  ("int",                      "int?",                             ""),
+        swift: ("Int32",                    "Int32?",                           "")
+    ));
+    m.insert("int4", row!(
+        ts:    ("number",                   "number | null",                    ""),
+        go:    ("int32",                    "*int32",                           ""),
+        py:    ("int",                      "Optional[int]",                    "from typing import Optional"),
+        rb:    ("Integer",                  "Integer",                          ""),
+        rs:    ("i32",                      "Option<i32>",                      ""),
+        java:  ("int",                      "Integer",                          ""),
+        cs:    ("int",                      "int?",                             ""),
+        php:   ("int",                      "?int",                             ""),
+        dart:  ("int",                      "int?",                             ""),
+        swift: ("Int32",                    "Int32?",                           "")
+    ));
+    m.insert("bigint", row!(
+        ts:    ("bigint",                   "bigint | null",                    ""),
+        go:    ("int64",                    "*int64",                           ""),
+        py:    ("int",                      "Optional[int]",                    "from typing import Optional"),
+        rb:    ("Integer",                  "Integer",                          ""),
+        rs:    ("i64",                      "Option<i64>",                      ""),
+        java:  ("long",                     "Long",                             ""),
+        cs:    ("long",                     "long?",                            ""),
+        php:   ("int",                      "?int",                             ""),
+        dart:  ("int",                      "int?",                             ""),
+        swift: ("Int64",                    "Int64?",                           "")
+    ));
+    m.insert("int8", row!(
+        ts:    ("bigint",                   "bigint | null",                    ""),
+        go:    ("int64",                    "*int64",                           ""),
+        py:    ("int",                      "Optional[int]",                    "from typing import Optional"),
+        rb:    ("Integer",                  "Integer",                          ""),
+        rs:    ("i64",                      "Option<i64>",                      ""),
+        java:  ("long",                     "Long",                             ""),
+        cs:    ("long",                     "long?",                            ""),
+        php:   ("int",                      "?int",                             ""),
+        dart:  ("int",                      "int?",                             ""),
+        swift: ("Int64",                    "Int64?",                           "")
+    ));
 
     // ── Floating-point family ────────────────────────────────────────────────
-    m.insert(
-        "real",
-        row!(
-            ts: ("number",             "number | null",            ""),
-            go: ("float32",            "*float32",                 ""),
-            py: ("float",              "Optional[float]",          "from typing import Optional")
-        ),
-    );
-    m.insert(
-        "float4",
-        row!(
-            ts: ("number",             "number | null",            ""),
-            go: ("float32",            "*float32",                 ""),
-            py: ("float",              "Optional[float]",          "from typing import Optional")
-        ),
-    );
-    m.insert(
-        "double precision",
-        row!(
-            ts: ("number",             "number | null",            ""),
-            go: ("float64",            "*float64",                 ""),
-            py: ("float",              "Optional[float]",          "from typing import Optional")
-        ),
-    );
-    m.insert(
-        "float8",
-        row!(
-            ts: ("number",             "number | null",            ""),
-            go: ("float64",            "*float64",                 ""),
-            py: ("float",              "Optional[float]",          "from typing import Optional")
-        ),
-    );
+    m.insert("real", row!(
+        ts:    ("number",                   "number | null",                    ""),
+        go:    ("float32",                  "*float32",                         ""),
+        py:    ("float",                    "Optional[float]",                  "from typing import Optional"),
+        rb:    ("Float",                    "Float",                            ""),
+        rs:    ("f32",                      "Option<f32>",                      ""),
+        java:  ("float",                    "Float",                            ""),
+        cs:    ("float",                    "float?",                           ""),
+        php:   ("float",                    "?float",                           ""),
+        dart:  ("double",                   "double?",                          ""),
+        swift: ("Float",                    "Float?",                           "")
+    ));
+    m.insert("float4", row!(
+        ts:    ("number",                   "number | null",                    ""),
+        go:    ("float32",                  "*float32",                         ""),
+        py:    ("float",                    "Optional[float]",                  "from typing import Optional"),
+        rb:    ("Float",                    "Float",                            ""),
+        rs:    ("f32",                      "Option<f32>",                      ""),
+        java:  ("float",                    "Float",                            ""),
+        cs:    ("float",                    "float?",                           ""),
+        php:   ("float",                    "?float",                           ""),
+        dart:  ("double",                   "double?",                          ""),
+        swift: ("Float",                    "Float?",                           "")
+    ));
+    m.insert("double precision", row!(
+        ts:    ("number",                   "number | null",                    ""),
+        go:    ("float64",                  "*float64",                         ""),
+        py:    ("float",                    "Optional[float]",                  "from typing import Optional"),
+        rb:    ("Float",                    "Float",                            ""),
+        rs:    ("f64",                      "Option<f64>",                      ""),
+        java:  ("double",                   "Double",                           ""),
+        cs:    ("double",                   "double?",                          ""),
+        php:   ("float",                    "?float",                           ""),
+        dart:  ("double",                   "double?",                          ""),
+        swift: ("Double",                   "Double?",                          "")
+    ));
+    m.insert("float8", row!(
+        ts:    ("number",                   "number | null",                    ""),
+        go:    ("float64",                  "*float64",                         ""),
+        py:    ("float",                    "Optional[float]",                  "from typing import Optional"),
+        rb:    ("Float",                    "Float",                            ""),
+        rs:    ("f64",                      "Option<f64>",                      ""),
+        java:  ("double",                   "Double",                           ""),
+        cs:    ("double",                   "double?",                          ""),
+        php:   ("float",                    "?float",                           ""),
+        dart:  ("double",                   "double?",                          ""),
+        swift: ("Double",                   "Double?",                          "")
+    ));
 
     // ── Exact numeric ────────────────────────────────────────────────────────
     m.insert("numeric", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("string",             "*string",                  ""),
-        py: ("Decimal",            "Optional[Decimal]",        "from decimal import Decimal\nfrom typing import Optional")
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("string",                   "*string",                          ""),
+        py:    ("Decimal",                  "Optional[Decimal]",                "from decimal import Decimal\nfrom typing import Optional"),
+        rb:    ("BigDecimal",               "BigDecimal",                       ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("java.math.BigDecimal",     "java.math.BigDecimal",             ""),
+        cs:    ("decimal",                  "decimal?",                         ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("String",                   "String?",                          ""),
+        swift: ("String",                   "String?",                          "")
     ));
     m.insert("decimal", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("string",             "*string",                  ""),
-        py: ("Decimal",            "Optional[Decimal]",        "from decimal import Decimal\nfrom typing import Optional")
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("string",                   "*string",                          ""),
+        py:    ("Decimal",                  "Optional[Decimal]",                "from decimal import Decimal\nfrom typing import Optional"),
+        rb:    ("BigDecimal",               "BigDecimal",                       ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("java.math.BigDecimal",     "java.math.BigDecimal",             ""),
+        cs:    ("decimal",                  "decimal?",                         ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("String",                   "String?",                          ""),
+        swift: ("String",                   "String?",                          "")
     ));
 
     // ── Text family ──────────────────────────────────────────────────────────
-    m.insert(
-        "text",
-        row!(
-            ts: ("string",             "string | null",            ""),
-            go: ("string",             "*string",                  ""),
-            py: ("str",                "Optional[str]",            "from typing import Optional")
-        ),
-    );
-    m.insert(
-        "character varying",
-        row!(
-            ts: ("string",             "string | null",            ""),
-            go: ("string",             "*string",                  ""),
-            py: ("str",                "Optional[str]",            "from typing import Optional")
-        ),
-    );
-    m.insert(
-        "varchar",
-        row!(
-            ts: ("string",             "string | null",            ""),
-            go: ("string",             "*string",                  ""),
-            py: ("str",                "Optional[str]",            "from typing import Optional")
-        ),
-    );
-    m.insert(
-        "character",
-        row!(
-            ts: ("string",             "string | null",            ""),
-            go: ("string",             "*string",                  ""),
-            py: ("str",                "Optional[str]",            "from typing import Optional")
-        ),
-    );
-    m.insert(
-        "char",
-        row!(
-            ts: ("string",             "string | null",            ""),
-            go: ("string",             "*string",                  ""),
-            py: ("str",                "Optional[str]",            "from typing import Optional")
-        ),
-    );
+    m.insert("text", row!(
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("string",                   "*string",                          ""),
+        py:    ("str",                      "Optional[str]",                    "from typing import Optional"),
+        rb:    ("String",                   "String",                           ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("String",                   "String",                           ""),
+        cs:    ("string",                   "string?",                          ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("String",                   "String?",                          ""),
+        swift: ("String",                   "String?",                          "")
+    ));
+    m.insert("character varying", row!(
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("string",                   "*string",                          ""),
+        py:    ("str",                      "Optional[str]",                    "from typing import Optional"),
+        rb:    ("String",                   "String",                           ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("String",                   "String",                           ""),
+        cs:    ("string",                   "string?",                          ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("String",                   "String?",                          ""),
+        swift: ("String",                   "String?",                          "")
+    ));
+    m.insert("varchar", row!(
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("string",                   "*string",                          ""),
+        py:    ("str",                      "Optional[str]",                    "from typing import Optional"),
+        rb:    ("String",                   "String",                           ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("String",                   "String",                           ""),
+        cs:    ("string",                   "string?",                          ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("String",                   "String?",                          ""),
+        swift: ("String",                   "String?",                          "")
+    ));
+    m.insert("character", row!(
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("string",                   "*string",                          ""),
+        py:    ("str",                      "Optional[str]",                    "from typing import Optional"),
+        rb:    ("String",                   "String",                           ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("String",                   "String",                           ""),
+        cs:    ("string",                   "string?",                          ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("String",                   "String?",                          ""),
+        swift: ("String",                   "String?",                          "")
+    ));
+    m.insert("char", row!(
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("string",                   "*string",                          ""),
+        py:    ("str",                      "Optional[str]",                    "from typing import Optional"),
+        rb:    ("String",                   "String",                           ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("String",                   "String",                           ""),
+        cs:    ("string",                   "string?",                          ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("String",                   "String?",                          ""),
+        swift: ("String",                   "String?",                          "")
+    ));
 
     // ── Binary ───────────────────────────────────────────────────────────────
-    m.insert(
-        "bytea",
-        row!(
-            ts: ("Uint8Array",         "Uint8Array | null",        ""),
-            go: ("[]byte",             "[]byte",                   ""),
-            py: ("bytes",              "Optional[bytes]",          "from typing import Optional")
-        ),
-    );
+    m.insert("bytea", row!(
+        ts:    ("Uint8Array",               "Uint8Array | null",                ""),
+        go:    ("[]byte",                   "[]byte",                           ""),
+        py:    ("bytes",                    "Optional[bytes]",                  "from typing import Optional"),
+        rb:    ("String",                   "String",                           ""),
+        rs:    ("Vec<u8>",                  "Option<Vec<u8>>",                  ""),
+        java:  ("byte[]",                   "byte[]",                           ""),
+        cs:    ("byte[]",                   "byte[]?",                          ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("List<int>",                "List<int>?",                       ""),
+        swift: ("Data",                     "Data?",                            "Foundation")
+    ));
 
     // ── UUID ─────────────────────────────────────────────────────────────────
     m.insert("uuid", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("[16]byte",           "*[16]byte",                ""),
-        py: ("UUID",               "Optional[UUID]",           "from uuid import UUID\nfrom typing import Optional")
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("[16]byte",                 "*[16]byte",                        ""),
+        py:    ("UUID",                     "Optional[UUID]",                   "from uuid import UUID\nfrom typing import Optional"),
+        rb:    ("String",                   "String",                           ""),
+        rs:    ("uuid::Uuid",               "Option<uuid::Uuid>",               "uuid"),
+        java:  ("java.util.UUID",           "java.util.UUID",                   ""),
+        cs:    ("Guid",                     "Guid?",                            ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("String",                   "String?",                          ""),
+        swift: ("UUID",                     "UUID?",                            "Foundation")
     ));
 
     // ── JSON / JSONB ─────────────────────────────────────────────────────────
     m.insert("jsonb", row!(
-        ts: ("Record<string, unknown>", "Record<string, unknown> | null", ""),
-        go: ("json.RawMessage",    "json.RawMessage",          "encoding/json"),
-        py: ("Any",                "Optional[Any]",            "from typing import Any, Optional")
+        ts:    ("Record<string, unknown>",  "Record<string, unknown> | null",   ""),
+        go:    ("json.RawMessage",          "json.RawMessage",                  "encoding/json"),
+        py:    ("Any",                      "Optional[Any]",                    "from typing import Any, Optional"),
+        rb:    ("Hash",                     "Hash",                             ""),
+        rs:    ("serde_json::Value",        "Option<serde_json::Value>",        "serde_json"),
+        java:  ("com.fasterxml.jackson.databind.JsonNode", "com.fasterxml.jackson.databind.JsonNode", ""),
+        cs:    ("JsonElement",              "JsonElement?",                     "System.Text.Json"),
+        php:   ("mixed",                    "mixed",                            ""),
+        dart:  ("Map<String, dynamic>",     "Map<String, dynamic>?",            ""),
+        swift: ("AnyCodable",               "AnyCodable?",                      "")
     ));
     m.insert("json", row!(
-        ts: ("Record<string, unknown>", "Record<string, unknown> | null", ""),
-        go: ("json.RawMessage",    "json.RawMessage",          "encoding/json"),
-        py: ("Any",                "Optional[Any]",            "from typing import Any, Optional")
+        ts:    ("Record<string, unknown>",  "Record<string, unknown> | null",   ""),
+        go:    ("json.RawMessage",          "json.RawMessage",                  "encoding/json"),
+        py:    ("Any",                      "Optional[Any]",                    "from typing import Any, Optional"),
+        rb:    ("Hash",                     "Hash",                             ""),
+        rs:    ("serde_json::Value",        "Option<serde_json::Value>",        "serde_json"),
+        java:  ("com.fasterxml.jackson.databind.JsonNode", "com.fasterxml.jackson.databind.JsonNode", ""),
+        cs:    ("JsonElement",              "JsonElement?",                     "System.Text.Json"),
+        php:   ("mixed",                    "mixed",                            ""),
+        dart:  ("Map<String, dynamic>",     "Map<String, dynamic>?",            ""),
+        swift: ("AnyCodable",               "AnyCodable?",                      "")
     ));
 
     // ── Timestamps ───────────────────────────────────────────────────────────
     m.insert("timestamp with time zone", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("time.Time",          "*time.Time",               "time"),
-        py: ("datetime",           "Optional[datetime]",       "from datetime import datetime\nfrom typing import Optional")
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("time.Time",                "*time.Time",                       "time"),
+        py:    ("datetime",                 "Optional[datetime]",               "from datetime import datetime\nfrom typing import Optional"),
+        rb:    ("Time",                     "Time",                             ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("java.time.OffsetDateTime", "java.time.OffsetDateTime",         ""),
+        cs:    ("DateTimeOffset",           "DateTimeOffset?",                  ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("DateTime",                 "DateTime?",                        ""),
+        swift: ("Date",                     "Date?",                            "Foundation")
     ));
     m.insert("timestamptz", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("time.Time",          "*time.Time",               "time"),
-        py: ("datetime",           "Optional[datetime]",       "from datetime import datetime\nfrom typing import Optional")
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("time.Time",                "*time.Time",                       "time"),
+        py:    ("datetime",                 "Optional[datetime]",               "from datetime import datetime\nfrom typing import Optional"),
+        rb:    ("Time",                     "Time",                             ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("java.time.OffsetDateTime", "java.time.OffsetDateTime",         ""),
+        cs:    ("DateTimeOffset",           "DateTimeOffset?",                  ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("DateTime",                 "DateTime?",                        ""),
+        swift: ("Date",                     "Date?",                            "Foundation")
     ));
     m.insert("timestamp without time zone", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("time.Time",          "*time.Time",               "time"),
-        py: ("datetime",           "Optional[datetime]",       "from datetime import datetime\nfrom typing import Optional")
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("time.Time",                "*time.Time",                       "time"),
+        py:    ("datetime",                 "Optional[datetime]",               "from datetime import datetime\nfrom typing import Optional"),
+        rb:    ("Time",                     "Time",                             ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("java.time.LocalDateTime",  "java.time.LocalDateTime",          ""),
+        cs:    ("DateTime",                 "DateTime?",                        ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("DateTime",                 "DateTime?",                        ""),
+        swift: ("Date",                     "Date?",                            "Foundation")
     ));
     m.insert("timestamp", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("time.Time",          "*time.Time",               "time"),
-        py: ("datetime",           "Optional[datetime]",       "from datetime import datetime\nfrom typing import Optional")
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("time.Time",                "*time.Time",                       "time"),
+        py:    ("datetime",                 "Optional[datetime]",               "from datetime import datetime\nfrom typing import Optional"),
+        rb:    ("Time",                     "Time",                             ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("java.time.LocalDateTime",  "java.time.LocalDateTime",          ""),
+        cs:    ("DateTime",                 "DateTime?",                        ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("DateTime",                 "DateTime?",                        ""),
+        swift: ("Date",                     "Date?",                            "Foundation")
     ));
 
     // ── Date ─────────────────────────────────────────────────────────────────
     m.insert("date", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("time.Time",          "*time.Time",               "time"),
-        py: ("date",               "Optional[date]",           "from datetime import date\nfrom typing import Optional")
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("time.Time",                "*time.Time",                       "time"),
+        py:    ("date",                     "Optional[date]",                   "from datetime import date\nfrom typing import Optional"),
+        rb:    ("Date",                     "Date",                             ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("java.time.LocalDate",      "java.time.LocalDate",              ""),
+        cs:    ("DateOnly",                 "DateOnly?",                        ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("DateTime",                 "DateTime?",                        ""),
+        swift: ("Date",                     "Date?",                            "Foundation")
     ));
 
     // ── Time ─────────────────────────────────────────────────────────────────
     m.insert("time without time zone", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("string",             "*string",                  ""),
-        py: ("time",               "Optional[time]",           "from datetime import time\nfrom typing import Optional")
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("string",                   "*string",                          ""),
+        py:    ("time",                     "Optional[time]",                   "from datetime import time\nfrom typing import Optional"),
+        rb:    ("String",                   "String",                           ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("java.time.LocalTime",      "java.time.LocalTime",              ""),
+        cs:    ("TimeOnly",                 "TimeOnly?",                        ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("String",                   "String?",                          ""),
+        swift: ("String",                   "String?",                          "")
     ));
     m.insert("time with time zone", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("string",             "*string",                  ""),
-        py: ("time",               "Optional[time]",           "from datetime import time\nfrom typing import Optional")
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("string",                   "*string",                          ""),
+        py:    ("time",                     "Optional[time]",                   "from datetime import time\nfrom typing import Optional"),
+        rb:    ("String",                   "String",                           ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("java.time.OffsetTime",     "java.time.OffsetTime",             ""),
+        cs:    ("TimeOnly",                 "TimeOnly?",                        ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("String",                   "String?",                          ""),
+        swift: ("String",                   "String?",                          "")
     ));
     m.insert("time", row!(
-        ts: ("string",             "string | null",            ""),
-        go: ("string",             "*string",                  ""),
-        py: ("time",               "Optional[time]",           "from datetime import time\nfrom typing import Optional")
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("string",                   "*string",                          ""),
+        py:    ("time",                     "Optional[time]",                   "from datetime import time\nfrom typing import Optional"),
+        rb:    ("String",                   "String",                           ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("java.time.LocalTime",      "java.time.LocalTime",              ""),
+        cs:    ("TimeOnly",                 "TimeOnly?",                        ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("String",                   "String?",                          ""),
+        swift: ("String",                   "String?",                          "")
     ));
 
     // ── Interval ─────────────────────────────────────────────────────────────
-    // Listed as 🚫 in CAPABILITIES.md alongside MONEY/XML, but information_schema
-    // may surface it from snapshots or future engine builds. Map to string.
-    m.insert(
-        "interval",
-        row!(
-            ts: ("string",             "string | null",            ""),
-            go: ("string",             "*string",                  ""),
-            py: ("str",                "Optional[str]",            "from typing import Optional")
-        ),
-    );
+    // Listed as unsupported in CAPABILITIES.md but information_schema may surface
+    // it from snapshots or future engine builds. Map to string in all languages.
+    m.insert("interval", row!(
+        ts:    ("string",                   "string | null",                    ""),
+        go:    ("string",                   "*string",                          ""),
+        py:    ("str",                      "Optional[str]",                    "from typing import Optional"),
+        rb:    ("String",                   "String",                           ""),
+        rs:    ("String",                   "Option<String>",                   ""),
+        java:  ("String",                   "String",                           ""),
+        cs:    ("string",                   "string?",                          ""),
+        php:   ("string",                   "?string",                          ""),
+        dart:  ("String",                   "String?",                          ""),
+        swift: ("String",                   "String?",                          "")
+    ));
 
     // ── Vector ───────────────────────────────────────────────────────────────
-    m.insert(
-        "vector",
-        row!(
-            ts: ("number[]",           "number[] | null",          ""),
-            go: ("[]float32",          "[]float32",                ""),
-            py: ("list[float]",        "Optional[list[float]]",    "from typing import Optional")
-        ),
-    );
+    m.insert("vector", row!(
+        ts:    ("number[]",                 "number[] | null",                  ""),
+        go:    ("[]float32",                "[]float32",                        ""),
+        py:    ("list[float]",              "Optional[list[float]]",            "from typing import Optional"),
+        rb:    ("Array",                    "Array",                            ""),
+        rs:    ("Vec<f32>",                 "Option<Vec<f32>>",                 ""),
+        java:  ("float[]",                  "float[]",                          ""),
+        cs:    ("float[]",                  "float[]?",                         ""),
+        php:   ("array",                    "?array",                           ""),
+        dart:  ("List<double>",             "List<double>?",                    ""),
+        swift: ("[Float]",                  "[Float]?",                         "")
+    ));
 
     m
 }
@@ -364,8 +569,15 @@ pub fn map_type(pg_name: &str, lang: LangTarget) -> Option<MappedType> {
     let row = table.get(pg_name)?;
     match lang {
         LangTarget::TypeScript => Some(row.ts.clone()),
-        LangTarget::Go => Some(row.go.clone()),
-        LangTarget::Python => Some(row.py.clone()),
+        LangTarget::Go        => Some(row.go.clone()),
+        LangTarget::Python    => Some(row.py.clone()),
+        LangTarget::Ruby      => Some(row.rb.clone()),
+        LangTarget::Rust      => Some(row.rs.clone()),
+        LangTarget::Java      => Some(row.java.clone()),
+        LangTarget::CSharp    => Some(row.cs.clone()),
+        LangTarget::Php       => Some(row.php.clone()),
+        LangTarget::Dart      => Some(row.dart.clone()),
+        LangTarget::Swift     => Some(row.swift.clone()),
     }
 }
 
@@ -453,6 +665,29 @@ fn to_pascal_case(s: &str) -> String {
     }
     let mut b = String::new();
     let mut upper = true;
+    for c in s.chars() {
+        if c == '_' || c == '-' || c == ' ' {
+            upper = true;
+            continue;
+        }
+        if upper {
+            b.extend(c.to_uppercase());
+            upper = false;
+        } else {
+            b.push(c);
+        }
+    }
+    b
+}
+
+/// to_camel_case converts snake_case to camelCase.
+/// "user_profile" → "userProfile", "id" → "id", "created_at" → "createdAt".
+fn to_camel_case(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let mut b = String::new();
+    let mut upper = false;
     for c in s.chars() {
         if c == '_' || c == '-' || c == ' ' {
             upper = true;
@@ -638,6 +873,363 @@ fn emit_python(w: &mut dyn Write, tables: &HashMap<String, TableColumns>, order:
     }
 }
 
+// ── Ruby emitter ─────────────────────────────────────────────────────────────
+
+fn emit_ruby(w: &mut dyn Write, tables: &HashMap<String, TableColumns>, order: &[String]) {
+    let _ = write!(w, "# Code generated by basin gen types — DO NOT EDIT.\n# frozen_string_literal: true\n\n");
+
+    for tbl in order {
+        let tc = &tables[tbl];
+        let class_name = to_pascal_case(tbl);
+        // Collect member names for the Struct definition line.
+        let members: Vec<String> = tc.columns.iter().map(|c| format!(":{}", c.column_name)).collect();
+        let _ = writeln!(w, "{} = Struct.new({}, keyword_init: true) do", class_name, members.join(", "));
+        // Add ATTRIBUTES constant for runtime inspection.
+        let attr_syms: Vec<String> = tc.columns.iter().map(|c| format!(":{}", c.column_name)).collect();
+        let _ = writeln!(w, "  ATTRIBUTES = [{}].freeze", attr_syms.join(", "));
+        for col in &tc.columns {
+            let nullable = col.is_nullable.to_uppercase() == "YES";
+            let rb_type = match map_type(&col.data_type, LangTarget::Ruby) {
+                Some(mt) => if nullable { mt.nullable.to_string() } else { mt.typ.to_string() },
+                None => {
+                    let _ = writeln!(w, "  # WARNING: unknown pg type {}", col.data_type);
+                    "Object".to_string()
+                }
+            };
+            let _ = writeln!(w, "  # @return [{}] {}", rb_type, col.column_name);
+        }
+        let _ = writeln!(w, "end\n");
+    }
+}
+
+// ── Rust emitter ─────────────────────────────────────────────────────────────
+
+fn emit_rust(w: &mut dyn Write, tables: &HashMap<String, TableColumns>, order: &[String]) {
+    let _ = write!(w, "// Code generated by basin gen types — DO NOT EDIT.\n\n");
+    let _ = writeln!(w, "use serde::{{Deserialize, Serialize}};\n");
+
+    // Collect crate-level uses (e.g. uuid).
+    let mut extra_uses: BTreeSet<&str> = BTreeSet::new();
+    for tbl in order {
+        for col in &tables[tbl].columns {
+            if let Some(mt) = map_type(&col.data_type, LangTarget::Rust) {
+                if mt.import == "uuid" {
+                    extra_uses.insert("use uuid::Uuid;");
+                }
+            }
+        }
+    }
+    for u in &extra_uses {
+        let _ = writeln!(w, "{u}");
+    }
+    if !extra_uses.is_empty() {
+        let _ = writeln!(w);
+    }
+
+    for tbl in order {
+        let tc = &tables[tbl];
+        let struct_name = to_pascal_case(tbl);
+        let _ = writeln!(w, "#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]");
+        let _ = writeln!(w, "pub struct {struct_name} {{");
+        for col in &tc.columns {
+            let nullable = col.is_nullable.to_uppercase() == "YES";
+            let rs_type = match map_type(&col.data_type, LangTarget::Rust) {
+                Some(mt) => if nullable { mt.nullable.to_string() } else { mt.typ.to_string() },
+                None => {
+                    let _ = writeln!(w, "    // WARNING: unknown pg type {}", col.data_type);
+                    if nullable { "Option<serde_json::Value>".to_string() } else { "serde_json::Value".to_string() }
+                }
+            };
+            let _ = writeln!(w, "    pub {}: {rs_type},", col.column_name);
+        }
+        let _ = write!(w, "}}\n\n");
+    }
+}
+
+// ── Java emitter ─────────────────────────────────────────────────────────────
+
+fn emit_java(
+    w: &mut dyn Write,
+    tables: &HashMap<String, TableColumns>,
+    order: &[String],
+    pkg_name: &str,
+) {
+    let _ = write!(w, "// Code generated by basin gen types — DO NOT EDIT.\n\n");
+    let _ = writeln!(w, "package {pkg_name};\n");
+    let _ = writeln!(w, "import com.fasterxml.jackson.annotation.JsonProperty;");
+    let _ = writeln!(w, "import javax.annotation.Nullable;\n");
+
+    for tbl in order {
+        let tc = &tables[tbl];
+        let class_name = to_pascal_case(tbl);
+        let _ = writeln!(w, "public final class {class_name} {{");
+        // Fields.
+        for col in &tc.columns {
+            let nullable = col.is_nullable.to_uppercase() == "YES";
+            let java_type = match map_type(&col.data_type, LangTarget::Java) {
+                Some(mt) => if nullable { mt.nullable.to_string() } else { mt.typ.to_string() },
+                None => {
+                    let _ = writeln!(w, "    // WARNING: unknown pg type {}", col.data_type);
+                    "Object".to_string()
+                }
+            };
+            let null_ann = if nullable { "@Nullable " } else { "" };
+            let _ = writeln!(
+                w,
+                "    @JsonProperty(\"{cn}\")\n    public final {null_ann}{java_type} {cn};",
+                cn = col.column_name,
+                null_ann = null_ann,
+                java_type = java_type,
+            );
+        }
+        // Constructor.
+        let _ = writeln!(w);
+        let ctor_params: Vec<String> = tc.columns.iter().map(|col| {
+            let nullable = col.is_nullable.to_uppercase() == "YES";
+            let java_type = map_type(&col.data_type, LangTarget::Java)
+                .map(|mt| if nullable { mt.nullable } else { mt.typ })
+                .unwrap_or("Object");
+            let null_ann = if nullable { "@Nullable " } else { "" };
+            format!(
+                "@JsonProperty(\"{cn}\") {null_ann}{java_type} {cn}",
+                cn = col.column_name,
+                null_ann = null_ann,
+                java_type = java_type,
+            )
+        }).collect();
+        let _ = writeln!(w, "    public {class_name}({})", ctor_params.join(", "));
+        let _ = writeln!(w, "    {{");
+        for col in &tc.columns {
+            let _ = writeln!(w, "        this.{cn} = {cn};", cn = col.column_name);
+        }
+        let _ = write!(w, "    }}\n}}\n\n");
+    }
+}
+
+// ── C# emitter ───────────────────────────────────────────────────────────────
+
+fn emit_csharp(
+    w: &mut dyn Write,
+    tables: &HashMap<String, TableColumns>,
+    order: &[String],
+    pkg_name: &str,
+) {
+    let _ = write!(w, "// Code generated by basin gen types — DO NOT EDIT.\n\n");
+    let _ = writeln!(w, "using System.Text.Json.Serialization;");
+
+    // Check if we need JsonElement.
+    let needs_json_element = order.iter().any(|tbl| {
+        tables[tbl].columns.iter().any(|col| {
+            map_type(&col.data_type, LangTarget::CSharp)
+                .map(|mt| mt.import == "System.Text.Json")
+                .unwrap_or(false)
+        })
+    });
+    if needs_json_element {
+        let _ = writeln!(w, "using System.Text.Json;");
+    }
+    let _ = writeln!(w, "\nnamespace {pkg_name};\n");
+
+    for tbl in order {
+        let tc = &tables[tbl];
+        let class_name = to_pascal_case(tbl);
+        let _ = writeln!(w, "public sealed record {class_name}(");
+        let props: Vec<String> = tc.columns.iter().map(|col| {
+            let nullable = col.is_nullable.to_uppercase() == "YES";
+            let cs_type = match map_type(&col.data_type, LangTarget::CSharp) {
+                Some(mt) => if nullable { mt.nullable.to_string() } else { mt.typ.to_string() },
+                None => {
+                    if nullable { "object?".to_string() } else { "object".to_string() }
+                }
+            };
+            let pascal_name = to_pascal_case(&col.column_name);
+            format!(
+                "    [JsonPropertyName(\"{cn}\")] {cs_type} {pascal_name}",
+                cn = col.column_name,
+            )
+        }).collect();
+        let _ = write!(w, "{}", props.join(",\n"));
+        let _ = write!(w, "\n);\n\n");
+    }
+}
+
+// ── PHP emitter ──────────────────────────────────────────────────────────────
+
+fn emit_php(
+    w: &mut dyn Write,
+    tables: &HashMap<String, TableColumns>,
+    order: &[String],
+    pkg_name: &str,
+) {
+    let _ = write!(w, "<?php\n// Code generated by basin gen types — DO NOT EDIT.\n\ndeclare(strict_types=1);\n\nnamespace {pkg_name};\n\n");
+
+    for tbl in order {
+        let tc = &tables[tbl];
+        let class_name = to_pascal_case(tbl);
+        let _ = writeln!(w, "final class {class_name}");
+        let _ = writeln!(w, "{{");
+        // Constructor with readonly properties.
+        let _ = writeln!(w, "    public function __construct(");
+        let params: Vec<String> = tc.columns.iter().map(|col| {
+            let nullable = col.is_nullable.to_uppercase() == "YES";
+            let php_type = match map_type(&col.data_type, LangTarget::Php) {
+                Some(mt) => if nullable { mt.nullable.to_string() } else { mt.typ.to_string() },
+                None => {
+                    if nullable { "mixed".to_string() } else { "mixed".to_string() }
+                }
+            };
+            format!("        public readonly {php_type} ${},", col.column_name)
+        }).collect();
+        let _ = writeln!(w, "{}", params.join("\n"));
+        let _ = writeln!(w, "    ) {{}}");
+        // fromArray factory.
+        let _ = writeln!(w);
+        let _ = writeln!(w, "    /** @param array<string,mixed> $data */");
+        let _ = writeln!(w, "    public static function fromArray(array $data): self");
+        let _ = writeln!(w, "    {{");
+        let _ = writeln!(w, "        return new self(");
+        for col in &tc.columns {
+            let nullable = col.is_nullable.to_uppercase() == "YES";
+            let php_type = match map_type(&col.data_type, LangTarget::Php) {
+                Some(mt) => if nullable { mt.nullable.replace('?', "") } else { mt.typ.to_string() },
+                None => "mixed".to_string(),
+            };
+            let cast = if nullable {
+                format!("isset($data['{}']) ? ({}) $data['{}'] : null", col.column_name, php_type, col.column_name)
+            } else {
+                format!("({}) $data['{}']", php_type, col.column_name)
+            };
+            let _ = writeln!(w, "            {}: {cast},", col.column_name);
+        }
+        let _ = writeln!(w, "        );");
+        let _ = write!(w, "    }}\n}}\n\n");
+    }
+}
+
+// ── Dart emitter ─────────────────────────────────────────────────────────────
+
+fn emit_dart(w: &mut dyn Write, tables: &HashMap<String, TableColumns>, order: &[String]) {
+    let _ = write!(w, "// Code generated by basin gen types — DO NOT EDIT.\n// ignore_for_file: always_specify_types\n\n");
+
+    for tbl in order {
+        let tc = &tables[tbl];
+        let class_name = to_pascal_case(tbl);
+        let _ = writeln!(w, "class {class_name} {{");
+        // Final fields.
+        for col in &tc.columns {
+            let nullable = col.is_nullable.to_uppercase() == "YES";
+            let dart_type = match map_type(&col.data_type, LangTarget::Dart) {
+                Some(mt) => if nullable { mt.nullable.to_string() } else { mt.typ.to_string() },
+                None => {
+                    let _ = writeln!(w, "  // WARNING: unknown pg type {}", col.data_type);
+                    if nullable { "dynamic".to_string() } else { "dynamic".to_string() }
+                }
+            };
+            let _ = writeln!(w, "  final {dart_type} {};", col.column_name);
+        }
+        // Constructor.
+        let _ = writeln!(w);
+        let _ = writeln!(w, "  const {class_name}({{");
+        for col in &tc.columns {
+            let nullable = col.is_nullable.to_uppercase() == "YES";
+            let required = if nullable { "" } else { "required " };
+            let _ = writeln!(w, "    {required}this.{},", col.column_name);
+        }
+        let _ = writeln!(w, "  }});");
+        // fromJson.
+        let _ = writeln!(w);
+        let _ = writeln!(w, "  factory {class_name}.fromJson(Map<String, dynamic> j) =>");
+        let _ = writeln!(w, "    {class_name}(");
+        for col in &tc.columns {
+            let nullable = col.is_nullable.to_uppercase() == "YES";
+            let dart_type = match map_type(&col.data_type, LangTarget::Dart) {
+                Some(mt) => if nullable { mt.nullable.to_string() } else { mt.typ.to_string() },
+                None => "dynamic".to_string(),
+            };
+            // Special handling for DateTime (needs parse) and List.
+            let expr = if dart_type.starts_with("DateTime") {
+                if nullable {
+                    format!("j['{}'] == null ? null : DateTime.parse(j['{}'] as String)", col.column_name, col.column_name)
+                } else {
+                    format!("DateTime.parse(j['{}'] as String)", col.column_name)
+                }
+            } else if dart_type.contains("List<") || dart_type.contains("Map<") {
+                format!("j['{}'] as {dart_type}", col.column_name)
+            } else {
+                let base = dart_type.trim_end_matches('?');
+                if nullable {
+                    format!("j['{}'] as {dart_type}", col.column_name)
+                } else {
+                    format!("j['{}'] as {base}", col.column_name)
+                }
+            };
+            let _ = writeln!(w, "      {}: {expr},", col.column_name);
+        }
+        let _ = writeln!(w, "    );");
+        // toJson.
+        let _ = writeln!(w);
+        let _ = writeln!(w, "  Map<String, dynamic> toJson() => {{");
+        for col in &tc.columns {
+            let _ = writeln!(w, "    '{}': {},", col.column_name, col.column_name);
+        }
+        let _ = write!(w, "  }};\n}}\n\n");
+    }
+}
+
+// ── Swift emitter ─────────────────────────────────────────────────────────────
+
+fn emit_swift(w: &mut dyn Write, tables: &HashMap<String, TableColumns>, order: &[String]) {
+    let _ = write!(w, "// Code generated by basin gen types — DO NOT EDIT.\n\n");
+
+    // Check if Foundation is needed (Date, UUID, Data).
+    let needs_foundation = order.iter().any(|tbl| {
+        tables[tbl].columns.iter().any(|col| {
+            map_type(&col.data_type, LangTarget::Swift)
+                .map(|mt| mt.import == "Foundation")
+                .unwrap_or(false)
+        })
+    });
+    if needs_foundation {
+        let _ = writeln!(w, "import Foundation\n");
+    }
+
+    for tbl in order {
+        let tc = &tables[tbl];
+        let struct_name = to_pascal_case(tbl);
+        let _ = writeln!(w, "public struct {struct_name}: Codable, Sendable {{");
+        // Stored properties.
+        for col in &tc.columns {
+            let nullable = col.is_nullable.to_uppercase() == "YES";
+            let swift_type = match map_type(&col.data_type, LangTarget::Swift) {
+                Some(mt) => if nullable { mt.nullable.to_string() } else { mt.typ.to_string() },
+                None => {
+                    let _ = writeln!(w, "    // WARNING: unknown pg type {}", col.data_type);
+                    if nullable { "String?".to_string() } else { "String".to_string() }
+                }
+            };
+            // Convert snake_case column name to camelCase for Swift convention.
+            let camel = to_camel_case(&col.column_name);
+            let _ = writeln!(w, "    public let {camel}: {swift_type}");
+        }
+        // CodingKeys — only emit if any column name would differ in camelCase.
+        let needs_coding_keys = tc.columns.iter().any(|c| to_camel_case(&c.column_name) != c.column_name);
+        if needs_coding_keys {
+            let _ = writeln!(w);
+            let _ = writeln!(w, "    enum CodingKeys: String, CodingKey {{");
+            for col in &tc.columns {
+                let camel = to_camel_case(&col.column_name);
+                if camel != col.column_name {
+                    let _ = writeln!(w, "        case {camel} = \"{}\"", col.column_name);
+                } else {
+                    let _ = writeln!(w, "        case {camel}");
+                }
+            }
+            let _ = writeln!(w, "    }}");
+        }
+        let _ = write!(w, "}}\n\n");
+    }
+}
+
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 
 pub fn cmd_gen(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
@@ -646,7 +1238,7 @@ pub fn cmd_gen(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             help_for_command(
                 "gen",
                 "Code-generation utilities.",
-                &["types <typescript|go|python>   Generate typed database interfaces."],
+                &["types <lang>   Generate typed database interfaces (ts/go/py/ruby/rust/java/csharp/php/dart/swift)."],
             );
             return Ok(());
         }
@@ -658,7 +1250,7 @@ pub fn cmd_gen(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             help_for_command(
                 "gen",
                 "Code-generation utilities.",
-                &["types <typescript|go|python>   Generate typed database interfaces."],
+                &["types <lang>   Generate typed database interfaces (ts/go/py/ruby/rust/java/csharp/php/dart/swift)."],
             );
             Ok(())
         }
@@ -759,16 +1351,25 @@ pub fn gen_types(
 
     if positional.is_empty() {
         gen_types_usage();
-        return Err(msg("gen types: <lang> is required (typescript|go|python)"));
+        return Err(msg(
+            "gen types: <lang> is required (typescript|go|python|ruby|rust|java|csharp|php|dart|swift)",
+        ));
     }
     let lang_str = positional[0].to_lowercase();
     let lang = match lang_str.as_str() {
-        "typescript" | "ts" => LangTarget::TypeScript,
-        "go" => LangTarget::Go,
-        "python" | "py" => LangTarget::Python,
+        "typescript" | "ts"          => LangTarget::TypeScript,
+        "go"                          => LangTarget::Go,
+        "python" | "py"               => LangTarget::Python,
+        "ruby" | "rb"                 => LangTarget::Ruby,
+        "rust" | "rs"                 => LangTarget::Rust,
+        "java"                        => LangTarget::Java,
+        "csharp" | "cs" | "dotnet" | "c#" => LangTarget::CSharp,
+        "php"                         => LangTarget::Php,
+        "dart"                        => LangTarget::Dart,
+        "swift"                       => LangTarget::Swift,
         _ => {
             return Err(msg(format!(
-                "gen types: unknown language {:?} (want typescript, go, or python)",
+                "gen types: unknown language {:?} (want typescript, go, python, ruby, rust, java, csharp, php, dart, or swift)",
                 positional[0]
             )))
         }
@@ -853,8 +1454,15 @@ pub fn gen_types(
     let mut buf: Vec<u8> = Vec::new();
     match lang {
         LangTarget::TypeScript => emit_typescript(&mut buf, &tables, &table_order),
-        LangTarget::Go => emit_go(&mut buf, &tables, &table_order, &pkg_name),
-        LangTarget::Python => emit_python(&mut buf, &tables, &table_order),
+        LangTarget::Go        => emit_go(&mut buf, &tables, &table_order, &pkg_name),
+        LangTarget::Python    => emit_python(&mut buf, &tables, &table_order),
+        LangTarget::Ruby      => emit_ruby(&mut buf, &tables, &table_order),
+        LangTarget::Rust      => emit_rust(&mut buf, &tables, &table_order),
+        LangTarget::Java      => emit_java(&mut buf, &tables, &table_order, &pkg_name),
+        LangTarget::CSharp    => emit_csharp(&mut buf, &tables, &table_order, &pkg_name),
+        LangTarget::Php       => emit_php(&mut buf, &tables, &table_order, &pkg_name),
+        LangTarget::Dart      => emit_dart(&mut buf, &tables, &table_order),
+        LangTarget::Swift     => emit_swift(&mut buf, &tables, &table_order),
     }
     let src = String::from_utf8(buf).unwrap_or_default();
 
@@ -956,8 +1564,15 @@ fn run_single_gen_pass(
     let mut buf: Vec<u8> = Vec::new();
     match lang {
         LangTarget::TypeScript => emit_typescript(&mut buf, &tables, &table_order),
-        LangTarget::Go => emit_go(&mut buf, &tables, &table_order, pkg_name),
-        LangTarget::Python => emit_python(&mut buf, &tables, &table_order),
+        LangTarget::Go        => emit_go(&mut buf, &tables, &table_order, pkg_name),
+        LangTarget::Python    => emit_python(&mut buf, &tables, &table_order),
+        LangTarget::Ruby      => emit_ruby(&mut buf, &tables, &table_order),
+        LangTarget::Rust      => emit_rust(&mut buf, &tables, &table_order),
+        LangTarget::Java      => emit_java(&mut buf, &tables, &table_order, pkg_name),
+        LangTarget::CSharp    => emit_csharp(&mut buf, &tables, &table_order, pkg_name),
+        LangTarget::Php       => emit_php(&mut buf, &tables, &table_order, pkg_name),
+        LangTarget::Dart      => emit_dart(&mut buf, &tables, &table_order),
+        LangTarget::Swift     => emit_swift(&mut buf, &tables, &table_order),
     }
     std::fs::write(output_path, &buf)
         .map_err(|e| msg(format!("gen types: write {output_path}: {e}")))?;
@@ -1056,11 +1671,13 @@ fn gen_types_usage() {
         "gen types",
         "Generate typed database interfaces from information_schema.",
         &[
-            "<lang>              Target language: typescript, go, python (required).",
+            "<lang>              Target language (required):",
+            "                    typescript|ts  go  python|py  ruby|rb",
+            "                    rust|rs  java  csharp|cs|dotnet  php  dart  swift",
             "--project=<ref>     Project ref (required if not linked).",
             "--schema=public     Schema name to introspect (default: public).",
             "--output=<path>     Write to file instead of stdout.",
-            "--package=<name>    Go package name (default: database, Go only).",
+            "--package=<name>    Package/namespace name (default: database; Go, Java, C#, PHP).",
             "--watch             Re-emit on migration-file changes (requires --output=<path>).",
         ],
     );
@@ -1283,13 +1900,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn snapshot_ruby() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["ruby", "--project=test-ref"]).unwrap();
+        let expected =
+            std::fs::read_to_string("testdata/expected.rb").expect("read testdata/expected.rb");
+        assert_eq!(
+            got, expected,
+            "Ruby snapshot mismatch.\nGOT:\n{got}\nWANT:\n{expected}"
+        );
+    }
+
+    #[test]
+    fn snapshot_rust() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["rust", "--project=test-ref"]).unwrap();
+        let expected =
+            std::fs::read_to_string("testdata/expected.rs").expect("read testdata/expected.rs");
+        assert_eq!(
+            got, expected,
+            "Rust snapshot mismatch.\nGOT:\n{got}\nWANT:\n{expected}"
+        );
+    }
+
+    #[test]
+    fn snapshot_java() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["java", "--project=test-ref"]).unwrap();
+        let expected =
+            std::fs::read_to_string("testdata/expected.java").expect("read testdata/expected.java");
+        assert_eq!(
+            got, expected,
+            "Java snapshot mismatch.\nGOT:\n{got}\nWANT:\n{expected}"
+        );
+    }
+
+    #[test]
+    fn snapshot_csharp() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["csharp", "--project=test-ref"]).unwrap();
+        let expected =
+            std::fs::read_to_string("testdata/expected.cs").expect("read testdata/expected.cs");
+        assert_eq!(
+            got, expected,
+            "C# snapshot mismatch.\nGOT:\n{got}\nWANT:\n{expected}"
+        );
+    }
+
+    #[test]
+    fn snapshot_php() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["php", "--project=test-ref"]).unwrap();
+        let expected =
+            std::fs::read_to_string("testdata/expected.php").expect("read testdata/expected.php");
+        assert_eq!(
+            got, expected,
+            "PHP snapshot mismatch.\nGOT:\n{got}\nWANT:\n{expected}"
+        );
+    }
+
+    #[test]
+    fn snapshot_dart() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["dart", "--project=test-ref"]).unwrap();
+        let expected =
+            std::fs::read_to_string("testdata/expected.dart").expect("read testdata/expected.dart");
+        assert_eq!(
+            got, expected,
+            "Dart snapshot mismatch.\nGOT:\n{got}\nWANT:\n{expected}"
+        );
+    }
+
+    #[test]
+    fn snapshot_swift() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["swift", "--project=test-ref"]).unwrap();
+        let expected =
+            std::fs::read_to_string("testdata/expected.swift").expect("read testdata/expected.swift");
+        assert_eq!(
+            got, expected,
+            "Swift snapshot mismatch.\nGOT:\n{got}\nWANT:\n{expected}"
+        );
+    }
+
     // ── Error paths ───────────────────────────────────────────────────────────
 
     #[test]
     fn unknown_lang() {
         let _cfg = with_temp_config_dir();
         let srv = build_schema_server();
-        let err = run_gen(&g_for(&srv), &["ruby", "--project=test-ref"]).unwrap_err();
+        // "cobol" is not a supported language.
+        let err = run_gen(&g_for(&srv), &["cobol", "--project=test-ref"]).unwrap_err();
         assert!(err.to_string().contains("unknown language"), "err={err}");
     }
 
@@ -1624,6 +2333,53 @@ mod tests {
         cmd_gen(&g, &[]).unwrap();
     }
 
+    // ── to_camel_case helper ──────────────────────────────────────────────────
+
+    #[test]
+    fn camel_case_cases() {
+        let cases = &[
+            ("id", "id"),
+            ("user_id", "userId"),
+            ("created_at", "createdAt"),
+            ("user_profile_name", "userProfileName"),
+            ("", ""),
+            ("score", "score"),
+        ];
+        for (input, want) in cases {
+            let got = to_camel_case(input);
+            assert_eq!(&got, want, "to_camel_case({input:?})");
+        }
+    }
+
+    // ── testdata generator — run with BASIN_GEN_TESTDATA=1 to regenerate ────
+
+    /// generate_testdata writes the golden testdata files for all new languages.
+    /// Run with: cargo test commands::gen::tests::generate_testdata -- --nocapture
+    /// (set BASIN_GEN_TESTDATA=1 env var first to actually write files)
+    #[test]
+    fn generate_testdata() {
+        let _cfg = with_temp_config_dir();
+        if std::env::var("BASIN_GEN_TESTDATA").unwrap_or_default() != "1" {
+            return; // skip unless explicitly opted in
+        }
+        let srv = build_schema_server();
+        let g = g_for(&srv);
+        let langs: &[(&str, &str)] = &[
+            ("ruby",       "testdata/expected.rb"),
+            ("rust",       "testdata/expected.rs"),
+            ("java",       "testdata/expected.java"),
+            ("csharp",     "testdata/expected.cs"),
+            ("php",        "testdata/expected.php"),
+            ("dart",       "testdata/expected.dart"),
+            ("swift",      "testdata/expected.swift"),
+        ];
+        for (lang, path) in langs {
+            let got = run_gen(&g, &[lang, "--project=test-ref"]).unwrap();
+            std::fs::write(path, got.as_bytes()).unwrap_or_else(|e| panic!("write {path}: {e}"));
+            eprintln!("wrote {path}");
+        }
+    }
+
     // ── to_pascal_case helper ─────────────────────────────────────────────────
 
     #[test]
@@ -1832,6 +2588,199 @@ mod tests {
         }
     }
 
+    // ── Ruby emit shape ───────────────────────────────────────────────────────
+
+    #[test]
+    fn ruby_emit_shape() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["ruby", "--project=test-ref"]).unwrap();
+        let checks = &[
+            "# Code generated by basin gen types — DO NOT EDIT.",
+            "# frozen_string_literal: true",
+            "Orders = Struct.new",
+            "Users = Struct.new",
+            "ATTRIBUTES",
+            ":id",
+            ":email",
+            "keyword_init: true",
+        ];
+        for check in checks {
+            assert!(got.contains(check), "missing {check:?} in:\n{got}");
+        }
+    }
+
+    // ── Rust emit shape ───────────────────────────────────────────────────────
+
+    #[test]
+    fn rust_emit_shape() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["rust", "--project=test-ref"]).unwrap();
+        let checks = &[
+            "// Code generated by basin gen types — DO NOT EDIT.",
+            "use serde::{Deserialize, Serialize};",
+            "pub struct Orders {",
+            "pub struct Users {",
+            "pub id: uuid::Uuid,",
+            "pub user_id: Option<uuid::Uuid>,",
+            "pub total: String,",
+            "pub metadata: Option<serde_json::Value>,",
+            "pub email: String,",
+            "pub created_at: Option<String>,",
+            "pub embedding: Option<Vec<f32>>,",
+            "pub score: i32,",
+        ];
+        for check in checks {
+            assert!(got.contains(check), "missing {check:?} in:\n{got}");
+        }
+    }
+
+    // ── Java emit shape ───────────────────────────────────────────────────────
+
+    #[test]
+    fn java_emit_shape() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["java", "--project=test-ref"]).unwrap();
+        let checks = &[
+            "// Code generated by basin gen types — DO NOT EDIT.",
+            "import com.fasterxml.jackson.annotation.JsonProperty;",
+            "public final class Orders {",
+            "public final class Users {",
+            "@JsonProperty(\"id\")",
+            "@JsonProperty(\"email\")",
+            "@Nullable",
+            "java.util.UUID",
+        ];
+        for check in checks {
+            assert!(got.contains(check), "missing {check:?} in:\n{got}");
+        }
+    }
+
+    // ── C# emit shape ────────────────────────────────────────────────────────
+
+    #[test]
+    fn csharp_emit_shape() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["csharp", "--project=test-ref"]).unwrap();
+        let checks = &[
+            "// Code generated by basin gen types — DO NOT EDIT.",
+            "using System.Text.Json.Serialization;",
+            "public sealed record Orders(",
+            "public sealed record Users(",
+            "[JsonPropertyName(\"id\")]",
+            "[JsonPropertyName(\"email\")]",
+            "Guid",
+            "Guid?",  // nullable uuid
+            "DateTimeOffset?",  // nullable timestamp
+        ];
+        for check in checks {
+            assert!(got.contains(check), "missing {check:?} in:\n{got}");
+        }
+    }
+
+    // ── PHP emit shape ────────────────────────────────────────────────────────
+
+    #[test]
+    fn php_emit_shape() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["php", "--project=test-ref"]).unwrap();
+        let checks = &[
+            "<?php",
+            "// Code generated by basin gen types — DO NOT EDIT.",
+            "declare(strict_types=1);",
+            "final class Orders",
+            "final class Users",
+            "public readonly",
+            "public static function fromArray",
+        ];
+        for check in checks {
+            assert!(got.contains(check), "missing {check:?} in:\n{got}");
+        }
+    }
+
+    // ── Dart emit shape ───────────────────────────────────────────────────────
+
+    #[test]
+    fn dart_emit_shape() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["dart", "--project=test-ref"]).unwrap();
+        let checks = &[
+            "// Code generated by basin gen types — DO NOT EDIT.",
+            "class Orders {",
+            "class Users {",
+            "factory Orders.fromJson(",
+            "factory Users.fromJson(",
+            "Map<String, dynamic> toJson()",
+            "final String id;",
+            "final String? user_id;",
+        ];
+        for check in checks {
+            assert!(got.contains(check), "missing {check:?} in:\n{got}");
+        }
+    }
+
+    // ── Swift emit shape ──────────────────────────────────────────────────────
+
+    #[test]
+    fn swift_emit_shape() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["swift", "--project=test-ref"]).unwrap();
+        let checks = &[
+            "// Code generated by basin gen types — DO NOT EDIT.",
+            "import Foundation",
+            "public struct Orders: Codable, Sendable {",
+            "public struct Users: Codable, Sendable {",
+            "public let id: UUID",
+            "public let email: String",
+            "public let createdAt: Date?",
+            "enum CodingKeys: String, CodingKey",
+            "case createdAt = \"created_at\"",
+        ];
+        for check in checks {
+            assert!(got.contains(check), "missing {check:?} in:\n{got}");
+        }
+    }
+
+    // ── Language aliases (new langs) ──────────────────────────────────────────
+
+    #[test]
+    fn lang_alias_rs() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["rs", "--project=test-ref"]).unwrap();
+        assert!(got.contains("pub struct"), "'rs' alias did not emit Rust");
+    }
+
+    #[test]
+    fn lang_alias_rb() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["rb", "--project=test-ref"]).unwrap();
+        assert!(got.contains("Struct.new"), "'rb' alias did not emit Ruby");
+    }
+
+    #[test]
+    fn lang_alias_cs() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["cs", "--project=test-ref"]).unwrap();
+        assert!(got.contains("sealed record"), "'cs' alias did not emit C#");
+    }
+
+    #[test]
+    fn lang_alias_dotnet() {
+        let _cfg = with_temp_config_dir();
+        let srv = build_schema_server();
+        let got = run_gen(&g_for(&srv), &["dotnet", "--project=test-ref"]).unwrap();
+        assert!(got.contains("sealed record"), "'dotnet' alias did not emit C#");
+    }
+
     // ── --package flag ────────────────────────────────────────────────────────
 
     #[test]
@@ -1895,7 +2844,18 @@ mod tests {
     #[test]
     fn map_type_table_completeness() {
         let table = type_table();
-        let langs = [LangTarget::TypeScript, LangTarget::Go, LangTarget::Python];
+        let langs = [
+            LangTarget::TypeScript,
+            LangTarget::Go,
+            LangTarget::Python,
+            LangTarget::Ruby,
+            LangTarget::Rust,
+            LangTarget::Java,
+            LangTarget::CSharp,
+            LangTarget::Php,
+            LangTarget::Dart,
+            LangTarget::Swift,
+        ];
         for pg_name in table.keys() {
             for &lang in &langs {
                 let mt = map_type(pg_name, lang).unwrap_or_else(|| {
