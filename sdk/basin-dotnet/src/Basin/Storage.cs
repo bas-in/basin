@@ -106,17 +106,13 @@ public sealed class StorageBucketClient
         string? contentType = null,
         CancellationToken ct = default)
     {
-        var extraHeaders = contentType is not null
-            ? new Dictionary<string, string> { ["Content-Type"] = contentType }
-            : null;
-
         // Storage upload uses raw bytes, not JSON encoding.
+        // contentType is passed directly as the Content-Type of the ByteArrayContent.
         var resp = await _transport.RequestAsync(
             HttpMethod.Post,
             ObjectPath(path),
             body: data,
             contentType: contentType ?? "application/octet-stream",
-            extraHeaders: extraHeaders,
             ct: ct).ConfigureAwait(false);
 
         var raw = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
