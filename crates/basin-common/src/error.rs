@@ -266,6 +266,25 @@ pub enum BasinError {
     #[error("there is no unique or exclusion constraint matching the ON CONFLICT specification (columns: {0})")]
     AmbiguousConflictTarget(String),
 
+    /// Multi-region v0.2 (ADR 0009) — a non-home write was routed by a
+    /// [`crate::region`]-style `WriteForwarder` running in `fly-replay` mode.
+    /// This is NOT a client-facing error: it is a control signal the engine's
+    /// pgwire / REST edge intercepts and turns into a Fly `fly-replay:
+    /// region=<home_region>` response header, so Fly re-fires the same request
+    /// against the home region (one extra RTT). The `home_region` field names
+    /// the replay target; `token` is an opaque correlation/loop-guard string
+    /// the edge echoes into the replay directive (and that the home region can
+    /// surface in logs to confirm the request arrived via replay rather than
+    /// looping). If the edge does NOT understand replay (e.g. a non-Fly
+    /// deployment) it falls back to rendering this exactly like
+    /// [`Self::WrongRegion`] — SQLSTATE `08006`, naming the home region — so a
+    /// region-aware client still reconnects to the right place.
+    #[error(
+        "write must replay to home region \"{home_region}\" (replay token {token}); \
+         reconnect to the home region if your edge does not support fly-replay"
+    )]
+    ForwardReplay { home_region: String, token: String },
+
     /// Catch-all for sources without a dedicated variant.
     #[error("internal: {0}")]
     Internal(String),
@@ -396,6 +415,16 @@ impl BasinError {
             "{op} rejected: project {project} is homed in region \"{home_region}\", \
              but this is region \"{local}\"; reconnect to the home region"
         ))
+    }
+
+    /// Multi-region v0.2 — typed constructor for the fly-replay control signal.
+    /// `home_region` is the replay target; `token` is an opaque loop-guard /
+    /// correlation string the edge echoes into the `fly-replay` directive.
+    pub fn forward_replay(home_region: impl Into<String>, token: impl Into<String>) -> Self {
+        Self::ForwardReplay {
+            home_region: home_region.into(),
+            token: token.into(),
+        }
     }
 
     /// Phase 5.28.B — typed constructor for `lock_timeout` expiry.

@@ -44,6 +44,30 @@ pub(crate) fn connection_limit_reached_response() -> ErrorResponse {
     info.into()
 }
 
+/// Multi-region v0.2: if `err` is the [`BasinError::ForwardReplay`] control
+/// signal, return the value of the Fly `fly-replay` response header that the
+/// edge should emit (`region=<home_region>;...`), so Fly re-fires the request
+/// against the project's home region. Returns `None` for any other error (the
+/// caller then renders a normal `ErrorResponse` via [`error_response`]).
+///
+/// The directive carries the replay TOKEN in the `instance`-style state field
+/// so the home region (and Fly's own loop detection) can observe it; the
+/// `region=` key is the part Fly acts on. Header shape per Fly's
+/// `fly-replay` docs: `region=<code>;state=<opaque>`.
+///
+/// This is the ONE place the engine binary's edge needs to call to honour
+/// `BASIN_WRITE_FORWARD_MODE=fly-replay`; the pgwire edge cannot carry a
+/// mid-session replay (no HTTP response to attach a header to), so the
+/// pgwire path falls back to the `http-forward` mode or the 08006 render.
+pub fn fly_replay_directive(err: &BasinError) -> Option<String> {
+    match err {
+        BasinError::ForwardReplay { home_region, token } => {
+            Some(format!("region={home_region};state={token}"))
+        }
+        _ => None,
+    }
+}
+
 fn classify(err: &BasinError) -> (&'static str, &'static str) {
     match err {
         BasinError::InvalidIdent(_) | BasinError::InvalidSchema(_) => ("ERROR", "42601"), // syntax_error
@@ -107,6 +131,14 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         // forwards instead of raising this, so the router only sees the error
         // in the fail-loud / forwarding-disabled deployment.)
         BasinError::WrongRegion(_) => ("ERROR", "08006"), // connection_failure
+        // Multi-region v0.2: the fly-replay control signal. The Fly-aware edge
+        // (see `fly_replay_directive`) intercepts this BEFORE classify() and
+        // emits a `fly-replay: region=<home>` header instead of an
+        // ErrorResponse. If it reaches here, the deployment's edge does not
+        // understand replay, so we degrade to the same fail-loud 08006 a
+        // no-forwarder deployment raises — the Display form already names the
+        // home region, so a region-aware client reconnects correctly.
+        BasinError::ForwardReplay { .. } => ("ERROR", "08006"), // connection_failure
         // Phase 5.28.B: lock_timeout expiry — PostgreSQL raises 55P03.
         BasinError::LockNotAvailable(_) => ("ERROR", "55P03"), // lock_not_available
         // Advisory-lock deadlock detection — PostgreSQL raises 40P01
