@@ -133,6 +133,7 @@ pub fn cmd_webhooks(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         "redeliver" => redeliver(g, rest),
         "delete" => delete(g, rest),
         "deliveries" => deliveries(g, rest),
+        "inbound" => super::inbound_webhooks::cmd_webhooks_inbound(g, rest),
         "--help" | "-h" | "help" => {
             help_for_command(
                 "webhooks",
@@ -145,6 +146,7 @@ pub fn cmd_webhooks(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                     "redeliver <id> --delivery=<id> [--project=<ref>]                  Redeliver a past delivery.",
                     "delete <id>                  [--project=<ref>] [--yes]             Delete a webhook.",
                     "deliveries <id> [--limit=N]  [--project=<ref>]                    List deliveries for a webhook.",
+                    "inbound list/create/get/delete/rotate [--project=<ref>]            Manage inbound webhook receivers.",
                 ],
             );
             Ok(())
