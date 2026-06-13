@@ -305,6 +305,43 @@ pub struct CvDef {
     /// catalog payload.
     #[serde(default)]
     pub last_bucket_max_unix_ms: Option<i64>,
+    /// True when this CV was created via the TimescaleDB-compatible SQL
+    /// surface (`CREATE MATERIALIZED VIEW ... WITH (timescaledb.continuous)`).
+    /// Affects nothing in the refresh engine — the materialisation and
+    /// watermark logic are identical to a `basin.continuous` CV — but it lets
+    /// the `timescaledb_information.continuous_aggregates` view and the
+    /// `add_continuous_aggregate_policy` / `refresh_continuous_aggregate`
+    /// functions distinguish a Timescale-flavoured cagg from a native one.
+    /// Defaults to `false` so pre-existing native CVs deserialise unchanged.
+    #[serde(default)]
+    pub timescaledb: bool,
+    /// Continuous-aggregate refresh policy registered via
+    /// `add_continuous_aggregate_policy(cagg, start_offset, end_offset,
+    /// schedule_interval)`. `None` when no policy has been added. Additive —
+    /// pre-policy catalog rows deserialise to `None`.
+    #[serde(default)]
+    pub cagg_policy: Option<CaggPolicy>,
+}
+
+/// A TimescaleDB `add_continuous_aggregate_policy` registration.
+///
+/// The policy refreshes the window `[now() - start_offset, now() -
+/// end_offset]` every `schedule_interval`. `start_offset = None` means
+/// "from the beginning of time" (Timescale's `NULL` start_offset); likewise
+/// `end_offset = None` means "up to now()". All offsets are stored in
+/// seconds. The policy is *driven* the same way the retention policy is —
+/// on-demand via the engine (deterministically triggerable in tests) and,
+/// in production, by the background CV refresher tick.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaggPolicy {
+    /// `now() - start_offset` is the lower bound of the refresh window.
+    /// `None` = unbounded (refresh from the earliest source data).
+    pub start_offset_secs: Option<u64>,
+    /// `now() - end_offset` is the upper bound of the refresh window.
+    /// `None` = up to now().
+    pub end_offset_secs: Option<u64>,
+    /// How often the policy fires, in seconds.
+    pub schedule_interval_secs: u64,
 }
 
 /// Per-table on-disk data-file format (#161). `Parquet` is the default and

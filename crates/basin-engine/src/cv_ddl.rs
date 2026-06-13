@@ -63,10 +63,17 @@ pub(crate) struct CvOptions {
     /// existence in the option list is what flags the view as a continuous
     /// aggregate (vs. a regular materialised view).
     pub continuous: bool,
-    /// `refresh_interval = '<duration>'`. Required when `continuous = true`.
-    /// Parsed at the point of registration; stored as seconds in the
-    /// catalog (one `BIGINT`).
+    /// `refresh_interval = '<duration>'`. Required when `continuous = true`
+    /// for the `basin.continuous` form; *optional* for the
+    /// `timescaledb.continuous` form (Timescale sets the cadence separately
+    /// via `add_continuous_aggregate_policy`). Parsed at the point of
+    /// registration; stored as seconds in the catalog (one `BIGINT`).
     pub refresh_interval_secs: Option<u64>,
+    /// True when the flag was the TimescaleDB form `timescaledb.continuous`
+    /// rather than Basin's native `basin.continuous`. The materialisation
+    /// engine is identical; this only tags the resulting `CvDef` so the
+    /// Timescale info-schema view and policy functions can recognise it.
+    pub timescaledb: bool,
 }
 
 /// Pre-screen result for a `CREATE MATERIALIZED VIEW ... WITH (...)`. The
@@ -194,6 +201,7 @@ pub(crate) fn extract_basin_cv_options(sql: &str) -> Result<(String, Option<CvOp
             Some(CvOptions {
                 continuous: false,
                 refresh_interval_secs: None,
+                timescaledb: false,
             }),
         ));
     };
@@ -222,11 +230,26 @@ pub(crate) fn extract_basin_cv_options(sql: &str) -> Result<(String, Option<CvOp
 /// turn into a regular materialised view.
 fn parse_cv_options(inside: &str) -> Result<CvOptions> {
     let mut continuous = false;
+    let mut timescaledb = false;
     let mut refresh_interval_secs: Option<u64> = None;
     for raw in split_top_level_commas(inside) {
         let token = raw.trim();
         if token.is_empty() {
             continue;
+        }
+        // TimescaleDB form: `timescaledb.continuous` (= true is also
+        // tolerated, e.g. `timescaledb.continuous = true`). This is the
+        // canonical Timescale syntax for a continuous aggregate. The
+        // materialisation engine is identical to `basin.continuous`; the only
+        // difference is the cadence comes from `add_continuous_aggregate_policy`
+        // rather than an inline `refresh_interval`.
+        {
+            let key = token.split('=').next().unwrap_or(token).trim();
+            if key.eq_ignore_ascii_case("timescaledb.continuous") {
+                continuous = true;
+                timescaledb = true;
+                continue;
+            }
         }
         // Flag form: `basin.continuous` (or just `continuous`).
         if token.eq_ignore_ascii_case("basin.continuous")
@@ -572,6 +595,7 @@ pub(crate) async fn exec_create_materialized_view(
     name: &str,
     source_sql: &str,
     refresh_interval_secs: u64,
+    timescaledb: bool,
 ) -> Result<ExecResult> {
     let table = TableName::new(name)?;
 
@@ -653,6 +677,8 @@ pub(crate) async fn exec_create_materialized_view(
         refresh_interval_secs,
         last_refreshed_at_unix_ms: Some(now.timestamp_millis()),
         last_bucket_max_unix_ms: None,
+        timescaledb,
+        cagg_policy: None,
     };
     catalog
         .set_continuous_aggregate(&sess.project, &table, Some(def))
@@ -1597,15 +1623,22 @@ pub(crate) fn match_create_materialized_view_ast(
 fn parse_into_cv_options(options: &[pg_query::protobuf::Node]) -> Result<CvOptions> {
     use pg_query::NodeEnum;
     let mut continuous = false;
+    let mut timescaledb = false;
     let mut refresh_interval_secs: Option<u64> = None;
     for node in options {
         let Some(NodeEnum::DefElem(de)) = node.node.as_ref() else {
             continue;
         };
         // `basin.continuous` → defnamespace="basin", defname="continuous", no arg.
+        // `timescaledb.continuous` → defnamespace="timescaledb".
         // Also accept bare `continuous` (defnamespace empty).
         let ns = de.defnamespace.to_ascii_lowercase();
         let name = de.defname.to_ascii_lowercase();
+        if name == "continuous" && ns == "timescaledb" {
+            continuous = true;
+            timescaledb = true;
+            continue;
+        }
         if name == "continuous" && (ns.is_empty() || ns == "basin") {
             continuous = true;
             continue;
@@ -1633,6 +1666,7 @@ fn parse_into_cv_options(options: &[pg_query::protobuf::Node]) -> Result<CvOptio
     Ok(CvOptions {
         continuous,
         refresh_interval_secs,
+        timescaledb,
     })
 }
 

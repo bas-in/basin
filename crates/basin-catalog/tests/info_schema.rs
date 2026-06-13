@@ -115,6 +115,8 @@ async fn tables_view_includes_materialized_views_as_base_table() {
             refresh_interval_secs: 60,
             last_refreshed_at_unix_ms: None,
             last_bucket_max_unix_ms: None,
+            timescaledb: false,
+            cagg_policy: None,
         }),
     )
     .await
@@ -181,6 +183,8 @@ async fn pg_class_relkind_is_correct() {
             refresh_interval_secs: 60,
             last_refreshed_at_unix_ms: None,
             last_bucket_max_unix_ms: None,
+            timescaledb: false,
+            cagg_policy: None,
         }),
     )
     .await

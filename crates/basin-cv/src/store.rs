@@ -173,6 +173,8 @@ impl CvStore {
             refresh_interval_secs: spec.refresh_interval_secs,
             last_refreshed_at_unix_ms: Some(now.timestamp_millis()),
             last_bucket_max_unix_ms: spec.last_bucket_max.map(|t| t.timestamp_millis()),
+            timescaledb: false,
+            cagg_policy: None,
         };
         catalog
             .set_continuous_aggregate(project, &name, Some(def))

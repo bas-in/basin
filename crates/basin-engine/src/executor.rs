@@ -2428,19 +2428,28 @@ async fn dispatch_parsed_statement(
                 let opts = cv_options.unwrap_or_default();
                 let source_sql = query.to_string();
                 if opts.continuous {
-                    // Continuous-aggregate path: requires refresh_interval.
-                    let interval = opts.refresh_interval_secs.ok_or_else(|| {
-                        BasinError::InvalidSchema(
-                            "CREATE MATERIALIZED VIEW: WITH (basin.continuous) \
-                             requires refresh_interval = '<duration>'"
-                                .into(),
-                        )
-                    })?;
+                    // Continuous-aggregate path. The native `basin.continuous`
+                    // form requires an inline `refresh_interval`; the
+                    // TimescaleDB form (`timescaledb.continuous`) sets the
+                    // cadence separately via add_continuous_aggregate_policy,
+                    // so the interval is optional there (0 = manual/policy).
+                    let interval = match opts.refresh_interval_secs {
+                        Some(s) => s,
+                        None if opts.timescaledb => 0,
+                        None => {
+                            return Err(BasinError::InvalidSchema(
+                                "CREATE MATERIALIZED VIEW: WITH (basin.continuous) \
+                                 requires refresh_interval = '<duration>'"
+                                    .into(),
+                            ));
+                        }
+                    };
                     crate::cv_ddl::exec_create_materialized_view(
                         sess,
                         &view_name,
                         &source_sql,
                         interval,
+                        opts.timescaledb,
                     )
                     .await
                 } else {
