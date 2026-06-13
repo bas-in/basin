@@ -2268,11 +2268,20 @@ fn rewrite_range_op_once(sql: &str, op: &str, func: &str) -> String {
             }
             "__range_lt_at" => {
                 if looks_like_range(lhs) || looks_like_range(rhs) {
-                    // Swap lhs / rhs for the "contained by" direction.
-                    let call = if looks_like_range(lhs) {
-                        format!("range_contains_range({rhs}, {lhs})")
-                    } else {
+                    // `A <@ B` is "A is contained by B" → `B @> A`. Swap to the
+                    // containment direction and pick elem-vs-range for the LHS:
+                    //   * `5 <@ r`           → `range_contains_elem(r, 5)`   (numeric LHS)
+                    //   * `r <@ '[0,35)'`    → `range_contains_range('[0,35)', r)`
+                    //   * `int4range(..) <@ B` → `range_contains_range(B, A)`
+                    // Only a numeric LHS is an element; a bare range column or a
+                    // range constructor/literal LHS is a range. (The old check
+                    // keyed off `looks_like_range(lhs)`, which mis-routed a bare
+                    // range COLUMN `<@` literal to the element form and returned
+                    // no rows.)
+                    let call = if looks_like_numeric(lhs) {
                         format!("range_contains_elem({rhs}, {lhs})")
+                    } else {
+                        format!("range_contains_range({rhs}, {lhs})")
                     };
                     s.replace_range(lhs_start..rhs_end, &call);
                     continue;
