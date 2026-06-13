@@ -53,6 +53,8 @@
 //! receives a `cursor_expired` frame and must re-snapshot.
 
 mod gc;
+/// ADR 0028 Phase 3 — Kafka/Redpanda push sink (delivery worker).
+pub mod kafka;
 mod live;
 mod record;
 mod ring;
@@ -70,6 +72,13 @@ use basin_storage::Storage;
 use tokio::sync::Mutex;
 
 pub use gc::{run_once as gc_run_once, spawn_retention_gc, RetentionGc};
+pub use kafka::{
+    build_records, mint_sink_id, partition_key_bytes, spawn_kafka_dispatcher,
+    spawn_kafka_supervisor_with_producer, KafkaConfig, KafkaDispatcher, KafkaProducer,
+    KafkaRecord, KafkaSupervisor,
+};
+#[cfg(feature = "cdc-kafka")]
+pub use kafka::spawn_kafka_supervisor;
 pub use live::{LiveRegistry, LIVE_CHANNEL_CAPACITY};
 pub use record::{CdcRecord, CdcSseFrame};
 pub use ring::{CdcIndex, ProjectRing, SEGMENT_MAX_BYTES, SEGMENT_MAX_RECORDS};
