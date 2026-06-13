@@ -538,6 +538,34 @@ async fn main() -> Result<()> {
         sink
     };
 
+    // --- multi-region write forwarder (ADR 0009, v0.2) ----------------------
+    //
+    // Gated on BASIN_WRITE_FORWARD_MODE. `off` (the default) registers NOTHING,
+    // so a non-home write keeps the byte-identical fail-loud WrongRegion path.
+    // `fly-replay` / `http-forward` install RegionWriteForwarder, which turns a
+    // non-home auto-commit write into a fly-replay directive at the edge or a
+    // 6PN HTTP forward to the home region (see basin_engine::write_forwarder).
+    // A malformed BASIN_REGION_PEERS list fails loud here at startup.
+    match basin_engine::write_forwarder::RegionWriteForwarder::from_env()
+        .context("BASIN_REGION_PEERS parse failed")?
+    {
+        Some(fwd) => {
+            let mode = fwd.mode();
+            engine.attach_write_forwarder(std::sync::Arc::new(fwd));
+            tracing::info!(
+                ?mode,
+                region = basin_common::local_region(),
+                "multi-region write forwarder attached"
+            );
+        }
+        None => {
+            tracing::debug!(
+                "multi-region write forwarder disabled (BASIN_WRITE_FORWARD_MODE=off); \
+                 non-home writes fail loud with WrongRegion"
+            );
+        }
+    }
+
     // Build the static resolver from `BASIN_PROJECTS`.
     //
     // SECURITY: `StaticProjectResolver` accepts ANY password (its

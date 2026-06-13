@@ -64,6 +64,9 @@ pub use connection_limit::{
     CatalogConnectionLimitProvider, ConnectionGuard, ConnectionLimitProvider, ConnectionLimiter,
     NoConnectionLimit,
 };
+/// Multi-region v0.2: edge helper that turns a [`basin_common::BasinError::ForwardReplay`]
+/// control signal into the value of the Fly `fly-replay` response header.
+pub use error::fly_replay_directive;
 pub use protocol::{COMMIT_CONFLICT_EXHAUSTED_COUNT, COMMIT_CONFLICT_RETRY_COUNT};
 pub use rate_limit::{from_env_qps, PgRateLimit, BURST_FACTOR, DEFAULT_SUSTAINED_QPS};
 pub use resolver::{

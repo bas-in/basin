@@ -1648,6 +1648,9 @@ mod range_udf;
 pub mod reactor_ddl;
 mod reactor_sink;
 pub mod region;
+/// Multi-region v0.2 (ADR 0009): concrete `WriteForwarder` impls (fly-replay /
+/// http-forward) compiled into the engine binary and registered at startup.
+pub mod write_forwarder;
 mod regex_udf;
 mod rls;
 mod schema_ddl;
