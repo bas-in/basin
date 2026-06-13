@@ -265,6 +265,15 @@ struct TermPostingList {
     /// Set once the first eviction fires, so the operator warning is logged
     /// exactly once per `(table, col)` posting list.
     eviction_warned: bool,
+    /// Files whose coarse terms were dropped by eviction since they were last
+    /// (re)built. A tainted file is NOT completeness-sealable: some of its terms
+    /// are missing from the posting list, so trusting it as "complete" would let
+    /// a probe prune a file (or a sealed file's own rows) that actually match.
+    /// This catches SELF-eviction during a single file's backfill — when a file
+    /// large enough to overflow the per-project budget evicts its OWN earlier
+    /// trigrams before its `mark_file_indexed` seal. Cleared on `remove_file`
+    /// (a CoW replacement rebuilds the file from scratch and may re-seal).
+    eviction_tainted: HashSet<Arc<str>>,
 
     // ── Row tier (optional, second granularity) ──────────────────────────────
     /// SEALED row-granular postings: `term → (file → sorted unique row
@@ -418,11 +427,25 @@ impl TermPostingList {
             if let Some(set) = self.entries.remove(k) {
                 for f in &set {
                     evicted_files.insert(f.as_ref().to_string());
+                    // Taint the file: at least one of its terms is now gone, so
+                    // it cannot be completeness-sealed until it is fully rebuilt
+                    // (CoW `remove_file` clears the taint).
+                    if let Some(arc) = self.files.get(f.as_ref()) {
+                        self.eviction_tainted.insert(arc.clone());
+                    } else {
+                        self.eviction_tainted.insert(f.clone());
+                    }
                 }
                 self.total_count = self.total_count.saturating_sub(set.len());
             }
         }
         evicted_files
+    }
+
+    /// `true` when `file`'s coarse terms were dropped by eviction since its last
+    /// (re)build — i.e. it is NOT safe to seal as completeness-complete.
+    fn is_eviction_tainted(&self, file: &str) -> bool {
+        self.eviction_tainted.iter().any(|f| f.as_ref() == file)
     }
 
     /// Probe for `term`. Returns `None` when the term has never been indexed
@@ -459,6 +482,9 @@ impl TermPostingList {
         self.row_insert_order.retain(|(_, f)| f.as_ref() != file_path);
         self.row_tier_files.remove(file_path);
         self.row_tier_dense_terms.remove(file_path);
+        // A removed file is gone; clear any eviction taint so a CoW replacement
+        // written under the same path can be sealed fresh.
+        self.eviction_tainted.retain(|f| f.as_ref() != file_path);
         removed
     }
 
@@ -564,16 +590,28 @@ impl TermPostingList {
                     if blocks.is_empty() {
                         self.row_entries.remove(&term);
                     }
-                    // If the file has no remaining row blocks AND no dense
-                    // markers, it is no longer row-tier-trustworthy.
-                    let file_has_blocks = self
-                        .row_entries
-                        .values()
-                        .any(|b| b.contains_key(&file));
-                    if !file_has_blocks
-                        && !self.row_tier_dense_terms.contains_key(&file)
-                    {
-                        self.row_tier_files.remove(&file);
+                    // COMPLETENESS: evicting ANY block of a file makes that
+                    // file's row tier INCOMPLETE — a probe can no longer trust
+                    // "term has no block ⇒ term absent" (the block may have been
+                    // evicted, not genuinely absent), nor a per-row count (an
+                    // evicted block under-counts a real match). Either error
+                    // would drop a true match. So un-seal the file's row tier on
+                    // the first evicted block: probes fall back to COARSE decode
+                    // for it (the coarse tier — never row-evicted — is the
+                    // correctness-preserving must-keep). The remaining blocks for
+                    // this file are now dead weight; drop them too so the budget
+                    // and probe state stay consistent.
+                    if self.row_tier_files.remove(&file) {
+                        // Purge this file's other surviving row blocks.
+                        for b in self.row_entries.values_mut() {
+                            if let Some(o) = b.remove(&file) {
+                                let c = row_block_budget_cost(o.len());
+                                self.row_tier_cost = self.row_tier_cost.saturating_sub(c);
+                                freed += c;
+                            }
+                        }
+                        self.row_entries.retain(|_, b| !b.is_empty());
+                        self.row_tier_dense_terms.remove(&file);
                     }
                 }
             }
@@ -649,6 +687,74 @@ impl TermPostingList {
             None => RowProbe::Full,
             Some(v) => RowProbe::Rows(v),
         }
+    }
+
+    /// Trigram row-tier probe: COUNT-based OR-merge (not the AND-merge that
+    /// `probe_row_offsets` uses for `@>`). For the supplied needle-trigram
+    /// `terms` and a single `file` with a sealed row tier, return the sorted
+    /// superset of row offsets whose name carries `>= min_shared` DISTINCT
+    /// needle trigrams.
+    ///
+    /// Returns:
+    /// * `RowProbe::Full` — the file cannot be row-narrowed: at least one needle
+    ///   trigram is DENSE for the file (its row posting was dropped by the
+    ///   density cap), so a row could clear `min_shared` partly via the dense
+    ///   term without any sparse-term offset to enumerate it. Decoding in full
+    ///   is the only safe choice — a dense term offers no offsets to union, and
+    ///   omitting it could under-count a real match below `min_shared` and drop
+    ///   it. (Coarse decode + the `similarity()` recheck is always correct.)
+    /// * `RowProbe::Rows(v)` — sorted superset of offsets clearing `min_shared`.
+    /// * `RowProbe::Absent` — every needle trigram is provably absent from this
+    ///   sealed file (no posting and not dense): no row can share even one
+    ///   needle trigram, so none can match (`min_shared >= 1`). Fully prunable.
+    fn probe_trgm_row_offsets(
+        &self,
+        terms: &[String],
+        file: &str,
+        min_shared: usize,
+    ) -> RowProbe {
+        let min_shared = min_shared.max(1);
+        let dense_for_file = self
+            .row_tier_dense_terms
+            .iter()
+            .find(|(f, _)| f.as_ref() == file)
+            .map(|(_, s)| s);
+        // Per-offset count of distinct needle trigrams occurring at that row.
+        let mut counts: HashMap<u32, u32> = HashMap::new();
+        let mut any_present = false;
+        for term in terms {
+            // A dense needle trigram has no row posting but DOES occur in many
+            // rows. We cannot enumerate them, so the file is not row-narrowable
+            // for this needle → decode in full (Full). Omitting the dense term
+            // from the count would risk under-counting a true match.
+            if dense_for_file.is_some_and(|s| s.contains(term)) {
+                return RowProbe::Full;
+            }
+            let block = self
+                .row_entries
+                .get(term)
+                .and_then(|blocks| blocks.iter().find(|(f, _)| f.as_ref() == file).map(|(_, v)| v));
+            if let Some(offs) = block {
+                any_present = true;
+                for &o in offs {
+                    *counts.entry(o).or_insert(0) += 1;
+                }
+            }
+            // A term with no block (and not dense) provably never occurs in this
+            // sealed file → it contributes nothing (correct OR-merge behaviour).
+        }
+        if !any_present {
+            // No needle trigram occurs anywhere in this sealed file → no row can
+            // share even one trigram → none can match (min_shared >= 1).
+            return RowProbe::Absent;
+        }
+        let mut out: Vec<u32> = counts
+            .into_iter()
+            .filter(|&(_, c)| c as usize >= min_shared)
+            .map(|(o, _)| o)
+            .collect();
+        out.sort_unstable();
+        RowProbe::Rows(out)
     }
 }
 
@@ -747,6 +853,74 @@ fn extract_terms_inner(value: &Value, opclass: &str, path_prefix: &str, out: &mu
         // arrays is handled by re-evaluation; scalars are not `@>` targets).
         _ => {}
     }
+}
+
+// ── Trigram term extraction (gin_trgm_ops) ─────────────────────────────────────
+//
+// The trigram GIN opclass indexes a TEXT column's trigram SET (the same set
+// `basin_trgm::similarity` computes: two-leading + one-trailing space padding
+// per alphanumeric word, ASCII case-fold). Each trigram becomes one posting
+// `term`, reusing the JSONB posting structures (interning / budget / row tier)
+// verbatim. A trigram is exactly 3 bytes after case-folding, but those bytes can
+// be the padding space (`0x20`) or any ASCII alnum, so we encode the term as a
+// fixed-width lowercase-hex string `"tg:aabbcc"` — unambiguous, collision-free
+// with the JSONB `key:`/`kv:`/`path_hash:` namespaces, and a valid UTF-8 map
+// key. The prefix keeps the keyspace disjoint so a column can never be probed
+// with the wrong opclass's terms.
+
+/// Encode one 3-byte trigram as a stable posting term `"tg:aabbcc"`.
+#[inline]
+fn trigram_term(tg: &[u8; 3]) -> String {
+    format!("tg:{:02x}{:02x}{:02x}", tg[0], tg[1], tg[2])
+}
+
+/// Extract trigram posting terms from a TEXT value, using `basin_trgm`'s exact
+/// extraction (same padding/case-fold as `similarity()` — consistency is
+/// correctness: the probe needle is extracted the same way, and the `%`
+/// predicate that rechecks every candidate calls the same `similarity()`).
+///
+/// Returns a sorted, deduplicated `Vec<String>` (one term per distinct
+/// trigram). Empty when `text` has no alphanumeric run (`pg_trgm` returns `{}`).
+pub fn extract_trigram_terms(text: &str) -> Vec<String> {
+    basin_trgm::extract(text).iter().map(trigram_term).collect()
+}
+
+/// Conservative count-based pruning threshold for `name % needle` at similarity
+/// threshold `t`: the minimum number of DISTINCT needle trigrams a candidate
+/// row's trigram set must share with the needle.
+///
+/// # Math (provably conservative vs. `similarity(name, needle) >= t`)
+///
+/// `similarity = i / u` where `i = |T(name) ∩ T(needle)|` and
+/// `u = |T(name) ∪ T(needle)| = |T(name)| + Q - i` with `Q = |T(needle)|`.
+///
+/// Because `i <= |T(name)|`, we have `u = |T(name)| + Q - i >= Q`. So for any
+/// matching row (`i / u >= t`):
+///
+/// ```text
+///   i >= t * u >= t * Q   ⟹   i >= ceil(t * Q)
+/// ```
+///
+/// Hence a row that shares fewer than `ceil(t * Q)` needle trigrams CANNOT
+/// match and is safely pruned. This is exactly PostgreSQL's GIN trigram bound.
+/// With `t > 0` the bound is `>= 1`, so the floor-1 superset (share ≥ 1
+/// trigram) is the `t → 0+` special case; the count bound only ever prunes
+/// MORE, never a real match. The `%` predicate re-evaluates `similarity()` on
+/// every surviving candidate (recheck discipline), so over-inclusion is merely
+/// slower, never wrong.
+///
+/// Returns `0` when the needle has no trigrams (caller declines to prune).
+#[inline]
+pub fn trgm_min_shared(needle_trgm_count: usize, threshold: f32) -> usize {
+    if needle_trgm_count == 0 {
+        return 0;
+    }
+    // ceil(t * Q). Clamp the threshold into [0, 1]; a non-positive threshold
+    // degrades to the floor-1 superset (still conservative).
+    let t = threshold.clamp(0.0, 1.0) as f64;
+    let raw = t * needle_trgm_count as f64;
+    let ceil = raw.ceil() as usize;
+    ceil.max(1).min(needle_trgm_count)
 }
 
 /// Compact JSON representation used as part of the GIN term key.
@@ -972,6 +1146,44 @@ impl GinIndexRegistry {
         if terms.is_empty() {
             return;
         }
+        self.index_terms(project, table, col, &terms, file_path, row);
+    }
+
+    /// Index a TEXT value's TRIGRAM set for a `gin_trgm_ops` column from
+    /// `file_path` / `row`. Extracts trigrams via `basin_trgm` (same padding /
+    /// case-fold as `similarity()`) and feeds the resulting terms through the
+    /// SAME posting machinery as [`index_row`] — interning, the per-project
+    /// budget, eviction, and the optional row tier are all shared. A text value
+    /// with no alphanumeric run produces no trigrams and is skipped.
+    pub fn index_text_row(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        text: &str,
+        file_path: &str,
+        row: u64,
+    ) {
+        let terms = extract_trigram_terms(text);
+        if terms.is_empty() {
+            return;
+        }
+        self.index_terms(project, table, col, &terms, file_path, row);
+    }
+
+    /// Shared posting-insertion body for one row's pre-extracted `terms`, used by
+    /// both the JSONB ([`index_row`]) and trigram ([`index_text_row`]) build
+    /// paths. From here the budget, interning, eviction, row-tier accumulation,
+    /// and per-project accounting are identical regardless of opclass.
+    fn index_terms(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        terms: &[String],
+        file_path: &str,
+        row: u64,
+    ) {
         let want_row_tier = row_tier_enabled();
         // Per-project partition (noisy-neighbour GIN): the eviction trigger is
         // this project's fair share of the global budget, with a floor, NOT the
@@ -993,7 +1205,7 @@ impl GinIndexRegistry {
         if want_row_tier {
             list.note_indexed_row(&file);
         }
-        for term in &terms {
+        for term in terms {
             let before = list.total_count;
             let row_off = if want_row_tier { Some(row) } else { None };
             let (evicted_files, removed) = list.insert_with_row(term, &file, row_off, budget);
@@ -1204,6 +1416,168 @@ impl GinIndexRegistry {
         GinScanSet::ScanFiles(scan)
     }
 
+    // ── Trigram (gin_trgm_ops) probe ─────────────────────────────────────────
+
+    /// Per-file trigram-similarity probe for a `name % 'needle'` predicate
+    /// (after the rewriter lowers `%` to `similarity(col,'needle') >= t`).
+    ///
+    /// `needle` is the literal RHS; `threshold` is the session's
+    /// `pg_trgm.similarity_threshold` in effect (`t`). The probe prunes what is
+    /// PROVABLE under the count-based bound (`trgm_min_shared`):
+    ///
+    /// * a live file NOT in the indexed-files set is a forced candidate
+    ///   (must-scan — unknown coverage);
+    /// * a fully-indexed file is a candidate iff it shares `>= ceil(t * Q)`
+    ///   DISTINCT needle trigrams (`Q = |T(needle)|`), counted by OR-merging the
+    ///   per-trigram posting lists. A file sharing fewer needle trigrams cannot
+    ///   contain a row with `similarity >= t` (see `trgm_min_shared`'s proof) and
+    ///   is pruned.
+    ///
+    /// Unlike the JSONB `@>` probe (AND-merge: every needle term required), the
+    /// trigram probe is an OR-merge with a COUNT floor — a single missing needle
+    /// trigram does not exclude a file, because a name can match the needle
+    /// while missing some of its trigrams (Jaccard < 1). The shared-count floor
+    /// is what makes the prune conservative without being a no-op.
+    ///
+    /// The `%` predicate ALWAYS re-evaluates `similarity(col, needle) >= t` on
+    /// every surviving candidate row (recheck discipline, exactly like JSONB
+    /// `@>`), so over-inclusion is only slower, never wrong.
+    ///
+    /// Returns [`GinScanSet::NoIndex`] when nothing is provable (no posting list
+    /// or the needle has no trigrams). Under-pruning is always safe.
+    pub fn probe_trgm_scan_set(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        needle: &str,
+        threshold: f32,
+        live_paths: &[String],
+    ) -> GinScanSet {
+        let needle_trgms = basin_trgm::extract(needle);
+        let q = needle_trgms.len();
+        if q == 0 {
+            // No trigrams in the needle — decline to prune (the scan + recheck
+            // decides; PG empty-needle semantics are subtle and rare).
+            return GinScanSet::NoIndex;
+        }
+        let min_shared = trgm_min_shared(q, threshold);
+        let terms: Vec<String> = needle_trgms.iter().map(trigram_term).collect();
+
+        let arc = match self.get(project, table, col) {
+            Some(a) => a,
+            None => return GinScanSet::NoIndex,
+        };
+        let list = arc.lock().expect("TermPostingList lock poisoned");
+        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let indexed: HashSet<String> = match self.indexed_files.lock() {
+            Ok(map) => map.get(&key).cloned().unwrap_or_default(),
+            Err(_) => return GinScanSet::NoIndex,
+        };
+
+        let mut scan: Vec<String> = Vec::with_capacity(live_paths.len());
+        for path in live_paths {
+            if !indexed.contains(path) {
+                // Unknown coverage → forced candidate.
+                scan.push(path.clone());
+                continue;
+            }
+            // Count DISTINCT needle trigrams with a posting hit for this file. A
+            // trigram term absent from the map provably never occurs in any
+            // indexed file (never inserted, or eviction un-marked the files that
+            // had it — and an un-marked file took the forced-candidate branch).
+            let mut shared = 0usize;
+            for t in &terms {
+                if list.probe_term(t).is_some_and(|s| s.contains(path.as_str())) {
+                    shared += 1;
+                    if shared >= min_shared {
+                        break;
+                    }
+                }
+            }
+            if shared >= min_shared {
+                scan.push(path.clone());
+            }
+        }
+        GinScanSet::ScanFiles(scan)
+    }
+
+    /// Row-tier trigram selection for `name % 'needle'`: for each candidate file
+    /// with a sealed row tier, return the sorted SUPERSET of row offsets whose
+    /// name may satisfy `similarity >= t`.
+    ///
+    /// A row matches only if it carries `>= ceil(t * Q)` DISTINCT needle
+    /// trigrams (`min_shared`). The row tier counts, per offset, how many needle
+    /// trigrams occur there and keeps offsets reaching `min_shared` — a sorted
+    /// superset of the matching rows (the `similarity()` recheck still runs on
+    /// each). Files without a sealed row tier (or where a needle trigram was
+    /// dense and dropped) decode in full (left out of both maps — the safe
+    /// default). A sealed file where no needle trigram has any row posting proves
+    /// no row matches → `prunable`.
+    ///
+    /// The caller is responsible for the overlay / completeness gate (same gate
+    /// the coarse path uses); this method assumes the handed file set is already
+    /// overlay-free and coarse-trustworthy.
+    pub fn probe_trgm_row_selection(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        needle: &str,
+        threshold: f32,
+        candidate_paths: &[String],
+    ) -> RowSelectionPlan {
+        let mut plan = RowSelectionPlan::default();
+        if !row_tier_enabled() {
+            return plan;
+        }
+        let needle_trgms = basin_trgm::extract(needle);
+        let q = needle_trgms.len();
+        if q == 0 {
+            return plan;
+        }
+        let min_shared = trgm_min_shared(q, threshold);
+        let terms: Vec<String> = needle_trgms.iter().map(trigram_term).collect();
+        let arc = match self.get(project, table, col) {
+            Some(a) => a,
+            None => return plan,
+        };
+        let list = arc.lock().expect("TermPostingList lock poisoned");
+        // Snapshot the COARSE completeness set UNDER the posting-list lock. The
+        // row tier may only narrow files that are coarse-COMPLETE: coarse
+        // eviction un-marks a file from `indexed_files` (making it a forced
+        // must-scan candidate) WITHOUT touching `row_tier_files`, so a file can
+        // be coarse-incomplete yet still carry a (now-stale-relative-to-coarse)
+        // row tier. Narrowing such a file would drop the very rows the forced
+        // full scan was meant to recover. Only row-narrow coarse-complete files;
+        // coarse-incomplete ones fall through to full decode (the caller already
+        // forced them into the candidate set).
+        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let indexed: HashSet<String> = match self.indexed_files.lock() {
+            Ok(map) => map.get(&key).cloned().unwrap_or_default(),
+            Err(_) => return plan,
+        };
+        for path in candidate_paths {
+            if !indexed.contains(path) {
+                continue; // coarse-incomplete (forced candidate) → full decode
+            }
+            if !list.file_has_row_tier(path) {
+                continue; // no sealed row tier → coarse decode
+            }
+            match list.probe_trgm_row_offsets(&terms, path, min_shared) {
+                RowProbe::Full => { /* coarse decode */ }
+                RowProbe::Absent => {
+                    plan.prunable.insert(path.clone());
+                }
+                RowProbe::Rows(offs) => {
+                    let offs64: Vec<u64> = offs.into_iter().map(|o| o as u64).collect();
+                    plan.row_offsets.insert(path.clone(), offs64);
+                }
+            }
+        }
+        plan
+    }
+
     /// Remove all posting entries for `file_path` in `(project, table, col)`.
     /// Also removes `file_path` from the indexed-files completeness set so
     /// future probes do not erroneously claim full coverage after this file
@@ -1245,6 +1619,21 @@ impl GinIndexRegistry {
         file_path: &str,
     ) {
         let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        // Completeness gate: a file whose terms were dropped by eviction since it
+        // was built is INCOMPLETE and must NOT be sealed — sealing it would let a
+        // probe trust missing terms and prune a file (or its own rows) that match.
+        // This catches SELF-eviction during a single oversized file's backfill
+        // (the file's earlier terms evicted by its own later terms before this
+        // seal). A tainted file stays OUT of `indexed_files` → forced must-scan
+        // candidate (correct, just unpruned). The row tier is likewise left
+        // unsealed below so the file decodes in full.
+        let tainted = self
+            .get(project, table, col)
+            .map(|arc| arc.lock().expect("TermPostingList lock poisoned").is_eviction_tainted(file_path))
+            .unwrap_or(false);
+        if tainted {
+            return;
+        }
         if let Ok(mut map) = self.indexed_files.lock() {
             map.entry(key.clone()).or_default().insert(file_path.to_string());
         }
@@ -1495,7 +1884,60 @@ impl GinIndexRegistry {
                 continue;
             };
             let col_arr = batch.column(col_idx);
-            if let Some(arr) = col_arr.as_any().downcast_ref::<arrow_array::LargeBinaryArray>() {
+            // Trigram GIN reads a TEXT column; JSONB GIN reads the LargeBinary
+            // JSONB payload. Dispatch on opclass so the CoW replacement file is
+            // re-indexed through the matching extraction (same machinery, same
+            // completeness-seal discipline).
+            if opclass == "gin_trgm_ops" {
+                // TEXT column. Accept the physical string encodings a CoW
+                // replacement batch can carry (Utf8 / LargeUtf8 / Utf8View); a
+                // silent downcast miss must NOT seal the file as complete (it
+                // would let the trgm probe prune rows that exist).
+                enum StrCol<'a> {
+                    Small(&'a arrow_array::StringArray),
+                    Large(&'a arrow_array::LargeStringArray),
+                    View(&'a arrow_array::StringViewArray),
+                }
+                let arr = if let Some(a) =
+                    col_arr.as_any().downcast_ref::<arrow_array::StringArray>()
+                {
+                    Some(StrCol::Small(a))
+                } else if let Some(a) =
+                    col_arr.as_any().downcast_ref::<arrow_array::LargeStringArray>()
+                {
+                    Some(StrCol::Large(a))
+                } else if let Some(a) =
+                    col_arr.as_any().downcast_ref::<arrow_array::StringViewArray>()
+                {
+                    Some(StrCol::View(a))
+                } else {
+                    None
+                };
+                match arr {
+                    Some(arr) => {
+                        let n = match &arr {
+                            StrCol::Small(a) => a.len(),
+                            StrCol::Large(a) => a.len(),
+                            StrCol::View(a) => a.len(),
+                        };
+                        for row in 0..n {
+                            let val = match &arr {
+                                StrCol::Small(a) => (!a.is_null(row)).then(|| a.value(row)),
+                                StrCol::Large(a) => (!a.is_null(row)).then(|| a.value(row)),
+                                StrCol::View(a) => (!a.is_null(row)).then(|| a.value(row)),
+                            };
+                            if let Some(text) = val {
+                                self.index_text_row(
+                                    project, table, col, text, new_file_path, row as u64,
+                                );
+                            }
+                        }
+                    }
+                    None => coverage_ok = false,
+                }
+            } else if let Some(arr) =
+                col_arr.as_any().downcast_ref::<arrow_array::LargeBinaryArray>()
+            {
                 for row in 0..arr.len() {
                     if arr.is_null(row) {
                         continue;
@@ -1755,6 +2197,107 @@ pub async fn detect_gin_containment(
         projection,
         is_aggregate,
     })
+}
+
+// ── Trigram (gin_trgm_ops) probe detection ────────────────────────────────────
+
+/// Detected trigram-similarity probe plan for a `col % 'needle'` predicate on a
+/// column with a `gin_trgm_ops` GIN index.
+#[derive(Debug)]
+pub struct TrgmSimilarityPlan {
+    /// The table to scan.
+    pub table: TableName,
+    /// The indexed TEXT column.
+    pub col: String,
+    /// The similarity needle (RHS / LHS string literal of `%`).
+    pub needle: String,
+}
+
+/// Detect `SELECT … FROM table WHERE col % 'needle'` (or `'needle' % col`) on a
+/// column with a `gin_trgm_ops` GIN index.
+///
+/// The SQL arrives *before* the `rewrite_trgm_operators` pass that lowers `%` to
+/// `similarity(col,'needle') >= t`, so the raw `%` operator is still present in
+/// both the text and the parsed AST (sqlparser's PG dialect parses `%` as a
+/// `BinaryOp`). We require ONE operand to be a bare column and the other a
+/// single-quoted string literal — exactly the trgm form (a `num % num` modulo
+/// has no string operand and is rejected).
+///
+/// Returns `None` for anything that doesn't match perfectly (caller falls
+/// through to the normal scan path — always correct, just unpruned).
+pub async fn detect_trgm_similarity(
+    sql: &str,
+    project: &ProjectId,
+    catalog: &Arc<dyn basin_catalog::Catalog>,
+) -> Option<TrgmSimilarityPlan> {
+    // Fast pre-check: must contain a `%` to be relevant.
+    if !sql.contains('%') {
+        return None;
+    }
+
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let query = match &stmts[0] {
+        sqlparser::ast::Statement::Query(q) => q.as_ref(),
+        _ => return None,
+    };
+    if query.with.is_some() {
+        return None;
+    }
+    let select = match query.body.as_ref() {
+        sqlparser::ast::SetExpr::Select(s) => s,
+        _ => return None,
+    };
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return None;
+    }
+    let table_name = match &select.from[0].relation {
+        sqlparser::ast::TableFactor::Table { name, alias: None, args: None, .. } => {
+            if name.0.len() != 1 {
+                return None;
+            }
+            use crate::pg_ast::ObjectNamePartExt;
+            name.0[0].id_val().clone()
+        }
+        _ => return None,
+    };
+    let table = TableName::new(table_name).ok()?;
+
+    // WHERE must be `col % 'lit'` or `'lit' % col`.
+    let (col_name, needle) = match &select.selection {
+        Some(sqlparser::ast::Expr::BinaryOp { left, op, right }) => {
+            if op.to_string() != "%" {
+                return None;
+            }
+            let lit_of = |e: &sqlparser::ast::Expr| extract_json_literal_for_prune(e);
+            let col_of = |e: &sqlparser::ast::Expr| match e {
+                sqlparser::ast::Expr::Identifier(id) => Some(id.value.clone()),
+                _ => None,
+            };
+            if let (Some(c), Some(n)) = (col_of(left), lit_of(right)) {
+                (c, n)
+            } else if let (Some(n), Some(c)) = (lit_of(left), col_of(right)) {
+                (c, n)
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    // Catalog: table must have a GIN index on `col_name` with `gin_trgm_ops`.
+    let meta = catalog.load_table(project, &table).await.ok()?;
+    let _idx = meta.indexes.iter().find(|idx| {
+        idx.access_method == "gin"
+            && idx.columns.len() == 1
+            && idx.columns[0] == col_name
+            && idx.opclass.as_deref() == Some("gin_trgm_ops")
+    })?;
+
+    Some(TrgmSimilarityPlan { table, col: col_name, needle })
 }
 
 /// True when every projected item is a bare (un-aliased, un-windowed)
@@ -3635,6 +4178,12 @@ mod tests {
         assert!(terms.contains(&"key:id".to_string()), "terms={terms:?}");
         assert!(terms.contains(&"kv:id=42".to_string()), "terms={terms:?}");
     }
+
+
+
+
+
+
 
     #[test]
     fn extract_terms_jsonb_path_ops_flat() {

@@ -4243,6 +4243,153 @@ pub(crate) async fn apply_gin_fts_pruning_for_query(
     Ok(())
 }
 
+/// Trigram GIN file-level + row-tier pruning for a `col % 'needle'` predicate.
+///
+/// Mirrors [`apply_gin_pruning_for_query`] for the `pg_trgm` `%` operator.
+/// Inspect `sql` (the *original* pre-rewrite SQL that still contains `%`, before
+/// `rewrite_trgm_operators` lowers it to `similarity(col,'needle') >= t`) for a
+/// trigram-similarity predicate on a column with a `gin_trgm_ops` GIN index.
+/// When the trigram posting list prunes a strict subset of the live files (and
+/// the row tier optionally narrows the surviving files to row offsets), replace
+/// the table's registration with a pruned provider.
+///
+/// `threshold` is the session's `pg_trgm.similarity_threshold` in effect — it
+/// sets the count-based prune bound (`trgm_min_shared`) and MUST equal the
+/// threshold the rewriter baked into the `similarity() >= t` recheck, or the
+/// prune could be tighter than the predicate (a dropped real match). The caller
+/// (executor) reads it from session state and passes it here.
+///
+/// Correctness contract (identical discipline to the JSONB `@>` path):
+/// * the trigram scan-set / row-selection is a conservative SUPERSET — the
+///   rewritten `similarity(col,'needle') >= t` predicate re-evaluates on every
+///   surviving row (recheck);
+/// * pruning only fires when the table has NO live hot-tier overlay
+///   (`table_has_live_overlay`) — the registrations below swap the
+///   overlay-aware provider for a bare cold reader;
+/// * per-file graceful degradation: an un-indexed live file is a forced
+///   candidate; eviction/partial coverage only widens the scan set, never drops
+///   a match;
+/// * on any error or uncertainty returns `Ok(())` → full scan.
+pub(crate) async fn apply_trgm_pruning_for_query(
+    engine: &Engine,
+    project: &ProjectId,
+    ctx: &SessionContext,
+    sql: &str,
+    threshold: f32,
+) -> Result<()> {
+    // Fast pre-check: must contain a `%` to be relevant.
+    if !sql.contains('%') {
+        return Ok(());
+    }
+
+    let plan = match crate::index_probe::detect_trgm_similarity(
+        sql,
+        project,
+        &engine.config().catalog,
+    )
+    .await
+    {
+        Some(p) => p,
+        None => return Ok(()), // shape not recognised → full scan
+    };
+
+    // Live-overlay gate — same blocker as `apply_gin_pruning_for_query`: the
+    // pruned registrations replace the overlay-aware provider with a bare cold
+    // reader. Skip pruning while any live UPDATE/DELETE overlay exists.
+    if table_has_live_overlay(engine, project, &plan.table) {
+        return Ok(());
+    }
+
+    let meta = match engine.config().catalog.load_table(project, &plan.table).await {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    let live_files: Vec<DataFileRef> = meta.live_data_files();
+    if live_files.is_empty() {
+        return Ok(());
+    }
+    let live_paths: Vec<String> = live_files.iter().map(|f| f.path.to_string()).collect();
+
+    // File-level scan set (per-file graceful degradation; un-indexed files are
+    // forced candidates).
+    let scan_set = engine.gin_index_registry().probe_trgm_scan_set(
+        project,
+        &plan.table,
+        &plan.col,
+        &plan.needle,
+        threshold,
+        &live_paths,
+    );
+    let pruned_paths: Vec<String> = match scan_set {
+        crate::index_probe::GinScanSet::ScanFiles(files) => files,
+        crate::index_probe::GinScanSet::NoIndex => return Ok(()),
+    };
+    if pruned_paths.is_empty() {
+        // Every file provably pruned — leave the full set registered so
+        // DataFusion computes the (empty) result for aggregate shapes.
+        return Ok(());
+    }
+
+    // Row tier: narrow surviving files to candidate row offsets where a sealed
+    // row tier exists. Drop provably-empty files.
+    let row_plan = engine.gin_index_registry().probe_trgm_row_selection(
+        project,
+        &plan.table,
+        &plan.col,
+        &plan.needle,
+        threshold,
+        &pruned_paths,
+    );
+    let candidate_paths: Vec<String> = if row_plan.prunable.is_empty() {
+        pruned_paths.clone()
+    } else {
+        pruned_paths
+            .iter()
+            .filter(|p| !row_plan.prunable.contains(*p))
+            .cloned()
+            .collect()
+    };
+    if candidate_paths.is_empty() {
+        return Ok(());
+    }
+    let row_selection_map = row_plan.row_offsets;
+
+    if !row_selection_map.is_empty() {
+        // Register the native pruned provider with a row selection (no
+        // row-group bloom for trgm — the offset list narrows decode directly).
+        let df_schema = match schema_ws_to_df(&meta.schema) {
+            Ok(s) => Arc::new(s),
+            Err(_) => {
+                return register_pruned_listing_table_if_narrowed(
+                    engine, ctx, &plan.table, &meta, &candidate_paths, &live_files,
+                )
+                .await;
+            }
+        };
+        let provider = crate::gin_rowgroup_scan::GinRowGroupPrunedTable::new_with_row_selection(
+            df_schema,
+            engine.config().storage.clone(),
+            *project,
+            plan.table.clone(),
+            meta.file_format,
+            candidate_paths.clone(),
+            Default::default(),
+            row_selection_map,
+        );
+        let tref = TableReference::Bare { table: plan.table.as_str().into() };
+        let _ = ctx.deregister_table(tref.clone());
+        ctx.register_table(tref, Arc::new(provider))
+            .map_err(|e| BasinError::internal(format!("register trgm row-pruned table: {e}")))?;
+        return Ok(());
+    }
+
+    // No row tier — fall back to file-level prune.
+    register_pruned_listing_table_if_narrowed(
+        engine, ctx, &plan.table, &meta, &candidate_paths, &live_files,
+    )
+    .await
+}
+
 /// Inv-W5 / W9 — relaxed JSONB `@>` shape detector for the posting-list
 /// prune.  Mirrors [`crate::index_probe::detect_gin_containment`] but is
 /// permissive about the projection (accepts `count(*)`, `SELECT col1, agg(x)`,
