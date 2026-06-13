@@ -1,0 +1,57 @@
+# Standalone crate — deliberately NOT a member of the engine workspace.
+# The empty [workspace] table below detaches it so it gets its own target/
+# dir and root Cargo.toml, avoiding contention with the engine workspace
+# (which lives at ../../Cargo.toml and is edited concurrently).
+[package]
+name = "basin-sdk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Async Rust client for Basin's REST, auth, realtime, functions, and storage HTTP surfaces."
+repository = "https://github.com/basin-db/basin"
+readme = "README.md"
+keywords = ["basin", "database", "client", "postgres", "rest"]
+categories = ["api-bindings", "database"]
+
+# Detach from the engine workspace at ../../Cargo.toml.
+[workspace]
+
+[lib]
+name = "basin"
+path = "src/lib.rs"
+
+[features]
+default = []
+# WebSocket realtime client (futures::Stream of change/presence events).
+realtime = ["dep:tokio-tungstenite", "dep:futures-util", "tokio/rt"]
+# Native Arrow IPC transport (query → RecordBatch stream).
+arrow = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema"]
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+base64 = "0.22"
+thiserror = "2"
+
+# realtime feature
+tokio-tungstenite = { version = "0.24", optional = true, features = ["rustls-tls-native-roots"] }
+futures-util = { version = "0.3", optional = true }
+
+# arrow feature
+arrow-array = { version = "53", optional = true }
+arrow-ipc = { version = "53", optional = true }
+arrow-schema = { version = "53", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+wiremock = "0.6"
+futures-util = "0.3"
+arrow-array = "53"
+arrow-ipc = "53"
+arrow-schema = "53"
+
+[package.metadata.docs.rs]
+all-features = true
