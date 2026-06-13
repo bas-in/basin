@@ -70,6 +70,7 @@ pub fn cmd_storage(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         "list" => storage_list(g, rest),
         "rm" => storage_rm(g, rest),
         "sign" => storage_sign(g, rest),
+        "policy" => storage_policy(g, rest),
         "--help" | "-h" | "help" => {
             print_storage_help();
             Ok(())
@@ -91,6 +92,8 @@ fn print_storage_help() {
             "list <bucket> [--prefix p]                List objects in a bucket.",
             "rm <bucket> <path…>                       Bulk-delete objects by prefix.",
             "sign <bucket> <path> [--expires-in 3600]  Mint a signed URL.",
+            "policy get [--project=<ref>]              Get the storage access policy.",
+            "policy put --policy=<json> [--project=<ref>]  Set the storage access policy.",
             "",
             "Global: --project=<ref>  --json",
         ],
@@ -619,6 +622,139 @@ fn storage_sign(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .or_else(|| raw["signed_url"].as_str())
         .unwrap_or("");
     println!("{signed_url}");
+    Ok(())
+}
+
+// ── storage policy ────────────────────────────────────────────────────────────
+//
+// Routes:
+//   GET /v1/projects/{ref}/storage-objects/policy
+//   PUT /v1/projects/{ref}/storage-objects/policy
+//
+// The policy is a JSON document that controls access to storage objects
+// under (project, bucket, key_prefix) tuples. Similar to RLS but for
+// object storage; see cloud T-135 (object_policy handler).
+
+fn storage_policy(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
+    let (sub, rest) = match args.split_first() {
+        None => {
+            help_for_command(
+                "storage policy",
+                "Get or set the project's storage object access policy.",
+                &[
+                    "get [--project=<ref>]                        Show the current policy.",
+                    "put --policy=<json> [--project=<ref>]        Replace the policy document.",
+                ],
+            );
+            return Ok(());
+        }
+        Some((s, r)) => (s.as_str(), r),
+    };
+    match sub {
+        "get" => storage_policy_get(g, rest),
+        "put" => storage_policy_put(g, rest),
+        "--help" | "-h" | "help" => {
+            help_for_command(
+                "storage policy",
+                "Get or set the project's storage object access policy.",
+                &[
+                    "get [--project=<ref>]                        Show the current policy.",
+                    "put --policy=<json> [--project=<ref>]        Replace the policy document.",
+                ],
+            );
+            Ok(())
+        }
+        other => Err(msg(format!(
+            "unknown subcommand {:?} for storage policy",
+            other
+        ))),
+    }
+}
+
+fn storage_policy_get(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
+    let cmd = Command::new("storage policy get")
+        .arg(Arg::new("project").long("project"))
+        .arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
+    let m = parse_or_silent(cmd, args)?;
+    if m.get_flag("help") {
+        help_for_command(
+            "storage policy get",
+            "Get the project's storage object access policy document.",
+            &["--project=<ref>   Project ref (or use basin link)."],
+        );
+        return Ok(());
+    }
+
+    let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
+    let project_ref = resolve_project_ref(&project_flag)?;
+
+    let c = require_client(g)?;
+    let path = format!("/v1/projects/{}/storage-objects/policy", project_ref);
+    let raw: serde_json::Value = c.do_json(reqwest::Method::GET, &path, None)?;
+
+    if g.json {
+        // JSON shape: { policy: object }
+        return crate::output::print_json(&mut std::io::stdout(), &raw);
+    }
+    // Pretty-print the policy document for human readers.
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&raw).unwrap_or_else(|_| raw.to_string())
+    );
+    Ok(())
+}
+
+fn storage_policy_put(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
+    let cmd = Command::new("storage policy put")
+        .arg(Arg::new("policy").long("policy"))
+        .arg(Arg::new("project").long("project"))
+        .arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
+    let m = parse_or_silent(cmd, args)?;
+    if m.get_flag("help") {
+        help_for_command(
+            "storage policy put",
+            "Replace the project's storage object access policy.",
+            &[
+                "--policy=<json>    JSON policy document (required). Pass @file to read from a file.",
+                "--project=<ref>    Project ref (or use basin link).",
+                "",
+                "Example:",
+                "  basin storage policy put --policy='{\"rules\":[]}' --project=myapp",
+                "  basin storage policy put --policy=@policy.json --project=myapp",
+            ],
+        );
+        return Ok(());
+    }
+
+    let policy_raw = m
+        .get_one::<String>("policy")
+        .cloned()
+        .ok_or_else(|| msg("storage policy put: --policy is required"))?;
+
+    // Support @file syntax.
+    let policy_str = if policy_raw.starts_with('@') {
+        let path = &policy_raw[1..];
+        std::fs::read_to_string(path)
+            .map_err(|e| msg(format!("storage policy put: could not read {path}: {e}")))?
+    } else {
+        policy_raw
+    };
+
+    let policy_doc: serde_json::Value = serde_json::from_str(&policy_str)
+        .map_err(|e| msg(format!("storage policy put: invalid JSON: {e}")))?;
+
+    let project_flag = m.get_one::<String>("project").cloned().unwrap_or_default();
+    let project_ref = resolve_project_ref(&project_flag)?;
+
+    let c = require_client(g)?;
+    let path = format!("/v1/projects/{}/storage-objects/policy", project_ref);
+    let raw: serde_json::Value = c.do_json(reqwest::Method::PUT, &path, Some(policy_doc))?;
+
+    if g.json {
+        // JSON shape: updated policy document
+        return crate::output::print_json(&mut std::io::stdout(), &raw);
+    }
+    println!("Storage policy updated.");
     Ok(())
 }
 
@@ -1234,5 +1370,112 @@ mod tests {
             let result = cmd_storage(&g, &[sub.to_string(), "--help".to_string()]);
             assert!(result.is_ok(), "{sub} --help failed: {result:?}");
         }
+    }
+
+    // ── storage policy ────────────────────────────────────────────────────────
+
+    #[test]
+    fn policy_no_args_prints_help() {
+        let _g = with_temp_config_dir();
+        let g = flags("http://127.0.0.1:1");
+        assert!(cmd_storage(&g, &["policy".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn policy_help_flags_work() {
+        let _g = with_temp_config_dir();
+        let g = flags("http://127.0.0.1:1");
+        assert!(cmd_storage(&g, &["policy".to_string(), "--help".to_string()]).is_ok());
+        assert!(cmd_storage(&g, &["policy".to_string(), "get".to_string(), "--help".to_string()]).is_ok());
+        assert!(cmd_storage(&g, &["policy".to_string(), "put".to_string(), "--help".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn policy_get_sends_get_to_correct_path() {
+        let _g = with_temp_config_dir();
+        let cap = Arc::new(Mutex::new(String::new()));
+        let c2 = Arc::clone(&cap);
+        let srv = TestServer::start(move |req: &Req| {
+            assert_eq!(req.method, "GET");
+            *c2.lock().unwrap() = req.path.clone();
+            Resp::ok(r#"{"rules":[]}"#)
+        });
+        let g = flags(&srv.url);
+        cmd_storage(
+            &g,
+            &["policy".to_string(), "get".to_string(), "--project=p1".to_string()],
+        )
+        .unwrap();
+        assert_eq!(*cap.lock().unwrap(), "/v1/projects/p1/storage-objects/policy");
+    }
+
+    #[test]
+    fn policy_put_sends_put_with_body() {
+        let _g = with_temp_config_dir();
+        let cap_path = Arc::new(Mutex::new(String::new()));
+        let cap_body = Arc::new(Mutex::new(String::new()));
+        let p2 = Arc::clone(&cap_path);
+        let b2 = Arc::clone(&cap_body);
+        let srv = TestServer::start(move |req: &Req| {
+            assert_eq!(req.method, "PUT");
+            *p2.lock().unwrap() = req.path.clone();
+            *b2.lock().unwrap() = req.body.clone();
+            Resp::ok(r#"{"rules":[]}"#)
+        });
+        let g = flags(&srv.url);
+        cmd_storage(
+            &g,
+            &[
+                "policy".to_string(),
+                "put".to_string(),
+                r#"--policy={"rules":[]}"#.to_string(),
+                "--project=p1".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(*cap_path.lock().unwrap(), "/v1/projects/p1/storage-objects/policy");
+        let body: serde_json::Value = serde_json::from_str(&cap_body.lock().unwrap()).unwrap();
+        assert!(body["rules"].is_array());
+    }
+
+    #[test]
+    fn policy_put_invalid_json_errors() {
+        let _g = with_temp_config_dir();
+        let g = flags("http://127.0.0.1:1");
+        let err = cmd_storage(
+            &g,
+            &[
+                "policy".to_string(),
+                "put".to_string(),
+                "--policy=not-json".to_string(),
+                "--project=p1".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("JSON"), "err: {err}");
+    }
+
+    #[test]
+    fn policy_put_missing_policy_errors() {
+        let _g = with_temp_config_dir();
+        let g = flags("http://127.0.0.1:1");
+        let err = cmd_storage(
+            &g,
+            &["policy".to_string(), "put".to_string(), "--project=p1".to_string()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--policy"), "err: {err}");
+    }
+
+    #[test]
+    fn policy_get_json_flag() {
+        let _g = with_temp_config_dir();
+        let srv = TestServer::start(|_: &Req| Resp::ok(r#"{"rules":[]}"#));
+        let g = flags_json(&srv.url);
+        cmd_storage(
+            &g,
+            &["policy".to_string(), "get".to_string(), "--project=p1".to_string()],
+        )
+        .unwrap();
     }
 }
