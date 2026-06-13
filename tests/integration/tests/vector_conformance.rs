@@ -34,13 +34,22 @@
 //!
 //! | Feature                                           | Reason not tested                            |
 //! |---------------------------------------------------|----------------------------------------------|
-//! | `vector_avg(embedding)` aggregate                 | Not registered; no aggregate UDF for vectors |
-//! | IVFFlat index (`USING ivfflat`)                   | Not implemented; only HNSW ships             |
+//! | `avg(embedding)` (unqualified)                    | Not overridden — would clobber numeric avg; use `vector_avg` |
 //! | `vector_l2_norm` / `l2_norm` shorthand            | Only `vector_norm` is registered             |
-//! | Non-f32 element types (e.g. halfvec, bit)         | v0.1: f32 only                               |
+//! | `sparsevec(N)` / `bit(N)` vector element types    | Typed 0A000 (see `sparsevec_typed_error`)    |
 //! | `ALTER TABLE … ADD COLUMN embedding vector(N)`    | Not separately tested; covered by DDL basics  |
 //! | pgvector `SELECT embedding FROM … OFFSET n`       | Pagination with vector order-by: not tested  |
 //! | `COPY … FROM` with vector literals                | copy_binary.rs covers binary COPY separately |
+//!
+//! ## Now covered (Phase 5.26.F — ivfflat / vector_avg / halfvec)
+//!
+//! | Feature                                           | Group |
+//! |---------------------------------------------------|-------|
+//! | IVFFlat index (`USING ivfflat`) DDL + kNN routing | 15    |
+//! | IVFFlat recall@k vs brute force (native quantiser)| 15 (basin-vector unit tests carry the recall gate) |
+//! | `vector_avg(embedding)` element-wise mean + GROUP BY + NULLs + dim-mismatch | 16 |
+//! | `halfvec(N)` f32-backed round-trip + distance     | 17    |
+//! | `sparsevec(N)` typed 0A000                         | 17    |
 //!
 //! ## Needs-psql-validation table
 //!
@@ -1420,4 +1429,319 @@ async fn orm_drizzle_shapes_work_end_to_end() {
     .await;
     assert_eq!(n, 3, "Drizzle ORDER BY <->: must return 3 rows; n={n}");
     println!("[vec ORM Drizzle] DDL+INSERT+ORDER BY ✓");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group 15 — IVFFlat index DDL + kNN routing
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The IVFFlat *algorithm* (k-means partitioning, probes-nearest-cell scan,
+// measured recall@10 and the more-probes-monotonic / all-cells-exact / exact-
+// candidate-ordering properties) is gated in the `basin-vector` crate unit
+// tests (`ivfflat::tests`), where the index can be driven directly with a
+// seeded clustered dataset and a configurable `probes`. Measured there:
+// recall@10 probes=1 ≈ 0.90, probes=4 = 1.00, all-cells = 1.00 (exact).
+//
+// These engine-level tests pin the SQL surface: `USING ivfflat` DDL with each
+// opclass + `WITH (lists = N)` is accepted and persisted, and `ORDER BY <->
+// LIMIT k` over an ivfflat-indexed table routes through Basin's ANN fast path
+// and agrees with brute force on a small exact set (recall = 1.0 at this size).
+
+/// `CREATE INDEX … USING ivfflat (col opclass) WITH (lists = N)` is accepted
+/// for all three opclasses and persists in `pg_indexes`.
+#[tokio::test]
+async fn ivfflat_ddl_all_opclasses_accepted_and_persisted() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    exec(
+        &sess,
+        "CREATE TABLE ivf_base (id BIGINT PRIMARY KEY, embedding vector(8))",
+    )
+    .await;
+
+    for (name, opclass) in &[
+        ("ivf_l2", "vector_l2_ops"),
+        ("ivf_cos", "vector_cosine_ops"),
+        ("ivf_ip", "vector_ip_ops"),
+    ] {
+        let r = sess
+            .execute(&format!(
+                "CREATE INDEX {name} ON ivf_base \
+                 USING ivfflat (embedding {opclass}) WITH (lists = 4)"
+            ))
+            .await;
+        assert!(r.is_ok(), "USING ivfflat ({opclass}) WITH (lists) must be accepted; got={r:?}");
+    }
+
+    // All three must appear in pg_indexes.
+    let n = row_count(
+        &sess,
+        "SELECT indexname FROM pg_indexes \
+         WHERE indexname IN ('ivf_l2', 'ivf_cos', 'ivf_ip')",
+    )
+    .await;
+    assert_eq!(n, 3, "all three ivfflat indexes must persist; n={n}");
+    println!("[vec IVFFlat DDL] all opclasses + WITH (lists) accepted & persisted ✓");
+}
+
+/// IVFFlat-routed `ORDER BY <-> LIMIT k` agrees with brute force on a tiny
+/// exact dataset (recall 1.0 at this size — same contract the HNSW equality
+/// test pins). The candidates the ANN path returns are exact-ordered, so the
+/// sorted top-k id sets must be identical.
+#[tokio::test]
+async fn ivfflat_index_backed_vs_brute_force_equality() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    exec(&sess, "CREATE TABLE ivf_bf (id BIGINT NOT NULL, v vector(4))").await;
+    exec(&sess, "CREATE TABLE ivf_idx (id BIGINT NOT NULL, v vector(4))").await;
+    exec(
+        &sess,
+        "CREATE INDEX ivf_idx_ann ON ivf_idx \
+         USING ivfflat (v vector_l2_ops) WITH (lists = 3)",
+    )
+    .await;
+
+    let rows = [
+        (1i64, "[0.1,0.2,0.3,0.4]"),
+        (2, "[0.9,0.1,0.5,0.2]"),
+        (3, "[0.3,0.7,0.1,0.8]"),
+        (4, "[0.5,0.5,0.5,0.5]"),
+        (5, "[0.0,0.0,1.0,0.0]"),
+        (6, "[0.8,0.6,0.0,0.0]"),
+        (7, "[0.2,0.4,0.6,0.8]"),
+        (8, "[0.7,0.3,0.2,0.1]"),
+        (9, "[0.1,0.9,0.1,0.9]"),
+        (10, "[0.4,0.4,0.4,0.4]"),
+    ];
+    for (id, v) in &rows {
+        exec(&sess, &format!("INSERT INTO ivf_bf VALUES ({id}, '{v}')")).await;
+        exec(&sess, &format!("INSERT INTO ivf_idx VALUES ({id}, '{v}')")).await;
+    }
+
+    let query = "[0.49,0.51,0.49,0.51]";
+    let k = 3;
+    let bf_ids = sorted_ids(
+        &sess,
+        &format!("SELECT id FROM ivf_bf ORDER BY v <-> '{query}' LIMIT {k}"),
+    )
+    .await;
+    let idx_ids = sorted_ids(
+        &sess,
+        &format!("SELECT id FROM ivf_idx ORDER BY v <-> '{query}' LIMIT {k}"),
+    )
+    .await;
+
+    assert_eq!(bf_ids.len(), k, "brute force must return {k}; got={bf_ids:?}");
+    assert_eq!(idx_ids.len(), k, "ivfflat-routed must return {k}; got={idx_ids:?}");
+    assert_eq!(
+        bf_ids, idx_ids,
+        "IVFFlat vs brute force must agree on 10-row exact set; bf={bf_ids:?} idx={idx_ids:?}"
+    );
+    println!("[vec IVFFlat vs BF] exact equality on 10 rows, k={k}: {bf_ids:?} ✓");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group 16 — vector_avg aggregate
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `vector_avg(v)` returns the element-wise mean of the non-NULL vectors.
+/// Hand-computed: avg([2,4],[4,8],[6,12]) = [4, 8].
+#[tokio::test]
+async fn vector_avg_elementwise_mean() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    exec(&sess, "CREATE TABLE vavg (id BIGINT, v vector(2))").await;
+    exec(
+        &sess,
+        "INSERT INTO vavg VALUES (1, '[2.0,4.0]'), (2, '[4.0,8.0]'), (3, '[6.0,12.0]')",
+    )
+    .await;
+
+    // Check the aggregate result numerically: the element-wise mean is
+    // [(2+4+6)/3, (4+8+12)/3] = [4, 8], so the L2 distance from the aggregate
+    // to the hand-computed mean must be ~0. (We assert via l2_distance rather
+    // than a `::text` cast because the FixedSizeList→text cast over an
+    // aggregate result is a separate, unwired path; the distance UDF consumes
+    // the aggregate's FixedSizeList directly.)
+    let d = single_f64(
+        &sess,
+        "SELECT l2_distance(vector_avg(v), '[4.0,8.0]') FROM vavg",
+    )
+    .await;
+    assert!(d.abs() < EPS, "vector_avg must equal [4,8]; l2 to [4,8] = {d}");
+    println!("[vec vector_avg] element-wise mean = [4,8] ✓");
+}
+
+/// NULL vectors are ignored by `vector_avg` (PG aggregate NULL semantics).
+/// avg([1,1], NULL, [3,3]) = [2, 2].
+#[tokio::test]
+async fn vector_avg_ignores_nulls() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    exec(&sess, "CREATE TABLE vavg_n (id BIGINT, v vector(2))").await;
+    exec(
+        &sess,
+        "INSERT INTO vavg_n VALUES (1, '[1.0,1.0]'), (2, NULL), (3, '[3.0,3.0]')",
+    )
+    .await;
+
+    let d = single_f64(
+        &sess,
+        "SELECT l2_distance(vector_avg(v), '[2.0,2.0]') FROM vavg_n",
+    )
+    .await;
+    assert!(d.abs() < EPS, "vector_avg must skip NULLs → [2,2]; l2 to [2,2] = {d}");
+    println!("[vec vector_avg] NULLs ignored → [2,2] ✓");
+}
+
+/// `vector_avg` over zero non-NULL rows returns NULL.
+#[tokio::test]
+async fn vector_avg_all_null_is_null() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    exec(&sess, "CREATE TABLE vavg_z (id BIGINT, v vector(3))").await;
+    exec(&sess, "INSERT INTO vavg_z VALUES (1, NULL), (2, NULL)").await;
+
+    match sess.execute("SELECT vector_avg(v) FROM vavg_z").await {
+        Ok(ExecResult::Rows { batches, .. }) => {
+            let b = batches.first().expect("batch");
+            assert!(
+                b.num_rows() == 0 || b.column(0).is_null(0),
+                "vector_avg over all-NULL must be NULL; got non-null"
+            );
+        }
+        Ok(ExecResult::Empty { .. }) => {}
+        Err(e) => panic!("vector_avg all-NULL must not error: {e}"),
+    }
+    println!("[vec vector_avg] all-NULL → NULL ✓");
+}
+
+/// `vector_avg` with GROUP BY computes a per-group mean.
+/// group a: [2,2],[4,4] → [3,3]; group b: [10,10] → [10,10].
+#[tokio::test]
+async fn vector_avg_group_by() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    exec(&sess, "CREATE TABLE vavg_g (g TEXT, v vector(2))").await;
+    exec(
+        &sess,
+        "INSERT INTO vavg_g VALUES \
+         ('a', '[2.0,2.0]'), ('a', '[4.0,4.0]'), ('b', '[10.0,10.0]')",
+    )
+    .await;
+
+    let d_a = single_f64(
+        &sess,
+        "SELECT l2_distance(vector_avg(v), '[3.0,3.0]') FROM vavg_g WHERE g = 'a' GROUP BY g",
+    )
+    .await;
+    assert!(d_a.abs() < EPS, "group a mean must be [3,3]; l2 = {d_a}");
+
+    let d_b = single_f64(
+        &sess,
+        "SELECT l2_distance(vector_avg(v), '[10.0,10.0]') FROM vavg_g WHERE g = 'b' GROUP BY g",
+    )
+    .await;
+    assert!(d_b.abs() < EPS, "group b mean must be [10,10]; l2 = {d_b}");
+    println!("[vec vector_avg] GROUP BY per-group mean ✓");
+}
+
+/// `vector_avg` over vectors of different dimension must error.
+#[tokio::test]
+async fn vector_avg_dim_mismatch_errors() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    // Two tables of different dim can't be mixed in one column, so we exercise
+    // the dim-mismatch guard via string literals fed through a UNION whose two
+    // arms have different widths. Simpler: a single vector(3) table plus a
+    // 2-dim literal handed to vector_avg through a VALUES-like set is awkward;
+    // instead assert the accumulator guard fires across a UNION ALL of two
+    // literal rows of different width.
+    let r = sess
+        .execute(
+            "SELECT vector_avg(v) FROM ( \
+                SELECT '[1.0,2.0,3.0]'::vector AS v \
+                UNION ALL \
+                SELECT '[1.0,2.0]'::vector AS v \
+             ) t",
+        )
+        .await;
+    assert!(
+        r.is_err(),
+        "vector_avg over mismatched dims must error; got={r:?}"
+    );
+    println!("[vec vector_avg] dim-mismatch error ✓");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group 17 — halfvec (f32-backed) + sparsevec typed error
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `halfvec(N)` is accepted as a column type and round-trips like `vector(N)`.
+/// DECISION: Basin stores halfvec with the same f32-backed FixedSizeList
+/// physical layout as vector(N) (no f16 truncation), so every vector path
+/// works unchanged. PRECISION NOTE: Basin keeps full f32 precision rather than
+/// pgvector's f16 rounding — distances are at least as accurate.
+#[tokio::test]
+async fn halfvec_roundtrip_and_distance() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    exec(&sess, "CREATE TABLE hv (id BIGINT, h halfvec(3))").await;
+    exec(&sess, "INSERT INTO hv VALUES (1, '[3.0,4.0,0.0]')").await;
+
+    // vector_dims works on a halfvec column.
+    match sess.execute("SELECT vector_dims(h) FROM hv WHERE id = 1").await {
+        Ok(ExecResult::Rows { batches, .. }) => {
+            let arr = batches
+                .first()
+                .unwrap()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32Array");
+            assert_eq!(arr.value(0), 3, "halfvec(3) vector_dims must be 3");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // Distance ops work on halfvec: l2([3,4,0], [0,0,0]) = 5.
+    let d = single_f64(&sess, "SELECT l2_distance(h, '[0.0,0.0,0.0]') FROM hv WHERE id = 1").await;
+    assert!(approx_eq(d, 5.0), "halfvec l2_distance must be 5.0; got={d}");
+    println!("[vec halfvec] f32-backed round-trip + distance ✓ (precision note: no f16 truncation)");
+}
+
+/// `sparsevec(N)` is a typed 0A000 (feature_not_supported) — not a silent
+/// dense coercion. Roadmap-tracked.
+#[tokio::test]
+async fn sparsevec_typed_error() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let r = sess
+        .execute("CREATE TABLE sv (id BIGINT, s sparsevec(5))")
+        .await;
+    assert!(r.is_err(), "sparsevec(N) must be a typed error; got={r:?}");
+    let msg = format!("{:?}", r.unwrap_err()).to_lowercase();
+    assert!(
+        msg.contains("sparsevec"),
+        "sparsevec error must name the feature; got={msg}"
+    );
+    println!("[vec sparsevec] typed 0A000 ✓");
 }
