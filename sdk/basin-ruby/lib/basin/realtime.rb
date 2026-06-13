@@ -253,6 +253,32 @@ module Basin
       send_frame("type" => "heartbeat", "channel" => channel, "client_id" => client_id)
     end
 
+    # Return an Enumerator that yields PresenceStateFrame, PresenceDiffFrame,
+    # and PresenceErrorFrame for +channel+.
+    #
+    # Start receiving frames by calling presence_track first; the server sends
+    # a presence_state snapshot on join, then presence_diff deltas.
+    #
+    # @param channel [String]
+    # @return [Enumerator]
+    def listen_presence(channel)
+      queue = Queue.new
+      @mutex.synchronize do
+        @callbacks[channel] = (@callbacks[channel] || []) + [
+          ->(frame) { queue << frame if frame.is_a?(PresenceStateFrame) ||
+                                        frame.is_a?(PresenceDiffFrame)  ||
+                                        frame.is_a?(PresenceErrorFrame) }
+        ]
+      end
+      Enumerator.new do |yielder|
+        loop do
+          item = queue.pop
+          break if item.nil?
+          yielder << item
+        end
+      end
+    end
+
     private
 
     def send_subscribe(table, opts)
