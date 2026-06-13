@@ -8,6 +8,96 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-14 — Program-wide feature summary (extensions, SQL surface, multi-node, CDC, SDKs, CLI, storage, scale)
+
+This entry summarises the capabilities that landed across the current program
+and are now on main. Per-commit detail lives in the individual dated entries
+that follow. Grouped by area.
+
+### Extensions
+
+- **`pg_trgm` — full SQL surface + GIN trigram index.** `similarity`, `word_similarity`, `show_trgm` registered as DataFusion UDFs. Operators: `%` (similarity threshold), `<%` (word-similarity threshold), `<->` (distance). GUC overrides via `SET pg_trgm.similarity_threshold` / `SET pg_trgm.word_similarity_threshold`. GIN trigram index (`CREATE INDEX … USING gin (col gin_trgm_ops)`): in-RAM posting list seeded at INSERT + CREATE INDEX backfill; `%` probes prune to candidate files using the conservative shared-trigram bound, then re-evaluate `similarity()` on survivors. Differential correctness pinned against unindexed twin: `trgm_gin_index.rs`. SQL conformance: `trgm_sql_conformance.rs`.
+
+- **Range types — full operator set + multirange + GIST EXCLUDE constraints.** All six range types (`int4range`, `int8range`, `numrange`, `tsrange`, `tstzrange`, `daterange`) as JSON-encoded structs with `BASIN_TYPE` sidecar. Full operator set: `@>`, `<@`, `&&`, `<<`, `>>`, `&<`, `&>`, `-|-`, `+`, `*`, `-`, `range_merge`. Accessors: `lower`, `upper`, `isempty`, `lower_inc`, `upper_inc`, `lower_inf`, `upper_inf`. Multirange: `int4multirange` construction and `@>` containment. Empty-range semantics (canonical half-open normalization). `EXCLUDE USING gist (col WITH &&)` on range columns: parsed by `extract_exclude_using_gist`, stored as sentinel CHECK, enforced at INSERT via the exclusion enforcer. Conformance: `range_conformance.rs`.
+
+- **Full-text search — complete surface shipped.** `TSVECTOR`/`TSQUERY` column types. `to_tsvector` with Snowball English stemming + stop-words. `to_tsquery` (Snowball-stemmed, PG parity), `plainto_tsquery`, `phraseto_tsquery`, `websearch_to_tsquery`. `@@` match operator. `ts_rank` (TF-weighted). `ts_rank_cd` (simplified cover-density). `ts_headline` fragments (`MaxFragments`, `<b>…</b>` wrapping). `setweight` (A–D class annotation). `strip()`, `tsvector_length`. GIN-on-tsvector: in-RAM lexeme posting list + CREATE INDEX backfill (settles live overlay first); `@@` probes structurally (`&`/`<->` intersect, `|` unions, `!`/unknown decline to full scan); provably-empty short-circuit; per-file completeness guard. `to_tsquery` stems through the same pipeline as `to_tsvector` so probe lexemes and `@@` re-evaluation agree. Full conformance + adversarial pruning harness: `fts_conformance.rs`.
+
+- **TimescaleDB — full surface.** `create_hypertable`, `time_bucket` (all forms: epoch-aligned + `origin`-aligned), `first(value, ts)` / `last(value, ts)` aggregates, `drop_chunks`, `add_retention_policy`, `run_retention_policy`, `time_bucket_gapfill` + `locf` carry-forward, continuous aggregates (`CREATE MATERIALIZED VIEW … WITH (timescaledb.continuous, …)`, `refresh_continuous_aggregate`, `add_continuous_aggregate_policy`, incremental refresh), `timescaledb_information.chunks` + `timescaledb_information.hypertables` catalog views, `compress_chunk` DDL accepted. Conformance: `timescale_conformance.rs` + `timescale_completions.rs` + `timescale_caggs.rs` + `timescale_gapfill.rs`.
+
+- **pgvector — complete surface.** HNSW (`CREATE INDEX USING hnsw WITH (m, ef_construction)`; opclass-matched routing). Native IVFFlat coarse quantiser (`CREATE INDEX USING ivfflat WITH (lists = N)`; k-means cells; `ivfflat.probes`). `vector_avg(v)` element-wise mean aggregate (NULL-skipping, GROUP BY, dimension-mismatch error). `halfvec(N)` f32-backed round-trip. `sparsevec` typed `0A000`. Conformance: `vector_conformance.rs` (17 groups).
+
+- **PostGIS — general 2-D geometry SQL surface.** `LINESTRING`/`POLYGON`/`MULTI*`/`GEOMETRYCOLLECTION` as WKB/EWKB/WKT/GeoJSON values. Full codec set: `ST_GeomFromText`, `ST_GeomFromGeoJSON`, `ST_GeomFromWKB`, `ST_AsText`, `ST_AsGeoJSON`, `ST_AsEWKB`. Accessors + measures: `ST_GeometryType`, `ST_NumPoints`, `ST_NumGeometries`, `ST_GeometryN`, `ST_PointN`, `ST_StartPoint`/`ST_EndPoint`/`ST_ExteriorRing`, `ST_Length`/`ST_Area`/`ST_Perimeter` (planar + WGS84 geography), `ST_Centroid`, `ST_Envelope`, `ST_Buffer`. Exact topology predicates: `ST_Intersects`/`ST_Contains`/`ST_Within`/`ST_Disjoint`/`ST_Crosses`/`ST_Touches`/`ST_Overlaps` via `geo` crate. Only `POINT` is a native column DDL type; only `POINT` has an R-tree index. Conformance: `postgis_conformance.rs`.
+
+- **JSONB GIN index.** `CREATE INDEX … USING gin (col)` / `gin (col jsonb_path_ops)`: in-RAM posting list, dedup-(term, file) storage for 1M-row backfill survival. `@>`, `<@` posting-list file pruning. Per-file completeness guard. `BASIN_GIN_POSTING_BUDGET` shared with FTS GIN. Harness: `jsonb_index_harness.rs` + `ext_bench_jsonb_gin.rs`.
+
+- **Advisory locks + deadlock detection.** `pg_advisory_lock`/`pg_advisory_unlock`/`pg_advisory_unlock_all`/`pg_try_advisory_lock` (session-scoped); xact-scoped variants auto-released at COMMIT/ROLLBACK. Reentrancy (N locks need N unlocks). Project isolation. Wait-for-graph deadlock detector — ABBA cycles broken promptly with SQLSTATE 40P01. Lock-wait timeout → SQLSTATE 55P03. Disconnect releases all held session locks. ORM tooling compatibility (Prisma, sqlx, Diesel, golang-migrate). Pinned: `advisory_locks.rs`.
+
+### SQL surface
+
+- **`MERGE INTO` (Postgres 15+).** Each WHEN action compiled to INSERT/UPDATE/DELETE through the normal pipeline. Actions: WHEN MATCHED THEN UPDATE/DELETE/DO NOTHING, WHEN NOT MATCHED THEN INSERT. First-match-wins. Duplicate-target SQLSTATE 21000. Atomicity (failing action rolls back the whole MERGE). RLS enforced on every action. VALUES and SELECT-subquery sources. Command tag `MERGE N`. Pinned: `merge_into.rs`.
+
+- **Composite `ON CONFLICT` targets.** `ON CONFLICT (a, b)` against composite PK or multi-column UNIQUE. DO UPDATE, DO NOTHING, EXCLUDED refs. ON CONFLICT ON CONSTRAINT by name (including implicit `<table>_pkey`). Mismatch → SQLSTATE 42P10. NULL semantics per PG (NULLs in composite key do not conflict). Mixed conflict/no-conflict rows. Pinned: `composite_on_conflict.rs`.
+
+- **`DECLARE`/`FETCH`/`MOVE`/`CLOSE` cursors.** Session-scoped, materialised at DECLARE. FETCH direction variants (NEXT, PRIOR, FIRST, LAST, ALL, ABSOLUTE, RELATIVE, N). MOVE (position-only). CLOSE c / CLOSE ALL. Past-end → 0 rows. Unknown cursor → SQLSTATE 34000. WITH HOLD → SQLSTATE 0A000. Django/psycopg2 server-side cursor pattern. `BASIN_CURSOR_MAX_ROWS` cap. Pinned: `cursor_lifecycle.rs` + `cursor_extended.rs`.
+
+- **`EXCLUDE USING gist` constraint on range columns.** Parsed (`extract_exclude_using_gist`), stripped from DDL, encoded as sentinel CHECK, enforced at INSERT time by the exclusion enforcer. Meeting-room / resource-booking overlap prevention. Part of range-types work (5.24.F).
+
+- **Schema namespaces (phase A).** `CREATE SCHEMA` / `DROP SCHEMA` / `CREATE SCHEMA IF NOT EXISTS`. Qualified `schema.table` names in DML/DDL. Schema-aware in-memory + Postgres catalog. `basin_schemas` table. Cross-schema queries with differential coverage. `search_path` semantics and wider schema-scoped DDL in phases B–E. Pinned: `schema_namespaces.rs` + `schema_ddl.rs` + `schema_e2e.rs`.
+
+### Multi-node
+
+- **`BASIN_LEASE_MODE=required` write-fence.** Catalog CAS + shard heartbeat writer-lease. Happy path: acquire → heartbeat renew (not a regrant) → writes flow. Fencing: lost lease → in-flight and fresh handles refuse writes (`BasinError::LeaseNotHeld`); reads continue; replica recovers by re-acquiring at a higher epoch. Writes refused under a foreign lease (reads unaffected). Off mode: pre-existing CommitConflict behaviour unchanged. Pinned: `lease_mode_required.rs` + `lease_failure_paths.rs` + `lease_handoff.rs`.
+
+- **`BASIN_WAL_MODE=raft` — quorum-replicated WAL.** openraft 0.9. Disk-backed log (`raft.log`) + vote (`raft.meta`) + manifest-anchored snapshot (`raft.snapshot`). WAL durability boundary = quorum ack (one consensus round amortised over the group-commit batch). `durable_lsn` advances on raft commit index. Fail-closed backpressure: cannot-reach-quorum → SQLSTATE 40001 (`RaftNoQuorum`). `raft-net` feature: cross-process gRPC transport via tonic, lazy-dial HTTP/2 channel per peer, backoff on transport failure. `BASIN_RAFT_BIND` / `BASIN_RAFT_PEERS` / `BASIN_RAFT_BOOTSTRAP` / `BASIN_NODE_ID`. Raft leadership supersedes `BASIN_LEASE_MODE`. Cluster status logged at startup. V1 plaintext; mTLS documented follow-up.
+
+- **Multi-region routing seams.** `home_region` field on `ProjectMetadata`. Writes to a non-home replica → typed retryable `WrongRegion` (SQLSTATE 40001). `basin.read_tier = 'lagging'` allows reads from non-home replica. `WriteForwarder` seam for proxy-side write routing. Pinned: `multiregion_homing.rs`.
+
+- **Per-project connection ceiling.** Hard ceiling enforced at pgwire startup (SQLSTATE 53300). `CatalogConnectionLimitProvider` reads from catalog; fail-closed (no stored ceiling → 25, Free tier). Admin API `POST /admin/v1/projects/:id/max-connections`. RAII guard; lowering never kills existing connections.
+
+### CDC
+
+- **Durable CDC ring (Phase 1).** `basin-cdc::CdcRingWriter` as a post-commit `ChangeEventSink`. Every committed mutation (including HTAP hot-tier UPDATE/DELETE fast paths and in-tx mutations drained at COMMIT) appended to a per-project append-only ring on object storage. Committed-only, commit-ordered (`seq` monotonic). Size/time-window batching. Retention window (`BASIN_CDC_RETENTION_HOURS`, default 24h, max 168h). `cursor_expired` frame on stale consumer.
+
+- **SSE stream (Phase 1).** `GET /cdc/v1/sse/:project` with resumable `seq` cursor. Bearer-JWT auth.
+
+- **Webhook fanout (Phase 2).** `basin-webhooks`: disk-backed retry queue keyed by `(subscription_id, project, table, seq)` SHA-256 idempotency key. Exponential backoff (1s → 5min cap), `max_retries`, dead-letter file. Auto-pause after `auto_pause_after` (default 24h); resume explicit. Per-project rate limiting via `basin-net` token bucket.
+
+- **Kafka/Redpanda push sink (Phase 3).** `basin-cdc::kafka` delivery worker draining the CDC ring into a Kafka/Redpanda topic.
+
+### SDKs
+
+- **10 client SDKs in `sdk/`.** `basin-js` (TypeScript/Node/Bun/Deno/CF Workers; realtime SSE + WebSocket; Arrow IPC), `basin-python` (async + sync; realtime via websockets extra; Arrow IPC via pyarrow extra), `basin-go` (Arrow IPC via arrow-go/v18), `basin-java`, `basin-rust`, `basin-ruby`, `basin-dotnet`, `basin-php`, `basin-dart`, `basin-swift`. All engine-direct (pgwire + REST); no cloud intermediary required.
+
+### CLI
+
+- **`basin-cli` (`bas-in/basin-cli`, Go).** `basin login`, `basin projects list`, `basin sql run`, `basin dev` local-stack launcher. Release artefacts Sigstore-signed. Talks to basin-cloud `/v1/*` API.
+
+### Storage
+
+- **Vortex is the default** (since 2026-05-18, commits ≤ 3787db0). Zero regression vs Parquet baseline. Catalog-persisted file stats (`column_stats` on every committed `DataFileRef`). Whole-file stats pruning (`Storage::read_paths` skips LIST + footer fetch when catalog stats prove the predicate prunes the file). Per-file bloom filters in `DataFileRef.bloom_filters`. `FileMetadataCache` + `VortexFooterCache` eliminate per-iteration footer re-parse.
+
+- **S3 cold-path levers.** `BASIN_STORAGE_BACKEND=s3|tigris`. NVMe disk cache (LRU; cold S3 fetches → warm SSD reads). Parquet page cache (LRU RecordBatches). HTTP/2 toggle for S3 client.
+
+### Scale benchmarks
+
+- **Fleet-scale isolation ladder** (`multi_project_fleet_scale.rs`): per-project isolation gates at 50 / 500 / 5000 projects with proportional noisy load. Victim p99 ratio pinned flat as fleet grows.
+- **1B-row write soak** (hypertable soak gate in `hypertable_harness.rs`, gated for provisioned hardware).
+- **Noisy-tenant fairness** (`noisy_neighbor_harness.rs`): per-project GIN posting budget partition + PkRowCache waterline + reconciler round-robin.
+- **Extension benchmark suites**: `ext_bench_vector.rs`, `ext_bench_postgis.rs`, `ext_bench_trgm.rs`, `ext_bench_timescale.rs`, `ext_bench_fts.rs`, `ext_bench_ranges.rs` (+ `_ext` variants for size-ladder sidecars) generate `benchmark/data/*.json` for the dashboard.
+
+### Honest gaps recorded
+
+The following items from the "what landed this program" brief are **partial or absent** on main at time of writing, and are noted honestly:
+
+- **TimescaleDB `interpolate()`**: `timescale_gapfill.rs` documents `interpolate()` returns typed `0A000` — the gap is tested and honest-rejected, not silently broken.
+- **CDC pgoutput / logical replication protocol**: `cdc_pgoutput_harness.rs` is a test-first gate; all slices `#[ignore]`-gated. Debezium/Fivetran e2e requires external connectors and is integration-env-gated.
+- **Hypertable auto-partition (5.29.B–F)**: `hypertable_harness.rs` slices are `#[ignore]`-gated; `create_hypertable` DDL is accepted and the basic conformance group (conformance.rs) is live, but the full auto-partition / chunk-exclusion / ORM-compat slices are pending.
+- **`sparsevec(N)` / vector `bit`**: typed `0A000` by design (ADR 0003). Not planned for v0.1.
+- **3-D geometry / `ST_Buffer`/`ST_Union` constructive ops**: not on roadmap for v0.1.
+- **`search_path` semantics** (schema namespace phases B–E): phase A (CREATE SCHEMA + cross-schema qualified names) is live; unqualified resolution across schemas is deferred.
+- **`array column DDL types`** (`TEXT[]`, `INT[]` in CREATE TABLE): not yet wired through the Arrow schema bridge; `ARRAY[…]` expressions and array functions work on existing columns.
+- **gen-types (SDK codegen)**: not found in `sdk/` at time of writing; omitted from SDK listing.
+
 ## 2026-06-13 — PostGIS general 2-D geometry SQL surface
 
 ### Added
