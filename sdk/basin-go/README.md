@@ -3,9 +3,15 @@
 Official Go SDK for [Basin](https://basin.run) — a cloud-native HTAP database
 with a PostgreSQL wire-compatible interface and an HTTP REST API.
 
-**Zero external dependencies.** The core SDK uses only the Go standard library
-(`net/http`, `encoding/json`, `context`, `sync`, `time`). No transitive module
-graph is imposed on users.
+**Two optional external dependencies** cover the non-core surfaces:
+
+| Dep | Why | Who gets it |
+|---|---|---|
+| `nhooyr.io/websocket` v1.8.11 | Realtime WebSocket client (`client.Realtime`) | Callers who import `Realtime` |
+| `github.com/apache/arrow-go/v18` | Arrow IPC decoding (`QueryBuilder.Arrow`) | Callers who call `.Arrow(ctx)` |
+
+All other surfaces (auth, query, storage, functions) use only the Go standard
+library.
 
 ## Installation
 
@@ -103,6 +109,94 @@ _, err = client.Table("orders").
 // Delete
 _, err = client.Table("orders").Eq("id", "5").Delete(ctx)
 ```
+
+### Realtime (WebSocket change streams)
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+// Subscribe to change events for "orders". The channel receives ServerFrame
+// values and closes when ctx is cancelled.
+events, err := client.Realtime.Subscribe(ctx, "orders", basin.SubscribeOptions{
+    Filter:      "NEW.status = 'paid'", // optional server-side SQL predicate
+    LastEventID: 42,                    // optional reconnect cursor (replay from seq 42)
+})
+if err != nil { ... }
+
+for frame := range events {
+    switch frame.Type {
+    case "event":
+        ev := frame.Event
+        fmt.Println(ev.Op, ev.Table, ev.Seq, ev.After)
+    case "error":
+        fmt.Println("lag or invalid_filter:", frame.Error.Code)
+    case "gap":
+        fmt.Println("replay ring evicted — cold re-sync needed", frame.Gap.OldestInRing)
+    }
+}
+
+// Unsubscribe explicitly (or just cancel ctx).
+_ = client.Realtime.Unsubscribe(ctx, "orders")
+client.Realtime.Disconnect()
+```
+
+**Presence:**
+
+```go
+// Register this client in a presence channel.
+_ = client.Realtime.PresenceTrack(ctx, "room:1", "user-c1", map[string]any{"name": "Alice"})
+
+// Refresh the presence TTL.
+_ = client.Realtime.PresenceHeartbeat(ctx, "room:1", "user-c1")
+
+// Remove from presence.
+_ = client.Realtime.PresenceUntrack(ctx, "room:1", "user-c1")
+```
+
+Realtime protocol notes:
+- URL: `wss://host/realtime/v1/ws/:project`
+- Auth: `Sec-WebSocket-Protocol: basin-v1,<token>` subprotocol (same as JS/Python SDKs)
+- Server close codes: `4001` unauthorized, `4003` forbidden, `4008` project deleted
+- Reconnects automatically with exponential backoff (0.5 s → … → 30 s), resubscribing all active channels.
+- Requires a JWT with a `project_id` claim (raw API keys don't carry a project ID; use `WithProjectID`).
+
+### Arrow IPC queries
+
+```go
+import "github.com/apache/arrow-go/v18/arrow/array"
+
+// Returns native Arrow record batches — zero JSON round-trip.
+result, err := client.Table("events").
+    Eq("status", "active").
+    Limit(1000).
+    Arrow(ctx)
+if err != nil { ... }
+defer result.Release()
+
+fmt.Println("rows:", result.Records[0].NumRows())
+fmt.Println("next cursor:", result.NextCursor)
+
+// Typed access via arrow-go.
+ids := result.Records[0].Column(0).(*array.Int64)
+for i := 0; i < int(result.Records[0].NumRows()); i++ {
+    fmt.Println(ids.Value(i))
+}
+
+// Paginate.
+if result.NextCursor != "" {
+    page2, err := client.Table("events").
+        Eq("status", "active").
+        Limit(1000).
+        Cursor(result.NextCursor).
+        Arrow(ctx)
+    ...
+}
+```
+
+When the server doesn't serve Arrow IPC (e.g. older server), `.Arrow()` falls
+back to JSON decoding. In that case `result.Records` is nil and
+`result.FallbackRows` contains the rows as `[]map[string]any`.
 
 ### RPC (catalog functions / Wasm UDFs)
 
@@ -262,11 +356,8 @@ err = client.Auth.UnenrollFactor(ctx, factorID)
 
 ## Deliberate omissions
 
-- **Arrow IPC transport**: the Basin server does not expose an Arrow/IPC
-  endpoint. JSON is the only supported transport. Client-side Arrow conversion
-  is not provided; use `result.Into(&dest)` for typed decoding.
-- **Realtime WebSocket**: `GET /realtime/v1/ws/:project` is not wrapped in v1
-  of this SDK. It is on the roadmap.
+- **SSE realtime** (`GET /realtime/v1/sse/:project/:table`): WebSocket covers
+  the same events; SSE is left for environments without WebSocket.
 - **Admin routes** (`/admin/v1/*`): operator-only; use the escape hatch below
   if needed.
 

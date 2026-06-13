@@ -9,6 +9,7 @@
 pub mod benchmark;
 pub mod big_stack;
 pub mod cache_defaults;
+pub mod ext_size_config;
 pub mod ext_store_select;
 pub mod test_config;
 pub mod workload;
