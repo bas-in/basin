@@ -55,7 +55,9 @@
 //! * `locf` without a `time_bucket_gapfill` in the same query —
 //!   `FeatureNotSupported` (TimescaleDB raises
 //!   `"locf can only be used in an aggregation query with time_bucket_gapfill"`).
-//! * `interpolate()` — not implemented; `FeatureNotSupported` (0A000).
+//! * `interpolate()` — linear interpolation between the nearest surrounding
+//!   non-NULL values; leading/trailing gaps where one side has no value stay
+//!   NULL (cannot interpolate without both endpoints).
 //! * Unbounded gapfill (no start/finish and no `BETWEEN`) — `InvalidSchema`
 //!   mirroring TimescaleDB's "missing argument" error.
 
@@ -75,11 +77,24 @@ use crate::cv_time_bucket::BucketWidth;
 
 // ─── detection ────────────────────────────────────────────────────────────────
 
+/// Fill mode for a single aggregate column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FillMode {
+    /// No fill wrapper — gap rows stay NULL.
+    Null,
+    /// `locf(agg)` — carry the last non-NULL observation forward.
+    Locf,
+    /// `interpolate(agg)` — linearly blend between the surrounding non-NULL
+    /// observations; leading/trailing gaps (no value on one side) stay NULL.
+    Interpolate,
+}
+
 /// A recognised gapfill request, extracted from the user's SQL.
 #[derive(Debug, Clone)]
 pub(crate) struct GapfillRequest {
     /// SQL with `time_bucket_gapfill(...)` rewritten to `time_bucket(interval,
-    /// ts)` and every `locf(x)` unwrapped to `x`.  This is what we actually run.
+    /// ts)` and every `locf(x)` / `interpolate(x)` unwrapped to `x`.
+    /// This is what we actually run.
     pub(crate) rewritten_sql: String,
     /// Bucket width parsed from the first argument.
     pub(crate) width: BucketWidth,
@@ -90,6 +105,15 @@ pub(crate) struct GapfillRequest {
     pub(crate) finish_us: i64,
     /// True if any output aggregate was wrapped in `locf(...)`.
     pub(crate) has_locf: bool,
+    /// True if any output aggregate was wrapped in `interpolate(...)`.
+    pub(crate) has_interpolate: bool,
+    /// Per-aggregate-column fill modes, in SELECT order (parallel to the
+    /// aggregate column indices returned by `densify`).  Empty when no fill
+    /// wrappers are present (all columns use `FillMode::Null`).
+    ///
+    /// Populated by `parse_fill_modes`; the densifier uses this to choose
+    /// between LOCF carry-forward and linear interpolation per column.
+    pub(crate) fill_modes: Vec<FillMode>,
 }
 
 /// Inspect `sql`.  Returns:
@@ -104,16 +128,17 @@ pub(crate) fn match_gapfill(sql: &str) -> Result<Option<GapfillRequest>, BasinEr
     let has_locf = contains_call(&lower, "locf");
     let has_interp = contains_call(&lower, "interpolate");
 
-    if has_interp {
-        return Err(BasinError::feature_not_supported(
-            "interpolate() is not supported; only time_bucket_gapfill + locf are implemented",
-        ));
-    }
     if !has_gapfill {
         if has_locf {
             // locf without gapfill — TimescaleDB rejects this.
             return Err(BasinError::feature_not_supported(
                 "locf can only be used in an aggregation query with time_bucket_gapfill",
+            ));
+        }
+        if has_interp {
+            // interpolate without gapfill — TimescaleDB rejects this.
+            return Err(BasinError::feature_not_supported(
+                "interpolate can only be used in an aggregation query with time_bucket_gapfill",
             ));
         }
         return Ok(None);
@@ -182,8 +207,15 @@ pub(crate) fn match_gapfill(sql: &str) -> Result<Option<GapfillRequest>, BasinEr
         ));
     }
 
-    // Build the rewritten SQL: gapfill→time_bucket (2-arg), strip locf wrappers.
-    let rewritten = rewrite_sql(sql, call_start, args_text, &interval_text, &ts_expr, has_locf)?;
+    // Build the rewritten SQL: gapfill→time_bucket (2-arg), strip locf and
+    // interpolate wrappers.
+    let rewritten = rewrite_sql(
+        sql, call_start, args_text, &interval_text, &ts_expr,
+        has_locf, has_interp,
+    )?;
+
+    // Parse per-aggregate fill modes from the SELECT clause.
+    let fill_modes = parse_fill_modes(sql);
 
     Ok(Some(GapfillRequest {
         rewritten_sql: rewritten,
@@ -191,12 +223,46 @@ pub(crate) fn match_gapfill(sql: &str) -> Result<Option<GapfillRequest>, BasinEr
         start_us,
         finish_us,
         has_locf,
+        has_interpolate: has_interp,
+        fill_modes,
     }))
+}
+
+/// Scan the SELECT clause of `sql` and, for every aggregate expression that
+/// is wrapped in `locf(...)` or `interpolate(...)`, record the corresponding
+/// `FillMode`.  Returns a `Vec<FillMode>` ordered by the appearance of
+/// locf/interpolate calls in the SQL text.
+///
+/// The mapping from this Vec to the aggregate column indices in the densified
+/// output is established by `densify`: it iterates aggregate columns in schema
+/// order and pairs them with entries from this vec in the order they appear in
+/// the SQL text, which must match the SELECT column order.
+///
+/// If no fill wrappers are present the vec is empty.
+fn parse_fill_modes(sql: &str) -> Vec<FillMode> {
+    let lower = sql.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut modes = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches_call_at_lower(&lower, i, "locf") {
+            modes.push(FillMode::Locf);
+            // Skip past the call name; the body rewrite handles the rest.
+            i += "locf".len();
+        } else if matches_call_at_lower(&lower, i, "interpolate") {
+            modes.push(FillMode::Interpolate);
+            i += "interpolate".len();
+        } else {
+            i += 1;
+        }
+    }
+    modes
 }
 
 /// Rewrite the SQL so it can run through the normal executor:
 ///   * `time_bucket_gapfill('iv', ts [, ...])` → `time_bucket('iv', ts)`
 ///   * every `locf(<expr>)` → `<expr>`
+///   * every `interpolate(<expr>)` → `<expr>`
 fn rewrite_sql(
     sql: &str,
     call_start: usize,
@@ -204,6 +270,7 @@ fn rewrite_sql(
     interval_text: &str,
     ts_expr: &str,
     has_locf: bool,
+    has_interp: bool,
 ) -> Result<String, BasinError> {
     // Replace the full `time_bucket_gapfill(<args>)` span with a 2-arg
     // `time_bucket('iv', ts)`. `call_start` points just past the function name;
@@ -218,6 +285,9 @@ fn rewrite_sql(
     if has_locf {
         out = unwrap_locf(&out)?;
     }
+    if has_interp {
+        out = unwrap_fn_call(&out, "interpolate")?;
+    }
     Ok(out)
 }
 
@@ -230,15 +300,21 @@ fn lower_fn_start(sql: &str, call_start: usize) -> usize {
 /// Replace every `locf(<expr>)` with `<expr>` (one level; nested locf is not a
 /// thing in TimescaleDB).  Quote/paren aware.
 fn unwrap_locf(sql: &str) -> Result<String, BasinError> {
+    unwrap_fn_call(sql, "locf")
+}
+
+/// Replace every `<fn_name>(<expr>)` with `(<expr>)` (one level).
+/// Quote/paren aware.  Used to strip both `locf(...)` and `interpolate(...)`.
+fn unwrap_fn_call(sql: &str, fn_name: &str) -> Result<String, BasinError> {
     let mut out = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
-        if matches_call_at(sql, i, "locf") {
-            // Skip 'locf', find its parens, splice the inner expression.
-            let after = i + "locf".len();
+        if matches_call_at(sql, i, fn_name) {
+            // Skip fn_name, find its parens, splice the inner expression.
+            let after = i + fn_name.len();
             let body = paren_contents(&sql[after..]).ok_or_else(|| {
-                BasinError::InvalidSchema("locf: malformed argument list".into())
+                BasinError::InvalidSchema(format!("{fn_name}: malformed argument list"))
             })?;
             out.push('(');
             out.push_str(body.trim());
@@ -371,40 +447,103 @@ pub(crate) fn densify(
         .map(|i| make_builder(schema.field(i).data_type()))
         .collect::<Result<_, _>>()?;
 
-    for gkey in &group_order {
-        // locf state per aggregate column.
+    // Determine per-aggregate fill mode.
+    // fill_modes from req are ordered by appearance of locf/interpolate in SQL.
+    // We map them to agg_cols in order: the i-th fill mode applies to the i-th
+    // aggregate column (skipping group and bucket columns).
+    let agg_fill_modes: Vec<FillMode> = {
+        let mut modes = Vec::with_capacity(agg_cols.len());
+        let mut fill_iter = req.fill_modes.iter().copied();
+        for _ in 0..agg_cols.len() {
+            // If no fill_modes recorded (pre-fill-mode queries or all-NULL),
+            // fall back to Locf when has_locf is set, else Null.
+            let mode = if req.fill_modes.is_empty() {
+                if req.has_locf { FillMode::Locf } else { FillMode::Null }
+            } else {
+                fill_iter.next().unwrap_or(FillMode::Null)
+            };
+            modes.push(mode);
+        }
+        modes
+    };
+
+    // Check whether any aggregate column uses interpolation.
+    let any_interp = agg_fill_modes.iter().any(|m| *m == FillMode::Interpolate);
+
+    // We build the output in two phases when interpolation is requested:
+    //   Phase 1: fill all values (real + LOCF carry for locf cols, NULL for
+    //            interpolate cols and no-fill cols).
+    //   Phase 2: linear-interpolation pass over per-group interpolate columns.
+    //
+    // To enable phase 2, we record the raw (possibly NULL) values for each
+    // interpolate column per group as a parallel Vec indexed by grid position.
+    // After phase 1 we compute interpolated values and patch the builder output.
+
+    // For interpolation: we collect raw aggregate values for every (group, grid)
+    // cell. indexed as [group_idx][agg_col_local_idx][grid_idx].
+    let n_groups = group_order.len();
+    let n_grid = grid.len();
+    // Only allocate when needed.
+    let mut interp_raw: Vec<Vec<Vec<Option<ScalarKey>>>> = if any_interp {
+        (0..n_groups)
+            .map(|_| (0..agg_cols.len()).map(|_| vec![None; n_grid]).collect())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    for (gi, gkey) in group_order.iter().enumerate() {
+        // locf carry state per aggregate column.
         let mut carry: Vec<Option<ScalarKey>> = vec![None; agg_cols.len()];
-        for &bus in &grid {
+        for (grid_idx, &bus) in grid.iter().enumerate() {
             // Bucket timestamp value.
             builders[bucket_idx].push_ts(bus, unit);
             // Group columns: echo the group key.
-            for (gi, &gc) in group_cols.iter().enumerate() {
-                builders[gc].push_scalar(&gkey[gi]);
+            for (gci, &gc) in group_cols.iter().enumerate() {
+                builders[gc].push_scalar(&gkey[gci]);
             }
             match present.get(&(gkey.clone(), bus)) {
                 Some(&(bi, row)) => {
                     // Real row: copy aggregate values, update locf carry.
                     for (ai, &ac) in agg_cols.iter().enumerate() {
                         let sk = ScalarKey::from_array(batches[bi].column(ac), row);
-                        builders[ac].push_scalar(&sk);
-                        if req.has_locf && !sk.is_null() {
-                            carry[ai] = Some(sk);
-                        } else if req.has_locf && sk.is_null() {
-                            // Real-but-NULL value: locf still carries forward the
-                            // previous non-NULL; leave carry unchanged.
+                        if any_interp {
+                            interp_raw[gi][ai][grid_idx] = Some(sk.clone());
+                        }
+                        match agg_fill_modes[ai] {
+                            FillMode::Locf => {
+                                builders[ac].push_scalar(&sk);
+                                if !sk.is_null() {
+                                    carry[ai] = Some(sk);
+                                }
+                                // Real-but-NULL: locf carry unchanged.
+                            }
+                            FillMode::Interpolate => {
+                                // Push the real value; interpolation pass will
+                                // not overwrite real (non-NULL) values.
+                                builders[ac].push_scalar(&sk);
+                            }
+                            FillMode::Null => {
+                                builders[ac].push_scalar(&sk);
+                            }
                         }
                     }
                 }
                 None => {
-                    // Synthetic row: NULL aggregates, unless locf carries.
+                    // Synthetic (gap) row.
                     for (ai, &ac) in agg_cols.iter().enumerate() {
-                        if req.has_locf {
-                            match &carry[ai] {
-                                Some(sk) => builders[ac].push_scalar(sk),
-                                None => builders[ac].push_null(),
+                        match agg_fill_modes[ai] {
+                            FillMode::Locf => {
+                                match &carry[ai] {
+                                    Some(sk) => builders[ac].push_scalar(sk),
+                                    None => builders[ac].push_null(),
+                                }
                             }
-                        } else {
-                            builders[ac].push_null();
+                            FillMode::Interpolate | FillMode::Null => {
+                                // Both stay NULL in phase 1; interpolate will
+                                // patch in phase 2.
+                                builders[ac].push_null();
+                            }
                         }
                     }
                 }
@@ -412,14 +551,115 @@ pub(crate) fn densify(
         }
     }
 
-    let arrays: Vec<ArrayRef> = builders
+    let mut arrays: Vec<ArrayRef> = builders
         .into_iter()
         .enumerate()
         .map(|(i, b)| b.finish(schema.field(i).data_type(), &tz))
         .collect::<Result<_, _>>()?;
+
+    // Phase 2: linear interpolation pass.
+    // For each interpolate aggregate column, scan each group's grid and fill in
+    // NULLs between the two nearest non-NULL surrounding values.
+    if any_interp {
+        for (ai, &ac) in agg_cols.iter().enumerate() {
+            if agg_fill_modes[ai] != FillMode::Interpolate {
+                continue;
+            }
+            // Patch the column in `arrays[ac]`.
+            let col_dt = schema.field(ac).data_type().clone();
+            let (tz_ref) = match schema.field(bucket_idx).data_type() {
+                DataType::Timestamp(_, z) => z.clone(),
+                _ => None,
+            };
+            // Build a new column by scanning each group.
+            let mut new_builder: Box<dyn ColBuilder> = make_builder(&col_dt)?;
+            for gi in 0..n_groups {
+                let raw = &interp_raw[gi][ai];
+                // Interpolation pass: for each NULL gap find the nearest
+                // prev and next non-NULL values and linearly interpolate.
+                // Leading/trailing gaps (no prev or next) stay NULL.
+                let n = raw.len();
+                let mut filled: Vec<Option<f64>> = vec![None; n];
+                // Extract f64 values where present.
+                for idx in 0..n {
+                    if let Some(sk) = &raw[idx] {
+                        filled[idx] = scalar_to_f64(sk);
+                    }
+                }
+                // Forward scan: for each None, find prev (p) and next (q) indices.
+                let mut result: Vec<Option<ScalarKey>> = vec![None; n];
+                let mut idx = 0;
+                while idx < n {
+                    if filled[idx].is_some() {
+                        result[idx] = raw[idx].clone();
+                        idx += 1;
+                    } else {
+                        // Find the prev non-NULL (scanning left).
+                        let prev_idx = (0..idx).rev().find(|&k| filled[k].is_some());
+                        // Find the next non-NULL (scanning right).
+                        let next_idx = (idx + 1..n).find(|&k| filled[k].is_some());
+                        match (prev_idx, next_idx) {
+                            (Some(p), Some(q)) => {
+                                // Linear interpolation over the gap [p+1 .. q-1].
+                                let v0 = filled[p].unwrap();
+                                let v1 = filled[q].unwrap();
+                                let steps = (q - p) as f64;
+                                // Fill the whole gap in one sweep.
+                                let gap_start = idx;
+                                let gap_end = q; // exclusive (q is non-NULL)
+                                for k in gap_start..gap_end {
+                                    let t = (k - p) as f64 / steps;
+                                    let interp = v0 + t * (v1 - v0);
+                                    result[k] = f64_to_scalar(interp, &col_dt);
+                                }
+                                idx = gap_end;
+                            }
+                            _ => {
+                                // Leading or trailing gap — stays NULL.
+                                result[idx] = None;
+                                idx += 1;
+                            }
+                        }
+                    }
+                }
+                // Push the interpolated values into the new builder.
+                for sk in &result {
+                    match sk {
+                        Some(s) => new_builder.push_scalar(s),
+                        None => new_builder.push_null(),
+                    }
+                }
+            }
+            arrays[ac] = new_builder.finish(&col_dt, &tz_ref)?;
+        }
+    }
+
     let out = RecordBatch::try_new(Arc::clone(schema), arrays)
         .map_err(|e| BasinError::InvalidSchema(format!("gapfill: building output batch: {e}")))?;
     Ok(vec![out])
+}
+
+/// Convert a `ScalarKey` to `f64` for interpolation arithmetic.
+/// Returns `None` for non-numeric types (they cannot be interpolated).
+fn scalar_to_f64(sk: &ScalarKey) -> Option<f64> {
+    match sk {
+        ScalarKey::Int(v) => Some(*v as f64),
+        ScalarKey::Float(bits) => Some(f64::from_bits(*bits)),
+        ScalarKey::Null => None,
+        ScalarKey::Bool(_) | ScalarKey::Str(_) => None,
+    }
+}
+
+/// Convert an interpolated `f64` back to a `ScalarKey` matching the column type.
+fn f64_to_scalar(v: f64, dt: &DataType) -> Option<ScalarKey> {
+    match dt {
+        DataType::Float64 | DataType::Float32 => Some(ScalarKey::Float(v.to_bits())),
+        DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8
+        | DataType::UInt64 | DataType::UInt32 | DataType::UInt16 | DataType::UInt8 => {
+            Some(ScalarKey::Int(v.round() as i64))
+        }
+        _ => None,
+    }
 }
 
 /// Determine which output columns are GROUP columns (everything between the
@@ -876,11 +1116,18 @@ fn contains_call(lower: &str, name: &str) -> bool {
 }
 
 fn matches_call_at_lower(lower: &str, pos: usize, name: &str) -> bool {
+    let end = pos + name.len();
+    if end > lower.len() {
+        return false;
+    }
+    // Verify the actual text at this position matches `name`.
+    if &lower[pos..end] != name {
+        return false;
+    }
     let pre_ok = pos == 0 || {
         let p = lower.as_bytes()[pos - 1];
         !(p.is_ascii_alphanumeric() || p == b'_')
     };
-    let end = pos + name.len();
     if !pre_ok {
         return false;
     }
@@ -1154,10 +1401,38 @@ mod tests {
     }
 
     #[test]
-    fn interpolate_errors() {
+    fn interpolate_without_gapfill_errors() {
+        // interpolate() without time_bucket_gapfill → typed error.
         let sql = "SELECT interpolate(avg(v)) FROM t";
         let err = match_gapfill(sql).unwrap_err();
         assert!(matches!(err, BasinError::FeatureNotSupported(_)));
+    }
+
+    #[test]
+    fn interpolate_with_gapfill_rewrites() {
+        // interpolate() inside a gapfill query is now supported and rewrites.
+        let sql = "SELECT time_bucket_gapfill('1 hour', ts) AS b, interpolate(avg(v)) AS a \
+                   FROM t WHERE ts BETWEEN '2024-01-01 00:00:00+00' AND '2024-01-01 02:00:00+00' \
+                   GROUP BY b";
+        let req = match_gapfill(sql).unwrap().expect("match");
+        assert!(req.has_interpolate);
+        assert!(req.rewritten_sql.to_lowercase().contains("avg(v)"));
+        assert!(!req.rewritten_sql.to_lowercase().contains("interpolate"));
+        assert!(req.rewritten_sql.contains("time_bucket('1 hour', ts)"));
+        // fill_modes should record an Interpolate entry.
+        assert!(req.fill_modes.iter().any(|m| *m == FillMode::Interpolate));
+    }
+
+    #[test]
+    fn parse_fill_modes_mixed() {
+        // A query with both locf and interpolate columns should yield the
+        // correct per-column fill mode ordering.
+        let sql = "SELECT time_bucket_gapfill('1h', ts) AS b, \
+                   locf(sum(a)), interpolate(avg(b)) \
+                   FROM t WHERE ts BETWEEN '2024-01-01' AND '2024-01-02' GROUP BY b";
+        let modes = parse_fill_modes(sql);
+        // locf appears before interpolate in the SQL.
+        assert_eq!(modes, vec![FillMode::Locf, FillMode::Interpolate]);
     }
 
     #[test]
