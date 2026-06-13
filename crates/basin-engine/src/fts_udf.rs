@@ -2144,6 +2144,10 @@ fn tv_with_weight(tv: &TsVector, w: char) -> String {
 mod tests {
     use super::*;
 
+    fn default_opts() -> HeadlineOptions {
+        HeadlineOptions::default()
+    }
+
     fn tsv(text: &str) -> String {
         TsVector::from_text_document(text, Some("english")).to_canonical()
     }
