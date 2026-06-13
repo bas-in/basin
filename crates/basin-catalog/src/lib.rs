@@ -29,6 +29,8 @@
 pub mod budgets;
 /// ADR 0028 Phase 2 — per-project CDC webhook subscriptions + delivery cursor.
 pub mod cdc_webhooks;
+/// ADR 0028 Phase 3 — per-project CDC Kafka/Redpanda sink configs + cursor.
+pub mod cdc_kafka;
 mod domains;
 mod enums;
 mod functions;
@@ -64,6 +66,10 @@ use basin_common::{ChangeOp, ProjectId, QualifiedTableName, Result, SchemaName, 
 pub use cdc_webhooks::{
     validate_registration as validate_cdc_webhook, CdcWebhookDef, CdcWebhookError, CdcWebhookRow,
     CdcWebhookState,
+};
+pub use cdc_kafka::{
+    validate_registration as validate_cdc_kafka_sink, CdcKafkaError, CdcKafkaSinkDef,
+    CdcKafkaSinkRow, CdcKafkaSinkState, PartitionKey,
 };
 pub use domains::{DomainDef, DomainError, BASIN_DOMAIN_KEY};
 pub use enums::{EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
@@ -1964,6 +1970,84 @@ pub trait Catalog: Send + Sync {
         let _ = (project, id);
         Err(basin_common::BasinError::Internal(
             "disable_cdc_webhook not implemented for this catalog backend".into(),
+        ))
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0028 Phase 3 — CDC Kafka sink configs + delivery cursor
+    //
+    // Per-project registered Kafka/Redpanda sinks that receive committed change
+    // events. The subscription (`CdcKafkaSinkDef`) is the registration (brokers,
+    // topic pattern, filters, partition-key strategy); the state
+    // (`CdcKafkaSinkState`) is the resumable delivery cursor persisted by the
+    // delivery worker on each producer-ack. The discipline mirrors the Phase 2
+    // webhook methods exactly (legacy-tolerant defaults, monotonic GREATEST
+    // cursor, retained-on-disable row); only the transport differs.
+    // -----------------------------------------------------------------------
+
+    /// Register a CDC Kafka sink config. The `def.id` is the caller-minted ULID;
+    /// the initial delivery state is the zero cursor. Default impl: not
+    /// implemented (Kafka sinks require a durable backend).
+    async fn register_cdc_kafka_sink(&self, def: cdc_kafka::CdcKafkaSinkDef) -> Result<()> {
+        let _ = def;
+        Err(basin_common::BasinError::Internal(
+            "register_cdc_kafka_sink not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Drop a registered CDC Kafka sink by `(project, id)`. Returns
+    /// [`basin_common::BasinError::NotFound`] when the id does not resolve.
+    /// Default impl: not implemented.
+    async fn drop_cdc_kafka_sink(&self, project: &ProjectId, id: &str) -> Result<()> {
+        let _ = (project, id);
+        Err(basin_common::BasinError::Internal(
+            "drop_cdc_kafka_sink not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// List every CDC Kafka sink registered for `project`, each bundled with its
+    /// current delivery state. The worker reads this to discover sinks and their
+    /// resume points; the GET route renders it. Default impl: empty.
+    async fn list_cdc_kafka_sinks(&self, project: &ProjectId) -> Vec<cdc_kafka::CdcKafkaSinkRow> {
+        let _ = project;
+        Vec::new()
+    }
+
+    /// Persist the delivery cursor for one sink after a producer-acked batch:
+    /// advance `last_seq` (monotonic GREATEST), record the last status, reset
+    /// `retry_count` to 0. Default impl: durable no-op (cursor lives in memory
+    /// only for ephemeral backends, replayed from `seq=0` on restart).
+    async fn record_cdc_kafka_ack(
+        &self,
+        project: &ProjectId,
+        id: &str,
+        last_seq: u64,
+        last_status: &str,
+    ) -> Result<()> {
+        let _ = (project, id, last_seq, last_status);
+        Ok(())
+    }
+
+    /// Persist a failed delivery attempt: bump `retry_count`, record the status.
+    /// Does NOT advance `last_seq`. Default impl: durable no-op.
+    async fn record_cdc_kafka_failure(
+        &self,
+        project: &ProjectId,
+        id: &str,
+        retry_count: u32,
+        last_status: &str,
+    ) -> Result<()> {
+        let _ = (project, id, retry_count, last_status);
+        Ok(())
+    }
+
+    /// Auto-disable a sink that exceeded the max delivery age: clear `active`
+    /// and stamp `disabled_at`. The row + cursor are retained. Default impl: not
+    /// implemented.
+    async fn disable_cdc_kafka_sink(&self, project: &ProjectId, id: &str) -> Result<()> {
+        let _ = (project, id);
+        Err(basin_common::BasinError::Internal(
+            "disable_cdc_kafka_sink not implemented for this catalog backend".into(),
         ))
     }
 

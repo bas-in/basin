@@ -17,6 +17,7 @@ use tracing::instrument;
 
 use basin_common::ChangeOp;
 
+use crate::cdc_kafka::{CdcKafkaSinkDef, CdcKafkaSinkRow, CdcKafkaSinkState};
 use crate::cdc_webhooks::{CdcWebhookDef, CdcWebhookRow, CdcWebhookState};
 use crate::domains::{self, DomainDef, DomainError};
 use crate::enums::{self, EnumError, EnumTypeDef};
@@ -217,6 +218,11 @@ pub struct InMemoryCatalog {
     /// value bundles the subscription `def` with its mutable delivery `state`.
     /// Per-project cost stays `O(bytes)`. Cleared in `drop_namespace`.
     cdc_webhooks: Mutex<HashMap<(ProjectId, String), (CdcWebhookDef, CdcWebhookState)>>,
+
+    /// ADR 0028 Phase 3 — per-project CDC Kafka sink configs + delivery cursor.
+    /// Same shape as `cdc_webhooks`, keyed by `(ProjectId, sink_id)`. Cleared in
+    /// `drop_namespace`.
+    cdc_kafka_sinks: Mutex<HashMap<(ProjectId, String), (CdcKafkaSinkDef, CdcKafkaSinkState)>>,
 }
 
 /// In-memory lease row. Mirrors the `partition_leases` Postgres table.
@@ -279,6 +285,7 @@ impl InMemoryCatalog {
             project_max_connections: Mutex::new(HashMap::new()),
             compaction_watermarks: Mutex::new(HashMap::new()),
             cdc_webhooks: Mutex::new(HashMap::new()),
+            cdc_kafka_sinks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -612,6 +619,9 @@ impl Catalog for InMemoryCatalog {
         // Clear per-project CDC webhook subscriptions + cursors.
         let mut cwh = self.cdc_webhooks.lock().await;
         cwh.retain(|(t, _), _| t != project);
+        // Clear per-project CDC Kafka sink configs + cursors.
+        let mut cks = self.cdc_kafka_sinks.lock().await;
+        cks.retain(|(t, _), _| t != project);
         Ok(())
     }
 
@@ -1683,6 +1693,98 @@ impl Catalog for InMemoryCatalog {
             }
             None => Err(BasinError::not_found(format!(
                 "cdc webhook {id:?} does not exist"
+            ))),
+        }
+    }
+
+    // ---- ADR 0028 Phase 3: CDC Kafka sinks ------------------------------
+
+    async fn register_cdc_kafka_sink(&self, def: CdcKafkaSinkDef) -> Result<()> {
+        self.bump_epoch();
+        let key = (def.project, def.id.clone());
+        let mut map = self.cdc_kafka_sinks.lock().await;
+        if map.contains_key(&key) {
+            return Err(BasinError::Catalog(format!(
+                "cdc kafka sink {:?} already exists for project {}",
+                def.id, def.project
+            )));
+        }
+        map.insert(key, (def, CdcKafkaSinkState::default()));
+        Ok(())
+    }
+
+    async fn drop_cdc_kafka_sink(&self, project: &ProjectId, id: &str) -> Result<()> {
+        self.bump_epoch();
+        let key = (*project, id.to_string());
+        let mut map = self.cdc_kafka_sinks.lock().await;
+        if map.remove(&key).is_none() {
+            return Err(BasinError::not_found(format!(
+                "cdc kafka sink {id:?} does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn list_cdc_kafka_sinks(&self, project: &ProjectId) -> Vec<CdcKafkaSinkRow> {
+        let map = self.cdc_kafka_sinks.lock().await;
+        let mut rows: Vec<CdcKafkaSinkRow> = map
+            .iter()
+            .filter(|((t, _), _)| t == project)
+            .map(|(_, (def, state))| CdcKafkaSinkRow {
+                def: def.clone(),
+                state: state.clone(),
+            })
+            .collect();
+        rows.sort_by(|a, b| a.def.id.cmp(&b.def.id));
+        rows
+    }
+
+    async fn record_cdc_kafka_ack(
+        &self,
+        project: &ProjectId,
+        id: &str,
+        last_seq: u64,
+        last_status: &str,
+    ) -> Result<()> {
+        let key = (*project, id.to_string());
+        let mut map = self.cdc_kafka_sinks.lock().await;
+        if let Some((_, state)) = map.get_mut(&key) {
+            // Monotonic cursor: never rewind (mirrors compaction watermark).
+            state.last_seq = state.last_seq.max(last_seq);
+            state.last_status = Some(last_status.to_string());
+            state.retry_count = 0;
+        }
+        Ok(())
+    }
+
+    async fn record_cdc_kafka_failure(
+        &self,
+        project: &ProjectId,
+        id: &str,
+        retry_count: u32,
+        last_status: &str,
+    ) -> Result<()> {
+        let key = (*project, id.to_string());
+        let mut map = self.cdc_kafka_sinks.lock().await;
+        if let Some((_, state)) = map.get_mut(&key) {
+            state.retry_count = retry_count;
+            state.last_status = Some(last_status.to_string());
+        }
+        Ok(())
+    }
+
+    async fn disable_cdc_kafka_sink(&self, project: &ProjectId, id: &str) -> Result<()> {
+        self.bump_epoch();
+        let key = (*project, id.to_string());
+        let mut map = self.cdc_kafka_sinks.lock().await;
+        match map.get_mut(&key) {
+            Some((def, state)) => {
+                def.active = false;
+                state.disabled_at = Some(chrono::Utc::now().to_rfc3339());
+                Ok(())
+            }
+            None => Err(BasinError::not_found(format!(
+                "cdc kafka sink {id:?} does not exist"
             ))),
         }
     }

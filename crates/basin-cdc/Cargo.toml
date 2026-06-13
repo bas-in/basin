@@ -45,6 +45,23 @@ dashmap = "6"
 # Phase 1 is SSE-only — so we pull axum without it.
 axum.workspace = true
 
+# Phase 3 Kafka sink — production producer transport. PURE-RUST client (no
+# librdkafka C dependency: `rskafka` speaks the Kafka wire protocol directly),
+# gated behind the `cdc-kafka` feature so the DEFAULT build never links it and
+# stays C-toolchain-free. `default-features = false` drops the compression
+# codecs (gzip/lz4/snappy/zstd) we do not need — CDC records are JSON v1 and
+# Kafka-level compression is not part of Phase 3.
+rskafka = { version = "0.6", optional = true, default-features = false }
+
+[features]
+# OFF by default. Enables the production `rskafka`-backed Kafka producer + the
+# `spawn_kafka_supervisor` convenience constructor. The delivery-worker logic,
+# the `KafkaProducer` trait, partition-key derivation, and record framing are
+# always compiled (and tested with an in-process mock producer) regardless of
+# this flag; only the real transport is gated.
+default = []
+cdc-kafka = ["dep:rskafka"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tempfile.workspace = true
