@@ -628,6 +628,41 @@ fn geom_binary_sig() -> Signature {
     point_binary_sig()
 }
 
+/// `one_of` signature for a geometry UDF taking a trailing 1-based integer
+/// index (`ST_PointN` / `ST_GeometryN`). The index may arrive as `Int32`
+/// (native) or `Int64` (sqlparser's default integer-literal width), so both
+/// are accepted — otherwise `ST_GeometryN(geom, 2)` trips the type checker
+/// with a `Binary, Int64` coercion failure. The geometry accepts any
+/// binary-family physical encoding.
+fn geom_with_index_sig() -> Signature {
+    let mut variants = Vec::new();
+    for p in point_input_variants() {
+        variants.push(TypeSignature::Exact(vec![p.clone(), DataType::Int32]));
+        variants.push(TypeSignature::Exact(vec![p, DataType::Int64]));
+    }
+    Signature::one_of(variants, Volatility::Immutable)
+}
+
+/// Read a 1-based integer index at row `i` from an `Int32`/`Int64` column.
+/// Returns `Ok(None)` for null slots; `Err` if the column is neither width.
+fn index_at(arr: &ArrayRef, i: usize) -> DFResult<Option<i32>> {
+    if arr.is_null(i) {
+        return Ok(None);
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
+        Ok(Some(a.value(i)))
+    } else if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Int64Array>() {
+        // Geometry indices are tiny; the i64→i32 narrowing is safe (an index
+        // beyond i32::MAX would address a geometry far larger than memory).
+        Ok(Some(a.value(i) as i32))
+    } else {
+        Err(datafusion::error::DataFusionError::Execution(format!(
+            "geometry index argument must be INT4 or INT8, got {:?}",
+            arr.data_type()
+        )))
+    }
+}
+
 /// Read a single string cell (`Utf8`/`LargeUtf8`) at row `i`, or `None` if null.
 fn str_at(arr: &ArrayRef, i: usize) -> DFResult<Option<String>> {
     if arr.is_null(i) {
@@ -2517,6 +2552,29 @@ simple_udf!(
     }
 );
 
+// `ST_NumPoints` is the PostGIS spelling of the vertex count. The POINT-only
+// wave-α UDF registered under this name always returned 1 (degenerate POINT
+// vertex count); the general one counts every vertex so LINESTRING/POLYGON/
+// MULTI* report their true vertex totals, while a POINT still counts 1 (so the
+// existing POINT pin is preserved). Registered after the wave-α UDF so it wins.
+simple_udf!(
+    NumPointsGeneralUdf,
+    "st_numpoints",
+    DataType::Int32,
+    geom_unary_sig(),
+    |args| {
+        let (n, arr) = columnar_unary_to_array(&args.args)?;
+        let mut out = Int32Builder::with_capacity(n);
+        for i in 0..n {
+            match decode_geom_at(&arr, i)? {
+                Some(g) => out.append_value(count_vertices(&g.geometry) as i32),
+                None => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+);
+
 simple_udf!(
     NumGeometriesUdf,
     "st_numgeometries",
@@ -2601,22 +2659,20 @@ simple_udf!(
     PointNGeneralUdf,
     "st_pointn",
     geom_dt(),
-    point_with_extra_sig(&[DataType::Int32]),
+    geom_with_index_sig(),
     |args| {
         let (n, geom_arr, idx_arr) = columnar_pair_to_arrays(&args.args)?;
-        let idx_col = idx_arr.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "ST_PointN: second argument must be INT32".into(),
-            )
-        })?;
         let mut out = BinaryBuilder::new();
         for i in 0..n {
-            if idx_col.is_null(i) {
-                out.append_null();
-                continue;
-            }
+            let idx = match index_at(&idx_arr, i)? {
+                Some(v) => v,
+                None => {
+                    out.append_null();
+                    continue;
+                }
+            };
             match decode_geom_at(&geom_arr, i)? {
-                Some(g) => match nth_point(&g.geometry, idx_col.value(i)) {
+                Some(g) => match nth_point(&g.geometry, idx) {
                     Some(p) => out.append_value(basin_geo::encode_wkb(
                         &geo::geometry::Geometry::Point(p),
                     )),
@@ -2659,22 +2715,20 @@ simple_udf!(
     GeometryNUdf,
     "st_geometryn",
     geom_dt(),
-    point_with_extra_sig(&[DataType::Int32]),
+    geom_with_index_sig(),
     |args| {
         let (n, geom_arr, idx_arr) = columnar_pair_to_arrays(&args.args)?;
-        let idx_col = idx_arr.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "ST_GeometryN: second argument must be INT32".into(),
-            )
-        })?;
         let mut out = BinaryBuilder::new();
         for i in 0..n {
-            if idx_col.is_null(i) {
-                out.append_null();
-                continue;
-            }
+            let idx = match index_at(&idx_arr, i)? {
+                Some(v) => v,
+                None => {
+                    out.append_null();
+                    continue;
+                }
+            };
             match decode_geom_at(&geom_arr, i)? {
-                Some(g) => match nth_geometry(&g.geometry, idx_col.value(i)) {
+                Some(g) => match nth_geometry(&g.geometry, idx) {
                     Some(member) => out.append_value(basin_geo::encode_wkb(&member)),
                     None => out.append_null(),
                 },
@@ -2831,6 +2885,7 @@ fn install_general_geom_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(AsEwkbGeneralUdf { signature: geom_unary_sig() }));
     ctx.register_udf(ScalarUDF::from(GeometryTypeUdf { signature: geom_unary_sig() }));
     ctx.register_udf(ScalarUDF::from(NPointsUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(NumPointsGeneralUdf { signature: geom_unary_sig() }));
     ctx.register_udf(ScalarUDF::from(NumGeometriesUdf { signature: geom_unary_sig() }));
     ctx.register_udf(ScalarUDF::from(LengthGeneralUdf { signature: geom_unary_sig() }));
     ctx.register_udf(ScalarUDF::from(AreaGeneralUdf { signature: geom_unary_sig() }));
@@ -2841,13 +2896,13 @@ fn install_general_geom_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(CentroidGeneralUdf { signature: geom_unary_sig() }));
     ctx.register_udf(ScalarUDF::from(EnvelopeGeneralUdf { signature: geom_unary_sig() }));
     ctx.register_udf(ScalarUDF::from(PointNGeneralUdf {
-        signature: point_with_extra_sig(&[DataType::Int32]),
+        signature: geom_with_index_sig(),
     }));
     ctx.register_udf(ScalarUDF::from(StartPointGeneralUdf { signature: geom_unary_sig() }));
     ctx.register_udf(ScalarUDF::from(EndPointGeneralUdf { signature: geom_unary_sig() }));
     ctx.register_udf(ScalarUDF::from(ExteriorRingUdf { signature: geom_unary_sig() }));
     ctx.register_udf(ScalarUDF::from(GeometryNUdf {
-        signature: point_with_extra_sig(&[DataType::Int32]),
+        signature: geom_with_index_sig(),
     }));
     ctx.register_udf(ScalarUDF::from(IntersectsGeneralUdf { signature: geom_binary_sig() }));
     ctx.register_udf(ScalarUDF::from(ContainsGeneralUdf { signature: geom_binary_sig() }));

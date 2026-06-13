@@ -753,6 +753,14 @@ fn rings_to_polygon(mut rings: Vec<GLineString<f64>>) -> GPolygon<f64> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Encode `g` as an RFC 7946 GeoJSON geometry object.
+///
+/// The outer object is assembled by hand so the `"type"` key always precedes
+/// `"coordinates"` / `"geometries"`, matching PostGIS `ST_AsGeoJSON` (and the
+/// fixed-21-byte POINT fast-path encoder). `serde_json::Value` is a `BTreeMap`
+/// by default — round-tripping the object through it would re-sort the keys
+/// alphabetically (`coordinates` before `type`), which diverges from PostGIS;
+/// emitting the wrapper directly avoids that. The coordinate/geometry payloads
+/// still go through `serde_json` so float formatting and escaping stay correct.
 pub fn encode_geojson(g: &Geometry<f64>) -> String {
     use serde_json::{json, Value};
     fn coord_json(c: &Coord<f64>) -> Value {
@@ -768,42 +776,53 @@ pub fn encode_geojson(g: &Geometry<f64>) -> String {
         }
         Value::Array(rings)
     }
-    let v: Value = match g {
-        Geometry::Point(p) => json!({"type":"Point","coordinates":coord_json(&p.0)}),
-        Geometry::Line(l) => json!({
-            "type":"LineString",
-            "coordinates":[coord_json(&l.start), coord_json(&l.end)]
-        }),
-        Geometry::LineString(ls) => json!({"type":"LineString","coordinates":ring_json(ls)}),
-        Geometry::Polygon(poly) => json!({"type":"Polygon","coordinates":polygon_json(poly)}),
+    // Render `{"type":"<ty>","coordinates":<payload>}` with type first.
+    fn wrap(ty: &str, key: &str, payload: &Value) -> String {
+        format!(
+            "{{\"type\":\"{ty}\",\"{key}\":{}}}",
+            serde_json::to_string(payload).expect("geometry json always serialises")
+        )
+    }
+    match g {
+        Geometry::Point(p) => wrap("Point", "coordinates", &coord_json(&p.0)),
+        Geometry::Line(l) => wrap(
+            "LineString",
+            "coordinates",
+            &json!([coord_json(&l.start), coord_json(&l.end)]),
+        ),
+        Geometry::LineString(ls) => wrap("LineString", "coordinates", &ring_json(ls)),
+        Geometry::Polygon(poly) => wrap("Polygon", "coordinates", &polygon_json(poly)),
         Geometry::Rect(r) => {
-            json!({"type":"Polygon","coordinates":polygon_json(&r.to_polygon())})
+            wrap("Polygon", "coordinates", &polygon_json(&r.to_polygon()))
         }
         Geometry::Triangle(t) => {
-            json!({"type":"Polygon","coordinates":polygon_json(&t.to_polygon())})
+            wrap("Polygon", "coordinates", &polygon_json(&t.to_polygon()))
         }
-        Geometry::MultiPoint(mp) => json!({
-            "type":"MultiPoint",
-            "coordinates": Value::Array(mp.0.iter().map(|p| coord_json(&p.0)).collect())
-        }),
-        Geometry::MultiLineString(ml) => json!({
-            "type":"MultiLineString",
-            "coordinates": Value::Array(ml.0.iter().map(ring_json).collect())
-        }),
-        Geometry::MultiPolygon(mpoly) => json!({
-            "type":"MultiPolygon",
-            "coordinates": Value::Array(mpoly.0.iter().map(polygon_json).collect())
-        }),
+        Geometry::MultiPoint(mp) => wrap(
+            "MultiPoint",
+            "coordinates",
+            &Value::Array(mp.0.iter().map(|p| coord_json(&p.0)).collect()),
+        ),
+        Geometry::MultiLineString(ml) => wrap(
+            "MultiLineString",
+            "coordinates",
+            &Value::Array(ml.0.iter().map(ring_json).collect()),
+        ),
+        Geometry::MultiPolygon(mpoly) => wrap(
+            "MultiPolygon",
+            "coordinates",
+            &Value::Array(mpoly.0.iter().map(polygon_json).collect()),
+        ),
         Geometry::GeometryCollection(gc) => {
-            let members: Vec<Value> = gc
-                .0
-                .iter()
-                .map(|m| serde_json::from_str(&encode_geojson(m)).unwrap())
-                .collect();
-            json!({"type":"GeometryCollection","geometries":members})
+            // Members are already type-first strings; join them into the array
+            // verbatim so nested ordering is preserved too.
+            let members: Vec<String> = gc.0.iter().map(encode_geojson).collect();
+            format!(
+                "{{\"type\":\"GeometryCollection\",\"geometries\":[{}]}}",
+                members.join(",")
+            )
         }
-    };
-    serde_json::to_string(&v).expect("geometry json always serialises")
+    }
 }
 
 /// Decode an RFC 7946 GeoJSON geometry object into a geometry.
