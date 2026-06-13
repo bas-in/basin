@@ -375,6 +375,22 @@ pub(crate) fn install_udfs(ctx: &SessionContext) {
             Volatility::Immutable,
         ),
     }));
+
+    // ── PG-Wave 5: general geometry surface ───────────────────────────────
+    //
+    // Registered LAST so the canonical names that overlap the POINT-only
+    // wave-α UDFs (st_astext, st_area, st_centroid, st_envelope, st_pointn,
+    // st_startpoint, st_endpoint, st_intersects, st_within, st_geomfromtext,
+    // st_geomfromgeojson, st_geomfromwkb, st_asgeojson, st_asewkb,
+    // st_perimeter) are *overwritten* by the general implementations. The
+    // general impls decode FSB(21) POINT blobs via `basin_geo::decode_any`
+    // too, and preserve every pinned POINT result (POINT→POINT(x y),
+    // ST_Area(POINT)=0, ST_Envelope(POINT)=identity, …). New names
+    // (st_geometrytype, st_npoints, st_numgeometries, st_geometryn,
+    // st_exteriorring, st_contains, st_length, st_lengthgeog, st_areageog,
+    // st_perimetergeog) are added net-new. The POINT-only ST_X/ST_Y/
+    // ST_Distance/ST_DWithin/ST_SRID/ST_Transform/ST_MakePoint stay as-is.
+    install_general_geom_udfs(ctx);
 }
 
 #[inline]
@@ -571,6 +587,72 @@ fn decode_point_at(arr: &ArrayRef, i: usize) -> DFResult<Option<Point>> {
             datafusion::error::DataFusionError::Execution(format!("decode POINT: {e}"))
         }),
     }
+}
+
+// ── General-geometry helpers (PG-Wave 5: LINESTRING/POLYGON/MULTI*) ──────────
+//
+// The fixed-21-byte POINT WKB blob is itself valid general WKB
+// (`01 01000000 X Y`), so `basin_geo::decode_any` decodes BOTH the FSB(21)
+// POINT fast-path encoding AND the variable-length `Binary` WKB used for every
+// other geometry type uniformly. These helpers let the general ST_* UDFs accept
+// a POINT column, a Binary WKB column, or a freshly-constructed geometry without
+// caring which physical encoding it arrived in.
+
+/// Decode the geometry at row `i` of any binary-family array into a
+/// `basin_geo::Geom` (geometry + recovered SRID). Returns `Ok(None)` for nulls.
+fn decode_geom_at(arr: &ArrayRef, i: usize) -> DFResult<Option<basin_geo::Geom>> {
+    match point_bytes_at(arr, i)? {
+        None => Ok(None),
+        Some(bytes) => basin_geo::decode_any(bytes).map(Some).map_err(|e| {
+            datafusion::error::DataFusionError::Execution(format!("decode geometry WKB: {e}"))
+        }),
+    }
+}
+
+/// Output `DataType` for a geometry-valued UDF result: variable-length WKB
+/// in `Binary`. (The POINT-typed constructors keep returning `FixedSizeBinary`
+/// for the POINT-column fast path; the general constructors below return this.)
+#[inline]
+fn geom_dt() -> DataType {
+    DataType::Binary
+}
+
+/// `one_of` signature for a unary geometry UDF accepting any binary-family
+/// physical encoding (POINT FSB(21) or general Binary WKB).
+fn geom_unary_sig() -> Signature {
+    point_unary_sig()
+}
+
+/// `one_of` signature for a binary geometry×geometry UDF.
+fn geom_binary_sig() -> Signature {
+    point_binary_sig()
+}
+
+/// Read a single string cell (`Utf8`/`LargeUtf8`) at row `i`, or `None` if null.
+fn str_at(arr: &ArrayRef, i: usize) -> DFResult<Option<String>> {
+    if arr.is_null(i) {
+        return Ok(None);
+    }
+    let s = match arr.data_type() {
+        DataType::Utf8 => arr
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray")
+            .value(i)
+            .to_string(),
+        DataType::LargeUtf8 => arr
+            .as_any()
+            .downcast_ref::<arrow_array::LargeStringArray>()
+            .expect("LargeStringArray")
+            .value(i)
+            .to_string(),
+        other => {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "expected a string argument, got {other:?}"
+            )))
+        }
+    };
+    Ok(Some(s))
 }
 
 // ── ST_MakePoint ──────────────────────────────────────────────────────────────
@@ -2174,6 +2256,602 @@ impl ScalarUDFImpl for StGeographyFromTextUdf {
         };
         geom.invoke_with_args(args)
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PG-Wave 5 — general geometry surface (LINESTRING/POLYGON/MULTI*/COLLECTION)
+//
+// These UDFs operate on / return *variable-length* WKB in Arrow `Binary`.
+// They decode any binary-family input via `basin_geo::decode_any`, so a POINT
+// FSB(21) column, a Binary WKB column, or a freshly-constructed geometry all
+// work. Constructors return `Binary` WKB; accessors return the appropriate
+// scalar/text; the geometry-returning ones (Centroid/Envelope/PointN/…) return
+// `Binary` WKB.
+//
+// ## Approximate-vs-exact honesty
+//
+// - Measures (Length/Area/Perimeter): two regimes. The default planar regime
+//   matches PostGIS `ST_*(geometry)` (Cartesian, degree-units). The `_Geog`
+//   suffixed variants (ST_LengthGeog / ST_AreaGeog) are WGS84-correct
+//   great-circle / spherical-excess in metres / m², matching
+//   `ST_*(geography)`. Documented so callers never mistake degrees for metres.
+// - Predicates (Intersects/Contains/Within): EXACT planar topology via the
+//   `geo` crate's DE-9IM-correct trait impls — NOT a bbox approximation. There
+//   is no silent bbox-only result here.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Macro-free helper: build a `ScalarUDF` invoke that maps each geometry row to
+/// an `f64` via `f`, NULL-safe.
+fn geom_unary_f64<F>(args: &ScalarFunctionArgs, f: F) -> DFResult<ColumnarValue>
+where
+    F: Fn(&basin_geo::Geom) -> f64,
+{
+    let (n, arr) = columnar_unary_to_array(&args.args)?;
+    let mut out = Float64Builder::with_capacity(n);
+    for i in 0..n {
+        match decode_geom_at(&arr, i)? {
+            Some(g) => out.append_value(f(&g)),
+            None => out.append_null(),
+        }
+    }
+    Ok(ColumnarValue::Array(Arc::new(out.finish())))
+}
+
+/// Build an invoke that maps each geometry row to an optional geometry (WKB),
+/// NULL-safe; `None` from `f` yields a NULL output cell.
+fn geom_unary_geom<F>(args: &ScalarFunctionArgs, f: F) -> DFResult<ColumnarValue>
+where
+    F: Fn(&basin_geo::Geom) -> Option<basin_geo::Geom>,
+{
+    let (n, arr) = columnar_unary_to_array(&args.args)?;
+    let mut out = BinaryBuilder::new();
+    for i in 0..n {
+        match decode_geom_at(&arr, i)? {
+            Some(g) => match f(&g) {
+                Some(res) => out.append_value(basin_geo::encode_wkb(&res.geometry)),
+                None => out.append_null(),
+            },
+            None => out.append_null(),
+        }
+    }
+    Ok(ColumnarValue::Array(Arc::new(out.finish())))
+}
+
+macro_rules! simple_udf {
+    ($ty:ident, $name:literal, $ret:expr, $sig:expr, $body:expr) => {
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct $ty {
+            signature: Signature,
+        }
+        impl ScalarUDFImpl for $ty {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn name(&self) -> &str {
+                $name
+            }
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+            fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+                Ok($ret)
+            }
+            fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+                let f: fn(&ScalarFunctionArgs) -> DFResult<ColumnarValue> = $body;
+                f(&args)
+            }
+        }
+    };
+}
+
+// ── Constructors (general WKB) ──────────────────────────────────────────────
+
+simple_udf!(
+    GeomFromTextUdf,
+    "st_geomfromtext",
+    geom_dt(),
+    geom_text_input_sig(),
+    |args| {
+        let (n, arr) = columnar_unary_to_array(&args.args)?;
+        let mut out = BinaryBuilder::new();
+        for i in 0..n {
+            match str_at(&arr, i)? {
+                None => out.append_null(),
+                Some(s) => {
+                    let g = basin_geo::decode_wkt(&s).map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "ST_GeomFromText: {e}"
+                        ))
+                    })?;
+                    out.append_value(basin_geo::encode_wkb(&g));
+                }
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+);
+
+simple_udf!(
+    GeomFromGeoJsonUdf,
+    "st_geomfromgeojson",
+    geom_dt(),
+    geom_text_input_sig(),
+    |args| {
+        let (n, arr) = columnar_unary_to_array(&args.args)?;
+        let mut out = BinaryBuilder::new();
+        for i in 0..n {
+            match str_at(&arr, i)? {
+                None => out.append_null(),
+                Some(s) => {
+                    let g = basin_geo::decode_geojson(&s).map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "ST_GeomFromGeoJSON: {e}"
+                        ))
+                    })?;
+                    out.append_value(basin_geo::encode_wkb(&g));
+                }
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+);
+
+simple_udf!(
+    GeomFromWkbGeneralUdf,
+    "st_geomfromwkb",
+    geom_dt(),
+    bytea_input_sig(),
+    |args| {
+        let (n, arr) = columnar_unary_to_array(&args.args)?;
+        let mut out = BinaryBuilder::new();
+        for i in 0..n {
+            match point_bytes_at(&arr, i)? {
+                None => out.append_null(),
+                Some(bytes) => {
+                    // Validate + canonicalise to plain WKB (strips any EWKB SRID).
+                    let g = basin_geo::decode_any(bytes).map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "ST_GeomFromWKB: invalid WKB: {e}"
+                        ))
+                    })?;
+                    out.append_value(basin_geo::encode_wkb(&g.geometry));
+                }
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+);
+
+// ── Output codecs ───────────────────────────────────────────────────────────
+
+simple_udf!(
+    AsTextGeneralUdf,
+    "st_astext",
+    DataType::Utf8,
+    geom_unary_sig(),
+    |args| {
+        let (n, arr) = columnar_unary_to_array(&args.args)?;
+        let mut out = StringBuilder::new();
+        for i in 0..n {
+            match decode_geom_at(&arr, i)? {
+                Some(g) => out.append_value(basin_geo::encode_wkt(&g.geometry)),
+                None => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+);
+
+simple_udf!(
+    AsGeoJsonGeneralUdf,
+    "st_asgeojson",
+    DataType::Utf8,
+    geom_unary_sig(),
+    |args| {
+        let (n, arr) = columnar_unary_to_array(&args.args)?;
+        let mut out = StringBuilder::new();
+        for i in 0..n {
+            match decode_geom_at(&arr, i)? {
+                Some(g) => out.append_value(basin_geo::encode_geojson(&g.geometry)),
+                None => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+);
+
+simple_udf!(
+    AsEwkbGeneralUdf,
+    "st_asewkb",
+    DataType::Binary,
+    geom_unary_sig(),
+    |args| {
+        // Emit EWKB with the geometry's recovered SRID (defaults to 4326).
+        let (n, arr) = columnar_unary_to_array(&args.args)?;
+        let mut out = BinaryBuilder::new();
+        for i in 0..n {
+            match decode_geom_at(&arr, i)? {
+                Some(g) => out.append_value(basin_geo::encode_ewkb(&g.geometry, g.srid)),
+                None => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+);
+
+// ── Type + accessors ────────────────────────────────────────────────────────
+
+simple_udf!(
+    GeometryTypeUdf,
+    "st_geometrytype",
+    DataType::Utf8,
+    geom_unary_sig(),
+    |args| {
+        let (n, arr) = columnar_unary_to_array(&args.args)?;
+        let mut out = StringBuilder::new();
+        for i in 0..n {
+            match decode_geom_at(&arr, i)? {
+                Some(g) => out.append_value(basin_geo::geometry_type_name(&g.geometry)),
+                None => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+);
+
+simple_udf!(
+    NPointsUdf,
+    "st_npoints",
+    DataType::Int32,
+    geom_unary_sig(),
+    |args| {
+        let (n, arr) = columnar_unary_to_array(&args.args)?;
+        let mut out = Int32Builder::with_capacity(n);
+        for i in 0..n {
+            match decode_geom_at(&arr, i)? {
+                Some(g) => out.append_value(count_vertices(&g.geometry) as i32),
+                None => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+);
+
+simple_udf!(
+    NumGeometriesUdf,
+    "st_numgeometries",
+    DataType::Int32,
+    geom_unary_sig(),
+    |args| {
+        let (n, arr) = columnar_unary_to_array(&args.args)?;
+        let mut out = Int32Builder::with_capacity(n);
+        for i in 0..n {
+            match decode_geom_at(&arr, i)? {
+                Some(g) => out.append_value(num_geometries(&g.geometry)),
+                None => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+);
+
+// ── Measures: planar (default) ──────────────────────────────────────────────
+
+simple_udf!(LengthGeneralUdf, "st_length", DataType::Float64, geom_unary_sig(), |args| {
+    geom_unary_f64(args, |g| basin_geo::measures::length_planar(&g.geometry))
+});
+simple_udf!(AreaGeneralUdf, "st_area", DataType::Float64, geom_unary_sig(), |args| {
+    geom_unary_f64(args, |g| basin_geo::measures::area_planar(&g.geometry))
+});
+simple_udf!(PerimeterGeneralUdf, "st_perimeter", DataType::Float64, geom_unary_sig(), |args| {
+    geom_unary_f64(args, |g| basin_geo::measures::perimeter_planar(&g.geometry))
+});
+
+// ── Measures: geographic (WGS84 metres / m²) ────────────────────────────────
+
+simple_udf!(LengthGeogUdf, "st_lengthgeog", DataType::Float64, geom_unary_sig(), |args| {
+    geom_unary_f64(args, |g| basin_geo::measures::length_geographic(&g.geometry))
+});
+simple_udf!(AreaGeogUdf, "st_areageog", DataType::Float64, geom_unary_sig(), |args| {
+    geom_unary_f64(args, |g| basin_geo::measures::area_geographic(&g.geometry))
+});
+simple_udf!(PerimeterGeogUdf, "st_perimetergeog", DataType::Float64, geom_unary_sig(), |args| {
+    geom_unary_f64(args, |g| basin_geo::measures::perimeter_geographic(&g.geometry))
+});
+
+// ── Centroid / Envelope (real, planar) ──────────────────────────────────────
+
+simple_udf!(CentroidGeneralUdf, "st_centroid", geom_dt(), geom_unary_sig(), |args| {
+    geom_unary_geom(args, |g| {
+        basin_geo::measures::centroid(&g.geometry).map(|p| {
+            basin_geo::Geom::with_srid(geo::geometry::Geometry::Point(p), g.srid)
+        })
+    })
+});
+
+simple_udf!(EnvelopeGeneralUdf, "st_envelope", geom_dt(), geom_unary_sig(), |args| {
+    geom_unary_geom(args, |g| {
+        // PostGIS ST_Envelope(POINT) returns the POINT itself (degenerate
+        // bbox). Basin pins this; preserve it. For all other types return the
+        // bbox POLYGON.
+        if matches!(g.geometry, geo::geometry::Geometry::Point(_)) {
+            return Some(g.clone());
+        }
+        basin_geo::measures::envelope(&g.geometry).map(|(minx, miny, maxx, maxy)| {
+            // PostGIS ST_Envelope returns a POLYGON (the bbox ring); for a
+            // degenerate bbox (horizontal/vertical line) PostGIS returns a
+            // LINESTRING, but a closed ring is always valid output and round-
+            // trips through ST_AsText. We emit the rectangle polygon.
+            let ext = geo::geometry::LineString::new(vec![
+                geo::geometry::Coord { x: minx, y: miny },
+                geo::geometry::Coord { x: maxx, y: miny },
+                geo::geometry::Coord { x: maxx, y: maxy },
+                geo::geometry::Coord { x: minx, y: maxy },
+                geo::geometry::Coord { x: minx, y: miny },
+            ]);
+            let poly = geo::geometry::Polygon::new(ext, vec![]);
+            basin_geo::Geom::with_srid(geo::geometry::Geometry::Polygon(poly), g.srid)
+        })
+    })
+});
+
+// ── Component accessors (PointN / StartPoint / EndPoint / ExteriorRing / GeometryN)
+
+simple_udf!(
+    PointNGeneralUdf,
+    "st_pointn",
+    geom_dt(),
+    point_with_extra_sig(&[DataType::Int32]),
+    |args| {
+        let (n, geom_arr, idx_arr) = columnar_pair_to_arrays(&args.args)?;
+        let idx_col = idx_arr.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(
+                "ST_PointN: second argument must be INT32".into(),
+            )
+        })?;
+        let mut out = BinaryBuilder::new();
+        for i in 0..n {
+            if idx_col.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            match decode_geom_at(&geom_arr, i)? {
+                Some(g) => match nth_point(&g.geometry, idx_col.value(i)) {
+                    Some(p) => out.append_value(basin_geo::encode_wkb(
+                        &geo::geometry::Geometry::Point(p),
+                    )),
+                    None => out.append_null(),
+                },
+                None => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+);
+
+simple_udf!(StartPointGeneralUdf, "st_startpoint", geom_dt(), geom_unary_sig(), |args| {
+    geom_unary_geom(args, |g| {
+        endpoint(&g.geometry, true).map(|p| {
+            basin_geo::Geom::with_srid(geo::geometry::Geometry::Point(p), g.srid)
+        })
+    })
+});
+simple_udf!(EndPointGeneralUdf, "st_endpoint", geom_dt(), geom_unary_sig(), |args| {
+    geom_unary_geom(args, |g| {
+        endpoint(&g.geometry, false).map(|p| {
+            basin_geo::Geom::with_srid(geo::geometry::Geometry::Point(p), g.srid)
+        })
+    })
+});
+
+simple_udf!(ExteriorRingUdf, "st_exteriorring", geom_dt(), geom_unary_sig(), |args| {
+    geom_unary_geom(args, |g| match &g.geometry {
+        geo::geometry::Geometry::Polygon(p) => Some(basin_geo::Geom::with_srid(
+            geo::geometry::Geometry::LineString(p.exterior().clone()),
+            g.srid,
+        )),
+        // PostGIS returns NULL for non-polygon ST_ExteriorRing.
+        _ => None,
+    })
+});
+
+simple_udf!(
+    GeometryNUdf,
+    "st_geometryn",
+    geom_dt(),
+    point_with_extra_sig(&[DataType::Int32]),
+    |args| {
+        let (n, geom_arr, idx_arr) = columnar_pair_to_arrays(&args.args)?;
+        let idx_col = idx_arr.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(
+                "ST_GeometryN: second argument must be INT32".into(),
+            )
+        })?;
+        let mut out = BinaryBuilder::new();
+        for i in 0..n {
+            if idx_col.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            match decode_geom_at(&geom_arr, i)? {
+                Some(g) => match nth_geometry(&g.geometry, idx_col.value(i)) {
+                    Some(member) => out.append_value(basin_geo::encode_wkb(&member)),
+                    None => out.append_null(),
+                },
+                None => out.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+);
+
+// ── Predicates (exact planar) ───────────────────────────────────────────────
+
+fn geom_binary_bool<F>(args: &ScalarFunctionArgs, f: F) -> DFResult<ColumnarValue>
+where
+    F: Fn(&basin_geo::Geom, &basin_geo::Geom) -> bool,
+{
+    let (n, a, b) = columnar_pair_to_arrays(&args.args)?;
+    let mut out = BooleanBuilder::with_capacity(n);
+    for i in 0..n {
+        match (decode_geom_at(&a, i)?, decode_geom_at(&b, i)?) {
+            (Some(ga), Some(gb)) => out.append_value(f(&ga, &gb)),
+            _ => out.append_null(),
+        }
+    }
+    Ok(ColumnarValue::Array(Arc::new(out.finish())))
+}
+
+simple_udf!(IntersectsGeneralUdf, "st_intersects", DataType::Boolean, geom_binary_sig(), |args| {
+    geom_binary_bool(args, |a, b| basin_geo::measures::intersects(&a.geometry, &b.geometry))
+});
+simple_udf!(ContainsGeneralUdf, "st_contains", DataType::Boolean, geom_binary_sig(), |args| {
+    geom_binary_bool(args, |a, b| basin_geo::measures::contains(&a.geometry, &b.geometry))
+});
+simple_udf!(WithinGeneralUdf, "st_within", DataType::Boolean, geom_binary_sig(), |args| {
+    geom_binary_bool(args, |a, b| basin_geo::measures::within(&a.geometry, &b.geometry))
+});
+
+// ── shared free helpers used by the general UDFs ────────────────────────────
+
+fn count_vertices(g: &geo::geometry::Geometry<f64>) -> usize {
+    use geo::geometry::Geometry as G;
+    match g {
+        G::Point(_) => 1,
+        G::Line(_) => 2,
+        G::LineString(ls) => ls.0.len(),
+        G::Polygon(p) => p.exterior().0.len() + p.interiors().iter().map(|r| r.0.len()).sum::<usize>(),
+        G::Rect(_) => 5,
+        G::Triangle(_) => 4,
+        G::MultiPoint(mp) => mp.0.len(),
+        G::MultiLineString(ml) => ml.0.iter().map(|ls| ls.0.len()).sum(),
+        G::MultiPolygon(mp) => mp
+            .0
+            .iter()
+            .map(|p| p.exterior().0.len() + p.interiors().iter().map(|r| r.0.len()).sum::<usize>())
+            .sum(),
+        G::GeometryCollection(gc) => gc.0.iter().map(count_vertices).sum(),
+    }
+}
+
+fn num_geometries(g: &geo::geometry::Geometry<f64>) -> i32 {
+    use geo::geometry::Geometry as G;
+    match g {
+        G::MultiPoint(mp) => mp.0.len() as i32,
+        G::MultiLineString(ml) => ml.0.len() as i32,
+        G::MultiPolygon(mp) => mp.0.len() as i32,
+        G::GeometryCollection(gc) => gc.0.len() as i32,
+        // Single geometries report 1 (PostGIS ST_NumGeometries).
+        _ => 1,
+    }
+}
+
+/// 1-based vertex access for LINESTRING (PostGIS `ST_PointN`); NULL otherwise.
+fn nth_point(g: &geo::geometry::Geometry<f64>, n: i32) -> Option<geo::geometry::Point<f64>> {
+    use geo::geometry::Geometry as G;
+    if n < 1 {
+        return None;
+    }
+    let idx = (n - 1) as usize;
+    match g {
+        G::LineString(ls) => ls.0.get(idx).map(|c| geo::geometry::Point(*c)),
+        G::Line(l) => match idx {
+            0 => Some(geo::geometry::Point(l.start)),
+            1 => Some(geo::geometry::Point(l.end)),
+            _ => None,
+        },
+        // PostGIS ST_PointN(point, 1) returns the point; other n → NULL.
+        G::Point(p) if idx == 0 => Some(*p),
+        _ => None,
+    }
+}
+
+/// First / last vertex of a (multi)linestring (PostGIS `ST_StartPoint`/`ST_EndPoint`).
+fn endpoint(g: &geo::geometry::Geometry<f64>, start: bool) -> Option<geo::geometry::Point<f64>> {
+    use geo::geometry::Geometry as G;
+    let ls = match g {
+        G::LineString(ls) => ls.0.as_slice(),
+        G::Line(l) => return Some(geo::geometry::Point(if start { l.start } else { l.end })),
+        // Basin pins ST_StartPoint/ST_EndPoint(POINT) == identity; preserve it
+        // (PostGIS proper returns NULL, but the v0.1 conformance pin is identity).
+        G::Point(p) => return Some(*p),
+        _ => return None,
+    };
+    if start {
+        ls.first().map(|c| geo::geometry::Point(*c))
+    } else {
+        ls.last().map(|c| geo::geometry::Point(*c))
+    }
+}
+
+/// 1-based member access for multipart geometries (PostGIS `ST_GeometryN`).
+fn nth_geometry(
+    g: &geo::geometry::Geometry<f64>,
+    n: i32,
+) -> Option<geo::geometry::Geometry<f64>> {
+    use geo::geometry::Geometry as G;
+    if n < 1 {
+        return None;
+    }
+    let idx = (n - 1) as usize;
+    match g {
+        G::MultiPoint(mp) => mp.0.get(idx).map(|p| G::Point(*p)),
+        G::MultiLineString(ml) => ml.0.get(idx).map(|ls| G::LineString(ls.clone())),
+        G::MultiPolygon(mp) => mp.0.get(idx).map(|p| G::Polygon(p.clone())),
+        G::GeometryCollection(gc) => gc.0.get(idx).cloned(),
+        // Single geometry: ST_GeometryN(g, 1) == g.
+        single if idx == 0 => Some(single.clone()),
+        _ => None,
+    }
+}
+
+/// Signature accepting a single text argument (`Utf8`/`LargeUtf8`).
+fn geom_text_input_sig() -> Signature {
+    Signature::one_of(
+        vec![
+            TypeSignature::Exact(vec![DataType::Utf8]),
+            TypeSignature::Exact(vec![DataType::LargeUtf8]),
+        ],
+        Volatility::Immutable,
+    )
+}
+
+/// Signature accepting a single bytea argument (any binary-family type).
+fn bytea_input_sig() -> Signature {
+    point_unary_sig()
+}
+
+/// Register the general-geometry UDFs. Called from [`install_udfs`].
+fn install_general_geom_udfs(ctx: &SessionContext) {
+    ctx.register_udf(ScalarUDF::from(GeomFromTextUdf { signature: geom_text_input_sig() }));
+    ctx.register_udf(ScalarUDF::from(GeomFromGeoJsonUdf { signature: geom_text_input_sig() }));
+    ctx.register_udf(ScalarUDF::from(GeomFromWkbGeneralUdf { signature: bytea_input_sig() }));
+    ctx.register_udf(ScalarUDF::from(AsTextGeneralUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(AsGeoJsonGeneralUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(AsEwkbGeneralUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(GeometryTypeUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(NPointsUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(NumGeometriesUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(LengthGeneralUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(AreaGeneralUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(PerimeterGeneralUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(LengthGeogUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(AreaGeogUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(PerimeterGeogUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(CentroidGeneralUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(EnvelopeGeneralUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(PointNGeneralUdf {
+        signature: point_with_extra_sig(&[DataType::Int32]),
+    }));
+    ctx.register_udf(ScalarUDF::from(StartPointGeneralUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(EndPointGeneralUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(ExteriorRingUdf { signature: geom_unary_sig() }));
+    ctx.register_udf(ScalarUDF::from(GeometryNUdf {
+        signature: point_with_extra_sig(&[DataType::Int32]),
+    }));
+    ctx.register_udf(ScalarUDF::from(IntersectsGeneralUdf { signature: geom_binary_sig() }));
+    ctx.register_udf(ScalarUDF::from(ContainsGeneralUdf { signature: geom_binary_sig() }));
+    ctx.register_udf(ScalarUDF::from(WithinGeneralUdf { signature: geom_binary_sig() }));
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
