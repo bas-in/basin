@@ -179,6 +179,13 @@ pub struct BoundStatement {
     /// `sql`. `None`, or an execute-time decline, falls through to the
     /// `fast_ast` / text routes above unchanged.
     pub(crate) bind_direct: Option<(Arc<crate::executor::BindInsertPlan>, Vec<ScalarParam>)>,
+    /// Bind-direct point-SELECT fast path: the prepare-time point plan plus the
+    /// decoded bind values, carried through so `execute_bound` can rebuild the
+    /// point `SimpleSelectPlan` directly
+    /// (`executor::try_point_select_bind_direct`) without touching `fast_ast`
+    /// or `sql`. `None`, or an execute-time decline, falls through to the
+    /// `fast_ast` / text routes above unchanged.
+    pub(crate) bind_point: Option<(Arc<crate::executor::BindPointPlan>, Vec<ScalarParam>)>,
 }
 
 impl BoundStatement {
@@ -203,6 +210,7 @@ impl BoundStatement {
             sql,
             fast_ast: None,
             bind_direct: None,
+            bind_point: None,
         }
     }
 }
@@ -240,6 +248,13 @@ struct PreparedEntry {
     /// (`executor::try_insert_bind_direct`); the AST/text routes remain the
     /// fallback when the execute-time gates decline.
     bind_plan: Option<Arc<crate::executor::BindInsertPlan>>,
+    /// Bind-direct parameterized point-SELECT plan, precomputed by
+    /// [`build_bind_point_plan`] when the template is an AST-fast-eligible
+    /// `SELECT <cols> FROM t WHERE <pk> = $N`. `Some` lets `execute_bound`
+    /// rebuild the point `SimpleSelectPlan` straight from the decoded PK bind
+    /// value (`executor::try_point_select_bind_direct`); the AST/text routes
+    /// remain the fallback when the execute-time gates decline.
+    bind_point: Option<Arc<crate::executor::BindPointPlan>>,
 }
 
 impl PreparedRegistry {
@@ -353,8 +368,8 @@ pub(crate) async fn prepare(
     // values, skipping AST substitution and the whole AST→rows→batch
     // pipeline. The AST stays cached as the fallback for when the bind-direct
     // execute-time gates decline (open transaction, schema drift, …).
-    let (ast, ast_fast_ok, bind_plan) = if literal_fast {
-        (None, false, None)
+    let (ast, ast_fast_ok, bind_plan, bind_point) = if literal_fast {
+        (None, false, None, None)
     } else {
         let dialect = PostgreSqlDialect {};
         let ast: Option<Arc<Statement>> = match Parser::parse_sql(&dialect, sql) {
@@ -373,7 +388,18 @@ pub(crate) async fn prepare(
         } else {
             None
         };
-        (ast, ast_fast_ok, bind_plan)
+        // Bind-direct point SELECT (perf-w-pointops): an AST-fast-eligible
+        // parameterized `SELECT … WHERE pk = $N` additionally gets a point
+        // plan so each Execute rebuilds the point read straight from the
+        // decoded PK value, skipping the per-Execute re-parse + matcher ladder.
+        let bind_point = if ast_fast_ok && placeholder_count > 0 {
+            ast.as_deref()
+                .and_then(|s| build_bind_point_plan(s, placeholder_count))
+                .map(Arc::new)
+        } else {
+            None
+        };
+        (ast, ast_fast_ok, bind_plan, bind_point)
     };
 
     let handle = StatementHandle::new();
@@ -384,6 +410,7 @@ pub(crate) async fn prepare(
         ast,
         ast_fast_ok,
         bind_plan,
+        bind_point,
     };
     sess.state
         .prepared
@@ -481,6 +508,186 @@ fn build_bind_insert_plan(
         columns,
         rows,
     })
+}
+
+/// Precompute the bind-direct point-SELECT plan (extended-protocol shape) for
+/// a template of the form `SELECT <cols> FROM t WHERE <pk> = $N`. Returns
+/// `None` for any other shape; those keep the AST / text bind routes.
+///
+/// Strategy (so the engagement set is provably a SUBSET of the normal
+/// simple-SELECT fast path): locate the single `<ident> = $N` WHERE atom to
+/// learn `pk_col` + `pk_param_idx`, then replace that `$N` placeholder node
+/// with a representative integer literal and run the REAL recogniser
+/// (`fast_select::match_simple_select`) on the resulting fully-literal clone.
+/// We accept ONLY when the recogniser returns a pure single-Eq point read:
+/// exactly one `Eq` predicate on `pk_col`, no aggregates / IN-list / IS NULL /
+/// ORDER BY / OFFSET / LIMIT / top-k, not `always_empty`, and an all-`Column`
+/// (or wildcard) projection. The matched `projection` / `read_cols` are
+/// captured verbatim, so the per-Execute rebuild is byte-identical to what the
+/// text/AST route would have produced for the same statement.
+///
+/// Everything schema-dependent (PK-ness, RLS, soft-delete, citext, column
+/// existence) is deliberately NOT checked here — the table can change between
+/// Parse and Execute, so those gates re-run per Execute in
+/// `executor::try_point_select_bind_direct`.
+fn build_bind_point_plan(
+    stmt: &Statement,
+    placeholder_count: usize,
+) -> Option<crate::executor::BindPointPlan> {
+    // Must be a single-statement Query.
+    let query = match stmt {
+        Statement::Query(q) => q.as_ref(),
+        _ => return None,
+    };
+    // Reach the SELECT body and its WHERE clause.
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s.as_ref(),
+        _ => return None,
+    };
+    // Exactly one FROM table (a bare table reference, no joins). The full
+    // table-shape validation is delegated to `match_simple_select`; here we
+    // only need the WHERE clause to find the `$N`.
+    let selection = select.selection.as_ref()?;
+    // The WHERE must be a single `<ident> = $N` (or `$N = <ident>`) atom.
+    let (pk_col, pk_param_idx) = match selection {
+        Expr::BinaryOp {
+            op: BinaryOperator::Eq,
+            left,
+            right,
+        } => {
+            // Identifier on one side, bare placeholder on the other.
+            if let (Expr::Identifier(id), Some(n)) = (left.as_ref(), placeholder_index(right)) {
+                (id.value.clone(), n)
+            } else if let (Some(n), Expr::Identifier(id)) =
+                (placeholder_index(left), right.as_ref())
+            {
+                (id.value.clone(), n)
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    if pk_col_is_quoted(select, &pk_col) {
+        // Quoted identifiers carry case semantics the fast paths don't
+        // replicate — leave to the AST/text route.
+        return None;
+    }
+    if pk_param_idx == 0 || pk_param_idx > placeholder_count {
+        return None;
+    }
+
+    // Replace the `$N` placeholder with a representative integer literal so the
+    // real recogniser can validate the full statement shape and derive the
+    // projection / read_cols exactly as the text route would.
+    let mut probe = stmt.clone();
+    if !substitute_single_placeholder_with_zero(&mut probe) {
+        return None;
+    }
+    let matched = crate::fast_select::match_simple_select(&probe)?;
+    // Accept only the pure single-Eq point shape. Anything richer (aggregate,
+    // IN-list, IS NULL, ORDER BY/LIMIT/OFFSET, top-k, multi-predicate,
+    // always-empty) is NOT a point read and stays on the existing routes.
+    if matched.aggregates.is_some()
+        || !matched.in_list_preds.is_empty()
+        || !matched.is_null_cols.is_empty()
+        || matched.order_by.is_some()
+        || matched.offset.is_some()
+        || matched.limit.is_some()
+        || matched.topk_late.is_some()
+        || matched.always_empty
+        || matched.predicates.len() != 1
+    {
+        return None;
+    }
+    // The single predicate must be an Eq on our pk_col.
+    match &matched.predicates[0] {
+        basin_storage::Predicate::Eq(c, _) if c == &pk_col => {}
+        _ => return None,
+    }
+    // Projection must be all-column (or wildcard) — computed items decline.
+    if let Some(items) = &matched.projection {
+        if items
+            .iter()
+            .any(|it| !matches!(it, crate::fast_select::ProjectionItem::Column(_)))
+        {
+            return None;
+        }
+    }
+
+    Some(crate::executor::BindPointPlan {
+        table: matched.table,
+        projection: matched.projection,
+        read_cols: matched.read_cols,
+        pk_col,
+        pk_param_idx: pk_param_idx - 1,
+    })
+}
+
+/// `true` when the SELECT references `pk_col` via a DOUBLE-QUOTED identifier
+/// anywhere in the WHERE or projection. The fast paths use case-insensitive
+/// name mapping; a quoted identifier must keep its exact-case semantics, so we
+/// leave those statements to the AST/text route. Conservative: a false
+/// positive only declines the fast path.
+fn pk_col_is_quoted(select: &sqlparser::ast::Select, _pk_col: &str) -> bool {
+    // sqlparser preserves quoting on `Ident::quote_style`. Walk the projection
+    // and WHERE for any quoted identifier; if present we decline.
+    fn expr_has_quoted_ident(e: &Expr) -> bool {
+        match e {
+            Expr::Identifier(id) => id.quote_style.is_some(),
+            Expr::CompoundIdentifier(ids) => ids.iter().any(|id| id.quote_style.is_some()),
+            Expr::BinaryOp { left, right, .. } => {
+                expr_has_quoted_ident(left) || expr_has_quoted_ident(right)
+            }
+            _ => false,
+        }
+    }
+    if let Some(sel) = &select.selection {
+        if expr_has_quoted_ident(sel) {
+            return true;
+        }
+    }
+    for item in &select.projection {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+            if expr_has_quoted_ident(e) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Replace the FIRST `$N` placeholder found anywhere in the statement's WHERE
+/// clause with the integer literal `0`, in place. Returns `true` on success.
+/// Used only by `build_bind_point_plan` to hand a fully-literal clone to the
+/// recogniser. Narrow on purpose: it descends only into the single SELECT's
+/// WHERE `BinaryOp` (the shape `build_bind_point_plan` already validated).
+fn substitute_single_placeholder_with_zero(stmt: &mut Statement) -> bool {
+    let Statement::Query(q) = stmt else {
+        return false;
+    };
+    let SetExpr::Select(select) = q.body.as_mut() else {
+        return false;
+    };
+    let Some(sel) = select.selection.as_mut() else {
+        return false;
+    };
+    let Expr::BinaryOp { left, right, .. } = sel else {
+        return false;
+    };
+    let zero = Expr::Value(ValueWithSpan {
+        value: Value::Number("0".to_string(), false),
+        span: sqlparser::tokenizer::Span::empty(),
+    });
+    if placeholder_index(left).is_some() {
+        **left = zero;
+        true
+    } else if placeholder_index(right).is_some() {
+        **right = zero;
+        true
+    } else {
+        false
+    }
 }
 
 /// Best-effort placeholder type inference. Walks the parsed SQL looking for
@@ -1604,16 +1811,20 @@ pub(crate) async fn bind(
     // and (when eligible) the substituted AST are still produced above — they
     // are the fallback when the execute-time gates decline (open transaction,
     // schema drift, unsupported param/column shape).
-    let bind_direct = entry
-        .bind_plan
-        .as_ref()
-        .map(|plan| (Arc::clone(plan), params));
+    // INSERT and point-SELECT plans are mutually exclusive by statement kind,
+    // so at most one of these is `Some`. Route `params` into whichever applies.
+    let (bind_direct, bind_point) = match (entry.bind_plan.as_ref(), entry.bind_point.as_ref()) {
+        (Some(plan), _) => (Some((Arc::clone(plan), params)), None),
+        (None, Some(plan)) => (None, Some((Arc::clone(plan), params))),
+        (None, None) => (None, None),
+    };
 
     Ok(BoundStatement {
         handle: *handle,
         sql,
         fast_ast,
         bind_direct,
+        bind_point,
     })
 }
 
@@ -1626,6 +1837,17 @@ pub(crate) async fn execute_bound(
     // which reproduce every behaviour (in-tx buffering, canonical errors, …).
     if let Some((plan, params)) = bound.bind_direct.as_ref() {
         if let Some(result) = crate::executor::try_insert_bind_direct(sess, plan, params).await {
+            return result;
+        }
+    }
+    // Bind-direct point SELECT: rebuild the point read straight from the
+    // decoded PK bind value, skipping the per-Execute re-parse + matcher
+    // ladder. A `None` decline falls through to the AST / text routes, which
+    // reproduce every behaviour (in-tx pins, RLS, soft-delete, …).
+    if let Some((plan, params)) = bound.bind_point.as_ref() {
+        if let Some(result) =
+            crate::executor::try_point_select_bind_direct(sess, plan, params).await
+        {
             return result;
         }
     }

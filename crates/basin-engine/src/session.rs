@@ -750,6 +750,16 @@ pub(crate) struct SessionState {
     /// `load_table` clone. Epoch+TTL validated; cleared in lockstep with
     /// `provider_cache`. See [`HeadProbeCache`].
     pub(crate) head_probe_cache: HeadProbeCache,
+    /// Per-session cache of the two project-scoped catalog flags the hot-tier
+    /// UPDATE/DELETE fast path consults PER STATEMENT — whether any child table
+    /// references this table by FK (`fks_referencing`) and whether a per-table
+    /// UPDATE reactor is registered (`list_reactors`). Both were uncached
+    /// awaited catalog round-trips on every single-row UPDATE
+    /// (~120µs/statement on the warm OLTP loop). Epoch+TTL validated exactly
+    /// like [`HeadProbeCache`]: any catalog mutation (FK DDL, reactor
+    /// register/drop, or any other epoch bump) invalidates the entry. See
+    /// [`DmlFlagsCache`].
+    pub(crate) dml_flags_cache: DmlFlagsCache,
 }
 
 /// Multi-region read-staleness tier (`basin.read_tier`). `Primary` is the
@@ -871,6 +881,7 @@ impl SessionState {
             table_meta_cache: TableMetaCache::new(),
             provider_cache: ProviderCache::new(),
             head_probe_cache: HeadProbeCache::new(),
+            dml_flags_cache: DmlFlagsCache::new(),
         }
     }
 
@@ -911,6 +922,7 @@ impl SessionState {
             table_meta_cache: TableMetaCache::new(),
             provider_cache: ProviderCache::new(),
             head_probe_cache: HeadProbeCache::new(),
+            dml_flags_cache: DmlFlagsCache::new(),
         }
     }
 
@@ -1434,6 +1446,117 @@ impl HeadProbeCache {
             .expect("head_probe_cache lock poisoned")
             .pop(table);
     }
+}
+
+/// The two project-scoped catalog flags the hot-tier UPDATE/DELETE fast path
+/// consults per statement. `false`/`false` is the common OLTP case (no FK
+/// children, no UPDATE reactor) that admits the overlay write.
+#[derive(Clone, Copy)]
+pub(crate) struct DmlFlags {
+    /// `true` when at least one child table references this table by FK (so an
+    /// UPDATE/DELETE could need ON UPDATE/DELETE cascade handling) — the fast
+    /// path declines.
+    pub(crate) has_referencing_fk: bool,
+    /// `true` when a per-table UPDATE reactor is registered for this table (it
+    /// needs before/after row images the overlay write doesn't gather) — the
+    /// fast path declines.
+    pub(crate) has_update_reactor: bool,
+}
+
+struct DmlFlagsEntry {
+    flags: DmlFlags,
+    inserted_at: Instant,
+    catalog_epoch: u64,
+}
+
+/// Per-session cache of [`DmlFlags`] keyed by table + catalog epoch. Validated
+/// exactly like [`HeadProbeCache`]: any catalog mutation bumps the epoch and
+/// forces a refetch, and a TTL bounds the epoch-0 (Postgres/Rest) backends.
+/// Replaces the two uncached awaited round-trips (`fks_referencing` +
+/// `list_reactors`) that ran on every fast-path UPDATE/DELETE.
+pub(crate) struct DmlFlagsCache {
+    inner: std::sync::Mutex<lru::LruCache<TableName, DmlFlagsEntry>>,
+}
+
+impl DmlFlagsCache {
+    pub(crate) fn new() -> Self {
+        let cap = NonZeroUsize::new(PROVIDER_CACHE_CAP).expect("cap is non-zero");
+        Self {
+            inner: std::sync::Mutex::new(lru::LruCache::new(cap)),
+        }
+    }
+
+    pub(crate) fn get_fresh(&self, table: &TableName, catalog_epoch: u64) -> Option<DmlFlags> {
+        let ttl = table_meta_cache_ttl();
+        let mut g = self.inner.lock().expect("dml_flags_cache lock poisoned");
+        let entry = g.get(table)?;
+        let epoch_ok = if catalog_epoch == 0 {
+            true
+        } else {
+            entry.catalog_epoch == catalog_epoch
+        };
+        if epoch_ok && entry.inserted_at.elapsed() <= ttl {
+            Some(entry.flags)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn insert(&self, table: TableName, flags: DmlFlags, catalog_epoch: u64) {
+        self.inner.lock().expect("dml_flags_cache lock poisoned").put(
+            table,
+            DmlFlagsEntry {
+                flags,
+                inserted_at: Instant::now(),
+                catalog_epoch,
+            },
+        );
+    }
+
+    pub(crate) fn invalidate_all(&self) {
+        self.inner
+            .lock()
+            .expect("dml_flags_cache lock poisoned")
+            .clear();
+    }
+
+    pub(crate) fn invalidate(&self, table: &TableName) {
+        self.inner
+            .lock()
+            .expect("dml_flags_cache lock poisoned")
+            .pop(table);
+    }
+}
+
+/// Return the cached [`DmlFlags`] for `table` if epoch-fresh; otherwise issue
+/// the `fks_referencing` + `list_reactors` catalog calls, cache the result, and
+/// return it. The single helper both fast-path UPDATE and DELETE use so the two
+/// round-trips collapse to one warm `Mutex` lock on the steady-state OLTP loop.
+pub(crate) async fn load_dml_flags_cached(
+    sess: &crate::ProjectSession,
+    table: &TableName,
+) -> Result<DmlFlags> {
+    let catalog = &sess.engine.config().catalog;
+    let current_epoch = catalog.epoch();
+    if let Some(flags) = sess.state.dml_flags_cache.get_fresh(table, current_epoch) {
+        return Ok(flags);
+    }
+    let referencing =
+        crate::constraints::fks_referencing(catalog, &sess.project, table.as_str()).await?;
+    let reactors = catalog.list_reactors(&sess.project).await;
+    let has_update_reactor = reactors.iter().any(|r| {
+        r.table.as_str().eq_ignore_ascii_case(table.as_str())
+            && r.ops.contains(basin_catalog::ReactorOps::UPDATE)
+    });
+    let flags = DmlFlags {
+        has_referencing_fk: !referencing.is_empty(),
+        has_update_reactor,
+    };
+    let fill_epoch = catalog.epoch();
+    sess.state
+        .dml_flags_cache
+        .insert(table.clone(), flags, fill_epoch);
+    Ok(flags)
 }
 
 /// One-shot helper: return the cached `(TableMetadata, view_present)` for
@@ -6424,5 +6547,36 @@ mod tests {
         let p = target_partitions_for_bulk_scan(10_000);
         assert!(p <= cap, "must not exceed cpu cap ({cap}), got {p}");
         assert!(p >= 1, "must return at least 1");
+    }
+
+    // perf-w-pointops: the DML-flags cache (FK/reactor presence) is the hot
+    // path's per-statement catalog-round-trip elimination. A non-zero epoch
+    // hit serves the cached flags; an epoch bump misses and refetches.
+    #[test]
+    fn dml_flags_cache_epoch_validated() {
+        let cache = DmlFlagsCache::new();
+        let t = TableName::new("orders").unwrap();
+        let flags = DmlFlags {
+            has_referencing_fk: false,
+            has_update_reactor: false,
+        };
+        // Empty → miss.
+        assert!(cache.get_fresh(&t, 7).is_none());
+        cache.insert(t.clone(), flags, 7);
+        // Same epoch → hit, same flags.
+        let got = cache.get_fresh(&t, 7).expect("epoch-fresh hit");
+        assert!(!got.has_referencing_fk && !got.has_update_reactor);
+        // Bumped epoch → miss (any catalog mutation invalidates).
+        assert!(
+            cache.get_fresh(&t, 8).is_none(),
+            "an epoch bump must miss so FK/reactor DDL is observed"
+        );
+        // epoch 0 (Postgres/Rest backends) is TTL-only, so a fresh insert hits
+        // regardless of the queried epoch value.
+        cache.insert(t.clone(), flags, 0);
+        assert!(cache.get_fresh(&t, 0).is_some());
+        // Explicit single-table invalidation drops the entry.
+        cache.invalidate(&t);
+        assert!(cache.get_fresh(&t, 0).is_none());
     }
 }

@@ -2061,27 +2061,20 @@ async fn try_resolve_fast_path_update(
     {
         return Ok(None);
     }
-    // Gate: any child table referencing this one (FK ON UPDATE) → slow path.
-    let referencing = crate::constraints::fks_referencing(
-        &sess.engine.config().catalog,
-        &sess.project,
-        table.as_str(),
-    )
-    .await?;
-    if !referencing.is_empty() {
+    // Gate: any child table referencing this one by FK (cascade handling), or a
+    // per-table UPDATE reactor (needs before/after row images) → slow path.
+    //
+    // perf-w-pointops: these were TWO uncached awaited catalog round-trips
+    // (`fks_referencing` + `list_reactors`) on EVERY fast-path UPDATE
+    // (~120µs/statement on the warm OLTP loop). They are now served from the
+    // per-session, catalog-epoch-validated `dml_flags_cache` — a single warm
+    // `Mutex` lock on the steady-state loop, refetched on any catalog mutation
+    // (FK/reactor DDL bumps the epoch). Correctness is unchanged: the cached
+    // flags carry the identical FK-presence and UPDATE-reactor-presence
+    // verdicts the inline calls computed.
+    let dml_flags = crate::session::load_dml_flags_cached(sess, table).await?;
+    if dml_flags.has_referencing_fk || dml_flags.has_update_reactor {
         return Ok(None);
-    }
-    // Gate: per-table UPDATE reactor needs before/after row images.
-    {
-        let catalog = &sess.engine.config().catalog;
-        let reactors = catalog.list_reactors(&sess.project).await;
-        let has_reactor = reactors.iter().any(|r| {
-            r.table.as_str().eq_ignore_ascii_case(table.as_str())
-                && r.ops.contains(basin_catalog::ReactorOps::UPDATE)
-        });
-        if has_reactor {
-            return Ok(None);
-        }
     }
     // NOTE: no-WHERE is NOT a gate. `UPDATE t SET …` with no predicate routes
     // through the resolve-by-probe machinery below (`SELECT * FROM t LIMIT

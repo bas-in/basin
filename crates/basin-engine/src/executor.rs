@@ -2341,6 +2341,7 @@ async fn dispatch_parsed_statement(
             sess.state.table_meta_cache.invalidate(&target);
             sess.state.provider_cache.invalidate(&target);
             sess.state.head_probe_cache.invalidate(&target);
+            sess.state.dml_flags_cache.invalidate(&target);
             sess.engine
                 .pk_row_cache()
                 .invalidate_table(&sess.project, &target);
@@ -2357,6 +2358,11 @@ async fn dispatch_parsed_statement(
             // statement.
             sess.state.provider_cache.invalidate_all();
             sess.state.head_probe_cache.invalidate_all();
+            // DML-flags cache (perf-w-pointops): FK / reactor DDL (the flags it
+            // caches) is exactly the non-SELECT class handled here. Epoch-keyed
+            // like the head-probe cache; this eager clear covers same-session
+            // within-statement visibility on the epoch-0 backends.
+            sess.state.dml_flags_cache.invalidate_all();
             // PK row cache (always-on): the same statement classes that flush
             // the table-meta cache — any non-SELECT we could not scope — can
             // change a table's schema or rewrite its rows. Most are caught by
@@ -5891,6 +5897,222 @@ pub(crate) async fn try_insert_bind_direct(
     // Same execution seam as the other INSERT fast paths. RETURNING is
     // impossible here (the plan precompute declines it).
     Some(exec_insert_prebuilt(sess, &plan.table, &meta, batch, false).await)
+}
+
+/// Count of point-SELECT executions served end-to-end by the bind-direct
+/// parameterized fast path (extended protocol Parse/Bind/Execute — the
+/// `SimpleSelectPlan` is rebuilt straight from the prepare-time plan plus the
+/// decoded PK bind value; no SQL text re-parse, no AST clone, no `execute()`
+/// observer/matcher ladder in the per-Execute loop). Test-visible
+/// instrumentation; relaxed ordering is fine for a monotone counter.
+pub(crate) static POINT_SELECT_BIND_DIRECT_FASTPATH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Plan for the bind-direct parameterized point-SELECT fast path, precomputed
+/// ONCE at prepare time (`prepared::build_bind_point_plan`) for the plain shape
+/// `SELECT <cols> FROM t WHERE <pk> = $N` over a single bare-table reference
+/// with no JOIN / aggregate / GROUP BY / ORDER BY / LIMIT / OFFSET / extra
+/// predicate. `projection` / `read_cols` are exactly the fields
+/// [`crate::fast_select::match_simple_select`] produced for the substituted
+/// template at prepare time, so the rebuilt plan is byte-identical to the one
+/// the text/AST route would have matched.
+///
+/// Like [`BindInsertPlan`], the plan stores column NAMES (not schema indices):
+/// a prepared statement outlives DDL, so `pk_col` is re-resolved against the
+/// freshly loaded `TableMetadata` on each Execute, and any drift (column
+/// renamed/dropped, PK changed, RLS toggled) declines back to the normal path.
+#[derive(Debug)]
+pub(crate) struct BindPointPlan {
+    pub(crate) table: TableName,
+    /// `None` = `SELECT *`; `Some(items)` = the matched output list (all
+    /// `ProjectionItem::Column` — `build_bind_point_plan` declines computed
+    /// items, exactly as the eligibility gate below re-asserts).
+    pub(crate) projection: Option<Vec<crate::fast_select::ProjectionItem>>,
+    /// The decode column superset `match_simple_select` derived (projection
+    /// columns ∪ filter column).
+    pub(crate) read_cols: Option<Vec<String>>,
+    /// The single equality-predicate column. Must equal the table's sole PK
+    /// column at Execute time, else decline.
+    pub(crate) pk_col: String,
+    /// Zero-based index into the bound params of the `$N` that supplies the PK
+    /// value.
+    pub(crate) pk_param_idx: usize,
+}
+
+/// Convert a single bound param into the `basin_storage::ScalarValue` the
+/// normal recogniser would have produced for the equivalent WHERE literal.
+///
+/// CORRECTNESS: the text/AST route renders the bound param to SQL text,
+/// re-parses, and `fast_select::literal_value` recognises the literal. We must
+/// produce the IDENTICAL `ScalarValue` — and DECLINE (return `None`) for any
+/// param that the recogniser would NOT accept as a bare literal, so the
+/// fast-path engagement set is a subset of the normal fast path:
+///   * `Int4`/`Int8` → `Int64` (the recogniser parses any integer literal to
+///     `Int64`);
+///   * `Float8` → `Float64` (only if finite — non-finite never appears as a
+///     SQL number literal and the recogniser rejects it);
+///   * `Bool`  → `Boolean`;
+///   * `Text`  → `Utf8`.
+/// `Null` is declined: `WHERE pk = NULL` is the 3VL-FALSE `always_empty` shape,
+/// a different path. `Timestamptz` is declined: it renders as a `::timestamptz`
+/// CAST, which `literal_value` does NOT accept (the normal path bails to
+/// DataFusion for it too), so declining keeps parity. `Bytea` / `Array` are
+/// likewise not bare literals.
+fn point_param_to_scalar(
+    param: &crate::prepared::ScalarParam,
+) -> Option<basin_storage::ScalarValue> {
+    use crate::prepared::ScalarParam;
+    use basin_storage::ScalarValue;
+    match param {
+        ScalarParam::Int8(v) => Some(ScalarValue::Int64(*v)),
+        ScalarParam::Int4(v) => Some(ScalarValue::Int64(*v as i64)),
+        ScalarParam::Float8(f) if f.is_finite() => Some(ScalarValue::Float64(*f)),
+        ScalarParam::Bool(b) => Some(ScalarValue::Boolean(*b)),
+        ScalarParam::Text(s) => Some(ScalarValue::Utf8(s.clone())),
+        ScalarParam::Null
+        | ScalarParam::Float8(_)
+        | ScalarParam::Timestamptz(_)
+        | ScalarParam::Bytea(_)
+        | ScalarParam::Array(_) => None,
+    }
+}
+
+/// Bind-direct fast path for a parameterized prepared point SELECT — the hook
+/// `prepared::execute_bound` runs BEFORE the AST / text bind routes when the
+/// prepared statement carries a [`BindPointPlan`].
+///
+/// Returns:
+/// * `None` — decline; the caller falls back to the AST fast route (or the
+///   text route), which reproduces every behaviour. A decline is never
+///   observable: this path is read-only and mutates no session state before a
+///   decline.
+/// * `Some(result)` — the statement was fully executed here.
+///
+/// Engagement gates mirror the simple-SELECT fast-path gate in
+/// `dispatch_parsed_statement` one-for-one (auto-commit only, not a view, RLS
+/// off, no soft-delete column, single-column PK, no citext on the PK), then
+/// hand the rebuilt point-shape [`crate::fast_select::SimpleSelectPlan`] to the
+/// SAME `execute_simple_select` the matched text/AST route would have called —
+/// so the pre-flush memtable probe, PK row cache, secondary-index probe, cold
+/// read and projection are all inherited unchanged.
+pub(crate) async fn try_point_select_bind_direct(
+    sess: &ProjectSession,
+    plan: &BindPointPlan,
+    params: &[crate::prepared::ScalarParam],
+) -> Option<Result<ExecResult>> {
+    // Same session bookkeeping the text / AST entry points run at their top.
+    crate::session::touch_last_active(&sess.state);
+    if sess.reaped_flag.is_reaped() {
+        return None;
+    }
+
+    // Gate 1: auto-commit only. Inside (or after an aborted) transaction the
+    // fast SELECT needs the pinned-read-view machinery the normal gate threads
+    // in; decline so the AST/text route handles it.
+    if crate::session::tx_is_active(&sess.state) || crate::session::tx_is_aborted(&sess.state) {
+        return None;
+    }
+
+    // Gate 2: resolve the PK bind value to the literal the recogniser would
+    // have produced. Decline (→ normal path) on any param shape the normal
+    // fast path would itself reject as a bare WHERE literal.
+    let pk_param = params.get(plan.pk_param_idx)?;
+    let pk_value = point_param_to_scalar(pk_param)?;
+
+    // Gate 3: table metadata via the epoch-validated per-session cache — the
+    // SAME loader + RLS-bypass guard the normal SELECT gate uses. `None` (view
+    // present without a table, or a catalog error) declines.
+    let (meta_arc, is_view) = crate::session::load_table_meta_cached(sess, &plan.table).await?;
+    if is_view {
+        return None;
+    }
+    let meta = &*meta_arc;
+
+    // Gate 4: replicate the normal SELECT gate's table guards exactly.
+    //   * RLS off (the fast path is the primary RLS-bypass vector);
+    //   * no soft-delete column (the normal gate routes those to DataFusion);
+    //   * single-column PK, and our predicate column IS that PK (self-heals on
+    //     DDL: a renamed/dropped PK column or a changed PK no longer matches);
+    //   * the PK column is not citext (byte-exact compare would break the
+    //     case-insensitive contract).
+    if meta.rls_enabled {
+        return None;
+    }
+    if crate::types::soft_delete_column(meta.schema.as_ref()).is_some() {
+        return None;
+    }
+    if meta.pk_columns.len() != 1 || meta.pk_columns[0] != plan.pk_col {
+        return None;
+    }
+    // Re-resolve the PK column against the CURRENT schema (DDL self-heal) and
+    // reject a citext PK.
+    let pk_field = meta.schema.field_with_name(&plan.pk_col).ok()?;
+    if pk_field
+        .metadata()
+        .get(crate::types::BASIN_TYPE_KEY)
+        .map(|v| v.as_str() == crate::types::BASIN_TYPE_CITEXT)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    // Every projected / read column must still resolve in the current schema —
+    // a dropped column declines rather than serving against a stale plan.
+    if let Some(items) = &plan.projection {
+        for item in items {
+            match item {
+                crate::fast_select::ProjectionItem::Column(c) => {
+                    if meta.schema.field_with_name(c).is_err() {
+                        return None;
+                    }
+                }
+                // build_bind_point_plan declines computed items; defence in depth.
+                crate::fast_select::ProjectionItem::Computed { .. } => return None,
+            }
+        }
+    }
+    if let Some(cols) = &plan.read_cols {
+        for c in cols {
+            if meta.schema.field_with_name(c).is_err() {
+                return None;
+            }
+        }
+    }
+
+    // Rebuild the point-shape plan. Cloning the small Vecs is cheap; this is
+    // the per-Execute work the parse + match avoided. The shape is fixed to the
+    // single-Eq-on-PK point read: no aggregates / IN-list / IS NULL / ORDER BY
+    // / OFFSET / LIMIT / top-k, `always_empty=false`.
+    let select_plan = crate::fast_select::SimpleSelectPlan {
+        table: plan.table.clone(),
+        projection: plan.projection.clone(),
+        read_cols: plan.read_cols.clone(),
+        aggregates: None,
+        predicates: vec![basin_storage::Predicate::Eq(plan.pk_col.clone(), pk_value)],
+        is_null_cols: Vec::new(),
+        in_list_preds: Vec::new(),
+        limit: None,
+        offset: None,
+        order_by: None,
+        always_empty: false,
+        topk_late: None,
+    };
+
+    POINT_SELECT_BIND_DIRECT_FASTPATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Hand to the SAME auto-commit entrypoint the matched text/AST route uses.
+    // `prefetched_meta` is the gate-loaded snapshot (skips a redundant load);
+    // `raw_sql` is unused on the point path (no `->>` rewrite, no DataFusion
+    // fallthrough text needed for a pure PK Eq), so an empty marker is safe.
+    Some(
+        crate::fast_select::execute_simple_select(
+            sess,
+            select_plan,
+            Some((*meta_arc).clone()),
+            "",
+            /* include_deleted */ false,
+        )
+        .await,
+    )
 }
 
 async fn exec_insert(
@@ -16232,6 +16454,340 @@ mod upsert_fastpath_tests {
             got,
             vec![15],
             "RMW SET (n = n + EXCLUDED.n) must accumulate via the slow path"
+        );
+    }
+}
+
+// ── Bind-direct point-SELECT fast path (perf-w-pointops) ─────────────────────
+// Engagement, decline-to-normal-path, DDL self-heal, and correctness
+// differentials (bind-direct == the normal text route) for
+// `try_point_select_bind_direct`. The `==` is asserted by comparing the
+// bind-direct result against the SAME statement run through the text `execute`
+// (which the fast path is required to reproduce byte-for-byte).
+#[cfg(test)]
+mod point_select_bind_direct_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use basin_catalog::{Catalog, InMemoryCatalog};
+    use basin_common::ProjectId;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    use super::POINT_SELECT_BIND_DIRECT_FASTPATH;
+    use crate::prepared::ScalarParam;
+    use crate::{Engine, EngineConfig, ExecResult, ProjectSession};
+
+    fn make_engine(dir: &TempDir) -> Engine {
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        })
+    }
+
+    /// Render an `ExecResult::Rows` to a stable, comparable string (schema field
+    /// names + each row's display cells) so two execution paths can be asserted
+    /// byte-equal without depending on Arrow's `PartialEq` of dictionary/offset
+    /// internals.
+    fn rows_repr(res: &ExecResult) -> String {
+        match res {
+            ExecResult::Rows { schema, batches } => {
+                let mut out = String::new();
+                out.push_str("COLS:");
+                for f in schema.fields() {
+                    out.push_str(f.name());
+                    out.push(',');
+                }
+                out.push('\n');
+                for b in batches {
+                    let opts = arrow::util::display::FormatOptions::default();
+                    for r in 0..b.num_rows() {
+                        for c in 0..b.num_columns() {
+                            let fmt = arrow::util::display::ArrayFormatter::try_new(
+                                b.column(c),
+                                &opts,
+                            )
+                            .unwrap();
+                            out.push_str(&fmt.value(r).to_string());
+                            out.push('|');
+                        }
+                        out.push('\n');
+                    }
+                }
+                out
+            }
+            ExecResult::Empty { tag } => format!("EMPTY:{tag}"),
+        }
+    }
+
+    /// Run `sql` (with the single param substituted) through BOTH the prepared
+    /// bind path (which engages the point fast path) and the text route, and
+    /// assert the rendered results match.
+    async fn assert_bind_eq_text(
+        sess: &ProjectSession,
+        prepared_sql: &str,
+        param: ScalarParam,
+        text_sql: &str,
+    ) -> ExecResult {
+        let (handle, _schema) = sess.prepare(prepared_sql).await.unwrap();
+        let bound = sess.bind(&handle, vec![param]).await.unwrap();
+        let via_bind = sess.execute_bound(bound).await.unwrap();
+        let via_text = sess.execute(text_sql).await.unwrap();
+        assert_eq!(
+            rows_repr(&via_bind),
+            rows_repr(&via_text),
+            "bind-direct point SELECT must match the text route for `{text_sql}`"
+        );
+        via_bind
+    }
+
+    #[tokio::test]
+    async fn engages_and_matches_text_route_int_pk() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT, n BIGINT)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO t (id, s, n) VALUES (1, 'a', 10), (2, 'b', 20)")
+            .await
+            .unwrap();
+
+        let before = POINT_SELECT_BIND_DIRECT_FASTPATH.load(Ordering::Relaxed);
+        assert_bind_eq_text(
+            &sess,
+            "SELECT id, s, n FROM t WHERE id = $1",
+            ScalarParam::Int8(2),
+            "SELECT id, s, n FROM t WHERE id = 2",
+        )
+        .await;
+        assert!(
+            POINT_SELECT_BIND_DIRECT_FASTPATH.load(Ordering::Relaxed) > before,
+            "engagement counter must advance for the int-PK point SELECT"
+        );
+
+        // SELECT * shape and a missing row.
+        assert_bind_eq_text(
+            &sess,
+            "SELECT * FROM t WHERE id = $1",
+            ScalarParam::Int8(1),
+            "SELECT * FROM t WHERE id = 1",
+        )
+        .await;
+        let missing = assert_bind_eq_text(
+            &sess,
+            "SELECT id, s FROM t WHERE id = $1",
+            ScalarParam::Int8(999),
+            "SELECT id, s FROM t WHERE id = 999",
+        )
+        .await;
+        match missing {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0)
+            }
+            other => panic!("expected empty Rows, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn matches_text_route_text_pk_and_null_param() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        // Text PK — exercises the Utf8 ScalarValue conversion + str RowKey.
+        sess.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v BIGINT)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO kv (k, v) VALUES ('alpha', 1), ('beta', 2)")
+            .await
+            .unwrap();
+        assert_bind_eq_text(
+            &sess,
+            "SELECT k, v FROM kv WHERE k = $1",
+            ScalarParam::Text("beta".into()),
+            "SELECT k, v FROM kv WHERE k = 'beta'",
+        )
+        .await;
+        // A NULL param maps to `WHERE k = NULL` — 3VL-FALSE. The bind-direct
+        // converter DECLINES `Null` (it is the always_empty shape, a different
+        // path), so this falls through to the normal route, which returns zero
+        // rows. We assert the fallback result is empty (correctness preserved).
+        let (h, _s) = sess.prepare("SELECT k, v FROM kv WHERE k = $1").await.unwrap();
+        let bound = sess.bind(&h, vec![ScalarParam::Null]).await.unwrap();
+        match sess.execute_bound(bound).await.unwrap() {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0)
+            }
+            other => panic!("`= NULL` must be empty, got {other:?}"),
+        }
+    }
+
+    // Decline tests assert CORRECTNESS via the fallback rather than the
+    // process-global engagement counter: that counter is shared across every
+    // test in the binary and is unreliable under parallel execution. Positive
+    // engagement is covered by `engages_and_matches_text_route_int_pk`, which
+    // uses a robust `> before` check.
+    #[tokio::test]
+    async fn declines_on_rls_serves_correct_result_via_fallback() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO t (id, s) VALUES (1, 'a')")
+            .await
+            .unwrap();
+        sess.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
+            .await
+            .unwrap();
+
+        // RLS table → the bind-direct path declines; the AST/text fallback
+        // serves the RLS-evaluated result, which must equal the text route.
+        assert_bind_eq_text(
+            &sess,
+            "SELECT id, s FROM t WHERE id = $1",
+            ScalarParam::Int8(1),
+            "SELECT id, s FROM t WHERE id = 1",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn declines_in_transaction_serves_correct_result() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO t (id, s) VALUES (1, 'a')")
+            .await
+            .unwrap();
+        let (handle, _s) = sess.prepare("SELECT id, s FROM t WHERE id = $1").await.unwrap();
+
+        sess.execute("BEGIN").await.unwrap();
+        // In-tx → the bind-direct path declines (pin machinery lives on the
+        // normal route); the fallback returns the row.
+        let bound = sess.bind(&handle, vec![ScalarParam::Int8(1)]).await.unwrap();
+        let res = sess.execute_bound(bound).await.unwrap();
+        match res {
+            ExecResult::Rows { batches, .. } => {
+                assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1)
+            }
+            other => panic!("expected the row via fallback, got {other:?}"),
+        }
+        sess.execute("COMMIT").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn self_heals_after_ddl_and_rebinds_fresh_param() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO t (id, s) VALUES (1, 'a'), (2, 'b')")
+            .await
+            .unwrap();
+        let (handle, _s) = sess
+            .prepare("SELECT id, s FROM t WHERE id = $1")
+            .await
+            .unwrap();
+
+        // First execute engages and returns row 1.
+        let b1 = sess.bind(&handle, vec![ScalarParam::Int8(1)]).await.unwrap();
+        let r1 = sess.execute_bound(b1).await.unwrap();
+        assert_eq!(rows_repr(&r1), rows_repr(&sess.execute("SELECT id, s FROM t WHERE id = 1").await.unwrap()));
+
+        // Re-bind a DIFFERENT param on the SAME prepared statement → row 2.
+        let b2 = sess.bind(&handle, vec![ScalarParam::Int8(2)]).await.unwrap();
+        let r2 = sess.execute_bound(b2).await.unwrap();
+        assert_eq!(rows_repr(&r2), rows_repr(&sess.execute("SELECT id, s FROM t WHERE id = 2").await.unwrap()));
+
+        // DDL that adds a column: the cached plan's read_cols/projection are
+        // still valid (they reference existing columns); the path must keep
+        // serving correctly against the new schema.
+        sess.execute("ALTER TABLE t ADD COLUMN extra TEXT")
+            .await
+            .unwrap();
+        let b3 = sess.bind(&handle, vec![ScalarParam::Int8(1)]).await.unwrap();
+        let r3 = sess.execute_bound(b3).await.unwrap();
+        assert_eq!(
+            rows_repr(&r3),
+            rows_repr(&sess.execute("SELECT id, s FROM t WHERE id = 1").await.unwrap()),
+            "point SELECT must re-resolve against the post-DDL schema"
+        );
+    }
+
+    // Sanctioned timing probe (genuinely a perf probe, not a correctness gate;
+    // ignored by default like `values_fast_ingest.rs`'s ingest probe). Asserts
+    // the bind-direct point SELECT is at most 0.5x the wall time of the same
+    // statement dispatched through the text route over 10k executes.
+    #[tokio::test]
+    #[ignore = "timing probe"]
+    async fn timing_probe_bind_direct_at_most_half_of_text() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT, n BIGINT)")
+            .await
+            .unwrap();
+        for i in 0..1000_i64 {
+            sess.execute(&format!("INSERT INTO t (id, s, n) VALUES ({i}, 'row-{i}', {i})"))
+                .await
+                .unwrap();
+        }
+        let (handle, _s) = sess
+            .prepare("SELECT id, s, n FROM t WHERE id = $1")
+            .await
+            .unwrap();
+
+        const N: i64 = 10_000;
+        // Warm both paths once.
+        let bw = sess.bind(&handle, vec![ScalarParam::Int8(0)]).await.unwrap();
+        let _ = sess.execute_bound(bw).await.unwrap();
+        let _ = sess.execute("SELECT id, s, n FROM t WHERE id = 0").await.unwrap();
+
+        let t_text = std::time::Instant::now();
+        for i in 0..N {
+            let k = i % 1000;
+            let _ = sess
+                .execute(&format!("SELECT id, s, n FROM t WHERE id = {k}"))
+                .await
+                .unwrap();
+        }
+        let text = t_text.elapsed();
+
+        let t_bind = std::time::Instant::now();
+        for i in 0..N {
+            let k = i % 1000;
+            let bound = sess.bind(&handle, vec![ScalarParam::Int8(k)]).await.unwrap();
+            let _ = sess.execute_bound(bound).await.unwrap();
+        }
+        let bind = t_bind.elapsed();
+
+        eprintln!(
+            "point-select bind-direct: text={:?} ({:.3} us/op), bind={:?} ({:.3} us/op), ratio={:.3}",
+            text,
+            text.as_micros() as f64 / N as f64,
+            bind,
+            bind.as_micros() as f64 / N as f64,
+            bind.as_secs_f64() / text.as_secs_f64(),
+        );
+        assert!(
+            bind.as_secs_f64() <= 0.5 * text.as_secs_f64(),
+            "bind-direct point SELECT must be <= 0.5x the text route (bind={bind:?}, text={text:?})"
         );
     }
 }
