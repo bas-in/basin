@@ -83,8 +83,8 @@ pub use leases::{
     Lease, LeaseRegistry, DEFAULT_LEASE_RENEW_SECS, DEFAULT_LEASE_TTL_SECS,
 };
 pub use metadata::{
-    CheckConstraint, ColumnStats, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy,
-    PolicyCommand, PromotedJsonbPath, RefAction, S3Config, SecondaryIndex, TableFileFormat,
+    CaggPolicy, CheckConstraint, ColumnStats, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec,
+    Policy, PolicyCommand, PromotedJsonbPath, RefAction, S3Config, SecondaryIndex, TableFileFormat,
     TableMetadata, ProjectMetadata, UniqueConstraint,
 };
 pub use postgres::PostgresCatalog;

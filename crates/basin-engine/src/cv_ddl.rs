@@ -291,6 +291,7 @@ fn parse_cv_options(inside: &str) -> Result<CvOptions> {
     Ok(CvOptions {
         continuous,
         refresh_interval_secs,
+        timescaledb,
     })
 }
 

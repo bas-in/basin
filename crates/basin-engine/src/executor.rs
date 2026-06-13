@@ -1721,6 +1721,19 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         return exec_compress_chunk(sess, intent).await;
     }
 
+    // ── Continuous aggregates: refresh_continuous_aggregate(cagg, start, end) ─
+    // Re-runs the cagg's defining query for the window and upserts the
+    // materialised rows. Maps onto the basin.continuous CV engine.
+    if let Some(intent) = crate::cagg::match_refresh_continuous_aggregate(raw_sql) {
+        return crate::cagg::exec_refresh_continuous_aggregate(sess, &intent).await;
+    }
+
+    // ── Continuous aggregates: add_continuous_aggregate_policy(…) ─────────────
+    // Stamps a refresh policy on the cagg's CvDef (mirrors add_retention_policy).
+    if let Some(intent) = crate::cagg::match_add_continuous_aggregate_policy(raw_sql) {
+        return crate::cagg::exec_add_continuous_aggregate_policy(sess, &intent).await;
+    }
+
     // ── Phase 5.29.G: SELECT time_bucket_gapfill(…) [+ locf(…)] ──────────────
     // Detect a gapfill query, run a rewritten (gapfill→time_bucket, locf
     // unwrapped) form through the normal SELECT path, then densify the result
