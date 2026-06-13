@@ -8,6 +8,39 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-14 — Point-op latency: bind-direct UPDATE, FK/reactor flag cache, prewarm flag
+
+### Changed
+
+- **Bind-direct UPDATE.** A prepared `UPDATE t SET col = $N WHERE pk = $M`
+  whose template triggers no string-rewrite pipeline now binds the AST-fast
+  route: at Execute the cached parsed statement is cloned, its SET-value /
+  WHERE placeholders are substituted with the decoded params, and the
+  resulting `Statement::Update` is dispatched straight through
+  `dispatch_parsed_statement` — eliminating the per-Execute whole-statement
+  re-parse the text route paid. The statement still flows through `exec_update`
+  verbatim (every gate, the hot-tier overlay fast path, and the
+  change-event/sink capture inside `hot_tier_update_by_pk`), so the bind path
+  is byte-for-byte identical to the normal path, including error parity.
+  Mirrors the existing AST-fast INSERT / point-SELECT routes.
+- **Single-row UPDATE/DELETE FK + reactor flag cache.** The hot-tier
+  fast-path gate consulted `fks_referencing` + `list_reactors` as two uncached
+  awaited catalog round-trips on every statement (~120µs on the warm OLTP
+  loop). They are now served from a per-session, catalog-epoch-validated
+  `dml_flags_cache` (one warm `Mutex` lock on the steady state), refetched on
+  any catalog mutation — FK / reactor DDL bumps the epoch and a same-statement
+  eager clear covers within-statement visibility on the epoch-0 backends. The
+  cached verdict is identical to the inline calls'.
+
+### Added
+
+- **`BASIN_PREWARM_PROVIDERS` (default off).** When set to `1`, the first cold
+  table-meta load in a session fires a fire-and-forget task that reads the
+  table's per-file stats/footers into the process-wide caches, so a follow-up
+  cold SELECT skips the per-file footer fetch (cold ~3.4→~2.3ms; the steady
+  warm path is unaffected). At most one warm per (session, table); a no-op when
+  the flag is unset. Covered by a structural cold-vs-warm test (not wall-clock).
+
 ## 2026-06-13 — PostGIS general 2-D geometry SQL surface
 
 ### Added
