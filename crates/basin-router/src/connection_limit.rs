@@ -18,6 +18,19 @@
 //! **unlimited** — the correct behaviour for OSS deployments that run no
 //! control plane.
 //!
+//! ## Multi-region accounting (ADR 0009 v0.2)
+//!
+//! The authoritative live count for a project lives in its **home region's**
+//! limiter — the only region that accepts a write for it. A cross-region
+//! forwarded write (see `basin_engine::write_forwarder`) is therefore counted
+//! HERE, at home, exactly once, never bypassing `max_connections`:
+//! `fly-replay` makes Fly re-fire the request at the home region (counted by
+//! this limiter on the re-fired connection), and `http-forward` makes the
+//! forward client connect to the home engine's admission path (counted by this
+//! limiter on the forwarded connection). The originating region never counts a
+//! forwarded write against the project. See
+//! `basin_engine::write_forwarder::CeilingAccounting`.
+//!
 //! ## Control-plane wiring gap
 //!
 //! The [`ConnectionLimitProvider`] trait is the injection point. Today's

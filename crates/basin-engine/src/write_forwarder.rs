@@ -228,6 +228,60 @@ impl ForwardClient for UnconfiguredForwardClient {
     }
 }
 
+// ─── region-aware connection-ceiling accounting model ──────────────────────
+
+/// Where a forwarded write is counted against the per-project
+/// `max_connections` ceiling (issue #28 follow-up).
+///
+/// The cloud pushes ONE ceiling per project; the authoritative live-connection
+/// count for a project lives in **its home region's** `ConnectionLimiter`
+/// (that is the only region that ever accepts a write for the project). The
+/// model below guarantees a forwarded write is counted exactly where it lands —
+/// at home — and never bypasses the cap, regardless of mode:
+///
+/// * **`fly-replay`** — the forwarder emits NO connection of its own. Fly
+///   re-fires the entire client request against the home region, which opens a
+///   real pgwire/REST connection THERE and is admitted (or refused with
+///   `53300`) by the home region's `ConnectionLimiter` like any direct client.
+///   The originating (non-home) region only ever served the pre-replay edge
+///   handshake, which is released the instant the `fly-replay` header is sent
+///   (the local write never executes). So the write is counted once, at home.
+///
+/// * **`http-forward`** — the [`ForwardClient`] opens an HTTP connection to the
+///   home region's engine. That connection MUST traverse the home region's
+///   connection-admission path (the same `ConnectionLimiter::try_admit` the
+///   pgwire/REST edge uses) so the forwarded write counts at home. The
+///   forwarded connection is counted at the home region; the originating region
+///   does NOT also count it against the project (the originating connection is
+///   a transient relay, not a project session executing the write locally).
+///
+/// In BOTH modes the rule is identical and is the answer to "does a forwarded
+/// write bypass `max_connections`?": **no** — it is admitted and counted by the
+/// home region's limiter, exactly once, at the region that executes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CeilingAccounting {
+    /// Counted by the home region's `ConnectionLimiter` when Fly re-fires the
+    /// request there. No local count in the originating region.
+    AtHomeViaReplay,
+    /// Counted by the home region's `ConnectionLimiter` when the forward client
+    /// connects to the home engine's admission path. No local count for the
+    /// project in the originating region.
+    AtHomeViaForwardConnection,
+}
+
+impl ForwardMode {
+    /// The connection-ceiling accounting model this mode uses for a forwarded
+    /// write. `Off` has no model (a non-home write never executes), so this is
+    /// only meaningful for the forwarding modes; it returns `None` for `Off`.
+    pub fn ceiling_accounting(self) -> Option<CeilingAccounting> {
+        match self {
+            ForwardMode::Off => None,
+            ForwardMode::FlyReplay => Some(CeilingAccounting::AtHomeViaReplay),
+            ForwardMode::HttpForward => Some(CeilingAccounting::AtHomeViaForwardConnection),
+        }
+    }
+}
+
 // ─── the forwarder ─────────────────────────────────────────────────────────
 
 /// Concrete [`WriteForwarder`] implementing both strategies behind
@@ -550,6 +604,23 @@ mod tests {
             f.forward_write(ctx).await,
             Err(BasinError::WrongRegion(_))
         ));
+    }
+
+    // ── ceiling-accounting model ────────────────────────────────────────────
+
+    #[test]
+    fn ceiling_accounting_is_always_at_home() {
+        // A forwarded write is counted at the HOME region in both modes, never
+        // double-counted, never bypassing the per-project max_connections cap.
+        assert_eq!(ForwardMode::Off.ceiling_accounting(), None);
+        assert_eq!(
+            ForwardMode::FlyReplay.ceiling_accounting(),
+            Some(CeilingAccounting::AtHomeViaReplay)
+        );
+        assert_eq!(
+            ForwardMode::HttpForward.ceiling_accounting(),
+            Some(CeilingAccounting::AtHomeViaForwardConnection)
+        );
     }
 
     #[test]
