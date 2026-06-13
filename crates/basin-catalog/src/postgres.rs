@@ -40,6 +40,7 @@ use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMe
 use tokio_postgres::NoTls;
 use tracing::instrument;
 
+use crate::cdc_kafka::{CdcKafkaSinkDef, CdcKafkaSinkRow, CdcKafkaSinkState, PartitionKey};
 use crate::cdc_webhooks::{CdcWebhookDef, CdcWebhookRow, CdcWebhookState};
 use crate::domains::{self, DomainDef, DomainError, BASIN_DOMAIN_KEY};
 use crate::enums::{self, EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
@@ -634,6 +635,32 @@ impl PostgresCatalog {
                     PRIMARY KEY (project_id, id)
                 )"
             ),
+            // ADR 0028 Phase 3 — per-project CDC Kafka sink configs + their
+            // delivery cursor. Mirrors `cdc_webhooks`: subscription columns
+            // (brokers, topic, filters, partition_key, active) written at
+            // registration; delivery columns (last_seq, last_status,
+            // retry_count, disabled_at) written by the worker on each producer
+            // ack / failure / auto-disable. `last_seq` advances monotonically
+            // (GREATEST upsert). Filters are JSONB arrays (NULL ⇒ no filter).
+            // A legacy catalog that predates this table simply has no rows.
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.cdc_kafka_sinks (
+                    project_id     TEXT NOT NULL,
+                    id             TEXT NOT NULL,
+                    brokers        TEXT NOT NULL,
+                    topic          TEXT NOT NULL,
+                    tables_json    JSONB,
+                    ops_json       JSONB,
+                    partition_key  TEXT NOT NULL DEFAULT 'row_pk',
+                    active         BOOLEAN NOT NULL DEFAULT true,
+                    last_seq       BIGINT NOT NULL DEFAULT 0,
+                    last_status    TEXT,
+                    retry_count    INTEGER NOT NULL DEFAULT 0,
+                    disabled_at    TIMESTAMPTZ,
+                    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (project_id, id)
+                )"
+            ),
         ];
         let client = self.client().await?;
         for stmt in stmts {
@@ -1066,6 +1093,13 @@ impl Catalog for PostgresCatalog {
         let _ = tx
             .execute(
                 &format!("DELETE FROM {sch}.cdc_webhooks WHERE project_id = $1"),
+                &[&project.to_string()],
+            )
+            .await;
+        // ADR 0028 Phase 3: CDC Kafka sink configs + cursors (same guard).
+        let _ = tx
+            .execute(
+                &format!("DELETE FROM {sch}.cdc_kafka_sinks WHERE project_id = $1"),
                 &[&project.to_string()],
             )
             .await;
@@ -4388,6 +4422,199 @@ impl Catalog for PostgresCatalog {
         if n == 0 {
             return Err(BasinError::not_found(format!(
                 "cdc webhook {id:?} does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    // ---- ADR 0028 Phase 3: CDC Kafka sinks ------------------------------
+
+    #[instrument(skip(self), fields(project = %def.project, id = %def.id))]
+    async fn register_cdc_kafka_sink(&self, def: CdcKafkaSinkDef) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let tables_json = def
+            .tables
+            .as_ref()
+            .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null));
+        let ops_json = def
+            .ops
+            .as_ref()
+            .map(|o| serde_json::to_value(o).unwrap_or(serde_json::Value::Null));
+        let pk = def.partition_key.as_str();
+        let n = client
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.cdc_kafka_sinks \
+                       (project_id, id, brokers, topic, tables_json, ops_json, partition_key, active) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                     ON CONFLICT (project_id, id) DO NOTHING"
+                ),
+                &[
+                    &def.project.to_string(),
+                    &def.id,
+                    &def.brokers,
+                    &def.topic,
+                    &tables_json,
+                    &ops_json,
+                    &pk,
+                    &def.active,
+                ],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_cdc_kafka_sink: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::Catalog(format!(
+                "cdc kafka sink {:?} already exists for project {}",
+                def.id, def.project
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project, id = %id))]
+    async fn drop_cdc_kafka_sink(&self, project: &ProjectId, id: &str) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let n = client
+            .execute(
+                &format!("DELETE FROM {sch}.cdc_kafka_sinks WHERE project_id = $1 AND id = $2"),
+                &[&project.to_string(), &id],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_cdc_kafka_sink: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!(
+                "cdc kafka sink {id:?} does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_cdc_kafka_sinks(&self, project: &ProjectId) -> Vec<CdcKafkaSinkRow> {
+        let sch = &self.schema;
+        let Ok(client) = self.client().await else {
+            return Vec::new();
+        };
+        let rows = match client
+            .query(
+                &format!(
+                    "SELECT id, brokers, topic, tables_json, ops_json, partition_key, active, \
+                            last_seq, last_status, retry_count, disabled_at \
+                     FROM {sch}.cdc_kafka_sinks \
+                     WHERE project_id = $1 \
+                     ORDER BY id ASC"
+                ),
+                &[&project.to_string()],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .map(|row| {
+                let tables_json: Option<serde_json::Value> = row.get(3);
+                let ops_json: Option<serde_json::Value> = row.get(4);
+                let pk_str: String = row.get(5);
+                let disabled_at: Option<DateTime<Utc>> = row.get(10);
+                let last_seq: i64 = row.get(7);
+                let retry_count: i32 = row.get(9);
+                CdcKafkaSinkRow {
+                    def: CdcKafkaSinkDef {
+                        id: row.get(0),
+                        project: *project,
+                        brokers: row.get(1),
+                        topic: row.get(2),
+                        tables: tables_json.and_then(|v| serde_json::from_value(v).ok()),
+                        ops: ops_json.and_then(|v| serde_json::from_value(v).ok()),
+                        // Legacy-tolerant: an unknown / NULL token defaults to
+                        // the per-row PK strategy (the documented default).
+                        partition_key: PartitionKey::parse(&pk_str).unwrap_or_default(),
+                        active: row.get(6),
+                    },
+                    state: CdcKafkaSinkState {
+                        last_seq: last_seq.max(0) as u64,
+                        last_status: row.get(8),
+                        retry_count: retry_count.max(0) as u32,
+                        disabled_at: disabled_at.map(|d| d.to_rfc3339()),
+                    },
+                }
+            })
+            .collect()
+    }
+
+    #[instrument(skip(self), fields(project = %project, id = %id))]
+    async fn record_cdc_kafka_ack(
+        &self,
+        project: &ProjectId,
+        id: &str,
+        last_seq: u64,
+        last_status: &str,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let seq_pg = last_seq as i64;
+        client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.cdc_kafka_sinks \
+                       SET last_seq = GREATEST(last_seq, $3), \
+                           last_status = $4, \
+                           retry_count = 0 \
+                     WHERE project_id = $1 AND id = $2"
+                ),
+                &[&project.to_string(), &id, &seq_pg, &last_status],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("record_cdc_kafka_ack: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project, id = %id))]
+    async fn record_cdc_kafka_failure(
+        &self,
+        project: &ProjectId,
+        id: &str,
+        retry_count: u32,
+        last_status: &str,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let rc = retry_count as i32;
+        client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.cdc_kafka_sinks \
+                       SET retry_count = $3, last_status = $4 \
+                     WHERE project_id = $1 AND id = $2"
+                ),
+                &[&project.to_string(), &id, &rc, &last_status],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("record_cdc_kafka_failure: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project, id = %id))]
+    async fn disable_cdc_kafka_sink(&self, project: &ProjectId, id: &str) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.cdc_kafka_sinks \
+                       SET active = false, disabled_at = now() \
+                     WHERE project_id = $1 AND id = $2"
+                ),
+                &[&project.to_string(), &id],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("disable_cdc_kafka_sink: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!(
+                "cdc kafka sink {id:?} does not exist"
             )));
         }
         Ok(())
