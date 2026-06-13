@@ -1,0 +1,40 @@
+# frozen_string_literal: true
+
+require_relative "lib/basin/version"
+
+Gem::Specification.new do |spec|
+  spec.name    = "basin-sdk"
+  spec.version = Basin::VERSION
+  spec.authors = ["Basin"]
+  spec.email   = ["support@basin.run"]
+
+  spec.summary     = "Ruby client for the Basin HTTP API"
+  spec.description = <<~DESC
+    Official Ruby SDK for Basin — REST data API, auth (email/password, magic links,
+    OAuth, MFA TOTP/WebAuthn, API keys), object storage, realtime WebSocket
+    change-data subscriptions, and serverless functions.
+  DESC
+  spec.homepage    = "https://basin.run"
+  spec.license     = "MIT"
+
+  spec.required_ruby_version = ">= 3.0.0"
+
+  spec.metadata["homepage_uri"]    = spec.homepage
+  spec.metadata["source_code_uri"] = "https://github.com/basin-run/basin"
+  spec.metadata["changelog_uri"]   = "https://github.com/basin-run/basin/blob/main/sdk/basin-ruby/CHANGELOG.md"
+
+  spec.files = Dir[
+    "lib/**/*.rb",
+    "basin.gemspec",
+    "README.md",
+    "LICENSE"
+  ]
+  spec.require_paths = ["lib"]
+
+  # No runtime deps for the core — stdlib net/http + json only.
+  # WebSocket realtime support requires the optional 'websocket-client-simple' gem.
+  # Install it and require 'basin/realtime' to enable.
+
+  spec.add_development_dependency "rspec",    "~> 3.13"
+  spec.add_development_dependency "webmock",  "~> 3.23"
+end
