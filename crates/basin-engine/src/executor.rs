@@ -16775,6 +16775,81 @@ mod point_select_bind_direct_tests {
     // ignored by default like `values_fast_ingest.rs`'s ingest probe). Asserts
     // the bind-direct point SELECT is at most 0.5x the wall time of the same
     // statement dispatched through the text route over 10k executes.
+    // Type-coverage differentials: the bind-direct point read must equal the
+    // text route for every PK / projected-column type. Each runs the same
+    // statement through both paths and asserts the rendered rows match. A type
+    // the bind-direct converter declines (timestamptz PK) is covered by its own
+    // decline test below — it still has to serve the correct result via the
+    // fallback.
+
+    #[tokio::test]
+    async fn matches_text_route_numeric_and_jsonb_projection() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        // NUMERIC and JSONB are projected (read) columns over an int PK point
+        // read — exercises the cached encoders for those output types.
+        sess.execute("CREATE TABLE m (id BIGINT PRIMARY KEY, amt NUMERIC(10,2), doc JSONB)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO m (id, amt, doc) VALUES (1, 12.34, '{\"k\":1}'), (2, 0.50, '{\"k\":2}')")
+            .await
+            .unwrap();
+        assert_bind_eq_text(
+            &sess,
+            "SELECT id, amt, doc FROM m WHERE id = $1",
+            ScalarParam::Int8(1),
+            "SELECT id, amt, doc FROM m WHERE id = 1",
+        )
+        .await;
+        // SELECT * over the wide-typed row.
+        assert_bind_eq_text(
+            &sess,
+            "SELECT * FROM m WHERE id = $1",
+            ScalarParam::Int8(2),
+            "SELECT * FROM m WHERE id = 2",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn declines_timestamptz_pk_param_matches_text_route() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE ev (ts TIMESTAMPTZ PRIMARY KEY, s TEXT)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO ev (ts, s) VALUES ('2026-01-02T03:04:05+00', 'a')")
+            .await
+            .unwrap();
+        // The point converter DECLINES a Timestamptz param (it renders as a
+        // `::timestamptz` CAST the literal recogniser rejects), so the bind path
+        // falls through to the normal route. The contract is parity with the
+        // text route for the SAME instant — whatever rows the text route returns,
+        // the declined bind path must return identically.
+        let ts_lit = "2026-01-02T03:04:05+00";
+        let micros = 1_767_323_045_000_000_i64; // same instant, micros since epoch
+        let (h, _s) = sess
+            .prepare("SELECT ts, s FROM ev WHERE ts = $1")
+            .await
+            .unwrap();
+        let bound = sess
+            .bind(&h, vec![ScalarParam::Timestamptz(micros)])
+            .await
+            .unwrap();
+        let via_bind = sess.execute_bound(bound).await.unwrap();
+        let via_text = sess
+            .execute(&format!("SELECT ts, s FROM ev WHERE ts = '{ts_lit}'::timestamptz"))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows_repr(&via_bind),
+            rows_repr(&via_text),
+            "declined timestamptz-PK bind must match the text route for the same instant"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "timing probe"]
     async fn timing_probe_bind_direct_at_most_half_of_text() {
