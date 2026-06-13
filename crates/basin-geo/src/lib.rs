@@ -74,10 +74,16 @@
 
 pub mod epsg_table;
 pub mod geojson;
+pub mod geometry;
+pub mod measures;
 pub mod transform;
 pub mod types;
 pub mod wkb;
 
+pub use geometry::{
+    decode_any, decode_geojson, decode_wkt, encode_ewkb, encode_geojson, encode_wkb, encode_wkt,
+    geometry_type_name, Geom, GeomError,
+};
 pub use transform::{st_transform, st_transform_xy, GeoError as TransformError};
 pub use types::{Box2d, GeometryError, LineString, Point, Polygon, SRID_WGS84};
 pub use wkb::{decode_point, encode_point, from_hex, to_hex, WkbError, POINT_WKB_LEN};

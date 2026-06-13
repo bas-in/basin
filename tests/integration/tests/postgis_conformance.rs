@@ -137,6 +137,23 @@ async fn single_f64(sess: &basin_engine::ProjectSession, sql: &str) -> f64 {
     }
 }
 
+async fn single_i32(sess: &basin_engine::ProjectSession, sql: &str) -> i32 {
+    match sess.execute(sql).await {
+        Ok(ExecResult::Rows { batches, .. }) => {
+            let b = batches.first().unwrap_or_else(|| panic!("no batch: {sql}"));
+            let col = b.column(0);
+            let arr = col
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap_or_else(|| panic!("expected Int32 column for: {sql}"));
+            assert!(arr.len() >= 1, "no rows from: {sql}");
+            arr.value(0)
+        }
+        Ok(other) => panic!("non-rows for {sql}: {other:?}"),
+        Err(e) => panic!("error for {sql}: {e}"),
+    }
+}
+
 async fn single_bool(sess: &basin_engine::ProjectSession, sql: &str) -> bool {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
@@ -304,10 +321,12 @@ async fn st_geomfromtext_invalid_wkt_errors() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     for bad in &[
-        "LINESTRING(0 0, 1 1)",  // unsupported geometry type
         "POINT()",               // missing coordinates
         "POINT(1.0)",            // single coordinate (Y missing)
+        "POINT(1 2 3)",          // Z coordinate (2-D only)
+        "LINESTRING(0 0 0, 1 1 1)", // Z coordinates (2-D only)
         "not_a_wkt",             // garbage
+        "TRIANGLE((0 0, 1 0, 0 1, 0 0))", // unknown geometry tag
     ] {
         let r = sess
             .execute(&format!("SELECT ST_AsText(ST_GeomFromText('{bad}'))"))
@@ -317,7 +336,16 @@ async fn st_geomfromtext_invalid_wkt_errors() {
             "ST_GeomFromText({bad:?}) must error; got={r:?}"
         );
     }
-    println!("[geo ST_GeomFromText] invalid WKT → error ✓");
+    // LINESTRING / POLYGON / MULTI* WKT now parse as first-class geometry
+    // (the general WKB codec replaced the POINT-only ST_GeomFromText). What
+    // used to be an "unsupported geometry type" error is now a valid value.
+    let ls = single_string(
+        &sess,
+        "SELECT ST_AsText(ST_GeomFromText('LINESTRING(0 0, 1 1)'))",
+    )
+    .await;
+    assert_eq!(ls, "LINESTRING(0 0, 1 1)", "LINESTRING WKT must round-trip; got={ls:?}");
+    println!("[geo ST_GeomFromText] invalid WKT → error; LINESTRING now valid ✓");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -401,23 +429,28 @@ async fn st_geomfromgeojson_wrong_type_errors() {
     let (engine, _dir) = make_engine();
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    // Geometry type "LineString" is not POINT — must error.
-    let r = sess
-        .execute(
-            r#"SELECT ST_AsText(ST_GeomFromGeoJSON('{"type":"LineString","coordinates":[[0,0],[1,1]]}'))"#,
-        )
-        .await;
-    assert!(
-        r.is_err(),
-        "ST_GeomFromGeoJSON with non-Point type must error; got={r:?}"
-    );
+    // Geometry type "LineString" now parses as a first-class geometry (the
+    // general GeoJSON codec replaced the POINT-only ST_GeomFromGeoJSON). What
+    // used to be a non-Point error is now a valid round-trip.
+    let ls = single_string(
+        &sess,
+        r#"SELECT ST_AsText(ST_GeomFromGeoJSON('{"type":"LineString","coordinates":[[0,0],[1,1]]}'))"#,
+    )
+    .await;
+    assert_eq!(ls, "LINESTRING(0 0, 1 1)", "LineString GeoJSON must round-trip; got={ls:?}");
 
-    // Missing 'type' field.
+    // Missing 'type' field — still an error.
     let r2 = sess
         .execute(r#"SELECT ST_AsText(ST_GeomFromGeoJSON('{"coordinates":[1,2]}'))"#)
         .await;
     assert!(r2.is_err(), "ST_GeomFromGeoJSON without type field must error");
-    println!("[geo ST_GeomFromGeoJSON] invalid type → error ✓");
+
+    // Unknown geometry type — still an error.
+    let r3 = sess
+        .execute(r#"SELECT ST_AsText(ST_GeomFromGeoJSON('{"type":"Nonesuch","coordinates":[1,2]}'))"#)
+        .await;
+    assert!(r3.is_err(), "ST_GeomFromGeoJSON with unknown type must error; got={r3:?}");
+    println!("[geo ST_GeomFromGeoJSON] missing/unknown type → error; LineString now valid ✓");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1512,16 +1545,18 @@ async fn invalid_inputs_produce_typed_errors() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     let bad_inputs = [
-        // ST_GeomFromText: non-POINT type
-        "SELECT ST_AsText(ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 0))'))",
         // ST_GeomFromText: missing Y coord
         "SELECT ST_AsText(ST_GeomFromText('POINT(1.0)'))",
-        // ST_GeomFromText: Z coord (unsupported in v0.1)
+        // ST_GeomFromText: Z coord (2-D only)
         "SELECT ST_AsText(ST_GeomFromText('POINT(1 2 3)'))",
+        // ST_GeomFromText: unknown geometry tag
+        "SELECT ST_AsText(ST_GeomFromText('CIRCLE(0 0, 1)'))",
         // ST_GeomFromGeoJSON: invalid JSON
         "SELECT ST_AsText(ST_GeomFromGeoJSON('not_json'))",
-        // ST_GeomFromGeoJSON: wrong geometry type
-        r#"SELECT ST_AsText(ST_GeomFromGeoJSON('{"type":"MultiPoint","coordinates":[[0,0]]}'))"#,
+        // ST_GeomFromGeoJSON: 3-D coordinate (2-D only)
+        r#"SELECT ST_AsText(ST_GeomFromGeoJSON('{"type":"Point","coordinates":[1,2,3]}'))"#,
+        // ST_GeomFromGeoJSON: unknown geometry type
+        r#"SELECT ST_AsText(ST_GeomFromGeoJSON('{"type":"Nonesuch","coordinates":[0,0]}'))"#,
     ];
 
     for sql in &bad_inputs {
@@ -1531,5 +1566,484 @@ async fn invalid_inputs_produce_typed_errors() {
             "Invalid input must error: {sql:?}; got={r:?}"
         );
     }
-    println!("[geo invalid inputs] all produce errors ✓");
+
+    // POLYGON / MULTIPOINT are now first-class supported geometries (general
+    // WKB codec); they must parse, not error.
+    let poly = single_string(
+        &sess,
+        "SELECT ST_AsText(ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 0))'))",
+    )
+    .await;
+    assert_eq!(
+        poly, "POLYGON((0 0, 1 0, 1 1, 0 0))",
+        "POLYGON WKT must round-trip; got={poly:?}"
+    );
+    let mpoint = single_string(
+        &sess,
+        r#"SELECT ST_AsText(ST_GeomFromGeoJSON('{"type":"MultiPoint","coordinates":[[0,0],[1,1]]}'))"#,
+    )
+    .await;
+    assert_eq!(
+        mpoint, "MULTIPOINT(0 0, 1 1)",
+        "MultiPoint GeoJSON must round-trip; got={mpoint:?}"
+    );
+    println!("[geo invalid inputs] genuine garbage errors; POLYGON/MULTIPOINT now valid ✓");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group 16 — General geometry surface (LINESTRING / POLYGON / MULTI* /
+// GEOMETRYCOLLECTION). Exercises the variable-length WKB/EWKB/WKT/GeoJSON
+// codecs and the measures (length/area/centroid/envelope) end-to-end through
+// the SQL layer, with hand-computed expected values.
+//
+// Honesty notes on predicates:
+//   * ST_Contains / ST_Within / ST_Intersects on the general surface use the
+//     `geo` crate's exact planar topology traits (see basin-geo::measures) —
+//     NOT a bbox approximation. The point-in-polygon truth cases below pin
+//     exact interior/exterior classification, including a point that is inside
+//     the bounding box but OUTSIDE the polygon (the concave/triangle case),
+//     which a bbox-only predicate would mis-report as contained.
+//   * Planar measures (ST_Length/ST_Area) are Cartesian in coordinate units,
+//     matching PostGIS ST_Length/ST_Area on a plain `geometry` (not geography).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// WKT round-trip for every 2-D geometry type through ST_GeomFromText →
+/// ST_AsText. Expected strings are Basin's canonical WKT (PostGIS-compatible
+/// shapes; comma spacing is Basin's pin — see NEEDS-PSQL-VALIDATION).
+#[tokio::test]
+async fn geom_wkt_roundtrip_all_types() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let cases = [
+        "POINT(1 2)",
+        "LINESTRING(0 0, 3 4, 6 4)",
+        "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))",
+        "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1))",
+        "MULTIPOINT(0 0, 1 1, 2 2)",
+        "MULTILINESTRING((0 0, 1 1), (2 2, 3 3))",
+        "MULTIPOLYGON(((0 0, 1 0, 1 1, 0 0)), ((10 10, 11 10, 11 11, 10 10)))",
+        "GEOMETRYCOLLECTION(POINT(9 8), LINESTRING(0 0, 1 1))",
+    ];
+    for wkt in &cases {
+        let got = single_string(
+            &sess,
+            &format!("SELECT ST_AsText(ST_GeomFromText('{wkt}'))"),
+        )
+        .await;
+        assert_eq!(&got, wkt, "WKT round-trip must be identity for {wkt:?}");
+    }
+    println!("[geo gen WKT] round-trip all types ✓");
+}
+
+/// GeoJSON round-trip for the general types. PostGIS ST_AsGeoJSON emits a
+/// type-first compact envelope; pin that ordering (the bug fixed in the
+/// general encoder).
+#[tokio::test]
+async fn geom_geojson_roundtrip_and_ordering() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    // Type key must come first (PostGIS ST_AsGeoJSON convention).
+    let ls = single_string(
+        &sess,
+        "SELECT ST_AsGeoJSON(ST_GeomFromText('LINESTRING(0 0, 1 1)'))",
+    )
+    .await;
+    assert_eq!(
+        ls, r#"{"type":"LineString","coordinates":[[0.0,0.0],[1.0,1.0]]}"#,
+        "LineString GeoJSON must be type-first and compact; got={ls:?}"
+    );
+
+    // Full round-trip GeoJSON → geometry → GeoJSON for a polygon with a hole.
+    let poly_json =
+        r#"{"type":"Polygon","coordinates":[[[0.0,0.0],[4.0,0.0],[4.0,4.0],[0.0,4.0],[0.0,0.0]],[[1.0,1.0],[2.0,1.0],[2.0,2.0],[1.0,1.0]]]}"#;
+    let back = single_string(
+        &sess,
+        &format!("SELECT ST_AsGeoJSON(ST_GeomFromGeoJSON('{poly_json}'))"),
+    )
+    .await;
+    assert_eq!(back, poly_json, "Polygon GeoJSON must round-trip exactly; got={back:?}");
+    println!("[geo gen GeoJSON] round-trip + type-first ordering ✓");
+}
+
+/// WKB and EWKB round-trip for the general types: ST_AsEWKB → ST_GeomFromWKB →
+/// ST_AsText recovers the original WKT, for a polygon and a multipolygon.
+#[tokio::test]
+async fn geom_wkb_ewkb_roundtrip() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    for wkt in &[
+        "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))",
+        "MULTIPOLYGON(((0 0, 1 0, 1 1, 0 0)), ((10 10, 11 10, 11 11, 10 10)))",
+        "MULTILINESTRING((0 0, 1 1), (2 2, 3 3))",
+    ] {
+        // ST_AsEWKB embeds SRID 4326; ST_GeomFromWKB canonicalises back to WKB.
+        let got = single_string(
+            &sess,
+            &format!(
+                "SELECT ST_AsText(ST_GeomFromWKB(ST_AsEWKB(ST_GeomFromText('{wkt}'))))"
+            ),
+        )
+        .await;
+        assert_eq!(&got, wkt, "WKB/EWKB round-trip must recover {wkt:?}; got={got:?}");
+    }
+    println!("[geo gen WKB/EWKB] round-trip ✓");
+}
+
+/// ST_GeometryType reports the PostGIS type string for each geometry.
+#[tokio::test]
+async fn geom_geometrytype_strings() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let cases = [
+        ("POINT(1 2)", "ST_Point"),
+        ("LINESTRING(0 0, 1 1)", "ST_LineString"),
+        ("POLYGON((0 0, 1 0, 1 1, 0 0))", "ST_Polygon"),
+        ("MULTIPOINT(0 0, 1 1)", "ST_MultiPoint"),
+        ("MULTILINESTRING((0 0, 1 1))", "ST_MultiLineString"),
+        ("MULTIPOLYGON(((0 0, 1 0, 1 1, 0 0)))", "ST_MultiPolygon"),
+        ("GEOMETRYCOLLECTION(POINT(0 0))", "ST_GeometryCollection"),
+    ];
+    for (wkt, ty) in &cases {
+        let got = single_string(
+            &sess,
+            &format!("SELECT ST_GeometryType(ST_GeomFromText('{wkt}'))"),
+        )
+        .await;
+        assert_eq!(&got.as_str(), ty, "ST_GeometryType({wkt:?}) expected {ty}; got={got:?}");
+    }
+    println!("[geo gen ST_GeometryType] ✓");
+}
+
+/// ST_Length of a known linestring: (0,0)->(3,4)->(6,4) = 5 + 3 = 8 (planar).
+#[tokio::test]
+async fn geom_length_planar_known() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let len = single_f64(
+        &sess,
+        "SELECT ST_Length(ST_GeomFromText('LINESTRING(0 0, 3 4, 6 4)'))",
+    )
+    .await;
+    // |(0,0)->(3,4)| = 5 (3-4-5 triangle); |(3,4)->(6,4)| = 3. Total = 8.
+    assert!((len - 8.0).abs() < 1e-9, "ST_Length must be 8.0 (5 + 3); got={len}");
+    println!("[geo gen ST_Length] linestring = 8.0 ✓");
+}
+
+/// ST_Area of the unit square = 1.0 (planar); with a hole subtracted it drops.
+#[tokio::test]
+async fn geom_area_planar_unit_square_and_hole() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let unit = single_f64(
+        &sess,
+        "SELECT ST_Area(ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'))",
+    )
+    .await;
+    assert!((unit - 1.0).abs() < 1e-12, "ST_Area(unit square) must be 1.0; got={unit}");
+
+    // 4x4 square (area 16) with a 1x1 hole (area 1) → 15.
+    let holed = single_f64(
+        &sess,
+        "SELECT ST_Area(ST_GeomFromText('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1))'))",
+    )
+    .await;
+    assert!((holed - 15.0).abs() < 1e-9, "ST_Area(4x4 minus 1x1 hole) must be 15.0; got={holed}");
+
+    // MultiPolygon area sums the parts: two unit squares → 2.0.
+    let multi = single_f64(
+        &sess,
+        "SELECT ST_Area(ST_GeomFromText('MULTIPOLYGON(((0 0, 1 0, 1 1, 0 1, 0 0)), ((5 5, 6 5, 6 6, 5 6, 5 5)))'))",
+    )
+    .await;
+    assert!((multi - 2.0).abs() < 1e-12, "ST_Area(2 unit squares) must be 2.0; got={multi}");
+    println!("[geo gen ST_Area] unit-square=1, holed=15, multi=2 ✓");
+}
+
+/// ST_Centroid of a triangle (0,0),(3,0),(0,3) is at (1,1) — hand-computed.
+#[tokio::test]
+async fn geom_centroid_triangle() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let wkt = single_string(
+        &sess,
+        "SELECT ST_AsText(ST_Centroid(ST_GeomFromText('POLYGON((0 0, 3 0, 0 3, 0 0))')))",
+    )
+    .await;
+    assert_eq!(wkt, "POINT(1 1)", "triangle centroid must be (1,1); got={wkt:?}");
+    println!("[geo gen ST_Centroid] triangle → POINT(1 1) ✓");
+}
+
+/// ST_Envelope of a linestring is its bounding-box POLYGON.
+#[tokio::test]
+async fn geom_envelope_of_linestring_is_bbox_polygon() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    // LINESTRING(0 0, 3 4, 6 4) bbox = [0,6]x[0,4] → closed ring polygon.
+    let wkt = single_string(
+        &sess,
+        "SELECT ST_AsText(ST_Envelope(ST_GeomFromText('LINESTRING(0 0, 3 4, 6 4)')))",
+    )
+    .await;
+    assert_eq!(
+        wkt, "POLYGON((0 0, 6 0, 6 4, 0 4, 0 0))",
+        "ST_Envelope(linestring) must be the bbox polygon; got={wkt:?}"
+    );
+    println!("[geo gen ST_Envelope] linestring bbox polygon ✓");
+}
+
+/// Multipart accessors: ST_NumGeometries and ST_GeometryN (1-based).
+#[tokio::test]
+async fn geom_numgeometries_and_geometryn() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let mp = "MULTIPOINT(0 0, 1 1, 2 2)";
+    let n = single_i32(
+        &sess,
+        &format!("SELECT ST_NumGeometries(ST_GeomFromText('{mp}'))"),
+    )
+    .await;
+    assert_eq!(n, 3, "ST_NumGeometries(MULTIPOINT[3]) must be 3; got={n}");
+
+    // ST_GeometryN is 1-based; member 2 of the multipoint is POINT(1 1).
+    let g2 = single_string(
+        &sess,
+        &format!("SELECT ST_AsText(ST_GeometryN(ST_GeomFromText('{mp}'), 2))"),
+    )
+    .await;
+    assert_eq!(g2, "POINT(1 1)", "ST_GeometryN(.., 2) must be the 2nd member; got={g2:?}");
+
+    // Out-of-range index → NULL.
+    match sess
+        .execute(&format!("SELECT ST_AsText(ST_GeometryN(ST_GeomFromText('{mp}'), 9))"))
+        .await
+    {
+        Ok(ExecResult::Rows { batches, .. }) => {
+            assert!(
+                batches.first().expect("batch").column(0).is_null(0),
+                "ST_GeometryN out-of-range must return NULL"
+            );
+        }
+        Ok(ExecResult::Empty { .. }) => {}
+        Err(e) => panic!("ST_GeometryN out-of-range must not error: {e}"),
+    }
+
+    // Single geometry: ST_NumGeometries(POINT) == 1, ST_GeometryN(.., 1) == itself.
+    let single_n = single_i32(
+        &sess,
+        "SELECT ST_NumGeometries(ST_GeomFromText('POINT(5 6)'))",
+    )
+    .await;
+    assert_eq!(single_n, 1, "ST_NumGeometries(POINT) must be 1; got={single_n}");
+    println!("[geo gen multipart] ST_NumGeometries / ST_GeometryN ✓");
+}
+
+/// ST_NumPoints and ST_PointN / ST_StartPoint / ST_EndPoint on a linestring.
+#[tokio::test]
+async fn geom_linestring_vertex_accessors() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let ls = "LINESTRING(0 0, 3 4, 6 4)";
+    let n = single_i32(
+        &sess,
+        &format!("SELECT ST_NumPoints(ST_GeomFromText('{ls}'))"),
+    )
+    .await;
+    assert_eq!(n, 3, "ST_NumPoints(3-vertex line) must be 3; got={n}");
+
+    let p2 = single_string(
+        &sess,
+        &format!("SELECT ST_AsText(ST_PointN(ST_GeomFromText('{ls}'), 2))"),
+    )
+    .await;
+    assert_eq!(p2, "POINT(3 4)", "ST_PointN(.., 2) must be the 2nd vertex; got={p2:?}");
+
+    let start = single_string(
+        &sess,
+        &format!("SELECT ST_AsText(ST_StartPoint(ST_GeomFromText('{ls}')))"),
+    )
+    .await;
+    let end = single_string(
+        &sess,
+        &format!("SELECT ST_AsText(ST_EndPoint(ST_GeomFromText('{ls}')))"),
+    )
+    .await;
+    assert_eq!(start, "POINT(0 0)", "ST_StartPoint must be first vertex; got={start:?}");
+    assert_eq!(end, "POINT(6 4)", "ST_EndPoint must be last vertex; got={end:?}");
+    println!("[geo gen line accessors] ST_NumPoints/ST_PointN/Start/End ✓");
+}
+
+/// Exact point-in-polygon truth cases via ST_Contains / ST_Within.
+///
+/// The triangle (0,0),(4,0),(0,4) has bounding box [0,4]x[0,4]. The point
+/// (3,3) lies INSIDE that bbox but OUTSIDE the triangle (above the hypotenuse
+/// x+y=4). A bbox-only predicate would wrongly report it contained; the exact
+/// planar `geo::Contains` must report it NOT contained. This pins that the
+/// predicate is exact, not bbox-approximate.
+#[tokio::test]
+async fn geom_point_in_polygon_exact_truth() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    let tri = "POLYGON((0 0, 4 0, 0 4, 0 0))";
+
+    // Clearly interior point.
+    let inside = single_bool(
+        &sess,
+        &format!("SELECT ST_Contains(ST_GeomFromText('{tri}'), ST_MakePoint(1.0, 1.0))"),
+    )
+    .await;
+    assert!(inside, "ST_Contains: (1,1) is interior to the triangle");
+
+    // Inside the bbox but outside the triangle (above the hypotenuse).
+    let bbox_only = single_bool(
+        &sess,
+        &format!("SELECT ST_Contains(ST_GeomFromText('{tri}'), ST_MakePoint(3.0, 3.0))"),
+    )
+    .await;
+    assert!(
+        !bbox_only,
+        "ST_Contains: (3,3) is in the bbox but OUTSIDE the triangle — exact \
+         predicate must NOT report it contained (bbox-approx would be wrong)"
+    );
+
+    // Clearly exterior point.
+    let outside = single_bool(
+        &sess,
+        &format!("SELECT ST_Contains(ST_GeomFromText('{tri}'), ST_MakePoint(9.0, 9.0))"),
+    )
+    .await;
+    assert!(!outside, "ST_Contains: (9,9) is exterior");
+
+    // ST_Within is the argument-flipped alias.
+    let within = single_bool(
+        &sess,
+        &format!("SELECT ST_Within(ST_MakePoint(1.0, 1.0), ST_GeomFromText('{tri}'))"),
+    )
+    .await;
+    assert!(within, "ST_Within(point, polygon) must mirror ST_Contains");
+    println!("[geo gen point-in-polygon] exact (not bbox) truth cases ✓");
+}
+
+/// ST_Intersects between two linestrings: crossing → true, disjoint → false.
+/// Exact planar intersection (geo::Intersects), not a bbox overlap test —
+/// the disjoint pair below has OVERLAPPING bounding boxes but the segments
+/// do not actually intersect.
+#[tokio::test]
+async fn geom_intersects_exact_not_bbox() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    // Two crossing segments: (0,0)-(2,2) and (0,2)-(2,0) cross at (1,1).
+    let cross = single_bool(
+        &sess,
+        "SELECT ST_Intersects(\
+            ST_GeomFromText('LINESTRING(0 0, 2 2)'), \
+            ST_GeomFromText('LINESTRING(0 2, 2 0)'))",
+    )
+    .await;
+    assert!(cross, "crossing linestrings must intersect");
+
+    // Two L-shaped polylines whose bounding boxes overlap ([0,2]x[0,2] each)
+    // but whose segments never touch: one hugs the bottom-left, the other the
+    // top-right, leaving a gap. A bbox test would say "intersects"; exact says no.
+    let disjoint = single_bool(
+        &sess,
+        "SELECT ST_Intersects(\
+            ST_GeomFromText('LINESTRING(0 0, 0 2, 0.5 2)'), \
+            ST_GeomFromText('LINESTRING(2 0, 2 2, 1.5 0)'))",
+    )
+    .await;
+    assert!(
+        !disjoint,
+        "linestrings with overlapping bboxes but no segment contact must NOT \
+         intersect — exact predicate, not bbox-approx"
+    );
+    println!("[geo gen ST_Intersects] exact (not bbox) ✓");
+}
+
+/// NULL / empty geometry handling on the general surface.
+#[tokio::test]
+async fn geom_null_and_empty_handling() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    // NULL input to the general unary UDFs returns NULL (NULL-safe).
+    exec(&sess, "CREATE TABLE gnull (id BIGINT, g BYTEA)").await;
+    exec(&sess, "INSERT INTO gnull VALUES (1, NULL)").await;
+    for fn_sql in &[
+        "ST_AsText(ST_GeomFromWKB(g))",
+        "ST_Length(ST_GeomFromWKB(g))",
+        "ST_Area(ST_GeomFromWKB(g))",
+        "ST_GeometryType(ST_GeomFromWKB(g))",
+        "ST_NumGeometries(ST_GeomFromWKB(g))",
+    ] {
+        let sql = format!("SELECT {fn_sql} FROM gnull WHERE id = 1");
+        match sess.execute(&sql).await {
+            Ok(ExecResult::Rows { batches, .. }) => {
+                assert!(
+                    batches.first().expect("batch").column(0).is_null(0),
+                    "NULL-safe: {sql} must return NULL"
+                );
+            }
+            Ok(ExecResult::Empty { .. }) => {}
+            Err(e) => panic!("NULL-safe: {sql} must not error: {e}"),
+        }
+    }
+
+    // Empty GEOMETRYCOLLECTION parses and reports 0 members.
+    let n = single_i32(
+        &sess,
+        "SELECT ST_NumGeometries(ST_GeomFromText('GEOMETRYCOLLECTION()'))",
+    )
+    .await;
+    assert_eq!(n, 0, "ST_NumGeometries(empty collection) must be 0; got={n}");
+    println!("[geo gen NULL/empty] handled ✓");
+}
+
+/// Invalid WKB fed to ST_GeomFromWKB must produce a typed error, not a panic.
+#[tokio::test]
+async fn geom_invalid_wkb_typed_error() {
+    basin_common::telemetry::try_init_for_tests();
+    let (engine, _dir) = make_engine();
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+
+    // Build a deliberately malformed WKB: claims POINT but supplies no coords.
+    // X'0101000000' = LE + type=1 (POINT) with zero body bytes → truncated.
+    let r = sess
+        .execute("SELECT ST_AsText(ST_GeomFromWKB(decode('0101000000', 'hex')))")
+        .await;
+    assert!(r.is_err(), "truncated WKB must error cleanly; got={r:?}");
+
+    // Trailing-garbage WKB (valid POINT followed by an extra byte) must also error.
+    let r2 = sess
+        .execute(
+            "SELECT ST_AsText(ST_GeomFromWKB(\
+                decode('0101000000000000000000F03F000000000000004000', 'hex')))",
+        )
+        .await;
+    assert!(r2.is_err(), "WKB with trailing bytes must error; got={r2:?}");
+    println!("[geo gen invalid WKB] typed error ✓");
 }
