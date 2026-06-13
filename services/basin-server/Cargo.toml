@@ -26,6 +26,10 @@ auth      = ["dep:basin-auth"]
 rest      = ["dep:basin-rest", "auth"]
 webhooks  = ["dep:basin-webhooks"]
 realtime  = ["dep:basin-realtime", "dep:basin-cdc", "basin-rest?/realtime"]
+# ADR 0028 Phase 3: enable the production Kafka/Redpanda CDC push sink. OFF by
+# default — pulls the pure-Rust `rskafka` client (no librdkafka C toolchain).
+# Implies `realtime` (the Kafka supervisor reuses the CDC ring writer).
+cdc-kafka = ["realtime", "basin-cdc/cdc-kafka"]
 # Feature 1: wire basin-fn FunctionRuntime for LANGUAGE javascript functions.
 # Enables the catalog-backed FunctionInvoker installed via set_global_invoker.
 wasm-fn   = ["dep:basin-fn"]

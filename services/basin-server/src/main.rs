@@ -517,6 +517,24 @@ async fn main() -> Result<()> {
             "basin-cdc post-commit sink attached (durable ring + retention GC + webhook push)"
         );
         // <<< ADR 0028 Phase 2 CDC-WEBHOOK SUPERVISOR (anchored, flagged) <<<
+
+        // >>> ADR 0028 Phase 3 CDC-KAFKA SUPERVISOR (anchored, flagged) >>>
+        // Process-wide Kafka push supervisor: discovers projects with a CDC ring
+        // and runs one isolated per-sink delivery worker per registered Kafka
+        // sink (catalog-backed configs + cursor), resuming from the durable ring
+        // exactly like the webhook supervisor. Gated on the `cdc-kafka` feature
+        // so the default build never links the Kafka client; detached for the
+        // process lifetime like the flusher / GC / webhook supervisor above.
+        #[cfg(feature = "cdc-kafka")]
+        {
+            std::mem::forget(basin_cdc::spawn_kafka_supervisor(
+                sink.clone(),
+                catalog.clone(),
+                basin_cdc::KafkaConfig::from_env(),
+            ));
+            tracing::info!("basin-cdc kafka push supervisor attached (cdc-kafka feature)");
+        }
+        // <<< ADR 0028 Phase 3 CDC-KAFKA SUPERVISOR (anchored, flagged) <<<
         sink
     };
 
