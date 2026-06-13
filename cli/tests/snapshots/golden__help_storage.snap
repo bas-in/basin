@@ -16,5 +16,7 @@ FLAGS / SUBCOMMANDS
   list <bucket> [--prefix p]                List objects in a bucket.
   rm <bucket> <path…>                       Bulk-delete objects by prefix.
   sign <bucket> <path> [--expires-in 3600]  Mint a signed URL.
+  policy get [--project=<ref>]              Get the storage access policy.
+  policy put --policy=<json> [--project=<ref>]  Set the storage access policy.
   
   Global: --project=<ref>  --json

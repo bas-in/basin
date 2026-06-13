@@ -15,3 +15,4 @@ FLAGS / SUBCOMMANDS
   redeliver <id> --delivery=<id> [--project=<ref>]                  Redeliver a past delivery.
   delete <id>                  [--project=<ref>] [--yes]             Delete a webhook.
   deliveries <id> [--limit=N]  [--project=<ref>]                    List deliveries for a webhook.
+  inbound list/create/get/delete/rotate [--project=<ref>]            Manage inbound webhook receivers.

@@ -85,14 +85,14 @@ Priority bands:
 | Functions delete | ✅ `functions delete` | ❌ | ✅ | — |
 | Functions `serve` (local dev server) | ❌ | ❌ | ✅ | P2 — needs local Wasm runtime host; the W2 `fn/v1/:name` data-plane route can serve invocations already, but a local file-watch + hot-reload dev loop needs the engine running locally. See local-dev-stack section. |
 | `rpc <fn>` (invoke SQL/Wasm function) | ✅ `rpc <fn>` | ❌ | ✅ (`functions invoke`) | — |
-| Inbound webhooks list / create / delete / rotate | ❌ | ❌ | ❌ | P0 — backed by `/v1/projects/:ref/inbound-webhooks/*` (fully wired in cloud T-094). CLI verb would be `basin webhooks inbound list/create/delete/rotate`. TASKS.md T26 footnote calls this out as a follow-on to `webhooks`. |
+| Inbound webhooks list / create / delete / rotate | ✅ `webhooks inbound list/create/get/delete/rotate` | ❌ | ❌ | — |
 | **Realtime** | | | | |
 | Realtime SSE subscribe (single table) | ✅ `realtime subscribe <table>` | ❌ | ✅ | — |
 | Realtime WS subscribe (multi-table) | ❌ (WS deferred — needs tungstenite) | ❌ | ✅ | P0 — engine 5.11.R3 ships WS; CLI blocked on tungstenite dep decision (decisions.md). Cloud route: `GET /realtime/v1/ws/:project`. |
 | **Object storage** | | | | |
 | Storage buckets list / create / delete | ✅ `storage buckets list/create/delete` | ❌ | ✅ | — |
 | Storage upload / download / list / rm / sign | ✅ `storage upload/download/list/rm/sign` | ❌ | ✅ | — |
-| Storage object policies (RLS-style) | ❌ | ❌ | ✅ | P0 — `GET/PUT /v1/projects/:ref/storage-objects/policy` (cloud T-135). CLI verb: `basin storage policy get/put`. |
+| Storage object policies (RLS-style) | ✅ `storage policy get/put` | ❌ | ✅ | — |
 | **Row-level security** | | | | |
 | RLS enable / disable | ✅ `rls enable/disable` | ❌ | ✅ | — |
 | RLS policies list / create / drop | ✅ `rls policies list/create/drop` | ❌ | ✅ | — |
@@ -110,9 +110,9 @@ Priority bands:
 | Webhooks list / create / test / redeliver / delete / deliveries | ✅ `webhooks` | ❌ | ✅ | — |
 | Alerts rules + events | ✅ `alerts rules/events` | ✅ | ❌ | — |
 | ERD export (svg / dot / json) | ✅ `erd export` | ❌ | ❌ | Basin-only |
-| Index advisor | ❌ | ❌ | ❌ | P0 — `GET /v1/projects/:ref/index-advisor` (cloud T-125). CLI verb: `basin index-advisor [--project=<ref>]`. Single GET, no body. |
-| EXPLAIN proxy | ❌ | ❌ | ❌ | P0 — `GET /v1/projects/:ref/explain?sql=<url-encoded>&analyze=<bool>`. CLI verb: `basin explain <sql> [--analyze] [--project=<ref>]`. |
-| Replication slots list / create / drop | ❌ | ✅ | ❌ | P0 — `GET/POST /v1/projects/:ref/replication-slots` + `DELETE /v1/projects/:ref/replication-slots/:name` (cloud T-121). CLI verb: `basin replication-slots list/create/drop`. |
+| Index advisor | ✅ `index-advisor` | ❌ | ❌ | — |
+| EXPLAIN proxy | ✅ `explain [--analyze]` | ❌ | ❌ | — |
+| Replication slots list / create / drop | ✅ `replication-slots list/create/drop` | ✅ | ❌ | — |
 | **Domains / SSL** | | | | |
 | Domains add / verify / cert / list / remove | ✅ `domains add/verify/cert/list/remove` | ✅ | ✅ | — |
 | **Engine knobs** | | | | |
@@ -131,11 +131,18 @@ Priority bands:
 | `gen types typescript` | ✅ `gen types typescript` | ❌ | ✅ | — |
 | `gen types go` | ✅ `gen types go` | ❌ | ❌ | — |
 | `gen types python` (Pydantic) | ✅ `gen types python` | ❌ | ❌ | — |
+| `gen types ruby` (Struct) | ✅ `gen types ruby` | ❌ | ❌ | Basin-only |
+| `gen types rust` (serde) | ✅ `gen types rust` | ❌ | ❌ | Basin-only |
+| `gen types java` (Jackson POJOs) | ✅ `gen types java` | ❌ | ❌ | Basin-only |
+| `gen types csharp` (System.Text.Json records) | ✅ `gen types csharp` | ❌ | ❌ | Basin-only |
+| `gen types php` (readonly classes) | ✅ `gen types php` | ❌ | ❌ | Basin-only |
+| `gen types dart` (fromJson/toJson classes) | ✅ `gen types dart` | ❌ | ❌ | Basin-only |
+| `gen types swift` (Codable structs) | ✅ `gen types swift` | ❌ | ❌ | Basin-only |
 | `gen types --watch` | ✅ `gen types --watch` | ❌ | ❌ | Basin-only |
 | **Local dev stack** | | | | |
-| `dev` / `start` (boot local engine) | ❌ | ❌ | ✅ | P1 — see §Local dev stack verdict below |
-| `stop` (stop local engine) | ❌ | ❌ | ✅ | P1 |
-| Local seed / reset | ❌ `db reset` covers remote | ❌ | ✅ | P1 |
+| `dev` / `start` (boot local engine) | ✅ `dev` (binary mode + Docker mode) | ❌ | ✅ | — P1 shipped |
+| `stop` (stop local engine) | ✅ `stop` (Docker Compose mode) | ❌ | ✅ | — P1 shipped |
+| Local seed / reset | ✅ `dev --seed` + `dev --apply-migrations` | ❌ | ✅ | — |
 | **Utilities** | | | | |
 | Shell completion (bash / zsh / fish) | ✅ `completion bash/zsh/fish` | ✅ | ✅ | — |
 | `config get/set` | ✅ `config get/set` | ✅ | ✅ | — |
@@ -151,128 +158,79 @@ Priority bands:
 
 | Priority | Count | Area |
 |---|---|---|
-| **P0** | 6 | inbound-webhooks, storage policy, realtime WS multi-table, index-advisor, explain, replication-slots |
-| **P1** | 3 | local dev stack (`basin dev/start/stop`), dedicated IP-allowlist command |
+| **P0** | 1 | realtime WS multi-table (tungstenite dep decision pending) |
+| **P1** | 1 | dedicated IP-allowlist command (covered by `tokens create/patch` flags — low-DX gap) |
 | **P2** | 3 | PITR restore, functions serve (local Wasm host), browser-flow OAuth login |
+
+All six original P0 gaps (inbound-webhooks, storage policy, index-advisor, explain,
+replication-slots) were shipped in the prior session. The local dev stack (P1) is now
+shipped. gen types covers the full 10-SDK matrix.
 
 ---
 
-## P0 gaps — backend exists, CLI work only
+## P0 gaps — SHIPPED (all CLI-only items done)
 
-### 1. `basin webhooks inbound list/create/get/delete/rotate`
+### 1. ✅ `basin webhooks inbound list/create/get/delete/rotate`
+Shipped in `src/commands/inbound_webhooks.rs` (commit 54660b8).
 
-Cloud routes (T-094, fully wired):
-```
-GET    /v1/projects/:ref/inbound-webhooks
-POST   /v1/projects/:ref/inbound-webhooks
-GET    /v1/projects/:ref/inbound-webhooks/:id
-DELETE /v1/projects/:ref/inbound-webhooks/:id
-POST   /v1/projects/:ref/inbound-webhooks/:id/rotate
-```
+### 2. ✅ `basin storage policy get/put`
+Shipped as `storage policy` sub-dispatcher in `src/commands/storage.rs` (commit 49421a1).
 
-New file: `src/commands/webhooks.rs` extension (add `inbound` sub-dispatcher) or
-a new `src/commands/inbound_webhooks.rs`. Mirrors the outbound `webhooks` shape.
-
-### 2. `basin storage policy get/put`
-
-Cloud routes (T-135):
-```
-GET /v1/projects/:ref/storage-objects/policy
-PUT /v1/projects/:ref/storage-objects/policy
-```
-
-Extend `src/commands/storage.rs` with a `policy` sub-dispatcher.
-
-### 3. `basin realtime subscribe --multi <t1>,<t2>,…`
+### 3. `basin realtime subscribe --multi <t1>,<t2>,…` — STILL BLOCKED
 
 Engine 5.11.R3 ships the WS multiplex path (`GET /realtime/v1/ws/:project`).
 Blocked on a tungstenite dep decision (see ROADMAP.md T26.2/T26.3). Decision
 needed before implementation; do not add async dep without recording in
 `decisions.md`.
 
-### 4. `basin index-advisor [--project=<ref>]`
+### 4. ✅ `basin index-advisor [--project=<ref>]`
+Shipped in `src/commands/index_advisor.rs` (commit 0229f70).
 
-Cloud route (T-125):
-```
-GET /v1/projects/:ref/index-advisor
-```
+### 5. ✅ `basin explain <sql> [--analyze] [--project=<ref>]`
+Shipped in `src/commands/explain.rs` (commit 7330d94).
 
-Single GET; returns per-column JSONB index hints with recommended DDL. High
-DX value: surfaces which columns need GIN indexes with the exact `CREATE INDEX`
-DDL pre-filled. New file: `src/commands/index_advisor.rs`.
-
-### 5. `basin explain <sql> [--analyze] [--project=<ref>]`
-
-Cloud route:
-```
-GET /v1/projects/:ref/explain?sql=<url-encoded>&analyze=true|false
-```
-
-Proxies to the engine's `EXPLAIN ANALYZE`. Useful for DX without a psql
-connection. New file: `src/commands/explain.rs`. `sql` can come from
-positional arg, `--file`, or stdin.
-
-### 6. `basin replication-slots list/create/drop`
-
-Cloud routes (T-121):
-```
-GET    /v1/projects/:ref/replication-slots
-POST   /v1/projects/:ref/replication-slots
-DELETE /v1/projects/:ref/replication-slots/:name
-```
-
-Neon surfaces this as `neonctl replication-slot`. Useful for CDC pipelines
-(Debezium, River). New file: `src/commands/replication_slots.rs`.
+### 6. ✅ `basin replication-slots list/create/drop`
+Shipped in `src/commands/replication_slots.rs` (commit 54660b8).
 
 ---
 
-## P1 gaps — local scaffolding needed
+## P1 gaps — SHIPPED
 
-### Local dev stack (`basin dev` / `basin start`)
+### ✅ Local dev stack (`basin dev` / `basin stop`)
 
-**Verdict: partially implementable today, full Supabase-parity requires
-Docker and a released engine image.**
+**Shipped** in `src/commands/dev.rs` with two modes:
 
-The OSS `basin-server` binary is available in `../basin/` as a Rust workspace;
-the `dev/docker-compose.yml` in the engine repo already wires catalog-pg +
-MinIO + basin-server into a three-service stack. A `basin dev` command could:
+**Binary mode (default, no Docker):**
+1. Resolves `basin-server` from `--server-bin` / `BASIN_SERVER_BIN` / PATH.
+2. Creates `BASIN_DATA_DIR` and `BASIN_WAL_DIR` under `/tmp/basin-dev`.
+3. Spawns `basin-server` with `BASIN_STORAGE_BACKEND=local`,
+   `BASIN_PROJECTS=dev=*`, and the specified port.
+4. Polls TCP readiness on 127.0.0.1:<port> (configurable timeout, default 60 s).
+5. Prints `postgres://dev@127.0.0.1:<port>/dev` and blocks until Ctrl-C.
 
-**Light version (no Docker, prereq: a pre-built basin-server on PATH):**
-1. Check `basin-server` is on PATH; if not, print install hint.
-2. Create a temp dir for `BASIN_DATA_DIR` and `BASIN_WAL_DIR`.
-3. Spawn `basin-server` with local FS storage (`BASIN_STORAGE_BACKEND=local`),
-   a single ephemeral project (`BASIN_PROJECTS=dev=*`), and port 5432.
-4. Poll pgwire readiness (tcp connect to 127.0.0.1:5432).
-5. Print `postgres://dev@127.0.0.1:5432/dev` and hang, forwarding Ctrl-C to
-   child process.
+**Docker mode (`--docker`):**
+1. Resolves docker-compose.yml from `--compose-file` / `BASIN_COMPOSE_FILE` /
+   `../basin/dev/docker-compose.yml`.
+2. Runs `docker compose up -d --remove-orphans`.
+3. Polls TCP readiness.
+4. `basin stop` runs `docker compose down`.
 
-**Full version (Docker required):**
-Shell-compose the `dev/docker-compose.yml` from the basin engine repo, or
-vendor a smaller single-service compose that only needs Docker installed.
+Both modes support `--apply-migrations` (applies `./basin/migrations/*.sql`
+via `psql`) and `--seed=<path>` (runs a seed SQL file via `psql`).
 
-**What's blocked:**
-- No released `basin-server` binary or image yet (engine is pre-v0.1 release).
-  The `ghcr.io/bas-in/basin-server:latest` image referenced in the quickstart
-  guide only ships post-tag.
-- Without a binary or image, `basin dev` cannot start the engine unless the
-  user builds from source (`cargo build --release -p basin-server`).
-- There is no `basin-cloud` equivalent exposed locally; all cloud-API commands
-  (`migrations apply`, `branches create`, etc.) still need the remote cloud.
-  `basin dev` would be engine-only (OSS commands: `rpc`, `storage`, `realtime`,
-  direct `psql` — same surface listed in README §"Self-hosted OSS engine").
+**Prerequisites (binary mode):** build `basin-server` from the engine repo:
+```
+cargo build --release -p basin-server  # in bas-in/basin checkout
+export BASIN_SERVER_BIN=/path/to/target/release/basin-server
+```
 
-**Recommended implementation (P1, add when engine image ships):**
-- `src/commands/dev.rs` — `basin dev [--port=5432] [--data-dir=<path>]`
-- Checks for `basin-server` on PATH (or `docker` + image); spawns the engine;
-  waits for ready; prints connection string.
-- `--apply-migrations` flag: after ready, apply `./basin/migrations/*.sql` via
-  pgwire (reuse the `db push` logic against localhost).
-- `--seed` flag: run `./basin/seed.sql` via pgwire.
-- Does not require basin-cloud; works entirely against the OSS engine.
-
-**Backend handoff**: engine maintainers need to (a) publish a tagged release
-of `basin-server` and (b) publish `ghcr.io/bas-in/basin-server:<tag>` before
-`basin dev` with the Docker path can be wired end-to-end.
+**Notes:**
+- No released `basin-server` binary or Docker image yet (engine pre-v0.1).
+  The command works today for anyone who has the engine built from source.
+- Cloud-API commands (`migrations apply`, `branches create`, etc.) still
+  require the remote cloud; `basin dev` is engine-only (OSS surface).
+- When `ghcr.io/bas-in/basin-server` is published, `--docker` will work
+  out-of-the-box without a local build.
 
 ---
 
@@ -295,7 +253,7 @@ unique platform surface:
 - `basin db lint` — SQL-compat linter against migration files
 - `basin erd export` — entity-relationship diagram export
 - `basin queries save/list/fork/history` — saved SQL query library
-- `basin gen types go` / `basin gen types python` — non-TS type generation
+- `basin gen types go/python/ruby/rust/java/csharp/php/dart/swift` — non-TS type generation for full SDK matrix
 - `basin gen types --watch` — live type re-emission on migration change
 - `basin audit --export` — multi-destination audit export (S3/SFTP/Splunk/Datadog)
 - `basin byo bucket/kms/engine` — bring-your-own infrastructure configuration
@@ -303,6 +261,8 @@ unique platform surface:
 - `basin migrate-from-pg` — guided Postgres → Basin migration
 - `basin orgs branding get/put` — org white-label branding
 - `basin tables import-csv/export-csv` — direct CSV ingest/export without psql
+- `basin index-advisor` — JSONB GIN index recommendations with exact CREATE INDEX DDL
+- `basin webhooks inbound list/create/get/delete/rotate` — HMAC inbound webhook receiver management
 
 ---
 
@@ -311,32 +271,29 @@ unique platform surface:
 1. **PITR `restore --as-of`** — requires engine v0.2 physical GC. File issue in
    `bas-in/basin` once GC ships; open basin-cli command in the same PR.
 
-2. **Local dev stack (`basin dev`)** — requires a published `basin-server` binary
-   or Docker image. Tag a `basin-server` release in `bas-in/basin` first;
-   then this becomes a 1-day CLI sprint.
+2. **`basin dev` Docker mode — full zero-config** — works today when the user
+   has the engine repo checked out as a sibling (`../basin/dev/docker-compose.yml`).
+   When `ghcr.io/bas-in/basin-server` is published it will work out-of-the-box
+   for any user with Docker (no engine source needed).
 
-3. **`functions serve` hot-reload** — depends on (2) above.
+3. **`functions serve` hot-reload** — depends on `basin dev` being available.
+   Once a user has `basin dev` running, `functions serve` becomes a file-watch
+   loop that re-deploys on change. Implement when `basin dev` is stable.
 
 4. **Realtime WS multi-table** — dep decision needed first: record in
    `decisions.md` whether `tungstenite` is acceptable (it is a production-
    quality, audited crate with no transitive C deps). If approved, T26.2 +
    T26.3 from TASKS.md become straightforward.
 
-5. **Browser-flow `login`** — requires cloud OAuth device-flow endpoint.
+5. **Browser-flow `login`** — requires cloud OAuth device-flow endpoint
+   (`GET /v1/oauth/device`). Not yet in cloud handlers.
 
-6. **Storage object policies** (`GET/PUT /storage-objects/policy`) — T-135 in
-   cloud; endpoint fully wired. CLI gap only.
-
-7. **Index advisor** — T-125 in cloud; endpoint fully wired. CLI gap only.
-
-8. **Explain proxy** — endpoint fully wired. CLI gap only.
-
-9. **Replication slots** — T-121 in cloud; endpoint fully wired. CLI gap only.
-
-10. **Inbound webhooks** — T-094 in cloud; endpoint fully wired. CLI gap only.
+6. **Dedicated IP-allowlist command** — covered at the UX level by
+   `basin tokens create/patch --ip-allowlist=...`; a dedicated `ip-allow`
+   command would add minimal DX value. Implement only if user demand warrants.
 
 ---
 
-*Generated by parity audit — 2026-06-13. Basis: HEAD commit `be8c791`, cloud
-handlers at `../basin-cloud/backend-rs/src/handlers/`, engine CAPABILITIES.md
-at `../basin/CAPABILITIES.md`, TASKS.md tiers 8–27 all ticked.*
+*Updated 2026-06-14. All six original P0 gaps (T-094, T-121, T-125, T-135,
+explain, index-advisor) shipped. P1 local dev stack shipped. gen types expanded
+to the full 10-SDK matrix (ts/go/py/ruby/rust/java/csharp/php/dart/swift).*
