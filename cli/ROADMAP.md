@@ -11,7 +11,7 @@ roadmap item links to one or more tiers there.
 
 > **Cross-references**
 > - Engine capabilities: `../basin/CAPABILITIES.md`
-> - Cloud product roadmap: `../basin-cloud/CLOUD_ROADMAP.md`
+> - Cloud product roadmap: `../basin-cloud/ROADMAP.md` (+ `TASKS.md` for agent-dispatchable work)
 > - Today's CLI surface: [`README.md`](./README.md)
 
 ---
