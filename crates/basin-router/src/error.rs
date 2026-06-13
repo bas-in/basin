@@ -295,6 +295,29 @@ mod tests {
     }
 
     #[test]
+    fn fly_replay_directive_renders_for_forward_replay() {
+        // The edge turns ForwardReplay into a `fly-replay` header value naming
+        // the home region; the token rides in the state field.
+        let err = BasinError::forward_replay("fra", "jnb-7");
+        assert_eq!(
+            super::fly_replay_directive(&err),
+            Some("region=fra;state=jnb-7".to_owned())
+        );
+        // Any other error: no directive (render a normal ErrorResponse).
+        assert_eq!(super::fly_replay_directive(&BasinError::wal("x")), None);
+    }
+
+    #[test]
+    fn forward_replay_degrades_to_08006_when_edge_ignores_it() {
+        // If the edge does NOT intercept the replay signal, classify() falls
+        // back to the same 08006 a no-forwarder deployment raises.
+        let er = error_response(&BasinError::forward_replay("fra", "tok"));
+        assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
+        assert_eq!(er.fields[1], (b'C', "08006".to_owned()));
+        assert!(er.fields[2].1.contains("fra"), "names the home region");
+    }
+
+    #[test]
     fn classifies_ambiguous_conflict_target() {
         // ON CONFLICT target mismatch must surface as SQLSTATE 42P10
         // (invalid_column_reference).
