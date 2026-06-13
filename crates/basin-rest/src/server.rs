@@ -509,6 +509,23 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         );
     // <<< ADR 0028 Phase 2 CDC-WEBHOOK ROUTES (anchored, flagged) <<<
 
+    // >>> ADR 0028 Phase 3 CDC-KAFKA-SINK ROUTES (anchored, flagged) >>>
+    // CDC Kafka sink config CRUD. Same project-scoped auth + `Arc<Inner>` state
+    // + `realtime` gating as the Phase 2 webhook routes above; only the entity
+    // (catalog-backed Kafka sink config) differs.
+    #[cfg(feature = "realtime")]
+    let app = app
+        .route(
+            "/v1/cdc/:project/kafka-sinks",
+            post(crate::routes::cdc_kafka::register_kafka_sink)
+                .get(crate::routes::cdc_kafka::list_kafka_sinks),
+        )
+        .route(
+            "/v1/cdc/:project/kafka-sinks/:id",
+            axum::routing::delete(crate::routes::cdc_kafka::delete_kafka_sink),
+        );
+    // <<< ADR 0028 Phase 3 CDC-KAFKA-SINK ROUTES (anchored, flagged) <<<
+
     let app = app
         .layer(body_limit)
         .layer(cors)

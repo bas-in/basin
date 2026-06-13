@@ -12,6 +12,11 @@ pub(crate) mod admin;
 pub(crate) mod admin_functions;
 pub(crate) mod admin_projects;
 pub(crate) mod auth;
+// ADR 0028 Phase 3: CDC Kafka sink config CRUD. Gated on the `realtime`
+// feature for the same reason as `cdc_webhooks` — it depends on `basin-cdc`
+// (sink-id minting), the optional dep behind the CDC SSE co-mount.
+#[cfg(feature = "realtime")]
+pub(crate) mod cdc_kafka;
 // ADR 0028 Phase 2: CDC webhook subscription CRUD. Gated on the `realtime`
 // feature because it depends on `basin-cdc` (id/secret minting), which is the
 // same optional dep the CDC SSE co-mount uses.
