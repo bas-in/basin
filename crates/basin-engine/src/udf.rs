@@ -68,6 +68,18 @@ pub(crate) fn register_distance_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(VectorToTextUdf {
         signature: Signature::any(1, Volatility::Immutable),
     }));
+    // pgvector aggregate: vector_avg(vector) → element-wise mean.
+    //
+    // Registered ONLY under `vector_avg`, not `avg`: replacing DataFusion's
+    // builtin `avg` by name would clobber numeric `avg(int/float/decimal)`
+    // (a registered UDAF shadows the builtin for every call site, and this
+    // accumulator can't serve numeric AVG). pgvector's own `avg(vector)`
+    // overload relies on PG's type-dispatched operator resolution, which the
+    // DataFusion registry (name-keyed, not signature-keyed for UDAFs) does
+    // not provide. `vector_avg` is the portable spelling; the gap is noted in
+    // the vector conformance suite.
+    use datafusion::logical_expr::AggregateUDF;
+    ctx.register_udaf(AggregateUDF::from(VectorAvgUdaf::new("vector_avg")));
 }
 
 /// Register the UUID + pgcrypto-shaped UDFs on `ctx`. Idempotent. Surface:
@@ -514,6 +526,256 @@ impl<'a> VectorView<'a> {
                 Ok(Some(parsed))
             }
         }
+    }
+}
+
+// ── vector_avg — element-wise mean aggregate ─────────────────────────────────
+//
+// pgvector's `avg(vector)` / `vector_avg(vector)` returns the element-wise
+// mean of the non-NULL vectors in the group:
+//
+//   vector_avg([1,2], [3,4], NULL) = [(1+3)/2, (2+4)/2] = [2, 3]
+//
+// Semantics (matching PostgreSQL / pgvector):
+//   * NULL inputs are skipped (PG aggregates ignore NULLs).
+//   * Zero non-NULL rows → NULL result.
+//   * Any dimension mismatch among the inputs is a hard error
+//     ("different vector dimensions N and M").
+//
+// State for partial aggregation: a running per-element f64 sum plus an i64
+// count, carried as a `List<Float64>` (the sum) and an `Int64` (the count).
+// f64 accumulation keeps the running sum well-conditioned; the final mean is
+// narrowed back to f32 to match the `vector(N)` storage form.
+
+use datafusion::arrow::array::{FixedSizeListBuilder, Float32Builder, ListArray};
+use datafusion::arrow::datatypes::Field;
+use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
+use datafusion::logical_expr::{Accumulator, AggregateUDFImpl};
+use datafusion::scalar::ScalarValue;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VectorAvgUdaf {
+    name: &'static str,
+    signature: Signature,
+}
+
+impl VectorAvgUdaf {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            // Accept any single argument; we validate it is a vector at
+            // accumulation time (FixedSizeList<Float32> or a '[..]' literal).
+            signature: Signature::any(1, Volatility::Immutable),
+        }
+    }
+}
+
+impl AggregateUDFImpl for VectorAvgUdaf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        // Mirror the input vector type when it is a typed FixedSizeList; for a
+        // literal/unknown input we can't know the dim until rows arrive, so
+        // fall back to a dim-1 placeholder (the accumulator carries the real
+        // dim and builds the correct-width result array).
+        match arg_types.first() {
+            Some(DataType::FixedSizeList(child, n)) if *child.data_type() == DataType::Float32 => {
+                Ok(DataType::FixedSizeList(child.clone(), *n))
+            }
+            _ => Ok(DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                1,
+            )),
+        }
+    }
+
+    fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<Arc<Field>>> {
+        Ok(vec![
+            Arc::new(Field::new(
+                format!("{}_sum", args.name),
+                DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+                true,
+            )),
+            Arc::new(Field::new(
+                format!("{}_count", args.name),
+                DataType::Int64,
+                true,
+            )),
+        ])
+    }
+
+    fn accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
+        // The output FixedSizeList width is fixed at plan time by `return_type`
+        // from the input vector's declared dim. The accumulator must emit a
+        // result of exactly that width — including the all-NULL case where no
+        // row ever fixes the running-sum length — or DataFusion rejects the
+        // batch ("column types must match schema types"). Capture the declared
+        // dim from the return type so `evaluate` can build a correctly-sized
+        // NULL when the group has zero non-NULL rows.
+        let declared_dim = match args.return_type() {
+            DataType::FixedSizeList(_, n) => *n as usize,
+            _ => 1,
+        };
+        Ok(Box::new(VectorAvgAccumulator {
+            sum: None,
+            count: 0,
+            declared_dim,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct VectorAvgAccumulator {
+    /// Running per-element f64 sum; `None` until the first non-NULL row fixes
+    /// the dimension.
+    sum: Option<Vec<f64>>,
+    count: i64,
+    /// Output FixedSizeList width from `return_type` (plan-time). Used to build
+    /// a correctly-sized NULL result when the group has zero non-NULL rows.
+    declared_dim: usize,
+}
+
+impl VectorAvgAccumulator {
+    /// Fold one f32 vector into the running sum, enforcing dim agreement.
+    fn add(&mut self, v: &[f32]) -> DFResult<()> {
+        match &mut self.sum {
+            None => {
+                self.sum = Some(v.iter().map(|&x| x as f64).collect());
+            }
+            Some(acc) => {
+                if acc.len() != v.len() {
+                    return exec_err!(
+                        "vector_avg: different vector dimensions {} and {}",
+                        acc.len(),
+                        v.len()
+                    );
+                }
+                for (a, &x) in acc.iter_mut().zip(v.iter()) {
+                    *a += x as f64;
+                }
+            }
+        }
+        self.count += 1;
+        Ok(())
+    }
+}
+
+impl Accumulator for VectorAvgAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
+        let view = VectorView::from_array(&values[0], "vector_avg", "input")?;
+        for i in 0..values[0].len() {
+            if let Some(v) = view.row(i)? {
+                self.add(&v)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn evaluate(&mut self) -> DFResult<ScalarValue> {
+        // Use the running-sum width when present, else the plan-declared dim so
+        // an all-NULL group still emits a FixedSizeList of the expected width.
+        let dim = self.sum.as_ref().map(|s| s.len()).unwrap_or(self.declared_dim);
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dim as i32).with_field(field);
+        match (&self.sum, self.count) {
+            (Some(sum), n) if n > 0 => {
+                for &s in sum {
+                    builder.values().append_value((s / n as f64) as f32);
+                }
+                builder.append(true);
+            }
+            // Zero non-NULL rows → NULL result (PG aggregate-over-no-rows).
+            _ => {
+                for _ in 0..dim {
+                    builder.values().append_null();
+                }
+                builder.append(false);
+            }
+        }
+        let arr = builder.finish();
+        ScalarValue::try_from_array(&arr, 0)
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self) + self.sum.as_ref().map(|s| s.len() * 8).unwrap_or(0)
+    }
+
+    fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
+        // Carry the running sum as a List<Float64> scalar and count as Int64.
+        let sum_scalar = match &self.sum {
+            Some(s) => {
+                let arr = Float64Array::from(s.clone());
+                ScalarValue::List(Arc::new(ListArray::from_iter_primitive::<
+                    datafusion::arrow::datatypes::Float64Type,
+                    _,
+                    _,
+                >(vec![Some(
+                    arr.iter().collect::<Vec<_>>(),
+                )])))
+            }
+            None => ScalarValue::List(Arc::new(ListArray::from_iter_primitive::<
+                datafusion::arrow::datatypes::Float64Type,
+                _,
+                _,
+            >(vec![None::<Vec<Option<f64>>>]))),
+        };
+        Ok(vec![sum_scalar, ScalarValue::Int64(Some(self.count))])
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
+        let sums = states[0]
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| DataFusionError::Execution("vector_avg merge: sum not List".into()))?;
+        let counts = states[1]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| DataFusionError::Execution("vector_avg merge: count not Int64".into()))?;
+        for i in 0..sums.len() {
+            if sums.is_null(i) || counts.is_null(i) {
+                continue;
+            }
+            let inner = sums.value(i);
+            let f = inner
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("vector_avg merge: sum inner not Float64".into())
+                })?;
+            let partial: Vec<f64> = (0..f.len()).map(|j| f.value(j)).collect();
+            let cnt = counts.value(i);
+            match &mut self.sum {
+                None => {
+                    self.sum = Some(partial);
+                    self.count = cnt;
+                }
+                Some(acc) => {
+                    if acc.len() != partial.len() {
+                        return exec_err!(
+                            "vector_avg: different vector dimensions {} and {}",
+                            acc.len(),
+                            partial.len()
+                        );
+                    }
+                    for (a, b) in acc.iter_mut().zip(partial.iter()) {
+                        *a += b;
+                    }
+                    self.count += cnt;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
