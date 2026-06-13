@@ -278,6 +278,8 @@ run_row_ladder() {
 }
 
 run_row_ladder trgm      ext_bench_trgm      ext_bench_trgm      "${SIZES_TRGM}"
+# Coverage-expansion card (ILIKE-via-trgm, autocomplete prefix) — same ladder.
+run_row_ladder trgm      ext_bench_trgm_ext  ext_bench_trgm_ext  "${SIZES_TRGM}"
 run_row_ladder fts       ext_bench_fts       ext_bench_fts       "${SIZES_FTS}"
 
 # vector: dim × rows matrix. Label = "<dim>d_<rowlabel>" e.g. 768d_100k.
@@ -297,6 +299,10 @@ if family_enabled vector; then
         "BASIN_EXT_BENCH_VEC_DIM=${d}" \
         "BASIN_EXT_BENCH_VEC_BIGDIM=${d}" \
         "BASIN_EXT_BENCH_VEC_BIGDIM_ROWS=${n}"
+      # Coverage-expansion card (cosine <=>, inner-product <#>, filtered-ANN sweep).
+      run_card vector ext_bench_vector_ext ext_bench_vector_ext "${label}" \
+        "BASIN_EXT_BENCH_ROWS=${n}" \
+        "BASIN_EXT_BENCH_VEC_DIM=${d}"
     done
   done
 else
@@ -304,8 +310,12 @@ else
 fi
 
 run_row_ladder postgis   ext_bench_postgis   ext_bench_postgis   "${SIZES_POSTGIS}"
+# Coverage-expansion card (ST_Distance ordered top-N) — same ladder.
+run_row_ladder postgis   ext_bench_postgis_ext ext_bench_postgis_ext "${SIZES_POSTGIS}"
 run_row_ladder ranges    ext_bench_ranges    ext_bench_ranges    "${SIZES_RANGES}"
 run_row_ladder timescale ext_bench_timescale ext_bench_timescale "${SIZES_TIMESCALE}"
+# Coverage-expansion card (latest-per-series DISTINCT ON, gapfill) — same ladder.
+run_row_ladder timescale ext_bench_timescale_ext ext_bench_timescale_ext "${SIZES_TIMESCALE}"
 run_row_ladder jsonb_gin ext_bench_jsonb_gin ext_bench_jsonb_gin "${SIZES_JSONB}"
 
 # ── verdict ───────────────────────────────────────────────────────────────────
