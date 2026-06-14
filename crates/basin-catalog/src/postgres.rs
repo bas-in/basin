@@ -41,6 +41,7 @@ use tokio_postgres::NoTls;
 use tracing::instrument;
 
 use crate::cdc_kafka::{CdcKafkaSinkDef, CdcKafkaSinkRow, CdcKafkaSinkState, PartitionKey};
+use crate::cdc_slots::{CdcSlotDef, CdcSlotRow, CdcSlotState, SlotPlugin};
 use crate::cdc_webhooks::{CdcWebhookDef, CdcWebhookRow, CdcWebhookState};
 use crate::domains::{self, DomainDef, DomainError, BASIN_DOMAIN_KEY};
 use crate::enums::{self, EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
@@ -661,6 +662,25 @@ impl PostgresCatalog {
                     PRIMARY KEY (project_id, id)
                 )"
             ),
+            // ADR 0028 Phase 5 — durable logical-replication slot cursors. The
+            // definition (slot_name, plugin, active) is written at register;
+            // the cursor columns (confirmed_seq, restart_seq, last_status) are
+            // advanced by the streaming worker as the consumer acks LSNs.
+            // `confirmed_seq` / `restart_seq` advance monotonically (GREATEST
+            // upsert). A legacy catalog that predates this table has no rows.
+            format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.cdc_slots (
+                    project_id     TEXT NOT NULL,
+                    slot_name      TEXT NOT NULL,
+                    plugin         TEXT NOT NULL DEFAULT 'pgoutput',
+                    active         BOOLEAN NOT NULL DEFAULT true,
+                    confirmed_seq  BIGINT NOT NULL DEFAULT 0,
+                    restart_seq    BIGINT NOT NULL DEFAULT 0,
+                    last_status    TEXT,
+                    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (project_id, slot_name)
+                )"
+            ),
         ];
         let client = self.client().await?;
         for stmt in stmts {
@@ -1100,6 +1120,13 @@ impl Catalog for PostgresCatalog {
         let _ = tx
             .execute(
                 &format!("DELETE FROM {sch}.cdc_kafka_sinks WHERE project_id = $1"),
+                &[&project.to_string()],
+            )
+            .await;
+        // ADR 0028 Phase 5: CDC replication slot cursors (same guard).
+        let _ = tx
+            .execute(
+                &format!("DELETE FROM {sch}.cdc_slots WHERE project_id = $1"),
                 &[&project.to_string()],
             )
             .await;
@@ -4615,6 +4642,149 @@ impl Catalog for PostgresCatalog {
         if n == 0 {
             return Err(BasinError::not_found(format!(
                 "cdc kafka sink {id:?} does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    // ---- ADR 0028 Phase 5: CDC replication slots ------------------------
+
+    #[instrument(skip(self), fields(project = %def.project, slot = %def.slot_name))]
+    async fn register_cdc_slot(&self, def: CdcSlotDef) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let n = client
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.cdc_slots (project_id, slot_name, plugin, active) \
+                     VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (project_id, slot_name) DO NOTHING"
+                ),
+                &[
+                    &def.project.to_string(),
+                    &def.slot_name,
+                    &def.plugin.as_str(),
+                    &def.active,
+                ],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("register_cdc_slot: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::Catalog(format!(
+                "replication slot {:?} already exists for project {}",
+                def.slot_name, def.project
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project, slot = %slot_name))]
+    async fn drop_cdc_slot(&self, project: &ProjectId, slot_name: &str) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let n = client
+            .execute(
+                &format!("DELETE FROM {sch}.cdc_slots WHERE project_id = $1 AND slot_name = $2"),
+                &[&project.to_string(), &slot_name],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("drop_cdc_slot: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!(
+                "replication slot {slot_name:?} does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project))]
+    async fn list_cdc_slots(&self, project: &ProjectId) -> Vec<CdcSlotRow> {
+        let sch = &self.schema;
+        let Ok(client) = self.client().await else {
+            return Vec::new();
+        };
+        let rows = match client
+            .query(
+                &format!(
+                    "SELECT slot_name, plugin, active, confirmed_seq, restart_seq, last_status \
+                     FROM {sch}.cdc_slots \
+                     WHERE project_id = $1 \
+                     ORDER BY slot_name ASC"
+                ),
+                &[&project.to_string()],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.into_iter()
+            .map(|row| {
+                let plugin_str: String = row.get(1);
+                let confirmed_seq: i64 = row.get(3);
+                let restart_seq: i64 = row.get(4);
+                CdcSlotRow {
+                    def: CdcSlotDef {
+                        slot_name: row.get(0),
+                        project: *project,
+                        // Legacy-tolerant: unknown / NULL token ⇒ pgoutput.
+                        plugin: SlotPlugin::parse(&plugin_str).unwrap_or_default(),
+                        active: row.get(2),
+                    },
+                    state: CdcSlotState {
+                        confirmed_seq: confirmed_seq.max(0) as u64,
+                        restart_seq: restart_seq.max(0) as u64,
+                        last_status: row.get(5),
+                    },
+                }
+            })
+            .collect()
+    }
+
+    #[instrument(skip(self), fields(project = %project, slot = %slot_name))]
+    async fn record_cdc_slot_confirm(
+        &self,
+        project: &ProjectId,
+        slot_name: &str,
+        confirmed_seq: u64,
+        last_status: &str,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let seq_pg = confirmed_seq as i64;
+        client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.cdc_slots \
+                       SET confirmed_seq = GREATEST(confirmed_seq, $3), \
+                           restart_seq = GREATEST(restart_seq, GREATEST(confirmed_seq, $3)), \
+                           last_status = $4 \
+                     WHERE project_id = $1 AND slot_name = $2"
+                ),
+                &[&project.to_string(), &slot_name, &seq_pg, &last_status],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("record_cdc_slot_confirm: {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(project = %project, slot = %slot_name))]
+    async fn disable_cdc_slot(&self, project: &ProjectId, slot_name: &str) -> Result<()> {
+        let sch = &self.schema;
+        let client = self.client().await?;
+        let n = client
+            .execute(
+                &format!(
+                    "UPDATE {sch}.cdc_slots SET active = false \
+                     WHERE project_id = $1 AND slot_name = $2"
+                ),
+                &[&project.to_string(), &slot_name],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("disable_cdc_slot: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!(
+                "replication slot {slot_name:?} does not exist"
             )));
         }
         Ok(())

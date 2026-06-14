@@ -31,6 +31,8 @@ pub mod budgets;
 pub mod cdc_webhooks;
 /// ADR 0028 Phase 3 — per-project CDC Kafka/Redpanda sink configs + cursor.
 pub mod cdc_kafka;
+/// ADR 0028 Phase 5 — per-project durable logical-replication slot cursors.
+pub mod cdc_slots;
 mod domains;
 mod enums;
 mod functions;
@@ -70,6 +72,10 @@ pub use cdc_webhooks::{
 pub use cdc_kafka::{
     validate_registration as validate_cdc_kafka_sink, CdcKafkaError, CdcKafkaSinkDef,
     CdcKafkaSinkRow, CdcKafkaSinkState, PartitionKey,
+};
+pub use cdc_slots::{
+    validate_registration as validate_cdc_slot, CdcSlotDef, CdcSlotError, CdcSlotRow,
+    CdcSlotState, SlotPlugin,
 };
 pub use domains::{DomainDef, DomainError, BASIN_DOMAIN_KEY};
 pub use enums::{EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
@@ -2048,6 +2054,69 @@ pub trait Catalog: Send + Sync {
         let _ = (project, id);
         Err(basin_common::BasinError::Internal(
             "disable_cdc_kafka_sink not implemented for this catalog backend".into(),
+        ))
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR 0028 Phase 5 — CDC logical-replication slots (durable cursor).
+    //
+    // The durable resume cursor for a pgoutput / wal2json streaming consumer.
+    // The definition (`CdcSlotDef`) is the registration (slot name, plugin,
+    // active); the state (`CdcSlotState`) is the resumable cursor persisted by
+    // the streaming worker as the consumer acks LSNs. The discipline mirrors
+    // the Phase 3 Kafka methods (legacy-tolerant defaults, monotonic GREATEST
+    // cursor, retained-on-disable row). The retention GC reads active slots'
+    // `restart_seq` to hold back pruning (ADR §5 slot-hold).
+    // -----------------------------------------------------------------------
+
+    /// Register a logical-replication slot. The initial state is the zero
+    /// cursor. Default impl: not implemented (slots need a durable backend).
+    async fn register_cdc_slot(&self, def: cdc_slots::CdcSlotDef) -> Result<()> {
+        let _ = def;
+        Err(basin_common::BasinError::Internal(
+            "register_cdc_slot not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Drop a registered slot by `(project, slot_name)`. Returns
+    /// [`basin_common::BasinError::NotFound`] when the name does not resolve.
+    /// Default impl: not implemented.
+    async fn drop_cdc_slot(&self, project: &ProjectId, slot_name: &str) -> Result<()> {
+        let _ = (project, slot_name);
+        Err(basin_common::BasinError::Internal(
+            "drop_cdc_slot not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// List every slot registered for `project`, each with its cursor state.
+    /// The streaming worker reads this to discover slots + resume points; the
+    /// retention GC reads active slots' `restart_seq`. Default impl: empty.
+    async fn list_cdc_slots(&self, project: &ProjectId) -> Vec<cdc_slots::CdcSlotRow> {
+        let _ = project;
+        Vec::new()
+    }
+
+    /// Advance a slot's cursor after the consumer confirmed an LSN: set
+    /// `confirmed_seq` and `restart_seq` (monotonic GREATEST), record status.
+    /// Default impl: durable no-op (cursor lives in memory only for ephemeral
+    /// backends; the consumer re-streams from `seq=0` on restart).
+    async fn record_cdc_slot_confirm(
+        &self,
+        project: &ProjectId,
+        slot_name: &str,
+        confirmed_seq: u64,
+        last_status: &str,
+    ) -> Result<()> {
+        let _ = (project, slot_name, confirmed_seq, last_status);
+        Ok(())
+    }
+
+    /// Disable a slot (release its retention hold) without dropping the row /
+    /// cursor. Default impl: not implemented.
+    async fn disable_cdc_slot(&self, project: &ProjectId, slot_name: &str) -> Result<()> {
+        let _ = (project, slot_name);
+        Err(basin_common::BasinError::Internal(
+            "disable_cdc_slot not implemented for this catalog backend".into(),
         ))
     }
 
