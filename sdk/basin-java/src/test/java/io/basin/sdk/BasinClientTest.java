@@ -544,6 +544,264 @@ class BasinClientTest {
     }
 
     // ------------------------------------------------------------------
+    // NDJSON streaming
+    // ------------------------------------------------------------------
+
+    @Test
+    void stream_decodes_ndjson_rows() throws Exception {
+        // Three data rows followed by a cursor sentinel line.
+        String ndjson =
+                "{\"id\":1,\"name\":\"alice\"}\n"
+                + "{\"id\":2,\"name\":\"bob\"}\n"
+                + "{\"id\":3,\"name\":\"carol\"}\n"
+                + "{\"_basin_next_cursor\":\"cur-xyz\"}\n";
+
+        server.createContext("/rest/v1/users", exchange -> {
+            // The server should see ?stream=true in the query string.
+            String qs = exchange.getRequestURI().getRawQuery();
+            assertTrue(qs != null && qs.contains("stream=true"),
+                    "stream=true must be present in query: " + qs);
+            byte[] body = ndjson.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/x-ndjson");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream os = exchange.getResponseBody()) { os.write(body); }
+        });
+
+        QueryBuilder.StreamResult sr = client.table("users").stream();
+        List<Map<String, Object>> rows = sr.rows();
+
+        assertEquals(3, rows.size(), "three data rows expected");
+        assertEquals(1, ((Number) rows.get(0).get("id")).intValue());
+        assertEquals("alice", rows.get(0).get("name"));
+        assertEquals(2, ((Number) rows.get(1).get("id")).intValue());
+        assertEquals(3, ((Number) rows.get(2).get("id")).intValue());
+        assertEquals("cur-xyz", sr.nextCursor(), "cursor extracted from sentinel line");
+    }
+
+    @Test
+    void stream_no_cursor_when_sentinel_absent() throws Exception {
+        String ndjson = "{\"id\":10}\n{\"id\":20}\n";
+
+        server.createContext("/rest/v1/items", exchange -> {
+            byte[] body = ndjson.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/x-ndjson");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream os = exchange.getResponseBody()) { os.write(body); }
+        });
+
+        QueryBuilder.StreamResult sr = client.table("items").stream();
+        assertEquals(2, sr.rows().size());
+        assertNull(sr.nextCursor(), "no cursor when sentinel line absent");
+    }
+
+    @Test
+    void stream_empty_response() throws Exception {
+        server.createContext("/rest/v1/empty_table", exchange -> {
+            exchange.getResponseHeaders().set("Content-Type", "application/x-ndjson");
+            exchange.sendResponseHeaders(200, 0);
+            exchange.getResponseBody().close();
+        });
+
+        QueryBuilder.StreamResult sr = client.table("empty_table").stream();
+        assertTrue(sr.rows().isEmpty());
+        assertNull(sr.nextCursor());
+    }
+
+    @Test
+    void stream_propagates_server_error() throws Exception {
+        server.createContext("/rest/v1/forbidden_stream", exchange -> {
+            byte[] body = mapper.writeValueAsBytes(
+                    Map.of("code", "E_FORBIDDEN", "message", "not allowed"));
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(403, body.length);
+            try (OutputStream os = exchange.getResponseBody()) { os.write(body); }
+        });
+
+        BasinApiException ex = assertThrows(BasinApiException.class,
+                () -> client.table("forbidden_stream").stream());
+        assertEquals("E_FORBIDDEN", ex.code);
+        assertEquals(403, ex.status);
+    }
+
+    @Test
+    void stream_iterable_in_foreach() throws Exception {
+        String ndjson = "{\"v\":1}\n{\"v\":2}\n{\"v\":3}\n";
+        server.createContext("/rest/v1/nums", exchange -> {
+            byte[] body = ndjson.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/x-ndjson");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream os = exchange.getResponseBody()) { os.write(body); }
+        });
+
+        int sum = 0;
+        for (Map<String, Object> row : client.table("nums").stream()) {
+            sum += ((Number) row.get("v")).intValue();
+        }
+        assertEquals(6, sum, "1+2+3=6");
+    }
+
+    // ------------------------------------------------------------------
+    // Arrow IPC transport
+    // ------------------------------------------------------------------
+
+    /**
+     * Encode a minimal Arrow IPC stream with two rows and two columns
+     * (id: Int64, name: Utf8) for use in Arrow tests.
+     */
+    private byte[] buildArrowIpcBytes() throws IOException {
+        org.apache.arrow.memory.RootAllocator allocator =
+                new org.apache.arrow.memory.RootAllocator(Long.MAX_VALUE);
+
+        List<org.apache.arrow.vector.types.pojo.Field> fields = List.of(
+                org.apache.arrow.vector.types.pojo.Field.nullable("id",
+                        new org.apache.arrow.vector.types.pojo.ArrowType.Int(64, true)),
+                org.apache.arrow.vector.types.pojo.Field.nullable("name",
+                        new org.apache.arrow.vector.types.pojo.ArrowType.Utf8()));
+        org.apache.arrow.vector.types.pojo.Schema schema =
+                new org.apache.arrow.vector.types.pojo.Schema(fields);
+
+        try (org.apache.arrow.vector.VectorSchemaRoot root =
+                     org.apache.arrow.vector.VectorSchemaRoot.create(schema, allocator)) {
+            root.allocateNew();
+
+            org.apache.arrow.vector.BigIntVector ids =
+                    (org.apache.arrow.vector.BigIntVector) root.getVector("id");
+            org.apache.arrow.vector.VarCharVector names =
+                    (org.apache.arrow.vector.VarCharVector) root.getVector("name");
+
+            ids.set(0, 101L);
+            ids.set(1, 202L);
+            names.set(0, "alice".getBytes(StandardCharsets.UTF_8));
+            names.set(1, "bob".getBytes(StandardCharsets.UTF_8));
+            ids.setValueCount(2);
+            names.setValueCount(2);
+            root.setRowCount(2);
+
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            try (org.apache.arrow.vector.ipc.ArrowStreamWriter writer =
+                         new org.apache.arrow.vector.ipc.ArrowStreamWriter(root, null, baos)) {
+                writer.start();
+                writer.writeBatch();
+                writer.end();
+            }
+            return baos.toByteArray();
+        }
+    }
+
+    @Test
+    void toArrow_native_ipc_path() throws Exception {
+        byte[] ipcBytes = buildArrowIpcBytes();
+
+        server.createContext("/rest/v1/arrow_users", exchange -> {
+            // Verify the client sent the Arrow Accept header.
+            String accept = exchange.getRequestHeaders().getFirst("Accept");
+            assertEquals("application/vnd.apache.arrow.stream", accept,
+                    "client must send Arrow Accept header");
+
+            exchange.getResponseHeaders().set("Content-Type", "application/vnd.apache.arrow.stream");
+            exchange.getResponseHeaders().set("X-Basin-Next-Cursor", "ipc-cursor-1");
+            exchange.getResponseHeaders().set("X-Basin-Row-Count", "2");
+            exchange.sendResponseHeaders(200, ipcBytes.length);
+            try (OutputStream os = exchange.getResponseBody()) { os.write(ipcBytes); }
+        });
+
+        try (ArrowResult ar = client.table("arrow_users").toArrow()) {
+            assertEquals(2, ar.root.getRowCount(), "two rows decoded");
+            assertEquals("ipc-cursor-1", ar.nextCursor, "cursor from header");
+            assertEquals(2L, ar.rowCount, "row count from header");
+
+            org.apache.arrow.vector.BigIntVector idVec =
+                    (org.apache.arrow.vector.BigIntVector) ar.root.getVector("id");
+            assertEquals(101L, idVec.get(0));
+            assertEquals(202L, idVec.get(1));
+
+            org.apache.arrow.vector.VarCharVector nameVec =
+                    (org.apache.arrow.vector.VarCharVector) ar.root.getVector("name");
+            assertEquals("alice", nameVec.getObject(0).toString());
+            assertEquals("bob", nameVec.getObject(1).toString());
+        }
+    }
+
+    @Test
+    void toArrow_json_fallback() throws Exception {
+        // Server returns plain JSON — SDK must convert client-side.
+        List<Map<String, Object>> jsonRows = List.of(
+                Map.of("id", 1, "score", 9.5, "active", true),
+                Map.of("id", 2, "score", 7.0, "active", false));
+
+        server.createContext("/rest/v1/scores", exchange -> {
+            // Accept header from client should be the Arrow MIME type.
+            String accept = exchange.getRequestHeaders().getFirst("Accept");
+            assertEquals("application/vnd.apache.arrow.stream", accept);
+
+            // But server replies with JSON (older server / fallback scenario).
+            byte[] body = mapper.writeValueAsBytes(jsonRows);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream os = exchange.getResponseBody()) { os.write(body); }
+        });
+
+        try (ArrowResult ar = client.table("scores").toArrow()) {
+            assertEquals(2, ar.root.getRowCount(), "two rows in fallback Arrow table");
+            assertNull(ar.nextCursor, "no cursor when header absent");
+            // id column inferred as BigInt (Integer → long).
+            org.apache.arrow.vector.BigIntVector idVec =
+                    (org.apache.arrow.vector.BigIntVector) ar.root.getVector("id");
+            assertNotNull(idVec, "id column present");
+            assertEquals(1L, idVec.get(0));
+            assertEquals(2L, idVec.get(1));
+        }
+    }
+
+    @Test
+    void toArrow_propagates_server_error() throws Exception {
+        server.createContext("/rest/v1/arrow_locked", exchange -> {
+            byte[] body = mapper.writeValueAsBytes(
+                    Map.of("code", "E_FORBIDDEN", "message", "no arrow for you"));
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(403, body.length);
+            try (OutputStream os = exchange.getResponseBody()) { os.write(body); }
+        });
+
+        BasinApiException ex = assertThrows(BasinApiException.class,
+                () -> client.table("arrow_locked").toArrow());
+        assertEquals("E_FORBIDDEN", ex.code);
+        assertEquals(403, ex.status);
+    }
+
+    @Test
+    void toArrow_no_cursor_when_header_absent() throws Exception {
+        byte[] ipcBytes = buildArrowIpcBytes();
+
+        server.createContext("/rest/v1/arrow_no_cursor", exchange -> {
+            exchange.getResponseHeaders().set("Content-Type", "application/vnd.apache.arrow.stream");
+            // No X-Basin-Next-Cursor header.
+            exchange.sendResponseHeaders(200, ipcBytes.length);
+            try (OutputStream os = exchange.getResponseBody()) { os.write(ipcBytes); }
+        });
+
+        try (ArrowResult ar = client.table("arrow_no_cursor").toArrow()) {
+            assertNull(ar.nextCursor, "null cursor when header absent");
+        }
+    }
+
+    @Test
+    void toArrow_empty_cursor_header_treated_as_null() throws Exception {
+        byte[] ipcBytes = buildArrowIpcBytes();
+
+        server.createContext("/rest/v1/arrow_empty_cursor", exchange -> {
+            exchange.getResponseHeaders().set("Content-Type", "application/vnd.apache.arrow.stream");
+            exchange.getResponseHeaders().set("X-Basin-Next-Cursor", "");
+            exchange.sendResponseHeaders(200, ipcBytes.length);
+            try (OutputStream os = exchange.getResponseBody()) { os.write(ipcBytes); }
+        });
+
+        try (ArrowResult ar = client.table("arrow_empty_cursor").toArrow()) {
+            assertNull(ar.nextCursor, "empty cursor header normalised to null");
+        }
+    }
+
+    // ------------------------------------------------------------------
     // JWT project_id extraction
     // ------------------------------------------------------------------
 
