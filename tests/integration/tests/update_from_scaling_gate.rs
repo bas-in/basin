@@ -403,21 +403,25 @@ async fn delete_using_at_100k_is_bounded() {
     wal.close().await.unwrap();
 }
 
-/// A point `DELETE … WHERE id IN (scattered)` on a btree-indexed table is
-/// forced down the cold copy-on-write path (the tombstone fast path admits
-/// GIN-only tables but declines anything with a btree index). This pins that
-/// the cold delete (a) is correct — deletes exactly the matched PKs, leaves the
-/// rest — and (b) prunes to the handful of files actually containing the
-/// matched PKs (per-file column stats) rather than rewriting the whole table,
-/// and skips the FK-cascade re-read entirely for a table with no inbound FK.
+/// A point `DELETE … WHERE id IN (scattered)` on a btree-indexed table now
+/// takes the tombstone overlay fast path: `delete_fastpath_table_eligible`
+/// admits tables whose every index is GIN or B-tree (the `fast_select`
+/// secondary-index allowlist probe skips pruning while a tombstone overlay is
+/// live, so the deleted row cannot leak through the index — see
+/// `btree_overlay_delete.rs` for that read oracle). This pins that the delete
+/// (a) is correct — deletes exactly the matched PKs, leaves the rest — and
+/// (b) stays well under budget: the tombstone path writes ZERO replacement
+/// files (it does not rewrite the matched files at all), so it is strictly
+/// cheaper than the cold copy-on-write path this used to force.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cold_point_delete_btree_is_pruned_and_correct() {
+async fn point_delete_btree_routes_tombstone_and_is_correct() {
     let total = 100_000i64;
     let (_sd, _wd, engine, shard, bg, wal) = build().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let _files = seed_events(&sess, &shard, total).await;
-    // A second, NON-GIN (btree) index forces the cold path: the tombstone fast
-    // path admits GIN-only tables but declines anything with a btree index.
+    // A second, NON-GIN (btree) index. Before the gate relaxation this forced
+    // the cold copy-on-write path; the table is now admitted to the tombstone
+    // fast path (GIN + B-tree) — gist/hnsw indexes still keep the cold path.
     exec(&sess, "CREATE INDEX events_val_btree ON events (val)").await;
 
     // Five PKs scattered across distinct files (ROWS_PER_FILE apart).
@@ -441,16 +445,17 @@ async fn cold_point_delete_btree_is_pruned_and_correct() {
             "deleted row id={id} must be gone",
         );
     }
-    // Pruning ceiling: rewriting only the ~5 files that hold the matched PKs (vs
-    // the whole 20-file table) keeps this far under a generous budget. A blown
-    // budget signals stats pruning or the FK-cascade re-read skip regressed.
+    // Budget ceiling: the tombstone fast path plants 5 tombstones and rewrites
+    // NO files, so this is comfortably under a generous budget. A blown budget
+    // signals the table fell back to the cold copy-on-write path (gate
+    // regression) or a per-row loop crept in.
     let bud = budget_ms(8_000.0);
     assert!(
         ms < bud,
-        "cold point DELETE of 5 scattered rows took {ms:.1} ms, budget {bud:.0} ms — \
-         stats pruning or the no-inbound-FK re-read skip likely regressed",
+        "point DELETE of 5 scattered rows took {ms:.1} ms, budget {bud:.0} ms — \
+         the table likely fell back to the cold copy-on-write path",
     );
-    println!("[cold-point-delete-btree] total={total} ids={ids:?} t={ms:.1}ms");
+    println!("[point-delete-btree-tombstone] total={total} ids={ids:?} t={ms:.1}ms");
 
     bg.shutdown().await;
     wal.close().await.unwrap();

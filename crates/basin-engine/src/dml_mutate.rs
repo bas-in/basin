@@ -730,17 +730,26 @@ async fn delete_fastpath_table_eligible(
             return Ok(false);
         }
     }
-    // Secondary indexes: ADMIT GIN-only tables (jsonb containment / tsvector
-    // FTS), exactly as the UPDATE twin does (see its `meta.indexes` gate). The
-    // read-path overlay guards already cover tombstones: `table_has_live_overlay`
-    // counts `tombstone_count`, so `apply_gin_pruning_for_query` /
-    // `apply_jsonb_posting_pruning_for_query` and the posting-probe `Empty`
-    // short-circuit all fall back to the overlay-aware (TombstoneFilter) scan
-    // while a tombstone is live, and `materialize_overlay_for_table` purges the
-    // replaced file's postings + rebuilds the replacement on drain. Any non-GIN
-    // index (btree / GIST / vector) still keeps the cold path — those read
-    // consumers have no overlay-emptiness guard. Oracle: `gin_overlay_delete.rs`.
-    if !meta.indexes.is_empty() && !meta.indexes.iter().all(|idx| idx.access_method == "gin") {
+    // Secondary indexes: ADMIT tables whose every index is GIN or B-tree onto
+    // the tombstone overlay fast path. The read-path overlay guards now cover
+    // both: `table_has_live_overlay` counts `tombstone_count`, so
+    //   * GIN — `apply_gin_pruning_for_query` /
+    //     `apply_jsonb_posting_pruning_for_query` and the posting-probe `Empty`
+    //     short-circuit fall back to the overlay-aware (TombstoneFilter) scan
+    //     while a tombstone is live; and
+    //   * B-tree — the `fast_select` secondary-index allowlist probe skips
+    //     pruning while a tombstone is live (the deleted row is still in the
+    //     cold file the index points at, so pruning to it would resurrect it).
+    // `materialize_overlay_for_table` then purges the replaced file's entries
+    // from both registries on drain, so pruning re-engages correctly afterward.
+    // GIST / HNSW (vector) read paths still have no overlay guard, so a table
+    // declaring one keeps the cold copy-on-write path. Oracles:
+    // `gin_overlay_delete.rs`, `btree_overlay_delete.rs`.
+    if meta
+        .indexes
+        .iter()
+        .any(|idx| idx.access_method != "gin" && idx.access_method != "btree")
+    {
         return Ok(false);
     }
     // Any *other* table referencing THIS one means CASCADE / NO ACTION must run
@@ -5963,6 +5972,36 @@ pub(crate) async fn materialize_overlay_for_table(
         added.clone(),
     )
     .await?;
+
+    // B-tree secondary-index maintenance for the overlay drain. The files just
+    // replaced still carry stale location pointers in the in-RAM B-tree index;
+    // purge every entry that references a removed path so a post-drain probe for
+    // a key whose only locations were in a replaced file falls through to a full
+    // (correct) scan instead of pruning to a now-deleted file. The replacement
+    // files are intentionally left unindexed — the auto-index advisor / CREATE
+    // INDEX re-covers them; until then their keys force-scan (correct, just
+    // unpruned), the same degradation the GIN drain accepts. Only single-column
+    // non-expression B-tree (non-gin/gist) indexes feed this registry; gist/hnsw
+    // tables never reach the overlay fast path (see `delete_fastpath_table_eligible`).
+    let btree_cols: Vec<String> = meta
+        .indexes
+        .iter()
+        .filter(|idx| {
+            idx.access_method != "gin"
+                && idx.access_method != "gist"
+                && idx.columns.len() == 1
+                && !idx.columns[0].starts_with("expr:")
+        })
+        .map(|idx| idx.columns[0].clone())
+        .collect();
+    if !btree_cols.is_empty() {
+        let registry = engine.secondary_index_registry();
+        for path in &removed {
+            for col in &btree_cols {
+                registry.remove_file_from_index(&project, table, col, path);
+            }
+        }
+    }
 
     // GIN-family registry maintenance — the materialize half of the UPDATE
     // fast-path gate's old blocker #3. Now that GIN-only tables are admitted

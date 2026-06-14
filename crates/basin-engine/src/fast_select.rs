@@ -3043,7 +3043,21 @@ async fn execute_simple_select_inner(
         let registry = sess.engine.secondary_index_registry();
         let mut result: Option<Option<SecondaryIndexHit>> = None;
 
-        if plan.aggregates.is_none() {
+        // A live tombstone/update overlay makes the in-RAM secondary-index
+        // allowlist unsafe to trust for pruning: a row deleted (or updated) via
+        // the hot-tier overlay fast path is still physically present in the cold
+        // file the index points at — the file is not rewritten until the overlay
+        // drains — and this allowlist path does not consult the tombstone set.
+        // Pruning to only the indexed file would then return the deleted row.
+        // While an overlay is live, skip index pruning entirely and fall through
+        // to the overlay-aware scan (which applies `TombstoneFilterExec`); the
+        // prune re-engages O(1) once the overlay drains and the cold files +
+        // index are rewritten in lockstep. Mirrors the GIN pruning guard
+        // (`apply_gin_pruning_for_query`).
+        let overlay_live =
+            crate::session::table_has_live_overlay(&sess.engine, &sess.project, &plan.table);
+
+        if plan.aggregates.is_none() && !overlay_live {
             for pred in &plan.predicates {
                 if let Predicate::Eq(col, val) = pred {
                     // Check if the table has a declared index on this column.
