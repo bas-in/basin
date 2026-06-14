@@ -2234,7 +2234,7 @@ async fn try_resolve_fast_path_update(
 /// `HardCapReached`. With per-key cost flat and memory capped by the budget
 /// (not the key count), the cap's job is only to keep a single statement's
 /// overlay write "small bulk" rather than a table rewrite; 10k covers the
-/// `WHERE status = 'x'` / tenant-slice shapes while a full-table UPDATE on a
+/// `WHERE status = 'x'` / project-slice shapes while a full-table UPDATE on a
 /// large table still takes the amortised cold rewrite.
 const DELTA_UPDATE_MAX_KEYS_DEFAULT: usize = 10_000;
 

@@ -4427,7 +4427,7 @@ impl InfoSchemaQuery {
     ///
     /// The `project` argument is not currently used for routing (the
     /// `CancelBackendRegistry` is process-wide by pid) but is held for
-    /// signature stability against the multi-tenant v0.2 expansion where pids
+    /// signature stability against the multi-project v0.2 expansion where pids
     /// will be scoped per-project.
     pub fn pg_cancel_backend(
         registry: &CancelBackendRegistry,

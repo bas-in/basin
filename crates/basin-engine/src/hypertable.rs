@@ -14,7 +14,7 @@
 //! * `timescaledb_information.chunks` is served from this registry as a
 //!   virtual provider (see [`ChunksProvider`]).
 //!
-//! ## Multi-tenant isolation
+//! ## Multi-project isolation
 //!
 //! The registry is a `DashMap<ProjectId, Arc<Mutex<ProjectHypertables>>>`.
 //! Each project pays only the cost of its own entry; an idle project is a

@@ -24,7 +24,7 @@
 //!
 //! ## Project-scoped keyspace
 //!
-//! Basin is multi-tenant: every session belongs to exactly one project. PG's
+//! Basin is multi-project: every session belongs to exactly one project. PG's
 //! advisory-lock keyspace is per-database, so Basin's must be per-project — two
 //! different projects taking the *same* numeric key (e.g. Prisma's migration
 //! lock `72707369`) must **not** contend. The process-global table is therefore
@@ -1391,7 +1391,7 @@ mod tests {
 
     #[test]
     fn same_key_isolated_across_projects() {
-        // The canonical multi-tenant invariant: two sessions in *different*
+        // The canonical multi-project invariant: two sessions in *different*
         // projects taking the same numeric key must NOT contend.
         let p1 = session_in_project(0x1111_1111_1111_1111_2222_2222_2222_2222);
         let p2 = session_in_project(0x3333_3333_3333_3333_4444_4444_4444_4444);

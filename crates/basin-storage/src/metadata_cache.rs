@@ -252,7 +252,7 @@ mod tests {
 
     /// Regression: the LRU must not grow past its configured capacity even
     /// when callers insert N >> cap distinct keys (scalability audit:
-    /// 10k-tenant cold tail must not balloon the cache to unbounded RAM).
+    /// 10k-project cold tail must not balloon the cache to unbounded RAM).
     #[test]
     fn parquet_meta_cache_never_exceeds_cap_under_load() {
         let cap = 64usize;

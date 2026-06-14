@@ -108,12 +108,12 @@ updates) and p50/p99 are reported. Budgets are set to generous dev-stack values
 
 #### `noisy-neighbor`
 
-Two tenant connections (alice + bob) share the same basin-server instance. Alice
+Two project connections (alice + bob) share the same basin-server instance. Alice
 bursts 200 concurrent INSERT + COUNT operations; Bob issues quiet point queries
 throughout. The test asserts that Bob's p99 latency stays within
 `BOB_P99_BUDGET_MS` (default 500 ms for Docker dev-stack).
 
-This validates the per-tenant fairness mechanisms in the pgwire router and
+This validates the per-project fairness mechanisms in the pgwire router and
 engine scheduler.
 
 #### `handoff`

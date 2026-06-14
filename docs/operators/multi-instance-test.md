@@ -14,7 +14,7 @@
 | `b_voluntary_handoff_within_adr_0023_budget` | Voluntary `yield_partition` (flush + epoch transfer + WAL marker) completes under 500 ms p99 in the small-memtable case. | ADR 0023 §6.X.C |
 | `c_per_project_cap_is_slice_not_n_times_per_replica` | Budget coordinator gives each partition `floor(project_cap / N)`, not `project_cap` — the aggregate across all partitions stays ≤ project cap. | ADR 0023 §heartbeat-budgets |
 | `d_killed_replica_leases_reassigned_no_data_loss` | After a replica is dropped without releasing its lease (SIGKILL model), surviving replicas pick up the orphaned partition after TTL elapses. WAL replay surfaces the dead replica's committed writes on the new leaseholder (zero data loss). | ADR 0023 §replica-loss |
-| `e_concurrent_multi_shard_cross_project_isolation` | Multiple shards sharing one Storage+Catalog+WAL have zero cross-project row leakage under concurrent write contention. | Multi-tenant wedge invariant |
+| `e_concurrent_multi_shard_cross_project_isolation` | Multiple shards sharing one Storage+Catalog+WAL have zero cross-project row leakage under concurrent write contention. | Multi-project wedge invariant |
 | `f_budget_resliced_when_partition_count_grows` | When a new partition joins the coordinator, all existing partitions are re-sliced so the total stays ≤ project cap. | ADR 0023 §dynamic-reslicing |
 
 ---

@@ -15,9 +15,9 @@ for what ships in v0.1 vs what's parked. The companion docs are
 
 ## What ships in v0.1 (THE WEDGE)
 
-Basin v0.1 is a **cheap multi-tenant Postgres-compatible store on object
+Basin v0.1 is a **cheap multi-project Postgres-compatible store on object
 storage** optimized for the read-dominant SaaS audit-log / event-stream /
-multi-tenant analytics workload. Single-region, single-shard transactions,
+multi-project analytics workload. Single-region, single-shard transactions,
 honest perf, honest gaps.
 
 The structural moats are:
@@ -231,7 +231,7 @@ A frozen item gets unfrozen only when one of these triggers fires:
 1. **A named wedge customer requests it AND has a paid contract pending.**
 2. **A production-blocking dependency forces it** (rare).
 
-The bar is intentional. The wedge is "cheap multi-tenant Postgres on S3
+The bar is intentional. The wedge is "cheap multi-project Postgres on S3
 for SaaS analytics." Anything not on the path to a paying wedge customer
 waits for v0.2+.
 

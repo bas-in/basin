@@ -180,7 +180,7 @@ fn global_engine() -> Arc<Engine> {
 /// Default cap on cached compiled [`wasmtime::Module`] instances. WASM UDFs
 /// are user-provided, so cardinality is bounded by the number of distinct
 /// `LANGUAGE wasm` function bodies a single process has ever evaluated; 1024
-/// covers all realistic multi-tenant workloads with headroom. Override with
+/// covers all realistic multi-project workloads with headroom. Override with
 /// [`MODULE_CACHE_CAP_ENV`].
 const DEFAULT_MODULE_CACHE_CAP: usize = 1024;
 

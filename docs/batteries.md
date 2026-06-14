@@ -90,7 +90,7 @@ GET  /auth/v1/user
 ```
 
 Honest caveat: identity tables are per-project, not global. Cross-
-project user federation (one identity across many tenants) is an
+project user federation (one identity across many projects) is an
 explicit non-goal in v0.1 — projects are the isolation primitive, and
 identities live inside them.
 
@@ -313,7 +313,7 @@ for the per-extension matrix.
 
 Basin ships the four or five extensions that real apps actually reach
 for, as native crates that boot with the engine. No
-`CREATE EXTENSION` step; no per-tenant `.so` install; no
+`CREATE EXTENSION` step; no per-project `.so` install; no
 shared-library version skew.
 
 | PG extension | Basin equivalent | Crate |

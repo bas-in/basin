@@ -1,6 +1,6 @@
-//! noisy-neighbor workload — 2-tenant adversarial fairness.
+//! noisy-neighbor workload — 2-project adversarial fairness.
 //!
-//! Two tenants (alice = whale, bob = quiet) connect to the same basin-server
+//! Two projects (alice = whale, bob = quiet) connect to the same basin-server
 //! over real TCP sockets. Alice bursts 200 consecutive INSERTs + SELECT COUNT(*)
 //! loops concurrently; Bob interleaves quiet point queries throughout. We assert
 //! that Bob's p99 latency does not degrade beyond the `BOB_P99_BUDGET_MS`

@@ -402,7 +402,7 @@ struct Inner {
     /// inline sweep (`PROJECT_STATE_SWEEP_BUDGET` candidates) and drop any
     /// entry whose `last_touched` is older than
     /// `project_state_ttl_secs`. This bounds the map's residency on
-    /// long-running multi-tenant hosts where projects are touched once
+    /// long-running multi-project hosts where projects are touched once
     /// then go quiet.
     project_semaphores: Mutex<HashMap<ProjectId, ProjectSemaphoreEntry>>,
     /// TTL (seconds) after which an untouched per-project semaphore is
@@ -609,12 +609,12 @@ impl ReadCountersSnapshot {
 }
 
 /// Default capacity for the Parquet footer cache. Bumped from 1024 to 16384
-/// after the scalability audit flagged cache thrash on multi-tenant fleets:
+/// after the scalability audit flagged cache thrash on multi-project fleets:
 /// at 10k projects × ~5 tables × ~10 files = 500k live footers, the prior
 /// cap re-fetched the cold tail on every promote. 16384 gives ~16× headroom
-/// for ~10k tenants with light table density; in the pessimistic footer-size
+/// for ~10k projects with light table density; in the pessimistic footer-size
 /// case (a few KB each) the cache costs O(tens of MB) of resident RAM —
-/// negligible against the bytes-per-tenant budget. Override at process start
+/// negligible against the bytes-per-project budget. Override at process start
 /// with `BASIN_STORAGE_PARQUET_META_CACHE_CAP` (positive `usize`); any
 /// unset / unparseable / zero value keeps the default.
 const DEFAULT_PARQUET_META_CACHE_CAP: usize = 16_384;

@@ -27,7 +27,7 @@
 //! are intercepted by a lightweight regex scan.  Detected table names are pushed
 //! into `entry.temp_tables`.  At the next checkout (scrub step) every listed
 //! table is dropped with `DROP TABLE IF EXISTS` before the session is handed to
-//! the next logical client, ensuring no cross-tenant temp-table visibility.
+//! the next logical client, ensuring no cross-project temp-table visibility.
 
 use std::sync::Arc;
 use std::time::Instant;

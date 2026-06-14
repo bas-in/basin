@@ -2,7 +2,7 @@
 //!
 //! Three workload modes:
 //!   perf            point/range/INSERT/UPDATE latency measurements
-//!   noisy-neighbor  2-tenant adversarial fairness check
+//!   noisy-neighbor  2-project adversarial fairness check
 //!   handoff         kill replica-0, assert replica-1 picks up within budget
 //!
 //! Usage:
@@ -50,11 +50,11 @@ pub struct Args {
     #[arg(long, default_value_t = 1)]
     pub replicas: u8,
 
-    /// Username for tenant Alice (project)
+    /// Username for project Alice
     #[arg(long, default_value = "alice")]
     pub user_alice: String,
 
-    /// Username for tenant Bob (project)
+    /// Username for project Bob
     #[arg(long, default_value = "bob")]
     pub user_bob: String,
 

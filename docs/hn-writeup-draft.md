@@ -10,9 +10,9 @@
 
 ## Title options
 
-1. **Show HN: Basin — Postgres-compatible multi-tenant database on object storage (Rust)**
+1. **Show HN: Basin — Postgres-compatible multi-project database on object storage (Rust)**
 2. **Show HN: We benchmarked our database against Postgres on every query and published the losses**
-3. **Show HN: Basin — columnar Postgres for 10k-tenant SaaS, $0.10/tenant/mo**
+3. **Show HN: Basin — columnar Postgres for 10k-project SaaS, $0.10/project/mo**
 
 (Option 2 leads with the integrity angle, which is the differentiator. Option 1 is the safe descriptive one. Pick based on whether you want to lead with the moat or the category.)
 
@@ -23,8 +23,8 @@
 Basin is a Postgres-wire-compatible database that stores data as columnar
 files (Vortex / Parquet) on object storage, with an Apache Iceberg catalog,
 a file-backed WAL, native vector search, and per-project prefix isolation.
-It's built for **multi-tenant SaaS with many tenants** — the case where
-running one Postgres per tenant gets expensive and running all tenants in
+It's built for **multi-project SaaS with many projects** — the case where
+running one Postgres per project gets expensive and running all projects in
 one Postgres gets operationally hairy.
 
 Apache-2.0, written in Rust, self-hostable. Repo: <link>
@@ -77,8 +77,8 @@ grows (COUNT(*), window LAG, INTERSECT, …).
 ### What this is good for
 
 - Many-isolated-projects (per-customer / per-environment / per-region) where
-  per-tenant cost is O(bytes-on-S3), not O(provisioned pool). 10k idle
-  tenants cost their bytes, ~1.2 KiB RAM each, not 10k Postgres instances.
+  per-project cost is O(bytes-on-S3), not O(provisioned pool). 10k idle
+  projects cost their bytes, ~1.2 KiB RAM each, not 10k Postgres instances.
 - Append-heavy / audit-log / event-stream workloads — Vortex columnar
   compression is ~29× smaller on disk than PG heap on our 1M SaaS shape.
 - Mixed tabular + vector (RAG) data in one database.
@@ -95,7 +95,7 @@ grows (COUNT(*), window LAG, INTERSECT, …).
 
 Pre-alpha, public eval. The hot-tier UPDATE/DELETE fast paths just went
 on-by-default (with a `BASIN_HOTTIER_FASTPATH_DISABLE=1` kill-switch). We're
-looking for multi-tenant SaaS teams who've felt the per-tenant Postgres
+looking for multi-project SaaS teams who've felt the per-project Postgres
 pricing wall to try it and tell us where it breaks.
 
 ---
@@ -103,8 +103,8 @@ pricing wall to try it and tell us where it breaks.
 ## Anticipated HN comments + honest answers (prep)
 
 **"Why not just use Postgres + Citus / partitioning?"** — Citus shards one
-big PG; it doesn't give you O(bytes) per-tenant cost for 10k mostly-idle
-tenants. The wedge is cold-tenant economics on object storage, not sharding
+big PG; it doesn't give you O(bytes) per-project cost for 10k mostly-idle
+projects. The wedge is cold-project economics on object storage, not sharding
 a hot cluster.
 
 **"JSONB 2000× slower is a dealbreaker for SaaS."** — Agreed for
@@ -118,8 +118,8 @@ uncached path on real S3; the bench shows this. The hot-tier + page cache
 keep warm paths competitive. We publish both the LocalFS and the real-S3
 cards so you can see the difference.
 
-**"Show me the $/tenant math."** — `docs/multi-project.md`. ~$0.10-0.20 per
-tenant per month at 100MB/tenant, dominated by storage bytes. The
+**"Show me the $/project math."** — `docs/multi-project.md`. ~$0.10-0.20 per
+project per month at 100MB/project, dominated by storage bytes. The
 head-to-head card against Nile (the direct competitor) is an open item —
 we'll publish it rather than hand-wave.
 
@@ -132,7 +132,7 @@ stock defaults. Run it yourself: `cargo test -p basin-integration-tests
 
 ## Post-week follow-through (not part of the post)
 
-- Start 20 cold-outreach conversations with multi-tenant SaaS founders the
+- Start 20 cold-outreach conversations with multi-project SaaS founders the
   same week (script: `docs/customer-interview-script.md`).
 - Have the Nile head-to-head card ready as the first follow-up reply if the
   pricing question dominates.

@@ -119,24 +119,24 @@ workloads feasible:
 - Compute amortised: ~$0.05/project/mo on a shared Fly Machine pool
 - Platform overhead (catalog rows, observability, billing): ~$0.05/project/mo
 
-At 10,000 active projects with this profile: **~$1,500/mo total**. Per-project / per-tenant comparisons for the same shape:
+At 10,000 active projects with this profile: **~$1,500/mo total**. Per-project comparisons for the same shape:
 
 | Platform | Per-project floor | 10,000 active projects (this profile) |
 |---|---|---|
 | **Basin (basin-cloud)** | O(bytes stored) — ~$0.10–$0.20 | **~$1,500/mo** |
 | Supabase Pro | $25/mo/project minimum | $250,000/mo (if 10k projects could even be provisioned) |
 | Neon Launch | $19/mo/project minimum | $190,000/mo |
-| Nile (Postgres-on-tenant) | Tier-based per-tenant active-tenant + storage charges (verify against the current Nile pricing page) | Worth measuring head-to-head — Nile is the direct competitor on the multi-tenant pitch, so the right comparison is **tenants × $/mo × p99 latency on a realistic SaaS shape**, not just storage cost. Published numbers should come from a real benchmark, not a calculator. |
+| Nile (Postgres-on-tenant) | Tier-based active-project + storage charges (verify against the current Nile pricing page) | Worth measuring head-to-head — Nile is the direct competitor on the multi-project pitch, so the right comparison is **projects × $/mo × p99 latency on a realistic SaaS shape**, not just storage cost. Published numbers should come from a real benchmark, not a calculator. |
 
 Basin's per-project cost is **O(bytes stored)**, not **O(provisioned pool)** —
 the same workload is dominated by storage bytes, not per-project minimums, so
 the cost story is orders of magnitude cheaper than the Postgres-per-project
 shape (Supabase Pro, Neon Launch). Against **Nile** specifically (which also
-sells multi-tenant Postgres but virtualizes tenants on a shared PG cluster),
-the wedge is the substrate: Nile inherits PG's per-tenant heap / connection /
-autovacuum overhead and PG's pool minimums; Basin's per-tenant overhead is
+sells multi-project Postgres but virtualizes projects on a shared PG cluster),
+the wedge is the substrate: Nile inherits PG's per-project heap / connection /
+autovacuum overhead and PG's pool minimums; Basin's per-project overhead is
 ~1.2 KiB of RAM and the bytes it has on S3. The head-to-head card —
-**tenants × $/mo × p99 on a realistic SaaS workload** — is the comparison
+**projects × $/mo × p99 on a realistic SaaS workload** — is the comparison
 that should drive evals, and it's an open work item on the roadmap.
 
 ---

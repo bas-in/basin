@@ -240,7 +240,7 @@ Until then, the CDC ring is the durability contract.
 **Auth model.** CDC stream access is authenticated via the same JWT path as
 REST/WebSocket. The JWT must carry the `project` claim. Per-project streams are
 fully isolated: no subscriber can read another project's events regardless of
-tenant configuration.
+project configuration.
 
 **Per-project quota dimensions** (enforced under the ADR 0008 EDF scheduler):
 - `cdc.events_per_second_cap` (default: 1 000 events/sec outbound) — limits

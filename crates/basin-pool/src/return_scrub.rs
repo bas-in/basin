@@ -34,8 +34,8 @@
 //!
 //! `CREATE TEMP TABLE` in Basin creates a **persistent** catalog entry (there
 //! is no session-scoped temp-schema as in standard Postgres).  Without
-//! explicit cleanup a temp table created by tenant A during one checkout
-//! remains visible to tenant B on the next checkout that reuses the same
+//! explicit cleanup a temp table created by project A during one checkout
+//! remains visible to project B on the next checkout that reuses the same
 //! physical session.
 //!
 //! The fix: [`PooledSession::execute`] intercepts `CREATE TEMP[ORARY] TABLE`

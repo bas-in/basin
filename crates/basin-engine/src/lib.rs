@@ -298,7 +298,7 @@ pub(crate) struct EngineInner {
     /// Holds per-project logical replication slots and their pending frame
     /// queues. Shared across all sessions; per-project isolation is structural
     /// (each project has its own slot map inside the `Arc<Mutex<HashMap<…>>>`).
-    /// Per-tenant cost is O(bytes) when no slots are active for a project.
+    /// Per-project cost is O(bytes) when no slots are active for a project.
     pub(crate) slot_registry: Arc<basin_catalog::SlotRegistry>,
 
     /// Phase 5.21.E — process-wide publication registry.

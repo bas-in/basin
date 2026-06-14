@@ -209,7 +209,7 @@ pub(crate) async fn list_data_files_with_stats(
     // on a table that has somehow accumulated >MAX listed files. This is
     // NOT a substitute for the caller pruning the file set up front
     // (catalog-stats prune, prefix filtering, per-partition listing); it
-    // exists so a runaway tenant can't burst the per-tenant memory
+    // exists so a runaway project can't burst the per-project memory
     // budget. Surfaces as SQLSTATE 54000 (`program_limit_exceeded`).
     let max_listed = resolve_max_listed_files();
     if files.len() > max_listed {

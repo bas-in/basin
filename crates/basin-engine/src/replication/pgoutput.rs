@@ -133,11 +133,11 @@ pub fn encode_change_event(
 /// frames. Attached as a post-commit sink on the engine so all sessions on
 /// the engine automatically feed into active replication slots.
 ///
-/// ## Per-tenant cost
+/// ## Per-project cost
 ///
 /// The sink holds only `Arc<SlotRegistry>` + `ProjectId` — O(bytes) per idle
 /// project. The `SlotRegistry` itself is a single `Arc<Mutex<HashMap<…>>>`,
-/// consistent with the "shared heavy resource + cheap per-tenant primitive"
+/// consistent with the "shared heavy resource + cheap per-project primitive"
 /// design rule.
 pub struct ReplicationSink {
     registry: Arc<SlotRegistry>,
