@@ -107,34 +107,34 @@ pub(crate) async fn execute_trgm_knn_plan(
     // `None` files are excluded (fill-only). ──
     let mut candidate_paths: Vec<ObjectPath> = Vec::new();
     let mut row_selection: HashMap<String, Vec<u64>> = HashMap::new();
+    // `None`-verdict files: no needle trigram occurs, so every row is a
+    // distance-1 fill row. These are the ONLY files NOT read by the candidate
+    // pass — `Rows`/`Full` files are read whole, so their distance-1 rows are
+    // already scored. Reading the candidate files whole (rather than via the
+    // row_selection narrow) makes the fill format-agnostic: it draws ONLY from
+    // disjoint `None` files, so no row is ever double-counted regardless of
+    // whether the storage layer honours the row_selection hint (Parquet does,
+    // Vortex ignores it). The row_selection is still attached as a SAFE perf
+    // SUPERSET hint for Parquet candidate files — the exact distance recompute
+    // below re-ranks whatever rows arrive, so an honoured-or-ignored hint is
+    // equally correct.
     let mut fill_paths: Vec<String> = Vec::new();
-    // Per `Rows` file: the candidate offsets already decoded by the candidate
-    // pass, so the fill re-read of that same file skips them (no double-count).
-    let mut consumed: HashMap<String, Vec<u64>> = HashMap::new();
     for path in &live_paths {
         match verdicts.get(path) {
             Some(TrgmKnnFile::Rows(offs)) => {
                 candidate_paths.push(ObjectPath::from(path.as_str()));
                 row_selection.insert(path.clone(), offs.clone());
-                // The non-candidate rows of this file are distance-1 fill rows.
-                let mut sorted = offs.clone();
-                sorted.sort_unstable();
-                consumed.insert(path.clone(), sorted);
-                fill_paths.push(path.clone());
             }
             Some(TrgmKnnFile::Full) => {
-                // Whole file is candidate read: it yields both near rows AND any
-                // distance-1 rows, so it never needs a separate fill pass.
                 candidate_paths.push(ObjectPath::from(path.as_str()));
             }
             Some(TrgmKnnFile::None) | None => {
-                // No needle trigram here → every row is a distance-1 fill row.
                 fill_paths.push(path.clone());
             }
         }
     }
 
-    // ── Read the candidate rows and exact-rank by `1 - similarity`. ──
+    // ── Read the candidate files and exact-rank by `1 - similarity`. ──
     let mut batches: Vec<RecordBatch> = Vec::new();
     // (distance, batch_idx, row_idx)
     let mut scored: Vec<(f32, usize, usize)> = Vec::new();
@@ -163,34 +163,20 @@ pub(crate) async fn execute_trgm_knn_plan(
             .then(a.1.cmp(&b.1))
             .then(a.2.cmp(&b.2))
     });
-    scored.truncate(plan.k);
 
-    // ── Boundary fill: fewer than k candidate rows survived → top up with
-    // arbitrary distance-1 rows (ties at distance 1 are arbitrary in PG). Fill
-    // rows come only from the `fill_paths` set (`None` files + the non-candidate
-    // offsets of `Rows` files); `Full` files are NOT in that set because the
-    // candidate pass already decoded every one of their rows (near AND
-    // distance-1). A `Rows` file's fill re-read skips its candidate offsets
-    // (`consumed`) so a near row is never double-counted. ──
+    // ── Boundary fill: when the candidate files hold fewer than k rows in
+    // total, the answer is short of k. The remaining slots are arbitrary
+    // distance-1 rows (PG returns min(k, #rows) with ties at distance 1
+    // arbitrary), which live exclusively in the `None` files (disjoint from the
+    // candidate files). Fill BEFORE the final truncate so the appended
+    // distance-1 rows sit after every scored candidate row. ──
     if scored.len() < plan.k && !fill_paths.is_empty() {
         let deficit = plan.k - scored.len();
-        // `consumed` (the candidate offsets of each `Rows` file) lets the fill
-        // re-read skip rows the candidate pass already ranked.
-        let fill = read_fill_rows(
-            sess,
-            &plan,
-            &catalog_schema,
-            &fill_paths,
-            &consumed,
-            deficit,
-        )
-        .await?;
+        let fill = read_fill_rows(sess, &plan, &catalog_schema, &fill_paths, deficit).await?;
         for (batch, rows) in fill {
             let bidx = batches.len();
             for r in rows {
-                // Fill rows are distance-1 by construction (no shared trigram),
-                // but we recompute exactly to stay honest — a `Rows` file's
-                // non-candidate offset is guaranteed distance 1.
+                // Fill rows carry no shared needle trigram → distance exactly 1.
                 scored.push((1.0, bidx, r));
                 if scored.len() >= plan.k {
                     break;
@@ -209,8 +195,10 @@ pub(crate) async fn execute_trgm_knn_plan(
                 .then(a.1.cmp(&b.1))
                 .then(a.2.cmp(&b.2))
         });
-        scored.truncate(plan.k);
     }
+    // Final exact top-k cut (covers both the no-fill path — candidate rows >= k
+    // — and the post-fill path).
+    scored.truncate(plan.k);
 
     if scored.is_empty() {
         return Ok(Some(empty_result(&meta.schema, &plan.projection)?));
@@ -261,32 +249,28 @@ fn score_batch_into(
     Ok(())
 }
 
-/// Read up to `deficit` distance-1 fill rows from `fill_paths`, skipping any
-/// absolute offsets in `consumed` (the candidate offsets of `Rows` files).
+/// Read up to `deficit` distance-1 fill rows from `fill_paths` (the `None`
+/// verdict files — disjoint from the candidate files, so no row is double
+/// counted).
 ///
 /// Returns `(batch, row_indices)` pairs; the caller appends them as distance-1
-/// rows. Reads whole files (no row selection) and applies the per-file
-/// `consumed` skip at decode time so a `Rows` file's already-ranked near rows
-/// are not double-counted.
+/// rows. Reads files one at a time and stops as soon as the deficit is met, so
+/// a tiny fill never over-fetches a large table.
 async fn read_fill_rows(
     sess: &ProjectSession,
     plan: &TrgmKnnPlan,
     catalog_schema: &Arc<Schema>,
     fill_paths: &[String],
-    consumed: &HashMap<String, Vec<u64>>,
     deficit: usize,
 ) -> Result<Vec<(RecordBatch, Vec<usize>)>> {
     let storage = sess.engine.config().storage.clone();
     let mut out: Vec<(RecordBatch, Vec<usize>)> = Vec::new();
     let mut need = deficit;
 
-    // Read files one at a time so we can stop as soon as the deficit is met and
-    // never over-fetch a large table for a tiny fill.
     for path in fill_paths {
         if need == 0 {
             break;
         }
-        let skip = consumed.get(path);
         let paths = vec![ObjectPath::from(path.as_str())];
         let opts = ReadOptions::default();
         let mut stream = storage
@@ -297,8 +281,6 @@ async fn read_fill_rows(
                 Some(catalog_schema.clone()),
             )
             .await?;
-        // Track the absolute offset within this file as batches stream in.
-        let mut file_off: u64 = 0;
         while let Some(item) = stream.next().await {
             if need == 0 {
                 break;
@@ -306,10 +288,7 @@ async fn read_fill_rows(
             let batch = item?;
             let col_idx = match batch.schema().index_of(&plan.col) {
                 Ok(i) => i,
-                Err(_) => {
-                    file_off += batch.num_rows() as u64;
-                    continue;
-                }
+                Err(_) => continue,
             };
             let col = batch.column(col_idx);
             let arr = col.as_any().downcast_ref::<StringArray>();
@@ -317,10 +296,6 @@ async fn read_fill_rows(
             for r in 0..batch.num_rows() {
                 if need == 0 {
                     break;
-                }
-                let abs = file_off + r as u64;
-                if skip.is_some_and(|s| s.binary_search(&abs).is_ok()) {
-                    continue; // already ranked as a near candidate
                 }
                 // Skip NULL text rows: a NULL is not a real distance-1 row a
                 // user expects ahead of materialised rows, and PG sorts NULLs
@@ -333,7 +308,6 @@ async fn read_fill_rows(
                 rows.push(r);
                 need -= 1;
             }
-            file_off += batch.num_rows() as u64;
             if !rows.is_empty() {
                 out.push((batch, rows));
             }
