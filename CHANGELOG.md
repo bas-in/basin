@@ -8,6 +8,22 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-14 — ALTER TABLE ADD CONSTRAINT … FOREIGN KEY (ORM migrations)
+
+- **`ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY …` is now accepted and enforced.**
+  ORMs create tables first and wire up foreign keys in a follow-up `ALTER`
+  (Django `AddField`, Rails), usually inside the same migration transaction — so
+  rejecting the FK addition rolled back every column the migration added in that
+  transaction too (the array/enum/`version` columns), failing a large fraction of
+  the live-ORM suite for an unrelated reason. The FK is now registered in catalog
+  metadata exactly as `CREATE TABLE` does and enforced on subsequent writes by
+  the existing FK machinery (`enforce_fk_on_insert`, cascade/no-action on parent
+  delete). Backfill validation of existing child rows is deferred (the migration
+  case adds the FK to a freshly-created, empty table). `ADD PRIMARY KEY` after
+  creation remains deferred (its NOT NULL backfill is out of scope). Source:
+  `crates/basin-engine/src/alter.rs`; covered by
+  `type_ddl::alter_add_foreign_key_registers_and_enforces`.
+
 ## 2026-06-14 — enum values stamped as a cast INSERT correctly (`'USER'::"Role"`)
 
 - **Cast-wrapped string literals coerce for enum / text columns.** ORMs (Django

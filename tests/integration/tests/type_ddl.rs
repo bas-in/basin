@@ -99,6 +99,44 @@ async fn create_type_enum_invalid_label_rejected() {
     );
 }
 
+/// `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY …` — ORMs create tables first,
+/// then wire up FKs in a follow-up ALTER (often in the same migration tx, so a
+/// rejection there used to roll back the whole migration). The FK must register
+/// in catalog metadata and be enforced on subsequent child INSERTs.
+#[tokio::test]
+async fn alter_add_foreign_key_registers_and_enforces() {
+    let (_dir, engine) = open_engine().await;
+    let sess = open_session(&engine).await;
+
+    exec_ok(&sess, "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)").await;
+    exec_ok(
+        &sess,
+        "CREATE TABLE child (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT)",
+    )
+    .await;
+    exec_ok(&sess, "INSERT INTO parent VALUES (1)").await;
+
+    // Add the FK after creation (the migration shape that used to be rejected).
+    exec_ok(
+        &sess,
+        "ALTER TABLE child ADD CONSTRAINT child_parent_fk FOREIGN KEY (parent_id) REFERENCES parent (id)",
+    )
+    .await;
+
+    // Enforced on subsequent writes: a valid reference inserts; a dangling one
+    // is rejected (proves the FK was registered, not silently accepted).
+    exec_ok(&sess, "INSERT INTO child VALUES (1, 1)").await;
+    let err = exec_err(&sess, "INSERT INTO child VALUES (2, 999)").await;
+    assert!(
+        err.contains("foreign key")
+            || err.contains("23503")
+            || err.contains("violates")
+            || err.contains("999")
+            || err.contains("parent"),
+        "dangling FK insert must be rejected after ALTER ADD FK, got: {err}"
+    );
+}
+
 /// ORMs (Django, et al.) stamp enum values in INSERT as an explicit cast —
 /// `'USER'::"Role"` (sqlparser: `CAST('USER' AS "Role")`, sometimes nested via
 /// `::TEXT`). The cast-wrapped literal must coerce to the enum (stored as Utf8)

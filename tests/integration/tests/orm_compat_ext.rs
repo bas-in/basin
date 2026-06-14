@@ -607,7 +607,8 @@ async fn orm_compat_corpus_ext() {
         // Migration breadth — `ALTER COLUMN … TYPE` (Django AlterField).
         Shape::raw(r#"ALTER TABLE "events" ALTER COLUMN "kind" TYPE varchar(255)"#),
         // Migration breadth — add FK after creation (Django AddField FK).
-        // KNOWN GAP: ALTER ADD CONSTRAINT FOREIGN KEY is deferred in v0.1.
+        // Now supported: ALTER ADD CONSTRAINT FOREIGN KEY registers the FK in
+        // catalog metadata (enforcement on subsequent writes; backfill deferred).
         Shape::raw(r#"ALTER TABLE "event_lines" ADD CONSTRAINT "event_lines_event_fk" FOREIGN KEY ("event_id") REFERENCES "events" ("id")"#),
         // Session cleanup guard (mirrors orm_compat.rs convention).
         Shape::raw(r#"ROLLBACK"#),

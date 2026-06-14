@@ -34,7 +34,7 @@
 use crate::pg_ast::ObjectNamePartExt;
 use crate::schema_ddl::SchemaState;
 use arrow_schema::{Field, Schema};
-use basin_catalog::{Catalog, CheckConstraint, UniqueConstraint};
+use basin_catalog::{Catalog, CheckConstraint, ForeignKeyDef, UniqueConstraint};
 use basin_common::{BasinError, Result, TableName};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, ColumnDef, ColumnOption, ObjectName, TableConstraint,
@@ -883,10 +883,91 @@ async fn add_constraint(
                 .set_unique_constraints(project, table, uniques)
                 .await?;
         }
-        TableConstraint::PrimaryKey(_) | TableConstraint::ForeignKey(_) => {
+        TableConstraint::ForeignKey(sqlparser::ast::ForeignKeyConstraint {
+            name,
+            columns,
+            foreign_table,
+            referred_columns,
+            on_delete,
+            on_update,
+            ..
+        }) => {
+            // `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY …` — the shape ORM
+            // migrations emit AFTER creating the tables (Django/Rails create the
+            // tables first, then wire up FKs in a follow-up ALTER, often inside
+            // the same migration transaction; rejecting it here used to abort
+            // the whole migration, rolling back every column it added too).
+            // Register the FK in catalog metadata exactly as CREATE TABLE does;
+            // enforcement rides the existing FK machinery on subsequent writes.
+            // Backfill validation of existing child rows is deferred (matching
+            // the CHECK "validated on later writes" behaviour) — the migration
+            // case adds the FK to a freshly-created table with no rows.
+            if foreign_table.0.len() != 1 {
+                return Err(BasinError::InvalidSchema(format!(
+                    "ALTER TABLE {table}: FOREIGN KEY reference must be a bare table name; got {foreign_table}"
+                )));
+            }
+            let ref_table = foreign_table.0[0].id_val().clone();
+            if columns.is_empty() {
+                return Err(BasinError::InvalidSchema(format!(
+                    "ALTER TABLE {table}: FOREIGN KEY column list cannot be empty"
+                )));
+            }
+            let local_cols: Vec<String> = columns.iter().map(|i| i.value.clone()).collect();
+            for c in &local_cols {
+                if meta.schema.field_with_name(c).is_err() {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "ALTER TABLE {table}: FOREIGN KEY column {c:?} not in table schema"
+                    )));
+                }
+            }
+            let ref_cols: Vec<String> =
+                referred_columns.iter().map(|i| i.value.clone()).collect();
+            // Implicit-PK / partial spec (no referred columns, or a count
+            // mismatch): accept the syntax but drop the catalog row — resolving
+            // the referenced PK needs an async lookup the CREATE path also
+            // skips here. Mirrors `ddl::schema_from_columns`.
+            let degraded = ref_cols.is_empty() || local_cols.len() != ref_cols.len();
+            let fk_name = match name {
+                Some(n) => n.value.clone(),
+                None => format!("{table}_{}_fkey", local_cols[0]),
+            };
+            if meta
+                .foreign_keys
+                .iter()
+                .any(|f| f.name.eq_ignore_ascii_case(&fk_name))
+            {
+                return Err(BasinError::InvalidSchema(format!(
+                    "ALTER TABLE {table}: FOREIGN KEY constraint {fk_name:?} already exists"
+                )));
+            }
+            if !degraded {
+                let on_delete_act = crate::ddl::referential_action_from_ast(*on_delete)?;
+                let on_update_act = crate::ddl::referential_action_from_ast(*on_update)?;
+                let mut fks = meta.foreign_keys.clone();
+                fks.push(ForeignKeyDef {
+                    name: fk_name,
+                    columns: local_cols,
+                    ref_table,
+                    ref_columns: ref_cols,
+                    on_delete: on_delete_act,
+                    on_update: on_update_act,
+                });
+                catalog
+                    .set_table_constraints(
+                        project,
+                        table,
+                        meta.pk_columns.clone(),
+                        meta.check_constraints.clone(),
+                        fks,
+                    )
+                    .await?;
+            }
+        }
+        TableConstraint::PrimaryKey(_) => {
             return Err(BasinError::InvalidSchema(
-                "ALTER TABLE ADD CONSTRAINT: only CHECK and UNIQUE are supported in v0.1 \
-                 (PRIMARY KEY / FOREIGN KEY additions after table creation are deferred)"
+                "ALTER TABLE ADD CONSTRAINT: PRIMARY KEY additions after table creation are \
+                 deferred in v0.1 (its NOT NULL backfill validation is out of scope)"
                     .into(),
             ));
         }

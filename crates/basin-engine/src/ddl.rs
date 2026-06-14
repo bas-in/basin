@@ -870,7 +870,7 @@ pub(crate) fn schema_and_constraints_from_columns(
     Ok((schema, extracted))
 }
 
-fn referential_action_from_ast(action: Option<ReferentialAction>) -> Result<RefAction> {
+pub(crate) fn referential_action_from_ast(action: Option<ReferentialAction>) -> Result<RefAction> {
     match action {
         None | Some(ReferentialAction::NoAction) => Ok(RefAction::NoAction),
         Some(ReferentialAction::Cascade) => Ok(RefAction::Cascade),
