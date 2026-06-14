@@ -402,3 +402,56 @@ async fn delete_using_at_100k_is_bounded() {
     bg.shutdown().await;
     wal.close().await.unwrap();
 }
+
+/// A point `DELETE … WHERE id IN (scattered)` on a btree-indexed table is
+/// forced down the cold copy-on-write path (the tombstone fast path admits
+/// GIN-only tables but declines anything with a btree index). This pins that
+/// the cold delete (a) is correct — deletes exactly the matched PKs, leaves the
+/// rest — and (b) prunes to the handful of files actually containing the
+/// matched PKs (per-file column stats) rather than rewriting the whole table,
+/// and skips the FK-cascade re-read entirely for a table with no inbound FK.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_point_delete_btree_is_pruned_and_correct() {
+    let total = 100_000i64;
+    let (_sd, _wd, engine, shard, bg, wal) = build().await;
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+    let _files = seed_events(&sess, &shard, total).await;
+    // A second, NON-GIN (btree) index forces the cold path: the tombstone fast
+    // path admits GIN-only tables but declines anything with a btree index.
+    exec(&sess, "CREATE INDEX events_val_btree ON events (val)").await;
+
+    // Five PKs scattered across distinct files (ROWS_PER_FILE apart).
+    let ids: Vec<i64> = (0..5).map(|k| k * ROWS_PER_FILE + 123).collect();
+    let in_list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+
+    let t0 = Instant::now();
+    let res = exec(&sess, &format!("DELETE FROM events WHERE id IN ({in_list})")).await;
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    assert_eq!(tag_of(&res), "DELETE 5", "must delete exactly the 5 scattered PKs");
+    assert_eq!(
+        int_at(&sess, "SELECT COUNT(*) FROM events").await,
+        total - 5,
+        "table must be down exactly 5 rows",
+    );
+    for &id in &ids {
+        assert_eq!(
+            rows_of(&exec(&sess, &format!("SELECT id FROM events WHERE id = {id}")).await),
+            0,
+            "deleted row id={id} must be gone",
+        );
+    }
+    // Pruning ceiling: rewriting only the ~5 files that hold the matched PKs (vs
+    // the whole 20-file table) keeps this far under a generous budget. A blown
+    // budget signals stats pruning or the FK-cascade re-read skip regressed.
+    let bud = budget_ms(8_000.0);
+    assert!(
+        ms < bud,
+        "cold point DELETE of 5 scattered rows took {ms:.1} ms, budget {bud:.0} ms — \
+         stats pruning or the no-inbound-FK re-read skip likely regressed",
+    );
+    println!("[cold-point-delete-btree] total={total} ids={ids:?} t={ms:.1}ms");
+
+    bg.shutdown().await;
+    wal.close().await.unwrap();
+}

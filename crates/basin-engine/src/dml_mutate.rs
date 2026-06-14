@@ -1410,8 +1410,25 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
     // tuple set, then for every child table that references this
     // one: NO ACTION rejects when referring rows exist; CASCADE
     // captures rows for a follow-on DELETE.
+    //
+    // Gate the whole thing on there actually being a child table that
+    // references THIS one: building `deleted_pks` re-reads every rewritten /
+    // dropped data file (a second full pass over the rewritten rows), so for
+    // the common no-inbound-FK table it is pure waste — a cold DELETE of a few
+    // rows from a large table re-read all its rewritten files for nothing. The
+    // `fks_referencing` probe is a cheap catalog-metadata lookup (no file I/O).
+    let referencing_children = if meta.pk_columns.is_empty() {
+        Vec::new()
+    } else {
+        crate::constraints::fks_referencing(
+            &sess.engine.config().catalog,
+            &sess.project,
+            table.as_str(),
+        )
+        .await?
+    };
     let mut cascades: Vec<crate::constraints::CascadeDelete> = Vec::new();
-    if !meta.pk_columns.is_empty() {
+    if !meta.pk_columns.is_empty() && !referencing_children.is_empty() {
         let mut deleted_pks: std::collections::HashSet<Vec<String>> = Default::default();
         for p in &dropped_paths {
             let mut stream = sess
