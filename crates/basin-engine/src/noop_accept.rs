@@ -312,7 +312,34 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
             {
                 None
             } else {
-                Some(ExecResult::Empty { tag: "SHOW".into() })
+                // PostgreSQL's SHOW always returns EXACTLY ONE row. Returning an
+                // empty result (no row, no RowDescription) makes a driver that
+                // FETCHes the value raise "no results to fetch" and abort the
+                // connection — psycopg / SQLAlchemy run `SHOW transaction
+                // isolation level` in get_isolation_level at connect. The real
+                // (sqlparser) executor cannot parse multi-word forms like that,
+                // so this interceptor must produce the row itself. Render the
+                // shown variable as the column name and a sensible value
+                // (read-committed snapshot semantics for the isolation level,
+                // empty otherwise — fetchable, never a hard connection failure).
+                let var = sql
+                    .trim()
+                    .trim_end_matches(';')
+                    .split_whitespace()
+                    .skip(1)
+                    .collect::<Vec<_>>()
+                    .join("_")
+                    .to_ascii_lowercase();
+                let val = if var == "transaction_isolation"
+                    || var == "transaction_isolation_level"
+                    || var == "default_transaction_isolation"
+                {
+                    "read committed"
+                } else {
+                    ""
+                };
+                let col = if var.is_empty() { "show" } else { var.as_str() };
+                Some(crate::executor::make_show_result(col, val))
             }
         }
         // Everything else is not in our accept set.

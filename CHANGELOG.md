@@ -39,8 +39,14 @@ graduate to 1.0 and the standard SemVer guarantees.
   SQLAlchemy `get_isolation_level` via `SHOW transaction isolation level` — raised
   "no results to fetch" and aborted the connection. `SHOW transaction_isolation`
   now returns "read committed", and every other unknown `SHOW <var>` returns a
-  single empty-valued row keyed by the variable name. Source:
-  `crates/basin-engine/src/executor.rs`.
+  single empty-valued row keyed by the variable name. The operative interceptor
+  is `noop_accept` (Basin classifies `SHOW` via the pg_query parser into
+  `StmtKind::VariableShow` and short-circuits there, before the sqlparser
+  executor — which in any case cannot parse multi-word forms like `SHOW
+  TRANSACTION ISOLATION LEVEL`): it now emits the row instead of an empty
+  result. Regression test: `orm_driver_connect.rs` exercises the psycopg/
+  SQLAlchemy connect statement sequence end-to-end. Source:
+  `crates/basin-engine/src/{noop_accept,executor}.rs`.
 
 ## 2026-06-14 — Cold DELETE write-amp: GIN-only tombstone fast path + FK-cascade re-read skip
 

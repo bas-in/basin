@@ -11368,7 +11368,7 @@ async fn exec_show_tables(sess: &ProjectSession) -> Result<ExecResult> {
 
 /// Phase 5.28.D: build a single-row/single-column `ExecResult::Rows` for `SHOW <var>`.
 /// Column name is the variable name; value is `val`.
-fn make_show_result(col_name: &str, val: &str) -> ExecResult {
+pub(crate) fn make_show_result(col_name: &str, val: &str) -> ExecResult {
     let schema = Arc::new(Schema::new(vec![Field::new(col_name, DataType::Utf8, false)]));
     let arr = StringArray::from(vec![val]);
     let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr) as ArrayRef])
