@@ -572,6 +572,11 @@ async fn run_full_rewrite_pipeline(sess: &ProjectSession, sql: &str) -> Result<S
     // PostgreSQL expands SRFs in the SELECT list to a row set; this restores
     // that behaviour for the common ORM array-/object-expansion idiom.
     let rewritten = crate::pg_operators::rewrite_jsonb_srf_scalar_select(&rewritten);
+    // Rewrite the bare `SELECT * FROM current_schema()` / current_database() /
+    // version() driver connect-probe (system fn in FROM position) to the
+    // equivalent scalar projection so it resolves via the scalar UDF instead of
+    // failing FROM-clause table-function dispatch (typeorm connect).
+    let rewritten = crate::pg_operators::rewrite_system_fn_from_table(&rewritten);
     // Rewrite PostgreSQL POSIX regex operators (`~`, `!~`, `~*`, `!~*`) to
     // `regexp_like(…)` calls DataFusion accepts; expand `BETWEEN SYMMETRIC`;
     // rewrite array containment / overlap operators (`@>`, `<@`, `&&`) for

@@ -67,6 +67,10 @@ async fn psycopg_connect_sequence_each_statement_returns_a_row() {
         "SELECT version()",
         "select pg_catalog.version()",
         "select current_schema()",
+        // typeorm calls these system functions in FROM position (table-function
+        // form), not as scalars — must resolve to the same single-row result.
+        "SELECT * FROM current_schema()",
+        "SELECT * FROM current_database()",
         "show transaction isolation level",
         "SHOW transaction_isolation",
         // A genuinely unknown GUC must still be fetchable (one empty-valued row),

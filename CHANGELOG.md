@@ -8,6 +8,19 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-14 — system functions in FROM position (`SELECT * FROM current_schema()`)
+
+- **`SELECT * FROM current_schema()` / `current_database()` / `version()` resolve.**
+  Drivers (typeorm's `PostgresQueryRunner` connect) call these nullary system
+  functions in FROM position, treating them as set-returning table functions.
+  Basin's FROM-clause dispatch only resolves registered UDTFs and rejected them
+  with `UndefinedFunction`, aborting the connection. The bare whole-statement
+  probe is now rewritten to the equivalent scalar projection
+  `SELECT <fn>() AS <fn>` (same single-row result PostgreSQL returns).
+  Conservative / correct-or-noop — only the exact bare form is rewritten.
+  Source: `crates/basin-engine/src/pg_operators.rs` (`rewrite_system_fn_from_table`);
+  covered by `orm_driver_connect.rs`.
+
 ## 2026-06-14 — pgwire reports a PG-compatible server_version (ORM connectivity fix)
 
 - **Startup `server_version` is now a real PostgreSQL version ("15.0").**

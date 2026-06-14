@@ -5951,6 +5951,39 @@ const JSONB_SRF_NAMES: &[&str] = &[
 /// change the semantics of a query that already works.  The FROM-clause form
 /// (`SELECT * FROM jsonb_array_elements(...)`) already routes to the UDTF and
 /// is not affected by this rewrite.
+/// typeorm (and some other drivers) call the nullary system functions
+/// `current_schema()` / `current_database()` / `version()` in FROM position —
+/// e.g. `SELECT * FROM current_schema()` in `PostgresQueryRunner` connect —
+/// treating them as set-returning table functions. Basin's FROM-clause dispatch
+/// only resolves registered UDTFs and rejects these with `UndefinedFunction`,
+/// aborting the connection. They ARE registered scalar UDFs, so rewrite the
+/// bare whole-statement probe into the equivalent scalar projection
+/// `SELECT <fn>() AS <fn>`, which yields the same single-row, single-column
+/// result PostgreSQL returns (the nullary-column-name pass already names the
+/// column after the function).
+///
+/// Deliberately conservative: ONLY the exact bare `SELECT * FROM <fn>()` form
+/// (any whitespace, optional `pg_catalog.` qualifier, optional trailing `;`) is
+/// rewritten — correct-or-noop. Anything with a WHERE/JOIN/alias/extra columns
+/// is left for the normal planner.
+pub(crate) fn rewrite_system_fn_from_table(sql: &str) -> String {
+    let lower = sql.trim().trim_end_matches(';').trim_end().to_ascii_lowercase();
+    if !lower.starts_with("select") {
+        return sql.to_string();
+    }
+    // Whitespace-insensitive exact match against `select*from<fn>()`.
+    let nows: String = lower.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    for fn_name in ["current_schema", "current_database", "version"] {
+        for qual in ["", "pg_catalog."] {
+            let q = format!("{qual}{fn_name}");
+            if nows == format!("select*from{q}()") {
+                return format!("SELECT {q}() AS {fn_name}");
+            }
+        }
+    }
+    sql.to_string()
+}
+
 pub(crate) fn rewrite_jsonb_srf_scalar_select(sql: &str) -> String {
     let lower = sql.to_ascii_lowercase();
 
