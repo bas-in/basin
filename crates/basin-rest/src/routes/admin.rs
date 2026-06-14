@@ -167,6 +167,45 @@ pub(crate) async fn list_project_tables(
         .into_response())
 }
 
+/// `DELETE /admin/v1/projects/{project_id}` — deprovision a project: delete its
+/// object-store bytes, drop its catalog rows (tables / snapshots / namespace),
+/// and remove its pgwire credentials. Admin-scoped. Idempotent — deleting an
+/// already-gone project succeeds (no bytes, no rows, no creds → 204).
+pub(crate) async fn delete_project(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    require_admin(&claims)?;
+    let project: ProjectId = project_id
+        .parse()
+        .map_err(|e| ApiError::invalid(format!("invalid project_id: {e}")))?;
+    assert_admin_for_path_project(&claims, &project)?;
+
+    let catalog = state.cfg.engine.config().catalog.clone();
+    // 1. Object-store bytes first (needs the catalog's file list).
+    state
+        .cfg
+        .engine
+        .config()
+        .storage
+        .delete_project(catalog.as_ref(), &project)
+        .await
+        .map_err(ApiError::from)?;
+    // 2. Catalog rows (tables, snapshots, namespace).
+    catalog.drop_namespace(&project).await.map_err(ApiError::from)?;
+    // 3. pgwire credentials.
+    state
+        .cfg
+        .auth
+        .delete_project_credentials(&project)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 /// `POST /admin/v1/projects/{id}/rotate` — rotate a credential's password.
 /// `id` is the `pgwire_user` (`project_<8 hex>` or `{ulid}_{hex}`), not the
 /// project ULID. The older password stops validating immediately; the response

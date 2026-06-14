@@ -463,6 +463,25 @@ impl AuthService {
         project_credentials::list(&self.inner, project).await
     }
 
+    /// Delete every pgwire credential for `project` — the credential half of
+    /// project deprovisioning (the storage bytes + catalog rows are torn down
+    /// by the engine/storage layers). Returns the number of credentials
+    /// removed. Per-credential deletes are idempotent (a `NotFound` row is
+    /// treated as already-removed), so this is safe to retry.
+    pub async fn delete_project_credentials(&self, project: &ProjectId) -> Result<usize> {
+        let creds = project_credentials::list(&self.inner, project).await?;
+        let mut removed = 0usize;
+        for c in &creds {
+            match self.inner.store.delete_project_credential(&c.pgwire_user).await {
+                Ok(()) => removed += 1,
+                // Already gone (idempotent) — count it as removed and continue.
+                Err(basin_common::BasinError::NotFound(_)) => removed += 1,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
+    }
+
     /// Returns all credentials across all projects that are in the legacy
     /// `project_<hex>` format. Used by the upgrade migration to discover rows
     /// that need to be rotated to the new `{project_id}_{hex}` format.

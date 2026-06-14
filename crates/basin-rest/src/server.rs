@@ -16,7 +16,7 @@ use std::sync::Arc;
 use axum::extract::DefaultBodyLimit;
 use axum::http::header::{HeaderName, AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, Method};
-use axum::routing::{any, get, post, Router};
+use axum::routing::{any, delete, get, post, Router};
 use basin_auth::Claims;
 use basin_blob::signing::BlobSigningSecret;
 use basin_blob::store::{BlobCatalog, BlobStore, InMemoryBlobCatalog};
@@ -359,6 +359,11 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         // and rotate them. All gated on `claims.is_admin == true` (see
         // `admin_routes::*`).
         .route("/admin/v1/projects", post(admin_routes::provision_project))
+        // Cloud control-plane: deprovision (delete) a project.
+        .route(
+            "/admin/v1/projects/:project_id",
+            delete(admin_routes::delete_project),
+        )
         .route(
             "/admin/v1/projects/:pgwire_user/rotate",
             post(admin_routes::rotate_project),

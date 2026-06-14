@@ -8,6 +8,18 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-15 — Cloud control-plane: deprovision (DELETE) a project
+
+- **`DELETE /admin/v1/projects/:id`** fully deprovisions a project: deletes its
+  object-store bytes (`Storage::delete_project`), drops its catalog rows —
+  tables, snapshots, namespace (`Catalog::drop_namespace`), and removes its
+  pgwire credentials (new `AuthService::delete_project_credentials`, idempotent
+  per-credential). Admin-scoped; returns 204. A serverless product must let you
+  tear a project down (cost control, self-serve, GDPR) — the teardown primitives
+  existed but were unrouted; this wires them. Pinned by
+  `admin_delete_project_deprovisions` (provision → credentials present → delete →
+  credentials gone, against the live PG-backed harness).
+
 ## 2026-06-15 — Cloud control-plane: list project tables
 
 - **`GET /admin/v1/projects/:id/tables`** returns a project's table names as

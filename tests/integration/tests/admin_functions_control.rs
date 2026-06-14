@@ -890,3 +890,66 @@ async fn admin_project_tables_lists_tables() {
     let r2 = http_request(fx.running.local_addr, "GET", &path, &[], None).await;
     assert_ne!(r2.status, 200, "tables without an admin token must be rejected");
 }
+
+/// `DELETE /admin/v1/projects/:id` deprovisions: after provisioning credentials
+/// for a project, DELETE returns 204 and the project's credentials are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_delete_project_deprovisions() {
+    let Some(fx) = boot().await else {
+        return;
+    };
+    let bearer_hdr = bearer(&fx.token);
+    let auth = ("Authorization", bearer_hdr.as_str());
+    let addr = fx.running.local_addr;
+    let creds_path = format!("/admin/v1/projects/{}/credentials", fx.project);
+
+    // Provision a credential for fx.project (the admin token is scoped to it).
+    let body = serde_json::json!({ "project_id": fx.project.to_string() }).to_string();
+    let r = http_request(
+        addr,
+        "POST",
+        "/admin/v1/projects",
+        &[("Content-Type", "application/json"), auth],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(r.status, 201, "provision must succeed; body={:?}", String::from_utf8_lossy(&r.body));
+
+    // Credentials present.
+    let r = http_request(addr, "GET", &creds_path, &[auth], None).await;
+    assert_eq!(r.status, 200);
+    assert!(
+        !r.json().as_array().map(|a| a.is_empty()).unwrap_or(true),
+        "credentials must exist after provision, got {}",
+        r.json()
+    );
+
+    // Deprovision.
+    let r = http_request(
+        addr,
+        "DELETE",
+        &format!("/admin/v1/projects/{}", fx.project),
+        &[auth],
+        None,
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        204,
+        "DELETE project must return 204; body={:?}",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    // Credentials gone.
+    let r = http_request(addr, "GET", &creds_path, &[auth], None).await;
+    assert_eq!(r.status, 200);
+    assert!(
+        r.json().as_array().map(|a| a.is_empty()).unwrap_or(false),
+        "credentials must be empty after deprovision, got {}",
+        r.json()
+    );
+
+    // No admin token → rejected.
+    let r2 = http_request(addr, "DELETE", &format!("/admin/v1/projects/{}", fx.project), &[], None).await;
+    assert_ne!(r2.status, 204, "delete without an admin token must be rejected");
+}
