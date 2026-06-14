@@ -2867,23 +2867,18 @@ async fn dispatch_parsed_statement(
                         // override shadows one. Skip the metadata-only path so
                         // the aggregate is computed over the merged hot+cold
                         // row set (where the overlay / tombstone filter runs).
-                        // S4: O(1) newest-version counters replace the
-                        // previous O(n) snapshot walk. Tombstone/Update
-                        // entries are always DIRTY (a flush ack removes clean
-                        // tombstones and re-tags acked Updates as Rows), so
-                        // the two counters are exactly the "overlay present"
-                        // signal this auto-commit (unwatermarked) gate needs.
-                        let has_hot_overlay = {
-                            let registry = sess.engine.memtable_registry();
-                            registry
-                                .get(&sess.project, &plan.table)
-                                .map(|e| {
-                                    e.memtable.tombstone_count() > 0
-                                        || e.memtable.update_count() > 0
-                                })
-                                .unwrap_or(false)
-                        };
-                        if !is_view && !has_rls && !has_soft_delete && !has_hot_overlay {
+                        // NOTE: a hot-tier overlay no longer blocks this path.
+                        // `execute_metadata_aggregate` flushes the shard tail
+                        // and then accounts for the overlay exactly: an UPDATE
+                        // override replaces a counted cold row 1:1 (no count
+                        // change) and a tombstone removes exactly one counted
+                        // row, so `COUNT(*) = Σrow_count − tombstone_count`. The
+                        // function adjusts COUNT(*) and declines (returns None →
+                        // full scan) for value aggregates (MIN/MAX/SUM/COUNT col)
+                        // when a tombstone is live, since those can't be derived
+                        // from counters. This turns the post-UPDATE/DELETE
+                        // COUNT(*) from a full-table scan back into O(files).
+                        if !is_view && !has_rls && !has_soft_delete {
                             if let Some(result) =
                                 crate::fast_aggregate::execute_metadata_aggregate(
                                     sess, plan, table_meta,

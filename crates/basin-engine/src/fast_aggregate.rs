@@ -389,7 +389,16 @@ pub(crate) async fn execute_metadata_aggregate(
     // task. The slow path runs only when the memtable is non-empty and
     // exits at the first tombstone — so its cost is bounded by overlay
     // density, not memtable size.
-    if metadata_aggregate_blocked_by_tombstone(sess, &plan.table) {
+    // Overlay accounting (read post-flush). An UPDATE override replaces a
+    // counted cold row 1:1 (no count change) and a `Row` residency entry is a
+    // now-cold row, so the only count-distorting overlay entry is a tombstone,
+    // which removes exactly one counted row: `COUNT(*) = Σrow_count − tombstones`.
+    // Value aggregates (MIN/MAX/SUM/COUNT col) can't be derived from counters
+    // once a row is tombstoned, so a live tombstone forces a full scan for them.
+    let overlay_tombstones = metadata_aggregate_overlay_tombstones(sess, &plan.table);
+    if overlay_tombstones > 0
+        && plan.aggs.iter().any(|(k, _)| !matches!(k, AggKind::CountStar))
+    {
         return Ok(None);
     }
 
@@ -413,10 +422,9 @@ pub(crate) async fn execute_metadata_aggregate(
     for (kind, out_name) in &plan.aggs {
         let (field, col): (Field, ArrayRef) = match kind {
             AggKind::CountStar => {
-                let total: i64 = files
-                    .iter()
-                    .map(|f| f.row_count as i64)
-                    .sum();
+                let cold: i64 = files.iter().map(|f| f.row_count as i64).sum();
+                // Correct for live tombstones (each removes one counted row).
+                let total = (cold - overlay_tombstones as i64).max(0);
                 (
                     Field::new(out_name, DataType::Int64, false),
                     Arc::new(Int64Array::from(vec![total])),
@@ -498,18 +506,16 @@ pub(crate) async fn execute_metadata_aggregate(
 /// learn there were no tombstones. The maintained `tombstone_count()`
 /// counter (kept exact by every insert/ack/evict path) answers the same
 /// question for free.
-fn metadata_aggregate_blocked_by_tombstone(
-    sess: &ProjectSession,
-    table: &TableName,
-) -> bool {
+/// Live tombstone count for `(project, table)` in the hot-tier overlay. `Row`
+/// (now-cold residency) and `Update` (1:1 override) entries do not change the
+/// count; only a tombstone removes a counted cold row. `COUNT(*)` subtracts
+/// this; value aggregates decline when it is non-zero (see caller).
+fn metadata_aggregate_overlay_tombstones(sess: &ProjectSession, table: &TableName) -> u64 {
     let registry = sess.engine.memtable_registry();
     match registry.get(&sess.project, table) {
-        // `Row` and `Update` entries do NOT block the shortcut (see rustdoc
-        // above) — only live tombstones make the metadata count over-report.
-        Some(e) => e.memtable.tombstone_count() > 0,
-        // No registry entry at all — no writes for this `(project, table)`
-        // have ever flowed through the hot tier. Catalog stats are exact.
-        None => false,
+        Some(e) => e.memtable.tombstone_count(),
+        // No registry entry — no writes ever flowed through the hot tier.
+        None => 0,
     }
 }
 

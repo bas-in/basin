@@ -8,6 +8,22 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-15 — COUNT(*) stays O(files) after a hot-tier UPDATE/DELETE
+
+- **`SELECT COUNT(*)` no longer falls back to a full table scan when the table
+  has a live hot-tier overlay** (a fast-path UPDATE or DELETE earlier in the
+  session). The metadata-only count path was gated off by *any* tombstone or
+  update entry, so a `COUNT(*)` after a bulk UPDATE+DELETE scanned every file
+  (~98 ms at 1M vs Postgres ~34 ms — a published loss). It now corrects the
+  catalog row-count by the exact overlay delta: an UPDATE override replaces a
+  counted row 1:1 (no change) and each tombstone removes one counted row, so
+  `COUNT(*) = Σrow_count − tombstone_count` — computed in O(files), turning the
+  loss into a ~30× win. Value aggregates (MIN/MAX/SUM/COUNT(col)) can't be
+  derived from counters once a row is tombstoned, so they correctly decline the
+  shortcut and run the overlay-aware scan. Pinned by
+  `count_star_metadata_shortcut.rs` (delete-adjusts, combined update+delete,
+  and a MAX-with-tombstone decline-and-correct test).
+
 ## 2026-06-14 — Multi-array UNNEST in INSERT … SELECT (Django bulk_create)
 
 - **`INSERT INTO t (…) SELECT * FROM UNNEST((ARRAY[…])::T1[], (ARRAY[…])::T2[])`

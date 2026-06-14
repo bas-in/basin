@@ -175,12 +175,13 @@ async fn count_star_fresh_table_uses_metadata_shortcut() {
     );
 }
 
-/// After a fast-path DELETE of 3 rows, COUNT(*) must reflect the
-/// tombstone-suppressed live count. This is the correctness gate PR2
-/// landed for; the test ensures the new cheap gate still defers to a
-/// real scan when tombstones are present.
+/// After a fast-path DELETE, COUNT(*) reflects the tombstone-suppressed live
+/// count via the metadata shortcut's tombstone adjustment
+/// (`COUNT(*) = Σrow_count − tombstone_count`) — NOT a full scan. Asserts both
+/// correctness AND that it stays fast: this is the perf win that turns a
+/// post-DELETE COUNT(*) from a full-table scan back into O(files).
 #[tokio::test]
-async fn count_star_after_fast_path_delete_excludes_tombstones() {
+async fn count_star_after_fast_path_delete_adjusts_via_metadata_shortcut() {
     let _g = ENV_LOCK.lock().await;
     let prev = std::env::var("BASIN_HOTTIER_DELETE_FASTPATH").ok();
     std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", "1");
@@ -188,32 +189,104 @@ async fn count_star_after_fast_path_delete_excludes_tombstones() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
-    seed(&sess, "ev", 100).await;
+    seed(&sess, "ev", 10_000).await;
+    let _ = count_star(&sess, "ev").await; // warm first-touch costs
 
     let res = sess
         .execute("DELETE FROM ev WHERE id IN (1, 2, 3)")
         .await
         .expect("fast-path DELETE must succeed");
     match res {
-        ExecResult::Empty { tag } => assert_eq!(
-            tag, "DELETE 3",
-            "fast-path DELETE must report 3 rows; a different tag \
-             means the slow copy-on-write rewrite path ran instead, \
-             which would still produce the right COUNT but defeats \
-             this test's gate coverage"
-        ),
+        ExecResult::Empty { tag } => assert_eq!(tag, "DELETE 3"),
         other => panic!("expected Empty from DELETE, got {other:?}"),
     }
 
-    let n = count_star(&sess, "ev").await;
+    let (n, ms) = timed_count(&sess, "ev").await;
     assert_eq!(
-        n, 97,
-        "COUNT(*) must subtract the 3 tombstones; a value of 100 here \
-         means the metadata shortcut fired despite tombstones in the \
-         memtable — the latent PR2 bug has regressed"
+        n, 9_997,
+        "COUNT(*) must subtract the 3 tombstones (Σrow_count − tombstone_count)"
+    );
+    assert!(
+        ms < 50.0,
+        "post-DELETE COUNT(*) took {ms:.2} ms — expected < 50 ms via the \
+         tombstone-adjusted metadata shortcut, not a full scan"
     );
 
-    // Restore env regardless of test outcome above.
+    match prev {
+        Some(v) => std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", v),
+        None => std::env::remove_var("BASIN_HOTTIER_DELETE_FASTPATH"),
+    }
+}
+
+/// The benchmark's exact shape: a fast-path UPDATE *and* a fast-path DELETE in
+/// the same session, then COUNT(*). Both overlays present → the shortcut must
+/// still fire (UPDATE is count-neutral; the DELETE's tombstones are subtracted)
+/// and stay fast. Previously the executor gate bailed on *any* tombstone OR
+/// update, forcing a full scan (the ~30× loss this fixes).
+#[tokio::test]
+async fn count_star_after_update_and_delete_uses_shortcut() {
+    let _g = ENV_LOCK.lock().await;
+    let pd = std::env::var("BASIN_HOTTIER_DELETE_FASTPATH").ok();
+    let pu = std::env::var("BASIN_HOTTIER_UPDATE_FASTPATH").ok();
+    std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", "1");
+    std::env::set_var("BASIN_HOTTIER_UPDATE_FASTPATH", "1");
+
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    seed(&sess, "ev", 10_000).await;
+    let _ = count_star(&sess, "ev").await;
+
+    exec(&sess, "UPDATE ev SET v = 7 WHERE id = 42").await;
+    let res = sess.execute("DELETE FROM ev WHERE id IN (1, 2, 3, 4, 5)").await.unwrap();
+    assert!(matches!(res, ExecResult::Empty { .. }));
+
+    let (n, ms) = timed_count(&sess, "ev").await;
+    assert_eq!(n, 9_995, "COUNT(*) = 10000 − 5 deleted (update is count-neutral)");
+    assert!(
+        ms < 50.0,
+        "COUNT(*) under a combined update+tombstone overlay took {ms:.2} ms — \
+         expected fast via the metadata shortcut (the gate must not bail on \
+         update/tombstone presence)"
+    );
+
+    match pd {
+        Some(v) => std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", v),
+        None => std::env::remove_var("BASIN_HOTTIER_DELETE_FASTPATH"),
+    }
+    match pu {
+        Some(v) => std::env::set_var("BASIN_HOTTIER_UPDATE_FASTPATH", v),
+        None => std::env::remove_var("BASIN_HOTTIER_UPDATE_FASTPATH"),
+    }
+}
+
+/// A value aggregate (MAX) with a live tombstone must NOT use the (counter-only)
+/// shortcut — it can't be derived from counts — so it falls back to the scan and
+/// still returns the correct tombstone-suppressed value.
+#[tokio::test]
+async fn max_with_tombstone_declines_shortcut_and_is_correct() {
+    let _g = ENV_LOCK.lock().await;
+    let prev = std::env::var("BASIN_HOTTIER_DELETE_FASTPATH").ok();
+    std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", "1");
+
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = open(&eng).await;
+    seed(&sess, "ev", 100).await; // seed sets id 1..=100, v = id
+
+    // Delete the top ids so MAX(id) must drop if tombstones are honored.
+    sess.execute("DELETE FROM ev WHERE id IN (99, 100)").await.unwrap();
+
+    let res = sess.execute("SELECT MAX(id) FROM ev").await.unwrap();
+    match res {
+        ExecResult::Rows { batches, .. } => {
+            use arrow_array::Int64Array;
+            let v = batches[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+            assert_eq!(v, 98, "MAX(id) must reflect the deleted top rows (scan, not stale metadata)");
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+
     match prev {
         Some(v) => std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", v),
         None => std::env::remove_var("BASIN_HOTTIER_DELETE_FASTPATH"),
