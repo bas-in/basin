@@ -8,9 +8,10 @@ route/serialization layer via `httpx`.
   (httpx.AsyncClient) with identical method surfaces.
 - **Derived from the server code, not invented** — every binding cites the
   Rust route it talks to (see route table below).
-- **Arrow support** — `to_arrow()` on any query result converts rows to a
-  `pyarrow.Table`. This is a client-side JSON→Arrow conversion; native Arrow
-  IPC transport from the server is not yet available (see notes).
+- **Arrow support** — `to_arrow()` on any query result fetches data via the
+  server's native Arrow IPC endpoint (`Accept: application/vnd.apache.arrow.stream`)
+  and decodes it with `pyarrow` — zero JSON round-trip, full i64/timestamp fidelity.
+  Falls back to client-side JSON→Arrow when talking to older servers.
 
 ## Install
 
@@ -61,8 +62,9 @@ basin.table("orders").eq("id", 7).delete()  # may raise E_ENGINE_UNSUPPORTED
 total = basin.rpc("add", {"a": 40, "b": 2})
 res = basin.functions.invoke("resize", body={"width": 100})
 
-# Arrow conversion (client-side JSON→Arrow; requires pyarrow)
+# Arrow IPC (native server transport; requires pyarrow)
 table = basin.table("metrics").limit(10_000).to_arrow()
+# Pagination cursor is in table.schema.metadata[b"x-basin-next-cursor"] when present
 ```
 
 ### Async
@@ -168,15 +170,19 @@ fails before a server response arrives (connection refused, timeout, etc.).
 
 ## Arrow transport notes
 
-The server does **not** expose a native Arrow IPC endpoint (confirmed by
-inspecting `crates/basin-rest/src/routes/data.rs` — no
-`application/vnd.apache.arrow.stream` content-type negotiation exists).
+The server exposes a native Arrow IPC endpoint: any `GET /rest/v1/:table`
+(or `POST /rest/v1/rpc/:fn`) request carrying
+`Accept: application/vnd.apache.arrow.stream` receives an Arrow IPC stream
+(`Content-Type: application/vnd.apache.arrow.stream`) with pagination state in
+response headers (`x-basin-next-cursor`, `x-basin-row-count`). See
+`crates/basin-rest/src/arrow_ipc.rs`.
 
-`to_arrow()` performs a client-side conversion: it fetches the JSON result set
-and converts via `pyarrow.Table.from_pylist()`. This works correctly for
-typical column types but may lose numeric precision for very large integers
-(which become Python `int` via JSON). A native server-side Arrow IPC stream
-would preserve the declared schema — see follow-ups below.
+`to_arrow()` and `stream_arrow()` on `QueryBuilder` send this `Accept` header
+and decode the IPC response natively via `pyarrow.ipc.open_stream` — zero JSON
+round-trip, preserving the declared schema types (i64, timestamps, nulls).
+When talking to an older server that returns JSON instead, the SDK falls back
+to `pyarrow.Table.from_pylist()` transparently; that path may lose precision
+for very large integers (JSON numbers are float64 in Python).
 
 ## Route bindings (method → verified server route)
 
@@ -443,8 +449,8 @@ basin.auth.unenroll_factor(enroll.factor_id)
   as an escape hatch.
 - **Sign-out / token revocation** — no server route exists; `sign_out()` is
   local-only by design.
-- **Native Arrow IPC** — no `application/vnd.apache.arrow.stream` endpoint
-  exists server-side; `to_arrow()` is a client-side fallback today.
+- **CDC stream** (`GET /v1/cdc/:project/stream`) — use `client.request(...)`
+  as an escape hatch.
 
 ## Development
 

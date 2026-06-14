@@ -424,6 +424,17 @@ cleared even if the server call fails.
 - **Admin surface** (`/admin/v1/*`) — operator-grade; use
   `client.request(...)`.
 - **CDC stream** (`GET /v1/cdc/:project/stream`) — use `client.request(...)`.
+- **Arrow IPC transport** — the server accepts
+  `Accept: application/vnd.apache.arrow.stream` on any `GET /rest/v1/:table`
+  request and returns a native Arrow IPC stream (see
+  `crates/basin-rest/src/arrow_ipc.rs`). A `toArrow()` method on
+  `QueryBuilder` is not yet implemented because no general-purpose Arrow IPC
+  decoder exists for Dart. The only pub.dev package that decodes Arrow IPC
+  (`meshagent_dart_arrow`) is a vendor-specific library tied to the Meshagent
+  agent platform and is not suitable as a general dependency. When an
+  official Apache Arrow Dart package ships, a `toArrow()` method should be
+  added to `QueryBuilder` following the pattern in `sdk/basin-js/src/query.ts`
+  and `sdk/basin-python/basin/query.py`.
 
 ## Development
 

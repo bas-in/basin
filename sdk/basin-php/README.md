@@ -372,3 +372,20 @@ and queue processors. For async / event-loop environments (ReactPHP, Amp),
 **ratchet/pawl** is suggested instead. Neither is a hard dependency — both are in
 `suggest` in `composer.json`; a clear `RuntimeException` is thrown on first use if
 neither is installed.
+
+## Arrow IPC transport
+
+The server accepts `Accept: application/vnd.apache.arrow.stream` on any
+`GET /rest/v1/:table` request and returns a native Arrow IPC stream with
+pagination state in response headers (`X-Basin-Next-Cursor`,
+`X-Basin-Row-Count`). See `crates/basin-rest/src/arrow_ipc.rs`.
+
+A `toArrow()` method on `QueryBuilder` is not yet implemented because no
+mature, pure-PHP Arrow IPC decoder exists. `flow-php/arrow-ext` is a compiled
+PHP C extension (`type: php-ext` on Packagist) — it requires the extension to
+be built and installed on the server, making it an unsuitable Composer
+dependency for a general-purpose SDK. No other PHP library decodes the Arrow
+IPC streaming format. When a pure-PHP (or stable FFI-backed) Arrow library
+becomes available, a `toArrow()` method should be added to `QueryBuilder`
+following the pattern in `sdk/basin-js/src/query.ts` and
+`sdk/basin-python/basin/query.py`.
