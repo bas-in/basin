@@ -148,6 +148,65 @@ internal sealed class BasinTransport : IDisposable
         return JsonSerializer.Deserialize<T>(raw, BasinJsonOptions.Default);
     }
 
+    /// <summary>
+    /// Begin an HTTP request and return the response with headers read but the
+    /// body still streaming. The caller is responsible for disposing the response.
+    /// Uses <see cref="HttpCompletionOption.ResponseHeadersRead"/> so the body is
+    /// not buffered in memory — suitable for NDJSON streaming.
+    /// Throws <see cref="BasinApiException"/> for non-2xx responses (reads the
+    /// error body before returning).
+    /// </summary>
+    internal async Task<HttpResponseMessage> RequestStreamAsync(
+        HttpMethod method,
+        string path,
+        IEnumerable<(string, string)>? query = null,
+        IDictionary<string, string>? extraHeaders = null,
+        bool auth = true,
+        CancellationToken ct = default)
+    {
+        var url = BuildUrl(path, query);
+        var req = new HttpRequestMessage(method, url);
+
+        if (auth)
+        {
+            var bearer = await BearerAsync(ct).ConfigureAwait(false);
+            if (bearer is not null)
+                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearer);
+        }
+
+        if (extraHeaders is not null)
+        {
+            foreach (var (k, v) in extraHeaders)
+                req.Headers.TryAddWithoutValidation(k, v);
+        }
+
+        HttpResponseMessage resp;
+        try
+        {
+            // ResponseHeadersRead: the response body is not buffered — the caller
+            // reads it incrementally via the response stream.
+            resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct)
+                              .ConfigureAwait(false);
+        }
+        catch (HttpRequestException ex)
+        {
+            throw new BasinNetworkException(ex.Message, ex);
+        }
+        catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            throw new BasinNetworkException("Request timed out", ex);
+        }
+
+        if (!resp.IsSuccessStatusCode)
+        {
+            var raw = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            resp.Dispose();
+            throw BasinApiException.FromResponseBody(raw, (int)resp.StatusCode);
+        }
+
+        return resp;
+    }
+
     /// <summary>Execute and return the raw response bytes (for storage downloads).</summary>
     internal async Task<(byte[] Data, string? ContentType, string? ETag)> RequestBytesAsync(
         HttpMethod method,

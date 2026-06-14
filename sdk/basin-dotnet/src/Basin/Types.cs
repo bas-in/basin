@@ -226,6 +226,104 @@ public sealed class QueryResult
     }
 }
 
+/// <summary>
+/// Lazily-streamed result of a <c>?stream=true</c> (NDJSON) GET request.
+///
+/// Implements <see cref="IAsyncEnumerable{T}"/> so it can be used directly in
+/// an <c>await foreach</c> loop. After the loop completes (or after the
+/// enumerator is disposed), <see cref="NextCursor"/> holds the keyset cursor
+/// from the trailing <c>{"_basin_next_cursor":"…"}</c> NDJSON line, or null
+/// when the server sent no cursor.
+///
+/// The result object can be enumerated exactly once; call
+/// <see cref="QueryBuilder.StreamAsync"/> again for subsequent pages.
+/// </summary>
+public sealed class StreamResult : IAsyncEnumerable<Dictionary<string, JsonElement>>
+{
+    private readonly BasinTransport _transport;
+    private readonly string _table;
+    private readonly IReadOnlyList<(string, string)> _query;
+    private readonly CancellationToken _ct;
+
+    /// <summary>
+    /// The keyset pagination cursor extracted from the trailing NDJSON line
+    /// <c>{"_basin_next_cursor":"…"}</c>. Null until the enumeration completes
+    /// or when the server sent no cursor.
+    /// </summary>
+    public string? NextCursor { get; private set; }
+
+    internal StreamResult(
+        BasinTransport transport,
+        string table,
+        IReadOnlyList<(string, string)> query,
+        CancellationToken ct)
+    {
+        _transport = transport;
+        _table     = table;
+        _query     = query;
+        _ct        = ct;
+    }
+
+    /// <inheritdoc />
+    public async IAsyncEnumerator<Dictionary<string, JsonElement>> GetAsyncEnumerator(
+        CancellationToken cancellationToken = default)
+    {
+        // Merge cancellation tokens: the one passed at construction time and the
+        // one passed by the await-foreach infrastructure (e.g. via WithCancellation).
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(_ct, cancellationToken);
+        var ct = linked.Token;
+
+        var resp = await _transport.RequestStreamAsync(
+            HttpMethod.Get,
+            $"/rest/v1/{Uri.EscapeDataString(_table)}",
+            query: _query,
+            ct: ct).ConfigureAwait(false);
+
+        using (resp)
+        await using (var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false))
+        using (var reader = new System.IO.StreamReader(stream, System.Text.Encoding.UTF8,
+                                                       detectEncodingFromByteOrderMarks: false,
+                                                       bufferSize: 4096,
+                                                       leaveOpen: true))
+        {
+            string? line;
+            while ((line = await reader.ReadLineAsync(ct).ConfigureAwait(false)) is not null)
+            {
+                if (line.Length == 0) continue;
+
+                JsonElement root;
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                    root = doc.RootElement.Clone();
+                }
+                catch (JsonException)
+                {
+                    // Skip malformed lines rather than aborting the stream.
+                    continue;
+                }
+
+                if (root.ValueKind != JsonValueKind.Object) continue;
+
+                // Detect the trailing cursor sentinel.
+                if (root.TryGetProperty("_basin_next_cursor", out var nc) &&
+                    nc.ValueKind == JsonValueKind.String)
+                {
+                    NextCursor = nc.GetString();
+                    continue;
+                }
+
+                // Materialise the row.
+                var row = new Dictionary<string, JsonElement>();
+                foreach (var prop in root.EnumerateObject())
+                    row[prop.Name] = prop.Value.Clone();
+
+                yield return row;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Storage types
 // ---------------------------------------------------------------------------

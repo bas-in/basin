@@ -14,10 +14,12 @@ namespace Basin;
 ///   (in.(a,b,c) parenthesised; is.null / is.notnull)
 /// - order=col[.asc|.desc], limit=N, offset=N
 /// - cursor=token (keyset pagination)
+/// - stream=true → NDJSON, one row per line; trailing {"_basin_next_cursor":"..."} when paginating
 ///
 /// Response shapes (crates/basin-rest/src/routes/data.rs):
 /// - plain GET → JSON array of rows
 /// - GET with limit or cursor → { rows, next_cursor }
+/// - GET with stream=true → NDJSON (see StreamAsync)
 /// - POST → 201, { ok, tag } or rows; PATCH/DELETE → { ok, tag }
 /// - DELETE may surface 501 E_ENGINE_UNSUPPORTED
 /// </summary>
@@ -131,6 +133,37 @@ public sealed class QueryBuilder
     {
         var r = await RunAsync(ct).ConfigureAwait(false);
         return r.Rows;
+    }
+
+    /// <summary>
+    /// Execute as GET with <c>?stream=true</c> (NDJSON) and stream rows as they
+    /// arrive without buffering the full response body.
+    ///
+    /// The server sends one JSON object per line. A trailing line of the form
+    /// <c>{"_basin_next_cursor":"…"}</c> signals keyset pagination; it is consumed
+    /// internally and not yielded as a row. Retrieve it from
+    /// <see cref="StreamResult.NextCursor"/> after the <c>await foreach</c> loop
+    /// completes.
+    ///
+    /// <code>
+    /// var stream = client.Table("events").Limit(5000).StreamAsync();
+    /// await foreach (var row in stream)
+    ///     Console.WriteLine(row["id"]);
+    ///
+    /// // Cursor is populated once the loop finishes (or is broken out of early).
+    /// var cursor = stream.NextCursor;
+    /// </code>
+    ///
+    /// Combine with active filters and ordering just like <see cref="RunAsync"/>:
+    /// <code>
+    /// await foreach (var row in client.Table("orders").Eq("status", "paid").StreamAsync())
+    ///     Process(row);
+    /// </code>
+    /// </summary>
+    public StreamResult StreamAsync(CancellationToken ct = default)
+    {
+        var query = new List<(string, string)>(_query) { ("stream", "true") };
+        return new StreamResult(_transport, _table, query, ct);
     }
 
     /// <summary>
