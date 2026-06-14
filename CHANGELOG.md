@@ -8,6 +8,20 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-14 — INSERT array values in the PostgreSQL curly-brace text form
+
+- **`'{a,b}'::T[]` / `'{}'::T[]` array literals INSERT into array columns.**
+  Drivers (Django ArrayField, libpq array output) emit the PostgreSQL
+  curly-brace text form for array values, not just the `ARRAY[...]` constructor.
+  The INSERT array-coercion path now parses that form (`parse_pg_array_literal`
+  + `extract_array`): unquoted / double-quoted (with `\"`,`\\` escapes) elements,
+  the unquoted `NULL` token as a null element, embedded commas inside quotes,
+  empty `{}`, and multi-byte UTF-8. Each element reuses the per-type element
+  coercion, so `'{1,2}'::int[]` and `'{a,b}'::text[]` both work. Also fixes the
+  `'{}'` empty-array rewrite (it was mis-lifted to `make_array('')`, a one-empty-
+  string array). Source: `crates/basin-engine/src/{dml,pg_operators}.rs`; covered
+  by `array_fns::insert_pg_curly_array_literals` + `dml::tests::pg_array_literal_parses_all_forms`.
+
 ## 2026-06-14 — ALTER TABLE ADD COLUMN … DEFAULT v NOT NULL (ORM migrations)
 
 - **`ALTER TABLE ADD COLUMN … DEFAULT v NOT NULL` is now allowed.** The canonical

@@ -5566,6 +5566,17 @@ pub(crate) fn rewrite_pg_array_literal_casts(sql: &str) -> String {
             .strip_prefix('{')
             .and_then(|s| s.strip_suffix('}'))
             .unwrap_or(inner);
+        // Empty array `'{}'`: `"".split(',')` yields `[""]` (one empty element),
+        // which would mis-rewrite to `make_array('')` — a 1-element array, not
+        // an empty one. Leave the empty literal untouched; the INSERT array
+        // coercion (`build_list_column`) parses the `'{}'` text form directly
+        // into an empty list, and an empty array in a read context is vanishingly
+        // rare. (Non-empty curly arrays are still lifted to `make_array(...)`.)
+        if inner.trim().is_empty() {
+            out.push_str(&sql[str_start..after_bracket]);
+            i = after_bracket;
+            continue;
+        }
         let items: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
 
         // Build `make_array(...)`.

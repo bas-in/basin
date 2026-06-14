@@ -591,3 +591,58 @@ async fn array_chained_operations() {
     .await;
     assert_eq!(s, "a,b,c,d", "chained split → append → join should work");
 }
+
+// ---------------------------------------------------------------------------
+// INSERT — PG curly-brace array literal text form
+// ---------------------------------------------------------------------------
+
+/// Drivers (Django ArrayField, libpq array output) emit the PostgreSQL
+/// curly-brace text form `'{a,b}'::T[]` / `'{}'::T[]` for array INSERT values,
+/// not just the `ARRAY[...]` constructor. Both must round-trip; quoted elements
+/// keep embedded commas, and the unquoted token NULL is a null element.
+#[tokio::test]
+async fn insert_pg_curly_array_literals() {
+    let (_dir, engine) = open_engine().await;
+    let sess = engine.open_session(ProjectId::new()).await.unwrap();
+    // VARCHAR(n)[] is exactly the Django ArrayField / typeorm column shape. The
+    // length-typed element keeps these literals on the INSERT array-coercion
+    // path (`build_list_column` → `parse_pg_array_literal`) rather than the
+    // SELECT-context make_array rewrite — which is the path the ORM hits.
+    sess.execute("CREATE TABLE arr_t (id BIGINT NOT NULL PRIMARY KEY, tags VARCHAR(50)[])")
+        .await
+        .unwrap();
+
+    sess.execute("INSERT INTO arr_t (id, tags) VALUES (1, '{}'::varchar(50)[])")
+        .await
+        .expect("empty curly array literal must insert");
+    sess.execute("INSERT INTO arr_t (id, tags) VALUES (2, '{a,b}'::varchar(50)[])")
+        .await
+        .expect("curly array literal with elements must insert");
+    sess.execute(r#"INSERT INTO arr_t (id, tags) VALUES (3, '{"x,y",NULL,z}'::varchar(50)[])"#)
+        .await
+        .expect("curly array with quoted-comma + NULL element must insert");
+    // ARRAY[...] constructor still works (regression guard).
+    sess.execute("INSERT INTO arr_t (id, tags) VALUES (4, ARRAY['c','d']::varchar(50)[])")
+        .await
+        .expect("ARRAY[...] constructor literal must still insert");
+
+    assert_eq!(
+        multi_str(&sess, "SELECT unnest(tags) FROM arr_t WHERE id = 2").await,
+        vec!["a", "b"],
+    );
+    assert_eq!(
+        multi_str(&sess, "SELECT unnest(tags) FROM arr_t WHERE id = 4").await,
+        vec!["c", "d"],
+    );
+    // Empty array unnests to zero rows.
+    let empty = match sess.execute("SELECT unnest(tags) FROM arr_t WHERE id = 1").await {
+        Ok(ExecResult::Rows { batches, .. }) => batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        Ok(ExecResult::Empty { .. }) => 0,
+        other => panic!("unexpected for empty-array unnest: {other:?}"),
+    };
+    assert_eq!(empty, 0, "empty array must unnest to zero rows");
+    // Quoted comma + NULL element preserved.
+    let id3 = multi_str(&sess, "SELECT unnest(tags) FROM arr_t WHERE id = 3").await;
+    assert!(id3.contains(&"x,y".to_string()), "quoted-comma element preserved, got {id3:?}");
+    assert!(id3.contains(&"<NULL>".to_string()), "NULL element preserved, got {id3:?}");
+}

@@ -577,18 +577,37 @@ fn build_list_column(
         cur
     }
 
-    /// Try to extract the per-row array literal. Returns:
-    /// * `Ok(Some(&[...]))` — `ARRAY[e1, e2, ...]` literal.
+    /// Try to extract the per-row array literal as owned element exprs. Returns:
+    /// * `Ok(Some(vec))` — element exprs of an `ARRAY[e1, e2, ...]` literal OR
+    ///   of the PostgreSQL curly-brace text form `'{a,b}'` / `'{}'` (each parsed
+    ///   element becomes a `SingleQuotedString` / `NULL` value expr, so the
+    ///   per-element coercion below is identical for both syntaxes — `'5'`
+    ///   coerces to an INT element exactly as PG implicitly casts it).
     /// * `Ok(None)` — `NULL` literal (whole-row null).
     /// * `Err(...)` — anything else (we only support literals here).
-    fn extract_array<'a>(expr: &'a Expr, col: &str) -> Result<Option<&'a [Expr]>> {
+    fn extract_array(expr: &Expr, col: &str) -> Result<Option<Vec<Expr>>> {
         match unwrap_cast(expr) {
-            Expr::Array(a) => Ok(Some(a.elem.as_slice())),
+            Expr::Array(a) => Ok(Some(a.elem.clone())),
             Expr::Value(ValueWithSpan {
                 value: Value::Null, ..
             }) => Ok(None),
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(s),
+                ..
+            }) => {
+                let elems = parse_pg_array_literal(s, col)?
+                    .into_iter()
+                    .map(|opt| match opt {
+                        Some(text) => {
+                            Expr::Value(Value::SingleQuotedString(text).with_empty_span())
+                        }
+                        None => Expr::Value(Value::Null.with_empty_span()),
+                    })
+                    .collect();
+                Ok(Some(elems))
+            }
             other => Err(BasinError::InvalidSchema(format!(
-                "expected ARRAY[...] literal or NULL for array column {col}, got {other}"
+                "expected ARRAY[...] or '{{...}}' literal or NULL for array column {col}, got {other}"
             ))),
         }
     }
@@ -600,7 +619,7 @@ fn build_list_column(
             for row in rows {
                 match extract_array(&row[col_idx], col_name)? {
                     Some(elems) => {
-                        for e in elems {
+                        for e in &elems {
                             match coerce_string_ref(e)? {
                                 Some(s) => b.values().append_value(s),
                                 None => b.values().append_null(),
@@ -621,7 +640,7 @@ fn build_list_column(
             for row in rows {
                 match extract_array(&row[col_idx], col_name)? {
                     Some(elems) => {
-                        for e in elems {
+                        for e in &elems {
                             match coerce_i64(e)? {
                                 Some(v) => b.values().append_value(v),
                                 None => b.values().append_null(),
@@ -642,7 +661,7 @@ fn build_list_column(
             for row in rows {
                 match extract_array(&row[col_idx], col_name)? {
                     Some(elems) => {
-                        for e in elems {
+                        for e in &elems {
                             match coerce_i64(e)? {
                                 Some(v) => {
                                     let v32 = i32::try_from(v).map_err(|_| {
@@ -670,7 +689,7 @@ fn build_list_column(
             for row in rows {
                 match extract_array(&row[col_idx], col_name)? {
                     Some(elems) => {
-                        for e in elems {
+                        for e in &elems {
                             match coerce_f64(e)? {
                                 Some(v) => b.values().append_value(v),
                                 None => b.values().append_null(),
@@ -691,7 +710,7 @@ fn build_list_column(
             for row in rows {
                 match extract_array(&row[col_idx], col_name)? {
                     Some(elems) => {
-                        for e in elems {
+                        for e in &elems {
                             match coerce_bool(e)? {
                                 Some(v) => b.values().append_value(v),
                                 None => b.values().append_null(),
@@ -715,6 +734,87 @@ fn build_list_column(
         }
     };
     Ok(arr)
+}
+
+/// Parse the PostgreSQL array text form `{elem,elem,…}` into per-element
+/// strings (`None` = the unquoted, case-insensitive token `NULL`). Elements are
+/// either unquoted (trimmed; `NULL` → null) or double-quoted (`"…"` with `\"`
+/// and `\\` escapes; a quoted element is always a non-null string, even
+/// `"NULL"`). `{}` parses to an empty vec. This backs the `'{a,b}'::T[]` /
+/// `'{}'::T[]` INSERT form drivers emit (Django ArrayField, the libpq array
+/// output format). Char-based so multi-byte UTF-8 elements survive.
+fn parse_pg_array_literal(s: &str, col: &str) -> Result<Vec<Option<String>>> {
+    let trimmed = s.trim();
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|x| x.strip_suffix('}'))
+        .ok_or_else(|| {
+            BasinError::InvalidSchema(format!(
+                "malformed array literal for column {col}: {s:?} (expected '{{…}}')"
+            ))
+        })?;
+    let mut out: Vec<Option<String>> = Vec::new();
+    let mut chars = inner.chars().peekable();
+    // Leading whitespace; an all-whitespace body ({} or {  }) is the empty array.
+    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+        chars.next();
+    }
+    if chars.peek().is_none() {
+        return Ok(out);
+    }
+    loop {
+        // Element value.
+        if chars.peek() == Some(&'"') {
+            chars.next(); // opening quote
+            let mut val = String::new();
+            loop {
+                match chars.next() {
+                    Some('\\') => {
+                        if let Some(c) = chars.next() {
+                            val.push(c);
+                        }
+                    }
+                    Some('"') => break,
+                    Some(c) => val.push(c),
+                    None => {
+                        return Err(BasinError::InvalidSchema(format!(
+                            "unterminated quoted array element for column {col}: {s:?}"
+                        )))
+                    }
+                }
+            }
+            out.push(Some(val));
+        } else {
+            let mut raw = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == ',' {
+                    break;
+                }
+                raw.push(c);
+                chars.next();
+            }
+            let t = raw.trim();
+            if t.eq_ignore_ascii_case("null") {
+                out.push(None);
+            } else {
+                out.push(Some(t.to_string()));
+            }
+        }
+        // Separator: skip whitespace, then require ',' or end-of-input.
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        match chars.next() {
+            Some(',') => continue,
+            None => break,
+            Some(other) => {
+                return Err(BasinError::InvalidSchema(format!(
+                    "unexpected {other:?} in array literal for column {col}: {s:?}"
+                )))
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// If `field` declares a `VARCHAR(n)` / `CHAR(n)` limit, validate every
@@ -3323,6 +3423,29 @@ mod tests {
     use sqlparser::ast::{Insert, SetExpr, Statement};
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
+
+    #[test]
+    fn pg_array_literal_parses_all_forms() {
+        let p = |s: &str| parse_pg_array_literal(s, "c").unwrap();
+        assert_eq!(p("{}"), Vec::<Option<String>>::new());
+        assert_eq!(p("{  }"), Vec::<Option<String>>::new());
+        assert_eq!(p("{a,b}"), vec![Some("a".into()), Some("b".into())]);
+        assert_eq!(p("{ a , b }"), vec![Some("a".into()), Some("b".into())]);
+        // unquoted NULL → null element; quoted "NULL" → literal string.
+        assert_eq!(p("{a,NULL,b}"), vec![Some("a".into()), None, Some("b".into())]);
+        assert_eq!(p(r#"{"NULL"}"#), vec![Some("NULL".into())]);
+        // quoted elements: embedded comma + escapes preserved.
+        assert_eq!(
+            p(r#"{"x,y","a\"b","c\\d"}"#),
+            vec![Some("x,y".into()), Some("a\"b".into()), Some("c\\d".into())]
+        );
+        // numeric elements stay as text (coerced per child type downstream).
+        assert_eq!(p("{1,2,3}"), vec![Some("1".into()), Some("2".into()), Some("3".into())]);
+        // multi-byte UTF-8 survives char-based parsing.
+        assert_eq!(p("{café,naïve}"), vec![Some("café".into()), Some("naïve".into())]);
+        // malformed → error, not panic.
+        assert!(parse_pg_array_literal("not-an-array", "c").is_err());
+    }
 
     fn rows_from_sql(sql: &str) -> Vec<Vec<Expr>> {
         let mut stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
