@@ -872,6 +872,8 @@ pub use raft_wal::{
 };
 #[cfg(feature = "raft-net")]
 pub use raft_net::{
-    raft_bind_addr_from_env, serve_raft, serve_raft_on_listener, PeerRegistry,
+    raft_bind_addr_from_env, serve_raft, serve_raft_on_listener,
+    serve_raft_on_listener_with_tls, serve_raft_with_tls, PeerRegistry, RaftTlsConfig,
     RaftTransportService, StaticPeers, TonicNetworkConfig, TonicNetworkFactory,
+    DEFAULT_RAFT_TLS_DOMAIN,
 };

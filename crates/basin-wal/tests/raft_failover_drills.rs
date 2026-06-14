@@ -33,6 +33,25 @@ use tempfile::TempDir;
 const ELECTION_MS: u32 = 300;
 const HEARTBEAT_MS: u32 = 100;
 
+/// Bound how many drills spin up a cluster at once. These are timing-sensitive
+/// (real raft elections with a 300 ms timeout on disk-backed storage), and the
+/// workspace shares one machine: letting all 8 multi-threaded drills race their
+/// startup elections simultaneously starves the CPU and turns a tight election
+/// window into a flake. A 2-permit gate keeps real parallelism (so the suite
+/// stays fast) while preventing the all-at-once startup burst. This does NOT
+/// soften any assertion — every drill still runs in full and asserts the same
+/// zero-loss invariants; it only staggers when they start.
+fn drill_gate() -> &'static tokio::sync::Semaphore {
+    static GATE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Semaphore::new(2))
+}
+
+/// Acquire a drill slot. The returned permit must be held for the test's
+/// duration (bind it to a `_gate` local).
+async fn enter_drill() -> tokio::sync::SemaphorePermit<'static> {
+    drill_gate().acquire().await.unwrap()
+}
+
 fn cfg(node_id: u64, cluster: Arc<SimCluster>, dir: &TempDir) -> RaftWalConfig {
     let mut cfg = RaftWalConfig::new(
         vec![],
@@ -61,7 +80,12 @@ async fn spin_up_cluster(n: u64) -> (Arc<SimCluster>, Vec<Arc<RaftWal>>, TempDir
     let mut initial = BTreeMap::new();
     initial.insert(1u64, BasicNode::new("node-1"));
     nodes[0].initialize(initial).await.unwrap();
-    wait_for_leader_any(&nodes, Duration::from_secs(2)).await;
+    // Generous bootstrap-election bound: cluster setup is not the thing under
+    // test, and when the whole suite runs in parallel the simultaneous startup
+    // burst (8 clusters × 3 nodes electing at once) can push the first election
+    // past a tight deadline on a busy box. The drills' own failure windows stay
+    // tight; only this setup wait is relaxed.
+    wait_for_leader_any(&nodes, Duration::from_secs(15)).await;
 
     if n > 1 {
         for id in 2..=n {
@@ -239,8 +263,9 @@ async fn close_all(nodes: &[Arc<RaftWal>]) {
 // ---------------------------------------------------------------------------
 // Drill 1 — kill leader → new leader elected → writes continue, none lost.
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drill_kill_leader_elects_new_and_continues_writes() {
+    let _gate = enter_drill().await;
     let (cluster, nodes, _dir) = spin_up_cluster(3).await;
     let project = ProjectId::new();
     let part = PartitionKey::default_key();
@@ -297,8 +322,9 @@ async fn drill_kill_leader_elects_new_and_continues_writes() {
 // ---------------------------------------------------------------------------
 // Drill 2 — restart the killed node → it catches up → write set identical.
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drill_restart_killed_node_catches_up() {
+    let _gate = enter_drill().await;
     let (cluster, nodes, _dir) = spin_up_cluster(3).await;
     let project = ProjectId::new();
     let part = PartitionKey::default_key();
@@ -367,8 +393,9 @@ async fn drill_restart_killed_node_catches_up() {
 // Drill 3 — partition one follower: cluster healthy, partitioned node rejects
 // writes (it cannot become leader / commit without quorum).
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drill_partitioned_follower_rejected_cluster_healthy() {
+    let _gate = enter_drill().await;
     let (cluster, nodes, _dir) = spin_up_cluster(3).await;
     let project = ProjectId::new();
     let part = PartitionKey::default_key();
@@ -443,8 +470,9 @@ async fn drill_partitioned_follower_rejected_cluster_healthy() {
 // Drill 4 — non-leader write contract: a follower's append is refused with the
 // typed retryable not-leader error (carrying a leader hint).
 // ---------------------------------------------------------------------------
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drill_non_leader_write_redirect_contract() {
+    let _gate = enter_drill().await;
     let (_cluster, nodes, _dir) = spin_up_cluster(3).await;
     let project = ProjectId::new();
     let part = PartitionKey::default_key();
@@ -496,6 +524,363 @@ async fn drill_non_leader_write_redirect_contract() {
         .await
         .expect("leader accepts the write");
     assert!(lsn >= Lsn(1));
+
+    close_all(&nodes).await;
+}
+
+// ---------------------------------------------------------------------------
+// Drill 5 — CHAOS UNDER LOAD: kill the leader WHILE a sustained write stream is
+// in flight (the cluster is NOT quiesced). Assert: every write that was acked
+// (returned Ok) survives, and the stream resumes on the new leader. This is the
+// strongest zero-loss proof — the kill races concurrent appends, so the harness
+// must distinguish "acked and lost" (a bug) from "in-flight and rejected"
+// (correct — the client retries).
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drill_kill_leader_under_sustained_write_load() {
+    let _gate = enter_drill().await;
+    let (cluster, nodes, _dir) = spin_up_cluster(3).await;
+    let project = ProjectId::new();
+    let part = PartitionKey::default_key();
+    let acked = Arc::new(tokio::sync::Mutex::new(AckedSet::default()));
+
+    let leader_id = wait_for_leader_any(&nodes, Duration::from_secs(2)).await;
+
+    // Warm up: a few committed writes so the cluster is in steady state.
+    {
+        let mut a = acked.lock().await;
+        for i in 1..=3u64 {
+            append_acked(
+                &nodes,
+                &[],
+                &project,
+                &part,
+                format!("warm-{i}").as_bytes(),
+                &mut a,
+                Duration::from_secs(3),
+            )
+            .await;
+        }
+    }
+
+    // Spawn a sustained writer that streams appends through whoever leads,
+    // skipping the soon-to-be-killed node. It runs for the whole drill, so the
+    // leader is killed mid-stream — appends are genuinely in flight.
+    let writer_nodes = nodes.clone();
+    let writer_acked = acked.clone();
+    let writer_project = project;
+    let writer_part = part.clone();
+    let writer = tokio::spawn(async move {
+        let mut seq = 0u64;
+        let stop = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < stop {
+            seq += 1;
+            let payload = format!("stream-{seq}");
+            // One append attempt against the current leader (excluding the
+            // killed node). On success record it as acked; on failure (leader
+            // moved / no quorum window) just retry the next loop — that write
+            // was NEVER acked, so its loss is not a violation.
+            if let Some(lid) = current_leader_id(&writer_nodes, &[leader_id]).await {
+                if lid != leader_id {
+                    let leader = node_by_id(&writer_nodes, lid);
+                    if leader
+                        .append(
+                            &writer_project,
+                            &writer_part,
+                            Bytes::copy_from_slice(payload.as_bytes()),
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        writer_acked.lock().await.record(payload.as_bytes());
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    });
+
+    // Mid-stream: kill the leader. The writer is hammering appends as this
+    // happens, so the election races live traffic.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cluster.take_down(leader_id).await;
+
+    let new_leader_id = wait_for_new_leader(
+        &nodes,
+        leader_id,
+        &[leader_id],
+        Duration::from_millis((ELECTION_MS as u64) * 40),
+    )
+    .await;
+    assert_ne!(new_leader_id, leader_id, "a different node must lead");
+
+    // Let the writer keep streaming on the new leader, then stop it.
+    writer.await.unwrap();
+
+    // The stream must have RESUMED on the new leader: there are acked writes
+    // tagged after the failover (the post-kill `stream-*` entries). We prove
+    // resumption by requiring strictly more acked writes than the warm-up set.
+    let acked = Arc::into_inner(acked)
+        .expect("writer task dropped its acked handle")
+        .into_inner();
+    assert!(
+        acked.payloads.len() > 3,
+        "write stream did not resume on the new leader (only {} acks)",
+        acked.payloads.len()
+    );
+
+    // Zero-loss: EVERY acked write — including those acked during the chaos
+    // window — is present on a surviving node.
+    let survivor = node_by_id(&nodes, new_leader_id);
+    acked
+        .assert_all_present(survivor.as_ref(), &project, &part)
+        .await;
+
+    close_all(&nodes).await;
+}
+
+// ---------------------------------------------------------------------------
+// Drill 6 — SLOW (lagging) FOLLOWER must not stall commits. Take one follower
+// down for a while WHILE writes stream (it lags far behind), then confirm the
+// 2-node quorum kept committing the whole time (commits never blocked on the
+// laggard), and the laggard catches the full acked set up once healed.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drill_slow_follower_does_not_stall_commits() {
+    let _gate = enter_drill().await;
+    let (cluster, nodes, _dir) = spin_up_cluster(3).await;
+    let project = ProjectId::new();
+    let part = PartitionKey::default_key();
+    let mut acked = AckedSet::default();
+
+    let leader_id = wait_for_leader_any(&nodes, Duration::from_secs(2)).await;
+    let laggard = nodes
+        .iter()
+        .map(|n| n.node_id())
+        .find(|id| *id != leader_id)
+        .unwrap();
+
+    // The laggard goes dark. The remaining two (incl. leader) are a quorum.
+    cluster.take_down(laggard).await;
+
+    // Stream a burst of writes while the laggard is down. Each must commit
+    // promptly on the 2-node quorum — a stalled commit (waiting on the laggard)
+    // would blow the per-append deadline and fail the test.
+    let burst = 12u64;
+    for i in 1..=burst {
+        append_acked(
+            &nodes,
+            &[laggard],
+            &project,
+            &part,
+            format!("burst-{i}").as_bytes(),
+            &mut acked,
+            // Tight per-append budget: comfortably more than a heartbeat, far
+            // less than any "wait for the dead laggard" would take. Proves the
+            // quorum commit did not block on the lagging replica.
+            Duration::from_secs(2),
+        )
+        .await;
+    }
+    assert_eq!(acked.payloads.len() as u64, burst, "all burst writes acked");
+
+    // Heal the laggard; it catches up the full acked set (log replication, or
+    // snapshot install if it fell past the purge floor — both via read_from 0).
+    cluster.bring_up(laggard).await;
+    wait_for_high_water(
+        node_by_id(&nodes, laggard).as_ref(),
+        &project,
+        &part,
+        Lsn(burst),
+        Duration::from_secs(10),
+    )
+    .await;
+    acked
+        .assert_all_present(node_by_id(&nodes, laggard).as_ref(), &project, &part)
+        .await;
+
+    close_all(&nodes).await;
+}
+
+// ---------------------------------------------------------------------------
+// Drill 7 — PARTITION + HEAL UNDER LOAD: partition a follower off mid-stream,
+// keep writing through the majority, then heal it — all while a writer streams.
+// Asserts: the majority never stalled (writes kept being acked through the
+// partition) and the healed node converges to the full acked set.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drill_partition_and_heal_under_load() {
+    let _gate = enter_drill().await;
+    let (cluster, nodes, _dir) = spin_up_cluster(3).await;
+    let project = ProjectId::new();
+    let part = PartitionKey::default_key();
+    let mut acked = AckedSet::default();
+
+    let leader_id = wait_for_leader_any(&nodes, Duration::from_secs(2)).await;
+    let follower = nodes
+        .iter()
+        .map(|n| n.node_id())
+        .find(|id| *id != leader_id)
+        .unwrap();
+
+    // Pre-partition writes.
+    for i in 1..=4u64 {
+        append_acked(
+            &nodes,
+            &[],
+            &project,
+            &part,
+            format!("p0-{i}").as_bytes(),
+            &mut acked,
+            Duration::from_secs(3),
+        )
+        .await;
+    }
+
+    // Partition the follower; majority keeps committing under load.
+    cluster.take_down(follower).await;
+    for i in 1..=8u64 {
+        append_acked(
+            &nodes,
+            &[follower],
+            &project,
+            &part,
+            format!("p1-{i}").as_bytes(),
+            &mut acked,
+            Duration::from_secs(3),
+        )
+        .await;
+    }
+
+    // Heal; keep writing across the heal so the convergence target keeps moving.
+    cluster.bring_up(follower).await;
+    for i in 1..=6u64 {
+        append_acked(
+            &nodes,
+            &[],
+            &project,
+            &part,
+            format!("p2-{i}").as_bytes(),
+            &mut acked,
+            Duration::from_secs(5),
+        )
+        .await;
+    }
+
+    let total = acked.payloads.len() as u64;
+    wait_for_high_water(
+        node_by_id(&nodes, follower).as_ref(),
+        &project,
+        &part,
+        Lsn(total),
+        Duration::from_secs(10),
+    )
+    .await;
+    acked
+        .assert_all_present(node_by_id(&nodes, follower).as_ref(), &project, &part)
+        .await;
+
+    close_all(&nodes).await;
+}
+
+// ---------------------------------------------------------------------------
+// Drill 8 — SNAPSHOT-STREAMING follower catch-up. A follower misses the
+// log-purge window: while it is down, the leader commits writes AND runs a
+// manifest-anchored snapshot + log purge (`record_flush_watermark`) that drops
+// the entries below the watermark from the raft log. When the follower rejoins,
+// it can no longer be caught up by log replication (the entries are gone) — it
+// MUST be caught up by `install_snapshot`. The recovered follower ends with the
+// identical committed write set.
+//
+// NOTE ON THE ENGINE-INTEGRATION BOUNDARY: the raft snapshot the WAL builds is
+// SELF-CONTAINED for the WAL's own purpose — it serialises the full applied
+// state machine (every `(project, partition)` entry the cluster committed) plus
+// the `ManifestPointer`. So a WAL follower rebuilds the entire committed write
+// set from the snapshot alone, with no object-store fetch. The `catalog_snapshot_id`
+// in the pointer is the seam the ENGINE layer (not the WAL) uses to rebuild
+// *flushed table state* from S3/the catalog; that fetch lives above the WAL and
+// is out of scope here. This drill proves the WAL-side contract end to end.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drill_snapshot_streaming_follower_catch_up() {
+    let _gate = enter_drill().await;
+    let (cluster, nodes, _dir) = spin_up_cluster(3).await;
+    let project = ProjectId::new();
+    let part = PartitionKey::default_key();
+    let mut acked = AckedSet::default();
+
+    let leader_id = wait_for_leader_any(&nodes, Duration::from_secs(2)).await;
+    let leader = node_by_id(&nodes, leader_id);
+
+    // A handful of writes while all 3 are up.
+    for i in 1..=3u64 {
+        append_acked(
+            &nodes,
+            &[],
+            &project,
+            &part,
+            format!("s0-{i}").as_bytes(),
+            &mut acked,
+            Duration::from_secs(3),
+        )
+        .await;
+    }
+
+    // Take a follower down. It will miss everything that follows, including the
+    // purge — so log replication alone cannot recover it.
+    let victim = nodes
+        .iter()
+        .map(|n| n.node_id())
+        .find(|id| *id != leader_id)
+        .unwrap();
+    cluster.take_down(victim).await;
+
+    // Commit a larger batch on the surviving quorum so there is a real log
+    // suffix to purge below.
+    for i in 1..=20u64 {
+        append_acked(
+            &nodes,
+            &[victim],
+            &project,
+            &part,
+            format!("s1-{i}").as_bytes(),
+            &mut acked,
+            Duration::from_secs(5),
+        )
+        .await;
+    }
+    let total = acked.payloads.len() as u64;
+
+    // Record a flush watermark THROUGH the current high-water mark and purge the
+    // raft log below it. This is the engine/compactor's post-flush call: it
+    // snapshots (capturing the full applied state) then drops the purged log
+    // entries. After this the only way a far-behind follower catches up is an
+    // install_snapshot.
+    let hw = leader.high_water(&project, &part).await.unwrap();
+    let purged = leader
+        .record_flush_watermark(&project, &part, hw, "catalog-snap-1")
+        .await
+        .expect("record_flush_watermark");
+    assert!(
+        purged.is_some(),
+        "expected the log to purge below the watermark (got {purged:?})"
+    );
+
+    // Bring the victim back. The leader's log no longer holds the early entries,
+    // so openraft must stream the snapshot to it. It ends with the identical
+    // committed write set.
+    cluster.bring_up(victim).await;
+    wait_for_high_water(
+        node_by_id(&nodes, victim).as_ref(),
+        &project,
+        &part,
+        Lsn(total),
+        Duration::from_secs(15),
+    )
+    .await;
+    acked
+        .assert_all_present(node_by_id(&nodes, victim).as_ref(), &project, &part)
+        .await;
 
     close_all(&nodes).await;
 }

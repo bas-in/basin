@@ -37,8 +37,10 @@ openraft = { version = "=0.9.24", features = ["serde"] }
 # `src/raft_net`; codegen in `build.rs` is gated on the same feature.
 # Versions pinned to what the workspace already resolves transitively
 # (opentelemetry pulls tonic 0.12 / prost 0.13) so the lockfile does not gain
-# a second major of either.
-tonic = { workspace = true, optional = true }
+# a second major of either. The `tls` feature pulls tokio-rustls (already in
+# the workspace lockfile via reqwest/tokio-postgres-rustls), enabling mutual
+# TLS on both the Server and Channel — see `raft_net/tls.rs`.
+tonic = { workspace = true, optional = true, features = ["tls"] }
 prost = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true, features = ["net"] }
 
@@ -58,3 +60,8 @@ tempfile.workspace = true
 tokio-test.workspace = true
 # Tests reach into raft types (BasicNode for membership bootstrap).
 openraft = { version = "=0.9.24", features = ["serde"] }
+# In-test certificate authority + leaf cert generation for the mTLS transport
+# tests (`raft_net_tls.rs`). Pinned to the version the workspace already
+# resolves so the lockfile gains no second major. Self-signed CA + per-node
+# leaf certs are minted in-process, never committed.
+rcgen = "0.13"

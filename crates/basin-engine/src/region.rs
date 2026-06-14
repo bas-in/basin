@@ -27,7 +27,9 @@
 
 use std::sync::Arc;
 
-use basin_common::{is_home_region, local_region, BasinError, Result};
+use basin_common::{
+    is_home_region, local_region, raft_group_for, BasinError, RaftGroupTarget, Result,
+};
 
 use crate::session::{session_read_tier, ReadTier};
 use crate::{ExecResult, ProjectSession};
@@ -145,12 +147,14 @@ pub(crate) async fn region_write_gate(
     sql: &str,
 ) -> Result<Option<ExecResult>> {
     let home = project_home_region(sess).await?;
-    if is_home_region(home.as_deref()) {
-        return Ok(None); // local region IS the home (or project is unpinned).
+    // The raft group that owns this project's writes is selected by its home
+    // region (one independent raft group per region — ADR 0009). A `Local`
+    // target appends to this region's group; a `Remote` target belongs to
+    // another region's group, so the write forwards or rejects.
+    match raft_group_for(home.as_deref()) {
+        RaftGroupTarget::Local => Ok(None),
+        RaftGroupTarget::Remote(home) => forward_or_reject(sess, &home, sql).await.map(Some),
     }
-    // Non-home write. `home` is Some(..) and != local_region().
-    let home = home.expect("non-home implies Some(home_region)");
-    forward_or_reject(sess, &home, sql).await.map(Some)
 }
 
 /// Write-path gate for the literal-INSERT fast path (which bypasses the parsed
@@ -167,11 +171,10 @@ pub(crate) async fn region_write_gate_insert(
     sql: &str,
 ) -> Result<Option<Result<ExecResult>>> {
     let home = project_home_region(sess).await?;
-    if is_home_region(home.as_deref()) {
-        return Ok(None);
+    match raft_group_for(home.as_deref()) {
+        RaftGroupTarget::Local => Ok(None),
+        RaftGroupTarget::Remote(home) => Ok(Some(forward_or_reject(sess, &home, sql).await)),
     }
-    let home = home.expect("non-home implies Some(home_region)");
-    Ok(Some(forward_or_reject(sess, &home, sql).await))
 }
 
 /// Shared tail: forward to the registered forwarder, or raise WrongRegion.

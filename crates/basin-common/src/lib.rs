@@ -23,5 +23,7 @@ pub use ids::{
 pub use project_counters::{
     AcquireResult, CapLabel, HistogramSnapshot, LeaseMetrics, RenewResult, ReplicaLeaseSnapshot,
 };
-pub use region::{is_home_region, local_region, DEFAULT_REGION, REGION_ENV};
+pub use region::{
+    is_home_region, local_region, raft_group_for, RaftGroupTarget, DEFAULT_REGION, REGION_ENV,
+};
 pub use telemetry::{ProjectCounterRegistry, ProjectCounters, ProjectCountersSnapshot};

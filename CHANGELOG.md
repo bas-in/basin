@@ -8,6 +8,45 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-14 — Multi-node raft hardening (mTLS transport, chaos-under-load drills, snapshot catch-up, per-region group routing, deploy harness)
+
+- **Mutual TLS for the raft transport (`BASIN_RAFT_TLS_CERT/KEY/CA`).** The
+  tonic transport now runs over rustls with mutual authentication when the
+  three TLS vars are set: each node presents a cluster-CA-signed leaf and
+  requires its peers to do the same — confidentiality plus peer auth, so a node
+  that cannot prove cluster membership is rejected at the handshake. All three
+  vars are required together (a partial config is a startup error; no silent
+  plaintext fallback). With TLS on, bare `host:port` peers are dialed over
+  `https://` automatically. `BASIN_RAFT_TLS_DOMAIN` (default `basin-raft`) is
+  the verification SAN. Default remains plaintext for a private cluster network.
+  This removes the documented "plaintext only" caveat. Verified end-to-end by
+  `crates/basin-wal/tests/raft_net_tls.rs` (a 3-node TLS cluster elects +
+  replicates). Source: `crates/basin-wal/src/raft_net/tls.rs`.
+- **Chaos-under-load failover drills.** New drills in
+  `raft_failover_drills.rs`: kill the leader WHILE a sustained write stream is
+  in flight (the stream resumes on the new leader; every acked write survives —
+  the strongest zero-loss proof); slow/lagging follower does not stall the 2/3
+  quorum commit; partition + heal under continuous load. The `AckedSet`
+  zero-acked-write-loss invariant is asserted in every drill.
+- **Snapshot-streaming follower catch-up.** A drill proves a follower that
+  misses the log-purge window (`record_flush_watermark` snapshots + purges)
+  catches up via `install_snapshot` and ends with the identical committed write
+  set. The WAL snapshot is self-contained (full applied state machine + manifest
+  pointer); the `catalog_snapshot_id` it carries is the seam the engine layer
+  uses to rebuild flushed table state from S3 (documented boundary).
+- **Per-region raft group routing.** One independent raft group per region
+  (no cross-region quorum). `basin_common::raft_group_for(home_region)` makes
+  the group-selection decision explicit and testable: a project's `home_region`
+  selects which region's group owns its writes; the engine region gate routes a
+  non-home write to the forwarder or rejects it (`WrongRegion`). Cross-region
+  replication of the underlying data is by S3 CRR at the bucket layer.
+- **Deployment harness + runbook.** `scripts/raft-cluster-smoke.sh` brings up a
+  real 3-node cluster (three `basin-server` processes, distinct ports/dirs,
+  `BASIN_WAL_MODE=raft`), waits for readiness, and runs a smoke (write to
+  leader, read from follower, kill leader, verify the pre-failover write
+  survived). `docs/runbooks/failover.md` gains the mTLS setup, the new drills,
+  and the harness pointer; `docs/deployment.md` documents the mTLS env matrix.
+
 ## 2026-06-14 — Program-wide feature summary (extensions, SQL surface, multi-node, CDC, SDKs, CLI, storage, scale)
 
 This entry summarises the capabilities that landed across the current program
