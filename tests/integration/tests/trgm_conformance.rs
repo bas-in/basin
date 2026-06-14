@@ -19,21 +19,16 @@
 //!
 //! ## What is NOT covered here (gap table)
 //!
+//! NOTE: the SQL surface shipped.  `similarity()`, `word_similarity()`,
+//! `show_trgm()`, the `%`, `<%`, `<->` operator rewrites, the
+//! `SET/SHOW pg_trgm.similarity_threshold` GUC, and the GIN trigram index
+//! all landed and are exercised in `trgm_sql_conformance.rs`.  The items
+//! below remain genuinely pending.
+//!
 //! | Feature                        | Reason not tested                                |
 //! |--------------------------------|--------------------------------------------------|
-//! | SQL `%` operator               | No SQL surface yet; `trgm_glue` is a no-op stub. |
-//! | SQL `<%` operator              | Same — not yet wired into the DataFusion context. |
-//! | SQL `<->` operator (distance)  | Not wired.                                        |
-//! | `similarity()` SQL UDF         | Not registered; DataFusion session unaware.       |
-//! | `word_similarity()` SQL UDF    | Not registered.                                   |
-//! | `show_trgm()` SQL UDF          | Not registered.                                   |
-//! | `SET pg_trgm.similarity_threshold` GUC | Not wired into session config.           |
-//! | GIN trigram index (storage)    | Index segment format not yet built (v0.2 plan).   |
+//! | GiST trgm index (`gist_trgm_ops`) | Only GIN built; KNN `<->` ordering via GiST index is a perf item (v0.2). |
 //! | Locale-aware case-folding      | v0.1 only handles ASCII; noted in crate docs.     |
-//!
-//! The SQL-surface gap means that `SELECT similarity('cat','bat')` will fail
-//! today.  When the DataFusion UDF registrations land in `trgm_glue`, add a
-//! new group here for SQL-level tests (modelled on `type_stubs.rs`).
 //!
 //! ## Needs-psql-validation table
 //!

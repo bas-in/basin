@@ -25,10 +25,14 @@
 //!
 //! ## What is NOT covered here (gap table)
 //!
+//! NOTE: `EXCLUDE USING gist` is now parsed and enforced via the sentinel-CHECK
+//! exclusion enforcer (`extract_exclude_using_gist` in `ddl.rs`, wired in
+//! `executor.rs`) as of Phase 5.24.  The GIST *index* (a performance optimisation
+//! for range queries, not a correctness gate) remains deferred.
+//!
 //! | Feature                                  | Reason not tested                         |
 //! |------------------------------------------|-------------------------------------------|
-//! | GIST index for range columns             | `CREATE INDEX USING gist` not yet implemented (5.24.E). |
-//! | `EXCLUDE USING gist` constraint          | Not yet parsed/enforced (5.24.F).         |
+//! | GIST index for range columns             | Perf optimisation; correctness covered by the interval-tree probe (5.24.D). |
 //! | `numrange`/`tsrange` text-literal `@>`   | Operator rewriter requires explicit ctor  |
 //! |                                          | keyword to distinguish from JSONB `@>`.   |
 //! | `range_agg()`                            | Not registered (no aggregate UDF yet).    |

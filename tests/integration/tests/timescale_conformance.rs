@@ -30,18 +30,22 @@
 //!
 //! ## Gap list (queued / unimplemented — not tested)
 //!
-//! - `time_bucket_gapfill` — UDF not registered; would fail with "function not found".
-//! - `locf` — UDF not registered.
-//! - `first(value, ts)` / `last(value, ts)` aggregates — not registered.
-//! - `drop_chunks` SQL procedure — not registered (retention works via
-//!   `add_retention_policy` + `run_retention_policy`).
-//! - `run_retention_policy` / actual chunk deletion — metadata-only in 5.29.D;
-//!   rows survive (the policy machinery exists but deletion is async/deferred).
-//! - `timescaledb_information.hypertables` catalog view — not yet exposed.
-//! - `time_bucket` with explicit `origin` / `offset` / `timezone` arguments — only
-//!   the 2-arg form `(interval, column)` is implemented.
-//! - Negative or zero intervals — not validated; behaviour is unspecified.
+//! NOTE: several items that were listed here as gaps have since shipped.
+//! The following have landed and are tested in dedicated suites:
+//! - `time_bucket_gapfill` + `locf` + `interpolate()` — shipped (`be6de49`);
+//!   tested in `timescale_gapfill.rs`.
+//! - `first(value, ts)` / `last(value, ts)` aggregates — shipped; tested in
+//!   `timescale_conformance.rs` (this file) and `timescale_caggs.rs`.
+//! - `drop_chunks` SQL procedure — shipped; tested in `timescale_conformance.rs`.
+//! - `run_retention_policy` + actual chunk deletion — shipped and active.
+//! - `timescaledb_information.hypertables` catalog view — shipped; tested in
+//!   `timescale_completions.rs`.
+//! - `time_bucket` with `origin` / `offset` / `timezone` arguments — shipped;
+//!   multi-arg forms tested in `timescale_conformance.rs`.
+//!
+//! Remaining true gaps (not tested here, genuinely pending):
 //! - `time_bucket` on DATE columns — not handled (only Timestamp* types).
+//! - Negative or zero intervals — not validated; behaviour is unspecified.
 
 #![allow(clippy::print_stdout)]
 
