@@ -26,7 +26,8 @@
 //! ## PG head-to-head
 //! `CREATE EXTENSION IF NOT EXISTS postgis` inside a try; PG uses GIST. The
 //! FAIRNESS INVARIANT from compare_postgis.rs is preserved: PG `ST_DWithin`
-//! operands are cast to `::geography` so both engines measure metres.
+//! operands are cast to `::geography` with `use_spheroid=>false` (spherical
+//! haversine) so both engines use the SAME distance model.
 //!
 //! ## Env knobs
 //!   * `BASIN_EXT_BENCH_ROWS`        — point count (default 100_000)
@@ -348,13 +349,15 @@ async fn ext_bench_postgis() {
             pg_g3 = pg_p50(&pg, &format!(
                 "SELECT count(*) FROM {schema}.pts WHERE geom && ST_MakeEnvelope({},{},{},{},4326)",
                 BBOX_WIDE.0, BBOX_WIDE.1, BBOX_WIDE.2, BBOX_WIDE.3), samples).await;
-            // G4 radius — FAIRNESS: ::geography cast so PG measures metres.
+            // G4 radius — FAIRNESS: ::geography cast so PG measures metres;
+            // use_spheroid=>false forces PostGIS onto the sphere (haversine),
+            // matching Basin's ST_DWithin implementation exactly.
             pg_g4_count = pg_count(&pg, &format!(
                 "SELECT count(*)::bigint FROM {schema}.pts WHERE ST_DWithin(geom::geography, \
-                 ST_SetSRID(ST_MakePoint({QUERY_X},{QUERY_Y}),4326)::geography, {RADIUS_M})")).await;
+                 ST_SetSRID(ST_MakePoint({QUERY_X},{QUERY_Y}),4326)::geography, {RADIUS_M}, false)")).await;
             pg_g4 = pg_p50(&pg, &format!(
                 "SELECT count(*) FROM {schema}.pts WHERE ST_DWithin(geom::geography, \
-                 ST_SetSRID(ST_MakePoint({QUERY_X},{QUERY_Y}),4326)::geography, {RADIUS_M})"), samples).await;
+                 ST_SetSRID(ST_MakePoint({QUERY_X},{QUERY_Y}),4326)::geography, {RADIUS_M}, false)"), samples).await;
             // G5 nearest-neighbour
             pg_g5 = pg_p50(&pg, &format!(
                 "SELECT id FROM {schema}.pts ORDER BY geom <-> ST_SetSRID(ST_MakePoint({QUERY_X},{QUERY_Y}),4326) LIMIT 10"),
@@ -418,9 +421,10 @@ async fn ext_bench_postgis() {
               "basin_hits": g6_count, "pg_hits": pg_g6_count },
         ],
         "note": "PG uses geometry(Point,4326) + GIST; Basin uses POINT + USING gist R-tree \
-                 row-group prune. FAIRNESS: PG ST_DWithin operands cast to ::geography so \
-                 BOTH engines measure metres with the same radius. bbox/radius/polygon \
-                 counts hard-asserted equal across engines when PostGIS is available. \
+                 row-group prune. FAIRNESS: PG ST_DWithin operands cast to ::geography with \
+                 use_spheroid=false (spherical haversine) so BOTH engines use the same \
+                 distance model and the same radius. bbox/radius/polygon counts \
+                 hard-asserted equal across engines when PostGIS is available. \
                  Unsupported Basin shapes record basin_supported:false and a PG-only timing \
                  (the card never fails because a shape is unimplemented).",
     }));
