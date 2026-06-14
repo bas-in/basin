@@ -1912,6 +1912,236 @@ pub(crate) fn rewrite_lateral_unnest(sql: &str) -> String {
     out
 }
 
+/// Split `s` at top-level commas, tracking `()` and `[]` nesting and skipping
+/// single-quoted string literals. Used to break a multi-arg `UNNEST(...)` arg
+/// list and an `ARRAY[...]` element list.
+fn split_top_commas_brackets(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < s.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < s.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < s.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            b',' if depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(s[start..].trim());
+    parts
+}
+
+fn split_nonempty(s: &str) -> Vec<&str> {
+    if s.trim().is_empty() {
+        return Vec::new();
+    }
+    split_top_commas_brackets(s)
+}
+
+/// Parse one `UNNEST` argument of the form `(ARRAY[e0, e1, …])::TYPE[]` or
+/// `ARRAY[e0, e1, …]::TYPE[]` into its element expressions and the element
+/// (non-array) type text. Returns `None` for any other shape (column refs,
+/// function calls, …) so the caller leaves the whole `UNNEST` untouched.
+fn parse_array_literal_arg(arg: &str) -> Option<(Vec<&str>, &str)> {
+    let s = arg.trim();
+    let bytes = s.as_bytes();
+    // Optional outer parens: `(ARRAY[…])::T[]`. Find the array's bracket span,
+    // then the `::TYPE[]` cast suffix after it.
+    let arr_open = s.find('[')?;
+    // Everything up to `[` (minus a leading `(`) must be the ARRAY keyword.
+    let head = s[..arr_open].trim_start_matches('(').trim();
+    if !head.eq_ignore_ascii_case("array") {
+        return None;
+    }
+    // Match the array's closing `]`.
+    let mut depth = 0i32;
+    let mut close = None;
+    let mut i = arr_open;
+    while i < s.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < s.len() && bytes[i] != b'\'' {
+                    i += 1;
+                }
+            }
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let close = close?;
+    let elems = split_nonempty(s[arr_open + 1..close].trim());
+    // After `]`: an optional `)` then `::TYPE[]`.
+    let suffix = s[close + 1..].trim().trim_start_matches(')').trim();
+    let ty = suffix.strip_prefix("::")?.trim().strip_suffix("[]")?.trim();
+    if ty.is_empty() {
+        return None;
+    }
+    Some((elems, ty))
+}
+
+/// Rewrite `FROM UNNEST((ARRAY[v0,…])::T1[], (ARRAY[w0,…])::T2[], …)` — where
+/// every argument is a literal `ARRAY[…]` constructor — into a VALUES table
+/// `(VALUES (CAST(v0 AS T1), CAST(w0 AS T2)), …) AS __unnest(col1, col2, …)`.
+///
+/// This is the multi-array PARALLEL `UNNEST` (Postgres zips the arrays
+/// element-wise, NULL-padding shorter ones) that Django's `bulk_create` emits:
+///   `INSERT INTO t (a,b) SELECT * FROM UNNEST((ARRAY[…])::varchar[], (ARRAY[…])::timestamptz[])`
+/// DataFusion accepts the syntax but its element-wise `List<Utf8>→List<T>` cast
+/// nullifies the literal arrays at execution, yielding zero rows. The VALUES
+/// form is planned natively. Fires only on 2+ literal-`ARRAY` args; single-arg
+/// `UNNEST` and `UNNEST(column)` forms are left untouched (bail → unchanged).
+pub(crate) fn rewrite_multi_unnest_literal(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("unnest(") || !lower.contains("array[") {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    while i < sql.len() {
+        if bytes[i] == b'\'' {
+            let start = i;
+            i += 1;
+            while i < sql.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < sql.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        if bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            while i < sql.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i < sql.len() {
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        let word_boundary =
+            i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+        if word_boundary && lower[i..].starts_with("unnest(") {
+            let open = i + "unnest".len(); // index of '('
+            if let Some(close) = matching_paren(bytes, open) {
+                if let Some(values) = unnest_args_to_values(&sql[open + 1..close]) {
+                    out.push_str(&values);
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Index of the `)` matching the `(` at `open`, skipping single-quoted
+/// literals; `None` if unbalanced.
+fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Build `(VALUES …) AS __unnest(col1, …)` from the comma-separated `UNNEST`
+/// argument list, or `None` if the args aren't all literal arrays, number fewer
+/// than two, or are all empty.
+fn unnest_args_to_values(args_str: &str) -> Option<String> {
+    let args = split_top_commas_brackets(args_str);
+    if args.len() < 2 {
+        return None;
+    }
+    let parsed: Vec<(Vec<&str>, &str)> = args
+        .iter()
+        .map(|a| parse_array_literal_arg(a))
+        .collect::<Option<Vec<_>>>()?;
+    let n = parsed.iter().map(|(e, _)| e.len()).max().unwrap_or(0);
+    if n == 0 {
+        return None;
+    }
+    let mut rows: Vec<String> = Vec::with_capacity(n);
+    for r in 0..n {
+        let cells: Vec<String> = parsed
+            .iter()
+            .map(|(elems, ty)| {
+                let e = elems.get(r).copied().unwrap_or("NULL");
+                format!("CAST({e} AS {ty})")
+            })
+            .collect();
+        rows.push(format!("({})", cells.join(", ")));
+    }
+    let cols: Vec<String> = (1..=parsed.len()).map(|k| format!("col{k}")).collect();
+    Some(format!(
+        "(VALUES {}) AS __unnest({})",
+        rows.join(", "),
+        cols.join(", ")
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // LATERAL subquery rewrites
 // ---------------------------------------------------------------------------
@@ -7343,6 +7573,48 @@ pub(crate) fn rewrite_json_agg_qualified_wildcard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_unnest_literal_rewrites_to_values() {
+        // The Django bulk_create shape: multi-arg literal UNNEST → VALUES.
+        let sql = "INSERT INTO t (a, b) SELECT * FROM UNNEST((ARRAY['x','y'])::varchar[], \
+                   (ARRAY[1,2])::int8[]) RETURNING id";
+        let out = rewrite_multi_unnest_literal(sql);
+        assert!(
+            out.contains(
+                "(VALUES (CAST('x' AS varchar), CAST(1 AS int8)), \
+                 (CAST('y' AS varchar), CAST(2 AS int8))) AS __unnest(col1, col2)"
+            ),
+            "got: {out}"
+        );
+        // The original `FROM UNNEST(` table-function call is gone (the `AS
+        // __unnest(...)` alias of the replacement VALUES is expected to remain).
+        assert!(
+            !out.to_ascii_lowercase().contains("from unnest("),
+            "FROM UNNEST call must be replaced: {out}"
+        );
+    }
+
+    #[test]
+    fn multi_unnest_literal_leaves_non_targets_untouched() {
+        // Single-array literal UNNEST — not the parallel shape, leave it.
+        let s1 = "SELECT * FROM UNNEST((ARRAY[1,2])::int8[])";
+        assert_eq!(rewrite_multi_unnest_literal(s1), s1);
+        // UNNEST over a column reference — leave it.
+        let s2 = "SELECT * FROM unnest(arr)";
+        assert_eq!(rewrite_multi_unnest_literal(s2), s2);
+        // Multi-arg but a column ref among the args — bail, leave untouched.
+        let s3 = "SELECT * FROM UNNEST((ARRAY[1,2])::int8[], some_col)";
+        assert_eq!(rewrite_multi_unnest_literal(s3), s3);
+    }
+
+    #[test]
+    fn multi_unnest_literal_null_pads_uneven_lengths() {
+        let sql = "SELECT * FROM UNNEST((ARRAY['a','b','c'])::text[], (ARRAY[1])::int8[])";
+        let out = rewrite_multi_unnest_literal(sql);
+        // Row 2 and 3 pad the shorter second array with NULL.
+        assert!(out.contains("CAST(NULL AS int8)"), "must NULL-pad: {out}");
+    }
 
     // ── POSIX regex rewriter ────────────────────────────────────────────────
 

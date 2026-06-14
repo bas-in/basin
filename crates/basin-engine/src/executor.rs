@@ -625,6 +625,11 @@ async fn run_full_rewrite_pipeline(sess: &ProjectSession, sql: &str) -> Result<S
     // TableFactor::UNNEST (handled by DataFusion) instead of
     // TableFactor::Function { lateral: true } (not a registered table fn).
     let rewritten = crate::pg_operators::rewrite_lateral_unnest(&rewritten);
+    // Rewrite multi-arg literal `FROM UNNEST((ARRAY[…])::T[], (ARRAY[…])::T[], …)`
+    // (Django bulk_create's parallel-array shape, which DataFusion accepts but
+    // executes to zero rows) into a `(VALUES …) AS __unnest(…)` table. Runs on
+    // the full string before parse, so INSERT…SELECT sources are covered too.
+    let rewritten = crate::pg_operators::rewrite_multi_unnest_literal(&rewritten);
     // Rewrite uncorrelated `LATERAL (subquery)` → `(subquery)`.  When the
     // subquery body has zero references to outer FROM columns, LATERAL is
     // semantically identical to a plain join.  Stripping it lets DataFusion

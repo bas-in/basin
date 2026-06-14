@@ -8,6 +8,21 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-14 — Multi-array UNNEST in INSERT … SELECT (Django bulk_create)
+
+- **`INSERT INTO t (…) SELECT * FROM UNNEST((ARRAY[…])::T1[], (ARRAY[…])::T2[])`
+  now inserts the zipped rows.** This parallel multi-array `UNNEST` (Postgres
+  zips the arrays element-wise) is what Django's `bulk_create` emits. DataFusion
+  accepts the syntax but executes it to **zero rows** for the literal-array form
+  (its element-wise `List<Utf8>→List<T>` cast nullifies the arrays), so the
+  whole bulk insert silently inserted nothing. A pre-parse rewrite turns the
+  literal-array `UNNEST` into a `(VALUES (CAST(v0 AS T1), CAST(w0 AS T2)), …) AS
+  __unnest(col1, col2, …)` table, which DataFusion plans natively; shorter
+  arrays are NULL-padded (PG semantics). Fires only on 2+ literal-`ARRAY`
+  arguments — single-array and `UNNEST(column)` forms are untouched. Combined
+  with the INSERT-SELECT RETURNING fix, the full `bulk_create` shape works
+  end-to-end. Pinned by `pg_operators` unit tests + `orm_sql_shapes.rs`.
+
 ## 2026-06-14 — Enum columns advertise their own type OID (Prisma)
 
 - **A user-enum result column now advertises the enum's own Postgres type OID in
