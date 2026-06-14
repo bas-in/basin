@@ -2717,6 +2717,16 @@ fn coerce_string(expr: &Expr) -> Result<Option<String>> {
 /// its single packed buffer, so an extra `String` allocation per row was
 /// pure waste.
 fn coerce_string_ref(expr: &Expr) -> Result<Option<&str>> {
+    // Peel CAST wrappers around a string literal. Drivers stamp enum values as
+    // `'USER'::"Role"` (sqlparser: `CAST('USER' AS "Role")`, sometimes nested
+    // through `::TEXT`); user-defined enum types are stored as Utf8, so the cast
+    // target is irrelevant here — the inner string literal is the value. Also
+    // covers explicit `'x'::text` / `'x'::varchar` casts. A non-string inner
+    // (number / identifier) still falls through to the error below.
+    let mut expr = expr;
+    while let Expr::Cast { expr: inner, .. } = expr {
+        expr = inner.as_ref();
+    }
     match expr {
         Expr::Value(ValueWithSpan {
             value: Value::SingleQuotedString(s),

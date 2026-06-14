@@ -99,6 +99,37 @@ async fn create_type_enum_invalid_label_rejected() {
     );
 }
 
+/// ORMs (Django, et al.) stamp enum values in INSERT as an explicit cast —
+/// `'USER'::"Role"` (sqlparser: `CAST('USER' AS "Role")`, sometimes nested via
+/// `::TEXT`). The cast-wrapped literal must coerce to the enum (stored as Utf8)
+/// exactly as a bare `'USER'` label does, and label validation must still fire.
+#[tokio::test]
+async fn enum_insert_with_cast_label() {
+    let (_dir, engine) = open_engine().await;
+    let sess = open_session(&engine).await;
+
+    exec_ok(&sess, r#"CREATE TYPE "Role" AS ENUM ('USER', 'ADMIN')"#).await;
+    exec_ok(
+        &sess,
+        r#"CREATE TABLE accounts (id BIGINT NOT NULL, role "Role" NOT NULL)"#,
+    )
+    .await;
+
+    // The two cast spellings drivers emit.
+    exec_ok(&sess, r#"INSERT INTO accounts VALUES (1, 'USER'::"Role")"#).await;
+    exec_ok(&sess, r#"INSERT INTO accounts VALUES (2, CAST('ADMIN' AS "Role"))"#).await;
+
+    // Label validation still applies through the cast.
+    let err = exec_err(&sess, r#"INSERT INTO accounts VALUES (3, 'GUEST'::"Role")"#).await;
+    assert!(
+        err.contains("GUEST")
+            || err.contains("22P02")
+            || err.contains("invalid")
+            || err.contains("label"),
+        "cast-wrapped invalid enum label must still be rejected, got: {err}"
+    );
+}
+
 #[tokio::test]
 async fn alter_type_add_value_appends_label() {
     let (_dir, engine) = open_engine().await;

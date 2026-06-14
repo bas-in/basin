@@ -8,6 +8,18 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-14 — enum values stamped as a cast INSERT correctly (`'USER'::"Role"`)
+
+- **Cast-wrapped string literals coerce for enum / text columns.** ORMs (Django
+  et al.) stamp enum INSERT values as an explicit cast — `'USER'::"Role"`
+  (`CAST('USER' AS "Role")`, sometimes nested through `::TEXT`) — which was
+  rejected with "expected string literal, got CAST(…)". The string coercion now
+  peels CAST wrappers around a string literal (user enums are stored as Utf8, so
+  the cast target is irrelevant); enum **label validation still fires** through
+  the cast, and `'x'::text` / `'x'::varchar` casts also resolve. Source:
+  `crates/basin-engine/src/dml.rs` (`coerce_string_ref`); covered by
+  `type_ddl::enum_insert_with_cast_label`.
+
 ## 2026-06-14 — INSERT array values in the PostgreSQL curly-brace text form
 
 - **`'{a,b}'::T[]` / `'{}'::T[]` array literals INSERT into array columns.**
