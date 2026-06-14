@@ -10,6 +10,13 @@ graduate to 1.0 and the standard SemVer guarantees.
 
 ## 2026-06-14 — ORM SQL-shape fixes (Drizzle, SQLAlchemy, Django, gorm)
 
+- **Array `&&` overlap with a parenthesized/cast operand** now rewrites to
+  `arrays_overlap(...)` instead of being mangled by the range-operator rewriter.
+  Django's ArrayField `__overlap` emits `"t"."tags" && (ARRAY['a','b'])::varchar(50)[]`;
+  the array-operator rewrite now (a) consumes the trailing `::type[]` cast on a
+  parenthesized operand, (b) recognizes an embedded `ARRAY[` as an array, and
+  (c) extracts a double-quoted compound identifier (`"t"."col"`) as the LHS.
+
 - **`(expr AT TIME ZONE 'tz')::date`** (Django `__date` lookups) now plans. The
   backward LHS scan in the `AT TIME ZONE` rewriter stopped at whitespace/comma
   but not `(`, so a parenthesized LHS like `("t"."col" AT TIME ZONE 'tz')`

@@ -918,6 +918,13 @@ fn looks_like_array(expr: &str) -> bool {
     if lower.starts_with("array[") || lower.starts_with("array [") {
         return true;
     }
+    // Parenthesized / cast-wrapped array constructor, e.g. Django's
+    // `(ARRAY['a','b'])::varchar(50)[]`. An `ARRAY[` anywhere in a single
+    // extracted operand is a definitive array signal (range constructors and
+    // bare column refs never contain it).
+    if lower.contains("array[") || lower.contains("array [") {
+        return true;
+    }
     // '{...}'::type[] cast form — starts with single-quote.
     // But skip range literals like `'[1,10)'::int4range` — their content
     // starts with `[` or `(` (range notation), not `{` (PG array literal).
@@ -1080,6 +1087,25 @@ fn array_extract_left(s: &str, end: usize) -> (usize, usize) {
         {
             i -= 1;
         }
+    } else if last == b'"' {
+        // Double-quoted identifier, possibly compound: `"col"`, `"t"."col"`,
+        // `"schema"."t"."col"`. Walk back over each `"…"` segment and any `.`
+        // separators between them. ORMs quote every identifier this way.
+        loop {
+            i -= 1; // step over the closing quote
+            while i > 0 && bytes[i - 1] != b'"' {
+                i -= 1;
+            }
+            if i > 0 {
+                i -= 1; // consume the opening quote
+            }
+            // Continue only if a `.`-joined quoted segment precedes this one.
+            if i > 1 && bytes[i - 1] == b'.' && bytes[i - 2] == b'"' {
+                i -= 1; // consume the dot; the loop consumes the next segment
+            } else {
+                break;
+            }
+        }
     } else {
         while i > 0
             && (bytes[i - 1].is_ascii_alphanumeric()
@@ -1160,6 +1186,19 @@ fn array_extract_right(s: &str, start: usize) -> (usize, usize) {
                 _ => {}
             }
             i += 1;
+        }
+        // Consume an optional `::type[]` cast on a parenthesized operand, e.g.
+        // `(ARRAY['a','b'])::varchar(50)[]` — the shape Django's ArrayField
+        // `__overlap` lookup emits as the `&&` right-hand side. The type name
+        // may itself carry parens (`varchar(50)`), so accept `(`/`)` too.
+        if i + 1 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b':' {
+            i += 2;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric()
+                    || matches!(bytes[i], b'_' | b'[' | b']' | b'(' | b')'))
+            {
+                i += 1;
+            }
         }
     } else {
         // Identifier or number — also capture ::type[] cast.
@@ -9061,6 +9100,21 @@ mod tests {
     }
 
     // ── collect_json_agg_star_aliases ───────────────────────────────────────
+
+    #[test]
+    fn array_overlap_rewrite_handles_parenthesized_cast_operand() {
+        // Django ArrayField `__overlap` emits `col && (ARRAY[...])::varchar(50)[]`.
+        // The array `&&` rewrite must recognize the parenthesized/cast operand
+        // (and so claim it) rather than leaving it for the range rewriter, which
+        // would emit a malformed `range_overlaps(...)`.
+        let sql = "SELECT 1 FROM t WHERE \"t\".\"tags\" && (ARRAY['go', 'rust'])::varchar(50)[]";
+        let out = rewrite_array_operators(sql);
+        assert!(
+            out.contains("arrays_overlap(\"t\".\"tags\", (ARRAY['go', 'rust'])::varchar(50)[])"),
+            "got: {out}"
+        );
+        assert!(!out.contains("range_overlaps"), "must not route to range: {out}");
+    }
 
     #[test]
     fn collect_finds_simple_alias() {
