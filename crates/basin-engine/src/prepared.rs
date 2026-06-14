@@ -378,7 +378,12 @@ pub(crate) async fn prepare(
         };
         let kind_ok = ast
             .as_ref()
-            .map(|s| matches!(s.as_ref(), Statement::Insert(_) | Statement::Query(_)))
+            .map(|s| {
+                matches!(
+                    s.as_ref(),
+                    Statement::Insert(_) | Statement::Query(_) | Statement::Update(_)
+                )
+            })
             .unwrap_or(false);
         let ast_fast_ok = kind_ok && crate::executor::rewrite_pipeline_is_noop(sess, sql).await;
         let bind_plan = if ast_fast_ok && placeholder_count > 0 {
@@ -2003,11 +2008,48 @@ fn substitute_ast(stmt: &mut Statement, params: &[ScalarParam]) -> Result<()> {
         Statement::Query(q) => {
             subst_query(q, params)?;
         }
-        // The caller only sets `ast_fast_ok` for INSERT / Query, so this is
-        // unreachable in practice; bail to text for anything else.
+        // Bind-direct UPDATE (perf-w-pointops): substitute placeholders in the
+        // SET RHS values, the WHERE selection, and any `UPDATE … FROM` factor /
+        // RETURNING expr, then dispatch the cached AST via `execute_statement` —
+        // reusing `exec_update` verbatim (every gate, the hot-tier fast path,
+        // and the change-event/sink capture inside `hot_tier_update_by_pk`).
+        // This skips ONLY the per-Execute whole-statement re-parse; the
+        // leftover-placeholder guard below forces a text fallback if any `$N`
+        // hides in a shape this targeted walker doesn't descend into.
+        Statement::Update(upd) => {
+            for assignment in &mut upd.assignments {
+                subst_expr(&mut assignment.value, params)?;
+            }
+            if let Some(sel) = upd.selection.as_mut() {
+                subst_expr(sel, params)?;
+            }
+            if let Some(from) = upd.from.as_mut() {
+                let twjs = match from {
+                    sqlparser::ast::UpdateTableFromKind::BeforeSet(v)
+                    | sqlparser::ast::UpdateTableFromKind::AfterSet(v) => v,
+                };
+                for twj in twjs.iter_mut() {
+                    subst_table_factor(&mut twj.relation, params)?;
+                    for join in &mut twj.joins {
+                        subst_table_factor(&mut join.relation, params)?;
+                    }
+                }
+            }
+            if let Some(items) = upd.returning.as_mut() {
+                for item in items {
+                    if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } =
+                        item
+                    {
+                        subst_expr(e, params)?;
+                    }
+                }
+            }
+        }
+        // The caller only sets `ast_fast_ok` for INSERT / Query / Update, so
+        // this is unreachable in practice; bail to text for anything else.
         _ => {
             return Err(BasinError::internal(
-                "substitute_ast: only INSERT/Query supported".to_string(),
+                "substitute_ast: only INSERT/Query/Update supported".to_string(),
             ));
         }
     }

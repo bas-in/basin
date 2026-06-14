@@ -3504,12 +3504,24 @@ pub(crate) async fn execute_statement(
     }
 
     // Hard kind gate (defence in depth — the caller already screened). Only
-    // INSERT and Query reach the AST path; everything else must go through the
-    // text `execute` so its DDL pre-screens / noop-accept gates run.
-    if !matches!(stmt, Statement::Insert(_) | Statement::Query(_)) {
+    // INSERT, Query and UPDATE reach the AST path; everything else must go
+    // through the text `execute` so its DDL pre-screens / noop-accept gates run.
+    // UPDATE was added for the bind-direct UPDATE fast path (perf-w-pointops):
+    // a prepared `UPDATE … SET … WHERE …` whose template is rewrite-pipeline
+    // noop dispatches the param-substituted cached AST here, skipping the
+    // per-Execute whole-statement re-parse. `dispatch_parsed_statement` routes
+    // it through `exec_update` verbatim — every gate, the hot-tier fast path,
+    // and the change-event/sink capture are inherited unchanged.
+    if !matches!(
+        stmt,
+        Statement::Insert(_) | Statement::Query(_) | Statement::Update(_)
+    ) {
         return Err(BasinError::FeatureNotSupported(
-            "execute_statement only handles INSERT/SELECT; use the text path".into(),
+            "execute_statement only handles INSERT/SELECT/UPDATE; use the text path".into(),
         ));
+    }
+    if matches!(stmt, Statement::Update(_)) {
+        UPDATE_AST_FAST_DISPATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     // For the AST fast path the substituted text needs no rewriting (gated on
@@ -5804,6 +5816,16 @@ async fn try_insert_preparse(
 /// the per-Execute loop). Test-visible instrumentation; relaxed ordering is
 /// fine for a monotone counter.
 pub(crate) static INSERTS_BIND_DIRECT_FASTPATH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Count of UPDATE executions dispatched through the bind-direct (AST-fast)
+/// prepared route — the param-substituted cached AST is handed straight to
+/// `dispatch_parsed_statement` via `execute_statement`, skipping the
+/// per-Execute whole-statement re-parse the text route pays. The statement
+/// still flows through `exec_update` verbatim (every gate, the hot-tier fast
+/// path, and the change-event/sink capture). Test-visible instrumentation;
+/// relaxed ordering is fine for a monotone counter.
+pub(crate) static UPDATE_AST_FAST_DISPATCH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Plan for the bind-direct parameterized-INSERT fast path, precomputed ONCE
@@ -16904,6 +16926,480 @@ mod point_select_bind_direct_tests {
         assert!(
             bind.as_secs_f64() <= 0.5 * text.as_secs_f64(),
             "bind-direct point SELECT must be <= 0.5x the text route (bind={bind:?}, text={text:?})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod update_bind_direct_tests {
+    //! Bind-direct (AST-fast) prepared UPDATE: a `UPDATE t SET col = $N WHERE
+    //! pk = $M` whose template is rewrite-pipeline-noop dispatches the
+    //! param-substituted cached AST through `execute_statement` (no per-Execute
+    //! re-parse), routed through `exec_update` verbatim. These assert the
+    //! engagement counter advances AND that the bind path is byte-for-byte
+    //! identical to the text route for every SET-value type, the missing-row
+    //! shape, post-DDL re-resolve, RLS tables, and inside an explicit tx.
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use basin_catalog::{Catalog, InMemoryCatalog};
+    use basin_common::ProjectId;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    use super::UPDATE_AST_FAST_DISPATCH;
+    use crate::prepared::ScalarParam;
+    use crate::{Engine, EngineConfig, ExecResult, ProjectSession};
+
+    fn make_engine(dir: &TempDir) -> Engine {
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        })
+    }
+
+    /// Render a table's full contents (ordered by PK) to a stable string so two
+    /// execution paths can be compared without depending on Arrow internals.
+    async fn dump(sess: &ProjectSession, select_sql: &str) -> String {
+        let res = sess.execute(select_sql).await.unwrap();
+        match res {
+            ExecResult::Rows { schema, batches } => {
+                let mut out = String::new();
+                for f in schema.fields() {
+                    out.push_str(f.name());
+                    out.push(',');
+                }
+                out.push('\n');
+                let opts = arrow::util::display::FormatOptions::default();
+                for b in &batches {
+                    for r in 0..b.num_rows() {
+                        for c in 0..b.num_columns() {
+                            let fmt =
+                                arrow::util::display::ArrayFormatter::try_new(b.column(c), &opts)
+                                    .unwrap();
+                            out.push_str(&fmt.value(r).to_string());
+                            out.push('|');
+                        }
+                        out.push('\n');
+                    }
+                }
+                out
+            }
+            ExecResult::Empty { tag } => format!("EMPTY:{tag}"),
+        }
+    }
+
+    fn tag_of(res: &ExecResult) -> String {
+        match res {
+            ExecResult::Empty { tag } => tag.clone(),
+            ExecResult::Rows { .. } => "ROWS".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn engages_and_matches_text_route_int_set() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, n BIGINT)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO t (id, n) VALUES (1, 10), (2, 20)")
+            .await
+            .unwrap();
+
+        let before = UPDATE_AST_FAST_DISPATCH.load(Ordering::Relaxed);
+        let (handle, _s) = sess
+            .prepare("UPDATE t SET n = $2 WHERE id = $1")
+            .await
+            .unwrap();
+        let bound = sess
+            .bind(&handle, vec![ScalarParam::Int8(2), ScalarParam::Int8(99)])
+            .await
+            .unwrap();
+        let res = sess.execute_bound(bound).await.unwrap();
+        assert_eq!(tag_of(&res), "UPDATE 1");
+        assert!(
+            UPDATE_AST_FAST_DISPATCH.load(Ordering::Relaxed) > before,
+            "engagement counter must advance for the bind-direct UPDATE"
+        );
+        assert_eq!(
+            dump(&sess, "SELECT id, n FROM t WHERE id = 2").await,
+            "id,n,\n2|99|\n"
+        );
+    }
+
+    /// Differential: run the SAME single-row UPDATE through the bind path on one
+    /// table and the text route on an identical sibling table, then assert both
+    /// tables hold byte-identical contents. Covers every SET-value type the
+    /// converter must handle the same as the text path.
+    async fn assert_bind_eq_text_update(
+        sess: &ProjectSession,
+        create_a: &str,
+        create_b: &str,
+        seed_a: &str,
+        seed_b: &str,
+        prepared_sql: &str,
+        params: Vec<ScalarParam>,
+        text_sql: &str,
+        select_a: &str,
+        select_b: &str,
+    ) {
+        sess.execute(create_a).await.unwrap();
+        sess.execute(create_b).await.unwrap();
+        sess.execute(seed_a).await.unwrap();
+        sess.execute(seed_b).await.unwrap();
+
+        let (handle, _s) = sess.prepare(prepared_sql).await.unwrap();
+        let bound = sess.bind(&handle, params).await.unwrap();
+        // The contract is PARITY with the normal path, including error parity:
+        // both routes feed the SAME rendered literal into the SAME `exec_update`,
+        // so an engine limitation hit by one (e.g. a wide-decimal coercion, an
+        // RLS predicate the v0.1 engine can't represent) must be hit identically
+        // by the other. We therefore compare OUTCOMES (Ok-tag or Err) rather
+        // than unwrapping, then — only when both succeeded — assert the two
+        // tables ended byte-identical.
+        let via_bind = sess.execute_bound(bound).await;
+        let via_text = sess.execute(text_sql).await;
+        match (&via_bind, &via_text) {
+            (Ok(b), Ok(t)) => {
+                assert_eq!(
+                    tag_of(b),
+                    tag_of(t),
+                    "row-count tag must match for `{text_sql}`"
+                );
+                let dump_a = dump(sess, select_a).await;
+                let dump_b = dump(sess, select_b).await;
+                assert_eq!(
+                    dump_a, dump_b,
+                    "bind-direct UPDATE must leave the table identical to the text route for `{text_sql}`"
+                );
+            }
+            (Err(b), Err(t)) => {
+                assert_eq!(
+                    b.to_string(),
+                    t.to_string(),
+                    "bind-direct UPDATE must produce the IDENTICAL error as the text route for `{text_sql}`"
+                );
+            }
+            (b, t) => panic!(
+                "bind-direct UPDATE and text route diverged for `{text_sql}`: bind={b:?} text={t:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn matches_text_route_all_set_value_types() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+        // Timestamptz SET value.
+        assert_bind_eq_text_update(
+            &sess,
+            "CREATE TABLE ta (id BIGINT PRIMARY KEY, ts TIMESTAMPTZ)",
+            "CREATE TABLE tb (id BIGINT PRIMARY KEY, ts TIMESTAMPTZ)",
+            "INSERT INTO ta (id, ts) VALUES (1, '2020-01-01T00:00:00+00')",
+            "INSERT INTO tb (id, ts) VALUES (1, '2020-01-01T00:00:00+00')",
+            "UPDATE ta SET ts = $2 WHERE id = $1",
+            vec![ScalarParam::Int8(1), ScalarParam::Timestamptz(1_767_323_045_000_000)],
+            "UPDATE tb SET ts = '2026-01-02T03:04:05+00'::timestamptz WHERE id = 1",
+            "SELECT ts FROM ta WHERE id = 1",
+            "SELECT ts FROM tb WHERE id = 1",
+        )
+        .await;
+
+        // jsonb SET value.
+        assert_bind_eq_text_update(
+            &sess,
+            "CREATE TABLE ja (id BIGINT PRIMARY KEY, doc JSONB)",
+            "CREATE TABLE jb (id BIGINT PRIMARY KEY, doc JSONB)",
+            "INSERT INTO ja (id, doc) VALUES (1, '{\"a\":1}')",
+            "INSERT INTO jb (id, doc) VALUES (1, '{\"a\":1}')",
+            "UPDATE ja SET doc = $2 WHERE id = $1",
+            vec![
+                ScalarParam::Int8(1),
+                ScalarParam::Text("{\"b\":2,\"c\":[3,4]}".into()),
+            ],
+            "UPDATE jb SET doc = '{\"b\":2,\"c\":[3,4]}' WHERE id = 1",
+            "SELECT doc FROM ja WHERE id = 1",
+            "SELECT doc FROM jb WHERE id = 1",
+        )
+        .await;
+
+        // uuid SET value.
+        assert_bind_eq_text_update(
+            &sess,
+            "CREATE TABLE ua (id BIGINT PRIMARY KEY, u UUID)",
+            "CREATE TABLE ub (id BIGINT PRIMARY KEY, u UUID)",
+            "INSERT INTO ua (id, u) VALUES (1, '00000000-0000-0000-0000-000000000000')",
+            "INSERT INTO ub (id, u) VALUES (1, '00000000-0000-0000-0000-000000000000')",
+            "UPDATE ua SET u = $2 WHERE id = $1",
+            vec![
+                ScalarParam::Int8(1),
+                ScalarParam::Text("11111111-2222-3333-4444-555555555555".into()),
+            ],
+            "UPDATE ub SET u = '11111111-2222-3333-4444-555555555555' WHERE id = 1",
+            "SELECT u FROM ua WHERE id = 1",
+            "SELECT u FROM ub WHERE id = 1",
+        )
+        .await;
+
+        // numeric SET value. Both paths render the literal the SAME way (the
+        // bind param renders to `'1234.56'`, and the text sibling uses the
+        // identical quoted form) so the differential isolates the bind-direct
+        // dispatch, not NUMERIC literal-vs-number coercion (a separate concern
+        // shared by both routes).
+        assert_bind_eq_text_update(
+            &sess,
+            "CREATE TABLE na (id BIGINT PRIMARY KEY, amt NUMERIC(10,2))",
+            "CREATE TABLE nb (id BIGINT PRIMARY KEY, amt NUMERIC(10,2))",
+            "INSERT INTO na (id, amt) VALUES (1, 1.00)",
+            "INSERT INTO nb (id, amt) VALUES (1, 1.00)",
+            "UPDATE na SET amt = $2 WHERE id = $1",
+            vec![ScalarParam::Int8(1), ScalarParam::Text("1234.56".into())],
+            "UPDATE nb SET amt = '1234.56' WHERE id = 1",
+            "SELECT amt FROM na WHERE id = 1",
+            "SELECT amt FROM nb WHERE id = 1",
+        )
+        .await;
+
+        // NULL SET value.
+        assert_bind_eq_text_update(
+            &sess,
+            "CREATE TABLE xa (id BIGINT PRIMARY KEY, s TEXT)",
+            "CREATE TABLE xb (id BIGINT PRIMARY KEY, s TEXT)",
+            "INSERT INTO xa (id, s) VALUES (1, 'before')",
+            "INSERT INTO xb (id, s) VALUES (1, 'before')",
+            "UPDATE xa SET s = $2 WHERE id = $1",
+            vec![ScalarParam::Int8(1), ScalarParam::Null],
+            "UPDATE xb SET s = NULL WHERE id = 1",
+            "SELECT s FROM xa WHERE id = 1",
+            "SELECT s FROM xb WHERE id = 1",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn missing_row_updates_zero() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO t (id, n) VALUES (1, 10)")
+            .await
+            .unwrap();
+        let (handle, _s) = sess
+            .prepare("UPDATE t SET n = $2 WHERE id = $1")
+            .await
+            .unwrap();
+        let bound = sess
+            .bind(&handle, vec![ScalarParam::Int8(404), ScalarParam::Int8(7)])
+            .await
+            .unwrap();
+        let res = sess.execute_bound(bound).await.unwrap();
+        assert_eq!(tag_of(&res), "UPDATE 0");
+        // The present row is untouched.
+        assert_eq!(
+            dump(&sess, "SELECT id, n FROM t WHERE id = 1").await,
+            "id,n,\n1|10|\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_heals_after_ddl_and_rebinds_fresh_param() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO t (id, n) VALUES (1, 10), (2, 20)")
+            .await
+            .unwrap();
+        let (handle, _s) = sess
+            .prepare("UPDATE t SET n = $2 WHERE id = $1")
+            .await
+            .unwrap();
+
+        let b1 = sess
+            .bind(&handle, vec![ScalarParam::Int8(1), ScalarParam::Int8(11)])
+            .await
+            .unwrap();
+        assert_eq!(tag_of(&sess.execute_bound(b1).await.unwrap()), "UPDATE 1");
+
+        // Add a column; the cached AST references only existing columns, so the
+        // prepared statement must keep serving correctly against the new schema.
+        sess.execute("ALTER TABLE t ADD COLUMN extra TEXT")
+            .await
+            .unwrap();
+        let b2 = sess
+            .bind(&handle, vec![ScalarParam::Int8(2), ScalarParam::Int8(22)])
+            .await
+            .unwrap();
+        assert_eq!(tag_of(&sess.execute_bound(b2).await.unwrap()), "UPDATE 1");
+        assert_eq!(
+            dump(&sess, "SELECT id, n, extra FROM t WHERE id = 2").await,
+            "id,n,extra,\n2|22||\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn rls_table_routes_correctly_via_exec_update() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO t (id, n) VALUES (1, 10)")
+            .await
+            .unwrap();
+        sess.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
+            .await
+            .unwrap();
+
+        // Unlike the read fast path (which DECLINES on rls_enabled and bypasses
+        // RLS), the bind-direct UPDATE routes through `exec_update`, which
+        // enforces RLS itself (USING + WITH CHECK). The contract is OUTCOME
+        // PARITY with the normal text route: whatever the RLS-evaluated UPDATE
+        // does on this table — succeed, no-op, or error on an unrepresentable
+        // policy predicate — the bind path must do identically. We run the bind
+        // path first, then the SAME statement via text, and assert the two
+        // outcomes match (both Ok with the same tag, or both the same Err).
+        let (handle, _s) = sess
+            .prepare("UPDATE t SET n = $2 WHERE id = $1")
+            .await
+            .unwrap();
+        let bound = sess
+            .bind(&handle, vec![ScalarParam::Int8(1), ScalarParam::Int8(77)])
+            .await
+            .unwrap();
+        let via_bind = sess.execute_bound(bound).await;
+        let via_text = sess.execute("UPDATE t SET n = 77 WHERE id = 1").await;
+        match (&via_bind, &via_text) {
+            (Ok(b), Ok(t)) => assert_eq!(tag_of(b), tag_of(t)),
+            (Err(b), Err(t)) => assert_eq!(
+                b.to_string(),
+                t.to_string(),
+                "RLS UPDATE error must be identical on both routes"
+            ),
+            (b, t) => panic!("RLS UPDATE diverged: bind={b:?} text={t:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inside_transaction_matches_text_route() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)")
+            .await
+            .unwrap();
+        sess.execute("INSERT INTO t (id, n) VALUES (1, 10), (2, 20)")
+            .await
+            .unwrap();
+        let (handle, _s) = sess
+            .prepare("UPDATE t SET n = $2 WHERE id = $1")
+            .await
+            .unwrap();
+
+        // Inside a tx the AST-fast UPDATE still dispatches through `exec_update`,
+        // which handles the in-tx overlay; a ROLLBACK must discard it.
+        sess.execute("BEGIN").await.unwrap();
+        let bound = sess
+            .bind(&handle, vec![ScalarParam::Int8(1), ScalarParam::Int8(111)])
+            .await
+            .unwrap();
+        assert_eq!(tag_of(&sess.execute_bound(bound).await.unwrap()), "UPDATE 1");
+        // Visible within the tx.
+        assert_eq!(
+            dump(&sess, "SELECT id, n FROM t WHERE id = 1").await,
+            "id,n,\n1|111|\n"
+        );
+        sess.execute("ROLLBACK").await.unwrap();
+        // Rolled back to the committed value.
+        assert_eq!(
+            dump(&sess, "SELECT id, n FROM t WHERE id = 1").await,
+            "id,n,\n1|10|\n"
+        );
+    }
+
+    // Sanctioned timing probe (perf probe, not a correctness gate; ignored by
+    // default like the point-SELECT probe). Asserts the bind-direct UPDATE is at
+    // most 0.5x the wall time of the same statement dispatched through the text
+    // route over 10k executes.
+    #[tokio::test]
+    #[ignore = "timing probe"]
+    async fn timing_probe_bind_direct_at_most_half_of_text() {
+        let dir = TempDir::new().unwrap();
+        let eng = make_engine(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, n BIGINT)")
+            .await
+            .unwrap();
+        for i in 0..1000_i64 {
+            sess.execute(&format!("INSERT INTO t (id, n) VALUES ({i}, {i})"))
+                .await
+                .unwrap();
+        }
+        let (handle, _s) = sess
+            .prepare("UPDATE t SET n = $2 WHERE id = $1")
+            .await
+            .unwrap();
+
+        const N: i64 = 10_000;
+        // Warm both paths once.
+        let bw = sess
+            .bind(&handle, vec![ScalarParam::Int8(0), ScalarParam::Int8(0)])
+            .await
+            .unwrap();
+        let _ = sess.execute_bound(bw).await.unwrap();
+        let _ = sess.execute("UPDATE t SET n = 0 WHERE id = 0").await.unwrap();
+
+        let t_text = std::time::Instant::now();
+        for i in 0..N {
+            let k = i % 1000;
+            let _ = sess
+                .execute(&format!("UPDATE t SET n = {i} WHERE id = {k}"))
+                .await
+                .unwrap();
+        }
+        let text = t_text.elapsed();
+
+        let t_bind = std::time::Instant::now();
+        for i in 0..N {
+            let k = i % 1000;
+            let bound = sess
+                .bind(&handle, vec![ScalarParam::Int8(k), ScalarParam::Int8(i)])
+                .await
+                .unwrap();
+            let _ = sess.execute_bound(bound).await.unwrap();
+        }
+        let bind = t_bind.elapsed();
+
+        eprintln!(
+            "update bind-direct: text={:?} ({:.3} us/op), bind={:?} ({:.3} us/op), ratio={:.3}",
+            text,
+            text.as_micros() as f64 / N as f64,
+            bind,
+            bind.as_micros() as f64 / N as f64,
+            bind.as_secs_f64() / text.as_secs_f64(),
+        );
+        assert!(
+            bind.as_secs_f64() <= 0.5 * text.as_secs_f64(),
+            "bind-direct UPDATE must be <= 0.5x the text route (bind={bind:?}, text={text:?})"
         );
     }
 }

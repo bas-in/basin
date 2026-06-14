@@ -5808,6 +5808,94 @@ mod tests {
         );
     }
 
+    /// Structural prewarm test (perf-w-pointops, BASIN_PREWARM_PROVIDERS): the
+    /// fire-and-forget footer/stats warm fires EXACTLY once per (session, table)
+    /// on the first cold meta miss while the flag is on, and never on a repeat
+    /// load or when the flag is off. We assert against the SESSION-LOCAL
+    /// `prewarmed_tables` set (which `maybe_prewarm_table` inserts into iff it
+    /// fires) rather than wall-clock — the perf claim (cold 3.4→~2.3ms) is not
+    /// gated here, only the structural cold-vs-warm fire discipline. The
+    /// session-local set is immune to the process-global env flag racing with
+    /// other parallel tests' meta loads.
+    ///
+    /// `maybe_prewarm_table` reads the env flag, calls `spawn`, and inserts the
+    /// table into the per-session set in one synchronous pass, so the set is
+    /// authoritative immediately after the awaited `execute` returns.
+    #[tokio::test]
+    async fn prewarm_fires_once_per_table_only_when_enabled() {
+        use std::sync::Arc;
+
+        use crate::{Engine, EngineConfig};
+        use basin_catalog::{Catalog, InMemoryCatalog};
+        use basin_common::ProjectId;
+        use basin_common::TableName;
+        use object_store::local::LocalFileSystem;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        let engine = Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        });
+        let table = TableName::new("off_t".to_string()).unwrap();
+        let warmed = |sess: &crate::ProjectSession| {
+            sess.state
+                .prewarmed_tables
+                .lock()
+                .unwrap()
+                .contains(&table)
+        };
+
+        // FLAG OFF (default): a cold load must NOT mark the table warmed.
+        std::env::remove_var("BASIN_PREWARM_PROVIDERS");
+        let sess_off = engine.open_session(ProjectId::new()).await.unwrap();
+        sess_off
+            .execute("CREATE TABLE off_t (id BIGINT PRIMARY KEY, n BIGINT)")
+            .await
+            .unwrap();
+        sess_off
+            .execute("INSERT INTO off_t (id, n) VALUES (1, 1)")
+            .await
+            .unwrap();
+        let sess_off2 = engine.open_session(sess_off.project).await.unwrap();
+        let _ = sess_off2.execute("SELECT id, n FROM off_t WHERE id = 1").await;
+        assert!(
+            !warmed(&sess_off2),
+            "flag OFF must not mark the table warmed"
+        );
+
+        // FLAG ON: a fresh session's FIRST cold meta miss marks the table
+        // warmed; the set holds exactly that one table.
+        std::env::set_var("BASIN_PREWARM_PROVIDERS", "1");
+        let sess_on = engine.open_session(sess_off.project).await.unwrap();
+        assert!(!warmed(&sess_on), "fresh session starts un-warmed");
+        let _ = sess_on.execute("SELECT id, n FROM off_t WHERE id = 1").await;
+        assert!(
+            warmed(&sess_on),
+            "flag ON: first cold meta miss must mark the table warmed"
+        );
+        let set_len_after_cold = sess_on.state.prewarmed_tables.lock().unwrap().len();
+        // Repeat load on the SAME session+table: the de-dup set is unchanged
+        // (no second fire).
+        let _ = sess_on.execute("SELECT id, n FROM off_t WHERE id = 1").await;
+        assert_eq!(
+            sess_on.state.prewarmed_tables.lock().unwrap().len(),
+            set_len_after_cold,
+            "flag ON: repeat load of an already-warmed table must not re-fire"
+        );
+
+        std::env::remove_var("BASIN_PREWARM_PROVIDERS");
+    }
+
     /// Timing micro-bench: measures the SessionContext construction + UDF
     /// registration phase in isolation (the primary target of the stateless-UDF-cache
     /// optimisation). Compares the BEFORE (200+ individual write-lock register_udf
