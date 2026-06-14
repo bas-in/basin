@@ -8,6 +8,25 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-14 — ALTER TABLE ADD COLUMN … DEFAULT v NOT NULL (ORM migrations)
+
+- **`ALTER TABLE ADD COLUMN … DEFAULT v NOT NULL` is now allowed.** The canonical
+  Django/Rails migration shape (`ADD COLUMN version INTEGER DEFAULT 0 NOT NULL`)
+  was rejected outright ("NOT NULL not supported"); since drivers wrap a
+  migration in one transaction, that rejection rolled back every other column
+  added in the same migration (e.g. an adjacent `ADD COLUMN tags VARCHAR[]`),
+  cascading to a large fraction of the live-ORM suite. NOT NULL is now admitted
+  WHEN a DEFAULT is present (the default supplies the value); a bare
+  `ADD COLUMN x T NOT NULL` with no default stays rejected. Source:
+  `crates/basin-engine/src/alter.rs`.
+- **String-literal defaults coerce to numeric column types.** Drivers stamp
+  integer/float defaults as quoted strings (`DEFAULT '0'`); the INSERT
+  default-application path now coerces a `SingleQuotedString` to the target
+  INTEGER / DOUBLE column (PostgreSQL's implicit cast — a non-numeric string
+  still errors). This also makes `INSERT … VALUES ('5')` into a numeric column
+  work, matching PG. Source: `crates/basin-engine/src/dml.rs` (`coerce_i64` /
+  `coerce_f64`). Covered by `schema_alter_add_column_not_null_with_default_allowed`.
+
 ## 2026-06-14 — system functions in FROM position (`SELECT * FROM current_schema()`)
 
 - **`SELECT * FROM current_schema()` / `current_database()` / `version()` resolve.**

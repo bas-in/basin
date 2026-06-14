@@ -972,19 +972,13 @@ async fn add_column(
         )));
     }
     let dt = arrow_data_type(&column_def.data_type)?;
-    // Default to nullable; a NOT NULL added column would force every
-    // existing row into a back-fill or rejection, which is out of scope
-    // for v0.1 schema evolution.
     let mut nullable = true;
+    let mut saw_not_null = false;
     let mut default_text: Option<String> = None;
     for opt in &column_def.options {
         match &opt.option {
             ColumnOption::NotNull => {
-                return Err(BasinError::InvalidSchema(
-                    "ALTER TABLE ADD COLUMN with NOT NULL is not supported in v0.1; \
-                     existing rows would have no value for the new column"
-                        .into(),
-                ));
+                saw_not_null = true;
             }
             ColumnOption::Null => nullable = true,
             // DEFAULT <expr>: store the expression text as column metadata so
@@ -1000,6 +994,27 @@ async fn add_column(
                     "unsupported column option in ADD COLUMN: {other}"
                 )));
             }
+        }
+    }
+    // `ADD COLUMN … NOT NULL` is admitted ONLY when a DEFAULT is also present —
+    // PostgreSQL's `ADD COLUMN x T DEFAULT v NOT NULL` is the canonical ORM
+    // migration shape (Django/Rails add not-null-with-default columns
+    // constantly). The default supplies the value: new rows are stamped by
+    // `apply_column_defaults`, and a freshly-added column on an empty/new table
+    // (the common migration case) has no pre-existing rows to violate the
+    // constraint. A bare `ADD COLUMN x T NOT NULL` (no default) is still
+    // rejected — existing rows genuinely have no value. (v0.1 limitation: rows
+    // in data files written before this ALTER read NULL via the scan-time pad
+    // rather than the default; eager back-fill is future work.)
+    if saw_not_null {
+        if default_text.is_some() {
+            nullable = false;
+        } else {
+            return Err(BasinError::InvalidSchema(
+                "ALTER TABLE ADD COLUMN with NOT NULL requires a DEFAULT in v0.1; \
+                 without one, existing rows would have no value for the new column"
+                    .into(),
+            ));
         }
     }
     // Carry BASIN_TYPE metadata so that the INSERT coercion path, pgwire

@@ -2376,6 +2376,23 @@ fn coerce_i64(expr: &Expr) -> Result<Option<i64>> {
                 value: Value::Null, ..
             }),
         ) => Ok(None),
+        // PostgreSQL implicitly coerces a string literal to the integer column
+        // type — `INSERT … VALUES ('5')` and, the common ORM case, an
+        // `ADD COLUMN x INTEGER DEFAULT '0' NOT NULL` whose default is stamped
+        // as the quoted string `'0'`. Parse it; a non-numeric string still
+        // errors (matching PG's "invalid input syntax for integer").
+        (
+            negated,
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(s),
+                ..
+            }),
+        ) => {
+            let parsed: i64 = s.trim().parse().map_err(|e| {
+                BasinError::InvalidSchema(format!("invalid input syntax for integer: {s:?}: {e}"))
+            })?;
+            Ok(Some(if negated { -parsed } else { parsed }))
+        }
         (_, other) => Err(BasinError::InvalidSchema(format!(
             "expected integer literal, got {other}"
         ))),
@@ -2402,6 +2419,22 @@ fn coerce_f64(expr: &Expr) -> Result<Option<f64>> {
                 value: Value::Null, ..
             }),
         ) => Ok(None),
+        // PG coerces a string literal to the float column type (e.g. a
+        // `DEFAULT '0'` / `DEFAULT '1.5'` stamped as a quoted string).
+        (
+            negated,
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(s),
+                ..
+            }),
+        ) => {
+            let parsed: f64 = s.trim().parse().map_err(|e| {
+                BasinError::InvalidSchema(format!(
+                    "invalid input syntax for double precision: {s:?}: {e}"
+                ))
+            })?;
+            Ok(Some(if negated { -parsed } else { parsed }))
+        }
         (_, other) => Err(BasinError::InvalidSchema(format!(
             "expected float literal, got {other}"
         ))),

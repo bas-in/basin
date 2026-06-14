@@ -428,6 +428,53 @@ async fn schema_alter_add_column_not_null_rejected_in_v01() {
     println!("[schema] ADD COLUMN NOT NULL rejected: {msg}");
 }
 
+/// `ALTER TABLE ADD COLUMN … DEFAULT v NOT NULL` IS allowed (the DEFAULT
+/// supplies the value) — the canonical Django/Rails migration shape the
+/// live-ORM suite exercises (`ADD COLUMN version INTEGER DEFAULT 0 NOT NULL`).
+/// Also pins that an array-typed ADD COLUMN (Django ArrayField → `VARCHAR[]`)
+/// is accepted. A bare NOT NULL without a default stays rejected (the test
+/// above).
+#[tokio::test]
+async fn schema_alter_add_column_not_null_with_default_allowed() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let eng = make_engine(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    // NOT NULL WITH a DEFAULT — admitted (default supplies the value).
+    sess.execute("ALTER TABLE t ADD COLUMN version INTEGER DEFAULT '0' NOT NULL")
+        .await
+        .expect("ADD COLUMN NOT NULL with a DEFAULT must be allowed");
+
+    // Array column (Django ArrayField), nullable.
+    sess.execute("ALTER TABLE t ADD COLUMN tags VARCHAR[]")
+        .await
+        .expect("ADD COLUMN with an array type must be allowed");
+
+    // The evolved schema is usable: an INSERT that omits `version` gets the
+    // default stamped, and `tags` is nullable.
+    sess.execute("INSERT INTO t (id) VALUES (1)")
+        .await
+        .expect("INSERT into the evolved schema must succeed");
+
+    // Both new columns exist and are queryable on the evolved schema.
+    let res = sess
+        .execute("SELECT version, tags FROM t WHERE id = 1")
+        .await
+        .expect("SELECT of the ADD COLUMN-evolved schema must succeed");
+    match res {
+        ExecResult::Rows { batches, .. } => {
+            let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(n, 1, "the inserted row must be returned with the new columns");
+        }
+        other => panic!("expected rows from SELECT, got {other:?}"),
+    }
+}
+
 /// Multi-column PRIMARY KEY enforcement: both columns together are unique.
 /// A row that duplicates the composite PK must be rejected.
 #[tokio::test]
