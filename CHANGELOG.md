@@ -36,6 +36,19 @@ graduate to 1.0 and the standard SemVer guarantees.
   `crates/basin-engine/src/dml.rs` (`coerce_string_ref`); covered by
   `type_ddl::enum_insert_with_cast_label`.
 
+## 2026-06-14 — array columns render in the PostgreSQL `{…}` text form on the wire
+
+- **Reading an array column returns PG array text `{a,b}` / `{}`.** A `List` /
+  `LargeList` / `FixedSizeList` result column previously fell through to a Debug
+  rendering, so array-aware clients (psycopg, lib-pq, node-postgres) failed to
+  parse it ("array does not start with '{'"). Array cells now render as the
+  PostgreSQL curly-brace text form: NULL elements as the `NULL` token, text
+  elements double-quoted + escaped when ambiguous (empty / looks-like-`NULL` /
+  contains a delimiter/brace/quote/backslash/whitespace), numerics bare, booleans
+  as `t`/`f`. Completes the array round-trip with the INSERT-side parsing.
+  Source: `crates/basin-router/src/types.rs` (`render_cell` / `format_pg_array_text`);
+  covered by `types::tests::pg_array_text_formatting`.
+
 ## 2026-06-14 — INSERT array values in the PostgreSQL curly-brace text form
 
 - **`'{a,b}'::T[]` / `'{}'::T[]` array literals INSERT into array columns.**

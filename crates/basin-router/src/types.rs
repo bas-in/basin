@@ -1202,9 +1202,104 @@ fn render_cell(col: &dyn Array, idx: usize) -> String {
                 .expect("Decimal128Array for NUMERIC column");
             arr.value_as_string(idx)
         }
+        // Array columns: emit the PostgreSQL curly-brace array text form
+        // `{a,b}` / `{}` so clients (psycopg / lib-pq / node-postgres array
+        // parsers, which require a leading `{`) decode the column. Without this
+        // a List column hit the Debug fallback below and failed with
+        // "array does not start with '{'".
+        DataType::List(_) => {
+            let list = col
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("ListArray for List column");
+            format_pg_array_text(list.value(idx).as_ref())
+        }
+        DataType::LargeList(_) => {
+            let list = col
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .expect("LargeListArray for LargeList column");
+            format_pg_array_text(list.value(idx).as_ref())
+        }
+        DataType::FixedSizeList(_, _) => {
+            let list = col
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("FixedSizeListArray for FixedSizeList column");
+            format_pg_array_text(list.value(idx).as_ref())
+        }
         // Fallback: best-effort Debug rendering.
         other => format!("{other:?}@{idx}"),
     }
+}
+
+/// Format one array row's elements as the PostgreSQL array text form
+/// `{e1,e2,…}`. NULL elements render as the unquoted token `NULL`; text
+/// elements are double-quoted (with `\"`,`\\` escapes) when they would
+/// otherwise be ambiguous (empty, look like `NULL`, or contain a delimiter /
+/// brace / quote / backslash / whitespace); numerics render bare; booleans as
+/// `t`/`f` (PG's array bool form).
+fn format_pg_array_text(elems: &dyn Array) -> String {
+    let mut s = String::with_capacity(2 + elems.len() * 4);
+    s.push('{');
+    for i in 0..elems.len() {
+        if i > 0 {
+            s.push(',');
+        }
+        if elems.is_null(i) {
+            s.push_str("NULL");
+            continue;
+        }
+        match elems.data_type() {
+            DataType::Utf8 => push_quoted_array_elem(&mut s, elems.as_string::<i32>().value(i)),
+            DataType::LargeUtf8 => {
+                push_quoted_array_elem(&mut s, elems.as_string::<i64>().value(i))
+            }
+            DataType::Boolean => s.push(if elems.as_boolean().value(i) { 't' } else { 'f' }),
+            DataType::Int64 => {
+                let _ = write!(s, "{}", elems.as_primitive::<Int64Type>().value(i));
+            }
+            DataType::Int32 => {
+                let _ = write!(s, "{}", elems.as_primitive::<Int32Type>().value(i));
+            }
+            DataType::Int16 => {
+                let _ = write!(s, "{}", elems.as_primitive::<Int16Type>().value(i));
+            }
+            DataType::Float64 => {
+                let _ = write!(s, "{}", elems.as_primitive::<Float64Type>().value(i));
+            }
+            DataType::Float32 => {
+                let _ = write!(s, "{}", elems.as_primitive::<Float32Type>().value(i));
+            }
+            // Nested arrays / other element types: best-effort element render.
+            _ => {
+                let inner = render_cell(elems, i);
+                push_quoted_array_elem(&mut s, &inner);
+            }
+        }
+    }
+    s.push('}');
+    s
+}
+
+/// Append one text array element, double-quoting + escaping when PG would.
+fn push_quoted_array_elem(s: &mut String, v: &str) {
+    let needs_quote = v.is_empty()
+        || v.eq_ignore_ascii_case("null")
+        || v.chars()
+            .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_whitespace());
+    if !needs_quote {
+        s.push_str(v);
+        return;
+    }
+    s.push('"');
+    for c in v.chars() {
+        if c == '"' || c == '\\' {
+            s.push('\\');
+        }
+        s.push(c);
+    }
+    s.push('"');
 }
 
 fn render_bytea(bytes: &[u8]) -> String {
@@ -1299,6 +1394,33 @@ mod tests {
     use super::*;
     use arrow_array::{BooleanArray, Int64Array, StringArray};
     use arrow_schema::{Field, Schema as ArrowSchema};
+
+    #[test]
+    fn pg_array_text_formatting() {
+        // Text elements: bare when safe, double-quoted + escaped when ambiguous.
+        let s = StringArray::from(vec![Some("a"), Some("b")]);
+        assert_eq!(format_pg_array_text(&s), "{a,b}");
+
+        let empty = StringArray::from(Vec::<Option<&str>>::new());
+        assert_eq!(format_pg_array_text(&empty), "{}");
+
+        // embedded comma → quote; NULL element; empty string → quote; the
+        // literal "NULL" → quote; quote/backslash → escaped.
+        let q = StringArray::from(vec![
+            Some("x,y"),
+            None,
+            Some(""),
+            Some("NULL"),
+            Some("a\"b"),
+        ]);
+        assert_eq!(format_pg_array_text(&q), r#"{"x,y",NULL,"","NULL","a\"b"}"#);
+
+        // Numerics bare; booleans as t/f.
+        let i = Int64Array::from(vec![1, 2, 3]);
+        assert_eq!(format_pg_array_text(&i), "{1,2,3}");
+        let b = BooleanArray::from(vec![true, false]);
+        assert_eq!(format_pg_array_text(&b), "{t,f}");
+    }
 
     #[test]
     fn maps_basic_types() {
