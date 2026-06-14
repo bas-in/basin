@@ -594,8 +594,28 @@ func TestQueryBuilderURLConstruction(t *testing.T) {
 		},
 		{
 			name:    "in filter",
-			build:   func(q *QueryBuilder) *QueryBuilder { return q.In("status", []string{"open", "closed"}) },
+			build:   func(q *QueryBuilder) *QueryBuilder { return q.In("status", []any{"open", "closed"}) },
 			wantURL: "/rest/v1/orders?status=in.%28open%2Cclosed%29",
+		},
+		{
+			name:    "eq int value",
+			build:   func(q *QueryBuilder) *QueryBuilder { return q.Eq("age", 30) },
+			wantURL: "/rest/v1/orders?age=eq.30",
+		},
+		{
+			name:    "gt int64 value",
+			build:   func(q *QueryBuilder) *QueryBuilder { return q.Gt("total", int64(100)) },
+			wantURL: "/rest/v1/orders?total=gt.100",
+		},
+		{
+			name:    "eq bool value",
+			build:   func(q *QueryBuilder) *QueryBuilder { return q.Eq("active", true) },
+			wantURL: "/rest/v1/orders?active=eq.true",
+		},
+		{
+			name:    "in mixed typed values",
+			build:   func(q *QueryBuilder) *QueryBuilder { return q.In("id", []any{1, 2, 3}) },
+			wantURL: "/rest/v1/orders?id=in.%281%2C2%2C3%29",
 		},
 		{
 			name:    "is null",

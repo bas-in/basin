@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -50,6 +51,56 @@ func (q *QueryBuilder) push(key, val string) *QueryBuilder {
 	return out
 }
 
+// formatValue converts a typed filter value to the string literal expected by
+// Basin's PostgREST-style parser. Rules:
+//
+//   - string → verbatim (no quoting; the server parser handles the op.<value> split)
+//   - bool   → "true" / "false"
+//   - integer types (int, int8…int64, uint…uint64) → decimal
+//   - float32/float64 → shortest decimal representation
+//   - nil    → "null"  (use with Is for IS NULL checks)
+//   - anything else → fmt.Sprint(v)
+func formatValue(v any) string {
+	if v == nil {
+		return "null"
+	}
+	switch t := v.(type) {
+	case string:
+		return t
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	case int:
+		return strconv.FormatInt(int64(t), 10)
+	case int8:
+		return strconv.FormatInt(int64(t), 10)
+	case int16:
+		return strconv.FormatInt(int64(t), 10)
+	case int32:
+		return strconv.FormatInt(int64(t), 10)
+	case int64:
+		return strconv.FormatInt(t, 10)
+	case uint:
+		return strconv.FormatUint(uint64(t), 10)
+	case uint8:
+		return strconv.FormatUint(uint64(t), 10)
+	case uint16:
+		return strconv.FormatUint(uint64(t), 10)
+	case uint32:
+		return strconv.FormatUint(uint64(t), 10)
+	case uint64:
+		return strconv.FormatUint(t, 10)
+	case float32:
+		return strconv.FormatFloat(float64(t), 'f', -1, 32)
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
 // Select sets the columns projection. Accepts a CSV string or a slice.
 // Omitting columns or passing "*" selects all columns.
 func (q *QueryBuilder) Select(columns ...string) *QueryBuilder {
@@ -63,41 +114,53 @@ func (q *QueryBuilder) Select(columns ...string) *QueryBuilder {
 }
 
 // Eq adds an equality filter: column=eq.value.
-func (q *QueryBuilder) Eq(column, value string) *QueryBuilder {
-	return q.push(column, "eq."+value)
+// value may be any scalar type: string, int, int64, float64, bool, or nil.
+func (q *QueryBuilder) Eq(column string, value any) *QueryBuilder {
+	return q.push(column, "eq."+formatValue(value))
 }
 
 // Neq adds a not-equal filter: column=neq.value.
-func (q *QueryBuilder) Neq(column, value string) *QueryBuilder {
-	return q.push(column, "neq."+value)
+// value may be any scalar type: string, int, int64, float64, bool, or nil.
+func (q *QueryBuilder) Neq(column string, value any) *QueryBuilder {
+	return q.push(column, "neq."+formatValue(value))
 }
 
 // Gt adds a greater-than filter: column=gt.value.
-func (q *QueryBuilder) Gt(column, value string) *QueryBuilder {
-	return q.push(column, "gt."+value)
+// value may be any scalar type: string, int, int64, float64, bool, or nil.
+func (q *QueryBuilder) Gt(column string, value any) *QueryBuilder {
+	return q.push(column, "gt."+formatValue(value))
 }
 
 // Gte adds a greater-than-or-equal filter: column=gte.value.
-func (q *QueryBuilder) Gte(column, value string) *QueryBuilder {
-	return q.push(column, "gte."+value)
+// value may be any scalar type: string, int, int64, float64, bool, or nil.
+func (q *QueryBuilder) Gte(column string, value any) *QueryBuilder {
+	return q.push(column, "gte."+formatValue(value))
 }
 
 // Lt adds a less-than filter: column=lt.value.
-func (q *QueryBuilder) Lt(column, value string) *QueryBuilder {
-	return q.push(column, "lt."+value)
+// value may be any scalar type: string, int, int64, float64, bool, or nil.
+func (q *QueryBuilder) Lt(column string, value any) *QueryBuilder {
+	return q.push(column, "lt."+formatValue(value))
 }
 
 // Lte adds a less-than-or-equal filter: column=lte.value.
-func (q *QueryBuilder) Lte(column, value string) *QueryBuilder {
-	return q.push(column, "lte."+value)
+// value may be any scalar type: string, int, int64, float64, bool, or nil.
+func (q *QueryBuilder) Lte(column string, value any) *QueryBuilder {
+	return q.push(column, "lte."+formatValue(value))
 }
 
 // In adds an IN filter: column=in.(a,b,c).
-func (q *QueryBuilder) In(column string, values []string) *QueryBuilder {
-	return q.push(column, "in.("+strings.Join(values, ",")+")")
+// Each element may be any scalar type: string, int, int64, float64, bool, or nil.
+func (q *QueryBuilder) In(column string, values []any) *QueryBuilder {
+	parts := make([]string, len(values))
+	for i, v := range values {
+		parts[i] = formatValue(v)
+	}
+	return q.push(column, "in.("+strings.Join(parts, ",")+")")
 }
 
 // Is adds an IS filter for null/notnull: column=is.null or column=is.notnull.
+// value must be the literal string "null" or "notnull".
 func (q *QueryBuilder) Is(column, value string) *QueryBuilder {
 	return q.push(column, "is."+value)
 }
