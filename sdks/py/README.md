@@ -5,8 +5,13 @@ The Python SDK for [basin](../basin) — a basin-native, async-first client on
 following Python idiom (an optional sync facade, `async for` iterators,
 `pyiceberg` interop).
 
-> **Status: pre-v0.1 — scaffolding.** No code is published yet. The plan lives
-> in [`ROADMAP.md`](./ROADMAP.md); the agent-sized work items in
+> **Status: v0.1 in development — core surface implemented, not yet
+> published.** The query builder (filters, NDJSON streaming, cursor
+> pagination), auth (password / magic-link / OAuth / MFA), admin, storage,
+> functions, realtime (SSE + WebSocket + presence), retry with backoff, the
+> sync facade, and OpenAPI-driven type codegen are all in place with a green
+> `pytest` / `mypy --strict` / `ruff` suite. The plan lives in
+> [`ROADMAP.md`](./ROADMAP.md); per-task status is tracked in
 > [`TASKS.md`](./TASKS.md). The public surface is settled in `basin-js`;
 > basin-py ports it without drifting on method names or route shapes.
 
@@ -31,6 +36,13 @@ await client.functions.invoke("monthly_rollup", {"month": "2026-05"})
 
 A `SyncClient` facade covers the same surface for scripts, notebooks, and
 sync frameworks.
+
+Generate typed row models from a running engine's OpenAPI document:
+
+```sh
+python -m basin.codegen --url https://<project>.basin.run --key <anon-key> --out database.py
+# or: basin-gen-types --url … --key … --out database.py [--pydantic]
+```
 
 ## Install (once published)
 

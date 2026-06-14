@@ -197,7 +197,10 @@ rendering exactly.
 
 ## Phase 0.2 — basin-distinctive surface
 
-### T-010 — NDJSON auto-detection on execute (bug, highest priority) [ ]
+### T-010 — NDJSON auto-detection on execute (bug, highest priority) [x]
+
+*Done — execute branches on `application/x-ndjson`/`application/jsonl` content
+type, peels the `_basin_next_cursor` sentinel, and exposes `next_cursor`.*
 
 **Files:** `src/basin/postgrest/builder.py`, `tests/test_builder.py`
 
@@ -223,7 +226,9 @@ JSON-only parser breaks on large queries.
 
 ---
 
-### T-011 — `.cursor(token)` modifier [ ]
+### T-011 — `.cursor(token)` modifier [x]
+
+*Done — `.cursor(token)` sets `?cursor=<token>`.*
 
 **Files:** `src/basin/postgrest/builder.py`, `tests/test_builder.py`
 
@@ -237,7 +242,10 @@ all params.
 
 ---
 
-### T-012 — `.paginate()` async iterator [ ]
+### T-012 — `.paginate()` async iterator [x]
+
+*Done — async `paginate()` walks `next_cursor`; sync facade now mirrors it
+lazily (see T-041).*
 
 **Files:** `src/basin/postgrest/builder.py`, `tests/test_builder.py`
 
@@ -256,7 +264,10 @@ shape as `await`.
 
 ---
 
-### T-013 — `.stream()` async iterator (NDJSON line-by-line) [ ]
+### T-013 — `.stream()` async iterator (NDJSON line-by-line) [x]
+
+*Done — async `stream()` yields rows via `aiter_lines()`; sync `stream()` added
+in T-041.*
 
 **Files:** `src/basin/postgrest/builder.py`, `tests/test_builder.py`
 
@@ -274,10 +285,13 @@ yields 3 rows then completes; mid-stream error → iterator raises
 
 ---
 
-### T-014 — OpenAPI fetch helper [ ]
+### T-014 — OpenAPI fetch helper [x]
+
+*Done — `basin.openapi.fetch_openapi(url, key)` GETs `/rest/v1/_openapi.json`
+with typed errors; re-exported as `basin.fetch_openapi`.*
 
 **Files:** `src/basin/openapi/__init__.py`, `src/basin/openapi/fetch.py`,
-`tests/test_openapi.py`
+`src/basin/openapi/types.py`, `tests/test_openapi.py`
 
 **Scope:** `async def fetch_openapi(url, anon_key, *, client=None) -> dict`
 fetching `GET {url}/rest/v1/_openapi.json` with the anon-key header; typed
@@ -292,7 +306,11 @@ error.
 
 ---
 
-### T-015 — `database.py` codegen from OpenAPI [ ]
+### T-015 — `database.py` codegen from OpenAPI [x]
+
+*Done — `openapi_to_types(doc, *, pydantic=False)` emits Row/Insert/Update
+TypedDicts (or pydantic v2 models) + a `Database` aggregate, ruff-formatted;
+runnable as `python -m basin.codegen` and the `basin-gen-types` console script.*
 
 **Files:** `src/basin/codegen/__init__.py`, `src/basin/codegen/__main__.py`,
 `src/basin/codegen/emit.py`, `tests/test_codegen.py`
@@ -340,25 +358,26 @@ variants); generated file imports + type-checks under mypy.
 
 ## Phase 0.3 — Server-route follow-on (engine routes shipped)
 
-### T-020 — `from_(t).delete()` live (engine DELETE shipped) [ ]
+### T-020 — `from_(t).delete()` live (engine DELETE shipped) [x]
 **Files:** `src/basin/postgrest/builder.py`, `tests/test_builder.py`. Confirm
 the engine `DELETE` path returns representation; remove any 501 guard. (Pairs
-basin-js T-027.)
+basin-js T-027.) *Done — `delete()` issues DELETE with no 501 guard.*
 
 ### T-021 — `client.functions.invoke()` → `POST /rest/v1/rpc/:fn` [x]
 **Files:** `src/basin/functions/client.py`, `__init__.py`, tests; wire
 `Client.functions`. Body = JSON object of named args; response = function
 result. (basin-js T-026.)
 
-### T-022 — `sign_in_with_oauth` → `GET /auth/v1/authorize` [ ]
+### T-022 — `sign_in_with_oauth` → `GET /auth/v1/authorize` [x]
 **Files:** `src/basin/auth/client.py`, tests. Returns the authorize URL (+
 opens/returns for the caller); `GET /auth/v1/callback` completion helper.
-(basin-js T-020.)
+(basin-js T-020.) *Done — `sign_in_with_oauth` implemented in `auth/client.py`.*
 
-### T-023 — `client.auth.mfa.*` (factors enroll/verify/challenge/unenroll) [ ]
-**Files:** `src/basin/auth/mfa.py`, tests. Routes `POST /auth/v1/factors`,
+### T-023 — `client.auth.mfa.*` (factors enroll/verify/challenge/unenroll) [x]
+**Files:** `src/basin/auth/client.py`, tests. Routes `POST /auth/v1/factors`,
 `/factors/:id/verify`, `/factors/:id/challenge`, `/factors/:id/challenge/
-verify`, `DELETE /factors/:id`. TOTP + WebAuthn. (basin-js T-021.)
+verify`, `DELETE /factors/:id`. TOTP + WebAuthn. (basin-js T-021.) *Done —
+`mfa_enroll/list/verify/challenge/challenge_verify/unenroll` on `AuthClient`.*
 
 ### T-024 — Storage: `upload` / `download` / `delete` [x]
 **Files:** `src/basin/storage/client.py`, `__init__.py`, tests; wire
@@ -399,15 +418,19 @@ read-only → SSE; presence/multi-table/dynamic-filter → WS). (basin-js T-030.
 
 ## Phase 0.4 — DX polish
 
-### T-040 — Retry + exponential backoff [ ]
+### T-040 — Retry + exponential backoff [x]
 **Files:** `src/basin/_retry.py`, `tests/test_retry.py`; integrate in
 `_http.py`. Retry network/5xx/429 (honour `Retry-After`); sensible defaults;
-per-call opt-out. (basin-js T-040.)
+per-call opt-out. (basin-js T-040.) *Done — `RetryConfig` + retry loop in
+`HttpTransport`; idempotent-only by default (`retry_writes` opt-in);
+`Retry-After` honoured for 429; configurable via `ClientOptions.retry`.*
 
-### T-041 — Sync facade completeness (`paginate`/`stream`/`channel`) [ ]
+### T-041 — Sync facade completeness (`paginate`/`stream`/`channel`) [x]
 **Files:** `src/basin/sync_client.py`, tests. Sync generators for
 `paginate`/`stream`; `channel()` over a background thread. The Python
-headline feature. (Extends T-007.)
+headline feature. (Extends T-007.) *Done — lazy `paginate()`/`stream()` via a
+background-loop queue bridge; `SyncClient.channel()` runs the async channel on
+a dedicated loop thread.*
 
 ### T-042 — `Prefer` header pass-through audit [ ]
 **Files:** `src/basin/postgrest/builder.py`, tests. Verify callers can set
