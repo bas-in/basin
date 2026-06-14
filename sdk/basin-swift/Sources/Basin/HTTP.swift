@@ -165,6 +165,48 @@ actor HTTPTransport {
                           body: body, headers: headers, auth: auth)
     }
 
+    /// Execute returning an `AsyncBytes` stream for incremental line reading (NDJSON).
+    ///
+    /// Validates the status code eagerly (reads the first bytes to detect an error
+    /// envelope), then hands off the byte stream to the caller for line iteration.
+    /// Available on macOS 12+ / iOS 15+ (URLSession.bytes).
+    func requestBytes(
+        _ method: String,
+        path: String,
+        query: [(String, String)]? = nil,
+        headers: [String: String] = [:],
+        auth: Bool = true
+    ) async throws -> (URLSession.AsyncBytes, HTTPURLResponse) {
+        let url = buildURL(base: baseURL, path: path, query: query)
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        if auth, let tok = await bearer() {
+            req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
+        }
+        for (k, v) in headers {
+            req.setValue(v, forHTTPHeaderField: k)
+        }
+        do {
+            let (bytes, response) = try await session.bytes(for: req)
+            guard let http = response as? HTTPURLResponse else {
+                throw BasinNetworkError(URLError(.badServerResponse))
+            }
+            if !(200..<300).contains(http.statusCode) {
+                // Materialize the body so we can decode the error envelope.
+                var buf = Data()
+                for try await byte in bytes { buf.append(byte) }
+                throw BasinApiError.fromResponseBody(buf, status: http.statusCode)
+            }
+            return (bytes, http)
+        } catch let e as BasinApiError {
+            throw e
+        } catch let e as BasinNetworkError {
+            throw e
+        } catch {
+            throw BasinNetworkError(error)
+        }
+    }
+
     /// POST/PATCH/DELETE with JSON body, ignore response body (204 or { ok, tag }).
     @discardableResult
     func requestJSONVoid<Body: Encodable>(

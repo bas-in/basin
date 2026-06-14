@@ -12,6 +12,8 @@
 /// Response shapes (routes/data.rs):
 /// - plain GET → JSON array of rows
 /// - GET with limit or cursor → { rows, next_cursor }
+/// - GET with ?stream=true → NDJSON, one row per line;
+///   final line `{"_basin_next_cursor":"…"}` carries the pagination cursor
 /// - POST → 201, { ok, tag }; PATCH/DELETE → { ok, tag }
 ///
 /// Generic `T` must be Decodable (or use [String: AnyCodable] for schemaless).
@@ -50,6 +52,24 @@ public extension QueryScalar {
 private struct PageEnvelope<T: Decodable>: Decodable {
     let rows: [T]
     let next_cursor: String?
+}
+
+// MARK: - NDJSON streaming helpers
+
+/// Sentinel line the server appends as the last NDJSON line when paginating.
+/// Wire field: `{"_basin_next_cursor": "..."}`.
+private struct CursorSentinel: Decodable {
+    let cursor: String
+    enum CodingKeys: String, CodingKey {
+        case cursor = "_basin_next_cursor"
+    }
+}
+
+/// Actor-isolated box that receives the pagination cursor captured during
+/// NDJSON streaming.  `StreamPage` holds a reference to this box.
+actor CursorBox {
+    private(set) var value: String?
+    func set(_ cursor: String?) { value = cursor }
 }
 
 // MARK: - QueryBuilder
@@ -154,6 +174,101 @@ public final class QueryBuilder: @unchecked Sendable {
     public func page<T: Decodable>() async throws -> QueryPage<T> {
         let (data, _) = try await transport.requestRaw("GET", path: "/rest/v1/\(table)", query: params)
         return try normalizeGetPage(data)
+    }
+
+    // MARK: - NDJSON streaming (?stream=true)
+
+    /// Execute as a streaming GET (`?stream=true`), decoding each newline-delimited
+    /// JSON row as it arrives.  Rows are yielded one-by-one via `AsyncThrowingStream`
+    /// without buffering the full response in memory.
+    ///
+    /// The server's trailing `{"_basin_next_cursor":"…"}` line is NOT yielded;
+    /// it is captured and returned as the stream's termination value.
+    /// Use `streamPage()` to also retrieve that cursor.
+    ///
+    /// Route: `GET /rest/v1/:table?stream=true&…`
+    /// Server source: `crates/basin-rest/src/routes/data.rs` NDJSON branch.
+    ///
+    /// ```swift
+    /// for try await row in client.table("events").eq("type", .string("click")).stream() as AsyncThrowingStream<Event, Error> {
+    ///     process(row)
+    /// }
+    /// ```
+    public func stream<T: Decodable>(_ type: T.Type = T.self) -> AsyncThrowingStream<T, Error> {
+        let streamParams = params + [("stream", "true")]
+        let transport = self.transport
+        let table = self.table
+        return AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    let (bytes, _) = try await transport.requestBytes(
+                        "GET",
+                        path: "/rest/v1/\(table)",
+                        query: streamParams
+                    )
+                    for try await line in bytes.lines {
+                        let trimmed = line.trimmingCharacters(in: .whitespaces)
+                        guard !trimmed.isEmpty else { continue }
+                        guard let lineData = trimmed.data(using: .utf8) else { continue }
+                        // Skip the trailing cursor sentinel line — don't yield it.
+                        if trimmed.hasPrefix("{\"_basin_next_cursor\"") { continue }
+                        let row = try JSONDecoder().decode(T.self, from: lineData)
+                        continuation.yield(row)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Like `stream()`, but also captures the trailing pagination cursor emitted
+    /// by the server as the final NDJSON line.
+    ///
+    /// Returns a `StreamPage<T>`: an `AsyncThrowingStream<T, Error>` of row values
+    /// plus a `nextCursor` property that is populated once the stream is exhausted.
+    ///
+    /// ```swift
+    /// let page = client.table("events").limit(500).streamPage() as StreamPage<Event>
+    /// for try await row in page.rows { process(row) }
+    /// let cursor = await page.nextCursor  // available after the loop
+    /// ```
+    public func streamPage<T: Decodable>(_ type: T.Type = T.self) -> StreamPage<T> {
+        let streamParams = params + [("stream", "true")]
+        let transport = self.transport
+        let table = self.table
+        let cursorBox = CursorBox()
+        let rows = AsyncThrowingStream<T, Error> { continuation in
+            Task {
+                do {
+                    let (bytes, _) = try await transport.requestBytes(
+                        "GET",
+                        path: "/rest/v1/\(table)",
+                        query: streamParams
+                    )
+                    for try await line in bytes.lines {
+                        let trimmed = line.trimmingCharacters(in: .whitespaces)
+                        guard !trimmed.isEmpty else { continue }
+                        guard let lineData = trimmed.data(using: .utf8) else { continue }
+                        // Intercept the trailing cursor sentinel.
+                        if trimmed.hasPrefix("{\"_basin_next_cursor\"") {
+                            if let sentinel = try? JSONDecoder().decode(
+                                CursorSentinel.self, from: lineData) {
+                                await cursorBox.set(sentinel.cursor)
+                            }
+                            continue
+                        }
+                        let row = try JSONDecoder().decode(T.self, from: lineData)
+                        continuation.yield(row)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+        return StreamPage(rows: rows, cursorBox: cursorBox)
     }
 
     /// POST /rest/v1/:table — insert one object or an array.

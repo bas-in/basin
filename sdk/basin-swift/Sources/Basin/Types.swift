@@ -206,6 +206,33 @@ public struct QueryPage<T: Decodable & Sendable>: Sendable {
     public let nextCursor: String?
 }
 
+/// Result of `QueryBuilder.streamPage()`: an `AsyncThrowingStream` of decoded rows
+/// plus the pagination cursor captured from the server's trailing NDJSON sentinel line.
+///
+/// The `nextCursor` actor property is populated once the stream is fully consumed.
+///
+/// ```swift
+/// let page = client.table("events").limit(500).streamPage() as StreamPage<Event>
+/// for try await row in page.rows { process(row) }
+/// let cursor = await page.nextCursor  // safe after the for-loop exits
+/// ```
+public struct StreamPage<T: Decodable & Sendable>: Sendable {
+    /// The row stream — consume with `for try await row in page.rows { … }`.
+    public let rows: AsyncThrowingStream<T, Error>
+    private let cursorBox: CursorBox
+
+    init(rows: AsyncThrowingStream<T, Error>, cursorBox: CursorBox) {
+        self.rows = rows
+        self.cursorBox = cursorBox
+    }
+
+    /// Pagination cursor emitted by the server as the final NDJSON line.
+    /// `nil` when there are no further pages or the stream is not yet exhausted.
+    public var nextCursor: String? {
+        get async { await cursorBox.value }
+    }
+}
+
 // MARK: - Storage
 
 /// Object bucket metadata.

@@ -60,6 +60,16 @@ let nextPage: QueryPage<Order> = try await client.table("orders")
     .limit(100)
     .page()
 
+// NDJSON streaming — rows arrive incrementally, no full-buffer in memory
+for try await order in client.table("orders").stream() as AsyncThrowingStream<Order, Error> {
+    process(order)
+}
+
+// Streaming with pagination cursor
+let streamResult = client.table("orders").limit(1000).streamPage() as StreamPage<Order>
+for try await order in streamResult.rows { process(order) }
+let nextCursor = await streamResult.nextCursor  // available after loop
+
 // Writes
 struct NewOrder: Encodable { let total: Int; let status: String }
 _ = try await client.table("orders").insert(NewOrder(total: 12, status: "new"))
@@ -71,6 +81,42 @@ let result = try await client.rpc("add", args: ["a": 40, "b": 2])
 let fnResult = try await client.functions.invoke("resize",
                                                   body: #"{"width":100}"#.data(using: .utf8))
 ```
+
+## NDJSON streaming
+
+`stream()` and `streamPage()` send `?stream=true` to the server and iterate
+rows line-by-line via `URLSession.bytes`, avoiding buffering the full result
+set in memory.  Useful for large exports or long-running queries.
+
+Route: `GET /rest/v1/:table?stream=true&…`
+Response: newline-delimited JSON rows; optional trailing
+`{"_basin_next_cursor":"…"}` line when paginating.
+
+```swift
+struct Event: Decodable { let id: Int; let type: String; let ts: String }
+
+// Simple streaming — rows only, cursor is discarded
+for try await event in client.table("events")
+    .eq("type", .string("click"))
+    .stream() as AsyncThrowingStream<Event, Error> {
+    process(event)
+}
+
+// Streaming with cursor capture — for paginating over large tables
+let page = client.table("events").limit(5000).streamPage() as StreamPage<Event>
+for try await event in page.rows {
+    process(event)
+}
+// Cursor is set once the for-loop above finishes (stream is exhausted).
+if let cursor = await page.nextCursor {
+    let nextPage = client.table("events").cursor(cursor).limit(5000).streamPage() as StreamPage<Event>
+    // …
+}
+```
+
+`stream()` / `streamPage()` respect all query builder filters, ordering,
+`select()`, `limit()`, and `cursor()` — the same filter chain works for
+both buffered (`run()`) and streaming variants.
 
 ## Auth (email/password, per-project)
 
@@ -347,6 +393,8 @@ Known codes: `.unauthenticated`, `.forbidden`, `.notFound`, `.invalidRequest`,
 | `auth.unenrollFactor` | `DELETE /auth/v1/factors/:id` | `server.rs:302-303` |
 | `table(t).run()` (select/eq/.../order/limit/offset/cursor) | `GET /rest/v1/:table` | `server.rs:243-249`, `parser.rs` |
 | `table(t).page()` | `GET /rest/v1/:table` → `{ rows, next_cursor }` | `server.rs:243`, `data.rs` |
+| `table(t).stream()` | `GET /rest/v1/:table?stream=true` → NDJSON rows | `server.rs:243`, `data.rs` |
+| `table(t).streamPage()` | `GET /rest/v1/:table?stream=true` → NDJSON rows + cursor | `server.rs:243`, `data.rs` |
 | `table(t).insert` | `POST /rest/v1/:table` (201) | `server.rs:246` |
 | `table(t).update` | `PATCH /rest/v1/:table?filters` | `server.rs:247` |
 | `table(t).delete` | `DELETE /rest/v1/:table?filters` (may 501) | `server.rs:248`, `data.rs` |
@@ -366,8 +414,12 @@ Known codes: `.unauthenticated`, `.forbidden`, `.notFound`, `.invalidRequest`,
 
 - **SSE realtime** (`GET /realtime/v1/sse/:project/:table`) — SSE variant of the realtime surface.
 - **Admin surface** (`/admin/v1/*`) — operator-grade; use `client.request(_:path:)` as an escape hatch.
-- **Arrow IPC** — the server does not expose a native Arrow IPC endpoint; use
-  row-level Decodable structs or post-process `[String: AnyCodable]` rows.
+- **Arrow IPC** — the server exposes an Arrow IPC endpoint (`Accept: application/vnd.apache.arrow.stream`
+  on `GET /rest/v1/:table`), but the Swift SDK does not yet implement Arrow IPC decoding.
+  The `apache/arrow-swift` package is available via SwiftPM but pulls in FlatBuffers and
+  swift-atomics as transitive dependencies, which conflicts with this SDK's zero-dependency
+  design goal.  Use row-level `Decodable` structs or `[String: AnyCodable]` rows in the
+  meantime; Arrow support can be added as an opt-in sub-library in a future release.
 
 ## Testing
 
