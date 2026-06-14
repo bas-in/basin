@@ -687,9 +687,10 @@ pub(crate) fn pk_scalar_to_row_key(
 /// `pk IN (…)` path in [`try_resolve_fast_path_pks`] and the `DELETE … USING`
 /// join path in [`exec_delete_using`]). Returns true when writing tombstones
 /// by PK is correctness-safe for THIS table, independent of the WHERE shape:
-/// single-column PK, no RLS / soft-delete / audit / DELETE reactor, no non-GIN
-/// secondary index (GIN-only is admitted — see the index gate), and no other
-/// table FK-referencing this one. The predicate-shape and
+/// single-column PK, no RLS / soft-delete / audit / DELETE reactor, only
+/// overlay-guarded secondary indexes (GIN and single-column btree are admitted
+/// — see the index gate; GIST / vector / multi-col / expression decline), and
+/// no other table FK-referencing this one. The predicate-shape and
 /// context gates (fast-path enabled, in-tx eligibility, RETURNING) are checked
 /// by each caller, since they are not table properties.
 ///
@@ -730,17 +731,29 @@ async fn delete_fastpath_table_eligible(
             return Ok(false);
         }
     }
-    // Secondary indexes: ADMIT GIN-only tables (jsonb containment / tsvector
-    // FTS), exactly as the UPDATE twin does (see its `meta.indexes` gate). The
-    // read-path overlay guards already cover tombstones: `table_has_live_overlay`
-    // counts `tombstone_count`, so `apply_gin_pruning_for_query` /
-    // `apply_jsonb_posting_pruning_for_query` and the posting-probe `Empty`
-    // short-circuit all fall back to the overlay-aware (TombstoneFilter) scan
-    // while a tombstone is live, and `materialize_overlay_for_table` purges the
-    // replaced file's postings + rebuilds the replacement on drain. Any non-GIN
-    // index (btree / GIST / vector) still keeps the cold path — those read
-    // consumers have no overlay-emptiness guard. Oracle: `gin_overlay_delete.rs`.
-    if !meta.indexes.is_empty() && !meta.indexes.iter().all(|idx| idx.access_method == "gin") {
+    // Secondary indexes: ADMIT GIN-only and single-column B-tree tables,
+    // exactly as the UPDATE twin does (see its `meta.indexes` gate). Both
+    // read consumers now have an overlay-emptiness guard:
+    //   * GIN/FTS: `apply_gin_pruning_for_query` /
+    //     `apply_jsonb_posting_pruning_for_query` + the posting-probe `Empty`
+    //     short-circuit fall back to the overlay-aware (TombstoneFilter) scan
+    //     while `table_has_live_overlay`.
+    //   * B-tree: `fast_select`'s secondary-index allowlist probe declines
+    //     entirely while `table_has_live_overlay`, so a HIT never prunes to a
+    //     cold-file set that an override/tombstone could escape.
+    // And `materialize_overlay_for_table` re-maintains BOTH families on drain
+    // (purge replaced files + re-register the replacement), so pruning
+    // re-engages after a drain instead of leaking. GIST / vector (hnsw) still
+    // keep the cold path — their readers have no overlay guard. Oracles:
+    // `gin_overlay_delete.rs`, `btree_overlay_delete.rs`.
+    if !meta.indexes.is_empty()
+        && !meta.indexes.iter().all(|idx| {
+            idx.access_method == "gin"
+                || (idx.access_method == "btree"
+                    && idx.columns.len() == 1
+                    && !idx.columns[0].starts_with("expr:"))
+        })
+    {
         return Ok(false);
     }
     // Any *other* table referencing THIS one means CASCADE / NO ACTION must run
@@ -2074,25 +2087,34 @@ async fn try_resolve_fast_path_update(
     //      leaves the posting lists complete and pruning RE-ENGAGES instead
     //      of degrading to full scans forever.
     //
-    // STILL DECLINED — any non-GIN index in `meta.indexes` keeps the cold
-    // path:
-    //   * "btree" (and anything unrecognized, conservatively): the
-    //     `fast_select` secondary-index probe treats a value HIT as an
-    //     authoritative cold-file allowlist, and that allowlist is maintained
-    //     only on the CoW commit paths (`maintain_btree_secondary_on_replace`)
-    //     — an overlay row whose NEW value hits the index would be served
-    //     from a file set that cannot contain it. The btree read path has no
-    //     overlay-emptiness guard equivalent to (1)/(2).
+    // ALSO ADMITTED — single-column "btree" (the default access method):
+    //   * `fast_select`'s secondary-index allowlist probe now DECLINES while
+    //     `table_has_live_overlay` (the overlay-emptiness guard equivalent to
+    //     (1)/(2) above), so a HIT never prunes to a cold-file set that an
+    //     overlay override / tombstone row could escape; and
+    //   * `materialize_overlay_for_table` re-maintains the B-tree location
+    //     registry on drain (purge replaced files + re-register the
+    //     replacement via `backfill_btree_batch`), mirroring the cold CoW
+    //     `maintain_btree_secondary_on_replace`, so pruning RE-ENGAGES after a
+    //     drain. Oracle: `btree_overlay_delete.rs`.
+    //
+    // STILL DECLINED — these readers have no overlay guard:
     //   * "gist": the interval-tree registry has its own consumers
-    //     (`rtree_rowgroup_scan` / range probes) with no overlay guards —
-    //     out of scope here.
+    //     (`rtree_rowgroup_scan` / range probes) with no overlay guards.
     //   * "hnsw"/vector: ANN sidecars have their own readers and rebuild
     //     lifecycle; overlay-merging a graph index is out of scope.
+    //   * multi-column / expression btree: the registry indexes single
+    //     non-expression columns only.
     //
-    // Mixed tables (GIN + btree, etc.) decline: one unsafe consumer is
-    // enough to leak a stale read.
+    // Mixed tables decline UNLESS every index is GIN or single-column btree:
+    // one unguarded consumer is enough to leak a stale read.
     if !meta.indexes.is_empty()
-        && !meta.indexes.iter().all(|idx| idx.access_method == "gin")
+        && !meta.indexes.iter().all(|idx| {
+            idx.access_method == "gin"
+                || (idx.access_method == "btree"
+                    && idx.columns.len() == 1
+                    && !idx.columns[0].starts_with("expr:"))
+        })
     {
         return Ok(None);
     }
@@ -5947,7 +5969,19 @@ pub(crate) async fn materialize_overlay_for_table(
     // types above, which is exactly what the index maintainers expect (JSONB
     // → `LargeBinary`, tsvector → `Utf8`).
     let table_has_gin = meta.indexes.iter().any(|idx| idx.access_method == "gin");
-    let index_batches: Vec<RecordBatch> = if table_has_gin {
+    // Single-column B-tree secondary indexes (the default access method; not
+    // GIN/GIST/vector) are now admitted to the overlay fast path, so a drain
+    // must re-register their replacement file's locations the same way the
+    // cold CoW commit paths do (`maintain_btree_secondary_on_replace`). Build
+    // the index batches when EITHER family is present; index-free materializes
+    // still pay nothing.
+    let table_has_btree_secondary = meta.indexes.iter().any(|idx| {
+        idx.access_method != "gin"
+            && idx.access_method != "gist"
+            && idx.columns.len() == 1
+            && !idx.columns[0].starts_with("expr:")
+    });
+    let index_batches: Vec<RecordBatch> = if table_has_gin || table_has_btree_secondary {
         batches.iter().cloned().collect()
     } else {
         Vec::new()
@@ -6093,6 +6127,77 @@ pub(crate) async fn materialize_overlay_for_table(
                     fts.mark_file_indexed(&project, table, col, &new_file.path);
                 }
             }
+        }
+    }
+    // B-tree secondary-index maintenance — the materialize twin of
+    // `maintain_btree_secondary_on_replace` (the cold CoW commit paths). Now
+    // that single-column B-tree-indexed tables are admitted to the overlay
+    // fast path (see the index gate in `delete_fastpath_table_eligible` /
+    // `try_resolve_fast_path_update`), a drain MUST keep the
+    // `ProjectIndexRegistry` location sets complete over the live file set:
+    // purge every replaced file's locations and re-register the replacement
+    // file's rows. Without this the `fast_select` HIT allowlist would prune to
+    // a stale file set and silently drop the replacement file's rows (the
+    // reverted-attempt failure mode). The `fast_select` probe additionally
+    // skips the allowlist entirely while an overlay is live
+    // (`table_has_live_overlay` guard), so pruning resumes only AFTER this
+    // drain restores completeness. No `mark_file_indexed`: the B-tree HIT
+    // contract is "every live file's rows are registered" (maintained on every
+    // file-creating path), not per-file sealing — mirroring the maintainer.
+    if table_has_btree_secondary {
+        let registry = engine.secondary_index_registry();
+        let storage = &engine.config().storage;
+        // Same row-group-size priority as the writer / CREATE INDEX backfill so
+        // the re-registered row-group ordinals line up with the on-disk layout
+        // (Parquet read hint only; Vortex uses the file-level allowlist).
+        let rg_size = meta
+            .row_block_size
+            .map(|v| v as usize)
+            .or(meta.row_group_rows)
+            .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE)
+            .max(1);
+        let btree_cols: Vec<String> = meta
+            .indexes
+            .iter()
+            .filter(|idx| {
+                idx.access_method != "gin"
+                    && idx.access_method != "gist"
+                    && idx.columns.len() == 1
+                    && !idx.columns[0].starts_with("expr:")
+            })
+            .map(|idx| idx.columns[0].clone())
+            .collect();
+        for col in &btree_cols {
+            if !registry.is_loaded(&project, table, col) {
+                // Pull the persisted sidecar into RAM — maintenance must apply
+                // to the FULL index, never seed a partial one.
+                crate::secondary_index::load_index(registry, storage, &project, table, col).await;
+                if !registry.is_loaded(&project, table, col) {
+                    continue;
+                }
+            }
+            for old_path in &removed {
+                registry.remove_file_from_index(&project, table, col, old_path);
+            }
+            if let Some(new_file) = added.first() {
+                let mut file_row_off = 0usize;
+                for batch in &index_batches {
+                    crate::executor::backfill_btree_batch(
+                        registry.as_ref(),
+                        &project,
+                        table,
+                        col,
+                        batch,
+                        &new_file.path,
+                        rg_size,
+                        file_row_off,
+                    );
+                    file_row_off += batch.num_rows();
+                }
+            }
+            // Re-persist so a restart's lazy sidecar load can't resurrect the
+            // stale pre-rewrite locations (the B-tree sidecar survives restarts).
+            crate::secondary_index::flush_index(registry, storage, &project, table, col).await;
         }
     }
     // Physically delete the just-replaced files so a subsequent
@@ -6316,8 +6421,7 @@ fn extend_replacement_with_shadow_cols(
 /// treats a HIT as a definitive file allowlist ("skip any live file NOT in
 /// the location set"). With no maintenance at all, a key whose locations all
 /// point at the replaced (now dead) file prunes EVERY live file and the read
-/// silently returns zero rows (tests/integration/tests/gin_overlay_update.rs
-/// `btree_indexed_column_write_declines_fast_path`). With purge-only
+/// silently returns zero rows. With purge-only
 /// maintenance, a key that has rows in BOTH an untouched file and the
 /// (unregistered) replacement file would HIT on the untouched file alone and
 /// the pruned read would drop the replacement file's rows. Only
@@ -6406,7 +6510,8 @@ async fn maintain_btree_secondary_on_replace(
             let mut file_row_off = 0usize;
             for batch in batches {
                 crate::executor::backfill_btree_batch(
-                    sess,
+                    registry.as_ref(),
+                    &sess.project,
                     table,
                     col,
                     batch,

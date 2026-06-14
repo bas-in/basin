@@ -3039,7 +3039,18 @@ async fn execute_simple_select_inner(
         /// Per-file row-group allowlist for the reader (deduped).
         rg_selection: std::collections::HashMap<String, Vec<u32>>,
     }
-    let secondary_index_file_allowlist: Option<Option<SecondaryIndexHit>> = {
+    let secondary_index_file_allowlist: Option<Option<SecondaryIndexHit>> = if crate::session::table_has_live_overlay(&sess.engine, &sess.project, &plan.table) {
+        // Overlay guard (mirrors the GIN/FTS empty-probe guards): while a
+        // hot-tier overlay is live the B-tree location registry is NOT
+        // maintained for override / tombstone writes — only the cold CoW
+        // commit paths and `materialize_overlay_for_table` re-register files,
+        // and the latter only on drain. A positive HIT's cold-file allowlist
+        // can therefore exclude a file (or an overlay override row) that holds
+        // a live match, so the pruned read would drop rows. Decline the probe
+        // and fall through to the overlay-aware scan; pruning re-engages once
+        // the overlay drains and the registry is complete again.
+        None
+    } else {
         let registry = sess.engine.secondary_index_registry();
         let mut result: Option<Option<SecondaryIndexHit>> = None;
 

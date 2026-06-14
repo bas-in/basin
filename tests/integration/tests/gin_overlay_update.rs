@@ -29,16 +29,18 @@
 //!      the posting list COMPLETE and pruning re-engages instead of
 //!      degrading to full scans forever.
 //!
-//! Still declined: any btree-like / GIST / vector index (btree probes are
-//! authoritative cold-file allowlists maintained only on the CoW paths;
-//! GIST / vector registries have their own unguarded consumers).
+//! Also admitted: single-column b-tree indexes — the `fast_select` allowlist
+//! probe declines while an overlay is live (overlay-emptiness guard) and
+//! `materialize_overlay_for_table` re-registers the replacement file's btree
+//! locations on drain. Still declined: GIST / vector (hnsw) and
+//! multi-column / expression b-tree (their registries have no overlay guard).
 //!
 //! ## What is asserted
 //!
 //! * ROUTING: a `jsonb_set` UPDATE on a GIN-only table plants an overlay
 //!   override (`update_count > 0`) and writes ZERO replacement files; an
-//!   UPDATE touching a b-tree-indexed table still declines (overlay stays
-//!   empty).
+//!   UPDATE on a single-column b-tree-indexed table ALSO routes to the overlay
+//!   and stays correct through the drain.
 //! * THE ORACLE: `@>` reads are correct DURING the overlay window — the
 //!   newly-matching row is returned (Empty-short-circuit trap) and the
 //!   no-longer-matching row is excluded (unwrapped-pruned-provider trap) —
@@ -519,12 +521,14 @@ async fn gin_update_no_longer_matching_containment_read_excludes_row() {
     );
 }
 
-/// B-tree gate: an UPDATE on a table with a b-tree index must keep declining
-/// the fast path (b-tree probes are authoritative cold-file allowlists
-/// maintained only on the CoW paths), and the indexed reads must see the new
-/// value via the cold path.
+/// B-tree gate: an UPDATE on a single-column b-tree-indexed table is now
+/// ADMITTED to the overlay fast path. The `fast_select` allowlist probe
+/// declines while the overlay is live (overlay-emptiness guard), so indexed
+/// reads fall through to the overlay-aware scan; and
+/// `materialize_overlay_for_table` re-registers the replacement file's
+/// locations on drain, so the allowlist re-engages without dropping rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn btree_indexed_column_write_declines_fast_path() {
+async fn btree_indexed_column_write_routes_overlay_and_serves_reads() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let project = ProjectId::new();
@@ -549,29 +553,52 @@ async fn btree_indexed_column_write_declines_fast_path() {
     })
     .await;
 
-    assert_eq!(
-        overlay_pending(&eng, &project, &table),
-        0,
-        "UPDATE on a b-tree-indexed table must DECLINE the overlay fast path \
-         (the relaxed gate admits GIN-only tables, never btree)"
+    assert!(
+        overlay_pending(&eng, &project, &table) > 0,
+        "UPDATE on a single-column b-tree-indexed table must ROUTE to the overlay fast path"
     );
 
-    // Probe on the NEW value (absent from the index pre-UPDATE) must find it.
+    // WHILE the overlay is live: the allowlist probe declines, so reads fall
+    // through to the overlay-aware scan and observe the override.
     assert_eq!(
         ids_for(&sess, "SELECT id FROM items WHERE status = 'archived'").await,
         vec![3]
     );
-    // Probe on the OLD value must no longer return the row.
     assert_eq!(
         ids_for(&sess, "SELECT id FROM items WHERE status = 'active'").await,
         vec![1, 2]
     );
+
+    // DRAIN through materialize_overlay_for_table (re-registers the
+    // replacement file's btree locations).
+    force_materialize_drain(&sess, "items").await;
+    assert_eq!(
+        overlay_pending(&eng, &project, &table),
+        0,
+        "the drain must settle the overlay"
+    );
+
+    // POST-DRAIN: the allowlist probe re-engages; reads must STILL be correct
+    // (no stale-allowlist row drop — the reverted-attempt failure mode).
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM items WHERE status = 'archived'").await,
+        vec![3]
+    );
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM items WHERE status = 'active'").await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM items WHERE status = 'idle'").await,
+        vec![4]
+    );
 }
 
-/// Mixed-index gate: GIN + b-tree on the same table must still decline (one
-/// unsafe consumer is enough to leak a stale read).
+/// Mixed-index gate: GIN + single-column b-tree on the same table is now
+/// ADMITTED — both read consumers have an overlay-emptiness guard and both
+/// registries are re-maintained on drain, so neither can leak a stale read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gin_plus_btree_mixed_table_declines_fast_path() {
+async fn gin_plus_btree_mixed_table_routes_overlay_and_serves_reads() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let project = ProjectId::new();
@@ -589,15 +616,33 @@ async fn gin_plus_btree_mixed_table_declines_fast_path() {
     })
     .await;
 
-    assert_eq!(
-        overlay_pending(&eng, &project, &table),
-        0,
-        "GIN + b-tree mixed table must DECLINE the overlay fast path"
+    assert!(
+        overlay_pending(&eng, &project, &table) > 0,
+        "GIN + single-column b-tree mixed table must ROUTE to the overlay fast path"
     );
-    // Cold path correctness: the cross-file needle still finds the row.
+    // Overlay-window correctness (both guards engaged): the cross-file needle
+    // still finds the row.
     assert_eq!(
         ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
         vec![1]
+    );
+
+    // DRAIN: both the GIN posting registry and the btree location registry are
+    // re-maintained over the replacement file.
+    force_materialize_drain(&sess, "docs").await;
+    assert_eq!(
+        overlay_pending(&eng, &project, &table),
+        0,
+        "the drain must settle the overlay"
+    );
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        vec![1],
+        "containment read must stay correct after the drain"
+    );
+    assert!(
+        gin_completeness_holds(&eng, &project, &table, "payload").await,
+        "post-drain GIN completeness must hold"
     );
 }
 

@@ -5229,7 +5229,14 @@ async fn backfill_index_over_live_files(
                 );
             } else {
                 backfill_btree_batch(
-                    sess, table, col_name, &batch, &f.path, rg_size, file_row_off,
+                    sess.engine.secondary_index_registry().as_ref(),
+                    &sess.project,
+                    table,
+                    col_name,
+                    &batch,
+                    &f.path,
+                    rg_size,
+                    file_row_off,
                 );
             }
             file_row_off += batch.num_rows();
@@ -5477,7 +5484,8 @@ fn backfill_trgm_batch(
 /// Feed one batch into the secondary B-tree registry, offsetting the row index
 /// by `file_row_off`. Mirrors `extract_entries_from_batch` + `insert_batch`.
 pub(crate) fn backfill_btree_batch(
-    sess: &ProjectSession,
+    registry: &crate::secondary_index::ProjectIndexRegistry,
+    project: &basin_common::ProjectId,
     table: &TableName,
     col_name: &str,
     batch: &arrow_array::RecordBatch,
@@ -5523,9 +5531,7 @@ pub(crate) fn backfill_btree_batch(
     extract_typed!(BooleanArray, |v: bool| if v { "t" } else { "f" }.to_string());
 
     if !entries.is_empty() {
-        sess.engine
-            .secondary_index_registry()
-            .insert_batch(&sess.project, table, col_name, entries);
+        registry.insert_batch(project, table, col_name, entries);
     }
 }
 

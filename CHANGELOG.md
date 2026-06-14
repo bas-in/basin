@@ -8,6 +8,25 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-15 — Hot-tier DELETE/UPDATE fast path admits single-column B-tree indexes
+
+- DELETE/UPDATE **by PK** on a table whose secondary indexes are all GIN or
+  **single-column B-tree** now routes to the hot-tier overlay fast path
+  (tombstone / override) instead of a cold copy-on-write rewrite + index
+  rebuild. Previously any non-GIN index forced the cold path, so the 1M-row
+  bulk-DELETE / point-mutation shapes on indexed tables paid the full rewrite.
+- Sound because both read consumers are now overlay-aware: `fast_select`'s
+  secondary-index allowlist probe DECLINES while a hot overlay is live
+  (`table_has_live_overlay`), so a value HIT never prunes to a cold-file set a
+  live tombstone/override could escape; and `materialize_overlay_for_table`
+  re-registers the replacement file's B-tree locations on drain (mirroring the
+  cold CoW `maintain_btree_secondary_on_replace`), so pruning re-engages with a
+  complete index once the overlay settles.
+- GIST / vector (hnsw) and multi-column / expression B-tree still decline
+  (their readers have no overlay guard). Adversarial oracle — an indexed value
+  spanning a rewritten row, a surviving same-file row, and an untouched file —
+  `tests/integration/tests/btree_overlay_delete.rs`.
+
 ## 2026-06-15 — Cloud control-plane: list projects
 
 - **`GET /admin/v1/projects`** enumerates all provisioned project ids (distinct
