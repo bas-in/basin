@@ -7100,6 +7100,22 @@ fn strip_table_qualifiers_deep(expr: Expr) -> Expr {
             op,
             expr: Box::new(strip_table_qualifiers_deep(*expr)),
         },
+        // `(CASE … END)::integer` — Django's bulk_update wraps the CASE in a
+        // cast; recurse into the cast operand so the inner qualified refs reach
+        // the CASE/identifier arms below.
+        Expr::Cast {
+            kind,
+            expr,
+            data_type,
+            array,
+            format,
+        } => Expr::Cast {
+            kind,
+            expr: Box::new(strip_table_qualifiers_deep(*expr)),
+            data_type,
+            array,
+            format,
+        },
         // `CASE WHEN "t"."id" = 1 THEN … ELSE "t"."pages" END` — Django's
         // `bulk_update` emits a qualified CASE on the SET RHS. Recurse into the
         // operand, every WHEN condition/result, and the ELSE branch.

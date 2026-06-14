@@ -166,11 +166,13 @@ async fn update_set_case_with_qualified_refs_resolves() {
         .unwrap();
     sess.execute("INSERT INTO books (id, pages) VALUES (1, 10), (2, 20)").await.unwrap();
 
+    // Django wraps the CASE in a cast — `(CASE … END)::integer` — so the strip
+    // must recurse through the Cast to reach the inner qualified refs.
     sess.execute(
-        "UPDATE books SET pages = CASE WHEN books.id = 1 THEN 999 ELSE books.pages END",
+        "UPDATE books SET pages = (CASE WHEN (books.id = 1) THEN 999 ELSE books.pages END)::bigint",
     )
     .await
-    .expect("qualified CASE on the SET RHS must resolve");
+    .expect("qualified CASE (cast-wrapped) on the SET RHS must resolve");
 
     let res = sess.execute("SELECT pages FROM books ORDER BY id").await.unwrap();
     match res {
