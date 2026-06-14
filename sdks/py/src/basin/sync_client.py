@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Coroutine, Generator
+import queue
+import threading
+from collections.abc import AsyncIterator, Callable, Coroutine, Generator
 from typing import Any, TypeVar
 
 from .auth.client import AuthClient
@@ -12,10 +14,45 @@ from .postgrest.types import APIResponse
 
 T = TypeVar("T")
 
+_SENTINEL = object()
+
 
 def _run(coro: Coroutine[Any, Any, T]) -> T:
     """Run a coroutine synchronously using a fresh event loop."""
     return asyncio.run(coro)
+
+
+def _aiter_to_sync(
+    factory: Callable[[], AsyncIterator[Any]],
+) -> Generator[Any, None, None]:
+    """Drive an async iterator on a background-thread event loop and yield its
+    items lazily to the synchronous caller via a bounded queue."""
+    items: queue.Queue[Any] = queue.Queue(maxsize=64)
+
+    async def pump() -> None:
+        try:
+            async for item in factory():
+                items.put((False, item))
+        except Exception as exc:  # surfaced to the sync side below
+            items.put((True, exc))
+        finally:
+            items.put((False, _SENTINEL))
+
+    def runner() -> None:
+        asyncio.run(pump())
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    try:
+        while True:
+            is_error, payload = items.get()
+            if is_error:
+                raise payload
+            if payload is _SENTINEL:
+                break
+            yield payload
+    finally:
+        thread.join()
 
 
 class SyncQueryBuilder:
@@ -129,15 +166,70 @@ class SyncQueryBuilder:
         return _run(self._b.execute())
 
     def paginate(self, *, page_size: int = 1000) -> Generator[Any, None, None]:
-        """Sync generator that walks all pages via cursor pagination."""
+        """Sync generator that walks all pages lazily via cursor pagination."""
+        yield from _aiter_to_sync(lambda: self._b.paginate(page_size=page_size))
 
-        async def collect() -> list[Any]:
-            rows = []
-            async for row in self._b.paginate(page_size=page_size):
-                rows.append(row)
-            return rows
+    def stream(self) -> Generator[Any, None, None]:
+        """Sync generator that yields NDJSON rows as they arrive."""
+        yield from _aiter_to_sync(self._b.stream)
 
-        yield from _run(collect())
+
+class SyncRealtimeChannel:
+    """
+    Synchronous wrapper around the async ``RealtimeChannel``.
+
+    A dedicated background thread runs an event loop that drives the SSE/WS
+    transports; ``.on()`` registers callbacks (invoked on that loop thread) and
+    ``.subscribe()``/``.unsubscribe()`` are scheduled onto it.  Keep a reference
+    to the channel for as long as you want to receive events; call
+    ``.unsubscribe()`` (or ``SyncClient.close()``) to tear it down.
+    """
+
+    def __init__(self, async_channel: Any) -> None:
+        self._ch = async_channel
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def _call(self, fn: Callable[[], Any]) -> Any:
+        future = asyncio.run_coroutine_threadsafe(self._async_call(fn), self._loop)
+        return future.result()
+
+    async def _async_call(self, fn: Callable[[], Any]) -> Any:
+        return fn()
+
+    def on(
+        self,
+        type: str,
+        filter: dict[str, Any],
+        callback: Callable[..., Any],
+    ) -> SyncRealtimeChannel:
+        self._call(lambda: self._ch.on(type, filter, callback))
+        return self
+
+    def subscribe(self) -> SyncRealtimeChannel:
+        self._call(self._ch.subscribe)
+        return self
+
+    def unsubscribe(self) -> SyncRealtimeChannel:
+        self._call(self._ch.unsubscribe)
+        return self
+
+    @property
+    def topic(self) -> str:
+        topic: str = self._ch.topic
+        return topic
+
+    def close(self) -> None:
+        try:
+            self._call(self._ch.unsubscribe)
+        finally:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=5.0)
 
 
 class SyncAuthClient:
@@ -190,11 +282,21 @@ class SyncClient:
     ) -> None:
         self._async = create_client(base_url, anon_key, options=options)
         self.auth = SyncAuthClient(self._async.auth)
+        self._channels: list[SyncRealtimeChannel] = []
 
     def from_(self, table: str) -> SyncQueryBuilder:
         return SyncQueryBuilder(self._async.from_(table))
 
+    def channel(self, topic: str) -> SyncRealtimeChannel:
+        """Open a realtime channel driven by a background event-loop thread."""
+        ch = SyncRealtimeChannel(self._async.channel(topic))
+        self._channels.append(ch)
+        return ch
+
     def close(self) -> None:
+        for ch in self._channels:
+            ch.close()
+        self._channels.clear()
         _run(self._async.aclose())
 
     def __enter__(self) -> SyncClient:
