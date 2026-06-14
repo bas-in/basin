@@ -17,13 +17,18 @@
 //!    engine's prepared-statement API. Per-connection statement and portal
 //!    maps live on the handler instance (one handler per connection).
 //!
-//! ### Format-code policy (v1)
+//! ### Format-code policy
 //!
-//! Both parameters and result columns are handled as Postgres text format.
-//! If the client requests binary format codes for parameters we still decode
-//! them as UTF-8 text — most drivers send text by default and the rest fall
-//! back when the response advertises text. Result columns are always text,
-//! matching the simple-query behaviour.
+//! **Result columns**: per-column binary format codes from the `Bind` message
+//! are respected. `encode_batches_with_formats` emits binary when the client
+//! requests format code 1, text (format code 0) otherwise. Simple-query
+//! results are always text (matching the PG spec).
+//!
+//! **Parameters**: binary input parameters are decoded for the common scalar
+//! types (int2/4/8, float4/8, bool, bytea, text, UUID, JSONB, NUMERIC,
+//! timestamp, date, one-dimensional arrays). Unknown binary types fall back
+//! to a best-effort UTF-8 decode so the engine's text-substitution path can
+//! still coerce them.
 
 use std::collections::HashMap;
 use std::fmt::Debug;

@@ -16,18 +16,20 @@
 //!   trait. The default [`StaticProjectResolver`] is a `HashMap` lookup.
 //! - **Simple query protocol** (what `psql` uses for `SELECT 1` before
 //!   switching to prepared statements).
-//! - **Extended query protocol** v1: `Parse`/`Bind`/`Describe`/`Execute`/
+//! - **Extended query protocol**: `Parse`/`Bind`/`Describe`/`Execute`/
 //!   `Close`/`Sync` against the engine's prepared-statement API. Unblocks
 //!   `tokio_postgres::query`, `asyncpg`, JDBC, and every popular ORM that
-//!   defaults to extended protocol. Both parameter binding and result rows
-//!   use Postgres text format; v2 will add binary.
-//! - Arrow -> Postgres text-format encoding for a small set of types: int8,
-//!   text, bool, float8, and timestamp (rendered RFC3339, UTC). Anything
-//!   else falls through to TEXT with a debug-formatted body.
+//!   defaults to extended protocol. Per-column result format codes from the
+//!   `Bind` message are respected: binary is emitted when the client requests
+//!   format code 1, text otherwise.
+//! - Arrow -> Postgres wire encoding for the common scalar types: int8, text,
+//!   bool, float8, timestamp, date, interval, bytea, JSONB, UUID, arrays, and
+//!   NUMERIC (both text and binary). Anything else falls through to TEXT with
+//!   a debug-formatted body.
 //!
 //! ## Out of scope
 //!
-//! - Transactions, `COPY`, binary format codes.
+//! - Transactions (auto-commit only in v1).
 //! - In-band project switching. The connection's project is fixed at startup;
 //!   any SQL trying to change it (e.g. `SET project TO ...`) routes through
 //!   the engine, which will reject it.
@@ -81,6 +83,35 @@ use crate::protocol::{
     EngineSessionFactory, PooledSessionFactory, SessionFactory,
 };
 use crate::remote_shard::RemoteShardSessionFactory;
+
+// ---------------------------------------------------------------------------
+// Test-accessible helpers for the numeric binary codec tests.
+//
+// These thin wrappers expose `pub(crate)` functions from `types.rs` to the
+// integration tests in `tests/numeric_binary_codec.rs` without adding them
+// to the main public API.
+// ---------------------------------------------------------------------------
+
+/// Exposed for `tests/numeric_binary_codec.rs` only.
+/// Delegates to `types::encode_batches_with_formats`.
+#[doc(hidden)]
+pub fn encode_batches_with_formats_for_test(
+    schema: &std::sync::Arc<arrow_schema::Schema>,
+    batches: &[arrow_array::RecordBatch],
+    format_codes: &[i16],
+) -> basin_common::Result<Vec<pgwire::messages::data::DataRow>> {
+    crate::types::encode_batches_with_formats(schema, batches, format_codes)
+}
+
+/// Exposed for `tests/numeric_binary_codec.rs` only.
+/// Delegates to `types::encode_batches` (text-only path).
+#[doc(hidden)]
+pub fn encode_batches_text_for_test(
+    schema: &std::sync::Arc<arrow_schema::Schema>,
+    batches: &[arrow_array::RecordBatch],
+) -> Vec<pgwire::messages::data::DataRow> {
+    crate::types::encode_batches(schema, batches)
+}
 
 /// Configuration for the pgwire server.
 ///

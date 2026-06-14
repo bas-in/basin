@@ -193,10 +193,10 @@ pub(crate) fn arrow_to_pg_type(dt: &DataType) -> Type {
         DataType::Interval(IntervalUnit::MonthDayNano) => Type::INTERVAL,
         DataType::Timestamp(_, Some(_)) => Type::TIMESTAMPTZ,
         DataType::Timestamp(_, None) => Type::TIMESTAMP,
-        // PG `numeric` (OID 1700) → Arrow `Decimal128(p, s)`. Wire format
-        // is text-only for v0.1 (binary numeric encoding is varlena-shaped:
-        // sign + weight + dscale + ndigits + base-10000 digit array; lots
-        // of edge cases. Lenient drivers tolerate text in a binary slot.)
+        // PG `numeric` (OID 1700) → Arrow `Decimal128(p, s)`. Binary wire
+        // format is implemented: `encode_numeric_binary` emits the PG
+        // base-10000 digit encoding when format code 1 is requested.
+        // Text format is unchanged (default for simple-query and format code 0).
         DataType::Decimal128(_, _) => Type::NUMERIC,
         // PG one-dimensional array types.  Used by the extended-query
         // ParameterDescription path so that `WHERE col = ANY($1)` over a
