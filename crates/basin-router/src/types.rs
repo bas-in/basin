@@ -43,6 +43,12 @@ pub(crate) const PG_EPOCH_MICROS_FROM_UNIX: i64 =
 /// constant so this crate stays free of an engine dependency cycle.
 const BASIN_TYPE_KEY: &str = "BASIN_TYPE";
 const BASIN_TYPE_JSONB: &str = "JSONB";
+/// Field-metadata key carrying a user enum's Postgres type OID (decimal
+/// string), set by the engine's enum-OID reattachment pass. Must match
+/// `basin_engine::types::BASIN_ENUM_OID_KEY` — duplicated here as a `&str` to
+/// keep this crate free of an engine dependency cycle. When present, the enum's
+/// own OID is advertised in `RowDescription` instead of TEXT (25).
+const BASIN_ENUM_OID_KEY: &str = "BASIN_ENUM_OID";
 const BASIN_TYPE_UUID: &str = "UUID";
 
 /// A tiny `fmt::Write` adaptor that formats values into a fixed-size stack
@@ -135,13 +141,26 @@ pub(crate) fn row_description_with_formats(
 }
 
 fn field_description(f: &Field, format_code: i16) -> FieldDescription {
-    let ty = arrow_to_pg_type_field(f);
+    // A user enum carries its own type OID in field metadata (reattached by the
+    // engine). Advertise it instead of the TEXT OID so Prisma / node-pg map the
+    // column to its declared enum; enums are pass-by-value with typlen 4.
+    let (type_id, type_size) = match f
+        .metadata()
+        .get(BASIN_ENUM_OID_KEY)
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        Some(oid) => (oid, 4i16),
+        None => {
+            let ty = arrow_to_pg_type_field(f);
+            (ty.oid(), type_size(&ty))
+        }
+    };
     FieldDescription::new(
         f.name().clone(),
         0, // table OID — unknown at this layer
         0, // column attnum — unknown at this layer
-        ty.oid(),
-        type_size(&ty),
+        type_id,
+        type_size,
         -1,
         format_code,
     )
@@ -1754,6 +1773,24 @@ mod tests {
         assert_eq!(rd.fields[0].type_id, Type::INT8.oid());
         assert_eq!(rd.fields[1].name, "b");
         assert_eq!(rd.fields[1].type_id, Type::TEXT.oid());
+    }
+
+    /// A field carrying the `BASIN_ENUM_OID` metadata marker must advertise that
+    /// OID (and typlen 4) in its `RowDescription`, not the bare TEXT OID — this
+    /// is what lets Prisma / node-pg map an enum column to its declared type.
+    #[test]
+    fn field_description_surfaces_enum_oid_from_metadata() {
+        use std::collections::HashMap;
+        let mut md = HashMap::new();
+        md.insert(BASIN_ENUM_OID_KEY.to_string(), "98765".to_string());
+        let f = Field::new("role", DataType::Utf8, true).with_metadata(md);
+        let fd = field_description(&f, FORMAT_CODE_TEXT);
+        assert_eq!(fd.type_id, 98765, "enum column must advertise its own OID");
+        assert_eq!(fd.type_size, 4, "enum is pass-by-value, typlen 4");
+        // A plain Utf8 field with no enum marker still reports TEXT.
+        let plain = Field::new("name", DataType::Utf8, true);
+        let fd2 = field_description(&plain, FORMAT_CODE_TEXT);
+        assert_eq!(fd2.type_id, Type::TEXT.oid(), "non-enum text stays TEXT");
     }
 
     /// gorm/pgx regression: the extended-protocol portal RowDescription must

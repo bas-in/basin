@@ -8,6 +8,22 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-14 — Enum columns advertise their own type OID (Prisma)
+
+- **A user-enum result column now advertises the enum's own Postgres type OID in
+  `RowDescription` instead of TEXT (25).** Prisma / node-pg map columns to their
+  declared enum by that OID; reporting TEXT made Prisma fail to map enum fields.
+  The stable per-enum OID already existed (`pg_type.oid` / `pg_enum.enumtypid`);
+  it is now (a) computed in the Postgres user-object range `[16384, u32::MAX)` so
+  it is a valid wire OID that matches the catalog rows a client introspects, and
+  (b) reattached to result-column field metadata in both the simple-query
+  (`exec_select`) and extended-protocol Describe (`probe_schema`) paths —
+  DataFusion strips the metadata through planning, the same problem the
+  `json_agg` annotation already solves. The pgwire layer reads the marker and
+  advertises the enum OID (typlen 4). Single-table SELECTs; joins fall back to
+  TEXT (unchanged). Pinned by `field_description_surfaces_enum_oid_from_metadata`
+  (router) and `enum_column_select_carries_oid_metadata` (engine).
+
 ## 2026-06-14 — ORM SQL-shape fixes (Drizzle, SQLAlchemy, Django, gorm)
 
 - **Array `&&` overlap with a parenthesized/cast operand** now rewrites to

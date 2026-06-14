@@ -4907,13 +4907,26 @@ fn sequence_oid(project: &ProjectId, name: &str) -> i64 {
     fnv1a_64_to_positive_i64(key.as_bytes())
 }
 
-/// Stable 64-bit oid for a user-defined enum type. This is the OID
-/// `pg_type.oid` reports for the enum AND the `pg_enum.enumtypid` the labels
-/// join against. Distinct prefix so an enum type never collides with a
-/// table / index / sequence oid.
-fn enum_type_oid(project: &ProjectId, name: &str) -> i64 {
+/// Stable **u32** oid for a user-defined enum type, in the user-object range
+/// `[16384, u32::MAX)` (Postgres `FirstNormalObjectId` is 16384; builtin type
+/// OIDs live below it). Postgres OIDs are unsigned 32-bit, so an enum's OID
+/// MUST fit `u32` to be a valid wire `RowDescription.type_id` — and the value
+/// the pgwire layer advertises for an enum column MUST equal the value
+/// `pg_type.oid` / `pg_enum.enumtypid` report, or a client's
+/// `SELECT … FROM pg_type WHERE oid = $1` introspection misses. This is the
+/// single source of truth for all three. Distinct key prefix so an enum type
+/// never collides with a table / index / sequence oid.
+pub fn enum_oid(project: &ProjectId, name: &str) -> u32 {
     let key = format!("basin.pg_enum_type:{project}:{name}");
-    fnv1a_64_to_positive_i64(key.as_bytes())
+    let h = fnv1a_64_to_positive_i64(key.as_bytes()) as u64;
+    const FIRST: u64 = 16384;
+    (FIRST + (h % (u32::MAX as u64 - FIRST))) as u32
+}
+
+/// `i64`-typed view of [`enum_oid`] for the `pg_type.oid` / `pg_enum.enumtypid`
+/// catalog columns (which are `Int64`). Same value as the wire OID.
+fn enum_type_oid(project: &ProjectId, name: &str) -> i64 {
+    enum_oid(project, name) as i64
 }
 
 /// Stable oid for a project-scoped namespace. v0.1 has one namespace per

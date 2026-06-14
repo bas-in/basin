@@ -198,6 +198,53 @@ async fn enum_insert_with_cast_label() {
     );
 }
 
+/// A SELECT of an enum column must carry the `BASIN_ENUM_OID` metadata on its
+/// result schema (reattached after DataFusion strips it), so the pgwire layer
+/// advertises the enum's own type OID instead of TEXT — what Prisma / node-pg
+/// need to map the column to its declared enum.
+#[tokio::test]
+async fn enum_column_select_carries_oid_metadata() {
+    let (_dir, engine) = open_engine().await;
+    let sess = open_session(&engine).await;
+
+    exec_ok(&sess, r#"CREATE TYPE "Role" AS ENUM ('USER', 'ADMIN')"#).await;
+    exec_ok(
+        &sess,
+        r#"CREATE TABLE accounts (id BIGINT NOT NULL, role "Role" NOT NULL)"#,
+    )
+    .await;
+    exec_ok(&sess, r#"INSERT INTO accounts VALUES (1, 'USER'::"Role")"#).await;
+
+    // ORDER BY drives the DataFusion (exec_select) path. The reattachment must
+    // stamp the enum OID + type marker onto the result schema's enum column.
+    let res = sess
+        .execute(r#"SELECT role FROM accounts ORDER BY id"#)
+        .await
+        .unwrap();
+    match res {
+        ExecResult::Rows { schema, .. } => {
+            let f = schema
+                .fields()
+                .iter()
+                .find(|f| f.name() == "role")
+                .expect("role column present");
+            let oid: u32 = f
+                .metadata()
+                .get("BASIN_ENUM_OID")
+                .expect("enum column must carry BASIN_ENUM_OID after reattach")
+                .parse()
+                .expect("enum oid parses as u32");
+            assert!(oid >= 16384, "enum oid must be in the user-object range, got {oid}");
+            assert_eq!(
+                f.metadata().get("BASIN_ENUM_TYPE").map(String::as_str),
+                Some("Role"),
+                "enum type marker must be reattached"
+            );
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn alter_type_add_value_appends_label() {
     let (_dir, engine) = open_engine().await;

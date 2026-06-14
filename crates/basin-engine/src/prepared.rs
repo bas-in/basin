@@ -2514,8 +2514,26 @@ async fn probe_schema(sess: &ProjectSession, sql: &str) -> Result<Vec<Field>> {
     // SELECTs and WITH-pure-SELECT CTEs.
     let plan_result = sess.ctx.sql(probe_sql).await;
 
+    let mut primary_table: Option<TableName> = None;
     let ws_schema = match plan_result {
         Ok(logical) => {
+            // Capture the single scanned table (if any) for enum-OID
+            // reattachment below — mirrors exec_select. Joins yield None.
+            fn first_scan(plan: &datafusion::logical_expr::LogicalPlan) -> Option<&str> {
+                use datafusion::logical_expr::LogicalPlan;
+                if let LogicalPlan::TableScan(ts) = plan {
+                    return Some(ts.table_name.table());
+                }
+                for child in plan.inputs() {
+                    if let Some(t) = first_scan(child) {
+                        return Some(t);
+                    }
+                }
+                None
+            }
+            if let Some(t) = first_scan(logical.logical_plan()) {
+                primary_table = TableName::new(t).ok();
+            }
             let df_schema = logical.schema().inner().clone();
             Arc::new(crate::convert::schema_df_to_ws(df_schema.as_ref())?)
         }
@@ -2540,6 +2558,22 @@ async fn probe_schema(sess: &ProjectSession, sql: &str) -> Result<Vec<Field>> {
     // TEXT. This is required for drivers that use the Describe-time RowDescription
     // to choose the correct wire deserializer (tokio-postgres, psycopg3, etc.).
     let ws_schema = crate::executor::annotate_json_agg_columns(&ws_schema, probe_sql);
+    // Reattach user-enum type OIDs: DataFusion strips field metadata (same
+    // problem json_agg has), so the Describe-time RowDescription would advertise
+    // TEXT (25) for an enum column and extended-protocol clients (prisma/
+    // node-pg) couldn't map it. Single-table SELECTs only; reuse exec_select's
+    // pass. Gated on a Utf8 column existing (enums are Utf8).
+    let ws_schema = match &primary_table {
+        Some(t)
+            if ws_schema
+                .fields()
+                .iter()
+                .any(|f| f.data_type() == &DataType::Utf8) =>
+        {
+            crate::executor::reattach_enum_oids(sess, t, ws_schema).await
+        }
+        _ => ws_schema,
+    };
     Ok(ws_schema.fields().iter().map(|f| (**f).clone()).collect())
 }
 

@@ -153,6 +153,14 @@ pub const BASIN_COLUMN_DEFAULT: &str = "BASIN_COLUMN_DEFAULT";
 /// against the catalog row at INSERT time.
 pub const BASIN_ENUM_TYPE_KEY: &str = basin_catalog::BASIN_ENUM_TYPE_KEY;
 
+/// Per-column marker carrying a user enum's Postgres type OID (as a decimal
+/// string), reattached to result columns so the pgwire `RowDescription`
+/// advertises the enum's own OID rather than TEXT (25). Without it Prisma /
+/// node-pg cannot map the column to its declared enum. The value is
+/// `basin_catalog::info_schema::enum_oid(project, name)`. The router reads the
+/// same key (a matching local const) — see `basin-router::types`.
+pub const BASIN_ENUM_OID_KEY: &str = "BASIN_ENUM_OID";
+
 /// Per-column marker for `CREATE DOMAIN` columns. Value is the
 /// unqualified domain name. The Arrow physical type is the domain's
 /// underlying base type; the engine evaluates the domain's CHECK

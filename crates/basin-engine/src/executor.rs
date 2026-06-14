@@ -10609,6 +10609,23 @@ pub(crate) async fn exec_select(
         let annotated = annotate_json_agg_columns(&raw, sql_for_df);
         pg_style_nullary_fn_column_names(&annotated)
     };
+    // Reattach user-enum type OIDs: DataFusion strips field metadata, so a
+    // result column sourced from an enum column comes back as bare Utf8 and the
+    // pgwire layer would advertise TEXT (OID 25) — Prisma / node-pg then cannot
+    // map it to the declared enum. For a single-table query, recover the enum
+    // marker + OID from the scanned table's stored schema (cheap cached load;
+    // exec_select is the DataFusion path, not the hot point-read fast path).
+    // Joins (`_multi_table_`) and metadata-free schemas skip.
+    let ws_schema = if primary_table.as_str() != "_multi_table_"
+        && ws_schema
+            .fields()
+            .iter()
+            .any(|f| f.data_type() == &arrow_schema::DataType::Utf8)
+    {
+        reattach_enum_oids(sess, &primary_table, ws_schema).await
+    } else {
+        ws_schema
+    };
 
     // Change C: when the shard is wired in we know there are large per-project
     // tails on the same runtime. Move the DataFusion executor onto the
@@ -11694,6 +11711,61 @@ fn pg_style_nullary_fn_column_names(schema: &Arc<Schema>) -> Arc<Schema> {
         Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
     } else {
         Arc::clone(schema)
+    }
+}
+
+/// Reattach `BASIN_ENUM_TYPE` + `BASIN_ENUM_OID` metadata to result columns
+/// that source from a user-enum column of `table`. DataFusion drops Arrow field
+/// metadata through planning, so without this the pgwire layer advertises TEXT
+/// (OID 25) for enum columns and Prisma / node-pg cannot map them. Best-effort:
+/// any failure (load error, no enum columns) leaves the schema unchanged — an
+/// enum that falls back to TEXT is no worse than before. Matches result fields
+/// to enum columns by bare name (the common single-table ORM `SELECT` shape).
+pub(crate) async fn reattach_enum_oids(
+    sess: &ProjectSession,
+    table: &TableName,
+    schema: Arc<Schema>,
+) -> Arc<Schema> {
+    let Ok(meta) = crate::session::load_table_meta_cached_err(sess, table).await else {
+        return schema;
+    };
+    let mut enum_cols: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for f in meta.schema.fields() {
+        if let Some(enum_name) = f.metadata().get(crate::types::BASIN_ENUM_TYPE_KEY) {
+            enum_cols.insert(f.name().clone(), enum_name.clone());
+        }
+    }
+    if enum_cols.is_empty() {
+        return schema;
+    }
+    let mut changed = false;
+    let new_fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let f = f.as_ref();
+            if f.data_type() == &DataType::Utf8
+                && f.metadata().get(crate::types::BASIN_ENUM_OID_KEY).is_none()
+            {
+                if let Some(enum_name) = enum_cols.get(f.name()) {
+                    changed = true;
+                    let oid = basin_catalog::info_schema::enum_oid(&sess.project, enum_name);
+                    let mut md = f.metadata().clone();
+                    md.insert(
+                        crate::types::BASIN_ENUM_TYPE_KEY.to_string(),
+                        enum_name.clone(),
+                    );
+                    md.insert(crate::types::BASIN_ENUM_OID_KEY.to_string(), oid.to_string());
+                    return f.clone().with_metadata(md);
+                }
+            }
+            f.clone()
+        })
+        .collect();
+    if changed {
+        Arc::new(Schema::new(new_fields))
+    } else {
+        schema
     }
 }
 
