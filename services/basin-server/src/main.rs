@@ -1042,10 +1042,18 @@ async fn build_raft_wal(cfg: &Cfg) -> Result<basin_wal::RaftWal> {
             basin_wal::StaticPeers::parse(&peer_spec)
                 .map_err(|e| anyhow!("parse BASIN_RAFT_PEERS for transport: {e}"))?,
         );
-        let factory = basin_wal::TonicNetworkFactory::with_shared(
+        // Optional mutual TLS (BASIN_RAFT_TLS_CERT/KEY/CA). All-or-none: a
+        // partial config is a startup error (no silent plaintext fallback).
+        let tls = basin_wal::RaftTlsConfig::from_env()
+            .map_err(|e| anyhow!("raft mTLS config: {e}"))?;
+        let mut factory = basin_wal::TonicNetworkFactory::with_shared(
             peers,
             basin_wal::TonicNetworkConfig::from_env(),
         );
+        if let Some(tls) = &tls {
+            factory = factory.with_tls(tls.clone());
+            tracing::info!("raft transport: mutual TLS enabled (BASIN_RAFT_TLS_*)");
+        }
         let wal = basin_wal::RaftWal::new_with_network(wal_cfg, factory)
             .await
             .map_err(|e| anyhow!("open RaftWal (tonic transport): {e}"))?;
@@ -1059,7 +1067,7 @@ async fn build_raft_wal(cfg: &Cfg) -> Result<basin_wal::RaftWal> {
         // is intentionally detached (the OS reclaims the socket on exit, and
         // graceful shutdown drops the RaftWal which stops the raft core). The
         // bound addr is logged for operator confirmation.
-        let (bound, _server) = basin_wal::serve_raft(svc, bind_addr)
+        let (bound, _server) = basin_wal::serve_raft_with_tls(svc, bind_addr, tls)
             .await
             .map_err(|e| anyhow!("start raft transport on {}: {e}", rcfg.bind))?;
         tracing::info!(bind = %bound, "raft transport server listening (tonic/gRPC)");

@@ -61,6 +61,7 @@ use super::codec;
 use super::peers::PeerRegistry;
 use super::proto::raft_transport_client::RaftTransportClient;
 use super::proto::{raft_rpc_response, RaftRpcRequest};
+use super::tls::RaftTlsConfig;
 use crate::raft_wal::BasinRaftTypeConfig;
 
 type C = BasinRaftTypeConfig;
@@ -139,13 +140,16 @@ struct CachedChannel {
     channel: Channel,
 }
 
-/// Factory: owns the peer registry, the per-peer channel cache, and the
-/// transport config. Cloned (cheap — all `Arc`s) into each `TonicNetwork`.
+/// Factory: owns the peer registry, the per-peer channel cache, the transport
+/// config, and (optionally) the mTLS material. Cloned (cheap — all `Arc`s /
+/// PEM bytes) into each `TonicNetwork`.
 #[derive(Clone)]
 pub struct TonicNetworkFactory<P: PeerRegistry> {
     peers: Arc<P>,
     config: TonicNetworkConfig,
     channels: Arc<Mutex<HashMap<NodeId, CachedChannel>>>,
+    /// mTLS material for outbound channels. `None` ⇒ plaintext (private-net).
+    tls: Option<RaftTlsConfig>,
 }
 
 impl<P: PeerRegistry> TonicNetworkFactory<P> {
@@ -154,6 +158,7 @@ impl<P: PeerRegistry> TonicNetworkFactory<P> {
             peers: Arc::new(peers),
             config,
             channels: Arc::new(Mutex::new(HashMap::new())),
+            tls: None,
         }
     }
 
@@ -163,7 +168,16 @@ impl<P: PeerRegistry> TonicNetworkFactory<P> {
             peers,
             config,
             channels: Arc::new(Mutex::new(HashMap::new())),
+            tls: None,
         }
+    }
+
+    /// Enable mutual TLS on every outbound channel this factory dials. The
+    /// client presents its node identity and verifies each peer against the
+    /// cluster CA + domain (see [`RaftTlsConfig`]). Returns `self` for chaining.
+    pub fn with_tls(mut self, tls: RaftTlsConfig) -> Self {
+        self.tls = Some(tls);
+        self
     }
 }
 
@@ -177,6 +191,7 @@ impl<P: PeerRegistry> RaftNetworkFactory<C> for TonicNetworkFactory<P> {
             peers: self.peers.clone(),
             config: self.config.clone(),
             channels: self.channels.clone(),
+            tls: self.tls.clone(),
         }
     }
 }
@@ -187,6 +202,7 @@ pub struct TonicNetwork<P: PeerRegistry> {
     peers: Arc<P>,
     config: TonicNetworkConfig,
     channels: Arc<Mutex<HashMap<NodeId, CachedChannel>>>,
+    tls: Option<RaftTlsConfig>,
 }
 
 impl<P: PeerRegistry> TonicNetwork<P> {
@@ -196,10 +212,19 @@ impl<P: PeerRegistry> TonicNetwork<P> {
     async fn channel<E: std::error::Error + 'static>(
         &self,
     ) -> Result<Channel, RPCError<NodeId, BasicNode, E>> {
-        let uri = self
+        let resolved = self
             .peers
             .resolve(self.target)
             .ok_or_else(|| unreachable(&PeerUnknown(self.target)))?;
+        // With mTLS on, a registry that returns a bare `http://` (the
+        // `normalize_uri` default) must be dialed over `https://` — the scheme
+        // is what makes tonic run the TLS handshake. An explicit `https://`
+        // from the operator is left untouched.
+        let uri = if self.tls.is_some() {
+            upgrade_to_https(&resolved)
+        } else {
+            resolved
+        };
 
         let mut guard = self.channels.lock().expect("channel cache mutex poisoned");
         if let Some(cached) = guard.get(&self.target) {
@@ -210,7 +235,7 @@ impl<P: PeerRegistry> TonicNetwork<P> {
             guard.remove(&self.target);
         }
 
-        let endpoint = Endpoint::from_shared(uri.clone())
+        let mut endpoint = Endpoint::from_shared(uri.clone())
             .map_err(|e| unreachable(&DialError(self.target, e.to_string())))?
             .connect_timeout(self.config.connect_timeout)
             .timeout(self.config.rpc_timeout)
@@ -228,6 +253,16 @@ impl<P: PeerRegistry> TonicNetwork<P> {
             .http2_keep_alive_interval(self.config.connect_timeout)
             .keep_alive_timeout(self.config.rpc_timeout)
             .keep_alive_while_idle(true);
+
+        // Apply mTLS to the endpoint when configured: present our node identity
+        // and verify the peer against the cluster CA + domain. A bad TLS config
+        // is a dial setup error → Unreachable (back off), never silent
+        // plaintext.
+        if let Some(tls) = &self.tls {
+            endpoint = endpoint
+                .tls_config(tls.client_tls())
+                .map_err(|e| unreachable(&DialError(self.target, e.to_string())))?;
+        }
 
         // `connect_lazy` returns immediately; the first RPC drives the dial,
         // and a dial failure surfaces there as a tonic transport error which
@@ -450,3 +485,36 @@ struct StatusWrap(tonic::Status);
 #[derive(Debug, thiserror::Error)]
 #[error("raft peer {0} returned an empty response envelope")]
 struct EmptyEnvelope(NodeId);
+
+/// Rewrite a `http://…` URI to `https://…` so tonic runs the TLS handshake.
+/// A URI that already names `https://` (operator opted in explicitly) is
+/// returned unchanged; anything else is prefixed defensively.
+fn upgrade_to_https(uri: &str) -> String {
+    if let Some(rest) = uri.strip_prefix("http://") {
+        format!("https://{rest}")
+    } else if uri.starts_with("https://") {
+        uri.to_string()
+    } else {
+        format!("https://{uri}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upgrade_to_https;
+
+    #[test]
+    fn upgrades_http_scheme() {
+        assert_eq!(upgrade_to_https("http://10.0.0.1:6010"), "https://10.0.0.1:6010");
+    }
+
+    #[test]
+    fn leaves_https_untouched() {
+        assert_eq!(upgrade_to_https("https://node:6010"), "https://node:6010");
+    }
+
+    #[test]
+    fn prefixes_bare_authority() {
+        assert_eq!(upgrade_to_https("node:6010"), "https://node:6010");
+    }
+}

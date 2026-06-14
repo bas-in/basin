@@ -22,18 +22,21 @@
 //!   with lazy connect, reconnect-with-backoff, channel reuse, request
 //!   timeouts, and typed error mapping into openraft's RPCError semantics.
 //!
-//! ## Security posture (honest)
+//! ## Security posture
 //!
-//! v1 ships **plaintext gRPC, no authentication**. The cluster network is
-//! assumed private (a single VPC / private mesh) and the raft port is NOT
+//! The transport defaults to **plaintext gRPC** for a private cluster network
+//! (a single VPC / private mesh, e.g. fly.io 6PN) where the raft port is NOT
 //! exposed publicly. The openraft `Vote` carried in every RPC fences stale
-//! leaders at the protocol layer, but it provides NO confidentiality and NO
-//! peer authentication: anyone who can reach `BASIN_RAFT_BIND` can speak raft
-//! to this node. **mTLS is the required production follow-up** — tonic's
-//! `tls_config` on both `Server` and `Channel` is the seam, and the
-//! [`PeerRegistry`] already returns full URIs so a future `https://` scheme +
-//! client cert wiring is additive. Do not run this transport across an
-//! untrusted network until mTLS lands.
+//! leaders at the protocol layer.
+//!
+//! For deployments that cannot assume a trusted network, **mutual TLS** is
+//! opt-in via [`tls::RaftTlsConfig`] (`BASIN_RAFT_TLS_CERT/KEY/CA`): both ends
+//! present a certificate signed by the cluster CA, giving confidentiality plus
+//! peer authentication — a node that cannot prove cluster membership cannot
+//! speak raft. The [`PeerRegistry`] returns full URIs; with TLS on, a bare
+//! `http://` is upgraded to `https://` so tonic runs the handshake. Use mTLS
+//! whenever the raft port is reachable from anything outside the trusted
+//! cluster network.
 
 #[allow(clippy::all)]
 pub(crate) mod proto {
@@ -45,7 +48,12 @@ pub mod client;
 pub mod codec;
 pub mod peers;
 pub mod server;
+pub mod tls;
 
 pub use client::{TonicNetworkFactory, TonicNetworkConfig};
 pub use peers::{PeerRegistry, StaticPeers};
-pub use server::{raft_bind_addr_from_env, serve_raft, serve_raft_on_listener, RaftTransportService};
+pub use server::{
+    raft_bind_addr_from_env, serve_raft, serve_raft_on_listener,
+    serve_raft_on_listener_with_tls, serve_raft_with_tls, RaftTransportService,
+};
+pub use tls::{RaftTlsConfig, DEFAULT_RAFT_TLS_DOMAIN};

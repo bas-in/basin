@@ -33,6 +33,7 @@ use tonic::{Request, Response, Status};
 use super::codec;
 use super::proto::raft_transport_server::{RaftTransport, RaftTransportServer};
 use super::proto::{raft_rpc_response, RaftRpcRequest, RaftRpcResponse};
+use super::tls::RaftTlsConfig;
 use crate::raft_wal::BasinRaftTypeConfig;
 
 type C = BasinRaftTypeConfig;
@@ -134,12 +135,23 @@ pub async fn serve_raft(
     service: RaftTransportService,
     addr: SocketAddr,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    serve_raft_with_tls(service, addr, None).await
+}
+
+/// As [`serve_raft`], but applies mutual TLS when `tls` is `Some` (presents the
+/// node identity and requires a CA-signed client cert; see [`RaftTlsConfig`]).
+/// `None` ⇒ plaintext (the private-network default).
+pub async fn serve_raft_with_tls(
+    service: RaftTransportService,
+    addr: SocketAddr,
+    tls: Option<RaftTlsConfig>,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     // Bind explicitly first so we can recover the OS-assigned port when the
     // caller passed `:0`.
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| BasinError::wal(format!("raft bind {addr}: {e}")))?;
-    serve_raft_on_listener(service, listener)
+    serve_raft_on_listener_with_tls(service, listener, tls)
 }
 
 /// As [`serve_raft`], but serves on an already-bound [`TcpListener`]. Tests
@@ -150,6 +162,16 @@ pub fn serve_raft_on_listener(
     service: RaftTransportService,
     listener: tokio::net::TcpListener,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    serve_raft_on_listener_with_tls(service, listener, None)
+}
+
+/// As [`serve_raft_on_listener`], but applies mutual TLS when `tls` is `Some`.
+/// `None` ⇒ plaintext.
+pub fn serve_raft_on_listener_with_tls(
+    service: RaftTransportService,
+    listener: tokio::net::TcpListener,
+    tls: Option<RaftTlsConfig>,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let local_addr = listener
         .local_addr()
         .map_err(|e| BasinError::wal(format!("raft local_addr: {e}")))?;
@@ -157,8 +179,19 @@ pub fn serve_raft_on_listener(
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let server = service.into_server();
 
+    // Build the tonic server, applying server-side mTLS up front so a config
+    // error fails before the task is spawned (rather than logging a warn from
+    // inside the detached task).
+    let mut builder = tonic::transport::Server::builder();
+    let secure = tls.is_some();
+    if let Some(tls) = tls {
+        builder = builder
+            .tls_config(tls.server_tls())
+            .map_err(|e| BasinError::wal(format!("raft transport server TLS config: {e}")))?;
+    }
+
     let join = tokio::spawn(async move {
-        if let Err(e) = tonic::transport::Server::builder()
+        if let Err(e) = builder
             .add_service(server)
             .serve_with_incoming(incoming)
             .await
@@ -167,7 +200,11 @@ pub fn serve_raft_on_listener(
         }
     });
 
-    tracing::info!(addr = %local_addr, "raft transport listening (plaintext; private network assumed)");
+    if secure {
+        tracing::info!(addr = %local_addr, "raft transport listening (mutual TLS)");
+    } else {
+        tracing::info!(addr = %local_addr, "raft transport listening (plaintext; private network assumed)");
+    }
     Ok((local_addr, join))
 }
 
