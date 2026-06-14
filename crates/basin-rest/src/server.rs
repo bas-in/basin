@@ -358,7 +358,10 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         // Operator-grade endpoints: provision per-project pgwire credentials
         // and rotate them. All gated on `claims.is_admin == true` (see
         // `admin_routes::*`).
-        .route("/admin/v1/projects", post(admin_routes::provision_project))
+        .route(
+            "/admin/v1/projects",
+            post(admin_routes::provision_project).get(admin_routes::list_projects),
+        )
         // Cloud control-plane: deprovision (delete) a project.
         .route(
             "/admin/v1/projects/:project_id",

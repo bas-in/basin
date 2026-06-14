@@ -297,6 +297,14 @@ pub trait AuthStore: Send + Sync {
     /// Returns `(project_id, pgwire_user)` pairs.
     async fn list_legacy_project_credentials(&self) -> Result<Vec<(ProjectId, String)>>;
 
+    /// Distinct project ids that have at least one pgwire credential — the
+    /// project enumeration the cloud control plane lists. The default returns
+    /// empty (stores that don't back credentials have no projects to list);
+    /// the Postgres store overrides it with a `SELECT DISTINCT`.
+    async fn list_projects(&self) -> Result<Vec<ProjectId>> {
+        Ok(Vec::new())
+    }
+
     /// Delete a single credential row by `pgwire_user`. Called after a
     /// successful migration INSERT to clean up the old-format row.
     /// Returns `NotFound` when the row is already gone (idempotent).

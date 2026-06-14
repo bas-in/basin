@@ -8,6 +8,14 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-15 — Cloud control-plane: list projects
+
+- **`GET /admin/v1/projects`** enumerates all provisioned project ids (distinct
+  `project_id` over the credential store, new `AuthStore::list_projects` +
+  `AuthService::list_projects`). Admin-global (`require_admin`; not project-
+  scoped). Dashboard table-stakes — there was previously no way to enumerate
+  projects over HTTP. Pinned by `admin_list_projects_enumerates`.
+
 ## 2026-06-15 — Cloud control-plane: deprovision (DELETE) a project
 
 - **`DELETE /admin/v1/projects/:id`** fully deprovisions a project: deletes its

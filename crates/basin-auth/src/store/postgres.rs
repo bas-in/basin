@@ -788,6 +788,29 @@ impl AuthStore for PostgresAuthStore {
             .collect()
     }
 
+    async fn list_projects(&self) -> Result<Vec<ProjectId>> {
+        let client = self.client.lock().await;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT DISTINCT project_id
+                     FROM {sch}_auth_project_credentials
+                     ORDER BY project_id ASC",
+                    sch = self.sch()
+                ),
+                &[],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("list_projects: {e}")))?;
+        rows.into_iter()
+            .map(|r| {
+                let s: String = r.get(0);
+                s.parse::<ProjectId>()
+                    .map_err(|e| BasinError::internal(format!("list_projects parse: {e}")))
+            })
+            .collect()
+    }
+
     async fn delete_project_credential(&self, pgwire_user: &str) -> Result<()> {
         let client = self.client.lock().await;
         let n = client

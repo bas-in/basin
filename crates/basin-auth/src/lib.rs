@@ -463,6 +463,12 @@ impl AuthService {
         project_credentials::list(&self.inner, project).await
     }
 
+    /// Distinct project ids that have at least one pgwire credential — the
+    /// cloud control plane's project enumeration.
+    pub async fn list_projects(&self) -> Result<Vec<ProjectId>> {
+        self.inner.store.list_projects().await
+    }
+
     /// Delete every pgwire credential for `project` — the credential half of
     /// project deprovisioning (the storage bytes + catalog rows are torn down
     /// by the engine/storage layers). Returns the number of credentials

@@ -137,6 +137,20 @@ pub(crate) async fn get_project_usage(
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
+/// `GET /admin/v1/projects` — enumerate all project ids (control-plane project
+/// list). Admin-global: `require_admin` only (it lists across projects, so it is
+/// not scoped to a single path project).
+pub(crate) async fn list_projects(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    require_admin(&claims)?;
+    let projects = state.cfg.auth.list_projects().await.map_err(ApiError::from)?;
+    let ids: Vec<String> = projects.iter().map(|p| p.to_string()).collect();
+    Ok((StatusCode::OK, Json(json!({ "projects": ids }))).into_response())
+}
+
 /// `GET /admin/v1/projects/{project_id}/tables` — list the project's table
 /// names (dashboard schema browser). Admin-scoped, read-only.
 pub(crate) async fn list_project_tables(

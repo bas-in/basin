@@ -953,3 +953,62 @@ async fn admin_delete_project_deprovisions() {
     let r2 = http_request(addr, "DELETE", &format!("/admin/v1/projects/{}", fx.project), &[], None).await;
     assert_ne!(r2.status, 204, "delete without an admin token must be rejected");
 }
+
+/// `GET /admin/v1/projects` enumerates all provisioned projects. Provision two,
+/// then list and assert both appear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_list_projects_enumerates() {
+    let Some(fx) = boot().await else {
+        return;
+    };
+    let bearer_hdr = bearer(&fx.token);
+    let auth = ("Authorization", bearer_hdr.as_str());
+    let ct = ("Content-Type", "application/json");
+    let addr = fx.running.local_addr;
+
+    let p2 = ProjectId::new();
+    for pid in [fx.project.to_string(), p2.to_string()] {
+        let body = serde_json::json!({ "project_id": pid }).to_string();
+        let r = http_request(
+            addr,
+            "POST",
+            "/admin/v1/projects",
+            &[ct, auth],
+            Some(body.as_bytes()),
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            201,
+            "provision {pid} must succeed; body={:?}",
+            String::from_utf8_lossy(&r.body)
+        );
+    }
+
+    let r = http_request(addr, "GET", "/admin/v1/projects", &[auth], None).await;
+    assert_eq!(
+        r.status,
+        200,
+        "list projects must succeed; body={:?}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let strs: Vec<String> = r.json()["projects"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    assert!(
+        strs.contains(&fx.project.to_string()),
+        "fx.project must be listed, got {strs:?}"
+    );
+    assert!(
+        strs.contains(&p2.to_string()),
+        "second project must be listed, got {strs:?}"
+    );
+
+    // No admin token → rejected.
+    let r2 = http_request(addr, "GET", "/admin/v1/projects", &[], None).await;
+    assert_ne!(r2.status, 200, "list projects without an admin token must be rejected");
+}
