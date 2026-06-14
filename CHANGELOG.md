@@ -8,6 +8,41 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-14 — Cold DELETE write-amp: GIN-only tombstone fast path + FK-cascade re-read skip
+
+- **GIN-only tables now take the DELETE tombstone fast path.** A DELETE on a
+  table whose only secondary index is `USING gin` (jsonb containment / tsvector
+  FTS) previously fell to the cold copy-on-write rewrite — a full-file rewrite
+  plus GIN posting rebuild — because the fast-path gate declined any table with
+  a secondary index. It now admits GIN-only tables (mirroring the UPDATE twin):
+  the read-path overlay guards are tombstone-aware (`table_has_live_overlay`
+  counts `tombstone_count`, so the GIN posting-probe `Empty` short-circuit and
+  `apply_gin_pruning_for_query` fall back to the overlay-aware TombstoneFilter
+  scan while a tombstone is live, and `materialize_overlay_for_table` purges +
+  rebuilds the postings on drain). The point `pk IN (…)` DELETE and the
+  `DELETE … USING` join DELETE now share one `delete_fastpath_table_eligible`
+  gate, and the USING path encodes the join's matched PKs straight to tombstones
+  — skipping the `pk IN (v1..vN)` predicate string build + full DELETE re-parse
+  that made a high-cardinality non-indexed join-delete quadratic. Oracle:
+  `gin_overlay_delete.rs` (routing + adversarial `@>` containment-read +
+  post-drain completeness, point and USING shapes). Source: `dml_mutate.rs`.
+- **Cold DELETE skips the FK-cascade re-read when nothing references the
+  target.** The cold copy-on-write DELETE rebuilt the deleted-PK set by
+  re-reading every rewritten and dropped data file — a second full pass over the
+  rewritten rows — unconditionally for any table with a primary key, purely to
+  feed parent-side FK cascade / NO ACTION enforcement. For the common table that
+  nothing references by foreign key that pass is pure waste. It is now gated on
+  a cheap `fks_referencing` catalog probe (no file I/O): no inbound FK → skip the
+  re-read and the cascade check. Regression:
+  `cold_point_delete_btree_is_pruned_and_correct` (btree-indexed table, scattered
+  point-IN delete, exact-row + pruning asserts).
+- Known limitation (unchanged): a DELETE of scattered rows from a large table
+  carrying a **non-GIN** (btree / GIST / vector) secondary index still takes the
+  cold rewrite of the files holding the matched PKs — those index read paths
+  have no overlay-emptiness guard, so a tombstone could serve a stale row.
+  Matching Postgres's in-place delete there needs overlay-aware btree/GIST
+  maintenance (tracked).
+
 ## 2026-06-14 — Multi-node raft hardening (mTLS transport, chaos-under-load drills, snapshot catch-up, per-region group routing, deploy harness)
 
 - **Mutual TLS for the raft transport (`BASIN_RAFT_TLS_CERT/KEY/CA`).** The
