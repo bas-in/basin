@@ -132,10 +132,12 @@ basin
 Track which clients are online in a channel. Presence state is maintained
 by the engine and broadcast as a diff whenever a client joins or leaves.
 
-### `track(metadata)` / `untrack()`
+Register presence listeners via `.on('presence', …)`. The underlying
+`PresenceChannel` (available through the WS transport) handles tracking
+and emits `sync`, `join`, and `leave` events to registered callbacks.
 
 ```ts
-const channel = basin
+basin
   .channel("room:lobby")
   // Listen for presence events
   .on("presence", { event: "sync" }, (members) => {
@@ -148,13 +150,13 @@ const channel = basin
     console.log("left:", members);
   })
   .subscribe();
-
-// Announce this client to the channel
-channel.track({ userId: "u_42", status: "online" });
-
-// Stop announcing (stays subscribed to events)
-channel.untrack();
 ```
+
+> **Note:** `track(metadata)`, `untrack()`, and `presenceState()` are
+> methods on the internal `PresenceChannel` object created when a
+> `presence` binding is registered. They are not currently exposed
+> directly on `RealtimeChannel`. A future SDK release will surface
+> them on the public channel interface.
 
 ### Presence events
 
@@ -163,15 +165,6 @@ channel.untrack();
 | `"sync"` | full presence snapshot arrives (on first join and after reconnect) |
 | `"join"` | one or more clients joined |
 | `"leave"` | one or more clients left |
-
-### `presenceState()`
-
-Read the current presence map synchronously at any time:
-
-```ts
-const members = channel.presenceState();
-// PresenceMember[] — each has { client_id: string; metadata: unknown }
-```
 
 ### Presence member shape
 
@@ -268,17 +261,9 @@ multiple times.
 
 ### `channel.unsubscribe(): this`
 
-Closes the transport and releases all resources.
+Closes the transport and releases all resources. Idempotent.
 
-### `channel.track(metadata: unknown): void`
-
-Announces this client to the presence channel. Requires a presence binding
-registered via `.on('presence', …)`.
-
-### `channel.untrack(): void`
-
-Stops announcing this client. Does not close the channel.
-
-### `channel.presenceState(): PresenceMember[]`
-
-Returns the current presence snapshot.
+> **`track` / `untrack` / `presenceState`** are methods on the internal
+> `PresenceChannel` class (see `src/realtime/presence.ts`), not yet
+> forwarded to the public `RealtimeChannel`. They will be promoted to
+> the public surface in a future minor release.

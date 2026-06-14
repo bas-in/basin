@@ -3,14 +3,11 @@
 Isomorphic JavaScript / TypeScript client for [Basin](https://basin.run).
 Speaks **directly** to a deployed [`basin-engine`](https://github.com/bas-in/basin)
 (the open-source Rust core, Apache-2.0) — auth, PostgREST-shaped table
-queries today; storage, realtime, and edge functions in engine v0.2.
+queries, object storage, realtime subscriptions, RPC functions, and admin
+project tooling.
 
 Works in Node 18+, browsers, Bun, Deno, Cloudflare Workers — anywhere
 with a global `fetch`.
-
-> **Status — `0.0.1` skeleton.** Public API surface is staked out so
-> app code can be written against it. Method bodies land tier-by-tier;
-> see [`TASKS.md`](./TASKS.md).
 
 ## Install
 
@@ -23,7 +20,7 @@ npm install @bas-in/basin-js
 Deno: `import { createClient } from "jsr:@bas-in/basin-js";` (ships from the
 same source via [JSR](https://jsr.io/@bas-in/basin-js); `jsr.json` is the
 companion manifest in this repo). Browser via CDN:
-`<script type="module" src="https://esm.sh/@bas-in/basin-js@0.1"></script>`.
+`<script type="module" src="https://esm.sh/@bas-in/basin-js"></script>`.
 
 ### Self-host basin
 
@@ -56,12 +53,12 @@ behaves identically to talking to the managed cloud.
   - **Cookie storage (SSR / Next.js / SvelteKit):** use `createServerClient`
     from the `./ssr` sub-path export; it stores the session in an `httpOnly`
     cookie that JavaScript cannot read.
-  - **Memory storage:** pass `storage: undefined` in the `BasinClientOptions`
+  - **Memory storage:** pass `authStorage: undefined` in the `BasinClientOptions`
     to keep the session only in memory — it is lost on page reload, which is
     the correct trade-off for highly sensitive contexts.
   ```ts
   // Memory-only session (no localStorage):
-  const basin = createClient(url, anonKey, { storage: undefined });
+  const basin = createClient(url, anonKey, { authStorage: undefined });
   ```
 
 ## Quickstart
@@ -102,23 +99,28 @@ is open source and deployable to Fly with `./deploy.sh -t engine`
 from the `basin-cloud` repo root, or runnable locally via
 `cargo run -p basin-server`.
 
-Engine v0.1 routes: `/auth/v1/{signup,signin,refresh,verify-email,
+Engine routes: `/auth/v1/{signup,signin,refresh,verify-email,
 reset-password,request-password-reset,magic-link,magic-link/consume,
-api-keys}`, `/rest/v1/:table`, `/health`. OAuth, MFA, storage,
-realtime, and functions return `BasinError('not_implemented')` until
-engine v0.2.
+oauth/:provider/authorize,factors/*}`, `/rest/v1/:table`,
+`/storage/v1/object/*`, `/realtime/v1/{sse,ws}/*`,
+`/admin/v1/projects/*`, `/health`. Two stubs remain:
+`vectorSearch` and `asOf` return `BasinError('not_implemented')` until
+basin-engine grows those operators.
 
 Full reference: <https://basin.run/docs/js-sdk>.
 
 ## API surface
 
-| Namespace        | Methods                                                                                                       |
-|------------------|---------------------------------------------------------------------------------------------------------------|
-| `basin.auth`     | `signUp`, `signInWithPassword`, `signInWithMagicLink`, `consumeMagicLink`, `refreshSession`, `signOut`, `getSession`, `getUser`, `onAuthStateChange`, `requestPasswordReset`, `resetPassword`, `verifyEmail` |
-| `basin.from(t)`  | `.select`, `.insert`, `.update`, `.upsert`, `.delete`, `.eq`, `.neq`, `.gt`, `.gte`, `.lt`, `.lte`, `.like`, `.ilike`, `.is`, `.in`, `.order`, `.limit`, `.range`, `.single`, `.maybeSingle` |
-| `basin.storage`  | `from(bucket).upload`, `.download`, `.list`, `.remove`, `.createSignedUrl`, `.getPublicUrl` — **v0.2** |
-| `basin.realtime` | `.channel(name).on('postgres_changes', …).subscribe()`, `.on('presence', …)`, `.track()`, `.untrack()`, `.presenceState()` |
-| `basin.functions`| `.invoke(fnName, { body })` → `POST /rest/v1/rpc/:fn_name` |
+| Namespace          | Methods / notes |
+|--------------------|-----------------|
+| `basin.auth`       | `signUp`, `signInWithPassword`, `signInWithOAuth`, `signInWithMagicLink`, `consumeMagicLink`, `refreshSession`, `signOut`, `getSession`, `getUser`, `onAuthStateChange`, `requestPasswordReset`, `resetPassword`, `verifyEmail` |
+| `basin.auth.mfa`   | `enroll`, `verify`, `challenge`, `challengeVerify`, `unenroll` — TOTP and WebAuthn, routes final per ADR 0020 |
+| `basin.from(t)`    | `.select`, `.insert`, `.update`, `.upsert`, `.delete`, `.eq`, `.neq`, `.gt`, `.gte`, `.lt`, `.lte`, `.like`, `.ilike`, `.is`, `.in`, `.contains`, `.containedBy`, `.overlaps`, `.textSearch`, `.match`, `.not`, `.or`, `.filter`, `.order`, `.limit`, `.range`, `.single`, `.maybeSingle`, `.cursor`, `.paginate()`, `.stream()`, `.csv()`, `.geojson()`, `.explain()`, `.returning()`, `.headers()` |
+| `basin.storage`    | `from(bucket).upload`, `.download`, `.list`, `.remove`, `.createSignedUrl`, `.getPublicUrl` — routes live per ADR 0021; `.uploadMultipart` / `.uploadResumable` return `not_implemented` (v0.3+) |
+| `basin.channel(t)` | `.on('postgres_changes', filter, cb).subscribe()`, `.on('presence', filter, cb)`, `.unsubscribe()` — SSE or WS picked automatically; presence tracking (`track`/`untrack`/`presenceState`) is on the internal `PresenceChannel`, accessible via the WS transport |
+| `basin.realtime`   | `.channel(topic)`, `.connect()`, `.disconnect()` |
+| `basin.functions`  | `.invoke(fnName, { body })` → `POST /rest/v1/rpc/:fn_name` |
+| `basin.admin`      | `projects.provision({ projectId })`, `projects.rotateCredentials(pgwireUser)`, `projects.listCredentials(projectId)` |
 
 ## Row Level Security and auth session functions
 
@@ -178,16 +180,14 @@ basin
   .subscribe();
 
 // Presence — track online users in a channel (uses WebSocket)
-const channel = basin
+const presenceChannel = basin
   .channel("room:lobby")
   .on("presence", { event: "sync" }, (members) => {
     console.log("online:", members);
   })
   .subscribe();
 
-channel.track({ userId: "u_42", status: "online" });
-// channel.untrack();   // stop announcing
-// channel.unsubscribe(); // close transport
+// presenceChannel.unsubscribe(); // close transport
 ```
 
 Full guide: [`docs/realtime.md`](./docs/realtime.md).
@@ -238,6 +238,39 @@ psql "postgres://{tenant_id}_{hex}:<api_key>@<engine-host>:5433/basin"
 After connecting via pgwire, `auth.uid()` / `auth.role()` / `auth.jwt()`
 work identically to the REST path — the same RLS policies apply.
 
+## Streaming and pagination
+
+The query builder supports two streaming modes for large result sets:
+
+```ts
+// .stream() — NDJSON row-by-row (low memory, any size)
+for await (const row of basin.from('events').select('*').stream()) {
+  process(row);
+}
+
+// .paginate() — cursor-based transparent pagination
+for await (const row of basin.from('events').select('*').order('id').paginate()) {
+  process(row);
+}
+```
+
+The engine auto-promotes responses > 1 MiB or > 10 000 rows to NDJSON.
+The `then()` path on the builder handles this transparently — large
+`.select()` calls always work even without explicit streaming.
+
+## Not-implemented stubs
+
+Two query-builder methods exist as forward-compat placeholders and return
+`BasinError('not_implemented')` at runtime until the engine grows the
+corresponding operators:
+
+- `.vectorSearch(column, query, opts)` — vector ANN search (v0.3+)
+- `.asOf(snapshotId)` — MVCC time-travel snapshot read (v0.3+)
+
+Both storage upload variants are also stubs:
+- `storage.from(bucket).uploadMultipart(...)` — multipart > 5 MB (v0.3+)
+- `storage.from(bucket).uploadResumable(...)` — TUS resumable upload (v0.3+)
+
 ## Tree-shaking
 
 Sub-path imports for consumers who only want one namespace:
@@ -246,6 +279,9 @@ Sub-path imports for consumers who only want one namespace:
 import { AuthClient } from "@bas-in/basin-js/auth";
 import { PostgrestQueryBuilder } from "@bas-in/basin-js/postgrest";
 import { StorageClient } from "@bas-in/basin-js/storage";
+import { createServerClient } from "@bas-in/basin-js/ssr";
+import { FunctionsClient } from "@bas-in/basin-js/functions";
+import { AdminClient } from "@bas-in/basin-js/admin";
 ```
 
 ## License

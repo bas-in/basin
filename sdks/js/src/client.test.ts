@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BasinError, createClient } from "./index.js";
+import { createClient } from "./index.js";
 
 describe("createClient", () => {
   it("constructs a client with every namespace", () => {
