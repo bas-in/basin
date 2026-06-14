@@ -157,6 +157,15 @@ pub struct ForeignKeyDef {
     pub on_delete: RefAction,
     #[serde(default)]
     pub on_update: RefAction,
+    /// `DEFERRABLE INITIALLY DEFERRED` — Postgres checks such FKs at COMMIT,
+    /// not at the statement, so a transaction may insert children before
+    /// parents (Django/Rails migrations rely on this). Basin has no
+    /// commit-time FK pass yet, so a deferred FK is accepted without
+    /// per-row enforcement — a documented v0.1 limitation scoped to FKs the
+    /// user explicitly marked `INITIALLY DEFERRED`. `#[serde(default)]`
+    /// keeps every existing catalog payload deserialising as `false`.
+    #[serde(default)]
+    pub initially_deferred: bool,
 }
 
 /// Within-project partitioning declared via `CREATE TABLE … PARTITION BY …`.

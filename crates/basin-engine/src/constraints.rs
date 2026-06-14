@@ -1478,6 +1478,16 @@ pub(crate) async fn enforce_fk_on_insert(
         return Ok(());
     }
     for fk in foreign_keys {
+        // DEFERRABLE INITIALLY DEFERRED: Postgres validates these at COMMIT,
+        // not at the statement, so a transaction may legally insert children
+        // before their parents (Django/Rails migrations do exactly this).
+        // Basin has no commit-time FK pass yet, so we accept a deferred FK
+        // without per-row enforcement rather than reject the legal ordering —
+        // a documented v0.1 limitation scoped to FKs the user explicitly
+        // marked INITIALLY DEFERRED. Immediate FKs are still enforced here.
+        if fk.initially_deferred {
+            continue;
+        }
         // Local column indexes.
         let local_idx: Vec<usize> = fk
             .columns

@@ -333,6 +333,10 @@ pub(crate) fn schema_and_constraints_from_columns(
                         ref_columns,
                         on_delete: on_delete_act,
                         on_update: on_update_act,
+                        // Column-level inline FK: `DEFERRABLE` on a column
+                        // constraint is rare (PG-migration DDL uses the
+                        // table-level ADD CONSTRAINT form); treat as immediate.
+                        initially_deferred: false,
                     };
                     // When the user omits the referenced column list we
                     // can't validate the FK against the target table's
@@ -721,6 +725,7 @@ pub(crate) fn schema_and_constraints_from_columns(
                 referred_columns,
                 on_delete,
                 on_update,
+                characteristics,
                 ..
             }) => {
                 if foreign_table.0.len() != 1 {
@@ -750,6 +755,9 @@ pub(crate) fn schema_and_constraints_from_columns(
                     Some(n) => n.value.clone(),
                     None => format!("{table_name}_{}_fkey", local_cols[0]),
                 };
+                let initially_deferred = characteristics.as_ref().is_some_and(|c| {
+                    matches!(c.initially, Some(sqlparser::ast::DeferrableInitial::Deferred))
+                });
                 if !degraded {
                     extracted.foreign_keys.push(ForeignKeyDef {
                         name: fk_name,
@@ -758,6 +766,7 @@ pub(crate) fn schema_and_constraints_from_columns(
                         ref_columns: ref_cols,
                         on_delete: on_delete_act,
                         on_update: on_update_act,
+                        initially_deferred,
                     });
                 }
             }

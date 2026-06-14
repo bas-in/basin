@@ -8,6 +8,21 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-14 — DEFERRABLE INITIALLY DEFERRED foreign keys (ORM migrations)
+
+- **`FOREIGN KEY … DEFERRABLE INITIALLY DEFERRED` is now accepted and treated as
+  deferred.** Postgres validates such FKs at `COMMIT`, not at the statement, so a
+  transaction may legally insert a child row before its parent — exactly what
+  Django/Rails migrations emit (create both tables, then insert seed rows in
+  dependency-free order inside one transaction). The prior `ALTER ADD FK`
+  enforcement change checked every FK per-row at insert, which rejected this
+  legal ordering and rolled the migration back. The FK's `INITIALLY DEFERRED`
+  characteristic is now parsed (both `CREATE TABLE` and `ALTER ADD CONSTRAINT`)
+  and recorded on the catalog `ForeignKeyDef` (`initially_deferred`,
+  `#[serde(default)]` so existing catalog payloads are unaffected); deferred FKs
+  skip per-row enforcement while **immediate FKs are still enforced**. Commit-time
+  validation of deferred FKs remains future work and is documented as such.
+
 ## 2026-06-14 — ALTER TABLE ADD CONSTRAINT … FOREIGN KEY (ORM migrations)
 
 - **`ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY …` is now accepted and enforced.**

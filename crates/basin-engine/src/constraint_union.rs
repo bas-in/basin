@@ -1073,6 +1073,7 @@ mod tests {
                     ref_columns: vec!["id".into()],
                     on_delete: RefAction::NoAction,
                     on_update: RefAction::NoAction,
+                    initially_deferred: false,
                 }],
             )
             .await;
@@ -1116,6 +1117,7 @@ mod tests {
                     ref_columns: vec!["id".into()],
                     on_delete: RefAction::NoAction,
                     on_update: RefAction::NoAction,
+                    initially_deferred: false,
                 }],
             )
             .await;
@@ -1154,6 +1156,7 @@ mod tests {
                     ref_columns: vec!["id".into()],
                     on_delete: RefAction::NoAction,
                     on_update: RefAction::NoAction,
+                    initially_deferred: false,
                 }],
             )
             .await;

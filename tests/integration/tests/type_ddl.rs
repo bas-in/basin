@@ -137,6 +137,36 @@ async fn alter_add_foreign_key_registers_and_enforces() {
     );
 }
 
+/// `DEFERRABLE INITIALLY DEFERRED` FKs are checked at COMMIT in Postgres, not
+/// at the statement, so a transaction may insert a child before its parent —
+/// the exact shape Django/Rails migrations emit. Basin accepts the deferred FK
+/// without per-row enforcement (documented v0.1 limitation): the child insert
+/// that would violate an *immediate* FK must succeed here. This is the case my
+/// ALTER-ADD-FK enforcement fix regressed; the `initially_deferred` flag
+/// distinguishes it from an immediate FK (which still rejects — see above).
+#[tokio::test]
+async fn deferred_foreign_key_allows_child_before_parent() {
+    let (_dir, engine) = open_engine().await;
+    let sess = open_session(&engine).await;
+
+    exec_ok(&sess, "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)").await;
+    exec_ok(
+        &sess,
+        "CREATE TABLE child (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT)",
+    )
+    .await;
+    exec_ok(
+        &sess,
+        "ALTER TABLE child ADD CONSTRAINT child_parent_fk FOREIGN KEY (parent_id) \
+         REFERENCES parent (id) DEFERRABLE INITIALLY DEFERRED",
+    )
+    .await;
+
+    // A reference with no matching parent row would be rejected for an
+    // immediate FK; for a deferred FK it is accepted (not enforced per-row).
+    exec_ok(&sess, "INSERT INTO child VALUES (1, 999)").await;
+}
+
 /// ORMs (Django, et al.) stamp enum values in INSERT as an explicit cast —
 /// `'USER'::"Role"` (sqlparser: `CAST('USER' AS "Role")`, sometimes nested via
 /// `::TEXT`). The cast-wrapped literal must coerce to the enum (stored as Utf8)

@@ -890,6 +890,7 @@ async fn add_constraint(
             referred_columns,
             on_delete,
             on_update,
+            characteristics,
             ..
         }) => {
             // `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY …` — the shape ORM
@@ -944,6 +945,9 @@ async fn add_constraint(
             if !degraded {
                 let on_delete_act = crate::ddl::referential_action_from_ast(*on_delete)?;
                 let on_update_act = crate::ddl::referential_action_from_ast(*on_update)?;
+                let initially_deferred = characteristics.as_ref().is_some_and(|c| {
+                    matches!(c.initially, Some(sqlparser::ast::DeferrableInitial::Deferred))
+                });
                 let mut fks = meta.foreign_keys.clone();
                 fks.push(ForeignKeyDef {
                     name: fk_name,
@@ -952,6 +956,7 @@ async fn add_constraint(
                     ref_columns: ref_cols,
                     on_delete: on_delete_act,
                     on_update: on_update_act,
+                    initially_deferred,
                 });
                 catalog
                     .set_table_constraints(
