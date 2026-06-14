@@ -10,6 +10,12 @@ graduate to 1.0 and the standard SemVer guarantees.
 
 ## 2026-06-14 — ORM SQL-shape fixes (Drizzle, SQLAlchemy, Django, gorm)
 
+- **`(expr AT TIME ZONE 'tz')::date`** (Django `__date` lookups) now plans. The
+  backward LHS scan in the `AT TIME ZONE` rewriter stopped at whitespace/comma
+  but not `(`, so a parenthesized LHS like `("t"."col" AT TIME ZONE 'tz')`
+  swallowed the leading paren and produced `at_time_zone(("t"."col", 'tz'))` — a
+  single struct argument that failed coercion. The scan now also stops at `(`.
+
 Five fixes for SQL shapes real ORMs emit, each validated by a toolchain-free
 regression test (`tests/integration/tests/orm_sql_shapes.rs`) plus, for the
 wire-protocol fix, a router unit test:
