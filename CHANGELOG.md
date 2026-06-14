@@ -21,6 +21,12 @@ graduate to 1.0 and the standard SemVer guarantees.
   REGRESSION → PASS. Regression test: `protocol::tests::startup_server_version_is_pg_compatible`
   (asserts major ≥ 14 and that we do not ship pgwire's crate-version default).
   Source: `crates/basin-router/src/protocol.rs`.
+- **`pg_catalog.pg_type` now exposes `typarray` / `typelem` / `typdelim`.**
+  psycopg (and SQLAlchemy on it) loads its type cache at connect time with a
+  query selecting those columns; their absence aborted the connection ("column
+  typarray does not exist") and cascaded to the whole SQLAlchemy suite. Basin
+  does not model distinct array-type OIDs, so `typarray`/`typelem` are 0 and
+  `typdelim` is the standard comma. Source: `crates/basin-catalog/src/info_schema.rs`.
 
 ## 2026-06-14 — Cold DELETE write-amp: GIN-only tombstone fast path + FK-cascade re-read skip
 
