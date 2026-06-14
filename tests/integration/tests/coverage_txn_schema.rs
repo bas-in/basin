@@ -475,6 +475,39 @@ async fn schema_alter_add_column_not_null_with_default_allowed() {
     }
 }
 
+/// Explicit `DEFAULT` keyword in INSERT value position — `INSERT INTO t (id, n)
+/// VALUES (1, DEFAULT)` — must apply the column's DEFAULT (ORMs emit this for
+/// not-null-with-default columns they don't set). Both the column-list and
+/// no-column-list forms are covered.
+#[tokio::test]
+async fn insert_explicit_default_keyword_applies_column_default() {
+    basin_common::telemetry::try_init_for_tests();
+    let dir = TempDir::new().unwrap();
+    let eng = make_engine(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, n INTEGER DEFAULT 7 NOT NULL, s TEXT DEFAULT 'x')",
+    )
+    .await
+    .unwrap();
+
+    // Column-list form.
+    sess.execute("INSERT INTO t (id, n, s) VALUES (1, DEFAULT, DEFAULT)")
+        .await
+        .expect("explicit DEFAULT in a column-list INSERT must apply the column default");
+    // No-column-list form.
+    sess.execute("INSERT INTO t VALUES (2, DEFAULT, DEFAULT)")
+        .await
+        .expect("explicit DEFAULT in a no-column-list INSERT must apply the column default");
+
+    // The DEFAULT (7) was applied to the NOT NULL column, not NULL.
+    let got = count_rows_result(sess.execute("SELECT COUNT(*) FROM t WHERE n = 7").await.unwrap());
+    assert_eq!(got, 2, "both rows must have n defaulted to 7");
+    let s_got = count_rows_result(sess.execute("SELECT COUNT(*) FROM t WHERE s = 'x'").await.unwrap());
+    assert_eq!(s_got, 2, "both rows must have s defaulted to 'x'");
+}
+
 /// Multi-column PRIMARY KEY enforcement: both columns together are unique.
 /// A row that duplicates the composite PK must be rejected.
 #[tokio::test]

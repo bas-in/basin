@@ -9447,12 +9447,48 @@ fn expand_insert_rows(
 /// receives a distinct sequence value. See
 /// [`crate::seq_ddl::evaluate_default_expression`] for the per-call
 /// rewrite + parse hop.
+/// True when `e` is the bare SQL `DEFAULT` keyword in a value position.
+/// sqlparser surfaces `INSERT … VALUES (…, DEFAULT)` as an unquoted `DEFAULT`
+/// identifier; a real string value would be quoted, so an unquoted, exactly
+/// case-insensitive "default" identifier is unambiguously the keyword.
+fn expr_is_default_keyword(e: &sqlparser::ast::Expr) -> bool {
+    matches!(
+        e,
+        sqlparser::ast::Expr::Identifier(id)
+            if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("default")
+    )
+}
+
 async fn apply_column_defaults(
     sess: &ProjectSession,
     schema: &Schema,
     insert_columns: &[sqlparser::ast::Ident],
     rows: &mut [Vec<sqlparser::ast::Expr>],
 ) -> Result<()> {
+    // Explicit `DEFAULT` keyword in a value position — `INSERT INTO t (a, v)
+    // VALUES (1, DEFAULT)` (ORMs emit this for not-null-with-default columns
+    // they don't set). sqlparser surfaces it as an unquoted `DEFAULT`
+    // identifier, which the value coercers reject ("expected string literal,
+    // got DEFAULT"). Replace each such marker with the column's DEFAULT
+    // expression, or NULL when the column has no default (PostgreSQL semantics).
+    // Independent of `insert_columns`, so handled before the omitted-column
+    // early-out below.
+    for row in rows.iter_mut() {
+        for (col_idx, field) in schema.fields().iter().enumerate() {
+            if col_idx >= row.len() || !expr_is_default_keyword(&row[col_idx]) {
+                continue;
+            }
+            row[col_idx] = match crate::types::field_default_text(field) {
+                Some(default_text) => {
+                    crate::seq_ddl::evaluate_default_expression(sess, default_text).await?
+                }
+                None => sqlparser::ast::Expr::Value(
+                    sqlparser::ast::Value::Null.with_empty_span(),
+                ),
+            };
+        }
+    }
+
     // Determine which columns the user explicitly mentioned. When
     // `insert_columns` is empty, the user wrote `INSERT INTO t VALUES
     // (...)` — every non-generated column is "mentioned" (the user

@@ -36,6 +36,17 @@ graduate to 1.0 and the standard SemVer guarantees.
   `crates/basin-engine/src/dml.rs` (`coerce_string_ref`); covered by
   `type_ddl::enum_insert_with_cast_label`.
 
+## 2026-06-14 — explicit `DEFAULT` keyword in INSERT values
+
+- **`INSERT INTO t (…, c) VALUES (…, DEFAULT)` applies the column default.** The
+  bare `DEFAULT` keyword in a value position was rejected by the value coercers
+  ("expected string literal, got DEFAULT"); ORMs emit it for not-null-with-default
+  columns they don't set. `apply_column_defaults` now replaces a `DEFAULT` marker
+  with the column's DEFAULT expression (or NULL when the column has none), for
+  both the column-list and no-column-list INSERT forms. Source:
+  `crates/basin-engine/src/executor.rs`; covered by
+  `coverage_txn_schema::insert_explicit_default_keyword_applies_column_default`.
+
 ## 2026-06-14 — array columns render in the PostgreSQL `{…}` text form on the wire
 
 - **Reading an array column returns PG array text `{a,b}` / `{}`.** A `List` /
