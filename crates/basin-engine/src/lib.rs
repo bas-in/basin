@@ -125,6 +125,12 @@ pub(crate) struct EngineInner {
     /// integration tests to prove the promoted read path actually engaged
     /// rather than falling back to the DataFusion / UDF path.
     pub(crate) promoted_fast_select_count: AtomicU64,
+    /// Cumulative number of `ORDER BY <text_col> <-> 'needle' LIMIT k`
+    /// statements served by the trigram-GIN index-assisted kNN fast path
+    /// (`trgm_knn_scan`). Tests assert this advances so they can prove the
+    /// trigram candidate-set narrowing engaged rather than silently falling
+    /// back to the full sequential scan + sort.
+    pub(crate) trgm_knn_routing_count: AtomicU64,
     /// Cumulative number of `WHERE k > $1 ORDER BY k ASC LIMIT n` statements
     /// served by the keyset per-file-LIMIT branch in `fast_select` (including
     /// the overlay-tolerant inflated-limit form). Tests assert on this to
@@ -399,6 +405,7 @@ impl Engine {
             pg_plan_routing_count: AtomicU64::new(0),
             blooms_skipped: AtomicU64::new(0),
             promoted_fast_select_count: AtomicU64::new(0),
+            trgm_knn_routing_count: AtomicU64::new(0),
             keyset_fast_select_count: AtomicU64::new(0),
             unordered_limit_fast_select_count: AtomicU64::new(0),
             topk_late_fast_select_count: AtomicU64::new(0),
@@ -897,6 +904,23 @@ impl Engine {
     /// path).
     pub fn promoted_fast_select_count(&self) -> u64 {
         self.inner.promoted_fast_select_count.load(Ordering::Relaxed)
+    }
+
+    /// Crate-private hook bumped once each time a `ORDER BY <text_col> <->
+    /// 'needle' LIMIT k` statement is served by the trigram-GIN index-assisted
+    /// kNN fast path (`trgm_knn_scan::execute_trgm_knn_plan`).
+    pub(crate) fn note_trgm_knn_routed(&self) {
+        self.inner
+            .trgm_knn_routing_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Number of trigram-index-assisted kNN (`ORDER BY col <-> 'needle' LIMIT
+    /// k`) statements served by the `trgm_knn_scan` fast path since this
+    /// `Engine` was built. Exposed for integration tests that prove the
+    /// candidate-set narrowing engaged vs. falling back to a full scan + sort.
+    pub fn trgm_knn_routing_count(&self) -> u64 {
+        self.inner.trgm_knn_routing_count.load(Ordering::Relaxed)
     }
 
     /// Crate-private hook bumped by `fast_select` each time the keyset
@@ -1664,6 +1688,7 @@ mod sql_functions;
 mod string_dt_udf;
 mod string_more_udf;
 mod trgm_glue;
+mod trgm_knn_scan;
 mod truncate;
 mod type_ddl;
 mod types;

@@ -1578,6 +1578,85 @@ impl GinIndexRegistry {
         plan
     }
 
+    /// Trigram-kNN candidate selection for `ORDER BY col <-> 'needle' LIMIT k`.
+    ///
+    /// A row's trigram distance is `1 - similarity(col, needle)`. A row sharing
+    /// ZERO needle trigrams has `similarity = 0`, hence distance `1` — the worst
+    /// possible. So the exact top-k by distance is drawn entirely from rows
+    /// sharing `>= 1` needle trigram (`min_shared = 1`), UNLESS fewer than `k`
+    /// such candidate rows exist, in which case the remaining slots are filled
+    /// by arbitrary distance-1 (zero-shared-trigram) rows. This method returns
+    /// the candidate set; the executor computes the EXACT `<->` distance on the
+    /// materialised candidate rows (the postings only narrow the SET, never the
+    /// ranking) and handles the boundary fill.
+    ///
+    /// For each live path it reports one of:
+    /// * a sorted superset of candidate row offsets (sealed-row-tier files where
+    ///   every shared-trigram row is enumerable), via [`TrgmKnnFile::Rows`];
+    /// * "scan the whole file" ([`TrgmKnnFile::Full`]) — an un-indexed (forced)
+    ///   file, a file lacking a sealed row tier, or a file where a needle trigram
+    ///   is dense (its row posting was dropped, so candidate rows can't be
+    ///   enumerated): decode in full and let the exact distance re-rank;
+    /// * "no candidate rows here" ([`TrgmKnnFile::None`]) — a coarse-complete
+    ///   sealed file where no needle trigram occurs at all (every row is
+    ///   distance-1). Such a file holds only fill rows, never top-k candidates.
+    ///
+    /// Returns `None` when there is no usable trigram index or the needle has no
+    /// trigrams (needle too short) — the caller declines to the full scan + sort.
+    /// The caller is responsible for the overlay / completeness gate.
+    pub fn probe_trgm_knn_candidates(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        needle: &str,
+        live_paths: &[String],
+    ) -> Option<HashMap<String, TrgmKnnFile>> {
+        let needle_trgms = basin_trgm::extract(needle);
+        if needle_trgms.is_empty() {
+            // Needle too short for any trigram → every row is distance-1 and the
+            // index can prove nothing. Decline; the caller seq-scans.
+            return None;
+        }
+        let terms: Vec<String> = needle_trgms.iter().map(trigram_term).collect();
+
+        let arc = self.get(project, table, col)?;
+        let list = arc.lock().expect("TermPostingList lock poisoned");
+        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let indexed: HashSet<String> = match self.indexed_files.lock() {
+            Ok(map) => map.get(&key).cloned().unwrap_or_default(),
+            Err(_) => return None,
+        };
+        // Row-tier narrowing is only safe on coarse-COMPLETE files (same snapshot
+        // discipline as `probe_trgm_row_selection`): a coarse-incomplete file is
+        // a forced full scan, and a file without a sealed row tier decodes in
+        // full. `min_shared = 1` makes the OR-merge an "any shared trigram" set.
+        let mut out: HashMap<String, TrgmKnnFile> = HashMap::with_capacity(live_paths.len());
+        for path in live_paths {
+            if !indexed.contains(path) {
+                out.insert(path.clone(), TrgmKnnFile::Full); // forced full scan
+                continue;
+            }
+            if !row_tier_enabled() || !list.file_has_row_tier(path) {
+                out.insert(path.clone(), TrgmKnnFile::Full); // coarse decode
+                continue;
+            }
+            match list.probe_trgm_row_offsets(&terms, path, 1) {
+                RowProbe::Full => {
+                    out.insert(path.clone(), TrgmKnnFile::Full);
+                }
+                RowProbe::Absent => {
+                    out.insert(path.clone(), TrgmKnnFile::None);
+                }
+                RowProbe::Rows(offs) => {
+                    let offs64: Vec<u64> = offs.into_iter().map(|o| o as u64).collect();
+                    out.insert(path.clone(), TrgmKnnFile::Rows(offs64));
+                }
+            }
+        }
+        Some(out)
+    }
+
     /// Remove all posting entries for `file_path` in `(project, table, col)`.
     /// Also removes `file_path` from the indexed-files completeness set so
     /// future probes do not erroneously claim full coverage after this file
@@ -2022,6 +2101,22 @@ impl RowSelectionPlan {
     pub fn is_empty(&self) -> bool {
         self.row_offsets.is_empty() && self.prunable.is_empty()
     }
+}
+
+/// Per-file verdict from [`GinIndexRegistry::probe_trgm_knn_candidates`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrgmKnnFile {
+    /// Decode the whole file (un-indexed/forced, no sealed row tier, or a needle
+    /// trigram is dense so candidate rows can't be enumerated). Every decoded
+    /// row is a candidate for the exact distance re-rank.
+    Full,
+    /// Sorted superset of absolute row offsets sharing `>= 1` needle trigram —
+    /// the kNN candidate rows in this file. Other rows in the file are
+    /// distance-1 (fill only).
+    Rows(Vec<u64>),
+    /// A coarse-complete sealed file where no needle trigram occurs at all —
+    /// every row is distance-1 (fill only, never a top-k candidate).
+    None,
 }
 
 // ── Planner detection ─────────────────────────────────────────────────────────
@@ -4162,12 +4257,228 @@ fn extract_make_point_with_srid(expr: &sqlparser::ast::Expr) -> Option<(f64, f64
     }
 }
 
+// ── Trigram kNN — `ORDER BY <text_col> <-> 'needle' LIMIT k` ─────────────────
+//
+// Index-assisted nearest-neighbour over a TEXT column backed by the trigram GIN
+// posting list. The order operator is `<->` (trigram distance, `1 - similarity`),
+// the right-hand side is a single-quoted string literal, and the column carries a
+// `gin_trgm_ops` GIN index in the catalog.
+//
+// DISAMBIGUATION: this detector runs AFTER the pgvector planner (RHS is a quoted
+// `'…'` string, not a `'[…]'` vector literal — the vector planner's literal parse
+// fails) and AFTER the spatial KNN detector (RHS here is a string literal, not an
+// `ST_MakePoint(...)` call). The three `<->` paths are structurally exclusive at
+// the RHS shape and confirmed exclusive at the column-type / index check below.
+//
+// The trigram postings only NARROW the candidate row set — the `<->` distance is
+// always recomputed exactly on every materialised candidate (and on the
+// distance-1 fill rows when there are fewer than `k` candidates), so the result
+// is EXACT top-k, never an approximation.
+
+/// Detected trigram-kNN plan for a `gin_trgm_ops`-indexed TEXT column.
+///
+/// Produced by [`detect_trgm_knn`] when the query matches
+/// `SELECT <proj> FROM <table> ORDER BY <col> <-> '<needle>' LIMIT k` and
+/// `<col>` carries a single-column `gin_trgm_ops` GIN index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrgmKnnPlan {
+    /// Projected output columns. `None` means `SELECT *`.
+    pub projection: Option<Vec<String>>,
+    /// The table to scan.
+    pub table: TableName,
+    /// The indexed TEXT column being ordered by trigram distance.
+    pub col: String,
+    /// The needle (RHS string literal of `<->`).
+    pub needle: String,
+    /// `LIMIT k` — number of nearest rows to return.
+    pub k: usize,
+}
+
+/// Detect `SELECT … FROM t ORDER BY <col> <-> '<needle>' LIMIT k` on a
+/// `gin_trgm_ops`-indexed TEXT column.
+///
+/// `raw_sql` MUST be the original SQL, before the `<->`→`(1.0 - similarity(...))`
+/// rewrite (once the operator is lowered the structural signal is gone — same
+/// invariant as the pgvector and spatial KNN planners).
+///
+/// Returns `None` (caller falls back to the standard scan + sort) on ANY
+/// off-shape query: no `<->`, a non-string-literal RHS, a missing/compound
+/// table, a non-`gin_trgm_ops` column, auxiliary clauses (`OFFSET`, `WHERE`,
+/// `GROUP BY`, …), descending order, or a non-positive `LIMIT`.
+pub async fn detect_trgm_knn(
+    raw_sql: &str,
+    project: &ProjectId,
+    catalog: &Arc<dyn basin_catalog::Catalog>,
+) -> Option<TrgmKnnPlan> {
+    use crate::pg_ast::{ObjectNamePartExt, OrderByExt, QueryClauseExt};
+    use sqlparser::ast::{
+        BinaryOperator, Expr, GroupByExpr, SetExpr, Statement, TableFactor, Value, ValueWithSpan,
+    };
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    // Fast pre-gate: must contain `<->`.
+    if !raw_sql.contains("<->") {
+        return None;
+    }
+
+    // sqlparser parses `a <-> b` as `BinaryOp { op: PGCustomBinaryOperator(["<->"]) }`
+    // in the PG dialect, so unlike the spatial path no pre-rewrite is needed.
+    let dialect = PostgreSqlDialect {};
+    let stmts = Parser::parse_sql(&dialect, raw_sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let query = match &stmts[0] {
+        Statement::Query(q) => q.as_ref(),
+        _ => return None,
+    };
+
+    // LIMIT k — constant positive integer.
+    let k = match query.ext_limit() {
+        Some(Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
+            match s.parse::<i64>() {
+                Ok(n) if n > 0 => n as usize,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    // Reject auxiliary clauses we'd silently lose when routing.
+    if query.with.is_some()
+        || !query.ext_limit_by().is_empty()
+        || query.ext_offset().is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+    {
+        return None;
+    }
+
+    // Exactly one ORDER BY expression, ASC, no NULLS FIRST/LAST.
+    let order = query.order_by.as_ref()?;
+    if order.ext_exprs().len() != 1 {
+        return None;
+    }
+    let order_expr = &order.ext_exprs()[0];
+    if let Some(false) = order_expr.options.asc {
+        return None;
+    }
+    if order_expr.options.nulls_first.is_some() {
+        return None;
+    }
+
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s.as_ref(),
+        _ => return None,
+    };
+    if select.distinct.is_some()
+        || select.top.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || select.selection.is_some()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || select.having.is_some()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+    {
+        return None;
+    }
+    match &select.group_by {
+        GroupByExpr::Expressions(exprs, mods) if exprs.is_empty() && mods.is_empty() => {}
+        _ => return None,
+    }
+
+    // Single bare table, no joins/aliases.
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return None;
+    }
+    let table_name = match &select.from[0].relation {
+        TableFactor::Table { name, alias: None, args: None, .. } => {
+            if name.0.len() != 1 {
+                return None;
+            }
+            name.0[0].id_val().clone()
+        }
+        _ => return None,
+    };
+    let table = TableName::new(table_name).ok()?;
+
+    // ORDER BY expr must be `<col> <-> '<needle>'` (or `'<needle>' <-> <col>` —
+    // trigram distance is symmetric, so either operand may carry the literal).
+    let (col, needle) = match &order_expr.expr {
+        Expr::BinaryOp { left, op, right } => {
+            // sqlparser renders the `<->` operator as `BinaryOperator::LtDashGt`.
+            if !matches!(op, BinaryOperator::LtDashGt) {
+                return None;
+            }
+            let col_of = |e: &Expr| extract_col_name(e);
+            let lit_of = |e: &Expr| extract_string_literal(e);
+            if let (Some(c), Some(n)) = (col_of(left), lit_of(right)) {
+                (c, n)
+            } else if let (Some(n), Some(c)) = (lit_of(left), col_of(right)) {
+                (c, n)
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    // Projection: `*` or a list of bare identifiers.
+    let projection = extract_simple_projection(&select.projection)?;
+
+    // Confirm `col` carries a single-column `gin_trgm_ops` GIN index.
+    let meta = catalog.load_table(project, &table).await.ok()?;
+    let _idx = meta.indexes.iter().find(|idx| {
+        idx.access_method == "gin"
+            && idx.columns.len() == 1
+            && idx.columns[0] == col
+            && idx.opclass.as_deref() == Some("gin_trgm_ops")
+    })?;
+    // Confirm the column exists (a dropped/renamed column → fall back).
+    meta.schema.field_with_name(&col).ok()?;
+
+    Some(TrgmKnnPlan { projection, table, col, needle, k })
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sqlparser_parses_trgm_distance_as_lt_dash_gt() {
+        // The trgm-kNN detector relies on sqlparser rendering `col <-> 'lit'`
+        // as `BinaryOp { op: BinaryOperator::LtDashGt }`. Pin that here so a
+        // sqlparser bump that changes the AST shape fails loudly.
+        use crate::pg_ast::OrderByExt;
+        use sqlparser::ast::{BinaryOperator, Expr, SetExpr, Statement};
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+        let sql = "SELECT id FROM t ORDER BY name <-> 'alice' LIMIT 5";
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parse");
+        let q = match &stmts[0] {
+            Statement::Query(q) => q,
+            _ => panic!("not a query"),
+        };
+        let order = q.order_by.as_ref().expect("order by");
+        let exprs = order.ext_exprs();
+        match &exprs[0].expr {
+            Expr::BinaryOp { op: BinaryOperator::LtDashGt, .. } => {}
+            other => panic!("expected LtDashGt binop, got {other:?}"),
+        }
+        // Sanity: the SELECT body parsed too.
+        assert!(matches!(q.body.as_ref(), SetExpr::Select(_)));
+    }
 
     #[test]
     fn extract_terms_jsonb_ops_flat() {

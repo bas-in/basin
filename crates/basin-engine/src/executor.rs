@@ -2160,6 +2160,34 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         }
     }
 
+    // Trigram-index-assisted kNN — auto-route `ORDER BY <text_col> <-> 'needle'
+    // LIMIT k` to the trigram-GIN candidate path. Runs AFTER the pgvector and
+    // spatial KNN planners (which decline a string-literal RHS) so the three
+    // `<->` paths are exclusive at the RHS shape: vector literal → HNSW,
+    // ST_MakePoint(...) → R-tree, '<needle>' string literal → trigram here.
+    // `detect_trgm_knn` confirms the ORDER BY column carries a single-column
+    // `gin_trgm_ops` GIN index; anything else returns None and the standard
+    // scan + sort takes over (correctness preserved). `execute_trgm_knn_plan`
+    // declines (`Ok(None)`) on a live overlay / no usable index / needle too
+    // short, also falling back.
+    if let Some(knn_plan) = crate::index_probe::detect_trgm_knn(
+        sql,
+        &sess.project,
+        &sess.engine.config().catalog,
+    )
+    .await
+    {
+        match crate::trgm_knn_scan::execute_trgm_knn_plan(sess, knn_plan).await {
+            Ok(Some(res)) => return Ok(res),
+            Ok(None) => {
+                tracing::debug!("trgm knn planner declined; falling back to scan + sort");
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "trgm knn planner errored; falling back");
+            }
+        }
+    }
+
     // Perf: skip the entire 40-pass string-rewrite pipeline when the SQL
     // contains no marker tokens that any pass could fire on.  For a trivial
     // point-query like `SELECT id FROM events WHERE id = 5000` the chain
