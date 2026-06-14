@@ -3,7 +3,6 @@
 require "base64"
 require "json"
 require "time"
-require "mutex_m"
 require_relative "errors"
 require_relative "types"
 

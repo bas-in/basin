@@ -113,14 +113,16 @@ RSpec.describe Basin::QueryBuilder do
     end
 
     it "normalizes a paginated { rows, next_cursor } response" do
-      stub_get("/rest/v1/orders", { "rows" => [{ "id" => 1 }], "next_cursor" => "cursor-abc" })
+      stub_get("/rest/v1/orders", { "rows" => [{ "id" => 1 }], "next_cursor" => "cursor-abc" },
+               query: { "limit" => "1" })
       result = client.from("orders").limit(1).execute
       expect(result.rows.length).to eq(1)
       expect(result.next_cursor).to eq("cursor-abc")
     end
 
     it "returns Basin::Page from #page" do
-      stub_get("/rest/v1/orders", { "rows" => [{ "id" => 1 }], "next_cursor" => "tok" })
+      stub_get("/rest/v1/orders", { "rows" => [{ "id" => 1 }], "next_cursor" => "tok" },
+               query: { "limit" => "1" })
       p = client.from("orders").limit(1).page
       expect(p).to be_a(Basin::Page)
       expect(p.next_cursor).to eq("tok")

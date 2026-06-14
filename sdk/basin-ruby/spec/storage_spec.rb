@@ -65,7 +65,7 @@ RSpec.describe Basin::StorageClient do
 
     describe "#upload" do
       it "posts bytes to /storage/v1/object/:bucket/*path" do
-        stub_request(:post, "#{BASE_URL}/storage/v1/object/avatars/users%2Falice.png")
+        stub_request(:post, "#{BASE_URL}/storage/v1/object/avatars/users/alice.png")
           .to_return(status: 200, body: JSON.generate(object_h),
                      headers: { "Content-Type" => "application/json" })
         result = bucket.upload("users/alice.png", "fake-bytes", content_type: "image/png")
@@ -76,7 +76,7 @@ RSpec.describe Basin::StorageClient do
 
     describe "#download" do
       it "gets /storage/v1/object/:bucket/*path" do
-        stub_request(:get, "#{BASE_URL}/storage/v1/object/avatars/users%2Falice.png")
+        stub_request(:get, "#{BASE_URL}/storage/v1/object/avatars/users/alice.png")
           .to_return(status: 200, body: "PNG-BYTES",
                      headers: { "Content-Type" => "image/png", "ETag" => "abc123" })
         result = bucket.download("users/alice.png")
@@ -89,7 +89,7 @@ RSpec.describe Basin::StorageClient do
 
     describe "#remove" do
       it "deletes /storage/v1/object/:bucket/*path" do
-        stub_request(:delete, "#{BASE_URL}/storage/v1/object/avatars/users%2Falice.png")
+        stub_request(:delete, "#{BASE_URL}/storage/v1/object/avatars/users/alice.png")
           .to_return(status: 200, body: '{"ok":true}',
                      headers: { "Content-Type" => "application/json" })
         expect { bucket.remove("users/alice.png") }.not_to raise_error
@@ -119,7 +119,7 @@ RSpec.describe Basin::StorageClient do
     describe "#get_public_url" do
       it "returns the public URL with project_id" do
         url = bucket.get_public_url("users/alice.png")
-        expect(url).to eq("#{BASE_URL}/storage/v1/object/public/#{FAKE_PROJECT}/avatars/users%2Falice.png")
+        expect(url).to eq("#{BASE_URL}/storage/v1/object/public/#{FAKE_PROJECT}/avatars/users/alice.png")
       end
 
       it "raises when no project_id is available" do

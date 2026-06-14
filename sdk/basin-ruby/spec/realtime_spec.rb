@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "spec_helper"
+require "basin/realtime"
 
 # ---------------------------------------------------------------------------
 # Realtime tests use a stub WebSocket (inject connect_fn:) so no real WS lib
@@ -70,6 +71,20 @@ RSpec.describe Basin::RealtimeClient do
       project_id: -> { FAKE_PROJECT },
       connect_fn: ->(url, proto) { ws }
     )
+  end
+
+  # Register the WebSocket #on(:message) handler the way run_loop would.
+  # The callback-style API only dispatches incoming frames once the receive
+  # loop has wired the message handler; StubWS#thread returns immediately so
+  # this exercises the real dispatch path without blocking.
+  def pump(c)
+    c.send(:_receive_loop)
+  end
+
+  # StubWS auto-emits a "subscribed" ack on subscribe; drop those acks so
+  # assertions can focus on the data/error/gap/presence frames under test.
+  def data_frames(events)
+    events.reject { |e| e.is_a?(Basin::SubscribedFrame) || e.is_a?(Basin::UnsubscribedFrame) }
   end
 
   # ---------------------------------------------------------------------------
@@ -151,6 +166,7 @@ RSpec.describe Basin::RealtimeClient do
     it "dispatches RealtimeEvent to the callback" do
       events = []
       client.subscribe("orders") { |ev| events << ev }
+      pump(client)
       sleep 0.05
 
       event_json = JSON.generate({
@@ -164,10 +180,11 @@ RSpec.describe Basin::RealtimeClient do
       ws.simulate_message(event_json)
       sleep 0.01
 
-      expect(events.length).to eq(1)
-      expect(events.first).to be_a(Basin::RealtimeEvent)
-      expect(events.first.op).to eq("INSERT")
-      expect(events.first.after).to eq({ "id" => 99 })
+      frames = data_frames(events)
+      expect(frames.length).to eq(1)
+      expect(frames.first).to be_a(Basin::RealtimeEvent)
+      expect(frames.first.op).to eq("INSERT")
+      expect(frames.first.after).to eq({ "id" => 99 })
     end
   end
 
@@ -191,6 +208,7 @@ RSpec.describe Basin::RealtimeClient do
     it "parses a RealtimeGapFrame" do
       events = []
       client.subscribe("events") { |ev| events << ev }
+      pump(client)
       sleep 0.05
 
       ws.simulate_message(JSON.generate({
@@ -201,12 +219,13 @@ RSpec.describe Basin::RealtimeClient do
         "newest_in_ring" => 20
       }))
       sleep 0.01
-      expect(events.first).to be_a(Basin::RealtimeGapFrame)
+      expect(data_frames(events).first).to be_a(Basin::RealtimeGapFrame)
     end
 
     it "parses a presenceerror frame (no underscore)" do
       events = []
       client.subscribe("room:1") { |ev| events << ev }
+      pump(client)
       sleep 0.05
 
       ws.simulate_message(JSON.generate({
@@ -216,26 +235,29 @@ RSpec.describe Basin::RealtimeClient do
         "message" => "client_id does not match JWT"
       }))
       sleep 0.01
-      expect(events.first).to be_a(Basin::PresenceErrorFrame)
-      expect(events.first.code).to eq("identity_mismatch")
+      frame = data_frames(events).first
+      expect(frame).to be_a(Basin::PresenceErrorFrame)
+      expect(frame.code).to eq("identity_mismatch")
     end
 
     it "silently drops unknown frame types" do
       events = []
       client.subscribe("t") { |ev| events << ev }
+      pump(client)
       sleep 0.05
       ws.simulate_message('{"type":"future_frame","payload":{}}')
       sleep 0.01
-      expect(events).to be_empty
+      expect(data_frames(events)).to be_empty
     end
 
     it "silently drops non-JSON text" do
       events = []
       client.subscribe("t") { |ev| events << ev }
+      pump(client)
       sleep 0.05
       ws.simulate_message("not json at all")
       sleep 0.01
-      expect(events).to be_empty
+      expect(data_frames(events)).to be_empty
     end
   end
 

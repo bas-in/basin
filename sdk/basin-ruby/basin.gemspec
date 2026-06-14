@@ -31,9 +31,14 @@ Gem::Specification.new do |spec|
   ]
   spec.require_paths = ["lib"]
 
-  # No runtime deps for the core — stdlib net/http + json only.
+  # Core transport is stdlib net/http + json. 'base64' (used by the auth client
+  # to decode JWT claims) left the default gems in Ruby 3.4, so it is declared
+  # explicitly here.
   # WebSocket realtime support requires the optional 'websocket-client-simple' gem.
   # Install it and require 'basin/realtime' to enable.
+  spec.add_dependency "base64", "~> 0.2"
+  # 'logger' (used by the realtime client) left the default gems in Ruby 4.0.
+  spec.add_dependency "logger", "~> 1.6"
 
   spec.add_development_dependency "rspec",    "~> 3.13"
   spec.add_development_dependency "webmock",  "~> 3.23"
