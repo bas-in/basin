@@ -81,7 +81,7 @@ use tokio::sync::Mutex;
 
 use crate::error::error_response;
 use crate::resolver::ProjectResolver;
-use crate::types::{arrow_to_pg_type, encode_batches, row_description};
+use crate::types::{arrow_to_pg_type, encode_batches, row_description, row_description_with_formats};
 
 /// The PostgreSQL `server_version` Basin advertises in the pgwire startup
 /// ParameterStatus. MUST stay a real PG-style version whose major component is
@@ -1867,9 +1867,13 @@ async fn handle_describe(state: &Mutex<ExtendedState>, msg: Describe) -> Vec<PgW
                 vec![PgWireBackendMessage::NoData(NoData::new())]
             } else {
                 let schema = arrow_schema::Schema::new(entry.schema.columns.clone());
-                vec![PgWireBackendMessage::RowDescription(row_description(
-                    &schema,
-                ))]
+                // Advertise the format codes this portal's rows will actually be
+                // encoded in (the Bind result-format codes), so the client
+                // decodes binary/text columns correctly — see
+                // `row_description_with_formats`.
+                vec![PgWireBackendMessage::RowDescription(
+                    row_description_with_formats(&schema, &entry.result_format_codes),
+                )]
             }
         }
         other => {

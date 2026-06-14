@@ -7075,6 +7075,35 @@ fn strip_table_qualifier_in_expr(expr: Expr) -> Expr {
     }
 }
 
+/// Deep qualifier strip for an UPDATE SET right-hand-side expression. The RHS
+/// is evaluated over a single temp table holding exactly the target table's
+/// columns, so every qualified column reference can be safely de-qualified.
+/// Django `F()` expressions arrive qualified — `SET pages = "dj_books"."pages"
+/// + 1` — and otherwise fail to resolve ("No field named dj_books.pages").
+/// Unlike [`strip_table_qualifier_in_expr`] (deliberately AST-shallow for the
+/// RETURNING column-list shape), this recurses through the arithmetic nodes an
+/// `F()` expression produces; other nodes pass through unchanged.
+fn strip_table_qualifiers_deep(expr: Expr) -> Expr {
+    match expr {
+        Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+            [_tbl, col] => Expr::Identifier(col.clone()),
+            [_schema, _tbl, col] => Expr::Identifier(col.clone()),
+            _ => Expr::CompoundIdentifier(parts),
+        },
+        Expr::Nested(inner) => Expr::Nested(Box::new(strip_table_qualifiers_deep(*inner))),
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(strip_table_qualifiers_deep(*left)),
+            op,
+            right: Box::new(strip_table_qualifiers_deep(*right)),
+        },
+        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+            op,
+            expr: Box::new(strip_table_qualifiers_deep(*expr)),
+        },
+        other => other,
+    }
+}
+
 /// Run the RETURNING projection over the captured input batches. Items
 /// are rendered back to SQL and pushed into one DataFusion SELECT, so
 /// any expression DataFusion understands (column refs, arithmetic,
@@ -7432,7 +7461,10 @@ fn parse_assignments(
                 // resolution loop in exec_update). If a subquery node somehow
                 // survives to this point it is correlated or unsupported — let
                 // the DataFusion expression path surface a helpful error.
-                AssignmentRhs::Expr(a.value.to_string())
+                // De-qualify column refs: the RHS is evaluated over a temp
+                // table, so an ORM-qualified `F()` expression like
+                // `"dj_books"."pages" + 1` must become `pages + 1`.
+                AssignmentRhs::Expr(strip_table_qualifiers_deep(a.value.clone()).to_string())
             }
         };
         out.push((idx, rhs));

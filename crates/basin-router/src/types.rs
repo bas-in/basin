@@ -98,15 +98,43 @@ fn field_is_uuid(f: &Field) -> bool {
 /// Convert an Arrow schema to a pgwire `RowDescription`. Field names are
 /// preserved verbatim. Type OIDs come from `arrow_to_pg_type`.
 pub(crate) fn row_description(schema: &Schema) -> RowDescription {
+    // No format codes supplied → text, which is correct for the simple-query
+    // path and for statement-level Describe (no Bind has happened yet).
+    row_description_with_formats(schema, &[])
+}
+
+/// Like [`row_description`] but stamps each field's wire format code to match
+/// how the `DataRow`s will actually be encoded — i.e. the Bind result-format
+/// codes. The extended-protocol portal Describe MUST advertise the same format
+/// the rows are encoded in: pgx (and other clients) decode each column using
+/// the format code from the *runtime* `RowDescription`, so advertising text
+/// for binary-encoded bytes (or vice versa) corrupts the value — e.g. an int8
+/// RETURNING column sent as 8 binary bytes but described as text makes pgx run
+/// `strconv.ParseInt` over the raw bytes and fail. The code-selection
+/// convention mirrors the row encoder (`encode_batches_with_formats`): an empty
+/// slice means all-text, a single entry applies to every column, otherwise one
+/// code per column.
+pub(crate) fn row_description_with_formats(
+    schema: &Schema,
+    format_codes: &[i16],
+) -> RowDescription {
     let fields = schema
         .fields()
         .iter()
-        .map(|f| field_description(f.as_ref()))
+        .enumerate()
+        .map(|(i, f)| {
+            let fc = match format_codes.len() {
+                0 => FORMAT_CODE_TEXT,
+                1 => format_codes[0],
+                _ => *format_codes.get(i).unwrap_or(&FORMAT_CODE_TEXT),
+            };
+            field_description(f.as_ref(), fc)
+        })
         .collect();
     RowDescription::new(fields)
 }
 
-fn field_description(f: &Field) -> FieldDescription {
+fn field_description(f: &Field, format_code: i16) -> FieldDescription {
     let ty = arrow_to_pg_type_field(f);
     FieldDescription::new(
         f.name().clone(),
@@ -115,7 +143,7 @@ fn field_description(f: &Field) -> FieldDescription {
         ty.oid(),
         type_size(&ty),
         -1,
-        FORMAT_CODE_TEXT,
+        format_code,
     )
 }
 
@@ -1726,6 +1754,33 @@ mod tests {
         assert_eq!(rd.fields[0].type_id, Type::INT8.oid());
         assert_eq!(rd.fields[1].name, "b");
         assert_eq!(rd.fields[1].type_id, Type::TEXT.oid());
+    }
+
+    /// gorm/pgx regression: the extended-protocol portal RowDescription must
+    /// advertise the SAME wire format the DataRows are encoded in (the Bind
+    /// result-format codes). A client that decodes by the advertised format
+    /// (pgx reads `fd.Format`) otherwise misreads binary int8 bytes as text and
+    /// fails `strconv.ParseInt`. `row_description_with_formats` stamps the
+    /// requested per-column format code instead of a hardcoded text 0.
+    #[test]
+    fn row_description_honors_requested_format_codes() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        // Empty codes → all text (simple query / pre-Bind statement describe).
+        let rd_text = row_description_with_formats(&schema, &[]);
+        assert_eq!(rd_text.fields[0].format_code, 0);
+        assert_eq!(rd_text.fields[1].format_code, 0);
+        // A single binary code applies to every column (the pgx/tokio-postgres
+        // "all binary" pattern that triggered the bug).
+        let rd_bin = row_description_with_formats(&schema, &[1]);
+        assert_eq!(rd_bin.fields[0].format_code, 1);
+        assert_eq!(rd_bin.fields[1].format_code, 1);
+        // Per-column codes are honored individually.
+        let rd_mixed = row_description_with_formats(&schema, &[1, 0]);
+        assert_eq!(rd_mixed.fields[0].format_code, 1);
+        assert_eq!(rd_mixed.fields[1].format_code, 0);
     }
 
     // -----------------------------------------------------------------------

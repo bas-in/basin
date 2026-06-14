@@ -8,6 +8,33 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-14 — ORM SQL-shape fixes (Drizzle, SQLAlchemy, Django, gorm)
+
+Five fixes for SQL shapes real ORMs emit, each validated by a toolchain-free
+regression test (`tests/integration/tests/orm_sql_shapes.rs`) plus, for the
+wire-protocol fix, a router unit test:
+
+- **`INSERT INTO t (id, …) VALUES (default, …)` on a SERIAL/identity column now
+  draws the next sequence value** instead of inserting NULL (which violated the
+  NOT NULL identity column). The explicit `DEFAULT` keyword path checked the
+  column's DEFAULT-expression text but not its backing identity sequence.
+  (Drizzle emits this shape; unblocks its insert/RETURNING cascade.)
+- **`INSERT INTO t (…) SELECT …` into a narrow integer identity PK** (e.g.
+  SQLAlchemy `Mapped[int]` → INTEGER) now casts the synthesized i64 identity
+  values to the column's declared type instead of failing with an Int64-vs-Int32
+  schema mismatch.
+- **Django `F()` UPDATE expressions** — `SET col = "t"."col" + 1` — now resolve:
+  the table qualifier on the SET right-hand side is stripped (it is evaluated
+  over a temp table), fixing "No field named t.col".
+- **Schema-qualified FK references** (`REFERENCES "public"."u" (id)`) are now
+  accepted in both `CREATE TABLE` and `ALTER TABLE … ADD CONSTRAINT` by taking
+  the bare referenced-table name (Basin FKs are single-project).
+- **Extended-protocol `RowDescription` now advertises the actual result format
+  codes** (the Bind result-format codes) instead of a hardcoded text `0`. A
+  client that decodes by the advertised format (pgx/gorm reads `fd.Format`)
+  previously misread binary `int8` bytes as text and failed `strconv.ParseInt`;
+  any binary-format result column over the extended protocol was affected.
+
 ## 2026-06-14 — DEFERRABLE INITIALLY DEFERRED foreign keys (ORM migrations)
 
 - **`FOREIGN KEY … DEFERRABLE INITIALLY DEFERRED` is now accepted and treated as

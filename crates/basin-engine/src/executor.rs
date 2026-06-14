@@ -7162,7 +7162,28 @@ async fn exec_insert_select(
                         .await;
                     ids.push(next);
                 }
-                columns.push(Arc::new(arrow_array::Int64Array::from(ids)) as ArrayRef);
+                // Synthesized identity values are i64, but the target PK may be
+                // a narrower integer (SQLAlchemy `Mapped[int]` → INTEGER = Int32).
+                // Cast to the column's declared type so the batch matches the
+                // table schema; `safe: false` surfaces an out-of-range id as an
+                // error rather than silently producing NULL.
+                let id_arr: ArrayRef = Arc::new(arrow_array::Int64Array::from(ids));
+                let id_arr = if id_arr.data_type() == target_field.data_type() {
+                    id_arr
+                } else {
+                    let opts = arrow::compute::CastOptions {
+                        safe: false,
+                        ..Default::default()
+                    };
+                    arrow::compute::cast_with_options(&id_arr, target_field.data_type(), &opts)
+                        .map_err(|e| {
+                            BasinError::internal(format!(
+                                "cast identity column to {:?}: {e}",
+                                target_field.data_type()
+                            ))
+                        })?
+                };
+                columns.push(id_arr);
             } else {
                 columns.push(arrow_array::new_null_array(
                     target_field.data_type(),
@@ -9482,9 +9503,28 @@ async fn apply_column_defaults(
                 Some(default_text) => {
                     crate::seq_ddl::evaluate_default_expression(sess, default_text).await?
                 }
-                None => sqlparser::ast::Expr::Value(
-                    sqlparser::ast::Value::Null.with_empty_span(),
-                ),
+                // A SERIAL/identity column carries no DEFAULT expression text —
+                // its default is the backing sequence. An explicit `DEFAULT`
+                // keyword on such a column (Drizzle emits `INSERT INTO t VALUES
+                // (default, …)`) must draw the next sequence value, not NULL,
+                // which would violate the NOT NULL identity column.
+                None => match crate::types::field_identity_sequence(field) {
+                    Some(seq_name) => {
+                        let catalog = &sess.engine.config().catalog;
+                        let next = catalog.nextval(&sess.project, seq_name).await?;
+                        sess.state
+                            .sequence_cache
+                            .record(sess.project, seq_name, next)
+                            .await;
+                        sqlparser::ast::Expr::Value(
+                            sqlparser::ast::Value::Number(next.to_string(), false)
+                                .with_empty_span(),
+                        )
+                    }
+                    None => sqlparser::ast::Expr::Value(
+                        sqlparser::ast::Value::Null.with_empty_span(),
+                    ),
+                },
             };
         }
     }

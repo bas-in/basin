@@ -728,12 +728,17 @@ pub(crate) fn schema_and_constraints_from_columns(
                 characteristics,
                 ..
             }) => {
-                if foreign_table.0.len() != 1 {
-                    return Err(BasinError::InvalidSchema(format!(
-                        "FOREIGN KEY references must be a bare table name; got {foreign_table}"
-                    )));
-                }
-                let ref_table = foreign_table.0[0].id_val().clone();
+                // Accept a schema-qualified reference (`"public"."users"`) by
+                // taking the bare table name — Basin FKs are single-project, so
+                // the schema qualifier carries no extra information.
+                let ref_table = match foreign_table.0.last() {
+                    Some(part) => part.id_val().clone(),
+                    None => {
+                        return Err(BasinError::InvalidSchema(
+                            "FOREIGN KEY reference table name is empty".to_string(),
+                        ))
+                    }
+                };
                 if columns.is_empty() {
                     return Err(BasinError::InvalidSchema(
                         "FOREIGN KEY: empty column list".into(),

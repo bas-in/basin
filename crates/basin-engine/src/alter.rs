@@ -903,12 +903,19 @@ async fn add_constraint(
             // Backfill validation of existing child rows is deferred (matching
             // the CHECK "validated on later writes" behaviour) — the migration
             // case adds the FK to a freshly-created table with no rows.
-            if foreign_table.0.len() != 1 {
-                return Err(BasinError::InvalidSchema(format!(
-                    "ALTER TABLE {table}: FOREIGN KEY reference must be a bare table name; got {foreign_table}"
-                )));
-            }
-            let ref_table = foreign_table.0[0].id_val().clone();
+            // Accept a schema-qualified reference (`"public"."d_users"`) by
+            // taking the bare table name. Basin FKs are single-project, so the
+            // schema qualifier (always the connection's schema) adds no
+            // information. Drizzle emits `REFERENCES "public"."t"` in its
+            // ALTER ADD CONSTRAINT migrations.
+            let ref_table = match foreign_table.0.last() {
+                Some(part) => part.id_val().clone(),
+                None => {
+                    return Err(BasinError::InvalidSchema(format!(
+                        "ALTER TABLE {table}: FOREIGN KEY reference table name is empty"
+                    )))
+                }
+            };
             if columns.is_empty() {
                 return Err(BasinError::InvalidSchema(format!(
                     "ALTER TABLE {table}: FOREIGN KEY column list cannot be empty"
