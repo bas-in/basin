@@ -105,6 +105,38 @@ pub(crate) async fn provision_project(
     Ok((StatusCode::CREATED, Json(connection_info_to_json(&info))).into_response())
 }
 
+/// `GET /admin/v1/projects/{project_id}/usage` — return the project's cumulative
+/// usage counters (the basin-cloud billing dimensions): total ops, bytes
+/// read/written, Class-A/Class-B object-store ops, CPU micros, errors, and a p99
+/// latency estimate. Read-only; admin-scoped. Returns zeros for a project that
+/// has not yet done any work.
+pub(crate) async fn get_project_usage(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    require_admin(&claims)?;
+    let project: ProjectId = project_id
+        .parse()
+        .map_err(|e| ApiError::invalid(format!("invalid project_id: {e}")))?;
+    assert_admin_for_path_project(&claims, &project)?;
+
+    let s = state.cfg.engine.project_counters(&project);
+    let body = json!({
+        "project_id": project.to_string(),
+        "ops_total": s.ops_total,
+        "bytes_read_total": s.bytes_read_total,
+        "bytes_written_total": s.bytes_written_total,
+        "class_a_ops_total": s.class_a_ops_total,
+        "class_b_ops_total": s.class_b_ops_total,
+        "cpu_micros_total": s.cpu_micros_total,
+        "errors_total": s.errors_total,
+        "latency_p99_ms_estimate": s.latency_p99_ms_estimate,
+    });
+    Ok((StatusCode::OK, Json(body)).into_response())
+}
+
 /// `POST /admin/v1/projects/{id}/rotate` — rotate a credential's password.
 /// `id` is the `pgwire_user` (`project_<8 hex>` or `{ulid}_{hex}`), not the
 /// project ULID. The older password stops validating immediately; the response

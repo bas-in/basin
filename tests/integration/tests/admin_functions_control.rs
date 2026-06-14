@@ -807,3 +807,51 @@ async fn admin_functions_invoke_meters_cpu_and_logs() {
     set_global_invoker(Arc::new(basin_rest::NoopFunctionInvoker));
     let _ = running.shutdown.send(());
 }
+
+/// `GET /admin/v1/projects/:id/usage` returns the project's billing-dimension
+/// counters as JSON (an authenticated admin scoped to the project), and rejects
+/// an unauthenticated request. Fresh project → zeros, but all fields present.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_project_usage_returns_counters() {
+    let Some(fx) = boot().await else {
+        return; // Postgres unavailable — skip (same gate as the other admin tests).
+    };
+    let bearer_hdr = bearer(&fx.token);
+    let path = format!("/admin/v1/projects/{}/usage", fx.project);
+
+    let r = http_request(
+        fx.running.local_addr,
+        "GET",
+        &path,
+        &[("Authorization", bearer_hdr.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        200,
+        "admin usage GET must succeed; body={:?}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let j = r.json();
+    assert_eq!(j["project_id"].as_str(), Some(fx.project.to_string().as_str()));
+    for k in [
+        "ops_total",
+        "bytes_read_total",
+        "bytes_written_total",
+        "class_a_ops_total",
+        "class_b_ops_total",
+        "cpu_micros_total",
+        "errors_total",
+        "latency_p99_ms_estimate",
+    ] {
+        assert!(
+            j.get(k).map(|v| v.is_number()).unwrap_or(false),
+            "usage must report numeric {k}, got {j}"
+        );
+    }
+
+    // No admin token → must not return usage.
+    let r2 = http_request(fx.running.local_addr, "GET", &path, &[], None).await;
+    assert_ne!(r2.status, 200, "usage without an admin token must be rejected");
+}

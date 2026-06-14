@@ -367,6 +367,11 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             "/admin/v1/projects/:project_id/credentials",
             get(admin_routes::list_project_credentials),
         )
+        // Cloud control-plane: per-project usage counters (billing dimensions).
+        .route(
+            "/admin/v1/projects/:project_id/usage",
+            get(admin_routes::get_project_usage),
+        )
         // T-049 engine-side: cloud-handed BYO bucket registration.
         .route(
             "/admin/v1/projects/:project_id/byo-bucket",

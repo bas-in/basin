@@ -8,6 +8,18 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-15 — Cloud control-plane: per-project usage endpoint
+
+- **`GET /admin/v1/projects/:id/usage`** returns a project's cumulative
+  billing-dimension counters as JSON — `ops_total`, `bytes_read/written_total`,
+  Class-A/Class-B object-store ops, `cpu_micros_total`, `errors_total`, and a p99
+  latency estimate. Admin-scoped (`require_admin` + project-scoped token).
+  Previously these counters (`Engine::project_counters`) were only readable via a
+  pgwire session (`SELECT * FROM basin_project_usage`); the control plane now has
+  a direct HTTP readout for billing/dashboard use. First of several cloud routes
+  exposing already-built engine/catalog capabilities. Pinned by
+  `admin_functions_control.rs::admin_project_usage_returns_counters`.
+
 ## 2026-06-15 — COUNT(*) stays O(files) after a hot-tier UPDATE/DELETE
 
 - **`SELECT COUNT(*)` no longer falls back to a full table scan when the table
