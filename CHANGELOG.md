@@ -47,6 +47,15 @@ graduate to 1.0 and the standard SemVer guarantees.
   result. Regression test: `orm_driver_connect.rs` exercises the psycopg/
   SQLAlchemy connect statement sequence end-to-end. Source:
   `crates/basin-engine/src/{noop_accept,executor}.rs`.
+- **Nullary function-call result columns are named PostgreSQL-style.**
+  `SELECT version()` / `now()` / `current_schema()` (and schema-qualified
+  `pg_catalog.version()`) now name their output column after the function
+  (`version`, `now`, `current_schema`) instead of DataFusion's `version()` with
+  parens. Drivers that read connect-probe results BY COLUMN NAME broke otherwise
+  — node-postgres / typeorm's `getVersion()` does
+  `result[0].version.replace(...)` and crashed on `undefined`. Scoped to nullary
+  `()` calls, so `count(*)` / `max(x)` are unchanged. Source:
+  `crates/basin-engine/src/executor.rs`.
 
 ## 2026-06-14 — Cold DELETE write-amp: GIN-only tombstone fast path + FK-cascade re-read skip
 

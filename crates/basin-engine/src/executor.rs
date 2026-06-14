@@ -10509,7 +10509,8 @@ pub(crate) async fn exec_select(
     // matching their aliases against the result schema field names.
     let ws_schema = {
         let raw = Arc::new(schema_df_to_ws(df_schema.as_ref())?);
-        annotate_json_agg_columns(&raw, sql_for_df)
+        let annotated = annotate_json_agg_columns(&raw, sql_for_df);
+        pg_style_nullary_fn_column_names(&annotated)
     };
 
     // Change C: when the shard is wired in we know there are large per-project
@@ -11560,6 +11561,45 @@ async fn exec_cursor_move(
 /// explicitly in the alias list are changed.  If a field is already annotated
 /// (e.g. from `return_field` for direct GROUP BY aggregates) the function is
 /// idempotent.
+/// Rename unaliased NULLARY function-call output columns to the PostgreSQL
+/// style. DataFusion names a function-call column `name()` (with parens);
+/// PostgreSQL names it after the function: `SELECT version()` → column
+/// `version`, `now()` → `now`, `current_schema()` → `current_schema`, and a
+/// schema-qualified `pg_catalog.version()` → `version`. Drivers that read
+/// connect-probe results BY COLUMN NAME break otherwise — node-postgres /
+/// typeorm's `getVersion()` does `result[0].version.replace(...)` and crashes
+/// on `undefined` when the column is named `version()`.
+///
+/// Scoped to NULLARY `()` calls so aggregate / scalar calls with arguments
+/// (`count(*)`, `max(x)`, `lower(name)`) are left exactly as DataFusion named
+/// them — this is the minimal change that fixes the ORM connect probes without
+/// disturbing existing result-column names elsewhere.
+fn pg_style_nullary_fn_column_names(schema: &Arc<Schema>) -> Arc<Schema> {
+    let mut changed = false;
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if let Some(stripped) = f.name().strip_suffix("()") {
+                // Strip an optional schema qualifier (`pg_catalog.version`).
+                let base = stripped.rsplit('.').next().unwrap_or(stripped);
+                if !base.is_empty()
+                    && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    changed = true;
+                    return f.as_ref().clone().with_name(base.to_string());
+                }
+            }
+            f.as_ref().clone()
+        })
+        .collect();
+    if changed {
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+    } else {
+        Arc::clone(schema)
+    }
+}
+
 pub(crate) fn annotate_json_agg_columns(ws_schema: &Arc<Schema>, sql: &str) -> Arc<Schema> {
     // Fast exit if no json_agg / jsonb_agg in the SQL.
     let lower = sql.to_ascii_lowercase();

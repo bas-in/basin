@@ -81,10 +81,22 @@ async fn psycopg_connect_sequence_each_statement_returns_a_row() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn version_banner_advertises_postgres_major_15() {
     let (_dir, _engine, sess) = open_session().await;
-    let batches = match sess.execute("SELECT version()").await {
-        Ok(ExecResult::Rows { batches, .. }) => batches,
+    let (schema, batches) = match sess.execute("SELECT version()").await {
+        Ok(ExecResult::Rows { schema, batches }) => (schema, batches),
         other => panic!("version() must return rows, got {other:?}"),
     };
+    // pgwire builds the RowDescription from the ExecResult schema (not the
+    // RecordBatch schema), so THAT is the column name the client sees. typeorm's
+    // PostgresQueryRunner.getVersion() reads `result[0].version` BY COLUMN NAME
+    // and calls `.replace()` on it — so the output column of `SELECT version()`
+    // must be named exactly "version" (as PostgreSQL names it), or typeorm
+    // crashes at connect with "Cannot read properties of undefined (reading
+    // 'replace')".
+    assert_eq!(
+        schema.field(0).name(),
+        "version",
+        "SELECT version() must name its column \"version\" (node-postgres/typeorm read by name)"
+    );
     let b = batches.iter().find(|b| b.num_rows() > 0).expect("a row");
     let col = b
         .column(0)
