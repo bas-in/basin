@@ -21,16 +21,22 @@ module Basin
     attr_reader :status
     # @return [String] human-readable detail — do NOT match on this
     attr_reader :message
+    # @return [String, nil] 5-character Postgres SQLSTATE (e.g. "23505" for a
+    #   unique violation), present for SQL-layer errors; nil otherwise
+    attr_reader :sqlstate
 
-    def initialize(code, message, status)
+    def initialize(code, message, status, sqlstate = nil)
       super(message)
-      @code    = code
-      @message = message
-      @status  = status
+      @code     = code
+      @message  = message
+      @status   = status
+      @sqlstate = sqlstate
     end
 
     def to_s
-      "Basin::ApiError(code=#{@code.inspect}, status=#{@status}, message=#{@message.inspect})"
+      base = "Basin::ApiError(code=#{@code.inspect}, status=#{@status}"
+      base += ", sqlstate=#{@sqlstate.inspect}" unless @sqlstate.nil?
+      "#{base}, message=#{@message.inspect})"
     end
 
     # Build from a parsed JSON error envelope.
@@ -38,9 +44,10 @@ module Basin
     # @param status [Integer] HTTP status code
     # @return [ApiError]
     def self.from_response_body(body, status)
-      code    = body.is_a?(Hash) && body["code"].is_a?(String) ? body["code"] : "E_UNKNOWN"
-      message = body.is_a?(Hash) && body["message"].is_a?(String) ? body["message"] : "HTTP #{status}"
-      new(code, message, status)
+      code     = body.is_a?(Hash) && body["code"].is_a?(String) ? body["code"] : "E_UNKNOWN"
+      message  = body.is_a?(Hash) && body["message"].is_a?(String) ? body["message"] : "HTTP #{status}"
+      sqlstate = body.is_a?(Hash) && body["sqlstate"].is_a?(String) ? body["sqlstate"] : nil
+      new(code, message, status, sqlstate)
     end
   end
 

@@ -33,12 +33,23 @@ export class BasinApiError extends Error {
   readonly code: BasinErrorCode;
   /** HTTP status of the response. */
   readonly status: number;
+  /**
+   * 5-character Postgres SQLSTATE code (e.g. `"23505"` for a unique
+   * violation), present for SQL-layer errors; `undefined` otherwise.
+   */
+  readonly sqlstate?: string;
 
-  constructor(code: BasinErrorCode, message: string, status: number) {
+  constructor(
+    code: BasinErrorCode,
+    message: string,
+    status: number,
+    sqlstate?: string,
+  ) {
     super(message);
     this.name = "BasinApiError";
     this.code = code;
     this.status = status;
+    this.sqlstate = sqlstate;
   }
 }
 
@@ -51,14 +62,20 @@ export class BasinApiError extends Error {
 export async function errorFromResponse(res: Response): Promise<BasinApiError> {
   let code: BasinErrorCode = "E_UNKNOWN";
   let message = `HTTP ${res.status}`;
+  let sqlstate: string | undefined;
   try {
     const text = await res.text();
     if (text.length > 0) {
       try {
-        const body = JSON.parse(text) as { code?: unknown; message?: unknown };
+        const body = JSON.parse(text) as {
+          code?: unknown;
+          message?: unknown;
+          sqlstate?: unknown;
+        };
         if (typeof body.code === "string") code = body.code;
         if (typeof body.message === "string") message = body.message;
         else message = text;
+        if (typeof body.sqlstate === "string") sqlstate = body.sqlstate;
       } catch {
         message = text;
       }
@@ -66,7 +83,7 @@ export async function errorFromResponse(res: Response): Promise<BasinApiError> {
   } catch {
     // Body unreadable; keep the defaults.
   }
-  return new BasinApiError(code, message, res.status);
+  return new BasinApiError(code, message, res.status, sqlstate);
 }
 
 /** True when `body` looks like the basin-rest error envelope. */

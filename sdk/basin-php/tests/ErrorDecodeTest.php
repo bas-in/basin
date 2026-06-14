@@ -21,6 +21,31 @@ class ErrorDecodeTest extends TestCase
         $this->assertSame(404, $e->getHttpStatus());
     }
 
+    public function testFromResponseBodySurfacesSqlState(): void
+    {
+        $e = BasinApiException::fromResponseBody(
+            [
+                'code' => 'E_INVALID_REQUEST',
+                'message' => 'duplicate key value violates unique constraint',
+                'sqlstate' => '23505',
+            ],
+            400,
+        );
+
+        $this->assertSame('E_INVALID_REQUEST', $e->getErrorCode());
+        $this->assertSame('23505', $e->getSqlState());
+    }
+
+    public function testFromResponseBodySqlStateNullWhenAbsent(): void
+    {
+        $e = BasinApiException::fromResponseBody(
+            ['code' => 'E_NOT_FOUND', 'message' => 'gone'],
+            404,
+        );
+
+        $this->assertNull($e->getSqlState());
+    }
+
     public function testFromResponseBodyMissingCode(): void
     {
         $e = BasinApiException::fromResponseBody(['message' => 'Something broke'], 500);

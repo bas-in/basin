@@ -64,7 +64,8 @@ public actor FunctionsClient {
                    let d = result as? [String: Any],
                    let code = d["code"] as? String, code.hasPrefix("E_"),
                    let msg = d["message"] as? String {
-                    throw BasinApiError(rawCode: code, message: msg, status: http.statusCode)
+                    throw BasinApiError(rawCode: code, message: msg, status: http.statusCode,
+                                        sqlState: d["sqlstate"] as? String)
                 }
             }
             var allHeaders: [String: String] = [:]

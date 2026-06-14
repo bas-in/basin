@@ -11,6 +11,23 @@ RSpec.describe Basin::ApiError do
       expect(err.status).to eq(404)
     end
 
+    it "surfaces sqlstate on a constraint-violation envelope" do
+      err = described_class.from_response_body(
+        { "code" => "E_INVALID_REQUEST",
+          "message" => "duplicate key value violates unique constraint",
+          "sqlstate" => "23505" },
+        400,
+      )
+      expect(err.code).to eq("E_INVALID_REQUEST")
+      expect(err.sqlstate).to eq("23505")
+      expect(err.to_s).to include("23505")
+    end
+
+    it "leaves sqlstate nil when absent" do
+      err = described_class.from_response_body({ "code" => "E_NOT_FOUND", "message" => "gone" }, 404)
+      expect(err.sqlstate).to be_nil
+    end
+
     it "defaults to E_UNKNOWN when code is missing" do
       err = described_class.from_response_body({}, 500)
       expect(err.code).to eq("E_UNKNOWN")

@@ -17,6 +17,28 @@ describe("error mapping", () => {
     expect(err.status).toBe(403);
   });
 
+  it("surfaces sqlstate on a constraint-violation envelope", async () => {
+    const err = await errorFromResponse(
+      jsonResponse(
+        {
+          code: "E_INVALID_REQUEST",
+          message: "duplicate key value violates unique constraint",
+          sqlstate: "23505",
+        },
+        400,
+      ),
+    );
+    expect(err.code).toBe("E_INVALID_REQUEST");
+    expect(err.sqlstate).toBe("23505");
+  });
+
+  it("leaves sqlstate undefined when absent", async () => {
+    const err = await errorFromResponse(
+      jsonResponse({ code: "E_NOT_FOUND", message: "gone" }, 404),
+    );
+    expect(err.sqlstate).toBeUndefined();
+  });
+
   it("falls back to E_UNKNOWN for non-envelope bodies", async () => {
     const err = await errorFromResponse(
       new Response("Bad Gateway", { status: 502 }),

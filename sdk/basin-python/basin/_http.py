@@ -38,6 +38,7 @@ def _raise_for_response(response: httpx.Response) -> None:
     """Parse a non-2xx response into a BasinApiError."""
     code = "E_UNKNOWN"
     message = f"HTTP {response.status_code}"
+    sqlstate: str | None = None
     try:
         text = response.text
         if text:
@@ -50,13 +51,15 @@ def _raise_for_response(response: httpx.Response) -> None:
                         message = body["message"]
                     else:
                         message = text
+                    if isinstance(body.get("sqlstate"), str):
+                        sqlstate = body["sqlstate"]
                 else:
                     message = text
             except (json.JSONDecodeError, ValueError):
                 message = text
     except Exception:
         pass
-    raise BasinApiError(code, message, response.status_code)
+    raise BasinApiError(code, message, response.status_code, sqlstate)
 
 
 def _decode_json_response(response: httpx.Response) -> Any:

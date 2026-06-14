@@ -140,6 +140,20 @@ final class StorageTests: XCTestCase {
         }
     }
 
+    func testErrorEnvelopeSurfacesSQLState() throws {
+        let body = #"{"code":"E_INVALID_REQUEST","message":"duplicate key value violates unique constraint","sqlstate":"23505"}"#
+        let err = BasinApiError.fromResponseBody(Data(body.utf8), status: 400)
+        XCTAssertEqual(err.rawCode, "E_INVALID_REQUEST")
+        XCTAssertEqual(err.sqlState, "23505")
+        XCTAssert(err.description.contains("23505"))
+    }
+
+    func testErrorEnvelopeSQLStateNilWhenAbsent() throws {
+        let body = #"{"code":"E_NOT_FOUND","message":"gone"}"#
+        let err = BasinApiError.fromResponseBody(Data(body.utf8), status: 404)
+        XCTAssertNil(err.sqlState)
+    }
+
     func testCreateSignedURL() async throws {
         MockURLProtocol.push { req in
             XCTAssertEqual(req.httpMethod, "POST")

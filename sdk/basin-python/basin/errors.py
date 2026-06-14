@@ -41,15 +41,28 @@ class BasinApiError(BasinError):
         client-side without a round-trip).
     message:
         Human-readable detail — do **not** match on this; use ``code``.
+    sqlstate:
+        5-character Postgres SQLSTATE code (e.g. ``"23505"`` for a unique
+        violation), present for SQL-layer errors; ``None`` otherwise.
     """
 
-    def __init__(self, code: str, message: str, status: int) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status: int,
+        sqlstate: Optional[str] = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.status = status
+        self.sqlstate = sqlstate
 
     def __repr__(self) -> str:  # pragma: no cover
-        return f"BasinApiError(code={self.code!r}, status={self.status}, message={str(self)!r})"
+        return (
+            f"BasinApiError(code={self.code!r}, status={self.status}, "
+            f"sqlstate={self.sqlstate!r}, message={str(self)!r})"
+        )
 
     @classmethod
     def from_response_body(cls, body: dict, status: int) -> "BasinApiError":
@@ -59,7 +72,10 @@ class BasinApiError(BasinError):
         message = body.get("message", f"HTTP {status}")
         if not isinstance(message, str):
             message = f"HTTP {status}"
-        return cls(code, message, status)
+        sqlstate = body.get("sqlstate")
+        if not isinstance(sqlstate, str):
+            sqlstate = None
+        return cls(code, message, status, sqlstate)
 
 
 class BasinNetworkError(BasinError):

@@ -26,12 +26,15 @@ sealed class BasinError implements Exception {}
 /// [code] is the stable `E_*` code from the response body.
 /// [status] is the HTTP status code (0 when synthesised client-side).
 /// [message] is human-readable — do **not** match on this; use [code].
+/// [sqlstate] is the 5-character Postgres SQLSTATE code (e.g. `23505` for a
+/// unique violation), present for SQL-layer errors; `null` otherwise.
 class BasinApiError extends BasinError {
   final String code;
   final int status;
   final String message;
+  final String? sqlstate;
 
-  const BasinApiError(this.code, this.message, this.status);
+  const BasinApiError(this.code, this.message, this.status, {this.sqlstate});
 
   factory BasinApiError.fromBody(Map<String, dynamic> body, int status) {
     final code =
@@ -40,12 +43,15 @@ class BasinApiError extends BasinError {
         (body['message'] is String)
             ? (body['message'] as String)
             : 'HTTP $status';
-    return BasinApiError(code, message, status);
+    final sqlstate =
+        (body['sqlstate'] is String) ? (body['sqlstate'] as String) : null;
+    return BasinApiError(code, message, status, sqlstate: sqlstate);
   }
 
   @override
-  String toString() =>
-      'BasinApiError(code: $code, status: $status, message: $message)';
+  String toString() => sqlstate != null
+      ? 'BasinApiError(code: $code, status: $status, sqlstate: $sqlstate, message: $message)'
+      : 'BasinApiError(code: $code, status: $status, message: $message)';
 }
 
 /// Raised when the transport layer fails before a server response arrives

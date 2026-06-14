@@ -13,6 +13,25 @@ void main() {
       expect(err.status, 404);
     });
 
+    test('fromBody surfaces sqlstate on a constraint violation', () {
+      final err = BasinApiError.fromBody({
+        'code': 'E_INVALID_REQUEST',
+        'message': 'duplicate key value violates unique constraint',
+        'sqlstate': '23505',
+      }, 400);
+      expect(err.code, 'E_INVALID_REQUEST');
+      expect(err.sqlstate, '23505');
+      expect(err.toString(), contains('23505'));
+    });
+
+    test('fromBody leaves sqlstate null when absent', () {
+      final err = BasinApiError.fromBody({
+        'code': 'E_NOT_FOUND',
+        'message': 'gone',
+      }, 404);
+      expect(err.sqlstate, isNull);
+    });
+
     test('fromBody falls back to E_UNKNOWN for missing code', () {
       final err = BasinApiError.fromBody({'message': 'oops'}, 500);
       expect(err.code, 'E_UNKNOWN');

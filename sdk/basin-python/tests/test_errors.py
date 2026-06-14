@@ -36,6 +36,22 @@ def test_basin_api_error_from_response_body():
     assert err.message if hasattr(err, "message") else True
 
 
+def test_basin_api_error_surfaces_sqlstate():
+    body = {
+        "code": "E_INVALID_REQUEST",
+        "message": "duplicate key value violates unique constraint",
+        "sqlstate": "23505",
+    }
+    err = BasinApiError.from_response_body(body, 400)
+    assert err.code == "E_INVALID_REQUEST"
+    assert err.sqlstate == "23505"
+
+
+def test_basin_api_error_sqlstate_none_when_absent():
+    err = BasinApiError.from_response_body({"code": "E_NOT_FOUND", "message": "gone"}, 404)
+    assert err.sqlstate is None
+
+
 def test_basin_api_error_unknown_code():
     body = {"code": "E_FUTURE_CODE", "message": "from a newer server"}
     err = BasinApiError.from_response_body(body, 400)
@@ -63,6 +79,24 @@ def test_sync_transport_non_2xx_raises():
     err = exc_info.value
     assert err.code == "E_UNAUTHENTICATED"
     assert err.status == 401
+
+
+@respx.mock
+def test_sync_transport_surfaces_sqlstate():
+    respx.get("http://basin.test/health").mock(
+        return_value=httpx.Response(
+            400,
+            json={
+                "code": "E_INVALID_REQUEST",
+                "message": "duplicate key value violates unique constraint",
+                "sqlstate": "23505",
+            },
+        )
+    )
+    transport = SyncTransport("http://basin.test")
+    with pytest.raises(BasinApiError) as exc_info:
+        transport.request("GET", "/health", auth=False)
+    assert exc_info.value.sqlstate == "23505"
 
 
 @respx.mock

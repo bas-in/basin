@@ -35,16 +35,23 @@ public struct BasinApiError: Error, CustomStringConvertible {
     public let status: Int
     /// Human-readable message.
     public let message: String
+    /// 5-character Postgres SQLSTATE code (e.g. `"23505"` for a unique
+    /// violation), present for SQL-layer errors; `nil` otherwise.
+    public let sqlState: String?
 
-    public init(rawCode: String, message: String, status: Int) {
+    public init(rawCode: String, message: String, status: Int, sqlState: String? = nil) {
         self.rawCode = rawCode
         self.code = BasinErrorCode(rawValue: rawCode) ?? .unknown
         self.status = status
         self.message = message
+        self.sqlState = sqlState
     }
 
     public var description: String {
-        "BasinApiError(code=\(rawCode), status=\(status), message=\(message))"
+        if let sqlState {
+            return "BasinApiError(code=\(rawCode), status=\(status), sqlstate=\(sqlState), message=\(message))"
+        }
+        return "BasinApiError(code=\(rawCode), status=\(status), message=\(message))"
     }
 }
 
@@ -67,12 +74,14 @@ public struct BasinNetworkError: Error, CustomStringConvertible {
 struct ErrorEnvelope: Decodable {
     let code: String
     let message: String
+    let sqlstate: String?
 }
 
 extension BasinApiError {
     static func fromResponseBody(_ body: Data, status: Int) -> BasinApiError {
         if let envelope = try? JSONDecoder().decode(ErrorEnvelope.self, from: body) {
-            return BasinApiError(rawCode: envelope.code, message: envelope.message, status: status)
+            return BasinApiError(rawCode: envelope.code, message: envelope.message,
+                                 status: status, sqlState: envelope.sqlstate)
         }
         let text = String(data: body, encoding: .utf8) ?? "HTTP \(status)"
         return BasinApiError(rawCode: "E_UNKNOWN", message: text, status: status)

@@ -28,6 +28,7 @@ class BasinApiException extends BasinException
         string $message,
         private readonly int $httpStatus,
         ?\Throwable $previous = null,
+        private readonly ?string $sqlState = null,
     ) {
         parent::__construct($message, $httpStatus, $previous);
     }
@@ -45,6 +46,15 @@ class BasinApiException extends BasinException
     }
 
     /**
+     * 5-character Postgres SQLSTATE code (e.g. "23505" for a unique
+     * violation), present for SQL-layer errors; null otherwise.
+     */
+    public function getSqlState(): ?string
+    {
+        return $this->sqlState;
+    }
+
+    /**
      * Build from a decoded JSON error envelope and HTTP status.
      *
      * @param array<string,mixed> $body
@@ -53,7 +63,8 @@ class BasinApiException extends BasinException
     {
         $code = is_string($body['code'] ?? null) ? $body['code'] : 'E_UNKNOWN';
         $message = is_string($body['message'] ?? null) ? $body['message'] : "HTTP {$status}";
+        $sqlState = is_string($body['sqlstate'] ?? null) ? $body['sqlstate'] : null;
 
-        return new self($code, $message, $status);
+        return new self($code, $message, $status, null, $sqlState);
     }
 }
