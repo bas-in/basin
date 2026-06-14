@@ -79,15 +79,36 @@ must appear in the peer list with an address matching `BASIN_RAFT_BIND`;
 duplicate ids are rejected. Config errors are hard startup failures, not
 warnings.
 
+### Raft transport mTLS (optional)
+
+The tonic transport defaults to plaintext for a private cluster network
+(VPC / 6PN). For deployments where the raft port is reachable from outside
+a fully trusted network, enable mutual TLS:
+
+| Var | Purpose |
+|---|---|
+| `BASIN_RAFT_TLS_CERT` | PEM path to this node's leaf certificate (signed by the cluster CA). |
+| `BASIN_RAFT_TLS_KEY` | PEM path to this node's private key. |
+| `BASIN_RAFT_TLS_CA` | PEM path to the cluster CA bundle used to verify peers. |
+| `BASIN_RAFT_TLS_DOMAIN` | (optional) SNI / verification hostname; default `basin-raft`. Leaf certs must carry this as a SAN. |
+
+All three of CERT/KEY/CA are required together — a partial config is a
+**startup error** (no silent plaintext fallback). With TLS on, bare
+`host:port` peers are dialed over `https://` automatically. Both ends
+present a CA-signed cert and verify the peer, so a node that cannot prove
+cluster membership is rejected at the handshake. Source:
+`crates/basin-wal/src/raft_net/tls.rs`; see
+[`runbooks/failover.md`](./runbooks/failover.md#raft-mode-mtls-setup) for
+the operator walkthrough.
+
 **v1 caveats:**
 
-- **Plaintext gRPC, no peer authentication.** The tonic transport
-  (`crates/basin-wal/src/raft_net`) ships with no TLS and no peer
-  verification. The raft port must only be reachable on a private
-  network. mTLS is the follow-up — `raft_net/mod.rs` documents the
-  tonic `tls_config` seam.
-- **Single-region only.** One raft group covers all projects in the
-  region. Multi-region raft is a separate phase.
+- **One raft group per region (no cross-region quorum).** A project's
+  `home_region` selects which region's raft group owns its writes
+  (`basin_common::raft_group_for`); writes to a non-home region are
+  forwarded or rejected at the engine region gate. Cross-region data sync
+  is by S3 cross-region replication at the bucket layer, not raft.
+  Multi-region is by independent per-region deployment.
 - **`GET /admin/v1/cluster` not yet wired.** `RaftWal::cluster_status()`
   exists and is logged at startup; the HTTP route is an open seam in
   `main.rs` (`let _ = &raft_wal` with a TODO comment). Use the startup

@@ -215,17 +215,37 @@ directory rejoins with its hard state intact.
 Source: `crates/basin-wal/src/raft_wal.rs` (module header + `RaftWal`
 impl) and `services/basin-server/src/main.rs` (`build_raft_wal`).
 
+### Transport security
+
+- **Default: plaintext gRPC for a private cluster network.** The tonic
+  transport (`crates/basin-wal/src/raft_net`) defaults to plaintext on
+  the assumption that the raft port is reachable only on a private VPC /
+  internal mesh (e.g. fly.io 6PN). `BASIN_RAFT_BIND` must not be exposed
+  publicly in this mode. The openraft `Vote` in every RPC fences stale
+  leaders at the protocol layer.
+- **Mutual TLS (opt-in) removes the plaintext caveat.** Set
+  `BASIN_RAFT_TLS_CERT` / `BASIN_RAFT_TLS_KEY` / `BASIN_RAFT_TLS_CA` on
+  every node to run the transport over rustls with mutual authentication:
+  each node presents a cluster-CA-signed leaf and requires its peers to
+  do the same, giving confidentiality plus peer auth (a node that cannot
+  prove cluster membership cannot speak raft). All three vars are required
+  together — a partial config is a **startup error** (no silent plaintext
+  fallback). See the [mTLS setup](#raft-mode-mtls-setup) below. Verified by
+  `crates/basin-wal/tests/raft_net_tls.rs` (a 3-node TLS cluster elects +
+  replicates).
+
 ### v1 caveats (honest bar)
 
-- **Transport: plaintext gRPC, no peer authentication.** The tonic
-  transport (`crates/basin-wal/src/raft_net`) is functional but ships
-  with no confidentiality and no peer auth. The cluster network is
-  assumed to be a private VPC or internal mesh; `BASIN_RAFT_BIND` must
-  not be exposed publicly. mTLS is the documented follow-up —
-  `raft_net/mod.rs` names the tonic `tls_config` seam.
-- **Single-region only.** One raft group per region, matching
-  [ADR 0009](../decisions/0009-multi-region-architecture.md). Multi-region
-  raft and catalog replication are separate phases.
+- **Single raft group per region.** Basin runs one independent raft group
+  per region — there is deliberately no cross-region quorum
+  ([ADR 0009](../decisions/0009-multi-region-architecture.md)). A project's
+  `home_region` selects which region's raft group owns its writes
+  (`basin_common::raft_group_for`); a write to a non-home region is
+  forwarded or rejected at the engine's region gate, never cross-region
+  committed. Setting up two regional clusters and the cross-region link is
+  a deployment exercise (independent `BASIN_RAFT_PEERS` per region + S3
+  cross-region replication of the bucket); the routing decision itself is
+  unit-tested (`basin_common::region` tests).
 - **Bootstrap-once semantics.** Set `BASIN_RAFT_BOOTSTRAP=1` on exactly
   one node for the initial cluster bring-up. On restart of the bootstrap
   node `initialize` is skipped when the raft log is non-empty
@@ -272,10 +292,52 @@ Start order:
    each node with `role=leader` (once) or `role=follower` (twice) and
    `members=3`.
 
+**Rehearse it on one box first.** `scripts/raft-cluster-smoke.sh` brings up
+a real 3-node cluster as three `basin-server` processes on distinct
+ports + data dirs (the same env wiring as a 3-machine deploy, on
+`127.0.0.1`), waits for readiness, then runs the end-to-end smoke: write
+to the leader, read the replicated row from a follower, kill the leader,
+confirm a new leader takes over and the pre-failover write survived. Run
+it in CI or before a production bring-up to validate the binary + env
+matrix. (Localhost cannot model a real cross-machine partition — the
+in-process drills in `raft_failover_drills.rs` cover that.)
+
 In production, route pgwire write traffic to the current leader. Reads
 can land anywhere (followers serve reads from their replicated state
 machine). The router re-resolves the leader on a `LeaseNotHeld` /
 `RaftNoQuorum` (SQLSTATE 40001) response and retries.
+
+### <a name="raft-mode-mtls-setup"></a>mTLS setup (optional, recommended off private net)
+
+If the raft port is reachable from anything outside a fully trusted
+cluster network, enable mutual TLS. You need a small private CA (a
+self-managed CA, step-ca, cert-manager, or even `openssl`/`rcgen` for a
+lab) and one leaf cert + key per node, each signed by that CA.
+
+Each leaf cert must carry the verification hostname as a SAN. The client
+verifies the peer cert against this name; it defaults to `basin-raft` and
+is overridable with `BASIN_RAFT_TLS_DOMAIN`. Include the node's reachable
+IP as an IP SAN as well if peers dial by IP.
+
+Set on **every** node (all three required together, or startup fails):
+
+```sh
+BASIN_RAFT_TLS_CERT=/etc/basin/raft/node.crt   # this node's leaf cert (PEM)
+BASIN_RAFT_TLS_KEY=/etc/basin/raft/node.key    # this node's private key (PEM)
+BASIN_RAFT_TLS_CA=/etc/basin/raft/ca.crt       # cluster CA bundle (PEM)
+# BASIN_RAFT_TLS_DOMAIN=basin-raft             # optional; SAN the leaf carries
+```
+
+With TLS on, a peer URI in `BASIN_RAFT_PEERS` written as a bare
+`host:port` (or `http://…`) is dialed over `https://` automatically — you
+do not need to rewrite the peer list. Confirm at startup: the transport
+logs `raft transport listening (mutual TLS)` instead of
+`(plaintext; private network assumed)`. A node presenting no client cert,
+or one signed by a different CA, is rejected at the TLS handshake and
+never reaches the raft protocol.
+
+Source: `crates/basin-wal/src/raft_net/tls.rs`; verified by
+`crates/basin-wal/tests/raft_net_tls.rs`.
 
 ### What changes vs. single-writer
 
@@ -293,8 +355,10 @@ machine). The router re-resolves the leader on a `LeaseNotHeld` /
 
 The failover drills in
 `crates/basin-wal/tests/raft_failover_drills.rs` run against real
-disk-backed `RaftWal` nodes with a `SimCluster` in-process mesh. The
-four drills cover the behaviors operators can rely on:
+disk-backed `RaftWal` nodes with a `SimCluster` in-process mesh. Every
+drill carries an `AckedSet` zero-data-loss invariant: every payload whose
+`append` returned `Ok` must be present in the surviving cluster after the
+drill. The drills cover the behaviors operators can rely on:
 
 1. **Leader killed → new leader elected → writes continue, none lost.**
    (`drill_kill_leader_elects_new_and_continues_writes`) Writes that
@@ -323,6 +387,40 @@ four drills cover the behaviors operators can rely on:
    message containing `"not raft leader"` and a `"leader hint"` pointing
    at the current leader. The router uses this hint to re-resolve and
    retry.
+
+5. **Leader killed UNDER SUSTAINED WRITE LOAD → stream resumes, none
+   lost.** (`drill_kill_leader_under_sustained_write_load`) A background
+   writer streams appends continuously; the leader is killed mid-stream so
+   the election races live traffic. After failover the stream resumes on
+   the new leader (strictly more acks than the warm-up set) and every
+   acked write — including those acked during the chaos window — survives.
+   This is the strongest zero-loss proof: in-flight-but-unacked writes may
+   be rejected (the client retries), but no acked write is ever lost.
+
+6. **Slow (lagging) follower does not stall commits.**
+   (`drill_slow_follower_does_not_stall_commits`) With one follower down,
+   a burst of writes each commit on the 2-node quorum within a tight
+   per-append budget — proving the quorum commit never blocks waiting on
+   the lagging replica. The laggard catches the full set up once healed.
+
+7. **Partition + heal under load.**
+   (`drill_partition_and_heal_under_load`) A follower is partitioned off
+   mid-stream, the majority keeps committing under load, then the follower
+   is healed while writes continue. The healed node converges to the full
+   acked set.
+
+8. **Snapshot-streaming follower catch-up past the purge floor.**
+   (`drill_snapshot_streaming_follower_catch_up`) A follower misses the
+   window in which the leader runs `record_flush_watermark` (snapshot +
+   log purge), so the early log entries are gone. When it rejoins it can
+   only be caught up by `install_snapshot` — and it ends with the
+   identical committed write set. The raft snapshot the WAL builds is
+   self-contained: it serialises the full applied state machine plus the
+   manifest pointer, so the WAL follower rebuilds the entire committed
+   write set from the snapshot alone (no object-store fetch). The
+   `catalog_snapshot_id` in the pointer is the seam the **engine** layer
+   uses to rebuild flushed *table* state from S3 — that fetch is above the
+   WAL and out of scope of this drill.
 
 ### Procedure: replace a lost node (raft mode)
 
