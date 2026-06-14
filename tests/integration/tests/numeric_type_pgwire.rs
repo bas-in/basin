@@ -6,9 +6,11 @@
 //! (NUMERIC) and the text-format payload must round-trip the column's
 //! `(precision, scale)` shape (e.g. `1.50` not `1.5`).
 //!
-//! Binary numeric encoding is deferred to v0.2; lenient drivers like
-//! `tokio-postgres` accept the text form in a binary slot via the
-//! fallback path in `basin-router::types::encode_value_binary`.
+//! Binary numeric encoding is implemented: `encode_numeric_binary` in
+//! `basin-router::types` emits the PG base-10000 wire encoding when
+//! format code 1 is requested (tokio-postgres default for NUMERIC columns).
+//! Unit-level byte-pin and round-trip tests live in
+//! `crates/basin-router/tests/numeric_binary_codec.rs`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -121,10 +123,10 @@ async fn numeric_round_trip_through_pgwire() {
     assert!(found, "expected a SimpleQueryMessage::Row");
 
     // Extended-query path: confirm RowDescription advertises OID 1700.
-    // tokio-postgres requests binary for NUMERIC by default; our v0.1
-    // binary fallback emits the text form, which lenient drivers tolerate
-    // — but the OID assertion is what guards drivers / introspection
-    // from seeing TEXT (25) instead of NUMERIC (1700).
+    // tokio-postgres requests binary for NUMERIC by default; the router
+    // emits the PG binary numeric wire encoding (encode_numeric_binary)
+    // when format code 1 is requested — the OID assertion here guards
+    // drivers and introspection from seeing TEXT (25) instead of NUMERIC (1700).
     let stmt = client
         .prepare("SELECT price FROM t WHERE id = $1")
         .await
