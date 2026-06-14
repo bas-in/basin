@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, TypeVar
+from typing import Any, TypeVar
 
 import httpx
 
@@ -22,8 +22,8 @@ class ClientOptions:
     def __init__(
         self,
         *,
-        headers: Optional[Dict[str, str]] = None,
-        transport: Optional[httpx.AsyncBaseTransport] = None,
+        headers: dict[str, str] | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.headers = headers or {}
         self.transport = transport
@@ -44,13 +44,13 @@ class Client:
         base_url: str,
         anon_key: str,
         *,
-        options: Optional[ClientOptions] = None,
+        options: ClientOptions | None = None,
     ) -> None:
         opts = options or ClientOptions()
         self._base_url = base_url.rstrip("/")
         self._anon_key = anon_key
 
-        base_headers: Dict[str, str] = {
+        base_headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "application/json",
             "apikey": anon_key,
@@ -113,8 +113,8 @@ class Client:
         path: str,
         *,
         json: Any = None,
-        params: Optional[Dict[str, str]] = None,
-        headers: Optional[Dict[str, str]] = None,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Any:
         """
         Low-level helper used by sub-clients.  Raises ``BasinError`` on
@@ -139,12 +139,12 @@ class Client:
             raise BasinError.from_response(resp)
         try:
             return resp.json()
-        except Exception:
+        except Exception as exc:
             raise BasinError(
                 "invalid_response",
                 f"response was not JSON (HTTP {resp.status_code})",
                 status=resp.status_code,
-            )
+            ) from exc
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -157,7 +157,7 @@ class Client:
 
     # ── Internals ──────────────────────────────────────────────────────
 
-    def _current_headers(self) -> Dict[str, str]:
+    def _current_headers(self) -> dict[str, str]:
         headers = dict(self._http._default_headers)
         session = self.auth.get_session()
         if session and session.access_token:
@@ -169,7 +169,7 @@ def create_client(
     url: str,
     key: str,
     *,
-    options: Optional[ClientOptions] = None,
+    options: ClientOptions | None = None,
 ) -> Client:
     """
     Construct a basin ``Client``.

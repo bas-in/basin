@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 RealtimeChannel + RealtimeClient — T-033.
 
@@ -13,15 +11,17 @@ Transport routing (same rule as basin-js):
 ``basin.realtime.channel(topic)``.
 """
 
+from __future__ import annotations
+
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 from urllib.parse import urlparse
 
 from ..errors import BasinError
-from .presence import PresenceCallback, PresenceChannel, PresenceMember
+from .presence import PresenceCallback, PresenceChannel
 from .sse import SseEvent, SseSubscription
 from .ws import WsConnection
-
 
 RealtimeEvent = str
 
@@ -33,7 +33,7 @@ class PostgresChangesFilter:
         event: RealtimeEvent,
         table: str,
         schema: str = "public",
-        filter: Optional[str] = None,
+        filter: str | None = None,
     ) -> None:
         self.event = event
         self.table = table
@@ -41,7 +41,7 @@ class PostgresChangesFilter:
         self.filter = filter
 
 
-RealtimeListener = Callable[[Dict[str, Any]], None]
+RealtimeListener = Callable[[dict[str, Any]], None]
 
 
 class _PostgresBinding:
@@ -52,7 +52,7 @@ class _PostgresBinding:
 
 
 class _PresenceBinding:
-    def __init__(self, filter: Dict[str, Any], callback: PresenceCallback) -> None:
+    def __init__(self, filter: dict[str, Any], callback: PresenceCallback) -> None:
         self.kind = "presence"
         self.filter = filter
         self.callback = callback
@@ -76,17 +76,17 @@ class RealtimeChannel:
         *,
         url: str,
         project: str,
-        headers: Dict[str, str],
+        headers: dict[str, str],
     ) -> None:
         self._topic = topic
         self._url = url
         self._project = project
         self._headers = headers
 
-        self._bindings: List[Any] = []
-        self._sse_sub: Optional[SseSubscription] = None
-        self._ws_conn: Optional[Any] = None
-        self._presence_channel: Optional[PresenceChannel] = None
+        self._bindings: list[Any] = []
+        self._sse_sub: SseSubscription | None = None
+        self._ws_conn: Any | None = None
+        self._presence_channel: PresenceChannel | None = None
         self._subscribed = False
 
     @property
@@ -96,9 +96,9 @@ class RealtimeChannel:
     def on(
         self,
         type: str,
-        filter: Dict[str, Any],
+        filter: dict[str, Any],
         callback: Callable[..., Any],
-    ) -> "RealtimeChannel":
+    ) -> RealtimeChannel:
         if type == "postgres_changes":
             pg_filter = PostgresChangesFilter(
                 event=filter.get("event", "*"),
@@ -111,7 +111,7 @@ class RealtimeChannel:
             self._bindings.append(_PresenceBinding(filter=filter, callback=callback))
         return self
 
-    def subscribe(self) -> "RealtimeChannel":
+    def subscribe(self) -> RealtimeChannel:
         if self._subscribed:
             return self
         self._subscribed = True
@@ -132,7 +132,7 @@ class RealtimeChannel:
 
         return self
 
-    def unsubscribe(self) -> "RealtimeChannel":
+    def unsubscribe(self) -> RealtimeChannel:
         if self._sse_sub is not None:
             self._sse_sub.stop()
             self._sse_sub = None
@@ -154,7 +154,7 @@ class RealtimeChannel:
             op = event.get("op", "")
             if filter_event != "*" and filter_event != op:
                 return
-            payload: Dict[str, Any] = {
+            payload: dict[str, Any] = {
                 "schema": binding.filter.schema,
                 "table": event.get("table", ""),
                 "commit_timestamp": "",
@@ -175,8 +175,8 @@ class RealtimeChannel:
 
     def _start_ws(
         self,
-        pg_bindings: List[_PostgresBinding],
-        presence_bindings: List[_PresenceBinding],
+        pg_bindings: list[_PostgresBinding],
+        presence_bindings: list[_PresenceBinding],
     ) -> None:
         conn = WsConnection(
             self._project,
@@ -189,13 +189,13 @@ class RealtimeChannel:
         for binding in pg_bindings:
             flt = binding.filter.filter
 
-            def make_cb(b: _PostgresBinding) -> Callable[[Dict[str, Any]], None]:
-                def cb(ws_event: Dict[str, Any]) -> None:
+            def make_cb(b: _PostgresBinding) -> Callable[[dict[str, Any]], None]:
+                def cb(ws_event: dict[str, Any]) -> None:
                     fe = b.filter.event
                     op = ws_event.get("op", "")
                     if fe != "*" and fe != op:
                         return
-                    payload: Dict[str, Any] = {
+                    payload: dict[str, Any] = {
                         "schema": b.filter.schema,
                         "table": ws_event.get("table", ""),
                         "commit_timestamp": "",
@@ -254,7 +254,7 @@ class RealtimeClient:
         self,
         *,
         url: str,
-        headers: Dict[str, str],
+        headers: dict[str, str],
     ) -> None:
         self._url = url
         self._headers = headers

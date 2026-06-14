@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 
 class ObjectInfo:
@@ -14,7 +14,7 @@ class ObjectInfo:
         content_type: str,
         created_at: str,
         updated_at: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         self.name = name
         self.size = size

@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import respx
 
-from basin import create_sync_client, BasinError
+from basin import create_sync_client
 
 BASE = "http://localhost:5434"
 KEY = "basin_anon"

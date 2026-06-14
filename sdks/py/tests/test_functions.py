@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json as jsonlib
 
+import httpx
 import pytest
 import respx
-import httpx
 
-from basin import create_client, BasinError
+from basin import BasinError, create_client
 
 BASE = "http://test.basin.run"
 KEY = "test-key"

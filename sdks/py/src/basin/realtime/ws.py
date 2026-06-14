@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 WebSocket multiplex transport — T-031.
 
@@ -9,10 +7,13 @@ subscribe/unsubscribe, event/error frames, ``seq`` gap detection.
 Engine WS route: ``/realtime/v1/ws/:project`` (separate port 5436 for realtime).
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 from ..errors import BasinError
 
@@ -23,19 +24,19 @@ _CAP_BACKOFF_S = 30.0
 
 
 def _backoff(attempt: int) -> float:
-    return min(_BASE_BACKOFF_S * (2 ** attempt), _CAP_BACKOFF_S)
+    return min(_BASE_BACKOFF_S * float(2**attempt), _CAP_BACKOFF_S)
 
 
-WsEvent = Dict[str, Any]
+WsEvent = dict[str, Any]
 WsEventCallback = Callable[[WsEvent], None]
 
 
 class _Subscription:
     def __init__(
         self,
-        filter: Optional[str],
+        filter: str | None,
         on_event: WsEventCallback,
-        on_lag: Optional[Callable[[str, int], None]],
+        on_lag: Callable[[str, int], None] | None,
     ) -> None:
         self.filter = filter
         self.on_event = on_event
@@ -60,18 +61,18 @@ class WsConnection:
         project: str,
         *,
         url: str,
-        headers: Optional[Dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self._project = project
         self._base_url = url
         self._headers = headers or {}
-        self._subs: Dict[str, _Subscription] = {}
-        self._presence_handlers: Dict[str, PresenceMessageHandler] = {}
+        self._subs: dict[str, _Subscription] = {}
+        self._presence_handlers: dict[str, PresenceMessageHandler] = {}
         self._closed = False
         self._reconnect_attempt = 0
         self._ws: Any = None
-        self._task: Optional[asyncio.Task[None]] = None
-        self._pending: Dict[str, asyncio.Future[None]] = {}
+        self._task: asyncio.Task[None] | None = None
+        self._pending: dict[str, asyncio.Future[None]] = {}
 
     def _build_ws_url(self) -> str:
         base = self._base_url
@@ -92,12 +93,12 @@ class WsConnection:
 
     async def _run(self) -> None:
         try:
-            import websockets  # type: ignore[import-untyped]
-        except ImportError:
+            import websockets  # type: ignore[import-not-found]
+        except ImportError as exc:
             raise BasinError(
                 "not_implemented",
                 "WebSocket realtime requires `pip install basin-sdk[realtime]`",
-            )
+            ) from exc
 
         while not self._closed:
             if self._reconnect_attempt > 0:
@@ -105,11 +106,11 @@ class WsConnection:
             if self._closed:
                 break
             try:
-                async with websockets.connect(self._build_ws_url()) as ws:  # type: ignore[attr-defined]
+                async with websockets.connect(self._build_ws_url()) as ws:
                     self._ws = ws
                     self._reconnect_attempt = 0
                     for table, sub in self._subs.items():
-                        frame: Dict[str, str] = {"type": "subscribe", "table": table}
+                        frame: dict[str, str] = {"type": "subscribe", "table": table}
                         if sub.filter:
                             frame["filter"] = sub.filter
                         await ws.send(json.dumps(frame))
@@ -177,9 +178,9 @@ class WsConnection:
         self,
         table: str,
         *,
-        filter: Optional[str] = None,
+        filter: str | None = None,
         on_event: WsEventCallback,
-        on_lag: Optional[Callable[[str, int], None]] = None,
+        on_lag: Callable[[str, int], None] | None = None,
     ) -> asyncio.Future[None]:
         sub = _Subscription(filter=filter, on_event=on_event, on_lag=on_lag)
         self._subs[table] = sub
@@ -187,7 +188,7 @@ class WsConnection:
         fut: asyncio.Future[None] = loop.create_future()
         self._pending[table] = fut
         if self._ws is not None:
-            frame: Dict[str, str] = {"type": "subscribe", "table": table}
+            frame: dict[str, str] = {"type": "subscribe", "table": table}
             if filter:
                 frame["filter"] = filter
             asyncio.ensure_future(self._ws.send(json.dumps(frame)))

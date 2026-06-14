@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 SSE transport for realtime — T-030.
 
@@ -12,9 +10,12 @@ Engine route: separate port 5435 for realtime (wsgi-level); the SSE path is
 ``/realtime/v1/sse/:project/:table``.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
-from typing import Any, Awaitable, Callable, Dict, Optional
+from collections.abc import Callable
+from typing import Any
 
 import httpx
 
@@ -25,10 +26,10 @@ _CAP_BACKOFF_MS = 30.0
 
 
 def _backoff(attempt: int) -> float:
-    return min(_BASE_BACKOFF_MS * (2 ** attempt), _CAP_BACKOFF_MS)
+    return min(_BASE_BACKOFF_MS * float(2**attempt), _CAP_BACKOFF_MS)
 
 
-SseEvent = Dict[str, Any]
+SseEvent = dict[str, Any]
 SseEventCallback = Callable[[SseEvent], None]
 SseErrorCallback = Callable[[BasinError], None]
 
@@ -58,8 +59,8 @@ class SseSubscription:
         jwt: str,
         on_event: SseEventCallback,
         *,
-        on_error: Optional[SseErrorCallback] = None,
-        http_client: Optional[httpx.AsyncClient] = None,
+        on_error: SseErrorCallback | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url = base_url
         self._project = project
@@ -68,10 +69,10 @@ class SseSubscription:
         self._on_event = on_event
         self._on_error = on_error
         self._http_client = http_client
-        self._last_seq: Optional[int] = None
+        self._last_seq: int | None = None
         self._stopped = False
         self._attempt = 0
-        self._task: Optional[asyncio.Task[None]] = None
+        self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
         self._stopped = False
@@ -103,14 +104,14 @@ class SseSubscription:
             except Exception as exc:
                 if self._stopped:
                     break
-                err = BasinError("network", str(exc))
+                wrapped = BasinError("network", str(exc))
                 if self._on_error is not None:
-                    self._on_error(err)
+                    self._on_error(wrapped)
                 self._attempt += 1
 
     async def _connect(self) -> None:
         url = _build_url(self._base_url, self._project, self._table)
-        headers: Dict[str, str] = {
+        headers: dict[str, str] = {
             "Authorization": f"Bearer {self._jwt}",
             "Accept": "text/event-stream",
         }
@@ -146,7 +147,7 @@ class SseSubscription:
                 raise BasinError(
                     "invalid_response",
                     f"SSE data line is not valid JSON: {exc}",
-                )
+                ) from exc
             ev = parsed
             if isinstance(ev, dict) and isinstance(ev.get("seq"), int):
                 self._last_seq = ev["seq"]

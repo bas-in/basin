@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Presence over WebSocket — T-032.
 
@@ -7,12 +5,15 @@ Presence over WebSocket — T-032.
 Mirrors basin-js ``PresenceChannel`` semantics.
 """
 
+from __future__ import annotations
+
 import asyncio
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 PresenceEvent = str
-PresenceMember = Dict[str, Any]
-PresenceCallback = Callable[[List[PresenceMember]], None]
+PresenceMember = dict[str, Any]
+PresenceCallback = Callable[[list[PresenceMember]], None]
 
 
 class _Binding:
@@ -41,9 +42,9 @@ class PresenceChannel:
         self._channel = channel
         self._client_id = client_id
         self._send = send
-        self._presences: Dict[str, PresenceMember] = {}
-        self._bindings: List[_Binding] = []
-        self._heartbeat_task: Optional[asyncio.Task[None]] = None
+        self._presences: dict[str, PresenceMember] = {}
+        self._bindings: list[_Binding] = []
+        self._heartbeat_task: asyncio.Task[None] | None = None
         self._tracked = False
 
     def track(self, metadata: Any = None) -> None:
@@ -71,16 +72,16 @@ class PresenceChannel:
             }
         )
 
-    def presence_state(self) -> List[PresenceMember]:
+    def presence_state(self) -> list[PresenceMember]:
         """Return current snapshot of tracked members."""
         return list(self._presences.values())
 
     def on(
         self,
         type: str,
-        filter: Dict[str, Any],
+        filter: dict[str, Any],
         callback: PresenceCallback,
-    ) -> "PresenceChannel":
+    ) -> PresenceChannel:
         event = filter.get("event", "sync")
         self._bindings.append(_Binding(event=event, callback=callback))
         return self
@@ -92,15 +93,15 @@ class PresenceChannel:
             return
         kind = msg.get("type")
         if kind == "presence_state":
-            presences: List[PresenceMember] = msg.get("presences") or []
+            presences: list[PresenceMember] = msg.get("presences") or []
             self._presences.clear()
             for p in presences:
                 if isinstance(p, dict):
                     self._presences[str(p.get("client_id", ""))] = p
             self._emit("sync", presences)
         elif kind == "presence_diff":
-            joins: List[PresenceMember] = msg.get("joins") or []
-            leaves: List[PresenceMember] = msg.get("leaves") or []
+            joins: list[PresenceMember] = msg.get("joins") or []
+            leaves: list[PresenceMember] = msg.get("leaves") or []
             for p in joins:
                 if isinstance(p, dict):
                     self._presences[str(p.get("client_id", ""))] = p
@@ -124,7 +125,7 @@ class PresenceChannel:
                 }
             )
 
-    def _emit(self, event: PresenceEvent, members: List[PresenceMember]) -> None:
+    def _emit(self, event: PresenceEvent, members: list[PresenceMember]) -> None:
         for b in self._bindings:
             if b.event == event:
                 b.callback(members)

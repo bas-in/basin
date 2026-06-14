@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, Generator, Optional, TypeVar
+from collections.abc import Coroutine, Generator
+from typing import Any, TypeVar
 
-from .client import Client, ClientOptions, create_client
+from .auth.client import AuthClient
 from .auth.types import AuthSession, AuthUser
+from .client import ClientOptions, create_client
 from .postgrest.builder import QueryBuilder
 from .postgrest.types import APIResponse
 
 T = TypeVar("T")
 
 
-def _run(coro: Any) -> Any:
+def _run(coro: Coroutine[Any, Any, T]) -> T:
     """Run a coroutine synchronously using a fresh event loop."""
     return asyncio.run(coro)
 
@@ -113,11 +115,11 @@ class SyncQueryBuilder:
         self._b.maybe_single()
         return self
 
-    def cursor(self, token: Optional[str]) -> SyncQueryBuilder:
+    def cursor(self, token: str | None) -> SyncQueryBuilder:
         self._b.cursor(token)
         return self
 
-    def headers(self, extra: Dict[str, str]) -> SyncQueryBuilder:
+    def headers(self, extra: dict[str, str]) -> SyncQueryBuilder:
         self._b.headers(extra)
         return self
 
@@ -139,7 +141,7 @@ class SyncQueryBuilder:
 
 
 class SyncAuthClient:
-    def __init__(self, async_auth: Any) -> None:
+    def __init__(self, async_auth: AuthClient) -> None:
         self._a = async_auth
 
     def sign_up(self, *, email: str, password: str, **kw: Any) -> Any:
@@ -157,10 +159,10 @@ class SyncAuthClient:
     def sign_out(self) -> Any:
         return _run(self._a.sign_out())
 
-    def get_session(self) -> Optional[AuthSession]:
+    def get_session(self) -> AuthSession | None:
         return self._a.get_session()
 
-    def get_user(self) -> Optional[AuthUser]:
+    def get_user(self) -> AuthUser | None:
         return self._a.get_user()
 
     def refresh_session(self) -> Any:
@@ -184,7 +186,7 @@ class SyncClient:
         base_url: str,
         anon_key: str,
         *,
-        options: Optional[ClientOptions] = None,
+        options: ClientOptions | None = None,
     ) -> None:
         self._async = create_client(base_url, anon_key, options=options)
         self.auth = SyncAuthClient(self._async.auth)
@@ -206,7 +208,7 @@ def create_sync_client(
     url: str,
     key: str,
     *,
-    options: Optional[ClientOptions] = None,
+    options: ClientOptions | None = None,
 ) -> SyncClient:
     """Synchronous counterpart to ``create_client``."""
     return SyncClient(url, key, options=options)

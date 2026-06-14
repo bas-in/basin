@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Generic, List, Optional, TypeVar
+from typing import Any, Generic, TypeVar
 
 T = TypeVar("T")
 
@@ -21,11 +21,11 @@ class APIResponse(Generic[T]):
     def __init__(
         self,
         *,
-        data: Optional[List[T]],
+        data: list[T] | None,
         error: Any,
-        count: Optional[int] = None,
+        count: int | None = None,
         status: int = 200,
-        next_cursor: Optional[str] = None,
+        next_cursor: str | None = None,
     ) -> None:
         self.data = data
         self.error = error

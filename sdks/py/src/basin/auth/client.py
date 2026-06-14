@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import math
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
+from typing import Any
 
 import httpx
 
@@ -39,15 +41,15 @@ class AuthClient:
         *,
         base_url: str,
         anon_key: str,
-        get_headers: Callable[[], Dict[str, str]],
+        get_headers: Callable[[], dict[str, str]],
         http: Any,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._anon_key = anon_key
         self._get_headers = get_headers
         self._http = http
-        self._session: Optional[AuthSession] = None
-        self._listeners: List[Callable[[str, Optional[AuthSession]], None]] = []
+        self._session: AuthSession | None = None
+        self._listeners: list[Callable[[str, AuthSession | None], None]] = []
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -56,12 +58,12 @@ class AuthClient:
         *,
         email: str,
         password: str,
-        data: Optional[Dict[str, Any]] = None,
-        email_redirect_to: Optional[str] = None,
-    ) -> Tuple[Optional[AuthSession], Optional[BasinError]]:
+        data: dict[str, Any] | None = None,
+        email_redirect_to: str | None = None,
+    ) -> tuple[AuthSession | None, BasinError | None]:
         if not email or not password:
             return None, BasinError("invalid_request", "sign_up requires email and password")
-        body: Dict[str, Any] = {"email": email, "password": password}
+        body: dict[str, Any] = {"email": email, "password": password}
         resp = await self._post("/auth/v1/signup", body)
         if isinstance(resp, BasinError):
             return None, resp
@@ -77,13 +79,13 @@ class AuthClient:
         *,
         email: str,
         password: str,
-    ) -> Tuple[Optional[AuthSession], Optional[BasinError]]:
+    ) -> tuple[AuthSession | None, BasinError | None]:
         if not email or not password:
             return None, BasinError(
                 "invalid_request",
                 "sign_in_with_password requires email and password",
             )
-        body: Dict[str, Any] = {"email": email, "password": password}
+        body: dict[str, Any] = {"email": email, "password": password}
         resp = await self._post("/auth/v1/signin", body)
         if isinstance(resp, BasinError):
             return None, resp
@@ -107,7 +109,7 @@ class AuthClient:
         self,
         *,
         email: str,
-    ) -> Tuple[None, Optional[BasinError]]:
+    ) -> tuple[None, BasinError | None]:
         if not email:
             return None, BasinError(
                 "invalid_request",
@@ -122,7 +124,7 @@ class AuthClient:
         self,
         *,
         token: str,
-    ) -> Tuple[Optional[AuthSession], Optional[BasinError]]:
+    ) -> tuple[AuthSession | None, BasinError | None]:
         if not token:
             return None, BasinError(
                 "invalid_request",
@@ -148,7 +150,7 @@ class AuthClient:
         self,
         *,
         token: str,
-    ) -> Tuple[None, Optional[BasinError]]:
+    ) -> tuple[None, BasinError | None]:
         if not token:
             return None, BasinError("invalid_request", "verify_email requires a token")
         resp = await self._post("/auth/v1/verify-email", {"token": token})
@@ -160,7 +162,7 @@ class AuthClient:
         self,
         *,
         email: str,
-    ) -> Tuple[None, Optional[BasinError]]:
+    ) -> tuple[None, BasinError | None]:
         if not email:
             return None, BasinError(
                 "invalid_request",
@@ -176,7 +178,7 @@ class AuthClient:
         *,
         token: str,
         new_password: str,
-    ) -> Tuple[None, Optional[BasinError]]:
+    ) -> tuple[None, BasinError | None]:
         if not token or not new_password:
             return None, BasinError(
                 "invalid_request",
@@ -190,21 +192,21 @@ class AuthClient:
             return None, resp
         return None, None
 
-    async def sign_out(self) -> Tuple[None, None]:
+    async def sign_out(self) -> tuple[None, None]:
         self._session = None
         self._emit("SIGNED_OUT", None)
         return None, None
 
-    def get_session(self) -> Optional[AuthSession]:
+    def get_session(self) -> AuthSession | None:
         return self._session
 
-    def get_user(self) -> Optional[AuthUser]:
+    def get_user(self) -> AuthUser | None:
         s = self._session
         return s.user if s else None
 
     async def refresh_session(
         self,
-    ) -> Tuple[Optional[AuthSession], Optional[BasinError]]:
+    ) -> tuple[AuthSession | None, BasinError | None]:
         current = self._session
         if not current or not current.refresh_token:
             return None, BasinError(
@@ -251,10 +253,10 @@ class AuthClient:
         self,
         *,
         provider: OAuthProvider,
-        redirect_to: Optional[str] = None,
-        scopes: Optional[str] = None,
-        query_params: Optional[Dict[str, str]] = None,
-    ) -> Tuple[Optional[Dict[str, Any]], Optional[BasinError]]:
+        redirect_to: str | None = None,
+        scopes: str | None = None,
+        query_params: dict[str, str] | None = None,
+    ) -> tuple[dict[str, Any] | None, BasinError | None]:
         """
         Build the OAuth authorize URL.
 
@@ -268,7 +270,7 @@ class AuthClient:
                 "invalid_request",
                 "sign_in_with_oauth requires a provider",
             )
-        params: Dict[str, str] = {}
+        params: dict[str, str] = {}
         if redirect_to:
             params["redirect_to"] = redirect_to
         if scopes:
@@ -288,7 +290,7 @@ class AuthClient:
         self,
         *,
         factor: str,
-    ) -> Tuple[Optional[Dict[str, Any]], Optional[BasinError]]:
+    ) -> tuple[dict[str, Any] | None, BasinError | None]:
         resp = await self._post("/auth/v1/factors", {"factor": factor})
         if isinstance(resp, BasinError):
             return None, resp
@@ -296,7 +298,7 @@ class AuthClient:
 
     async def mfa_list(
         self,
-    ) -> Tuple[Optional[List[Any]], Optional[BasinError]]:
+    ) -> tuple[list[Any] | None, BasinError | None]:
         resp = await self._get_req("/auth/v1/factors")
         if isinstance(resp, BasinError):
             return None, resp
@@ -306,8 +308,8 @@ class AuthClient:
         self,
         *,
         factor_id: str,
-        body: Dict[str, Any],
-    ) -> Tuple[Optional[Dict[str, Any]], Optional[BasinError]]:
+        body: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, BasinError | None]:
         resp = await self._post(f"/auth/v1/factors/{factor_id}/verify", body)
         if isinstance(resp, BasinError):
             return None, resp
@@ -317,7 +319,7 @@ class AuthClient:
         self,
         *,
         factor_id: str,
-    ) -> Tuple[Optional[Dict[str, Any]], Optional[BasinError]]:
+    ) -> tuple[dict[str, Any] | None, BasinError | None]:
         resp = await self._post(f"/auth/v1/factors/{factor_id}/challenge", {})
         if isinstance(resp, BasinError):
             return None, resp
@@ -328,8 +330,8 @@ class AuthClient:
         *,
         factor_id: str,
         challenge_id: str,
-        body: Dict[str, Any],
-    ) -> Tuple[Optional[Dict[str, Any]], Optional[BasinError]]:
+        body: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, BasinError | None]:
         payload = {"challenge_id": challenge_id, **body}
         resp = await self._post(
             f"/auth/v1/factors/{factor_id}/challenge/verify",
@@ -343,7 +345,7 @@ class AuthClient:
         self,
         *,
         factor_id: str,
-    ) -> Tuple[Optional[Dict[str, Any]], Optional[BasinError]]:
+    ) -> tuple[dict[str, Any] | None, BasinError | None]:
         headers = self._authed_headers()
         try:
             raw = await self._http.request(
@@ -359,15 +361,13 @@ class AuthClient:
 
     def on_auth_state_change(
         self,
-        callback: Callable[[str, Optional[AuthSession]], None],
+        callback: Callable[[str, AuthSession | None], None],
     ) -> Callable[[], None]:
         self._listeners.append(callback)
 
         def unsubscribe() -> None:
-            try:
+            with contextlib.suppress(ValueError):
                 self._listeners.remove(callback)
-            except ValueError:
-                pass
 
         return unsubscribe
 
@@ -377,14 +377,12 @@ class AuthClient:
         self._session = session
         self._emit(event, session)
 
-    def _emit(self, event: str, session: Optional[AuthSession]) -> None:
+    def _emit(self, event: str, session: AuthSession | None) -> None:
         for cb in list(self._listeners):
-            try:
+            with contextlib.suppress(Exception):
                 cb(event, session)
-            except Exception:
-                pass
 
-    def _authed_headers(self) -> Dict[str, str]:
+    def _authed_headers(self) -> dict[str, str]:
         headers = dict(self._get_headers())
         if self._session and self._session.access_token:
             headers["Authorization"] = f"Bearer {self._session.access_token}"
@@ -450,7 +448,7 @@ class AuthClient:
 
 def _parse_session_response(
     body: Any,
-) -> Tuple[Optional[AuthSession], Optional[BasinError]]:
+) -> tuple[AuthSession | None, BasinError | None]:
     if not isinstance(body, dict):
         return None, BasinError("invalid_response", "auth response body is not an object")
     user_raw = body.get("user")
@@ -495,7 +493,7 @@ def _parse_expires_at(value: Any) -> int:
         return math.floor(value)
     if isinstance(value, str):
         try:
-            from datetime import datetime, timezone
+            from datetime import datetime
             dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
             return math.floor(dt.timestamp())
         except Exception:

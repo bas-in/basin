@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 
 class ProvisionResult:
     """Returned by ``provision`` and ``rotate_credentials``."""
@@ -24,7 +22,7 @@ class Credential:
         pgwire_user: str,
         dbname: str,
         created_at: str,
-        rotated_at: Optional[str] = None,
+        rotated_at: str | None = None,
     ) -> None:
         self.id = id
         self.project_id = project_id

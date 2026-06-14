@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-import pytest
+
 import httpx
+import pytest
 import respx
 
-from basin import create_client, BasinError
+from basin import create_client
 
 BASE = "http://localhost:5434"
 KEY = "basin_test"
@@ -174,7 +175,7 @@ async def test_delete_method():
     with respx.mock:
         route = respx.delete(URL).mock(return_value=httpx.Response(204))
         async with client() as c:
-            result = await c.from_(TABLE).delete().eq("id", 1)
+            await c.from_(TABLE).delete().eq("id", 1)
         req = route.calls.last.request
         assert req.method == "DELETE"
         qs = str(req.url.query)

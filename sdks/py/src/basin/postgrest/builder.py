@@ -1,18 +1,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator, Callable, Iterable
 from typing import (
     Any,
-    AsyncIterator,
-    Callable,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Tuple,
-    Type,
     TypeVar,
-    Union,
 )
 from urllib.parse import urlencode
 
@@ -46,7 +38,7 @@ class QueryBuilder(APIResponse[T]):
         self,
         *,
         table_url: str,
-        get_headers: Callable[[], Dict[str, str]],
+        get_headers: Callable[[], dict[str, str]],
         http: Any,
     ) -> None:
         super().__init__(data=None, error=None)
@@ -54,17 +46,17 @@ class QueryBuilder(APIResponse[T]):
         self._get_headers = get_headers
         self._http = http
 
-        self._params: List[Tuple[str, str]] = []
+        self._params: list[tuple[str, str]] = []
         self._method: str = "GET"
         self._body: Any = None
-        self._single: Optional[str] = None
+        self._single: str | None = None
         self._returning: str = "representation"
-        self._extra_headers: Dict[str, str] = {}
-        self._count: Optional[str] = None
+        self._extra_headers: dict[str, str] = {}
+        self._count: str | None = None
 
     # ── select / mutations ─────────────────────────────────────────────
 
-    def select(self, columns: str = "*", *, count: Optional[str] = None) -> QueryBuilder[T]:
+    def select(self, columns: str = "*", *, count: str | None = None) -> QueryBuilder[T]:
         self._set_param("select", columns)
         if count:
             self._count = count
@@ -72,7 +64,7 @@ class QueryBuilder(APIResponse[T]):
 
     def insert(
         self,
-        rows: Union[Dict[str, Any], List[Dict[str, Any]]],
+        rows: dict[str, Any] | list[dict[str, Any]],
         *,
         returning: str = "representation",
     ) -> QueryBuilder[T]:
@@ -83,7 +75,7 @@ class QueryBuilder(APIResponse[T]):
 
     def update(
         self,
-        values: Dict[str, Any],
+        values: dict[str, Any],
         *,
         returning: str = "representation",
     ) -> QueryBuilder[T]:
@@ -94,9 +86,9 @@ class QueryBuilder(APIResponse[T]):
 
     def upsert(
         self,
-        rows: Union[Dict[str, Any], List[Dict[str, Any]]],
+        rows: dict[str, Any] | list[dict[str, Any]],
         *,
-        on_conflict: Optional[str] = None,
+        on_conflict: str | None = None,
         returning: str = "representation",
     ) -> QueryBuilder[T]:
         self._method = "POST"
@@ -139,7 +131,7 @@ class QueryBuilder(APIResponse[T]):
     def ilike(self, column: str, pattern: str) -> QueryBuilder[T]:
         return self._filter(column, "ilike", _encode_value(pattern))
 
-    def is_(self, column: str, value: Optional[bool]) -> QueryBuilder[T]:
+    def is_(self, column: str, value: bool | None) -> QueryBuilder[T]:
         encoded = "null" if value is None else str(value).lower()
         return self._filter(column, "is", encoded)
 
@@ -165,12 +157,12 @@ class QueryBuilder(APIResponse[T]):
             encoded = _encode_value(value)
         return self._filter(column, f"not.{operator}", encoded)
 
-    def or_(self, filters: str, *, foreign_table: Optional[str] = None) -> QueryBuilder[T]:
+    def or_(self, filters: str, *, foreign_table: str | None = None) -> QueryBuilder[T]:
         key = f"{foreign_table}.or" if foreign_table else "or"
         self._params.append((key, f"({filters})"))
         return self
 
-    def match(self, query: Dict[str, Any]) -> QueryBuilder[T]:
+    def match(self, query: dict[str, Any]) -> QueryBuilder[T]:
         for k, v in query.items():
             self.eq(k, v)
         return self
@@ -221,7 +213,7 @@ class QueryBuilder(APIResponse[T]):
         self._returning = mode
         return self
 
-    def headers(self, extra: Dict[str, str]) -> QueryBuilder[T]:
+    def headers(self, extra: dict[str, str]) -> QueryBuilder[T]:
         for k, v in extra.items():
             if k.lower() == "prefer" and "Prefer" in self._extra_headers:
                 self._extra_headers["Prefer"] = (
@@ -231,7 +223,7 @@ class QueryBuilder(APIResponse[T]):
                 self._extra_headers[k] = v
         return self
 
-    def cursor(self, token: Optional[str]) -> QueryBuilder[T]:
+    def cursor(self, token: str | None) -> QueryBuilder[T]:
         if token is not None:
             self._set_param("cursor", token)
         return self
@@ -303,7 +295,7 @@ class QueryBuilder(APIResponse[T]):
     def _parse_ndjson(
         self,
         resp: httpx.Response,
-        count: Optional[int],
+        count: int | None,
     ) -> APIResponse[T]:
         if not resp.is_success:
             return APIResponse(
@@ -325,7 +317,7 @@ class QueryBuilder(APIResponse[T]):
                 status=resp.status_code,
             )
         lines = [ln for ln in text.splitlines() if ln.strip()]
-        parsed: List[Any] = []
+        parsed: list[Any] = []
         for line in lines:
             try:
                 parsed.append(json.loads(line))
@@ -339,7 +331,7 @@ class QueryBuilder(APIResponse[T]):
                     ),
                     status=resp.status_code,
                 )
-        next_cursor: Optional[str] = None
+        next_cursor: str | None = None
         if parsed:
             last = parsed[-1]
             if isinstance(last, dict) and "_basin_next_cursor" in last:
@@ -356,7 +348,7 @@ class QueryBuilder(APIResponse[T]):
     def _unwrap_single(
         self,
         payload: Any,
-        count: Optional[int],
+        count: int | None,
         status: int,
     ) -> APIResponse[T]:
         if isinstance(payload, list):
@@ -387,14 +379,14 @@ class QueryBuilder(APIResponse[T]):
             row = payload[0]
         else:
             row = payload
-        return APIResponse(data=row, error=None, count=count, status=status)  # type: ignore[arg-type]
+        return APIResponse(data=row, error=None, count=count, status=status)
 
-    def _build_request(self) -> Tuple[str, Dict[str, str]]:
+    def _build_request(self) -> tuple[str, dict[str, str]]:
         params = list(self._params)
         qs = urlencode(params) if params else ""
         url = (self._table_url + ("?" + qs if qs else ""))
         headers = dict(self._get_headers())
-        prefer_parts: List[str] = []
+        prefer_parts: list[str] = []
         if self._method != "GET":
             prefer_parts.append(f"return={self._returning}")
         if self._count:
@@ -430,7 +422,7 @@ class QueryBuilder(APIResponse[T]):
             result = await self._execute()
             if result.error:
                 raise result.error
-            rows: List[T] = result.data or []
+            rows: list[T] = result.data or []
             for row in rows:
                 yield row
             if result.next_cursor is None:
@@ -466,7 +458,7 @@ class QueryBuilder(APIResponse[T]):
                     ) from exc
                 if isinstance(obj, dict) and "_basin_next_cursor" in obj:
                     return
-                yield obj  # type: ignore[misc]
+                yield obj
 
 
 def _encode_value(value: Any) -> str:
@@ -495,7 +487,7 @@ def _unwrap_envelope(raw: Any) -> Any:
     return raw
 
 
-def _parse_content_range(header: Optional[str]) -> Optional[int]:
+def _parse_content_range(header: str | None) -> int | None:
     if not header:
         return None
     slash = header.find("/")

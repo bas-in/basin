@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import json
-import pytest
 import httpx
+import pytest
 import respx
 
-from basin import create_client, BasinError
+from basin import create_client
 from basin.client import ClientOptions
-
 
 BASE = "http://localhost:5434"
 ANON_KEY = "basin_test_anon"
@@ -25,7 +23,7 @@ async def test_headers_present():
             return_value=httpx.Response(200, json=[{"id": 1}])
         )
         client = make_client()
-        result = await client.from_("users").select()
+        await client.from_("users").select()
         assert route.called
         req = route.calls.last.request
         assert req.headers["apikey"] == ANON_KEY

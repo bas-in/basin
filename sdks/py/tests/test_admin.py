@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 import respx
-import httpx
 
-from basin import create_client, BasinError
+from basin import BasinError, create_client
 
 BASE = "http://test.basin.run"
 KEY = "test-key"

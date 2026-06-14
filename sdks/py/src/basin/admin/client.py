@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 from urllib.parse import quote
 
 from .._http import HttpTransport
@@ -18,8 +19,9 @@ def _extract_connection_url(body: Any) -> str:
     entry so older engine builds still work.
     """
     if isinstance(body, dict):
-        if isinstance(body.get("connection_url"), str):
-            return body["connection_url"]
+        url = body.get("connection_url")
+        if isinstance(url, str):
+            return url
         for v in body.values():
             if isinstance(v, str) and v.startswith("postgres://"):
                 return v
@@ -42,16 +44,16 @@ class AdminProjectsClient:
         self,
         *,
         http: HttpTransport,
-        get_headers: Callable[[], Dict[str, str]],
+        get_headers: Callable[[], dict[str, str]],
     ) -> None:
         self._http = http
         self._get_headers = get_headers
 
     async def provision(
         self,
-        project_id: Optional[str] = None,
+        project_id: str | None = None,
         *,
-        dbname: Optional[str] = None,
+        dbname: str | None = None,
     ) -> ProvisionResult:
         """
         ``POST /admin/v1/projects`` — provision a new project (or the
@@ -61,7 +63,7 @@ class AdminProjectsClient:
         Raises ``BasinError("unauthorized", …)`` when the token lacks
         ``is_admin: true``.
         """
-        body: Dict[str, Any] = {}
+        body: dict[str, Any] = {}
         if project_id is not None:
             body["project_id"] = project_id
         if dbname is not None:
@@ -83,12 +85,12 @@ class AdminProjectsClient:
             raise BasinError.from_response(resp)
         try:
             data = resp.json()
-        except Exception:
+        except Exception as exc:
             raise BasinError(
                 "invalid_response",
                 f"Admin provision response was not JSON (HTTP {resp.status_code})",
                 status=resp.status_code,
-            )
+            ) from exc
         return ProvisionResult(connection_string=_extract_connection_url(data))
 
     async def rotate_credentials(self, pgwire_user: str) -> ProvisionResult:
@@ -119,15 +121,15 @@ class AdminProjectsClient:
             raise BasinError.from_response(resp)
         try:
             data = resp.json()
-        except Exception:
+        except Exception as exc:
             raise BasinError(
                 "invalid_response",
                 f"Admin rotateCredentials response was not JSON (HTTP {resp.status_code})",
                 status=resp.status_code,
-            )
+            ) from exc
         return ProvisionResult(connection_string=_extract_connection_url(data))
 
-    async def list_credentials(self, project_id: str) -> List[Credential]:
+    async def list_credentials(self, project_id: str) -> list[Credential]:
         """
         ``GET /admin/v1/projects/:project_id/credentials`` — return
         credential descriptors for the project (no password/hash).
@@ -147,12 +149,12 @@ class AdminProjectsClient:
             raise BasinError.from_response(resp)
         try:
             items = resp.json()
-        except Exception:
+        except Exception as exc:
             raise BasinError(
                 "invalid_response",
                 f"Admin listCredentials response was not JSON (HTTP {resp.status_code})",
                 status=resp.status_code,
-            )
+            ) from exc
         if not isinstance(items, list):
             return []
         return [
@@ -183,6 +185,6 @@ class AdminClient:
         self,
         *,
         http: HttpTransport,
-        get_headers: Callable[[], Dict[str, str]],
+        get_headers: Callable[[], dict[str, str]],
     ) -> None:
         self.projects = AdminProjectsClient(http=http, get_headers=get_headers)

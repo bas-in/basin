@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 StorageClient — ``client.storage.from_(bucket)`` returns a ``StorageBucket``
 with ``.upload``, ``.download``, ``.list``, ``.remove``, ``.create_signed_url``,
@@ -21,7 +19,12 @@ for axum, fixes #55).  basin-js uses /sign/:bucket/:path which was the old path;
 the engine changed it post-5.17.D.  We follow the engine source of truth.
 """
 
-from typing import Any, Callable, Dict, List, Optional
+from __future__ import annotations
+
+import builtins
+import contextlib
+from collections.abc import Callable
+from typing import Any
 from urllib.parse import quote
 
 from .._http import HttpTransport
@@ -61,13 +64,13 @@ class StorageBucket:
         bucket: str,
         *,
         http: HttpTransport,
-        get_headers: Callable[[], Dict[str, str]],
+        get_headers: Callable[[], dict[str, str]],
     ) -> None:
         self._bucket = bucket
         self._http = http
         self._get_headers = get_headers
 
-    def _headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         h = dict(self._get_headers())
         if extra:
             h.update(extra)
@@ -80,7 +83,7 @@ class StorageBucket:
         *,
         content_type: str = "application/octet-stream",
         upsert: bool = False,
-    ) -> Dict[str, str]:
+    ) -> dict[str, str]:
         """
         Upload ``data`` to ``{bucket}/{path}``.
 
@@ -93,7 +96,7 @@ class StorageBucket:
         path_enc = _encode_path(path)
         url = f"/storage/v1/object/{bucket_enc}/{path_enc}"
 
-        extra: Dict[str, str] = {"Content-Type": content_type}
+        extra: dict[str, str] = {"Content-Type": content_type}
         if upsert:
             extra["x-upsert"] = "true"
         headers = self._headers(extra)
@@ -107,10 +110,8 @@ class StorageBucket:
 
         if not resp.is_success:
             details: Any = None
-            try:
+            with contextlib.suppress(Exception):
                 details = resp.json()
-            except Exception:
-                pass
             raise _http_error(resp.status_code, details)
 
         return {"path": path}
@@ -134,10 +135,8 @@ class StorageBucket:
 
         if not resp.is_success:
             details = None
-            try:
+            with contextlib.suppress(Exception):
                 details = resp.json()
-            except Exception:
-                pass
             raise _http_error(resp.status_code, details)
 
         return resp.content
@@ -146,10 +145,10 @@ class StorageBucket:
         self,
         prefix: str = "",
         *,
-        limit: Optional[int] = None,
-        offset: Optional[int] = None,
-        sort_by: Optional[Dict[str, str]] = None,
-    ) -> List[ObjectInfo]:
+        limit: int | None = None,
+        offset: int | None = None,
+        sort_by: dict[str, str] | None = None,
+    ) -> builtins.list[ObjectInfo]:
         """
         List objects in the bucket under ``prefix``.
 
@@ -160,7 +159,7 @@ class StorageBucket:
         bucket_enc = quote(self._bucket, safe="")
         url = f"/storage/v1/object/list/{bucket_enc}"
 
-        body: Dict[str, Any] = {"prefix": prefix}
+        body: dict[str, Any] = {"prefix": prefix}
         if limit is not None:
             body["limit"] = limit
         if offset is not None:
@@ -182,20 +181,18 @@ class StorageBucket:
 
         if not resp.is_success:
             details = None
-            try:
+            with contextlib.suppress(Exception):
                 details = resp.json()
-            except Exception:
-                pass
             raise _http_error(resp.status_code, details)
 
         try:
             items = resp.json()
-        except Exception:
+        except Exception as exc:
             raise BasinError(
                 "internal",
                 "storage.list response was not JSON",
                 status=resp.status_code,
-            )
+            ) from exc
 
         if not isinstance(items, list):
             return []
@@ -213,7 +210,7 @@ class StorageBucket:
             if isinstance(item, dict)
         ]
 
-    async def remove(self, paths: List[str]) -> Dict[str, Any]:
+    async def remove(self, paths: builtins.list[str]) -> dict[str, Any]:
         """
         Remove objects in bulk.
 
@@ -238,10 +235,8 @@ class StorageBucket:
 
         if not resp.is_success:
             details = None
-            try:
+            with contextlib.suppress(Exception):
                 details = resp.json()
-            except Exception:
-                pass
             raise _http_error(resp.status_code, details)
 
         return {"paths": paths}
@@ -250,7 +245,7 @@ class StorageBucket:
         self,
         path: str,
         expires_in: int,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Mint a short-lived signed URL for ``{bucket}/{path}``.
 
@@ -288,20 +283,18 @@ class StorageBucket:
 
         if not resp.is_success:
             details = None
-            try:
+            with contextlib.suppress(Exception):
                 details = resp.json()
-            except Exception:
-                pass
             raise _http_error(resp.status_code, details)
 
         try:
             body = resp.json()
-        except Exception:
+        except Exception as exc:
             raise BasinError(
                 "internal",
                 "storage.create_signed_url response was not JSON",
                 status=resp.status_code,
-            )
+            ) from exc
 
         raw_url = ""
         if isinstance(body, dict):
@@ -312,12 +305,12 @@ class StorageBucket:
             base = self._http._base_url
             signed_url = base + ("" if raw_url.startswith("/") else "/") + raw_url
 
-        result: Dict[str, Any] = {"signed_url": signed_url}
+        result: dict[str, Any] = {"signed_url": signed_url}
         if isinstance(body, dict) and body.get("expiresAt"):
             result["expires_at"] = body["expiresAt"]
         return result
 
-    def get_public_url(self, path: str, *, project_id: str = "") -> Dict[str, str]:
+    def get_public_url(self, path: str, *, project_id: str = "") -> dict[str, str]:
         """
         Construct a public URL for ``{bucket}/{path}`` synchronously.
 
@@ -383,7 +376,7 @@ class StorageClient:
         self,
         *,
         http: HttpTransport,
-        get_headers: Callable[[], Dict[str, str]],
+        get_headers: Callable[[], dict[str, str]],
     ) -> None:
         self._http = http
         self._get_headers = get_headers

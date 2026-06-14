@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 FunctionsClient — ``client.functions.invoke(name, ...)``
 
@@ -9,7 +7,10 @@ Engine route (confirmed against basin-rest/src/server.rs):
 Body is a JSON object of named args.  Response is the function result.
 """
 
-from typing import Any, Callable, Dict, Optional
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
 from urllib.parse import quote
 
 from .._http import HttpTransport
@@ -31,7 +32,7 @@ class FunctionsClient:
         self,
         *,
         http: HttpTransport,
-        get_headers: Callable[[], Dict[str, str]],
+        get_headers: Callable[[], dict[str, str]],
     ) -> None:
         self._http = http
         self._get_headers = get_headers
@@ -40,8 +41,8 @@ class FunctionsClient:
         self,
         fn_name: str,
         *,
-        body: Optional[Dict[str, Any]] = None,
-        headers: Optional[Dict[str, str]] = None,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Any:
         """
         ``POST /rest/v1/rpc/:fn_name`` — invoke a named function.
@@ -83,12 +84,12 @@ class FunctionsClient:
 
         try:
             result = resp.json()
-        except Exception:
+        except Exception as exc:
             raise BasinError(
                 "invalid_response",
                 f"functions.invoke('{fn_name}') response was not JSON (HTTP {resp.status_code})",
                 status=resp.status_code,
-            )
+            ) from exc
 
         if not resp.is_success:
             raise BasinError(

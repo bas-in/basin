@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Realtime tests — T-030, T-031, T-032, T-033.
 
@@ -8,17 +6,18 @@ for SSE tests).  WS tests mock the connection object directly so the
 ``websockets`` optional dep is not imported.
 """
 
+from __future__ import annotations
+
 import asyncio
-import json
-from typing import Any, Dict, List
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from basin import create_client, BasinError
-from basin.realtime.sse import SseSubscription
-from basin.realtime.presence import PresenceChannel
+from basin import BasinError, create_client
 from basin.realtime.channel import RealtimeChannel, RealtimeClient
+from basin.realtime.presence import PresenceChannel
+from basin.realtime.sse import SseSubscription
 
 BASE = "http://test.basin.run"
 KEY = "test-key"
@@ -46,13 +45,11 @@ def test_realtime_client_enabled() -> None:
 
 
 def test_channel_extract_project_from_url() -> None:
-    from basin.realtime.channel import RealtimeClient
     rt = RealtimeClient(url="http://acme.basin.run", headers={})
     assert rt._extract_project() == "acme"
 
 
 def test_channel_extract_project_localhost() -> None:
-    from basin.realtime.channel import RealtimeClient
     rt = RealtimeClient(url="http://localhost:5434", headers={})
     assert rt._extract_project() == "localhost"
 
@@ -61,7 +58,7 @@ def test_channel_extract_project_localhost() -> None:
 
 def test_single_pg_binding_no_filter_chooses_sse() -> None:
     """One postgres_changes binding, no filter → SSE transport."""
-    events: List[Dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
 
     with patch.object(SseSubscription, "start", return_value=None):
         ch = RealtimeChannel(
@@ -92,7 +89,7 @@ def _make_ws_mock() -> MagicMock:
 
 def test_multiple_pg_bindings_chooses_ws() -> None:
     """Multiple postgres_changes → WS transport."""
-    events: List[Any] = []
+    events: list[Any] = []
 
     with patch("basin.realtime.channel.WsConnection", return_value=_make_ws_mock()):
         ch = RealtimeChannel(
@@ -110,7 +107,7 @@ def test_multiple_pg_bindings_chooses_ws() -> None:
 
 def test_filter_string_chooses_ws() -> None:
     """postgres_changes with filter= → WS transport."""
-    events: List[Any] = []
+    events: list[Any] = []
 
     with patch("basin.realtime.channel.WsConnection", return_value=_make_ws_mock()):
         ch = RealtimeChannel(
@@ -131,7 +128,7 @@ def test_filter_string_chooses_ws() -> None:
 
 def test_presence_binding_chooses_ws() -> None:
     """Presence binding → WS transport."""
-    events: List[Any] = []
+    events: list[Any] = []
 
     with patch("basin.realtime.channel.WsConnection", return_value=_make_ws_mock()):
         ch = RealtimeChannel(
@@ -159,7 +156,7 @@ def test_no_bindings_is_none_transport() -> None:
 # ── SSE subscription unit tests ────────────────────────────────────────────────
 
 def test_sse_process_line_dispatches_event() -> None:
-    received: List[Any] = []
+    received: list[Any] = []
     sub = SseSubscription(BASE, "proj", "orders", "tok", received.append)
     sub._process_line('data: {"op":"INSERT","table":"orders","after":{"id":1},"seq":1}')
     assert len(received) == 1
@@ -168,21 +165,21 @@ def test_sse_process_line_dispatches_event() -> None:
 
 
 def test_sse_process_line_ignores_comments() -> None:
-    received: List[Any] = []
+    received: list[Any] = []
     sub = SseSubscription(BASE, "proj", "orders", "tok", received.append)
     sub._process_line(": heartbeat")
     assert received == []
 
 
 def test_sse_process_line_ignores_blank() -> None:
-    received: List[Any] = []
+    received: list[Any] = []
     sub = SseSubscription(BASE, "proj", "orders", "tok", received.append)
     sub._process_line("")
     assert received == []
 
 
 def test_sse_process_line_invalid_json_raises() -> None:
-    received: List[Any] = []
+    received: list[Any] = []
     sub = SseSubscription(BASE, "proj", "orders", "tok", received.append)
     with pytest.raises(BasinError) as exc_info:
         sub._process_line("data: {not-json}")
@@ -190,7 +187,7 @@ def test_sse_process_line_invalid_json_raises() -> None:
 
 
 def test_sse_last_seq_updated() -> None:
-    received: List[Any] = []
+    received: list[Any] = []
     sub = SseSubscription(BASE, "proj", "t", "tok", received.append)
     sub._process_line('data: {"op":"INSERT","table":"t","after":{},"seq":5}')
     assert sub._last_seq == 5
@@ -199,13 +196,13 @@ def test_sse_last_seq_updated() -> None:
 # ── Presence unit tests ────────────────────────────────────────────────────────
 
 def test_presence_state_initially_empty() -> None:
-    sent: List[Any] = []
+    sent: list[Any] = []
     pc = PresenceChannel("room1", "cid1", sent.append)
     assert pc.presence_state() == []
 
 
 def test_presence_track_sends_frame() -> None:
-    sent: List[Any] = []
+    sent: list[Any] = []
     pc = PresenceChannel("room1", "cid1", sent.append)
     pc._stop_heartbeat()  # prevent asyncio task in sync context
     with patch.object(pc, "_start_heartbeat", return_value=None):
@@ -216,19 +213,21 @@ def test_presence_track_sends_frame() -> None:
 
 
 def test_presence_untrack_sends_frame() -> None:
-    sent: List[Any] = []
+    sent: list[Any] = []
     pc = PresenceChannel("room1", "cid1", sent.append)
-    with patch.object(pc, "_start_heartbeat", return_value=None):
-        with patch.object(pc, "_stop_heartbeat", return_value=None):
-            pc.track(None)
-            pc.untrack()
+    with (
+        patch.object(pc, "_start_heartbeat", return_value=None),
+        patch.object(pc, "_stop_heartbeat", return_value=None),
+    ):
+        pc.track(None)
+        pc.untrack()
     untrack_frames = [f for f in sent if f.get("type") == "presence_untrack"]
     assert len(untrack_frames) == 1
 
 
 def test_presence_handle_state_message() -> None:
-    sent: List[Any] = []
-    received_sync: List[Any] = []
+    sent: list[Any] = []
+    received_sync: list[Any] = []
     pc = PresenceChannel("room1", "cid1", sent.append)
     pc.on("presence", {"event": "sync"}, received_sync.append)
     pc.handle_message(
@@ -245,9 +244,9 @@ def test_presence_handle_state_message() -> None:
 
 
 def test_presence_handle_diff_message() -> None:
-    sent: List[Any] = []
-    joined: List[Any] = []
-    left: List[Any] = []
+    sent: list[Any] = []
+    joined: list[Any] = []
+    left: list[Any] = []
     pc = PresenceChannel("room1", "cid1", sent.append)
     pc.on("presence", {"event": "join"}, joined.append)
     pc.on("presence", {"event": "leave"}, left.append)
@@ -275,8 +274,8 @@ def test_presence_handle_diff_message() -> None:
 
 
 def test_presence_ignores_wrong_channel() -> None:
-    sent: List[Any] = []
-    received: List[Any] = []
+    sent: list[Any] = []
+    received: list[Any] = []
     pc = PresenceChannel("room1", "cid1", sent.append)
     pc.on("presence", {"event": "sync"}, received.append)
     pc.handle_message(
@@ -292,7 +291,7 @@ def test_presence_ignores_wrong_channel() -> None:
 # ── SSE event dispatch through channel ────────────────────────────────────────
 
 def test_sse_event_dispatched_to_channel_callback() -> None:
-    events: List[Dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
 
     with patch.object(SseSubscription, "start", return_value=None):
         ch = RealtimeChannel(
@@ -315,7 +314,7 @@ def test_sse_event_dispatched_to_channel_callback() -> None:
 
 
 def test_sse_event_filtered_by_event_type() -> None:
-    events: List[Dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
 
     with patch.object(SseSubscription, "start", return_value=None):
         ch = RealtimeChannel(
