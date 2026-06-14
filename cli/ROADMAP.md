@@ -18,14 +18,35 @@ roadmap item links to one or more tiers there.
 
 ## Today's surface (shipped)
 
-`login` · `logout` · `whoami` · `orgs` · `projects` · `sql` · `tables`
-(read-only) · `migrations` (list, apply) · `snapshots` · `logs` ·
-`secrets` · `tokens` · `config` · `completion` · `version` · `help`.
+All Tiers 8–27 from TASKS.md are complete. The full command surface:
 
-Foundations: stdlib-only Go binary, `--json` everywhere, two-minor
-support window vs cloud, soft-warn out-of-window, opt-in telemetry,
-self-update check, shell completions, multi-arch `goreleaser`
-pipeline, Sigstore keyless signing.
+`login` · `logout` · `whoami` · `orgs` (CRUD + branding + ownership-transfers) ·
+`members` · `invitations` · `projects` (CRUD + pause/resume + transfers) ·
+`init` · `link` · `status` · `unlink` · `sql` · `tx` (interactive REPL) ·
+`tables` (CRUD + CSV import/export) · `rows` · `rls` + `policies` ·
+`migrations` (list/apply/new/get/diff/rollback) · `db` (push/pull/diff/reset/url/dump/lint) ·
+`branches` (CRUD + merge + events) · `api-keys` · `pgwire` (show/reveal/rotate + engine-keys) ·
+`backups` (policy + snapshots + restore + restore-jobs) · `snapshots` ·
+`gen types` (ts/go/py/ruby/rust/java/csharp/php/dart/swift + --watch) ·
+`dev` (local engine: binary + Docker modes) · `stop` ·
+`functions` (deploy/list/logs/delete) · `rpc` ·
+`realtime subscribe` (SSE single-table; WS multi-table deferred) ·
+`storage` (buckets + upload/download/list/rm/sign + policy) ·
+`secrets` · `tokens` · `api-keys` · `domains` · `webhooks` (inbound + outbound) ·
+`alerts` · `audit` · `activity` · `metrics` · `logs` · `erd` ·
+`index-advisor` · `explain` · `replication-slots` ·
+`engine-pin` · `extensions` · `oauth-providers` · `email` ·
+`queries` (save/list/get/fork/delete/history) ·
+`byo` (bucket/kms/engine) · `saml` · `scim` · `oauth-apps` ·
+`migrate-from-pg` · `dump` · `restore` ·
+`config` · `completion` · `docs` · `version` · `help`.
+
+Foundations: Rust binary, `--json` everywhere, two-minor support window
+vs cloud, soft-warn out-of-window, opt-in telemetry, self-update check,
+shell completions (bash/zsh/fish), multi-arch `goreleaser` pipeline,
+Sigstore keyless signing. 1321 tests (unit + integration + contract +
+golden snapshot + JSON schema locks + fuzz). Stdlib-only design replaced
+by Rust for the full command surface.
 
 ---
 
@@ -51,266 +72,92 @@ twice a quarter.
 
 ---
 
-## Capability areas
+## Shipped capability areas (Tiers 8–27 complete)
 
-### 1. Project context — P1
+All 15 original capability areas plus the Realtime/RPC tier and
+migrate-from-pg are shipped. See TASKS.md for per-tier detail.
 
-The CLI today is stateless: every command takes `--project=<slug>`.
-The endgame is a directory-scoped context (`./basin/config.toml` +
-`./basin/migrations/` + `./basin/seed.sql`) so a developer in a
-checked-out repo never has to repeat the project flag.
+### ✅ 1. Project context (Tier 8)
+`init` · `link` · `status` · `unlink` — directory-scoped project
+binding with `./basin/config.toml` + migration walk-up.
 
-- `basin init` — scaffold a fresh project directory
-- `basin link --project=<ref>` — bind cwd to a remote project
-- `basin status` — show linked project, drift, pending migrations,
-  pause state, current branch
-- `basin unlink` — remove the binding
+### ✅ 2. Database workflow `db` namespace (Tier 9)
+`push` · `pull` · `diff` · `reset` · `url` · `dump` · `lint`
 
-Tracked: TASKS.md Tier 8.
+### ✅ 3. Migration completeness (Tier 10)
+`new` · `get` · `diff` · `rollback` (extending existing `list`/`apply`)
 
----
+### ✅ 4. Branches (Tier 11)
+`list` · `create` · `get` · `merge` · `delete` · `events --follow`
 
-### 2. Database workflow (`db` namespace) — P0 + P1
+### ✅ 5. Tables, data, RLS (Tier 12)
+Full table CRUD + CSV · `rows insert/update/delete` · `rls enable/disable` + policies
 
-The most-used loop: change a schema locally, push it, pull what the
-team merged, reset for a fresh test run, hand the DSN to a driver.
+### ✅ 6. Project keys + pgwire credentials (Tier 13)
+`api-keys` CRUD · `pgwire show/reveal/rotate` + `engine-keys`
 
-Backed entirely by existing cloud endpoints
-(`/migrations/diff`, `/migrations/{id}/rollback`, `/pgwire`,
-`/pgwire/reveal`, `/pgwire/rotate`, `/sql/query`):
+### ✅ 7. Backups (Tier 14)
+`policy get/set` · `snapshots list/create/expire` · `restore` · `restore-jobs`
 
-- `basin db push` — apply local `./basin/migrations/*` to remote
-- `basin db pull` — materialise remote schema as local SQL
-- `basin db diff [--schema=public]` — generate a new migration from
-  the live-vs-local diff
-- `basin db reset` — drop + re-apply all migrations + seed
-- `basin db url [--reveal]` — print the pgwire DSN (rotated key
-  optional)
-- `basin db dump [--data-only|--schema-only]` — pg_dump-shaped export
-- `basin db lint` — run the engine's SQL-compat linter against
-  `./basin/migrations/`
+### ✅ 8. Type generation (Tier 15)
+`gen types ts/go/py/ruby/rust/java/csharp/php/dart/swift` + `--watch`
 
-Tracked: TASKS.md Tier 9.
+### ✅ 9. Org & member management (Tier 16)
+`members` CRUD · `invitations` · `orgs create/update/delete/branding`
 
----
+### ✅ 10. Operations & observability (Tier 17)
+`domains` · `webhooks` (inbound + outbound) · `alerts` · `audit` ·
+`activity` · `metrics` · `erd` · `index-advisor` · `explain` · `replication-slots`
 
-### 3. Migration completeness — P0
+### ✅ 11. Engine knobs (Tier 18)
+`engine-pin` · `extensions` · `oauth-providers` · `email templates + allowance`
 
-`migrations list` + `migrations apply` ship today. The other half of
-the surface — already wired in cloud — is:
+### ✅ 12. Saved queries & history (Tier 19)
+`queries save/list/get/fork/delete/history`
 
-- `basin migrations new <name>` — timestamp-prefixed file
-- `basin migrations diff` — surface `/migrations/diff`
-- `basin migrations get <id>`
-- `basin migrations rollback <id>` — surface `/migrations/{id}/rollback`
+### ✅ 13. BYO surfaces (Tier 20)
+`byo bucket/kms/engine`
 
-Tracked: TASKS.md Tier 10.
+### ✅ 14. Enterprise auth (Tier 21)
+`saml` · `scim` · `oauth-apps`
 
----
+### ✅ 15. Project transfers (Tier 22)
+`projects transfers` · `orgs ownership-transfers`
 
-### 4. Branches (preview environments) — P0
+### ✅ 16. Realtime & RPC (Tier 26)
+`realtime subscribe` (SSE) · `rpc <fn>` — WS multi-table blocked on tungstenite dep decision
 
-Cloud ships full branch CRUD + merge + events
-(`/projects/{id}/branches/*`). Zero CLI today.
-
-- `basin branches list`
-- `basin branches create <name> [--from=<ref>]`
-- `basin branches get <ref>`
-- `basin branches merge <ref>`
-- `basin branches delete <ref>`
-- `basin branches events --follow`
-
-Tracked: TASKS.md Tier 11.
+### ✅ 17. migrate-from-pg (Tier 27)
+`migrate-from-pg` — guided Postgres → Basin migration
 
 ---
 
-### 5. Tables, data, RLS — P0
+## Remaining open work (honest)
 
-Today's `tables` subcommand only lists / describes / paginates rows.
-Cloud has the full surface; we mirror it:
+### Upstream-blocked items (do not implement until the blocker clears)
 
-- `basin tables create <name> --schema=<sql-or-json>`
-- `basin tables alter <name> --add-column=... --drop-column=...`
-- `basin tables drop <name>`
-- `basin tables import-csv <name> < file.csv`
-- `basin tables export-csv <name> > file.csv`
-- `basin rows insert/update/delete <name>`
-- `basin rls enable <table>` / `disable <table>`
-- `basin policies list/create/drop <table>`
-
-Tracked: TASKS.md Tier 12.
-
----
-
-### 6. Project keys + connection strings — P0
-
-Cloud separates org-level PATs (already wired as `basin tokens`) from
-**project-scoped API keys** and **pgwire credentials**. The CLI is
-missing both:
-
-- `basin api-keys list/create/rotate/revoke` — `/projects/{id}/api-keys`
-- `basin pgwire show` — `GET /pgwire`
-- `basin pgwire reveal` — `POST /pgwire/reveal`
-- `basin pgwire rotate` — `POST /pgwire/rotate`
-- `basin pgwire engine-keys list/rotate` — internal engine keys
-
-Tracked: TASKS.md Tier 13.
-
----
-
-### 7. Backups — P0
-
-`snapshots` ships, but only covers part of the surface. Cloud has
-backup *policy* + *restore jobs* under `/backups/*`:
-
-- `basin backups policy get/set`
-- `basin backups snapshots list/create/expire`
-- `basin backups restore --from=<snapshot> [--into=<branch>]`
-- `basin backups restore-jobs list`
-
-Tracked: TASKS.md Tier 14.
-
----
-
-### 8. Type generation — P1
-
-The single highest-leverage developer feature after `db push`. Drives
-type-safe client code without manually mirroring the schema. Backed
-by `information_schema` + `/tables`+`/columns`; assembled CLI-side.
-
-- `basin gen types typescript` — write `database.ts`
-- `basin gen types go` — write `database.go`
-- `basin gen types python` — write `database.py` (Pydantic)
-- `basin gen types --watch` — re-emit on every push
-
-Tracked: TASKS.md Tier 15.
-
----
-
-### 9. Org & member management — P0
-
-- `basin members list/invite/remove/role`
-- `basin invitations list/resend/revoke`
-- `basin orgs create/update/delete`
-- `basin orgs branding get/put`
-
-Tracked: TASKS.md Tier 16.
-
----
-
-### 10. Operations & observability — P0
-
-Cloud already exposes everything below; surfacing it in the terminal
-is the ops-engineer happy path.
-
-- `basin domains add/verify/cert/list/remove`
-- `basin webhooks list/create/test/redeliver/delete`
-- `basin alerts rules list/create/silence/unsilence`
-- `basin alerts events list`
-- `basin audit list [--export=<dest>]`
-- `basin activity list`
-- `basin metrics --project=<ref> [--range=24h]`
-- `basin erd export <project> > erd.svg`
-
-Tracked: TASKS.md Tier 17.
-
----
-
-### 11. Engine knobs — P0/P2
-
-Project-scoped runtime configuration.
-
-- `basin engine-pin get/put/delete` — `/engine-version/pin`
-- `basin extensions list` — `/extensions/catalog`
-- `basin oauth-providers list/set/delete` — `/oauth-providers`
-- `basin email templates get/put/delete/test`
-- `basin email allowance` — quota lookup
-
-Tracked: TASKS.md Tier 18.
-
----
-
-### 12. Saved queries & history — P0
-
-- `basin queries save/list/get/fork/delete`
-- `basin queries history [--clear]`
-
-Tracked: TASKS.md Tier 19.
-
----
-
-### 13. BYO surfaces — P0/P2
-
-For customers running their own buckets, KMS, or engine binaries:
-
-- `basin byo bucket get/put/probe/delete`
-- `basin byo kms get/put/rotate/verify/audit/delete`
-- `basin byo engine get/put/probe/delete`
-
-Tracked: TASKS.md Tier 20.
-
----
-
-### 14. Enterprise auth — P2
-
-- `basin saml get/put/test/enable/disable`
-- `basin scim config get/tokens create/revoke`
-- `basin oauth-apps list/create/rotate/disable/enable/delete`
-
-Tracked: TASKS.md Tier 21.
-
----
-
-### 15. Project transfers — P0
-
-- `basin transfers list/create/cancel/accept/decline`
-- `basin orgs ownership-transfers list/create/cancel/accept/decline`
-
-Tracked: TASKS.md Tier 22.
-
----
-
-## Parking lot — engine or cloud must ship first (P3)
-
-These commands would lie if we shipped them now. We hold them until
-the backing capability exists, but design the shape upfront so the
-naming doesn't churn.
-
-| Command (eventual) | Blocked on |
+| Command | Blocked on |
 |---|---|
-| `basin functions deploy / serve` | cloud Phase 8 (V8 edge functions, "8–12 weeks once unblocked"). NOTE: **`basin rpc <fn>` invoke is now unblocked** — see "Realtime & RPC" below — only deploy/serve of *new* function bodies waits on V8. |
-| `basin storage buckets list/create/upload/download` | object-storage product distinct from BYO-bucket-for-Parquet; not on cloud roadmap |
-| `basin tx begin / commit / rollback` (interactive) | engine single-shard transactions **shipped** (BEGIN/COMMIT/ROLLBACK + SAVEPOINT); interactive multi-statement REPL session is the only remaining CLI scaffolding |
-| `basin restore --as-of=<timestamp>` | engine PITR cross-DML rollback is v0.2 work (catalog-level rollback shipped; physical-file GC pending) |
+| `realtime subscribe --multi` (WS multi-table) | tungstenite dep decision (T26.2/T26.3). Record in decisions.md first. |
+| `functions serve` (hot-reload dev loop) | Local Wasm runtime host; unblocks once `basin dev` is stable in practice. |
+| `login --browser` (OAuth device flow) | Cloud OAuth device endpoint not yet in `backend-rs/src/handlers/`. |
+| `restore --as-of=<timestamp>` (PITR) | Engine physical-file GC for cross-DML rollback is v0.2 work. |
 
-Tracked: TASKS.md Tier 23 — design-only, no implementation until the
-blocker clears.
+### Distribution milestones (user-gated)
 
----
+| Item | Gate |
+|---|---|
+| First Homebrew tap publish | Needs v0.1.0 tag push + `bas-in/homebrew-tap` repo created |
+| AUR `basin-bin` package | Needs AUR account + `AUR_KEY` secret |
+| Scoop bucket | Needs `bas-in/scoop-bucket` repo + `SCOOP_TAP_TOKEN` secret |
+| `ghcr.io/bas-in/basin` Docker image | Fires automatically on first v* tag |
+| `basin dev --docker` zero-config | Needs `ghcr.io/bas-in/basin-server` published |
+| Cross-version replay fixtures (N-1/N/N+1) | Future work once cloud minor version ticks |
 
-## Realtime & RPC — P0 (engine shipped 2026-05-20)
+### Low-priority backlog
 
-The engine landed a complete realtime stack (basin 5.11.R1–R7) and the
-RPC mount (5.11.L). The earlier "no pub/sub today" caveat is **obsolete** —
-these are now P0 (backend exists, only CLI work needed).
-
-- `basin realtime subscribe <table> [--project=<ref>]` — stream live
-  `INSERT/UPDATE/DELETE` events for a table to stdout (JSON-lines, one
-  event per line; `--json` is implicit). Backed by SSE
-  `GET /realtime/v1/sse/:project/:table` with `Authorization: Bearer`.
-  15s heartbeats keep the connection alive; `--since=<seq>` replays via
-  the `Last-Event-Id` header. Ctrl-C closes cleanly.
-- `basin realtime subscribe --multi <t1>,<t2>,…` — multiplex several
-  tables over one WebSocket (`GET /realtime/v1/ws/:project`); each event
-  line is tagged with its table. Optional `--filter="NEW.status='paid'"`
-  pushes the predicate server-side.
-- `basin rpc <fn> [--arg k=v …] [--json-body @file]` — invoke a
-  user-defined `LANGUAGE sql`/`LANGUAGE wasm` function via
-  `POST /rest/v1/rpc/:fn`. Prints the scalar result, or a JSON array for
-  `RETURNS TABLE`. The daily-driver replacement for "run a one-off SQL
-  helper."
-
-Tracked: TASKS.md Tier 26 — Realtime & RPC.
+- Dedicated `ip-allow` command (covered adequately by `tokens create/patch --ip-allowlist`; implement only if user demand warrants).
+- Per-command `man` pages (requires dispatch refactor to `clap::Command` tree; see decisions.md 2026-05-23).
 
 ---
 
@@ -390,4 +237,4 @@ existing 41-test foundation is the floor, not the ceiling.
 
 ---
 
-*Last updated: 2026-05-19.*
+*Last updated: 2026-06-14. Tiers 8–27 complete. Remaining work: 4 upstream-blocked items + distribution milestones (user-gated).*
