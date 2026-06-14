@@ -1483,6 +1483,7 @@ dependencies = [
  "async-trait",
  "basin-auth",
  "basin-catalog",
+ "basin-cdc",
  "basin-common",
  "basin-engine",
  "basin-pool",

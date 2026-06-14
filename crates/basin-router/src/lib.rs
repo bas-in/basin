@@ -54,6 +54,10 @@ mod error;
 mod protocol;
 mod rate_limit;
 mod remote_shard;
+/// ADR 0028 Phase 5 — Postgres logical-replication command path
+/// (IDENTIFY_SYSTEM / CREATE_REPLICATION_SLOT / START_REPLICATION). Flagged
+/// off by default (`BASIN_PGWIRE_REPLICATION`).
+pub mod replication;
 mod resolver;
 mod sharding;
 pub mod test_cluster;
