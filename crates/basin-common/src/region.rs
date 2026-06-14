@@ -81,6 +81,50 @@ pub fn is_home_region(home_region: Option<&str>) -> bool {
     }
 }
 
+/// Which raft group owns a project's writes (multi-region raft, ADR 0009).
+///
+/// Basin runs **one independent raft group per region** — there is deliberately
+/// no cross-region quorum. Each region's deployment is its own raft cluster
+/// (its own `BASIN_RAFT_PEERS`, its own leader, its own log). A project is
+/// pinned to a `home_region`, and that pin selects which region's raft group
+/// owns the project's WAL: the home region's group is the single writer.
+///
+/// This enum is the *routing decision* a write makes before it touches a WAL:
+/// it answers "does this write belong to the local region's raft group, or
+/// must it go to another region's group?" without performing the cross-region
+/// hop itself (that is the [`crate::region`]-layer forwarder's job in the
+/// engine crate). Cross-region replication of the underlying object data is by
+/// S3 cross-region replication at the bucket layer, also out of band of raft.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RaftGroupTarget {
+    /// The project is homed in (or unpinned to) the local region: its write
+    /// targets the LOCAL region's raft group. Append locally.
+    Local,
+    /// The project is homed in another region: its write targets that region's
+    /// raft group. The local node is not in that group, so the write is
+    /// forwarded (engine `WriteForwarder`) or rejected (`WrongRegion`). Carries
+    /// the home region name for the forward/reject decision.
+    Remote(String),
+}
+
+/// Decide which raft group a project's write targets, given its catalogued
+/// `home_region`. The selection is purely a function of `home_region` vs.
+/// [`local_region`]:
+///
+/// * `None` (unpinned/legacy) or `Some(home) == local_region()` ⇒ [`RaftGroupTarget::Local`],
+/// * `Some(home) != local_region()` ⇒ [`RaftGroupTarget::Remote(home)`].
+///
+/// This makes the per-region-group ownership explicit and testable in isolation
+/// (the cross-region hop itself is hardware-bound — two real regional clusters
+/// — and is documented, not unit-tested here).
+pub fn raft_group_for(home_region: Option<&str>) -> RaftGroupTarget {
+    match home_region {
+        None => RaftGroupTarget::Local,
+        Some(home) if home == local_region() => RaftGroupTarget::Local,
+        Some(home) => RaftGroupTarget::Remote(home.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +163,46 @@ mod tests {
     #[test]
     fn default_is_local_string() {
         assert_eq!(DEFAULT_REGION, "local");
+    }
+
+    #[test]
+    fn raft_group_unpinned_is_local() {
+        // A legacy/unpinned project's writes target the local region's group.
+        assert_eq!(raft_group_for(None), RaftGroupTarget::Local);
+    }
+
+    #[test]
+    fn raft_group_home_match_is_local() {
+        // Pinned to this region ⇒ local group owns it.
+        let here = local_region();
+        assert_eq!(raft_group_for(Some(here)), RaftGroupTarget::Local);
+    }
+
+    #[test]
+    fn raft_group_foreign_home_is_remote() {
+        // Pinned elsewhere ⇒ that region's group owns it; the local node
+        // forwards or rejects. The decision carries the home region name.
+        let foreign = format!("{}__definitely_not_here", local_region());
+        assert_eq!(
+            raft_group_for(Some(&foreign)),
+            RaftGroupTarget::Remote(foreign.clone())
+        );
+    }
+
+    #[test]
+    fn raft_group_routing_agrees_with_is_home_region() {
+        // The group selection and the home-region predicate must never
+        // disagree: Local iff is_home_region.
+        let here = local_region();
+        let foreign = format!("{here}__elsewhere");
+        for (home, expect_home) in [
+            (None, true),
+            (Some(here), true),
+            (Some(foreign.as_str()), false),
+        ] {
+            let is_local = matches!(raft_group_for(home), RaftGroupTarget::Local);
+            assert_eq!(is_local, is_home_region(home));
+            assert_eq!(is_local, expect_home);
+        }
     }
 }
