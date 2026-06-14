@@ -683,6 +683,80 @@ pub(crate) fn pk_scalar_to_row_key(
 ///   * No RETURNING clause (we don't have the row image to project).
 ///   * The WHERE predicate is `pk = lit` or `pk IN (lits)` only.
 ///   * Every PK literal encodes to a `RowKey` (supported PK types).
+/// Table-level gates shared by both DELETE hot-tier fast paths (the point /
+/// `pk IN (…)` path in [`try_resolve_fast_path_pks`] and the `DELETE … USING`
+/// join path in [`exec_delete_using`]). Returns true when writing tombstones
+/// by PK is correctness-safe for THIS table, independent of the WHERE shape:
+/// single-column PK, no RLS / soft-delete / audit / DELETE reactor, no non-GIN
+/// secondary index (GIN-only is admitted — see the index gate), and no other
+/// table FK-referencing this one. The predicate-shape and
+/// context gates (fast-path enabled, in-tx eligibility, RETURNING) are checked
+/// by each caller, since they are not table properties.
+///
+/// Keep this in lock-step with the inline gates the callers no longer duplicate
+/// — relaxing a gate here relaxes it for every tombstone-by-PK path.
+async fn delete_fastpath_table_eligible(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &basin_catalog::TableMetadata,
+) -> Result<bool> {
+    // Single-column PK only — the RowKey encoders and the tombstone overlay key
+    // on one column.
+    if meta.pk_columns.len() != 1 {
+        return Ok(false);
+    }
+    // RLS, soft-delete, audit all need the slow read+rewrite.
+    if meta.rls_enabled {
+        return Ok(false);
+    }
+    if crate::types::soft_delete_column(meta.schema.as_ref()).is_some() {
+        return Ok(false);
+    }
+    if crate::types::audit_table_name(meta.schema.as_ref()).is_some() {
+        return Ok(false);
+    }
+    // Per-table DELETE reactor subscribers need before/after row images
+    // dispatched through the event pipeline; the fast path discards them. (We
+    // use the per-table catalog list, not `sinks_attached`, because the engine
+    // always attaches a `ReactorSink` dispatcher.)
+    {
+        let catalog = &sess.engine.config().catalog;
+        let reactors = catalog.list_reactors(&sess.project).await;
+        let has_reactor = reactors.iter().any(|r| {
+            r.table.as_str().eq_ignore_ascii_case(table.as_str())
+                && r.ops.contains(basin_catalog::ReactorOps::DELETE)
+        });
+        if has_reactor {
+            return Ok(false);
+        }
+    }
+    // Secondary indexes: ADMIT GIN-only tables (jsonb containment / tsvector
+    // FTS), exactly as the UPDATE twin does (see its `meta.indexes` gate). The
+    // read-path overlay guards already cover tombstones: `table_has_live_overlay`
+    // counts `tombstone_count`, so `apply_gin_pruning_for_query` /
+    // `apply_jsonb_posting_pruning_for_query` and the posting-probe `Empty`
+    // short-circuit all fall back to the overlay-aware (TombstoneFilter) scan
+    // while a tombstone is live, and `materialize_overlay_for_table` purges the
+    // replaced file's postings + rebuilds the replacement on drain. Any non-GIN
+    // index (btree / GIST / vector) still keeps the cold path — those read
+    // consumers have no overlay-emptiness guard. Oracle: `gin_overlay_delete.rs`.
+    if !meta.indexes.is_empty() && !meta.indexes.iter().all(|idx| idx.access_method == "gin") {
+        return Ok(false);
+    }
+    // Any *other* table referencing THIS one means CASCADE / NO ACTION must run
+    // on the slow path.
+    let referencing = crate::constraints::fks_referencing(
+        &sess.engine.config().catalog,
+        &sess.project,
+        table.as_str(),
+    )
+    .await?;
+    if !referencing.is_empty() {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 async fn try_resolve_fast_path_pks(
     sess: &ProjectSession,
     table: &TableName,
@@ -735,70 +809,14 @@ async fn try_resolve_fast_path_pks(
     if returning.is_some() {
         return Ok(None);
     }
-    // Gate: single-column PK only.
-    if meta.pk_columns.len() != 1 {
+    // Gate: table-level fast-path eligibility — single-column PK, no RLS /
+    // soft-delete / audit / DELETE reactor / secondary index, no FK referencing
+    // this table. Shared with the DELETE … USING join fast path so the two can
+    // never diverge (`delete_fastpath_table_eligible`).
+    if !delete_fastpath_table_eligible(sess, table, meta).await? {
         return Ok(None);
     }
     let pk_col = &meta.pk_columns[0];
-    // Gate: RLS, soft-delete, audit all need the slow read+rewrite.
-    if meta.rls_enabled {
-        return Ok(None);
-    }
-    if crate::types::soft_delete_column(meta.schema.as_ref()).is_some() {
-        return Ok(None);
-    }
-    if crate::types::audit_table_name(meta.schema.as_ref()).is_some() {
-        return Ok(None);
-    }
-    // Gate: per-table reactor subscribers need before/after row images
-    // dispatched through the event pipeline. The fast path discards those
-    // images, so any table with a reactor declared for DELETE must route
-    // through the slow CoW path.
-    //
-    // We deliberately do NOT use `sinks_attached(sess)` here: the engine
-    // always attaches a `ReactorSink` pre-commit dispatcher even when no
-    // user-defined reactor exists, so that probe is permanently true. We
-    // need the per-table catalog list to know whether there's actually a
-    // subscriber for THIS table's DELETE.
-    {
-        let catalog = &sess.engine.config().catalog;
-        let reactors = catalog.list_reactors(&sess.project).await;
-        let has_reactor = reactors.iter().any(|r| {
-            r.table.as_str().eq_ignore_ascii_case(table.as_str())
-                && r.ops.contains(basin_catalog::ReactorOps::DELETE)
-        });
-        if has_reactor {
-            return Ok(None);
-        }
-    }
-    // Gate: secondary indexes (B-tree / GIN / GIST / vector) need entry
-    // maintenance on delete — the slow path handles them. The UPDATE twin of
-    // this gate (`try_resolve_fast_path_update`) now ADMITS GIN-only tables:
-    // the read paths gate their posting-probe short-circuits and pruned
-    // re-registrations on overlay-emptiness (which covers tombstones too —
-    // `table_has_live_overlay` reads `tombstone_count`), and the materialize
-    // drain performs GIN registry maintenance. DELETE stays blanket-declined
-    // conservatively: the tombstone fast path has not been validated against
-    // the GIN read paths end-to-end (no gin_overlay_delete oracle yet) — see
-    // the UPDATE gate's comment for the per-access-method contract before
-    // relaxing this one.
-    if !meta.indexes.is_empty() {
-        return Ok(None);
-    }
-    // Gate: CHECK / UNIQUE don't fire on DELETE, but per-table FKs (this
-    // table referencing another) are also irrelevant for the parent-side
-    // check; the slow path handles them via `enforce_fk_on_delete_or_pk_update`.
-    // The relevant gate is: any *other* table referencing THIS one. If yes,
-    // CASCADE / NO ACTION must run on the slow path.
-    let referencing = crate::constraints::fks_referencing(
-        &sess.engine.config().catalog,
-        &sess.project,
-        table.as_str(),
-    )
-    .await?;
-    if !referencing.is_empty() {
-        return Ok(None);
-    }
     // Gate: WHERE must resolve to a pure pk = lit / pk IN (lits) shape.
     let Some(expr) = predicate else {
         // `DELETE FROM t` with no WHERE — would delete everything; that's a
@@ -4059,6 +4077,73 @@ async fn exec_delete_using(
             })
         }
     };
+
+    // ── Hot-tier fast path (single-PK) ──────────────────────────────────────
+    //
+    // When the target satisfies the same table-level gates as the point DELETE
+    // fast path (single-column PK, no RLS / soft-delete / audit / DELETE reactor
+    // / secondary index / inbound FK), no event sink is attached, and the in-tx
+    // eligibility holds, tombstone the join's matched PKs DIRECTLY. This skips
+    // the `build_pk_in_predicate` string assembly (which materialises a
+    // `pk IN (v1,…,vN)` clause megabytes wide for a high-cardinality join) and
+    // the subsequent full DELETE re-parse / re-plan / fast-path re-resolution —
+    // the source of the quadratic blow-up that made join-DELETE 100s of x slower
+    // than Postgres on a million-row match. The join SELECT above already found
+    // the rows; we encode their PKs straight to RowKeys and write tombstones,
+    // mirroring `exec_update_from`'s "never round-trip through SQL" strategy.
+    let tx_active = crate::session::tx_is_active(&sess.state);
+    let fast_eligible = hottier_fastpath_enabled("BASIN_HOTTIER_DELETE_FASTPATH")
+        && !post_commit_sink_attached(sess)
+        && (!tx_active || tx_fastpath_eligible_for_table(sess, target))
+        && delete_fastpath_table_eligible(sess, target, &meta).await?;
+    if fast_eligible {
+        // The join projection's column 0 IS `target.<pk>` (single-PK guaranteed
+        // by the eligibility gate). Encode each value to a RowKey, deduplicating
+        // so the affected-row count is DISTINCT target rows (the join can match a
+        // target row more than once; PG reports rows-deleted, not join
+        // cardinality). A value whose type has no RowKey encoder (exotic PK)
+        // yields `None` → fall through to the SQL predicate path unchanged.
+        let pk_col = &pk[0];
+        let pk_idx = meta.schema.index_of(pk_col).map_err(|_| {
+            BasinError::internal(format!("PK column {pk_col:?} missing from schema"))
+        })?;
+        let pk_dt = meta.schema.field(pk_idx).data_type().clone();
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut keys: Vec<basin_hottier::RowKey> = Vec::new();
+        let mut unsupported_pk = false;
+        'batches: for batch in &batches {
+            let arr = batch.column(0);
+            for row in 0..batch.num_rows() {
+                match crate::hot_tombstone::array_value_to_row_key(arr.as_ref(), row, &pk_dt) {
+                    Some(rk) => {
+                        if seen.insert(rk.as_bytes().to_vec()) {
+                            keys.push(rk);
+                        }
+                    }
+                    None => {
+                        unsupported_pk = true;
+                        break 'batches;
+                    }
+                }
+            }
+        }
+        if !unsupported_pk {
+            if keys.is_empty() {
+                return Ok(ExecResult::Empty {
+                    tag: "DELETE 0".into(),
+                });
+            }
+            let n = if tx_active {
+                hot_tier_delete_by_pk_tx(sess, target, keys)
+            } else {
+                hot_tier_delete_by_pk(sess, target, keys)
+            };
+            return Ok(ExecResult::Empty {
+                tag: format!("DELETE {n}"),
+            });
+        }
+        // exotic PK type → fall through to the SQL predicate path below.
+    }
 
     // Collect pk tuples.
     let pk_tuples = collect_pk_batches(&batches, pk)?;
