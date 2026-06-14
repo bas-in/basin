@@ -5,6 +5,36 @@ require_relative "errors"
 require_relative "types"
 
 module Basin
+  # MIME type for the Arrow IPC streaming format.
+  # Matches the server constant in crates/basin-rest/src/arrow_ipc.rs.
+  ARROW_STREAM_MIME = "application/vnd.apache.arrow.stream"
+
+  # @api private
+  # Raise a helpful LoadError when red-arrow is not available.
+  def self._require_red_arrow!
+    require "arrow"
+  rescue LoadError
+    raise LoadError,
+      "red-arrow is required for Arrow IPC transport: " \
+      "gem install red-arrow  (or add gem 'red-arrow' to your Gemfile). " \
+      "The native Apache Arrow GLib library must also be present — " \
+      "see https://arrow.apache.org/install/ for platform packages."
+  end
+
+  # @api private
+  # Decode an Arrow IPC stream byte string into an Arrow::Table.
+  # Returns the table and the next-cursor header value (may be nil).
+  def self._decode_arrow_ipc(raw_bytes, next_cursor)
+    _require_red_arrow!
+    ipc = raw_bytes.dup.force_encoding(Encoding::BINARY)
+    arrow_buf = Arrow::Buffer.new(ipc)
+    input     = Arrow::BufferInputStream.new(arrow_buf)
+    reader    = Arrow::RecordBatchStreamReader.new(input)
+    batches   = reader.each.to_a
+    table     = Arrow::Table.new(reader.schema, batches)
+    [table, next_cursor]
+  end
+
   # Fluent query builder for /rest/v1/:table.
   #
   # Route source (verified): crates/basin-rest/src/server.rs:243-249 —
@@ -26,6 +56,9 @@ module Basin
   #   GET with stream=true → NDJSON, final line {"_basin_next_cursor":"..."}
   #   POST → 201, { ok, tag } or rows; PATCH/DELETE → { ok, tag }
   #   DELETE may surface 501 E_ENGINE_UNSUPPORTED
+  #   GET with Accept: application/vnd.apache.arrow.stream → Arrow IPC stream
+  #     (see crates/basin-rest/src/arrow_ipc.rs; pagination cursor surfaced in
+  #     the x-basin-next-cursor response header rather than the body)
   #
   # Usage:
   #   result = client.from("orders")
@@ -38,6 +71,10 @@ module Basin
   #
   #   result.rows      # => [{"id"=>1, ...}, ...]
   #   result.next_cursor  # => "opaque-token" or nil
+  #
+  # Arrow IPC transport:
+  #   table = client.from("orders").limit(1000).to_arrow
+  #   # => Arrow::Table  (requires the red-arrow gem)
   #
   class QueryBuilder
     # Normalize a scalar to the string form the Basin filter grammar expects.
@@ -167,6 +204,68 @@ module Basin
       end
 
       next_cursor
+    end
+
+    # Execute the query and return the result as an Arrow::Table (red-arrow).
+    #
+    # Sends +Accept: application/vnd.apache.arrow.stream+. When the server
+    # responds with an Arrow IPC stream (crates/basin-rest/src/arrow_ipc.rs),
+    # the bytes are decoded natively via red-arrow — zero JSON round-trip, full
+    # i64/timestamp fidelity.
+    #
+    # Falls back to JSON→Arrow conversion when the server returns JSON (e.g. an
+    # older server without IPC support). The returned table is identical in
+    # shape, but column types are inferred from Ruby values (all numbers become
+    # double, timestamps become strings) rather than being read from the schema.
+    #
+    # Pagination: the +x-basin-next-cursor+ response header is returned as the
+    # second element of the result tuple so callers can page through results:
+    #
+    #   table, cursor = client.from("orders").limit(1000).to_arrow
+    #   if cursor
+    #     next_table, _ = client.from("orders").limit(1000).cursor(cursor).to_arrow
+    #   end
+    #
+    # Requires the +red-arrow+ gem and the Apache Arrow GLib library.
+    # Install the gem:   gem install red-arrow
+    # macOS native lib:  brew install apache-arrow-glib
+    #
+    # @return [Array(Arrow::Table, String, nil)]
+    #   Two-element array: [table, next_cursor].  +next_cursor+ is +nil+ when
+    #   there are no further pages.
+    def to_arrow
+      Basin._require_red_arrow!
+
+      resp = @http.request(
+        "GET",
+        "/rest/v1/#{@table}",
+        query:   @params,
+        headers: { "Accept" => ARROW_STREAM_MIME }
+      )
+
+      ct          = resp["Content-Type"].to_s
+      next_cursor = resp["x-basin-next-cursor"]
+      next_cursor = nil if next_cursor && next_cursor.strip.empty?
+
+      if ct.include?(ARROW_STREAM_MIME)
+        Basin._decode_arrow_ipc(resp.body.to_s, next_cursor)
+      else
+        # Fallback: server returned JSON.  Convert row-by-row into an Arrow
+        # table using the same schema-inference path as QueryResult.normalize.
+        require "arrow"
+        rows = QueryResult.normalize(JSON.parse(resp.body.to_s)).rows
+        table = if rows.empty?
+                  Arrow::Table.new({})
+                else
+                  # Pivot Array<Hash> → { col_name => [values...] } and let
+                  # red-arrow infer Arrow types from the Ruby value classes.
+                  col_arrays = rows.each_with_object(Hash.new { |h, k| h[k] = [] }) do |row, h|
+                    row.each { |k, v| h[k] << v }
+                  end
+                  Arrow::Table.new(col_arrays)
+                end
+        [table, next_cursor]
+      end
     end
 
     # POST /rest/v1/:table — insert one Hash or an Array of Hashes (201).

@@ -202,6 +202,143 @@ RSpec.describe Basin::QueryBuilder do
   end
 
   # ---------------------------------------------------------------------------
+  # Arrow IPC transport — QueryBuilder#to_arrow
+  # ---------------------------------------------------------------------------
+  describe "#to_arrow" do
+    # Helper: build a minimal Arrow IPC stream byte string using red-arrow so
+    # the fixture matches exactly what the server produces.
+    def build_ipc_fixture(rows_hash)
+      require "arrow"
+      col_data = rows_hash.transform_values { |vals|
+        case vals.first
+        when Integer then Arrow::Int64Array.new(vals)
+        when String  then Arrow::StringArray.new(vals)
+        else Arrow::StringArray.new(vals.map(&:to_s))
+        end
+      }
+      tbl = Arrow::Table.new(col_data)
+      buf = Arrow::ResizableBuffer.new(4096)
+      Arrow::BufferOutputStream.open(buf) do |out|
+        Arrow::RecordBatchStreamWriter.open(out, tbl.schema) { |w| w.write_table(tbl) }
+      end
+      buf.data.to_s
+    end
+
+    before do
+      begin
+        require "arrow"
+      rescue LoadError
+        skip "red-arrow not installed"
+      end
+    end
+
+    it "sends Accept: application/vnd.apache.arrow.stream header" do
+      ipc_bytes = build_ipc_fixture("id" => [1, 2])
+      stub_request(:get, "#{BASE_URL}/rest/v1/events")
+        .with(headers: { "Accept" => "application/vnd.apache.arrow.stream" })
+        .to_return(
+          status:  200,
+          body:    ipc_bytes,
+          headers: { "Content-Type" => "application/vnd.apache.arrow.stream" }
+        )
+      table, _cursor = client.from("events").to_arrow
+      expect(table).to be_a(Arrow::Table)
+    end
+
+    it "decodes an Arrow IPC response into an Arrow::Table with correct rows" do
+      ipc_bytes = build_ipc_fixture("id" => [1, 2], "label" => %w[alice bob])
+      stub_request(:get, "#{BASE_URL}/rest/v1/orders")
+        .to_return(
+          status:  200,
+          body:    ipc_bytes,
+          headers: { "Content-Type" => "application/vnd.apache.arrow.stream" }
+        )
+      table, cursor = client.from("orders").to_arrow
+      expect(table).to be_a(Arrow::Table)
+      expect(table.n_rows).to eq(2)
+      expect(table.schema.find_field("id")).not_to be_nil
+      expect(table.schema.find_field("label")).not_to be_nil
+      expect(cursor).to be_nil
+    end
+
+    it "returns next_cursor from the x-basin-next-cursor header" do
+      ipc_bytes = build_ipc_fixture("id" => [1])
+      stub_request(:get, "#{BASE_URL}/rest/v1/orders")
+        .to_return(
+          status:  200,
+          body:    ipc_bytes,
+          headers: {
+            "Content-Type"         => "application/vnd.apache.arrow.stream",
+            "x-basin-next-cursor"  => "tok-abc"
+          }
+        )
+      _table, cursor = client.from("orders").to_arrow
+      expect(cursor).to eq("tok-abc")
+    end
+
+    it "returns nil next_cursor when the header is absent" do
+      ipc_bytes = build_ipc_fixture("id" => [1])
+      stub_request(:get, "#{BASE_URL}/rest/v1/orders")
+        .to_return(
+          status:  200,
+          body:    ipc_bytes,
+          headers: { "Content-Type" => "application/vnd.apache.arrow.stream" }
+        )
+      _table, cursor = client.from("orders").to_arrow
+      expect(cursor).to be_nil
+    end
+
+    it "falls back to JSON→Arrow when server returns JSON" do
+      rows = [{ "id" => 1, "label" => "alice" }, { "id" => 2, "label" => "bob" }]
+      stub_request(:get, "#{BASE_URL}/rest/v1/orders")
+        .to_return(
+          status:  200,
+          body:    JSON.generate(rows),
+          headers: { "Content-Type" => "application/json" }
+        )
+      table, cursor = client.from("orders").to_arrow
+      expect(table).to be_a(Arrow::Table)
+      expect(table.n_rows).to eq(2)
+      expect(cursor).to be_nil
+    end
+
+    it "preserves query filters in the Arrow IPC request" do
+      ipc_bytes = build_ipc_fixture("id" => [7])
+      stub_request(:get, "#{BASE_URL}/rest/v1/orders")
+        .with(
+          query:   { "status" => "eq.paid", "limit" => "10" },
+          headers: { "Accept" => "application/vnd.apache.arrow.stream" }
+        )
+        .to_return(
+          status:  200,
+          body:    ipc_bytes,
+          headers: { "Content-Type" => "application/vnd.apache.arrow.stream" }
+        )
+      table, _cursor = client.from("orders").eq("status", "paid").limit(10).to_arrow
+      expect(table).to be_a(Arrow::Table)
+    end
+
+    it "preserves i64 column type fidelity (no JSON float coercion)" do
+      ipc_bytes = build_ipc_fixture("v" => [1, 2, 3])
+      stub_request(:get, "#{BASE_URL}/rest/v1/orders")
+        .to_return(
+          status:  200,
+          body:    ipc_bytes,
+          headers: { "Content-Type" => "application/vnd.apache.arrow.stream" }
+        )
+      table, _cursor = client.from("orders").to_arrow
+      # Find column index by name and read as Arrow::Column
+      field_idx = table.schema.fields.index { |f| f.name == "v" }
+      expect(field_idx).not_to be_nil
+      col = table[field_idx]
+      # Arrow::Column#to_a flattens all chunks to Ruby values
+      expect(col.to_a).to eq([1, 2, 3])
+      # Verify the underlying Arrow type is int64 (not float64 as JSON would give)
+      expect(col.to_arrow_array).to be_a(Arrow::Int64Array)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Client#table alias and method chaining
   # ---------------------------------------------------------------------------
   describe "Client#from / #table aliases" do

@@ -4,3 +4,8 @@ source "https://rubygems.org"
 
 # Resolve runtime + development dependencies from the gemspec.
 gemspec
+
+# Optional: Arrow IPC transport.  Not required at runtime — only loaded when
+# QueryBuilder#to_arrow is called.  Requires the native Apache Arrow GLib
+# library (brew install apache-arrow-glib on macOS).
+gem "red-arrow", ">= 14.0", require: false
