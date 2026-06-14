@@ -237,6 +237,21 @@ pub(crate) fn register_pg_scalar_aliases(ctx: &SessionContext) {
         "postgres",
     )));
 
+    // ── version() → TEXT ─────────────────────────────────────────────────────
+    // Returns the PostgreSQL-style version banner. psycopg / SQLAlchemy call
+    // this at connect time (often schema-qualified as `pg_catalog.version()`);
+    // its absence aborts the connection ("function pg_catalog.version does not
+    // exist"). The banner advertises the same major (15) as the
+    // `server_version` startup parameter and `pg_settings.server_version`.
+    // Registered under both the bare and `pg_catalog.`-qualified names because
+    // clients use either (mirrors `pg_catalog.pg_cancel_backend`).
+    const VERSION_BANNER: &str = "PostgreSQL 15.0 (Basin) on basin, 64-bit";
+    ctx.register_udf(ScalarUDF::from(ConstTextUdf::new("version", VERSION_BANNER)));
+    ctx.register_udf(ScalarUDF::from(ConstTextUdf::new(
+        "pg_catalog.version",
+        VERSION_BANNER,
+    )));
+
     // ── current_setting(name [, missing_ok]) → TEXT ──────────────────────────
     // Returns GUC setting. Stub returns empty string for any setting name.
     ctx.register_udf(ScalarUDF::from(CurrentSettingUdf {

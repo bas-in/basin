@@ -27,6 +27,12 @@ graduate to 1.0 and the standard SemVer guarantees.
   typarray does not exist") and cascaded to the whole SQLAlchemy suite. Basin
   does not model distinct array-type OIDs, so `typarray`/`typelem` are 0 and
   `typdelim` is the standard comma. Source: `crates/basin-catalog/src/info_schema.rs`.
+- **`version()` / `pg_catalog.version()` implemented.** psycopg / SQLAlchemy call
+  it at connect time to read the server banner; its absence aborted the
+  connection ("function pg_catalog.version does not exist"). Returns a
+  PostgreSQL-15-style banner consistent with the advertised `server_version`.
+  Registered under both the bare and `pg_catalog.`-qualified names. Source:
+  `crates/basin-engine/src/pg_scalar_aliases.rs`.
 
 ## 2026-06-14 — Cold DELETE write-amp: GIN-only tombstone fast path + FK-cascade re-read skip
 
