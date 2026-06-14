@@ -56,9 +56,14 @@ mod gc;
 /// ADR 0028 Phase 3 — Kafka/Redpanda push sink (delivery worker).
 pub mod kafka;
 mod live;
+/// ADR 0028 Phase 5 — `pgoutput` binary logical-replication message encoder +
+/// synthetic-LSN / slot-cursor model.
+pub mod pgoutput;
 mod record;
 mod ring;
 pub mod sse;
+/// ADR 0028 Phase 4 — `wal2json` logical-replication output format.
+pub mod wal2json;
 /// ADR 0028 Phase 2 — webhook push sink (delivery worker).
 pub mod webhook;
 

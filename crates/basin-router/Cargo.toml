@@ -44,6 +44,12 @@ tempfile.workspace = true
 object_store.workspace = true
 basin-storage.workspace = true
 basin-catalog.workspace = true
+# ADR 0028 Phase 5: the logical-replication command path (replication.rs)
+# borrows the synthetic-LSN text format, the OutputPlugin parse, and the
+# pgoutput message encoder from basin-cdc so the router and the encoder agree
+# on one mapping. basin-cdc depends only on common/storage/auth/catalog, so
+# this edge is acyclic.
+basin-cdc.workspace = true
 # Used to render 16-byte FixedSizeBinary UUID columns as canonical
 # hyphenated text (Postgres OID 2950) on both the simple-query and
 # extended-query response paths. See `types::render_uuid`.

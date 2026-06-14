@@ -18,6 +18,7 @@ use tracing::instrument;
 use basin_common::ChangeOp;
 
 use crate::cdc_kafka::{CdcKafkaSinkDef, CdcKafkaSinkRow, CdcKafkaSinkState};
+use crate::cdc_slots::{CdcSlotDef, CdcSlotRow, CdcSlotState};
 use crate::cdc_webhooks::{CdcWebhookDef, CdcWebhookRow, CdcWebhookState};
 use crate::domains::{self, DomainDef, DomainError};
 use crate::enums::{self, EnumError, EnumTypeDef};
@@ -223,6 +224,9 @@ pub struct InMemoryCatalog {
     /// Same shape as `cdc_webhooks`, keyed by `(ProjectId, sink_id)`. Cleared in
     /// `drop_namespace`.
     cdc_kafka_sinks: Mutex<HashMap<(ProjectId, String), (CdcKafkaSinkDef, CdcKafkaSinkState)>>,
+    /// ADR 0028 Phase 5 — per-project durable logical-replication slot cursors.
+    /// Keyed by `(ProjectId, slot_name)`. Cleared in `drop_namespace`.
+    cdc_slots: Mutex<HashMap<(ProjectId, String), (CdcSlotDef, CdcSlotState)>>,
 }
 
 /// In-memory lease row. Mirrors the `partition_leases` Postgres table.
@@ -286,6 +290,7 @@ impl InMemoryCatalog {
             compaction_watermarks: Mutex::new(HashMap::new()),
             cdc_webhooks: Mutex::new(HashMap::new()),
             cdc_kafka_sinks: Mutex::new(HashMap::new()),
+            cdc_slots: Mutex::new(HashMap::new()),
         }
     }
 
@@ -622,6 +627,9 @@ impl Catalog for InMemoryCatalog {
         // Clear per-project CDC Kafka sink configs + cursors.
         let mut cks = self.cdc_kafka_sinks.lock().await;
         cks.retain(|(t, _), _| t != project);
+        // Clear per-project CDC replication slot cursors.
+        let mut csl = self.cdc_slots.lock().await;
+        csl.retain(|(t, _), _| t != project);
         Ok(())
     }
 
@@ -1785,6 +1793,81 @@ impl Catalog for InMemoryCatalog {
             }
             None => Err(BasinError::not_found(format!(
                 "cdc kafka sink {id:?} does not exist"
+            ))),
+        }
+    }
+
+    // ---- ADR 0028 Phase 5: CDC replication slots ------------------------
+
+    async fn register_cdc_slot(&self, def: CdcSlotDef) -> Result<()> {
+        self.bump_epoch();
+        let key = (def.project, def.slot_name.clone());
+        let mut map = self.cdc_slots.lock().await;
+        if map.contains_key(&key) {
+            return Err(BasinError::Catalog(format!(
+                "replication slot {:?} already exists for project {}",
+                def.slot_name, def.project
+            )));
+        }
+        map.insert(key, (def, CdcSlotState::default()));
+        Ok(())
+    }
+
+    async fn drop_cdc_slot(&self, project: &ProjectId, slot_name: &str) -> Result<()> {
+        self.bump_epoch();
+        let key = (*project, slot_name.to_string());
+        let mut map = self.cdc_slots.lock().await;
+        if map.remove(&key).is_none() {
+            return Err(BasinError::not_found(format!(
+                "replication slot {slot_name:?} does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn list_cdc_slots(&self, project: &ProjectId) -> Vec<CdcSlotRow> {
+        let map = self.cdc_slots.lock().await;
+        let mut rows: Vec<CdcSlotRow> = map
+            .iter()
+            .filter(|((t, _), _)| t == project)
+            .map(|(_, (def, state))| CdcSlotRow {
+                def: def.clone(),
+                state: state.clone(),
+            })
+            .collect();
+        rows.sort_by(|a, b| a.def.slot_name.cmp(&b.def.slot_name));
+        rows
+    }
+
+    async fn record_cdc_slot_confirm(
+        &self,
+        project: &ProjectId,
+        slot_name: &str,
+        confirmed_seq: u64,
+        last_status: &str,
+    ) -> Result<()> {
+        let key = (*project, slot_name.to_string());
+        let mut map = self.cdc_slots.lock().await;
+        if let Some((_, state)) = map.get_mut(&key) {
+            // Monotonic cursor: never rewind (mirrors the Kafka ack).
+            state.confirmed_seq = state.confirmed_seq.max(confirmed_seq);
+            state.restart_seq = state.restart_seq.max(state.confirmed_seq);
+            state.last_status = Some(last_status.to_string());
+        }
+        Ok(())
+    }
+
+    async fn disable_cdc_slot(&self, project: &ProjectId, slot_name: &str) -> Result<()> {
+        self.bump_epoch();
+        let key = (*project, slot_name.to_string());
+        let mut map = self.cdc_slots.lock().await;
+        match map.get_mut(&key) {
+            Some((def, _)) => {
+                def.active = false;
+                Ok(())
+            }
+            None => Err(BasinError::not_found(format!(
+                "replication slot {slot_name:?} does not exist"
             ))),
         }
     }

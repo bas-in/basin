@@ -315,6 +315,21 @@ pub(crate) async fn simple_query_messages<S>(session: &S, sql: &str) -> Vec<PgWi
 where
     S: Session + ?Sized,
 {
+    // ── ADR 0028 Phase 5: logical-replication command path (FLAGGED) ──────
+    //
+    // A `replication=database` consumer (Debezium / pg_recvlogical / DMS)
+    // issues replication commands — not SQL — over this same simple-query
+    // channel. When the flag is on, recognise them here BEFORE the SQL split
+    // (they are not valid SQL and would otherwise syntax-error). When off,
+    // fall through so a default build behaves exactly like a non-replication
+    // backend. See `crate::replication` for the parse + response shapes and
+    // the documented START_REPLICATION streaming wiring.
+    if crate::replication::replication_enabled() {
+        if let Some(msgs) = replication_command_messages(session, sql) {
+            return msgs;
+        }
+    }
+
     let mut out = Vec::new();
     let stmts = split_simple_query(sql);
 
@@ -361,6 +376,76 @@ where
         TransactionStatus::Idle,
     )));
     out
+}
+
+/// ADR 0028 Phase 5 — handle a recognised logical-replication command, or
+/// return `None` if `sql` is not one (so the caller falls through to SQL).
+///
+/// The query-protocol commands (`IDENTIFY_SYSTEM`, `CREATE_REPLICATION_SLOT`,
+/// `DROP_REPLICATION_SLOT`) answer with their real message shapes.
+/// `START_REPLICATION` requires CopyBoth streaming mode, which the framework's
+/// `SimpleQueryHandler` path does not model: it returns a structured
+/// `ErrorResponse` naming the exact remaining wiring rather than faking a
+/// stream (an honest deferral; see `crate::replication::START_REPLICATION_WIRING`).
+fn replication_command_messages<S>(session: &S, sql: &str) -> Option<Vec<PgWireBackendMessage>>
+where
+    S: Session + ?Sized,
+{
+    use crate::replication::{
+        create_slot_response, drop_slot_response, identify_system_response,
+        parse_replication_command, ReplicationCommand, START_REPLICATION_WIRING,
+    };
+
+    let cmd = parse_replication_command(sql)?;
+    let project = session.project();
+    // `confirmed_seq` (the live ring high-water mark) is the remaining wiring:
+    // a working stream reads it from the CDC ring / slot catalog. At the
+    // command layer we report a fresh `0` xlogpos, which is protocol-valid
+    // (a slot created at 0/... streams from the start of the ring).
+    let confirmed_seq: u64 = 0;
+    let dbname = project.to_string();
+
+    let msgs = match cmd {
+        ReplicationCommand::IdentifySystem => {
+            identify_system_response(&dbname, confirmed_seq, &dbname)
+        }
+        ReplicationCommand::CreateSlot {
+            slot_name, plugin, ..
+        } => {
+            // The durable slot row is the additive catalog model
+            // (`basin_catalog::cdc_slots`); persisting it here is the wiring
+            // that turns this from a stateless ack into a held cursor.
+            create_slot_response(&slot_name, confirmed_seq, plugin)
+        }
+        ReplicationCommand::DropSlot { .. } => drop_slot_response(),
+        ReplicationCommand::StartReplication { .. } => {
+            // Honest deferral — never fake a CopyBoth stream.
+            vec![
+                PgWireBackendMessage::ErrorResponse(pgwire::messages::response::ErrorResponse::from(
+                    pgwire::error::ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "0A000".to_owned(), // feature_not_supported
+                        format!("START_REPLICATION streaming not yet wired: {START_REPLICATION_WIRING}"),
+                    ),
+                )),
+                PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)),
+            ]
+        }
+        ReplicationCommand::TimelineHistory { .. } => {
+            // Basin has a single synthetic timeline (1); no history file.
+            vec![
+                PgWireBackendMessage::ErrorResponse(pgwire::messages::response::ErrorResponse::from(
+                    pgwire::error::ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "0A000".to_owned(),
+                        "TIMELINE_HISTORY: Basin has a single synthetic timeline (1)".to_owned(),
+                    ),
+                )),
+                PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)),
+            ]
+        }
+    };
+    Some(msgs)
 }
 
 /// pgwire `SimpleQueryHandler` that drives one connection's session.
