@@ -61,7 +61,20 @@ pub struct HnswIndexBuilder {
     /// `None` keeps the `instant-distance` default (100). Set from a
     /// `CREATE INDEX … USING hnsw WITH (ef_construction = N)` clause.
     ef_construction: Option<usize>,
+    /// `ef_search` override (candidate-list size at QUERY time — the dominant
+    /// recall knob). `None` applies [`DEFAULT_EF_SEARCH`]. `instant-distance`'s
+    /// own default (100) measured recall@10 ≈ 0.60 on the 128-dim bench; a
+    /// higher value explores more of the graph per query for materially better
+    /// recall at a modest latency cost.
+    ef_search: Option<usize>,
 }
+
+/// Default query-time `ef_search`. `instant-distance` defaults to 100, which
+/// under-recalls badly (recall@10 ≈ 0.60 on the 128-dim/100k bench: 0.60@100,
+/// 0.80@200). Query latency is row-fetch-dominated here (p50 flat ~38ms across
+/// ef 100→200), so a generous default buys recall almost for free. Overridable
+/// per index via [`HnswIndexBuilder::with_ef_search`].
+const DEFAULT_EF_SEARCH: usize = 400;
 
 impl HnswIndexBuilder {
     pub fn new(distance: Distance, dim: usize) -> Self {
@@ -71,7 +84,15 @@ impl HnswIndexBuilder {
             points: Vec::new(),
             ids: Vec::new(),
             ef_construction: None,
+            ef_search: None,
         }
+    }
+
+    /// Set the query-time `ef_search` (candidate-list size). Larger → higher
+    /// recall, higher latency. `None` applies [`DEFAULT_EF_SEARCH`].
+    pub fn with_ef_search(mut self, ef_search: Option<usize>) -> Self {
+        self.ef_search = ef_search;
+        self
     }
 
     /// Set the `ef_construction` build parameter (pgvector `WITH
@@ -104,6 +125,9 @@ impl HnswIndexBuilder {
         if let Some(ef) = self.ef_construction {
             builder = builder.ef_construction(ef);
         }
+        // `ef_search` is stored on the built graph and used by every query;
+        // raise it above instant-distance's low default for usable recall.
+        builder = builder.ef_search(self.ef_search.unwrap_or(DEFAULT_EF_SEARCH));
         let map = builder.build(self.points.clone(), self.ids.clone());
         HnswIndex {
             distance: self.distance,

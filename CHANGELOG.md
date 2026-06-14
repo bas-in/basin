@@ -47,6 +47,18 @@ graduate to 1.0 and the standard SemVer guarantees.
   `crates/basin-engine/src/executor.rs`; covered by
   `coverage_txn_schema::insert_explicit_default_keyword_applies_column_default`.
 
+## 2026-06-14 — HNSW vector search recall@10 0.60 → 1.00 (ef_search default)
+
+- **Vector ANN search now sets a usable query-time `ef_search`.** The HNSW index
+  left `instant-distance`'s default `ef_search` (100), which measured
+  **recall@10 ≈ 0.60** on the 128-dim / 100k benchmark — a silent quality hole
+  (queries missed ~40% of true nearest neighbours). Query latency here is
+  row-fetch-dominated, so a larger candidate list is nearly free: raising the
+  default to **400** lifts **recall@10 to 1.00** with p50 only 38 → 42 ms
+  (0.60→0.80 at 200, 1.00 at 400). Per-index override via
+  `HnswIndexBuilder::with_ef_search`. Source: `crates/basin-vector/src/index.rs`;
+  measured by `ext_bench_vector`.
+
 ## 2026-06-14 — array columns render in the PostgreSQL `{…}` text form on the wire
 
 - **Reading an array column returns PG array text `{a,b}` / `{}`.** A `List` /
