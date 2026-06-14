@@ -92,13 +92,32 @@ below. See **0.6 — Realtime** for the full protocol.
   multi-table multiplexing + presence + mid-stream filter changes.
   Full protocol in 0.6.
 
-### Still waiting — engine routes not yet shipped
+### Spec ready — route shapes final, blocked only on engine implementation
 
-- `signInWithOAuth` → `/auth/v1/oauth/:provider/authorize` + callback handler
-- `auth.mfa.{enroll, verify, unenroll}` → `/auth/v1/mfa/*` (TOTP first;
-  WebAuthn is a follow-on)
-- `storage.from(bucket).{upload, download, list, remove, createSignedUrl}` →
-  `/object/*` (engine has no object-storage HTTP surface yet; keep stubbed)
+Route shapes are now **final** (basin ADR 0020 auth v2, ADR 0021 object
+storage; engine tasks 5.10.O / 5.10.M / 5.17.*). The SDK can build
+against these shapes now and flip the stubs when the engine implements
+them. **The shapes below correct the earlier guesses** — they are
+Supabase-shaped, matching the rest of the SDK.
+
+- `signInWithOAuth` → **`GET /auth/v1/authorize?provider=<name>&redirect_to=…`**
+  (**not** the old `/auth/v1/oauth/:provider/authorize`). Presets +
+  generic OIDC per ADR 0020; PKCE + signed `state` handled server-side;
+  `GET /auth/v1/callback` completes the exchange.
+- `auth.mfa.*` → **`POST /auth/v1/factors`** (enroll),
+  **`POST /auth/v1/factors/:id/verify`**,
+  **`POST /auth/v1/factors/:id/challenge`**,
+  **`POST /auth/v1/factors/:id/challenge/verify`**,
+  **`DELETE /auth/v1/factors/:id`** (**not** `/auth/v1/mfa/totp/*`).
+  TOTP **and** WebAuthn/passkeys ship together (ADR 0020) — WebAuthn is
+  no longer a separate follow-on. JWT carries `aal` + `amr`; consult via
+  the new `auth.aal()` engine fn.
+- `storage.from(bucket).*` → **`/storage/v1/object/:bucket/:path`**
+  (upload/download/delete), **`/storage/v1/object/list/:bucket`**,
+  **`/storage/v1/object/sign/:bucket/:path`** (**not** bare `/object/*`).
+  Catalog-backed (`storage.objects` + RLS) per ADR 0021. `.remove(paths[])`
+  maps to bulk delete `DELETE /storage/v1/object/:bucket` with a
+  `{prefixes}` body.
 
 ---
 
