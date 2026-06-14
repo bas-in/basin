@@ -7365,6 +7365,22 @@ async fn exec_insert_select(
     refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
     write_insert_audit_rows(sess, meta.schema.as_ref(), std::slice::from_ref(&batch)).await?;
 
+    // RETURNING on INSERT … SELECT (Django `bulk_create` emits
+    // `INSERT … SELECT * FROM UNNEST(…) RETURNING id` to read back PKs). The
+    // written `batch` already carries every column including synthesized
+    // identity values, so project the RETURNING items over it exactly as the
+    // VALUES path does.
+    if let Some(returning_items) = ins.returning.as_ref() {
+        return crate::dml_mutate::project_returning(
+            &sess.engine.config().catalog,
+            &sess.project,
+            schema.clone(),
+            vec![batch.clone()],
+            returning_items,
+        )
+        .await;
+    }
+
     Ok(ExecResult::Empty {
         tag: format!("INSERT 0 {row_count}"),
     })

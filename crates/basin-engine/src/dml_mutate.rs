@@ -7146,7 +7146,7 @@ fn strip_table_qualifiers_deep(expr: Expr) -> Expr {
 /// are rendered back to SQL and pushed into one DataFusion SELECT, so
 /// any expression DataFusion understands (column refs, arithmetic,
 /// function calls) works without a bespoke evaluator here.
-async fn project_returning(
+pub(crate) async fn project_returning(
     catalog: &Arc<dyn basin_catalog::Catalog>,
     project: &basin_common::ProjectId,
     table_schema: Arc<Schema>,

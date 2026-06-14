@@ -23,6 +23,12 @@ wire-protocol fix, a router unit test:
   SQLAlchemy `Mapped[int]` → INTEGER) now casts the synthesized i64 identity
   values to the column's declared type instead of failing with an Int64-vs-Int32
   schema mismatch.
+- **`INSERT … SELECT … RETURNING`** now emits the projected RETURNING rows. The
+  INSERT-SELECT path previously returned only an `INSERT 0 N` tag, so Django's
+  `bulk_create` (`INSERT … SELECT * FROM UNNEST(…) RETURNING id`) saw no rows
+  ("no results to fetch"). The written batch — which already carries synthesized
+  identity values — is now projected through the same RETURNING machinery as the
+  VALUES path.
 - **Django `F()` UPDATE expressions** — `SET col = "t"."col" + 1` — now resolve:
   the table qualifier on the SET right-hand side is stripped (it is evaluated
   over a temp table), fixing "No field named t.col". The strip recurses through
