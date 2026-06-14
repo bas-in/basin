@@ -152,6 +152,33 @@ async fn update_set_qualified_self_reference_resolves() {
     }
 }
 
+/// Django `bulk_update` emits `SET pages = CASE WHEN "books"."id" = 1 THEN 999
+/// ELSE "books"."pages" END` — qualified column refs nested inside a CASE. The
+/// SET-RHS qualifier strip must recurse through CASE so it resolves against the
+/// update's temp table rather than failing with "No field named books.id".
+#[tokio::test]
+async fn update_set_case_with_qualified_refs_resolves() {
+    let dir = TempDir::new().unwrap();
+    let sess = engine_in(&dir).await.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute("CREATE TABLE books (id BIGINT PRIMARY KEY, pages BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO books (id, pages) VALUES (1, 10), (2, 20)").await.unwrap();
+
+    sess.execute(
+        "UPDATE books SET pages = CASE WHEN books.id = 1 THEN 999 ELSE books.pages END",
+    )
+    .await
+    .expect("qualified CASE on the SET RHS must resolve");
+
+    let res = sess.execute("SELECT pages FROM books ORDER BY id").await.unwrap();
+    match res {
+        ExecResult::Rows { batches, .. } => assert_eq!(ids_i64(&batches, "pages"), vec![999, 20]),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
 /// Schema-qualified FK reference in `ALTER TABLE … ADD CONSTRAINT` (Drizzle
 /// migrations) — accepted by taking the bare referenced-table name.
 #[tokio::test]

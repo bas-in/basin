@@ -25,7 +25,9 @@ wire-protocol fix, a router unit test:
   schema mismatch.
 - **Django `F()` UPDATE expressions** — `SET col = "t"."col" + 1` — now resolve:
   the table qualifier on the SET right-hand side is stripped (it is evaluated
-  over a temp table), fixing "No field named t.col".
+  over a temp table), fixing "No field named t.col". The strip recurses through
+  `CASE` expressions too, so Django `bulk_update` (`SET col = CASE WHEN
+  "t"."id" = … THEN … ELSE "t"."col" END`) resolves as well.
 - **Schema-qualified FK references** (`REFERENCES "public"."u" (id)`) are now
   accepted in both `CREATE TABLE` and `ALTER TABLE … ADD CONSTRAINT` by taking
   the bare referenced-table name (Basin FKs are single-project).

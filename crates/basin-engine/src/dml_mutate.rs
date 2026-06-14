@@ -7100,6 +7100,28 @@ fn strip_table_qualifiers_deep(expr: Expr) -> Expr {
             op,
             expr: Box::new(strip_table_qualifiers_deep(*expr)),
         },
+        // `CASE WHEN "t"."id" = 1 THEN … ELSE "t"."pages" END` — Django's
+        // `bulk_update` emits a qualified CASE on the SET RHS. Recurse into the
+        // operand, every WHEN condition/result, and the ELSE branch.
+        Expr::Case {
+            case_token,
+            end_token,
+            operand,
+            conditions,
+            else_result,
+        } => Expr::Case {
+            case_token,
+            end_token,
+            operand: operand.map(|o| Box::new(strip_table_qualifiers_deep(*o))),
+            conditions: conditions
+                .into_iter()
+                .map(|w| sqlparser::ast::CaseWhen {
+                    condition: strip_table_qualifiers_deep(w.condition),
+                    result: strip_table_qualifiers_deep(w.result),
+                })
+                .collect(),
+            else_result: else_result.map(|e| Box::new(strip_table_qualifiers_deep(*e))),
+        },
         other => other,
     }
 }
