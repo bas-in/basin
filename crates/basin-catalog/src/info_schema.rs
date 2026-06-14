@@ -1508,6 +1508,16 @@ impl InfoSchemaQuery {
             Field::new("typcategory", DataType::Utf8, false),
             Field::new("typlen", DataType::Int16, false),
             Field::new("typbyval", DataType::Boolean, false),
+            // psycopg / SQLAlchemy load their type cache at connect time with a
+            // query that selects `typarray` (the OID of this type's array type),
+            // `typelem` (element type for an array type), and `typdelim` (array
+            // element delimiter). A missing column aborts the connection outright
+            // ("column typarray does not exist"), taking down the whole driver.
+            // Basin does not model distinct array-type OIDs, so `typarray` and
+            // `typelem` are 0 ("none") and `typdelim` is the standard comma.
+            Field::new("typarray", DataType::Int64, false),
+            Field::new("typelem", DataType::Int64, false),
+            Field::new("typdelim", DataType::Utf8, false),
         ]))
     }
 
@@ -1560,6 +1570,14 @@ impl InfoSchemaQuery {
             typbyvals.push(true);
         }
 
+        // Basin does not model distinct array-type OIDs; report `typarray` /
+        // `typelem` as 0 ("none") and the standard comma `typdelim` so the
+        // psycopg / SQLAlchemy connect-time type-cache query resolves.
+        let row_count = oids.len();
+        let typarrays: Vec<i64> = vec![0; row_count];
+        let typelems: Vec<i64> = vec![0; row_count];
+        let typdelims: Vec<&str> = vec![","; row_count];
+
         let schema = Self::pg_type_schema();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(oids)),
@@ -1569,6 +1587,9 @@ impl InfoSchemaQuery {
             Arc::new(StringArray::from(typcategories)),
             Arc::new(Int16Array::from(typlens)),
             Arc::new(BooleanArray::from(typbyvals)),
+            Arc::new(Int64Array::from(typarrays)),
+            Arc::new(Int64Array::from(typelems)),
+            Arc::new(StringArray::from(typdelims)),
         ];
         RecordBatch::try_new(schema, columns)
             .map_err(|e| BasinError::internal(format!("pg_catalog.pg_type build: {e}")))

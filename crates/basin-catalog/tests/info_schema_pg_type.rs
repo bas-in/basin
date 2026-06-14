@@ -75,6 +75,10 @@ async fn pg_type_lists_basin_supported_types() {
             "typcategory".to_string(),
             "typlen".to_string(),
             "typbyval".to_string(),
+            // Added for psycopg / SQLAlchemy connect-time type-cache resolution.
+            "typarray".to_string(),
+            "typelem".to_string(),
+            "typdelim".to_string(),
         ]
     );
 
