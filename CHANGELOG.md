@@ -8,26 +8,6 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
-## 2026-06-14 — B-tree-indexed tables take the DELETE tombstone fast path
-
-- **A point DELETE / `DELETE … USING` on a B-tree-indexed table now plants a
-  tombstone instead of doing a cold copy-on-write rewrite + index rebuild.**
-  Previously only GIN-indexed (and index-free) tables were admitted to the
-  hot-tier tombstone overlay fast path; any B-tree secondary index forced the
-  cold path, which made the 1M-row `DELETE … USING` shape dramatically slower
-  than Postgres. The hazard that kept B-tree out — the `fast_select`
-  secondary-index allowlist probe trusting a stale index HIT (the deleted row is
-  still in the cold file the index points at until the overlay drains) — is
-  closed by guarding that probe with `table_has_live_overlay`: while an overlay
-  is live the probe skips pruning and falls through to the overlay-aware
-  (`TombstoneFilter`) scan, and `materialize_overlay_for_table` purges the
-  replaced files' entries from the B-tree registry on drain so pruning
-  re-engages. GIST / HNSW (vector) indexes still keep the cold path. Correctness
-  is pinned by `tests/integration/tests/btree_overlay_delete.rs` (deleted row
-  excluded from an indexed `=` read during the overlay window and after drain,
-  for both point and `USING` deletes); GIN behavior is unchanged
-  (`gin_overlay_delete.rs` green).
-
 ## 2026-06-14 — ORM SQL-shape fixes (Drizzle, SQLAlchemy, Django, gorm)
 
 - **Array `&&` overlap with a parenthesized/cast operand** now rewrites to
