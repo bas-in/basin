@@ -1101,6 +1101,177 @@ func TestCreateSignedURL(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Stream (NDJSON)
+// ---------------------------------------------------------------------------
+
+func respondNDJSON(w http.ResponseWriter, lines []string) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.WriteHeader(200)
+	for _, l := range lines {
+		_, _ = fmt.Fprintln(w, l)
+	}
+}
+
+func TestStreamBasic(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/rest/v1/events", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("stream") != "true" {
+			t.Errorf("stream param missing: %q", r.URL.RawQuery)
+		}
+		respondNDJSON(w, []string{
+			`{"id":1,"name":"alice"}`,
+			`{"id":2,"name":"bob"}`,
+			`{"id":3,"name":"carol"}`,
+		})
+	})
+	client, _ := newTestClient(t, mux)
+
+	var rows []Row
+	for row, err := range client.Table("events").Stream(context.Background()) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		rows = append(rows, row)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows: got %d want 3", len(rows))
+	}
+	if rows[0]["name"] != "alice" {
+		t.Errorf("row[0].name: got %v", rows[0]["name"])
+	}
+	if rows[2]["id"] != float64(3) {
+		t.Errorf("row[2].id: got %v", rows[2]["id"])
+	}
+}
+
+func TestStreamWithCursorLine(t *testing.T) {
+	// The trailing {"_basin_next_cursor":"..."} line should be captured and not yielded.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/rest/v1/events", func(w http.ResponseWriter, r *http.Request) {
+		respondNDJSON(w, []string{
+			`{"id":1}`,
+			`{"id":2}`,
+			`{"_basin_next_cursor":"tok-abc"}`,
+		})
+	})
+	client, _ := newTestClient(t, mux)
+
+	out := &StreamResult{}
+	var count int
+	for row, err := range client.Table("events").StreamWithCursor(context.Background(), out) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, ok := row["_basin_next_cursor"]; ok {
+			t.Error("sentinel line must not be yielded as a row")
+		}
+		count++
+	}
+	if count != 2 {
+		t.Errorf("yielded rows: got %d want 2", count)
+	}
+	if out.NextCursor != "tok-abc" {
+		t.Errorf("NextCursor: got %q want tok-abc", out.NextCursor)
+	}
+}
+
+func TestStreamEmpty(t *testing.T) {
+	// An empty NDJSON body (no lines) should yield no rows and no error.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/rest/v1/events", func(w http.ResponseWriter, r *http.Request) {
+		respondNDJSON(w, nil)
+	})
+	client, _ := newTestClient(t, mux)
+
+	var count int
+	for _, err := range client.Table("events").Stream(context.Background()) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		count++
+	}
+	if count != 0 {
+		t.Errorf("expected 0 rows, got %d", count)
+	}
+}
+
+func TestStreamFiltersCarriedThrough(t *testing.T) {
+	// Verify that filters set on the builder are sent alongside stream=true.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/rest/v1/orders", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if q.Get("stream") != "true" {
+			t.Errorf("stream param missing")
+		}
+		if q.Get("status") != "eq.open" {
+			t.Errorf("filter not forwarded: %q", r.URL.RawQuery)
+		}
+		respondNDJSON(w, []string{`{"id":42,"status":"open"}`})
+	})
+	client, _ := newTestClient(t, mux)
+
+	var rows []Row
+	for row, err := range client.Table("orders").Eq("status", "open").Stream(context.Background()) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		rows = append(rows, row)
+	}
+	if len(rows) != 1 || rows[0]["id"] != float64(42) {
+		t.Errorf("rows: %v", rows)
+	}
+}
+
+func TestStreamNonSuccessResponse(t *testing.T) {
+	// A 401 response should surface as a *BasinError, not a decode error.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/rest/v1/events", func(w http.ResponseWriter, r *http.Request) {
+		respondError(w, 401, "E_UNAUTHENTICATED", "missing token")
+	})
+	client, _ := newTestClient(t, mux)
+
+	var gotErr error
+	for _, err := range client.Table("events").Stream(context.Background()) {
+		gotErr = err
+		break
+	}
+	var be *BasinError
+	if !errors.As(gotErr, &be) {
+		t.Fatalf("expected *BasinError, got %T: %v", gotErr, gotErr)
+	}
+	if be.Code != "E_UNAUTHENTICATED" {
+		t.Errorf("Code: got %q want E_UNAUTHENTICATED", be.Code)
+	}
+}
+
+func TestStreamEarlyBreak(t *testing.T) {
+	// Breaking out of the range loop early must not panic or deadlock.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/rest/v1/events", func(w http.ResponseWriter, r *http.Request) {
+		respondNDJSON(w, []string{
+			`{"id":1}`,
+			`{"id":2}`,
+			`{"id":3}`,
+		})
+	})
+	client, _ := newTestClient(t, mux)
+
+	var count int
+	for _, err := range client.Table("events").Stream(context.Background()) {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		count++
+		if count == 1 {
+			break
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected 1 row before break, got %d", count)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
 

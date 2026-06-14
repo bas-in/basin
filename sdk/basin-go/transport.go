@@ -154,6 +154,34 @@ func (t *transport) doRaw(ctx context.Context, method, path string, query []quer
 	return t.httpClient.Do(req)
 }
 
+// doStream executes a GET with ?stream=true and returns the raw *http.Response
+// so the caller can read the NDJSON body incrementally. On non-2xx responses
+// the body is consumed and an error is returned. The caller is responsible for
+// calling resp.Body.Close() on success.
+func (t *transport) doStream(ctx context.Context, path string, query []queryParam) (*http.Response, error) {
+	rawURL := t.buildURL(path, query)
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("basin: build request: %w", err)
+	}
+	req.Header.Set("Accept", "application/x-ndjson")
+	if tok := t.bearer(ctx); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("basin: http: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		return nil, t.parseError(raw, resp.StatusCode)
+	}
+	return resp, nil
+}
+
 // doUpload performs a POST with a raw byte body (object upload).
 func (t *transport) doUpload(ctx context.Context, method, path string, data []byte, contentType string, useAuth bool) (json.RawMessage, int, error) {
 	rawURL := t.buildURL(path, nil)

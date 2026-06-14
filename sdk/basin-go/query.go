@@ -1,9 +1,11 @@
 package basin
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"iter"
 	"strconv"
 	"strings"
 )
@@ -196,6 +198,124 @@ func (q *QueryBuilder) Run(ctx context.Context) (*QueryResult, error) {
 		return nil, err
 	}
 	return normalizeGetResponse(raw)
+}
+
+// Stream executes the query with ?stream=true and returns an iterator that
+// yields decoded rows as they arrive from the NDJSON response body. The
+// iterator is pull-based (range-over-func, Go 1.23+):
+//
+//	for row, err := range q.Stream(ctx) {
+//	    if err != nil { /* handle */ break }
+//	    fmt.Println(row)
+//	}
+//
+// The response body is read line-by-line with bufio.Scanner; each non-empty
+// line is JSON-decoded into a Row. The trailing pagination line
+// {"_basin_next_cursor":"..."} is captured and not yielded as a row — retrieve
+// it via (*StreamResult).NextCursor after the loop.
+//
+// The caller must consume or break the iterator to ensure the HTTP response
+// body is closed. Cancelling ctx terminates the iterator with the
+// context's error.
+func (q *QueryBuilder) Stream(ctx context.Context) iter.Seq2[Row, error] {
+	return func(yield func(Row, error) bool) {
+		params := make([]queryParam, len(q.query)+1)
+		copy(params, q.query)
+		params[len(q.query)] = queryParam{"stream", "true"}
+
+		resp, err := q.t.doStream(ctx, "/rest/v1/"+q.table, params)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		defer resp.Body.Close()
+
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			var parsed map[string]any
+			if err := json.Unmarshal([]byte(line), &parsed); err != nil {
+				if !yield(nil, fmt.Errorf("basin: stream decode: %w", err)) {
+					return
+				}
+				continue
+			}
+			// Skip the trailing pagination sentinel line; do not yield it.
+			if _, ok := parsed["_basin_next_cursor"]; ok {
+				continue
+			}
+			if !yield(Row(parsed), nil) {
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			yield(nil, fmt.Errorf("basin: stream read: %w", err))
+		}
+	}
+}
+
+// StreamResult is returned by StreamWithCursor; it exposes the next_cursor
+// from the trailing NDJSON sentinel line so callers can page through results.
+type StreamResult struct {
+	// NextCursor is the opaque cursor from the trailing
+	// {"_basin_next_cursor":"..."} line, or "" when there are no more pages.
+	NextCursor string
+}
+
+// StreamWithCursor is like Stream but also captures the trailing
+// {"_basin_next_cursor":"..."} pagination sentinel line. The returned
+// *StreamResult is populated after the iterator is fully consumed.
+//
+//	res := &basin.StreamResult{}
+//	for row, err := range q.StreamWithCursor(ctx, res) {
+//	    if err != nil { break }
+//	    handle(row)
+//	}
+//	fmt.Println(res.NextCursor)
+func (q *QueryBuilder) StreamWithCursor(ctx context.Context, out *StreamResult) iter.Seq2[Row, error] {
+	return func(yield func(Row, error) bool) {
+		params := make([]queryParam, len(q.query)+1)
+		copy(params, q.query)
+		params[len(q.query)] = queryParam{"stream", "true"}
+
+		resp, err := q.t.doStream(ctx, "/rest/v1/"+q.table, params)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		defer resp.Body.Close()
+
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			var parsed map[string]any
+			if err := json.Unmarshal([]byte(line), &parsed); err != nil {
+				if !yield(nil, fmt.Errorf("basin: stream decode: %w", err)) {
+					return
+				}
+				continue
+			}
+			// Capture the pagination sentinel; do not yield it as a row.
+			if cursor, ok := parsed["_basin_next_cursor"]; ok {
+				if s, ok := cursor.(string); ok && out != nil {
+					out.NextCursor = s
+				}
+				continue
+			}
+			if !yield(Row(parsed), nil) {
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			yield(nil, fmt.Errorf("basin: stream read: %w", err))
+		}
+	}
 }
 
 // Insert inserts one row or a slice of rows (POST /rest/v1/:table → 201).
