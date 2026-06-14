@@ -73,9 +73,16 @@ pub struct CdcSseState {
 
 /// Build the CDC SSE sub-router. Merge into the main axum app (same idiom as
 /// `basin_realtime::sse::router`).
+///
+/// Routes:
+/// - `GET /v1/cdc/:project/stream` — Basin-native JSON event frames (Phase 1).
+/// - `GET /v1/cdc/:project/wal2json` — the same resumable stream, but each
+///   frame is one [`crate::wal2json`] v2 action object (Phase 4), so a
+///   `wal2json`-shaped consumer parses it without a Basin-specific codec.
 pub fn cdc_router(state: CdcSseState) -> Router {
     Router::new()
         .route("/v1/cdc/:project/stream", get(cdc_stream_handler))
+        .route("/v1/cdc/:project/wal2json", get(cdc_wal2json_handler))
         .with_state(state)
 }
 
@@ -157,6 +164,20 @@ fn frame_for(rec: &CdcRecord) -> Option<Event> {
         Ok(data) => Some(Event::default().id(rec.seq.to_string()).data(data)),
         Err(e) => {
             warn!(seq = rec.seq, error = %e, "cdc SSE: serialize failed");
+            None
+        }
+    }
+}
+
+/// Build a wal2json v2 per-row action object frame for one record (Phase 4).
+/// `id:` carries the `seq` cursor exactly like the native frame, so resume /
+/// `Last-Event-ID` works identically across both stream shapes.
+fn wal2json_frame_for(rec: &CdcRecord) -> Option<Event> {
+    let payload = crate::wal2json::Wal2JsonTxn::row(rec);
+    match serde_json::to_string(&payload) {
+        Ok(data) => Some(Event::default().id(rec.seq.to_string()).data(data)),
+        Err(e) => {
+            warn!(seq = rec.seq, error = %e, "cdc wal2json SSE: serialize failed");
             None
         }
     }
@@ -280,6 +301,145 @@ pub async fn cdc_stream_handler(
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(lagged = n, "cdc SSE live tail lagged; client should reconnect with Last-Event-ID");
+                        let c = Ok(Event::default().comment(format!("lagged:{n}")));
+                        return Some((c, (rx, high, f)));
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    );
+
+    let stream = gap_stream.chain(replay_stream).chain(live_stream);
+
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("heartbeat"),
+    ))
+}
+
+/// `GET /v1/cdc/:project/wal2json` — the resumable CDC stream rendered as
+/// `wal2json` v2 per-row action objects (ADR 0028 Phase 4).
+///
+/// Identical auth / cross-project isolation / replay-then-live / cursor-gap
+/// machinery as [`cdc_stream_handler`]; only the per-record frame differs
+/// ([`wal2json_frame_for`]). A `wal2json`-shaped consumer parses each `data:`
+/// frame as one `{"action":"I|U|D", ...}` object.
+#[axum::debug_handler]
+pub async fn cdc_wal2json_handler(
+    State(state): State<CdcSseState>,
+    Path(project_str): Path<String>,
+    Query(params): Query<StreamParams>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
+    // --- 1. Auth ---------------------------------------------------------
+    let token = bearer(&headers)?;
+    let claims = state
+        .auth
+        .verify_jwt(token)
+        .map_err(|_| err(StatusCode::UNAUTHORIZED, "invalid or expired JWT"))?;
+
+    // --- 2. Parse + isolate ----------------------------------------------
+    let project: ProjectId = project_str
+        .parse()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid project id in path"))?;
+    if claims.project_id != project {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "JWT project does not match path project",
+        ));
+    }
+
+    // --- 3. Cursor (query param or Last-Event-ID) ------------------------
+    let resume_after: u64 = params.resume_after.unwrap_or_else(|| {
+        headers
+            .get("last-event-id")
+            .or_else(|| headers.get("Last-Event-ID"))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    });
+
+    let filter = StreamFilter::from_params(&params);
+
+    // --- 4. Subscribe to live BEFORE replay (no-miss window) -------------
+    let live_rx = state.live.subscribe(project);
+
+    // --- 5. Durable replay + gap detection -------------------------------
+    let ring = ProjectRing::with_root(
+        project,
+        state.storage.project_object_store(&project),
+        state.storage.root_prefix_handle().map(|p| p.to_string()),
+    );
+    let mut gap_frame: Option<Event> = None;
+    let replay: Vec<CdcRecord> = if resume_after == 0 {
+        Vec::new()
+    } else {
+        let min_avail = ring.min_available_seq().await.unwrap_or(None);
+        if let Some(min) = min_avail {
+            if resume_after + 1 < min {
+                warn!(
+                    project = %project,
+                    resume_after,
+                    min_available_seq = min,
+                    "cdc wal2json: resume cursor predates retention; emitting cursor_expired",
+                );
+                let body = serde_json::json!({
+                    "type": "cursor_expired",
+                    "resume_after": resume_after,
+                    "min_available_seq": min,
+                });
+                gap_frame = Some(Event::default().data(body.to_string()));
+            }
+        }
+        ring.replay_after(resume_after).await.unwrap_or_default()
+    };
+
+    debug!(
+        project = %project,
+        resume_after,
+        replay_count = replay.len(),
+        "cdc wal2json SSE subscriber connected",
+    );
+
+    let last_replayed = replay.last().map(|r| r.seq).unwrap_or(resume_after);
+
+    // --- 6. Build the stream: gap → replay → live -----------------------
+    let gap_stream = stream::iter(gap_frame.into_iter().map(Ok));
+
+    let f_replay = filter.clone();
+    let replay_stream = stream::iter(replay).filter_map(move |rec| {
+        let f = f_replay.clone();
+        async move {
+            if !f.matches(&rec) {
+                return None;
+            }
+            wal2json_frame_for(&rec).map(Ok)
+        }
+    });
+
+    let f_live = filter.clone();
+    let live_stream = stream::unfold(
+        (live_rx, last_replayed, f_live),
+        move |(mut rx, mut high, f)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(rec) => {
+                        if rec.seq <= high {
+                            continue;
+                        }
+                        high = rec.seq;
+                        if !f.matches(&rec) {
+                            continue;
+                        }
+                        let ev = wal2json_frame_for(&rec)
+                            .map(Ok)
+                            .unwrap_or_else(|| Ok(Event::default().comment("serialize_error")));
+                        return Some((ev, (rx, high, f)));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(lagged = n, "cdc wal2json SSE live tail lagged; client should reconnect with Last-Event-ID");
                         let c = Ok(Event::default().comment(format!("lagged:{n}")));
                         return Some((c, (rx, high, f)));
                     }

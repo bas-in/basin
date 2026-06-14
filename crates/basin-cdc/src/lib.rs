@@ -59,6 +59,8 @@ mod live;
 mod record;
 mod ring;
 pub mod sse;
+/// ADR 0028 Phase 4 — `wal2json` logical-replication output format.
+pub mod wal2json;
 /// ADR 0028 Phase 2 — webhook push sink (delivery worker).
 pub mod webhook;
 
