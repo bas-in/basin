@@ -46,7 +46,7 @@
 //! path through the public API that lets project A query B's index — every
 //! caller supplies their own `ProjectId` and the registry enforces it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use basin_common::{BasinError, ProjectId, Result, TableName};
@@ -56,7 +56,7 @@ use tracing::{debug, warn};
 /// Serialisation magic for the index file format.
 const MAGIC: [u8; 4] = *b"BIDX";
 /// Current format version.
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 /// Maximum number of distinct key values kept in RAM per `(table, col)` pair.
 ///
@@ -105,6 +105,19 @@ pub struct ColumnIndex {
     /// track distinct key order (not individual locations), which is an
     /// approximation but keeps overhead tiny.
     insert_order: Vec<String>,
+
+    /// Set of data files this index FULLY covers — every row of these files has
+    /// been extracted into `entries`. This is the coverage ground-truth a reader
+    /// consults before trusting a probe HIT as an authoritative file allowlist:
+    /// pruning to a HIT's files is only correct when the index covers ALL live
+    /// files, else a key whose rows span a covered and an uncovered file would
+    /// be served a subset (dropping the uncovered file's rows). A file is added
+    /// only when fully indexed (INSERT extractor, CREATE INDEX backfill, overlay
+    /// drain re-index); it is removed when the file is replaced/deleted
+    /// (`remove_file`) and the whole set is cleared on FIFO eviction (eviction
+    /// drops keys, making per-file coverage indeterminate — clearing is the
+    /// conservative, always-safe choice: an empty set ⇒ "trust no prune").
+    indexed_files: HashSet<String>,
 }
 
 impl ColumnIndex {
@@ -113,7 +126,24 @@ impl ColumnIndex {
         Self {
             entries: BTreeMap::new(),
             insert_order: Vec::new(),
+            indexed_files: HashSet::new(),
         }
+    }
+
+    /// Mark `file_path` as FULLY indexed (every row extracted into `entries`).
+    /// Call this only after all of a file's rows are inserted.
+    pub fn mark_file_indexed(&mut self, file_path: &str) {
+        self.indexed_files.insert(file_path.to_string());
+    }
+
+    /// True if `file_path` is recorded as fully covered by this index.
+    pub fn is_file_indexed(&self, file_path: &str) -> bool {
+        self.indexed_files.contains(file_path)
+    }
+
+    /// The set of files this index fully covers (see [`Self::indexed_files`]).
+    pub fn indexed_files(&self) -> &HashSet<String> {
+        &self.indexed_files
     }
 
     /// Add a location entry for `key`. If `key` is new, it is appended to
@@ -132,6 +162,13 @@ impl ColumnIndex {
             for k in &to_evict {
                 self.entries.remove(k);
             }
+            // Eviction drops keys, not whole files, so per-file coverage becomes
+            // indeterminate (an evicted key may have been a file's only entry).
+            // Clear the coverage set: the index degrades to "trust no prune"
+            // (correct, full-scan) until files are re-indexed. Coarse but always
+            // safe — the alternative (tracking which files lost a key) is far
+            // more bookkeeping for a cold path.
+            self.indexed_files.clear();
         }
     }
 
@@ -152,6 +189,8 @@ impl ColumnIndex {
             self.entries.remove(k);
             self.insert_order.retain(|x| x != k);
         }
+        // The file is no longer present in this index → it is no longer covered.
+        self.indexed_files.remove(file_path);
         removed
     }
 
@@ -215,6 +254,13 @@ pub fn encode_index(idx: &ColumnIndex) -> Vec<u8> {
             buf.extend_from_slice(&loc.row.to_le_bytes());
         }
     }
+    // v2 trailer: the indexed-file coverage set.
+    buf.extend_from_slice(&(idx.indexed_files.len() as u64).to_le_bytes());
+    for f in &idx.indexed_files {
+        let fb = f.as_bytes();
+        buf.extend_from_slice(&(fb.len() as u32).to_le_bytes());
+        buf.extend_from_slice(fb);
+    }
     buf
 }
 
@@ -251,7 +297,9 @@ pub fn decode_index(data: &[u8]) -> Result<ColumnIndex> {
         return Err(BasinError::internal("secondary index: bad magic"));
     }
     let ver = read_bytes!(1)[0];
-    if ver != VERSION {
+    // v1 has no coverage trailer (decodes as uncovered → "trust no prune", safe);
+    // v2 appends the indexed-file set. Accept both.
+    if ver != 1 && ver != 2 {
         return Err(BasinError::internal(format!(
             "secondary index: unsupported version {ver}"
         )));
@@ -274,6 +322,19 @@ pub fn decode_index(data: &[u8]) -> Result<ColumnIndex> {
             let row_group = read_u32!();
             let row = read_u64!();
             idx.insert(key.clone(), IndexLocation { file_path, row_group, row });
+        }
+    }
+    // v2 trailer: indexed-file coverage set (read AFTER inserts, since insert's
+    // eviction path clears the set). v1 has no trailer → coverage stays empty.
+    if ver >= 2 {
+        let file_count = read_u64!() as usize;
+        for _ in 0..file_count {
+            let flen = read_u32!() as usize;
+            let fb = read_bytes!(flen);
+            let f = std::str::from_utf8(fb)
+                .map_err(|e| BasinError::internal(format!("secondary index: bad coverage utf8: {e}")))?
+                .to_string();
+            idx.indexed_files.insert(f);
         }
     }
     Ok(idx)
@@ -425,6 +486,56 @@ impl ProjectIndexRegistry {
         };
         let mut idx = arc.lock().expect("column index lock poisoned");
         let _ = idx.remove_file(file_path);
+    }
+
+    /// Mark `file_path` as fully indexed for `(project, table, col)`. No-op if
+    /// the column index isn't loaded (nothing to mark).
+    pub fn mark_file_indexed(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+        file_path: &str,
+    ) {
+        let arc = {
+            let map = self.inner.lock().expect("index registry lock poisoned");
+            match map.get(&RegKey {
+                project: *project,
+                table: table.clone(),
+                col: col.to_string(),
+            }) {
+                Some(a) => a.clone(),
+                None => return,
+            }
+        };
+        arc.lock()
+            .expect("column index lock poisoned")
+            .mark_file_indexed(file_path);
+    }
+
+    /// The set of files the `(project, table, col)` index fully covers. Returns
+    /// an empty set when the index isn't loaded — an unloaded index covers
+    /// nothing, so a caller's completeness check correctly declines to prune.
+    pub fn indexed_files_for(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        col: &str,
+    ) -> HashSet<String> {
+        let arc = {
+            let map = self.inner.lock().expect("index registry lock poisoned");
+            match map.get(&RegKey {
+                project: *project,
+                table: table.clone(),
+                col: col.to_string(),
+            }) {
+                Some(a) => a.clone(),
+                None => return HashSet::new(),
+            }
+        };
+        let guard = arc.lock().expect("column index lock poisoned");
+        let files = guard.indexed_files().clone();
+        files
     }
 
     /// Populate the registry from a serialised blob (loaded from disk).
@@ -753,6 +864,59 @@ mod tests {
     fn probe_returns_none_for_absent_key() {
         let idx = ColumnIndex::new();
         assert!(idx.probe("missing").is_none());
+    }
+
+    #[test]
+    fn indexed_file_coverage_roundtrips_and_tracks_lifecycle() {
+        let mut idx = ColumnIndex::new();
+        idx.insert(
+            "k".to_string(),
+            IndexLocation { file_path: "f1.parquet".to_string(), row_group: 0, row: 0 },
+        );
+        idx.mark_file_indexed("f1.parquet");
+        idx.mark_file_indexed("f2.parquet");
+        assert!(idx.is_file_indexed("f1.parquet") && idx.is_file_indexed("f2.parquet"));
+
+        // v2 serde preserves the coverage set.
+        let decoded = decode_index(&encode_index(&idx)).unwrap();
+        assert_eq!(decoded.indexed_files().len(), 2);
+        assert!(decoded.is_file_indexed("f1.parquet"));
+
+        // Removing a file drops its coverage.
+        let mut idx2 = decoded;
+        idx2.remove_file("f1.parquet");
+        assert!(!idx2.is_file_indexed("f1.parquet"));
+        assert!(idx2.is_file_indexed("f2.parquet"));
+    }
+
+    #[test]
+    fn v1_blob_decodes_as_uncovered() {
+        // A version-1 index blob (no coverage trailer) must decode with an empty
+        // coverage set — "trust no prune" until files are re-indexed.
+        let mut idx = ColumnIndex::new();
+        idx.insert(
+            "k".to_string(),
+            IndexLocation { file_path: "f1.parquet".to_string(), row_group: 0, row: 0 },
+        );
+        // Build a v1 blob: same as encode_index but version byte = 1 and no trailer.
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&MAGIC);
+        v1.push(1u8);
+        v1.extend_from_slice(&(idx.entries.len() as u64).to_le_bytes());
+        for (key, locs) in &idx.entries {
+            v1.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            v1.extend_from_slice(key.as_bytes());
+            v1.extend_from_slice(&(locs.len() as u32).to_le_bytes());
+            for l in locs {
+                v1.extend_from_slice(&(l.file_path.len() as u32).to_le_bytes());
+                v1.extend_from_slice(l.file_path.as_bytes());
+                v1.extend_from_slice(&l.row_group.to_le_bytes());
+                v1.extend_from_slice(&l.row.to_le_bytes());
+            }
+        }
+        let decoded = decode_index(&v1).unwrap();
+        assert_eq!(decoded.entries.len(), 1);
+        assert!(decoded.indexed_files().is_empty(), "v1 must decode as uncovered");
     }
 
     #[test]
