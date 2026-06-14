@@ -33,6 +33,14 @@ graduate to 1.0 and the standard SemVer guarantees.
   PostgreSQL-15-style banner consistent with the advertised `server_version`.
   Registered under both the bare and `pg_catalog.`-qualified names. Source:
   `crates/basin-engine/src/pg_scalar_aliases.rs`.
+- **`SHOW <var>` always returns a row (was empty for unknown vars).** PostgreSQL's
+  `SHOW` returns exactly one row; Basin returned an empty result (no row) for any
+  variable it didn't special-case, so drivers that FETCH the value — psycopg /
+  SQLAlchemy `get_isolation_level` via `SHOW transaction isolation level` — raised
+  "no results to fetch" and aborted the connection. `SHOW transaction_isolation`
+  now returns "read committed", and every other unknown `SHOW <var>` returns a
+  single empty-valued row keyed by the variable name. Source:
+  `crates/basin-engine/src/executor.rs`.
 
 ## 2026-06-14 — Cold DELETE write-amp: GIN-only tombstone fast path + FK-cascade re-read skip
 

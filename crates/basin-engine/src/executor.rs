@@ -3416,10 +3416,26 @@ async fn dispatch_parsed_statement(
                 // SHOW basin.read_tier (ADR 0009). Renders 'primary'|'lagging'.
                 let v = crate::session::show_read_tier(&sess.state);
                 Ok(make_show_result("basin.read_tier", v))
+            } else if var_name == "transaction_isolation"
+                || var_name == "transaction_isolation_level"
+                || var_name == "default_transaction_isolation"
+            {
+                // psycopg / SQLAlchemy read this at connect via
+                // `SHOW transaction isolation level` (joined to
+                // `transaction_isolation_level`) and FETCH the row — returning
+                // an empty result makes them raise "no results to fetch" and
+                // abort the connection. Basin commits run read-committed
+                // snapshot semantics.
+                Ok(make_show_result("transaction_isolation", "read committed"))
             } else {
-                // Silently return empty for other SHOW <var> forms so
-                // ORM startup queries don't hard-fail.
-                Ok(ExecResult::Empty { tag: "SHOW".into() })
+                // PostgreSQL's SHOW always returns EXACTLY ONE row. Returning an
+                // empty result (no row, no RowDescription) makes drivers that
+                // fetch the value — psycopg / SQLAlchemy `get_isolation_level`,
+                // node-postgres, JDBC — raise "no results to fetch" and abort
+                // the connection. Return a single row keyed by the variable name
+                // with an empty value so unknown `SHOW <var>` forms stay benign
+                // and fetchable.
+                Ok(make_show_result(&var_name, ""))
             }
         }
         Statement::AlterTable(sqlparser::ast::AlterTable {
