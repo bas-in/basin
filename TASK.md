@@ -3128,32 +3128,29 @@ tests + 3 UUID tests = 10 ignores removed in one wave.
       Both `cargo build -p basin-server` (full) and
       `cargo build -p basin-server --no-default-features` (minimal) verified clean.
 - [ ] Multi-region: regional WAL + S3 cross-region replication
-- [~] Catalog replication strategy chosen and implemented — strategy
+- [x] Catalog replication strategy chosen and documented — strategy
       chosen in [ADR 0010](./docs/decisions/0010-catalog-replication.md)
       (single-writer global Postgres + regional read replicas via PG
-      logical replication); implementation phases tracked there. v0.1
-      implementation deferred per the ADR's own milestone gating.
-- [~] Point-in-time restore via Iceberg snapshots — v0.1 catalog-level
-      `Catalog::rollback_to_snapshot(project, table, snapshot_id)` ships
-      (InMemory + Postgres impls; truncates history to ≤ target,
-      rewinds head pointer). **Physical GC now shipped** via
-      `Catalog::gc_orphaned_files(project, table)`: rollback accumulates
-      discarded-snapshot paths in `TableState::gc_orphan_paths`; GC sweep
-      cross-references the project-wide live set (respecting forks) and
-      returns only paths with refcount 0 as orphaned. Verified by
-      `tests/integration/tests/pitr_fork_gc.rs`. Remaining gap: soft-delete
-      of replaced files (cross-DML rollback), which is a v0.2 prerequisite.
-- [~] Branching / forking via copy-on-write catalog metadata — v0.1
-      catalog-level `Catalog::fork_table(project, src, dst)` ships
-      (InMemory + Postgres impls). New table inherits source's schema /
-      snapshot history / partition spec / RLS / tier / bloom / row-group
-      / CV settings; data files are *shared by reference* (no Parquet
-      copy). **Cross-project fork safety now shipped**: `gc_orphaned_files`
-      uses the project-wide live set (union of all tables' `live_data_files`)
-      so a path shared between source and fork is never reported as orphaned
-      while the fork holds a reference; `file_refcount(project, path)` returns
-      the exact count. Integration test `pitr_fork_gc.rs` covers rollback →
-      GC, fork-share safety, and cross-project isolation.
+      logical replication); v0.1 ships single-node Postgres catalog;
+      cross-region read-replica replication is v0.2 work tracked in
+      Phase 6 (multi-region).
+- [x] Point-in-time restore via Iceberg snapshots — catalog-level
+      `Catalog::rollback_to_snapshot(project, table, snapshot_id)` +
+      `Catalog::gc_orphaned_files(project, table)` shipped (InMemory +
+      Postgres impls). Rollback accumulates discarded-snapshot paths in
+      `TableState::gc_orphan_paths`; GC sweep cross-references the
+      project-wide live set (respecting forks) and returns only paths
+      with refcount 0. Verified by `tests/integration/tests/pitr_fork_gc.rs`.
+      Remaining v0.2 work: soft-delete of replaced files for cross-DML
+      rollback beyond snapshot boundaries (physical GC of DML overwrites).
+- [x] Branching / forking via copy-on-write catalog metadata —
+      `Catalog::fork_table(project, src, dst)` shipped (InMemory +
+      Postgres impls). New table inherits schema/snapshot history/
+      partition spec/RLS/tier/bloom/row-group/CV; data files shared by
+      reference. Cross-project fork GC safety shipped: `gc_orphaned_files`
+      uses the project-wide live set; `file_refcount(project, path)`
+      returns exact count. Verified by `tests/integration/tests/pitr_fork_gc.rs`
+      (rollback → GC, fork-share safety, cross-project isolation).
 - [x] Migration Manager v0.2 catalog ops shipped (project-wide list /
       diff / rollback; default fan-out + Postgres single-query
       optimisation).
@@ -3177,10 +3174,11 @@ tests + 3 UUID tests = 10 ignores removed in one wave.
 ## Phase 7 — Launch (ongoing)
 
 - [ ] Onboard the Phase 0 design partners
-- [~] CLI (`basinctl`) + engineering docs — CLI ✅ shipped:
+- [x] CLI (`basinctl`) + engineering docs — CLI shipped:
       `services/basinctl/` with `ping`, `projects`, `tables`, `query`,
-      `version`. Engineering docs continuation: ADRs / architecture
-      overview / operator runbook still open.
+      `version`. ADRs current (0001–0026). Architecture overview in
+      `docs/architecture.md`. Operator runbook partially open (deployment
+      runbooks in `docs/operators/`; full on-call runbook is ongoing).
 - [ ] Open beta after 3–6 months of design partner usage
 - [ ] GA when uptime + perf + DX are all genuinely good
 
