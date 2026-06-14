@@ -8,6 +8,20 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-14 — pgwire reports a PG-compatible server_version (ORM connectivity fix)
+
+- **Startup `server_version` is now a real PostgreSQL version ("15.0").**
+  pgwire's `DefaultServerParameterProvider` defaults `server_version` to its OWN
+  crate version (`env!("CARGO_PKG_VERSION")`, e.g. "0.28.0") in the startup
+  ParameterStatus. Version-gating clients read that as "PostgreSQL 0.28" and
+  refuse to connect outright — Django: *"PostgreSQL 14 or later is required
+  (found 0.2800)"* — which cascades to every later driver in a connection pool.
+  Basin now overrides the startup `server_version` to "15.0", matching the value
+  `pg_settings.server_version` already reports. Live-ORM Django connect goes
+  REGRESSION → PASS. Regression test: `protocol::tests::startup_server_version_is_pg_compatible`
+  (asserts major ≥ 14 and that we do not ship pgwire's crate-version default).
+  Source: `crates/basin-router/src/protocol.rs`.
+
 ## 2026-06-14 — Cold DELETE write-amp: GIN-only tombstone fast path + FK-cascade re-read skip
 
 - **GIN-only tables now take the DELETE tombstone fast path.** A DELETE on a

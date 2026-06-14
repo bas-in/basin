@@ -83,6 +83,16 @@ use crate::error::error_response;
 use crate::resolver::ProjectResolver;
 use crate::types::{arrow_to_pg_type, encode_batches, row_description};
 
+/// The PostgreSQL `server_version` Basin advertises in the pgwire startup
+/// ParameterStatus. MUST stay a real PG-style version whose major component is
+/// the major Basin claims wire-compatibility with — clients (Django, psycopg,
+/// node-postgres, JDBC, …) gate features and even the initial connection on it.
+/// pgwire's `DefaultServerParameterProvider` defaults this to its OWN crate
+/// version, which a client reads as "PostgreSQL 0.28" and rejects; we override
+/// it here. Keep it consistent with `pg_settings.server_version`
+/// (`basin-catalog` info_schema, currently 15.0).
+const BASIN_PG_SERVER_VERSION: &str = "15.0";
+
 // ── Commit-conflict retry policy ──────────────────────────────────────────────
 //
 // When a write DML (INSERT / UPDATE / DELETE) lands a `CommitConflict` the
@@ -2688,7 +2698,17 @@ impl<F: SessionFactory + 'static> StartupHandler for BasinStartupHandler<F> {
 
                 tracing::info!(%project, %user, "project authenticated");
 
-                finish_authentication(client, &DefaultServerParameterProvider::default()).await?;
+                // pgwire's `DefaultServerParameterProvider` reports its OWN
+                // crate version (e.g. "0.28.0", from `env!("CARGO_PKG_VERSION")`)
+                // as the `server_version` startup ParameterStatus. Clients that
+                // gate on the major version parse that as PostgreSQL 0.28 and
+                // refuse to connect entirely — Django: "PostgreSQL 14 or later
+                // is required (found 0.2800)". Report a PG-compatible version
+                // that matches `pg_settings.server_version` (15.0) so version
+                // checks in Django / SQLAlchemy / TypeORM / etc. pass.
+                let mut server_params = DefaultServerParameterProvider::default();
+                server_params.server_version = BASIN_PG_SERVER_VERSION.to_owned();
+                finish_authentication(client, &server_params).await?;
             }
             _ => {}
         }
@@ -3415,6 +3435,34 @@ mod tests {
     use basin_engine::ExecResult;
 
     use super::*;
+
+    // Regression: the startup `server_version` Basin advertises must be a real
+    // PG-style version whose MAJOR is >= 14, and it must NOT be pgwire's own
+    // crate-version default (which a client reads as "PostgreSQL 0.x" and
+    // refuses — Django: "PostgreSQL 14 or later is required (found 0.2800)").
+    // Also pin it equal to the value the `DefaultServerParameterProvider` we
+    // build for `finish_authentication` actually emits, so a future revert to
+    // `::default()` (crate version) trips this test.
+    #[test]
+    fn startup_server_version_is_pg_compatible() {
+        // The literal Basin advertises.
+        let major: u32 = BASIN_PG_SERVER_VERSION
+            .split('.')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .expect("server_version must start with a numeric major");
+        assert!(
+            major >= 14,
+            "advertised server_version {BASIN_PG_SERVER_VERSION:?} has major {major} (< 14); \
+             version-gating clients (Django et al.) will refuse to connect"
+        );
+        // Guard against silently shipping pgwire's crate-version default.
+        let pgwire_default = DefaultServerParameterProvider::default().server_version;
+        assert_ne!(
+            BASIN_PG_SERVER_VERSION, pgwire_default,
+            "server_version must be overridden away from pgwire's crate-version default"
+        );
+    }
 
     enum FakeOutcome {
         Empty(String),
