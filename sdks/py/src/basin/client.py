@@ -5,6 +5,7 @@ from typing import Any, TypeVar
 import httpx
 
 from ._http import HttpTransport
+from ._retry import RetryConfig
 from .admin.client import AdminClient
 from .auth.client import AuthClient
 from .errors import BasinError
@@ -24,9 +25,11 @@ class ClientOptions:
         *,
         headers: dict[str, str] | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        retry: RetryConfig | None = None,
     ) -> None:
         self.headers = headers or {}
         self.transport = transport
+        self.retry = retry
 
 
 class Client:
@@ -62,6 +65,7 @@ class Client:
             self._base_url,
             base_headers,
             transport=opts.transport,
+            retry=opts.retry,
         )
 
         self.auth = AuthClient(
