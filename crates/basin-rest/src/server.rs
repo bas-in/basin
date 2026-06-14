@@ -372,6 +372,11 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             "/admin/v1/projects/:project_id/usage",
             get(admin_routes::get_project_usage),
         )
+        // Cloud control-plane: list a project's tables (schema browser).
+        .route(
+            "/admin/v1/projects/:project_id/tables",
+            get(admin_routes::list_project_tables),
+        )
         // T-049 engine-side: cloud-handed BYO bucket registration.
         .route(
             "/admin/v1/projects/:project_id/byo-bucket",

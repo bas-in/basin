@@ -8,6 +8,12 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-15 — Cloud control-plane: list project tables
+
+- **`GET /admin/v1/projects/:id/tables`** returns a project's table names as
+  JSON (`catalog.list_tables`) — a control-plane schema browser. Admin-scoped,
+  read-only. Pinned by `admin_project_tables_lists_tables`.
+
 ## 2026-06-15 — Cloud control-plane: per-project usage endpoint
 
 - **`GET /admin/v1/projects/:id/usage`** returns a project's cumulative

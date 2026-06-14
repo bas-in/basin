@@ -855,3 +855,38 @@ async fn admin_project_usage_returns_counters() {
     let r2 = http_request(fx.running.local_addr, "GET", &path, &[], None).await;
     assert_ne!(r2.status, 200, "usage without an admin token must be rejected");
 }
+
+/// `GET /admin/v1/projects/:id/tables` lists the project's tables as JSON. A
+/// fresh project has none → 200 with an empty array (route mechanics + auth).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_project_tables_lists_tables() {
+    let Some(fx) = boot().await else {
+        return;
+    };
+    let bearer_hdr = bearer(&fx.token);
+    let path = format!("/admin/v1/projects/{}/tables", fx.project);
+
+    let r = http_request(
+        fx.running.local_addr,
+        "GET",
+        &path,
+        &[("Authorization", bearer_hdr.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        200,
+        "admin tables GET must succeed; body={:?}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let j = r.json();
+    assert_eq!(j["project_id"].as_str(), Some(fx.project.to_string().as_str()));
+    assert!(
+        j["tables"].as_array().map(|a| a.is_empty()).unwrap_or(false),
+        "fresh project must report an empty tables array, got {j}"
+    );
+
+    let r2 = http_request(fx.running.local_addr, "GET", &path, &[], None).await;
+    assert_ne!(r2.status, 200, "tables without an admin token must be rejected");
+}

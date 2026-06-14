@@ -137,6 +137,36 @@ pub(crate) async fn get_project_usage(
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
+/// `GET /admin/v1/projects/{project_id}/tables` — list the project's table
+/// names (dashboard schema browser). Admin-scoped, read-only.
+pub(crate) async fn list_project_tables(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    require_admin(&claims)?;
+    let project: ProjectId = project_id
+        .parse()
+        .map_err(|e| ApiError::invalid(format!("invalid project_id: {e}")))?;
+    assert_admin_for_path_project(&claims, &project)?;
+
+    let tables = state
+        .cfg
+        .engine
+        .config()
+        .catalog
+        .list_tables(&project)
+        .await
+        .map_err(ApiError::from)?;
+    let names: Vec<String> = tables.iter().map(|t| t.as_str().to_string()).collect();
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "project_id": project.to_string(), "tables": names })),
+    )
+        .into_response())
+}
+
 /// `POST /admin/v1/projects/{id}/rotate` — rotate a credential's password.
 /// `id` is the `pgwire_user` (`project_<8 hex>` or `{ulid}_{hex}`), not the
 /// project ULID. The older password stops validating immediately; the response
