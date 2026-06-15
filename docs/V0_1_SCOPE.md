@@ -176,12 +176,10 @@ Each entry: name + brief rationale + the unparked-when condition.
   incremental refresh for `date_trunc` / `time_bucket` shapes is shipped;
   no new shape coverage in v0.1.
 - **Range types beyond what already ships.** All six range types + GIST
-  interval-tree probe wired in 5.24.D (`decisions.md` 2026-05-22). No
-  range-of-records, no exclusion constraints, no `EXCLUDE USING gist`
-  on geometry.
-- **`citext` `WHERE`-rewrite expansion.** Callers use `citext_eq(col, $1)`
-  or explicit `::citext` cast (CAPABILITIES.md caveat); planner-rule
-  auto-fold deferred.
+  interval-tree probe wired in 5.24.D (`decisions.md` 2026-05-22), and
+  `EXCLUDE USING gist` exclusion constraints on range columns are enforced
+  (sentinel-CHECK). Still out: range-of-records, `EXCLUDE USING gist` on
+  geometry.
 - **FTS GIN wiring expansion.** `to_tsvector` + `@@` ship correctness-only;
   `ts_headline`, weighted vectors (`setweight`), language configs beyond
   `english` / `simple` are post-v0.1.
@@ -200,10 +198,6 @@ Each entry: name + brief rationale + the unparked-when condition.
 - **`ALTER TABLE … RENAME TO` / `RENAME COLUMN`.** Rejected at parse time
   in v0.1.
 - **Composite types** (`CREATE TYPE … AS (...)`). Use JSONB.
-- **Array column types in DDL** (`TEXT[]` / `INT[]` columns). `ARRAY[…]`
-  expressions and array functions work; DDL is rejected. INSERT support
-  for `List(Utf8)` / `List(Int64)` / `List(Int32)` did land (`60e04b9`),
-  but the full schema-DDL bridge is post-v0.1.
 - **`GENERATED ALWAYS AS … VIRTUAL`.** Only `STORED` ships.
 - **`SELECT … AS OF SNAPSHOT n` / `AS OF TIMESTAMP ts`.** Parser support
   deferred to `basin-analytical` v0.2.
@@ -268,7 +262,6 @@ when v0.1 ships; **not promises**.
 - **Row-group-level coalesced stats** (Phase 5.7 A4 B1 follow-up).
 - **`pg_dump` ingest path** (today: export-only + skipped-feature
   annotations).
-- **`citext` planner auto-fold rule.**
 
 ---
 
