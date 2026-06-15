@@ -8,6 +8,17 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-15 — Docs: correct stale capability claims (binary NUMERIC wire, citext WHERE-fold)
+
+- `CAPABILITIES.md` no longer advertises two already-shipped features as deferred:
+  - **Binary `NUMERIC` wire encoding** is implemented (`encode_numeric_binary`,
+    wired into the Decimal128 result branch + ParameterDescription) — the old
+    "text-only, deferred to v0.2" caveat was stale.
+  - **citext `WHERE`/`ORDER BY` auto-folding** is implemented (`CitextAnalyzerRule`,
+    registered in `session.rs`) — the old "must use `citext_eq` / explicit cast"
+    caveat was stale. (End-to-end harness remains `#[ignore]`-gated.)
+- Doc-only sync verified against current code; no behaviour change.
+
 ## 2026-06-15 — Hot-tier DELETE/UPDATE fast path admits single-column B-tree indexes
 
 - DELETE/UPDATE **by PK** on a table whose secondary indexes are all GIN or
