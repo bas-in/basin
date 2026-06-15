@@ -1,6 +1,10 @@
 # Basin SDK Feature-Parity Matrix
 
-This matrix compares the public surface of all ten Basin client SDKs in `sdk/`.
+This matrix compares the public surface of all ten Basin client SDKs, each now
+maintained as a standalone repo alongside basin (`basin-go`, `basin-php`,
+`basin-dart`, `basin-dotnet`, `basin-java`, `basin-ruby`, `basin-rust`,
+`basin-swift`; TypeScript and Python live in `basin-js` and `basin-py`). Cited
+source paths below are relative to each SDK's own repository root.
 Every cell was derived by reading the SDK source (not READMEs, not tests). The
 SDKs are unusually uniform: all ten are hand-derived from the same `basin-rest`
 route set, so the **query builder, auth, storage, functions, realtime, and the
