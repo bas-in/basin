@@ -50,7 +50,7 @@
 //! | `bytes_per_sec` | DOUBLE | no | **Flagged missing** — returns 0.0; no live counter |
 //! | `memory_budget_bytes` | BIGINT | no | Real: from `BudgetTracker::hard_cap()` |
 //! | `memory_used_bytes` | BIGINT | no | Real: from `BudgetTracker::bytes_in_flight(project)` |
-//! | `captured_at` | TIMESTAMPTZ | no | Current wall-clock timestamp at scan time |
+//! | `captured_at` | TIMESTAMPTZ | no | Stable per-process timestamp (fixed once at first scan) |
 //!
 //! **Rate columns are NOT live counters.** `events_per_sec`, `errors_per_sec`,
 //! and `bytes_per_sec` are always 0.0. Adding lightweight atomic counters to
@@ -59,7 +59,7 @@
 //! correct-but-conservative rather than fabricated.
 
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
@@ -116,6 +116,29 @@ pub trait RealtimeChannelSource: Send + Sync {
     /// Memory budget snapshot for `project`. Called on every `SELECT` from
     /// `basin_realtime.stats`.
     fn budget_for_project(&self, project: ProjectId) -> BudgetSnapshot;
+}
+
+// ---------------------------------------------------------------------------
+// Stable process-level timestamp for basin_realtime.stats.captured_at
+// ---------------------------------------------------------------------------
+
+/// `captured_at` is fixed once per process lifetime and never changes.
+///
+/// Semantic: "this stats epoch started when this process started". Using a
+/// stable value means that a query which scans `basin_realtime.stats` twice
+/// (e.g. `WHERE captured_at = (SELECT MAX(captured_at) FROM basin_realtime.stats)`)
+/// observes the same `captured_at` in both scans and therefore returns exactly
+/// one row.  If we called `now()` inside each `scan()` the two scans would
+/// race and the self-join would return zero rows.
+static STATS_CAPTURED_AT_US: OnceLock<i64> = OnceLock::new();
+
+fn stable_captured_at_us() -> i64 {
+    *STATS_CAPTURED_AT_US.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros().min(i64::MAX as u128) as i64)
+            .unwrap_or_default()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -336,10 +359,7 @@ impl TableProvider for RealtimeStatsProvider {
                 memory_used_bytes: 0,
             });
 
-        let now_us: i64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros().min(i64::MAX as u128) as i64)
-            .unwrap_or_default();
+        let now_us: i64 = stable_captured_at_us();
 
         // Rate columns: not yet tracked — always 0.0.
         // (See module doc: basin Phase 5.11.R7 follow-up for live counters.)
