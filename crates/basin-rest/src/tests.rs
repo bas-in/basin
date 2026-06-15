@@ -2585,3 +2585,44 @@ async fn fn_persist_cross_project_isolation() {
     let lookup_b = catalog.lookup_sql_function(&project_b, name).await;
     assert!(lookup_b.is_none(), "cross-project lookup must return None");
 }
+
+// ─── Backup / restore routes registered ───────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_and_restore_routes_return_401_not_404() {
+    let Some((running, _svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new().to_string();
+
+    let snap = http_request(
+        addr,
+        "POST",
+        &format!("/admin/v1/projects/{project}/snapshot"),
+        &[],
+        None,
+    )
+    .await;
+    assert_ne!(
+        snap.status, 404,
+        "snapshot route must be registered (got 404 instead of 401)"
+    );
+    assert_eq!(snap.status, 401, "unauthenticated snapshot must return 401");
+
+    let restore = http_request(
+        addr,
+        "POST",
+        &format!("/admin/v1/projects/{project}/restore"),
+        &[],
+        None,
+    )
+    .await;
+    assert_ne!(
+        restore.status, 404,
+        "restore route must be registered (got 404 instead of 401)"
+    );
+    assert_eq!(restore.status, 401, "unauthenticated restore must return 401");
+
+    let _ = running.shutdown.send(());
+}

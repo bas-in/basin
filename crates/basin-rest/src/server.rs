@@ -43,7 +43,8 @@ use basin_cdc::CdcSseState;
 
 use crate::errors::ApiError;
 use crate::routes::{
-    admin as admin_routes, admin_functions as admin_fn_routes,
+    admin as admin_routes, admin_backups as admin_backups_routes,
+    admin_functions as admin_fn_routes,
     admin_projects as admin_projects_routes, auth as auth_routes, data as data_routes,
     fn_handler as fn_handler_routes, inbound as inbound_routes,
     openapi as openapi_routes, rpc as rpc_routes,
@@ -403,6 +404,17 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             "/admin/v1/projects/:project_id/placement",
             post(admin_projects_routes::set_project_placement)
                 .get(admin_projects_routes::get_project_placement),
+        )
+        // Backups + PITR: snapshot capture and restore.
+        // POST /admin/v1/projects/:project_id/snapshot → capture current head.
+        // POST /admin/v1/projects/:project_id/restore  → named-snapshot or PITR.
+        .route(
+            "/admin/v1/projects/:project_id/snapshot",
+            post(admin_backups_routes::create_project_snapshot),
+        )
+        .route(
+            "/admin/v1/projects/:project_id/restore",
+            post(admin_backups_routes::restore_project),
         )
         // Feature 3 (5.22.D): pg_dump-compatible project export.
         .route(
