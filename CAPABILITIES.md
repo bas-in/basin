@@ -444,9 +444,7 @@ each affected object with a `-- skipped: <feature>` comment so that
 | `CREATE TRIGGER … EXECUTE FUNCTION` (PL/pgSQL body) | See above. Equivalent: `ALTER TABLE … REACT ON {INSERT\|UPDATE\|DELETE} EXECUTE <sql>`. |
 | `ALTER TABLE … RENAME TO` / `ALTER TABLE … RENAME COLUMN` | Column and table renames not yet implemented; rejected at parse time in v0.1. |
 | `CREATE TABLE … INHERITS (parent)` | Table inheritance not supported; use partitioning or separate tables. |
-| `CREATE TYPE … AS (…)` composite types | Composite row types not supported; use JSONB for structured sub-objects. |
-| `CREATE TABLE … (col TEXT[])` / `col INT[]` array column types | Array column types in `CREATE TABLE` DDL are not yet wired through the Arrow schema bridge. `ARRAY[…]` expressions and array functions work on existing columns; DDL for array-typed columns is rejected. |
-| `CREATE INDEX … USING gist` (geometry, `EXCLUDE USING gist`) | GIST geo-index is not on the roadmap. `EXCLUDE USING gist` (e.g. for meeting-room scheduling) is not supported. Use Basin's interval-tree–backed range index (`USING gist` on range columns is mapped to the interval-tree probe for `tstzrange`/`daterange`; geometry spatial index is not available). |
+| `CREATE TYPE … AS (…)` composite types | Composite row types not supported; use JSONB for structured sub-objects. || `CREATE INDEX … USING gist` (geometry spatial index) | A general geometry GIST spatial index is not on the roadmap (only `POINT` has an R-tree index). `EXCLUDE USING gist` constraints **on range columns** ARE supported — parsed, stripped from DDL, and enforced via the sentinel-CHECK exclusion enforcer (see the range-types row), so e.g. meeting-room scheduling exclusion works; `USING gist` on range columns maps to the interval-tree probe (`tstzrange`/`daterange`). |
 | `CREATE SEQUENCE … CYCLE` / `OWNED BY` options | Sequences ship; `CYCLE` and `OWNED BY` options are not parsed and will be silently dropped or rejected. |
 | `ALTER TABLE … SET TABLESPACE` | Tablespaces do not exist in Basin; rejected. |
 | `COMMENT ON …` | Object comments are not stored or surfaced in `pg_catalog`. |
