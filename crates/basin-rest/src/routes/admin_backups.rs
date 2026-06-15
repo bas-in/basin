@@ -430,8 +430,11 @@ mod tests {
         let dummy = DataFileRef {
             path: "a.parquet".to_string(),
             row_count: 1,
-            byte_size: 100,
+            size_bytes: 100,
             column_stats: Default::default(),
+            bloom_filters: Default::default(),
+            hll_sketches: Default::default(),
+            tdigest_sketches: Default::default(),
         };
         let meta_orders = cat
             .append_data_files(&project, &t_orders, SnapshotId::GENESIS, vec![dummy.clone()])
@@ -461,8 +464,11 @@ mod tests {
         let dummy2 = DataFileRef {
             path: "b.parquet".to_string(),
             row_count: 1,
-            byte_size: 100,
+            size_bytes: 100,
             column_stats: Default::default(),
+            bloom_filters: Default::default(),
+            hll_sketches: Default::default(),
+            tdigest_sketches: Default::default(),
         };
         cat.append_data_files(
             &project,
@@ -505,8 +511,11 @@ mod tests {
         let dummy = DataFileRef {
             path: "ev1.parquet".to_string(),
             row_count: 10,
-            byte_size: 200,
+            size_bytes: 200,
             column_stats: Default::default(),
+            bloom_filters: Default::default(),
+            hll_sketches: Default::default(),
+            tdigest_sketches: Default::default(),
         };
         let snap1 = cat
             .append_data_files(&project, &table, SnapshotId::GENESIS, vec![dummy])
@@ -526,8 +535,11 @@ mod tests {
         let dummy2 = DataFileRef {
             path: "ev2.parquet".to_string(),
             row_count: 5,
-            byte_size: 100,
+            size_bytes: 100,
             column_stats: Default::default(),
+            bloom_filters: Default::default(),
+            hll_sketches: Default::default(),
+            tdigest_sketches: Default::default(),
         };
         let _snap2 = cat
             .append_data_files(&project, &table, snap1.current_snapshot, vec![dummy2])

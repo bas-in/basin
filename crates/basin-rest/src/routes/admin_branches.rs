@@ -151,14 +151,21 @@ pub(crate) async fn fork_project(
             .map_err(|e| {
                 // Surface a clear conflict error for the `dst table already
                 // exists` case so the cloud can act on it rather than seeing
-                // a generic 500.
+                // a generic 500.  Internal identifiers (project / table names,
+                // storage errors) are logged server-side only and never sent
+                // to the caller.
                 let msg = e.to_string();
                 if msg.contains("already exists") {
+                    tracing::warn!(
+                        src_project = %src_project,
+                        dst_project = %dst_project,
+                        table = %table,
+                        error = %msg,
+                        "fork conflict: destination already contains a table",
+                    );
                     ApiError::new(
                         crate::errors::ErrorCode::InvalidRequest,
-                        format!(
-                            "destination project {dst_project} already contains table {table}: {msg}"
-                        ),
+                        "fork conflict: destination already contains a table",
                     )
                 } else {
                     ApiError::from(e)
@@ -211,8 +218,11 @@ mod tests {
         let f = DataFileRef {
             path: format!("{name}_data.parquet"),
             row_count: 5,
-            byte_size: 512,
+            size_bytes: 512,
             column_stats: Default::default(),
+            bloom_filters: Default::default(),
+            hll_sketches: Default::default(),
+            tdigest_sketches: Default::default(),
         };
         cat.append_data_files(project, &table, SnapshotId::GENESIS, vec![f])
             .await
@@ -283,8 +293,11 @@ mod tests {
         let extra = DataFileRef {
             path: "alpha_v2.parquet".to_string(),
             row_count: 1,
-            byte_size: 100,
+            size_bytes: 100,
             column_stats: Default::default(),
+            bloom_filters: Default::default(),
+            hll_sketches: Default::default(),
+            tdigest_sketches: Default::default(),
         };
         let src_meta = cat.load_table(&src, &t_a).await.unwrap();
         cat.append_data_files(&src, &t_a, src_meta.current_snapshot, vec![extra])
