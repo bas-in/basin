@@ -418,13 +418,12 @@ async fn text_encoding_roundtrip() {
 // length(bytea) — byte-length overload
 // ---------------------------------------------------------------------------
 
-/// REAL BUG (Phase 6.X): `length(bytea)` returns character count instead of
-/// byte count for multi-byte UTF-8 sequences.  `convert_to('€', 'UTF8')`
-/// produces 3 bytes for U+20AC but `length(...)` returns 1 (character count).
-/// Fix required in basin-engine length(bytea) overload (src-only).
+/// `length(bytea)` returns BYTE count (PG semantics), not character count:
+/// `convert_to('€', 'UTF8')` is 3 bytes for U+20AC and `length(...)` returns 3.
+/// The `LengthPgUdf` overload dispatches on input type (Binary → byte length,
+/// Utf8 → char length); regression guard for that dispatch.
 #[tokio::test]
 #[serial_test::serial]
-#[ignore = "real engine bug: length(bytea) returns char count not byte count for multi-byte UTF-8 (Phase 6.X)"]
 async fn length_bytea() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
