@@ -1,9 +1,9 @@
 //! Phase 5.30.A — citext (case-insensitive text) test harness.
 //!
-//! **Task:** TASK.md Phase 5.30.A — citext type harness, RED.
-//! **Test-first convention:** this file lands BEFORE any citext type
-//! implementation. Every test is `#[ignore]`d until the implementation tasks
-//! 5.30.B–E close the corresponding slices.
+//! **Task:** TASK.md Phase 5.30.A — citext type harness.
+//! **Status:** GREEN. The 5.30.B–E implementation slices have all shipped, so
+//! every test below now runs (no `#[ignore]`) and passes under a plain
+//! `cargo test --test citext_harness`.
 //!
 //! ## Named slices
 //!
@@ -14,12 +14,8 @@
 //! | `citext_unique_constraint_case_insensitive`    | unique-constraint case-insensitivity    | 5.30.D    |
 //! | `citext_orm_compat`                            | ORM compat                              | 5.30.E    |
 //!
-//! ## How to flip a slice green
-//!
-//! Once the corresponding 5.30.B–E task lands, drop the `#[ignore]` on the
-//! relevant test (or replace it with a targeted `#[ignore = "gated on #NNN"]`
-//! if only part of the slice is resolved), and verify that
-//! `cargo test --test citext_harness` passes without `--ignored`.
+//! All slices are closed (5.30.B–E shipped); the harness is part of the
+//! default `cargo test` run.
 
 #![allow(clippy::print_stdout)]
 
