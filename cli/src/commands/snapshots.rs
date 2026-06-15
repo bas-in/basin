@@ -18,7 +18,7 @@ use serde_json::json;
 
 use crate::config::load_working_project;
 use crate::error::{msg, CliResult};
-use crate::global::{require_client, GlobalFlags};
+use crate::global::{engine_admin_path, require_client, require_engine_client, GlobalFlags};
 use crate::output::{print_json, read_line, Table};
 use crate::printerr;
 
@@ -88,6 +88,11 @@ pub fn cmd_snapshots(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                     "list    --project <ref>                             List snapshots, newest first.",
                     "create  --project <ref> [--name <description>]      Create a manual snapshot.",
                     "restore <id> --project <ref> [--yes]                Restore (confirm-by-ref).",
+                    "",
+                    "Self-hosted engine mode (BASIN_MODE=engine or --engine):",
+                    "  create  --project <ulid>                          Capture engine snapshot head.",
+                    "  restore <engine_snapshot_id> --project <ulid>     Restore to a named engine snapshot.",
+                    "  Requires BASIN_ADMIN_TOKEN or --admin-token.",
                 ],
             );
             Ok(())
@@ -163,7 +168,12 @@ fn create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             "Create a manual snapshot for a project.",
             &[
                 "--project <ref>           Project ref (required).",
-                "--name <description>      Free-form description.",
+                "--name <description>      Free-form description (cloud mode only).",
+                "",
+                "Self-hosted engine mode (BASIN_MODE=engine or --engine):",
+                "  Calls POST /admin/v1/projects/:id/snapshot on the engine directly.",
+                "  Requires BASIN_ADMIN_TOKEN or --admin-token with is_admin:true JWT.",
+                "  --project must be the engine project ULID, not a cloud ref.",
             ],
         );
         return Ok(());
@@ -175,6 +185,38 @@ fn create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     )?;
     let name = m.get_one::<String>("name").cloned().unwrap_or_default();
 
+    if g.engine_mode {
+        // Engine admin path: POST /admin/v1/projects/:id/snapshot (no body).
+        // The engine ignores any body; the snapshot is the current head of
+        // every table in the project.
+        let c = require_engine_client(g)?;
+        let resp: serde_json::Value = c.do_json(
+            Method::POST,
+            &engine_admin_path(&project, "snapshot"),
+            None,
+        )?;
+        if g.json {
+            // Engine shape: { engine_snapshot_id, size_bytes, created_at }
+            return print_json(&mut std::io::stdout(), &resp);
+        }
+        println!("Snapshot created.");
+        if let Some(id) = resp.get("engine_snapshot_id").and_then(|v| v.as_str()) {
+            if !id.is_empty() {
+                println!("  engine_snapshot_id: {id}");
+            }
+        }
+        if let Some(ts) = resp.get("created_at").and_then(|v| v.as_str()) {
+            if !ts.is_empty() {
+                println!("  created_at:         {ts}");
+            }
+        }
+        if let Some(sz) = resp.get("size_bytes").and_then(|v| v.as_u64()) {
+            println!("  size_bytes:         {sz}");
+        }
+        return Ok(());
+    }
+
+    // Cloud path: POST /v1/projects/:ref/backups/snapshots
     let c = require_client(g)?;
     let mut body = json!({});
     if !name.is_empty() {
@@ -226,7 +268,9 @@ fn restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             "Restore a project from a snapshot (destructive — confirm by retyping project ref).",
             &[
                 "<id>               Snapshot ID to restore.",
+                "                   In engine mode: the engine_snapshot_id returned by `snapshots create`.",
                 "--project <ref>    Project ref (required).",
+                "                   In engine mode: the engine project ULID.",
                 "--yes              Skip the confirm-by-ref prompt.",
             ],
         );
@@ -242,7 +286,7 @@ fn restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             .map(|s| s.as_str())
             .unwrap_or(""),
     )?;
-    let c = require_client(g)?;
+
     if !m.get_flag("yes") {
         eprint!(
             "Restore overwrites the project's data plane. Re-type the project ref {:?} to confirm:\n> ",
@@ -253,6 +297,28 @@ fn restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             return Err(msg("ref mismatch — aborted"));
         }
     }
+
+    if g.engine_mode {
+        // Engine admin path: POST /admin/v1/projects/:id/restore
+        // Body: { engine_snapshot_id: "<opaque string>" }
+        let c = require_engine_client(g)?;
+        let body = json!({ "engine_snapshot_id": id });
+        let out: serde_json::Value = c.do_json(
+            Method::POST,
+            &engine_admin_path(&project, "restore"),
+            Some(body),
+        )?;
+        if g.json {
+            // Engine shape: { ok: bool, restored_tables: N }
+            return print_json(&mut std::io::stdout(), &out);
+        }
+        let restored = out.get("restored_tables").and_then(|v| v.as_u64()).unwrap_or(0);
+        println!("Restore from snapshot {id} complete ({restored} table(s) restored).");
+        return Ok(());
+    }
+
+    // Cloud path: POST /v1/projects/:ref/backups/restore
+    let c = require_client(g)?;
     let body = json!({
         "source_kind": "snapshot",
         "snapshot_id": id,

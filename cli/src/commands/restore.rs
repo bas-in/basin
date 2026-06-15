@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::{msg, CliResult};
-use crate::global::{require_client, GlobalFlags};
+use crate::global::{engine_admin_path, require_client, require_engine_client, GlobalFlags};
 use crate::output::{print_json, read_line};
 
 use super::help::help_for_command;
@@ -190,13 +190,20 @@ pub fn cmd_restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if m.get_flag("help") {
         help_for_command(
             "restore",
-            "Restore a project — either from a cloud backup/PITR or by replaying a dump file.",
+            "Restore a project — from a cloud backup/PITR, a self-hosted engine snapshot, or by replaying a dump file.",
             &[
-                "Cloud backup restore (calls POST /v1/projects/:ref/backups/restore):",
+                "Cloud backup restore (default; calls POST /v1/projects/:ref/backups/restore):",
                 "  --snapshot=<id>       Restore from a specific backup snapshot (source_kind=snapshot).",
                 "  --as-of=<rfc3339>     Point-in-time restore to a timestamp (source_kind=timestamp).",
                 "  --yes                 Skip the confirmation prompt.",
                 "  --project=<ref>       Project ref (required, or auto-detected from ./basin/config.toml).",
+                "",
+                "Self-hosted engine mode (BASIN_MODE=engine or global --engine flag):",
+                "  --snapshot=<engine_snapshot_id>  Restore from engine_snapshot_id returned by `basin snapshots create`.",
+                "  --as-of=<rfc3339>                Point-in-time restore on the engine.",
+                "  --project=<ulid>                 Engine project ULID (not a cloud ref).",
+                "  Requires BASIN_ADMIN_TOKEN or --admin-token with is_admin:true JWT.",
+                "  Calls POST /admin/v1/projects/:id/restore on the engine.",
                 "",
                 "Dump-file replay (inverse of `basin dump`):",
                 "  dump.sql              Path to the dump file produced by `basin dump`.",
@@ -204,8 +211,8 @@ pub fn cmd_restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                 "  --project=<ref>       Project ref (required, or auto-detected from ./basin/config.toml).",
                 "",
                 "Mode is selected automatically:",
-                "  --snapshot / --as-of present → cloud restore.",
-                "  File path / stdin present    → dump-file replay.",
+                "  --snapshot / --as-of present → engine restore (engine mode) or cloud restore (cloud mode).",
+                "  File path / stdin present    → dump-file replay (cloud mode only).",
             ],
         );
         return Ok(());
@@ -232,8 +239,11 @@ pub fn cmd_restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let as_of = m.get_one::<String>("as-of").cloned().unwrap_or_default();
     let yes = m.get_flag("yes");
 
-    // ── Mode: cloud backup restore ────────────────────────────────────────────
+    // ── Mode: backup restore (engine or cloud) ────────────────────────────────
     if !snapshot.is_empty() || !as_of.is_empty() {
+        if g.engine_mode {
+            return engine_restore(g, &project_ref, &snapshot, &as_of, yes);
+        }
         return cloud_restore(g, &project_ref, &snapshot, &as_of, yes);
     }
 
@@ -288,6 +298,81 @@ pub fn cmd_restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     } else if !g.quiet {
         println!("restore: {total} statement(s) applied, 0 errors");
     }
+    Ok(())
+}
+
+// ── engine_restore ────────────────────────────────────────────────────────────
+
+/// engine_restore calls POST /admin/v1/projects/:id/restore on the self-hosted
+/// engine directly.
+///
+/// - `snapshot` non-empty → body `{ engine_snapshot_id: "…" }` (named-snapshot restore)
+/// - `as_of` non-empty    → body `{ as_of: "…" }` (PITR; RFC-3339 timestamp)
+///
+/// Returns `{ ok: true, restored_tables: N }` on success.
+fn engine_restore(
+    g: &GlobalFlags,
+    project_ref: &str,
+    snapshot: &str,
+    as_of: &str,
+    yes: bool,
+) -> CliResult<()> {
+    if !snapshot.is_empty() && !as_of.is_empty() {
+        return Err(msg(
+            "restore: --snapshot and --as-of are mutually exclusive; use one or the other",
+        ));
+    }
+
+    let desc = if !snapshot.is_empty() {
+        format!("engine snapshot {:?}", snapshot)
+    } else {
+        format!("timestamp {:?}", as_of)
+    };
+
+    if !yes {
+        if g.json {
+            return Err(msg(format!(
+                "confirmation required: pass --yes to restore project {:?} from {} non-interactively under --json",
+                project_ref, desc
+            )));
+        }
+        eprint!(
+            "Restore project {:?} from {}? This will overwrite the project's data. [y/N] ",
+            project_ref, desc
+        );
+        let line = read_line()?;
+        if !line.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let c = require_engine_client(g)?;
+
+    let body = if !snapshot.is_empty() {
+        json!({ "engine_snapshot_id": snapshot })
+    } else {
+        json!({ "as_of": as_of })
+    };
+
+    let resp: serde_json::Value = c.do_json(
+        Method::POST,
+        &engine_admin_path(project_ref, "restore"),
+        Some(body),
+    )?;
+
+    if g.json {
+        // Engine shape: { ok: bool, restored_tables: N }
+        return print_json(&mut std::io::stdout(), &resp);
+    }
+
+    let restored = resp
+        .get("restored_tables")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    println!(
+        "Restore from {desc} complete ({restored} table(s) restored)."
+    );
     Ok(())
 }
 

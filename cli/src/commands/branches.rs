@@ -27,7 +27,7 @@ use serde_json::json;
 use crate::client::query_string;
 use crate::config::load_working_project;
 use crate::error::{as_api_error, msg, silent, CliResult};
-use crate::global::{require_client, GlobalFlags};
+use crate::global::{engine_admin_path, require_client, require_engine_client, GlobalFlags};
 use crate::output::{print_json, read_line, Table};
 use crate::printerr;
 use crate::printinfo;
@@ -218,6 +218,7 @@ fn branches_create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .arg(Arg::new("project").long("project"))
         .arg(Arg::new("from").long("from"))
         .arg(Arg::new("kind").long("kind").default_value("branch"))
+        .arg(Arg::new("dst-project").long("dst-project"))
         .arg(Arg::new("name").num_args(1..).trailing_var_arg(true))
         .arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
     let m = parse_or_silent(cmd, args)?;
@@ -226,10 +227,18 @@ fn branches_create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             "branches create",
             "Create a new branch for a project.",
             &[
-                "<name>                    Branch display name (required).",
+                "<name>                    Branch display name (required; ignored in engine mode).",
                 "--project=<ref>           Project ref (required if not linked).",
-                "--from=<branch_ref>       Branch ref to create from.",
-                "--kind=<branch|preview>   Branch kind (default: branch).",
+                "                          In engine mode: the source project ULID.",
+                "--from=<branch_ref>       Branch ref to create from (cloud mode only).",
+                "--kind=<branch|preview>   Branch kind (default: branch; cloud mode only).",
+                "",
+                "Self-hosted engine mode (BASIN_MODE=engine or global --engine flag):",
+                "  Calls POST /admin/v1/projects/:id/fork {dst_project_id} on the engine.",
+                "  --dst-project=<ulid>    Destination project ULID (required in engine mode).",
+                "  Requires BASIN_ADMIN_TOKEN or --admin-token with is_admin:true JWT.",
+                "  Note: the fork route is in-progress in the engine; verify it is wired",
+                "  in the engine's admin router before using.",
             ],
         );
         return Ok(());
@@ -238,13 +247,54 @@ fn branches_create(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         .get_many::<String>("name")
         .map(|v| v.cloned().collect::<Vec<_>>().join(" "))
         .unwrap_or_default();
+
+    let project = m.get_one::<String>("project").cloned().unwrap_or_default();
+    let r#ref = resolve_project_ref(&project)?;
+
+    if g.engine_mode {
+        // Engine admin path: POST /admin/v1/projects/:id/fork
+        // Body: { dst_project_id: "<ulid>" }
+        // The fork route copies all tables from src to dst at their current
+        // snapshot head (a point-in-time data copy / branch).
+        let dst_project = m
+            .get_one::<String>("dst-project")
+            .cloned()
+            .unwrap_or_default();
+        if dst_project.is_empty() {
+            return Err(msg(
+                "engine mode: --dst-project=<ulid> is required for `branches create` (fork).\n\
+                 The destination project must already exist on the engine.",
+            ));
+        }
+        let c = require_engine_client(g)?;
+        let body = json!({ "dst_project_id": dst_project });
+        let resp: serde_json::Value = c.do_json_timeout(
+            Method::POST,
+            &engine_admin_path(&r#ref, "fork"),
+            Some(body),
+            Duration::from_secs(120),
+        )?;
+        if g.json {
+            // Engine shape: { ok: bool, forked_tables: N }
+            return print_json(&mut std::io::stdout(), &resp);
+        }
+        let forked = resp
+            .get("forked_tables")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        println!(
+            "Fork from project {:?} to {:?} complete ({forked} table(s) copied).",
+            r#ref, dst_project
+        );
+        return Ok(());
+    }
+
+    // Cloud path: POST /v1/projects/:ref/branches
     if name.is_empty() {
         return Err(msg(
             "usage: basin branches create <name> [--from=<branch_ref>] [--kind=<branch|preview>] [--project=<ref>]",
         ));
     }
-    let project = m.get_one::<String>("project").cloned().unwrap_or_default();
-    let r#ref = resolve_project_ref(&project)?;
     let from_ref = m.get_one::<String>("from").cloned().unwrap_or_default();
     let kind = m
         .get_one::<String>("kind")
