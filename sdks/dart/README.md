@@ -1,24 +1,35 @@
 # basin_sdk
 
-Dart / Flutter client for [Basin](../../README.md)'s HTTP surfaces: REST data
-API, auth, functions, object storage, and realtime WebSocket.
+Official Dart / Flutter client for [Basin](https://basin.run) — the
+open-source Postgres-compatible data platform.
 
-Works on **Flutter** (iOS, Android, Web, desktop) and pure **Dart** (CLI,
-server) with a single package — `package:http` and `package:web_socket_channel`
-abstract the platform-level differences.
+Speaks directly to a deployed
+[`basin-engine`](https://github.com/bas-in/basin) (Apache-2.0 Rust core):
+auth, PostgREST-style table queries, object storage, SQL/Wasm functions, and
+realtime WebSocket subscriptions. Works on **Flutter** (iOS, Android, Web,
+desktop) and pure **Dart** (CLI, server) from a single package —
+`package:http` and `package:web_socket_channel` handle the platform
+differences.
+
+basin_sdk is part of the Basin SDK family alongside
+[basin-js](https://github.com/bas-in/basin-js) (TypeScript) and
+[basin-py](https://github.com/bas-in/basin-py) (Python). All SDKs bind the
+same engine routes (pgwire + REST) so behaviour is consistent across
+languages.
 
 ## Install
 
-```yaml
-# pubspec.yaml
-dependencies:
-  basin_sdk: ^0.1.0
+```sh
+dart pub add basin_sdk
+# Flutter:
+flutter pub add basin_sdk
 ```
 
-```sh
-dart pub get
-# or for Flutter:
-flutter pub add basin_sdk
+Or add manually to `pubspec.yaml`:
+
+```yaml
+dependencies:
+  basin_sdk: ^0.1.0
 ```
 
 ## Quickstart
@@ -29,16 +40,16 @@ import 'package:basin_sdk/basin_sdk.dart';
 void main() async {
   final basin = BasinClient.create(
     url: 'https://your-project.basin.run',
-    key: 'your-api-key',
-    projectId: '01J...',   // optional when key is a JWT with project_id claim
+    key: 'your-api-key',         // JWT or raw API key
+    projectId: '01J...',         // optional when key is a JWT with project_id
   );
 
   // Health check
   print(await basin.health()); // 'ok'
 
-  // Query builder
+  // Query — GET /rest/v1/orders
   final result = await basin
-      .table('orders')
+      .from('orders')
       .select('id,total,status')
       .eq('status', 'paid')
       .gte('total', 100)
@@ -50,24 +61,16 @@ void main() async {
     print(row);
   }
 
-  // Keyset pagination
-  final page = await basin.table('orders').limit(100).page();
-  final next = await basin.table('orders').cursor(page.nextCursor!).limit(100).page();
-
-  // Writes
-  await basin.table('orders').insert({'total': 12, 'status': 'new'});
-  await basin.table('orders').eq('id', 7).update({'status': 'paid'});
-  await basin.table('orders').eq('id', 7).delete(); // may throw E_ENGINE_UNSUPPORTED
-
-  // RPC / functions
-  final total = await basin.rpc('add', {'a': 40, 'b': 2});
-  final res = await basin.functions.invoke('resize', body: {'width': 100});
-
   basin.close();
 }
 ```
 
-## Auth (email / password, per-project)
+`BasinClient.from(table)` and `BasinClient.table(table)` are aliases; the
+`from` form matches the JS/Python SDK style.
+
+## Auth
+
+### Sign up / sign in
 
 ```dart
 final basin = BasinClient.create(
@@ -75,52 +78,199 @@ final basin = BasinClient.create(
   projectId: '01J...',
 );
 
-// Sign up
 await basin.auth.signUp(email: 'alice@example.com', password: 'secret');
 
-// Sign in — session stored; access token auto-refreshes 10 s before expiry
+// signIn stores the session; access token is auto-refreshed 10 s before expiry.
 final session = await basin.auth.signIn(
   email: 'alice@example.com',
   password: 'secret',
 );
 
-// API keys (JWT-gated)
-final key = await basin.auth.createApiKey('ci-pipeline');
-print(key.secret);   // shown exactly once
-await basin.auth.deleteApiKey(key.id);
-
-// Magic links
-await basin.auth.requestMagicLink('alice@example.com');
-final magicSession = await basin.auth.consumeMagicLink('token-from-email');
-
-// Sign out — revokes the refresh token server-side, clears local session
+// Sign out — revokes refresh token server-side, clears local session.
 await basin.auth.signOut();
 ```
 
-### Token persistence (Flutter)
+### Password reset
 
-`BasinClient` stores the session in memory only. For mobile apps that must
-survive process restarts, persist the session yourself:
+```dart
+await basin.auth.requestPasswordReset(email: 'alice@example.com');
+// User receives an email; extract the token and call:
+await basin.auth.resetPassword(token: '<token>', newPassword: 'newpass');
+```
+
+### Email verification
+
+```dart
+await basin.auth.verifyEmail(token: '<token-from-email>');
+```
+
+### Magic link
+
+```dart
+await basin.auth.requestMagicLink('alice@example.com'); // 204 always
+final session = await basin.auth.consumeMagicLink('<token-from-email>');
+```
+
+### OAuth
+
+```dart
+final result = await basin.auth.getOAuthAuthorizeUrl(
+  'google',
+  redirectTo: 'https://myapp.com/auth/callback',
+);
+// Redirect the user's browser to result.redirectUrl.
+// After the callback, restore the session from the returned tokens:
+basin.auth.setSession(Session(
+  accessToken: '...',
+  refreshToken: '...',
+  accessExpiresAt: '...',
+  refreshExpiresAt: '...',
+));
+```
+
+Supported preset providers: google, github, apple, bitbucket, discord,
+figma, gitlab, linkedin, microsoft (azure_ad), notion, slack, spotify,
+twitch, twitter_x.
+
+### API keys
+
+```dart
+// Issue a named key (JWT-gated; secret shown exactly once).
+final issued = await basin.auth.createApiKey('ci-pipeline');
+print(issued.secret);
+
+final keys = await basin.auth.listApiKeys();
+await basin.auth.deleteApiKey(issued.id);
+```
+
+### MFA — TOTP
+
+```dart
+// 1. Enroll
+final enroll = await basin.auth.enrollFactor('totp',
+    friendlyName: 'My Authenticator') as TotpEnrollResult;
+// Show enroll.otpauthUri as a QR code; the user scans with an authenticator app.
+
+// 2. Confirm enrollment
+final verify = await basin.auth.verifyFactor(
+  enroll.factorId,
+  code: '123456',
+);
+if (verify.recoveryCodes != null) print(verify.recoveryCodes); // save these
+
+// 3. Step-up challenge → aal2 session
+final challenge = await basin.auth.challengeFactor(enroll.factorId)
+    as TotpChallengeResult;
+final aal2Session = await basin.auth.verifyChallenge(
+  enroll.factorId,
+  challenge.challengeId,
+  code: '654321',
+);
+
+// 4. Unenroll (requires aal2 token)
+await basin.auth.unenrollFactor(enroll.factorId);
+```
+
+### MFA — WebAuthn
+
+```dart
+final enroll = await basin.auth.enrollFactor('webauthn',
+    friendlyName: 'YubiKey') as WebAuthnEnrollResult;
+// Pass enroll.creationOptionsJson to navigator.credentials.create() in JS.
+await basin.auth.verifyFactor(
+  enroll.factorId,
+  attestation: '<json from navigator.credentials.create()>',
+  challengeId: enroll.challengeId,
+);
+```
+
+### Session persistence (Flutter)
+
+`BasinClient` keeps the session in memory only. For mobile apps that need to
+survive process restarts, persist it yourself:
 
 ```dart
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
 
-// Save after signIn / consumeMagicLink / verifyChallenge:
-Future<void> saveSession(Session session) async {
+Future<void> saveSession(Session s) async {
   final prefs = await SharedPreferences.getInstance();
-  await prefs.setString('basin_session', jsonEncode(session.toJson()));
+  await prefs.setString('basin_session', jsonEncode(s.toJson()));
 }
 
-// Restore on app start:
 Future<void> restoreSession(BasinClient client) async {
   final prefs = await SharedPreferences.getInstance();
   final raw = prefs.getString('basin_session');
   if (raw != null) {
-    client.auth.setSession(Session.fromJson(jsonDecode(raw) as Map<String, dynamic>));
+    client.auth.setSession(
+      Session.fromJson(jsonDecode(raw) as Map<String, dynamic>));
   }
 }
 ```
+
+## Query builder
+
+```dart
+// Filter, project, order, limit
+final result = await basin
+    .from('products')
+    .select('id,name,price')
+    .eq('active', true)
+    .gte('price', 10)
+    .lt('price', 500)
+    .order('price')           // ascending by default
+    .limit(20)
+    .get();
+
+// .rows() is shorthand for .get() and discarding the cursor.
+final rows = await basin.from('products').rows();
+
+// in-list filter
+await basin.from('orders').inFilter('status', ['paid', 'shipped']).rows();
+
+// NULL check
+await basin.from('events').is_('deleted_at', 'null').rows();
+
+// Insert / update / delete
+await basin.from('orders').insert({'total': 42, 'status': 'new'});
+await basin.from('orders').eq('id', 7).update({'status': 'paid'});
+await basin.from('orders').eq('id', 7).delete();
+```
+
+### Keyset cursor pagination
+
+The engine returns `{rows, next_cursor}` for requests that include `limit`.
+Walk pages with `.page()` and `.cursor()`:
+
+```dart
+var page = await basin.from('events').select('*').limit(100).page();
+while (page.rows.isNotEmpty) {
+  process(page.rows);
+  if (page.nextCursor == null) break;
+  page = await basin
+      .from('events')
+      .select('*')
+      .limit(100)
+      .cursor(page.nextCursor!)
+      .page();
+}
+```
+
+### NDJSON streaming
+
+For large result sets the engine supports `?stream=true`, returning rows
+as newline-delimited JSON. `streamCollect()` reads the stream lazily and
+returns a `QueryResult` with all rows and the final cursor:
+
+```dart
+final result = await basin.from('events').select('*').streamCollect();
+for (final row in result.rows) {
+  process(row);
+}
+```
+
+The engine auto-promotes responses above ~1 MiB or 10 000 rows to NDJSON
+even without the flag; `.get()` handles both response shapes transparently.
 
 ## Storage
 
@@ -128,61 +278,86 @@ Future<void> restoreSession(BasinClient client) async {
 // Create a bucket
 await basin.storage.createBucket('avatars', public: true);
 
-// Upload / download
+// Upload bytes
 final bucket = basin.storage.fromBucket('avatars');
 await bucket.upload(
   'users/alice.png',
   await File('alice.png').readAsBytes(),
   contentType: 'image/png',
 );
+
+// Download
 final download = await bucket.download('users/alice.png');
 print(download.contentType); // 'image/png'
 
 // List objects
 final objects = await bucket.list(prefix: 'users/');
 
-// Signed URL (time-boxed download, no JWT needed by caller)
+// Signed URL (time-boxed, no auth needed by the recipient)
 final signed = await bucket.createSignedUrl('users/alice.png', expiresIn: 3600);
-print(signed.absoluteUrl); // https://...
+print(signed.absoluteUrl);
 
-// Public URL (bucket must have public: true)
+// Public URL (bucket must be public)
 final url = bucket.getPublicUrl('users/alice.png');
+
+// Remove
+await bucket.remove('users/alice.png');
+
+// Bulk remove by prefix
+await bucket.removeByPrefixes(['users/']);
 ```
 
-## Realtime (WebSocket)
+## Functions
 
-Receive INSERT / UPDATE / DELETE events as they happen via
-`GET /realtime/v1/ws/:project`.
+### HTTP-handler functions (`/fn/v1/:name`)
+
+```dart
+// POST by default; any method supported
+final result = await basin.functions.invoke(
+  'resize',
+  body: {'width': 100, 'height': 100},
+);
+print(result.status); // function's own HTTP status
+print(result.data);   // decoded response body
+```
+
+### SQL / Wasm UDFs (`/rest/v1/rpc/:fn_name`)
+
+```dart
+// Scalar UDF: add(a int, b int) RETURNS int
+final total = await basin.rpc('add', {'a': 40, 'b': 2});
+// total == 42
+
+// RETURNS TABLE UDF
+final rows = await basin.rpc('active_users', {'min_logins': 5}) as List;
+```
+
+The active session JWT is forwarded automatically on both paths.
+
+## Realtime
+
+All realtime goes through `GET /realtime/v1/ws/:project` (WebSocket).
+`RealtimeClient` reconnects automatically with exponential backoff (0.5 s,
+1 s, 2 s … capped at 30 s) and re-issues active subscriptions on reconnect.
 
 ### Stream-based (recommended)
 
 ```dart
-import 'package:basin_sdk/basin_sdk.dart';
-
-Future<void> main() async {
-  final basin = BasinClient.create(
-    url: 'https://your-project.basin.run',
-    key: 'your-api-key',
-    projectId: '01J...',
-  );
-
-  await for (final frame in basin.realtime.listen('orders')) {
-    if (frame is RealtimeEvent) {
-      print('${frame.op} ${frame.table} seq=${frame.seq}');
-      print('after: ${frame.after}');
-    } else if (frame is RealtimeGapFrame) {
-      print('gap — cold re-sync needed (oldestInRing: ${frame.oldestInRing})');
-    } else if (frame is RealtimeErrorFrame) {
-      print('error: ${frame.code}');
-    }
+await for (final frame in basin.realtime.listen('orders')) {
+  if (frame is RealtimeEvent) {
+    print('${frame.op.name} on ${frame.table}, seq=${frame.seq}');
+    print('row: ${frame.after}');
+  } else if (frame is RealtimeGapFrame) {
+    print('gap detected — consider a cold re-sync');
+  } else if (frame is RealtimeErrorFrame) {
+    print('server error: ${frame.code}');
   }
 }
 ```
 
-### With filter
+### Server-side change filter
 
 ```dart
-// Only events where NEW.status = 'paid'
 await for (final frame in basin.realtime.listen(
   'orders',
   filter: "NEW.status = 'paid'",
@@ -191,14 +366,14 @@ await for (final frame in basin.realtime.listen(
 }
 ```
 
-### Reconnect resume
+### Reconnect with replay
 
 ```dart
 int lastSeq = 0;
 
 await for (final frame in basin.realtime.listen(
   'orders',
-  lastEventId: lastSeq,  // server replays from this seq
+  lastEventId: lastSeq,   // server replays events missed since this seq
 )) {
   if (frame is RealtimeEvent) {
     lastSeq = frame.seq;
@@ -216,233 +391,163 @@ final handle = await basin.realtime.subscribe(
     if (frame is RealtimeEvent) print(frame.op);
   },
 );
-// Later:
+
+// Stop listening:
 await handle.unsubscribe();
 ```
 
-### Presence (Phoenix Channels shape)
+### Presence
 
 ```dart
-// Track presence
+// Track this client in a named channel
 await basin.realtime.presenceTrack(
-  'room:1',
+  'room:lobby',
   'user-alice',
-  metadata: {'name': 'Alice'},
+  metadata: {'name': 'Alice', 'avatar': 'https://...'},
 );
 
-// Listen for presence frames
-await for (final frame in basin.realtime.listenPresence('room:1')) {
+// Listen for presence state and diffs
+await for (final frame in basin.realtime.listenPresence('room:lobby')) {
   if (frame is PresenceStateFrame) {
-    print('snapshot: ${frame.presences.map((p) => p.clientId)}');
+    print('online: ${frame.presences.map((p) => p.clientId)}');
   } else if (frame is PresenceDiffFrame) {
-    print('joins: ${frame.joins}, leaves: ${frame.leaves}');
+    print('joined: ${frame.joins}, left: ${frame.leaves}');
   }
 }
 
-// Heartbeat (refresh TTL)
-await basin.realtime.presenceHeartbeat('room:1', 'user-alice');
+// Refresh TTL (call every ~30 s)
+await basin.realtime.presenceHeartbeat('room:lobby', 'user-alice');
 
-// Untrack
-await basin.realtime.presenceUntrack('room:1', 'user-alice');
+// Leave
+await basin.realtime.presenceUntrack('room:lobby', 'user-alice');
 ```
-
-### Reconnect behaviour
-
-On unexpected disconnect, `RealtimeClient` reconnects with exponential
-backoff (0.5 s, 1 s, 2 s … capped at 30 s) and automatically re-issues all
-active subscriptions. Pass `lastEventId` to `listen()` to request server-side
-replay of events missed during the gap.
 
 ### Flutter Web vs. native
 
-`package:web_socket_channel` is cross-platform:
-
-- **Flutter Web** — uses `dart:html` WebSocket under the hood.
-- **Flutter native / Dart CLI** — uses `dart:io` WebSocket.
-
-Both support the `Sec-WebSocket-Protocol: basin-v1, <token>` subprotocol
-form used by this SDK. This is the correct choice for browser compatibility
-(browsers cannot set arbitrary HTTP headers on WebSocket upgrade requests).
-
-## OAuth
-
-```dart
-// Get the authorize URL — redirect the user's browser here.
-final result = await basin.auth.getOAuthAuthorizeUrl(
-  'google',
-  redirectTo: 'https://myapp.com/auth/callback',
-);
-// Redirect to result.redirectUrl in your app's browser/webview.
-
-// After the OAuth flow completes, restore the session from the tokens
-// your redirect_to URL receives:
-basin.auth.setSession(Session(
-  accessToken: '...',
-  refreshToken: '...',
-  accessExpiresAt: '...',
-  refreshExpiresAt: '...',
-));
-```
-
-Supported preset providers: google, github, apple, bitbucket, discord,
-figma, gitlab, linkedin, microsoft (azure_ad), notion, slack, spotify,
-twitch, twitter_x.
-
-## MFA (TOTP and WebAuthn)
-
-### TOTP
-
-```dart
-// 1. Enroll
-final enroll = await basin.auth.enrollFactor('totp',
-    friendlyName: 'My Authenticator') as TotpEnrollResult;
-// Display enroll.otpauthUri as QR code; user scans with authenticator app.
-
-// 2. Verify enrollment
-final verify = await basin.auth.verifyFactor(
-  enroll.factorId,
-  code: '123456',  // from the authenticator app
-);
-if (verify.recoveryCodes != null) {
-  // Save these — shown exactly once.
-  print(verify.recoveryCodes);
-}
-
-// 3. Step-up: challenge + verify → aal2 session
-final challenge = await basin.auth.challengeFactor(enroll.factorId)
-    as TotpChallengeResult;
-final aal2Session = await basin.auth.verifyChallenge(
-  enroll.factorId,
-  challenge.challengeId,
-  code: '654321',
-);
-
-// 4. Unenroll (requires aal2 token)
-await basin.auth.unenrollFactor(enroll.factorId);
-```
-
-### WebAuthn
-
-```dart
-final enroll = await basin.auth.enrollFactor('webauthn',
-    friendlyName: 'YubiKey') as WebAuthnEnrollResult;
-// Pass enroll.creationOptionsJson to navigator.credentials.create() in JS.
-await basin.auth.verifyFactor(
-  enroll.factorId,
-  attestation: '<json from navigator.credentials.create()>',
-  challengeId: enroll.challengeId,
-);
-```
+`package:web_socket_channel` is cross-platform. On Flutter Web the
+transport uses `dart:html` WebSocket; on native (iOS, Android, desktop,
+server) it uses `dart:io` WebSocket. Auth is passed via the
+`Sec-WebSocket-Protocol: basin-v1, <token>` subprotocol — the correct
+approach for browsers, which cannot set arbitrary HTTP headers on WebSocket
+upgrade requests.
 
 ## Error handling
 
-Every non-2xx response throws `BasinApiError(code, message, status)`,
-mirroring the server envelope `{"code": "E_...", "message": "..."}`.
-Match on `code`, never on `message`:
+Non-2xx responses from the engine throw `BasinApiError`. Match on `code`,
+not `message` — `message` is human-readable and not a stable contract.
 
 ```dart
 import 'package:basin_sdk/basin_sdk.dart';
 
 try {
-  await basin.table('orders').eq('id', 7).delete();
+  await basin.from('orders').eq('id', 7).delete();
 } on BasinApiError catch (e) {
   switch (e.code) {
     case 'E_ENGINE_UNSUPPORTED':
-      print('DELETE not supported on this table');
+      print('DELETE not yet supported on this table');
     case 'E_UNAUTHENTICATED':
       await basin.auth.refreshSession();
+    case 'E_RATE_LIMITED':
+      print('rate limited — retry after a moment');
     default:
       rethrow;
   }
 } on BasinNetworkError catch (e) {
-  print('Network failure: ${e.message}');
+  print('transport failure: ${e.message}');
 }
 ```
 
-Known codes: `E_UNAUTHENTICATED`, `E_FORBIDDEN`, `E_NOT_FOUND`,
+When a SQL-layer error occurs the `sqlstate` field carries the 5-character
+Postgres SQLSTATE code (e.g. `23505` for a unique-key violation):
+
+```dart
+} on BasinApiError catch (e) {
+  if (e.sqlstate == '23505') {
+    print('duplicate key — record already exists');
+  }
+}
+```
+
+Known stable codes: `E_UNAUTHENTICATED`, `E_FORBIDDEN`, `E_NOT_FOUND`,
 `E_INVALID_REQUEST`, `E_RATE_LIMITED`, `E_ENGINE_UNSUPPORTED`, `E_INTERNAL`,
 `E_EMAIL_DISABLED`, `E_REVOKED_TOKEN`.
 
 `BasinNetworkError` is thrown when the transport fails before a server
 response arrives (connection refused, timeout, etc.).
 
-## Auth model
+## Architecture
 
-Everything is `Authorization: Bearer <token>`. The server tries JWT
-verification first, then falls back to API-key lookup — so `BasinClient.create`
-accepts either. After `auth.signIn(...)`, the session's access token takes
-precedence over the static key and is **auto-refreshed** 10 seconds before
-`accessExpiresAt`. Refresh tokens rotate; reusing a rotated token surfaces as
-`E_REVOKED_TOKEN`.
+[Basin Cloud](https://basin.run) is the control plane — dashboard, billing,
+project management, and where you mint the anon-key JWT. Once you have a
+URL + key, the cloud is off the data path: every SDK call hits `basin-engine`
+directly. The engine is open source and self-hostable:
 
-`signOut()` calls `POST /auth/v1/signout` to revoke the refresh token
-server-side, then clears the local session. The local session is always
-cleared even if the server call fails.
+```sh
+cargo run -p basin-server   # default pgwire :5433, REST :5434
+```
 
-## Route bindings (method → verified server route)
+Point `BasinClient.create(url: 'http://localhost:5434', ...)` at a local
+engine and the SDK behaves identically to the managed cloud.
 
-| SDK method | Route | Source |
-|---|---|---|
-| `auth.signUp` | `POST /auth/v1/signup` | `server.rs:250` |
-| `auth.signIn` | `POST /auth/v1/signin` | `server.rs:251` |
-| `auth.refreshSession` (+auto-refresh) | `POST /auth/v1/refresh` | `server.rs:252` |
-| `auth.signOut` | `POST /auth/v1/signout` | `server.rs:253` |
-| `auth.verifyEmail` | `POST /auth/v1/verify-email` | `server.rs:254` |
-| `auth.resetPassword` | `POST /auth/v1/reset-password` | `server.rs:255` |
-| `auth.requestPasswordReset` | `POST /auth/v1/request-password-reset` | `server.rs:256` |
-| `auth.requestMagicLink` | `POST /auth/v1/magic-link` (204) | `server.rs:262` |
-| `auth.consumeMagicLink` | `POST /auth/v1/magic-link/consume` | `server.rs:263` |
-| `auth.createApiKey` / `listApiKeys` | `POST/GET /auth/v1/api-keys` | `server.rs:267-270` |
-| `auth.deleteApiKey` | `DELETE /auth/v1/api-keys/:id` | `server.rs:271` |
-| `auth.getOAuthAuthorizeUrl` | `GET /auth/v1/oauth/:provider/authorize` | `server.rs:277-279` |
-| `auth.enrollFactor` | `POST /auth/v1/factors` (201) | `server.rs:286-287` |
-| `auth.listFactors` | `GET /auth/v1/factors` | `server.rs:286-287` |
-| `auth.verifyFactor` | `POST /auth/v1/factors/:id/verify` | `server.rs:290-291` |
-| `auth.challengeFactor` | `POST /auth/v1/factors/:id/challenge` | `server.rs:294-296` |
-| `auth.verifyChallenge` | `POST /auth/v1/factors/:id/challenge/verify` | `server.rs:298-300` |
-| `auth.unenrollFactor` | `DELETE /auth/v1/factors/:id` | `server.rs:302-303` |
-| `table(t).get()` (select/eq/.../order/limit/offset/cursor) | `GET /rest/v1/:table` | `server.rs:243-249`, `parser.rs` |
-| `table(t).insert` | `POST /rest/v1/:table` (201) | `server.rs:246` |
-| `table(t).update` | `PATCH /rest/v1/:table?filters` | `server.rs:247` |
-| `table(t).delete` | `DELETE /rest/v1/:table?filters` (may 501) | `server.rs:248`, `data.rs` |
-| `rpc` / `functions.rpc` | `POST /rest/v1/rpc/:fn_name` | `server.rs:236`, `routes/rpc.rs` |
-| `functions.invoke` | `ANY /fn/v1/:name` | `server.rs:238`, `routes/fn_handler.rs` |
-| `storage.createBucket` | `POST /storage/v1/bucket` | `server.rs:373` |
-| `storage.getBucket` / `deleteBucket` | `GET/DELETE /storage/v1/bucket/:name` | `server.rs:377` |
-| `storage.fromBucket(b).upload/download/remove` | `POST/GET/DELETE /storage/v1/object/:bucket/*path` | `server.rs:409` |
-| `storage.fromBucket(b).list` | `POST /storage/v1/object/list/:bucket` | `server.rs:417` |
-| `storage.fromBucket(b).removeByPrefixes` | `DELETE /storage/v1/object/:bucket` | `server.rs:421` |
-| `storage.fromBucket(b).getPublicUrl` | `GET /storage/v1/object/public/:project/:bucket/*path` | `server.rs:384` |
-| `storage.fromBucket(b).createSignedUrl` | `POST /storage/v1/object/sign/upload/:bucket/*path` | `server.rs:397`, `storage_sign.rs` |
-| `health` | `GET /health` | `server.rs:368` |
-| `realtime.listen` / `subscribe` / presence | `GET /realtime/v1/ws/:project` | `basin-realtime/src/ws.rs:191` |
+**Direct pgwire connections** (psql, DBeaver, migration tools):
 
-## Not bound yet
+```
+# JWT / session token:
+psql "postgres://<access_token>@<engine-host>:5433/basin"
 
-- **SSE realtime** (`GET /realtime/v1/sse/:project/:table`) — use
-  `client.request(...)` as an escape hatch.
-- **Admin surface** (`/admin/v1/*`) — operator-grade; use
-  `client.request(...)`.
-- **CDC stream** (`GET /v1/cdc/:project/stream`) — use `client.request(...)`.
-- **Arrow IPC transport** — the server accepts
-  `Accept: application/vnd.apache.arrow.stream` on any `GET /rest/v1/:table`
-  request and returns a native Arrow IPC stream (see
-  `crates/basin-rest/src/arrow_ipc.rs`). A `toArrow()` method on
-  `QueryBuilder` is not yet implemented because no general-purpose Arrow IPC
-  decoder exists for Dart. The only pub.dev package that decodes Arrow IPC
-  (`meshagent_dart_arrow`) is a vendor-specific library tied to the Meshagent
-  agent platform and is not suitable as a general dependency. When an
-  official Apache Arrow Dart package ships, a `toArrow()` method should be
-  added to `QueryBuilder` following the pattern in `sdk/basin-js/src/query.ts`
-  and `sdk/basin-python/basin/query.py`.
+# API key:
+psql "postgres://{tenant_id}_{hex}:<api_key>@<engine-host>:5433/basin"
+```
+
+After connecting, `auth.uid()` / `auth.role()` / `auth.jwt()` SQL functions
+work identically to the REST path — the same RLS policies apply.
+
+## Row Level Security
+
+After `auth.signIn(...)` the query builder attaches the JWT as
+`Authorization: Bearer <token>` automatically. Enable RLS and a policy in
+schema setup:
+
+```sql
+ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "users see own rows" ON items
+  FOR ALL USING (owner_id = auth.uid());
+```
+
+Then `basin.from('items').rows()` returns only the signed-in user's rows —
+no extra client code needed.
+
+## Testing / injection
+
+Both `http.Client` and the WebSocket factory are injectable for offline
+testing:
+
+```dart
+import 'package:http/testing.dart';
+
+final client = MockClient((request) async {
+  return http.Response('[{"id":1}]', 200,
+      headers: {'content-type': 'application/json'});
+});
+
+final basin = BasinClient.create(
+  url: 'http://localhost',
+  key: 'test-key',
+  httpClient: client,
+);
+```
 
 ## Development
 
 ```sh
-cd sdk/basin-dart
 dart pub get
-dart test test/          # offline suite (no server required)
+dart analyze
+dart test test/
 ```
 
 There is no live integration test runner in this package. For end-to-end
-testing, point `BasinClient.create(url: ...)` at a running Basin instance.
+testing point `BasinClient.create(url: ...)` at a running Basin engine.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
