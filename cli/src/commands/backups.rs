@@ -512,18 +512,31 @@ fn restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         }
     }
 
-    // Restore can be slow — use a longer timeout (2 min).
-    let mut body = json!({ "snapshot_id": from });
-    if !into.is_empty() {
-        body["into_branch_ref"] = json!(into);
+    // Cloud expects: { source_kind, snapshot_id }.
+    // `into` is not part of the cloud contract for /backups/restore — it is a
+    // project-level restore that always targets the project itself.
+    let body = json!({
+        "source_kind": "snapshot",
+        "snapshot_id": from,
+    });
+    let _ = into; // accepted for forward-compat; currently unused by the API.
+
+    #[derive(Deserialize, Serialize)]
+    struct RestoreJobInner {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        status: String,
     }
 
     #[derive(Deserialize, Serialize)]
     struct RestoreResp {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job: Option<RestoreJobInner>,
+        #[serde(default)]
+        engine_ok: bool,
         #[serde(default, skip_serializing_if = "String::is_empty")]
-        restore_job_id: String,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        status: String,
+        engine_msg: String,
     }
 
     let resp: RestoreResp = c.do_json(
@@ -532,13 +545,17 @@ fn restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         Some(body),
     )?;
     if g.json {
-        // JSON shape: { "restore_job_id": "...", "status": "..." }
+        // JSON shape: { "job": { "id": "...", "status": "..." }, "engine_ok": bool, "engine_msg": "..." }
         return print_json(&mut std::io::stdout(), &resp);
     }
-    println!(
-        "Restore job started: {} (status: {})",
-        resp.restore_job_id, resp.status
-    );
+    if let Some(j) = &resp.job {
+        println!("Restore job queued: {} (status: {})", j.id, j.status);
+    } else {
+        println!("Restore job queued.");
+    }
+    if !resp.engine_ok && !resp.engine_msg.is_empty() {
+        println!("  engine: {} (engine wiring pending)", resp.engine_msg);
+    }
     Ok(())
 }
 
@@ -1140,7 +1157,7 @@ mod tests {
             assert_eq!(req.method, "POST");
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             *cap2.lock().unwrap() = body;
-            Resp::ok(r#"{"restore_job_id":"job-1","status":"pending"}"#)
+            Resp::ok(r#"{"job":{"id":"job-1","status":"pending"},"engine_ok":false,"engine_msg":"engine_unconfigured"}"#)
         });
         let g = flags(&srv.url);
         cmd_backups(
@@ -1155,6 +1172,8 @@ mod tests {
         .unwrap();
         let body = captured.lock().unwrap();
         assert_eq!(body["snapshot_id"].as_str().unwrap(), "snap-1");
+        assert_eq!(body["source_kind"].as_str().unwrap(), "snapshot");
+        // into_branch_ref should be absent (not part of cloud contract)
         assert!(
             body.get("into_branch_ref").is_none(),
             "into_branch_ref should be absent"
@@ -1162,14 +1181,16 @@ mod tests {
     }
 
     #[test]
-    fn restore_with_into_branch() {
+    fn restore_with_into_flag_accepted() {
+        // --into is accepted for forward-compat; currently not sent to the cloud.
+        // The test verifies the call succeeds and source_kind is correct.
         let _g = with_temp_config_dir();
         let captured = Arc::new(Mutex::new(serde_json::Value::Null));
         let cap2 = Arc::clone(&captured);
         let srv = TestServer::start(move |req: &Req| {
             let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
             *cap2.lock().unwrap() = body;
-            Resp::ok(r#"{"restore_job_id":"job-2","status":"running"}"#)
+            Resp::ok(r#"{"job":{"id":"job-2","status":"running"},"engine_ok":false,"engine_msg":"engine_unconfigured"}"#)
         });
         let g = flags(&srv.url);
         cmd_backups(
@@ -1184,7 +1205,8 @@ mod tests {
         )
         .unwrap();
         let body = captured.lock().unwrap();
-        assert_eq!(body["into_branch_ref"].as_str().unwrap(), "branch-ref-1");
+        assert_eq!(body["source_kind"].as_str().unwrap(), "snapshot");
+        assert_eq!(body["snapshot_id"].as_str().unwrap(), "snap-1");
     }
 
     #[test]
@@ -1215,30 +1237,41 @@ mod tests {
     fn restore_json_shape() {
         let _g = with_temp_config_dir();
         let srv = TestServer::start(|_req: &Req| {
-            Resp::ok(r#"{"restore_job_id":"job-j","status":"pending"}"#)
+            Resp::ok(r#"{"job":{"id":"job-j","status":"pending"},"engine_ok":false,"engine_msg":"engine_unconfigured"}"#)
         });
         let _g = flags_json(&srv.url);
         let mut buf = Vec::<u8>::new();
         let c = crate::client::Client::new(&srv.url, "tok");
 
         #[derive(Deserialize, Serialize)]
-        struct RestoreResp {
+        struct JobInner {
             #[serde(default, skip_serializing_if = "String::is_empty")]
-            restore_job_id: String,
+            id: String,
             #[serde(default, skip_serializing_if = "String::is_empty")]
             status: String,
+        }
+        #[derive(Deserialize, Serialize)]
+        struct RestoreResp {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            job: Option<JobInner>,
+            #[serde(default)]
+            engine_ok: bool,
+            #[serde(default, skip_serializing_if = "String::is_empty")]
+            engine_msg: String,
         }
         let resp: RestoreResp = c
             .do_json(
                 Method::POST,
                 "/v1/projects/proj1/backups/restore",
-                Some(json!({"snapshot_id":"snap-1"})),
+                Some(json!({"source_kind":"snapshot","snapshot_id":"snap-1"})),
             )
             .unwrap();
         print_json(&mut buf, &resp).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert_eq!(v["restore_job_id"].as_str().unwrap(), "job-j");
-        assert_eq!(v["status"].as_str().unwrap(), "pending");
+        assert_eq!(v["job"]["id"].as_str().unwrap(), "job-j");
+        assert_eq!(v["job"]["status"].as_str().unwrap(), "pending");
+        assert!(!v["engine_ok"].as_bool().unwrap());
+        assert_eq!(v["engine_msg"].as_str().unwrap(), "engine_unconfigured");
     }
 
     // ── backups restore-jobs list ───────────────────────────────────────────

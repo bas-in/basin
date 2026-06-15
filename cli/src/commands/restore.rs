@@ -1,40 +1,54 @@
-//! restore — `basin restore --project=<ref> [dump.sql | -]`
+//! restore — `basin restore` with two modes:
 //!
-//! Replays a dump file (produced by `basin dump`) into a project.
+//! ## Cloud backup restore (calls `POST /v1/projects/:ref/backups/restore`)
 //!
-//! Input sources (in priority order):
-//!   1. A positional file path argument (dump.sql).
-//!   2. Stdin when the path is `-` or when no path is given and stdin is
-//!      not a TTY (i.e. the output of `basin dump | basin restore`).
+//!   basin restore --project=<ref> --snapshot=<id> [--yes]
+//!   basin restore --project=<ref> --as-of=<rfc3339> [--yes]
 //!
-//! Transport: the CLI splits the SQL on statement boundaries (`;` at end
-//! of line, matching pg_dump's output) and POSTs each statement batch to
-//! POST /v1/projects/{ref}/sql/query with writes_enabled=true. This is
-//! the same mechanism used by `migrate_from_pg::basin_restore_sql`.
+//! Enqueues a restore job via the cloud management API.  The cloud records
+//! the job and (once engine wiring lands) triggers the engine-side restore.
+//! While `engine_ok: false` is returned the cloud still creates the DB row;
+//! the status is surfaced faithfully so the caller can track via
+//! `basin backups restore-jobs list`.
 //!
-//! Engine-native restore:
-//!   When basin-engine ships a dedicated restore endpoint (e.g.
-//!   POST /v1/projects/{ref}/restore) that accepts a streamed dump body,
-//!   replace the SQL-splitting + batch-post logic below with a single
-//!   streaming call to that endpoint.
-//!   See: // TODO(5.22.D-engine-api)
+//! ## Dump-file replay (legacy; kept for `basin dump | basin restore` pipelines)
+//!
+//!   basin restore --project=<ref> [dump.sql | -]
+//!
+//! Splits the dump on statement boundaries and POSTs each statement to
+//! `POST /v1/projects/{ref}/sql/query` with `writes_enabled=true`.
+//!
+//! ### Mode selection (priority order)
+//!
+//!  1. `--snapshot=<id>` → cloud backup restore, `source_kind=snapshot`.
+//!  2. `--as-of=<rfc3339>` → cloud PITR restore, `source_kind=timestamp`.
+//!  3. Positional file path (or stdin) → dump-file replay.
+//!
+//! ### Route
+//!
+//!   POST /v1/projects/:ref/backups/restore
+//!   body: { source_kind: "snapshot"|"timestamp", snapshot_id?: "...", target_timestamp?: "..." }
+//!   response: { job: { id, status, ... }, engine_ok: bool, engine_msg?: string }
 
 use std::io::Read;
 use std::time::Duration;
 
 use clap::{Arg, ArgAction, Command};
 use reqwest::Method;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::{msg, CliResult};
 use crate::global::{require_client, GlobalFlags};
+use crate::output::{print_json, read_line};
 
 use super::help::help_for_command;
 use super::parse_or_silent;
 
 // ── RestoreOpts ───────────────────────────────────────────────────────────────
 
-/// RestoreOpts captures the parsed CLI flags for `basin restore`.
+/// RestoreOpts captures the parsed CLI flags for `basin restore`
+/// when running in dump-replay mode.
 pub struct RestoreOpts {
     pub project_ref: String,
     /// Path to the dump file, or "-" to read from stdin.
@@ -83,18 +97,11 @@ pub fn split_sql_statements(sql: &str) -> Vec<String> {
     statements
 }
 
-// ── Core implementation ───────────────────────────────────────────────────────
+// ── Core implementation (dump-replay mode) ────────────────────────────────────
 
 /// run_restore replays the SQL from `sql_content` into the target project.
 ///
 /// Returns the count of statements executed and the count of errors.
-///
-/// TODO(5.22.D-engine-api): When basin-engine exposes a native restore
-/// endpoint (e.g. `POST /v1/projects/{ref}/restore` accepting an
-/// `application/octet-stream` or `text/plain` body), replace the statement-
-/// splitting + per-statement POST loop below with a single streaming call to
-/// that endpoint. The `RestoreOpts` struct and command wiring here should
-/// remain unchanged.
 pub fn run_restore(
     g: &GlobalFlags,
     opts: &RestoreOpts,
@@ -106,12 +113,7 @@ pub fn run_restore(
     let mut errors = 0usize;
 
     for (i, stmt) in statements.iter().enumerate() {
-        crate::printinfo!(
-            g,
-            "restore: statement {}/{} …",
-            i + 1,
-            total
-        );
+        crate::printinfo!(g, "restore: statement {}/{} …", i + 1, total);
         let body = json!({
             "sql": stmt,
             "writes_enabled": true,
@@ -125,14 +127,49 @@ pub fn run_restore(
         if let Err(e) = result {
             errors += 1;
             // Non-fatal: log and continue so the rest of the dump is applied.
-            eprintln!(
-                "restore: statement {} error (continuing): {e}",
-                i + 1
-            );
+            eprintln!("restore: statement {} error (continuing): {e}", i + 1);
         }
     }
 
     Ok((total, errors))
+}
+
+// ── Cloud restore response shape ──────────────────────────────────────────────
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct RestoreJobInner {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    project_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    source_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    initiated_by: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct CloudRestoreResp {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    job: Option<RestoreJobInner>,
+    #[serde(default)]
+    engine_ok: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    engine_msg: String,
 }
 
 // ── Dispatcher ────────────────────────────────────────────────────────────────
@@ -140,6 +177,11 @@ pub fn run_restore(
 pub fn cmd_restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     let cmd = Command::new("restore")
         .arg(Arg::new("project").long("project"))
+        // Cloud-restore flags:
+        .arg(Arg::new("snapshot").long("snapshot"))
+        .arg(Arg::new("as-of").long("as-of"))
+        .arg(Arg::new("yes").long("yes").action(ArgAction::SetTrue))
+        // Dump-replay flag:
         .arg(Arg::new("file").index(1)) // positional dump.sql
         .arg(Arg::new("help").long("help").action(ArgAction::SetTrue));
 
@@ -148,14 +190,22 @@ pub fn cmd_restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
     if m.get_flag("help") {
         help_for_command(
             "restore",
-            "Replay a dump file into a project (inverse of `basin dump`).",
+            "Restore a project — either from a cloud backup/PITR or by replaying a dump file.",
             &[
-                "--project=<ref>   Project ref (required, or auto-detected from ./basin/config.toml).",
-                "dump.sql          Path to the dump file produced by `basin dump`.",
-                "                  Use `-` to read from stdin (or pipe: basin dump ... | basin restore ...).",
+                "Cloud backup restore (calls POST /v1/projects/:ref/backups/restore):",
+                "  --snapshot=<id>       Restore from a specific backup snapshot (source_kind=snapshot).",
+                "  --as-of=<rfc3339>     Point-in-time restore to a timestamp (source_kind=timestamp).",
+                "  --yes                 Skip the confirmation prompt.",
+                "  --project=<ref>       Project ref (required, or auto-detected from ./basin/config.toml).",
                 "",
-                "Engine-native restore endpoint (POST /v1/projects/{ref}/restore) will be wired",
-                "once basin-engine ships it. See TODO(5.22.D-engine-api) in restore.rs.",
+                "Dump-file replay (inverse of `basin dump`):",
+                "  dump.sql              Path to the dump file produced by `basin dump`.",
+                "                        Use `-` to read from stdin (or pipe: basin dump ... | basin restore ...).",
+                "  --project=<ref>       Project ref (required, or auto-detected from ./basin/config.toml).",
+                "",
+                "Mode is selected automatically:",
+                "  --snapshot / --as-of present → cloud restore.",
+                "  File path / stdin present    → dump-file replay.",
             ],
         );
         return Ok(());
@@ -178,7 +228,16 @@ pub fn cmd_restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         }
     };
 
-    // Resolve input: positional arg, then stdin.
+    let snapshot = m.get_one::<String>("snapshot").cloned().unwrap_or_default();
+    let as_of = m.get_one::<String>("as-of").cloned().unwrap_or_default();
+    let yes = m.get_flag("yes");
+
+    // ── Mode: cloud backup restore ────────────────────────────────────────────
+    if !snapshot.is_empty() || !as_of.is_empty() {
+        return cloud_restore(g, &project_ref, &snapshot, &as_of, yes);
+    }
+
+    // ── Mode: dump-file replay ────────────────────────────────────────────────
     let file = m.get_one::<String>("file").cloned().unwrap_or_default();
 
     let sql_content = if file.is_empty() || file == "-" {
@@ -189,7 +248,8 @@ pub fn cmd_restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
             .map_err(|e| msg(format!("restore: read stdin: {e}")))?;
         if s.trim().is_empty() {
             return Err(msg(
-                "restore: no SQL input (provide a file path or pipe a dump via stdin)",
+                "restore: no SQL input (provide a file path or pipe a dump via stdin)\n\
+                 hint: use --snapshot=<id> or --as-of=<rfc3339> for cloud backup restore",
             ));
         }
         s
@@ -216,9 +276,7 @@ pub fn cmd_restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
                 &json!({ "statements": total, "errors": errors, "ok": false }),
             )?;
         }
-        return Err(msg(format!(
-            "restore finished with {errors} error(s)"
-        )));
+        return Err(msg(format!("restore finished with {errors} error(s)")));
     }
 
     if g.json {
@@ -229,6 +287,92 @@ pub fn cmd_restore(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
         )?;
     } else if !g.quiet {
         println!("restore: {total} statement(s) applied, 0 errors");
+    }
+    Ok(())
+}
+
+// ── cloud_restore ─────────────────────────────────────────────────────────────
+
+/// cloud_restore calls POST /v1/projects/:ref/backups/restore.
+///
+/// - snapshot non-empty → source_kind=snapshot
+/// - as_of non-empty    → source_kind=timestamp (PITR)
+///
+/// The cloud creates the restore job row and (when engine wiring is complete)
+/// triggers the engine-side restore. While engine_ok=false the job row still
+/// exists and is trackable via `basin backups restore-jobs list`.
+fn cloud_restore(
+    g: &GlobalFlags,
+    project_ref: &str,
+    snapshot: &str,
+    as_of: &str,
+    yes: bool,
+) -> CliResult<()> {
+    if !snapshot.is_empty() && !as_of.is_empty() {
+        return Err(msg(
+            "restore: --snapshot and --as-of are mutually exclusive; use one or the other",
+        ));
+    }
+
+    let (source_kind, desc) = if !snapshot.is_empty() {
+        ("snapshot", format!("snapshot {:?}", snapshot))
+    } else {
+        ("timestamp", format!("timestamp {:?}", as_of))
+    };
+
+    if !yes {
+        if g.json {
+            return Err(msg(format!(
+                "confirmation required: pass --yes to restore project {:?} from {} non-interactively under --json",
+                project_ref, desc
+            )));
+        }
+        eprint!(
+            "Restore project {:?} from {}? This will overwrite the project's data. [y/N] ",
+            project_ref, desc
+        );
+        let line = read_line()?;
+        if !line.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let c = require_client(g)?;
+
+    let mut body = json!({ "source_kind": source_kind });
+    if !snapshot.is_empty() {
+        body["snapshot_id"] = json!(snapshot);
+    }
+    if !as_of.is_empty() {
+        body["target_timestamp"] = json!(as_of);
+    }
+
+    let resp: CloudRestoreResp = c.do_json(
+        Method::POST,
+        &format!("/v1/projects/{project_ref}/backups/restore"),
+        Some(body),
+    )?;
+
+    if g.json {
+        // JSON shape: { job: { id, status, source_kind, ... }, engine_ok: bool, engine_msg?: string }
+        return print_json(&mut std::io::stdout(), &resp);
+    }
+
+    if let Some(j) = &resp.job {
+        println!("Restore job queued: {} (status: {})", j.id, j.status);
+    } else {
+        println!("Restore job queued for project {project_ref}.");
+    }
+    if !resp.engine_ok {
+        if !resp.engine_msg.is_empty() {
+            println!(
+                "  engine: {} (engine wiring pending; job will be picked up automatically)",
+                resp.engine_msg
+            );
+        } else {
+            println!("  note: engine step is pending; track progress with `basin backups restore-jobs list --project={project_ref}`");
+        }
     }
     Ok(())
 }
@@ -245,6 +389,16 @@ mod tests {
             api_url: url.to_string(),
             token: "bso_org_test".into(),
             quiet: true,
+            ..Default::default()
+        }
+    }
+
+    fn flags_json(url: &str) -> GlobalFlags {
+        GlobalFlags {
+            api_url: url.to_string(),
+            token: "bso_org_test".into(),
+            quiet: true,
+            json: true,
             ..Default::default()
         }
     }
@@ -322,7 +476,141 @@ mod tests {
         cmd_restore(&g, &["--help".into()]).unwrap();
     }
 
-    // ── stub-server: run_restore posts each statement ─────────────────────────
+    #[test]
+    fn snapshot_and_as_of_mutually_exclusive() {
+        let _cfg = with_temp_config_dir();
+        let g = GlobalFlags {
+            quiet: true,
+            ..Default::default()
+        };
+        let err = cmd_restore(
+            &g,
+            &[
+                "--project=proj1".into(),
+                "--snapshot=snap-1".into(),
+                "--as-of=2026-01-01T00:00:00Z".into(),
+                "--yes".into(),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "err: {err}");
+    }
+
+    // ── cloud restore: --snapshot ─────────────────────────────────────────────
+
+    #[test]
+    fn cloud_restore_snapshot_yes() {
+        let _cfg = with_temp_config_dir();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
+        let cap2 = std::sync::Arc::clone(&captured);
+        let srv = TestServer::start(move |req: &Req| {
+            assert_eq!(req.method, "POST");
+            assert_eq!(req.path, "/v1/projects/proj1/backups/restore");
+            let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+            *cap2.lock().unwrap() = body;
+            Resp::ok(r#"{"job":{"id":"job-1","status":"pending","source_kind":"snapshot"},"engine_ok":false,"engine_msg":"engine_unconfigured"}"#)
+        });
+        let g = flags(&srv.url);
+        cmd_restore(
+            &g,
+            &[
+                "--project=proj1".into(),
+                "--snapshot=snap-abc".into(),
+                "--yes".into(),
+            ],
+        )
+        .unwrap();
+        let body = captured.lock().unwrap();
+        assert_eq!(body["source_kind"].as_str().unwrap(), "snapshot");
+        assert_eq!(body["snapshot_id"].as_str().unwrap(), "snap-abc");
+        assert!(body.get("target_timestamp").is_none());
+    }
+
+    #[test]
+    fn cloud_restore_pitr_yes() {
+        let _cfg = with_temp_config_dir();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
+        let cap2 = std::sync::Arc::clone(&captured);
+        let srv = TestServer::start(move |req: &Req| {
+            let body: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+            *cap2.lock().unwrap() = body;
+            Resp::ok(r#"{"job":{"id":"job-2","status":"pending","source_kind":"timestamp"},"engine_ok":false,"engine_msg":"engine_unconfigured"}"#)
+        });
+        let g = flags(&srv.url);
+        cmd_restore(
+            &g,
+            &[
+                "--project=proj1".into(),
+                "--as-of=2026-01-15T12:00:00Z".into(),
+                "--yes".into(),
+            ],
+        )
+        .unwrap();
+        let body = captured.lock().unwrap();
+        assert_eq!(body["source_kind"].as_str().unwrap(), "timestamp");
+        assert_eq!(body["target_timestamp"].as_str().unwrap(), "2026-01-15T12:00:00Z");
+        assert!(body.get("snapshot_id").is_none());
+    }
+
+    #[test]
+    fn cloud_restore_json_flag_requires_yes() {
+        let _cfg = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| Resp::ok("{}"));
+        let g = flags_json(&srv.url);
+        let err = cmd_restore(
+            &g,
+            &[
+                "--project=proj1".into(),
+                "--snapshot=snap-1".into(),
+                // no --yes
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("confirmation required"), "err: {err}");
+    }
+
+    #[test]
+    fn cloud_restore_json_shape() {
+        let _cfg = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| {
+            Resp::ok(r#"{"job":{"id":"job-j","status":"pending","source_kind":"snapshot"},"engine_ok":false,"engine_msg":"engine_unconfigured"}"#)
+        });
+        let g = flags_json(&srv.url);
+        cmd_restore(
+            &g,
+            &[
+                "--project=proj1".into(),
+                "--snapshot=snap-j".into(),
+                "--yes".into(),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cloud_restore_409_propagates() {
+        let _cfg = with_temp_config_dir();
+        let srv = TestServer::start(|_req: &Req| {
+            Resp::status(
+                409,
+                r#"{"error":{"code":"restore_in_progress","message":"A restore is already in progress."}}"#,
+            )
+        });
+        let g = flags(&srv.url);
+        let err = cmd_restore(
+            &g,
+            &[
+                "--project=proj1".into(),
+                "--snapshot=snap-1".into(),
+                "--yes".into(),
+            ],
+        )
+        .unwrap_err();
+        let ae = crate::error::as_api_error(err.as_ref()).expect("ApiError");
+        assert_eq!(ae.http_status, 409);
+    }
+
+    // ── dump-replay mode ──────────────────────────────────────────────────────
 
     #[test]
     fn run_restore_posts_statements() {
@@ -338,10 +626,7 @@ mod tests {
             if let Some(sql) = body["sql"].as_str() {
                 posted2.lock().unwrap().push(sql.to_string());
             }
-            assert_eq!(
-                body["writes_enabled"], true,
-                "writes_enabled must be true"
-            );
+            assert_eq!(body["writes_enabled"], true, "writes_enabled must be true");
             Resp::ok(r#"{"data":{}}"#)
         });
 
@@ -369,8 +654,6 @@ mod tests {
             p[1]
         );
     }
-
-    // ── stub-server: run_restore tolerates server errors ──────────────────────
 
     #[test]
     fn run_restore_continues_on_error() {
@@ -404,8 +687,6 @@ mod tests {
         assert_eq!(errors, 1, "expected 1 error from the failing second stmt");
     }
 
-    // ── stub-server: run_restore writes_enabled=true check ────────────────────
-
     #[test]
     fn run_restore_sets_writes_enabled_true() {
         let _cfg = with_temp_config_dir();
@@ -436,8 +717,6 @@ mod tests {
             "all calls must set writes_enabled=true: {flags_vec:?}"
         );
     }
-
-    // ── stub-server: cmd_restore with file path ───────────────────────────────
 
     #[test]
     fn cmd_restore_reads_from_file() {
