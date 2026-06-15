@@ -1,0 +1,22 @@
+name: basin_sdk
+description: >-
+  Official Dart / Flutter client for Basin — REST data API, auth, functions,
+  object storage, and realtime WebSocket.
+version: 0.1.0
+homepage: https://basin.run
+repository: https://github.com/basin-db/basin
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  # Cross-platform HTTP (works on Flutter Web, iOS, Android, desktop, server).
+  http: "^1.2.0"
+  # WebSocket channel abstraction — the Flutter standard; cross-platform.
+  web_socket_channel: "^3.0.0"
+  meta: "^1.10.0"
+
+dev_dependencies:
+  lints: "^4.0.0"
+  test: "^1.25.0"
+  # MockClient is in the main http package under http/testing.dart.
