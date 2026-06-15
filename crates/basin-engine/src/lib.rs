@@ -347,6 +347,16 @@ pub(crate) struct EngineInner {
     /// forwarder via `Engine::attach_write_forwarder`. `RwLock` mirrors the
     /// `event_sinks` attach-after-construction pattern.
     pub(crate) write_forwarder: RwLock<Option<Arc<dyn crate::region::WriteForwarder>>>,
+
+    /// Optional handle to the realtime channel + budget state exposed via the
+    /// `basin_realtime.channels` and `basin_realtime.stats` virtual tables.
+    ///
+    /// Not set by default (OSS builds without realtime). Call
+    /// [`Engine::attach_realtime_source`] at startup to wire in the
+    /// `basin-realtime` implementation so the virtual tables return live data.
+    /// When `None` the tables return empty/zero rows without error.
+    pub(crate) realtime_source:
+        RwLock<Option<Arc<dyn crate::realtime_catalog::RealtimeChannelSource>>>,
 }
 
 impl Engine {
@@ -465,6 +475,10 @@ impl Engine {
             // Multi-region: no forwarder by default (OSS fail-loud). The
             // cloud-private layer attaches one at startup.
             write_forwarder: RwLock::new(None),
+            // Realtime channel source: unset by default. Callers that wire up
+            // basin-realtime's RealtimeSink call attach_realtime_source to feed
+            // live data into basin_realtime.channels / basin_realtime.stats.
+            realtime_source: RwLock::new(None),
         });
         // Phase 5.14.D2: register the query-history adapter with the shard so
         // the compactor can consult observed ORDER BY / GROUP BY patterns.
@@ -601,6 +615,37 @@ impl Engine {
             .write_forwarder
             .write()
             .expect("write_forwarder lock poisoned") = Some(fwd);
+    }
+
+    /// Register the realtime channel + budget data source so
+    /// `SELECT … FROM basin_realtime.channels` / `basin_realtime.stats`
+    /// return live values.
+    ///
+    /// Intended to be called once at startup by callers that also call
+    /// [`Self::attach_post_commit_sink`] with a `RealtimeSink`. Last writer
+    /// wins (idempotent). Safe to not call — the virtual tables return valid
+    /// empty/zero rows when no source is attached.
+    pub fn attach_realtime_source(
+        &self,
+        source: Arc<dyn crate::realtime_catalog::RealtimeChannelSource>,
+    ) {
+        *self
+            .inner
+            .realtime_source
+            .write()
+            .expect("realtime_source lock poisoned") = Some(source);
+    }
+
+    /// Read the current realtime source handle. Returns a cloned `Arc` so
+    /// the caller can use it without holding the lock.
+    pub(crate) fn realtime_source(
+        &self,
+    ) -> Option<Arc<dyn crate::realtime_catalog::RealtimeChannelSource>> {
+        self.inner
+            .realtime_source
+            .read()
+            .expect("realtime_source lock poisoned")
+            .clone()
     }
 
     /// The currently-registered write forwarder, if any. Cloned `Arc` so the
@@ -1667,6 +1712,7 @@ pub mod query_shape;
 pub mod query_stats;
 pub mod query_stats_export;
 pub(crate) mod project_usage_view;
+pub mod realtime_catalog;
 mod procedure_ddl;
 mod range_udf;
 pub mod reactor_ddl;

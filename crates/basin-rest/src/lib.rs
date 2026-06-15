@@ -103,6 +103,13 @@ mod parser;
 mod routes;
 mod server;
 
+// Phase 5.11.R: realtime channel source adapter. Bridges basin-engine's
+// RealtimeChannelSource trait to basin-realtime's ChannelRegistry +
+// BudgetTracker. Gated on the `realtime` feature so it doesn't add the
+// basin-realtime dep when the feature is off.
+#[cfg(feature = "realtime")]
+pub mod realtime_source;
+
 #[cfg(test)]
 mod tests;
 

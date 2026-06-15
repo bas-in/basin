@@ -75,6 +75,16 @@ pub struct ChannelKey {
     pub table: TableName,
 }
 
+/// One row returned by [`ChannelRegistry::channels_for_project`].
+/// Represents a single active broadcast (table-change) channel.
+#[derive(Debug, Clone)]
+pub struct ChannelRow {
+    /// The table name used as the channel identifier.
+    pub channel_name: String,
+    /// Number of live broadcast receivers currently subscribed.
+    pub subscriber_count: i64,
+}
+
 impl ChannelKey {
     pub fn new(project: ProjectId, table: TableName) -> Self {
         Self { project, table }
@@ -159,6 +169,28 @@ impl ChannelRegistry {
     /// when a new subscriber arrives or when `prune` is called).
     pub fn channel_count(&self) -> usize {
         self.channels.len()
+    }
+
+    /// Snapshot all broadcast channels for `project` that have at least one
+    /// live receiver. Channels whose last subscriber dropped (receiver_count
+    /// == 0) are excluded — they are only visible after `prune` removes them.
+    pub fn channels_for_project(&self, project: ProjectId) -> Vec<ChannelRow> {
+        self.channels
+            .iter()
+            .filter_map(|entry| {
+                if entry.key().project != project {
+                    return None;
+                }
+                let subscriber_count = entry.value().sender.receiver_count();
+                if subscriber_count == 0 {
+                    return None;
+                }
+                Some(ChannelRow {
+                    channel_name: entry.key().table.to_string(),
+                    subscriber_count: subscriber_count as i64,
+                })
+            })
+            .collect()
     }
 
     /// Remove channels whose sender has no live receivers. Intended to be

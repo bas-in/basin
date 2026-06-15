@@ -2769,6 +2769,23 @@ pub(crate) async fn open(
         tracing::warn!("register_cdc_providers: {e}");
     }
 
+    // Phase 5.11.R: register `basin_realtime.channels` and
+    // `basin_realtime.stats` virtual tables. The providers return live data
+    // when a RealtimeChannelSource is attached; otherwise they return valid
+    // empty/zero rows so the cloud handler's graceful fallback still triggers.
+    {
+        let rt_source = engine.realtime_source();
+        let notify = Arc::new(engine.notify_registry().clone());
+        if let Err(e) = crate::realtime_catalog::register_realtime_providers(
+            &ctx,
+            project,
+            rt_source,
+            notify,
+        ) {
+            tracing::warn!("register_realtime_providers: {e}");
+        }
+    }
+
     let state = Arc::new(SessionState::new_with_schema_state(Arc::clone(&schema_state)));
 
     // Phase 5.28.C: register with the idle-in-txn reaper.

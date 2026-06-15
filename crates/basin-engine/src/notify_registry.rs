@@ -90,6 +90,16 @@ struct ChannelEntry {
     sender: broadcast::Sender<Notification>,
 }
 
+/// One row returned by [`NotifyRegistry::channels_for_project`]. Represents
+/// a single active SQL LISTEN/NOTIFY channel with at least one live subscriber.
+#[derive(Debug, Clone)]
+pub struct NotifyChannelRow {
+    /// Normalised (lowercase) channel name.
+    pub channel_name: String,
+    /// Number of live receivers (sessions that issued LISTEN on this channel).
+    pub subscriber_count: i64,
+}
+
 /// Process-wide SQL `LISTEN` / `NOTIFY` registry. One per [`crate::Engine`].
 /// Cheap to clone (all state behind an `Arc`).
 #[derive(Clone)]
@@ -161,6 +171,30 @@ impl NotifyRegistry {
     /// subscriber (entries persist until `prune` is called).
     pub fn channel_count(&self) -> usize {
         self.channels.len()
+    }
+
+    /// Snapshot all active LISTEN/NOTIFY channels for `project`.
+    ///
+    /// Returns one [`NotifyChannelRow`] per `(project, channel)` entry whose
+    /// sender still has at least one live receiver. Entries that have been
+    /// `prune`d or never subscribed are omitted.
+    pub fn channels_for_project(&self, project: ProjectId) -> Vec<NotifyChannelRow> {
+        self.channels
+            .iter()
+            .filter_map(|entry| {
+                if entry.key().project != project {
+                    return None;
+                }
+                let subscriber_count = entry.value().sender.receiver_count();
+                if subscriber_count == 0 {
+                    return None;
+                }
+                Some(NotifyChannelRow {
+                    channel_name: entry.key().channel.clone(),
+                    subscriber_count: subscriber_count as i64,
+                })
+            })
+            .collect()
     }
 
     /// GC channels whose last subscriber has dropped. Intended for a
