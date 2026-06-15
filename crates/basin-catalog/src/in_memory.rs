@@ -2239,6 +2239,71 @@ impl Catalog for InMemoryCatalog {
         Ok(Self::build_metadata(project, &dst.name, &dst_state))
     }
 
+    #[instrument(skip(self), fields(
+        src_project = %src_project,
+        src_table   = %src_table,
+        dst_project = %dst_project,
+        dst_table   = %dst_table,
+    ))]
+    async fn fork_table_to_project(
+        &self,
+        src_project: &ProjectId,
+        src_table: &TableName,
+        dst_project: &ProjectId,
+        dst_table: &TableName,
+    ) -> Result<TableMetadata> {
+        self.bump_epoch();
+        // Clone the source table's state, then insert it under (dst_project,
+        // dst_table). File paths are cloned verbatim — no bytes are copied.
+        let qsrc = self.resolve_qtable(src_project, src_table).await;
+        let cloned_state = {
+            let src_arc = self.get_table_qualified(src_project, &qsrc).await?;
+            let s = src_arc.lock().await;
+            TableState {
+                schema: s.schema.clone(),
+                current: s.current,
+                snapshots: s.snapshots.clone(),
+                partition_spec: s.partition_spec.clone(),
+                rls_enabled: s.rls_enabled,
+                policies: s.policies.clone(),
+                cold_after_seconds: s.cold_after_seconds,
+                cold_age_column: s.cold_age_column.clone(),
+                bloom_filter_columns: s.bloom_filter_columns.clone(),
+                row_group_rows: s.row_group_rows,
+                continuous_aggregate: s.continuous_aggregate.clone(),
+                cluster_columns: s.cluster_columns.clone(),
+                file_format: s.file_format,
+                row_block_size: s.row_block_size,
+                home_region: s.home_region.clone(),
+                indexes: s.indexes.clone(),
+                pk_columns: s.pk_columns.clone(),
+                check_constraints: s.check_constraints.clone(),
+                foreign_keys: s.foreign_keys.clone(),
+                unique_constraints: s.unique_constraints.clone(),
+                global_sort_order: s.global_sort_order.clone(),
+                adaptive_sort_override: s.adaptive_sort_override,
+                // The fork starts with a clean GC orphan list.
+                gc_orphan_paths: Vec::new(),
+                promoted_jsonb_paths: s.promoted_jsonb_paths.clone(),
+            }
+        };
+
+        let qdst = QualifiedTableName::in_public(dst_table.clone());
+        let dst_key = (*dst_project, qdst.clone());
+        let mut tables = self.tables.write().await;
+        if tables.contains_key(&dst_key) {
+            return Err(BasinError::catalog(format!(
+                "fork_table_to_project: {dst_project}/{dst_table} already exists",
+            )));
+        }
+        let dst_arc = Arc::new(Mutex::new(cloned_state));
+        tables.insert(dst_key, dst_arc.clone());
+        drop(tables);
+
+        let dst_state = dst_arc.lock().await;
+        Ok(Self::build_metadata(dst_project, dst_table, &dst_state))
+    }
+
     async fn rollback_to_snapshot_qualified(
         &self,
         project: &ProjectId,

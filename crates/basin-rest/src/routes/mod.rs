@@ -10,6 +10,7 @@
 
 pub(crate) mod admin;
 pub(crate) mod admin_backups;
+pub(crate) mod admin_branches;
 pub(crate) mod admin_functions;
 pub(crate) mod admin_projects;
 pub(crate) mod auth;

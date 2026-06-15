@@ -44,6 +44,7 @@ use basin_cdc::CdcSseState;
 use crate::errors::ApiError;
 use crate::routes::{
     admin as admin_routes, admin_backups as admin_backups_routes,
+    admin_branches as admin_branches_routes,
     admin_functions as admin_fn_routes,
     admin_projects as admin_projects_routes, auth as auth_routes, data as data_routes,
     fn_handler as fn_handler_routes, inbound as inbound_routes,
@@ -415,6 +416,12 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         .route(
             "/admin/v1/projects/:project_id/restore",
             post(admin_backups_routes::restore_project),
+        )
+        // COW branch: fork all source-project tables into a destination project.
+        // POST /admin/v1/projects/:project_id/fork body { "dst_project_id": "…" }
+        .route(
+            "/admin/v1/projects/:project_id/fork",
+            post(admin_branches_routes::fork_project),
         )
         // Feature 3 (5.22.D): pg_dump-compatible project export.
         .route(

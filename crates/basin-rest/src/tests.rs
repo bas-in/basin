@@ -2626,3 +2626,30 @@ async fn snapshot_and_restore_routes_return_401_not_404() {
 
     let _ = running.shutdown.send(());
 }
+
+// ─── Fork (COW branch) route registered ───────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_route_returns_401_not_404() {
+    let Some((running, _svc, _auth, _mailer, _g)) = try_serve().await else {
+        return;
+    };
+    let addr = running.local_addr;
+    let project = ProjectId::new().to_string();
+
+    let resp = http_request(
+        addr,
+        "POST",
+        &format!("/admin/v1/projects/{project}/fork"),
+        &[],
+        None,
+    )
+    .await;
+    assert_ne!(
+        resp.status, 404,
+        "fork route must be registered (got 404 instead of 401)"
+    );
+    assert_eq!(resp.status, 401, "unauthenticated fork must return 401");
+
+    let _ = running.shutdown.send(());
+}

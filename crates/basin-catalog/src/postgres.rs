@@ -2203,6 +2203,116 @@ impl Catalog for PostgresCatalog {
         self.load_table(project, dst_table).await
     }
 
+    #[instrument(skip(self), fields(
+        src_project = %src_project,
+        src_table   = %src_table,
+        dst_project = %dst_project,
+        dst_table   = %dst_table,
+    ))]
+    async fn fork_table_to_project(
+        &self,
+        src_project: &ProjectId,
+        src_table: &TableName,
+        dst_project: &ProjectId,
+        dst_table: &TableName,
+    ) -> Result<TableMetadata> {
+        let sch = &self.schema;
+        let src_proj_str = src_project.to_string();
+        let src_str = src_table.to_string();
+        let dst_proj_str = dst_project.to_string();
+        let dst_str = dst_table.to_string();
+
+        let mut client = self.client().await?;
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("fork_to_project txn begin: {e}")))?;
+
+        // 1. Lock & verify the source row exists; fail fast if not.
+        let src_row = txn
+            .query_opt(
+                &format!(
+                    "SELECT 1 FROM {sch}.tables \
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2 \
+                     FOR UPDATE"
+                ),
+                &[&src_proj_str, &src_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("fork_to_project src lookup: {e}")))?;
+        if src_row.is_none() {
+            return Err(BasinError::not_found(format!(
+                "{src_project}/{src_table}"
+            )));
+        }
+
+        // 2. Copy the table row into dst_project / dst_table.
+        //    `ON CONFLICT DO NOTHING` + row-count check detects a pre-existing
+        //    destination without a second SELECT round-trip.
+        let inserted = txn
+            .execute(
+                &format!(
+                    "INSERT INTO {sch}.tables (
+                        project_id, schema_name, table_name, schema_json, current_snapshot,
+                        format_version, partition_spec_json, rls_enabled,
+                        policies_json, cold_after_seconds, cold_age_column,
+                        bloom_filter_columns_json, row_group_rows,
+                        continuous_aggregate_json, cluster_columns_json,
+                        home_region,
+                        pk_columns_json, check_constraints_json, foreign_keys_json,
+                        file_format, row_block_size
+                     )
+                     SELECT $3, schema_name, $4, schema_json, current_snapshot,
+                            format_version, partition_spec_json, rls_enabled,
+                            policies_json, cold_after_seconds, cold_age_column,
+                            bloom_filter_columns_json, row_group_rows,
+                            continuous_aggregate_json, cluster_columns_json,
+                            home_region,
+                            pk_columns_json, check_constraints_json, foreign_keys_json,
+                            file_format, row_block_size
+                     FROM {sch}.tables
+                     WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2
+                     ON CONFLICT (project_id, schema_name, table_name) DO NOTHING"
+                ),
+                &[&src_proj_str, &src_str, &dst_proj_str, &dst_str],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("fork_to_project insert table: {e}")))?;
+        if inserted == 0 {
+            return Err(BasinError::catalog(format!(
+                "fork_table_to_project: {dst_project}/{dst_table} already exists",
+            )));
+        }
+
+        // 3. Copy every snapshot row, retargeted at dst_project / dst_table.
+        //    Snapshot ids are preserved verbatim — the fork has identical
+        //    history up to creation, then diverges.
+        txn.execute(
+            &format!(
+                "INSERT INTO {sch}.snapshots (
+                    project_id, schema_name, table_name, snapshot_id, parent_id,
+                    operation, committed_at, summary_json, data_files,
+                    removed_paths_json
+                 )
+                 SELECT $3, schema_name, $4, snapshot_id, parent_id,
+                        operation, committed_at, summary_json, data_files,
+                        removed_paths_json
+                 FROM {sch}.snapshots
+                 WHERE project_id = $1 AND schema_name = 'public' AND table_name = $2"
+            ),
+            &[&src_proj_str, &src_str, &dst_proj_str, &dst_str],
+        )
+        .await
+        .map_err(|e| BasinError::catalog(format!("fork_to_project copy snapshots: {e}")))?;
+
+        txn.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("fork_to_project commit: {e}")))?;
+
+        drop(client);
+        self.load_table(dst_project, dst_table).await
+    }
+
     #[instrument(skip(self), fields(project = %project, table = %table, snapshot = %snapshot_id))]
     async fn rollback_to_snapshot(
         &self,

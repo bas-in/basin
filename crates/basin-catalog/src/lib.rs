@@ -536,6 +536,39 @@ pub trait Catalog: Send + Sync {
         ))
     }
 
+    /// Cross-project copy-on-write table fork. Creates `dst_table` for
+    /// `dst_project` as a clone of `src_table`'s current state in
+    /// `src_project`: same schema, same snapshot history (same
+    /// `DataFileRef` paths), same partition / RLS / tier / bloom /
+    /// row-group / CV settings. From this point the two tables have
+    /// independent lineages — commits to one do not affect the other.
+    ///
+    /// **Data files are shared, not copied.** Both sides reference the
+    /// same Parquet files on object storage. This is the "COW" in
+    /// copy-on-write: subsequent writes produce new files referenced only
+    /// by the writing side.
+    ///
+    /// Errors:
+    /// - [`basin_common::BasinError::NotFound`] when `src_table` in
+    ///   `src_project` doesn't exist.
+    /// - [`basin_common::BasinError::Catalog`] when `dst_table` already
+    ///   exists in `dst_project` (no implicit overwrite).
+    /// - Default impl returns [`basin_common::BasinError::Internal`]
+    ///   (`"fork_table_to_project not implemented"`) so backends opt in
+    ///   explicitly.
+    async fn fork_table_to_project(
+        &self,
+        src_project: &ProjectId,
+        src_table: &TableName,
+        dst_project: &ProjectId,
+        dst_table: &TableName,
+    ) -> Result<TableMetadata> {
+        let _ = (src_project, src_table, dst_project, dst_table);
+        Err(basin_common::BasinError::Internal(
+            "fork_table_to_project not implemented for this catalog backend".into(),
+        ))
+    }
+
     /// Point-in-time restore: rewind `(project, table)` to `snapshot_id`,
     /// discarding any snapshots with `id > snapshot_id`. The current
     /// snapshot pointer becomes `snapshot_id`; subsequent commits chain
