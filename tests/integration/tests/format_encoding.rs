@@ -309,12 +309,12 @@ async fn to_date_basic() {
 // to_timestamp — extended format strings
 // ---------------------------------------------------------------------------
 
-/// REAL BUG (Phase 6.X): `to_char(to_timestamp(...), fmt)` returns the format
-/// string literally instead of applying it.  Same root cause as
-/// `to_char_datetime_extended` — datetime picture string not implemented.
+/// `to_timestamp(text, fmt)` parsing + `to_char(timestamp, fmt)` round-trip for
+/// the common picture tokens (`YYYY MM DD HH24 HH12 MI SS MS AM`). These work;
+/// only the exotic datetime tokens remain a gap (see the still-ignored
+/// `to_char_datetime_extended`). Regression guard for the common round-trip.
 #[tokio::test]
 #[serial_test::serial]
-#[ignore = "real engine bug: to_char(timestamp, fmt) returns format string literally (same as to_char_datetime_extended)"]
 async fn to_timestamp_extended() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
