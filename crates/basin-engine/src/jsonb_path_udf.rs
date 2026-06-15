@@ -199,6 +199,38 @@ fn rewrite_binary_op_to_fn(sql: &str, op: &str, func: &str) -> String {
             continue;
         }
 
+        // Skip `--` line comments verbatim: an operator inside a comment must
+        // not be rewritten, and LHS/RHS capture must not cross the comment
+        // boundary (mirrors `find_at_at` in pg_ast.rs).
+        if bytes[i] == b'-' && i + 1 < n && bytes[i + 1] == b'-' {
+            result.push_str("--");
+            i += 2;
+            while i < n && bytes[i] != b'\n' {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+        // Skip `/* … */` block comments verbatim (no nesting in v0.1).
+        if bytes[i] == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+            result.push_str("/*");
+            i += 2;
+            while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+            if i + 1 < n {
+                result.push_str("*/");
+                i += 2;
+            } else {
+                while i < n {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
         // Check for operator match (requires whitespace/boundary around it)
         if i + op_len <= n && &bytes[i..i + op_len] == op_bytes {
             // Verify it's not part of a longer operator token by checking

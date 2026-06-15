@@ -8,6 +8,17 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-15 — Fix: `@@` rewriter no longer mangles SQL comments
+
+- The jsonb-path `@@` text-rewriter (`rewrite_binary_op_to_fn` in
+  `jsonb_path_udf.rs`) skipped string literals + quoted identifiers but **not**
+  `--` / `/* … */` comments, so an `@@` inside a comment (e.g.
+  `SELECT 1 -- a @@ b`) was lowered to a function call with operand capture
+  crossing the comment boundary → a parse/execute error. It now skips comment
+  spans verbatim, mirroring the comment-aware tsvector rewriter (`find_at_at`).
+- Un-ignores `fts_at_at::at_at_inside_line_comment_is_ignored` (now a green
+  regression guard).
+
 ## 2026-06-15 — Docs: correct stale capability claims (binary NUMERIC wire, citext WHERE-fold)
 
 - `CAPABILITIES.md` no longer advertises two already-shipped features as deferred:

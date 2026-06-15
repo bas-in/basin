@@ -178,15 +178,14 @@ async fn at_at_inside_string_literal_is_data() {
 
 /// `@@` inside a `--` line comment must be ignored.
 ///
-/// REAL BUG (Phase 6.X): the `@@` text-rewriter in `basin_engine::pg_ast`
-/// operates on the raw SQL string without stripping comments first.  It
-/// transforms `@@ b` inside the `--` comment into `tsvector_match_udf(a, b)`,
-/// injecting a `(` after the comment terminator which causes a parse error.
-/// Fix requires teaching the rewriter to skip `-- … \n` and `/* … */` spans.
-///
-/// Test ignored until the rewriter is comment-aware.
+/// Regression guard: the `@@` text-rewriters must skip `-- … \n` and
+/// `/* … */` comment spans so an operator inside a comment is never lowered
+/// and operand capture never crosses the comment boundary. Both the tsvector
+/// rewriter (`find_at_at` in `pg_ast`) and the jsonb-path rewriter
+/// (`rewrite_binary_op_to_fn` in `jsonb_path_udf`) are comment-aware; the
+/// latter was the missing piece (it skipped string literals + quoted idents
+/// but not comments, so `a @@ b` in a comment captured across the `--`).
 #[tokio::test]
-#[ignore = "real engine bug: @@ rewriter does not respect -- comment boundaries (injects tsvector_match_udf into comment body)"]
 async fn at_at_inside_line_comment_is_ignored() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
