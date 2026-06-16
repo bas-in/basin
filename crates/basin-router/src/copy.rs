@@ -773,23 +773,21 @@ pub(crate) async fn resolve_table_columns<S: Session + ?Sized>(
     Ok(schema.columns)
 }
 
-/// Metadata key carrying the source text of a column's `DEFAULT <expr>`.
-/// Mirrors `basin_engine::types::BASIN_COLUMN_DEFAULT` (kept private in the
-/// engine crate); the engine's INSERT path reads the metadata back during
-/// row coercion. We rely on the same key here to detect "column has a
-/// default" without taking on a dep on the engine's internal module.
-const BASIN_COLUMN_DEFAULT_KEY: &str = "BASIN_COLUMN_DEFAULT";
-
-fn field_has_default(f: &Field) -> bool {
-    f.metadata().contains_key(BASIN_COLUMN_DEFAULT_KEY)
-}
-
 /// Given the full table schema and an optional user-supplied column list,
 /// return the subset of `Field`s the COPY-IN reader should expect (in column-
-/// list order). For COPY FROM with a column list, also validate that every
-/// column NOT in the list is either nullable or has a DEFAULT — otherwise
-/// the row would have nothing to put there. Each error returns SQLSTATE
-/// 42601 at the call site.
+/// list order). Validates that every listed column exists and is listed at
+/// most once; errors return SQLSTATE 42601 at the call site.
+///
+/// It deliberately does NOT validate that omitted NOT-NULL columns have a
+/// DEFAULT. `table_columns` here is resolved via a `SELECT * LIMIT 0` prepare
+/// (see [`resolve_table_columns`]), and DataFusion strips per-field metadata
+/// off projection output — so `BASIN_COLUMN_DEFAULT` (the marker behind SERIAL
+/// and user DEFAULTs) is invisible at this layer. A metadata-blind check here
+/// wrongly rejected valid column-list COPYs that omit a defaulted column (e.g.
+/// a SERIAL primary key). Authoritative enforcement lives in the engine ingest
+/// path (`copy_ingest::exec_copy_from_batch`), which reads the catalog schema
+/// (metadata intact): it fills DEFAULTs for omitted columns and raises a
+/// genuine NOT-NULL violation for an omitted required column with no default.
 pub(crate) fn select_copy_in_columns(
     table: &str,
     table_columns: &[Field],
@@ -812,18 +810,6 @@ pub(crate) fn select_copy_in_columns(
             .find(|f| f.name().eq_ignore_ascii_case(name))
             .ok_or_else(|| format!("COPY: column {name:?} does not exist on table {table:?}"))?;
         selected.push(field.clone());
-    }
-    // Every NOT NULL column without a DEFAULT must be in the list.
-    for f in table_columns {
-        if listed_names.contains(&f.name().to_ascii_lowercase()) {
-            continue;
-        }
-        if !f.is_nullable() && !field_has_default(f) {
-            return Err(format!(
-                "COPY: column \"{}\" cannot be NULL and has no default",
-                f.name()
-            ));
-        }
     }
     Ok(selected)
 }
@@ -2844,14 +2830,11 @@ mod tests {
     }
 
     #[test]
-    fn select_copy_in_columns_subset_with_default_ok() {
-        use std::collections::HashMap;
-        let mut md = HashMap::new();
-        md.insert(BASIN_COLUMN_DEFAULT_KEY.to_string(), "42".to_string());
+    fn select_copy_in_columns_subset_returns_listed_columns() {
         let table_cols = vec![
             Field::new("a", DataType::Int64, false),
             Field::new("b", DataType::Utf8, false),
-            Field::new("c", DataType::Int64, false).with_metadata(md),
+            Field::new("c", DataType::Int64, false),
         ];
         let list = vec!["a".to_string(), "b".to_string()];
         let r = select_copy_in_columns("t", &table_cols, Some(&list)).unwrap();
@@ -2861,16 +2844,22 @@ mod tests {
     }
 
     #[test]
-    fn select_copy_in_columns_missing_required_rejects() {
+    fn select_copy_in_columns_omitting_required_defers_to_engine() {
+        // The protocol layer no longer rejects an omitted NOT-NULL column: it
+        // cannot see DEFAULT metadata (stripped by DataFusion projection), so a
+        // SERIAL/defaulted column would be wrongly rejected here. Authoritative
+        // NOT-NULL + DEFAULT enforcement is the engine ingest path's job. So a
+        // column list that omits column "b" must pass this selection step.
         let table_cols = vec![
             Field::new("a", DataType::Int64, false),
-            Field::new("b", DataType::Utf8, false), // NOT NULL, no default
+            Field::new("b", DataType::Utf8, false), // NOT NULL (default invisible here)
             Field::new("c", DataType::Int64, true),
         ];
         let list = vec!["a".to_string(), "c".to_string()];
-        let e = select_copy_in_columns("t", &table_cols, Some(&list)).unwrap_err();
-        assert!(e.contains("\"b\""), "got: {e}");
-        assert!(e.contains("cannot be NULL"), "got: {e}");
+        let r = select_copy_in_columns("t", &table_cols, Some(&list)).unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].name(), "a");
+        assert_eq!(r[1].name(), "c");
     }
 
     #[test]

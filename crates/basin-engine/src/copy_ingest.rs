@@ -627,6 +627,16 @@ pub(crate) async fn exec_copy_from_batch(
         ));
     }
 
+    // Use the catalog's authoritative schema rather than the one passed by the
+    // router. The router derives its schema from a `SELECT * LIMIT 0` prepare,
+    // and DataFusion strips per-field metadata off projection output — so
+    // `BASIN_COLUMN_DEFAULT` (the `nextval(...)` expression behind SERIAL and
+    // any user DEFAULT) is invisible there. Without it the default-fill pass
+    // below silently no-ops and an omitted NOT-NULL DEFAULT column (e.g. a
+    // SERIAL primary key on a column-list COPY) wrongly fails the null check.
+    // `meta.schema` comes straight from the catalog and keeps that metadata.
+    let full_schema = meta.schema.clone();
+
     // Expand column-list rows to full-schema width (no-op when no column list).
     let full_rows = match column_names {
         None => rows,
