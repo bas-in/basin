@@ -8,6 +8,43 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Fix: `COPY` now fills column DEFAULTs (incl. `SERIAL`) for omitted columns
+
+- A column-list `COPY t (a, b) FROM …` that omitted a `NOT NULL` column backed
+  by a `DEFAULT`/`SERIAL`/`BIGSERIAL` wrongly failed with
+  `COPY: column "id" cannot be NULL and has no default`. Root cause: the router
+  resolved the table schema via a `SELECT * LIMIT 0` prepare, and DataFusion
+  strips per-field metadata off projection output — so `BASIN_COLUMN_DEFAULT`
+  (the marker behind a column default / serial sequence) was invisible at the
+  protocol layer, both for the pre-validation and for the schema handed to the
+  ingest path. Postgres fills serial defaults during `COPY`; Basin now does too.
+- Engine (`copy_ingest::exec_copy_from_batch`) resolves the **catalog** schema
+  (metadata intact) instead of trusting the router-supplied one, so the
+  DEFAULT-fill pass evaluates `nextval(...)` for omitted serial columns.
+- Router (`select_copy_in_columns`) drops the metadata-blind NOT-NULL
+  pre-validation; authoritative NOT-NULL + DEFAULT enforcement is the engine
+  ingest path's job (it fills defaults or raises a genuine null violation).
+
+## 2026-06-17 — Fix: control-plane admin token may administer any project
+
+- `/admin/v1/projects/:id/{max-connections,placement,snapshot,restore,fork}`
+  gated on the JWT's `project_id` matching the path project exactly, so the
+  single deploy-time control-plane token (scoped to `INTERNAL_AUTH_PROJECT_ID`)
+  could create projects (unscoped route) but got `403` on every per-project
+  admin call. `assert_admin_for_path_project` now treats an `is_admin` token
+  scoped to `INTERNAL_AUTH_PROJECT_ID` as a super-admin able to operate on any
+  project — security-neutral, since such a token is already all-powerful via the
+  unscoped provisioning route.
+
+## 2026-06-17 — Fix: TCP keepalive + nodelay on accepted pgwire connections
+
+- A freshly-accepted pgwire socket now gets `SO_KEEPALIVE` (30s idle / 10s
+  interval) and `TCP_NODELAY`. Keepalive stops an L4 proxy in front of the
+  engine (e.g. Fly's edge) from silently reaping a SQL connection that goes
+  quiet between statements; nodelay removes Nagle latency on the small messages
+  a session exchanges. Best-effort — a platform that rejects an option leaves
+  the socket usable.
+
 ## 2026-06-15 — Fix: `@@` rewriter no longer mangles SQL comments
 
 - The jsonb-path `@@` text-rewriter (`rewrite_binary_op_to_fn` in
