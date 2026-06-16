@@ -121,6 +121,15 @@ fn assert_admin_for_path_project(
     claims: &basin_auth::Claims,
     path_project_id: &ProjectId,
 ) -> Result<(), ApiError> {
+    // The control-plane super-admin token — scoped to INTERNAL_AUTH_PROJECT_ID —
+    // may operate on any project. That is the single deploy-time `is_admin`
+    // token the cloud control plane mints to provision and administer every
+    // project (see `basin_auth::Claims::is_admin` docs); without this it could
+    // create projects (the unscoped `POST /admin/v1/projects` route) but not
+    // set their connection ceiling or placement, which are path-scoped.
+    if claims.project_id.to_string() == basin_auth::INTERNAL_AUTH_PROJECT_ID {
+        return Ok(());
+    }
     if claims.project_id != *path_project_id {
         return Err(ApiError::forbidden(format!(
             "admin token scoped to project {} cannot operate on project {}",
@@ -355,6 +364,41 @@ mod tests {
     use std::sync::Arc;
 
     use basin_catalog::InMemoryCatalog;
+
+    fn claims_for(project_id: ProjectId, is_admin: bool) -> basin_auth::Claims {
+        basin_auth::Claims {
+            project_id,
+            user_id: Default::default(),
+            email: "admin@test".to_string(),
+            roles: Vec::new(),
+            exp: 0,
+            iat: 0,
+            is_admin,
+            aal: basin_auth::jwt::Aal::Aal1,
+            amr: Vec::new(),
+        }
+    }
+
+    /// The control-plane token (scoped to INTERNAL_AUTH_PROJECT_ID) is a
+    /// super-admin: it may operate on any path project. This is what lets the
+    /// cloud's single deploy-time admin JWT set per-project ceilings/placement.
+    #[test]
+    fn internal_project_token_is_super_admin() {
+        let internal: ProjectId = basin_auth::INTERNAL_AUTH_PROJECT_ID.parse().unwrap();
+        let some_other = ProjectId::new();
+        let claims = claims_for(internal, true);
+        assert!(assert_admin_for_path_project(&claims, &some_other).is_ok());
+    }
+
+    /// A token scoped to a concrete project may only operate on that project.
+    #[test]
+    fn project_scoped_token_cannot_cross_projects() {
+        let a = ProjectId::new();
+        let b = ProjectId::new();
+        let claims = claims_for(a.clone(), true);
+        assert!(assert_admin_for_path_project(&claims, &a).is_ok());
+        assert!(assert_admin_for_path_project(&claims, &b).is_err());
+    }
 
     // -- max-connections: catalog round-trips ---------------------------------
 

@@ -57,6 +57,15 @@ fn assert_admin_for_path_project(
     claims: &basin_auth::Claims,
     path_project_id: &ProjectId,
 ) -> Result<(), ApiError> {
+    // The control-plane super-admin token — scoped to INTERNAL_AUTH_PROJECT_ID —
+    // may operate on any project. That is the single deploy-time `is_admin`
+    // token the cloud control plane mints to provision and administer every
+    // project (see `basin_auth::Claims::is_admin` docs); without this it could
+    // create projects (the unscoped `POST /admin/v1/projects` route) but not
+    // set their connection ceiling or placement, which are path-scoped.
+    if claims.project_id.to_string() == basin_auth::INTERNAL_AUTH_PROJECT_ID {
+        return Ok(());
+    }
     if claims.project_id != *path_project_id {
         return Err(ApiError::forbidden(format!(
             "admin token scoped to project {} cannot operate on project {}",
