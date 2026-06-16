@@ -21,6 +21,7 @@ serde_json.workspace = true
 sqlparser.workspace = true
 
 tokio.workspace = true
+socket2.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 bytes.workspace = true

@@ -78,6 +78,10 @@ basin-autoscale = { path = "crates/basin-autoscale" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+# Raw socket options (TCP keepalive) on accepted pgwire connections, so a
+# long-lived client connection isn't reaped as idle by an L4 proxy in front
+# of the engine (e.g. Fly's edge). tokio already pulls socket2 in transitively.
+socket2 = "0.5"
 futures = "0.3"
 async-trait = "0.1"
 bytes = "1"

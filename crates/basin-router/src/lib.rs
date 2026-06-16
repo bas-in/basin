@@ -367,6 +367,13 @@ where
                         continue;
                     }
                 };
+                // Harden long-lived pgwire connections: TCP keepalive stops an
+                // L4 proxy in front of the engine (e.g. Fly's edge) from reaping
+                // a connection that's quiet between statements, and TCP_NODELAY
+                // removes Nagle latency on the small request/response messages a
+                // SQL session exchanges. Best-effort — a socket that rejects an
+                // option is still usable, so failures only log at debug.
+                tune_pgwire_socket(&sock, peer);
                 let factory = factory.clone();
                 let resolver = resolver.clone();
                 let rate_limit = rate_limit.clone();
@@ -379,6 +386,26 @@ where
                 });
             }
         }
+    }
+}
+
+/// Apply TCP_NODELAY + SO_KEEPALIVE (with a 30s idle / 10s interval probe
+/// schedule) to a freshly-accepted pgwire socket. Keepalive is what prevents an
+/// L4 proxy ahead of the engine (Fly's edge, a cloud LB) from silently dropping
+/// a SQL connection that goes quiet between statements; NODELAY trims Nagle
+/// latency on the small messages pgwire exchanges. All best-effort: a platform
+/// that rejects an option leaves the socket usable, so we log at debug and move
+/// on rather than fail the connection.
+fn tune_pgwire_socket(sock: &tokio::net::TcpStream, peer: SocketAddr) {
+    if let Err(e) = sock.set_nodelay(true) {
+        tracing::debug!(error = %e, %peer, "set_nodelay failed");
+    }
+    let sref = socket2::SockRef::from(sock);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(30))
+        .with_interval(std::time::Duration::from_secs(10));
+    if let Err(e) = sref.set_tcp_keepalive(&ka) {
+        tracing::debug!(error = %e, %peer, "set_tcp_keepalive failed");
     }
 }
 

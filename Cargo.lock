@@ -1498,6 +1498,7 @@ dependencies = [
  "rcgen",
  "rustls-pemfile",
  "serde_json",
+ "socket2 0.5.10",
  "sqlparser",
  "tempfile",
  "thiserror 2.0.18",
