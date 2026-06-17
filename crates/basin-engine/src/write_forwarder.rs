@@ -49,8 +49,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::StreamWriter;
+use arrow_array::RecordBatch;
+use arrow_schema::Schema;
 use async_trait::async_trait;
-use basin_common::{BasinError, Result};
+use base64::Engine as _;
+use basin_common::{BasinError, ProjectId, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::region::{ForwardContext, WriteForwarder};
 use crate::ExecResult;
@@ -63,6 +69,125 @@ pub const FORWARD_MODE_ENV: &str = "BASIN_WRITE_FORWARD_MODE";
 /// Format mirrors the Raft peers list: `region@host:port,region@host:port`,
 /// e.g. `fra@basin-fra.internal:5432,sin@basin-sin.internal:5432`.
 pub const REGION_PEERS_ENV: &str = "BASIN_REGION_PEERS";
+
+/// Environment variable holding the shared secret that authenticates the
+/// internal 6PN forward channel (`http-forward` mode). The forwarding client
+/// sends it in the [`FORWARD_SECRET_HEADER`] header; the receive route checks
+/// it. When unset:
+///
+/// * the receive route is NOT mounted (fail closed — the endpoint that executes
+///   arbitrary SQL as an arbitrary principal simply does not exist), and
+/// * the `http-forward` *client* is NOT installed — [`RegionWriteForwarder::from_env`]
+///   leaves the fail-loud [`UnconfiguredForwardClient`] in place, so a forward
+///   attempt errors instead of sending an unauthenticated request.
+///
+/// On Fly the endpoint is reachable only over the private 6PN `.internal`
+/// network; the shared secret is defence-in-depth on top of that isolation.
+pub const FORWARD_SECRET_ENV: &str = "BASIN_FORWARD_SECRET";
+
+/// The HTTP header carrying [`FORWARD_SECRET_ENV`] on an `http-forward` request.
+/// A custom header (not `Authorization`) keeps the internal channel distinct
+/// from client JWT / API-key auth.
+pub const FORWARD_SECRET_HEADER: &str = "x-basin-forward-secret";
+
+/// The path of the receive route on the home region's engine REST server that
+/// executes a forwarded statement. The [`HttpForwardClient`] POSTs to
+/// `http://<peer base_url>{FORWARD_RECEIVE_PATH}`.
+pub const FORWARD_RECEIVE_PATH: &str = "/internal/v1/forward";
+
+// ─── forward wire protocol (shared by client + receive route) ───────────────
+
+/// The JSON body POSTed to the home region's [`FORWARD_RECEIVE_PATH`]. Mirrors
+/// the carryable subset of [`ForwardContext`] (verbatim SQL + the principal
+/// that resolves `current_user` for RLS); session-local state is deliberately
+/// not carried (see the [`WriteForwarder`] contract).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForwardRequest {
+    /// Project whose home region (this receiver) must execute the statement.
+    pub project_id: ProjectId,
+    /// Principal that resolves SQL's `current_user` for RLS in the home region.
+    pub current_user: String,
+    /// The exact SQL text, unrewritten.
+    pub sql: String,
+}
+
+/// JSON-serializable image of an [`ExecResult`] for the forward wire. An
+/// `Empty` result carries only its command tag; a `Rows` result carries the
+/// schema + batches encoded as a base64 Arrow IPC stream (the same encoding the
+/// REST Arrow path uses), so row/column fidelity is preserved across the hop.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ForwardExecResult {
+    /// DDL/DML with no result set; `tag` is the Postgres command tag.
+    Empty { tag: String },
+    /// A result set, as a base64-encoded Arrow IPC stream (schema + batches).
+    Rows { ipc_b64: String },
+}
+
+impl ForwardExecResult {
+    /// Encode an engine [`ExecResult`] into its wire image. For `Rows`, the
+    /// schema + batches are serialised into a single Arrow IPC stream and
+    /// base64-encoded.
+    pub fn from_exec_result(res: &ExecResult) -> Result<ForwardExecResult> {
+        match res {
+            ExecResult::Empty { tag } => Ok(ForwardExecResult::Empty { tag: tag.clone() }),
+            ExecResult::Rows { schema, batches } => {
+                let bytes = encode_ipc(schema, batches)?;
+                let ipc_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+                Ok(ForwardExecResult::Rows { ipc_b64 })
+            }
+        }
+    }
+
+    /// Decode the wire image back into an engine [`ExecResult`], reconstructing
+    /// the schema + batches from the Arrow IPC stream.
+    pub fn into_exec_result(self) -> Result<ExecResult> {
+        match self {
+            ForwardExecResult::Empty { tag } => Ok(ExecResult::Empty { tag }),
+            ForwardExecResult::Rows { ipc_b64 } => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(ipc_b64.as_bytes())
+                    .map_err(|e| {
+                        BasinError::internal(format!("forward result: bad base64 IPC: {e}"))
+                    })?;
+                let (schema, batches) = decode_ipc(&bytes)?;
+                Ok(ExecResult::Rows { schema, batches })
+            }
+        }
+    }
+}
+
+/// Write `schema` + `batches` into a single Arrow IPC stream byte buffer.
+fn encode_ipc(schema: &Arc<Schema>, batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut buf, schema.as_ref())
+        .map_err(|e| BasinError::internal(format!("forward result: IPC writer: {e}")))?;
+    for batch in batches {
+        writer
+            .write(batch)
+            .map_err(|e| BasinError::internal(format!("forward result: IPC write: {e}")))?;
+    }
+    writer
+        .finish()
+        .map_err(|e| BasinError::internal(format!("forward result: IPC finish: {e}")))?;
+    drop(writer);
+    Ok(buf)
+}
+
+/// Decode an Arrow IPC stream back into `(schema, batches)`.
+fn decode_ipc(bytes: &[u8]) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
+    let cursor = std::io::Cursor::new(bytes);
+    let reader = StreamReader::try_new(cursor, None)
+        .map_err(|e| BasinError::internal(format!("forward result: IPC reader: {e}")))?;
+    let schema = reader.schema();
+    let mut batches = Vec::new();
+    for batch in reader {
+        let batch =
+            batch.map_err(|e| BasinError::internal(format!("forward result: IPC batch: {e}")))?;
+        batches.push(batch);
+    }
+    Ok((schema, batches))
+}
 
 // ─── forwarding mode ───────────────────────────────────────────────────────
 
@@ -221,10 +346,86 @@ impl ForwardClient for UnconfiguredForwardClient {
         _sql: &str,
     ) -> Result<ExecResult> {
         Err(BasinError::wal(format!(
-            "http-forward transport to peer {base_url:?} is not yet wired \
-             (the home-region internal SQL endpoint is the edge-integration \
-             follow-up); set BASIN_WRITE_FORWARD_MODE=fly-replay on Fly"
+            "http-forward transport to peer {base_url:?} is not configured \
+             (set BASIN_FORWARD_SECRET to enable the 6PN forward channel, or \
+             set BASIN_WRITE_FORWARD_MODE=fly-replay on Fly)"
         )))
+    }
+}
+
+/// The real `http-forward` transport: POSTs a [`ForwardRequest`] to the home
+/// region's engine over Fly 6PN HTTP ([`FORWARD_RECEIVE_PATH`]), authenticated
+/// by the shared secret in the [`FORWARD_SECRET_HEADER`] header, and decodes the
+/// home region's [`ForwardExecResult`] back into an [`ExecResult`].
+///
+/// Installed by [`RegionWriteForwarder::from_env`] only when
+/// `BASIN_WRITE_FORWARD_MODE=http-forward` AND peers AND [`FORWARD_SECRET_ENV`]
+/// are all set; otherwise the fail-loud [`UnconfiguredForwardClient`] stays in
+/// place. Any transport / decode fault is surfaced as a typed [`BasinError`]
+/// (no silent swallow), per the [`WriteForwarder`] contract.
+pub struct HttpForwardClient {
+    http: reqwest::Client,
+    secret: String,
+}
+
+impl HttpForwardClient {
+    /// Build with an explicit reqwest client + shared secret. The peer base URL
+    /// is supplied per-call by the routing decision.
+    pub fn new(http: reqwest::Client, secret: impl Into<String>) -> Self {
+        Self {
+            http,
+            secret: secret.into(),
+        }
+    }
+
+    /// Build with a default reqwest client (rustls, JSON) and the given secret.
+    pub fn with_secret(secret: impl Into<String>) -> Self {
+        Self::new(reqwest::Client::new(), secret.into())
+    }
+
+    /// The full receive URL for a peer `base_url` (`host:port`). 6PN traffic is
+    /// plain HTTP on the private network; `base_url` already carries host:port.
+    pub fn receive_url(base_url: &str) -> String {
+        format!("http://{base_url}{FORWARD_RECEIVE_PATH}")
+    }
+}
+
+#[async_trait]
+impl ForwardClient for HttpForwardClient {
+    async fn forward(
+        &self,
+        base_url: &str,
+        project: basin_common::ProjectId,
+        current_user: &str,
+        sql: &str,
+    ) -> Result<ExecResult> {
+        let url = Self::receive_url(base_url);
+        let body = ForwardRequest {
+            project_id: project,
+            current_user: current_user.to_string(),
+            sql: sql.to_string(),
+        };
+        let resp = self
+            .http
+            .post(&url)
+            .header(FORWARD_SECRET_HEADER, &self.secret)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                BasinError::wal(format!("http-forward POST to {url:?} failed: {e}"))
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(BasinError::wal(format!(
+                "http-forward to {url:?} returned {status}: {detail}"
+            )));
+        }
+        let wire: ForwardExecResult = resp.json().await.map_err(|e| {
+            BasinError::wal(format!("http-forward response from {url:?} is not a ForwardExecResult: {e}"))
+        })?;
+        wire.into_exec_result()
     }
 }
 
@@ -315,7 +516,18 @@ impl RegionWriteForwarder {
             return Ok(None);
         }
         let peers = PeerRegistry::from_env()?;
-        let client: Arc<dyn ForwardClient> = Arc::new(UnconfiguredForwardClient);
+        // For http-forward, install the real transport ONLY when a shared
+        // secret is configured AND peers exist; otherwise keep the fail-loud
+        // placeholder so an unauthenticated / unroutable forward never goes out
+        // silently. fly-replay never touches the client, so its behaviour is
+        // unchanged regardless of the secret.
+        let client: Arc<dyn ForwardClient> = match mode {
+            ForwardMode::HttpForward => match forward_secret_from_env() {
+                Some(secret) if !peers.is_empty() => Arc::new(HttpForwardClient::with_secret(secret)),
+                _ => Arc::new(UnconfiguredForwardClient),
+            },
+            _ => Arc::new(UnconfiguredForwardClient),
+        };
         Ok(Some(Self::new(mode, peers, client)))
     }
 
@@ -372,6 +584,16 @@ impl RegionWriteForwarder {
 /// originating (local) region so a replay loop (region A → B → A) is visible in
 /// logs. Uniqueness comes from a monotonic process counter; this is a
 /// correlation id, not a security token.
+/// Read [`FORWARD_SECRET_ENV`] from the process environment, treating an empty
+/// / whitespace-only value as absent (fail-closed). Public so the REST receive
+/// route mounts on exactly the same condition the client installs on.
+pub fn forward_secret_from_env() -> Option<String> {
+    match std::env::var(FORWARD_SECRET_ENV) {
+        Ok(v) if !v.trim().is_empty() => Some(v),
+        _ => None,
+    }
+}
+
 fn fresh_replay_token(local_region: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -629,5 +851,136 @@ mod tests {
         let b = fresh_replay_token("jnb");
         assert_ne!(a, b);
         assert!(a.starts_with("jnb-"));
+    }
+
+    // ── http-forward transport: URL + secret header construction ─────────────
+
+    #[test]
+    fn http_forward_receive_url_targets_peer_internal_path() {
+        // The client must POST to the peer's base_url + the internal receive
+        // path over plain HTTP (6PN is a private, plaintext network).
+        assert_eq!(
+            HttpForwardClient::receive_url("basin-fra.internal:5432"),
+            "http://basin-fra.internal:5432/internal/v1/forward"
+        );
+        assert_eq!(FORWARD_RECEIVE_PATH, "/internal/v1/forward");
+    }
+
+    #[test]
+    fn http_forward_client_carries_secret_in_request() {
+        // Build a request the same way `forward()` does and assert the secret
+        // is attached to the configured header. Mirrors the request-construction
+        // test style used elsewhere (no live server needed): we inspect the
+        // built `reqwest::Request` rather than sending it.
+        let client = HttpForwardClient::with_secret("top-secret");
+        let url = HttpForwardClient::receive_url("host-fra:5432");
+        let body = ForwardRequest {
+            project_id: proj(),
+            current_user: "app".into(),
+            sql: "INSERT INTO t VALUES (1)".into(),
+        };
+        let req = client
+            .http
+            .post(&url)
+            .header(FORWARD_SECRET_HEADER, &client.secret)
+            .json(&body)
+            .build()
+            .expect("request builds");
+        assert_eq!(req.method(), reqwest::Method::POST);
+        assert_eq!(
+            req.url().as_str(),
+            "http://host-fra:5432/internal/v1/forward"
+        );
+        let got = req
+            .headers()
+            .get(FORWARD_SECRET_HEADER)
+            .expect("secret header present");
+        assert_eq!(got.to_str().unwrap(), "top-secret");
+    }
+
+    // ── forward wire round-trip ──────────────────────────────────────────────
+
+    #[test]
+    fn forward_request_json_round_trip() {
+        let req = ForwardRequest {
+            project_id: proj(),
+            current_user: "service_role".into(),
+            sql: "UPDATE t SET a = 1 WHERE id = 7".into(),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: ForwardRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(req, back);
+        // project_id serialises as a transparent ULID string.
+        assert!(json.contains(&req.project_id.to_string()));
+    }
+
+    #[test]
+    fn forward_exec_result_empty_round_trip() {
+        let res = ExecResult::Empty {
+            tag: "INSERT 0 1".into(),
+        };
+        let wire = ForwardExecResult::from_exec_result(&res).expect("encode");
+        let json = serde_json::to_string(&wire).expect("serialize");
+        // Tag-shaped enum so the receiver can distinguish empty vs rows.
+        assert!(json.contains("\"kind\":\"empty\""));
+        let back: ForwardExecResult = serde_json::from_str(&json).expect("deserialize");
+        match back.into_exec_result().expect("decode") {
+            ExecResult::Empty { tag } => assert_eq!(tag, "INSERT 0 1"),
+            other => panic!("expected Empty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forward_exec_result_rows_round_trip() {
+        use arrow_array::{Array, Int64Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 42])),
+                Arc::new(StringArray::from(vec![Some("alice"), None])),
+            ],
+        )
+        .unwrap();
+        let res = ExecResult::Rows {
+            schema: schema.clone(),
+            batches: vec![batch],
+        };
+
+        // Encode → JSON → decode and verify schema + values survive the hop.
+        let wire = ForwardExecResult::from_exec_result(&res).expect("encode");
+        let json = serde_json::to_string(&wire).expect("serialize");
+        assert!(json.contains("\"kind\":\"rows\""));
+        let back: ForwardExecResult = serde_json::from_str(&json).expect("deserialize");
+        match back.into_exec_result().expect("decode") {
+            ExecResult::Rows { schema: s, batches } => {
+                assert_eq!(s.fields().len(), 2);
+                assert_eq!(s.field(0).name(), "id");
+                assert_eq!(s.field(1).name(), "name");
+                assert_eq!(batches.len(), 1);
+                let b = &batches[0];
+                assert_eq!(b.num_rows(), 2);
+                let ids = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                assert_eq!(ids.value(0), 1);
+                assert_eq!(ids.value(1), 42);
+                let names = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(names.value(0), "alice");
+                assert!(names.is_null(1));
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
     }
 }

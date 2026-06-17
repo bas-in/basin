@@ -8,6 +8,69 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-18 — Catalog-driven file discovery: zero LIST RPCs on warm scans/writes
+
+- `Storage::list_data_files` (and through it `list_data_files_with_stats`) and
+  the storage-layer `read()` file-discovery path now serve the table's live
+  data-file set straight from the attached catalog
+  (`Snapshot::live_data_files`) instead of issuing object-store `LIST` RPCs
+  against the hot `data/` and cold `cold/` tier prefixes. The catalog already
+  holds the authoritative file set (path + size + row-count + column-stats,
+  committed transactionally at write/compaction time), so a warm scan or write
+  on a RAM-resident table now makes **zero** `LIST` round-trips.
+- Eliminates a fixed ~2× object-store `LIST` per query (≈50 ms combined on
+  intra-region S3/Tigris at ~25 ms/RTT) that previously hit every range scan,
+  aggregate, `ORDER BY … LIMIT`, single-row `INSERT`, `UPDATE`, and `DELETE`
+  — collapsing the scan/write latency floor toward the point-lookup floor.
+  Measured locally against MinIO with per-op object-store tracing: range /
+  full-agg / top-k / update / insert went from 2 `LIST`s each to 0.
+- Strict round-trip elimination, not a visibility change: the catalog and a
+  `LIST` enumerate the same physical files, and un-flushed rows are still
+  tail-merged from the in-memory memtable on the read path. Falls back to the
+  object-store `LIST` when no catalog is attached or the table is not
+  catalog-known (schema-less callers, integration tests), so behaviour for
+  those paths is unchanged.
+
+## 2026-06-18 — Multi-region: `http-forward` write transport + receive endpoint (ADR 0009)
+
+- `BASIN_WRITE_FORWARD_MODE=http-forward` now actually forwards a non-home
+  auto-commit write to the project's home region over Fly 6PN HTTP and returns
+  the home region's result. Previously the transport was a placeholder
+  (`UnconfiguredForwardClient`) that failed loud, and no route received a
+  forwarded statement — only `fly-replay` worked.
+- New receive route `POST /internal/v1/forward` on the engine REST server: body
+  `{project_id, current_user, sql}`. It opens a home-region session as that
+  principal (so `current_user`/RLS resolve correctly), executes the statement,
+  and returns the `ExecResult` as JSON (`{kind:"empty",tag}` or
+  `{kind:"rows",ipc_b64}`, where rows are a base64 Arrow IPC stream preserving
+  schema + values).
+- Security / fail-closed: the route executes arbitrary SQL as an arbitrary
+  principal, so it is **only mounted when `BASIN_FORWARD_SECRET` is set**, and
+  every request must carry that secret in the `x-basin-forward-secret` header
+  (constant-time compare; 401 on missing/mismatch). On Fly it is reachable only
+  over the private 6PN `.internal` network. With no secret the route does not
+  exist (404). The `http-forward` *client* is likewise only installed when the
+  mode is `http-forward` AND peers (`BASIN_REGION_PEERS`) AND
+  `BASIN_FORWARD_SECRET` are all configured; otherwise the fail-loud placeholder
+  remains.
+- `fly-replay` and `off` modes are unchanged; unset/empty mode or a missing
+  secret/peers behaves identically to before.
+
+## 2026-06-18 — Observability: `GET /metrics/inflight` exposes in-flight + latency for autoscaling
+
+- New REST route `GET /metrics/inflight` returns a small JSON snapshot of
+  engine-wide load: `inflight` (concurrency gauge of statements executing now),
+  rolling-window `p50_micros`/`p99_micros` query-latency percentiles, `samples`,
+  `window_secs` (default 10), plus `started_at`/`observed_at` (RFC3339 UTC) and a
+  `goroutines` mirror of `inflight`. Previously this route 404'd, so an external
+  autoscaler had no load signal.
+- Backed by a process-global `inflight_metrics` module: an `AtomicI64` gauge with
+  an RAII guard (decrements + records latency on drop, including error/unwind
+  paths) and a mutex-guarded latency ring pruned to the window on read. The gauge
+  wraps the pgwire/REST statement chokepoints (`ProjectSession::execute` and
+  `execute_bound`) — one wrap per statement, no double-count. One atomic inc/dec +
+  one mutex push per query; polled once per scrape.
+
 ## 2026-06-18 — Perf (OLTP): point/small INSERT prunes instead of rebuilding the PK set
 
 - Single-row INSERT was ~200 ms+ because `enforce_pk_on_insert` on a sub-threshold

@@ -27,6 +27,9 @@ pub(crate) mod cdc_webhooks;
 pub(crate) mod data;
 pub(crate) mod fn_handler;
 pub(crate) mod inbound;
+// Multi-region (ADR 0009) http-forward receive endpoint. Mounted only when
+// `BASIN_FORWARD_SECRET` is set (fail-closed); see `crate::server::router`.
+pub(crate) mod internal_forward;
 pub(crate) mod openapi;
 pub(crate) mod rpc;
 pub(crate) mod storage;

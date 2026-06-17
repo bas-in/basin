@@ -48,6 +48,7 @@ use crate::routes::{
     admin_functions as admin_fn_routes,
     admin_projects as admin_projects_routes, auth as auth_routes, data as data_routes,
     fn_handler as fn_handler_routes, inbound as inbound_routes,
+    internal_forward as internal_forward_routes,
     openapi as openapi_routes, rpc as rpc_routes,
     storage as storage_routes, storage_sign as storage_sign_routes,
 };
@@ -90,6 +91,14 @@ pub(crate) struct Inner {
     /// independently. Seeded from the JWT secret at startup; rotated via
     /// `POST /admin/v1/storage/signing-key/rotate`.
     pub(crate) blob_signing_secret: Arc<BlobSigningSecret>,
+    /// Multi-region (ADR 0009) http-forward shared secret. When `Some`, the
+    /// `POST /internal/v1/forward` receive route is mounted and authenticates
+    /// every request against this value. When `None` (the default — env
+    /// `BASIN_FORWARD_SECRET` unset/empty) the route is NOT mounted at all, so
+    /// the arbitrary-SQL-as-arbitrary-principal endpoint does not exist and
+    /// behaviour is byte-identical to before the feature. Read once at startup
+    /// from [`basin_engine::write_forwarder::forward_secret_from_env`].
+    pub(crate) forward_secret: Option<String>,
     /// Feature 2: optional realtime co-mount (SSE + WS on the REST port).
     /// When set, the SSE router is merged at `/realtime/v1/sse/:project/:table`
     /// and the WS router at `/realtime/v1/ws/:project`.  Absent → those paths
@@ -204,6 +213,7 @@ impl Inner {
             fn_catalog: None,
             function_registry: admin_fn_routes::FunctionRegistry::new(),
             blob_signing_secret,
+            forward_secret: basin_engine::write_forwarder::forward_secret_from_env(),
             #[cfg(feature = "realtime")]
             realtime: None,
             #[cfg(feature = "realtime")]
@@ -479,6 +489,9 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             post(admin_fn_routes::function_rollback),
         )
         .route("/health", get(health))
+        // Engine in-flight + latency telemetry for the cloud autoscaler. The
+        // scaler polls this per region (~15s) and scales up on p99 or inflight.
+        .route("/metrics/inflight", get(metrics_inflight))
         // --- Phase 5.17.B: object-storage HTTP surface (ADR 0021) -----------
         // TODO 5.17.B-featuregate: wrap in #[cfg(feature = "storage")] once
         //      ADR 0018 adds the `storage` Cargo feature to basin-server.
@@ -572,6 +585,19 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         );
     // <<< ADR 0028 Phase 3 CDC-KAFKA-SINK ROUTES (anchored, flagged) <<<
 
+    // Multi-region (ADR 0009) http-forward receive route. FAIL CLOSED: only
+    // mounted when a shared secret is configured. With no secret the route
+    // does not exist (404) — the arbitrary-SQL endpoint is not reachable and
+    // default deployments are byte-identical to before this feature.
+    let app = if inner.forward_secret.is_some() {
+        app.route(
+            "/internal/v1/forward",
+            post(internal_forward_routes::post_forward),
+        )
+    } else {
+        app
+    };
+
     let app = app
         .layer(body_limit)
         .layer(cors)
@@ -606,6 +632,15 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// `GET /metrics/inflight` — process-global in-flight + latency snapshot.
+///
+/// Serves the engine's [`basin_engine::inflight_metrics`] snapshot as JSON.
+/// The field names + casing match the `MetricsSample` contract the cloud
+/// autoscaler deserializes; do not reshape this here.
+async fn metrics_inflight() -> axum::Json<basin_engine::inflight_metrics::MetricsSnapshot> {
+    axum::Json(basin_engine::inflight_metrics::snapshot())
 }
 
 /// Build the CORS layer from the configured allowlist.

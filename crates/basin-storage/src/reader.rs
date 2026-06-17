@@ -182,6 +182,22 @@ pub(crate) async fn list_data_files(
     project: &ProjectId,
     table: &TableName,
 ) -> Result<Vec<DataFile>> {
+    // Catalog-driven fast path: when a catalog is attached it already holds
+    // the authoritative live file set (path + size + row_count +
+    // column_stats), so we discover the table's files with ZERO object-store
+    // LIST RPCs. On a warm, RAM-resident table this collapses the per-query
+    // 2× LIST round-trip (hot `data/` + `cold/` prefixes) that dominated the
+    // scan/write latency floor on high-RTT object stores. Both the
+    // catalog and the LIST enumerate the same physical files (the catalog is
+    // updated transactionally at write-commit / compaction), so this is a
+    // strict round-trip elimination, not a visibility change.
+    //
+    // Falls back to the object-store LIST when no catalog is attached or the
+    // table is not catalog-known (schema-less callers, integration tests).
+    if let Some(files) = storage.catalog_live_data_files(project, table).await {
+        return Ok(files);
+    }
+
     // Backward-compat thin wrapper: drains the streaming variant into a
     // `Vec`. Callers that need to short-circuit on LIMIT should use
     // [`list_data_files_stream`] directly so they don't pay for the cold
@@ -627,6 +643,12 @@ pub(crate) async fn read(
             })
             .map(|f| f.path)
             .collect()
+    } else if let Some(files) = storage.catalog_live_data_files(project, table).await {
+        // Catalog-driven fast path (no predicate): the catalog already knows
+        // the live file set, so a warm unfiltered scan makes ZERO LIST RPCs.
+        // The catalog never records files outside the project prefix; the
+        // suffix filter already ran inside `catalog_live_data_files`.
+        files.into_iter().map(|f| f.path).collect()
     } else {
         let store = storage.project_store(project);
         let project_id_string = project.as_prefix();

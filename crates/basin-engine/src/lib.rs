@@ -1485,6 +1485,13 @@ impl ProjectSession {
     /// or a side-effect tag for DML/DDL ([`ExecResult::Empty`]).
     #[tracing::instrument(skip(self, sql), fields(project=%self.project, sql=%sql.lines().next().unwrap_or("")))]
     pub async fn execute(&self, sql: &str) -> Result<ExecResult> {
+        // In-flight gauge + latency window for the cloud autoscaler. The guard
+        // increments the engine-wide concurrency counter now and, on drop
+        // (success, error, or unwind), decrements it and records elapsed
+        // latency. This is the simple-query chokepoint; `execute_bound` is the
+        // extended/prepared one — a statement passes through exactly one of
+        // them, so they never double-count.
+        let _inflight = crate::inflight_metrics::enter();
         let started = std::time::Instant::now();
         let result = crate::executor::execute(self, sql).await;
         // Bump the noisy-project rate estimator regardless of success: a
@@ -1535,6 +1542,9 @@ impl ProjectSession {
     /// Execute a previously [`bind`](Self::bind)-produced statement. Output
     /// shape matches [`execute`](Self::execute).
     pub async fn execute_bound(&self, bound: BoundStatement) -> Result<ExecResult> {
+        // Extended/prepared-query chokepoint. See `execute` above — the guard
+        // covers the in-flight gauge + latency window on all exit paths.
+        let _inflight = crate::inflight_metrics::enter();
         crate::prepared::execute_bound(self, bound).await
     }
 
@@ -1679,6 +1689,7 @@ mod is_distinct_rewrite;
 mod function_ddl;
 mod generated_cols;
 pub mod inbound_webhook_ddl;
+pub mod inflight_metrics;
 mod geo_glue;
 mod index_extras;
 pub(crate) mod index_probe;
