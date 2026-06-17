@@ -8,6 +8,18 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Perf: keep Vortex footers/zone-maps RAM-resident (cold-read + point-lookup win)
+
+- The Vortex footer cache was capped at 512 entries (LRU) while the Parquet meta
+  cache holds 16k — so a many-file table re-fetched footers from the object store
+  on every query, slowing cold OLAP and the point-lookup file-open. Bumped the
+  default to 16,384 (≈ a few MB resident; footers are tiny) + added
+  `BASIN_STORAGE_VORTEX_FOOTER_CACHE_CAP`. Now zone-map pruning never re-reads a
+  footer from the bucket, so most point/range queries open exactly one data file
+  — directly helps both OLAP cold reads and OLTP point lookups (the bloom-pruned
+  single-file open is served from cache). Page cache is bumped per-deployment via
+  `BASIN_PAGE_CACHE_MAX_BYTES` (engine default stays conservative for small OSS boxes).
+
 ## 2026-06-17 — Observability: shard tail-pressure warning (bounded-memory signal)
 
 - A 10M-row wide COPY OOM-killed a 2 GB engine: the shard's in-memory tail

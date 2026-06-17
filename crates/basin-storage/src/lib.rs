@@ -639,12 +639,31 @@ pub fn resolve_parquet_meta_cache_cap() -> usize {
 /// segments per (project, table, column).
 const DEFAULT_HNSW_SEGMENT_CACHE_CAP: usize = 256;
 
-/// Default capacity for the Vortex footer cache: 512 entries. Each entry
-/// holds a cloned `vortex_file::Footer` (Arc-wrapped internals, O(1) clone)
-/// so the per-entry cost is dominated by the Arc ref counts, not by the
-/// footer payload size. 512 covers the working set of all current benchmarks
-/// and the Phase 5.7 integration suite without material RAM overhead.
-const DEFAULT_VORTEX_FOOTER_CACHE_CAP: usize = 512;
+/// Default capacity for the Vortex footer cache. Each entry holds a cloned
+/// `vortex_file::Footer` (Arc-wrapped internals, O(1) clone) — per-entry cost
+/// is dominated by Arc ref counts + the path string, not the footer payload,
+/// so ~16k resident footers cost only a few MB. Sized to match the Parquet
+/// meta cache so footer-based pruning stays warm across a large file set:
+/// keeping footers RAM-resident means query pruning (`evaluate_compound_for_pruning`)
+/// never re-reads a footer from the object store, so most point/range queries
+/// open exactly one data file. (Was 512 — too small for a many-file table, so
+/// cold OLAP re-fetched footers from the bucket on every query.) Override with
+/// `BASIN_STORAGE_VORTEX_FOOTER_CACHE_CAP` (positive `usize`).
+const DEFAULT_VORTEX_FOOTER_CACHE_CAP: usize = 16_384;
+
+/// Resolve the Vortex footer cache capacity, honoring
+/// `BASIN_STORAGE_VORTEX_FOOTER_CACHE_CAP` when present and parseable to a
+/// positive `usize`. Falls back to [`DEFAULT_VORTEX_FOOTER_CACHE_CAP`].
+pub fn resolve_vortex_footer_cache_cap() -> usize {
+    if let Ok(v) = std::env::var("BASIN_STORAGE_VORTEX_FOOTER_CACHE_CAP") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    DEFAULT_VORTEX_FOOTER_CACHE_CAP
+}
 
 /// Default capacity for the per-file data-file stats cache. Sized to match
 /// [`DEFAULT_PARQUET_META_CACHE_CAP`] so a table whose footers all fit in the
@@ -708,7 +727,7 @@ impl Storage {
                 // `StorageConfig` field means every existing call site compiles
                 // unchanged.
                 vortex_footer_cache: Arc::new(VortexFooterCache::new(
-                    DEFAULT_VORTEX_FOOTER_CACHE_CAP,
+                    resolve_vortex_footer_cache_cap(),
                 )),
                 data_file_stats_cache: Arc::new(metadata_cache::DataFileStatsCache::new(
                     DEFAULT_DATA_FILE_STATS_CACHE_CAP,
