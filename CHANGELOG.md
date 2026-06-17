@@ -8,6 +8,20 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Fix: DROP TABLE purges object-store files (no ghost rows on re-create)
+
+- `DROP TABLE` dropped the catalog row, hot-tier overlay, and shard tail but
+  **left the table's cold data files in object storage**. A later
+  `CREATE TABLE` of the SAME name then inherited those orphaned `.vortex`
+  files — surfacing as ghost rows: spurious `duplicate key` errors on a fresh
+  PK table, or inflated `count(*)` on a no-PK table. (The materialized-view
+  drop path already deleted its files; regular DROP TABLE did not.)
+- Fix: new `Storage::delete_table_prefix` deletes everything under
+  `…/projects/{project}/tables/{table}/` (all tiers + index segments), called
+  by `exec_drop_table` after the shard tail is cleared (so no in-flight
+  compaction is still writing under the prefix). Verified: COPY 50k → DROP →
+  re-CREATE same name → COPY 50k yields exactly 50k rows, no ghost duplicate.
+
 ## 2026-06-17 — Fix (major): pooled sessions now use the fast batched COPY path
 
 - `PooledSessionWrapper` (the session the pgwire router uses whenever

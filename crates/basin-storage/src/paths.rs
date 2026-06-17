@@ -80,6 +80,22 @@ pub(crate) fn table_data_prefix(
     table_tier_prefix(root, project, table, Tier::Hot)
 }
 
+/// Prefix that ALL of one project+table's files live under — every tier
+/// (`data/`, `cold/`), index segments, and sidecars. Deleting this prefix
+/// removes the table's bytes entirely (used by DROP TABLE so a re-created
+/// same-named table does not inherit orphaned data files).
+pub(crate) fn table_root(
+    root: Option<&ObjectPath>,
+    project: &ProjectId,
+    table: &TableName,
+) -> ObjectPath {
+    let mut p = root.cloned().unwrap_or_else(|| ObjectPath::from(""));
+    p = p.child(PROJECTS_SEGMENT);
+    p = p.child(project.as_prefix());
+    p = p.child(TABLES_SEGMENT);
+    p.child(table.as_str())
+}
+
 /// Prefix that all of one project+table's files in a storage tier live under.
 pub(crate) fn table_tier_prefix(
     root: Option<&ObjectPath>,

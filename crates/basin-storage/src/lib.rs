@@ -1653,6 +1653,47 @@ impl Storage {
         Ok(deleted.len())
     }
 
+    /// Delete every object under one project+table's prefix
+    /// (`…/projects/{project}/tables/{table}/` — all tiers, index segments,
+    /// sidecars). Called by DROP TABLE so a later re-CREATE of the same name
+    /// starts empty instead of inheriting orphaned data files (which surface
+    /// as ghost rows / spurious PK-duplicate errors). Best-effort and
+    /// idempotent: a table with no files deletes zero objects. Returns the
+    /// number of objects removed.
+    pub async fn delete_table_prefix(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<usize> {
+        let p = paths::table_root(self.inner.root_prefix.as_ref(), project, table);
+        let gated = self.project_object_store(project);
+        let paths_stream = gated.list(Some(&p)).map_ok(|m| m.location).boxed();
+        let inner = self.inner.object_store.clone();
+        let collected: Vec<ObjectPath> = paths_stream.try_collect().await.map_err(|e| {
+            basin_common::BasinError::storage(format!(
+                "delete_table_prefix({project}/{table}) list: {e}"
+            ))
+        })?;
+        let deleted: Vec<ObjectPath> = bulk_delete(&inner, collected).await.map_err(|e| {
+            basin_common::BasinError::storage(format!(
+                "delete_table_prefix({project}/{table}): {e}"
+            ))
+        })?;
+        if let Some(pc) = self.page_cache_handle() {
+            for path in &deleted {
+                pc.invalidate_path(path);
+            }
+        }
+        tracing::info!(
+            target: "basin_storage::delete_table",
+            project = %project,
+            table = %table.as_str(),
+            files = deleted.len(),
+            "delete_table_prefix",
+        );
+        Ok(deleted.len())
+    }
+
     /// Build the project's full object-store prefix, honouring the optional
     /// configured root. `…/projects/{project}` — every key the storage layer
     /// emits for this project lives below this.

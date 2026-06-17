@@ -4468,6 +4468,29 @@ async fn exec_drop_table(
                     // be looked up via the catalog).
                     let _ = shard.drop_table(&sess.project, &table).await;
                 }
+
+                // Purge the table's object-store bytes. The catalog row is
+                // gone and (above) the hot tier + shard tail are cleared, but
+                // the cold data files persist in object storage — so a later
+                // CREATE TABLE of the SAME name would inherit them as ghost
+                // rows (spurious PK-duplicate errors / double counts). Done
+                // AFTER the shard tail drop so no in-flight compaction is
+                // still writing under the prefix. Best-effort: a failure here
+                // leaves reclaimable bytes but does not corrupt the catalog.
+                if let Err(e) = sess
+                    .engine
+                    .config()
+                    .storage
+                    .delete_table_prefix(&sess.project, &table)
+                    .await
+                {
+                    tracing::warn!(
+                        project = %sess.project,
+                        table = %table.as_str(),
+                        error = %e,
+                        "DROP TABLE: object-store purge failed; bytes may be reclaimable later",
+                    );
+                }
             }
             Err(BasinError::NotFound(_)) if if_exists => {
                 // IF EXISTS — silently ignore missing tables.
