@@ -76,6 +76,13 @@ pub(crate) struct PkSetCache {
 
 pub(crate) struct CachedPkSet {
     pub files_sig: u64,
+    /// The data-file paths this PK set was built from. When a later enforcement
+    /// finds the file set has only GROWN (new files added, none removed — the
+    /// bulk-COPY/append case where each committed chunk adds a file), it seeds
+    /// from this cached set and scans ONLY the new files instead of re-reading
+    /// every file from cold storage. That turns a PK-table bulk load from
+    /// O(files²) cold reads into O(files).
+    pub files: Arc<std::collections::HashSet<String>>,
     /// On-disk PK tuples — string-canonical form, matching the shape the
     /// constraint comparator hashes on (`scalar_to_canonical_string`).
     pub set: Arc<std::collections::HashSet<Vec<String>>>,
@@ -301,13 +308,19 @@ pub(crate) async fn enforce_pk_on_insert(
     // safe — it falls back to the old (still-correct) full scan path.
     let files_sig = files_signature(&data_files);
     let cache_eligible = tombstone_keys.is_empty();
-    let cached_entry: Option<Arc<CachedPkSet>> = if cache_eligible {
-        pk_cache
-            .and_then(|c| c.get(project, table))
-            .filter(|entry| entry.files_sig == files_sig)
+    // Path set of the current live files — used both to detect the "files only
+    // grew" case (incremental extend) and stored on the cache entry we write.
+    let current_paths: Arc<std::collections::HashSet<String>> =
+        Arc::new(data_files.iter().map(|f| f.path.to_string()).collect());
+    let raw_cached: Option<Arc<CachedPkSet>> = if cache_eligible {
+        pk_cache.and_then(|c| c.get(project, table))
     } else {
         None
     };
+    let cached_entry: Option<Arc<CachedPkSet>> = raw_cached
+        .as_ref()
+        .filter(|entry| entry.files_sig == files_sig)
+        .cloned();
 
     if let Some(entry) = cached_entry {
         // Cache hit. Probe directly against the cached set.
@@ -352,20 +365,54 @@ pub(crate) async fn enforce_pk_on_insert(
         return Ok(());
     }
 
-    // Cache miss (or cache-ineligible): rebuild the existing set from the
-    // current on-disk file set, using projection pushdown to skip the
-    // JSONB / TEXT payload columns entirely.
+    // Cache miss: rebuild the existing PK set. If a cached set was built from a
+    // SUBSET of the current files (only additions since — the bulk-COPY case
+    // where each committed chunk adds a file), seed from it and scan ONLY the
+    // newly-added files. Otherwise (first build, or files were replaced by a
+    // compaction → not a subset) rebuild from scratch over every file. Uses
+    // projection pushdown to read only the PK columns, skipping JSONB / TEXT.
     let read_opts = basin_storage::ReadOptions {
         projection: Some(pk_columns.to_vec()),
         ..Default::default()
     };
-    let mut existing: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
-    let mut existing_i64: Option<std::collections::HashSet<i64>> = if single_i64_pk {
-        Some(std::collections::HashSet::new())
-    } else {
-        None
+    let incremental_base = raw_cached
+        .as_ref()
+        .filter(|entry| cache_eligible && entry.files.is_subset(&current_paths));
+    let (mut existing, mut existing_i64, scan_files): (
+        std::collections::HashSet<Vec<String>>,
+        Option<std::collections::HashSet<i64>>,
+        Vec<&basin_storage::DataFile>,
+    ) = match incremental_base {
+        Some(entry) => {
+            let base = entry.set.as_ref().clone();
+            let base_i64 = if single_i64_pk {
+                Some(
+                    entry
+                        .set_i64
+                        .as_ref()
+                        .map(|s| s.as_ref().clone())
+                        .unwrap_or_default(),
+                )
+            } else {
+                None
+            };
+            let new_files: Vec<&basin_storage::DataFile> = data_files
+                .iter()
+                .filter(|f| !entry.files.contains(f.path.as_ref()))
+                .collect();
+            (base, base_i64, new_files)
+        }
+        None => {
+            let ex = std::collections::HashSet::new();
+            let ex_i64 = if single_i64_pk {
+                Some(std::collections::HashSet::new())
+            } else {
+                None
+            };
+            (ex, ex_i64, data_files.iter().collect())
+        }
     };
-    for f in &data_files {
+    for f in scan_files {
         let mut stream = storage
             .read_file_with_options(project, &f.path, read_opts.clone())
             .await?;
@@ -460,6 +507,7 @@ pub(crate) async fn enforce_pk_on_insert(
                                 table,
                                 Arc::new(CachedPkSet {
                                     files_sig,
+                                    files: current_paths.clone(),
                                     set: Arc::new(existing),
                                     set_i64: Some(Arc::new(set_i64.clone())),
                                 }),
@@ -481,6 +529,7 @@ pub(crate) async fn enforce_pk_on_insert(
                         table,
                         Arc::new(CachedPkSet {
                             files_sig,
+                            files: current_paths.clone(),
                             set: Arc::new(existing),
                             set_i64: Some(Arc::new(set_i64.clone())),
                         }),
@@ -502,6 +551,7 @@ pub(crate) async fn enforce_pk_on_insert(
                         table,
                         Arc::new(CachedPkSet {
                             files_sig,
+                            files: current_paths.clone(),
                             set: Arc::new(existing),
                             set_i64: existing_i64.map(Arc::new),
                         }),
@@ -523,6 +573,7 @@ pub(crate) async fn enforce_pk_on_insert(
                 table,
                 Arc::new(CachedPkSet {
                     files_sig,
+                    files: current_paths.clone(),
                     set: Arc::new(existing),
                     set_i64: existing_i64.map(Arc::new),
                 }),

@@ -8,6 +8,19 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Perf: O(n) bulk COPY into a PRIMARY KEY table (was O(n²))
+
+- COPY into a table with a PRIMARY KEY was pathologically slow (<~25 rows/s on
+  an object-store backend) because every committed chunk added a data file and
+  `enforce_pk_on_insert` then re-scanned **all** prior files' PK columns from
+  cold storage for the next chunk — O(files²) cold reads. The PK-set cache only
+  helped when the file set was unchanged, so a chunked bulk load missed it every
+  chunk. The cache now records the file paths its set was built from and, when
+  the file set has only GROWN (the bulk-append case), seeds from the cached set
+  and scans only the newly-added files — O(files) total. Correctness is
+  unchanged: cached-subset ∪ new-files = full scan; compaction (files replaced)
+  falls back to a full rebuild; tombstone-active paths still bypass the cache.
+
 ## 2026-06-17 — Fix: bounded-memory COPY (no per-batch Expr blow-up / OOM)
 
 - `copy_ingest::apply_column_defaults_to_batch` materialised `n_rows × n_cols`
