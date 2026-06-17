@@ -8,6 +8,15 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Fix: SUM/MIN/MAX over NUMERIC/FLOAT route to DataFusion (correct type)
+
+- The integer fast-aggregate path accumulates in i64; a SUM/MIN/MAX over a
+  NUMERIC/FLOAT column previously errored "column is not Int64". The fast-SELECT
+  gate now checks the aggregate column types against the table schema and bails
+  to DataFusion for non-integer columns, which computes the sum with the correct
+  output type. Integer aggregates keep the fast path. (Found by the shape-matrix
+  harness — all shapes now green.)
+
 ## 2026-06-17 — Engine: shape-matrix test harness + COPY timestamptz + integer SUM/MIN/MAX
 
 - **New** `crates/basin-engine/tests/shape_matrix.rs`: a fast, in-process,

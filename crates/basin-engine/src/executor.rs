@@ -3127,12 +3127,38 @@ async fn dispatch_parsed_statement(
                     // ONLY with a pinned read-view request (the safe sub-case
                     // above — already-pinned or untouched-first-touch).
                     let in_tx_fast_ok = !in_txn || in_tx_request.is_some();
+                    // The fast SELECT aggregate path accumulates SUM/MIN/MAX in
+                    // i64, so it only handles integer columns; FLOAT / NUMERIC /
+                    // other numeric types must route to DataFusion, which sums
+                    // them with the correct output type. COUNT(*) is always fine.
+                    // (Without this, a SUM over a NUMERIC/FLOAT column errored
+                    // "column is not Int64" instead of returning the right sum.)
+                    let fast_agg_types_ok = plan.aggregates.as_ref().map_or(true, |aggs| {
+                        use crate::fast_select::AggregateFn;
+                        aggs.iter().all(|a| match a {
+                            AggregateFn::CountStar => true,
+                            AggregateFn::Sum(c) | AggregateFn::Min(c) | AggregateFn::Max(c) => meta
+                                .schema
+                                .field_with_name(c)
+                                .map(|f| {
+                                    matches!(
+                                        f.data_type(),
+                                        arrow_schema::DataType::Int8
+                                            | arrow_schema::DataType::Int16
+                                            | arrow_schema::DataType::Int32
+                                            | arrow_schema::DataType::Int64
+                                    )
+                                })
+                                .unwrap_or(false),
+                        })
+                    });
                     if !is_view
                         && !has_rls
                         && !has_soft_delete
                         && in_tx_fast_ok
                         && !has_citext_predicate
                         && !has_citext_order_by
+                        && fast_agg_types_ok
                     {
                         return crate::fast_select::execute_simple_select_pinned(
                             sess,
