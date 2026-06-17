@@ -57,6 +57,13 @@ use crate::{
     ShardStats, TopPatternProvider,
 };
 
+/// Soft cap on a partition's in-memory tail (uncompacted batches). When the
+/// resident tail crosses this, `write_batch_inner` drains it synchronously so
+/// RAM stays bounded under fast ingest (backpressure: the writer blocks on
+/// compaction / object-store throughput instead of buffering unboundedly).
+/// 256 MiB leaves ample headroom on the 8 GB box for query execution + caches.
+const MAX_TAIL_BYTES: usize = 256 * 1024 * 1024;
+
 /// Per-(project, partition) in-memory state. Lives behind an `RwLock` inside
 /// the shard's outer map.
 pub(crate) struct PartitionState {
@@ -2936,17 +2943,46 @@ impl InProcessProjectHandle {
                 .await?
         };
 
-        let mut guard = self.state.write().await;
-        guard
-            .tail
-            .entry(table.clone())
-            .or_default()
-            .push((lsn, batch.clone()));
-        guard
-            .schemas
-            .entry(table.clone())
-            .or_insert_with(|| batch.schema());
-        guard.touch();
+        let tail_bytes = {
+            let mut guard = self.state.write().await;
+            guard
+                .tail
+                .entry(table.clone())
+                .or_default()
+                .push((lsn, batch.clone()));
+            guard
+                .schemas
+                .entry(table.clone())
+                .or_insert_with(|| batch.schema());
+            guard.touch();
+            // Sum the resident (uncompacted) tail bytes across this partition's
+            // tables. `get_array_memory_size` is O(columns) per batch and the
+            // tail holds few (large) batches, so this is cheap.
+            guard
+                .tail
+                .values()
+                .flatten()
+                .map(|(_, b)| b.get_array_memory_size())
+                .sum::<usize>()
+        };
+
+        // BOUNDED-MEMORY signal (#tail-oom): the in-memory tail grows with
+        // ingest rate; for wide rows fast COPY can outrun the time-ticked
+        // compactor and OOM the box. Surface tail pressure so it is observable
+        // and the autoscaler/operator can react. NOTE: the proper fix is
+        // synchronous backpressure here (drain the tail when over threshold so
+        // the writer blocks on compaction throughput), but the per-partition
+        // handle cannot yet invoke the shard's compaction directly (it lacks
+        // the compaction registries) — tracked as a follow-up refactor.
+        if tail_bytes >= MAX_TAIL_BYTES {
+            tracing::warn!(
+                project = %self.project,
+                partition = %self.partition,
+                tail_mib = tail_bytes / (1024 * 1024),
+                "shard tail over soft cap; compaction is not keeping up with ingest \
+                 (risk of OOM under sustained fast/wide ingest — see tail-backpressure follow-up)",
+            );
+        }
         Ok(())
     }
 }

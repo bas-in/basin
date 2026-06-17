@@ -8,6 +8,19 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Observability: shard tail-pressure warning (bounded-memory signal)
+
+- A 10M-row wide COPY OOM-killed a 2 GB engine: the shard's in-memory tail
+  (uncompacted batches) grows with ingest rate and, for wide rows, outran the
+  time-ticked compactor. `write_batch_inner` now measures the resident tail
+  bytes (cheap: `get_array_memory_size` over the few large tail batches) and
+  WARNs when it crosses a 256 MiB soft cap — making "compaction not keeping up"
+  observable to the operator/autoscaler. The proper fix (synchronous
+  backpressure: drain the tail when over cap so the writer blocks on compaction
+  throughput, keeping RAM `O(cap)` regardless of ingest rate) needs a refactor
+  to let the per-partition handle invoke the shard compactor — tracked as a
+  follow-up. Interim mitigation: 8 GB dev boxes.
+
 ## 2026-06-17 — Feat: per-project (per-tier) pgwire rate limiting
 
 - The pgwire request rate limiter was per-project-keyed but with a single
