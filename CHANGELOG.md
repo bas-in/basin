@@ -8,6 +8,19 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Fix: serial sequences resume past recovered data after restart
+
+- On restart the engine recovers committed rows from its durable WAL + object
+  store, but the in-memory catalog's SERIAL/identity sequence cursor reset to
+  its start — so `nextval` re-handed-out an id that already existed in the
+  recovered data, causing a spurious `duplicate key (id)=(N)` on the next insert
+  (surfaced as pgwire-credential provisioning failures after an engine restart).
+- WAL replay (`replay_wal_into`) now realigns each serial/identity sequence to
+  `MAX(recovered id)` — combining the replayed tail (authoritative for the
+  newest, highest ids) with cold column-stats (covers a fully-compacted table) —
+  so the sequence resumes exactly where the durable data left off. Recovered
+  entirely from Basin's own WAL/storage; no external dependency.
+
 ## 2026-06-17 — Fix: `COPY` now fills column DEFAULTs (incl. `SERIAL`) for omitted columns
 
 - A column-list `COPY t (a, b) FROM …` that omitted a `NOT NULL` column backed

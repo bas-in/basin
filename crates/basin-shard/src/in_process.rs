@@ -3146,6 +3146,19 @@ async fn replay_wal_into(
             table_tail.push((entry.lsn, batch));
         }
     }
+
+    // Reconstruct serial-sequence cursors from the data we just recovered.
+    // WAL replay restores committed rows with their original id values, but the
+    // in-memory catalog's sequence cursor resets to its start on restart (the
+    // catalog is volatile; the WAL + object store are the durable source of
+    // truth). Without this, `nextval` would re-hand-out an id that already
+    // exists in the recovered data -> a spurious primary-key collision on the
+    // next insert (this is the credential-provisioning `duplicate key (id)=(N)`
+    // bug). Realign each SERIAL/identity sequence to MAX(recovered id) so the
+    // sequence resumes exactly where the durable data left off — Basin recovers
+    // this from its own WAL + storage, with no external dependency.
+    reconcile_serial_sequences(catalog, project, state).await;
+
     debug!(
         %project,
         %partition,
@@ -3153,6 +3166,140 @@ async fn replay_wal_into(
         "replayed WAL into partition state",
     );
     Ok(())
+}
+
+/// Catalog field-metadata key for a SERIAL/identity column's backing sequence
+/// (mirrors `basin_engine::types::BASIN_IDENTITY_SEQ`, kept as a literal here so
+/// `basin-shard` doesn't depend on the engine crate).
+const BASIN_IDENTITY_SEQ_KEY: &str = "BASIN_IDENTITY_SEQ";
+/// Catalog field-metadata key carrying a column's `DEFAULT <expr>` source text
+/// (mirrors `basin_engine::types::BASIN_COLUMN_DEFAULT`). For SERIAL columns
+/// this is `nextval('<seq>')`, from which we recover the sequence name.
+const BASIN_COLUMN_DEFAULT_KEY: &str = "BASIN_COLUMN_DEFAULT";
+
+/// Return the backing sequence name for a SERIAL/identity field, or `None` for
+/// a plain column. Prefers the explicit `BASIN_IDENTITY_SEQ` marker; falls back
+/// to parsing `nextval('<seq>')` out of the column's DEFAULT expression.
+fn serial_sequence_name(field: &arrow_schema::Field) -> Option<String> {
+    if let Some(seq) = field.metadata().get(BASIN_IDENTITY_SEQ_KEY) {
+        if !seq.is_empty() {
+            return Some(seq.clone());
+        }
+    }
+    let default = field.metadata().get(BASIN_COLUMN_DEFAULT_KEY)?;
+    parse_nextval_sequence(default)
+}
+
+/// Extract `<seq>` from a `nextval('<seq>')` expression (case-insensitive on the
+/// function name; tolerant of surrounding whitespace and an optional `::regclass`
+/// cast). Returns `None` for any other default expression.
+fn parse_nextval_sequence(default_expr: &str) -> Option<String> {
+    let s = default_expr.trim();
+    let lower = s.to_ascii_lowercase();
+    let rest = lower.strip_prefix("nextval")?;
+    let open = rest.find('(')?;
+    // Work on the original (case-preserving) string from the '(' onward.
+    let after_paren = &s[("nextval".len() + open + 1)..];
+    let inner = after_paren.split(')').next()?.trim();
+    // Strip an optional `::regclass` cast, then surrounding quotes.
+    let inner = inner.split("::").next().unwrap_or(inner).trim();
+    let unquoted = inner
+        .trim_matches('\'')
+        .trim_matches('"')
+        .trim();
+    if unquoted.is_empty() {
+        None
+    } else {
+        Some(unquoted.to_string())
+    }
+}
+
+/// Largest i64-coercible value of `col_name` across `batches` (Int64/Int32/Int16
+/// serial columns). `None` when the column is absent, non-integer, or all-null.
+fn column_i64_max(batches: &[(Lsn, RecordBatch)], col_name: &str) -> Option<i64> {
+    use arrow_array::{Array, Int16Array, Int32Array, Int64Array};
+    let mut best: Option<i64> = None;
+    for (_lsn, batch) in batches {
+        let Some(col) = batch.column_by_name(col_name) else {
+            continue;
+        };
+        let m = if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+            arrow::compute::max(a)
+        } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+            arrow::compute::max(a).map(i64::from)
+        } else if let Some(a) = col.as_any().downcast_ref::<Int16Array>() {
+            arrow::compute::max(a).map(i64::from)
+        } else {
+            None
+        };
+        if let Some(m) = m {
+            best = Some(best.map_or(m, |b| b.max(m)));
+        }
+    }
+    best
+}
+
+/// Decode a column-stats `max_bytes` blob into an i64 when it is a
+/// little-endian fixed-width integer (Parquet physical encoding for INT32 /
+/// INT64). Best-effort: returns `None` for any other width/encoding, in which
+/// case the caller falls back to the (authoritative for serial) tail maximum.
+fn decode_le_int_max(max_bytes: &Option<Vec<u8>>) -> Option<i64> {
+    let b = max_bytes.as_ref()?;
+    match b.len() {
+        8 => Some(i64::from_le_bytes(b[..8].try_into().ok()?)),
+        4 => Some(i64::from(i32::from_le_bytes(b[..4].try_into().ok()?))),
+        2 => Some(i64::from(i16::from_le_bytes(b[..2].try_into().ok()?))),
+        _ => None,
+    }
+}
+
+/// Realign every SERIAL/identity sequence in this partition's recovered tables
+/// to the maximum id present in the durable data, so `nextval` resumes past it.
+/// Combines the tail maximum (authoritative for the just-replayed uncompacted
+/// rows — where a serial column's newest/highest ids live) with the cold
+/// column-stats maximum (covers a fully-compacted table whose tail is empty).
+async fn reconcile_serial_sequences(
+    catalog: &Arc<dyn basin_catalog::Catalog>,
+    project: &ProjectId,
+    state: &PartitionState,
+) {
+    for (table, schema) in &state.schemas {
+        // Cold (compacted) stats are best-effort: a missing/unknown catalog
+        // entry just means we rely on the tail maximum.
+        let cold = catalog.load_table(project, table).await.ok();
+        for field in schema.fields() {
+            let Some(seq_name) = serial_sequence_name(field) else {
+                continue;
+            };
+            let mut max_id = state
+                .tail
+                .get(table)
+                .and_then(|batches| column_i64_max(batches, field.name()));
+            if let Some(meta) = &cold {
+                for file in meta.live_data_files() {
+                    if let Some(cs) = file.column_stats.get(field.name()) {
+                        if let Some(cold_max) = decode_le_int_max(&cs.max_bytes) {
+                            max_id = Some(max_id.map_or(cold_max, |m| m.max(cold_max)));
+                        }
+                    }
+                }
+            }
+            let Some(max_id) = max_id else { continue };
+            // `advance = true`: MAX becomes the last-handed-out value, so the
+            // next `nextval` returns MAX + increment — exactly Postgres'
+            // `setval(seq, max, true)` semantics used by pg_restore.
+            match catalog.setval(project, &seq_name, max_id, true).await {
+                Ok(_) => debug!(
+                    %project, table = %table.as_str(), seq = %seq_name, max_id,
+                    "reconciled serial sequence to recovered max",
+                ),
+                Err(e) => warn!(
+                    %project, table = %table.as_str(), seq = %seq_name, max_id, error = %e,
+                    "reconcile serial sequence: setval failed (sequence may be absent)",
+                ),
+            }
+        }
+    }
 }
 
 /// Project a `RecordBatch` onto a subset of column names, in the requested
@@ -3837,6 +3984,89 @@ mod tests {
             .collect();
         let names: StringArray = names.iter().map(|s| Some(s.as_str())).collect();
         RecordBatch::try_new(schema(), vec![Arc::new(ids), Arc::new(names)]).unwrap()
+    }
+
+    fn schema_with_serial_default(seq: &str) -> Arc<Schema> {
+        let mut md = std::collections::HashMap::new();
+        md.insert(
+            BASIN_COLUMN_DEFAULT_KEY.to_string(),
+            format!("nextval('{seq}')"),
+        );
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(md),
+            Field::new("name", DataType::Utf8, false),
+        ]))
+    }
+
+    #[test]
+    fn parse_nextval_sequence_variants() {
+        assert_eq!(
+            parse_nextval_sequence("nextval('t_id_seq')").as_deref(),
+            Some("t_id_seq")
+        );
+        assert_eq!(
+            parse_nextval_sequence("NEXTVAL( '\"t_id_seq\"' )").as_deref(),
+            Some("t_id_seq")
+        );
+        assert_eq!(
+            parse_nextval_sequence("nextval('s'::regclass)").as_deref(),
+            Some("s")
+        );
+        assert_eq!(parse_nextval_sequence("now()"), None);
+        assert_eq!(parse_nextval_sequence("42"), None);
+    }
+
+    #[test]
+    fn decode_le_int_max_widths() {
+        assert_eq!(decode_le_int_max(&Some(7i64.to_le_bytes().to_vec())), Some(7));
+        assert_eq!(decode_le_int_max(&Some(9i32.to_le_bytes().to_vec())), Some(9));
+        assert_eq!(decode_le_int_max(&None), None);
+        assert_eq!(decode_le_int_max(&Some(vec![1, 2, 3])), None); // odd width → skip
+    }
+
+    /// Regression guard for the credential-provisioning `duplicate key (id)=(N)`
+    /// bug: after WAL replay restores rows 1..5, a fresh sequence (which would
+    /// otherwise hand out 1) must be realigned to resume at 6.
+    #[tokio::test]
+    async fn reconcile_serial_sequences_resumes_past_recovered_max() {
+        let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        let table = TableName::new("t".to_string()).unwrap();
+        let seq = "t_id_seq";
+        catalog
+            .create_sequence(basin_catalog::SequenceDef::with_defaults(project, seq))
+            .await
+            .unwrap();
+
+        let mut state = PartitionState::new(project, PartitionKey::default_key());
+        state
+            .schemas
+            .insert(table.clone(), schema_with_serial_default(seq));
+        // Recovered tail rows carry ids 1..=5.
+        state
+            .tail
+            .insert(table.clone(), vec![(Lsn(1), batch(1, 5, "r"))]);
+
+        reconcile_serial_sequences(&catalog, &project, &state).await;
+
+        // Without reconciliation this would be 1 → a PK collision with row 1.
+        let next = catalog.nextval(&project, seq).await.unwrap();
+        assert_eq!(next, 6, "sequence must resume at max(recovered id)+1");
+    }
+
+    /// A plain (non-serial) column must not touch any sequence.
+    #[tokio::test]
+    async fn reconcile_serial_sequences_ignores_plain_columns() {
+        let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        let table = TableName::new("plain".to_string()).unwrap();
+        let mut state = PartitionState::new(project, PartitionKey::default_key());
+        state.schemas.insert(table.clone(), schema()); // no serial metadata
+        state
+            .tail
+            .insert(table.clone(), vec![(Lsn(1), batch(1, 5, "r"))]);
+        // Must not panic / error — simply a no-op.
+        reconcile_serial_sequences(&catalog, &project, &state).await;
     }
 
     /// Build a fresh shard wired against a `tempdir`-backed object store and
