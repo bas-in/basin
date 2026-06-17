@@ -3263,11 +3263,25 @@ async fn reconcile_serial_sequences(
     project: &ProjectId,
     state: &PartitionState,
 ) {
-    for (table, schema) in &state.schemas {
+    for table in state.schemas.keys() {
         // Cold (compacted) stats are best-effort: a missing/unknown catalog
         // entry just means we rely on the tail maximum.
         let cold = catalog.load_table(project, table).await.ok();
-        for field in schema.fields() {
+        // Detect serial/identity columns from the CATALOG schema — it is the
+        // authoritative carrier of `BASIN_COLUMN_DEFAULT` / `BASIN_IDENTITY_SEQ`
+        // metadata. The replayed WAL batch schema does not always preserve that
+        // field metadata, so relying on `state.schemas` alone silently skipped
+        // the reconciliation. Fall back to the batch schema only when the table
+        // isn't in the catalog (then there's no sequence to realign anyway).
+        let fields: Vec<arrow_schema::FieldRef> = match &cold {
+            Some(meta) => meta.schema.fields().iter().cloned().collect(),
+            None => state
+                .schemas
+                .get(table)
+                .map(|s| s.fields().iter().cloned().collect())
+                .unwrap_or_default(),
+        };
+        for field in &fields {
             let Some(seq_name) = serial_sequence_name(field) else {
                 continue;
             };
@@ -4052,6 +4066,42 @@ mod tests {
         // Without reconciliation this would be 1 → a PK collision with row 1.
         let next = catalog.nextval(&project, seq).await.unwrap();
         assert_eq!(next, 6, "sequence must resume at max(recovered id)+1");
+    }
+
+    /// The real production shape: the catalog carries the serial metadata but
+    /// the replayed WAL batch schema does NOT. Detection must use the catalog
+    /// schema (regression: reading only the batch schema silently skipped the
+    /// reconciliation, so provisioning kept colliding after a restart).
+    #[tokio::test]
+    async fn reconcile_detects_serial_via_catalog_when_batch_bare() {
+        let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        let table = TableName::new("t".to_string()).unwrap();
+        let seq = "t_id_seq";
+        // Catalog table carries the serial metadata; sequence registered.
+        catalog
+            .create_table(&project, &table, schema_with_serial_default(seq).as_ref())
+            .await
+            .unwrap();
+        catalog
+            .create_sequence(basin_catalog::SequenceDef::with_defaults(project, seq))
+            .await
+            .unwrap();
+
+        let mut state = PartitionState::new(project, PartitionKey::default_key());
+        // Replayed tail uses a BARE schema (no serial metadata) — the WAL case.
+        state.schemas.insert(table.clone(), schema());
+        state
+            .tail
+            .insert(table.clone(), vec![(Lsn(1), batch(1, 7, "r"))]); // ids 1..=7
+
+        reconcile_serial_sequences(&catalog, &project, &state).await;
+
+        let next = catalog.nextval(&project, seq).await.unwrap();
+        assert_eq!(
+            next, 8,
+            "serial must be detected via the catalog schema and resume at 8"
+        );
     }
 
     /// A plain (non-serial) column must not touch any sequence.
