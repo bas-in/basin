@@ -113,7 +113,10 @@ const SHAPES: &[Shape] = &[
         gen: gen_narrow,
         ops: &[
             ("point_lookup", "SELECT id, x FROM {T} WHERE id = 12345"),
-            ("full_agg", "SELECT count(*), sum(x) FROM {T}"),
+            ("range", "SELECT count(*) FROM {T} WHERE id BETWEEN 1000 AND 6000"),
+            ("top_k", "SELECT id FROM {T} ORDER BY id DESC LIMIT 50"),
+            ("full_agg", "SELECT count(*), sum(x), min(x), max(x) FROM {T}"),
+            ("update_pk", "UPDATE {T} SET x = x + 1 WHERE id = 12345"),
         ],
     },
     Shape {
@@ -124,8 +127,15 @@ const SHAPES: &[Shape] = &[
         gen: gen_wide,
         ops: &[
             ("point_lookup", "SELECT id, amount FROM {T} WHERE id = 12345"),
+            ("range", "SELECT count(*) FROM {T} WHERE id BETWEEN 1000 AND 6000"),
+            ("filtered_agg", "SELECT count(*), avg(amount) FROM {T} WHERE status = 'active'"),
+            ("top_k", "SELECT id, amount FROM {T} ORDER BY amount DESC LIMIT 50"),
+            ("count_distinct", "SELECT count(DISTINCT tenant_id) FROM {T}"),
             ("group_by", "SELECT tenant_id, count(*), sum(amount) FROM {T} GROUP BY tenant_id ORDER BY 2 DESC LIMIT 20"),
             ("full_agg", "SELECT count(*), avg(amount) FROM {T}"),
+            ("update_pk", "UPDATE {T} SET amount = amount + 1 WHERE id = 12345"),
+            ("delete_noop", "DELETE FROM {T} WHERE id = 999000111"),
+            ("jsonb_extract", "SELECT count(*) FROM {T} WHERE payload->>'v' = '1'"),
         ],
     },
     Shape {
