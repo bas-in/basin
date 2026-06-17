@@ -8,6 +8,15 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Dev/test: opt-in plaintext-HTTP S3 endpoints (BASIN_STORAGE_ALLOW_HTTP)
+
+- The S3-compatible backend hard-rejected non-HTTPS endpoints, which blocked
+  pointing the engine at a local MinIO/RustFS dev server over `http://127.0.0.1`.
+  `BASIN_STORAGE_ALLOW_HTTP=1` now permits a plaintext endpoint (sets
+  object_store's `allow_http`); HTTPS stays mandatory by default so production
+  credentials never traverse plaintext. Enables local S3-path reproduction/tests
+  without TLS certs.
+
 ## 2026-06-17 — Fix: S3/Tigris custom endpoints use path-style (was dropping the bucket → 403)
 
 - The S3-compatible storage backend forced virtual-hosted-style requests for all

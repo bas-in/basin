@@ -221,11 +221,22 @@ impl S3LikeConfig {
             .with_secret_access_key(&self.secret_access_key)
             .with_client_options(client_opts);
 
+        // Plaintext HTTP is rejected by default (avoid silently leaking
+        // credentials over the wire), but allowed behind an explicit opt-in for
+        // local S3-compatible dev/test servers (MinIO/RustFS on http://127.0.0.1).
+        let allow_http = std::env::var("BASIN_STORAGE_ALLOW_HTTP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         if let Some(ep) = &self.endpoint {
-            // S3-compatible endpoints are always HTTPS; reject plaintext to avoid
-            // silently leaking credentials over the wire.
-            if !ep.starts_with("https://") {
-                return Err(format!("BASIN_STORAGE_ENDPOINT must be HTTPS (got {ep:?})"));
+            if ep.starts_with("http://") {
+                if !allow_http {
+                    return Err(format!(
+                        "endpoint must be HTTPS unless BASIN_STORAGE_ALLOW_HTTP=1 (got {ep:?})"
+                    ));
+                }
+                b = b.with_allow_http(true);
+            } else if !ep.starts_with("https://") {
+                return Err(format!("BASIN_STORAGE_ENDPOINT must be http(s) (got {ep:?})"));
             }
             // A CUSTOM endpoint (Tigris, MinIO, Wasabi, …) exposes a single
             // global/regional host with NO per-bucket subdomain, e.g.
