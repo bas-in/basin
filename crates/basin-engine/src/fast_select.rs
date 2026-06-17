@@ -5600,6 +5600,38 @@ fn apply_aggregates(
     use arrow_array::{Int64Array, ArrayRef};
     use arrow_schema::{DataType, Field};
 
+    // Coerce an aggregate input column to Int64 for the i64 accumulator path.
+    // Integer types narrower than i64 (Int8/16/32) are widened — `SUM(int)`
+    // yields bigint in Postgres, so an i64 accumulator + output is correct, and
+    // MIN/MAX values are exact. Non-integer types (FLOAT/NUMERIC/…) are NOT
+    // handled by this fast aggregate path (the i64 accumulator can't represent
+    // them); they return an error and should be routed to the general executor.
+    // Without this, any `SUM/MIN/MAX` over an INT/SMALLINT column failed with
+    // "column is not Int64".
+    fn as_i64(arr: &ArrayRef, col: &str, op: &str) -> Result<Int64Array> {
+        match arr.data_type() {
+            DataType::Int64 => Ok(arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 downcast")
+                .clone()),
+            DataType::Int8 | DataType::Int16 | DataType::Int32 => {
+                let casted = arrow::compute::cast(arr, &DataType::Int64).map_err(|e| {
+                    BasinError::internal(format!("{op}: cast {col} to Int64: {e}"))
+                })?;
+                Ok(casted
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("cast yields Int64")
+                    .clone())
+            }
+            other => Err(BasinError::internal(format!(
+                "{op}: column {col} has type {other:?}; the integer fast-aggregate \
+                 path only supports integer columns"
+            ))),
+        }
+    }
+
     // Compute per-batch partial aggregates, then combine.
     // COUNT(*): accumulate row counts.
     // SUM/MIN/MAX: accumulate over all batches.
@@ -5635,12 +5667,8 @@ fn apply_aggregates(
                         continue;
                     };
                     let arr = batch.column(col_idx);
-                    let i64_arr = arr
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| {
-                            BasinError::internal(format!("SUM: column {col} is not Int64"))
-                        })?;
+                    let i64_owned = as_i64(arr, col, "SUM")?;
+                    let i64_arr = &i64_owned;
                     if let Some(partial) = arrow_sum(i64_arr) {
                         acc.sum = Some(acc.sum.unwrap_or(0) + partial);
                     }
@@ -5653,12 +5681,8 @@ fn apply_aggregates(
                         continue;
                     };
                     let arr = batch.column(col_idx);
-                    let i64_arr = arr
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| {
-                            BasinError::internal(format!("MIN: column {col} is not Int64"))
-                        })?;
+                    let i64_owned = as_i64(arr, col, "MIN")?;
+                    let i64_arr = &i64_owned;
                     if let Some(partial) = arrow_min(i64_arr) {
                         acc.min = Some(match acc.min {
                             Some(prev) => prev.min(partial),
@@ -5674,12 +5698,8 @@ fn apply_aggregates(
                         continue;
                     };
                     let arr = batch.column(col_idx);
-                    let i64_arr = arr
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| {
-                            BasinError::internal(format!("MAX: column {col} is not Int64"))
-                        })?;
+                    let i64_owned = as_i64(arr, col, "MAX")?;
+                    let i64_arr = &i64_owned;
                     if let Some(partial) = arrow_max(i64_arr) {
                         acc.max = Some(match acc.max {
                             Some(prev) => prev.max(partial),

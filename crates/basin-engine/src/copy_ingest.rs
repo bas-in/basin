@@ -115,6 +115,18 @@ fn parse_timestamp_micros(s: &str, col: &str) -> Result<i64> {
     if let Ok(dt) = s.parse::<DateTime<Utc>>() {
         return Ok(dt.timestamp_micros());
     }
+    // Postgres' default `timestamptz` text form: "YYYY-MM-DD HH:MM:SS[.ffffff]±HH[:MM]"
+    // — space separator and a numeric offset that may be just `+00` (not
+    // `+00:00`). chrono's `%#z` accepts `+00`, `+0000`, and `+00:00`. This is the
+    // shape `pg_dump`/COPY and most clients emit, so it must round-trip; without
+    // it COPY of any timestamptz column failed with a parse error (which over
+    // pgwire surfaced as the COPY connection closing).
+    if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%#z") {
+        return Ok(dt.timestamp_micros());
+    }
+    if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%#z") {
+        return Ok(dt.timestamp_micros());
+    }
     // "YYYY-MM-DD HH:MM:SS[.ffffff]" (no zone → UTC). `%.f` matches an
     // optional fractional-seconds part — binary COPY decodes timestamps to
     // microsecond precision, so the dotted form is the common case there.

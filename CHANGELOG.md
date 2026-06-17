@@ -8,6 +8,23 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Engine: shape-matrix test harness + COPY timestamptz + integer SUM/MIN/MAX
+
+- **New** `crates/basin-engine/tests/shape_matrix.rs`: a fast, in-process,
+  scalable engine bench over a matrix of table shapes (narrow/wide, PK/no-PK,
+  JSONB/NUMERIC/TIMESTAMPTZ, composite-PK) × operations (bulk COPY, point
+  lookup, range, agg, group-by), timing each and surfacing per-shape perf
+  cliffs + correctness gaps before they reach the cloud benchmark. Scales
+  toward the 1B-row target via `BASIN_SHAPE_ROWS`.
+- **Fix (COPY):** `parse_timestamp_micros` now accepts Postgres' default
+  `timestamptz` text form `YYYY-MM-DD HH:MM:SS[.ffffff]±HH[:MM]` (space
+  separator, `+00`-style offset). Previously COPY of *any* timestamptz column
+  failed to parse, which over pgwire surfaced as the COPY connection closing.
+- **Fix (aggregates):** the integer fast-aggregate path widens Int8/16/32 → Int64,
+  so `SUM/MIN/MAX` over INT/SMALLINT columns work (`SUM(int)`→bigint, matching
+  Postgres) instead of erroring "column is not Int64". (NUMERIC/FLOAT in this
+  fast path are still pending — tracked by the shape-matrix harness.)
+
 ## 2026-06-17 — Perf: O(n) bulk COPY into a PRIMARY KEY table (was O(n²))
 
 - COPY into a table with a PRIMARY KEY was pathologically slow (<~25 rows/s on
