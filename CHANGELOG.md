@@ -8,6 +8,17 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Fix: bounded-memory COPY (no per-batch Expr blow-up / OOM)
+
+- `copy_ingest::apply_column_defaults_to_batch` materialised `n_rows × n_cols`
+  sqlparser `Expr` values for **every** column-list COPY — even when all columns
+  were supplied and nothing needed a default. On a large batch this was a ~100×
+  memory blow-up that OOM-killed `basin-server` mid-COPY; the client saw the
+  connection drop as an unexpected EOF. Added a fast path: when no *unlisted*
+  column needs a DEFAULT/SERIAL/identity value, return the batch unchanged and
+  skip the allocation entirely (the dominant COPY shape). Correctness is
+  identical — that path previously spliced the supplied columns straight back.
+
 ## 2026-06-17 — Fix: serial sequences resume past recovered data after restart
 
 - On restart the engine recovers committed rows from its durable WAL + object

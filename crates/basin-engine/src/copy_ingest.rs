@@ -692,6 +692,24 @@ async fn apply_column_defaults_to_batch(
         .map(|n| n.to_ascii_lowercase())
         .collect();
 
+    // Fast path: if no UNLISTED column actually needs a generated value
+    // (DEFAULT / SERIAL / identity), there is nothing to fill, so skip the
+    // O(rows × cols) `Expr` materialisation below and return the batch as-is.
+    // This is the dominant COPY shape (every column supplied — e.g. a
+    // `pg_dump`/bulk-load that lists all columns). Without this guard the
+    // engine allocated `n_rows × n_cols` heavy sqlparser `Expr` values per
+    // batch — a ~100×+ memory blow-up that OOM-killed the process on large
+    // COPYs and dropped the client connection mid-stream.
+    let needs_fill = schema.fields().iter().any(|f| {
+        let lower = f.name().to_ascii_lowercase();
+        !supplied_set.contains(&lower)
+            && (crate::types::field_default_text(f).is_some()
+                || crate::types::field_identity_sequence(f).is_some())
+    });
+    if !needs_fill {
+        return Ok(batch);
+    }
+
     // Build null Expr rows.  apply_column_defaults fills DEFAULT positions;
     // other positions are ignored (we only care about the result for unlisted
     // DEFAULT columns).
