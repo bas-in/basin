@@ -8,6 +8,17 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Feat: super-admin cross-project live usage analytics
+
+- New `GET /admin/v1/usage` (admin-global, `require_admin` only): per-project
+  live usage across ALL projects on the engine instance — ops, bytes r/w,
+  Class-A/B object-store ops, CPU-micros, errors, p99-latency estimate — sorted
+  by CPU-micros descending so the heaviest/largest projects surface first. The
+  operator's "who's hot / who's big / who's erroring" view. Reuses the existing
+  per-project atomic counters (O(1), no hot-path cost) + `auth.list_projects()`;
+  read-only. The control plane fans this out across engine instances for a
+  fleet-wide dashboard.
+
 ## 2026-06-17 — Fix: DROP TABLE purges object-store files (no ghost rows on re-create)
 
 - `DROP TABLE` dropped the catalog row, hot-tier overlay, and shard tail but

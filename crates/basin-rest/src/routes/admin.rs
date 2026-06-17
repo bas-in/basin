@@ -146,6 +146,49 @@ pub(crate) async fn get_project_usage(
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
+/// `GET /admin/v1/usage` — super-admin LIVE analytics across ALL projects on
+/// this engine instance: per-project ops, bytes r/w, Class-A/B object-store ops,
+/// CPU micros, errors, p99-latency estimate. Admin-global (`require_admin` only).
+/// Sorted by CPU-micros descending so the heaviest / largest projects surface
+/// first — the operator's "who's hot / who's big" view. For a fleet-wide view
+/// the control plane fans this out across engine instances and merges.
+pub(crate) async fn get_all_usage(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    require_admin(&claims)?;
+    let projects = state.cfg.auth.list_projects().await.map_err(ApiError::from)?;
+    let mut rows: Vec<(u64, Value)> = projects
+        .iter()
+        .map(|p| {
+            let s = state.cfg.engine.project_counters(p);
+            (
+                s.cpu_micros_total,
+                json!({
+                    "project_id": p.to_string(),
+                    "ops_total": s.ops_total,
+                    "bytes_read_total": s.bytes_read_total,
+                    "bytes_written_total": s.bytes_written_total,
+                    "class_a_ops_total": s.class_a_ops_total,
+                    "class_b_ops_total": s.class_b_ops_total,
+                    "cpu_micros_total": s.cpu_micros_total,
+                    "errors_total": s.errors_total,
+                    "latency_p99_ms_estimate": s.latency_p99_ms_estimate,
+                }),
+            )
+        })
+        .collect();
+    // Heaviest first (CPU-micros desc).
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    let projects_json: Vec<Value> = rows.into_iter().map(|(_, v)| v).collect();
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "project_count": projects_json.len(), "projects": projects_json })),
+    )
+        .into_response())
+}
+
 /// `GET /admin/v1/projects` — enumerate all project ids (control-plane project
 /// list). Admin-global: `require_admin` only (it lists across projects, so it is
 /// not scoped to a single path project).

@@ -382,6 +382,9 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             "/admin/v1/projects/:project_id/usage",
             get(admin_routes::get_project_usage),
         )
+        // Super-admin live analytics: usage across ALL projects on this engine
+        // (spot issues + large projects). Admin-global; require_admin only.
+        .route("/admin/v1/usage", get(admin_routes::get_all_usage))
         // Cloud control-plane: list a project's tables (schema browser).
         .route(
             "/admin/v1/projects/:project_id/tables",
