@@ -258,7 +258,10 @@ async fn accept_loop(
     // first burst that should have been throttled.
     let rate_limit =
         match from_env_qps(std::env::var("BASIN_PGWIRE_RATE_LIMIT_QPS").ok().as_deref()) {
-            Ok(rl) => rl.map(Arc::new),
+            // Attach the catalog so the limiter resolves per-project (per-tier)
+            // quotas lazily from `get_project_rate_limit_qps` — the global env
+            // qps becomes the default; cloud-pushed per-project values override.
+            Ok(rl) => rl.map(|l| Arc::new(l.with_catalog(engine.config().catalog.clone()))),
             Err(e) => return Err(BasinError::Internal(e)),
         };
     if let Some(rl) = &rate_limit {

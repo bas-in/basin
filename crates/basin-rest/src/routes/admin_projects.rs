@@ -256,6 +256,74 @@ pub(crate) async fn get_project_max_connections(
 }
 
 // ---------------------------------------------------------------------------
+// Rate limit: POST/GET /admin/v1/projects/:project_id/rate-limit
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub(crate) struct SetRateLimitRequest {
+    /// Sustained pgwire statements/sec for this project (per-tier cap). Burst
+    /// is 3× this. The control plane pushes it per tier.
+    pub qps: i64,
+}
+
+/// `POST /admin/v1/projects/:project_id/rate-limit` — set the per-project pgwire
+/// request rate cap. Persisted to the catalog; the router resolves it lazily per
+/// project at connection time (cloud-pushed per tier), mirroring max-connections.
+pub(crate) async fn set_project_rate_limit(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(req): Json<SetRateLimitRequest>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    require_admin(&claims)?;
+    let project: ProjectId = project_id
+        .parse()
+        .map_err(|e| ApiError::invalid(format!("invalid project_id: {e}")))?;
+    assert_admin_for_path_project(&claims, &project)?;
+    if req.qps <= 0 || req.qps > u32::MAX as i64 {
+        return Err(ApiError::invalid(format!("qps must be in 1..={}", u32::MAX)));
+    }
+    let qps = req.qps as u32;
+    state
+        .cfg
+        .engine
+        .config()
+        .catalog
+        .clone()
+        .set_project_rate_limit_qps(&project, qps)
+        .await
+        .map_err(ApiError::from)?;
+    tracing::info!(%project, qps, "per-project pgwire rate limit updated");
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `GET /admin/v1/projects/:project_id/rate-limit` — read the per-project cap
+/// (`null` qps when none is set → project uses the global default limiter).
+pub(crate) async fn get_project_rate_limit(
+    State(state): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let claims = authorize(&state, &headers).await?;
+    require_admin(&claims)?;
+    let project: ProjectId = project_id
+        .parse()
+        .map_err(|e| ApiError::invalid(format!("invalid project_id: {e}")))?;
+    assert_admin_for_path_project(&claims, &project)?;
+    let qps = state
+        .cfg
+        .engine
+        .config()
+        .catalog
+        .clone()
+        .get_project_rate_limit_qps(&project)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "project_id": project.to_string(), "qps": qps })).into_response())
+}
+
+// ---------------------------------------------------------------------------
 // Placement: POST /admin/v1/projects/:project_id/placement
 //            GET  /admin/v1/projects/:project_id/placement
 // ---------------------------------------------------------------------------

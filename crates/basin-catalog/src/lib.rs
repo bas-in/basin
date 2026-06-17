@@ -448,6 +448,24 @@ pub trait Catalog: Send + Sync {
         Ok(None)
     }
 
+    /// Persist the per-project pgwire request rate limit (sustained
+    /// statements/sec). The control plane pushes this per tier, mirroring
+    /// `set_project_max_connections`. Default impl is a no-op so backends that
+    /// pre-date this take the global/default limiter path.
+    async fn set_project_rate_limit_qps(&self, project: &ProjectId, qps: u32) -> Result<()> {
+        let _ = (project, qps);
+        Ok(())
+    }
+
+    /// Read the persisted per-project pgwire rate limit (sustained stmts/sec).
+    /// `None` → no per-project override; the router uses the global default
+    /// limiter (or no limit when the limiter is disabled). Default impl returns
+    /// `Ok(None)`.
+    async fn get_project_rate_limit_qps(&self, project: &ProjectId) -> Result<Option<u32>> {
+        let _ = project;
+        Ok(None)
+    }
+
     // NOTE: the per-project home region (placement pin) is the `home_region`
     // field of [`ProjectMetadata`] — persisted via `set_project_metadata` /
     // `get_project_metadata`. That is the single source of truth the

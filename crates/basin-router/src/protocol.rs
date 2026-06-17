@@ -2424,7 +2424,7 @@ impl<S: Session + 'static> ExtendedQueryHandler for BasinExtendedQueryHandler<S>
         // bucket is dry. We don't emit ReadyForQuery here because the
         // pgwire extended-query state machine will emit one after Sync.
         if let Some(rl) = &self.rate_limit {
-            if rl.check(&session.project()).is_err() {
+            if rl.check_async(&session.project()).await.is_err() {
                 client
                     .feed(PgWireBackendMessage::ErrorResponse(
                         crate::error::rate_limit_exceeded_response(),
@@ -3016,7 +3016,7 @@ impl<S: Session + 'static> SimpleQueryHandler for BasinSimpleQueryHandlerSlot<S>
         // before it touches the engine if the project has burned their
         // budget. Map to SQLSTATE 53400 (configuration_limit_exceeded).
         if let Some(rl) = &self.rate_limit {
-            if rl.check(&session.project()).is_err() {
+            if rl.check_async(&session.project()).await.is_err() {
                 if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
                     return Err(PgWireError::NotReadyForQuery);
                 }

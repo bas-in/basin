@@ -208,6 +208,10 @@ pub struct InMemoryCatalog {
     /// Per-project pgwire connection ceiling. Written by the admin route;
     /// read by the pgwire startup handler. Cleared in `drop_namespace`.
     project_max_connections: Mutex<HashMap<ProjectId, u32>>,
+    /// Per-project pgwire request rate limit (sustained stmts/sec). Written by
+    /// the admin route; read at connection setup to install a per-project
+    /// limiter. `None`/absent → global default limiter.
+    project_rate_limit_qps: Mutex<HashMap<ProjectId, u32>>,
     /// Per-`(project, partition)` compaction watermark — the highest WAL LSN
     /// whose tail batch has been compacted into a catalog-committed cold file.
     /// Mirrors the Postgres `compaction_watermarks` table. Monotonic: writes
@@ -287,6 +291,7 @@ impl InMemoryCatalog {
             leases: Mutex::new(HashMap::new()),
             project_metadata: Mutex::new(HashMap::new()),
             project_max_connections: Mutex::new(HashMap::new()),
+            project_rate_limit_qps: Mutex::new(HashMap::new()),
             compaction_watermarks: Mutex::new(HashMap::new()),
             cdc_webhooks: Mutex::new(HashMap::new()),
             cdc_kafka_sinks: Mutex::new(HashMap::new()),
@@ -1520,6 +1525,17 @@ impl Catalog for InMemoryCatalog {
 
     async fn get_project_max_connections(&self, project: &ProjectId) -> Result<Option<u32>> {
         let m = self.project_max_connections.lock().await;
+        Ok(m.get(project).copied())
+    }
+
+    async fn set_project_rate_limit_qps(&self, project: &ProjectId, qps: u32) -> Result<()> {
+        let mut m = self.project_rate_limit_qps.lock().await;
+        m.insert(*project, qps);
+        Ok(())
+    }
+
+    async fn get_project_rate_limit_qps(&self, project: &ProjectId) -> Result<Option<u32>> {
+        let m = self.project_rate_limit_qps.lock().await;
         Ok(m.get(project).copied())
     }
 

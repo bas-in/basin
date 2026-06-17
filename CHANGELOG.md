@@ -8,6 +8,23 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Feat: per-project (per-tier) pgwire rate limiting
+
+- The pgwire request rate limiter was per-project-keyed but with a single
+  GLOBAL quota (`BASIN_PGWIRE_RATE_LIMIT_QPS`) — every project got the same cap,
+  with no per-tier differentiation. Now per-project: the limiter carries an
+  override map of dedicated token buckets and resolves each project's quota
+  lazily from the catalog (`get_project_rate_limit_qps`) on first query, cached
+  thereafter (one fetch per project per process; the hot-path check is an O(1)
+  map read + bucket check — no added per-request catalog cost).
+- Plumbing mirrors max-connections: `Catalog::{get,set}_project_rate_limit_qps`
+  (default no-op; InMemoryCatalog stores it), `POST/GET
+  /admin/v1/projects/:id/rate-limit` for the control plane to push per tier, and
+  the global env qps becomes the default when no per-project value is set.
+- Isolation verified by unit test: a project with a tight cap is throttled while
+  a project without an override is unaffected (one project's cap cannot starve
+  another) — the per-project noisy-neighbor guard at the request-rate dimension.
+
 ## 2026-06-17 — Feat: super-admin cross-project live usage analytics
 
 - New `GET /admin/v1/usage` (admin-global, `require_admin` only): per-project

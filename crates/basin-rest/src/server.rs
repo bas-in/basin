@@ -402,6 +402,12 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             post(admin_projects_routes::set_project_max_connections)
                 .get(admin_projects_routes::get_project_max_connections),
         )
+        // per-project pgwire request rate cap (per-tier QoS).
+        .route(
+            "/admin/v1/projects/:project_id/rate-limit",
+            post(admin_projects_routes::set_project_rate_limit)
+                .get(admin_projects_routes::get_project_rate_limit),
+        )
         // multi-region placement (ADR 0009): per-project home region.
         // POST sets the home region (persists); GET reads it.
         .route(

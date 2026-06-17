@@ -24,11 +24,24 @@
 //! breaches. Drivers map it to a specific exception class so app code
 //! can retry-with-backoff distinct from a parse / permission error.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use basin_common::ProjectId;
-use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
+use governor::{
+    clock::DefaultClock, state::keyed::DefaultKeyedStateStore, state::InMemoryState,
+    state::NotKeyed, Quota, RateLimiter,
+};
+
+/// A single (not-keyed) token-bucket limiter for one project's override quota.
+type DirectLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+
+fn build_quota(qps: u32) -> Quota {
+    let per_sec = NonZeroU32::new(qps.max(1)).expect("qps>=1");
+    let burst = NonZeroU32::new(qps.saturating_mul(BURST_FACTOR).max(1)).expect("nonzero burst");
+    Quota::per_second(per_sec).allow_burst(burst)
+}
 
 /// Sustained statements/sec when the limiter is enabled. Matches the
 /// 10:30 ratio basin-net uses for outbound HTTP, scaled 10× because
@@ -53,6 +66,20 @@ pub struct PgRateLimit {
     inner: Arc<RateLimiter<ProjectId, DefaultKeyedStateStore<ProjectId>, DefaultClock>>,
     sustained_qps: u32,
     slice: Option<basin_catalog::SliceGate>,
+    /// Per-project quota OVERRIDES (the control plane pushes these per tier via
+    /// the catalog; the router installs them at connection setup). When a
+    /// project has an override its dedicated bucket is consulted INSTEAD of the
+    /// global keyed bucket, so Free/Pro/Scale can carry different caps on the
+    /// same engine. Read on the hot path under a shared lock (uncontended);
+    /// written rarely (once per project per quota change).
+    overrides: Arc<RwLock<HashMap<ProjectId, (u32, Arc<DirectLimiter>)>>>,
+    /// Optional catalog handle: when set, [`Self::check_async`] lazily resolves
+    /// each project's per-tier quota from the catalog on first sight and caches
+    /// it (one fetch per project per process; later checks are a map read).
+    catalog: Option<Arc<dyn basin_catalog::Catalog>>,
+    /// Projects whose per-project quota was already resolved (whether or not an
+    /// override exists), so `check_async` doesn't re-hit the catalog each query.
+    resolved: Arc<RwLock<std::collections::HashSet<ProjectId>>>,
 }
 
 impl std::fmt::Debug for PgRateLimit {
@@ -83,7 +110,43 @@ impl PgRateLimit {
             inner: Arc::new(RateLimiter::keyed(quota)),
             sustained_qps: qps,
             slice: None,
+            overrides: Arc::new(RwLock::new(HashMap::new())),
+            catalog: None,
+            resolved: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Attach a catalog so per-project quotas resolve lazily from
+    /// `get_project_rate_limit_qps` on first query (cached thereafter).
+    pub fn with_catalog(mut self, catalog: Arc<dyn basin_catalog::Catalog>) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+
+    fn has_override(&self, project: &ProjectId) -> bool {
+        self.overrides
+            .read()
+            .expect("pg rate-limit overrides poisoned")
+            .contains_key(project)
+    }
+
+    /// Install (or update) a per-project quota override. Idempotent: a repeat
+    /// call with the same qps is a no-op (keeps the existing bucket + its
+    /// accumulated tokens); a changed qps rebuilds the bucket. Called at
+    /// connection setup from the catalog-pushed value, so the hot-path `check`
+    /// just reads the map.
+    pub fn set_project_qps(&self, project: ProjectId, qps: u32) {
+        {
+            let map = self.overrides.read().expect("pg rate-limit overrides poisoned");
+            if map.get(&project).map(|(q, _)| *q) == Some(qps) {
+                return;
+            }
+        }
+        let lim = Arc::new(RateLimiter::direct(build_quota(qps)));
+        self.overrides
+            .write()
+            .expect("pg rate-limit overrides poisoned")
+            .insert(project, (qps, lim));
     }
 
     /// Phase 6.X.D — attach a [`basin_catalog::SliceGate`] so `check_async`
@@ -120,6 +183,13 @@ impl PgRateLimit {
                 return Err(());
             }
         }
+        // Per-project override bucket takes precedence over the global keyed one.
+        {
+            let map = self.overrides.read().expect("pg rate-limit overrides poisoned");
+            if let Some((_, lim)) = map.get(project) {
+                return lim.check().map(|_| ()).map_err(|_| ());
+            }
+        }
         self.inner.check_key(project).map(|_| ()).map_err(|_| ())
     }
 
@@ -134,6 +204,30 @@ impl PgRateLimit {
                 .is_err()
             {
                 return Err(());
+            }
+        }
+        // Lazily resolve this project's per-tier quota from the catalog on first
+        // sight (cached in `resolved`; one fetch per project per process).
+        if let Some(catalog) = &self.catalog {
+            let already = self
+                .resolved
+                .read()
+                .expect("pg rate-limit resolved poisoned")
+                .contains(project);
+            if !already {
+                if let Ok(Some(qps)) = catalog.get_project_rate_limit_qps(project).await {
+                    self.set_project_qps(*project, qps);
+                }
+                self.resolved
+                    .write()
+                    .expect("pg rate-limit resolved poisoned")
+                    .insert(*project);
+            }
+        }
+        {
+            let map = self.overrides.read().expect("pg rate-limit overrides poisoned");
+            if let Some((_, lim)) = map.get(project) {
+                return lim.check().map(|_| ()).map_err(|_| ());
             }
         }
         self.inner.check_key(project).map(|_| ()).map_err(|_| ())
@@ -214,6 +308,44 @@ mod tests {
         // another.
         rl.check(&b)
             .expect("project B starved by project A's burst");
+    }
+
+    #[test]
+    fn per_project_override_caps_independently() {
+        // Generous global default; one project gets a tight per-project cap.
+        let rl = PgRateLimit::with_qps(100_000);
+        let capped = ProjectId::new();
+        let other = ProjectId::new();
+        rl.set_project_qps(capped, 1); // 1 qps × 3 burst = 3 tokens
+        for _ in 0..3 {
+            rl.check(&capped).unwrap();
+        }
+        let mut throttled = false;
+        for _ in 0..10 {
+            if rl.check(&capped).is_err() {
+                throttled = true;
+                break;
+            }
+        }
+        assert!(throttled, "per-project override did not cap the project");
+        // A project WITHOUT an override is unaffected (uses the generous
+        // default) — one project's tight cap cannot starve another.
+        rl.check(&other)
+            .expect("non-overridden project starved by another's cap");
+    }
+
+    #[test]
+    fn set_project_qps_is_idempotent_on_same_value() {
+        let rl = PgRateLimit::with_qps(10);
+        let p = ProjectId::new();
+        rl.set_project_qps(p, 5);
+        for _ in 0..5 {
+            let _ = rl.check(&p);
+        }
+        // Re-setting the SAME qps must NOT reset the bucket (keeps accumulated
+        // consumption); a different qps rebuilds it.
+        rl.set_project_qps(p, 5);
+        assert!(rl.has_override(&p));
     }
 
     #[test]
