@@ -146,6 +146,14 @@ impl PkSetCache {
 /// millions of rows.
 const PK_STREAMING_MIN_ROWS_DEFAULT: u64 = 2_000_000;
 
+/// Incoming-batch size at/below which the PK existence check uses the
+/// prune/stream path regardless of table size (the OLTP point/small-INSERT
+/// case). A single-row INSERT (batch = 1) then zone-map/bloom-prunes the
+/// existing files instead of rebuilding the whole PK set, so it reads ~0 files
+/// for a serial/above-range key. Bulk COPY (chunks ≫ this) into a small table
+/// still uses the cached-set fast path. Shape-agnostic.
+const PK_STREAMING_SMALL_BATCH: usize = 256;
+
 fn pk_streaming_min_rows() -> u64 {
     std::env::var("BASIN_PK_STREAMING_MIN_ROWS")
         .ok()
@@ -324,8 +332,19 @@ pub(crate) async fn enforce_pk_on_insert(
     // The small-table path below is left untouched: it still builds and caches
     // the full set (with cross-batch memoization), which is faster when the set
     // fits comfortably in RAM.
+    // Use the prune/stream path when EITHER the table is large (bounded memory)
+    // OR the incoming batch is small (a point/small INSERT, any shape). The
+    // small-batch case is the OLTP fix: the cached-set path rebuilds/re-reads the
+    // existing PK set, and because every INSERT changes the file set it
+    // cache-misses each time → re-reading the whole table per insert (the
+    // ~200ms single-INSERT). The streaming path instead zone-map-prunes (on the
+    // first PK column — BIGINT for narrow/wide/composite alike) and bloom-prunes
+    // (single-column PKs), so a serial/above-range insert reads ~0 files. This is
+    // shape-agnostic: it handles single-i64 and composite/text PKs the same way.
     let total_existing_rows: u64 = data_files.iter().map(|f| f.row_count).sum();
-    if total_existing_rows > pk_streaming_min_rows() {
+    if total_existing_rows > pk_streaming_min_rows()
+        || batch.num_rows() <= PK_STREAMING_SMALL_BATCH
+    {
         return enforce_pk_streaming(
             storage,
             project,
@@ -757,6 +776,26 @@ async fn enforce_pk_streaming(
                 PruneOutcome::NoMatch
             ) {
                 continue;
+            }
+        }
+        // Bloom prune (single-column PK): if the file's per-file PK bloom says
+        // NONE of the incoming keys are present, skip the file without reading
+        // it. Catches random/non-monotonic keys that zone-map ranges can't prune
+        // (the OLTP point-insert case where the new key falls inside an existing
+        // file's [min,max] but isn't actually there). Restricted to single-i64
+        // PKs so the probe encoding (`i64::to_le_bytes`) exactly matches the
+        // writer's bloom encoding — a false-positive only causes a needless read,
+        // and a false-negative is impossible, so this can never miss a collision.
+        if single_i64_pk {
+            if let Some(bytes) = f.bloom_filters.get(&pk_columns[0]) {
+                if let Some(bloom) = basin_storage::bloom_from_bytes(bytes) {
+                    let keys = batch_keys_i64.as_ref().unwrap();
+                    let any_present =
+                        keys.iter().any(|k| bloom.contains(k.to_le_bytes().as_ref()));
+                    if !any_present {
+                        continue;
+                    }
+                }
             }
         }
         let mut stream = storage

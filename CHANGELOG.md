@@ -8,6 +8,22 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-18 — Perf (OLTP): point/small INSERT prunes instead of rebuilding the PK set
+
+- Single-row INSERT was ~200 ms+ because `enforce_pk_on_insert` on a sub-threshold
+  table used the cached-set path, which rebuilds/re-reads the existing PK set —
+  and since every INSERT changes the file set it cache-missed each time, re-reading
+  the whole table per insert.
+- Now: any INSERT with a small incoming batch (≤256 rows, the OLTP point/small-write
+  case) takes the prune/stream path regardless of table size: **zone-map prune** on
+  the first PK column (BIGINT for narrow/wide/composite alike) skips files whose
+  range can't contain the key, and **per-file PK bloom prune** (single-column i64
+  PKs) skips files whose bloom says the key is absent. A serial/above-range or
+  random key therefore reads ~0 existing files. Shape-agnostic (single-i64,
+  composite, text PKs all handled; composite/text fall back to zone-map prune).
+  Correctness preserved (bloom false-positives only cause a needless read;
+  false-negatives are impossible) — verified by tests/pk_streaming.rs.
+
 ## 2026-06-17 — Perf: keep Vortex footers/zone-maps RAM-resident (cold-read + point-lookup win)
 
 - The Vortex footer cache was capped at 512 entries (LRU) while the Parquet meta
