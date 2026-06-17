@@ -219,23 +219,31 @@ impl S3LikeConfig {
             .with_region(&self.region)
             .with_access_key_id(&self.access_key_id)
             .with_secret_access_key(&self.secret_access_key)
-            .with_client_options(client_opts)
-            // Virtual-hosted-style is required by Tigris and accepted by
-            // AWS S3, so this default is safe across S3-compatible providers.
-            .with_virtual_hosted_style_request(true);
+            .with_client_options(client_opts);
 
         if let Some(ep) = &self.endpoint {
-            b = b.with_endpoint(ep);
-        }
-        if let Some(tok) = &self.session_token {
-            b = b.with_token(tok);
-        }
-        // S3-compatible endpoints are always HTTPS; reject any plaintext
-        // config to avoid silently leaking credentials over the wire.
-        if let Some(ep) = &self.endpoint {
+            // S3-compatible endpoints are always HTTPS; reject plaintext to avoid
+            // silently leaking credentials over the wire.
             if !ep.starts_with("https://") {
                 return Err(format!("BASIN_STORAGE_ENDPOINT must be HTTPS (got {ep:?})"));
             }
+            // A CUSTOM endpoint (Tigris, MinIO, Wasabi, …) exposes a single
+            // global/regional host with NO per-bucket subdomain, e.g.
+            // `https://fly.storage.tigris.dev`. Virtual-hosted-style would then
+            // emit `{endpoint}/{key}` and DROP the bucket entirely — the first
+            // key segment gets misread as the bucket and the PUT 403s
+            // (AccessDenied). Use PATH-STYLE so the bucket lands in the URL path:
+            // `{endpoint}/{bucket}/{key}`. (If an operator points the endpoint at
+            // a bucket-subdomain host, vhost can be re-enabled via config, but
+            // path-style is the portable default for custom endpoints.)
+            b = b.with_endpoint(ep).with_virtual_hosted_style_request(false);
+        } else {
+            // AWS S3 proper: no custom endpoint. Virtual-hosted-style is the
+            // modern, correct default.
+            b = b.with_virtual_hosted_style_request(true);
+        }
+        if let Some(tok) = &self.session_token {
+            b = b.with_token(tok);
         }
 
         let store = b

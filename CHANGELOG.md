@@ -8,6 +8,22 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Fix: S3/Tigris custom endpoints use path-style (was dropping the bucket → 403)
+
+- The S3-compatible storage backend forced virtual-hosted-style requests for all
+  providers. With a custom endpoint that has no per-bucket subdomain (Tigris's
+  `https://fly.storage.tigris.dev`, MinIO, Wasabi, …), object_store then emitted
+  `{endpoint}/{key}` and **dropped the bucket** — the first object-key segment
+  (`projects/…`) was misread as the bucket name, so every PUT 403'd
+  (`AccessDenied`). Symptom: COPY/INSERT succeeded into the WAL/memtable but
+  compaction to object storage failed on every tick, so `count(*)` stayed 0 —
+  data never became durable/queryable.
+- Now: a **custom endpoint → path-style** (`{endpoint}/{bucket}/{key}`), which
+  Tigris/MinIO/Wasabi support and which keeps the bucket in the request. AWS S3
+  proper (no custom endpoint) keeps virtual-hosted-style. Surfaced the first time
+  the dev engine actually ran on Tigris (it had silently defaulted to local
+  storage because `BASIN_STORAGE_BACKEND` was unset).
+
 ## 2026-06-17 — Perf/scale: bounded-memory PRIMARY KEY enforcement on bulk COPY
 
 - `enforce_pk_on_insert` previously materialized the **entire** existing PK set
