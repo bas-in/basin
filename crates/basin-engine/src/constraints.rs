@@ -135,6 +135,24 @@ impl PkSetCache {
     }
 }
 
+/// Row-count threshold above which `enforce_pk_on_insert` switches from the
+/// build-the-whole-set-in-RAM path to the bounded-memory streaming path
+/// (`enforce_pk_streaming`). Below it, materializing + caching the existing
+/// PK set is cheap and fast; above it the set would be `O(rows)` RAM (a 1B-row
+/// PK table needs ~8 GB+ just for the keys), so we stream instead.
+///
+/// Overridable via `BASIN_PK_STREAMING_MIN_ROWS` — primarily so tests can force
+/// the streaming path at small scale (set to 0) to validate it without seeding
+/// millions of rows.
+const PK_STREAMING_MIN_ROWS_DEFAULT: u64 = 2_000_000;
+
+fn pk_streaming_min_rows() -> u64 {
+    std::env::var("BASIN_PK_STREAMING_MIN_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(PK_STREAMING_MIN_ROWS_DEFAULT)
+}
+
 /// FNV-1a hash of the sorted file paths in the current `(project, table)`
 /// data-file set. Stable across calls when the set is unchanged.
 fn files_signature(files: &[basin_storage::DataFile]) -> u64 {
@@ -292,6 +310,36 @@ pub(crate) async fn enforce_pk_on_insert(
                 .map(|f| f.data_type().clone())
         })
     };
+
+    // ── Bounded-memory path for large tables ────────────────────────────
+    // Materializing the entire existing PK set is `O(rows_in_table)` RAM and
+    // does not scale (a 1B-row PK table needs ~8 GB+ just for the key set).
+    // Above a threshold, stream the existing PK column(s) per file — pruning
+    // files whose zone-map [min,max] can't overlap the incoming batch's key
+    // range — and probe each existing key against the sorted batch keys with a
+    // binary search. Per-batch memory is O(batch), not O(table). For the common
+    // monotonic-key bulk load (serial ids, time order), zone-map pruning skips
+    // every prior file, so the per-chunk cost is just the batch sort.
+    //
+    // The small-table path below is left untouched: it still builds and caches
+    // the full set (with cross-batch memoization), which is faster when the set
+    // fits comfortably in RAM.
+    let total_existing_rows: u64 = data_files.iter().map(|f| f.row_count).sum();
+    if total_existing_rows > pk_streaming_min_rows() {
+        return enforce_pk_streaming(
+            storage,
+            project,
+            table_name_str,
+            pk_columns,
+            &pk_idx,
+            single_i64_pk,
+            batch,
+            &data_files,
+            &tombstone_keys,
+            pk_dt_for_tombstone.as_ref(),
+        )
+        .await;
+    }
 
     // Tier 1 (projection pushdown) + Tier 2 (cross-batch memoization) +
     // Tier 3 (i64 fast-path) all converge here.
@@ -580,6 +628,208 @@ pub(crate) async fn enforce_pk_on_insert(
             );
         }
     }
+    Ok(())
+}
+
+/// Bounded-memory PRIMARY KEY collision check for large tables.
+///
+/// Instead of building the full existing-PK set in RAM, this:
+///   1. sorts the incoming batch's PK keys once (O(batch));
+///   2. prunes data files whose first-PK-column zone-map [min,max] can't
+///      overlap the batch's key range (when that column is `Int64`);
+///   3. streams the PK column(s) of each surviving file and binary-searches
+///      every existing key into the sorted batch keys — reporting the same
+///      `UniqueViolation` the in-RAM path would.
+///
+/// Peak memory is O(batch) plus one file chunk at a time. Correctness is
+/// identical to the in-RAM path: a collision exists iff some incoming key
+/// equals an existing (non-tombstoned) key in some file, and we check every
+/// surviving file's every row. Pruning only ever skips files proven disjoint
+/// (`PruneOutcome::NoMatch`); missing/inconclusive stats fall through to a full
+/// read, so no collision can be missed. The intra-batch duplicate + NULL checks
+/// have already run in the caller before this is reached.
+#[allow(clippy::too_many_arguments)]
+async fn enforce_pk_streaming(
+    storage: &basin_storage::Storage,
+    project: &ProjectId,
+    table_name_str: &str,
+    pk_columns: &[String],
+    pk_idx: &[usize],
+    single_i64_pk: bool,
+    batch: &RecordBatch,
+    data_files: &[basin_storage::DataFile],
+    tombstone_keys: &std::collections::HashSet<Vec<u8>>,
+    pk_dt_for_tombstone: Option<&DataType>,
+) -> Result<()> {
+    use basin_storage::{
+        evaluate_compound_for_pruning, CompoundPredicate, Predicate, PruneOutcome, ScalarValue,
+    };
+
+    let read_opts = basin_storage::ReadOptions {
+        projection: Some(pk_columns.to_vec()),
+        ..Default::default()
+    };
+    let batch_schema = batch.schema();
+
+    // Build a zone-map pruning predicate on the first PK column when it is an
+    // Int64 (covers single-i64 PKs and the common (BIGINT, …) composite). A
+    // file survives only if its [min,max] for that column overlaps the batch's
+    // [min,max]. We express overlap as `col > (bmin-1) AND col < (bmax+1)`;
+    // `evaluate_compound_for_pruning` then returns `NoMatch` exactly when the
+    // file's range is entirely below or entirely above the batch range.
+    let first_is_i64 = batch_schema.field(pk_idx[0]).data_type() == &DataType::Int64;
+    let prune_pred: Option<CompoundPredicate> = if first_is_i64 {
+        let arr = batch
+            .column(pk_idx[0])
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| BasinError::internal("Int64Array downcast (batch PK, streaming)"))?;
+        let mut bmin = i64::MAX;
+        let mut bmax = i64::MIN;
+        for row in 0..batch.num_rows() {
+            if arr.is_null(row) {
+                continue;
+            }
+            let v = arr.value(row);
+            bmin = bmin.min(v);
+            bmax = bmax.max(v);
+        }
+        if bmin > bmax {
+            // No non-null keys in the batch → nothing to check.
+            return Ok(());
+        }
+        let col = pk_columns[0].clone();
+        Some(CompoundPredicate::And(vec![
+            CompoundPredicate::Atom(Predicate::Gt(
+                col.clone(),
+                ScalarValue::Int64(bmin.saturating_sub(1)),
+            )),
+            CompoundPredicate::Atom(Predicate::Lt(col, ScalarValue::Int64(bmax.saturating_add(1)))),
+        ]))
+    } else {
+        None
+    };
+
+    // Sorted incoming keys for binary-search probing.
+    let batch_keys_i64: Option<Vec<i64>> = if single_i64_pk {
+        let arr = batch
+            .column(pk_idx[0])
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| BasinError::internal("Int64Array downcast (batch PK, streaming)"))?;
+        let mut keys: Vec<i64> = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            if !arr.is_null(row) {
+                keys.push(arr.value(row));
+            }
+        }
+        keys.sort_unstable();
+        Some(keys)
+    } else {
+        None
+    };
+    let batch_keys_generic: Option<Vec<Vec<String>>> = if single_i64_pk {
+        None
+    } else {
+        let mut keys: Vec<Vec<String>> = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            if let Some(k) = pk_tuple_for_row(batch, pk_idx, row)? {
+                keys.push(k);
+            }
+        }
+        keys.sort();
+        Some(keys)
+    };
+
+    let dup_err = |key_display: String| {
+        BasinError::UniqueViolation(format!(
+            "duplicate key value violates unique constraint \"{table_name_str}_pkey\": \
+             Key ({})=({}) already exists.",
+            pk_columns.join(", "),
+            key_display
+        ))
+    };
+
+    for f in data_files {
+        if let Some(pred) = &prune_pred {
+            if matches!(
+                evaluate_compound_for_pruning(pred, &f.column_stats, &batch_schema, f.row_count),
+                PruneOutcome::NoMatch
+            ) {
+                continue;
+            }
+        }
+        let mut stream = storage
+            .read_file_with_options(project, &f.path, read_opts.clone())
+            .await?;
+        while let Some(rb) = stream.next().await {
+            let rb = rb?;
+            let rb_pk_idx: Vec<usize> = pk_columns
+                .iter()
+                .map(|c| {
+                    rb.schema().index_of(c).map_err(|_| {
+                        BasinError::internal(format!("PK column {c:?} missing from data file"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            if single_i64_pk {
+                let keys = batch_keys_i64.as_ref().unwrap();
+                let arr = rb
+                    .column(rb_pk_idx[0])
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| BasinError::internal("Int64Array downcast (cold PK, streaming)"))?;
+                for row in 0..rb.num_rows() {
+                    if arr.is_null(row) {
+                        continue;
+                    }
+                    if !tombstone_keys.is_empty() {
+                        if let Some(dt) = pk_dt_for_tombstone {
+                            let col = rb.column(rb_pk_idx[0]);
+                            if let Some(rk) = crate::constraint_union::array_value_to_row_key(
+                                col.as_ref(),
+                                row,
+                                dt,
+                            ) {
+                                if tombstone_keys.contains(rk.as_bytes()) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    let v = arr.value(row);
+                    if keys.binary_search(&v).is_ok() {
+                        return Err(dup_err(v.to_string()));
+                    }
+                }
+            } else {
+                let keys = batch_keys_generic.as_ref().unwrap();
+                for row in 0..rb.num_rows() {
+                    if !tombstone_keys.is_empty() {
+                        if let Some(dt) = pk_dt_for_tombstone {
+                            let col = rb.column(rb_pk_idx[0]);
+                            if let Some(rk) = crate::constraint_union::array_value_to_row_key(
+                                col.as_ref(),
+                                row,
+                                dt,
+                            ) {
+                                if tombstone_keys.contains(rk.as_bytes()) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(k) = pk_tuple_for_row(&rb, &rb_pk_idx, row)? {
+                        if keys.binary_search(&k).is_ok() {
+                            return Err(dup_err(k.join(", ")));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

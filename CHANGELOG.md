@@ -8,6 +8,32 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Perf/scale: bounded-memory PRIMARY KEY enforcement on bulk COPY
+
+- `enforce_pk_on_insert` previously materialized the **entire** existing PK set
+  in RAM (a `HashSet` of every key in the table) to detect collisions — `O(rows)`
+  memory, which OOMs a large PK table (a 1B-row `BIGINT` PK needs ~8 GB+ just for
+  the keys) and is the single blocker for scaling COPY to 1B rows on a small box.
+- **New bounded path** (`enforce_pk_streaming`): above a row-count threshold the
+  check sorts the incoming batch's keys once, prunes data files whose first
+  PK-column zone-map `[min,max]` cannot overlap the batch's key range (reusing
+  the storage layer's `evaluate_compound_for_pruning`), then streams each
+  surviving file's PK column and binary-searches every existing key into the
+  sorted batch. Peak memory is `O(batch)` + one file chunk, **not** `O(table)`.
+  Correctness is byte-identical to the in-RAM path (same `UniqueViolation`,
+  same intra-batch + NULL checks; pruning only ever skips files proven disjoint).
+- For the common monotonic-key bulk load (serial ids, time order) zone-map
+  pruning skips every prior file, so per-chunk cost collapses to the batch sort:
+  measured **~25× faster** ingest at 200k (narrow PK 29k→793k r/s, wide PK
+  11k→272k r/s) *and* flat per-chunk time (no superlinear growth) — bounded
+  memory and faster.
+- Threshold defaults to 2M existing rows; small tables keep the build-and-cache
+  fast path (with cross-batch memoization) unchanged. Overridable via
+  `BASIN_PK_STREAMING_MIN_ROWS` (tests force the streaming path at small scale).
+- Tests: `crates/basin-engine/tests/pk_streaming.rs` gates correctness
+  (clean load passes, cross-file + intra-batch dups rejected, no false positives);
+  the shape-matrix harness confirms all shapes green on both paths.
+
 ## 2026-06-17 — Fix: SUM/MIN/MAX over NUMERIC/FLOAT route to DataFusion (correct type)
 
 - The integer fast-aggregate path accumulates in i64; a SUM/MIN/MAX over a
