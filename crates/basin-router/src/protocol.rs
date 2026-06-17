@@ -2883,6 +2883,25 @@ impl Session for PooledSessionWrapper {
     async fn close_statement(&self, handle: &StatementHandle) {
         self.pooled.session().close_statement(handle).await
     }
+
+    // Forward the bulk-COPY fast path to the inner session. Without this
+    // override the default trait impl returns `FeatureNotSupported`, so EVERY
+    // COPY under the pool (the default dev/prod config, BASIN_POOL_ENABLED=1)
+    // silently fell back to per-row INSERTs — collapsing bulk-ingest throughput
+    // (measured: PK COPY ~350 r/s vs ~64k r/s on the batched path) and making
+    // large PK COPYs slow enough to trip the edge proxy's connection timeout.
+    async fn ingest_csv_batch(
+        &self,
+        table_name: &str,
+        full_schema: std::sync::Arc<arrow_schema::Schema>,
+        column_names: Option<&[String]>,
+        rows: Vec<Vec<Option<String>>>,
+    ) -> Result<u64> {
+        self.pooled
+            .session()
+            .ingest_csv_batch(table_name, full_schema, column_names, rows)
+            .await
+    }
 }
 
 #[async_trait]

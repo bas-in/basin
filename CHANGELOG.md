@@ -8,6 +8,24 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-17 — Fix (major): pooled sessions now use the fast batched COPY path
+
+- `PooledSessionWrapper` (the session the pgwire router uses whenever
+  `BASIN_POOL_ENABLED=1` — the default dev/prod config) did not override
+  `ingest_csv_batch`, so it hit the trait's default impl which returns
+  `FeatureNotSupported`. The router then fell back to **per-row INSERT** for
+  EVERY `COPY`, on every table, in the pooled configuration — the fast bulk
+  path was effectively dead in production.
+- Impact was severe and PK-amplified: measured on the shard+object-store path,
+  bulk `COPY` ran at **~350 rows/s for a PRIMARY KEY table** (each row paying a
+  full INSERT + constraint + WAL cycle) vs **~2.0M rows/s** once batched — a
+  ~5900× regression. Large PK COPYs were slow enough to trip the edge proxy's
+  connection timeout, surfacing to clients as "server closed the connection
+  unexpectedly" mid-COPY.
+- Fix: forward `ingest_csv_batch` from `PooledSessionWrapper` to the inner
+  session (same delegation as every other `Session` method). COPY now takes the
+  batched fast path under the pool. No-PK and PK COPY both ~2M+ rows/s locally.
+
 ## 2026-06-17 — Dev/test: opt-in plaintext-HTTP S3 endpoints (BASIN_STORAGE_ALLOW_HTTP)
 
 - The S3-compatible backend hard-rejected non-HTTPS endpoints, which blocked
