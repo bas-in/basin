@@ -165,7 +165,7 @@ window.__BASIN_RESULTS = {
       "kind": "scaling",
       "id": "data_size",
       "name": "Basin-only scale curve (Neon free tier cannot hold these)",
-      "claim": "Neon free tier caps at 512MB, so it cannot hold 1M+ of this workload \u2014 this curve is Basin-only. No-PK ingest scales FLAT (~68-85k rows/s held from 1M through 425M+ and counting), so 1B is bandwidth/time-bound (~3.3h from a single co-located loader), not architecture-bound. PK bulk-COPY, by contrast, slows super-linearly and is impractical past ~100M (per-chunk PK enforcement re-reads a growing file set \u2014 tracked separately). Cold first-touch reads climb with the file count as the working set outgrows cache.",
+      "claim": "Neon free tier caps at 512MB, so it cannot hold 1M+ of this workload \u2014 this curve is Basin-only. No-PK ingest holds ~55-85k rows/s through ~400M but then DECLINES (\u224836k r/s by 450M \u2014 compaction cost grows with table size even without a PK), and at ~450M the COPY connection dropped (server terminated abnormally) on this 8GB dev box \u2014 so 1B was NOT reached. No-PK is far better than PK (which slows super-linearly and is impractical past ~100M \u2014 per-chunk PK enforcement re-reads a growing file set, tracked separately), but neither completed a 1B seed here: a real 1B needs a bigger box / bounded-tail backpressure (tracked) and/or multiple loaders. Cold first-touch reads also climb with file count as the working set outgrows cache.",
       "passed": true,
       "x_axis": {
         "key": "rows",
@@ -249,10 +249,10 @@ window.__BASIN_RESULTS = {
           "label": "100M seeded at flat ~85k rows/s"
         },
         {
-          "rows": 425000000,
+          "rows": 450000000,
           "config": "narrow_nopk",
-          "seed_rows_per_sec": 68474,
-          "label": "425M+ sustained, ingest still flat (~68-85k rows/s, run continuing toward 1B)"
+          "seed_rows_per_sec": 36500,
+          "label": "450M reached, then the COPY connection dropped (server terminated abnormally); incremental ingest had declined ~57k->36k r/s over 400M->450M. 1B NOT reached on this 8GB dev box."
         },
         {
           "rows": 1000000000,
