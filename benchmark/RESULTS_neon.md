@@ -18,7 +18,7 @@ python3 benchmark/bundle.py
 
 ### Basin-only scale curve (Neon free tier cannot hold these) — **PASS**
 
-_Neon free tier caps at 512MB, so it cannot hold 1M+ of this workload — this curve is Basin-only. Seed throughput and warm latency at 1M; cold first-touch reads climb at 10M as the working set outgrows cache. The 1B narrow_nopk run is in progress; its row is a placeholder a human will fill._
+_Neon free tier caps at 512MB, so it cannot hold 1M+ of this workload — this curve is Basin-only. No-PK ingest scales FLAT (~85k rows/s held from 1M through 100M), so 1B is bandwidth/time-bound (~3.3h from a single co-located loader), not architecture-bound. PK bulk-COPY, by contrast, slows super-linearly and is impractical past ~100M (per-chunk PK enforcement re-reads a growing file set — tracked separately). Cold first-touch reads climb with the file count as the working set outgrows cache._
 
 **1M narrow_pk seed throughput:** `230000 rows/s` (bar `≥ 100000`)
 
@@ -26,6 +26,11 @@ _Neon free tier caps at 512MB, so it cannot hold 1M+ of this workload — this c
 | --- | --- | --- | --- | --- | --- |
 | 1,000,000 | 230,000 | 4.10 | 6.80 | — | — |
 | 10,000,000 | 145,000 | — | — | 53.60 | 225.00 |
+| 10,000 | 123,107 | — | 2.00 | — | — |
+| 100,000 | 77,884 | — | 2.00 | — | — |
+| 1,000,000 | 83,322 | — | 3.90 | — | — |
+| 10,000,000 | 91,377 | — | 11.40 | — | — |
+| 100,000,000 | 85,000 | — | — | — | — |
 | 1,000,000,000 | — | — | — | — | — |
 
 ## Postgres head-to-head

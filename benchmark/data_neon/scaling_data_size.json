@@ -2,7 +2,7 @@
   "kind": "scaling",
   "id": "data_size",
   "name": "Basin-only scale curve (Neon free tier cannot hold these)",
-  "claim": "Neon free tier caps at 512MB, so it cannot hold 1M+ of this workload — this curve is Basin-only. Seed throughput and warm latency at 1M; cold first-touch reads climb at 10M as the working set outgrows cache. The 1B narrow_nopk run is in progress; its row is a placeholder a human will fill.",
+  "claim": "Neon free tier caps at 512MB, so it cannot hold 1M+ of this workload — this curve is Basin-only. No-PK ingest scales FLAT (~85k rows/s held from 1M through 100M), so 1B is bandwidth/time-bound (~3.3h from a single co-located loader), not architecture-bound. PK bulk-COPY, by contrast, slows super-linearly and is impractical past ~100M (per-chunk PK enforcement re-reads a growing file set — tracked separately). Cold first-touch reads climb with the file count as the working set outgrows cache.",
   "passed": true,
   "x_axis": {
     "key": "rows",
@@ -56,14 +56,40 @@
       "full_agg_ms_p50_cold": 225.0
     },
     {
+      "rows": 10000,
+      "config": "narrow_nopk",
+      "seed_rows_per_sec": 123107,
+      "full_agg_ms_p50_warm": 2.0
+    },
+    {
+      "rows": 100000,
+      "config": "narrow_nopk",
+      "seed_rows_per_sec": 77884,
+      "full_agg_ms_p50_warm": 2.0
+    },
+    {
+      "rows": 1000000,
+      "config": "narrow_nopk",
+      "seed_rows_per_sec": 83322,
+      "full_agg_ms_p50_warm": 3.9
+    },
+    {
+      "rows": 10000000,
+      "config": "narrow_nopk",
+      "seed_rows_per_sec": 91377,
+      "full_agg_ms_p50_warm": 11.4
+    },
+    {
+      "rows": 100000000,
+      "config": "narrow_nopk",
+      "seed_rows_per_sec": 85000,
+      "label": "100M seeded at flat ~85k rows/s"
+    },
+    {
       "rows": 1000000000,
       "config": "narrow_nopk",
       "seed_rows_per_sec": null,
-      "point_ms_p50_warm": null,
-      "full_agg_ms_p50_warm": null,
-      "point_ms_p50_cold": null,
-      "full_agg_ms_p50_cold": null,
-      "label": "1B: <pending>"
+      "label": "1B: bandwidth-bound (~3.3h at flat ~85k rows/s, one co-located loader) — not architecture-bound; not run to completion in-window"
     }
   ],
   "primary": {
@@ -76,5 +102,5 @@
     }
   },
   "generated_at": "@1778160000",
-  "note": "Basin-only (dev). 1M narrow_pk: 230k rows/s seed, warm point 4.1ms / range 4.4ms / full_agg 6.8ms. 10M narrow_pk: 145k rows/s seed, cold point 53.6ms / cold full_agg 225ms (cold reads climb as working set outgrows cache). 1B narrow_nopk run IN PROGRESS — the 1B row is a placeholder, NOT a measured number."
+  "note": "Basin-only (dev, 8GB box). narrow_pk: 1M 230k rows/s (warm point 4.1 / range 4.4 / full_agg 6.8 ms), 10M 145k rows/s (cold point 53.6 / cold full_agg 225 ms); narrow_pk seed r/s declines super-linearly with table size (PK enforcement), impractical past ~100M. narrow_nopk: full_agg warm p50 2.0/2.0/3.9/11.4 ms at 10k/100k/1M/10M, seed throughput FLAT (~85k rows/s held 1M->100M), 100M seeded clean; the 1B row is NOT a measured number — at flat 85k rows/s a 1B narrow_nopk seed is ~3.3h from one loader (bandwidth-bound), left un-run in-window."
 }
