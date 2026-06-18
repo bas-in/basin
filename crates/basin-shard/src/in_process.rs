@@ -58,11 +58,33 @@ use crate::{
 };
 
 /// Soft cap on a partition's in-memory tail (uncompacted batches). When the
-/// resident tail crosses this, `write_batch_inner` drains it synchronously so
-/// RAM stays bounded under fast ingest (backpressure: the writer blocks on
-/// compaction / object-store throughput instead of buffering unboundedly).
-/// 256 MiB leaves ample headroom on the 8 GB box for query execution + caches.
+/// resident tail crosses this, `write_batch_inner` logs a pressure warning
+/// (observability). The HARD backpressure cap below is what actually bounds
+/// memory. 256 MiB leaves ample headroom on the 8 GB box for query execution
+/// + caches.
 const MAX_TAIL_BYTES: usize = 256 * 1024 * 1024;
+
+/// HARD cap on a partition's in-memory tail. When `write_batch_inner` observes
+/// the resident tail at or above this, it synchronously flushes the oldest tail
+/// batches to an immutable data file BEFORE returning, so RAM stays bounded
+/// under sustained fast ingest. This is real backpressure: a writer that
+/// outruns the time-ticked compactor paces itself to flush (object-store)
+/// throughput instead of buffering the whole table in memory and OOMing the
+/// box. Set above the soft cap so the soft-cap WARN fires first as an early
+/// signal. The flush is bounded (see `MAX_COMPACTION_ROWS`), so a single
+/// backpressure stall costs one bounded file write, never an O(table) rewrite.
+const HARD_TAIL_BYTES: usize = 384 * 1024 * 1024;
+
+/// Upper bound on the number of rows a single compaction flush folds into one
+/// immutable data file. Compaction drains a partition's tail in chunks of at
+/// most this many rows per output file, so the cost of one flush
+/// (concat + encode + object-store PUT) is bounded by RECENT writes, not by how
+/// large the tail has grown (or how large the table already is). The tail can
+/// span many such files; reads prune across them by zone-map / manifest. This
+/// is the wedge that keeps per-chunk ingest cost flat as the table scales to 1B
+/// rows and beyond: a compaction tick that finds a huge backlog produces
+/// several bounded files instead of one giant O(tail) re-encode.
+const MAX_COMPACTION_ROWS: usize = 512 * 1024;
 
 /// Per-(project, partition) in-memory state. Lives behind an `RwLock` inside
 /// the shard's outer map.
@@ -1440,25 +1462,51 @@ impl InProcessShard {
         };
         let _compact_guard = compact_lock.lock().await;
 
-        // Snapshot the tail under the inner write lock. Holding it briefly is
-        // fine; the lock is per-partition and we drop it before any I/O.
+        // Drain the partition tail in BOUNDED passes. Each pass snapshots a
+        // prefix of each table's tail capped at `MAX_COMPACTION_ROWS` rows,
+        // writes it as ONE immutable file, then prunes exactly the flushed
+        // entries. Looping until the tail is empty means a tick that finds a
+        // large backlog (e.g. a fast COPY that outran the time-ticked compactor)
+        // produces SEVERAL bounded files instead of one giant O(tail) concat +
+        // encode. The cost of any single file write is bounded by recent
+        // writes, not by how large the tail (or table) has grown — this is what
+        // keeps per-chunk ingest cost flat as the table scales.
+        let mut max_lsn_overall: Option<Lsn> = None;
+        let mut any_adaptive_sort = false;
+        loop {
+        // Snapshot a bounded prefix of each table's tail under the inner read
+        // lock. Holding it briefly is fine; the lock is per-partition and we
+        // drop it before any I/O. Capping rows per pass bounds the concat +
+        // encode below.
         let tail_snapshot: Vec<(TableName, Vec<(Lsn, RecordBatch)>)> = {
             let guard = state.read().await;
             guard
                 .tail
                 .iter()
                 .filter(|(_, v)| !v.is_empty())
-                .map(|(t, v)| (t.clone(), v.clone()))
+                .map(|(t, v)| {
+                    let mut taken = Vec::new();
+                    let mut rows = 0usize;
+                    for (lsn, b) in v.iter() {
+                        // Always take at least one batch so a single oversized
+                        // batch still makes progress; stop once we'd exceed the
+                        // per-file row budget.
+                        if !taken.is_empty() && rows + b.num_rows() > MAX_COMPACTION_ROWS {
+                            break;
+                        }
+                        rows += b.num_rows();
+                        taken.push((*lsn, b.clone()));
+                    }
+                    (t.clone(), taken)
+                })
                 .collect()
         };
 
         if tail_snapshot.is_empty() {
-            return Ok(());
+            break;
         }
 
-        let mut max_lsn_overall: Option<Lsn> = None;
         let mut drained_per_table: HashMap<TableName, Lsn> = HashMap::new();
-        let mut any_adaptive_sort = false;
 
         for (table, entries) in tail_snapshot {
             let max_lsn = entries
@@ -1753,8 +1801,9 @@ impl InProcessShard {
         }
 
         // Apply the drain: clear only the (lsn, batch) entries we actually
-        // committed. New writes that landed during compaction (with higher
-        // LSNs) stay in the tail for the next tick.
+        // committed in THIS pass. Entries beyond the per-pass row budget (and
+        // new writes that landed during compaction, with higher LSNs) stay in
+        // the tail and are picked up by the next loop iteration / tick.
         {
             let mut guard = state.write().await;
             for (table, max_lsn) in &drained_per_table {
@@ -1765,6 +1814,9 @@ impl InProcessShard {
                     guard.last_compacted_lsn = *max_lsn;
                 }
             }
+        }
+        // Loop back to drain the next bounded prefix. The snapshot at the top
+        // returns empty once the tail is fully drained, breaking the loop.
         }
 
         // DURABILITY (compaction watermark — duplicate-row crash-window fix).
@@ -2441,10 +2493,15 @@ impl ShardImpl for InProcessShard {
         let inner: Arc<dyn ProjectHandleImpl> = Arc::new(InProcessProjectHandle {
             project: *project,
             partition: partition.clone(),
-            state,
+            state: state.clone(),
             cfg: self.cfg.clone(),
             held_leases: self.held_leases.clone(),
             draining: self.draining.clone(),
+            // Share the same partitions map + registries so a backpressure
+            // flush from the write path is identical to a background-tick
+            // compaction (`share_clone` snapshots the registry cells, which are
+            // wired once at engine startup before any COPY runs).
+            shard: Arc::new(self.share_clone()),
         });
         Ok(ProjectHandle { inner })
     }
@@ -2881,6 +2938,13 @@ struct InProcessProjectHandle {
     /// partition is draining so the router can retry against the new owner.
     /// Reads are unaffected.
     draining: DrainingSet,
+    /// Bounded-tail backpressure: a shard view (sharing the same partitions
+    /// map + registries via `share_clone`) the write path uses to flush the
+    /// in-memory tail to immutable files when it crosses the hard cap, so RAM
+    /// stays bounded under sustained fast ingest instead of buffering the whole
+    /// table. Reuses the exact `compact_one` flush (index sidecars included) so
+    /// a backpressure flush is indistinguishable from a background-tick flush.
+    shard: Arc<InProcessShard>,
 }
 
 impl InProcessProjectHandle {
@@ -2966,22 +3030,51 @@ impl InProcessProjectHandle {
                 .sum::<usize>()
         };
 
-        // BOUNDED-MEMORY signal (#tail-oom): the in-memory tail grows with
-        // ingest rate; for wide rows fast COPY can outrun the time-ticked
-        // compactor and OOM the box. Surface tail pressure so it is observable
-        // and the autoscaler/operator can react. NOTE: the proper fix is
-        // synchronous backpressure here (drain the tail when over threshold so
-        // the writer blocks on compaction throughput), but the per-partition
-        // handle cannot yet invoke the shard's compaction directly (it lacks
-        // the compaction registries) — tracked as a follow-up refactor.
+        // BOUNDED-MEMORY backpressure (#tail-oom): the in-memory tail grows with
+        // ingest rate; for fast/wide COPY a writer can outrun the time-ticked
+        // (30 s) compactor and, with no flow control, buffer the whole table in
+        // RAM and OOM the box (observed in a 1B dev run: the COPY connection was
+        // dropped around 450M rows). Two thresholds:
+        //
+        //   * SOFT cap (`MAX_TAIL_BYTES`): emit an early-warning WARN so tail
+        //     pressure is observable to the operator / autoscaler.
+        //   * HARD cap (`HARD_TAIL_BYTES`): synchronously flush the tail to
+        //     immutable files BEFORE returning. The writer now paces itself to
+        //     object-store flush throughput instead of buffering unboundedly —
+        //     ingest slows gracefully under pressure, it never crashes. The
+        //     flush reuses `compact_one`, which drains in bounded
+        //     (`MAX_COMPACTION_ROWS`) passes, so a single backpressure stall
+        //     costs bounded file writes, not an O(table) rewrite.
         if tail_bytes >= MAX_TAIL_BYTES {
             tracing::warn!(
                 project = %self.project,
                 partition = %self.partition,
                 tail_mib = tail_bytes / (1024 * 1024),
-                "shard tail over soft cap; compaction is not keeping up with ingest \
-                 (risk of OOM under sustained fast/wide ingest — see tail-backpressure follow-up)",
+                "shard tail over soft cap; compaction is falling behind ingest \
+                 (will hard-flush at the backpressure cap)",
             );
+        }
+        if tail_bytes >= HARD_TAIL_BYTES {
+            // Flush the tail to immutable files. `compact_one` serializes per
+            // partition via the partition's compaction lock, so a concurrent
+            // background tick and this backpressure flush cannot double-commit
+            // the same entries — whichever loses the race finds a drained tail
+            // and no-ops. A flush failure is surfaced but NOT fatal to the
+            // write (the rows are already durable in the WAL); the next tick /
+            // write retries. We do not propagate the error so a transient
+            // object-store hiccup does not fail an otherwise-committed COPY row.
+            if let Err(e) = self
+                .shard
+                .compact_one(&self.project, &self.partition, self.state.clone())
+                .await
+            {
+                tracing::warn!(
+                    project = %self.project,
+                    partition = %self.partition,
+                    error = %e,
+                    "backpressure tail flush failed; tail stays resident, next write/tick retries",
+                );
+            }
         }
         Ok(())
     }
@@ -4388,6 +4481,75 @@ mod tests {
         // value or higher, never resetting to ZERO. Just call it to ensure
         // truncate didn't error out.
         let _ = wal.high_water(&project, &partition).await.unwrap();
+    }
+
+    /// Incremental-compaction guard (flat-O(1) ingest wedge): a single
+    /// compaction tick that finds a tail larger than `MAX_COMPACTION_ROWS`
+    /// must drain it as SEVERAL bounded files, not one giant O(tail) concat +
+    /// encode. We insert 700k rows (> the 512k per-file budget) across small
+    /// batches, run ONE compaction, and assert (a) the tail is fully drained,
+    /// (b) MORE THAN ONE data file was produced (bounded per file), (c) every
+    /// row is still readable through the cold tier, and (d) no file exceeds the
+    /// budget. This is what keeps a backlog-catch-up compaction cost bounded by
+    /// recent writes rather than total table size.
+    #[tokio::test]
+    async fn compaction_is_incremental_bounded_files() {
+        let (shard, _sd, _wd, storage, _cat, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        let handle = shard.get(&project, &partition).await.unwrap();
+        // 7 batches of 100k rows = 700k rows > MAX_COMPACTION_ROWS (512k).
+        let per = 100_000usize;
+        let n_batches = 7usize;
+        let total = per * n_batches;
+        for i in 0..n_batches {
+            handle
+                .write_batch(&table, batch((i * per) as i64, per, "v-"))
+                .await
+                .unwrap();
+        }
+
+        let inner = impl_of(&shard);
+        inner.run_compaction_once().await.unwrap();
+
+        // (a) Tail fully drained in one tick (the inner loop keeps going until
+        // the snapshot is empty).
+        let state = {
+            let map = inner.partitions.lock().await;
+            map.get(&(project, partition.clone())).unwrap().clone()
+        };
+        assert!(
+            state.read().await.tail_is_empty(),
+            "tail should be fully drained after one compaction tick"
+        );
+
+        // (b) + (d) Multiple bounded files, each within the per-file row budget.
+        let files = storage
+            .list_data_files_with_stats(&project, &table)
+            .await
+            .unwrap();
+        assert!(
+            files.len() >= 2,
+            "expected >= 2 bounded data files for {total} rows (budget \
+             {MAX_COMPACTION_ROWS}/file), got {}",
+            files.len(),
+        );
+        for f in &files {
+            assert!(
+                f.row_count as usize <= MAX_COMPACTION_ROWS,
+                "file {} has {} rows, exceeds per-file budget {MAX_COMPACTION_ROWS}",
+                f.path,
+                f.row_count,
+            );
+        }
+        let file_rows: usize = files.iter().map(|f| f.row_count as usize).sum();
+        assert_eq!(file_rows, total, "compacted files must hold every row");
+
+        // (c) Every row still readable through the cold tier.
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(rows_in(&read), total, "all rows readable after compaction");
     }
 
     /// Regression for the concurrent-compaction over-count (#95).

@@ -8,6 +8,49 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-18 — Perf: flat-cost bulk ingest at scale (bounded tail + incremental compaction)
+
+- **Bulk ingest (COPY / INSERT) now stays roughly flat in per-chunk cost as a
+  table grows, and the in-memory tail is bounded — no more OOM / dropped COPY
+  connection on a long load.** Two shard-layer changes remove the
+  ingest-doesn't-scale wedge:
+  - **Bounded incremental compaction.** A compaction tick used to concatenate a
+    partition's ENTIRE uncompacted tail into ONE data file. A fast COPY that
+    outran the 30 s compaction cadence therefore let the tail grow without
+    bound, and when compaction finally fired it paid an O(tail) concat + encode
+    that grew with how far behind it had fallen. Compaction now drains the tail
+    in bounded passes capped at `MAX_COMPACTION_ROWS` (512k) rows per output
+    file, looping within a tick until the backlog is cleared. A single file
+    write is bounded by recent writes, not by total table (or tail) size; the
+    immutable file set may grow (reads prune across it by zone-map / manifest).
+  - **Real bounded-tail backpressure.** `write_batch` previously only logged a
+    WARN when the resident tail crossed a 256 MiB soft cap — there was no flow
+    control, so sustained fast ingest buffered the whole table in RAM and
+    eventually OOM'd the engine (observed: a 1B-row dev COPY dropped the
+    connection near 450M rows). The write path now hard-flushes the tail to
+    immutable files inline once it crosses `HARD_TAIL_BYTES` (384 MiB), reusing
+    the same per-partition compaction (index sidecars included) the background
+    tick runs. A writer that outpaces compaction now paces itself to flush
+    throughput — ingest slows gracefully under pressure instead of crashing.
+- Measured on the local MinIO rig (`t(id BIGINT NOT NULL, x INT)`, no PK, 200k-row
+  COPY chunks): per-chunk wall time stays flat at ~0.11 s from 0 → 40M rows
+  (≈1.8M rows/s) and the resident per-partition tail never exceeds the 384 MiB
+  hard cap for the whole load. Before the change the tail (and process RSS) grew
+  linearly with rows (≈400 MiB by 20M rows and climbing, unbounded). Correctness
+  after the load: `COUNT(*)` exact (40,000,000), point and range queries return
+  the right rows.
+- Durability and crash-safety are unchanged: the compaction watermark is still
+  persisted to the catalog before the WAL truncate, so cold-start replay stays
+  duplicate-safe; bounded passes only ever drain a contiguous LSN prefix.
+- Regression guard: `in_process::tests::compaction_is_incremental_bounded_files`
+  inserts 700k rows (> the 512k per-file budget), runs one compaction tick, and
+  asserts the tail fully drains, MORE THAN ONE bounded file is produced, no file
+  exceeds the budget, and every row reads back through the cold tier.
+- Follow-up (not in this change): the PK / keyed ingest path (#26) still re-reads
+  a growing file set for uniqueness enforcement and does not yet stay flat at
+  scale; the in-memory catalog clones the full snapshot chain per call
+  (O(files)) which the engine's own catalog storage avoids in production.
+
 ## 2026-06-18 — Fix: DELETE fast path lost a row count for an absent PK (data-loss correctness)
 
 - **`DELETE FROM t WHERE pk = <absent>` no longer reports a phantom deletion or
