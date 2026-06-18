@@ -86,6 +86,30 @@ const HARD_TAIL_BYTES: usize = 384 * 1024 * 1024;
 /// several bounded files instead of one giant O(tail) re-encode.
 const MAX_COMPACTION_ROWS: usize = 512 * 1024;
 
+/// Number of bounded output files a single `compact_one` flushes CONCURRENTLY.
+/// Against a high-RTT object store a single-file flush is latency-bound (one
+/// PUT round-trip per file), so serial draining caps compaction throughput at
+/// `MAX_COMPACTION_ROWS / PUT_RTT` — below sustained ingest, which lets the
+/// in-memory tail fill to the soft cap and pace ingest down. Writing several
+/// files at once makes compaction throughput scale with parallel PUT
+/// BANDWIDTH instead of single-PUT latency, so the tail drains faster than it
+/// fills and stays well below the soft cap without throttling the writer.
+///
+/// The data-file PUTs are further bounded by the storage layer's per-project
+/// permit pool, so this only controls how many chunks `compact_one` prepares
+/// and writes per wave. Catalog commits stay SERIAL (one CAS at a time per
+/// table) so no two waves double-append the same snapshot. Env-overridable
+/// via `BASIN_SHARD_FLUSH_CONCURRENCY`.
+const DEFAULT_FLUSH_CONCURRENCY: usize = 8;
+
+fn flush_concurrency() -> usize {
+    std::env::var("BASIN_SHARD_FLUSH_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_FLUSH_CONCURRENCY)
+}
+
 /// Resolved per-table write configuration, cached for the lifetime of one
 /// `compact_one` call so the compactor reads the table's catalog metadata once
 /// per table instead of once per flushed file. Every field is table-level
@@ -1515,33 +1539,48 @@ impl InProcessShard {
         // dominant catalog cost behind the long-COPY ingest decay. Caching it
         // collapses that to one chain clone per table per compaction call.
         let mut table_cfg_cache: HashMap<TableName, ResolvedTableCompactCfg> = HashMap::new();
+        let flush_concurrency = flush_concurrency();
         loop {
         // Snapshot a bounded prefix of each table's tail under the inner read
-        // lock. Holding it briefly is fine; the lock is per-partition and we
-        // drop it before any I/O. Capping rows per pass bounds the concat +
-        // encode below.
+        // lock as a flat list of CHUNKS (each chunk ≤ `MAX_COMPACTION_ROWS`
+        // rows = one output file). We take up to `flush_concurrency` chunks
+        // per wave so the file writes below can be issued CONCURRENTLY against
+        // the object store — a single no-PK COPY has just one table, so the
+        // parallelism that lets compaction keep pace with ingest comes from
+        // flushing several of that one table's chunks at once, not from many
+        // tables. Holding the read lock briefly is fine; the lock is
+        // per-partition and we drop it before any I/O. Capping rows per chunk
+        // bounds each concat + encode; capping chunks per wave bounds the
+        // per-wave memory and in-flight PUTs.
         let tail_snapshot: Vec<(TableName, Vec<(Lsn, RecordBatch)>)> = {
             let guard = state.read().await;
-            guard
-                .tail
-                .iter()
-                .filter(|(_, v)| !v.is_empty())
-                .map(|(t, v)| {
-                    let mut taken = Vec::new();
-                    let mut rows = 0usize;
-                    for (lsn, b) in v.iter() {
-                        // Always take at least one batch so a single oversized
-                        // batch still makes progress; stop once we'd exceed the
-                        // per-file row budget.
-                        if !taken.is_empty() && rows + b.num_rows() > MAX_COMPACTION_ROWS {
-                            break;
+            let mut chunks: Vec<(TableName, Vec<(Lsn, RecordBatch)>)> = Vec::new();
+            'outer: for (t, v) in guard.tail.iter().filter(|(_, v)| !v.is_empty()) {
+                let mut taken = Vec::new();
+                let mut rows = 0usize;
+                for (lsn, b) in v.iter() {
+                    // Always take at least one batch per chunk so a single
+                    // oversized batch still makes progress; close the chunk
+                    // once it would exceed the per-file row budget and start a
+                    // new one (still the same table) so the writes parallelise.
+                    if !taken.is_empty() && rows + b.num_rows() > MAX_COMPACTION_ROWS {
+                        chunks.push((t.clone(), std::mem::take(&mut taken)));
+                        rows = 0;
+                        if chunks.len() >= flush_concurrency {
+                            break 'outer;
                         }
-                        rows += b.num_rows();
-                        taken.push((*lsn, b.clone()));
                     }
-                    (t.clone(), taken)
-                })
-                .collect()
+                    rows += b.num_rows();
+                    taken.push((*lsn, b.clone()));
+                }
+                if !taken.is_empty() {
+                    chunks.push((t.clone(), taken));
+                    if chunks.len() >= flush_concurrency {
+                        break 'outer;
+                    }
+                }
+            }
+            chunks
         };
 
         if tail_snapshot.is_empty() {
@@ -1549,6 +1588,23 @@ impl InProcessShard {
         }
 
         let mut drained_per_table: HashMap<TableName, Lsn> = HashMap::new();
+
+        // PHASE 1 (sequential, cheap, no object-store I/O): for each chunk
+        // resolve the per-table write config (cached), pick sort columns, build
+        // the WriteOptions and the backfilled merged batch. This touches the
+        // `!Send` top-pattern-provider guard and the per-call cfg cache, so it
+        // stays on this task. The output is a list of self-contained write
+        // plans that PHASE 2 can hand to concurrent writer tasks.
+        struct ChunkWritePlan {
+            table: TableName,
+            max_lsn: Lsn,
+            merged: RecordBatch,
+            write_opts: basin_storage::WriteOptions,
+            gin_indexes: Vec<basin_catalog::SecondaryIndex>,
+            effective_rg_size: usize,
+            used_adaptive_sort: bool,
+        }
+        let mut plans: Vec<ChunkWritePlan> = Vec::with_capacity(tail_snapshot.len());
 
         for (table, entries) in tail_snapshot {
             let max_lsn = entries
@@ -1696,11 +1752,86 @@ impl InProcessShard {
             // file (otherwise they'd read NULL via DataFusion's missing-column
             // fill). No-op when the table has no promoted paths.
             let merged = backfill_promoted_columns(merged, &promoted_paths)?;
-            let data_file = self
-                .cfg
-                .storage
-                .write_batch_with_options(project, &table, partition, &merged, &write_opts)
-                .await?;
+            // The effective row-group size mirrors the writer's priority:
+            // row_block_size (WITH clause) > row_group_rows (ALTER TABLE) > default.
+            let effective_rg_size = row_block_size
+                .map(|v| v as usize)
+                .or(row_group_rows)
+                .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE);
+            plans.push(ChunkWritePlan {
+                table,
+                max_lsn,
+                merged,
+                write_opts,
+                gin_indexes,
+                effective_rg_size,
+                used_adaptive_sort,
+            });
+        }
+
+        // PHASE 2a (CONCURRENT, latency-bound): write every chunk's data file
+        // to the object store at once, bounded by `flush_concurrency`. This is
+        // the change that lets compaction keep pace with ingest: a single PUT
+        // is RTT-bound, so serial writes capped compaction throughput below
+        // ingest and let the tail fill; issuing `flush_concurrency` PUTs at
+        // once makes compaction throughput scale with parallel PUT BANDWIDTH.
+        // The storage layer's per-project permit pool further bounds the real
+        // in-flight PUT count, so this never floods the store. Each task only
+        // writes the file (no catalog mutation), so the writes are independent
+        // and cannot conflict.
+        let written: Vec<(usize, basin_storage::DataFile)> = {
+            use futures::stream::{FuturesUnordered, StreamExt as _};
+            let mut futs = FuturesUnordered::new();
+            for (idx, plan) in plans.iter().enumerate() {
+                let storage = self.cfg.storage.clone();
+                let table = plan.table.clone();
+                let merged = plan.merged.clone();
+                let write_opts = plan.write_opts.clone();
+                let partition = partition.clone();
+                let project = *project;
+                futs.push(async move {
+                    let res = storage
+                        .write_batch_with_options(&project, &table, &partition, &merged, &write_opts)
+                        .await;
+                    (idx, res)
+                });
+            }
+            // The per-wave snapshot already caps `plans.len()` at
+            // `flush_concurrency`, so all these futures in flight at once is
+            // exactly the intended bound; the storage layer's per-project
+            // permit pool is the final guard on real in-flight PUTs. We fail
+            // the whole wave on the first write error (the data is still in the
+            // tail + WAL and no catalog commit has happened yet, so the next
+            // tick retries — nothing is dropped or double-committed).
+            let mut out: Vec<(usize, basin_storage::DataFile)> = Vec::with_capacity(plans.len());
+            while let Some((idx, res)) = futs.next().await {
+                out.push((idx, res?));
+            }
+            out
+        };
+        // Re-pair writes with their plans, sorted by plan index so the
+        // sequential commit below runs in deterministic (ascending-LSN) order.
+        let mut written_by_idx: Vec<Option<basin_storage::DataFile>> =
+            (0..plans.len()).map(|_| None).collect();
+        for (idx, df) in written {
+            written_by_idx[idx] = Some(df);
+        }
+
+        // PHASE 2b (SEQUENTIAL): commit each written file to the catalog and
+        // build its sidecar indexes. Commits MUST be serial per table — the
+        // catalog append is a CAS against the current snapshot, so two
+        // concurrent appends would conflict-loop; running them in order keeps
+        // the fast path conflict-free and avoids any double-commit. The
+        // expensive (RTT-bound) work already happened concurrently in 2a; the
+        // commit is an in-process catalog CAS.
+        for (idx, plan) in plans.iter().enumerate() {
+            let table = &plan.table;
+            let merged = &plan.merged;
+            let gin_indexes = &plan.gin_indexes;
+            let effective_rg_size = plan.effective_rg_size;
+            let data_file = written_by_idx[idx]
+                .take()
+                .expect("every plan has a corresponding written file");
 
             let file_ref = DataFileRef {
                 path: data_file.path.as_ref().to_string(),
@@ -1712,92 +1843,50 @@ impl InProcessShard {
                 tdigest_sketches: ::std::collections::BTreeMap::new(),
             };
 
-            self.commit_with_retry(project, &table, &merged, file_ref)
+            self.commit_with_retry(project, table, merged, file_ref)
                 .await?;
 
             // Re-index the compacted file's JSONB GIN columns into the
             // row-group bloom registry so the engine's `@>` row-group prune
-            // fires on compacted files.
-            //
-            // This is the ONLY place GIN row-group summaries are populated on
-            // the shard path: INSERT writes go directly to WAL+tail (the
-            // executor's `maintain_gin_rowgroup_index_on_insert` is not called
-            // on the shard fast path), so compaction is where all indexing
-            // happens for shard-written data.
-            //
-            // Correctness: the registry is a conservative superset (bloom
-            // false positives are fine; `jsonb_contains` re-checks every
-            // surviving row at read time).  Skipping indexing (when the
-            // registry is None) is safe — the completeness guard in
-            // `apply_gin_pruning_for_query` falls back to full scan for
-            // un-indexed files, never producing false negatives.
-            //
-            // Eviction of stale entries: on the current shard path,
-            // INSERT never populates the registry (tail batches are never
-            // indexed), so the registry starts empty before the first
-            // compaction.  The compacted file is always NEW — there is no
-            // pre-existing entry to evict.  If a future Parquet-merge
-            // compactor (that merges existing cold-tier files into fewer
-            // larger files) is added, it should call
-            // `GinRowGroupRegistry::remove_file` for each superseded file
-            // to reclaim memory.  That path doesn't exist today.
-            //
-            // The effective row-group size mirrors the writer's priority:
-            // row_block_size (WITH clause) > row_group_rows (ALTER TABLE) > default.
-            let effective_rg_size = row_block_size
-                .map(|v| v as usize)
-                .or(row_group_rows)
-                .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE);
+            // fires on compacted files. This is the ONLY place GIN row-group
+            // summaries are populated on the shard path (INSERT writes go
+            // directly to WAL+tail). Correctness: the registry is a
+            // conservative superset (bloom false positives are fine;
+            // `jsonb_contains` re-checks every surviving row at read time).
             reindex_compacted_file_gin(
                 &self.gin_rowgroup_registry,
                 project,
-                &table,
-                &gin_indexes,
+                table,
+                gin_indexes,
                 effective_rg_size,
-                &merged,
+                merged,
                 data_file.path.as_ref().as_ref(),
             );
 
             // FIX 2(a) — register the compacted file's single-column B-tree
             // index values into the secondary-index registry so point queries
-            // on an indexed column can prune to this file.  Like the GIN
-            // re-index above, this is the ONLY place the secondary registry is
-            // populated for shard-written data (INSERT bypasses the engine's
-            // `maintain_secondary_indexes_on_insert`).
-            //
-            // Stale-entry eviction: the current shard compactor only APPENDS a
-            // new merged file (`commit_with_retry` -> `append_data_file`); the
-            // tail rows it consumed were never in the registry under any file
-            // path (INSERT never populated it), so there is no pre-existing
-            // entry to remove for those rows.  A future Parquet-merge compactor
-            // that supersedes existing cold-tier files would need to call the
-            // sink's `remove_file` for each replaced path; that path does not
-            // exist today (mirrors the GIN-reindex eviction note above).
+            // on an indexed column can prune to this file.
             reindex_compacted_file_secondary(
                 &self.secondary_index_registry,
                 project,
-                &table,
-                &gin_indexes,
+                table,
+                gin_indexes,
                 effective_rg_size,
-                &merged,
+                merged,
                 data_file.path.as_ref().as_ref(),
             );
 
-            // Inv-W5 / W9: build the JSONB posting list (per-(key, value)
-            // → set of (file, row_group) inverted index) for any GIN
-            // index on a JSONB column.  This is the prune primitive for
-            // `@>` containment — the existing bloom registry above stays
-            // wired for `?` key-exists queries.  Best-effort: a sidecar
-            // write failure is logged but does not abort the commit
-            // (queries fall back to the bloom / full-scan path).
+            // Inv-W5 / W9: build the JSONB posting list for any GIN index on a
+            // JSONB column. Best-effort: a sidecar write failure is logged but
+            // does not abort the commit (queries fall back to bloom/full scan).
             if let Err(e) = reindex_compacted_file_jsonb_posting(
                 &self.jsonb_posting_registry,
                 self.cfg.storage.clone(),
                 project,
-                &table,
-                &gin_indexes,
+                table,
+                gin_indexes,
                 effective_rg_size,
-                &merged,
+                merged,
                 data_file.path.as_ref(),
             )
             .await
@@ -1811,20 +1900,16 @@ impl InProcessShard {
                 );
             }
 
-            // PG-Wave-α: write `.rtree` sidecars for any GIST index on a
-            // POINT column. The probe path (RTreePrunedTable +
-            // apply_rtree_pruning_for_query) lands in PG-Wave-β; the
-            // sidecar must already exist for that wave to wire onto.
-            // Best-effort: a sidecar write failure is logged but does
-            // not abort the compaction commit (the data is already
-            // catalogued, future queries fall back to a full scan).
+            // PG-Wave-α: write `.rtree` sidecars for any GIST index on a POINT
+            // column. Best-effort: a sidecar write failure is logged but does
+            // not abort the compaction commit (the data is already catalogued).
             if let Err(e) = reindex_compacted_file_rtree(
                 self.cfg.storage.clone(),
                 project,
-                &table,
-                &gin_indexes,
+                table,
+                gin_indexes,
                 effective_rg_size as u32,
-                &merged,
+                merged,
                 data_file.path.as_ref(),
             )
             .await
@@ -1838,11 +1923,15 @@ impl InProcessShard {
                 );
             }
 
-            if used_adaptive_sort {
+            if plan.used_adaptive_sort {
                 any_adaptive_sort = true;
             }
 
-            drained_per_table.insert(table, max_lsn);
+            let max_lsn = plan.max_lsn;
+            let entry = drained_per_table.entry(table.clone()).or_insert(max_lsn);
+            if *entry < max_lsn {
+                *entry = max_lsn;
+            }
             max_lsn_overall = Some(match max_lsn_overall {
                 Some(prev) if prev >= max_lsn => prev,
                 _ => max_lsn,
@@ -6082,6 +6171,355 @@ mod tests {
                 .live_data_files()
                 .len(),
             1
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Parallel compaction + WAL GC (flat ingest under high object-store RTT).
+    // ----------------------------------------------------------------------
+
+    /// Object-store decorator that sleeps before every `put` so a fast local
+    /// store behaves like a high-RTT remote one. Without injected latency a
+    /// loopback/tmpfs store hides the very effect under test (serial flushes
+    /// only fall behind ingest when each PUT is latency-bound).
+    #[derive(Debug)]
+    struct LatencyPutStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        delay: Duration,
+        puts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LatencyPutStore {
+        fn new(inner: Arc<dyn object_store::ObjectStore>, delay: Duration) -> Self {
+            Self {
+                inner,
+                delay,
+                puts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl std::fmt::Display for LatencyPutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "LatencyPutStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for LatencyPutStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(self.delay).await;
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, opts).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::ObjectMeta>,
+        > {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            opts: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    /// Total bytes of all `.seg` files under a WAL directory — the live WAL
+    /// footprint. Used to assert WAL GC keeps the on-disk WAL bounded.
+    fn wal_dir_seg_bytes(dir: &std::path::Path) -> u64 {
+        fn walk(p: &std::path::Path, acc: &mut u64) {
+            let Ok(rd) = std::fs::read_dir(p) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, acc);
+                } else if path.extension().and_then(|s| s.to_str()) == Some("seg") {
+                    *acc += e.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        let mut acc = 0;
+        walk(dir, &mut acc);
+        acc
+    }
+
+    /// Parallel compaction keeps the tail bounded under a high-RTT store.
+    ///
+    /// With ~20ms-per-PUT latency injected, a SERIAL drain of a many-chunk
+    /// backlog takes `n_files * 20ms`; the concurrent drain overlaps the PUTs
+    /// so the same backlog clears in roughly `ceil(n_files/concurrency) * 20ms`.
+    /// We compare a CONCURRENT drain (flush_concurrency=N) against a SERIAL
+    /// drain (flush_concurrency=1) of the SAME multi-file backlog under the
+    /// same high per-PUT latency. The encode cost is identical in both runs,
+    /// so the wall-clock delta isolates the PUT-latency term: serial pays it
+    /// `n` times, concurrent pays it ~`n/N` times. We assert (a) the whole
+    /// backlog drains in ONE call (tail empty), (b) more than one file was
+    /// produced (the concurrency path is exercised), (c) the concurrent run is
+    /// meaningfully faster than serial (PUTs overlapped), and (d) every row
+    /// survives. This proves compaction throughput scales with PUT bandwidth,
+    /// which is what keeps the tail below the soft cap without throttling
+    /// ingest.
+    async fn drain_backlog_elapsed(flush_concurrency: usize, delay: Duration) -> (Duration, usize) {
+        let storage_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+        let storage_inner: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap());
+        let storage = Storage::new(StorageConfig {
+            object_store: Arc::new(LatencyPutStore::new(storage_inner, delay)),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
+                root_prefix: None,
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
+            })
+            .await
+            .unwrap(),
+        );
+        let shard = crate::Shard::new(ShardConfig::new(storage.clone(), catalog, wal));
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+        let handle = shard.get(&project, &partition).await.unwrap();
+
+        // 6 * 512k rows => 6 bounded output files, drained in one wave at
+        // flush_concurrency>=6.
+        let per = MAX_COMPACTION_ROWS;
+        let n = 6usize;
+        for i in 0..n {
+            handle
+                .write_batch(&table, batch((i * per) as i64, per, "v-"))
+                .await
+                .unwrap();
+        }
+
+        std::env::set_var("BASIN_SHARD_FLUSH_CONCURRENCY", flush_concurrency.to_string());
+        let inner = impl_of(&shard);
+        let started = Instant::now();
+        inner.run_compaction_once().await.unwrap();
+        let elapsed = started.elapsed();
+        std::env::remove_var("BASIN_SHARD_FLUSH_CONCURRENCY");
+
+        // (a) tail drained.
+        let state = {
+            let map = inner.partitions.lock().await;
+            map.get(&(project, partition.clone())).unwrap().clone()
+        };
+        assert!(
+            state.read().await.tail_is_empty(),
+            "tail must be fully drained after one compaction call"
+        );
+        let files = storage.list_data_files(&project, &table).await.unwrap();
+        // (d) correctness.
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(rows_in(&read), n * per, "all rows must survive compaction");
+        (elapsed, files.len())
+    }
+
+    #[tokio::test]
+    async fn parallel_compaction_keeps_tail_bounded() {
+        basin_common::telemetry::try_init_for_tests();
+        // High per-PUT delay so the latency term dominates the (identical)
+        // encode cost in both runs.
+        let delay = Duration::from_millis(250);
+
+        let (serial, serial_files) = drain_backlog_elapsed(1, delay).await;
+        let (concurrent, conc_files) = drain_backlog_elapsed(6, delay).await;
+
+        // (b) the backlog really was several files (concurrency path exercised).
+        assert!(
+            serial_files >= 2 && conc_files >= 2,
+            "expected several bounded files (serial={serial_files}, concurrent={conc_files})"
+        );
+
+        // (c) concurrent overlapped the PUTs. Serial pays ~6*250ms = 1.5s of
+        // pure PUT latency that the concurrent run overlaps into ~250ms; the
+        // shared (constant) encode cost cancels out. Require the concurrent run
+        // to beat serial by at least ~3 PUT-latencies — well above timing
+        // jitter, conservatively below the ~5-latency ideal.
+        let savings = delay.mul_f64(3.0);
+        assert!(
+            concurrent + savings < serial,
+            "concurrent drain ({concurrent:?}) did not overlap PUTs vs serial ({serial:?}); \
+             expected at least {savings:?} faster",
+        );
+    }
+
+    /// WAL GC bounds on-disk WAL footprint AND preserves crash recovery.
+    ///
+    /// Sequence: write+compact several waves (each advances the watermark and
+    /// truncates the now-durable WAL segments), measuring the WAL `.seg`
+    /// footprint after each. The footprint must NOT grow monotonically with
+    /// total rows — that is the "WAL fills the volume" bug. Then we write a
+    /// final un-compacted wave (still only in the WAL), simulate a crash by
+    /// dropping the shard, and reopen a NEW shard over the SAME catalog + WAL +
+    /// storage. Recovery must reconstruct the FULL row count: WAL GC must not
+    /// have dropped any segment still needed to replay the un-flushed tail.
+    #[tokio::test]
+    async fn wal_gc_bounds_space_and_preserves_recovery() {
+        basin_common::telemetry::try_init_for_tests();
+
+        let storage_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+        let storage_fs: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap());
+        let storage = Storage::new(StorageConfig {
+            object_store: storage_fs,
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        // The catalog is the durable surface that survives a crash (it carries
+        // the compaction watermark). Reuse the SAME Arc across the crash so the
+        // post-crash replay floor is the real persisted watermark.
+        let catalog = Arc::new(InMemoryCatalog::new());
+
+        let open_wal = || {
+            let dir = wal_dir.path().to_path_buf();
+            async move {
+                let w: Arc<dyn Wal> = Arc::new(
+                    LocalWal::open(WalConfig {
+                        object_store: Arc::new(
+                            LocalFileSystem::new_with_prefix(dir).unwrap(),
+                        ),
+                        root_prefix: None,
+                        flush_interval: Duration::from_millis(20),
+                        flush_max_bytes: 256 * 1024,
+                        commit_delay: Duration::from_millis(2),
+                    })
+                    .await
+                    .unwrap(),
+                );
+                w
+            }
+        };
+
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        let per = 50_000usize;
+        let mut total_committed = 0usize;
+        let mut footprints: Vec<u64> = Vec::new();
+
+        {
+            let wal = open_wal().await;
+            let shard =
+                crate::Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+            let handle = shard.get(&project, &partition).await.unwrap();
+            let inner = impl_of(&shard);
+
+            // Several write+compact waves. After each compaction the WAL
+            // segments below the watermark are deleted, so the footprint should
+            // stay bounded rather than grow with total rows.
+            for wave in 0..5 {
+                for j in 0..4 {
+                    handle
+                        .write_batch(
+                            &table,
+                            batch(((wave * 4 + j) * per) as i64, per, "v-"),
+                        )
+                        .await
+                        .unwrap();
+                    total_committed += per;
+                }
+                wal.flush().await.unwrap();
+                inner.run_compaction_once().await.unwrap();
+                footprints.push(wal_dir_seg_bytes(wal_dir.path()));
+            }
+
+            // Final un-compacted wave: lands in the WAL only (durable), never
+            // compacted before the "crash". WAL GC must NOT touch these
+            // segments (their LSNs are above the watermark).
+            for j in 0..4 {
+                handle
+                    .write_batch_opts(
+                        &table,
+                        batch(((20 + j) * per) as i64, per, "tail-"),
+                        true, // durable: on the store before ack
+                    )
+                    .await
+                    .unwrap();
+                total_committed += per;
+            }
+            wal.flush().await.unwrap();
+            wal.close().await.unwrap();
+            // Drop the shard -> simulate crash (in-memory tail lost; only the
+            // catalog watermark + object-store files + WAL survive).
+        }
+
+        // (a) WAL footprint is bounded: the last steady-state wave's footprint
+        // must not be a large multiple of the first — segments were reclaimed.
+        // (Compacted waves leave only the most recent, not-yet-truncated tail.)
+        let max_steady = *footprints.iter().max().unwrap();
+        let min_steady = *footprints.iter().min().unwrap();
+        assert!(
+            max_steady <= min_steady.saturating_mul(3) + 1024 * 1024,
+            "WAL footprint grew unbounded across waves: {footprints:?}"
+        );
+
+        // (b) Crash recovery: reopen over the SAME catalog + WAL dir + storage.
+        // The reconstructed row count must be exact — WAL GC must not have
+        // dropped any segment still needed for the un-flushed tail.
+        let wal2 = open_wal().await;
+        let shard2 = crate::Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal2));
+        let handle2 = shard2.get(&project, &partition).await.unwrap();
+        let read = handle2.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(
+            rows_in(&read),
+            total_committed,
+            "recovery must reconstruct every committed row (no segment dropped early)"
         );
     }
 }

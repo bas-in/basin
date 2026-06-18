@@ -8,6 +8,45 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-19 — Perf: parallel compaction keeps the tail bounded under a high-RTT object store
+
+- **Compaction now flushes multiple bounded output files concurrently, so its
+  throughput scales with parallel object-store PUT bandwidth instead of
+  single-PUT latency.** Against a high-RTT object store (e.g. Tigris) a serial
+  flush is RTT-bound — one PUT round trip per file — so its throughput stayed
+  below sustained no-PK ingest, the in-memory tail filled to the soft cap, and
+  backpressure paced ingest *down* (incremental throughput gently declined as
+  the table grew). `compact_one` now snapshots several bounded chunks
+  (`MAX_COMPACTION_ROWS` each) per wave and writes their data files
+  **concurrently** (bound `BASIN_SHARD_FLUSH_CONCURRENCY`, default 8; the
+  storage layer's per-project permit pool further caps in-flight PUTs); catalog
+  commits stay **serial** per table so no two writes double-append the same
+  snapshot. The tail now drains faster than it fills and stays well below the
+  soft cap without throttling the writer. Watermark-before-truncate durability,
+  the per-partition compaction lock, and the bounded-memory hard-cap backstop
+  are unchanged. (`basin-shard/src/in_process.rs`: `compact_one`,
+  `flush_concurrency`.)
+- **WAL disk usage is bounded by the un-flushed tail (flat, regardless of total
+  rows).** A compaction that commits a tail prefix to object storage advances
+  the durable compaction watermark in the catalog and then deletes the WAL
+  segments entirely below it (`Wal::truncate` removes every closed segment whose
+  `last_lsn <= watermark`). With compaction now keeping pace, the truncate fires
+  regularly, so WAL segments are reclaimed promptly after their data is durable
+  — fixing the "No space left on device" wall on the WAL volume during long
+  no-PK COPYs. **Durability safety:** a segment is deleted only once the
+  watermark is strictly past its max LSN (i.e. all its rows are durable in
+  object storage + catalog); segments covering un-flushed data are never
+  dropped, so crash recovery from the remaining WAL + object store reconstructs
+  the full state. Covered by a new recovery test.
+  (`basin-shard/src/in_process.rs`: `compact_one` watermark→truncate path;
+  `basin-wal/src/file_wal.rs`: `truncate`.)
+- Tests: `parallel_compaction_keeps_tail_bounded` (concurrent vs serial drain of
+  a multi-file backlog under injected per-PUT latency — proves the PUTs overlap)
+  and `wal_gc_bounds_space_and_preserves_recovery` (WAL `.seg` footprint stays
+  bounded across write+compact waves, and a crash + reopen over the same
+  catalog/WAL/storage reconstructs every committed row — no segment dropped
+  early). (`basin-shard/src/in_process.rs`.)
+
 ## 2026-06-18 — Perf: flatter no-PK bulk-COPY ingest against a high-RTT object store
 
 - **Sustained no-PK bulk-COPY throughput no longer decays as the table grows
