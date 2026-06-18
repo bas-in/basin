@@ -1680,3 +1680,176 @@ async fn update_set_date_literal_round_trip() {
     // Row 1 → 2022-03-01 = 19052 days since epoch; row 2 untouched.
     assert_eq!(col_date32(&batches, "d"), vec![Some(19_052), Some(18_793)]);
 }
+
+// ─── Adversarial: DELETE/UPDATE fast path on absent keys must not lose rows ──
+
+/// Parse the affected-row count out of an `ExecResult::Empty { tag }` such as
+/// `"DELETE 3"` / `"UPDATE 0"`.
+fn affected_from_tag(res: &ExecResult) -> i64 {
+    match res {
+        ExecResult::Empty { tag } => tag
+            .rsplit(' ')
+            .next()
+            .and_then(|n| n.parse::<i64>().ok())
+            .unwrap_or_else(|| panic!("tag has no trailing count: {tag:?}")),
+        ExecResult::Rows { .. } => panic!("expected Empty tag, got Rows"),
+    }
+}
+
+/// COUNT(*) via the engine (exercises the metadata-aggregate fast path that
+/// subtracts the live tombstone count — the second half of the data-loss bug).
+async fn count_star(sess: &ProjectSession, table: &str) -> i64 {
+    let ExecResult::Rows { batches, .. } = sess
+        .execute(&format!("SELECT count(*) AS c FROM {table}"))
+        .await
+        .unwrap()
+    else {
+        panic!("count(*) returned no rows")
+    };
+    col_i64(&batches, "c")[0]
+}
+
+/// The full surviving key set, materialised by enumeration (NOT a counter) so
+/// it cross-checks the tombstone-filter read path independently of count(*).
+async fn surviving_ids(sess: &ProjectSession, table: &str) -> std::collections::BTreeSet<i64> {
+    let ExecResult::Rows { batches, .. } = sess
+        .execute(&format!("SELECT id FROM {table} ORDER BY id"))
+        .await
+        .unwrap()
+    else {
+        panic!("id enumeration returned no rows result")
+    };
+    col_i64(&batches, "id").into_iter().collect()
+}
+
+/// Adversarial oracle test for the DELETE/UPDATE hot-tier fast path.
+///
+/// Regression guard for the data-loss bug: `DELETE FROM t WHERE id = <absent>`
+/// reported `DELETE 1` and decremented `COUNT(*)` even though no matching row
+/// existed (a phantom tombstone). This test seeds a single-column BIGINT-PK
+/// table, then runs a long mix of DELETEs and UPDATEs with PRESENT and ABSENT
+/// keys — below, within, above, and at the boundaries of the seeded range, plus
+/// repeated deletes of the same key — and after EVERY statement asserts:
+///   (a) the reported affected-row count == the true number of matching live
+///       rows (computed from an in-test `HashSet` oracle), and
+///   (b) `COUNT(*)` and the actual surviving key set both equal the oracle.
+///
+/// FAILS on the pre-fix code (absent-key DELETE returns 1 and drops the count);
+/// PASSES after `resolve_present_pk_keys` gates the tombstone write to keys that
+/// resolve to a live row.
+#[tokio::test]
+async fn fast_path_absent_key_delete_update_oracle() {
+    std::env::set_var("BASIN_HOTTIER_DELETE_FASTPATH", "1");
+    std::env::set_var("BASIN_HOTTIER_FASTPATH_DISABLE", "0");
+
+    let (_dir, eng) = open_engine().await;
+    let sess = session(&eng).await;
+
+    sess.execute("CREATE TABLE adv (id BIGINT PRIMARY KEY, x INT NOT NULL)")
+        .await
+        .unwrap();
+
+    // Seed ids 1..=100, x = id*10. Oracle mirrors the live key set.
+    let mut oracle: std::collections::BTreeSet<i64> = (1..=100).collect();
+    {
+        let vals: Vec<String> = (1..=100).map(|i| format!("({i}, {})", i * 10)).collect();
+        sess.execute(&format!("INSERT INTO adv (id, x) VALUES {}", vals.join(", ")))
+            .await
+            .unwrap();
+    }
+    assert_eq!(count_star(&sess, "adv").await, 100);
+    assert_eq!(surviving_ids(&sess, "adv").await, oracle);
+
+    // A scripted mix: each entry is (id, is_delete). Keys cover below-range (0,
+    // -5), within-range present (37, 50, 99), within-range gaps after deletion,
+    // boundaries (1, 100), above-range absent (101, 999_999, i64::MAX), and
+    // repeated deletes of the same key.
+    let ops: &[(i64, bool)] = &[
+        (999_999, true),  // absent above range  → DELETE 0
+        (0, true),        // absent below range  → DELETE 0
+        (-5, true),       // absent (negative)   → DELETE 0
+        (50, true),       // present             → DELETE 1
+        (50, true),       // repeat, now absent  → DELETE 0
+        (50, false),      // UPDATE absent        → UPDATE 0
+        (100, true),      // boundary present    → DELETE 1
+        (101, true),      // just above range     → DELETE 0
+        (1, true),        // boundary present    → DELETE 1
+        (1, true),        // repeat, now absent  → DELETE 0
+        (37, false),      // UPDATE present       → UPDATE 1
+        (37, true),       // present (still)     → DELETE 1
+        (37, false),      // UPDATE absent        → UPDATE 0
+        (i64::MAX, true), // extreme absent       → DELETE 0
+        (99, false),      // UPDATE present       → UPDATE 1
+        (99, true),       // present             → DELETE 1
+        (200, false),     // UPDATE absent        → UPDATE 0
+        (200, true),      // absent               → DELETE 0
+        (2, true),        // present             → DELETE 1
+    ];
+
+    for (i, &(id, is_delete)) in ops.iter().enumerate() {
+        let (sql, expected_affected) = if is_delete {
+            let present = oracle.remove(&id);
+            (
+                format!("DELETE FROM adv WHERE id = {id}"),
+                i64::from(present),
+            )
+        } else {
+            // UPDATE never changes membership; affected == 1 iff present.
+            let present = oracle.contains(&id);
+            (
+                format!("UPDATE adv SET x = x + 1 WHERE id = {id}"),
+                i64::from(present),
+            )
+        };
+
+        let res = sess.execute(&sql).await.unwrap_or_else(|e| {
+            panic!("op #{i} ({sql:?}) failed: {e:?}");
+        });
+        let affected = affected_from_tag(&res);
+        assert_eq!(
+            affected, expected_affected,
+            "op #{i} ({sql:?}): reported {affected} affected, oracle says {expected_affected}",
+        );
+
+        // (b) count(*) and the enumerated surviving key set both track the oracle
+        // after every single statement.
+        let c = count_star(&sess, "adv").await;
+        assert_eq!(
+            c,
+            oracle.len() as i64,
+            "op #{i} ({sql:?}): count(*) = {c}, oracle has {} live rows",
+            oracle.len(),
+        );
+        let survivors = surviving_ids(&sess, "adv").await;
+        assert_eq!(
+            survivors, oracle,
+            "op #{i} ({sql:?}): surviving key set diverged from oracle",
+        );
+    }
+
+    // Final sanity: an IN-list mixing present and absent keys reports exactly the
+    // present count and removes exactly those.
+    let before: Vec<i64> = oracle.iter().copied().collect();
+    let present_in_list: Vec<i64> = before.iter().copied().take(3).collect();
+    let mut in_list = present_in_list.clone();
+    in_list.extend_from_slice(&[7_000_001, 7_000_002, 7_000_003]); // all absent
+    for k in &present_in_list {
+        oracle.remove(k);
+    }
+    let list_sql = format!(
+        "DELETE FROM adv WHERE id IN ({})",
+        in_list
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let res = sess.execute(&list_sql).await.unwrap();
+    assert_eq!(
+        affected_from_tag(&res),
+        present_in_list.len() as i64,
+        "IN-list DELETE must report only the present keys",
+    );
+    assert_eq!(count_star(&sess, "adv").await, oracle.len() as i64);
+    assert_eq!(surviving_ids(&sess, "adv").await, oracle);
+}

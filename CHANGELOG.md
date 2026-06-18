@@ -8,6 +8,36 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-18 — Fix: DELETE fast path lost a row count for an absent PK (data-loss correctness)
+
+- **`DELETE FROM t WHERE pk = <absent>` no longer reports a phantom deletion or
+  corrupts `COUNT(*)`.** The hot-tier DELETE fast path (single-column-PK
+  `pk = lit` / `pk IN (lits)`) wrote one tombstone per *requested* PK and
+  reported `keys.len()` as the affected-row count — without confirming the key
+  resolved to a live row. A DELETE of a key that does not exist (e.g. one far
+  above the populated range, or one already deleted) therefore reported
+  `DELETE 1` and, because the metadata-aggregate `COUNT(*)` fast path subtracts
+  one per live tombstone, dropped the reported row count by one even though no
+  real row was removed. The fix resolves the requested PKs against the live row
+  set first — tier precedence tx-overlay > shared memtable > cold, via the same
+  PK-point-probe machinery the UPDATE fast path uses — and tombstones/counts
+  **only** the keys that resolve to a live row. An absent-key DELETE now reports
+  `DELETE 0` and leaves `COUNT(*)` unchanged; a present-key DELETE removes
+  exactly that row; a repeated DELETE of an already-deleted key reports
+  `DELETE 0`; an `IN`-list reports exactly the count of present keys. The
+  affected-row tag now matches Postgres (rows that actually existed and were
+  deleted), mirroring the UPDATE fast path which was already correct.
+- The `DELETE … USING` join fast path was **not** affected (its keys come from a
+  live read of the target table) and is unchanged. The UPDATE fast path was
+  already correct (it reports only PKs that resolved to an existing row).
+- Regression guard: `dml_extras::fast_path_absent_key_delete_update_oracle` runs
+  a long mix of present/absent DELETEs and UPDATEs (below, within, above, and at
+  the boundaries of the seeded range, plus repeated deletes) against an in-test
+  `HashSet` oracle and asserts, after every statement, that the reported
+  affected count, `COUNT(*)`, and the enumerated surviving key set all match the
+  oracle. Correctness over speed — the fast path stays a point-probe (O(matching
+  files), not a full scan).
+
 ## 2026-06-18 — Cold-read: background whole-file prefetch + higher storage scan fan-out
 
 - **Disk-cache whole-file prefetch moved off the cold critical path.** The

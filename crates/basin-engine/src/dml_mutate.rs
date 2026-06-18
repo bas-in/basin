@@ -869,15 +869,15 @@ async fn try_resolve_fast_path_pks(
 
 /// Execute the resolved hot-tier DELETE: write a `Tombstone` per PK into
 /// the process-wide `MemTableRegistry`. Returns the number of tombstones
-/// written (which equals the number of PKs in the WHERE list — see
-/// "Affected-row semantics" below).
+/// written (which equals `keys.len()`).
 ///
 /// Affected-row semantics. Postgres reports the number of rows that
-/// *actually existed and were deleted*. Determining that here would
-/// require a hot+cold lookup per PK — equivalent in cost to the slow
-/// path we're trying to skip. PR1 instead reports the number of PKs the
-/// user asked to delete; for `DELETE … WHERE id IN (1,2,3)` against a
-/// fully-populated bench table the two numbers coincide.
+/// *actually existed and were deleted*. The caller (`exec_delete`) now passes
+/// ONLY the PKs that `resolve_present_pk_keys` confirmed resolve to a live row,
+/// so `keys.len()` here is exactly that count — an absent / already-tombstoned
+/// PK never reaches this function and is never tombstoned or counted. This
+/// keeps the affected-row tag and the metadata `COUNT(*)` correction (which
+/// subtracts one per live tombstone) both exact.
 fn hot_tier_delete_by_pk(
     sess: &ProjectSession,
     table: &TableName,
@@ -899,9 +899,10 @@ fn hot_tier_delete_by_pk(
 /// `entry.memtable.insert`), exactly mirroring the durability of the auto-commit
 /// path (which is also registry-only — no WAL).
 ///
-/// Affected-row semantics match the auto-commit path: we report the number of
-/// PKs requested (a PK that matches no live row still contributes to the tag,
-/// exactly as `hot_tier_delete_by_pk` does — see its doc-comment).
+/// Affected-row semantics match the auto-commit path: the caller passes only
+/// PKs confirmed live by `resolve_present_pk_keys`, so `keys.len()` is the true
+/// number of rows deleted (an absent / already-tombstoned PK never reaches
+/// here — see `hot_tier_delete_by_pk`'s doc-comment).
 fn hot_tier_delete_by_pk_tx(
     sess: &ProjectSession,
     table: &TableName,
@@ -933,6 +934,185 @@ fn hot_tier_delete_by_pk_tx(
 /// arrays, and the cold tier is reached via the same per-file catalog probe +
 /// single-key equality pushdown so a point DELETE pays O(matching files), not a
 /// full scan.
+/// Resolve which of `keys` correspond to a row that is currently LIVE, in tier
+/// precedence (tx overlay when `tx_mode` > shared memtable > cold). A key that
+/// resolves to a `Tombstone` (already deleted) or to no row at all is NOT live.
+/// Returns the live subset in the original `keys` order, deduplicated.
+///
+/// This is the DELETE fast path's correctness gate: the path writes one
+/// tombstone per requested PK and (historically) reported `keys.len()` and
+/// subtracted one from `COUNT(*)` per tombstone — but a PK that matches no live
+/// row must affect 0 rows and leave the count unchanged. By tombstoning ONLY
+/// live keys, both the affected-row tag (`= live.len()`) and the metadata
+/// `COUNT(*)` correction (which subtracts the tombstone count) become exact:
+/// every tombstone written now shadows exactly one real row. Postgres reports
+/// the number of rows that actually existed and were deleted; this matches it.
+///
+/// Cost mirrors `capture_pre_images_for_keys`: O(1) overlay/memtable probes
+/// plus, for any key not resolved in RAM, a cold per-file PK-point probe
+/// (`pk_point_probe` pruning + single-key equality pushdown) — O(matching
+/// files), not a full scan. Re-uses that function's exact tier-precedence and
+/// cold-probe machinery; keep the two in lock-step.
+async fn resolve_present_pk_keys(
+    sess: &ProjectSession,
+    table: &TableName,
+    meta: &basin_catalog::TableMetadata,
+    keys: &[basin_hottier::RowKey],
+    tx_mode: bool,
+) -> Result<Vec<basin_hottier::RowKey>> {
+    use std::collections::{HashMap, HashSet};
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schema = meta.schema.clone();
+    let storage = sess.engine.config().storage.clone();
+    let registry = sess.engine.memtable_registry();
+    let entry = registry.get_or_create(sess.project, table.clone());
+
+    // Dedup the requested keys while preserving first-seen order: a repeated
+    // `DELETE WHERE id = 5` issued twice in one IN-list must still tombstone /
+    // count that key only once (it is a single live row).
+    let mut order: Vec<basin_hottier::RowKey> = Vec::with_capacity(keys.len());
+    let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(keys.len());
+    for k in keys {
+        if seen.insert(k.as_bytes().to_vec()) {
+            order.push(k.clone());
+        }
+    }
+
+    let want: HashSet<Vec<u8>> = seen;
+    // Per requested-key liveness: `Some(true)` live, `Some(false)` definitively
+    // tombstoned/absent (a higher tier answered), `None` still unresolved.
+    let mut live: HashMap<Vec<u8>, bool> = HashMap::with_capacity(order.len());
+
+    // 1a. Tx overlay (highest precedence) — only inside a tx.
+    if tx_mode {
+        for k in &order {
+            let kb = k.as_bytes().to_vec();
+            let Some(v) = crate::session::tx_overlay_get(&sess.state, table, k) else {
+                continue;
+            };
+            let is_live = matches!(
+                v,
+                basin_hottier::MemRowValue::Row { .. } | basin_hottier::MemRowValue::Update { .. }
+            );
+            live.insert(kb, is_live);
+        }
+    }
+    // 1b. Shared memtable for any key not resolved above.
+    {
+        let snap = entry.memtable.snapshot();
+        for (k, v) in snap {
+            let kb = k.as_bytes().to_vec();
+            if !want.contains(&kb) || live.contains_key(&kb) {
+                continue;
+            }
+            let is_live = matches!(
+                v,
+                basin_hottier::MemRowValue::Row { .. } | basin_hottier::MemRowValue::Update { .. }
+            );
+            live.insert(kb, is_live);
+        }
+    }
+
+    // 2. Cold-tier fill for keys still unresolved (no overlay/memtable entry).
+    let missing: Vec<&basin_hottier::RowKey> =
+        order.iter().filter(|k| !live.contains_key(k.as_bytes())).collect();
+    if !missing.is_empty() {
+        let pk_col = &meta.pk_columns[0];
+        let pk_idx = schema.index_of(pk_col).map_err(|_| {
+            BasinError::internal(format!("PK column {pk_col:?} missing from schema"))
+        })?;
+        let pk_dt = schema.field(pk_idx).data_type().clone();
+
+        let probe_scalars: Option<Vec<basin_storage::ScalarValue>> = missing
+            .iter()
+            .map(|k| pk_row_key_to_scalar(k, &pk_dt))
+            .collect();
+
+        let catalog_files = meta.live_data_files();
+        let pruned_paths: Option<std::collections::HashSet<String>> = match probe_scalars.as_ref() {
+            Some(scalars) => {
+                let mut paths: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for scalar in scalars {
+                    if let crate::index_probe::PkProbeOutcome::Candidates { paths: cands, .. } =
+                        crate::index_probe::pk_point_probe(
+                            pk_col,
+                            scalar,
+                            &catalog_files,
+                            schema.as_ref(),
+                        )
+                    {
+                        for p in cands {
+                            paths.insert(p.to_string());
+                        }
+                    }
+                }
+                Some(paths)
+            }
+            None => None,
+        };
+        let single_eq: Option<basin_storage::Predicate> = match probe_scalars.as_deref() {
+            Some([scalar]) => Some(basin_storage::Predicate::Eq(pk_col.clone(), scalar.clone())),
+            _ => None,
+        };
+        // Keys still unresolved after the cold scan resolve to "absent".
+        let missing_bytes: HashSet<Vec<u8>> =
+            missing.iter().map(|k| k.as_bytes().to_vec()).collect();
+        let mut found_cold: HashSet<Vec<u8>> = HashSet::new();
+
+        let data_files = storage.list_data_files_with_stats(&sess.project, table).await?;
+        let data_files = filter_to_live_data_files(sess, table, data_files).await?;
+        'files: for f in &data_files {
+            if found_cold.len() == missing_bytes.len() {
+                break 'files;
+            }
+            if let Some(ref allow) = pruned_paths {
+                if !allow.contains(f.path.as_ref()) {
+                    continue;
+                }
+            }
+            let mut stream = match single_eq.as_ref() {
+                Some(pred) => {
+                    let opts = basin_storage::ReadOptions {
+                        filters: vec![pred.clone()],
+                        ..Default::default()
+                    };
+                    storage
+                        .read_file_with_options(&sess.project, &f.path, opts)
+                        .await?
+                }
+                None => storage.read_file(&sess.project, &f.path).await?,
+            };
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                let pk_array = batch.column(pk_idx);
+                for row in 0..batch.num_rows() {
+                    let Some(rk) =
+                        crate::hot_tombstone::array_value_to_row_key(pk_array.as_ref(), row, &pk_dt)
+                    else {
+                        continue;
+                    };
+                    let kb = rk.as_bytes().to_vec();
+                    if missing_bytes.contains(&kb) {
+                        found_cold.insert(kb);
+                    }
+                }
+            }
+        }
+        for k in &missing {
+            let kb = k.as_bytes().to_vec();
+            live.insert(kb.clone(), found_cold.contains(&kb));
+        }
+    }
+
+    Ok(order
+        .into_iter()
+        .filter(|k| *live.get(k.as_bytes()).unwrap_or(&false))
+        .collect())
+}
+
 async fn capture_pre_images_for_keys(
     sess: &ProjectSession,
     table: &TableName,
@@ -1176,6 +1356,20 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
     .await?
     {
         let tx_mode = crate::session::tx_is_active(&sess.state);
+        // CORRECTNESS: tombstone (and count) ONLY the requested PKs that actually
+        // resolve to a LIVE row right now, in tier precedence (tx overlay >
+        // shared memtable > cold). A PK that matches no live row — including one
+        // far outside the seeded range, or one already deleted — must affect 0
+        // rows and leave `COUNT(*)` unchanged. Writing a tombstone for an absent
+        // key both over-reported the affected-row tag (it returned the requested
+        // count) and corrupted the metadata `COUNT(*)` fast path (which subtracts
+        // one per live tombstone): a phantom tombstone dropped the count by one
+        // even though no real row was removed. Resolving liveness first makes
+        // every tombstone we write shadow exactly one real row, so the tag and
+        // the count correction are both exact (mirrors the UPDATE fast path,
+        // which already reports only PKs that resolved to an existing row).
+        let live_keys = resolve_present_pk_keys(sess, &table, &meta, &pk_keys, tx_mode).await?;
+
         // Change-event capture: the DELETE fast path writes tombstones by PK and
         // never reads the row — so to emit before-images we read them HERE, but
         // ONLY when a sink is attached (lazy: the zero-sink OLTP DELETE hot path
@@ -1183,9 +1377,11 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
         // is tier-precedence (tx overlay > shared memtable > cold), overlay-aware
         // so a prior hot-tier UPDATE on the same PK is reflected in the captured
         // before-image. Done BEFORE the tombstone write so the row is still live.
+        // Only the live keys can have a before-image (absent keys contribute no
+        // event), so we capture for those.
         let delete_pre_images: std::collections::HashMap<Vec<u8>, RecordBatch> =
-            if post_commit_sink_attached(sess) && !pk_keys.is_empty() {
-                capture_pre_images_for_keys(sess, &table, &meta, &pk_keys, tx_mode).await?
+            if post_commit_sink_attached(sess) && !live_keys.is_empty() {
+                capture_pre_images_for_keys(sess, &table, &meta, &live_keys, tx_mode).await?
             } else {
                 std::collections::HashMap::new()
             };
@@ -1194,9 +1390,9 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
         // to the shared registry. The gate (`try_resolve_fast_path_pks`) only
         // admits the in-tx case when `tx_fastpath_eligible_for_table` held.
         let n = if tx_mode {
-            hot_tier_delete_by_pk_tx(sess, &table, pk_keys)
+            hot_tier_delete_by_pk_tx(sess, &table, live_keys)
         } else {
-            hot_tier_delete_by_pk(sess, &table, pk_keys)
+            hot_tier_delete_by_pk(sess, &table, live_keys)
         };
         // Empty IN-list / zero-row matches still return DELETE 0.
         if n == 0 {
