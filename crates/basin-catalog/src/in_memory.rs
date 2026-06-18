@@ -556,6 +556,22 @@ impl Catalog for InMemoryCatalog {
         )))
     }
 
+    /// O(1) override (see the trait doc): reads `state.current` under the
+    /// per-table lock without cloning the snapshot chain. The shard compactor's
+    /// per-file commit calls this on the hot path so commit cost stays flat as
+    /// the table accumulates flushed files (the `load_table` fallback would
+    /// clone all N snapshots on every commit — O(files) and growing).
+    async fn current_snapshot_id(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<SnapshotId> {
+        let qtable = self.resolve_qtable(project, table).await;
+        let state_arc = self.get_table_qualified(project, &qtable).await?;
+        let state = state_arc.lock().await;
+        Ok(state.current)
+    }
+
     #[instrument(skip(self), fields(project = %project, table = %table))]
     async fn drop_table(&self, project: &ProjectId, table: &TableName) -> Result<()> {
         let qtable = self.resolve_qtable(project, table).await;
@@ -3943,6 +3959,49 @@ mod tests {
         let mut paths: Vec<String> = meta.live_data_files().into_iter().map(|f| f.path).collect();
         paths.sort();
         assert_eq!(paths, vec!["f1.parquet", "f2.parquet"]);
+    }
+
+    /// `current_snapshot_id` (the O(1) accessor the shard flush path uses)
+    /// tracks `load_table().current_snapshot` exactly across appends, and
+    /// returns NotFound for an unknown table.
+    #[tokio::test]
+    async fn current_snapshot_id_tracks_load_table() {
+        let cat = InMemoryCatalog::new();
+        let t = ProjectId::new();
+        let tbl = TableName::new("csid_track").unwrap();
+
+        // Unknown table → NotFound, same as load_table.
+        let err = cat.current_snapshot_id(&t, &tbl).await.unwrap_err();
+        assert!(
+            matches!(err, basin_common::BasinError::NotFound(_)),
+            "unknown table must be NotFound, got {err:?}",
+        );
+
+        cat.create_table(&t, &tbl, &schema()).await.unwrap();
+        assert_eq!(
+            cat.current_snapshot_id(&t, &tbl).await.unwrap(),
+            cat.load_table(&t, &tbl).await.unwrap().current_snapshot,
+            "genesis: O(1) id must equal load_table().current_snapshot",
+        );
+
+        // After each append the O(1) id must still match the full metadata's
+        // current_snapshot — this is the invariant `commit_with_retry` relies
+        // on to CAS the next append.
+        let mut parent = SnapshotId::GENESIS;
+        for i in 0..5u64 {
+            cat.append_data_files(
+                &t,
+                &tbl,
+                parent,
+                vec![file(&format!("csid_f{i}.parquet"), 1, 10)],
+            )
+            .await
+            .unwrap();
+            let via_o1 = cat.current_snapshot_id(&t, &tbl).await.unwrap();
+            let via_load = cat.load_table(&t, &tbl).await.unwrap().current_snapshot;
+            assert_eq!(via_o1, via_load, "append {i}: id mismatch");
+            parent = via_o1;
+        }
     }
 
     /// Replace removes the specified files and adds the replacements.

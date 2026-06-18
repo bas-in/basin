@@ -8,6 +8,39 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-18 — Perf: flatter no-PK bulk-COPY ingest against a high-RTT object store
+
+- **Sustained no-PK bulk-COPY throughput no longer decays as the table grows
+  when flushes hit a high-latency object store (e.g. Tigris).** Two compounding
+  costs were paced into the ingest hot path as a long COPY accumulated flushed
+  files:
+  - **Proactive, non-blocking tail drain (shard).** The bounded in-memory tail
+    previously drained only on the 30 s background compaction tick or via a
+    *blocking* inline flush once the tail crossed the hard cap
+    (`HARD_TAIL_BYTES`). When each object-store PUT is a high-RTT round trip,
+    that inline flush serially drains the whole saturated tail before the COPY
+    can proceed — so ingest paces to single-PUT latency and falls off a cliff
+    once the tail fills. The shard now kicks off a non-blocking background
+    `compact_one` as soon as the tail crosses the *soft* cap
+    (`MAX_TAIL_BYTES`), so the tail drains **concurrently** with ongoing ingest
+    and the blocking hard-cap flush rarely fires. Memory stays bounded: the hard
+    cap still backstops the writer if the proactive drain can't keep up.
+    (`basin-shard/src/in_process.rs`: `write_batch_inner`.)
+  - **O(1) catalog commit on the flush path (catalog + shard).** Each flush
+    registered its new file via the catalog, and the shard read the parent
+    snapshot id through `Catalog::load_table`, which clones the *entire* snapshot
+    chain (O(files)) — so per-flush catalog cost grew without bound as files
+    accumulated. Added `Catalog::current_snapshot_id` (O(1); default falls back
+    to `load_table`, `InMemoryCatalog` reads the id under the per-table lock with
+    no chain clone) and switched the shard's `commit_with_retry` to it. The
+    compactor also now resolves per-table write config (format, cluster columns,
+    indexes, row-group size) **once per `compact_one`** instead of once per
+    flushed file, collapsing an O(files²) drain to one chain clone per table.
+    (`basin-catalog/src/{lib,in_memory}.rs`, `basin-shard/src/in_process.rs`.)
+  - Correctness and bounded memory are unchanged: counts stay exact, the tail
+    is still hard-capped, and the watermark-before-truncate durability ordering
+    is untouched.
+
 ## 2026-06-18 — Fix: catalog is a stats cache, not the authoritative file index
 
 - **Correctness fix — the storage read path and the PRIMARY-KEY duplicate check

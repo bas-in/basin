@@ -86,6 +86,38 @@ const HARD_TAIL_BYTES: usize = 384 * 1024 * 1024;
 /// several bounded files instead of one giant O(tail) re-encode.
 const MAX_COMPACTION_ROWS: usize = 512 * 1024;
 
+/// Resolved per-table write configuration, cached for the lifetime of one
+/// `compact_one` call so the compactor reads the table's catalog metadata once
+/// per table instead of once per flushed file. Every field is table-level
+/// config that is stable across a single compaction drain.
+struct ResolvedTableCompactCfg {
+    file_format: basin_storage::FileFormat,
+    declared_cluster_cols: Vec<String>,
+    adaptive_sort_override: bool,
+    gin_indexes: Vec<basin_catalog::SecondaryIndex>,
+    row_group_rows: Option<usize>,
+    row_block_size: Option<u32>,
+    promoted_paths: Vec<basin_catalog::PromotedJsonbPath>,
+    pk_default_cluster_cols: Vec<String>,
+    bloom_cols: Vec<String>,
+}
+
+impl Default for ResolvedTableCompactCfg {
+    fn default() -> Self {
+        Self {
+            file_format: basin_storage::FileFormat::default(),
+            declared_cluster_cols: Vec::new(),
+            adaptive_sort_override: false,
+            gin_indexes: Vec::new(),
+            row_group_rows: None,
+            row_block_size: None,
+            promoted_paths: Vec::new(),
+            pk_default_cluster_cols: Vec::new(),
+            bloom_cols: Vec::new(),
+        }
+    }
+}
+
 /// Per-(project, partition) in-memory state. Lives behind an `RwLock` inside
 /// the shard's outer map.
 pub(crate) struct PartitionState {
@@ -1473,6 +1505,16 @@ impl InProcessShard {
         // keeps per-chunk ingest cost flat as the table scales.
         let mut max_lsn_overall: Option<Lsn> = None;
         let mut any_adaptive_sort = false;
+        // Per-`compact_one` cache of the resolved per-table write config. The
+        // config (file format, cluster columns, indexes, row-group size, …) is
+        // table-level metadata that does not change while we drain the tail, so
+        // we load it from the catalog ONCE per table here instead of once per
+        // flushed file. `load_table` clones the whole snapshot chain (O(files)),
+        // so resolving it inside the per-file loop made a single backpressure
+        // drain of a saturated tail cost O(files-per-flush × total-files) — the
+        // dominant catalog cost behind the long-COPY ingest decay. Caching it
+        // collapses that to one chain clone per table per compaction call.
+        let mut table_cfg_cache: HashMap<TableName, ResolvedTableCompactCfg> = HashMap::new();
         loop {
         // Snapshot a bounded prefix of each table's tail under the inner read
         // lock. Holding it briefly is fine; the lock is per-partition and we
@@ -1529,10 +1571,15 @@ impl InProcessShard {
             // should be sorted by when the table declares no explicit
             // clustering — sorting by it makes per-row-group / zone ranges
             // disjoint so the reader's min/max prune isolates `WHERE pk = $1`.
-            let (file_format, declared_cluster_cols, adaptive_sort_override,
-                 gin_indexes, row_group_rows, row_block_size, promoted_paths,
-                 pk_default_cluster_cols, bloom_cols) =
-                match self.cfg.catalog.load_table(project, &table).await {
+            //
+            // PERF: resolved ONCE per table per `compact_one` via
+            // `table_cfg_cache` (see its declaration above) — this metadata is
+            // table-level config that does not change while we drain the tail,
+            // and `load_table` clones the full O(files) snapshot chain. Loading
+            // it per flushed file made a saturated-tail backpressure drain cost
+            // O(files²); the cache makes it one chain clone per table.
+            if !table_cfg_cache.contains_key(&table) {
+                let resolved = match self.cfg.catalog.load_table(project, &table).await {
                     Ok(m) => {
                         let pk_default = m.default_cluster_cols();
                         // #212: bloom the single-column PK (plus any declared
@@ -1559,30 +1606,32 @@ impl InProcessShard {
                                 bloom.push(s);
                             }
                         }
-                        (
-                            shard_map_file_format(m.file_format),
-                            m.cluster_columns,
-                            m.adaptive_sort_override.unwrap_or(false),
-                            m.indexes.clone(),
-                            m.row_group_rows,
-                            m.row_block_size,
-                            m.promoted_jsonb_paths,
-                            pk_default,
-                            bloom,
-                        )
+                        ResolvedTableCompactCfg {
+                            file_format: shard_map_file_format(m.file_format),
+                            declared_cluster_cols: m.cluster_columns,
+                            adaptive_sort_override: m.adaptive_sort_override.unwrap_or(false),
+                            gin_indexes: m.indexes.clone(),
+                            row_group_rows: m.row_group_rows,
+                            row_block_size: m.row_block_size,
+                            promoted_paths: m.promoted_jsonb_paths,
+                            pk_default_cluster_cols: pk_default,
+                            bloom_cols: bloom,
+                        }
                     }
-                    Err(_) => (
-                        basin_storage::FileFormat::default(),
-                        Vec::new(),
-                        false,
-                        Vec::new(),
-                        None,
-                        None,
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    ),
+                    Err(_) => ResolvedTableCompactCfg::default(),
                 };
+                table_cfg_cache.insert(table.clone(), resolved);
+            }
+            let cfg_entry = table_cfg_cache.get(&table).expect("just inserted");
+            let file_format = cfg_entry.file_format;
+            let declared_cluster_cols = cfg_entry.declared_cluster_cols.clone();
+            let adaptive_sort_override = cfg_entry.adaptive_sort_override;
+            let gin_indexes = cfg_entry.gin_indexes.clone();
+            let row_group_rows = cfg_entry.row_group_rows;
+            let row_block_size = cfg_entry.row_block_size;
+            let promoted_paths = cfg_entry.promoted_paths.clone();
+            let pk_default_cluster_cols = cfg_entry.pk_default_cluster_cols.clone();
+            let bloom_cols = cfg_entry.bloom_cols.clone();
 
             // Phase 5.14.D2: consult the query-pattern history and decide
             // which columns to sort the output file by.  Use a block scope so
@@ -1895,8 +1944,13 @@ impl InProcessShard {
         file: DataFileRef,
     ) -> Result<()> {
         // Make sure the table exists; if not, create it from the batch schema.
-        let mut snapshot = match self.cfg.catalog.load_table(project, table).await {
-            Ok(meta) => meta.current_snapshot,
+        // Hot-path note: read only the current snapshot id (O(1)), not the full
+        // `load_table` metadata — the latter clones the entire snapshot chain
+        // (O(files)), which on a long bulk COPY grows the per-flush catalog cost
+        // without bound as flushed files accumulate. We only need the parent id
+        // to CAS the append against; every other metadata field is unused here.
+        let mut snapshot = match self.cfg.catalog.current_snapshot_id(project, table).await {
+            Ok(id) => id,
             Err(BasinError::NotFound(_)) => {
                 let meta = self
                     .cfg
@@ -1917,8 +1971,7 @@ impl InProcessShard {
             {
                 Ok(_) => return Ok(()),
                 Err(BasinError::CommitConflict(_)) if attempt == 0 => {
-                    let meta = self.cfg.catalog.load_table(project, table).await?;
-                    snapshot = meta.current_snapshot;
+                    snapshot = self.cfg.catalog.current_snapshot_id(project, table).await?;
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -3053,6 +3106,56 @@ impl InProcessProjectHandle {
                 "shard tail over soft cap; compaction is falling behind ingest \
                  (will hard-flush at the backpressure cap)",
             );
+            // PROACTIVE DRAIN (flat-ingest under slow flushes): kick off a
+            // NON-BLOCKING background `compact_one` as soon as the tail crosses
+            // the soft cap, so the tail drains CONCURRENTLY with ongoing ingest
+            // instead of waiting for the 30 s background tick or the blocking
+            // hard-cap flush. This is the wedge that keeps sustained ingest
+            // tracking object-store write BANDWIDTH (the drain runs in parallel
+            // with the next writes) rather than single-PUT latency (a blocking
+            // full-tail drain at the hard cap, which is what produced the
+            // throughput cliff once the tail saturated against a high-RTT
+            // object store).
+            //
+            // `compact_one` already serializes per partition via the partition
+            // compaction lock and is duplicate-safe (a racing background tick or
+            // hard-flush that loses the lock finds a drained tail and no-ops).
+            // We use `try_lock` here purely to avoid piling up redundant spawns:
+            // if a drain is already in flight we skip — the in-flight one is
+            // already draining toward the floor. Memory stays bounded because
+            // the hard cap below still blocks the writer if the proactive drain
+            // can't keep up.
+            if let Ok(guard) = self.state.try_read() {
+                let lock = guard.compact_lock.clone();
+                drop(guard);
+                // Probe the per-partition compaction lock without blocking: if
+                // it is free, no drain is in flight, so we spawn one. The probe
+                // guard is explicitly dropped BEFORE the spawn so the spawned
+                // `compact_one` can re-acquire the same lock (no double-hold /
+                // deadlock).
+                let free = {
+                    let probe = lock.try_lock();
+                    let was_free = probe.is_ok();
+                    drop(probe);
+                    was_free
+                };
+                if free {
+                    let shard = self.shard.clone();
+                    let project = self.project;
+                    let partition = self.partition.clone();
+                    let state = self.state.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = shard.compact_one(&project, &partition, state).await {
+                            tracing::warn!(
+                                %project,
+                                %partition,
+                                error = %e,
+                                "proactive soft-cap tail drain failed; hard cap will backstop",
+                            );
+                        }
+                    });
+                }
+            }
         }
         if tail_bytes >= HARD_TAIL_BYTES {
             // Flush the tail to immutable files. `compact_one` serializes per
@@ -4550,6 +4653,69 @@ mod tests {
         // (c) Every row still readable through the cold tier.
         let read = handle.read(&table, ReadOptions::default()).await.unwrap();
         assert_eq!(rows_in(&read), total, "all rows readable after compaction");
+    }
+
+    /// Per-`compact_one` table-config cache must stay correct across MANY
+    /// bounded passes. The compactor now resolves each table's write config
+    /// (format, cluster cols, indexes, row-group size) ONCE per `compact_one`
+    /// and reuses it for every bounded file in the drain (previously it called
+    /// `load_table` — an O(files) snapshot-chain clone — per flushed file). This
+    /// drains a tail large enough to need several passes through one tick and
+    /// asserts every row lands exactly once in a bounded file and is readable —
+    /// i.e. caching the config did not drop, duplicate, or mis-bound any pass.
+    #[tokio::test]
+    async fn compaction_config_cache_correct_across_many_passes() {
+        let (shard, _sd, _wd, storage, _cat, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("cache_passes").unwrap();
+
+        let handle = shard.get(&project, &partition).await.unwrap();
+        // 12 batches of 200k = 2.4M rows > 4 * MAX_COMPACTION_ROWS (512k) →
+        // forces at least 5 bounded passes through the single compaction tick.
+        let per = 200_000usize;
+        let n_batches = 12usize;
+        let total = per * n_batches;
+        for i in 0..n_batches {
+            handle
+                .write_batch(&table, batch((i * per) as i64, per, "v-"))
+                .await
+                .unwrap();
+        }
+
+        let inner = impl_of(&shard);
+        inner.run_compaction_once().await.unwrap();
+
+        let state = {
+            let map = inner.partitions.lock().await;
+            map.get(&(project, partition.clone())).unwrap().clone()
+        };
+        assert!(
+            state.read().await.tail_is_empty(),
+            "tail must be fully drained after one multi-pass tick",
+        );
+
+        let files = storage
+            .list_data_files_with_stats(&project, &table)
+            .await
+            .unwrap();
+        assert!(
+            files.len() >= 5,
+            "expected >= 5 bounded files for {total} rows, got {}",
+            files.len(),
+        );
+        for f in &files {
+            assert!(
+                f.row_count as usize <= MAX_COMPACTION_ROWS,
+                "file {} exceeds per-file budget",
+                f.path,
+            );
+        }
+        let file_rows: usize = files.iter().map(|f| f.row_count as usize).sum();
+        assert_eq!(file_rows, total, "every row must land exactly once");
+
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(rows_in(&read), total, "all rows readable after multi-pass drain");
     }
 
     /// Regression for the concurrent-compaction over-count (#95).

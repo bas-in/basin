@@ -188,6 +188,27 @@ pub trait Catalog: Send + Sync {
     /// [`basin_common::BasinError::NotFound`] if the table does not exist.
     async fn load_table(&self, project: &ProjectId, table: &TableName) -> Result<TableMetadata>;
 
+    /// O(1) read of just the current snapshot id for `(project, table)`,
+    /// without materializing the full [`TableMetadata`].
+    ///
+    /// The hot ingest/flush path (the shard compactor's per-file commit) only
+    /// needs the parent snapshot id to CAS against — it discards every other
+    /// field of the metadata. Calling [`load_table`](Catalog::load_table) there
+    /// forces a clone of the entire snapshot chain (O(files)), so as a table
+    /// accumulates flushed files every commit pays an ever-growing metadata
+    /// clone. This accessor lets that path read the single id it needs in O(1).
+    ///
+    /// The default implementation falls back to `load_table` so backends that
+    /// don't specialize it stay correct (just not O(1)); `InMemoryCatalog`
+    /// overrides it to read the id under the per-table lock with no chain clone.
+    async fn current_snapshot_id(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<SnapshotId> {
+        Ok(self.load_table(project, table).await?.current_snapshot)
+    }
+
     /// Load metadata for `(project, table)` as it appeared at a historical
     /// `snapshot_id`, for transaction snapshot-stable reads (REPEATABLE READ).
     ///
