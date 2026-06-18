@@ -8,27 +8,8 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
-## 2026-06-18 — Cold-read round-trips: sibling-coalesced whole-file prefetch + higher scan fan-out
+## 2026-06-18 — Cold-read: higher storage scan fan-out
 
-- **Disk-cache prefetch now coalesces concurrent ranges of the same file.**
-  A cold Vortex (or Parquet) file open issues several *different* byte ranges
-  of the *same* file near-simultaneously — the footer suffix, then one or more
-  column segments — which are distinct `(path, range)` cache keys. The
-  existing speculative whole-file prefetch (LEVER 3) only promoted to a single
-  full GET *after* a ranged miss, so these sibling ranges each raced to issue
-  their own object-store GET first (measured: ~2.2 GETs per ~0.5 MiB file on a
-  cold scan, against a co-located object store where every GET is ~RTT-bound).
-  `DiskCachedStore` now gates the whole-file prefetch with a **path-level
-  singleflight** (`prefetch_inflight`): the first ranged miss on a path becomes
-  the prefetch leader and fetches the whole (small) file once; concurrent
-  ranges of the same path wait on it and then slice their range out of the
-  cached full file. A cold open of a small file trends toward **one** object-
-  store round-trip instead of one-per-range. Files larger than
-  `BASIN_DISK_CACHE_SPECULATIVE_BYTES` (default 4 MiB) are never whole-file
-  prefetched, so big-file behaviour is unchanged. Returned bytes are
-  byte-identical to a direct ranged GET; `.vortex` files are immutable and
-  PUT/DELETE invalidates every cached fragment of a path, so a stale slice is
-  impossible.
 - **Higher default file-scan fan-out on the storage read path.** The
   table-wide reader (`read_paths_inner`) fetched + decoded files with a fixed
   concurrency of 4, serialising a cold multi-file scan into `ceil(n/4)` waves.

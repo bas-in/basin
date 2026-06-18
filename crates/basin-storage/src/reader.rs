@@ -69,6 +69,35 @@ pub(crate) const DEFAULT_MAX_LISTED_FILES: usize = 50_000;
 /// analytical scans are unaffected.
 const VORTEX_UNFILTERED_DECODE_EXPANSION: u64 = 2;
 
+/// Default number of data files fetched + decoded concurrently in the
+/// table-wide read path ([`read_paths_inner`]).
+///
+/// The previous value (4) serialised a cold multi-file scan into
+/// `ceil(n_files / 4)` waves. On a co-located object store (Tigris / S3)
+/// each cold file open pays one ~RTT-bounded GET, so a 40-file scan cost
+/// ~10 sequential RTTs even though the per-project concurrency permit pool
+/// ([`crate::default_storage_concurrency`], default 64) allows far more
+/// in-flight. Raising the in-flight fan-out to 16 turns those 10 waves
+/// into ~3, so cold latency trends toward `max(GET)` per wave instead of
+/// `sum(GET)`. We keep [`futures::stream::StreamExt::buffered`] (ordered
+/// emission), NOT `buffer_unordered`, so the row order handed downstream is
+/// byte-identical to the prior behaviour — only the fetch concurrency
+/// changes, never the result set or its order. The project permit pool
+/// remains the real ceiling, so this never exceeds a project's fair share.
+///
+/// Override with `BASIN_READ_FILE_CONCURRENCY` (positive integer); unset /
+/// unparseable / zero falls back to this default.
+const DEFAULT_READ_FILE_CONCURRENCY: usize = 16;
+
+/// Resolve the data-file read fan-out, honouring `BASIN_READ_FILE_CONCURRENCY`.
+fn read_file_concurrency() -> usize {
+    std::env::var("BASIN_READ_FILE_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_READ_FILE_CONCURRENCY)
+}
+
 /// Serve-side row ceiling for answering a FILTERED read from the shared
 /// unfiltered-decode cache entry. Override with
 /// `BASIN_UNFILTERED_SERVE_MAX_ROWS` (positive integer); any unset /
@@ -863,7 +892,7 @@ async fn read_paths_inner(
                 .await
             }
         })
-        .buffered(4)
+        .buffered(read_file_concurrency())
         .map(
             |res: Result<BoxStream<'static, Result<RecordBatch>>>| match res {
                 Ok(s) => s,
