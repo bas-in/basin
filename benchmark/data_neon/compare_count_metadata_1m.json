@@ -1,0 +1,35 @@
+{
+  "kind": "compare",
+  "id": "count_metadata_1m",
+  "name": "bare count(*), 1M rows, WARM — O(1) from metadata, NOT a scan",
+  "claim": "DIFFERENT KIND OF WIN, labeled honestly: a bare count(*) with no predicate is served O(1) from Basin's maintained row-count metadata — Basin does not scan the table at all. Neon counts by scanning. This is a real feature, but it is metadata lookup vs scan, not 'we scan faster'. p50 ms, lower is better.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "count(*) full_agg shape (a) — SELECT count(*) FROM t",
+      "basin": 1.45,
+      "postgres": 63.86,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "neon / basin = 44x warm (metadata, not a scan)"
+    },
+    {
+      "label": "count(*) full_agg shape (b) — SELECT count(*) FROM t",
+      "basin": 1.40,
+      "postgres": 34.98,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "neon / basin = 25x warm (metadata, not a scan)"
+    },
+    {
+      "label": "count(*) timestamp_only — SELECT count(*) FROM t",
+      "basin": 1.42,
+      "postgres": 33.12,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "neon / basin = 23x warm (metadata, not a scan)"
+    }
+  ],
+  "generated_at": "@1778160000",
+  "note": "These are NOT scan-speed numbers. A bare count(*) (no WHERE) is answered from Basin's maintained metadata in O(1) — the ~1.4ms is dispatch + wire, not table work. We separate this from the scan wins on purpose. A maintained-count bug (DELETE of an absent PK reported 'DELETE 1' and corrupted count(*)) was found and fixed this cycle with an adversarial oracle test, so this metadata path is now correctness-gated."
+}

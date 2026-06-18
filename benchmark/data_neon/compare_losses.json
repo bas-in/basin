@@ -1,0 +1,19 @@
+{
+  "kind": "compare",
+  "id": "losses",
+  "name": "Where a row store still wins (Basin v57 vs Neon free)",
+  "claim": "Honest losses, published. A row store (Neon) wins tiny warm point reads, and Basin loses cold first-touch reads across the board. We show these next to the wins. p50 ms, lower is better.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "10k warm point op — SELECT ... WHERE id = $1 (single-row read)",
+      "basin": 2.6,
+      "postgres": 0.9,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "neon wins ~2.9x warm (small-scale point read)"
+    }
+  ],
+  "generated_at": "@1778160000",
+  "note": "At 10k rows, Neon's warm point read (~0.9ms) beats Basin's (~2.6ms). But Basin's per-query ENGINE compute for that read is only ~255us — the gap is connection-pool + network round-trip, NOT the query path. A row store wins tiny warm point reads; Basin's architecture targets analytical scans and elastic per-project storage. Cold first-touch reads also lose: Basin reads object storage (Tigris) ~25-50ms/file on the first miss vs Neon's local SSD. Also honest: PK bulk-COPY slows super-linearly with table size (practical ceiling ~100M today); no-PK ingest stays flat. Per-size warm verdict: 10k 11/21/2 loss, 100k 17/15/4, 1M 12/11/1."
+}

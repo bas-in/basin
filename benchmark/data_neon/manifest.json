@@ -1,0 +1,12 @@
+{
+  "viability": [],
+  "scaling": [
+    "data_size"
+  ],
+  "compare": [
+    "analytics_warm_1m",
+    "analytics_cold_1m",
+    "count_metadata_1m",
+    "losses"
+  ]
+}

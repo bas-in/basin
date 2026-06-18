@@ -1,0 +1,43 @@
+{
+  "kind": "compare",
+  "id": "analytics_cold_1m",
+  "name": "Analytical scans, 1M rows, COLD first-touch (Basin v57 vs Neon free)",
+  "claim": "The same scans on a COLD first touch — Basin reads from object storage (Tigris) before its cache is warm. The big aggregations still win cold; top_k does NOT (the first-touch object-storage reads dominate). Published honestly. p50 ms, lower is better.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "sum(amount), numeric_only — SELECT sum(amount) FROM t",
+      "basin": 46.98,
+      "postgres": 111.57,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "neon / basin = 2.37x cold (WIN)"
+    },
+    {
+      "label": "count(DISTINCT tenant_id), wide_pk — SELECT count(DISTINCT tenant_id) FROM t",
+      "basin": 85.85,
+      "postgres": 177.98,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "neon / basin = 2.07x cold (WIN)"
+    },
+    {
+      "label": "group_by top20, wide_pk — SELECT tenant_id,count(*),sum(amount) FROM t GROUP BY tenant_id ORDER BY 2 DESC LIMIT 20",
+      "basin": 95.58,
+      "postgres": 122.08,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "neon / basin = 1.28x cold (WIN)"
+    },
+    {
+      "label": "top_k, wide_pk — SELECT id,amount FROM t ORDER BY amount DESC LIMIT 50",
+      "basin": 811.0,
+      "postgres": 116.0,
+      "unit": "ms",
+      "better": "postgres",
+      "ratio_text": "neon wins 7.0x cold (LOSS)"
+    }
+  ],
+  "generated_at": "@1778160000",
+  "note": "Cold = first-touch p50 (caches empty, Basin pays the object-storage read). The disaggregated-storage tradeoff: Basin's cache helps repeat reads, not the first miss. top_k loses cold (811ms vs 116ms) even though it wins 3.64x warm — we publish the loss."
+}

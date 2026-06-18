@@ -1,0 +1,51 @@
+{
+  "kind": "compare",
+  "id": "analytics_warm_1m",
+  "name": "Analytical scans, 1M rows, WARM (Basin v57 vs Neon free)",
+  "claim": "Where Basin earns its keep: warm steady-state analytical scans at 1M rows. These are genuine 'we scan faster' wins — Basin reads and aggregates the data, just faster than a row store. p50 ms, lower is better.",
+  "available": true,
+  "metrics": [
+    {
+      "label": "sum(amount), numeric_only — SELECT sum(amount) FROM t",
+      "basin": 15.97,
+      "postgres": 110.11,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "neon / basin = 6.90x warm"
+    },
+    {
+      "label": "count(DISTINCT tenant_id), wide_pk — SELECT count(DISTINCT tenant_id) FROM t",
+      "basin": 34.61,
+      "postgres": 168.66,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "neon / basin = 4.87x warm"
+    },
+    {
+      "label": "top_k, wide_pk — SELECT id,amount FROM t ORDER BY amount DESC LIMIT 50",
+      "basin": 28.59,
+      "postgres": 103.96,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "neon / basin = 3.64x warm"
+    },
+    {
+      "label": "group_by top20, wide_pk — SELECT tenant_id,count(*),sum(amount) FROM t GROUP BY tenant_id ORDER BY 2 DESC LIMIT 20",
+      "basin": 44.58,
+      "postgres": 116.59,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "neon / basin = 2.62x warm"
+    },
+    {
+      "label": "full_agg(count,avg), wide_pk — SELECT count(*),avg(amount) FROM t",
+      "basin": 31.09,
+      "postgres": 67.28,
+      "unit": "ms",
+      "better": "basin",
+      "ratio_text": "neon / basin = 2.16x warm"
+    }
+  ],
+  "generated_at": "@1778160000",
+  "note": "Warm = steady-state p50 (repeat-read, caches hot). Identical 1M-row workload, co-located Frankfurt loader. These are scan wins: Basin actually reads and aggregates the rows. SQL for each metric is shown in its label."
+}
