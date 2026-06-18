@@ -8,8 +8,25 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
-## 2026-06-18 — Cold-read: higher storage scan fan-out
+## 2026-06-18 — Cold-read: background whole-file prefetch + higher storage scan fan-out
 
+- **Disk-cache whole-file prefetch moved off the cold critical path.** The
+  speculative whole-file promotion (LEVER 3) — which warms a small file's whole
+  body into the cache after a ranged miss so later range reads become zero-RTT
+  slices — previously ran *inline*: the cold read that triggered it blocked on a
+  second, full-file GET before returning. For a single-pass scan that touches
+  only a subset of columns this added a round-trip and transferred bytes the
+  cold query never used; measured against a 30 ms-RTT object store it made a
+  cold `count(distinct)` scan ~4× slower (≈408 ms) than serving the requested
+  range directly. The promotion now runs in a **detached background task**: the
+  cold read returns its requested range immediately, and the whole file warms
+  asynchronously for subsequent reads. A new path-level dedup
+  (`prefetch_inflight`) ensures the several distinct ranges a cold file-open
+  fires near-simultaneously elect **one** background prefetch per file, not one
+  per range. Same cold `count(distinct)` measured at ≈103 ms after the change.
+  Files larger than `BASIN_DISK_CACHE_SPECULATIVE_BYTES` (default 4 MiB) are
+  still never whole-file prefetched. Returned bytes are byte-identical to a
+  direct ranged GET.
 - **Higher default file-scan fan-out on the storage read path.** The
   table-wide reader (`read_paths_inner`) fetched + decoded files with a fixed
   concurrency of 4, serialising a cold multi-file scan into `ceil(n/4)` waves.

@@ -333,6 +333,17 @@ struct DiskCacheState {
     /// (insert / remove of one entry) and we don't need to hold it
     /// across an await.
     inflight: AsyncMutex<HashMap<KeyHash, Arc<Notify>>>,
+    /// Path-level dedup for the BACKGROUND whole-file prefetch (LEVER 3). A
+    /// cold Vortex/Parquet open issues several DIFFERENT ranges of the SAME
+    /// file near-simultaneously (footer suffix, then column segments) —
+    /// distinct keys, so the per-key `inflight` map above does not dedup them.
+    /// Without a path-level gate each ranged miss would spawn its own
+    /// whole-file prefetch task. This map elects ONE background prefetch per
+    /// `ObjectPath`: the first ranged miss inserts the path, spawns the detached
+    /// full-file fetch, and removes the entry when that task ends; concurrent
+    /// sibling ranges see the entry and skip spawning. The `Notify` is only a
+    /// presence marker — nothing awaits it (the prefetch is off the read path).
+    prefetch_inflight: AsyncMutex<HashMap<ObjectPath, Arc<Notify>>>,
     /// Process-wide hit / miss counters. Best-effort observability,
     /// useful for asserting the cache is doing real work in tests.
     hits: std::sync::atomic::AtomicU64,
@@ -374,6 +385,7 @@ impl DiskCachedStore {
                 root: cfg.root,
                 index: Mutex::new(index),
                 inflight: AsyncMutex::new(HashMap::new()),
+                prefetch_inflight: AsyncMutex::new(HashMap::new()),
                 hits: std::sync::atomic::AtomicU64::new(0),
                 misses: std::sync::atomic::AtomicU64::new(0),
             }),
@@ -502,42 +514,55 @@ impl DiskCachedStore {
         let full_size = got.meta.size;
         let bytes = got.bytes().await?;
 
-        // LEVER 3: speculative whole-file prefetch. On a *ranged* miss against
-        // a small object, fetch the whole file ONCE and cache it under the
-        // full-file key, then serve the requested slice from it. Subsequent
-        // range reads of this file are served as local slices in `get_cached`
-        // (see the full-file probe there) instead of more RTTs. We only do the
-        // second (full) GET when we actually requested a strict subset; the
-        // singleflight already guards concurrent leaders for THIS key, and the
-        // full-file fetch goes through the inner store directly so it cannot
-        // recurse into the cache or double-fetch.
+        // LEVER 3: speculative whole-file prefetch — BACKGROUND, off the cold
+        // critical path. On a *ranged* miss against a small object we warm the
+        // WHOLE file into the cache so SUBSEQUENT range reads of this file
+        // become zero-RTT local slices (footer, then column segments, then
+        // every later query). Crucially this runs in a detached task: a cold
+        // single-pass scan that touches only a subset of columns must NOT wait
+        // on a full-file fetch — doing so was measured to make cold scans
+        // *slower* against a remote store (it adds a round-trip and transfers
+        // bytes the cold query never uses). So we return the requested ranged
+        // bytes immediately and let the full file land in the background.
+        //
+        // Path-gated singleflight (`prefetch_inflight`): the sibling ranges a
+        // cold open fires near-simultaneously would otherwise each spawn their
+        // own full-file fetch. We elect ONE background prefetch per path; the
+        // rest skip it. Only fires when we requested a strict subset of a small
+        // file; large files (> ceiling) are never whole-file warmed.
         let spec_bytes = resolve_speculative_bytes();
         let did_partial = range.is_some();
         if spec_bytes > 0 && did_partial && full_size <= spec_bytes && full_size > 0 {
-            // Don't re-fetch if the full file is already cached (a concurrent
-            // sibling range may have populated it).
-            let full_key = key_for(location, None);
-            let full_fs = self.fragment_path(&full_key);
-            let full = match try_read_cached(&self.state, &full_key, &full_fs).await {
-                Some(b) => Some(b),
-                None => match self
-                    .inner
-                    .get_opts(location, GetOptions::default())
-                    .await
-                {
-                    Ok(g) => g.bytes().await.ok(),
-                    Err(_) => None, // best-effort: fall back to the ranged bytes
-                },
+            let claimed = {
+                let mut g = self.state.prefetch_inflight.lock().await;
+                if g.contains_key(location) {
+                    false
+                } else {
+                    // The Notify is only a presence marker here (the dedup key);
+                    // nothing awaits it. Removed when the background task ends.
+                    g.insert(location.clone(), Arc::new(Notify::new()));
+                    true
+                }
             };
-            if let Some(full) = full {
-                // Cache the full file (best-effort write-through), then serve
-                // the originally-requested slice from it.
-                self.store_fragment(&full_key, &full_fs, location, &full).await;
-                let r = resolve_range(range.as_ref(), full.len() as u64);
-                return Ok(full.slice(r));
+            if claimed {
+                let inner = self.inner.clone();
+                let state = self.state.clone();
+                let loc = location.clone();
+                let full_key = key_for(location, None);
+                let full_fs = self.fragment_path(&full_key);
+                tokio::spawn(async move {
+                    // Skip if a prior prefetch already warmed the full file.
+                    if try_read_cached(&state, &full_key, &full_fs).await.is_none() {
+                        if let Ok(g) = inner.get_opts(&loc, GetOptions::default()).await {
+                            if let Ok(full) = g.bytes().await {
+                                store_fragment_into(&state, &full_key, &full_fs, &loc, &full)
+                                    .await;
+                            }
+                        }
+                    }
+                    state.prefetch_inflight.lock().await.remove(&loc);
+                });
             }
-            // Speculative full fetch failed — fall through and serve/cache the
-            // ranged bytes we already have, exactly as before.
         }
 
         // Write-through. Best effort: if the cache write fails (disk
@@ -577,44 +602,6 @@ impl DiskCachedStore {
         Ok(bytes)
     }
 
-    /// Write `bytes` through to disk under `(key, fs_path)` and register it in
-    /// the LRU index, unlinking any fragments evicted to make room. Best
-    /// effort: a failed write-through is logged and skipped (the cache is a
-    /// performance tier, not a durability boundary).
-    async fn store_fragment(
-        &self,
-        key: &KeyHash,
-        fs_path: &FsPath,
-        location: &ObjectPath,
-        bytes: &Bytes,
-    ) {
-        if let Err(e) = write_through(fs_path, bytes).await {
-            tracing::warn!(
-                target = "basin_storage::disk_cache",
-                fragment = %fs_path.display(),
-                error = %e,
-                "disk_cache: speculative full-file write-through failed"
-            );
-            return;
-        }
-        let meta = FileMeta {
-            fs_path: fs_path.to_path_buf(),
-            size: bytes.len() as u64,
-            object_path: location.clone(),
-        };
-        let to_delete = {
-            let mut g = self
-                .state
-                .index
-                .lock()
-                .expect("disk-cache index mutex poisoned");
-            g.insert(*key, meta)
-        };
-        for p in to_delete {
-            let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(p)).await;
-        }
-    }
-
     /// Drop every cached entry that maps to `location`. Used by the
     /// invalidation hooks on PUT / DELETE.
     async fn invalidate(&self, location: &ObjectPath) {
@@ -629,6 +616,41 @@ impl DiskCachedStore {
         for p in to_delete {
             let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(p)).await;
         }
+    }
+}
+
+/// Write `bytes` through to disk under `(key, fs_path)` and register it in the
+/// LRU index, unlinking any fragments evicted to make room. Free-function form
+/// so the background prefetch task (which owns an `Arc<DiskCacheState>`, not
+/// `&self`) can reuse the exact same write-through + eviction path. Best effort:
+/// a failed write is logged and skipped (the cache is a performance tier).
+async fn store_fragment_into(
+    state: &DiskCacheState,
+    key: &KeyHash,
+    fs_path: &FsPath,
+    location: &ObjectPath,
+    bytes: &Bytes,
+) {
+    if let Err(e) = write_through(fs_path, bytes).await {
+        tracing::warn!(
+            target = "basin_storage::disk_cache",
+            fragment = %fs_path.display(),
+            error = %e,
+            "disk_cache: speculative full-file write-through failed"
+        );
+        return;
+    }
+    let meta = FileMeta {
+        fs_path: fs_path.to_path_buf(),
+        size: bytes.len() as u64,
+        object_path: location.clone(),
+    };
+    let to_delete = {
+        let mut g = state.index.lock().expect("disk-cache index mutex poisoned");
+        g.insert(*key, meta)
+    };
+    for p in to_delete {
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(p)).await;
     }
 }
 
@@ -1123,10 +1145,29 @@ mod tests {
         assert_eq!(resolve_range(Some(&GetRange::Suffix(99)), 10), 0..10);
     }
 
-    /// LEVER 3 decision: a *ranged* read of a SMALL file triggers exactly ONE
-    /// full-file fetch; the originally-requested slice is correct, and a
-    /// second, DIFFERENT range read of the same file is served from the cached
-    /// full file with no further inner GET.
+    /// Poll until the full-file entry for `p` is cached (the BACKGROUND
+    /// prefetch landed) or the bounded deadline elapses. Returns whether it
+    /// became cached.
+    async fn await_full_file_cached(cache: &DiskCachedStore, p: &ObjectPath) -> bool {
+        let full_key = key_for(p, None);
+        let full_fs = cache.fragment_path(&full_key);
+        for _ in 0..200 {
+            if try_read_cached(&cache.state, &full_key, &full_fs)
+                .await
+                .is_some()
+            {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// LEVER 3 decision: a *ranged* read of a SMALL file warms the WHOLE file
+    /// into the cache in the BACKGROUND (off the cold critical path). The cold
+    /// ranged read returns its slice immediately; once the background prefetch
+    /// lands, a later DIFFERENT range of the same file is served from the
+    /// cached full file with no further inner GET.
     #[tokio::test]
     async fn speculative_prefetch_serves_ranges_from_one_full_fetch() {
         let _guard = SpecEnvGuard::set("1048576"); // 1 MiB ceiling; file is tiny
@@ -1147,8 +1188,8 @@ mod tests {
         cached.put(&p, payload(b"abcdefghij")).await.unwrap();
 
         let n0 = counting.gets.load(Ordering::Relaxed);
-        // First ranged read: cold miss → one ranged GET + one full GET
-        // (the speculative promotion). Slice must be correct.
+        // First ranged read: cold miss. Returns the slice immediately; the
+        // whole-file warm happens in a detached task.
         let r1 = cached.get_range(&p, 0..3).await.unwrap();
         assert_eq!(&r1[..], b"abc");
         let n1 = counting.gets.load(Ordering::Relaxed);
@@ -1157,14 +1198,21 @@ mod tests {
             "first ranged read must hit inner at least once"
         );
 
-        // A DIFFERENT range, now served from the speculatively-cached full
-        // file: NO further inner GET.
+        // Wait for the background prefetch to land the full file.
+        assert!(
+            await_full_file_cached(&cached, &p).await,
+            "background prefetch should warm the whole file"
+        );
+        let n_after_prefetch = counting.gets.load(Ordering::Relaxed);
+
+        // A DIFFERENT range, now served from the background-cached full file:
+        // NO further inner GET.
         let r2 = cached.get_range(&p, 5..8).await.unwrap();
         assert_eq!(&r2[..], b"fgh");
         let n2 = counting.gets.load(Ordering::Relaxed);
         assert_eq!(
-            n2, n1,
-            "second range must be sliced from the cached full file (no inner GET)"
+            n2, n_after_prefetch,
+            "second range must be sliced from the warmed full file (no inner GET)"
         );
 
         // The full file is also a warm hit.
@@ -1172,6 +1220,133 @@ mod tests {
         assert_eq!(&full[..], b"abcdefghij");
         let n3 = counting.gets.load(Ordering::Relaxed);
         assert_eq!(n3, n2, "full read must be a cache hit too");
+    }
+
+    /// Background prefetch is path-gated and single-flighted: several DIFFERENT
+    /// ranges of the same small file issued CONCURRENTLY (the cold open pattern)
+    /// each return correct bytes, and they trigger AT MOST ONE background
+    /// whole-file prefetch for the path — not one per range. Once that single
+    /// prefetch lands, every later range of the file is a pure cache hit.
+    #[tokio::test]
+    async fn concurrent_ranges_single_background_prefetch() {
+        let _guard = SpecEnvGuard::set("1048576"); // 1 MiB ceiling; file is tiny
+        let inner_dir = TempDir::new().unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        let inner_real = Arc::new(LocalFileSystem::new_with_prefix(inner_dir.path()).unwrap());
+        let counting = Arc::new(CountingStore {
+            inner: inner_real,
+            gets: AtomicUsize::new(0),
+        });
+        let cached = Arc::new(
+            DiskCachedStore::new(
+                counting.clone() as Arc<dyn ObjectStore>,
+                DiskCacheConfig::new(cache_dir.path().to_path_buf(), 1024 * 1024),
+            )
+            .unwrap(),
+        );
+
+        let p = ObjectPath::from("small.vortex");
+        cached.put(&p, payload(b"abcdefghij")).await.unwrap();
+
+        let n0 = counting.gets.load(Ordering::Relaxed);
+
+        // Fire four distinct ranges of the SAME path concurrently. Each returns
+        // its own bytes; the background prefetch is path-gated to fire once.
+        let ranges = [0usize..2, 3..5, 5..7, 8..10];
+        let mut handles = Vec::new();
+        for r in ranges.iter().cloned() {
+            let c = cached.clone();
+            let pp = p.clone();
+            handles.push(tokio::spawn(async move {
+                c.get_range(&pp, r.start as u64..r.end as u64).await
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap().unwrap());
+        }
+        // Correctness: each slice matches the source bytes exactly.
+        assert_eq!(&results[0][..], b"ab");
+        assert_eq!(&results[1][..], b"de");
+        assert_eq!(&results[2][..], b"fg");
+        assert_eq!(&results[3][..], b"ij");
+
+        // Wait for the single background prefetch to warm the full file.
+        assert!(
+            await_full_file_cached(&cached, &p).await,
+            "exactly one background prefetch should warm the whole file"
+        );
+        let n1 = counting.gets.load(Ordering::Relaxed);
+        // The 4 concurrent ranges each did their own ranged GET (cold, correct
+        // for a single-pass scan that reads a subset), PLUS exactly ONE
+        // background full-file GET — NOT four. So total <= 4 ranged + 1 full.
+        assert!(
+            n1 - n0 <= ranges.len() + 1,
+            "path-gated prefetch must spawn at most ONE background full GET \
+             (expected <= {} inner GETs, got {})",
+            ranges.len() + 1,
+            n1 - n0
+        );
+
+        // Now that the full file is warm, every range is a pure cache hit.
+        let r = cached.get_range(&p, 1..4).await.unwrap();
+        assert_eq!(&r[..], b"bcd");
+        assert_eq!(
+            counting.gets.load(Ordering::Relaxed),
+            n1,
+            "post-prefetch ranges must be served from the warmed full file"
+        );
+    }
+
+    /// A file LARGER than the speculative ceiling must NOT be whole-file
+    /// prefetched: a later distinct range issues its own fetch (no warmed full
+    /// file to slice from). Guards against the prefetch over-fetching big files.
+    #[tokio::test]
+    async fn large_file_not_whole_prefetched() {
+        let _guard = SpecEnvGuard::set("8"); // 8-byte ceiling; file is 10 bytes
+        let inner_dir = TempDir::new().unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        let inner_real = Arc::new(LocalFileSystem::new_with_prefix(inner_dir.path()).unwrap());
+        let counting = Arc::new(CountingStore {
+            inner: inner_real,
+            gets: AtomicUsize::new(0),
+        });
+        let cached = DiskCachedStore::new(
+            counting.clone() as Arc<dyn ObjectStore>,
+            DiskCacheConfig::new(cache_dir.path().to_path_buf(), 1024 * 1024),
+        )
+        .unwrap();
+
+        let p = ObjectPath::from("big.vortex");
+        cached.put(&p, payload(b"abcdefghij")).await.unwrap(); // 10 bytes > 8
+
+        let n0 = counting.gets.load(Ordering::Relaxed);
+        let r1 = cached.get_range(&p, 0..3).await.unwrap();
+        assert_eq!(&r1[..], b"abc");
+        let n1 = counting.gets.load(Ordering::Relaxed);
+        // A distinct range must NOT be served from a (non-existent) full-file
+        // prefetch — it issues its own fetch.
+        let r2 = cached.get_range(&p, 5..8).await.unwrap();
+        assert_eq!(&r2[..], b"fgh");
+        let n2 = counting.gets.load(Ordering::Relaxed);
+        assert!(
+            n2 > n1,
+            "a large file must not be whole-file prefetched; the second range \
+             issues its own GET (got n1={n1}, n2={n2})"
+        );
+        // The full file must never get cached for an over-ceiling object.
+        assert!(
+            !await_full_file_cached(&cached, &p).await,
+            "over-ceiling file must not be whole-file prefetched"
+        );
+        // But the SAME range is a cache hit.
+        let r1b = cached.get_range(&p, 0..3).await.unwrap();
+        assert_eq!(&r1b[..], b"abc");
+        assert_eq!(
+            counting.gets.load(Ordering::Relaxed),
+            n2,
+            "exact-range repeat is a cache hit even for a large file"
+        );
     }
 
     /// With the speculative ceiling DISABLED (0), each distinct range is its
