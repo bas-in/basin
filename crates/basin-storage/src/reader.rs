@@ -211,22 +211,23 @@ pub(crate) async fn list_data_files(
     project: &ProjectId,
     table: &TableName,
 ) -> Result<Vec<DataFile>> {
-    // Catalog-driven fast path: when a catalog is attached it already holds
-    // the authoritative live file set (path + size + row_count +
-    // column_stats), so we discover the table's files with ZERO object-store
-    // LIST RPCs. On a warm, RAM-resident table this collapses the per-query
-    // 2× LIST round-trip (hot `data/` + `cold/` prefixes) that dominated the
-    // scan/write latency floor on high-RTT object stores. Both the
-    // catalog and the LIST enumerate the same physical files (the catalog is
-    // updated transactionally at write-commit / compaction), so this is a
-    // strict round-trip elimination, not a visibility change.
+    // File EXISTENCE is sourced from the object-store LIST, NOT the catalog.
     //
-    // Falls back to the object-store LIST when no catalog is attached or the
-    // table is not catalog-known (schema-less callers, integration tests).
-    if let Some(files) = storage.catalog_live_data_files(project, table).await {
-        return Ok(files);
-    }
-
+    // At the storage layer the object store is the authoritative index of
+    // which files physically exist: files written directly via
+    // `Storage::write_batch` (some non-shard paths, integration tests) land on
+    // the object store WITHOUT a catalog registration, so a catalog-sourced
+    // file SET would MISS them — `read()` and the PK dup-check would then
+    // return wrong results / miss a duplicate key. The catalog is a STATS
+    // cache (column_stats / bloom), not the file index; it is consulted in
+    // `list_data_files_with_stats` purely to ENRICH the listed files and skip
+    // their footer fetches (the round-trip that actually dominated cold-path
+    // latency). That stats-enrichment is the part of the bc57fa48 win that is
+    // safe and is preserved; the LIST RPC itself is reinstated for
+    // correctness because the storage layer cannot tell a complete catalog
+    // (shard-managed) from a partial one (direct writes) — see
+    // `tests/read_stats_pruning.rs::list_partial_catalog_stats_falls_back_per_file`.
+    //
     // Backward-compat thin wrapper: drains the streaming variant into a
     // `Vec`. Callers that need to short-circuit on LIMIT should use
     // [`list_data_files_stream`] directly so they don't pay for the cold
@@ -672,13 +673,13 @@ pub(crate) async fn read(
             })
             .map(|f| f.path)
             .collect()
-    } else if let Some(files) = storage.catalog_live_data_files(project, table).await {
-        // Catalog-driven fast path (no predicate): the catalog already knows
-        // the live file set, so a warm unfiltered scan makes ZERO LIST RPCs.
-        // The catalog never records files outside the project prefix; the
-        // suffix filter already ran inside `catalog_live_data_files`.
-        files.into_iter().map(|f| f.path).collect()
     } else {
+        // No predicate: enumerate the file set from the object-store LIST.
+        // The catalog is NOT consulted for existence here — it is not an
+        // authoritative file index at the storage layer (direct
+        // `write_batch` files are on the object store but uncataloged), so a
+        // catalog-sourced SET would miss on-disk files and return wrong rows.
+        // See the note in `list_data_files`.
         let store = storage.project_store(project);
         let project_id_string = project.as_prefix();
         let mut paths: Vec<ObjectPath> = Vec::new();

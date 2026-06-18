@@ -1055,28 +1055,28 @@ impl Storage {
         out
     }
 
-    /// The full set of live data files for `(project, table)` as recorded by
-    /// the attached catalog, materialised into [`DataFile`] descriptors
-    /// (path + size + row_count + column_stats + tier).
+    /// The live data files for `(project, table)` as recorded by the attached
+    /// catalog, materialised into [`DataFile`] descriptors (path + size +
+    /// row_count + column_stats + bloom_filters + tier).
     ///
     /// Returns `None` when no catalog is attached, OR when the table is not
-    /// known to the catalog (schema-less callers, integration tests) — both
-    /// cases fall back to the object-store LIST path in
-    /// [`crate::reader::list_data_files`].
+    /// known to the catalog, OR when the catalog records ZERO files for the
+    /// table.
     ///
-    /// This is the round-trip-eliminating primitive: the catalog already
-    /// holds the authoritative live file set (`Snapshot::live_data_files`,
-    /// the same source the engine's `fast_select` / `fast_aggregate` paths
-    /// read), so a warm scan/write needs ZERO object-store LIST RPCs to
-    /// discover its files. The tier is derived from the path the same way
-    /// the LIST path derives it (`Tier::from_path`), and `column_stats`
-    /// flow straight through so a catalog-known file also skips the footer
-    /// GET in `list_data_files_with_stats`. Catalog and LIST enumerate the
-    /// same physical file set (the catalog is updated transactionally at
-    /// write-commit / compaction time), so this is a strict round-trip
-    /// elimination, never a visibility change: un-flushed rows live in the
-    /// memtable and are tail-merged on the read path independently of which
-    /// file-discovery primitive runs here.
+    /// IMPORTANT — this is a STATS/bloom enrichment primitive, NOT an
+    /// authoritative file index. The catalog is not guaranteed to be a
+    /// complete index of on-disk files: files written directly via
+    /// [`Storage::write_batch`] (some non-shard paths, integration tests) land
+    /// on the object store WITHOUT a catalog row. Callers must therefore source
+    /// file EXISTENCE from the object-store LIST (the authoritative index) and
+    /// use this only to ENRICH the listed files with the catalog's per-file
+    /// `column_stats` / `bloom_filters`, skipping the per-file footer GET. The
+    /// read path (`reader::list_data_files`, `reader::read`) and the PK
+    /// dup-check (`constraints::enforce_pk_on_insert`) all LIST for existence;
+    /// the bc57fa48 "source the file SET from the catalog" shortcut was a
+    /// correctness regression (it missed uncataloged on-disk files) and has
+    /// been reverted — see `tests/read_stats_pruning.rs::
+    /// list_partial_catalog_stats_falls_back_per_file`.
     pub(crate) async fn catalog_live_data_files(
         &self,
         project: &ProjectId,
@@ -1105,13 +1105,30 @@ impl Storage {
                     size_bytes: f.size_bytes,
                     row_count: f.row_count,
                     column_stats: f.column_stats,
-                    bloom_filters: std::collections::BTreeMap::new(),
+                    // Carry the catalog's per-file blooms through so the
+                    // constraint PK pruner can bloom-prune random keys without
+                    // an object-store footer fetch. The shard commits these at
+                    // compaction / stripe-merge time (compact_one, stripe_merge).
+                    bloom_filters: f.bloom_filters,
                     hll_sketches: std::collections::BTreeMap::new(),
                     tdigest_sketches: std::collections::BTreeMap::new(),
                     tier,
                 })
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // A catalog that knows the table's SCHEMA but has no live data files
+        // recorded for it must NOT shadow the object store: that happens when
+        // files were written directly via `Storage::write_batch` without
+        // catalog registration (some non-shard paths, integration tests), or
+        // for a genuinely empty table. Returning `Some(empty)` here would make
+        // `read()` (and the PK dup-check) see zero files and miss on-disk data
+        // — a correctness bug. Return `None` so the caller falls back to the
+        // object-store LIST and discovers any real files. A cataloged table
+        // that DOES have files still returns `Some(files)` (the LIST-floor
+        // win is preserved); an empty table just pays one cheap LIST.
+        if files.is_empty() {
+            return None;
+        }
         Some(files)
     }
 
@@ -1398,6 +1415,31 @@ impl Storage {
         table: &'a TableName,
     ) -> BoxStream<'a, Result<DataFile>> {
         reader::list_data_files_stream(self, project, table)
+    }
+
+    /// The live data files for `(project, table)` straight from the catalog —
+    /// `path`, `size_bytes`, `row_count`, `column_stats`, and `bloom_filters`
+    /// — with **zero object-store RPCs** (no LIST, no footer fetch). Returns
+    /// `None` when no catalog is attached, the table is unknown, or the catalog
+    /// records zero files.
+    ///
+    /// This is a STATS/bloom ENRICHMENT primitive, not an authoritative file
+    /// index — see [`catalog_live_data_files`](Self::catalog_live_data_files)
+    /// for why the catalog cannot stand in for the object-store LIST when
+    /// determining which files EXIST. The streaming PRIMARY-KEY enforcement
+    /// (`constraints::enforce_pk_on_insert`) LISTs for the authoritative file
+    /// set and then overlays the per-file PK `bloom_filters` returned here by
+    /// path, so a cataloged table keeps the zone-map + bloom prune that makes
+    /// keyed bulk-INSERT cost independent of table size — while an uncataloged
+    /// on-disk file is still enumerated (and read), so a duplicate key can
+    /// never be missed.
+    #[tracing::instrument(skip(self), fields(project=%project, table=%table))]
+    pub async fn catalog_data_files(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Option<Vec<DataFile>> {
+        self.catalog_live_data_files(project, table).await
     }
 
     /// Like [`list_data_files`](Self::list_data_files) but populates each
@@ -2577,14 +2619,17 @@ mod tests {
         }
     }
 
-    /// With a catalog attached, `list_data_files` must serve the live file
-    /// set straight from the catalog and issue ZERO object-store LIST RPCs.
-    /// We prove this by registering files in the catalog that DO NOT EXIST on
-    /// the object store: a LIST would return nothing, so getting them back
-    /// means the catalog fast path ran. This is the round-trip-elimination
-    /// that drops the scan/write latency floor on high-RTT object stores.
+    /// `list_data_files` sources file EXISTENCE from the object-store LIST,
+    /// which is authoritative — the catalog is NOT a complete file index at
+    /// the storage layer (direct `write_batch` files have no catalog row), so
+    /// it must never invent files that aren't on disk nor shadow files that
+    /// are. This guards against the bc57fa48 regression, where a
+    /// catalog-sourced file SET made `read()` and the PK dup-check miss
+    /// uncataloged on-disk files. Stats enrichment (skipping footer fetches
+    /// for catalog-known files) is exercised separately by
+    /// `tests/read_stats_pruning.rs`.
     #[tokio::test]
-    async fn list_data_files_uses_catalog_without_listing() {
+    async fn list_data_files_lists_object_store_not_catalog() {
         use basin_catalog::{DataFileRef, InMemoryCatalog, SnapshotId};
 
         basin_common::telemetry::try_init_for_tests();
@@ -2595,70 +2640,67 @@ mod tests {
 
         let project = ProjectId::new();
         let table = TableName::new("t").unwrap();
+        let part = PartitionKey::default_key();
         catalog.create_namespace(&project).await.unwrap();
-        let schema = arrow_schema::Schema::new(vec![Field::new("id", DataType::Int64, false)]);
-        catalog.create_table(&project, &table, &schema).await.unwrap();
-
-        // Two catalog-only files: one hot, one cold. Neither is written to
-        // the object store, so the LIST fallback would return an empty set.
-        let hot = format!(
-            "projects/{}/tables/t/data/_default/2026/06/18/AAAA.vortex",
-            project
-        );
-        let cold = format!(
-            "projects/{}/tables/t/cold/_default/2026/06/18/BBBB.vortex",
-            project
-        );
-        let files = vec![
-            DataFileRef {
-                path: hot.clone(),
-                size_bytes: 111,
-                row_count: 10,
-                column_stats: std::collections::BTreeMap::new(),
-                bloom_filters: std::collections::BTreeMap::new(),
-                hll_sketches: std::collections::BTreeMap::new(),
-                tdigest_sketches: std::collections::BTreeMap::new(),
-            },
-            DataFileRef {
-                path: cold.clone(),
-                size_bytes: 222,
-                row_count: 20,
-                column_stats: std::collections::BTreeMap::new(),
-                bloom_filters: std::collections::BTreeMap::new(),
-                hll_sketches: std::collections::BTreeMap::new(),
-                tdigest_sketches: std::collections::BTreeMap::new(),
-            },
-        ];
         catalog
-            .append_data_files(&project, &table, SnapshotId::GENESIS, files)
+            .create_table(&project, &table, &small_schema())
+            .await
+            .unwrap();
+
+        // Write TWO real files to the object store. Neither is registered in
+        // the catalog (this mimics the direct-`write_batch` / integration-test
+        // path that the regression broke).
+        s.write_batch(&project, &table, &part, &small_batch(0, 3, "a-"))
+            .await
+            .unwrap();
+        s.write_batch(&project, &table, &part, &small_batch(3, 3, "b-"))
+            .await
+            .unwrap();
+
+        // Register a catalog-only file that DOES NOT EXIST on disk. A correct
+        // lister must NOT return it (the object store is authoritative); a
+        // regressed catalog-sourced lister would.
+        let ghost = format!(
+            "projects/{}/tables/t/data/_default/2026/06/18/GHOST.vortex",
+            project
+        );
+        catalog
+            .append_data_files(
+                &project,
+                &table,
+                SnapshotId::GENESIS,
+                vec![DataFileRef {
+                    path: ghost.clone(),
+                    size_bytes: 999,
+                    row_count: 99,
+                    column_stats: std::collections::BTreeMap::new(),
+                    bloom_filters: std::collections::BTreeMap::new(),
+                    hll_sketches: std::collections::BTreeMap::new(),
+                    tdigest_sketches: std::collections::BTreeMap::new(),
+                }],
+            )
             .await
             .unwrap();
 
         let listed = s.list_data_files(&project, &table).await.unwrap();
+        // Exactly the two on-disk files — the catalog-only ghost is absent.
         assert_eq!(
             listed.len(),
             2,
-            "catalog fast path must return both files without a LIST"
+            "lister must enumerate the object store, not the catalog: {:?}",
+            listed.iter().map(|f| f.path.to_string()).collect::<Vec<_>>()
         );
-        let by_path: std::collections::HashMap<&str, &DataFile> =
-            listed.iter().map(|f| (f.path.as_ref(), f)).collect();
-        let hf = by_path.get(hot.as_str()).expect("hot file present");
-        assert_eq!(hf.size_bytes, 111);
-        assert_eq!(hf.row_count, 10);
-        assert_eq!(hf.tier, Tier::Hot);
-        let cf = by_path.get(cold.as_str()).expect("cold file present");
-        assert_eq!(cf.size_bytes, 222);
-        assert_eq!(cf.tier, Tier::Cold, "cold-tier path must classify as cold");
-
-        // No catalog → falls back to the object-store LIST (empty here since
-        // nothing was physically written), proving the fast path is gated on
-        // catalog attachment and not unconditional.
-        let s_nocat = storage_in(&dir);
-        let listed_nocat = s_nocat.list_data_files(&project, &table).await.unwrap();
         assert!(
-            listed_nocat.is_empty(),
-            "no-catalog path must LIST and find no physical files"
+            !listed.iter().any(|f| f.path.as_ref() == ghost),
+            "catalog-only file that does not exist on disk must not be listed"
         );
+        for f in &listed {
+            assert!(
+                f.path.as_ref().contains(&format!("projects/{project}/")),
+                "leaked path {}",
+                f.path
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

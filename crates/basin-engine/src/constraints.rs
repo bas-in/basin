@@ -285,9 +285,44 @@ pub(crate) async fn enforce_pk_on_insert(
     }
 
     // 2. Existing-table scan. Read every data file's PK columns.
-    let data_files = storage.list_data_files_with_stats(project, table).await?;
+    //
+    // CORRECTNESS: file EXISTENCE is sourced from the authoritative
+    // object-store LIST (`list_data_files_with_stats`), NEVER from the catalog
+    // alone. The catalog is not a complete file index at the storage layer —
+    // files written directly via `Storage::write_batch` (non-shard paths,
+    // integration tests) exist on the object store but carry no catalog row.
+    // Sourcing the candidate SET from the catalog would skip such a file and
+    // could MISS a duplicate key (a PRIMARY KEY integrity violation), so we
+    // must LIST. `list_data_files_with_stats` already overlays the catalog's
+    // `(row_count, column_stats)` onto the listed files (skipping their footer
+    // fetches), so a cataloged table keeps the zone-map prune for free.
+    //
+    // PERF: the streaming bloom prune below additionally needs each file's
+    // per-file PK `bloom_filters`, which `list_data_files_with_stats` does not
+    // carry. We overlay those from `catalog_data_files` (a zero-RPC in-RAM
+    // catalog read) by path so a cataloged table keeps the OLTP bloom-prune
+    // fast path. A file present on disk but absent from the catalog simply
+    // keeps empty blooms → it is always READ (never bloom-pruned), which is
+    // conservative and correct. The pruner is fail-safe throughout: empty
+    // `column_stats` → `Mixed` (file read), empty `bloom_filters` → no prune
+    // (file read), so an uncataloged file can never be wrongly skipped.
+    let mut data_files = storage.list_data_files_with_stats(project, table).await?;
     if data_files.is_empty() {
         return Ok(());
+    }
+    if let Some(catalog_files) = storage.catalog_data_files(project, table).await {
+        let mut blooms: std::collections::HashMap<String, _> = catalog_files
+            .into_iter()
+            .filter(|f| !f.bloom_filters.is_empty())
+            .map(|f| (f.path.to_string(), f.bloom_filters))
+            .collect();
+        if !blooms.is_empty() {
+            for f in data_files.iter_mut() {
+                if let Some(b) = blooms.remove(f.path.as_ref()) {
+                    f.bloom_filters = b;
+                }
+            }
+        }
     }
 
     // Pre-compute the tombstone set from the registry once, outside the file

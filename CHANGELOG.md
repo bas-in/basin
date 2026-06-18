@@ -8,6 +8,78 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-18 — Fix: catalog is a stats cache, not the authoritative file index
+
+- **Correctness fix — the storage read path and the PRIMARY-KEY duplicate check
+  no longer miss on-disk files that the catalog does not track.** A prior change
+  ("kill per-query LIST floor") sourced the data-file SET from the catalog
+  (`Storage::catalog_live_data_files` / `catalog_data_files`) in
+  `reader::list_data_files`, `reader::read`, and
+  `constraints::enforce_pk_on_insert`. But the catalog is **not** a complete
+  index of on-disk files at the storage layer: files written directly via
+  `Storage::write_batch` (some non-shard paths, integration tests) are on the
+  object store with no catalog row. A catalog-sourced file set therefore missed
+  those files, so reads returned wrong results and the PK check could miss a
+  duplicate key (a uniqueness integrity violation).
+  - **Object store is authoritative for file existence; the catalog enriches
+    stats only.** File discovery now always uses the object-store LIST. The
+    catalog is consulted purely to fill each listed file's
+    `(row_count, column_stats)` — skipping the per-file footer GET — and, for the
+    PK check, to overlay the per-file PK `bloom_filters` so a cataloged table
+    keeps its zone-map + bloom prune. A file present on disk but absent from the
+    catalog is still listed and read (empty stats are conservatively kept,
+    empty blooms skip the bloom prune), so it can never be wrongly dropped.
+  - **Performance impact:** the footer-fetch elimination (the dominant cold-path
+    round-trip on a high-RTT object store) is fully preserved via catalog stats;
+    only the per-query LIST RPC itself returns. The engine's own analytical
+    paths (`fast_select` / `fast_aggregate`) source their file set from the
+    catalog snapshot independently of `Storage::read`, so the OLAP scan path is
+    unaffected by this change. Keyed bulk-INSERT still gets catalog-resident
+    zone-map/bloom pruning; it pays one LIST per chunk for the authoritative
+    file set.
+
+## 2026-06-18 — Perf: flat-cost keyed/PRIMARY-KEY bulk ingest at scale
+
+- **Keyed (PRIMARY KEY) bulk ingest now stays roughly flat in per-chunk cost as
+  a table grows — the per-chunk PK-uniqueness check no longer does work that
+  scales with table size.** Previously every COPY/INSERT chunk into a PK table
+  ran `enforce_pk_on_insert`, which discovered the existing file set via
+  `Storage::list_data_files_with_stats` — an object-store **LIST** of the table
+  prefix plus a per-file footer/stats resolution, both O(files in table). As an
+  ascending-key load accumulates immutable files (each chunk's disjoint key
+  range never overlaps, so stripe-merge correctly leaves them un-merged), the
+  file count grows ~linearly with rows and the per-chunk LIST cost grew with it
+  — the super-linear bulk-load decline (projected ~33 h for 1B, abandoned past
+  ~100M). On a real object store each LIST page is a network round-trip, so the
+  effect is worse than the local rig shows.
+  - **Catalog-resident file discovery (zero object-store RPCs).** The streaming
+    PK check now sources its candidate file set from the catalog
+    (`Storage::catalog_data_files`), which already records `(row_count,
+    column_stats, bloom_filters)` per file transactionally at compaction /
+    stripe-merge time. Per-chunk file discovery is now an in-RAM catalog read,
+    not a LIST + footer fan-out, and it enumerates the same physical file set —
+    a strict round-trip elimination, never a visibility change.
+  - **Zone-map prune now actually bounds the candidate set.** With the catalog's
+    per-file PK `[min,max]` in hand, an ascending / above-range batch prunes
+    EVERY existing file to `NoMatch` — the read (candidate) set is ~0 regardless
+    of how many files have accumulated. The shard already wrote correct PK
+    min/max `column_stats` on its files; the missing piece was surfacing them to
+    the constraint pruner without the LIST.
+  - **Random-key bloom prune is no longer a no-op.** The LIST path returned files
+    with empty `bloom_filters`, so the streaming check's per-file PK-bloom prune
+    never fired. The catalog set carries the committed blooms, so a random key
+    whose range overlaps a file but isn't present is now bloom-pruned instead of
+    read.
+- Measured on the local MinIO rig (`t(id BIGINT PRIMARY KEY, x INT)`, ascending
+  ids, 200k-row COPY chunks, incompressible `x`): per-chunk wall time stays flat
+  at ~0.12 s through 30M rows and ~0.26 s at 50M (82 immutable files). Before the
+  change the same shape (compressible `x`, ~53 files) rose from ~0.20 s to
+  ~0.47 s by 50M — the per-chunk cost tracked file count. The streaming check's
+  candidate-file count after pruning is **~0 for ascending keys** (was an
+  O(total-files) LIST per chunk). Correctness after the 50M load: `COUNT(*)`
+  exact, a genuine duplicate key is still rejected (`23505` on `t_pkey`), and
+  point lookups return the right row.
+
 ## 2026-06-18 — Perf: flat-cost bulk ingest at scale (bounded tail + incremental compaction)
 
 - **Bulk ingest (COPY / INSERT) now stays roughly flat in per-chunk cost as a
