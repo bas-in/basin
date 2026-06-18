@@ -453,6 +453,84 @@ pub fn parse(sql: &str) -> Result<ParseTree> {
     }
 }
 
+// ── libpg_query parse cache ───────────────────────────────────────────────
+//
+// `pg_query::parse` calls into the C libpg_query library (a full PostgreSQL
+// grammar reduction + protobuf serialization). It runs at the very top of
+// `executor::execute` for EVERY statement, and it is not cheap — measured at
+// ~30µs per call on a warm point-lookup, ~11% of the warm server-side
+// latency. For a repeat-shape OLTP workload (the same SELECT / DML statement
+// fired over and over, often across a connection pool that round-robins
+// sessions) this fixed tax is paid on every execute even though the parse is
+// a pure function of the SQL bytes.
+//
+// Cache strategy: process-global LRU keyed by xxh3_64 of the SQL string —
+// the exact same pattern (and safety argument) as the sqlparser
+// `executor::parse_sql_cached` cache. The libpg_query `ParseResult` is a
+// deterministic function of the input bytes alone (no session/catalog state
+// enters it), so the same hash ⇒ the same parse tree, and handing back a
+// shared `Arc<ParseTree>` is correct. Entries are `Arc` so a hit is a cheap
+// pointer clone; the executor only ever reads the tree through `&` (stmts(),
+// stmt_kind, ctas_shape, reject_unsupported, …), never mutates it.
+//
+// `check_parse_depth` (the recursive-descent DoS guard) is preserved on the
+// miss path; the executor also calls it independently before this, so a
+// cached hit cannot smuggle in an over-deep statement.
+fn pg_parse_cache_size() -> std::num::NonZeroUsize {
+    let cap = std::env::var("BASIN_ENGINE_PG_PARSE_CACHE_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(256);
+    std::num::NonZeroUsize::new(cap).expect("cap > 0 enforced above")
+}
+
+fn pg_parse_cache() -> &'static std::sync::Mutex<lru::LruCache<u64, std::sync::Arc<ParseTree>>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<lru::LruCache<u64, std::sync::Arc<ParseTree>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(lru::LruCache::new(pg_parse_cache_size())))
+}
+
+/// Parse `sql` via libpg_query, consulting a process-global parse-tree cache.
+/// On a cache hit returns the cached `Arc<ParseTree>` (a cheap pointer clone);
+/// on a miss parses, inserts, and returns. Errors are never cached.
+///
+/// Correctness: identical to [`parse`] for any given `sql` — the cache only
+/// short-circuits recomputation of a pure, text-deterministic result. See the
+/// module-level cache comment for the full safety argument.
+pub fn parse_cached(sql: &str) -> Result<std::sync::Arc<ParseTree>> {
+    use xxhash_rust::xxh3::xxh3_64;
+    // Escape hatch for A/B latency measurement and incident mitigation: when
+    // set, every call re-parses (no cache read or write), reproducing the
+    // pre-cache behaviour on the same binary. Default off.
+    static NOCACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NOCACHE.get_or_init(|| std::env::var("BASIN_PG_PARSE_NOCACHE").is_ok()) {
+        return Ok(std::sync::Arc::new(parse(sql)?));
+    }
+    let key = xxh3_64(sql.as_bytes());
+    if let Ok(mut g) = pg_parse_cache().lock() {
+        if let Some(cached) = g.get(&key) {
+            return Ok(std::sync::Arc::clone(cached));
+        }
+    }
+    let tree = std::sync::Arc::new(parse(sql)?);
+    if let Ok(mut g) = pg_parse_cache().lock() {
+        g.put(key, std::sync::Arc::clone(&tree));
+    }
+    Ok(tree)
+}
+
+#[cfg(test)]
+pub(crate) fn pg_parse_cache_contains_for_test(sql: &str) -> bool {
+    use xxhash_rust::xxh3::xxh3_64;
+    let key = xxh3_64(sql.as_bytes());
+    pg_parse_cache()
+        .lock()
+        .map(|mut g| g.contains(&key))
+        .unwrap_or(false)
+}
+
 /// Shape of a plain `CREATE TABLE … AS <query>` statement, as classified
 /// by libpg_query (the real PostgreSQL parser).
 #[derive(Debug, Clone)]
@@ -1620,6 +1698,47 @@ mod tests {
         let stmts: Vec<_> = tree.stmts().collect();
         assert_eq!(stmts.len(), 1);
         assert_eq!(stmt_kind(stmts[0]), StmtKind::Select);
+    }
+
+    #[test]
+    fn parse_cached_matches_parse_and_caches() {
+        // Unique SQL so the assertion is robust to other tests warming the
+        // shared process-global cache.
+        let sql = "SELECT 424242 AS pg_parse_cache_probe";
+        assert!(
+            !pg_parse_cache_contains_for_test(sql),
+            "probe SQL must start uncached"
+        );
+
+        // First call: a miss that inserts. Result must equal the uncached parse.
+        let cached = parse_cached(sql).expect("parse_cached should succeed");
+        let direct = parse(sql).expect("parse should succeed");
+        let ck: Vec<_> = cached.stmts().map(stmt_kind).collect();
+        let dk: Vec<_> = direct.stmts().map(stmt_kind).collect();
+        assert_eq!(ck, dk, "cached tree must classify identically to direct");
+        assert_eq!(ck, vec![StmtKind::Select]);
+        assert!(
+            pg_parse_cache_contains_for_test(sql),
+            "after parse_cached the entry must be present"
+        );
+
+        // Second call: a hit returns the same Arc allocation (pointer-equal).
+        let a = parse_cached(sql).expect("hit");
+        let b = parse_cached(sql).expect("hit");
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &b),
+            "repeated parse_cached must hand back the same cached Arc"
+        );
+    }
+
+    #[test]
+    fn parse_cached_errors_are_not_cached() {
+        let bad = "SELECT FROM WHERE pg_parse_cache_err_probe";
+        assert!(parse_cached(bad).is_err(), "malformed SQL must error");
+        assert!(
+            !pg_parse_cache_contains_for_test(bad),
+            "a parse error must never populate the cache"
+        );
     }
 
     #[test]

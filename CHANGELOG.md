@@ -8,6 +8,61 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-18 — Cold-read round-trips: sibling-coalesced whole-file prefetch + higher scan fan-out
+
+- **Disk-cache prefetch now coalesces concurrent ranges of the same file.**
+  A cold Vortex (or Parquet) file open issues several *different* byte ranges
+  of the *same* file near-simultaneously — the footer suffix, then one or more
+  column segments — which are distinct `(path, range)` cache keys. The
+  existing speculative whole-file prefetch (LEVER 3) only promoted to a single
+  full GET *after* a ranged miss, so these sibling ranges each raced to issue
+  their own object-store GET first (measured: ~2.2 GETs per ~0.5 MiB file on a
+  cold scan, against a co-located object store where every GET is ~RTT-bound).
+  `DiskCachedStore` now gates the whole-file prefetch with a **path-level
+  singleflight** (`prefetch_inflight`): the first ranged miss on a path becomes
+  the prefetch leader and fetches the whole (small) file once; concurrent
+  ranges of the same path wait on it and then slice their range out of the
+  cached full file. A cold open of a small file trends toward **one** object-
+  store round-trip instead of one-per-range. Files larger than
+  `BASIN_DISK_CACHE_SPECULATIVE_BYTES` (default 4 MiB) are never whole-file
+  prefetched, so big-file behaviour is unchanged. Returned bytes are
+  byte-identical to a direct ranged GET; `.vortex` files are immutable and
+  PUT/DELETE invalidates every cached fragment of a path, so a stale slice is
+  impossible.
+- **Higher default file-scan fan-out on the storage read path.** The
+  table-wide reader (`read_paths_inner`) fetched + decoded files with a fixed
+  concurrency of 4, serialising a cold multi-file scan into `ceil(n/4)` waves.
+  Raised the default in-flight fan-out to 16 (override
+  `BASIN_READ_FILE_CONCURRENCY`), keeping ordered (`buffered`) emission so the
+  row order handed downstream is unchanged — only the fetch concurrency
+  changes, never the result set or its order. The per-project concurrency
+  permit pool remains the real ceiling.
+- General across any cold scan of any table; not benchmark-shaped. No change
+  to query results, the warm path, or default durability behaviour.
+
+## 2026-06-18 — Cached libpg_query parse: lower warm per-statement floor
+
+- The libpg_query parse that runs at the top of every statement
+  (`pg_ast::parse`, the C-library PostgreSQL grammar reduction +
+  protobuf build) is now memoized behind a process-global LRU
+  (`pg_ast::parse_cached`, default 256 entries, overridable via
+  `BASIN_ENGINE_PG_PARSE_CACHE_SIZE`). On a cache hit the executor gets a
+  cheap `Arc<ParseTree>` pointer clone instead of re-reducing the grammar.
+- Mirrors the existing sqlparser statement cache
+  (`executor::parse_sql_cached`) exactly, including its safety argument: the
+  parse tree is a pure, text-deterministic function of the SQL bytes (no
+  session or catalog state enters it), so the same SQL hash yields the same
+  tree and the cached `Arc` is read-only on every consumer
+  (`stmts`, `stmt_kind`, `ctas_shape`, `reject_unsupported`). Errors are
+  never cached; the recursive-descent depth guard still runs on the miss
+  path. Process-global so a connection pool round-robining sessions keeps the
+  cache warm across checkouts.
+- Removes a measured ~30µs fixed cost per statement (~11% of the warm
+  server-side point-lookup latency) for the repeat-shape OLTP workloads the
+  small-scale point/range cards exercise, with no change to results,
+  prepared-statement semantics, or the extended-query path. Measured locally
+  on a LocalFS engine driving a warmed `id = $1` point lookup.
+
 ## 2026-06-18 — Catalog-driven file discovery: zero LIST RPCs on warm scans/writes
 
 - `Storage::list_data_files` (and through it `list_data_files_with_stats`) and

@@ -237,6 +237,13 @@ impl Session for ProjectSession {
 /// On a tokenizer error we fall back to returning the full SQL as a single
 /// statement; the engine will re-tokenize and surface a properly-shaped
 /// parse error.
+/// Whether the per-statement server-side latency probe is enabled. Gated on
+/// `BASIN_PERF_TRACE` and cached so the hot path pays a single relaxed load.
+fn perf_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BASIN_PERF_TRACE").is_ok())
+}
+
 pub(crate) fn split_simple_query(sql: &str) -> Vec<String> {
     let dialect = PostgreSqlDialect {};
     let tokens = match Tokenizer::new(&dialect, sql).tokenize_with_location() {
@@ -353,8 +360,23 @@ where
         return out;
     }
 
+    // Per-statement server-side latency probe. Off by default (one cached
+    // bool read per query); when `BASIN_PERF_TRACE` is set it logs the
+    // wall-clock spent inside `session.execute` — the pgwire-decode →
+    // parse → plan → execute → result-build span — at debug level. Cheap and
+    // useful for diagnosing the warm per-statement floor without a profiler.
+    let perf_trace = perf_trace_enabled();
     for stmt_sql in &stmts {
-        match session.execute(stmt_sql).await {
+        let exec_started = perf_trace.then(std::time::Instant::now);
+        let exec_result = session.execute(stmt_sql).await;
+        if let Some(t0) = exec_started {
+            tracing::debug!(
+                target: "basin_router::perf",
+                micros = t0.elapsed().as_micros() as u64,
+                "simple-query server-side execute",
+            );
+        }
+        match exec_result {
             Ok(ExecResult::Empty { tag }) => {
                 out.push(PgWireBackendMessage::CommandComplete(CommandComplete::new(
                     tag,

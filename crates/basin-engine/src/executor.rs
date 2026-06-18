@@ -824,7 +824,8 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // gate later in this function (after the string-rewrite pipeline) can
     // reuse the same tree without calling pg_query::parse a second time.
     // pg_query::parse calls into a C library and is not cheap.
-    let raw_pg_tree: Option<crate::pg_ast::ParseTree> = crate::pg_ast::parse(sql).ok();
+    let raw_pg_tree: Option<std::sync::Arc<crate::pg_ast::ParseTree>> =
+        crate::pg_ast::parse_cached(sql).ok();
     if let Some(ref tree) = raw_pg_tree {
         // Collect statement kinds so we can dispatch before sqlparser.
         let kinds: Vec<_> = tree.stmts().map(|n| crate::pg_ast::stmt_kind(n)).collect();
@@ -853,7 +854,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
 
             // TRUNCATE is a real operation — delete all rows.
             if matches!(kind, crate::pg_ast::StmtKind::Truncate) {
-                return crate::truncate::exec_truncate(sess, &tree).await;
+                return crate::truncate::exec_truncate(sess, tree.as_ref()).await;
             }
 
             // ── Aborted-state guard (SQLSTATE 25P02) ──────────────────────────
@@ -1684,7 +1685,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 return Ok(result);
             }
         }
-        crate::pg_ast::reject_unsupported(&tree)?;
+        crate::pg_ast::reject_unsupported(tree.as_ref())?;
     }
 
     // ── Phase 5.29.B: ALTER TABLE … SET (timescaledb.compress …) ────────────
