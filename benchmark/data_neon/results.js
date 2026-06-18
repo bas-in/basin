@@ -165,7 +165,7 @@ window.__BASIN_RESULTS = {
       "kind": "scaling",
       "id": "data_size",
       "name": "Basin-only scale curve (Neon free tier cannot hold these)",
-      "claim": "Neon free tier caps at 512MB, so it cannot hold 1M+ of this workload \u2014 this curve is Basin-only. No-PK ingest scales FLAT (~85k rows/s held from 1M through 100M), so 1B is bandwidth/time-bound (~3.3h from a single co-located loader), not architecture-bound. PK bulk-COPY, by contrast, slows super-linearly and is impractical past ~100M (per-chunk PK enforcement re-reads a growing file set \u2014 tracked separately). Cold first-touch reads climb with the file count as the working set outgrows cache.",
+      "claim": "Neon free tier caps at 512MB, so it cannot hold 1M+ of this workload \u2014 this curve is Basin-only. No-PK ingest scales FLAT (~68-85k rows/s held from 1M through 425M+ and counting), so 1B is bandwidth/time-bound (~3.3h from a single co-located loader), not architecture-bound. PK bulk-COPY, by contrast, slows super-linearly and is impractical past ~100M (per-chunk PK enforcement re-reads a growing file set \u2014 tracked separately). Cold first-touch reads climb with the file count as the working set outgrows cache.",
       "passed": true,
       "x_axis": {
         "key": "rows",
@@ -247,6 +247,12 @@ window.__BASIN_RESULTS = {
           "config": "narrow_nopk",
           "seed_rows_per_sec": 85000,
           "label": "100M seeded at flat ~85k rows/s"
+        },
+        {
+          "rows": 425000000,
+          "config": "narrow_nopk",
+          "seed_rows_per_sec": 68474,
+          "label": "425M+ sustained, ingest still flat (~68-85k rows/s, run continuing toward 1B)"
         },
         {
           "rows": 1000000000,
