@@ -71,7 +71,7 @@ use std::time::Duration;
 
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use basin_common::{BasinError, ProjectId, Result, TableName};
+use basin_common::{BasinError, ProjectId, QualifiedTableName, Result, SchemaName, TableName};
 use bytes::Bytes;
 use chrono::Utc;
 use object_store::{path::Path as OsPath, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
@@ -259,8 +259,9 @@ pub struct ObjectStoreCatalog {
     /// Monotonic mutation epoch for session-cache validation (same contract as
     /// `InMemoryCatalog::epoch`). Bumped on every successful mutation.
     epoch: AtomicU64,
-    /// Per-`(project, table)` resolved-manifest cache. Keyed by the same
-    /// `(project, public.table)` shape the rest of the catalog uses.
+    /// Per-`(project, schema.table)` resolved-manifest cache. Keyed by the
+    /// fully-qualified `schema.table` string so the same bare name in two
+    /// schemas (e.g. `public.users` vs `auth.users`) never shares a cache slot.
     cache: Mutex<HashMap<(ProjectId, String), CacheEntry>>,
 }
 
@@ -290,25 +291,113 @@ impl ObjectStoreCatalog {
         self.epoch.fetch_add(1, SeqCst);
     }
 
-    fn table_dir(&self, project: &ProjectId, table: &TableName) -> String {
-        // Single-schema (public) keying for v0.1, mirroring the other backends'
-        // public-schema fast path. Schema-qualified manifests are a follow-up.
-        format!("{}{}/public/{}/", self.root, project, table)
+    fn table_dir(&self, project: &ProjectId, qtable: &QualifiedTableName) -> String {
+        // Schema-qualified keying, mirroring `PostgresCatalog`'s
+        // `(project, schema, table)` primary key: the same bare table name in
+        // two different schemas (e.g. `public.users` vs `auth.users`) lands at
+        // distinct manifest prefixes and never collides.
+        format!(
+            "{}{}/{}/{}/",
+            self.root, project, qtable.schema, qtable.name
+        )
     }
 
-    fn manifest_key(&self, project: &ProjectId, table: &TableName, version: u64) -> OsPath {
+    fn manifest_key(&self, project: &ProjectId, qtable: &QualifiedTableName, version: u64) -> OsPath {
         OsPath::from(format!(
             "{}v{version:020}.json",
-            self.table_dir(project, table)
+            self.table_dir(project, qtable)
         ))
     }
 
-    fn head_key(&self, project: &ProjectId, table: &TableName) -> OsPath {
-        OsPath::from(format!("{}HEAD", self.table_dir(project, table)))
+    fn head_key(&self, project: &ProjectId, qtable: &QualifiedTableName) -> OsPath {
+        OsPath::from(format!("{}HEAD", self.table_dir(project, qtable)))
     }
 
-    fn cache_key(&self, project: &ProjectId, table: &TableName) -> (ProjectId, String) {
-        (*project, table.as_str().to_string())
+    fn cache_key(&self, project: &ProjectId, qtable: &QualifiedTableName) -> (ProjectId, String) {
+        (*project, qtable.to_string())
+    }
+
+    /// Resolve a bare [`TableName`] to a [`QualifiedTableName`], mirroring
+    /// [`InMemoryCatalog::resolve_qtable`]: try the `public` schema first
+    /// (fast path for the common case), then LIST across all schemas for a
+    /// unique bare-name match (so system-schema tables like `auth.users` or
+    /// `cron.job` resolve by bare name after DataFusion schema stripping). If
+    /// not found in any schema — or ambiguous across schemas — fall back to
+    /// `public` so the downstream lookup produces the expected NotFound error.
+    async fn resolve_qtable(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> QualifiedTableName {
+        let pub_qtable = QualifiedTableName::in_public(table.clone());
+        // Fast path: a live `public` manifest exists.
+        if self.resolve_head_version(project, &pub_qtable).await.ok().flatten().is_some() {
+            return pub_qtable;
+        }
+        // Search non-public schemas for a table with this bare name.
+        match self.list_schema_table_names(project).await {
+            Ok(found) => {
+                let mut candidate: Option<QualifiedTableName> = None;
+                for qt in found {
+                    if qt.name == *table {
+                        if candidate.is_some() {
+                            // Ambiguous across schemas — fall back to public.
+                            return pub_qtable;
+                        }
+                        candidate = Some(qt);
+                    }
+                }
+                candidate.unwrap_or(pub_qtable)
+            }
+            Err(_) => pub_qtable,
+        }
+    }
+
+    /// Enumerate every `(schema, table)` directory present under
+    /// `{root}{project}/`, regardless of tombstone state. Used by
+    /// `resolve_qtable` and `list_tables`. Each returned name is built from the
+    /// `{schema}/{table}` path segments.
+    async fn list_schema_table_names(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Vec<QualifiedTableName>> {
+        use futures::StreamExt;
+        // `OsPath` normalises away the trailing slash, so build the string
+        // prefix ourselves and match against `meta.location.as_ref()`.
+        let prefix_str = format!("{}{}/", self.root, project);
+        let list_prefix = OsPath::from(prefix_str.clone());
+        let mut stream = self.store.list(Some(&list_prefix));
+        // Distinct (schema, table) pairs; BTreeSet gives deterministic order.
+        let mut pairs: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        let trimmed = prefix_str.trim_end_matches('/');
+        while let Some(item) = stream.next().await {
+            let meta = item.map_err(|e| storage_err("list tables", e))?;
+            let key = meta.location.as_ref();
+            // key = {root}{project}/{schema}/{table}/v{N}.json  (or /HEAD)
+            // The project-scoped `_project/…` metadata keys are NOT table dirs;
+            // skip them so they are never mistaken for a `{schema}/{table}`.
+            let Some(rest) = key.strip_prefix(trimmed) else {
+                continue;
+            };
+            let rest = rest.trim_start_matches('/');
+            let mut segs = rest.split('/');
+            let (Some(schema), Some(table)) = (segs.next(), segs.next()) else {
+                continue;
+            };
+            if schema.is_empty() || table.is_empty() || schema == "_project" {
+                continue;
+            }
+            pairs.insert((schema.to_string(), table.to_string()));
+        }
+        let mut out = Vec::with_capacity(pairs.len());
+        for (schema, table) in pairs {
+            let (Ok(schema), Ok(table)) = (SchemaName::new(schema), TableName::new(table)) else {
+                continue;
+            };
+            out.push(QualifiedTableName::new(schema, table));
+        }
+        Ok(out)
     }
 
     /// Resolve the highest manifest version `N` for a table. Tries `HEAD`
@@ -317,10 +406,10 @@ impl ObjectStoreCatalog {
     async fn resolve_head_version(
         &self,
         project: &ProjectId,
-        table: &TableName,
+        qtable: &QualifiedTableName,
     ) -> Result<Option<u64>> {
         // HEAD fast path.
-        match self.store.get(&self.head_key(project, table)).await {
+        match self.store.get(&self.head_key(project, qtable)).await {
             Ok(res) => {
                 if let Ok(bytes) = res.bytes().await {
                     if let Ok(s) = std::str::from_utf8(&bytes) {
@@ -329,7 +418,7 @@ impl ObjectStoreCatalog {
                             // a torn/stale HEAD falls through to the LIST scan.
                             if self
                                 .store
-                                .head(&self.manifest_key(project, table, v))
+                                .head(&self.manifest_key(project, qtable, v))
                                 .await
                                 .is_ok()
                             {
@@ -343,16 +432,16 @@ impl ObjectStoreCatalog {
             Err(e) => return Err(storage_err("get HEAD", e)),
         }
         // LIST fallback: scan the table dir for the max v{N}.json.
-        self.list_max_version(project, table).await
+        self.list_max_version(project, qtable).await
     }
 
     async fn list_max_version(
         &self,
         project: &ProjectId,
-        table: &TableName,
+        qtable: &QualifiedTableName,
     ) -> Result<Option<u64>> {
         use futures::StreamExt;
-        let prefix = OsPath::from(self.table_dir(project, table));
+        let prefix = OsPath::from(self.table_dir(project, qtable));
         let mut stream = self.store.list(Some(&prefix));
         let mut max: Option<u64> = None;
         while let Some(item) = stream.next().await {
@@ -372,19 +461,19 @@ impl ObjectStoreCatalog {
     async fn get_manifest(
         &self,
         project: &ProjectId,
-        table: &TableName,
+        qtable: &QualifiedTableName,
         version: u64,
     ) -> Result<TableManifest> {
-        let key = self.manifest_key(project, table, version);
+        let key = self.manifest_key(project, qtable, version);
         let res = self.store.get(&key).await.map_err(|e| match e {
             object_store::Error::NotFound { .. } => {
-                BasinError::not_found(format!("{project}/{table}@v{version}"))
+                BasinError::not_found(format!("{project}/{qtable}@v{version}"))
             }
             other => storage_err("get manifest", other),
         })?;
         let bytes = res.bytes().await.map_err(|e| storage_err("read manifest", e))?;
         serde_json::from_slice(&bytes)
-            .map_err(|e| BasinError::catalog(format!("decode manifest {project}/{table}: {e}")))
+            .map_err(|e| BasinError::catalog(format!("decode manifest {project}/{qtable}: {e}")))
     }
 
     /// Load the current manifest (highest version), using the cache when its
@@ -393,25 +482,25 @@ impl ObjectStoreCatalog {
     async fn load_current(
         &self,
         project: &ProjectId,
-        table: &TableName,
+        qtable: &QualifiedTableName,
     ) -> Result<(u64, Arc<TableManifest>)> {
         let version = self
-            .resolve_head_version(project, table)
+            .resolve_head_version(project, qtable)
             .await?
-            .ok_or_else(|| BasinError::not_found(format!("{project}/{table}")))?;
-        let ck = self.cache_key(project, table);
+            .ok_or_else(|| BasinError::not_found(format!("{project}/{qtable}")))?;
+        let ck = self.cache_key(project, qtable);
         {
             let cache = self.cache.lock().await;
             if let Some(entry) = cache.get(&ck) {
                 if entry.version == version {
                     if entry.manifest.dropped {
-                        return Err(BasinError::not_found(format!("{project}/{table}")));
+                        return Err(BasinError::not_found(format!("{project}/{qtable}")));
                     }
                     return Ok((version, entry.manifest.clone()));
                 }
             }
         }
-        let manifest = Arc::new(self.get_manifest(project, table, version).await?);
+        let manifest = Arc::new(self.get_manifest(project, qtable, version).await?);
         {
             let mut cache = self.cache.lock().await;
             cache.insert(
@@ -423,7 +512,7 @@ impl ObjectStoreCatalog {
             );
         }
         if manifest.dropped {
-            return Err(BasinError::not_found(format!("{project}/{table}")));
+            return Err(BasinError::not_found(format!("{project}/{qtable}")));
         }
         Ok((version, manifest))
     }
@@ -433,13 +522,13 @@ impl ObjectStoreCatalog {
     async fn put_manifest_create(
         &self,
         project: &ProjectId,
-        table: &TableName,
+        qtable: &QualifiedTableName,
         version: u64,
         manifest: &TableManifest,
     ) -> Result<bool> {
         let bytes = serde_json::to_vec(manifest)
             .map_err(|e| BasinError::catalog(format!("serialise manifest: {e}")))?;
-        let key = self.manifest_key(project, table, version);
+        let key = self.manifest_key(project, qtable, version);
         let opts = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
@@ -455,7 +544,7 @@ impl ObjectStoreCatalog {
     async fn after_commit(
         &self,
         project: &ProjectId,
-        table: &TableName,
+        qtable: &QualifiedTableName,
         version: u64,
         manifest: TableManifest,
     ) {
@@ -464,7 +553,7 @@ impl ObjectStoreCatalog {
         let _ = self
             .store
             .put_opts(
-                &self.head_key(project, table),
+                &self.head_key(project, qtable),
                 Bytes::from(version.to_string()).into(),
                 PutOptions {
                     mode: PutMode::Overwrite,
@@ -472,7 +561,7 @@ impl ObjectStoreCatalog {
                 },
             )
             .await;
-        let ck = self.cache_key(project, table);
+        let ck = self.cache_key(project, qtable);
         let mut cache = self.cache.lock().await;
         cache.insert(
             ck,
@@ -494,16 +583,17 @@ impl ObjectStoreCatalog {
     async fn commit_snapshot(
         &self,
         project: &ProjectId,
-        table: &TableName,
+        qtable: &QualifiedTableName,
         expected_snapshot: SnapshotId,
         operation: SnapshotOperation,
         removed_paths: Vec<String>,
         added_files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
-        let (version, manifest) = self.load_current(project, table).await?;
+        let table = &qtable.name;
+        let (version, manifest) = self.load_current(project, qtable).await?;
         if manifest.current_snapshot != expected_snapshot {
             return Err(BasinError::CommitConflict(format!(
-                "{project}/{table}: expected snapshot {expected_snapshot}, current is {}",
+                "{project}/{qtable}: expected snapshot {expected_snapshot}, current is {}",
                 manifest.current_snapshot
             )));
         }
@@ -519,7 +609,7 @@ impl ObjectStoreCatalog {
             for p in &removed_paths {
                 if !live.contains(p) {
                     return Err(BasinError::catalog(format!(
-                        "{project}/{table}: replace_data_files removed path {p:?} not in live set"
+                        "{project}/{qtable}: replace_data_files removed path {p:?} not in live set"
                     )));
                 }
             }
@@ -552,25 +642,25 @@ impl ObjectStoreCatalog {
         next.snapshots.push(snap);
 
         if self
-            .put_manifest_create(project, table, next.version, &next)
+            .put_manifest_create(project, qtable, next.version, &next)
             .await?
         {
             let meta = next.to_metadata(project, table);
-            self.after_commit(project, table, next.version, next).await;
+            self.after_commit(project, qtable, next.version, next).await;
             Ok(meta)
         } else {
             // Lost the create race: someone else committed v{N+1}. Invalidate
             // cache and surface CommitConflict — the engine reloads + retries.
-            self.invalidate(project, table).await;
+            self.invalidate(project, qtable).await;
             Err(BasinError::CommitConflict(format!(
-                "{project}/{table}: lost commit race at version {}",
+                "{project}/{qtable}: lost commit race at version {}",
                 next.version
             )))
         }
     }
 
-    async fn invalidate(&self, project: &ProjectId, table: &TableName) {
-        let ck = self.cache_key(project, table);
+    async fn invalidate(&self, project: &ProjectId, qtable: &QualifiedTableName) {
+        let ck = self.cache_key(project, qtable);
         self.cache.lock().await.remove(&ck);
     }
 
@@ -581,31 +671,261 @@ impl ObjectStoreCatalog {
     async fn mutate_manifest<F>(
         &self,
         project: &ProjectId,
-        table: &TableName,
+        qtable: &QualifiedTableName,
         mut mutate: F,
     ) -> Result<TableManifest>
     where
         F: FnMut(&mut TableManifest),
     {
         for _ in 0..MAX_DDL_RETRIES {
-            let (version, manifest) = self.load_current(project, table).await?;
+            let (version, manifest) = self.load_current(project, qtable).await?;
             let mut next = (*manifest).clone();
             next.version = version + 1;
             mutate(&mut next);
             if self
-                .put_manifest_create(project, table, next.version, &next)
+                .put_manifest_create(project, qtable, next.version, &next)
                 .await?
             {
                 let out = next.clone();
-                self.after_commit(project, table, next.version, next).await;
+                self.after_commit(project, qtable, next.version, next).await;
                 return Ok(out);
             }
             // Lost the race — reload and retry the (idempotent) mutation.
-            self.invalidate(project, table).await;
+            self.invalidate(project, qtable).await;
         }
         Err(BasinError::CommitConflict(format!(
-            "{project}/{table}: exhausted DDL retries under contention"
+            "{project}/{qtable}: exhausted DDL retries under contention"
         )))
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema-qualified workers. Both the bare-`TableName` trait methods (which
+    // resolve a schema via `resolve_qtable`) and the `*_qualified` trait
+    // overrides (which carry an explicit schema) delegate here so the keying
+    // logic lives in exactly one place.
+    // -----------------------------------------------------------------------
+
+    async fn create_table_q(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        schema: &Schema,
+    ) -> Result<TableMetadata> {
+        let table = &qtable.name;
+        // Genesis manifest at v0 via create-if-absent. AlreadyExists => the
+        // table already has a v0 manifest. If that v0 is a tombstone (dropped),
+        // a recreate is allowed by writing a fresh genesis at the next version.
+        let manifest = TableManifest::genesis(schema.clone());
+        if self.put_manifest_create(project, qtable, 0, &manifest).await? {
+            let meta = manifest.to_metadata(project, table);
+            self.after_commit(project, qtable, 0, manifest).await;
+            return Ok(meta);
+        }
+        // v0 exists. Resolve the live state.
+        match self.load_current(project, qtable).await {
+            Ok(_) => Err(BasinError::catalog(format!(
+                "table {project}/{qtable} already exists"
+            ))),
+            Err(BasinError::NotFound(_)) => {
+                // Latest manifest is a tombstone — recreate at next version.
+                let version = self
+                    .resolve_head_version(project, qtable)
+                    .await?
+                    .unwrap_or(0);
+                let mut genesis = TableManifest::genesis(schema.clone());
+                genesis.version = version + 1;
+                if self
+                    .put_manifest_create(project, qtable, genesis.version, &genesis)
+                    .await?
+                {
+                    let meta = genesis.to_metadata(project, table);
+                    self.after_commit(project, qtable, genesis.version, genesis)
+                        .await;
+                    Ok(meta)
+                } else {
+                    Err(BasinError::catalog(format!(
+                        "table {project}/{qtable} recreate lost race"
+                    )))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn load_table_q(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<TableMetadata> {
+        let (_v, manifest) = self.load_current(project, qtable).await?;
+        Ok(manifest.to_metadata(project, &qtable.name))
+    }
+
+    async fn drop_table_q(&self, project: &ProjectId, qtable: &QualifiedTableName) -> Result<()> {
+        // Tombstone: append a manifest version with `dropped = true`. Keeps the
+        // history immutable and lets concurrent readers resolve deterministically.
+        self.load_current(project, qtable).await?; // NotFound if absent.
+        self.mutate_manifest(project, qtable, |m| m.dropped = true)
+            .await?;
+        Ok(())
+    }
+
+    async fn rename_table_q(
+        &self,
+        project: &ProjectId,
+        old: &QualifiedTableName,
+        new: &QualifiedTableName,
+    ) -> Result<()> {
+        let (_v, manifest) = self.load_current(project, old).await?;
+        // Destination must not already exist.
+        match self.load_current(project, new).await {
+            Ok(_) => {
+                return Err(BasinError::catalog(format!(
+                    "rename_table: {project}/{new} already exists"
+                )))
+            }
+            Err(BasinError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        // Write a fresh genesis-versioned manifest for `new` carrying old state,
+        // then tombstone `old`. (Snapshot history + all fields are preserved.)
+        // `old` and `new` may live in different schemas — the keys differ, so
+        // this correctly moves the manifest across schema dirs.
+        let mut dst = (*manifest).clone();
+        dst.version = 0;
+        dst.dropped = false;
+        if !self.put_manifest_create(project, new, 0, &dst).await? {
+            // new dir had a stale/tombstoned manifest; place at next version.
+            let v = self.resolve_head_version(project, new).await?.unwrap_or(0);
+            dst.version = v + 1;
+            if !self
+                .put_manifest_create(project, new, dst.version, &dst)
+                .await?
+            {
+                return Err(BasinError::catalog(format!(
+                    "rename_table: {project}/{new} lost create race"
+                )));
+            }
+        }
+        self.after_commit(project, new, dst.version, dst).await;
+        self.mutate_manifest(project, old, |m| m.dropped = true)
+            .await?;
+        Ok(())
+    }
+
+    async fn current_snapshot_id_q(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<SnapshotId> {
+        let (_v, manifest) = self.load_current(project, qtable).await?;
+        Ok(manifest.current_snapshot)
+    }
+
+    async fn list_snapshots_q(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<Vec<Snapshot>> {
+        let (_v, manifest) = self.load_current(project, qtable).await?;
+        let mut snaps = manifest.snapshots.clone();
+        snaps.sort_by_key(|s| s.id);
+        Ok(snaps)
+    }
+
+    async fn rollback_to_snapshot_q(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        snapshot_id: SnapshotId,
+    ) -> Result<TableMetadata> {
+        let (_v, manifest) = self.load_current(project, qtable).await?;
+        if !manifest.snapshots.iter().any(|s| s.id == snapshot_id) {
+            return Err(BasinError::not_found(format!(
+                "{project}/{qtable}: snapshot {snapshot_id} not in history"
+            )));
+        }
+        let next = self
+            .mutate_manifest(project, qtable, |m| {
+                let mut orphans: Vec<String> = Vec::new();
+                for s in m.snapshots.iter().filter(|s| s.id > snapshot_id) {
+                    for f in &s.data_files {
+                        orphans.push(f.path.clone());
+                    }
+                }
+                m.gc_orphan_paths.extend(orphans);
+                m.snapshots.retain(|s| s.id <= snapshot_id);
+                m.current_snapshot = snapshot_id;
+            })
+            .await?;
+        Ok(next.to_metadata(project, &qtable.name))
+    }
+
+    async fn create_index_q(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        name: &str,
+        columns: &[String],
+        if_not_exists: bool,
+        access_method: &str,
+        opclass: Option<&str>,
+    ) -> Result<()> {
+        if columns.is_empty() {
+            return Err(BasinError::InvalidSchema(
+                "create_index: column list cannot be empty".into(),
+            ));
+        }
+        // Validate columns + duplicate name against the current manifest first
+        // so we return the right error without burning a version.
+        let (_v, manifest) = self.load_current(project, qtable).await?;
+        for col in columns {
+            if manifest.schema.field_with_name(col).is_err() {
+                return Err(BasinError::InvalidSchema(format!(
+                    "create_index: column {col:?} not in table {project}/{qtable} schema"
+                )));
+            }
+        }
+        if manifest.indexes.iter().any(|i| i.name == name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(BasinError::catalog(format!(
+                "create_index: {project}/{qtable}: index {name:?} already exists"
+            )));
+        }
+        let idx = SecondaryIndex {
+            name: name.to_string(),
+            columns: columns.to_vec(),
+            access_method: access_method.to_string(),
+            opclass: opclass.map(|s| s.to_string()),
+        };
+        self.mutate_manifest(project, qtable, |m| {
+            if !m.indexes.iter().any(|i| i.name == idx.name) {
+                m.indexes.push(idx.clone());
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn drop_index_q(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        name: &str,
+    ) -> Result<()> {
+        let (_v, manifest) = self.load_current(project, qtable).await?;
+        if !manifest.indexes.iter().any(|i| i.name == name) {
+            return Err(BasinError::not_found(format!(
+                "{project}/{qtable}: index {name:?}"
+            )));
+        }
+        self.mutate_manifest(project, qtable, |m| {
+            m.indexes.retain(|i| i.name != name);
+        })
+        .await?;
+        Ok(())
     }
 }
 
@@ -632,49 +952,14 @@ impl Catalog for ObjectStoreCatalog {
         table: &TableName,
         schema: &Schema,
     ) -> Result<TableMetadata> {
-        // Genesis manifest at v0 via create-if-absent. AlreadyExists => the
-        // table already has a v0 manifest. If that v0 is a tombstone (dropped),
-        // a recreate is allowed by writing a fresh genesis at the next version.
-        let manifest = TableManifest::genesis(schema.clone());
-        if self.put_manifest_create(project, table, 0, &manifest).await? {
-            let meta = manifest.to_metadata(project, table);
-            self.after_commit(project, table, 0, manifest).await;
-            return Ok(meta);
-        }
-        // v0 exists. Resolve the live state.
-        match self.load_current(project, table).await {
-            Ok(_) => Err(BasinError::catalog(format!(
-                "table {project}/{table} already exists"
-            ))),
-            Err(BasinError::NotFound(_)) => {
-                // Latest manifest is a tombstone — recreate at next version.
-                let version = self
-                    .resolve_head_version(project, table)
-                    .await?
-                    .unwrap_or(0);
-                let mut genesis = TableManifest::genesis(schema.clone());
-                genesis.version = version + 1;
-                if self
-                    .put_manifest_create(project, table, genesis.version, &genesis)
-                    .await?
-                {
-                    let meta = genesis.to_metadata(project, table);
-                    self.after_commit(project, table, genesis.version, genesis)
-                        .await;
-                    Ok(meta)
-                } else {
-                    Err(BasinError::catalog(format!(
-                        "table {project}/{table} recreate lost race"
-                    )))
-                }
-            }
-            Err(e) => Err(e),
-        }
+        // Old API: always creates in the public schema (mirrors InMemory).
+        let qtable = QualifiedTableName::in_public(table.clone());
+        self.create_table_q(project, &qtable, schema).await
     }
 
     async fn load_table(&self, project: &ProjectId, table: &TableName) -> Result<TableMetadata> {
-        let (_v, manifest) = self.load_current(project, table).await?;
-        Ok(manifest.to_metadata(project, table))
+        let qtable = self.resolve_qtable(project, table).await;
+        self.load_table_q(project, &qtable).await
     }
 
     async fn current_snapshot_id(
@@ -682,17 +967,13 @@ impl Catalog for ObjectStoreCatalog {
         project: &ProjectId,
         table: &TableName,
     ) -> Result<SnapshotId> {
-        let (_v, manifest) = self.load_current(project, table).await?;
-        Ok(manifest.current_snapshot)
+        let qtable = self.resolve_qtable(project, table).await;
+        self.current_snapshot_id_q(project, &qtable).await
     }
 
     async fn drop_table(&self, project: &ProjectId, table: &TableName) -> Result<()> {
-        // Tombstone: append a manifest version with `dropped = true`. Keeps the
-        // history immutable and lets concurrent readers resolve deterministically.
-        self.load_current(project, table).await?; // NotFound if absent.
-        self.mutate_manifest(project, table, |m| m.dropped = true)
-            .await?;
-        Ok(())
+        let qtable = self.resolve_qtable(project, table).await;
+        self.drop_table_q(project, &qtable).await
     }
 
     async fn rename_table(
@@ -701,75 +982,29 @@ impl Catalog for ObjectStoreCatalog {
         old: &TableName,
         new: &TableName,
     ) -> Result<()> {
-        let (_v, manifest) = self.load_current(project, old).await?;
-        // Destination must not already exist.
-        match self.load_current(project, new).await {
-            Ok(_) => {
-                return Err(BasinError::catalog(format!(
-                    "rename_table: {project}/{new} already exists"
-                )))
-            }
-            Err(BasinError::NotFound(_)) => {}
-            Err(e) => return Err(e),
-        }
-        // Write a fresh genesis-versioned manifest for `new` carrying old state,
-        // then tombstone `old`. (Snapshot history + all fields are preserved.)
-        let mut dst = (*manifest).clone();
-        dst.version = 0;
-        dst.dropped = false;
-        if !self.put_manifest_create(project, new, 0, &dst).await? {
-            // new dir had a stale/tombstoned manifest; place at next version.
-            let v = self.resolve_head_version(project, new).await?.unwrap_or(0);
-            dst.version = v + 1;
-            if !self
-                .put_manifest_create(project, new, dst.version, &dst)
-                .await?
-            {
-                return Err(BasinError::catalog(format!(
-                    "rename_table: {project}/{new} lost create race"
-                )));
-            }
-        }
-        self.after_commit(project, new, dst.version, dst).await;
-        self.mutate_manifest(project, old, |m| m.dropped = true)
-            .await?;
-        Ok(())
+        let qold = self.resolve_qtable(project, old).await;
+        // New tables go to public unless qualified (mirrors InMemory).
+        let qnew = QualifiedTableName::in_public(new.clone());
+        self.rename_table_q(project, &qold, &qnew).await
     }
 
     async fn list_tables(&self, project: &ProjectId) -> Result<Vec<TableName>> {
-        use futures::StreamExt;
-        // List the project prefix and collect distinct table dirs whose latest
-        // manifest is not a tombstone.
-        // `OsPath` normalises away the trailing slash, so build the string
-        // prefix ourselves and match against `meta.location.as_ref()` (which is
-        // the normalised, slash-separated key with no leading/trailing slash).
-        let prefix_str = format!("{}{}/public/", self.root, project);
-        let list_prefix = OsPath::from(prefix_str.clone());
-        let mut stream = self.store.list(Some(&list_prefix));
-        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        while let Some(item) = stream.next().await {
-            let meta = item.map_err(|e| storage_err("list tables", e))?;
-            let key = meta.location.as_ref();
-            // key = {root}{project}/public/{table}/v{N}.json  (or /HEAD)
-            if let Some(rest) = key.strip_prefix(prefix_str.trim_end_matches('/')) {
-                let rest = rest.trim_start_matches('/');
-                if let Some(table_name) = rest.split('/').next() {
-                    if !table_name.is_empty() {
-                        names.insert(table_name.to_string());
-                    }
-                }
-            }
-        }
+        // Back-compat: return only the bare names of live public-schema tables.
+        let all = self.list_schema_table_names(project).await?;
+        let public = SchemaName::public();
         let mut out = Vec::new();
-        for name in names {
-            let Ok(tn) = TableName::new(name) else { continue };
+        for qt in all {
+            if qt.schema != public {
+                continue;
+            }
             // Filter out tombstoned tables.
-            match self.load_current(project, &tn).await {
-                Ok(_) => out.push(tn),
+            match self.load_current(project, &qt).await {
+                Ok(_) => out.push(qt.name),
                 Err(BasinError::NotFound(_)) => {}
                 Err(e) => return Err(e),
             }
         }
+        out.sort();
         Ok(out)
     }
 
@@ -780,9 +1015,10 @@ impl Catalog for ObjectStoreCatalog {
         expected_snapshot: SnapshotId,
         files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
+        let qtable = self.resolve_qtable(project, table).await;
         self.commit_snapshot(
             project,
-            table,
+            &qtable,
             expected_snapshot,
             SnapshotOperation::Append,
             Vec::new(),
@@ -799,9 +1035,10 @@ impl Catalog for ObjectStoreCatalog {
         removed_paths: Vec<String>,
         added_files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
+        let qtable = self.resolve_qtable(project, table).await;
         self.commit_snapshot(
             project,
-            table,
+            &qtable,
             expected_snapshot,
             SnapshotOperation::Replace,
             removed_paths,
@@ -815,10 +1052,8 @@ impl Catalog for ObjectStoreCatalog {
         project: &ProjectId,
         table: &TableName,
     ) -> Result<Vec<Snapshot>> {
-        let (_v, manifest) = self.load_current(project, table).await?;
-        let mut snaps = manifest.snapshots.clone();
-        snaps.sort_by_key(|s| s.id);
-        Ok(snaps)
+        let qtable = self.resolve_qtable(project, table).await;
+        self.list_snapshots_q(project, &qtable).await
     }
 
     async fn rollback_to_snapshot(
@@ -827,27 +1062,9 @@ impl Catalog for ObjectStoreCatalog {
         table: &TableName,
         snapshot_id: SnapshotId,
     ) -> Result<TableMetadata> {
-        let (_v, manifest) = self.load_current(project, table).await?;
-        if !manifest.snapshots.iter().any(|s| s.id == snapshot_id) {
-            return Err(BasinError::not_found(format!(
-                "{project}/{table}: snapshot {snapshot_id} not in history"
-            )));
-        }
-        // Collect orphan paths added by discarded snapshots before pruning.
-        let next = self
-            .mutate_manifest(project, table, |m| {
-                let mut orphans: Vec<String> = Vec::new();
-                for s in m.snapshots.iter().filter(|s| s.id > snapshot_id) {
-                    for f in &s.data_files {
-                        orphans.push(f.path.clone());
-                    }
-                }
-                m.gc_orphan_paths.extend(orphans);
-                m.snapshots.retain(|s| s.id <= snapshot_id);
-                m.current_snapshot = snapshot_id;
-            })
-            .await?;
-        Ok(next.to_metadata(project, table))
+        let qtable = self.resolve_qtable(project, table).await;
+        self.rollback_to_snapshot_q(project, &qtable, snapshot_id)
+            .await
     }
 
     async fn set_partition_spec(
@@ -856,7 +1073,8 @@ impl Catalog for ObjectStoreCatalog {
         table: &TableName,
         spec: PartitionSpec,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| m.partition_spec = spec.clone())
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| m.partition_spec = spec.clone())
             .await?;
         Ok(())
     }
@@ -868,7 +1086,8 @@ impl Catalog for ObjectStoreCatalog {
         rls_enabled: bool,
         policies: Vec<Policy>,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| {
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| {
             m.rls_enabled = rls_enabled;
             m.policies = policies.clone();
         })
@@ -883,7 +1102,8 @@ impl Catalog for ObjectStoreCatalog {
         cold_after_seconds: Option<u64>,
         cold_age_column: Option<String>,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| {
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| {
             m.cold_after_seconds = cold_after_seconds;
             m.cold_age_column = cold_age_column.clone();
         })
@@ -897,7 +1117,8 @@ impl Catalog for ObjectStoreCatalog {
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| m.bloom_filter_columns = columns.clone())
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| m.bloom_filter_columns = columns.clone())
             .await?;
         Ok(())
     }
@@ -908,7 +1129,8 @@ impl Catalog for ObjectStoreCatalog {
         table: &TableName,
         rows: Option<usize>,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| m.row_group_rows = rows)
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| m.row_group_rows = rows)
             .await?;
         Ok(())
     }
@@ -919,7 +1141,8 @@ impl Catalog for ObjectStoreCatalog {
         table: &TableName,
         schema: Schema,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| m.schema = schema.clone())
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| m.schema = schema.clone())
             .await?;
         Ok(())
     }
@@ -930,7 +1153,8 @@ impl Catalog for ObjectStoreCatalog {
         table: &TableName,
         def: Option<CvDef>,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| m.continuous_aggregate = def.clone())
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| m.continuous_aggregate = def.clone())
             .await?;
         Ok(())
     }
@@ -941,7 +1165,8 @@ impl Catalog for ObjectStoreCatalog {
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| m.cluster_columns = columns.clone())
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| m.cluster_columns = columns.clone())
             .await?;
         Ok(())
     }
@@ -952,7 +1177,8 @@ impl Catalog for ObjectStoreCatalog {
         table: &TableName,
         format: TableFileFormat,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| m.file_format = format)
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| m.file_format = format)
             .await?;
         Ok(())
     }
@@ -963,7 +1189,8 @@ impl Catalog for ObjectStoreCatalog {
         table: &TableName,
         columns: Vec<String>,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| {
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| {
             m.global_sort_order = if columns.is_empty() {
                 None
             } else {
@@ -980,7 +1207,8 @@ impl Catalog for ObjectStoreCatalog {
         table: &TableName,
         size: Option<u32>,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| m.row_block_size = size)
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| m.row_block_size = size)
             .await?;
         Ok(())
     }
@@ -991,7 +1219,8 @@ impl Catalog for ObjectStoreCatalog {
         table: &TableName,
         value: Option<bool>,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| m.adaptive_sort_override = value)
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| m.adaptive_sort_override = value)
             .await?;
         Ok(())
     }
@@ -1002,7 +1231,8 @@ impl Catalog for ObjectStoreCatalog {
         table: &TableName,
         region: Option<String>,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| m.home_region = region.clone())
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| m.home_region = region.clone())
             .await?;
         Ok(())
     }
@@ -1015,7 +1245,8 @@ impl Catalog for ObjectStoreCatalog {
         check_constraints: Vec<CheckConstraint>,
         foreign_keys: Vec<ForeignKeyDef>,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| {
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| {
             m.pk_columns = pk_columns.clone();
             m.check_constraints = check_constraints.clone();
             m.foreign_keys = foreign_keys.clone();
@@ -1030,7 +1261,8 @@ impl Catalog for ObjectStoreCatalog {
         table: &TableName,
         unique_constraints: Vec<UniqueConstraint>,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| {
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| {
             m.unique_constraints = unique_constraints.clone();
         })
         .await?;
@@ -1059,56 +1291,22 @@ impl Catalog for ObjectStoreCatalog {
         access_method: &str,
         opclass: Option<&str>,
     ) -> Result<()> {
-        if columns.is_empty() {
-            return Err(BasinError::InvalidSchema(
-                "create_index: column list cannot be empty".into(),
-            ));
-        }
-        // Validate columns + duplicate name against the current manifest first
-        // so we return the right error without burning a version.
-        let (_v, manifest) = self.load_current(project, table).await?;
-        for col in columns {
-            if manifest.schema.field_with_name(col).is_err() {
-                return Err(BasinError::InvalidSchema(format!(
-                    "create_index: column {col:?} not in table {project}/{table} schema"
-                )));
-            }
-        }
-        if manifest.indexes.iter().any(|i| i.name == name) {
-            if if_not_exists {
-                return Ok(());
-            }
-            return Err(BasinError::catalog(format!(
-                "create_index: {project}/{table}: index {name:?} already exists"
-            )));
-        }
-        let idx = SecondaryIndex {
-            name: name.to_string(),
-            columns: columns.to_vec(),
-            access_method: access_method.to_string(),
-            opclass: opclass.map(|s| s.to_string()),
-        };
-        self.mutate_manifest(project, table, |m| {
-            if !m.indexes.iter().any(|i| i.name == idx.name) {
-                m.indexes.push(idx.clone());
-            }
-        })
-        .await?;
-        Ok(())
+        let qtable = self.resolve_qtable(project, table).await;
+        self.create_index_q(
+            project,
+            &qtable,
+            name,
+            columns,
+            if_not_exists,
+            access_method,
+            opclass,
+        )
+        .await
     }
 
     async fn drop_index(&self, project: &ProjectId, table: &TableName, name: &str) -> Result<()> {
-        let (_v, manifest) = self.load_current(project, table).await?;
-        if !manifest.indexes.iter().any(|i| i.name == name) {
-            return Err(BasinError::not_found(format!(
-                "{project}/{table}: index {name:?}"
-            )));
-        }
-        self.mutate_manifest(project, table, |m| {
-            m.indexes.retain(|i| i.name != name);
-        })
-        .await?;
-        Ok(())
+        let qtable = self.resolve_qtable(project, table).await;
+        self.drop_index_q(project, &qtable, name).await
     }
 
     async fn promote_jsonb_path(
@@ -1118,7 +1316,8 @@ impl Catalog for ObjectStoreCatalog {
         source_col: &str,
         json_key: &str,
     ) -> Result<()> {
-        self.mutate_manifest(project, table, |m| {
+        let qtable = self.resolve_qtable(project, table).await;
+        self.mutate_manifest(project, &qtable, |m| {
             let exists = m
                 .promoted_jsonb_paths
                 .iter()
@@ -1200,6 +1399,335 @@ impl Catalog for ObjectStoreCatalog {
     async fn get_project_rate_limit_qps(&self, project: &ProjectId) -> Result<Option<u32>> {
         self.get_project_json::<u32>(project, "rate_limit_qps.json")
             .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema-qualified API (ADR 0022). Unlike the trait defaults (which reject
+    // any non-public schema), these honour the caller's schema directly so
+    // reserved-schema tables (e.g. `auth.users`) are first-class. Each forwards
+    // to the same `*_q` worker the bare methods use, keying by `(project,
+    // schema, table)`.
+    // -----------------------------------------------------------------------
+
+    async fn create_table_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        schema: Arc<Schema>,
+    ) -> Result<TableMetadata> {
+        self.create_table_q(project, qtable, schema.as_ref()).await
+    }
+
+    async fn load_table_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<TableMetadata> {
+        self.load_table_q(project, qtable).await
+    }
+
+    async fn drop_table_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<()> {
+        self.drop_table_q(project, qtable).await
+    }
+
+    async fn rename_table_qualified(
+        &self,
+        project: &ProjectId,
+        old: &QualifiedTableName,
+        new: &QualifiedTableName,
+    ) -> Result<()> {
+        self.rename_table_q(project, old, new).await
+    }
+
+    async fn list_tables_qualified(&self, project: &ProjectId) -> Result<Vec<QualifiedTableName>> {
+        // Enumerate every schema under the project prefix; drop tombstoned
+        // tables. Returns correctly-qualified names (schema carried verbatim),
+        // matching `InMemoryCatalog::list_tables_qualified`.
+        let all = self.list_schema_table_names(project).await?;
+        let mut out = Vec::new();
+        for qt in all {
+            match self.load_current(project, &qt).await {
+                Ok(_) => out.push(qt),
+                Err(BasinError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    async fn append_data_files_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        expected_snapshot: SnapshotId,
+        files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata> {
+        self.commit_snapshot(
+            project,
+            qtable,
+            expected_snapshot,
+            SnapshotOperation::Append,
+            Vec::new(),
+            files,
+        )
+        .await
+    }
+
+    async fn replace_data_files_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        expected_snapshot: SnapshotId,
+        removed_paths: Vec<String>,
+        added_files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata> {
+        self.commit_snapshot(
+            project,
+            qtable,
+            expected_snapshot,
+            SnapshotOperation::Replace,
+            removed_paths,
+            added_files,
+        )
+        .await
+    }
+
+    async fn list_snapshots_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<Vec<Snapshot>> {
+        self.list_snapshots_q(project, qtable).await
+    }
+
+    async fn fork_table_qualified(
+        &self,
+        project: &ProjectId,
+        src: &QualifiedTableName,
+        dst: &QualifiedTableName,
+    ) -> Result<TableMetadata> {
+        // Copy the source manifest verbatim (paths included; no bytes copied)
+        // into a fresh genesis-versioned manifest at the destination key.
+        let (_v, manifest) = self.load_current(project, src).await?;
+        match self.load_current(project, dst).await {
+            Ok(_) => {
+                return Err(BasinError::catalog(format!(
+                    "fork_table: {project}/{dst} already exists"
+                )))
+            }
+            Err(BasinError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        let mut forked = (*manifest).clone();
+        forked.version = 0;
+        forked.dropped = false;
+        // A fork starts with a clean GC orphan list.
+        forked.gc_orphan_paths = Vec::new();
+        if !self.put_manifest_create(project, dst, 0, &forked).await? {
+            let v = self.resolve_head_version(project, dst).await?.unwrap_or(0);
+            forked.version = v + 1;
+            if !self
+                .put_manifest_create(project, dst, forked.version, &forked)
+                .await?
+            {
+                return Err(BasinError::catalog(format!(
+                    "fork_table: {project}/{dst} lost create race"
+                )));
+            }
+        }
+        let meta = forked.to_metadata(project, &dst.name);
+        self.after_commit(project, dst, forked.version, forked).await;
+        Ok(meta)
+    }
+
+    async fn fork_table_to_project(
+        &self,
+        src_project: &ProjectId,
+        src_table: &TableName,
+        dst_project: &ProjectId,
+        dst_table: &TableName,
+    ) -> Result<TableMetadata> {
+        let qsrc = self.resolve_qtable(src_project, src_table).await;
+        let qdst = QualifiedTableName::in_public(dst_table.clone());
+        let (_v, manifest) = self.load_current(src_project, &qsrc).await?;
+        match self.load_current(dst_project, &qdst).await {
+            Ok(_) => {
+                return Err(BasinError::catalog(format!(
+                    "fork_table_to_project: {dst_project}/{qdst} already exists"
+                )))
+            }
+            Err(BasinError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        let mut forked = (*manifest).clone();
+        forked.version = 0;
+        forked.dropped = false;
+        forked.gc_orphan_paths = Vec::new();
+        if !self
+            .put_manifest_create(dst_project, &qdst, 0, &forked)
+            .await?
+        {
+            let v = self
+                .resolve_head_version(dst_project, &qdst)
+                .await?
+                .unwrap_or(0);
+            forked.version = v + 1;
+            if !self
+                .put_manifest_create(dst_project, &qdst, forked.version, &forked)
+                .await?
+            {
+                return Err(BasinError::catalog(format!(
+                    "fork_table_to_project: {dst_project}/{qdst} lost create race"
+                )));
+            }
+        }
+        let meta = forked.to_metadata(dst_project, dst_table);
+        self.after_commit(dst_project, &qdst, forked.version, forked)
+            .await;
+        Ok(meta)
+    }
+
+    async fn rollback_to_snapshot_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        snapshot_id: SnapshotId,
+    ) -> Result<TableMetadata> {
+        self.rollback_to_snapshot_q(project, qtable, snapshot_id)
+            .await
+    }
+
+    async fn set_partition_spec_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        spec: PartitionSpec,
+    ) -> Result<()> {
+        self.mutate_manifest(project, qtable, |m| m.partition_spec = spec.clone())
+            .await?;
+        Ok(())
+    }
+
+    async fn set_rls_state_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        rls_enabled: bool,
+        policies: Vec<Policy>,
+    ) -> Result<()> {
+        self.mutate_manifest(project, qtable, |m| {
+            m.rls_enabled = rls_enabled;
+            m.policies = policies.clone();
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn set_tier_policy_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        cold_after_seconds: Option<u64>,
+        cold_age_column: Option<String>,
+    ) -> Result<()> {
+        self.mutate_manifest(project, qtable, |m| {
+            m.cold_after_seconds = cold_after_seconds;
+            m.cold_age_column = cold_age_column.clone();
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn set_bloom_filter_columns_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        self.mutate_manifest(project, qtable, |m| m.bloom_filter_columns = columns.clone())
+            .await?;
+        Ok(())
+    }
+
+    async fn set_row_group_rows_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        rows: Option<usize>,
+    ) -> Result<()> {
+        self.mutate_manifest(project, qtable, |m| m.row_group_rows = rows)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_schema_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        schema: Schema,
+    ) -> Result<()> {
+        self.mutate_manifest(project, qtable, |m| m.schema = schema.clone())
+            .await?;
+        Ok(())
+    }
+
+    async fn set_continuous_aggregate_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        def: Option<CvDef>,
+    ) -> Result<()> {
+        self.mutate_manifest(project, qtable, |m| m.continuous_aggregate = def.clone())
+            .await?;
+        Ok(())
+    }
+
+    async fn set_cluster_columns_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        columns: Vec<String>,
+    ) -> Result<()> {
+        self.mutate_manifest(project, qtable, |m| m.cluster_columns = columns.clone())
+            .await?;
+        Ok(())
+    }
+
+    async fn set_home_region_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        region: Option<String>,
+    ) -> Result<()> {
+        self.mutate_manifest(project, qtable, |m| m.home_region = region.clone())
+            .await?;
+        Ok(())
+    }
+
+    async fn create_index_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        name: &str,
+        columns: &[String],
+        if_not_exists: bool,
+    ) -> Result<()> {
+        self.create_index_q(project, qtable, name, columns, if_not_exists, "btree", None)
+            .await
+    }
+
+    async fn drop_index_qualified(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        name: &str,
+    ) -> Result<()> {
+        self.drop_index_q(project, qtable, name).await
     }
 }
 
@@ -2109,5 +2637,169 @@ mod tests {
         let (owner2, epoch2) = lease_a.owner_of(&p, part).await.unwrap().unwrap();
         assert_eq!(owner2, "nodeB");
         assert_eq!(epoch2, 2);
+    }
+
+    // --- Test: schema-qualified isolation (ADR 0022) ----------------------
+    //
+    // The same bare table name in two different schemas must be completely
+    // independent: separate manifests, separate snapshot chains, no collision.
+    // This guards the deploy-blocker case where `BASIN_AUTH_ENABLED=1` keeps
+    // its system tables in the reserved `auth` schema while user tables live in
+    // `public`.
+    #[tokio::test]
+    async fn public_and_auth_same_name_are_independent() {
+        let c = cat();
+        let p = ProjectId::new();
+        c.create_namespace(&p).await.unwrap();
+
+        let users = TableName::new("users").unwrap();
+        let pub_users = QualifiedTableName::in_public(users.clone());
+        let auth_users =
+            QualifiedTableName::new(SchemaName::new("auth").unwrap(), users.clone());
+
+        // Two tables, SAME bare name, DIFFERENT schemas, over ONE store.
+        c.create_table_qualified(&p, &pub_users, Arc::new(schema()))
+            .await
+            .unwrap();
+        c.create_table_qualified(&p, &auth_users, Arc::new(schema()))
+            .await
+            .unwrap();
+
+        // Drive their snapshot chains to DIFFERENT lengths so a collision would
+        // be immediately visible.
+        let mut expected = SnapshotId::GENESIS;
+        for i in 0..3 {
+            let m = c
+                .append_data_files_qualified(
+                    &p,
+                    &pub_users,
+                    expected,
+                    vec![file(&format!("pub{i}.parquet"), 10)],
+                )
+                .await
+                .unwrap();
+            expected = m.current_snapshot;
+        }
+        let mut expected_auth = SnapshotId::GENESIS;
+        let m = c
+            .append_data_files_qualified(
+                &p,
+                &auth_users,
+                expected_auth,
+                vec![file("auth0.parquet", 99)],
+            )
+            .await
+            .unwrap();
+        expected_auth = m.current_snapshot;
+        let _ = expected_auth;
+
+        // Each resolves to ITS OWN current snapshot and live file set.
+        let pub_meta = c.load_table_qualified(&p, &pub_users).await.unwrap();
+        let auth_meta = c.load_table_qualified(&p, &auth_users).await.unwrap();
+        assert_eq!(
+            pub_meta.current_snapshot,
+            SnapshotId(3),
+            "public.users advanced 3 snapshots independently"
+        );
+        assert_eq!(
+            auth_meta.current_snapshot,
+            SnapshotId(1),
+            "auth.users advanced exactly 1 snapshot — NOT contaminated by public"
+        );
+        assert_eq!(pub_meta.live_data_files().len(), 3);
+        assert_eq!(auth_meta.live_data_files().len(), 1);
+        // The file paths prove the manifests are physically distinct.
+        assert!(pub_meta
+            .live_data_files()
+            .iter()
+            .all(|f| f.path.starts_with("pub")));
+        assert_eq!(auth_meta.live_data_files()[0].path, "auth0.parquet");
+
+        // list_tables_qualified returns BOTH, correctly schema-qualified.
+        let mut listed = c.list_tables_qualified(&p).await.unwrap();
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec![auth_users.clone(), pub_users.clone()],
+            "both schemas enumerated with correct qualification"
+        );
+        // The back-compat bare list_tables returns ONLY the public-schema name.
+        assert_eq!(
+            c.list_tables(&p).await.unwrap(),
+            vec![users.clone()],
+            "bare list_tables stays public-only for back-compat"
+        );
+
+        // Dropping the auth-schema table leaves the public one untouched.
+        c.drop_table_qualified(&p, &auth_users).await.unwrap();
+        assert!(matches!(
+            c.load_table_qualified(&p, &auth_users).await,
+            Err(BasinError::NotFound(_))
+        ));
+        let pub_after = c.load_table_qualified(&p, &pub_users).await.unwrap();
+        assert_eq!(
+            pub_after.current_snapshot,
+            SnapshotId(3),
+            "dropping auth.users did not affect public.users"
+        );
+        // After the auth drop, only public.users remains in the qualified list.
+        assert_eq!(
+            c.list_tables_qualified(&p).await.unwrap(),
+            vec![pub_users.clone()]
+        );
+    }
+
+    // Bare-name resolution finds a unique non-public table (mirrors the
+    // InMemory `resolve_qtable` fallback) — so the executor can address
+    // `auth.users` by its stripped bare name when no `public.users` exists.
+    #[tokio::test]
+    async fn bare_name_resolves_unique_non_public_schema() {
+        let c = cat();
+        let p = ProjectId::new();
+        c.create_namespace(&p).await.unwrap();
+        let t = TableName::new("sessions").unwrap();
+        let auth_t = QualifiedTableName::new(SchemaName::new("auth").unwrap(), t.clone());
+        c.create_table_qualified(&p, &auth_t, Arc::new(schema()))
+            .await
+            .unwrap();
+        // No public.sessions exists → bare load resolves to auth.sessions.
+        let loaded = c.load_table(&p, &t).await.unwrap();
+        assert_eq!(loaded.current_snapshot, SnapshotId::GENESIS);
+    }
+
+    // fork_table_qualified copies across schemas without aliasing the source.
+    #[tokio::test]
+    async fn fork_qualified_across_schemas_is_independent() {
+        let c = cat();
+        let p = ProjectId::new();
+        c.create_namespace(&p).await.unwrap();
+        let src = QualifiedTableName::in_public(TableName::new("src").unwrap());
+        let dst = QualifiedTableName::new(
+            SchemaName::new("staging").unwrap(),
+            TableName::new("src").unwrap(),
+        );
+        c.create_table_qualified(&p, &src, Arc::new(schema()))
+            .await
+            .unwrap();
+        let m = c
+            .append_data_files_qualified(&p, &src, SnapshotId::GENESIS, vec![file("a.parquet", 5)])
+            .await
+            .unwrap();
+        c.fork_table_qualified(&p, &src, &dst).await.unwrap();
+        // Fork carries the source's live files.
+        let forked = c.load_table_qualified(&p, &dst).await.unwrap();
+        assert_eq!(forked.live_data_files().len(), 1);
+        // Mutating the fork does not touch the source.
+        c.append_data_files_qualified(&p, &dst, m.current_snapshot, vec![file("b.parquet", 7)])
+            .await
+            .unwrap();
+        let src_after = c.load_table_qualified(&p, &src).await.unwrap();
+        assert_eq!(
+            src_after.live_data_files().len(),
+            1,
+            "source unchanged after fork mutation"
+        );
+        let dst_after = c.load_table_qualified(&p, &dst).await.unwrap();
+        assert_eq!(dst_after.live_data_files().len(), 2);
     }
 }

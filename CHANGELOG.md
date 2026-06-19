@@ -8,6 +8,38 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-20 — Object-store shared catalog is schema-qualified (ADR 0022)
+
+The Basin-native object-store catalog (`BASIN_CATALOG_BACKEND=object_store`)
+now keys table manifests by `(project, schema, table)` instead of assuming a
+hardcoded `public` schema. Previously every manifest landed at
+`{prefix}/{project}/public/{table}/…`, so a non-`public` schema was
+unaddressable — and the deployed engine runs `BASIN_AUTH_ENABLED=1`, whose
+system tables live in the reserved `auth` schema (ADR 0022). Enabling the
+object-store backend would have made those `auth` tables collide with / shadow
+`public`, breaking auth + provisioning at boot.
+
+- **Schema-qualified key layout.** Manifests, the `HEAD` pointer, and the
+  per-table cache now key on `{prefix}/{project}/{schema}/{table}/v{N}.json`,
+  mirroring `PostgresCatalog`'s `(project_id, schema_name, table_name)` primary
+  key. The same bare table name in two schemas (`public.users` vs `auth.users`)
+  has fully independent manifests and snapshot chains.
+- **Schema-aware API.** `ObjectStoreCatalog` now implements every `*_qualified`
+  trait method (`create_table_qualified`, `load_table_qualified`,
+  `append_data_files_qualified`, the `set_*_qualified` DDL setters,
+  `create_index_qualified`, `fork_table_qualified`, `fork_table_to_project`,
+  etc.) honouring the caller's schema, instead of inheriting the trait defaults
+  that reject any non-`public` schema. The bare-`TableName` methods resolve a
+  schema the same way `InMemoryCatalog` does (try `public`, else a unique
+  bare-name match across schemas), so executor DML keeps addressing
+  system-schema tables by stripped bare name.
+- **`list_tables` across schemas.** `list_tables_qualified` enumerates all
+  schemas under the project prefix and returns correctly-qualified names; the
+  back-compat bare `list_tables` still returns public-schema names only.
+- No on-disk migration: the object-store catalog has never been deployed, so
+  the key layout was changed freely (no manifest-version migration code exists
+  to update).
+
 ## 2026-06-19 — Fly.io self-id derivation + dynamic peer discovery for partition forwarding (#28)
 
 Multi-node partition forwarding now works on Fly.io, where (a) all machines in
