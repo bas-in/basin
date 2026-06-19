@@ -2768,6 +2768,14 @@ impl ShardImpl for InProcessShard {
         &self.cfg.wal
     }
 
+    fn replica_id(&self) -> &str {
+        &self.cfg.replica_id
+    }
+
+    fn lease_registry(&self) -> Option<&Arc<dyn basin_catalog::LeaseRegistry>> {
+        self.cfg.lease_registry.as_ref()
+    }
+
     fn set_top_pattern_provider(&self, provider: Arc<dyn TopPatternProvider>) {
         let mut guard = self
             .top_pattern_provider

@@ -348,6 +348,21 @@ pub(crate) struct EngineInner {
     /// `event_sinks` attach-after-construction pattern.
     pub(crate) write_forwarder: RwLock<Option<Arc<dyn crate::region::WriteForwarder>>>,
 
+    /// #28 multi-node bulk ingest: deterministic per-partition owner resolver.
+    /// Built once at engine startup from `BASIN_SHARD_PEERS` + the shard's
+    /// replica id. A local-only router (unset / single peer) makes
+    /// `write_batch_fanout` behave byte-for-byte as before. `RwLock` mirrors the
+    /// attach-after-construction pattern of the sibling forwarders.
+    pub(crate) partition_router: RwLock<crate::partition_router::PartitionRouter>,
+
+    /// #28 multi-node bulk ingest: transport used to forward an Arrow batch to
+    /// the node that owns its target partition. `None` (default) keeps every
+    /// write local; the server installs `HttpPartitionForwardClient` when
+    /// `BASIN_FORWARD_SECRET` + a multi-peer `BASIN_SHARD_PEERS` are configured,
+    /// and the two-engine test injects an in-process stub.
+    pub(crate) partition_forward_client:
+        RwLock<Option<Arc<dyn crate::write_forwarder::PartitionForwardClient>>>,
+
     /// Optional handle to the realtime channel + budget state exposed via the
     /// `basin_realtime.channels` and `basin_realtime.stats` virtual tables.
     ///
@@ -409,6 +424,17 @@ impl Engine {
         let memtable_registry = Arc::new(basin_hottier::MemTableRegistry::new_with_config(
             basin_hottier::MemTableConfig::from_env(),
         ));
+        // #28 multi-node bulk ingest: build the per-partition owner resolver
+        // from BASIN_SHARD_PEERS + this node's lease holder id (the shard's
+        // replica_id, which the dev deploy sets to this node's own peer URL).
+        // Unset / single-peer → a local-only router (write_batch_fanout stays
+        // byte-for-byte identical to single-node).
+        let self_id = cfg
+            .shard
+            .as_ref()
+            .map(|s| s.replica_id().to_string())
+            .unwrap_or_default();
+        let partition_router = crate::partition_router::PartitionRouter::from_env(&self_id);
         let inner = Arc::new(EngineInner {
             cfg,
             vector_routing_count: AtomicU64::new(0),
@@ -475,6 +501,11 @@ impl Engine {
             // Multi-region: no forwarder by default (OSS fail-loud). The
             // cloud-private layer attaches one at startup.
             write_forwarder: RwLock::new(None),
+            // #28: per-partition owner resolver (local-only unless
+            // BASIN_SHARD_PEERS configures a multi-node peer list) + the
+            // forward transport (installed by the server / injected by tests).
+            partition_router: RwLock::new(partition_router),
+            partition_forward_client: RwLock::new(None),
             // Realtime channel source: unset by default. Callers that wire up
             // basin-realtime's RealtimeSink call attach_realtime_source to feed
             // live data into basin_realtime.channels / basin_realtime.stats.
@@ -655,6 +686,63 @@ impl Engine {
             .write_forwarder
             .read()
             .expect("write_forwarder lock poisoned")
+            .clone()
+    }
+
+    /// Register the per-partition forward transport (#28 multi-node bulk
+    /// ingest). The server installs `HttpPartitionForwardClient` at startup
+    /// when forwarding is configured; the two-engine test injects an in-process
+    /// stub. Last writer wins.
+    pub fn attach_partition_forward_client(
+        &self,
+        client: Arc<dyn crate::write_forwarder::PartitionForwardClient>,
+    ) {
+        *self
+            .inner
+            .partition_forward_client
+            .write()
+            .expect("partition_forward_client lock poisoned") = Some(client);
+    }
+
+    /// Override the partition owner resolver (#28). The server builds one from
+    /// the environment at startup; the two-engine test sets an explicit peer
+    /// list so partitions split deterministically between the two engines.
+    pub fn attach_partition_router(&self, router: crate::partition_router::PartitionRouter) {
+        *self
+            .inner
+            .partition_router
+            .write()
+            .expect("partition_router lock poisoned") = router;
+    }
+
+    /// This engine's shard handle, if configured. Exposed so the REST
+    /// partition-write receive route (#28 multi-node bulk ingest) can land a
+    /// forwarded Arrow batch directly into the owning partition via
+    /// `shard.get(project, partition).write_batch_opts(...)`. Returns `None`
+    /// in shardless deployments (the receive route then 503s).
+    pub fn shard(&self) -> Option<basin_shard::Shard> {
+        self.inner.cfg.shard.clone()
+    }
+
+    /// Snapshot of the per-partition owner resolver. Cloned so the caller
+    /// resolves owners without holding the lock.
+    pub(crate) fn partition_router(&self) -> crate::partition_router::PartitionRouter {
+        self.inner
+            .partition_router
+            .read()
+            .expect("partition_router lock poisoned")
+            .clone()
+    }
+
+    /// The per-partition forward transport, if installed. Cloned `Arc` so the
+    /// caller can `.await` the forward without holding the lock.
+    pub(crate) fn partition_forward_client(
+        &self,
+    ) -> Option<Arc<dyn crate::write_forwarder::PartitionForwardClient>> {
+        self.inner
+            .partition_forward_client
+            .read()
+            .expect("partition_forward_client lock poisoned")
             .clone()
     }
 
@@ -1731,7 +1819,12 @@ mod reactor_sink;
 pub mod region;
 /// Multi-region v0.2 (ADR 0009): concrete `WriteForwarder` impls (fly-replay /
 /// http-forward) compiled into the engine binary and registered at startup.
+pub mod partition_router;
 pub mod write_forwarder;
+/// #28 two-engine integration test for transparent per-partition write
+/// forwarding (compiled only under `cfg(test)`).
+#[cfg(test)]
+mod partition_forward_integration_test;
 mod regex_udf;
 mod rls;
 mod schema_ddl;

@@ -113,6 +113,9 @@ geo.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio-test.workspace = true
+# Construct deterministic ProjectIds (ProjectId::from_ulid) in partition-router
+# owner-resolution unit tests.
+ulid.workspace = true
 # simd-json — SIMD-accelerated JSON parser (port of simdjson). Evaluated as a
 # faster replacement for serde_json in the JSONB parse hot path
 # (jsonb_udf::jsonb_to_value) but NOT adopted: it mutates its input in place

@@ -8,6 +8,58 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-19 — Transparent per-partition write forwarding (#28 multi-node bulk ingest)
+
+- **A bulk COPY/ingest landing on any node now writes each fan-out partition on
+  the node that OWNS it, transparently to the client.** N engine nodes sharing
+  one project's object-store catalog + lease registry split a table's fan-out
+  partitions across the cluster — each partition has ONE deterministic owner —
+  so the write fan-out spreads compaction lanes across nodes instead of pinning
+  them to whichever node the client connected to.
+  - **Owner resolution** (`basin_engine::partition_router::PartitionRouter`)
+    hashes `(project, partition_id)` with a fixed, seedless **FNV-1a** (NOT
+    `DefaultHasher`, which is per-process randomized) modulo the ordered
+    `BASIN_SHARD_PEERS` list, so every node agrees on the owner for all time.
+    Self is identified by `BASIN_REPLICA_ID`.
+  - **Back-compat is byte-for-byte:** unset / single-entry `BASIN_SHARD_PEERS`
+    makes every partition owned by self, so `executor::write_batch_fanout` takes
+    the existing local path unchanged (asserted by a back-compat test).
+  - **The seam:** in `write_batch_fanout`, after the stripe partition is chosen,
+    a non-self owner forwards the already-constraint-checked Arrow batch to that
+    peer's `POST /internal/v1/partition-write` endpoint and returns the owner's
+    rowcount. A transient lease race on the owner
+    (`lease_handoff_in_progress` / `lease_not_held`) is retried exactly once
+    after re-resolving the owner; otherwise the error is surfaced — rows are
+    never silently dropped.
+  - **The receiver** (`basin-rest` `POST /internal/v1/partition-write`) mounts
+    only when `BASIN_FORWARD_SECRET` is set (fail-closed, mirroring
+    `/internal/v1/forward`), checks the shared secret in constant time, rejects
+    any `hop != 1` (loop guard — the receiver never re-forwards), decodes the
+    Arrow IPC body, and does a RAW partition write
+    (`shard.get(project, partition).write_batch_opts(table, batch, durable=true)`).
+    Constraints are NOT re-checked: PK/UNIQUE ran on the sender across ALL
+    partitions before fan-out, and the lease CAS on `shard.get` keeps the owner
+    the single writer.
+  - **Wire format:** Arrow IPC RecordBatch in the body (no JSON/base64 envelope
+    — bulk batches are large); `(project, table, partition_id, hop)` in
+    `x-basin-partition-*` headers; rowcount returned as a bare JSON number. The
+    engine client (`HttpPartitionForwardClient`) and the receiver share the
+    encode/decode helpers (`encode_partition_batch` / `decode_partition_batch`).
+  - **New tests:** `partition_router` owner-resolution unit tests (cross-process
+    agreement, pinned FNV-1a value, even distribution, self-not-in-list);
+    receiver hop-guard + secret-check tests; and the headline two-engine
+    integration test `two_engine_partition_forward_lands_on_owner_and_scans_cross_node`
+    (two in-process engines/shards over one shared `InMemory` store + one shared
+    catalog/lease registry: rows whose owner is B physically land on B and not
+    A, the lease for each partition is held by exactly its owner, the total
+    rowcount is exact, and a flushed cross-node `SELECT count(*)` from EITHER
+    engine sees all rows), plus `back_compat_no_peers_keeps_fanout_local`.
+  - **Out of scope / honest gaps:** rebalance on peer-list change (a partition's
+    owner moves when peers are added/removed; no live migration of already-
+    written data — a follow-up). Non-`public`-schema tables are unsupported by
+    the object-store catalog (carried gap). The forwarded request is counted
+    against the home node's connection ceiling like any HTTP request.
+
 ## 2026-06-19 — Wire the object-store shared catalog into the deployed engine server
 
 - **`BASIN_CATALOG=object_store` now selects the Basin-native shared catalog +

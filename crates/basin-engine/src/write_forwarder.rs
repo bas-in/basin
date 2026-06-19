@@ -429,6 +429,155 @@ impl ForwardClient for HttpForwardClient {
     }
 }
 
+// ─── per-partition write forwarding (#28 multi-node bulk ingest) ────────────
+//
+// Distinct from the region forwarder above (which carries verbatim SQL to a
+// project's HOME region). This path forwards an already-parsed, already-
+// constraint-checked Arrow RecordBatch to the node that OWNS a specific
+// partition, so a bulk COPY landing on node A but fanning to a partition owned
+// by node B is written on B. See `crate::partition_router` for owner
+// resolution and `executor::write_batch_fanout` for the seam.
+
+/// Header carrying the destination project ULID on a `partition-write`.
+pub const PARTITION_FORWARD_PROJECT_HEADER: &str = "x-basin-partition-project";
+/// Header carrying the destination table name on a `partition-write`.
+pub const PARTITION_FORWARD_TABLE_HEADER: &str = "x-basin-partition-table";
+/// Header carrying the destination partition id on a `partition-write`.
+pub const PARTITION_FORWARD_PARTITION_HEADER: &str = "x-basin-partition-id";
+/// Header carrying the forward hop count. A forwarded batch carries `1`; the
+/// receiver MUST write locally and never re-forward (loop guard — prevents
+/// A→B→A). Absent/`0` means an origin (client) request.
+pub const PARTITION_FORWARD_HOP_HEADER: &str = "x-basin-partition-hop";
+
+/// The receive path for forwarded partition writes (Arrow IPC body). Mounted on
+/// the same fail-closed condition as [`FORWARD_RECEIVE_PATH`] (only when
+/// `BASIN_FORWARD_SECRET` is set).
+pub const PARTITION_FORWARD_RECEIVE_PATH: &str = "/internal/v1/partition-write";
+
+/// The boundary between owner resolution (tested) and the live wire round trip
+/// (deployment-validated) for partition-write forwarding. A real impl POSTs the
+/// Arrow-IPC-encoded batch to the owner node's
+/// [`PARTITION_FORWARD_RECEIVE_PATH`]; the two-engine integration test injects
+/// an in-process stub that delivers straight into engine B's handler.
+#[async_trait]
+pub trait PartitionForwardClient: Send + Sync + 'static {
+    /// Forward `batch` to the partition owner at `peer_base_url`, to be written
+    /// into `(project, table, partition_id)`. Returns the rows written. The
+    /// receiver is, by construction, the partition's lease owner, so it writes
+    /// directly and does NOT re-run constraints (they ran on the sender).
+    async fn forward_partition_write(
+        &self,
+        peer_base_url: &str,
+        project: ProjectId,
+        table: &str,
+        partition_id: &str,
+        batch: RecordBatch,
+    ) -> Result<u64>;
+}
+
+/// The real partition-write transport: POSTs an Arrow IPC stream (schema + one
+/// RecordBatch) to the owner node's [`PARTITION_FORWARD_RECEIVE_PATH`] over 6PN
+/// HTTP, authenticated by the shared secret in [`FORWARD_SECRET_HEADER`]. The
+/// destination `(project, table, partition_id)` travel in headers; the body is
+/// raw IPC bytes (no base64 / JSON envelope — bulk batches are large). The
+/// `hop=1` header tells the receiver this is a forwarded write it must land
+/// locally without re-forwarding.
+pub struct HttpPartitionForwardClient {
+    http: reqwest::Client,
+    secret: String,
+}
+
+impl HttpPartitionForwardClient {
+    pub fn new(http: reqwest::Client, secret: impl Into<String>) -> Self {
+        Self {
+            http,
+            secret: secret.into(),
+        }
+    }
+
+    pub fn with_secret(secret: impl Into<String>) -> Self {
+        Self::new(reqwest::Client::new(), secret.into())
+    }
+
+    /// Full receive URL for `peer_base_url`. The base URL may already carry an
+    /// `http://` scheme (the `BASIN_SHARD_PEERS` format) or be bare host:port;
+    /// we only prepend `http://` when no scheme is present (6PN is plaintext).
+    pub fn receive_url(peer_base_url: &str) -> String {
+        if peer_base_url.starts_with("http://") || peer_base_url.starts_with("https://") {
+            format!("{peer_base_url}{PARTITION_FORWARD_RECEIVE_PATH}")
+        } else {
+            format!("http://{peer_base_url}{PARTITION_FORWARD_RECEIVE_PATH}")
+        }
+    }
+}
+
+/// Encode one `RecordBatch` as a self-describing Arrow IPC stream (schema +
+/// batch). Shared by the client (send) and the receive route (decode).
+pub fn encode_partition_batch(batch: &RecordBatch) -> Result<Vec<u8>> {
+    encode_ipc(&batch.schema(), std::slice::from_ref(batch))
+}
+
+/// Decode an Arrow IPC stream produced by [`encode_partition_batch`] back into
+/// a single concatenated `RecordBatch`. The stream always carries exactly one
+/// batch on the wire; if a future sender splits it we concatenate so the
+/// receiver writes one batch.
+pub fn decode_partition_batch(bytes: &[u8]) -> Result<RecordBatch> {
+    let (schema, batches) = decode_ipc(bytes)?;
+    match batches.len() {
+        1 => Ok(batches.into_iter().next().unwrap()),
+        0 => Err(BasinError::internal(
+            "partition-write: IPC stream carried no record batch",
+        )),
+        _ => arrow::compute::concat_batches(&schema, &batches)
+            .map_err(|e| BasinError::internal(format!("partition-write: concat batches: {e}"))),
+    }
+}
+
+#[async_trait]
+impl PartitionForwardClient for HttpPartitionForwardClient {
+    async fn forward_partition_write(
+        &self,
+        peer_base_url: &str,
+        project: ProjectId,
+        table: &str,
+        partition_id: &str,
+        batch: RecordBatch,
+    ) -> Result<u64> {
+        let url = Self::receive_url(peer_base_url);
+        let body = encode_partition_batch(&batch)?;
+        let resp = self
+            .http
+            .post(&url)
+            .header(FORWARD_SECRET_HEADER, &self.secret)
+            .header(PARTITION_FORWARD_PROJECT_HEADER, project.to_string())
+            .header(PARTITION_FORWARD_TABLE_HEADER, table)
+            .header(PARTITION_FORWARD_PARTITION_HEADER, partition_id)
+            .header(PARTITION_FORWARD_HOP_HEADER, "1")
+            .header("content-type", "application/vnd.apache.arrow.stream")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| {
+                BasinError::wal(format!("partition-write POST to {url:?} failed: {e}"))
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(BasinError::wal(format!(
+                "partition-write to {url:?} returned {status}: {detail}"
+            )));
+        }
+        let text = resp.text().await.map_err(|e| {
+            BasinError::wal(format!("partition-write response from {url:?} unreadable: {e}"))
+        })?;
+        text.trim().parse::<u64>().map_err(|e| {
+            BasinError::wal(format!(
+                "partition-write response from {url:?} is not a rowcount: {text:?} ({e})"
+            ))
+        })
+    }
+}
+
 // ─── region-aware connection-ceiling accounting model ──────────────────────
 
 /// Where a forwarded write is counted against the per-project

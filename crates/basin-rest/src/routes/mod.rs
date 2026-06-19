@@ -30,6 +30,9 @@ pub(crate) mod inbound;
 // Multi-region (ADR 0009) http-forward receive endpoint. Mounted only when
 // `BASIN_FORWARD_SECRET` is set (fail-closed); see `crate::server::router`.
 pub(crate) mod internal_forward;
+// #28 multi-node bulk ingest: partition-owner receive endpoint. Mounted only
+// when `BASIN_FORWARD_SECRET` is set (fail-closed); see `crate::server::router`.
+pub(crate) mod internal_partition_forward;
 pub(crate) mod openapi;
 pub(crate) mod rpc;
 pub(crate) mod storage;

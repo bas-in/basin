@@ -308,6 +308,20 @@ impl Shard {
         self.inner.wal()
     }
 
+    /// This replica's stable lease holder id. Used by the engine's
+    /// partition-write owner resolution to identify "self" within the shared
+    /// `BASIN_SHARD_PEERS` list.
+    pub fn replica_id(&self) -> &str {
+        self.inner.replica_id()
+    }
+
+    /// The configured lease registry, if any. The engine's partition
+    /// forwarding consults this to confirm/observe the live owner of a
+    /// partition. `None` in single-replica / no-lease mode.
+    pub fn lease_registry(&self) -> Option<&Arc<dyn basin_catalog::LeaseRegistry>> {
+        self.inner.lease_registry()
+    }
+
     /// Get a handle to `(project, partition)`. Lazy-loads the state from WAL +
     /// Parquet on first access; subsequent calls return a cheap clone.
     pub async fn get(
@@ -728,6 +742,15 @@ pub(crate) trait ShardImpl: Send + Sync {
     fn stats(&self) -> ShardStats;
     fn clone_arc(&self) -> Arc<dyn ShardImpl>;
     fn wal(&self) -> &Arc<dyn basin_wal::Wal>;
+    /// This replica's stable lease holder id (see [`ShardConfig::replica_id`]).
+    /// Exposed so the engine's partition-write owner resolution can identify
+    /// "self" within a shared peer list.
+    fn replica_id(&self) -> &str;
+    /// The configured lease registry, if any. Exposed so the engine's
+    /// partition forwarding can ask `owner_of(project, partition)` directly
+    /// (multi-node bulk-ingest forwarding). `None` in single-replica / no-lease
+    /// mode.
+    fn lease_registry(&self) -> Option<&Arc<dyn basin_catalog::LeaseRegistry>>;
     async fn flush_to_parquet(&self) -> Result<()>;
     async fn run_tiering_sweep(&self) -> Result<()>;
     /// One synchronous stripe-merge sweep (see `Shard::run_stripe_merge_once`).

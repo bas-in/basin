@@ -49,6 +49,7 @@ use crate::routes::{
     admin_projects as admin_projects_routes, auth as auth_routes, data as data_routes,
     fn_handler as fn_handler_routes, inbound as inbound_routes,
     internal_forward as internal_forward_routes,
+    internal_partition_forward as internal_partition_forward_routes,
     openapi as openapi_routes, rpc as rpc_routes,
     storage as storage_routes, storage_sign as storage_sign_routes,
 };
@@ -593,6 +594,16 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         app.route(
             "/internal/v1/forward",
             post(internal_forward_routes::post_forward),
+        )
+        // #28 multi-node bulk ingest: partition-owner receive route. Same
+        // fail-closed gate as /internal/v1/forward — only exists when the
+        // shared secret is set. Forwarded bulk batches can far exceed the
+        // 1 MiB client body cap, so this internal (secret-gated, 6PN-only)
+        // route opts out of the default body limit.
+        .route(
+            "/internal/v1/partition-write",
+            post(internal_partition_forward_routes::post_partition_write)
+                .layer(DefaultBodyLimit::disable()),
         )
     } else {
         app

@@ -376,6 +376,7 @@ fn fanout_cursors() -> &'static dashmap::DashMap<(basin_common::ProjectId, Strin
 /// `_default` single-handle path — identical to the pre-#28 behavior for
 /// single-partition tables and tiny statements.
 async fn write_batch_fanout(
+    engine: &crate::Engine,
     shard: &basin_shard::Shard,
     project: &basin_common::ProjectId,
     table: &TableName,
@@ -399,8 +400,95 @@ async fn write_batch_fanout(
         entry.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % fanout
     };
     let part = stripe_partition_key(idx);
+
+    // #28 multi-node bulk ingest: resolve the deterministic owner of this
+    // partition. Local-only routers (unset / single-peer BASIN_SHARD_PEERS)
+    // always return self → the local path below, byte-for-byte identical to the
+    // pre-multi-node behaviour. Only a configured multi-peer list can route
+    // off-node.
+    let router = engine.partition_router();
+    if !router.is_local_only() {
+        let owner = router.desired_owner(project, part.as_str());
+        if !owner.is_self {
+            if let Some(client) = engine.partition_forward_client() {
+                return forward_partition_to_owner(
+                    engine, &client, &owner.base_url, project, table, &part, batch,
+                )
+                .await
+                .map(|_rows| ());
+            }
+            // A multi-peer router resolved an off-node owner but no transport is
+            // installed: fail loud rather than silently writing to the wrong
+            // node (which would split-brain the lease). This only happens on a
+            // misconfiguration (peers set, forward secret missing).
+            return Err(BasinError::wal(format!(
+                "partition {} of table {} is owned by peer {:?} but no \
+                 partition-forward transport is configured (set \
+                 BASIN_FORWARD_SECRET)",
+                part.as_str(),
+                table.as_str(),
+                owner.base_url
+            )));
+        }
+    }
+
     let handle = shard.get(project, &part).await?;
     handle.write_batch_opts(table, batch, durable).await
+}
+
+/// Forward one fan-out batch to the node that owns `part`, retrying ONCE after
+/// a short backoff + owner re-resolve if the peer rejects with a lease handoff /
+/// lease-not-held race (the owner is mid-handoff). Surfaces the error after the
+/// retry — never silently drops the write. Returns the rows the owner wrote.
+async fn forward_partition_to_owner(
+    engine: &crate::Engine,
+    client: &Arc<dyn crate::write_forwarder::PartitionForwardClient>,
+    base_url: &str,
+    project: &basin_common::ProjectId,
+    table: &TableName,
+    part: &PartitionKey,
+    batch: RecordBatch,
+) -> Result<u64> {
+    match client
+        .forward_partition_write(
+            base_url,
+            *project,
+            table.as_str(),
+            part.as_str(),
+            batch.clone(),
+        )
+        .await
+    {
+        Ok(rows) => Ok(rows),
+        Err(e) if is_lease_transient(&e) => {
+            // The owner is mid-handoff (draining) or just lost/hasn't acquired
+            // its lease. Back off briefly, re-resolve the owner (it may have
+            // moved), and retry exactly once.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let owner = engine.partition_router().desired_owner(project, part.as_str());
+            client
+                .forward_partition_write(
+                    &owner.base_url,
+                    *project,
+                    table.as_str(),
+                    part.as_str(),
+                    batch,
+                )
+                .await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// True when a forward error reflects a transient lease race on the owner
+/// (handoff in progress / lease not yet held) that a single retry may clear,
+/// rather than a hard failure we must surface immediately.
+fn is_lease_transient(e: &BasinError) -> bool {
+    let msg = e.to_string();
+    msg.contains("lease_handoff_in_progress")
+        || msg.contains("handoff")
+        || msg.contains("lease_not_held")
+        || msg.contains("does not hold")
 }
 
 #[cfg(test)]
@@ -7929,6 +8017,7 @@ pub(crate) async fn exec_ingest_batch(
             // already ran above against all partitions. See `write_batch_fanout`.
             let _ = part;
             write_batch_fanout(
+                &sess.engine,
                 shard,
                 &sess.project,
                 table,
