@@ -288,6 +288,29 @@ pub struct ShardStats {
     pub stripe_merges: u64,
 }
 
+/// Ingest-pressure snapshot for the cloud autoscaler's `/metrics/inflight`
+/// route (issue #28 / multi-node ingest-aware autoscaling). Summed across this
+/// node's resident `(project, partition)` tails at poll time; cheap
+/// (O(resident-partitions), no object-store I/O).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TailPressure {
+    /// Sum, across every resident partition, of the in-memory (uncompacted,
+    /// WAL-resident) tail bytes. Maps to the autoscaler's
+    /// `wal_tail_bytes_resident`: how much un-flushed ingest this node is
+    /// holding in RAM right now. Grows when compaction falls behind ingest.
+    pub total_tail_bytes: i64,
+    /// The single worst partition's resident tail bytes (the max over
+    /// partitions, not the sum). Maps to the autoscaler's `compaction_lag_max`:
+    /// the deepest single-partition compaction backlog. The autoscaler maxes
+    /// this across the fleet, so it must be a per-partition max, not an average.
+    pub max_partition_tail_bytes: i64,
+    /// Most recent COMPLETE one-second ingest rate (rows/sec) on this node, from
+    /// the rolling [`in_process`] ingest counter. Maps to the autoscaler's
+    /// `ingest_rows_per_sec`. 0 when the node is idle (the last full second saw
+    /// no writes).
+    pub ingest_rows_per_sec: i64,
+}
+
 /// Handle to the shard map. Cheap to clone (Arc inside).
 #[derive(Clone)]
 pub struct Shard {
@@ -343,6 +366,15 @@ impl Shard {
 
     pub fn stats(&self) -> ShardStats {
         self.inner.stats()
+    }
+
+    /// Ingest-pressure snapshot for the autoscaler's `/metrics/inflight` route.
+    /// Sums resident per-partition tail bytes (and reports the worst single
+    /// partition + the rolling rows/sec) so a node ingesting hard under a
+    /// behind-falling compactor is visible to the cloud scaler. Cheap:
+    /// O(resident-partitions), no object-store I/O, never drains the tail.
+    pub async fn tail_pressure(&self) -> TailPressure {
+        self.inner.tail_pressure().await
     }
 
     /// Synchronously drain every resident partition's in-memory tail into
@@ -740,6 +772,12 @@ pub(crate) trait ShardImpl: Send + Sync {
     async fn get(&self, project: &ProjectId, partition: &PartitionKey) -> Result<ProjectHandle>;
     fn spawn_background(self: Arc<Self>) -> ShardBackgroundHandle;
     fn stats(&self) -> ShardStats;
+    /// Ingest-pressure snapshot (resident tail bytes + rolling ingest rate) for
+    /// the autoscaler. Default: all-zero (a backend without an in-memory tail
+    /// has no resident ingest pressure to report).
+    async fn tail_pressure(&self) -> TailPressure {
+        TailPressure::default()
+    }
     fn clone_arc(&self) -> Arc<dyn ShardImpl>;
     fn wal(&self) -> &Arc<dyn basin_wal::Wal>;
     /// This replica's stable lease holder id (see [`ShardConfig::replica_id`]).

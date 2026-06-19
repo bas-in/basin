@@ -8,6 +8,49 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-19 — Install partition-forward transport + ingest-pressure metrics in the deployed server (#28)
+
+- **`basin-server` now installs the partition-forward HTTP transport**, so a
+  multi-node deploy can actually forward a fan-out batch to the partition's
+  owner node (the engine-side wiring shipped earlier had no transport in the
+  deployed binary). After the engine is built, the server constructs
+  `HttpPartitionForwardClient` and attaches it via
+  `Engine::attach_partition_forward_client` — but ONLY when forwarding is viable:
+  `BASIN_FORWARD_SECRET` is set AND `BASIN_SHARD_PEERS` has >1 entry. Otherwise
+  nothing is attached and the node stays byte-for-byte local-only. Startup logs
+  `partition-forward transport installed` (with peer count) or `... not installed
+  (local-only or no BASIN_FORWARD_SECRET)`.
+  - **SELF-ID INVARIANT + startup validation:** the router decides partition
+    ownership by matching `BASIN_REPLICA_ID` against `BASIN_SHARD_PEERS`, so on a
+    multi-node deploy `BASIN_REPLICA_ID` MUST equal this node's own peer URL. If a
+    multi-peer node's replica-id is absent from its own peer list, startup logs a
+    loud `WARN` (warn-and-continue, not refuse: the node degrades to all-forwarding
+    and the env can be fixed without a redeploy stall, vs. taking a healthy node
+    offline for a recoverable slip). New `Engine` accessors
+    `partition_router_{peer_count,is_local_only,self_is_peer}` +
+    `PartitionRouter::self_is_peer` expose the router state to the server.
+  - The multi-node env surface (`BASIN_SHARD_PEERS` / `BASIN_REPLICA_ID`-must-be-
+    self / `BASIN_FORWARD_SECRET`) is documented in the `basin-server` module doc.
+- **`GET /metrics/inflight` now emits ingest pressure** so the cloud autoscaler
+  can scale on bulk-COPY load, which never showed up in the existing
+  execute/execute_bound `inflight` gauge (a COPY floods the WAL tail while
+  `inflight` reads ~0). Three new fields are overlaid onto the snapshot from the
+  shard's resident tail at poll time (the 8 latency/concurrency fields are
+  unchanged — back-compat):
+  - `wal_tail_bytes_resident` — sum of in-memory (uncompacted, WAL-resident) tail
+    bytes across this node's resident partitions.
+  - `compaction_lag_max` — the single worst partition's resident tail bytes (a
+    per-partition MAX, which the autoscaler maxes across the fleet).
+  - `ingest_rows_per_sec` — most recent COMPLETE one-second ingest rate, from a
+    new lock-free rolling counter the shard updates on every WAL-ack'd
+    `write_batch` (0 when idle). This is a real measured signal, not a fabricated
+    constant.
+  - New `Shard::tail_pressure()` (async, O(resident-partitions), no object-store
+    I/O) sums the per-partition tails; in a shardless deployment the three fields
+    honestly stay 0. New tests: `tail_pressure_reports_resident_tail_bytes`
+    (basin-shard), `with_ingest_pressure_overlays_three_keys_only` +
+    `snapshot_serializes_with_all_eleven_fields` (basin-engine).
+
 ## 2026-06-19 — Transparent per-partition write forwarding (#28 multi-node bulk ingest)
 
 - **A bulk COPY/ingest landing on any node now writes each fan-out partition on

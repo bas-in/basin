@@ -54,8 +54,76 @@ use tracing::{debug, instrument, warn};
 
 use crate::{
     LeaseMode, ProjectHandle, ProjectHandleImpl, ShardBackgroundHandle, ShardConfig, ShardImpl,
-    ShardStats, TopPatternProvider,
+    ShardStats, TailPressure, TopPatternProvider,
 };
+
+/// Cheap rolling ingest-rate counter (rows/sec) feeding the autoscaler's
+/// `ingest_rows_per_sec` metric. Lock-free: two atomics tracking the current
+/// 1-second bucket and the last fully-elapsed second's total.
+///
+/// On every `write_batch` we add the batch row count to the current bucket. The
+/// bucket is keyed by a monotonic "seconds since process start" stamp; when a
+/// write (or a read) observes a newer second, the just-closed bucket's count is
+/// promoted to `last_full` and the new bucket starts at 0. `rows_per_sec()`
+/// reports `last_full` (the most recent COMPLETE second) so a reader never sees
+/// a partially-filled current bucket undercount the true rate. This is an
+/// honest, cheaply-maintained signal — not a smoothed EWMA — which is all the
+/// autoscaler needs to see "this node is ingesting hard right now".
+#[derive(Debug)]
+struct IngestRate {
+    start: Instant,
+    /// Second-stamp (seconds since `start`) the current bucket belongs to.
+    bucket_sec: std::sync::atomic::AtomicU64,
+    /// Rows accumulated in the current (open) one-second bucket.
+    bucket_rows: std::sync::atomic::AtomicU64,
+    /// Rows in the most recently CLOSED one-second bucket.
+    last_full: std::sync::atomic::AtomicU64,
+}
+
+impl IngestRate {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            bucket_sec: std::sync::atomic::AtomicU64::new(0),
+            bucket_rows: std::sync::atomic::AtomicU64::new(0),
+            last_full: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Roll the bucket forward if the wall has advanced past it, promoting the
+    /// closed bucket to `last_full`. Called on both write (record) and read
+    /// (rate) so a quiet node correctly reports 0 once a second elapses with no
+    /// writes (rather than reporting a stale rate forever).
+    fn roll(&self, now_sec: u64) {
+        use std::sync::atomic::Ordering;
+        let cur = self.bucket_sec.load(Ordering::Relaxed);
+        if now_sec > cur
+            && self
+                .bucket_sec
+                .compare_exchange(cur, now_sec, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            // We won the roll: the bucket we just closed is `last_full` only if
+            // it was the IMMEDIATELY preceding second; a gap (idle node) means
+            // the last full second saw zero writes.
+            let closed = self.bucket_rows.swap(0, Ordering::Relaxed);
+            let promoted = if now_sec == cur + 1 { closed } else { 0 };
+            self.last_full.store(promoted, Ordering::Relaxed);
+        }
+    }
+
+    fn record(&self, rows: u64) {
+        use std::sync::atomic::Ordering;
+        let now_sec = self.start.elapsed().as_secs();
+        self.roll(now_sec);
+        self.bucket_rows.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    fn rows_per_sec(&self) -> u64 {
+        self.roll(self.start.elapsed().as_secs());
+        self.last_full.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 /// Whole-shard soft-cap budget for resident (uncompacted) tail bytes, BEFORE
 /// the per-partition division below. When a partition's tail crosses its share
@@ -300,6 +368,11 @@ pub(crate) struct InProcessShard {
     /// this set the write path returns `LeaseHandoffInProgress`; the read
     /// path is unaffected. Cleared once the handoff completes or aborts.
     draining: DrainingSet,
+    /// Rolling rows/sec ingest counter feeding the autoscaler's
+    /// `ingest_rows_per_sec`. `Arc`-shared so the `share_clone` the write path
+    /// and background loops run on update the SAME counter the metrics snapshot
+    /// reads.
+    ingest_rate: Arc<IngestRate>,
 }
 
 impl InProcessShard {
@@ -316,6 +389,7 @@ impl InProcessShard {
             stripe_merge_lock: Arc::new(Mutex::new(())),
             held_leases: Arc::new(Mutex::new(HashMap::new())),
             draining: Arc::new(Mutex::new(HashSet::new())),
+            ingest_rate: Arc::new(IngestRate::new()),
         }
     }
 
@@ -354,6 +428,9 @@ impl InProcessShard {
             stripe_merge_lock: self.stripe_merge_lock.clone(),
             held_leases: self.held_leases.clone(),
             draining: self.draining.clone(),
+            // Shared: the write path runs on a `share_clone` and must update the
+            // same rolling counter the metrics snapshot reads.
+            ingest_rate: self.ingest_rate.clone(),
         }
     }
 
@@ -2756,6 +2833,37 @@ impl ShardImpl for InProcessShard {
         }
     }
 
+    async fn tail_pressure(&self) -> TailPressure {
+        // Snapshot every resident partition state under the outer map mutex,
+        // then release it before touching the per-partition RwLocks (same
+        // discipline as `has_pending_tail`: never hold the global map lock
+        // across an await). For each partition sum its tail bytes; track the
+        // running total and the per-partition max.
+        let snapshot: Vec<Arc<RwLock<PartitionState>>> = {
+            let map = self.partitions.lock().await;
+            map.values().cloned().collect()
+        };
+        let mut total: i64 = 0;
+        let mut max_one: i64 = 0;
+        for state in snapshot {
+            let g = state.read().await;
+            // O(columns) per tail batch; the tail holds few (large) batches.
+            let part_bytes: i64 = g
+                .tail
+                .values()
+                .flatten()
+                .map(|(_, b)| b.get_array_memory_size() as i64)
+                .sum();
+            total = total.saturating_add(part_bytes);
+            max_one = max_one.max(part_bytes);
+        }
+        TailPressure {
+            total_tail_bytes: total,
+            max_partition_tail_bytes: max_one,
+            ingest_rows_per_sec: self.ingest_rate.rows_per_sec().min(i64::MAX as u64) as i64,
+        }
+    }
+
     fn clone_arc(&self) -> Arc<dyn ShardImpl> {
         // Returns a *new* outer Arc whose inner `InProcessShard` shares the
         // same `partitions` map and `stats` cell as the original via the
@@ -3210,6 +3318,10 @@ impl InProcessProjectHandle {
                 .map(|(_, b)| b.get_array_memory_size())
                 .sum::<usize>()
         };
+
+        // Feed the rolling ingest-rate counter (autoscaler `ingest_rows_per_sec`).
+        // Lock-free; counts every WAL-ack'd row on the hot write path.
+        self.shard.ingest_rate.record(batch.num_rows() as u64);
 
         // BOUNDED-MEMORY backpressure (#tail-oom): the in-memory tail grows with
         // ingest rate; for fast/wide COPY a writer can outrun the time-ticked
@@ -4567,6 +4679,50 @@ mod tests {
 
         let read = handle.read(&table, ReadOptions::default()).await.unwrap();
         assert_eq!(rows_in(&read), 30);
+    }
+
+    #[tokio::test]
+    async fn tail_pressure_reports_resident_tail_bytes() {
+        let (shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let table = TableName::new("events").unwrap();
+
+        // Empty shard: no resident tail, all zero.
+        let before = shard.tail_pressure().await;
+        assert_eq!(before.total_tail_bytes, 0);
+        assert_eq!(before.max_partition_tail_bytes, 0);
+
+        // Write into two distinct partitions so total != max and we exercise
+        // the per-partition max.
+        let p1 = PartitionKey::default_key();
+        let p2 = PartitionKey::new("s1".to_string()).unwrap();
+        shard
+            .get(&project, &p1)
+            .await
+            .unwrap()
+            .write_batch(&table, batch(0, 100, "v-"))
+            .await
+            .unwrap();
+        // Two batches into p2 so its tail is the heavier of the two.
+        let h2 = shard.get(&project, &p2).await.unwrap();
+        h2.write_batch(&table, batch(0, 100, "v-")).await.unwrap();
+        h2.write_batch(&table, batch(100, 100, "v-")).await.unwrap();
+
+        let after = shard.tail_pressure().await;
+        assert!(
+            after.total_tail_bytes > 0,
+            "resident tail bytes must be visible: {after:?}"
+        );
+        assert!(
+            after.max_partition_tail_bytes > 0
+                && after.max_partition_tail_bytes <= after.total_tail_bytes,
+            "max single-partition tail must be a positive subset of the total: {after:?}"
+        );
+        // p2 holds two batches vs p1's one → max is strictly less than total.
+        assert!(
+            after.max_partition_tail_bytes < after.total_tail_bytes,
+            "two-partition spread must make max < total: {after:?}"
+        );
     }
 
     /// `write_batch_opts(durable = true)` (`basin.synchronous_commit = on`)

@@ -117,6 +117,12 @@ impl InflightMetrics {
             p99_micros: p99,
             started_at: rfc3339(self.start_wall),
             observed_at: rfc3339(SystemTime::now()),
+            // Ingest-pressure defaults to 0; the REST handler overlays live
+            // values from the shard via `with_ingest_pressure`. A shardless /
+            // metrics-only caller of `snapshot()` honestly reports 0.
+            wal_tail_bytes_resident: 0,
+            compaction_lag_max: 0,
+            ingest_rows_per_sec: 0,
         }
     }
 }
@@ -152,6 +158,40 @@ pub struct MetricsSnapshot {
     pub p99_micros: i64,
     pub started_at: String,
     pub observed_at: String,
+    // ─── ingest-pressure (issue #28 ingest-aware autoscaling) ───────────────
+    // The cloud autoscaler reads these three to scale on INGEST pressure
+    // (COPY/bulk load), which the execute/execute_bound `inflight` gauge above
+    // does NOT capture (a bulk COPY shows inflight≈0 while it floods the WAL
+    // tail). The engine sources them from the shard's resident tail at poll
+    // time and overlays them onto the global latency snapshot; in a shardless
+    // deployment they stay 0 (the cloud side already defaults absent fields to
+    // 0). Names are part of the cloud contract — do not rename.
+    /// Sum of in-memory (uncompacted, WAL-resident) tail bytes across this
+    /// node's resident partitions. Rises when compaction lags ingest.
+    pub wal_tail_bytes_resident: i64,
+    /// Worst single-partition resident tail bytes (a per-partition MAX, not an
+    /// average) — the deepest compaction backlog on this node. The autoscaler
+    /// maxes this across the fleet, so it must stay a max.
+    pub compaction_lag_max: i64,
+    /// Most recent complete one-second ingest rate (rows/sec) on this node.
+    pub ingest_rows_per_sec: i64,
+}
+
+impl MetricsSnapshot {
+    /// Overlay the ingest-pressure fields onto a latency snapshot. Called by
+    /// the REST `/metrics/inflight` handler with the shard's `tail_pressure()`;
+    /// leaves the 8 latency/concurrency fields untouched.
+    pub fn with_ingest_pressure(
+        mut self,
+        wal_tail_bytes_resident: i64,
+        compaction_lag_max: i64,
+        ingest_rows_per_sec: i64,
+    ) -> Self {
+        self.wal_tail_bytes_resident = wal_tail_bytes_resident;
+        self.compaction_lag_max = compaction_lag_max;
+        self.ingest_rows_per_sec = ingest_rows_per_sec;
+        self
+    }
 }
 
 /// The one process-global metrics instance, lazily initialised on first use
@@ -241,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_serializes_with_all_eight_fields() {
+    fn snapshot_serializes_with_all_eleven_fields() {
         let m = fresh(DEFAULT_WINDOW_SECS);
         let _g = m.enter();
         m.record(123);
@@ -249,6 +289,7 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&snap).unwrap();
         let obj = v.as_object().unwrap();
         for field in [
+            // The original 8 latency/concurrency fields (back-compat).
             "goroutines",
             "inflight",
             "window_secs",
@@ -257,15 +298,38 @@ mod tests {
             "p99_micros",
             "started_at",
             "observed_at",
+            // The 3 ingest-pressure fields (cloud autoscaler contract).
+            "wal_tail_bytes_resident",
+            "compaction_lag_max",
+            "ingest_rows_per_sec",
         ] {
             assert!(obj.contains_key(field), "missing field: {field}");
         }
-        assert_eq!(obj.len(), 8, "exactly 8 fields, no extras");
+        assert_eq!(obj.len(), 11, "exactly 11 fields, no extras");
         // window_secs default + the live guard is counted.
         assert_eq!(obj["window_secs"], 10);
         assert_eq!(obj["inflight"], 1);
+        // Ingest-pressure defaults to 0 on the bare snapshot (no shard overlay).
+        assert_eq!(obj["wal_tail_bytes_resident"], 0);
+        assert_eq!(obj["compaction_lag_max"], 0);
+        assert_eq!(obj["ingest_rows_per_sec"], 0);
         // RFC3339 UTC ends in Z.
         assert!(obj["started_at"].as_str().unwrap().ends_with('Z'));
         assert!(obj["observed_at"].as_str().unwrap().ends_with('Z'));
+    }
+
+    #[test]
+    fn with_ingest_pressure_overlays_three_keys_only() {
+        let m = fresh(DEFAULT_WINDOW_SECS);
+        let snap = m.snapshot().with_ingest_pressure(4096, 4096, 250_000);
+        let v: serde_json::Value = serde_json::to_value(&snap).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj["wal_tail_bytes_resident"], 4096);
+        assert_eq!(obj["compaction_lag_max"], 4096);
+        assert_eq!(obj["ingest_rows_per_sec"], 250_000);
+        // Latency/concurrency fields are untouched by the overlay.
+        assert_eq!(obj["inflight"], 0);
+        assert_eq!(obj["window_secs"], 10);
+        assert_eq!(obj.len(), 11);
     }
 }

@@ -645,13 +645,35 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// `GET /metrics/inflight` — process-global in-flight + latency snapshot.
+/// `GET /metrics/inflight` — process-global in-flight + latency snapshot,
+/// overlaid with this node's live ingest pressure.
 ///
-/// Serves the engine's [`basin_engine::inflight_metrics`] snapshot as JSON.
-/// The field names + casing match the `MetricsSample` contract the cloud
-/// autoscaler deserializes; do not reshape this here.
-async fn metrics_inflight() -> axum::Json<basin_engine::inflight_metrics::MetricsSnapshot> {
-    axum::Json(basin_engine::inflight_metrics::snapshot())
+/// Serves the engine's [`basin_engine::inflight_metrics`] snapshot as JSON. The
+/// field names + casing match the `MetricsSample` contract the cloud autoscaler
+/// deserializes; do not reshape this here.
+///
+/// The 8 latency/concurrency fields come from the process-global metrics. The 3
+/// ingest-pressure fields (`wal_tail_bytes_resident`, `compaction_lag_max`,
+/// `ingest_rows_per_sec`) are overlaid from the shard's `tail_pressure()` at
+/// poll time so the autoscaler can scale on bulk-COPY ingest, which never shows
+/// up in the execute/execute_bound `inflight` gauge. In a shardless deployment
+/// the shard handle is `None` and those three stay 0 (honest absence).
+async fn metrics_inflight(
+    axum::extract::State(state): axum::extract::State<Arc<Inner>>,
+) -> axum::Json<basin_engine::inflight_metrics::MetricsSnapshot> {
+    let snap = basin_engine::inflight_metrics::snapshot();
+    let snap = match state.cfg.engine.shard() {
+        Some(shard) => {
+            let tp = shard.tail_pressure().await;
+            snap.with_ingest_pressure(
+                tp.total_tail_bytes,
+                tp.max_partition_tail_bytes,
+                tp.ingest_rows_per_sec,
+            )
+        }
+        None => snap,
+    };
+    axum::Json(snap)
 }
 
 /// Build the CORS layer from the configured allowlist.

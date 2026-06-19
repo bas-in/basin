@@ -133,6 +133,15 @@ impl PartitionRouter {
         self.peers.len()
     }
 
+    /// True when this node's id matched an entry in the peer list (i.e. the
+    /// SELF-ID INVARIANT holds: `BASIN_REPLICA_ID` is one of `BASIN_SHARD_PEERS`).
+    /// When false on a multi-peer router this node never claims any partition as
+    /// self — it forwards EVERY write and owns nothing (a misconfiguration the
+    /// server warns about at startup).
+    pub fn self_is_peer(&self) -> bool {
+        self.self_index.is_some()
+    }
+
     /// The deterministic owner node of `(project, partition_id)`.
     ///
     /// Local-only routers (0/1 peers) always return self (`base_url` = the lone

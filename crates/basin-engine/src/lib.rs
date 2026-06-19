@@ -724,6 +724,26 @@ impl Engine {
         self.inner.cfg.shard.clone()
     }
 
+    /// Number of configured partition-forwarding peers (`BASIN_SHARD_PEERS`).
+    /// `<= 1` means local-only (single-node). The server reads this at startup
+    /// to decide whether to install the partition-forward HTTP transport.
+    pub fn partition_router_peer_count(&self) -> usize {
+        self.partition_router().peer_count()
+    }
+
+    /// Whether forwarding is effectively disabled (0/1 peers → local-only).
+    pub fn partition_router_is_local_only(&self) -> bool {
+        self.partition_router().is_local_only()
+    }
+
+    /// Whether this node's id (`BASIN_REPLICA_ID`) appears in its own
+    /// `BASIN_SHARD_PEERS` list (the SELF-ID INVARIANT). When false on a
+    /// multi-peer router this node forwards every write and owns nothing — the
+    /// server warns loudly at startup. See [`crate::partition_router`].
+    pub fn partition_router_self_is_peer(&self) -> bool {
+        self.partition_router().self_is_peer()
+    }
+
     /// Snapshot of the per-partition owner resolver. Cloned so the caller
     /// resolves owners without holding the lock.
     pub(crate) fn partition_router(&self) -> crate::partition_router::PartitionRouter {

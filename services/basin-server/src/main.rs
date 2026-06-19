@@ -136,6 +136,39 @@
 //! the WAL. `required` without `BASIN_SHARD_ENABLED=1` is a startup error:
 //! the legacy synchronous write path has no lease seam to enforce.
 //!
+//! ## Multi-node bulk ingest — per-partition write forwarding (#28, ADR 0023)
+//!
+//! A single bulk `COPY` lands on whichever node the client connected to, but a
+//! table's write fan-out spreads chunks across P partitions. With several nodes
+//! we want those partitions owned by different nodes; a batch destined for a
+//! partition this node doesn't own is transparently forwarded to the owner over
+//! 6PN HTTP (`POST /internal/v1/partition-write`).
+//!
+//! ```text
+//! BASIN_SHARD_PEERS=http://m1.vm.app.internal:5434,http://m2.vm.app.internal:5434
+//!                            # ordered peer REST base-URL list, INCLUDING this node.
+//!                            # Unset / single entry → local-only (byte-identical to single-node).
+//! BASIN_REPLICA_ID=http://m1.vm.app.internal:5434
+//!                            # THIS node's own peer URL — MUST be byte-identical to its
+//!                            # entry in BASIN_SHARD_PEERS (see invariant below).
+//! BASIN_FORWARD_SECRET=<shared-secret>
+//!                            # shared secret authenticating the 6PN forward channel; the
+//!                            # receive route is only mounted (and the forward client only
+//!                            # installed) when this is set.
+//! ```
+//!
+//! **SELF-ID INVARIANT (load-bearing):** the partition router decides "do I own
+//! this partition?" by matching `BASIN_REPLICA_ID` against the entries in
+//! `BASIN_SHARD_PEERS`. On a multi-node deploy `BASIN_REPLICA_ID` MUST therefore
+//! be set to THIS node's own peer URL, byte-identical to its `BASIN_SHARD_PEERS`
+//! entry (e.g. `http://{machine}.vm.{app}.internal:5434`). A node whose
+//! replica-id is absent from its own peer list never claims any partition as
+//! self — it would forward EVERY write and own nothing, a silent misconfig.
+//! Startup logs a loud `WARN` (warn-and-continue, not refuse: a single
+//! mis-set node degrades to all-forwarding but the cluster keeps serving, and
+//! the operator can fix the env without a redeploy stall; refusing would take
+//! the node fully offline for a recoverable config slip).
+//!
 //! ## Pool, auth, REST
 //!
 //! Three additional env vars layer the optional pieces of the Basin stack on
@@ -628,6 +661,51 @@ async fn main() -> Result<()> {
                  non-home writes fail loud with WrongRegion"
             );
         }
+    }
+
+    // --- multi-node bulk ingest: per-partition write forwarding (#28) -------
+    //
+    // Install the HTTP transport so a node can forward an already-checked Arrow
+    // batch to the node that OWNS the destination partition. The engine already
+    // built a `PartitionRouter` from BASIN_SHARD_PEERS + BASIN_REPLICA_ID at
+    // construction; here we only attach the wire client + validate self-id.
+    //
+    // Viability gate: install ONLY when forwarding can actually happen — a
+    // shared secret is set (so the receive route on the owner is mounted and
+    // requests authenticate) AND the router has >1 peer (a real multi-node
+    // list; 0/1 peers is local-only and the fan-out takes the byte-identical
+    // local path). Otherwise we attach nothing and stay local-only.
+    let forward_secret = basin_engine::write_forwarder::forward_secret_from_env();
+    let peers = engine.partition_router_peer_count();
+    if !engine.partition_router_is_local_only() && forward_secret.is_some() {
+        // SELF-ID INVARIANT: a multi-node node MUST appear in its own peer list
+        // (BASIN_REPLICA_ID == this node's BASIN_SHARD_PEERS entry), else it
+        // never claims a partition as self and forwards EVERY write. We
+        // warn-loud-and-continue rather than refuse: a single mis-set node
+        // degrades to all-forwarding (the cluster still serves) and the env can
+        // be corrected without a stalled redeploy; refusing would take an
+        // otherwise-healthy node fully offline for a recoverable config slip.
+        if !engine.partition_router_self_is_peer() {
+            tracing::warn!(
+                replica_id = ?cfg.replica_id,
+                peers,
+                "BASIN_REPLICA_ID is not present in BASIN_SHARD_PEERS — this node \
+                 will forward EVERY partition write and own no partition locally. \
+                 Set BASIN_REPLICA_ID to this node's own peer URL (byte-identical \
+                 to its BASIN_SHARD_PEERS entry, e.g. http://<machine>.vm.<app>.internal:5434)."
+            );
+        }
+        let client = basin_engine::write_forwarder::HttpPartitionForwardClient::with_secret(
+            forward_secret.expect("forward_secret is Some in this branch"),
+        );
+        engine.attach_partition_forward_client(std::sync::Arc::new(client));
+        tracing::info!(peers, "partition-forward transport installed");
+    } else {
+        tracing::info!(
+            peers,
+            has_secret = forward_secret.is_some(),
+            "partition-forward transport not installed (local-only or no BASIN_FORWARD_SECRET)"
+        );
     }
 
     // Build the static resolver from `BASIN_PROJECTS`.
