@@ -8,6 +8,49 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-19 — Fly.io self-id derivation + dynamic peer discovery for partition forwarding (#28)
+
+Multi-node partition forwarding now works on Fly.io, where (a) all machines in
+an app SHARE env vars (so `BASIN_REPLICA_ID` cannot be a static per-machine
+value) and (b) the machine set changes under autoscaling (so a static
+`BASIN_SHARD_PEERS` goes stale).
+
+- **Per-machine self-id derivation.** When `BASIN_REPLICA_ID` is NOT set but
+  `FLY_MACHINE_ID` + `FLY_APP_NAME` are present, the server derives this
+  machine's self-id as its own routable 6PN REST URL
+  `http://{FLY_MACHINE_ID}.vm.{FLY_APP_NAME}.internal:{rest_port}` (`rest_port`
+  parsed from `BASIN_REST_BIND`, default `5434`). This is BOTH the shard lease
+  holder id AND the partition-router self-id, byte-identical to how peers are
+  listed in discovery so a node recognises itself. An explicit
+  `BASIN_REPLICA_ID` always wins (tests / non-Fly). The resolved id is logged.
+- **Dynamic Fly-DNS peer discovery.** Precedence: if `BASIN_SHARD_PEERS` is set
+  it is used verbatim and discovery does NOT run (deterministic for tests /
+  fixed-N clusters). Otherwise discovery runs when `FLY_APP_NAME` is set AND
+  `BASIN_FORWARD_SECRET` is set AND `BASIN_SHARD_ENABLED=1`. Discovery resolves
+  the Fly `vms.{app}.internal` 6PN TXT record (which lists every running
+  machine as `machine_id region` pairs) via a hand-rolled DNS-over-UDP query to
+  Fly's internal resolver `fdaa::3:53` — no DNS-resolver crate was in the
+  workspace and `getaddrinfo`/`tokio::lookup_host` cannot query TXT, so the
+  query builder + response parser are pure, unit-tested functions and only the
+  socket I/O is untested without a live Fly env. Peer URLs are built with the
+  same format as the self-id and SORTED for determinism (so the fnv1a owner
+  mapping is identical across nodes that discovered in different orders).
+  Discovery runs once at startup (best-effort: a failure logs `WARN` and the
+  node stays local-only, never crashes) and on a background refresh loop every
+  `BASIN_SHARD_DISCOVERY_INTERVAL_SECS` (default 15); the router is rebuilt only
+  when the peer set actually changes, logging added/removed members. The
+  partition-forward client is installed unconditionally when discovery is
+  enabled + a secret is set, so a node promoted from local-only to multi-peer at
+  runtime can forward immediately (a local-only router no-ops the transport).
+- **Membership-change behaviour (no data migration).** When the peer set
+  changes, a partition's deterministic `desired_owner` can move to a new node.
+  The new owner acquires the writer lease via CAS (the old owner's lease expires
+  within the ~15s TTL), so there is NO double-write; writes in flight during the
+  flip may hit a transient `LeaseNotHeld` and retry (handled in Wave 2b).
+  Already-written data is NOT migrated — reads still see it via the shared
+  catalog + object-store LIST regardless of which node wrote it. Live data
+  rebalance remains out of scope.
+
 ## 2026-06-19 — Install partition-forward transport + ingest-pressure metrics in the deployed server (#28)
 
 - **`basin-server` now installs the partition-forward HTTP transport**, so a

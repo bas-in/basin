@@ -248,6 +248,10 @@ mod engine_auth_store;
 #[cfg(feature = "wasm-fn")]
 mod fn_runtime;
 
+// #28 multi-node bulk ingest on Fly.io: per-machine self-id derivation +
+// dynamic Fly-DNS peer discovery for the partition write forwarder.
+mod shard_discovery;
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -696,7 +700,7 @@ async fn main() -> Result<()> {
             );
         }
         let client = basin_engine::write_forwarder::HttpPartitionForwardClient::with_secret(
-            forward_secret.expect("forward_secret is Some in this branch"),
+            forward_secret.clone().expect("forward_secret is Some in this branch"),
         );
         engine.attach_partition_forward_client(std::sync::Arc::new(client));
         tracing::info!(peers, "partition-forward transport installed");
@@ -706,6 +710,142 @@ async fn main() -> Result<()> {
             has_secret = forward_secret.is_some(),
             "partition-forward transport not installed (local-only or no BASIN_FORWARD_SECRET)"
         );
+    }
+
+    // --- Fly.io dynamic peer discovery (#28 autoscaling membership) ---------
+    //
+    // On Fly.io the machine set changes under autoscaling, so a static
+    // BASIN_SHARD_PEERS goes stale. When BASIN_SHARD_PEERS is NOT set but we're
+    // on Fly with a forward secret and the shard enabled, discover the live
+    // machine set from the `vms.{app}.internal` 6PN TXT record and rebuild the
+    // router; refresh on a background loop so membership tracks scaling events.
+    //
+    // MEMBERSHIP-CHANGE BEHAVIOUR: when the peer set changes, a partition's
+    // deterministic desired_owner can move to a new node. The new owner acquires
+    // the writer lease via CAS (the old owner's lease expires within the ~15s
+    // TTL), so there is NO double-write; writes in flight during the flip may
+    // hit a transient LeaseNotHeld and retry (handled in Wave 2b). Already-
+    // written data is NOT migrated — reads still see it via the shared catalog +
+    // object-store LIST regardless of which node wrote it. Live rebalance is out
+    // of scope.
+    {
+        let static_peers = std::env::var("BASIN_SHARD_PEERS").ok();
+        let fly_app = std::env::var("FLY_APP_NAME").ok();
+        let fly_machine = std::env::var("FLY_MACHINE_ID").ok();
+        let rest_port = shard_discovery::rest_port_from_bind(
+            std::env::var("BASIN_REST_BIND").ok().as_deref(),
+        );
+        let discovery_on = shard_discovery::discovery_enabled(
+            static_peers.as_deref(),
+            fly_app.as_deref(),
+            forward_secret.is_some(),
+            cfg.shard_enabled,
+        );
+        if discovery_on {
+            let self_id = cfg.replica_id.clone().unwrap_or_default();
+            let dcfg = shard_discovery::DiscoveryConfig {
+                app_name: fly_app.expect("discovery gate requires FLY_APP_NAME"),
+                self_machine_id: fly_machine,
+                rest_port,
+                interval_secs: std::env::var("BASIN_SHARD_DISCOVERY_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(shard_discovery::DEFAULT_DISCOVERY_INTERVAL_SECS),
+            };
+            // Install the forward client unconditionally when discovery is
+            // enabled + a secret is set: discovery may promote this node from
+            // local-only to multi-peer at runtime, and a local-only router
+            // simply no-ops the transport (every owner resolves to self).
+            if let Some(secret) = forward_secret.clone() {
+                let client =
+                    basin_engine::write_forwarder::HttpPartitionForwardClient::with_secret(secret);
+                engine.attach_partition_forward_client(std::sync::Arc::new(client));
+            }
+            // Best-effort startup discovery: a failure logs a warning and the
+            // node stays local-only — never crash.
+            let mut current_peers: Vec<String> = match shard_discovery::discover_peers(&dcfg).await
+            {
+                Ok(Some(urls)) => {
+                    tracing::info!(
+                        app = %dcfg.app_name,
+                        peers = urls.len(),
+                        self_id = %self_id,
+                        "fly-dns peer discovery: initial membership {:?}",
+                        urls
+                    );
+                    engine.attach_partition_router(
+                        basin_engine::partition_router::PartitionRouter::new(
+                            urls.clone(),
+                            &self_id,
+                        ),
+                    );
+                    urls
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        app = %dcfg.app_name,
+                        "fly-dns peer discovery returned no peers; staying local-only"
+                    );
+                    Vec::new()
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        app = %dcfg.app_name,
+                        error = %e,
+                        "fly-dns peer discovery failed at startup; staying local-only"
+                    );
+                    Vec::new()
+                }
+            };
+
+            // Background refresh loop: rebuild the router only when the peer set
+            // actually changes, logging added/removed members.
+            let engine_bg = engine.clone();
+            tokio::spawn(async move {
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_secs(dcfg.interval_secs));
+                tick.tick().await; // consume the immediate first tick
+                loop {
+                    tick.tick().await;
+                    match shard_discovery::discover_peers(&dcfg).await {
+                        Ok(Some(urls)) => {
+                            if shard_discovery::peer_set_changed(&current_peers, &urls) {
+                                let (added, removed) =
+                                    shard_discovery::peer_set_diff(&current_peers, &urls);
+                                tracing::info!(
+                                    app = %dcfg.app_name,
+                                    peers = urls.len(),
+                                    ?added,
+                                    ?removed,
+                                    "fly-dns peer discovery: membership changed"
+                                );
+                                engine_bg.attach_partition_router(
+                                    basin_engine::partition_router::PartitionRouter::new(
+                                        urls.clone(),
+                                        &self_id,
+                                    ),
+                                );
+                                current_peers = urls;
+                            }
+                        }
+                        Ok(None) => {
+                            // Transient empty/timeout — keep the last good set.
+                            tracing::debug!(
+                                app = %dcfg.app_name,
+                                "fly-dns peer discovery refresh: no peers; keeping current set"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                app = %dcfg.app_name,
+                                error = %e,
+                                "fly-dns peer discovery refresh failed; keeping current set"
+                            );
+                        }
+                    }
+                }
+            });
+        }
     }
 
     // Build the static resolver from `BASIN_PROJECTS`.
@@ -1388,10 +1528,29 @@ impl Cfg {
                  (writer leases fence the WAL write path through basin-shard)"
             ));
         }
-        let replica_id = std::env::var("BASIN_REPLICA_ID")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        // Self-id (shard lease holder AND partition-router self-id). On Fly.io
+        // all machines in an app SHARE env vars, so BASIN_REPLICA_ID cannot be a
+        // static per-machine constant. When it is NOT set but FLY_MACHINE_ID +
+        // FLY_APP_NAME are, derive this machine's own routable peer REST URL
+        // `http://{machine}.vm.{app}.internal:{rest_port}` — byte-identical to
+        // how peers are listed in discovery (shard_discovery::fly_peer_url) so
+        // the router recognises self. An explicit BASIN_REPLICA_ID always wins
+        // (tests / non-Fly). See `shard_discovery` module docs.
+        let explicit_replica_id = std::env::var("BASIN_REPLICA_ID").ok();
+        let fly_machine_id = std::env::var("FLY_MACHINE_ID").ok();
+        let fly_app_name = std::env::var("FLY_APP_NAME").ok();
+        let rest_port = shard_discovery::rest_port_from_bind(
+            std::env::var("BASIN_REST_BIND").ok().as_deref(),
+        );
+        let replica_id = shard_discovery::derive_replica_id(
+            explicit_replica_id.as_deref(),
+            fly_machine_id.as_deref(),
+            fly_app_name.as_deref(),
+            rest_port,
+        );
+        if let Some(id) = &replica_id {
+            tracing::info!(replica_id = %id, "resolved shard/partition-router self-id");
+        }
 
         // BASIN_WAL_MODE (multi-node raft, commit 6). Strict parse + config
         // validation mirroring the lease-mode / rest-requires-auth idiom.
