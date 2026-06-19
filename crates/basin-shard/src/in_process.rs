@@ -57,23 +57,54 @@ use crate::{
     ShardStats, TopPatternProvider,
 };
 
-/// Soft cap on a partition's in-memory tail (uncompacted batches). When the
-/// resident tail crosses this, `write_batch_inner` logs a pressure warning
-/// (observability). The HARD backpressure cap below is what actually bounds
-/// memory. 256 MiB leaves ample headroom on the 8 GB box for query execution
-/// + caches.
-const MAX_TAIL_BYTES: usize = 256 * 1024 * 1024;
+/// Whole-shard soft-cap budget for resident (uncompacted) tail bytes, BEFORE
+/// the per-partition division below. When a partition's tail crosses its share
+/// of this, `write_batch_inner` logs a pressure warning (observability). The
+/// HARD backpressure cap is what actually bounds memory. 256 MiB leaves ample
+/// headroom on the 8 GB box for query execution + caches.
+const MAX_TAIL_BYTES_TOTAL: usize = 256 * 1024 * 1024;
 
-/// HARD cap on a partition's in-memory tail. When `write_batch_inner` observes
-/// the resident tail at or above this, it synchronously flushes the oldest tail
-/// batches to an immutable data file BEFORE returning, so RAM stays bounded
-/// under sustained fast ingest. This is real backpressure: a writer that
-/// outruns the time-ticked compactor paces itself to flush (object-store)
-/// throughput instead of buffering the whole table in memory and OOMing the
-/// box. Set above the soft cap so the soft-cap WARN fires first as an early
-/// signal. The flush is bounded (see `MAX_COMPACTION_ROWS`), so a single
-/// backpressure stall costs one bounded file write, never an O(table) rewrite.
-const HARD_TAIL_BYTES: usize = 384 * 1024 * 1024;
+/// Whole-shard HARD-cap budget for resident tail bytes, BEFORE the
+/// per-partition division. When a partition's tail reaches its share of this,
+/// `write_batch_inner` synchronously flushes its oldest tail batches to an
+/// immutable file BEFORE returning, so RAM stays bounded under sustained fast
+/// ingest. Real backpressure: a writer that outruns the time-ticked compactor
+/// paces itself to flush (object-store) throughput instead of buffering the
+/// whole table in memory and OOMing the box. Above the soft cap so the
+/// soft-cap WARN fires first. The flush is bounded (see `MAX_COMPACTION_ROWS`),
+/// so a single backpressure stall costs one bounded file write, never an
+/// O(table) rewrite.
+const HARD_TAIL_BYTES_TOTAL: usize = 384 * 1024 * 1024;
+
+/// #28: per-partition memory budgeting. `BASIN_SHARD_PARTITIONS_PER_TABLE`
+/// fans a table's bulk ingest across P partitions, each with its OWN tail. To
+/// keep the WHOLE-shard resident tail bounded by the same budget rather than
+/// P× it, the per-partition soft/hard caps are the total budgets divided by P.
+/// Read from the same env the engine fan-out uses so the two stay consistent;
+/// clamped to >= 1 and floored at a sane minimum so a tiny per-partition cap
+/// can't thrash the compactor.
+fn fanout_partitions() -> usize {
+    std::env::var("BASIN_SHARD_PARTITIONS_PER_TABLE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4)
+}
+
+/// Floor on the per-partition tail caps so dividing by a large P can't shrink
+/// the cap below a useful flush size (one `MAX_COMPACTION_ROWS` chunk of a
+/// narrow row is well under this).
+const MIN_PER_PARTITION_TAIL_BYTES: usize = 32 * 1024 * 1024;
+
+/// Per-partition soft cap = total soft budget / P, floored.
+fn max_tail_bytes() -> usize {
+    (MAX_TAIL_BYTES_TOTAL / fanout_partitions()).max(MIN_PER_PARTITION_TAIL_BYTES)
+}
+
+/// Per-partition hard cap = total hard budget / P, floored.
+fn hard_tail_bytes() -> usize {
+    (HARD_TAIL_BYTES_TOTAL / fanout_partitions()).max(MIN_PER_PARTITION_TAIL_BYTES)
+}
 
 /// Upper bound on the number of rows a single compaction flush folds into one
 /// immutable data file. Compaction drains a partition's tail in chunks of at
@@ -3187,7 +3218,7 @@ impl InProcessProjectHandle {
         //     flush reuses `compact_one`, which drains in bounded
         //     (`MAX_COMPACTION_ROWS`) passes, so a single backpressure stall
         //     costs bounded file writes, not an O(table) rewrite.
-        if tail_bytes >= MAX_TAIL_BYTES {
+        if tail_bytes >= max_tail_bytes() {
             tracing::warn!(
                 project = %self.project,
                 partition = %self.partition,
@@ -3246,7 +3277,7 @@ impl InProcessProjectHandle {
                 }
             }
         }
-        if tail_bytes >= HARD_TAIL_BYTES {
+        if tail_bytes >= hard_tail_bytes() {
             // Flush the tail to immutable files. `compact_one` serializes per
             // partition via the partition's compaction lock, so a concurrent
             // background tick and this backpressure flush cannot double-commit
@@ -4296,7 +4327,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use arrow_array::{Int64Array, StringArray};
+    use arrow_array::{Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use basin_catalog::{InMemoryCatalog, LeaseRegistry};
     use basin_common::{PartitionKey, ProjectId, TableName};
@@ -4914,6 +4945,131 @@ mod tests {
         // No absolute bar — CI variance is too wide. The correctness
         // assertion above is the load-bearing claim; the wall-clock
         // print lets a follow-up regression be eyeballed quickly.
+    }
+
+    /// #28 fan-out correctness: rows written to DISTINCT partitions of the
+    /// same `(project, table)` must ALL be visible to a single
+    /// `(project, table)`-scoped read after compaction — the read unions every
+    /// partition (object-store LIST is table-prefix-scoped, above the partition
+    /// segment). This is the load-bearing correctness claim for intra-node
+    /// horizontal partitioning: no row may be lost or double-counted regardless
+    /// of which partition it landed in.
+    #[tokio::test]
+    async fn fanout_rows_across_partitions_read_unions_correctly() {
+        const PARTITIONS: usize = 4;
+        const ROWS_PER_PARTITION: usize = 250;
+        let (shard, _sd, _wd, storage, _cat, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let table = TableName::new("events").unwrap();
+
+        // Each partition gets a DISJOINT id range so every id is unique across
+        // the whole table — exactly the round-robin fan-out shape (stripe i
+        // gets rows i*N .. (i+1)*N). `s0` is `_default`, `s1`.. are `sN`,
+        // matching `executor::stripe_partition_key`.
+        for i in 0..PARTITIONS {
+            let partition = if i == 0 {
+                PartitionKey::default_key()
+            } else {
+                PartitionKey::new(format!("s{i}")).unwrap()
+            };
+            let handle = shard.get(&project, &partition).await.unwrap();
+            let start = (i * ROWS_PER_PARTITION) as i64;
+            handle
+                .write_batch(&table, batch(start, ROWS_PER_PARTITION, "v-"))
+                .await
+                .unwrap();
+        }
+
+        // Flush every partition's tail; `compact_all` schedules them all.
+        shard.flush_to_parquet().await.unwrap();
+
+        // Cold read is `(project, table)`-scoped and lists at the table prefix,
+        // so it spans EVERY partition subdir. Count must equal the total.
+        let stream = storage
+            .read(&project, &table, ReadOptions::default())
+            .await
+            .unwrap();
+        let read: Vec<RecordBatch> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows_in(&read),
+            PARTITIONS * ROWS_PER_PARTITION,
+            "fan-out read must union every partition: lost or double-counted rows",
+        );
+
+        // Point-lookup correctness: every id from every partition is present
+        // exactly once, regardless of which partition it landed in.
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for b in &read {
+            let ids = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for k in 0..ids.len() {
+                assert!(seen.insert(ids.value(k)), "duplicate id across partitions");
+            }
+        }
+        for expected in 0..(PARTITIONS * ROWS_PER_PARTITION) as i64 {
+            assert!(
+                seen.contains(&expected),
+                "id {expected} written to a fan-out partition was not found by the union read",
+            );
+        }
+    }
+
+    /// #28 PK-safety: a duplicate single-column-PK value must be detectable no
+    /// matter which partition each copy lands in. PK enforcement reads via the
+    /// `(project, table)`-scoped `list_data_files_with_stats`, which spans every
+    /// partition — so two rows with the same id written to DIFFERENT partitions
+    /// are both present in the union and a dup-check sees both. This test proves
+    /// the union surface the engine's `enforce_pk_on_insert` reads from contains
+    /// the duplicate; the engine then rejects it before the second write.
+    #[tokio::test]
+    async fn fanout_duplicate_key_visible_across_partitions() {
+        let (shard, _sd, _wd, storage, _cat, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let table = TableName::new("events").unwrap();
+
+        // id=42 written to `_default`, and a SECOND id=42 written to `s1`.
+        let h0 = shard.get(&project, &PartitionKey::default_key()).await.unwrap();
+        h0.write_batch(&table, batch(42, 1, "a-")).await.unwrap();
+        let h1 = shard.get(&project, &PartitionKey::new("s1").unwrap()).await.unwrap();
+        h1.write_batch(&table, batch(42, 1, "b-")).await.unwrap();
+
+        shard.flush_to_parquet().await.unwrap();
+
+        // The table-scoped union read must contain BOTH id=42 rows — i.e. a
+        // PK dup-check that reads this surface sees the collision even though
+        // the copies live in different partitions.
+        let stream = storage
+            .read(&project, &table, ReadOptions::default())
+            .await
+            .unwrap();
+        let read: Vec<RecordBatch> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let mut count_42 = 0usize;
+        for b in &read {
+            let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            for k in 0..ids.len() {
+                if ids.value(k) == 42 {
+                    count_42 += 1;
+                }
+            }
+        }
+        assert_eq!(
+            count_42, 2,
+            "both copies of the duplicate PK must be visible to the cross-partition union \
+             so the engine's PK check (which reads this surface) can reject the dup",
+        );
     }
 
     #[tokio::test]

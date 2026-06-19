@@ -8,6 +8,43 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-19 — Perf: intra-node horizontal partitioning fans bulk ingest across P compaction lanes
+
+- **A single bulk COPY now fans its batches across `P` shard partitions, so the
+  table runs `P` independent compaction lanes instead of one.** Previously every
+  batch of one ingest session landed in a single partition (`_default`), giving
+  it one tail + one compaction lane; against a high-RTT object store that lone
+  lane's compaction throughput capped sustained ingest (the tail filled and
+  backpressure paced the COPY *down* — per-chunk throughput decayed as the table
+  grew). Bulk batches now round-robin across `P` partitions
+  (`BASIN_SHARD_PARTITIONS_PER_TABLE`, default 4; `1` restores the old
+  single-partition behavior), each with its own tail + compaction lane that the
+  background compactor (`compact_all`) already schedules in parallel. Aggregate
+  compaction bandwidth scales ~`P×`, so the tails stay drained and sustained
+  ingest stays flat at a much higher rate. Measured under ~45 ms/PUT injected
+  latency (MinIO, simulating Tigris RTT), 12M-row no-PK COPY in 500k chunks:
+  `P=1` decayed from ~1.0M to ~0.65M rows/s (per-chunk 0.46 s → 1.00 s, RSS to
+  400 MiB); `P=4` ramped up and held flat at ~1.9M rows/s (per-chunk 0.26 s),
+  finishing in 13.3 s vs 21.2 s. (`basin-engine/src/executor.rs`:
+  `write_batch_fanout`, `fanout_partition_count`, wired into `exec_ingest_batch`.)
+- **Reads union every partition; correctness is unchanged.** The cold read path
+  is `(project, table)`-scoped and lists at the table prefix (above the
+  partition segment), so `SELECT`/`count(*)`/point/range span every partition's
+  files; the shard's `read_table_merging_tails` merges every resident
+  partition's un-flushed tail. `count(*)` is exact and point/range lookups
+  return the right rows regardless of which partition a row landed in.
+- **Single-column PRIMARY KEY / UNIQUE tables fan out too, with no risk of a
+  missed duplicate.** Constraint checks run before the write via
+  `list_data_files_with_stats` + the memtable registry, both of which span every
+  partition — so a duplicate key is detected no matter which partition each copy
+  lands in (verified: duplicate INSERT and COPY both rejected after a fanned-out
+  load). Round-robin (not hash-by-PK) is therefore safe.
+- **Per-partition memory stays bounded.** The shard's soft/hard tail caps are
+  now the whole-shard budget divided by `P` (floored at 32 MiB/partition), so
+  total resident tail is bounded by ~the single-partition budget rather than
+  `P×` it. (`basin-shard/src/in_process.rs`: `max_tail_bytes`, `hard_tail_bytes`,
+  `fanout_partitions`.)
+
 ## 2026-06-19 — Perf: parallel compaction keeps the tail bounded under a high-RTT object store
 
 - **Compaction now flushes multiple bounded output files concurrently, so its

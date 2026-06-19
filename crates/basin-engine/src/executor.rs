@@ -305,6 +305,156 @@ async fn write_batch_striped(
     handle.write_batch_opts(table, batch, durable).await
 }
 
+// ---------------------------------------------------------------------------
+// #28: intra-node horizontal partitioning (write fan-out for bulk ingest).
+//
+// `write_batch_striped` keys the partition off `session_pid`, so one session's
+// entire ingest lands in ONE partition → ONE shard compaction lane. A single
+// bulk COPY is one session, so against a high-RTT object store its lone lane's
+// compaction throughput caps sustained ingest (the tail fills, backpressure
+// paces the COPY down).
+//
+// The shard already runs an independent tail + compaction lane PER partition
+// (`compact_all` snapshots every resident partition and compacts each
+// concurrently) and reads already UNION every resident partition
+// (`read_table_merging_tails` merges every partition's tail; the cold side is
+// table-prefix-scoped via `storage.read`, which lists across all partition
+// subdirs). So fanning ONE table's bulk batches across P partitions gives P
+// independent compaction lanes → ~P× aggregate compaction bandwidth, keeping
+// the tails bounded and ingest flat at higher sustained rates.
+//
+// Selection scheme: chunk-granularity ROUND-ROBIN. Each bulk batch (one COPY
+// chunk) is written WHOLE to the next partition in rotation, tracked by a
+// per-(project, table) atomic counter. Over many chunks the lanes fill evenly.
+// Whole-chunk routing keeps each chunk in one WAL stream (no extra Arrow-IPC
+// encodes / schema headers) and is balanced and trivially correct.
+//
+// PK / UNIQUE handling: NO special-casing. Constraint checks run BEFORE this
+// point (`enforce_pk_on_insert` / `enforce_unique_on_insert`) and read via
+// `storage.list_data_files_with_stats` + the memtable registry, BOTH of which
+// span every partition — so a duplicate key is detected no matter which
+// partition either copy lands in. Round-robin (not hash-by-PK) is therefore
+// safe for PK tables too; a missed duplicate is impossible because the check
+// never depends on partition placement.
+//
+// Memory: each partition's tail is independently bounded (soft/hard caps in
+// basin-shard, now scaled DOWN by the active partition count there), so total
+// resident tail stays bounded by ~the single-partition budget rather than
+// P× it.
+// ---------------------------------------------------------------------------
+
+const FANOUT_PARTITIONS_DEFAULT: usize = 4;
+
+/// Number of partitions a single table's bulk ingest fans across. `1` disables
+/// fan-out (back-compat: all bulk writes stay in `_default`). Clamped to >= 1.
+/// Env: `BASIN_SHARD_PARTITIONS_PER_TABLE`.
+fn fanout_partition_count() -> usize {
+    std::env::var("BASIN_SHARD_PARTITIONS_PER_TABLE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(FANOUT_PARTITIONS_DEFAULT)
+}
+
+/// Per-`(project, table)` round-robin cursor for bulk-ingest partition
+/// fan-out. Process-global; an idle table costs one `AtomicUsize`.
+fn fanout_cursors() -> &'static dashmap::DashMap<(basin_common::ProjectId, String), std::sync::atomic::AtomicUsize>
+{
+    static CURSORS: OnceLock<
+        dashmap::DashMap<(basin_common::ProjectId, String), std::sync::atomic::AtomicUsize>,
+    > = OnceLock::new();
+    CURSORS.get_or_init(dashmap::DashMap::new)
+}
+
+/// Write `batch` whole through `shard` into the NEXT fan-out partition for
+/// `(project, table)`, rotating round-robin across `fanout_partition_count()`
+/// partitions so a single bulk-ingest session spreads across P independent
+/// compaction lanes. See the `#28` block comment above for the full rationale
+/// and the PK-safety argument.
+///
+/// `fanout == 1` or a trivially small batch (`<= 1` row) falls back to the
+/// `_default` single-handle path — identical to the pre-#28 behavior for
+/// single-partition tables and tiny statements.
+async fn write_batch_fanout(
+    shard: &basin_shard::Shard,
+    project: &basin_common::ProjectId,
+    table: &TableName,
+    batch: RecordBatch,
+    durable: bool,
+) -> Result<()> {
+    let fanout = fanout_partition_count();
+    if fanout <= 1 || batch.num_rows() <= 1 {
+        let handle = shard.get(project, &PartitionKey::default_key()).await?;
+        return handle.write_batch_opts(table, batch, durable).await;
+    }
+
+    // Round-robin: claim the next slot for this table and advance the cursor.
+    // `fetch_add` wraps at usize::MAX (decades of chunks away); the modulo
+    // keeps the index in range regardless, so wrap is harmless.
+    let idx = {
+        let key = (*project, table.as_str().to_owned());
+        let entry = fanout_cursors()
+            .entry(key)
+            .or_insert_with(|| std::sync::atomic::AtomicUsize::new(0));
+        entry.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % fanout
+    };
+    let part = stripe_partition_key(idx);
+    let handle = shard.get(project, &part).await?;
+    handle.write_batch_opts(table, batch, durable).await
+}
+
+#[cfg(test)]
+mod fanout_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// The per-`(project, table)` cursor advances round-robin and lands on each
+    /// of the P stripe partitions evenly — the mechanism that gives a single
+    /// bulk-ingest session P independent compaction lanes (#28). We exercise the
+    /// cursor + modulo directly (the same arithmetic `write_batch_fanout` uses)
+    /// so the test needs no shard / object store.
+    #[test]
+    fn fanout_cursor_round_robins_evenly_per_table() {
+        // A fresh ProjectId per run already makes the cursor key unique, so the
+        // process-global cursor map can't carry state in from another test.
+        let project = basin_common::ProjectId::new();
+        let table = "fanout_rr".to_string();
+        let fanout = 4usize;
+        let mut hits = [0usize; 4];
+        for _ in 0..(fanout * 25) {
+            let key = (project, table.clone());
+            let entry = fanout_cursors()
+                .entry(key)
+                .or_insert_with(|| std::sync::atomic::AtomicUsize::new(0));
+            let idx = entry.fetch_add(1, Ordering::Relaxed) % fanout;
+            hits[idx] += 1;
+        }
+        // Perfectly balanced: 25 writes to each of the 4 stripes.
+        assert_eq!(hits, [25, 25, 25, 25], "fan-out must round-robin evenly");
+        // Stripe 0 is `_default` (back-compat), 1..N are `sN`.
+        assert_eq!(stripe_partition_key(0), PartitionKey::default_key());
+        assert_eq!(stripe_partition_key(1).as_str(), "s1");
+    }
+
+    /// `BASIN_SHARD_PARTITIONS_PER_TABLE=1` disables fan-out (back-compat:
+    /// everything stays in `_default`); a missing / invalid value falls back to
+    /// the safe default of 4.
+    #[test]
+    fn fanout_partition_count_honors_env_and_defaults() {
+        // Single-threaded test; we restore the prior value.
+        let prev = std::env::var("BASIN_SHARD_PARTITIONS_PER_TABLE").ok();
+        std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "1");
+        assert_eq!(fanout_partition_count(), 1);
+        std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "0");
+        assert_eq!(fanout_partition_count(), FANOUT_PARTITIONS_DEFAULT, "0 is clamped to default");
+        std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
+        assert_eq!(fanout_partition_count(), FANOUT_PARTITIONS_DEFAULT);
+        if let Some(v) = prev {
+            std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", v);
+        }
+    }
+}
+
 /// Dispatch `LISTEN` / `UNLISTEN` / `NOTIFY` through the engine's SQL
 /// pub-sub primitive (`crate::notify_registry`).
 ///
@@ -7771,14 +7921,18 @@ pub(crate) async fn exec_ingest_batch(
     // Shard path (auto-commit only — same guard as exec_insert).
     if let Some(shard) = sess.engine.config().shard.as_ref() {
         if !crate::session::tx_is_active(&sess.state) {
-            // W4: statement-affine striping; see `write_batch_striped`.
+            // #28: bulk-ingest fan-out. This is the COPY / bulk-INSERT entry
+            // point — a single such session's chunks would all land in ONE
+            // `session_pid` stripe (one compaction lane). Round-robin each
+            // chunk across P partitions so the table runs P independent
+            // compaction lanes. Reads union every partition; PK/UNIQUE checks
+            // already ran above against all partitions. See `write_batch_fanout`.
             let _ = part;
-            write_batch_striped(
+            write_batch_fanout(
                 shard,
                 &sess.project,
                 table,
                 batch,
-                sess.session_pid,
                 sess.synchronous_commit(),
             )
             .await?;
