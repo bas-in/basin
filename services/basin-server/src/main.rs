@@ -19,9 +19,18 @@
 //!
 //! ```text
 //! BASIN_CATALOG=memory                                  # default; volatile
+//! BASIN_CATALOG=object_store                            # shared, durable, no external DB
+//! BASIN_CATALOG_PREFIX=_catalog                         # optional, default = _catalog/ (object_store only)
 //! BASIN_CATALOG=postgres://pc@127.0.0.1:5432/postgres   # durable, persists across restarts
 //! BASIN_CATALOG_SCHEMA=basin_catalog                    # optional, default = basin_catalog
 //! ```
+//!
+//! `BASIN_CATALOG=object_store` builds a Basin-native shared catalog + writer
+//! lease registry directly on the SAME object store as the data — N engine
+//! nodes pointed at one bucket share one project's catalog and partition leases
+//! with no external database. The catalog lives under `_catalog/` and leases
+//! under `_leases/` (both nested under `BASIN_STORAGE_ROOT_PREFIX` when set, so
+//! catalog + data co-locate cleanly under one bucket sub-prefix).
 //!
 //! Object storage is selected via `BASIN_STORAGE_BACKEND`:
 //!
@@ -251,6 +260,12 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)
         .with_context(|| format!("create data dir {}", cfg.data_dir.display()))?;
     let object_store = build_storage_object_store(&cfg)?;
+    // The object-store catalog (when selected) must read/write the RAW bucket —
+    // the same store as the data, under distinct top-level prefixes
+    // (`_catalog/`/`_leases/`) — NOT the page/disk-cached `Storage` wrapper
+    // (which would serve stale cached pages and cannot CAS). `object_store` is
+    // moved into `Storage` below, so clone the Arc now to keep a raw handle.
+    let catalog_object_store = object_store.clone();
 
     // Production cache defaults: disk + page cache ON unless explicitly
     // disabled. Knobs (in priority order, highest wins):
@@ -346,6 +361,55 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("connect postgres catalog at {url}"))?;
             let cat = Arc::new(cat);
             (cat.clone(), cat)
+        }
+        CatalogBackend::ObjectStore { prefix } => {
+            // Catalog + lease registry over the RAW data store. Layout (under
+            // the same bucket, nested below `storage_root_prefix` when set so
+            // catalog and data co-locate):
+            //
+            //   {root}_catalog/{project}/public/{table}/v{N}.json   # catalog
+            //   {root}_leases/{project}/{partition}/e{EPOCH}.json   # leases
+            //
+            // where {root} = "<storage_root_prefix>/" (or "" when unset). The
+            // catalog root prefix can be overridden with BASIN_CATALOG_PREFIX
+            // (default `_catalog/`); leases always use the sibling `_leases/`.
+            let root = cfg
+                .storage_root_prefix
+                .as_ref()
+                .map(|p| {
+                    let s = p.as_ref();
+                    if s.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{s}/")
+                    }
+                })
+                .unwrap_or_default();
+            let catalog_prefix = prefix
+                .clone()
+                .unwrap_or_else(|| basin_catalog::DEFAULT_CATALOG_PREFIX.to_string());
+            let catalog_root = format!("{root}{}", catalog_prefix.trim_end_matches('/'));
+            let lease_root = format!(
+                "{root}{}",
+                basin_catalog::DEFAULT_LEASE_PREFIX.trim_end_matches('/')
+            );
+            tracing::info!(
+                catalog_root = %catalog_root,
+                lease_root = %lease_root,
+                "catalog backend: object_store (shared, durable, no external DB)"
+            );
+            let cat = Arc::new(basin_catalog::ObjectStoreCatalog::with_prefix(
+                catalog_object_store.clone(),
+                &catalog_root,
+            ));
+            let leases = Arc::new(basin_catalog::ObjectStoreLeaseRegistry::with_prefix(
+                catalog_object_store.clone(),
+                &lease_root,
+            ));
+            (
+                cat as Arc<dyn basin_catalog::Catalog>,
+                leases as Arc<dyn basin_catalog::LeaseRegistry>,
+            )
         }
     };
 
@@ -1209,6 +1273,15 @@ enum CatalogBackend {
         url: String,
         schema: String,
     },
+    /// Basin-native shared catalog + lease registry backed by the SAME object
+    /// store as the data (no external DB). N engine nodes pointed at one bucket
+    /// share one project's catalog and partition leases. `prefix` overrides the
+    /// catalog root (default `DEFAULT_CATALOG_PREFIX`); the lease registry lives
+    /// under the sibling `_leases/` prefix. Both nest under
+    /// `cfg.storage_root_prefix` when set, so catalog + data co-locate.
+    ObjectStore {
+        prefix: Option<String>,
+    },
 }
 
 impl Cfg {
@@ -1480,6 +1553,12 @@ fn parse_catalog_env() -> Result<CatalogBackend> {
     if raw == "memory" {
         return Ok(CatalogBackend::Memory);
     }
+    // Basin-native shared catalog over the data object store (no external DB).
+    if raw == "object_store" {
+        return Ok(CatalogBackend::ObjectStore {
+            prefix: std::env::var("BASIN_CATALOG_PREFIX").ok(),
+        });
+    }
     // `tokio_postgres::connect` accepts both `postgres://...` URL form and
     // libpq keyword form (`host=... user=...`). We accept either as the
     // postgres backend marker.
@@ -1489,7 +1568,7 @@ fn parse_catalog_env() -> Result<CatalogBackend> {
         return Ok(CatalogBackend::Postgres { url: raw, schema });
     }
     Err(anyhow!(
-        "BASIN_CATALOG must be 'memory' or a postgres connection string, got {raw:?}"
+        "BASIN_CATALOG must be 'memory', 'object_store', or a postgres connection string, got {raw:?}"
     ))
 }
 

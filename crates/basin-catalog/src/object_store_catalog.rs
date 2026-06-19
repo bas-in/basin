@@ -2009,4 +2009,105 @@ mod tests {
             Some(100)
         );
     }
+
+    // --- Test: two NODES share one project's catalog over one store ---------
+    //
+    // This is the multi-node property the object-store backend exists for: two
+    // engine nodes, each with its OWN in-process `ObjectStoreCatalog` instance
+    // (and thus its own session cache), pointed at one shared bucket + prefix.
+    // Node A creates a table and commits a chain; node B — which never wrote —
+    // must see the full state through HEAD/version refresh, not stale/empty
+    // cached data. Then the same for the lease registry: A holds, B is fenced.
+    #[tokio::test]
+    async fn two_nodes_share_catalog_over_one_store() {
+        // ONE shared bucket; TWO independent catalog instances (= two nodes).
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let node_a = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
+        let node_b = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
+
+        let p = ProjectId::new();
+        let t = TableName::new("shared").unwrap();
+
+        // Node A creates the table and commits 3 append snapshots.
+        node_a.create_namespace(&p).await.unwrap();
+        node_a.create_table(&p, &t, &schema()).await.unwrap();
+        let mut expected = SnapshotId::GENESIS;
+        for i in 0..3 {
+            let m = node_a
+                .append_data_files(&p, &t, expected, vec![file(&format!("a{i}.parquet"), 10)])
+                .await
+                .unwrap();
+            expected = m.current_snapshot;
+        }
+        let a_snapshot = node_a.current_snapshot_id(&p, &t).await.unwrap();
+        assert_eq!(a_snapshot, SnapshotId(3));
+
+        // KEY ASSERTION: node B — independent in-process cache, never wrote —
+        // sees the table, all 3 commits' files, and the SAME current snapshot.
+        // If B served a stale/empty cache this would fail (cross-node staleness
+        // bug); it passes because reads revalidate against HEAD/version.
+        let b_loaded = node_b.load_table(&p, &t).await.unwrap();
+        assert_eq!(
+            b_loaded.live_data_files().len(),
+            3,
+            "node B sees all 3 of node A's committed files (cross-node visibility)"
+        );
+        let b_snapshot = node_b.current_snapshot_id(&p, &t).await.unwrap();
+        assert_eq!(
+            b_snapshot, a_snapshot,
+            "node B's current snapshot matches node A's (no stale cache)"
+        );
+
+        // Now the lease registry across the same two nodes. Use a manual clock
+        // so the expired-steal branch is deterministic.
+        let clock = Arc::new(ManualClock(AtomicI64::new(1_000)));
+        let lease_a = ObjectStoreLeaseRegistry::with_prefix_and_clock(
+            store.clone(),
+            DEFAULT_LEASE_PREFIX,
+            clock.clone(),
+        );
+        let lease_b = ObjectStoreLeaseRegistry::with_prefix_and_clock(
+            store.clone(),
+            DEFAULT_LEASE_PREFIX,
+            clock.clone(),
+        );
+        let part = "partition-0";
+
+        // Node A acquires the writer lease.
+        let granted = lease_a
+            .acquire(&p, part, "nodeA", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("node A acquires the lease");
+        assert_eq!(granted.epoch, 1);
+
+        // Node B cannot acquire while A's lease is live: single-writer ACROSS
+        // nodes through the shared store.
+        let b_attempt = lease_b
+            .acquire(&p, part, "nodeB", Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert!(
+            b_attempt.is_none(),
+            "node B is refused while node A holds the lease (single-writer across nodes)"
+        );
+
+        // Node B sees node A as the owner at the granted epoch.
+        let (owner, epoch) = lease_b.owner_of(&p, part).await.unwrap().unwrap();
+        assert_eq!(owner, "nodeA");
+        assert_eq!(epoch, 1);
+
+        // Advance past A's TTL: node B can steal the EXPIRED lease at a strictly
+        // higher epoch (the WAL fencing token increments across nodes).
+        clock.0.store(40_000, SeqCst);
+        let stolen = lease_b
+            .acquire(&p, part, "nodeB", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("node B steals the expired lease");
+        assert_eq!(stolen.epoch, 2, "stolen epoch strictly increases across nodes");
+        let (owner2, epoch2) = lease_a.owner_of(&p, part).await.unwrap().unwrap();
+        assert_eq!(owner2, "nodeB");
+        assert_eq!(epoch2, 2);
+    }
 }

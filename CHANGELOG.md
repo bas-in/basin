@@ -8,6 +8,40 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-19 — Wire the object-store shared catalog into the deployed engine server
+
+- **`BASIN_CATALOG=object_store` now selects the Basin-native shared catalog +
+  writer-lease registry in `basin-server`.** Previously the
+  `ObjectStoreCatalog` / `ObjectStoreLeaseRegistry` existed in `basin-catalog`
+  but the deployed server could only pick `memory` (per-process, false multi-node
+  safety) or `postgres` (durable but an external DB). The new backend gives
+  multiple engine nodes one shared, durable catalog and partition-lease registry
+  with **no external database** — both built on the SAME object store as the data.
+  - The catalog uses the **raw** object store (the same bucket as the data,
+    distinct top-level prefixes `_catalog/` and `_leases/`), not the
+    page/disk-cached `Storage` wrapper — so it can do create-if-absent CAS and
+    never serves stale cached pages. The raw `Arc<dyn ObjectStore>` is cloned
+    before it is moved into `Storage`.
+  - Catalog + leases nest under `BASIN_STORAGE_ROOT_PREFIX` when set
+    (`{root}/_catalog/…`, `{root}/_leases/…`), so catalog and data co-locate
+    cleanly under one bucket sub-prefix. `BASIN_CATALOG_PREFIX` overrides the
+    catalog root (default `_catalog/`); leases always use the sibling `_leases/`.
+  - When `BASIN_LEASE_MODE=required` (+ `BASIN_SHARD_ENABLED=1`), this shared
+    registry is the one wired into the shard, so single-writer enforcement is now
+    correct across nodes (the in-memory registry was per-process).
+  - New multi-node integration test `two_nodes_share_catalog_over_one_store`:
+    two independent `ObjectStoreCatalog` instances over one `InMemory` store —
+    node A creates a table and commits 3 snapshots; node B (own in-process cache,
+    never wrote) sees all 3 files and the same `current_snapshot_id`, proving
+    cross-node visibility via HEAD/version refresh (no stale-cache bug). The same
+    test then proves single-writer leasing across nodes: A holds, B is refused
+    and sees A as owner, then steals the lease at a strictly higher epoch after A
+    expires.
+  - Honest gap (carried from Wave 1): the object-store catalog keys only the
+    `public` schema (`{project}/public/{table}/`). Tables created in other
+    schemas are not yet addressable by this backend — schema-qualified manifests
+    remain a follow-up.
+
 ## 2026-06-19 — Basin-native shared catalog + lease registry on the object store (no external DB)
 
 - **New `basin_catalog::ObjectStoreCatalog` — a shared, multi-node catalog
