@@ -8,6 +8,52 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-19 — Basin-native shared catalog + lease registry on the object store (no external DB)
+
+- **New `basin_catalog::ObjectStoreCatalog` — a shared, multi-node catalog
+  backed entirely by the object store (Tigris/S3), with no external database.**
+  N engine nodes share one project's table metadata and partition leases by
+  pointing at the same bucket/prefix. The whole design rests on one object-store
+  primitive: create-if-absent (`PutMode::Create` / HTTP `If-None-Match: *`).
+  - **Table metadata is a versioned manifest log.** Per `(project, table)` the
+    full table state (schema, current snapshot, the entire snapshot chain with
+    data files / removed paths / summaries, partition spec, RLS, bloom/cluster
+    columns, file format, indexes, constraints, promoted JSONB paths, GC orphan
+    list, etc.) is serialised as JSON at `_catalog/{project}/public/{table}/v{N:020}.json`,
+    where `N` is the monotonic catalog version. A best-effort `HEAD` pointer
+    resolves the current version in one GET, with a LIST-max fallback. Old
+    versions are never deleted — they are the time-travel history and let a
+    reader mid-commit see a consistent older manifest.
+  - **Optimistic concurrency → `CommitConflict`.** `append_data_files` /
+    `replace_data_files` verify `manifest.current_snapshot == expected_snapshot`,
+    build manifest `N+1`, and write it with `PutMode::Create`. An
+    `AlreadyExists` (another node already wrote `N+1`) surfaces as
+    `BasinError::CommitConflict`, which the engine already retries. Idempotent
+    `set_*` DDL transparently re-applies on a lost race (bounded retries).
+  - **Shared lease registry on the same primitive.** `ObjectStoreLeaseRegistry`
+    models leases as a monotonic epoch log at
+    `_leases/{project}/{partition}/e{EPOCH:020}.json`. Acquisition only ever
+    *creates a higher epoch* via create-if-absent, so two racers can never both
+    win the same epoch — the loser is fenced. This replaces the per-process
+    in-memory `LeaseRegistry` that gives false safety across nodes. The epoch is
+    the same fencing token the shard records and the WAL appends carry.
+  - **Backend selection.** `BASIN_CATALOG_BACKEND=object_store` opts in; the
+    default (unset) is unchanged, so all existing behaviour and tests are
+    untouched. `basin_catalog::build_object_store_backend(store)` constructs the
+    catalog + lease registry from the same object store the storage layer uses
+    (`Storage::object_store_handle()`).
+  - **S3/Tigris conditional-put** (`AmazonS3Builder::with_conditional_put`) is
+    now pinned explicitly to `ETagMatch` in `basin-storage`'s S3 builder. This
+    is the object_store 0.13 default, but pinning it makes the create-if-absent
+    atomicity the shared catalog depends on robust against future builder edits.
+  - Correctness is covered by a split-brain double-committer test (N racers,
+    many rounds: exactly one winner per round, linear conflict-free chain) and a
+    double-lease test (exactly one holder per epoch, strictly increasing epochs,
+    expired-lease steal + fenced-loser observation).
+  - Partial / follow-up: schema-qualified (non-`public`) manifests, GC of old
+    manifest versions, and the live cloud-server wiring of the env switch are
+    out of scope for this wave.
+
 ## 2026-06-19 — Perf: intra-node horizontal partitioning fans bulk ingest across P compaction lanes
 
 - **A single bulk COPY now fans its batches across `P` shard partitions, so the

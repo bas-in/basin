@@ -219,6 +219,15 @@ impl S3LikeConfig {
             .with_region(&self.region)
             .with_access_key_id(&self.access_key_id)
             .with_secret_access_key(&self.secret_access_key)
+            // Conditional put (If-None-Match: *) is load-bearing for the
+            // Basin-native object-store catalog's create-if-absent CAS core
+            // (`basin_catalog::ObjectStoreCatalog`): it is what makes
+            // `PutMode::Create` atomic on S3/Tigris. `ETagMatch` is the
+            // object_store 0.13 default, but we pin it explicitly so a future
+            // builder edit can't silently disable it and break catalog safety.
+            // Tigris and Cloudflare R2 both support the standard precondition
+            // headers; AWS S3 has supported If-None-Match on PUT since 2024.
+            .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
             .with_client_options(client_opts);
 
         // Plaintext HTTP is rejected by default (avoid silently leaking

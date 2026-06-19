@@ -42,6 +42,10 @@ mod inbound_webhooks;
 /// Phase 6.X.A — partition-lease primitive (ADR 0023 foundation).
 pub mod leases;
 mod metadata;
+/// Basin-native shared catalog + lease registry backed by the object store
+/// (Tigris/S3) — no external database. N engine nodes share one project's
+/// table metadata + partition leases via create-if-absent (`PutMode::Create`).
+pub mod object_store_catalog;
 mod postgres;
 mod procedures;
 mod project_storage_config;
@@ -98,6 +102,11 @@ pub use metadata::{
     CaggPolicy, CheckConstraint, ColumnStats, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec,
     Policy, PolicyCommand, PromotedJsonbPath, RefAction, S3Config, SecondaryIndex, TableFileFormat,
     TableMetadata, ProjectMetadata, UniqueConstraint,
+};
+pub use object_store_catalog::{
+    build_object_store_backend, object_store_backend_selected, LeaseClock, ObjectStoreCatalog,
+    ObjectStoreLeaseRegistry, SystemClock, CATALOG_BACKEND_ENV, DEFAULT_CATALOG_PREFIX,
+    DEFAULT_LEASE_PREFIX,
 };
 pub use postgres::PostgresCatalog;
 pub use procedures::{ProcedureError, SqlProcedureDef};

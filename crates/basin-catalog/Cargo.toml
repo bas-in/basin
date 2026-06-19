@@ -35,6 +35,10 @@ sqlparser.workspace = true
 bitflags = "2"
 # HTTP client for POSTing metering batches to the cloud ingest endpoint (T-053).
 reqwest.workspace = true
+# Object-store-backed shared catalog + lease registry (Basin-native, no external
+# DB). Uses PutMode::Create (create-if-absent) for the CAS core.
+object_store.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
