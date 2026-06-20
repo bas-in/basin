@@ -8,6 +8,65 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-20 — Flat-scale ingest: O(1)-amortized per-partition catalog commits (delta segments + periodic snapshot)
+
+On a live 2-node dev test, multi-node ingest throughput decayed ~48k→31k r/s
+from 10M→155M rows — with the compaction tail bounded (1–6 MiB), zero
+backpressure and zero CAS contention. The decay was NOT compaction; it was
+`O(files-in-partition)` work in the per-partition object-store catalog commit
+path. Each per-partition segment object held the partition's FULL cumulative
+data-file list, so every data-file commit (`commit_part_snapshot`, the
+`append_data_files_in_partition` / `replace_data_files_in_partition` hot path)
+read the full list (GET), appended one file, and wrote the full list+1 (PUT) —
+so per-commit cost, and therefore ingest throughput, scaled with how many files
+the partition already held.
+
+Fix — **the per-partition segment is now an append-only DELTA LOG with periodic
+snapshot compaction**, so each commit is O(1) in the data it writes,
+independent of partition size:
+
+- **What a commit writes.** Each versioned object `parts/{pid}/v{M}.json` is now
+  EITHER a small DELTA — only THIS commit's `{added, removed}` plus a
+  `base_version` pointer to the prior object — OR a self-contained BASELINE
+  (`baseline = Some(full live set)`, `base_version = None`). A commit reads only
+  the partition HEAD version (O(1), for the per-partition OCC token + replace
+  validation against the folded live set) and writes ONE delta object whose
+  serialized size is O(files added/removed in THIS commit). The flat-scale
+  property: per-commit PUT cost no longer grows with table size.
+- **Fold-on-read.** `load_part_current` folds the chain from the latest baseline
+  forward — read the HEAD object, walk back along `base_version` collecting
+  deltas to the nearest baseline, then apply baseline + deltas. Cost is
+  `O(baseline + ≤K deltas)`, bounded by the compaction threshold K, NOT
+  `O(total commits)`. The unioned read (`load_unioned` / `load_table`) is
+  unchanged in semantics: every committed file appears exactly once, removed
+  files absent.
+- **Segment compaction.** When the deltas on top of the latest baseline would
+  reach K, the commit writes a fresh consolidated BASELINE instead of a delta,
+  bounding read fold depth to < K. Compaction runs inline but only once per K
+  commits (amortized O(1) per commit); the partition's single deterministic
+  owner means no cross-writer race on its chain, and the existing create-if-
+  absent CAS on the version is the safety net. K is
+  `BASIN_PART_SEGMENT_COMPACT_EVERY` (default 32).
+- **Correctness preserved.** Per-partition OCC token semantics, COW
+  UPDATE/DELETE via `replace_data_files_in_partition`, the non-partitioned
+  single-node META path, and `InMemory` / `Postgres` backends are all
+  unchanged. The first commit to a partition is always a baseline (no
+  predecessor to fold from).
+- **Format note.** The per-partition segment object format changed; there is no
+  production data in the object-store catalog (dev-only, droppable tables), so
+  the new format is required (no migration of old per-partition segments).
+
+Tests (`object_store_catalog`): `part_commit_is_o1_delta_independent_of_file_count`
+seeds 200 files via 200 commits and asserts the next commit's object carries
+only the 1 added file (and stays < 4 KiB) — the regression guard against the
+decay; `part_delta_fold_matches_reference_replay` checks the folded live set
+equals a replay reference across appends + interleaved removes crossing several
+baselines; `part_segment_compaction_writes_bounded_baseline` checks a baseline
+is written every K and read fold depth stays < K with the set still exactly
+correct. The multi-writer / no-contention / union-correctness test
+(`multi_writer_cross_partition_no_contention`) and same-partition OCC test
+still pass.
+
 ## 2026-06-20 — Route the ingest hot path through a cheap META-only catalog load (multi-node ingest throughput)
 
 After the per-partition data-file sharding (below), multi-node bulk ingest

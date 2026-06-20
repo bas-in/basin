@@ -73,7 +73,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use basin_common::{BasinError, ProjectId, QualifiedTableName, Result, SchemaName, TableName};
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use object_store::{path::Path as OsPath, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -247,73 +247,84 @@ impl TableManifest {
     }
 }
 
-/// The data-file state of ONE partition of a table, serialised at a
-/// monotonically-versioned per-partition key. This is the unit that the hot
-/// ingest path CASes — sharding it by partition is the multi-node scaling fix:
-/// each partition has a single owner/writer, so concurrent writers CAS
-/// different keys and never contend.
+/// One versioned object in a partition's segment chain. This is the on-disk
+/// unit that the hot ingest path CASes — sharding it by partition is the
+/// multi-node scaling fix: each partition has a single owner/writer, so
+/// concurrent writers CAS different keys and never contend.
 ///
 /// Layout (per `(project, schema, table, partition_id)`):
 /// ```text
-///   {root}{project}/{schema}/{table}/parts/{partition_id}/v{M:020}.json  # immutable segment, M = per-partition version
+///   {root}{project}/{schema}/{table}/parts/{partition_id}/v{M:020}.json  # immutable segment object, M = per-partition version
 ///   {root}{project}/{schema}/{table}/parts/{partition_id}/HEAD           # best-effort max-M pointer
 /// ```
-/// A segment carries this partition's own snapshot chain + OCC token. Reads
-/// UNION every partition's live data files (see `load_unioned`); the table META
-/// manifest (the legacy `v{N}.json` chain) keeps schema/DDL/spec.
+///
+/// FLAT-SCALE FORMAT (delta log + periodic snapshot): each versioned object is
+/// EITHER a small DELTA — only the change for THIS commit (`delta`) plus a
+/// `base_version` pointer to the prior object — OR a consolidated SNAPSHOT/
+/// baseline (`baseline = Some(full live set)`, `base_version = None`). A commit
+/// writes ONE delta object whose size is O(files added/removed in THIS commit),
+/// independent of how many files the partition already holds — so per-commit
+/// work (and thus ingest throughput) is flat in table size. Reads FOLD the
+/// chain from the latest baseline forward (bounded by the compaction threshold
+/// K, see [`ObjectStoreCatalog::part_segment_compact_every`]).
+///
+/// Reads UNION every partition's live data files (see `load_unioned`); the
+/// table META manifest (the legacy `v{N}.json` chain) keeps schema/DDL/spec.
+///
+/// Single-owner-per-partition + the create-if-absent CAS on `version` make the
+/// chain race-free: only the owning writer ever appends to a partition's chain.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PartitionSegment {
+struct PartSegmentObject {
     /// Monotonic per-partition version (`M` in `parts/{pid}/v{M}.json`).
     version: u64,
     /// This partition's OCC token (advances on every data-file commit here).
     current_snapshot: SnapshotId,
-    /// This partition's append/replace snapshot chain (data-file deltas only).
-    snapshots: Vec<Snapshot>,
+    /// The single snapshot (delta) committed at THIS version: its `data_files`
+    /// are the files ADDED here and `removed_paths` the files removed here. Even
+    /// for a baseline object this carries the OCC bookkeeping (id/parent/time).
+    delta: Snapshot,
+    /// For a DELTA object: the version of the prior object to fold from
+    /// (`version - 1`). `None` marks a BASELINE/genesis object that needs no
+    /// predecessor — its `baseline` holds the full live set.
+    base_version: Option<u64>,
+    /// For a BASELINE object (genesis or a compaction consolidation): the FULL
+    /// live data-file set as of this version. `None` for a pure delta object.
+    baseline: Option<Vec<DataFileRef>>,
 }
 
-impl PartitionSegment {
+/// A partition's FOLDED current state: its OCC token, version, and the full
+/// live data-file set produced by folding the delta chain from the latest
+/// baseline forward. This is what `load_part_current` returns and what every
+/// reader consumes; it preserves the old `PartitionSegment` read API
+/// (`current_snapshot` / `live_data_files()`) so callers are unchanged.
+#[derive(Clone, Debug)]
+struct PartitionLive {
+    /// The HEAD version this view was folded at (diagnostic / parity with the
+    /// cached segment version).
+    #[allow(dead_code)]
+    version: u64,
+    current_snapshot: SnapshotId,
+    live: Vec<DataFileRef>,
+    /// Latest commit time across the folded chain (used to stamp unioned reads).
+    latest_committed_at: DateTime<Utc>,
+    /// Number of delta objects applied on top of the latest baseline (i.e. the
+    /// read fold depth). Used to decide when to write a fresh baseline.
+    deltas_since_baseline: u64,
+}
+
+impl PartitionLive {
     fn genesis() -> Self {
-        let genesis = Snapshot {
-            id: SnapshotId::GENESIS,
-            parent: None,
-            committed_at: Utc::now(),
-            data_files: Vec::new(),
-            removed_paths: Vec::new(),
-            summary: SnapshotSummary {
-                operation: SnapshotOperation::Genesis,
-                added_files: 0,
-                added_rows: 0,
-                added_bytes: 0,
-                removed_files: 0,
-            },
-        };
         Self {
             version: 0,
             current_snapshot: SnapshotId::GENESIS,
-            snapshots: vec![genesis],
+            live: Vec::new(),
+            latest_committed_at: Utc::now(),
+            deltas_since_baseline: 0,
         }
     }
 
-    /// Live data files in this partition at its current snapshot (applies the
-    /// partition's own removed_paths; paths are globally unique, so a partition
-    /// only ever removes its own files).
     fn live_data_files(&self) -> Vec<DataFileRef> {
-        use std::collections::HashMap;
-        let mut ordered: Vec<&Snapshot> = self.snapshots.iter().collect();
-        ordered.sort_by_key(|s| s.id);
-        let mut live: HashMap<String, DataFileRef> = HashMap::new();
-        for snap in ordered {
-            if snap.id > self.current_snapshot {
-                break;
-            }
-            for p in &snap.removed_paths {
-                live.remove(p);
-            }
-            for f in &snap.data_files {
-                live.insert(f.path.clone(), f.clone());
-            }
-        }
-        live.into_values().collect()
+        self.live.clone()
     }
 }
 
@@ -324,11 +335,11 @@ struct CacheEntry {
     manifest: Arc<TableManifest>,
 }
 
-/// One cached per-partition segment plus the version it was read at.
+/// One cached per-partition FOLDED live view plus the version it was read at.
 #[derive(Clone)]
 struct PartCacheEntry {
     version: u64,
-    segment: Arc<PartitionSegment>,
+    segment: Arc<PartitionLive>,
 }
 
 /// Basin-native shared catalog backed by an object store.
@@ -361,6 +372,11 @@ pub struct ObjectStoreCatalog {
     /// avoid racing on a shared process env var, and available to callers that
     /// want a per-catalog block size). See [`ObjectStoreCatalog::seq_block`].
     seq_block_override: Option<u64>,
+    /// Explicit per-partition segment-compaction threshold override. `None`
+    /// means "read `BASIN_PART_SEGMENT_COMPACT_EVERY` (default 32)"; `Some(k)`
+    /// pins it (used by tests to avoid racing on a shared process env var). See
+    /// [`ObjectStoreCatalog::part_segment_compact_every`].
+    part_compact_override: Option<u64>,
 }
 
 /// Node-local cursor over a reserved sequence block. `next` is the value the
@@ -399,6 +415,7 @@ impl ObjectStoreCatalog {
             part_cache: Mutex::new(HashMap::new()),
             seq_local: Mutex::new(HashMap::new()),
             seq_block_override: None,
+            part_compact_override: None,
         }
     }
 
@@ -409,6 +426,16 @@ impl ObjectStoreCatalog {
     pub fn with_seq_block(store: Arc<dyn ObjectStore>, block: u64) -> Self {
         let mut c = Self::with_prefix(store, DEFAULT_CATALOG_PREFIX);
         c.seq_block_override = Some(block.max(1));
+        c
+    }
+
+    /// Construct with an explicit per-partition segment-compaction threshold
+    /// (bypasses `BASIN_PART_SEGMENT_COMPACT_EVERY`). Mainly for tests that need
+    /// a deterministic K without touching the shared process env.
+    #[cfg(test)]
+    pub fn with_part_compact_every(store: Arc<dyn ObjectStore>, k: u64) -> Self {
+        let mut c = Self::with_prefix(store, DEFAULT_CATALOG_PREFIX);
+        c.part_compact_override = Some(k.max(1));
         c
     }
 
@@ -916,7 +943,7 @@ impl ObjectStoreCatalog {
         qtable: &QualifiedTableName,
         partition_id: &str,
         version: u64,
-    ) -> Result<PartitionSegment> {
+    ) -> Result<PartSegmentObject> {
         let key = self.part_segment_key(project, qtable, partition_id, version);
         let res = self.store.get(&key).await.map_err(|e| match e {
             object_store::Error::NotFound { .. } => BasinError::not_found(format!(
@@ -930,20 +957,91 @@ impl ObjectStoreCatalog {
         })
     }
 
-    /// Load a partition's current segment (highest version), via cache when the
-    /// cached version matches HEAD. Returns a genesis segment (version 0) when
-    /// the partition has no segment yet, so a first append starts cleanly.
+    /// Fold a partition's delta chain at `head_version` into its full live set.
+    ///
+    /// Reads the HEAD object, then walks back along `base_version` collecting
+    /// delta objects until it hits a BASELINE (which carries the full live set
+    /// at its version) or genesis. It then applies the collected deltas
+    /// oldest-first on top of the baseline's live set. Cost is
+    /// `O(baseline_size + deltas_since_baseline)` GETs of `≤ K + 1` objects,
+    /// bounded by the compaction threshold K — NOT O(total commits).
+    async fn fold_part_chain(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+        head_version: u64,
+    ) -> Result<PartitionLive> {
+        use std::collections::HashMap;
+        // Collect delta objects from HEAD back to (and including) the baseline.
+        let head = self
+            .get_part_segment(project, qtable, partition_id, head_version)
+            .await?;
+        let current_snapshot = head.current_snapshot;
+        // Commits to a partition are monotonic (single owner), so the HEAD
+        // object's commit time is the partition's latest.
+        let latest_committed_at = head.delta.committed_at;
+        let mut deltas: Vec<Snapshot> = Vec::new();
+        let mut deltas_since_baseline: u64 = 0;
+        let mut live: HashMap<String, DataFileRef> = HashMap::new();
+
+        let mut cur = head;
+        loop {
+            if let Some(files) = cur.baseline.take() {
+                // Reached a baseline (or genesis): it carries the full live set.
+                for f in files {
+                    live.insert(f.path.clone(), f);
+                }
+                break;
+            }
+            // A delta object: stash its change, follow the base pointer.
+            deltas_since_baseline += 1;
+            let base = cur.base_version.ok_or_else(|| {
+                BasinError::catalog(format!(
+                    "{project}/{qtable}[{partition_id}]: delta v{} has no base_version",
+                    cur.version
+                ))
+            })?;
+            deltas.push(cur.delta);
+            cur = self
+                .get_part_segment(project, qtable, partition_id, base)
+                .await?;
+        }
+
+        // Apply deltas oldest-first on top of the baseline (we pushed them
+        // newest-first while walking back, so iterate in reverse).
+        for snap in deltas.into_iter().rev() {
+            for p in &snap.removed_paths {
+                live.remove(p);
+            }
+            for f in &snap.data_files {
+                live.insert(f.path.clone(), f.clone());
+            }
+        }
+
+        Ok(PartitionLive {
+            version: head_version,
+            current_snapshot,
+            live: live.into_values().collect(),
+            latest_committed_at,
+            deltas_since_baseline,
+        })
+    }
+
+    /// Load a partition's current FOLDED live view (highest version), via cache
+    /// when the cached version matches HEAD. Returns a genesis view (version 0)
+    /// when the partition has no segment yet, so a first append starts cleanly.
     async fn load_part_current(
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
         partition_id: &str,
-    ) -> Result<(u64, Arc<PartitionSegment>)> {
+    ) -> Result<(u64, Arc<PartitionLive>)> {
         let Some(version) = self
             .resolve_part_head_version(project, qtable, partition_id)
             .await?
         else {
-            return Ok((0, Arc::new(PartitionSegment::genesis())));
+            return Ok((0, Arc::new(PartitionLive::genesis())));
         };
         let ck = self.part_cache_key(project, qtable, partition_id);
         {
@@ -954,8 +1052,8 @@ impl ObjectStoreCatalog {
                 }
             }
         }
-        let segment = Arc::new(
-            self.get_part_segment(project, qtable, partition_id, version)
+        let live = Arc::new(
+            self.fold_part_chain(project, qtable, partition_id, version)
                 .await?,
         );
         let mut cache = self.part_cache.lock().await;
@@ -963,10 +1061,10 @@ impl ObjectStoreCatalog {
             ck,
             PartCacheEntry {
                 version,
-                segment: segment.clone(),
+                segment: live.clone(),
             },
         );
-        Ok((version, segment))
+        Ok((version, live))
     }
 
     /// Write partition segment `version` via create-if-absent. `true` = won.
@@ -976,7 +1074,7 @@ impl ObjectStoreCatalog {
         qtable: &QualifiedTableName,
         partition_id: &str,
         version: u64,
-        segment: &PartitionSegment,
+        segment: &PartSegmentObject,
     ) -> Result<bool> {
         let bytes = serde_json::to_vec(segment)
             .map_err(|e| BasinError::catalog(format!("serialise partition segment: {e}")))?;
@@ -998,7 +1096,7 @@ impl ObjectStoreCatalog {
         qtable: &QualifiedTableName,
         partition_id: &str,
         version: u64,
-        segment: PartitionSegment,
+        live: PartitionLive,
     ) {
         let _ = self
             .store
@@ -1016,7 +1114,7 @@ impl ObjectStoreCatalog {
             ck,
             PartCacheEntry {
                 version,
-                segment: Arc::new(segment),
+                segment: Arc::new(live),
             },
         );
         self.bump_epoch();
@@ -1080,12 +1178,13 @@ impl ObjectStoreCatalog {
         let removed_files = removed_paths.len() as u64;
 
         let new_id = expected_snapshot.next();
+        let new_version = version + 1;
         let snap = Snapshot {
             id: new_id,
             parent: Some(expected_snapshot),
             committed_at: Utc::now(),
-            data_files: added_files,
-            removed_paths,
+            data_files: added_files.clone(),
+            removed_paths: removed_paths.clone(),
             summary: SnapshotSummary {
                 operation,
                 added_files: added_files_count,
@@ -1095,26 +1194,96 @@ impl ObjectStoreCatalog {
             },
         };
 
-        let mut next = (*segment).clone();
-        next.version = version + 1;
-        next.current_snapshot = new_id;
-        next.snapshots.push(snap);
+        // Compute the new folded live set incrementally from the prior folded
+        // view + this delta — O(delta), no re-read of the chain.
+        let new_live = {
+            use std::collections::HashMap;
+            let mut live: HashMap<String, DataFileRef> = segment
+                .live
+                .iter()
+                .map(|f| (f.path.clone(), f.clone()))
+                .collect();
+            for p in &removed_paths {
+                live.remove(p);
+            }
+            for f in &added_files {
+                live.insert(f.path.clone(), f.clone());
+            }
+            live.into_values().collect::<Vec<_>>()
+        };
 
+        // SEGMENT COMPACTION: fold into a fresh BASELINE every K commits so the
+        // read fold depth stays bounded by K. Otherwise write a small DELTA
+        // object whose serialized size is O(this commit's files) — independent
+        // of how many files the partition already holds. This is the flat-scale
+        // property: per-commit PUT cost does not grow with table size.
+        let compact_every = self.part_segment_compact_every();
+        // `deltas_since_baseline` counts deltas already on top of the latest
+        // baseline; this commit would make it `+1`. Snapshot when it reaches K.
+        // The FIRST commit (no prior object at `version` to fold from) MUST be a
+        // self-contained baseline — there is no predecessor to point a delta at.
+        let write_baseline = version == 0 || segment.deltas_since_baseline + 1 >= compact_every;
+
+        let obj = if write_baseline {
+            PartSegmentObject {
+                version: new_version,
+                current_snapshot: new_id,
+                delta: snap,
+                base_version: None,
+                baseline: Some(new_live.clone()),
+            }
+        } else {
+            PartSegmentObject {
+                version: new_version,
+                current_snapshot: new_id,
+                delta: snap,
+                base_version: Some(version),
+                baseline: None,
+            }
+        };
+
+        let committed_at = obj.delta.committed_at;
         if self
-            .put_part_segment_create(project, qtable, partition_id, next.version, &next)
+            .put_part_segment_create(project, qtable, partition_id, new_version, &obj)
             .await?
         {
-            self.after_part_commit(project, qtable, partition_id, next.version, next)
+            let next_live = PartitionLive {
+                version: new_version,
+                current_snapshot: new_id,
+                live: new_live,
+                latest_committed_at: committed_at,
+                deltas_since_baseline: if write_baseline {
+                    0
+                } else {
+                    segment.deltas_since_baseline + 1
+                },
+            };
+            self.after_part_commit(project, qtable, partition_id, new_version, next_live)
                 .await;
             // Return the unioned table metadata so callers see the complete set.
             self.load_unioned(project, qtable, &manifest).await
         } else {
             self.invalidate_part(project, qtable, partition_id).await;
             Err(BasinError::CommitConflict(format!(
-                "{project}/{qtable}[{partition_id}]: lost commit race at partition version {}",
-                next.version
+                "{project}/{qtable}[{partition_id}]: lost commit race at partition version {new_version}"
             )))
         }
+    }
+
+    /// Number of delta objects allowed on top of a partition's latest baseline
+    /// before a fresh consolidated baseline is written (segment compaction).
+    /// Bounds read fold depth to `O(baseline + ≤K deltas)` while keeping every
+    /// commit O(1). Override via `BASIN_PART_SEGMENT_COMPACT_EVERY` (clamped
+    /// `>= 1`); defaults to 32.
+    fn part_segment_compact_every(&self) -> u64 {
+        if let Some(k) = self.part_compact_override {
+            return k.max(1);
+        }
+        std::env::var("BASIN_PART_SEGMENT_COMPACT_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&k| k >= 1)
+            .unwrap_or(32)
     }
 
     /// Enumerate every partition id that has at least one segment under
@@ -1163,30 +1332,36 @@ impl ObjectStoreCatalog {
             if live.is_empty() {
                 continue;
             }
-            // Represent the source's live set as a fresh genesis+append chain in
-            // the destination partition segment (id 1 carries every live file).
+            // Represent the source's live set as a fresh BASELINE segment in the
+            // destination partition (a self-contained consolidated snapshot
+            // carrying every live file). A baseline needs no predecessor, so the
+            // dst chain starts clean.
             let added_files = live.len() as u64;
             let added_rows: u64 = live.iter().map(|f| f.row_count).sum();
             let added_bytes: u64 = live.iter().map(|f| f.size_bytes).sum();
-            let mut fresh = PartitionSegment::genesis();
-            fresh.snapshots.push(Snapshot {
-                id: SnapshotId(1),
-                parent: Some(SnapshotId::GENESIS),
-                committed_at: Utc::now(),
-                data_files: live,
-                removed_paths: Vec::new(),
-                summary: SnapshotSummary {
-                    operation: SnapshotOperation::Append,
-                    added_files,
-                    added_rows,
-                    added_bytes,
-                    removed_files: 0,
+            let make_baseline = |version: u64| PartSegmentObject {
+                version,
+                current_snapshot: SnapshotId(1),
+                delta: Snapshot {
+                    id: SnapshotId(1),
+                    parent: Some(SnapshotId::GENESIS),
+                    committed_at: Utc::now(),
+                    data_files: live.clone(),
+                    removed_paths: Vec::new(),
+                    summary: SnapshotSummary {
+                        operation: SnapshotOperation::Append,
+                        added_files,
+                        added_rows,
+                        added_bytes,
+                        removed_files: 0,
+                    },
                 },
-            });
-            fresh.current_snapshot = SnapshotId(1);
-            fresh.version = 0;
+                base_version: None,
+                baseline: Some(live.clone()),
+            };
+            let mut obj = make_baseline(0);
             if !self
-                .put_part_segment_create(dst_project, dst, &pid, 0, &fresh)
+                .put_part_segment_create(dst_project, dst, &pid, 0, &obj)
                 .await?
             {
                 // Destination partition already has a segment — place at next.
@@ -1194,12 +1369,19 @@ impl ObjectStoreCatalog {
                     .resolve_part_head_version(dst_project, dst, &pid)
                     .await?
                     .unwrap_or(0);
-                fresh.version = v + 1;
+                obj = make_baseline(v + 1);
                 let _ = self
-                    .put_part_segment_create(dst_project, dst, &pid, fresh.version, &fresh)
+                    .put_part_segment_create(dst_project, dst, &pid, obj.version, &obj)
                     .await?;
             }
-            self.after_part_commit(dst_project, dst, &pid, fresh.version, fresh)
+            let fresh_live = PartitionLive {
+                version: obj.version,
+                current_snapshot: SnapshotId(1),
+                live: live.clone(),
+                latest_committed_at: obj.delta.committed_at,
+                deltas_since_baseline: 0,
+            };
+            self.after_part_commit(dst_project, dst, &pid, obj.version, fresh_live)
                 .await;
         }
         Ok(())
@@ -1245,10 +1427,8 @@ impl ObjectStoreCatalog {
             for f in segment.live_data_files() {
                 all_live.push(f);
             }
-            if let Some(t) = segment.snapshots.iter().map(|s| s.committed_at).max() {
-                if t > latest_commit {
-                    latest_commit = t;
-                }
+            if segment.latest_committed_at > latest_commit {
+                latest_commit = segment.latest_committed_at;
             }
         }
 
@@ -3989,6 +4169,165 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(c.load_table(&p, &t).await.unwrap().live_data_files().len(), 2);
+    }
+
+    // --- Test 2c-flat-1: COMMIT IS O(1) — delta size independent of file count
+    //
+    // The flat-scale regression guard. Seed a partition with MANY existing files
+    // (one per commit), then assert the object written by the NEXT commit
+    // contains only THIS commit's added file(s) — NOT the cumulative set. This is
+    // what keeps per-commit PUT cost (and thus ingest throughput) constant as a
+    // partition accumulates files.
+    #[tokio::test]
+    async fn part_commit_is_o1_delta_independent_of_file_count() {
+        // Big K so the seeding commits stay deltas (no baseline interferes with
+        // the size assertion at the measured commit).
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let c = ObjectStoreCatalog::with_part_compact_every(store.clone(), 100_000);
+        let p = ProjectId::new();
+        let t = TableName::new("flat").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+        let qt = c.resolve_qtable(&p, &t).await;
+
+        // Seed 200 files via 200 single-file commits to one partition.
+        const SEED: usize = 200;
+        for i in 0..SEED {
+            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file(&format!("seed{i}.parquet"), 1)])
+                .await
+                .unwrap();
+        }
+
+        // The folded live set has all 200 files (correctness).
+        assert_eq!(c.load_table(&p, &t).await.unwrap().live_data_files().len(), SEED);
+
+        // The NEXT commit writes a delta object carrying ONLY the 1 added file.
+        let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file("hot.parquet", 1)])
+            .await
+            .unwrap();
+        let head_v = c.resolve_part_head_version(&p, &qt, "p0").await.unwrap().unwrap();
+        let key = c.part_segment_key(&p, &qt, "p0", head_v);
+        let bytes = c.store.get(&key).await.unwrap().bytes().await.unwrap();
+        let obj: PartSegmentObject = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(obj.base_version.is_some(), "hot commit is a delta, not a baseline");
+        assert!(obj.baseline.is_none(), "delta carries no cumulative baseline");
+        assert_eq!(
+            obj.delta.data_files.len(),
+            1,
+            "delta object holds ONLY this commit's file, not the {SEED}+ cumulative set"
+        );
+        assert_eq!(obj.delta.data_files[0].path, "hot.parquet");
+
+        // The serialized object is small and its size does NOT scale with SEED:
+        // bound it well under what 201 files would require.
+        assert!(
+            bytes.len() < 4096,
+            "delta object stays tiny ({} bytes) regardless of {SEED} existing files",
+            bytes.len()
+        );
+    }
+
+    // --- Test 2c-flat-2: FOLD CORRECTNESS across adds + interleaved removes ----
+    #[tokio::test]
+    async fn part_delta_fold_matches_reference_replay() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let c = ObjectStoreCatalog::with_part_compact_every(store.clone(), 5);
+        let p = ProjectId::new();
+        let t = TableName::new("fold").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Reference model: replay the same ops over a HashMap of path -> present.
+        use std::collections::BTreeSet;
+        let mut reference: BTreeSet<String> = BTreeSet::new();
+
+        // 30 commits: mostly appends, with periodic replaces that remove an
+        // earlier file and add a compacted one. Crosses the K=5 baseline several
+        // times, so the fold must traverse baselines + deltas correctly.
+        for i in 0..30usize {
+            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            if i > 0 && i % 4 == 0 {
+                // Replace: remove the two oldest present files, add one merged.
+                let to_remove: Vec<String> = reference.iter().take(2).cloned().collect();
+                let added = file(&format!("merged{i}.parquet"), 5);
+                c.replace_data_files_in_partition(&p, &t, "p0", exp, to_remove.clone(), vec![added.clone()])
+                    .await
+                    .unwrap();
+                for r in &to_remove {
+                    reference.remove(r);
+                }
+                reference.insert(added.path);
+            } else {
+                let added = file(&format!("f{i}.parquet"), 1);
+                c.append_data_files_in_partition(&p, &t, "p0", exp, vec![added.clone()])
+                    .await
+                    .unwrap();
+                reference.insert(added.path);
+            }
+        }
+
+        let live: BTreeSet<String> = c
+            .load_table(&p, &t)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(live, reference, "folded live set must equal the replay reference");
+    }
+
+    // --- Test 2c-flat-3: SEGMENT COMPACTION writes a baseline every K ----------
+    //
+    // After >K deltas a baseline is written; subsequent reads fold from it with
+    // bounded depth, and the folded set stays exactly correct.
+    #[tokio::test]
+    async fn part_segment_compaction_writes_bounded_baseline() {
+        const K: u64 = 8;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let c = ObjectStoreCatalog::with_part_compact_every(store.clone(), K);
+        let p = ProjectId::new();
+        let t = TableName::new("compact").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+        let qt = c.resolve_qtable(&p, &t).await;
+
+        const N: usize = 30; // > several K cycles
+        for i in 0..N {
+            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file(&format!("c{i}.parquet"), 1)])
+                .await
+                .unwrap();
+        }
+
+        // Correct total after compaction.
+        assert_eq!(c.load_table(&p, &t).await.unwrap().live_data_files().len(), N);
+
+        // Read fold depth is bounded by K: a fresh instance folding the chain
+        // walks at most K-1 deltas back to a baseline.
+        let head_v = c.resolve_part_head_version(&p, &qt, "p0").await.unwrap().unwrap();
+        let fresh = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
+        let folded = fresh.fold_part_chain(&p, &qt, "p0", head_v).await.unwrap();
+        assert_eq!(folded.live.len(), N, "compacted fold is still exactly correct");
+        assert!(
+            folded.deltas_since_baseline < K,
+            "fold depth {} must stay < K={K} (bounded read cost)",
+            folded.deltas_since_baseline
+        );
+
+        // At least one BASELINE object exists in the chain (compaction ran).
+        let mut saw_baseline = false;
+        for v in 1..=head_v {
+            let obj = c.get_part_segment(&p, &qt, "p0", v).await.unwrap();
+            if obj.baseline.is_some() {
+                saw_baseline = true;
+                break;
+            }
+        }
+        assert!(saw_baseline, "segment compaction wrote at least one baseline");
     }
 
     // --- Test 2e: non-partitioned replace resolves the owning chain --------
