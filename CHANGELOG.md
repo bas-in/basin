@@ -8,6 +8,47 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-20 — Route the ingest hot path through a cheap META-only catalog load (multi-node ingest throughput)
+
+After the per-partition data-file sharding (below), multi-node bulk ingest
+dropped from ~60k r/s to ~12.5k r/s — no CAS contention, no backpressure, pure
+per-batch latency. Root cause: `exec_ingest_batch` called
+`catalog.load_table(project, table)` at the START of every COPY chunk to get the
+schema + constraints for the insert-time enforcers. With the sharded catalog,
+`load_table` now LISTs `parts/` and GETs **every** partition segment to union
+the live data-file set (~5 object-store round-trips per chunk) — but the
+enforcers consume only the table META (schema, `check_constraints`,
+`pk_columns`, `unique_constraints`, `foreign_keys`, RLS `policies`, enum/domain
+defs), never the unioned file list. (Existing-row PK/UNIQUE/FK checks source
+their candidate files from the storage LIST, `list_data_files_with_stats`, not
+from the catalog metadata.)
+
+Fix — **a META-only catalog read on the ingest hot path, cached on a
+data-stable meta-version**:
+
+- New `Catalog::load_table_meta(project, table)`: returns schema + DDL +
+  constraints + RLS policies + partition spec + write tunables with an EMPTY
+  data-file set. `ObjectStoreCatalog` overrides it to read ONLY the single META
+  manifest chain (one HEAD + one cached GET) — it never LISTs `parts/` or loads
+  partition segments, so it is O(1) however many partitions a table has. The
+  default impl delegates to `load_table` (cheap for `InMemoryCatalog` /
+  `PostgresCatalog`).
+- New `Catalog::meta_version(project, table)`: an epoch that bumps ONLY on
+  META/DDL changes, NOT on per-partition data appends. `ObjectStoreCatalog`
+  returns the META manifest version (the per-partition append path never bumps
+  it); the default returns the global `epoch()`.
+- `exec_ingest_batch` now fetches its per-batch meta via a new per-session
+  `IngestMetaCache` keyed on `meta_version`. The global catalog `epoch` bumps on
+  every per-partition data commit, so the existing `epoch`-keyed `TableMetaCache`
+  invalidated on every chunk and re-paid the partition union; keying on
+  `meta_version` keeps the entry valid across the whole COPY — one cold META
+  load total — while a concurrent `ALTER TABLE` (which bumps `meta_version`) is
+  still observed on the next batch.
+
+Read paths (scans / COUNT / SELECT) keep the full unioned `load_table` — they
+legitimately need the live data-file set. Only the ingest constraint-prep path
+changed.
+
 ## 2026-06-20 — Shard the object-store data-file manifest by partition (multi-node ingest scaling)
 
 A live two-node deploy stalled a bulk `COPY` at ~55M rows with a CAS-contention

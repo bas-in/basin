@@ -1400,6 +1400,49 @@ impl ObjectStoreCatalog {
         self.load_unioned(project, qtable, &manifest).await
     }
 
+    /// META-only metadata: schema + DDL + constraints + RLS policies +
+    /// partition spec + write tunables, with an EMPTY snapshot/data-file set.
+    ///
+    /// Reads ONLY the single META manifest chain via [`load_current`] (one HEAD
+    /// + one cached manifest GET) — it does NOT call [`list_partition_ids`] or
+    /// [`load_part_current`], so it stays O(1) however many partition segments
+    /// the table has accumulated. The data-file fields are deliberately blanked
+    /// (genesis-only chain) so a caller can never mistake this for a live file
+    /// set; the ingest constraint-prep path that consumes it sources existing
+    /// rows from the storage LIST, not from metadata (see `load_table_meta`).
+    async fn load_table_meta_q(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<TableMetadata> {
+        let (_v, manifest) = self.load_current(project, qtable).await?;
+        let mut meta = manifest.to_metadata(project, &qtable.name);
+        // Blank the data-file set: META-only by contract. Present a valid
+        // genesis-only chain so `live_data_files()` is empty (not a panic) for
+        // any caller that probes it.
+        meta.current_snapshot = SnapshotId::GENESIS;
+        meta.snapshots = vec![Snapshot {
+            id: SnapshotId::GENESIS,
+            parent: None,
+            committed_at: manifest
+                .snapshots
+                .iter()
+                .find(|s| s.id == SnapshotId::GENESIS)
+                .map(|s| s.committed_at)
+                .unwrap_or_else(Utc::now),
+            data_files: Vec::new(),
+            removed_paths: Vec::new(),
+            summary: SnapshotSummary {
+                operation: SnapshotOperation::Genesis,
+                added_files: 0,
+                added_rows: 0,
+                added_bytes: 0,
+                removed_files: 0,
+            },
+        }];
+        Ok(meta)
+    }
+
     async fn drop_table_q(&self, project: &ProjectId, qtable: &QualifiedTableName) -> Result<()> {
         // Tombstone: append a manifest version with `dropped = true`. Keeps the
         // history immutable and lets concurrent readers resolve deterministically.
@@ -1624,6 +1667,30 @@ impl Catalog for ObjectStoreCatalog {
     async fn load_table(&self, project: &ProjectId, table: &TableName) -> Result<TableMetadata> {
         let qtable = self.resolve_qtable(project, table).await;
         self.load_table_q(project, &qtable).await
+    }
+
+    async fn load_table_meta(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<TableMetadata> {
+        let qtable = self.resolve_qtable(project, table).await;
+        self.load_table_meta_q(project, &qtable).await
+    }
+
+    async fn meta_version(&self, project: &ProjectId, table: &TableName) -> u64 {
+        // The META manifest version IS the meta-epoch: it advances only on a
+        // manifest write (DDL / schema evolution / single-node META-chain
+        // appends), never on `append_data_files_in_partition` (which writes a
+        // per-partition segment, not the manifest). A failure to resolve the
+        // version (missing/tombstoned table, transient store error) maps to 0,
+        // which is always-stale → the ingest cache misses and re-loads; that is
+        // the safe degradation, never a stale hit.
+        let qtable = self.resolve_qtable(project, table).await;
+        match self.resolve_head_version(project, &qtable).await {
+            Ok(Some(v)) => v.wrapping_add(1), // +1 so version 0 is distinguishable from the "unknown" 0
+            _ => 0,
+        }
     }
 
     async fn current_snapshot_id(
@@ -4736,5 +4803,125 @@ mod tests {
             node_b.get_project_storage_config(&p).await.unwrap(),
             Some(cfg)
         );
+    }
+
+    // --- cheap META-only load + meta-version (multi-node ingest fix) -------
+
+    #[tokio::test]
+    async fn load_table_meta_returns_schema_and_constraints_without_partition_segments() {
+        let c = cat();
+        let p = ProjectId::new();
+        let t = TableName::new("ingest_meta").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Register META: pk + a check constraint.
+        let check = CheckConstraint {
+            name: "ingest_meta_id_check".into(),
+            predicate: "id > 0".into(),
+        };
+        c.set_table_constraints(
+            &p,
+            &t,
+            vec!["id".into()],
+            vec![check.clone()],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        // Append a pile of data files across MANY distinct partitions: a full
+        // `load_table` would LIST `parts/` and GET each of these segments.
+        for pid in 0..8u32 {
+            let part = pid.to_string();
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, &part)
+                .await
+                .unwrap();
+            c.append_data_files_in_partition(
+                &p,
+                &t,
+                &part,
+                exp,
+                vec![file(&format!("part-{pid}.parquet"), 100)],
+            )
+            .await
+            .unwrap();
+        }
+
+        // The cheap META load returns the schema + constraints…
+        let meta = c.load_table_meta(&p, &t).await.unwrap();
+        assert_eq!(meta.pk_columns, vec!["id".to_string()]);
+        assert_eq!(meta.check_constraints, vec![check]);
+        assert_eq!(meta.schema.fields().len(), 2);
+        // …but surfaces NO data files (META-only by contract): it never unioned
+        // the 8 partition segments.
+        assert!(
+            meta.live_data_files().is_empty(),
+            "load_table_meta must not union per-partition data files"
+        );
+        assert_eq!(meta.current_snapshot, SnapshotId::GENESIS);
+
+        // The full load DOES see all 8 partition files (sanity: the data exists).
+        let full = c.load_table(&p, &t).await.unwrap();
+        assert_eq!(full.live_data_files().len(), 8);
+        assert_eq!(full.pk_columns, vec!["id".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn meta_version_stable_across_data_appends_bumps_on_ddl() {
+        let c = cat();
+        let p = ProjectId::new();
+        let t = TableName::new("mv").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        let v0 = c.meta_version(&p, &t).await;
+        assert_ne!(v0, 0, "a live table resolves a non-zero meta-version");
+
+        // Per-partition DATA appends MUST NOT bump the meta-version — this is
+        // what keeps the ingest cache valid across a bulk COPY.
+        for pid in 0..5u32 {
+            let part = pid.to_string();
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, &part)
+                .await
+                .unwrap();
+            c.append_data_files_in_partition(
+                &p,
+                &t,
+                &part,
+                exp,
+                vec![file(&format!("d-{pid}.parquet"), 10)],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                c.meta_version(&p, &t).await,
+                v0,
+                "data append to partition {pid} must not bump meta_version"
+            );
+        }
+
+        // A DDL/constraint change MUST bump the meta-version (the ingest cache
+        // re-loads and observes the new constraint on the next batch).
+        c.set_table_constraints(
+            &p,
+            &t,
+            vec!["id".into()],
+            vec![CheckConstraint {
+                name: "mv_chk".into(),
+                predicate: "id >= 0".into(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let v_after_ddl = c.meta_version(&p, &t).await;
+        assert_ne!(v_after_ddl, v0, "DDL must bump meta_version");
+
+        // And a fresh cheap META load reflects the new constraint.
+        let meta = c.load_table_meta(&p, &t).await.unwrap();
+        assert_eq!(meta.check_constraints.len(), 1);
     }
 }

@@ -760,6 +760,12 @@ pub(crate) struct SessionState {
     /// register/drop, or any other epoch bump) invalidates the entry. See
     /// [`DmlFlagsCache`].
     pub(crate) dml_flags_cache: DmlFlagsCache,
+    /// Per-session ingest META cache. Serves `exec_ingest_batch`'s per-batch
+    /// schema/constraint fetch from the cheap META-only `Catalog::load_table_meta`,
+    /// keyed on `Catalog::meta_version()` so the stream of per-partition DATA
+    /// commits a bulk COPY issues never invalidates it (the multi-node ingest
+    /// throughput fix). See [`IngestMetaCache`].
+    pub(crate) ingest_meta_cache: IngestMetaCache,
     /// Tables this session has already fired a `BASIN_PREWARM_PROVIDERS`
     /// fire-and-forget warm for. The prewarm reads the table's per-file
     /// stats/footers (`Storage::list_data_files_with_stats`) into the
@@ -891,6 +897,7 @@ impl SessionState {
             provider_cache: ProviderCache::new(),
             head_probe_cache: HeadProbeCache::new(),
             dml_flags_cache: DmlFlagsCache::new(),
+            ingest_meta_cache: IngestMetaCache::new(),
             prewarmed_tables: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -933,6 +940,7 @@ impl SessionState {
             provider_cache: ProviderCache::new(),
             head_probe_cache: HeadProbeCache::new(),
             dml_flags_cache: DmlFlagsCache::new(),
+            ingest_meta_cache: IngestMetaCache::new(),
             prewarmed_tables: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -1199,6 +1207,88 @@ impl TableMetaCache {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().expect("table_meta_cache lock poisoned").len()
+    }
+}
+
+// ── Per-session ingest META cache (multi-node ingest throughput fix) ─────────
+//
+// The bulk-ingest constraint-prep path (`exec_ingest_batch`) needs the table's
+// schema + constraints + RLS policies + write tunables on EVERY batch, but NOT
+// the live data-file set (existing-row PK/UNIQUE/FK checks source their
+// candidate files from the storage LIST, never from this metadata).
+//
+// `TableMetaCache` is keyed on `Catalog::epoch()`, which the sharded
+// `ObjectStoreCatalog` bumps on every per-partition DATA commit. During a 1M-row
+// COPY that invalidates the entry on every chunk → a full `load_table` (LIST
+// `parts/` + GET per partition, ~5 round-trips) per chunk → the ~12.5k r/s
+// regression. This cache instead keys on `Catalog::meta_version()`, which bumps
+// ONLY on META/DDL changes, so a stream of data commits never invalidates it:
+// the whole COPY pays exactly one cold META load.
+//
+// Correctness: the entry is dropped the instant the META version moves (DDL /
+// schema evolution / constraint change), so an `ALTER TABLE … ADD CONSTRAINT`
+// concurrent with ingest is observed on the next batch. Cleared wholesale by the
+// dispatch-top `invalidate_all` hook alongside the other per-session caches.
+struct IngestMetaEntry {
+    meta: Arc<TableMetadata>,
+    inserted_at: Instant,
+    /// `Catalog::meta_version()` at fill time. A mismatch is an instant miss.
+    meta_version: u64,
+}
+
+pub(crate) struct IngestMetaCache {
+    inner: std::sync::Mutex<lru::LruCache<TableName, IngestMetaEntry>>,
+}
+
+impl IngestMetaCache {
+    pub(crate) fn new() -> Self {
+        let cap = NonZeroUsize::new(TABLE_META_CACHE_CAP).expect("cap is non-zero");
+        Self {
+            inner: std::sync::Mutex::new(lru::LruCache::new(cap)),
+        }
+    }
+
+    /// Return the cached META iff present, meta-version-fresh and within TTL.
+    /// `meta_version == 0` (backend could not resolve a version) is treated as
+    /// always-stale so the caller re-loads rather than serving a stale hit.
+    fn get_fresh(&self, table: &TableName, meta_version: u64) -> Option<Arc<TableMetadata>> {
+        let ttl = table_meta_cache_ttl();
+        let mut g = self.inner.lock().expect("ingest_meta_cache lock poisoned");
+        let entry = g.get(table)?;
+        let version_ok = meta_version != 0 && entry.meta_version == meta_version;
+        if version_ok && entry.inserted_at.elapsed() <= ttl {
+            Some(entry.meta.clone())
+        } else {
+            None
+        }
+    }
+
+    fn insert(&self, table: TableName, meta: Arc<TableMetadata>, meta_version: u64) {
+        self.inner
+            .lock()
+            .expect("ingest_meta_cache lock poisoned")
+            .put(
+                table,
+                IngestMetaEntry {
+                    meta,
+                    inserted_at: Instant::now(),
+                    meta_version,
+                },
+            );
+    }
+
+    pub(crate) fn invalidate(&self, table: &TableName) {
+        self.inner
+            .lock()
+            .expect("ingest_meta_cache lock poisoned")
+            .pop(table);
+    }
+
+    pub(crate) fn invalidate_all(&self) {
+        self.inner
+            .lock()
+            .expect("ingest_meta_cache lock poisoned")
+            .clear();
     }
 }
 
@@ -1681,6 +1771,45 @@ pub(crate) async fn load_table_meta_cached_err(
     sess.state
         .table_meta_cache
         .insert(table.clone(), arc.clone(), view_present, fill_epoch);
+    Ok(arc)
+}
+
+/// Ingest hot-path counterpart of [`load_table_meta_cached_err`]: returns the
+/// cheap META-only `TableMetadata` (schema + constraints + RLS policies + write
+/// tunables, NO unioned per-partition data-file set) for `exec_ingest_batch`'s
+/// per-batch constraint prep.
+///
+/// Keyed on [`Catalog::meta_version`], NOT the global `epoch`: the sharded
+/// `ObjectStoreCatalog` bumps `epoch` on every per-partition DATA commit, so an
+/// epoch-keyed cache would invalidate on every COPY chunk and re-pay the
+/// `load_table` partition union (~5 object-store round-trips → the ~12.5k r/s
+/// regression). `meta_version` advances only on META/DDL changes, so the whole
+/// bulk ingest pays exactly one cold META load — and an `ALTER TABLE …` that
+/// changes a constraint is still observed on the next batch.
+///
+/// The constraint enforcers `exec_ingest_batch` calls consume only META fields
+/// (schema / `check_constraints` / `pk_columns` / `unique_constraints` /
+/// `foreign_keys` / RLS `policies` / enum+domain defs); existing-row checks
+/// source their candidate files from the storage LIST, never from this
+/// metadata's (empty) data-file set. So the cheap META load is sufficient.
+pub(crate) async fn load_table_meta_cached_for_ingest(
+    sess: &crate::ProjectSession,
+    table: &TableName,
+) -> Result<Arc<TableMetadata>> {
+    let catalog = &sess.engine.config().catalog;
+    let meta_version = catalog.meta_version(&sess.project, table).await;
+    if let Some(meta) = sess.state.ingest_meta_cache.get_fresh(table, meta_version) {
+        return Ok(meta);
+    }
+    let meta = catalog.load_table_meta(&sess.project, table).await?;
+    let arc = Arc::new(meta);
+    // Re-read the meta-version after the load so a concurrent DDL that landed
+    // mid-load is not masked by a stale fill version (conservative: a bump
+    // between the two reads just costs the next batch one extra load).
+    let fill_version = catalog.meta_version(&sess.project, table).await;
+    sess.state
+        .ingest_meta_cache
+        .insert(table.clone(), arc.clone(), fill_version);
     Ok(arc)
 }
 
@@ -6730,5 +6859,135 @@ mod tests {
         // Explicit single-table invalidation drops the entry.
         cache.invalidate(&t);
         assert!(cache.get_fresh(&t, 0).is_none());
+    }
+}
+
+// Regression coverage for the multi-node ingest throughput fix: the ingest
+// meta-cache must serve `exec_ingest_batch`'s per-batch meta fetch from the
+// cheap META-only `Catalog::load_table_meta`, keyed on `Catalog::meta_version`
+// so a stream of per-partition DATA commits never invalidates it. These run
+// over a real `Engine` + sharded `ObjectStoreCatalog` so the cache validity is
+// exercised against the actual catalog that exhibited the regression.
+#[cfg(test)]
+mod ingest_meta_cache_tests {
+    use std::sync::Arc;
+
+    use basin_catalog::{Catalog, ObjectStoreCatalog, SnapshotId};
+    use basin_common::{ProjectId, TableName};
+    use object_store::memory::InMemory;
+
+    use crate::session::load_table_meta_cached_for_ingest;
+    use crate::{Engine, EngineConfig};
+
+    fn engine_over_object_store() -> Engine {
+        let store = Arc::new(InMemory::new());
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: store.clone(),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn Catalog> = Arc::new(ObjectStoreCatalog::new(store));
+        Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        })
+    }
+
+    fn data_file(path: &str, rows: u64) -> basin_catalog::DataFileRef {
+        basin_catalog::DataFileRef {
+            path: path.to_string(),
+            size_bytes: rows * 10,
+            row_count: rows,
+            column_stats: Default::default(),
+            bloom_filters: Default::default(),
+            hll_sketches: Default::default(),
+            tdigest_sketches: Default::default(),
+        }
+    }
+
+    /// The cold ingest meta fetch returns the table's constraints (the enforcers'
+    /// inputs) and then survives a stream of per-partition DATA commits without a
+    /// re-load — i.e. the cache stays valid across the data appends a bulk COPY
+    /// issues. A DDL change invalidates it and surfaces the new constraint.
+    #[tokio::test]
+    async fn ingest_meta_cache_survives_data_appends_invalidated_by_ddl() {
+        let eng = engine_over_object_store();
+        let project = ProjectId::new();
+        let sess = eng.open_session(project).await.unwrap();
+        let table = TableName::new("orders").unwrap();
+
+        sess.execute("CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, qty BIGINT)")
+            .await
+            .unwrap();
+        sess.execute("ALTER TABLE orders ADD CONSTRAINT qty_pos CHECK (qty > 0)")
+            .await
+            .unwrap();
+
+        // Cold ingest meta fetch: carries the PK + the CHECK constraint the
+        // enforcers consume, and (cheap META path) surfaces no data files.
+        let m1 = load_table_meta_cached_for_ingest(&sess, &table)
+            .await
+            .unwrap();
+        assert_eq!(m1.pk_columns, vec!["id".to_string()]);
+        assert_eq!(m1.check_constraints.len(), 1, "CHECK constraint present");
+        assert!(
+            m1.live_data_files().is_empty(),
+            "cheap META load must not union per-partition data files"
+        );
+
+        // Simulate the bulk-ingest fan-out: several per-partition DATA commits.
+        // Each bumps the global catalog epoch, but NOT the META version — so the
+        // ingest meta-cache must keep serving the SAME cached Arc (no re-load).
+        let catalog = &eng.config().catalog;
+        for pid in 0..6u32 {
+            let part = pid.to_string();
+            let exp = catalog
+                .current_snapshot_id_in_partition(&project, &table, &part)
+                .await
+                .unwrap();
+            catalog
+                .append_data_files_in_partition(
+                    &project,
+                    &table,
+                    &part,
+                    exp,
+                    vec![data_file(&format!("orders/part-{pid}.parquet"), 1000)],
+                )
+                .await
+                .unwrap();
+
+            let m = load_table_meta_cached_for_ingest(&sess, &table)
+                .await
+                .unwrap();
+            assert!(
+                Arc::ptr_eq(&m1, &m),
+                "data append to partition {pid} must not invalidate the ingest meta-cache"
+            );
+        }
+
+        // A DDL change bumps the META version → the next ingest fetch re-loads
+        // and observes the new constraint set (here: dropping the CHECK).
+        sess.execute("ALTER TABLE orders DROP CONSTRAINT qty_pos")
+            .await
+            .unwrap();
+        let m2 = load_table_meta_cached_for_ingest(&sess, &table)
+            .await
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&m1, &m2),
+            "a DDL change must invalidate the ingest meta-cache"
+        );
+        assert_eq!(
+            m2.check_constraints.len(),
+            0,
+            "the dropped CHECK must be observed on the next ingest batch"
+        );
+        // The data committed via the partitions is real: the FULL load still
+        // unions all 6 partition files (the ingest path just doesn't pay for it).
+        let full = catalog.load_table(&project, &table).await.unwrap();
+        assert_eq!(full.live_data_files().len(), 6);
+        let _ = SnapshotId::GENESIS; // keep the import meaningful across refactors
     }
 }

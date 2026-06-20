@@ -197,6 +197,56 @@ pub trait Catalog: Send + Sync {
     /// [`basin_common::BasinError::NotFound`] if the table does not exist.
     async fn load_table(&self, project: &ProjectId, table: &TableName) -> Result<TableMetadata>;
 
+    /// Cheap META-only metadata load for `(project, table)`: the schema, DDL,
+    /// constraints, RLS policies, partition spec and write tunables — but NOT
+    /// the unioned per-partition live data-file set.
+    ///
+    /// The INGEST constraint-prep path (`exec_ingest_batch`) consults only the
+    /// META fields (schema / `check_constraints` / `pk_columns` /
+    /// `unique_constraints` / `foreign_keys` / RLS `policies` / enum+domain
+    /// defs) and never the data-file list — existing-row PK/UNIQUE/FK checks
+    /// source their candidate files from the storage LIST
+    /// (`Storage::list_data_files_with_stats`), not from this metadata. On the
+    /// sharded [`ObjectStoreCatalog`], [`load_table`](Catalog::load_table)
+    /// LISTs `parts/` and GETs every partition segment to union the data files;
+    /// at multi-node ingest that is ~5 object-store round-trips PER batch and
+    /// caps throughput. This accessor reads ONLY the single META manifest chain
+    /// (one HEAD + one cached GET) and surfaces an EMPTY `snapshots`/data-file
+    /// set, so it is O(1) regardless of how many partition segments exist.
+    ///
+    /// The default implementation delegates to [`load_table`](Catalog::load_table),
+    /// which is correct (a superset) and cheap for the in-RAM `InMemoryCatalog`
+    /// and the single-row-per-table `PostgresCatalog`. Only `ObjectStoreCatalog`
+    /// overrides it with the dedicated META-only read.
+    async fn load_table_meta(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<TableMetadata> {
+        self.load_table(project, table).await
+    }
+
+    /// Version/epoch that bumps ONLY on META/DDL changes for `(project, table)`,
+    /// NOT on per-partition DATA-file appends.
+    ///
+    /// A session cache keyed on this value stays valid across the stream of
+    /// data commits a bulk ingest issues (which advance the global
+    /// [`epoch`](Catalog::epoch) on every batch), and is invalidated only when
+    /// the schema / constraints / policies actually change. The ingest
+    /// meta-cache (`load_table_meta_cached_for_ingest`) keys on this so a 1M-row
+    /// COPY pays exactly one cold META load.
+    ///
+    /// The default implementation returns the global [`epoch`](Catalog::epoch).
+    /// That is correct (conservative — it over-invalidates on data commits) and
+    /// fine for backends where `load_table_meta` is itself cheap
+    /// (`InMemoryCatalog`, `PostgresCatalog`). `ObjectStoreCatalog` overrides it
+    /// to return the META manifest's version, which the per-partition data
+    /// append path (`append_data_files_in_partition`) never bumps.
+    async fn meta_version(&self, project: &ProjectId, table: &TableName) -> u64 {
+        let _ = (project, table);
+        self.epoch()
+    }
+
     /// O(1) read of just the current snapshot id for `(project, table)`,
     /// without materializing the full [`TableMetadata`].
     ///

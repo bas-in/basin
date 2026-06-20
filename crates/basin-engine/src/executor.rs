@@ -2664,11 +2664,13 @@ async fn dispatch_parsed_statement(
             sess.state.provider_cache.invalidate(&target);
             sess.state.head_probe_cache.invalidate(&target);
             sess.state.dml_flags_cache.invalidate(&target);
+            sess.state.ingest_meta_cache.invalidate(&target);
             sess.engine
                 .pk_row_cache()
                 .invalidate_table(&sess.project, &target);
         } else {
             sess.state.table_meta_cache.invalidate_all();
+            sess.state.ingest_meta_cache.invalidate_all();
             // Fix B+C provider cache: the same statement classes that flush the
             // table-meta cache can change a table's schema, file set or overlay
             // shape. Most are caught by the per-query `(snapshot)` key, but
@@ -7966,12 +7968,16 @@ pub(crate) async fn exec_ingest_batch(
     table: &TableName,
     batch: RecordBatch,
 ) -> Result<u64> {
-    let meta = sess
-        .engine
-        .config()
-        .catalog
-        .load_table(&sess.project, table)
-        .await?;
+    // INGEST hot path: the per-batch constraint prep needs only the table META
+    // (schema / constraints / RLS policies / write tunables), NOT the unioned
+    // per-partition data-file set. On the sharded `ObjectStoreCatalog` a full
+    // `load_table` LISTs `parts/` + GETs each partition segment (~5 round-trips
+    // PER batch → the ~12.5k r/s multi-node regression). The cheap META load is
+    // cached on `Catalog::meta_version()` so the stream of data commits a bulk
+    // COPY issues never invalidates it (a DDL change still does). Existing-row
+    // PK/UNIQUE/FK checks source their candidate files from the storage LIST,
+    // never from this metadata. See `load_table_meta_cached_for_ingest`.
+    let meta = crate::session::load_table_meta_cached_for_ingest(sess, table).await?;
 
     let batch = crate::generated_cols::materialise_generated_columns(
         &sess.engine.config().catalog,
@@ -8062,7 +8068,7 @@ pub(crate) async fn exec_ingest_batch(
     }
 
     // Synchronous Parquet path (no shard or inside a transaction).
-    let opts = write_options_for(&meta, crate::session::tx_is_active(&sess.state));
+    let opts = write_options_for(meta.as_ref(), crate::session::tx_is_active(&sess.state));
     let events = build_insert_events(sess, table, std::slice::from_ref(&batch))?;
     let df = sess
         .engine
