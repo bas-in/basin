@@ -133,6 +133,7 @@ impl PartitionForwardClient for InProcDouble {
         project: ProjectId,
         table: &str,
         partition_id: &str,
+        _idem_key: &str,
         batch: RecordBatch,
     ) -> Result<u64> {
         let engine = self
@@ -399,6 +400,7 @@ async fn back_compat_no_peers_keeps_fanout_local() {
             _project: ProjectId,
             _table: &str,
             _partition_id: &str,
+            _idem_key: &str,
             _batch: RecordBatch,
         ) -> Result<u64> {
             panic!("local-only fan-out must NEVER forward");
@@ -439,6 +441,167 @@ async fn back_compat_no_peers_keeps_fanout_local() {
         );
     }
     assert_eq!(on_a, total_ingested, "local-only: all rows land on A");
+
+    std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
+}
+
+// ── exactly-once forwarding: lost-ack retry reuses key & applies once ────────
+
+/// A forward transport double that models the LOST-ACK failure: it writes the
+/// batch into engine B (the owner) exactly like the real receiver, dedups on
+/// the idempotency key (so a re-POST of the same key does NOT write twice), and
+/// on the FIRST receipt of any key returns a transport error AFTER recording the
+/// apply — simulating "the owner committed, then the HTTP ack was lost". The
+/// sender's retry re-POSTs the SAME key; this time the double returns success.
+/// It records every (idem_key) it saw so the test can assert the retry reused
+/// the key and that exactly one physical apply happened.
+struct LostAckDouble {
+    target: Engine,
+    /// idem_key → rows applied (dedup map, mirrors the real receiver window).
+    applied: std::sync::Mutex<HashMap<String, u64>>,
+    /// Every idem_key seen across all calls (incl. retries), in order.
+    keys_seen: std::sync::Mutex<Vec<String>>,
+    /// How many keys have we already failed-after-apply once (so the retry of
+    /// that same key succeeds).
+    failed_once: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+#[async_trait]
+impl PartitionForwardClient for LostAckDouble {
+    async fn forward_partition_write(
+        &self,
+        _peer_base_url: &str,
+        project: ProjectId,
+        table: &str,
+        partition_id: &str,
+        idem_key: &str,
+        batch: RecordBatch,
+    ) -> Result<u64> {
+        self.keys_seen.lock().unwrap().push(idem_key.to_string());
+        let rows = batch.num_rows() as u64;
+
+        // Dedup exactly like the receiver: an already-applied key SKIPS the
+        // write and returns the original rowcount.
+        if let Some(&n) = self.applied.lock().unwrap().get(idem_key) {
+            return Ok(n);
+        }
+
+        // First sight of this key: physically write to B (the owner).
+        let shard = self.target.shard().expect("target engine has a shard");
+        let part = PartitionKey::new(partition_id)?;
+        let handle = shard.get(&project, &part).await?;
+        handle
+            .write_batch_opts(&TableName::new(table.to_owned())?, batch, true)
+            .await?;
+        self.applied.lock().unwrap().insert(idem_key.to_string(), rows);
+
+        // LOST ACK: the very first time we see a key we report a transport error
+        // AFTER the write committed, forcing the sender to retry. The retry will
+        // hit the dedup branch above and return the recorded rowcount.
+        let mut failed = self.failed_once.lock().unwrap();
+        if !failed.contains(idem_key) {
+            failed.insert(idem_key.to_string());
+            return Err(basin_common::BasinError::wal(
+                "partition-write POST to \"http://owner\" failed: simulated lost ack".to_string(),
+            ));
+        }
+        Ok(rows)
+    }
+}
+
+/// End-to-end-ish: force ONE lost-ack retry on a forwarded batch and assert the
+/// owner holds the batch's rows EXACTLY once (no dup), the retry reused the
+/// SAME idempotency key, and the total rowcount across the table equals what was
+/// sent (no dup, no loss).
+#[tokio::test]
+async fn lost_ack_retry_reuses_key_and_applies_exactly_once() {
+    let _env = FANOUT_ENV_LOCK.lock().unwrap();
+    std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
+
+    let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = Arc::new(InMemoryCatalog::new());
+    let eng_a = engine_for(cold.clone(), catalog.clone(), PEER_A).await;
+    let eng_b = engine_for(cold.clone(), catalog.clone(), PEER_B).await;
+
+    let peers = vec![PEER_A.to_string(), PEER_B.to_string()];
+    eng_a.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_A));
+    eng_b.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_B));
+
+    let double = Arc::new(LostAckDouble {
+        target: eng_b.clone(),
+        applied: std::sync::Mutex::new(HashMap::new()),
+        keys_seen: std::sync::Mutex::new(Vec::new()),
+        failed_once: std::sync::Mutex::new(std::collections::HashSet::new()),
+    });
+    eng_a.attach_partition_forward_client(double.clone());
+
+    let sess_a = eng_a.open_session(ProjectId::new()).await.unwrap();
+    let project = sess_a.project();
+    sess_a.execute("CREATE TABLE t (id BIGINT)").await.unwrap();
+    let table = TableName::new("t").unwrap();
+    let router = PartitionRouter::new(peers.clone(), PEER_A);
+
+    // Drive batches until at least one lands on a B-owned partition (forwarded).
+    let per_batch = 10i64;
+    let mut all_ids: Vec<i64> = Vec::new();
+    let mut forwarded_any = false;
+    for i in 0..8usize {
+        let base = (i as i64) * 100;
+        let ids: Vec<i64> = (0..per_batch).map(|k| base + k).collect();
+        all_ids.extend_from_slice(&ids);
+        crate::executor::exec_ingest_batch(&sess_a, &table, ids_batch(&ids))
+            .await
+            .expect("ingest must succeed despite the lost-ack retry");
+        let part = if i == 0 {
+            PartitionKey::default_key()
+        } else {
+            PartitionKey::new(format!("s{i}")).unwrap()
+        };
+        if !router.desired_owner(&project, part.as_str()).is_self {
+            forwarded_any = true;
+        }
+    }
+    assert!(forwarded_any, "router put no partitions on B — no forward exercised");
+
+    // A retry happened (a key appears twice in keys_seen) and EVERY retry reused
+    // the SAME key (each distinct key applied exactly once).
+    let keys = double.keys_seen.lock().unwrap().clone();
+    let applied = double.applied.lock().unwrap();
+    // Each distinct forwarded batch was applied exactly once.
+    for (k, &rows) in applied.iter() {
+        let seen = keys.iter().filter(|x| *x == k).count();
+        assert!(
+            seen >= 2,
+            "key {k} should have been seen at least twice (attempt + lost-ack retry)"
+        );
+        assert_eq!(rows, per_batch as u64, "each batch applies its full rowcount once");
+    }
+
+    // Owner B holds each forwarded partition's rows EXACTLY once (no dup from
+    // the retry). Total across both nodes equals what we sent.
+    let shard_a = eng_a.shard().unwrap();
+    let shard_b = eng_b.shard().unwrap();
+    let mut total = 0usize;
+    for i in 0..8usize {
+        let part = if i == 0 {
+            PartitionKey::default_key()
+        } else {
+            PartitionKey::new(format!("s{i}")).unwrap()
+        };
+        let owner_shard = if router.desired_owner(&project, part.as_str()).is_self {
+            &shard_a
+        } else {
+            &shard_b
+        };
+        let n = tail_rows(owner_shard, &project, &part, &table).await;
+        assert_eq!(
+            n, per_batch as usize,
+            "partition {} must hold its rows EXACTLY once (no dup from the lost-ack retry)",
+            part.as_str()
+        );
+        total += n;
+    }
+    assert_eq!(total, all_ids.len(), "no dup, no loss across the cluster");
 
     std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
 }

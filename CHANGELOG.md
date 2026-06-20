@@ -8,6 +8,42 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-20 — Fix multi-node duplicate rows from at-least-once partition-write forwarding
+
+A live two-node deploy lost zero rows but produced **duplicates**: a 10,000,000-row
+`COPY` (no PK) acked `COPY 10000000` yet `count(*)` returned 10,520,000 with
+`count(distinct id) = 10,000,000` — ~520k duplicate rows in contiguous
+chunk-sized ranges (≈5 chunks of 100k applied twice). Both nodes agreed on the
+inflated count, so it was a write-path bug, not a read bug.
+
+Root cause: transparent per-partition write forwarding
+(`forward_partition_to_owner` → `POST /internal/v1/partition-write`) was
+**at-least-once**. When a forwarded batch's HTTP call transiently failed or
+timed out *after* the owner had already written and committed it (a lost ack,
+common cross-region), the sender's retry re-POSTed the same batch and the owner
+wrote it again. No idempotency.
+
+Fix — make partition-write forwarding **exactly-once**:
+
+- **Sender** generates a stable 128-bit idempotency nonce **once per batch**
+  before the first attempt (`fresh_partition_idem_key`, a random UUID — not a
+  content hash, so two distinct batches with identical content can't falsely
+  dedup) and reuses the identical key on the retry, sent in the
+  `x-basin-partition-idem` header. The retry now also covers transient transport
+  faults (POST failed / ack unreadable), which is safe because the key is reused.
+- **Receiver** keeps a bounded (8192-key), mutex-guarded FIFO window of
+  recently-applied keys. Check-and-claim is atomic: the first receipt claims the
+  key in-flight and applies; a duplicate (already-applied or concurrently
+  in-flight) skips the write and returns the **same** rowcount, so totals stay
+  correct. A failed apply forgets the in-flight key so a legitimate retry can
+  re-apply. Absent header → apply unconditionally (back-compat with an older
+  sender).
+
+Also: fixed a misleading startup log that claimed the partition-forward
+transport was "not installed" on every multi-node boot even when the Fly
+discovery path had installed it unconditionally; the install state is now logged
+once, truthfully, after both install paths have run.
+
 ## 2026-06-20 — Fix multi-node data loss from lease-stealing reads (basin-shard)
 
 A live two-node deploy (`BASIN_LEASE_MODE=required`, object-store catalog,

@@ -448,6 +448,16 @@ pub const PARTITION_FORWARD_PARTITION_HEADER: &str = "x-basin-partition-id";
 /// receiver MUST write locally and never re-forward (loop guard — prevents
 /// A→B→A). Absent/`0` means an origin (client) request.
 pub const PARTITION_FORWARD_HOP_HEADER: &str = "x-basin-partition-hop";
+/// Header carrying a STABLE per-batch idempotency key (a 128-bit nonce as
+/// lowercase hex), generated ONCE on the sender before the first attempt and
+/// reused byte-for-byte on every retry of the SAME batch. The receiver dedups
+/// on this key so a lost-ack retry (the receiver wrote+committed, then the HTTP
+/// ack was lost, so the sender re-POSTs the identical batch) is applied exactly
+/// once. Absent → the receiver falls back to apply-unconditionally (back-compat
+/// with a pre-idempotency sender); the matching sender in this build always
+/// sends it. See `executor::forward_partition_to_owner` (key generation) and
+/// `internal_partition_forward::post_partition_write` (dedup).
+pub const PARTITION_FORWARD_IDEM_HEADER: &str = "x-basin-partition-idem";
 
 /// The receive path for forwarded partition writes (Arrow IPC body). Mounted on
 /// the same fail-closed condition as [`FORWARD_RECEIVE_PATH`] (only when
@@ -465,12 +475,18 @@ pub trait PartitionForwardClient: Send + Sync + 'static {
     /// into `(project, table, partition_id)`. Returns the rows written. The
     /// receiver is, by construction, the partition's lease owner, so it writes
     /// directly and does NOT re-run constraints (they ran on the sender).
+    ///
+    /// `idem_key` is a STABLE per-batch idempotency nonce generated once before
+    /// the first attempt and reused unchanged across retries; the receiver
+    /// dedups on it so a lost-ack retry is applied exactly once. The same
+    /// `idem_key` MUST accompany every retry of the same batch.
     async fn forward_partition_write(
         &self,
         peer_base_url: &str,
         project: ProjectId,
         table: &str,
         partition_id: &str,
+        idem_key: &str,
         batch: RecordBatch,
     ) -> Result<u64>;
 }
@@ -511,6 +527,18 @@ impl HttpPartitionForwardClient {
     }
 }
 
+/// Generate a fresh 128-bit idempotency nonce for one forwarded batch, as
+/// lowercase hex (32 chars, ASCII-header-safe). Generated ONCE per batch before
+/// the first attempt and reused unchanged across retries (see
+/// `executor::forward_partition_to_owner`), so the receiver can dedup a
+/// lost-ack retry to exactly one apply. A random nonce (not a content hash) is
+/// used deliberately: two distinct batches with identical content+partition
+/// (possible for repeated values when there is no PK) must NOT collide into one
+/// apply, while a re-POST of the same batch reuses the same nonce and dedups.
+pub fn fresh_partition_idem_key() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
 /// Encode one `RecordBatch` as a self-describing Arrow IPC stream (schema +
 /// batch). Shared by the client (send) and the receive route (decode).
 pub fn encode_partition_batch(batch: &RecordBatch) -> Result<Vec<u8>> {
@@ -541,6 +569,7 @@ impl PartitionForwardClient for HttpPartitionForwardClient {
         project: ProjectId,
         table: &str,
         partition_id: &str,
+        idem_key: &str,
         batch: RecordBatch,
     ) -> Result<u64> {
         let url = Self::receive_url(peer_base_url);
@@ -553,6 +582,7 @@ impl PartitionForwardClient for HttpPartitionForwardClient {
             .header(PARTITION_FORWARD_TABLE_HEADER, table)
             .header(PARTITION_FORWARD_PARTITION_HEADER, partition_id)
             .header(PARTITION_FORWARD_HOP_HEADER, "1")
+            .header(PARTITION_FORWARD_IDEM_HEADER, idem_key)
             .header("content-type", "application/vnd.apache.arrow.stream")
             .body(body)
             .send()

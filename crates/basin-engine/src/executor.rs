@@ -440,6 +440,15 @@ async fn write_batch_fanout(
 /// a short backoff + owner re-resolve if the peer rejects with a lease handoff /
 /// lease-not-held race (the owner is mid-handoff). Surfaces the error after the
 /// retry — never silently drops the write. Returns the rows the owner wrote.
+///
+/// EXACTLY-ONCE: forwarding is at-least-once over the network — a lost ack
+/// (the owner wrote+committed, but the HTTP response was lost to a timeout /
+/// transient transport error) makes the retry re-POST the SAME batch. To keep
+/// that from double-applying, a STABLE idempotency nonce is generated here ONCE
+/// (`fresh_partition_idem_key`) BEFORE the first attempt and reused unchanged on
+/// the retry; the receiver dedups on it and returns the original rowcount. The
+/// retry must NOT regenerate the key, or the receiver would treat the re-POST as
+/// a new batch and apply it twice.
 async fn forward_partition_to_owner(
     engine: &crate::Engine,
     client: &Arc<dyn crate::write_forwarder::PartitionForwardClient>,
@@ -449,21 +458,29 @@ async fn forward_partition_to_owner(
     part: &PartitionKey,
     batch: RecordBatch,
 ) -> Result<u64> {
+    // Generate the idempotency key ONCE, before attempt 1; both the first
+    // attempt and the retry below send this IDENTICAL key so the receiver can
+    // dedup a lost-ack re-POST to exactly one apply.
+    let idem_key = crate::write_forwarder::fresh_partition_idem_key();
     match client
         .forward_partition_write(
             base_url,
             *project,
             table.as_str(),
             part.as_str(),
+            &idem_key,
             batch.clone(),
         )
         .await
     {
         Ok(rows) => Ok(rows),
-        Err(e) if is_lease_transient(&e) => {
-            // The owner is mid-handoff (draining) or just lost/hasn't acquired
-            // its lease. Back off briefly, re-resolve the owner (it may have
-            // moved), and retry exactly once.
+        Err(e) if is_lease_transient(&e) || is_forward_transport_transient(&e) => {
+            // Either the owner is mid-handoff (draining) or just lost/hasn't
+            // acquired its lease, OR the transport faulted (POST failed / ack
+            // lost). Back off briefly, re-resolve the owner (it may have moved),
+            // and retry exactly once with the SAME idempotency key — so if the
+            // owner already applied the batch on attempt 1 (lost-ack case), it
+            // dedups and returns the original rowcount instead of writing twice.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let owner = engine.partition_router().desired_owner(project, part.as_str());
             client
@@ -472,6 +489,7 @@ async fn forward_partition_to_owner(
                     *project,
                     table.as_str(),
                     part.as_str(),
+                    &idem_key,
                     batch,
                 )
                 .await
@@ -489,6 +507,20 @@ fn is_lease_transient(e: &BasinError) -> bool {
         || msg.contains("handoff")
         || msg.contains("lease_not_held")
         || msg.contains("does not hold")
+}
+
+/// True when a forward error reflects a transient TRANSPORT fault — the POST
+/// itself failed (connection refused/reset, timeout) or the response was
+/// unreadable (the LOST-ACK case: the owner may already have written+committed
+/// the batch, but its HTTP ack never reached us). Retrying is now safe because
+/// the retry carries the SAME idempotency key, so a re-POST of an
+/// already-applied batch dedups on the owner instead of double-writing.
+/// Surfaced by `HttpPartitionForwardClient` as `BasinError::wal` with these
+/// markers (see `write_forwarder.rs`).
+fn is_forward_transport_transient(e: &BasinError) -> bool {
+    let msg = e.to_string();
+    msg.contains("partition-write POST to") && msg.contains("failed")
+        || msg.contains("partition-write response from") && msg.contains("unreadable")
 }
 
 #[cfg(test)]

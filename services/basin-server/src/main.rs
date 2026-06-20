@@ -681,6 +681,11 @@ async fn main() -> Result<()> {
     // local path). Otherwise we attach nothing and stay local-only.
     let forward_secret = basin_engine::write_forwarder::forward_secret_from_env();
     let peers = engine.partition_router_peer_count();
+    // Tracks whether the partition-forward transport ends up installed by EITHER
+    // the eager gate here OR the discovery path below, so the single
+    // "installed / not installed" log at the end is truthful (the discovery path
+    // installs unconditionally when enabled + a secret is set).
+    let mut forward_transport_installed = false;
     if !engine.partition_router_is_local_only() && forward_secret.is_some() {
         // SELF-ID INVARIANT: a multi-node node MUST appear in its own peer list
         // (BASIN_REPLICA_ID == this node's BASIN_SHARD_PEERS entry), else it
@@ -703,14 +708,12 @@ async fn main() -> Result<()> {
             forward_secret.clone().expect("forward_secret is Some in this branch"),
         );
         engine.attach_partition_forward_client(std::sync::Arc::new(client));
-        tracing::info!(peers, "partition-forward transport installed");
-    } else {
-        tracing::info!(
-            peers,
-            has_secret = forward_secret.is_some(),
-            "partition-forward transport not installed (local-only or no BASIN_FORWARD_SECRET)"
-        );
+        forward_transport_installed = true;
     }
+    // NOTE: do NOT log the transport state here. The discovery path below can STILL
+    // install the transport unconditionally (it may promote this node from
+    // local-only to multi-peer at runtime). A single truthful log is emitted
+    // after both the eager gate above and the discovery install below have run.
 
     // --- Fly.io dynamic peer discovery (#28 autoscaling membership) ---------
     //
@@ -760,6 +763,7 @@ async fn main() -> Result<()> {
                 let client =
                     basin_engine::write_forwarder::HttpPartitionForwardClient::with_secret(secret);
                 engine.attach_partition_forward_client(std::sync::Arc::new(client));
+                forward_transport_installed = true;
             }
             // Best-effort startup discovery: a failure logs a warning and the
             // node stays local-only — never crash.
@@ -846,6 +850,22 @@ async fn main() -> Result<()> {
                 }
             });
         }
+    }
+
+    // Single truthful log of the partition-forward transport state, after BOTH
+    // the eager gate and the discovery-path install have had their say. The
+    // discovery path installs the transport unconditionally when enabled + a
+    // secret is set, so this is the only place we can honestly say whether it
+    // ended up installed (the old per-branch "not installed" log fired even when
+    // discovery later installed it — a false negative on every multi-node boot).
+    if forward_transport_installed {
+        tracing::info!(peers, "partition-forward transport installed");
+    } else {
+        tracing::info!(
+            peers,
+            has_secret = forward_secret.is_some(),
+            "partition-forward transport not installed (local-only or no BASIN_FORWARD_SECRET)"
+        );
     }
 
     // Build the static resolver from `BASIN_PROJECTS`.

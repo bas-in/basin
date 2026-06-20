@@ -48,8 +48,9 @@
 //!   `x-basin-forward-secret` header (constant-time compare). On Fly the
 //!   endpoint is additionally reachable only over the private 6PN network.
 
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -59,12 +60,130 @@ use axum::Json;
 use basin_common::{PartitionKey, ProjectId, TableName};
 use basin_engine::write_forwarder::{
     decode_partition_batch, FORWARD_SECRET_HEADER, PARTITION_FORWARD_HOP_HEADER,
-    PARTITION_FORWARD_PARTITION_HEADER, PARTITION_FORWARD_PROJECT_HEADER,
-    PARTITION_FORWARD_TABLE_HEADER,
+    PARTITION_FORWARD_IDEM_HEADER, PARTITION_FORWARD_PARTITION_HEADER,
+    PARTITION_FORWARD_PROJECT_HEADER, PARTITION_FORWARD_TABLE_HEADER,
 };
 
 use crate::errors::ApiError;
 use crate::server::Inner;
+
+/// How many recently-applied idempotency keys the per-process dedup window
+/// retains. A lost-ack retry fires near-immediately (the sender backs off only
+/// ~50ms before retrying — see `executor::forward_partition_to_owner`), so the
+/// retry's key is still in the window even under heavy concurrent ingest: with
+/// 8 fan-out partitions and many in-flight batches, several thousand keys covers
+/// far more than the handful of batches that can be in flight within a 50ms
+/// retry window. The bound caps memory (32 bytes/key + map overhead → well
+/// under a few MB) and evicts FIFO. A retry that somehow arrived AFTER eviction
+/// would re-apply (back to the original at-least-once bug for that one batch),
+/// but the immediate retry timing makes that practically impossible; see the
+/// note in `forward_partition_to_owner`.
+const IDEM_WINDOW: usize = 8192;
+
+/// State recorded for an idempotency key the moment a batch begins applying.
+#[derive(Clone, Copy)]
+enum IdemEntry {
+    /// A receipt with this key is currently applying (in-flight). Carries no
+    /// rowcount yet; a concurrent duplicate must wait/skip rather than re-apply.
+    InFlight,
+    /// The batch with this key was applied; carries the rowcount the original
+    /// apply returned, so a dedup'd retry returns the IDENTICAL rowcount.
+    Applied(u64),
+}
+
+/// A bounded, concurrency-safe set of recently-seen idempotency keys with their
+/// apply state. FIFO eviction at [`IDEM_WINDOW`]. The single `Mutex` makes
+/// check-and-record atomic, so two near-simultaneous retries of the same key
+/// can't both apply: the first claims `InFlight` and applies; the second sees
+/// the key present and skips.
+struct IdemWindow {
+    inner: Mutex<IdemWindowInner>,
+}
+
+struct IdemWindowInner {
+    map: HashMap<String, IdemEntry>,
+    order: VecDeque<String>,
+}
+
+/// Outcome of claiming an idempotency key for application.
+enum IdemClaim {
+    /// First sight of this key — the caller must apply the write, then call
+    /// [`IdemWindow::record_applied`] with the rowcount.
+    Apply,
+    /// Already applied — skip the write and return this rowcount (matches the
+    /// original apply, so the sender's retry sees the expected total).
+    AlreadyApplied(u64),
+    /// A concurrent receipt of the same key is mid-apply. Treat as a duplicate:
+    /// skip and return this rowcount (known up front from the batch size, which
+    /// equals what the in-flight apply will return — partition writes never drop
+    /// rows on the receiver, so batch size IS the applied rowcount).
+    InFlightDuplicate(u64),
+}
+
+impl IdemWindow {
+    fn global() -> &'static IdemWindow {
+        static W: OnceLock<IdemWindow> = OnceLock::new();
+        W.get_or_init(|| IdemWindow {
+            inner: Mutex::new(IdemWindowInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            }),
+        })
+    }
+
+    /// Atomically claim `key` for application. On the first sight of `key`
+    /// records it `InFlight` and returns [`IdemClaim::Apply`]; a repeat returns
+    /// `AlreadyApplied`/`InFlightDuplicate` so the caller skips the write.
+    /// `rows` is the batch size, used as the dedup rowcount for the in-flight
+    /// case (the receiver never drops rows, so batch size == applied rowcount).
+    fn claim(&self, key: &str, rows: u64) -> IdemClaim {
+        let mut g = self.inner.lock().expect("idem window poisoned");
+        match g.map.get(key) {
+            Some(IdemEntry::Applied(n)) => IdemClaim::AlreadyApplied(*n),
+            Some(IdemEntry::InFlight) => IdemClaim::InFlightDuplicate(rows),
+            None => {
+                g.insert(key.to_string(), IdemEntry::InFlight);
+                IdemClaim::Apply
+            }
+        }
+    }
+
+    /// Promote an in-flight key to `Applied(rows)` after the write committed.
+    fn record_applied(&self, key: &str, rows: u64) {
+        let mut g = self.inner.lock().expect("idem window poisoned");
+        // Key is already present (claimed InFlight); just update its state.
+        if let Some(slot) = g.map.get_mut(key) {
+            *slot = IdemEntry::Applied(rows);
+        }
+    }
+
+    /// Drop an in-flight key when the apply FAILED, so a later retry of the same
+    /// batch is allowed to apply (the failed attempt wrote nothing to dedup
+    /// against). Without this a transient owner-side write error would wedge the
+    /// key as permanently-skipped and silently lose the batch.
+    fn forget_inflight(&self, key: &str) {
+        let mut g = self.inner.lock().expect("idem window poisoned");
+        if let Some(IdemEntry::InFlight) = g.map.get(key) {
+            g.map.remove(key);
+            g.order.retain(|k| k != key);
+        }
+    }
+}
+
+impl IdemWindowInner {
+    /// Insert a new key, evicting the oldest when at capacity (FIFO ring).
+    fn insert(&mut self, key: String, entry: IdemEntry) {
+        if self.map.len() >= IDEM_WINDOW {
+            while let Some(old) = self.order.pop_front() {
+                if self.map.remove(&old).is_some() {
+                    break;
+                }
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, entry);
+    }
+}
 
 /// Constant-time secret comparison so a timing side-channel can't reveal the
 /// configured secret byte-by-byte. Mirrors `internal_forward::secrets_match`.
@@ -144,19 +263,69 @@ pub(crate) async fn post_partition_write(
     let batch = decode_partition_batch(&body).map_err(ApiError::from)?;
     let rows = batch.num_rows() as u64;
 
+    // EXACTLY-ONCE: forwarding is at-least-once over the network — a lost ack
+    // makes the sender re-POST the SAME batch with the SAME idempotency key.
+    // Dedup on that key so an already-applied batch is NOT written twice;
+    // instead return the original rowcount so the sender's retry sees success
+    // and totals stay correct. Back-compat: if the header is absent (older
+    // sender), fall back to apply-unconditionally — the matching sender in this
+    // build always sends it.
+    let idem_key = headers
+        .get(PARTITION_FORWARD_IDEM_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    if let Some(key) = idem_key.as_deref() {
+        match IdemWindow::global().claim(key, rows) {
+            IdemClaim::AlreadyApplied(n) | IdemClaim::InFlightDuplicate(n) => {
+                // Duplicate receipt — skip the write entirely, return the same
+                // rowcount the original apply did (== batch size; the receiver
+                // never drops rows). Atomic check-and-claim above guarantees two
+                // simultaneous retries can't both reach the apply path.
+                return Ok((StatusCode::OK, Json(n)).into_response());
+            }
+            IdemClaim::Apply => { /* fall through to apply, then record */ }
+        }
+    }
+
     // The shard handle. `shard.get` performs the lease CAS (ensure_lease): this
     // node, the partition's deterministic owner, holds the writer lease, so the
     // RAW write below is the single writer for the partition.
-    let shard = state.cfg.engine.shard().ok_or_else(|| {
-        ApiError::internal("partition-write received but this node has no shard configured")
-    })?;
-    let handle = shard.get(&project, &partition).await.map_err(ApiError::from)?;
+    let shard = match state.cfg.engine.shard() {
+        Some(s) => s,
+        None => {
+            if let Some(key) = idem_key.as_deref() {
+                IdemWindow::global().forget_inflight(key);
+            }
+            return Err(ApiError::internal(
+                "partition-write received but this node has no shard configured",
+            ));
+        }
+    };
     // RAW partition write — durable. Constraints already ran on the SENDER
-    // across all partitions before fan-out (see module docs); do NOT re-run.
-    handle
-        .write_batch_opts(&table, batch, true)
-        .await
-        .map_err(ApiError::from)?;
+    // across all partitions before fan-out (see module docs); do NOT re-run. On
+    // ANY failure, forget the in-flight key so a legitimate retry can re-apply
+    // (the failed attempt wrote nothing to dedup against).
+    let apply = async {
+        let handle = shard.get(&project, &partition).await.map_err(ApiError::from)?;
+        handle
+            .write_batch_opts(&table, batch, true)
+            .await
+            .map_err(ApiError::from)
+    }
+    .await;
+    if let Err(e) = apply {
+        if let Some(key) = idem_key.as_deref() {
+            IdemWindow::global().forget_inflight(key);
+        }
+        return Err(e);
+    }
+
+    // Commit succeeded: promote the in-flight key to Applied(rows) so a
+    // lost-ack retry dedups to exactly this rowcount.
+    if let Some(key) = idem_key.as_deref() {
+        IdemWindow::global().record_applied(key, rows);
+    }
 
     Ok((StatusCode::OK, Json(rows)).into_response())
 }
@@ -209,6 +378,96 @@ mod tests {
         let headers = secret_headers("anything");
         let err = check_forward_secret(&headers, None).unwrap_err();
         assert_eq!(err.code.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── idempotency window: dedup correctness + bound + atomicity ────────────
+
+    /// A fresh window (not the process-global one) so tests don't alias state.
+    fn fresh_window() -> IdemWindow {
+        IdemWindow {
+            inner: Mutex::new(IdemWindowInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn same_key_twice_applies_once_with_same_rowcount() {
+        let w = fresh_window();
+        // First receipt of key "k": claim → Apply, then we "write" 100 rows.
+        match w.claim("k", 100) {
+            IdemClaim::Apply => w.record_applied("k", 100),
+            _ => panic!("first claim must be Apply, got a duplicate"),
+        }
+        // Second receipt of the SAME key: dedup to AlreadyApplied with the SAME
+        // rowcount — the receiver must SKIP the write and return 100 again.
+        match w.claim("k", 100) {
+            IdemClaim::AlreadyApplied(n) => assert_eq!(n, 100, "dedup returns original rowcount"),
+            _ => panic!("second claim of same key must dedup to AlreadyApplied"),
+        }
+    }
+
+    #[test]
+    fn different_key_same_content_applies_again() {
+        let w = fresh_window();
+        match w.claim("k1", 100) {
+            IdemClaim::Apply => w.record_applied("k1", 100),
+            _ => panic!("k1 first claim must Apply"),
+        }
+        // A DIFFERENT key (even with identical content/rowcount) is a distinct
+        // batch → must apply again, never dedup.
+        assert!(
+            matches!(w.claim("k2", 100), IdemClaim::Apply),
+            "a distinct idempotency key must apply (no false dedup on content)"
+        );
+    }
+
+    #[test]
+    fn concurrent_double_receipt_of_one_key_applies_once() {
+        // The first claim takes InFlight; a SECOND concurrent claim of the same
+        // key (before record_applied) must NOT also Apply — it sees the in-flight
+        // entry and dedups, so two simultaneous retries can't both write.
+        let w = fresh_window();
+        assert!(matches!(w.claim("k", 100), IdemClaim::Apply), "first claims");
+        match w.claim("k", 100) {
+            IdemClaim::InFlightDuplicate(n) => assert_eq!(n, 100),
+            _ => panic!("concurrent second claim must dedup as InFlightDuplicate"),
+        }
+        // Only after the first finishes does it become Applied.
+        w.record_applied("k", 100);
+        assert!(matches!(w.claim("k", 100), IdemClaim::AlreadyApplied(100)));
+    }
+
+    #[test]
+    fn failed_apply_forgets_inflight_so_retry_can_apply() {
+        let w = fresh_window();
+        assert!(matches!(w.claim("k", 100), IdemClaim::Apply));
+        // Apply failed → forget the in-flight key; a later retry must be allowed
+        // to apply (the failed attempt wrote nothing to dedup against).
+        w.forget_inflight("k");
+        assert!(
+            matches!(w.claim("k", 100), IdemClaim::Apply),
+            "after a failed apply, the same key must be allowed to apply again"
+        );
+    }
+
+    #[test]
+    fn window_evicts_fifo_at_bound() {
+        let w = fresh_window();
+        // Fill past the bound; the earliest key must be evicted (and so re-apply
+        // if it ever returns — accepted trade-off, see IDEM_WINDOW doc).
+        for i in 0..(IDEM_WINDOW + 10) {
+            let k = format!("k{i}");
+            match w.claim(&k, 1) {
+                IdemClaim::Apply => w.record_applied(&k, 1),
+                _ => panic!("each distinct key applies"),
+            }
+        }
+        let g = w.inner.lock().unwrap();
+        assert!(g.map.len() <= IDEM_WINDOW, "window stays bounded");
+        assert!(!g.map.contains_key("k0"), "oldest key evicted FIFO");
+        assert!(g.map.contains_key(&format!("k{}", IDEM_WINDOW + 9)), "newest retained");
     }
 
     #[test]
