@@ -710,6 +710,33 @@ impl InProcessShard {
         Ok(())
     }
 
+    /// Build a `ProjectHandle` for `(project, partition)`, loading the state
+    /// from the WAL on first access. Shared by `get` (write path, after
+    /// `ensure_lease`) and `get_for_read` (read path, no lease) — neither the
+    /// state load nor the handle wiring touches the lease.
+    async fn build_handle(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+    ) -> Result<ProjectHandle> {
+        let state = self.load_or_create(project, partition).await?;
+        self.refresh_resident_stats().await;
+        let inner: Arc<dyn ProjectHandleImpl> = Arc::new(InProcessProjectHandle {
+            project: *project,
+            partition: partition.clone(),
+            state: state.clone(),
+            cfg: self.cfg.clone(),
+            held_leases: self.held_leases.clone(),
+            draining: self.draining.clone(),
+            // Share the same partitions map + registries so a backpressure
+            // flush from the write path is identical to a background-tick
+            // compaction (`share_clone` snapshots the registry cells, which are
+            // wired once at engine startup before any COPY runs).
+            shard: Arc::new(self.share_clone()),
+        });
+        Ok(ProjectHandle { inner })
+    }
+
     /// Look up the per-partition state (if resident) and run `compact_one`.
     /// Used by [`Self::yield_partition`]. Returns `Ok` if the partition is
     /// not resident — nothing to drain.
@@ -867,18 +894,67 @@ impl InProcessShard {
             if renewed {
                 continue;
             }
-            // Lost the lease. Drop the partition's in-memory state and stop
-            // tracking it; a peer has (or will) take over.
-            warn!(
-                %project,
-                %partition,
-                epoch,
-                "lease renewal failed; dropping partition state",
-            );
+            // Lost the lease. FLUSH-BEFORE-DROP: the in-memory tail lives only
+            // in THIS node's local WAL; if we drop the state without committing
+            // it, those rows are stranded (the new owner's WAL doesn't have
+            // them) → permanent loss (the original multi-node data-loss bug).
+            //
+            // The catalog commit (`compact_one` → `commit_with_retry` →
+            // `append_data_files`) is OCC on the TABLE snapshot, NOT gated by
+            // the partition lease, so a node that just lost the writer lease can
+            // still durably commit its buffered tail; the OCC retry handles a
+            // concurrent append from the new owner (both land, no loss).
+            //
+            // Stop renewing immediately (clear `held_leases`) so we never
+            // re-extend a lease we lost; but keep the in-memory STATE until the
+            // tail is durably committed. We do NOT block the eviction/heartbeat
+            // loop indefinitely: the flush is one bounded `compact_one_keyed`
+            // call (same bounded-pass drain the background compactor uses); if
+            // it FAILS we log loudly and LEAVE the state resident so the next
+            // heartbeat tick retries the flush — we never silently drop a
+            // non-empty tail.
             {
                 let mut held = self.held_leases.lock().await;
                 held.remove(&(project, partition.clone()));
             }
+            let flush_res = {
+                // Make any in-RAM buffered WAL entries into closed segments so
+                // the compaction's WAL truncate can prune them (mirrors the
+                // lease-handoff drain in `yield_partition`).
+                if let Err(e) = self.cfg.wal.flush().await {
+                    warn!(
+                        %project,
+                        %partition,
+                        error = %e,
+                        "lease-loss pre-flush wal flush failed; proceeding to compact",
+                    );
+                }
+                self.compact_one_keyed(&project, &partition).await
+            };
+            if let Err(e) = flush_res {
+                // The flush+commit did not succeed: the tail is still in this
+                // node's WAL/RAM. Do NOT drop the state — keep it resident so
+                // the next heartbeat tick retries. Losing the lease without a
+                // durable tail must never strand rows.
+                warn!(
+                    %project,
+                    %partition,
+                    epoch,
+                    error = %e,
+                    "lease renewal failed; tail flush-before-drop FAILED, \
+                     keeping partition state resident to retry next tick",
+                );
+                continue;
+            }
+            // Tail is durably committed (or was empty). Now it is safe to drop
+            // the in-memory state; the peer owns the partition and reads see the
+            // flushed files via the shared catalog.
+            warn!(
+                %project,
+                %partition,
+                epoch,
+                "lease renewal failed; tail flushed+committed, dropping partition state",
+            );
             {
                 let mut map = self.partitions.lock().await;
                 map.remove(&(project, partition.clone()));
@@ -1565,10 +1641,28 @@ impl InProcessShard {
         use futures::stream::{FuturesUnordered, StreamExt as _};
         use tokio::sync::Semaphore;
 
-        let snapshot: PartitionSnapshot = {
+        let mut snapshot: PartitionSnapshot = {
             let map = self.partitions.lock().await;
             map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
+        // Owner-only compaction (multi-node). Only the lease holder may
+        // compact + commit a partition; a non-owner compacting races the real
+        // owner's catalog commit ("lost commit race at version N"). In no-lease
+        // mode (`lease_registry == None`) there is no ownership concept and the
+        // node is the sole writer, so we compact every resident partition as
+        // before. When a registry IS configured, drop partitions whose lease
+        // this node does not currently hold. (Note: state for a non-owned
+        // partition can still be resident transiently — e.g. just after a lease
+        // loss before the flush-before-drop in `heartbeat_renew` runs.)
+        if self.cfg.lease_registry.is_some() {
+            let held: std::collections::HashSet<(ProjectId, PartitionKey)> = {
+                let h = self.held_leases.lock().await;
+                h.keys().cloned().collect()
+            };
+            snapshot.retain(|((project, partition), _)| {
+                held.contains(&(*project, partition.clone()))
+            });
+        }
         if snapshot.is_empty() {
             return Ok(());
         }
@@ -2735,25 +2829,27 @@ fn unique_projects(map: &PartitionMap) -> usize {
 impl ShardImpl for InProcessShard {
     #[instrument(skip(self), fields(project = %project, partition = %partition))]
     async fn get(&self, project: &ProjectId, partition: &PartitionKey) -> Result<ProjectHandle> {
-        // Phase 6.X.A: acquire the lease before exposing the partition (no-op
-        // in no-lease mode). Errors if a peer holds a live lease.
+        // Phase 6.X.A: acquire the WRITER lease before exposing the partition
+        // (no-op in no-lease mode). Errors if a peer holds a live lease. This
+        // is the WRITE path only — reads must use `get_for_read`, which never
+        // takes the lease (a read that touched `get` would steal/fence the
+        // owner's writer lease, the multi-node data-loss bug).
         self.ensure_lease(project, partition).await?;
-        let state = self.load_or_create(project, partition).await?;
-        self.refresh_resident_stats().await;
-        let inner: Arc<dyn ProjectHandleImpl> = Arc::new(InProcessProjectHandle {
-            project: *project,
-            partition: partition.clone(),
-            state: state.clone(),
-            cfg: self.cfg.clone(),
-            held_leases: self.held_leases.clone(),
-            draining: self.draining.clone(),
-            // Share the same partitions map + registries so a backpressure
-            // flush from the write path is identical to a background-tick
-            // compaction (`share_clone` snapshots the registry cells, which are
-            // wired once at engine startup before any COPY runs).
-            shard: Arc::new(self.share_clone()),
-        });
-        Ok(ProjectHandle { inner })
+        self.build_handle(project, partition).await
+    }
+
+    async fn get_for_read(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+    ) -> Result<ProjectHandle> {
+        // Read path: deliberately NO `ensure_lease`. The cross-node lease is a
+        // writer lease; a read (e.g. a `count(*)` that unions every partition)
+        // must never acquire or steal it. The handle reads this node's resident
+        // tail for partitions it owns plus the shared flushed files via the
+        // catalog + object store; it does not fetch a remote owner's un-flushed
+        // tail (consistent-after-flush).
+        self.build_handle(project, partition).await
     }
 
     fn spawn_background(self: Arc<Self>) -> ShardBackgroundHandle {
@@ -5508,6 +5604,243 @@ mod tests {
         );
         // A no longer tracks the lease epoch.
         assert_eq!(inner_a.lease_epoch(&project, &partition).await, None);
+    }
+
+    /// Build a shared (storage, wal, catalog) triple for multi-replica tests
+    /// where the replicas must agree on the durable substrate AND the lease
+    /// registry (the same `InMemoryCatalog` is both).
+    async fn shared_substrate() -> (Storage, Arc<dyn Wal>, Arc<InMemoryCatalog>, TempDir, TempDir) {
+        let storage_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+        let storage_fs = LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap();
+        let wal_fs = LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap();
+        let storage = Storage::new(StorageConfig {
+            object_store: Arc::new(storage_fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(wal_fs),
+                root_prefix: None,
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
+            })
+            .await
+            .unwrap(),
+        );
+        let catalog = Arc::new(InMemoryCatalog::new());
+        (storage, wal, catalog, storage_dir, wal_dir)
+    }
+
+    /// MULTI-NODE DATA-LOSS regression (Fix A): a READ must NOT steal the
+    /// cross-node writer lease. A owns partition `p` (acquired its lease via a
+    /// write). B then performs a READ that touches `p` via `get_for_read`. A
+    /// must STILL hold `p`'s lease afterwards (B did not steal it), and B's
+    /// read returns `p`'s FLUSHED rows without error.
+    #[tokio::test]
+    async fn read_does_not_steal_writer_lease() {
+        let (storage, wal, catalog, _sd, _wd) = shared_substrate().await;
+        let project = ProjectId::new();
+        let part = PartitionKey::new("s2").unwrap();
+        let table = TableName::new("mt").unwrap();
+
+        // A acquires the writer lease for `p` (via `get`) and writes 50 rows.
+        let shard_a = leased_shard_with_storage(
+            catalog.clone(),
+            storage.clone(),
+            wal.clone(),
+            "replica-a",
+            Duration::from_secs(30),
+        );
+        let ha = shard_a.get(&project, &part).await.unwrap();
+        ha.write_batch(&table, batch(0, 50, "a-")).await.unwrap();
+        let inner_a = impl_of(&shard_a);
+        let epoch_before = inner_a
+            .lease_epoch(&project, &part)
+            .await
+            .expect("A holds p's lease after its write");
+
+        // Flush A's tail to the shared object store so the flushed rows are
+        // visible cross-node (consistent-after-flush).
+        shard_a.flush_to_parquet().await.unwrap();
+
+        // B performs a READ that touches `p` via the no-lease accessor.
+        let shard_b = leased_shard_with_storage(
+            catalog.clone(),
+            storage.clone(),
+            wal.clone(),
+            "replica-b",
+            Duration::from_secs(30),
+        );
+        let hb = shard_b.get_for_read(&project, &part).await.unwrap();
+        let read = hb.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(rows_in(&read), 50, "B's read sees p's flushed rows");
+
+        // KEY ASSERTION: A STILL holds p's lease — B did not steal it.
+        assert_eq!(
+            inner_a.lease_epoch(&project, &part).await,
+            Some(epoch_before),
+            "A must keep p's writer lease while B reads (no steal)",
+        );
+        // The registry confirms A is still the live owner.
+        assert_eq!(
+            catalog.owner_of(&project, part.as_str()).await.unwrap(),
+            Some(("replica-a".to_string(), epoch_before)),
+        );
+        // B never recorded an epoch for `p` (it only read).
+        assert_eq!(impl_of(&shard_b).lease_epoch(&project, &part).await, None);
+
+        // A's heartbeat still renews cleanly — its state is NOT dropped (no
+        // "dropping partition state" path was taken).
+        inner_a.run_heartbeat_once().await;
+        assert_eq!(
+            shard_a.stats().resident_partitions, 1,
+            "A keeps p resident after B's read + a heartbeat",
+        );
+    }
+
+    /// FLUSH-BEFORE-DROP regression (Fix C): when a node loses the writer
+    /// lease while holding an un-flushed tail, the tail must be flushed +
+    /// committed to the shared catalog BEFORE the in-memory state is dropped.
+    /// Zero rows may be lost across the forced ownership change.
+    #[tokio::test]
+    async fn lost_lease_flushes_tail_before_dropping_state() {
+        let (storage, wal, catalog, _sd, _wd) = shared_substrate().await;
+        let project = ProjectId::new();
+        let part = PartitionKey::new("s1").unwrap();
+        let table = TableName::new("mt").unwrap();
+
+        // A acquires with a short TTL so its lease can be stolen, and writes
+        // 50 rows that stay in the in-memory tail (NO flush).
+        let shard_a = {
+            let registry: Arc<dyn basin_catalog::LeaseRegistry> = catalog.clone();
+            let mut cfg = ShardConfig::new(storage.clone(), catalog.clone(), wal.clone())
+                .with_lease_registry(registry, "replica-a");
+            cfg.lease_ttl = Duration::from_millis(10);
+            cfg.lease_renew_interval = Duration::from_millis(50);
+            crate::Shard::new(cfg)
+        };
+        let ha = shard_a.get(&project, &part).await.unwrap();
+        ha.write_batch(&table, batch(0, 50, "a-")).await.unwrap();
+        let inner_a = impl_of(&shard_a);
+        assert!(inner_a.lease_epoch(&project, &part).await.is_some());
+
+        // Force the lease loss: let A's lease expire, then B steals it.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        catalog
+            .acquire(&project, part.as_str(), "replica-b", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .expect("B steals after A's TTL expiry");
+
+        // A's heartbeat tick now fails to renew. Fix C: it FLUSHES + COMMITS
+        // the 50-row tail before dropping the partition state.
+        inner_a.run_heartbeat_once().await;
+
+        // State is dropped (tail was committed) and the lease is no longer held.
+        assert_eq!(
+            shard_a.stats().resident_partitions, 0,
+            "state dropped only AFTER a successful flush",
+        );
+        assert_eq!(inner_a.lease_epoch(&project, &part).await, None);
+
+        // ZERO LOSS: the 50 rows are durably in the shared catalog. A fresh
+        // reader (no resident tail) sees them from the flushed files alone.
+        let reader = leased_shard_with_storage(
+            catalog.clone(),
+            storage.clone(),
+            wal.clone(),
+            "replica-reader",
+            Duration::from_secs(30),
+        );
+        let rows = reader
+            .read_table_merging_tails(&project, &table, ReadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows_in(&rows), 50,
+            "the un-flushed tail must be flushed+committed on lease loss (zero loss)",
+        );
+    }
+
+    /// COMPACTION OWNER-ONLY regression (Fix B): a node that does NOT hold a
+    /// partition's lease must not compact/commit it (which would race the real
+    /// owner's catalog commit — "lost commit race"). Only the holder compacts.
+    #[tokio::test]
+    async fn only_lease_holder_compacts() {
+        let (storage, wal, catalog, _sd, _wd) = shared_substrate().await;
+        let project = ProjectId::new();
+        let part = PartitionKey::new("s3").unwrap();
+        let table = TableName::new("mt").unwrap();
+
+        // B acquires p's lease and writes 50 rows into its in-memory tail
+        // (un-flushed, so the tail is dirty and resident).
+        let shard_b = leased_shard_with_storage(
+            catalog.clone(),
+            storage.clone(),
+            wal.clone(),
+            "replica-b",
+            Duration::from_secs(30),
+        );
+        let inner_b = impl_of(&shard_b);
+        let hb = shard_b.get(&project, &part).await.unwrap();
+        hb.write_batch(&table, batch(0, 50, "b-")).await.unwrap();
+        assert!(inner_b.lease_epoch(&project, &part).await.is_some());
+
+        // Simulate the lease-loss-with-lingering-state window: B is no longer
+        // the lease holder, but its dirty tail is still resident (the exact
+        // condition that caused "lost commit race"). We strip ONLY the held
+        // lease, leaving the resident state in place.
+        {
+            let mut held = inner_b.held_leases.lock().await;
+            held.remove(&(project, part.clone()));
+        }
+        assert_eq!(
+            shard_b.stats().resident_partitions, 1,
+            "B still has p resident (dirty tail) but no longer holds the lease",
+        );
+
+        // B runs a compaction tick. The owner-gate skips `p` (B is not the
+        // holder) → it must NOT compact/commit B's tail (no "lost commit
+        // race"). Must succeed without error.
+        shard_b.flush_to_parquet().await.unwrap();
+
+        // The catalog must carry ZERO rows: a non-owner compaction did NOT
+        // commit B's tail. (Had the owner-gate been absent, B would have
+        // committed its 50 rows and raced the real owner.)
+        let reader = leased_shard_with_storage(
+            catalog.clone(),
+            storage.clone(),
+            wal.clone(),
+            "replica-reader",
+            Duration::from_secs(30),
+        );
+        let rows = reader
+            .read_table_merging_tails(&project, &table, ReadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows_in(&rows), 0,
+            "non-owner B must not compact/commit p's tail (owner-only gate)",
+        );
+
+        // Re-grant the lease to B; now it IS the holder and compaction commits.
+        {
+            let mut held = inner_b.held_leases.lock().await;
+            held.insert((project, part.clone()), 1);
+        }
+        shard_b.flush_to_parquet().await.unwrap();
+        let rows = reader
+            .read_table_merging_tails(&project, &table, ReadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows_in(&rows), 50,
+            "the lease holder compacts + commits its own partition",
+        );
     }
 
     #[tokio::test]

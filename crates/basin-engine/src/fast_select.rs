@@ -3865,8 +3865,11 @@ async fn execute_simple_select_inner(
             // the shard's `handle.read` drives its own async I/O / WAL-replay
             // cooperatively; nesting a runtime would re-create the fast_select
             // livelock the non-shard heavy path documents.
+            // Read path: use the no-lease accessor so a SELECT/scan never
+            // acquires the cross-node writer lease (which would fence the
+            // partition's true owner — the multi-node data-loss bug).
             let handle = shard
-                .get(&sess.project, &PartitionKey::default_key())
+                .get_for_read(&sess.project, &PartitionKey::default_key())
                 .await?;
             handle.read(&plan.table, opts).await?
         }

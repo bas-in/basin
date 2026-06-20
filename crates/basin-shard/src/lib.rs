@@ -355,6 +355,20 @@ impl Shard {
         self.inner.get(project, partition).await
     }
 
+    /// Read-only handle to `(project, partition)` that does NOT acquire the
+    /// cross-node writer lease. Use this on every read/scan path (a `count(*)`
+    /// / `SELECT` touches every partition and must not fence the true owner).
+    /// The handle reads the resident tail this node owns plus the shared
+    /// flushed files; it never steals the writer lease. See
+    /// [`ShardImpl::get_for_read`].
+    pub async fn get_for_read(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+    ) -> Result<ProjectHandle> {
+        self.inner.get_for_read(project, partition).await
+    }
+
     /// Spawn the eviction + compaction + clean-retention-sweep background
     /// loops. Returns a handle that, when dropped, signals shutdown. Call
     /// this once at server boot. May be called before
@@ -770,6 +784,21 @@ pub trait CvRefreshDriver: Send + Sync {
 #[async_trait]
 pub(crate) trait ShardImpl: Send + Sync {
     async fn get(&self, project: &ProjectId, partition: &PartitionKey) -> Result<ProjectHandle>;
+    /// Read-only handle: returns the partition handle WITHOUT acquiring the
+    /// cross-node writer lease. The lease is a *writer* lease; a read that
+    /// touches a partition (e.g. a `count(*)` that unions every partition)
+    /// must never acquire or steal it from the true owner. The returned handle
+    /// reads this node's resident tail (for partitions it owns) plus the shared
+    /// FLUSHED files via the catalog + object store — it does NOT see a remote
+    /// owner's un-flushed tail (consistent-after-flush). Default delegates to
+    /// `get` for backends with no lease concept.
+    async fn get_for_read(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+    ) -> Result<ProjectHandle> {
+        self.get(project, partition).await
+    }
     fn spawn_background(self: Arc<Self>) -> ShardBackgroundHandle;
     fn stats(&self) -> ShardStats;
     /// Ingest-pressure snapshot (resident tail bytes + rolling ingest rate) for
@@ -900,7 +929,10 @@ pub(crate) trait ShardImpl: Send + Sync {
         table: &TableName,
         opts: basin_storage::ReadOptions,
     ) -> Result<Vec<RecordBatch>> {
-        let handle = self.get(project, &PartitionKey::default_key()).await?;
+        // Read path: never acquire the writer lease (see `get_for_read`).
+        let handle = self
+            .get_for_read(project, &PartitionKey::default_key())
+            .await?;
         handle.read(table, opts).await
     }
     /// Test-only downcast for the inline test suite.

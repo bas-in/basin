@@ -8,6 +8,49 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-20 — Fix multi-node data loss from lease-stealing reads (basin-shard)
+
+A live two-node deploy (`BASIN_LEASE_MODE=required`, object-store catalog,
+partition fan-out) lost exactly one partition's worth of rows: a 200,000-row
+`COPY` acked `COPY 200000` but `count(*)` returned 150,000. The cross-node lease
+is a **writer** lease, but three paths violated that:
+
+- **Reads stole the writer lease.** `InProcessShard::get` acquired the lease for
+  *every* access, including reads. A `count(*)`/`SELECT` unions every partition,
+  so each node acquired the lease for partitions it did not own, fencing the
+  true owner — two nodes reading + writing flapped the leases across all
+  partitions.
+- **Lease loss dropped the un-flushed tail.** The heartbeat-renewal path dropped
+  a partition's in-memory state on a lost lease. That state held the un-flushed
+  tail, which lived only in *this* node's local WAL — once dropped, those rows
+  were stranded (the new owner's WAL never had them) → permanent loss.
+- **Non-owners compacted.** The background compactor committed any resident
+  partition regardless of ownership, racing the real owner's catalog commit
+  ("lost commit race at version N").
+
+Fixes:
+
+- **Reads never take the writer lease.** Added `Shard::get_for_read` /
+  `ShardImpl::get_for_read`, which returns the partition handle WITHOUT
+  `ensure_lease`. The read/scan path (`read_table_merging_tails`, the
+  `fast_select` small-tail merge) now uses it; the write path (`get`) keeps
+  lease acquisition. A reader sees a non-owned partition's **flushed** files via
+  the shared catalog + object store, not the owner's in-memory tail
+  (consistent-after-flush).
+- **Flush-before-drop.** On lease loss the heartbeat now flushes + commits the
+  resident tail to the shared catalog *before* dropping the in-memory state. The
+  catalog append is OCC on the table snapshot (not lease-gated), so a node that
+  just lost the writer lease can still durably commit its buffered tail (the OCC
+  retry lands both appends). If the flush fails the state is kept resident and
+  retried — a non-empty tail is never silently dropped.
+- **Owner-only compaction.** The background compactor now skips partitions this
+  node does not hold the lease for (when a lease registry is configured),
+  eliminating the lost-commit race. No-lease mode is unchanged (sole writer
+  compacts everything).
+
+New regression tests in `basin-shard`: `read_does_not_steal_writer_lease`,
+`lost_lease_flushes_tail_before_dropping_state`, `only_lease_holder_compacts`.
+
 ## 2026-06-20 — Durable, multi-node-safe sequences in the object-store catalog
 
 The Basin-native object-store catalog (`BASIN_CATALOG_BACKEND=object_store`)
