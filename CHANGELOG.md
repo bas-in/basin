@@ -8,6 +8,56 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-20 — Shard the object-store data-file manifest by partition (multi-node ingest scaling)
+
+A live two-node deploy stalled a bulk `COPY` at ~55M rows with a CAS-contention
+storm in the logs (`commit conflict: …: lost commit race at version 394`,
+repeated across partitions `_default/s1/s2/s3` on **both** nodes). The tail grew
+past its soft cap, backpressure engaged, and ingest stalled.
+
+Root cause: `ObjectStoreCatalog` stored **all** of a table's data files in ONE
+monotonic manifest version chain (`{table}/v{N}.json` + `HEAD`). Every
+partition's compaction flush from every node appended to that single chain via
+create-if-absent CAS, so 2 nodes × 4 partitions = up to 8 concurrent committers
+raced one version — most lost, retried, and compaction could not keep pace. The
+single per-table manifest was a hard serialization point capping multi-writer
+throughput.
+
+Fix — **shard the data-file manifest by partition**:
+
+- New per-partition segment layout:
+  `{root}{project}/{schema}/{table}/parts/{partition_id}/v{M:020}.json` (+ a
+  per-partition `HEAD`). Each segment carries that partition's own data-file
+  snapshot chain + per-partition OCC version `M`. Under deterministic
+  single-owner partition ownership, a partition's owner CASes only **its** chain
+  — so concurrent writers on different partitions/nodes never contend.
+- New partition-scoped `Catalog` methods —
+  `current_snapshot_id_in_partition`, `append_data_files_in_partition`,
+  `replace_data_files_in_partition` — with table-level default impls (so
+  `InMemoryCatalog` / `PostgresCatalog` and single-node paths are unchanged);
+  `ObjectStoreCatalog` shards by partition. The shard compactor's
+  `commit_with_retry` now routes through the partition-scoped append using the
+  partition it just flushed and that partition's own OCC token.
+- **Reads union across partitions**: `load_table` / `current_snapshot_id` /
+  `list_snapshots` enumerate all partition segments under `{table}/parts/`,
+  reduce each partition's live set, and union them (plus the table META chain's
+  own files) into one complete `TableMetadata`. Data-file paths are globally
+  unique and `removed_paths` are path-scoped, so the union is exact — no loss,
+  no double-count.
+- Per-partition segment cache keyed by `(partition_id, version)`, revalidated
+  against the partition `HEAD`; correctness never depends on the cache.
+
+Honest reductions: the table-level snapshot id is now **synthetic** (a current-
+state cut), so fine-grained per-commit time-travel is not retained for the
+object-store catalog — `load_table_at_snapshot` returns `FeatureNotSupported`
+for historical ids and the caller serves a current read. The non-partitioned
+`append_data_files` / `replace_data_files` remain on the legacy META chain
+(resolving their OCC internally) for back-compat with single-node OLTP and other
+backends; rename / fork carry per-partition segments over to the new identity.
+A table written under the pre-shard single-chain layout is not auto-migrated —
+the object-store catalog requires the new layout (no production data exists in
+it yet, so no migration is needed).
+
 ## 2026-06-20 — Fix multi-node duplicate rows from at-least-once partition-write forwarding
 
 A live two-node deploy lost zero rows but produced **duplicates**: a 10,000,000-row

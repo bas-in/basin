@@ -2045,7 +2045,7 @@ impl InProcessShard {
                 tdigest_sketches: ::std::collections::BTreeMap::new(),
             };
 
-            self.commit_with_retry(project, table, merged, file_ref)
+            self.commit_with_retry(project, table, partition, merged, file_ref)
                 .await?;
 
             // Re-index the compacted file's JSONB GIN columns into the
@@ -2231,24 +2231,43 @@ impl InProcessShard {
         &self,
         project: &ProjectId,
         table: &TableName,
+        partition: &PartitionKey,
         batch: &RecordBatch,
         file: DataFileRef,
     ) -> Result<()> {
         // Make sure the table exists; if not, create it from the batch schema.
+        //
+        // Multi-node scaling fix: commit through the PARTITION-scoped catalog
+        // methods. Each partition owns its own data-file segment chain, so the
+        // per-partition OCC token below only ever races a concurrent commit to
+        // the SAME partition — never another partition or another node's
+        // partitions. This removes the single per-table manifest as a
+        // serialization point (the old `append_data_files` had every partition
+        // on every node CASing one version chain, which under bulk COPY became a
+        // "lost commit race" storm and stalled ingest). On a single-chain
+        // catalog (`InMemoryCatalog` / `PostgresCatalog`) the partition methods
+        // default to the table-level behaviour, so nothing changes there.
+        //
         // Hot-path note: read only the current snapshot id (O(1)), not the full
-        // `load_table` metadata — the latter clones the entire snapshot chain
-        // (O(files)), which on a long bulk COPY grows the per-flush catalog cost
-        // without bound as flushed files accumulate. We only need the parent id
-        // to CAS the append against; every other metadata field is unused here.
-        let mut snapshot = match self.cfg.catalog.current_snapshot_id(project, table).await {
+        // `load_table` metadata — the latter clones the entire snapshot chain.
+        let pid = partition.as_str();
+        let mut snapshot = match self
+            .cfg
+            .catalog
+            .current_snapshot_id_in_partition(project, table, pid)
+            .await
+        {
             Ok(id) => id,
             Err(BasinError::NotFound(_)) => {
-                let meta = self
-                    .cfg
+                self.cfg
                     .catalog
                     .create_table(project, table, batch.schema().as_ref())
                     .await?;
-                meta.current_snapshot
+                // Fresh table → this partition's segment starts at genesis.
+                self.cfg
+                    .catalog
+                    .current_snapshot_id_in_partition(project, table, pid)
+                    .await?
             }
             Err(e) => return Err(e),
         };
@@ -2257,19 +2276,23 @@ impl InProcessShard {
             match self
                 .cfg
                 .catalog
-                .append_data_files(project, table, snapshot, vec![file.clone()])
+                .append_data_files_in_partition(project, table, pid, snapshot, vec![file.clone()])
                 .await
             {
                 Ok(_) => return Ok(()),
                 Err(BasinError::CommitConflict(_)) if attempt == 0 => {
-                    snapshot = self.cfg.catalog.current_snapshot_id(project, table).await?;
+                    snapshot = self
+                        .cfg
+                        .catalog
+                        .current_snapshot_id_in_partition(project, table, pid)
+                        .await?;
                     continue;
                 }
                 Err(e) => return Err(e),
             }
         }
         Err(BasinError::CommitConflict(format!(
-            "{project}/{table}: lost commit race twice"
+            "{project}/{table}[{pid}]: lost commit race twice"
         )))
     }
 

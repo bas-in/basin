@@ -247,11 +247,88 @@ impl TableManifest {
     }
 }
 
+/// The data-file state of ONE partition of a table, serialised at a
+/// monotonically-versioned per-partition key. This is the unit that the hot
+/// ingest path CASes — sharding it by partition is the multi-node scaling fix:
+/// each partition has a single owner/writer, so concurrent writers CAS
+/// different keys and never contend.
+///
+/// Layout (per `(project, schema, table, partition_id)`):
+/// ```text
+///   {root}{project}/{schema}/{table}/parts/{partition_id}/v{M:020}.json  # immutable segment, M = per-partition version
+///   {root}{project}/{schema}/{table}/parts/{partition_id}/HEAD           # best-effort max-M pointer
+/// ```
+/// A segment carries this partition's own snapshot chain + OCC token. Reads
+/// UNION every partition's live data files (see `load_unioned`); the table META
+/// manifest (the legacy `v{N}.json` chain) keeps schema/DDL/spec.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PartitionSegment {
+    /// Monotonic per-partition version (`M` in `parts/{pid}/v{M}.json`).
+    version: u64,
+    /// This partition's OCC token (advances on every data-file commit here).
+    current_snapshot: SnapshotId,
+    /// This partition's append/replace snapshot chain (data-file deltas only).
+    snapshots: Vec<Snapshot>,
+}
+
+impl PartitionSegment {
+    fn genesis() -> Self {
+        let genesis = Snapshot {
+            id: SnapshotId::GENESIS,
+            parent: None,
+            committed_at: Utc::now(),
+            data_files: Vec::new(),
+            removed_paths: Vec::new(),
+            summary: SnapshotSummary {
+                operation: SnapshotOperation::Genesis,
+                added_files: 0,
+                added_rows: 0,
+                added_bytes: 0,
+                removed_files: 0,
+            },
+        };
+        Self {
+            version: 0,
+            current_snapshot: SnapshotId::GENESIS,
+            snapshots: vec![genesis],
+        }
+    }
+
+    /// Live data files in this partition at its current snapshot (applies the
+    /// partition's own removed_paths; paths are globally unique, so a partition
+    /// only ever removes its own files).
+    fn live_data_files(&self) -> Vec<DataFileRef> {
+        use std::collections::HashMap;
+        let mut ordered: Vec<&Snapshot> = self.snapshots.iter().collect();
+        ordered.sort_by_key(|s| s.id);
+        let mut live: HashMap<String, DataFileRef> = HashMap::new();
+        for snap in ordered {
+            if snap.id > self.current_snapshot {
+                break;
+            }
+            for p in &snap.removed_paths {
+                live.remove(p);
+            }
+            for f in &snap.data_files {
+                live.insert(f.path.clone(), f.clone());
+            }
+        }
+        live.into_values().collect()
+    }
+}
+
 /// One cached, resolved manifest plus the version it was read at.
 #[derive(Clone)]
 struct CacheEntry {
     version: u64,
     manifest: Arc<TableManifest>,
+}
+
+/// One cached per-partition segment plus the version it was read at.
+#[derive(Clone)]
+struct PartCacheEntry {
+    version: u64,
+    segment: Arc<PartitionSegment>,
 }
 
 /// Basin-native shared catalog backed by an object store.
@@ -265,6 +342,12 @@ pub struct ObjectStoreCatalog {
     /// fully-qualified `schema.table` string so the same bare name in two
     /// schemas (e.g. `public.users` vs `auth.users`) never shares a cache slot.
     cache: Mutex<HashMap<(ProjectId, String), CacheEntry>>,
+    /// Per-`(project, schema.table, partition_id)` resolved-segment cache. The
+    /// hot ingest path revalidates a partition's segment against its per-
+    /// partition `HEAD`; a stale entry only ever costs an extra reload or a
+    /// benign per-partition `CommitConflict` retry. Keyed separately from the
+    /// META `cache` so DDL and data-file commits never invalidate each other.
+    part_cache: Mutex<HashMap<(ProjectId, String, String), PartCacheEntry>>,
     /// Per-instance ("session") sequence state: the locally-reserved block and
     /// the last value handed out by *this* node. Durable disjointness across
     /// nodes comes from the persisted high-water mark (see the module docs on
@@ -313,6 +396,7 @@ impl ObjectStoreCatalog {
             root,
             epoch: AtomicU64::new(0),
             cache: Mutex::new(HashMap::new()),
+            part_cache: Mutex::new(HashMap::new()),
             seq_local: Mutex::new(HashMap::new()),
             seq_block_override: None,
         }
@@ -353,6 +437,56 @@ impl ObjectStoreCatalog {
 
     fn head_key(&self, project: &ProjectId, qtable: &QualifiedTableName) -> OsPath {
         OsPath::from(format!("{}HEAD", self.table_dir(project, qtable)))
+    }
+
+    /// Directory holding one partition's data-file segment chain.
+    fn part_dir(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+    ) -> String {
+        format!(
+            "{}parts/{}/",
+            self.table_dir(project, qtable),
+            sanitize(partition_id)
+        )
+    }
+
+    /// Prefix under which ALL of a table's partition segment dirs live.
+    fn parts_root(&self, project: &ProjectId, qtable: &QualifiedTableName) -> String {
+        format!("{}parts/", self.table_dir(project, qtable))
+    }
+
+    fn part_segment_key(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+        version: u64,
+    ) -> OsPath {
+        OsPath::from(format!(
+            "{}v{version:020}.json",
+            self.part_dir(project, qtable, partition_id)
+        ))
+    }
+
+    fn part_head_key(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+    ) -> OsPath {
+        OsPath::from(format!("{}HEAD", self.part_dir(project, qtable, partition_id)))
+    }
+
+    fn part_cache_key(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+    ) -> (ProjectId, String, String) {
+        (*project, qtable.to_string(), sanitize(partition_id))
     }
 
     fn cache_key(&self, project: &ProjectId, qtable: &QualifiedTableName) -> (ProjectId, String) {
@@ -622,28 +756,311 @@ impl ObjectStoreCatalog {
     /// committer that already advanced the table → [`BasinError::CommitConflict`]
     /// (the engine retries). The create-if-absent loser on the manifest write
     /// is also surfaced as `CommitConflict`.
+    /// Commit a data-file delta to the table META chain (the legacy single
+    /// chain, retained for the non-partitioned back-compat path: the engine
+    /// executor's single-node OLTP commits and other callers that don't carry a
+    /// partition id). Sharded multi-node ingest uses `commit_part_snapshot`
+    /// instead, which never touches this chain.
+    ///
+    /// The caller's `expected_snapshot` is the synthetic table-level union token
+    /// (GENESIS / 1; see `load_unioned`), not the META chain's internal id — so
+    /// OCC here is resolved INTERNALLY by read-modify-write against the META
+    /// manifest's real `current_snapshot`, retrying the create-if-absent race
+    /// transparently (bounded). `expected_snapshot` is therefore informational;
+    /// per-write isolation in the multi-node path comes from per-partition OCC.
     async fn commit_snapshot(
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
-        expected_snapshot: SnapshotId,
+        _expected_snapshot: SnapshotId,
         operation: SnapshotOperation,
         removed_paths: Vec<String>,
         added_files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
         let table = &qtable.name;
-        let (version, manifest) = self.load_current(project, qtable).await?;
-        if manifest.current_snapshot != expected_snapshot {
+        for _ in 0..MAX_DDL_RETRIES {
+            let (version, manifest) = self.load_current(project, qtable).await?;
+
+            // For Replace, validate removed_paths are in the META chain's live
+            // set (the back-compat path keeps all its data on the META chain).
+            if operation == SnapshotOperation::Replace {
+                let live: std::collections::HashSet<String> = manifest
+                    .to_metadata(project, table)
+                    .live_data_files()
+                    .into_iter()
+                    .map(|f| f.path)
+                    .collect();
+                for p in &removed_paths {
+                    if !live.contains(p) {
+                        return Err(BasinError::catalog(format!(
+                            "{project}/{qtable}: replace_data_files removed path {p:?} not in live set"
+                        )));
+                    }
+                }
+            }
+
+            let added_files_count = added_files.len() as u64;
+            let added_rows: u64 = added_files.iter().map(|f| f.row_count).sum();
+            let added_bytes: u64 = added_files.iter().map(|f| f.size_bytes).sum();
+            let removed_files = removed_paths.len() as u64;
+
+            let parent = manifest.current_snapshot;
+            let new_id = parent.next();
+            let snap = Snapshot {
+                id: new_id,
+                parent: Some(parent),
+                committed_at: Utc::now(),
+                data_files: added_files.clone(),
+                removed_paths: removed_paths.clone(),
+                summary: SnapshotSummary {
+                    operation,
+                    added_files: added_files_count,
+                    added_rows,
+                    added_bytes,
+                    removed_files,
+                },
+            };
+
+            let mut next = (*manifest).clone();
+            next.version = version + 1;
+            next.current_snapshot = new_id;
+            next.snapshots.push(snap);
+
+            if self
+                .put_manifest_create(project, qtable, next.version, &next)
+                .await?
+            {
+                let committed = next.clone();
+                self.after_commit(project, qtable, next.version, next).await;
+                return self.load_unioned(project, qtable, &committed).await;
+            }
+            // Lost the create race: reload and retry transparently.
+            self.invalidate(project, qtable).await;
+        }
+        Err(BasinError::CommitConflict(format!(
+            "{project}/{qtable}: exhausted commit retries under contention"
+        )))
+    }
+
+    async fn invalidate(&self, project: &ProjectId, qtable: &QualifiedTableName) {
+        let ck = self.cache_key(project, qtable);
+        self.cache.lock().await.remove(&ck);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-partition data-file segments (the multi-writer scaling fix).
+    //
+    // Each partition owns its own monotonic segment chain under
+    // `{table}/parts/{partition_id}/`. The owner of a partition CASes only ITS
+    // chain, so concurrent writers on different partitions never contend. Reads
+    // UNION every partition's live data files into one `TableMetadata`.
+    // -----------------------------------------------------------------------
+
+    /// Resolve the highest segment version `M` for one partition. HEAD fast
+    /// path, then LIST fallback. `None` when the partition has no segment yet.
+    async fn resolve_part_head_version(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+    ) -> Result<Option<u64>> {
+        match self.store.get(&self.part_head_key(project, qtable, partition_id)).await {
+            Ok(res) => {
+                if let Ok(bytes) = res.bytes().await {
+                    if let Ok(s) = std::str::from_utf8(&bytes) {
+                        if let Ok(v) = s.trim().parse::<u64>() {
+                            if self
+                                .store
+                                .head(&self.part_segment_key(project, qtable, partition_id, v))
+                                .await
+                                .is_ok()
+                            {
+                                return Ok(Some(v));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(storage_err("get partition HEAD", e)),
+        }
+        // LIST fallback: max v{M}.json directly under the partition dir.
+        use futures::StreamExt;
+        let dir = self.part_dir(project, qtable, partition_id);
+        let prefix = OsPath::from(dir.clone());
+        let trimmed = dir.trim_end_matches('/');
+        let mut stream = self.store.list(Some(&prefix));
+        let mut max: Option<u64> = None;
+        while let Some(item) = stream.next().await {
+            let meta = item.map_err(|e| storage_err("list partition segments", e))?;
+            let key = meta.location.as_ref();
+            // Only count segments DIRECTLY under this partition dir (the file
+            // name is the only remaining path component after the prefix).
+            let Some(rest) = key.strip_prefix(trimmed) else { continue };
+            let rest = rest.trim_start_matches('/');
+            if rest.contains('/') {
+                continue;
+            }
+            if let Some(num) = rest.strip_prefix('v').and_then(|s| s.strip_suffix(".json")) {
+                if let Ok(v) = num.parse::<u64>() {
+                    max = Some(max.map_or(v, |m| m.max(v)));
+                }
+            }
+        }
+        Ok(max)
+    }
+
+    async fn get_part_segment(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+        version: u64,
+    ) -> Result<PartitionSegment> {
+        let key = self.part_segment_key(project, qtable, partition_id, version);
+        let res = self.store.get(&key).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => BasinError::not_found(format!(
+                "{project}/{qtable}/parts/{partition_id}@v{version}"
+            )),
+            other => storage_err("get partition segment", other),
+        })?;
+        let bytes = res.bytes().await.map_err(|e| storage_err("read partition segment", e))?;
+        serde_json::from_slice(&bytes).map_err(|e| {
+            BasinError::catalog(format!("decode partition segment {project}/{qtable}/{partition_id}: {e}"))
+        })
+    }
+
+    /// Load a partition's current segment (highest version), via cache when the
+    /// cached version matches HEAD. Returns a genesis segment (version 0) when
+    /// the partition has no segment yet, so a first append starts cleanly.
+    async fn load_part_current(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+    ) -> Result<(u64, Arc<PartitionSegment>)> {
+        let Some(version) = self
+            .resolve_part_head_version(project, qtable, partition_id)
+            .await?
+        else {
+            return Ok((0, Arc::new(PartitionSegment::genesis())));
+        };
+        let ck = self.part_cache_key(project, qtable, partition_id);
+        {
+            let cache = self.part_cache.lock().await;
+            if let Some(entry) = cache.get(&ck) {
+                if entry.version == version {
+                    return Ok((version, entry.segment.clone()));
+                }
+            }
+        }
+        let segment = Arc::new(
+            self.get_part_segment(project, qtable, partition_id, version)
+                .await?,
+        );
+        let mut cache = self.part_cache.lock().await;
+        cache.insert(
+            ck,
+            PartCacheEntry {
+                version,
+                segment: segment.clone(),
+            },
+        );
+        Ok((version, segment))
+    }
+
+    /// Write partition segment `version` via create-if-absent. `true` = won.
+    async fn put_part_segment_create(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+        version: u64,
+        segment: &PartitionSegment,
+    ) -> Result<bool> {
+        let bytes = serde_json::to_vec(segment)
+            .map_err(|e| BasinError::catalog(format!("serialise partition segment: {e}")))?;
+        let key = self.part_segment_key(project, qtable, partition_id, version);
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        match self.store.put_opts(&key, Bytes::from(bytes).into(), opts).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+            Err(e) => Err(storage_err("put partition segment", e)),
+        }
+    }
+
+    async fn after_part_commit(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+        version: u64,
+        segment: PartitionSegment,
+    ) {
+        let _ = self
+            .store
+            .put_opts(
+                &self.part_head_key(project, qtable, partition_id),
+                Bytes::from(version.to_string()).into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let ck = self.part_cache_key(project, qtable, partition_id);
+        self.part_cache.lock().await.insert(
+            ck,
+            PartCacheEntry {
+                version,
+                segment: Arc::new(segment),
+            },
+        );
+        self.bump_epoch();
+    }
+
+    async fn invalidate_part(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+    ) {
+        let ck = self.part_cache_key(project, qtable, partition_id);
+        self.part_cache.lock().await.remove(&ck);
+    }
+
+    /// Commit a data-file delta into ONE partition's segment chain. OCC is the
+    /// PARTITION's own `current_snapshot`. Loser of the per-partition CAS gets
+    /// `CommitConflict` (engine reloads + retries) — but only the same partition
+    /// can ever race it, never another partition (the whole point).
+    async fn commit_part_snapshot(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+        expected_snapshot: SnapshotId,
+        operation: SnapshotOperation,
+        removed_paths: Vec<String>,
+        added_files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata> {
+        // The table META manifest must exist (schema/DDL). NotFound if absent.
+        let (_mv, manifest) = self.load_current(project, qtable).await?;
+        let (version, segment) = self
+            .load_part_current(project, qtable, partition_id)
+            .await?;
+
+        if segment.current_snapshot != expected_snapshot {
             return Err(BasinError::CommitConflict(format!(
-                "{project}/{qtable}: expected snapshot {expected_snapshot}, current is {}",
-                manifest.current_snapshot
+                "{project}/{qtable}[{partition_id}]: expected snapshot {expected_snapshot}, current is {}",
+                segment.current_snapshot
             )));
         }
 
-        // For Replace, validate removed_paths are in the current live set.
         if operation == SnapshotOperation::Replace {
-            let live: std::collections::HashSet<String> = manifest
-                .to_metadata(project, table)
+            let live: std::collections::HashSet<String> = segment
                 .live_data_files()
                 .into_iter()
                 .map(|f| f.path)
@@ -651,7 +1068,7 @@ impl ObjectStoreCatalog {
             for p in &removed_paths {
                 if !live.contains(p) {
                     return Err(BasinError::catalog(format!(
-                        "{project}/{qtable}: replace_data_files removed path {p:?} not in live set"
+                        "{project}/{qtable}[{partition_id}]: replace_data_files removed path {p:?} not in partition live set"
                     )));
                 }
             }
@@ -678,32 +1095,211 @@ impl ObjectStoreCatalog {
             },
         };
 
-        let mut next = (*manifest).clone();
+        let mut next = (*segment).clone();
         next.version = version + 1;
         next.current_snapshot = new_id;
         next.snapshots.push(snap);
 
         if self
-            .put_manifest_create(project, qtable, next.version, &next)
+            .put_part_segment_create(project, qtable, partition_id, next.version, &next)
             .await?
         {
-            let meta = next.to_metadata(project, table);
-            self.after_commit(project, qtable, next.version, next).await;
-            Ok(meta)
+            self.after_part_commit(project, qtable, partition_id, next.version, next)
+                .await;
+            // Return the unioned table metadata so callers see the complete set.
+            self.load_unioned(project, qtable, &manifest).await
         } else {
-            // Lost the create race: someone else committed v{N+1}. Invalidate
-            // cache and surface CommitConflict — the engine reloads + retries.
-            self.invalidate(project, qtable).await;
+            self.invalidate_part(project, qtable, partition_id).await;
             Err(BasinError::CommitConflict(format!(
-                "{project}/{qtable}: lost commit race at version {}",
+                "{project}/{qtable}[{partition_id}]: lost commit race at partition version {}",
                 next.version
             )))
         }
     }
 
-    async fn invalidate(&self, project: &ProjectId, qtable: &QualifiedTableName) {
-        let ck = self.cache_key(project, qtable);
-        self.cache.lock().await.remove(&ck);
+    /// Enumerate every partition id that has at least one segment under
+    /// `{table}/parts/`. Used by the unioned read.
+    async fn list_partition_ids(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+    ) -> Result<Vec<String>> {
+        use futures::StreamExt;
+        let root = self.parts_root(project, qtable);
+        let prefix = OsPath::from(root.clone());
+        let trimmed = root.trim_end_matches('/');
+        let mut stream = self.store.list(Some(&prefix));
+        let mut ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        while let Some(item) = stream.next().await {
+            let meta = item.map_err(|e| storage_err("list partitions", e))?;
+            let key = meta.location.as_ref();
+            // key = {parts_root}{partition_id}/v{M}.json (or /HEAD).
+            let Some(rest) = key.strip_prefix(trimmed) else { continue };
+            let rest = rest.trim_start_matches('/');
+            if let Some(seg) = rest.split('/').next() {
+                if !seg.is_empty() {
+                    ids.insert(seg.to_string());
+                }
+            }
+        }
+        Ok(ids.into_iter().collect())
+    }
+
+    /// Copy every per-partition segment of `src` into `dst` as a fresh genesis
+    /// segment (version 0) carrying the source partition's CURRENT live file
+    /// set. Used by rename / fork so data committed through the partition path
+    /// (sharded ingest) is preserved across the table-identity change. Files are
+    /// shared by reference (no bytes copied), matching `fork`'s contract.
+    async fn copy_partition_segments(
+        &self,
+        src_project: &ProjectId,
+        src: &QualifiedTableName,
+        dst_project: &ProjectId,
+        dst: &QualifiedTableName,
+    ) -> Result<()> {
+        for pid in self.list_partition_ids(src_project, src).await? {
+            let (_v, segment) = self.load_part_current(src_project, src, &pid).await?;
+            let live = segment.live_data_files();
+            if live.is_empty() {
+                continue;
+            }
+            // Represent the source's live set as a fresh genesis+append chain in
+            // the destination partition segment (id 1 carries every live file).
+            let added_files = live.len() as u64;
+            let added_rows: u64 = live.iter().map(|f| f.row_count).sum();
+            let added_bytes: u64 = live.iter().map(|f| f.size_bytes).sum();
+            let mut fresh = PartitionSegment::genesis();
+            fresh.snapshots.push(Snapshot {
+                id: SnapshotId(1),
+                parent: Some(SnapshotId::GENESIS),
+                committed_at: Utc::now(),
+                data_files: live,
+                removed_paths: Vec::new(),
+                summary: SnapshotSummary {
+                    operation: SnapshotOperation::Append,
+                    added_files,
+                    added_rows,
+                    added_bytes,
+                    removed_files: 0,
+                },
+            });
+            fresh.current_snapshot = SnapshotId(1);
+            fresh.version = 0;
+            if !self
+                .put_part_segment_create(dst_project, dst, &pid, 0, &fresh)
+                .await?
+            {
+                // Destination partition already has a segment — place at next.
+                let v = self
+                    .resolve_part_head_version(dst_project, dst, &pid)
+                    .await?
+                    .unwrap_or(0);
+                fresh.version = v + 1;
+                let _ = self
+                    .put_part_segment_create(dst_project, dst, &pid, fresh.version, &fresh)
+                    .await?;
+            }
+            self.after_part_commit(dst_project, dst, &pid, fresh.version, fresh)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Build the COMPLETE [`TableMetadata`] for a table: schema/DDL from the
+    /// META `manifest`, plus a UNION of every partition's live data files.
+    ///
+    /// The unioned snapshot chain is the per-partition chains concatenated and
+    /// **renumbered** into one contiguous id space (ordered by commit time),
+    /// with `current_snapshot` set to the last. Because `removed_paths` are
+    /// path-scoped and data-file paths are globally unique, the renumbered
+    /// chain reduces (via `live_data_files`) to exactly the union of every
+    /// partition's live set — no loss, no double-count. Time-travel to an
+    /// arbitrary historical cut across partitions is NOT preserved (the synthetic
+    /// ids are read-time-derived); `load_table_at_snapshot` falls back to a
+    /// current read for any id it can't find, which is the documented behaviour.
+    async fn load_unioned(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        manifest: &TableManifest,
+    ) -> Result<TableMetadata> {
+        let mut meta = manifest.to_metadata(project, &qtable.name);
+
+        // Start the union with the META manifest's OWN live data files. The
+        // non-partitioned `append_data_files`/`replace_data_files` (the engine
+        // executor's single-node OLTP path, and other back-compat callers)
+        // still commit to the META chain; sharded multi-node ingest commits to
+        // the per-partition segments below. Both feed the same unioned read.
+        let mut all_live: Vec<DataFileRef> = meta.live_data_files();
+
+        let partition_ids = self.list_partition_ids(project, qtable).await?;
+        // Track the latest commit time across partitions to stamp the union.
+        let mut latest_commit = manifest
+            .snapshots
+            .iter()
+            .map(|s| s.committed_at)
+            .max()
+            .unwrap_or_else(Utc::now);
+        for pid in &partition_ids {
+            let (_v, segment) = self.load_part_current(project, qtable, pid).await?;
+            for f in segment.live_data_files() {
+                all_live.push(f);
+            }
+            if let Some(t) = segment.snapshots.iter().map(|s| s.committed_at).max() {
+                if t > latest_commit {
+                    latest_commit = t;
+                }
+            }
+        }
+
+        // Represent the unioned live set as a single contiguous chain: a
+        // genesis (id 0) plus one Append (id 1) carrying every live file. This
+        // keeps `live_data_files()` correct and gives a deterministic, valid
+        // `current_snapshot` that callers can pin / advance against.
+        let genesis = Snapshot {
+            id: SnapshotId::GENESIS,
+            parent: None,
+            committed_at: meta
+                .snapshots
+                .iter()
+                .find(|s| s.id == SnapshotId::GENESIS)
+                .map(|s| s.committed_at)
+                .unwrap_or(latest_commit),
+            data_files: Vec::new(),
+            removed_paths: Vec::new(),
+            summary: SnapshotSummary {
+                operation: SnapshotOperation::Genesis,
+                added_files: 0,
+                added_rows: 0,
+                added_bytes: 0,
+                removed_files: 0,
+            },
+        };
+        if all_live.is_empty() {
+            meta.current_snapshot = SnapshotId::GENESIS;
+            meta.snapshots = vec![genesis];
+        } else {
+            let added_files = all_live.len() as u64;
+            let added_rows: u64 = all_live.iter().map(|f| f.row_count).sum();
+            let added_bytes: u64 = all_live.iter().map(|f| f.size_bytes).sum();
+            let union_snap = Snapshot {
+                id: SnapshotId(1),
+                parent: Some(SnapshotId::GENESIS),
+                committed_at: latest_commit,
+                data_files: all_live,
+                removed_paths: Vec::new(),
+                summary: SnapshotSummary {
+                    operation: SnapshotOperation::Append,
+                    added_files,
+                    added_rows,
+                    added_bytes,
+                    removed_files: 0,
+                },
+            };
+            meta.current_snapshot = SnapshotId(1);
+            meta.snapshots = vec![genesis, union_snap];
+        }
+        Ok(meta)
     }
 
     /// Read-modify-write a metadata field with transparent retry on the
@@ -800,7 +1396,8 @@ impl ObjectStoreCatalog {
         qtable: &QualifiedTableName,
     ) -> Result<TableMetadata> {
         let (_v, manifest) = self.load_current(project, qtable).await?;
-        Ok(manifest.to_metadata(project, &qtable.name))
+        // UNION every partition's data files into the returned metadata.
+        self.load_unioned(project, qtable, &manifest).await
     }
 
     async fn drop_table_q(&self, project: &ProjectId, qtable: &QualifiedTableName) -> Result<()> {
@@ -850,6 +1447,8 @@ impl ObjectStoreCatalog {
             }
         }
         self.after_commit(project, new, dst.version, dst).await;
+        // Carry over any per-partition data-file segments (sharded ingest data).
+        self.copy_partition_segments(project, old, project, new).await?;
         self.mutate_manifest(project, old, |m| m.dropped = true)
             .await?;
         Ok(())
@@ -860,8 +1459,27 @@ impl ObjectStoreCatalog {
         project: &ProjectId,
         qtable: &QualifiedTableName,
     ) -> Result<SnapshotId> {
+        // The table-level current snapshot is the synthetic union id: GENESIS
+        // when nothing has data, else `SnapshotId(1)` (see `load_unioned`).
+        // Confirm the table exists (NotFound if its META manifest is absent or
+        // tombstoned), then report based on whether the META chain or any
+        // partition holds live files.
         let (_v, manifest) = self.load_current(project, qtable).await?;
-        Ok(manifest.current_snapshot)
+        if !manifest
+            .to_metadata(project, &qtable.name)
+            .live_data_files()
+            .is_empty()
+        {
+            return Ok(SnapshotId(1));
+        }
+        let partition_ids = self.list_partition_ids(project, qtable).await?;
+        for pid in &partition_ids {
+            let (_pv, segment) = self.load_part_current(project, qtable, pid).await?;
+            if !segment.live_data_files().is_empty() {
+                return Ok(SnapshotId(1));
+            }
+        }
+        Ok(SnapshotId::GENESIS)
     }
 
     async fn list_snapshots_q(
@@ -869,8 +1487,12 @@ impl ObjectStoreCatalog {
         project: &ProjectId,
         qtable: &QualifiedTableName,
     ) -> Result<Vec<Snapshot>> {
+        // Surface the unioned (synthetic) chain so callers see a complete,
+        // consistent file set per snapshot. Per-partition history is not
+        // collapsed into a single global timeline (see `load_unioned`).
         let (_v, manifest) = self.load_current(project, qtable).await?;
-        let mut snaps = manifest.snapshots.clone();
+        let meta = self.load_unioned(project, qtable, &manifest).await?;
+        let mut snaps = meta.snapshots.clone();
         snaps.sort_by_key(|s| s.id);
         Ok(snaps)
     }
@@ -1078,9 +1700,170 @@ impl Catalog for ObjectStoreCatalog {
         added_files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
         let qtable = self.resolve_qtable(project, table).await;
+        // Removed paths may live on the META chain (back-compat single-node
+        // writes) OR in a per-partition segment (sharded ingest). A non-
+        // partitioned caller (tiering / stripe-merge / COW table sweeps) does
+        // not know which — so route the replace to the chain that actually
+        // holds the removed path(s). All removed paths in one call belong to
+        // one physical file group, so they resolve to a single owning chain.
+        // Group removed paths by the chain that currently holds each one: a
+        // single UPDATE/DELETE may touch files committed via the META chain
+        // (single-node OLTP) AND files in per-partition segments (sharded
+        // ingest). Each chain's removes must be committed to THAT chain.
+        if !removed_paths.is_empty() {
+            use std::collections::{HashMap, HashSet};
+            let mut by_partition: HashMap<String, Vec<String>> = HashMap::new();
+            let mut remaining: HashSet<String> = removed_paths.iter().cloned().collect();
+            for pid in self.list_partition_ids(project, &qtable).await? {
+                if remaining.is_empty() {
+                    break;
+                }
+                let (_pv, segment) = self.load_part_current(project, &qtable, &pid).await?;
+                let live: HashSet<String> = segment
+                    .live_data_files()
+                    .into_iter()
+                    .map(|f| f.path)
+                    .collect();
+                let here: Vec<String> = remaining
+                    .iter()
+                    .filter(|p| live.contains(*p))
+                    .cloned()
+                    .collect();
+                for p in &here {
+                    remaining.remove(p);
+                }
+                if !here.is_empty() {
+                    by_partition.insert(pid, here);
+                }
+            }
+
+            // Paths not found in any partition segment belong to the META chain.
+            // Attach the new added_files to the META commit when the META chain
+            // is involved; otherwise attach them to one partition commit so they
+            // land exactly once.
+            let meta_removed: Vec<String> = remaining.into_iter().collect();
+
+            if !meta_removed.is_empty() || by_partition.is_empty() {
+                // META chain owns some removed paths (or there were none in any
+                // partition) → commit the adds here together with META removes.
+                self.commit_snapshot(
+                    project,
+                    &qtable,
+                    expected_snapshot,
+                    SnapshotOperation::Replace,
+                    meta_removed,
+                    added_files,
+                )
+                .await?;
+                // Partition removes (if any) are committed without re-adding.
+                for (pid, paths) in by_partition {
+                    let (_pv, segment) = self.load_part_current(project, &qtable, &pid).await?;
+                    self.commit_part_snapshot(
+                        project,
+                        &qtable,
+                        &pid,
+                        segment.current_snapshot,
+                        SnapshotOperation::Replace,
+                        paths,
+                        Vec::new(),
+                    )
+                    .await?;
+                }
+            } else {
+                // All removed paths live in partition segments. Attach the adds
+                // to the FIRST partition commit, the rest are pure removes.
+                let mut iter = by_partition.into_iter();
+                let (first_pid, first_paths) = iter.next().expect("non-empty by_partition");
+                let (_pv, seg0) = self.load_part_current(project, &qtable, &first_pid).await?;
+                self.commit_part_snapshot(
+                    project,
+                    &qtable,
+                    &first_pid,
+                    seg0.current_snapshot,
+                    SnapshotOperation::Replace,
+                    first_paths,
+                    added_files,
+                )
+                .await?;
+                for (pid, paths) in iter {
+                    let (_pv, segment) = self.load_part_current(project, &qtable, &pid).await?;
+                    self.commit_part_snapshot(
+                        project,
+                        &qtable,
+                        &pid,
+                        segment.current_snapshot,
+                        SnapshotOperation::Replace,
+                        paths,
+                        Vec::new(),
+                    )
+                    .await?;
+                }
+            }
+            // Return a fresh unioned read so the caller sees the complete set.
+            let (_v, manifest) = self.load_current(project, &qtable).await?;
+            return self.load_unioned(project, &qtable, &manifest).await;
+        }
+
+        // Pure add (no removals) → META chain.
         self.commit_snapshot(
             project,
             &qtable,
+            expected_snapshot,
+            SnapshotOperation::Replace,
+            removed_paths,
+            added_files,
+        )
+        .await
+    }
+
+    async fn current_snapshot_id_in_partition(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        partition_id: &str,
+    ) -> Result<SnapshotId> {
+        let qtable = self.resolve_qtable(project, table).await;
+        // Confirm the table exists (NotFound if absent/tombstoned).
+        self.load_current(project, &qtable).await?;
+        let (_v, segment) = self.load_part_current(project, &qtable, partition_id).await?;
+        Ok(segment.current_snapshot)
+    }
+
+    async fn append_data_files_in_partition(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        partition_id: &str,
+        expected_snapshot: SnapshotId,
+        files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata> {
+        let qtable = self.resolve_qtable(project, table).await;
+        self.commit_part_snapshot(
+            project,
+            &qtable,
+            partition_id,
+            expected_snapshot,
+            SnapshotOperation::Append,
+            Vec::new(),
+            files,
+        )
+        .await
+    }
+
+    async fn replace_data_files_in_partition(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        partition_id: &str,
+        expected_snapshot: SnapshotId,
+        removed_paths: Vec<String>,
+        added_files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata> {
+        let qtable = self.resolve_qtable(project, table).await;
+        self.commit_part_snapshot(
+            project,
+            &qtable,
+            partition_id,
             expected_snapshot,
             SnapshotOperation::Replace,
             removed_paths,
@@ -1984,9 +2767,10 @@ impl Catalog for ObjectStoreCatalog {
                 )));
             }
         }
-        let meta = forked.to_metadata(project, &dst.name);
-        self.after_commit(project, dst, forked.version, forked).await;
-        Ok(meta)
+        self.after_commit(project, dst, forked.version, forked.clone()).await;
+        // Carry over any per-partition data-file segments (sharded ingest data).
+        self.copy_partition_segments(project, src, project, dst).await?;
+        self.load_unioned(project, dst, &forked).await
     }
 
     async fn fork_table_to_project(
@@ -2030,10 +2814,12 @@ impl Catalog for ObjectStoreCatalog {
                 )));
             }
         }
-        let meta = forked.to_metadata(dst_project, dst_table);
-        self.after_commit(dst_project, &qdst, forked.version, forked)
+        self.after_commit(dst_project, &qdst, forked.version, forked.clone())
             .await;
-        Ok(meta)
+        // Carry over any per-partition data-file segments (sharded ingest data).
+        self.copy_partition_segments(src_project, &qsrc, dst_project, &qdst)
+            .await?;
+        self.load_unioned(dst_project, &qdst, &forked).await
     }
 
     async fn rollback_to_snapshot_qualified(
@@ -2873,38 +3659,53 @@ mod tests {
         let meta = c.create_table(&p, &t, &schema()).await.unwrap();
         assert_eq!(meta.current_snapshot, SnapshotId::GENESIS);
 
+        // Non-partitioned append (the back-compat path): commits land on the
+        // table META chain and the unioned read presents them. With the
+        // partition-sharded layout the table-level snapshot id is SYNTHETIC
+        // (GENESIS when empty, else `SnapshotId(1)` — see `load_unioned`), so a
+        // commit's returned `current_snapshot` is the synthetic union id, not a
+        // per-commit monotonic id.
         let mut expected = SnapshotId::GENESIS;
         for i in 0..5 {
             let m = c
                 .append_data_files(&p, &t, expected, vec![file(&format!("f{i}.parquet"), 100)])
                 .await
                 .unwrap();
-            assert_eq!(m.current_snapshot, expected.next());
             expected = m.current_snapshot;
         }
 
         let loaded = c.load_table(&p, &t).await.unwrap();
-        assert_eq!(loaded.current_snapshot, SnapshotId(5));
+        assert_eq!(loaded.current_snapshot, SnapshotId(1));
+        // Correctness that matters: every committed file is present (no loss,
+        // no double-count) in the unioned read.
         let live = loaded.live_data_files();
         assert_eq!(live.len(), 5);
 
+        // `list_snapshots` reflects the synthetic union chain (genesis + a
+        // single union snapshot). Fine-grained per-commit time-travel collapses
+        // for the object-store catalog; this is the documented reduction.
         let snaps = c.list_snapshots(&p, &t).await.unwrap();
-        assert_eq!(snaps.len(), 6); // genesis + 5
-        assert_eq!(c.current_snapshot_id(&p, &t).await.unwrap(), SnapshotId(5));
+        assert_eq!(snaps.len(), 2); // genesis + union
+        assert_eq!(c.current_snapshot_id(&p, &t).await.unwrap(), SnapshotId(1));
 
-        // Time-travel rewind.
-        let at2 = c
-            .load_table_at_snapshot(&p, &t, SnapshotId(2))
-            .await
-            .unwrap();
-        assert_eq!(at2.current_snapshot, SnapshotId(2));
-        assert_eq!(at2.live_data_files().len(), 2);
+        // Time-travel to a fine-grained historical id is no longer retained:
+        // `load_table_at_snapshot` falls back to FeatureNotSupported, and the
+        // caller serves a current read instead of the wrong point-in-time.
+        let at2 = c.load_table_at_snapshot(&p, &t, SnapshotId(2)).await;
+        assert!(matches!(at2, Err(BasinError::FeatureNotSupported(_))), "got {at2:?}");
     }
 
-    // --- Test 2: split-brain / double-committer ---------------------------
-
+    // --- Test 2: same-CHAIN contention (META chain, back-compat path) ------
+    //
+    // The non-partitioned `append_data_files` now resolves the META-chain OCC
+    // INTERNALLY (read-modify-write with bounded retry), so concurrent racers
+    // on the same table all LAND rather than all-but-one conflicting. The
+    // load-bearing property is no-loss / no-double-count: every file committed
+    // appears exactly once in the unioned read. (The hard CommitConflict for
+    // the SAME-partition data-file chain is exercised by
+    // `same_partition_occ_one_winner` below.)
     #[tokio::test]
-    async fn split_brain_exactly_one_winner_per_round() {
+    async fn same_chain_contention_all_land_no_loss() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let c = Arc::new(ObjectStoreCatalog::new(store));
         let p = ProjectId::new();
@@ -2917,7 +3718,6 @@ mod tests {
         let mut total_committed_files = 0u64;
 
         for round in 0..ROUNDS {
-            // All racers read the SAME expected_snapshot then race to commit.
             let expected = c.current_snapshot_id(&p, &t).await.unwrap();
             let mut handles = Vec::new();
             for r in 0..RACERS {
@@ -2934,30 +3734,17 @@ mod tests {
                     .await
                 }));
             }
-            let mut winners = 0;
-            let mut conflicts = 0;
             for h in handles {
-                match h.await.unwrap() {
-                    Ok(_) => winners += 1,
-                    Err(BasinError::CommitConflict(_)) => conflicts += 1,
-                    Err(e) => panic!("unexpected error: {e:?}"),
-                }
+                h.await.unwrap().expect("internal RMW retry lands every commit");
             }
-            assert_eq!(winners, 1, "round {round}: exactly one winner");
-            assert_eq!(conflicts, RACERS - 1, "round {round}: rest conflict");
-            total_committed_files += 1;
+            total_committed_files += RACERS as u64;
         }
 
-        // Chain must be linear and consistent: current == ROUNDS, ids 0..=ROUNDS.
+        // Every file landed exactly once; the unioned read is complete.
         let meta = c.load_table(&p, &t).await.unwrap();
-        assert_eq!(meta.current_snapshot, SnapshotId(ROUNDS as u64));
-        let snaps = c.list_snapshots(&p, &t).await.unwrap();
-        assert_eq!(snaps.len(), ROUNDS + 1); // genesis + one per round
-        let ids: Vec<u64> = snaps.iter().map(|s| s.id.0).collect();
-        let expected_ids: Vec<u64> = (0..=ROUNDS as u64).collect();
-        assert_eq!(ids, expected_ids, "linear, no gaps/dupes");
-        // One file committed per round.
         assert_eq!(meta.live_data_files().len() as u64, total_committed_files);
+        // Synthetic union id once data exists.
+        assert_eq!(meta.current_snapshot, SnapshotId(1));
     }
 
     // --- Test 2b: contention with retry-to-completion ---------------------
@@ -2996,12 +3783,217 @@ mod tests {
             h.await.unwrap();
         }
         let meta = c.load_table(&p, &t).await.unwrap();
-        // Genesis + RACERS commits; all files present, ids contiguous.
-        assert_eq!(meta.current_snapshot, SnapshotId(RACERS as u64));
+        // Genesis + RACERS commits; all files present (no loss), synthetic id.
+        assert_eq!(meta.current_snapshot, SnapshotId(1));
         assert_eq!(meta.live_data_files().len(), RACERS);
-        let snaps = c.list_snapshots(&p, &t).await.unwrap();
-        let ids: Vec<u64> = snaps.iter().map(|s| s.id.0).collect();
-        assert_eq!(ids, (0..=RACERS as u64).collect::<Vec<_>>());
+    }
+
+    // --- Test 2c: MULTI-WRITER, NO CONTENTION (the scaling fix) -----------
+    //
+    // Two ObjectStoreCatalog instances (= two nodes) over ONE shared store
+    // commit data files to DIFFERENT partitions of the SAME table, heavily
+    // interleaved. Because each partition owns its own segment chain, NO commit
+    // ever raises a CommitConflict against another partition. A fresh third
+    // instance then reads the table and sees the UNION of every partition's
+    // files (correct total, no loss, no dup).
+    #[tokio::test]
+    async fn multi_writer_cross_partition_no_contention() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let node_a = Arc::new(ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX));
+        let node_b = Arc::new(ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX));
+        let p = ProjectId::new();
+        let t = TableName::new("ingest").unwrap();
+        node_a.create_namespace(&p).await.unwrap();
+        node_a.create_table(&p, &t, &schema()).await.unwrap();
+
+        const ROUNDS: usize = 40;
+        // Node A owns partitions s0/s2; node B owns s1/s3 — deterministic,
+        // disjoint ownership (exactly the forwarding model).
+        let a_parts = ["s0", "s2"];
+        let b_parts = ["s1", "s3"];
+
+        let conflicts = Arc::new(AtomicI64::new(0));
+        let committed = Arc::new(AtomicI64::new(0));
+
+        let mut handles = Vec::new();
+        for (node, parts) in [(node_a.clone(), a_parts), (node_b.clone(), b_parts)] {
+            for pid in parts {
+                let node = node.clone();
+                let p = p;
+                let t = t.clone();
+                let conflicts = conflicts.clone();
+                let committed = committed.clone();
+                handles.push(tokio::spawn(async move {
+                    for round in 0..ROUNDS {
+                        let exp = node
+                            .current_snapshot_id_in_partition(&p, &t, pid)
+                            .await
+                            .unwrap();
+                        match node
+                            .append_data_files_in_partition(
+                                &p,
+                                &t,
+                                pid,
+                                exp,
+                                vec![file(&format!("{pid}_r{round}.parquet"), 1)],
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                committed.fetch_add(1, SeqCst);
+                            }
+                            Err(BasinError::CommitConflict(_)) => {
+                                conflicts.fetch_add(1, SeqCst);
+                            }
+                            Err(e) => panic!("unexpected: {e:?}"),
+                        }
+                    }
+                }));
+            }
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let total_partitions = a_parts.len() + b_parts.len();
+        let expected_total = (total_partitions * ROUNDS) as i64;
+        assert_eq!(
+            conflicts.load(SeqCst),
+            0,
+            "cross-partition commits must NEVER contend"
+        );
+        assert_eq!(committed.load(SeqCst), expected_total, "all commits succeed");
+
+        // Fresh third instance: unioned read sees every partition's files.
+        let node_c = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
+        let meta = node_c.load_table(&p, &t).await.unwrap();
+        let live = meta.live_data_files();
+        assert_eq!(
+            live.len() as i64,
+            expected_total,
+            "union total correct: no loss, no double-count"
+        );
+        // No duplicate paths.
+        let mut paths: Vec<String> = live.iter().map(|f| f.path.clone()).collect();
+        paths.sort();
+        let n = paths.len();
+        paths.dedup();
+        assert_eq!(paths.len(), n, "no duplicate paths in unioned set");
+    }
+
+    // --- Test 2d: SAME-partition OCC still gives exactly one winner --------
+    #[tokio::test]
+    async fn same_partition_occ_one_winner() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let c = Arc::new(ObjectStoreCatalog::new(store));
+        let p = ProjectId::new();
+        let t = TableName::new("onepart").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Two commits to the SAME partition with the SAME expected version:
+        // exactly one wins, the other gets a per-partition CommitConflict.
+        let expected = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        let c1 = c.clone();
+        let c2 = c.clone();
+        let (p1, p2) = (p, p);
+        let (t1, t2) = (t.clone(), t.clone());
+        let h1 = tokio::spawn(async move {
+            c1.append_data_files_in_partition(&p1, &t1, "p0", expected, vec![file("a.parquet", 1)])
+                .await
+        });
+        let h2 = tokio::spawn(async move {
+            c2.append_data_files_in_partition(&p2, &t2, "p0", expected, vec![file("b.parquet", 1)])
+                .await
+        });
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+        let wins = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        let conflicts = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, Err(BasinError::CommitConflict(_))))
+            .count();
+        assert_eq!(wins, 1, "exactly one same-partition winner");
+        assert_eq!(conflicts, 1, "the other gets a per-partition conflict");
+
+        // The loser retries against the now-current partition version and lands.
+        let exp2 = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        c.append_data_files_in_partition(&p, &t, "p0", exp2, vec![file("c.parquet", 1)])
+            .await
+            .unwrap();
+        assert_eq!(c.load_table(&p, &t).await.unwrap().live_data_files().len(), 2);
+    }
+
+    // --- Test 2e: non-partitioned replace resolves the owning chain --------
+    //
+    // A file committed to a PARTITION segment can be replaced via the bare
+    // (non-partitioned) `replace_data_files` — the catalog locates the owning
+    // chain and commits the swap there, and a mixed replace (one path on the
+    // META chain, one in a partition) routes each removed path to its own chain.
+    #[tokio::test]
+    async fn non_partitioned_replace_resolves_owning_chain() {
+        let c = cat();
+        let p = ProjectId::new();
+        let t = TableName::new("mix").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // META-chain file (single-node OLTP style append).
+        c.append_data_files(&p, &t, SnapshotId::GENESIS, vec![file("meta.parquet", 3)])
+            .await
+            .unwrap();
+        // Partition-segment file (sharded ingest style).
+        let exp = c.current_snapshot_id_in_partition(&p, &t, "s0").await.unwrap();
+        c.append_data_files_in_partition(&p, &t, "s0", exp, vec![file("part.parquet", 3)])
+            .await
+            .unwrap();
+
+        // Sanity: union sees both.
+        let live: std::collections::HashSet<String> = c
+            .load_table(&p, &t)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert!(live.contains("meta.parquet") && live.contains("part.parquet"));
+
+        // Replace the PARTITION file via the bare API → routed to partition s0.
+        let head = c.current_snapshot_id(&p, &t).await.unwrap();
+        c.replace_data_files(
+            &p,
+            &t,
+            head,
+            vec!["part.parquet".into()],
+            vec![file("part2.parquet", 3)],
+        )
+        .await
+        .unwrap();
+
+        // Mixed replace: remove one META path + one partition path at once.
+        let head2 = c.current_snapshot_id(&p, &t).await.unwrap();
+        c.replace_data_files(
+            &p,
+            &t,
+            head2,
+            vec!["meta.parquet".into(), "part2.parquet".into()],
+            vec![file("merged.parquet", 6)],
+        )
+        .await
+        .unwrap();
+
+        let final_live: std::collections::HashSet<String> = c
+            .load_table(&p, &t)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        // Only the merged file survives; both removed paths are gone, no dup.
+        assert_eq!(final_live.len(), 1, "exactly one live file after the swaps");
+        assert!(final_live.contains("merged.parquet"));
     }
 
     // --- Test 3: double-lease-acquire -------------------------------------
@@ -3180,7 +4172,8 @@ mod tests {
             .unwrap();
         let head = m.current_snapshot;
 
-        // Replace a.parquet -> c.parquet at the correct expected snapshot.
+        // Replace a.parquet -> c.parquet (the META-chain back-compat path now
+        // resolves its OCC internally, so the passed `head` is informational).
         let m2 = c
             .replace_data_files(&p, &t, head, vec!["a.parquet".into()], vec![file("c.parquet", 5)])
             .await
@@ -3190,14 +4183,18 @@ mod tests {
         assert!(live.contains(&"c.parquet".to_string()));
         assert!(!live.contains(&"a.parquet".to_string()));
 
-        // Stale expected snapshot -> CommitConflict.
-        let err = c
+        // A second replace lands too (internal RMW); the live set tracks it.
+        let m3 = c
             .replace_data_files(&p, &t, head, vec!["b.parquet".into()], vec![file("d.parquet", 5)])
             .await
-            .unwrap_err();
-        assert!(matches!(err, BasinError::CommitConflict(_)), "got {err:?}");
+            .unwrap();
+        let live3: Vec<String> = m3.live_data_files().into_iter().map(|f| f.path).collect();
+        assert!(live3.contains(&"c.parquet".to_string()));
+        assert!(live3.contains(&"d.parquet".to_string()));
+        assert!(!live3.contains(&"b.parquet".to_string()));
 
-        // Removing a non-live path -> Catalog error.
+        // Removing a non-live path -> Catalog error (path is in neither the META
+        // chain nor any partition segment).
         let head2 = c.current_snapshot_id(&p, &t).await.unwrap();
         let err2 = c
             .replace_data_files(&p, &t, head2, vec!["does-not-exist".into()], vec![])
@@ -3286,7 +4283,9 @@ mod tests {
             expected = m.current_snapshot;
         }
         let a_snapshot = node_a.current_snapshot_id(&p, &t).await.unwrap();
-        assert_eq!(a_snapshot, SnapshotId(3));
+        // Synthetic union id once data exists (was SnapshotId(3) under the old
+        // single-chain layout; the count assertion below is what matters).
+        assert_eq!(a_snapshot, SnapshotId(1));
 
         // KEY ASSERTION: node B — independent in-process cache, never wrote —
         // sees the table, all 3 commits' files, and the SAME current snapshot.
@@ -3414,18 +4413,21 @@ mod tests {
         // Each resolves to ITS OWN current snapshot and live file set.
         let pub_meta = c.load_table_qualified(&p, &pub_users).await.unwrap();
         let auth_meta = c.load_table_qualified(&p, &auth_users).await.unwrap();
+        // Both report the synthetic union id (1) since both have data; the
+        // independence proof is the DISTINCT live file sets + paths below, not
+        // the (now synthetic) snapshot id.
+        assert_eq!(pub_meta.current_snapshot, SnapshotId(1));
+        assert_eq!(auth_meta.current_snapshot, SnapshotId(1));
         assert_eq!(
-            pub_meta.current_snapshot,
-            SnapshotId(3),
-            "public.users advanced 3 snapshots independently"
+            pub_meta.live_data_files().len(),
+            3,
+            "public.users advanced 3 commits independently"
         );
         assert_eq!(
-            auth_meta.current_snapshot,
-            SnapshotId(1),
-            "auth.users advanced exactly 1 snapshot — NOT contaminated by public"
+            auth_meta.live_data_files().len(),
+            1,
+            "auth.users advanced exactly 1 commit — NOT contaminated by public"
         );
-        assert_eq!(pub_meta.live_data_files().len(), 3);
-        assert_eq!(auth_meta.live_data_files().len(), 1);
         // The file paths prove the manifests are physically distinct.
         assert!(pub_meta
             .live_data_files()
@@ -3456,8 +4458,8 @@ mod tests {
         ));
         let pub_after = c.load_table_qualified(&p, &pub_users).await.unwrap();
         assert_eq!(
-            pub_after.current_snapshot,
-            SnapshotId(3),
+            pub_after.live_data_files().len(),
+            3,
             "dropping auth.users did not affect public.users"
         );
         // After the auth drop, only public.users remains in the qualified list.

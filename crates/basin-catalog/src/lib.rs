@@ -538,6 +538,81 @@ pub trait Catalog: Send + Sync {
         added_files: Vec<DataFileRef>,
     ) -> Result<TableMetadata>;
 
+    /// O(1) read of the current snapshot id for one **partition** of a table.
+    ///
+    /// This is the per-partition OCC token used by the multi-writer ingest
+    /// path: under deterministic partition ownership each partition has a
+    /// single writer, so its data-file segment chain advances independently of
+    /// every other partition's. The shard reads this id, appends to that
+    /// partition's segment, and CASes against it — so two partitions never
+    /// contend on the same chain (the multi-node ingest scaling fix).
+    ///
+    /// Default implementation maps to the (non-partitioned) table-level
+    /// [`current_snapshot_id`](Catalog::current_snapshot_id), which is correct
+    /// for single-chain backends (`InMemoryCatalog` / `PostgresCatalog`): they
+    /// keep one chain per table, so the "partition token" *is* the table token.
+    /// `ObjectStoreCatalog` overrides this to read the per-partition segment.
+    async fn current_snapshot_id_in_partition(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        partition_id: &str,
+    ) -> Result<SnapshotId> {
+        let _ = partition_id;
+        self.current_snapshot_id(project, table).await
+    }
+
+    /// Append `files` to one **partition's** data-file segment, producing a new
+    /// per-partition snapshot. `expected_snapshot` is that partition's OCC token
+    /// (from [`current_snapshot_id_in_partition`](Catalog::current_snapshot_id_in_partition)).
+    ///
+    /// Sharding the data-file manifest by partition removes the single
+    /// per-table serialization point: with one writer per partition (the
+    /// forwarding layer routes each partition's writes to one owner node), two
+    /// partitions' commits CAS *different* keys and can never raise a spurious
+    /// `CommitConflict` against each other. A conflict here means the **same**
+    /// partition was committed concurrently (a handoff), and the retry is cheap
+    /// and uncontended by other partitions.
+    ///
+    /// Default implementation falls back to the non-partitioned
+    /// [`append_data_files`](Catalog::append_data_files) (single shared chain),
+    /// so `InMemoryCatalog` / `PostgresCatalog` keep working unchanged.
+    /// `ObjectStoreCatalog` overrides this to shard by partition.
+    async fn append_data_files_in_partition(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        partition_id: &str,
+        expected_snapshot: SnapshotId,
+        files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata> {
+        let _ = partition_id;
+        self.append_data_files(project, table, expected_snapshot, files)
+            .await
+    }
+
+    /// Partition-scoped variant of
+    /// [`replace_data_files`](Catalog::replace_data_files): the resulting
+    /// partition snapshot's file set = (parent − removed_paths) ∪ added_files.
+    /// Same OCC + non-contention story as
+    /// [`append_data_files_in_partition`](Catalog::append_data_files_in_partition).
+    ///
+    /// Default implementation falls back to the non-partitioned
+    /// [`replace_data_files`](Catalog::replace_data_files).
+    async fn replace_data_files_in_partition(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        partition_id: &str,
+        expected_snapshot: SnapshotId,
+        removed_paths: Vec<String>,
+        added_files: Vec<DataFileRef>,
+    ) -> Result<TableMetadata> {
+        let _ = partition_id;
+        self.replace_data_files(project, table, expected_snapshot, removed_paths, added_files)
+            .await
+    }
+
     /// Snapshots in commit order (oldest first). Used by point-in-time-restore
     /// and the analytical reader.
     async fn list_snapshots(&self, project: &ProjectId, table: &TableName)
