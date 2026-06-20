@@ -8,6 +8,41 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-20 — Durable, multi-node-safe sequences in the object-store catalog
+
+The Basin-native object-store catalog (`BASIN_CATALOG_BACKEND=object_store`)
+now implements the full sequence surface plus the remaining state-bearing
+catalog methods that the auth-provisioning + basic-DDL path needs. Previously
+these inherited the trait defaults that `Err("not implemented")`, so
+provisioning a project on the object-store backend failed at runtime with
+`nextval not implemented for this catalog backend` (SERIAL columns and the auth
+credential insert both depend on sequences).
+
+- **Durable sequences with block allocation.** `create_sequence`, `nextval`,
+  `currval`, `setval`, `drop_sequence`, `lookup_sequence`, and `list_sequences`
+  are persisted on the object store. Each sequence stores an immutable
+  `SequenceDef` and a monotonic high-water-mark log
+  (`{prefix}/{project}/_sequences/{name}/hwm/v{N}.json`). A node reserves a
+  contiguous block of values by CAS-advancing the mark via `PutMode::Create`
+  (the same create-if-absent primitive the manifest log uses) and hands the
+  block out locally — no per-row network round-trip on SERIAL bulk inserts.
+- **Multi-node-safe.** Two engine nodes over one store reserve disjoint blocks
+  (the create-if-absent loser re-reads and retries), so `nextval` never returns
+  a duplicate value across nodes. Gaps are allowed (standard SQL sequence
+  semantics): an unused in-memory block tail is skipped on crash/restart, and a
+  fresh instance resumes strictly above any previously-allocated value — the
+  high-water mark is persisted *before* values are handed out, so values are
+  never reused. This closes the durable-SERIAL-recovery gap (#15) on this
+  backend. Block size is configurable via `BASIN_SEQ_BLOCK` (default 64).
+- **SQL functions + schemas + storage config.** `register_sql_function`,
+  `drop_sql_function`, `lookup_sql_function`, and `list_sql_functions` are now
+  durable (small JSON objects under `_functions/`, last-writer-wins with the
+  same `version`-bump-on-REPLACE contract as the in-memory backend).
+  `create_schema` / `drop_schema` / `list_schemas` persist an explicit schema
+  set (so an empty schema survives) unioned with table-implied schemas;
+  `set_/get_project_storage_config` and the bare `fork_table` are implemented.
+  All are visible across nodes sharing one store.
+
 ## 2026-06-20 — Object-store shared catalog is schema-qualified (ADR 0022)
 
 The Basin-native object-store catalog (`BASIN_CATALOG_BACKEND=object_store`)

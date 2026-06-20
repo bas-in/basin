@@ -83,6 +83,8 @@ use crate::metadata::{
     CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, ProjectMetadata,
     PromotedJsonbPath, SecondaryIndex, TableFileFormat, TableMetadata, UniqueConstraint,
 };
+use crate::functions::SqlFunctionDef;
+use crate::sequences::{compute_next, SequenceDef, SequenceError};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
 use crate::Catalog;
 
@@ -263,6 +265,34 @@ pub struct ObjectStoreCatalog {
     /// fully-qualified `schema.table` string so the same bare name in two
     /// schemas (e.g. `public.users` vs `auth.users`) never shares a cache slot.
     cache: Mutex<HashMap<(ProjectId, String), CacheEntry>>,
+    /// Per-instance ("session") sequence state: the locally-reserved block and
+    /// the last value handed out by *this* node. Durable disjointness across
+    /// nodes comes from the persisted high-water mark (see the module docs on
+    /// sequences); this map only tracks the in-memory cursor inside the block
+    /// this node reserved, plus the `currval` session value. Never shared
+    /// across nodes — two `ObjectStoreCatalog` instances over one store keep
+    /// independent maps and reserve disjoint blocks.
+    seq_local: Mutex<HashMap<(ProjectId, String), SeqLocal>>,
+    /// Explicit sequence-block-size override. `None` means "read
+    /// `BASIN_SEQ_BLOCK` (default 64)"; `Some(n)` pins it (used by tests to
+    /// avoid racing on a shared process env var, and available to callers that
+    /// want a per-catalog block size). See [`ObjectStoreCatalog::seq_block`].
+    seq_block_override: Option<u64>,
+}
+
+/// Node-local cursor over a reserved sequence block. `next` is the value the
+/// next `nextval` will hand out; once `next` would step past `block_last`
+/// (in the increment's direction) the node must reserve a fresh block by
+/// CAS-advancing the persisted high-water mark. `last_returned` backs the
+/// per-instance `currval`.
+#[derive(Clone, Debug)]
+struct SeqLocal {
+    /// Inclusive: the values `[.. block_last]` (in increment direction) are
+    /// reserved by this node and safe to hand out without touching the store.
+    block_values: std::collections::VecDeque<i64>,
+    /// Last value returned by `nextval` on this instance; `None` until the
+    /// first `nextval` this session (drives `currval`'s not-advanced error).
+    last_returned: Option<i64>,
 }
 
 impl ObjectStoreCatalog {
@@ -283,7 +313,19 @@ impl ObjectStoreCatalog {
             root,
             epoch: AtomicU64::new(0),
             cache: Mutex::new(HashMap::new()),
+            seq_local: Mutex::new(HashMap::new()),
+            seq_block_override: None,
         }
+    }
+
+    /// Construct with the default `_catalog/` prefix and an explicit sequence
+    /// block size (bypasses `BASIN_SEQ_BLOCK`). Mainly for tests that need a
+    /// deterministic block size without touching the shared process env.
+    #[cfg(test)]
+    pub fn with_seq_block(store: Arc<dyn ObjectStore>, block: u64) -> Self {
+        let mut c = Self::with_prefix(store, DEFAULT_CATALOG_PREFIX);
+        c.seq_block_override = Some(block.max(1));
+        c
     }
 
     #[inline]
@@ -1401,6 +1443,408 @@ impl Catalog for ObjectStoreCatalog {
             .await
     }
 
+    async fn set_project_storage_config(
+        &self,
+        project: &ProjectId,
+        config: crate::project_storage_config::ProjectStorageConfig,
+    ) -> Result<()> {
+        self.put_project_json(project, "storage_config.json", &config)
+            .await
+    }
+
+    async fn get_project_storage_config(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Option<crate::project_storage_config::ProjectStorageConfig>> {
+        self.get_project_json::<crate::project_storage_config::ProjectStorageConfig>(
+            project,
+            "storage_config.json",
+        )
+        .await
+    }
+
+    // ---- SQL functions (durable; mirrors InMemory semantics) ----
+
+    async fn register_sql_function(&self, mut def: SqlFunctionDef) -> Result<()> {
+        // REPLACE bumps `version` (same contract as InMemory) so downstream
+        // caches can detect a redeploy without diffing the body.
+        if let Some(existing) = self.lookup_sql_function(&def.project, &def.name).await {
+            def.version = existing.version.saturating_add(1);
+        }
+        let bytes = serde_json::to_vec(&def)
+            .map_err(|e| BasinError::catalog(format!("serialise sql function: {e}")))?;
+        self.store
+            .put_opts(
+                &self.sql_function_key(&def.project, &def.name),
+                Bytes::from(bytes).into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| storage_err("put sql function", e))?;
+        self.bump_epoch();
+        Ok(())
+    }
+
+    async fn drop_sql_function(&self, project: &ProjectId, name: &str) -> Result<()> {
+        let key = self.sql_function_key(project, name);
+        match self.store.delete(&key).await {
+            Ok(_) => {
+                self.bump_epoch();
+                Ok(())
+            }
+            Err(object_store::Error::NotFound { .. }) => Err(BasinError::not_found(format!(
+                "{project}: sql function {name:?}"
+            ))),
+            Err(e) => Err(storage_err("delete sql function", e)),
+        }
+    }
+
+    async fn lookup_sql_function(&self, project: &ProjectId, name: &str) -> Option<SqlFunctionDef> {
+        match self.store.get(&self.sql_function_key(project, name)).await {
+            Ok(res) => {
+                let bytes = res.bytes().await.ok()?;
+                serde_json::from_slice(&bytes).ok()
+            }
+            _ => None,
+        }
+    }
+
+    async fn list_sql_functions(&self, project: &ProjectId) -> Vec<SqlFunctionDef> {
+        use futures::StreamExt;
+        let prefix = OsPath::from(self.sql_function_dir(project));
+        let mut stream = self.store.list(Some(&prefix));
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            let Ok(meta) = item else { continue };
+            let Ok(res) = self.store.get(&meta.location).await else {
+                continue;
+            };
+            let Ok(bytes) = res.bytes().await else { continue };
+            if let Ok(def) = serde_json::from_slice::<SqlFunctionDef>(&bytes) {
+                out.push(def);
+            }
+        }
+        out
+    }
+
+    // ---- Sequences (durable, multi-node-safe block allocation) ----
+
+    async fn create_sequence(&self, def: SequenceDef) -> Result<()> {
+        if def.increment == 0 {
+            return Err(BasinError::InvalidSchema(
+                "sequence increment must be non-zero".into(),
+            ));
+        }
+        // Resurrect a tombstoned name: clearing the tombstone lets the new def
+        // take over. A live def with this name is a conflict (PG semantics).
+        if self.seq_exists(&def.project, &def.name).await? {
+            return Err(BasinError::catalog(format!(
+                "sequence {}/{} already exists",
+                def.project, def.name,
+            )));
+        }
+        let tombstone = self.seq_tombstone_key(&def.project, &def.name);
+        if self.seq_is_tombstoned(&def.project, &def.name).await? {
+            let _ = self.store.delete(&tombstone).await;
+        }
+        // Reset any stale hwm log from a prior drop so the resurrected sequence
+        // starts from genesis.
+        self.seq_purge(&def.project, &def.name).await?;
+        let bytes = serde_json::to_vec(&def)
+            .map_err(|e| BasinError::catalog(format!("serialise sequence def: {e}")))?;
+        match self
+            .store
+            .put_opts(
+                &self.seq_def_key(&def.project, &def.name),
+                Bytes::from(bytes).into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                return Err(BasinError::catalog(format!(
+                    "sequence {}/{} already exists",
+                    def.project, def.name,
+                )))
+            }
+            Err(e) => return Err(storage_err("put sequence def", e)),
+        }
+        self.bump_epoch();
+        Ok(())
+    }
+
+    async fn drop_sequence(&self, project: &ProjectId, name: &str) -> Result<()> {
+        if !self.seq_exists(project, name).await? {
+            return Err(BasinError::not_found(format!(
+                "{project}: sequence {name:?}"
+            )));
+        }
+        // Tombstone first (makes the sequence invisible at once), then best-
+        // effort purge of the def + hwm log objects.
+        self.store
+            .put_opts(
+                &self.seq_tombstone_key(project, name),
+                Bytes::from_static(b"1").into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| storage_err("put sequence tombstone", e))?;
+        let _ = self.store.delete(&self.seq_def_key(project, name)).await;
+        self.seq_purge(project, name).await?;
+        // Forget any node-local cursor.
+        self.seq_local.lock().await.remove(&(*project, name.to_string()));
+        self.bump_epoch();
+        Ok(())
+    }
+
+    async fn lookup_sequence(&self, project: &ProjectId, name: &str) -> Option<SequenceDef> {
+        self.seq_load_def(project, name).await.ok().flatten()
+    }
+
+    async fn nextval(&self, project: &ProjectId, name: &str) -> Result<i64> {
+        let def = self
+            .seq_load_def(project, name)
+            .await?
+            .ok_or_else(|| BasinError::not_found(format!("{project}: sequence {name:?}")))?;
+        let block = self.seq_block();
+        let key = (*project, name.to_string());
+        // Fast path: hand out from the locally-reserved block if any remains.
+        {
+            let mut local = self.seq_local.lock().await;
+            if let Some(entry) = local.get_mut(&key) {
+                if let Some(v) = entry.block_values.pop_front() {
+                    entry.last_returned = Some(v);
+                    return Ok(v);
+                }
+            }
+        }
+        // Block empty / unseen: reserve a fresh block via durable CAS.
+        let mut values = self.seq_reserve_block(&def, block).await?;
+        let v = values
+            .pop_front()
+            .expect("seq_reserve_block returns a non-empty block on Ok");
+        let mut local = self.seq_local.lock().await;
+        let entry = local.entry(key).or_insert_with(|| SeqLocal {
+            block_values: std::collections::VecDeque::new(),
+            last_returned: None,
+        });
+        entry.block_values = values;
+        entry.last_returned = Some(v);
+        Ok(v)
+    }
+
+    async fn currval(&self, project: &ProjectId, name: &str) -> Result<i64> {
+        if !self.seq_exists(project, name).await? {
+            return Err(BasinError::not_found(format!(
+                "{project}: sequence {name:?}"
+            )));
+        }
+        let local = self.seq_local.lock().await;
+        match local
+            .get(&(*project, name.to_string()))
+            .and_then(|e| e.last_returned)
+        {
+            Some(v) => Ok(v),
+            None => Err(BasinError::not_found(format!(
+                "{project}: sequence {name:?} has not been advanced"
+            ))),
+        }
+    }
+
+    async fn setval(
+        &self,
+        project: &ProjectId,
+        name: &str,
+        value: i64,
+        advance: bool,
+    ) -> Result<i64> {
+        let def = self
+            .seq_load_def(project, name)
+            .await?
+            .ok_or_else(|| BasinError::not_found(format!("{project}: sequence {name:?}")))?;
+        // PG: setval(seq, n, true) => next nextval returns n+increment, so the
+        // persisted "last" is n. setval(seq, n, false) => next nextval returns
+        // n exactly, so store n-increment (the started-advance lands on n).
+        let stored_last = if advance {
+            value
+        } else {
+            value.wrapping_sub(def.increment)
+        };
+        const MAX_RETRIES: u32 = 64;
+        for _ in 0..MAX_RETRIES {
+            let (version, _hwm) = self.seq_read_hwm(project, name).await?;
+            let next_hwm = SeqHwm {
+                last: stored_last,
+                started: true,
+            };
+            if self.seq_put_hwm_create(project, name, version + 1, &next_hwm).await? {
+                self.bump_epoch();
+                // Drop any node-local reserved block: it may straddle the new
+                // mark. The next nextval re-reserves from the persisted mark.
+                let mut local = self.seq_local.lock().await;
+                if let Some(entry) = local.get_mut(&(*project, name.to_string())) {
+                    entry.block_values.clear();
+                    entry.last_returned = Some(value);
+                } else {
+                    local.insert(
+                        (*project, name.to_string()),
+                        SeqLocal {
+                            block_values: std::collections::VecDeque::new(),
+                            last_returned: Some(value),
+                        },
+                    );
+                }
+                return Ok(value);
+            }
+        }
+        Err(BasinError::catalog(format!(
+            "{project}: sequence {name:?} setval contention exceeded retry budget"
+        )))
+    }
+
+    async fn list_sequences(&self, project: &ProjectId) -> Vec<SequenceDef> {
+        use futures::StreamExt;
+        // Enumerate `{root}{project}/_sequences/{name}/` directories, decode the
+        // live def for each (tombstoned ones are skipped by `seq_load_def`).
+        let prefix_str = format!("{}{}/_sequences/", self.root, project);
+        let list_prefix = OsPath::from(prefix_str.clone());
+        let mut stream = self.store.list(Some(&list_prefix));
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let trimmed = prefix_str.trim_end_matches('/');
+        while let Some(item) = stream.next().await {
+            let Ok(meta) = item else { continue };
+            let key = meta.location.as_ref();
+            if let Some(rest) = key.strip_prefix(trimmed) {
+                let rest = rest.trim_start_matches('/');
+                if let Some(seg) = rest.split('/').next() {
+                    if !seg.is_empty() {
+                        names.insert(seg.to_string());
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for n in names {
+            if let Ok(Some(def)) = self.seq_load_def(project, &n).await {
+                out.push(def);
+            }
+        }
+        out
+    }
+
+    // ---- Schemas (durable; explicit set + table-implied schemas) ----
+
+    async fn list_schemas(&self, project: &ProjectId) -> Result<Vec<SchemaName>> {
+        // Union of: the explicitly-created set (so an empty schema survives),
+        // `public` (always present), and any schema implied by a live table.
+        let mut set: std::collections::BTreeSet<SchemaName> =
+            std::collections::BTreeSet::new();
+        set.insert(SchemaName::public());
+        if let Some(stored) = self
+            .get_project_json::<Vec<String>>(project, "schemas.json")
+            .await?
+        {
+            for s in stored {
+                if let Ok(name) = SchemaName::new(s) {
+                    set.insert(name);
+                }
+            }
+        }
+        // Schemas implied by existing tables (covers reserved schemas created
+        // implicitly via `create_table_qualified` without an explicit
+        // `create_schema`).
+        for qt in self.list_tables_qualified(project).await? {
+            set.insert(qt.schema);
+        }
+        Ok(set.into_iter().collect())
+    }
+
+    async fn create_schema(&self, project: &ProjectId, schema: &SchemaName) -> Result<()> {
+        // Idempotent; `public` is implicit.
+        if schema == &SchemaName::public() {
+            return Ok(());
+        }
+        let mut stored = self
+            .get_project_json::<Vec<String>>(project, "schemas.json")
+            .await?
+            .unwrap_or_default();
+        let s = schema.to_string();
+        if !stored.iter().any(|e| e == &s) {
+            stored.push(s);
+            self.put_project_json(project, "schemas.json", &stored).await?;
+        }
+        Ok(())
+    }
+
+    async fn drop_schema(
+        &self,
+        project: &ProjectId,
+        schema: &SchemaName,
+        cascade: bool,
+    ) -> Result<()> {
+        if schema == &SchemaName::public() {
+            return Err(BasinError::catalog("cannot drop the public schema"));
+        }
+        let stored = self
+            .get_project_json::<Vec<String>>(project, "schemas.json")
+            .await?
+            .unwrap_or_default();
+        let tables_in_schema: Vec<QualifiedTableName> = self
+            .list_tables_qualified(project)
+            .await?
+            .into_iter()
+            .filter(|qt| &qt.schema == schema)
+            .collect();
+        // Exist iff in the explicit set or implied by a live table.
+        let exists = stored.iter().any(|e| e == &schema.to_string())
+            || !tables_in_schema.is_empty();
+        if !exists {
+            return Err(BasinError::not_found(format!(
+                "{project}: schema {schema:?}"
+            )));
+        }
+        if !cascade && !tables_in_schema.is_empty() {
+            return Err(BasinError::catalog(format!(
+                "cannot drop schema {schema}: {} table(s) still exist (use CASCADE to drop them)",
+                tables_in_schema.len()
+            )));
+        }
+        if cascade {
+            for qt in &tables_in_schema {
+                self.drop_table_q(project, qt).await?;
+            }
+        }
+        let remaining: Vec<String> = stored
+            .into_iter()
+            .filter(|e| e != &schema.to_string())
+            .collect();
+        self.put_project_json(project, "schemas.json", &remaining).await?;
+        Ok(())
+    }
+
+    // Bare `fork_table`: resolve the source schema, fork into `public`,
+    // mirroring `InMemoryCatalog::fork_table`.
+    async fn fork_table(
+        &self,
+        project: &ProjectId,
+        src_table: &TableName,
+        dst_table: &TableName,
+    ) -> Result<TableMetadata> {
+        let qsrc = self.resolve_qtable(project, src_table).await;
+        let qdst = QualifiedTableName::in_public(dst_table.clone());
+        self.fork_table_qualified(project, &qsrc, &qdst).await
+    }
+
     // -----------------------------------------------------------------------
     // Schema-qualified API (ADR 0022). Unlike the trait defaults (which reject
     // any non-public schema), these honour the caller's schema directly so
@@ -1773,6 +2217,280 @@ impl ObjectStoreCatalog {
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(storage_err("get project meta", e)),
+        }
+    }
+
+    // ---- SQL functions (durable, last-writer-wins like project metadata) ----
+
+    fn sql_function_key(&self, project: &ProjectId, name: &str) -> OsPath {
+        OsPath::from(format!(
+            "{}{}/_functions/{}.json",
+            self.root,
+            project,
+            sanitize(name)
+        ))
+    }
+
+    fn sql_function_dir(&self, project: &ProjectId) -> String {
+        format!("{}{}/_functions/", self.root, project)
+    }
+
+    // ---- Sequences (durable high-water mark + block allocation) ----
+    //
+    // Layout under `{root}{project}/_sequences/{name}/`:
+    //   def.json                  — the immutable `SequenceDef`, written once
+    //                               via PutMode::Create at create time.
+    //   hwm/v{N:020}.json         — high-water-mark log. Each object holds a
+    //                               `SeqHwm { last, started }` record. "Current"
+    //                               = highest N present; advancing reserves a
+    //                               block by writing v{N+1} via PutMode::Create
+    //                               (the create-if-absent CAS the manifest log
+    //                               already uses). The loser of a race re-reads
+    //                               and retries (bounded). Old versions are kept
+    //                               as history; the high-water mark only ever
+    //                               moves forward, so a restart resumes from the
+    //                               persisted max and never reuses a value.
+    //   TOMBSTONE                 — present iff the sequence was dropped.
+
+    fn seq_dir(&self, project: &ProjectId, name: &str) -> String {
+        format!("{}{}/_sequences/{}/", self.root, project, sanitize(name))
+    }
+
+    fn seq_def_key(&self, project: &ProjectId, name: &str) -> OsPath {
+        OsPath::from(format!("{}def.json", self.seq_dir(project, name)))
+    }
+
+    fn seq_tombstone_key(&self, project: &ProjectId, name: &str) -> OsPath {
+        OsPath::from(format!("{}TOMBSTONE", self.seq_dir(project, name)))
+    }
+
+    fn seq_hwm_key(&self, project: &ProjectId, name: &str, version: u64) -> OsPath {
+        OsPath::from(format!(
+            "{}hwm/v{version:020}.json",
+            self.seq_dir(project, name)
+        ))
+    }
+
+    /// Block size for sequence reservation. Configurable via `BASIN_SEQ_BLOCK`
+    /// (clamped to `>= 1`); defaults to 64. A larger block means fewer CAS
+    /// round-trips for SERIAL bulk inserts at the cost of larger gaps on
+    /// crash/restart; the auth-provisioning path (a handful of values) keeps
+    /// gaps tiny even at the default.
+    fn seq_block(&self) -> u64 {
+        if let Some(b) = self.seq_block_override {
+            return b.max(1);
+        }
+        std::env::var("BASIN_SEQ_BLOCK")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&b| b >= 1)
+            .unwrap_or(64)
+    }
+
+    /// Is this sequence present (created and not tombstoned)?
+    async fn seq_exists(&self, project: &ProjectId, name: &str) -> Result<bool> {
+        if self.seq_is_tombstoned(project, name).await? {
+            return Ok(false);
+        }
+        match self.store.head(&self.seq_def_key(project, name)).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(storage_err("head sequence def", e)),
+        }
+    }
+
+    /// Best-effort delete of every hwm object under a sequence's `hwm/`
+    /// prefix. Used on drop and on resurrect-after-drop to clear stale state.
+    async fn seq_purge(&self, project: &ProjectId, name: &str) -> Result<()> {
+        use futures::StreamExt;
+        let prefix = OsPath::from(format!("{}hwm/", self.seq_dir(project, name)));
+        let mut stream = self.store.list(Some(&prefix));
+        let mut keys = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(meta) => keys.push(meta.location),
+                Err(e) => return Err(storage_err("list sequence hwm for purge", e)),
+            }
+        }
+        for k in keys {
+            let _ = self.store.delete(&k).await;
+        }
+        Ok(())
+    }
+
+    async fn seq_is_tombstoned(&self, project: &ProjectId, name: &str) -> Result<bool> {
+        match self.store.head(&self.seq_tombstone_key(project, name)).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(storage_err("head sequence tombstone", e)),
+        }
+    }
+
+    async fn seq_load_def(&self, project: &ProjectId, name: &str) -> Result<Option<SequenceDef>> {
+        if self.seq_is_tombstoned(project, name).await? {
+            return Ok(None);
+        }
+        match self.store.get(&self.seq_def_key(project, name)).await {
+            Ok(res) => {
+                let bytes = res
+                    .bytes()
+                    .await
+                    .map_err(|e| storage_err("read sequence def", e))?;
+                let def = serde_json::from_slice(&bytes).map_err(|e| {
+                    BasinError::catalog(format!("decode sequence def {project}/{name}: {e}"))
+                })?;
+                Ok(Some(def))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(storage_err("get sequence def", e)),
+        }
+    }
+
+    /// Highest high-water-mark version present, with its decoded record.
+    /// Returns `(version, hwm)`; `version == 0` with `started == false`
+    /// genesis when no hwm object exists yet.
+    async fn seq_read_hwm(
+        &self,
+        project: &ProjectId,
+        name: &str,
+    ) -> Result<(u64, SeqHwm)> {
+        use futures::StreamExt;
+        let prefix = OsPath::from(format!("{}hwm/", self.seq_dir(project, name)));
+        let mut stream = self.store.list(Some(&prefix));
+        let mut max: Option<u64> = None;
+        while let Some(item) = stream.next().await {
+            let meta = item.map_err(|e| storage_err("list sequence hwm", e))?;
+            let key = meta.location.as_ref();
+            if let Some(file) = key.rsplit('/').next() {
+                if let Some(num) = file.strip_prefix('v').and_then(|s| s.strip_suffix(".json")) {
+                    if let Ok(v) = num.parse::<u64>() {
+                        max = Some(max.map_or(v, |m| m.max(v)));
+                    }
+                }
+            }
+        }
+        match max {
+            None => Ok((0, SeqHwm::genesis())),
+            Some(v) => {
+                let res = self
+                    .store
+                    .get(&self.seq_hwm_key(project, name, v))
+                    .await
+                    .map_err(|e| storage_err("get sequence hwm", e))?;
+                let bytes = res
+                    .bytes()
+                    .await
+                    .map_err(|e| storage_err("read sequence hwm", e))?;
+                let hwm = serde_json::from_slice(&bytes).map_err(|e| {
+                    BasinError::catalog(format!("decode sequence hwm {project}/{name}: {e}"))
+                })?;
+                Ok((v, hwm))
+            }
+        }
+    }
+
+    /// CAS-write hwm version `version` via create-if-absent. `true` = we won,
+    /// `false` = another node already wrote that version (re-read + retry).
+    async fn seq_put_hwm_create(
+        &self,
+        project: &ProjectId,
+        name: &str,
+        version: u64,
+        hwm: &SeqHwm,
+    ) -> Result<bool> {
+        let bytes = serde_json::to_vec(hwm)
+            .map_err(|e| BasinError::catalog(format!("serialise sequence hwm: {e}")))?;
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        match self
+            .store
+            .put_opts(&self.seq_hwm_key(project, name, version), Bytes::from(bytes).into(), opts)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+            Err(e) => Err(storage_err("put sequence hwm", e)),
+        }
+    }
+
+    /// Reserve a contiguous block of up to `block` values by CAS-advancing the
+    /// persisted high-water mark. Returns the reserved values in hand-out
+    /// order (`VecDeque`), plus the new persisted `last`. Disjoint across nodes
+    /// because the winner is the only one that advances a given hwm version.
+    async fn seq_reserve_block(
+        &self,
+        def: &SequenceDef,
+        block: u64,
+    ) -> Result<std::collections::VecDeque<i64>> {
+        const MAX_RETRIES: u32 = 64;
+        for _ in 0..MAX_RETRIES {
+            let (version, hwm) = self.seq_read_hwm(&def.project, &def.name).await?;
+            // Compute up to `block` successive values starting from the current
+            // persisted (last, started), mirroring `compute_next` exactly so
+            // increment / min / max / cycle / exhaustion all match InMemory.
+            let mut values = std::collections::VecDeque::new();
+            let mut last = hwm.last;
+            let mut started = hwm.started;
+            for _ in 0..block {
+                match compute_next(def, last, started) {
+                    Ok(v) => {
+                        values.push_back(v);
+                        last = v;
+                        started = true;
+                    }
+                    Err(SequenceError::Exhausted) => break,
+                    Err(SequenceError::InvalidIncrement) => {
+                        return Err(BasinError::InvalidSchema(format!(
+                            "{}: sequence {:?} has zero increment",
+                            def.project, def.name
+                        )))
+                    }
+                }
+            }
+            if values.is_empty() {
+                // No room left in the value space and the very first step is
+                // already exhausted.
+                return Err(BasinError::catalog(format!(
+                    "{}: sequence {:?} exhausted",
+                    def.project, def.name
+                )));
+            }
+            let next_hwm = SeqHwm { last, started };
+            if self
+                .seq_put_hwm_create(&def.project, &def.name, version + 1, &next_hwm)
+                .await?
+            {
+                self.bump_epoch();
+                return Ok(values);
+            }
+            // Lost the CAS race — another node reserved version+1. Re-read and
+            // retry; the next attempt starts from the now-higher mark, so the
+            // blocks are disjoint.
+        }
+        Err(BasinError::catalog(format!(
+            "{}: sequence {:?} hwm contention exceeded retry budget",
+            def.project, def.name
+        )))
+    }
+}
+
+/// Persisted high-water mark for a sequence. `last` is the last value logically
+/// allocated (handed out to some node's block); `started` distinguishes "never
+/// advanced" (next is `start`) from "advanced" (next is `compute_next(last)`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SeqHwm {
+    last: i64,
+    started: bool,
+}
+
+impl SeqHwm {
+    fn genesis() -> Self {
+        // `last` is unused while `started == false` (first hand-out is `start`).
+        SeqHwm {
+            last: 0,
+            started: false,
         }
     }
 }
@@ -2801,5 +3519,220 @@ mod tests {
         );
         let dst_after = c.load_table_qualified(&p, &dst).await.unwrap();
         assert_eq!(dst_after.live_data_files().len(), 2);
+    }
+
+    // --- Sequences --------------------------------------------------------
+
+    fn seq_def(project: ProjectId, name: &str, start: i64, increment: i64) -> SequenceDef {
+        SequenceDef {
+            project,
+            name: name.to_string(),
+            start,
+            increment,
+            min_value: if increment > 0 { 1 } else { i64::MIN + 1 },
+            max_value: if increment > 0 { i64::MAX } else { -1 },
+            cache_size: 1,
+            cycle: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn sequence_basics_match_increment_and_currval_setval_drop() {
+        // BLOCK=1 exercises the per-value CAS path (the auth-provisioning shape).
+        let c = ObjectStoreCatalog::with_seq_block(Arc::new(InMemory::new()), 1);
+        let p = ProjectId::new();
+        let d = seq_def(p, "s", 5, 2);
+        c.create_sequence(d.clone()).await.unwrap();
+        // First nextval returns `start`, then steps by `increment`.
+        assert_eq!(c.nextval(&p, "s").await.unwrap(), 5);
+        assert_eq!(c.nextval(&p, "s").await.unwrap(), 7);
+        assert_eq!(c.nextval(&p, "s").await.unwrap(), 9);
+        // currval reflects the last value returned this session.
+        assert_eq!(c.currval(&p, "s").await.unwrap(), 9);
+        // lookup + list see the def.
+        assert_eq!(c.lookup_sequence(&p, "s").await.unwrap(), d);
+        assert_eq!(c.list_sequences(&p).await.len(), 1);
+        // setval(advance=true): next nextval is value+increment.
+        assert_eq!(c.setval(&p, "s", 100, true).await.unwrap(), 100);
+        assert_eq!(c.nextval(&p, "s").await.unwrap(), 102);
+        // setval(advance=false): next nextval is value exactly.
+        assert_eq!(c.setval(&p, "s", 200, false).await.unwrap(), 200);
+        assert_eq!(c.nextval(&p, "s").await.unwrap(), 200);
+        // drop: gone everywhere.
+        c.drop_sequence(&p, "s").await.unwrap();
+        assert!(c.lookup_sequence(&p, "s").await.is_none());
+        assert!(c.nextval(&p, "s").await.is_err());
+        assert!(c.drop_sequence(&p, "s").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sequence_matches_in_memory_value_stream() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let os = ObjectStoreCatalog::with_seq_block(store, 7);
+        let im = crate::InMemoryCatalog::new();
+        let p = ProjectId::new();
+        let d = seq_def(p, "s", 1, 3);
+        os.create_sequence(d.clone()).await.unwrap();
+        im.create_sequence(d).await.unwrap();
+        // The same op stream must produce identical values across backends,
+        // even though ObjectStore reserves blocks of 7 under the hood.
+        for _ in 0..50 {
+            assert_eq!(
+                os.nextval(&p, "s").await.unwrap(),
+                im.nextval(&p, "s").await.unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sequence_no_cycle_exhausts_like_in_memory() {
+        let c = ObjectStoreCatalog::with_seq_block(Arc::new(InMemory::new()), 4);
+        let p = ProjectId::new();
+        let mut d = seq_def(p, "s", 1, 1);
+        d.max_value = 3;
+        c.create_sequence(d).await.unwrap();
+        assert_eq!(c.nextval(&p, "s").await.unwrap(), 1);
+        assert_eq!(c.nextval(&p, "s").await.unwrap(), 2);
+        assert_eq!(c.nextval(&p, "s").await.unwrap(), 3);
+        // NO CYCLE past max -> exhausted error.
+        assert!(c.nextval(&p, "s").await.is_err());
+    }
+
+    // HEADLINE: two nodes over one store never hand out a duplicate value.
+    #[tokio::test]
+    async fn sequence_two_nodes_disjoint_no_duplicates() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let node_a = ObjectStoreCatalog::with_seq_block(store.clone(), 8);
+        let node_b = ObjectStoreCatalog::with_seq_block(store.clone(), 8);
+        let p = ProjectId::new();
+        node_a.create_sequence(seq_def(p, "s", 1, 1)).await.unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        // Interleave nextval across both nodes, spanning many block allocations.
+        for _ in 0..200 {
+            let va = node_a.nextval(&p, "s").await.unwrap();
+            let vb = node_b.nextval(&p, "s").await.unwrap();
+            assert!(va >= 1, "in range");
+            assert!(vb >= 1, "in range");
+            assert!(seen.insert(va), "no duplicate values across two nodes: {va}");
+            assert!(seen.insert(vb), "no duplicate values across two nodes: {vb}");
+        }
+        assert_eq!(seen.len(), 400, "every value distinct across both nodes");
+    }
+
+    // CRASH RECOVERY: a fresh instance resumes strictly above any value the
+    // crashed instance handed out (gap allowed, never reused).
+    #[tokio::test]
+    async fn sequence_crash_recovery_resumes_strictly_greater() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let p = ProjectId::new();
+        let mut max_a = i64::MIN;
+        {
+            // Instance A reserves a block of 64 and hands out only a few, then
+            // "crashes" (dropped) leaving an unused tail.
+            let node_a = ObjectStoreCatalog::with_seq_block(store.clone(), 64);
+            node_a.create_sequence(seq_def(p, "s", 1, 1)).await.unwrap();
+            for _ in 0..3 {
+                max_a = max_a.max(node_a.nextval(&p, "s").await.unwrap());
+            }
+        }
+        // Fresh instance B over the same store.
+        let node_b = ObjectStoreCatalog::new(store.clone());
+        let first_b = node_b.nextval(&p, "s").await.unwrap();
+        assert!(
+            first_b > max_a,
+            "B resumes strictly greater than A: first_b={first_b} max_a={max_a}"
+        );
+    }
+
+    // Cross-node visibility for sequences + SQL functions (mirrors
+    // two_nodes_share_catalog): write on A, read on B over one store.
+    #[tokio::test]
+    async fn sequence_and_sql_function_visible_across_nodes() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let node_a = ObjectStoreCatalog::new(store.clone());
+        let node_b = ObjectStoreCatalog::new(store.clone());
+        let p = ProjectId::new();
+        // Sequence def created on A is looked up on B.
+        node_a.create_sequence(seq_def(p, "s", 10, 5)).await.unwrap();
+        assert_eq!(
+            node_b.lookup_sequence(&p, "s").await.unwrap().start,
+            10,
+            "sequence def visible on the other node"
+        );
+        assert_eq!(node_b.list_sequences(&p).await.len(), 1);
+
+        // SQL function registered on A is visible + listable on B.
+        use crate::functions::{SqlArgType, SqlFunctionLanguage, SqlReturnType};
+        let f = SqlFunctionDef {
+            project: p,
+            name: "f".to_string(),
+            args: vec![],
+            return_type: SqlReturnType::Scalar(SqlArgType::BigInt),
+            body: "SELECT 1".to_string(),
+            language: SqlFunctionLanguage::Sql,
+            version: 1,
+            source: None,
+        };
+        node_a.register_sql_function(f.clone()).await.unwrap();
+        let got = node_b.lookup_sql_function(&p, "f").await.unwrap();
+        assert_eq!(got.body, "SELECT 1");
+        assert_eq!(node_b.list_sql_functions(&p).await.len(), 1);
+        // drop on B is observed on A.
+        node_b.drop_sql_function(&p, "f").await.unwrap();
+        assert!(node_a.lookup_sql_function(&p, "f").await.is_none());
+    }
+
+    // Schemas: create (empty), list, drop — visible across nodes.
+    #[tokio::test]
+    async fn schemas_durable_and_visible_across_nodes() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let node_a = ObjectStoreCatalog::new(store.clone());
+        let node_b = ObjectStoreCatalog::new(store.clone());
+        let p = ProjectId::new();
+        node_a.create_namespace(&p).await.unwrap();
+        // Default: only public.
+        assert_eq!(
+            node_b.list_schemas(&p).await.unwrap(),
+            vec![SchemaName::public()]
+        );
+        // Empty schema survives (no tables in it) and is visible on B.
+        let analytics = SchemaName::new("analytics").unwrap();
+        node_a.create_schema(&p, &analytics).await.unwrap();
+        let schemas = node_b.list_schemas(&p).await.unwrap();
+        assert!(schemas.contains(&analytics));
+        assert!(schemas.contains(&SchemaName::public()));
+        // Idempotent.
+        node_a.create_schema(&p, &analytics).await.unwrap();
+        // RESTRICT drop of empty schema succeeds; then it's gone.
+        node_b.drop_schema(&p, &analytics, false).await.unwrap();
+        assert!(!node_a.list_schemas(&p).await.unwrap().contains(&analytics));
+        // Dropping public is rejected.
+        assert!(node_a
+            .drop_schema(&p, &SchemaName::public(), false)
+            .await
+            .is_err());
+        // Unknown schema -> NotFound.
+        assert!(node_a
+            .drop_schema(&p, &SchemaName::new("nope").unwrap(), false)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn project_storage_config_round_trip_across_nodes() {
+        use crate::project_storage_config::ProjectStorageConfig;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let node_a = ObjectStoreCatalog::new(store.clone());
+        let node_b = ObjectStoreCatalog::new(store.clone());
+        let p = ProjectId::new();
+        // Default before any set.
+        assert!(node_b.get_project_storage_config(&p).await.unwrap().is_none());
+        let cfg = ProjectStorageConfig::default();
+        node_a.set_project_storage_config(&p, cfg.clone()).await.unwrap();
+        assert_eq!(
+            node_b.get_project_storage_config(&p).await.unwrap(),
+            Some(cfg)
+        );
     }
 }
