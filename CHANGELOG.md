@@ -8,6 +8,44 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-21 — Flatten residual ingest-rate decline: per-partition commit no longer unions the whole table
+
+After the O(1) delta-segment commit fix, single-node sustained ingest no longer
+collapsed, but a MILD residual decline remained (~32k r/s early → ~17k by 440M):
+a gentle per-commit cost that grew with table FILE COUNT.
+
+Root cause: `ObjectStoreCatalog::commit_part_snapshot` (the per-partition data
+commit behind sharded ingest) called `load_unioned` on EVERY commit to build its
+`TableMetadata` return value. `load_unioned` LISTs every partition and
+re-materialises EVERY live data file across the WHOLE table (folding each
+partition's chain, summing row/byte stats, cloning every `DataFileRef` into one
+union snapshot) — an amortised-O(total-files-in-table) cost per flush. That
+union return value is then DISCARDED by the only production caller
+(`Shard::commit_with_retry`), which commits per partition and reads back through
+`load_table`/`load_unioned` only when a query needs the complete set. So the
+dominant residual slope was rebuilding a whole-table metadata object on every
+single ingest commit, purely to throw it away.
+
+Fix — `commit_part_snapshot` now returns the cheap META manifest metadata
+(`manifest.to_metadata`, its own live set only, never the per-partition union)
+instead of calling `load_unioned`. The per-commit object-store work is now flat
+in table size. Correctness is unchanged: readers still see the complete unioned
+live set through the read path; the per-partition fold stays O(K)-bounded; OCC,
+multi-writer non-contention, split-brain and union-correctness are untouched
+(those tests verify via `load_table`, not via the commit return value). Guarded
+by a new regression test (`part_commit_store_reads_independent_of_file_count`)
+that asserts a commit issues the SAME number of store GET/LIST RPCs at 40 files
+and 400 files.
+
+Honest scope: this removes the dominant whole-table O(files) term per commit.
+The remaining per-partition baseline write (segment compaction every K commits)
+still serialises that partition's live set, an amortised-O(files-in-partition/K)
+cost — far smaller (one partition, not the cross-table union) and bounded by K,
+but not perfectly flat. TRUE flatness at unbounded scale still wants a
+data-rewrite compaction tier that bounds the per-partition data-file COUNT
+(merging many small flushed files into fewer larger ones); that is the deeper
+follow-up (#27) and is out of scope for this no-deploy catalog/metadata pass.
+
 ## 2026-06-21 — Fix S3/Tigris connection-pool exhaustion under sustained writes (tight retry budget)
 
 Under sustained high-throughput ingest, compaction flush PUTs to Tigris began

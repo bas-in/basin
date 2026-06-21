@@ -1260,8 +1260,22 @@ impl ObjectStoreCatalog {
             };
             self.after_part_commit(project, qtable, partition_id, new_version, next_live)
                 .await;
-            // Return the unioned table metadata so callers see the complete set.
-            self.load_unioned(project, qtable, &manifest).await
+            // FLAT-SCALE: do NOT build the unioned table metadata here. The
+            // sustained-ingest hot path (`Shard::commit_with_retry`) discards
+            // this return value entirely — it commits per partition and reads
+            // back through `load_table`/`load_unioned` only when a query needs
+            // the complete set. Calling `load_unioned` on every commit would
+            // re-materialise EVERY live data file across EVERY partition
+            // (O(total-files-in-table)) on each flush, an amortised-O(files)
+            // cost that grows with table size — the dominant residual
+            // ingest-rate slope at scale. Returning the cheap META manifest
+            // metadata (its own live set only, never the per-partition union)
+            // keeps the commit O(1) in table size. Readers still see the
+            // complete unioned set via the read path; the meta-cache test
+            // (`load_table_meta_cached_for_ingest`) explicitly requires that a
+            // META load must NOT union per-partition files, so this is the
+            // intended contract for the cheap commit return.
+            Ok(manifest.to_metadata(project, &qtable.name))
         } else {
             self.invalidate_part(project, qtable, partition_id).await;
             Err(BasinError::CommitConflict(format!(
@@ -4328,6 +4342,164 @@ mod tests {
             }
         }
         assert!(saw_baseline, "segment compaction wrote at least one baseline");
+    }
+
+    // --- Test 2c-flat-4: per-commit store-GET count is BOUNDED in file count --
+    //
+    // The regression guard for the RESIDUAL ingest-rate decline at scale. A
+    // sustained-ingest commit (`append_data_files_in_partition`) must do an
+    // amount of object-store work that is INDEPENDENT of how many files the
+    // table already holds. Before the fix, every partition commit called
+    // `load_unioned`, which `load_part_current`-folds EVERY partition and
+    // re-materialises EVERY live data file across the whole table — an
+    // amortised-O(total-files) cost per flush that shows up as a gentle
+    // throughput slope as the table grows. After the fix the commit returns the
+    // cheap META metadata and never unions, so the GET/LIST count per commit is
+    // flat in N.
+    //
+    // We count store reads (GET via `get_opts` non-head, plus `list`) issued by
+    // ONE commit when the table holds N files vs 2N files; the counts must be
+    // equal (no growth term in N). Caches are warm (the same catalog instance
+    // seeded the files), mirroring the steady-state ingest hot path.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: Arc<dyn ObjectStore>,
+        gets: std::sync::atomic::AtomicUsize,
+        lists: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore")
+        }
+    }
+
+    impl CountingStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                gets: std::sync::atomic::AtomicUsize::new(0),
+                lists: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn reset(&self) {
+            self.gets.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.lists.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn reads(&self) -> usize {
+            self.gets.load(std::sync::atomic::Ordering::Relaxed)
+                + self.lists.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &OsPath,
+            payload: object_store::PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &OsPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &OsPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if !options.head {
+                self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<OsPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<OsPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &OsPath,
+            to: &OsPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Drive `seed` single-file commits across a few partitions, then measure the
+    /// store reads issued by ONE more commit. Returns that per-commit read count.
+    async fn per_commit_reads_after_seeding(seed: usize) -> usize {
+        // Big K so seeding stays in deltas and a periodic baseline write (itself
+        // O(files-in-partition)) doesn't land on the MEASURED commit and muddy
+        // the N-independence signal — the baseline path is a separate concern.
+        let counting = CountingStore::new(Arc::new(InMemory::new()));
+        let c = ObjectStoreCatalog::with_part_compact_every(counting.clone(), 1_000_000);
+        let p = ProjectId::new();
+        let t = TableName::new("scale").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Spread the seed over 4 partitions so the union (if it ran) would touch
+        // multiple partition chains — i.e. a real O(total-files) shape.
+        const PARTS: usize = 4;
+        for i in 0..seed {
+            let pid = (i % PARTS).to_string();
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, &pid)
+                .await
+                .unwrap();
+            c.append_data_files_in_partition(&p, &t, &pid, exp, vec![file(&format!("s{i}.parquet"), 1)])
+                .await
+                .unwrap();
+        }
+
+        // Measure exactly one steady-state commit (caches warm from seeding).
+        let pid = "0";
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &t, pid)
+            .await
+            .unwrap();
+        counting.reset();
+        c.append_data_files_in_partition(&p, &t, pid, exp, vec![file("measured.parquet", 1)])
+            .await
+            .unwrap();
+        counting.reads()
+    }
+
+    #[tokio::test]
+    async fn part_commit_store_reads_independent_of_file_count() {
+        let small = per_commit_reads_after_seeding(40).await;
+        let large = per_commit_reads_after_seeding(400).await; // 10x the files
+        assert_eq!(
+            small, large,
+            "per-commit object-store reads must NOT grow with table file count \
+             (40-file table: {small} reads, 400-file table: {large} reads) — \
+             a growth term here is the residual ingest-rate slope at scale"
+        );
     }
 
     // --- Test 2e: non-partitioned replace resolves the owning chain --------
