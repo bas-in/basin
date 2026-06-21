@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use object_store::aws::AmazonS3Builder;
-use object_store::{ClientOptions, ObjectStore};
+use object_store::{BackoffConfig, ClientOptions, ObjectStore, RetryConfig};
 
 /// Default HTTP connection-pool ceiling per host for the S3 client. Overridable
 /// with `BASIN_S3_POOL_MAX_IDLE` (positive `usize`); unset / unparseable / zero
@@ -50,6 +50,79 @@ fn resolve_pool_max_idle() -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_S3_POOL_MAX_IDLE)
+}
+
+/// Default max object_store-level retries per request. Deliberately TIGHT
+/// (object_store's own default is 10). The shard's flush path already retries
+/// the *whole* flush at the tick level
+/// (`basin-shard/in_process.rs`: "backpressure tail flush failed; tail stays
+/// resident, next write/tick retries"), so the object_store layer does not need
+/// a 10×/180s budget. A hung/slow PUT under sustained concurrent flushes holds a
+/// pooled HTTP connection for the entire retry budget; with the upstream default
+/// (10 retries, 180s timeout) a handful of stuck PUTs exhaust the connection
+/// pool and every new PUT then fails with "error sending request" — the wedge.
+/// Failing fast here frees the connection back to the pool so the pool can never
+/// be permanently exhausted by a transient Tigris hiccup; the shard re-drains the
+/// tail on the next tick once Tigris recovers. Overridable with
+/// `BASIN_S3_MAX_RETRIES` (any `usize`, including 0 to disable retries).
+const DEFAULT_S3_MAX_RETRIES: usize = 3;
+
+/// Default object_store retry-timeout budget (seconds): the maximum wall-clock
+/// from the initial request after which no further retries are attempted.
+/// TIGHT (object_store's own default is 180s) for the same reason as
+/// [`DEFAULT_S3_MAX_RETRIES`]: a stuck PUT must surface in ~tens of seconds and
+/// release its connection, not hold it for three minutes. Overridable with
+/// `BASIN_S3_RETRY_TIMEOUT_SECS` (positive integer seconds).
+const DEFAULT_S3_RETRY_TIMEOUT_SECS: u64 = 30;
+
+/// Default whole-request timeout (seconds) for a single S3 attempt. A multi-MiB
+/// Vortex flush PUT completes in seconds intra-Fly; 30s is a generous per-attempt
+/// ceiling that, combined with the retry budget above, bounds the total time a
+/// connection can be tied up by a stuck request. Overridable with
+/// `BASIN_S3_REQUEST_TIMEOUT_SECS` (positive integer seconds).
+const DEFAULT_S3_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Resolve the object_store-level retry budget from the environment, falling
+/// back to the tight Basin defaults ([`DEFAULT_S3_MAX_RETRIES`] /
+/// [`DEFAULT_S3_RETRY_TIMEOUT_SECS`]) — NOT object_store's loose 10×/180s.
+///
+/// `BASIN_S3_MAX_RETRIES` accepts any `usize` (0 disables retries entirely);
+/// only an unset/unparseable value falls back to the default. The retry-timeout
+/// must be positive — zero or garbage falls back.
+fn resolve_retry_config() -> RetryConfig {
+    let max_retries = std::env::var("BASIN_S3_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_S3_MAX_RETRIES);
+
+    let retry_timeout_secs = std::env::var("BASIN_S3_RETRY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_S3_RETRY_TIMEOUT_SECS);
+
+    RetryConfig {
+        // Keep the upstream decorrelated-jitter backoff shape but cap the per-hop
+        // wait so the whole tight budget isn't spent in one long sleep.
+        backoff: BackoffConfig {
+            init_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(5),
+            base: 2.0,
+        },
+        max_retries,
+        retry_timeout: Duration::from_secs(retry_timeout_secs),
+    }
+}
+
+/// Resolve the per-attempt whole-request timeout from
+/// `BASIN_S3_REQUEST_TIMEOUT_SECS`, falling back to
+/// [`DEFAULT_S3_REQUEST_TIMEOUT_SECS`]. Must be positive.
+fn resolve_request_timeout_secs() -> u64 {
+    std::env::var("BASIN_S3_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_S3_REQUEST_TIMEOUT_SECS)
 }
 
 /// Provider flavour. The values share the same builder and the same
@@ -209,9 +282,12 @@ impl S3LikeConfig {
             // Keep idle conns warm long enough to be reused across the bursts
             // of a point-query workload, but not so long they leak fds.
             .with_pool_idle_timeout(Duration::from_secs(90))
-            // Whole-request and connect ceilings: a stuck S3 GET should error
-            // out and let the caller retry/prune rather than wedge the worker.
-            .with_timeout(Duration::from_secs(60))
+            // Whole-request and connect ceilings: a stuck S3 GET/PUT should error
+            // out and recycle its pooled connection rather than wedge the worker
+            // (or, under sustained flushes, exhaust the pool). Env-tunable; the
+            // default is tight enough that a stuck request can't tie a connection
+            // up for long.
+            .with_timeout(Duration::from_secs(resolve_request_timeout_secs()))
             .with_connect_timeout(Duration::from_secs(10));
 
         let mut b = AmazonS3Builder::new()
@@ -219,6 +295,16 @@ impl S3LikeConfig {
             .with_region(&self.region)
             .with_access_key_id(&self.access_key_id)
             .with_secret_access_key(&self.secret_access_key)
+            // TIGHT retry budget (NOT object_store's default 10×/180s). A
+            // hung/slow PUT under sustained concurrent compaction flushes holds
+            // its pooled HTTP connection for the whole retry budget; the loose
+            // upstream default lets a few stuck PUTs exhaust the pool, after
+            // which every new PUT fails with "error sending request" and ingest
+            // wedges until restart. Failing fast here recycles the connection;
+            // the shard's tick-level flush retry re-drains the tail once Tigris
+            // recovers, so durability is preserved. Env-tunable via
+            // BASIN_S3_MAX_RETRIES / BASIN_S3_RETRY_TIMEOUT_SECS.
+            .with_retry(resolve_retry_config())
             // Conditional put (If-None-Match: *) is load-bearing for the
             // Basin-native object-store catalog's create-if-absent CAS core
             // (`basin_catalog::ObjectStoreCatalog`): it is what makes
@@ -342,6 +428,9 @@ mod tests {
         "AWS_ENDPOINT_URL_S3",
         "BUCKET_NAME",
         "BASIN_S3_POOL_MAX_IDLE",
+        "BASIN_S3_MAX_RETRIES",
+        "BASIN_S3_RETRY_TIMEOUT_SECS",
+        "BASIN_S3_REQUEST_TIMEOUT_SECS",
     ];
 
     fn clean_env_with(overrides: &[(&'static str, &str)]) -> EnvGuard {
@@ -382,6 +471,84 @@ mod tests {
         // Unparseable → default.
         let _g2 = clean_env_with(&[("BASIN_S3_POOL_MAX_IDLE", "not-a-number")]);
         assert_eq!(resolve_pool_max_idle(), DEFAULT_S3_POOL_MAX_IDLE);
+    }
+
+    #[test]
+    fn retry_config_defaults_are_tight_not_upstream() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = clean_env_with(&[]); // clears BASIN_S3_MAX_RETRIES / *_TIMEOUT_SECS
+        let rc = resolve_retry_config();
+        // The whole point of the fix: NOT object_store's loose 10×/180s default.
+        assert_eq!(rc.max_retries, DEFAULT_S3_MAX_RETRIES);
+        assert_eq!(rc.max_retries, 3);
+        assert_ne!(rc.max_retries, 10, "must not inherit object_store default");
+        assert_eq!(
+            rc.retry_timeout,
+            Duration::from_secs(DEFAULT_S3_RETRY_TIMEOUT_SECS)
+        );
+        assert_eq!(rc.retry_timeout, Duration::from_secs(30));
+        assert_ne!(
+            rc.retry_timeout,
+            Duration::from_secs(180),
+            "must not inherit object_store default"
+        );
+        // Backoff is capped tight so the budget isn't burned in one long sleep.
+        assert_eq!(rc.backoff.max_backoff, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn retry_config_honours_env_overrides() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = clean_env_with(&[
+            ("BASIN_S3_MAX_RETRIES", "5"),
+            ("BASIN_S3_RETRY_TIMEOUT_SECS", "45"),
+        ]);
+        let rc = resolve_retry_config();
+        assert_eq!(rc.max_retries, 5);
+        assert_eq!(rc.retry_timeout, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn retry_config_allows_zero_retries_but_rejects_garbage() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // 0 retries is a legitimate "fail on first error" choice.
+        let _g = clean_env_with(&[("BASIN_S3_MAX_RETRIES", "0")]);
+        assert_eq!(resolve_retry_config().max_retries, 0);
+        drop(_g);
+        // Garbage retries → tight default.
+        let _g2 = clean_env_with(&[("BASIN_S3_MAX_RETRIES", "lots")]);
+        assert_eq!(resolve_retry_config().max_retries, DEFAULT_S3_MAX_RETRIES);
+        drop(_g2);
+        // Zero / garbage retry-timeout is meaningless → tight default.
+        let _g3 = clean_env_with(&[("BASIN_S3_RETRY_TIMEOUT_SECS", "0")]);
+        assert_eq!(
+            resolve_retry_config().retry_timeout,
+            Duration::from_secs(DEFAULT_S3_RETRY_TIMEOUT_SECS)
+        );
+        drop(_g3);
+        let _g4 = clean_env_with(&[("BASIN_S3_RETRY_TIMEOUT_SECS", "soon")]);
+        assert_eq!(
+            resolve_retry_config().retry_timeout,
+            Duration::from_secs(DEFAULT_S3_RETRY_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn request_timeout_defaults_and_overrides() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = clean_env_with(&[]);
+        assert_eq!(resolve_request_timeout_secs(), DEFAULT_S3_REQUEST_TIMEOUT_SECS);
+        assert_eq!(resolve_request_timeout_secs(), 30);
+        drop(_g);
+        let _g2 = clean_env_with(&[("BASIN_S3_REQUEST_TIMEOUT_SECS", "20")]);
+        assert_eq!(resolve_request_timeout_secs(), 20);
+        drop(_g2);
+        // Zero / garbage → default.
+        let _g3 = clean_env_with(&[("BASIN_S3_REQUEST_TIMEOUT_SECS", "0")]);
+        assert_eq!(resolve_request_timeout_secs(), DEFAULT_S3_REQUEST_TIMEOUT_SECS);
+        drop(_g3);
+        let _g4 = clean_env_with(&[("BASIN_S3_REQUEST_TIMEOUT_SECS", "nope")]);
+        assert_eq!(resolve_request_timeout_secs(), DEFAULT_S3_REQUEST_TIMEOUT_SECS);
     }
 
     #[test]

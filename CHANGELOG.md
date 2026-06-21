@@ -8,6 +8,47 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-21 — Fix S3/Tigris connection-pool exhaustion under sustained writes (tight retry budget)
+
+Under sustained high-throughput ingest, compaction flush PUTs to Tigris began
+failing with `Generic S3 error: Error performing PUT ... in 219s/309s/332s,
+after 1 retries ... HTTP error: error sending request` — the client could no
+longer even *send* the request, i.e. the HTTP connection pool was stuck. Once it
+started, the compaction tail couldn't drain → backpressure → ingest wedged. A
+full engine restart cleared it (fresh pool → all pending PUTs succeeded
+immediately), proving a client-side connection-pool/retry wedge, NOT a Tigris
+capacity problem (logical write volume was only ~5 MB/s) and NOT data loss (the
+tail is held in the WAL and replays cleanly).
+
+Root cause: the S3 builder set `ClientOptions` but no `RetryConfig`, so
+object_store's loose default applied — `max_retries=10`, `retry_timeout=180s`. A
+hung/slow PUT therefore held a pooled connection for up to ~180s across retries;
+under sustained concurrent flushes (`flush_concurrency × partitions × 2 nodes`)
+a handful of stuck PUTs exhausted the pool, after which every new PUT failed with
+"error sending request" and cascaded into the wedge.
+
+Fix — apply a TIGHT, env-tunable `RetryConfig` on the `AmazonS3Builder`
+(`crates/basin-storage/src/backends/s3_compatible.rs`):
+
+- `max_retries=3` (`BASIN_S3_MAX_RETRIES`), `retry_timeout=30s`
+  (`BASIN_S3_RETRY_TIMEOUT_SECS`), backoff capped at 5s. A stuck PUT now surfaces
+  in ~tens of seconds and recycles its connection instead of tying it up for
+  three minutes, so a transient Tigris hiccup can no longer permanently exhaust
+  the pool. Durability is preserved by the shard's tick-level flush retry
+  (`basin-shard/in_process.rs`: "backpressure tail flush failed; tail stays
+  resident, next write/tick retries") — the whole flush is re-driven once Tigris
+  recovers; the object_store layer doesn't need its own 10×/180s budget.
+- Per-attempt whole-request `timeout` lowered 60s → 30s
+  (`BASIN_S3_REQUEST_TIMEOUT_SECS`); `connect_timeout` unchanged at 10s. A
+  multi-MiB Vortex flush PUT completes in seconds intra-Fly.
+- `pool_max_idle_per_host` default (64, `BASIN_S3_POOL_MAX_IDLE`) is generous
+  enough for legitimate concurrent flushes and is left unchanged.
+
+No inflight-PUT semaphore was added — the shared `Arc<dyn ObjectStore>` is used
+across the catalog/hottier/shard write paths, so a global PUT gate would be
+invasive and risk deadlocking against the catalog CAS commit path; the
+fast-fail/recycle behaviour above resolves the wedge on its own.
+
 ## 2026-06-20 — Flat-scale ingest: O(1)-amortized per-partition catalog commits (delta segments + periodic snapshot)
 
 On a live 2-node dev test, multi-node ingest throughput decayed ~48k→31k r/s
