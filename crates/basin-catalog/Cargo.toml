@@ -33,6 +33,12 @@ sqlparser.workspace = true
 # Bitflags for `ReactorOps`. Already in the lock file via several
 # transitive deps.
 bitflags = "2"
+# Persistent (structural-sharing) map for the per-partition folded live set.
+# Lets a commit derive a new version in O(delta·log n) instead of cloning the
+# whole file list each time, so per-commit catalog cost stays flat even when
+# the file-merge lags. The `Sync` alias is Arc-backed (Send+Sync) — required
+# because the folded view lives behind Arc<PartitionLive> in the part cache.
+rpds = "1"
 # HTTP client for POSTing metering batches to the cloud ingest endpoint (T-053).
 reqwest.workspace = true
 # Object-store-backed shared catalog + lease registry (Basin-native, no external

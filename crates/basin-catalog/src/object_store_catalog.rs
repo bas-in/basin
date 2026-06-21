@@ -304,7 +304,12 @@ struct PartitionLive {
     #[allow(dead_code)]
     version: u64,
     current_snapshot: SnapshotId,
-    live: Vec<DataFileRef>,
+    /// The folded live set, keyed by file path, as a PERSISTENT map so a
+    /// commit derives the next version by `insert`/`remove` on the delta only
+    /// (O(delta·log n) with structural sharing) instead of cloning the whole
+    /// Vec each commit. In-memory only — never serialized (the on-disk format
+    /// is `PartSegmentObject.baseline: Vec<DataFileRef>`, unchanged).
+    live: rpds::HashTrieMapSync<String, DataFileRef>,
     /// Latest commit time across the folded chain (used to stamp unioned reads).
     latest_committed_at: DateTime<Utc>,
     /// Number of delta objects applied on top of the latest baseline (i.e. the
@@ -317,14 +322,17 @@ impl PartitionLive {
         Self {
             version: 0,
             current_snapshot: SnapshotId::GENESIS,
-            live: Vec::new(),
+            live: rpds::HashTrieMapSync::new_sync(),
             latest_committed_at: Utc::now(),
             deltas_since_baseline: 0,
         }
     }
 
     fn live_data_files(&self) -> Vec<DataFileRef> {
-        self.live.clone()
+        // Materialize the persistent map's values for callers that want a Vec.
+        // Order is unspecified (set semantics) — same contract as before, when
+        // this was a Vec collected from a HashMap.
+        self.live.values().cloned().collect()
     }
 }
 
@@ -972,7 +980,6 @@ impl ObjectStoreCatalog {
         partition_id: &str,
         head_version: u64,
     ) -> Result<PartitionLive> {
-        use std::collections::HashMap;
         // Collect delta objects from HEAD back to (and including) the baseline.
         let head = self
             .get_part_segment(project, qtable, partition_id, head_version)
@@ -983,14 +990,15 @@ impl ObjectStoreCatalog {
         let latest_committed_at = head.delta.committed_at;
         let mut deltas: Vec<Snapshot> = Vec::new();
         let mut deltas_since_baseline: u64 = 0;
-        let mut live: HashMap<String, DataFileRef> = HashMap::new();
+        let mut live: rpds::HashTrieMapSync<String, DataFileRef> =
+            rpds::HashTrieMapSync::new_sync();
 
         let mut cur = head;
         loop {
             if let Some(files) = cur.baseline.take() {
                 // Reached a baseline (or genesis): it carries the full live set.
                 for f in files {
-                    live.insert(f.path.clone(), f);
+                    live.insert_mut(f.path.clone(), f);
                 }
                 break;
             }
@@ -1012,17 +1020,17 @@ impl ObjectStoreCatalog {
         // newest-first while walking back, so iterate in reverse).
         for snap in deltas.into_iter().rev() {
             for p in &snap.removed_paths {
-                live.remove(p);
+                live.remove_mut(p);
             }
             for f in &snap.data_files {
-                live.insert(f.path.clone(), f.clone());
+                live.insert_mut(f.path.clone(), f.clone());
             }
         }
 
         Ok(PartitionLive {
             version: head_version,
             current_snapshot,
-            live: live.into_values().collect(),
+            live,
             latest_committed_at,
             deltas_since_baseline,
         })
@@ -1195,21 +1203,19 @@ impl ObjectStoreCatalog {
         };
 
         // Compute the new folded live set incrementally from the prior folded
-        // view + this delta — O(delta), no re-read of the chain.
-        let new_live = {
-            use std::collections::HashMap;
-            let mut live: HashMap<String, DataFileRef> = segment
-                .live
-                .iter()
-                .map(|f| (f.path.clone(), f.clone()))
-                .collect();
+        // view + this delta — O(delta), no re-read of the chain AND no O(files)
+        // clone of the prior set: cloning the persistent map is O(1) structural
+        // sharing, and each removed/added path is an O(log n) update. This keeps
+        // per-commit cost independent of the partition's existing file count.
+        let new_live: rpds::HashTrieMapSync<String, DataFileRef> = {
+            let mut live = segment.live.clone();
             for p in &removed_paths {
-                live.remove(p);
+                live.remove_mut(p);
             }
             for f in &added_files {
-                live.insert(f.path.clone(), f.clone());
+                live.insert_mut(f.path.clone(), f.clone());
             }
-            live.into_values().collect::<Vec<_>>()
+            live
         };
 
         // SEGMENT COMPACTION: fold into a fresh BASELINE every K commits so the
@@ -1230,7 +1236,10 @@ impl ObjectStoreCatalog {
                 current_snapshot: new_id,
                 delta: snap,
                 base_version: None,
-                baseline: Some(new_live.clone()),
+                // On-disk baseline is a Vec<DataFileRef> (format unchanged);
+                // materialize the persistent map's values. O(n) only every K
+                // commits, which is the baseline cadence by design.
+                baseline: Some(new_live.values().cloned().collect()),
             }
         } else {
             PartSegmentObject {
@@ -1391,7 +1400,9 @@ impl ObjectStoreCatalog {
             let fresh_live = PartitionLive {
                 version: obj.version,
                 current_snapshot: SnapshotId(1),
-                live: live.clone(),
+                // `live` here is the Vec from live_data_files(); fold it into
+                // the persistent map for the in-memory cached view.
+                live: live.iter().map(|f| (f.path.clone(), f.clone())).collect(),
                 latest_committed_at: obj.delta.committed_at,
                 deltas_since_baseline: 0,
             };
@@ -4358,7 +4369,7 @@ mod tests {
         let head_v = c.resolve_part_head_version(&p, &qt, "p0").await.unwrap().unwrap();
         let fresh = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
         let folded = fresh.fold_part_chain(&p, &qt, "p0", head_v).await.unwrap();
-        assert_eq!(folded.live.len(), N, "compacted fold is still exactly correct");
+        assert_eq!(folded.live.size(), N, "compacted fold is still exactly correct");
         assert!(
             folded.deltas_since_baseline < K,
             "fold depth {} must stay < K={K} (bounded read cost)",
