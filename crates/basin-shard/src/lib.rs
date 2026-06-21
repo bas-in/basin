@@ -286,6 +286,12 @@ pub struct ShardStats {
     /// `(project, table)` whose overlapping cold files were merged into
     /// fewer files with disjoint PK ranges and committed).
     pub stripe_merges: u64,
+    /// Count of completed file-count-bounding merge passes (one per
+    /// `(project, partition)` whose accumulated small cold files were merged
+    /// into fewer larger files to keep the per-partition data-file count — and
+    /// therefore every O(files) cost, notably the segment baseline fold —
+    /// bounded under sustained ingest).
+    pub file_merges: u64,
 }
 
 /// Ingest-pressure snapshot for the cloud autoscaler's `/metrics/inflight`
@@ -409,6 +415,18 @@ impl Shard {
     /// same steady-state file layout deterministically.
     pub async fn run_stripe_merge_once(&self) -> Result<()> {
         self.inner.run_stripe_merge_once().await
+    }
+
+    /// Run one file-count-bounding merge sweep synchronously: per `(project,
+    /// partition)` over the configured ceiling
+    /// (`BASIN_COMPACT_MAX_FILES_PER_PARTITION`), merge the smallest bounded
+    /// batch of cold files into fewer larger ones so the per-partition file
+    /// count — and every O(files) cost, notably the segment baseline fold —
+    /// stays bounded. The background tick runs this on the stripe-merge
+    /// cadence; tests/benchmarks call it directly to reach the steady state
+    /// deterministically.
+    pub async fn run_file_merge_once(&self) -> Result<()> {
+        self.inner.run_file_merge_once().await
     }
 
     /// Run one pass of the tiered-storage sweep. For every `(project, table)`
@@ -823,6 +841,12 @@ pub(crate) trait ShardImpl: Send + Sync {
     /// One synchronous stripe-merge sweep (see `Shard::run_stripe_merge_once`).
     /// Default: no-op for backends without per-file cold data.
     async fn run_stripe_merge_once(&self) -> Result<()> {
+        Ok(())
+    }
+    /// One synchronous file-count-bounding merge sweep (see
+    /// `Shard::run_file_merge_once`). Default: no-op for backends without
+    /// per-file cold data.
+    async fn run_file_merge_once(&self) -> Result<()> {
         Ok(())
     }
     /// ADR 0027 Phase 4 — rewrite all cold-tier data files that are missing

@@ -663,6 +663,52 @@ pub trait Catalog: Send + Sync {
             .await
     }
 
+    /// Enumerate the partition ids that currently hold at least one live data
+    /// file for `table`, for **file-count-bounding merge compaction**. The
+    /// background merge sweep walks these ids and, per partition, merges the
+    /// smallest files when the count exceeds a threshold — so any per-partition
+    /// O(files) cost (notably the segment baseline fold) stays bounded.
+    ///
+    /// Default implementation reports a single synthetic partition
+    /// (`PartitionKey::default_key()`) for single-chain backends
+    /// (`InMemoryCatalog` / `PostgresCatalog`): they keep one chain per table,
+    /// so the whole table *is* one partition for merge purposes.
+    /// `ObjectStoreCatalog` overrides this to enumerate its real per-partition
+    /// segments. Returns an empty vec for a table with no live files.
+    async fn list_merge_partitions(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<Vec<String>> {
+        let meta = self.load_table(project, table).await?;
+        if meta.live_data_files().is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![basin_common::PartitionKey::default_key().to_string()])
+        }
+    }
+
+    /// The live data files of one **partition** plus that partition's OCC token
+    /// (the snapshot id to pass to
+    /// [`replace_data_files_in_partition`](Catalog::replace_data_files_in_partition)).
+    /// Used by the merge sweep to read a single partition's file set and commit
+    /// the merge against the correct per-partition chain atomically.
+    ///
+    /// Default implementation returns the full table live set + table snapshot
+    /// id (single-chain backends): the table is one partition, so the table
+    /// token is the partition token and a table-level
+    /// [`replace_data_files`](Catalog::replace_data_files) commits it.
+    async fn live_data_files_in_partition(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        partition_id: &str,
+    ) -> Result<(SnapshotId, Vec<DataFileRef>)> {
+        let _ = partition_id;
+        let meta = self.load_table(project, table).await?;
+        Ok((meta.current_snapshot, meta.live_data_files()))
+    }
+
     /// Snapshots in commit order (oldest first). Used by point-in-time-restore
     /// and the analytical reader.
     async fn list_snapshots(&self, project: &ProjectId, table: &TableName)

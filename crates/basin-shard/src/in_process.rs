@@ -44,6 +44,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use basin_catalog::DataFileRef;
+use basin_catalog::SnapshotId;
 use basin_common::{BasinError, PartitionKey, ProjectId, Result, TableName};
 use basin_storage::ReadOptions;
 use basin_wal::Lsn;
@@ -1018,6 +1019,12 @@ impl InProcessShard {
     #[allow(dead_code)]
     pub(crate) async fn run_stripe_merge_once(&self) -> Result<()> {
         self.stripe_merge_sweep().await
+    }
+
+    /// Test-only: drive one file-count-bounding merge sweep synchronously.
+    #[allow(dead_code)]
+    pub(crate) async fn run_file_merge_once(&self) -> Result<()> {
+        self.file_merge_sweep().await
     }
 
     /// Walk every resident project's tables and migrate any data file whose
@@ -2838,6 +2845,555 @@ impl InProcessShard {
         );
         Ok(true)
     }
+
+    /// File-count-bounding merge compaction — one sweep tick.
+    ///
+    /// Sustained single-node ingest appends ~one cold data file per flush to a
+    /// partition's segment chain; nothing in the stripe-merge path coalesces
+    /// files whose PK ranges are already disjoint (the monotonic-PK append
+    /// case) or that have no single-column PK at all, so the per-partition file
+    /// count grows without bound. Every O(files) operation then slowly grows —
+    /// most importantly the periodic per-partition segment BASELINE write,
+    /// which serialises the partition's FULL live set every K commits. That is
+    /// the residual gentle ingest-rate decline at scale.
+    ///
+    /// This sweep keeps the count bounded: per `(project, partition)`, when the
+    /// live cold-file count exceeds `BASIN_COMPACT_MAX_FILES_PER_PARTITION`
+    /// (default 64), it merges the SMALLEST `BASIN_COMPACT_MERGE_BATCH`
+    /// (default 16) files into fewer, larger files (each capped at the
+    /// write-stripe target size) and commits the swap atomically via
+    /// `replace_data_files_in_partition`. Bounded work per tick walks a hot
+    /// partition down over several ticks rather than stalling ingest.
+    ///
+    /// Same process-wide serialisation as the stripe-merge (shares
+    /// `stripe_merge_lock`), so at most one merge pass — stripe or file-count —
+    /// runs at a time, bounding the resources a merge can pin.
+    async fn file_merge_sweep(&self) -> Result<()> {
+        let _merge_guard = self.stripe_merge_lock.lock().await;
+
+        let projects: Vec<ProjectId> = {
+            let map = self.partitions.lock().await;
+            let mut seen: HashSet<ProjectId> = HashSet::new();
+            for (t, _) in map.keys() {
+                seen.insert(*t);
+            }
+            seen.into_iter().collect()
+        };
+
+        for project in projects {
+            let tables = match self.cfg.catalog.list_tables(&project).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(%project, error = %e, "file-merge: list_tables failed; skipping project");
+                    continue;
+                }
+            };
+            for table in tables {
+                let partitions = match self
+                    .cfg
+                    .catalog
+                    .list_merge_partitions(&project, &table)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(%project, %table, error = %e, "file-merge: list_merge_partitions failed; skipping table");
+                        continue;
+                    }
+                };
+                for pid in partitions {
+                    if let Err(e) = self.file_merge_partition(&project, &table, &pid).await {
+                        warn!(
+                            %project,
+                            %table,
+                            partition = %pid,
+                            error = %e,
+                            "file-merge failed for partition; will retry next tick",
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Merge the smallest bounded batch of one partition's cold files into
+    /// fewer, larger files when the live count is over the ceiling. Returns
+    /// `Ok(true)` when a merge committed, `Ok(false)` for a no-op (under the
+    /// ceiling, abandoned on a commit race, or nothing decodable to merge).
+    ///
+    /// Correctness: the output carries EXACTLY the union of the selected
+    /// inputs' rows (a row-preserving concat — no sort, no dedup, so it is safe
+    /// for any schema / clustering / PK shape, unlike stripe-merge). The
+    /// catalog `replace_data_files_in_partition` atomically removes the N input
+    /// paths and adds the outputs under per-partition OCC, so a concurrent
+    /// reader sees either the pre- or post-merge file set, never a torn or
+    /// double-counted set. A `count(*)` is therefore identical across the
+    /// merge. Single-writer-per-partition means the only concurrent committer
+    /// is a tail-flush APPEND (which leaves our inputs live → we retry at the
+    /// new snapshot) — no cross-writer merge race.
+    async fn file_merge_partition(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        partition_id: &str,
+    ) -> Result<bool> {
+        let max_files = env_u64(
+            "BASIN_COMPACT_MAX_FILES_PER_PARTITION",
+            COMPACT_MAX_FILES_PER_PARTITION_DEFAULT,
+        )
+        .max(2) as usize;
+        let batch_cap = env_u64("BASIN_COMPACT_MERGE_BATCH", COMPACT_MERGE_BATCH_DEFAULT).max(2)
+            as usize;
+        let max_bytes = env_u64(
+            "BASIN_COMPACT_MERGE_MAX_BYTES",
+            COMPACT_MERGE_MAX_BYTES_DEFAULT,
+        );
+
+        let (snapshot, live) = match self
+            .cfg
+            .catalog
+            .live_data_files_in_partition(project, table, partition_id)
+            .await
+        {
+            Ok(v) => v,
+            Err(BasinError::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if live.len() <= max_files {
+            return Ok(false); // Under the ceiling — nothing to do.
+        }
+
+        let meta = match self.cfg.catalog.load_table(project, table).await {
+            Ok(m) => m,
+            Err(BasinError::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+
+        // Pick the SMALLEST files first (coalesce the cheap tiny flush files),
+        // bounded to `batch_cap` inputs AND `max_bytes` total encoded bytes so
+        // a single tick's work — and its peak memory — stays bounded.
+        let mut by_size = live.clone();
+        by_size.sort_by_key(|f| f.size_bytes);
+        let mut inputs: Vec<DataFileRef> = Vec::new();
+        let mut input_bytes: u64 = 0;
+        for f in by_size {
+            if inputs.len() >= batch_cap {
+                break;
+            }
+            // Always admit the first file even if it alone exceeds the byte cap
+            // (otherwise a partition of large files could never shrink); stop
+            // before exceeding the cap once we already hold >= 2.
+            if inputs.len() >= 2 && input_bytes.saturating_add(f.size_bytes) > max_bytes {
+                break;
+            }
+            input_bytes = input_bytes.saturating_add(f.size_bytes);
+            inputs.push(f);
+        }
+        if inputs.len() < 2 {
+            return Ok(false); // Need at least 2 to reduce the count.
+        }
+
+        // ── Read every selected input (same read machinery the stripe-merge
+        // uses), normalising promoted-JSONB shadow columns so historic files
+        // concat cleanly with post-promotion ones.
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut schema: Option<arrow_schema::SchemaRef> = None;
+        for f in &inputs {
+            let path = object_store::path::Path::from(f.path.clone());
+            let stream = match self.cfg.storage.read_file(project, &path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // A concurrent CoW may have removed the file between the
+                    // snapshot read and this read; retry next tick.
+                    debug!(
+                        %project,
+                        %table,
+                        partition = %partition_id,
+                        path = %f.path,
+                        error = %e,
+                        "file-merge: input read failed (concurrent rewrite?); abandoning pass",
+                    );
+                    return Ok(false);
+                }
+            };
+            let file_batches: Vec<RecordBatch> = stream
+                .collect::<Vec<Result<RecordBatch>>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            for b in file_batches {
+                if b.num_rows() == 0 {
+                    continue;
+                }
+                let b = backfill_promoted_columns(b, &meta.promoted_jsonb_paths)?;
+                match &schema {
+                    None => schema = Some(b.schema()),
+                    Some(s) if *s != b.schema() => {
+                        // Schema drift across files (mid-ALTER) — bail
+                        // conservatively rather than concat incompatible
+                        // batches.
+                        debug!(
+                            %project,
+                            %table,
+                            partition = %partition_id,
+                            "file-merge: input files disagree on schema; skipping partition",
+                        );
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+                batches.push(b);
+            }
+        }
+        let Some(schema) = schema else {
+            // Every selected input was zero-row: the swap still drops them,
+            // collapsing N empty files to none (count(*) unchanged: 0 rows).
+            let removed: Vec<String> = inputs.iter().map(|f| f.path.clone()).collect();
+            return self
+                .commit_file_merge(project, table, partition_id, snapshot, removed, Vec::new())
+                .await;
+        };
+
+        // ── Row-preserving concat → re-emit into <= target-sized output files.
+        // We DO NOT sort: the output is exactly the union of input rows, so the
+        // merge is correctness-neutral for every table shape. Output count is
+        // strictly fewer than inputs (we cap each output at the write-stripe
+        // target and only merge when over the ceiling).
+        let merged = arrow::compute::concat_batches(&schema, &batches)
+            .map_err(|e| BasinError::storage(format!("file-merge concat: {e}")))?;
+        drop(batches);
+        let total_rows = merged.num_rows();
+        if total_rows == 0 {
+            let removed: Vec<String> = inputs.iter().map(|f| f.path.clone()).collect();
+            return self
+                .commit_file_merge(project, table, partition_id, snapshot, removed, Vec::new())
+                .await;
+        }
+
+        // Aim for ~target bytes per output (estimated from input bytes), and
+        // ALWAYS strictly fewer outputs than inputs so the count drops.
+        let n_out = (input_bytes
+            .div_ceil(STRIPE_MERGE_TARGET_FILE_BYTES)
+            .max(1) as usize)
+            .min(inputs.len() - 1)
+            .max(1);
+        let rows_per = total_rows.div_ceil(n_out);
+
+        let file_format = shard_map_file_format(meta.file_format);
+        let mut bloom_cols = meta.global_sort_order.clone().unwrap_or_default();
+        for pk in &meta.pk_columns {
+            if !bloom_cols.contains(pk) {
+                bloom_cols.push(pk.clone());
+            }
+        }
+        let cluster_columns = if meta.cluster_columns.is_empty() {
+            meta.default_cluster_cols()
+        } else {
+            meta.cluster_columns.clone()
+        };
+        let write_opts = basin_storage::WriteOptions {
+            file_format,
+            cluster_columns,
+            row_block_size: meta.row_block_size,
+            max_row_group_size: meta.row_group_rows,
+            bloom_columns: bloom_cols,
+            ..Default::default()
+        };
+        let write_partition = PartitionKey::default_key();
+
+        let mut outputs: Vec<(basin_storage::DataFile, RecordBatch)> = Vec::with_capacity(n_out);
+        let mut offset = 0usize;
+        while offset < total_rows {
+            let len = rows_per.min(total_rows - offset);
+            let chunk = merged.slice(offset, len);
+            offset += len;
+            match self
+                .cfg
+                .storage
+                .write_batch_with_options(project, table, &write_partition, &chunk, &write_opts)
+                .await
+            {
+                Ok(df) => outputs.push((df, chunk)),
+                Err(e) => {
+                    for (df, _) in &outputs {
+                        let _ = self.cfg.storage.delete_file(project, &df.path).await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        drop(merged);
+
+        let removed: Vec<String> = inputs.iter().map(|f| f.path.clone()).collect();
+        let added: Vec<DataFileRef> = outputs
+            .iter()
+            .map(|(df, _)| DataFileRef {
+                path: df.path.as_ref().to_string(),
+                size_bytes: df.size_bytes,
+                row_count: df.row_count,
+                column_stats: df.column_stats.clone(),
+                bloom_filters: df.bloom_filters.clone(),
+                hll_sketches: ::std::collections::BTreeMap::new(),
+                tdigest_sketches: ::std::collections::BTreeMap::new(),
+            })
+            .collect();
+
+        // ── Atomic per-partition catalog swap (OCC on the partition snapshot).
+        let mut snap = snapshot;
+        let committed = 'commit: {
+            for attempt in 0..3 {
+                match self
+                    .cfg
+                    .catalog
+                    .replace_data_files_in_partition(
+                        project,
+                        table,
+                        partition_id,
+                        snap,
+                        removed.clone(),
+                        added.clone(),
+                    )
+                    .await
+                {
+                    Ok(_) => break 'commit true,
+                    Err(BasinError::CommitConflict(_)) if attempt < 2 => {
+                        // The partition snapshot advanced. A tail-flush APPEND
+                        // leaves our inputs live → retry at the new snapshot. A
+                        // concurrent CoW REPLACE removes an input → abandon (the
+                        // merged bytes are stale).
+                        let (fresh_snap, fresh_live) = match self
+                            .cfg
+                            .catalog
+                            .live_data_files_in_partition(project, table, partition_id)
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                for (df, _) in &outputs {
+                                    let _ = self.cfg.storage.delete_file(project, &df.path).await;
+                                }
+                                return Err(e);
+                            }
+                        };
+                        let live_now: HashSet<String> =
+                            fresh_live.into_iter().map(|f| f.path).collect();
+                        if removed.iter().all(|p| live_now.contains(p)) {
+                            snap = fresh_snap;
+                            continue;
+                        }
+                        break 'commit false;
+                    }
+                    Err(BasinError::CommitConflict(_)) => break 'commit false,
+                    Err(e) => {
+                        for (df, _) in &outputs {
+                            let _ = self.cfg.storage.delete_file(project, &df.path).await;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            false
+        };
+
+        if !committed {
+            debug!(
+                %project,
+                %table,
+                partition = %partition_id,
+                "file-merge: lost the commit race; outputs abandoned, retrying next tick",
+            );
+            for (df, _) in &outputs {
+                let _ = self.cfg.storage.delete_file(project, &df.path).await;
+            }
+            return Ok(false);
+        }
+
+        self.reindex_and_reclaim_merge(project, table, &meta, &outputs, &removed)
+            .await;
+
+        {
+            let mut stats = self.stats.lock().await;
+            stats.file_merges = stats.file_merges.saturating_add(1);
+        }
+        tracing::info!(
+            %project,
+            %table,
+            partition = %partition_id,
+            inputs = removed.len(),
+            outputs = outputs.len(),
+            rows = total_rows,
+            "file-merge compaction complete: partition file count bounded",
+        );
+        Ok(true)
+    }
+
+    /// Commit a pure-removal file-merge (all selected inputs were zero-row):
+    /// drop the N input paths, add nothing. Count(*) is unchanged (0 rows
+    /// removed). OCC-retried like the main path.
+    async fn commit_file_merge(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        partition_id: &str,
+        snapshot: SnapshotId,
+        removed: Vec<String>,
+        added: Vec<DataFileRef>,
+    ) -> Result<bool> {
+        let mut snap = snapshot;
+        for attempt in 0..3 {
+            match self
+                .cfg
+                .catalog
+                .replace_data_files_in_partition(
+                    project,
+                    table,
+                    partition_id,
+                    snap,
+                    removed.clone(),
+                    added.clone(),
+                )
+                .await
+            {
+                Ok(_) => {
+                    let mut stats = self.stats.lock().await;
+                    stats.file_merges = stats.file_merges.saturating_add(1);
+                    return Ok(true);
+                }
+                Err(BasinError::CommitConflict(_)) if attempt < 2 => {
+                    let (fresh_snap, fresh_live) = self
+                        .cfg
+                        .catalog
+                        .live_data_files_in_partition(project, table, partition_id)
+                        .await?;
+                    let live_now: HashSet<String> =
+                        fresh_live.into_iter().map(|f| f.path).collect();
+                    if removed.iter().all(|p| live_now.contains(p)) {
+                        snap = fresh_snap;
+                        continue;
+                    }
+                    return Ok(false);
+                }
+                Err(BasinError::CommitConflict(_)) => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Register the merge outputs in the in-RAM index registries, evict the
+    /// superseded inputs, and best-effort delete the input objects. Mirrors the
+    /// stripe-merge's post-commit maintenance exactly.
+    async fn reindex_and_reclaim_merge(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        meta: &basin_catalog::TableMetadata,
+        outputs: &[(basin_storage::DataFile, RecordBatch)],
+        removed: &[String],
+    ) {
+        let effective_rg_size = meta
+            .row_block_size
+            .map(|v| v as usize)
+            .or(meta.row_group_rows)
+            .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE);
+        for (df, chunk) in outputs {
+            reindex_compacted_file_gin(
+                &self.gin_rowgroup_registry,
+                project,
+                table,
+                &meta.indexes,
+                effective_rg_size,
+                chunk,
+                df.path.as_ref(),
+            );
+            reindex_compacted_file_secondary(
+                &self.secondary_index_registry,
+                project,
+                table,
+                &meta.indexes,
+                effective_rg_size,
+                chunk,
+                df.path.as_ref(),
+            );
+            if let Err(e) = reindex_compacted_file_jsonb_posting(
+                &self.jsonb_posting_registry,
+                self.cfg.storage.clone(),
+                project,
+                table,
+                &meta.indexes,
+                effective_rg_size,
+                chunk,
+                df.path.as_ref(),
+            )
+            .await
+            {
+                warn!(%project, %table, file = %df.path, error = %e, "file-merge: JSONB posting sidecar write failed");
+            }
+            if let Err(e) = reindex_compacted_file_rtree(
+                self.cfg.storage.clone(),
+                project,
+                table,
+                &meta.indexes,
+                effective_rg_size as u32,
+                chunk,
+                df.path.as_ref(),
+            )
+            .await
+            {
+                warn!(%project, %table, file = %df.path, error = %e, "file-merge: R-tree sidecar write failed");
+            }
+        }
+
+        {
+            let rg = self
+                .gin_rowgroup_registry
+                .read()
+                .expect("gin_rowgroup_registry lock poisoned")
+                .clone();
+            let jp = self
+                .jsonb_posting_registry
+                .read()
+                .expect("jsonb_posting_registry lock poisoned")
+                .clone();
+            let sec = self
+                .secondary_index_registry
+                .read()
+                .expect("secondary_index_registry lock poisoned")
+                .clone();
+            for old in removed {
+                for idx in &meta.indexes {
+                    if idx.columns.len() != 1 {
+                        continue;
+                    }
+                    let col = &idx.columns[0];
+                    match idx.access_method.as_str() {
+                        "gin" => {
+                            if let Some(r) = &rg {
+                                r.remove_file(project, table, col, old);
+                            }
+                            if let Some(r) = &jp {
+                                r.remove_file(project, table, col, old);
+                            }
+                        }
+                        "btree" => {
+                            if let Some(r) = &sec {
+                                r.remove_file(project, table, col, old);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        for old in removed {
+            let path = object_store::path::Path::from(old.clone());
+            if let Err(e) = self.cfg.storage.delete_file(project, &path).await {
+                warn!(%project, %table, path = %old, error = %e, "file-merge: superseded file delete failed (orphan)");
+            }
+        }
+    }
 }
 
 fn unique_projects(map: &PartitionMap) -> usize {
@@ -2934,6 +3490,14 @@ impl ShardImpl for InProcessShard {
                     _ = stripe_merge_tick.tick(), if stripe_merge_enabled => {
                         if let Err(e) = me.stripe_merge_sweep().await {
                             warn!(error = %e, "stripe-merge tick failed");
+                        }
+                        // Same cadence/lock domain: bound the per-partition
+                        // file count so the segment baseline fold (and every
+                        // other O(files) cost) stays flat under sustained
+                        // ingest. Runs after stripe-merge so any disjoint-range
+                        // coalescing happens first.
+                        if let Err(e) = me.file_merge_sweep().await {
+                            warn!(error = %e, "file-merge tick failed");
                         }
                     }
                 }
@@ -3055,6 +3619,10 @@ impl ShardImpl for InProcessShard {
 
     async fn run_stripe_merge_once(&self) -> Result<()> {
         self.stripe_merge_sweep().await
+    }
+
+    async fn run_file_merge_once(&self) -> Result<()> {
+        self.file_merge_sweep().await
     }
 
     async fn run_tiering_sweep(&self) -> Result<()> {
@@ -3278,6 +3846,28 @@ const STRIPE_MERGE_MAX_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
 /// 8 stripe files into 1; very large tables split into multiple outputs
 /// whose PK ranges are still strictly disjoint (slices of one sorted batch).
 const STRIPE_MERGE_TARGET_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default per-partition live-data-file ceiling before the file-count-bounding
+/// merge sweep kicks in (`BASIN_COMPACT_MAX_FILES_PER_PARTITION`; clamped
+/// `>= 2`). Sustained ingest appends ~one file per flush to a partition's
+/// segment chain; left unmerged the count grows without bound and every
+/// O(files) operation — most importantly the periodic segment baseline fold
+/// (which serialises the partition's FULL live set) — slowly grows, producing
+/// the residual ingest-rate decline at scale. Bounding the count bounds those
+/// costs → flat ingest.
+const COMPACT_MAX_FILES_PER_PARTITION_DEFAULT: u64 = 64;
+
+/// Default cap on how many input files a SINGLE file-merge tick consumes for
+/// one partition (`BASIN_COMPACT_MERGE_BATCH`; clamped `>= 2`). Bounding the
+/// per-tick work keeps the merge OFF the hot path: a partition far over the
+/// ceiling is walked down over several ticks instead of stalling ingest by
+/// rewriting everything at once.
+const COMPACT_MERGE_BATCH_DEFAULT: u64 = 16;
+
+/// Default cap on the total *encoded* bytes a single file-merge pass may decode
+/// in memory (`BASIN_COMPACT_MERGE_MAX_BYTES`). Mirrors the stripe-merge byte
+/// bound — the selected batch is materialised as Arrow before re-emitting.
+const COMPACT_MERGE_MAX_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
 
 fn env_u64(var: &str, default: u64) -> u64 {
     std::env::var(var)
@@ -6848,6 +7438,255 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // File-count-bounding merge compaction (flat ingest at scale).
+    // ----------------------------------------------------------------------
+
+    /// Serialises the env-var-driven file-merge tests: the merge thresholds are
+    /// read from process-global env, so two tests mutating them concurrently
+    /// would race. Each test holds this for its duration and restores the env.
+    static FILE_MERGE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        keys: Vec<(&'static str, Option<String>)>,
+    }
+    impl EnvGuard {
+        fn set(pairs: &[(&'static str, &str)]) -> Self {
+            let keys = pairs
+                .iter()
+                .map(|(k, v)| {
+                    let prev = std::env::var(k).ok();
+                    std::env::set_var(k, v);
+                    (*k, prev)
+                })
+                .collect();
+            Self { keys }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, prev) in &self.keys {
+                match prev {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// Flush `n` separate files into one (default) partition by writing then
+    /// compacting `n` times. Each compaction drains the tail into exactly one
+    /// new data file, so the partition's live-file count grows ~1 per cycle —
+    /// the unbounded growth the merge sweep exists to bound.
+    async fn flush_n_files(
+        shard: &crate::Shard,
+        inner: &Arc<InProcessShard>,
+        project: &ProjectId,
+        table: &TableName,
+        n: usize,
+        rows_each: usize,
+    ) {
+        let key = PartitionKey::default_key();
+        let handle = shard.get(project, &key).await.unwrap();
+        for i in 0..n {
+            let b = batch((i * rows_each) as i64, rows_each, "v");
+            handle.write_batch(table, b).await.unwrap();
+            inner.run_compaction_once().await.unwrap();
+        }
+    }
+
+    /// Ingest M flushes into one partition, then run the merge sweep to a fixed
+    /// point: the live data-file COUNT must drop to/under the ceiling (it must
+    /// NOT stay at M), and every row must survive (count + full id set).
+    #[tokio::test]
+    async fn file_merge_bounds_partition_file_count() {
+        use basin_catalog::Catalog as _;
+        let _env_lock = FILE_MERGE_ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("BASIN_COMPACT_MAX_FILES_PER_PARTITION", "4"),
+            ("BASIN_COMPACT_MERGE_BATCH", "4"),
+        ]);
+
+        let (shard, _sd, _wd, _storage, catalog, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let table = TableName::new("events").unwrap();
+        catalog
+            .create_table(&project, &table, schema().as_ref())
+            .await
+            .unwrap();
+
+        const M: usize = 20;
+        const ROWS: usize = 3;
+        flush_n_files(&shard, &impl_of(&shard), &project, &table, M, ROWS).await;
+
+        let before = catalog
+            .load_table(&project, &table)
+            .await
+            .unwrap()
+            .live_data_files();
+        assert_eq!(before.len(), M, "one flushed file per write+compact cycle");
+        let rows_before: u64 = before.iter().map(|f| f.row_count).sum();
+        assert_eq!(rows_before as usize, M * ROWS);
+
+        // Drive the sweep to a fixed point (bounded work per tick → several
+        // ticks to walk M files down to the ceiling).
+        let inner = impl_of(&shard);
+        for _ in 0..M {
+            inner.run_file_merge_once().await.unwrap();
+            let n = catalog
+                .load_table(&project, &table)
+                .await
+                .unwrap()
+                .live_data_files()
+                .len();
+            if n <= 4 {
+                break;
+            }
+        }
+
+        let after = catalog
+            .load_table(&project, &table)
+            .await
+            .unwrap()
+            .live_data_files();
+        assert!(
+            after.len() <= 4,
+            "file count must be bounded by the ceiling, got {} (was {M})",
+            after.len()
+        );
+        let rows_after: u64 = after.iter().map(|f| f.row_count).sum();
+        assert_eq!(
+            rows_after as usize,
+            M * ROWS,
+            "no rows lost or duplicated across merges"
+        );
+        assert!(shard.stats().file_merges >= 1, "at least one merge committed");
+
+        // Full row set identical: read every live file, collect ids, expect the
+        // exact dense range [0, M*ROWS).
+        let mut ids: Vec<i64> = Vec::new();
+        for f in &after {
+            let path = object_store::path::Path::from(f.path.clone());
+            let batches: Vec<RecordBatch> = _storage
+                .read_file(&project, &path)
+                .await
+                .unwrap()
+                .collect::<Vec<Result<RecordBatch>>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            for b in &batches {
+                let col = b
+                    .column(b.schema().index_of("id").unwrap())
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .clone();
+                ids.extend(col.values().iter().copied());
+            }
+        }
+        ids.sort_unstable();
+        let expected: Vec<i64> = (0..(M * ROWS) as i64).collect();
+        assert_eq!(ids, expected, "exact union of all input rows, no dup/loss");
+    }
+
+    /// A SINGLE merge tick consumes at most `BASIN_COMPACT_MERGE_BATCH` input
+    /// files — it does not collapse an unbounded partition in one pass (keeping
+    /// the merge off the hot ingest path).
+    #[tokio::test]
+    async fn file_merge_bounded_work_per_tick() {
+        use basin_catalog::Catalog as _;
+        let _env_lock = FILE_MERGE_ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("BASIN_COMPACT_MAX_FILES_PER_PARTITION", "4"),
+            ("BASIN_COMPACT_MERGE_BATCH", "4"),
+        ]);
+
+        let (shard, _sd, _wd, _storage, catalog, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let table = TableName::new("events").unwrap();
+        catalog
+            .create_table(&project, &table, schema().as_ref())
+            .await
+            .unwrap();
+
+        const M: usize = 20;
+        flush_n_files(&shard, &impl_of(&shard), &project, &table, M, 2).await;
+        let before = catalog
+            .load_table(&project, &table)
+            .await
+            .unwrap()
+            .live_data_files()
+            .len();
+        assert_eq!(before, M);
+
+        // ONE tick: merges a batch of 4 smallest → 1 (or a few) output. The net
+        // count drop must be bounded by batch-1 (we removed <= batch inputs,
+        // added >= 1 output), so the count cannot collapse to the ceiling in a
+        // single tick.
+        impl_of(&shard).run_file_merge_once().await.unwrap();
+        let after = catalog
+            .load_table(&project, &table)
+            .await
+            .unwrap()
+            .live_data_files()
+            .len();
+        let dropped = before - after;
+        assert!(dropped >= 1, "the tick must make progress");
+        assert!(
+            dropped <= 4 - 1,
+            "one tick removes at most batch (4) inputs and adds >= 1 output, so net drop <= 3; got {dropped}"
+        );
+        assert!(
+            after > 4,
+            "a single tick must NOT collapse 20 files to the ceiling"
+        );
+    }
+
+    /// count(*) (and the live-file set) are unchanged when the partition is
+    /// already at/under the ceiling: the sweep is a no-op, never rewrites.
+    #[tokio::test]
+    async fn file_merge_noop_under_ceiling() {
+        use basin_catalog::Catalog as _;
+        let _env_lock = FILE_MERGE_ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[("BASIN_COMPACT_MAX_FILES_PER_PARTITION", "8")]);
+
+        let (shard, _sd, _wd, _storage, catalog, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let table = TableName::new("events").unwrap();
+        catalog
+            .create_table(&project, &table, schema().as_ref())
+            .await
+            .unwrap();
+
+        flush_n_files(&shard, &impl_of(&shard), &project, &table, 3, 5).await;
+        let mut before: Vec<String> = catalog
+            .load_table(&project, &table)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        before.sort();
+        assert_eq!(before.len(), 3);
+
+        impl_of(&shard).run_file_merge_once().await.unwrap();
+
+        let mut after: Vec<String> = catalog
+            .load_table(&project, &table)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        after.sort();
+        assert_eq!(before, after, "under-ceiling partition is untouched");
+        assert_eq!(shard.stats().file_merges, 0);
     }
 
     // ----------------------------------------------------------------------

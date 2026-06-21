@@ -2133,6 +2133,39 @@ impl Catalog for ObjectStoreCatalog {
         .await
     }
 
+    async fn list_merge_partitions(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<Vec<String>> {
+        let qtable = self.resolve_qtable(project, table).await;
+        // The unbounded-file-count growth lives in the per-partition SEGMENT
+        // chains (the sharded ingest path appends one file per flush there).
+        // Report exactly those partitions that hold live segment files; the
+        // merge sweep commits each via `replace_data_files_in_partition`, the
+        // matching OCC chain. META-chain (single-node OLTP) files are not
+        // enumerated here — they are coalesced by copy-on-write / stripe-merge.
+        let mut out = Vec::new();
+        for pid in self.list_partition_ids(project, &qtable).await? {
+            let (_v, segment) = self.load_part_current(project, &qtable, &pid).await?;
+            if !segment.live_data_files().is_empty() {
+                out.push(pid);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn live_data_files_in_partition(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        partition_id: &str,
+    ) -> Result<(SnapshotId, Vec<DataFileRef>)> {
+        let qtable = self.resolve_qtable(project, table).await;
+        let (_v, segment) = self.load_part_current(project, &qtable, partition_id).await?;
+        Ok((segment.current_snapshot, segment.live_data_files()))
+    }
+
     async fn list_snapshots(
         &self,
         project: &ProjectId,

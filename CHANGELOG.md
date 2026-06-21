@@ -8,6 +8,51 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-21 — Bound per-partition data-file count: file-merge compaction tier for truly flat ingest
+
+The previous two ingest-flatness fixes (O(1) delta-segment commits; dropping the
+per-commit whole-table `load_unioned`) left a MILD residual decline (~32k → ~17k
+r/s over ~530M rows). Root: every per-partition flush appends one cold data file
+to that partition's segment chain, and NOTHING merged those files into fewer
+larger ones. So the live-file COUNT per partition grew ~1-per-flush without
+bound, and the one remaining O(files) term — the periodic segment BASELINE write
+(every `BASIN_PART_SEGMENT_COMPACT_EVERY=32` commits, which serialises the
+partition's FULL live set) — slowly grew with it. Stripe-merge did NOT bound the
+count: it only fires for single-column-PK tables whose per-file PK zone maps
+OVERLAP, so the common monotonic-PK append case (strictly increasing, *disjoint*
+ranges) and every non-single-PK table never merged at all.
+
+Fix — a new background **file-count-bounding merge compaction** tier
+(`Shard::run_file_merge_once`, on the existing stripe-merge tick / lock). Per
+`(project, partition)`, when the live cold-file count exceeds
+`BASIN_COMPACT_MAX_FILES_PER_PARTITION` (default 64), it merges the SMALLEST
+`BASIN_COMPACT_MERGE_BATCH` (default 16) files (capped at
+`BASIN_COMPACT_MERGE_MAX_BYTES`, default 256 MiB) into fewer, larger files (each
+capped at the write-stripe target size) and commits the swap atomically via
+`replace_data_files_in_partition` (per-partition OCC). Bounded work per tick
+walks a hot partition down over several ticks instead of stalling ingest;
+single-writer-per-partition means the only concurrent committer is a tail-flush
+APPEND (inputs stay live → retry) — no cross-writer merge race. Two new catalog
+trait methods (`list_merge_partitions`, `live_data_files_in_partition`) expose
+per-partition enumeration; `ObjectStoreCatalog` reads the real segment chains,
+single-chain backends (`InMemoryCatalog` / `PostgresCatalog`) get correct
+table-level defaults.
+
+Correctness: the merge is a row-preserving concat (no sort, no dedup) so the
+output carries EXACTLY the union of the inputs' rows for ANY schema / clustering
+/ PK shape; the atomic replace removes the N input paths and adds the outputs in
+one OCC commit, so a concurrent reader sees either the pre- or post-merge set,
+never a torn/double-counted one — `count(*)` is identical across the merge.
+Superseded objects are deleted so a stale LIST cannot double-count. Guarded by
+new tests: `file_merge_bounds_partition_file_count` (20 flushes → count drops
+to/under the ceiling, full id set survives, no dup/loss),
+`file_merge_bounded_work_per_tick` (one tick removes at most a batch),
+`file_merge_noop_under_ceiling` (under-ceiling partition untouched).
+
+Needs deploy-validation: the file-count bound is proven in-process over an
+InMemory store; the sustained-ingest flatness win must be confirmed against a
+real object store (Tigris) under load before publishing a flat-ingest number.
+
 ## 2026-06-21 — Flatten residual ingest-rate decline: per-partition commit no longer unions the whole table
 
 After the O(1) delta-segment commit fix, single-node sustained ingest no longer
