@@ -1183,7 +1183,32 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "realtime"))]
     let _realtime_ws_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-    // Wait for Ctrl-C, then signal the router to stop.
+    // Wait for SIGINT (Ctrl-C, dev) OR SIGTERM, then signal the router to stop.
+    // Fly sends SIGTERM (not SIGINT) before destroying a machine on scale-in or
+    // a rolling deploy; catching only SIGINT meant the graceful drain below
+    // (overlay drain + shard tail flush) NEVER ran on scale-in, so the leaving
+    // node's un-flushed tail was lost and survivors had to cold-replay from the
+    // shared WAL — the ~minutes-long disruption observed on autoscale-in. With
+    // SIGTERM wired in (and a long enough `kill_timeout` in the Fly config), the
+    // leaving node flushes everything durable BEFORE exit, so ownership hands
+    // off to survivors over a complete, committed dataset.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received"),
+                    _ = sigterm.recv() => tracing::info!("SIGTERM received (scale-in / deploy)"),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGTERM handler install failed; waiting on SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutdown signal received");
     let _ = router.shutdown.send(());
