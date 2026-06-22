@@ -910,7 +910,29 @@ impl ObjectStoreCatalog {
                                 .await
                                 .is_ok()
                             {
-                                return Ok(Some(v));
+                                // The head pointer is only a HINT — its write
+                                // (`after_part_commit`) is a best-effort overwrite
+                                // that can be lost if the process dies or the store
+                                // PUT fails right after a segment was created. If
+                                // the pointer lags behind an already-committed
+                                // higher segment, trusting it blindly makes every
+                                // commit recompute the SAME `new_version` and lose
+                                // the create-if-absent race against the existing
+                                // object forever ("lost commit race at version N"
+                                // livelock — the tail can never drain). Cheaply
+                                // probe the very next version: if `v+1` does NOT
+                                // exist (the overwhelming common case) the pointer
+                                // is current, so return it with no LIST. If it DOES
+                                // exist the pointer is stale — fall through to the
+                                // LIST scan below to recover the true max version.
+                                if self
+                                    .store
+                                    .head(&self.part_segment_key(project, qtable, partition_id, v + 1))
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(Some(v));
+                                }
                             }
                         }
                     }
@@ -1106,17 +1128,50 @@ impl ObjectStoreCatalog {
         version: u64,
         live: PartitionLive,
     ) {
-        let _ = self
-            .store
-            .put_opts(
-                &self.part_head_key(project, qtable, partition_id),
-                Bytes::from(version.to_string()).into(),
-                PutOptions {
-                    mode: PutMode::Overwrite,
-                    ..Default::default()
-                },
-            )
-            .await;
+        // The head pointer is a best-effort hint, but a LOST write here is what
+        // lets the pointer lag behind an already-committed segment and (without
+        // the self-healing probe in `resolve_part_head_version`) wedges the
+        // partition in a "lost commit race" livelock. On flaky object stores a
+        // single PUT can transiently fail, so retry a few times with a short
+        // backoff and `warn!` if it never lands — the resolver recovers the true
+        // version via LIST regardless, but a persistently stale pointer forces an
+        // O(segments) LIST on every resolve, so we want it observed, not silent.
+        let head_key = self.part_head_key(project, qtable, partition_id);
+        let mut head_written = false;
+        for attempt in 0..3u32 {
+            match self
+                .store
+                .put_opts(
+                    &head_key,
+                    Bytes::from(version.to_string()).into(),
+                    PutOptions {
+                        mode: PutMode::Overwrite,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => {
+                    head_written = true;
+                    break;
+                }
+                Err(e) => {
+                    if attempt + 1 < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            20u64 << attempt,
+                        ))
+                        .await;
+                    } else {
+                        tracing::warn!(
+                            %project, %qtable, partition_id, version, error = %e,
+                            "partition head-pointer write failed after retries; \
+                             resolver will recover via LIST (extra cost until repaired)"
+                        );
+                    }
+                }
+            }
+        }
+        let _ = head_written;
         let ck = self.part_cache_key(project, qtable, partition_id);
         self.part_cache.lock().await.insert(
             ck,
@@ -4286,6 +4341,74 @@ mod tests {
             "delta object stays tiny ({} bytes) regardless of {SEED} existing files",
             bytes.len()
         );
+    }
+
+    // --- Regression: stale head pointer must not livelock commits -------------
+    //
+    // Reproduces the "lost commit race at partition version N" wedge observed at
+    // ~143M rows on dev: a partition segment was committed (create-if-absent PUT
+    // succeeded) but the best-effort head-pointer overwrite that should have
+    // advanced the pointer was lost — process killed or the store PUT failed
+    // right after. With the old resolver, the stale pointer pinned EVERY future
+    // commit to recompute the same `new_version`, lose the create race against
+    // the already-existing segment, and conflict forever (the shard tail could
+    // never drain; restarts replayed the tail and re-wedged identically). The
+    // resolver must detect the lag and recover the true max version.
+    #[tokio::test]
+    async fn stale_head_pointer_self_heals_no_commit_livelock() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let c = ObjectStoreCatalog::with_part_compact_every(store.clone(), 100_000);
+        let p = ProjectId::new();
+        let t = TableName::new("heal").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+        let qt = c.resolve_qtable(&p, &t).await;
+
+        // Build a segment chain of several commits on partition p0.
+        for i in 0..4 {
+            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file(&format!("f{i}.parquet"), 1)])
+                .await
+                .unwrap();
+        }
+        let head_v = c.resolve_part_head_version(&p, &qt, "p0").await.unwrap().unwrap();
+        assert!(head_v >= 4, "seeded at least 4 segment versions, got {head_v}");
+
+        // SIMULATE THE LOST HEAD WRITE: roll the on-store head pointer back to an
+        // earlier version whose segment still exists, exactly as if the PUT that
+        // should have advanced it never landed. Drop the in-memory cache so the
+        // resolver must read the store cold (as it would after a restart).
+        let stale = head_v - 2;
+        c.store
+            .put_opts(
+                &c.part_head_key(&p, &qt, "p0"),
+                Bytes::from(stale.to_string()).into(),
+                PutOptions { mode: PutMode::Overwrite, ..Default::default() },
+            )
+            .await
+            .unwrap();
+        c.invalidate_part(&p, &qt, "p0").await;
+
+        // The resolver must NOT trust the stale pointer: `stale+1` exists, so it
+        // recovers the true max segment via the LIST fallback.
+        let resolved = c.resolve_part_head_version(&p, &qt, "p0").await.unwrap().unwrap();
+        assert_eq!(resolved, head_v, "resolver heals a stale head pointer to the true max segment");
+
+        // The decisive assertion: a subsequent commit SUCCEEDS instead of looping
+        // on "lost commit race at partition version N".
+        let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file("after-heal.parquet", 1)])
+            .await
+            .expect("commit must succeed after head-pointer heal, not livelock");
+
+        // No rows lost or shadowed: every committed file is in the folded live set.
+        let live: std::collections::BTreeSet<String> = c
+            .load_table(&p, &t).await.unwrap()
+            .live_data_files().into_iter().map(|f| f.path).collect();
+        for i in 0..4 {
+            assert!(live.contains(&format!("f{i}.parquet")), "f{i}.parquet present after heal");
+        }
+        assert!(live.contains("after-heal.parquet"), "post-heal commit present");
     }
 
     // --- Test 2c-flat-2: FOLD CORRECTNESS across adds + interleaved removes ----
