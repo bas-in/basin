@@ -531,7 +531,31 @@ async fn recover_partitions(
             .map_err(|e| {
                 BasinError::storage(format!("wal recovery body {}: {e}", meta.location))
             })?;
-        let (header, entries) = decode_segment(&body)?;
+        // RECOVERY ROBUSTNESS: an abrupt kill (OOM, power loss, SIGKILL after a
+        // drain that couldn't flush in time) can leave the segment that was
+        // being written with no header yet ("segment: missing header") or a
+        // partial trailing frame ("truncated …"). That segment holds only
+        // un-flushed, ack-before-durable entries — never committed/durable state
+        // (durable state lives in the object-store catalog). Skipping it with a
+        // loud warning lets the engine BOOT and recover every complete segment,
+        // instead of crash-looping forever on an unreadable trailing segment. A
+        // client resuming from the authoritative count(*) re-ingests any lost
+        // tail, so this preserves exactly-once. (Closed/complete segments must
+        // still decode cleanly — a genuine error there is surfaced via the warn,
+        // not silently masked; the engine simply does not replay that segment.)
+        let (header, entries) = match decode_segment(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    segment = %meta.location,
+                    error = %e,
+                    "WAL recovery: skipping unreadable segment (interrupted write / partial \
+                     trailing frame). Its un-flushed entries are not replayed; durable state is \
+                     in the catalog and a resuming client re-ingests any lost tail."
+                );
+                continue;
+            }
+        };
         let last_lsn = entries.last().map(|e| e.lsn).unwrap_or(header.first_lsn);
         let key = (header.project, header.partition.clone());
         closed.entry(key).or_default().push(ClosedSegment {
@@ -1101,6 +1125,55 @@ mod tests {
         for (i, e) in all.iter().enumerate() {
             assert_eq!(e.lsn, Lsn((i + 1) as u64));
         }
+        wal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_skips_corrupt_trailing_segment() {
+        // An abrupt kill (OOM / power loss / SIGKILL after a drain that couldn't
+        // flush) can leave the actively-written segment headerless or with a
+        // partial trailing frame. Recovery must BOOT (skip that segment) rather
+        // than crash-loop on "segment: missing header" / "truncated …".
+        use std::fs;
+        let dir = TempDir::new().unwrap();
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+        {
+            let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
+            for i in 1..=20u64 {
+                wal.append(&project, &part, payload(i)).await.unwrap();
+            }
+            wal.flush().await.unwrap();
+            wal.close().await.unwrap();
+        }
+        // Inject a corrupt segment into the partition dir, named to sort LAST
+        // (the trailing/newest segment). A 0xFFFFFFFF length prefix claims a body
+        // that isn't there -> undecodable -> must be skipped, not fatal.
+        fn find_seg_dir(p: &std::path::Path) -> Option<std::path::PathBuf> {
+            for e in fs::read_dir(p).ok()?.flatten() {
+                let pp = e.path();
+                if pp.is_dir() {
+                    if let Some(d) = find_seg_dir(&pp) {
+                        return Some(d);
+                    }
+                } else if pp.extension().map_or(false, |x| x == "seg") {
+                    return pp.parent().map(|x| x.to_path_buf());
+                }
+            }
+            None
+        }
+        let seg_dir = find_seg_dir(dir.path()).expect("a directory holding .seg files");
+        fs::write(seg_dir.join("zzzz_crash.seg"), [0xFFu8, 0xFF, 0xFF, 0xFF]).unwrap();
+
+        // Reopen MUST NOT crash and MUST recover all 20 committed entries.
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
+        assert_eq!(wal.high_water(&project, &part).await.unwrap(), Lsn(20));
+        let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+        assert_eq!(
+            all.len(),
+            20,
+            "complete segments recover despite a corrupt trailing segment"
+        );
         wal.close().await.unwrap();
     }
 
