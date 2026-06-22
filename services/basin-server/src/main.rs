@@ -277,8 +277,29 @@ use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Multi-tenant query fairness: size the async runtime with MORE worker
+    // threads than CPU cores. CPU-bound ingest work (Parquet/Vortex encode,
+    // compaction concat) runs inline on worker threads; with exactly `cores`
+    // threads, a heavy-ingest tenant can occupy all of them and a co-tenant's
+    // tiny SELECT blocks for seconds waiting for a free thread (observed p50
+    // ~10s / p95 ~44s under a noisy-neighbor 1B ingest). Over-subscribing
+    // (2× cores, floor 8) guarantees interactive query tasks always get a
+    // thread and the OS time-slices CPU, so reads stay responsive under heavy
+    // ingest instead of starving. The storage EDF scheduler already prioritises
+    // point reads over bulk PUTs; this removes the runtime-thread starvation
+    // that sat upstream of it.
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads((cores * 2).max(8))
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let _ = init(tracing::Level::INFO, LogFormat::Pretty);
 
     let cfg = Cfg::from_env()?;
