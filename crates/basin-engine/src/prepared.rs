@@ -2512,7 +2512,19 @@ async fn probe_schema(sess: &ProjectSession, sql: &str) -> Result<Vec<Field>> {
 
     // Try planning the (possibly rewritten) SQL directly. This handles plain
     // SELECTs and WITH-pure-SELECT CTEs.
-    let plan_result = sess.ctx.sql(probe_sql).await;
+    let mut plan_result = sess.ctx.sql(probe_sql).await;
+    if plan_result.is_err() {
+        // Refresh-on-miss (multi-node): the referenced table may have been
+        // CREATEd on another node after this session snapshotted its table
+        // list, so it isn't registered in `ctx` and planning failed. Re-register
+        // the referenced base tables from the shared catalog and retry once.
+        // On the single-node hot path the first plan succeeds, so this never
+        // runs. A genuinely-absent table stays unregistered (refresh swallows
+        // NotFound), so the retry fails again and we fall through as before —
+        // never masking an absent table as present.
+        crate::executor::refresh_select_tables_on_miss(sess, probe_sql).await;
+        plan_result = sess.ctx.sql(probe_sql).await;
+    }
 
     let mut primary_table: Option<TableName> = None;
     let ws_schema = match plan_result {

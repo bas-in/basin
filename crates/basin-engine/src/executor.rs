@@ -11458,6 +11458,46 @@ async fn compute_select_refresh_set(
     Some(out)
 }
 
+/// Multi-node refresh-on-miss for prepare-time schema probes.
+///
+/// A pooled session's DataFusion `ctx` snapshots the catalog table list at
+/// session-open (`session::open` → `list_tables_qualified`). A table CREATEd on
+/// ANOTHER node afterwards is absent from this `ctx`, so planning fails and
+/// COPY's column probe (`probe_schema`) would wrongly report
+/// `cannot resolve schema`. This re-registers the base tables `sql` references
+/// from the SHARED object_store catalog, mirroring what `exec_select` does on
+/// every query — but it is only ever called AFTER an initial plan attempt
+/// failed, so the single-node hot path (plan succeeds first try) pays nothing.
+///
+/// `refresh_table` errors `NotFound` for a genuinely-absent table; we swallow
+/// that and leave it unregistered, so a missing table is never masked as
+/// present — the caller's retry plan still fails and surfaces the normal 42P01.
+pub(crate) async fn refresh_select_tables_on_miss(sess: &ProjectSession, sql: &str) {
+    let all_tables = match sess.engine.config().catalog.list_tables(&sess.project).await {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let scoped = match compute_select_refresh_set(sess, sql, &all_tables).await {
+        Some(s) => s,
+        None => all_tables,
+    };
+    for table in &scoped {
+        // Only refresh tables not already registered in this ctx, to bound the
+        // work to what's actually missing.
+        if sess.ctx.table_exist(table.as_str()).unwrap_or(false) {
+            continue;
+        }
+        let _ = crate::session::refresh_table(
+            &sess.engine,
+            &sess.project,
+            &sess.ctx,
+            &sess.state,
+            table,
+        )
+        .await;
+    }
+}
+
 /// Resolve a single referenced name to zero-or-more base tables, accumulating
 /// into `out` (deduped via `resolved`). Returns `false` if the name cannot be
 /// classified as a base table, a known view, or an in-statement CTE — the
