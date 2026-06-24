@@ -27,6 +27,8 @@
 
 /// Phase 6.X.D — heartbeat-reconciled per-project budgets (ADR 0023).
 pub mod budgets;
+/// Bounded multi-bucket storage-pool records (#36, Stage 1).
+pub mod bucket_pool;
 /// ADR 0028 Phase 2 — per-project CDC webhook subscriptions + delivery cursor.
 pub mod cdc_webhooks;
 /// ADR 0028 Phase 3 — per-project CDC Kafka/Redpanda sink configs + cursor.
@@ -110,6 +112,9 @@ pub use object_store_catalog::{
 };
 pub use postgres::PostgresCatalog;
 pub use procedures::{ProcedureError, SqlProcedureDef};
+pub use bucket_pool::{
+    BucketAssignment, BucketRegistry, BucketRegistryEntry, BucketTier,
+};
 pub use project_storage_config::ProjectStorageConfig;
 pub use reactors::{ReactorDef, ReactorError, ReactorOps};
 pub use rest::RestCatalog;
@@ -2038,6 +2043,58 @@ pub trait Catalog: Send + Sync {
     ) -> Result<Option<ProjectStorageConfig>> {
         let _ = project;
         Ok(None)
+    }
+
+    // ---- Multi-bucket storage pool (#36, Stage 1) ----
+    //
+    // These records back the bounded bucket pool. They are only consulted
+    // when `BASIN_BUCKET_POOL` is ON; with the flag OFF the storage layer
+    // never calls them, so a backend that leaves the defaults below is fully
+    // single-bucket-compatible (today's behaviour).
+
+    /// Read the global bucket registry (the full pool topology). Default impl
+    /// returns an empty registry — a fresh deployment has no pooled buckets
+    /// registered yet.
+    async fn get_bucket_registry(&self) -> Result<bucket_pool::BucketRegistry> {
+        Ok(bucket_pool::BucketRegistry::default())
+    }
+
+    /// Persist the global bucket registry. Last-writer-wins; callers serialise
+    /// registry mutations through the storage layer's pool lock. Default impl
+    /// returns `Internal("not implemented")` so a backend opts in explicitly.
+    async fn put_bucket_registry(&self, registry: &bucket_pool::BucketRegistry) -> Result<()> {
+        let _ = registry;
+        Err(basin_common::BasinError::Internal(
+            "put_bucket_registry not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Look up a project's stable bucket assignment. `None` = unassigned
+    /// (first write will assign). Default impl: `None`.
+    async fn get_bucket_assignment(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Option<bucket_pool::BucketAssignment>> {
+        let _ = project;
+        Ok(None)
+    }
+
+    /// Persist a project's bucket assignment if and only if none exists yet,
+    /// returning the assignment that is now durable. This is the
+    /// linearization point for assignment: a create-if-absent (CAS) so two
+    /// racing first-writes converge on a single stable assignment. Backends
+    /// that support atomic create return the WINNER (which may differ from
+    /// `proposed` if another writer won). Default impl returns
+    /// `Internal("not implemented")`.
+    async fn assign_bucket_if_absent(
+        &self,
+        project: &ProjectId,
+        proposed: &bucket_pool::BucketAssignment,
+    ) -> Result<bucket_pool::BucketAssignment> {
+        let _ = (project, proposed);
+        Err(basin_common::BasinError::Internal(
+            "assign_bucket_if_absent not implemented for this catalog backend".into(),
+        ))
     }
 
     /// Persist the PRIMARY KEY column list, CHECK constraints, and

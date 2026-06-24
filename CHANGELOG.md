@@ -8,6 +8,43 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Multi-bucket storage pool, Stage 1 (foundation, flag-gated)
+
+Lays the FOUNDATION for the bounded multi-bucket storage pool (engine task #36):
+many projects share a bounded set of pooled object-store buckets, isolated by the
+existing per-project key prefix, so bucket count can track load instead of project
+count. This is Stage 1 only — online consolidation/migration (#37),
+dedicated-tier promotion, and multi-provider pools are explicitly out of scope.
+
+**Flag-gated, default OFF — a provable no-op at the default.** With
+`BASIN_BUCKET_POOL` unset/off, routing returns exactly today's single shared
+bucket + per-project prefix for every project, byte-for-byte; the pool is never
+consulted. A regression test asserts flag-OFF routing is indistinguishable from
+having no pool attached at all (same default store, same `projects/{id}/…`
+layout).
+
+When ON:
+- Two new catalog records (no external DB — persisted in the object-store
+  catalog): a **bucket registry** (`bucket_id → endpoint/region/credentials-ref`;
+  credentials are *referenced* by env/secret-key name, never inlined) and a
+  per-project **bucket assignment** (`project_id → bucket_id (+ tier)`).
+- Deterministic assignment on first write: pick the least-loaded pooled bucket
+  below the occupancy watermark; if all are at/above it and we're under
+  `BASIN_BUCKET_POOL_MAX`, register a new pooled bucket; otherwise pack into the
+  least-full bucket (graceful degrade — never fail the write). Assignment is
+  STABLE: persisted via a create-if-absent CAS (first writer wins), re-read on
+  restart, never recomputed.
+- Routing hooks the single existing chokepoint (`Storage::project_object_store`),
+  with a per-process assignment cache (warmed on the async write/read entry,
+  read on the sync path) and invalidation, mirroring the per-project
+  storage-config cache.
+- Stage-1 load signal is the cheap per-bucket assigned-project count; the
+  richer sustained-PUT-rate/bytes-per-second signal plugs in at the same
+  `choose_bucket` site later.
+
+Config: `BASIN_BUCKET_POOL` (off), `BASIN_BUCKET_POOL_MAX` (8),
+`BASIN_BUCKET_POOL_WATERMARK` (64).
+
 ## 2026-06-25 — Crash-consistent COPY across nodes: durable-on-forward
 
 Extends the end-of-COPY durable barrier (below) to cover FORWARDED partitions in

@@ -182,6 +182,11 @@ pub struct InMemoryCatalog {
     /// per-project cost stays `O(bytes)` with no per-project heavy
     /// resource. Cleared in `drop_namespace`.
     project_storage_config: Mutex<HashMap<ProjectId, ProjectStorageConfig>>,
+    /// Multi-bucket pool (#36, Stage 1): the global bucket registry and the
+    /// per-project stable bucket assignment. Only consulted when the storage
+    /// layer's `BASIN_BUCKET_POOL` flag is ON.
+    bucket_registry: Mutex<crate::bucket_pool::BucketRegistry>,
+    bucket_assignments: Mutex<HashMap<ProjectId, crate::bucket_pool::BucketAssignment>>,
     /// Per-project plain-view definitions (`CREATE VIEW … AS SELECT …`).
     /// Same shape as `sql_functions`: keyed by `(ProjectId, lower-name)`.
     views: Mutex<HashMap<(ProjectId, String), ViewDef>>,
@@ -285,6 +290,8 @@ impl InMemoryCatalog {
             domains: Mutex::new(HashMap::new()),
             procedures: Mutex::new(HashMap::new()),
             project_storage_config: Mutex::new(HashMap::new()),
+            bucket_registry: Mutex::new(crate::bucket_pool::BucketRegistry::default()),
+            bucket_assignments: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
             schemas: Mutex::new(HashMap::new()),
             inbound_webhooks: Mutex::new(HashMap::new()),
@@ -1481,6 +1488,43 @@ impl Catalog for InMemoryCatalog {
     ) -> Result<Option<ProjectStorageConfig>> {
         let map = self.project_storage_config.lock().await;
         Ok(map.get(project).cloned())
+    }
+
+    // ---- Multi-bucket storage pool (#36, Stage 1) ----
+
+    async fn get_bucket_registry(&self) -> Result<crate::bucket_pool::BucketRegistry> {
+        Ok(self.bucket_registry.lock().await.clone())
+    }
+
+    async fn put_bucket_registry(
+        &self,
+        registry: &crate::bucket_pool::BucketRegistry,
+    ) -> Result<()> {
+        self.bump_epoch();
+        *self.bucket_registry.lock().await = registry.clone();
+        Ok(())
+    }
+
+    async fn get_bucket_assignment(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Option<crate::bucket_pool::BucketAssignment>> {
+        Ok(self.bucket_assignments.lock().await.get(project).cloned())
+    }
+
+    async fn assign_bucket_if_absent(
+        &self,
+        project: &ProjectId,
+        proposed: &crate::bucket_pool::BucketAssignment,
+    ) -> Result<crate::bucket_pool::BucketAssignment> {
+        let mut map = self.bucket_assignments.lock().await;
+        // Create-if-absent: the first writer wins; a later racer re-reads the
+        // existing assignment so the result is stable.
+        let entry = map.entry(*project).or_insert_with(|| {
+            self.bump_epoch();
+            proposed.clone()
+        });
+        Ok(entry.clone())
     }
 
     #[instrument(skip(self, meta), fields(project = %project))]

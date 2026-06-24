@@ -2606,6 +2606,105 @@ impl Catalog for ObjectStoreCatalog {
         .await
     }
 
+    // ---- Multi-bucket storage pool (#36, Stage 1) ----
+    //
+    // The registry is a single GLOBAL object (`{root}_bucket_pool/registry.json`)
+    // so any node reads the full pool topology in one GET. Each project's
+    // assignment is a per-project record written create-if-absent so the FIRST
+    // write wins and the assignment is stable thereafter (the linearization
+    // point). Credentials are referenced by name in the registry, never inlined.
+
+    async fn get_bucket_registry(&self) -> Result<crate::bucket_pool::BucketRegistry> {
+        let key = OsPath::from(format!("{}_bucket_pool/registry.json", self.root));
+        match self.store.get(&key).await {
+            Ok(res) => {
+                let bytes = res
+                    .bytes()
+                    .await
+                    .map_err(|e| storage_err("read bucket registry", e))?;
+                let v = serde_json::from_slice(&bytes)
+                    .map_err(|e| BasinError::catalog(format!("decode bucket registry: {e}")))?;
+                Ok(v)
+            }
+            Err(object_store::Error::NotFound { .. }) => {
+                Ok(crate::bucket_pool::BucketRegistry::default())
+            }
+            Err(e) => Err(storage_err("get bucket registry", e)),
+        }
+    }
+
+    async fn put_bucket_registry(
+        &self,
+        registry: &crate::bucket_pool::BucketRegistry,
+    ) -> Result<()> {
+        let key = OsPath::from(format!("{}_bucket_pool/registry.json", self.root));
+        let bytes = serde_json::to_vec(registry)
+            .map_err(|e| BasinError::catalog(format!("serialise bucket registry: {e}")))?;
+        self.store
+            .put_opts(
+                &key,
+                Bytes::from(bytes).into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| storage_err("put bucket registry", e))?;
+        self.bump_epoch();
+        Ok(())
+    }
+
+    async fn get_bucket_assignment(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Option<crate::bucket_pool::BucketAssignment>> {
+        self.get_project_json::<crate::bucket_pool::BucketAssignment>(
+            project,
+            "bucket_assignment.json",
+        )
+        .await
+    }
+
+    async fn assign_bucket_if_absent(
+        &self,
+        project: &ProjectId,
+        proposed: &crate::bucket_pool::BucketAssignment,
+    ) -> Result<crate::bucket_pool::BucketAssignment> {
+        let key = self.project_meta_key(project, "bucket_assignment.json");
+        let bytes = serde_json::to_vec(proposed)
+            .map_err(|e| BasinError::catalog(format!("serialise bucket assignment: {e}")))?;
+        // Create-if-absent is the CAS: only the first writer's PUT succeeds;
+        // the loser gets AlreadyExists and re-reads the winning assignment, so
+        // the assignment is stable and identical on every node.
+        match self
+            .store
+            .put_opts(
+                &key,
+                Bytes::from(bytes).into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => {
+                self.bump_epoch();
+                Ok(proposed.clone())
+            }
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                // Lost the race: read back the durable winner.
+                self.get_bucket_assignment(project).await?.ok_or_else(|| {
+                    BasinError::catalog(
+                        "assign_bucket_if_absent: AlreadyExists but assignment not readable",
+                    )
+                })
+            }
+            Err(e) => Err(storage_err("assign bucket if absent", e)),
+        }
+    }
+
     // ---- SQL functions (durable; mirrors InMemory semantics) ----
 
     async fn register_sql_function(&self, mut def: SqlFunctionDef) -> Result<()> {
@@ -5480,6 +5579,56 @@ mod tests {
         assert_eq!(
             node_b.get_project_storage_config(&p).await.unwrap(),
             Some(cfg)
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_registry_and_assignment_persist_and_cas() {
+        use crate::bucket_pool::{
+            BucketAssignment, BucketRegistry, BucketRegistryEntry, BucketTier,
+        };
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let node_a = ObjectStoreCatalog::new(store.clone());
+        let node_b = ObjectStoreCatalog::new(store.clone());
+
+        // Empty registry by default; persisted registry round-trips to a peer.
+        assert!(node_b.get_bucket_registry().await.unwrap().buckets.is_empty());
+        let registry = BucketRegistry {
+            buckets: vec![BucketRegistryEntry {
+                bucket_id: "pool-0000".into(),
+                bucket_name: "pool-0000".into(),
+                endpoint: "https://example".into(),
+                region: "auto".into(),
+                credentials_ref: Some("AWS".into()),
+                assigned_count: 1,
+            }],
+        };
+        node_a.put_bucket_registry(&registry).await.unwrap();
+        assert_eq!(node_b.get_bucket_registry().await.unwrap(), registry);
+
+        // First assignment wins; a racing assignment to a DIFFERENT bucket
+        // returns the durable winner (create-if-absent CAS), so the assignment
+        // is stable.
+        let p = ProjectId::new();
+        assert!(node_a.get_bucket_assignment(&p).await.unwrap().is_none());
+        let first = BucketAssignment {
+            bucket_id: "pool-0000".into(),
+            tier: BucketTier::Pooled,
+        };
+        let won = node_a.assign_bucket_if_absent(&p, &first).await.unwrap();
+        assert_eq!(won, first);
+
+        let second = BucketAssignment {
+            bucket_id: "pool-0001".into(),
+            tier: BucketTier::Pooled,
+        };
+        let still = node_b.assign_bucket_if_absent(&p, &second).await.unwrap();
+        assert_eq!(still, first, "CAS must keep the first durable assignment");
+        // A fresh node re-reads the same stable assignment.
+        let node_c = ObjectStoreCatalog::new(store.clone());
+        assert_eq!(
+            node_c.get_bucket_assignment(&p).await.unwrap(),
+            Some(first)
         );
     }
 

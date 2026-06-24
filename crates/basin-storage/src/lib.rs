@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backends;
+pub mod bucket_pool;
 mod concurrency;
 pub mod index;
 mod data_file;
@@ -477,6 +478,14 @@ struct Inner {
     /// [`Storage::project_object_store`] routes its I/O to the
     /// registered store instead of `Inner::object_store`.
     byo_object_stores: Mutex<HashMap<ProjectId, Arc<dyn ObjectStore>>>,
+    /// #36 (Stage 1) — bounded multi-bucket storage pool. Attached by the
+    /// engine (or tests) via [`Storage::attach_bucket_pool`]; first attach
+    /// wins. When `None`, or when the pool's `BASIN_BUCKET_POOL` flag is OFF,
+    /// [`Storage::project_object_store`] routes every project to the single
+    /// shared `object_store` exactly as today (provable no-op). When attached
+    /// and ON, a project's warmed assignment routes its I/O to the assigned
+    /// pooled bucket.
+    bucket_pool: OnceLock<Arc<bucket_pool::BucketPool>>,
 }
 
 /// Best-effort counters for the read path. See [`Inner::read_counters`].
@@ -738,6 +747,7 @@ impl Storage {
                 project_config_cache: RwLock::new(HashMap::new()),
                 scheduler: Scheduler::new(resolve_global_budget()),
                 byo_object_stores: Mutex::new(HashMap::new()),
+                bucket_pool: OnceLock::new(),
             }),
         }
     }
@@ -745,6 +755,40 @@ impl Storage {
     /// Attach a per-project counter registry. Idempotent (first attach wins).
     pub fn attach_project_counters(&self, registry: Arc<ProjectCounterRegistry>) {
         let _ = self.inner.project_counters.set(registry);
+    }
+
+    /// #36 (Stage 1) — attach the bounded multi-bucket storage pool. Idempotent
+    /// (first attach wins). With no pool attached, or with the pool's
+    /// `BASIN_BUCKET_POOL` flag OFF, routing is byte-for-byte today's
+    /// single-bucket behaviour.
+    pub fn attach_bucket_pool(&self, pool: Arc<bucket_pool::BucketPool>) {
+        let _ = self.inner.bucket_pool.set(pool);
+    }
+
+    /// Handle to the attached bucket pool, if any.
+    pub fn bucket_pool(&self) -> Option<&Arc<bucket_pool::BucketPool>> {
+        self.inner.bucket_pool.get()
+    }
+
+    /// #36 (Stage 1) — ensure `project` has a stable, persisted bucket
+    /// assignment and that its routed store is cached for the synchronous
+    /// [`Storage::project_object_store`] path. Called on the async write path
+    /// before any `project_store` use. No-op when no pool is attached or the
+    /// flag is OFF, and idempotent otherwise (catalog round-trip happens at
+    /// most once per project per process until invalidated).
+    pub async fn ensure_bucket_assignment(&self, project: &ProjectId) -> Result<()> {
+        let Some(pool) = self.inner.bucket_pool.get() else {
+            return Ok(());
+        };
+        if !pool.enabled() {
+            return Ok(());
+        }
+        let Some(catalog) = self.inner.catalog.get() else {
+            // Pool ON but no catalog attached: cannot persist an assignment.
+            // Stay on the default store (no-op) rather than fail the write.
+            return Ok(());
+        };
+        pool.ensure_assignment(project, catalog.as_ref()).await
     }
 
     /// Attach a BYO-key envelope-encryption provider. Idempotent (first
@@ -1281,6 +1325,17 @@ impl Storage {
                 .expect("byo_object_stores poisoned");
             byo.get(project).cloned()
         };
+        // #36 (Stage 1): when no BYO override and the bucket pool is attached
+        // AND enabled AND this project has a warmed assignment, route to the
+        // assigned pooled bucket. Every other case (no pool, flag OFF, or no
+        // warmed assignment) falls through to the single shared store — the
+        // byte-for-byte current behaviour.
+        let backing = backing.or_else(|| {
+            self.inner
+                .bucket_pool
+                .get()
+                .and_then(|p| p.routed_store(project))
+        });
         let backing = backing.unwrap_or_else(|| self.inner.object_store.clone());
 
         let sem = self.project_semaphore(project);
@@ -1385,6 +1440,10 @@ impl Storage {
         table: &TableName,
         opts: ReadOptions,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        // #36 (Stage 1): warm the bucket assignment so the sync read path
+        // routes to the project's assigned pooled bucket. No-op when the pool
+        // is absent or OFF.
+        self.ensure_bucket_assignment(project).await?;
         reader::read(self, project, table, opts).await
     }
 
@@ -1395,6 +1454,7 @@ impl Storage {
         project: &ProjectId,
         table: &TableName,
     ) -> Result<Vec<DataFile>> {
+        self.ensure_bucket_assignment(project).await?;
         reader::list_data_files(self, project, table).await
     }
 

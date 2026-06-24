@@ -1,7 +1,41 @@
 # Multi-bucket storage pool — design
 
-Status: design (not yet implemented). Tracks engine tasks #36 (bounded tiered
-pool + routing), #37 (online consolidation on scale-down), #38 (tests).
+Status: **Stage 1 implemented (flag-gated, default OFF)** — the foundation
+(bucket registry + deterministic project→bucket assignment + routing through
+the single object-store chokepoint) is in the engine behind `BASIN_BUCKET_POOL`.
+Consolidation/migration (#37), dedicated-tier promotion, and multi-provider
+pools remain design-only. Tracks engine tasks #36 (bounded tiered pool +
+routing — Stage 1 done), #37 (online consolidation on scale-down — deferred),
+#38 (tests — Stage 1 allocation/stability/ceiling/round-trip done; the
+crash-injection migration matrix lands with #37).
+
+## Stage 1 — what shipped
+
+Behind `BASIN_BUCKET_POOL` (default OFF; OFF is a provable no-op routing to
+today's single bucket):
+
+- `basin-catalog::bucket_pool` — the persisted record shapes:
+  `BucketRegistryEntry` (`bucket_id → bucket_name/endpoint/region/credentials_ref
+  + assigned_count`; credentials referenced, never inlined), `BucketAssignment`
+  (`bucket_id + tier`), and the `BucketRegistry` global list. `Catalog` gains
+  `get/put_bucket_registry`, `get_bucket_assignment`, and
+  `assign_bucket_if_absent` (a create-if-absent CAS — the linearization point);
+  implemented for the in-memory and object-store backends.
+- `basin-storage::bucket_pool::BucketPool` — env config (`BASIN_BUCKET_POOL`,
+  `BASIN_BUCKET_POOL_MAX`, `BASIN_BUCKET_POOL_WATERMARK`), a per-process
+  assignment cache + resolved-store cache, a `BucketResolver` (maps a registry
+  entry's credentials-ref to a real `ObjectStore`; the engine wires the
+  S3 resolver, tests use in-memory stores), and `ensure_assignment` (the async,
+  catalog-backed, idempotent warm).
+- Routing hooks the single chokepoint `Storage::project_object_store`: BYO
+  override → pooled assignment (if warmed) → single shared store. The write/read
+  entries (`write_batch`, `read`, `list_data_files`) call
+  `Storage::ensure_bucket_assignment` first so the sync routing call only reads
+  the cache.
+
+Deferred (NOT in Stage 1): consolidation/migration (#37), dedicated promotion,
+multi-provider, the sustained-PUT-rate load signal (Stage 1 uses the cheap
+per-bucket assigned-project count; see `BucketPool::choose_bucket`).
 
 ## Problem
 

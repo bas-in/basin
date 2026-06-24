@@ -221,6 +221,11 @@ pub(crate) async fn write_batch_with_options(
     batch: &RecordBatch,
     opts: &WriteOptions,
 ) -> Result<DataFile> {
+    // #36 (Stage 1): warm the project's bucket assignment so the sync
+    // `project_store` calls below route to the assigned pooled bucket. No-op
+    // when the pool is absent or its flag is OFF.
+    storage.ensure_bucket_assignment(project).await?;
+
     let data_ulid = Ulid::new();
     let key = data_file_key(
         storage.root_prefix(),
