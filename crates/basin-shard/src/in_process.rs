@@ -2033,27 +2033,56 @@ impl InProcessShard {
         // the fast path conflict-free and avoids any double-commit. The
         // expensive (RTT-bound) work already happened concurrently in 2a; the
         // commit is an in-process catalog CAS.
+        // Take every written file for this wave up front (keep the DataFiles
+        // alive so the per-file sidecar indexing below can reference their
+        // paths), then commit them grouped by table in ONE append per table.
+        let wave_data_files: Vec<basin_storage::DataFile> = (0..plans.len())
+            .map(|i| {
+                written_by_idx[i]
+                    .take()
+                    .expect("every plan has a corresponding written file")
+            })
+            .collect();
+
+        // Group plan indices by table (a wave's chunks are usually one table,
+        // but the snapshot can span several within the partition), build the
+        // file refs, and commit each table's whole file set in ONE catalog
+        // append (#39: amortizes the per-commit segment+head PUTs across the
+        // wave instead of 2 PUTs per file). Commit serially per table so the
+        // per-partition CAS stays conflict-free.
+        let mut idx_by_table: HashMap<TableName, Vec<usize>> = HashMap::new();
+        for (idx, plan) in plans.iter().enumerate() {
+            idx_by_table.entry(plan.table.clone()).or_default().push(idx);
+        }
+        for (table, idxs) in &idx_by_table {
+            let files: Vec<DataFileRef> = idxs
+                .iter()
+                .map(|&i| {
+                    let df = &wave_data_files[i];
+                    DataFileRef {
+                        path: df.path.as_ref().to_string(),
+                        size_bytes: df.size_bytes,
+                        row_count: df.row_count,
+                        column_stats: df.column_stats.clone(),
+                        bloom_filters: df.bloom_filters.clone(),
+                        hll_sketches: ::std::collections::BTreeMap::new(),
+                        tdigest_sketches: ::std::collections::BTreeMap::new(),
+                    }
+                })
+                .collect();
+            // Representative batch (first plan's) for the create-table-on-first
+            // -commit path; schema is identical across a table's chunks.
+            self.commit_with_retry(project, table, partition, &plans[idxs[0]].merged, files)
+                .await?;
+        }
+
+        // Per-file sidecar indexing + drain bookkeeping (after the commits).
         for (idx, plan) in plans.iter().enumerate() {
             let table = &plan.table;
             let merged = &plan.merged;
             let gin_indexes = &plan.gin_indexes;
             let effective_rg_size = plan.effective_rg_size;
-            let data_file = written_by_idx[idx]
-                .take()
-                .expect("every plan has a corresponding written file");
-
-            let file_ref = DataFileRef {
-                path: data_file.path.as_ref().to_string(),
-                size_bytes: data_file.size_bytes,
-                row_count: data_file.row_count,
-                column_stats: data_file.column_stats.clone(),
-                bloom_filters: data_file.bloom_filters.clone(),
-                hll_sketches: ::std::collections::BTreeMap::new(),
-                tdigest_sketches: ::std::collections::BTreeMap::new(),
-            };
-
-            self.commit_with_retry(project, table, partition, merged, file_ref)
-                .await?;
+            let data_file = &wave_data_files[idx];
 
             // Re-index the compacted file's JSONB GIN columns into the
             // row-group bloom registry so the engine's `@>` row-group prune
@@ -2231,17 +2260,29 @@ impl InProcessShard {
         Ok(())
     }
 
-    /// Commit one data file to the catalog. On `CommitConflict`, reload + retry
-    /// once. The catalog auto-creates the table on first commit using the
-    /// batch's schema.
+    /// Commit a BATCH of data files to the catalog in ONE snapshot append. On
+    /// `CommitConflict`, reload + retry once. The catalog auto-creates the table
+    /// on first commit using the batch's schema.
+    ///
+    /// Batching matters for throughput (#39): each catalog append writes one
+    /// delta segment object + one head-pointer object (2 PUTs), regardless of
+    /// how many files it carries. Committing a whole compaction wave's files in
+    /// ONE append amortizes those 2 PUTs across the wave instead of paying 2
+    /// PUTs PER FILE — the per-partition commit path is the dominant sustained-
+    /// ingest cost (serial PUT-latency-bound), so this cuts commit PUTs by the
+    /// flush-concurrency factor. Exactly-once is unaffected: the append is a
+    /// single all-or-nothing CAS over the file set.
     async fn commit_with_retry(
         &self,
         project: &ProjectId,
         table: &TableName,
         partition: &PartitionKey,
         batch: &RecordBatch,
-        file: DataFileRef,
+        files: Vec<DataFileRef>,
     ) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
         // Make sure the table exists; if not, create it from the batch schema.
         //
         // Multi-node scaling fix: commit through the PARTITION-scoped catalog
@@ -2283,7 +2324,7 @@ impl InProcessShard {
             match self
                 .cfg
                 .catalog
-                .append_data_files_in_partition(project, table, pid, snapshot, vec![file.clone()])
+                .append_data_files_in_partition(project, table, pid, snapshot, files.clone())
                 .await
             {
                 Ok(_) => return Ok(()),
