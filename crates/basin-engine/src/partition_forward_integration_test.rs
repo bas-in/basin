@@ -605,3 +605,94 @@ async fn lost_ack_retry_reuses_key_and_applies_exactly_once() {
 
     std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
 }
+
+/// STAGE 1: a single-node, multi-batch bulk COPY must populate the session's
+/// `copy_touched` set with EVERY fan-out partition it wrote to, each carrying a
+/// monotone (strictly increasing across that partition's batches) WAL LSN — the
+/// per-partition last-LSN the end-of-COPY durable barrier awaits. Then
+/// `await_copy_durable` must drive every touched partition durable and clear
+/// the set.
+#[tokio::test]
+async fn copy_touched_set_covers_all_partitions_with_monotone_lsns() {
+    let _guard = FANOUT_ENV_LOCK.lock().unwrap();
+    // Pin a 4-way fan-out so the round-robin visits _default, s1, s2, s3.
+    std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "4");
+
+    let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = Arc::new(InMemoryCatalog::new());
+    // Local-only engine (no peer router): every fan-out write stays on-node, so
+    // every partition surfaces a local LSN into copy_touched.
+    let eng = engine_for(cold, catalog, "solo").await;
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT)").await.unwrap();
+
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+
+    // 8 batches of 10 rows each (>1 row → fan-out engages); round-robin over 4
+    // partitions means each partition is written twice → its LSN must advance.
+    let fanout = 4usize;
+    let n_batches = 8usize;
+    let per = 10usize;
+    let mut prev_lsn_per_part: std::collections::HashMap<PartitionKey, basin_wal::Lsn> =
+        std::collections::HashMap::new();
+
+    for i in 0..n_batches {
+        let base = (i * per) as i64;
+        let rows: Vec<Vec<Option<String>>> = (0..per)
+            .map(|k| vec![Some((base + k as i64).to_string())])
+            .collect();
+        sess.ingest_csv_batch("t", schema.clone(), None, rows)
+            .await
+            .unwrap();
+
+        // After each batch, the just-written partition's recorded LSN must be
+        // strictly greater than what it held before (monotone per partition).
+        let part = if i % fanout == 0 {
+            PartitionKey::default_key()
+        } else {
+            PartitionKey::new(format!("s{}", i % fanout)).unwrap()
+        };
+        let g = sess.copy_touched.lock().await;
+        let cur = *g.get(&part).expect("touched set must include the written partition");
+        if let Some(prev) = prev_lsn_per_part.get(&part) {
+            assert!(
+                cur > *prev,
+                "partition {} LSN must advance across batches ({cur:?} > {prev:?})",
+                part.as_str()
+            );
+        }
+        prev_lsn_per_part.insert(part, cur);
+        drop(g);
+    }
+
+    // Every one of the 4 fan-out partitions must be present in the touched set.
+    {
+        let g = sess.copy_touched.lock().await;
+        assert_eq!(g.len(), fanout, "touched set must cover all {fanout} partitions");
+        for i in 0..fanout {
+            let part = if i == 0 {
+                PartitionKey::default_key()
+            } else {
+                PartitionKey::new(format!("s{i}")).unwrap()
+            };
+            assert!(
+                g.contains_key(&part),
+                "touched set missing partition {}",
+                part.as_str()
+            );
+        }
+    }
+
+    // The barrier drives every touched partition durable and clears the set.
+    sess.await_copy_durable().await.unwrap();
+    assert!(
+        sess.copy_touched.lock().await.is_empty(),
+        "await_copy_durable must drain the touched set"
+    );
+
+    std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
+}

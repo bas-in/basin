@@ -3997,7 +3997,7 @@ impl InProcessProjectHandle {
         table: &TableName,
         batch: RecordBatch,
         durable: bool,
-    ) -> Result<()> {
+    ) -> Result<Lsn> {
         // Phase 6.X.C: short-circuit if this partition is mid-handoff.
         // The router treats `LeaseHandoffInProgress` as retryable: it
         // invalidates its lease cache for the partition and retries against
@@ -4169,19 +4169,23 @@ impl InProcessProjectHandle {
                 );
             }
         }
-        Ok(())
+        // Surface the WAL LSN this batch was appended at (Stage 1 of the
+        // end-of-COPY durable barrier): the bulk-ingest caller accumulates the
+        // max LSN per touched partition so `on_copy_done` can await durability
+        // through it before acking `COPY n`.
+        Ok(lsn)
     }
 }
 
 #[async_trait]
 impl ProjectHandleImpl for InProcessProjectHandle {
     #[instrument(skip(self, batch), fields(project = %self.project, partition = %self.partition, table = %table, rows = batch.num_rows()))]
-    async fn write_batch(&self, table: &TableName, batch: RecordBatch) -> Result<()> {
+    async fn write_batch(&self, table: &TableName, batch: RecordBatch) -> Result<Lsn> {
         self.write_batch_inner(table, batch, false).await
     }
 
     #[instrument(skip(self, batch), fields(project = %self.project, partition = %self.partition, table = %table, rows = batch.num_rows()))]
-    async fn write_batch_durable(&self, table: &TableName, batch: RecordBatch) -> Result<()> {
+    async fn write_batch_durable(&self, table: &TableName, batch: RecordBatch) -> Result<Lsn> {
         self.write_batch_inner(table, batch, true).await
     }
 
@@ -4248,6 +4252,21 @@ impl ProjectHandleImpl for InProcessProjectHandle {
 
     fn project(&self) -> ProjectId {
         self.project
+    }
+
+    fn partition(&self) -> PartitionKey {
+        self.partition.clone()
+    }
+
+    async fn await_durable(&self, lsn: Lsn) -> Result<()> {
+        // Delegate to the WAL's per-partition durable barrier. The WAL raises
+        // the fsync watermark to `lsn`, nudges the flush loop, and blocks until
+        // the published durable watermark covers `lsn` (the segment containing
+        // it has been PUT, and fsync'd on an `FsyncOnPut`-wrapped local store).
+        self.cfg
+            .wal
+            .await_durable(&self.project, &self.partition, lsn)
+            .await
     }
 }
 
@@ -8076,6 +8095,382 @@ mod tests {
             rows_in(&read),
             total_committed,
             "recovery must reconstruct every committed row (no segment dropped early)"
+        );
+    }
+
+    /// `ObjectStore` wrapper that models a crash that drops the un-flushed
+    /// RAM buffer of SELECTED WAL partitions. A PUT whose path contains any
+    /// configured "blocked" partition segment (e.g. `/s1/`) returns success
+    /// WITHOUT writing the segment — exactly what happens to an
+    /// ack-before-durable batch that was still in RAM (never PUT) when the
+    /// node crashed. Unblocked partitions PUT normally (their segments are
+    /// durable and survive the crash). All non-PUT ops delegate untouched.
+    #[derive(Debug)]
+    struct PartialFlushStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        /// Path-substrings whose PUTs are silently dropped (the partition's
+        /// un-flushed tail is "lost in the crash").
+        blocked: Vec<String>,
+    }
+
+    impl std::fmt::Display for PartialFlushStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PartialFlushStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for PartialFlushStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let loc = location.as_ref();
+            if self.blocked.iter().any(|b| loc.contains(b.as_str())) {
+                // Drop the segment: report success (the WAL ack'd it from RAM
+                // already) but never persist it — the crash window.
+                return Ok(object_store::PutResult {
+                    e_tag: None,
+                    version: None,
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Largest `id` value present across the recovered batches, and the count
+    /// of distinct ids. A contiguous prefix `1..=max` has `count == max`.
+    fn max_and_count(batches: &[RecordBatch]) -> (i64, usize) {
+        let mut max = 0i64;
+        let mut count = 0usize;
+        for b in batches {
+            let ids = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id col is Int64");
+            for i in 0..ids.len() {
+                let v = ids.value(i);
+                if v > max {
+                    max = v;
+                }
+                count += 1;
+            }
+        }
+        (max, count)
+    }
+
+    /// Shared driver for the fan-out crash scenarios. Drives a multi-batch,
+    /// multi-partition bulk-ingest exactly as `executor::write_batch_fanout`
+    /// does — round-robin whole 10k-row batches across 4 stripe partitions,
+    /// async (`synchronous_commit = off`). It returns the WAL it wrote to (so
+    /// the caller can run the durable barrier before the crash), the storage +
+    /// catalog + wal dir to reopen against, and the acked row count.
+    ///
+    /// The WAL is opened over a `PartialFlushStore` that DROPS the PUTs of
+    /// partitions `s1` and `s3`: those partitions' segments never reach the
+    /// store, modelling the un-flushed RAM buffers that a node crash loses.
+    /// `s0`/`s2` PUT normally and survive. `flush_interval`/`flush_max_bytes`
+    /// are set huge so nothing auto-flushes — the only durability point is the
+    /// explicit barrier / final `flush()`.
+    struct FanoutCrashFixture {
+        storage: Storage,
+        catalog: Arc<InMemoryCatalog>,
+        wal_dir: TempDir,
+        _storage_dir: TempDir,
+        wal: Arc<dyn Wal>,
+        project: ProjectId,
+        table: TableName,
+        parts: Vec<PartitionKey>,
+        acked: usize,
+    }
+
+    async fn write_fanout_copy() -> FanoutCrashFixture {
+        basin_common::telemetry::try_init_for_tests();
+        let storage_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+        let storage_fs: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap());
+        let storage = Storage::new(StorageConfig {
+            object_store: storage_fs,
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog = Arc::new(InMemoryCatalog::new());
+
+        let project = ProjectId::new();
+        let table = TableName::new("events").unwrap();
+        // Four fan-out stripe partitions, matching executor::stripe_partition_key.
+        let parts: Vec<PartitionKey> = vec![
+            PartitionKey::default_key(),
+            PartitionKey::new("s1".to_string()).unwrap(),
+            PartitionKey::new("s2".to_string()).unwrap(),
+            PartitionKey::new("s3".to_string()).unwrap(),
+        ];
+        let fanout = parts.len();
+
+        // 16 batches of 10k rows = 160k rows, ids 1..=160_000, round-robined.
+        let per = 10_000usize;
+        let n_batches = 16usize;
+
+        let crashy: Arc<dyn object_store::ObjectStore> = Arc::new(PartialFlushStore {
+            inner: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
+            blocked: vec!["/s1/".to_string(), "/s3/".to_string()],
+        });
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: crashy,
+                root_prefix: None,
+                flush_interval: Duration::from_secs(3600), // never auto-flush
+                flush_max_bytes: 1024 * 1024 * 1024,        // never pressure-flush
+                commit_delay: Duration::from_millis(1),
+            })
+            .await
+            .unwrap(),
+        );
+        let shard =
+            crate::Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+
+        let mut acked = 0usize;
+        for i in 0..n_batches {
+            let part = &parts[i % fanout];
+            let handle = shard.get(&project, part).await.unwrap();
+            let start = (i * per) as i64 + 1; // ids 1..=160_000
+            handle
+                .write_batch_opts(&table, batch(start, per, "v-"), false)
+                .await
+                .unwrap();
+            acked += per;
+        }
+
+        FanoutCrashFixture {
+            storage,
+            catalog,
+            wal_dir,
+            _storage_dir: storage_dir,
+            wal,
+            project,
+            table,
+            parts,
+            acked,
+        }
+    }
+
+    /// Reopen over the SAME wal dir with a CLEAN store (only the segments that
+    /// actually reached the store survive), replay every partition, and return
+    /// `(max_id, recovered_count)`.
+    async fn recover_fanout(fx: &FanoutCrashFixture) -> (i64, usize) {
+        let wal2: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(
+                    LocalFileSystem::new_with_prefix(fx.wal_dir.path()).unwrap(),
+                ),
+                root_prefix: None,
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
+            })
+            .await
+            .unwrap(),
+        );
+        let shard2 =
+            crate::Shard::new(ShardConfig::new(fx.storage.clone(), fx.catalog.clone(), wal2));
+        let mut recovered: Vec<RecordBatch> = Vec::new();
+        for part in &fx.parts {
+            let h = shard2.get(&fx.project, part).await.unwrap();
+            recovered.extend(h.read(&fx.table, ReadOptions::default()).await.unwrap());
+        }
+        max_and_count(&recovered)
+    }
+
+    /// STAGE 0 characterization of the bug: WITHOUT the durable barrier the
+    /// COPY is ACKed while two fan-out partitions' batches are still un-flushed
+    /// in RAM. A crash drops them, leaving HOLES below max(id); a `max(id)+1`
+    /// resumer silently skips the lost rows. This test PINS that loss: it
+    /// proves the recovered set is a non-contiguous prefix (count < max), i.e.
+    /// the ACK was a lie. The `with_barrier` test below proves the barrier
+    /// closes exactly this hole.
+    ///
+    /// (Run with the no-barrier assertion flipped to `count == max` to see the
+    /// raw repro failure: "recovered N rows but max(id)=160000".)
+    #[tokio::test]
+    async fn fanout_copy_crash_without_barrier_loses_rows() {
+        let fx = write_fanout_copy().await;
+        let acked = fx.acked;
+        // Crash boundary: a flush drops s1/s3 PUTs; s0/s2 persist.
+        let _ = fx.wal.flush().await;
+        fx.wal.close().await.unwrap();
+
+        let (max, count) = recover_fanout(&fx).await;
+        // The hole is real: two of four partitions' rows vanished, but max(id)
+        // (which lives in a surviving partition) did not — so a max(id)-based
+        // resumer would skip the lost rows entirely.
+        assert!(
+            (count as i64) < max,
+            "expected silent row loss without the barrier: recovered {count} rows \
+             with max(id)={max} (acked {acked}) — a hole below max(id)"
+        );
+        assert!(
+            count < acked,
+            "without the barrier the ACKed count {acked} overstates the durable rows {count}"
+        );
+    }
+
+    /// STAGE 2: WITH the end-of-COPY durable barrier the ACK is honest — the
+    /// COPY does not return "COPY n" until every touched partition is durable
+    /// through its last LSN (the same `Wal::await_durable` the router's
+    /// `on_copy_done` calls). A crash AFTER a successful barrier cannot lose
+    /// acked rows: recovery is a contiguous prefix AND the count equals the
+    /// acked count EXACTLY (no loss, no duplicate regression).
+    ///
+    /// Like the Stage 0 driver but over a CLEAN store (no dropped PUTs): the
+    /// `with_barrier` scenario writes through a store where every partition
+    /// CAN reach durability, so the barrier completes rather than hanging.
+    /// Returns the fixture and the acked count.
+    async fn write_fanout_copy_clean() -> FanoutCrashFixture {
+        basin_common::telemetry::try_init_for_tests();
+        let storage_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+        let storage_fs: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap());
+        let storage = Storage::new(StorageConfig {
+            object_store: storage_fs,
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let project = ProjectId::new();
+        let table = TableName::new("events").unwrap();
+        let parts: Vec<PartitionKey> = vec![
+            PartitionKey::default_key(),
+            PartitionKey::new("s1".to_string()).unwrap(),
+            PartitionKey::new("s2".to_string()).unwrap(),
+            PartitionKey::new("s3".to_string()).unwrap(),
+        ];
+        let fanout = parts.len();
+        let per = 10_000usize;
+        let n_batches = 16usize;
+
+        // Clean store, but huge flush thresholds so the ONLY durability path is
+        // the explicit end-of-COPY barrier (proves the barrier — not an
+        // incidental background flush — is what makes the rows durable).
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
+                root_prefix: None,
+                flush_interval: Duration::from_secs(3600),
+                flush_max_bytes: 1024 * 1024 * 1024,
+                commit_delay: Duration::from_millis(1),
+            })
+            .await
+            .unwrap(),
+        );
+        let shard =
+            crate::Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+        let mut acked = 0usize;
+        for i in 0..n_batches {
+            let part = &parts[i % fanout];
+            let h = shard.get(&project, part).await.unwrap();
+            let start = (i * per) as i64 + 1;
+            h.write_batch_opts(&table, batch(start, per, "v-"), false)
+                .await
+                .unwrap();
+            acked += per;
+        }
+        FanoutCrashFixture {
+            storage,
+            catalog,
+            wal_dir,
+            _storage_dir: storage_dir,
+            wal,
+            project,
+            table,
+            parts,
+            acked,
+        }
+    }
+
+    /// STAGE 2: WITH the end-of-COPY durable barrier the ACK is honest. After
+    /// the async fan-out appends, the barrier awaits durability of every
+    /// touched partition through its high-water LSN (the same `await_durable`
+    /// the router's `on_copy_done` calls) BEFORE the crash. NO explicit flush
+    /// runs — the barrier is the only durability point. A crash after a
+    /// successful barrier loses nothing: recovery is a contiguous prefix AND
+    /// the count equals the acked count EXACTLY (no loss, no duplicate).
+    #[tokio::test]
+    async fn fanout_copy_crash_with_barrier_preserves_all_rows() {
+        let fx = write_fanout_copy_clean().await;
+        // The barrier: await durability of every touched partition.
+        for part in &fx.parts {
+            let hw = fx.wal.high_water(&fx.project, part).await.unwrap();
+            fx.wal.await_durable(&fx.project, part, hw).await.unwrap();
+        }
+        // Crash boundary: close WITHOUT flush — durability was the barrier's job.
+        fx.wal.close().await.unwrap();
+
+        let (max, count) = recover_fanout(&fx).await;
+        assert_eq!(
+            count as i64, max,
+            "with the barrier recovery must be a contiguous prefix (count {count} == max {max})"
+        );
+        assert_eq!(
+            count, fx.acked,
+            "recovered count must equal acked count EXACTLY — no loss and no duplicate"
         );
     }
 }

@@ -451,6 +451,31 @@ pub trait Wal: Send + Sync + std::fmt::Debug {
     /// the local WAL it forces an upload of buffered entries.
     async fn flush(&self) -> Result<()>;
 
+    /// Block until `(project, partition)` is durable through `lsn` — i.e. the
+    /// segment containing `lsn` (and every lower LSN) has been PUT to the
+    /// backing store (and fsync'd on an `FsyncOnPut`-wrapped local store).
+    ///
+    /// This is the end-of-COPY durable barrier: a bulk-ingest session appends
+    /// async (ack-before-durable) per batch for throughput, then calls this
+    /// once per touched partition before acking `COPY n` to the client, so the
+    /// ack is honest — every acked row is on the store and survives a node
+    /// crash. Returns immediately if the partition is already durable through
+    /// `lsn` (including `lsn == Lsn::ZERO`, the no-rows case).
+    ///
+    /// Idempotent and concurrency-safe: it raises the partition's fsync
+    /// watermark to `max(current, lsn)`, nudges the flush loop, and waits on
+    /// the same `durable_lsn` watch the synchronous-commit path uses. The
+    /// default implementation is a no-op for backends that are already durable
+    /// on ack (e.g. [`RaftWal`]: quorum ack on append).
+    async fn await_durable(
+        &self,
+        _project: &ProjectId,
+        _partition: &PartitionKey,
+        _lsn: Lsn,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Return all entries for `(project, partition)` with LSN strictly greater
     /// than `since_lsn`, in append order. Used by the compactor and by shard
     /// owner cold-start replay.
@@ -677,6 +702,15 @@ impl Wal for LocalWal {
         self.inner.flush().await
     }
 
+    async fn await_durable(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        lsn: Lsn,
+    ) -> Result<()> {
+        self.inner.await_durable(project, partition, lsn).await
+    }
+
     async fn read_from(
         &self,
         project: &ProjectId,
@@ -802,6 +836,16 @@ pub(crate) trait WalImpl: Send + Sync {
         self.append_fenced(project, partition, payload, epoch).await
     }
     async fn flush(&self) -> Result<()>;
+    /// Block until `(project, partition)` is durable through `lsn`. See
+    /// [`Wal::await_durable`]. Default is a no-op (durable-on-ack backends).
+    async fn await_durable(
+        &self,
+        _project: &ProjectId,
+        _partition: &PartitionKey,
+        _lsn: Lsn,
+    ) -> Result<()> {
+        Ok(())
+    }
     async fn read_from(
         &self,
         project: &ProjectId,

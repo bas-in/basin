@@ -629,6 +629,45 @@ impl WalImpl for FileWal {
         self.inner.flush_all().await
     }
 
+    #[tracing::instrument(skip(self), fields(project=%project, partition=%partition, %lsn))]
+    async fn await_durable(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        lsn: Lsn,
+    ) -> Result<()> {
+        // The no-rows / nothing-written case: durable through LSN 0 is always
+        // true, so don't even touch the partition state.
+        if lsn == Lsn::ZERO {
+            return Ok(());
+        }
+        let state = self.inner.get_or_create_partition(project, partition).await;
+        let mut rx = {
+            let mut guard = state.lock().await;
+            // Fast path: already durable through `lsn`.
+            if guard.durable_lsn >= lsn {
+                return Ok(());
+            }
+            // Raise the fsync watermark so the next flush of the segment
+            // containing `lsn` fsyncs it (same mechanism the synchronous-commit
+            // append uses). Monotonic: never lower a higher request.
+            if lsn > guard.sync_requested_up_to {
+                guard.sync_requested_up_to = lsn;
+            }
+            guard.durable_tx.subscribe()
+        };
+        // Nudge the flush loop (a buffered-but-unflushed tail won't otherwise
+        // PUT until the next interval tick), then wait until the published
+        // durable watermark covers `lsn`. One segment PUT (+fsync) wakes every
+        // waiter it covers; a failed flush is retried by the loop and we keep
+        // waiting — "durable" means durable.
+        self.inner.flush_notify.notify_one();
+        rx.wait_for(|durable| *durable >= lsn).await.map_err(|_| {
+            BasinError::wal("wal closed while a durable barrier awaited durability")
+        })?;
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self), fields(project=%project, partition=%partition, %since_lsn))]
     async fn read_from(
         &self,
@@ -1125,6 +1164,60 @@ mod tests {
         for (i, e) in all.iter().enumerate() {
             assert_eq!(e.lsn, Lsn((i + 1) as u64));
         }
+        wal.close().await.unwrap();
+    }
+
+    /// `await_durable` is the end-of-COPY barrier: after async (ack-before-
+    /// durable) appends, awaiting durability through the high-water LSN must
+    /// guarantee every entry is on the store. Proven by reopening with NO
+    /// explicit flush in between — the reopened WAL must see all entries.
+    #[tokio::test]
+    async fn await_durable_makes_async_appends_recoverable() {
+        let dir = TempDir::new().unwrap();
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+
+        {
+            // Long flush interval + huge byte cap so nothing auto-flushes: the
+            // only path to durability is the explicit barrier below.
+            let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+            let cfg = WalConfig {
+                object_store: Arc::new(fs),
+                root_prefix: None,
+                flush_interval: Duration::from_secs(3600),
+                flush_max_bytes: 1024 * 1024 * 1024,
+                commit_delay: Duration::from_millis(1),
+            };
+            let wal = LocalWal::open(cfg).await.unwrap();
+            for i in 1..=12u64 {
+                // Async append (durable = false): ack-before-durable.
+                wal.append(&project, &part, payload(i)).await.unwrap();
+            }
+            let hw = wal.high_water(&project, &part).await.unwrap();
+            assert_eq!(hw, Lsn(12));
+            // The barrier: block until the partition is durable through hw.
+            wal.await_durable(&project, &part, hw).await.unwrap();
+            // A second await through the same LSN is a no-op fast path.
+            wal.await_durable(&project, &part, hw).await.unwrap();
+            // await through LSN 0 is always immediately satisfied.
+            wal.await_durable(&project, &part, Lsn::ZERO).await.unwrap();
+            // Close WITHOUT an explicit flush() — durability was the barrier's job.
+            wal.close().await.unwrap();
+        }
+
+        // Reopen: all 12 entries must replay even though flush() was never called.
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let cfg = WalConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            flush_interval: Duration::from_millis(50),
+            flush_max_bytes: 1024 * 1024,
+            commit_delay: Duration::from_millis(2),
+        };
+        let wal = LocalWal::open(cfg).await.unwrap();
+        assert_eq!(wal.high_water(&project, &part).await.unwrap(), Lsn(12));
+        let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+        assert_eq!(all.len(), 12, "await_durable must make every async append durable");
         wal.close().await.unwrap();
     }
 

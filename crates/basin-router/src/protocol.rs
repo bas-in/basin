@@ -173,6 +173,15 @@ pub(crate) trait Session: Send + Sync {
             "ingest_csv_batch not implemented for this session type".into(),
         ))
     }
+
+    /// End-of-COPY durable barrier: block until every partition the COPY
+    /// touched is WAL-durable through its last-written LSN before the client
+    /// is told `COPY n`. Makes the ack honest — a node crash mid-COPY can't
+    /// lose acked rows below the global `max(id)`. Default is a no-op so test
+    /// fakes need no override.
+    async fn await_copy_durable(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -217,6 +226,10 @@ impl Session for ProjectSession {
         rows: Vec<Vec<Option<String>>>,
     ) -> Result<u64> {
         ProjectSession::ingest_csv_batch(self, table_name, full_schema, column_names, rows).await
+    }
+
+    async fn await_copy_durable(&self) -> Result<()> {
+        ProjectSession::await_copy_durable(self).await
     }
 }
 
@@ -2924,6 +2937,13 @@ impl Session for PooledSessionWrapper {
             .ingest_csv_batch(table_name, full_schema, column_names, rows)
             .await
     }
+
+    // Forward the end-of-COPY durable barrier to the inner session too —
+    // without this override pooled COPYs (the default config) would use the
+    // no-op default and skip the barrier, re-opening the crash-loss window.
+    async fn await_copy_durable(&self) -> Result<()> {
+        self.pooled.session().await_copy_durable().await
+    }
 }
 
 #[async_trait]
@@ -3427,6 +3447,20 @@ impl<S: Session + 'static> CopyHandler for BasinSimpleQueryHandlerSlot<S> {
         };
         // Flush any final unterminated row.
         crate::copy::process_buffered_rows(&mut state, session.as_ref(), true).await;
+
+        // END-OF-COPY DURABLE BARRIER (crash consistency): before we ack
+        // `COPY n`, block until every partition this COPY touched is WAL-durable
+        // through its last-written LSN. The per-batch writes are async
+        // (ack-before-durable) for throughput; this single barrier makes the
+        // ACK honest, so a node crash mid-COPY cannot lose acked rows below the
+        // global max(id) (which would leave a hole a max(id)+1 resumer silently
+        // skips). On a barrier error we surface an ErrorResponse rather than a
+        // (dishonest) CommandComplete. Skipped when the COPY already errored.
+        if state.error.is_none() {
+            if let Err(e) = session.await_copy_durable().await {
+                state.error = Some(format!("COPY durability barrier: {e}"));
+            }
+        }
 
         // For the simple-protocol case: framework appends ReadyForQuery
         // itself after we return; we just emit the close tag.

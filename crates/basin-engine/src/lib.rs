@@ -1529,6 +1529,13 @@ pub struct ProjectSession {
     /// `open_session` / `open_session_as` / `open_session_with_auth`, all of
     /// which set `is_system = false`. There is no SQL statement that sets it.
     pub(crate) is_system: bool,
+    /// Partitions touched by the in-progress bulk COPY and the highest WAL LSN
+    /// written to each, accumulated per fan-out batch in `ingest_csv_batch`.
+    /// Drained + awaited by `await_copy_durable` at end-of-COPY (the
+    /// crash-consistency barrier), so the `COPY n` ack is durable. A session
+    /// runs at most one COPY at a time, so session scope is the right grain.
+    pub(crate) copy_touched:
+        tokio::sync::Mutex<std::collections::HashMap<basin_common::PartitionKey, basin_wal::Lsn>>,
 }
 
 impl ProjectSession {
@@ -1587,6 +1594,10 @@ impl ProjectSession {
         crate::session::listen_unsubscribe_all(&self.state);
         // 5: all session GUCs back to process defaults (complete-by-construction).
         self.state.reset_gucs();
+        // 6: drop any leftover end-of-COPY durable-barrier touched set (e.g. a
+        // COPY that errored before `await_copy_durable` drained it) so it can't
+        // leak into the next client that reuses this physical session.
+        self.copy_touched.lock().await.clear();
     }
 
     /// Run one SQL statement. Returns either a result set ([`ExecResult::Rows`])
@@ -1697,9 +1708,67 @@ impl ProjectSession {
         column_names: Option<&[String]>,
         rows: Vec<Vec<Option<String>>>,
     ) -> Result<u64> {
-        crate::copy_ingest::exec_copy_from_batch(self, table_name, full_schema, column_names, rows)
-            .await
+        let (rows_written, touched) =
+            crate::copy_ingest::exec_copy_from_batch(self, table_name, full_schema, column_names, rows)
+                .await?;
+        // Stage 1 of the end-of-COPY durable barrier: record the (partition,
+        // max-LSN) this batch landed at so `await_copy_durable` can await
+        // durability for every partition this COPY touched before the client
+        // is told `COPY n`. A forwarded/Parquet batch surfaces `None` and is
+        // not tracked here (see the multi-node TODO in `write_batch_fanout`).
+        if let Some((part, lsn)) = touched {
+            let mut g = self.copy_touched.lock().await;
+            let e = g.entry(part).or_insert(lsn);
+            if lsn > *e {
+                *e = lsn;
+            }
+        }
+        Ok(rows_written)
     }
+
+    /// End-of-COPY durable barrier: block until every partition this COPY
+    /// touched is WAL-durable through its highest-written LSN, then clear the
+    /// touched set. Makes the `COPY n` ack honest — on a node crash mid-COPY,
+    /// no acked row below the global `max(id)` can be lost (which would leave a
+    /// hole a `max(id)+1` resumer silently skips). Gated by
+    /// `BASIN_COPY_DURABLE_BARRIER` (on unless explicitly "0"/"false").
+    ///
+    /// MULTI-NODE CAVEAT (Stage 3 follow-up): partitions forwarded to a remote
+    /// owner are not in the touched set (their LSN is not observable locally),
+    /// so this awaits LOCAL partitions only. A forwarded batch is still
+    /// ack-before-durable across the network until the forward RPC returns the
+    /// owner's LSN and a remote `await_durable` is wired up.
+    pub async fn await_copy_durable(&self) -> Result<()> {
+        let touched: Vec<(basin_common::PartitionKey, basin_wal::Lsn)> = {
+            let mut g = self.copy_touched.lock().await;
+            g.drain().collect()
+        };
+        if touched.is_empty() || !copy_durable_barrier_enabled() {
+            return Ok(());
+        }
+        let Some(shard) = self.engine.config().shard.as_ref() else {
+            return Ok(());
+        };
+        for (part, lsn) in touched {
+            let handle = shard.get(&self.project, &part).await?;
+            handle.await_durable(lsn).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether the end-of-COPY durable barrier is engaged. ON by default; an
+/// operator can disable it with `BASIN_COPY_DURABLE_BARRIER=0` (or `false`).
+/// Cached so the COPY ack path pays a single relaxed load.
+fn copy_durable_barrier_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("BASIN_COPY_DURABLE_BARRIER") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "off" || v == "no")
+        }
+        Err(_) => true,
+    })
 }
 
 impl Drop for ProjectSession {

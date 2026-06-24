@@ -3032,6 +3032,7 @@ pub(crate) async fn open(
         session_pid,
         cancel_notify,
         is_system,
+        copy_touched: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     })
 }
 

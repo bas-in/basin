@@ -382,11 +382,13 @@ async fn write_batch_fanout(
     table: &TableName,
     batch: RecordBatch,
     durable: bool,
-) -> Result<()> {
+) -> Result<Option<(PartitionKey, basin_wal::Lsn)>> {
     let fanout = fanout_partition_count();
     if fanout <= 1 || batch.num_rows() <= 1 {
-        let handle = shard.get(project, &PartitionKey::default_key()).await?;
-        return handle.write_batch_opts(table, batch, durable).await;
+        let part = PartitionKey::default_key();
+        let handle = shard.get(project, &part).await?;
+        let lsn = handle.write_batch_opts_lsn(table, batch, durable).await?;
+        return Ok(Some((part, lsn)));
     }
 
     // Round-robin: claim the next slot for this table and advance the cursor.
@@ -411,11 +413,19 @@ async fn write_batch_fanout(
         let owner = router.desired_owner(project, part.as_str());
         if !owner.is_self {
             if let Some(client) = engine.partition_forward_client() {
+                // TODO(Stage 3 / multi-node durable barrier): a forwarded
+                // (remote-owned) partition is written on the OWNER node; its
+                // WAL LSN is not observable here, so we return `None` and the
+                // end-of-COPY barrier in `on_copy_done` awaits durability only
+                // for LOCAL partitions. A forwarded batch is therefore still
+                // ack-before-durable across the network. Closing this needs the
+                // forward RPC to return the owner's (partition, lsn) and a
+                // remote `await_durable` call. Tracked as a follow-up.
                 return forward_partition_to_owner(
                     engine, &client, &owner.base_url, project, table, &part, batch,
                 )
                 .await
-                .map(|_rows| ());
+                .map(|_rows| None);
             }
             // A multi-peer router resolved an off-node owner but no transport is
             // installed: fail loud rather than silently writing to the wrong
@@ -433,7 +443,8 @@ async fn write_batch_fanout(
     }
 
     let handle = shard.get(project, &part).await?;
-    handle.write_batch_opts(table, batch, durable).await
+    let lsn = handle.write_batch_opts_lsn(table, batch, durable).await?;
+    Ok(Some((part, lsn)))
 }
 
 /// Forward one fan-out batch to the node that owns `part`, retrying ONCE after
@@ -7968,6 +7979,21 @@ pub(crate) async fn exec_ingest_batch(
     table: &TableName,
     batch: RecordBatch,
 ) -> Result<u64> {
+    exec_ingest_batch_touched(sess, table, batch)
+        .await
+        .map(|(rows, _touched)| rows)
+}
+
+/// Like [`exec_ingest_batch`] but also returns the `(partition, max-LSN)` the
+/// batch was appended at on the LOCAL shard, when the write went through the
+/// bulk-ingest fan-out path. `None` means the batch did not surface a local
+/// LSN (forwarded to a remote owner, or the non-shard Parquet path). The COPY
+/// fast path uses this to drive the end-of-COPY durable barrier.
+pub(crate) async fn exec_ingest_batch_touched(
+    sess: &ProjectSession,
+    table: &TableName,
+    batch: RecordBatch,
+) -> Result<(u64, Option<(PartitionKey, basin_wal::Lsn)>)> {
     // INGEST hot path: the per-batch constraint prep needs only the table META
     // (schema / constraints / RLS policies / write tunables), NOT the unioned
     // per-partition data-file set. On the sharded `ObjectStoreCatalog` a full
@@ -8054,7 +8080,7 @@ pub(crate) async fn exec_ingest_batch(
             // compaction lanes. Reads union every partition; PK/UNIQUE checks
             // already ran above against all partitions. See `write_batch_fanout`.
             let _ = part;
-            write_batch_fanout(
+            let touched = write_batch_fanout(
                 &sess.engine,
                 shard,
                 &sess.project,
@@ -8063,7 +8089,7 @@ pub(crate) async fn exec_ingest_batch(
                 sess.synchronous_commit(),
             )
             .await?;
-            return Ok(row_count);
+            return Ok((row_count, touched));
         }
     }
 
@@ -8106,7 +8132,7 @@ pub(crate) async fn exec_ingest_batch(
             crate::session::tx_set_aborted(&sess.state);
             return Err(e);
         }
-        return Ok(row_count);
+        return Ok((row_count, None));
     }
 
     // Auto-commit: pre-commit hook → catalog commit → refresh.
@@ -8142,7 +8168,7 @@ pub(crate) async fn exec_ingest_batch(
     dispatch_post_commit(&sess.engine, events);
     refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, table).await?;
     write_insert_audit_rows(sess, meta.schema.as_ref(), std::slice::from_ref(&batch)).await?;
-    Ok(row_count)
+    Ok((row_count, None))
 }
 
 /// Expose `write_options_for` to `copy_ingest` (same crate, different module).

@@ -8,6 +8,33 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-24 — Crash-consistent COPY: end-of-COPY durable barrier
+
+A single `COPY` buffers its rows into batches that the bulk-ingest fan-out
+round-robins across N partitions, each appended to the WAL async (the default
+`synchronous_commit = off`: buffered in RAM, ack'd before the segment is
+PUT). The `COPY n` ack carried no durability barrier, so a node crash
+mid-COPY could lose the un-flushed RAM buffers of *some* partitions while
+others survived — leaving holes below the global `max(id)`. A resumer that
+trusts `max(id)+1` then silently skips the lost rows (observed: a node bounce
+mid-10M load lost 20k rows).
+
+`COPY n` is now withheld until every partition the COPY touched is WAL-durable
+through its last-written LSN: the fan-out write path surfaces each batch's
+`(partition, LSN)`, the session accumulates the max LSN per touched partition,
+and `on_copy_done` awaits durability for all of them (a new `Wal::await_durable`
+that raises the partition's fsync watermark and blocks on the same `durable_lsn`
+watch the synchronous-commit path uses) before emitting `CommandComplete`. The
+ack is now honest — every acked row is on the store — so existing
+watermark-gated WAL replay reconstructs the full contiguous prefix on restart
+and `max(id)` is a safe resume oracle again. Per-batch writes stay async (no
+forced per-batch fsync), so bulk throughput is unchanged; the cost is one
+durability wait at end-of-COPY. Gated by `BASIN_COPY_DURABLE_BARRIER` (on by
+default; set `0`/`false` to disable). Multi-node caveat: a COPY that forwards a
+partition to a remote owner currently awaits only its *local* partitions
+(forwarded batches remain ack-before-durable across the network until the
+forward RPC returns the owner's LSN — a tracked follow-up).
+
 ## 2026-06-24 — Metadata-only aggregates over an integer range predicate
 
 `SELECT COUNT(*) / MIN(col) / MAX(col) / SUM(col) FROM t WHERE col >= A AND col < B`

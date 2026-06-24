@@ -619,9 +619,9 @@ pub(crate) async fn exec_copy_from_batch(
     full_schema: Arc<Schema>,
     column_names: Option<&[String]>,
     rows: Vec<Vec<Option<String>>>,
-) -> Result<u64> {
+) -> Result<(u64, Option<(basin_common::PartitionKey, basin_wal::Lsn)>)> {
     if rows.is_empty() {
-        return Ok(0);
+        return Ok((0, None));
     }
 
     // Quick check: partitioned tables are not yet supported in this increment.
@@ -676,7 +676,7 @@ pub(crate) async fn exec_copy_from_batch(
     };
 
     let table = TableName::new(table_name.to_owned())?;
-    crate::executor::exec_ingest_batch(sess, &table, batch).await
+    crate::executor::exec_ingest_batch_touched(sess, &table, batch).await
 }
 
 /// Apply column defaults for any unlisted columns.

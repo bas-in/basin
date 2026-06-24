@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use basin_common::{PartitionKey, ProjectId, Result, TableName};
+use basin_wal::Lsn;
 
 /// Default cadence of the hot-tier clean-retention sweep, seconds
 /// (`BASIN_HOTTIER_SWEEP_SECS`).
@@ -673,7 +674,7 @@ impl ProjectHandle {
     /// the next WAL flush (200 ms tick / 1 MiB pressure / explicit flush).
     /// The batch is ack'd before it has reached Parquet.
     pub async fn write_batch(&self, table: &TableName, batch: RecordBatch) -> Result<()> {
-        self.inner.write_batch(table, batch).await
+        self.inner.write_batch(table, batch).await.map(|_lsn| ())
     }
 
     /// [`Self::write_batch`] with an explicit durability mode. `durable =
@@ -689,11 +690,39 @@ impl ProjectHandle {
         batch: RecordBatch,
         durable: bool,
     ) -> Result<()> {
+        self.write_batch_opts_lsn(table, batch, durable)
+            .await
+            .map(|_lsn| ())
+    }
+
+    /// [`Self::write_batch_opts`] that additionally returns the WAL [`Lsn`] the
+    /// batch landed at. Used by the bulk-ingest fan-out path to record the max
+    /// LSN per touched partition for the end-of-COPY durable barrier (so a
+    /// crash mid-COPY can't lose acked rows below the global max id).
+    pub async fn write_batch_opts_lsn(
+        &self,
+        table: &TableName,
+        batch: RecordBatch,
+        durable: bool,
+    ) -> Result<Lsn> {
         if durable {
             self.inner.write_batch_durable(table, batch).await
         } else {
             self.inner.write_batch(table, batch).await
         }
+    }
+
+    /// Block until this partition is durable through `lsn` on the backing
+    /// store (the end-of-COPY barrier; see [`basin_wal::Wal::await_durable`]).
+    /// `lsn == Lsn::ZERO` (or already-durable) returns immediately.
+    pub async fn await_durable(&self, lsn: Lsn) -> Result<()> {
+        self.inner.await_durable(lsn).await
+    }
+
+    /// The `(project, partition)` this handle addresses. Used by the bulk
+    /// ingest path to key the touched-partition durable set.
+    pub fn partition(&self) -> PartitionKey {
+        self.inner.partition()
     }
 
     /// Read all rows currently visible for a table — both the in-RAM tail
@@ -968,12 +997,16 @@ pub(crate) trait ShardImpl: Send + Sync {
 
 #[async_trait]
 pub(crate) trait ProjectHandleImpl: Send + Sync {
-    async fn write_batch(&self, table: &TableName, batch: RecordBatch) -> Result<()>;
+    /// Append `batch` and return the WAL [`Lsn`] it landed at. The LSN is
+    /// surfaced so the bulk-ingest fan-out path can record the max LSN per
+    /// touched partition and await durability through it at end-of-COPY (the
+    /// crash-consistency barrier).
+    async fn write_batch(&self, table: &TableName, batch: RecordBatch) -> Result<Lsn>;
     /// Synchronous-commit variant of [`Self::write_batch`]: only returns
     /// once the WAL append is durable on the backing store (group-commit).
     /// Default delegates to `write_batch` so backends whose plain append is
-    /// already durable-on-ack need no override.
-    async fn write_batch_durable(&self, table: &TableName, batch: RecordBatch) -> Result<()> {
+    /// already durable-on-ack need no override. Returns the appended LSN.
+    async fn write_batch_durable(&self, table: &TableName, batch: RecordBatch) -> Result<Lsn> {
         self.write_batch(table, batch).await
     }
     async fn read(
@@ -981,6 +1014,13 @@ pub(crate) trait ProjectHandleImpl: Send + Sync {
         table: &TableName,
         opts: basin_storage::ReadOptions,
     ) -> Result<Vec<RecordBatch>>;
+    /// Block until this partition is durable through `lsn`. Default is a
+    /// no-op for backends that are durable on ack.
+    async fn await_durable(&self, _lsn: Lsn) -> Result<()> {
+        Ok(())
+    }
+    /// The partition key this handle addresses.
+    fn partition(&self) -> PartitionKey;
     fn last_active(&self) -> Instant;
     fn project(&self) -> ProjectId;
 }
