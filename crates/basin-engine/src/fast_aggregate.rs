@@ -85,6 +85,28 @@ pub(crate) struct MetadataAggregatePlan {
     /// Output columns, in projection order. Each carries the aggregate
     /// kind and the exact DataFusion-equivalent output column name.
     pub aggs: Vec<(AggKind, String)>,
+    /// `Some` when the query carried a recognised `WHERE` that reduces to a
+    /// half-open integer range `lo <= col < hi` on a SINGLE column (see
+    /// [`RangeBound`]). The aggregate is then answered from the subset of
+    /// files whose per-file min/max lie ENTIRELY inside the range; if any
+    /// surviving file only partially overlaps, the execute path bails to a
+    /// full scan (we can't know the in-range row count / extremes of a
+    /// partial file from metadata alone). `None` is the original WHERE-less
+    /// shape.
+    pub range: Option<RangeBound>,
+}
+
+/// A `WHERE` reduced to a half-open integer range `lo <= col < hi` on one
+/// column. `lo`/`hi` are `None` when that side is unbounded. Built only from
+/// an AND-conjunction of `col </<=/>/>=  <int-literal>` comparisons on the
+/// SAME column (either operand order); anything else (OR, BETWEEN, a second
+/// column, a non-integer literal, equality) drops the whole query off the
+/// fast path. Bounds are normalised to inclusive-lo / exclusive-hi.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RangeBound {
+    pub column: String,
+    pub lo: Option<i64>,
+    pub hi: Option<i64>,
 }
 
 /// Recognise the supported "pure metadata aggregate" shape. Returns `None`
@@ -148,11 +170,17 @@ fn match_query(q: &Query) -> Option<MetadataAggregatePlan> {
         _ => return None,
     }
 
-    // WHERE absent — v1 scope. A filtered aggregate would need
-    // whole-file-prune reasoning that is error-prone; bail to DataFusion.
-    if select.selection.is_some() {
-        return None;
-    }
+    // WHERE: accept ONLY a half-open integer range on a single column
+    // (`col >= A AND col < B`, either bound optional, operands either order).
+    // Anything else bails to DataFusion. A NULL/odd shape returns None from
+    // the parser, so the contract stays "when in doubt, full scan".
+    let range = match &select.selection {
+        None => None,
+        Some(expr) => match parse_range_bound(expr) {
+            Some(rb) => Some(rb),
+            None => return None,
+        },
+    };
 
     // FROM: exactly one bare table, no joins, no alias / args / hints /
     // version / ordinality / partitions.
@@ -207,7 +235,131 @@ fn match_query(q: &Query) -> Option<MetadataAggregatePlan> {
         aggs.push((kind, name));
     }
 
-    Some(MetadataAggregatePlan { table, aggs })
+    Some(MetadataAggregatePlan { table, aggs, range })
+}
+
+/// Parse a `WHERE` predicate into a half-open integer [`RangeBound`] on a
+/// single column, or `None` to fall through to DataFusion. Accepts only an
+/// AND-conjunction of `col`-vs-`<int literal>` comparisons (`>`, `>=`, `<`,
+/// `<=`) on ONE column, in either operand order. Equality, `OR`, `BETWEEN`,
+/// `IS NULL`, a second column, a non-integer literal, or any other shape
+/// returns `None` — keeping the recogniser conservative.
+fn parse_range_bound(expr: &Expr) -> Option<RangeBound> {
+    let mut acc = RangeBound { column: String::new(), lo: None, hi: None };
+    collect_range(expr, &mut acc)?;
+    if acc.column.is_empty() {
+        return None; // no comparison contributed a column
+    }
+    // An empty or inverted range (lo >= hi) is a valid predicate but a
+    // degenerate one; let DataFusion handle it rather than reason about it.
+    if let (Some(lo), Some(hi)) = (acc.lo, acc.hi) {
+        if lo >= hi {
+            return None;
+        }
+    }
+    Some(acc)
+}
+
+/// Walk an AND-tree of comparisons, tightening `acc`'s bounds. Returns `None`
+/// the instant it meets anything outside the accepted grammar (a different
+/// column, a non-`AND` connective, a non-integer literal, an unsupported
+/// operator). All comparisons must reference the SAME column.
+fn collect_range(expr: &Expr, acc: &mut RangeBound) -> Option<()> {
+    use sqlparser::ast::BinaryOperator as Op;
+    let binop = match expr {
+        Expr::BinaryOp { left, op, right } => (left, op, right),
+        // A parenthesised sub-predicate is transparent.
+        Expr::Nested(inner) => return collect_range(inner, acc),
+        _ => return None,
+    };
+    let (left, op, right) = binop;
+    if matches!(op, Op::And) {
+        collect_range(left, acc)?;
+        collect_range(right, acc)?;
+        return Some(());
+    }
+
+    // A leaf comparison: exactly one side a bare column, the other an integer
+    // literal. Normalise so `col OP value`.
+    let (col, value, flipped) = match (column_name(left), int_literal(right)) {
+        (Some(c), Some(v)) => (c, v, false),
+        _ => match (int_literal(left), column_name(right)) {
+            // `value OP col` — flip the operator's sense below.
+            (Some(v), Some(c)) => (c, v, true),
+            _ => return None,
+        },
+    };
+    // All comparisons must be on the same column.
+    if acc.column.is_empty() {
+        acc.column = col;
+    } else if acc.column != col {
+        return None;
+    }
+
+    // Resolve the effective operator after a possible operand flip
+    // (`5 < col` ≡ `col > 5`).
+    let eff = match (op, flipped) {
+        (Op::Gt, false) | (Op::Lt, true) => Bound::GtExcl,
+        (Op::GtEq, false) | (Op::LtEq, true) => Bound::GtIncl,
+        (Op::Lt, false) | (Op::Gt, true) => Bound::LtExcl,
+        (Op::LtEq, false) | (Op::GtEq, true) => Bound::LtIncl,
+        _ => return None, // Eq / NotEq / Spaceship / anything else
+    };
+    match eff {
+        // lower bound, normalise to inclusive-lo
+        Bound::GtIncl => tighten_lo(acc, value),
+        Bound::GtExcl => tighten_lo(acc, value.checked_add(1)?),
+        // upper bound, normalise to exclusive-hi
+        Bound::LtExcl => tighten_hi(acc, value),
+        Bound::LtIncl => tighten_hi(acc, value.checked_add(1)?),
+    }
+    Some(())
+}
+
+enum Bound {
+    GtIncl,
+    GtExcl,
+    LtIncl,
+    LtExcl,
+}
+
+fn tighten_lo(acc: &mut RangeBound, v: i64) {
+    acc.lo = Some(match acc.lo {
+        Some(cur) => cur.max(v),
+        None => v,
+    });
+}
+
+fn tighten_hi(acc: &mut RangeBound, v: i64) {
+    acc.hi = Some(match acc.hi {
+        Some(cur) => cur.min(v),
+        None => v,
+    });
+}
+
+/// A bare (single-identifier) column reference, else `None`.
+fn column_name(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Identifier(id) => Some(id.value.clone()),
+        Expr::Nested(inner) => column_name(inner),
+        _ => None,
+    }
+}
+
+/// A non-negative-or-negative integer literal as `i64`, else `None`. Accepts
+/// `Value::Number` (the lexer's form for `123`) and a unary-minus wrapper
+/// (`-123` parses as `UnaryOp{Minus, Number}`). Rejects floats, strings, etc.
+fn int_literal(e: &Expr) -> Option<i64> {
+    use sqlparser::ast::{UnaryOperator, Value, ValueWithSpan};
+    match e {
+        Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => s.parse::<i64>().ok(),
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
+            int_literal(expr).and_then(|v| v.checked_neg())
+        }
+        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => int_literal(expr),
+        Expr::Nested(inner) => int_literal(inner),
+        _ => None,
+    }
 }
 
 fn single_part_table(name: &ObjectName) -> Option<TableName> {
@@ -401,6 +553,14 @@ pub(crate) async fn execute_metadata_aggregate(
     {
         return Ok(None);
     }
+    // With a range predicate even COUNT(*) can't trust the tombstone counter:
+    // a tombstone removes one cold row, but we can't tell from the counter
+    // whether that row's id falls inside the range. Bail to a full scan (which
+    // runs the overlay filter) whenever any tombstone is live and a range is
+    // in play.
+    if plan.range.is_some() && overlay_tombstones > 0 {
+        return Ok(None);
+    }
 
     let meta = match prefetched_meta {
         Some(m) => m,
@@ -415,6 +575,21 @@ pub(crate) async fn execute_metadata_aggregate(
 
     let schema = meta.schema.as_ref();
     let files = meta.live_data_files();
+
+    // Range predicate: keep only files whose per-file min/max lie ENTIRELY
+    // inside [lo, hi). Non-overlapping files are dropped (they contribute
+    // nothing); a file that only partially overlaps means we'd have to count
+    // its in-range rows / find its in-range extreme by decoding data, so we
+    // bail the whole query to a full scan. Every aggregate below then folds
+    // over this in-range subset exactly as it would over a whole table — the
+    // file stats it reads are, by construction, all within the range.
+    let files = match &plan.range {
+        None => files,
+        Some(rb) => match filter_files_in_range(&files, rb, schema) {
+            Some(f) => f,
+            None => return Ok(None),
+        },
+    };
 
     let mut out_fields: Vec<Field> = Vec::with_capacity(plan.aggs.len());
     let mut out_cols: Vec<ArrayRef> = Vec::with_capacity(plan.aggs.len());
@@ -539,6 +714,60 @@ fn decode_f64(b: &[u8]) -> Option<f64> {
     let mut arr = [0u8; 8];
     arr.copy_from_slice(b);
     Some(f64::from_le_bytes(arr))
+}
+
+/// Keep only the files whose per-file min/max for the range column lie
+/// ENTIRELY inside `[rb.lo, rb.hi)`; return `None` (bail to a full scan) the
+/// moment a file only PARTIALLY overlaps — we can't fold an exact in-range
+/// answer from a partial file's metadata.
+///
+/// Conservative bail conditions (all → `None`):
+/// * range column absent from the schema, or not exactly `Int64`,
+/// * any file missing the column's stats / min / max bytes,
+/// * any file with `null_count != Some(0)` for the range column — a NULL row
+///   is NOT matched by `col >= A AND col < B`, so a file holding nulls has
+///   `row_count > in-range rows` and would over-count COUNT(*),
+/// * any file partially overlapping the range.
+///
+/// Files entirely OUTSIDE the range are dropped (contribute nothing). The
+/// returned subset is folded by the normal per-aggregate code: by
+/// construction every kept file's rows all satisfy the predicate, so the
+/// existing folds give the exact range answer.
+fn filter_files_in_range(
+    files: &[basin_catalog::DataFileRef],
+    rb: &RangeBound,
+    schema: &Schema,
+) -> Option<Vec<basin_catalog::DataFileRef>> {
+    let field = schema.fields().iter().find(|f| f.name() == &rb.column)?;
+    if *field.data_type() != DataType::Int64 {
+        return None;
+    }
+    let mut kept: Vec<basin_catalog::DataFileRef> = Vec::new();
+    for f in files {
+        let cs = f.column_stats.get(&rb.column)?;
+        // Require a proven-zero null count so row_count == in-range row count.
+        if cs.null_count != Some(0) {
+            return None;
+        }
+        let fmin = decode_i64(cs.min_bytes.as_deref()?)?;
+        let fmax = decode_i64(cs.max_bytes.as_deref()?)?;
+        // Entirely outside [lo, hi)? (hi is exclusive.)
+        let below = rb.lo.map_or(false, |lo| fmax < lo);
+        let above = rb.hi.map_or(false, |hi| fmin >= hi);
+        if below || above {
+            continue;
+        }
+        // Entirely inside?
+        let lo_ok = rb.lo.map_or(true, |lo| fmin >= lo);
+        let hi_ok = rb.hi.map_or(true, |hi| fmax < hi);
+        if lo_ok && hi_ok {
+            kept.push(f.clone());
+        } else {
+            // Partial overlap — can't answer from metadata alone.
+            return None;
+        }
+    }
+    Some(kept)
 }
 
 /// Fold per-file min (or max) for `col`. Returns:
@@ -1161,9 +1390,182 @@ mod tests {
     }
 
     #[test]
-    fn rejects_where() {
-        let stmt = parse_one("SELECT COUNT(*) FROM t WHERE id > 5");
+    fn matches_simple_range_where() {
+        // A half-open integer range on one column is now a recognised shape.
+        let stmt = parse_one("SELECT COUNT(*) FROM t WHERE id >= 100 AND id < 500");
+        let plan = match_metadata_aggregate(&stmt).expect("range should match");
+        let rb = plan.range.expect("range present");
+        assert_eq!(rb.column, "id");
+        assert_eq!(rb.lo, Some(100));
+        assert_eq!(rb.hi, Some(500));
+    }
+
+    #[test]
+    fn range_normalises_strict_and_inclusive_bounds() {
+        // `id > 5` → lo=6 (exclusive→inclusive); `id <= 9` → hi=10 (incl→excl).
+        let stmt = parse_one("SELECT MAX(id) FROM t WHERE id > 5 AND id <= 9");
+        let rb = match_metadata_aggregate(&stmt).unwrap().range.unwrap();
+        assert_eq!((rb.lo, rb.hi), (Some(6), Some(10)));
+    }
+
+    #[test]
+    fn range_accepts_flipped_operands() {
+        // `100 <= id` ≡ `id >= 100`; `id < 500` upper bound.
+        let stmt = parse_one("SELECT COUNT(*) FROM t WHERE 100 <= id AND id < 500");
+        let rb = match_metadata_aggregate(&stmt).unwrap().range.unwrap();
+        assert_eq!((rb.column.as_str(), rb.lo, rb.hi), ("id", Some(100), Some(500)));
+    }
+
+    #[test]
+    fn range_single_sided_bound() {
+        let stmt = parse_one("SELECT COUNT(*) FROM t WHERE id >= 100");
+        let rb = match_metadata_aggregate(&stmt).unwrap().range.unwrap();
+        assert_eq!((rb.lo, rb.hi), (Some(100), None));
+    }
+
+    #[test]
+    fn range_rejects_two_columns() {
+        // Two distinct columns is not a single-column range.
+        let stmt = parse_one("SELECT COUNT(*) FROM t WHERE id >= 1 AND k < 9");
         assert!(match_metadata_aggregate(&stmt).is_none());
+    }
+
+    #[test]
+    fn range_rejects_or_and_equality() {
+        assert!(
+            match_metadata_aggregate(&parse_one(
+                "SELECT COUNT(*) FROM t WHERE id > 1 OR id < 9"
+            ))
+            .is_none()
+        );
+        assert!(
+            match_metadata_aggregate(&parse_one("SELECT COUNT(*) FROM t WHERE id = 5"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn range_rejects_non_integer_literal() {
+        assert!(
+            match_metadata_aggregate(&parse_one(
+                "SELECT COUNT(*) FROM t WHERE id < 5.5"
+            ))
+            .is_none()
+        );
+        assert!(
+            match_metadata_aggregate(&parse_one(
+                "SELECT COUNT(*) FROM t WHERE id > 'x'"
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn range_rejects_empty_interval() {
+        // lo >= hi is degenerate — defer to DataFusion.
+        let stmt = parse_one("SELECT COUNT(*) FROM t WHERE id >= 500 AND id < 100");
+        assert!(match_metadata_aggregate(&stmt).is_none());
+    }
+
+    #[test]
+    fn plain_aggregate_has_no_range() {
+        let stmt = parse_one("SELECT COUNT(*) FROM t");
+        assert!(match_metadata_aggregate(&stmt).unwrap().range.is_none());
+    }
+
+    // ── filter_files_in_range unit tests ─────────────────────────────────
+
+    fn id_schema() -> Schema {
+        Schema::new(vec![Field::new("id", DataType::Int64, false)])
+    }
+
+    /// Build a one-column ("id") file with the given min/max/null_count/rows.
+    fn file_with(min: i64, max: i64, nulls: u64, rows: u64) -> basin_catalog::DataFileRef {
+        let mut cs = std::collections::BTreeMap::new();
+        cs.insert(
+            "id".to_string(),
+            basin_catalog::ColumnStats {
+                null_count: Some(nulls),
+                min_bytes: Some(min.to_le_bytes().to_vec()),
+                max_bytes: Some(max.to_le_bytes().to_vec()),
+                sum_bytes: None,
+            },
+        );
+        basin_catalog::DataFileRef {
+            path: format!("f-{min}-{max}"),
+            size_bytes: 0,
+            row_count: rows,
+            column_stats: cs,
+            bloom_filters: Default::default(),
+            hll_sketches: Default::default(),
+            tdigest_sketches: Default::default(),
+        }
+    }
+
+    fn rb(lo: Option<i64>, hi: Option<i64>) -> RangeBound {
+        RangeBound { column: "id".into(), lo, hi }
+    }
+
+    #[test]
+    fn filter_keeps_fully_covered_drops_outside() {
+        let sc = id_schema();
+        let files = vec![
+            file_with(0, 99, 0, 100),    // below [100,500) → dropped
+            file_with(100, 199, 0, 100), // inside → kept
+            file_with(200, 299, 0, 100), // inside → kept
+            file_with(500, 599, 0, 100), // above → dropped
+        ];
+        let kept = filter_files_in_range(&files, &rb(Some(100), Some(500)), &sc).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept.iter().map(|f| f.row_count).sum::<u64>(), 200);
+    }
+
+    #[test]
+    fn filter_bails_on_partial_overlap() {
+        let sc = id_schema();
+        // file [50,150) straddles the lower bound 100 → can't answer.
+        let files = vec![file_with(50, 150, 0, 100)];
+        assert!(filter_files_in_range(&files, &rb(Some(100), Some(500)), &sc).is_none());
+    }
+
+    #[test]
+    fn filter_bails_on_nulls_in_range_column() {
+        let sc = id_schema();
+        // Fully covered by min/max but holds nulls → row_count over-counts.
+        let files = vec![file_with(100, 199, 3, 100)];
+        assert!(filter_files_in_range(&files, &rb(Some(100), Some(500)), &sc).is_none());
+    }
+
+    #[test]
+    fn filter_half_open_upper_is_exclusive() {
+        let sc = id_schema();
+        // hi=200 exclusive: a file whose max is 200 is NOT fully inside.
+        let straddle = vec![file_with(150, 200, 0, 100)];
+        assert!(filter_files_in_range(&straddle, &rb(Some(100), Some(200)), &sc).is_none());
+        // max 199 < 200 → fully inside.
+        let inside = vec![file_with(150, 199, 0, 100)];
+        assert_eq!(
+            filter_files_in_range(&inside, &rb(Some(100), Some(200)), &sc)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn filter_single_sided_and_unbounded() {
+        let sc = id_schema();
+        let files = vec![file_with(0, 99, 0, 100), file_with(100, 199, 0, 100)];
+        // lo=100, no hi → first file dropped, second kept.
+        let kept = filter_files_in_range(&files, &rb(Some(100), None), &sc).unwrap();
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn filter_bails_on_non_int64_column() {
+        let sc = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+        let files = vec![file_with(100, 199, 0, 100)];
+        assert!(filter_files_in_range(&files, &rb(Some(100), Some(500)), &sc).is_none());
     }
 
     #[test]

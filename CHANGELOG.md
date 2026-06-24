@@ -8,6 +8,21 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-24 — Metadata-only aggregates over an integer range predicate
+
+`SELECT COUNT(*) / MIN(col) / MAX(col) / SUM(col) FROM t WHERE col >= A AND col < B`
+(a half-open integer range on a single column) is now answered from per-file
+catalog `column_stats` instead of a full scan — the same fast path that already
+served the WHERE-less forms. The recogniser accepts an AND-conjunction of
+`col`-vs-`<int literal>` comparisons (`>`, `>=`, `<`, `<=`, either operand
+order, bounds optional) on one column; anything else (OR, BETWEEN, equality, a
+second column, a non-integer literal) still falls through to DataFusion. Files
+whose per-file min/max lie entirely inside the range fold their `row_count` /
+min / max directly; a file that only partially overlaps the range (or carries
+nulls in the range column, or lacks stats) bails the whole query to a correct
+full scan. Same answer, no data decode when the range aligns with file
+boundaries.
+
 ## 2026-06-21 — Bound per-partition data-file count: file-merge compaction tier for truly flat ingest
 
 The previous two ingest-flatness fixes (O(1) delta-segment commits; dropping the
