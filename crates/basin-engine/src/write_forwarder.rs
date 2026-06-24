@@ -512,7 +512,20 @@ impl HttpPartitionForwardClient {
     }
 
     pub fn with_secret(secret: impl Into<String>) -> Self {
-        Self::new(reqwest::Client::new(), secret.into())
+        // Build a client that survives a PEER RESTART (#35). A peer that bounces
+        // keeps the same 6PN URL, so discovery's peer-set-unchanged check never
+        // rebuilds the router/client — meaning this client must shed the now-dead
+        // pooled connections to the restarted peer on its own. A short idle
+        // timeout drops stale pooled connections quickly, TCP keepalive detects a
+        // silently-dead peer, and a bounded connect timeout fails fast so the
+        // retry loop in `forward_partition_write` can open a fresh connection.
+        let http = reqwest::Client::builder()
+            .pool_idle_timeout(std::time::Duration::from_secs(5))
+            .tcp_keepalive(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self::new(http, secret.into())
     }
 
     /// Full receive URL for `peer_base_url`. The base URL may already carry an
@@ -574,22 +587,51 @@ impl PartitionForwardClient for HttpPartitionForwardClient {
     ) -> Result<u64> {
         let url = Self::receive_url(peer_base_url);
         let body = encode_partition_batch(&batch)?;
-        let resp = self
-            .http
-            .post(&url)
-            .header(FORWARD_SECRET_HEADER, &self.secret)
-            .header(PARTITION_FORWARD_PROJECT_HEADER, project.to_string())
-            .header(PARTITION_FORWARD_TABLE_HEADER, table)
-            .header(PARTITION_FORWARD_PARTITION_HEADER, partition_id)
-            .header(PARTITION_FORWARD_HOP_HEADER, "1")
-            .header(PARTITION_FORWARD_IDEM_HEADER, idem_key)
-            .header("content-type", "application/vnd.apache.arrow.stream")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| {
-                BasinError::wal(format!("partition-write POST to {url:?} failed: {e}"))
-            })?;
+        // Retry on TRANSPORT errors (connection refused/reset/timeout). The
+        // dominant cause in practice is a peer that RESTARTED (#35): its 6PN URL
+        // is unchanged so discovery never rebuilds this client, and the first
+        // POST after the bounce hits a dead pooled connection. Re-sending is
+        // exactly-once-safe because the SAME `idem_key` is reused on every
+        // attempt and the receiver dedups on it (a write that landed but whose
+        // ack was lost is applied exactly once). We retry ONLY the send/transport
+        // failure — a returned HTTP status is a real decision, handled below.
+        const MAX_FORWARD_ATTEMPTS: u32 = 5;
+        let mut attempt: u32 = 0;
+        let resp = loop {
+            attempt += 1;
+            let send_result = self
+                .http
+                .post(&url)
+                .header(FORWARD_SECRET_HEADER, &self.secret)
+                .header(PARTITION_FORWARD_PROJECT_HEADER, project.to_string())
+                .header(PARTITION_FORWARD_TABLE_HEADER, table)
+                .header(PARTITION_FORWARD_PARTITION_HEADER, partition_id)
+                .header(PARTITION_FORWARD_HOP_HEADER, "1")
+                .header(PARTITION_FORWARD_IDEM_HEADER, idem_key)
+                .header("content-type", "application/vnd.apache.arrow.stream")
+                .body(body.clone())
+                .send()
+                .await;
+            match send_result {
+                Ok(r) => break r,
+                Err(e) if attempt < MAX_FORWARD_ATTEMPTS => {
+                    tracing::warn!(
+                        url = %url, attempt, error = %e,
+                        "partition-write POST transport error; retrying with a fresh connection"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100u64 * attempt as u64,
+                    ))
+                    .await;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(BasinError::wal(format!(
+                        "partition-write POST to {url:?} failed after {attempt} attempts: {e}"
+                    )));
+                }
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
             let detail = resp.text().await.unwrap_or_default();
