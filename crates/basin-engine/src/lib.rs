@@ -1713,9 +1713,13 @@ impl ProjectSession {
                 .await?;
         // Stage 1 of the end-of-COPY durable barrier: record the (partition,
         // max-LSN) this batch landed at so `await_copy_durable` can await
-        // durability for every partition this COPY touched before the client
-        // is told `COPY n`. A forwarded/Parquet batch surfaces `None` and is
-        // not tracked here (see the multi-node TODO in `write_batch_fanout`).
+        // durability for every LOCAL partition this COPY touched before the
+        // client is told `COPY n`. A forwarded batch surfaces `None` and is not
+        // tracked here — by design: it was already group-committed durable on
+        // its OWNER node before the forward POST returned (Stage 3 durable-on-
+        // forward; see `write_batch_fanout` and `forward_lands_durable`), so it
+        // needs no local barrier entry. A synchronous-Parquet batch likewise
+        // surfaces `None`.
         if let Some((part, lsn)) = touched {
             let mut g = self.copy_touched.lock().await;
             let e = g.entry(part).or_insert(lsn);
@@ -1733,11 +1737,16 @@ impl ProjectSession {
     /// hole a `max(id)+1` resumer silently skips). Gated by
     /// `BASIN_COPY_DURABLE_BARRIER` (on unless explicitly "0"/"false").
     ///
-    /// MULTI-NODE CAVEAT (Stage 3 follow-up): partitions forwarded to a remote
-    /// owner are not in the touched set (their LSN is not observable locally),
-    /// so this awaits LOCAL partitions only. A forwarded batch is still
-    /// ack-before-durable across the network until the forward RPC returns the
-    /// owner's LSN and a remote `await_durable` is wired up.
+    /// MULTI-NODE (Stage 3 — closed): this awaits LOCAL partitions only, and
+    /// that is sufficient for cluster-wide crash-consistency. Partitions
+    /// forwarded to a remote owner are deliberately NOT in the touched set
+    /// (their LSN is not observable here); instead the owner durably group-
+    /// commits a forwarded batch to its OWN WAL before acking the forward POST
+    /// (durable-on-forward — see `crate::write_forwarder::forward_lands_durable`
+    /// and `crate::executor::write_batch_fanout`). Since each forward is awaited
+    /// inline during the COPY, every forwarded row is already durable on its
+    /// owner by the time this returns — so after `COPY n` is acked, a crash of
+    /// ANY node (the originator OR a remote owner) cannot lose an acked row.
     pub async fn await_copy_durable(&self) -> Result<()> {
         let touched: Vec<(basin_common::PartitionKey, basin_wal::Lsn)> = {
             let mut g = self.copy_touched.lock().await;
@@ -1760,7 +1769,17 @@ impl ProjectSession {
 /// Whether the end-of-COPY durable barrier is engaged. ON by default; an
 /// operator can disable it with `BASIN_COPY_DURABLE_BARRIER=0` (or `false`).
 /// Cached so the COPY ack path pays a single relaxed load.
-fn copy_durable_barrier_enabled() -> bool {
+///
+/// This single flag governs the durable barrier on BOTH limbs of a multi-node
+/// COPY (Stage 3): the LOCAL limb (`await_copy_durable` awaits each on-node
+/// partition's WAL watermark) and the FORWARDED limb (the partition-write
+/// receive route durably group-commits a forwarded batch before acking the
+/// forward POST — durable-on-forward, see
+/// `crate::write_forwarder::forward_lands_durable`). Keeping one flag for both
+/// keeps the semantics symmetric: with the barrier ON, `COPY n` is acked only
+/// after every row — local AND forwarded — is durable on its owner; with it
+/// OFF, both limbs revert to async ack-before-durable.
+pub fn copy_durable_barrier_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("BASIN_COPY_DURABLE_BARRIER") {
         Ok(v) => {

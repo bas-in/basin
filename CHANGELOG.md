@@ -8,6 +8,30 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## 2026-06-25 — Crash-consistent COPY across nodes: durable-on-forward
+
+Extends the end-of-COPY durable barrier (below) to cover FORWARDED partitions in
+a multi-node cluster. In `#28` multi-node bulk ingest, a `COPY` landing on one
+node fans its batches across partitions, and a partition owned by a *remote* node
+is forwarded to that owner over 6PN HTTP. The end-of-COPY barrier awaits WAL
+durability only for *local* partitions (a forwarded batch's owner-side LSN is not
+observable on the originator), so a forwarded batch was previously
+ack-before-durable across the network — a crash of the OWNER node mid-COPY could
+lose acked rows on a remote partition even though the local barrier was honest.
+
+Closed via **durable-on-forward** (the simplest correct shape, and the one the
+forward protocol already favours: forwards are synchronous request/response, so
+the originator already blocks on the owner's reply). The partition-write receive
+route on the owner now group-commits a forwarded batch to its *own* WAL
+(ack-after-durable) before acking the forward POST, so a returned forward already
+implies owner-durability. Because each forward is awaited inline per fan-out
+batch, every forwarded row is durable on its owner by the time `COPY n` is acked
+— no second RPC and no remote barrier call needed. After the ack, a crash of ANY
+node (originator or remote owner) cannot lose an acked row. Gated by the SAME
+`BASIN_COPY_DURABLE_BARRIER` flag as the local limb (on by default; with it off,
+both limbs revert to async, symmetric); the forwarded path stays idempotent /
+retry-safe via the existing per-batch `idem_key`.
+
 ## 2026-06-24 — Crash-consistent COPY: end-of-COPY durable barrier
 
 A single `COPY` buffers its rows into batches that the bulk-ingest fan-out
@@ -30,10 +54,9 @@ watermark-gated WAL replay reconstructs the full contiguous prefix on restart
 and `max(id)` is a safe resume oracle again. Per-batch writes stay async (no
 forced per-batch fsync), so bulk throughput is unchanged; the cost is one
 durability wait at end-of-COPY. Gated by `BASIN_COPY_DURABLE_BARRIER` (on by
-default; set `0`/`false` to disable). Multi-node caveat: a COPY that forwards a
-partition to a remote owner currently awaits only its *local* partitions
-(forwarded batches remain ack-before-durable across the network until the
-forward RPC returns the owner's LSN — a tracked follow-up).
+default; set `0`/`false` to disable). The multi-node limb (a COPY that forwards
+a partition to a remote owner) is closed by the durable-on-forward change dated
+below.
 
 ## 2026-06-24 — Metadata-only aggregates over an integer range predicate
 

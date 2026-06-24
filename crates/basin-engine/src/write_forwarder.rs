@@ -540,6 +540,32 @@ impl HttpPartitionForwardClient {
     }
 }
 
+/// Whether a forwarded partition write must land DURABLE on its owner before
+/// the owner acks the forward POST — the FORWARDED limb of the end-of-COPY
+/// durable barrier (Stage 3, #28 multi-node).
+///
+/// This is the key to closing the multi-node COPY durability gap WITHOUT a
+/// second RPC round trip (Option A — "durable-on-forward"). A forwarded batch
+/// is written on the OWNER node, whose WAL LSN is not observable on the
+/// originating node, so the originator's local `ProjectSession::await_copy_durable`
+/// barrier cannot await it. Instead the OWNER's receive route group-commits the
+/// batch to its own WAL (ack-after-durable) BEFORE returning the rowcount, so a
+/// RETURNED forward already implies owner-durability. Because
+/// `executor::forward_partition_to_owner` is awaited inline per fan-out batch,
+/// every forwarded batch of a COPY is durable on its owner by the time the
+/// `COPY n` ack is emitted — no extra end-of-COPY step, and no remote barrier
+/// RPC, is needed for the forwarded limb.
+///
+/// Gated by the SAME `BASIN_COPY_DURABLE_BARRIER` flag as the local limb
+/// ([`crate::copy_durable_barrier_enabled`]): ON (default) → durable-on-forward;
+/// OFF → the forward lands async (ack-before-durable), symmetric with the local
+/// async path. Both the real receive route
+/// (`basin_rest::routes::internal_partition_forward`) and the in-process
+/// integration double consult this so the contract has one source of truth.
+pub fn forward_lands_durable() -> bool {
+    crate::copy_durable_barrier_enabled()
+}
+
 /// Generate a fresh 128-bit idempotency nonce for one forwarded batch, as
 /// lowercase hex (32 chars, ASCII-header-safe). Generated ONCE per batch before
 /// the first attempt and reused unchanged across retries (see

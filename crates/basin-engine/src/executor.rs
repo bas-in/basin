@@ -413,14 +413,20 @@ async fn write_batch_fanout(
         let owner = router.desired_owner(project, part.as_str());
         if !owner.is_self {
             if let Some(client) = engine.partition_forward_client() {
-                // TODO(Stage 3 / multi-node durable barrier): a forwarded
-                // (remote-owned) partition is written on the OWNER node; its
-                // WAL LSN is not observable here, so we return `None` and the
-                // end-of-COPY barrier in `on_copy_done` awaits durability only
-                // for LOCAL partitions. A forwarded batch is therefore still
-                // ack-before-durable across the network. Closing this needs the
-                // forward RPC to return the owner's (partition, lsn) and a
-                // remote `await_durable` call. Tracked as a follow-up.
+                // Stage 3 (multi-node durable barrier — DURABLE-ON-FORWARD):
+                // a forwarded (remote-owned) partition is written on the OWNER
+                // node, whose WAL LSN is not observable here, so it cannot enter
+                // the local `copy_touched` set — we return `None` for the local
+                // barrier. That is CORRECT, not a gap: the owner's partition-
+                // write receive route group-commits the batch to its own WAL
+                // (ack-after-durable) BEFORE acking this forward POST whenever
+                // the barrier is engaged (see
+                // `write_forwarder::forward_lands_durable`). Because this call
+                // is awaited inline per fan-out batch, a RETURNED forward
+                // already means the rows are durable on their owner — so by the
+                // time `COPY n` is acked, every forwarded batch is durable too,
+                // with no extra end-of-COPY step and no remote barrier RPC. The
+                // forwarded limb of the barrier is thus closed here.
                 return forward_partition_to_owner(
                     engine, &client, &owner.base_url, project, table, &part, batch,
                 )

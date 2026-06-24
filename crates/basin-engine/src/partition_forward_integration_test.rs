@@ -144,9 +144,13 @@ impl PartitionForwardClient for InProcDouble {
         let shard = engine.shard().expect("peer engine has a shard");
         let part = PartitionKey::new(partition_id)?;
         let handle = shard.get(&project, &part).await?;
-        // RAW write, durable — identical to the receiver handler.
+        // RAW write — identical to the receiver handler, including the Stage-3
+        // durable-on-forward gate: with the barrier engaged (default) the owner
+        // group-commits the batch to its WAL before acking, so a returned
+        // forward implies owner-durability.
+        let durable = crate::write_forwarder::forward_lands_durable();
         handle
-            .write_batch_opts(&TableName::new(table.to_owned())?, batch, true)
+            .write_batch_opts(&TableName::new(table.to_owned())?, batch, durable)
             .await?;
         Ok(rows)
     }
@@ -693,6 +697,143 @@ async fn copy_touched_set_covers_all_partitions_with_monotone_lsns() {
         sess.copy_touched.lock().await.is_empty(),
         "await_copy_durable must drain the touched set"
     );
+
+    std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
+}
+
+/// A partition-forward transport double that mirrors the receive route's Stage-3
+/// durable-on-forward contract AND records, per forwarded batch, the owner WAL
+/// LSN it landed at — so a test can prove the batch is DURABLE on the owner the
+/// moment the forward returns (Option A: durable-on-forward).
+struct DurabilityProbingDouble {
+    peers: HashMap<String, Engine>,
+    /// (partition, lsn) the owner durably committed each forwarded batch at.
+    landed: std::sync::Mutex<Vec<(PartitionKey, basin_wal::Lsn)>>,
+}
+
+#[async_trait]
+impl PartitionForwardClient for DurabilityProbingDouble {
+    async fn forward_partition_write(
+        &self,
+        peer_base_url: &str,
+        project: ProjectId,
+        table: &str,
+        partition_id: &str,
+        _idem_key: &str,
+        batch: RecordBatch,
+    ) -> Result<u64> {
+        let engine = self
+            .peers
+            .get(peer_base_url)
+            .unwrap_or_else(|| panic!("no in-proc peer for {peer_base_url:?}"));
+        let rows = batch.num_rows() as u64;
+        let shard = engine.shard().expect("peer engine has a shard");
+        let part = PartitionKey::new(partition_id)?;
+        let handle = shard.get(&project, &part).await?;
+        // The receive route's exact gate: durable-on-forward when the barrier is
+        // engaged. `write_batch_opts_lsn(..., true)` returns ONLY after the
+        // owner's WAL has group-committed through this LSN, so the returned LSN
+        // is durable on the owner by the time this method returns.
+        let durable = crate::write_forwarder::forward_lands_durable();
+        let lsn = handle
+            .write_batch_opts_lsn(&TableName::new(table.to_owned())?, batch, durable)
+            .await?;
+        self.landed.lock().unwrap().push((part, lsn));
+        Ok(rows)
+    }
+}
+
+/// STAGE 3 (forwarded limb of the end-of-COPY durable barrier): a COPY batch
+/// whose partition is owned by a REMOTE node must be DURABLE on that owner by
+/// the time the forward returns — so when the originator later acks `COPY n`, a
+/// crash of the OWNER node cannot lose the acked rows. We prove this by writing
+/// a forwarded batch through the full engine A→B path and then asserting the
+/// owner's WAL is ALREADY durable through the exact LSN it landed at (the
+/// `await_durable` fast path resolves immediately — well within a tight
+/// timeout). With the barrier OFF the contract relaxes to async, which this
+/// test does not require; here we assert the default (barrier ON) guarantee.
+#[tokio::test]
+async fn forwarded_copy_batch_is_durable_on_owner_before_ack() {
+    let _env = FANOUT_ENV_LOCK.lock().unwrap();
+    std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
+    // Barrier ON (default). Be explicit so the test is hermetic regardless of
+    // ambient env; the flag is read once and cached, so this must match the
+    // process default to stay deterministic across the suite.
+    assert!(
+        crate::write_forwarder::forward_lands_durable(),
+        "default: forwarded writes land durable (BASIN_COPY_DURABLE_BARRIER on)"
+    );
+
+    let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = Arc::new(InMemoryCatalog::new());
+    let eng_a = engine_for(cold.clone(), catalog.clone(), PEER_A).await;
+    let eng_b = engine_for(cold.clone(), catalog.clone(), PEER_B).await;
+
+    let peers = vec![PEER_A.to_string(), PEER_B.to_string()];
+    eng_a.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_A));
+    eng_b.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_B));
+
+    let mut map = HashMap::new();
+    map.insert(PEER_A.to_string(), eng_a.clone());
+    map.insert(PEER_B.to_string(), eng_b.clone());
+    let double = Arc::new(DurabilityProbingDouble {
+        peers: map,
+        landed: std::sync::Mutex::new(Vec::new()),
+    });
+    eng_a.attach_partition_forward_client(double.clone());
+
+    let sess_a = eng_a.open_session(ProjectId::new()).await.unwrap();
+    let project = sess_a.project();
+    sess_a.execute("CREATE TABLE t (id BIGINT)").await.unwrap();
+    let table = TableName::new("t").unwrap();
+
+    // Drive 8 multi-row batches so the cursor visits every stripe; some forward
+    // to B. Each forward, per the double, records the owner WAL LSN it landed at.
+    let router = PartitionRouter::new(peers.clone(), PEER_A);
+    let mut b_owned: Vec<PartitionKey> = Vec::new();
+    for i in 0..8usize {
+        let base = (i as i64) * 100;
+        let ids: Vec<i64> = (0..10).map(|k| base + k).collect();
+        crate::executor::exec_ingest_batch(&sess_a, &table, ids_batch(&ids))
+            .await
+            .unwrap();
+        let part = if i == 0 {
+            PartitionKey::default_key()
+        } else {
+            PartitionKey::new(format!("s{i}")).unwrap()
+        };
+        if !router.desired_owner(&project, part.as_str()).is_self {
+            b_owned.push(part);
+        }
+    }
+    assert!(
+        !b_owned.is_empty(),
+        "router put no partitions on B — cannot exercise forwarded durability"
+    );
+
+    // Every forwarded batch recorded a (partition, lsn) that landed on B. For
+    // each, B's WAL must ALREADY be durable through that LSN: the forward only
+    // returned after the owner's synchronous-commit append covered it, so
+    // `await_durable` takes its fast path and resolves immediately. A tight
+    // timeout makes "immediately durable" an assertion, not a hope — if the
+    // owner had acked before durability, this LSN's segment would still be
+    // buffered and the await would block past the budget.
+    let shard_b = eng_b.shard().unwrap();
+    let landed = double.landed.lock().unwrap().clone();
+    assert!(!landed.is_empty(), "no batches were forwarded to B");
+    for (part, lsn) in landed {
+        let handle = shard_b.get(&project, &part).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(250), handle.await_durable(lsn))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "forwarded batch on B partition {} is NOT durable through {lsn:?} \
+                     after the forward returned — durable-on-forward violated",
+                    part.as_str()
+                )
+            })
+            .unwrap();
+    }
 
     std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
 }

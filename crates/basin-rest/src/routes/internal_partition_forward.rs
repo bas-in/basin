@@ -302,14 +302,25 @@ pub(crate) async fn post_partition_write(
             ));
         }
     };
-    // RAW partition write — durable. Constraints already ran on the SENDER
-    // across all partitions before fan-out (see module docs); do NOT re-run. On
-    // ANY failure, forget the in-flight key so a legitimate retry can re-apply
-    // (the failed attempt wrote nothing to dedup against).
+    // RAW partition write. Constraints already ran on the SENDER across all
+    // partitions before fan-out (see module docs); do NOT re-run. On ANY
+    // failure, forget the in-flight key so a legitimate retry can re-apply (the
+    // failed attempt wrote nothing to dedup against).
+    //
+    // DURABLE-ON-FORWARD (Stage 3, the forwarded limb of the end-of-COPY
+    // durable barrier): when the barrier is engaged (the default), this is an
+    // ack-after-durable write — the owner group-commits the batch to its WAL
+    // and only then acks this POST, so a returned forward already means the
+    // rows are durable HERE on the owner. The originating node therefore needs
+    // no remote barrier: by the time it emits `COPY n`, every forwarded batch
+    // is durable on its owner, so a crash of THIS owner node cannot lose an
+    // acked row. With the barrier disabled (`BASIN_COPY_DURABLE_BARRIER=0`) the
+    // write is async (ack-before-durable), symmetric with the local async path.
+    let durable = basin_engine::write_forwarder::forward_lands_durable();
     let apply = async {
         let handle = shard.get(&project, &partition).await.map_err(ApiError::from)?;
         handle
-            .write_batch_opts(&table, batch, true)
+            .write_batch_opts(&table, batch, durable)
             .await
             .map_err(ApiError::from)
     }
