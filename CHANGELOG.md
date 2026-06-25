@@ -8,6 +8,59 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Fix: exactly-once partition commit under an ambiguous object-store PUT (no more double-counted rows during a 408 storm)
+
+**Correctness fix.** Under a sustained object-store (Tigris S3) `408 Request
+Timeout` storm, a heavy ingest could over-report `count(*)` and return duplicate
+rows. A 100M-row COPY (loader sent exactly ids 0..99,999,999, no client drops)
+read back as **100,120,000** rows — ~120k rows (~0.12%) double-counted — with
+`max(id)` correct, i.e. the data was 100M distinct but the live-set referenced
+some segment files twice. Clean runs without a 408 storm were always exact.
+
+**Root cause — an ambiguous PUT.** A partition segment-create PUT
+(`put_part_segment_create`, create-if-absent) could LAND on the store yet
+surface a timeout *error* to us (the `object_store` client retries a `408`
+transparently, but when its retry budget is exhausted under a sustained storm it
+returns the raw timeout rather than the `AlreadyExists` a retried conditional
+create would see). The old code treated that error as a hard failure even though
+the segment was durably written. The shard's `compact_one` then left the WAL
+**untruncated** and the next heartbeat tick **re-flushed the same rows into a new
+data file** (a fresh ULID path) committed on top of the already-landed segment —
+so both files were live and every row in the wave was counted twice. Path-level
+dedup cannot catch this: the re-flush has a *different* path for the same rows.
+
+**Fix — disambiguate the landed-but-errored PUT.** On a non-`AlreadyExists`
+store error, `put_part_segment_create` now reads the object back at the target
+version. The segment object is fully self-describing (its `version`,
+`current_snapshot`, and `delta` encode exactly this commit's intent), so:
+
+- **absent** → the PUT genuinely did not land → the original error is surfaced
+  and the caller retries safely (never silently drops a write);
+- **present and byte-identical to our write** → our write landed (the ambiguous
+  PUT) → the commit converges to success, so the WAL is truncated and the wave
+  is **never re-flushed**;
+- **present but different** → another writer won the version → `Ok(false)`,
+  identical to the existing `AlreadyExists` CAS-loss path.
+
+Single-owner-per-partition means a byte-identical object at our version can only
+be our own landed write, so this never mistakes a peer's commit for ours. The
+create-if-absent CAS stays the authoritative arbiter; this only resolves an
+outcome the store left uncertain. The #34 durable barrier, #31 anti-livelock
+`v+1` probe, and the create-if-absent arbiter are all preserved.
+
+**Pre-existing, not caused by the head-resolution cache (011abf76).** The double
+reference comes purely from the ambiguous-PUT + WAL re-flush path; it does not
+require the per-node commit cache and is not aggravated by it (the cache can only
+cause a *lost* create-if-absent CAS → `CommitConflict` → the same re-resolve
+that re-commits the SAME paths, which dedups). No revert is recommended.
+
+Regression test: `ambiguous_put_segment_create_converges_exactly_once` injects a
+segment-create PUT that lands but returns a `408`-style error and asserts the
+commit succeeds with the wave's file referenced exactly once (fresh cold-read
+`count(*)` == seeded + wave rows, no duplicate paths). Fails before the fix
+(commit surfaces the timeout → would re-flush), passes after. basin-catalog lib:
+247 pass.
+
 ## Unreleased — Perf: eliminate redundant object-store head-resolution on the compaction commit hot path (per-node ingest throughput)
 
 **Cuts the object-store round trips per conflict-free per-partition commit by

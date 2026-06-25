@@ -1197,6 +1197,33 @@ impl ObjectStoreCatalog {
     }
 
     /// Write partition segment `version` via create-if-absent. `true` = won.
+    ///
+    /// AMBIGUOUS-PUT SAFETY (exactly-once under a flaky object store): a PUT can
+    /// LAND on the store yet surface a non-`AlreadyExists` error to us — e.g. a
+    /// `408 Request Timeout` (Tigris throttling under sustained load) whose
+    /// response we never see, or one that exhausts the `object_store` retry
+    /// budget. `object_store` retries a 408 transparently; the retried Create
+    /// then hits the just-landed object and returns `AlreadyExists`, but if the
+    /// budget is exhausted first it returns the raw timeout error. Treating that
+    /// error as a hard failure is UNSAFE: the caller (`compact_one`) leaves the
+    /// WAL untruncated and the next tick re-flushes the SAME rows into a NEW
+    /// data file (a fresh ULID path) committed on top of our already-landed
+    /// segment — so the rows are referenced TWICE and `count(*)` over-reports.
+    ///
+    /// To make the create idempotent we RESOLVE the ambiguity: on a store error
+    /// we read back the object at `version`. The segment object is fully
+    /// self-describing (its `version`, `current_snapshot`, and `delta` encode
+    /// exactly this commit's intent), so:
+    ///   * absent              → the PUT genuinely did not land → propagate the
+    ///                            error so the caller retries safely;
+    ///   * present == our bytes → OUR write landed (ambiguous PUT) → `Ok(true)`,
+    ///                            converging exactly-once with no re-flush;
+    ///   * present != our bytes → another writer won the version → `Ok(false)`,
+    ///                            identical to the `AlreadyExists` CAS-loss path.
+    /// Single-owner-per-partition means a byte-identical object at our version
+    /// can only be our own landed write, so this never mistakes a peer's commit
+    /// for ours. The create-if-absent CAS stays the authoritative arbiter; this
+    /// only disambiguates an error whose outcome the store left uncertain.
     async fn put_part_segment_create(
         &self,
         project: &ProjectId,
@@ -1212,10 +1239,38 @@ impl ObjectStoreCatalog {
             mode: PutMode::Create,
             ..Default::default()
         };
-        match self.store.put_opts(&key, Bytes::from(bytes).into(), opts).await {
+        match self
+            .store
+            .put_opts(&key, Bytes::from(bytes.clone()).into(), opts)
+            .await
+        {
             Ok(_) => Ok(true),
             Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
-            Err(e) => Err(storage_err("put partition segment", e)),
+            Err(e) => {
+                // Ambiguous PUT: disambiguate by reading back the object.
+                match self.store.get(&key).await {
+                    Ok(res) => {
+                        let landed = res
+                            .bytes()
+                            .await
+                            .map_err(|ge| storage_err("read partition segment after ambiguous put", ge))?;
+                        if landed.as_ref() == bytes.as_slice() {
+                            // Our write landed despite the error — converge.
+                            Ok(true)
+                        } else {
+                            // A different object occupies this version: lost the
+                            // create-if-absent race, same as `AlreadyExists`.
+                            Ok(false)
+                        }
+                    }
+                    // Nothing landed: the PUT truly failed — surface the original
+                    // error so the caller retries (never silently drops a write).
+                    Err(object_store::Error::NotFound { .. }) => {
+                        Err(storage_err("put partition segment", e))
+                    }
+                    Err(ge) => Err(storage_err("verify partition segment after ambiguous put", ge)),
+                }
+            }
         }
     }
 
@@ -4668,6 +4723,162 @@ mod tests {
             assert!(live.contains(&format!("f{i}.parquet")), "f{i}.parquet present after heal");
         }
         assert!(live.contains("after-heal.parquet"), "post-heal commit present");
+    }
+
+    // --- Ambiguous-PUT exactly-once: a 408-after-landed must NOT double-count --
+    //
+    // REGRESSION (engine v114, dev 100M COPY under a sustained Tigris 408 storm):
+    // a partition segment-create PUT LANDED on the store but surfaced a timeout
+    // error to us (object_store exhausted its 408 retry budget, or the response
+    // was lost). The OLD `put_part_segment_create` propagated that error as a
+    // hard failure, so the commit failed even though the segment was durable.
+    // The shard's `compact_one` then left the WAL untruncated and the next tick
+    // re-flushed the SAME rows into a NEW data file (a fresh ULID path) on top of
+    // the already-landed segment — both references live, so `count(*)` over-
+    // reported (dev: 100M rows read back as 100,120,000, ~0.12% double-counted).
+    //
+    // The fix disambiguates the landed-but-errored PUT by reading the object
+    // back: if our exact bytes are present the create WON (converge, no re-
+    // flush); if absent the error stands (safe retry). This test injects that
+    // ambiguous PUT and asserts the commit SUCCEEDS (so the caller truncates the
+    // WAL and never re-flushes) with the wave's file referenced exactly once.
+
+    /// Wraps a store and, for the FIRST `PutMode::Create`, writes the object
+    /// through to the inner store and THEN returns a generic error — exactly the
+    /// "408 after the write landed" ambiguity. All other ops pass through.
+    #[derive(Debug)]
+    struct AmbiguousCreateStore {
+        inner: Arc<dyn ObjectStore>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+    impl std::fmt::Display for AmbiguousCreateStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "AmbiguousCreateStore")
+        }
+    }
+    #[async_trait::async_trait]
+    impl ObjectStore for AmbiguousCreateStore {
+        async fn put_opts(
+            &self,
+            location: &OsPath,
+            payload: object_store::PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if matches!(opts.mode, PutMode::Create)
+                && self
+                    .armed
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                // Land the write, then report a timeout as if the response were
+                // lost — the ambiguous PUT. Overwrite-mode so the inner write
+                // actually persists regardless of conditional-put support.
+                self.inner
+                    .put_opts(
+                        location,
+                        payload,
+                        PutOptions { mode: PutMode::Overwrite, ..Default::default() },
+                    )
+                    .await?;
+                return Err(object_store::Error::Generic {
+                    store: "AmbiguousCreateStore",
+                    source: "injected 408 Request Timeout after the object landed".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &OsPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &OsPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<OsPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<OsPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &OsPath,
+            to: &OsPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_put_segment_create_converges_exactly_once() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wrapper = Arc::new(AmbiguousCreateStore {
+            inner: inner.clone(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store: Arc<dyn ObjectStore> = wrapper.clone();
+        let c = ObjectStoreCatalog::with_part_compact_every(store, 100_000);
+        let p = ProjectId::new();
+        let t = TableName::new("ambig").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Seed one clean commit so the next is a normal delta (the create whose
+        // PUT we will make ambiguous), exercising the steady-state ingest path.
+        let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file("seed.parquet", 10)])
+            .await
+            .unwrap();
+
+        // ARM the ambiguous PUT: the NEXT segment-create lands but errors.
+        wrapper.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // The wave's file (rows the loader sent exactly once). Under the OLD
+        // code this commit returns the injected storage error → the shard never
+        // truncates the WAL → re-flush of these rows under a new path → double
+        // count. The FIX makes `put_part_segment_create` read the landed object
+        // back and converge, so the commit SUCCEEDS exactly once.
+        let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        let wave = vec![file("wave.parquet", 25)];
+        c.append_data_files_in_partition(&p, &t, "p0", exp, wave.clone())
+            .await
+            .expect(
+                "ambiguous PUT that LANDED must converge to a successful commit, \
+                 not surface a hard error that triggers a re-flush (double count)",
+            );
+
+        // A FRESH catalog (cold caches, like a peer / restart) must read back
+        // exactly the seeded + wave rows once each — no duplicate reference.
+        let fresh = ObjectStoreCatalog::with_prefix(inner.clone(), DEFAULT_CATALOG_PREFIX);
+        let live = fresh.load_table(&p, &t).await.unwrap().live_data_files();
+        let total_rows: u64 = live.iter().map(|f| f.row_count).sum();
+        assert_eq!(total_rows, 35, "count(*) must equal seed(10)+wave(25), not double-count");
+        let mut paths: Vec<String> = live.iter().map(|f| f.path.clone()).collect();
+        paths.sort();
+        let n = paths.len();
+        paths.dedup();
+        assert_eq!(paths.len(), n, "no duplicate file references in the live set");
+        assert_eq!(n, 2, "exactly the two committed files are live");
     }
 
     // --- Test 2c-flat-2: FOLD CORRECTNESS across adds + interleaved removes ----
