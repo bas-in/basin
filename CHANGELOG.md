@@ -8,6 +8,32 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Fix: dead pgwire connections no longer leak the per-project connection-ceiling slot (#33)
+
+**Correctness / availability fix.** Each accepted pgwire session holds a
+`ConnectionGuard` that decrements the project's live-connection counter on
+drop, so a clean disconnect (pgwire `Terminate`) and a panic both release the
+project's `max_connections` slot correctly. But on an *unclean* disconnect —
+the client process killed, a network drop, or an L4 proxy in front of the
+engine (Fly's edge) that keeps the engine-side TCP open after the real client
+vanishes — the session task blocked forever on a socket read, the guard never
+dropped, and the slot **leaked**. Enough leaked slots and the project hit its
+ceiling and rejected every new connection (the "connection-ceiling lockout"
+where leaked sessions from a dead loader pinned the project).
+
+TCP keepalive alone cannot fix the proxy case: the proxy↔engine TCP hop stays
+healthy and answers probes even after the client is gone. The fix adds an
+application-level **idle watchdog** in `basin-router`'s `handle_connection`:
+an authenticated connection that processes no frontend message for longer than
+the idle ceiling is torn down, which drops `process_socket` and with it the
+`ConnectionGuard`, releasing the slot. The ceiling is generous (default 30 min,
+`BASIN_PGWIRE_IDLE_TIMEOUT_SECS`, `0` disables) so a healthy long-idle pooled
+connection is never reaped — only a genuinely abandoned socket trips it. TCP
+keepalive also now pins its probe count (`with_retries(6)`) so a *directly*
+dead socket is torn down deterministically (~90s) regardless of host
+`tcp_keepalive_probes`. The guard's decrement is idempotent (saturating, never
+negative, never double-counted).
+
 ## Unreleased — Fix: SERIAL/sequence no longer regresses on restart (#15)
 
 **Correctness fix.** On restart, the shard reconciles each SERIAL/identity

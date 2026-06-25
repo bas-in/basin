@@ -44,11 +44,79 @@
 #![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use basin_common::{BasinError, Result};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex};
+
+/// Per-connection activity clock.
+///
+/// Every time the pgwire handlers process a frontend message (startup,
+/// simple/extended query, COPY data) they call [`Activity::touch`]. The
+/// idle watchdog in [`handle_connection`] reads [`Activity::idle`] to decide
+/// whether a connection has gone silent for longer than the idle ceiling.
+///
+/// This is the application-level backstop for the connection-ceiling leak:
+/// TCP keepalive tears down a *directly* dead socket, but when an L4 proxy
+/// sits in front of the engine (Fly's edge) the proxy↔engine TCP hop stays
+/// healthy even after the real client vanishes, so keepalive never fires and
+/// the blocked `process_socket` read would pin the project's connection slot
+/// forever. The watchdog forces the session task to exit, which drops the
+/// `ConnectionGuard` and releases the slot. The ceiling is generous so a
+/// long-idle but *healthy* pooled connection is never killed.
+#[derive(Clone, Debug)]
+pub(crate) struct Activity {
+    /// Millis since the shared `start` baseline of the most recent touch.
+    last: Arc<AtomicU64>,
+    start: Instant,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            last: Arc::new(AtomicU64::new(0)),
+            start: Instant::now(),
+        }
+    }
+
+    /// Record activity at "now". Cheap (one relaxed atomic store).
+    pub(crate) fn touch(&self) {
+        let elapsed = self.start.elapsed().as_millis() as u64;
+        self.last.store(elapsed, Ordering::Relaxed);
+    }
+
+    /// How long since the last [`touch`](Self::touch).
+    fn idle(&self) -> Duration {
+        let last = self.last.load(Ordering::Relaxed);
+        let now = self.start.elapsed().as_millis() as u64;
+        Duration::from_millis(now.saturating_sub(last))
+    }
+}
+
+/// Idle ceiling for an authenticated pgwire connection, in seconds.
+///
+/// A connection that processes no frontend message for this long is assumed
+/// dead (its client gone behind a proxy that keeps the engine-side TCP open)
+/// and is torn down so its per-project connection slot is released. The
+/// default is deliberately generous — 30 minutes — so a healthy connection
+/// pooler that parks idle connections between bursts is never reaped; only a
+/// genuinely abandoned socket trips it. Override with
+/// `BASIN_PGWIRE_IDLE_TIMEOUT_SECS`; `0` disables the watchdog entirely
+/// (keepalive remains the only backstop).
+fn idle_timeout_from_env() -> Option<Duration> {
+    let secs = std::env::var("BASIN_PGWIRE_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1800);
+    if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    }
+}
 
 mod connection_limit;
 mod copy;
@@ -240,6 +308,10 @@ async fn accept_loop(
     connection_limiter: Option<Arc<ConnectionLimiter>>,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
+    // Resolve the idle ceiling once at startup from the environment
+    // (`BASIN_PGWIRE_IDLE_TIMEOUT_SECS`, default 30 min, `0` disables) so it is
+    // not re-parsed on every accept.
+    let idle_ceiling = idle_timeout_from_env();
     // Build the TlsAcceptor once at startup so every connection shares one
     // rustls ServerConfig (cheap clone on accept). Failure here is a hard
     // startup error so a bad cert is loud, not silently per-connection.
@@ -308,6 +380,7 @@ async fn accept_loop(
             rate_limit,
             tls_acceptor,
             connection_limiter,
+            idle_ceiling,
             &mut shutdown,
         )
         .await;
@@ -322,6 +395,7 @@ async fn accept_loop(
             rate_limit,
             tls_acceptor,
             connection_limiter,
+            idle_ceiling,
             &mut shutdown,
         )
         .await;
@@ -335,6 +409,7 @@ async fn accept_loop(
         rate_limit,
         tls_acceptor,
         connection_limiter,
+        idle_ceiling,
         &mut shutdown,
     )
     .await
@@ -351,6 +426,7 @@ async fn run_accept_loop<F>(
     rate_limit: Option<Arc<PgRateLimit>>,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     connection_limiter: Option<Arc<ConnectionLimiter>>,
+    idle_ceiling: Option<Duration>,
     shutdown: &mut oneshot::Receiver<()>,
 ) -> Result<()>
 where
@@ -383,7 +459,7 @@ where
                 let tls_acceptor = tls_acceptor.clone();
                 let connection_limiter = connection_limiter.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(sock, peer, factory, resolver, rate_limit, tls_acceptor, connection_limiter).await {
+                    if let Err(e) = handle_connection(sock, peer, factory, resolver, rate_limit, tls_acceptor, connection_limiter, idle_ceiling).await {
                         tracing::warn!(error = %e, %peer, "connection ended with error");
                     }
                 });
@@ -404,9 +480,17 @@ fn tune_pgwire_socket(sock: &tokio::net::TcpStream, peer: SocketAddr) {
         tracing::debug!(error = %e, %peer, "set_nodelay failed");
     }
     let sref = socket2::SockRef::from(sock);
+    // 30s idle before the first probe, 10s between probes, give up after 6
+    // unanswered probes. `with_retries` pins the probe count instead of
+    // inheriting the host's `tcp_keepalive_probes` (often 9), so a *directly*
+    // dead socket is torn down deterministically (~90s) on any platform —
+    // unblocking the session read and dropping its ConnectionGuard. (The proxy-
+    // held-socket case, where keepalive can't help, is covered by the
+    // application idle watchdog in `handle_connection`.)
     let ka = socket2::TcpKeepalive::new()
         .with_time(std::time::Duration::from_secs(30))
-        .with_interval(std::time::Duration::from_secs(10));
+        .with_interval(std::time::Duration::from_secs(10))
+        .with_retries(6);
     if let Err(e) = sref.set_tcp_keepalive(&ka) {
         tracing::debug!(error = %e, %peer, "set_tcp_keepalive failed");
     }
@@ -421,14 +505,18 @@ async fn handle_connection<F>(
     rate_limit: Option<Arc<PgRateLimit>>,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     connection_limiter: Option<Arc<ConnectionLimiter>>,
+    idle_ceiling: Option<Duration>,
 ) -> Result<()>
 where
     F: SessionFactory + 'static,
 {
+    let activity = Activity::new();
+    activity.touch();
     let slot = Arc::new(Mutex::new(None::<Arc<F::Session>>));
     let simple = Arc::new(BasinSimpleQueryHandlerSlot::new(
         slot.clone(),
         rate_limit.clone(),
+        activity.clone(),
     ));
     let copy_state = simple.copy_state.clone();
     let handlers = BasinHandlers {
@@ -437,13 +525,55 @@ where
             resolver,
             slot.clone(),
             connection_limiter,
+            activity.clone(),
         )),
         simple,
-        extended: Arc::new(BasinExtendedQueryHandler::new(slot, rate_limit, copy_state)),
+        extended: Arc::new(BasinExtendedQueryHandler::new(
+            slot,
+            rate_limit,
+            copy_state,
+            activity.clone(),
+        )),
     };
     // pgwire 0.28 owns the SSLRequest peek + 'S'/'N' response + TLS wrap when
     // a TlsAcceptor is supplied; `None` keeps the pre-TLS plaintext path.
-    pgwire::tokio::process_socket(sock, tls_acceptor, handlers)
-        .await
-        .map_err(|e| BasinError::Internal(format!("pgwire: {e}")))
+    //
+    // Wrap the session in an idle watchdog so a silently-dead client (whose
+    // engine-side TCP a proxy keeps open, defeating keepalive) cannot pin the
+    // project's connection-ceiling slot forever. When the watchdog wins the
+    // select, `process_socket` is dropped, which drops the handlers — and with
+    // them the `ConnectionGuard` — releasing the slot. The ceiling is generous
+    // (default 30 min) so a healthy long-idle pooled connection survives.
+    let serve = pgwire::tokio::process_socket(sock, tls_acceptor, handlers);
+    match idle_ceiling {
+        None => serve
+            .await
+            .map_err(|e| BasinError::Internal(format!("pgwire: {e}"))),
+        Some(ceiling) => {
+            tokio::pin!(serve);
+            // Probe at a fraction of the ceiling so detection lag is bounded
+            // (a connection is reaped within one tick of crossing the ceiling)
+            // without spinning a hot timer.
+            let tick = (ceiling / 4).max(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    res = &mut serve => {
+                        return res.map_err(|e| BasinError::Internal(format!("pgwire: {e}")));
+                    }
+                    _ = tokio::time::sleep(tick) => {
+                        if activity.idle() >= ceiling {
+                            tracing::info!(
+                                %peer,
+                                idle_secs = activity.idle().as_secs(),
+                                "pgwire connection idle past ceiling; reaping to release slot",
+                            );
+                            // Dropping `serve` here (loop exit) drops the
+                            // handlers and the ConnectionGuard with them.
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

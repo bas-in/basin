@@ -2379,6 +2379,10 @@ pub(crate) struct BasinExtendedQueryHandler<S: Session + 'static> {
     /// COPY came in over simple or extended protocol. `None` always for
     /// non-COPY statements.
     pub(crate) copy_state: crate::copy::CopyStateSlot,
+    /// Per-connection activity clock the idle watchdog reads. Touched whenever
+    /// the extended protocol reaches the session (Bind/Describe/Execute) so an
+    /// active prepared-statement client is never reaped.
+    activity: crate::Activity,
 }
 
 impl<S: Session + 'static> BasinExtendedQueryHandler<S> {
@@ -2386,16 +2390,19 @@ impl<S: Session + 'static> BasinExtendedQueryHandler<S> {
         session_slot: Arc<Mutex<Option<Arc<S>>>>,
         rate_limit: Option<Arc<crate::rate_limit::PgRateLimit>>,
         copy_state: crate::copy::CopyStateSlot,
+        activity: crate::Activity,
     ) -> Self {
         Self {
             session_slot,
             state: Arc::new(Mutex::new(ExtendedState::new())),
             rate_limit,
             copy_state,
+            activity,
         }
     }
 
     async fn require_session(&self) -> PgWireResult<Arc<S>> {
+        self.activity.touch();
         let g = self.session_slot.lock().await;
         g.clone().ok_or_else(|| {
             PgWireError::ApiError(
@@ -2625,6 +2632,9 @@ pub(crate) struct BasinStartupHandler<F: SessionFactory + 'static> {
     /// and is never shared with any other struct. Removing the `Arc` saves one
     /// heap allocation per connection on the accept hot-path.
     conn_guard: Mutex<Option<crate::ConnectionGuard>>,
+    /// Per-connection activity clock the idle watchdog reads. Touched on every
+    /// startup message so an authenticating-then-vanishing client is reaped.
+    activity: crate::Activity,
 }
 
 impl<F: SessionFactory + 'static> BasinStartupHandler<F> {
@@ -2633,6 +2643,7 @@ impl<F: SessionFactory + 'static> BasinStartupHandler<F> {
         resolver: Arc<dyn ProjectResolver>,
         slot: Arc<Mutex<Option<Arc<F::Session>>>>,
         connection_limiter: Option<Arc<crate::ConnectionLimiter>>,
+        activity: crate::Activity,
     ) -> Self {
         Self {
             factory,
@@ -2640,6 +2651,7 @@ impl<F: SessionFactory + 'static> BasinStartupHandler<F> {
             slot,
             connection_limiter,
             conn_guard: Mutex::new(None),
+            activity,
         }
     }
 }
@@ -2656,6 +2668,7 @@ impl<F: SessionFactory + 'static> StartupHandler for BasinStartupHandler<F> {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.activity.touch();
         match message {
             PgWireFrontendMessage::Startup(ref startup) => {
                 save_startup_parameters_to_metadata(client, startup);
@@ -3023,17 +3036,22 @@ pub(crate) struct BasinSimpleQueryHandlerSlot<S: Session + 'static> {
     /// `CopyHandler` impl, so the on_copy_data / on_copy_done callbacks
     /// reach the same slot.
     pub(crate) copy_state: crate::copy::CopyStateSlot,
+    /// Per-connection activity clock the idle watchdog reads. Touched on every
+    /// simple query and COPY-data chunk so an active session is never reaped.
+    pub(crate) activity: crate::Activity,
 }
 
 impl<S: Session + 'static> BasinSimpleQueryHandlerSlot<S> {
     pub(crate) fn new(
         slot: Arc<Mutex<Option<Arc<S>>>>,
         rate_limit: Option<Arc<crate::rate_limit::PgRateLimit>>,
+        activity: crate::Activity,
     ) -> Self {
         Self {
             slot,
             rate_limit,
             copy_state: Arc::new(tokio::sync::Mutex::new(None)),
+            activity,
         }
     }
 }
@@ -3046,6 +3064,7 @@ impl<S: Session + 'static> SimpleQueryHandler for BasinSimpleQueryHandlerSlot<S>
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.activity.touch();
         let session = {
             let guard = self.slot.lock().await;
             guard.clone().ok_or_else(|| {
@@ -3389,6 +3408,7 @@ impl<S: Session + 'static> CopyHandler for BasinSimpleQueryHandlerSlot<S> {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.activity.touch();
         let session = {
             let g = self.slot.lock().await;
             g.clone().ok_or_else(|| {
