@@ -58,6 +58,23 @@ use crate::{
     ShardStats, TailPressure, TopPatternProvider,
 };
 
+/// Process-global one-shot claim for the Phase 2 autotune controller: the
+/// first background loop to call this wins (`true`); every later caller gets
+/// `false`. The runtime fan-out / flush atomics are process-global, so exactly
+/// one controller must drive them even when a node hosts several shards (and
+/// in the test suite, where many `spawn_background` calls share one process).
+fn autotune_claim() -> bool {
+    static CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    CLAIMED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+}
+
 /// Cheap rolling ingest-rate counter (rows/sec) feeding the autoscaler's
 /// `ingest_rows_per_sec` metric. Lock-free: two atomics tracking the current
 /// 1-second bucket and the last fully-elapsed second's total.
@@ -2082,8 +2099,15 @@ impl InProcessShard {
                 .collect();
             // Representative batch (first plan's) for the create-table-on-first
             // -commit path; schema is identical across a table's chunks.
+            let wave_rows: u64 = files.iter().map(|f| f.row_count as u64).sum();
             self.commit_with_retry(project, table, partition, &plans[idxs[0]].merged, files)
                 .await?;
+            // Phase 2 autotune: feed the process-global committed-rows/s signal
+            // (one relaxed atomic add per committed wave — NOT per row). Read
+            // only by the adaptive controller's tick task, which is spawned only
+            // under BASIN_AUTOTUNE; off → this counter is written but never
+            // observed (no-op).
+            basin_common::autotune::record_committed_rows(wave_rows);
         }
 
         // Per-file sidecar indexing + drain bookkeeping (after the commits).
@@ -3508,6 +3532,43 @@ impl ShardImpl for InProcessShard {
             } else {
                 std::time::Duration::from_secs(3600)
             });
+            // Phase 2 autotune: the adaptive ingest-concurrency controller.
+            // Spawned ONLY when BASIN_AUTOTUNE is on, and only ONCE per process
+            // (the runtime fan-out / flush atomics are process-global, so a
+            // single controller drives the whole node even with several shards).
+            // When off, `autotune_state` is `None`, the select arm below is
+            // guarded out entirely, and no override is ever published — a strict
+            // no-op at the default. The first shard's background loop to start
+            // wins the `Once`; later shards' loops leave it `None`.
+            let mut autotune_state: Option<(
+                basin_common::autotune::AdaptiveController,
+                f64,
+                std::time::Instant,
+            )> = if basin_common::autotune::autotune_enabled() && autotune_claim() {
+                let (controller, flush_ratio) = basin_common::autotune::build_controller();
+                // Publish the derived start immediately (== derived, so no
+                // behavior change until the first adjustment).
+                basin_common::autotune::set_runtime_fanout(controller.fanout());
+                basin_common::autotune::publish_flush_for(controller.fanout(), flush_ratio);
+                tracing::info!(
+                    start_fanout = controller.fanout(),
+                    interval_secs = basin_common::autotune::tick_interval_secs(),
+                    "BASIN_AUTOTUNE on: adaptive ingest-concurrency controller started"
+                );
+                Some((controller, flush_ratio, std::time::Instant::now()))
+            } else {
+                None
+            };
+            let autotune_enabled = autotune_state.is_some();
+            // Placeholder cadence when disabled keeps `interval` away from a
+            // zero duration and the arm is `if autotune_enabled`-guarded anyway.
+            let mut autotune_tick = tokio::time::interval(std::time::Duration::from_secs(
+                if autotune_enabled {
+                    basin_common::autotune::tick_interval_secs()
+                } else {
+                    3600
+                },
+            ));
             // First firing of `interval` is immediate; skip it so the loops
             // align with their configured cadence.
             evict_tick.tick().await;
@@ -3515,9 +3576,44 @@ impl ShardImpl for InProcessShard {
             heartbeat_tick.tick().await;
             sweep_tick.tick().await;
             stripe_merge_tick.tick().await;
+            autotune_tick.tick().await;
             loop {
                 tokio::select! {
                     _ = &mut shutdown => break,
+                    _ = autotune_tick.tick(), if autotune_enabled => {
+                        if let Some((controller, flush_ratio, last)) = autotune_state.as_mut() {
+                            let elapsed = last.elapsed().as_secs_f64();
+                            *last = std::time::Instant::now();
+                            let (rows, waves, stalls) =
+                                basin_common::autotune::drain_signals();
+                            // Idle interval (no committed work, no stalls): no
+                            // signal, so hold the knob rather than walk on noise.
+                            if rows == 0 && stalls == 0 {
+                                continue;
+                            }
+                            let sample = basin_common::autotune::sample_from_signals(
+                                rows, waves, stalls, elapsed,
+                            );
+                            let prev = controller.fanout();
+                            let next = controller.observe(sample);
+                            if next != prev {
+                                basin_common::autotune::set_runtime_fanout(next);
+                                basin_common::autotune::publish_flush_for(next, *flush_ratio);
+                                let dir = if next > prev {
+                                    "throughput up"
+                                } else if sample.overload >= 0.5 {
+                                    "overload, backing off"
+                                } else {
+                                    "throughput down, backing off"
+                                };
+                                tracing::info!(
+                                    rows_per_sec = sample.rows_per_sec,
+                                    overload = sample.overload,
+                                    "autotune: fanout {prev}\u{2192}{next} ({dir})"
+                                );
+                            }
+                        }
+                    }
                     _ = evict_tick.tick() => {
                         if let Err(e) = me.evict_idle().await {
                             warn!(error = %e, "eviction tick failed");
@@ -4158,6 +4254,13 @@ impl InProcessProjectHandle {
             }
         }
         if tail_bytes >= hard_tail_bytes() {
+            // Phase 2 autotune OVERLOAD signal: hitting the hard cap means the
+            // writer is about to BLOCK on a synchronous compaction because the
+            // in-memory tail outran the compactor — i.e. compaction is not
+            // keeping pace with ingest, the exact regime over-fanning produces
+            // on a shared vCPU. One relaxed atomic add; read only by the
+            // controller tick (autotune on). Off → written, never observed.
+            basin_common::autotune::record_overload_stall();
             // Flush the tail to immutable files. `compact_one` serializes per
             // partition via the partition's compaction lock, so a concurrent
             // background tick and this backpressure flush cannot double-commit

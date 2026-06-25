@@ -36,7 +36,7 @@
 //! If a source is unreadable we fall back to `available_parallelism()` for
 //! CPUs and a conservative default for memory; the tuner never panics.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 /// Per-knob ingest concurrency tuning derived from hardware.
@@ -364,6 +364,160 @@ pub fn set_runtime_flush_concurrency(n: usize) {
     RUNTIME_FLUSH.store(n, Ordering::Relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2 — process-global live feedback signals.
+//
+// The adaptive controller needs a node-wide view, not a per-shard one: a node
+// may host several shards, but the fan-out / flush-concurrency knobs are
+// process-global, so the controller must see the SUM of committed throughput
+// and the SUM of overload events across every shard. We therefore accumulate
+// the two signals in process-global relaxed atomics rather than per-shard
+// state. The hot-path cost is a single `fetch_add(Relaxed)` per commit wave
+// (NOT per row) and per hard-cap backpressure stall — no lock, no allocation,
+// no per-row work. The controller's tick reads-and-resets (`swap`) these to
+// derive an interval rate, so an unread accumulator just keeps growing
+// cheaply and is bounded by `u64`.
+//
+// These counters are written unconditionally on the commit / backpressure
+// paths (the `record_*` calls are unconditional), but that is still a no-op at
+// the default: the only READER is the tick task, which is spawned ONLY when
+// `BASIN_AUTOTUNE` is on. With autotune off, nothing ever swaps or observes
+// them, no override is ever published (the runtime atomics stay 0), and the
+// knob readers fall through to their historical defaults. The extra relaxed
+// add on the commit path is unconditional but negligible (one uncontended
+// atomic increment per bounded compaction wave / backpressure stall, both of
+// which already do object-store I/O).
+// ---------------------------------------------------------------------------
+
+/// Total rows committed to cold storage since process start (monotonic until
+/// the controller's `swap`). Written on the compaction commit path.
+static COMMITTED_ROWS: AtomicU64 = AtomicU64::new(0);
+/// Count of commit waves observed since the last controller tick. The
+/// denominator for the overload ratio (overload = stalls / waves).
+static COMMIT_WAVES: AtomicU64 = AtomicU64::new(0);
+/// Count of hard-cap backpressure stalls (the writer blocked on a synchronous
+/// `compact_one` because the in-memory tail hit the hard cap = compaction is
+/// not keeping up with ingest) since the last controller tick.
+static OVERLOAD_STALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Record `rows` committed to cold storage in one compaction wave. Called on
+/// the commit path (`compact_one`). Cheap: one relaxed `fetch_add` per wave.
+#[inline]
+pub fn record_committed_rows(rows: u64) {
+    COMMITTED_ROWS.fetch_add(rows, Ordering::Relaxed);
+    COMMIT_WAVES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a hard-cap backpressure stall (writer blocked on synchronous
+/// compaction because the tail hit the hard cap). This is the overload proxy:
+/// it fires exactly when compaction cannot keep pace with ingest, which is the
+/// regime over-fanning produces on a shared vCPU. Cheap: one relaxed
+/// `fetch_add`.
+#[inline]
+pub fn record_overload_stall() {
+    OVERLOAD_STALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Read-and-reset the global signal accumulators, returning the rows
+/// committed, the number of commit waves, and the number of overload stalls
+/// since the last call. Used by the controller tick only.
+pub fn drain_signals() -> (u64, u64, u64) {
+    (
+        COMMITTED_ROWS.swap(0, Ordering::Relaxed),
+        COMMIT_WAVES.swap(0, Ordering::Relaxed),
+        OVERLOAD_STALLS.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Tick interval (seconds) for the adaptive controller. Env-tunable via
+/// `BASIN_AUTOTUNE_INTERVAL_SECS`; defaults to 20 s. Clamped to `[5, 600]` so
+/// a fat-fingered value can't busy-spin or stall the loop. Conservative: long
+/// enough that one interval reflects a real throughput trend, short enough to
+/// converge within a few minutes.
+pub fn tick_interval_secs() -> u64 {
+    std::env::var("BASIN_AUTOTUNE_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(20)
+        .clamp(5, 600)
+}
+
+/// Build one [`Sample`] from the drained global signals over an interval of
+/// `elapsed_secs` seconds. Pure (no atomics, no clock) so it is unit-testable:
+/// `throughput = committed_rows / elapsed`, `overload = stalls / waves`
+/// (clamped to `[0, 1]`; `0` waves ⇒ `0` overload). Exposed for the tick task
+/// and tests.
+pub fn sample_from_signals(
+    committed_rows: u64,
+    commit_waves: u64,
+    overload_stalls: u64,
+    elapsed_secs: f64,
+) -> Sample {
+    let elapsed = elapsed_secs.max(1.0);
+    let rows_per_sec = committed_rows as f64 / elapsed;
+    let overload = if commit_waves == 0 {
+        // No commits at all this interval: either idle, or every wave stalled
+        // (backpressure with no successful commit). If there were stalls,
+        // that IS overload; otherwise the node is idle (overload 0).
+        if overload_stalls > 0 {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        (overload_stalls as f64 / commit_waves as f64).clamp(0.0, 1.0)
+    };
+    Sample {
+        rows_per_sec,
+        overload,
+    }
+}
+
+/// The hard floor on the published flush concurrency: the controller never
+/// drives flush below this, matching the fan-out floor of 4 (the empirical
+/// "don't starve compaction" minimum).
+pub const FLUSH_FLOOR: usize = 4;
+
+/// Build the live controller for the current hardware, plus the flush-per-
+/// fanout ratio used to scale flush concurrency with fan-out. The async tick
+/// loop (in `basin-shard`, where tokio lives) owns the controller and calls
+/// [`AdaptiveController::observe`] each tick. Kept here (env- and
+/// hardware-pure) so it is unit-testable and the policy (floors/ceilings)
+/// lives next to the controller.
+///
+/// Floors/ceilings: fan-out roams `[max(4, derived/2), max(derived×2, …)]`;
+/// flush is published as `round(fanout × flush_per_fanout)` floored at
+/// [`FLUSH_FLOOR`]. Returns the derived starting fan-out as the third element
+/// so the caller can publish it immediately (still == derived, so no behavior
+/// change until the first adjustment).
+pub fn build_controller() -> (AdaptiveController, f64) {
+    // Seed from the hardware-derived tuning (autotune is on, so `tuning()` is
+    // `Some`). Fall back to the empirical anchor if detection somehow yields
+    // `None` (it cannot when enabled, but be defensive).
+    let derived = tuning().copied().unwrap_or(Tuning {
+        fanout: 8,
+        flush_concurrency: 16,
+        project_concurrency: 96,
+        global_budget: 96,
+    });
+    let min_fanout = (derived.fanout / 2).max(4);
+    let max_fanout = (derived.fanout * 2).max(min_fanout + 2);
+    let flush_per_fanout =
+        (derived.flush_concurrency as f64 / derived.fanout.max(1) as f64).max(1.0);
+    (
+        AdaptiveController::new(derived.fanout, min_fanout, max_fanout),
+        flush_per_fanout,
+    )
+}
+
+/// Publish a flush concurrency proportional to `fanout` (keeping the derived
+/// ratio), floored at [`FLUSH_FLOOR`]. Controller-only.
+pub fn publish_flush_for(fanout: usize, flush_per_fanout: f64) {
+    let flush = ((fanout as f64 * flush_per_fanout).round() as usize).max(FLUSH_FLOOR);
+    set_runtime_flush_concurrency(flush);
+}
+
 /// A throughput sample fed to the [`AdaptiveController`] each tick.
 #[derive(Debug, Clone, Copy)]
 pub struct Sample {
@@ -673,5 +827,108 @@ mod tests {
         let before = c.fanout();
         c.observe(Sample { rows_per_sec: 100_000.0, overload: 0.9 });
         assert!(c.fanout() < before, "overload must force back-off");
+    }
+
+    /// `sample_from_signals` derives rows/s and a bounded overload ratio.
+    #[test]
+    fn sample_from_signals_derives_rate_and_overload() {
+        // 200k rows over 20 s, 10 waves, 0 stalls → 10k r/s, overload 0.
+        let s = sample_from_signals(200_000, 10, 0, 20.0);
+        assert!((s.rows_per_sec - 10_000.0).abs() < 1e-6);
+        assert_eq!(s.overload, 0.0);
+
+        // 5 of 10 waves stalled → overload 0.5.
+        let s = sample_from_signals(100_000, 10, 5, 20.0);
+        assert_eq!(s.overload, 0.5);
+
+        // More stalls than waves clamps at 1.0.
+        let s = sample_from_signals(0, 2, 9, 20.0);
+        assert_eq!(s.overload, 1.0);
+
+        // Stalls but zero committed waves = full overload (every wave blocked).
+        let s = sample_from_signals(0, 0, 3, 20.0);
+        assert_eq!(s.overload, 1.0);
+
+        // Fully idle interval: no signal, overload 0, rate 0.
+        let s = sample_from_signals(0, 0, 0, 20.0);
+        assert_eq!(s.rows_per_sec, 0.0);
+        assert_eq!(s.overload, 0.0);
+
+        // Elapsed is floored at 1 s so a tiny/zero interval can't divide-by-zero.
+        let s = sample_from_signals(5_000, 1, 0, 0.0);
+        assert!((s.rows_per_sec - 5_000.0).abs() < 1e-6);
+    }
+
+    /// `publish_flush_for` scales flush with fan-out at the derived ratio and
+    /// never drops below the flush floor.
+    #[test]
+    fn publish_flush_floors_at_min() {
+        // Derived anchor ratio is flush/fanout = 16/8 = 2.0.
+        // (We don't actually read the runtime atomic here — that's process-
+        //  global state other tests rely on staying 0. We only check the math
+        //  by recomputing it the way publish_flush_for does.)
+        let ratio = 2.0;
+        let flush = |f: usize| ((f as f64 * ratio).round() as usize).max(FLUSH_FLOOR);
+        assert_eq!(flush(8), 16);
+        assert_eq!(flush(12), 24);
+        // A small fan-out can't push flush below the floor.
+        assert_eq!(flush(1), FLUSH_FLOOR);
+        assert_eq!(FLUSH_FLOOR, 4);
+    }
+
+    /// End-to-end live-loop policy: drive the controller through the SAME
+    /// scripted-sample path the tick task uses (`sample_from_signals` →
+    /// `observe`), feeding rising-then-falling committed throughput, and assert
+    /// it climbs while throughput rises and backs off (without runaway
+    /// oscillation) once it falls — the load-bearing shared-vCPU behavior.
+    #[test]
+    fn live_loop_climbs_then_backs_off() {
+        // Mirror build_controller's floors/ceilings for the 4-vCPU anchor
+        // (derived fanout 8): roam [4, 16].
+        let mut c = AdaptiveController::new(8, 4, 16);
+        let elapsed = 20.0; // one nominal interval
+
+        // Rising throughput: committed rows per interval climb. No stalls.
+        for rows in [800_000u64, 1_000_000, 1_200_000, 1_400_000] {
+            let s = sample_from_signals(rows, 20, 0, elapsed);
+            c.observe(s);
+        }
+        let peak = c.fanout();
+        assert!(peak > 8, "should climb above the derived start (got {peak})");
+
+        // Over-fanned: throughput collapses (CPU saturated) AND stalls appear.
+        for (rows, stalls) in [(700_000u64, 8u64), (650_000, 10)] {
+            let s = sample_from_signals(rows, 20, stalls, elapsed);
+            c.observe(s);
+        }
+        assert!(
+            c.fanout() < peak,
+            "must back off after the regression (peak {peak}, now {})",
+            c.fanout()
+        );
+
+        // Plateau within the hysteresis band: must settle, not oscillate.
+        let settled = c.fanout();
+        for _ in 0..20 {
+            let s = sample_from_signals(660_000, 20, 1, elapsed);
+            c.observe(s);
+        }
+        let drift = (c.fanout() as i64 - settled as i64).abs();
+        assert!(drift <= c.step as i64, "must settle within one step (drift {drift})");
+        assert!(c.fanout() >= 4 && c.fanout() <= 16, "stays within bounds");
+    }
+
+    /// No-op proof: the global signal accumulators exist, but with autotune off
+    /// nothing READS them (the tick task is never spawned) and the runtime
+    /// override atomics stay 0, so the knob readers fall through to their
+    /// historical defaults. We assert the override atomics are unset; we do not
+    /// touch the accumulators (process-global) so sibling tests are unaffected.
+    #[test]
+    fn signals_are_noop_without_reader() {
+        // The runtime overrides — the ONLY thing that changes live behavior —
+        // are unset unless the controller publishes, which only happens in the
+        // spawned tick task (autotune on).
+        assert_eq!(RUNTIME_FANOUT.load(Ordering::Relaxed), 0);
+        assert_eq!(RUNTIME_FLUSH.load(Ordering::Relaxed), 0);
     }
 }

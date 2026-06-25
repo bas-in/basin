@@ -8,7 +8,7 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
-## Unreleased — Add: hardware-aware ingest concurrency auto-tuner (`BASIN_AUTOTUNE`, default OFF)
+## Unreleased — Add: hardware-aware ingest concurrency auto-tuner with live self-tuning (`BASIN_AUTOTUNE`, default OFF)
 
 **Perf feature, flag-gated and off by default.** Basin's ingest concurrency
 knobs — shard fan-out (`BASIN_SHARD_PARTITIONS_PER_TABLE`), flush concurrency
@@ -47,10 +47,37 @@ atomic-knob plumbing for the two per-operation knobs (fan-out and flush
 concurrency, runtime-adjustable via `set_runtime_fanout` /
 `set_runtime_flush_concurrency`) are built and unit-tested. The per-project
 semaphore and the scheduler global-budget semaphore are sized once at
-construction and remain **startup-only**. The live sampling background task
-that feeds the controller is scaffolded (the controller and atomic overrides
-are ready) but not yet wired into the server, pending a global committed-rows/s
-counter and overload aggregator on the hot path.
+construction and remain **startup-only**.
+
+**Phase 2 — the live feedback loop is now wired.** Static hardware detection
+can't tell a *shared* vCPU from a *dedicated* one (Fly's `shared-cpu-Nx`
+reports a cgroup quota of N, but the host steals cycles, so the true
+throughput-optimal fan-out is lower), so under `BASIN_AUTOTUNE` the engine now
+self-tunes from live runtime signals:
+
+- **Throughput signal (committed rows/s):** one relaxed atomic `fetch_add` per
+  committed compaction wave on the commit path (`compact_one`), *not* per row —
+  negligible hot-path cost on a path that already does object-store I/O.
+- **Overload signal:** the hard-cap backpressure stall — the writer blocked on
+  a synchronous `compact_one` because the in-memory tail outran the compactor,
+  i.e. compaction can't keep pace with ingest, the exact regime over-fanning
+  produces on a shared vCPU. One relaxed atomic add per stall. The controller's
+  overload = stalls ÷ commit-waves over the interval.
+- **Controller tick:** a background task (one per process, guarded by a
+  one-shot claim so multi-shard nodes run a single controller) wakes every
+  `BASIN_AUTOTUNE_INTERVAL_SECS` (default 20 s, clamped `[5, 600]`), builds a
+  `Sample`, and steps the controller. It climbs fan-out by one step while
+  throughput rises and overload stays low, and **backs off** when throughput
+  drops vs. the prior sample *or* overload crosses the ceiling — hysteresis
+  prevents oscillation. Fan-out roams `[max(4, derived/2), derived×2]`; flush
+  scales with fan-out at the derived ratio, floored at 4. Each adjustment logs
+  at INFO (`autotune: fanout 8→9 (throughput up)`).
+
+**Provable no-op at the default remains intact.** The tick task is spawned
+*only* when `BASIN_AUTOTUNE` is on; with it off the controller is never
+constructed, no override is ever published (the runtime atomics stay 0), and
+the two hot-path counters are written but never observed — behavior is
+byte-for-byte today's.
 
 ## Unreleased — Fix: dead pgwire connections no longer leak the per-project connection-ceiling slot (#33)
 
