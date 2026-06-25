@@ -8,6 +8,50 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Fix: adaptive ingest auto-tuner no longer changes fan-out at runtime (correctness — was double-counting `count(*)`) (`BASIN_AUTOTUNE`, default OFF)
+
+**Correctness fix.** Phase 2 of the auto-tuner adjusted the bulk-ingest
+**fan-out** live (via a runtime override read by `executor::write_batch_fanout`).
+Fan-out is the ingest **partition topology** — it is the modulus of the
+round-robin that routes a table's bulk chunks across partitions
+(`idx = cursor % fanout`). Changing it mid-stream reshapes which partitions a
+single COPY's chunks land in *while the background compaction and file-merge
+sweeps run concurrently under different locks* (per-partition `compact_lock`
+vs. process-wide `stripe_merge_lock`). The cold read / `count(*)` path
+enumerates data files by **object-store LIST across every partition subdir** —
+it does not consult the catalog live set for existence — so when the partition
+set shifts under those concurrent sweeps, pre-merge source files and the
+post-merge output could remain physically live at the same time, and the
+LIST-based count double-counted them. Measured on dev: a clean 20,000,000-row
+COPY (no client disruption, no drops) read back `count = 23,310,000`
+(`max(id) = 19,999,999`) — ~16.5% phantom rows, uniform across id buckets —
+**only** when the controller changed fan-out mid-ingest. With `BASIN_AUTOTUNE`
+off (fan-out fixed) the identical load was exact.
+
+The fix makes Phase 2 exactly-once-safe by **pinning fan-out**:
+
+- **Fan-out is now fixed for the life of the process** at its Phase-1
+  hardware-derived value. The runtime fan-out override and its setter are
+  removed; `executor::fanout_partition_count` no longer consults a live
+  override (explicit env → derived → historical default, unchanged otherwise).
+- **The adaptive controller now tunes flush concurrency only** — the sole
+  ingest knob that is exactly-once-safe to change live. Flush concurrency
+  bounds how many compaction chunks a wave prepares/writes; each chunk is still
+  drained once, written once, committed once, and pruned by its own `max_lsn`,
+  so a mid-wave change alters I/O parallelism without ever changing data
+  identity or partition routing. The controller seeds at the derived flush and
+  roams `[max(4, derived/2), derived×2]`; the anchored, smoothed,
+  clear-margin/sustained hill-climbing policy is unchanged (it now climbs flush
+  instead of fan-out).
+
+New regression tests: a controller gate asserting Phase 2 drives the flush knob
+(not fan-out), and a multi-threaded shard test that shifts the partition
+topology mid-ingest while compaction + file-merge run concurrently and the live
+flush knob is mutated each chunk — the LIST-based `count(*)` must equal the rows
+written, every id exactly once. Still a provable no-op at the default (the
+controller is constructed only when `BASIN_AUTOTUNE` is on, and no runtime
+override is ever published when off).
+
 ## Unreleased — Fix: adaptive ingest auto-tuner can no longer drift below the hardware-derived baseline on noisy signals (`BASIN_AUTOTUNE`, default OFF)
 
 **Robustness fix for the live controller.** The committed-rows/s signal is

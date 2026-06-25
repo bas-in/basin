@@ -3542,20 +3542,23 @@ impl ShardImpl for InProcessShard {
             // wins the `Once`; later shards' loops leave it `None`.
             let mut autotune_state: Option<(
                 basin_common::autotune::AdaptiveController,
-                f64,
                 std::time::Instant,
             )> = if basin_common::autotune::autotune_enabled() && autotune_claim() {
-                let (controller, flush_ratio) = basin_common::autotune::build_controller();
-                // Publish the derived start immediately (== derived, so no
-                // behavior change until the first adjustment).
-                basin_common::autotune::set_runtime_fanout(controller.fanout());
-                basin_common::autotune::publish_flush_for(controller.fanout(), flush_ratio);
+                let controller = basin_common::autotune::build_controller();
+                // Publish the derived start flush immediately (== derived, so no
+                // behavior change until the first adjustment). Fan-out is NOT
+                // published as a runtime override: it is pinned to the Phase-1
+                // hardware-derived value for the life of the process, because
+                // changing the partition topology mid-ingest double-counts the
+                // LIST-based count(*) (see autotune.rs module comment).
+                basin_common::autotune::publish_flush(controller.fanout());
                 tracing::info!(
-                    start_fanout = controller.fanout(),
+                    start_flush = controller.fanout(),
                     interval_secs = basin_common::autotune::tick_interval_secs(),
-                    "BASIN_AUTOTUNE on: adaptive ingest-concurrency controller started"
+                    "BASIN_AUTOTUNE on: adaptive flush-concurrency controller started \
+                     (fan-out pinned to hardware-derived value)"
                 );
-                Some((controller, flush_ratio, std::time::Instant::now()))
+                Some((controller, std::time::Instant::now()))
             } else {
                 None
             };
@@ -3581,7 +3584,7 @@ impl ShardImpl for InProcessShard {
                 tokio::select! {
                     _ = &mut shutdown => break,
                     _ = autotune_tick.tick(), if autotune_enabled => {
-                        if let Some((controller, flush_ratio, last)) = autotune_state.as_mut() {
+                        if let Some((controller, last)) = autotune_state.as_mut() {
                             let elapsed = last.elapsed().as_secs_f64();
                             *last = std::time::Instant::now();
                             let (rows, waves, stalls) =
@@ -3594,11 +3597,14 @@ impl ShardImpl for InProcessShard {
                             let sample = basin_common::autotune::sample_from_signals(
                                 rows, waves, stalls, elapsed,
                             );
+                            // The controller drives FLUSH concurrency only — the
+                            // sole exactly-once-safe runtime ingest knob. Fan-out
+                            // stays pinned (never published), so the partition
+                            // topology never changes mid-ingest.
                             let prev = controller.fanout();
                             let next = controller.observe(sample);
                             if next != prev {
-                                basin_common::autotune::set_runtime_fanout(next);
-                                basin_common::autotune::publish_flush_for(next, *flush_ratio);
+                                basin_common::autotune::publish_flush(next);
                                 // The controller emits the authoritative INFO
                                 // log (smoothed rate + reason) on every change;
                                 // this records the published knob + raw sample.
@@ -3607,7 +3613,7 @@ impl ShardImpl for InProcessShard {
                                     smoothed_rows_per_sec =
                                         controller.smoothed_rps().unwrap_or(sample.rows_per_sec),
                                     overload = sample.overload,
-                                    "autotune: published fanout {prev}\u{2192}{next}"
+                                    "autotune: published flush concurrency {prev}\u{2192}{next}"
                                 );
                             }
                         }
@@ -7947,6 +7953,211 @@ mod tests {
         after.sort();
         assert_eq!(before, after, "under-ceiling partition is untouched");
         assert_eq!(shard.stats().file_merges, 0);
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase-2 autotune exactly-once regression (runtime knob mutation).
+    // ----------------------------------------------------------------------
+
+    /// Restores the runtime flush override to "unset" (0) on drop so the
+    /// no-op-at-default invariant other tests assert is never broken.
+    struct RuntimeKnobGuard;
+    impl Drop for RuntimeKnobGuard {
+        fn drop(&mut self) {
+            basin_common::autotune::set_runtime_flush_concurrency(0);
+        }
+    }
+
+    /// Build a shard whose catalog is an `ObjectStoreCatalog` over the SAME
+    /// object store the `Storage` reads/writes (the dev/cloud topology: the
+    /// per-partition segment chains and the table-prefix data-file LIST both
+    /// live in one store). Returns the shard, the storage handle, and the
+    /// shared store so the test can drive a LIST-based count(*).
+    async fn fresh_osc_shard() -> (crate::Shard, Storage, Arc<dyn basin_catalog::Catalog>) {
+        use basin_catalog::ObjectStoreCatalog;
+        use object_store::memory::InMemory;
+        basin_common::telemetry::try_init_for_tests();
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let storage = Storage::new(StorageConfig {
+            object_store: store.clone(),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn basin_catalog::Catalog> =
+            Arc::new(ObjectStoreCatalog::new(store.clone()));
+        let wal_fs = LocalFileSystem::new_with_prefix(TempDir::new().unwrap().keep()).unwrap();
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(wal_fs),
+                root_prefix: None,
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
+            })
+            .await
+            .unwrap(),
+        );
+        let cfg = ShardConfig::new(storage.clone(), catalog.clone(), wal);
+        (crate::Shard::new(cfg), storage, catalog)
+    }
+
+    /// Count every row visible to a no-predicate, table-prefix LIST read — the
+    /// exact surface `count(*)` sums (object-store LIST across every partition
+    /// subdir, NOT the catalog live set). See `reader::read`.
+    async fn list_count(storage: &Storage, project: &ProjectId, table: &TableName) -> usize {
+        let stream = storage
+            .read(project, table, ReadOptions::default())
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        rows_in(&batches)
+    }
+
+    /// REGRESSION (Phase-2 autotune correctness): a bulk ingest whose
+    /// partition TOPOLOGY shifts mid-stream — exactly what a runtime fan-out
+    /// change used to do to `executor::write_batch_fanout`'s round-robin
+    /// (`idx = cursor % fanout`, `stripe_partition_key(idx)`) — must stay
+    /// exactly-once, AND the now-only runtime knob (flush concurrency) may be
+    /// mutated live throughout without breaking it.
+    ///
+    /// We drive a multi-batch ingest across a SHIFTING set of stripe partitions
+    /// (mimicking fan-out climbing/backing-off 4→10→6→12→4) while the
+    /// background compaction + file-merge sweeps run CONCURRENTLY and the live
+    /// flush override is flipped each chunk. The LIST-based count(*) must equal
+    /// the rows actually written: every id exactly once, none duplicated.
+    ///
+    /// The dev over-count this guards: a clean 20M COPY read back 23.31M
+    /// (~16.5% phantom) precisely when the adaptive controller changed fan-out
+    /// mid-ingest, because shifting the partition set under the concurrent
+    /// compaction + file-merge sweeps (which run under DIFFERENT locks) left
+    /// pre-merge sources and post-merge output both physically live under the
+    /// table prefix, which the LIST-based count double-counts. The fix pins
+    /// fan-out; this test keeps the data path honest under topology flux AND
+    /// confirms a live flush change alone is exactly-once-safe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_knob_change_mid_ingest_stays_exactly_once() {
+        let _guard = RuntimeKnobGuard;
+        let _env_lock = FILE_MERGE_ENV_LOCK.lock().unwrap();
+        // Make the file-merge sweep engage aggressively so a mid-ingest merge
+        // actually runs against the fanned-out partitions.
+        let _env = EnvGuard::set(&[
+            ("BASIN_COMPACT_MAX_FILES_PER_PARTITION", "2"),
+            ("BASIN_COMPACT_MERGE_BATCH", "4"),
+        ]);
+
+        let (shard, storage, catalog) = fresh_osc_shard().await;
+        let shard = Arc::new(shard);
+        let project = ProjectId::new();
+        let table = TableName::new("events").unwrap();
+        catalog
+            .create_table(&project, &table, schema().as_ref())
+            .await
+            .unwrap();
+
+        let inner = impl_of(&shard);
+
+        // Mirror `executor::write_batch_fanout`'s partition selection:
+        // partition = stripe i where i = cursor % fanout.
+        let stripe_key = |i: usize| -> PartitionKey {
+            if i == 0 {
+                PartitionKey::default_key()
+            } else {
+                PartitionKey::new(format!("s{i}")).unwrap()
+            }
+        };
+
+        // Background compaction + file-merge sweeps run continuously, exactly
+        // as the shard's background loop drives them — CONCURRENTLY with the
+        // ingest and the knob changes.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sweeper = {
+            let inner = inner.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = inner.run_compaction_once().await;
+                    let _ = inner.run_file_merge_once().await;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        const CHUNKS: usize = 48;
+        const ROWS_PER_CHUNK: usize = 100;
+        let mut cursor = 0usize;
+        let mut next_id: i64 = 0;
+        for chunk in 0..CHUNKS {
+            // The partition fan-out shifts mid-stream the way a (now-removed)
+            // runtime fan-out change would have reshaped routing.
+            let fanout = match chunk % 10 {
+                0 => 8,
+                2 => 10,
+                4 => 6,
+                6 => 12,
+                8 => 4,
+                _ => 8,
+            };
+            // The ONLY live runtime ingest knob — flush concurrency — is also
+            // mutated each chunk; this must be exactly-once-safe on its own.
+            basin_common::autotune::set_runtime_flush_concurrency(4 + (chunk % 13));
+
+            let idx = cursor % fanout;
+            cursor += 1;
+            let part = stripe_key(idx);
+            let handle = shard.get(&project, &part).await.unwrap();
+            handle
+                .write_batch(&table, batch(next_id, ROWS_PER_CHUNK, "v-"))
+                .await
+                .unwrap();
+            next_id += ROWS_PER_CHUNK as i64;
+            tokio::task::yield_now().await;
+        }
+
+        // Stop the sweeper, then drain + merge to a fixed point.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = sweeper.await;
+        inner.run_compaction_once().await.unwrap();
+        for _ in 0..CHUNKS {
+            inner.run_file_merge_once().await.unwrap();
+        }
+
+        let written = CHUNKS * ROWS_PER_CHUNK;
+        let counted = list_count(&storage, &project, &table).await;
+        assert_eq!(
+            counted, written,
+            "mid-ingest topology + flush mutation must stay exactly-once: wrote {written} \
+             distinct rows, count(*) (LIST-based) sees {counted}",
+        );
+
+        // Every id present exactly once — no phantom duplicates.
+        let stream = storage
+            .read(&project, &table, ReadOptions::default())
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for b in &batches {
+            let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            for k in 0..ids.len() {
+                assert!(
+                    seen.insert(ids.value(k)),
+                    "id {} double-counted after a mid-ingest fan-out change",
+                    ids.value(k)
+                );
+            }
+        }
+        assert_eq!(seen.len(), written, "every written id present exactly once");
     }
 
     // ----------------------------------------------------------------------

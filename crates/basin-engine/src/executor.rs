@@ -354,14 +354,17 @@ fn fanout_partition_count() -> usize {
             return n; // explicit env always wins
         }
     }
-    // Phase 2: a live override from the adaptive controller takes precedence
-    // over the static derived value once the controller is running.
-    if let Some(n) = basin_common::autotune::runtime_fanout() {
-        return n;
-    }
-    // Phase 1: hardware-derived default when BASIN_AUTOTUNE is on and there is
-    // no explicit env override. Off → falls through to the historical default
-    // (provable no-op).
+    // Phase 1 (static): hardware-derived default when BASIN_AUTOTUNE is on and
+    // there is no explicit env override. Off → falls through to the historical
+    // default (provable no-op).
+    //
+    // Fan-out is deliberately NOT runtime-adjustable. It is the bulk-ingest
+    // PARTITION TOPOLOGY (the modulus of the round-robin in
+    // `write_batch_fanout`); changing it mid-stream while the concurrent
+    // compaction + file-merge sweeps run leaves superseded data files live and
+    // double-counts the object-store-LIST-based `count(*)`. So once derived it
+    // is fixed for the life of the process — the Phase-2 adaptive controller
+    // only tunes flush concurrency. See `basin_common::autotune` module docs.
     if let Some(t) = basin_common::autotune::tuning() {
         return t.fanout;
     }

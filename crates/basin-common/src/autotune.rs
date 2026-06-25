@@ -312,17 +312,37 @@ fn ceil_div(a: u64, b: u64) -> usize {
 //
 // Static hardware detection cannot tell a *shared* vCPU from a *dedicated*
 // one: on Fly's shared-cpu-Nx the cgroup quota reports N, but the host may
-// steal cycles, so the real throughput-optimal fan-out is lower than the
+// steal cycles, so the real throughput-optimal concurrency is lower than the
 // dedicated-N value. The only way to find the true optimum is to observe
 // throughput and an overload signal at runtime and hill-climb.
 //
-// Only knobs read *per operation* can be adjusted live:
-//   * fanout            — read on every bulk write (executor::write_batch_fanout)
-//   * flush_concurrency — read at the top of every compaction wave
-// These read [`runtime_fanout`] / [`runtime_flush_concurrency`], which return
-// an `Option<usize>` override the controller writes via [`set_runtime_fanout`]
-// / [`set_runtime_flush_concurrency`]. `0` means "no override" (use the
-// caller's startup value), so the AtomicUsize default is a clean no-op.
+// CORRECTNESS — what may change live, and what MUST NOT:
+//
+//   * flush_concurrency — SAFE to adjust live. It only bounds how many
+//     compaction chunks one wave prepares/writes per pass
+//     (`in_process::compact_one`). Each chunk is still drained once, written
+//     once, committed once, and pruned by its own `max_lsn`; the knob changes
+//     I/O parallelism, never the identity of the data or which partition it
+//     belongs to. So a mid-wave change is exactly-once-safe.
+//
+//   * fanout — NOT safe to adjust live, and the controller NO LONGER touches
+//     it. `fanout` is the bulk-ingest PARTITION TOPOLOGY: it is the modulus of
+//     the round-robin in `executor::write_batch_fanout`
+//     (`idx = cursor % fanout`), so changing it mid-stream reshapes which
+//     partitions a single table's chunks land in. The cold read / `count(*)`
+//     path enumerates data files by OBJECT-STORE LIST across EVERY partition
+//     subdir (`reader::read`, no-predicate branch) — it does not consult the
+//     catalog live set for existence. Exactly-once therefore depends on the
+//     compaction + file-merge sweeps (which run under DIFFERENT locks:
+//     per-partition `compact_lock` vs. process-wide `stripe_merge_lock`)
+//     retiring superseded files cleanly. Shifting the partition set under
+//     those concurrent sweeps let the pre-merge sources AND the post-merge
+//     output stay physically live at once, which the LIST-based count then
+//     double-counts (measured on dev: a clean 20M COPY read back 23.31M,
+//     ~16.5% phantom rows, exactly when the controller changed fan-out
+//     mid-ingest; with fan-out fixed the same load is exact). So fan-out is
+//     pinned to the Phase-1 hardware-derived value for the life of the process
+//     and never published as a runtime override.
 //
 // The scheduler global budget and per-project concurrency are sized once, at
 // `Storage::new`, from a Tokio `Semaphore` whose permit count is fixed at
@@ -332,19 +352,8 @@ fn ceil_div(a: u64, b: u64) -> usize {
 // documented on [`AdaptiveController`].
 // ---------------------------------------------------------------------------
 
-/// Runtime fan-out override. `0` = unset (callers use their startup value).
-static RUNTIME_FANOUT: AtomicUsize = AtomicUsize::new(0);
 /// Runtime flush-concurrency override. `0` = unset.
 static RUNTIME_FLUSH: AtomicUsize = AtomicUsize::new(0);
-
-/// Current runtime fan-out override, if the controller has set one.
-/// `None` means callers should use their own startup-resolved value.
-pub fn runtime_fanout() -> Option<usize> {
-    match RUNTIME_FANOUT.load(Ordering::Relaxed) {
-        0 => None,
-        n => Some(n),
-    }
-}
 
 /// Current runtime flush-concurrency override, if any.
 pub fn runtime_flush_concurrency() -> Option<usize> {
@@ -354,12 +363,12 @@ pub fn runtime_flush_concurrency() -> Option<usize> {
     }
 }
 
-/// Set the live fan-out override (controller-only). `0` clears it.
-pub fn set_runtime_fanout(n: usize) {
-    RUNTIME_FANOUT.store(n, Ordering::Relaxed);
-}
-
 /// Set the live flush-concurrency override (controller-only). `0` clears it.
+///
+/// Flush concurrency is the ONLY ingest knob the adaptive controller adjusts
+/// at runtime: it changes compaction I/O parallelism without changing the
+/// partition topology, so a mid-ingest change stays exactly-once. Fan-out is
+/// deliberately NOT runtime-adjustable — see the module comment above.
 pub fn set_runtime_flush_concurrency(n: usize) {
     RUNTIME_FLUSH.store(n, Ordering::Relaxed);
 }
@@ -479,19 +488,23 @@ pub fn sample_from_signals(
 /// "don't starve compaction" minimum).
 pub const FLUSH_FLOOR: usize = 4;
 
-/// Build the live controller for the current hardware, plus the flush-per-
-/// fanout ratio used to scale flush concurrency with fan-out. The async tick
-/// loop (in `basin-shard`, where tokio lives) owns the controller and calls
+/// Build the live controller for the current hardware. The async tick loop
+/// (in `basin-shard`, where tokio lives) owns the controller and calls
 /// [`AdaptiveController::observe`] each tick. Kept here (env- and
 /// hardware-pure) so it is unit-testable and the policy (floors/ceilings)
 /// lives next to the controller.
 ///
-/// Floors/ceilings: fan-out roams `[max(4, derived/2), max(derived×2, …)]`;
-/// flush is published as `round(fanout × flush_per_fanout)` floored at
-/// [`FLUSH_FLOOR`]. Returns the derived starting fan-out as the third element
-/// so the caller can publish it immediately (still == derived, so no behavior
-/// change until the first adjustment).
-pub fn build_controller() -> (AdaptiveController, f64) {
+/// The controller drives **flush concurrency only** — the sole ingest knob
+/// that is exactly-once-safe to change live (it changes compaction I/O
+/// parallelism, never the partition topology; see the module comment).
+/// Fan-out is held FIXED at the Phase-1 hardware-derived value and is never
+/// published as a runtime override, because mutating the partition topology
+/// mid-stream double-counts the LIST-based `count(*)`.
+///
+/// Floors/ceilings: flush roams `[max(FLUSH_FLOOR, derived/2), derived×2]`,
+/// seeded at the derived flush value so it is a no-op until the first
+/// adjustment.
+pub fn build_controller() -> AdaptiveController {
     // Seed from the hardware-derived tuning (autotune is on, so `tuning()` is
     // `Some`). Fall back to the empirical anchor if detection somehow yields
     // `None` (it cannot when enabled, but be defensive).
@@ -501,21 +514,15 @@ pub fn build_controller() -> (AdaptiveController, f64) {
         project_concurrency: 96,
         global_budget: 96,
     });
-    let min_fanout = (derived.fanout / 2).max(4);
-    let max_fanout = (derived.fanout * 2).max(min_fanout + 2);
-    let flush_per_fanout =
-        (derived.flush_concurrency as f64 / derived.fanout.max(1) as f64).max(1.0);
-    (
-        AdaptiveController::new(derived.fanout, min_fanout, max_fanout),
-        flush_per_fanout,
-    )
+    let min_flush = (derived.flush_concurrency / 2).max(FLUSH_FLOOR);
+    let max_flush = (derived.flush_concurrency * 2).max(min_flush + 2);
+    AdaptiveController::new(derived.flush_concurrency, min_flush, max_flush)
 }
 
-/// Publish a flush concurrency proportional to `fanout` (keeping the derived
-/// ratio), floored at [`FLUSH_FLOOR`]. Controller-only.
-pub fn publish_flush_for(fanout: usize, flush_per_fanout: f64) {
-    let flush = ((fanout as f64 * flush_per_fanout).round() as usize).max(FLUSH_FLOOR);
-    set_runtime_flush_concurrency(flush);
+/// Publish the controller's current flush concurrency as the live override,
+/// floored at [`FLUSH_FLOOR`]. Controller-only.
+pub fn publish_flush(flush: usize) {
+    set_runtime_flush_concurrency(flush.max(FLUSH_FLOOR));
 }
 
 /// A throughput sample fed to the [`AdaptiveController`] each tick.
@@ -549,8 +556,14 @@ const CLEAR_MARGIN: f64 = 0.10;
 /// tick is never enough — the win must be sustained.
 const SUSTAIN_TICKS: u32 = 2;
 
-/// Conservative, anchored hill-climbing controller for the runtime-adjustable
-/// knobs.
+/// Conservative, anchored hill-climbing controller for the one runtime-
+/// adjustable ingest knob, **flush concurrency**.
+///
+/// (The controller is a generic anchored hill-climber over a single integer
+/// knob; its internal `*_fanout` field/method names are historical — they now
+/// carry the flush-concurrency value. Fan-out itself is NOT runtime-adjustable;
+/// see the module comment for why mutating the partition topology mid-stream is
+/// unsafe.)
 ///
 /// The load-bearing invariant: **the adaptive layer's worst case must equal
 /// the static hardware-derived baseline.** A noisy throughput signal must
@@ -576,12 +589,14 @@ const SUSTAIN_TICKS: u32 = 2;
 /// Overload (compaction can't keep pace) forces an immediate one-step back-off
 /// regardless of throughput.
 ///
-/// STARTUP-ONLY knobs (`project_concurrency`, `global_budget`) are *not*
-/// driven here — see the module comment. The controller is constructed and
-/// stepped only when `BASIN_AUTOTUNE` is on; the background task that calls
-/// [`AdaptiveController::observe`] on a 10–30 s tick is wired by the server
-/// (see `set_runtime_fanout` call sites). When autotune is off it is never
-/// constructed, so it is a strict no-op at the default.
+/// STARTUP-ONLY knobs (`fanout`, `project_concurrency`, `global_budget`) are
+/// *not* driven here — see the module comment (fan-out is the partition
+/// topology and pinning it is a correctness requirement). The controller is
+/// constructed and stepped only when `BASIN_AUTOTUNE` is on; the background
+/// task that calls [`AdaptiveController::observe`] on a 10–30 s tick is wired
+/// by the server (see `set_runtime_flush_concurrency` call sites). When
+/// autotune is off it is never constructed, so it is a strict no-op at the
+/// default.
 #[derive(Debug, Clone)]
 pub struct AdaptiveController {
     cur_fanout: usize,
@@ -870,10 +885,10 @@ mod tests {
 
     #[test]
     fn runtime_overrides_default_to_unset() {
-        // Module-global atomics default to 0 (= unset = no-op). We don't set
-        // them here (process-global state) so the no-op invariant holds for
-        // every other test in the suite.
-        assert_eq!(RUNTIME_FANOUT.load(Ordering::Relaxed), 0);
+        // The flush override atomic defaults to 0 (= unset = no-op). We don't
+        // set it here (process-global state) so the no-op invariant holds for
+        // every other test in the suite. There is no runtime fan-out override:
+        // fan-out is pinned to the derived value for the process lifetime.
         assert_eq!(RUNTIME_FLUSH.load(Ordering::Relaxed), 0);
     }
 
@@ -1071,19 +1086,17 @@ mod tests {
         assert!((s.rows_per_sec - 5_000.0).abs() < 1e-6);
     }
 
-    /// `publish_flush_for` scales flush with fan-out at the derived ratio and
-    /// never drops below the flush floor.
+    /// `publish_flush` publishes the controller's flush value verbatim but
+    /// never below the flush floor.
     #[test]
     fn publish_flush_floors_at_min() {
-        // Derived anchor ratio is flush/fanout = 16/8 = 2.0.
-        // (We don't actually read the runtime atomic here — that's process-
-        //  global state other tests rely on staying 0. We only check the math
-        //  by recomputing it the way publish_flush_for does.)
-        let ratio = 2.0;
-        let flush = |f: usize| ((f as f64 * ratio).round() as usize).max(FLUSH_FLOOR);
-        assert_eq!(flush(8), 16);
-        assert_eq!(flush(12), 24);
-        // A small fan-out can't push flush below the floor.
+        // (We don't actually call `publish_flush` here — it writes the
+        //  process-global atomic other tests rely on staying 0. We check the
+        //  flooring contract by recomputing it the way `publish_flush` does.)
+        let flush = |f: usize| f.max(FLUSH_FLOOR);
+        assert_eq!(flush(16), 16);
+        assert_eq!(flush(8), 8);
+        // A tiny value can't push the published flush below the floor.
         assert_eq!(flush(1), FLUSH_FLOOR);
         assert_eq!(FLUSH_FLOOR, 4);
     }
@@ -1139,10 +1152,62 @@ mod tests {
     /// touch the accumulators (process-global) so sibling tests are unaffected.
     #[test]
     fn signals_are_noop_without_reader() {
-        // The runtime overrides — the ONLY thing that changes live behavior —
-        // are unset unless the controller publishes, which only happens in the
-        // spawned tick task (autotune on).
-        assert_eq!(RUNTIME_FANOUT.load(Ordering::Relaxed), 0);
+        // The runtime flush override — the ONLY ingest knob that changes live
+        // behavior — is unset unless the controller publishes, which only
+        // happens in the spawned tick task (autotune on). Fan-out has no
+        // runtime override at all (pinned to the derived value).
         assert_eq!(RUNTIME_FLUSH.load(Ordering::Relaxed), 0);
+    }
+
+    /// CORRECTNESS GATE (Phase-2 exactly-once): `build_controller` drives the
+    /// FLUSH-concurrency knob — it seeds the controller on the derived FLUSH
+    /// value and roams the FLUSH bounds `[max(FLUSH_FLOOR, seed/2), seed×2]`,
+    /// NOT the fan-out value/bounds. Fan-out is pinned (see the module
+    /// comment), so the controller can never publish a fan-out change that
+    /// reshapes the partition topology mid-ingest and double-counts the
+    /// LIST-based count(*).
+    ///
+    /// Detection-order-independent: `build_controller` reads the process-cached
+    /// `tuning()`, which a sibling test may have resolved first. We assert the
+    /// STRUCTURE (seed → flush-shaped bounds) rather than an absolute value,
+    /// and contrast it against the fan-out bounds the OLD controller used so a
+    /// regression to fan-out tuning is caught regardless of detection order.
+    #[test]
+    fn controller_tunes_flush_not_fanout() {
+        let c = build_controller();
+        let seed = c.fanout(); // historical accessor name; carries the flush seed.
+
+        // The controller's bounds are the FLUSH bounds derived from its seed.
+        let min_flush = (seed / 2).max(FLUSH_FLOOR);
+        let max_flush = (seed * 2).max(min_flush + 2);
+        assert_eq!(c.min_fanout, min_flush, "lower bound is max(FLUSH_FLOOR, seed/2)");
+        assert_eq!(c.max_fanout, max_flush, "upper bound is 2× seed");
+
+        // The seed must be the derived FLUSH value, never the derived fan-out.
+        // For ANY derived tuning, flush = clamp(4×cpus, …) is always >= fan-out
+        // = clamp(2×cpus, …) before the memory cap, and the memory cap only
+        // ever SHRINKS flush — so deriving the controller from fan-out would be
+        // observable as a smaller seed on a fat box. The decisive structural
+        // fact we pin: the bounds match the seed's FLUSH shaping, and the seed
+        // is floored at FLUSH_FLOOR (the flush floor), which the fan-out floor
+        // of 4 happens to share — so we additionally check the seed equals the
+        // derived flush for whatever envelope build_controller resolved.
+        let cached = tuning().copied();
+        let derived = cached.unwrap_or(Tuning {
+            fanout: 8,
+            flush_concurrency: 16,
+            project_concurrency: 96,
+            global_budget: 96,
+        });
+        assert_eq!(
+            seed, derived.flush_concurrency,
+            "controller must seed at derived flush ({}), not derived fan-out ({})",
+            derived.flush_concurrency, derived.fanout,
+        );
+
+        // There is NO runtime fan-out override surface at all (the symbol does
+        // not even exist); the only live ingest knob is flush concurrency, and
+        // it is a no-op until the tick task publishes.
+        assert_eq!(RUNTIME_FLUSH.load(Ordering::Relaxed), 0, "no-op until published");
     }
 }
