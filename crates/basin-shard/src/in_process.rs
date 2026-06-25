@@ -203,11 +203,21 @@ const MAX_COMPACTION_ROWS: usize = 512 * 1024;
 const DEFAULT_FLUSH_CONCURRENCY: usize = 8;
 
 fn flush_concurrency() -> usize {
-    std::env::var("BASIN_SHARD_FLUSH_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_FLUSH_CONCURRENCY)
+    if let Ok(v) = std::env::var("BASIN_SHARD_FLUSH_CONCURRENCY") {
+        if let Some(n) = v.parse::<usize>().ok().filter(|n| *n > 0) {
+            return n; // explicit env always wins
+        }
+    }
+    // Phase 2: live override from the adaptive controller, if running.
+    if let Some(n) = basin_common::autotune::runtime_flush_concurrency() {
+        return n;
+    }
+    // Phase 1: hardware-derived default under BASIN_AUTOTUNE (no env override).
+    // Off → historical default (no-op).
+    if let Some(t) = basin_common::autotune::tuning() {
+        return t.flush_concurrency;
+    }
+    DEFAULT_FLUSH_CONCURRENCY
 }
 
 /// Resolved per-table write configuration, cached for the lifetime of one

@@ -222,9 +222,15 @@ pub fn resolve_project_concurrency() -> usize {
     if let Ok(v) = std::env::var("BASIN_STORAGE_PROJECT_CONCURRENCY") {
         if let Ok(n) = v.parse::<usize>() {
             if n > 0 {
-                return n;
+                return n; // explicit env always wins
             }
         }
+    }
+    // Hardware-derived value under BASIN_AUTOTUNE (no env override). Startup-
+    // only: the per-project semaphore is sized once at `Storage::new`. Off →
+    // historical formula (no-op).
+    if let Some(t) = basin_common::autotune::tuning() {
+        return t.project_concurrency;
     }
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -279,9 +285,15 @@ pub fn resolve_global_budget() -> usize {
     if let Ok(v) = std::env::var("BASIN_STORAGE_GLOBAL_BUDGET") {
         if let Ok(n) = v.parse::<usize>() {
             if n > 0 {
-                return n;
+                return n; // explicit env always wins
             }
         }
+    }
+    // Hardware-derived value under BASIN_AUTOTUNE (no env override). Startup-
+    // only: the scheduler's global-budget semaphore is sized once at
+    // construction and is not resized live. Off → scheduler default (no-op).
+    if let Some(t) = basin_common::autotune::tuning() {
+        return t.global_budget;
     }
     scheduler::default_global_budget()
 }

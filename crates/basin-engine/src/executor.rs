@@ -349,11 +349,23 @@ const FANOUT_PARTITIONS_DEFAULT: usize = 4;
 /// fan-out (back-compat: all bulk writes stay in `_default`). Clamped to >= 1.
 /// Env: `BASIN_SHARD_PARTITIONS_PER_TABLE`.
 fn fanout_partition_count() -> usize {
-    std::env::var("BASIN_SHARD_PARTITIONS_PER_TABLE")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(FANOUT_PARTITIONS_DEFAULT)
+    if let Ok(s) = std::env::var("BASIN_SHARD_PARTITIONS_PER_TABLE") {
+        if let Some(n) = s.parse::<usize>().ok().filter(|&n| n > 0) {
+            return n; // explicit env always wins
+        }
+    }
+    // Phase 2: a live override from the adaptive controller takes precedence
+    // over the static derived value once the controller is running.
+    if let Some(n) = basin_common::autotune::runtime_fanout() {
+        return n;
+    }
+    // Phase 1: hardware-derived default when BASIN_AUTOTUNE is on and there is
+    // no explicit env override. Off → falls through to the historical default
+    // (provable no-op).
+    if let Some(t) = basin_common::autotune::tuning() {
+        return t.fanout;
+    }
+    FANOUT_PARTITIONS_DEFAULT
 }
 
 /// Per-`(project, table)` round-robin cursor for bulk-ingest partition
@@ -590,6 +602,7 @@ mod fanout_tests {
             std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", v);
         }
     }
+
 }
 
 /// Dispatch `LISTEN` / `UNLISTEN` / `NOTIFY` through the engine's SQL

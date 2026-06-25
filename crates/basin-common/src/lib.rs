@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod autotune;
 pub mod error;
 pub mod events;
 pub mod ids;
@@ -15,6 +16,7 @@ pub mod region;
 pub mod telemetry;
 pub mod types;
 
+pub use autotune::{autotune_enabled, derive_tuning, detect_hardware, tuning, Hardware, Tuning};
 pub use error::{BasinError, Result};
 pub use events::{ChangeEvent, ChangeEventSink, ChangeOp, EventSinkRegistry};
 pub use ids::{

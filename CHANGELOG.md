@@ -8,6 +8,50 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Add: hardware-aware ingest concurrency auto-tuner (`BASIN_AUTOTUNE`, default OFF)
+
+**Perf feature, flag-gated and off by default.** Basin's ingest concurrency
+knobs — shard fan-out (`BASIN_SHARD_PARTITIONS_PER_TABLE`), flush concurrency
+(`BASIN_SHARD_FLUSH_CONCURRENCY`), per-project storage concurrency
+(`BASIN_STORAGE_PROJECT_CONCURRENCY`), and the scheduler global RPC budget
+(`BASIN_STORAGE_GLOBAL_BUDGET`) — shipped as fixed constants chosen for a small
+CI box, independent of the machine the engine actually runs on. On a small
+shared-cpu box, raising them makes ingest *slower* (CPU saturates); on a fat
+box, leaving them low leaves throughput on the table.
+
+The new `basin-common::autotune` module derives each knob from the **effective**
+hardware envelope, detected once at startup:
+
+- **CPU count, container-aware.** `min(available_parallelism, cgroup quota)` so
+  a Fly/Kubernetes process that sees the host's `nproc` is clamped to its actual
+  allotment. Reads cgroup v2 `/sys/fs/cgroup/cpu.max`, falls back to cgroup v1
+  `cpu.cfs_quota_us` / `cpu.cfs_period_us`, then to `available_parallelism`.
+- **Memory limit.** cgroup v2 `/sys/fs/cgroup/memory.max`, falling back to
+  cgroup v1 `memory.limit_in_bytes`, then `/proc/meminfo` `MemTotal`. Used to
+  cap in-flight ingest segments so a fat-CPU / thin-RAM box can't OOM.
+
+`derive_tuning(cpus, mem_bytes)` is a pure, unit-tested function anchored on the
+measured 4-vCPU / 8-GiB sweet spot (`fanout 8`, `flush 16`, `project 96`,
+`budget 96`); parallelism stays roughly proportional to CPUs (small multiples,
+not a large multiple, because over-fanning regressed throughput) and the
+memory cap trims the in-flight segment product to ≤ ¼ of RAM.
+
+**Provable no-op at the default.** Gated entirely on `BASIN_AUTOTUNE` (truthy =
+`1`/`true`/`yes`/`on`). When unset/off, `autotune::tuning()` returns `None` and
+every knob reader falls through to its exact historical default / env behavior.
+When on, a derived value is used *only* for a knob with no explicit env
+override — explicit env always wins.
+
+A conservative hill-climbing controller (`AdaptiveController`) and the
+atomic-knob plumbing for the two per-operation knobs (fan-out and flush
+concurrency, runtime-adjustable via `set_runtime_fanout` /
+`set_runtime_flush_concurrency`) are built and unit-tested. The per-project
+semaphore and the scheduler global-budget semaphore are sized once at
+construction and remain **startup-only**. The live sampling background task
+that feeds the controller is scaffolded (the controller and atomic overrides
+are ready) but not yet wired into the server, pending a global committed-rows/s
+counter and overload aggregator on the hot path.
+
 ## Unreleased — Fix: dead pgwire connections no longer leak the per-project connection-ceiling slot (#33)
 
 **Correctness / availability fix.** Each accepted pgwire session holds a
