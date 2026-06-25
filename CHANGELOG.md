@@ -8,6 +8,37 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Fix: adaptive ingest auto-tuner can no longer drift below the hardware-derived baseline on noisy signals (`BASIN_AUTOTUNE`, default OFF)
+
+**Robustness fix for the live controller.** The committed-rows/s signal is
+noisy at low ingest rates (dev: ~10–17k r/s), and the previous controller
+compared single consecutive samples — so noise could read as "throughput up"
+and walk fan-out away from the validated hardware-derived value, settling at a
+*worse* point (observed: fan-out drifted 8→12 and stranded at 12, no better
+than the derived 8). The adaptive layer must never make throughput worse than
+the static derivation. `AdaptiveController` is now conservative and anchored:
+
+- **Smoothing.** Decisions use an EWMA (`alpha = 0.3`) of committed-rows/s, not
+  raw consecutive samples, so per-tick jitter is not read as a trend.
+- **Clear-margin, sustained move-gate.** Fan-out steps *away* from its current
+  value only when the smoothed throughput beats the best-seen-at-that-fan-out by
+  a clear margin (`>= 10%`) for at least 2 consecutive evaluations. A single
+  noisy tick, or a one-off win that does not repeat, never moves the knob.
+- **Anchor to the derived baseline.** The controller remembers the derived
+  start fan-out. Whenever it sits at a non-derived setting that is not clearly
+  better than the best smoothed throughput ever seen *at the derived value*, it
+  biases one step back toward derived. Net effect: absent a clear, sustained
+  win the knob converges to the derived baseline — its safe floor — and never
+  strands at a noise-chosen worse point. **The adaptive layer's worst case now
+  equals the static derived baseline.**
+
+Overload still forces an immediate one-step back-off; bounds
+(`[max(4, derived/2), derived×2]`), flush floor (4), and INFO-on-change logging
+(now including the smoothed rate and the decision reason) are unchanged. New
+unit tests cover the no-drift-under-noise regression and the clear-sustained-
+win path; the climb/back-off/overload tests still hold. Still a provable no-op
+at the default (controller constructed only when `BASIN_AUTOTUNE` is on).
+
 ## Unreleased — Add: hardware-aware ingest concurrency auto-tuner with live self-tuning (`BASIN_AUTOTUNE`, default OFF)
 
 **Perf feature, flag-gated and off by default.** Basin's ingest concurrency

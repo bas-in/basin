@@ -530,13 +530,51 @@ pub struct Sample {
     pub overload: f64,
 }
 
-/// Conservative hill-climbing controller for the runtime-adjustable knobs.
+/// EWMA smoothing factor for the throughput signal. The committed-rows/s
+/// signal is noisy at low ingest rates (measured: ~10–17k r/s on dev swings
+/// enough that a single sample can flip "up"/"down"). We smooth with an
+/// exponentially-weighted moving average so decisions ride the trend, not the
+/// jitter. `0.3` keeps ~70% of the prior estimate each tick — slow enough to
+/// reject noise, fast enough to track a real regime change within a few ticks.
+const EWMA_ALPHA: f64 = 0.3;
+
+/// Clear-margin a *smoothed* throughput must beat the best-seen-at-this-fanout
+/// reference by before the controller will step AWAY from where it is. At 10%
+/// this is well above dev's per-sample noise, so noise cannot masquerade as a
+/// win and walk the knob off the derived baseline.
+const CLEAR_MARGIN: f64 = 0.10;
+
+/// How many *consecutive* evaluations the clear-margin win must hold before the
+/// controller commits to a move away from the current fan-out. A single noisy
+/// tick is never enough — the win must be sustained.
+const SUSTAIN_TICKS: u32 = 2;
+
+/// Conservative, anchored hill-climbing controller for the runtime-adjustable
+/// knobs.
 ///
-/// It nudges `fanout` (the primary lever) up by one step while throughput
-/// rises and overload stays low, and backs off by one step when throughput
-/// drops or overload crosses the ceiling. Hysteresis (`improve_margin` /
-/// `regress_margin` around the last-best throughput) prevents oscillation
-/// from sampling noise; the controller settles at the plateau.
+/// The load-bearing invariant: **the adaptive layer's worst case must equal
+/// the static hardware-derived baseline.** A noisy throughput signal must
+/// never strand the knob at a value worse than `derived`. We get this from
+/// three mechanisms, all keyed off a *smoothed* (EWMA) throughput:
+///
+/// 1. **Smoothing.** Decisions use an EWMA of committed-rows/s
+///    ([`EWMA_ALPHA`]), not raw consecutive samples, so per-tick jitter does
+///    not register as a trend.
+/// 2. **Clear-margin, sustained gate to move.** The controller steps *away*
+///    from its current fan-out only when the smoothed throughput beats the
+///    best-seen-at-the-current-fanout by [`CLEAR_MARGIN`] for at least
+///    [`SUSTAIN_TICKS`] consecutive evaluations. A move that does not clearly,
+///    repeatably help is not taken (and an explored move that fails to pay off
+///    is unwound by mechanism 3).
+/// 3. **Anchor to the derived baseline.** The controller remembers the derived
+///    start fan-out. Whenever it sits at a *non-derived* setting that is not
+///    clearly better than the best smoothed throughput it ever saw *at the
+///    derived value*, it biases one step back toward `derived`. Net effect: in
+///    the absence of a clear, sustained win the knob converges to `derived`
+///    (its safe floor) and never strands at a noise-chosen worse point.
+///
+/// Overload (compaction can't keep pace) forces an immediate one-step back-off
+/// regardless of throughput.
 ///
 /// STARTUP-ONLY knobs (`project_concurrency`, `global_budget`) are *not*
 /// driven here — see the module comment. The controller is constructed and
@@ -547,33 +585,52 @@ pub struct Sample {
 #[derive(Debug, Clone)]
 pub struct AdaptiveController {
     cur_fanout: usize,
+    /// The hardware-derived start fan-out — the validated safe baseline the
+    /// controller anchors to.
+    derived_fanout: usize,
     min_fanout: usize,
     max_fanout: usize,
     step: usize,
-    best_rows_per_sec: f64,
-    last_rows_per_sec: f64,
-    /// Direction of the last move: +1 climbing, -1 backing off.
+    /// Smoothed (EWMA) throughput; `None` until the first sample seeds it.
+    smoothed_rps: Option<f64>,
+    /// Best smoothed throughput ever observed *while sitting at*
+    /// `derived_fanout`. The reference the anchor compares against: a
+    /// non-derived setting must clear this by [`CLEAR_MARGIN`] to be kept.
+    best_at_derived: f64,
+    /// Best smoothed throughput observed at the *current* fan-out since we last
+    /// arrived here. The reference the clear-margin move-gate compares against.
+    best_at_cur: f64,
+    /// Direction of the last exploratory move: +1 climbing, -1 backing off.
     direction: i8,
-    improve_margin: f64,
-    regress_margin: f64,
+    /// Consecutive evaluations the clear-margin win has held.
+    sustain: u32,
+    clear_margin: f64,
+    sustain_ticks: u32,
     overload_ceiling: f64,
 }
 
 impl AdaptiveController {
     /// Build a controller seeded at the hardware-derived fan-out, free to roam
-    /// between `min` and `max` (typically `[2, derived×2]`).
+    /// between `min` and `max` (typically `[max(4, derived/2), derived×2]`).
+    /// The start value is the derived anchor the controller converges back to
+    /// absent a clear, sustained throughput win.
     pub fn new(start_fanout: usize, min_fanout: usize, max_fanout: usize) -> Self {
-        let cur = start_fanout.clamp(min_fanout.max(1), max_fanout.max(1));
+        let lo = min_fanout.max(1);
+        let hi = max_fanout.max(lo);
+        let cur = start_fanout.clamp(lo, hi);
         Self {
             cur_fanout: cur,
-            min_fanout: min_fanout.max(1),
-            max_fanout: max_fanout.max(1),
+            derived_fanout: cur,
+            min_fanout: lo,
+            max_fanout: hi,
             step: 2,
-            best_rows_per_sec: 0.0,
-            last_rows_per_sec: 0.0,
+            smoothed_rps: None,
+            best_at_derived: 0.0,
+            best_at_cur: 0.0,
             direction: 1,
-            improve_margin: 0.05, // need +5% to count as "rising"
-            regress_margin: 0.05, // tolerate -5% before backing off
+            sustain: 0,
+            clear_margin: CLEAR_MARGIN,
+            sustain_ticks: SUSTAIN_TICKS,
             overload_ceiling: 0.5,
         }
     }
@@ -583,46 +640,112 @@ impl AdaptiveController {
         self.cur_fanout
     }
 
-    /// Feed one [`Sample`]; returns the new fan-out to publish. Conservative:
-    /// at most one `step` move per tick, with hysteresis and a hard overload
-    /// back-off.
+    /// The smoothed throughput estimate (EWMA of committed-rows/s), if seeded.
+    pub fn smoothed_rps(&self) -> Option<f64> {
+        self.smoothed_rps
+    }
+
+    /// Feed one [`Sample`]; returns the new fan-out to publish.
+    ///
+    /// Conservative and anchored: at most one `step` move per tick. Overload
+    /// forces an immediate back-off; otherwise a move *away* from the current
+    /// fan-out requires a clear, sustained smoothed-throughput win, and absent
+    /// that the controller biases back toward the derived baseline.
     pub fn observe(&mut self, s: Sample) -> usize {
         let prev = self.cur_fanout;
 
-        if s.overload >= self.overload_ceiling {
-            // Overloaded: back off regardless of throughput.
-            self.cur_fanout = self.cur_fanout.saturating_sub(self.step).max(self.min_fanout);
-            self.direction = -1;
-        } else if s.rows_per_sec > self.best_rows_per_sec * (1.0 + self.improve_margin) {
-            // Throughput improving: keep moving in the current direction.
-            self.best_rows_per_sec = s.rows_per_sec;
-            self.cur_fanout = self.step_in_direction();
-        } else if s.rows_per_sec < self.last_rows_per_sec * (1.0 - self.regress_margin) {
-            // Throughput regressed: reverse direction and step.
-            self.direction = -self.direction;
-            self.cur_fanout = self.step_in_direction();
-        }
-        // else: within the hysteresis band → hold (settle, no oscillation).
+        // 1. Smooth the throughput signal (EWMA). Decisions use `sm`, not the
+        //    raw sample — single-tick noise must not register as a trend.
+        let sm = match self.smoothed_rps {
+            Some(prev_sm) => EWMA_ALPHA * s.rows_per_sec + (1.0 - EWMA_ALPHA) * prev_sm,
+            None => s.rows_per_sec,
+        };
+        self.smoothed_rps = Some(sm);
 
-        self.last_rows_per_sec = s.rows_per_sec;
+        let reason: &str;
+
+        if s.overload >= self.overload_ceiling {
+            // Overloaded: compaction can't keep pace. Back off one step
+            // immediately, regardless of throughput.
+            self.direction = -1;
+            self.cur_fanout = self.cur_fanout.saturating_sub(self.step).max(self.min_fanout);
+            self.sustain = 0;
+            reason = "overload, backing off";
+        } else if sm > self.best_at_cur * (1.0 + self.clear_margin) {
+            // 2. Clear-margin gate to MOVE. The smoothed throughput clearly
+            //    beats the best we've seen at this fan-out. Require it to hold
+            //    for `sustain_ticks` consecutive evals before committing — one
+            //    noisy tick is not enough.
+            self.best_at_cur = sm;
+            self.sustain = self.sustain.saturating_add(1);
+            if self.sustain >= self.sustain_ticks {
+                self.sustain = 0;
+                self.cur_fanout = self.step_in_direction();
+                reason = "clear sustained throughput win";
+            } else {
+                reason = "win pending sustain";
+            }
+        } else {
+            // No clear win at the current fan-out. Reset the sustain counter
+            // (the streak is broken) and, if we are away from the derived
+            // baseline without having justified it, bias back toward derived.
+            self.sustain = 0;
+            if self.cur_fanout != self.derived_fanout
+                && sm <= self.best_at_derived * (1.0 + self.clear_margin)
+            {
+                // 3. Anchor. This non-derived setting is not clearly better
+                //    than the best we ever saw at the derived value — step one
+                //    toward derived. Convergence to the safe floor.
+                self.cur_fanout = self.step_toward(self.derived_fanout);
+                reason = "anchor: no clear win, biasing to derived";
+            } else {
+                reason = "hold";
+            }
+        }
+
+        // Maintain the per-position best references AFTER any move. If we just
+        // landed somewhere new, start its best from the current smoothed value
+        // so the move-gate measures improvement *from here*.
         if self.cur_fanout != prev {
-            tracing::debug!(
+            self.best_at_cur = sm;
+        } else {
+            self.best_at_cur = self.best_at_cur.max(sm);
+        }
+        if self.cur_fanout == self.derived_fanout {
+            self.best_at_derived = self.best_at_derived.max(sm);
+        }
+
+        if self.cur_fanout != prev {
+            tracing::info!(
                 from = prev,
                 to = self.cur_fanout,
+                smoothed_rows_per_sec = sm,
                 rows_per_sec = s.rows_per_sec,
                 overload = s.overload,
+                reason,
                 "autotune controller adjusted fanout"
             );
         }
         self.cur_fanout
     }
 
+    /// Step one in the current exploratory direction, clamped to bounds.
     fn step_in_direction(&self) -> usize {
         if self.direction >= 0 {
             (self.cur_fanout + self.step).min(self.max_fanout)
         } else {
             self.cur_fanout.saturating_sub(self.step).max(self.min_fanout)
         }
+    }
+
+    /// Step one toward `target`, clamped to bounds (overshoot snaps to target).
+    fn step_toward(&self, target: usize) -> usize {
+        let next = if self.cur_fanout > target {
+            self.cur_fanout.saturating_sub(self.step).max(target)
+        } else {
+            (self.cur_fanout + self.step).min(target)
+        };
+        next.clamp(self.min_fanout, self.max_fanout)
     }
 }
 
@@ -754,41 +877,130 @@ mod tests {
         assert_eq!(RUNTIME_FLUSH.load(Ordering::Relaxed), 0);
     }
 
-    /// The controller climbs while throughput rises, then backs off and
-    /// settles once it falls — no runaway oscillation.
+    /// The controller climbs while throughput *clearly and sustainedly* rises,
+    /// then anchors back toward the derived baseline once the gains stop —
+    /// never stranding above derived without a sustained win.
     #[test]
     fn controller_climbs_then_backs_off_and_settles() {
-        let mut c = AdaptiveController::new(8, 2, 24);
+        let mut c = AdaptiveController::new(8, 4, 24);
 
-        // Throughput rises monotonically as fanout climbs: controller should
-        // ratchet fanout up toward the peak.
-        for rps in [50_000.0, 60_000.0, 70_000.0, 78_000.0] {
+        // Throughput rises by a clear margin each tick (well over CLEAR_MARGIN)
+        // and sustains: after each pair of confirming ticks the controller
+        // steps fan-out up. Feed enough to climb several steps above derived.
+        for rps in [
+            50_000.0, 60_000.0, 75_000.0, 95_000.0, 120_000.0, 150_000.0, 190_000.0, 240_000.0,
+        ] {
             c.observe(Sample { rows_per_sec: rps, overload: 0.1 });
         }
         let peak_fanout = c.fanout();
         assert!(peak_fanout > 8, "should have climbed above the start (got {peak_fanout})");
 
-        // Now throughput collapses (over-fanned: CPU saturated). Controller
-        // must reverse and reduce fanout.
-        for rps in [40_000.0, 38_000.0] {
+        // Now throughput collapses (over-fanned: CPU saturated). No clear win
+        // at the peak and not clearly better than best-at-derived, so the
+        // controller anchors back down toward derived.
+        for rps in [40_000.0, 38_000.0, 37_000.0, 36_000.0, 35_000.0] {
             c.observe(Sample { rows_per_sec: rps, overload: 0.2 });
         }
         assert!(
             c.fanout() < peak_fanout,
-            "should back off after regression (peak {peak_fanout}, now {})",
+            "should back off after the gains stop (peak {peak_fanout}, now {})",
             c.fanout()
         );
 
-        // Feed a long flat plateau within the hysteresis band: it must settle,
-        // not oscillate unboundedly.
-        let settled = c.fanout();
+        // Feed a long flat plateau: with no clear win it must converge to the
+        // derived baseline and settle there, not oscillate.
         for _ in 0..20 {
             c.observe(Sample { rows_per_sec: 39_000.0, overload: 0.2 });
         }
-        let drift = (c.fanout() as i64 - settled as i64).abs();
-        assert!(drift <= c.step as i64, "must settle within one step, drifted {drift}");
+        assert_eq!(
+            c.fanout(),
+            8,
+            "absent a sustained win it converges to the derived baseline"
+        );
         // Stays within configured bounds throughout.
-        assert!(c.fanout() >= 2 && c.fanout() <= 24);
+        assert!(c.fanout() >= 4 && c.fanout() <= 24);
+    }
+
+    /// NOISE regression (the bug this fix targets): a flat true throughput with
+    /// ±noise must NOT walk the knob away from the derived baseline. Single
+    /// noisy samples can read as "throughput up", but smoothing + the
+    /// clear/sustained move-gate + the derived anchor must keep the controller
+    /// pinned to (or converging back to) the derived value.
+    #[test]
+    fn controller_does_not_drift_on_noise() {
+        let mut c = AdaptiveController::new(8, 4, 16);
+        let derived = c.fanout();
+
+        // Deterministic pseudo-noise around a flat ~12k r/s mean (dev-like low
+        // rate). Swings of ±~15% — bigger than the real per-sample jitter —
+        // yet never a *sustained* clear-margin trend.
+        let base = 12_000.0;
+        let offsets = [
+            0.12, -0.10, 0.08, -0.13, 0.15, -0.07, 0.11, -0.14, 0.06, -0.09, 0.13, -0.12, 0.10,
+            -0.08, 0.14, -0.11,
+        ];
+        let mut max_seen = derived;
+        let mut min_seen = derived;
+        for &off in offsets.iter().cycle().take(120) {
+            let f = c.observe(Sample {
+                rows_per_sec: base * (1.0 + off),
+                overload: 0.0,
+            });
+            max_seen = max_seen.max(f);
+            min_seen = min_seen.min(f);
+        }
+
+        // Never strands away from derived: at most one exploratory step in
+        // either direction during the run, and it converges back.
+        assert!(
+            max_seen <= derived + c.step,
+            "noise pushed fan-out above derived+step (max {max_seen}, derived {derived})"
+        );
+        assert!(
+            min_seen + c.step >= derived,
+            "noise pushed fan-out below derived-step (min {min_seen}, derived {derived})"
+        );
+        assert_eq!(
+            c.fanout(),
+            derived,
+            "must converge back to the derived baseline under pure noise (got {})",
+            c.fanout()
+        );
+    }
+
+    /// CLEAR-WIN: when a higher fan-out genuinely sustains higher smoothed
+    /// throughput, the controller moves up and *stays* there (does not anchor
+    /// back to derived, because the win clears the margin against best-at-
+    /// derived).
+    #[test]
+    fn controller_moves_up_and_stays_on_clear_win() {
+        let mut c = AdaptiveController::new(8, 4, 16);
+
+        // Establish a stable baseline at derived first.
+        for _ in 0..3 {
+            c.observe(Sample { rows_per_sec: 50_000.0, overload: 0.0 });
+        }
+        assert_eq!(c.fanout(), 8, "settled at derived on the flat baseline");
+
+        // A genuine, large, sustained improvement (well over CLEAR_MARGIN, held
+        // many ticks) drives — and holds — fan-out above derived.
+        for _ in 0..12 {
+            c.observe(Sample { rows_per_sec: 120_000.0, overload: 0.0 });
+        }
+        let up = c.fanout();
+        assert!(up > 8, "clear sustained win must move fan-out up (got {up})");
+
+        // The win persists: hold the higher throughput and the controller does
+        // NOT anchor back, because it clearly beats best-at-derived.
+        for _ in 0..20 {
+            c.observe(Sample { rows_per_sec: 120_000.0, overload: 0.0 });
+        }
+        assert!(
+            c.fanout() >= up,
+            "must stay up while the win holds (was {up}, now {})",
+            c.fanout()
+        );
+        assert!(c.fanout() > 8, "must not anchor back to derived during a real win");
     }
 
     /// No-op proof: `autotune_enabled` is false unless `BASIN_AUTOTUNE` is an
@@ -888,8 +1100,11 @@ mod tests {
         let mut c = AdaptiveController::new(8, 4, 16);
         let elapsed = 20.0; // one nominal interval
 
-        // Rising throughput: committed rows per interval climb. No stalls.
-        for rows in [800_000u64, 1_000_000, 1_200_000, 1_400_000] {
+        // Rising throughput: committed rows per interval climb by a clear,
+        // sustained margin. No stalls.
+        for rows in [
+            800_000u64, 1_000_000, 1_300_000, 1_700_000, 2_200_000, 2_900_000, 3_800_000,
+        ] {
             let s = sample_from_signals(rows, 20, 0, elapsed);
             c.observe(s);
         }
@@ -897,7 +1112,7 @@ mod tests {
         assert!(peak > 8, "should climb above the derived start (got {peak})");
 
         // Over-fanned: throughput collapses (CPU saturated) AND stalls appear.
-        for (rows, stalls) in [(700_000u64, 8u64), (650_000, 10)] {
+        for (rows, stalls) in [(700_000u64, 8u64), (650_000, 10), (640_000, 11)] {
             let s = sample_from_signals(rows, 20, stalls, elapsed);
             c.observe(s);
         }
@@ -907,14 +1122,13 @@ mod tests {
             c.fanout()
         );
 
-        // Plateau within the hysteresis band: must settle, not oscillate.
-        let settled = c.fanout();
+        // Plateau: with no sustained win the controller converges to the
+        // derived baseline and settles there (overload now gone).
         for _ in 0..20 {
-            let s = sample_from_signals(660_000, 20, 1, elapsed);
+            let s = sample_from_signals(660_000, 20, 0, elapsed);
             c.observe(s);
         }
-        let drift = (c.fanout() as i64 - settled as i64).abs();
-        assert!(drift <= c.step as i64, "must settle within one step (drift {drift})");
+        assert_eq!(c.fanout(), 8, "converges to derived absent a sustained win");
         assert!(c.fanout() >= 4 && c.fanout() <= 16, "stays within bounds");
     }
 

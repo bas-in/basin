@@ -3599,17 +3599,15 @@ impl ShardImpl for InProcessShard {
                             if next != prev {
                                 basin_common::autotune::set_runtime_fanout(next);
                                 basin_common::autotune::publish_flush_for(next, *flush_ratio);
-                                let dir = if next > prev {
-                                    "throughput up"
-                                } else if sample.overload >= 0.5 {
-                                    "overload, backing off"
-                                } else {
-                                    "throughput down, backing off"
-                                };
+                                // The controller emits the authoritative INFO
+                                // log (smoothed rate + reason) on every change;
+                                // this records the published knob + raw sample.
                                 tracing::info!(
                                     rows_per_sec = sample.rows_per_sec,
+                                    smoothed_rows_per_sec =
+                                        controller.smoothed_rps().unwrap_or(sample.rows_per_sec),
                                     overload = sample.overload,
-                                    "autotune: fanout {prev}\u{2192}{next} ({dir})"
+                                    "autotune: published fanout {prev}\u{2192}{next}"
                                 );
                             }
                         }
