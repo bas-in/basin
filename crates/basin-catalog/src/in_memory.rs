@@ -1195,6 +1195,40 @@ impl Catalog for InMemoryCatalog {
         Ok(value)
     }
 
+    #[instrument(skip(self), fields(project = %project, name = %name, floor = floor))]
+    async fn advance_sequence_floor(
+        &self,
+        project: &ProjectId,
+        name: &str,
+        floor: i64,
+    ) -> Result<()> {
+        let entry = {
+            let key = (*project, name.to_string());
+            let map = self.sequences.lock().await;
+            map.get(&key)
+                .cloned()
+                .ok_or_else(|| BasinError::not_found(format!("{project}: sequence {name:?}")))?
+        };
+        let mut state = entry.state.lock().await;
+        // Monotonic: the new "last handed out" is the greater of the current
+        // position (only meaningful once started) and the recovered floor.
+        // Never lower it — that would let `nextval` re-issue an already-used id.
+        let current = state.current.load(std::sync::atomic::Ordering::Relaxed);
+        let new_last = if state.started {
+            current.max(floor)
+        } else {
+            floor
+        };
+        state
+            .current
+            .store(new_last, std::sync::atomic::Ordering::Relaxed);
+        state
+            .block_end
+            .store(new_last, std::sync::atomic::Ordering::Relaxed);
+        state.started = true;
+        Ok(())
+    }
+
     #[instrument(skip(self, def), fields(project = %def.project, table = %def.table, name = %def.name))]
     async fn register_reactor(&self, def: ReactorDef) -> Result<()> {
         self.bump_epoch();

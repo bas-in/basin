@@ -4540,17 +4540,27 @@ async fn reconcile_serial_sequences(
                 }
             }
             let Some(max_id) = max_id else { continue };
-            // `advance = true`: MAX becomes the last-handed-out value, so the
-            // next `nextval` returns MAX + increment — exactly Postgres'
-            // `setval(seq, max, true)` semantics used by pg_restore.
-            match catalog.setval(project, &seq_name, max_id, true).await {
+            // Monotonic floor (NOT `setval`): raise the sequence so the next
+            // `nextval` is strictly greater than `max_id`, but never lower it.
+            // A plain `setval(max_id, true)` would CLOBBER the persisted
+            // high-water mark — and on a durable backend the persisted hwm can
+            // legitimately sit ABOVE `max_id` (a reserved-but-unused block
+            // ceiling whose tail rows never committed, or rows we couldn't scan
+            // for a max). Clobbering down to `max_id` would re-issue values an
+            // earlier instance already handed out → duplicate PKs. `advance_
+            // sequence_floor` takes `max(persisted_hwm, max_id)`, so recovery
+            // can only ever move the sequence forward.
+            match catalog
+                .advance_sequence_floor(project, &seq_name, max_id)
+                .await
+            {
                 Ok(_) => debug!(
                     %project, table = %table.as_str(), seq = %seq_name, max_id,
-                    "reconciled serial sequence to recovered max",
+                    "reconciled serial sequence floor to recovered max",
                 ),
                 Err(e) => warn!(
                     %project, table = %table.as_str(), seq = %seq_name, max_id, error = %e,
-                    "reconcile serial sequence: setval failed (sequence may be absent)",
+                    "reconcile serial sequence: advance_sequence_floor failed (sequence may be absent)",
                 ),
             }
         }
@@ -5358,6 +5368,85 @@ mod tests {
             .insert(table.clone(), vec![(Lsn(1), batch(1, 5, "r"))]);
         // Must not panic / error — simply a no-op.
         reconcile_serial_sequences(&catalog, &project, &state).await;
+    }
+
+    /// REGRESSION (#15): on a durable catalog the persisted high-water mark can
+    /// sit ABOVE the maximum id present in the recovered rows — e.g. a block of
+    /// 64 was reserved but only the first few rows committed before a crash.
+    /// Recovery must NOT clobber the sequence down to the recovered max (the old
+    /// `setval` behaviour); that would re-issue values an earlier instance had
+    /// already handed out. With `advance_sequence_floor` the persisted ceiling
+    /// wins, so the next `nextval` is strictly above every handed-out value.
+    #[tokio::test]
+    async fn reconcile_does_not_regress_durable_hwm_below_reserved_block() {
+        use basin_catalog::{Catalog, ObjectStoreCatalog};
+        use object_store::memory::InMemory;
+
+        // Pin the reservation block so the persisted ceiling is deterministic
+        // (16) regardless of any ambient `BASIN_SEQ_BLOCK`. Restored on drop.
+        let _prev_block = std::env::var("BASIN_SEQ_BLOCK").ok();
+        std::env::set_var("BASIN_SEQ_BLOCK", "16");
+        struct RestoreBlock(Option<String>);
+        impl Drop for RestoreBlock {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("BASIN_SEQ_BLOCK", v),
+                    None => std::env::remove_var("BASIN_SEQ_BLOCK"),
+                }
+            }
+        }
+        let _restore = RestoreBlock(_prev_block);
+
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let osc = ObjectStoreCatalog::new(store.clone());
+        let project = ProjectId::new();
+        let table = TableName::new("t".to_string()).unwrap();
+        let seq = "t_id_seq";
+        osc.create_sequence(basin_catalog::SequenceDef::with_defaults(project, seq))
+            .await
+            .unwrap();
+        // Hand out a few ids; this reserves the block, persisting hwm.last = 16.
+        let mut handed_out = Vec::new();
+        for _ in 0..3 {
+            handed_out.push(osc.nextval(&project, seq).await.unwrap());
+        }
+        // The reserved block ceiling: block size 16, so hwm.last == 16.
+        let reserved_ceiling = 16i64;
+        drop(osc); // "crash": the node-local reserved block (4..=16) is lost.
+
+        // RESTART: a FRESH instance over the same store. The node-local block is
+        // gone; only the durable hwm (= reserved ceiling 16) survives. This is
+        // exactly the production restart path that runs `reconcile_serial_*`.
+        let osc2 = ObjectStoreCatalog::new(store.clone());
+        let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(osc2);
+
+        // Recovered tail only carries the committed ids 1..=3; the reserved tail
+        // was never written to a row.
+        let mut state = PartitionState::new(project, PartitionKey::default_key());
+        state
+            .schemas
+            .insert(table.clone(), schema_with_serial_default(seq));
+        state
+            .tail
+            .insert(table.clone(), vec![(Lsn(1), batch(1, 3, "r"))]);
+
+        reconcile_serial_sequences(&catalog, &project, &state).await;
+
+        // Recovery floor (recovered max = 3) is BELOW the persisted ceiling
+        // (16), so it must be a no-op: the next value resumes strictly above the
+        // ceiling (17), NEVER re-issuing a reserved value. The old `setval`-
+        // clobber bug regressed the hwm to 3 and handed out 4 here.
+        let next = catalog.nextval(&project, seq).await.unwrap();
+        assert!(
+            handed_out.iter().all(|&v| v < next),
+            "no previously-handed-out value is re-issued after recovery: next={next}, handed_out={handed_out:?}"
+        );
+        assert_eq!(
+            next,
+            reserved_ceiling + 1,
+            "recovery must keep the persisted block ceiling ({reserved_ceiling}); \
+             a clobbering setval would have produced 4. got next={next}"
+        );
     }
 
     /// Build a fresh shard wired against a `tempdir`-backed object store and

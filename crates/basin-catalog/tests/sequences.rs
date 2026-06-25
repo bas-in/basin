@@ -253,3 +253,47 @@ async fn drop_namespace_clears_sequences() {
     let err = cat.nextval(&t, "s").await.unwrap_err();
     assert!(matches!(err, BasinError::NotFound(_)));
 }
+
+/// `advance_sequence_floor` raises the sequence so the next `nextval` is
+/// strictly above the floor — the crash-recovery primitive.
+#[tokio::test]
+async fn advance_sequence_floor_raises_to_floor() {
+    let cat = InMemoryCatalog::new();
+    let t = ProjectId::new();
+    cat.create_sequence(def(t, "s", 1, 1)).await.unwrap();
+    // Never advanced: floor seeds the position, next is floor+1.
+    cat.advance_sequence_floor(&t, "s", 100).await.unwrap();
+    assert_eq!(cat.nextval(&t, "s").await.unwrap(), 101);
+}
+
+/// `advance_sequence_floor` is monotonic: a floor at or below the current
+/// position must NEVER lower it (no re-issued values after recovery).
+#[tokio::test]
+async fn advance_sequence_floor_never_regresses() {
+    let cat = InMemoryCatalog::new();
+    let t = ProjectId::new();
+    cat.create_sequence(def(t, "s", 1, 1)).await.unwrap();
+    // Hand out 1..=5.
+    for _ in 0..5 {
+        cat.nextval(&t, "s").await.unwrap();
+    }
+    // A lower floor must be ignored — the position stays at 5.
+    cat.advance_sequence_floor(&t, "s", 2).await.unwrap();
+    assert_eq!(
+        cat.nextval(&t, "s").await.unwrap(),
+        6,
+        "floor below current position must not regress the sequence"
+    );
+    // A higher floor raises it.
+    cat.advance_sequence_floor(&t, "s", 1000).await.unwrap();
+    assert_eq!(cat.nextval(&t, "s").await.unwrap(), 1001);
+}
+
+/// Missing sequence is a NotFound, mirroring `setval`.
+#[tokio::test]
+async fn advance_sequence_floor_missing_is_not_found() {
+    let cat = InMemoryCatalog::new();
+    let t = ProjectId::new();
+    let err = cat.advance_sequence_floor(&t, "missing", 5).await.unwrap_err();
+    assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
+}

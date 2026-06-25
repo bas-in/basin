@@ -2954,6 +2954,60 @@ impl Catalog for ObjectStoreCatalog {
         )))
     }
 
+    async fn advance_sequence_floor(
+        &self,
+        project: &ProjectId,
+        name: &str,
+        floor: i64,
+    ) -> Result<()> {
+        // Confirm the sequence exists (and isn't tombstoned) before touching
+        // the hwm log; a missing sequence is a NotFound, mirroring setval.
+        let _def = self
+            .seq_load_def(project, name)
+            .await?
+            .ok_or_else(|| BasinError::not_found(format!("{project}: sequence {name:?}")))?;
+        const MAX_RETRIES: u32 = 64;
+        for _ in 0..MAX_RETRIES {
+            let (version, hwm) = self.seq_read_hwm(project, name).await?;
+            // Monotonic floor: the new persisted "last handed out" is the
+            // greater of what is already durably reserved and the recovered
+            // floor. Crucially this NEVER lowers the persisted high-water mark
+            // — a reserved-but-unused block ceiling (hwm.last > floor) wins, so
+            // we never re-issue a value an earlier instance already handed out.
+            let new_last = if hwm.started {
+                hwm.last.max(floor)
+            } else {
+                floor
+            };
+            // Already at or above the floor and started — nothing to persist.
+            if hwm.started && new_last == hwm.last {
+                return Ok(());
+            }
+            let next_hwm = SeqHwm {
+                last: new_last,
+                started: true,
+            };
+            if self
+                .seq_put_hwm_create(project, name, version + 1, &next_hwm)
+                .await?
+            {
+                self.bump_epoch();
+                // Drop any node-local reserved block: it may straddle the new
+                // mark. The next nextval re-reserves from the persisted mark.
+                let mut local = self.seq_local.lock().await;
+                if let Some(entry) = local.get_mut(&(*project, name.to_string())) {
+                    entry.block_values.clear();
+                }
+                return Ok(());
+            }
+            // Lost the CAS race — another instance advanced the mark. Re-read
+            // and retry; the next attempt observes the now-higher mark.
+        }
+        Err(BasinError::catalog(format!(
+            "{project}: sequence {name:?} advance_sequence_floor contention exceeded retry budget"
+        )))
+    }
+
     async fn list_sequences(&self, project: &ProjectId) -> Vec<SequenceDef> {
         use futures::StreamExt;
         // Enumerate `{root}{project}/_sequences/{name}/` directories, decode the
@@ -5489,6 +5543,46 @@ mod tests {
             first_b > max_a,
             "B resumes strictly greater than A: first_b={first_b} max_a={max_a}"
         );
+    }
+
+    // CRASH RECOVERY (durable hwm must NOT regress): a reserved-but-unused
+    // block ceiling sits ABOVE the highest committed id. Recovery's
+    // `advance_sequence_floor(max_committed)` must keep the persisted ceiling,
+    // not clobber down to it — otherwise the next `nextval` re-issues values
+    // an earlier instance already handed out (the regression bug).
+    #[tokio::test]
+    async fn advance_floor_never_regresses_below_persisted_hwm() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let p = ProjectId::new();
+        let mut handed_out = Vec::new();
+        {
+            // Instance A reserves a block of 64 (hwm.last == 64) and hands out
+            // 1..=10, then crashes leaving the unused tail 11..=64 reserved.
+            let node_a = ObjectStoreCatalog::with_seq_block(store.clone(), 64);
+            node_a.create_sequence(seq_def(p, "s", 1, 1)).await.unwrap();
+            for _ in 0..10 {
+                handed_out.push(node_a.nextval(&p, "s").await.unwrap());
+            }
+        }
+        // Recovery on a fresh instance: max committed id is 10 (rows 1..=10),
+        // but the persisted hwm is 64. The floor must NOT lower the hwm.
+        let node_b = ObjectStoreCatalog::new(store.clone());
+        node_b.advance_sequence_floor(&p, "s", 10).await.unwrap();
+        let next = node_b.nextval(&p, "s").await.unwrap();
+        assert_eq!(
+            next, 65,
+            "must resume above the persisted block ceiling (64), not re-issue 11"
+        );
+        assert!(
+            handed_out.iter().all(|&v| v < next),
+            "no previously-handed-out value is re-issued"
+        );
+
+        // Conversely, when the recovered max EXCEEDS the persisted hwm (e.g. a
+        // rows-loaded-then-catalog-lost scenario), the floor raises it.
+        let node_c = ObjectStoreCatalog::new(store.clone());
+        node_c.advance_sequence_floor(&p, "s", 1000).await.unwrap();
+        assert_eq!(node_c.nextval(&p, "s").await.unwrap(), 1001);
     }
 
     // Cross-node visibility for sequences + SQL functions (mirrors

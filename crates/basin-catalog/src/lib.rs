@@ -1819,6 +1819,36 @@ pub trait Catalog: Send + Sync {
         ))
     }
 
+    /// Monotonically raise a sequence's floor so the next `nextval` returns a
+    /// value strictly greater than `floor`, **without ever regressing** below
+    /// what the sequence has already handed out (or persisted as a reserved
+    /// high-water mark). This is the crash-recovery primitive: after a restart
+    /// the shard recovers the maximum id durably stored in a SERIAL/identity
+    /// column and calls this so `nextval` can never re-issue a value that
+    /// already exists in the recovered data — while still honouring an even
+    /// higher persisted reservation (a reserved-but-unused block ceiling).
+    ///
+    /// Semantics: equivalent to `setval(seq, max(current_high_water, floor),
+    /// advance=true)` — the next `nextval` returns `max(...) + increment`.
+    /// Unlike [`Catalog::setval`], which unconditionally clobbers the stored
+    /// position (and can therefore *lower* it, reissuing values), this never
+    /// moves the sequence backwards. Gaps are acceptable (PG sequences gap
+    /// after a crash); duplicates / regression are the bug this guards.
+    ///
+    /// Default impl: not-implemented. Durable backends override; the in-memory
+    /// backend overrides to keep the recovery test harness faithful.
+    async fn advance_sequence_floor(
+        &self,
+        project: &ProjectId,
+        name: &str,
+        floor: i64,
+    ) -> Result<()> {
+        let _ = (project, name, floor);
+        Err(basin_common::BasinError::Internal(
+            "advance_sequence_floor not implemented for this catalog backend".into(),
+        ))
+    }
+
     /// Register a SQL-bodied reactor. The catalog stores the definition
     /// verbatim; the engine's `ReactorSink` reparses the body / predicate
     /// on each fire. Re-registering the same `(project, table, name)` is

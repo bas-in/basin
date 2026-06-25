@@ -8,6 +8,29 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Fix: SERIAL/sequence no longer regresses on restart (#15)
+
+**Correctness fix.** On restart, the shard reconciles each SERIAL/identity
+sequence against the maximum id recovered from its own durable WAL + storage
+(no external dependency). That reconciliation previously called
+`setval(seq, max_recovered_id, advance=true)`, which **unconditionally clobbered**
+the persisted sequence position — including *lowering* it. On the durable
+object-store catalog the persisted high-water mark can legitimately sit *above*
+the highest committed id (a reserved-but-unused block ceiling whose tail rows
+never committed before a crash, or rows the recovery scan couldn't read a max
+for). Clobbering down to the recovered max would let the next `nextval` re-issue
+values an earlier instance had already handed out → duplicate primary keys (the
+credential-provisioning `duplicate key (id)=(N)` symptom).
+
+The fix adds a monotonic `Catalog::advance_sequence_floor(project, name, floor)`
+primitive that raises a sequence to `max(persisted_high_water, floor)` and
+**never moves it backward**, implemented natively on all three backends
+(in-memory, object-store, Postgres) via the same CAS / row-lock the sequence
+already uses. Restart reconciliation now calls it instead of `setval`, so
+recovery can only ever move a sequence forward. Gaps after a crash remain
+acceptable (PG-compatible); regression/duplicates cannot occur. New tests cover
+the no-regression invariant at the catalog and shard-recovery layers.
+
 ## Unreleased — Multi-bucket storage pool, Stage 1 (foundation, flag-gated)
 
 Lays the FOUNDATION for the bounded multi-bucket storage pool (engine task #36):

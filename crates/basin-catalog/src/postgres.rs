@@ -2807,6 +2807,49 @@ impl Catalog for PostgresCatalog {
         Ok(value)
     }
 
+    #[instrument(skip(self), fields(project = %project, name = %name, floor = floor))]
+    async fn advance_sequence_floor(
+        &self,
+        project: &ProjectId,
+        name: &str,
+        floor: i64,
+    ) -> Result<()> {
+        let sch = &self.schema;
+        let project_str = project.to_string();
+        let mut client = self.client().await?;
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|e| BasinError::catalog(format!("advance_sequence_floor txn: {e}")))?;
+        // FOR UPDATE serialises against concurrent nextval/setval. Monotonic:
+        // never lower `current_value`. When the sequence was never started, the
+        // stored value is meaningless, so seed it from the floor; otherwise take
+        // the greater of the existing position and the floor — guaranteeing the
+        // next nextval is strictly above any recovered (or already-issued) id.
+        let n = txn
+            .execute(
+                &format!(
+                    "UPDATE {sch}.sequences \
+                     SET current_value = CASE WHEN started THEN GREATEST(current_value, $3) \
+                                              ELSE $3 END, \
+                         started = TRUE \
+                     WHERE project_id = $1 AND name = $2"
+                ),
+                &[&project_str, &name, &floor],
+            )
+            .await
+            .map_err(|e| BasinError::catalog(format!("advance_sequence_floor update: {e}")))?;
+        if n == 0 {
+            return Err(BasinError::not_found(format!(
+                "{project}: sequence {name:?}"
+            )));
+        }
+        txn.commit()
+            .await
+            .map_err(|e| BasinError::catalog(format!("advance_sequence_floor commit: {e}")))?;
+        Ok(())
+    }
+
     #[instrument(skip(self, def), fields(project = %def.project, table = %def.table, name = %def.name))]
     async fn register_reactor(&self, def: ReactorDef) -> Result<()> {
         if def.ops.is_empty() {
@@ -6126,6 +6169,35 @@ mod tests {
             .unwrap();
         assert_eq!(cat.nextval(&b, "shared").await.unwrap(), 100);
         assert_eq!(cat.nextval(&a, "shared").await.unwrap(), 2);
+    }
+
+    /// `advance_sequence_floor` raises a sequence to the recovery floor but is
+    /// strictly monotonic: a floor at/below the current position is a no-op
+    /// (never re-issues a value), a floor above it raises the sequence.
+    #[tokio::test]
+    async fn sequence_advance_floor_is_monotonic() {
+        let Some((cat, _guard)) = try_connect().await else {
+            return;
+        };
+        let t = ProjectId::new();
+        cat.create_namespace(&t).await.unwrap();
+        cat.create_sequence(seq_def(t, "s", 1, 1)).await.unwrap();
+        for _ in 0..5 {
+            cat.nextval(&t, "s").await.unwrap();
+        }
+        // Floor below the current position (5): no-op, next stays 6.
+        cat.advance_sequence_floor(&t, "s", 2).await.unwrap();
+        assert_eq!(
+            cat.nextval(&t, "s").await.unwrap(),
+            6,
+            "floor below current position must not regress the sequence"
+        );
+        // Floor above it raises the sequence.
+        cat.advance_sequence_floor(&t, "s", 1000).await.unwrap();
+        assert_eq!(cat.nextval(&t, "s").await.unwrap(), 1001);
+        // Missing sequence is NotFound.
+        let err = cat.advance_sequence_floor(&t, "missing", 5).await.unwrap_err();
+        assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
     }
 
     /// Concurrent `nextval` calls must always return distinct values —
