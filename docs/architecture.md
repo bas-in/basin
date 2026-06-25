@@ -311,6 +311,38 @@ will be. Basin uses it where its strengths apply (long-term persistence,
 analytical scans, branching) and never where its weaknesses bite
 (synchronous commit on the user's request thread).
 
+### Durability vs. exactly-once under retry
+
+No-loss (a committed write survives a crash) is not the same as exactly-once.
+If a client connection drops mid-`COPY`/`INSERT`, the client cannot always tell
+whether the last batch committed, so a robust loader **resyncs by re-sending**
+rows it cannot prove landed. Whether that re-send produces duplicates depends
+entirely on whether the table has a key:
+
+- **`PRIMARY KEY` / `UNIQUE` tables are exactly-once under retry.** PK/UNIQUE is
+  enforced on every ingest path — plain `INSERT`, multi-row `INSERT`, and the
+  `COPY` bulk fast path all run `enforce_pk_on_insert` /
+  `enforce_unique_on_insert` (`crates/basin-engine/src/constraints.rs`). The
+  existing-row check sources its candidate files from the authoritative
+  object-store `LIST`, so it catches a key written by a *prior* committed
+  statement, not just one inside the same batch. Re-sending an already-committed
+  key is **rejected** with a unique violation; the table never holds a second
+  copy.
+
+- **`INSERT ... ON CONFLICT (cols) DO NOTHING` is the recommended retry shape.**
+  A resync re-send is **silently absorbed** — the conflict filter drops the
+  already-present keys before the unique check runs, so the re-send is a no-op
+  for committed rows and admits only genuinely new ones, with no error. This is
+  what a retry-safe loader should issue.
+
+- **Keyless (no-PK, no-UNIQUE) append tables are at-least-once, not
+  exactly-once.** With no key, the engine has nothing to dedup a blind re-send
+  against — re-sending duplicates rows. A keyless bulk load that must be
+  retry-safe has to close this client-side: declare a `PRIMARY KEY` / `UNIQUE`
+  on a natural or synthetic key (and, for silent retries, use
+  `ON CONFLICT DO NOTHING`). The regression suite
+  `crates/basin-engine/tests/exactly_once_resync.rs` pins all three behaviours.
+
 ---
 
 ## 5. Project isolation: defense in depth

@@ -137,6 +137,14 @@ two source schemas, non-`public` copies are prefixed
 - A binary COPY *refused at start* (e.g. Basin's `0A000` "no binary
   codec") retries once as CSV. A *mid-stream* failure does not retry —
   rows may already have landed; the table is reported failed.
+- **Retry-safety (exactly-once).** Re-running a `COPY`/`INSERT` after a
+  mid-stream drop is duplicate-free only for tables with a `PRIMARY KEY` /
+  `UNIQUE` key: the bulk path enforces the key against all committed files, so
+  a re-sent committed row is rejected (or silently dropped under
+  `ON CONFLICT (cols) DO NOTHING`, the recommended retry shape). Keyless append
+  tables have no key to dedup against, so a blind re-send duplicates rows —
+  declare a key (or `ON CONFLICT DO NOTHING`) to make a keyless load
+  retry-safe. See `docs/architecture.md` §4 "Durability vs. exactly-once".
 - Exit code is non-zero when any table failed or mismatched, so the
   command is safe to script.
 

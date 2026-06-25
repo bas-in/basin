@@ -8,6 +8,38 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Docs + tests: exactly-once-under-retry contract for COPY/INSERT resync (no behaviour change)
+
+**Clarifies and pins the exactly-once-under-retry guarantee** for the bulk
+ingest path. The durable barrier (#34) made the engine no-LOSS, but a client
+that drops mid-`COPY`/`INSERT` and resyncs by re-sending rows could create
+duplicates on **keyless** tables (the no-PK benchmark loader saw ~0.06% dups on
+resync). Investigation confirmed the engine **already** enforces exactly-once
+for keyed tables and that no engine change is needed:
+
+- `PRIMARY KEY` / `UNIQUE` tables: `enforce_pk_on_insert` /
+  `enforce_unique_on_insert` run on every ingest path (plain INSERT, multi-row
+  INSERT, and the `COPY` bulk fast path via `exec_ingest_batch`) and check the
+  candidate set sourced from the authoritative object-store `LIST` of all
+  committed files — so a re-sent committed key is **rejected** with SQLSTATE
+  23505, never duplicated.
+- `INSERT … ON CONFLICT (cols) DO NOTHING` (the recommended retry shape):
+  the conflict filter drops already-present keys before the unique check, so a
+  resync re-send is **silently absorbed** with no error and no duplicate.
+- Keyless (no-PK/UNIQUE) append tables remain **at-least-once**: with no key
+  the engine cannot dedup a blind re-send. This is now documented as a
+  client-side responsibility (declare a key, or use `ON CONFLICT DO NOTHING`)
+  rather than an engine gap; building a durable per-batch idempotency-token
+  subsystem was rejected as over-build (single-node, non-crash-safe, unbounded
+  growth — a correctness liability for a no-loss engine).
+
+Added: regression suite `crates/basin-engine/tests/exactly_once_resync.rs`
+(PK resync rejected, `ON CONFLICT DO NOTHING` resync exactly-once across
+repeated retries, composite-PK resync, and a locked-in test documenting that a
+keyless blind re-send duplicates). Docs: `docs/architecture.md` §4 gains a
+"Durability vs. exactly-once under retry" subsection; `CAPABILITIES.md` COPY row
+and `docs/import.md` retry-safety note updated. No engine behaviour change.
+
 ## Unreleased — Fix: adaptive ingest auto-tuner no longer changes fan-out at runtime (correctness — was double-counting `count(*)`) (`BASIN_AUTOTUNE`, default OFF)
 
 **Correctness fix.** Phase 2 of the auto-tuner adjusted the bulk-ingest
