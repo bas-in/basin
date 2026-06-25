@@ -367,6 +367,20 @@ pub struct ObjectStoreCatalog {
     /// benign per-partition `CommitConflict` retry. Keyed separately from the
     /// META `cache` so DDL and data-file commits never invalidate each other.
     part_cache: Mutex<HashMap<(ProjectId, String, String), PartCacheEntry>>,
+    /// Per-`(project, schema.table)` cache of the *resolved META manifest head
+    /// version*. The table manifest head only advances on a manifest write
+    /// (DDL / schema evolution / single-node META-chain append) — NEVER on a
+    /// per-partition data-file commit (`append_data_files_in_partition`), which
+    /// is the sustained-ingest hot path. Caching the resolved head lets a hot
+    /// commit skip the `resolve_head_version` GET(HEAD)+HEAD(manifest) RTT pair
+    /// it would otherwise pay just to confirm a head that did not move. Every
+    /// manifest mutation updates this entry through `after_commit`, and every
+    /// invalidation (DDL, lost-race reload) removes it through `invalidate`, so
+    /// it is filled/cleared in lockstep with the `cache` manifest-body entry.
+    /// A miss simply falls back to the authoritative store resolve — never a
+    /// stale hit, because the populating writes are the same ones that move the
+    /// manifest.
+    meta_head_cache: Mutex<HashMap<(ProjectId, String), u64>>,
     /// Per-instance ("session") sequence state: the locally-reserved block and
     /// the last value handed out by *this* node. Durable disjointness across
     /// nodes comes from the persisted high-water mark (see the module docs on
@@ -421,6 +435,7 @@ impl ObjectStoreCatalog {
             epoch: AtomicU64::new(0),
             cache: Mutex::new(HashMap::new()),
             part_cache: Mutex::new(HashMap::new()),
+            meta_head_cache: Mutex::new(HashMap::new()),
             seq_local: Mutex::new(HashMap::new()),
             seq_block_override: None,
             part_compact_override: None,
@@ -541,7 +556,22 @@ impl ObjectStoreCatalog {
         table: &TableName,
     ) -> QualifiedTableName {
         let pub_qtable = QualifiedTableName::in_public(table.clone());
-        // Fast path: a live `public` manifest exists.
+        // Fast path: a live `public` manifest exists. During sustained ingest the
+        // table is overwhelmingly in `public` and its manifest head is already in
+        // the META-head cache (filled on resolve/commit, cleared on DDL/drop), so
+        // serve the existence check from cache with NO store round trip — the same
+        // contract `load_current` relies on. A miss falls back to the
+        // authoritative store resolve. (This is the table-head GET+HEAD pair the
+        // hot commit would otherwise pay TWICE: once here in `resolve_qtable`,
+        // again in `load_current`.)
+        if self
+            .meta_head_cache
+            .lock()
+            .await
+            .contains_key(&self.cache_key(project, &pub_qtable))
+        {
+            return pub_qtable;
+        }
         if self.resolve_head_version(project, &pub_qtable).await.ok().flatten().is_some() {
             return pub_qtable;
         }
@@ -695,11 +725,39 @@ impl ObjectStoreCatalog {
         project: &ProjectId,
         qtable: &QualifiedTableName,
     ) -> Result<(u64, Arc<TableManifest>)> {
+        let ck = self.cache_key(project, qtable);
+        // HOT-PATH FAST RESOLVE: the table manifest head moves only on a manifest
+        // write (DDL / schema evolution / single-node META-chain append), all of
+        // which run through `after_commit` (fills both caches) or `invalidate`
+        // (clears both). A per-partition data-file commit — the sustained-ingest
+        // path — never touches the manifest, so during ingest the cached head is
+        // exactly current. When BOTH the meta-head version AND the manifest body
+        // at that version are cached, serve them with zero store round-trips,
+        // skipping the `resolve_head_version` GET(HEAD)+HEAD(manifest) pair. The
+        // two caches are written together, so a head hit always has a body hit at
+        // the same version; if either is absent we fall through to the
+        // authoritative store resolve below. This is a strict subset of the
+        // existing version-pinned cache contract: it can only ever return a
+        // manifest the store resolve would also have returned (same version key).
+        if let Some(version) = self.meta_head_cache.lock().await.get(&ck).copied() {
+            let cache = self.cache.lock().await;
+            if let Some(entry) = cache.get(&ck) {
+                if entry.version == version {
+                    if entry.manifest.dropped {
+                        return Err(BasinError::not_found(format!("{project}/{qtable}")));
+                    }
+                    return Ok((version, entry.manifest.clone()));
+                }
+            }
+        }
         let version = self
             .resolve_head_version(project, qtable)
             .await?
             .ok_or_else(|| BasinError::not_found(format!("{project}/{qtable}")))?;
-        let ck = self.cache_key(project, qtable);
+        // Record the freshly-resolved head so the next hot commit can skip the
+        // resolve. Safe because every manifest mutation rewrites this entry
+        // (after_commit) or clears it (invalidate).
+        self.meta_head_cache.lock().await.insert(ck.clone(), version);
         {
             let cache = self.cache.lock().await;
             if let Some(entry) = cache.get(&ck) {
@@ -773,6 +831,9 @@ impl ObjectStoreCatalog {
             )
             .await;
         let ck = self.cache_key(project, qtable);
+        // Keep the META-head cache in lockstep with the manifest-body cache: this
+        // is a manifest write, so the head now points at `version`.
+        self.meta_head_cache.lock().await.insert(ck.clone(), version);
         let mut cache = self.cache.lock().await;
         cache.insert(
             ck,
@@ -879,6 +940,10 @@ impl ObjectStoreCatalog {
 
     async fn invalidate(&self, project: &ProjectId, qtable: &QualifiedTableName) {
         let ck = self.cache_key(project, qtable);
+        // Clear the META-head cache alongside the manifest body so a stale head
+        // can never outlive its manifest entry (they are always written and
+        // cleared together).
+        self.meta_head_cache.lock().await.remove(&ck);
         self.cache.lock().await.remove(&ck);
     }
 
@@ -1097,6 +1162,40 @@ impl ObjectStoreCatalog {
         Ok((version, live))
     }
 
+    /// Hot-path partition resolve that AVOIDS the redundant store round-trip.
+    ///
+    /// The commit hot path resolves a partition's head TWICE per commit today:
+    /// once in the caller's `current_snapshot_id_in_partition` (which folds and
+    /// caches `(version, PartitionLive)` in `part_cache`), then AGAIN inside
+    /// `commit_part_snapshot` via `load_part_current`. The second resolve issues
+    /// `resolve_part_head_version`'s GET(HEAD)+HEAD(seg)+HEAD(seg+1) probe purely
+    /// to re-confirm a head the caller just read — pure latency waste on the
+    /// PUT-budget-idle, RTT-bound commit path.
+    ///
+    /// This serves the already-folded `(version, segment)` straight from
+    /// `part_cache` with ZERO store reads when present. On a miss it falls back
+    /// to the authoritative `load_part_current` (full resolve). Correctness does
+    /// NOT depend on the cached state being current: the caller's
+    /// `expected_snapshot` check and, decisively, the create-if-absent
+    /// `put_part_segment_create` CAS remain the sole authoritative arbiters. A
+    /// stale cache can only make us compute a `new_version` that already exists,
+    /// LOSE the create-if-absent race, and surface `CommitConflict` — which the
+    /// engine's `commit_with_retry` re-resolves and retries, exactly as today.
+    /// It can never produce a double-commit or drop a write.
+    async fn load_part_current_cached(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+    ) -> Result<(u64, Arc<PartitionLive>)> {
+        let ck = self.part_cache_key(project, qtable, partition_id);
+        if let Some(entry) = self.part_cache.lock().await.get(&ck) {
+            return Ok((entry.version, entry.segment.clone()));
+        }
+        // Cold cache (first touch / post-invalidation): authoritative resolve.
+        self.load_part_current(project, qtable, partition_id).await
+    }
+
     /// Write partition segment `version` via create-if-absent. `true` = won.
     async fn put_part_segment_create(
         &self,
@@ -1208,9 +1307,16 @@ impl ObjectStoreCatalog {
         added_files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
         // The table META manifest must exist (schema/DDL). NotFound if absent.
+        // Served from the META-head cache during ingest (no store RTT) — the
+        // manifest head never moves on a data-file commit.
         let (_mv, manifest) = self.load_current(project, qtable).await?;
+        // Resolve the partition's current segment from `part_cache` WITHOUT a
+        // redundant store head-resolution when the caller already warmed it via
+        // `current_snapshot_id_in_partition`. The `expected_snapshot` check and
+        // the create-if-absent CAS below stay authoritative, so a stale cached
+        // version simply loses the CAS and falls into the engine's retry.
         let (version, segment) = self
-            .load_part_current(project, qtable, partition_id)
+            .load_part_current_cached(project, qtable, partition_id)
             .await?;
 
         if segment.current_snapshot != expected_snapshot {
@@ -4820,6 +4926,344 @@ mod tests {
              (40-file table: {small} reads, 400-file table: {large} reads) — \
              a growth term here is the residual ingest-rate slope at scale"
         );
+    }
+
+    // --- Redundant-resolve elimination: per-commit ROUND TRIPS drop ----------
+    //
+    // The throughput lift removes the SECOND head-resolution per partition
+    // commit: `commit_part_snapshot` no longer re-runs `resolve_part_head_version`
+    // (GET HEAD + HEAD seg + HEAD seg+1) that the caller's
+    // `current_snapshot_id_in_partition` already paid, and `load_current` serves
+    // the table manifest head from the META-head cache instead of GET HEAD + HEAD
+    // manifest. We count ALL store round trips (GET + HEAD + LIST + PUT) issued by
+    // a single steady-state commit and assert the resolve-side reads collapse,
+    // while the authoritative PUTs (segment create + best-effort head pointer)
+    // are unchanged.
+    #[derive(Debug)]
+    struct RtCountingStore {
+        inner: Arc<dyn ObjectStore>,
+        gets: std::sync::atomic::AtomicUsize,
+        heads: std::sync::atomic::AtomicUsize,
+        lists: std::sync::atomic::AtomicUsize,
+        puts: std::sync::atomic::AtomicUsize,
+    }
+    impl std::fmt::Display for RtCountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RtCountingStore")
+        }
+    }
+    impl RtCountingStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                gets: std::sync::atomic::AtomicUsize::new(0),
+                heads: std::sync::atomic::AtomicUsize::new(0),
+                lists: std::sync::atomic::AtomicUsize::new(0),
+                puts: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn reset(&self) {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.gets.store(0, Relaxed);
+            self.heads.store(0, Relaxed);
+            self.lists.store(0, Relaxed);
+            self.puts.store(0, Relaxed);
+        }
+        fn read_rts(&self) -> usize {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.gets.load(Relaxed) + self.heads.load(Relaxed) + self.lists.load(Relaxed)
+        }
+        fn put_rts(&self) -> usize {
+            self.puts.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ObjectStore for RtCountingStore {
+        async fn put_opts(
+            &self,
+            location: &OsPath,
+            payload: object_store::PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &OsPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &OsPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if options.head {
+                self.heads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<OsPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<OsPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &OsPath,
+            to: &OsPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_eliminates_redundant_head_resolution_round_trips() {
+        let counting = RtCountingStore::new(Arc::new(InMemory::new()));
+        let c = ObjectStoreCatalog::with_part_compact_every(counting.clone(), 1_000_000);
+        let p = ProjectId::new();
+        let t = TableName::new("rt").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Warm the caches the way the engine hot path does: a few prior commits
+        // so the META-head and partition caches are populated (steady state).
+        for i in 0..3 {
+            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file(&format!("w{i}.parquet"), 1)])
+                .await
+                .unwrap();
+        }
+
+        // Measure ONE steady-state commit cycle exactly as `commit_with_retry`
+        // drives it: resolve the partition snapshot, then append.
+        counting.reset();
+        let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        let read_rts_after_resolve = counting.read_rts();
+        c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file("hot.parquet", 1)])
+            .await
+            .unwrap();
+        let total_read_rts = counting.read_rts();
+        let append_read_rts = total_read_rts - read_rts_after_resolve;
+        let put_rts = counting.put_rts();
+
+        // The APPEND must do NO resolve-side reads of its own: the META head is
+        // served from the meta-head cache and the partition segment from the
+        // part_cache the caller's resolve just warmed. (Before the fix the append
+        // re-ran resolve_head_version + resolve_part_head_version = ~5 reads.)
+        assert_eq!(
+            append_read_rts, 0,
+            "append_data_files_in_partition must issue ZERO redundant resolve reads \
+             (META + partition heads served from cache); got {append_read_rts}"
+        );
+
+        // Authoritative writes are unchanged: exactly the segment create + the
+        // best-effort head-pointer overwrite (2 PUTs).
+        assert_eq!(
+            put_rts, 2,
+            "commit still issues exactly the 2 authoritative PUTs (segment create + head pointer)"
+        );
+
+        // Sanity: the whole cycle's read round trips collapsed to roughly the
+        // single (first, anti-livelock-probe-bearing) resolve, well under the
+        // ~10 the doubled-resolve path used to issue.
+        assert!(
+            total_read_rts <= 5,
+            "one commit cycle now costs <= 5 read round trips (was ~10 with the \
+             duplicate resolve); got {total_read_rts}"
+        );
+
+        // Correctness preserved: every file is live, none lost/dup.
+        let live: std::collections::BTreeSet<String> = c
+            .load_table(&p, &t)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        for i in 0..3 {
+            assert!(live.contains(&format!("w{i}.parquet")));
+        }
+        assert!(live.contains("hot.parquet"));
+        assert_eq!(live.len(), 4, "no over/under count after redundant-resolve removal");
+    }
+
+    // --- Exactly-once gate: concurrent multi-partition ingest + compaction ----
+    //
+    // The bar for the redundant-resolve removal. Many writers hammer several
+    // partitions concurrently (appends) while a compaction sweep concurrently
+    // REPLACES files in those same partitions. With the second head-resolution
+    // removed, the per-partition CAS must STILL admit exactly one winner per
+    // version: the final folded row count must equal the rows that actually
+    // committed — never over- or under-counted — and the chain must converge with
+    // no livelock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_multipart_ingest_plus_compaction_exactly_once() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // Small K so compaction baselines fire frequently during the run.
+        let c = Arc::new(ObjectStoreCatalog::with_part_compact_every(store.clone(), 4));
+        let p = ProjectId::new();
+        let t = TableName::new("xo").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        const PARTS: usize = 6;
+        const PER_PART: usize = 25;
+        const ROWS_PER_FILE: u64 = 7;
+
+        // One appender task per partition: each commits PER_PART single-file
+        // appends, retrying its own per-partition CAS on conflict (exactly the
+        // engine's `commit_with_retry` loop). Tracks the paths it durably landed.
+        let mut appenders = Vec::new();
+        for part in 0..PARTS {
+            let c = c.clone();
+            let t = t.clone();
+            appenders.push(tokio::spawn(async move {
+                let pid = part.to_string();
+                let mut landed: Vec<String> = Vec::new();
+                for i in 0..PER_PART {
+                    let path = format!("p{part}-f{i}.parquet");
+                    loop {
+                        let exp = c
+                            .current_snapshot_id_in_partition(&p, &t, &pid)
+                            .await
+                            .unwrap();
+                        match c
+                            .append_data_files_in_partition(
+                                &p,
+                                &t,
+                                &pid,
+                                exp,
+                                vec![file(&path, ROWS_PER_FILE)],
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                landed.push(path.clone());
+                                break;
+                            }
+                            Err(BasinError::CommitConflict(_)) => {
+                                // Re-resolve (authoritative, via cold-cache path)
+                                // and retry — no double commit, no loss.
+                                continue;
+                            }
+                            Err(e) => panic!("unexpected append error: {e}"),
+                        }
+                    }
+                }
+                landed
+            }));
+        }
+
+        // A concurrent compaction sweep: repeatedly merge each partition's two
+        // oldest live files into one, via the partition replace CAS — racing the
+        // appenders on the SAME chains. Replaces preserve row counts (merged file
+        // carries the summed rows), so the row total is invariant under merges.
+        let merger = {
+            let c = c.clone();
+            let t = t.clone();
+            tokio::spawn(async move {
+                let qt = c.resolve_qtable(&p, &t).await;
+                for _ in 0..40 {
+                    for part in 0..PARTS {
+                        let pid = part.to_string();
+                        let (_v, seg) = match c.load_part_current(&p, &qt, &pid).await {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        let mut files = seg.live_data_files();
+                        if files.len() < 2 {
+                            continue;
+                        }
+                        files.sort_by(|a, b| a.path.cmp(&b.path));
+                        let a = files[0].clone();
+                        let b = files[1].clone();
+                        let merged = file(
+                            &format!("{}+{}.merged", a.path, b.path),
+                            a.row_count + b.row_count,
+                        );
+                        // Best-effort: a conflict means an appender advanced the
+                        // chain; just skip this round (the appender's retry and
+                        // the next sweep make progress). Never panic on conflict.
+                        let _ = c
+                            .replace_data_files_in_partition(
+                                &p,
+                                &t,
+                                &pid,
+                                seg.current_snapshot,
+                                vec![a.path.clone(), b.path.clone()],
+                                vec![merged],
+                            )
+                            .await;
+                        tokio::task::yield_now().await;
+                    }
+                }
+            })
+        };
+
+        let mut all_landed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for h in appenders {
+            for path in h.await.unwrap() {
+                assert!(all_landed.insert(path.clone()), "a path was committed twice: {path}");
+            }
+        }
+        merger.await.unwrap();
+
+        // The decisive count: total live rows must equal exactly the rows the
+        // appenders durably landed. Merges fold pairs but preserve summed rows,
+        // so the invariant is: every appended file's rows are present exactly
+        // once, whether still standalone or rolled into a merged file.
+        let expected_rows = (all_landed.len() as u64) * ROWS_PER_FILE;
+
+        // Read through a COLD instance: forces a full store re-resolve + fold of
+        // every partition, so the assertion reflects durable state, not caches.
+        let cold = ObjectStoreCatalog::with_part_compact_every(store.clone(), 4);
+        let meta = cold.load_table(&p, &t).await.unwrap();
+        let live = meta.live_data_files();
+        let total_rows: u64 = live.iter().map(|f| f.row_count).sum();
+        assert_eq!(
+            total_rows, expected_rows,
+            "EXACTLY-ONCE: folded row count must equal rows committed (no over/under count)"
+        );
+
+        // No duplicate paths survive in the live set (CAS admitted one winner).
+        let mut paths: Vec<String> = live.iter().map(|f| f.path.clone()).collect();
+        let n = paths.len();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), n, "no duplicate paths in the folded live set");
+
+        // Heads converged: a fresh resolve of every partition succeeds and a
+        // final append lands first try (no livelock / wedged chain).
+        for part in 0..PARTS {
+            let pid = part.to_string();
+            let exp = cold.current_snapshot_id_in_partition(&p, &t, &pid).await.unwrap();
+            cold.append_data_files_in_partition(&p, &t, &pid, exp, vec![file(&format!("final-{part}.parquet"), 1)])
+                .await
+                .expect("post-run commit lands without livelock");
+        }
     }
 
     // --- Test 2e: non-partitioned replace resolves the owning chain --------

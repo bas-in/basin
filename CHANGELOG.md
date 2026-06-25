@@ -8,6 +8,48 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Perf: eliminate redundant object-store head-resolution on the compaction commit hot path (per-node ingest throughput)
+
+**Cuts the object-store round trips per conflict-free per-partition commit by
+about half** (~10 sequential GET/HEAD reads → ~5), lifting per-node sustained
+ingest throughput on the latency-bound commit path with **no change to the
+exactly-once or durability guarantees**. A compaction commit was resolving the
+same heads **twice**:
+
+- the **partition** head was resolved once by the engine's
+  `current_snapshot_id_in_partition` (which folds and caches the partition's
+  `(version, live-set)`), then **again** inside
+  `append_data_files_in_partition` → `commit_part_snapshot`;
+- the **table META manifest** head was resolved (a `GET HEAD` + `HEAD vN` pair)
+  on every commit even though it only moves on DDL, and a third time inside
+  `resolve_qtable`'s public-schema existence check.
+
+The second partition resolve now reads the already-folded segment straight from
+the per-partition cache the caller just warmed (`load_part_current_cached`), and
+the table-manifest head is served from a version-pinned **META-head cache**
+written/cleared in lockstep with the existing manifest-body cache (filled on
+resolve/commit, invalidated on DDL/drop). `resolve_qtable`'s public fast path
+consults the same cache.
+
+**Exactly-once is unchanged.** The authoritative arbiters are untouched: the
+segment-object create-if-absent (`put_part_segment_create`) and the
+`expected_snapshot != segment.current_snapshot` check stay synchronous and
+authoritative. A stale cached version can only LOSE the create-if-absent CAS and
+surface `CommitConflict`, which falls into the engine's existing re-resolve +
+retry — degrading exactly to the prior behaviour, never a double-commit or lost
+write. The #31 anti-livelock `v+1` probe remains on the **first** (caller's)
+resolve; the #34 durable barrier and head-pointer recovery are untouched.
+
+Added regression tests in `crates/basin-catalog/src/object_store_catalog.rs`:
+`commit_eliminates_redundant_head_resolution_round_trips` (asserts the append
+issues **zero** resolve-side reads and still exactly the 2 authoritative PUTs;
+the whole cycle's read round trips drop from ~10 to ≤5) and
+`concurrent_multipart_ingest_plus_compaction_exactly_once` (concurrent
+multi-partition appends racing a compaction-replace sweep; final folded row
+count equals exactly the rows committed — no over/under count, no duplicate
+paths, heads converge, no livelock). The existing adversarial CAS / stale-head /
+lost-commit-race gates stay green.
+
 ## Unreleased — Docs + tests: exactly-once-under-retry contract for COPY/INSERT resync (no behaviour change)
 
 **Clarifies and pins the exactly-once-under-retry guarantee** for the bulk
