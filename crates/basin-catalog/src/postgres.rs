@@ -2816,17 +2816,16 @@ impl Catalog for PostgresCatalog {
     ) -> Result<()> {
         let sch = &self.schema;
         let project_str = project.to_string();
-        let mut client = self.client().await?;
-        let txn = client
-            .transaction()
-            .await
-            .map_err(|e| BasinError::catalog(format!("advance_sequence_floor txn: {e}")))?;
-        // FOR UPDATE serialises against concurrent nextval/setval. Monotonic:
-        // never lower `current_value`. When the sequence was never started, the
-        // stored value is meaningless, so seed it from the floor; otherwise take
-        // the greater of the existing position and the floor — guaranteeing the
-        // next nextval is strictly above any recovered (or already-issued) id.
-        let n = txn
+        let client = self.client().await?;
+        // A single atomic UPDATE (autocommit) — no explicit transaction needed.
+        // Monotonic: never lower `current_value`. When the sequence was never
+        // started the stored value is meaningless, so seed it from the floor;
+        // otherwise take the greater of the existing position and the floor —
+        // `current_value` updates under a row lock for the duration of this
+        // statement, so it serialises against concurrent nextval/setval. The
+        // result guarantees the next nextval is strictly above any recovered
+        // (or already-issued) id.
+        let n = client
             .execute(
                 &format!(
                     "UPDATE {sch}.sequences \
@@ -2844,9 +2843,6 @@ impl Catalog for PostgresCatalog {
                 "{project}: sequence {name:?}"
             )));
         }
-        txn.commit()
-            .await
-            .map_err(|e| BasinError::catalog(format!("advance_sequence_floor commit: {e}")))?;
         Ok(())
     }
 
