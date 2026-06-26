@@ -4150,6 +4150,197 @@ pub(crate) async fn apply_partition_pruning_for_query(
     Ok(())
 }
 
+/// `true` when the general min/max file-prune pass is disabled.
+///
+/// The prune is correctness-exact (it only drops files whose per-file
+/// `column_stats` min/max provably cannot satisfy the predicate), so it is ON
+/// by default — matching the always-on partition / GIN prune passes — with an
+/// env opt-out (`BASIN_DISABLE_MINMAX_PRUNE=1`) for A/B measurement and as a
+/// safety hatch. Parsed once and cached.
+fn minmax_prune_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        matches!(
+            std::env::var("BASIN_DISABLE_MINMAX_PRUNE").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// Decode an 8-byte little-endian `i64` from a catalog `column_stats`
+/// min/max blob. Mirrors `fast_aggregate::decode_i64` and the writer's
+/// `Int64` encoding byte-for-byte. Any other length → `None` (treated as
+/// "unknown stats" by the caller, which then keeps the file).
+fn decode_stats_i64(b: &[u8]) -> Option<i64> {
+    if b.len() != 8 {
+        return None;
+    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(b);
+    Some(i64::from_le_bytes(arr))
+}
+
+/// General per-file min/max prune for an integer-range `WHERE` predicate.
+///
+/// Complements [`apply_partition_pruning_for_query`] (which only handles
+/// `PARTITION BY RANGE` tables by Hive path segments): this prunes ANY table
+/// whose live data files carry catalog `column_stats` (min/max) for the
+/// predicate column, regardless of partitioning. For a query reducible to a
+/// half-open integer range `[lo, hi)` on a single `Int64` column (the
+/// `fast_aggregate::parse_range_bound` grammar — an AND-conjunction of
+/// `col </<=/>/>=  <int>` on one column), every live file whose
+/// `[min, max]` provably lies ENTIRELY OUTSIDE `[lo, hi)` is dropped from the
+/// scan set and the table is re-registered with only the survivors — so the
+/// object store never issues a footer GET or a data GET for a pruned file.
+///
+/// ## Correctness (only provably-non-matching files are dropped)
+/// A file is dropped iff `file_max < lo` (every value strictly below the
+/// inclusive lower bound) OR `file_min >= hi` (every value at/above the
+/// exclusive upper bound). Either condition means no row in the file can
+/// satisfy the predicate:
+/// * The min/max are over the column's NON-NULL values; a NULL never
+///   satisfies a range comparison, so a file with `file_max < lo` (or
+///   `file_min >= hi`) has zero matching rows whether or not it holds NULLs —
+///   we therefore do NOT require a zero null-count (unlike the
+///   exact-row-count fast aggregate, which does).
+/// * A file with missing stats, a missing/short min or max blob, or an
+///   inverted `min > max` pair is KEPT (conservative) — never dropped.
+/// * If the predicate column is absent from the schema or is not `Int64`,
+///   the whole pass is a no-op (full scan).
+///
+/// ## Live-overlay gate
+/// Declines (no-op → full scan) whenever the table has a live hot-tier
+/// UPDATE/DELETE overlay. A fast-path UPDATE can change a row's value to one
+/// that falls inside `[lo, hi)` while the cold file's stale min/max still say
+/// "outside"; the overlay-aware provider appends the post-image row, but if we
+/// had dropped that cold file the `UpdateOverlayExec` would have no base row to
+/// match the override against. Mirrors every other prune pass's overlay gate.
+///
+/// On any parse failure, multi-table / joined query, missing metadata, or
+/// uncertainty this returns `Ok(())` and the un-pruned scan proceeds —
+/// correctness is never traded for speed.
+pub(crate) async fn apply_minmax_file_pruning_for_query(
+    engine: &Engine,
+    project: &ProjectId,
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<()> {
+    if minmax_prune_disabled() {
+        return Ok(());
+    }
+    let dialect = PostgreSqlDialect {};
+    let stmts = match Parser::parse_sql(&dialect, sql) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+    if stmts.len() != 1 {
+        return Ok(());
+    }
+    let Statement::Query(query) = &stmts[0] else {
+        return Ok(());
+    };
+    // Single bare table, no joins: a join would need per-relation predicate
+    // attribution we don't attempt here.
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(());
+    };
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return Ok(());
+    }
+    let refs = collect_table_refs(query);
+    if refs.len() != 1 {
+        return Ok(());
+    }
+    let Some(where_expr) = select.selection.as_ref() else {
+        return Ok(()); // no WHERE → nothing to prune on
+    };
+    // Reuse the conservative integer-range grammar from the metadata-aggregate
+    // recogniser. Returns None on anything outside `col </<=/>/>= <int>`
+    // AND-conjunctions on a single column.
+    let Some(rb) = crate::fast_aggregate::parse_range_bound(where_expr) else {
+        return Ok(());
+    };
+    // An unbounded-both-sides range can't drop anything.
+    if rb.lo.is_none() && rb.hi.is_none() {
+        return Ok(());
+    }
+
+    let Ok(table) = TableName::new(refs[0].clone()) else {
+        return Ok(());
+    };
+    // Live overlay → decline (see doc comment).
+    if table_has_live_overlay(engine, project, &table) {
+        return Ok(());
+    }
+    let meta = match engine.config().catalog.load_table(project, &table).await {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+    // Predicate column must exist and be Int64 (the only type the integer-range
+    // grammar + min/max byte contract covers here).
+    let df_schema = match schema_ws_to_df(meta.schema.as_ref()) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+    match df_schema.fields().iter().find(|f| f.name() == &rb.column) {
+        Some(f) if *f.data_type() == arrow_schema::DataType::Int64 => {}
+        _ => return Ok(()),
+    }
+
+    let files = meta.live_data_files();
+    if files.is_empty() {
+        return Ok(());
+    }
+    let mut survivors: Vec<String> = Vec::with_capacity(files.len());
+    for f in &files {
+        // Decode this file's min/max for the predicate column. Any missing /
+        // short / inconsistent stat means "unknown" → KEEP the file.
+        let keep = match f.column_stats.get(&rb.column) {
+            Some(cs) => match (
+                cs.min_bytes.as_deref().and_then(decode_stats_i64),
+                cs.max_bytes.as_deref().and_then(decode_stats_i64),
+            ) {
+                (Some(fmin), Some(fmax)) if fmin <= fmax => {
+                    // Drop iff provably entirely outside [lo, hi):
+                    //   file all below lo  → fmax < lo
+                    //   file all at/above hi → fmin >= hi
+                    let below = rb.lo.is_some_and(|lo| fmax < lo);
+                    let above = rb.hi.is_some_and(|hi| fmin >= hi);
+                    !(below || above)
+                }
+                // Missing / short / inverted stats: conservative keep.
+                _ => true,
+            },
+            None => true,
+        };
+        if keep {
+            survivors.push(f.path.clone());
+        }
+    }
+
+    // Nothing pruned (every file is a candidate) → leave the existing
+    // registration untouched. All files pruned would be a correct empty result,
+    // but registering a zero-file ListingTable is finicky across DataFusion
+    // versions, so when EVERYTHING is dropped we keep a single survivor's path
+    // out and let DataFusion's own predicate evaluation return the empty set —
+    // i.e. we only re-register when we strictly narrowed AND kept >= 1 file.
+    if survivors.len() == files.len() || survivors.is_empty() {
+        return Ok(());
+    }
+
+    let _ = register_pruned_listing_table(
+        engine,
+        ctx,
+        &table,
+        &meta.schema,
+        meta.file_format,
+        &survivors,
+        meta.global_sort_order.as_deref(),
+    )
+    .await;
+    Ok(())
+}
+
 /// Re-register `table_name` as a `ListingTable` whose `table_paths` is a
 /// per-file URL list of `paths`. This bypasses DataFusion's directory scan
 /// entirely, so no footer GET is issued for files we already proved

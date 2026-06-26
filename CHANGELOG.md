@@ -8,6 +8,38 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Perf: heavy-OLAP scans prune non-matching data files from catalog min/max before any object-store GET
+
+**A selective integer-range scan (`WHERE col >= A AND col < B` on an `Int64`
+column) over a large table no longer reads every data file from object storage.**
+The metadata fast-aggregate path already prunes files for bare
+`count(*)`/`min`/`max`, but a heavy analytical query that must actually scan
+(filtered SELECT, range-filtered GROUP BY/aggregation) handed the full live-file
+set to DataFusion's `ListingTable`, which then fetched **every** file's footer to
+do its own stats pruning — N footer GETs plus the data GETs — turning a selective
+query into a near-full scan over remote storage (and, on the cloud, tripping the
+HTTP proxy timeout on big tables).
+
+- **New `apply_minmax_file_pruning_for_query` pass** (runs alongside the existing
+  partition / GIN / FTS / GIST / R-tree prune passes, before the DataFusion plan
+  executes). For a `WHERE` reducible to a half-open integer range on a single
+  `Int64` column it drops every live file whose per-file catalog `column_stats`
+  `[min,max]` provably lies entirely outside `[A,B)` (`file_max < A` or
+  `file_min >= B`) and re-registers the table over only the survivors — so the
+  object store issues **no footer GET and no data GET** for a pruned file.
+- **Correctness-exact**: only provably-non-matching files are dropped (NULLs
+  never satisfy a range, so the non-null min/max bound is sufficient and a
+  zero-null-count is NOT required); missing/short/inverted stats keep the file;
+  a non-`Int64` or absent predicate column makes the pass a no-op; DataFusion
+  still re-applies the predicate over the survivors. **Declines on a live
+  hot-tier UPDATE/DELETE overlay** (a fast-path UPDATE could move a row's value
+  into range while the cold file's stale min/max say "outside"), mirroring every
+  other prune pass's overlay gate.
+- **On by default** (matching the always-on partition prune); opt out for A/B
+  measurement with `BASIN_DISABLE_MINMAX_PRUNE=1`.
+- Verified by `viability_minmax_file_pruning`: a 2-band query over 10 disjoint
+  single-band files GETs at most 2 files and returns the exact rows.
+
 ## Unreleased — Fix: DROP TABLE + recreate of the SAME name no longer leaks stale rows into `count(*)`
 
 **After `DROP TABLE t` then `CREATE TABLE t` of the same name, a bare `count(*)`

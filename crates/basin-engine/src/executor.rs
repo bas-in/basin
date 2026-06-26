@@ -10797,6 +10797,29 @@ pub(crate) async fn exec_select(
         .await?;
     }
 
+    // Task #17 — general per-file min/max prune for an integer-range WHERE.
+    //
+    // Unlike partition pruning above (PARTITION BY RANGE tables only, via Hive
+    // path segments), this prunes ANY table whose live data files carry catalog
+    // `column_stats` (min/max) for the predicate column: a selective
+    // `WHERE col >= A AND col < B` on an Int64 column drops every file whose
+    // [min,max] provably lies outside [A,B) so the object store never issues a
+    // footer GET or a data GET for it — cutting heavy-OLAP scan latency over
+    // remote storage (where a full scan can trip the cloud HTTP proxy timeout).
+    //
+    // Runs unconditionally (no `has_partitioned_table` gate) but is internally
+    // cheap on the common path: it re-parses `sql`, bails the instant the WHERE
+    // isn't a single-column integer range, and declines on a live hot-tier
+    // overlay. Correctness is exact — only provably-non-matching files are
+    // dropped; DataFusion still re-applies the predicate over the survivors.
+    crate::session::apply_minmax_file_pruning_for_query(
+        &sess.engine,
+        &sess.project,
+        &sess.ctx,
+        sql,
+    )
+    .await?;
+
     // Phase 5.19.C — GIN file-level pruning (JSONB @> / <@).
     // Use the original (pre-operator-rewrite) SQL so `@>` / `<@` operators
     // are still present in the text.  After `rewrite_json_operators` runs,

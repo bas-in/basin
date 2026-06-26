@@ -244,7 +244,7 @@ fn match_query(q: &Query) -> Option<MetadataAggregatePlan> {
 /// `<=`) on ONE column, in either operand order. Equality, `OR`, `BETWEEN`,
 /// `IS NULL`, a second column, a non-integer literal, or any other shape
 /// returns `None` — keeping the recogniser conservative.
-fn parse_range_bound(expr: &Expr) -> Option<RangeBound> {
+pub(crate) fn parse_range_bound(expr: &Expr) -> Option<RangeBound> {
     let mut acc = RangeBound { column: String::new(), lo: None, hi: None };
     collect_range(expr, &mut acc)?;
     if acc.column.is_empty() {
