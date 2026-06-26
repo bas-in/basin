@@ -471,6 +471,37 @@ async fn run() -> Result<()> {
         }
     };
 
+    // #36 (Stage 2a) — multi-bucket pool. Attached ONLY when
+    // `BASIN_BUCKET_POOL` is truthy (default OFF). With it OFF the pool is
+    // never constructed and every storage routing call is byte-identical to
+    // the single-bucket behaviour that has always shipped. When ON, the pool
+    // assigns each project a stable (optionally striped) set of pooled buckets
+    // and routes data files accordingly; the S3 `BucketResolver` builds one
+    // `AmazonS3` per registry `credentials_ref`, mirroring the BYO-bucket S3
+    // construction. The bootstrap registry entry (empty endpoint/credentials)
+    // resolves to the process-default store, so enabling the flag on an
+    // existing single-bucket deployment keeps every project on the original
+    // bucket.
+    {
+        let pool_cfg = basin_storage::bucket_pool::PoolConfig::from_env();
+        if pool_cfg.enabled {
+            let resolver: Arc<dyn basin_storage::bucket_pool::BucketResolver> =
+                Arc::new(S3BucketResolver::new(catalog_object_store.clone()));
+            let pool = Arc::new(basin_storage::bucket_pool::BucketPool::new(
+                pool_cfg, resolver,
+            ));
+            storage.attach_bucket_pool(pool);
+            tracing::info!(
+                max_buckets = pool_cfg.max_buckets,
+                watermark = pool_cfg.watermark,
+                stripe = pool_cfg.stripe,
+                "bucket pool ENABLED (#36): projects routed to pooled buckets; \
+                 data files stripe across the per-project stripe set, catalog \
+                 stays on the primary bucket"
+            );
+        }
+    }
+
     // Optional WAL + shard owner. Constructed when BASIN_SHARD_ENABLED=1 so we
     // can ship the wedge-deepening change incrementally without breaking demos
     // that don't have a writable WAL directory available.
@@ -1873,6 +1904,111 @@ fn parse_catalog_env() -> Result<CatalogBackend> {
     Err(anyhow!(
         "BASIN_CATALOG must be 'memory', 'object_store', or a postgres connection string, got {raw:?}"
     ))
+}
+
+/// #36 (Stage 2a) — production [`BucketResolver`]: maps a registry
+/// `bucket_id`/entry to a real S3-compatible `ObjectStore`, mirroring the
+/// BYO-bucket S3 construction in
+/// `basin_storage::Storage::build_byo_object_store_from_config_with_secret`.
+///
+/// Credentials are resolved HERE from the entry's `credentials_ref` (never
+/// persisted into the catalog): the reference names an env prefix
+/// `{REF}_ACCESS_KEY_ID` / `{REF}_SECRET_ACCESS_KEY` (with the process-default
+/// `BASIN_STORAGE_*` / `AWS_*` as the fallback). An entry with an EMPTY
+/// endpoint (the bootstrap `pool-0000` entry) resolves to the process-default
+/// store handed in at construction — so flipping the flag on an existing
+/// single-bucket deployment keeps every project on the original bucket.
+struct S3BucketResolver {
+    /// The process-default store (same one the single-bucket path uses). Used
+    /// verbatim for the bootstrap entry with an empty endpoint.
+    default_store: Arc<dyn ObjectStore>,
+}
+
+impl S3BucketResolver {
+    fn new(default_store: Arc<dyn ObjectStore>) -> Self {
+        Self { default_store }
+    }
+}
+
+impl basin_storage::bucket_pool::BucketResolver for S3BucketResolver {
+    fn resolve(
+        &self,
+        entry: &basin_catalog::BucketRegistryEntry,
+    ) -> basin_common::Result<Arc<dyn ObjectStore>> {
+        use object_store::aws::AmazonS3Builder;
+
+        // Bootstrap / single-bucket entry: no endpoint → the process-default
+        // store. This is the entry `BucketPool::choose_one_bucket` registers
+        // first when the registry is empty.
+        if entry.endpoint.trim().is_empty() {
+            return Ok(self.default_store.clone());
+        }
+
+        // Resolve credentials from the reference (env), falling back to the
+        // process-default S3 credentials.
+        let (access_key_id, secret_access_key) = match entry.credentials_ref.as_deref() {
+            Some(prefix) if !prefix.trim().is_empty() => {
+                let id = std::env::var(format!("{prefix}_ACCESS_KEY_ID"))
+                    .or_else(|_| std::env::var("BASIN_STORAGE_ACCESS_KEY_ID"))
+                    .or_else(|_| std::env::var("AWS_ACCESS_KEY_ID"))
+                    .map_err(|_| {
+                        basin_common::BasinError::storage(format!(
+                            "bucket pool: no access key for credentials_ref {prefix:?} \
+                             (set {prefix}_ACCESS_KEY_ID or BASIN_STORAGE_ACCESS_KEY_ID)"
+                        ))
+                    })?;
+                let secret = std::env::var(format!("{prefix}_SECRET_ACCESS_KEY"))
+                    .or_else(|_| std::env::var("BASIN_STORAGE_SECRET_ACCESS_KEY"))
+                    .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
+                    .map_err(|_| {
+                        basin_common::BasinError::storage(format!(
+                            "bucket pool: no secret key for credentials_ref {prefix:?} \
+                             (set {prefix}_SECRET_ACCESS_KEY or BASIN_STORAGE_SECRET_ACCESS_KEY)"
+                        ))
+                    })?;
+                (id, secret)
+            }
+            _ => {
+                let id = std::env::var("BASIN_STORAGE_ACCESS_KEY_ID")
+                    .or_else(|_| std::env::var("AWS_ACCESS_KEY_ID"))
+                    .map_err(|_| {
+                        basin_common::BasinError::storage(
+                            "bucket pool: no process-default access key \
+                             (set BASIN_STORAGE_ACCESS_KEY_ID)"
+                                .to_string(),
+                        )
+                    })?;
+                let secret = std::env::var("BASIN_STORAGE_SECRET_ACCESS_KEY")
+                    .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
+                    .map_err(|_| {
+                        basin_common::BasinError::storage(
+                            "bucket pool: no process-default secret key \
+                             (set BASIN_STORAGE_SECRET_ACCESS_KEY)"
+                                .to_string(),
+                        )
+                    })?;
+                (id, secret)
+            }
+        };
+
+        let store = AmazonS3Builder::new()
+            .with_bucket_name(&entry.bucket_name)
+            .with_region(&entry.region)
+            .with_access_key_id(&access_key_id)
+            .with_secret_access_key(&secret_access_key)
+            .with_endpoint(&entry.endpoint)
+            // Tigris / most S3-compatible endpoints use virtual-hosted style;
+            // mirror the single-bucket default (force_path_style = false).
+            .with_virtual_hosted_style_request(true)
+            .build()
+            .map_err(|e| {
+                basin_common::BasinError::storage(format!(
+                    "bucket pool: build S3 store for bucket_id {}: {e}",
+                    entry.bucket_id
+                ))
+            })?;
+        Ok(Arc::new(store))
+    }
 }
 
 fn build_storage_object_store(cfg: &Cfg) -> Result<Arc<dyn ObjectStore>> {

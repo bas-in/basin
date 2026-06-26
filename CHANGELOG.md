@@ -8,6 +8,49 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Multi-bucket partition striping wired into the hot path (#36, flag-gated, default OFF)
+
+**The Stage-2a partition→bucket striping seam is now wired end-to-end so it
+functions when `BASIN_BUCKET_POOL` + `BASIN_BUCKET_POOL_STRIPE` are enabled.**
+Previously the routing primitives existed (deterministic `store_for_partition`
+/ `routed_stores`) but the data-file write/read paths and the production
+`basin-server` pool instantiation were deferred. Now:
+
+- **Write path** — `basin-storage`'s writer PUTs a partition's DATA file (and
+  its `.wrapped` encryption sidecar) to that partition's stripe bucket via the
+  new `Storage::partition_store`, instead of the single project store.
+- **Read / scan path** — Scheme C: a data file's bucket is re-derived from the
+  partition encoded in its key (`partition_id_from_data_file_key`), so reads
+  resolve the same bucket the write landed on with no change to `DataFileRef`
+  or the catalog. The reader's union LIST fans across the whole stripe
+  (`partition_stores_for_listing`); per-file footer/body GETs route per path;
+  and the DataFusion scan registers a striping-aware `StripeRouterStore` under
+  `basin://engine/` that routes each `<path>` GET and unions LISTs.
+- **`basin-server`** — when `BASIN_BUCKET_POOL` is truthy, a `BucketPool` is
+  constructed with an S3 `BucketResolver` that builds one `AmazonS3` per
+  registry `credentials_ref` (mirroring the BYO-bucket construction); the
+  bootstrap empty-endpoint entry resolves to the process-default store.
+
+**Invariant preserved:** only DATA files stripe; the catalog (per-partition
+segments / HEAD / #27 chunks / manifest / registry / assignments) stays on the
+primary bucket, keeping the create-if-absent commit CAS the single
+linearization point. The partition→bucket map is a pure, stable function of the
+partition, so reads always resolve where writes landed, across restarts and
+across nodes (the CAS still arbitrates the assignment exactly-once).
+
+**Flag OFF (default) is a provable no-op.** With the pool absent, the flag OFF,
+a width-1 stripe, an unwarmed assignment, or a BYO project, every routing call
+collapses to today's single store — byte-identical. Asserted by
+`wired_flag_off_data_path_is_a_noop` plus the existing `flag_off_*` /
+`stripe_width_one_*` tests. New end-to-end tests
+(`wired_write_then_read_round_trips_across_stripe`,
+`wired_read_after_restart_resolves_same_buckets`,
+`wired_catalog_stays_on_primary_data_stripes`) drive the real
+`Storage::write_batch` / `Storage::read` entry points over multiple in-memory
+stripe buckets and assert correct placement, the catalog-on-primary invariant,
+and exact union read-back. Throughput validation against real pooled buckets
+(multi-node) remains the deferred gate — no throughput number is claimed.
+
 ## Unreleased — Perf: catalog file pruning extended to equality, `IN`, string ranges, and bloom definite-negatives
 
 **The catalog-level file prune that already drops data files for an Int64-range

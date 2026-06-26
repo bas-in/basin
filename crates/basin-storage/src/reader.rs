@@ -132,6 +132,26 @@ fn resolve_unfiltered_serve_max_rows() -> u64 {
     DEFAULT_UNFILTERED_SERVE_MAX_ROWS
 }
 
+/// #36 (Stage 2a, Scheme C) — resolve the object store a SINGLE data file's
+/// body/footer GET must hit, by re-deriving its partition from the key and
+/// routing to that partition's stripe bucket. With the pool OFF / width-1 /
+/// unwarmed, or for a key that doesn't follow the data-file layout, this is
+/// byte-identical to `storage.project_store(project)` — so the read path is
+/// unchanged when striping is off, and a striped read always resolves the
+/// bucket the matching write landed on (the partition→bucket map is a pure,
+/// stable function of the partition that the key carries).
+pub(crate) fn store_for_data_file(
+    storage: &Storage,
+    project: &ProjectId,
+    path: &ObjectPath,
+) -> Arc<dyn ObjectStore> {
+    match crate::paths::partition_id_from_data_file_key(path.as_ref()) {
+        Some(partition_id) => storage.partition_object_store(project, &partition_id),
+        // Not a striped data-file key (sidecar, manifest, malformed) → primary.
+        None => storage.project_store(project),
+    }
+}
+
 /// Resolve [`DEFAULT_MAX_LISTED_FILES`], honoring
 /// `BASIN_STORAGE_MAX_LISTED_FILES` when present and parseable to a
 /// positive `usize`.
@@ -161,21 +181,31 @@ pub(crate) fn list_data_files_stream<'a>(
     project: &'a ProjectId,
     table: &'a TableName,
 ) -> BoxStream<'a, Result<DataFile>> {
-    let store = storage.project_store(project);
+    // #36 (Stage 2a) — the union read LISTs every bucket in the project's
+    // stripe. With striping OFF / width-1 / unwarmed this is exactly one store
+    // (the single shared store wrapped per-project), so the listing below is
+    // byte-identical to the pre-striping single LIST. A partition lives in
+    // exactly one bucket, so the per-bucket subtrees are disjoint — no file is
+    // double-counted and none is missed.
+    let stores = storage.partition_stores_for_listing(project);
     let root_prefix = storage.root_prefix().cloned();
     let project = project.clone();
     let table = table.clone();
 
     // We can't borrow `storage` across the async stream because callers
     // expect a `'static`-ish stream; clone the cheap handles up front and
-    // build the per-tier listing inside `try_unfold`. We use
-    // `stream::iter` over the two tiers and `flat_map` so the entire
+    // build the per-(store, tier) listing inside `flat_map` so the entire
     // listing is consumed lazily.
-    let store_for_stream = store.clone();
-    stream::iter([Tier::Hot, Tier::Cold])
-        .flat_map(move |tier| {
+    //
+    // Cartesian product (store × tier): for a width-1 stripe this is the
+    // identical [Hot, Cold] walk over the single store as before.
+    let pairs: Vec<(Arc<dyn ObjectStore>, Tier)> = stores
+        .into_iter()
+        .flat_map(|s| [(s.clone(), Tier::Hot), (s, Tier::Cold)])
+        .collect();
+    stream::iter(pairs)
+        .flat_map(move |(store, tier)| {
             let prefix = table_tier_prefix(root_prefix.as_ref(), &project, &table, tier);
-            let store = store_for_stream.clone();
             let listing = store.list(Some(&prefix));
             listing.filter_map(|res| async move {
                 match res {
@@ -266,7 +296,6 @@ pub(crate) async fn list_data_files_with_stats(
             n = files.len(),
         )));
     }
-    let store = storage.project_store(project);
     let cache = storage.parquet_meta_cache().clone();
     let stats_cache = storage.data_file_stats_cache().clone();
 
@@ -331,7 +360,10 @@ pub(crate) async fn list_data_files_with_stats(
         .enumerate()
         .filter(|(i, f)| needs.contains(i) && f.path.as_ref().ends_with(".parquet"))
         .map(|(i, f)| {
-            let store = store.clone();
+            // #36 (Scheme C): the footer GET must hit the file's stripe
+            // bucket. Re-derive the partition from the key and route to its
+            // store; OFF / width-1 collapses to `project_store` (today).
+            let store = store_for_data_file(storage, project, &f.path);
             let cache = cache.clone();
             let path = f.path.clone();
             let listed_size = f.size_bytes; // captured from LIST, no HEAD needed
@@ -408,7 +440,9 @@ pub(crate) async fn list_data_files_with_stats(
         let vwork: Vec<_> = vortex_idxs
             .into_iter()
             .map(|i| {
-                let store = store.clone();
+                // #36 (Scheme C): route this Vortex file's tail GET to its
+                // partition's stripe bucket; OFF / width-1 = the project store.
+                let store = store_for_data_file(storage, project, &files[i].path);
                 let path = files[i].path.clone();
                 // Size from the LIST result — no HEAD; feeds the tail reader so
                 // it skips the implicit `size()` round-trip too.
@@ -680,39 +714,46 @@ pub(crate) async fn read(
         // `write_batch` files are on the object store but uncataloged), so a
         // catalog-sourced SET would miss on-disk files and return wrong rows.
         // See the note in `list_data_files`.
-        let store = storage.project_store(project);
+        // #36 (Stage 2a): union the LIST across the project's whole stripe.
+        // OFF / width-1 = a single store, byte-identical to today's single
+        // LIST. A partition lives in exactly one bucket, so the per-bucket
+        // subtrees are disjoint — no path double-counted or missed.
+        let stores = storage.partition_stores_for_listing(project);
         let project_id_string = project.as_prefix();
         let mut paths: Vec<ObjectPath> = Vec::new();
         // Walk hot and cold tiers in turn. The reader is tier-agnostic — files
         // live wherever the (compactor-driven) tier policy put them; here we
         // just consume both prefixes.
-        for tier in [Tier::Hot, Tier::Cold] {
-            let prefix = table_tier_prefix(storage.root_prefix(), project, table, tier);
-            let mut s = store.list(Some(&prefix));
-            while let Some(meta) = s.next().await {
-                let meta = meta.map_err(|e| BasinError::storage(format!("list: {e}")))?;
-                // Data files are `.parquet` or (opt-in) `.vortex`. List both;
-                // skip everything else (e.g. `.wrapped` encryption sidecars).
-                // Filtering to `.parquet` only made every Vortex data file
-                // invisible to the constraint / FK / UNIQUE / PK and
-                // UPDATE/DELETE row-matching scans (list-then-read), so a dup
-                // INSERT was accepted and post-INSERT UPDATEs matched zero rows.
-                if !(meta.location.as_ref().ends_with(".parquet")
-                    || meta.location.as_ref().ends_with(".vortex"))
-                {
-                    continue;
+        for store in &stores {
+            for tier in [Tier::Hot, Tier::Cold] {
+                let prefix = table_tier_prefix(storage.root_prefix(), project, table, tier);
+                let mut s = store.list(Some(&prefix));
+                while let Some(meta) = s.next().await {
+                    let meta = meta.map_err(|e| BasinError::storage(format!("list: {e}")))?;
+                    // Data files are `.parquet` or (opt-in) `.vortex`. List
+                    // both; skip everything else (e.g. `.wrapped` encryption
+                    // sidecars). Filtering to `.parquet` only made every Vortex
+                    // data file invisible to the constraint / FK / UNIQUE / PK
+                    // and UPDATE/DELETE row-matching scans (list-then-read), so
+                    // a dup INSERT was accepted and post-INSERT UPDATEs matched
+                    // zero rows.
+                    if !(meta.location.as_ref().ends_with(".parquet")
+                        || meta.location.as_ref().ends_with(".vortex"))
+                    {
+                        continue;
+                    }
+                    // Belt-and-braces: never read a file whose key isn't under
+                    // the project prefix. If this ever fired we'd want a P0; we
+                    // treat it as `IsolationViolation`, not `Storage`.
+                    let expected = format!("projects/{project_id_string}/");
+                    if !meta.location.as_ref().contains(&expected) {
+                        return Err(BasinError::isolation(format!(
+                            "listed object {} does not contain {}",
+                            meta.location, expected
+                        )));
+                    }
+                    paths.push(meta.location);
                 }
-                // Belt-and-braces: never read a file whose key isn't under the
-                // project prefix. If this ever fired we'd want a P0; we treat it
-                // as `IsolationViolation`, not `Storage`.
-                let expected = format!("projects/{project_id_string}/");
-                if !meta.location.as_ref().contains(&expected) {
-                    return Err(BasinError::isolation(format!(
-                        "listed object {} does not contain {}",
-                        meta.location, expected
-                    )));
-                }
-                paths.push(meta.location);
             }
         }
         paths
@@ -843,9 +884,20 @@ async fn read_paths_inner(
     opts: ReadOptions,
     catalog_schema: Option<SchemaRef>,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-    let store = storage.project_store(project);
     let opts = Arc::new(opts);
-    let store_for_stream = store.clone();
+    // #36 (Scheme C): each path's body GET routes to ITS partition's stripe
+    // bucket (re-derived from the key) — a single read can span partitions on
+    // different buckets, so pair each path with its resolved store up front
+    // (the `paths` Vec is already materialised; resolving is a sync cache
+    // lookup). With striping off every pairing is the single project store, so
+    // the stream below is byte-identical to today's single-store read.
+    let paths: Vec<(ObjectPath, Arc<dyn ObjectStore>)> = paths
+        .into_iter()
+        .map(|p| {
+            let store = store_for_data_file(storage, project, &p);
+            (p, store)
+        })
+        .collect();
     let cache = storage.parquet_meta_cache().clone();
     let counters = storage.read_counters().clone();
     let page_cache = storage.page_cache_handle().cloned();
@@ -864,8 +916,7 @@ async fn read_paths_inner(
     let project_owned = *project;
     let limit = opts.limit;
     let stream = futures::stream::iter(paths)
-        .map(move |p| {
-            let store = store_for_stream.clone();
+        .map(move |(p, store)| {
             let opts = opts.clone();
             let cache = cache.clone();
             let counters = counters.clone();
@@ -931,7 +982,9 @@ pub(crate) async fn read_file_with_options(
     opts: ReadOptions,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
     let opts = Arc::new(opts);
-    let store = storage.project_store(project);
+    // #36 (Scheme C): route this file's GET to its partition's stripe bucket
+    // (re-derived from the key). OFF / width-1 = the single project store.
+    let store = store_for_data_file(storage, project, path);
     let cache = storage.parquet_meta_cache().clone();
     let counters = storage.read_counters().clone();
     let page_cache = storage.page_cache_handle().cloned();

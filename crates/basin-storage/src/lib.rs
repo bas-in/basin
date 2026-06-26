@@ -28,6 +28,7 @@ mod paths;
 mod predicate;
 mod reader;
 mod scheduler;
+mod stripe_router_store;
 mod tier;
 mod vector_index;
 mod vortex_footer_cache;
@@ -1372,6 +1373,34 @@ impl Storage {
         self.project_object_store(project)
     }
 
+    /// #36 (Stage 2a) — the crate-internal store for ONE partition's DATA
+    /// files, used by the writer's PUTs and the per-partition GET. Routes to
+    /// the partition's stripe bucket when striping is ON and warmed; otherwise
+    /// byte-identical to [`project_store`]. This is the write-side half of
+    /// Scheme C (the read side re-derives the partition from the key).
+    pub(crate) fn partition_store(
+        &self,
+        project: &ProjectId,
+        partition: &basin_common::PartitionKey,
+    ) -> Arc<dyn ObjectStore> {
+        self.partition_object_store(project, partition.as_str())
+    }
+
+    /// #36 (Stage 2a, Scheme C) — the store a SINGLE data-file PATH routes to,
+    /// re-deriving the partition from the key. Used by the maintenance paths
+    /// (tier migration, per-file delete) so they act on the file's stripe
+    /// bucket. OFF / width-1 / non-data-key = the single project store.
+    pub(crate) fn partition_store_for_path(
+        &self,
+        project: &ProjectId,
+        path: &ObjectPath,
+    ) -> Arc<dyn ObjectStore> {
+        match paths::partition_id_from_data_file_key(path.as_ref()) {
+            Some(partition_id) => self.partition_object_store(project, &partition_id),
+            None => self.project_store(project),
+        }
+    }
+
     /// #36 (Stage 2a) — route ONE partition's DATA files to its assigned
     /// stripe bucket. The CLEAN SEAM for partition→bucket striping: the writer
     /// and the per-partition reader call this with the partition id; the bucket
@@ -1419,6 +1448,104 @@ impl Storage {
             *project,
             counters,
         ))
+    }
+
+    /// #36 (Stage 2a) — the full stripe of project-scoped stores a table's
+    /// union read must LIST across. Each stripe bucket's store is wrapped in a
+    /// [`concurrency::ProjectScopedStore`] exactly like [`project_object_store`]
+    /// so per-project fairness/billing is unchanged regardless of stripe width.
+    ///
+    /// No-op equivalence: a BYO project, or no pool / flag-OFF / width-1 /
+    /// unwarmed stripe, returns exactly one element — byte-identical to
+    /// `vec![self.project_object_store(project)]`, so the union LIST collapses
+    /// to today's single LIST. Striping only ever WIDENS this list; it never
+    /// drops or reorders the primary.
+    pub(crate) fn partition_stores_for_listing(
+        &self,
+        project: &ProjectId,
+    ) -> Vec<Arc<dyn ObjectStore>> {
+        // BYO override is never pool-striped — one store, as today.
+        let byo = {
+            let map = self
+                .inner
+                .byo_object_stores
+                .lock()
+                .expect("byo_object_stores poisoned");
+            map.get(project).cloned()
+        };
+        if byo.is_some() {
+            return vec![self.project_object_store(project)];
+        }
+        let stripe = self
+            .inner
+            .bucket_pool
+            .get()
+            .and_then(|p| p.routed_stores(project));
+        let backings: Vec<Arc<dyn ObjectStore>> = match stripe {
+            // A warmed stripe → list every bucket in it. A width-1 stripe is a
+            // one-element vec == today's single LIST.
+            Some(s) if !s.is_empty() => s,
+            // No pool / OFF / unwarmed → the single shared store, as today.
+            _ => vec![self.inner.object_store.clone()],
+        };
+        backings
+            .into_iter()
+            .map(|backing| {
+                let sem = self.project_semaphore(project);
+                let counters = self.project_counters(project);
+                Arc::new(concurrency::ProjectScopedStore::new(
+                    backing,
+                    sem,
+                    self.inner.scheduler.clone(),
+                    *project,
+                    counters,
+                )) as Arc<dyn ObjectStore>
+            })
+            .collect()
+    }
+
+    /// #36 (Stage 2a) — whether the DataFusion scan path should register the
+    /// striping-aware [`stripe_router_store::StripeRouterStore`] for `project`
+    /// instead of the plain single store. True ONLY when the pool is enabled
+    /// AND the project has a warmed stripe wider than one bucket AND it is not
+    /// a BYO project. Every other case keeps today's single-store registration
+    /// — the scan path is then byte-identical to before striping.
+    pub fn should_stripe_scan(&self, project: &ProjectId) -> bool {
+        // BYO projects are never pool-striped.
+        {
+            let map = self
+                .inner
+                .byo_object_stores
+                .lock()
+                .expect("byo_object_stores poisoned");
+            if map.contains_key(project) {
+                return false;
+            }
+        }
+        match self.inner.bucket_pool.get() {
+            Some(pool) if pool.enabled() => pool
+                .routed_stores(project)
+                .map(|s| s.len() > 1)
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// #36 (Stage 2a) — the object store the DataFusion scan should register
+    /// under `basin://engine/` for `project`. When [`should_stripe_scan`]
+    /// holds, this is a [`stripe_router_store::StripeRouterStore`] that
+    /// re-derives each file's partition→bucket at I/O time (Scheme C) and
+    /// unions LISTs across the stripe; otherwise it is exactly
+    /// [`project_object_store`] (today's behaviour, byte-identical).
+    pub fn scan_object_store(&self, project: &ProjectId) -> Arc<dyn ObjectStore> {
+        if self.should_stripe_scan(project) {
+            Arc::new(stripe_router_store::StripeRouterStore::new(
+                self.clone(),
+                *project,
+            ))
+        } else {
+            self.project_object_store(project)
+        }
     }
 
     pub(crate) fn parquet_meta_cache(&self) -> &Arc<metadata_cache::ParquetMetaCache> {
@@ -1670,9 +1797,13 @@ impl Storage {
         project: &ProjectId,
         from: &ObjectPath,
     ) -> Result<DataFile> {
+        // #36 (Scheme C): a data file's tier migration stays on the file's
+        // stripe bucket — `from` and the cold `to` share the partition, so the
+        // partition-routed store backs both the copy source and target. OFF /
+        // width-1 = the single project store (today).
+        let store = self.partition_store_for_path(project, from);
         // Already cold? Re-stat and return without touching anything.
         if matches!(Tier::from_path(from.as_ref()), Tier::Cold) {
-            let store = self.project_store(project);
             let head = store
                 .head(from)
                 .await
@@ -1694,7 +1825,6 @@ impl Storage {
                 "migrate_to_cold: path does not match `tables/<t>/data/...`: {from}"
             ))
         })?;
-        let store = self.project_store(project);
         // Belt-and-braces: confirm the target sits under this project's prefix.
         // The path was derived from `from`, which already cleared this check
         // at write time — we re-check defensively.
@@ -1765,17 +1895,48 @@ impl Storage {
                 )));
             }
         }
-        // Use the per-project gated store so the deletes count against
-        // this project's permit pool (the same contract as `delete_file`).
-        let inner: Arc<dyn ObjectStore> = self.project_store(project);
         let n = paths.len();
-        let _ = bulk_delete(&inner, paths.clone()).await.map_err(|e| {
-            // Same shape as `delete_project_prefix`: we still report the
-            // count attempted in the success path; per-key errors are
-            // logged below. Aggregate failures only surface here.
-            tracing::warn!(target: "basin_storage", error = %e, "bulk_delete_files: aggregate error");
-            basin_common::BasinError::storage(format!("bulk_delete_files({project}): {e}"))
-        })?;
+        // #36 (Scheme C): when striping is active a batch can span partitions
+        // on DIFFERENT stripe buckets, so the single-store native bulk-delete
+        // would silently no-op on the files that live on other buckets. Group
+        // by stripe bucket and bulk-delete per bucket. With striping OFF /
+        // width-1 there is exactly ONE stripe store, so we take the unchanged
+        // single `bulk_delete` fast path (native S3 `DeleteObjects` batching),
+        // byte-identical to before.
+        if self.should_stripe_scan(project) {
+            // Striping active: route each path to its partition's bucket and
+            // bulk-delete per bucket. Bucket identity comes from the stripe
+            // slot of the re-derived partition (stable), so files on the same
+            // bucket batch together.
+            use std::collections::HashMap;
+            let mut by_partition_slot: HashMap<String, Vec<ObjectPath>> = HashMap::new();
+            for p in &paths {
+                // Key by the recovered partition id; per-partition groups are a
+                // safe over-partitioning (one bucket may hold several
+                // partitions, but each group still targets the correct bucket).
+                let key = paths::partition_id_from_data_file_key(p.as_ref())
+                    .unwrap_or_default();
+                by_partition_slot.entry(key).or_default().push(p.clone());
+            }
+            for (_pid, group) in by_partition_slot {
+                let store = self.partition_store_for_path(project, &group[0]);
+                let _ = bulk_delete(&store, group).await.map_err(|e| {
+                    tracing::warn!(target: "basin_storage", error = %e, "bulk_delete_files: aggregate error");
+                    basin_common::BasinError::storage(format!("bulk_delete_files({project}): {e}"))
+                })?;
+            }
+        } else {
+            // Use the per-project gated store so the deletes count against
+            // this project's permit pool (the same contract as `delete_file`).
+            let inner: Arc<dyn ObjectStore> = self.project_store(project);
+            let _ = bulk_delete(&inner, paths.clone()).await.map_err(|e| {
+                // Same shape as `delete_project_prefix`: we still report the
+                // count attempted in the success path; per-key errors are
+                // logged below. Aggregate failures only surface here.
+                tracing::warn!(target: "basin_storage", error = %e, "bulk_delete_files: aggregate error");
+                basin_common::BasinError::storage(format!("bulk_delete_files({project}): {e}"))
+            })?;
+        }
         // Invalidate page-cache entries for every deleted file. The
         // disk-cache layer (when present) already invalidates on its
         // own `delete()` interception, but the page cache sits above
@@ -1803,7 +1964,9 @@ impl Storage {
                 "delete_file: {path} missing project prefix {expected_prefix}"
             )));
         }
-        let store = self.project_store(project);
+        // #36 (Scheme C): delete from the file's stripe bucket (re-derived from
+        // the key); OFF / width-1 = the single project store.
+        let store = self.partition_store_for_path(project, path);
         store
             .delete(path)
             .await
@@ -1857,22 +2020,46 @@ impl Storage {
 
         // Step 1: gated LIST.
         let list_started = std::time::Instant::now();
-        let gated = self.project_object_store(project);
-        let paths_stream = gated.list(Some(&p)).map_ok(|m| m.location).boxed();
-
-        // Step 2: hand the path stream to the *inner* store's
-        // `delete_stream`. On AWS this picks up the
-        // `aws::AmazonS3::delete_stream` override (1000-key batches,
-        // 20-way parallel); on LocalFS / GCS / Azure we collect first
-        // and fan-out 64-way through `bulk_delete` (the default
-        // `.buffered(10)` is the bottleneck at 5000+ files).
-        let inner = self.inner.object_store.clone();
-        let collected: Vec<ObjectPath> = paths_stream.try_collect().await.map_err(|e| {
-            basin_common::BasinError::storage(format!("delete_project_prefix({project}) list: {e}"))
-        })?;
-        let deleted: Vec<ObjectPath> = bulk_delete(&inner, collected).await.map_err(|e| {
-            basin_common::BasinError::storage(format!("delete_project_prefix({project}): {e}"))
-        })?;
+        let deleted: Vec<ObjectPath>;
+        if self.should_stripe_scan(project) {
+            // #36 (Stage 2a): a striped project's DATA files live on the pooled
+            // stripe buckets, not the primary. Fan the LIST+delete across every
+            // stripe bucket (each via its own gated store / native batch) so
+            // all the project's bytes are freed.
+            let mut acc: Vec<ObjectPath> = Vec::new();
+            for store in self.partition_stores_for_listing(project) {
+                let s = store.list(Some(&p)).map_ok(|m| m.location).boxed();
+                let c: Vec<ObjectPath> = s.try_collect().await.map_err(|e| {
+                    basin_common::BasinError::storage(format!(
+                        "delete_project_prefix({project}) stripe list: {e}"
+                    ))
+                })?;
+                let part = bulk_delete(&store, c).await.map_err(|e| {
+                    basin_common::BasinError::storage(format!(
+                        "delete_project_prefix({project}) stripe: {e}"
+                    ))
+                })?;
+                acc.extend(part);
+            }
+            deleted = acc;
+        } else {
+            // OFF path: byte-identical to before striping. Gated LIST, then
+            // hand the path stream to the *inner* store's `delete_stream`. On
+            // AWS this picks up the `aws::AmazonS3::delete_stream` override
+            // (1000-key batches, 20-way parallel); on LocalFS / GCS / Azure we
+            // collect first and fan-out 64-way through `bulk_delete`.
+            let gated = self.project_object_store(project);
+            let paths_stream = gated.list(Some(&p)).map_ok(|m| m.location).boxed();
+            let inner = self.inner.object_store.clone();
+            let collected: Vec<ObjectPath> = paths_stream.try_collect().await.map_err(|e| {
+                basin_common::BasinError::storage(format!(
+                    "delete_project_prefix({project}) list: {e}"
+                ))
+            })?;
+            deleted = bulk_delete(&inner, collected).await.map_err(|e| {
+                basin_common::BasinError::storage(format!("delete_project_prefix({project}): {e}"))
+            })?;
+        }
         let list_delete_ms = list_started.elapsed().as_millis();
         // Drop any cached decoded batches for each deleted file. Same
         // rationale as `delete_file`: page cache lives one layer above
@@ -1908,19 +2095,43 @@ impl Storage {
         table: &TableName,
     ) -> Result<usize> {
         let p = paths::table_root(self.inner.root_prefix.as_ref(), project, table);
-        let gated = self.project_object_store(project);
-        let paths_stream = gated.list(Some(&p)).map_ok(|m| m.location).boxed();
-        let inner = self.inner.object_store.clone();
-        let collected: Vec<ObjectPath> = paths_stream.try_collect().await.map_err(|e| {
-            basin_common::BasinError::storage(format!(
-                "delete_table_prefix({project}/{table}) list: {e}"
-            ))
-        })?;
-        let deleted: Vec<ObjectPath> = bulk_delete(&inner, collected).await.map_err(|e| {
-            basin_common::BasinError::storage(format!(
-                "delete_table_prefix({project}/{table}): {e}"
-            ))
-        })?;
+        let mut deleted: Vec<ObjectPath>;
+        if self.should_stripe_scan(project) {
+            // #36 (Stage 2a): a striped table's data files live on the pooled
+            // stripe buckets, not the primary — wipe the table prefix on EVERY
+            // stripe bucket (each via its own gated store / native batch).
+            deleted = Vec::new();
+            for store in self.partition_stores_for_listing(project) {
+                let s = store.list(Some(&p)).map_ok(|m| m.location).boxed();
+                let c: Vec<ObjectPath> = s.try_collect().await.map_err(|e| {
+                    basin_common::BasinError::storage(format!(
+                        "delete_table_prefix({project}/{table}) stripe list: {e}"
+                    ))
+                })?;
+                let part = bulk_delete(&store, c).await.map_err(|e| {
+                    basin_common::BasinError::storage(format!(
+                        "delete_table_prefix({project}/{table}) stripe: {e}"
+                    ))
+                })?;
+                deleted.extend(part);
+            }
+        } else {
+            // OFF path: byte-identical to before striping — gated LIST, native
+            // batch delete via the raw inner store.
+            let gated = self.project_object_store(project);
+            let paths_stream = gated.list(Some(&p)).map_ok(|m| m.location).boxed();
+            let inner = self.inner.object_store.clone();
+            let collected: Vec<ObjectPath> = paths_stream.try_collect().await.map_err(|e| {
+                basin_common::BasinError::storage(format!(
+                    "delete_table_prefix({project}/{table}) list: {e}"
+                ))
+            })?;
+            deleted = bulk_delete(&inner, collected).await.map_err(|e| {
+                basin_common::BasinError::storage(format!(
+                    "delete_table_prefix({project}/{table}): {e}"
+                ))
+            })?;
+        }
         if let Some(pc) = self.page_cache_handle() {
             for path in &deleted {
                 pc.invalidate_path(path);
@@ -1987,6 +2198,19 @@ impl Storage {
         project: &ProjectId,
     ) -> Result<usize> {
         let total_started = std::time::Instant::now();
+
+        // #36 (Stage 2a): the catalog-fast path below deletes catalog-known
+        // data files against the single primary `inner` store. When striping
+        // is active those data files live on the pooled stripe buckets, so the
+        // primary-only delete would strand them. Route to the stripe-aware
+        // prefix wipe (which fans LIST+delete across every stripe bucket) and
+        // still drop the catalog namespace. Skipped when striping is OFF —
+        // provable no-op (the catalog-fast path below is unchanged).
+        if self.should_stripe_scan(project) {
+            let n = self.delete_project_prefix(project).await?;
+            let _ = catalog.drop_namespace(project).await;
+            return Ok(n);
+        }
 
         // ---- 1. Pull catalog file paths (fast) -----------------------
         let cat_started = std::time::Instant::now();

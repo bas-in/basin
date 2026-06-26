@@ -501,6 +501,340 @@ async fn striped_assignment_cas_is_exactly_once_across_nodes() {
     }
 }
 
+// ===========================================================================
+// #36 Stage 2a — END-TO-END wiring of the seam into the real write/read entry
+// points (`Storage::write_batch` / `Storage::read` / `list_data_files`). These
+// exercise the production hot path, not just the routing primitives.
+// ===========================================================================
+
+/// Multi-row batch over several partitions so the writer's real PUT path is
+/// driven across distinct partitions (hence distinct stripe buckets).
+fn batch_rows(n: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let ids: Int64Array = (0..n).collect();
+    RecordBatch::try_new(schema, vec![Arc::new(ids)]).unwrap()
+}
+
+/// THE end-to-end striping proof on the real `Storage::write_batch` /
+/// `Storage::read` path: writes across many partitions stripe their data
+/// files across the project's pooled buckets, NOTHING lands on the single
+/// default store, the per-partition placement matches the slot map, and the
+/// unioned `Storage::read` reads back EXACTLY the rows written across all
+/// buckets.
+#[tokio::test]
+async fn wired_write_then_read_round_trips_across_stripe() {
+    let default_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let cat = Arc::new(InMemoryCatalog::new());
+    let storage = Storage::new(StorageConfig {
+        object_store: default_store.clone(),
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
+    let resolver = Arc::new(InMemoryResolver::default());
+    let pool = Arc::new(BucketPool::new(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        resolver.clone(),
+    ));
+    storage.attach_bucket_pool(pool.clone());
+
+    let project = ProjectId::new();
+    let table = TableName::new("t").unwrap();
+
+    // Warm so we can read the durable stripe + assert physical placement.
+    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
+    assert_eq!(a.stripe.len(), 4);
+
+    let mut total_written = 0i64;
+    let mut per_bucket_files: HashMap<String, usize> = HashMap::new();
+    for i in 0..24 {
+        let part = PartitionKey::new(format!("p{i}")).unwrap();
+        let rows = 4 + (i % 3);
+        storage
+            .write_batch(&project, &table, &part, &batch_rows(rows))
+            .await
+            .unwrap();
+        total_written += rows;
+        // The data file must be in this partition's slot bucket — and ONLY it.
+        let slot = basin_catalog::bucket_pool::stripe_slot(part.as_str(), a.stripe.len());
+        let expected_bucket = &a.stripe[slot];
+        let prefix = format!("projects/{project}/tables/t/data/{}/", part.as_str());
+        let keys = list_keys(&resolver.store_for(expected_bucket)).await;
+        let here = keys.iter().filter(|k| k.starts_with(&prefix)).count();
+        assert_eq!(here, 1, "partition {} file must be in slot bucket {expected_bucket}", part.as_str());
+        *per_bucket_files.entry(expected_bucket.clone()).or_default() += 1;
+        for (j, other) in a.stripe.iter().enumerate() {
+            if j == slot {
+                continue;
+            }
+            let ok = list_keys(&resolver.store_for(other)).await;
+            assert!(
+                !ok.iter().any(|k| k.starts_with(&prefix)),
+                "partition {} must not appear in sibling bucket {other}", part.as_str()
+            );
+        }
+    }
+
+    // The single default store holds NOTHING — every data file was striped.
+    assert!(
+        list_keys(&default_store).await.is_empty(),
+        "striped writes must never touch the single default store"
+    );
+    // The spread is real: more than one bucket holds data files.
+    assert!(per_bucket_files.len() > 1, "data files must spread across >1 bucket");
+
+    // Union READ through the real `Storage::read` entry point returns EXACTLY
+    // the rows written, aggregated across all stripe buckets.
+    let stream = storage
+        .read(&project, &table, basin_storage::ReadOptions::default())
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.collect().await;
+    let total_read: i64 = batches
+        .iter()
+        .map(|b| b.as_ref().unwrap().num_rows() as i64)
+        .sum();
+    assert_eq!(
+        total_read, total_written,
+        "unioned read must return exactly the striped rows across all buckets"
+    );
+
+    // `list_data_files` (the union LIST) sees every file across the stripe.
+    let listed = storage.list_data_files(&project, &table).await.unwrap();
+    assert_eq!(listed.len(), 24, "union LIST must find every striped data file");
+}
+
+/// Cold-catalog restart: drop the per-process cache, re-warm from the SAME
+/// catalog, and confirm reads still resolve the SAME buckets the writes landed
+/// on (the partition→bucket map is stable, so a fresh process reads where the
+/// old one wrote).
+#[tokio::test]
+async fn wired_read_after_restart_resolves_same_buckets() {
+    let default_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let cat = Arc::new(InMemoryCatalog::new());
+    let storage = Storage::new(StorageConfig {
+        object_store: default_store,
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
+    let resolver = Arc::new(InMemoryResolver::default());
+    let pool = Arc::new(BucketPool::new(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 3 },
+        resolver.clone(),
+    ));
+    storage.attach_bucket_pool(pool.clone());
+
+    let project = ProjectId::new();
+    let table = TableName::new("t").unwrap();
+    let mut total = 0i64;
+    for i in 0..18 {
+        let part = PartitionKey::new(format!("p{i}")).unwrap();
+        storage.write_batch(&project, &table, &part, &batch_rows(5)).await.unwrap();
+        total += 5;
+    }
+
+    // Simulated restart: forget every in-process assignment + resolved store.
+    pool.invalidate_all();
+
+    // A fresh read re-warms from the catalog and unions across the SAME stripe.
+    let stream = storage
+        .read(&project, &table, basin_storage::ReadOptions::default())
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.collect().await;
+    let read_total: i64 = batches
+        .iter()
+        .map(|b| b.as_ref().unwrap().num_rows() as i64)
+        .sum();
+    assert_eq!(
+        read_total, total,
+        "after a cold-catalog restart the read must still find every striped row"
+    );
+}
+
+/// Flag-OFF data-path no-op on the REAL write/read entry points: every data
+/// file lands on the single default store, the read returns every row, and the
+/// per-bucket resolver is NEVER consulted (the striping seam is fully inert).
+#[tokio::test]
+async fn wired_flag_off_data_path_is_a_noop() {
+    let default_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (storage, _cat) = build_storage_with_default(default_store.clone());
+    let resolver = Arc::new(InMemoryResolver::default());
+    let pool_off = Arc::new(BucketPool::new(
+        PoolConfig { enabled: false, max_buckets: 8, watermark: 1, stripe: 4 },
+        resolver.clone(),
+    ));
+    storage.attach_bucket_pool(pool_off);
+
+    let project = ProjectId::new();
+    let table = TableName::new("t").unwrap();
+    let mut total = 0i64;
+    for i in 0..12 {
+        let part = PartitionKey::new(format!("p{i}")).unwrap();
+        storage.write_batch(&project, &table, &part, &batch_rows(6)).await.unwrap();
+        total += 6;
+    }
+
+    // Everything is on the single default store; no pooled bucket was created.
+    let keys = list_keys(&default_store).await;
+    assert_eq!(keys.len(), 12, "flag OFF: all 12 data files on the single store");
+    assert!(
+        resolver.stores.lock().unwrap().is_empty(),
+        "flag OFF must never resolve a pooled bucket (seam fully inert)"
+    );
+
+    // Read returns every row from the single store.
+    let stream = storage
+        .read(&project, &table, basin_storage::ReadOptions::default())
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.collect().await;
+    let read_total: i64 = batches
+        .iter()
+        .map(|b| b.as_ref().unwrap().num_rows() as i64)
+        .sum();
+    assert_eq!(read_total, total, "flag OFF: read returns every row from the single store");
+}
+
+/// The catalog-stays-on-primary / data-stripes invariant, proven with a real
+/// `ObjectStoreCatalog` whose objects live on the PRIMARY store while striped
+/// data files land on the pooled buckets. After striped writes: the primary
+/// store holds catalog objects (`_catalog/…`) and NO `tables/.../data/` files;
+/// the pooled stripe buckets hold the data files and NO catalog objects.
+#[tokio::test]
+async fn wired_catalog_stays_on_primary_data_stripes() {
+    use basin_catalog::ObjectStoreCatalog;
+    // The primary store backs BOTH the catalog and is the pool's bootstrap
+    // bucket fallback (empty-endpoint entry). We instead force a real stripe of
+    // distinct in-memory buckets via the resolver, and keep the catalog on this
+    // primary store explicitly — exactly the design invariant
+    // (object_store_catalog stays on the catalog/primary store; data stripes).
+    let primary: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog_store = primary.clone();
+    let cat = Arc::new(ObjectStoreCatalog::new(catalog_store.clone()));
+    let storage = Storage::new(StorageConfig {
+        object_store: primary.clone(),
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
+    let resolver = Arc::new(InMemoryResolver::default());
+    let pool = Arc::new(BucketPool::new(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        resolver.clone(),
+    ));
+    storage.attach_bucket_pool(pool.clone());
+
+    let project = ProjectId::new();
+    let table = TableName::new("t").unwrap();
+    let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+
+    // A real catalog object on the PRIMARY store: the table manifest + HEAD.
+    cat.create_namespace(&project).await.unwrap();
+    cat.create_table(&project, &table, &schema).await.unwrap();
+
+    // Warm the (striped) assignment — this also persists the bucket registry +
+    // assignment to the catalog/primary store, another catalog-on-primary fact.
+    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+
+    // Write the data through the real writer (which stripes the data file).
+    for i in 0..16 {
+        let part = PartitionKey::new(format!("p{i}")).unwrap();
+        storage.write_batch(&project, &table, &part, &batch_rows(4)).await.unwrap();
+    }
+
+    // PRIMARY store: holds catalog objects, holds NO striped data file.
+    let primary_keys = list_keys(&primary).await;
+    assert!(
+        !primary_keys.is_empty(),
+        "primary store must hold catalog objects (manifest/HEAD/registry)"
+    );
+    assert!(
+        !primary_keys.iter().any(|k| k.contains("/tables/t/data/")),
+        "primary store must hold NO striped data file, got {primary_keys:?}"
+    );
+
+    // POOLED stripe buckets: hold the data files, hold NO catalog object.
+    let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
+    let mut data_files_on_stripe = 0usize;
+    for b in &a.stripe {
+        let keys = list_keys(&resolver.store_for(b)).await;
+        for k in &keys {
+            assert!(
+                k.contains("/tables/t/data/"),
+                "stripe bucket {b} must hold only data files, found {k}"
+            );
+            assert!(
+                !k.contains("/parts/") && !k.contains("_catalog") && !k.ends_with("HEAD"),
+                "stripe bucket {b} must hold NO catalog object, found {k}"
+            );
+            data_files_on_stripe += 1;
+        }
+    }
+    assert_eq!(data_files_on_stripe, 16, "all 16 data files must be on the stripe buckets");
+}
+
+/// Striped DROP TABLE: `delete_table_prefix` must free the table's data files
+/// across EVERY stripe bucket (they don't live on the primary), so a later
+/// re-create of the same name starts empty. Proves the maintenance-path
+/// stripe fan-out.
+#[tokio::test]
+async fn wired_drop_table_frees_striped_data_across_buckets() {
+    let default_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let cat = Arc::new(InMemoryCatalog::new());
+    let storage = Storage::new(StorageConfig {
+        object_store: default_store,
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
+    let resolver = Arc::new(InMemoryResolver::default());
+    let pool = Arc::new(BucketPool::new(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        resolver.clone(),
+    ));
+    storage.attach_bucket_pool(pool.clone());
+
+    let project = ProjectId::new();
+    let table = TableName::new("t").unwrap();
+    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
+
+    for i in 0..20 {
+        let part = PartitionKey::new(format!("p{i}")).unwrap();
+        storage.write_batch(&project, &table, &part, &batch_rows(3)).await.unwrap();
+    }
+    // Pre-drop: data files exist across the stripe.
+    let pre: usize = {
+        let mut n = 0;
+        for b in &a.stripe {
+            n += list_keys(&resolver.store_for(b)).await.len();
+        }
+        n
+    };
+    assert_eq!(pre, 20, "all 20 data files present before drop");
+
+    // DROP TABLE.
+    let freed = storage.delete_table_prefix(&project, &table).await.unwrap();
+    assert_eq!(freed, 20, "drop must free every striped data file");
+
+    // Post-drop: nothing left on any stripe bucket under the table prefix.
+    for b in &a.stripe {
+        let keys = list_keys(&resolver.store_for(b)).await;
+        let table_prefix = format!("projects/{project}/tables/t/");
+        assert!(
+            !keys.iter().any(|k| k.starts_with(&table_prefix)),
+            "stripe bucket {b} must hold no table data after drop, got {keys:?}"
+        );
+    }
+}
+
 /// Stripe width == 1 is byte-identical single-bucket routing: every partition
 /// of a project resolves to the SAME single store, and that store is the
 /// primary routed_store (the no-op proof for the striping layer specifically).

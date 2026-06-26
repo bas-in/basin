@@ -375,16 +375,22 @@ pub(crate) async fn write_batch_with_options(
     };
     let size = body_to_put.len() as u64;
 
-    storage
-        .project_store(project)
+    // #36 (Stage 2a, Scheme C): a partition's DATA files PUT to its stripe
+    // bucket (`partition_store`). With striping OFF / width-1 / unwarmed this
+    // is byte-identical to `project_store`. The catalog (segments/HEAD/chunks)
+    // is NOT routed here — it stays on the primary catalog store, which is the
+    // single linearization point for the per-partition commit CAS. The sidecar
+    // travels with its data file to the same bucket so a striped read resolves
+    // both from one store.
+    let data_store = storage.partition_store(project, partition);
+    data_store
         .put(&key, PutPayload::from_bytes(Bytes::from(body_to_put)))
         .await
         .map_err(|e| BasinError::storage(format!("put {key}: {e}")))?;
 
     if let Some(wrapped) = wrapped_for_sidecar {
         let sidecar_key = wrapped_sidecar_key(&key);
-        storage
-            .project_store(project)
+        data_store
             .put(&sidecar_key, PutPayload::from_bytes(Bytes::from(wrapped.0)))
             .await
             .map_err(|e| BasinError::storage(format!("put sidecar {sidecar_key}: {e}")))?;

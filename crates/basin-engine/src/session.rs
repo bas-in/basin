@@ -2806,7 +2806,14 @@ pub(crate) async fn open(
     // project fairness on shared object-store backends (real S3 in
     // particular, where the shared reqwest pool would otherwise be
     // saturated by one heavy project).
-    let store = engine.config().storage.project_object_store(&project);
+    // #36 (Stage 2a, Scheme C): when partition→bucket striping is ON and this
+    // project has a warmed multi-bucket stripe, register the striping-aware
+    // store so each `basin://engine/<path>` GET re-derives the file's partition
+    // and resolves its stripe bucket, and LISTs union across the stripe. In
+    // every other case (pool absent / OFF / width-1 / unwarmed / BYO) this
+    // returns exactly `project_object_store(project)` — byte-identical to the
+    // single-store registration that has always been here.
+    let store = engine.config().storage.scan_object_store(&project);
     ctx.register_object_store(&url, store);
 
     // Register JSONB table-valued functions (UDTFs) directly on the real

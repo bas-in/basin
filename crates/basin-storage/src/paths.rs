@@ -156,6 +156,50 @@ pub(crate) fn rewrite_to_cold(path: &ObjectPath) -> Option<ObjectPath> {
     None
 }
 
+/// #36 (Stage 2a, Scheme C) — recover a data file's `partition_id` from its
+/// object key, so a read can re-derive the partition's stripe bucket without
+/// any change to `DataFileRef`. This is the EXACT inverse of
+/// [`data_file_key_in_tier`]'s partition encoding: the partition is the run of
+/// segments between the tier segment (`data`/`cold`) and the trailing
+/// `yyyy/mm/dd/{ulid}.{ext}` (always exactly four segments).
+///
+/// Returns the partition string in the SAME shape the writer hashed
+/// (`PartitionKey::as_str()`, with `_default` for the empty key), so
+/// `stripe_slot(partition_id, k)` reproduces the write-time slot bit-for-bit.
+/// Returns `None` for any key that does not follow the canonical data-file
+/// layout (e.g. a sidecar, a manifest) — the caller then routes it to the
+/// primary store, never mis-striping it.
+pub(crate) fn partition_id_from_data_file_key(key: &str) -> Option<String> {
+    // Split into path segments. The canonical tail is
+    // `…/{tables}/{table}/{tier}/{partition…}/yyyy/mm/dd/{file}`.
+    let segments: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
+    // Find the LAST `tables` segment (a root prefix or project id could in
+    // principle contain the literal, so anchor on the last occurrence, which
+    // is the table-layout one; `{table}` then `{tier}` follow it).
+    let tables_idx = segments.iter().rposition(|s| *s == TABLES_SEGMENT)?;
+    // After `tables`: [table, tier, partition…, yyyy, mm, dd, file].
+    // tier is at tables_idx + 2; partition starts at tables_idx + 3.
+    let tier_idx = tables_idx + 2;
+    if tier_idx >= segments.len() {
+        return None;
+    }
+    let tier_seg = segments[tier_idx];
+    if tier_seg != Tier::Hot.segment() && tier_seg != Tier::Cold.segment() {
+        return None;
+    }
+    let part_start = tier_idx + 1;
+    // The trailing 4 segments are yyyy / mm / dd / filename. The partition is
+    // everything between `part_start` and those 4.
+    if segments.len() < part_start + 4 {
+        return None;
+    }
+    let part_end = segments.len() - 4; // exclusive: drops yyyy/mm/dd/file
+    if part_end <= part_start {
+        return None;
+    }
+    Some(segments[part_start..part_end].join("/"))
+}
+
 /// Prefix that all of one project's data lives under. Used for the safety-net
 /// invariant test.
 #[cfg(test)]
@@ -230,5 +274,65 @@ mod tests {
             let tprefix = project_prefix(None, &project);
             assert_eq!(tprefix.as_ref(), format!("projects/{project}"));
         }
+    }
+
+    /// #36 Scheme C: the partition recovered from a written key must equal the
+    /// `PartitionKey::as_str()` the writer hashed — for single- and
+    /// multi-segment partitions, the default key, and with/without a root
+    /// prefix. This is the round-trip that keeps a striped read resolving the
+    /// SAME bucket the write landed on.
+    #[test]
+    fn partition_round_trips_through_the_key() {
+        let project = ProjectId::new();
+        let table = TableName::new("orders").unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 30, 12, 0, 0).unwrap();
+
+        for (part, root) in [
+            (PartitionKey::new("region:us").unwrap(), None),
+            (
+                PartitionKey::new("year=2026/month=04").unwrap(),
+                Some(ObjectPath::from("warehouse")),
+            ),
+            (PartitionKey::default_key(), None),
+            (
+                PartitionKey::default_key(),
+                Some(ObjectPath::from("a/b/warehouse")),
+            ),
+        ] {
+            let key = data_file_key(root.as_ref(), &project, &table, &part, now, Ulid::new());
+            let recovered =
+                partition_id_from_data_file_key(key.as_ref()).expect("partition must recover");
+            assert_eq!(
+                recovered,
+                part.as_str(),
+                "recovered partition {recovered:?} must equal writer's {:?} (key {})",
+                part.as_str(),
+                key
+            );
+            // The whole point of Scheme C: same partition → same stripe slot
+            // on the read as the write computed.
+            for k in 1..=8usize {
+                assert_eq!(
+                    basin_catalog::bucket_pool::stripe_slot(&recovered, k),
+                    basin_catalog::bucket_pool::stripe_slot(part.as_str(), k),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_data_keys_return_none() {
+        // Manifest / sidecar / arbitrary keys are not stripe-routable; the
+        // extractor returns None so the caller falls back to the primary store.
+        assert_eq!(partition_id_from_data_file_key("projects/p/HEAD"), None);
+        assert_eq!(
+            partition_id_from_data_file_key("p/schema/t/parts/region:us/v00.json"),
+            None
+        );
+        // A data key whose tail is too short to hold yyyy/mm/dd/file.
+        assert_eq!(
+            partition_id_from_data_file_key("projects/p/tables/t/data/region/2026/04"),
+            None
+        );
     }
 }
