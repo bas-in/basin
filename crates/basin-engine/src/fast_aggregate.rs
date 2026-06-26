@@ -751,19 +751,34 @@ fn filter_files_in_range(
         }
         let fmin = decode_i64(cs.min_bytes.as_deref()?)?;
         let fmax = decode_i64(cs.max_bytes.as_deref()?)?;
-        // Entirely outside [lo, hi)? (hi is exclusive.)
-        let below = rb.lo.map_or(false, |lo| fmax < lo);
-        let above = rb.hi.map_or(false, |hi| fmin >= hi);
-        if below || above {
-            continue;
+        // Self-consistency: a true min/max bound always has `min <= max`. An
+        // inverted/corrupt pair (e.g. a stripe-merge that recorded a partial
+        // bound) could otherwise be mis-classified as "entirely below" AND
+        // "entirely above", or kept as in-range while its real rows fall
+        // outside — over-counting COUNT(*). When in doubt, bail to a scan.
+        if fmin > fmax {
+            return None;
         }
-        // Entirely inside?
-        let lo_ok = rb.lo.map_or(true, |lo| fmin >= lo);
-        let hi_ok = rb.hi.map_or(true, |hi| fmax < hi);
-        if lo_ok && hi_ok {
+        // Classify the file against [lo, hi) (hi exclusive). We REQUIRE a file
+        // to be unambiguously one of: entirely inside (kept), entirely outside
+        // (dropped). A file that overlaps the boundary in any way — a straddle
+        // OR a SUPERSET of the range (fmin < lo and fmax >= hi) — cannot have
+        // its in-range row count derived from metadata, so it forces a bail.
+        // We test "inside" and "outside" explicitly and bail on anything else,
+        // rather than dropping on a `below`/`above` shortcut that could fire
+        // before the overlap is ruled out.
+        let inside = rb.lo.map_or(true, |lo| fmin >= lo) && rb.hi.map_or(true, |hi| fmax < hi);
+        let outside =
+            rb.lo.map_or(false, |lo| fmax < lo) || rb.hi.map_or(false, |hi| fmin >= hi);
+        if inside {
+            // `inside` and `outside` are mutually exclusive for a valid range
+            // (lo < hi, guaranteed by parse_range_bound) and a consistent
+            // file (fmin <= fmax), so a kept file is provably all-in-range.
             kept.push(f.clone());
+        } else if outside {
+            continue;
         } else {
-            // Partial overlap — can't answer from metadata alone.
+            // Partial overlap or superset — can't answer from metadata alone.
             return None;
         }
     }
@@ -1566,6 +1581,84 @@ mod tests {
         let sc = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
         let files = vec![file_with(100, 199, 0, 100)];
         assert!(filter_files_in_range(&files, &rb(Some(100), Some(500)), &sc).is_none());
+    }
+
+    /// Regression for the dev v116 over-count: a single stripe-merged file
+    /// whose stats span the WHOLE id space (`[0, 999_999]`, row_count 1M)
+    /// STRADDLES the `id < 500_000` boundary. The fast path MUST bail (return
+    /// `None`) rather than count its full million rows as if in-range — the
+    /// true in-range count is at most 500_000, so counting 1_000_000 would be
+    /// an impossible over-count. Symmetrically for `id >= 500_000`.
+    #[test]
+    fn filter_bails_on_whole_space_straddler() {
+        let sc = id_schema();
+        let files = vec![file_with(0, 999_999, 0, 1_000_000)];
+        // `id < 500000` → lo=None, hi=500000.
+        assert!(
+            filter_files_in_range(&files, &rb(None, Some(500_000)), &sc).is_none(),
+            "a [0,999999] file straddles id<500000 and must force a bail, not be \
+             counted as fully in-range"
+        );
+        // `id >= 500000` → lo=500000, hi=None.
+        assert!(
+            filter_files_in_range(&files, &rb(Some(500_000), None), &sc).is_none(),
+            "a [0,999999] file straddles id>=500000 and must force a bail"
+        );
+    }
+
+    /// Several stripe-merged files with OVERLAPPING wide id ranges (the shape
+    /// that produced 685_000 + 695_000 = 1_380_000 on dev). Each file
+    /// individually straddles the `id < 500_000` boundary, so the fast path
+    /// MUST bail; if instead each file were classified "fully in-range" on
+    /// both sides, the two half-ranges would double-count the overlap.
+    #[test]
+    fn filter_bails_on_overlapping_wide_merged_files() {
+        let sc = id_schema();
+        // Two wide overlapping files that together hold the dense 1M set.
+        let files = vec![
+            file_with(0, 700_000, 0, 685_000),
+            file_with(300_000, 999_999, 0, 695_000),
+        ];
+        // Neither half-range can be answered from metadata: both files
+        // straddle the 500_000 boundary.
+        assert!(
+            filter_files_in_range(&files, &rb(None, Some(500_000)), &sc).is_none(),
+            "overlapping wide files straddle id<500000 — must bail"
+        );
+        assert!(
+            filter_files_in_range(&files, &rb(Some(500_000), None), &sc).is_none(),
+            "overlapping wide files straddle id>=500000 — must bail"
+        );
+    }
+
+    /// A file whose stats span is a SUPERSET of a bounded range (fmin < lo and
+    /// fmax >= hi) overlaps both boundaries; its in-range row count is unknown
+    /// from metadata, so the fast path must bail (never count its full rows).
+    #[test]
+    fn filter_bails_on_range_subset_of_file() {
+        let sc = id_schema();
+        let files = vec![file_with(0, 999_999, 0, 1_000_000)];
+        // range [200000, 700000) is a strict subset of the file's [0,999999].
+        assert!(
+            filter_files_in_range(&files, &rb(Some(200_000), Some(700_000)), &sc).is_none(),
+            "a file spanning the whole range (and beyond) must bail, not be counted in full"
+        );
+    }
+
+    /// Internally-inconsistent stats (fmin > fmax — a corrupt/partial bound)
+    /// must force a bail rather than be classified as in/out of range. Without
+    /// the consistency guard such a file could be silently dropped (under-count)
+    /// or kept (over-count).
+    #[test]
+    fn filter_bails_on_inverted_minmax() {
+        let sc = id_schema();
+        // max (100) < min (999999): an impossible bound. Must bail on every range.
+        let files = vec![file_with(999_999, 100, 0, 500_000)];
+        assert!(filter_files_in_range(&files, &rb(None, Some(500_000)), &sc).is_none());
+        assert!(filter_files_in_range(&files, &rb(Some(500_000), None), &sc).is_none());
+        assert!(
+            filter_files_in_range(&files, &rb(Some(0), Some(1_000_000)), &sc).is_none()
+        );
     }
 
     #[test]

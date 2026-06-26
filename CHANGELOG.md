@@ -8,6 +8,45 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Fix (#41): metadata range-aggregate must not over-count files that overlap the boundary or carry inconsistent/partial stats
+
+**Correctness fix for the COUNT/MIN/MAX/SUM-over-an-integer-range fast path.**
+The fast path answers `COUNT(*) … WHERE col >=/>/<=/< lit` from per-file
+`column_stats` (min/max) without scanning: a file whose `[min,max]` lies fully
+inside the range contributes its full `row_count`, a file fully outside
+contributes 0, and a file that overlaps the boundary must bail to a real scan.
+Observed on dev (1M dense rows, ids 0..999_999): `COUNT(*) WHERE id < 500000`
+returned 685_000 and `WHERE id >= 500000` returned 695_000 — summing to
+1_380_000, 380k over the true 1_000_000. Bare `COUNT(*)` and `MAX(id)` were
+correct; only the ranged-predicate fast path over-counted, after stripe-merge
+consolidated small files into wide-id-range files.
+
+Root cause is a file being counted in full on BOTH sides of the boundary — i.e.
+a boundary-overlapping or stats-inconsistent file mis-classified as
+fully-in-range instead of triggering a bail. Two hardenings, both
+exactly-correct and neither false-bailing honest data:
+
+- **`fast_aggregate::filter_files_in_range`** now classifies each file as
+  unambiguously *inside* or *outside* the half-open range and bails on anything
+  else — a straddle (overlaps one boundary) OR a **superset** (`min < lo` and
+  `max >= hi`, the range strictly inside the file). It also rejects
+  **internally-inconsistent stats** (`min > max`) rather than risk mis-classify.
+  Previously a `below`/`above` early-drop ran ahead of the overlap check.
+- **`writer::extract_column_stats`** (Parquet) now treats a column whose stats
+  are **incomplete** — any row group missing the column's statistics or null
+  count — as UNKNOWN (cleared to default) so the catalog/fast-path bails to a
+  scan instead of trusting a partial bound that can under-state the true max and
+  over-count. (Vortex stats are computed from the full in-memory batch and were
+  already complete.)
+
+Verified the **#27 chunked baseline preserves `column_stats` byte-for-byte**
+through chunk serialize → fold (new `chunked_baseline_preserves_column_stats`
+catalog test drives frozen chunks + the re-chunk valve and asserts every folded
+file's min/max/null_count round-trips exactly) — so this is **not** a #27
+regression. Regression tests cover fully-contained (counted), fully-outside (0),
+straddle (bail), range-superset (bail), inverted-stats (bail), and a
+multi-row-group Parquet file whose coalesced stats span every row group.
+
 ## Unreleased — Perf (#27): flat-scale partition baselines — chunked, content-addressed baseline so per-commit PUT bytes no longer grow with table size
 
 **Correctness-preserving perf fix.** Sustained single-table ingest decayed as

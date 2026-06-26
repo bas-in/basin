@@ -4775,6 +4775,7 @@ impl LeaseRegistry for ObjectStoreLeaseRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ColumnStats;
     use arrow_schema::{DataType, Field};
     use object_store::memory::InMemory;
     use std::sync::atomic::AtomicI64;
@@ -4792,6 +4793,32 @@ mod tests {
             size_bytes: rows * 10,
             row_count: rows,
             column_stats: Default::default(),
+            bloom_filters: Default::default(),
+            hll_sketches: Default::default(),
+            tdigest_sketches: Default::default(),
+        }
+    }
+
+    /// A file carrying per-column `id` stats (min/max as 8-byte LE i64, plus a
+    /// null count). Used to assert the #27 chunked-baseline path preserves
+    /// `column_stats` byte-for-byte through chunk serialize → fold — the
+    /// stats the metadata range-aggregate fast path classifies straddlers by.
+    fn file_with_stats(path: &str, rows: u64, id_min: i64, id_max: i64, nulls: u64) -> DataFileRef {
+        let mut cs = std::collections::BTreeMap::new();
+        cs.insert(
+            "id".to_string(),
+            ColumnStats {
+                null_count: Some(nulls),
+                min_bytes: Some(id_min.to_le_bytes().to_vec()),
+                max_bytes: Some(id_max.to_le_bytes().to_vec()),
+                sum_bytes: None,
+            },
+        );
+        DataFileRef {
+            path: path.to_string(),
+            size_bytes: rows * 10,
+            row_count: rows,
+            column_stats: cs,
             bloom_filters: Default::default(),
             hll_sketches: Default::default(),
             tdigest_sketches: Default::default(),
@@ -5975,6 +6002,90 @@ mod tests {
             .collect();
         assert_eq!(cold.len(), reference.len(), "cold fold count must match reference");
         assert_eq!(cold, reference, "cold fold path set must EXACTLY match the reference");
+    }
+
+    // COLUMN-STATS SURVIVE the chunked-baseline round-trip. The #41 metadata
+    // range-aggregate classifies a file as fully-in-range / straddling /
+    // outside purely from its per-file `column_stats` (min/max). If the #27
+    // chunked baseline (commit a5fc5082) dropped or zeroed those stats through
+    // chunk serialize → fold, a wide straddling file would mis-classify as
+    // fully-in-range and the range count would over-report. This drives enough
+    // appends + removals to force several frozen chunks AND the re-chunk valve,
+    // then asserts the cold-folded live set carries the EXACT min/max/null_count
+    // of every file — byte-for-byte.
+    #[tokio::test]
+    async fn chunked_baseline_preserves_column_stats() {
+        const K: u64 = 4;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // Small TARGET + cap so files freeze into chunks and the re-chunk valve
+        // (the O(n) full re-seal) fires within the run.
+        let c = ObjectStoreCatalog::with_chunk_config(store.clone(), K, true, 16, 8);
+        let p = ProjectId::new();
+        let t = TableName::new("statsrt").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        use std::collections::BTreeMap;
+        // path -> (row_count, id_min, id_max, null_count) reference.
+        let mut reference: BTreeMap<String, (u64, i64, i64, u64)> = BTreeMap::new();
+
+        const N: usize = 400;
+        for i in 0..N {
+            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            // Give each file a DISTINCT, wide-ish id range so a dropped/zeroed
+            // stat would be obvious (every file's stats differ).
+            let lo = (i as i64) * 1000;
+            let hi = lo + 999;
+            if i > 0 && i % 7 == 0 && reference.len() >= 4 {
+                let victims: Vec<String> = reference.keys().take(3).cloned().collect();
+                let added = file_with_stats(&format!("m{i}.parquet"), 5, lo, hi, 0);
+                c.replace_data_files_in_partition(
+                    &p, &t, "p0", exp, victims.clone(), vec![added.clone()],
+                )
+                .await
+                .unwrap();
+                for v in &victims {
+                    reference.remove(v);
+                }
+                reference.insert(added.path, (5, lo, hi, 0));
+            } else {
+                let nulls = (i % 3) as u64;
+                let added = file_with_stats(&format!("f{i}.parquet"), 10, lo, hi, nulls);
+                c.append_data_files_in_partition(&p, &t, "p0", exp, vec![added.clone()])
+                    .await
+                    .unwrap();
+                reference.insert(added.path, (10, lo, hi, nulls));
+            }
+        }
+
+        // Cold catalog (fresh instance, empty caches): fold purely from objects.
+        let fresh = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
+        let live = fresh.load_table(&p, &t).await.unwrap().live_data_files();
+        assert_eq!(live.len(), reference.len(), "cold fold file count must match");
+
+        for f in &live {
+            let (rows, lo, hi, nulls) = *reference
+                .get(&f.path)
+                .unwrap_or_else(|| panic!("unexpected file {} in cold fold", f.path));
+            assert_eq!(f.row_count, rows, "row_count drifted for {}", f.path);
+            let cs = f
+                .column_stats
+                .get("id")
+                .unwrap_or_else(|| panic!("column_stats for `id` DROPPED on {} through the chunk round-trip", f.path));
+            assert_eq!(cs.null_count, Some(nulls), "null_count drifted for {}", f.path);
+            assert_eq!(
+                cs.min_bytes,
+                Some(lo.to_le_bytes().to_vec()),
+                "min_bytes drifted for {} (straddle classification would break)",
+                f.path
+            );
+            assert_eq!(
+                cs.max_bytes,
+                Some(hi.to_le_bytes().to_vec()),
+                "max_bytes drifted for {} (straddle classification would break)",
+                f.path
+            );
+        }
     }
 
     // RE-CHUNK VALVE fires under heavy removal churn and the result is exactly

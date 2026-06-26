@@ -722,6 +722,20 @@ fn extract_column_stats(
         out.insert(f.name().clone(), ColumnStats::default());
     }
 
+    // A column whose stats are INCOMPLETE — at least one row group missing a
+    // column chunk's statistics, OR a chunk that has stats but no recorded
+    // null count — cannot yield a sound file-level min/max/null_count: the
+    // skipped rows could hold a smaller min, a LARGER max, or extra nulls.
+    // Trusting a partial bound under-states the true max (etc.), which the
+    // metadata range-aggregate fast path would then treat as a fully-in-range
+    // file and over-count. Track which columns are incomplete and reset them
+    // to "unknown" (default) at the end so the catalog/fast-path bails to a
+    // real scan rather than pruning/counting on a partial bound.
+    let mut incomplete: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let n_row_groups = meta.row_groups().len();
+    // Per-column count of row groups that contributed complete stats.
+    let mut covered: BTreeMap<String, usize> = BTreeMap::new();
+
     // Aggregate across row groups using typed comparisons. The naive
     // lexicographic merge from earlier was wrong for primitive types whose
     // byte representation isn't order-preserving (e.g. little-endian
@@ -730,13 +744,42 @@ fn extract_column_stats(
     for rg in meta.row_groups() {
         for col in rg.columns() {
             let name = col.column_descr().name().to_string();
-            let entry = out.entry(name).or_default();
-            if let Some(stats) = col.statistics() {
-                if let Some(n) = stats.null_count_opt() {
-                    entry.null_count = Some(entry.null_count.unwrap_or(0) + n);
+            let entry = out.entry(name.clone()).or_default();
+            match col.statistics() {
+                Some(stats) => {
+                    match stats.null_count_opt() {
+                        Some(n) => entry.null_count = Some(entry.null_count.unwrap_or(0) + n),
+                        // No null count for this chunk → file-level null_count
+                        // is unknowable; mark the column incomplete.
+                        None => {
+                            incomplete.insert(name.clone());
+                        }
+                    }
+                    merge_typed_stats(entry, stats);
+                    *covered.entry(name).or_default() += 1;
                 }
-                merge_typed_stats(entry, stats);
+                // This row group carries NO stats for the column: its rows are
+                // unaccounted for in the running min/max.
+                None => {
+                    incomplete.insert(name);
+                }
             }
+        }
+    }
+
+    // A column not present in EVERY row group's column set (covered < n) is
+    // also incomplete (its missing chunks could shift the bound).
+    for (name, c) in &covered {
+        if n_row_groups > 0 && *c < n_row_groups {
+            incomplete.insert(name.clone());
+        }
+    }
+
+    // Reset incomplete columns to "unknown" so consumers bail rather than
+    // trust a partial bound.
+    for name in incomplete {
+        if let Some(entry) = out.get_mut(&name) {
+            *entry = ColumnStats::default();
         }
     }
     Ok(out)
@@ -1330,6 +1373,50 @@ mod tests {
             .unwrap()
             .values()
             .to_vec()
+    }
+
+    /// File-level min/max must span EVERY row group. A multi-row-group Parquet
+    /// file whose stats only reflected the first row group would UNDER-state the
+    /// max — and the metadata range-aggregate fast path, trusting that bound,
+    /// would classify a wide straddling file as fully-in-range and over-count.
+    /// Force several row groups (small `max_row_group_size`) over a dense
+    /// 0..9999 id span and assert the coalesced stats recover the true [0,9999].
+    #[test]
+    fn parquet_stats_span_all_row_groups() {
+        let n = 10_000i64;
+        let id_vals: Vec<i64> = (0..n).collect();
+        let names: Vec<&str> = vec!["x"; n as usize];
+        let b = batch(&id_vals, &names);
+        let opts = WriteOptions {
+            file_format: FileFormat::Parquet,
+            // 1000 rows/group → 10 row groups; the first group covers ids 0..999
+            // only, so a first-group-only bug would record max=999.
+            max_row_group_size: Some(1000),
+            ..Default::default()
+        };
+        let bytes = encode_parquet(&b, &opts).unwrap();
+        // More than one row group must actually have been produced.
+        {
+            use parquet::file::reader::{FileReader, SerializedFileReader};
+            let r = SerializedFileReader::new(Bytes::copy_from_slice(&bytes)).unwrap();
+            assert!(
+                r.metadata().num_row_groups() > 1,
+                "test must produce multiple row groups to exercise cross-RG coalescing"
+            );
+        }
+        let stats = extract_column_stats(&bytes, &b).unwrap();
+        let id = stats.get("id").expect("id stats present");
+        assert_eq!(
+            decode_le_i64(id.min_bytes.as_deref().unwrap()),
+            Some(0),
+            "file-level min must be the global min across all row groups"
+        );
+        assert_eq!(
+            decode_le_i64(id.max_bytes.as_deref().unwrap()),
+            Some(n - 1),
+            "file-level max must be the global max across all row groups (not just the first)"
+        );
+        assert_eq!(id.null_count, Some(0));
     }
 
     #[test]
