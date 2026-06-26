@@ -4180,33 +4180,420 @@ fn decode_stats_i64(b: &[u8]) -> Option<i64> {
     Some(i64::from_le_bytes(arr))
 }
 
-/// General per-file min/max prune for an integer-range `WHERE` predicate.
+/// A selective single-column predicate the min/max + bloom file prune can
+/// reason about. Recognised from the query `WHERE` clause by
+/// [`recognise_selective_predicate`]; each variant carries everything the
+/// per-file keep decision needs.
+///
+/// Correctness contract for the variants (all dispatch through
+/// [`file_survives_selective`], DataFusion re-applies the full predicate over
+/// the survivors, so KEEP is always safe and only DROP must be proven):
+/// * `IntRange` / `StrRange` — drop iff the file's `[min,max]` lies entirely
+///   outside the (half-open, for ints) range.
+/// * `IntEq` / `StrEq` — drop iff `lit` is strictly outside `[min,max]`, OR a
+///   per-column bloom reports a *definite negative*. A bloom "maybe" keeps.
+/// * `IntIn` / `StrIn` — keep iff ANY listed value could be present (the union
+///   of the per-value Eq decisions); drop only when EVERY value is provably
+///   absent from the file.
+enum SelectivePredicate {
+    /// Existing Int64 half-open range `[lo, hi)` (at least one bound set).
+    IntRange { column: String, rb: crate::fast_aggregate::RangeBound },
+    /// `col = <int>` on an Int64 column.
+    IntEq { column: String, lit: i64 },
+    /// `col IN (<int>, ...)` on an Int64 column (non-empty, deduped).
+    IntIn { column: String, lits: Vec<i64> },
+    /// Lexicographic string range; each bound is `(value_bytes, inclusive)`.
+    StrRange {
+        column: String,
+        lo: Option<(Vec<u8>, bool)>,
+        hi: Option<(Vec<u8>, bool)>,
+    },
+    /// `col = '<str>'` on a Utf8 column.
+    StrEq { column: String, lit: Vec<u8> },
+    /// `col IN ('<str>', ...)` on a Utf8 column (non-empty).
+    StrIn { column: String, lits: Vec<Vec<u8>> },
+}
+
+impl SelectivePredicate {
+    fn column(&self) -> &str {
+        match self {
+            SelectivePredicate::IntRange { column, .. }
+            | SelectivePredicate::IntEq { column, .. }
+            | SelectivePredicate::IntIn { column, .. }
+            | SelectivePredicate::StrRange { column, .. }
+            | SelectivePredicate::StrEq { column, .. }
+            | SelectivePredicate::StrIn { column, .. } => column,
+        }
+    }
+
+    /// The Arrow type this predicate variant requires the predicate column to
+    /// have. A mismatch with the catalog schema makes the whole prune a no-op
+    /// (the stats byte-encoding contract is type-specific).
+    fn required_type(&self) -> arrow_schema::DataType {
+        match self {
+            SelectivePredicate::IntRange { .. }
+            | SelectivePredicate::IntEq { .. }
+            | SelectivePredicate::IntIn { .. } => arrow_schema::DataType::Int64,
+            SelectivePredicate::StrRange { .. }
+            | SelectivePredicate::StrEq { .. }
+            | SelectivePredicate::StrIn { .. } => arrow_schema::DataType::Utf8,
+        }
+    }
+}
+
+/// A bare single-identifier column name from a sqlparser `Expr`, else `None`.
+fn ident_column(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Identifier(id) => Some(id.value.clone()),
+        Expr::Nested(inner) => ident_column(inner),
+        _ => None,
+    }
+}
+
+/// A signed integer literal from a sqlparser `Expr` (mirrors
+/// `fast_aggregate::int_literal`'s accepted grammar), else `None`.
+fn expr_int_literal(e: &Expr) -> Option<i64> {
+    use sqlparser::ast::UnaryOperator;
+    match e {
+        Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => s.parse::<i64>().ok(),
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
+            expr_int_literal(expr).and_then(|v| v.checked_neg())
+        }
+        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => expr_int_literal(expr),
+        Expr::Nested(inner) => expr_int_literal(inner),
+        _ => None,
+    }
+}
+
+/// A single-quoted string literal's bytes from a sqlparser `Expr`, else
+/// `None`. Only the plain `'...'` form is accepted; typed/national/escaped
+/// string forms fall through (so the prune declines rather than guess an
+/// encoding that might not match the stored UTF-8 stat bytes).
+fn expr_str_literal(e: &Expr) -> Option<Vec<u8>> {
+    match e {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
+            Some(s.clone().into_bytes())
+        }
+        Expr::Nested(inner) => expr_str_literal(inner),
+        _ => None,
+    }
+}
+
+/// Recognise a selective single-column predicate from a `WHERE` expression.
+///
+/// Tries, in order:
+/// 1. The existing conservative Int64 half-open range grammar
+///    (`fast_aggregate::parse_range_bound`).
+/// 2. A single equality `col = <int>` / `col = '<str>'`.
+/// 3. A single `col IN (...)` of all-int or all-string literals.
+/// 4. A single string comparison `col </<=/>/>= '<str>'`, optionally a
+///    two-sided AND-conjunction of them on ONE column.
+///
+/// Returns `None` (→ full scan) on anything outside these shapes. The
+/// recogniser is deliberately conservative: a shape it can't prove it
+/// understands is never pruned on.
+fn recognise_selective_predicate(where_expr: &Expr) -> Option<SelectivePredicate> {
+    // 1. Int64 half-open range (existing grammar). An unbounded-both-sides
+    //    range can't drop anything, so the caller's `lo|hi` check still applies.
+    if let Some(rb) = crate::fast_aggregate::parse_range_bound(where_expr) {
+        if rb.lo.is_some() || rb.hi.is_some() {
+            return Some(SelectivePredicate::IntRange { column: rb.column.clone(), rb });
+        }
+    }
+
+    // 2/3/4 operate on a single (possibly nested) leaf predicate, or — for the
+    // string range only — an AND-conjunction on one column.
+    match unwrap_nested(where_expr) {
+        // Equality: `col = lit` or `lit = col`.
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            let (col, lit_expr) = match (ident_column(left), ident_column(right)) {
+                (Some(c), None) => (c, right.as_ref()),
+                (None, Some(c)) => (c, left.as_ref()),
+                _ => return None,
+            };
+            if let Some(v) = expr_int_literal(lit_expr) {
+                return Some(SelectivePredicate::IntEq { column: col, lit: v });
+            }
+            if let Some(s) = expr_str_literal(lit_expr) {
+                return Some(SelectivePredicate::StrEq { column: col, lit: s });
+            }
+            None
+        }
+        // `col IN (a, b, ...)` — reject `NOT IN` and subquery forms.
+        Expr::InList { expr, list, negated: false } => {
+            let col = ident_column(expr)?;
+            if list.is_empty() {
+                return None;
+            }
+            // All-int, else all-string, else decline.
+            let ints: Option<Vec<i64>> = list.iter().map(expr_int_literal).collect();
+            if let Some(mut lits) = ints {
+                lits.sort_unstable();
+                lits.dedup();
+                return Some(SelectivePredicate::IntIn { column: col, lits });
+            }
+            let strs: Option<Vec<Vec<u8>>> = list.iter().map(expr_str_literal).collect();
+            if let Some(lits) = strs {
+                return Some(SelectivePredicate::StrIn { column: col, lits });
+            }
+            None
+        }
+        // String range — a single comparison or an AND-conjunction on one col.
+        other => {
+            let mut acc = StrRangeAcc::default();
+            collect_str_range(other, &mut acc).ok()?;
+            let column = acc.column?;
+            if acc.lo.is_none() && acc.hi.is_none() {
+                return None;
+            }
+            Some(SelectivePredicate::StrRange { column, lo: acc.lo, hi: acc.hi })
+        }
+    }
+}
+
+/// Strip transparent `Nested` (parenthesisation) wrappers.
+fn unwrap_nested(e: &Expr) -> &Expr {
+    match e {
+        Expr::Nested(inner) => unwrap_nested(inner),
+        other => other,
+    }
+}
+
+#[derive(Default)]
+struct StrRangeAcc {
+    column: Option<String>,
+    /// Lower bound: `(value_bytes, inclusive)`.
+    lo: Option<(Vec<u8>, bool)>,
+    /// Upper bound: `(value_bytes, inclusive)`.
+    hi: Option<(Vec<u8>, bool)>,
+}
+
+/// Walk an AND-tree of string comparisons on a single column, tightening the
+/// lexicographic bounds. `Err(())` the instant it meets anything outside the
+/// accepted grammar (a different column, a non-`AND` connective, a non-string
+/// literal, an unsupported operator, equality).
+fn collect_str_range(expr: &Expr, acc: &mut StrRangeAcc) -> Result<(), ()> {
+    let expr = unwrap_nested(expr);
+    if let Expr::BinaryOp { left, op: BinaryOperator::And, right } = expr {
+        collect_str_range(left, acc)?;
+        collect_str_range(right, acc)?;
+        return Ok(());
+    }
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return Err(());
+    };
+    // Normalise to `col OP value`, flipping the operator sense if `value OP col`.
+    let (col, val, flipped) = match (ident_column(left), expr_str_literal(right)) {
+        (Some(c), Some(v)) => (c, v, false),
+        _ => match (expr_str_literal(left), ident_column(right)) {
+            (Some(v), Some(c)) => (c, v, true),
+            _ => return Err(()),
+        },
+    };
+    match &acc.column {
+        Some(existing) if existing != &col => return Err(()),
+        Some(_) => {}
+        None => acc.column = Some(col),
+    }
+    use sqlparser::ast::BinaryOperator as Op;
+    // Effective operator after a possible operand flip (`'x' < col` ≡ `col > 'x'`).
+    let eff = match (op, flipped) {
+        (Op::Gt, false) | (Op::Lt, true) => Op::Gt,
+        (Op::GtEq, false) | (Op::LtEq, true) => Op::GtEq,
+        (Op::Lt, false) | (Op::Gt, true) => Op::Lt,
+        (Op::LtEq, false) | (Op::GtEq, true) => Op::LtEq,
+        _ => return Err(()), // Eq / NotEq / anything else
+    };
+    match eff {
+        Op::Gt => tighten_str_lo(acc, val, false),
+        Op::GtEq => tighten_str_lo(acc, val, true),
+        Op::Lt => tighten_str_hi(acc, val, false),
+        Op::LtEq => tighten_str_hi(acc, val, true),
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+fn tighten_str_lo(acc: &mut StrRangeAcc, v: Vec<u8>, inclusive: bool) {
+    acc.lo = Some(match acc.lo.take() {
+        // A higher lower bound is tighter; on a tie the exclusive one is tighter.
+        Some((cur, cur_incl)) if cur > v || (cur == v && !cur_incl) => (cur, cur_incl),
+        _ => (v, inclusive),
+    });
+}
+
+fn tighten_str_hi(acc: &mut StrRangeAcc, v: Vec<u8>, inclusive: bool) {
+    acc.hi = Some(match acc.hi.take() {
+        // A lower upper bound is tighter; on a tie the exclusive one is tighter.
+        Some((cur, cur_incl)) if cur < v || (cur == v && !cur_incl) => (cur, cur_incl),
+        _ => (v, inclusive),
+    });
+}
+
+/// Probe a per-file column bloom for a *definite negative* on `needle`.
+///
+/// Returns `true` ONLY when the bloom is present, well-formed, and reports the
+/// needle as DEFINITELY NOT present (`contains == false`). A bloom "maybe"
+/// (`contains == true`, possibly a false positive), an absent bloom, or a
+/// malformed blob all return `false` → KEEP the file. This is the only place a
+/// bloom may cause a DROP, and it does so only on a proven absence.
+///
+/// `needle` is the exact byte sequence the writer's `compute_bloom_filters`
+/// inserted: `i64::to_le_bytes` for Int64, the raw UTF-8 bytes for Utf8.
+fn bloom_definite_negative(f: &DataFileRef, column: &str, needle: &[u8]) -> bool {
+    match f.bloom_filters.get(column) {
+        Some(bytes) => match basin_storage::bloom_from_bytes(bytes) {
+            // `contains == false` is the bloom's only sound assertion.
+            Some(filter) => !filter.contains(needle),
+            None => false, // malformed → cannot prove absence → keep
+        },
+        None => false, // no bloom → cannot prove absence → keep
+    }
+}
+
+/// Decide whether a single Int64-equality `lit` could be present in `f`:
+/// `false` (drop) iff `lit` is strictly outside the file's `[min,max]`, OR a
+/// per-column bloom proves it absent. Missing/short stats → KEEP.
+fn int_eq_could_be_present(f: &DataFileRef, column: &str, lit: i64) -> bool {
+    if let Some(cs) = f.column_stats.get(column) {
+        if let (Some(fmin), Some(fmax)) = (
+            cs.min_bytes.as_deref().and_then(decode_stats_i64),
+            cs.max_bytes.as_deref().and_then(decode_stats_i64),
+        ) {
+            if fmin <= fmax && (lit < fmin || lit > fmax) {
+                return false; // provably outside the zone map
+            }
+        }
+    }
+    // Inside the zone map (or stats unknown): a definite-negative bloom can
+    // still prove absence.
+    !bloom_definite_negative(f, column, &lit.to_le_bytes())
+}
+
+/// String analogue of [`int_eq_could_be_present`] using lexicographic
+/// (byte-wise) min/max — the same ordering SQL uses for `text` and the
+/// ordering the writer's `ByteArray` stat merge preserves.
+fn str_eq_could_be_present(f: &DataFileRef, column: &str, lit: &[u8]) -> bool {
+    if let Some(cs) = f.column_stats.get(column) {
+        if let (Some(fmin), Some(fmax)) =
+            (cs.min_bytes.as_deref(), cs.max_bytes.as_deref())
+        {
+            if fmin <= fmax && (lit < fmin || lit > fmax) {
+                return false;
+            }
+        }
+    }
+    !bloom_definite_negative(f, column, lit)
+}
+
+/// Per-file keep decision for a recognised [`SelectivePredicate`].
+///
+/// Returns `true` to KEEP the file in the scan set. Every `false` (DROP) is
+/// proven: no file that could contain a matching row is ever dropped.
+/// DataFusion re-applies the full predicate over the survivors, so a kept
+/// partial-overlap file still yields exact rows.
+fn file_survives_selective(f: &DataFileRef, pred: &SelectivePredicate) -> bool {
+    match pred {
+        SelectivePredicate::IntRange { column, rb } => {
+            match f.column_stats.get(column) {
+                Some(cs) => match (
+                    cs.min_bytes.as_deref().and_then(decode_stats_i64),
+                    cs.max_bytes.as_deref().and_then(decode_stats_i64),
+                ) {
+                    (Some(fmin), Some(fmax)) if fmin <= fmax => {
+                        let below = rb.lo.is_some_and(|lo| fmax < lo);
+                        let above = rb.hi.is_some_and(|hi| fmin >= hi);
+                        !(below || above)
+                    }
+                    _ => true, // missing / short / inverted → keep
+                },
+                None => true,
+            }
+        }
+        SelectivePredicate::IntEq { column, lit } => {
+            int_eq_could_be_present(f, column, *lit)
+        }
+        SelectivePredicate::IntIn { column, lits } => {
+            // Keep iff ANY value could be present.
+            lits.iter().any(|v| int_eq_could_be_present(f, column, *v))
+        }
+        SelectivePredicate::StrEq { column, lit } => {
+            str_eq_could_be_present(f, column, lit)
+        }
+        SelectivePredicate::StrIn { column, lits } => {
+            lits.iter().any(|v| str_eq_could_be_present(f, column, v))
+        }
+        SelectivePredicate::StrRange { column, lo, hi } => {
+            match f.column_stats.get(column) {
+                Some(cs) => match (cs.min_bytes.as_deref(), cs.max_bytes.as_deref()) {
+                    (Some(fmin), Some(fmax)) if fmin <= fmax => {
+                        // Drop iff the file's [fmin,fmax] is entirely below the
+                        // lower bound or entirely above the upper bound.
+                        //   below: fmax < lo            (exclusive-lo: fmax <= lo)
+                        //   above: fmin > hi            (exclusive-hi: fmin >= hi)
+                        let below = lo.as_ref().is_some_and(|(lv, incl)| {
+                            if *incl { fmax < lv.as_slice() } else { fmax <= lv.as_slice() }
+                        });
+                        let above = hi.as_ref().is_some_and(|(hv, incl)| {
+                            if *incl { fmin > hv.as_slice() } else { fmin >= hv.as_slice() }
+                        });
+                        !(below || above)
+                    }
+                    _ => true,
+                },
+                None => true,
+            }
+        }
+    }
+}
+
+/// General per-file min/max + bloom prune for a selective `WHERE` predicate.
 ///
 /// Complements [`apply_partition_pruning_for_query`] (which only handles
 /// `PARTITION BY RANGE` tables by Hive path segments): this prunes ANY table
-/// whose live data files carry catalog `column_stats` (min/max) for the
-/// predicate column, regardless of partitioning. For a query reducible to a
-/// half-open integer range `[lo, hi)` on a single `Int64` column (the
-/// `fast_aggregate::parse_range_bound` grammar — an AND-conjunction of
-/// `col </<=/>/>=  <int>` on one column), every live file whose
-/// `[min, max]` provably lies ENTIRELY OUTSIDE `[lo, hi)` is dropped from the
-/// scan set and the table is re-registered with only the survivors — so the
-/// object store never issues a footer GET or a data GET for a pruned file.
+/// whose live data files carry catalog `column_stats` (min/max) — or, for the
+/// equality path, per-column `bloom_filters` — for the predicate column,
+/// regardless of partitioning. Every live file whose stats/bloom PROVE it
+/// cannot contain a matching row is dropped from the scan set and the table is
+/// re-registered with only the survivors — so the object store never issues a
+/// footer GET or a data GET for a pruned file.
+///
+/// ## Recognised predicate shapes (single bare column, dispatched by type)
+/// * **Int64 half-open range** `col </<=/>/>= <int>` (AND-conjunctions on one
+///   column; the `fast_aggregate::parse_range_bound` grammar). Drop iff the
+///   file's `[min,max]` lies entirely outside `[lo, hi)`.
+/// * **Int64 / Utf8 equality** `col = <lit>`. Drop iff `lit` is strictly
+///   outside `[min,max]`, OR the file carries a `bloom_filter` for `col` whose
+///   probe is a DEFINITE NEGATIVE (`contains == false`).
+/// * **Int64 / Utf8 `IN (...)`** — keep iff ANY listed value could be present
+///   (per-value union of the equality decision); drop only when EVERY value is
+///   provably absent.
+/// * **Utf8 (lexicographic) range** `col </<=/>/>= '<str>'`. Drop iff the
+///   file's `[min,max]` lies entirely outside the (inclusive-aware) bounds.
+///
+/// Strings use the byte-wise (lexicographic) ordering SQL uses for `text` and
+/// the ordering the writer's `ByteArray` stat merge preserves. Temporal
+/// columns (`Date32`/`Timestamp`) are NOT pruned here: their catalog stat
+/// encoding is not a stable, mergeable contract the prune can rely on, so they
+/// fall through to a full scan (correctness over aggressiveness).
 ///
 /// ## Correctness (only provably-non-matching files are dropped)
-/// A file is dropped iff `file_max < lo` (every value strictly below the
-/// inclusive lower bound) OR `file_min >= hi` (every value at/above the
-/// exclusive upper bound). Either condition means no row in the file can
-/// satisfy the predicate:
-/// * The min/max are over the column's NON-NULL values; a NULL never
-///   satisfies a range comparison, so a file with `file_max < lo` (or
-///   `file_min >= hi`) has zero matching rows whether or not it holds NULLs —
-///   we therefore do NOT require a zero null-count (unlike the
-///   exact-row-count fast aggregate, which does).
+/// Every DROP is proven; KEEP is always sound because DataFusion re-applies the
+/// full predicate over the survivors. In particular:
+/// * The min/max are over the column's NON-NULL values; a NULL never satisfies
+///   a `=`/range comparison, so a file provably outside the predicate has zero
+///   matching rows whether or not it holds NULLs — we do NOT require a zero
+///   null-count (unlike the exact-row-count fast aggregate, which does).
+/// * **Bloom is probabilistic and may PRUNE only on a definite-negative.** A
+///   bloom "maybe" (`contains == true`, possibly a false positive), an absent
+///   bloom, or a malformed blob all KEEP the file. A false-positive bloom
+///   therefore costs an extra (correct, possibly-empty) file read, never a
+///   wrong answer. See [`bloom_definite_negative`].
 /// * A file with missing stats, a missing/short min or max blob, or an
 ///   inverted `min > max` pair is KEPT (conservative) — never dropped.
-/// * If the predicate column is absent from the schema or is not `Int64`,
-///   the whole pass is a no-op (full scan).
+/// * If the predicate column is absent from the schema, or its Arrow type does
+///   not match the recognised predicate's expected type (Int64 / Utf8), the
+///   whole pass is a no-op (full scan).
 ///
 /// ## Live-overlay gate
 /// Declines (no-op → full scan) whenever the table has a live hot-tier
@@ -4254,21 +4641,19 @@ pub(crate) async fn apply_minmax_file_pruning_for_query(
     let Some(where_expr) = select.selection.as_ref() else {
         return Ok(()); // no WHERE → nothing to prune on
     };
-    // Reuse the conservative integer-range grammar from the metadata-aggregate
-    // recogniser. Returns None on anything outside `col </<=/>/>= <int>`
-    // AND-conjunctions on a single column.
-    let Some(rb) = crate::fast_aggregate::parse_range_bound(where_expr) else {
+    // Recognise a selective single-column predicate: an Int64 half-open range
+    // (the original shape), an Int64/Utf8 equality, an Int64/Utf8 `IN (...)`,
+    // or a lexicographic string range. Anything else → full scan.
+    let Some(pred) = recognise_selective_predicate(where_expr) else {
         return Ok(());
     };
-    // An unbounded-both-sides range can't drop anything.
-    if rb.lo.is_none() && rb.hi.is_none() {
-        return Ok(());
-    }
 
     let Ok(table) = TableName::new(refs[0].clone()) else {
         return Ok(());
     };
-    // Live overlay → decline (see doc comment).
+    // Live overlay → decline (see doc comment). A fast-path UPDATE can change a
+    // value past stale cold stats / out of a cold bloom; the overlay-aware
+    // provider needs the cold base row to merge against.
     if table_has_live_overlay(engine, project, &table) {
         return Ok(());
     }
@@ -4276,14 +4661,16 @@ pub(crate) async fn apply_minmax_file_pruning_for_query(
         Ok(m) => m,
         Err(_) => return Ok(()),
     };
-    // Predicate column must exist and be Int64 (the only type the integer-range
-    // grammar + min/max byte contract covers here).
+    // Predicate column must exist AND have the exact Arrow type the variant's
+    // stats/bloom byte contract covers (Int64 little-endian, or Utf8 raw
+    // bytes). A mismatch makes the whole pass a no-op (full scan).
     let df_schema = match schema_ws_to_df(meta.schema.as_ref()) {
         Ok(s) => s,
         Err(_) => return Ok(()),
     };
-    match df_schema.fields().iter().find(|f| f.name() == &rb.column) {
-        Some(f) if *f.data_type() == arrow_schema::DataType::Int64 => {}
+    let want_ty = pred.required_type();
+    match df_schema.fields().iter().find(|f| f.name() == pred.column()) {
+        Some(f) if *f.data_type() == want_ty => {}
         _ => return Ok(()),
     }
 
@@ -4293,38 +4680,29 @@ pub(crate) async fn apply_minmax_file_pruning_for_query(
     }
     let mut survivors: Vec<String> = Vec::with_capacity(files.len());
     for f in &files {
-        // Decode this file's min/max for the predicate column. Any missing /
-        // short / inconsistent stat means "unknown" → KEEP the file.
-        let keep = match f.column_stats.get(&rb.column) {
-            Some(cs) => match (
-                cs.min_bytes.as_deref().and_then(decode_stats_i64),
-                cs.max_bytes.as_deref().and_then(decode_stats_i64),
-            ) {
-                (Some(fmin), Some(fmax)) if fmin <= fmax => {
-                    // Drop iff provably entirely outside [lo, hi):
-                    //   file all below lo  → fmax < lo
-                    //   file all at/above hi → fmin >= hi
-                    let below = rb.lo.is_some_and(|lo| fmax < lo);
-                    let above = rb.hi.is_some_and(|hi| fmin >= hi);
-                    !(below || above)
-                }
-                // Missing / short / inverted stats: conservative keep.
-                _ => true,
-            },
-            None => true,
-        };
-        if keep {
+        // KEEP unless this file is PROVABLY non-matching (min/max zone map or a
+        // definite-negative bloom). DataFusion re-applies the full predicate
+        // over survivors, so a kept partial-overlap file still returns exactly
+        // the matching rows.
+        if file_survives_selective(f, &pred) {
             survivors.push(f.path.clone());
         }
     }
 
     // Nothing pruned (every file is a candidate) → leave the existing
-    // registration untouched. All files pruned would be a correct empty result,
-    // but registering a zero-file ListingTable is finicky across DataFusion
-    // versions, so when EVERYTHING is dropped we keep a single survivor's path
-    // out and let DataFusion's own predicate evaluation return the empty set —
-    // i.e. we only re-register when we strictly narrowed AND kept >= 1 file.
-    if survivors.len() == files.len() || survivors.is_empty() {
+    // registration untouched.
+    if survivors.len() == files.len() {
+        return Ok(());
+    }
+
+    // EVERY file is provably non-matching → the correct answer is the empty
+    // set. Register an empty in-memory table (zero batches, correct schema) so
+    // DataFusion reads NOTHING from the object store. This is the common,
+    // high-value case for a selective equality on an out-of-domain literal
+    // (e.g. `WHERE id = <absent>`): without it we would fall back to a full
+    // scan of every file only to filter them all out.
+    if survivors.is_empty() {
+        let _ = register_empty_table(ctx, &table, &meta.schema);
         return Ok(());
     }
 
@@ -4338,6 +4716,30 @@ pub(crate) async fn apply_minmax_file_pruning_for_query(
         meta.global_sort_order.as_deref(),
     )
     .await;
+    Ok(())
+}
+
+/// Re-register `table` as an EMPTY `MemTable` (zero rows, the table's exact
+/// schema). Used by the selective prune when every live file is proven
+/// non-matching: the query's correct result is the empty set, and an empty
+/// in-memory provider serves it with ZERO object-store GETs.
+///
+/// Correctness: the schema is the catalog schema, so column order / types /
+/// nullability match what every other read path produces for this table; an
+/// empty batch set is the exact result DataFusion would compute after applying
+/// the predicate to a (provably non-matching) full scan.
+fn register_empty_table(
+    ctx: &SessionContext,
+    table: &TableName,
+    schema: &arrow_schema::Schema,
+) -> Result<()> {
+    let df_schema = Arc::new(schema_ws_to_df(schema)?);
+    let provider = MemTable::try_new(df_schema, vec![vec![]])
+        .map_err(|e| BasinError::internal(format!("empty MemTable::try_new (pruned): {e}")))?;
+    let tref = TableReference::Bare { table: table.as_str().into() };
+    let _ = ctx.deregister_table(tref.clone());
+    ctx.register_table(tref, Arc::new(provider))
+        .map_err(|e| BasinError::internal(format!("register_table empty (pruned): {e}")))?;
     Ok(())
 }
 

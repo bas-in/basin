@@ -8,6 +8,43 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Perf: catalog file pruning extended to equality, `IN`, string ranges, and bloom definite-negatives
+
+**The catalog-level file prune that already drops data files for an Int64-range
+`WHERE` (so a selective analytic scan never GETs a provably non-matching file)
+now covers the other common selective filters too.** On the DataFusion read
+path (`apply_minmax_file_pruning_for_query`), a single bare-column predicate of
+any of these shapes is reduced to the minimal file set before any object-store
+GET; DataFusion still re-applies the full predicate over the survivors, so the
+result is always exact and pruning is a pure GET-saving:
+
+- **Equality** `col = lit` (Int64 or text) — a file is dropped iff `lit` is
+  strictly outside its `[min,max]` zone map, OR the file carries a per-column
+  **bloom filter** whose probe is a *definite negative*. The bloom is
+  probabilistic, so it may prune **only** on a proven absence; a bloom "maybe",
+  an absent bloom, or a malformed blob always KEEPS the file (a false positive
+  costs an extra, correct, possibly-empty read — never a wrong answer). This
+  catches the in-range-but-absent case the zone map alone cannot.
+- **`col IN (a, b, …)`** (Int64 or text) — a file is kept iff ANY listed value
+  could be present (per-value union of the equality decision); dropped only when
+  every value is provably absent.
+- **String / `text` ranges** `col >=/>/<=/< 'lit'` (and string equality) — use
+  the lexicographic (byte-wise) `min/max` the writer records for `text`
+  columns, the same ordering SQL uses.
+- **All-files-pruned** (e.g. an out-of-domain `WHERE id = <absent>`) now serves
+  the empty result from an in-memory provider with **zero** GETs, instead of
+  falling back to a full scan that filters everything out.
+
+Correctness is conservative throughout: only provably-non-matching files are
+dropped; missing / short / inconsistent stats, a type mismatch, or a live
+hot-tier UPDATE/DELETE overlay all decline to a full scan. Honours the existing
+`BASIN_DISABLE_MINMAX_PRUNE=1` opt-out. Temporal columns (`Date`/`Timestamp`)
+are intentionally not pruned here (their catalog stat encoding is not a stable
+prune contract across the storage formats). New test card
+`viability_minmax_eq_bloom_pruning` covers each shape, including the bloom
+definite-negative prune, a bloom non-negative keep with an exact result, and a
+no-over-prune check.
+
 ## Unreleased — Perf: bounded-staleness metadata-read snapshot cuts `count(*)`/`max` latency under heavy concurrent ingest
 
 **A metadata read (`count(*)`, `min`/`max`, any `load_table`) issued while a
