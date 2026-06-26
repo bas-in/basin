@@ -8,19 +8,34 @@ USAGE
   basin [global flags] <command> [args]
 
 GLOBAL FLAGS
-  --api-url=<url>    Override the API endpoint (default https://api.basin.run).
-  --token=<pat>      Use this PAT instead of the on-disk config.
-  --org=<slug>       Use the per-org token from the config file.
-  --json             Emit machine-readable JSON.
-  -q, --quiet        Suppress non-essential output.
-  --no-color         Disable ANSI colour in tables.
-  -h, --help         Show this help.
+  --api-url=<url>        Override the API endpoint (default https://api.basin.run).
+  --token=<pat>          Use this PAT instead of the on-disk config.
+  --org=<slug>           Use the per-org token from the config file.
+  --engine               Target a self-hosted OSS engine instead of basin.run cloud.
+  --admin-token=<jwt>    Admin JWT (is_admin:true) for engine-direct mode.
+  --json                 Emit machine-readable JSON.
+  -q, --quiet            Suppress non-essential output.
+  --no-color             Disable ANSI colour in tables.
+  -h, --help             Show this help.
 
 ENVIRONMENT
-  BASIN_TOKEN        Same as --token.
-  BASIN_API          Same as --api-url.
-  XDG_CONFIG_HOME    Where to look for config.json (default ~/.config).
-  NO_COLOR           Disable ANSI colour (any non-empty value).
+  BASIN_TOKEN            Same as --token.
+  BASIN_API              Same as --api-url.
+  BASIN_MODE=engine      Same as --engine (route to self-hosted OSS engine).
+  BASIN_ADMIN_TOKEN      Same as --admin-token (is_admin:true JWT for /admin/v1/* routes).
+  XDG_CONFIG_HOME        Where to look for config.json (default ~/.config).
+  NO_COLOR               Disable ANSI colour (any non-empty value).
+
+SELF-HOSTED OSS ENGINE
+  Point the CLI at a self-hosted basin-server and set engine mode:
+    export BASIN_API=http://localhost:3000
+    export BASIN_MODE=engine
+    export BASIN_ADMIN_TOKEN=<jwt-with-is_admin-true>
+  The following commands then target the engine admin API directly:
+    snapshots create / snapshots restore   → /admin/v1/projects/:id/snapshot|restore
+    restore --snapshot / --as-of           → /admin/v1/projects/:id/restore
+    branches create --dst-project=<ulid>   → /admin/v1/projects/:id/fork
+  All other commands continue to target the cloud control plane.
 
 COMMANDS
   login              Sign in by pasting a personal access token.
