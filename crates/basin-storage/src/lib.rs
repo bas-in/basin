@@ -1372,6 +1372,55 @@ impl Storage {
         self.project_object_store(project)
     }
 
+    /// #36 (Stage 2a) — route ONE partition's DATA files to its assigned
+    /// stripe bucket. The CLEAN SEAM for partition→bucket striping: the writer
+    /// and the per-partition reader call this with the partition id; the bucket
+    /// is `stripe[fnv1a(partition_id) % k]`, resolved deterministically from
+    /// the project's warmed stripe assignment.
+    ///
+    /// No-op equivalence: when no pool is attached, the flag is OFF, the
+    /// project's stripe width is 1, or the stripe isn't warmed, this returns
+    /// exactly [`project_object_store`] — byte-identical single-bucket routing.
+    /// A non-default route only happens when striping is ON *and* the project
+    /// has a multi-bucket stripe warmed in the pool's cache.
+    ///
+    /// BYO overrides still win (a BYO project is never pool-striped) — checked
+    /// first, exactly as in [`project_object_store`].
+    pub fn partition_object_store(
+        &self,
+        project: &ProjectId,
+        partition_id: &str,
+    ) -> Arc<dyn ObjectStore> {
+        // BYO override takes precedence over any pool routing.
+        let byo = {
+            let map = self
+                .inner
+                .byo_object_stores
+                .lock()
+                .expect("byo_object_stores poisoned");
+            map.get(project).cloned()
+        };
+        let backing = byo.or_else(|| {
+            self.inner
+                .bucket_pool
+                .get()
+                .and_then(|p| p.store_for_partition(project, partition_id))
+        });
+        let Some(backing) = backing else {
+            // No striped route → identical to the per-project routing.
+            return self.project_object_store(project);
+        };
+        let sem = self.project_semaphore(project);
+        let counters = self.project_counters(project);
+        Arc::new(concurrency::ProjectScopedStore::new(
+            backing,
+            sem,
+            self.inner.scheduler.clone(),
+            *project,
+            counters,
+        ))
+    }
+
     pub(crate) fn parquet_meta_cache(&self) -> &Arc<metadata_cache::ParquetMetaCache> {
         &self.inner.parquet_meta_cache
     }

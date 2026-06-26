@@ -69,11 +69,68 @@ pub struct BucketRegistryEntry {
 /// write (when the pool flag is ON) and re-read thereafter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketAssignment {
-    /// The registry bucket this project's objects live in.
+    /// The registry bucket this project's objects live in. For a striped
+    /// assignment this is `stripe[0]` (the primary), so a striping-unaware
+    /// reader still resolves a valid bucket.
     pub bucket_id: String,
     /// Tier of the assignment. Stage 1 always [`BucketTier::Pooled`].
     #[serde(default)]
     pub tier: BucketTier,
+    /// #36 (Stage 2a) — the project's ORDERED, FROZEN stripe set of pooled
+    /// bucket ids. A single project's partitions are spread across these
+    /// buckets by `stripe[fnv1a(partition_id) % stripe.len()]`, raising the
+    /// project's aggregate write bandwidth beyond a single bucket's cap.
+    ///
+    /// Back-compat + no-op contract:
+    /// - **Empty** (the default — every Stage-1 assignment persisted before
+    ///   this field existed) means "no striping": treat the project as a
+    ///   single-bucket assignment on [`Self::bucket_id`]. Deserialising an old
+    ///   record yields an empty vec, so the behaviour is unchanged.
+    /// - A **single-element** stripe (`[bucket_id]`) is also single-bucket —
+    ///   byte-identical routing to today.
+    ///
+    /// The order is significant and is NEVER reordered or shrunk while files
+    /// exist (the `% k` map would otherwise remap an existing partition's
+    /// already-written files). Growing the set is a (deferred) migration.
+    #[serde(default)]
+    pub stripe: Vec<String>,
+}
+
+impl BucketAssignment {
+    /// The effective ordered stripe set: the explicit [`Self::stripe`] when
+    /// non-empty, else the single [`Self::bucket_id`] (the Stage-1 / legacy
+    /// shape). Never empty for a well-formed assignment, so callers can index
+    /// `% len()` safely.
+    pub fn effective_stripe(&self) -> Vec<String> {
+        if self.stripe.is_empty() {
+            vec![self.bucket_id.clone()]
+        } else {
+            self.stripe.clone()
+        }
+    }
+}
+
+/// FNV-1a (64-bit) over a partition id — the SAME hash basin-engine's
+/// `partition_router` uses for partition→node ownership, reused here for the
+/// partition→bucket stripe map so there is one deterministic hashing story.
+/// Pure + stable across processes and restarts (no random seed).
+pub fn fnv1a_partition_hash(partition_id: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for b in partition_id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
+
+/// The stripe slot (index into the ordered stripe set) for `partition_id`
+/// given a stripe width `k`. Deterministic + stable. `k == 0` is treated as
+/// `k == 1` (defensive; a well-formed stripe is never empty).
+pub fn stripe_slot(partition_id: &str, k: usize) -> usize {
+    let k = k.max(1);
+    (fnv1a_partition_hash(partition_id) % k as u64) as usize
 }
 
 /// The bucket registry as persisted: a flat list of entries. Stored as a
@@ -96,5 +153,78 @@ impl BucketRegistry {
         if let Some(b) = self.buckets.iter_mut().find(|b| b.bucket_id == bucket_id) {
             b.assigned_count = b.assigned_count.saturating_add(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_stripe_defaults_to_single_bucket() {
+        // A legacy / Stage-1 assignment (empty stripe) is a width-1 stripe on
+        // bucket_id — the no-op shape.
+        let a = BucketAssignment {
+            bucket_id: "pool-0000".into(),
+            tier: BucketTier::Pooled,
+            stripe: Vec::new(),
+        };
+        assert_eq!(a.effective_stripe(), vec!["pool-0000".to_string()]);
+
+        // An explicit stripe is returned verbatim, in order.
+        let b = BucketAssignment {
+            bucket_id: "pool-0000".into(),
+            tier: BucketTier::Pooled,
+            stripe: vec!["pool-0000".into(), "pool-0001".into(), "pool-0002".into()],
+        };
+        assert_eq!(
+            b.effective_stripe(),
+            vec![
+                "pool-0000".to_string(),
+                "pool-0001".to_string(),
+                "pool-0002".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_assignment_deserialises_to_empty_stripe() {
+        // A record serialised before the `stripe` field existed must
+        // round-trip to an empty stripe (back-compat / no-op).
+        let json = r#"{"bucket_id":"pool-0007","tier":"pooled"}"#;
+        let a: BucketAssignment = serde_json::from_str(json).unwrap();
+        assert_eq!(a.bucket_id, "pool-0007");
+        assert!(a.stripe.is_empty());
+        assert_eq!(a.effective_stripe(), vec!["pool-0007".to_string()]);
+    }
+
+    #[test]
+    fn stripe_slot_is_deterministic_and_in_range() {
+        // Same partition + width → same slot, every call (stable across
+        // restarts because the hash has no random seed).
+        for pid in ["", "p0", "region:us/2026", "year=2026/month=06/day=26"] {
+            for k in 1..=8usize {
+                let s1 = stripe_slot(pid, k);
+                let s2 = stripe_slot(pid, k);
+                assert_eq!(s1, s2, "slot must be deterministic for {pid:?} k={k}");
+                assert!(s1 < k, "slot {s1} out of range for k={k}");
+            }
+        }
+        // k == 0 is treated as 1 (defensive).
+        assert_eq!(stripe_slot("anything", 0), 0);
+    }
+
+    #[test]
+    fn stripe_slot_distributes_partitions_across_buckets() {
+        // Across many partitions the slots cover the whole width — i.e. the
+        // map actually spreads load (not a constant). 256 partitions across 4
+        // buckets must touch all 4.
+        let k = 4;
+        let mut seen = [false; 4];
+        for i in 0..256 {
+            let pid = format!("partition-{i}");
+            seen[stripe_slot(&pid, k)] = true;
+        }
+        assert!(seen.iter().all(|&b| b), "stripe map must spread across all buckets");
     }
 }

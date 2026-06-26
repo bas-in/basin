@@ -7399,6 +7399,7 @@ mod tests {
         let first = BucketAssignment {
             bucket_id: "pool-0000".into(),
             tier: BucketTier::Pooled,
+            stripe: Vec::new(),
         };
         let won = node_a.assign_bucket_if_absent(&p, &first).await.unwrap();
         assert_eq!(won, first);
@@ -7406,6 +7407,7 @@ mod tests {
         let second = BucketAssignment {
             bucket_id: "pool-0001".into(),
             tier: BucketTier::Pooled,
+            stripe: Vec::new(),
         };
         let still = node_b.assign_bucket_if_absent(&p, &second).await.unwrap();
         assert_eq!(still, first, "CAS must keep the first durable assignment");

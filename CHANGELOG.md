@@ -367,6 +367,50 @@ recovery can only ever move a sequence forward. Gaps after a crash remain
 acceptable (PG-compatible); regression/duplicates cannot occur. New tests cover
 the no-regression invariant at the catalog and shard-recovery layers.
 
+## Unreleased — Multi-bucket storage pool, Stage 2a: single-project partition→bucket striping (routing seam, flag-gated)
+
+Adds the THROUGHPUT lever to the multi-bucket pool (engine task #36). Stage 1
+isolated projects from each other (one project ↔ one bucket) but did not raise a
+single hot project's write bandwidth — that project still landed on one bucket
+and inherited one bucket's req/s + bandwidth cap. Stage 2a stripes a SINGLE
+project's partitions across an ordered set of N pooled buckets so concurrent
+partition commits hit different buckets, giving aggregate write bandwidth ≈
+(#buckets × per-bucket cap). The win is conditional on the deployment shape:
+multiple concurrent committers (multi-node, or a single node only after the #27
+ingest-decay clone is gone and Vortex encode no longer binds CPU) — see
+`docs/multi-bucket-throughput-striping.md` §2 for the honest bottleneck analysis.
+
+**Flag-gated, default OFF + stripe width 1 = a provable no-op.** With
+`BASIN_BUCKET_POOL` off, OR `BASIN_BUCKET_POOL_STRIPE=1` (the default), routing
+is byte-identical single-bucket behaviour: every partition of a project resolves
+to the one assigned bucket, exactly as Stage 1. Regression tests assert both the
+flag-OFF and the width-1 no-op.
+
+What landed (routing + registry primitives, fully tested):
+- `BucketAssignment` grows a back-compat optional `stripe: Vec<String>` (an
+  ordered, frozen, append-only stripe set). A pre-Stage-2a record (no field)
+  deserialises to an empty stripe = single-bucket; `effective_stripe()` collapses
+  either shape to a non-empty ordered set.
+- A deterministic, restart-stable partition→bucket map:
+  `stripe[fnv1a(partition_id) % k]`, reusing the same FNV-1a the partition router
+  uses for node ownership.
+- `BucketPool::{store_for_partition, routed_stores}` and the
+  `Storage::partition_object_store` SEAM — the function the writer and
+  per-partition reader will call. The catalog stays on a single primary bucket
+  (the create-if-absent CAS / #34 durable barrier is unchanged); only DATA files
+  stripe.
+- Assignment allocates a width-`k` stripe of distinct pooled buckets on first
+  write (reusing the Stage-1 least-loaded chooser per slot), persists it via the
+  same create-if-absent CAS (first writer wins, stable on restart), and caches
+  the resolved stripe of stores.
+
+Deferred (documented seam, NOT half-implemented — correctness-first): wiring the
+seam into the DataFusion scan's per-file GET-by-path and the storage write/read
+entry points, growing/rebalancing a stripe set, and production instantiation in
+`basin-server`. See `docs/multi-bucket-throughput-striping.md` §5.
+
+Config: adds `BASIN_BUCKET_POOL_STRIPE` (default 1 = no striping).
+
 ## Unreleased — Multi-bucket storage pool, Stage 1 (foundation, flag-gated)
 
 Lays the FOUNDATION for the bounded multi-bucket storage pool (engine task #36):

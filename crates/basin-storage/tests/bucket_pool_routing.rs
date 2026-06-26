@@ -20,7 +20,7 @@ use basin_storage::bucket_pool::{BucketPool, BucketResolver, PoolConfig};
 use basin_storage::{Storage, StorageConfig};
 use futures::stream::StreamExt;
 use object_store::memory::InMemory;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 
 /// Resolver that hands out one distinct `InMemory` store per `bucket_id`, so
 /// we can inspect exactly which bucket a project's objects landed in.
@@ -111,6 +111,7 @@ async fn flag_off_is_a_noop_identical_to_today() {
             enabled: false,
             max_buckets: 8,
             watermark: 1,
+            stripe: 1,
         },
         resolver.clone(),
     ));
@@ -168,6 +169,7 @@ async fn flag_on_spreads_is_stable_and_round_trips() {
             enabled: true,
             max_buckets: 4,
             watermark: 1,
+            stripe: 1,
         },
         resolver.clone(),
     ));
@@ -244,6 +246,7 @@ async fn flag_on_stops_growing_at_ceiling_then_packs() {
             enabled: true,
             max_buckets: 2,
             watermark: 1,
+            stripe: 1,
         },
         resolver.clone(),
     ));
@@ -273,4 +276,255 @@ async fn flag_on_stops_growing_at_ceiling_then_packs() {
     for (_id, n) in &per_bucket {
         assert_eq!(*n, 3, "projects past the ceiling pack into the least-full bucket");
     }
+}
+
+// ===========================================================================
+// #36 Stage 2a — single-project partition→bucket STRIPING (throughput lever).
+// ===========================================================================
+
+/// Build a pool with an explicit stripe width and attach it to a fresh
+/// Storage over a fresh default store. Returns (storage, catalog, pool,
+/// resolver) so a test can inspect every pooled bucket directly.
+fn build_striped(
+    stripe: usize,
+    max_buckets: usize,
+) -> (Storage, Arc<InMemoryCatalog>, Arc<BucketPool>, Arc<InMemoryResolver>) {
+    let default_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (storage, cat) = build_storage_with_default(default_store);
+    let resolver = Arc::new(InMemoryResolver::default());
+    let pool = Arc::new(BucketPool::new(
+        PoolConfig {
+            enabled: true,
+            max_buckets,
+            watermark: 1,
+            stripe,
+        },
+        resolver.clone(),
+    ));
+    storage.attach_bucket_pool(pool.clone());
+    (storage, cat, pool, resolver)
+}
+
+/// A striped project's partitions distribute across its N pooled buckets, the
+/// distribution is deterministic, and it is STABLE across a simulated restart
+/// (re-read from the catalog, not recomputed).
+#[tokio::test]
+async fn striped_partitions_distribute_and_are_stable() {
+    let (_storage, cat, pool, resolver) = build_striped(4, 8);
+    let project = ProjectId::new();
+
+    // Warm the assignment: a width-4 stripe of distinct buckets is allocated +
+    // persisted on first ensure.
+    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
+    assert_eq!(a.stripe.len(), 4, "stripe width must equal config.stripe");
+    let distinct: std::collections::HashSet<_> = a.stripe.iter().collect();
+    assert_eq!(distinct.len(), 4, "stripe buckets must be distinct");
+    assert_eq!(a.bucket_id, a.stripe[0], "primary bucket_id == stripe[0]");
+
+    // Map 64 partitions → buckets via the public routing primitive and assert
+    // coverage of all 4 buckets (the spread is real, not a constant).
+    let mut covered: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+    for i in 0..64 {
+        let pid = format!("partition-{i}");
+        let store = pool.store_for_partition(&project, &pid).expect("warmed stripe");
+        covered.insert(Arc::as_ptr(&store) as *const ());
+    }
+    assert_eq!(
+        covered.len(),
+        4,
+        "64 partitions must spread across all 4 stripe buckets"
+    );
+
+    // Stability across restart: drop the per-process cache, re-warm from the
+    // SAME catalog, and assert every partition resolves to its slot-derived
+    // bucket store (deterministic + stable, re-read not recomputed).
+    pool.invalidate_all();
+    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    for i in 0..64 {
+        let pid = format!("partition-{i}");
+        let store = pool.store_for_partition(&project, &pid).expect("re-warmed stripe");
+        let bucket_id = &a.stripe[basin_catalog::bucket_pool::stripe_slot(&pid, a.stripe.len())];
+        let expected = resolver.store_for(bucket_id);
+        assert_eq!(
+            Arc::as_ptr(&store) as *const (),
+            Arc::as_ptr(&expected) as *const (),
+            "partition {pid} must re-resolve its stable bucket after restart"
+        );
+    }
+}
+
+/// Write partition P then read partition P resolves the SAME bucket and the
+/// data round-trips exactly. Also asserts the file physically landed in the
+/// slot-derived bucket (not a sibling stripe bucket).
+#[tokio::test]
+async fn striped_write_then_read_same_partition_round_trips() {
+    let (storage, cat, pool, resolver) = build_striped(4, 8);
+    let project = ProjectId::new();
+    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
+
+    for i in 0..8 {
+        let part = PartitionKey::new(format!("p{i}")).unwrap();
+        let pid = part.as_str().to_string();
+
+        // WRITE through the partition-routed store seam.
+        let store_w = storage.partition_object_store(&project, &pid);
+        let key = object_store::path::Path::from(format!(
+            "projects/{project}/tables/t/data/{pid}/2026/06/26/file-{i}.vortex"
+        ));
+        store_w
+            .put(&key, object_store::PutPayload::from_static(b"hello-stripe"))
+            .await
+            .unwrap();
+
+        // READ through the seam: same partition → same bucket → exact bytes.
+        let store_r = storage.partition_object_store(&project, &pid);
+        let got = store_r.get(&key).await.unwrap().bytes().await.unwrap();
+        assert_eq!(&got[..], b"hello-stripe", "partition {pid} round-trip");
+
+        // Physical placement: the file is in the slot-derived bucket only.
+        let slot = basin_catalog::bucket_pool::stripe_slot(&pid, a.stripe.len());
+        let expected_bucket = &a.stripe[slot];
+        let keys = list_keys(&resolver.store_for(expected_bucket)).await;
+        assert!(
+            keys.iter().any(|k| k == key.as_ref()),
+            "partition {pid} file must live in its slot bucket {expected_bucket}"
+        );
+        for (j, other) in a.stripe.iter().enumerate() {
+            if j == slot {
+                continue;
+            }
+            let other_keys = list_keys(&resolver.store_for(other)).await;
+            assert!(
+                !other_keys.iter().any(|k| k == key.as_ref()),
+                "partition {pid} must NOT appear in sibling bucket {other}"
+            );
+        }
+    }
+}
+
+/// The unioned table read aggregates files across ALL stripe buckets: the
+/// exact path set and count match what was written, with no file missed or
+/// double-counted.
+#[tokio::test]
+async fn striped_union_read_aggregates_all_buckets() {
+    let (storage, cat, pool, resolver) = build_striped(4, 8);
+    let project = ProjectId::new();
+    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
+
+    let mut written: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for i in 0..40 {
+        let pid = format!("part-{i}");
+        let store = storage.partition_object_store(&project, &pid);
+        let key = object_store::path::Path::from(format!(
+            "projects/{project}/tables/t/data/{pid}/2026/06/26/f{i}.vortex"
+        ));
+        store
+            .put(&key, object_store::PutPayload::from_static(b"x"))
+            .await
+            .unwrap();
+        written.insert(key.to_string());
+    }
+
+    // Union read = LIST every stripe-bucket store and concat (what the striped
+    // reader will do via routed_stores). The union must equal exactly the
+    // written set, with no file appearing twice.
+    let stores = pool.routed_stores(&project).expect("warmed stripe");
+    assert_eq!(stores.len(), 4, "routed_stores must return the full stripe");
+    let mut union: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for s in &stores {
+        for k in list_keys(s).await {
+            assert!(
+                union.insert(k.clone()),
+                "no file may appear in two stripe buckets (would double-count): {k}"
+            );
+        }
+    }
+    assert_eq!(union, written, "union read must equal exactly the written set");
+    assert_eq!(union.len(), 40, "union read count must be exact");
+
+    // No single bucket holds the whole table (proves the spread is real).
+    for b in &a.stripe {
+        let n = list_keys(&resolver.store_for(b)).await.len();
+        assert!(n < 40, "no single bucket should hold the whole table");
+    }
+}
+
+/// Exactly-once: the per-project create-if-absent CAS yields ONE stable striped
+/// assignment under concurrent first-writers from two independent catalog
+/// handles over the SAME store (two "nodes"). The loser adopts the winner's
+/// stripe verbatim — no split-brain, both nodes route identically.
+#[tokio::test]
+async fn striped_assignment_cas_is_exactly_once_across_nodes() {
+    use basin_catalog::ObjectStoreCatalog;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let node_a: Arc<dyn Catalog> = Arc::new(ObjectStoreCatalog::new(store.clone()));
+    let node_b: Arc<dyn Catalog> = Arc::new(ObjectStoreCatalog::new(store.clone()));
+
+    let resolver = Arc::new(InMemoryResolver::default());
+    let pool_a = BucketPool::new(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 3 },
+        resolver.clone(),
+    );
+    let pool_b = BucketPool::new(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 3 },
+        resolver.clone(),
+    );
+
+    let project = ProjectId::new();
+    let (ra, rb) = tokio::join!(
+        pool_a.ensure_assignment(&project, node_a.as_ref()),
+        pool_b.ensure_assignment(&project, node_b.as_ref()),
+    );
+    ra.unwrap();
+    rb.unwrap();
+
+    // Exactly one durable assignment, a valid width-3 distinct stripe.
+    let durable = node_a.get_bucket_assignment(&project).await.unwrap().unwrap();
+    assert_eq!(durable.stripe.len(), 3, "durable stripe width");
+    let distinct: std::collections::HashSet<_> = durable.stripe.iter().collect();
+    assert_eq!(distinct.len(), 3, "durable stripe buckets distinct");
+
+    // Both nodes route a given partition to the SAME bucket (the durable
+    // winner's stripe), regardless of who won the CAS.
+    for i in 0..16 {
+        let pid = format!("p{i}");
+        let sa = pool_a.store_for_partition(&project, &pid).unwrap();
+        let sb = pool_b.store_for_partition(&project, &pid).unwrap();
+        assert_eq!(
+            Arc::as_ptr(&sa) as *const (),
+            Arc::as_ptr(&sb) as *const (),
+            "both nodes must route partition {pid} to the same stripe bucket"
+        );
+    }
+}
+
+/// Stripe width == 1 is byte-identical single-bucket routing: every partition
+/// of a project resolves to the SAME single store, and that store is the
+/// primary routed_store (the no-op proof for the striping layer specifically).
+#[tokio::test]
+async fn stripe_width_one_is_single_bucket() {
+    let (_storage, cat, pool, _resolver) = build_striped(1, 8);
+    let project = ProjectId::new();
+    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
+    assert_eq!(a.stripe.len(), 1, "width-1 stripe");
+
+    let s0 = pool.store_for_partition(&project, "part-A").unwrap();
+    let mut ptrs = std::collections::HashSet::new();
+    for i in 0..32 {
+        let pid = format!("part-{i}");
+        let s = pool.store_for_partition(&project, &pid).unwrap();
+        ptrs.insert(Arc::as_ptr(&s) as *const ());
+    }
+    assert_eq!(ptrs.len(), 1, "width-1 must route every partition to one store");
+
+    let primary = pool.routed_store(&project).unwrap();
+    assert_eq!(
+        Arc::as_ptr(&primary) as *const (),
+        Arc::as_ptr(&s0) as *const (),
+        "width-1: primary routed store == every partition's store"
+    );
 }
