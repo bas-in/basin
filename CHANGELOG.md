@@ -8,6 +8,39 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Perf (opt-in): faster compaction encode for ingest-throughput-over-disk-size workloads
+
+**Flag-gated lever for the single-node bulk-COPY ingest CPU ceiling.** Sustained
+single-node bulk-COPY ingest is CPU-bound on the per-batch columnar encode, not
+object-store-bound (a prior measurement found 3× PUT budget bought only ~1.5×).
+COPY rows land in the in-memory tail and are encoded exactly once — in
+compaction — and the primary compaction flush used the full BtrBlocks `Best`
+search cascade (the smallest, best-compressed output, the right default for the
+durable, query-served representation). On a small box every core is already busy
+encoding, so adding parallelism does not help (the auto-tuner already measured
+that over-fanning makes ingest *slower*); the only per-node lever is a cheaper
+encode.
+
+- **`BASIN_SHARD_COMPACTION_FAST_ENCODE=1`** flips the primary compaction flush
+  (`InProcessShard::compact_one`) to the Vortex `Fast` cascade — the same minimal
+  cascade the non-tx direct INSERT path already uses — trading larger files and
+  slightly weaker scan compression for a materially cheaper encode. **Default is
+  unchanged (`Best`)**, so the published-default behaviour, on-disk size, and
+  read performance are byte-for-byte identical unless the flag is set. Ignored
+  for Parquet tables (their ZSTD-1 path is already fast).
+- **Correctness-safe.** `Fast` is a strictly smaller cascade of lossless
+  encodings (round-trip parity gated by the Vortex Fast⇆Best differential test);
+  exactly-once, the #34 durable barrier, the per-partition compaction lock, the
+  create-if-absent CAS commit, and the #27 chunked-bounded flat-ingest baseline
+  are all untouched. Files written `Fast` are transient — the background
+  stripe/file-merge sweeps still consolidate with `Best`.
+- **Measured (`vortex_format::compaction_fast_encode_is_materially_cheaper`):**
+  on a 200k-row search-heavy batch, `Fast` encode is ~1.38× faster than `Best`
+  (1.01s → 0.73s); the disk-size cost is highly data-dependent (much larger on
+  pathologically dictionary-friendly data), which is exactly why the lever is
+  opt-in rather than the default. The test asserts a conservative ≥1.2× floor so
+  a regression that erases the win fails CI.
+
 ## Unreleased — Fix: read-freshness convergence — drain the residual tail promptly once ingest goes idle
 
 **Correctness/freshness fix for the durable-vs-visible gap after a write burst.**

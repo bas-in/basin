@@ -232,6 +232,33 @@ const MAX_COMPACTION_ROWS: usize = 512 * 1024;
 /// via `BASIN_SHARD_FLUSH_CONCURRENCY`.
 const DEFAULT_FLUSH_CONCURRENCY: usize = 8;
 
+/// Vortex encode cascade the primary compaction flush uses for the merged
+/// ingest tail. Default is [`EncodingMode::Best`] — the full BtrBlocks search
+/// cascade — exactly the historical behaviour: compacted files are the
+/// durable, query-served representation, so the smaller, better-compressed
+/// `Best` output is the right default for read-heavy / disk-cost-sensitive
+/// workloads.
+///
+/// On a CPU-bound single node the `Best` per-column sampling search is the
+/// dominant cost of sustained bulk-COPY ingest (COPY rows are encoded exactly
+/// ONCE, here, with `Best`). Setting `BASIN_SHARD_COMPACTION_FAST_ENCODE=1`
+/// flips this hot flush to [`EncodingMode::Fast`] (the same minimal cascade the
+/// non-tx direct INSERT path already uses), trading ~1.5× larger files and
+/// slightly weaker scan compression for a materially cheaper per-batch encode —
+/// the right trade for an ingest-throughput-over-disk-size workload on a small
+/// box where every core is already busy encoding. Correctness is unaffected:
+/// `Fast` is a strictly smaller cascade of lossless encodings, round-trip
+/// parity is gated by the Vortex Fast⇆Best differential test, and the
+/// background stripe/file-merge sweeps still re-encode consolidated output with
+/// `Best`, so a file written `Fast` here is transient. Ignored for Parquet
+/// tables (their ZSTD-1 path is already fast).
+fn compaction_encoding_mode() -> basin_storage::EncodingMode {
+    match std::env::var("BASIN_SHARD_COMPACTION_FAST_ENCODE") {
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => basin_storage::EncodingMode::Fast,
+        _ => basin_storage::EncodingMode::Best,
+    }
+}
+
 fn flush_concurrency() -> usize {
     if let Ok(v) = std::env::var("BASIN_SHARD_FLUSH_CONCURRENCY") {
         if let Some(n) = v.parse::<usize>().ok().filter(|n| *n > 0) {
@@ -1854,6 +1881,10 @@ impl InProcessShard {
         // collapses that to one chain clone per table per compaction call.
         let mut table_cfg_cache: HashMap<TableName, ResolvedTableCompactCfg> = HashMap::new();
         let flush_concurrency = flush_concurrency();
+        // Encode cascade for this drain's flushed files. Default `Best`
+        // (historical behaviour); opt-in `Fast` for ingest-throughput-over-
+        // disk-size workloads (see `compaction_encoding_mode`).
+        let compaction_encoding = compaction_encoding_mode();
         loop {
         // Snapshot a bounded prefix of each table's tail under the inner read
         // lock as a flat list of CHUNKS (each chunk ≤ `MAX_COMPACTION_ROWS`
@@ -2058,6 +2089,10 @@ impl InProcessShard {
                 row_block_size,
                 max_row_group_size: row_group_rows,
                 bloom_columns: bloom_cols,
+                // Default `Best`; `BASIN_SHARD_COMPACTION_FAST_ENCODE=1` opts
+                // the ingest hot path into the cheaper `Fast` cascade. No-op
+                // for Parquet tables (their ZSTD-1 path ignores this).
+                encoding_mode: compaction_encoding,
                 ..Default::default()
             };
             // ADR 0027 Phase 4 backfill: extend the merged batch with shadow

@@ -1130,6 +1130,101 @@ mod tests {
         );
     }
 
+    /// Micro-benchmark for the `BASIN_SHARD_COMPACTION_FAST_ENCODE` lever:
+    /// quantify the per-batch encode-cost delta between the compaction default
+    /// (`Best`, full BtrBlocks search) and the opt-in `Fast` cascade on a
+    /// realistically wide, compaction-sized merged batch.
+    ///
+    /// This is the work that dominates a CPU-bound single node's sustained
+    /// bulk-COPY ingest (COPY rows are encoded exactly once, in compaction).
+    /// The lever cannot add parallelism on a saturated box — it makes each
+    /// core's encode CHEAPER. This test demonstrates that the cheaper encode
+    /// is real and measurable, and asserts a conservative lower bound on the
+    /// speedup so a regression that silently erases the win fails CI.
+    ///
+    /// Conservative gate: `Fast` must be at least 1.2× faster than `Best` on
+    /// this batch. The #92 design claims ~3-4×; we assert only 1.2× so the
+    /// test is stable on a loaded CI box while still failing if the cascade
+    /// distinction is lost. The measured ratio is printed for the curious.
+    #[tokio::test]
+    async fn compaction_fast_encode_is_materially_cheaper() {
+        use std::time::Instant;
+
+        // A compaction-sized merged batch with the column shapes that make the
+        // `Best` per-column search expensive: a high-cardinality int key, a
+        // moderate-cardinality string (dictionary/FSST candidates), a float
+        // measure (Pco candidate), and a low-cardinality category (RLE/dict
+        // candidate). `Fast` excludes exactly those search schemes.
+        const N: usize = 200_000;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("sku", DataType::Utf8, false),
+            Field::new("amount", DataType::Float64, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let id = Int64Array::from((0i64..N as i64).collect::<Vec<_>>());
+        let sku = StringArray::from(
+            (0..N).map(|i| format!("SKU-{:06}", i % 4000)).collect::<Vec<_>>(),
+        );
+        let amount = Float64Array::from((0..N).map(|i| (i as f64) * 1.37).collect::<Vec<_>>());
+        let region = StringArray::from(
+            (0..N).map(|i| ["us-east", "us-west", "eu", "ap"][i % 4].to_string()).collect::<Vec<_>>(),
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(id), Arc::new(sku), Arc::new(amount), Arc::new(region)],
+        )
+        .expect("build compaction-sized batch");
+
+        // Warm the codec (session init + encoding registration is one-time).
+        let _warm = encode_with_mode(&batch, None, EncodingMode::Best)
+            .await
+            .expect("warm encode");
+
+        // Best-of-3 each, to damp scheduler noise on a loaded box.
+        let mut best = std::time::Duration::MAX;
+        let mut best_bytes_len = 0usize;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let b = encode_with_mode(&batch, None, EncodingMode::Best)
+                .await
+                .expect("encode best");
+            best = best.min(t.elapsed());
+            best_bytes_len = b.len();
+        }
+        let mut fast = std::time::Duration::MAX;
+        let mut fast_bytes_len = 0usize;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let b = encode_with_mode(&batch, None, EncodingMode::Fast)
+                .await
+                .expect("encode fast");
+            fast = fast.min(t.elapsed());
+            fast_bytes_len = b.len();
+        }
+
+        let ratio = best.as_secs_f64() / fast.as_secs_f64();
+        eprintln!(
+            "compaction encode {N} rows: Best={best:?} ({best_bytes_len} B) \
+             Fast={fast:?} ({fast_bytes_len} B) speedup={ratio:.2}x \
+             size_ratio={:.2}x",
+            fast_bytes_len as f64 / best_bytes_len as f64
+        );
+
+        assert!(
+            ratio >= 1.2,
+            "Fast compaction encode should be >=1.2x faster than Best on a \
+             search-heavy batch (got {ratio:.2}x: Best={best:?}, Fast={fast:?}); \
+             if this regressed, the BASIN_SHARD_COMPACTION_FAST_ENCODE lever no \
+             longer buys a measurable ingest-throughput win"
+        );
+
+        // Sanity: both produce non-empty, decodable output (correctness is
+        // covered in depth by `fast_mode_round_trips_and_is_not_slower`; here
+        // we just guard against a degenerate empty-blob false positive).
+        assert!(best_bytes_len > 0 && fast_bytes_len > 0);
+    }
+
     /// Self-describing decode: with `schema = None` the Arrow schema is
     /// recovered from the Vortex file's own DType (Parquet-footer-symmetric).
     /// This is the path Basin's schema-less internal readers
