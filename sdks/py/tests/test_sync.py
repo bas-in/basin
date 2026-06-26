@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import http.server
 import json
+import threading
 from typing import Any
 from unittest.mock import patch
 
@@ -120,6 +122,42 @@ def test_sync_stream_yields_rows():
         with create_sync_client(BASE, KEY) as c:
             rows = list(c.from_("events").select().stream())
     assert [r["id"] for r in rows] == [1, 2, 3]
+
+
+def test_sync_multiple_requests_keepalive_server():
+    """Regression: a real keep-alive connection parks in the httpx pool bound to
+    the event loop.  If each sync call spun up a fresh ``asyncio.run`` loop, the
+    second request would fail with ``RuntimeError: Event loop is closed``.  This
+    drives a real HTTP/1.1 keep-alive server (respx's mock transport holds no
+    live socket, so it can't catch this)."""
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"  # keep-alive
+
+        def do_GET(self) -> None:  # noqa: N802
+            body = b'[{"id":1}]'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a: Any) -> None:
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = srv.server_address[1]
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with create_sync_client(f"http://127.0.0.1:{port}", KEY) as c:
+            for _ in range(3):
+                result = c.from_("items").select().execute()
+                assert result.error is None
+                assert result.data == [{"id": 1}]
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5.0)
 
 
 def test_sync_channel_lifecycle():

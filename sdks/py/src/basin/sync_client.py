@@ -17,42 +17,64 @@ T = TypeVar("T")
 _SENTINEL = object()
 
 
-def _run(coro: Coroutine[Any, Any, T]) -> T:
-    """Run a coroutine synchronously using a fresh event loop."""
-    return asyncio.run(coro)
+class _LoopThread:
+    """A single persistent event loop running on a daemon background thread.
 
+    Every sync call is driven on this one loop, so the underlying
+    ``httpx.AsyncClient`` connection pool stays bound to a single event loop
+    for its entire lifetime.  Using a fresh ``asyncio.run`` per call (as an
+    earlier version did) closes the loop after each request and leaves parked
+    keep-alive connections bound to a dead loop — the next request then fails
+    with ``RuntimeError: Event loop is closed``.
+    """
 
-def _aiter_to_sync(
-    factory: Callable[[], AsyncIterator[Any]],
-) -> Generator[Any, None, None]:
-    """Drive an async iterator on a background-thread event loop and yield its
-    items lazily to the synchronous caller via a bounded queue."""
-    items: queue.Queue[Any] = queue.Queue(maxsize=64)
+    def __init__(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._run_forever, name="basin-sync-loop", daemon=True
+        )
+        self._thread.start()
 
-    async def pump() -> None:
+    def _run_forever(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def run(self, coro: Coroutine[Any, Any, T]) -> T:
+        """Run a coroutine to completion on the background loop and return its
+        result (re-raising any exception on the calling thread)."""
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    def iterate(
+        self, factory: Callable[[], AsyncIterator[Any]]
+    ) -> Generator[Any, None, None]:
+        """Drive an async iterator on the background loop, yielding its items
+        lazily to the synchronous caller via a bounded queue."""
+        items: queue.Queue[Any] = queue.Queue(maxsize=64)
+
+        async def pump() -> None:
+            try:
+                async for item in factory():
+                    items.put((False, item))
+            except Exception as exc:  # surfaced to the sync side below
+                items.put((True, exc))
+            finally:
+                items.put((False, _SENTINEL))
+
+        future = asyncio.run_coroutine_threadsafe(pump(), self._loop)
         try:
-            async for item in factory():
-                items.put((False, item))
-        except Exception as exc:  # surfaced to the sync side below
-            items.put((True, exc))
+            while True:
+                is_error, payload = items.get()
+                if is_error:
+                    raise payload
+                if payload is _SENTINEL:
+                    break
+                yield payload
         finally:
-            items.put((False, _SENTINEL))
+            future.cancel()
 
-    def runner() -> None:
-        asyncio.run(pump())
-
-    thread = threading.Thread(target=runner, daemon=True)
-    thread.start()
-    try:
-        while True:
-            is_error, payload = items.get()
-            if is_error:
-                raise payload
-            if payload is _SENTINEL:
-                break
-            yield payload
-    finally:
-        thread.join()
+    def close(self) -> None:
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5.0)
 
 
 class SyncQueryBuilder:
@@ -63,8 +85,9 @@ class SyncQueryBuilder:
     ``await``-ing; everything else is the same chainable interface.
     """
 
-    def __init__(self, async_builder: QueryBuilder[Any]) -> None:
+    def __init__(self, async_builder: QueryBuilder[Any], loop: _LoopThread) -> None:
         self._b = async_builder
+        self._loop = loop
 
     # ── delegating filter/modifier methods ─────────────────────────────
 
@@ -163,15 +186,15 @@ class SyncQueryBuilder:
     # ── terminal ───────────────────────────────────────────────────────
 
     def execute(self) -> APIResponse[Any]:
-        return _run(self._b.execute())
+        return self._loop.run(self._b.execute())
 
     def paginate(self, *, page_size: int = 1000) -> Generator[Any, None, None]:
         """Sync generator that walks all pages lazily via cursor pagination."""
-        yield from _aiter_to_sync(lambda: self._b.paginate(page_size=page_size))
+        yield from self._loop.iterate(lambda: self._b.paginate(page_size=page_size))
 
     def stream(self) -> Generator[Any, None, None]:
         """Sync generator that yields NDJSON rows as they arrive."""
-        yield from _aiter_to_sync(self._b.stream)
+        yield from self._loop.iterate(self._b.stream)
 
 
 class SyncRealtimeChannel:
@@ -233,23 +256,26 @@ class SyncRealtimeChannel:
 
 
 class SyncAuthClient:
-    def __init__(self, async_auth: AuthClient) -> None:
+    def __init__(self, async_auth: AuthClient, loop: _LoopThread) -> None:
         self._a = async_auth
+        self._loop = loop
 
     def sign_up(self, *, email: str, password: str, **kw: Any) -> Any:
-        return _run(self._a.sign_up(email=email, password=password, **kw))
+        return self._loop.run(self._a.sign_up(email=email, password=password, **kw))
 
     def sign_in_with_password(self, *, email: str, password: str) -> Any:
-        return _run(self._a.sign_in_with_password(email=email, password=password))
+        return self._loop.run(
+            self._a.sign_in_with_password(email=email, password=password)
+        )
 
     def sign_in_with_magic_link(self, *, email: str) -> Any:
-        return _run(self._a.sign_in_with_magic_link(email=email))
+        return self._loop.run(self._a.sign_in_with_magic_link(email=email))
 
     def consume_magic_link(self, *, token: str) -> Any:
-        return _run(self._a.consume_magic_link(token=token))
+        return self._loop.run(self._a.consume_magic_link(token=token))
 
     def sign_out(self) -> Any:
-        return _run(self._a.sign_out())
+        return self._loop.run(self._a.sign_out())
 
     def get_session(self) -> AuthSession | None:
         return self._a.get_session()
@@ -258,7 +284,7 @@ class SyncAuthClient:
         return self._a.get_user()
 
     def refresh_session(self) -> Any:
-        return _run(self._a.refresh_session())
+        return self._loop.run(self._a.refresh_session())
 
     def sign_in_with_oauth(self, *, provider: str, **kw: Any) -> Any:
         return self._a.sign_in_with_oauth(provider=provider, **kw)
@@ -280,12 +306,13 @@ class SyncClient:
         *,
         options: ClientOptions | None = None,
     ) -> None:
+        self._loop = _LoopThread()
         self._async = create_client(base_url, anon_key, options=options)
-        self.auth = SyncAuthClient(self._async.auth)
+        self.auth = SyncAuthClient(self._async.auth, self._loop)
         self._channels: list[SyncRealtimeChannel] = []
 
     def from_(self, table: str) -> SyncQueryBuilder:
-        return SyncQueryBuilder(self._async.from_(table))
+        return SyncQueryBuilder(self._async.from_(table), self._loop)
 
     def channel(self, topic: str) -> SyncRealtimeChannel:
         """Open a realtime channel driven by a background event-loop thread."""
@@ -297,7 +324,10 @@ class SyncClient:
         for ch in self._channels:
             ch.close()
         self._channels.clear()
-        _run(self._async.aclose())
+        try:
+            self._loop.run(self._async.aclose())
+        finally:
+            self._loop.close()
 
     def __enter__(self) -> SyncClient:
         return self

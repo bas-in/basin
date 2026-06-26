@@ -47,11 +47,14 @@ python -m basin.codegen --url https://<project>.basin.run --key <anon-key> --out
 ## Install (once published)
 
 ```sh
-pip install basin                 # core (httpx only)
-pip install 'basin[pydantic]'     # typed row models
-pip install 'basin[realtime]'     # WebSocket realtime
-pip install 'basin[iceberg]'      # pyiceberg catalog interop
+pip install basin-sdk                 # core (httpx only)
+pip install 'basin-sdk[pydantic]'     # typed row models
+pip install 'basin-sdk[realtime]'     # WebSocket realtime
+pip install 'basin-sdk[iceberg]'      # pyiceberg catalog interop
 ```
+
+(The distribution is `basin-sdk`; the import package is `basin` —
+`from basin import create_client`.)
 
 ## Develop
 
