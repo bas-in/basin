@@ -47,6 +47,18 @@ const DEFAULT_CLEAN_SWEEP_SECS: u64 = 30;
 /// (`BASIN_STRIPE_MERGE_SECS`). `0` disables the sweep entirely.
 const DEFAULT_STRIPE_MERGE_SECS: u64 = 60;
 
+/// Default cadence of the quiesce-drain tick, seconds
+/// (`BASIN_QUIESCE_COMPACT_SECS`). This short tick runs `compact_all` ONLY
+/// when shard-wide ingest has gone idle (rolling rows/sec == 0) AND a pending
+/// uncompacted tail exists, so a burst of writes that stops (e.g. the tail end
+/// of a bulk COPY) is folded into the catalog promptly — `count(*)`/`max(id)`
+/// converge within this interval after the last write instead of waiting up to
+/// a full `compaction_interval` (30 s) timer tick. While ingest is ACTIVE the
+/// tick is a strict no-op (it returns before touching any partition), so it
+/// adds zero steady-state ingest cost and cannot steal PUT/CPU budget from the
+/// write path. `0` disables it (the 30 s timer is then the sole driver).
+const DEFAULT_QUIESCE_COMPACT_SECS: u64 = 2;
+
 /// Multi-node phase 1 (ADR 0023) — lease enforcement mode, sourced from
 /// `BASIN_LEASE_MODE` by `basin-server`.
 ///
@@ -123,6 +135,17 @@ pub struct ShardConfig {
     /// (`BASIN_STRIPE_MERGE_SECS`); a zero duration (env value `0`)
     /// disables the sweep.
     pub stripe_merge_interval: Duration,
+    /// Read-freshness convergence: cadence of the quiesce-drain tick. This
+    /// short tick runs `compact_all` ONLY when shard-wide ingest is idle
+    /// (rolling rows/sec == 0) and a pending uncompacted tail exists, so the
+    /// residual tail left by a stopped write burst (e.g. the end of a bulk
+    /// COPY) is folded into the catalog within this interval instead of waiting
+    /// up to a full `compaction_interval` (30 s) timer tick — closing the gap
+    /// between WAL-durable (the end-of-COPY barrier) and queryable
+    /// (segment-committed). While ingest is ACTIVE the tick short-circuits
+    /// before touching any partition, so it never competes with the write path.
+    /// Default 2 s (`BASIN_QUIESCE_COMPACT_SECS`); a zero duration disables it.
+    pub quiesce_compact_interval: Duration,
     /// Phase 6.X.A — optional lease registry (ADR 0023). When present, the
     /// shard acquires a lease per `(project, partition)` it owns and the
     /// background heartbeat renews held leases on a fixed cadence; a renewal
@@ -200,6 +223,10 @@ impl ShardConfig {
             stripe_merge_interval: Duration::from_secs(env_secs(
                 "BASIN_STRIPE_MERGE_SECS",
                 DEFAULT_STRIPE_MERGE_SECS,
+            )),
+            quiesce_compact_interval: Duration::from_secs(env_secs(
+                "BASIN_QUIESCE_COMPACT_SECS",
+                DEFAULT_QUIESCE_COMPACT_SECS,
             )),
             lease_registry: None,
             lease_mode: LeaseMode::Off,

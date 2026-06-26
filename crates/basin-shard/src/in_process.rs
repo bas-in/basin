@@ -141,6 +141,19 @@ impl IngestRate {
         self.roll(self.start.elapsed().as_secs());
         self.last_full.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Test-only: pin the reported rate so the quiesce-drain idle gate can be
+    /// exercised deterministically (the wall-second bucketing is otherwise
+    /// timing-fragile to drive from a test). Sets the current bucket's stamp to
+    /// the live second so the next `roll` does not immediately clobber the
+    /// forced `last_full` back to 0.
+    #[cfg(test)]
+    fn force_rate_for_test(&self, rows_per_sec: u64) {
+        use std::sync::atomic::Ordering;
+        self.bucket_sec
+            .store(self.start.elapsed().as_secs(), Ordering::Relaxed);
+        self.last_full.store(rows_per_sec, Ordering::Relaxed);
+    }
 }
 
 /// Whole-shard soft-cap budget for resident (uncompacted) tail bytes, BEFORE
@@ -1048,6 +1061,12 @@ impl InProcessShard {
         self.stripe_merge_sweep().await
     }
 
+    /// Test-only: drive one quiesce-drain tick synchronously.
+    #[allow(dead_code)]
+    pub(crate) async fn run_quiesce_drain_once(&self) -> Result<()> {
+        self.quiesce_drain().await
+    }
+
     /// Test-only: drive one file-count-bounding merge sweep synchronously.
     #[allow(dead_code)]
     pub(crate) async fn run_file_merge_once(&self) -> Result<()> {
@@ -1734,6 +1753,65 @@ impl InProcessShard {
             }
         }
         Ok(())
+    }
+
+    /// Read-freshness convergence: drain every resident partition's residual
+    /// tail PROMPTLY once shard-wide ingest has gone idle.
+    ///
+    /// Why this exists: a row is made WAL-durable on the write path (the
+    /// end-of-COPY durable barrier waits on `Wal::await_durable`), but it only
+    /// becomes visible to metadata reads — `count(*)`/`max(id)` answered from
+    /// `Catalog::live_data_files()` via the fast-aggregate path — once it has
+    /// been COMPACTED out of the in-memory tail into a catalog segment. The
+    /// read-side `flush_to_parquet()` only drains partitions resident on the
+    /// node serving the read, so a forwarded (peer-owned) partition's residual
+    /// tail — or any local residual — otherwise becomes visible only on the
+    /// 30 s `compaction_interval` timer. After a write burst stops there is no
+    /// further write to trigger the soft-cap proactive drain, so the residual
+    /// lingers until the next timer tick. This short tick closes that window.
+    ///
+    /// Cost discipline (preserves the flat-ingest win): the tick is a strict
+    /// no-op WHILE ingest is active. It returns immediately when the rolling
+    /// ingest rate is non-zero, so it never issues a PUT or holds a compaction
+    /// lock that competes with the write path — the soft-cap proactive drain
+    /// and the 30 s timer remain the sole compaction drivers under load. Only
+    /// once `ingest_rate.rows_per_sec()` reads 0 (a full quiet second elapsed
+    /// with no writes) does it run a single bounded `compact_all`, identical to
+    /// the read-path flush, so exactly-once / watermark / per-partition
+    /// compaction-lock semantics are unchanged.
+    async fn quiesce_drain(&self) -> Result<()> {
+        // Idle gate: bail while writes are flowing. The compactor keeps pace
+        // under load via the soft-cap proactive drain + 30 s timer; this tick
+        // exists only to collapse the post-quiesce visibility lag.
+        if self.ingest_rate.rows_per_sec() > 0 {
+            return Ok(());
+        }
+        // Pending-tail gate: avoid the `compact_all` snapshot + per-partition
+        // lock churn when there is nothing resident to drain. A cheap scan of
+        // the resident partition tails under their read locks (never the global
+        // map lock across an await, same discipline as `tail_pressure`).
+        let snapshot: Vec<Arc<RwLock<PartitionState>>> = {
+            let map = self.partitions.lock().await;
+            map.values().cloned().collect()
+        };
+        let mut any_pending = false;
+        for state in &snapshot {
+            let g = state.read().await;
+            if !g.tail_is_empty() {
+                any_pending = true;
+                break;
+            }
+        }
+        if !any_pending {
+            return Ok(());
+        }
+        // Re-check idleness right before doing work: a write may have landed
+        // while we scanned the tails. If so, defer to the soft-cap/timer path
+        // and let the next quiesce tick try again once it is truly quiet.
+        if self.ingest_rate.rows_per_sec() > 0 {
+            return Ok(());
+        }
+        self.compact_all().await
     }
 
     async fn compact_one(
@@ -3532,6 +3610,22 @@ impl ShardImpl for InProcessShard {
             } else {
                 std::time::Duration::from_secs(3600)
             });
+            // Read-freshness convergence: a short tick that drains the residual
+            // tail PROMPTLY once ingest goes idle, so `count(*)`/`max(id)`
+            // (which read the catalog's segment-committed live files, NOT the
+            // uncompacted tail) reflect every durably-committed row within
+            // `quiesce_compact_interval` of the last write — instead of lagging
+            // by up to a full `compaction_interval` (30 s) tick after a write
+            // burst stops. The arm itself short-circuits while ingest is active
+            // (see `quiesce_drain`), so it adds no steady-state ingest cost.
+            // `BASIN_QUIESCE_COMPACT_SECS=0` disables it (zero-duration interval
+            // would panic, so use the placeholder cadence and guard the arm).
+            let quiesce_drain_enabled = !me.cfg.quiesce_compact_interval.is_zero();
+            let mut quiesce_drain_tick = tokio::time::interval(if quiesce_drain_enabled {
+                me.cfg.quiesce_compact_interval
+            } else {
+                std::time::Duration::from_secs(3600)
+            });
             // Phase 2 autotune: the adaptive ingest-concurrency controller.
             // Spawned ONLY when BASIN_AUTOTUNE is on, and only ONCE per process
             // (the runtime fan-out / flush atomics are process-global, so a
@@ -3579,6 +3673,7 @@ impl ShardImpl for InProcessShard {
             heartbeat_tick.tick().await;
             sweep_tick.tick().await;
             stripe_merge_tick.tick().await;
+            quiesce_drain_tick.tick().await;
             autotune_tick.tick().await;
             loop {
                 tokio::select! {
@@ -3637,6 +3732,11 @@ impl ShardImpl for InProcessShard {
                     }
                     _ = sweep_tick.tick() => {
                         me.clean_retention_sweep().await;
+                    }
+                    _ = quiesce_drain_tick.tick(), if quiesce_drain_enabled => {
+                        if let Err(e) = me.quiesce_drain().await {
+                            warn!(error = %e, "quiesce-drain tick failed");
+                        }
                     }
                     _ = stripe_merge_tick.tick(), if stripe_merge_enabled => {
                         if let Err(e) = me.stripe_merge_sweep().await {
@@ -5843,6 +5943,148 @@ mod tests {
         // value or higher, never resetting to ZERO. Just call it to ensure
         // truncate didn't error out.
         let _ = wal.high_water(&project, &partition).await.unwrap();
+    }
+
+    /// Read-freshness convergence (the durable-vs-visible gap): metadata reads
+    /// (`count(*)`/`max(id)` via the fast-aggregate path) answer from the
+    /// catalog's `live_data_files()` — the SEGMENT-COMMITTED row set — and never
+    /// see the in-memory tail. A write burst lands in the tail (and the WAL)
+    /// immediately, so the catalog under-counts until compaction folds the tail
+    /// into a segment. This test captures the property the quiesce-drain tick
+    /// guarantees: after a burst with NO further writes, ONE quiesce-drain tick
+    /// converges the catalog row set to every written row — promptly (bounded
+    /// ticks), not lazily on the 30 s timer.
+    #[tokio::test]
+    async fn quiesce_drain_converges_catalog_after_idle_burst() {
+        use basin_catalog::Catalog;
+        let (shard, _sd, _wd, _storage, catalog, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        let handle = shard.get(&project, &partition).await.unwrap();
+        let n_batches = 5usize;
+        let per = 10usize;
+        let total = (n_batches * per) as u64;
+        for i in 0..n_batches {
+            handle
+                .write_batch(&table, batch((i * per) as i64, per, "v-"))
+                .await
+                .unwrap();
+        }
+
+        let inner = impl_of(&shard);
+
+        // BEFORE the drain: the rows are WAL-durable and in the tail, but the
+        // catalog (what `count(*)` reads) does not yet reflect them — this is
+        // the freshness gap. A freshly-loaded table has no committed segment, so
+        // `live_data_files()` is empty / under the written total.
+        let cold_before: u64 = match catalog.load_table(&project, &table).await {
+            Ok(m) => m.live_data_files().iter().map(|f| f.row_count).sum(),
+            // Table not yet in the catalog at all == 0 committed rows.
+            Err(_) => 0,
+        };
+        assert!(
+            cold_before < total,
+            "precondition: catalog should under-count before the drain \
+             (got {cold_before}, wrote {total}); the gap is the tail",
+        );
+        // The tail must actually hold the residual (otherwise there is nothing
+        // for the quiesce tick to converge).
+        let state = {
+            let map = inner.partitions.lock().await;
+            map.get(&(project, partition.clone())).unwrap().clone()
+        };
+        assert!(
+            !state.read().await.tail_is_empty(),
+            "precondition: tail holds the durable-but-uncompacted residual",
+        );
+
+        // ONE quiesce-drain tick. Pin the rate to 0 so the idle gate is
+        // exercised deterministically (the burst stopped — ingest is quiet).
+        inner.ingest_rate.force_rate_for_test(0);
+        inner.run_quiesce_drain_once().await.unwrap();
+
+        let cold_after: u64 = catalog
+            .load_table(&project, &table)
+            .await
+            .unwrap()
+            .live_data_files()
+            .iter()
+            .map(|f| f.row_count)
+            .sum();
+        assert_eq!(
+            cold_after, total,
+            "after a single quiesce-drain tick the catalog (what count(*) reads) \
+             must reflect every durably-committed row",
+        );
+        assert!(
+            state.read().await.tail_is_empty(),
+            "tail fully drained by the quiesce tick",
+        );
+    }
+
+    /// The quiesce-drain tick must be a strict no-op when there is nothing
+    /// resident to drain (empty shard / already-compacted tail): it neither
+    /// errors nor produces a spurious data file. Guards the pending-tail gate.
+    #[tokio::test]
+    async fn quiesce_drain_noop_when_no_pending_tail() {
+        let (shard, _sd, _wd, storage, _cat, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        // Resident partition, but empty tail.
+        let _handle = shard.get(&project, &partition).await.unwrap();
+        let inner = impl_of(&shard);
+        inner.run_quiesce_drain_once().await.unwrap();
+
+        let files = storage.list_data_files(&project, &table).await.unwrap();
+        assert!(
+            files.is_empty(),
+            "quiesce drain with no pending tail must not write a data file",
+        );
+    }
+
+    /// While ingest is ACTIVE (rolling rows/sec > 0) the quiesce-drain tick must
+    /// short-circuit and NOT compact — so it never competes with the write path
+    /// (the flat-ingest win). We make the rate non-zero deterministically by
+    /// recording a write into one wall-second and letting the bucket roll into
+    /// the next, then assert the tick leaves the tail untouched.
+    #[tokio::test]
+    async fn quiesce_drain_is_noop_while_ingest_active() {
+        let (shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        let handle = shard.get(&project, &partition).await.unwrap();
+        let inner = impl_of(&shard);
+
+        // Leave a residual tail, then pin the rolling rate non-zero so the shard
+        // looks "actively ingesting" (deterministic — the wall-second bucketing
+        // is otherwise timing-fragile to drive).
+        handle
+            .write_batch(&table, batch(0, 100, "v-"))
+            .await
+            .unwrap();
+        inner.ingest_rate.force_rate_for_test(34_000);
+        assert!(
+            inner.ingest_rate.rows_per_sec() > 0,
+            "rate should report active ingest after force_rate_for_test",
+        );
+
+        // The tick sees a non-zero rate and must bail before compacting.
+        inner.run_quiesce_drain_once().await.unwrap();
+
+        let state = {
+            let map = inner.partitions.lock().await;
+            map.get(&(project, partition.clone())).unwrap().clone()
+        };
+        assert!(
+            !state.read().await.tail_is_empty(),
+            "quiesce drain must NOT compact while ingest is active; tail intact",
+        );
     }
 
     /// Incremental-compaction guard (flat-O(1) ingest wedge): a single

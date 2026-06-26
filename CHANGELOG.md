@@ -8,6 +8,40 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Fix: read-freshness convergence — drain the residual tail promptly once ingest goes idle
+
+**Correctness/freshness fix for the durable-vs-visible gap after a write burst.**
+A row is made WAL-durable on the write path (the #34 end-of-COPY durable barrier
+waits on `Wal::await_durable`), but it only becomes visible to metadata reads —
+`count(*)`/`max(id)` answered from the catalog's `live_data_files()` via the
+fast-aggregate path — once it has been COMPACTED out of the in-memory tail into a
+catalog segment. The read-side `flush_to_parquet()` only drains partitions
+resident on the node serving the read, so a forwarded (peer-owned) partition's
+residual tail — or any local residual left when a write burst stops — otherwise
+became visible only on the 30 s `compaction_interval` timer. Observed on dev
+(engine v117, 100M-row COPY, `synchronous_commit=on`): immediately after the
+loader stopped, `count(*)` read ~99,990,000 and converged to the exact
+100,000,000 only over ~10–12 minutes; a 1M load converged in <1 min. No rows were
+ever lost — the lag was purely WAL-durable-but-not-yet-segment-committed data
+draining at the compaction cadence after ingest stopped.
+
+- **New quiesce-drain background tick** (`InProcessShard::quiesce_drain`) runs
+  `compact_all` on a short cadence (`BASIN_QUIESCE_COMPACT_SECS`, default 2 s)
+  ONLY when shard-wide ingest has gone idle (rolling `rows/sec == 0`) AND a
+  resident partition has a non-empty tail. After a burst stops, the residual is
+  folded into the catalog within the tick interval, so `count(*)`/`max(id)`
+  converge promptly instead of lagging by up to a full 30 s timer tick.
+- **Zero steady-state ingest cost.** While ingest is active the tick
+  short-circuits before touching any partition (it issues no PUT and takes no
+  compaction lock), so it never competes with the write path — the soft-cap
+  proactive drain and the 30 s timer remain the sole compaction drivers under
+  load. The flat-ingest win is preserved.
+- **Exactly-once preserved.** The tick reuses the existing `compact_all` →
+  `compact_one` path verbatim (per-partition compaction lock, monotonic
+  compaction watermark before WAL truncate, create-if-absent CAS), so #34, #31,
+  #27 and the CAS semantics are unchanged. Set `BASIN_QUIESCE_COMPACT_SECS=0` to
+  disable.
+
 ## Unreleased — Fix (#41): metadata range-aggregate must not over-count files that overlap the boundary or carry inconsistent/partial stats
 
 **Correctness fix for the COUNT/MIN/MAX/SUM-over-an-integer-range fast path.**
