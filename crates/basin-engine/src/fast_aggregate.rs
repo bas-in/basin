@@ -527,8 +527,20 @@ pub(crate) async fn execute_metadata_aggregate(
     // freshly-flushed rows. Discard it and reload below from the post-flush
     // catalog head. Without a shard there is nothing to flush and the
     // prefetched meta is exact, so we keep it (saves a catalog round-trip).
+    // Use the NON-BLOCKING read-path drain (`flush_to_parquet_for_read`): a
+    // partition currently being compacted by an in-flight write-path drain is
+    // skipped rather than waited on. Under a heavy sustained COPY the write
+    // path holds each partition's compaction lock across object-store PUTs +
+    // the catalog commit; the blocking `flush_to_parquet` would queue this
+    // read behind that work, which is the observed "count(*) hangs during
+    // ingest" symptom. The metadata aggregate is documented to reflect the
+    // last COMMITTED segment state (the quiesce-drain converges the in-flight
+    // tail once ingest idles), so skipping an actively-compacting partition
+    // cannot return a wrong count — it reads exactly what that compaction has
+    // committed. `BASIN_FASTAGG_BLOCKING_FLUSH=1` restores the legacy blocking
+    // drain. See `InProcessShard::compact_all_for_read`.
     let prefetched_meta = if let Some(shard) = sess.engine.config().shard.as_ref() {
-        shard.flush_to_parquet().await?;
+        shard.flush_to_parquet_for_read().await?;
         None
     } else {
         prefetched_meta

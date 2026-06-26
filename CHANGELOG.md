@@ -8,6 +8,44 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Fix: `count(*)`/`max` no longer blocks behind in-flight compaction during heavy ingest
+
+**A bare metadata aggregate (`SELECT count(*)`/`max(id)`) issued during a heavy
+sustained COPY could stall for the duration of an in-flight compaction.** The
+metadata fast-aggregate read path (`execute_metadata_aggregate`) synchronously
+called `Shard::flush_to_parquet()` before reading the catalog, which ran
+`compact_all` → `compact_one` and acquired each partition's per-partition
+compaction lock with a BLOCKING `lock().await`. Under sustained ingest the write
+path holds that same lock across object-store PUTs + the catalog commit (the
+soft-cap proactive drain, the hard-cap backpressure flush, and the 30 s
+background tick all go through `compact_one`), so the read serialized behind the
+write path's compaction — the observed "count(\*) hangs while ingest is running,
+fast once it stops" symptom.
+
+- **The read path now drains NON-BLOCKING w.r.t. the write path.** New
+  `Shard::flush_to_parquet_for_read()` (→ `InProcessShard::compact_all_for_read`)
+  acquires each partition's compaction lock with `try_lock`: a partition already
+  being compacted by an in-flight write-path drain is SKIPPED rather than waited
+  on. The metadata read then reflects the catalog's last COMMITTED segment
+  state, which already includes whatever the in-flight compaction commits.
+- **Correctness-preserving.** A bare metadata aggregate is documented to reflect
+  committed segment state, not the un-compacted in-RAM tail (the quiesce-drain,
+  `BASIN_QUIESCE_COMPACT_SECS`, converges that tail once ingest idles). Skipping
+  an actively-compacting partition therefore cannot return a WRONG count — at
+  worst it omits the residual tail an in-flight bounded drain hasn't committed
+  yet, the same row that would not be visible had the read arrived a moment
+  earlier. Exactly-once, the #34 durable barrier, the #27 chunked-bounded
+  baseline, the per-partition compaction lock's anti-double-commit guarantee,
+  the create-if-absent CAS commit, and the quiesce-drain are all untouched (the
+  blocking `flush_to_parquet` still backs every write/quiesce drain).
+- **Flag to restore the old behaviour:** `BASIN_FASTAGG_BLOCKING_FLUSH=1` makes
+  the read path use the legacy blocking full-tail drain (a read that waits for
+  the in-flight compaction and thus includes the residual tail).
+- **Test:** `in_process::tests::flush_for_read_does_not_block_on_held_compaction_lock`
+  holds a partition's compaction lock and asserts `flush_to_parquet_for_read`
+  returns promptly while the blocking `flush_to_parquet` waits, then that the
+  count converges exactly after the lock releases.
+
 ## Unreleased — Perf (opt-in): faster compaction encode for ingest-throughput-over-disk-size workloads
 
 **Flag-gated lever for the single-node bulk-COPY ingest CPU ceiling.** Sustained

@@ -1782,6 +1782,86 @@ impl InProcessShard {
         Ok(())
     }
 
+    /// Read-path drain that is NON-BLOCKING w.r.t. the write path.
+    ///
+    /// Identical to `compact_all` except each per-partition compaction acquires
+    /// the compaction lock with `try_lock` (see `compact_one_impl`'s
+    /// `skip_if_locked`): a partition whose lock is currently held by an
+    /// in-flight write-path compaction (the soft-cap proactive drain, the
+    /// hard-cap backpressure flush, or the background tick) is SKIPPED rather
+    /// than waited on. The caller (`flush_to_parquet_for_read`) then reads the
+    /// catalog's committed segment state, which already reflects whatever that
+    /// in-flight compaction commits.
+    ///
+    /// Why this is safe for the metadata-aggregate read path: a bare
+    /// `count(*)`/`max` answered from `live_data_files()` is documented as
+    /// reflecting the last COMMITTED segment state, not the un-compacted
+    /// in-RAM tail (the quiesce-drain — `BASIN_QUIESCE_COMPACT_SECS` — exists
+    /// precisely to converge that tail promptly once ingest goes idle). Skipping
+    /// a partition that is mid-compaction therefore cannot return a WRONG count;
+    /// at worst it omits the residual tail the in-flight bounded drain hasn't
+    /// committed yet — the same row that would not yet be visible if the read
+    /// had arrived a moment earlier. The win: the read never blocks behind the
+    /// write path's object-store PUTs + catalog commit, so a `count(*)` issued
+    /// during a heavy sustained COPY returns in catalog-read time instead of
+    /// stalling for the duration of an in-flight compaction.
+    async fn compact_all_for_read(&self) -> Result<()> {
+        use futures::stream::{FuturesUnordered, StreamExt as _};
+        use tokio::sync::Semaphore;
+
+        let mut snapshot: PartitionSnapshot = {
+            let map = self.partitions.lock().await;
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        // Owner-only compaction (multi-node), identical gate to `compact_all`.
+        if self.cfg.lease_registry.is_some() {
+            let held: std::collections::HashSet<(ProjectId, PartitionKey)> = {
+                let h = self.held_leases.lock().await;
+                h.keys().cloned().collect()
+            };
+            snapshot.retain(|((project, partition), _)| {
+                held.contains(&(*project, partition.clone()))
+            });
+        }
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+
+        let concurrency = std::env::var("BASIN_SHARD_COMPACTION_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            });
+        let permits = Arc::new(Semaphore::new(concurrency));
+
+        let mut futs = FuturesUnordered::new();
+        for ((project, partition), state) in snapshot {
+            let permits = permits.clone();
+            futs.push(async move {
+                let _permit = permits.acquire_owned().await.expect("compaction semaphore");
+                let res = self
+                    .compact_one_impl(&project, &partition, state, true)
+                    .await;
+                (project, partition, res)
+            });
+        }
+        while let Some((project, partition, res)) = futs.next().await {
+            if let Err(e) = res {
+                warn!(
+                    %project,
+                    %partition,
+                    error = %e,
+                    "read-path compaction failed for partition; will retry next tick",
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Read-freshness convergence: drain every resident partition's residual
     /// tail PROMPTLY once shard-wide ingest has gone idle.
     ///
@@ -1847,6 +1927,30 @@ impl InProcessShard {
         partition: &PartitionKey,
         state: Arc<RwLock<PartitionState>>,
     ) -> Result<()> {
+        self.compact_one_impl(project, partition, state, false).await
+    }
+
+    /// Per-partition compaction body. `skip_if_locked == true` makes the
+    /// compaction-lock acquisition NON-BLOCKING: if another compaction
+    /// (a write-path proactive/hard-cap drain or the background tick) already
+    /// holds the lock, return immediately instead of waiting behind its
+    /// object-store PUTs + catalog commit. The in-flight compaction is already
+    /// draining this partition toward the catalog, so a caller that only needs
+    /// the committed segment state (the metadata `count(*)`/`max` read path —
+    /// see `flush_to_parquet_for_read`) loses nothing by not waiting: it reads
+    /// whatever that compaction has committed, exactly the "consistent-after-
+    /// commit" visibility the metadata-aggregate path already documents.
+    ///
+    /// `skip_if_locked == false` is the original blocking behaviour used by the
+    /// write path and the read-freshness drains, where the caller must observe
+    /// a fully drained tail.
+    async fn compact_one_impl(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        state: Arc<RwLock<PartitionState>>,
+        skip_if_locked: bool,
+    ) -> Result<()> {
         // Serialize compaction per partition (#95). Clone the compaction lock
         // out under a brief read lock, then hold it across the whole body so a
         // concurrent `compact_one` on the same partition cannot snapshot and
@@ -1857,7 +1961,19 @@ impl InProcessShard {
             let guard = state.read().await;
             guard.compact_lock.clone()
         };
-        let _compact_guard = compact_lock.lock().await;
+        // Non-blocking read-path variant: if a compaction is already in flight
+        // for this partition, don't wait behind it. `try_lock` keeps the
+        // guard's lifetime tied to this scope; bind it so the guard outlives
+        // the body when we DO acquire it.
+        let _compact_guard;
+        if skip_if_locked {
+            match compact_lock.try_lock() {
+                Ok(g) => _compact_guard = g,
+                Err(_) => return Ok(()),
+            }
+        } else {
+            _compact_guard = compact_lock.lock().await;
+        }
 
         // Drain the partition tail in BOUNDED passes. Each pass snapshots a
         // prefix of each table's tail capped at `MAX_COMPACTION_ROWS` rows,
@@ -3901,6 +4017,26 @@ impl ShardImpl for InProcessShard {
 
     async fn flush_to_parquet(&self) -> Result<()> {
         self.compact_all().await
+    }
+
+    async fn flush_to_parquet_for_read(&self) -> Result<()> {
+        // Default: non-blocking w.r.t. the write path (skip partitions whose
+        // compaction lock is held by an in-flight write-path drain). Set
+        // `BASIN_FASTAGG_BLOCKING_FLUSH=1` to restore the legacy behaviour where
+        // the read waits for a full tail drain (and may therefore block behind
+        // an active COPY's compaction). The flag exists because the non-blocking
+        // path can, mid-ingest, omit the residual tail of a partition that is
+        // currently compacting — a count that is correct-as-of-last-commit but
+        // may trail the blocking path's count by the in-flight tail.
+        let blocking = matches!(
+            std::env::var("BASIN_FASTAGG_BLOCKING_FLUSH").as_deref(),
+            Ok("1") | Ok("true")
+        );
+        if blocking {
+            self.compact_all().await
+        } else {
+            self.compact_all_for_read().await
+        }
     }
 
     async fn run_stripe_merge_once(&self) -> Result<()> {
@@ -6297,6 +6433,75 @@ mod tests {
             N,
             "concurrent compaction must not duplicate rows (got {}, want {N})",
             rows_in(&read),
+        );
+    }
+
+    /// Read-path latency bound: `flush_to_parquet_for_read` (the metadata
+    /// `count(*)`/`max` drain) must NOT block behind an in-flight write-path
+    /// compaction. We simulate a stuck/long compaction by holding the
+    /// partition's `compact_lock` for the whole test and assert that
+    /// `flush_to_parquet_for_read` still returns promptly, whereas the blocking
+    /// `flush_to_parquet` would queue behind the held lock (we bound it with a
+    /// timeout to prove the difference without flaking on the held branch).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_for_read_does_not_block_on_held_compaction_lock() {
+        let (shard, _sd, _wd, _storage, _cat, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        let handle = shard.get(&project, &partition).await.unwrap();
+        // A resident tail so the drain has something to (try to) do.
+        for i in 0..16i64 {
+            handle.write_batch(&table, batch(i, 1, "v-")).await.unwrap();
+        }
+
+        // Grab the partition's compaction lock and hold it for the duration of
+        // the read-path flush, standing in for an in-flight write-path drain
+        // (proactive soft-cap / hard-cap flush / background tick).
+        let inner = impl_of(&shard);
+        let compact_lock = {
+            let map = inner.partitions.lock().await;
+            let state = map.get(&(project, partition.clone())).unwrap().clone();
+            let g = state.read().await;
+            g.compact_lock.clone()
+        };
+        let held = compact_lock.lock_owned().await;
+
+        // Non-blocking read drain must return promptly despite the held lock.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            shard.flush_to_parquet_for_read(),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "flush_to_parquet_for_read must not block on a held compaction lock",
+        );
+        res.unwrap().unwrap();
+
+        // And the legacy blocking drain DOES wait on the same held lock (it
+        // would only complete once we release it) — confirms the lock is what
+        // gates compaction and that the read-path variant is the one that skips.
+        let blocking = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            shard.flush_to_parquet(),
+        )
+        .await;
+        assert!(
+            blocking.is_err(),
+            "blocking flush_to_parquet is expected to wait on the held compaction lock",
+        );
+
+        // Release the lock; a subsequent read-path drain converges the tail and
+        // the row count is exactly what was written (no loss / no duplication).
+        drop(held);
+        shard.flush_to_parquet_for_read().await.unwrap();
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(
+            rows_in(&read),
+            16,
+            "after lock release the read drain must converge to the exact row count",
         );
     }
 

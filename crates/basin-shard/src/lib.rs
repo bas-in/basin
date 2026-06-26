@@ -436,6 +436,15 @@ impl Shard {
         self.inner.flush_to_parquet().await
     }
 
+    /// Read-freshness drain for the metadata-aggregate fast path
+    /// (`count(*)`/`max`) that does NOT block behind an in-flight write-path
+    /// compaction. See [`ShardImpl::flush_to_parquet_for_read`]. Use this on
+    /// the read path; `flush_to_parquet` (blocking, full-tail drain) remains
+    /// the write/quiesce drain.
+    pub async fn flush_to_parquet_for_read(&self) -> Result<()> {
+        self.inner.flush_to_parquet_for_read().await
+    }
+
     /// Run one stripe-merge sweep synchronously (merge cold files with
     /// overlapping PK zone maps into disjoint sorted runs). The background
     /// tick does this on `BASIN_STRIPE_MERGE_SECS` cadence; benchmarks and
@@ -893,6 +902,18 @@ pub(crate) trait ShardImpl: Send + Sync {
     /// mode.
     fn lease_registry(&self) -> Option<&Arc<dyn basin_catalog::LeaseRegistry>>;
     async fn flush_to_parquet(&self) -> Result<()>;
+    /// Read-freshness drain for the metadata-aggregate fast path that is
+    /// NON-BLOCKING w.r.t. the write path: a partition currently being
+    /// compacted by an in-flight write-path drain is skipped rather than
+    /// waited on, so a `count(*)`/`max` issued during a heavy COPY returns in
+    /// catalog-read time instead of stalling behind the write path's
+    /// object-store PUTs + catalog commit. The metadata read then reflects the
+    /// committed segment state (the documented semantics — see
+    /// `flush_to_parquet`). Default delegates to the blocking `flush_to_parquet`
+    /// for backends without a per-partition compaction lock.
+    async fn flush_to_parquet_for_read(&self) -> Result<()> {
+        self.flush_to_parquet().await
+    }
     async fn run_tiering_sweep(&self) -> Result<()>;
     /// One synchronous stripe-merge sweep (see `Shard::run_stripe_merge_once`).
     /// Default: no-op for backends without per-file cold data.
