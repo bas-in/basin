@@ -8,6 +8,44 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Low-cardinality GROUP BY fast path extended to SUM / COUNT(col) / AVG
+
+**The in-process low-cardinality GROUP BY fast path now answers `SUM(col)`,
+`COUNT(col)`, and `AVG(col)` per group — not just `COUNT(*)`.** Previously a
+query like `SELECT k, SUM(v), AVG(v) FROM t GROUP BY k` over a low-cardinality
+key fell through to DataFusion's full planner + hash aggregate even though the
+existing fast path already recognised the same `GROUP BY k` shape for
+`COUNT(*)`. Now the recogniser accepts a projection of the bare key followed by
+any mix of un-aliased `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)` over
+Int64/Float64 value columns; execution reads only the key plus the referenced
+value columns (projection-pushdown) and hash-aggregates them in one pass,
+skipping DataFusion's planner overhead for the common analytical rollup shape.
+
+This is the non-selective-aggregation lever from the continuous pre-aggregation
+plan: file pruning only helps *selective* scans, so a `GROUP BY low-card-key`
+over the whole table is sped up here by cutting the per-query planning/IO to
+exactly the columns it touches.
+
+**Correctness (fast-path answer == full-scan answer, or bail):**
+- SUM/AVG/COUNT(col) follow PostgreSQL/DataFusion NULL semantics: NULLs are
+  ignored; an all-NULL group yields `SUM = NULL`, `AVG = NULL`,
+  `COUNT(col) = 0`, while `COUNT(*)` counts every row in the group.
+- Output column names (`sum(t.v)`, `count(t.v)`, `avg(t.v)`, `count(*)`),
+  types (SUM follows the column; AVG is Float64; COUNT is Int64), and
+  nullability are byte-identical to DataFusion 53's.
+- The path bails to a correct DataFusion full scan (returns `None`) on: a
+  value column that is absent or not Int64/Float64, a NULL grouping key, an
+  integer SUM that overflows i64, a key range above the low-cardinality
+  threshold, or missing catalog stats. MIN/MAX per group, aliased aggregates,
+  `DISTINCT`/expression arguments, WHERE/HAVING, and compound GROUP BY all
+  remain DataFusion's job. Same view/RLS/soft-delete/transaction gates as the
+  existing fast path apply unchanged.
+
+No new flags; the path is a transparent optimisation of an existing recogniser.
+Covered by `tests/integration/tests/groupby_low_card_aggs.rs` (Int64 + Float64
+value columns, NULL groups, and a high-cardinality bail that confirms the
+DataFusion scan returns the same values) and `fast_aggregate` unit tests.
+
 ## Unreleased — Multi-bucket partition striping wired into the hot path (#36, flag-gated, default OFF)
 
 **The Stage-2a partition→bucket striping seam is now wired end-to-end so it

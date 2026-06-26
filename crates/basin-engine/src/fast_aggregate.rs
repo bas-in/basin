@@ -1030,18 +1030,40 @@ fn fold_sum(
 
 // ─── Low-cardinality GROUP BY fast path ──────────────────────────────────────
 
-/// A recognised `SELECT key, COUNT(*) FROM t GROUP BY key` plan.
+/// One recognised per-group aggregate following the grouping key in the
+/// projection. `out_name` is the exact column name DataFusion 53 emits for
+/// the aggregate over this table, so the result schema is drop-in identical.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum GbAgg {
+    /// `COUNT(*)` → rows in the group. Output `count(*)`, Int64 non-null.
+    CountStar,
+    /// `COUNT(col)` → non-null rows of `col` in the group. Output
+    /// `count(<table>.<col>)`, Int64 non-null.
+    CountCol(String),
+    /// `SUM(col)` → Σ of non-null `col` in the group. Output
+    /// `sum(<table>.<col>)`, type follows the column (Int64→Int64,
+    /// Float64→Float64), nullable (NULL when the group is all-NULL).
+    SumCol(String),
+    /// `AVG(col)` → Σ/COUNT of non-null `col` in the group. Output
+    /// `avg(<table>.<col>)`, Float64, nullable (NULL when all-NULL).
+    AvgCol(String),
+}
+
+/// A recognised `SELECT key, <aggs...> FROM t GROUP BY key` plan.
 ///
 /// Only a single Int64 grouping column is supported; compound GROUP BY or
-/// non-Int64 keys fall back to DataFusion.  Output column names mirror what
-/// DataFusion 53 would emit for the same query:
-///   * `key_col` — same name as the grouping column
-///   * `"count(*)"` — the COUNT(*) aggregate
+/// non-Int64 keys fall back to DataFusion. The projection is the bare key
+/// followed by one or more un-aliased aggregates drawn from `COUNT(*)`,
+/// `COUNT(col)`, `SUM(col)`, `AVG(col)` (SUM/AVG over Int64/Float64 columns).
+/// Output column names/types mirror what DataFusion 53 would emit for the
+/// same query (see [`GbAgg`]).
 #[derive(Debug)]
 pub(crate) struct GroupByCountStarPlan {
     pub table: TableName,
     /// Name of the single grouping column.
     pub key_col: String,
+    /// Per-group aggregates, in projection order (after the key).
+    pub aggs: Vec<(GbAgg, String)>,
 }
 
 /// Recognise `SELECT key, COUNT(*) FROM t GROUP BY key`.
@@ -1144,8 +1166,8 @@ pub(crate) fn match_groupby_low_card(stmt: &Statement) -> Option<GroupByCountSta
         _ => return None,
     };
 
-    // Projection: exactly `key_col, COUNT(*)` — both un-aliased.
-    if select.projection.len() != 2 {
+    // Projection: bare `key_col` followed by ≥1 un-aliased aggregate.
+    if select.projection.len() < 2 {
         return None;
     }
     // First item: bare identifier matching the GROUP BY key.
@@ -1153,42 +1175,83 @@ pub(crate) fn match_groupby_low_card(stmt: &Statement) -> Option<GroupByCountSta
         SelectItem::UnnamedExpr(Expr::Identifier(id)) if id.value == key_col => {}
         _ => return None,
     }
-    // Second item: un-aliased COUNT(*).
-    match &select.projection[1] {
-        SelectItem::UnnamedExpr(Expr::Function(f)) => {
-            if f.over.is_some()
-                || f.filter.is_some()
-                || !f.within_group.is_empty()
-                || f.null_treatment.is_some()
-                || !matches!(f.parameters, FunctionArguments::None)
-            {
-                return None;
-            }
-            if f.name.0.len() != 1 {
-                return None;
-            }
-            if f.name.0[0].id_val().to_ascii_lowercase() != "count" {
-                return None;
-            }
-            let list = match &f.args {
-                FunctionArguments::List(l) => l,
-                _ => return None,
-            };
-            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
-                return None;
-            }
-            if list.args.len() != 1 {
-                return None;
-            }
-            match &list.args[0] {
-                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {}
-                _ => return None,
-            }
-        }
-        _ => return None,
+    // Remaining items: each an un-aliased recognised aggregate. The output
+    // column name is built against the bare table name (no alias), matching
+    // DataFusion 53's emitted names.
+    let table_qualifier = table.as_str().to_string();
+    let mut aggs: Vec<(GbAgg, String)> = Vec::with_capacity(select.projection.len() - 1);
+    for item in &select.projection[1..] {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) => e,
+            _ => return None,
+        };
+        let agg = match_gb_aggregate(expr, &table_qualifier)?;
+        aggs.push(agg);
     }
 
-    Some(GroupByCountStarPlan { table, key_col })
+    Some(GroupByCountStarPlan { table, key_col, aggs })
+}
+
+/// Match a single per-group aggregate in a low-card GROUP BY projection.
+/// Accepts un-aliased `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)` with a
+/// bare single-column argument; returns `(kind, output_column_name)` whose
+/// name is byte-identical to DataFusion 53's emitted column name. Any other
+/// shape (window/FILTER/DISTINCT/expression arg/MIN/MAX/etc.) returns `None`,
+/// dropping the whole query to DataFusion.
+fn match_gb_aggregate(expr: &Expr, table_qualifier: &str) -> Option<(GbAgg, String)> {
+    let func = match expr {
+        Expr::Function(f) => f,
+        _ => return None,
+    };
+    if func.over.is_some()
+        || func.filter.is_some()
+        || !func.within_group.is_empty()
+        || func.null_treatment.is_some()
+        || !matches!(func.parameters, FunctionArguments::None)
+    {
+        return None;
+    }
+    if func.name.0.len() != 1 {
+        return None;
+    }
+    let fname = func.name.0[0].id_val().to_ascii_lowercase();
+    let list = match &func.args {
+        FunctionArguments::List(l) => l,
+        _ => return None,
+    };
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return None;
+    }
+    if list.args.len() != 1 {
+        return None;
+    }
+    match fname.as_str() {
+        "count" => match &list.args[0] {
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                Some((GbAgg::CountStar, "count(*)".to_string()))
+            }
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                let col = bare_column(e)?;
+                let name = format!("count({table_qualifier}.{col})");
+                Some((GbAgg::CountCol(col), name))
+            }
+            _ => None,
+        },
+        "sum" | "avg" => {
+            let col = match &list.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => bare_column(e)?,
+                _ => return None,
+            };
+            let name = format!("{fname}({table_qualifier}.{col})");
+            let kind = if fname == "sum" {
+                GbAgg::SumCol(col)
+            } else {
+                GbAgg::AvgCol(col)
+            };
+            Some((kind, name))
+        }
+        _ => None,
+    }
 }
 
 fn gb_single_part_table(name: &ObjectName) -> Option<TableName> {
@@ -1198,16 +1261,48 @@ fn gb_single_part_table(name: &ObjectName) -> Option<TableName> {
     TableName::new(name.0[0].id_val().clone()).ok()
 }
 
-/// Execute a recognised low-cardinality GROUP BY COUNT(*) plan.
+/// Numeric type of a SUM/AVG value column, resolved from the table schema.
+#[derive(Clone, Copy, PartialEq)]
+enum ValTy {
+    Int64,
+    Float64,
+}
+
+/// Running per-group accumulator for one value column referenced by a
+/// SUM/AVG/COUNT(col). `sum_*` accumulate only NON-NULL values (PG/DataFusion
+/// semantics: SUM/AVG ignore NULLs; COUNT(col) counts non-nulls). `non_null`
+/// is the count of non-null values in the group. A group with `non_null == 0`
+/// yields `SUM = NULL`, `AVG = NULL`, `COUNT(col) = 0` — matching DataFusion.
+#[derive(Default, Clone)]
+struct ColAcc {
+    sum_i: i128,
+    sum_f: f64,
+    non_null: i64,
+}
+
+/// Per-group state: COUNT(*) plus one [`ColAcc`] per referenced value column.
+#[derive(Clone)]
+struct GroupState {
+    count_star: i64,
+    cols: Vec<ColAcc>,
+}
+
+/// Execute a recognised low-cardinality GROUP BY plan (`key` + COUNT(*),
+/// COUNT(col), SUM(col), AVG(col)).
 ///
 /// Returns:
-/// * `Ok(Some(result))` — a multi-row `RecordBatch` with schema `(key, count(*))`.
-/// * `Ok(None)` — cardinality gate failed or catalog stats insufficient; caller
-///   falls through to DataFusion for a correct full scan.
+/// * `Ok(Some(result))` — a multi-row `RecordBatch` whose schema is
+///   `(key, <agg cols...>)`, byte-identical to DataFusion 53's output.
+/// * `Ok(None)` — cardinality gate failed, catalog stats insufficient, a
+///   value column is absent / not Int64|Float64, a NULL key was seen, or an
+///   integer SUM overflowed i64; the caller falls through to DataFusion for
+///   a correct full scan.
 ///
-/// The output column names match DataFusion 53 exactly:
-/// * column 0: `key_col` (same name as the grouping column, same type)
-/// * column 1: `"count(*)"` (Int64, non-nullable)
+/// Correctness: every group's aggregates are computed from a full read of
+/// the (projection-limited) value columns — there is no metadata shortcut on
+/// the value side, so the per-group result equals the full-scan result. The
+/// path only avoids DataFusion's planner/hash-aggregate overhead and reads
+/// strictly the columns the query needs.
 pub(crate) async fn execute_groupby_low_card(
     sess: &ProjectSession,
     plan: GroupByCountStarPlan,
@@ -1238,6 +1333,41 @@ pub(crate) async fn execute_groupby_low_card(
         return Ok(None);
     }
 
+    // Resolve the distinct set of value columns referenced by SUM/AVG/COUNT(col),
+    // verifying each is Int64 or Float64. COUNT(*) references no column. Each
+    // aggregate is mapped to the index of its value column in `val_cols` (or
+    // `usize::MAX` for COUNT(*)).
+    let mut val_cols: Vec<(String, ValTy)> = Vec::new();
+    let mut agg_col_idx: Vec<usize> = Vec::with_capacity(plan.aggs.len());
+    for (kind, _) in &plan.aggs {
+        let col = match kind {
+            GbAgg::CountStar => {
+                agg_col_idx.push(usize::MAX);
+                continue;
+            }
+            GbAgg::CountCol(c) | GbAgg::SumCol(c) | GbAgg::AvgCol(c) => c,
+        };
+        // Find-or-insert the value column. Resolve its type from the schema.
+        let idx = match val_cols.iter().position(|(name, _)| name == col) {
+            Some(i) => i,
+            None => {
+                let field = match meta.schema.fields().iter().find(|f| f.name() == col) {
+                    Some(f) => f,
+                    None => return Ok(None),
+                };
+                let ty = match field.data_type() {
+                    DataType::Int64 => ValTy::Int64,
+                    DataType::Float64 => ValTy::Float64,
+                    // MIN/MAX-free path: only numeric SUM/AVG/COUNT supported.
+                    _ => return Ok(None),
+                };
+                val_cols.push((col.clone(), ty));
+                val_cols.len() - 1
+            }
+        };
+        agg_col_idx.push(idx);
+    }
+
     let files = meta.live_data_files();
 
     // Cardinality gate: derive the global key range from per-file catalog stats.
@@ -1262,15 +1392,14 @@ pub(crate) async fn execute_groupby_low_card(
         global_max = Some(global_max.map_or(file_max, |m| m.max(file_max)));
     }
 
+    // Output schema (shared by the empty-table and populated paths).
+    let out_schema = build_gb_out_schema(&key_field, &plan.aggs, &val_cols);
+
     // Empty table — return empty result (DataFusion would return zero rows).
     if files.is_empty() {
-        let key_schema = Arc::new(Schema::new(vec![
-            key_field.as_ref().clone(),
-            Field::new("count(*)", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::new_empty(key_schema.clone());
+        let batch = RecordBatch::new_empty(out_schema.clone());
         return Ok(Some(ExecResult::Rows {
-            schema: key_schema,
+            schema: out_schema,
             batches: vec![batch],
         }));
     }
@@ -1292,16 +1421,22 @@ pub(crate) async fn execute_groupby_low_card(
         .map(|f| object_store::path::Path::from(f.path.as_str()))
         .collect();
 
-    // Read ONLY the key column from all files. No LIMIT pushdown: a GROUP
-    // BY aggregate has to see every row.
+    // Read the key column plus every referenced value column. Projection order
+    // is `[key, val_cols...]`; the read returns columns in that order. No LIMIT
+    // pushdown: a GROUP BY aggregate has to see every row.
+    let mut projection = Vec::with_capacity(1 + val_cols.len());
+    projection.push(plan.key_col.clone());
+    for (name, _) in &val_cols {
+        projection.push(name.clone());
+    }
     let opts = basin_storage::ReadOptions {
-        projection: Some(vec![plan.key_col.clone()]),
+        projection: Some(projection),
         filters: vec![],
         partition: None,
         limit: None,
         row_group_selection: None,
         row_selection: None,
-            sorted_by: None,
+        sorted_by: None,
     };
     let schema_ref = Some(meta.schema.clone());
 
@@ -1312,57 +1447,201 @@ pub(crate) async fn execute_groupby_low_card(
         .read_paths_with_schema(&sess.project, live_paths, opts, schema_ref)
         .await?;
 
-    // Accumulate per-key row counts across all batches.
-    let mut counts: HashMap<i64, i64> = HashMap::new();
+    // Accumulate per-key group state across all batches.
+    let ncols = val_cols.len();
+    let new_state = || GroupState {
+        count_star: 0,
+        cols: vec![ColAcc::default(); ncols],
+    };
+    let mut groups: HashMap<i64, GroupState> = HashMap::new();
     let mut batches_stream = stream;
     while let Some(batch_result) = batches_stream.next().await {
         let batch = batch_result?;
-        let col = batch.column(0);
-        let arr = match col.as_any().downcast_ref::<Int64Array>() {
+        // Column 0 is the key; columns 1..=ncols are the value columns in
+        // `val_cols` order. Downcast each up front; bail on any type surprise.
+        let key_arr = match batch.column(0).as_any().downcast_ref::<Int64Array>() {
             Some(a) => a,
-            None => return Ok(None), // unexpected type — bail
+            None => return Ok(None),
         };
-        for i in 0..arr.len() {
-            if arr.is_null(i) {
-                // NULL keys: DataFusion includes NULL as its own group.
-                // To stay correct we would need a separate NULL counter.
-                // For now, bail to DataFusion when any NULL key is present.
+        // Resolve value arrays once per batch.
+        enum ValArr<'a> {
+            Int(&'a Int64Array),
+            Float(&'a Float64Array),
+        }
+        let mut val_arrs: Vec<ValArr> = Vec::with_capacity(ncols);
+        for (ci, (_, ty)) in val_cols.iter().enumerate() {
+            let col = batch.column(ci + 1);
+            let va = match ty {
+                ValTy::Int64 => match col.as_any().downcast_ref::<Int64Array>() {
+                    Some(a) => ValArr::Int(a),
+                    None => return Ok(None),
+                },
+                ValTy::Float64 => match col.as_any().downcast_ref::<Float64Array>() {
+                    Some(a) => ValArr::Float(a),
+                    None => return Ok(None),
+                },
+            };
+            val_arrs.push(va);
+        }
+        for i in 0..key_arr.len() {
+            if key_arr.is_null(i) {
+                // NULL keys: DataFusion includes NULL as its own group. To
+                // stay correct we'd need a separate NULL group; bail instead.
                 return Ok(None);
             }
-            *counts.entry(arr.value(i)).or_insert(0) += 1;
+            let st = groups.entry(key_arr.value(i)).or_insert_with(new_state);
+            st.count_star += 1;
+            for (ci, va) in val_arrs.iter().enumerate() {
+                match va {
+                    ValArr::Int(a) => {
+                        if !a.is_null(i) {
+                            let acc = &mut st.cols[ci];
+                            acc.sum_i += a.value(i) as i128;
+                            acc.non_null += 1;
+                        }
+                    }
+                    ValArr::Float(a) => {
+                        if !a.is_null(i) {
+                            let acc = &mut st.cols[ci];
+                            acc.sum_f += a.value(i);
+                            acc.non_null += 1;
+                        }
+                    }
+                }
+            }
         }
     }
 
     // Safety: actual distinct count after reading must not exceed threshold
     // (the range-based gate is an upper bound, not exact).
-    if counts.len() as i64 > LOW_CARD_THRESHOLD {
+    if groups.len() as i64 > LOW_CARD_THRESHOLD {
         return Ok(None);
     }
 
     // Sort by key ascending — DataFusion's hash-aggregate output order is
-    // non-deterministic, but the differential test normalises rows.  Sorting
-    // here matches the most common expectation and makes the result stable.
-    let mut sorted_pairs: Vec<(i64, i64)> = counts.into_iter().collect();
-    sorted_pairs.sort_unstable_by_key(|(k, _)| *k);
+    // non-deterministic, but the differential test normalises rows. Sorting
+    // here makes the result stable.
+    let mut sorted: Vec<(i64, GroupState)> = groups.into_iter().collect();
+    sorted.sort_unstable_by_key(|(k, _)| *k);
 
-    let key_vals: Vec<i64> = sorted_pairs.iter().map(|(k, _)| *k).collect();
-    let cnt_vals: Vec<i64> = sorted_pairs.iter().map(|(_, c)| *c).collect();
+    // Build the output columns: key first, then one array per aggregate.
+    let mut out_cols: Vec<ArrayRef> = Vec::with_capacity(1 + plan.aggs.len());
+    let key_vals: Vec<i64> = sorted.iter().map(|(k, _)| *k).collect();
+    out_cols.push(Arc::new(Int64Array::from(key_vals)));
 
-    let out_schema = Arc::new(Schema::new(vec![
-        key_field.as_ref().clone(),
-        Field::new("count(*)", DataType::Int64, false),
-    ]));
+    for (ai, (kind, _)) in plan.aggs.iter().enumerate() {
+        let arr: ArrayRef = match kind {
+            GbAgg::CountStar => {
+                let v: Vec<i64> = sorted.iter().map(|(_, s)| s.count_star).collect();
+                Arc::new(Int64Array::from(v))
+            }
+            GbAgg::CountCol(_) => {
+                let ci = agg_col_idx[ai];
+                let v: Vec<i64> = sorted.iter().map(|(_, s)| s.cols[ci].non_null).collect();
+                Arc::new(Int64Array::from(v))
+            }
+            GbAgg::SumCol(_) => {
+                let ci = agg_col_idx[ai];
+                match val_cols[ci].1 {
+                    ValTy::Int64 => {
+                        // SUM(int64) → Int64; NULL when the group is all-NULL.
+                        // Bail if any group's i128 sum overflows i64 (DataFusion
+                        // would error; a full scan is the honest fallback).
+                        let mut vals: Vec<Option<i64>> = Vec::with_capacity(sorted.len());
+                        for (_, s) in &sorted {
+                            let acc = &s.cols[ci];
+                            if acc.non_null == 0 {
+                                vals.push(None);
+                            } else if acc.sum_i < i64::MIN as i128
+                                || acc.sum_i > i64::MAX as i128
+                            {
+                                return Ok(None);
+                            } else {
+                                vals.push(Some(acc.sum_i as i64));
+                            }
+                        }
+                        Arc::new(Int64Array::from(vals))
+                    }
+                    ValTy::Float64 => {
+                        let vals: Vec<Option<f64>> = sorted
+                            .iter()
+                            .map(|(_, s)| {
+                                let acc = &s.cols[ci];
+                                (acc.non_null > 0).then_some(acc.sum_f)
+                            })
+                            .collect();
+                        Arc::new(Float64Array::from(vals))
+                    }
+                }
+            }
+            GbAgg::AvgCol(_) => {
+                // AVG → Float64; NULL when the group is all-NULL. Divisor is
+                // the non-null count (PG/DataFusion semantics).
+                let ci = agg_col_idx[ai];
+                let ty = val_cols[ci].1;
+                let vals: Vec<Option<f64>> = sorted
+                    .iter()
+                    .map(|(_, s)| {
+                        let acc = &s.cols[ci];
+                        if acc.non_null == 0 {
+                            None
+                        } else {
+                            let sum = match ty {
+                                ValTy::Int64 => acc.sum_i as f64,
+                                ValTy::Float64 => acc.sum_f,
+                            };
+                            Some(sum / acc.non_null as f64)
+                        }
+                    })
+                    .collect();
+                Arc::new(Float64Array::from(vals))
+            }
+        };
+        out_cols.push(arr);
+    }
 
-    let key_array: ArrayRef = Arc::new(Int64Array::from(key_vals));
-    let cnt_array: ArrayRef = Arc::new(Int64Array::from(cnt_vals));
-
-    let batch = RecordBatch::try_new(out_schema.clone(), vec![key_array, cnt_array])
+    let batch = RecordBatch::try_new(out_schema.clone(), out_cols)
         .map_err(|e| BasinError::internal(format!("groupby_low_card result batch: {e}")))?;
 
     Ok(Some(ExecResult::Rows {
         schema: out_schema,
         batches: vec![batch],
     }))
+}
+
+/// Build the GROUP BY output schema: the key field (verbatim) followed by one
+/// field per aggregate, with DataFusion 53's column names / types /
+/// nullability. COUNT(*) and COUNT(col) are Int64 non-null; SUM follows the
+/// column type and is nullable; AVG is Float64 nullable.
+fn build_gb_out_schema(
+    key_field: &Field,
+    aggs: &[(GbAgg, String)],
+    val_cols: &[(String, ValTy)],
+) -> Arc<Schema> {
+    let mut fields: Vec<Field> = Vec::with_capacity(1 + aggs.len());
+    fields.push(key_field.clone());
+    for (kind, out_name) in aggs {
+        let field = match kind {
+            GbAgg::CountStar | GbAgg::CountCol(_) => {
+                Field::new(out_name, DataType::Int64, false)
+            }
+            GbAgg::SumCol(c) => {
+                let ty = val_cols
+                    .iter()
+                    .find(|(n, _)| n == c)
+                    .map(|(_, t)| *t)
+                    .unwrap_or(ValTy::Int64);
+                let dt = match ty {
+                    ValTy::Int64 => DataType::Int64,
+                    ValTy::Float64 => DataType::Float64,
+                };
+                Field::new(out_name, dt, true)
+            }
+            GbAgg::AvgCol(_) => Field::new(out_name, DataType::Float64, true),
+        };
+        fields.push(field);
+    }
+    Arc::new(Schema::new(fields))
 }
 
 #[cfg(test)]
@@ -1735,6 +2014,56 @@ mod tests {
         let plan = match_groupby_low_card(&stmt).expect("should match");
         assert_eq!(plan.table.as_str(), "t");
         assert_eq!(plan.key_col, "k");
+        assert_eq!(plan.aggs, vec![(GbAgg::CountStar, "count(*)".to_string())]);
+    }
+
+    #[test]
+    fn groupby_matches_sum_count_avg_with_df_names() {
+        let stmt =
+            parse_one("SELECT k, COUNT(*), SUM(v), COUNT(v), AVG(v) FROM t GROUP BY k");
+        let plan = match_groupby_low_card(&stmt).expect("should match");
+        assert_eq!(plan.key_col, "k");
+        assert_eq!(
+            plan.aggs,
+            vec![
+                (GbAgg::CountStar, "count(*)".to_string()),
+                (GbAgg::SumCol("v".into()), "sum(t.v)".to_string()),
+                (GbAgg::CountCol("v".into()), "count(t.v)".to_string()),
+                (GbAgg::AvgCol("v".into()), "avg(t.v)".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn groupby_matches_sum_only() {
+        // The named non-selective shape: `SELECT k, SUM(v) ... GROUP BY k`.
+        let stmt = parse_one("SELECT k, SUM(v) FROM t GROUP BY k");
+        let plan = match_groupby_low_card(&stmt).expect("should match");
+        assert_eq!(plan.aggs, vec![(GbAgg::SumCol("v".into()), "sum(t.v)".to_string())]);
+    }
+
+    #[test]
+    fn groupby_rejects_min_max_agg() {
+        // MIN/MAX per group is not yet supported on this path → DataFusion.
+        assert!(match_groupby_low_card(&parse_one("SELECT k, MIN(v) FROM t GROUP BY k")).is_none());
+        assert!(match_groupby_low_card(&parse_one("SELECT k, MAX(v) FROM t GROUP BY k")).is_none());
+    }
+
+    #[test]
+    fn groupby_rejects_distinct_and_expr_agg() {
+        assert!(
+            match_groupby_low_card(&parse_one("SELECT k, SUM(DISTINCT v) FROM t GROUP BY k"))
+                .is_none()
+        );
+        assert!(
+            match_groupby_low_card(&parse_one("SELECT k, SUM(a + b) FROM t GROUP BY k")).is_none()
+        );
+    }
+
+    #[test]
+    fn groupby_rejects_aliased_sum() {
+        let stmt = parse_one("SELECT k, SUM(v) AS s FROM t GROUP BY k");
+        assert!(match_groupby_low_card(&stmt).is_none());
     }
 
     #[test]
