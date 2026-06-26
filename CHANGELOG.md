@@ -8,6 +8,26 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Docs/tests: per-project pgwire rate limiting (catalog-driven) is shipped, not deferred
+
+The per-project (per-tier) pgwire request rate limiter (#18) is fully wired —
+catalog-driven override + global env default, enforced on the simple- and
+extended-query hot paths — but `CAPABILITIES.md` still described per-project
+overrides and catalog config as "deferred to v0.2". Corrected the capability
+row and the `rate_limit.rs` module docs to describe the shipped two-layer
+design (global `BASIN_PGWIRE_RATE_LIMIT_QPS` default + lazily-resolved,
+cached `Catalog::get_project_rate_limit_qps` override; over-limit → SQLSTATE
+`53400`; disabled-by-default is a true no-op gated behind `Option`).
+
+- `PgRateLimit::has_override` is now public (queryable telemetry/admin surface,
+  mirroring `ConnectionLimiter`'s `live_count`/`get`), resolving its dead-code
+  warning honestly instead of with an `#[allow]`.
+- Added unit/async/concurrency tests: catalog override beats the default and is
+  per-project isolated; absent catalog entry falls through to the default;
+  disabled config is `None` (no-op); and hammering one project's limiter from
+  many tasks neither deadlocks nor over-admits, and does not starve another
+  project. No behavior change — enforcement and defaults are unchanged.
+
 ## Unreleased — Low-cardinality GROUP BY fast path extended to SUM / COUNT(col) / AVG
 
 **The in-process low-cardinality GROUP BY fast path now answers `SUM(col)`,

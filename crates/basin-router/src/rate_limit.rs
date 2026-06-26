@@ -9,12 +9,21 @@
 //!
 //! # Quota
 //!
-//! v0.1 hard-codes 100 statements/sec sustained, burst 300 (3× sustained,
-//! same shape as the basin-net default). A per-project override and a
-//! catalog-driven config are deferred to v0.2; the env var
-//! `BASIN_PGWIRE_RATE_LIMIT_QPS` lets the operator dial the global rate
-//! at startup, with `0` (the default) disabling the limiter entirely so
-//! existing demos and benches keep their unbounded throughput.
+//! Two layers, resolved per project on the hot path:
+//!
+//! 1. **Global default** — the env var `BASIN_PGWIRE_RATE_LIMIT_QPS` sets the
+//!    sustained statements/sec every project gets when it has no per-project
+//!    override (burst is `qps × BURST_FACTOR`, same 3× shape as basin-net).
+//!    `0` / unset / empty disables the limiter entirely (the protocol-side
+//!    option is `None`), so existing demos and benches keep their unbounded
+//!    throughput — the disabled path is a true no-op (the per-query check is
+//!    behind `if let Some(rl) = &self.rate_limit`).
+//! 2. **Per-project (per-tier) override** — read from the catalog
+//!    (`Catalog::get_project_rate_limit_qps`) lazily on a project's first query
+//!    and cached for the process lifetime; the control plane pushes it per tier
+//!    via `POST /admin/v1/projects/:id/rate-limit`. When present, the project's
+//!    dedicated bucket is consulted INSTEAD of the global keyed one, so
+//!    Free/Pro/Scale can carry different caps on the same engine.
 //!
 //! # When the bucket is empty
 //!
@@ -123,7 +132,12 @@ impl PgRateLimit {
         self
     }
 
-    fn has_override(&self, project: &ProjectId) -> bool {
+    /// Whether this project currently carries a per-project quota override
+    /// (vs. falling through to the global default bucket). Cheap shared-lock
+    /// read; surfaced for telemetry / admin introspection ("is this project on
+    /// a custom cap?") and consulted by tests. Mirrors the queryable surface
+    /// `ConnectionLimiter` exposes (`live_count` / `get`).
+    pub fn has_override(&self, project: &ProjectId) -> bool {
         self.overrides
             .read()
             .expect("pg rate-limit overrides poisoned")
@@ -392,5 +406,138 @@ mod tests {
     fn from_env_trims_whitespace() {
         let rl = from_env_qps(Some("  17  ")).unwrap().unwrap();
         assert_eq!(rl.sustained_qps(), 17);
+    }
+
+    #[test]
+    fn no_limiter_constructed_is_a_true_noop() {
+        // The "disabled" config is `None` at the protocol layer — there is no
+        // limiter at all, so the hot path pays nothing. Assert the env parser
+        // produces exactly that for the default/unset case, which is what the
+        // protocol code gates on (`if let Some(rl) = &self.rate_limit`). This
+        // is the no-behavior-change-by-default guarantee.
+        assert!(from_env_qps(None).unwrap().is_none());
+        assert!(from_env_qps(Some("0")).unwrap().is_none());
+        assert!(from_env_qps(Some("")).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn catalog_override_beats_default_and_is_isolated() {
+        use basin_catalog::{Catalog, InMemoryCatalog};
+        // Generous global default; one project gets a tight per-project cap
+        // persisted in the catalog. `check_async` must resolve it lazily on
+        // first sight and apply it INSTEAD of the default.
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let capped = ProjectId::new();
+        let other = ProjectId::new();
+        catalog
+            .set_project_rate_limit_qps(&capped, 1)
+            .await
+            .unwrap(); // 1 qps × 3 burst = 3 tokens
+        let rl = PgRateLimit::with_qps(100_000).with_catalog(catalog);
+
+        // First check resolves + caches the override from the catalog.
+        rl.check_async(&capped).await.unwrap();
+        assert!(
+            rl.has_override(&capped),
+            "catalog qps should have been resolved into a per-project override"
+        );
+        // Drain the rest of the tight bucket, then it must throttle — proving
+        // the catalog override (1 qps) beat the generous 100k default.
+        for _ in 0..2 {
+            let _ = rl.check_async(&capped).await;
+        }
+        let mut throttled = false;
+        for _ in 0..10 {
+            if rl.check_async(&capped).await.is_err() {
+                throttled = true;
+                break;
+            }
+        }
+        assert!(throttled, "catalog override did not cap the project");
+
+        // A project with NO catalog override uses the generous default and is
+        // unaffected by the capped project burning its budget (isolation).
+        rl.check_async(&other)
+            .await
+            .expect("non-overridden project starved by another's catalog cap");
+        assert!(
+            !rl.has_override(&other),
+            "project without a catalog entry must not gain an override"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_absent_override_falls_through_to_default() {
+        use basin_catalog::InMemoryCatalog;
+        // No catalog entry → the project rides the global default bucket and
+        // the catalog is consulted exactly once (cached as resolved-with-no-
+        // override thereafter). A small default still admits the burst.
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let rl = PgRateLimit::with_qps(10).with_catalog(catalog);
+        let p = ProjectId::new();
+        for i in 0..20 {
+            rl.check_async(&p)
+                .await
+                .unwrap_or_else(|_| panic!("rejected at iter {i} under default"));
+        }
+        assert!(!rl.has_override(&p));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_hammer_one_project_stays_correct() {
+        // Many tasks hammering ONE project's limiter must not deadlock and must
+        // not over-admit beyond the bucket. With 1 qps × 3 burst, at most a
+        // small number of the immediate calls succeed; the rest are throttled.
+        let rl = Arc::new(PgRateLimit::with_qps(1));
+        let p = ProjectId::new();
+        let mut handles = Vec::new();
+        let allowed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..64 {
+            let rl = rl.clone();
+            let allowed = allowed.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..50 {
+                    if rl.check_async(&p).await.is_ok() {
+                        allowed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("limiter task panicked / deadlocked");
+        }
+        // 3200 attempts in a tiny wall-clock window against a 1-qps/3-burst
+        // bucket: comfortably fewer than half can succeed. The exact count is
+        // timing-dependent (governor refills against the real clock), so we
+        // assert the safety property (no runaway over-admission), not equality.
+        let n = allowed.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            n < 1600,
+            "limiter over-admitted under concurrency: {n} allowed of 3200"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_two_projects_isolated() {
+        // Hammering project A's tight bucket must not starve project B, even
+        // under concurrent contention from many tasks.
+        let rl = Arc::new(PgRateLimit::with_qps(1));
+        let a = ProjectId::new();
+        let b = ProjectId::new();
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let rl = rl.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..100 {
+                    let _ = rl.check_async(&a).await;
+                }
+            }));
+        }
+        // While A is being hammered, B's very first call must still pass.
+        let b_ok = rl.check_async(&b).await.is_ok();
+        for h in handles {
+            h.await.expect("limiter task panicked / deadlocked");
+        }
+        assert!(b_ok, "project B starved by concurrent load on project A");
     }
 }
