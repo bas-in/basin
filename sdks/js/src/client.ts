@@ -63,7 +63,9 @@ export interface BasinClientOptions {
    * Retry configuration for all network requests. Pass `false` to
    * disable retries entirely. Defaults to 3 attempts with exponential
    * backoff (250ms base, 5000ms cap), retrying on network errors, 5xx,
-   * and 429 (honouring `Retry-After`).
+   * and 429 (honouring `Retry-After`). Non-idempotent writes (POST/PATCH
+   * inserts and updates) are NOT retried unless `retryWrites: true`, since
+   * a request the server already applied could be duplicated.
    */
   retry?: RetryOptions | false;
 }

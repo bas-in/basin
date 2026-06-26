@@ -122,4 +122,61 @@ describe("withRetry", () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
     expect(response.status).toBe(500);
   });
+
+  it("POST 500 — not retried by default (writes are not idempotent)", async () => {
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValue(new Response("err", { status: 500 }));
+    const retryingFetch = withRetry(mockFetch as typeof globalThis.fetch);
+
+    const promise = retryingFetch("https://example.com/", { method: "POST" });
+    await vi.runAllTimersAsync();
+    const response = await promise;
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(response.status).toBe(500);
+  });
+
+  it("PATCH network error — not retried by default, rejects on first failure", async () => {
+    const networkError = new TypeError("Failed to fetch");
+    const mockFetch = vi.fn().mockRejectedValue(networkError);
+    const retryingFetch = withRetry(mockFetch as typeof globalThis.fetch);
+
+    await expect(
+      retryingFetch("https://example.com/", { method: "PATCH" }),
+    ).rejects.toBe(networkError);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("DELETE 500 — retried (DELETE is idempotent)", async () => {
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("err", { status: 500 }))
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }));
+    const retryingFetch = withRetry(mockFetch as typeof globalThis.fetch);
+
+    const promise = retryingFetch("https://example.com/", { method: "DELETE" });
+    await vi.runAllTimersAsync();
+    const response = await promise;
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(response.status).toBe(200);
+  });
+
+  it("POST 500 with retryWrites — retried when opted in", async () => {
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("err", { status: 500 }))
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }));
+    const retryingFetch = withRetry(mockFetch as typeof globalThis.fetch, {
+      retryWrites: true,
+    });
+
+    const promise = retryingFetch("https://example.com/", { method: "POST" });
+    await vi.runAllTimersAsync();
+    const response = await promise;
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(response.status).toBe(200);
+  });
 });

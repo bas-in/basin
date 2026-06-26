@@ -2,11 +2,31 @@ export interface RetryOptions {
   maxAttempts?: number;
   baseMs?: number;
   maxMs?: number;
+  /**
+   * Retry non-idempotent methods (POST / PATCH). Off by default: replaying a
+   * POST insert or PATCH update that the server may have already applied risks
+   * duplicate rows / double-applied mutations. Only enable when the target
+   * endpoint is itself idempotent. Mirrors basin-py's `retry_writes`.
+   */
+  retryWrites?: boolean;
   retryOn?: (
     response: Response | null,
     error: unknown,
     attempt: number,
   ) => boolean;
+}
+
+// Methods safe to replay automatically (per RFC 7231 idempotency).
+const IDEMPOTENT_METHODS = new Set([
+  "GET",
+  "HEAD",
+  "PUT",
+  "DELETE",
+  "OPTIONS",
+]);
+
+function isIdempotent(method: string): boolean {
+  return IDEMPOTENT_METHODS.has(method.toUpperCase());
 }
 
 function defaultRetryOn(
@@ -41,10 +61,18 @@ export function withRetry(
   const maxMs = opts.maxMs ?? 5000;
   const retryOn = opts.retryOn ?? defaultRetryOn;
 
+  const retryWrites = opts.retryWrites ?? false;
+
   return async function retryingFetch(
     input: RequestInfo | URL,
     init?: RequestInit,
   ): Promise<Response> {
+    const method = (init?.method ?? "GET").toUpperCase();
+    // Don't replay writes (POST/PATCH) unless explicitly opted in — a request
+    // the server already applied could be duplicated. GET/HEAD/PUT/DELETE/
+    // OPTIONS are idempotent and safe to retry.
+    const methodRetryable = retryWrites || isIdempotent(method);
+    const effectiveMaxAttempts = methodRetryable ? maxAttempts : 1;
     let attempt = 0;
 
     while (true) {
@@ -59,7 +87,7 @@ export function withRetry(
       }
 
       const shouldRetry =
-        attempt < maxAttempts && retryOn(response, fetchError, attempt);
+        attempt < effectiveMaxAttempts && retryOn(response, fetchError, attempt);
 
       if (!shouldRetry) {
         if (fetchError !== null && response === null) {
