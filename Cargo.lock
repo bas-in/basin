@@ -1031,6 +1031,7 @@ dependencies = [
  "deadpool-postgres",
  "futures",
  "httpmock",
+ "lru",
  "object_store",
  "reqwest",
  "rpds",

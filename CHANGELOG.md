@@ -8,6 +8,37 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Perf: content-addressed baseline-chunk read cache (read latency under heavy ingest)
+
+**A read concurrent with sustained ingest re-fetched the same immutable baseline
+chunk objects on every query.** After the non-blocking-read fix above, a bare
+`count(*)`/`max` under ~40k row/s ingest still took ~10 s (vs <1 s on a quiet
+table). The residual was the catalog FOLD on the read path: the per-partition
+folded-view cache (`part_cache`) is keyed by partition VERSION, which advances on
+EVERY commit, so a read concurrent with ingest constantly MISSES that cache and
+cold-folds via `fold_part_chain` → `load_baseline_chunks`, issuing one object-
+store GET per referenced #27 baseline chunk against a store already saturated
+with ingest PUTs (Tigris). Successive baselines REUSE every frozen chunk verbatim
+(only the open-tail chunk re-seals), so those GETs are repeated reads of the SAME
+immutable objects.
+
+- **New process-wide, content-addressed chunk read cache** (`chunk_cache`, a
+  size-capped `lru::LruCache<hash, Arc<Vec<DataFileRef>>>` on `ObjectStoreCatalog`,
+  cap `BASIN_CHUNK_CACHE_CAP`, default 4096) consulted by `load_baseline_chunks`.
+  A cold/evicted chunk falls back to the pre-existing store GET (and re-populates
+  the cache); a repeated fold of the same baseline issues ZERO chunk GETs.
+- **Correctness-preserving with NO staleness.** Baseline chunk objects are
+  IMMUTABLE and CONTENT-ADDRESSED (`parts/{pid}/chunks/{hash}.json`, the SHA-256
+  of the canonical chunk bytes IS the key/identity). A cache hit on `hash` is
+  therefore exactly the bytes the store holds — the cache can be kept forever
+  with zero correctness risk, independent of versions or commits. Exactly-once,
+  the #34 durable barrier, the #27 chunked-baseline reconstruction, the #31 head
+  probe, and the create-if-absent CAS are all untouched.
+- **Test:** `fold_reuses_cached_immutable_chunks_zero_gets_on_second_fold` seeds
+  several frozen chunks, cold-folds twice against a fresh catalog with the
+  version-keyed `part_cache` cleared between folds (emulating ingest version
+  churn), and asserts the second fold issues ZERO baseline-chunk object GETs.
+
 ## Unreleased — Fix: `count(*)`/`max` no longer blocks behind in-flight compaction during heavy ingest
 
 **A bare metadata aggregate (`SELECT count(*)`/`max(id)`) issued during a heavy

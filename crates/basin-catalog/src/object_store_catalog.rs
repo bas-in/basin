@@ -74,6 +74,7 @@ use async_trait::async_trait;
 use basin_common::{BasinError, ProjectId, QualifiedTableName, Result, SchemaName, TableName};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use lru::LruCache;
 use object_store::{path::Path as OsPath, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -96,6 +97,21 @@ pub const DEFAULT_LEASE_PREFIX: &str = "_leases/";
 /// Bound on transparent retries for an idempotent DDL mutation that lost the
 /// create-if-absent race. After this many losses we surface the conflict.
 const MAX_DDL_RETRIES: usize = 8;
+
+/// Capacity (number of distinct chunk objects) of the content-addressed baseline
+/// chunk read cache. Each entry is one `Vec<DataFileRef>` (~TARGET files), so a
+/// few thousand entries cover many large partitions' frozen chunk sets while
+/// keeping memory bounded. Overridable via `BASIN_CHUNK_CACHE_CAP`.
+const DEFAULT_CHUNK_CACHE_CAP: usize = 4096;
+
+fn chunk_cache_cap() -> std::num::NonZeroUsize {
+    let n = std::env::var("BASIN_CHUNK_CACHE_CAP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_CHUNK_CACHE_CAP);
+    std::num::NonZeroUsize::new(n).unwrap_or(std::num::NonZeroUsize::new(DEFAULT_CHUNK_CACHE_CAP).unwrap())
+}
 
 /// The full, serialisable state of one table at one catalog version.
 ///
@@ -463,6 +479,25 @@ pub struct ObjectStoreCatalog {
     /// stale hit, because the populating writes are the same ones that move the
     /// manifest.
     meta_head_cache: Mutex<HashMap<(ProjectId, String), u64>>,
+    /// Process-wide, content-addressed cache of immutable #27 baseline CHUNK
+    /// objects, keyed by content hash. A baseline chunk object lives at
+    /// `parts/{pid}/chunks/{hash}.json` and is IMMUTABLE + CONTENT-ADDRESSED:
+    /// the hash IS its identity, so its bytes can be cached forever with zero
+    /// correctness risk — a cache hit returns exactly the bytes the store holds.
+    ///
+    /// This is the read-latency win under sustained ingest. The per-partition
+    /// folded-view `part_cache` is keyed by partition VERSION, which advances on
+    /// EVERY commit, so a read concurrent with heavy ingest constantly MISSES it
+    /// and cold-folds via `fold_part_chain` → `load_baseline_chunks`, issuing one
+    /// GET per referenced chunk against a store already saturated with ingest
+    /// PUTs. But successive baselines REUSE every frozen chunk verbatim (only the
+    /// open tail re-seals), so those chunk GETs are repeated reads of the SAME
+    /// immutable objects. Caching them by hash collapses the per-read GET count to
+    /// just the (one) changed tail chunk, with NO staleness (immutable identity).
+    ///
+    /// Size-capped LRU so memory stays bounded regardless of table count/size;
+    /// the worst case on a cold/evicted entry is the pre-existing store GET.
+    chunk_cache: Mutex<LruCache<String, Arc<Vec<DataFileRef>>>>,
     /// Per-instance ("session") sequence state: the locally-reserved block and
     /// the last value handed out by *this* node. Durable disjointness across
     /// nodes comes from the persisted high-water mark (see the module docs on
@@ -524,6 +559,7 @@ impl ObjectStoreCatalog {
             cache: Mutex::new(HashMap::new()),
             part_cache: Mutex::new(HashMap::new()),
             meta_head_cache: Mutex::new(HashMap::new()),
+            chunk_cache: Mutex::new(LruCache::new(chunk_cache_cap())),
             seq_local: Mutex::new(HashMap::new()),
             seq_block_override: None,
             part_compact_override: None,
@@ -1316,8 +1352,26 @@ impl ObjectStoreCatalog {
         refs: &[BaselineChunkRef],
     ) -> Result<Vec<Vec<DataFileRef>>> {
         use futures::stream::{FuturesUnordered, StreamExt};
+
+        // Slots filled either from the process-wide content-addressed chunk cache
+        // (zero store reads) or by GETting the misses below. Chunk objects are
+        // immutable + content-addressed, so a cache hit on `hash` is ALWAYS the
+        // exact bytes the store holds — no version/staleness reasoning needed.
+        let mut cached: Vec<Option<Arc<Vec<DataFileRef>>>> = (0..refs.len()).map(|_| None).collect();
+        {
+            let mut cache = self.chunk_cache.lock().await;
+            for (idx, r) in refs.iter().enumerate() {
+                if let Some(hit) = cache.get(&r.hash) {
+                    cached[idx] = Some(hit.clone());
+                }
+            }
+        }
+
         let mut futs = FuturesUnordered::new();
         for (idx, r) in refs.iter().enumerate() {
+            if cached[idx].is_some() {
+                continue; // served from the immutable-chunk cache; no store read.
+            }
             let key = self.baseline_chunk_key(project, qtable, partition_id, &r.hash);
             let store = self.store.clone();
             let hash = r.hash.clone();
@@ -1334,15 +1388,27 @@ impl ObjectStoreCatalog {
                     .map_err(|e| storage_err("read baseline chunk", e))?;
                 let files: Vec<DataFileRef> = serde_json::from_slice(&bytes)
                     .map_err(|e| BasinError::catalog(format!("decode baseline chunk {hash}: {e}")))?;
-                Ok::<(usize, Vec<DataFileRef>), BasinError>((idx, files))
+                Ok::<(usize, String, Vec<DataFileRef>), BasinError>((idx, hash, files))
             });
         }
-        let mut slots: Vec<Option<Vec<DataFileRef>>> = (0..refs.len()).map(|_| None).collect();
+        let mut fetched: Vec<(usize, String, Arc<Vec<DataFileRef>>)> = Vec::new();
         while let Some(item) = futs.next().await {
-            let (idx, files) = item?;
-            slots[idx] = Some(files);
+            let (idx, hash, files) = item?;
+            fetched.push((idx, hash, Arc::new(files)));
         }
-        Ok(slots.into_iter().map(|s| s.unwrap_or_default()).collect())
+        // Populate the cache with the freshly-fetched (immutable) chunks.
+        if !fetched.is_empty() {
+            let mut cache = self.chunk_cache.lock().await;
+            for (idx, hash, files) in &fetched {
+                cache.put(hash.clone(), files.clone());
+                cached[*idx] = Some(files.clone());
+            }
+        }
+
+        Ok(cached
+            .into_iter()
+            .map(|s| s.map(|a| (*a).clone()).unwrap_or_default())
+            .collect())
     }
 
     /// Content hash of a chunk's canonical serialised bytes (hex SHA-256). The
@@ -5512,6 +5578,10 @@ mod tests {
         inner: Arc<dyn ObjectStore>,
         gets: std::sync::atomic::AtomicUsize,
         lists: std::sync::atomic::AtomicUsize,
+        /// Non-head GETs against a content-addressed baseline CHUNK object
+        /// (`.../chunks/{hash}.json`). The chunk-cache test asserts this drops to
+        /// zero on a repeated fold of the same immutable chunks.
+        chunk_gets: std::sync::atomic::AtomicUsize,
     }
 
     impl std::fmt::Display for CountingStore {
@@ -5526,15 +5596,20 @@ mod tests {
                 inner,
                 gets: std::sync::atomic::AtomicUsize::new(0),
                 lists: std::sync::atomic::AtomicUsize::new(0),
+                chunk_gets: std::sync::atomic::AtomicUsize::new(0),
             })
         }
         fn reset(&self) {
             self.gets.store(0, std::sync::atomic::Ordering::Relaxed);
             self.lists.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.chunk_gets.store(0, std::sync::atomic::Ordering::Relaxed);
         }
         fn reads(&self) -> usize {
             self.gets.load(std::sync::atomic::Ordering::Relaxed)
                 + self.lists.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn chunk_gets(&self) -> usize {
+            self.chunk_gets.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -5562,6 +5637,10 @@ mod tests {
         ) -> object_store::Result<object_store::GetResult> {
             if !options.head {
                 self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let k = location.as_ref();
+                if k.contains("/chunks/") && k.ends_with(".json") {
+                    self.chunk_gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             self.inner.get_opts(location, options).await
         }
@@ -5933,6 +6012,101 @@ mod tests {
             "#27 seal bound: {} chunk PUTs, {} distinct full chunks; max seal {max_seal}B (bound {seal_bound}B, whole-set {whole_bytes}B)",
             puts.len(),
             counts.len(),
+        );
+    }
+
+    // CONTENT-ADDRESSED CHUNK CACHE: a fold under churning version (the read-
+    // latency-under-ingest case) must NOT re-GET the immutable baseline chunk
+    // objects it already read on an earlier fold. We seed several FROZEN chunks,
+    // then force two cold folds against a fresh catalog (empty part_cache, so each
+    // fold cold-folds via `fold_part_chain` → `load_baseline_chunks`). The FIRST
+    // cold fold reads the chunk objects from the store; the SECOND cold fold —
+    // which references the SAME immutable chunk hashes — must serve every repeated
+    // chunk from the process-wide cache, issuing ZERO chunk-object GETs. This is
+    // exactly the win under ingest: the partition version advances on every commit
+    // (part_cache misses), but the frozen chunks are reused, so the per-read GET
+    // count collapses to the (one) changed tail with no staleness (immutable
+    // content-addressed identity).
+    #[tokio::test]
+    async fn fold_reuses_cached_immutable_chunks_zero_gets_on_second_fold() {
+        const K: u64 = 4;
+        const TARGET: u64 = 8;
+        let counting = CountingStore::new(Arc::new(InMemory::new()));
+        let store: Arc<dyn ObjectStore> = counting.clone();
+        // Big chunk cap so we stay with several FROZEN chunks (no re-chunk valve).
+        let c = ObjectStoreCatalog::with_chunk_config(store, K, true, TARGET, 1024);
+        let p = ProjectId::new();
+        let t = TableName::new("chunkcache").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Enough appends to seal several FROZEN chunks at TARGET=8.
+        const N: usize = 80;
+        for i in 0..N {
+            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file(&format!("r{i}.parquet"), 1)])
+                .await
+                .unwrap();
+        }
+
+        // The reference live set, from the warm catalog.
+        use std::collections::BTreeSet;
+        let warm: BTreeSet<String> = c
+            .load_table(&p, &t)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(warm.len(), N, "warm live set should hold all N files");
+
+        // FIRST cold fold: fresh catalog, EMPTY chunk cache. It must GET the
+        // baseline chunk objects from the store. Measure the chunk-object GETs.
+        let fresh = ObjectStoreCatalog::with_chunk_config(counting.clone(), K, true, TARGET, 1024);
+        counting.reset();
+        let cold1: BTreeSet<String> = fresh
+            .load_table(&p, &t)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        let chunk_gets_first = counting.chunk_gets();
+        assert_eq!(cold1, warm, "first cold fold must reconstruct the exact live set");
+        assert!(
+            chunk_gets_first >= 2,
+            "first cold fold must GET the frozen baseline chunk objects (cold chunk cache); \
+             got {chunk_gets_first} chunk GETs — expected several frozen chunks"
+        );
+
+        // SECOND cold fold on the SAME catalog: clear the part_cache to force a
+        // cold re-fold (emulating the version churn under ingest that constantly
+        // misses the version-keyed part_cache), but the process-wide chunk cache
+        // stays WARM. The fold must reuse the cached immutable chunks: ZERO
+        // chunk-object GETs.
+        fresh.part_cache.lock().await.clear();
+        counting.reset();
+        let cold2: BTreeSet<String> = fresh
+            .load_table(&p, &t)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        let chunk_gets_second = counting.chunk_gets();
+        assert_eq!(cold2, warm, "second cold fold must reconstruct the exact live set");
+
+        // The decisive assertion: a re-fold that references the SAME immutable
+        // content-addressed chunk objects performs ZERO chunk-object GETs — every
+        // chunk is served from the process-wide cache. This is the read-latency
+        // win under ingest with NO staleness (immutable identity).
+        assert_eq!(
+            chunk_gets_second, 0,
+            "second cold fold must issue ZERO baseline-chunk GETs (content-addressed cache \
+             reuse); first fold did {chunk_gets_first} chunk GETs, second did {chunk_gets_second}"
         );
     }
 

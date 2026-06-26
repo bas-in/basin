@@ -49,6 +49,11 @@ bytes.workspace = true
 # chunk bytes gives an immutable, dedup-friendly key so a baseline write reuses
 # prior chunks (create-if-absent) instead of re-uploading the whole live set.
 sha2.workspace = true
+# Bounded LRU for the content-addressed baseline-chunk read cache: immutable,
+# content-addressed chunk objects (`chunks/{hash}.json`) can be cached process-
+# wide forever (the hash IS the identity), collapsing the per-read fold GET count
+# under sustained ingest. Size-capped so memory stays bounded.
+lru.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
