@@ -8,6 +8,47 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Perf: bounded-staleness metadata-read snapshot cuts `count(*)`/`max` latency under heavy concurrent ingest
+
+**A metadata read (`count(*)`, `min`/`max`, any `load_table`) issued while a
+table is under sustained high-rate ingest no longer re-walks the object store on
+every query.** Under ~40k row/s ingest such reads measured ~7s (vs <1s on a
+quiet table). The cause was the read path's per-query object-store round-trips:
+each `load_table` did, per partition, a `resolve_part_head_version`
+(GET `HEAD` + HEAD seg `v` + HEAD seg `v+1`) plus a `list_partition_ids` LIST and
+a chain fold. Because the partition version advances on *every* ingest commit,
+the version-keyed `part_cache` missed on every read, so those round-trips —
+contending with the heavy PUT traffic — repeated per query.
+
+- **New bounded-staleness read-snapshot cache** (OPT-IN, default **disabled**)
+  keyed by `(project, schema.table)`. When `BASIN_READ_SNAPSHOT_TTL_MS > 0`,
+  `load_table` serves the last fully-resolved unioned `TableMetadata` for up to
+  that TTL with **zero** LIST / `HEAD` / fold round-trips; on a miss or expiry it
+  re-resolves and refreshes. The cheap META-version gate (`load_current` is
+  cache-served during ingest, since ingest never moves the META head) means a
+  read within the TTL skips the partition LIST + head probes + fold entirely.
+- **Default-off rationale:** `load_table` feeds BOTH the metadata fast-aggregate
+  path AND the scan path, and a per-partition data commit does not bump the META
+  version that gates the snapshot — so a non-zero default would let a scan miss
+  just-inserted rows for up to the TTL (a read-your-writes regression). It is
+  therefore opt-in for analytics-heavy-under-ingest deployments that accept
+  bounded staleness; default `0` keeps every read exact. (Follow-up: scope the
+  snapshot to the `count(*)`/`max` fast-aggregate path — already
+  eventually-consistent under ingest — so it can default on without affecting
+  scan freshness.)
+- **Correctness (when enabled):** the cached metadata is a real committed unioned
+  view (never a torn mix); staleness is bounded by the TTL; any DDL /
+  schema-evolution / drop / rename / single-node META-chain commit advances the
+  META version and drops the snapshot, so schema and identity are never served
+  stale and converge immediately. A `count(*)` from a ≤TTL-old snapshot is
+  metadata-read semantics — it already excludes the uncompacted WAL tail. The fix
+  touches none of exactly-once, the #34 barrier, the #27 chunked baseline, the
+  #31 probe, the create-if-absent CAS, the read-QoS try-lock, or the immutable
+  chunk cache.
+- Covered by tests asserting zero object-store round-trips for repeated reads
+  within the TTL under simulated version churn, a refresh-to-exact after the TTL,
+  and exact-every-read on a quiet table and with the cache disabled.
+
 ## Unreleased — Perf: heavy-OLAP scans prune non-matching data files from catalog min/max before any object-store GET
 
 **A selective integer-range scan (`WHERE col >= A AND col < B` on an `Int64`

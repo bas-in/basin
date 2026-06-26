@@ -104,6 +104,22 @@ const MAX_DDL_RETRIES: usize = 8;
 /// keeping memory bounded. Overridable via `BASIN_CHUNK_CACHE_CAP`.
 const DEFAULT_CHUNK_CACHE_CAP: usize = 4096;
 
+/// Default bounded-staleness read-snapshot TTL (ms). A metadata read under
+/// active ingest serves the last resolved unioned view for up to this long
+/// without re-LISTing / re-HEADing / re-folding.
+///
+/// DEFAULT IS `0` (DISABLED) — a non-zero TTL trades bounded read staleness for
+/// read throughput under ingest, and because `load_table` feeds BOTH the
+/// metadata fast-aggregate path AND the scan path (and a per-partition data
+/// commit does not bump the META version that gates the snapshot), a non-zero
+/// default would let a scan miss just-inserted rows for up to the TTL — a
+/// read-your-writes regression. So it is OPT-IN via `BASIN_READ_SNAPSHOT_TTL_MS`
+/// for analytics-heavy-under-ingest deployments that accept bounded staleness.
+/// (Follow-up: scope the snapshot to the count/max fast-aggregate path only —
+/// which is already eventually-consistent under ingest — so it can default on
+/// without affecting scan freshness.)
+const DEFAULT_READ_SNAPSHOT_TTL_MS: u64 = 0;
+
 fn chunk_cache_cap() -> std::num::NonZeroUsize {
     let n = std::env::var("BASIN_CHUNK_CACHE_CAP")
         .ok()
@@ -448,6 +464,28 @@ struct PartCacheEntry {
     segment: Arc<PartitionLive>,
 }
 
+/// One bounded-staleness read snapshot: a fully-resolved unioned
+/// [`TableMetadata`] (the exact value `load_table_q` would return), the META
+/// manifest version it was resolved against, and the instant it expires.
+///
+/// The metadata is internally consistent — it is the output of a single
+/// `load_unioned` over one committed META manifest plus a coherent pass over
+/// the partition segments — so it is never a torn mix. The META `meta_version`
+/// gate means any DDL / schema-evolution / drop (all of which advance the META
+/// head and run through `after_commit` / `invalidate`) forces a refresh
+/// regardless of the TTL, so schema and table identity are never served stale.
+/// Only the *data-file* live-set is allowed to lag, and only up to `expires_at`.
+#[derive(Clone)]
+struct ReadSnapshotEntry {
+    /// META manifest version this snapshot was resolved against; a head move
+    /// (DDL) invalidates the snapshot even before the TTL elapses.
+    meta_version: u64,
+    /// The resolved unioned metadata (a real committed view).
+    meta: Arc<TableMetadata>,
+    /// Monotonic deadline; past this the entry is stale and must be refreshed.
+    expires_at: std::time::Instant,
+}
+
 /// Basin-native shared catalog backed by an object store.
 pub struct ObjectStoreCatalog {
     store: Arc<dyn ObjectStore>,
@@ -498,6 +536,29 @@ pub struct ObjectStoreCatalog {
     /// Size-capped LRU so memory stays bounded regardless of table count/size;
     /// the worst case on a cold/evicted entry is the pre-existing store GET.
     chunk_cache: Mutex<LruCache<String, Arc<Vec<DataFileRef>>>>,
+    /// #30 bounded-staleness read-snapshot cache, keyed by `(project,
+    /// schema.table)`. Under sustained ingest the per-partition VERSION advances
+    /// on EVERY commit, so the version-keyed `part_cache` misses on every read
+    /// and each `load_table` re-pays a `list_partition_ids` LIST plus, per
+    /// partition, a `resolve_part_head_version` (GET HEAD + HEAD seg + HEAD
+    /// seg+1) and a fold — object-store round-trips that contend with the heavy
+    /// PUT traffic and push `count(*)`/`max` to multiple seconds.
+    ///
+    /// This caches the fully-resolved unioned [`TableMetadata`] for a short TTL
+    /// (`BASIN_READ_SNAPSHOT_TTL_MS`, default [`DEFAULT_READ_SNAPSHOT_TTL_MS`];
+    /// `0` disables → exact-every-read legacy). A read within the TTL is served
+    /// from here with ZERO LIST / HEAD / fold round-trips. Correctness: the
+    /// cached metadata is a real committed view (never torn), the META-version
+    /// gate forces a refresh on any DDL before the TTL elapses, and a quiet
+    /// table converges to exact within one tiny TTL. A `count(*)` answered from
+    /// a ≤TTL-old snapshot is correct metadata-read semantics — it already
+    /// excludes the uncompacted WAL tail, and the quiesce-drain converges once
+    /// ingest idles.
+    read_snapshot_cache: Mutex<HashMap<(ProjectId, String), ReadSnapshotEntry>>,
+    /// Per-catalog override for the read-snapshot TTL in ms (bypasses
+    /// `BASIN_READ_SNAPSHOT_TTL_MS`, for deterministic tests that must not race
+    /// on the process-global env var). `None` = read the env / default.
+    read_snapshot_ttl_override: Option<u64>,
     /// Per-instance ("session") sequence state: the locally-reserved block and
     /// the last value handed out by *this* node. Durable disjointness across
     /// nodes comes from the persisted high-water mark (see the module docs on
@@ -560,6 +621,8 @@ impl ObjectStoreCatalog {
             part_cache: Mutex::new(HashMap::new()),
             meta_head_cache: Mutex::new(HashMap::new()),
             chunk_cache: Mutex::new(LruCache::new(chunk_cache_cap())),
+            read_snapshot_cache: Mutex::new(HashMap::new()),
+            read_snapshot_ttl_override: None,
             seq_local: Mutex::new(HashMap::new()),
             seq_block_override: None,
             part_compact_override: None,
@@ -605,6 +668,19 @@ impl ObjectStoreCatalog {
         c.baseline_chunking_override = Some(chunking);
         c.baseline_chunk_files_override = Some(chunk_files.max(1));
         c.baseline_chunk_cap_override = Some(chunk_cap.max(1));
+        c
+    }
+
+    /// Construct with an explicit #30 read-snapshot TTL (ms), bypassing
+    /// `BASIN_READ_SNAPSHOT_TTL_MS` so parallel tests don't race on the
+    /// process-global env var. `0` disables the snapshot cache.
+    #[cfg(test)]
+    fn with_read_snapshot_ttl(store: Arc<dyn ObjectStore>, ttl_ms: u64) -> Self {
+        let mut c = Self::with_prefix(store, DEFAULT_CATALOG_PREFIX);
+        // Pin a huge compaction K so seeding stays in deltas (no baseline-write
+        // noise on the partition chains during the test's measured reads).
+        c.part_compact_override = Some(1_000_000);
+        c.read_snapshot_ttl_override = Some(ttl_ms);
         c
     }
 
@@ -988,6 +1064,13 @@ impl ObjectStoreCatalog {
                 manifest: Arc::new(manifest),
             },
         );
+        drop(cache);
+        // This is a META manifest write (DDL, schema evolution, or a single-node
+        // META-chain data-file append). The new `version` already invalidates
+        // any read snapshot via the META-version gate, but drop it explicitly so
+        // a META-chain commit converges to the new live set immediately rather
+        // than after the TTL.
+        self.invalidate_read_snapshot(project, qtable).await;
         self.bump_epoch();
     }
 
@@ -1091,6 +1174,10 @@ impl ObjectStoreCatalog {
         // cleared together).
         self.meta_head_cache.lock().await.remove(&ck);
         self.cache.lock().await.remove(&ck);
+        // A META mutation (or lost-race reload) can change schema/identity; drop
+        // the bounded-staleness read snapshot so the next read re-resolves
+        // immediately rather than serving a pre-mutation view until the TTL.
+        self.invalidate_read_snapshot(project, qtable).await;
     }
 
     // -----------------------------------------------------------------------
@@ -2042,6 +2129,27 @@ impl ObjectStoreCatalog {
             .unwrap_or(32)
     }
 
+    /// #30 bounded-staleness read-snapshot TTL. `0` disables the cache
+    /// (exact-every-read legacy). Override via `BASIN_READ_SNAPSHOT_TTL_MS`;
+    /// defaults to [`DEFAULT_READ_SNAPSHOT_TTL_MS`].
+    fn read_snapshot_ttl_ms(&self) -> u64 {
+        if let Some(ms) = self.read_snapshot_ttl_override {
+            return ms;
+        }
+        std::env::var("BASIN_READ_SNAPSHOT_TTL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_READ_SNAPSHOT_TTL_MS)
+    }
+
+    /// Drop the bounded-staleness read snapshot for one table. Called whenever
+    /// the table's META manifest mutates (DDL / drop / rename / fork) so a
+    /// schema/identity change converges immediately rather than after the TTL.
+    async fn invalidate_read_snapshot(&self, project: &ProjectId, qtable: &QualifiedTableName) {
+        let ck = self.cache_key(project, qtable);
+        self.read_snapshot_cache.lock().await.remove(&ck);
+    }
+
     /// #27: whether to write CHUNKED (content-addressed, flat-scale) baselines.
     /// Default ON. `BASIN_BASELINE_CHUNKING=0` falls back to the legacy inline
     /// baseline (the pre-#27 O(files) PUT) — an escape hatch for safety, not a
@@ -2392,8 +2500,48 @@ impl ObjectStoreCatalog {
         project: &ProjectId,
         qtable: &QualifiedTableName,
     ) -> Result<TableMetadata> {
-        let (_v, manifest) = self.load_current(project, qtable).await?;
-        // UNION every partition's data files into the returned metadata.
+        // Resolve the current META manifest. Under sustained ingest the META
+        // head never moves (ingest commits to per-partition segments, not the
+        // META chain), so `load_current` serves both head + body from cache with
+        // ZERO store round-trips — making it a safe, cheap gate for the
+        // bounded-staleness snapshot below.
+        let (meta_version, manifest) = self.load_current(project, qtable).await?;
+
+        // #30 bounded-staleness read snapshot: if enabled and a non-expired
+        // entry exists for the SAME META version, serve the already-resolved
+        // unioned view without re-LISTing partitions, re-HEAD-probing segment
+        // heads, or re-folding chains — the round-trips that contend with heavy
+        // ingest PUT traffic. The META-version gate guarantees a DDL forces a
+        // refresh even before the TTL elapses (a manifest mutation runs through
+        // `after_commit` / `invalidate`, which also drops the snapshot).
+        let ttl_ms = self.read_snapshot_ttl_ms();
+        if ttl_ms > 0 {
+            let ck = self.cache_key(project, qtable);
+            {
+                let cache = self.read_snapshot_cache.lock().await;
+                if let Some(entry) = cache.get(&ck) {
+                    if entry.meta_version == meta_version
+                        && entry.expires_at > std::time::Instant::now()
+                    {
+                        return Ok((*entry.meta).clone());
+                    }
+                }
+            }
+            // Miss / expired / stale META version: do the authoritative resolve
+            // and refresh the snapshot with a fresh deadline.
+            let meta = self.load_unioned(project, qtable, &manifest).await?;
+            let entry = ReadSnapshotEntry {
+                meta_version,
+                meta: Arc::new(meta.clone()),
+                expires_at: std::time::Instant::now()
+                    + std::time::Duration::from_millis(ttl_ms),
+            };
+            self.read_snapshot_cache.lock().await.insert(ck, entry);
+            return Ok(meta);
+        }
+
+        // TTL disabled: exact-every-read legacy path. UNION every partition's
+        // data files into the returned metadata on every call.
         self.load_unioned(project, qtable, &manifest).await
     }
 
@@ -6169,6 +6317,135 @@ mod tests {
             chunk_gets_second, 0,
             "second cold fold must issue ZERO baseline-chunk GETs (content-addressed cache \
              reuse); first fold did {chunk_gets_first} chunk GETs, second did {chunk_gets_second}"
+        );
+    }
+
+    // #30 BOUNDED-STALENESS READ SNAPSHOT: under simulated partition-version
+    // CHURN (a fresh part commit between reads, which advances the partition
+    // version and so MISSES the version-keyed part_cache), repeated `load_table`
+    // reads WITHIN the TTL must issue ZERO new object-store round-trips — no
+    // `list_partition_ids` LIST, no `resolve_part_head_version` GET(HEAD), no
+    // fold GET — serving the last resolved unioned view. A read AFTER the TTL
+    // refreshes (re-resolves, paying round-trips again), and the refreshed view
+    // is exact. This is the read-latency-under-ingest win.
+    #[tokio::test]
+    async fn read_snapshot_zero_round_trips_within_ttl_and_refreshes_after() {
+        let counting = CountingStore::new(Arc::new(InMemory::new()));
+        // 200ms TTL — long enough to do several reads inside it deterministically,
+        // short enough to expire within the test.
+        let c = ObjectStoreCatalog::with_read_snapshot_ttl(counting.clone(), 200);
+        let p = ProjectId::new();
+        let t = TableName::new("snap").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Seed a few partitions so a re-resolve would touch multiple chains.
+        const PARTS: usize = 3;
+        for i in 0..PARTS {
+            let pid = i.to_string();
+            let exp = c.current_snapshot_id_in_partition(&p, &t, &pid).await.unwrap();
+            c.append_data_files_in_partition(&p, &t, &pid, exp, vec![file(&format!("seed{i}.parquet"), 1)])
+                .await
+                .unwrap();
+        }
+
+        // First read PRIMES the snapshot (pays the full resolve).
+        let first = c.load_table(&p, &t).await.unwrap();
+        assert_eq!(first.live_data_files().len(), PARTS, "primed view = seed set");
+
+        // CHURN: commit a fresh file to partition 0. This advances partition 0's
+        // version (version-keyed part_cache now MISSES) but does NOT touch the
+        // META manifest, so the bounded-staleness snapshot stays valid.
+        let exp = c.current_snapshot_id_in_partition(&p, &t, "0").await.unwrap();
+        c.append_data_files_in_partition(&p, &t, "0", exp, vec![file("churn.parquet", 1)])
+            .await
+            .unwrap();
+
+        // Now measure: repeated reads WITHIN the TTL must touch the store ZERO
+        // times (no LIST, no GET(HEAD), no fold GET). They serve the PRIMED
+        // (pre-churn) snapshot — bounded staleness by design.
+        counting.reset();
+        for _ in 0..5 {
+            let m = c.load_table(&p, &t).await.unwrap();
+            // Still the pre-churn view: the churn file is intentionally not yet
+            // visible (staleness bounded by the TTL), but the snapshot is a real
+            // internally-consistent committed view of exactly PARTS files.
+            assert_eq!(m.live_data_files().len(), PARTS, "within-TTL read = primed snapshot");
+        }
+        assert_eq!(
+            counting.reads(),
+            0,
+            "repeated metadata reads within the TTL must issue ZERO object-store \
+             round-trips (no LIST / GET(HEAD) / fold GET) — got {} reads",
+            counting.reads()
+        );
+
+        // After the TTL expires the next read REFRESHES: it re-resolves (paying
+        // round-trips) and now reflects the churn commit exactly.
+        tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+        counting.reset();
+        let refreshed = c.load_table(&p, &t).await.unwrap();
+        assert!(
+            counting.reads() > 0,
+            "a read after the TTL must re-resolve (touch the store), not serve a stale snapshot"
+        );
+        assert_eq!(
+            refreshed.live_data_files().len(),
+            PARTS + 1,
+            "the post-TTL refresh must reflect the churn commit exactly (converges to exact)"
+        );
+    }
+
+    // #30 QUIET-TABLE EXACTNESS: with the snapshot enabled, a table that is NOT
+    // being mutated still converges to the exact live set within one TTL — and a
+    // DDL/commit forces an immediate refresh (META-version gate) rather than
+    // waiting out the TTL. Also covers the TTL=0 disable: every read is exact.
+    #[tokio::test]
+    async fn read_snapshot_quiet_table_is_exact_and_disable_works() {
+        // ---- TTL enabled: a commit (META-chain append) forces immediate refresh.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let c = ObjectStoreCatalog::with_read_snapshot_ttl(store, 5_000);
+        let p = ProjectId::new();
+        let t = TableName::new("quiet").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Prime an (empty) snapshot.
+        assert_eq!(c.load_table(&p, &t).await.unwrap().live_data_files().len(), 0);
+
+        // A single-node META-chain append advances the META version and runs
+        // through `after_commit`, which drops the snapshot. Despite the long
+        // 5s TTL the very next read sees the new file (no stale snapshot).
+        c.append_data_files(&p, &t, SnapshotId::GENESIS, vec![file("m1.parquet", 1)])
+            .await
+            .unwrap();
+        assert_eq!(
+            c.load_table(&p, &t).await.unwrap().live_data_files().len(),
+            1,
+            "a META commit must force an immediate refresh (META-version gate), not wait the TTL"
+        );
+
+        // ---- TTL = 0 disables the snapshot: exact-every-read legacy.
+        let store2: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let c0 = ObjectStoreCatalog::with_read_snapshot_ttl(store2, 0);
+        let p0 = ProjectId::new();
+        let t0 = TableName::new("disabled").unwrap();
+        c0.create_namespace(&p0).await.unwrap();
+        c0.create_table(&p0, &t0, &schema()).await.unwrap();
+        let exp = c0.current_snapshot_id_in_partition(&p0, &t0, "0").await.unwrap();
+        c0.append_data_files_in_partition(&p0, &t0, "0", exp, vec![file("d0.parquet", 1)])
+            .await
+            .unwrap();
+        assert_eq!(c0.load_table(&p0, &t0).await.unwrap().live_data_files().len(), 1);
+        // A churn commit is visible on the VERY NEXT read (no snapshot at all).
+        let exp = c0.current_snapshot_id_in_partition(&p0, &t0, "0").await.unwrap();
+        c0.append_data_files_in_partition(&p0, &t0, "0", exp, vec![file("d1.parquet", 1)])
+            .await
+            .unwrap();
+        assert_eq!(
+            c0.load_table(&p0, &t0).await.unwrap().live_data_files().len(),
+            2,
+            "with the snapshot disabled (TTL=0) every read must be exact"
         );
     }
 
