@@ -93,6 +93,23 @@ pub(crate) struct CachedPkSet {
     pub set_i64: Option<Arc<std::collections::HashSet<i64>>>,
 }
 
+impl CachedPkSet {
+    /// Cheap (Arc-clone) duplicate used only on the rare incremental-extend
+    /// fallback where a concurrent reader still holds the cached Arc so
+    /// `Arc::try_unwrap` of the outer entry fails. The inner sets are shared by
+    /// Arc; the caller then `try_unwrap`s those (and clones only if THEY are
+    /// also shared). Correctness is unaffected — a clone is always a faithful
+    /// copy of the same key set.
+    fn clone_for_extend(&self) -> CachedPkSet {
+        CachedPkSet {
+            files_sig: self.files_sig,
+            files: self.files.clone(),
+            set: self.set.clone(),
+            set_i64: self.set_i64.clone(),
+        }
+    }
+}
+
 impl PkSetCache {
     pub(crate) fn new() -> Self {
         Self {
@@ -106,6 +123,20 @@ impl PkSetCache {
             .expect("pk_set_cache poisoned")
             .get(&(*project, table.clone()))
             .cloned()
+    }
+
+    /// Remove and return the cached entry for `(project, table)`, leaving the
+    /// cache without one. Used by the incremental-extend path so it can take
+    /// sole ownership of the prior set (`Arc::try_unwrap`) and mutate it in
+    /// place — extending by only the newly-added files' keys — instead of
+    /// cloning the whole O(rows) set on every committed bulk-COPY chunk. The
+    /// caller re-`put`s the extended entry before returning, so the steady
+    /// state still has exactly one cached entry per table.
+    fn take(&self, project: &ProjectId, table: &TableName) -> Option<Arc<CachedPkSet>> {
+        self.inner
+            .write()
+            .expect("pk_set_cache poisoned")
+            .remove(&(*project, table.clone()))
     }
 
     fn put(&self, project: &ProjectId, table: &TableName, entry: Arc<CachedPkSet>) {
@@ -477,41 +508,76 @@ pub(crate) async fn enforce_pk_on_insert(
         projection: Some(pk_columns.to_vec()),
         ..Default::default()
     };
-    let incremental_base = raw_cached
+    // Can we incrementally extend a prior cached set? Only when the cached
+    // files are a strict subset of the current ones (additions only — the
+    // bulk-COPY case where each committed chunk adds a file). A compaction that
+    // REPLACES files is not a subset → rebuild from scratch.
+    let can_extend = raw_cached
         .as_ref()
-        .filter(|entry| cache_eligible && entry.files.is_subset(&current_paths));
+        .map(|entry| cache_eligible && entry.files.is_subset(&current_paths))
+        .unwrap_or(false);
+
+    // For the single-i64 PK (the dominant keyed bulk-load shape) we keep ONLY
+    // the `HashSet<i64>` — the string `existing` set is never probed on the i64
+    // path (see the cache-hit and post-scan probes), so building/cloning it per
+    // batch was pure O(rows) waste (one `Vec<String>` + one `String` heap
+    // allocation per existing row, EVERY committed chunk). Dropping it removes
+    // the allocation storm that made keyed bulk COPY super-linear despite the
+    // incremental cache. The i64 base set is taken by VALUE out of the cache and
+    // mutated in place when we hold the sole reference (`Arc::try_unwrap`), so
+    // the per-chunk extend is O(new rows), not O(table). When the Arc is shared
+    // (a concurrent reader holds it) we fall back to a one-time clone.
+    //
+    // Take the cached entry out of the cache so `Arc::try_unwrap` can succeed.
+    // We re-`put` the extended entry before returning. Only do this on the
+    // extend path; a from-scratch rebuild leaves any stale entry to be
+    // overwritten by the final `put`.
+    let taken: Option<Arc<CachedPkSet>> = if can_extend && cache_eligible {
+        // Drop our extra reference first so the cache holds the only other one.
+        drop(raw_cached);
+        pk_cache.and_then(|c| c.take(project, table))
+    } else {
+        drop(raw_cached);
+        None
+    };
+
     let (mut existing, mut existing_i64, scan_files): (
         std::collections::HashSet<Vec<String>>,
         Option<std::collections::HashSet<i64>>,
         Vec<&basin_storage::DataFile>,
-    ) = match incremental_base {
-        Some(entry) => {
-            let base = entry.set.as_ref().clone();
-            let base_i64 = if single_i64_pk {
-                Some(
-                    entry
-                        .set_i64
-                        .as_ref()
-                        .map(|s| s.as_ref().clone())
-                        .unwrap_or_default(),
-                )
-            } else {
-                None
-            };
+    ) = match taken {
+        Some(entry_arc) => {
+            // Compute the new-file set against the cached file paths BEFORE we
+            // consume the entry. We hold the only reference to `entry_arc` (we
+            // `take`-removed it from the cache and dropped `raw_cached`), so
+            // `try_unwrap` moves the inner sets out without an O(rows) clone in
+            // the steady-state bulk-load case. A concurrent reader holding a
+            // clone forces a one-time fallback clone — still correct.
             let new_files: Vec<&basin_storage::DataFile> = data_files
                 .iter()
-                .filter(|f| !entry.files.contains(f.path.as_ref()))
+                .filter(|f| !entry_arc.files.contains(f.path.as_ref()))
                 .collect();
-            (base, base_i64, new_files)
+            let entry = Arc::try_unwrap(entry_arc)
+                .unwrap_or_else(|shared| (*shared).clone_for_extend());
+            if single_i64_pk {
+                let base_i64 = entry.set_i64.map(|arc| {
+                    Arc::try_unwrap(arc).unwrap_or_else(|shared| (*shared).clone())
+                });
+                let base_i64 = base_i64.unwrap_or_default();
+                (std::collections::HashSet::new(), Some(base_i64), new_files)
+            } else {
+                let base = Arc::try_unwrap(entry.set)
+                    .unwrap_or_else(|shared| (*shared).clone());
+                (base, None, new_files)
+            }
         }
         None => {
-            let ex = std::collections::HashSet::new();
             let ex_i64 = if single_i64_pk {
                 Some(std::collections::HashSet::new())
             } else {
                 None
             };
-            (ex, ex_i64, data_files.iter().collect())
+            (std::collections::HashSet::new(), ex_i64, data_files.iter().collect())
         }
     };
     for f in scan_files {
@@ -528,10 +594,11 @@ pub(crate) async fn enforce_pk_on_insert(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            // Tier 3 hot loop for single-Int64 PKs. We still build the
-            // string `existing` set in parallel so cache fill and the
-            // tombstone path remain byte-compatible; the i64 probe is
-            // additive.
+            // Tier 3 hot loop for single-Int64 PKs. Only the `existing_i64` set
+            // is built/probed/cached for this shape; the string `existing` set
+            // is never consulted on the i64 path, so we no longer pay the
+            // per-row `Vec<String>` + `String` allocation that previously made
+            // keyed bulk COPY super-linear.
             if single_i64_pk {
                 let arr = rb
                     .column(rb_pk_idx[0])
@@ -561,7 +628,6 @@ pub(crate) async fn enforce_pk_on_insert(
                     if let Some(s) = existing_i64.as_mut() {
                         s.insert(v);
                     }
-                    existing.insert(vec![v.to_string()]);
                 }
             } else {
                 for row in 0..rb.num_rows() {
@@ -589,41 +655,33 @@ pub(crate) async fn enforce_pk_on_insert(
 
     // Probe the batch against the freshly-built set.
     if single_i64_pk {
-        if let Some(set_i64) = existing_i64.as_ref() {
+        if let Some(set_i64) = existing_i64.take() {
+            // Wrap the freshly-built/extended set in an Arc ONCE so both the
+            // probe and the cache fill share it without an O(rows) clone — the
+            // set was moved out of the prior cache entry (or built fresh), so
+            // this is the only allocation of the key set this batch performs.
+            // The string `set` is intentionally empty on the i64 path (never
+            // probed for this shape); the cache-hit branch keys off
+            // `set_i64.is_some()` and never reads `set` for an i64 PK.
+            let set_i64 = Arc::new(set_i64);
             let arr = batch
                 .column(pk_idx[0])
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| BasinError::internal("Int64Array downcast (batch PK)"))?;
+            let mut dup: Option<i64> = None;
             for row in 0..batch.num_rows() {
                 if arr.is_null(row) {
                     continue;
                 }
                 let v = arr.value(row);
                 if set_i64.contains(&v) {
-                    // Fill cache before returning so a retry sees the same set.
-                    if cache_eligible {
-                        if let Some(c) = pk_cache {
-                            c.put(
-                                project,
-                                table,
-                                Arc::new(CachedPkSet {
-                                    files_sig,
-                                    files: current_paths.clone(),
-                                    set: Arc::new(existing),
-                                    set_i64: Some(Arc::new(set_i64.clone())),
-                                }),
-                            );
-                        }
-                    }
-                    return Err(BasinError::UniqueViolation(format!(
-                        "duplicate key value violates unique constraint \"{table_name_str}_pkey\": \
-                         Key ({})=({}) already exists.",
-                        pk_columns.join(", "),
-                        v
-                    )));
+                    dup = Some(v);
+                    break;
                 }
             }
+            // Fill cache (move the shared Arc in) before returning so a retry —
+            // and the next chunk's incremental extend — sees the same set.
             if cache_eligible {
                 if let Some(c) = pk_cache {
                     c.put(
@@ -633,10 +691,18 @@ pub(crate) async fn enforce_pk_on_insert(
                             files_sig,
                             files: current_paths.clone(),
                             set: Arc::new(existing),
-                            set_i64: Some(Arc::new(set_i64.clone())),
+                            set_i64: Some(set_i64),
                         }),
                     );
                 }
+            }
+            if let Some(v) = dup {
+                return Err(BasinError::UniqueViolation(format!(
+                    "duplicate key value violates unique constraint \"{table_name_str}_pkey\": \
+                     Key ({})=({}) already exists.",
+                    pk_columns.join(", "),
+                    v
+                )));
             }
             return Ok(());
         }
@@ -2246,5 +2312,134 @@ mod tests {
         let twice = strip_check_wrapper(once);
         assert_eq!(once, twice);
         assert_eq!(once, "score >= 0");
+    }
+
+    // --- incremental PK-set cache: per-chunk work does not grow -------------
+
+    /// Bulk COPY into a single-i64 PK table must NOT pay an O(table) cost on
+    /// every committed chunk. The incremental cache extends the prior
+    /// `HashSet<i64>` IN PLACE (moved out of the cache via `Arc::try_unwrap`,
+    /// not cloned) and never materializes the redundant `HashSet<Vec<String>>`
+    /// for this shape. This test asserts the structural invariants that make the
+    /// per-chunk constraint work O(chunk) instead of O(table):
+    ///
+    ///   1. the cached entry is the i64 fast-path entry (`set_i64.is_some()`);
+    ///   2. its string `set` stays EMPTY no matter how many rows accumulate
+    ///      (no per-row `Vec<String>`/`String` allocation storm — the prior
+    ///      super-linear cost);
+    ///   3. `set_i64` holds exactly the keys loaded so far (correctness of the
+    ///      extend);
+    ///   4. and the cache holds a SINGLE entry that grew across chunks (the
+    ///      `take`+extend+`put` cycle, not a fresh O(table) rebuild each time).
+    ///
+    /// Uses the cached path explicitly: streaming is disabled (high MIN_ROWS)
+    /// and the chunks are far larger than `PK_STREAMING_SMALL_BATCH`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn incremental_pk_cache_is_flat_per_chunk_for_i64() {
+        use std::sync::Arc;
+
+        use arrow_schema::Schema;
+        use basin_catalog::InMemoryCatalog;
+        use basin_common::{ProjectId, TableName};
+        use object_store::local::LocalFileSystem;
+        use tempfile::TempDir;
+
+        use crate::{Engine, EngineConfig};
+
+        // Force the in-RAM cached path, never the streaming path.
+        std::env::set_var("BASIN_PK_STREAMING_MIN_ROWS", "1000000000");
+
+        let dir = TempDir::new().unwrap();
+        let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: Arc::new(fs),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
+        let eng = Engine::new(EngineConfig { storage, catalog, shard: None });
+        let project = ProjectId::new();
+        let sess = eng.open_session(project).await.unwrap();
+        let schema = Arc::new(Schema::empty());
+        let cols = vec!["id".to_string(), "x".to_string()];
+
+        sess.execute("DROP TABLE IF EXISTS t").await.unwrap();
+        sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, x INT)")
+            .await
+            .unwrap();
+
+        let table = TableName::new("t".to_string()).unwrap();
+        let chunk_rows = 5_000u64;
+        let chunks = 6u64;
+        for c in 0..chunks {
+            let batch: Vec<Vec<Option<String>>> = (c * chunk_rows..(c + 1) * chunk_rows)
+                .map(|i| vec![Some((i as i64 + 1).to_string()), Some(((i % 7) as i64).to_string())])
+                .collect();
+            let n = sess
+                .ingest_csv_batch("t", schema.clone(), Some(&cols), batch)
+                .await
+                .expect("clean ascending chunk must load");
+            assert_eq!(n as u64, chunk_rows);
+
+            // Chunk 0 enforces against an EMPTY table (early return, no cache
+            // write). From chunk 1 on, each enforce runs against the prior
+            // files and must populate/extend the cache. After each such chunk
+            // the cache must reflect the i64 fast path with an EMPTY string set,
+            // and set_i64 must hold exactly the loaded keys.
+            if c == 0 {
+                continue;
+            }
+            let entry = eng
+                .pk_set_cache()
+                .get(&project, &table)
+                .expect("a cached PK set must exist after a cached-path bulk insert");
+            assert!(
+                entry.set.is_empty(),
+                "i64 PK cache must NOT build the redundant string set (got {} entries) — \
+                 that was the O(table)-per-chunk allocation storm",
+                entry.set.len()
+            );
+            let s_i64 = entry
+                .set_i64
+                .as_ref()
+                .expect("single-i64 PK cache must carry set_i64");
+            // The cache reflects the files that EXISTED when this chunk's
+            // enforce ran — i.e. the c prior chunks, not the just-loaded one.
+            let expected = c * chunk_rows;
+            assert_eq!(
+                s_i64.len() as u64,
+                expected,
+                "set_i64 must hold every key on disk at enforce time ({} before chunk {})",
+                expected,
+                c
+            );
+        }
+
+        // The cache holds exactly ONE entry for the table — it was extended in
+        // place across chunks, not rebuilt as N stale copies.
+        assert_eq!(
+            eng.pk_set_cache().inner.read().unwrap().len(),
+            1,
+            "exactly one cached PK set per table"
+        );
+
+        // Correctness under the cached path: an existing key is rejected, a
+        // fresh key is accepted (no false positive from the in-place extend).
+        let dup = vec![vec![Some("42".to_string()), Some("0".to_string())]];
+        assert!(
+            sess.ingest_csv_batch("t", schema.clone(), Some(&cols), dup)
+                .await
+                .is_err(),
+            "a duplicate PK must still be rejected on the cached path"
+        );
+        let fresh = vec![vec![Some("999999".to_string()), Some("1".to_string())]];
+        let n = sess
+            .ingest_csv_batch("t", schema.clone(), Some(&cols), fresh)
+            .await
+            .expect("a fresh unique key must be accepted");
+        assert_eq!(n, 1);
+
+        std::env::remove_var("BASIN_PK_STREAMING_MIN_ROWS");
     }
 }

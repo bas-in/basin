@@ -8,6 +8,42 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Perf (#26): keyed bulk COPY no longer pays an O(table) constraint cost per chunk
+
+**Bulk COPY into a table with a single-`BIGINT` PRIMARY KEY slowed super-linearly
+with table size** even though the incremental PK-set cache was supposed to make
+it O(n). The residual super-linearity was in the cache's incremental-extend path
+(`constraints::enforce_pk_on_insert`): every committed COPY chunk adds a data
+file, which changes the file-set signature → a cache MISS on the next chunk. The
+miss path then `clone()`d the ENTIRE existing PK set before scanning only the new
+file — and for the single-i64 fast path it ALSO maintained a redundant
+`HashSet<Vec<String>>` (one `Vec<String>` + one `String` heap allocation per
+existing row) that the i64 probe never reads. So each chunk paid an O(rows-so-far)
+allocation storm, summing to O(n²/chunk) across a load.
+
+- **Drop the redundant string set on the single-i64 PK path.** That shape probes
+  and caches only `HashSet<i64>`; the string `set` is never consulted for it, so
+  it is no longer built or cloned. This removes the per-row `Vec<String>`/`String`
+  allocation that dominated the per-chunk cost.
+- **Extend the cached set IN PLACE instead of cloning it.** The incremental path
+  now `take`s the cached entry out of the cache and `Arc::try_unwrap`s the inner
+  key set so it can be mutated by only the newly-added files' keys — O(new rows),
+  not O(table). A concurrent reader holding the Arc forces a one-time fallback
+  clone (still correct). The cache fill moves the set in (one `Arc::new`) rather
+  than re-cloning it.
+- **Exact uniqueness is unchanged.** This only removes redundant bookkeeping and
+  a clone; the set of keys checked, and the dup/no-dup decision, are byte-identical
+  to before. The large-table streaming path (zone-map + bloom prune) and its
+  correctness gate are untouched. Wide/JSONB columns were never read by this path
+  (projection pushdown already restricts the scan to the PK column); their COPY
+  cost is the write-side encode, not the constraint check.
+- **Test:** `constraints::tests::incremental_pk_cache_is_flat_per_chunk_for_i64`
+  bulk-loads ascending i64 chunks on the cached path (streaming disabled) and
+  asserts the per-chunk invariants that bound the work: the cached string `set`
+  stays EMPTY regardless of accumulated rows, `set_i64` holds exactly the on-disk
+  keys, and the cache holds a single entry extended across chunks (not rebuilt).
+  Correctness (dup rejected, fresh key accepted) re-verified on the same path.
+
 ## Unreleased — Perf: content-addressed baseline-chunk read cache (read latency under heavy ingest)
 
 **A read concurrent with sustained ingest re-fetched the same immutable baseline
