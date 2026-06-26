@@ -45,6 +45,10 @@ reqwest.workspace = true
 # DB). Uses PutMode::Create (create-if-absent) for the CAS core.
 object_store.workspace = true
 bytes.workspace = true
+# Content-addressed baseline chunks (#27): SHA-256 over the canonical serialised
+# chunk bytes gives an immutable, dedup-friendly key so a baseline write reuses
+# prior chunks (create-if-absent) instead of re-uploading the whole live set.
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

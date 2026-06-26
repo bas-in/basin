@@ -8,6 +8,43 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Perf (#27): flat-scale partition baselines — chunked, content-addressed baseline so per-commit PUT bytes no longer grow with table size
+
+**Correctness-preserving perf fix.** Sustained single-table ingest decayed as
+the table grew (observed on dev: ~34k → ~18k rows/s on one growing table). The
+residual slope was the periodic per-partition **baseline** object: every
+`BASIN_PART_SEGMENT_COMPACT_EVERY` (default 32) commits, the partition wrote a
+baseline segment that serialised the **entire** live `Vec<DataFileRef>` (each
+ref carrying column_stats + bloom/hll/tdigest sketches) into one JSON PUT. That
+PUT is `O(total files in the partition)` and lands on the durable-barrier ack
+path, so a steadily larger blob was uploaded as the table grew. A probe measured
+**50.7 KB @ 400 files → 523 KB @ 4000 files = 10.3×** (linear in file count).
+
+**Fix — append-only, content-addressed chunked baseline.** A baseline is now a
+list of **immutable, content-addressed chunk objects** plus a tombstone set,
+stored under `…/parts/{pid}/chunks/{hash}.json`. Each baseline re-seals only the
+small growing **open tail** (≤ `BASIN_BASELINE_CHUNK_FILES`, default 1024) into
+one fresh chunk and **reuses every frozen chunk by hash**; once the tail reaches
+target it freezes (immutable, never re-uploaded) and a new tail begins. So the
+new bytes a baseline writes are `O(files-since-last-baseline)` bounded by the
+chunk target — a constant, independent of total table size. A rare re-chunk
+safety valve (tombstones > ¼ of live, or chunk count ≥ `BASIN_BASELINE_CHUNK_CAP`,
+default 64) consolidates the live set into fresh chunks; this is the only
+`O(n)` path and stays off the steady append path. After the fix the same probe
+reads **≈565 B @ 400 files → ≈852 B @ 4000 files = 1.5×** (flat in file count).
+
+**Backward compatible.** Old tables with legacy inline baselines
+(`baseline: Some(Vec<DataFileRef>)`) still fold/commit correctly; mixed chains
+(legacy inline baseline + new deltas + new chunked baselines) fold to the exact
+live set. `BASIN_BASELINE_CHUNKING=0` is an escape hatch back to inline
+baselines. Chunk PUTs are create-if-absent and content-addressed, so they are
+idempotent and ambiguous-PUT-safe (a 408-after-landed re-PUT of identical bytes
+is a no-op/`AlreadyExists`); a chunk is always confirmed durable **before** the
+segment object that references it, and a fold that ever finds a referenced chunk
+missing errors clearly rather than silently dropping files. The create-if-absent
+CAS on the segment object remains the sole commit arbiter. Per-commit
+object-store **read** count was already flat and is unchanged.
+
 ## Unreleased — Fix: exactly-once partition commit under an ambiguous object-store PUT (no more double-counted rows during a 408 storm)
 
 **Correctness fix.** Under a sustained object-store (Tigris S3) `408 Request

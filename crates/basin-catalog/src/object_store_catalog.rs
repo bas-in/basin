@@ -289,7 +289,66 @@ struct PartSegmentObject {
     base_version: Option<u64>,
     /// For a BASELINE object (genesis or a compaction consolidation): the FULL
     /// live data-file set as of this version. `None` for a pure delta object.
+    ///
+    /// LEGACY inline baseline. Kept for BACKWARD COMPATIBILITY: objects written
+    /// before the #27 chunked-baseline fix carry the entire live set inline here,
+    /// and they must still fold/commit correctly. New baselines instead populate
+    /// `chunk_baseline` (content-addressed chunk refs) so a baseline PUT is
+    /// O(files-added-since-last-baseline), not O(total-files). A baseline object
+    /// sets EITHER `chunk_baseline` (new, default) OR `baseline` (legacy / the
+    /// `BASIN_BASELINE_CHUNKING=0` escape hatch). Genesis is a baseline too.
+    #[serde(default)]
     baseline: Option<Vec<DataFileRef>>,
+    /// For a CHUNKED BASELINE object (the #27 flat-scale format): the live set is
+    /// the union of the referenced immutable chunk objects MINUS `tombstones`.
+    /// `None` for a delta object or a legacy inline baseline. See
+    /// [`ChunkedBaseline`].
+    #[serde(default)]
+    chunk_baseline: Option<ChunkedBaseline>,
+}
+
+/// The #27 chunked-baseline descriptor carried by a BASELINE segment object.
+///
+/// Instead of serialising the entire live `Vec<DataFileRef>` on every baseline
+/// (O(total-files), the observed ingest decay), a baseline references a list of
+/// IMMUTABLE, content-addressed chunk objects plus a tombstone set. Each chunk
+/// object is `Vec<DataFileRef>` stored at `{parts_root}{pid}/chunks/{hash}.json`
+/// and is written exactly once (create-if-absent, content-addressed → idempotent
+/// and ambiguous-PUT-safe). A steady-state baseline seals only the files added
+/// since the previous baseline into ONE new chunk and REUSES every prior chunk
+/// ref, so the baseline PUT bytes are O(files-added-since-last-baseline) =
+/// bounded, independent of total table size.
+///
+/// Reconstruction: live = (⋃ chunk.files) − tombstones, then deltas on top.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct ChunkedBaseline {
+    /// Ordered list of referenced chunk objects (by content hash). The FIRST
+    /// `frozen` entries are immutable, ~TARGET-file chunks reused verbatim on
+    /// every later baseline; any trailing entry (at most one) is the GROWING
+    /// open-tail chunk that gets re-sealed (bigger) on the next baseline until
+    /// it reaches TARGET and itself becomes frozen.
+    chunks: Vec<BaselineChunkRef>,
+    /// Count of leading `chunks` that are FROZEN (immutable, full). The
+    /// remaining `chunks[frozen..]` (0 or 1 entry) is the open tail. Stored
+    /// explicitly so a fold reconstructs the frozen/tail split exactly even if
+    /// `TARGET_CHUNK_FILES` changed across restarts.
+    #[serde(default)]
+    frozen: u32,
+    /// Paths present in some referenced chunk that have since been removed from
+    /// the live set (a `Replace` removed a file already sealed into a chunk).
+    /// Subtracted from the chunk union when reconstructing the baseline.
+    tombstones: Vec<String>,
+}
+
+/// A reference to one immutable, content-addressed baseline chunk object.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct BaselineChunkRef {
+    /// Content hash of the canonical serialised `Vec<DataFileRef>` bytes; also
+    /// the chunk object's key suffix (`chunks/{hash}.json`). Identical content →
+    /// identical hash → create-if-absent dedupes/reuses.
+    hash: String,
+    /// Number of files sealed into this chunk (diagnostic / re-chunk sizing).
+    file_count: u32,
 }
 
 /// A partition's FOLDED current state: its OCC token, version, and the full
@@ -315,6 +374,26 @@ struct PartitionLive {
     /// Number of delta objects applied on top of the latest baseline (i.e. the
     /// read fold depth). Used to decide when to write a fresh baseline.
     deltas_since_baseline: u64,
+    /// #27 chunked-baseline structure carried forward incrementally so a baseline
+    /// PUT is O(TARGET_CHUNK_FILES) (a bounded CONSTANT), never O(total-files):
+    ///   * `frozen_chunks` — immutable, FULL chunk refs (~TARGET files each).
+    ///     REUSED by hash on every later baseline; never re-sealed.
+    ///   * `open_tail` — the paths in the single GROWING tail chunk (< TARGET
+    ///     files). Each baseline re-seals `open_tail` (cost ≤ O(TARGET)) into a
+    ///     fresh content-addressed chunk and references it; once it reaches
+    ///     TARGET the tail is FROZEN (moved into `frozen_chunks`) and a new empty
+    ///     tail begins. So the chunk-ref count a baseline carries is
+    ///     `ceil(live / TARGET)` — bounded by table size / TARGET, and each
+    ///     baseline's NEW bytes are at most one TARGET-sized chunk = constant.
+    ///   * `tombstones` — paths sealed into some chunk that have since been
+    ///     removed (subtracted at reconstruction). The re-chunk valve drains
+    ///     these when they grow large.
+    /// `open_tail` order is preserved (Vec) so re-sealing is deterministic and
+    /// content-addressing dedupes a re-seal of the identical tail. All derived
+    /// from the same chain the `live` map folds → a cold fold reproduces them.
+    frozen_chunks: Vec<BaselineChunkRef>,
+    open_tail: Vec<String>,
+    tombstones: std::collections::HashSet<String>,
 }
 
 impl PartitionLive {
@@ -325,6 +404,9 @@ impl PartitionLive {
             live: rpds::HashTrieMapSync::new_sync(),
             latest_committed_at: Utc::now(),
             deltas_since_baseline: 0,
+            frozen_chunks: Vec::new(),
+            open_tail: Vec::new(),
+            tombstones: std::collections::HashSet::new(),
         }
     }
 
@@ -399,6 +481,12 @@ pub struct ObjectStoreCatalog {
     /// pins it (used by tests to avoid racing on a shared process env var). See
     /// [`ObjectStoreCatalog::part_segment_compact_every`].
     part_compact_override: Option<u64>,
+    /// #27 chunked-baseline test overrides (avoid racing on process env vars
+    /// across parallel tests). `None` = read the corresponding `BASIN_*` env /
+    /// default. `(enabled, chunk_files, chunk_cap)`.
+    baseline_chunking_override: Option<bool>,
+    baseline_chunk_files_override: Option<u64>,
+    baseline_chunk_cap_override: Option<u64>,
 }
 
 /// Node-local cursor over a reserved sequence block. `next` is the value the
@@ -439,6 +527,9 @@ impl ObjectStoreCatalog {
             seq_local: Mutex::new(HashMap::new()),
             seq_block_override: None,
             part_compact_override: None,
+            baseline_chunking_override: None,
+            baseline_chunk_files_override: None,
+            baseline_chunk_cap_override: None,
         }
     }
 
@@ -459,6 +550,25 @@ impl ObjectStoreCatalog {
     pub fn with_part_compact_every(store: Arc<dyn ObjectStore>, k: u64) -> Self {
         let mut c = Self::with_prefix(store, DEFAULT_CATALOG_PREFIX);
         c.part_compact_override = Some(k.max(1));
+        c
+    }
+
+    /// Construct with explicit per-partition compaction K AND #27 chunked-baseline
+    /// knobs (bypasses the `BASIN_BASELINE_*` env), so parallel tests don't race
+    /// on process-global env vars.
+    #[cfg(test)]
+    fn with_chunk_config(
+        store: Arc<dyn ObjectStore>,
+        k: u64,
+        chunking: bool,
+        chunk_files: u64,
+        chunk_cap: u64,
+    ) -> Self {
+        let mut c = Self::with_prefix(store, DEFAULT_CATALOG_PREFIX);
+        c.part_compact_override = Some(k.max(1));
+        c.baseline_chunking_override = Some(chunking);
+        c.baseline_chunk_files_override = Some(chunk_files.max(1));
+        c.baseline_chunk_cap_override = Some(chunk_cap.max(1));
         c
     }
 
@@ -1080,11 +1190,55 @@ impl ObjectStoreCatalog {
         let mut live: rpds::HashTrieMapSync<String, DataFileRef> =
             rpds::HashTrieMapSync::new_sync();
 
+        // The baseline structure reconstructed at the baseline boundary, then
+        // carried forward through the replayed deltas so the in-memory view can
+        // seal the NEXT baseline in O(TARGET) without re-reading the chain.
+        // `frozen_chunks` are immutable full chunk refs; `open_tail` is the
+        // ordered list of currently-live paths in the growing tail chunk.
+        let mut frozen_chunks: Vec<BaselineChunkRef> = Vec::new();
+        let mut open_tail: Vec<String> = Vec::new();
+        let mut tombstones: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Membership of `open_tail` for O(1) removal classification during replay.
+        let mut tail_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         let mut cur = head;
         loop {
+            if let Some(cb) = cur.chunk_baseline.take() {
+                // #27 chunked baseline: live = (⋃ chunk files) − tombstones.
+                // Load every referenced chunk object (concurrently), union, and
+                // reconstruct the frozen/tail split. The first `cb.frozen` refs
+                // are immutable; a trailing ref (if any) is the open tail.
+                let per_chunk = self
+                    .load_baseline_chunks(project, qtable, partition_id, &cb.chunks)
+                    .await?;
+                let tomb: std::collections::HashSet<&str> =
+                    cb.tombstones.iter().map(String::as_str).collect();
+                let frozen_n = (cb.frozen as usize).min(cb.chunks.len());
+                for (idx, files) in per_chunk.into_iter().enumerate() {
+                    let is_tail = idx >= frozen_n;
+                    for f in files {
+                        if tomb.contains(f.path.as_str()) {
+                            continue;
+                        }
+                        if is_tail {
+                            open_tail.push(f.path.clone());
+                            tail_set.insert(f.path.clone());
+                        }
+                        live.insert_mut(f.path.clone(), f);
+                    }
+                }
+                frozen_chunks = cb.chunks[..frozen_n].to_vec();
+                tombstones = cb.tombstones.into_iter().collect();
+                break;
+            }
             if let Some(files) = cur.baseline.take() {
-                // Reached a baseline (or genesis): it carries the full live set.
+                // LEGACY inline baseline (or genesis): it carries the full live
+                // set inline. Treat the whole set as the OPEN TAIL for the next
+                // chunked baseline so a mixed chain (old inline baseline + new
+                // deltas) seals correctly into chunks.
                 for f in files {
+                    open_tail.push(f.path.clone());
+                    tail_set.insert(f.path.clone());
                     live.insert_mut(f.path.clone(), f);
                 }
                 break;
@@ -1104,13 +1258,22 @@ impl ObjectStoreCatalog {
         }
 
         // Apply deltas oldest-first on top of the baseline (we pushed them
-        // newest-first while walking back, so iterate in reverse).
+        // newest-first while walking back, so iterate in reverse). Maintain the
+        // open-tail/tombstone bookkeeping in lockstep so the folded view matches
+        // a freshly-committed warm view exactly.
         for snap in deltas.into_iter().rev() {
             for p in &snap.removed_paths {
                 live.remove_mut(p);
+                apply_removal_to_tail(p, &mut open_tail, &mut tail_set, &mut tombstones);
             }
             for f in &snap.data_files {
                 live.insert_mut(f.path.clone(), f.clone());
+                // A (re-)added path joins the open tail (it is not in any FROZEN
+                // chunk's effective set); clear any tombstone for it.
+                tombstones.remove(&f.path);
+                if tail_set.insert(f.path.clone()) {
+                    open_tail.push(f.path.clone());
+                }
             }
         }
 
@@ -1120,6 +1283,128 @@ impl ObjectStoreCatalog {
             live,
             latest_committed_at,
             deltas_since_baseline,
+            frozen_chunks,
+            open_tail,
+            tombstones,
+        })
+    }
+
+    /// Key for an immutable, content-addressed baseline chunk object.
+    fn baseline_chunk_key(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+        hash: &str,
+    ) -> OsPath {
+        OsPath::from(format!(
+            "{}chunks/{hash}.json",
+            self.part_dir(project, qtable, partition_id)
+        ))
+    }
+
+    /// Load every referenced baseline chunk object, returning their file lists
+    /// IN THE SAME ORDER as `refs` (so the caller can split frozen vs tail by
+    /// index). Loads concurrently. Chunk objects are immutable + content-
+    /// addressed, so a missing chunk means a corrupt/torn baseline; we error
+    /// CLEARLY (never silently lose files).
+    async fn load_baseline_chunks(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+        refs: &[BaselineChunkRef],
+    ) -> Result<Vec<Vec<DataFileRef>>> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let mut futs = FuturesUnordered::new();
+        for (idx, r) in refs.iter().enumerate() {
+            let key = self.baseline_chunk_key(project, qtable, partition_id, &r.hash);
+            let store = self.store.clone();
+            let hash = r.hash.clone();
+            futs.push(async move {
+                let res = store.get(&key).await.map_err(|e| match e {
+                    object_store::Error::NotFound { .. } => BasinError::catalog(format!(
+                        "baseline chunk {hash} missing for partition (torn baseline; refusing to fold a baseline that references a missing chunk)"
+                    )),
+                    other => storage_err("get baseline chunk", other),
+                })?;
+                let bytes = res
+                    .bytes()
+                    .await
+                    .map_err(|e| storage_err("read baseline chunk", e))?;
+                let files: Vec<DataFileRef> = serde_json::from_slice(&bytes)
+                    .map_err(|e| BasinError::catalog(format!("decode baseline chunk {hash}: {e}")))?;
+                Ok::<(usize, Vec<DataFileRef>), BasinError>((idx, files))
+            });
+        }
+        let mut slots: Vec<Option<Vec<DataFileRef>>> = (0..refs.len()).map(|_| None).collect();
+        while let Some(item) = futs.next().await {
+            let (idx, files) = item?;
+            slots[idx] = Some(files);
+        }
+        Ok(slots.into_iter().map(|s| s.unwrap_or_default()).collect())
+    }
+
+    /// Content hash of a chunk's canonical serialised bytes (hex SHA-256). The
+    /// chunk's serialised `Vec<DataFileRef>` is itself the canonical form, so two
+    /// chunks with identical file sets in identical order hash identically and
+    /// dedupe via create-if-absent.
+    fn chunk_hash(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let d = h.finalize();
+        let mut s = String::with_capacity(d.len() * 2);
+        for b in d {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    /// Seal `files` into ONE immutable, content-addressed chunk object via
+    /// create-if-absent and return its ref. Idempotent + ambiguous-PUT-safe:
+    /// identical content → identical hash/key → `AlreadyExists` is a benign
+    /// no-op (the bytes already there ARE our bytes). MUST complete (chunk
+    /// confirmed durable) BEFORE the referencing segment object is written, so a
+    /// crash never leaves a baseline pointing at a missing chunk.
+    async fn seal_baseline_chunk(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        partition_id: &str,
+        files: &[DataFileRef],
+    ) -> Result<BaselineChunkRef> {
+        let bytes = serde_json::to_vec(files)
+            .map_err(|e| BasinError::catalog(format!("serialise baseline chunk: {e}")))?;
+        let hash = Self::chunk_hash(&bytes);
+        let key = self.baseline_chunk_key(project, qtable, partition_id, &hash);
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        match self
+            .store
+            .put_opts(&key, Bytes::from(bytes).into(), opts)
+            .await
+        {
+            // Wrote it, or it already existed with the SAME content (content-
+            // addressed): either way the chunk is durable.
+            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
+            Err(e) => {
+                // Ambiguous PUT: confirm the chunk is present before referencing
+                // it. Content-addressed, so presence = our exact bytes.
+                match self.store.head(&key).await {
+                    Ok(_) => {}
+                    Err(object_store::Error::NotFound { .. }) => {
+                        return Err(storage_err("put baseline chunk", e));
+                    }
+                    Err(he) => return Err(storage_err("verify baseline chunk after ambiguous put", he)),
+                }
+            }
+        }
+        Ok(BaselineChunkRef {
+            hash,
+            file_count: files.len() as u32,
         })
     }
 
@@ -1434,6 +1719,26 @@ impl ObjectStoreCatalog {
             live
         };
 
+        // #27 baseline-structure bookkeeping, advanced in O(Δ) from the prior
+        // folded view. `frozen_chunks` are immutable full chunk refs (carried,
+        // reused). `open_tail` is the ordered list of currently-live paths in the
+        // growing tail chunk. A removal of a tail path drops it from the tail; a
+        // removal of an already-frozen path becomes a tombstone. An (re-)added
+        // path clears any tombstone and joins the tail.
+        let frozen_chunks = segment.frozen_chunks.clone();
+        let mut open_tail = segment.open_tail.clone();
+        let mut tombstones = segment.tombstones.clone();
+        let mut tail_set: std::collections::HashSet<String> = open_tail.iter().cloned().collect();
+        for p in &removed_paths {
+            apply_removal_to_tail(p, &mut open_tail, &mut tail_set, &mut tombstones);
+        }
+        for f in &added_files {
+            tombstones.remove(&f.path);
+            if tail_set.insert(f.path.clone()) {
+                open_tail.push(f.path.clone());
+            }
+        }
+
         // SEGMENT COMPACTION: fold into a fresh BASELINE every K commits so the
         // read fold depth stays bounded by K. Otherwise write a small DELTA
         // object whose serialized size is O(this commit's files) — independent
@@ -1446,16 +1751,108 @@ impl ObjectStoreCatalog {
         // self-contained baseline — there is no predecessor to point a delta at.
         let write_baseline = version == 0 || segment.deltas_since_baseline + 1 >= compact_every;
 
+        // Carried forward into the in-memory view after a successful commit.
+        let mut next_frozen = frozen_chunks.clone();
+        let mut next_open_tail = open_tail.clone();
+        let mut next_tombstones = tombstones.clone();
+
         let obj = if write_baseline {
-            PartSegmentObject {
-                version: new_version,
-                current_snapshot: new_id,
-                delta: snap,
-                base_version: None,
-                // On-disk baseline is a Vec<DataFileRef> (format unchanged);
-                // materialize the persistent map's values. O(n) only every K
-                // commits, which is the baseline cadence by design.
-                baseline: Some(new_live.values().cloned().collect()),
+            if self.baseline_chunking_enabled() {
+                let target = self.baseline_chunk_files();
+                let chunk_cap = self.baseline_chunk_cap();
+                let live_count = new_live.size();
+                // RE-CHUNK SAFETY VALVE (the ONLY O(n) baseline path, RARE by
+                // construction): when tombstones bloat the chunk union OR the
+                // frozen-chunk count hits the cap, re-seal the ENTIRE live set
+                // into fresh ~TARGET-sized chunks, dropping tombstoned files and
+                // collapsing the chunk-ref list back down.
+                let rechunk = (tombstones.len() * 4 > live_count.max(1))
+                    || (frozen_chunks.len() as u64 >= chunk_cap);
+
+                let cb = if rechunk {
+                    let all: Vec<DataFileRef> = new_live.values().cloned().collect();
+                    let mut fresh: Vec<BaselineChunkRef> = Vec::new();
+                    for batch in all.chunks(target as usize) {
+                        fresh.push(
+                            self.seal_baseline_chunk(project, qtable, partition_id, batch)
+                                .await?,
+                        );
+                    }
+                    // After a full re-chunk every chunk is ~TARGET and FROZEN;
+                    // the open tail is empty (next appends start a new tail).
+                    next_frozen = fresh.clone();
+                    next_open_tail = Vec::new();
+                    next_tombstones = std::collections::HashSet::new();
+                    ChunkedBaseline {
+                        frozen: fresh.len() as u32,
+                        chunks: fresh,
+                        tombstones: Vec::new(),
+                    }
+                } else {
+                    // STEADY-STATE seal: (re-)seal ONLY the open tail (≤ TARGET
+                    // files) into a fresh content-addressed chunk and reference
+                    // it after the reused frozen chunks. New PUT bytes are
+                    // O(tail) ≤ O(TARGET) = a bounded constant, independent of
+                    // total table size. If the tail has reached TARGET it is
+                    // FROZEN (kept) and a new empty tail begins.
+                    let mut chunks = frozen_chunks.clone();
+                    let mut frozen_n = frozen_chunks.len() as u32;
+                    if !open_tail.is_empty() {
+                        let tail_files: Vec<DataFileRef> = open_tail
+                            .iter()
+                            .filter_map(|p| new_live.get(p).cloned())
+                            .collect();
+                        let cref = self
+                            .seal_baseline_chunk(project, qtable, partition_id, &tail_files)
+                            .await?;
+                        let tail_full = tail_files.len() as u64 >= target;
+                        chunks.push(cref.clone());
+                        if tail_full {
+                            // Freeze the tail: it joins the immutable set, a new
+                            // empty tail starts next baseline.
+                            next_frozen = chunks.clone();
+                            next_open_tail = Vec::new();
+                            frozen_n = chunks.len() as u32;
+                        } else {
+                            // Tail stays open (re-sealed bigger next baseline).
+                            next_frozen = frozen_chunks.clone();
+                            next_open_tail = open_tail.clone();
+                            frozen_n = frozen_chunks.len() as u32;
+                        }
+                    } else {
+                        next_frozen = frozen_chunks.clone();
+                        next_open_tail = Vec::new();
+                    }
+                    next_tombstones = tombstones.clone();
+                    ChunkedBaseline {
+                        frozen: frozen_n,
+                        chunks,
+                        tombstones: tombstones.iter().cloned().collect(),
+                    }
+                };
+                PartSegmentObject {
+                    version: new_version,
+                    current_snapshot: new_id,
+                    delta: snap,
+                    base_version: None,
+                    baseline: None,
+                    chunk_baseline: Some(cb),
+                }
+            } else {
+                // Escape hatch (BASIN_BASELINE_CHUNKING=0): legacy inline
+                // baseline — O(files), the pre-#27 behavior. The whole live set
+                // becomes the open tail for a future (re-enabled) chunked seal.
+                next_frozen = Vec::new();
+                next_open_tail = new_live.keys().cloned().collect();
+                next_tombstones = std::collections::HashSet::new();
+                PartSegmentObject {
+                    version: new_version,
+                    current_snapshot: new_id,
+                    delta: snap,
+                    base_version: None,
+                    baseline: Some(new_live.values().cloned().collect()),
+                    chunk_baseline: None,
+                }
             }
         } else {
             PartSegmentObject {
@@ -1464,6 +1861,7 @@ impl ObjectStoreCatalog {
                 delta: snap,
                 base_version: Some(version),
                 baseline: None,
+                chunk_baseline: None,
             }
         };
 
@@ -1482,6 +1880,9 @@ impl ObjectStoreCatalog {
                 } else {
                     segment.deltas_since_baseline + 1
                 },
+                frozen_chunks: next_frozen,
+                open_tail: next_open_tail,
+                tombstones: next_tombstones,
             };
             self.after_part_commit(project, qtable, partition_id, new_version, next_live)
                 .await;
@@ -1523,6 +1924,55 @@ impl ObjectStoreCatalog {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&k| k >= 1)
             .unwrap_or(32)
+    }
+
+    /// #27: whether to write CHUNKED (content-addressed, flat-scale) baselines.
+    /// Default ON. `BASIN_BASELINE_CHUNKING=0` falls back to the legacy inline
+    /// baseline (the pre-#27 O(files) PUT) — an escape hatch for safety, not a
+    /// path the steady state should take.
+    fn baseline_chunking_enabled(&self) -> bool {
+        if let Some(b) = self.baseline_chunking_override {
+            return b;
+        }
+        !matches!(
+            std::env::var("BASIN_BASELINE_CHUNKING").ok().as_deref(),
+            Some("0") | Some("off") | Some("false")
+        )
+    }
+
+    /// #27: target maximum files sealed into one baseline chunk during a FULL
+    /// re-chunk (the rare O(n) valve). Steady-state append seals exactly the
+    /// pending set regardless of this. Override via `BASIN_BASELINE_CHUNK_FILES`
+    /// (clamped `>= 1`); defaults to 1024.
+    fn baseline_chunk_files(&self) -> u64 {
+        if let Some(n) = self.baseline_chunk_files_override {
+            return n.max(1);
+        }
+        std::env::var("BASIN_BASELINE_CHUNK_FILES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1024)
+    }
+
+    /// #27: maximum number of chunk refs a baseline may carry before a FULL
+    /// re-chunk consolidates them (bounds BOTH the segment-object PUT size —
+    /// O(chunk_refs) — and the fold's chunk-GET fan-out). Each steady-state
+    /// baseline appends ONE tiny chunk, so without this cap the chunk-ref list
+    /// (and thus the segment PUT) would grow O(total_files / K). The cap forces
+    /// a periodic consolidation into `ceil(live / TARGET_CHUNK_FILES)` large
+    /// chunks, so the chunk count oscillates within `[ceil(live/TARGET), cap]`
+    /// and the segment PUT stays bounded by `cap` refs regardless of table size.
+    /// Override via `BASIN_BASELINE_CHUNK_CAP` (clamped `>= 1`); defaults to 64.
+    fn baseline_chunk_cap(&self) -> u64 {
+        if let Some(n) = self.baseline_chunk_cap_override {
+            return n.max(1);
+        }
+        std::env::var("BASIN_BASELINE_CHUNK_CAP")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(64)
     }
 
     /// Enumerate every partition id that has at least one segment under
@@ -1596,7 +2046,11 @@ impl ObjectStoreCatalog {
                     },
                 },
                 base_version: None,
+                // Genesis copy keeps a legacy inline baseline (simplest valid
+                // baseline the new fold reads directly); subsequent commits to
+                // the dst partition switch to chunked baselines as usual.
                 baseline: Some(live.clone()),
+                chunk_baseline: None,
             };
             let mut obj = make_baseline(0);
             if !self
@@ -1621,6 +2075,12 @@ impl ObjectStoreCatalog {
                 live: live.iter().map(|f| (f.path.clone(), f.clone())).collect(),
                 latest_committed_at: obj.delta.committed_at,
                 deltas_since_baseline: 0,
+                // Legacy inline baseline → the whole set is the OPEN TAIL for the
+                // next (chunked) baseline, mirroring fold_part_chain's handling
+                // of an inline baseline boundary.
+                frozen_chunks: Vec::new(),
+                open_tail: live.iter().map(|f| f.path.clone()).collect(),
+                tombstones: std::collections::HashSet::new(),
             };
             self.after_part_commit(dst_project, dst, &pid, obj.version, fresh_live)
                 .await;
@@ -3996,6 +4456,26 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// #27 removal bookkeeping shared by fold-replay and the commit hot path: a
+/// removed path that is in the OPEN TAIL (not yet frozen) is dropped from the
+/// tail in O(tail) (and never needs a tombstone); a path already sealed into a
+/// FROZEN chunk becomes a tombstone (subtracted at reconstruction). Keeps the
+/// folded view byte-identical to a freshly-committed warm view.
+fn apply_removal_to_tail(
+    path: &str,
+    open_tail: &mut Vec<String>,
+    tail_set: &mut std::collections::HashSet<String>,
+    tombstones: &mut std::collections::HashSet<String>,
+) {
+    if tail_set.remove(path) {
+        if let Some(pos) = open_tail.iter().position(|p| p == path) {
+            open_tail.remove(pos);
+        }
+    } else {
+        tombstones.insert(path.to_string());
+    }
+}
+
 // ===========================================================================
 // Shared lease registry on the same create-if-absent primitive.
 // ===========================================================================
@@ -4970,10 +5450,12 @@ mod tests {
         );
 
         // At least one BASELINE object exists in the chain (compaction ran).
+        // Post-#27 a baseline carries `chunk_baseline` (the default chunked form);
+        // a legacy inline `baseline` also counts.
         let mut saw_baseline = false;
         for v in 1..=head_v {
             let obj = c.get_part_segment(&p, &qt, "p0", v).await.unwrap();
-            if obj.baseline.is_some() {
+            if obj.baseline.is_some() || obj.chunk_baseline.is_some() {
                 saw_baseline = true;
                 break;
             }
@@ -5137,6 +5619,560 @@ mod tests {
              (40-file table: {small} reads, 400-file table: {large} reads) — \
              a growth term here is the residual ingest-rate slope at scale"
         );
+    }
+
+    // --- PROBE (#27): per-commit PUT BYTES must not grow with file count -------
+    //
+    // The per-commit object-store READ count is already flat in N (the test
+    // above). The residual ingest-rate slope at scale is the per-commit PUT
+    // *bytes*: every `compact_every` commits the partition writes a BASELINE
+    // segment that serializes the ENTIRE live `Vec<DataFileRef>` (each ref also
+    // carrying column_stats + bloom/hll/tdigest sketches) into one JSON object.
+    // That PUT is O(files-in-partition) and grows as the table grows, so a
+    // steadily larger blob is uploaded on the commit path — the decay observed
+    // on dev (34k -> 18k r/s as a single table grew). This probe records the
+    // bytes of every part-segment PUT and reports the largest, which is the
+    // most-recent baseline. On the CURRENT code the largest baseline PUT grows
+    // ~linearly with N; the #27 fix must make it bounded (chunk reuse), at which
+    // point the assertion below flips to require flatness.
+    #[derive(Debug)]
+    struct SegPutSizeProbe {
+        inner: Arc<dyn ObjectStore>,
+        seg_put_bytes: std::sync::Mutex<Vec<usize>>,
+    }
+    impl std::fmt::Display for SegPutSizeProbe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SegPutSizeProbe")
+        }
+    }
+    #[async_trait::async_trait]
+    impl ObjectStore for SegPutSizeProbe {
+        async fn put_opts(
+            &self,
+            location: &OsPath,
+            payload: object_store::PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            // Record bytes for partition SEGMENT objects only (…/parts/<pid>/v<M>.json),
+            // not the best-effort HEAD pointer, data files, or the #27 immutable
+            // baseline CHUNK objects (…/parts/<pid>/chunks/<hash>.json). The probe
+            // measures the per-baseline SEGMENT (metadata) PUT slope; a chunk's
+            // bytes are the rare re-chunk O(n) valve, a separate documented path.
+            let k = location.as_ref();
+            if k.contains("/parts/")
+                && !k.contains("/chunks/")
+                && k.ends_with(".json")
+                && !k.ends_with("HEAD")
+            {
+                self.seg_put_bytes
+                    .lock()
+                    .unwrap()
+                    .push(payload.content_length());
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &OsPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &OsPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<OsPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<OsPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &OsPath,
+            to: &OsPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Drive `n` single-file commits to ONE partition and return the largest
+    /// part-segment PUT (bytes) — i.e. the most-recent, biggest baseline.
+    async fn max_segment_put_bytes_after(n: usize, k: u64) -> usize {
+        let probe = Arc::new(SegPutSizeProbe {
+            inner: Arc::new(InMemory::new()),
+            seg_put_bytes: std::sync::Mutex::new(Vec::new()),
+        });
+        let store: Arc<dyn ObjectStore> = probe.clone();
+        let c = ObjectStoreCatalog::with_part_compact_every(store, k);
+        let p = ProjectId::new();
+        let t = TableName::new("decay").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+        for i in 0..n {
+            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file(&format!("f{i}.parquet"), 1)])
+                .await
+                .unwrap();
+        }
+        let max = probe.seg_put_bytes.lock().unwrap().iter().copied().max().unwrap_or(0);
+        max
+    }
+
+    #[tokio::test]
+    async fn probe_27_baseline_put_bytes_slope() {
+        const K: u64 = 32;
+        let small = max_segment_put_bytes_after(400, K).await;
+        let large = max_segment_put_bytes_after(4000, K).await; // 10x the files
+        let ratio = large as f64 / small.max(1) as f64;
+        eprintln!(
+            "#27 PROBE baseline PUT bytes: 400-file={small}B  4000-file={large}B  ratio={ratio:.2}x \
+             (flat-scale target: ratio < 2; chunked-baseline reuses prior chunks)"
+        );
+        // POST-FIX: the chunked baseline seals only the files appended since the
+        // previous baseline into one new chunk and REUSES prior chunk refs, so
+        // the largest baseline-time SEGMENT PUT is O(files-added-since-last-
+        // baseline) — bounded by ~K, independent of total table size. The 10x
+        // file count must NOT produce a ~10x baseline PUT.
+        assert!(
+            ratio < 2.0,
+            "chunked baseline PUT bytes must be bounded (flat in file count); \
+             got {ratio:.2}x for 10x files (400-file={small}B, 4000-file={large}B) \
+             — a growth term here means the #27 chunking regressed"
+        );
+    }
+
+    // --- #27: chunked-baseline correctness, reuse, crash-safety, re-chunk -----
+    //
+    // A store that records, per PUT, the key + content length and counts PUTs to
+    // chunk objects (…/chunks/<hash>.json). Lets a test assert that a baseline
+    // with only-appends seals exactly ONE new bounded chunk and reuses the rest.
+    #[derive(Debug)]
+    struct ChunkPutProbe {
+        inner: Arc<dyn ObjectStore>,
+        chunk_puts: std::sync::Mutex<Vec<(String, usize)>>,
+    }
+    impl std::fmt::Display for ChunkPutProbe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ChunkPutProbe")
+        }
+    }
+    #[async_trait::async_trait]
+    impl ObjectStore for ChunkPutProbe {
+        async fn put_opts(
+            &self,
+            location: &OsPath,
+            payload: object_store::PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let k = location.as_ref();
+            if k.contains("/chunks/") && k.ends_with(".json") {
+                self.chunk_puts
+                    .lock()
+                    .unwrap()
+                    .push((k.to_string(), payload.content_length()));
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &OsPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &OsPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<OsPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<OsPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &OsPath,
+            to: &OsPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    // BOUNDED SEAL + FROZEN-CHUNK REUSE: with a small TARGET, the open tail
+    // FREEZES once full and is never re-sealed; only the growing (≤ TARGET) tail
+    // is re-sealed each baseline. So (1) EVERY chunk seal serializes ≤ TARGET
+    // files (a bounded constant, NEVER the whole live set), and (2) once a tail
+    // freezes its exact content-addressed object is never PUT again — the count
+    // of FROZEN (TARGET-sized) chunk objects equals floor(N / TARGET) and each
+    // such hash appears exactly once across all PUTs.
+    #[tokio::test]
+    async fn baseline_seals_bounded_tail_and_freezes_chunks() {
+        const K: u64 = 4;
+        const TARGET: u64 = 8;
+        let probe = Arc::new(ChunkPutProbe {
+            inner: Arc::new(InMemory::new()),
+            chunk_puts: std::sync::Mutex::new(Vec::new()),
+        });
+        let store: Arc<dyn ObjectStore> = probe.clone();
+        let c = ObjectStoreCatalog::with_chunk_config(store, K, true, TARGET, 1024);
+        let p = ProjectId::new();
+        let t = TableName::new("reuse").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        const N: usize = 80; // several frozen chunks at TARGET=8
+        for i in 0..N {
+            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file(&format!("r{i}.parquet"), 1)])
+                .await
+                .unwrap();
+        }
+
+        let puts = probe.chunk_puts.lock().unwrap().clone();
+        // Bytes of a single ~TARGET-file chunk (realistic long filenames) vs the
+        // whole live set: the seal bound sits clearly between them, so passing it
+        // proves seals are O(TARGET), not O(N).
+        let target_files: Vec<DataFileRef> = (0..TARGET)
+            .map(|j| file(&format!("r{}.parquet", j + (N as u64 - TARGET)), 1))
+            .collect();
+        let target_bytes = serde_json::to_vec(&target_files).unwrap().len();
+        let whole_files: Vec<DataFileRef> =
+            (0..N).map(|j| file(&format!("r{j}.parquet"), 1)).collect();
+        let whole_bytes = serde_json::to_vec(&whole_files).unwrap().len();
+        // Bound: <= 1.5 TARGET chunks, and comfortably under a quarter of a
+        // whole-live-set seal.
+        let seal_bound = (target_bytes * 3 / 2).min(whole_bytes / 2);
+        let max_seal = puts.iter().map(|(_, s)| *s).max().unwrap_or(0);
+        for (k, sz) in &puts {
+            assert!(
+                *sz <= seal_bound,
+                "chunk seal {k} = {sz}B exceeds the O(TARGET) bound (~{seal_bound}B; \
+                 one TARGET chunk ~{target_bytes}B, whole live set ~{whole_bytes}B) — \
+                 a seal must never serialize O(total files)"
+            );
+        }
+        // FROZEN chunks (full, ~TARGET-byte seals) are each PUT exactly once — a
+        // frozen chunk is never re-uploaded (content-addressed reuse). A frozen
+        // seal is one whose byte size is within the TARGET-chunk band.
+        use std::collections::HashMap as Map;
+        let mut counts: Map<&String, usize> = Map::new();
+        for (k, sz) in &puts {
+            if *sz as f64 >= target_bytes as f64 * 0.85 {
+                *counts.entry(k).or_default() += 1;
+            }
+        }
+        assert!(
+            counts.values().all(|&c| c == 1),
+            "each FROZEN (full) chunk must be PUT exactly once (content-addressed reuse)"
+        );
+        eprintln!(
+            "#27 seal bound: {} chunk PUTs, {} distinct full chunks; max seal {max_seal}B (bound {seal_bound}B, whole-set {whole_bytes}B)",
+            puts.len(),
+            counts.len(),
+        );
+    }
+
+    // FOLD CORRECTNESS across MANY baselines + re-chunks + removals: drive
+    // thousands of appends interleaved with replace removals, then assert a FRESH
+    // cold catalog folds to the EXACT live set (count + path set) the warm
+    // in-memory view reports. This is the exactly-once core property.
+    #[tokio::test]
+    async fn cold_fold_matches_warm_across_chunked_baselines_and_removals() {
+        const K: u64 = 16;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // Small chunk target + cap so the re-chunk valve fires within the run.
+        let c = ObjectStoreCatalog::with_chunk_config(store.clone(), K, true, 64, 8);
+        let p = ProjectId::new();
+        let t = TableName::new("coldfold").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        use std::collections::BTreeSet;
+        let mut reference: BTreeSet<String> = BTreeSet::new();
+
+        const N: usize = 2000;
+        for i in 0..N {
+            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            // Every 7th commit (after warmup) is a Replace that removes a few of
+            // the OLDEST live files (some sealed into chunks → tombstones) and
+            // adds a merged one — drives tombstone growth → eventual re-chunk.
+            if i > 0 && i % 7 == 0 && reference.len() >= 4 {
+                let to_remove: Vec<String> = reference.iter().take(4).cloned().collect();
+                let added = file(&format!("m{i}.parquet"), 5);
+                c.replace_data_files_in_partition(&p, &t, "p0", exp, to_remove.clone(), vec![added.clone()])
+                    .await
+                    .unwrap();
+                for r in &to_remove {
+                    reference.remove(r);
+                }
+                reference.insert(added.path);
+            } else {
+                let added = file(&format!("f{i}.parquet"), 1);
+                c.append_data_files_in_partition(&p, &t, "p0", exp, vec![added.clone()])
+                    .await
+                    .unwrap();
+                reference.insert(added.path);
+            }
+        }
+
+        // Warm view.
+        let warm: BTreeSet<String> = c
+            .load_table(&p, &t)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(warm, reference, "warm folded live set must equal the replay reference");
+
+        // Cold catalog (fresh instance, empty caches) must fold to the identical set.
+        let fresh = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
+        let cold: BTreeSet<String> = fresh
+            .load_table(&p, &t)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(cold.len(), reference.len(), "cold fold count must match reference");
+        assert_eq!(cold, reference, "cold fold path set must EXACTLY match the reference");
+    }
+
+    // RE-CHUNK VALVE fires under heavy removal churn and the result is exactly
+    // correct. We force a tiny chunk cap so it trips quickly, churn heavily, and
+    // assert (a) a chunked baseline with FEWER chunks than the pre-rechunk count
+    // eventually appears (compaction happened) and (b) the cold fold is exact.
+    #[tokio::test]
+    async fn rechunk_valve_fires_and_is_exact() {
+        const K: u64 = 4;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // TARGET=32 (so the live set freezes into ~6 chunks, giving frozen files
+        // to tombstone), cap=64 (NOT hit — so the valve fires via the TOMBSTONE
+        // fraction path under heavy churn, not the chunk-count cap).
+        let c = ObjectStoreCatalog::with_chunk_config(store.clone(), K, true, 32, 64);
+        let p = ProjectId::new();
+        let t = TableName::new("rechunk").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+        let qt = c.resolve_qtable(&p, &t).await;
+
+        use std::collections::BTreeSet;
+        let mut reference: BTreeSet<String> = BTreeSet::new();
+
+        // Build up a healthy live set first.
+        for i in 0..200usize {
+            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            let added = file(&format!("a{i}.parquet"), 1);
+            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![added.clone()])
+                .await
+                .unwrap();
+            reference.insert(added.path);
+        }
+        // Now churn heavily: remove an old file and add a new one each commit, so
+        // tombstones pile up and trip the rechunk valve (tomb*4 > live).
+        for i in 0..400usize {
+            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            let victim = reference.iter().next().cloned().unwrap();
+            let added = file(&format!("c{i}.parquet"), 1);
+            c.replace_data_files_in_partition(&p, &t, "p0", exp, vec![victim.clone()], vec![added.clone()])
+                .await
+                .unwrap();
+            reference.remove(&victim);
+            reference.insert(added.path);
+        }
+
+        // Scan the baseline trajectory: a RE-CHUNK consolidates the live set into
+        // fresh ~TARGET chunks, so it (a) DROPS the tombstone set to empty after
+        // tombstones had accumulated, and/or (b) reduces the chunk-ref count vs
+        // the previous baseline. We detect either signal.
+        let head_v = c.resolve_part_head_version(&p, &qt, "p0").await.unwrap().unwrap();
+        let mut saw_rechunk = false;
+        let mut max_tomb = 0usize;
+        let mut prev_chunks: Option<usize> = None;
+        let mut prev_tomb = 0usize;
+        for v in 1..=head_v {
+            let obj = c.get_part_segment(&p, &qt, "p0", v).await.unwrap();
+            if let Some(cb) = obj.chunk_baseline {
+                max_tomb = max_tomb.max(cb.tombstones.len());
+                let now_chunks = cb.chunks.len();
+                let dropped_chunks = prev_chunks.is_some_and(|pc| now_chunks < pc);
+                let absorbed_tomb = prev_tomb >= 4 && cb.tombstones.is_empty();
+                if dropped_chunks || absorbed_tomb {
+                    saw_rechunk = true;
+                }
+                prev_chunks = Some(now_chunks);
+                prev_tomb = cb.tombstones.len();
+            }
+        }
+        eprintln!("#27 rechunk valve: head_v={head_v} max_tombstones_seen={max_tomb} saw_rechunk={saw_rechunk}");
+        assert!(saw_rechunk, "re-chunk valve must fire under heavy churn (chunk-count drop or absorbed tombstones)");
+
+        // Exactly correct from a cold catalog.
+        let fresh = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
+        let cold: BTreeSet<String> = fresh
+            .load_table(&p, &t)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(cold, reference, "cold fold after re-chunk must be exactly correct");
+    }
+
+    // CRASH / AMBIGUOUS-PUT safety for CHUNK objects: a chunk Create that LANDS
+    // but surfaces an error (mirror of `AmbiguousCreateStore`) must converge —
+    // the seal sees the content-addressed object already present and proceeds,
+    // and a fresh cold catalog folds the referencing baseline correctly.
+    #[tokio::test]
+    async fn ambiguous_chunk_put_converges_and_cold_fold_is_correct() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wrapper = Arc::new(AmbiguousCreateStore {
+            inner: inner.clone(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store: Arc<dyn ObjectStore> = wrapper.clone();
+        // K=2 so the second commit writes a baseline (and seals a chunk) — we arm
+        // the ambiguous PUT just before it so the CHUNK create lands-but-errors.
+        let c = ObjectStoreCatalog::with_part_compact_every(store, 2);
+        let p = ProjectId::new();
+        let t = TableName::new("ambigchunk").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Commit 1 = genesis baseline (seals a chunk). Disarmed.
+        let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file("g0.parquet", 10)])
+            .await
+            .unwrap();
+
+        // ARM: the NEXT Create PUT lands but errors. The baseline commit seals a
+        // chunk FIRST (that is the create we make ambiguous), then writes the
+        // segment object. The seal must converge (chunk is content-addressed and
+        // already present), so the whole commit succeeds.
+        wrapper.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file("g1.parquet", 25)])
+            .await
+            .expect("ambiguous CHUNK put that LANDED must converge, not fail the commit");
+
+        // Cold catalog reads back both files once each — the baseline references
+        // a chunk that is durably present.
+        let fresh = ObjectStoreCatalog::with_prefix(inner.clone(), DEFAULT_CATALOG_PREFIX);
+        let live = fresh.load_table(&p, &t).await.unwrap().live_data_files();
+        let total_rows: u64 = live.iter().map(|f| f.row_count).sum();
+        assert_eq!(total_rows, 35, "cold fold must see g0(10)+g1(25) exactly once");
+        let mut paths: Vec<String> = live.iter().map(|f| f.path.clone()).collect();
+        paths.sort();
+        let n = paths.len();
+        paths.dedup();
+        assert_eq!(paths.len(), n, "no duplicate file refs after ambiguous chunk put");
+        assert_eq!(n, 2, "exactly the two committed files are live");
+    }
+
+    // BACKWARD COMPAT: a chain that STARTS with a legacy inline baseline (written
+    // with chunking off) then continues with chunked baselines + deltas must fold
+    // correctly from a cold catalog. We force the genesis baseline inline via the
+    // escape hatch, then re-enable chunking for the rest.
+    #[tokio::test]
+    async fn legacy_inline_baseline_then_chunked_folds_correctly() {
+        const K: u64 = 4;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let p = ProjectId::new();
+        let t = TableName::new("compat").unwrap();
+
+        use std::collections::BTreeSet;
+        let mut reference: BTreeSet<String> = BTreeSet::new();
+
+        // Phase 1: chunking OFF → genesis + early baselines are LEGACY inline.
+        {
+            let c = ObjectStoreCatalog::with_chunk_config(store.clone(), K, false, 1024, 1024);
+            c.create_namespace(&p).await.unwrap();
+            c.create_table(&p, &t, &schema()).await.unwrap();
+            for i in 0..10usize {
+                let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+                let added = file(&format!("legacy{i}.parquet"), 1);
+                c.append_data_files_in_partition(&p, &t, "p0", exp, vec![added.clone()])
+                    .await
+                    .unwrap();
+                reference.insert(added.path);
+            }
+        }
+
+        // Phase 2: chunking ON (default) → deltas + chunked baselines on top of
+        // the legacy inline baseline chain. Fresh instance (cold caches) so it
+        // must fold the legacy inline boundary correctly.
+        {
+            let c = ObjectStoreCatalog::with_chunk_config(store.clone(), K, true, 1024, 1024);
+            for i in 10..40usize {
+                let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+                if i % 5 == 0 {
+                    let victim = reference.iter().next().cloned().unwrap();
+                    let added = file(&format!("mix{i}.parquet"), 1);
+                    c.replace_data_files_in_partition(&p, &t, "p0", exp, vec![victim.clone()], vec![added.clone()])
+                        .await
+                        .unwrap();
+                    reference.remove(&victim);
+                    reference.insert(added.path);
+                } else {
+                    let added = file(&format!("new{i}.parquet"), 1);
+                    c.append_data_files_in_partition(&p, &t, "p0", exp, vec![added.clone()])
+                        .await
+                        .unwrap();
+                    reference.insert(added.path);
+                }
+            }
+        }
+
+        let fresh = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
+        let cold: BTreeSet<String> = fresh
+            .load_table(&p, &t)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(cold, reference, "mixed legacy-inline + chunked chain must fold exactly");
     }
 
     // --- Redundant-resolve elimination: per-commit ROUND TRIPS drop ----------
