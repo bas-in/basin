@@ -1698,6 +1698,56 @@ impl ObjectStoreCatalog {
         self.part_cache.lock().await.remove(&ck);
     }
 
+    /// Drop every `part_cache` entry belonging to `(project, qtable)`,
+    /// regardless of partition. The folded `PartitionLive` views the entries
+    /// hold are pinned to a segment-chain version; once that chain is purged
+    /// (see [`Self::purge_part_segments`]) any cached fold is stale and MUST be
+    /// evicted so a recreated same-name table never serves the old live set.
+    async fn invalidate_all_parts(&self, project: &ProjectId, qtable: &QualifiedTableName) {
+        let qname = qtable.to_string();
+        let mut cache = self.part_cache.lock().await;
+        cache.retain(|(p, q, _pid), _| !(*p == *project && *q == qname));
+    }
+
+    /// Hard-delete every per-partition segment object under the table's
+    /// `parts/` tree (`parts/{pid}/v*.json` + `HEAD` + #27 chunk objects).
+    ///
+    /// These segment objects are the catalog's record of partition-sharded
+    /// data files and are NOT part of the META manifest chain — so the
+    /// drop-tombstone on the manifest leaves them intact. Because a table's
+    /// object-store prefix is keyed only on `(project, schema, name)` with no
+    /// generation, a CREATE TABLE of the SAME name reuses this exact prefix; a
+    /// surviving segment would then be re-resolved by `load_unioned` and
+    /// re-counted (its `row_count` is summed by the metadata fast-aggregate
+    /// path even though the underlying data bytes were already purged by the
+    /// engine's DROP-time `delete_table_prefix`, so a bare `count(*)` would
+    /// over-report rows a scan can no longer see). Purging the tree here makes
+    /// the recreated same-name table resolve to an EMPTY live set.
+    ///
+    /// Best-effort, like the engine's object-store purge: a delete failure
+    /// leaves reclaimable bytes but never corrupts the (already-tombstoned)
+    /// catalog. List/delete is O(segment objects under the prefix).
+    async fn purge_part_segments(&self, project: &ProjectId, qtable: &QualifiedTableName) {
+        use futures::StreamExt;
+        let prefix = OsPath::from(self.parts_root(project, qtable));
+        let mut stream = self.store.list(Some(&prefix));
+        let mut keys = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(meta) => keys.push(meta.location),
+                Err(_) => {
+                    // A transient list error leaves the tree in place; the
+                    // tombstone already makes the table unresolvable, and a
+                    // later drop/recreate retries the purge.
+                    return;
+                }
+            }
+        }
+        for k in keys {
+            let _ = self.store.delete(&k).await;
+        }
+    }
+
     /// Commit a data-file delta into ONE partition's segment chain. OCC is the
     /// PARTITION's own `current_snapshot`. Loser of the per-partition CAS gets
     /// `CommitConflict` (engine reloads + retries) — but only the same partition
@@ -2396,6 +2446,18 @@ impl ObjectStoreCatalog {
         self.load_current(project, qtable).await?; // NotFound if absent.
         self.mutate_manifest(project, qtable, |m| m.dropped = true)
             .await?;
+        // The META tombstone alone does NOT empty a recreated same-name table:
+        // partition-sharded data lives in the `parts/` segment tree, which is
+        // outside the manifest chain and reuses the table's prefix verbatim on
+        // recreate. Purge that tree so `load_unioned` resolves an empty live set
+        // (otherwise `count(*)` re-sums stale `row_count`s — see
+        // `purge_part_segments`). Then evict ALL per-node caches for the key so
+        // a warm catalog can't serve the pre-drop folded views: the manifest
+        // body + META head (`invalidate`) and every partition's folded segment
+        // (`invalidate_all_parts`).
+        self.purge_part_segments(project, qtable).await;
+        self.invalidate(project, qtable).await;
+        self.invalidate_all_parts(project, qtable).await;
         Ok(())
     }
 
@@ -7822,5 +7884,135 @@ mod tests {
         // And a fresh cheap META load reflects the new constraint.
         let meta = c.load_table_meta(&p, &t).await.unwrap();
         assert_eq!(meta.check_constraints.len(), 1);
+    }
+
+    // --- DROP + recreate-SAME-name starts clean --------------------------
+    //
+    // A DROP TABLE followed by CREATE TABLE of the SAME name must present an
+    // EMPTY table. The leak: partition-sharded data lives in the `parts/`
+    // segment tree, which is outside the META manifest chain and reuses the
+    // table prefix verbatim on recreate. Before the fix, the manifest
+    // tombstone left those segments behind, so `load_unioned` re-summed their
+    // `row_count` — a bare `count(*)` (the metadata fast-aggregate path) saw
+    // the stale rows even though a scan saw none. The regression target is
+    // the catalog-visible symptom: `live_data_files()` and its summed
+    // `row_count` must both be empty on the recreated table.
+
+    /// WARM, same instance: drop + recreate-same-name → empty live set
+    /// (zero files, zero rows). Fails before the fix (stale partition segment
+    /// re-counted), passes after.
+    #[tokio::test]
+    async fn drop_recreate_same_name_warm_is_empty() {
+        let c = cat();
+        let p = ProjectId::new();
+        let t = TableName::new("t").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Land a partition-sharded data file (mirrors the engine's INSERT
+        // route on dev). One file, 1 row.
+        let exp = c.current_snapshot_id_in_partition(&p, &t, "s0").await.unwrap();
+        c.append_data_files_in_partition(&p, &t, "s0", exp, vec![file("pre_drop.parquet", 1)])
+            .await
+            .unwrap();
+        let before = c.load_table(&p, &t).await.unwrap();
+        assert_eq!(before.live_data_files().len(), 1, "precondition: 1 file live");
+
+        c.drop_table(&p, &t).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        let after = c.load_table(&p, &t).await.unwrap();
+        let live = after.live_data_files();
+        let rows: u64 = live.iter().map(|f| f.row_count).sum();
+        assert_eq!(after.current_snapshot, SnapshotId::GENESIS, "recreated table is genesis");
+        assert_eq!(live.len(), 0, "no stale data file survives drop+recreate (warm)");
+        assert_eq!(rows, 0, "count(*) fast-aggregate sees zero rows (warm)");
+    }
+
+    /// COLD, fresh instance: a brand-new catalog over the SAME store reads the
+    /// recreated table as empty. Proves the leak was PERSISTED (the `parts/`
+    /// segment objects), not merely a stale per-node cache.
+    #[tokio::test]
+    async fn drop_recreate_same_name_cold_is_empty() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let writer = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
+        let p = ProjectId::new();
+        let t = TableName::new("t").unwrap();
+        writer.create_namespace(&p).await.unwrap();
+        writer.create_table(&p, &t, &schema()).await.unwrap();
+        let exp = writer.current_snapshot_id_in_partition(&p, &t, "s0").await.unwrap();
+        writer
+            .append_data_files_in_partition(&p, &t, "s0", exp, vec![file("pre_drop.parquet", 7)])
+            .await
+            .unwrap();
+
+        writer.drop_table(&p, &t).await.unwrap();
+        writer.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Fresh catalog: empty caches, must resolve purely from the store.
+        let cold = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
+        let after = cold.load_table(&p, &t).await.unwrap();
+        let live = after.live_data_files();
+        let rows: u64 = live.iter().map(|f| f.row_count).sum();
+        assert_eq!(live.len(), 0, "no stale segment persisted under reused prefix");
+        assert_eq!(rows, 0, "cold count(*) sees zero rows");
+    }
+
+    /// After recreate, a NEW insert is counted exactly once — the recreated
+    /// table accrues only its own rows, with no stale add from the prior life.
+    #[tokio::test]
+    async fn drop_recreate_then_insert_counts_only_new() {
+        let c = cat();
+        let p = ProjectId::new();
+        let t = TableName::new("t").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+        let exp = c.current_snapshot_id_in_partition(&p, &t, "s0").await.unwrap();
+        c.append_data_files_in_partition(&p, &t, "s0", exp, vec![file("old.parquet", 999)])
+            .await
+            .unwrap();
+
+        c.drop_table(&p, &t).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Insert into the recreated table (same partition id reused).
+        let exp = c.current_snapshot_id_in_partition(&p, &t, "s0").await.unwrap();
+        assert_eq!(exp, SnapshotId::GENESIS, "recreated partition starts at genesis");
+        c.append_data_files_in_partition(&p, &t, "s0", exp, vec![file("new.parquet", 3)])
+            .await
+            .unwrap();
+
+        let after = c.load_table(&p, &t).await.unwrap();
+        let live = after.live_data_files();
+        let rows: u64 = live.iter().map(|f| f.row_count).sum();
+        assert_eq!(live.len(), 1, "only the post-recreate file is live");
+        assert_eq!(rows, 3, "count(*) == exactly the new rows, no stale add");
+    }
+
+    /// Control: a FRESH (never-reused) table name is unaffected by the fix —
+    /// its data is read back intact.
+    #[tokio::test]
+    async fn fresh_named_table_unaffected_by_drop_recreate() {
+        let c = cat();
+        let p = ProjectId::new();
+        let dropped = TableName::new("t").unwrap();
+        let fresh = TableName::new("never_reused").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &dropped, &schema()).await.unwrap();
+        c.create_table(&p, &fresh, &schema()).await.unwrap();
+        let exp = c.current_snapshot_id_in_partition(&p, &fresh, "s0").await.unwrap();
+        c.append_data_files_in_partition(&p, &fresh, "s0", exp, vec![file("keep.parquet", 5)])
+            .await
+            .unwrap();
+
+        // Dropping/recreating the OTHER table must not perturb `fresh`.
+        c.drop_table(&p, &dropped).await.unwrap();
+        c.create_table(&p, &dropped, &schema()).await.unwrap();
+
+        let after = c.load_table(&p, &fresh).await.unwrap();
+        let live = after.live_data_files();
+        let rows: u64 = live.iter().map(|f| f.row_count).sum();
+        assert_eq!(live.len(), 1, "fresh-named table keeps its data");
+        assert_eq!(rows, 5, "fresh-named table row count intact");
     }
 }

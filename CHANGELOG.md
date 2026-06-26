@@ -8,6 +8,44 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Fix: DROP TABLE + recreate of the SAME name no longer leaks stale rows into `count(*)`
+
+**After `DROP TABLE t` then `CREATE TABLE t` of the same name, a bare `count(*)`
+over-reported rows from the dropped table while a scan correctly saw the empty
+table.** The two paths disagreed because they read different state: a scan opens
+the data-file bytes (already purged at DROP by the engine's `delete_table_prefix`,
+so it sees nothing), but `count(*)` takes the metadata fast-aggregate path
+(`fast_aggregate` → `load_table` → `load_unioned` → sum of `DataFileRef.row_count`)
+and never touches storage.
+
+The leak was **persisted, not a cache artifact**: partition-sharded data lives in
+the catalog's per-partition `parts/{pid}/v*.json` segment tree, which is *outside*
+the table META manifest chain. `drop_table_q` only appended a `dropped = true`
+manifest tombstone — it never removed the `parts/` segments. Because a table's
+catalog prefix is keyed solely on `(project, schema, name)` with no generation, a
+recreate of the same name reuses that exact prefix; `load_unioned` then LISTs the
+surviving segments and re-sums their `row_count`. A fresh (never-reused) name was
+always correct.
+
+- **`drop_table_q` now purges the `parts/` segment tree** (`v*.json` + `HEAD` +
+  #27 chunk objects) via a new best-effort `purge_part_segments`, so a recreated
+  same-name table resolves to an EMPTY live set. Best-effort like the engine's
+  existing object-store purge (#16): a delete failure leaves reclaimable bytes
+  but never corrupts the already-tombstoned catalog.
+- **All per-node caches are evicted for the key on DROP** — manifest body + META
+  head (`invalidate`) and every partition's folded `PartitionLive`
+  (`invalidate_all_parts`) — so a warm catalog can't serve a pre-drop folded
+  view either. `count(*)` and the scan now agree (both empty) on the recreated
+  table.
+- **Preserved:** fresh-named tables, exactly-once / per-partition OCC, the #27
+  chunked baseline, the META manifest chain, and the engine's DROP-time
+  `delete_table_prefix` purge are all untouched.
+- **Tests** (`object_store_catalog`): `drop_recreate_same_name_warm_is_empty`,
+  `drop_recreate_same_name_cold_is_empty` (proves the leak was persisted by
+  reading through a fresh catalog instance), `drop_recreate_then_insert_counts_only_new`,
+  and the `fresh_named_table_unaffected_by_drop_recreate` control. The first
+  three fail before the fix, all pass after.
+
 ## Unreleased — Perf (#26): keyed bulk COPY no longer pays an O(table) constraint cost per chunk
 
 **Bulk COPY into a table with a single-`BIGINT` PRIMARY KEY slowed super-linearly
