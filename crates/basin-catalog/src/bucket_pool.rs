@@ -110,6 +110,74 @@ impl BucketAssignment {
     }
 }
 
+/// The phase of an in-flight online-consolidation migration (#37). The phase
+/// is the resume point of the crash-safe state machine: on restart the engine
+/// reads the [`MigrationIntent`] and re-enters at exactly this phase. Each
+/// phase's work is idempotent, so re-running a partially-completed phase
+/// converges to the same result.
+///
+/// Ordering is the forward progression `Copy → Verify → Cutover → Drain →
+/// Delete`. The numeric discriminants are stable (persisted) — never reorder
+/// or renumber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationPhase {
+    /// Server-side copy every live object of the project from `A/<prefix>` to
+    /// `B/<prefix>`. Writes still go to A (assignment unchanged). Idempotent:
+    /// re-copy is a no-op overwrite.
+    Copy,
+    /// Confirm every catalog-referenced live object exists in B with matching
+    /// size. Re-copy any mismatch. Only a fully-verified copy proceeds.
+    Verify,
+    /// The linearization point: atomically flip the assignment record
+    /// `project → B` (single catalog write). After this, reads/writes resolve
+    /// to B.
+    Cutover,
+    /// Copy any objects written to A between Copy and Cutover, verify again,
+    /// then delete A's now-orphaned project objects.
+    Drain,
+    /// Delete the source bucket from the registry iff it holds no live project
+    /// (provably empty). The LAST step; idempotent (delete-if-exists).
+    Delete,
+}
+
+impl MigrationPhase {
+    /// The phase that follows `self` in the forward progression, or `None` when
+    /// `self` is the terminal [`MigrationPhase::Delete`] (migration complete).
+    pub fn next(self) -> Option<MigrationPhase> {
+        match self {
+            MigrationPhase::Copy => Some(MigrationPhase::Verify),
+            MigrationPhase::Verify => Some(MigrationPhase::Cutover),
+            MigrationPhase::Cutover => Some(MigrationPhase::Drain),
+            MigrationPhase::Drain => Some(MigrationPhase::Delete),
+            MigrationPhase::Delete => None,
+        }
+    }
+}
+
+/// A persisted intent record for an online-consolidation migration of one
+/// project's objects from a sparse/cold source bucket (`from`) into a target
+/// pooled bucket (`to`). Stored in the catalog (no external DB), one per
+/// in-flight migration, keyed by `project`. Its presence means "a migration is
+/// in progress or crashed mid-flight"; its absence means "no migration".
+///
+/// The record is the single source of truth for resuming after a crash: read
+/// it, resume from [`Self::phase`]. It is deleted only after the terminal
+/// [`MigrationPhase::Delete`] completes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationIntent {
+    /// The project whose objects are being migrated.
+    pub project: ProjectId,
+    /// Source bucket id (the sparse/cold bucket being reclaimed).
+    pub from: String,
+    /// Target bucket id (a pooled bucket with headroom).
+    pub to: String,
+    /// Resume point: the phase to (re-)enter on restart.
+    pub phase: MigrationPhase,
+}
+
+use basin_common::ProjectId;
+
 /// FNV-1a (64-bit) over a partition id — the SAME hash basin-engine's
 /// `partition_router` uses for partition→node ownership, reused here for the
 /// partition→bucket stripe map so there is one deterministic hashing story.

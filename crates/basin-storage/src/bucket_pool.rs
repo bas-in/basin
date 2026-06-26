@@ -35,10 +35,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use basin_catalog::bucket_pool::stripe_slot;
+use basin_catalog::bucket_pool::{stripe_slot, MigrationIntent, MigrationPhase};
 use basin_catalog::{BucketAssignment, BucketRegistry, BucketRegistryEntry, BucketTier, Catalog};
-use basin_common::{ProjectId, Result};
-use object_store::ObjectStore;
+use basin_common::{BasinError, ProjectId, Result};
+use futures::stream::StreamExt;
+use object_store::{path::Path as OsPath, ObjectStore, ObjectStoreExt, PutPayload};
 
 /// Env flag that turns the pool ON. Default OFF (single-bucket, today's
 /// behaviour). Any value other than the off-set (`0`, `false`, `off`, empty,
@@ -477,4 +478,454 @@ impl BucketPool {
             .insert(*project, stripe);
         Ok(())
     }
+}
+
+// ===========================================================================
+// Online consolidation on scale-down (#37): the crash-safe object-migration
+// state machine. FLAG-GATED, MANUAL. There is NO always-on background loop —
+// consolidation is a function a future scheduler (or a test) calls explicitly.
+// With `BASIN_BUCKET_POOL` OFF every entry point below is a provable no-op.
+//
+// See `docs/multi-bucket-pool-design.md` §"Online consolidation on scale-down".
+// ===========================================================================
+
+/// Default ceiling on concurrent in-flight migrations (`≤ K`). Consolidation is
+/// best-effort background work; we never let it stampede the provider's
+/// copy/list budgets. Overridable per-call via [`BucketPool::consolidate_project`]'s
+/// concurrency check against [`Catalog::list_migration_intents`].
+pub const DEFAULT_MAX_CONCURRENT_MIGRATIONS: usize = 2;
+
+/// Where to inject a simulated crash, for the #38 exactly-once test matrix.
+/// A crash means "stop NOW, as if the node died" — the intent record is left
+/// in the catalog at whatever phase was durably written, and resume must
+/// converge to the same exactly-once result.
+///
+/// `Before(phase)` halts just before the phase's work runs (the intent already
+/// records `phase`, so resume re-enters at `phase`). `After(phase)` halts after
+/// the phase's work AND after its intent advance is durable (resume re-enters
+/// at the NEXT phase). [`CrashPoint::MidCopy`] halts partway through the copy
+/// loop, leaving B with a STRICT SUBSET of A's objects — the adversarial case
+/// proving copy idempotency + completeness on resume. `None` runs to
+/// completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashPoint {
+    /// Run to completion (no crash). Production default.
+    None,
+    /// Crash just before `phase`'s work executes.
+    Before(MigrationPhase),
+    /// Crash just after `phase`'s work executes and its advance is durable.
+    After(MigrationPhase),
+    /// Crash partway through the Copy phase, after `n` objects copied.
+    MidCopy(usize),
+    /// Crash partway through the Drain delete, after `n` source objects deleted.
+    MidDrainDelete(usize),
+}
+
+/// A simulated crash, surfaced as a distinct error so callers/tests can tell a
+/// crash-injection from a real failure. The migration intent is intact in the
+/// catalog; the next [`run_migration`] resumes it.
+#[derive(Debug)]
+pub struct SimulatedCrash(pub MigrationPhase);
+
+impl BucketPool {
+    /// Identify pooled buckets at or below the reclaim watermark — candidate
+    /// SOURCES for consolidation. A bucket qualifies when its `assigned_count`
+    /// is `> 0` (still holds projects, so there's something to reclaim) and
+    /// `<= reclaim_watermark` (sparse/cold enough to be worth emptying). Pure;
+    /// the caller decides whether/when to act (manual trigger, never a loop).
+    pub fn reclaim_candidates(registry: &BucketRegistry, reclaim_watermark: u64) -> Vec<String> {
+        registry
+            .buckets
+            .iter()
+            .filter(|b| b.assigned_count > 0 && b.assigned_count <= reclaim_watermark)
+            .map(|b| b.bucket_id.clone())
+            .collect()
+    }
+
+    /// Pick a TARGET bucket for a project leaving `from`: the most-loaded pooled
+    /// bucket that is NOT `from` (pack densely so `from` can be emptied + a
+    /// bucket reclaimed). `None` when no other bucket exists. Pure.
+    pub fn consolidation_target(registry: &BucketRegistry, from: &str) -> Option<String> {
+        registry
+            .buckets
+            .iter()
+            .filter(|b| b.bucket_id != from)
+            .max_by(|a, b| {
+                a.assigned_count
+                    .cmp(&b.assigned_count)
+                    .then_with(|| b.bucket_id.cmp(&a.bucket_id))
+            })
+            .map(|b| b.bucket_id.clone())
+    }
+
+    /// Resolve a bucket id to its store (registry-backed, cached). Public so the
+    /// migration driver + tests can fetch the source/target handles.
+    pub fn resolve_store(
+        &self,
+        bucket_id: &str,
+        registry: &BucketRegistry,
+    ) -> Result<Arc<dyn ObjectStore>> {
+        self.store_for_bucket(bucket_id, registry)
+    }
+
+    /// MANUAL consolidation entry point. Migrate `project` from bucket `from`
+    /// into bucket `to`, crash-safely + exactly-once. Off-by-default: a no-op
+    /// when the pool is disabled. Bounds concurrency to
+    /// [`DEFAULT_MAX_CONCURRENT_MIGRATIONS`] by counting live intents.
+    ///
+    /// Records an intent (`phase=Copy`) if none exists, then drives the state
+    /// machine to completion. Idempotent: calling it again after a crash
+    /// resumes from the durable intent. NOT a background loop — a scheduler
+    /// calls this per (project, from, to).
+    pub async fn consolidate_project(
+        &self,
+        project: &ProjectId,
+        from: &str,
+        to: &str,
+        catalog: &dyn Catalog,
+    ) -> Result<()> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+        if from == to {
+            return Err(BasinError::storage(
+                "consolidate_project: source and target bucket must differ",
+            ));
+        }
+
+        // Resume an existing intent verbatim; else admit a new one under the
+        // concurrency ceiling.
+        let intent = match catalog.get_migration_intent(project).await? {
+            Some(existing) => existing,
+            None => {
+                let live = catalog.list_migration_intents().await?.len();
+                if live >= DEFAULT_MAX_CONCURRENT_MIGRATIONS {
+                    return Err(BasinError::storage(format!(
+                        "consolidate_project: at migration concurrency ceiling ({live})"
+                    )));
+                }
+                let intent = MigrationIntent {
+                    project: *project,
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    phase: MigrationPhase::Copy,
+                };
+                catalog.put_migration_intent(&intent).await?;
+                intent
+            }
+        };
+        // Production never injects a crash, so a `Crash` variant is impossible
+        // here; surface only the real-failure path.
+        self.run_migration(&intent, catalog, CrashPoint::None)
+            .await
+            .map_err(MigrationError::into_basin)
+    }
+
+    /// Resume every in-flight migration found in the catalog. Called on startup
+    /// (after a node bounce) so a migration that crashed mid-flight converges.
+    /// No-op when the pool is disabled. Returns the number resumed.
+    pub async fn resume_migrations(&self, catalog: &dyn Catalog) -> Result<usize> {
+        if !self.config.enabled {
+            return Ok(0);
+        }
+        let intents = catalog.list_migration_intents().await?;
+        let n = intents.len();
+        for intent in intents {
+            self.run_migration(&intent, catalog, CrashPoint::None)
+                .await
+                .map_err(MigrationError::into_basin)?;
+        }
+        Ok(n)
+    }
+
+    /// Drive the migration state machine from `intent.phase` to completion (or
+    /// to an injected crash). The single resumable engine behind
+    /// [`Self::consolidate_project`] and [`Self::resume_migrations`]; the
+    /// `crash` hook exists for the #38 test matrix (production passes
+    /// [`CrashPoint::None`]).
+    ///
+    /// Each iteration: run the current phase's idempotent work, then advance the
+    /// durable intent to the next phase (a single catalog write). A crash at any
+    /// point leaves the intent at a phase whose work, re-run, is a no-op or
+    /// re-converges — so resume is exactly-once.
+    pub async fn run_migration(
+        &self,
+        intent: &MigrationIntent,
+        catalog: &dyn Catalog,
+        crash: CrashPoint,
+    ) -> std::result::Result<(), MigrationError> {
+        let project = intent.project;
+        let from_id = intent.from.clone();
+        let to_id = intent.to.clone();
+
+        // Resolve the source + target stores from the registry. Done once;
+        // re-resolved on each call (a fresh process rebuilds them).
+        let registry = catalog.get_bucket_registry().await?;
+        let from_store = self.resolve_store(&from_id, &registry)?;
+        let to_store = self.resolve_store(&to_id, &registry)?;
+        let prefix = project_object_prefix(&project);
+
+        let mut phase = intent.phase;
+        loop {
+            // CRASH: just before this phase's work runs (intent already at `phase`).
+            if crash == CrashPoint::Before(phase) {
+                return Err(MigrationError::Crash(SimulatedCrash(phase)));
+            }
+
+            match phase {
+                MigrationPhase::Copy => {
+                    copy_prefix(&from_store, &to_store, &prefix, crash, MigrationPhase::Copy)
+                        .await?;
+                }
+                MigrationPhase::Verify => {
+                    verify_prefix(&from_store, &to_store, &prefix).await?;
+                }
+                MigrationPhase::Cutover => {
+                    // THE linearization point: one atomic assignment write to B.
+                    let assignment = BucketAssignment {
+                        bucket_id: to_id.clone(),
+                        tier: BucketTier::Pooled,
+                        stripe: vec![to_id.clone()],
+                    };
+                    catalog.set_bucket_assignment(&project, &assignment).await?;
+                    // Drop the per-process route cache so reads/writes re-resolve
+                    // to B on the next access (cutover is now durable).
+                    self.invalidate(&project);
+                }
+                MigrationPhase::Drain => {
+                    // Catch any writes that landed in A between Copy and Cutover:
+                    // re-copy (idempotent), re-verify, then delete A's objects.
+                    copy_prefix(&from_store, &to_store, &prefix, CrashPoint::None, phase).await?;
+                    verify_prefix(&from_store, &to_store, &prefix).await?;
+                    delete_prefix(&from_store, &prefix, crash).await?;
+                }
+                MigrationPhase::Delete => {
+                    // Reclaim the bucket iff it is provably empty of THIS project
+                    // and holds no other live project. Then drop the intent.
+                    finish_delete(&project, &from_id, &from_store, catalog).await?;
+                    catalog.delete_migration_intent(&project).await?;
+                    return Ok(());
+                }
+            }
+
+            // Advance: persist the next phase as the new durable resume point.
+            let Some(next) = phase.next() else {
+                // Unreachable (Delete returns above), but be defensive.
+                catalog.delete_migration_intent(&project).await?;
+                return Ok(());
+            };
+            let advanced = MigrationIntent {
+                project,
+                from: from_id.clone(),
+                to: to_id.clone(),
+                phase: next,
+            };
+            catalog.put_migration_intent(&advanced).await?;
+
+            // CRASH: just after this phase's work + its advance are durable
+            // (resume re-enters at `next`).
+            if crash == CrashPoint::After(phase) {
+                return Err(MigrationError::Crash(SimulatedCrash(phase)));
+            }
+            phase = next;
+        }
+    }
+}
+
+/// The object-key prefix every one of a project's objects lives under, in ANY
+/// bucket. Matches the layout `Storage` writes (`projects/{project}/…`); the
+/// migration copies/verifies/deletes by this prefix so it is layout-agnostic.
+fn project_object_prefix(project: &ProjectId) -> OsPath {
+    OsPath::from(format!("projects/{project}/"))
+}
+
+/// Error from the migration state machine: a real failure, or an injected
+/// [`SimulatedCrash`] (tests only — production never injects).
+#[derive(Debug)]
+pub enum MigrationError {
+    /// A genuine error (storage/catalog).
+    Failed(BasinError),
+    /// An injected crash (#38 test matrix). The intent is intact; resume.
+    Crash(SimulatedCrash),
+}
+
+impl From<BasinError> for MigrationError {
+    fn from(e: BasinError) -> Self {
+        MigrationError::Failed(e)
+    }
+}
+
+impl MigrationError {
+    /// `true` iff this was an injected crash (not a real failure).
+    pub fn is_crash(&self) -> bool {
+        matches!(self, MigrationError::Crash(_))
+    }
+
+    /// Collapse to a [`BasinError`] for the production callers that pass
+    /// [`CrashPoint::None`] (where a `Crash` variant cannot occur). A `Crash`
+    /// here would be a logic bug, so it is surfaced as an internal error rather
+    /// than silently dropped.
+    pub fn into_basin(self) -> BasinError {
+        match self {
+            MigrationError::Failed(e) => e,
+            MigrationError::Crash(SimulatedCrash(phase)) => BasinError::Internal(format!(
+                "migration produced an injected crash at {phase:?} with CrashPoint::None"
+            )),
+        }
+    }
+}
+
+/// List every object under `prefix` in `store`, returning `(location, size)`
+/// pairs. Used by copy/verify/delete.
+async fn list_objects(store: &Arc<dyn ObjectStore>, prefix: &OsPath) -> Result<Vec<(OsPath, u64)>> {
+    let mut out = Vec::new();
+    let mut s = store.list(Some(prefix));
+    while let Some(item) = s.next().await {
+        let meta = item.map_err(|e| BasinError::storage(format!("migration list: {e}")))?;
+        out.push((meta.location, meta.size));
+    }
+    Ok(out)
+}
+
+/// COPY phase: copy every object under `prefix` from `from` to `to`. Idempotent
+/// — each object is GET-from-A + PUT-to-B (overwrite), so a re-copy is a no-op
+/// overwrite. `crash`/`crash_phase` let the #38 matrix halt mid-loop, leaving B
+/// with a strict subset (resume must complete it).
+async fn copy_prefix(
+    from: &Arc<dyn ObjectStore>,
+    to: &Arc<dyn ObjectStore>,
+    prefix: &OsPath,
+    crash: CrashPoint,
+    crash_phase: MigrationPhase,
+) -> std::result::Result<(), MigrationError> {
+    let objects = list_objects(from, prefix).await?;
+    for (i, (loc, _size)) in objects.iter().enumerate() {
+        if let CrashPoint::MidCopy(n) = crash {
+            if crash_phase == MigrationPhase::Copy && i == n {
+                return Err(MigrationError::Crash(SimulatedCrash(MigrationPhase::Copy)));
+            }
+        }
+        let bytes = from
+            .get(loc)
+            .await
+            .map_err(|e| BasinError::storage(format!("migration copy get {loc}: {e}")))?
+            .bytes()
+            .await
+            .map_err(|e| BasinError::storage(format!("migration copy read {loc}: {e}")))?;
+        to.put(loc, PutPayload::from_bytes(bytes))
+            .await
+            .map_err(|e| BasinError::storage(format!("migration copy put {loc}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// VERIFY phase: every object under `prefix` in `from` must exist in `to` with a
+/// matching size. Re-copy any missing/mismatched object, then fail if it still
+/// doesn't match (so a verified copy is provably complete). Exactly-once: this
+/// is the gate that proves no object was lost before cutover.
+async fn verify_prefix(
+    from: &Arc<dyn ObjectStore>,
+    to: &Arc<dyn ObjectStore>,
+    prefix: &OsPath,
+) -> Result<()> {
+    let src = list_objects(from, prefix).await?;
+    let dst: HashMap<String, u64> = list_objects(to, prefix)
+        .await?
+        .into_iter()
+        .map(|(loc, size)| (loc.to_string(), size))
+        .collect();
+    for (loc, size) in &src {
+        let key = loc.to_string();
+        let ok = dst.get(&key).map(|d| d == size).unwrap_or(false);
+        if !ok {
+            // Re-copy the offending object (idempotent overwrite).
+            let bytes = from
+                .get(loc)
+                .await
+                .map_err(|e| BasinError::storage(format!("migration verify get {loc}: {e}")))?
+                .bytes()
+                .await
+                .map_err(|e| BasinError::storage(format!("migration verify read {loc}: {e}")))?;
+            to.put(loc, PutPayload::from_bytes(bytes.clone()))
+                .await
+                .map_err(|e| BasinError::storage(format!("migration verify put {loc}: {e}")))?;
+            // Confirm the re-copy actually landed at the right size.
+            let after = to
+                .head(loc)
+                .await
+                .map_err(|e| BasinError::storage(format!("migration verify head {loc}: {e}")))?;
+            if after.size != *size {
+                return Err(BasinError::storage(format!(
+                    "migration verify: {loc} size {} != source {size} after re-copy",
+                    after.size
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// DRAIN delete: remove every object under `prefix` from `from` (A's now-orphaned
+/// project objects, after they're proven present in B). `crash`/`MidDrainDelete`
+/// lets the #38 matrix halt mid-delete; resume re-runs delete idempotently.
+async fn delete_prefix(
+    from: &Arc<dyn ObjectStore>,
+    prefix: &OsPath,
+    crash: CrashPoint,
+) -> std::result::Result<(), MigrationError> {
+    let objects = list_objects(from, prefix).await?;
+    for (i, (loc, _)) in objects.iter().enumerate() {
+        if let CrashPoint::MidDrainDelete(n) = crash {
+            if i == n {
+                return Err(MigrationError::Crash(SimulatedCrash(MigrationPhase::Drain)));
+            }
+        }
+        match from.delete(loc).await {
+            Ok(()) => {}
+            // Idempotent: an already-deleted object is fine on re-run.
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => {
+                return Err(MigrationError::Failed(BasinError::storage(format!(
+                    "migration drain delete {loc}: {e}"
+                ))))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// DELETE phase: the source bucket may be reclaimed from the registry iff it now
+/// holds NO live project and is physically empty of this project's objects.
+/// Decrements `from`'s `assigned_count` for `project`, and removes the bucket
+/// entry when its count reaches zero AND it is provably empty. Refuses to drop a
+/// bucket that still holds a live project (a hard correctness gate).
+async fn finish_delete(
+    project: &ProjectId,
+    from_id: &str,
+    from_store: &Arc<dyn ObjectStore>,
+    catalog: &dyn Catalog,
+) -> Result<()> {
+    // Provable-empty gate: A must hold none of this project's objects.
+    let prefix = project_object_prefix(project);
+    let remaining = list_objects(from_store, &prefix).await?;
+    if !remaining.is_empty() {
+        return Err(BasinError::storage(format!(
+            "migration delete: source bucket {from_id} still holds {} object(s) for {project}",
+            remaining.len()
+        )));
+    }
+
+    // Decrement the source's assigned-project count (idempotent-ish: clamped at
+    // 0). When it reaches zero the bucket holds no live project and may be
+    // dropped from the registry.
+    let mut registry = catalog.get_bucket_registry().await?;
+    if let Some(b) = registry.buckets.iter_mut().find(|b| b.bucket_id == from_id) {
+        b.assigned_count = b.assigned_count.saturating_sub(1);
+        let now_empty = b.assigned_count == 0;
+        if now_empty {
+            registry.buckets.retain(|b| b.bucket_id != from_id);
+        }
+        catalog.put_bucket_registry(&registry).await?;
+    }
+    Ok(())
 }

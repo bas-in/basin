@@ -8,6 +8,50 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Multi-bucket pool: online consolidation on scale-down (#37) + exactly-once crash-injection matrix (#38)
+
+**The bounded multi-bucket storage pool now reclaims sparse/cold buckets via a
+crash-safe, exactly-once online migration of a project's objects from a source
+bucket A into a target bucket B (flag-gated behind `BASIN_BUCKET_POOL`, default
+OFF — a provable no-op when disabled).** Migration is a resumable state machine
+driven by a persisted intent record (no external DB): the phases
+`Copy → Verify → Cutover → Drain → Delete` each do idempotent work and then
+advance the durable intent by a single catalog write, so a crash anywhere
+re-converges to the same result on restart.
+
+- **Intent record + catalog seam** (`basin-catalog::bucket_pool::MigrationIntent`
+  / `MigrationPhase`): per-project `migrating(project, from, to, phase)` stored
+  under a global prefix so any node LISTs every in-flight migration for
+  resume-on-restart + bounded concurrency. New `Catalog` methods
+  `set_bucket_assignment` (the atomic CUTOVER pointer flip — the linearization
+  point), `get/put/delete/list_migration_intent(s)`, implemented for the
+  in-memory and object-store backends; backend-default impls keep other
+  catalogs buildable.
+- **State machine** (`basin-storage::bucket_pool`): `consolidate_project`
+  (manual entry point, bounds concurrency to
+  `DEFAULT_MAX_CONCURRENT_MIGRATIONS`), `resume_migrations` (startup recovery),
+  and `run_migration` (the resumable driver). Copy is an idempotent GET+PUT
+  (server-side copy on a real provider); Verify re-copies any size mismatch and
+  refuses to proceed unless A's live set is provably present in B; Cutover is a
+  single atomic assignment write; Drain catches late writes to A then deletes
+  A's objects; Delete reclaims the source bucket from the registry ONLY when it
+  is provably empty of live projects. There is NO always-on loop — a future
+  scheduler calls `reclaim_candidates`/`consolidation_target`/`consolidate_project`.
+- **Exactly-once + crash-injection matrix** (#38,
+  `crates/basin-storage/tests/bucket_pool_consolidation.rs`): a `CrashPoint`
+  hook injects a simulated crash before/after every phase boundary (and partway
+  through copy + drain-delete); the test restarts (forgets the per-process
+  cache, re-reads the intent) and asserts the migration resumes and converges to
+  EXACTLY the project's live set on B (count + per-object identity) with A
+  empty — no lost, no doubled object. Covers cutover atomicity (reads resolve to
+  A pre-flip / B post-flip), provable-empty bucket deletion (a source still
+  holding another project is never dropped), vacuum→reclaim end-to-end, bounded
+  concurrency, late-write drain, and the flag-OFF no-op.
+
+No default-path behavior change: with `BASIN_BUCKET_POOL` OFF the consolidation
+entry points return immediately and the existing single-bucket routing is
+byte-identical.
+
 ## Unreleased — Docs/tests: per-project pgwire rate limiting (catalog-driven) is shipped, not deferred
 
 The per-project (per-tier) pgwire request rate limiter (#18) is fully wired —

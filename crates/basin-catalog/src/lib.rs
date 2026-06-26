@@ -113,7 +113,8 @@ pub use object_store_catalog::{
 pub use postgres::PostgresCatalog;
 pub use procedures::{ProcedureError, SqlProcedureDef};
 pub use bucket_pool::{
-    BucketAssignment, BucketRegistry, BucketRegistryEntry, BucketTier,
+    BucketAssignment, BucketRegistry, BucketRegistryEntry, BucketTier, MigrationIntent,
+    MigrationPhase,
 };
 pub use project_storage_config::ProjectStorageConfig;
 pub use reactors::{ReactorDef, ReactorError, ReactorOps};
@@ -2125,6 +2126,68 @@ pub trait Catalog: Send + Sync {
         Err(basin_common::BasinError::Internal(
             "assign_bucket_if_absent not implemented for this catalog backend".into(),
         ))
+    }
+
+    // ---- Online consolidation / migration (#37) ----
+    //
+    // These back the crash-safe object-migration state machine. They are only
+    // consulted when consolidation is invoked (flag-gated, manual — never an
+    // always-on loop). The default impls keep backends that don't support the
+    // pool buildable.
+
+    /// Overwrite a project's bucket assignment unconditionally. This is the
+    /// CUTOVER linearization point: a SINGLE atomic catalog write that flips a
+    /// project from its old bucket to the migration target. Unlike
+    /// [`Self::assign_bucket_if_absent`] (create-only), this replaces an
+    /// existing assignment, so it must be used ONLY at cutover, under the
+    /// migration's single-writer discipline. Default impl returns
+    /// `Internal("not implemented")`.
+    async fn set_bucket_assignment(
+        &self,
+        project: &ProjectId,
+        assignment: &bucket_pool::BucketAssignment,
+    ) -> Result<()> {
+        let _ = (project, assignment);
+        Err(basin_common::BasinError::Internal(
+            "set_bucket_assignment not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Read the in-flight migration intent for `project`, if any. `None` = no
+    /// migration in progress. Default impl: `None`.
+    async fn get_migration_intent(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Option<bucket_pool::MigrationIntent>> {
+        let _ = project;
+        Ok(None)
+    }
+
+    /// Persist (create or overwrite) a migration intent record. Overwrite is
+    /// how the state machine advances `phase`. Because each phase is
+    /// idempotent, an overwrite that races a crash is safe to re-apply. Default
+    /// impl returns `Internal("not implemented")`.
+    async fn put_migration_intent(
+        &self,
+        intent: &bucket_pool::MigrationIntent,
+    ) -> Result<()> {
+        let _ = intent;
+        Err(basin_common::BasinError::Internal(
+            "put_migration_intent not implemented for this catalog backend".into(),
+        ))
+    }
+
+    /// Delete a project's migration intent — the very last act of a completed
+    /// migration. Idempotent (delete-if-exists). Default impl: no-op.
+    async fn delete_migration_intent(&self, project: &ProjectId) -> Result<()> {
+        let _ = project;
+        Ok(())
+    }
+
+    /// List every in-flight migration intent (for resume-on-restart and the
+    /// bounded-concurrency check). Default impl: empty.
+    async fn list_migration_intents(&self) -> Result<Vec<bucket_pool::MigrationIntent>> {
+        Ok(Vec::new())
     }
 
     /// Persist the PRIMARY KEY column list, CHECK constraints, and

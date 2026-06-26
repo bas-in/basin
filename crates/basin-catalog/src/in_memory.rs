@@ -187,6 +187,9 @@ pub struct InMemoryCatalog {
     /// layer's `BASIN_BUCKET_POOL` flag is ON.
     bucket_registry: Mutex<crate::bucket_pool::BucketRegistry>,
     bucket_assignments: Mutex<HashMap<ProjectId, crate::bucket_pool::BucketAssignment>>,
+    /// In-flight online-consolidation migration intents (#37), keyed by
+    /// project. Present = a migration is in progress or crashed mid-flight.
+    bucket_migrations: Mutex<HashMap<ProjectId, crate::bucket_pool::MigrationIntent>>,
     /// Per-project plain-view definitions (`CREATE VIEW … AS SELECT …`).
     /// Same shape as `sql_functions`: keyed by `(ProjectId, lower-name)`.
     views: Mutex<HashMap<(ProjectId, String), ViewDef>>,
@@ -292,6 +295,7 @@ impl InMemoryCatalog {
             project_storage_config: Mutex::new(HashMap::new()),
             bucket_registry: Mutex::new(crate::bucket_pool::BucketRegistry::default()),
             bucket_assignments: Mutex::new(HashMap::new()),
+            bucket_migrations: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
             schemas: Mutex::new(HashMap::new()),
             inbound_webhooks: Mutex::new(HashMap::new()),
@@ -1559,6 +1563,52 @@ impl Catalog for InMemoryCatalog {
             proposed.clone()
         });
         Ok(entry.clone())
+    }
+
+    // ---- Online consolidation / migration (#37) ----
+
+    async fn set_bucket_assignment(
+        &self,
+        project: &ProjectId,
+        assignment: &crate::bucket_pool::BucketAssignment,
+    ) -> Result<()> {
+        self.bump_epoch();
+        self.bucket_assignments
+            .lock()
+            .await
+            .insert(*project, assignment.clone());
+        Ok(())
+    }
+
+    async fn get_migration_intent(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Option<crate::bucket_pool::MigrationIntent>> {
+        Ok(self.bucket_migrations.lock().await.get(project).cloned())
+    }
+
+    async fn put_migration_intent(
+        &self,
+        intent: &crate::bucket_pool::MigrationIntent,
+    ) -> Result<()> {
+        self.bump_epoch();
+        self.bucket_migrations
+            .lock()
+            .await
+            .insert(intent.project, intent.clone());
+        Ok(())
+    }
+
+    async fn delete_migration_intent(&self, project: &ProjectId) -> Result<()> {
+        self.bump_epoch();
+        self.bucket_migrations.lock().await.remove(project);
+        Ok(())
+    }
+
+    async fn list_migration_intents(
+        &self,
+    ) -> Result<Vec<crate::bucket_pool::MigrationIntent>> {
+        Ok(self.bucket_migrations.lock().await.values().cloned().collect())
     }
 
     #[instrument(skip(self, meta), fields(project = %project))]

@@ -3602,6 +3602,108 @@ impl Catalog for ObjectStoreCatalog {
         }
     }
 
+    // ---- Online consolidation / migration (#37) ----
+    //
+    // The migration intent is a single per-project object under a GLOBAL
+    // prefix (`{root}_bucket_pool/migrations/{project}.json`) so any node can
+    // LIST every in-flight migration for resume + bounded-concurrency. Cutover
+    // overwrites the per-project `bucket_assignment.json` — a single atomic PUT
+    // (the linearization point).
+
+    async fn set_bucket_assignment(
+        &self,
+        project: &ProjectId,
+        assignment: &crate::bucket_pool::BucketAssignment,
+    ) -> Result<()> {
+        // A single Overwrite PUT — the atomic cutover. After it returns the
+        // assignment durably points at the target; a crash either left the old
+        // value (re-run cutover) or the new one (done).
+        self.put_project_json(project, "bucket_assignment.json", assignment)
+            .await
+    }
+
+    async fn get_migration_intent(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Option<crate::bucket_pool::MigrationIntent>> {
+        let key = self.migration_intent_key(project);
+        match self.store.get(&key).await {
+            Ok(res) => {
+                let bytes = res
+                    .bytes()
+                    .await
+                    .map_err(|e| storage_err("read migration intent", e))?;
+                let v = serde_json::from_slice(&bytes)
+                    .map_err(|e| BasinError::catalog(format!("decode migration intent: {e}")))?;
+                Ok(Some(v))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(storage_err("get migration intent", e)),
+        }
+    }
+
+    async fn put_migration_intent(
+        &self,
+        intent: &crate::bucket_pool::MigrationIntent,
+    ) -> Result<()> {
+        let key = self.migration_intent_key(&intent.project);
+        let bytes = serde_json::to_vec(intent)
+            .map_err(|e| BasinError::catalog(format!("serialise migration intent: {e}")))?;
+        self.store
+            .put_opts(
+                &key,
+                Bytes::from(bytes).into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| storage_err("put migration intent", e))?;
+        self.bump_epoch();
+        Ok(())
+    }
+
+    async fn delete_migration_intent(&self, project: &ProjectId) -> Result<()> {
+        let key = self.migration_intent_key(project);
+        match self.store.delete(&key).await {
+            Ok(()) => {
+                self.bump_epoch();
+                Ok(())
+            }
+            // Idempotent: deleting an absent intent is success.
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(storage_err("delete migration intent", e)),
+        }
+    }
+
+    async fn list_migration_intents(
+        &self,
+    ) -> Result<Vec<crate::bucket_pool::MigrationIntent>> {
+        use futures::StreamExt;
+        let prefix = OsPath::from(format!("{}_bucket_pool/migrations/", self.root));
+        let mut stream = self.store.list(Some(&prefix));
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            let meta = item.map_err(|e| storage_err("list migration intents", e))?;
+            let res = self
+                .store
+                .get(&meta.location)
+                .await
+                .map_err(|e| storage_err("read migration intent", e))?;
+            let bytes = res
+                .bytes()
+                .await
+                .map_err(|e| storage_err("read migration intent", e))?;
+            if let Ok(intent) =
+                serde_json::from_slice::<crate::bucket_pool::MigrationIntent>(&bytes)
+            {
+                out.push(intent);
+            }
+        }
+        Ok(out)
+    }
+
     // ---- SQL functions (durable; mirrors InMemory semantics) ----
 
     async fn register_sql_function(&self, mut def: SqlFunctionDef) -> Result<()> {
@@ -4374,6 +4476,13 @@ impl Catalog for ObjectStoreCatalog {
 impl ObjectStoreCatalog {
     fn project_meta_key(&self, project: &ProjectId, name: &str) -> OsPath {
         OsPath::from(format!("{}{}/_project/{}", self.root, project, name))
+    }
+
+    /// Global key for a project's in-flight migration intent (#37). Lives under
+    /// a single global prefix so `list_migration_intents` LISTs every in-flight
+    /// migration in one shot (resume-on-restart + bounded-concurrency).
+    fn migration_intent_key(&self, project: &ProjectId) -> OsPath {
+        OsPath::from(format!("{}_bucket_pool/migrations/{}.json", self.root, project))
     }
 
     async fn put_project_json<T: Serialize>(
@@ -8039,7 +8148,77 @@ mod tests {
         let node_c = ObjectStoreCatalog::new(store.clone());
         assert_eq!(
             node_c.get_bucket_assignment(&p).await.unwrap(),
-            Some(first)
+            Some(first.clone())
+        );
+
+        // Cutover: set_bucket_assignment OVERWRITES (the atomic flip). Visible
+        // to a peer node.
+        let flipped = BucketAssignment {
+            bucket_id: "pool-0001".into(),
+            tier: BucketTier::Pooled,
+            stripe: vec!["pool-0001".into()],
+        };
+        node_a.set_bucket_assignment(&p, &flipped).await.unwrap();
+        assert_eq!(
+            node_b.get_bucket_assignment(&p).await.unwrap(),
+            Some(flipped),
+            "cutover overwrite is visible to a peer (atomic flip)"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_intent_persist_list_resume_delete() {
+        use crate::bucket_pool::{MigrationIntent, MigrationPhase};
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let node_a = ObjectStoreCatalog::new(store.clone());
+        let node_b = ObjectStoreCatalog::new(store.clone());
+
+        let p1 = ProjectId::new();
+        let p2 = ProjectId::new();
+        // No intents to start.
+        assert!(node_a.get_migration_intent(&p1).await.unwrap().is_none());
+        assert!(node_a.list_migration_intents().await.unwrap().is_empty());
+
+        let i1 = MigrationIntent {
+            project: p1,
+            from: "A".into(),
+            to: "B".into(),
+            phase: MigrationPhase::Copy,
+        };
+        let i2 = MigrationIntent {
+            project: p2,
+            from: "C".into(),
+            to: "B".into(),
+            phase: MigrationPhase::Cutover,
+        };
+        node_a.put_migration_intent(&i1).await.unwrap();
+        node_a.put_migration_intent(&i2).await.unwrap();
+
+        // A peer node reads the same intent (resume-on-restart) and LISTs both.
+        assert_eq!(node_b.get_migration_intent(&p1).await.unwrap(), Some(i1.clone()));
+        let mut listed = node_b.list_migration_intents().await.unwrap();
+        listed.sort_by_key(|m| m.project);
+        let mut expected = vec![i1.clone(), i2.clone()];
+        expected.sort_by_key(|m| m.project);
+        assert_eq!(listed, expected, "LIST must return every in-flight intent");
+
+        // Overwrite advances the phase (the state-machine advance step).
+        let advanced = MigrationIntent { phase: MigrationPhase::Verify, ..i1.clone() };
+        node_a.put_migration_intent(&advanced).await.unwrap();
+        assert_eq!(
+            node_b.get_migration_intent(&p1).await.unwrap(),
+            Some(advanced),
+            "phase advance is a durable overwrite"
+        );
+
+        // Delete is idempotent (delete-if-exists).
+        node_a.delete_migration_intent(&p1).await.unwrap();
+        node_a.delete_migration_intent(&p1).await.unwrap();
+        assert!(node_b.get_migration_intent(&p1).await.unwrap().is_none());
+        assert_eq!(
+            node_b.list_migration_intents().await.unwrap(),
+            vec![i2],
+            "only the remaining intent is listed after delete"
         );
     }
 

@@ -1,13 +1,14 @@
 # Multi-bucket storage pool — design
 
-Status: **Stage 1 implemented (flag-gated, default OFF)** — the foundation
-(bucket registry + deterministic project→bucket assignment + routing through
-the single object-store chokepoint) is in the engine behind `BASIN_BUCKET_POOL`.
-Consolidation/migration (#37), dedicated-tier promotion, and multi-provider
-pools remain design-only. Tracks engine tasks #36 (bounded tiered pool +
-routing — Stage 1 done), #37 (online consolidation on scale-down — deferred),
-#38 (tests — Stage 1 allocation/stability/ceiling/round-trip done; the
-crash-injection migration matrix lands with #37).
+Status: **Stages 1–2 + online consolidation implemented (flag-gated, default
+OFF).** The foundation (bucket registry + deterministic project→bucket
+assignment + routing through the single object-store chokepoint), per-project
+partition striping, and the crash-safe online-consolidation/migration state
+machine (#37) are all in the engine behind `BASIN_BUCKET_POOL`. Dedicated-tier
+promotion and multi-provider pools remain design-only. Tracks engine tasks #36
+(bounded tiered pool + routing + striping — done), #37 (online consolidation on
+scale-down — **done**, see below), #38 (tests — allocation/stability/ceiling/
+round-trip done; **crash-injection migration matrix done**).
 
 ## Stage 1 — what shipped
 
@@ -104,7 +105,21 @@ to provider per-bucket caps. Promotion to dedicated fires when a project's
 sustained share of its pooled bucket's budget exceeds a threshold for a
 sustained window (hysteresis to avoid flapping).
 
-## Online consolidation on scale-down (#37)
+## Online consolidation on scale-down (#37) — IMPLEMENTED
+
+**Status: implemented, flag-gated (OFF is a provable no-op), MANUAL (no
+always-on loop).** The state machine lives in
+`basin-storage::bucket_pool` (`BucketPool::consolidate_project` /
+`run_migration` / `resume_migrations`); the persisted intent record +
+cutover/intent catalog methods live in `basin-catalog::bucket_pool`
+(`MigrationIntent`, `MigrationPhase`) and the `Catalog` trait
+(`set_bucket_assignment`, `get/put/delete/list_migration_intent(s)`),
+implemented for both the in-memory and object-store backends. Triggering is a
+function a future scheduler calls (`reclaim_candidates` →
+`consolidation_target` → `consolidate_project`), **never** a background loop, so
+the feature can never surprise a deployment. Concurrency is bounded
+(`DEFAULT_MAX_CONCURRENT_MIGRATIONS`, counted against the live intents in the
+catalog).
 
 When projects are **vacuumed** (deleted/emptied) a pooled bucket can become
 sparsely occupied, and a previously-hot (dedicated) project can go cold. To
@@ -147,6 +162,29 @@ the migration is exactly-once regardless of where a crash lands. This mirrors
 the loader's purge-and-verify discipline but at the object level and inside the
 engine, where it belongs.
 
+Implementation notes:
+- **Copy** is GET-from-A + PUT-to-B at the `ObjectStore` trait level (so it
+  works across two distinct buckets, including the in-memory stores the tests
+  use). On a single provider this is a server-side copy; the idempotent
+  overwrite contract is identical either way.
+- **Advance is a single catalog write per phase**: each iteration runs the
+  current phase's idempotent work, then PUTs the intent at the next phase. A
+  crash leaves the intent at a phase whose re-run converges. The driver takes a
+  `CrashPoint` hook used ONLY by the #38 tests to halt before/after each phase
+  (and partway through copy + drain-delete); production passes `CrashPoint::None`.
+- **Delete is gated on provable-emptiness**: `finish_delete` LISTs A under the
+  project prefix and refuses to drop the bucket while any object remains; it
+  decrements the source's `assigned_count` and removes the registry entry only
+  when the count hits zero (no live project left). The intent is deleted last.
+- **Drain** re-runs copy (catching writes that landed in A between Copy and
+  Cutover), re-verifies, then deletes A's project objects.
+
+Deferred (documented, not yet wired): the *automatic* reclaim trigger (a
+scheduler that periodically calls `reclaim_candidates`/`consolidate_project` on
+a hysteresis timer) and the sustained-PUT-rate load signal — Stage uses the
+cheap `assigned_count`. The state machine itself, its crash-safety, and the
+exactly-once matrix are complete.
+
 ## Bounds & safety knobs
 
 - `BASIN_BUCKET_POOL_MAX` — hard ceiling on total buckets (and a per-region
@@ -168,7 +206,8 @@ Allocation:
 - Promotion to dedicated fires only after the sustained threshold (no flap on
   a brief spike).
 
-Consolidation / migration (the exactly-once matrix — the high-risk part):
+Consolidation / migration (the exactly-once matrix — the high-risk part;
+implemented in `crates/basin-storage/tests/bucket_pool_consolidation.rs`):
 - Migrate a project A→B with concurrent writes; assert post-cutover that B
   holds exactly the project's live set (count + per-object etag) and A holds
   none — no lost, no doubled objects.
