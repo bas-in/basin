@@ -485,16 +485,36 @@ async fn run() -> Result<()> {
     {
         let pool_cfg = basin_storage::bucket_pool::PoolConfig::from_env();
         if pool_cfg.enabled {
+            // REAL pooled buckets the operator pre-created (names + shared
+            // endpoint/region). When `BASIN_BUCKET_POOL_BUCKETS` is unset the
+            // list is empty and the pool keeps today's behaviour exactly: the
+            // bootstrap entry has an empty endpoint → the resolver maps it to
+            // the process-default store. When set, registered entries carry the
+            // real names + endpoint/region so the resolver builds stores against
+            // the real Tigris buckets and striping works for real.
+            let pool_buckets = basin_storage::bucket_pool::BucketPoolBuckets::from_env();
             let resolver: Arc<dyn basin_storage::bucket_pool::BucketResolver> =
                 Arc::new(S3BucketResolver::new(catalog_object_store.clone()));
-            let pool = Arc::new(basin_storage::bucket_pool::BucketPool::new(
-                pool_cfg, resolver,
+            let pool = Arc::new(basin_storage::bucket_pool::BucketPool::new_with_buckets(
+                pool_cfg,
+                pool_buckets.clone(),
+                resolver,
             ));
+            // Pre-seed the durable registry from the configured real buckets
+            // (idempotent create-if-absent) so every node + a restarted process
+            // converge on the SAME id→bucket mapping. No-op when no real buckets
+            // are configured (today's lazy-bootstrap path).
+            pool.prepopulate_registry(catalog.as_ref())
+                .await
+                .context("pre-seed bucket pool registry")?;
             storage.attach_bucket_pool(pool);
             tracing::info!(
                 max_buckets = pool_cfg.max_buckets,
                 watermark = pool_cfg.watermark,
                 stripe = pool_cfg.stripe,
+                real_buckets = pool_buckets.names.len(),
+                endpoint = %pool_buckets.endpoint,
+                region = %pool_buckets.region,
                 "bucket pool ENABLED (#36): projects routed to pooled buckets; \
                  data files stripe across the per-project stripe set, catalog \
                  stays on the primary bucket"

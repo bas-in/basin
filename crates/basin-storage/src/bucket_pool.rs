@@ -55,6 +55,31 @@ pub const BUCKET_POOL_WATERMARK_ENV: &str = "BASIN_BUCKET_POOL_WATERMARK";
 /// (byte-identical to Stage 1). Clamped to the pool ceiling.
 pub const BUCKET_POOL_STRIPE_ENV: &str = "BASIN_BUCKET_POOL_STRIPE";
 
+/// Comma-separated list of the REAL provider bucket names the pool stripes
+/// across (e.g. `basin-pool-0,basin-pool-1,basin-pool-2`). When set, the pool
+/// registers entries that carry these real names + the configured
+/// endpoint/region (below), so the production resolver builds stores against
+/// the REAL buckets instead of generated empty-endpoint placeholders. When
+/// UNSET/empty the pool keeps today's behaviour exactly: the bootstrap entry
+/// has an empty endpoint and the resolver maps it to the process-default store.
+pub const BUCKET_POOL_BUCKETS_ENV: &str = "BASIN_BUCKET_POOL_BUCKETS";
+/// The S3-compatible endpoint for the configured pool buckets. Defaults to the
+/// engine's existing storage endpoint (`AWS_ENDPOINT_URL_S3`) so Tigris is used
+/// without extra configuration.
+pub const BUCKET_POOL_ENDPOINT_ENV: &str = "BASIN_BUCKET_POOL_ENDPOINT";
+/// The region literal for the configured pool buckets. Defaults to the engine's
+/// existing storage region (`AWS_REGION` / `AWS_DEFAULT_REGION`), else `auto`
+/// (Tigris).
+pub const BUCKET_POOL_REGION_ENV: &str = "BASIN_BUCKET_POOL_REGION";
+/// Optional per-bucket credentials-reference list, parallel to
+/// `BASIN_BUCKET_POOL_BUCKETS`. When set, entry `i` carries `credentials_ref =
+/// Some(refs[i])` and the resolver reads `{refs[i]}_ACCESS_KEY_ID` /
+/// `_SECRET_ACCESS_KEY` for that bucket — required when each pooled bucket has
+/// its OWN access key (e.g. Fly/Tigris buckets, whose keys are bucket-scoped).
+/// Unset → `credentials_ref = None` → the process-default keys (today's
+/// behaviour, for an org-wide key). Refs MUST be env-var-safe (e.g. `POOL0`).
+pub const BUCKET_POOL_CREDS_REFS_ENV: &str = "BASIN_BUCKET_POOL_CREDS_REFS";
+
 /// Default pool ceiling when `BASIN_BUCKET_POOL_MAX` is unset/invalid.
 const DEFAULT_POOL_MAX: usize = 8;
 /// Default occupancy watermark when `BASIN_BUCKET_POOL_WATERMARK` is unset.
@@ -87,6 +112,120 @@ pub struct PoolConfig {
     /// (Stage-1 behaviour, the default). Always clamped to `1..=max_buckets`
     /// at assignment time.
     pub stripe: usize,
+}
+
+/// The operator-configured set of REAL provider buckets the pool stripes
+/// across, with the endpoint + region every one of them shares. Parsed once
+/// from the environment. EMPTY `names` (the default — `BASIN_BUCKET_POOL_BUCKETS`
+/// unset/empty) means "no real buckets configured": the pool falls back to
+/// generating bootstrap placeholder entries with an empty endpoint, which the
+/// resolver maps to the process-default store — today's behaviour, byte-identical.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BucketPoolBuckets {
+    /// The REAL provider bucket names, in configured order. Entry `i` is
+    /// registered under the stable `bucket_id` `pool-{i:04}`, so the id→name
+    /// mapping is deterministic + identical on every node.
+    pub names: Vec<String>,
+    /// The S3 endpoint shared by every configured bucket (empty when unset, in
+    /// which case the pool stays on the placeholder/default-store path).
+    pub endpoint: String,
+    /// The region literal shared by every configured bucket.
+    pub region: String,
+    /// Optional per-bucket credentials refs (parallel to `names`). Empty → all
+    /// buckets use the process-default keys (`credentials_ref: None`). When
+    /// non-empty, `names[i]`'s entry carries `credentials_ref = Some(creds_refs[i])`
+    /// so the resolver reads that bucket's own `{ref}_ACCESS_KEY_ID`.
+    pub creds_refs: Vec<String>,
+}
+
+impl BucketPoolBuckets {
+    /// `true` when the operator configured at least one real bucket. When
+    /// `false` the pool keeps today's empty-endpoint placeholder behaviour.
+    pub fn is_configured(&self) -> bool {
+        !self.names.is_empty()
+    }
+
+    /// Read the real-bucket config from the process environment.
+    ///
+    /// - `names`: `BASIN_BUCKET_POOL_BUCKETS` split on commas, trimmed, empties
+    ///   dropped. Unset/empty → no real buckets (placeholder/default-store
+    ///   behaviour).
+    /// - `endpoint`: `BASIN_BUCKET_POOL_ENDPOINT`, defaulting to the engine's
+    ///   existing storage endpoint (`AWS_ENDPOINT_URL_S3`).
+    /// - `region`: `BASIN_BUCKET_POOL_REGION`, defaulting to the engine's
+    ///   existing region (`AWS_REGION`/`AWS_DEFAULT_REGION`), else `auto`.
+    pub fn from_env() -> Self {
+        let names = std::env::var(BUCKET_POOL_BUCKETS_ENV)
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let endpoint = std::env::var(BUCKET_POOL_ENDPOINT_ENV)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::env::var("AWS_ENDPOINT_URL_S3")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_default();
+        let region = std::env::var(BUCKET_POOL_REGION_ENV)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::env::var("AWS_REGION")
+                    .ok()
+                    .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| "auto".to_string());
+        let creds_refs = std::env::var(BUCKET_POOL_CREDS_REFS_ENV)
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Self {
+            names,
+            endpoint,
+            region,
+            creds_refs,
+        }
+    }
+
+    /// The deterministic `bucket_id` for the `i`th configured bucket. Stable +
+    /// identical on every node so the registry converges.
+    fn bucket_id_for(i: usize) -> String {
+        format!("pool-{i:04}")
+    }
+
+    /// Build the registry entry for the `i`th configured bucket, carrying the
+    /// REAL name + the configured endpoint/region. `credentials_ref` is the
+    /// `i`th entry of `creds_refs` when configured (so the resolver reads that
+    /// bucket's OWN `{ref}_ACCESS_KEY_ID` — required for bucket-scoped keys like
+    /// Fly/Tigris), else `None` (process-default keys, for an org-wide key).
+    /// `i` must be in range.
+    fn entry_for(&self, i: usize) -> BucketRegistryEntry {
+        BucketRegistryEntry {
+            bucket_id: Self::bucket_id_for(i),
+            bucket_name: self.names[i].clone(),
+            endpoint: self.endpoint.clone(),
+            region: self.region.clone(),
+            credentials_ref: self.creds_refs.get(i).cloned(),
+            assigned_count: 0,
+        }
+    }
 }
 
 impl PoolConfig {
@@ -129,6 +268,12 @@ impl PoolConfig {
 /// `config.enabled` is false.
 pub struct BucketPool {
     config: PoolConfig,
+    /// Operator-configured REAL buckets (names + endpoint + region). EMPTY by
+    /// default — the pool then generates empty-endpoint placeholder entries
+    /// (today's behaviour). When configured, `choose_one_bucket` /
+    /// `prepopulate_registry` register entries carrying these real names +
+    /// endpoint/region so the resolver builds stores against the real buckets.
+    buckets: BucketPoolBuckets,
     /// Per-process cache of `project → ORDERED stripe of assigned bucket
     /// stores`. Populated by [`ensure_assignment`]; read by the sync routing
     /// path. A missing entry means "no cached assignment" — routing then
@@ -148,10 +293,26 @@ pub struct BucketPool {
 }
 
 impl BucketPool {
-    /// Build a pool from env config and a resolver.
+    /// Build a pool from env config and a resolver, with NO operator-configured
+    /// real buckets (empty list = today's placeholder/default-store behaviour).
+    /// Production uses [`BucketPool::new_with_buckets`]; tests that don't care
+    /// about real-bucket wiring use this.
     pub fn new(config: PoolConfig, resolver: Arc<dyn BucketResolver>) -> Self {
+        Self::new_with_buckets(config, BucketPoolBuckets::default(), resolver)
+    }
+
+    /// Build a pool from env config, the operator-configured REAL buckets, and a
+    /// resolver. When `buckets.is_configured()` the pool registers entries that
+    /// carry the real names + endpoint/region; when empty it behaves exactly
+    /// like [`BucketPool::new`] (placeholder entries → process-default store).
+    pub fn new_with_buckets(
+        config: PoolConfig,
+        buckets: BucketPoolBuckets,
+        resolver: Arc<dyn BucketResolver>,
+    ) -> Self {
         Self {
             config,
+            buckets,
             assignment_cache: RwLock::new(HashMap::new()),
             store_cache: RwLock::new(HashMap::new()),
             grow_lock: tokio::sync::Mutex::new(()),
@@ -285,22 +446,86 @@ impl BucketPool {
     ///
     /// NOTE (future): the richer load signal from the design doc (sustained PUT
     /// rate / bytes per second) would replace `assigned_count` here.
-    fn choose_one_bucket(&self, registry: &mut BucketRegistry, exclude: &[String]) -> String {
-        // No pooled buckets at all → register the first one. The bootstrap
-        // bucket carries empty endpoint/credentials, which the engine's
-        // resolver maps to the process-default store (the same single bucket
-        // used today) — so enabling the flag on an existing single-bucket
-        // deployment keeps every project on the original bucket.
-        if registry.buckets.is_empty() {
-            let id = "pool-0000".to_string();
-            registry.buckets.push(BucketRegistryEntry {
+    /// Build the registry entry for the `i`th pooled bucket. With real buckets
+    /// configured this carries the configured real name + endpoint + region (so
+    /// the resolver builds a store against the REAL bucket); without them it is
+    /// the legacy placeholder (generated name, EMPTY endpoint), which the
+    /// resolver maps to the process-default store — today's behaviour. `i` is
+    /// the bucket's position; for the configured path it indexes the configured
+    /// names (and is always in range because `choose_one_bucket` /
+    /// `prepopulate_registry` cap growth at `names.len()`).
+    fn new_pool_entry(&self, i: usize) -> BucketRegistryEntry {
+        if self.buckets.is_configured() {
+            self.buckets.entry_for(i)
+        } else {
+            let id = format!("pool-{i:04}");
+            BucketRegistryEntry {
                 bucket_id: id.clone(),
-                bucket_name: id.clone(),
+                bucket_name: id,
                 endpoint: String::new(),
                 region: String::new(),
                 credentials_ref: None,
                 assigned_count: 0,
-            });
+            }
+        }
+    }
+
+    /// Pre-seed the durable registry from the operator-configured real buckets,
+    /// idempotently (create-if-absent per `bucket_id`). Called once on pool init
+    /// so every node — and a restarted process — converges to the SAME registry
+    /// (the id→real-name mapping is deterministic, derived from the configured
+    /// list's order). Existing entries (and their `assigned_count`) are left
+    /// untouched; only missing configured buckets are appended. The write is
+    /// skipped entirely when nothing changed, so this never churns the catalog.
+    ///
+    /// No-op (and the catalog is never touched) when the pool is disabled OR no
+    /// real buckets are configured — the empty-list path keeps today's
+    /// lazy-bootstrap behaviour exactly.
+    pub async fn prepopulate_registry(&self, catalog: &dyn Catalog) -> Result<()> {
+        if !self.config.enabled || !self.buckets.is_configured() {
+            return Ok(());
+        }
+        // Cap at the env ceiling so an over-long configured list can't grow the
+        // registry past BASIN_BUCKET_POOL_MAX.
+        let want = self.buckets.names.len().min(self.config.max_buckets);
+
+        let _guard = self.grow_lock.lock().await;
+        let mut registry = catalog.get_bucket_registry().await?;
+        let mut changed = false;
+        for i in 0..want {
+            let id = BucketPoolBuckets::bucket_id_for(i);
+            if registry.get(&id).is_none() {
+                registry.buckets.push(self.buckets.entry_for(i));
+                changed = true;
+            }
+        }
+        if changed {
+            catalog.put_bucket_registry(&registry).await?;
+        }
+        Ok(())
+    }
+
+    fn choose_one_bucket(&self, registry: &mut BucketRegistry, exclude: &[String]) -> String {
+        // The growth ceiling: when the operator configured REAL buckets, never
+        // register more entries than there are real buckets (a generated id past
+        // the list would have no real bucket behind it). Otherwise the env
+        // ceiling alone applies.
+        let grow_ceiling = if self.buckets.is_configured() {
+            self.config.max_buckets.min(self.buckets.names.len())
+        } else {
+            self.config.max_buckets
+        };
+
+        // No pooled buckets at all → register the first one. With real buckets
+        // configured this carries the first real name + endpoint/region; without
+        // them it is the bootstrap placeholder (empty endpoint), which the
+        // engine's resolver maps to the process-default store — so enabling the
+        // flag on an existing single-bucket deployment keeps every project on
+        // the original bucket.
+        if registry.buckets.is_empty() {
+            let entry = self.new_pool_entry(0);
+            let id = entry.bucket_id.clone();
+            registry.buckets.push(entry);
             registry.bump_assigned(&id);
             return id;
         }
@@ -322,18 +547,10 @@ impl BucketPool {
 
         // Grow only when EVERY candidate bucket is at/above the watermark and we
         // have headroom under the ceiling.
-        if min_load >= self.config.watermark as u64
-            && registry.buckets.len() < self.config.max_buckets
-        {
-            let id = format!("pool-{:04}", registry.buckets.len());
-            registry.buckets.push(BucketRegistryEntry {
-                bucket_id: id.clone(),
-                bucket_name: id.clone(),
-                endpoint: String::new(),
-                region: String::new(),
-                credentials_ref: None,
-                assigned_count: 0,
-            });
+        if min_load >= self.config.watermark as u64 && registry.buckets.len() < grow_ceiling {
+            let entry = self.new_pool_entry(registry.buckets.len());
+            let id = entry.bucket_id.clone();
+            registry.buckets.push(entry);
             registry.bump_assigned(&id);
             return id;
         }

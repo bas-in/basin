@@ -16,7 +16,7 @@ use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::bucket_pool::BucketRegistryEntry;
 use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::{PartitionKey, ProjectId, Result, TableName};
-use basin_storage::bucket_pool::{BucketPool, BucketResolver, PoolConfig};
+use basin_storage::bucket_pool::{BucketPool, BucketPoolBuckets, BucketResolver, PoolConfig};
 use basin_storage::{Storage, StorageConfig};
 use futures::stream::StreamExt;
 use object_store::memory::InMemory;
@@ -861,4 +861,258 @@ async fn stripe_width_one_is_single_bucket() {
         Arc::as_ptr(&s0) as *const (),
         "width-1: primary routed store == every partition's store"
     );
+}
+
+// ===========================================================================
+// #36 — REAL-BUCKET WIRING: operator-configured pooled buckets carry their
+// real provider name + endpoint + region into the registry, so the production
+// resolver builds stores against the REAL buckets (not generated empty-endpoint
+// placeholders). These tests use a resolver keyed by the REAL bucket_name +
+// endpoint to prove the configured values actually reach the resolver.
+// ===========================================================================
+
+/// Resolver keyed by the REAL `bucket_name` (not `bucket_id`), and that records
+/// the (bucket_name, endpoint, region) of every entry it resolved — so a test
+/// can assert the registered entries carried the configured endpoint/region.
+#[derive(Default)]
+struct RealNameResolver {
+    stores: Mutex<HashMap<String, Arc<dyn ObjectStore>>>,
+    resolved: Mutex<Vec<(String, String, String)>>,
+}
+
+impl RealNameResolver {
+    fn store_for_name(&self, bucket_name: &str) -> Arc<dyn ObjectStore> {
+        self.stores
+            .lock()
+            .unwrap()
+            .entry(bucket_name.to_string())
+            .or_insert_with(|| Arc::new(InMemory::new()))
+            .clone()
+    }
+}
+
+impl BucketResolver for RealNameResolver {
+    fn resolve(&self, entry: &BucketRegistryEntry) -> Result<Arc<dyn ObjectStore>> {
+        self.resolved.lock().unwrap().push((
+            entry.bucket_name.clone(),
+            entry.endpoint.clone(),
+            entry.region.clone(),
+        ));
+        Ok(self.store_for_name(&entry.bucket_name))
+    }
+}
+
+const POOL_ENDPOINT: &str = "https://t3.storage.dev";
+const POOL_REGION: &str = "auto";
+
+fn configured_buckets() -> BucketPoolBuckets {
+    BucketPoolBuckets {
+        names: vec![
+            "basin-pool-0".into(),
+            "basin-pool-1".into(),
+            "basin-pool-2".into(),
+            "basin-pool-3".into(),
+        ],
+        endpoint: POOL_ENDPOINT.into(),
+        region: POOL_REGION.into(),
+        creds_refs: Vec::new(),
+    }
+}
+
+/// With real buckets configured, `prepopulate_registry` seeds the registry with
+/// those real names + the configured endpoint/region, `choose_stripe` picks
+/// among them, and every resolved entry carries the configured endpoint/region
+/// (not empty) keyed by the REAL bucket name — proving the resolver would build
+/// a store against the real bucket.
+#[tokio::test]
+async fn configured_real_buckets_prepopulate_and_carry_endpoint_region() {
+    let cat = Arc::new(InMemoryCatalog::new());
+    let resolver = Arc::new(RealNameResolver::default());
+    let pool = Arc::new(BucketPool::new_with_buckets(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 3 },
+        configured_buckets(),
+        resolver.clone(),
+    ));
+
+    // Pre-seed: the registry now holds exactly the 4 configured buckets, in
+    // order, each carrying the REAL name + configured endpoint/region.
+    pool.prepopulate_registry(cat.as_ref()).await.unwrap();
+    let registry = cat.get_bucket_registry().await.unwrap();
+    assert_eq!(registry.buckets.len(), 4, "all configured buckets pre-seeded");
+    for (i, b) in registry.buckets.iter().enumerate() {
+        assert_eq!(b.bucket_id, format!("pool-{i:04}"));
+        assert_eq!(b.bucket_name, format!("basin-pool-{i}"), "real provider name");
+        assert_eq!(b.endpoint, POOL_ENDPOINT, "configured endpoint, not empty");
+        assert_eq!(b.region, POOL_REGION, "configured region, not empty");
+        assert!(b.credentials_ref.is_none(), "creds via process-default keys");
+    }
+
+    // Pre-seed again: idempotent — same registry, no duplicate entries.
+    pool.prepopulate_registry(cat.as_ref()).await.unwrap();
+    let registry2 = cat.get_bucket_registry().await.unwrap();
+    assert_eq!(registry2.buckets, registry.buckets, "prepopulate is idempotent");
+
+    // A striped project picks among the configured buckets; resolving its
+    // stripe builds stores keyed by the REAL bucket names with the configured
+    // endpoint/region.
+    let project = ProjectId::new();
+    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
+    assert_eq!(a.stripe.len(), 3, "stripe width");
+    for id in &a.stripe {
+        let i: usize = id.strip_prefix("pool-").unwrap().parse().unwrap();
+        assert!(i < 4, "stripe bucket {id} is one of the configured buckets");
+    }
+    // Force store resolution for every stripe bucket.
+    let _ = pool.routed_stores(&project).expect("warmed stripe");
+    let resolved = resolver.resolved.lock().unwrap();
+    assert!(!resolved.is_empty(), "resolver consulted for the real buckets");
+    for (name, endpoint, region) in resolved.iter() {
+        assert!(name.starts_with("basin-pool-"), "resolved by REAL name: {name}");
+        assert_eq!(endpoint, POOL_ENDPOINT, "resolver saw configured endpoint");
+        assert_eq!(region, POOL_REGION, "resolver saw configured region");
+    }
+}
+
+/// Cross-node convergence: two independent pools over the SAME object-store
+/// catalog, each pre-seeding from the SAME configured list, converge on an
+/// identical registry (same id→real-name mapping), and both resolve a given
+/// project's partitions to the same real bucket.
+#[tokio::test]
+async fn configured_real_buckets_converge_across_nodes() {
+    use basin_catalog::ObjectStoreCatalog;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let node_a: Arc<dyn Catalog> = Arc::new(ObjectStoreCatalog::new(store.clone()));
+    let node_b: Arc<dyn Catalog> = Arc::new(ObjectStoreCatalog::new(store.clone()));
+    let resolver = Arc::new(RealNameResolver::default());
+    let pool_a = BucketPool::new_with_buckets(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 3 },
+        configured_buckets(),
+        resolver.clone(),
+    );
+    let pool_b = BucketPool::new_with_buckets(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 3 },
+        configured_buckets(),
+        resolver.clone(),
+    );
+
+    // Both nodes pre-seed (idempotent create-if-absent) → identical registry.
+    pool_a.prepopulate_registry(node_a.as_ref()).await.unwrap();
+    pool_b.prepopulate_registry(node_b.as_ref()).await.unwrap();
+    let reg_a = node_a.get_bucket_registry().await.unwrap();
+    let reg_b = node_b.get_bucket_registry().await.unwrap();
+    assert_eq!(reg_a.buckets, reg_b.buckets, "registries converge across nodes");
+    assert_eq!(reg_a.buckets.len(), 4);
+
+    // Both nodes route a given partition of the same project to the same real
+    // bucket store.
+    let project = ProjectId::new();
+    let (ra, rb) = tokio::join!(
+        pool_a.ensure_assignment(&project, node_a.as_ref()),
+        pool_b.ensure_assignment(&project, node_b.as_ref()),
+    );
+    ra.unwrap();
+    rb.unwrap();
+    for i in 0..16 {
+        let pid = format!("p{i}");
+        let sa = pool_a.store_for_partition(&project, &pid).unwrap();
+        let sb = pool_b.store_for_partition(&project, &pid).unwrap();
+        assert_eq!(
+            Arc::as_ptr(&sa) as *const (),
+            Arc::as_ptr(&sb) as *const (),
+            "both nodes route partition {pid} to the same real bucket"
+        );
+    }
+}
+
+/// The growth ceiling is the configured list length: a stripe wider than the
+/// configured bucket count never registers a bucket without a real name behind
+/// it (no generated placeholder past the list).
+#[tokio::test]
+async fn configured_real_buckets_cap_growth_at_list_length() {
+    let cat = Arc::new(InMemoryCatalog::new());
+    let resolver = Arc::new(RealNameResolver::default());
+    // Only 2 real buckets, but stripe=4 requested.
+    let pool = Arc::new(BucketPool::new_with_buckets(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        BucketPoolBuckets {
+            names: vec!["basin-pool-0".into(), "basin-pool-1".into()],
+            endpoint: POOL_ENDPOINT.into(),
+            region: POOL_REGION.into(),
+            creds_refs: Vec::new(),
+        },
+        resolver.clone(),
+    ));
+    let project = ProjectId::new();
+    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    let registry = cat.get_bucket_registry().await.unwrap();
+    assert_eq!(registry.buckets.len(), 2, "never grow past the configured list");
+    for b in &registry.buckets {
+        assert!(b.bucket_name.starts_with("basin-pool-"), "only real buckets registered");
+        assert_eq!(b.endpoint, POOL_ENDPOINT);
+    }
+}
+
+/// OFF / empty-list no-op proof for the real-bucket wiring: with NO configured
+/// buckets, `prepopulate_registry` never touches the catalog and the registry
+/// stays empty (lazy bootstrap on first write, as today). With the flag OFF and
+/// buckets configured, `prepopulate_registry` is still a no-op (the resolver is
+/// never consulted).
+#[tokio::test]
+async fn no_real_buckets_or_flag_off_is_a_noop() {
+    // (a) Flag ON but empty list → prepopulate is a no-op, registry untouched.
+    let cat = Arc::new(InMemoryCatalog::new());
+    let resolver = Arc::new(RealNameResolver::default());
+    let pool = Arc::new(BucketPool::new_with_buckets(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 1 },
+        BucketPoolBuckets::default(),
+        resolver.clone(),
+    ));
+    pool.prepopulate_registry(cat.as_ref()).await.unwrap();
+    assert!(
+        cat.get_bucket_registry().await.unwrap().buckets.is_empty(),
+        "empty list: prepopulate must not seed the registry"
+    );
+
+    // (b) Flag OFF but a real list configured → prepopulate still a no-op.
+    let cat_off = Arc::new(InMemoryCatalog::new());
+    let resolver_off = Arc::new(RealNameResolver::default());
+    let pool_off = Arc::new(BucketPool::new_with_buckets(
+        PoolConfig { enabled: false, max_buckets: 8, watermark: 1, stripe: 1 },
+        configured_buckets(),
+        resolver_off.clone(),
+    ));
+    pool_off.prepopulate_registry(cat_off.as_ref()).await.unwrap();
+    assert!(
+        cat_off.get_bucket_registry().await.unwrap().buckets.is_empty(),
+        "flag OFF: prepopulate must not seed the registry"
+    );
+    assert!(
+        resolver_off.resolved.lock().unwrap().is_empty(),
+        "flag OFF: resolver never consulted"
+    );
+}
+
+/// Empty configured list keeps the legacy bootstrap entry shape EXACTLY: the
+/// first registered bucket is `pool-0000` with an EMPTY endpoint/region (which
+/// the production resolver maps to the process-default store) — byte-identical
+/// to today.
+#[tokio::test]
+async fn empty_list_keeps_legacy_bootstrap_entry_shape() {
+    let cat = Arc::new(InMemoryCatalog::new());
+    let resolver = Arc::new(RealNameResolver::default());
+    let pool = Arc::new(BucketPool::new_with_buckets(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 1 },
+        BucketPoolBuckets::default(),
+        resolver.clone(),
+    ));
+    let project = ProjectId::new();
+    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    let registry = cat.get_bucket_registry().await.unwrap();
+    assert_eq!(registry.buckets.len(), 1, "lazy bootstrap registers one entry");
+    let b = &registry.buckets[0];
+    assert_eq!(b.bucket_id, "pool-0000");
+    assert_eq!(b.bucket_name, "pool-0000", "legacy generated name");
+    assert!(b.endpoint.is_empty(), "legacy bootstrap entry has EMPTY endpoint");
+    assert!(b.region.is_empty(), "legacy bootstrap entry has EMPTY region");
 }

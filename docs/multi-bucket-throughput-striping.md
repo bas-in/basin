@@ -1,6 +1,7 @@
 # Multi-bucket throughput striping — single-project write-bandwidth design
 
-Status: **Design + Stage-2a routing seam implemented (flag-gated, default OFF).**
+Status: **Design + Stage-2a routing seam implemented + production real-bucket
+wiring (config-driven, flag-gated, default OFF).**
 Extends `docs/multi-bucket-pool-design.md` (Stage 1: per-PROJECT bucket
 assignment). This document covers the *throughput* lever — striping ONE hot
 project's data across multiple pooled buckets — that Stage 1 deliberately does
@@ -281,6 +282,50 @@ collapses to the single store and the behaviour is byte-identical to today —
 proven by the existing `flag_off_is_a_noop_identical_to_today` test plus a new
 `stripe_width_one_is_single_bucket` test.
 
+### 4.1 Pointing the pool at REAL buckets (the wiring fix)
+
+Striping only does real work if the pooled buckets are **real** provider
+buckets. Until the operator names them, the pool registers a single bootstrap
+entry with an **empty endpoint**, which the production `S3BucketResolver`
+(`services/basin-server/src/main.rs`) maps to the process-default store — so
+every "stripe" slot resolves to the one default bucket and no real striping
+happens. The fix is three config knobs, all consulted by
+`BucketPool`/`BucketPoolBuckets::from_env`
+(`crates/basin-storage/src/bucket_pool.rs`):
+
+| Env var | Meaning | Default |
+| --- | --- | --- |
+| `BASIN_BUCKET_POOL_BUCKETS` | Comma-separated REAL provider bucket names, e.g. `basin-pool-0,basin-pool-1,basin-pool-2,basin-pool-3`. Entry *i* is registered under the stable `bucket_id` `pool-000i` (deterministic, identical on every node). | unset → empty → today's placeholder/default-store behaviour |
+| `BASIN_BUCKET_POOL_ENDPOINT` | The S3 endpoint shared by those buckets. | the engine's existing storage endpoint (`AWS_ENDPOINT_URL_S3`) so Tigris is used |
+| `BASIN_BUCKET_POOL_REGION` | The region literal shared by those buckets. | the engine's existing region (`AWS_REGION`/`AWS_DEFAULT_REGION`), else `auto` |
+
+Credentials are NOT configured per bucket: the registered entries carry
+`credentials_ref = None`, so the resolver authenticates with the
+**process-default** keys (`BASIN_STORAGE_*` / `AWS_*`) — the same keys the
+single-bucket path uses. (The `credentials_ref` mechanism remains available for
+a future per-bucket-credential pool; Stage-2a's real-bucket pool shares one
+credential set across the endpoint.)
+
+When the list is set, the registered `BucketRegistryEntry` rows now carry the
+real `bucket_name` + the configured `endpoint` + `region` (instead of a
+generated name + empty endpoint), so the resolver builds an `AmazonS3` against
+the **real** bucket. When the list is **unset/empty**, `choose_one_bucket` still
+emits the legacy placeholder entry (generated name, empty endpoint) and the pool
+behaves exactly as before — a provable no-op (test
+`empty_list_keeps_legacy_bootstrap_entry_shape` +
+`no_real_buckets_or_flag_off_is_a_noop`).
+
+**Cross-node registry consistency.** On pool init,
+`BucketPool::prepopulate_registry` seeds the durable registry from the configured
+list, idempotently (create-if-absent per `bucket_id`). Because the id→name
+mapping is positional (`pool-000i` ↔ `names[i]`) and derived purely from the
+configured list, every node — and a restarted process — converges on the same
+registry without coordination. Existing entries and their `assigned_count` are
+left untouched; the write is skipped when nothing changed. The growth ceiling is
+`min(BASIN_BUCKET_POOL_MAX, len(BASIN_BUCKET_POOL_BUCKETS))`, so a generated id
+without a real bucket behind it is never registered (test
+`configured_real_buckets_cap_growth_at_list_length`).
+
 ---
 
 ## 5. What Stage-2a implements vs defers
@@ -314,9 +359,15 @@ proven by the existing `flag_off_is_a_noop_identical_to_today` test plus a new
   the per-project `routed_store` — gated behind a second internal switch so the
   Stage-1 per-project behaviour is the default until the scan wiring lands.
 - Growing/rebalancing `S` (§3.6) — the #37-style migration.
-- Production instantiation in `services/basin-server/src/main.rs` (the pool is
-  still only wired in tests; `main.rs:320-396` builds a single store and does
-  not yet construct a `BucketPool` or an S3 `BucketResolver`).
+
+**Wired since (this change):**
+
+- Production instantiation in `services/basin-server/src/main.rs`: the
+  `BucketPool` + `S3BucketResolver` are constructed when `BASIN_BUCKET_POOL` is
+  ON, and the registry is pre-seeded with the operator-configured REAL buckets
+  (`BASIN_BUCKET_POOL_BUCKETS` + endpoint/region) so striping works against real
+  Tigris buckets, not generated placeholders (§4.1). The single-bucket /
+  empty-list path is byte-identical to before.
 
 Correctness-first: the deferred items are exactly the ones that, if
 half-done, could mis-route or lose committed data (a GET resolving the wrong
@@ -329,14 +380,16 @@ round-trip gate.
 
 ## 6. Dev throughput validation (the path to proving the win)
 
-1. Provision N real Tigris pooled buckets (operator task; credentials referenced
-   by `credentials_ref` per registry entry, never inlined — `bucket_pool.rs`
-   doc + `BucketRegistryEntry::credentials_ref`).
-2. Wire `BucketPool` in `main.rs` with an S3 `BucketResolver` that builds an
-   `AmazonS3` per `credentials_ref` (mirrors
-   `Storage::build_byo_object_store_from_config_with_secret`,
-   `lib.rs:897+`). Set `BASIN_BUCKET_POOL=on`,
-   `BASIN_BUCKET_POOL_STRIPE=N`, `BASIN_BUCKET_POOL_MAX≥N`.
+1. Provision N real Tigris pooled buckets (operator task), sharing the engine's
+   existing Tigris endpoint + credentials. Name them per the list you'll set in
+   step 2, e.g. `basin-pool-0 … basin-pool-3`.
+2. Set the env on the engine (the `BucketPool` + `S3BucketResolver` are now
+   constructed automatically when `BASIN_BUCKET_POOL` is ON, and the registry is
+   pre-seeded from the list — §4.1). Set `BASIN_BUCKET_POOL=on`,
+   `BASIN_BUCKET_POOL_BUCKETS=basin-pool-0,basin-pool-1,basin-pool-2,basin-pool-3`,
+   `BASIN_BUCKET_POOL_STRIPE=N`, `BASIN_BUCKET_POOL_MAX≥N`. The endpoint/region
+   default to the engine's existing Tigris endpoint/region, so they need not be
+   set unless the pool buckets live elsewhere.
 3. Deploy **multi-node** (fra+jnb or 2×fra; the win needs concurrent committers
    per §2). One project, table partitioned so partition count ≫ N.
 4. Loader: enough concurrency to saturate ≥1 bucket at the single-bucket
@@ -344,3 +397,27 @@ round-trip gate.
 5. Measure sustained rows/s vs the single-bucket baseline. Expect ≈ linear in
    min(N, #nodes) until CPU re-binds; record the crossover. Restore the
    fra=1/jnb=1 @ 8gb baseline and drop test tables afterward (dev scale-safety).
+
+### 6.1 Exact dev runbook (env to set on basin-engine-dev)
+
+Given N pre-created Tigris buckets sharing the engine's existing Tigris endpoint
++ creds (so NO per-bucket credentials needed), set on `basin-engine-dev`:
+
+```
+BASIN_BUCKET_POOL=on
+BASIN_BUCKET_POOL_BUCKETS=basin-pool-0,basin-pool-1,basin-pool-2,basin-pool-3
+BASIN_BUCKET_POOL_STRIPE=4
+BASIN_BUCKET_POOL_MAX=4
+# endpoint/region inherit the engine's existing storage endpoint
+# (AWS_ENDPOINT_URL_S3) + region (AWS_REGION); set these ONLY if the pool
+# buckets live at a different endpoint/region than the primary store:
+# BASIN_BUCKET_POOL_ENDPOINT=https://t3.storage.dev
+# BASIN_BUCKET_POOL_REGION=auto
+```
+
+On boot every node logs `bucket pool ENABLED (#36) … real_buckets=4` and
+idempotently pre-seeds the registry (`pool-0000 … pool-0003` ↔
+`basin-pool-0 … basin-pool-3`). Leaving `BASIN_BUCKET_POOL_BUCKETS` unset (but
+the flag ON) keeps the existing single-default-bucket behaviour, so the rollout
+is safe to stage. Do NOT create the buckets from the engine — the operator
+pre-creates them out-of-band.

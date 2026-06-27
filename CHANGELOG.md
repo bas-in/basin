@@ -8,6 +8,41 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Fix (#36): multi-bucket pool can point at REAL provider buckets (striping works on Tigris)
+
+**The bucket pool's `choose_one_bucket` registered new pooled
+`BucketRegistryEntry` rows with a GENERATED name and an EMPTY
+endpoint/region.** The production `S3BucketResolver` maps an empty-endpoint
+entry to the process-default store, so every pooled bucket beyond the bootstrap
+entry resolved to the one default bucket — real multi-bucket striping could not
+function against real Tigris buckets, only in-memory tests. This wires the pool
+to operator-configured REAL buckets, default OFF (byte-identical to before).
+
+- **Config knobs** (`crates/basin-storage/src/bucket_pool.rs`,
+  `BucketPoolBuckets::from_env`): `BASIN_BUCKET_POOL_BUCKETS` (comma-separated
+  REAL provider bucket names), `BASIN_BUCKET_POOL_ENDPOINT` (defaults to the
+  engine's existing `AWS_ENDPOINT_URL_S3` so Tigris is used),
+  `BASIN_BUCKET_POOL_REGION` (defaults to `AWS_REGION`/`AWS_DEFAULT_REGION`, else
+  `auto`). When set, registered entries carry the real name + endpoint + region
+  (creds via the process-default `BASIN_STORAGE_*`/`AWS_*` keys), so the resolver
+  builds an `AmazonS3` against the real bucket.
+- **Cross-node consistency**: `BucketPool::prepopulate_registry` seeds the
+  durable registry from the list on pool init, idempotently (create-if-absent
+  per `bucket_id`). The id→name mapping is positional (`pool-000i` ↔ `names[i]`),
+  so every node and a restarted process converge on the same registry without
+  coordination; growth is capped at `min(BASIN_BUCKET_POOL_MAX, len(list))`.
+- **No-op default**: with `BASIN_BUCKET_POOL_BUCKETS` unset/empty (or the flag
+  OFF), `choose_one_bucket` still emits the legacy placeholder entry (generated
+  name, empty endpoint → process-default store) and `prepopulate_registry` never
+  touches the catalog — byte-identical to today, asserted by
+  `empty_list_keeps_legacy_bootstrap_entry_shape` and
+  `no_real_buckets_or_flag_off_is_a_noop`. Catalog stays on the primary store;
+  only data files stripe (unchanged). Exactly-once / CAS untouched.
+- **Wiring**: `services/basin-server/src/main.rs` builds the pool with the
+  configured buckets and calls `prepopulate_registry` on boot when the flag is
+  ON. See `docs/multi-bucket-throughput-striping.md` §4.1 + §6.1 for the
+  operator runbook.
+
 ## Unreleased — Fix (#17): broadened catalog file prune no longer errors a plain string / `IN` / out-of-domain `WHERE`
 
 **The broadened selective file prune (#17) dropped the ADR 0027 promoted-JSONB
