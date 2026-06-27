@@ -8,6 +8,44 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Fix (#17): broadened catalog file prune no longer errors a plain string / `IN` / out-of-domain `WHERE`
+
+**The broadened selective file prune (#17) dropped the ADR 0027 promoted-JSONB
+shadow columns when it re-registered the survivor / empty table, so a query
+that resolved against the original (extended) registration then hit a provider
+whose schema was missing those fields — failing DataFusion's `type_coercion`
+analyzer pass (`internal: create plan: type_coercion`).** The prune is on by
+default; an on-by-default prune must NEVER error or change a result, so this is
+a correctness fix, not a perf tweak.
+
+- **Root cause** (`apply_minmax_file_pruning_for_query` /
+  `register_pruned_listing_table` / `register_empty_table` in `session.rs`):
+  the re-registration declared the bare catalog schema
+  (`schema_ws_to_df(meta.schema)`), while the original `refresh_table`
+  registration declares the EXTENDED schema
+  (`extend_schema_with_promoted_cols`, base + promoted-JSONB shadow columns
+  the physical files actually carry). Once the prune swapped in a provider
+  missing those shadow fields, any plan that referenced a promoted path (e.g.
+  `payload->>'category'`) failed to bind. The fast-path
+  (`fast_select`/`fast_aggregate`) intercepts plain equality / `IN`, so the
+  failure only surfaced on the DataFusion path (string ranges, and any shape
+  the fast path declines) — which is why the existing per-file unit tests,
+  testing `file_survives_*` in isolation, never planned a query and missed it.
+- **Fix**: every pruned re-registration (the min/max prune's survivor + empty
+  paths, plus the partition / GIN-FTS / spatial prune callers that share
+  `register_pruned_listing_table`) now declares the SAME extended DataFusion
+  schema the original registration used, so the re-registered provider is
+  schema-identical and `type_coercion` cannot newly fail. Predicate-shape
+  type-gating still happens against the base (user-visible) schema. Every
+  predicate shape (Int64 `=`/`IN`, string `=`/range, out-of-domain → empty)
+  now plans and returns the exact result with the prune still applied;
+  `BASIN_DISABLE_MINMAX_PRUNE` is no longer needed for correctness.
+- **Tests**: new `tests/minmax_prune_plain_predicate.rs` drives PLAIN predicates
+  (no projection trick) end-to-end through real planning and asserts exact
+  results — including a promoted-JSONB table whose shadow column the
+  re-registration used to drop (the exact repro: fails before the fix with the
+  missing shadow column, passes after) and all-pruned → empty (not an error).
+
 ## Unreleased — Multi-bucket pool: online consolidation on scale-down (#37) + exactly-once crash-injection matrix (#38)
 
 **The bounded multi-bucket storage pool now reclaims sparse/cold buckets via a

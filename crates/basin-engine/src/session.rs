@@ -4143,11 +4143,15 @@ pub(crate) async fn apply_partition_pruning_for_query(
             // matches (no point re-registering). Skip the swap.
             continue;
         }
+        let df_schema = Arc::new(extend_schema_with_promoted_cols(
+            schema_ws_to_df(meta.schema.as_ref())?,
+            &meta.promoted_jsonb_paths,
+        ));
         let _ = register_pruned_listing_table(
             engine,
             ctx,
             &table,
-            &meta.schema,
+            df_schema,
             meta.file_format,
             &matching,
             meta.global_sort_order.as_deref(),
@@ -4668,18 +4672,34 @@ pub(crate) async fn apply_minmax_file_pruning_for_query(
         Ok(m) => m,
         Err(_) => return Ok(()),
     };
-    // Predicate column must exist AND have the exact Arrow type the variant's
-    // stats/bloom byte contract covers (Int64 little-endian, or Utf8 raw
-    // bytes). A mismatch makes the whole pass a no-op (full scan).
-    let df_schema = match schema_ws_to_df(meta.schema.as_ref()) {
+    // Build the DataFusion schema the survivor / empty re-registration will
+    // declare. This MUST be byte-identical to the schema `refresh_table`
+    // registered the table with originally — same field names, Arrow types,
+    // nullability, metadata, AND the ADR 0027 promoted-JSONB shadow columns —
+    // or DataFusion's `type_coercion` analyzer pass fails when the (string /
+    // IN-list / out-of-domain) predicate is bound against a re-registered
+    // provider whose schema differs from the one the rest of the plan was
+    // resolved against. Re-deriving only the bare catalog schema here (the
+    // pre-fix behaviour) dropped the promoted shadow columns the physical files
+    // carry, so a plan that resolved against the extended schema then hit a
+    // provider missing those fields → `Optimizer rule 'type_coercion' failed`.
+    let base_df_schema = match schema_ws_to_df(meta.schema.as_ref()) {
         Ok(s) => s,
         Err(_) => return Ok(()),
     };
+    // Type-gate against the BASE schema (the predicate column is always a
+    // user-visible column, never a synthetic shadow): a mismatch makes the
+    // whole pass a no-op (full scan), since the stats byte-encoding contract is
+    // type-specific.
     let want_ty = pred.required_type();
-    match df_schema.fields().iter().find(|f| f.name() == pred.column()) {
+    match base_df_schema.fields().iter().find(|f| f.name() == pred.column()) {
         Some(f) if *f.data_type() == want_ty => {}
         _ => return Ok(()),
     }
+    let df_schema = Arc::new(extend_schema_with_promoted_cols(
+        base_df_schema,
+        &meta.promoted_jsonb_paths,
+    ));
 
     let files = meta.live_data_files();
     if files.is_empty() {
@@ -4709,7 +4729,7 @@ pub(crate) async fn apply_minmax_file_pruning_for_query(
     // (e.g. `WHERE id = <absent>`): without it we would fall back to a full
     // scan of every file only to filter them all out.
     if survivors.is_empty() {
-        let _ = register_empty_table(ctx, &table, &meta.schema);
+        let _ = register_empty_table(ctx, &table, df_schema);
         return Ok(());
     }
 
@@ -4717,7 +4737,7 @@ pub(crate) async fn apply_minmax_file_pruning_for_query(
         engine,
         ctx,
         &table,
-        &meta.schema,
+        df_schema,
         meta.file_format,
         &survivors,
         meta.global_sort_order.as_deref(),
@@ -4731,16 +4751,21 @@ pub(crate) async fn apply_minmax_file_pruning_for_query(
 /// non-matching: the query's correct result is the empty set, and an empty
 /// in-memory provider serves it with ZERO object-store GETs.
 ///
-/// Correctness: the schema is the catalog schema, so column order / types /
-/// nullability match what every other read path produces for this table; an
-/// empty batch set is the exact result DataFusion would compute after applying
-/// the predicate to a (provably non-matching) full scan.
+/// Correctness: `df_schema` MUST be the SAME extended DataFusion schema the
+/// caller built for the original `refresh_table` registration (base catalog
+/// schema + ADR 0027 promoted-JSONB shadow columns) — same field names, Arrow
+/// types, nullability, and metadata. Declaring a different schema here (e.g.
+/// dropping the promoted shadow fields, the pre-fix behaviour) makes the
+/// re-registered provider disagree with the schema the rest of the plan was
+/// resolved against, so DataFusion's `type_coercion` analyzer pass fails. With
+/// the identical schema, an empty batch set is the exact result DataFusion
+/// would compute after applying the predicate to a (provably non-matching)
+/// full scan.
 fn register_empty_table(
     ctx: &SessionContext,
     table: &TableName,
-    schema: &arrow_schema::Schema,
+    df_schema: Arc<arrow_schema::Schema>,
 ) -> Result<()> {
-    let df_schema = Arc::new(schema_ws_to_df(schema)?);
     let provider = MemTable::try_new(df_schema, vec![vec![]])
         .map_err(|e| BasinError::internal(format!("empty MemTable::try_new (pruned): {e}")))?;
     let tref = TableReference::Bare { table: table.as_str().into() };
@@ -4754,16 +4779,23 @@ fn register_empty_table(
 /// per-file URL list of `paths`. This bypasses DataFusion's directory scan
 /// entirely, so no footer GET is issued for files we already proved
 /// irrelevant.
+///
+/// `df_schema` MUST be the SAME extended DataFusion schema the caller built for
+/// the original `refresh_table` registration (base catalog schema + ADR 0027
+/// promoted-JSONB shadow columns). The physical files carry those shadow
+/// columns; declaring a schema that omits them (or otherwise differs) makes the
+/// survivor provider disagree with the schema the plan was resolved against and
+/// trips DataFusion's `type_coercion` analyzer pass — so we thread through the
+/// already-extended schema rather than re-deriving the bare catalog schema.
 async fn register_pruned_listing_table(
     _engine: &Engine,
     ctx: &SessionContext,
     table: &TableName,
-    schema: &arrow_schema::Schema,
+    df_schema: Arc<arrow_schema::Schema>,
     file_format: TableFileFormat,
     paths: &[String],
     global_sort_order: Option<&[String]>,
 ) -> Result<()> {
-    let df_schema = Arc::new(schema_ws_to_df(schema)?);
     let (file_format, file_ext) = listing_file_format(file_format);
     let mut listing_options = ListingOptions::new(file_format).with_file_extension(file_ext);
     if let Some(sort_cols) = global_sort_order {
@@ -5153,11 +5185,20 @@ async fn register_pruned_listing_table_if_narrowed(
     if pruned_paths.is_empty() || pruned_paths.len() == live_files.len() {
         return Ok(());
     }
+    // Build the SAME extended schema `refresh_table` registered the table with
+    // (base catalog schema + ADR 0027 promoted-JSONB shadow columns) so the
+    // re-registered survivor provider is schema-identical to the original and
+    // DataFusion's `type_coercion` pass cannot newly fail. See
+    // `register_pruned_listing_table`.
+    let df_schema = Arc::new(extend_schema_with_promoted_cols(
+        schema_ws_to_df(meta.schema.as_ref())?,
+        &meta.promoted_jsonb_paths,
+    ));
     let _ = register_pruned_listing_table(
         engine,
         ctx,
         table,
-        &meta.schema,
+        df_schema,
         meta.file_format,
         pruned_paths,
         meta.global_sort_order.as_deref(),
@@ -5290,23 +5331,15 @@ pub(crate) async fn apply_gin_fts_pruning_for_query(
     // conservative superset of the posting-list rows that touched the
     // query lexemes; the full `@@` UDF re-evaluates every emitted row.
     let df_schema = match schema_ws_to_df(&meta.schema) {
-        Ok(s) => Arc::new(s),
+        Ok(s) => Arc::new(extend_schema_with_promoted_cols(s, &meta.promoted_jsonb_paths)),
         Err(_) => {
-            // Schema conversion failed — fall back to file-level prune
-            // (still safe; just opens all row-groups of each candidate file).
-            if pruned_paths.len() == live_files.len() {
-                return Ok(());
-            }
-            let _ = register_pruned_listing_table(
-                engine,
-                ctx,
-                &fts_plan.table,
-                &meta.schema,
-                meta.file_format,
-                &pruned_paths,
-                meta.global_sort_order.as_deref(),
-            )
-            .await;
+            // Schema conversion failed — we cannot build a provider whose
+            // schema matches the original registration, so re-registering
+            // anything risks a `type_coercion` plan failure. Leave the full
+            // (un-pruned) set registered and full-scan: correctness over the
+            // row-group prune. (A schema the catalog itself can't convert would
+            // have failed the original registration too, so this is unreachable
+            // in practice — but bailing is the safe branch.)
             return Ok(());
         }
     };
@@ -5882,12 +5915,18 @@ pub(crate) async fn apply_gist_pruning_for_query(
         return Ok(());
     }
 
-    // Re-register with only the pruned file set.
+    // Re-register with only the pruned file set, using the SAME extended
+    // schema the original registration declared (see
+    // `register_pruned_listing_table`).
+    let df_schema = Arc::new(extend_schema_with_promoted_cols(
+        schema_ws_to_df(meta.schema.as_ref())?,
+        &meta.promoted_jsonb_paths,
+    ));
     let _ = register_pruned_listing_table(
         engine,
         ctx,
         &plan.table,
-        &meta.schema,
+        df_schema,
         meta.file_format,
         &pruned_paths,
         meta.global_sort_order.as_deref(),
