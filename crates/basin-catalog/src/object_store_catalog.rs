@@ -193,6 +193,22 @@ struct TableManifest {
     /// (rather than racing a delete); `load_table` treats it as `NotFound`.
     #[serde(default)]
     dropped: bool,
+    /// Per-create GENERATION of this table's partition (`parts/`) segment tree.
+    ///
+    /// A table's META manifest prefix is keyed only on `(project, schema, name)`
+    /// with no generation, so a CREATE TABLE of the SAME name reuses the prefix.
+    /// The partition segment chains live under `parts/g{generation}/{pid}/…`, so
+    /// each create stamps a fresh generation: a DROP's best-effort purge LISTs
+    /// (and deletes) only the generation that was current AT DROP TIME, so it can
+    /// NEVER delete a segment that a later same-name recreate (a higher
+    /// generation) wrote — closing the drop-purge-vs-recreate race that tore a
+    /// delta chain (a delta whose baseline segment had been concurrently purged).
+    ///
+    /// `0` for genesis tables AND for every manifest written before this field
+    /// existed (serde default), so legacy partition trees at the un-prefixed
+    /// `parts/{pid}/…` layout are read transparently (see `gen_subdir`).
+    #[serde(default)]
+    parts_generation: u64,
 }
 
 impl TableManifest {
@@ -239,6 +255,7 @@ impl TableManifest {
             gc_orphan_paths: Vec::new(),
             promoted_jsonb_paths: Vec::new(),
             dropped: false,
+            parts_generation: 0,
         }
     }
 
@@ -711,35 +728,61 @@ impl ObjectStoreCatalog {
         OsPath::from(format!("{}HEAD", self.table_dir(project, qtable)))
     }
 
-    /// Directory holding one partition's data-file segment chain.
+    /// Sub-directory component for a partition-tree GENERATION.
+    ///
+    /// Generation `0` (genesis tables + every pre-generation manifest, via the
+    /// serde default) maps to the EMPTY string so the layout stays byte-identical
+    /// to the historical `parts/{pid}/…` keys — existing on-disk trees are read
+    /// and written unchanged, no migration. Generations `>0` (written only by a
+    /// same-name RECREATE) nest under `g{gen}/`, an isolated namespace a prior
+    /// drop's purge (scoped to the dropped generation) can never enumerate.
+    fn gen_subdir(generation: u64) -> String {
+        if generation == 0 {
+            String::new()
+        } else {
+            format!("g{generation}/")
+        }
+    }
+
+    /// Directory holding one partition's data-file segment chain, for a given
+    /// partition-tree generation.
     fn part_dir(
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
     ) -> String {
         format!(
-            "{}parts/{}/",
+            "{}parts/{}{}/",
             self.table_dir(project, qtable),
+            Self::gen_subdir(generation),
             sanitize(partition_id)
         )
     }
 
-    /// Prefix under which ALL of a table's partition segment dirs live.
-    fn parts_root(&self, project: &ProjectId, qtable: &QualifiedTableName) -> String {
-        format!("{}parts/", self.table_dir(project, qtable))
+    /// Prefix under which a table's partition segment dirs for ONE generation
+    /// live. The drop-time purge lists exactly this prefix (the generation that
+    /// was current at drop) so it cannot reach a later recreate's tree.
+    fn parts_root(&self, project: &ProjectId, qtable: &QualifiedTableName, generation: u64) -> String {
+        format!(
+            "{}parts/{}",
+            self.table_dir(project, qtable),
+            Self::gen_subdir(generation)
+        )
     }
 
     fn part_segment_key(
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
         version: u64,
     ) -> OsPath {
         OsPath::from(format!(
             "{}v{version:020}.json",
-            self.part_dir(project, qtable, partition_id)
+            self.part_dir(project, qtable, generation, partition_id)
         ))
     }
 
@@ -747,18 +790,27 @@ impl ObjectStoreCatalog {
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
     ) -> OsPath {
-        OsPath::from(format!("{}HEAD", self.part_dir(project, qtable, partition_id)))
+        OsPath::from(format!("{}HEAD", self.part_dir(project, qtable, generation, partition_id)))
     }
 
     fn part_cache_key(
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
     ) -> (ProjectId, String, String) {
-        (*project, qtable.to_string(), sanitize(partition_id))
+        // Fold the generation into the partition component so a recreated
+        // same-name table (higher generation) can never serve a folded view
+        // cached against the dropped generation's segment chain.
+        (
+            *project,
+            qtable.to_string(),
+            format!("{generation}/{}", sanitize(partition_id)),
+        )
     }
 
     fn cache_key(&self, project: &ProjectId, qtable: &QualifiedTableName) -> (ProjectId, String) {
@@ -1195,16 +1247,17 @@ impl ObjectStoreCatalog {
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
     ) -> Result<Option<u64>> {
-        match self.store.get(&self.part_head_key(project, qtable, partition_id)).await {
+        match self.store.get(&self.part_head_key(project, qtable, generation, partition_id)).await {
             Ok(res) => {
                 if let Ok(bytes) = res.bytes().await {
                     if let Ok(s) = std::str::from_utf8(&bytes) {
                         if let Ok(v) = s.trim().parse::<u64>() {
                             if self
                                 .store
-                                .head(&self.part_segment_key(project, qtable, partition_id, v))
+                                .head(&self.part_segment_key(project, qtable, generation, partition_id, v))
                                 .await
                                 .is_ok()
                             {
@@ -1225,7 +1278,7 @@ impl ObjectStoreCatalog {
                                 // LIST scan below to recover the true max version.
                                 if self
                                     .store
-                                    .head(&self.part_segment_key(project, qtable, partition_id, v + 1))
+                                    .head(&self.part_segment_key(project, qtable, generation, partition_id, v + 1))
                                     .await
                                     .is_err()
                                 {
@@ -1241,7 +1294,7 @@ impl ObjectStoreCatalog {
         }
         // LIST fallback: max v{M}.json directly under the partition dir.
         use futures::StreamExt;
-        let dir = self.part_dir(project, qtable, partition_id);
+        let dir = self.part_dir(project, qtable, generation, partition_id);
         let prefix = OsPath::from(dir.clone());
         let trimmed = dir.trim_end_matches('/');
         let mut stream = self.store.list(Some(&prefix));
@@ -1269,10 +1322,11 @@ impl ObjectStoreCatalog {
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
         version: u64,
     ) -> Result<PartSegmentObject> {
-        let key = self.part_segment_key(project, qtable, partition_id, version);
+        let key = self.part_segment_key(project, qtable, generation, partition_id, version);
         let res = self.store.get(&key).await.map_err(|e| match e {
             object_store::Error::NotFound { .. } => BasinError::not_found(format!(
                 "{project}/{qtable}/parts/{partition_id}@v{version}"
@@ -1297,12 +1351,13 @@ impl ObjectStoreCatalog {
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
         head_version: u64,
     ) -> Result<PartitionLive> {
         // Collect delta objects from HEAD back to (and including) the baseline.
         let head = self
-            .get_part_segment(project, qtable, partition_id, head_version)
+            .get_part_segment(project, qtable, generation, partition_id, head_version)
             .await?;
         let current_snapshot = head.current_snapshot;
         // Commits to a partition are monotonic (single owner), so the HEAD
@@ -1332,7 +1387,7 @@ impl ObjectStoreCatalog {
                 // reconstruct the frozen/tail split. The first `cb.frozen` refs
                 // are immutable; a trailing ref (if any) is the open tail.
                 let per_chunk = self
-                    .load_baseline_chunks(project, qtable, partition_id, &cb.chunks)
+                    .load_baseline_chunks(project, qtable, generation, partition_id, &cb.chunks)
                     .await?;
                 let tomb: std::collections::HashSet<&str> =
                     cb.tombstones.iter().map(String::as_str).collect();
@@ -1376,7 +1431,7 @@ impl ObjectStoreCatalog {
             })?;
             deltas.push(cur.delta);
             cur = self
-                .get_part_segment(project, qtable, partition_id, base)
+                .get_part_segment(project, qtable, generation, partition_id, base)
                 .await?;
         }
 
@@ -1417,12 +1472,13 @@ impl ObjectStoreCatalog {
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
         hash: &str,
     ) -> OsPath {
         OsPath::from(format!(
             "{}chunks/{hash}.json",
-            self.part_dir(project, qtable, partition_id)
+            self.part_dir(project, qtable, generation, partition_id)
         ))
     }
 
@@ -1435,6 +1491,7 @@ impl ObjectStoreCatalog {
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
         refs: &[BaselineChunkRef],
     ) -> Result<Vec<Vec<DataFileRef>>> {
@@ -1459,7 +1516,7 @@ impl ObjectStoreCatalog {
             if cached[idx].is_some() {
                 continue; // served from the immutable-chunk cache; no store read.
             }
-            let key = self.baseline_chunk_key(project, qtable, partition_id, &r.hash);
+            let key = self.baseline_chunk_key(project, qtable, generation, partition_id, &r.hash);
             let store = self.store.clone();
             let hash = r.hash.clone();
             futs.push(async move {
@@ -1524,13 +1581,14 @@ impl ObjectStoreCatalog {
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
         files: &[DataFileRef],
     ) -> Result<BaselineChunkRef> {
         let bytes = serde_json::to_vec(files)
             .map_err(|e| BasinError::catalog(format!("serialise baseline chunk: {e}")))?;
         let hash = Self::chunk_hash(&bytes);
-        let key = self.baseline_chunk_key(project, qtable, partition_id, &hash);
+        let key = self.baseline_chunk_key(project, qtable, generation, partition_id, &hash);
         let opts = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
@@ -1568,15 +1626,16 @@ impl ObjectStoreCatalog {
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
     ) -> Result<(u64, Arc<PartitionLive>)> {
         let Some(version) = self
-            .resolve_part_head_version(project, qtable, partition_id)
+            .resolve_part_head_version(project, qtable, generation, partition_id)
             .await?
         else {
             return Ok((0, Arc::new(PartitionLive::genesis())));
         };
-        let ck = self.part_cache_key(project, qtable, partition_id);
+        let ck = self.part_cache_key(project, qtable, generation, partition_id);
         {
             let cache = self.part_cache.lock().await;
             if let Some(entry) = cache.get(&ck) {
@@ -1586,7 +1645,7 @@ impl ObjectStoreCatalog {
             }
         }
         let live = Arc::new(
-            self.fold_part_chain(project, qtable, partition_id, version)
+            self.fold_part_chain(project, qtable, generation, partition_id, version)
                 .await?,
         );
         let mut cache = self.part_cache.lock().await;
@@ -1624,14 +1683,15 @@ impl ObjectStoreCatalog {
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
     ) -> Result<(u64, Arc<PartitionLive>)> {
-        let ck = self.part_cache_key(project, qtable, partition_id);
+        let ck = self.part_cache_key(project, qtable, generation, partition_id);
         if let Some(entry) = self.part_cache.lock().await.get(&ck) {
             return Ok((entry.version, entry.segment.clone()));
         }
         // Cold cache (first touch / post-invalidation): authoritative resolve.
-        self.load_part_current(project, qtable, partition_id).await
+        self.load_part_current(project, qtable, generation, partition_id).await
     }
 
     /// Write partition segment `version` via create-if-absent. `true` = won.
@@ -1666,13 +1726,14 @@ impl ObjectStoreCatalog {
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
         version: u64,
         segment: &PartSegmentObject,
     ) -> Result<bool> {
         let bytes = serde_json::to_vec(segment)
             .map_err(|e| BasinError::catalog(format!("serialise partition segment: {e}")))?;
-        let key = self.part_segment_key(project, qtable, partition_id, version);
+        let key = self.part_segment_key(project, qtable, generation, partition_id, version);
         let opts = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
@@ -1716,6 +1777,7 @@ impl ObjectStoreCatalog {
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
         version: u64,
         live: PartitionLive,
@@ -1728,7 +1790,7 @@ impl ObjectStoreCatalog {
         // backoff and `warn!` if it never lands — the resolver recovers the true
         // version via LIST regardless, but a persistently stale pointer forces an
         // O(segments) LIST on every resolve, so we want it observed, not silent.
-        let head_key = self.part_head_key(project, qtable, partition_id);
+        let head_key = self.part_head_key(project, qtable, generation, partition_id);
         let mut head_written = false;
         for attempt in 0..3u32 {
             match self
@@ -1764,7 +1826,7 @@ impl ObjectStoreCatalog {
             }
         }
         let _ = head_written;
-        let ck = self.part_cache_key(project, qtable, partition_id);
+        let ck = self.part_cache_key(project, qtable, generation, partition_id);
         self.part_cache.lock().await.insert(
             ck,
             PartCacheEntry {
@@ -1779,9 +1841,10 @@ impl ObjectStoreCatalog {
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
         partition_id: &str,
     ) {
-        let ck = self.part_cache_key(project, qtable, partition_id);
+        let ck = self.part_cache_key(project, qtable, generation, partition_id);
         self.part_cache.lock().await.remove(&ck);
     }
 
@@ -1796,32 +1859,74 @@ impl ObjectStoreCatalog {
         cache.retain(|(p, q, _pid), _| !(*p == *project && *q == qname));
     }
 
-    /// Hard-delete every per-partition segment object under the table's
-    /// `parts/` tree (`parts/{pid}/v*.json` + `HEAD` + #27 chunk objects).
+    /// Hard-delete every per-partition segment object under ONE GENERATION of
+    /// the table's `parts/` tree (`parts/{g}/{pid}/v*.json` + `HEAD` + #27 chunk
+    /// objects).
     ///
     /// These segment objects are the catalog's record of partition-sharded
     /// data files and are NOT part of the META manifest chain — so the
     /// drop-tombstone on the manifest leaves them intact. Because a table's
-    /// object-store prefix is keyed only on `(project, schema, name)` with no
-    /// generation, a CREATE TABLE of the SAME name reuses this exact prefix; a
-    /// surviving segment would then be re-resolved by `load_unioned` and
-    /// re-counted (its `row_count` is summed by the metadata fast-aggregate
-    /// path even though the underlying data bytes were already purged by the
-    /// engine's DROP-time `delete_table_prefix`, so a bare `count(*)` would
-    /// over-report rows a scan can no longer see). Purging the tree here makes
-    /// the recreated same-name table resolve to an EMPTY live set.
+    /// object-store prefix is keyed only on `(project, schema, name)`, a CREATE
+    /// TABLE of the SAME name reuses this exact prefix; a surviving segment would
+    /// then be re-resolved by `load_unioned` and re-counted (its `row_count` is
+    /// summed by the metadata fast-aggregate path even though the underlying data
+    /// bytes were already purged by the engine's DROP-time `delete_table_prefix`,
+    /// so a bare `count(*)` would over-report rows a scan can no longer see).
+    /// Purging the tree here makes the recreated same-name table resolve to an
+    /// EMPTY live set.
+    ///
+    /// GENERATION SCOPING (drop-purge-vs-recreate race fix): the purge is bound
+    /// to `generation` — the generation that was current at DROP time. A same-
+    /// name recreate stamps a FRESH higher generation (`create_table_q`), whose
+    /// segments live under a distinct `parts/g{n}/…` prefix that this purge can
+    /// NEVER enumerate. So a lagging/concurrent drop purge can no longer delete a
+    /// successor table's segments (which previously left a delta whose baseline
+    /// was purged → torn chain → a project-wide session-open FATAL). For the
+    /// genesis layout (`generation == 0`, prefix `…/parts/`), the LIST would also
+    /// return higher-generation keys under `parts/g{n}/…`; those are filtered out
+    /// here so generation-0 purge stays scoped to the un-prefixed segments only.
     ///
     /// Best-effort, like the engine's object-store purge: a delete failure
     /// leaves reclaimable bytes but never corrupts the (already-tombstoned)
     /// catalog. List/delete is O(segment objects under the prefix).
-    async fn purge_part_segments(&self, project: &ProjectId, qtable: &QualifiedTableName) {
+    async fn purge_part_segments(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        generation: u64,
+    ) {
         use futures::StreamExt;
-        let prefix = OsPath::from(self.parts_root(project, qtable));
+        let root = self.parts_root(project, qtable, generation);
+        let prefix = OsPath::from(root.clone());
+        // `gen == 0` lists `…/parts/`, which ALSO returns higher-generation keys
+        // (`…/parts/g{n}/…`). Keep only keys whose first path component after the
+        // prefix is NOT a `g{n}` generation dir, so a genesis-generation purge
+        // never reaches a recreate's tree. For `gen > 0` the prefix is exact and
+        // isolated, so every listed key belongs to this generation.
+        let trimmed = root.trim_end_matches('/');
         let mut stream = self.store.list(Some(&prefix));
         let mut keys = Vec::new();
         while let Some(item) = stream.next().await {
             match item {
-                Ok(meta) => keys.push(meta.location),
+                Ok(meta) => {
+                    if generation == 0 {
+                        let key = meta.location.as_ref();
+                        if let Some(rest) = key.strip_prefix(trimmed) {
+                            let rest = rest.trim_start_matches('/');
+                            if let Some(seg) = rest.split('/').next() {
+                                // A `g<digits>/` first component is a higher
+                                // generation's subtree — leave it untouched.
+                                if seg.starts_with('g')
+                                    && seg.len() > 1
+                                    && seg[1..].chars().all(|c| c.is_ascii_digit())
+                                {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    keys.push(meta.location);
+                }
                 Err(_) => {
                     // A transient list error leaves the tree in place; the
                     // tombstone already makes the table unresolvable, and a
@@ -1853,13 +1958,17 @@ impl ObjectStoreCatalog {
         // Served from the META-head cache during ingest (no store RTT) — the
         // manifest head never moves on a data-file commit.
         let (_mv, manifest) = self.load_current(project, qtable).await?;
+        // This commit lands in the manifest's CURRENT partition generation, so a
+        // prior drop's generation-scoped purge can never reach the segment we
+        // write (or its baseline) here.
+        let generation = manifest.parts_generation;
         // Resolve the partition's current segment from `part_cache` WITHOUT a
         // redundant store head-resolution when the caller already warmed it via
         // `current_snapshot_id_in_partition`. The `expected_snapshot` check and
         // the create-if-absent CAS below stay authoritative, so a stale cached
         // version simply loses the CAS and falls into the engine's retry.
         let (version, segment) = self
-            .load_part_current_cached(project, qtable, partition_id)
+            .load_part_current_cached(project, qtable, generation, partition_id)
             .await?;
 
         if segment.current_snapshot != expected_snapshot {
@@ -1977,7 +2086,7 @@ impl ObjectStoreCatalog {
                     let mut fresh: Vec<BaselineChunkRef> = Vec::new();
                     for batch in all.chunks(target as usize) {
                         fresh.push(
-                            self.seal_baseline_chunk(project, qtable, partition_id, batch)
+                            self.seal_baseline_chunk(project, qtable, generation, partition_id, batch)
                                 .await?,
                         );
                     }
@@ -2006,7 +2115,7 @@ impl ObjectStoreCatalog {
                             .filter_map(|p| new_live.get(p).cloned())
                             .collect();
                         let cref = self
-                            .seal_baseline_chunk(project, qtable, partition_id, &tail_files)
+                            .seal_baseline_chunk(project, qtable, generation, partition_id, &tail_files)
                             .await?;
                         let tail_full = tail_files.len() as u64 >= target;
                         chunks.push(cref.clone());
@@ -2070,7 +2179,7 @@ impl ObjectStoreCatalog {
 
         let committed_at = obj.delta.committed_at;
         if self
-            .put_part_segment_create(project, qtable, partition_id, new_version, &obj)
+            .put_part_segment_create(project, qtable, generation, partition_id, new_version, &obj)
             .await?
         {
             let next_live = PartitionLive {
@@ -2087,7 +2196,7 @@ impl ObjectStoreCatalog {
                 open_tail: next_open_tail,
                 tombstones: next_tombstones,
             };
-            self.after_part_commit(project, qtable, partition_id, new_version, next_live)
+            self.after_part_commit(project, qtable, generation, partition_id, new_version, next_live)
                 .await;
             // FLAT-SCALE: do NOT build the unioned table metadata here. The
             // sustained-ingest hot path (`Shard::commit_with_retry`) discards
@@ -2106,7 +2215,7 @@ impl ObjectStoreCatalog {
             // intended contract for the cheap commit return.
             Ok(manifest.to_metadata(project, &qtable.name))
         } else {
-            self.invalidate_part(project, qtable, partition_id).await;
+            self.invalidate_part(project, qtable, generation, partition_id).await;
             Err(BasinError::CommitConflict(format!(
                 "{project}/{qtable}[{partition_id}]: lost commit race at partition version {new_version}"
             )))
@@ -2205,9 +2314,10 @@ impl ObjectStoreCatalog {
         &self,
         project: &ProjectId,
         qtable: &QualifiedTableName,
+        generation: u64,
     ) -> Result<Vec<String>> {
         use futures::StreamExt;
-        let root = self.parts_root(project, qtable);
+        let root = self.parts_root(project, qtable, generation);
         let prefix = OsPath::from(root.clone());
         let trimmed = root.trim_end_matches('/');
         let mut stream = self.store.list(Some(&prefix));
@@ -2218,11 +2328,22 @@ impl ObjectStoreCatalog {
             // key = {parts_root}{partition_id}/v{M}.json (or /HEAD).
             let Some(rest) = key.strip_prefix(trimmed) else { continue };
             let rest = rest.trim_start_matches('/');
-            if let Some(seg) = rest.split('/').next() {
-                if !seg.is_empty() {
-                    ids.insert(seg.to_string());
-                }
+            let Some(seg) = rest.split('/').next() else { continue };
+            if seg.is_empty() {
+                continue;
             }
+            // `gen == 0` lists `…/parts/`, which ALSO returns higher-generation
+            // keys under `…/parts/g{n}/…`; their first component is a `g{n}` dir,
+            // never a real partition id — skip them so a genesis-generation read
+            // never folds a recreate's partitions.
+            if generation == 0
+                && seg.starts_with('g')
+                && seg.len() > 1
+                && seg[1..].chars().all(|c| c.is_ascii_digit())
+            {
+                continue;
+            }
+            ids.insert(seg.to_string());
         }
         Ok(ids.into_iter().collect())
     }
@@ -2239,8 +2360,21 @@ impl ObjectStoreCatalog {
         dst_project: &ProjectId,
         dst: &QualifiedTableName,
     ) -> Result<()> {
-        for pid in self.list_partition_ids(src_project, src).await? {
-            let (_v, segment) = self.load_part_current(src_project, src, &pid).await?;
+        // Each side reads/writes its own current partition generation: a rename
+        // (or fork) copies the live segments of the source generation into the
+        // destination's generation, leaving any older dropped generations behind.
+        let src_gen = self
+            .load_current(src_project, src)
+            .await?
+            .1
+            .parts_generation;
+        let dst_gen = self
+            .load_current(dst_project, dst)
+            .await?
+            .1
+            .parts_generation;
+        for pid in self.list_partition_ids(src_project, src, src_gen).await? {
+            let (_v, segment) = self.load_part_current(src_project, src, src_gen, &pid).await?;
             let live = segment.live_data_files();
             if live.is_empty() {
                 continue;
@@ -2278,17 +2412,17 @@ impl ObjectStoreCatalog {
             };
             let mut obj = make_baseline(0);
             if !self
-                .put_part_segment_create(dst_project, dst, &pid, 0, &obj)
+                .put_part_segment_create(dst_project, dst, dst_gen, &pid, 0, &obj)
                 .await?
             {
                 // Destination partition already has a segment — place at next.
                 let v = self
-                    .resolve_part_head_version(dst_project, dst, &pid)
+                    .resolve_part_head_version(dst_project, dst, dst_gen, &pid)
                     .await?
                     .unwrap_or(0);
                 obj = make_baseline(v + 1);
                 let _ = self
-                    .put_part_segment_create(dst_project, dst, &pid, obj.version, &obj)
+                    .put_part_segment_create(dst_project, dst, dst_gen, &pid, obj.version, &obj)
                     .await?;
             }
             let fresh_live = PartitionLive {
@@ -2306,7 +2440,7 @@ impl ObjectStoreCatalog {
                 open_tail: live.iter().map(|f| f.path.clone()).collect(),
                 tombstones: std::collections::HashSet::new(),
             };
-            self.after_part_commit(dst_project, dst, &pid, obj.version, fresh_live)
+            self.after_part_commit(dst_project, dst, dst_gen, &pid, obj.version, fresh_live)
                 .await;
         }
         Ok(())
@@ -2339,7 +2473,8 @@ impl ObjectStoreCatalog {
         // the per-partition segments below. Both feed the same unioned read.
         let mut all_live: Vec<DataFileRef> = meta.live_data_files();
 
-        let partition_ids = self.list_partition_ids(project, qtable).await?;
+        let generation = manifest.parts_generation;
+        let partition_ids = self.list_partition_ids(project, qtable, generation).await?;
         // Track the latest commit time across partitions to stamp the union.
         let mut latest_commit = manifest
             .snapshots
@@ -2348,7 +2483,7 @@ impl ObjectStoreCatalog {
             .max()
             .unwrap_or_else(Utc::now);
         for pid in &partition_ids {
-            let (_v, segment) = self.load_part_current(project, qtable, pid).await?;
+            let (_v, segment) = self.load_part_current(project, qtable, generation, pid).await?;
             for f in segment.live_data_files() {
                 all_live.push(f);
             }
@@ -2477,6 +2612,22 @@ impl ObjectStoreCatalog {
                     .unwrap_or(0);
                 let mut genesis = TableManifest::genesis(schema.clone());
                 genesis.version = version + 1;
+                // BUMP the partition generation past the dropped manifest's so
+                // the recreated table writes its segment chains under a FRESH
+                // `parts/g{n}/…` prefix. A prior/concurrent drop's purge is scoped
+                // to the OLD generation (see `drop_table_q` / `purge_part_segments`)
+                // and can never enumerate — let alone delete — these segments, so
+                // a recreate's delta chain can never reference a baseline the purge
+                // removed (the torn-chain root cause). Reading the dropped
+                // manifest's generation is cheap (the tombstone version we just
+                // resolved). Genesis defaulted `parts_generation = 0`; default the
+                // dropped read to 0 too so a legacy un-prefixed tree becomes g1.
+                let dropped_generation = self
+                    .get_manifest(project, qtable, version)
+                    .await
+                    .map(|m| m.parts_generation)
+                    .unwrap_or(0);
+                genesis.parts_generation = dropped_generation + 1;
                 if self
                     .put_manifest_create(project, qtable, genesis.version, &genesis)
                     .await?
@@ -2591,7 +2742,12 @@ impl ObjectStoreCatalog {
     async fn drop_table_q(&self, project: &ProjectId, qtable: &QualifiedTableName) -> Result<()> {
         // Tombstone: append a manifest version with `dropped = true`. Keeps the
         // history immutable and lets concurrent readers resolve deterministically.
-        self.load_current(project, qtable).await?; // NotFound if absent.
+        // Capture the partition GENERATION that is live at drop time BEFORE the
+        // tombstone so the purge below is scoped to exactly this generation's
+        // segment tree — a concurrent/subsequent same-name recreate stamps a
+        // HIGHER generation under a distinct prefix the purge can never reach.
+        let (_v, manifest) = self.load_current(project, qtable).await?; // NotFound if absent.
+        let dropped_generation = manifest.parts_generation;
         self.mutate_manifest(project, qtable, |m| m.dropped = true)
             .await?;
         // The META tombstone alone does NOT empty a recreated same-name table:
@@ -2599,11 +2755,15 @@ impl ObjectStoreCatalog {
         // outside the manifest chain and reuses the table's prefix verbatim on
         // recreate. Purge that tree so `load_unioned` resolves an empty live set
         // (otherwise `count(*)` re-sums stale `row_count`s — see
-        // `purge_part_segments`). Then evict ALL per-node caches for the key so
-        // a warm catalog can't serve the pre-drop folded views: the manifest
-        // body + META head (`invalidate`) and every partition's folded segment
+        // `purge_part_segments`). The purge is scoped to `dropped_generation`, so
+        // even if a same-name CREATE + heavy ingest races this purge, the
+        // recreated table's segments (a fresh higher generation) are untouched —
+        // no delta whose baseline got purged → no torn chain → no project-wide
+        // session-open FATAL. Then evict ALL per-node caches for the key so a
+        // warm catalog can't serve the pre-drop folded views: the manifest body +
+        // META head (`invalidate`) and every partition's folded segment
         // (`invalidate_all_parts`).
-        self.purge_part_segments(project, qtable).await;
+        self.purge_part_segments(project, qtable, dropped_generation).await;
         self.invalidate(project, qtable).await;
         self.invalidate_all_parts(project, qtable).await;
         Ok(())
@@ -2672,9 +2832,10 @@ impl ObjectStoreCatalog {
         {
             return Ok(SnapshotId(1));
         }
-        let partition_ids = self.list_partition_ids(project, qtable).await?;
+        let generation = manifest.parts_generation;
+        let partition_ids = self.list_partition_ids(project, qtable, generation).await?;
         for pid in &partition_ids {
-            let (_pv, segment) = self.load_part_current(project, qtable, pid).await?;
+            let (_pv, segment) = self.load_part_current(project, qtable, generation, pid).await?;
             if !segment.live_data_files().is_empty() {
                 return Ok(SnapshotId(1));
             }
@@ -2936,13 +3097,17 @@ impl Catalog for ObjectStoreCatalog {
         // ingest). Each chain's removes must be committed to THAT chain.
         if !removed_paths.is_empty() {
             use std::collections::{HashMap, HashSet};
+            // Resolve the current partition generation once; every partition
+            // probe below reads only this generation's segment chains (the
+            // per-partition `commit_part_snapshot` re-resolves it itself).
+            let generation = self.load_current(project, &qtable).await?.1.parts_generation;
             let mut by_partition: HashMap<String, Vec<String>> = HashMap::new();
             let mut remaining: HashSet<String> = removed_paths.iter().cloned().collect();
-            for pid in self.list_partition_ids(project, &qtable).await? {
+            for pid in self.list_partition_ids(project, &qtable, generation).await? {
                 if remaining.is_empty() {
                     break;
                 }
-                let (_pv, segment) = self.load_part_current(project, &qtable, &pid).await?;
+                let (_pv, segment) = self.load_part_current(project, &qtable, generation, &pid).await?;
                 let live: HashSet<String> = segment
                     .live_data_files()
                     .into_iter()
@@ -2981,7 +3146,7 @@ impl Catalog for ObjectStoreCatalog {
                 .await?;
                 // Partition removes (if any) are committed without re-adding.
                 for (pid, paths) in by_partition {
-                    let (_pv, segment) = self.load_part_current(project, &qtable, &pid).await?;
+                    let (_pv, segment) = self.load_part_current(project, &qtable, generation, &pid).await?;
                     self.commit_part_snapshot(
                         project,
                         &qtable,
@@ -2998,7 +3163,7 @@ impl Catalog for ObjectStoreCatalog {
                 // to the FIRST partition commit, the rest are pure removes.
                 let mut iter = by_partition.into_iter();
                 let (first_pid, first_paths) = iter.next().expect("non-empty by_partition");
-                let (_pv, seg0) = self.load_part_current(project, &qtable, &first_pid).await?;
+                let (_pv, seg0) = self.load_part_current(project, &qtable, generation, &first_pid).await?;
                 self.commit_part_snapshot(
                     project,
                     &qtable,
@@ -3010,7 +3175,7 @@ impl Catalog for ObjectStoreCatalog {
                 )
                 .await?;
                 for (pid, paths) in iter {
-                    let (_pv, segment) = self.load_part_current(project, &qtable, &pid).await?;
+                    let (_pv, segment) = self.load_part_current(project, &qtable, generation, &pid).await?;
                     self.commit_part_snapshot(
                         project,
                         &qtable,
@@ -3047,9 +3212,10 @@ impl Catalog for ObjectStoreCatalog {
         partition_id: &str,
     ) -> Result<SnapshotId> {
         let qtable = self.resolve_qtable(project, table).await;
-        // Confirm the table exists (NotFound if absent/tombstoned).
-        self.load_current(project, &qtable).await?;
-        let (_v, segment) = self.load_part_current(project, &qtable, partition_id).await?;
+        // Confirm the table exists (NotFound if absent/tombstoned) and read its
+        // current partition generation.
+        let generation = self.load_current(project, &qtable).await?.1.parts_generation;
+        let (_v, segment) = self.load_part_current(project, &qtable, generation, partition_id).await?;
         Ok(segment.current_snapshot)
     }
 
@@ -3109,8 +3275,9 @@ impl Catalog for ObjectStoreCatalog {
         // matching OCC chain. META-chain (single-node OLTP) files are not
         // enumerated here — they are coalesced by copy-on-write / stripe-merge.
         let mut out = Vec::new();
-        for pid in self.list_partition_ids(project, &qtable).await? {
-            let (_v, segment) = self.load_part_current(project, &qtable, &pid).await?;
+        let generation = self.load_current(project, &qtable).await?.1.parts_generation;
+        for pid in self.list_partition_ids(project, &qtable, generation).await? {
+            let (_v, segment) = self.load_part_current(project, &qtable, generation, &pid).await?;
             if !segment.live_data_files().is_empty() {
                 out.push(pid);
             }
@@ -3125,7 +3292,8 @@ impl Catalog for ObjectStoreCatalog {
         partition_id: &str,
     ) -> Result<(SnapshotId, Vec<DataFileRef>)> {
         let qtable = self.resolve_qtable(project, table).await;
-        let (_v, segment) = self.load_part_current(project, &qtable, partition_id).await?;
+        let generation = self.load_current(project, &qtable).await?.1.parts_generation;
+        let (_v, segment) = self.load_part_current(project, &qtable, generation, partition_id).await?;
         Ok((segment.current_snapshot, segment.live_data_files()))
     }
 
@@ -5526,8 +5694,8 @@ mod tests {
         c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file("hot.parquet", 1)])
             .await
             .unwrap();
-        let head_v = c.resolve_part_head_version(&p, &qt, "p0").await.unwrap().unwrap();
-        let key = c.part_segment_key(&p, &qt, "p0", head_v);
+        let head_v = c.resolve_part_head_version(&p, &qt, 0, "p0").await.unwrap().unwrap();
+        let key = c.part_segment_key(&p, &qt, 0, "p0", head_v);
         let bytes = c.store.get(&key).await.unwrap().bytes().await.unwrap();
         let obj: PartSegmentObject = serde_json::from_slice(&bytes).unwrap();
 
@@ -5577,7 +5745,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let head_v = c.resolve_part_head_version(&p, &qt, "p0").await.unwrap().unwrap();
+        let head_v = c.resolve_part_head_version(&p, &qt, 0, "p0").await.unwrap().unwrap();
         assert!(head_v >= 4, "seeded at least 4 segment versions, got {head_v}");
 
         // SIMULATE THE LOST HEAD WRITE: roll the on-store head pointer back to an
@@ -5587,17 +5755,17 @@ mod tests {
         let stale = head_v - 2;
         c.store
             .put_opts(
-                &c.part_head_key(&p, &qt, "p0"),
+                &c.part_head_key(&p, &qt, 0, "p0"),
                 Bytes::from(stale.to_string()).into(),
                 PutOptions { mode: PutMode::Overwrite, ..Default::default() },
             )
             .await
             .unwrap();
-        c.invalidate_part(&p, &qt, "p0").await;
+        c.invalidate_part(&p, &qt, 0, "p0").await;
 
         // The resolver must NOT trust the stale pointer: `stale+1` exists, so it
         // recovers the true max segment via the LIST fallback.
-        let resolved = c.resolve_part_head_version(&p, &qt, "p0").await.unwrap().unwrap();
+        let resolved = c.resolve_part_head_version(&p, &qt, 0, "p0").await.unwrap().unwrap();
         assert_eq!(resolved, head_v, "resolver heals a stale head pointer to the true max segment");
 
         // The decisive assertion: a subsequent commit SUCCEEDS instead of looping
@@ -5851,9 +6019,9 @@ mod tests {
 
         // Read fold depth is bounded by K: a fresh instance folding the chain
         // walks at most K-1 deltas back to a baseline.
-        let head_v = c.resolve_part_head_version(&p, &qt, "p0").await.unwrap().unwrap();
+        let head_v = c.resolve_part_head_version(&p, &qt, 0, "p0").await.unwrap().unwrap();
         let fresh = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
-        let folded = fresh.fold_part_chain(&p, &qt, "p0", head_v).await.unwrap();
+        let folded = fresh.fold_part_chain(&p, &qt, 0, "p0", head_v).await.unwrap();
         assert_eq!(folded.live.size(), N, "compacted fold is still exactly correct");
         assert!(
             folded.deltas_since_baseline < K,
@@ -5866,7 +6034,7 @@ mod tests {
         // a legacy inline `baseline` also counts.
         let mut saw_baseline = false;
         for v in 1..=head_v {
-            let obj = c.get_part_segment(&p, &qt, "p0", v).await.unwrap();
+            let obj = c.get_part_segment(&p, &qt, 0, "p0", v).await.unwrap();
             if obj.baseline.is_some() || obj.chunk_baseline.is_some() {
                 saw_baseline = true;
                 break;
@@ -6757,13 +6925,13 @@ mod tests {
         // fresh ~TARGET chunks, so it (a) DROPS the tombstone set to empty after
         // tombstones had accumulated, and/or (b) reduces the chunk-ref count vs
         // the previous baseline. We detect either signal.
-        let head_v = c.resolve_part_head_version(&p, &qt, "p0").await.unwrap().unwrap();
+        let head_v = c.resolve_part_head_version(&p, &qt, 0, "p0").await.unwrap().unwrap();
         let mut saw_rechunk = false;
         let mut max_tomb = 0usize;
         let mut prev_chunks: Option<usize> = None;
         let mut prev_tomb = 0usize;
         for v in 1..=head_v {
-            let obj = c.get_part_segment(&p, &qt, "p0", v).await.unwrap();
+            let obj = c.get_part_segment(&p, &qt, 0, "p0", v).await.unwrap();
             if let Some(cb) = obj.chunk_baseline {
                 max_tomb = max_tomb.max(cb.tombstones.len());
                 let now_chunks = cb.chunks.len();
@@ -7169,7 +7337,7 @@ mod tests {
                 for _ in 0..40 {
                     for part in 0..PARTS {
                         let pid = part.to_string();
-                        let (_v, seg) = match c.load_part_current(&p, &qt, &pid).await {
+                        let (_v, seg) = match c.load_part_current(&p, &qt, 0, &pid).await {
                             Ok(s) => s,
                             Err(_) => continue,
                         };
@@ -8470,5 +8638,112 @@ mod tests {
         let rows: u64 = live.iter().map(|f| f.row_count).sum();
         assert_eq!(live.len(), 1, "fresh-named table keeps its data");
         assert_eq!(rows, 5, "fresh-named table row count intact");
+    }
+
+    /// REGRESSION (drop-purge-vs-same-name-recreate race): a DROP's best-effort
+    /// `parts/` purge, lagging or racing the recreate's writes, MUST NOT delete a
+    /// segment the recreated same-name table just wrote. Before the per-create
+    /// GENERATION fix, the recreate reused the dropped table's `parts/{pid}/…`
+    /// prefix verbatim, so a lagging purge LISTed + deleted the recreate's
+    /// segments — leaving a delta whose baseline segment was gone (a torn chain).
+    /// Any later fold then errored `not found: …/parts/{pid}@v{N}`, which (eager
+    /// session-open warm) FATAL'd every pgwire connection to the whole project.
+    ///
+    /// We reproduce the race deterministically: drop (which makes the next
+    /// create bump the partition generation), recreate, write enough to the
+    /// recreated table to build a delta chain (baseline + deltas), THEN re-run
+    /// the DROPPED generation's purge directly — simulating the stale/lagging
+    /// purge landing AFTER the recreate's writes. The recreated chain must be
+    /// untouched (no torn fold, exact row count). A COLD catalog confirms it
+    /// reads the same intact set from the store.
+    #[tokio::test]
+    async fn drop_recreate_purge_race_does_not_corrupt_recreated_chain() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let c = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
+        let p = ProjectId::new();
+        let t = TableName::new("p100m").unwrap();
+        let qt = QualifiedTableName::in_public(t.clone());
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Original life: a few partition-sharded commits (generation 0).
+        let mut exp = c.current_snapshot_id_in_partition(&p, &t, "s5").await.unwrap();
+        for i in 0..3 {
+            c.append_data_files_in_partition(&p, &t, "s5", exp, vec![file(&format!("old{i}.parquet"), 10)])
+                .await
+                .unwrap();
+            // The per-table union id is synthetic; re-resolve the PARTITION head.
+            exp = c.current_snapshot_id_in_partition(&p, &t, "s5").await.unwrap();
+        }
+
+        // The dropped table is generation 0.
+        let dropped_gen = c.load_current(&p, &qt).await.unwrap().1.parts_generation;
+        assert_eq!(dropped_gen, 0, "first life is the genesis generation");
+
+        c.drop_table(&p, &t).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // The recreate stamped a FRESH higher generation.
+        let new_gen = c.load_current(&p, &qt).await.unwrap().1.parts_generation;
+        assert_eq!(new_gen, dropped_gen + 1, "recreate bumps the partition generation");
+
+        // Recreated life: build a delta chain (baseline + several deltas) under
+        // the new generation, reusing the SAME partition id `s5`.
+        let mut exp = c.current_snapshot_id_in_partition(&p, &t, "s5").await.unwrap();
+        assert_eq!(exp, SnapshotId::GENESIS, "recreated partition starts at genesis");
+        for i in 0..6 {
+            c.append_data_files_in_partition(&p, &t, "s5", exp, vec![file(&format!("new{i}.parquet"), 4)])
+                .await
+                .unwrap();
+            exp = c.current_snapshot_id_in_partition(&p, &t, "s5").await.unwrap();
+        }
+        let before_race = c.load_table(&p, &t).await.unwrap();
+        let n_files = before_race.live_data_files().len();
+        let n_rows: u64 = before_race.live_data_files().iter().map(|f| f.row_count).sum();
+        assert_eq!(n_files, 6, "precondition: recreated table has its 6 files");
+        assert_eq!(n_rows, 24, "precondition: recreated table has its 24 rows");
+
+        // THE RACE: the dropped table's purge lands NOW, after the recreate's
+        // writes. Scoped to the dropped generation, it can only enumerate the OLD
+        // generation's prefix — never the recreate's.
+        c.purge_part_segments(&p, &qt, dropped_gen).await;
+        c.invalidate_all_parts(&p, &qt).await;
+
+        // The recreated chain is intact: the fold does NOT error (no torn chain)
+        // and the row count is exactly the recreate's own.
+        let after_race = c.load_table(&p, &t).await.expect("recreated chain still folds (not torn)");
+        let live = after_race.live_data_files();
+        let rows: u64 = live.iter().map(|f| f.row_count).sum();
+        assert_eq!(live.len(), 6, "recreated table's files survive the stale purge");
+        assert_eq!(rows, 24, "recreated table's rows survive the stale purge");
+
+        // COLD: a fresh catalog over the same store reads the same intact set.
+        let cold = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
+        let cold_after = cold.load_table(&p, &t).await.expect("cold fold of recreated chain succeeds");
+        assert_eq!(cold_after.live_data_files().len(), 6, "cold read: 6 files intact");
+    }
+
+    /// The other half of the #44 contract still holds WITH generations: after a
+    /// drop+recreate, the recreated same-name table reads EMPTY (the prior life's
+    /// segments are not unioned in), because the recreate reads its own (higher)
+    /// generation whose tree the drop purged / never populated.
+    #[tokio::test]
+    async fn drop_recreate_with_generation_still_starts_empty() {
+        let c = cat();
+        let p = ProjectId::new();
+        let t = TableName::new("p100m").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+        let exp = c.current_snapshot_id_in_partition(&p, &t, "s5").await.unwrap();
+        c.append_data_files_in_partition(&p, &t, "s5", exp, vec![file("pre.parquet", 100)])
+            .await
+            .unwrap();
+
+        c.drop_table(&p, &t).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        let after = c.load_table(&p, &t).await.unwrap();
+        assert_eq!(after.current_snapshot, SnapshotId::GENESIS, "recreated table is genesis");
+        assert_eq!(after.live_data_files().len(), 0, "recreated table starts empty");
     }
 }

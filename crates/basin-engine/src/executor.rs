@@ -7333,17 +7333,20 @@ async fn exec_insert_select(
             .catalog
             .list_tables(&sess.project)
             .await?;
-        let tables: Vec<TableName> =
+        // Scoped set → a refresh failure is a real error for THIS statement and
+        // propagates. Refresh-ALL fallback → tolerate (skip+warn) a corrupt
+        // unrelated table so one torn table can't fail an unrelated statement.
+        let (tables, scoped): (Vec<TableName>, bool) =
             match compute_select_refresh_set(sess, &source_sql, &all_tables).await {
-                Some(scoped) => scoped,
-                None => all_tables,
+                Some(scoped_tables) => (scoped_tables, true),
+                None => (all_tables, false),
             };
         for t in &tables {
-            if in_tx {
+            let res = if in_tx {
                 let pending = crate::session::tx_pending_files_for(&sess.state, t);
                 let htap_batches = crate::session::tx_htap_batches_for(&sess.state, t);
                 if pending.is_empty() && htap_batches.is_empty() {
-                    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, t).await?;
+                    refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, t).await
                 } else {
                     crate::session::refresh_table_with_htap(
                         &sess.engine,
@@ -7354,10 +7357,20 @@ async fn exec_insert_select(
                         &pending,
                         htap_batches,
                     )
-                    .await?;
+                    .await
                 }
             } else {
-                refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, t).await?;
+                refresh_table(&sess.engine, &sess.project, &sess.ctx, &sess.state, t).await
+            };
+            if let Err(e) = res {
+                if scoped {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    project = %sess.project, table = %t, error = %e,
+                    "skipping unrelated table during refresh-all (it failed to \
+                     resolve, e.g. torn partition chain); statement proceeds"
+                );
             }
         }
     }
@@ -10664,10 +10677,20 @@ pub(crate) async fn exec_select(
             .catalog
             .list_tables(&sess.project)
             .await?;
-        let tables: Vec<TableName> =
+        // `scoped == true` means the refresh set is EXACTLY the base tables this
+        // query reads — a refresh failure there is a real error for THIS query
+        // and must propagate. `scoped == false` is the conservative refresh-ALL
+        // fallback (e.g. `pg_catalog`/`information_schema` refs, multi-statement,
+        // unparseable): the set includes tables the query does NOT touch, so a
+        // single corrupt/unresolvable table (a torn partition delta chain) must
+        // NOT fail an unrelated query — otherwise one bad table locks the whole
+        // project out of every read. In that case we skip+warn the offending
+        // table; a query that actually references it would have been scoped and
+        // would still error on its own refresh.
+        let (tables, scoped): (Vec<TableName>, bool) =
             match compute_select_refresh_set(sess, sql, &all_tables).await {
-                Some(scoped) => scoped,
-                None => all_tables,
+                Some(scoped_tables) => (scoped_tables, true),
+                None => (all_tables, false),
             };
         for table in &tables {
             if in_tx {
@@ -10680,7 +10703,7 @@ pub(crate) async fn exec_select(
                 // not in the htap overlay.
                 let pending = crate::session::tx_pending_files_for(&sess.state, table);
                 let htap_batches = crate::session::tx_htap_batches_for(&sess.state, table);
-                if pending.is_empty() && htap_batches.is_empty() {
+                let res = if pending.is_empty() && htap_batches.is_empty() {
                     crate::session::refresh_table(
                         &sess.engine,
                         &sess.project,
@@ -10688,32 +10711,56 @@ pub(crate) async fn exec_select(
                         &sess.state,
                         table,
                     )
-                    .await?;
+                    .await
                 } else {
-                crate::session::refresh_table_with_htap(
-                    &sess.engine,
-                    &sess.project,
-                    &sess.ctx,
-                    &sess.state,
-                    table,
-                    &pending,
-                    htap_batches,
-                )
-                .await?;
+                    crate::session::refresh_table_with_htap(
+                        &sess.engine,
+                        &sess.project,
+                        &sess.ctx,
+                        &sess.state,
+                        table,
+                        &pending,
+                        htap_batches,
+                    )
+                    .await
+                };
+                if let Err(e) = res {
+                    if scoped {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        project = %sess.project, %table, error = %e,
+                        "skipping unrelated table during refresh-all (it failed to \
+                         resolve, e.g. torn partition chain); query proceeds"
+                    );
                 }
                 // In-transaction: skip file count (parallelism heuristic is
                 // non-critical; counting would require an extra catalog call).
             } else {
-                let n = refresh_table_counted(
+                match refresh_table_counted(
                     &sess.engine,
                     &sess.project,
                     &sess.ctx,
                     &sess.state,
                     table,
                 )
-                .await?;
-                if n > max_single_table_files {
-                    max_single_table_files = n;
+                .await
+                {
+                    Ok(n) => {
+                        if n > max_single_table_files {
+                            max_single_table_files = n;
+                        }
+                    }
+                    Err(e) => {
+                        if scoped {
+                            return Err(e);
+                        }
+                        tracing::warn!(
+                            project = %sess.project, %table, error = %e,
+                            "skipping unrelated table during refresh-all (it failed to \
+                             resolve, e.g. torn partition chain); query proceeds"
+                        );
+                    }
                 }
             }
         }

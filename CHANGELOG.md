@@ -8,6 +8,46 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Fix: a torn/corrupt table can no longer lock a whole project out, and a DROP can no longer corrupt a same-name recreate
+
+A perfection test left a dev project unable to accept ANY pgwire connection.
+Rapidly `DROP`-ing then recreating + reloading the SAME table name under heavy
+ingest left one partition's delta chain TORN — a segment referenced a base
+version whose object had been deleted from the store. Two distinct bugs, fixed
+independently:
+
+**1. Availability — one bad table must never deny a session
+(`crates/basin-engine/src/session.rs`, `crates/basin-engine/src/executor.rs`).**
+Session-open eagerly "warmed" every table in the project and propagated the
+first failure, so a single torn table (a fold hitting `NotFound:
+<project>/<table>/parts/<pid>@v<N>`) FATAL'd EVERY new connection — even
+`SELECT 1` was refused, and the operator could not even `DROP TABLE` the broken
+table to recover. The warm is now best-effort per table: a table that fails to
+resolve is logged and skipped (it errors only when a query touches it directly;
+everything else works). The read-path refresh got the same treatment for its
+conservative refresh-ALL fallback (an unrelated corrupt table can't fail a
+query that doesn't reference it; a query that DOES reference a corrupt table
+still errors, because that case is scoped). This is what lets a torn project
+reconnect and `DROP` its way back to health.
+
+**2. Root cause — drop-purge vs same-name recreate race
+(`crates/basin-catalog/src/object_store_catalog.rs`).** A `DROP`'s best-effort
+`parts/` purge (the #44 fix: LIST + delete the partition segment tree) could,
+when racing a same-name CREATE + ingest, delete segments the recreated table had
+just written — leaving a delta whose baseline was gone (the torn chain). Fixed
+with a per-create **partition GENERATION**: each table manifest carries
+`parts_generation`, the partition segment chains live under
+`parts/g{generation}/{pid}/…`, a same-name recreate stamps a fresh higher
+generation, and a `DROP`'s purge is scoped to exactly the generation that was
+live at drop time. A prior drop's purge therefore can never enumerate — let
+alone delete — a successor table's segments. Generation `0` (genesis tables and
+every pre-existing manifest, via serde default) keeps the historical un-prefixed
+`parts/{pid}/…` layout, so the change is on-disk backward compatible with no
+migration; the genesis-generation purge/list filters out any higher-generation
+subtree. The #44 property (recreate-same-name reads empty) and exactly-once /
+CAS / #16 / #27 are all preserved. New regression tests cover both the torn-table
+session-open survival and the purge-vs-recreate race (fail-before / pass-after).
+
 ## Unreleased — Fix (#36): enabling the multi-bucket pool no longer breaks pgwire auth or orphans existing-project data
 
 **Turning `BASIN_BUCKET_POOL` on broke pgwire auth for every project**

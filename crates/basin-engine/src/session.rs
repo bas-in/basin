@@ -2970,9 +2970,32 @@ pub(crate) async fn open(
     // in this session's DataFusion context. DataFusion uses bare table names
     // (schema stripping happens before SQL reaches DataFusion), so we register
     // each table under its bare TableName regardless of schema.
+    //
+    // AVAILABILITY: pre-registration is BEST-EFFORT per table. A single
+    // corrupt/unresolvable table (a torn partition delta chain whose baseline
+    // segment is missing, a NotFound on a referenced segment, a transient store
+    // error) must NEVER fail session-open — otherwise one bad table locks EVERY
+    // pgwire connection to the whole project out at the door (even `SELECT 1`),
+    // and the operator can't even `DROP TABLE` it to recover. So we log a warning
+    // and SKIP the offending table: it is simply not registered in this session,
+    // so a query that explicitly touches it errors ("table not found") while the
+    // session opens and every other table works normally. The table is also lazy
+    // re-resolved on first access (`ensure_table_registered` /
+    // `refresh_table` on the query path), so a table that fails to warm here but
+    // is later repaired (or whose transient error clears) still becomes queryable
+    // without reconnecting.
     let qtables = engine.config().catalog.list_tables_qualified(&project).await?;
     for qtable in qtables {
-        refresh_table_qualified(&engine, &project, &ctx, &state, &qtable).await?;
+        if let Err(e) = refresh_table_qualified(&engine, &project, &ctx, &state, &qtable).await {
+            tracing::warn!(
+                %project,
+                table = %qtable,
+                error = %e,
+                "skipping table during session-open warm: it failed to resolve \
+                 (e.g. torn/missing partition segment); the session opens and \
+                 other tables work — only a query that touches this table errors"
+            );
+        }
     }
 
     // Phase 5.23.C: register session with the connection registry. The handle
@@ -7517,7 +7540,7 @@ mod ingest_meta_cache_tests {
     use object_store::memory::InMemory;
 
     use crate::session::load_table_meta_cached_for_ingest;
-    use crate::{Engine, EngineConfig};
+    use crate::{Engine, EngineConfig, ExecResult};
 
     fn engine_over_object_store() -> Engine {
         let store = Arc::new(InMemory::new());
@@ -7629,5 +7652,138 @@ mod ingest_meta_cache_tests {
         let full = catalog.load_table(&project, &table).await.unwrap();
         assert_eq!(full.live_data_files().len(), 6);
         let _ = SnapshotId::GENESIS; // keep the import meaningful across refactors
+    }
+
+    /// AVAILABILITY (Part 1): a single table with a TORN partition delta chain
+    /// (a referenced segment object is missing from the store, exactly the dev
+    /// outage's `not found: …/parts/s5@v229`) must NOT fail session-open. The
+    /// session opens, every OTHER table queries normally, and the broken table
+    /// errors ONLY when a query touches it directly. Before the fix, the eager
+    /// session-open warm propagated the fold's NotFound and FATAL'd every pgwire
+    /// connection to the whole project — so even `SELECT 1` was refused and the
+    /// operator could not even `DROP TABLE` to recover.
+    #[tokio::test]
+    async fn session_open_survives_one_torn_table() {
+        use futures::StreamExt;
+        use object_store::{ObjectStore, ObjectStoreExt};
+
+        let store = Arc::new(InMemory::new());
+        let project = ProjectId::new();
+
+        // --- SEED (first catalog) ------------------------------------------
+        // Build the tables + segment chains through one catalog, then drop it.
+        // The engine that recovers below uses a SEPARATE catalog over the SAME
+        // store with cold caches — mirroring the dev outage, which persisted
+        // across an engine restart (the torn chain lives in the object store, so
+        // a warm part-cache can't mask it on the post-restart cold fold).
+        let catalog: Arc<dyn Catalog> = Arc::new(ObjectStoreCatalog::new(store.clone()));
+        {
+            let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+                object_store: store.clone(),
+                root_prefix: None,
+                disk_cache: None,
+                page_cache: None,
+            });
+            let seed_eng = Engine::new(EngineConfig {
+                storage,
+                catalog: catalog.clone(),
+                shard: None,
+            });
+            let sess = seed_eng.open_session(project).await.unwrap();
+            sess.execute("CREATE TABLE good (id BIGINT)").await.unwrap();
+            sess.execute("CREATE TABLE p100m (id BIGINT)").await.unwrap();
+        }
+        let good = TableName::new("good").unwrap();
+        let bad = TableName::new("p100m").unwrap();
+        // `good` gets one segment. `p100m` gets a TWO-segment chain: a baseline
+        // (v0) plus a delta (v1) that points its `base_version` at v0. Deleting
+        // ONLY the baseline (below) leaves a HEAD/delta that references a missing
+        // base — a genuine torn chain (not just an empty partition).
+        let exp = catalog
+            .current_snapshot_id_in_partition(&project, &good, "s5")
+            .await
+            .unwrap();
+        catalog
+            .append_data_files_in_partition(&project, &good, "s5", exp, vec![data_file("good/part.parquet", 100)])
+            .await
+            .unwrap();
+        let mut exp = catalog
+            .current_snapshot_id_in_partition(&project, &bad, "s5")
+            .await
+            .unwrap();
+        for i in 0..2 {
+            catalog
+                .append_data_files_in_partition(&project, &bad, "s5", exp, vec![data_file(&format!("p100m/part{i}.parquet"), 100)])
+                .await
+                .unwrap();
+            exp = catalog
+                .current_snapshot_id_in_partition(&project, &bad, "s5")
+                .await
+                .unwrap();
+        }
+
+        // FORGE THE TORN CHAIN: delete the BASELINE segment (v1) of `p100m`'s
+        // partition, leaving HEAD + the v2 delta that points its `base_version`
+        // at v1. A fold now reads v2 (a delta) and GETs its base v1 → `NotFound`,
+        // exactly the dev outage's `not found: …/parts/s5@v229`.
+        let mut baseline_key: Option<object_store::path::Path> = None;
+        let mut listing = store.list(None);
+        while let Some(item) = listing.next().await {
+            let loc = item.unwrap().location;
+            let k = loc.as_ref();
+            if k.contains("/p100m/parts/") && k.ends_with("v00000000000000000001.json") {
+                baseline_key = Some(loc);
+            }
+        }
+        let baseline_key = baseline_key.expect("precondition: p100m has a v1 baseline segment to delete");
+        let store_dyn: &dyn ObjectStore = store.as_ref();
+        store_dyn.delete(&baseline_key).await.unwrap();
+
+        // --- RECOVER (fresh catalog + engine, cold caches) -----------------
+        let cold_catalog: Arc<dyn Catalog> = Arc::new(ObjectStoreCatalog::new(store.clone()));
+        let cold_storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+            object_store: store.clone(),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let eng = Engine::new(EngineConfig {
+            storage: cold_storage,
+            catalog: cold_catalog.clone(),
+            shard: None,
+        });
+        // Sanity: a direct cold catalog load of the torn table now errors.
+        assert!(
+            cold_catalog.load_table(&project, &bad).await.is_err(),
+            "precondition: the torn table fails to resolve at the catalog layer (cold)"
+        );
+
+        // THE FIX: opening a fresh session must SUCCEED despite the torn table.
+        let sess = eng
+            .open_session(project)
+            .await
+            .expect("session-open must not fail because one table is torn");
+
+        // The trivial query works (the connection is usable).
+        sess.execute("SELECT 1").await.expect("SELECT 1 works on a session opened past a torn table");
+
+        // The healthy table queries fine.
+        let n = match sess.execute("SELECT count(*) FROM good").await.unwrap() {
+            ExecResult::Rows { batches, .. } => {
+                batches.iter().map(|b| b.num_rows()).sum::<usize>()
+            }
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(n, 1, "the healthy table returns its single count row");
+
+        // A query that TOUCHES the torn table errors (it is not silently empty).
+        assert!(
+            sess.execute("SELECT * FROM p100m").await.is_err(),
+            "a query on the torn table must error, not silently succeed"
+        );
+
+        // And the session is still usable afterwards — the torn-table error did
+        // not poison the connection.
+        sess.execute("SELECT 1").await.expect("session still usable after a torn-table query error");
     }
 }
