@@ -21,6 +21,7 @@ pub use error::{BasinError, Result};
 pub use events::{ChangeEvent, ChangeEventSink, ChangeOp, EventSinkRegistry};
 pub use ids::{
     Ident, PartitionKey, ProjectId, QualifiedTableName, SchemaName, TableName, MAX_IDENT_LEN,
+    RESERVED_SYSTEM_PROJECT_ID,
 };
 pub use project_counters::{
     AcquireResult, CapLabel, HistogramSnapshot, LeaseMetrics, RenewResult, ReplicaLeaseSnapshot,

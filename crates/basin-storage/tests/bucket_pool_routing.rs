@@ -16,7 +16,9 @@ use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::bucket_pool::BucketRegistryEntry;
 use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::{PartitionKey, ProjectId, Result, TableName};
-use basin_storage::bucket_pool::{BucketPool, BucketPoolBuckets, BucketResolver, PoolConfig};
+use basin_storage::bucket_pool::{
+    BucketPool, BucketPoolBuckets, BucketResolver, PoolConfig, PRIMARY_PIN_BUCKET_ID,
+};
 use basin_storage::{Storage, StorageConfig};
 use futures::stream::StreamExt;
 use object_store::memory::InMemory;
@@ -1115,4 +1117,205 @@ async fn empty_list_keeps_legacy_bootstrap_entry_shape() {
     assert_eq!(b.bucket_name, "pool-0000", "legacy generated name");
     assert!(b.endpoint.is_empty(), "legacy bootstrap entry has EMPTY endpoint");
     assert!(b.region.is_empty(), "legacy bootstrap entry has EMPTY region");
+}
+
+// ===========================================================================
+// #36 SAFETY: AUTH IS NEVER POOL-ROUTED, and enabling the pool never orphans an
+// existing project's primary-bucket data. These guard the correctness bug where
+// turning the pool ON broke pgwire auth (the internal auth/catalog project got
+// striped to an empty pool bucket) and rerouted existing projects.
+// ===========================================================================
+
+/// The reserved system project (the internal auth/catalog project, where the
+/// pgwire credential rows live) is NEVER assigned to the pool and NEVER striped,
+/// even with the flag ON and real stripe buckets configured. Its data
+/// (standing in for the `auth_project_credentials` table) stays on the
+/// primary/catalog store and reads back from there — so the credential lookup
+/// that authenticates a pgwire connection cannot be broken by enabling the pool.
+#[tokio::test]
+async fn reserved_auth_project_never_pool_routed_resolves_from_primary() {
+    let primary: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let cat = Arc::new(InMemoryCatalog::new());
+    let storage = Storage::new(StorageConfig {
+        object_store: primary.clone(),
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
+    let resolver = Arc::new(InMemoryResolver::default());
+    // Pool ON with a real width-4 stripe — exactly the dev config that broke auth.
+    let pool = Arc::new(BucketPool::new(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        resolver.clone(),
+    ));
+    storage.attach_bucket_pool(pool.clone());
+
+    // The reserved internal auth/catalog project.
+    let reserved: ProjectId = basin_common::RESERVED_SYSTEM_PROJECT_ID.parse().unwrap();
+    assert!(reserved.is_reserved_system());
+    let table = TableName::new("auth_project_credentials").unwrap();
+    let part = PartitionKey::default_key();
+
+    // Write the reserved project's "credential" rows through the real entry point.
+    storage.write_batch(&reserved, &table, &part, &small_batch()).await.unwrap();
+
+    // It was NEVER assigned to the pool (the credential lookup is not pool-routed).
+    assert!(
+        cat.get_bucket_assignment(&reserved).await.unwrap().is_none(),
+        "reserved auth project must never get a pool assignment"
+    );
+    // The sync routing path returns no warmed stripe → falls back to primary.
+    assert!(
+        pool.routed_store(&reserved).is_none(),
+        "reserved auth project must not resolve to a pool bucket"
+    );
+    // The data lives on the PRIMARY store, not on any pooled bucket.
+    let primary_keys = list_keys(&primary).await;
+    let prefix = format!("projects/{reserved}/");
+    assert!(
+        primary_keys.iter().any(|k| k.starts_with(&prefix)),
+        "reserved project's auth data must live on the primary/catalog store"
+    );
+    assert!(
+        resolver.stores.lock().unwrap().is_empty(),
+        "no pooled bucket may ever be resolved for the reserved auth project"
+    );
+
+    // And it reads back from primary (the credential lookup succeeds).
+    let stream = storage
+        .read(&reserved, &table, basin_storage::ReadOptions::default())
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.collect().await;
+    let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
+    assert_eq!(total, 16, "reserved auth project must read its rows back from primary");
+}
+
+/// An EXISTING project whose data already lives on the primary bucket is PINNED
+/// to primary when the pool is enabled (its reads keep resolving its existing
+/// data), while a genuinely-NEW project created with the pool on DOES stripe.
+#[tokio::test]
+async fn existing_primary_project_is_pinned_new_project_stripes() {
+    let primary: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let cat = Arc::new(InMemoryCatalog::new());
+
+    // --- Phase 1: pool OFF. An existing project writes data onto the primary. ---
+    let storage_off = Storage::new(StorageConfig {
+        object_store: primary.clone(),
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    storage_off.attach_catalog(cat.clone() as Arc<dyn Catalog>);
+    let existing = ProjectId::new();
+    let table = TableName::new("t").unwrap();
+    let part = PartitionKey::default_key();
+    storage_off.write_batch(&existing, &table, &part, &small_batch()).await.unwrap();
+    let existing_prefix = format!("projects/{existing}/");
+    assert!(
+        list_keys(&primary).await.iter().any(|k| k.starts_with(&existing_prefix)),
+        "existing project's data must be on the primary while OFF"
+    );
+
+    // --- Phase 2: flip the pool ON (same catalog + primary store). ---
+    let storage = Storage::new(StorageConfig {
+        object_store: primary.clone(),
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
+    let resolver = Arc::new(InMemoryResolver::default());
+    let pool = Arc::new(BucketPool::new(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        resolver.clone(),
+    ));
+    storage.attach_bucket_pool(pool.clone());
+
+    // The existing project: warming pins it to primary (not striped), so its
+    // reads still resolve its existing primary data.
+    pool.ensure_assignment(&existing, cat.as_ref()).await.unwrap();
+    let a = cat.get_bucket_assignment(&existing).await.unwrap().expect("pinned assignment");
+    assert_eq!(a.bucket_id, PRIMARY_PIN_BUCKET_ID, "existing project must be pinned to primary");
+    assert_eq!(a.stripe, vec![PRIMARY_PIN_BUCKET_ID.to_string()]);
+    let stream = storage
+        .read(&existing, &table, basin_storage::ReadOptions::default())
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.collect().await;
+    let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
+    assert_eq!(total, 16, "pinned existing project must still read its primary data");
+    // Its routed store is the primary store (raw backing), not a pool bucket.
+    let routed = pool.routed_store(&existing).expect("pinned project has a warmed route");
+    assert_eq!(
+        Arc::as_ptr(&routed) as *const (),
+        Arc::as_ptr(&primary) as *const (),
+        "pinned project must route to the primary store"
+    );
+
+    // A genuinely-new project (no pre-pool primary data) DOES stripe to pool buckets.
+    let fresh = ProjectId::new();
+    storage.write_batch(&fresh, &table, &part, &small_batch()).await.unwrap();
+    let fa = cat.get_bucket_assignment(&fresh).await.unwrap().expect("new project assigned");
+    assert_ne!(fa.bucket_id, PRIMARY_PIN_BUCKET_ID, "a new project must NOT be pinned");
+    assert!(fa.stripe.iter().all(|b| b.starts_with("pool-")), "new project stripes to pool buckets");
+    assert!(
+        !list_keys(&primary).await.iter().any(|k| k.starts_with(&format!("projects/{fresh}/"))),
+        "a new project's data must stripe off the primary store"
+    );
+
+    // The pinned existing project never created a pooled bucket for its own data.
+    for store in resolver.stores.lock().unwrap().values() {
+        let keys = list_keys(store).await;
+        assert!(
+            !keys.iter().any(|k| k.starts_with(&existing_prefix)),
+            "existing project's data must never appear in a pool bucket"
+        );
+    }
+}
+
+/// A primary-pinned assignment is STABLE across a simulated restart: a fresh
+/// process re-reads the pinned record and keeps the project on primary (no
+/// re-probe, no stripe).
+#[tokio::test]
+async fn primary_pin_is_stable_across_restart() {
+    let primary: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let cat = Arc::new(InMemoryCatalog::new());
+    let storage = Storage::new(StorageConfig {
+        object_store: primary.clone(),
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
+    let existing = ProjectId::new();
+    let table = TableName::new("t").unwrap();
+    let part = PartitionKey::default_key();
+
+    // Seed primary data BEFORE attaching the pool so the project is "existing".
+    storage.write_batch(&existing, &table, &part, &small_batch()).await.unwrap();
+
+    let resolver = Arc::new(InMemoryResolver::default());
+    let pool = Arc::new(BucketPool::new(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        resolver.clone(),
+    ));
+    storage.attach_bucket_pool(pool.clone());
+    pool.ensure_assignment(&existing, cat.as_ref()).await.unwrap();
+    assert_eq!(
+        cat.get_bucket_assignment(&existing).await.unwrap().unwrap().bucket_id,
+        PRIMARY_PIN_BUCKET_ID
+    );
+
+    // Simulated restart: drop the per-process cache; re-warm from the SAME
+    // catalog. The pinned record must re-yield a primary route.
+    pool.invalidate_all();
+    pool.ensure_assignment(&existing, cat.as_ref()).await.unwrap();
+    let routed = pool.routed_store(&existing).expect("re-warmed pinned route");
+    assert_eq!(
+        Arc::as_ptr(&routed) as *const (),
+        Arc::as_ptr(&primary) as *const (),
+        "pinned project must re-resolve to primary after restart"
+    );
 }

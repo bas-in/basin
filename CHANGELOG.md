@@ -8,6 +8,49 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Fix (#36): enabling the multi-bucket pool no longer breaks pgwire auth or orphans existing-project data
+
+**Turning `BASIN_BUCKET_POOL` on broke pgwire auth for every project**
+(`FATAL: invalid pgwire credentials`), and silently rerouted any existing
+project's reads to empty pool buckets. Two correctness gaps, both at the
+assignment chokepoint `BucketPool::ensure_assignment`:
+
+1. **Auth was pool-routed.** The per-project pgwire credentials live in the
+   reserved internal auth/catalog project (`RESERVED_SYSTEM_PROJECT_ID` ==
+   `basin-auth`'s `INTERNAL_AUTH_PROJECT_ID`). With the pool on (real Tigris
+   stripe buckets), that project was assigned a pool stripe like any other, so
+   the credential lookup that authenticates a connection read from an empty pool
+   bucket and found nothing → uniform `invalid pgwire credentials`. Auth is not
+   data and must never stripe.
+2. **Existing projects were orphaned.** A project whose data already lived on the
+   primary bucket got striped to the (empty) pool buckets on first
+   read/write-after-enable, so its tables appeared lost.
+
+Fixes (`crates/basin-common/src/ids.rs`, `crates/basin-storage/src/bucket_pool.rs`,
+`crates/basin-storage/src/lib.rs`):
+
+- **Auth is never pool-routed.** `ProjectId::is_reserved_system()` (keyed off the
+  new shared `basin_common::RESERVED_SYSTEM_PROJECT_ID`, which `basin-auth`'s
+  `INTERNAL_AUTH_PROJECT_ID` now re-exports so the two can never drift)
+  short-circuits `ensure_assignment` for the reserved project: it is never
+  assigned and never striped, so the sync routing path always falls back to the
+  primary/catalog store where the credentials live — independent of the flag.
+- **Safe enable: pin existing projects to primary, stripe only new ones.** Before
+  striping a not-yet-assigned project, the pool probes the primary store for
+  pre-existing `projects/{project}/` data. If any exists, the project is pinned to
+  primary (a durable `PRIMARY_PIN_BUCKET_ID` assignment that the routing path
+  resolves straight to the primary store, stable across restarts); only a
+  genuinely-new project (no pre-pool primary data) stripes. Flipping the flag can
+  no longer orphan existing data; moving a pinned project into the pool is an
+  explicit migration (#37, in reverse).
+- **Default OFF stays a byte-identical no-op**; exactly-once / CAS / #34 / #27 /
+  #37 migration paths untouched. New coverage:
+  `reserved_auth_project_never_pool_routed_resolves_from_primary`,
+  `existing_primary_project_is_pinned_new_project_stripes`,
+  `primary_pin_is_stable_across_restart` (in
+  `crates/basin-storage/tests/bucket_pool_routing.rs`), plus
+  `reserved_system_project_is_recognised` in basin-common.
+
 ## Unreleased — Fix (#36): multi-bucket pool can point at REAL provider buckets (striping works on Tigris)
 
 **The bucket pool's `choose_one_bucket` registered new pooled

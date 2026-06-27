@@ -80,6 +80,16 @@ pub const BUCKET_POOL_REGION_ENV: &str = "BASIN_BUCKET_POOL_REGION";
 /// behaviour, for an org-wide key). Refs MUST be env-var-safe (e.g. `POOL0`).
 pub const BUCKET_POOL_CREDS_REFS_ENV: &str = "BASIN_BUCKET_POOL_CREDS_REFS";
 
+/// Reserved `bucket_id` for a project PINNED to the primary/default store
+/// (never striped). Persisted as the assignment's `bucket_id`/`stripe[0]` for an
+/// EXISTING project that already had data on the primary bucket when the pool
+/// was first enabled, so flipping `BASIN_BUCKET_POOL` on can never silently
+/// reroute that project's reads to an empty pool bucket and orphan its data.
+/// A migration (#37, in reverse) is the only thing that ever moves such a
+/// project into the pool. This id is NEVER a real registry entry — the routing
+/// path resolves it straight to the process-default store.
+pub const PRIMARY_PIN_BUCKET_ID: &str = "primary";
+
 /// Default pool ceiling when `BASIN_BUCKET_POOL_MAX` is unset/invalid.
 const DEFAULT_POOL_MAX: usize = 8;
 /// Default occupancy watermark when `BASIN_BUCKET_POOL_WATERMARK` is unset.
@@ -290,6 +300,15 @@ pub struct BucketPool {
     /// simultaneously. Cheap async mutex; only taken on the rare first-write.
     grow_lock: tokio::sync::Mutex<()>,
     resolver: Arc<dyn BucketResolver>,
+    /// The process-default/primary object store (the single shared bucket the
+    /// catalog lives on). Used to (a) probe whether an EXISTING project already
+    /// has primary-bucket data — in which case it is PINNED to primary instead
+    /// of striped (safe flag-enable, never orphan data) — and (b) resolve a
+    /// [`PRIMARY_PIN_BUCKET_ID`] assignment back to the primary store on the
+    /// routing path. `None` until [`Self::set_default_store`] is called by the
+    /// storage layer; when `None` the safe path degrades to "stay on primary"
+    /// (never stripe an existing project we can't probe).
+    default_store: RwLock<Option<Arc<dyn ObjectStore>>>,
 }
 
 impl BucketPool {
@@ -317,7 +336,29 @@ impl BucketPool {
             store_cache: RwLock::new(HashMap::new()),
             grow_lock: tokio::sync::Mutex::new(()),
             resolver,
+            default_store: RwLock::new(None),
         }
+    }
+
+    /// Register the process-default/primary object store. Idempotent (last
+    /// writer wins; the store is process-stable). The storage layer calls this
+    /// when the pool is attached so the pool can (a) probe an existing project's
+    /// primary-bucket data and (b) resolve a primary-pinned assignment back to
+    /// the primary store. Without it, the pool conservatively keeps every
+    /// not-yet-assigned project on the primary (never stripes blind).
+    pub fn set_default_store(&self, store: Arc<dyn ObjectStore>) {
+        *self
+            .default_store
+            .write()
+            .expect("default_store poisoned") = Some(store);
+    }
+
+    /// The registered default/primary store, if any.
+    fn default_store(&self) -> Option<Arc<dyn ObjectStore>> {
+        self.default_store
+            .read()
+            .expect("default_store poisoned")
+            .clone()
     }
 
     /// Whether the pool is enabled. When false the pool is a no-op and the
@@ -593,7 +634,11 @@ impl BucketPool {
     }
 
     /// Resolve an ordered stripe of bucket ids into an ordered stripe of
-    /// stores, building each via the resolver (cached per bucket).
+    /// stores, building each via the resolver (cached per bucket). The reserved
+    /// [`PRIMARY_PIN_BUCKET_ID`] resolves to the registered default/primary
+    /// store (NOT via the resolver, and it is never a registry entry) — that is
+    /// how a primary-pinned existing project keeps reading its primary-bucket
+    /// data with the flag ON.
     fn stores_for_stripe(
         &self,
         stripe: &[String],
@@ -601,8 +646,61 @@ impl BucketPool {
     ) -> Result<Vec<Arc<dyn ObjectStore>>> {
         stripe
             .iter()
-            .map(|id| self.store_for_bucket(id, registry))
+            .map(|id| {
+                if id == PRIMARY_PIN_BUCKET_ID {
+                    self.default_store().ok_or_else(|| {
+                        basin_common::BasinError::storage(
+                            "bucket pool: primary-pinned assignment but no default store registered",
+                        )
+                    })
+                } else {
+                    self.store_for_bucket(id, registry)
+                }
+            })
             .collect()
+    }
+
+    /// `true` iff `project` already has at least one object under its
+    /// per-project prefix on the primary/default store. Used to decide, at
+    /// first-assignment time, whether enabling the pool would ORPHAN an existing
+    /// project's data: such a project is PINNED to primary instead of striped.
+    /// Returns `false` when no default store is registered (we then pin to
+    /// primary anyway — the conservative, never-orphan choice).
+    async fn has_primary_data(&self, project: &ProjectId) -> Result<bool> {
+        let Some(store) = self.default_store() else {
+            return Ok(false);
+        };
+        let prefix = OsPath::from(format!("projects/{project}/"));
+        let mut s = store.list(Some(&prefix));
+        match s.next().await {
+            Some(Ok(_)) => Ok(true),
+            Some(Err(e)) => Err(basin_common::BasinError::storage(format!(
+                "bucket pool: probe primary data for {project}: {e}"
+            ))),
+            None => Ok(false),
+        }
+    }
+
+    /// Persist (CAS) and cache a PRIMARY-PINNED assignment for `project`: a
+    /// width-1 assignment on [`PRIMARY_PIN_BUCKET_ID`] that the routing path
+    /// resolves to the default/primary store. This is the safe-enable record for
+    /// an existing project — durable, so a restart re-reads it and keeps the
+    /// project on primary (no re-probe, no stripe). Idempotent via the catalog's
+    /// create-if-absent CAS; whatever became durable is cached.
+    async fn pin_to_primary(&self, project: &ProjectId, catalog: &dyn Catalog) -> Result<()> {
+        let proposed = BucketAssignment {
+            bucket_id: PRIMARY_PIN_BUCKET_ID.to_string(),
+            tier: BucketTier::Pooled,
+            stripe: vec![PRIMARY_PIN_BUCKET_ID.to_string()],
+        };
+        let winner = catalog.assign_bucket_if_absent(project, &proposed).await?;
+        let registry = catalog.get_bucket_registry().await?;
+        let stripe = self.stores_for_stripe(&winner.effective_stripe(), &registry)?;
+        self.assignment_cache
+            .write()
+            .expect("assignment_cache poisoned")
+            .insert(*project, stripe);
+        Ok(())
     }
 
     /// Ensure `project` has a stable bucket assignment (a possibly-striped
@@ -623,6 +721,16 @@ impl BucketPool {
         catalog: &dyn Catalog,
     ) -> Result<()> {
         if !self.config.enabled {
+            return Ok(());
+        }
+        // CORRECTNESS GATE: a reserved system project (the internal auth/catalog
+        // project) is NEVER pool-routed. Authenticating a connection reads this
+        // project's credential rows; striping them to an empty pool bucket would
+        // break auth for every project. Leaving it UNassigned means the sync
+        // routing path finds no warmed stripe and falls back to the
+        // primary/catalog store — exactly where auth lives, independent of the
+        // flag.
+        if project.is_reserved_system() {
             return Ok(());
         }
         if self
@@ -658,6 +766,17 @@ impl BucketPool {
                 .expect("assignment_cache poisoned")
                 .insert(*project, stripe);
             return Ok(());
+        }
+
+        // SAFE-ENABLE GATE: an EXISTING project whose data already lives on the
+        // primary bucket must NOT be rerouted to (empty) pool buckets when the
+        // flag is flipped on — that would orphan its tables. Such a project is
+        // PINNED to primary (durably) and only ever enters the pool via an
+        // explicit migration (#37, in reverse). A project with NO pre-pool
+        // primary data is genuinely new and DOES stripe. When no default store
+        // is registered we cannot prove emptiness, so we pin (never stripe blind).
+        if self.has_primary_data(project).await? {
+            return self.pin_to_primary(project, catalog).await;
         }
 
         let registry = catalog.get_bucket_registry().await?;

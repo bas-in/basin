@@ -24,6 +24,19 @@ pub const MAX_IDENT_LEN: usize = 63;
 #[serde(transparent)]
 pub struct ProjectId(Ulid);
 
+/// Reserved system project that holds Basin's own internal catalog/auth state
+/// (per-project pgwire credentials, the auth tables, etc.). It is NOT a customer
+/// project: it is provisioned by the engine itself and its objects are the
+/// control-plane's source of truth. Because authenticating any connection reads
+/// this project's credential rows, its storage MUST always resolve from the
+/// primary/catalog bucket and MUST NEVER be routed through the multi-bucket pool
+/// (#36) — auth is not data and must not stripe. This is the same 26-char ULID
+/// `basin-auth` uses for `INTERNAL_AUTH_PROJECT_ID`; the constant is duplicated
+/// here (the shared base crate) so the storage layer can recognise it without a
+/// dependency on `basin-auth` (which would be a cycle). Deterministic — the
+/// constant is the contract.
+pub const RESERVED_SYSTEM_PROJECT_ID: &str = "01JBAS1NAVTH00000000000000";
+
 impl ProjectId {
     pub fn new() -> Self {
         Self(Ulid::new())
@@ -31,6 +44,18 @@ impl ProjectId {
 
     pub fn from_ulid(u: Ulid) -> Self {
         Self(u)
+    }
+
+    /// `true` iff this is a reserved system project (currently only
+    /// [`RESERVED_SYSTEM_PROJECT_ID`], the internal auth/catalog project). The
+    /// multi-bucket pool refuses to assign or stripe a reserved project so its
+    /// auth/credential reads always resolve from the primary/catalog bucket,
+    /// independent of `BASIN_BUCKET_POOL`.
+    pub fn is_reserved_system(&self) -> bool {
+        // Parse the constant once; it is a compile-time-fixed valid ULID.
+        Ulid::from_string(RESERVED_SYSTEM_PROJECT_ID)
+            .map(|u| self.0 == u)
+            .unwrap_or(false)
     }
 
     pub fn as_ulid(&self) -> Ulid {
@@ -504,6 +529,19 @@ mod tests {
         let parsed: ProjectId = s.parse().unwrap();
         assert_eq!(id, parsed);
         assert_eq!(s.len(), 26);
+    }
+
+    #[test]
+    fn reserved_system_project_is_recognised() {
+        let reserved: ProjectId = RESERVED_SYSTEM_PROJECT_ID.parse().unwrap();
+        assert!(
+            reserved.is_reserved_system(),
+            "the reserved system project id must be recognised"
+        );
+        // A random project is not reserved.
+        assert!(!ProjectId::new().is_reserved_system());
+        // The constant is a valid 26-char ULID.
+        assert_eq!(RESERVED_SYSTEM_PROJECT_ID.len(), 26);
     }
 
     #[test]

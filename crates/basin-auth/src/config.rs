@@ -101,8 +101,11 @@ impl AuthConfig {
 /// pgwire path.
 ///
 /// 26-char Crockford base-32 ULID (no I, L, O, U). Deterministic — the
-/// constant is the contract.
-pub const INTERNAL_AUTH_PROJECT_ID: &str = "01JBAS1NAVTH00000000000000";
+/// constant is the contract. It is the same value as
+/// [`basin_common::RESERVED_SYSTEM_PROJECT_ID`]; the storage layer keys its
+/// "never pool-route auth" rule off that shared constant, so the two must stay
+/// identical (re-exported here, not re-spelled, to make drift impossible).
+pub const INTERNAL_AUTH_PROJECT_ID: &str = basin_common::RESERVED_SYSTEM_PROJECT_ID;
 
 /// Reserved pgwire username basin-auth uses when connecting back to basin
 /// engine over the loopback catalog path.

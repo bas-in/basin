@@ -775,6 +775,10 @@ impl Storage {
     /// `BASIN_BUCKET_POOL` flag OFF, routing is byte-for-byte today's
     /// single-bucket behaviour.
     pub fn attach_bucket_pool(&self, pool: Arc<bucket_pool::BucketPool>) {
+        // Give the pool the process-default/primary store so it can (a) probe an
+        // existing project's primary-bucket data (pin-not-stripe, never orphan)
+        // and (b) resolve a primary-pinned assignment back to the primary store.
+        pool.set_default_store(self.inner.object_store.clone());
         let _ = self.inner.bucket_pool.set(pool);
     }
 
