@@ -2524,7 +2524,15 @@ impl InProcessShard {
         // committed in THIS pass. Entries beyond the per-pass row budget (and
         // new writes that landed during compaction, with higher LSNs) stay in
         // the tail and are picked up by the next loop iteration / tick.
-        {
+        //
+        // While we hold the write lock, also compute the partition-wide
+        // "committed-through" floor for the PER-WAVE watermark persist below:
+        // the largest LSN strictly below which NO table has any remaining
+        // (uncommitted) tail entry. Every entry at or below it has been
+        // committed to the catalog this drain, so it is a safe replay floor —
+        // advancing the watermark to it cannot strand (lose) an uncommitted
+        // lower-LSN entry of a table that this wave didn't snapshot.
+        let wave_safe_floor: Option<Lsn> = {
             let mut guard = state.write().await;
             for (table, max_lsn) in &drained_per_table {
                 if let Some(v) = guard.tail.get_mut(table) {
@@ -2533,6 +2541,53 @@ impl InProcessShard {
                 if guard.last_compacted_lsn < *max_lsn {
                     guard.last_compacted_lsn = *max_lsn;
                 }
+            }
+            // Lowest LSN still sitting in ANY table's tail after this drain.
+            let min_remaining = guard
+                .tail
+                .values()
+                .flat_map(|v| v.iter().map(|(lsn, _)| *lsn))
+                .min();
+            match min_remaining {
+                // Some entries remain: only LSNs strictly below the lowest
+                // remaining one are fully committed -> floor = min_remaining-1.
+                Some(min) if min > Lsn::ZERO => Some(Lsn(min.0 - 1)),
+                Some(_) => None,
+                // Tail fully drained: everything committed so far is safe; use
+                // the highest LSN we committed across the whole drain.
+                None => max_lsn_overall,
+            }
+        };
+
+        // PER-WAVE durable watermark (duplicate-row crash-window fix). The
+        // catalog commits above are visible now; if a LATER wave's write/commit
+        // fails (e.g. a wedged data PUT) the whole `compact_one_impl` aborts via
+        // `?` BEFORE the end-of-drain watermark persist below — leaving THIS
+        // wave's already-committed rows uncovered by the persisted watermark. A
+        // restart would then replay them from the stale floor and re-commit a
+        // SECOND file for rows already in the cold tier (the observed
+        // count(*) > count(DISTINCT id) incident). Persisting the safe floor
+        // after every wave closes that window: replay always starts strictly
+        // above the highest fully-committed LSN. Monotonic (GREATEST upsert) and
+        // best-effort — a failure here is non-fatal (the end-of-drain persist
+        // and the next tick both retry); we deliberately do NOT truncate the WAL
+        // here (truncate stays at the end, after the full drain).
+        if let Some(floor) = wave_safe_floor {
+            if let Err(e) = self
+                .cfg
+                .catalog
+                .set_compaction_watermark(project, partition.as_str(), floor.0)
+                .await
+            {
+                warn!(
+                    %project,
+                    %partition,
+                    floor = floor.0,
+                    error = %e,
+                    "per-wave compaction watermark persist failed; relying on \
+                     end-of-drain persist / next tick (replay stays duplicate-safe \
+                     via the existing floor)",
+                );
             }
         }
         // Loop back to drain the next bounded prefix. The snapshot at the top
@@ -9903,6 +9958,310 @@ mod tests {
             "point lookup of a recovered uncompacted id ({probe_id}) must return \
              exactly one row (got {hits})",
         );
+    }
+
+    /// Object store that lets the first `allow_data_files` DATA-file PUTs (a
+    /// path ending in `.parquet` / `.vortex`) through, then fails every later
+    /// data-file PUT. All other PUTs (catalog segment/head objects, best-effort
+    /// sidecars) and all non-PUT ops delegate untouched.
+    ///
+    /// This models the live incident precisely: a multi-wave compaction drain
+    /// writes several bounded data files; an EARLIER wave commits its file to
+    /// the catalog, then a LATER wave's data PUT to the object store fails. The
+    /// failure aborts `compact_one_impl` via `?` BEFORE the end-of-drain
+    /// `set_compaction_watermark`, so the watermark never records the
+    /// already-committed wave. A restart then replays the WAL from the stale
+    /// watermark and re-commits the already-committed rows -> duplicates.
+    #[derive(Debug)]
+    struct DataPutFailAfterStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        allow_data_files: usize,
+        data_puts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::fmt::Display for DataPutFailAfterStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "DataPutFailAfterStore({})", self.inner)
+        }
+    }
+
+    impl DataPutFailAfterStore {
+        fn is_data_file(location: &object_store::path::Path) -> bool {
+            let s = location.as_ref();
+            s.ends_with(".parquet") || s.ends_with(".vortex")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for DataPutFailAfterStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if Self::is_data_file(location) {
+                let n = self
+                    .data_puts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n >= self.allow_data_files {
+                    return Err(object_store::Error::Generic {
+                        store: "DataPutFailAfterStore",
+                        source: "data-file PUT failed (later compaction wave)".into(),
+                    });
+                }
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Distinct count of the `id` (column 0) values across every committed +
+    /// resident row a read handle returns — the `count(DISTINCT id)` the live
+    /// incident measured.
+    fn distinct_ids(batches: &[RecordBatch]) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        for b in batches {
+            let ids = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id col is Int64");
+            for i in 0..ids.len() {
+                seen.insert(ids.value(i));
+            }
+        }
+        seen.len()
+    }
+
+    /// REPRODUCTION of the boot-replay DUPLICATE-ROW incident (count(*) =
+    /// 101_370_000 vs count(DISTINCT id) = 100_000_000 after a restart): a
+    /// multi-wave compaction drain commits an EARLIER wave's data file to the
+    /// catalog, then a LATER wave's data PUT fails — aborting `compact_one_impl`
+    /// via `?` BEFORE the trailing `set_compaction_watermark`. The committed
+    /// wave's rows are therefore NOT covered by the persisted watermark. On
+    /// restart, `replay_wal_into` replays the WAL from the stale watermark
+    /// (`Lsn::ZERO` here) and re-commits the already-committed rows, producing a
+    /// SECOND data file for them -> duplicates.
+    ///
+    /// This pins the invariant the live cluster violated: after a restart +
+    /// `recover_all`, `count(*)` MUST equal `count(DISTINCT id)` MUST equal N
+    /// (no loss, no duplicate). Pre-fix this fails with `count(*) > N`.
+    #[tokio::test]
+    async fn restart_replay_does_not_duplicate_committed_compaction_wave() {
+        basin_common::telemetry::try_init_for_tests();
+
+        // One chunk per wave so the wedge cleanly straddles a wave boundary:
+        // wave 1 writes + commits data file #1, wave 2's data PUT is wedged.
+        std::env::set_var("BASIN_SHARD_FLUSH_CONCURRENCY", "1");
+
+        // 700k rows in 100k batches > MAX_COMPACTION_ROWS (512k): the drain
+        // needs >= 2 bounded waves (wave 1 ~500k, wave 2 the remainder).
+        let per: usize = 100_000;
+        let n_batches: usize = 7;
+        let n = per * n_batches; // 700_000
+
+        let storage_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+
+        // DATA store: allow exactly ONE data-file PUT (wave 1), fail the rest.
+        let data_fs: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap());
+        let data_puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let data_store: Arc<dyn object_store::ObjectStore> = Arc::new(DataPutFailAfterStore {
+            inner: data_fs,
+            allow_data_files: 1,
+            data_puts: data_puts.clone(),
+        });
+        let storage = Storage::new(StorageConfig {
+            object_store: data_store,
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog = Arc::new(InMemoryCatalog::new());
+
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("c700k").unwrap();
+
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
+                root_prefix: None,
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
+            })
+            .await
+            .unwrap(),
+        );
+
+        let shard =
+            crate::Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+
+        // Durable writes: ids 1..=N, all in one partition.
+        let handle = shard.get(&project, &partition).await.unwrap();
+        let mut max_lsn = Lsn::ZERO;
+        for i in 0..n_batches {
+            let start = (i * per) as i64 + 1;
+            let lsn = handle
+                .write_batch_opts_lsn(&table, batch(start, per, "v-"), true)
+                .await
+                .unwrap();
+            if max_lsn < lsn {
+                max_lsn = lsn;
+            }
+        }
+        handle.await_durable(max_lsn).await.unwrap();
+
+        // Drive a compaction. Wave 1 commits data file #1 to the catalog; wave 2's
+        // data PUT is wedged, so `compact_one_impl` aborts BEFORE the trailing
+        // watermark persist (the error is logged + swallowed by `compact_all`,
+        // matching the production "retry next tick" path).
+        let inner = impl_of(&shard);
+        inner.run_compaction_once().await.unwrap();
+
+        // Precondition: an earlier wave DID commit a data file (so there are
+        // already-committed rows that replay can double).
+        let committed_before = committed_count(&catalog, &project, &table).await;
+        assert!(
+            committed_before > 0 && committed_before < n as u64,
+            "precondition: exactly one committed wave (0 < {committed_before} < {n})",
+        );
+        // Watermark must cover ONLY the fully-committed prefix — never the
+        // uncommitted (wedged) wave's LSNs. Pre-fix it was left at 0 (no per-wave
+        // persist), so the committed wave was replayed + re-committed. The fix
+        // advances it per wave to the safe floor (here = the committed wave's max
+        // LSN), so replay starts strictly above it. Either way it must NOT reach
+        // the partition's high-water (that would strand the uncommitted tail).
+        let hw = wal.high_water(&project, &partition).await.unwrap();
+        let wm = {
+            use basin_catalog::Catalog as _;
+            catalog
+                .get_compaction_watermark(&project, partition.as_str())
+                .await
+                .unwrap()
+        };
+        assert!(
+            wm.unwrap_or(0) < hw.0,
+            "watermark ({wm:?}) must stay below the WAL high-water ({hw}) — the \
+             uncommitted tail must remain replayable",
+        );
+
+        // === RESTART: drop the shard, close + reopen the WAL over the same dir,
+        // and reopen the shard over the same (healthy now) storage + catalog.
+        drop(handle);
+        drop(shard);
+        wal.close().await.unwrap();
+        drop(wal);
+
+        let wal2: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
+                root_prefix: None,
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
+            })
+            .await
+            .unwrap(),
+        );
+
+        // The data store is healthy on restart (the wedge cleared) so recovery's
+        // compaction can commit the replayed tail.
+        let storage2 = Storage::new(StorageConfig {
+            object_store: Arc::new(
+                LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
+            ),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let shard2 =
+            crate::Shard::new(ShardConfig::new(storage2.clone(), catalog.clone(), wal2.clone()));
+
+        // Boot recovery: replay + drain every WAL-known partition.
+        shard2.recover_all().await.unwrap();
+
+        // INVARIANT: count(*) == count(DISTINCT id) == N. Pre-fix this FAILS
+        // because the committed wave's rows are replayed and re-committed.
+        let committed_after = committed_count(&catalog, &project, &table).await;
+        assert_eq!(
+            committed_after, n as u64,
+            "count(*) after restart+recover must equal N (got {committed_after}, wrote {n}) \
+             — re-committing the already-committed wave duplicates rows",
+        );
+
+        let read = shard2
+            .get_for_read(&project, &partition)
+            .await
+            .unwrap()
+            .read(&table, ReadOptions::default())
+            .await
+            .unwrap();
+        let distinct = distinct_ids(&read);
+        assert_eq!(
+            distinct, n,
+            "count(DISTINCT id) after restart must equal N (got {distinct}, wrote {n})",
+        );
+        assert_eq!(
+            rows_in(&read),
+            n,
+            "total rows read back must equal N (no duplicate, no loss)",
+        );
+
+        std::env::remove_var("BASIN_SHARD_FLUSH_CONCURRENCY");
     }
 
     /// READ-PATH NON-BLOCK GATE (the 764 s `SELECT 1` incident): a
