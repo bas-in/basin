@@ -4027,6 +4027,24 @@ impl ShardImpl for InProcessShard {
         // ones a restart would otherwise leave invisible to `count(*)` until a
         // write faulted them back in.
         let known = self.cfg.wal.list_partitions().await?;
+        // UNCONDITIONAL boot-recovery breadcrumb (incl. the empty case): on a
+        // multi-node cluster a node whose local WAL prefix/volume did not
+        // survive the restart enumerates ZERO partitions and would otherwise
+        // recover silently — leaving forwarded WAL-durable rows that physically
+        // lived on THIS node invisible to `count(*)` with no log to explain it.
+        // Emit the count + the exact partition keys so the live cluster is
+        // re-diagnosable from the boot log alone (this node's WAL listing is the
+        // ground truth for "did the per-node WAL survive the restart?").
+        let known_keys: Vec<String> = known
+            .iter()
+            .map(|(p, part)| format!("{p}/{part}"))
+            .collect();
+        tracing::info!(
+            replica_id = %self.cfg.replica_id,
+            wal_known_partitions = known.len(),
+            partitions = ?known_keys,
+            "recover_all: WAL-known partitions enumerated at boot",
+        );
         if known.is_empty() {
             return Ok(());
         }

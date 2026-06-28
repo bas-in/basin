@@ -837,3 +837,472 @@ async fn forwarded_copy_batch_is_durable_on_owner_before_ack() {
 
     std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
 }
+
+// ── MULTI-NODE restart-recovery of forwarded WAL-durable rows (#28) ──────────
+
+/// Object store that FAILS every PUT while `wedged` is true, delegating every
+/// other op to an inner store. Models the cloud incident where compaction /
+/// flush PUTs to the shared DATA object store were wedged: a write's segment
+/// never reaches a committed catalog file, but the rows are already WAL-durable
+/// (each node's WAL has its own healthy store). Flip `wedged` to false to model
+/// the wedge clearing after a node restart. Mirrors the single-node
+/// `WedgeablePutStore` in `basin-shard`'s in_process tests.
+#[derive(Debug)]
+struct WedgeablePutStore {
+    inner: Arc<dyn ObjectStore>,
+    wedged: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl std::fmt::Display for WedgeablePutStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WedgeablePutStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for WedgeablePutStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if self.wedged.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(object_store::Error::Generic {
+                store: "WedgeablePutStore",
+                source: "data store wedged (compaction PUTs failing)".into(),
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOpts,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        if self.wedged.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(object_store::Error::Generic {
+                store: "WedgeablePutStore",
+                source: "data store wedged (compaction PUTs failing)".into(),
+            });
+        }
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Build a no-lease-mode engine wired for multi-node forwarding over a SHARED
+/// cold store + SHARED catalog, with its OWN per-node WAL. Mirrors the live
+/// `BASIN_LEASE_MODE=off` deployment: forwarding is by the deterministic
+/// `PartitionRouter`, NOT the lease registry, so the router has peers but no
+/// `LeaseRegistry` is attached (writes on the owner need no lease, and
+/// `recover_all` recovers every WAL-known partition rather than only
+/// lease-held ones). The WAL store + cold store are supplied by the caller so a
+/// "restart" can reopen fresh handles over the SAME backing dirs.
+async fn lease_off_engine_for(
+    cold: Arc<dyn ObjectStore>,
+    catalog: Arc<InMemoryCatalog>,
+    wal_store: Arc<dyn ObjectStore>,
+    replica_id: &str,
+) -> Engine {
+    let wal: Arc<dyn basin_wal::Wal> = Arc::new(
+        basin_wal::LocalWal::open(basin_wal::WalConfig {
+            object_store: wal_store,
+            root_prefix: None,
+            // Real flush cadence so synchronous (durable=true) appends ack only
+            // after a real segment PUT to the WAL store.
+            flush_interval: std::time::Duration::from_millis(50),
+            flush_max_bytes: 1024 * 1024,
+            commit_delay: std::time::Duration::from_millis(2),
+        })
+        .await
+        .unwrap(),
+    );
+    let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
+        object_store: cold.clone(),
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    // NO lease registry: lease-off mode. `replica_id` still identifies the node
+    // for the WAL/shard, but ownership is the router's deterministic hash.
+    let mut cfg = basin_shard::ShardConfig::new(
+        storage,
+        catalog.clone() as Arc<dyn basin_catalog::Catalog>,
+        wal,
+    );
+    cfg.replica_id = replica_id.to_string();
+    let shard = basin_shard::Shard::new(cfg);
+    let storage2 = basin_storage::Storage::new(basin_storage::StorageConfig {
+        object_store: cold,
+        root_prefix: None,
+        disk_cache: None,
+        page_cache: None,
+    });
+    Engine::new(EngineConfig {
+        storage: storage2,
+        catalog: catalog as Arc<dyn basin_catalog::Catalog>,
+        shard: Some(shard),
+    })
+}
+
+/// Wire the two engines for deterministic A/B forwarding: a two-peer router on
+/// each, and A's forward transport delivers straight into the peers' engines
+/// (faithful to the REST receive handler — see [`InProcDouble`]).
+fn wire_forwarding(eng_a: &Engine, eng_b: &Engine) {
+    let peers = vec![PEER_A.to_string(), PEER_B.to_string()];
+    eng_a.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_A));
+    eng_b.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_B));
+    let mut map = HashMap::new();
+    map.insert(PEER_A.to_string(), eng_a.clone());
+    map.insert(PEER_B.to_string(), eng_b.clone());
+    eng_a.attach_partition_forward_client(Arc::new(InProcDouble { peers: map }));
+}
+
+/// Count rows in a single WAL payload. The WAL payload layout is
+/// `u32 LE table-name length | table name | Arrow-IPC stream of the batch`
+/// (see `basin-shard`'s `encode_payload`). We only need the row count, so we
+/// skip the table-name header and sum `num_rows()` over the IPC stream.
+fn wal_payload_rows(payload: &[u8]) -> usize {
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+    assert!(payload.len() >= 4, "WAL payload shorter than 4-byte header");
+    let tlen = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let ipc = &payload[4 + tlen..];
+    let reader = StreamReader::try_new(Cursor::new(ipc), None).expect("ipc reader");
+    reader
+        .map(|b| b.expect("ipc batch").num_rows())
+        .sum()
+}
+
+/// `SELECT count(*)` through a session — the global committed-segment row count
+/// (the in-RAM tail is NOT counted; only committed catalog segments are).
+async fn select_count(sess: &crate::ProjectSession, table: &str) -> i64 {
+    let res = sess
+        .execute(&format!("SELECT count(*) AS n FROM {table}"))
+        .await
+        .unwrap();
+    match res {
+        crate::ExecResult::Rows { batches, .. } => batches
+            .iter()
+            .flat_map(|b| {
+                let col = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                (0..b.num_rows()).map(|i| col.value(i)).collect::<Vec<_>>()
+            })
+            .next()
+            .unwrap_or(0),
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
+/// REPRODUCTION of the live MULTI-NODE restart-recovery incident
+/// (object-store catalog, `BASIN_LEASE_MODE=off`): a durable fan-out COPY at
+/// node A forwards the B-owned partitions' batches to node B, which group-
+/// commits them to ITS OWN local WAL before acking (durable-on-forward). The
+/// shared DATA object store is wedged, so NO partition tail on either node ever
+/// compacts to a committed segment — `count(*)` (committed-segment-only)
+/// under-counts even though every row is WAL-durable on its owner.
+///
+/// Then BOTH nodes restart: drop both engines/shards, close both WALs, reopen
+/// fresh engines/shards over the SAME per-node WAL dirs + the SAME shared cold
+/// store + catalog. The wedge clears. The headline question the live incident
+/// posed: does `recover_all()` on BOTH nodes drain every WAL-durable partition
+/// (including the FORWARDED ones that physically live on node B's WAL) so the
+/// global `count(*)` returns N again?
+///
+/// Pins, in order:
+///   1. The forwarded rows physically live on node B's reopened WAL (not lost).
+///   2. WITHOUT recover_all, after reopen, count(*) < N (bug surface).
+///   3. WITH recover_all on BOTH nodes, count(*) == N and a known id reads back
+///      exactly once.
+#[tokio::test]
+async fn two_node_restart_recovers_forwarded_wal_durable_tail() {
+    let _env = FANOUT_ENV_LOCK.lock().unwrap();
+    std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
+    basin_common::telemetry::try_init_for_tests();
+
+    // The forwarded limb's durable-on-forward gate must be ON (process default),
+    // or "forwarded rows are WAL-durable on B" would not hold.
+    assert!(
+        crate::write_forwarder::forward_lands_durable(),
+        "default: forwarded writes land durable on the owner"
+    );
+
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    // SHARED cold store (wedgeable), persistent across the restart via a TempDir.
+    let cold_dir = TempDir::new().unwrap();
+    let wedged = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let cold_fs: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(cold_dir.path()).unwrap());
+    let cold: Arc<dyn ObjectStore> = Arc::new(WedgeablePutStore {
+        inner: cold_fs,
+        wedged: wedged.clone(),
+    });
+    // SHARED catalog (the object-store catalog the peers both see). The Arc
+    // outlives the shard drop, modelling the shared catalog surviving a restart.
+    let catalog = Arc::new(InMemoryCatalog::new());
+
+    // PER-NODE WAL dirs, persistent across the restart.
+    let wal_dir_a = TempDir::new().unwrap();
+    let wal_dir_b = TempDir::new().unwrap();
+    let wal_store_a: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(wal_dir_a.path()).unwrap());
+    let wal_store_b: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(wal_dir_b.path()).unwrap());
+
+    let eng_a =
+        lease_off_engine_for(cold.clone(), catalog.clone(), wal_store_a.clone(), PEER_A).await;
+    let eng_b =
+        lease_off_engine_for(cold.clone(), catalog.clone(), wal_store_b.clone(), PEER_B).await;
+    wire_forwarding(&eng_a, &eng_b);
+
+    // CREATE TABLE on A (catalog-level → visible to both via the shared catalog).
+    let sess_a = eng_a.open_session(ProjectId::new()).await.unwrap();
+    let project = sess_a.project();
+    sess_a.execute("CREATE TABLE t (id BIGINT)").await.unwrap();
+    let table = TableName::new("t").unwrap();
+    let router = PartitionRouter::new(vec![PEER_A.to_string(), PEER_B.to_string()], PEER_A);
+
+    // Durable fan-out COPY: 20k rows across 8 stripes, multi-row batches so the
+    // fan-out path engages and the round-robin cursor visits every stripe —
+    // some land locally on A, some forward to B. ids are 0..N-1, unique.
+    let n: i64 = 20_000;
+    let per: i64 = 200;
+    let n_batches = (n / per) as usize; // 100 batches over 8 stripes
+    let mut b_owned: Vec<PartitionKey> = Vec::new();
+    let mut a_owned: Vec<PartitionKey> = Vec::new();
+    for i in 0..n_batches {
+        let base = (i as i64) * per;
+        let ids: Vec<i64> = (0..per).map(|k| base + k).collect();
+        crate::executor::exec_ingest_batch(&sess_a, &table, ids_batch(&ids))
+            .await
+            .unwrap();
+    }
+    // Classify the 8 stripes by owner (for the cross-node landing assertion).
+    for i in 0..8usize {
+        let part = if i == 0 {
+            PartitionKey::default_key()
+        } else {
+            PartitionKey::new(format!("s{i}")).unwrap()
+        };
+        if router.desired_owner(&project, part.as_str()).is_self {
+            a_owned.push(part);
+        } else {
+            b_owned.push(part);
+        }
+    }
+    assert!(
+        !b_owned.is_empty(),
+        "router put no partitions on B — forwarding not exercised"
+    );
+    assert!(
+        !a_owned.is_empty(),
+        "router put no partitions on A — local limb not exercised"
+    );
+
+    // End-of-COPY durable barrier: drives every LOCALLY-touched (A-owned)
+    // partition durable on A's WAL. The FORWARDED (B-owned) partitions are
+    // already durable on B (durable-on-forward), so they never entered A's
+    // local touched set — the barrier on A is sufficient.
+    sess_a.await_copy_durable().await.unwrap();
+
+    // The wedge means NOTHING compacted on either node: global count(*) < N.
+    let committed_before = select_count(&sess_a, "t").await;
+    assert!(
+        committed_before < n,
+        "precondition: wedged data store ⇒ count(*) must under-count \
+         (committed {committed_before}, wrote {n})"
+    );
+
+    // === CRASH BOTH NODES: drop engines/shards and close BOTH WALs (flushes
+    // buffered segments to the healthy WAL stores; the barrier + durable-on-
+    // forward already made every row durable).
+    let shard_a = eng_a.shard().unwrap();
+    let shard_b = eng_b.shard().unwrap();
+    shard_a.wal().close().await.unwrap();
+    shard_b.wal().close().await.unwrap();
+    drop(shard_a);
+    drop(shard_b);
+    drop(sess_a);
+    drop(eng_a);
+    drop(eng_b);
+
+    // === RESTART: reopen fresh WAL stores over the SAME per-node dirs + the
+    // SAME shared cold store + catalog.
+    let wal_store_a2: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(wal_dir_a.path()).unwrap());
+    let wal_store_b2: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(wal_dir_b.path()).unwrap());
+
+    // (1) DEFINITIVE recoverability check: every acked row is still in SOME
+    //     node's reopened WAL. Read each stripe from BOTH nodes' WALs (a stripe
+    //     physically lives on exactly its owner's WAL); the union must be N, and
+    //     node B's WAL must hold the forwarded rows.
+    let probe_wal_a: Arc<dyn basin_wal::Wal> = Arc::new(
+        basin_wal::LocalWal::open(basin_wal::WalConfig {
+            object_store: wal_store_a2.clone(),
+            root_prefix: None,
+            flush_interval: std::time::Duration::from_millis(50),
+            flush_max_bytes: 1024 * 1024,
+            commit_delay: std::time::Duration::from_millis(2),
+        })
+        .await
+        .unwrap(),
+    );
+    let probe_wal_b: Arc<dyn basin_wal::Wal> = Arc::new(
+        basin_wal::LocalWal::open(basin_wal::WalConfig {
+            object_store: wal_store_b2.clone(),
+            root_prefix: None,
+            flush_interval: std::time::Duration::from_millis(50),
+            flush_max_bytes: 1024 * 1024,
+            commit_delay: std::time::Duration::from_millis(2),
+        })
+        .await
+        .unwrap(),
+    );
+    let mut wal_rows = 0usize;
+    let mut b_wal_rows = 0usize;
+    for i in 0..8usize {
+        let part = if i == 0 {
+            PartitionKey::default_key()
+        } else {
+            PartitionKey::new(format!("s{i}")).unwrap()
+        };
+        for (wal, is_b) in [(&probe_wal_a, false), (&probe_wal_b, true)] {
+            let entries = wal
+                .read_from(&project, &part, basin_wal::Lsn::ZERO)
+                .await
+                .unwrap();
+            for e in &entries {
+                let r = wal_payload_rows(&e.payload);
+                wal_rows += r;
+                if is_b {
+                    b_wal_rows += r;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        wal_rows, n as usize,
+        "RECOVERABILITY: every acked row must still be in SOME node's reopened \
+         WAL (found {wal_rows}, expected {n}) — the rows are NOT lost"
+    );
+    assert!(
+        b_wal_rows > 0,
+        "FORWARDED rows must physically live on node B's WAL (found {b_wal_rows})"
+    );
+    probe_wal_a.close().await.unwrap();
+    probe_wal_b.close().await.unwrap();
+    drop(probe_wal_a);
+    drop(probe_wal_b);
+
+    // Reopen the two engines for real over the same dirs.
+    let wal_store_a3: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(wal_dir_a.path()).unwrap());
+    let wal_store_b3: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(wal_dir_b.path()).unwrap());
+    let eng_a2 = lease_off_engine_for(cold.clone(), catalog.clone(), wal_store_a3, PEER_A).await;
+    let eng_b2 = lease_off_engine_for(cold.clone(), catalog.clone(), wal_store_b3, PEER_B).await;
+    wire_forwarding(&eng_a2, &eng_b2);
+
+    // Un-wedge: the incident's wedge has cleared, so compaction PUTs succeed.
+    wedged.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let sess_a2 = eng_a2.open_session(project).await.unwrap();
+
+    // (2) BUG SURFACE: after reopen, with NO recover_all and no write, the
+    //     resident map on each node is empty and count(*) is committed-only, so
+    //     it still under-counts even though the wedge cleared.
+    let after_reopen = select_count(&sess_a2, "t").await;
+    assert!(
+        after_reopen < n,
+        "after reopen (no recover_all) count(*) must still under-count — \
+         got {after_reopen}, wrote {n}"
+    );
+
+    // (3) THE FIX UNDER TEST: recover_all on BOTH nodes force-replays + drains
+    //     every WAL-known partition each node owns (no-lease ⇒ all of its own).
+    eng_a2.shard().unwrap().recover_all().await.unwrap();
+    eng_b2.shard().unwrap().recover_all().await.unwrap();
+
+    let after_recover = select_count(&sess_a2, "t").await;
+    assert_eq!(
+        after_recover, n,
+        "FIX: recover_all on BOTH nodes must make global count(*) == N \
+         (got {after_recover}, wrote {n}) — every WAL-durable row (incl. the \
+         FORWARDED ones on node B) drained into committed segments"
+    );
+
+    // Point lookup of a known id (a high id in the last batch): after recovery
+    // it must read back exactly once.
+    let probe_id = n - 3;
+    let res = sess_a2
+        .execute(&format!("SELECT count(*) AS n FROM t WHERE id = {probe_id}"))
+        .await
+        .unwrap();
+    let hits = match res {
+        crate::ExecResult::Rows { batches, .. } => batches
+            .iter()
+            .flat_map(|b| {
+                let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                (0..b.num_rows()).map(|i| col.value(i)).collect::<Vec<_>>()
+            })
+            .next()
+            .unwrap_or(0),
+        other => panic!("expected Rows, got {other:?}"),
+    };
+    assert_eq!(
+        hits, 1,
+        "point lookup of a recovered id ({probe_id}) must return exactly one row \
+         (got {hits})"
+    );
+
+    std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
+}
