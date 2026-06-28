@@ -357,7 +357,20 @@ pub(crate) struct PartitionState {
     /// truncate window cannot re-replay an already-committed batch into a
     /// duplicate cold file. A legacy catalog without a watermark replays from
     /// `Lsn::ZERO` (the prior behavior) — see `replay_wal_into`.
-    last_compacted_lsn: Lsn,
+    ///
+    /// Cancellation-safety (the count(*)>count(DISTINCT) incident, #30/#46):
+    /// this is an `Arc<AtomicU64>` so `compact_one_impl` can advance it
+    /// SYNCHRONOUSLY — with no `.await` between the catalog commit returning
+    /// and the advance — the instant a wave commits, BEFORE the physical tail
+    /// prune. The tail snapshot filters out entries at or below it, so if the
+    /// read-path drain's bounded timeout DROPS the compaction future after a
+    /// wave committed but before it pruned the tail, the next (background or
+    /// read) compaction re-snapshots that partition, sees those entries are
+    /// already covered by the watermark, and does NOT commit a second file for
+    /// them. The stale physical tail entries are pruned by the next drain that
+    /// runs to completion. Atomic (not the `PartitionState` RwLock) precisely
+    /// so the advance needs no await and thus no cancellation point.
+    last_compacted_lsn: Arc<std::sync::atomic::AtomicU64>,
     /// Schemas cached from the catalog the first time we touch a table.
     schemas: HashMap<TableName, Arc<Schema>>,
     /// In-memory tail keyed by table. Each `(lsn, batch)` pair tracks the WAL
@@ -390,7 +403,7 @@ impl PartitionState {
             project,
             partition,
             last_active: Instant::now(),
-            last_compacted_lsn: Lsn::ZERO,
+            last_compacted_lsn: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             schemas: HashMap::new(),
             tail: HashMap::new(),
             compact_lock: Arc::new(Mutex::new(())),
@@ -471,6 +484,16 @@ pub(crate) struct InProcessShard {
     /// and background loops run on update the SAME counter the metrics snapshot
     /// reads.
     ingest_rate: Arc<IngestRate>,
+    /// Test-only barrier awaited by `compact_one_impl` immediately AFTER a
+    /// wave's catalog commit and BEFORE it prunes the committed entries from the
+    /// in-memory tail. Lets a test deterministically suspend a compaction inside
+    /// the exact committed-but-unpruned window the read-path bounded-timeout
+    /// cancellation used to drop a future in — so the
+    /// `read_flush_cancelled_mid_commit_does_not_duplicate_rows` reproduction is
+    /// timing-free. `None` (and a zero-cost `Option` check) in production.
+    #[cfg(test)]
+    post_commit_barrier:
+        Arc<std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
 }
 
 impl InProcessShard {
@@ -488,6 +511,8 @@ impl InProcessShard {
             held_leases: Arc::new(Mutex::new(HashMap::new())),
             draining: Arc::new(Mutex::new(HashSet::new())),
             ingest_rate: Arc::new(IngestRate::new()),
+            #[cfg(test)]
+            post_commit_barrier: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -529,6 +554,12 @@ impl InProcessShard {
             // Shared: the write path runs on a `share_clone` and must update the
             // same rolling counter the metrics snapshot reads.
             ingest_rate: self.ingest_rate.clone(),
+            // Test-only: SHARED across share_clones (like memtable_registry_cell)
+            // so a barrier installed via `impl_of(&shard).set_post_commit_barrier`
+            // — which itself runs on a share_clone — is observed by the
+            // `compact_all_for_read` the read path runs (also on a share_clone).
+            #[cfg(test)]
+            post_commit_barrier: self.post_commit_barrier.clone(),
         }
     }
 
@@ -545,6 +576,17 @@ impl InProcessShard {
     ) -> Option<i64> {
         let held = self.held_leases.lock().await;
         held.get(&(*project, partition.clone())).copied()
+    }
+
+    /// Test-only: install (or clear) the post-commit barrier `compact_one_impl`
+    /// awaits between a wave's catalog commit and the tail prune. See the field
+    /// doc on `post_commit_barrier`.
+    #[cfg(test)]
+    pub(crate) fn set_post_commit_barrier(&self, sem: Option<Arc<tokio::sync::Semaphore>>) {
+        *self
+            .post_commit_barrier
+            .lock()
+            .expect("post_commit_barrier lock poisoned") = sem;
     }
 
     /// Acquire (or refresh) the lease for `(project, partition)` on first
@@ -2042,6 +2084,17 @@ impl InProcessShard {
             let guard = state.read().await;
             guard.compact_lock.clone()
         };
+        // The committed-through watermark for THIS partition. Cloned out as an
+        // `Arc<AtomicU64>` so the commit loop can advance it with no `.await`
+        // between the catalog commit returning and the advance — see the field
+        // doc on `PartitionState::last_compacted_lsn`. Filtering the tail
+        // snapshot by it (below) makes compaction idempotent under the read-path
+        // bounded-timeout cancellation that can drop this future after a wave
+        // committed but before its tail prune ran.
+        let watermark = {
+            let guard = state.read().await;
+            guard.last_compacted_lsn.clone()
+        };
         // Non-blocking read-path variant: if a compaction is already in flight
         // for this partition, don't wait behind it. `try_lock` keeps the
         // guard's lifetime tied to this scope; bind it so the guard outlives
@@ -2096,11 +2149,25 @@ impl InProcessShard {
         // per-wave memory and in-flight PUTs.
         let tail_snapshot: Vec<(TableName, Vec<(Lsn, RecordBatch)>)> = {
             let guard = state.read().await;
+            // Idempotency floor (defense-in-depth): never re-snapshot an entry
+            // whose data an earlier wave/compaction already committed. `compact
+            // _one_impl` advances `watermark` to each wave's PROVABLY-SAFE floor
+            // as part of the prune below; a second compaction that snapshots
+            // AFTER that advance — a concurrent or background compaction racing a
+            // just-pruned wave — therefore skips the already-committed entries
+            // instead of re-committing a duplicate file for them. (The primary
+            // guard against the count(*)>count(DISTINCT id) incident is the
+            // cancellation-safe detached read-path drain in
+            // `flush_to_parquet_for_read`, which guarantees the prune + this
+            // watermark advance always run; this filter closes the residual
+            // concurrent-re-snapshot window the per-partition compaction lock
+            // already mostly covers.)
+            let floor = Lsn(watermark.load(std::sync::atomic::Ordering::SeqCst));
             let mut chunks: Vec<(TableName, Vec<(Lsn, RecordBatch)>)> = Vec::new();
             'outer: for (t, v) in guard.tail.iter().filter(|(_, v)| !v.is_empty()) {
                 let mut taken = Vec::new();
                 let mut rows = 0usize;
-                for (lsn, b) in v.iter() {
+                for (lsn, b) in v.iter().filter(|(lsn, _)| *lsn > floor) {
                     // Always take at least one batch per chunk so a single
                     // oversized batch still makes progress; close the chunk
                     // once it would exceed the per-file row budget and start a
@@ -2420,6 +2487,27 @@ impl InProcessShard {
             basin_common::autotune::record_committed_rows(wave_rows);
         }
 
+        // Test-only: suspend INSIDE the committed-but-unpruned window (after the
+        // wave's catalog commit, before the tail prune below). A reproduction
+        // can drop this future here — exactly where the read-path bounded
+        // timeout used to cancel — to prove the prune/watermark advance is not
+        // skipped. No-op in production (the cell is always `None`).
+        #[cfg(test)]
+        {
+            let barrier = self
+                .post_commit_barrier
+                .lock()
+                .expect("post_commit_barrier lock poisoned")
+                .clone();
+            if let Some(sem) = barrier {
+                // Acquire one permit, then immediately drop it: the test gates
+                // progress by withholding permits until it is ready to let the
+                // prune proceed. If the future is cancelled while parked here,
+                // the prune never runs — the cancellation-window reproduction.
+                let _ = sem.acquire().await;
+            }
+        }
+
         // Per-file sidecar indexing + drain bookkeeping (after the commits).
         for (idx, plan) in plans.iter().enumerate() {
             let table = &plan.table;
@@ -2538,9 +2626,6 @@ impl InProcessShard {
                 if let Some(v) = guard.tail.get_mut(table) {
                     v.retain(|(lsn, _)| *lsn > *max_lsn);
                 }
-                if guard.last_compacted_lsn < *max_lsn {
-                    guard.last_compacted_lsn = *max_lsn;
-                }
             }
             // Lowest LSN still sitting in ANY table's tail after this drain.
             let min_remaining = guard
@@ -2558,6 +2643,29 @@ impl InProcessShard {
                 None => max_lsn_overall,
             }
         };
+        // Advance the in-memory committed-through watermark to the PROVABLY-SAFE
+        // floor for this wave — the largest LSN below which every entry (of
+        // every table) is committed. The tail-snapshot filter at the top of the
+        // loop reads this, so subsequent compactions (this drain's next wave,
+        // the background tick, or a read-path drain) never re-snapshot — and
+        // thus never re-commit a duplicate file for — already-committed rows.
+        // Advancing to the safe FLOOR (not a per-table max) is what keeps a
+        // multi-table wave from stranding a lower-LSN entry of a table whose
+        // commit comes later. Monotonic.
+        if let Some(floor) = wave_safe_floor {
+            let mut cur = watermark.load(std::sync::atomic::Ordering::SeqCst);
+            while floor.0 > cur {
+                match watermark.compare_exchange_weak(
+                    cur,
+                    floor.0,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => cur = observed,
+                }
+            }
+        }
 
         // PER-WAVE durable watermark (duplicate-row crash-window fix). The
         // catalog commits above are visible now; if a LATER wave's write/commit
@@ -4286,14 +4394,42 @@ impl ShardImpl for InProcessShard {
         // `BASIN_FASTAGG_COMPACT_TIMEOUT_MS=0` restores the un-bounded await.
         match read_compaction_timeout() {
             Some(bound) => {
-                match tokio::time::timeout(bound, self.compact_all_for_read()).await {
-                    Ok(res) => res,
+                // Cancellation-safety (count(*)>count(DISTINCT id) incident):
+                // run the drain in a DETACHED task and bound only the WAIT, not
+                // the drain itself. If we instead wrapped `compact_all_for_read`
+                // directly in `tokio::time::timeout`, an elapsed bound would DROP
+                // the compaction future mid-flight — and `compact_one_impl`'s
+                // wave loop commits a file to the catalog (`commit_with_retry`)
+                // BEFORE it prunes the committed entries from the in-memory tail
+                // and advances the per-partition watermark. A drop in that window
+                // left committed-but-unpruned entries that the NEXT compaction
+                // re-snapshotted and re-committed, duplicating rows (~5.66M dups
+                // at 100M). Spawning detaches the drain from this future's
+                // lifetime: the read stops WAITING on the bound (the 764 s
+                // wedged-PUT fix stays intact — see
+                // `read_flush_does_not_block_on_wedged_compaction_put`), while
+                // the drain always runs commit→prune→watermark as one
+                // uninterrupted unit. The task runs on a `share_clone` that
+                // shares the same partition map / compaction locks / watermarks,
+                // so its work is observed by every subsequent read.
+                let drainer = Arc::new(self.share_clone());
+                let handle =
+                    tokio::spawn(async move { drainer.compact_all_for_read().await });
+                match tokio::time::timeout(bound, handle).await {
+                    // Drain finished within the bound: surface its result (a
+                    // join error means the task panicked — propagate as storage).
+                    Ok(Ok(res)) => res,
+                    Ok(Err(join_err)) => Err(BasinError::storage(format!(
+                        "read-path compaction task panicked: {join_err}"
+                    ))),
                     Err(_elapsed) => {
                         warn!(
                             timeout_ms = bound.as_millis() as u64,
                             "read-path compaction drain exceeded its bound; answering \
-                             from committed catalog state (the residual tail converges \
-                             via the background compactor + quiesce-drain)",
+                             from committed catalog state (the detached drain runs to \
+                             completion in the background — it is never cancelled \
+                             mid-commit, so it cannot leave a committed-but-unpruned \
+                             tail that the next compaction would re-commit)",
                         );
                         Ok(())
                     }
@@ -5020,8 +5156,10 @@ async fn replay_wal_into(
     };
     // Seed the in-memory marker so the first post-restart compaction's
     // `last_compacted_lsn` bookkeeping starts from the durable floor.
-    if state.last_compacted_lsn < floor {
-        state.last_compacted_lsn = floor;
+    if state.last_compacted_lsn.load(std::sync::atomic::Ordering::SeqCst) < floor.0 {
+        state
+            .last_compacted_lsn
+            .store(floor.0, std::sync::atomic::Ordering::SeqCst);
     }
     let entries = wal.read_from(project, partition, floor).await?;
     for entry in entries {
@@ -10382,5 +10520,112 @@ mod tests {
             "committed count must stay correct under the wedge (got {after}, \
              want {COMMITTED}) — the read answered from committed catalog state",
         );
+    }
+
+    /// REPRODUCTION of the count(*) > count(DISTINCT id) duplicate-row incident
+    /// (~5.66M persistent dups on a clean 100M load, no restart).
+    ///
+    /// Root cause: `flush_to_parquet_for_read` bounded its read-path compaction
+    /// drain with `tokio::time::timeout(BASIN_FASTAGG_COMPACT_TIMEOUT_MS, ...)`
+    /// (commit 574975da). On elapse the drain FUTURE was DROPPED. But
+    /// `compact_one_impl`'s per-wave body commits a data file to the catalog
+    /// (`commit_with_retry`) BEFORE it prunes the committed entries from the
+    /// in-memory tail and advances the partition watermark. A drop in that
+    /// window left the committed entries RESIDENT in the tail (the compaction
+    /// lock was released by the drop), so the next compaction (background tick
+    /// or another read) re-snapshotted and re-committed a SECOND file for them
+    /// — duplicating every row of that wave. It freezes once compaction idles
+    /// because no further re-snapshot happens.
+    ///
+    /// This test drives that exact window deterministically: a post-commit
+    /// barrier parks the read-path drain after it commits but before it prunes,
+    /// the bounded read timeout elapses (the read returns from committed state),
+    /// then a second compaction runs. The invariant: committed `count(*)` ==
+    /// `count(DISTINCT id)` == N, with no duplicate file ever produced.
+    ///
+    /// Pre-fix (direct `timeout(bound, compact_all_for_read())`) this FAILS:
+    /// the drop cancels the drain at the barrier, the lock frees, and the second
+    /// compaction re-commits the un-pruned tail -> `count(*) == 2N`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn read_flush_cancelled_mid_commit_does_not_duplicate_rows() {
+        basin_common::telemetry::try_init_for_tests();
+        // One file per wave keeps the commit/prune window crisp and the assert
+        // arithmetic exact.
+        std::env::set_var("BASIN_SHARD_FLUSH_CONCURRENCY", "1");
+        // Short read-path bound: the barrier holds the drain well past it, so the
+        // read STOPS waiting (the 764 s fix) while the drain is parked mid-commit.
+        std::env::set_var("BASIN_FASTAGG_COMPACT_TIMEOUT_MS", "50");
+
+        let (shard, _sd, _wd, _storage, catalog, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        const N: usize = 200;
+        let handle = shard.get(&project, &partition).await.unwrap();
+        for i in 0..N as i64 {
+            handle.write_batch(&table, batch(i, 1, "v-")).await.unwrap();
+        }
+
+        // Install a 0-permit barrier: the read-path drain commits its wave, then
+        // parks here (inside the committed-but-unpruned window) until the test
+        // adds permits.
+        let inner = impl_of(&shard);
+        let barrier = Arc::new(tokio::sync::Semaphore::new(0));
+        inner.set_post_commit_barrier(Some(barrier.clone()));
+
+        // Read-path flush: spawns the drain detached and waits only the bound.
+        // It returns (~50 ms) while the detached drain is PARKED at the barrier,
+        // its wave already committed but not yet pruned. Pre-fix, the elapsed
+        // timeout would instead DROP the drain future here — releasing the lock
+        // with the tail un-pruned.
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            shard.flush_to_parquet_for_read(),
+        )
+        .await;
+        assert!(
+            res.is_ok() && res.unwrap().is_ok(),
+            "read-path flush must return promptly from committed state even while \
+             the drain is parked mid-commit (the 764 s non-block guarantee)",
+        );
+
+        // Release the barrier so the (post-fix) detached drain finishes its
+        // prune + watermark advance. Pre-fix there is no parked drain to release
+        // — it was cancelled — so the tail is already un-pruned and the lock free.
+        inner.set_post_commit_barrier(None);
+        barrier.add_permits(1_000);
+
+        // Now run a SECOND compaction to completion. It blocks on the partition
+        // compaction lock until the detached drain (if any) releases it, then
+        // runs. Post-fix the tail is already pruned + watermark-advanced, so this
+        // is a no-op. Pre-fix the un-pruned tail is re-snapshotted and a SECOND
+        // file is committed for the same rows.
+        inner.run_compaction_once().await.unwrap();
+        // A final blocking drain converges any residual tail either way.
+        shard.flush_to_parquet().await.unwrap();
+
+        // INVARIANT: committed count == distinct == N. No duplicate file.
+        let committed = committed_count(&catalog, &project, &table).await;
+        assert_eq!(
+            committed, N as u64,
+            "committed count(*) must equal N (got {committed}, wrote {N}) — a \
+             cancelled-mid-commit read-path drain must not let the next compaction \
+             re-commit the un-pruned tail",
+        );
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(
+            distinct_ids(&read),
+            N,
+            "count(DISTINCT id) must equal N",
+        );
+        assert_eq!(
+            rows_in(&read),
+            N,
+            "total rows read back must equal N (no duplicate, no loss)",
+        );
+
+        std::env::remove_var("BASIN_SHARD_FLUSH_CONCURRENCY");
+        std::env::remove_var("BASIN_FASTAGG_COMPACT_TIMEOUT_MS");
     }
 }
