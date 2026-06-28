@@ -436,6 +436,28 @@ impl Shard {
         self.inner.flush_to_parquet().await
     }
 
+    /// Boot-time recovery for the durable-but-uncompacted tail.
+    ///
+    /// A row is made WAL-durable on the write path before it is compacted into
+    /// a committed catalog segment. `count(*)`/`max(id)` (the fast-aggregate
+    /// path) read only committed segments. If a node restarts while a
+    /// partition's tail was WAL-durable but not yet compacted — e.g. compaction
+    /// PUTs to object storage were wedged, so the drain erred BEFORE the catalog
+    /// commit / WAL truncate — that tail stays in the WAL but is invisible to
+    /// `count(*)`: the reopened shard's resident partition map is empty and
+    /// every count/compact path is resident-only, so the partition is only
+    /// faulted in (and drained) lazily on the next WRITE to it. Until then the
+    /// rows are durable yet uncounted.
+    ///
+    /// `recover_all` closes that window: for every WAL-known partition this
+    /// node owns it forces `get` (→ WAL replay into a resident tail) and a
+    /// bounded compaction (→ commits the replayed tail to catalog segments and
+    /// truncates the WAL), with no write required. Call it once at boot, after
+    /// the shard is constructed and before the first read is served.
+    pub async fn recover_all(&self) -> Result<()> {
+        self.inner.recover_all().await
+    }
+
     /// Read-freshness drain for the metadata-aggregate fast path
     /// (`count(*)`/`max`) that does NOT block behind an in-flight write-path
     /// compaction. See [`ShardImpl::flush_to_parquet_for_read`]. Use this on
@@ -901,6 +923,12 @@ pub(crate) trait ShardImpl: Send + Sync {
     /// (multi-node bulk-ingest forwarding). `None` in single-replica / no-lease
     /// mode.
     fn lease_registry(&self) -> Option<&Arc<dyn basin_catalog::LeaseRegistry>>;
+    /// Boot-time recovery: FORCE-replay + drain every WAL-known partition this
+    /// node owns. See [`Shard::recover_all`]. Default no-op for backends
+    /// without a WAL-backed in-memory tail.
+    async fn recover_all(&self) -> Result<()> {
+        Ok(())
+    }
     async fn flush_to_parquet(&self) -> Result<()>;
     /// Read-freshness drain for the metadata-aggregate fast path that is
     /// NON-BLOCKING w.r.t. the write path: a partition currently being

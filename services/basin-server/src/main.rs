@@ -605,6 +605,21 @@ async fn run() -> Result<()> {
             );
         }
         let shard = basin_shard::Shard::new(shard_cfg);
+        // Boot-time recovery for the durable-but-uncompacted tail: FORCE-replay
+        // + drain every WAL-known partition this node owns before the first
+        // read is served. Without this, rows that were WAL-durable but never
+        // compacted before a restart (e.g. compaction PUTs were wedged, so the
+        // drain erred before the catalog commit / WAL truncate) stay in the WAL
+        // but are invisible to `count(*)` until a write happens to fault the
+        // partition back in. Non-fatal: a recovery error is logged and the
+        // background compactor / next write retries.
+        if let Err(e) = shard.recover_all().await {
+            tracing::warn!(
+                error = %e,
+                "shard boot recovery (recover_all) failed; durable-but-uncompacted \
+                 tails will be drained lazily on the next write / background tick"
+            );
+        }
         let bg = shard.spawn_background();
         tracing::info!(
             wal_dir = %cfg.wal_dir.display(),

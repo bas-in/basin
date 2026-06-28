@@ -733,6 +733,16 @@ impl WalImpl for FileWal {
         Ok(guard.high_water())
     }
 
+    #[tracing::instrument(skip(self))]
+    async fn list_partitions(&self) -> Result<Vec<(ProjectId, PartitionKey)>> {
+        // The partition map is seeded from the backing store at `open`
+        // (`recover_partitions`) and extended lazily as partitions are touched,
+        // so its keys are exactly the WAL-known partitions. Snapshot under the
+        // read lock (no store I/O).
+        let map = self.inner.partitions.read().await;
+        Ok(map.keys().cloned().collect())
+    }
+
     #[tracing::instrument(skip(self), fields(project=%project, partition=%partition, %up_to))]
     async fn truncate(
         &self,

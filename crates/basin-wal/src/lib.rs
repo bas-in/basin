@@ -489,6 +489,17 @@ pub trait Wal: Send + Sync + std::fmt::Debug {
     /// Latest LSN for `(project, partition)`. `Lsn::ZERO` means no entries.
     async fn high_water(&self, project: &ProjectId, partition: &PartitionKey) -> Result<Lsn>;
 
+    /// Every `(project, partition)` the WAL currently knows about — the set
+    /// rebuilt from the backing store at open (`recover_partitions`) plus any
+    /// touched since. Used by shard cold-start recovery to FORCE-replay every
+    /// WAL-known partition (not just the ones lazily faulted in by a write), so
+    /// rows that are WAL-durable but never compacted before a restart become
+    /// visible without waiting for a write to that partition. Default returns
+    /// an empty list for backends that don't enumerate partitions.
+    async fn list_partitions(&self) -> Result<Vec<(ProjectId, PartitionKey)>> {
+        Ok(Vec::new())
+    }
+
     /// Drop all entries for `(project, partition)` whose LSN is strictly
     /// less than or equal to `up_to`. Called by the compactor after the
     /// segment has been merged into Parquet and committed to the catalog.
@@ -724,6 +735,10 @@ impl Wal for LocalWal {
         self.inner.high_water(project, partition).await
     }
 
+    async fn list_partitions(&self) -> Result<Vec<(ProjectId, PartitionKey)>> {
+        self.inner.list_partitions().await
+    }
+
     async fn truncate(
         &self,
         project: &ProjectId,
@@ -853,6 +868,11 @@ pub(crate) trait WalImpl: Send + Sync {
         since_lsn: Lsn,
     ) -> Result<Vec<WalEntry>>;
     async fn high_water(&self, project: &ProjectId, partition: &PartitionKey) -> Result<Lsn>;
+    /// See [`Wal::list_partitions`]. Default returns an empty list for backends
+    /// that don't enumerate partitions.
+    async fn list_partitions(&self) -> Result<Vec<(ProjectId, PartitionKey)>> {
+        Ok(Vec::new())
+    }
     async fn truncate(
         &self,
         project: &ProjectId,

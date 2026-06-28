@@ -1910,6 +1910,57 @@ impl InProcessShard {
             }
         }
         if !any_pending {
+            // Self-heal the durable-but-not-resident tail: a WAL-known partition
+            // that is NOT resident (e.g. the node restarted while its tail was
+            // WAL-durable but uncompacted, so no write has faulted it back in)
+            // holds rows that `count(*)` cannot see. `recover_all` does this at
+            // boot; this catches the case where a partition was never faulted in
+            // (or was evicted) after a restart. Cheap when everything is already
+            // recovered: a resident-or-already-truncated partition replays an
+            // empty above-watermark set and compacts to a no-op.
+            let resident: std::collections::HashSet<(ProjectId, PartitionKey)> = {
+                let map = self.partitions.lock().await;
+                map.keys().cloned().collect()
+            };
+            let known = self.cfg.wal.list_partitions().await.unwrap_or_default();
+            let owned: Option<std::collections::HashSet<(ProjectId, PartitionKey)>> =
+                if self.cfg.lease_registry.is_some() {
+                    let h = self.held_leases.lock().await;
+                    Some(h.keys().cloned().collect())
+                } else {
+                    None
+                };
+            let missing: Vec<(ProjectId, PartitionKey)> = known
+                .into_iter()
+                .filter(|k| !resident.contains(k))
+                .filter(|k| owned.as_ref().map(|o| o.contains(k)).unwrap_or(true))
+                .collect();
+            if missing.is_empty() {
+                return Ok(());
+            }
+            // Re-check idleness before doing the heal work.
+            if self.ingest_rate.rows_per_sec() > 0 {
+                return Ok(());
+            }
+            for (project, partition) in missing {
+                let state = match self.get(&project, &partition).await {
+                    Ok(_) => {
+                        let map = self.partitions.lock().await;
+                        map.get(&(project, partition.clone())).cloned()
+                    }
+                    Err(e) => {
+                        warn!(%project, %partition, error = %e,
+                            "quiesce self-heal: fault-in failed; next tick retries");
+                        None
+                    }
+                };
+                if let Some(state) = state {
+                    if let Err(e) = self.compact_one(&project, &partition, state).await {
+                        warn!(%project, %partition, error = %e,
+                            "quiesce self-heal: drain failed; next tick retries");
+                    }
+                }
+            }
             return Ok(());
         }
         // Re-check idleness right before doing work: a write may have landed
@@ -3967,6 +4018,89 @@ impl ShardImpl for InProcessShard {
 
     fn lease_registry(&self) -> Option<&Arc<dyn basin_catalog::LeaseRegistry>> {
         self.cfg.lease_registry.as_ref()
+    }
+
+    async fn recover_all(&self) -> Result<()> {
+        // Enumerate every partition the WAL knows about (rebuilt from the
+        // backing store at open). These are the partitions whose tail may be
+        // WAL-durable but not yet compacted into a committed segment — the
+        // ones a restart would otherwise leave invisible to `count(*)` until a
+        // write faulted them back in.
+        let known = self.cfg.wal.list_partitions().await?;
+        if known.is_empty() {
+            return Ok(());
+        }
+        // Ownership filter (multi-node): when a lease registry is configured,
+        // only the partition's lease holder may compact + commit it (a
+        // non-owner racing the owner's catalog commit is the "lost commit race"
+        // failure). Mirror `compact_all`'s gate: recover only partitions this
+        // node currently holds a lease for. In no-lease mode
+        // (`lease_registry == None` — the default and the BASIN_LEASE_MODE=off
+        // deployment) there is no ownership concept and this node is the sole
+        // writer, so recover every WAL-known partition.
+        let owned: Option<std::collections::HashSet<(ProjectId, PartitionKey)>> =
+            if self.cfg.lease_registry.is_some() {
+                let h = self.held_leases.lock().await;
+                Some(h.keys().cloned().collect())
+            } else {
+                None
+            };
+
+        let mut recovered = 0usize;
+        for (project, partition) in known {
+            if let Some(owned) = &owned {
+                if !owned.contains(&(project, partition.clone())) {
+                    continue;
+                }
+            }
+            // Force the partition resident: `get` -> `load_or_create` replays
+            // the WAL (above the durable compaction watermark) into a fresh
+            // in-memory tail. Holding the handle here keeps the state pinned
+            // through the drain below.
+            let state = {
+                let map = self.partitions.lock().await;
+                map.get(&(project, partition.clone())).cloned()
+            };
+            let state = match state {
+                Some(s) => s,
+                None => {
+                    // Not resident: fault it in via the same cold-load path a
+                    // write would use (WAL replay). `get` may acquire a writer
+                    // lease in lease mode — correct, since we already filtered
+                    // to owned partitions.
+                    let _ = self.get(&project, &partition).await?;
+                    let map = self.partitions.lock().await;
+                    match map.get(&(project, partition.clone())).cloned() {
+                        Some(s) => s,
+                        None => continue,
+                    }
+                }
+            };
+            // Drain the replayed tail into committed catalog segments (and
+            // truncate the WAL through the compacted LSN). Blocking compaction
+            // (skip_if_locked == false) so we observe a fully drained tail.
+            // A per-partition failure (e.g. the store is still wedged) must not
+            // abort recovery of the others — log and continue; the next write
+            // or background tick retries.
+            if let Err(e) = self.compact_one(&project, &partition, state).await {
+                warn!(
+                    %project,
+                    %partition,
+                    error = %e,
+                    "recover_all: compaction of replayed tail failed; \
+                     partition stays resident for the next tick to retry",
+                );
+            } else {
+                recovered += 1;
+            }
+        }
+        if recovered > 0 {
+            tracing::info!(
+                partitions = recovered,
+                "recover_all: replayed + drained WAL-known partitions on boot",
+            );
+        }
+        Ok(())
     }
 
     fn set_top_pattern_provider(&self, provider: Arc<dyn TopPatternProvider>) {
@@ -9364,6 +9498,315 @@ mod tests {
         assert_eq!(
             count, fx.acked,
             "recovered count must equal acked count EXACTLY — no loss and no duplicate"
+        );
+    }
+
+    /// Object store that FAILS every PUT while `wedged` is true, delegating all
+    /// other ops to an inner store. Models the cloud incident where compaction
+    /// / flush PUTs to the DATA object store were wedged for ~13 min: a write's
+    /// segment never reaches a committed catalog file, but the rows are already
+    /// WAL-durable (the WAL has its own, healthy store). Flip `wedged` to false
+    /// to model the wedge clearing after a node restart.
+    #[derive(Debug)]
+    struct WedgeablePutStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        wedged: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::fmt::Display for WedgeablePutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "WedgeablePutStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for WedgeablePutStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if self.wedged.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "WedgeablePutStore",
+                    source: "data store wedged (compaction PUTs failing)".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            if self.wedged.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "WedgeablePutStore",
+                    source: "data store wedged (compaction PUTs failing)".into(),
+                });
+            }
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Total committed (segment) row count for `(project, table)` — exactly what
+    /// the `count(*)` fast-aggregate path reads (`Catalog::live_data_files`).
+    /// The in-memory tail is NOT counted (it is not yet a committed segment).
+    async fn committed_count(catalog: &Arc<InMemoryCatalog>, project: &ProjectId, table: &TableName) -> u64 {
+        use basin_catalog::Catalog;
+        match catalog.load_table(project, table).await {
+            Ok(m) => m.live_data_files().iter().map(|f| f.row_count).sum(),
+            Err(_) => 0,
+        }
+    }
+
+    /// REPRODUCTION of the multi-node restart-recovery data-visibility incident
+    /// (object-store catalog, BASIN_LEASE_MODE=off): a durable fan-out COPY runs
+    /// while the DATA object store is wedged so no partition tail ever compacts
+    /// to a committed segment. The rows are WAL-durable (the COPY barrier
+    /// succeeds), but `count(*)` — which reads committed segments only — under-
+    /// counts. After a node restart (drop the shard + WAL, reopen fresh over the
+    /// SAME WAL dir + storage) the reopened shard's resident partition map is
+    /// empty and every count/compact path is resident-only, so the rows stay
+    /// invisible even after the wedge clears — UNTIL `recover_all` force-replays
+    /// + drains every WAL-known partition.
+    ///
+    /// This test pins:
+    ///   1. The rows ARE in the WAL after reopen (recoverable, not lost).
+    ///   2. WITHOUT `recover_all`, `count(*)` < N after reopen (bug reproduced).
+    ///   3. WITH `recover_all`, `count(*)` == N and an uncompacted id reads back.
+    #[tokio::test]
+    async fn restart_recovers_wal_durable_uncompacted_tail() {
+        basin_common::telemetry::try_init_for_tests();
+
+        // N rows across the default fan-out partitions, durable=true.
+        let n: usize = 200_000;
+        let per: usize = 10_000;
+        let n_batches = n / per; // 20 batches
+
+        let storage_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+
+        // DATA store: wedged so compaction PUTs fail (no committed segment).
+        let wedged = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let data_fs: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap());
+        let data_store: Arc<dyn object_store::ObjectStore> = Arc::new(WedgeablePutStore {
+            inner: data_fs,
+            wedged: wedged.clone(),
+        });
+        let storage = Storage::new(StorageConfig {
+            object_store: data_store,
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog = Arc::new(InMemoryCatalog::new());
+
+        let project = ProjectId::new();
+        let table = TableName::new("c100m").unwrap();
+        let parts: Vec<PartitionKey> = vec![
+            PartitionKey::default_key(),
+            PartitionKey::new("s1".to_string()).unwrap(),
+            PartitionKey::new("s2".to_string()).unwrap(),
+            PartitionKey::new("s3".to_string()).unwrap(),
+        ];
+        let fanout = parts.len();
+
+        // WAL store: healthy LocalFileSystem (the WAL has its own store, so
+        // appends are durable even while the DATA store is wedged).
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
+                root_prefix: None,
+                // Real flush cadence so synchronous (durable=true) appends ack
+                // after a real segment PUT to the WAL store.
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
+            })
+            .await
+            .unwrap(),
+        );
+
+        let shard =
+            crate::Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+
+        // Durable fan-out COPY: every batch is ack-after-durable (synchronous
+        // commit). Round-robin whole 10k-row batches across the 4 stripes.
+        let mut per_part_max_lsn: std::collections::HashMap<PartitionKey, Lsn> =
+            std::collections::HashMap::new();
+        for i in 0..n_batches {
+            let part = &parts[i % fanout];
+            let handle = shard.get(&project, part).await.unwrap();
+            let start = (i * per) as i64 + 1; // ids 1..=N
+            let lsn = handle
+                .write_batch_opts_lsn(&table, batch(start, per, "v-"), true)
+                .await
+                .unwrap();
+            let e = per_part_max_lsn.entry(part.clone()).or_insert(lsn);
+            if *e < lsn {
+                *e = lsn;
+            }
+        }
+        // End-of-COPY durable barrier (what the router's on_copy_done runs):
+        // every touched partition durable through its max LSN before the COPY
+        // is acked. This succeeds because the WAL store is healthy.
+        for (part, lsn) in &per_part_max_lsn {
+            shard
+                .get(&project, part)
+                .await
+                .unwrap()
+                .await_durable(*lsn)
+                .await
+                .unwrap();
+        }
+
+        // The wedge means NOTHING compacted: committed count is 0 (or far < N).
+        let committed_before = committed_count(&catalog, &project, &table).await;
+        assert!(
+            committed_before < n as u64,
+            "precondition: with the data store wedged, count(*) must under-count \
+             (committed {committed_before}, wrote {n})"
+        );
+
+        // Crash the node: drop the shard handle and CLOSE the WAL (flushes any
+        // buffered segment to the healthy WAL store, exactly as a clean process
+        // teardown would; the durable barrier already made every row durable).
+        drop(shard);
+        wal.close().await.unwrap();
+        drop(wal);
+
+        // === RESTART: reopen a fresh WAL + shard over the SAME wal dir + the
+        // same storage/catalog (the shared object-store catalog the peers see).
+        let wal2: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
+                root_prefix: None,
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
+            })
+            .await
+            .unwrap(),
+        );
+
+        // DEFINITIVE WAL CHECK: are the rows still in the reopened WAL?
+        let mut wal_rows = 0usize;
+        for part in &parts {
+            let entries = wal2.read_from(&project, part, Lsn::ZERO).await.unwrap();
+            for e in &entries {
+                let (_t, batches) = decode_payload(&e.payload).unwrap();
+                wal_rows += batches.iter().map(|b| b.num_rows()).sum::<usize>();
+            }
+        }
+        assert_eq!(
+            wal_rows, n,
+            "RECOVERABILITY: every acked row must still be in the reopened WAL \
+             (found {wal_rows}, expected {n}) — the rows are NOT lost",
+        );
+
+        // Un-wedge the data store: the incident's wedge has cleared. Compaction
+        // PUTs can now succeed.
+        wedged.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let shard2 =
+            crate::Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal2.clone()));
+
+        // BUG REPRODUCTION: without recover_all, no write to the lost
+        // partitions, the resident map is empty, so count(*) still under-counts
+        // even though the wedge cleared and the rows are WAL-durable.
+        let committed_after_reopen = committed_count(&catalog, &project, &table).await;
+        assert!(
+            committed_after_reopen < n as u64,
+            "BUG: after reopen (no recover_all, no write) count(*) must still \
+             under-count — got {committed_after_reopen}, wrote {n}",
+        );
+
+        // === THE FIX: recover_all force-replays + drains every WAL-known
+        // partition this node owns (no-lease mode -> all of them).
+        shard2.recover_all().await.unwrap();
+
+        let committed_after_recover = committed_count(&catalog, &project, &table).await;
+        assert_eq!(
+            committed_after_recover, n as u64,
+            "FIX: recover_all must make count(*) == N (got {committed_after_recover}, \
+             wrote {n}) — every WAL-durable row drained into committed segments",
+        );
+
+        // Point lookup of a known previously-uncompacted id must return 1 row.
+        // A handle's `read` returns the table-wide committed files (plus its own
+        // tail), so reading from ONE handle sees the whole committed set exactly
+        // once — iterating every partition would re-scan the same committed row
+        // per partition.
+        let probe_id: i64 = (n as i64) - 3; // a high id in the last batch
+        let probe_handle = shard2.get_for_read(&project, &parts[0]).await.unwrap();
+        let mut hits = 0usize;
+        for b in probe_handle
+            .read(&table, ReadOptions::default())
+            .await
+            .unwrap()
+        {
+            let ids = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id col is Int64");
+            for i in 0..ids.len() {
+                if ids.value(i) == probe_id {
+                    hits += 1;
+                }
+            }
+        }
+        assert_eq!(
+            hits, 1,
+            "point lookup of a recovered uncompacted id ({probe_id}) must return \
+             exactly one row (got {hits})",
         );
     }
 }
