@@ -259,6 +259,36 @@ fn compaction_encoding_mode() -> basin_storage::EncodingMode {
     }
 }
 
+/// Hard upper bound on how long a metadata-aggregate READ will wait for the
+/// opportunistic read-path compaction drain (`compact_all_for_read`) before it
+/// gives up and answers from the already-committed catalog state.
+///
+/// The read path runs compaction only OPPORTUNISTICALLY (to keep the file count
+/// bounded between background ticks); the `count(*)`/`max` answer itself comes
+/// from `Catalog::live_data_files()`, which already reflects the last COMMITTED
+/// segment state and never needs the in-flight drain (see
+/// `compact_all_for_read`). So if the drain stalls — e.g. an object-store PUT is
+/// wedged, the cloud incident where a `SELECT 1` blocked 764 s because every
+/// resident partition's read-path compaction awaited a 60–243 s PUT timeout —
+/// the read must NOT inherit that latency. After this bound elapses the query
+/// proceeds and reads committed state; the abandoned drain is harmless (it held
+/// only the per-partition compaction lock, which the next background tick /
+/// quiesce-drain re-acquires) and the residual tail it failed to commit converges
+/// via the background compactor (`BASIN_STRIPE_MERGE_SECS`) + `quiesce_drain`.
+///
+/// `0` disables the bound (await the drain to completion — the legacy behaviour).
+fn read_compaction_timeout() -> Option<std::time::Duration> {
+    let ms = std::env::var("BASIN_FASTAGG_COMPACT_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
+    if ms == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(ms))
+    }
+}
+
 fn flush_concurrency() -> usize {
     if let Ok(v) = std::env::var("BASIN_SHARD_FLUSH_CONCURRENCY") {
         if let Some(n) = v.parse::<usize>().ok().filter(|n| *n > 0) {
@@ -4185,9 +4215,36 @@ impl ShardImpl for InProcessShard {
             Ok("1") | Ok("true")
         );
         if blocking {
-            self.compact_all().await
-        } else {
-            self.compact_all_for_read().await
+            return self.compact_all().await;
+        }
+        // The read-path drain is OPPORTUNISTIC: its only job is to keep the file
+        // count bounded between background ticks. The `count(*)`/`max` answer
+        // comes from the committed catalog (`live_data_files`), which never needs
+        // this drain. So bound the drain with a short timeout: if it stalls (a
+        // wedged object-store PUT — the incident where a `SELECT 1` blocked 764 s
+        // because every resident partition's read-path compaction awaited a
+        // 60–243 s PUT timeout), the read STOPS waiting and answers from committed
+        // state instead of inheriting the PUT latency. A bounded drain neither
+        // fails the read (a timeout is not an error) nor loses data: the residual
+        // tail the abandoned drain didn't commit stays WAL-durable and converges
+        // via the background compactor (`BASIN_STRIPE_MERGE_SECS`) + `quiesce_drain`.
+        // `BASIN_FASTAGG_COMPACT_TIMEOUT_MS=0` restores the un-bounded await.
+        match read_compaction_timeout() {
+            Some(bound) => {
+                match tokio::time::timeout(bound, self.compact_all_for_read()).await {
+                    Ok(res) => res,
+                    Err(_elapsed) => {
+                        warn!(
+                            timeout_ms = bound.as_millis() as u64,
+                            "read-path compaction drain exceeded its bound; answering \
+                             from committed catalog state (the residual tail converges \
+                             via the background compactor + quiesce-drain)",
+                        );
+                        Ok(())
+                    }
+                }
+            }
+            None => self.compact_all_for_read().await,
         }
     }
 
@@ -9519,21 +9576,46 @@ mod tests {
         );
     }
 
-    /// Object store that FAILS every PUT while `wedged` is true, delegating all
-    /// other ops to an inner store. Models the cloud incident where compaction
-    /// / flush PUTs to the DATA object store were wedged for ~13 min: a write's
-    /// segment never reaches a committed catalog file, but the rows are already
-    /// WAL-durable (the WAL has its own, healthy store). Flip `wedged` to false
-    /// to model the wedge clearing after a node restart.
+    /// Object store that DISRUPTS every PUT while `wedged` is true, delegating
+    /// all other ops to an inner store. Models the cloud incident where
+    /// compaction / flush PUTs to the DATA object store were wedged for ~13 min:
+    /// a write's segment never reaches a committed catalog file, but the rows are
+    /// already WAL-durable (the WAL has its own, healthy store). Flip `wedged` to
+    /// false to model the wedge clearing after a node restart.
+    ///
+    /// `hang` selects the failure mode: when false (default) a wedged PUT fails
+    /// fast (a `Generic` error); when true it HANGS forever (never resolves),
+    /// modelling the actual incident where each PUT stalled for 60–243 s — the
+    /// shape that made a `SELECT 1` block 764 s on the read path.
     #[derive(Debug)]
     struct WedgeablePutStore {
         inner: Arc<dyn object_store::ObjectStore>,
         wedged: Arc<std::sync::atomic::AtomicBool>,
+        hang: bool,
     }
 
     impl std::fmt::Display for WedgeablePutStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "WedgeablePutStore({})", self.inner)
+        }
+    }
+
+    impl WedgeablePutStore {
+        /// Resolves to a wedge action ONLY while wedged; otherwise returns None
+        /// so the caller delegates to the inner store. Hangs in place (never
+        /// returns) in `hang` mode; otherwise yields a fast Generic error.
+        async fn wedge_block<T>(&self) -> Option<object_store::Result<T>> {
+            if !self.wedged.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            if self.hang {
+                // Model a PUT that never completes (the 60–243 s incident stall).
+                std::future::pending::<()>().await;
+            }
+            Some(Err(object_store::Error::Generic {
+                store: "WedgeablePutStore",
+                source: "data store wedged (compaction PUTs failing)".into(),
+            }))
         }
     }
 
@@ -9545,11 +9627,8 @@ mod tests {
             payload: object_store::PutPayload,
             opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            if self.wedged.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(object_store::Error::Generic {
-                    store: "WedgeablePutStore",
-                    source: "data store wedged (compaction PUTs failing)".into(),
-                });
+            if let Some(blocked) = self.wedge_block().await {
+                return blocked;
             }
             self.inner.put_opts(location, payload, opts).await
         }
@@ -9559,11 +9638,8 @@ mod tests {
             location: &object_store::path::Path,
             opts: object_store::PutMultipartOpts,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            if self.wedged.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(object_store::Error::Generic {
-                    store: "WedgeablePutStore",
-                    source: "data store wedged (compaction PUTs failing)".into(),
-                });
+            if let Some(blocked) = self.wedge_block().await {
+                return blocked;
             }
             self.inner.put_multipart_opts(location, opts).await
         }
@@ -9657,6 +9733,7 @@ mod tests {
         let data_store: Arc<dyn object_store::ObjectStore> = Arc::new(WedgeablePutStore {
             inner: data_fs,
             wedged: wedged.clone(),
+            hang: false,
         });
         let storage = Storage::new(StorageConfig {
             object_store: data_store,
@@ -9825,6 +9902,126 @@ mod tests {
             hits, 1,
             "point lookup of a recovered uncompacted id ({probe_id}) must return \
              exactly one row (got {hits})",
+        );
+    }
+
+    /// READ-PATH NON-BLOCK GATE (the 764 s `SELECT 1` incident): a
+    /// metadata-aggregate read (`count(*)`) runs `flush_to_parquet_for_read`,
+    /// whose opportunistic compaction drain `await`s an object-store PUT per
+    /// resident partition. On the live cluster those PUTs were WEDGED (each
+    /// stalling 60–243 s), so the read inherited the stall and a `SELECT 1` took
+    /// 764 s. This pins the fix: with the DATA store wedged so every compaction
+    /// PUT HANGS, the read-path flush must RETURN PROMPTLY (bounded by
+    /// `BASIN_FASTAGG_COMPACT_TIMEOUT_MS`, default 300 ms) and the committed
+    /// count it answers from must remain CORRECT — exactly the rows that
+    /// committed before the wedge, neither blocking nor erroring on the hung PUT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn read_flush_does_not_block_on_wedged_compaction_put() {
+        let storage_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+
+        // DATA store wraps a healthy LocalFS; `wedged=false` initially so the
+        // first compaction commits real segments. `hang=true` so that, once
+        // wedged, every PUT stalls forever (the incident shape).
+        let wedged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let data_fs: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap());
+        let data_store: Arc<dyn object_store::ObjectStore> = Arc::new(WedgeablePutStore {
+            inner: data_fs,
+            wedged: wedged.clone(),
+            hang: true,
+        });
+        let storage = Storage::new(StorageConfig {
+            object_store: data_store,
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let wal: Arc<dyn Wal> = Arc::new(
+            LocalWal::open(WalConfig {
+                object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
+                root_prefix: None,
+                flush_interval: Duration::from_millis(50),
+                flush_max_bytes: 1024 * 1024,
+                commit_delay: Duration::from_millis(2),
+            })
+            .await
+            .unwrap(),
+        );
+
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        let shard = crate::Shard::new(ShardConfig::new(
+            storage.clone(),
+            catalog.clone(),
+            wal.clone(),
+        ));
+
+        // Phase 1 (store HEALTHY): write a tail and compact it into a committed
+        // segment. This is the "last committed segment state" the read path must
+        // keep returning while the store is later wedged.
+        const COMMITTED: usize = 50;
+        let handle = shard.get(&project, &partition).await.unwrap();
+        handle
+            .write_batch(&table, batch(1, COMMITTED, "v-"))
+            .await
+            .unwrap();
+        shard.flush_to_parquet().await.unwrap();
+        let committed = committed_count(&catalog, &project, &table).await;
+        assert_eq!(
+            committed, COMMITTED as u64,
+            "precondition: the healthy-store compaction must commit {COMMITTED} rows \
+             (got {committed})",
+        );
+
+        // Phase 2: WEDGE the store, then accumulate a fresh uncompacted tail.
+        // Any compaction PUT now hangs forever.
+        wedged.store(true, std::sync::atomic::Ordering::SeqCst);
+        handle
+            .write_batch(&table, batch(1_000, 25, "w-"))
+            .await
+            .unwrap();
+
+        // THE GATE: the read-path metadata flush must return PROMPTLY despite the
+        // wedged PUT. We bound the call with a 5 s test watchdog — far above the
+        // 300 ms internal timeout, far below the would-be infinite PUT hang — so a
+        // regression (re-introducing the synchronous await of the wedged PUT)
+        // trips the watchdog instead of hanging the suite.
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            shard.flush_to_parquet_for_read(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            res.is_ok(),
+            "flush_to_parquet_for_read must NOT block on a wedged compaction PUT \
+             (the 764 s SELECT 1 incident); it hung past the 5 s watchdog",
+        );
+        // And it must not surface the wedged PUT as a query error.
+        res.unwrap().expect(
+            "read-path flush must answer from committed state, not error, when the \
+             compaction PUT is wedged",
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "read-path flush should return within the bounded timeout (~300 ms), \
+             took {elapsed:?}",
+        );
+
+        // CORRECTNESS: the committed count is unchanged — exactly the rows that
+        // committed before the wedge. The hung uncompacted tail is not (and need
+        // not be) reflected; it converges via the background compactor once the
+        // store recovers. The read neither blocked nor returned a WRONG count.
+        let after = committed_count(&catalog, &project, &table).await;
+        assert_eq!(
+            after, COMMITTED as u64,
+            "committed count must stay correct under the wedge (got {after}, \
+             want {COMMITTED}) — the read answered from committed catalog state",
         );
     }
 }
