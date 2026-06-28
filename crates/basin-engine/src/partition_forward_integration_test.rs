@@ -40,7 +40,7 @@ use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
 use crate::partition_router::PartitionRouter;
-use crate::write_forwarder::PartitionForwardClient;
+use crate::write_forwarder::{ForwardWriteResult, PartitionForwardClient};
 use crate::{Engine, EngineConfig};
 
 const PEER_A: &str = "http://a:5434";
@@ -135,7 +135,7 @@ impl PartitionForwardClient for InProcDouble {
         partition_id: &str,
         _idem_key: &str,
         batch: RecordBatch,
-    ) -> Result<u64> {
+    ) -> Result<ForwardWriteResult> {
         let engine = self
             .peers
             .get(peer_base_url)
@@ -146,13 +146,16 @@ impl PartitionForwardClient for InProcDouble {
         let handle = shard.get(&project, &part).await?;
         // RAW write — identical to the receiver handler, including the Stage-3
         // durable-on-forward gate: with the barrier engaged (default) the owner
-        // group-commits the batch to its WAL before acking, so a returned
-        // forward implies owner-durability.
+        // group-commits the batch to its WAL before acking, so the returned LSN
+        // is a CONFIRMED durable high-water on the owner (#46 audit).
         let durable = crate::write_forwarder::forward_lands_durable();
-        handle
-            .write_batch_opts(&TableName::new(table.to_owned())?, batch, durable)
+        let lsn = handle
+            .write_batch_opts_lsn(&TableName::new(table.to_owned())?, batch, durable)
             .await?;
-        Ok(rows)
+        Ok(ForwardWriteResult {
+            rows,
+            durable_lsn: Some(lsn),
+        })
     }
 }
 
@@ -406,7 +409,7 @@ async fn back_compat_no_peers_keeps_fanout_local() {
             _partition_id: &str,
             _idem_key: &str,
             _batch: RecordBatch,
-        ) -> Result<u64> {
+        ) -> Result<ForwardWriteResult> {
             panic!("local-only fan-out must NEVER forward");
         }
     }
@@ -461,8 +464,9 @@ async fn back_compat_no_peers_keeps_fanout_local() {
 /// the key and that exactly one physical apply happened.
 struct LostAckDouble {
     target: Engine,
-    /// idem_key → rows applied (dedup map, mirrors the real receiver window).
-    applied: std::sync::Mutex<HashMap<String, u64>>,
+    /// idem_key → (rows, owner durable lsn) applied (dedup map, mirrors the
+    /// real receiver window + the #46 audit's per-batch durable LSN).
+    applied: std::sync::Mutex<HashMap<String, (u64, basin_wal::Lsn)>>,
     /// Every idem_key seen across all calls (incl. retries), in order.
     keys_seen: std::sync::Mutex<Vec<String>>,
     /// How many keys have we already failed-after-apply once (so the retry of
@@ -480,24 +484,30 @@ impl PartitionForwardClient for LostAckDouble {
         partition_id: &str,
         idem_key: &str,
         batch: RecordBatch,
-    ) -> Result<u64> {
+    ) -> Result<ForwardWriteResult> {
         self.keys_seen.lock().unwrap().push(idem_key.to_string());
         let rows = batch.num_rows() as u64;
 
         // Dedup exactly like the receiver: an already-applied key SKIPS the
-        // write and returns the original rowcount.
-        if let Some(&n) = self.applied.lock().unwrap().get(idem_key) {
-            return Ok(n);
+        // write and returns the original rowcount + durable LSN.
+        if let Some(&(n, lsn)) = self.applied.lock().unwrap().get(idem_key) {
+            return Ok(ForwardWriteResult {
+                rows: n,
+                durable_lsn: Some(lsn),
+            });
         }
 
         // First sight of this key: physically write to B (the owner).
         let shard = self.target.shard().expect("target engine has a shard");
         let part = PartitionKey::new(partition_id)?;
         let handle = shard.get(&project, &part).await?;
-        handle
-            .write_batch_opts(&TableName::new(table.to_owned())?, batch, true)
+        let lsn = handle
+            .write_batch_opts_lsn(&TableName::new(table.to_owned())?, batch, true)
             .await?;
-        self.applied.lock().unwrap().insert(idem_key.to_string(), rows);
+        self.applied
+            .lock()
+            .unwrap()
+            .insert(idem_key.to_string(), (rows, lsn));
 
         // LOST ACK: the very first time we see a key we report a transport error
         // AFTER the write committed, forcing the sender to retry. The retry will
@@ -509,7 +519,10 @@ impl PartitionForwardClient for LostAckDouble {
                 "partition-write POST to \"http://owner\" failed: simulated lost ack".to_string(),
             ));
         }
-        Ok(rows)
+        Ok(ForwardWriteResult {
+            rows,
+            durable_lsn: Some(lsn),
+        })
     }
 }
 
@@ -572,7 +585,7 @@ async fn lost_ack_retry_reuses_key_and_applies_exactly_once() {
     let keys = double.keys_seen.lock().unwrap().clone();
     let applied = double.applied.lock().unwrap();
     // Each distinct forwarded batch was applied exactly once.
-    for (k, &rows) in applied.iter() {
+    for (k, &(rows, _lsn)) in applied.iter() {
         let seen = keys.iter().filter(|x| *x == k).count();
         assert!(
             seen >= 2,
@@ -721,7 +734,7 @@ impl PartitionForwardClient for DurabilityProbingDouble {
         partition_id: &str,
         _idem_key: &str,
         batch: RecordBatch,
-    ) -> Result<u64> {
+    ) -> Result<ForwardWriteResult> {
         let engine = self
             .peers
             .get(peer_base_url)
@@ -739,7 +752,10 @@ impl PartitionForwardClient for DurabilityProbingDouble {
             .write_batch_opts_lsn(&TableName::new(table.to_owned())?, batch, durable)
             .await?;
         self.landed.lock().unwrap().push((part, lsn));
-        Ok(rows)
+        Ok(ForwardWriteResult {
+            rows,
+            durable_lsn: Some(lsn),
+        })
     }
 }
 
@@ -834,6 +850,143 @@ async fn forwarded_copy_batch_is_durable_on_owner_before_ack() {
             })
             .unwrap();
     }
+
+    std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
+}
+
+/// #46 END-TO-END DURABILITY AUDIT (gate): a 2-node forwarded durable COPY,
+/// driven through the real COPY entry point (`ingest_csv_batch` → the audit
+/// accumulator), must account for ALL acked rows — `rows_durable_confirmed ==
+/// rows_acked` — and every touched partition (LOCAL and FORWARDED) must carry a
+/// non-null CONFIRMED durable LSN. This is what makes a future ingest data-loss
+/// incident self-diagnosing: the audit's accounting is the smoking-gun signal.
+#[tokio::test]
+async fn copy_durability_audit_accounts_for_every_acked_row_across_nodes() {
+    let _env = FANOUT_ENV_LOCK.lock().unwrap();
+    std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
+    // The audit only proves owner-durability when the durable-on-forward gate is
+    // ON (the process default). Assert it so the gate is meaningful.
+    assert!(
+        crate::write_forwarder::forward_lands_durable(),
+        "default: forwarded writes land durable on the owner (barrier on)"
+    );
+
+    let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = Arc::new(InMemoryCatalog::new());
+    let eng_a = engine_for(cold.clone(), catalog.clone(), PEER_A).await;
+    let eng_b = engine_for(cold.clone(), catalog.clone(), PEER_B).await;
+
+    let peers = vec![PEER_A.to_string(), PEER_B.to_string()];
+    eng_a.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_A));
+    eng_b.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_B));
+
+    // A's transport delivers into B (faithful to the receive route, returning
+    // the owner's confirmed durable LSN — see `InProcDouble`).
+    let mut map = HashMap::new();
+    map.insert(PEER_A.to_string(), eng_a.clone());
+    map.insert(PEER_B.to_string(), eng_b.clone());
+    eng_a.attach_partition_forward_client(Arc::new(InProcDouble { peers: map }));
+
+    let sess_a = eng_a.open_session(ProjectId::new()).await.unwrap();
+    let project = sess_a.project();
+    sess_a.execute("CREATE TABLE t (id BIGINT)").await.unwrap();
+
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+
+    // Drive 8 multi-row COPY batches through the REAL COPY path (`ingest_csv_batch`
+    // → the audit). The round-robin cursor visits every stripe; some land locally
+    // on A, some forward to B. 10 rows/batch (>1 → fan-out engages).
+    let per = 10usize;
+    let n_batches = 8usize;
+    let mut acked: u64 = 0;
+    for i in 0..n_batches {
+        let base = (i * per) as i64;
+        let rows: Vec<Vec<Option<String>>> = (0..per)
+            .map(|k| vec![Some((base + k as i64).to_string())])
+            .collect();
+        acked += sess_a
+            .ingest_csv_batch("t", schema.clone(), None, rows)
+            .await
+            .unwrap();
+    }
+
+    // Snapshot the audit BEFORE the end-of-COPY barrier drains it.
+    let audit = sess_a.copy_audit_snapshot().await;
+
+    // (1) Every acked row is tied to a CONFIRMED durable owner LSN.
+    assert_eq!(
+        audit.rows_acked, acked,
+        "audit must count every acked row (acked {acked}, audit {})",
+        audit.rows_acked
+    );
+    assert_eq!(
+        audit.rows_durable_confirmed, audit.rows_acked,
+        "EVERY acked row must be confirmed durable on its owner \
+         (confirmed {}, acked {})",
+        audit.rows_durable_confirmed, audit.rows_acked
+    );
+
+    // (2) Every touched partition — LOCAL and FORWARDED — carries a non-null
+    //     confirmed durable LSN, and the per-partition rows sum to the acked
+    //     total (no partition is unaccounted).
+    assert_eq!(
+        audit.partitions.len(),
+        n_batches,
+        "the fan-out visited all {n_batches} stripes"
+    );
+    let mut forwarded_seen = false;
+    let mut local_seen = false;
+    let mut summed: u64 = 0;
+    for (part, rec) in &audit.partitions {
+        assert!(
+            rec.durable_lsn.is_some(),
+            "touched partition {} has NO confirmed durable LSN — durability \
+             audit shortfall (owner={}, forwarded={})",
+            part.as_str(),
+            rec.owner,
+            rec.forwarded
+        );
+        if rec.forwarded {
+            forwarded_seen = true;
+            assert_eq!(
+                rec.owner, PEER_B,
+                "forwarded partition {} must report owner B",
+                part.as_str()
+            );
+        } else {
+            local_seen = true;
+            assert_eq!(
+                rec.owner, "local",
+                "local partition {} must report owner=local",
+                part.as_str()
+            );
+        }
+        summed += rec.rows;
+    }
+    assert!(
+        forwarded_seen,
+        "router put no partitions on B — forwarded limb of the audit not exercised"
+    );
+    assert!(
+        local_seen,
+        "router put no partitions on A — local limb of the audit not exercised"
+    );
+    assert_eq!(
+        summed, audit.rows_acked,
+        "per-partition rows must sum to the acked total (summed {summed}, acked {})",
+        audit.rows_acked
+    );
+
+    // The barrier drains the audit (and the touched set); a second snapshot is
+    // empty — no leakage into a subsequent COPY on the same session.
+    sess_a.await_copy_durable().await.unwrap();
+    let after = sess_a.copy_audit_snapshot().await;
+    assert_eq!(after.rows_acked, 0, "await_copy_durable must drain the audit");
+    assert!(after.partitions.is_empty(), "audit partitions must be cleared");
 
     std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
 }
@@ -1333,7 +1486,7 @@ impl PartitionForwardClient for AlwaysFailForward {
         _partition_id: &str,
         _idem_key: &str,
         _batch: RecordBatch,
-    ) -> Result<u64> {
+    ) -> Result<ForwardWriteResult> {
         *self.attempts.lock().unwrap() += 1;
         // A hard, NON-transient failure: the owner is gone / refused and nothing
         // was written. Deliberately not one of the retry-eligible markers

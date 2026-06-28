@@ -23,8 +23,11 @@
 //!     always `1`. The receiver rejects `hop != 1` (loop guard: it must never
 //!     re-forward, which would let A→B→A spin).
 //!   - `x-basin-forward-secret`    — the shared secret (constant-time checked).
-//! * Response: the rowcount written, as a bare JSON number (mirrors the
-//!   sender's `text.trim().parse::<u64>()` decode).
+//! * Response: a JSON object `{"rows":N,"durable_lsn":M}` (#46 durability
+//!   audit) — the rows committed AND the owner's confirmed durable WAL
+//!   high-water LSN for the partition after the write. The sender
+//!   ([`basin_engine::write_forwarder::HttpPartitionForwardClient`]) decodes
+//!   either this object or a bare number (back-compat with a pre-audit peer).
 //!
 //! # Why no constraint re-check
 //!
@@ -275,19 +278,6 @@ pub(crate) async fn post_partition_write(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    if let Some(key) = idem_key.as_deref() {
-        match IdemWindow::global().claim(key, rows) {
-            IdemClaim::AlreadyApplied(n) | IdemClaim::InFlightDuplicate(n) => {
-                // Duplicate receipt — skip the write entirely, return the same
-                // rowcount the original apply did (== batch size; the receiver
-                // never drops rows). Atomic check-and-claim above guarantees two
-                // simultaneous retries can't both reach the apply path.
-                return Ok((StatusCode::OK, Json(n)).into_response());
-            }
-            IdemClaim::Apply => { /* fall through to apply, then record */ }
-        }
-    }
-
     // The shard handle. `shard.get` performs the lease CAS (ensure_lease): this
     // node, the partition's deterministic owner, holds the writer lease, so the
     // RAW write below is the single writer for the partition.
@@ -302,6 +292,35 @@ pub(crate) async fn post_partition_write(
             ));
         }
     };
+
+    if let Some(key) = idem_key.as_deref() {
+        match IdemWindow::global().claim(key, rows) {
+            IdemClaim::AlreadyApplied(n) | IdemClaim::InFlightDuplicate(n) => {
+                // Duplicate receipt — skip the write entirely, return the same
+                // rowcount the original apply did (== batch size; the receiver
+                // never drops rows). Atomic check-and-claim above guarantees two
+                // simultaneous retries can't both reach the apply path. For the
+                // #46 durability audit, report the partition's CURRENT durable
+                // WAL high-water: the original apply already landed durable, so
+                // the partition is durable at least through it.
+                let durable_lsn = shard
+                    .wal()
+                    .high_water(&project, &partition)
+                    .await
+                    .ok()
+                    .map(|l| l.0);
+                return Ok((
+                    StatusCode::OK,
+                    Json(basin_engine::write_forwarder::PartitionWriteResponse {
+                        rows: n,
+                        durable_lsn,
+                    }),
+                )
+                    .into_response());
+            }
+            IdemClaim::Apply => { /* fall through to apply, then record */ }
+        }
+    }
     // RAW partition write. Constraints already ran on the SENDER across all
     // partitions before fan-out (see module docs); do NOT re-run. On ANY
     // failure, forget the in-flight key so a legitimate retry can re-apply (the
@@ -319,18 +338,26 @@ pub(crate) async fn post_partition_write(
     let durable = basin_engine::write_forwarder::forward_lands_durable();
     let apply = async {
         let handle = shard.get(&project, &partition).await.map_err(ApiError::from)?;
+        // #46 durability audit: capture the WAL LSN the batch landed at. With
+        // durable-on-forward engaged (the default), `write_batch_opts_lsn(...,
+        // true)` returns ONLY after the owner's WAL group-committed through this
+        // LSN — so the LSN we return is a CONFIRMED durable high-water for the
+        // partition, tying every acked forwarded row to owner durability.
         handle
-            .write_batch_opts(&table, batch, durable)
+            .write_batch_opts_lsn(&table, batch, durable)
             .await
             .map_err(ApiError::from)
     }
     .await;
-    if let Err(e) = apply {
-        if let Some(key) = idem_key.as_deref() {
-            IdemWindow::global().forget_inflight(key);
+    let durable_lsn = match apply {
+        Ok(lsn) => lsn,
+        Err(e) => {
+            if let Some(key) = idem_key.as_deref() {
+                IdemWindow::global().forget_inflight(key);
+            }
+            return Err(e);
         }
-        return Err(e);
-    }
+    };
 
     // Commit succeeded: promote the in-flight key to Applied(rows) so a
     // lost-ack retry dedups to exactly this rowcount.
@@ -338,7 +365,20 @@ pub(crate) async fn post_partition_write(
         IdemWindow::global().record_applied(key, rows);
     }
 
-    Ok((StatusCode::OK, Json(rows)).into_response())
+    // #46: report rows + the owner's confirmed durable high-water LSN. When the
+    // barrier is OFF (async forward) the append is ack-before-durable, so the
+    // returned LSN is the appended position, not yet a durability confirmation;
+    // the originator's audit treats a confirmed LSN as durable only because the
+    // default (barrier ON) path is ack-after-durable. We still report the LSN so
+    // the audit has a per-partition high-water either way.
+    Ok((
+        StatusCode::OK,
+        Json(basin_engine::write_forwarder::PartitionWriteResponse {
+            rows,
+            durable_lsn: Some(durable_lsn.0),
+        }),
+    )
+        .into_response())
 }
 
 #[cfg(test)]

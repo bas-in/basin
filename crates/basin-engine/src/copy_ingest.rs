@@ -619,7 +619,7 @@ pub(crate) async fn exec_copy_from_batch(
     full_schema: Arc<Schema>,
     column_names: Option<&[String]>,
     rows: Vec<Vec<Option<String>>>,
-) -> Result<(u64, Option<(basin_common::PartitionKey, basin_wal::Lsn)>)> {
+) -> Result<(u64, Option<crate::CopyLanding>)> {
     if rows.is_empty() {
         return Ok((0, None));
     }

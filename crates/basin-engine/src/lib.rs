@@ -1536,6 +1536,92 @@ pub struct ProjectSession {
     /// runs at most one COPY at a time, so session scope is the right grain.
     pub(crate) copy_touched:
         tokio::sync::Mutex<std::collections::HashMap<basin_common::PartitionKey, basin_wal::Lsn>>,
+    /// End-to-end DURABILITY AUDIT for the in-progress bulk COPY (#46). Parallel
+    /// to `copy_touched` (which only drives the barrier for LOCAL partitions),
+    /// this accumulates the full per-COPY accounting so that every acked row is
+    /// provably tied to a CONFIRMED durable WAL LSN on its owner — local OR
+    /// forwarded — and any shortfall is logged loudly at end-of-COPY. Overhead
+    /// is O(partitions touched), not O(rows): one entry per touched partition
+    /// plus two running counters. Drained + reported by `await_copy_durable`.
+    pub(crate) copy_audit: tokio::sync::Mutex<CopyDurabilityAudit>,
+}
+
+/// Per-COPY end-to-end durability accounting (#46). Aggregate, O(partitions):
+/// it never holds per-row state, only running totals plus one record per
+/// touched partition. A future ingest data-loss incident becomes
+/// self-diagnosing: at COPY completion we can prove `rows_durable_confirmed ==
+/// rows_acked` and that every touched partition carries a confirmed durable LSN
+/// on its owner, and log a loud shortfall otherwise.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CopyDurabilityAudit {
+    /// Total rows the engine acked back to the COPY (sum of per-batch
+    /// `rows_written`) — the basis of the client's `COPY n`.
+    pub(crate) rows_acked: u64,
+    /// Total rows that landed with a CONFIRMED durable WAL LSN on their owner:
+    /// a local partition whose WAL advanced (durable barrier awaits it), or a
+    /// forwarded partition whose OWNER returned a durable high-water LSN.
+    pub(crate) rows_durable_confirmed: u64,
+    /// One record per touched partition (last write wins for the LSN/owner;
+    /// rows summed). Keyed by partition so the map stays O(partitions).
+    pub(crate) partitions: std::collections::HashMap<basin_common::PartitionKey, CopyPartitionAudit>,
+}
+
+/// Audit record for ONE partition a COPY touched (#46).
+#[derive(Debug, Clone)]
+pub(crate) struct CopyPartitionAudit {
+    /// Owner replica label: the forwarded owner's base URL, or `"local"`.
+    pub(crate) owner: String,
+    /// The highest CONFIRMED durable WAL LSN for this partition (owner-side for
+    /// forwarded, local WAL for local). `None` means NO confirmed durable LSN —
+    /// the shortfall signal.
+    pub(crate) durable_lsn: Option<basin_wal::Lsn>,
+    /// Whether this partition was forwarded to a remote owner.
+    pub(crate) forwarded: bool,
+    /// Rows accumulated for this partition across the COPY's batches.
+    pub(crate) rows: u64,
+}
+
+impl CopyDurabilityAudit {
+    /// Fold one fan-out batch's landing into the audit. `rows` are the rows the
+    /// batch wrote; `landing` is `None` only when the write surfaced no
+    /// confirmed durable LSN (the shortfall path). O(1).
+    pub(crate) fn record(&mut self, rows: u64, landing: Option<CopyLanding>) {
+        self.rows_acked += rows;
+        let Some(landing) = landing else {
+            // Acked rows with NO confirmed durable landing — the smoking-gun
+            // case. Counted toward rows_acked but NOT rows_durable_confirmed.
+            return;
+        };
+        self.rows_durable_confirmed += rows;
+        let e = self
+            .partitions
+            .entry(landing.partition)
+            .or_insert_with(|| CopyPartitionAudit {
+                owner: landing.owner.clone(),
+                durable_lsn: None,
+                forwarded: landing.forwarded,
+                rows: 0,
+            });
+        e.owner = landing.owner;
+        e.forwarded = landing.forwarded;
+        e.rows += rows;
+        // Keep the highest durable LSN seen for the partition.
+        e.durable_lsn = match (e.durable_lsn, Some(landing.durable_lsn)) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+    }
+}
+
+/// What one fan-out batch confirmed about its durable landing (#46). Carried up
+/// from `write_batch_fanout`: a LOCAL write returns its own WAL LSN; a FORWARDED
+/// write returns the OWNER's confirmed durable high-water LSN.
+#[derive(Debug, Clone)]
+pub(crate) struct CopyLanding {
+    pub(crate) partition: basin_common::PartitionKey,
+    pub(crate) durable_lsn: basin_wal::Lsn,
+    pub(crate) owner: String,
+    pub(crate) forwarded: bool,
 }
 
 impl ProjectSession {
@@ -1598,6 +1684,7 @@ impl ProjectSession {
         // COPY that errored before `await_copy_durable` drained it) so it can't
         // leak into the next client that reuses this physical session.
         self.copy_touched.lock().await.clear();
+        *self.copy_audit.lock().await = CopyDurabilityAudit::default();
     }
 
     /// Run one SQL statement. Returns either a result set ([`ExecResult::Rows`])
@@ -1708,23 +1795,40 @@ impl ProjectSession {
         column_names: Option<&[String]>,
         rows: Vec<Vec<Option<String>>>,
     ) -> Result<u64> {
-        let (rows_written, touched) =
+        let (rows_written, landing) =
             crate::copy_ingest::exec_copy_from_batch(self, table_name, full_schema, column_names, rows)
                 .await?;
+
+        // #46 DURABILITY AUDIT: fold every batch's landing into the per-COPY
+        // accounting — local AND forwarded — so end-of-COPY can prove every
+        // acked row is tied to a confirmed durable owner LSN. O(1) per batch.
+        // A forwarded landing carries the OWNER's confirmed durable LSN; a
+        // `None` landing (no shard / Parquet path / a pre-audit peer that
+        // returned no LSN) is counted as acked-but-unconfirmed — the shortfall
+        // signal. Note `rows_written` is the rows the batch acked; the audit's
+        // per-partition `rows` therefore sums to the COPY's acked total.
+        {
+            let mut audit = self.copy_audit.lock().await;
+            audit.record(rows_written, landing.clone());
+        }
+
         // Stage 1 of the end-of-COPY durable barrier: record the (partition,
         // max-LSN) this batch landed at so `await_copy_durable` can await
         // durability for every LOCAL partition this COPY touched before the
-        // client is told `COPY n`. A forwarded batch surfaces `None` and is not
-        // tracked here — by design: it was already group-committed durable on
-        // its OWNER node before the forward POST returned (Stage 3 durable-on-
-        // forward; see `write_batch_fanout` and `forward_lands_durable`), so it
-        // needs no local barrier entry. A synchronous-Parquet batch likewise
-        // surfaces `None`.
-        if let Some((part, lsn)) = touched {
-            let mut g = self.copy_touched.lock().await;
-            let e = g.entry(part).or_insert(lsn);
-            if lsn > *e {
-                *e = lsn;
+        // client is told `COPY n`. A FORWARDED batch is NOT tracked here — by
+        // design: it was already group-committed durable on its OWNER node
+        // before the forward POST returned (Stage 3 durable-on-forward; see
+        // `write_batch_fanout` and `forward_lands_durable`), and its LSN is an
+        // owner LSN not awaitable on this node, so it needs no local barrier
+        // entry (the audit, not the barrier, accounts for it). A
+        // synchronous-Parquet batch surfaces `None`.
+        if let Some(landing) = landing {
+            if !landing.forwarded {
+                let mut g = self.copy_touched.lock().await;
+                let e = g.entry(landing.partition).or_insert(landing.durable_lsn);
+                if landing.durable_lsn > *e {
+                    *e = landing.durable_lsn;
+                }
             }
         }
         Ok(rows_written)
@@ -1752,17 +1856,111 @@ impl ProjectSession {
             let mut g = self.copy_touched.lock().await;
             g.drain().collect()
         };
-        if touched.is_empty() || !copy_durable_barrier_enabled() {
-            return Ok(());
+        // The local-limb barrier: await each LOCAL partition's WAL durable
+        // watermark (forwarded partitions are already durable on their owner).
+        if copy_durable_barrier_enabled() && !touched.is_empty() {
+            if let Some(shard) = self.engine.config().shard.as_ref() {
+                for (part, lsn) in touched {
+                    let handle = shard.get(&self.project, &part).await?;
+                    handle.await_durable(lsn).await?;
+                }
+            }
         }
-        let Some(shard) = self.engine.config().shard.as_ref() else {
-            return Ok(());
-        };
-        for (part, lsn) in touched {
-            let handle = shard.get(&self.project, &part).await?;
-            handle.await_durable(lsn).await?;
-        }
+        // #46: emit the end-to-end durability audit AFTER the barrier (so a
+        // local-limb await failure surfaces first). Drains the per-COPY audit
+        // unconditionally, even when the barrier is disabled, so a shortfall is
+        // never hidden by an early return.
+        self.emit_copy_durability_audit().await;
         Ok(())
+    }
+
+    /// Drain + report the #46 end-to-end COPY durability audit. Emits ONE
+    /// structured INFO line accounting for every acked row, and — if any acked
+    /// row lacks a confirmed durable LSN, or any touched partition has no
+    /// confirmed durable LSN — a WARN "durability audit shortfall" that always
+    /// fires (the self-diagnosing signal for a future ingest data-loss
+    /// incident). Overhead is O(partitions touched): the audit holds one record
+    /// per partition plus two counters, never per-row state.
+    ///
+    /// The INFO line is gated by `BASIN_COPY_DURABILITY_AUDIT` (default ON; set
+    /// to "0"/"false"/"off"/"no" to silence it at scale). The shortfall WARN is
+    /// NOT gated — it fires regardless so a real loss is never quiet.
+    async fn emit_copy_durability_audit(&self) {
+        let audit = {
+            let mut g = self.copy_audit.lock().await;
+            std::mem::take(&mut *g)
+        };
+        // Nothing landed through the fan-out path (e.g. a non-COPY session, or a
+        // COPY that wrote zero rows) — nothing to audit.
+        if audit.rows_acked == 0 && audit.partitions.is_empty() {
+            return;
+        }
+
+        let partitions_touched = audit.partitions.len();
+        // A partition with no confirmed durable LSN is itself a shortfall, even
+        // if the row counters happened to balance.
+        let partitions_without_durable_lsn = audit
+            .partitions
+            .values()
+            .filter(|p| p.durable_lsn.is_none())
+            .count();
+        let row_gap = audit.rows_acked.saturating_sub(audit.rows_durable_confirmed);
+
+        // Compact per-partition summary: {owner, durable_lsn, forwarded, rows}.
+        // O(partitions), bounded by the fan-out width.
+        let per_partition: Vec<String> = audit
+            .partitions
+            .iter()
+            .map(|(part, rec)| {
+                format!(
+                    "{}=>{{owner={},durable_lsn={},forwarded={},rows={}}}",
+                    part.as_str(),
+                    rec.owner,
+                    rec.durable_lsn
+                        .map(|l| l.to_string())
+                        .unwrap_or_else(|| "NONE".to_string()),
+                    rec.forwarded,
+                    rec.rows,
+                )
+            })
+            .collect();
+        let per_partition = per_partition.join(", ");
+
+        if row_gap > 0 || partitions_without_durable_lsn > 0 {
+            // ALWAYS-ON shortfall signal — an acked row not provably tied to a
+            // confirmed durable owner LSN. This is the #46 smoking gun.
+            tracing::warn!(
+                target: "basin::copy_durability_audit",
+                project = %self.project,
+                rows_acked = audit.rows_acked,
+                rows_durable_confirmed = audit.rows_durable_confirmed,
+                row_gap,
+                partitions_touched,
+                partitions_without_durable_lsn,
+                per_partition = %per_partition,
+                "durability audit shortfall: acked rows are NOT all tied to a \
+                 confirmed durable owner LSN"
+            );
+        } else if copy_durability_audit_log_enabled() {
+            tracing::info!(
+                target: "basin::copy_durability_audit",
+                project = %self.project,
+                rows_acked = audit.rows_acked,
+                rows_durable_confirmed = audit.rows_durable_confirmed,
+                partitions_touched,
+                per_partition = %per_partition,
+                "copy durability audit: all acked rows tied to a confirmed durable owner LSN"
+            );
+        }
+    }
+
+    /// Read-only accessor to the in-progress COPY durability audit, for tests
+    /// (the integration gate asserts `rows_durable_confirmed == rows_acked` and
+    /// that every touched partition carries a confirmed durable LSN). Returns a
+    /// clone of the current accumulator without draining it.
+    #[cfg(test)]
+    pub(crate) async fn copy_audit_snapshot(&self) -> CopyDurabilityAudit {
+        self.copy_audit.lock().await.clone()
     }
 }
 
@@ -1782,6 +1980,23 @@ impl ProjectSession {
 pub fn copy_durable_barrier_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("BASIN_COPY_DURABLE_BARRIER") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "off" || v == "no")
+        }
+        Err(_) => true,
+    })
+}
+
+/// Whether the end-of-COPY durability-audit INFO line is emitted (#46). ON by
+/// default; silence it at scale with `BASIN_COPY_DURABILITY_AUDIT=0` (or
+/// false/off/no). This gates ONLY the happy-path structured INFO line — the
+/// shortfall WARN (`rows_durable_confirmed < rows_acked`, or a touched partition
+/// with no confirmed durable LSN) ALWAYS fires, so a real loss is never quiet.
+/// Cached so the COPY ack path pays a single relaxed load.
+pub fn copy_durability_audit_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("BASIN_COPY_DURABILITY_AUDIT") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !(v == "0" || v == "false" || v == "off" || v == "no")

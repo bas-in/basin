@@ -397,13 +397,18 @@ async fn write_batch_fanout(
     table: &TableName,
     batch: RecordBatch,
     durable: bool,
-) -> Result<Option<(PartitionKey, basin_wal::Lsn)>> {
+) -> Result<Option<crate::CopyLanding>> {
     let fanout = fanout_partition_count();
     if fanout <= 1 || batch.num_rows() <= 1 {
         let part = PartitionKey::default_key();
         let handle = shard.get(project, &part).await?;
         let lsn = handle.write_batch_opts_lsn(table, batch, durable).await?;
-        return Ok(Some((part, lsn)));
+        return Ok(Some(crate::CopyLanding {
+            partition: part,
+            durable_lsn: lsn,
+            owner: "local".to_string(),
+            forwarded: false,
+        }));
     }
 
     // Round-robin: claim the next slot for this table and advance the cursor.
@@ -431,22 +436,33 @@ async fn write_batch_fanout(
                 // Stage 3 (multi-node durable barrier — DURABLE-ON-FORWARD):
                 // a forwarded (remote-owned) partition is written on the OWNER
                 // node, whose WAL LSN is not observable here, so it cannot enter
-                // the local `copy_touched` set — we return `None` for the local
-                // barrier. That is CORRECT, not a gap: the owner's partition-
-                // write receive route group-commits the batch to its own WAL
-                // (ack-after-durable) BEFORE acking this forward POST whenever
-                // the barrier is engaged (see
-                // `write_forwarder::forward_lands_durable`). Because this call
-                // is awaited inline per fan-out batch, a RETURNED forward
+                // the local `copy_touched` set (the local-only barrier). That is
+                // CORRECT, not a gap: the owner's partition-write receive route
+                // group-commits the batch to its own WAL (ack-after-durable)
+                // BEFORE acking this forward POST whenever the barrier is engaged
+                // (see `write_forwarder::forward_lands_durable`). Because this
+                // call is awaited inline per fan-out batch, a RETURNED forward
                 // already means the rows are durable on their owner — so by the
                 // time `COPY n` is acked, every forwarded batch is durable too,
-                // with no extra end-of-COPY step and no remote barrier RPC. The
-                // forwarded limb of the barrier is thus closed here.
-                return forward_partition_to_owner(
+                // with no extra end-of-COPY step and no remote barrier RPC.
+                //
+                // #46 DURABILITY AUDIT: we no longer DISCARD the owner's result
+                // (`.map(|_rows| None)`); instead we surface a `CopyLanding`
+                // carrying the OWNER's confirmed durable WAL high-water LSN so
+                // every acked forwarded row is provably tied to a durable owner
+                // LSN. The local barrier still skips this partition (its LSN is
+                // an owner LSN, not awaitable here) — the audit, not the barrier,
+                // is what consumes the forwarded landing.
+                let res = forward_partition_to_owner(
                     engine, &client, &owner.base_url, project, table, &part, batch,
                 )
-                .await
-                .map(|_rows| None);
+                .await?;
+                return Ok(res.durable_lsn.map(|lsn| crate::CopyLanding {
+                    partition: part,
+                    durable_lsn: lsn,
+                    owner: owner.base_url.clone(),
+                    forwarded: true,
+                }));
             }
             // A multi-peer router resolved an off-node owner but no transport is
             // installed: fail loud rather than silently writing to the wrong
@@ -465,7 +481,12 @@ async fn write_batch_fanout(
 
     let handle = shard.get(project, &part).await?;
     let lsn = handle.write_batch_opts_lsn(table, batch, durable).await?;
-    Ok(Some((part, lsn)))
+    Ok(Some(crate::CopyLanding {
+        partition: part,
+        durable_lsn: lsn,
+        owner: "local".to_string(),
+        forwarded: false,
+    }))
 }
 
 /// Forward one fan-out batch to the node that owns `part`, retrying ONCE after
@@ -489,7 +510,7 @@ async fn forward_partition_to_owner(
     table: &TableName,
     part: &PartitionKey,
     batch: RecordBatch,
-) -> Result<u64> {
+) -> Result<crate::write_forwarder::ForwardWriteResult> {
     // Generate the idempotency key ONCE, before attempt 1; both the first
     // attempt and the retry below send this IDENTICAL key so the receiver can
     // dedup a lost-ack re-POST to exactly one apply.
@@ -505,7 +526,7 @@ async fn forward_partition_to_owner(
         )
         .await
     {
-        Ok(rows) => Ok(rows),
+        Ok(res) => Ok(res),
         Err(e) if is_lease_transient(&e) || is_forward_transport_transient(&e) => {
             // Either the owner is mid-handoff (draining) or just lost/hasn't
             // acquired its lease, OR the transport faulted (POST failed / ack
@@ -8019,16 +8040,20 @@ pub(crate) async fn exec_ingest_batch(
         .map(|(rows, _touched)| rows)
 }
 
-/// Like [`exec_ingest_batch`] but also returns the `(partition, max-LSN)` the
-/// batch was appended at on the LOCAL shard, when the write went through the
-/// bulk-ingest fan-out path. `None` means the batch did not surface a local
-/// LSN (forwarded to a remote owner, or the non-shard Parquet path). The COPY
-/// fast path uses this to drive the end-of-COPY durable barrier.
+/// Like [`exec_ingest_batch`] but also returns the [`crate::CopyLanding`] the
+/// batch landed at, when the write went through the bulk-ingest fan-out path.
+/// The landing carries the partition, the CONFIRMED durable WAL LSN (local WAL
+/// for a local write, the OWNER's durable high-water for a forwarded one), and
+/// whether it was forwarded. `None` means the batch did not surface a durable
+/// landing (no shard / the non-shard Parquet path / a pre-audit peer that
+/// returned no LSN). The COPY fast path uses the local landings to drive the
+/// end-of-COPY durable barrier and ALL landings to drive the #46 durability
+/// audit.
 pub(crate) async fn exec_ingest_batch_touched(
     sess: &ProjectSession,
     table: &TableName,
     batch: RecordBatch,
-) -> Result<(u64, Option<(PartitionKey, basin_wal::Lsn)>)> {
+) -> Result<(u64, Option<crate::CopyLanding>)> {
     // INGEST hot path: the per-batch constraint prep needs only the table META
     // (schema / constraints / RLS policies / write tunables), NOT the unioned
     // per-partition data-file set. On the sharded `ObjectStoreCatalog` a full

@@ -472,9 +472,18 @@ pub const PARTITION_FORWARD_RECEIVE_PATH: &str = "/internal/v1/partition-write";
 #[async_trait]
 pub trait PartitionForwardClient: Send + Sync + 'static {
     /// Forward `batch` to the partition owner at `peer_base_url`, to be written
-    /// into `(project, table, partition_id)`. Returns the rows written. The
-    /// receiver is, by construction, the partition's lease owner, so it writes
-    /// directly and does NOT re-run constraints (they ran on the sender).
+    /// into `(project, table, partition_id)`. Returns the owner-side durable
+    /// result — rows written AND the owner's confirmed durable WAL high-water
+    /// LSN for this partition (the DURABILITY AUDIT, #46). The receiver is, by
+    /// construction, the partition's lease owner, so it writes directly and does
+    /// NOT re-run constraints (they ran on the sender).
+    ///
+    /// The returned `durable_lsn` is the OWNER's WAL LSN the batch group-
+    /// committed at when durable-on-forward is engaged (the default), so a
+    /// returned forward ties every acked forwarded row to a confirmed durable
+    /// LSN on its owner. `None` means the owner reported no durable LSN (an
+    /// older peer that predates the audit, or the barrier disabled) — surfaced
+    /// to the audit as an UNconfirmed landing rather than silently dropped.
     ///
     /// `idem_key` is a STABLE per-batch idempotency nonce generated once before
     /// the first attempt and reused unchanged across retries; the receiver
@@ -488,7 +497,20 @@ pub trait PartitionForwardClient: Send + Sync + 'static {
         partition_id: &str,
         idem_key: &str,
         batch: RecordBatch,
-    ) -> Result<u64>;
+    ) -> Result<ForwardWriteResult>;
+}
+
+/// Owner-side result of a forwarded partition write (#46 durability audit).
+/// Replaces the bare rowcount the forward used to return, so the originator can
+/// tie every acked forwarded row to a CONFIRMED durable LSN on its owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardWriteResult {
+    /// Rows the owner committed for this batch.
+    pub rows: u64,
+    /// The owner's confirmed durable WAL high-water LSN for the partition after
+    /// the write (durable-on-forward: the LSN the batch group-committed at).
+    /// `None` when the owner returned no LSN (pre-audit peer / barrier off).
+    pub durable_lsn: Option<basin_wal::Lsn>,
 }
 
 /// The real partition-write transport: POSTs an Arrow IPC stream (schema + one
@@ -610,7 +632,7 @@ impl PartitionForwardClient for HttpPartitionForwardClient {
         partition_id: &str,
         idem_key: &str,
         batch: RecordBatch,
-    ) -> Result<u64> {
+    ) -> Result<ForwardWriteResult> {
         let url = Self::receive_url(peer_base_url);
         let body = encode_partition_batch(&batch)?;
         // Retry on TRANSPORT errors (connection refused/reset/timeout). The
@@ -668,12 +690,45 @@ impl PartitionForwardClient for HttpPartitionForwardClient {
         let text = resp.text().await.map_err(|e| {
             BasinError::wal(format!("partition-write response from {url:?} unreadable: {e}"))
         })?;
-        text.trim().parse::<u64>().map_err(|e| {
+        parse_forward_write_response(&text).map_err(|e| {
             BasinError::wal(format!(
-                "partition-write response from {url:?} is not a rowcount: {text:?} ({e})"
+                "partition-write response from {url:?} is not a result: {text:?} ({e})"
             ))
         })
     }
+}
+
+/// Wire body the partition-write receive route returns: rows committed + the
+/// owner's confirmed durable WAL high-water LSN (#46 durability audit). Sent as
+/// JSON; the sender accepts EITHER this object OR a bare rowcount number for
+/// back-compat with a peer that predates the audit (no LSN → `durable_lsn:
+/// None`, surfaced as an UNconfirmed landing rather than a hard error).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PartitionWriteResponse {
+    pub rows: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_lsn: Option<u64>,
+}
+
+/// Parse the partition-write response body into a [`ForwardWriteResult`].
+/// Accepts the JSON object form (current) and the bare-number form (older peer).
+fn parse_forward_write_response(text: &str) -> std::result::Result<ForwardWriteResult, String> {
+    let trimmed = text.trim();
+    // Object form (current build): {"rows":N,"durable_lsn":M}.
+    if let Ok(obj) = serde_json::from_str::<PartitionWriteResponse>(trimmed) {
+        return Ok(ForwardWriteResult {
+            rows: obj.rows,
+            durable_lsn: obj.durable_lsn.map(basin_wal::Lsn),
+        });
+    }
+    // Back-compat: a bare rowcount number from a pre-audit peer.
+    trimmed
+        .parse::<u64>()
+        .map(|rows| ForwardWriteResult {
+            rows,
+            durable_lsn: None,
+        })
+        .map_err(|e| e.to_string())
 }
 
 // ─── region-aware connection-ceiling accounting model ──────────────────────

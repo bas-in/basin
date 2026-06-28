@@ -3063,6 +3063,7 @@ pub(crate) async fn open(
         cancel_notify,
         is_system,
         copy_touched: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        copy_audit: tokio::sync::Mutex::new(crate::CopyDurabilityAudit::default()),
     })
 }
 
