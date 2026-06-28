@@ -52,6 +52,38 @@ fn resolve_pool_max_idle() -> usize {
         .unwrap_or(DEFAULT_S3_POOL_MAX_IDLE)
 }
 
+/// Default idle-connection eviction timeout (seconds) for the S3 HTTP pool.
+/// THIS IS THE WEDGE FIX. An idle keep-alive connection that the pool reuses
+/// AFTER the server (Tigris) has already half-closed it surfaces as "error
+/// sending request" — a client-SEND failure where the request never left the
+/// box. Observed on the live cluster: after a fast 100M load, compaction PUTs
+/// failed with that exact transport error for ~13 min, cleared only by a node
+/// restart. The earlier hardcoded 90s pool-idle timeout was the bug: it is far
+/// LONGER than Tigris's server-side keep-alive (S3 fronts typically idle-close
+/// in the 5–20s range), so a connection sitting idle between compaction bursts
+/// would be reaped by the server yet kept in our pool and handed to the next
+/// PUT, which then fails to send. Setting the client-side idle timeout BELOW
+/// the server's keep-alive means a connection idle that long is dropped from
+/// the pool and a fresh one is dialled instead of reusing a dead socket.
+///
+/// 20s is conservative: it is short enough to evict before the typical S3
+/// server keep-alive window closes, but long enough to keep connections warm
+/// across the back-to-back PUTs of a compaction sweep (so we don't pay a
+/// TLS handshake per file). Overridable with `BASIN_S3_POOL_IDLE_TIMEOUT_SECS`
+/// (positive integer seconds); unset / zero / unparseable keeps this default.
+const DEFAULT_S3_POOL_IDLE_TIMEOUT_SECS: u64 = 20;
+
+/// Resolve the HTTP connection-pool idle-eviction timeout (seconds) from
+/// `BASIN_S3_POOL_IDLE_TIMEOUT_SECS`, falling back to
+/// [`DEFAULT_S3_POOL_IDLE_TIMEOUT_SECS`]. Must be positive.
+fn resolve_pool_idle_timeout_secs() -> u64 {
+    std::env::var("BASIN_S3_POOL_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_S3_POOL_IDLE_TIMEOUT_SECS)
+}
+
 /// Default max object_store-level retries per request. Deliberately TIGHT
 /// (object_store's own default is 10). The shard's flush path already retries
 /// the *whole* flush at the tick level
@@ -279,9 +311,16 @@ impl S3LikeConfig {
         // of stalling the whole query.
         let client_opts = ClientOptions::default()
             .with_pool_max_idle_per_host(resolve_pool_max_idle())
-            // Keep idle conns warm long enough to be reused across the bursts
-            // of a point-query workload, but not so long they leak fds.
-            .with_pool_idle_timeout(Duration::from_secs(90))
+            // Evict idle connections BEFORE the S3 server (Tigris) half-closes
+            // them server-side. Reusing a keep-alive the server already dropped
+            // is exactly the "error sending request" wedge seen on the live
+            // cluster (a client-SEND failure: the request never left). Keeping
+            // this BELOW Tigris's server keep-alive window means an idle socket
+            // is dropped from the pool and a fresh one dialled instead of being
+            // handed, dead, to the next compaction PUT. Short enough to evict a
+            // stale conn, long enough to stay warm across a compaction sweep's
+            // back-to-back PUTs. Env-tunable via BASIN_S3_POOL_IDLE_TIMEOUT_SECS.
+            .with_pool_idle_timeout(Duration::from_secs(resolve_pool_idle_timeout_secs()))
             // Whole-request and connect ceilings: a stuck S3 GET/PUT should error
             // out and recycle its pooled connection rather than wedge the worker
             // (or, under sustained flushes, exhaust the pool). Env-tunable; the
@@ -428,6 +467,7 @@ mod tests {
         "AWS_ENDPOINT_URL_S3",
         "BUCKET_NAME",
         "BASIN_S3_POOL_MAX_IDLE",
+        "BASIN_S3_POOL_IDLE_TIMEOUT_SECS",
         "BASIN_S3_MAX_RETRIES",
         "BASIN_S3_RETRY_TIMEOUT_SECS",
         "BASIN_S3_REQUEST_TIMEOUT_SECS",
@@ -549,6 +589,50 @@ mod tests {
         drop(_g3);
         let _g4 = clean_env_with(&[("BASIN_S3_REQUEST_TIMEOUT_SECS", "nope")]);
         assert_eq!(resolve_request_timeout_secs(), DEFAULT_S3_REQUEST_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn pool_idle_timeout_defaults_short_for_stale_keepalive_eviction() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = clean_env_with(&[]); // clears BASIN_S3_POOL_IDLE_TIMEOUT_SECS
+        // The wedge fix: the idle-eviction timeout must default SHORT (20s),
+        // not the old hardcoded 90s, so an idle keep-alive is dropped before
+        // the S3 server half-closes it and we reuse a dead socket ("error
+        // sending request").
+        assert_eq!(
+            resolve_pool_idle_timeout_secs(),
+            DEFAULT_S3_POOL_IDLE_TIMEOUT_SECS
+        );
+        assert_eq!(resolve_pool_idle_timeout_secs(), 20);
+        assert_ne!(
+            resolve_pool_idle_timeout_secs(),
+            90,
+            "must not regress to the old over-long hardcoded idle timeout"
+        );
+    }
+
+    #[test]
+    fn pool_idle_timeout_honours_env_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = clean_env_with(&[("BASIN_S3_POOL_IDLE_TIMEOUT_SECS", "30")]);
+        assert_eq!(resolve_pool_idle_timeout_secs(), 30);
+    }
+
+    #[test]
+    fn pool_idle_timeout_rejects_zero_and_garbage() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // Zero would disable eviction (reintroducing the wedge) → default.
+        let _g = clean_env_with(&[("BASIN_S3_POOL_IDLE_TIMEOUT_SECS", "0")]);
+        assert_eq!(
+            resolve_pool_idle_timeout_secs(),
+            DEFAULT_S3_POOL_IDLE_TIMEOUT_SECS
+        );
+        drop(_g);
+        let _g2 = clean_env_with(&[("BASIN_S3_POOL_IDLE_TIMEOUT_SECS", "soon")]);
+        assert_eq!(
+            resolve_pool_idle_timeout_secs(),
+            DEFAULT_S3_POOL_IDLE_TIMEOUT_SECS
+        );
     }
 
     #[test]
