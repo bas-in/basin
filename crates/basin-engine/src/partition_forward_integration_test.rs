@@ -1306,3 +1306,203 @@ async fn two_node_restart_recovers_forwarded_wal_durable_tail() {
 
     std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
 }
+
+// ── DEGRADED forwarding: a failed forward must FAIL the COPY (fail-closed) ────
+
+/// A partition-forward transport double that ALWAYS fails for B-owned
+/// partitions, writing NOTHING anywhere — models the live incident's degraded
+/// forwarding (peer unreachable / POST rejected / owner storage wedged so the
+/// owner's durable append errors). The error string is a GENERIC one that does
+/// NOT match the lease-transient or transport-transient retry predicates, so it
+/// must surface on the FIRST attempt. The headline question: does a forwarded
+/// batch that never got a durable home anywhere FAIL the COPY, or is it silently
+/// dropped / counted as success (= acked rows with no durable home = data loss)?
+struct AlwaysFailForward {
+    /// Count of forward attempts, so the test can assert the transport was
+    /// actually consulted (the partition really did route off-node).
+    attempts: std::sync::Mutex<usize>,
+}
+
+#[async_trait]
+impl PartitionForwardClient for AlwaysFailForward {
+    async fn forward_partition_write(
+        &self,
+        _peer_base_url: &str,
+        _project: ProjectId,
+        _table: &str,
+        _partition_id: &str,
+        _idem_key: &str,
+        _batch: RecordBatch,
+    ) -> Result<u64> {
+        *self.attempts.lock().unwrap() += 1;
+        // A hard, NON-transient failure: the owner is gone / refused and nothing
+        // was written. Deliberately not one of the retry-eligible markers
+        // (`is_lease_transient` / `is_forward_transport_transient`).
+        Err(basin_common::BasinError::wal(
+            "owner unreachable: forward dropped, rows have no durable home".to_string(),
+        ))
+    }
+}
+
+/// FAIL-CLOSED REPRODUCTION: with forwarding wired (multi-peer router + a
+/// transport that drops every B-owned batch), a fan-out COPY that touches a
+/// B-owned partition must return an ERROR — the rows that could not be confirmed
+/// durable on their owner are NOT acked. If the COPY instead succeeds (acks
+/// `COPY n`) while the forwarded rows were dropped, that is the silent
+/// ack-without-durability hole behind the live 14.19M loss.
+#[tokio::test]
+async fn forward_drop_fails_the_copy_fail_closed() {
+    let _env = FANOUT_ENV_LOCK.lock().unwrap();
+    std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
+
+    let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = Arc::new(InMemoryCatalog::new());
+    let eng_a = engine_for(cold.clone(), catalog.clone(), PEER_A).await;
+    let eng_b = engine_for(cold.clone(), catalog.clone(), PEER_B).await;
+
+    let peers = vec![PEER_A.to_string(), PEER_B.to_string()];
+    eng_a.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_A));
+    eng_b.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_B));
+
+    let transport = Arc::new(AlwaysFailForward {
+        attempts: std::sync::Mutex::new(0),
+    });
+    eng_a.attach_partition_forward_client(transport.clone());
+
+    let sess_a = eng_a.open_session(ProjectId::new()).await.unwrap();
+    let project = sess_a.project();
+    sess_a.execute("CREATE TABLE t (id BIGINT)").await.unwrap();
+    let table = TableName::new("t").unwrap();
+    let router = PartitionRouter::new(peers.clone(), PEER_A);
+
+    // Drive multi-row batches across the 8 stripes. The FIRST batch that routes
+    // to a B-owned partition MUST surface the forward error; capture it.
+    let per_batch = 10i64;
+    let mut saw_b_owned = false;
+    let mut forward_errored = false;
+    for i in 0..8usize {
+        let base = (i as i64) * 100;
+        let ids: Vec<i64> = (0..per_batch).map(|k| base + k).collect();
+        let part = if i == 0 {
+            PartitionKey::default_key()
+        } else {
+            PartitionKey::new(format!("s{i}")).unwrap()
+        };
+        let routes_to_b = !router.desired_owner(&project, part.as_str()).is_self;
+        let res = crate::executor::exec_ingest_batch(&sess_a, &table, ids_batch(&ids)).await;
+        if routes_to_b {
+            saw_b_owned = true;
+            // FAIL-CLOSED: a dropped forward must propagate as a statement error.
+            // A silent `Ok` here is the data-loss bug.
+            assert!(
+                res.is_err(),
+                "FAIL-CLOSED VIOLATED: a B-owned batch whose forward was dropped \
+                 returned Ok (rows acked with no durable home) — silent multi-node \
+                 data loss reproduced for partition {}",
+                part.as_str()
+            );
+            let msg = res.unwrap_err().to_string();
+            assert!(
+                msg.contains("no durable home") || msg.contains("unreachable"),
+                "the surfaced error must be the forward failure, got: {msg}"
+            );
+            forward_errored = true;
+        } else {
+            // A-owned local batches still succeed.
+            res.unwrap();
+        }
+    }
+
+    assert!(
+        saw_b_owned,
+        "router put no partitions on B — forwarding not exercised (test proves nothing)"
+    );
+    assert!(
+        forward_errored,
+        "expected at least one forwarded batch to fail the COPY"
+    );
+    assert!(
+        *transport.attempts.lock().unwrap() >= 1,
+        "the forward transport must have been consulted for the B-owned batch"
+    );
+
+    // NONE of the dropped rows landed on B (the transport wrote nothing).
+    let shard_b = eng_b.shard().unwrap();
+    for i in 0..8usize {
+        let part = if i == 0 {
+            PartitionKey::default_key()
+        } else {
+            PartitionKey::new(format!("s{i}")).unwrap()
+        };
+        if !router.desired_owner(&project, part.as_str()).is_self {
+            assert_eq!(
+                tail_rows(&shard_b, &project, &part, &table).await,
+                0,
+                "dropped forward must have written nothing on B for {}",
+                part.as_str()
+            );
+        }
+    }
+
+    std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
+}
+
+/// MISCONFIG / owner-unknown limb: a multi-peer router resolves a B-owned
+/// partition off-node, but NO forward transport is installed (the
+/// `BASIN_FORWARD_SECRET` / transport was never wired). The fan-out path must
+/// FAIL the write rather than silently writing to the wrong node (which would
+/// split-brain the lease) or silently dropping the rows. Pins the
+/// `write_batch_fanout` guard at executor.rs ~455.
+#[tokio::test]
+async fn forward_off_node_without_transport_fails_closed() {
+    let _env = FANOUT_ENV_LOCK.lock().unwrap();
+    std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
+
+    let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = Arc::new(InMemoryCatalog::new());
+    let eng_a = engine_for(cold.clone(), catalog.clone(), PEER_A).await;
+    let eng_b = engine_for(cold.clone(), catalog.clone(), PEER_B).await;
+
+    let peers = vec![PEER_A.to_string(), PEER_B.to_string()];
+    eng_a.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_A));
+    eng_b.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_B));
+    // Deliberately DO NOT attach a partition-forward client to A.
+
+    let sess_a = eng_a.open_session(ProjectId::new()).await.unwrap();
+    let project = sess_a.project();
+    sess_a.execute("CREATE TABLE t (id BIGINT)").await.unwrap();
+    let table = TableName::new("t").unwrap();
+    let router = PartitionRouter::new(peers.clone(), PEER_A);
+
+    let mut saw_b_owned = false;
+    for i in 0..8usize {
+        let base = (i as i64) * 100;
+        let ids: Vec<i64> = (0..10).map(|k| base + k).collect();
+        let part = if i == 0 {
+            PartitionKey::default_key()
+        } else {
+            PartitionKey::new(format!("s{i}")).unwrap()
+        };
+        let routes_to_b = !router.desired_owner(&project, part.as_str()).is_self;
+        let res = crate::executor::exec_ingest_batch(&sess_a, &table, ids_batch(&ids)).await;
+        if routes_to_b {
+            saw_b_owned = true;
+            assert!(
+                res.is_err(),
+                "FAIL-CLOSED VIOLATED: off-node partition {} with no transport \
+                 returned Ok — rows were silently dropped or mis-written",
+                part.as_str()
+            );
+            let msg = res.unwrap_err().to_string();
+            assert!(
+                msg.contains("partition-forward transport") && msg.contains("BASIN_FORWARD_SECRET"),
+                "error must name the missing transport, got: {msg}"
+            );
+        } else {
+            res.unwrap();
+        }
+    }
+    assert!(saw_b_owned, "router put no partitions on B — guard not exercised");
+
+    std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
+}
