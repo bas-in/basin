@@ -2032,9 +2032,23 @@ impl basin_storage::bucket_pool::BucketResolver for S3BucketResolver {
             .with_access_key_id(&access_key_id)
             .with_secret_access_key(&secret_access_key)
             .with_endpoint(&entry.endpoint)
-            // Tigris / most S3-compatible endpoints use virtual-hosted style;
-            // mirror the single-bucket default (force_path_style = false).
-            .with_virtual_hosted_style_request(true)
+            // PATH-STYLE for a custom endpoint, sharing the single-bucket
+            // backend's decision (`use_virtual_hosted_style`). A pooled bucket
+            // always has a CUSTOM endpoint here (the empty-endpoint bootstrap
+            // entry returned the default store above), e.g. the Tigris regional
+            // host `https://fly.storage.tigris.dev` with NO per-bucket subdomain.
+            // Virtual-hosted style against such a host emits `{endpoint}/{key}`
+            // and DROPS the bucket entirely — the FIRST key segment is then
+            // misread as the bucket. With `BASIN_STORAGE_ROOT_PREFIX` set, that
+            // first segment is the root prefix (e.g. `mn5`), so the PUT hit
+            // `https://fly.storage.tigris.dev/mn5/...` → `NoSuchBucket` and the
+            // pooled table never materialised. Path-style lands the real bucket
+            // in the URL path: `{endpoint}/{bucket}/{root}/projects/...`.
+            .with_virtual_hosted_style_request(
+                basin_storage::backends::s3_compatible::use_virtual_hosted_style(Some(
+                    &entry.endpoint,
+                )),
+            )
             .build()
             .map_err(|e| {
                 basin_common::BasinError::storage(format!(

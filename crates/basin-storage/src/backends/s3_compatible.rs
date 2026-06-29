@@ -372,20 +372,16 @@ impl S3LikeConfig {
             } else if !ep.starts_with("https://") {
                 return Err(format!("BASIN_STORAGE_ENDPOINT must be http(s) (got {ep:?})"));
             }
-            // A CUSTOM endpoint (Tigris, MinIO, Wasabi, …) exposes a single
-            // global/regional host with NO per-bucket subdomain, e.g.
-            // `https://fly.storage.tigris.dev`. Virtual-hosted-style would then
-            // emit `{endpoint}/{key}` and DROP the bucket entirely — the first
-            // key segment gets misread as the bucket and the PUT 403s
-            // (AccessDenied). Use PATH-STYLE so the bucket lands in the URL path:
-            // `{endpoint}/{bucket}/{key}`. (If an operator points the endpoint at
-            // a bucket-subdomain host, vhost can be re-enabled via config, but
-            // path-style is the portable default for custom endpoints.)
-            b = b.with_endpoint(ep).with_virtual_hosted_style_request(false);
+            // A CUSTOM endpoint (Tigris, MinIO, Wasabi, …) must use PATH-STYLE so
+            // the bucket lands in the URL path `{endpoint}/{bucket}/{key}` rather
+            // than being dropped (see `use_virtual_hosted_style`).
+            b = b
+                .with_endpoint(ep)
+                .with_virtual_hosted_style_request(use_virtual_hosted_style(Some(ep)));
         } else {
             // AWS S3 proper: no custom endpoint. Virtual-hosted-style is the
             // modern, correct default.
-            b = b.with_virtual_hosted_style_request(true);
+            b = b.with_virtual_hosted_style_request(use_virtual_hosted_style(None));
         }
         if let Some(tok) = &self.session_token {
             b = b.with_token(tok);
@@ -396,6 +392,26 @@ impl S3LikeConfig {
             .map_err(|e| format!("AmazonS3Builder::build failed: {e}"))?;
         Ok(Arc::new(store))
     }
+}
+
+/// Whether to issue virtual-hosted-style S3 requests for `endpoint`.
+///
+/// A CUSTOM endpoint (Tigris, MinIO, Wasabi, …) is a single global/regional
+/// host with NO per-bucket subdomain, e.g. `https://fly.storage.tigris.dev`.
+/// Virtual-hosted style against such a host emits `{endpoint}/{key}` and DROPS
+/// the bucket entirely — the FIRST key segment is then misread as the bucket
+/// (e.g. a `BASIN_STORAGE_ROOT_PREFIX` like `mn5`), so the request hits a
+/// nonexistent bucket and 403/NoSuchBuckets. PATH-STYLE (`false`) lands the
+/// bucket in the URL path: `{endpoint}/{bucket}/{key}`. With NO custom endpoint
+/// (`None` → AWS S3 proper) virtual-hosted style (`true`) is the correct
+/// modern default.
+///
+/// This is the single source of truth for the style decision, shared by the
+/// single-bucket backend ([`S3LikeConfig::build_object_store`]) and the #36
+/// multi-bucket pool resolver in the server binary, so a pooled bucket against
+/// a custom endpoint is never built virtual-hosted (the dev `mn5` bug).
+pub fn use_virtual_hosted_style(endpoint: Option<&str>) -> bool {
+    endpoint.is_none()
 }
 
 /// Read `primary` from the environment; if unset or empty, fall back to
@@ -418,6 +434,24 @@ mod tests {
     // Env-var tests must not run in parallel — `std::env::set_var` mutates
     // process-global state. Serialise them through one mutex.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The style decision shared by the single-bucket backend and the #36 pool
+    /// resolver: a CUSTOM endpoint (Tigris/MinIO/Wasabi) MUST be path-style so
+    /// the bucket isn't dropped and the root-prefix key segment misread as the
+    /// bucket (the live dev `mn5` → NoSuchBucket bug). AWS-proper (no endpoint)
+    /// stays virtual-hosted.
+    #[test]
+    fn custom_endpoint_uses_path_style_aws_proper_uses_vhost() {
+        // Tigris regional host — must be PATH-STYLE.
+        assert!(
+            !use_virtual_hosted_style(Some("https://fly.storage.tigris.dev")),
+            "custom endpoint must NOT use virtual-hosted style (drops the bucket)"
+        );
+        // Any other custom endpoint (MinIO/Wasabi) — path-style too.
+        assert!(!use_virtual_hosted_style(Some("https://s3.example.com")));
+        // AWS S3 proper (no custom endpoint) — virtual-hosted style.
+        assert!(use_virtual_hosted_style(None));
+    }
 
     /// RAII guard that snapshots and restores a set of env vars across a
     /// test body. Set the var to `None` to unset it for the duration.

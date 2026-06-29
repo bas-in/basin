@@ -1319,3 +1319,150 @@ async fn primary_pin_is_stable_across_restart() {
         "pinned project must re-resolve to primary after restart"
     );
 }
+
+// ===========================================================================
+// #36 multi-bucket pool — bucket_name vs root-prefix regression gate.
+//
+// Live bug (dev v139): a fresh pooled project's data-file PUTs targeted bucket
+// `mn5` — which is `BASIN_STORAGE_ROOT_PREFIX` (the object-key PREFIX), NOT a
+// pool bucket — so Tigris returned NoSuchBucket, compaction failed, and the
+// table never became visible. The store the resolver builds for a pooled
+// stripe MUST use the configured REAL bucket name (`basin-pool-N`), never the
+// root prefix; the root prefix belongs in the KEY (`{root}/projects/...`).
+//
+// This gate asserts the assignment hands the resolver entries whose
+// `bucket_name` is a configured pool name (never the root prefix), and that the
+// data key written through the routed seam carries the `{root}/projects/...`
+// layout — so a resolver that (like production's S3 resolver) builds a store
+// from `entry.bucket_name` can never end up pointed at the root prefix.
+// ===========================================================================
+
+/// Resolver that RECORDS every `BucketRegistryEntry` it is handed (so a test
+/// can assert the `bucket_name` the production resolver would build a store
+/// against), and hands out one distinct `InMemory` store per `bucket_id`.
+#[derive(Default)]
+struct RecordingResolver {
+    stores: Mutex<HashMap<String, Arc<dyn ObjectStore>>>,
+    seen: Mutex<Vec<BucketRegistryEntry>>,
+}
+
+impl RecordingResolver {
+    fn store_for(&self, bucket_id: &str) -> Arc<dyn ObjectStore> {
+        self.stores
+            .lock()
+            .unwrap()
+            .entry(bucket_id.to_string())
+            .or_insert_with(|| Arc::new(InMemory::new()))
+            .clone()
+    }
+
+    fn resolved_bucket_names(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.bucket_name.clone())
+            .collect()
+    }
+}
+
+impl BucketResolver for RecordingResolver {
+    fn resolve(&self, entry: &BucketRegistryEntry) -> Result<Arc<dyn ObjectStore>> {
+        self.seen.lock().unwrap().push(entry.clone());
+        Ok(self.store_for(&entry.bucket_id))
+    }
+}
+
+/// REGRESSION GATE for the `bucket_name == root-prefix` bug. With a pool
+/// configured exactly as on dev (real names `basin-pool-0..3`, a custom Tigris
+/// endpoint, stripe=4) and a `BASIN_STORAGE_ROOT_PREFIX` set on the Storage,
+/// assigning a fresh project must:
+///   (A) hand the resolver ONLY entries whose `bucket_name` is one of the
+///       configured pool bucket names — never the root prefix; and
+///   (B) write data files under `{root}/projects/...` (root prefix in the KEY,
+///       not the bucket).
+/// Before the fix the production resolver built a vhost-style S3 store against
+/// such a custom endpoint, which drops the bucket and lets the first key
+/// segment (the root prefix `mn5`) be misread as the bucket — exactly the
+/// NoSuchBucket failure observed live. This gate fails if a resolved store is
+/// ever pointed at the root prefix instead of a real pool bucket.
+#[tokio::test]
+async fn pooled_project_resolves_real_bucket_names_not_root_prefix() {
+    const ROOT_PREFIX: &str = "mn5";
+    let pool_names = ["basin-pool-0", "basin-pool-1", "basin-pool-2", "basin-pool-3"];
+
+    // Storage with a root prefix set (so data keys are `{root}/projects/...`).
+    let default_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let cat = Arc::new(InMemoryCatalog::new());
+    let storage = Storage::new(StorageConfig {
+        object_store: default_store,
+        root_prefix: Some(object_store::path::Path::from(ROOT_PREFIX)),
+        disk_cache: None,
+        page_cache: None,
+    });
+    storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
+
+    // Pool configured with REAL bucket names + a CUSTOM endpoint (the dev shape).
+    let buckets = BucketPoolBuckets {
+        names: pool_names.iter().map(|s| s.to_string()).collect(),
+        endpoint: "https://fly.storage.tigris.dev".to_string(),
+        region: "auto".to_string(),
+        creds_refs: vec!["POOL0".into(), "POOL1".into(), "POOL2".into(), "POOL3".into()],
+    };
+    let resolver = Arc::new(RecordingResolver::default());
+    let pool = Arc::new(BucketPool::new_with_buckets(
+        PoolConfig { enabled: true, max_buckets: 4, watermark: 1, stripe: 4 },
+        buckets,
+        resolver.clone(),
+    ));
+    storage.attach_bucket_pool(pool.clone());
+    // Seed the registry from the configured real buckets (production does this
+    // via `prepopulate_registry` on boot).
+    pool.prepopulate_registry(cat.as_ref()).await.unwrap();
+
+    let project = ProjectId::new();
+    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+
+    // (A) Every entry the resolver was handed carries a REAL pool bucket name —
+    // never the root prefix. This is the seam the production S3 resolver builds
+    // `with_bucket_name(&entry.bucket_name)` against.
+    let resolved = resolver.resolved_bucket_names();
+    assert!(!resolved.is_empty(), "the stripe must resolve at least one bucket");
+    for name in &resolved {
+        assert_ne!(
+            name, ROOT_PREFIX,
+            "resolved bucket_name must NEVER be the storage root prefix (the dev `mn5` bug)"
+        );
+        assert!(
+            pool_names.contains(&name.as_str()),
+            "resolved bucket_name {name:?} must be one of the configured pool buckets {pool_names:?}"
+        );
+    }
+
+    // (B) Data files land under `{root}/projects/...` — the root prefix is in
+    // the KEY, not the bucket. Write through the real write seam and confirm.
+    let table = TableName::new("s1").unwrap();
+    let part = PartitionKey::new("p0").unwrap();
+    storage
+        .write_batch(&project, &table, &part, &small_batch())
+        .await
+        .unwrap();
+
+    let want_prefix = format!("{ROOT_PREFIX}/projects/{project}/");
+    let mut found_any = false;
+    for i in 0..pool_names.len() {
+        let id = format!("pool-{i:04}");
+        for k in list_keys(&resolver.store_for(&id)).await {
+            assert!(
+                k.starts_with(&want_prefix),
+                "data key {k:?} must live under {want_prefix:?} (root prefix in the KEY)"
+            );
+            assert!(
+                !k.starts_with("projects/"),
+                "data key {k:?} must NOT drop the root prefix"
+            );
+            found_any = true;
+        }
+    }
+    assert!(found_any, "the write must have produced at least one pooled data file");
+}
