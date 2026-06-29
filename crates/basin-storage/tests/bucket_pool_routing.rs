@@ -1558,3 +1558,207 @@ async fn pooled_project_resolves_real_bucket_names_not_root_prefix() {
     }
     assert!(found_any, "the write must have produced at least one pooled data file");
 }
+
+/// LIVE-PATH GATE (dev v142+): a FRESH project must stripe across the configured
+/// pool buckets even when the persisted bucket registry starts EMPTY — i.e. when
+/// `prepopulate_registry` is NOT relied upon to pre-seed it. This mirrors the
+/// production failure where every project's data landed on the PRIMARY bucket
+/// and all four pool buckets stayed empty.
+///
+/// It is identical to `pooled_project_resolves_real_bucket_names_not_root_prefix`
+/// EXCEPT it never calls `prepopulate_registry`, so the assignment path must seed
+/// the configured real buckets into the registry itself. Asserts the fresh
+/// project is NOT pinned to primary and that its data files land in pool buckets
+/// under `{root}/projects/{project}/` — not on the primary store.
+#[tokio::test]
+async fn fresh_project_stripes_to_pool_buckets_with_empty_registry() {
+    const ROOT_PREFIX: &str = "mn5";
+    let pool_names = ["basin-pool-0", "basin-pool-1", "basin-pool-2", "basin-pool-3"];
+
+    // The PRIMARY/default store backs the catalog (exactly the live shape: the
+    // object-store catalog lives on the primary bucket). We watch it to prove no
+    // project data leaks onto it.
+    let primary: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let cat = Arc::new(InMemoryCatalog::new());
+    let storage = Storage::new(StorageConfig {
+        object_store: primary.clone(),
+        root_prefix: Some(object_store::path::Path::from(ROOT_PREFIX)),
+        disk_cache: None,
+        page_cache: None,
+    });
+    storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
+
+    // Pool configured with REAL bucket names + a CUSTOM endpoint + per-bucket
+    // creds refs (the exact dev config).
+    let buckets = BucketPoolBuckets {
+        names: pool_names.iter().map(|s| s.to_string()).collect(),
+        endpoint: "https://fly.storage.tigris.dev".to_string(),
+        region: "auto".to_string(),
+        creds_refs: vec!["POOL0".into(), "POOL1".into(), "POOL2".into(), "POOL3".into()],
+    };
+    let resolver = Arc::new(RecordingResolver::default());
+    let pool = Arc::new(BucketPool::new_with_buckets(
+        PoolConfig { enabled: true, max_buckets: 4, watermark: 1, stripe: 4 },
+        buckets,
+        resolver.clone(),
+    ));
+    storage.attach_bucket_pool(pool.clone());
+
+    // The persisted registry starts EMPTY — and we deliberately do NOT call
+    // `prepopulate_registry`. This is the live path: the registry the assignment
+    // reads has no pooled buckets.
+    assert!(
+        cat.get_bucket_registry().await.unwrap().buckets.is_empty(),
+        "precondition: registry must start empty (no pre-seed)"
+    );
+
+    // Assign a FRESH project (no pre-pool data anywhere).
+    let project = ProjectId::new();
+    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+
+    // It must NOT be pinned to primary — a fresh project stripes.
+    let a = cat
+        .get_bucket_assignment(&project)
+        .await
+        .unwrap()
+        .expect("fresh project must get an assignment");
+    assert_ne!(
+        a.bucket_id, PRIMARY_PIN_BUCKET_ID,
+        "a fresh project must NOT be pinned to primary"
+    );
+    assert!(
+        a.stripe.iter().all(|b| b.starts_with("pool-")),
+        "a fresh project's stripe must be pool buckets, got {:?}",
+        a.stripe
+    );
+
+    // Every resolved entry carries a REAL pool bucket name (non-empty endpoint),
+    // never the root prefix / empty-endpoint primary bootstrap.
+    let resolved = resolver.resolved_bucket_names();
+    assert!(!resolved.is_empty(), "the stripe must resolve at least one bucket");
+    for name in &resolved {
+        assert!(
+            pool_names.contains(&name.as_str()),
+            "resolved bucket_name {name:?} must be a configured pool bucket {pool_names:?}, \
+             not the primary/root prefix"
+        );
+    }
+
+    // Data files land in POOL buckets under `{root}/projects/{project}/`, and the
+    // PRIMARY store holds NO project data file.
+    let table = TableName::new("s1").unwrap();
+    let part = PartitionKey::new("p0").unwrap();
+    storage
+        .write_batch(&project, &table, &part, &small_batch())
+        .await
+        .unwrap();
+
+    let want_prefix = format!("{ROOT_PREFIX}/projects/{project}/");
+    let mut found_any = false;
+    for i in 0..pool_names.len() {
+        let id = format!("pool-{i:04}");
+        for k in list_keys(&resolver.store_for(&id)).await {
+            assert!(
+                k.starts_with(&want_prefix),
+                "data key {k:?} must live under {want_prefix:?} in a pool bucket"
+            );
+            found_any = true;
+        }
+    }
+    assert!(
+        found_any,
+        "the write must have produced at least one pooled data file (not on primary)"
+    );
+    assert!(
+        !list_keys(&primary)
+            .await
+            .iter()
+            .any(|k| k.contains(&format!("projects/{project}/"))),
+        "PRIMARY store must hold NO data for the fresh pooled project"
+    );
+}
+
+/// STALE-REGISTRY GATE (the live root cause, dev v142+): when an EARLIER boot
+/// (pool ON but no `BASIN_BUCKET_POOL_BUCKETS`, or pre-#36) lazily registered
+/// placeholder `pool-000N` entries with EMPTY endpoint/region into the persisted
+/// registry, a later boot that configures REAL buckets must REFRESH those stale
+/// entries to carry the real name + endpoint + region. Otherwise
+/// `prepopulate_registry`'s create-if-absent skips them, the production resolver
+/// maps their empty endpoint to the PRIMARY store, and every project's "stripe"
+/// of `pool-000N` ids resolves to the primary bucket — exactly the live symptom
+/// (correct counts, no errors, all data on primary, pool buckets empty).
+#[tokio::test]
+async fn stale_empty_endpoint_registry_is_refreshed_to_real_buckets() {
+    use basin_catalog::bucket_pool::BucketRegistry;
+
+    let pool_names = ["basin-pool-0", "basin-pool-1", "basin-pool-2", "basin-pool-3"];
+    let cat = Arc::new(InMemoryCatalog::new());
+
+    // Simulate the legacy lazy-bootstrap registry: placeholder entries with
+    // EMPTY endpoint/region under the SAME deterministic ids the config maps to.
+    let stale = BucketRegistry {
+        buckets: (0..4)
+            .map(|i| BucketRegistryEntry {
+                bucket_id: format!("pool-{i:04}"),
+                bucket_name: format!("pool-{i:04}"),
+                endpoint: String::new(),
+                region: String::new(),
+                credentials_ref: None,
+                assigned_count: 0,
+            })
+            .collect(),
+    };
+    cat.put_bucket_registry(&stale).await.unwrap();
+
+    let buckets = BucketPoolBuckets {
+        names: pool_names.iter().map(|s| s.to_string()).collect(),
+        endpoint: "https://fly.storage.tigris.dev".to_string(),
+        region: "auto".to_string(),
+        creds_refs: vec!["POOL0".into(), "POOL1".into(), "POOL2".into(), "POOL3".into()],
+    };
+    let resolver = Arc::new(RecordingResolver::default());
+    let pool = Arc::new(BucketPool::new_with_buckets(
+        PoolConfig { enabled: true, max_buckets: 4, watermark: 1, stripe: 4 },
+        buckets,
+        resolver.clone(),
+    ));
+
+    // Boot-time seed (production calls this): must REFRESH the stale entries.
+    pool.prepopulate_registry(cat.as_ref()).await.unwrap();
+
+    let registry = cat.get_bucket_registry().await.unwrap();
+    assert_eq!(registry.buckets.len(), 4, "no duplicate entries");
+    for (i, b) in registry.buckets.iter().enumerate() {
+        assert_eq!(b.bucket_id, format!("pool-{i:04}"));
+        assert_eq!(
+            b.bucket_name, pool_names[i],
+            "stale placeholder name must be refreshed to the REAL bucket name"
+        );
+        assert_eq!(
+            b.endpoint, "https://fly.storage.tigris.dev",
+            "stale EMPTY endpoint must be refreshed to the configured endpoint \
+             (else the resolver maps it to the primary store)"
+        );
+        assert_eq!(b.region, "auto", "stale empty region must be refreshed");
+        assert_eq!(
+            b.credentials_ref.as_deref(),
+            Some(format!("POOL{i}").as_str()),
+            "configured per-bucket creds ref must be applied"
+        );
+    }
+
+    // And a fresh project's resolved stripe carries REAL bucket names (non-empty
+    // endpoint), so the production resolver builds real-bucket stores — not the
+    // empty-endpoint primary fallback.
+    let project = ProjectId::new();
+    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    let _ = pool.routed_stores(&project).expect("warmed stripe");
+    let resolved = resolver.resolved_bucket_names();
+    assert!(!resolved.is_empty());
+    for name in &resolved {
+        assert!(
+            pool_names.contains(&name.as_str()),
+            "resolved bucket {name:?} must be a REAL pool bucket, not the placeholder"
+        );
+    }
+}

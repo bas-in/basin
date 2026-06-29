@@ -565,6 +565,16 @@ impl BucketPool {
     /// untouched; only missing configured buckets are appended. The write is
     /// skipped entirely when nothing changed, so this never churns the catalog.
     ///
+    /// Existing entries that ALREADY carry the configured real name + endpoint +
+    /// region + creds_ref are left untouched. A STALE entry under a configured
+    /// id — e.g. a legacy lazy-bootstrap placeholder (`pool-000N`, EMPTY endpoint)
+    /// registered by an earlier boot that had the pool ON but no
+    /// `BASIN_BUCKET_POOL_BUCKETS` — is REFRESHED in place to the configured real
+    /// values (preserving its `assigned_count`). Without this refresh the resolver
+    /// maps the stale empty endpoint to the PRIMARY store, so every project's
+    /// stripe of `pool-000N` ids resolves to the primary bucket and nothing ever
+    /// reaches the real pool buckets.
+    ///
     /// No-op (and the catalog is never touched) when the pool is disabled OR no
     /// real buckets are configured — the empty-list path keeps today's
     /// lazy-bootstrap behaviour exactly.
@@ -581,9 +591,29 @@ impl BucketPool {
         let mut changed = false;
         for i in 0..want {
             let id = BucketPoolBuckets::bucket_id_for(i);
-            if registry.get(&id).is_none() {
-                registry.buckets.push(self.buckets.entry_for(i));
-                changed = true;
+            let desired = self.buckets.entry_for(i);
+            match registry.buckets.iter_mut().find(|b| b.bucket_id == id) {
+                None => {
+                    registry.buckets.push(desired);
+                    changed = true;
+                }
+                Some(existing) => {
+                    // Refresh a STALE entry (e.g. a legacy empty-endpoint
+                    // placeholder) to the configured real values, preserving its
+                    // load count. Only touch (and only PUT) when something
+                    // actually differs, so a converged registry never churns.
+                    if existing.bucket_name != desired.bucket_name
+                        || existing.endpoint != desired.endpoint
+                        || existing.region != desired.region
+                        || existing.credentials_ref != desired.credentials_ref
+                    {
+                        existing.bucket_name = desired.bucket_name;
+                        existing.endpoint = desired.endpoint;
+                        existing.region = desired.region;
+                        existing.credentials_ref = desired.credentials_ref;
+                        changed = true;
+                    }
+                }
             }
         }
         if changed {
