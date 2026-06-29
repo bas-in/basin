@@ -89,6 +89,150 @@ const VORTEX_UNFILTERED_DECODE_EXPANSION: u64 = 2;
 /// unparseable / zero falls back to this default.
 const DEFAULT_READ_FILE_CONCURRENCY: usize = 16;
 
+/// Default number of bounded retries the read path makes when an object-store
+/// GET / HEAD for a data file fails with `NotFound` (404) or a transient
+/// send error.
+///
+/// `NotFound` on the read path is almost always the compaction supersede
+/// race: a read resolves its live-file set from a snapshot (LIST or catalog),
+/// then a concurrent compaction commits the merged output and DELETES the
+/// superseded input before the read opens it — the GET then 404s and, without
+/// this retry, the whole query errors even though the data is intact (just
+/// relocated into the merged file, plus still present on the store during the
+/// delete grace window — see `BASIN_SUPERSEDE_GC_GRACE_SECS`). Retrying the
+/// SAME path a few times with short backoff lets the read complete against the
+/// file while the grace window keeps it alive, and also absorbs an S3
+/// read-after-overwrite negative-cache 404 / a transient "error sending
+/// request" blip. Retrying the SAME path (never substituting a different file)
+/// is what makes this double-count-safe: we never read a merged output whose
+/// sibling inputs are also in our resolved set.
+///
+/// Override with `BASIN_READ_OPEN_MAX_RETRIES`; unset / unparseable keeps this
+/// default. `0` disables the retry (legacy fail-fast behaviour).
+const DEFAULT_READ_OPEN_MAX_RETRIES: u32 = 5;
+
+/// Resolve the read-open retry budget, honouring `BASIN_READ_OPEN_MAX_RETRIES`.
+fn read_open_max_retries() -> u32 {
+    std::env::var("BASIN_READ_OPEN_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_READ_OPEN_MAX_RETRIES)
+}
+
+/// True when an object-store error at the per-file open seam should be retried
+/// in place (re-issuing the SAME path). This covers TRANSIENT failures only —
+/// a `Generic` send error ("error sending request"), connection reset, or DNS
+/// blip — for which re-issuing the identical request is the correct fix.
+///
+/// A `NotFound` is deliberately NOT retried here: under the supersede race the
+/// file is GONE for good (the merge committed its replacement and deleted this
+/// input), so re-fetching the same path can never succeed — the recovery is to
+/// RE-LIST and read the merged replacement, which the `read`-level re-resolve
+/// loop owns (`resolve_table_read_paths` + the restart in [`read`]). Retrying a
+/// dead path here would only waste the backoff budget before that re-resolve.
+fn is_retryable_open_error(e: &object_store::Error) -> bool {
+    match e {
+        // `Generic` wraps reqwest send failures ("error sending request"),
+        // connection resets, and DNS blips — all transient. The inner
+        // `RetryConfig` already retries these at the HTTP layer, but a retry
+        // here adds a second, cheaper layer for the localfs / non-S3 stores
+        // that don't carry a `RetryConfig`, and re-issues the request after a
+        // backoff if the HTTP retry budget was exhausted.
+        object_store::Error::Generic { .. } => true,
+        _ => false,
+    }
+}
+
+/// GET a data file's bytes with bounded retry-on-NotFound / transient error.
+/// See [`DEFAULT_READ_OPEN_MAX_RETRIES`] for why a `NotFound` is retried.
+async fn get_bytes_with_retry(
+    store: &Arc<dyn ObjectStore>,
+    path: &ObjectPath,
+) -> std::result::Result<bytes::Bytes, object_store::Error> {
+    let max_retries = read_open_max_retries();
+    let mut attempt: u32 = 0;
+    loop {
+        match store.get(path).await {
+            Ok(r) => match r.bytes().await {
+                Ok(b) => return Ok(b),
+                Err(e) if attempt < max_retries && is_retryable_open_error(&e) => {
+                    backoff_open_retry(attempt).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            },
+            Err(e) if attempt < max_retries && is_retryable_open_error(&e) => {
+                backoff_open_retry(attempt).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// HEAD a data file with bounded retry-on-NotFound / transient error, mirroring
+/// [`get_bytes_with_retry`] for the Parquet path's size probe.
+async fn head_with_retry(
+    store: &Arc<dyn ObjectStore>,
+    path: &ObjectPath,
+) -> std::result::Result<object_store::ObjectMeta, object_store::Error> {
+    let max_retries = read_open_max_retries();
+    let mut attempt: u32 = 0;
+    loop {
+        match store.head(path).await {
+            Ok(m) => return Ok(m),
+            Err(e) if attempt < max_retries && is_retryable_open_error(&e) => {
+                backoff_open_retry(attempt).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Load Parquet footer metadata with bounded retry on a NotFound / transient
+/// error. The inner error here is a [`parquet::errors::ParquetError`] (the
+/// object-store error is wrapped), so we classify on its rendered text — the
+/// supersede-race 404 surfaces as a message containing "not found" / "404" /
+/// "NoSuchKey", and a transient blip as "error sending request".
+async fn load_parquet_meta_with_retry(
+    reader: &mut ParquetObjectReader,
+) -> std::result::Result<ArrowReaderMetadata, parquet::errors::ParquetError> {
+    let max_retries = read_open_max_retries();
+    let mut attempt: u32 = 0;
+    loop {
+        let opts = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
+        match ArrowReaderMetadata::load_async(reader, opts).await {
+            Ok(m) => return Ok(m),
+            Err(e) if attempt < max_retries && is_retryable_parquet_error(&e) => {
+                backoff_open_retry(attempt).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Classify a [`parquet::errors::ParquetError`] as a TRANSIENT read-open error
+/// worth retrying in place (re-issuing the same request), by its rendered text
+/// — the underlying `object_store::Error` is wrapped and not directly
+/// matchable. As with [`is_retryable_open_error`], a NotFound is excluded: a
+/// superseded file is gone for good and the `read`-level re-LIST owns that
+/// recovery; only a transient send blip is retried here.
+fn is_retryable_parquet_error(e: &parquet::errors::ParquetError) -> bool {
+    e.to_string()
+        .to_ascii_lowercase()
+        .contains("error sending request")
+}
+
+/// Decorrelated-ish fixed backoff between read-open retries: 50ms, 100ms,
+/// 200ms, 400ms, capped at 800ms. Short enough not to balloon p99 on the rare
+/// retry, long enough to outlast a single supersede-delete in flight.
+async fn backoff_open_retry(attempt: u32) {
+    let ms = 50u64.saturating_mul(1u64 << attempt.min(4)).min(800);
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
 /// Resolve the data-file read fan-out, honouring `BASIN_READ_FILE_CONCURRENCY`.
 fn read_file_concurrency() -> usize {
     std::env::var("BASIN_READ_FILE_CONCURRENCY")
@@ -683,15 +827,80 @@ pub(crate) async fn read(
     // can never produce a false `NoMatch`. This lifts the per-file
     // open+decode cost off every point query on a many-file table even
     // without a catalog (previously the no-catalog branch opened ALL files).
+    // Resolve the live data-file set, then build the read stream. Wrapped in a
+    // bounded RE-RESOLVE loop: a compaction that supersedes our resolved set
+    // (commits the merged output, then DELETES the input files) can make a
+    // listed file 404 when the stream opens it. Because the read sources file
+    // EXISTENCE from the object-store LIST (not the catalog — see
+    // `list_data_files`), the safe recovery is to discard the stale set and
+    // re-LIST: the new LIST reflects the committed merge (the merged output is
+    // present; the deleted inputs are gone), so the re-resolved read returns
+    // every row exactly once. We restart ONLY while no batch has been emitted
+    // downstream yet (peeking the first item), so an accumulating consumer can
+    // never double-count — a NotFound after emission has begun surfaces as the
+    // error it was (rare: the supersede 404 overwhelmingly strikes on the first
+    // file the scan opens, and `read_one`'s per-file transient retry absorbs a
+    // momentary blip on later files). Bounded by `BASIN_READ_OPEN_MAX_RETRIES`.
+    let max_restarts = read_open_max_retries();
+    let mut attempt: u32 = 0;
+    loop {
+        let paths =
+            resolve_table_read_paths(storage, project, table, &opts, catalog_schema.as_ref())
+                .await?;
+        let stream =
+            read_paths_inner(storage, project, paths, opts.clone(), catalog_schema.clone()).await?;
+        // Peek the first item so a pre-emission supersede 404 triggers a
+        // re-resolve instead of failing the query.
+        let mut peekable = stream.peekable();
+        let first_is_retryable_notfound = {
+            let pinned = std::pin::Pin::new(&mut peekable);
+            matches!(
+                pinned.peek().await,
+                Some(Err(e)) if attempt < max_restarts && is_retryable_read_error(e)
+            )
+        };
+        if first_is_retryable_notfound {
+            backoff_open_retry(attempt).await;
+            attempt += 1;
+            continue;
+        }
+        return Ok(peekable.boxed());
+    }
+}
+
+/// True when a read-path `BasinError` is a transient/supersede failure worth
+/// re-resolving the live-file set for: a missing object (404 / NoSuchKey — the
+/// compaction supersede race) or a transient send error. Classified on the
+/// rendered storage message because the typed object-store error is wrapped
+/// into [`BasinError::Storage`] at the open seam.
+fn is_retryable_read_error(e: &BasinError) -> bool {
+    let msg = e.to_string().to_ascii_lowercase();
+    msg.contains("not found")
+        || msg.contains("nosuchkey")
+        || msg.contains("404")
+        || msg.contains("error sending request")
+}
+
+/// Resolve the set of live data-file paths for a table read: the catalog-stats
+/// pruned set when the request carries a predicate, else the object-store LIST
+/// of the table's hot+cold prefixes. Extracted from [`read`] so the read can
+/// RE-RESOLVE this set when a concurrent compaction supersedes it.
+async fn resolve_table_read_paths(
+    storage: &Storage,
+    project: &ProjectId,
+    table: &TableName,
+    opts: &ReadOptions,
+    catalog_schema: Option<&SchemaRef>,
+) -> Result<Vec<ObjectPath>> {
     let prune_with_stats = !opts.filters.is_empty();
-    let paths: Vec<ObjectPath> = if prune_with_stats {
-        let schema = match catalog_schema.as_ref() {
+    if prune_with_stats {
+        let schema = match catalog_schema {
             Some(s) => s.as_ref().clone(),
             None => filters_to_prune_schema(&opts.filters),
         };
         let cp = filters_to_compound(&opts.filters);
         let files = list_data_files_with_stats(storage, project, table).await?;
-        files
+        Ok(files
             .into_iter()
             .filter(|f| {
                 // Files whose stats are empty (no footer parsed, e.g.
@@ -706,7 +915,7 @@ pub(crate) async fn read(
                 )
             })
             .map(|f| f.path)
-            .collect()
+            .collect())
     } else {
         // No predicate: enumerate the file set from the object-store LIST.
         // The catalog is NOT consulted for existence here — it is not an
@@ -756,10 +965,8 @@ pub(crate) async fn read(
                 }
             }
         }
-        paths
-    };
-
-    read_paths_inner(storage, project, paths, opts, catalog_schema).await
+        Ok(paths)
+    }
 }
 
 /// Synthesise a minimal Arrow schema for stats-pruning from the predicate
@@ -1235,21 +1442,13 @@ async fn read_one(
             .await?
             {
                 Some(plaintext) => bytes::Bytes::from(plaintext),
-                None => store
-                    .get(&path)
+                None => get_bytes_with_retry(&store, &path)
                     .await
-                    .map_err(|e| BasinError::storage(format!("get vortex {path}: {e}")))?
-                    .bytes()
-                    .await
-                    .map_err(|e| BasinError::storage(format!("read vortex {path}: {e}")))?,
+                    .map_err(|e| BasinError::storage(format!("get vortex {path}: {e}")))?,
             },
-            None => store
-                .get(&path)
+            None => get_bytes_with_retry(&store, &path)
                 .await
-                .map_err(|e| BasinError::storage(format!("get vortex {path}: {e}")))?
-                .bytes()
-                .await
-                .map_err(|e| BasinError::storage(format!("read vortex {path}: {e}")))?,
+                .map_err(|e| BasinError::storage(format!("get vortex {path}: {e}")))?,
         };
 
         // Cold read: we issued the GET and now hold the file bytes. Count the
@@ -1597,19 +1796,20 @@ async fn read_one(
             size,
         )
     } else {
-        let head = store
-            .head(&path)
+        // HEAD + footer load with bounded retry-on-NotFound / transient error,
+        // for the same supersede-race / transient-blip reason the Vortex GET
+        // above retries (see `get_bytes_with_retry`). We retry the SAME path
+        // only — never substitute a different file — so this can never
+        // double-count a merged output against its still-listed sibling inputs.
+        let head = head_with_retry(&store, &path)
             .await
             .map_err(|e| BasinError::storage(format!("head {path}: {e}")))?;
         let size = head.size;
         let mut reader = ParquetObjectReader::new(store, path.clone()).with_file_size(size);
         let arrow_meta =
-            ArrowReaderMetadata::load_async(
-                &mut reader,
-                ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
-            )
-            .await
-            .map_err(|e| BasinError::storage(format!("open parquet {path}: {e}")))?;
+            load_parquet_meta_with_retry(&mut reader)
+                .await
+                .map_err(|e| BasinError::storage(format!("open parquet {path}: {e}")))?;
         meta_cache.insert(
             path.clone(),
             CachedParquetMeta {
@@ -5724,5 +5924,211 @@ mod tests {
             total < file_size,
             "tail reads ({total} B) must be smaller than the file ({file_size} B)"
         );
+    }
+
+    /// A store that injects a bounded number of `NotFound` errors on the FIRST
+    /// GET / HEAD of each data-file key, then serves the real bytes. This
+    /// reproduces the compaction supersede race (a read lists file X, a merge
+    /// GC's X before the read opens it) AND a transient S3 read-after-write
+    /// 404 — the read-open seam must retry and complete, never surface the 404.
+    #[derive(Debug)]
+    struct VanishThenServeStore {
+        inner: Arc<dyn ObjectStore>,
+        // Remaining number of times to fail GET/HEAD per key.
+        fails_left: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+        initial_fails: u32,
+    }
+
+    impl VanishThenServeStore {
+        fn fail_or_pass(&self, key: &str) -> Option<object_store::Error> {
+            // Only fault real data files; let footer/sidecar/list pass.
+            if !(key.ends_with(".vortex") || key.ends_with(".parquet")) {
+                return None;
+            }
+            let mut g = self.fails_left.lock().unwrap();
+            let n = g.entry(key.to_string()).or_insert(self.initial_fails);
+            if *n > 0 {
+                *n -= 1;
+                Some(object_store::Error::NotFound {
+                    path: key.to_string(),
+                    source: "injected supersede/transient 404".to_string().into(),
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    impl std::fmt::Display for VanishThenServeStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "VanishThenServeStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for VanishThenServeStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if let Some(e) = self.fail_or_pass(location.as_ref()) {
+                return Err(e);
+            }
+            self.inner.get_opts(location, options).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Serialises the two read-open-retry tests, which both pin the
+    /// process-global `BASIN_READ_OPEN_MAX_RETRIES` env var.
+    static READ_OPEN_RETRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Gate: a read whose listed data file 404s on first open (compaction
+    /// supersede race / transient S3 404) must STILL return the correct rows,
+    /// not fail the query. The store fails the first GET/HEAD of each data
+    /// file then serves it; the read-open retry must absorb the 404.
+    #[tokio::test]
+    async fn read_survives_file_vanishing_then_reappearing() {
+        let _env = READ_OPEN_RETRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Pin an explicit retry budget so a concurrently-restored env from the
+        // sibling test can't bleed in. Default-equivalent value.
+        std::env::set_var("BASIN_READ_OPEN_MAX_RETRIES", "5");
+        let inner = Arc::new(InMemory::new());
+        // Write the data file through a plain store.
+        let writer = Storage::new(StorageConfig {
+            object_store: inner.clone(),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let project = ProjectId::new();
+        let table = TableName::new("evt").unwrap();
+        let part = PartitionKey::default_key();
+        writer
+            .write_batch(&project, &table, &part, &small_batch(0, 100))
+            .await
+            .unwrap();
+
+        // Now read through a store that 404s the first GET/HEAD of each data
+        // file, then serves it.
+        let faulty = Arc::new(VanishThenServeStore {
+            inner: inner.clone(),
+            fails_left: std::sync::Mutex::new(std::collections::HashMap::new()),
+            initial_fails: 2,
+        });
+        let storage = Storage::new(StorageConfig {
+            object_store: faulty,
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+
+        let mut stream = read(&storage, &project, &table, ReadOptions::default())
+            .await
+            .expect("read setup must not fail");
+        let mut rows = 0usize;
+        while let Some(b) = stream.next().await {
+            let b = b.expect("read must not surface the injected 404 — it must retry");
+            rows += b.num_rows();
+        }
+        assert_eq!(rows, 100, "all rows returned despite the file vanishing then reappearing");
+        std::env::remove_var("BASIN_READ_OPEN_MAX_RETRIES");
+    }
+
+    /// With the retry budget disabled (`BASIN_READ_OPEN_MAX_RETRIES=0`), the
+    /// SAME injected 404 must fail the read — proving the test above passes
+    /// because of the retry, not because the fault never fired.
+    #[tokio::test]
+    async fn read_without_retry_budget_surfaces_the_404() {
+        let _env = READ_OPEN_RETRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("BASIN_READ_OPEN_MAX_RETRIES", "0");
+        let inner = Arc::new(InMemory::new());
+        let writer = Storage::new(StorageConfig {
+            object_store: inner.clone(),
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+        let project = ProjectId::new();
+        let table = TableName::new("evt").unwrap();
+        let part = PartitionKey::default_key();
+        writer
+            .write_batch(&project, &table, &part, &small_batch(0, 100))
+            .await
+            .unwrap();
+
+        let faulty = Arc::new(VanishThenServeStore {
+            inner: inner.clone(),
+            fails_left: std::sync::Mutex::new(std::collections::HashMap::new()),
+            initial_fails: 1,
+        });
+        let storage = Storage::new(StorageConfig {
+            object_store: faulty,
+            root_prefix: None,
+            disk_cache: None,
+            page_cache: None,
+        });
+
+        let stream = read(&storage, &project, &table, ReadOptions::default()).await;
+        let errored = match stream {
+            Err(_) => true,
+            Ok(mut s) => {
+                let mut err = false;
+                while let Some(b) = s.next().await {
+                    if b.is_err() {
+                        err = true;
+                        break;
+                    }
+                }
+                err
+            }
+        };
+        assert!(
+            errored,
+            "with retries disabled the injected 404 must fail the read (proves the fault fires)"
+        );
+        std::env::remove_var("BASIN_READ_OPEN_MAX_RETRIES");
     }
 }
