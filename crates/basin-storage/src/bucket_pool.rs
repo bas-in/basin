@@ -309,6 +309,16 @@ pub struct BucketPool {
     /// storage layer; when `None` the safe path degrades to "stay on primary"
     /// (never stripe an existing project we can't probe).
     default_store: RwLock<Option<Arc<dyn ObjectStore>>>,
+    /// The storage layer's configured root key prefix (e.g. `mn5`), if any.
+    /// Every object the storage layer writes for a project lives under
+    /// `{root}/projects/{project}/…`, so the [`Self::has_primary_data`] probe
+    /// MUST include this prefix — otherwise it lists the wrong key space
+    /// (`projects/{project}/…` with the root dropped), never sees the project's
+    /// real primary data, and an EXISTING project is wrongly striped instead of
+    /// pinned (orphaning its data). Set by [`Self::set_default_store`] alongside
+    /// the default store. `None` = no root prefix (probe `projects/{project}/`,
+    /// the default-config behaviour).
+    default_root_prefix: RwLock<Option<String>>,
 }
 
 impl BucketPool {
@@ -337,6 +347,7 @@ impl BucketPool {
             grow_lock: tokio::sync::Mutex::new(()),
             resolver,
             default_store: RwLock::new(None),
+            default_root_prefix: RwLock::new(None),
         }
     }
 
@@ -351,6 +362,41 @@ impl BucketPool {
             .default_store
             .write()
             .expect("default_store poisoned") = Some(store);
+    }
+
+    /// Register the storage layer's configured root key prefix (e.g. `mn5`) so
+    /// the [`Self::has_primary_data`] probe lists `{root}/projects/{project}/…`
+    /// — the key space the storage layer actually writes — instead of a
+    /// root-less `projects/{project}/…` that would never match real data when a
+    /// root prefix is configured. The storage layer calls this when the pool is
+    /// attached. `None`/empty = no root prefix (today's default-config probe).
+    pub fn set_default_root_prefix(&self, root_prefix: Option<String>) {
+        let normalized = root_prefix
+            .map(|p| p.trim().trim_matches('/').to_string())
+            .filter(|p| !p.is_empty());
+        *self
+            .default_root_prefix
+            .write()
+            .expect("default_root_prefix poisoned") = normalized;
+    }
+
+    /// The configured root prefix, if any (normalised, no surrounding slashes).
+    fn default_root_prefix(&self) -> Option<String> {
+        self.default_root_prefix
+            .read()
+            .expect("default_root_prefix poisoned")
+            .clone()
+    }
+
+    /// The per-project object-key prefix the storage layer writes under,
+    /// including the configured root prefix: `{root}/projects/{project}/` (or
+    /// `projects/{project}/` when no root prefix). This is the prefix the
+    /// safe-enable probe must list to see a project's real primary data.
+    fn project_primary_prefix(&self, project: &ProjectId) -> OsPath {
+        match self.default_root_prefix() {
+            Some(root) => OsPath::from(format!("{root}/projects/{project}/")),
+            None => OsPath::from(format!("projects/{project}/")),
+        }
     }
 
     /// The registered default/primary store, if any.
@@ -670,7 +716,7 @@ impl BucketPool {
         let Some(store) = self.default_store() else {
             return Ok(false);
         };
-        let prefix = OsPath::from(format!("projects/{project}/"));
+        let prefix = self.project_primary_prefix(project);
         let mut s = store.list(Some(&prefix));
         match s.next().await {
             Some(Ok(_)) => Ok(true),

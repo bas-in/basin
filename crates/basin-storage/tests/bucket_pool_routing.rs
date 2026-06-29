@@ -1320,6 +1320,98 @@ async fn primary_pin_is_stable_across_restart() {
     );
 }
 
+/// REGRESSION GATE (live bug, dev v142): the safe-enable probe must honour the
+/// storage ROOT PREFIX. With `BASIN_STORAGE_ROOT_PREFIX` set (e.g. `mn5`), an
+/// existing project's data lives at `mn5/projects/{project}/…`. The pool's
+/// `has_primary_data` probe used to list a root-LESS `projects/{project}/…`,
+/// which NEVER matches that key space — so an existing project was wrongly
+/// striped to (empty) pool buckets instead of being PINNED to primary, and a
+/// primary-pinned project routes every partition to the default store (all pool
+/// buckets stay empty, the live symptom). This gate proves the probe sees the
+/// root-prefixed data and pins.
+#[tokio::test]
+async fn existing_project_with_root_prefix_is_pinned_not_striped() {
+    use object_store::path::Path as OsPath;
+    const ROOT_PREFIX: &str = "mn5";
+    let primary: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let cat = Arc::new(InMemoryCatalog::new());
+
+    // --- Phase 1: pool OFF, ROOT PREFIX set. The existing project writes data,
+    // which lands at `mn5/projects/{project}/…` on the primary. ---
+    let storage_off = Storage::new(StorageConfig {
+        object_store: primary.clone(),
+        root_prefix: Some(OsPath::from(ROOT_PREFIX)),
+        disk_cache: None,
+        page_cache: None,
+    });
+    storage_off.attach_catalog(cat.clone() as Arc<dyn Catalog>);
+    let existing = ProjectId::new();
+    let table = TableName::new("t").unwrap();
+    let part = PartitionKey::default_key();
+    storage_off
+        .write_batch(&existing, &table, &part, &small_batch())
+        .await
+        .unwrap();
+    let rooted_prefix = format!("{ROOT_PREFIX}/projects/{existing}/");
+    assert!(
+        list_keys(&primary).await.iter().any(|k| k.starts_with(&rooted_prefix)),
+        "existing project's data must live under the ROOT-PREFIXED key space while OFF"
+    );
+
+    // --- Phase 2: flip the pool ON (same catalog + primary, same root prefix). ---
+    let storage = Storage::new(StorageConfig {
+        object_store: primary.clone(),
+        root_prefix: Some(OsPath::from(ROOT_PREFIX)),
+        disk_cache: None,
+        page_cache: None,
+    });
+    storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
+    let resolver = Arc::new(InMemoryResolver::default());
+    let pool = Arc::new(BucketPool::new(
+        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        resolver.clone(),
+    ));
+    // `attach_bucket_pool` threads BOTH the default store AND the root prefix
+    // into the pool (the fix): the probe now lists `{root}/projects/{p}/…`.
+    storage.attach_bucket_pool(pool.clone());
+
+    // Warming must PIN the existing project to primary — its root-prefixed data
+    // is found by the probe — not stripe it to empty pool buckets.
+    pool.ensure_assignment(&existing, cat.as_ref()).await.unwrap();
+    let a = cat
+        .get_bucket_assignment(&existing)
+        .await
+        .unwrap()
+        .expect("existing project must get a (pinned) assignment");
+    assert_eq!(
+        a.bucket_id, PRIMARY_PIN_BUCKET_ID,
+        "existing root-prefixed project MUST be pinned to primary, not striped"
+    );
+    assert_eq!(a.stripe, vec![PRIMARY_PIN_BUCKET_ID.to_string()]);
+    // It routes to the primary store (its real data) and never resolves a pool bucket.
+    let routed = pool.routed_store(&existing).expect("pinned route warmed");
+    assert_eq!(
+        Arc::as_ptr(&routed) as *const (),
+        Arc::as_ptr(&primary) as *const (),
+        "pinned existing project must route to the primary store"
+    );
+    assert!(
+        resolver.stores.lock().unwrap().is_empty(),
+        "no pool bucket may be resolved for a pinned existing project"
+    );
+
+    // A genuinely-fresh project (no pre-pool data anywhere) still STRIPES: the
+    // probe correctly finds nothing under `{root}/projects/{fresh}/`.
+    let fresh = ProjectId::new();
+    pool.ensure_assignment(&fresh, cat.as_ref()).await.unwrap();
+    let fa = cat.get_bucket_assignment(&fresh).await.unwrap().expect("fresh assigned");
+    assert_ne!(fa.bucket_id, PRIMARY_PIN_BUCKET_ID, "a fresh project must NOT be pinned");
+    assert!(
+        fa.stripe.iter().all(|b| b.starts_with("pool-")),
+        "a fresh project must stripe across pool buckets"
+    );
+}
+
 // ===========================================================================
 // #36 multi-bucket pool — bucket_name vs root-prefix regression gate.
 //

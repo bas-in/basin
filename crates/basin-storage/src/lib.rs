@@ -779,6 +779,12 @@ impl Storage {
         // existing project's primary-bucket data (pin-not-stripe, never orphan)
         // and (b) resolve a primary-pinned assignment back to the primary store.
         pool.set_default_store(self.inner.object_store.clone());
+        // Give the pool the configured root key prefix too, so its safe-enable
+        // probe (`has_primary_data`) lists `{root}/projects/{project}/…` — the
+        // exact key space the storage layer writes — instead of a root-less
+        // `projects/{project}/…` that would never match real data when a root
+        // prefix (e.g. `mn5`) is configured.
+        pool.set_default_root_prefix(self.inner.root_prefix.as_ref().map(|p| p.as_ref().to_string()));
         let _ = self.inner.bucket_pool.set(pool);
     }
 
