@@ -358,19 +358,16 @@ pub(crate) struct PartitionState {
     /// duplicate cold file. A legacy catalog without a watermark replays from
     /// `Lsn::ZERO` (the prior behavior) — see `replay_wal_into`.
     ///
-    /// Cancellation-safety (the count(*)>count(DISTINCT) incident, #30/#46):
-    /// this is an `Arc<AtomicU64>` so `compact_one_impl` can advance it
-    /// SYNCHRONOUSLY — with no `.await` between the catalog commit returning
-    /// and the advance — the instant a wave commits, BEFORE the physical tail
-    /// prune. The tail snapshot filters out entries at or below it, so if the
-    /// read-path drain's bounded timeout DROPS the compaction future after a
-    /// wave committed but before it pruned the tail, the next (background or
-    /// read) compaction re-snapshots that partition, sees those entries are
-    /// already covered by the watermark, and does NOT commit a second file for
-    /// them. The stale physical tail entries are pruned by the next drain that
-    /// runs to completion. Atomic (not the `PartitionState` RwLock) precisely
-    /// so the advance needs no await and thus no cancellation point.
-    last_compacted_lsn: Arc<std::sync::atomic::AtomicU64>,
+    /// This is in-memory replay bookkeeping ONLY: it seeds the post-restart
+    /// replay floor and tracks the highest LSN compacted this process. It is
+    /// NEVER used to filter the compaction tail snapshot — doing so stalled the
+    /// drain (a fresh load whose tail LSNs sit at-or-below a stale persisted
+    /// watermark, seeded here on fault-in, was excluded wholesale, committing
+    /// nothing — the count(*)=0 incident, #48). Idempotency of the read-path
+    /// drain is provided by the cancellation-safe DETACHED drain in
+    /// `flush_to_parquet_for_read`, which runs commit→prune→watermark as one
+    /// uninterrupted unit; no snapshot filter is needed.
+    last_compacted_lsn: Lsn,
     /// Schemas cached from the catalog the first time we touch a table.
     schemas: HashMap<TableName, Arc<Schema>>,
     /// In-memory tail keyed by table. Each `(lsn, batch)` pair tracks the WAL
@@ -403,7 +400,7 @@ impl PartitionState {
             project,
             partition,
             last_active: Instant::now(),
-            last_compacted_lsn: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_compacted_lsn: Lsn::ZERO,
             schemas: HashMap::new(),
             tail: HashMap::new(),
             compact_lock: Arc::new(Mutex::new(())),
@@ -2084,17 +2081,6 @@ impl InProcessShard {
             let guard = state.read().await;
             guard.compact_lock.clone()
         };
-        // The committed-through watermark for THIS partition. Cloned out as an
-        // `Arc<AtomicU64>` so the commit loop can advance it with no `.await`
-        // between the catalog commit returning and the advance — see the field
-        // doc on `PartitionState::last_compacted_lsn`. Filtering the tail
-        // snapshot by it (below) makes compaction idempotent under the read-path
-        // bounded-timeout cancellation that can drop this future after a wave
-        // committed but before its tail prune ran.
-        let watermark = {
-            let guard = state.read().await;
-            guard.last_compacted_lsn.clone()
-        };
         // Non-blocking read-path variant: if a compaction is already in flight
         // for this partition, don't wait behind it. `try_lock` keeps the
         // guard's lifetime tied to this scope; bind it so the guard outlives
@@ -2149,25 +2135,11 @@ impl InProcessShard {
         // per-wave memory and in-flight PUTs.
         let tail_snapshot: Vec<(TableName, Vec<(Lsn, RecordBatch)>)> = {
             let guard = state.read().await;
-            // Idempotency floor (defense-in-depth): never re-snapshot an entry
-            // whose data an earlier wave/compaction already committed. `compact
-            // _one_impl` advances `watermark` to each wave's PROVABLY-SAFE floor
-            // as part of the prune below; a second compaction that snapshots
-            // AFTER that advance — a concurrent or background compaction racing a
-            // just-pruned wave — therefore skips the already-committed entries
-            // instead of re-committing a duplicate file for them. (The primary
-            // guard against the count(*)>count(DISTINCT id) incident is the
-            // cancellation-safe detached read-path drain in
-            // `flush_to_parquet_for_read`, which guarantees the prune + this
-            // watermark advance always run; this filter closes the residual
-            // concurrent-re-snapshot window the per-partition compaction lock
-            // already mostly covers.)
-            let floor = Lsn(watermark.load(std::sync::atomic::Ordering::SeqCst));
             let mut chunks: Vec<(TableName, Vec<(Lsn, RecordBatch)>)> = Vec::new();
             'outer: for (t, v) in guard.tail.iter().filter(|(_, v)| !v.is_empty()) {
                 let mut taken = Vec::new();
                 let mut rows = 0usize;
-                for (lsn, b) in v.iter().filter(|(lsn, _)| *lsn > floor) {
+                for (lsn, b) in v.iter() {
                     // Always take at least one batch per chunk so a single
                     // oversized batch still makes progress; close the chunk
                     // once it would exceed the per-file row budget and start a
@@ -2626,6 +2598,9 @@ impl InProcessShard {
                 if let Some(v) = guard.tail.get_mut(table) {
                     v.retain(|(lsn, _)| *lsn > *max_lsn);
                 }
+                if guard.last_compacted_lsn < *max_lsn {
+                    guard.last_compacted_lsn = *max_lsn;
+                }
             }
             // Lowest LSN still sitting in ANY table's tail after this drain.
             let min_remaining = guard
@@ -2643,30 +2618,6 @@ impl InProcessShard {
                 None => max_lsn_overall,
             }
         };
-        // Advance the in-memory committed-through watermark to the PROVABLY-SAFE
-        // floor for this wave — the largest LSN below which every entry (of
-        // every table) is committed. The tail-snapshot filter at the top of the
-        // loop reads this, so subsequent compactions (this drain's next wave,
-        // the background tick, or a read-path drain) never re-snapshot — and
-        // thus never re-commit a duplicate file for — already-committed rows.
-        // Advancing to the safe FLOOR (not a per-table max) is what keeps a
-        // multi-table wave from stranding a lower-LSN entry of a table whose
-        // commit comes later. Monotonic.
-        if let Some(floor) = wave_safe_floor {
-            let mut cur = watermark.load(std::sync::atomic::Ordering::SeqCst);
-            while floor.0 > cur {
-                match watermark.compare_exchange_weak(
-                    cur,
-                    floor.0,
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                ) {
-                    Ok(_) => break,
-                    Err(observed) => cur = observed,
-                }
-            }
-        }
-
         // PER-WAVE durable watermark (duplicate-row crash-window fix). The
         // catalog commits above are visible now; if a LATER wave's write/commit
         // fails (e.g. a wedged data PUT) the whole `compact_one_impl` aborts via
@@ -5156,10 +5107,8 @@ async fn replay_wal_into(
     };
     // Seed the in-memory marker so the first post-restart compaction's
     // `last_compacted_lsn` bookkeeping starts from the durable floor.
-    if state.last_compacted_lsn.load(std::sync::atomic::Ordering::SeqCst) < floor.0 {
-        state
-            .last_compacted_lsn
-            .store(floor.0, std::sync::atomic::Ordering::SeqCst);
+    if state.last_compacted_lsn < floor {
+        state.last_compacted_lsn = floor;
     }
     let entries = wal.read_from(project, partition, floor).await?;
     for entry in entries {
@@ -6463,6 +6412,90 @@ mod tests {
             );
             crash_view.close().await.unwrap();
         }
+    }
+
+    /// REGRESSION (the count(*) stays 0 / "tail never drains" incident, #48):
+    /// a normal load reported DONE (rows WAL-durable) but `count(*)` stayed 0
+    /// for minutes with ZERO "compaction complete" log lines — the in-memory
+    /// tail was never folded into committed segments.
+    ///
+    /// Root cause: `compact_one_impl` filtered its tail SNAPSHOT by the
+    /// in-memory compaction watermark (`lsn > last_compacted_lsn`). The
+    /// watermark is seeded on partition fault-in from the catalog's PERSISTED
+    /// (object-store) compaction watermark, which is monotonic and survives a
+    /// WAL reset. When a fresh load's tail entries sit at LSNs at-or-below that
+    /// stale-but-persisted floor, the snapshot filter excluded the ENTIRE tail
+    /// -> `tail_snapshot` empty -> the drain loop broke immediately, committing
+    /// nothing and logging nothing. `count(*)` (answered from committed segment
+    /// state) stayed 0 indefinitely.
+    ///
+    /// This drives that exact seam deterministically: write N rows to a fresh
+    /// partition (the tail holds LSNs `1..=N`), then seed the partition's
+    /// in-memory watermark to N — modeling the fault-in seeding from a stale
+    /// persisted watermark — and run the NORMAL background drain. The invariant:
+    /// every WAL-durable tail row drains into a committed segment, so
+    /// `count(*) == count(DISTINCT id) == N`.
+    ///
+    /// Pre-fix (snapshot filter present) this FAILS: the filter excludes the
+    /// whole tail and `count(*)` stays 0.
+    #[tokio::test]
+    async fn compaction_drains_tail_when_watermark_seeded_high() {
+        let (shard, _sd, _wd, _storage, catalog, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        const N: usize = 50_000;
+        const PER: usize = 1_000;
+        let handle = shard.get(&project, &partition).await.unwrap();
+        for i in 0..(N / PER) {
+            handle
+                .write_batch(&table, batch((i * PER) as i64, PER, "v-"))
+                .await
+                .unwrap();
+        }
+
+        let inner = impl_of(&shard);
+
+        // Seed the in-memory compaction watermark to the tail's max LSN, exactly
+        // as `replay_wal_into` does on fault-in from the catalog's persisted
+        // (monotonic, survives-WAL-reset) watermark. Find the partition's max
+        // tail LSN and store it.
+        let state = {
+            let map = inner.partitions.lock().await;
+            map.get(&(project, partition.clone())).unwrap().clone()
+        };
+        {
+            let mut guard = state.write().await;
+            let max_tail_lsn = guard
+                .tail
+                .values()
+                .flat_map(|v| v.iter().map(|(lsn, _)| *lsn))
+                .max()
+                .expect("tail non-empty");
+            guard.last_compacted_lsn = max_tail_lsn;
+        }
+
+        // Normal background drain (the compaction-tick path).
+        inner.run_compaction_once().await.unwrap();
+
+        // INVARIANT: every WAL-durable tail row drained into committed segments.
+        let committed = committed_count(&catalog, &project, &table).await;
+        assert_eq!(
+            committed, N as u64,
+            "committed count(*) must equal N (got {committed}, wrote {N}) — a \
+             seeded-high in-memory watermark must NOT cause the drain to skip the \
+             whole tail and commit nothing",
+        );
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(distinct_ids(&read), N, "count(DISTINCT id) must equal N");
+
+        // Tail fully drained.
+        let guard = state.read().await;
+        assert!(
+            guard.tail_is_empty(),
+            "tail must be empty after the drain",
+        );
     }
 
     #[tokio::test]
