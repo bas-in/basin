@@ -2806,6 +2806,26 @@ pub(crate) async fn open(
     // project fairness on shared object-store backends (real S3 in
     // particular, where the shared reqwest pool would otherwise be
     // saturated by one heavy project).
+    // #36 (Stage 2b): WARM the project's bucket assignment from the durable
+    // catalog BEFORE resolving the scan store. `scan_object_store` registers
+    // the striping-aware store only when `should_stripe_scan` sees a warmed
+    // multi-bucket stripe in the pool's per-process cache. That cache is warmed
+    // by writes (the writer's `ensure_bucket_assignment`), so a node that has
+    // only ever SERVED READS for this project — the non-owning multi-node peer,
+    // or any node after a restart — would find a COLD cache, register the plain
+    // primary store, and full-scan ZERO files for a striped project (whose data
+    // lives in the pool buckets, not on primary). Warming reads the durable
+    // assignment and populates the cache so the registration below stripes
+    // correctly regardless of which node planned the write. No-op when the pool
+    // is OFF/absent or the project is unstriped (width-1 → primary, unchanged).
+    // FAIL CLOSED: if the assignment cannot be resolved we must NOT silently
+    // register the primary store and return wrong (empty) results for a striped
+    // table — surface the error and let the session open fail.
+    engine
+        .config()
+        .storage
+        .ensure_bucket_assignment(&project)
+        .await?;
     // #36 (Stage 2a, Scheme C): when partition→bucket striping is ON and this
     // project has a warmed multi-bucket stripe, register the striping-aware
     // store so each `basin://engine/<path>` GET re-derives the file's partition
