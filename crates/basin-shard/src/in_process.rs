@@ -491,6 +491,14 @@ pub(crate) struct InProcessShard {
     #[cfg(test)]
     post_commit_barrier:
         Arc<std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
+    /// Test-only fault injector for #48: the number of upcoming compaction
+    /// catalog commits to turn into an AMBIGUOUS result — the append applies
+    /// durably but `commit_with_retry` sees a synthetic transient error, exactly
+    /// as a segment/head PUT that lands server-side but whose response is lost
+    /// under storage backpressure (observed on the 100M cloud load). Drives the
+    /// idempotency probe in `commit_with_retry`. `0` (no-op) in production.
+    #[cfg(test)]
+    commit_ambiguous_fault: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl InProcessShard {
@@ -510,6 +518,8 @@ impl InProcessShard {
             ingest_rate: Arc::new(IngestRate::new()),
             #[cfg(test)]
             post_commit_barrier: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            commit_ambiguous_fault: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -557,6 +567,11 @@ impl InProcessShard {
             // `compact_all_for_read` the read path runs (also on a share_clone).
             #[cfg(test)]
             post_commit_barrier: self.post_commit_barrier.clone(),
+            // Test-only: SHARED across share_clones so a fault installed on the
+            // original handle is observed by the compaction the background/read
+            // paths run on a share_clone (mirrors post_commit_barrier).
+            #[cfg(test)]
+            commit_ambiguous_fault: self.commit_ambiguous_fault.clone(),
         }
     }
 
@@ -584,6 +599,40 @@ impl InProcessShard {
             .post_commit_barrier
             .lock()
             .expect("post_commit_barrier lock poisoned") = sem;
+    }
+
+    /// Test-only: arm the #48 ambiguous-commit fault for the next `n` compaction
+    /// catalog commits. See the `commit_ambiguous_fault` field doc.
+    #[cfg(test)]
+    pub(crate) fn set_commit_ambiguous_fault(&self, n: usize) {
+        self.commit_ambiguous_fault
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: if the fault counter is positive and `res` is `Ok`, consume one
+    /// and turn it into a synthetic transient error — the append already applied
+    /// to the catalog, so this models a commit that LANDED but whose response was
+    /// lost. No-op when the counter is 0 or `res` is already an error.
+    #[cfg(test)]
+    fn maybe_inject_ambiguous_commit<T>(&self, res: Result<T>) -> Result<T> {
+        use std::sync::atomic::Ordering;
+        if res.is_ok()
+            && self
+                .commit_ambiguous_fault
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    if n > 0 {
+                        Some(n - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+        {
+            return Err(BasinError::storage(
+                "injected ambiguous commit (test): append landed but response lost",
+            ));
+        }
+        res
     }
 
     /// Acquire (or refresh) the lease for `(project, partition)` on first
@@ -2779,27 +2828,84 @@ impl InProcessShard {
         };
 
         for attempt in 0..2 {
-            match self
+            let res = self
                 .cfg
                 .catalog
                 .append_data_files_in_partition(project, table, pid, snapshot, files.clone())
-                .await
-            {
+                .await;
+            // Test-only (#48): turn the next armed commit into an AMBIGUOUS
+            // result — the append applied durably but the response is "lost".
+            #[cfg(test)]
+            let res = self.maybe_inject_ambiguous_commit(res);
+            match res {
                 Ok(_) => return Ok(()),
-                Err(BasinError::CommitConflict(_)) if attempt == 0 => {
-                    snapshot = self
-                        .cfg
-                        .catalog
-                        .current_snapshot_id_in_partition(project, table, pid)
-                        .await?;
-                    continue;
+                Err(e) => {
+                    // #48 IDEMPOTENCY PROBE. An append whose underlying
+                    // segment/head PUT LANDED but returned a transient error
+                    // (ambiguous commit under storage backpressure) would
+                    // otherwise abort the wave, leave the in-memory tail
+                    // UN-pruned, and let the NEXT compaction tick re-flush the
+                    // same rows into a fresh file — both committed, so the rows
+                    // are DUPLICATED (count(*) > count(distinct); the distinct
+                    // set is unchanged because the ids are identical). The
+                    // CommitConflict retry below has the same hazard: if it was
+                    // OUR OWN landed append that advanced the head, re-appending
+                    // the same paths on the refreshed snapshot double-commits.
+                    // So before reacting to ANY error, re-read the partition's
+                    // committed live set: if THIS wave's files (their paths are
+                    // deterministic and fixed BEFORE the commit) are already
+                    // present, the commit truly succeeded — return Ok so the
+                    // caller PRUNES the tail instead of re-flushing. Safe and
+                    // idempotent: it only converts a landed-but-unacknowledged
+                    // commit into the success it actually was.
+                    if self.files_committed(project, table, pid, &files).await {
+                        return Ok(());
+                    }
+                    match e {
+                        BasinError::CommitConflict(_) if attempt == 0 => {
+                            snapshot = self
+                                .cfg
+                                .catalog
+                                .current_snapshot_id_in_partition(project, table, pid)
+                                .await?;
+                            continue;
+                        }
+                        other => return Err(other),
+                    }
                 }
-                Err(e) => return Err(e),
             }
         }
         Err(BasinError::CommitConflict(format!(
             "{project}/{table}[{pid}]: lost commit race twice"
         )))
+    }
+
+    /// #48: whether every file in `files` (matched by its deterministic path) is
+    /// already present in the partition's committed live set. Used by
+    /// [`commit_with_retry`](Self::commit_with_retry) to recognise a
+    /// landed-but-unacknowledged (ambiguous) commit and avoid re-flushing the
+    /// same rows into a second file. A read error answers `false` (cannot
+    /// confirm → the caller retries or propagates the original error).
+    async fn files_committed(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        pid: &str,
+        files: &[DataFileRef],
+    ) -> bool {
+        match self
+            .cfg
+            .catalog
+            .live_data_files_in_partition(project, table, pid)
+            .await
+        {
+            Ok((_snapshot, live)) => {
+                let present: std::collections::HashSet<&str> =
+                    live.iter().map(|f| f.path.as_str()).collect();
+                files.iter().all(|f| present.contains(f.path.as_str()))
+            }
+            Err(_) => false,
+        }
     }
 
     async fn refresh_resident_stats(&self) {
@@ -10660,5 +10766,64 @@ mod tests {
 
         std::env::remove_var("BASIN_SHARD_FLUSH_CONCURRENCY");
         std::env::remove_var("BASIN_FASTAGG_COMPACT_TIMEOUT_MS");
+    }
+
+    /// #48 regression: an AMBIGUOUS compaction commit — the catalog append lands
+    /// durably but `commit_with_retry` sees a transient error, exactly as a
+    /// segment/head PUT that succeeds server-side but whose response is lost
+    /// under storage backpressure (observed duplicating ~210k rows on the 100M
+    /// cloud load) — must NOT cause the next compaction tick to re-flush the same
+    /// tail rows into a second file. The idempotency probe recognises the landed
+    /// commit, so the tail is pruned and no duplicate file is created.
+    #[tokio::test]
+    async fn ambiguous_compaction_commit_does_not_duplicate_rows() {
+        basin_common::telemetry::try_init_for_tests();
+        // One file per wave keeps the commit/prune arithmetic exact.
+        std::env::set_var("BASIN_SHARD_FLUSH_CONCURRENCY", "1");
+
+        let (shard, _sd, _wd, _storage, catalog, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        const N: usize = 200;
+        let handle = shard.get(&project, &partition).await.unwrap();
+        for i in 0..N as i64 {
+            handle.write_batch(&table, batch(i, 1, "v-")).await.unwrap();
+        }
+
+        // Arm ONE ambiguous commit: the first compaction wave's catalog append
+        // applies, but commit_with_retry observes a synthetic transient error.
+        let inner = impl_of(&shard);
+        inner.set_commit_ambiguous_fault(1);
+
+        // First compaction hits the ambiguous commit. Post-fix the idempotency
+        // probe sees the file already committed → Ok → the tail is pruned.
+        // Pre-fix the error aborts the wave with the tail un-pruned (compact_all
+        // logs + swallows the per-partition error, so this still returns Ok).
+        inner.run_compaction_once().await.unwrap();
+        // Second compaction: post-fix the tail is empty (no-op). Pre-fix it
+        // re-snapshots the un-pruned tail and commits a SECOND file for the same
+        // rows → duplicates (count(*) == 2N while distinct == N).
+        inner.run_compaction_once().await.unwrap();
+        // Converge any residual tail either way.
+        shard.flush_to_parquet().await.unwrap();
+
+        let committed = committed_count(&catalog, &project, &table).await;
+        assert_eq!(
+            committed, N as u64,
+            "committed count(*) must equal N (got {committed}) — an ambiguous \
+             (landed-but-unacked) commit must not let the next tick re-flush the \
+             un-pruned tail into a duplicate file",
+        );
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(distinct_ids(&read), N, "count(DISTINCT id) must equal N");
+        assert_eq!(
+            rows_in(&read),
+            N,
+            "total rows read back must equal N (no duplicate, no loss)",
+        );
+
+        std::env::remove_var("BASIN_SHARD_FLUSH_CONCURRENCY");
     }
 }
