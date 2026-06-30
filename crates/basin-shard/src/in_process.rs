@@ -307,6 +307,24 @@ fn flush_concurrency() -> usize {
     DEFAULT_FLUSH_CONCURRENCY
 }
 
+/// #50: grace window (seconds) compaction waits before deleting a merge's
+/// SUPERSEDED input objects. A long full-scan plans against the file list as it
+/// was at planning time; if a concurrent stripe/file merge deletes one of those
+/// inputs before the scan's GET reaches it, the GET fails `NoSuchKey` (404) and
+/// the whole query errors — the read-vs-GC race seen on the 100M pool battery.
+/// Holding the (already catalog-unreferenced) inputs for this window lets
+/// in-flight reads finish first. `0` restores immediate deletion. Default 300s
+/// — comfortably longer than a multi-minute full-table scan at 100M–1B, bounded
+/// so superseded bytes are reclaimed promptly once the window elapses.
+/// Overridable via `BASIN_SUPERSEDED_DELETE_GRACE_SECS`.
+fn superseded_delete_grace() -> std::time::Duration {
+    let secs = std::env::var("BASIN_SUPERSEDED_DELETE_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(300);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Resolved per-table write configuration, cached for the lifetime of one
 /// `compact_one` call so the compactor reads the table's catalog metadata once
 /// per table instead of once per flushed file. Every field is table-level
@@ -2908,6 +2926,50 @@ impl InProcessShard {
         }
     }
 
+    /// #50: delete compaction-SUPERSEDED objects after `grace`, so an in-flight
+    /// full-scan that planned against the pre-merge file list finishes before
+    /// the object is removed (else its GET fails `NoSuchKey`/404 and the query
+    /// errors). The merge already committed the replacement, so these paths are
+    /// catalog-UNREFERENCED — deletion is pure space reclamation and a crash
+    /// during the grace window leaks them only as harmless orphans (re-derivable
+    /// by a vacuum), never data loss. Associated fn (not `&self`) so it can be
+    /// spawned detached and unit-tested with a zero grace.
+    async fn delete_superseded_after_grace(
+        storage: basin_storage::Storage,
+        project: ProjectId,
+        paths: Vec<String>,
+        grace: std::time::Duration,
+    ) {
+        if !grace.is_zero() {
+            tokio::time::sleep(grace).await;
+        }
+        for p in paths {
+            let path = object_store::path::Path::from(p.clone());
+            if let Err(e) = storage.delete_file(&project, &path).await {
+                warn!(
+                    %project,
+                    path = %p,
+                    error = %e,
+                    "deferred superseded-file delete failed (harmless orphan)",
+                );
+            }
+        }
+    }
+
+    /// Spawn the deferred superseded-file delete (#50) on the runtime. No-op for
+    /// an empty set. Replaces the immediate post-merge delete loop at the
+    /// stripe-merge / file-merge sites.
+    fn spawn_deferred_superseded_delete(&self, project: ProjectId, paths: Vec<String>) {
+        if paths.is_empty() {
+            return;
+        }
+        let storage = self.cfg.storage.clone();
+        let grace = superseded_delete_grace();
+        tokio::spawn(Self::delete_superseded_after_grace(
+            storage, project, paths, grace,
+        ));
+    }
+
     async fn refresh_resident_stats(&self) {
         let map = self.partitions.lock().await;
         let mut stats = self.stats.lock().await;
@@ -3420,21 +3482,13 @@ impl InProcessShard {
             }
         }
 
-        // Delete the superseded objects best-effort (same pattern as the
-        // tiering sweep — a leftover object is wasted bytes, not a
-        // correctness issue: the catalog no longer references it).
-        for old in &removed {
-            let path = object_store::path::Path::from(old.clone());
-            if let Err(e) = self.cfg.storage.delete_file(project, &path).await {
-                warn!(
-                    %project,
-                    %table,
-                    path = %old,
-                    error = %e,
-                    "stripe-merge: superseded file delete failed (orphan)",
-                );
-            }
-        }
+        // #50: DEFER the superseded-input deletes past a grace window. The merge
+        // already committed the replacement, so these paths are catalog-
+        // unreferenced (a leftover is wasted bytes, never a correctness issue) —
+        // but deleting them IMMEDIATELY races an in-flight full-scan that planned
+        // against the pre-merge file list, whose GET then 404s the whole query.
+        // Holding them for the grace window lets in-flight reads finish first.
+        self.spawn_deferred_superseded_delete(*project, removed.clone());
 
         {
             let mut stats = self.stats.lock().await;
@@ -3992,12 +4046,10 @@ impl InProcessShard {
             }
         }
 
-        for old in removed {
-            let path = object_store::path::Path::from(old.clone());
-            if let Err(e) = self.cfg.storage.delete_file(project, &path).await {
-                warn!(%project, %table, path = %old, error = %e, "file-merge: superseded file delete failed (orphan)");
-            }
-        }
+        // #50: defer the superseded-input deletes (see stripe-merge sweep) so an
+        // in-flight full-scan finishes before these catalog-unreferenced objects
+        // are removed, instead of racing its GET into a NoSuchKey/404.
+        self.spawn_deferred_superseded_delete(*project, removed.to_vec());
     }
 }
 
