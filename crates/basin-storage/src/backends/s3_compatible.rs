@@ -157,6 +157,36 @@ fn resolve_request_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_S3_REQUEST_TIMEOUT_SECS)
 }
 
+/// The connection-pool + timeout [`ClientOptions`] Basin pins on EVERY S3
+/// client — the primary backend ([`S3LikeConfig::build_object_store`]) and the
+/// multi-bucket-pool resolver alike: a bounded idle pool, idle-eviction kept
+/// below Tigris's server keep-alive window, and tight whole-request / connect
+/// ceilings so a stuck PUT fails fast and recycles its connection instead of
+/// tying it up for minutes.
+///
+/// Exposed (#46) so the pooled-bucket resolver applies the SAME hardening. When
+/// a pooled-bucket store is built without it, the PUTs inherit object_store's
+/// loose defaults (10 retries / 180s budget / NO whole-request timeout); a slow
+/// Tigris PUT under post-load compaction backpressure then hangs ~200s, a
+/// handful exhaust the per-host connection pool, and every subsequent compaction
+/// PUT fails with "error sending request" — the tail never promotes and
+/// `count(*)` stalls below the row total until the process is restarted.
+pub fn tuned_client_options() -> ClientOptions {
+    ClientOptions::default()
+        .with_pool_max_idle_per_host(resolve_pool_max_idle())
+        .with_pool_idle_timeout(Duration::from_secs(resolve_pool_idle_timeout_secs()))
+        .with_timeout(Duration::from_secs(resolve_request_timeout_secs()))
+        .with_connect_timeout(Duration::from_secs(10))
+}
+
+/// The tight S3 retry budget Basin pins on every client (see
+/// [`tuned_client_options`]). Exposed (#46) so the pooled-bucket resolver
+/// matches the primary backend instead of inheriting object_store's loose
+/// 10×/180s default that wedges compaction under storage backpressure.
+pub fn tuned_retry_config() -> RetryConfig {
+    resolve_retry_config()
+}
+
 /// Provider flavour. The values share the same builder and the same
 /// env-var surface; only the *default* region and endpoint differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -309,25 +339,14 @@ impl S3LikeConfig {
         // (footer + row-group reads), which is what capped QPS in the bench;
         // we raise it and pin timeouts so a hung connection fails fast instead
         // of stalling the whole query.
-        let client_opts = ClientOptions::default()
-            .with_pool_max_idle_per_host(resolve_pool_max_idle())
-            // Evict idle connections BEFORE the S3 server (Tigris) half-closes
-            // them server-side. Reusing a keep-alive the server already dropped
-            // is exactly the "error sending request" wedge seen on the live
-            // cluster (a client-SEND failure: the request never left). Keeping
-            // this BELOW Tigris's server keep-alive window means an idle socket
-            // is dropped from the pool and a fresh one dialled instead of being
-            // handed, dead, to the next compaction PUT. Short enough to evict a
-            // stale conn, long enough to stay warm across a compaction sweep's
-            // back-to-back PUTs. Env-tunable via BASIN_S3_POOL_IDLE_TIMEOUT_SECS.
-            .with_pool_idle_timeout(Duration::from_secs(resolve_pool_idle_timeout_secs()))
-            // Whole-request and connect ceilings: a stuck S3 GET/PUT should error
-            // out and recycle its pooled connection rather than wedge the worker
-            // (or, under sustained flushes, exhaust the pool). Env-tunable; the
-            // default is tight enough that a stuck request can't tie a connection
-            // up for long.
-            .with_timeout(Duration::from_secs(resolve_request_timeout_secs()))
-            .with_connect_timeout(Duration::from_secs(10));
+        // Shared hardened client config (#46): bounded idle pool + idle-eviction
+        // below Tigris's keep-alive + tight whole-request/connect ceilings so a
+        // stuck GET/PUT fails fast and recycles its connection rather than
+        // wedging the worker or exhausting the pool. The multi-bucket-pool
+        // resolver applies the SAME `tuned_client_options()` so pooled buckets
+        // are hardened identically (env-tunable via BASIN_S3_POOL_IDLE_TIMEOUT_SECS
+        // / BASIN_S3_REQUEST_TIMEOUT_SECS).
+        let client_opts = tuned_client_options();
 
         let mut b = AmazonS3Builder::new()
             .with_bucket_name(&self.bucket)
@@ -568,6 +587,34 @@ mod tests {
         );
         // Backoff is capped tight so the budget isn't burned in one long sleep.
         assert_eq!(rc.backoff.max_backoff, Duration::from_secs(5));
+    }
+
+    /// #46: the multi-bucket-pool resolver shares `tuned_retry_config()` /
+    /// `tuned_client_options()` so pooled buckets get the SAME tight hardening
+    /// as the primary backend. Guard that the shared budget is the tight Basin
+    /// default and never object_store's loose 10×/180s — a regression there is
+    /// exactly the pooled-bucket compaction wedge (count(*) stalls under load).
+    #[test]
+    fn tuned_config_is_the_tight_shared_budget() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = clean_env_with(&[]);
+        let rc = tuned_retry_config();
+        assert_eq!(rc.max_retries, DEFAULT_S3_MAX_RETRIES);
+        assert_eq!(
+            rc.retry_timeout,
+            Duration::from_secs(DEFAULT_S3_RETRY_TIMEOUT_SECS)
+        );
+        assert_ne!(
+            rc.max_retries, 10,
+            "pooled-bucket resolver must not inherit object_store's loose retry count"
+        );
+        assert_ne!(
+            rc.retry_timeout,
+            Duration::from_secs(180),
+            "pooled-bucket resolver must not inherit object_store's loose 180s budget"
+        );
+        // Constructing the shared client options must not panic.
+        let _ = tuned_client_options();
     }
 
     #[test]

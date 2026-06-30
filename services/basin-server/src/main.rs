@@ -2049,6 +2049,17 @@ impl basin_storage::bucket_pool::BucketResolver for S3BucketResolver {
                     &entry.endpoint,
                 )),
             )
+            // #46: apply the SAME hardened retry budget + connection-pool/timeout
+            // ClientOptions the primary backend pins. Without this a pooled-bucket
+            // PUT inherits object_store's loose 10×/180s/no-request-timeout
+            // defaults; a slow Tigris PUT under post-load compaction backpressure
+            // then hangs ~200s, a few exhaust the per-host connection pool, and
+            // every subsequent compaction PUT fails with "error sending request"
+            // so the tail never promotes and count(*) stalls below the row total.
+            .with_retry(basin_storage::backends::s3_compatible::tuned_retry_config())
+            .with_client_options(
+                basin_storage::backends::s3_compatible::tuned_client_options(),
+            )
             .build()
             .map_err(|e| {
                 basin_common::BasinError::storage(format!(
