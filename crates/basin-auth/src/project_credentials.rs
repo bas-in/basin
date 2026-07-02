@@ -200,15 +200,19 @@ pub(crate) async fn provision(
 
 pub(crate) async fn validate(inner: &Inner, user: &str, password_plain: &str) -> Result<ProjectId> {
     // Uniform error for both "no such user" and "user exists but wrong
-    // password" — keeps the SQLSTATE 28P01 surface minimal and avoids
-    // leaking enumeration information. bcrypt's constant-ish work factor
-    // does the timing-attack hardening; we add a single error string here.
+    // password" — keeps the SQLSTATE 28P01 surface minimal and avoids leaking
+    // enumeration information. The uniform *string* isn't enough on its own: the
+    // not-found branch returns before doing any bcrypt work, so we equalize its
+    // timing with a dummy verify (see `password::verify_dummy`) — otherwise
+    // response latency alone distinguishes a real `pgwire_user` (which embeds
+    // the project id) from an unknown one.
     let unknown = || BasinError::InvalidIdent("invalid pgwire credentials".into());
     if user.is_empty() {
         return Err(unknown());
     }
     let row = inner.store.find_project_credential(user).await?;
     let Some(row) = row else {
+        password::verify_dummy(password_plain, inner.cfg.bcrypt_cost);
         return Err(unknown());
     };
     if !password::verify(password_plain, &row.password_hash)? {

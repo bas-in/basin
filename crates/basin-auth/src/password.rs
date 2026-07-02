@@ -17,6 +17,25 @@ pub fn verify(password: &str, hash: &str) -> Result<bool> {
     bcrypt::verify(password, hash).map_err(|e| BasinError::internal(format!("bcrypt verify: {e}")))
 }
 
+/// Perform a bcrypt verify against a process-static dummy hash and discard the
+/// result. This exists purely for its *timing*: the credential lookup returns
+/// early on an unknown username, so without this the "no such user" path would
+/// be measurably faster than the "user exists, wrong password" path — letting an
+/// attacker enumerate valid `pgwire_user` strings (which embed the project id)
+/// by response latency. Calling this on the not-found branch equalizes the two.
+///
+/// The dummy hash is computed once at `cost` — the same work factor real
+/// credentials use — and cached. If that one-time hash somehow fails (only an
+/// invalid cost can do that, which config already rejects) the call is a no-op
+/// rather than a panic on the auth hot path.
+pub fn verify_dummy(password: &str, cost: u32) {
+    static DUMMY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let dummy = DUMMY.get_or_init(|| hash("bcrypt-timing-equalizer", cost).ok());
+    if let Some(h) = dummy {
+        let _ = bcrypt::verify(password, h);
+    }
+}
+
 /// Reject passwords shorter than `min_len` bytes. Length is checked in bytes,
 /// not chars, because attackers measure storage too.
 pub fn check_length(password: &str, min_len: usize) -> Result<()> {
@@ -57,5 +76,15 @@ mod tests {
     fn check_length_rejects_huge() {
         let huge = "a".repeat(2048);
         assert!(check_length(&huge, 10).is_err());
+    }
+
+    #[test]
+    fn verify_dummy_completes_without_error() {
+        // The unknown-user auth branch calls this to pay bcrypt's timing cost so
+        // response latency can't distinguish it from a wrong-password attempt.
+        // cost 4 keeps the test fast; it must run the dummy bcrypt verify (and
+        // discard the result) without panicking, for any input including empty.
+        verify_dummy("any password", 4);
+        verify_dummy("", 4);
     }
 }
