@@ -118,6 +118,27 @@ fn idle_timeout_from_env() -> Option<Duration> {
     }
 }
 
+/// Global ceiling on concurrently-served pgwire connections, enforced at the
+/// accept loop *before* a per-connection task is spawned. This is the process's
+/// OOM backstop against a raw TCP connection flood: the per-project
+/// [`ConnectionLimiter`] only applies *after* the pgwire startup handshake, so
+/// without this a flood of half-open sockets would `tokio::spawn` unbounded
+/// tasks (each pinning a socket + buffers) and exhaust memory. The default
+/// (8192) sits far above any legitimate single-engine load; connections that
+/// would exceed it are rejected (socket closed) rather than queued. Override
+/// with `BASIN_PGWIRE_MAX_CONNECTIONS`; `0` disables the ceiling.
+fn max_connections_from_env() -> Option<usize> {
+    let n = std::env::var("BASIN_PGWIRE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8192);
+    if n == 0 {
+        None
+    } else {
+        Some(n)
+    }
+}
+
 mod connection_limit;
 mod copy;
 mod error;
@@ -312,6 +333,17 @@ async fn accept_loop(
     // (`BASIN_PGWIRE_IDLE_TIMEOUT_SECS`, default 30 min, `0` disables) so it is
     // not re-parsed on every accept.
     let idle_ceiling = idle_timeout_from_env();
+    // Global connection admission ceiling — the OOM backstop against a raw TCP
+    // connection flood. Resolved once at startup; enforced at accept *before*
+    // a per-connection task is spawned (see `max_connections_from_env`).
+    let max_conns =
+        max_connections_from_env().map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+    if let Some(sem) = &max_conns {
+        tracing::info!(
+            max_connections = sem.available_permits(),
+            "pgwire global connection ceiling enabled"
+        );
+    }
     // Build the TlsAcceptor once at startup so every connection shares one
     // rustls ServerConfig (cheap clone on accept). Failure here is a hard
     // startup error so a bad cert is loud, not silently per-connection.
@@ -380,6 +412,7 @@ async fn accept_loop(
             rate_limit,
             tls_acceptor,
             connection_limiter,
+            max_conns.clone(),
             idle_ceiling,
             &mut shutdown,
         )
@@ -395,6 +428,7 @@ async fn accept_loop(
             rate_limit,
             tls_acceptor,
             connection_limiter,
+            max_conns.clone(),
             idle_ceiling,
             &mut shutdown,
         )
@@ -409,6 +443,7 @@ async fn accept_loop(
         rate_limit,
         tls_acceptor,
         connection_limiter,
+        max_conns.clone(),
         idle_ceiling,
         &mut shutdown,
     )
@@ -426,6 +461,7 @@ async fn run_accept_loop<F>(
     rate_limit: Option<Arc<PgRateLimit>>,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
     connection_limiter: Option<Arc<ConnectionLimiter>>,
+    max_conns: Option<Arc<tokio::sync::Semaphore>>,
     idle_ceiling: Option<Duration>,
     shutdown: &mut oneshot::Receiver<()>,
 ) -> Result<()>
@@ -452,6 +488,27 @@ where
                 // removes Nagle latency on the small request/response messages a
                 // SQL session exchanges. Best-effort — a socket that rejects an
                 // option is still usable, so failures only log at debug.
+                // Global admission control: bound concurrently-served
+                // connections so a raw TCP flood can't spawn unbounded tasks and
+                // OOM the process. `try_acquire_owned` is non-blocking — over the
+                // ceiling we shed load (close the socket) rather than queue it (a
+                // queue would still pin the socket + its buffers). The per-project
+                // `ConnectionLimiter` (post-handshake) still enforces per-tenant
+                // fairness *below* this global cap.
+                let permit = match &max_conns {
+                    Some(sem) => match sem.clone().try_acquire_owned() {
+                        Ok(p) => Some(p),
+                        Err(_) => {
+                            tracing::warn!(
+                                %peer,
+                                "pgwire global connection ceiling reached; rejecting connection"
+                            );
+                            drop(sock);
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 tune_pgwire_socket(&sock, peer);
                 let factory = factory.clone();
                 let resolver = resolver.clone();
@@ -459,6 +516,9 @@ where
                 let tls_acceptor = tls_acceptor.clone();
                 let connection_limiter = connection_limiter.clone();
                 tokio::spawn(async move {
+                    // Hold the admission permit for the connection's lifetime;
+                    // dropping it when the task ends frees a global slot.
+                    let _permit = permit;
                     if let Err(e) = handle_connection(sock, peer, factory, resolver, rate_limit, tls_acceptor, connection_limiter, idle_ceiling).await {
                         tracing::warn!(error = %e, %peer, "connection ended with error");
                     }
@@ -575,5 +635,62 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    /// The global connection ceiling defaults to a generous-but-FINITE value
+    /// (never unbounded), `0` disables it, and a garbage value falls back to the
+    /// safe default rather than uncapping. This is the OOM-backstop contract the
+    /// accept loop relies on — a flood must never be able to spawn unbounded
+    /// connection tasks because the operator fat-fingered the env var.
+    #[test]
+    fn max_connections_env_contract() {
+        // Env is process-global; this test owns BASIN_PGWIRE_MAX_CONNECTIONS and
+        // is the only reader, so it restores the var when done.
+        std::env::remove_var("BASIN_PGWIRE_MAX_CONNECTIONS");
+        assert_eq!(max_connections_from_env(), Some(8192), "safe finite default");
+
+        std::env::set_var("BASIN_PGWIRE_MAX_CONNECTIONS", "0");
+        assert_eq!(max_connections_from_env(), None, "0 disables the ceiling");
+
+        std::env::set_var("BASIN_PGWIRE_MAX_CONNECTIONS", "3");
+        assert_eq!(max_connections_from_env(), Some(3), "explicit ceiling honoured");
+
+        std::env::set_var("BASIN_PGWIRE_MAX_CONNECTIONS", "notanumber");
+        assert_eq!(
+            max_connections_from_env(),
+            Some(8192),
+            "a bad value falls back to the safe default, never unbounded"
+        );
+
+        std::env::remove_var("BASIN_PGWIRE_MAX_CONNECTIONS");
+    }
+
+    /// The admission primitive the accept loop uses: a bounded semaphore rejects
+    /// once its permits are exhausted (a flood is SHED, not queued) and frees a
+    /// slot the instant a held permit drops (a connection ending). This is the
+    /// exact `try_acquire_owned` + permit-lifetime contract the accept loop
+    /// depends on for its OOM backstop.
+    #[tokio::test]
+    async fn admission_semaphore_rejects_past_ceiling_and_frees_on_drop() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let p1 = sem.clone().try_acquire_owned().expect("1st admitted");
+        let _p2 = sem.clone().try_acquire_owned().expect("2nd admitted");
+        // Ceiling reached: the 3rd connection is rejected (the accept loop would
+        // `drop(sock); continue` here — shed, never spawn an unbounded task).
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "past ceiling → rejected"
+        );
+        // A connection ends → its permit drops → a slot frees for the next.
+        drop(p1);
+        assert!(
+            sem.clone().try_acquire_owned().is_ok(),
+            "slot freed for the next connection on drop"
+        );
     }
 }
