@@ -2308,6 +2308,19 @@ impl ObjectStoreCatalog {
             .unwrap_or(64)
     }
 
+    /// Bounded fan-out for the concurrent per-partition fold in `load_unioned`.
+    /// Each partition resolve is several object-store round-trips; running them
+    /// with bounded concurrency turns the union walk from O(partitions)×RTT into
+    /// ~O(partitions / fanout)×RTT without flooding the store's connection pool.
+    /// Override via `BASIN_PARTITION_FOLD_CONCURRENCY` (clamped `>= 1`); 32.
+    fn partition_fold_concurrency(&self) -> usize {
+        std::env::var("BASIN_PARTITION_FOLD_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(32)
+    }
+
     /// Enumerate every partition id that has at least one segment under
     /// `{table}/parts/`. Used by the unioned read.
     async fn list_partition_ids(
@@ -2482,13 +2495,28 @@ impl ObjectStoreCatalog {
             .map(|s| s.committed_at)
             .max()
             .unwrap_or_else(Utc::now);
-        for pid in &partition_ids {
-            let (_v, segment) = self.load_part_current(project, qtable, generation, pid).await?;
-            for f in segment.live_data_files() {
-                all_live.push(f);
-            }
-            if segment.latest_committed_at > latest_commit {
-                latest_commit = segment.latest_committed_at;
+        // Resolve each partition's current segment CONCURRENTLY (bounded
+        // fan-out) instead of one-at-a-time. Each `load_part_current` is several
+        // object-store round-trips, and a large table has many partitions, so
+        // the old sequential fold was O(partitions)×RTT — the dominant cost
+        // behind multi-second session-open / first-read on big tables. `buffered`
+        // overlaps the RTTs while PRESERVING partition order (deterministic
+        // union), collapsing the walk to ~O(partitions / fanout)×RTT.
+        let fanout = self.partition_fold_concurrency();
+        for chunk in partition_ids.chunks(fanout) {
+            let segments = futures::future::try_join_all(
+                chunk
+                    .iter()
+                    .map(|pid| self.load_part_current(project, qtable, generation, pid)),
+            )
+            .await?;
+            for (_v, segment) in &segments {
+                for f in segment.live_data_files() {
+                    all_live.push(f);
+                }
+                if segment.latest_committed_at > latest_commit {
+                    latest_commit = segment.latest_committed_at;
+                }
             }
         }
 
