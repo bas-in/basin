@@ -1986,8 +1986,17 @@ impl ObjectStoreCatalog {
                 .collect();
             for p in &removed_paths {
                 if !live.contains(p) {
-                    return Err(BasinError::catalog(format!(
-                        "{project}/{qtable}[{partition_id}]: replace_data_files removed path {p:?} not in partition live set"
+                    // A removed path that is no longer live means a CONCURRENT
+                    // commit on this partition (a racing drain baseline re-chunk,
+                    // file-merge, or deferred-GC — all of which touch the same
+                    // per-partition segment chain at fanout>1) already removed it.
+                    // That is an optimistic-concurrency conflict, NOT a hard
+                    // error: surface CommitConflict so the caller re-reads the
+                    // current live set, recomputes its removed set, and retries —
+                    // instead of failing the whole compaction and stalling the
+                    // tail drain. This is the #28 fanout compaction-commit race.
+                    return Err(BasinError::CommitConflict(format!(
+                        "{project}/{qtable}[{partition_id}]: replace_data_files removed path {p:?} not in partition live set (concurrent commit)"
                     )));
                 }
             }
