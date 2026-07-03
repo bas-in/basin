@@ -3029,6 +3029,8 @@ impl InProcessShard {
     /// Per-table errors are logged, never propagated (one bad table mustn't
     /// stall the rest — same convention as `tiering_sweep`).
     async fn stripe_merge_sweep(&self) -> Result<()> {
+        use futures::stream::{FuturesUnordered, StreamExt as _};
+        use tokio::sync::Semaphore;
         // One merge pass at a time, even if a test driver overlaps a
         // background tick.
         let _merge_guard = self.stripe_merge_lock.lock().await;
@@ -3044,6 +3046,13 @@ impl InProcessShard {
             seen.into_iter().collect()
         };
 
+        // Merge independent TABLES concurrently (bounded). Each
+        // `stripe_merge_table` commits via per-table OCC and touches a disjoint
+        // file set, so concurrency is a pure throughput win — the same reason
+        // `compact_all` fans out. Bounded by `merge_concurrency`; still under
+        // `stripe_merge_lock` so stripe- and file-merge passes don't overlap.
+        let permits = Arc::new(Semaphore::new(self.merge_concurrency()));
+        let mut futs = FuturesUnordered::new();
         for project in projects {
             let tables = match self.cfg.catalog.list_tables(&project).await {
                 Ok(t) => t,
@@ -3053,14 +3062,22 @@ impl InProcessShard {
                 }
             };
             for table in tables {
-                if let Err(e) = self.stripe_merge_table(&project, &table).await {
-                    warn!(
-                        %project,
-                        %table,
-                        error = %e,
-                        "stripe-merge failed for table; will retry next tick",
-                    );
-                }
+                let permits = permits.clone();
+                futs.push(async move {
+                    let _permit = permits.acquire_owned().await.expect("merge semaphore");
+                    let res = self.stripe_merge_table(&project, &table).await;
+                    (project, table, res)
+                });
+            }
+        }
+        while let Some((project, table, res)) = futs.next().await {
+            if let Err(e) = res {
+                warn!(
+                    %project,
+                    %table,
+                    error = %e,
+                    "stripe-merge failed for table; will retry next tick",
+                );
             }
         }
         Ok(())
@@ -3524,10 +3541,39 @@ impl InProcessShard {
     /// `replace_data_files_in_partition`. Bounded work per tick walks a hot
     /// partition down over several ticks rather than stalling ingest.
     ///
+    /// Bounded fan-out for the cold-file / stripe merge sweeps. Independent
+    /// partitions merge DISJOINT file sets and commit via per-partition OCC, so
+    /// they never contend — merging them concurrently (instead of one-at-a-time)
+    /// is what lets aggregate merge throughput keep pace with a many-partition
+    /// table's growing file count at scale (#28). The semaphore bounds the
+    /// aggregate merge memory/CPU the way the old fully-serial loop did, and the
+    /// sweep still runs under `stripe_merge_lock` so stripe- and file-merge
+    /// passes don't pile on top of each other. Default = compaction concurrency
+    /// (`available_parallelism`); override via `BASIN_SHARD_MERGE_CONCURRENCY`.
+    fn merge_concurrency(&self) -> usize {
+        std::env::var("BASIN_SHARD_MERGE_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| {
+                std::env::var("BASIN_SHARD_COMPACTION_CONCURRENCY")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|n| *n > 0)
+                    .unwrap_or_else(|| {
+                        std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(4)
+                    })
+            })
+    }
+
     /// Same process-wide serialisation as the stripe-merge (shares
     /// `stripe_merge_lock`), so at most one merge pass — stripe or file-count —
     /// runs at a time, bounding the resources a merge can pin.
     async fn file_merge_sweep(&self) -> Result<()> {
+        use futures::stream::{FuturesUnordered, StreamExt as _};
+        use tokio::sync::Semaphore;
         let _merge_guard = self.stripe_merge_lock.lock().await;
 
         let projects: Vec<ProjectId> = {
@@ -3539,6 +3585,12 @@ impl InProcessShard {
             seen.into_iter().collect()
         };
 
+        // Merge independent partitions CONCURRENTLY (bounded). Different
+        // partitions commit via per-partition OCC and never contend, so this is
+        // a pure throughput win — the drain keeps up with a many-partition
+        // table's file count instead of walking partitions one-at-a-time.
+        let permits = Arc::new(Semaphore::new(self.merge_concurrency()));
+        let mut futs = FuturesUnordered::new();
         for project in projects {
             let tables = match self.cfg.catalog.list_tables(&project).await {
                 Ok(t) => t,
@@ -3561,16 +3613,26 @@ impl InProcessShard {
                     }
                 };
                 for pid in partitions {
-                    if let Err(e) = self.file_merge_partition(&project, &table, &pid).await {
-                        warn!(
-                            %project,
-                            %table,
-                            partition = %pid,
-                            error = %e,
-                            "file-merge failed for partition; will retry next tick",
-                        );
-                    }
+                    let permits = permits.clone();
+                    let table = table.clone();
+                    futs.push(async move {
+                        let _permit =
+                            permits.acquire_owned().await.expect("merge semaphore");
+                        let res = self.file_merge_partition(&project, &table, &pid).await;
+                        (project, table, pid, res)
+                    });
                 }
+            }
+        }
+        while let Some((project, table, pid, res)) = futs.next().await {
+            if let Err(e) = res {
+                warn!(
+                    %project,
+                    %table,
+                    partition = %pid,
+                    error = %e,
+                    "file-merge failed for partition; will retry next tick",
+                );
             }
         }
         Ok(())
