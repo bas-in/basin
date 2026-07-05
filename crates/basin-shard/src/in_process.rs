@@ -3694,7 +3694,25 @@ impl InProcessShard {
         // Pick the SMALLEST files first (coalesce the cheap tiny flush files),
         // bounded to `batch_cap` inputs AND `max_bytes` total encoded bytes so
         // a single tick's work — and its peak memory — stays bounded.
-        let mut by_size = live.clone();
+        //
+        // BOUND WRITE-AMPLIFICATION: exclude files that have already reached the
+        // sealed target size — they are at their terminal size and must NEVER be
+        // re-merged. Otherwise, to hold the file-count ceiling, the merge keeps
+        // rewriting near-target files every tick, so each byte is rewritten
+        // O(N / ceiling) times over the partition's life — unbounded write-amp
+        // that makes compaction fall behind ingest at scale (the ~600M stall).
+        // With sealed files excluded, only genuinely small flush files are
+        // candidates, so a byte is rewritten a bounded number of times as it
+        // climbs to the sealed size, then never again. Sealed files stay few
+        // (total_bytes / sealed_bytes) so the read-path file count stays bounded.
+        // Config-reversible: BASIN_COMPACT_SEALED_BYTES=<huge> restores the old
+        // (merge-everything) behaviour.
+        let sealed_bytes = env_u64("BASIN_COMPACT_SEALED_BYTES", STRIPE_MERGE_TARGET_FILE_BYTES);
+        let mut by_size: Vec<DataFileRef> = live
+            .iter()
+            .filter(|f| f.size_bytes < sealed_bytes)
+            .cloned()
+            .collect();
         by_size.sort_by_key(|f| f.size_bytes);
         let mut inputs: Vec<DataFileRef> = Vec::new();
         let mut input_bytes: u64 = 0;
