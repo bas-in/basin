@@ -3839,7 +3839,19 @@ impl InProcessShard {
             bloom_columns: bloom_cols,
             ..Default::default()
         };
-        let write_partition = PartitionKey::default_key();
+        // Write the merged output under the SOURCE partition key, NOT _default.
+        // The object-store key encodes this partition, and in a multi-bucket
+        // pool the destination bucket is stripe_slot(partition_key): _default
+        // hashes to a CONSTANT slot, so writing merged files there funnels ALL
+        // 16 partitions' compacted data into ONE pool bucket. That bucket then
+        // saturates (merge PUTs time out), the per-partition file-count ceiling
+        // can't be relieved, and ingest backpressure-stalls (~600M). Using the
+        // real partition spreads merged files across the pool exactly like the
+        // tail-flush writes do, so striping delivers its intended N-bucket write
+        // bandwidth. Consistent on read (the partition is re-derived from the
+        // key) and in the catalog (commit_file_merge scopes membership by
+        // `partition_id`, independent of the object key).
+        let write_partition = PartitionKey::new(partition_id)?;
 
         let mut outputs: Vec<(basin_storage::DataFile, RecordBatch)> = Vec::with_capacity(n_out);
         let mut offset = 0usize;
