@@ -58,7 +58,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutOptions, PutPayload};
-use tokio::sync::{watch, Mutex, Notify, RwLock};
+use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 use ulid::Ulid;
 
 use crate::fsync::DurablePut;
@@ -250,14 +250,55 @@ impl Inner {
             .clone()
     }
 
+    /// Max concurrent per-partition segment PUTs in a single `flush_all` pass.
+    /// Defaults to 16 (matches the common shard fanout); env-overridable so a
+    /// deployment can tune the object-store write concurrency.
+    fn flush_concurrency(&self) -> usize {
+        std::env::var("BASIN_WAL_FLUSH_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(16)
+    }
+
     /// Flush every partition that has buffered entries.
     async fn flush_all(&self) -> Result<()> {
         let states: Vec<Arc<Mutex<PartitionState>>> = {
             let map = self.partitions.read().await;
             map.values().cloned().collect()
         };
-        for state in states {
-            self.flush_one(&state).await?;
+        // Single (or zero) partition: no fan-out overhead, keep the direct path.
+        if states.len() <= 1 {
+            for state in &states {
+                self.flush_one(state).await?;
+            }
+            return Ok(());
+        }
+        // Fan out the per-partition segment PUTs concurrently. Each `flush_one`
+        // takes only its own partition mutex and publishes a per-partition
+        // durable watermark, so partitions never serialise behind each other —
+        // a group-commit pass spanning N partitions issues N PUTs in parallel
+        // instead of one-after-another (the serial loop capped throughput at
+        // `partitions / put_latency`). Bound the in-flight PUTs so a table with
+        // many partitions can't swamp the object store.
+        let limit = self.flush_concurrency().min(states.len()).max(1);
+        let permits = Arc::new(Semaphore::new(limit));
+        let results = futures::future::join_all(states.into_iter().map(|state| {
+            let permits = permits.clone();
+            async move {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .expect("flush semaphore never closed");
+                self.flush_one(&state).await
+            }
+        }))
+        .await;
+        // Every partition was attempted; a failed `flush_one` restored its own
+        // buffer to the front, so surfacing the first error and retrying on the
+        // next flush loses nothing and preserves per-partition LSN order.
+        for r in results {
+            r?;
         }
         Ok(())
     }
