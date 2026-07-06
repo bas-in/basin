@@ -5440,6 +5440,17 @@ async fn replay_wal_into(
     if state.last_compacted_lsn < floor {
         state.last_compacted_lsn = floor;
     }
+    // #49: seed the WAL stream above the durable replay floor so a fresh stream
+    // (a new node faulting the partition in, or a volume-loss restart that kept
+    // the catalog watermark but lost the local WAL segments) never emits LSNs at
+    // or below `floor`. Without this, those low-LSN entries are skipped by the
+    // `read_from(floor)` below and then deleted by the next truncate — silent
+    // row loss after DROP + recreate on a reused partition id. Forward-only, so
+    // it's a safe no-op when the stream is already ahead of the floor.
+    if floor > Lsn::ZERO {
+        wal.ensure_next_lsn_at_least(project, partition, Lsn(floor.0 + 1))
+            .await?;
+    }
     let entries = wal.read_from(project, partition, floor).await?;
     for entry in entries {
         let (table, batches) = decode_payload(&entry.payload)?;

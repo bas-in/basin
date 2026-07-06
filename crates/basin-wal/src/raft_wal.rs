@@ -1147,6 +1147,26 @@ impl Wal for RaftWal {
         Ok(())
     }
 
+    async fn ensure_next_lsn_at_least(
+        &self,
+        _project: &ProjectId,
+        _partition: &PartitionKey,
+        _min_lsn: Lsn,
+    ) -> Result<()> {
+        // Reasoned no-op (NOT a forgotten stub). The LocalWal seed exists so a
+        // fresh WAL stream on a volume-loss restart doesn't emit LSNs below a
+        // leaked compaction watermark (#49). Under raft that precondition can't
+        // arise the same way: LSNs are assigned by the replicated state machine
+        // (raft_storage apply), and a restarting/joining node restores
+        // `next_lsn` from the consensus log + snapshot — never a fresh `1`
+        // below a persisted watermark. Bumping the local state machine's
+        // counter here, outside consensus, would diverge it from peers. If the
+        // exotic "brand-new cluster reusing an old catalog's watermarks" case
+        // ever needs covering, the correct mechanism is a replicated bump
+        // command through raft, not a local mutation.
+        Ok(())
+    }
+
     async fn close(&self) -> Result<()> {
         let _ = self.raft.shutdown().await;
         Ok(())

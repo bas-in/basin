@@ -815,6 +815,35 @@ impl WalImpl for FileWal {
         Ok(())
     }
 
+    /// Ensure this partition's next-assigned LSN is at least `min_lsn`, bumping
+    /// it (and the published durable marker) forward if lower. LSNs need not be
+    /// contiguous, so moving the counter forward is always safe. See the `Wal`
+    /// trait method: cold init seeds the stream above the compaction watermark
+    /// so a fresh WAL stream (new node / volume-loss restart that kept the
+    /// catalog but lost local segments) never emits LSNs at or below a leaked
+    /// replay floor — which replay would skip and truncate would delete (#49).
+    async fn ensure_next_lsn_at_least(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        min_lsn: Lsn,
+    ) -> Result<()> {
+        let state = self.inner.get_or_create_partition(project, partition).await;
+        let mut guard = state.lock().await;
+        if guard.next_lsn < min_lsn {
+            guard.next_lsn = min_lsn;
+            // durable_lsn trails next_lsn by one; the skipped LSN range was never
+            // written, so it is vacuously durable. Publish so await_durable and
+            // read tracking stay consistent.
+            let new_durable = Lsn(min_lsn.0.saturating_sub(1));
+            if guard.durable_lsn < new_durable {
+                guard.durable_lsn = new_durable;
+                guard.durable_tx.send_replace(new_durable);
+            }
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self))]
     async fn close(&self) -> Result<()> {
         // Idempotent: if we've already shut down the watch send is a no-op.
@@ -1091,6 +1120,41 @@ mod tests {
             assert_eq!(lsn, Lsn(i));
             prev = lsn;
         }
+        wal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_next_lsn_at_least_seeds_stream_above_floor() {
+        // #49: a fresh WAL stream (new node / volume-loss restart that kept the
+        // catalog watermark but lost local segments) must not emit LSNs at or
+        // below a leaked compaction watermark — replay's read_from(floor) would
+        // skip them and the next truncate would delete them (silent row loss
+        // after DROP + recreate on a reused partition id). Cold init seeds the
+        // stream to floor+1 via this method.
+        let dir = TempDir::new().unwrap();
+        let wal = LocalWal::open(cfg_in(&dir)).await.unwrap();
+        let project = ProjectId::new();
+        let part = PartitionKey::default_key();
+
+        // Leaked floor = 5000; cold init seeds to 5001.
+        wal.ensure_next_lsn_at_least(&project, &part, Lsn(5001))
+            .await
+            .unwrap();
+
+        // First append on the fresh stream must land ABOVE the floor, not at
+        // LSN 1 (which replay's read_from(5000) would silently drop).
+        let first = wal.append(&project, &part, payload(1)).await.unwrap();
+        assert_eq!(first, Lsn(5001), "first append must be seeded above floor");
+        let second = wal.append(&project, &part, payload(2)).await.unwrap();
+        assert_eq!(second, Lsn(5002));
+
+        // Forward-only: seeding below the current position must not rewind.
+        wal.ensure_next_lsn_at_least(&project, &part, Lsn(10))
+            .await
+            .unwrap();
+        let third = wal.append(&project, &part, payload(3)).await.unwrap();
+        assert_eq!(third, Lsn(5003), "seeding below current must not rewind");
+
         wal.close().await.unwrap();
     }
 

@@ -525,6 +525,24 @@ pub trait Wal: Send + Sync + std::fmt::Debug {
         up_to: Lsn,
     ) -> Result<()>;
 
+    /// Ensure this partition's next-assigned LSN is at least `min_lsn`, bumping
+    /// the counter forward if it is currently lower (a no-op otherwise). LSNs
+    /// need not be contiguous, so moving the counter forward is always safe.
+    ///
+    /// Cold partition init calls this with `compaction_watermark + 1` so a fresh
+    /// WAL stream (a new node faulting the partition in, or a volume-loss
+    /// restart that kept the durable catalog watermark but lost the local WAL
+    /// segments) never starts at LSN 1 and emits entries at or below a leaked
+    /// replay floor. Without it, replay skips those entries and the next
+    /// truncate deletes their segments — silent row loss after DROP + recreate
+    /// on a reused partition id (#49).
+    async fn ensure_next_lsn_at_least(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        min_lsn: Lsn,
+    ) -> Result<()>;
+
     /// Stop background tasks and drain. Idempotent.
     async fn close(&self) -> Result<()>;
 
@@ -763,6 +781,17 @@ impl Wal for LocalWal {
         self.inner.truncate(project, partition, up_to).await
     }
 
+    async fn ensure_next_lsn_at_least(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        min_lsn: Lsn,
+    ) -> Result<()> {
+        self.inner
+            .ensure_next_lsn_at_least(project, partition, min_lsn)
+            .await
+    }
+
     async fn close(&self) -> Result<()> {
         self.inner.close().await
     }
@@ -893,6 +922,15 @@ pub(crate) trait WalImpl: Send + Sync {
         project: &ProjectId,
         partition: &PartitionKey,
         up_to: Lsn,
+    ) -> Result<()>;
+    /// Seed this partition's next-assigned LSN to at least `min_lsn` (see the
+    /// public [`Wal::ensure_next_lsn_at_least`]). Forward-only; no-op when
+    /// already ahead.
+    async fn ensure_next_lsn_at_least(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        min_lsn: Lsn,
     ) -> Result<()>;
     async fn close(&self) -> Result<()>;
     async fn append_tx_begin(
