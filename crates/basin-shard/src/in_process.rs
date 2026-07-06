@@ -448,6 +448,50 @@ type HeldLeases = Arc<Mutex<HashMap<(ProjectId, PartitionKey), i64>>>;
 /// new owner once the handoff completes. Reads are unaffected.
 type DrainingSet = Arc<Mutex<HashSet<(ProjectId, PartitionKey)>>>;
 
+/// Per-project fair-share caps for the background compaction/merge sweeps.
+///
+/// The sweeps fan out ALL dirty (project, table, partition) work into one
+/// `FuturesUnordered` gated by a single global `Semaphore(total)`. Because
+/// permits are granted in poll (push) order and the outer loop iterates
+/// project-by-project, one project with many partitions front-loads the queue
+/// and grabs every global slot — starving a co-tenant whose single dirty
+/// partition waits behind the whole backlog (the noisy-neighbor failure).
+///
+/// Fix: give each active project its own sub-semaphore capped at
+/// `max(1, total / active_projects)` slots, acquired BEFORE the global permit.
+/// No project can then hold more than its fair share of the `total` slots, and
+/// the floor of 1 guarantees every project makes forward progress each sweep
+/// (no starvation, no livelock — a permit is held only across one partition's
+/// compaction, never across a re-entrant storage call). Correctness is
+/// untouched: this only reorders WHICH compaction runs first; WHAT commits is
+/// the per-partition OCC swap, orthogonal to admission order.
+///
+/// Gated by `BASIN_FAIRSHARE_COMPACTION` (default ON). When off, every project
+/// gets `total` permits — i.e. no per-project constraint, byte-for-byte the
+/// old FCFS behaviour, so the change is fully revertable via config.
+fn fair_share_project_sems(
+    total: usize,
+    projects: impl IntoIterator<Item = ProjectId>,
+) -> HashMap<ProjectId, Arc<tokio::sync::Semaphore>> {
+    let set: HashSet<ProjectId> = projects.into_iter().collect();
+    let enabled = std::env::var("BASIN_FAIRSHARE_COMPACTION")
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no"
+            )
+        })
+        .unwrap_or(true);
+    let slots = if enabled {
+        (total / set.len().max(1)).max(1)
+    } else {
+        total.max(1)
+    };
+    set.into_iter()
+        .map(|p| (p, Arc::new(tokio::sync::Semaphore::new(slots))))
+        .collect()
+}
+
 pub(crate) struct InProcessShard {
     pub(crate) cfg: ShardConfig,
     pub(crate) partitions: Arc<Mutex<PartitionMap>>,
@@ -1893,11 +1937,22 @@ impl InProcessShard {
                     .unwrap_or(4)
             });
         let permits = Arc::new(Semaphore::new(concurrency));
+        // Fair-share: cap each project's concurrent compactions so one project
+        // with many dirty partitions cannot monopolize all `concurrency` slots
+        // and starve co-tenants (#64 noisy-neighbor).
+        let proj_sems = fair_share_project_sems(concurrency, snapshot.iter().map(|((p, _), _)| *p));
 
         let mut futs = FuturesUnordered::new();
         for ((project, partition), state) in snapshot {
             let permits = permits.clone();
+            let psem = proj_sems.get(&project).cloned();
             futs.push(async move {
+                // Per-project slot BEFORE the global one (never the reverse, so
+                // the two-level gate can't invert). Both released on completion.
+                let _pp: Option<tokio::sync::OwnedSemaphorePermit> = match psem {
+                    Some(s) => Some(s.acquire_owned().await.expect("fairshare permit")),
+                    None => None,
+                };
                 let _permit = permits.acquire_owned().await.expect("compaction semaphore");
                 let res = self.compact_one(&project, &partition, state).await;
                 (project, partition, res)
@@ -1973,11 +2028,18 @@ impl InProcessShard {
                     .unwrap_or(4)
             });
         let permits = Arc::new(Semaphore::new(concurrency));
+        // Fair-share per project (#64): no single project monopolizes the slots.
+        let proj_sems = fair_share_project_sems(concurrency, snapshot.iter().map(|((p, _), _)| *p));
 
         let mut futs = FuturesUnordered::new();
         for ((project, partition), state) in snapshot {
             let permits = permits.clone();
+            let psem = proj_sems.get(&project).cloned();
             futs.push(async move {
+                let _pp: Option<tokio::sync::OwnedSemaphorePermit> = match psem {
+                    Some(s) => Some(s.acquire_owned().await.expect("fairshare permit")),
+                    None => None,
+                };
                 let _permit = permits.acquire_owned().await.expect("compaction semaphore");
                 let res = self
                     .compact_one_impl(&project, &partition, state, true)
@@ -3051,7 +3113,10 @@ impl InProcessShard {
         // file set, so concurrency is a pure throughput win — the same reason
         // `compact_all` fans out. Bounded by `merge_concurrency`; still under
         // `stripe_merge_lock` so stripe- and file-merge passes don't overlap.
-        let permits = Arc::new(Semaphore::new(self.merge_concurrency()));
+        let total = self.merge_concurrency();
+        let permits = Arc::new(Semaphore::new(total));
+        // Fair-share per project (#64): one project's tables can't hold all slots.
+        let proj_sems = fair_share_project_sems(total, projects.iter().copied());
         let mut futs = FuturesUnordered::new();
         for project in projects {
             let tables = match self.cfg.catalog.list_tables(&project).await {
@@ -3061,9 +3126,15 @@ impl InProcessShard {
                     continue;
                 }
             };
+            let psem = proj_sems.get(&project).cloned();
             for table in tables {
                 let permits = permits.clone();
+                let psem = psem.clone();
                 futs.push(async move {
+                    let _pp: Option<tokio::sync::OwnedSemaphorePermit> = match psem {
+                        Some(s) => Some(s.acquire_owned().await.expect("fairshare permit")),
+                        None => None,
+                    };
                     let _permit = permits.acquire_owned().await.expect("merge semaphore");
                     let res = self.stripe_merge_table(&project, &table).await;
                     (project, table, res)
@@ -3589,7 +3660,10 @@ impl InProcessShard {
         // partitions commit via per-partition OCC and never contend, so this is
         // a pure throughput win — the drain keeps up with a many-partition
         // table's file count instead of walking partitions one-at-a-time.
-        let permits = Arc::new(Semaphore::new(self.merge_concurrency()));
+        let total = self.merge_concurrency();
+        let permits = Arc::new(Semaphore::new(total));
+        // Fair-share per project (#64): one project's partitions can't hog slots.
+        let proj_sems = fair_share_project_sems(total, projects.iter().copied());
         let mut futs = FuturesUnordered::new();
         for project in projects {
             let tables = match self.cfg.catalog.list_tables(&project).await {
@@ -3599,6 +3673,7 @@ impl InProcessShard {
                     continue;
                 }
             };
+            let psem = proj_sems.get(&project).cloned();
             for table in tables {
                 let partitions = match self
                     .cfg
@@ -3615,7 +3690,12 @@ impl InProcessShard {
                 for pid in partitions {
                     let permits = permits.clone();
                     let table = table.clone();
+                    let psem = psem.clone();
                     futs.push(async move {
+                        let _pp: Option<tokio::sync::OwnedSemaphorePermit> = match psem {
+                            Some(s) => Some(s.acquire_owned().await.expect("fairshare permit")),
+                            None => None,
+                        };
                         let _permit =
                             permits.acquire_owned().await.expect("merge semaphore");
                         let res = self.file_merge_partition(&project, &table, &pid).await;
