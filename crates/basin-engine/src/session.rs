@@ -2508,20 +2508,28 @@ pub(crate) fn set_session_idle_in_transaction_timeout(
         .expect("idle_in_transaction_session_timeout lock poisoned") = d;
 }
 
-/// Engine-wide default for `basin.synchronous_commit`: `on` when
-/// `BASIN_SYNCHRONOUS_COMMIT` is set to a truthy value (`on`/`true`/`1`/
-/// `yes`), `off` otherwise. Read once per session at open; `SET
-/// basin.synchronous_commit` overrides it for the session.
+/// Engine-wide default for `basin.synchronous_commit`.
+///
+/// Defaults to `on` (DURABLE): a write is not acked until its WAL entry is
+/// durably flushed (the WAL lives on a local fsync'd volume, so this is a
+/// ~1-5 ms group-committed fsync, not a network round-trip — Postgres-like,
+/// and the same guarantee Postgres gives by default). This closes the async
+/// loss window (up to `flush_interval`, ~200 ms of acked-but-unflushed writes
+/// lost on a crash) that a database must not expose by default.
+///
+/// Set `BASIN_SYNCHRONOUS_COMMIT=off` (or per-session `SET
+/// basin.synchronous_commit = off`) to opt into the faster async path — an
+/// explicit, informed throughput/durability trade, never a silent default.
+/// `BASIN_SYNCHRONOUS_COMMIT=on`/`true`/`1`/`yes` also forces it on.
 pub(crate) fn synchronous_commit_env_default() -> bool {
-    std::env::var("BASIN_SYNCHRONOUS_COMMIT")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "on" | "true" | "1" | "yes"
-            )
-        })
-        .unwrap_or(false)
+    match std::env::var("BASIN_SYNCHRONOUS_COMMIT") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "on" | "true" | "1" | "yes"
+        ),
+        // Unset → durable by default.
+        Err(_) => true,
+    }
 }
 
 /// Parse a Postgres boolean GUC value (`SET … = on|off|true|false|1|0|
@@ -7338,8 +7346,8 @@ mod tests {
         std::env::remove_var("BASIN_SYNCHRONOUS_COMMIT");
         let state = make_test_session_state();
         assert!(
-            !session_synchronous_commit(&state),
-            "synchronous_commit must default to off"
+            session_synchronous_commit(&state),
+            "synchronous_commit must default to on (durable) — no silent async loss window"
         );
         set_session_synchronous_commit(&state, true);
         assert!(session_synchronous_commit(&state));
@@ -7357,11 +7365,16 @@ mod tests {
         std::env::set_var("BASIN_SYNCHRONOUS_COMMIT", "off");
         let off_state = make_test_session_state();
         std::env::remove_var("BASIN_SYNCHRONOUS_COMMIT");
+        let default_state = make_test_session_state();
         assert!(
             session_synchronous_commit(&on_state),
             "BASIN_SYNCHRONOUS_COMMIT=on must flip the engine default"
         );
         assert!(!session_synchronous_commit(&off_state));
+        assert!(
+            session_synchronous_commit(&default_state),
+            "unset BASIN_SYNCHRONOUS_COMMIT must default to DURABLE (on) — no silent async loss window"
+        );
     }
 
     #[test]

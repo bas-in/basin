@@ -333,6 +333,21 @@ impl WalConfig {
             .unwrap_or(2);
         Duration::from_millis(ms)
     }
+
+    /// Background async-flush tick: `BASIN_WAL_FLUSH_INTERVAL_MS` when set and
+    /// parseable, else 200 ms. This bounds the loss window ONLY for sessions
+    /// that have explicitly opted into async commit (`synchronous_commit =
+    /// off`); durable sessions (the default) never expose this window because
+    /// they wait for the flush before acking. Lowering it tightens an async
+    /// session's exposure at the cost of more idle flushes.
+    pub fn default_flush_interval() -> Duration {
+        let ms = std::env::var("BASIN_WAL_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(200);
+        Duration::from_millis(ms)
+    }
 }
 
 impl Default for WalConfig {
@@ -340,7 +355,7 @@ impl Default for WalConfig {
         Self {
             object_store: panic_no_default_object_store(),
             root_prefix: None,
-            flush_interval: Duration::from_millis(200),
+            flush_interval: Self::default_flush_interval(),
             flush_max_bytes: 1024 * 1024,
             commit_delay: Self::default_commit_delay(),
         }
