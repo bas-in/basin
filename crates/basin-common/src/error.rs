@@ -150,6 +150,19 @@ pub enum BasinError {
     #[error("writer lease not held: {0}")]
     LeaseNotHeld(String),
 
+    /// #67 no-serve-until-converged: this replica is still faulting in the
+    /// partition's durable state (catalog head / compaction watermark) after a
+    /// restart, and the authoritative read has not yet succeeded within the
+    /// warm-up budget. Writes and reads are refused rather than served from a
+    /// blind default — a blind node acks writes into a WAL stream seeded below
+    /// the durable replay floor (acked-row loss on the next replay) and serves
+    /// wrong counts from partial views. Retryable (same 40001 class as
+    /// [`Self::LeaseNotHeld`]): the partition converges as soon as the catalog
+    /// read goes through; callers back off and retry. The message names the
+    /// partition.
+    #[error("partition warming (durable state not yet converged): {0}")]
+    PartitionWarming(String),
+
     /// Multi-node commit 4 (`BASIN_WAL_MODE=raft`) — the raft-backed WAL could
     /// not durably commit the write because consensus did not reach quorum:
     /// no leader, lost leadership, replication timed out, or not enough

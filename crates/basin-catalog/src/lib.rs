@@ -490,6 +490,20 @@ pub trait Catalog: Send + Sync {
         Ok(None)
     }
 
+    /// Whether this backend durably persists compaction watermarks, i.e.
+    /// whether `get_compaction_watermark` returning `Ok(None)`/`Err` can be a
+    /// *blind or failed read* rather than "none was ever recorded".
+    ///
+    /// Recovery fault-in keys on this (#67): on a persisting backend a
+    /// watermark read must be retried until it succeeds (a transient failure
+    /// or unwarmed store view silently mapped to `Lsn::ZERO` restarts the WAL
+    /// stream at LSN 1 under a durable floor — replay then skips those acked
+    /// entries: acked-row loss). Non-persisting backends (in-memory / REST /
+    /// legacy) keep the None-by-design replay-from-zero contract unchanged.
+    fn persists_compaction_watermark(&self) -> bool {
+        false
+    }
+
     /// Persist the per-project pgwire connection ceiling set by the cloud
     /// control-plane (`POST /admin/v1/projects/:id/max-connections`).
     ///

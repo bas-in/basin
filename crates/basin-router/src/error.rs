@@ -114,6 +114,11 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         // handoff rejection above (the caller should re-resolve the owner
         // and retry there). Reads are never rejected with this code.
         BasinError::LeaseNotHeld(_) => ("ERROR", "40001"), // serialization_failure
+        // #67 no-serve-until-converged: this replica is still faulting in the
+        // partition's durable state after a restart — retryable, same class as
+        // LeaseNotHeld (back off briefly and retry; the partition converges as
+        // soon as the catalog read goes through).
+        BasinError::PartitionWarming(_) => ("ERROR", "40001"), // serialization_failure
         // Multi-node commit 4 (BASIN_WAL_MODE=raft): the raft WAL could not
         // reach quorum to durably commit the write — retryable, same class as
         // LeaseNotHeld above (re-resolve the leader and retry). 57P03 was the

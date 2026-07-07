@@ -3252,7 +3252,38 @@ impl Catalog for ObjectStoreCatalog {
         // Confirm the table exists (NotFound if absent/tombstoned) and read its
         // current partition generation.
         let generation = self.load_current(project, &qtable).await?.1.parts_generation;
-        let (_v, segment) = self.load_part_current(project, &qtable, generation, partition_id).await?;
+        let (v, segment) = self.load_part_current(project, &qtable, generation, partition_id).await?;
+        // MONOTONIC EXPECTED-SNAPSHOT GUARD (#67): "the store shows no
+        // segment" is NOT proof that none has ever existed — a blind/unwarmed
+        // store view (cold node, unwarmed pool routing, transient empty LIST
+        // at boot) answers clean-but-empty. Handing the COMMIT path
+        // `expected = 0` while the durable head is at 3+ produces a CAS that
+        // loses forever ('expected snapshot 0, current is 3' every tick) and,
+        // downstream, an acked WAL tail the replay floor later skips
+        // (acked-row loss). Within a generation the chain is append-only and
+        // only drop-purge (which evicts this cache) removes it wholesale, so a
+        // cached version > 0 alongside a genesis resolve proves the resolve is
+        // blind. REFUSE with a retryable conflict rather than fabricating
+        // content — the wave fails to the next tick, by which time the view
+        // has converged. Scoped HERE (commit expected-resolution only), NOT in
+        // `load_part_current`: the general read path legitimately sees
+        // transient empty resolves during merge chain-rewrites, and serving a
+        // stale cached live-set there resurrects superseded files (LIST-based
+        // over-count — the runtime-knob chaos regression).
+        if v == 0 {
+            let ck = self.part_cache_key(project, &qtable, generation, partition_id);
+            let cache = self.part_cache.lock().await;
+            if let Some(entry) = cache.get(&ck) {
+                if entry.version > 0 {
+                    return Err(BasinError::CommitConflict(format!(
+                        "{project}/{qtable}[{partition_id}]: head resolve returned genesis \
+                         but cache holds committed version {} — blind store view, retry \
+                         after convergence",
+                        entry.version
+                    )));
+                }
+            }
+        }
         Ok(segment.current_snapshot)
     }
 
@@ -3662,6 +3693,13 @@ impl Catalog for ObjectStoreCatalog {
     ) -> Result<Option<u64>> {
         let key = format!("watermark_{}.json", sanitize(partition_id));
         self.get_project_json::<u64>(project, &key).await
+    }
+
+    fn persists_compaction_watermark(&self) -> bool {
+        // Watermarks are durable objects here, so `Ok(None)` / `Err` from a
+        // read can be a blind/failed store view — recovery must retry rather
+        // than silently replay from zero (#67).
+        true
     }
 
     async fn set_project_max_connections(

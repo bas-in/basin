@@ -36,7 +36,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
@@ -2907,6 +2907,17 @@ impl InProcessShard {
             Err(e) => return Err(e),
         };
 
+        // #67 NOTE — deliberately NOT an in-place adopt-head retry loop. A
+        // stuck/blind conflict (expected 0 vs durable 3+, refresh unchanged)
+        // is healed by the CATALOG side: the monotonic-head guard in
+        // `load_part_current` stops empty store views from regressing to
+        // genesis, so the refresh on the NEXT tick reads the real head and the
+        // wave commits then. Widening this loop (extra re-appends, or sleeping
+        // between attempts) is unsafe and was tried + reverted: every extra
+        // re-append is another #48 ambiguous-commit window, and any sleep here
+        // opens a double-drain race with the backpressure hard-flush path (the
+        // chaos suite catches both as count > distinct duplicates). Fail the
+        // wave fast; the tail stays resident; the 30s tick is the safe retry.
         for attempt in 0..2 {
             let res = self
                 .cfg
@@ -5414,25 +5425,84 @@ async fn replay_wal_into(
     // back to the prior `Lsn::ZERO` behavior. That is correct for those
     // backends because their catalog and WAL are durable-or-lost together (an
     // ephemeral catalog cannot outlive a WAL it would re-replay against).
-    let floor = match catalog
-        .get_compaction_watermark(project, partition.as_str())
-        .await
-    {
-        Ok(Some(lsn)) => Lsn(lsn),
-        Ok(None) => Lsn::ZERO,
-        Err(e) => {
-            // A watermark read failure must not silently widen the replay floor
-            // (that would re-introduce the duplicate); but it also must not
-            // strand recovery. Fall back to ZERO (the legacy behavior) and warn
-            // — at worst we re-create the historical duplicate-file exposure for
-            // this one cold-start, which is strictly no worse than pre-fix.
-            warn!(
-                %project,
-                %partition,
-                error = %e,
-                "compaction watermark read failed; replaying from Lsn::ZERO (legacy fallback)",
-            );
-            Lsn::ZERO
+    // #67 no-serve-until-converged: on a backend that durably persists
+    // watermarks, `Ok(None)` / `Err` from this read can be a BLIND or FAILED
+    // store view (cold node, unwarmed pool routing, transient boot failure) —
+    // not "no watermark was ever recorded". Silently mapping that to
+    // `Lsn::ZERO` is the proven acked-row-loss chain: floor 0 skips the #49
+    // stream seed below, the fresh WAL stream emits from LSN 1 under a durable
+    // floor W, and the NEXT replay (with the healed floor) skips those acked
+    // entries before truncate deletes them. So: retry until an authoritative
+    // answer, confirm an `Ok(None)` once before trusting genesis, and if the
+    // warm-up budget expires FAIL the fault-in (the partition stays out of the
+    // map; writes/reads get a retryable `PartitionWarming` instead of a blind
+    // ack). Non-persisting backends (in-memory / REST / legacy) keep the
+    // None-by-design replay-from-zero contract, single-shot, unchanged.
+    let floor = if catalog.persists_compaction_watermark() {
+        let budget = Duration::from_secs(env_u64("BASIN_PARTITION_WARMUP_TIMEOUT_SECS", 30));
+        let mut delay = Duration::from_millis(env_u64("BASIN_PARTITION_WARMUP_RETRY_MS", 200));
+        let started = std::time::Instant::now();
+        let mut none_confirmed = false;
+        loop {
+            match catalog
+                .get_compaction_watermark(project, partition.as_str())
+                .await
+            {
+                Ok(Some(lsn)) => break Lsn(lsn),
+                Ok(None) if none_confirmed => break Lsn::ZERO,
+                Ok(None) => {
+                    // Confirm genesis with an IMMEDIATE second read (no sleep:
+                    // fault-in latency is on the write path for brand-new
+                    // partitions, and delaying it perturbs the merge/count
+                    // timing — see the runtime-knob chaos regression). A blind
+                    // view answers a clean NotFound indistinguishable from
+                    // "never recorded" on a single read; two consecutive
+                    // agreeing reads guard the single-blip case, and the
+                    // FAILED-read case below (the proven loss-chain trigger)
+                    // keeps its full retry-with-backoff budget.
+                    none_confirmed = true;
+                    continue;
+                }
+                Err(e) => {
+                    if started.elapsed() >= budget {
+                        return Err(BasinError::PartitionWarming(format!(
+                            "{project}/{partition}: compaction watermark unreadable after \
+                             {:?}: {e}",
+                            started.elapsed()
+                        )));
+                    }
+                    warn!(
+                        %project,
+                        %partition,
+                        error = %e,
+                        "compaction watermark read failed during fault-in; retrying \
+                         (no-serve-until-converged)",
+                    );
+                }
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(5));
+        }
+    } else {
+        match catalog
+            .get_compaction_watermark(project, partition.as_str())
+            .await
+        {
+            Ok(Some(lsn)) => Lsn(lsn),
+            Ok(None) => Lsn::ZERO,
+            Err(e) => {
+                // Non-persisting backend: a read failure must not strand
+                // recovery. Fall back to ZERO (the legacy behavior) and warn —
+                // at worst we re-create the historical duplicate-file exposure
+                // for this one cold-start, strictly no worse than pre-fix.
+                warn!(
+                    %project,
+                    %partition,
+                    error = %e,
+                    "compaction watermark read failed; replaying from Lsn::ZERO (legacy fallback)",
+                );
+                Lsn::ZERO
+            }
         }
     };
     // Seed the in-memory marker so the first post-restart compaction's
