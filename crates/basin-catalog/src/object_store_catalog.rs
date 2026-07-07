@@ -520,6 +520,15 @@ pub struct ObjectStoreCatalog {
     /// benign per-partition `CommitConflict` retry. Keyed separately from the
     /// META `cache` so DDL and data-file commits never invalidate each other.
     part_cache: Mutex<HashMap<(ProjectId, String, String), PartCacheEntry>>,
+    /// #67 monotonic head FLOOR per part-cache key: the highest partition
+    /// version this process has EVER observed (read-side fold or own commit).
+    /// Unlike `part_cache` it is NEVER evicted by `invalidate_part` — a lost
+    /// CAS must not erase the memory that v≥N existed, because that memory is
+    /// what stops a blind store resolve (peer-written objects not yet visible
+    /// cross-region, lost head-pointer PUT) from regressing the commit path's
+    /// expected snapshot to 0 and livelocking. The generation folded into the
+    /// key keeps drop+recreate correct (new generation → new key).
+    part_head_floor: Mutex<HashMap<(ProjectId, String, String), u64>>,
     /// Per-`(project, schema.table)` cache of the *resolved META manifest head
     /// version*. The table manifest head only advances on a manifest write
     /// (DDL / schema evolution / single-node META-chain append) — NEVER on a
@@ -636,6 +645,7 @@ impl ObjectStoreCatalog {
             epoch: AtomicU64::new(0),
             cache: Mutex::new(HashMap::new()),
             part_cache: Mutex::new(HashMap::new()),
+            part_head_floor: Mutex::new(HashMap::new()),
             meta_head_cache: Mutex::new(HashMap::new()),
             chunk_cache: Mutex::new(LruCache::new(chunk_cache_cap())),
             read_snapshot_cache: Mutex::new(HashMap::new()),
@@ -1315,6 +1325,25 @@ impl ObjectStoreCatalog {
                 }
             }
         }
+        if let Some(v) = max {
+            // READ-REPAIR (#67): the head-pointer GET missed but the chain
+            // exists — the pointer PUT was lost (it is best-effort on commit)
+            // or was written by a peer and hasn't landed here. Re-PUT the
+            // recovered head best-effort so subsequent resolves take the O(1)
+            // pointer path instead of depending on LIST forever (a blind or
+            // slow LIST here is what regresses commits to expected=0).
+            let head_key = self.part_head_key(project, qtable, generation, partition_id);
+            if let Err(e) = self
+                .store
+                .put(&head_key, v.to_string().into())
+                .await
+            {
+                tracing::debug!(
+                    %project, table = %qtable, partition_id, version = v, error = %e,
+                    "partition head-pointer read-repair PUT failed (best-effort)",
+                );
+            }
+        }
         Ok(max)
     }
 
@@ -1648,6 +1677,14 @@ impl ObjectStoreCatalog {
             self.fold_part_chain(project, qtable, generation, partition_id, version)
                 .await?,
         );
+        {
+            // #67: advance the non-evictable monotonic head floor.
+            let mut floor = self.part_head_floor.lock().await;
+            let f = floor.entry(ck.clone()).or_insert(0);
+            if version > *f {
+                *f = version;
+            }
+        }
         let mut cache = self.part_cache.lock().await;
         cache.insert(
             ck,
@@ -1827,6 +1864,14 @@ impl ObjectStoreCatalog {
         }
         let _ = head_written;
         let ck = self.part_cache_key(project, qtable, generation, partition_id);
+        {
+            // #67: advance the non-evictable monotonic head floor.
+            let mut floor = self.part_head_floor.lock().await;
+            let f = floor.entry(ck.clone()).or_insert(0);
+            if version > *f {
+                *f = version;
+            }
+        }
         self.part_cache.lock().await.insert(
             ck,
             PartCacheEntry {
@@ -3271,15 +3316,22 @@ impl Catalog for ObjectStoreCatalog {
         // stale cached live-set there resurrects superseded files (LIST-based
         // over-count — the runtime-knob chaos regression).
         if v == 0 {
+            // Consult the NON-EVICTABLE monotonic floor, not `part_cache`: the
+            // livelock this guards against produces lost CASes whose
+            // `invalidate_part` would evict the very cache entry the guard
+            // needs, letting expected=0 through on the next round (observed
+            // live: peer-owned stripes whose objects were written cross-region
+            // alternated 'expected 0, current 1' with the guard refusal for
+            // 25+ min). The floor map is only superseded by generation change
+            // (folded into the key), never evicted.
             let ck = self.part_cache_key(project, &qtable, generation, partition_id);
-            let cache = self.part_cache.lock().await;
-            if let Some(entry) = cache.get(&ck) {
-                if entry.version > 0 {
+            let floor = self.part_head_floor.lock().await;
+            if let Some(&f) = floor.get(&ck) {
+                if f > 0 {
                     return Err(BasinError::CommitConflict(format!(
                         "{project}/{qtable}[{partition_id}]: head resolve returned genesis \
-                         but cache holds committed version {} — blind store view, retry \
-                         after convergence",
-                        entry.version
+                         but this process has observed committed version {f} — blind store \
+                         view, retry after convergence",
                     )));
                 }
             }
