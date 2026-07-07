@@ -541,6 +541,22 @@ pub(crate) async fn execute_metadata_aggregate(
     // drain. See `InProcessShard::compact_all_for_read`.
     let prefetched_meta = if let Some(shard) = sess.engine.config().shard.as_ref() {
         shard.flush_to_parquet_for_read().await?;
+        // #70: if the bounded read-drain timed out (or skipped locked
+        // partitions) and this table STILL has un-drained tail rows, the
+        // metadata aggregate would silently omit them. The answer is
+        // "correct-as-of-last-commit" but wrong as an audit oracle: a
+        // DELETE → count(*)-until-0 purge-confirm loop then reads a stale
+        // nonzero (rows draining in after the DELETE's file listing) or a
+        // stale zero (un-drained inserts) forever, and every timed-out count
+        // spawns another detached drain — a livelock feedback loop proven on
+        // the 1B capstone at 750M. Decline the fast path instead: the
+        // exec_select fallback runs the BLOCKING flush, so the caller either
+        // gets a true answer or visibly waits on the drain (attributable,
+        // timeout-able) rather than being confidently misinformed. The probe
+        // is O(resident partitions), RAM-only.
+        if shard.has_pending_tail(&sess.project, &plan.table).await {
+            return Ok(None);
+        }
         None
     } else {
         prefetched_meta

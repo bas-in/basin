@@ -543,6 +543,13 @@ pub(crate) struct InProcessShard {
     /// and background loops run on update the SAME counter the metrics snapshot
     /// reads.
     ingest_rate: Arc<IngestRate>,
+    /// #70: whether a DETACHED read-path drain (`compact_all_for_read` spawned
+    /// by the bounded `flush_to_parquet_for_read`) is currently in flight.
+    /// Shared across `share_clone`s so a tight count(*)-under-backlog loop
+    /// coalesces onto ONE background drain instead of stacking a new one per
+    /// timed-out read (which deepens the very storage backlog the reads are
+    /// waiting out).
+    read_drain_inflight: Arc<std::sync::atomic::AtomicBool>,
     /// Test-only barrier awaited by `compact_one_impl` immediately AFTER a
     /// wave's catalog commit and BEFORE it prunes the committed entries from the
     /// in-memory tail. Lets a test deterministically suspend a compaction inside
@@ -578,6 +585,7 @@ impl InProcessShard {
             held_leases: Arc::new(Mutex::new(HashMap::new())),
             draining: Arc::new(Mutex::new(HashSet::new())),
             ingest_rate: Arc::new(IngestRate::new()),
+            read_drain_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             post_commit_barrier: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -623,6 +631,8 @@ impl InProcessShard {
             // Shared: the write path runs on a `share_clone` and must update the
             // same rolling counter the metrics snapshot reads.
             ingest_rate: self.ingest_rate.clone(),
+            // Shared (#70): read-drain coalescing must span every handle.
+            read_drain_inflight: self.read_drain_inflight.clone(),
             // Test-only: SHARED across share_clones (like memtable_registry_cell)
             // so a barrier installed via `impl_of(&shard).set_post_commit_barrier`
             // — which itself runs on a share_clone — is observed by the
@@ -4704,9 +4714,35 @@ impl ShardImpl for InProcessShard {
                 // uninterrupted unit. The task runs on a `share_clone` that
                 // shares the same partition map / compaction locks / watermarks,
                 // so its work is observed by every subsequent read.
+                // #70 damping: COALESCE detached read-drains. A tight
+                // count(*)-under-backlog loop (the loader's purge-confirm
+                // audit) would otherwise spawn a NEW compact_all_for_read per
+                // timed-out read, stacking unbounded drains onto an already
+                // backed-up object store — a feedback loop that deepens the
+                // very backlog the reads are waiting out. If a detached drain
+                // is already in flight, just wait the bound on nothing new:
+                // the in-flight drain's progress is shared state, so this
+                // read still observes whatever it commits.
+                if self
+                    .read_drain_inflight
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    tokio::time::sleep(bound).await;
+                    return Ok(());
+                }
                 let drainer = Arc::new(self.share_clone());
-                let handle =
-                    tokio::spawn(async move { drainer.compact_all_for_read().await });
+                let inflight = self.read_drain_inflight.clone();
+                let handle = tokio::spawn(async move {
+                    let res = drainer.compact_all_for_read().await;
+                    inflight.store(false, std::sync::atomic::Ordering::Release);
+                    res
+                });
                 match tokio::time::timeout(bound, handle).await {
                     // Drain finished within the bound: surface its result (a
                     // join error means the task panicked — propagate as storage).
