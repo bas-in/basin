@@ -5963,6 +5963,21 @@ async fn pre_mutation_flush_if_tail(sess: &ProjectSession, table: &TableName) ->
     if let Some(shard) = sess.engine.config().shard.as_ref() {
         if shard.has_pending_tail(&sess.project, table).await {
             shard.flush_to_parquet().await?;
+            // #70 edit-3: `flush_to_parquet` (compact_all) SWALLOWS per-
+            // partition drain failures (warn + Ok) so one wedged partition
+            // can't stall the background tick — correct there, WRONG as a
+            // mutation barrier: a copy-on-write DELETE/UPDATE proceeding on a
+            // partially-flushed base misses the still-resident tail rows;
+            // they commit later and "reappear" after the mutation (the
+            // purge-confirm livelock chain proven on the 1B capstone).
+            // Re-probe and FAIL LOUD instead — retryable (40001 class), and
+            // an honest error beats a silently incomplete mutation.
+            if shard.has_pending_tail(&sess.project, table).await {
+                return Err(BasinError::CommitConflict(format!(
+                    "{table}: mutation under drain backlog — pre-mutation flush left \
+                     un-drained tail rows (a partition's drain failed); retry",
+                )));
+            }
         }
     }
     Ok(())
