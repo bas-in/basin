@@ -4739,9 +4739,21 @@ impl ShardImpl for InProcessShard {
                 let drainer = Arc::new(self.share_clone());
                 let inflight = self.read_drain_inflight.clone();
                 let handle = tokio::spawn(async move {
-                    let res = drainer.compact_all_for_read().await;
-                    inflight.store(false, std::sync::atomic::Ordering::Release);
-                    res
+                    // Drop guard, not a trailing store: if the drain PANICS,
+                    // a plain store after the await is skipped by the unwind
+                    // and the in-flight flag wedges TRUE forever — every
+                    // subsequent bounded read would then sleep out its bound
+                    // and answer from committed state only (silent permanent
+                    // degradation). The guard clears the flag on every exit
+                    // path, panic included.
+                    struct ClearOnDrop(Arc<std::sync::atomic::AtomicBool>);
+                    impl Drop for ClearOnDrop {
+                        fn drop(&mut self) {
+                            self.0.store(false, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                    let _clear = ClearOnDrop(inflight);
+                    drainer.compact_all_for_read().await
                 });
                 match tokio::time::timeout(bound, handle).await {
                     // Drain finished within the bound: surface its result (a
