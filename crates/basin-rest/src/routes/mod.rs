@@ -33,6 +33,10 @@ pub(crate) mod internal_forward;
 // #28 multi-node bulk ingest: partition-owner receive endpoint. Mounted only
 // when `BASIN_FORWARD_SECRET` is set (fail-closed); see `crate::server::router`.
 pub(crate) mod internal_partition_forward;
+// mn2 read barrier: peer tail-drain receive endpoint for multi-node metadata
+// aggregates. Mounted only when `BASIN_FORWARD_SECRET` is set (fail-closed);
+// see `crate::server::router`.
+pub(crate) mod internal_tail_drain;
 pub(crate) mod openapi;
 pub(crate) mod rpc;
 pub(crate) mod storage;

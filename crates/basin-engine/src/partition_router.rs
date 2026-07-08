@@ -142,6 +142,25 @@ impl PartitionRouter {
         self.self_index.is_some()
     }
 
+    /// Every configured peer base URL EXCEPT this node — the fan-out set for
+    /// cluster-wide read barriers (the tail-drain each metadata aggregate
+    /// broadcasts before answering, so no peer's un-drained in-memory tail is
+    /// silently omitted). Empty for a local-only router (0/1 peers), so the
+    /// single-node path stays byte-identical. A misconfigured node whose id
+    /// is absent from the peer list (`self_index == None`) returns EVERY peer
+    /// — it owns nothing locally, so every peer's tail is remote to it.
+    pub fn non_self_peers(&self) -> Vec<String> {
+        if self.is_local_only() {
+            return Vec::new();
+        }
+        self.peers
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != self.self_index)
+            .map(|(_, p)| p.clone())
+            .collect()
+    }
+
     /// The deterministic owner node of `(project, partition_id)`.
     ///
     /// Local-only routers (0/1 peers) always return self (`base_url` = the lone
@@ -276,6 +295,31 @@ mod tests {
         for (i, c) in counts.iter().enumerate() {
             assert!(*c > 100, "peer {i} starved: only {c}/600 partitions");
         }
+    }
+
+    #[test]
+    fn non_self_peers_excludes_self_and_is_empty_when_local_only() {
+        // Local-only (unset / single peer): no fan-out targets.
+        assert!(PartitionRouter::parse("", "node-a").non_self_peers().is_empty());
+        assert!(PartitionRouter::parse("http://a:5434", "http://a:5434")
+            .non_self_peers()
+            .is_empty());
+
+        // Multi-peer: everyone but self, in configured order.
+        let peers = vec![
+            "http://a:5434".to_string(),
+            "http://b:5434".to_string(),
+            "http://c:5434".to_string(),
+        ];
+        let r = PartitionRouter::new(peers.clone(), "http://b:5434");
+        assert_eq!(
+            r.non_self_peers(),
+            vec!["http://a:5434".to_string(), "http://c:5434".to_string()]
+        );
+
+        // Misconfigured self (not in the list): every peer is remote.
+        let r = PartitionRouter::new(peers.clone(), "http://stranger:5434");
+        assert_eq!(r.non_self_peers(), peers);
     }
 
     #[test]

@@ -50,6 +50,7 @@ use crate::routes::{
     fn_handler as fn_handler_routes, inbound as inbound_routes,
     internal_forward as internal_forward_routes,
     internal_partition_forward as internal_partition_forward_routes,
+    internal_tail_drain as internal_tail_drain_routes,
     openapi as openapi_routes, rpc as rpc_routes,
     storage as storage_routes, storage_sign as storage_sign_routes,
 };
@@ -604,6 +605,13 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             "/internal/v1/partition-write",
             post(internal_partition_forward_routes::post_partition_write)
                 .layer(DefaultBodyLimit::disable()),
+        )
+        // mn2 read barrier: peer tail-drain receive route. Same fail-closed
+        // gate — only exists when the shared secret is set. Body-less (the
+        // target travels in headers), so the default body limit is fine.
+        .route(
+            "/internal/v1/tail-drain",
+            post(internal_tail_drain_routes::post_tail_drain),
         )
     } else {
         app

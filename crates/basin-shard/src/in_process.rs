@@ -4779,6 +4779,74 @@ impl ShardImpl for InProcessShard {
         }
     }
 
+    async fn flush_tables_for_read(&self, project: &ProjectId, table: &TableName) -> Result<()> {
+        // Scoped read-barrier drain (multi-node metadata aggregates). Snapshot
+        // this project's resident partition states under the outer map mutex,
+        // release it, then decide per partition under its own read lock — the
+        // same never-hold-the-map-lock-across-an-await discipline as
+        // `has_pending_tail`. Only partitions whose tail actually holds rows
+        // for THIS table are compacted, so the barrier is O(resident-partitions)
+        // RAM-only when clean and skips partitions the table doesn't touch.
+        // (Within a selected partition, `compact_one` drains the WHOLE
+        // partition tail — a co-located table drains alongside; harmless
+        // over-drain, never a wrong answer.)
+        let snapshot: Vec<((ProjectId, PartitionKey), Arc<RwLock<PartitionState>>)> = {
+            let map = self.partitions.lock().await;
+            map.iter()
+                .filter(|((p, _), _)| p == project)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        let mut dirty: Vec<((ProjectId, PartitionKey), Arc<RwLock<PartitionState>>)> = Vec::new();
+        for (key, state) in snapshot {
+            let has_tail = {
+                let g = state.read().await;
+                g.tail.get(table).map(|v| !v.is_empty()).unwrap_or(false)
+            };
+            if has_tail {
+                dirty.push((key, state));
+            }
+        }
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        // Owner-only compaction gate, mirroring `compact_all`: when a lease
+        // registry is configured only the lease holder may compact + commit a
+        // partition (a non-owner racing the owner's catalog commit is the
+        // "lost commit race" failure). But unlike `compact_all` we must NOT
+        // silently SKIP a non-owned dirty partition — the caller would then
+        // ack a drain that left tail rows behind, and the querying node would
+        // answer a silently-wrong count (the exact bug this barrier exists to
+        // kill). A non-owned resident tail is a transient state (a just-lost
+        // lease whose flush-before-drop hasn't run yet), so fail LOUD with the
+        // retryable warming error and let the caller retry once it converges.
+        if self.cfg.lease_registry.is_some() {
+            let held: std::collections::HashSet<(ProjectId, PartitionKey)> = {
+                let h = self.held_leases.lock().await;
+                h.keys().cloned().collect()
+            };
+            for ((project, partition), _) in &dirty {
+                if !held.contains(&(*project, partition.clone())) {
+                    return Err(BasinError::PartitionWarming(format!(
+                        "read-barrier drain: partition {project}/{partition} holds tail rows \
+                         for table {table:?} but this replica no longer holds its writer \
+                         lease (handoff in flight); retry after the flush-before-drop"
+                    )));
+                }
+            }
+        }
+        // BLOCKING per-partition compaction (`compact_one`, skip_if_locked ==
+        // false): the barrier's ack means "the tail is now in committed catalog
+        // segments", so a partition mid-compaction is WAITED on, not skipped.
+        // Errors PROPAGATE — the background drains log-and-retry because their
+        // caller is a tick; here a swallowed failure becomes a wrong count on
+        // the peer, so the first failure aborts and surfaces.
+        for ((project, partition), state) in dirty {
+            self.compact_one(&project, &partition, state).await?;
+        }
+        Ok(())
+    }
+
     async fn run_stripe_merge_once(&self) -> Result<()> {
         self.stripe_merge_sweep().await
     }
@@ -7328,6 +7396,67 @@ mod tests {
             "concurrent compaction must not duplicate rows (got {}, want {N})",
             rows_in(&read),
         );
+    }
+
+    /// Scoped read-barrier drain (`flush_tables_for_read`): draining table A
+    /// must commit ALL of A's tail rows (across every resident stripe
+    /// partition) while leaving partitions that hold NOTHING for A untouched.
+    /// The scope is PARTITION-level: `compact_one` drains a whole partition's
+    /// tail, so a table co-located in a dirty partition drains alongside it
+    /// (harmless over-drain — extra commits, never a wrong answer); what the
+    /// barrier must NOT do is walk/compact partitions that carry no rows for
+    /// the named table.
+    #[tokio::test]
+    async fn flush_tables_for_read_drains_only_partitions_holding_the_table() {
+        let (shard, _sd, _wd, storage, _cat, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let table_a = TableName::new("barrier_a").unwrap();
+        let table_b = TableName::new("barrier_b").unwrap();
+
+        // Table A's tail spans two partitions (the striped-ingest shape);
+        // table B's tail lives ONLY in a third partition A never touches, so
+        // the scoped drain must walk p1+p2 and skip p3 entirely.
+        let p1 = PartitionKey::default_key();
+        let p2 = PartitionKey::new("s1").unwrap();
+        let p3 = PartitionKey::new("s2").unwrap();
+        let h1 = shard.get(&project, &p1).await.unwrap();
+        let h2 = shard.get(&project, &p2).await.unwrap();
+        let h3 = shard.get(&project, &p3).await.unwrap();
+        h1.write_batch(&table_a, batch(0, 10, "a-")).await.unwrap();
+        h2.write_batch(&table_a, batch(10, 5, "a-")).await.unwrap();
+        h3.write_batch(&table_b, batch(0, 7, "b-")).await.unwrap();
+
+        shard.flush_tables_for_read(&project, &table_a).await.unwrap();
+
+        // A: fully committed (no pending tail; every row in cold files).
+        assert!(
+            !shard.has_pending_tail(&project, &table_a).await,
+            "drained table must have no pending tail after the barrier"
+        );
+        let files_a = storage
+            .list_data_files_with_stats(&project, &table_a)
+            .await
+            .unwrap();
+        let rows_a: usize = files_a.iter().map(|f| f.row_count as usize).sum();
+        assert_eq!(rows_a, 15, "every tail row of the drained table is committed");
+
+        // B (in a partition holding nothing for A): untouched — still
+        // pending, nothing committed.
+        assert!(
+            shard.has_pending_tail(&project, &table_b).await,
+            "a partition holding no rows for the drained table must be skipped"
+        );
+        let files_b = storage
+            .list_data_files_with_stats(&project, &table_b)
+            .await
+            .unwrap();
+        assert!(
+            files_b.is_empty(),
+            "scoped drain must not compact partitions the table doesn't touch"
+        );
+
+        // A clean re-run is a no-op Ok (the O(1)-when-clean contract).
+        shard.flush_tables_for_read(&project, &table_a).await.unwrap();
     }
 
     /// Read-path latency bound: `flush_to_parquet_for_read` (the metadata

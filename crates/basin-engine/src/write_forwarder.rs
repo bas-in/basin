@@ -464,6 +464,40 @@ pub const PARTITION_FORWARD_IDEM_HEADER: &str = "x-basin-partition-idem";
 /// `BASIN_FORWARD_SECRET` is set).
 pub const PARTITION_FORWARD_RECEIVE_PATH: &str = "/internal/v1/partition-write";
 
+/// The receive path for the multi-node metadata-aggregate READ BARRIER: "drain
+/// your in-memory tail for `(project, table)` before I answer a `count(*)` /
+/// `max`". Mounted on the same fail-closed condition as
+/// [`PARTITION_FORWARD_RECEIVE_PATH`] (only when `BASIN_FORWARD_SECRET` is
+/// set). Destination travels in the [`PARTITION_FORWARD_PROJECT_HEADER`] /
+/// [`PARTITION_FORWARD_TABLE_HEADER`] headers (no partition header — the drain
+/// is table-scoped on the peer); [`PARTITION_FORWARD_HOP_HEADER`] must be `1`
+/// (the receiver drains locally and never re-fans-out).
+pub const TAIL_DRAIN_PATH: &str = "/internal/v1/tail-drain";
+
+/// Env var bounding one tail-drain request's wall clock, in seconds (default
+/// [`DEFAULT_TAIL_DRAIN_TIMEOUT_SECS`]). A peer draining a deep tail commits
+/// real object-store PUTs before acking, so this is deliberately generous —
+/// but bounded, so a wedged peer fails the read LOUDLY instead of hanging it.
+pub const TAIL_DRAIN_TIMEOUT_ENV: &str = "BASIN_TAIL_DRAIN_TIMEOUT_SECS";
+
+/// Default per-request tail-drain timeout (see [`TAIL_DRAIN_TIMEOUT_ENV`]).
+pub const DEFAULT_TAIL_DRAIN_TIMEOUT_SECS: u64 = 120;
+
+/// Machine-readable code the tail-drain receive route returns (HTTP 503 body)
+/// when the peer is still warming (boot recovery / partition convergence not
+/// yet done). The client maps it back to the typed retryable
+/// [`BasinError::PartitionWarming`] so the router surfaces SQLSTATE 40001.
+pub const TAIL_DRAIN_WARMING_CODE: &str = "E_PARTITION_WARMING";
+
+/// Wire body the tail-drain receive route returns on success: whether the peer
+/// actually had (and therefore drained) tail rows for the table. `false` is
+/// the O(1) clean-peer fast path. Shared by the client and the REST route so
+/// the contract has one source of truth (mirrors [`PartitionWriteResponse`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TailDrainResponse {
+    pub had_tail: bool,
+}
+
 /// The boundary between owner resolution (tested) and the live wire round trip
 /// (deployment-validated) for partition-write forwarding. A real impl POSTs the
 /// Arrow-IPC-encoded batch to the owner node's
@@ -498,6 +532,37 @@ pub trait PartitionForwardClient: Send + Sync + 'static {
         idem_key: &str,
         batch: RecordBatch,
     ) -> Result<ForwardWriteResult>;
+
+    /// Multi-node metadata-aggregate READ BARRIER: ask the peer at
+    /// `peer_base_url` to synchronously drain its in-memory tail for
+    /// `(project, table)` into committed catalog segments, so a `count(*)` /
+    /// `max` answered from the shared catalog on THIS node cannot silently
+    /// omit rows resident only in the peer's RAM. Returns `had_tail` — whether
+    /// the peer actually had (and drained) tail rows; a clean peer answers
+    /// O(1) without touching storage.
+    ///
+    /// Error contract (all fail-LOUD; the caller must fail the query, never
+    /// answer without the drain): a transport failure / non-2xx is a plain
+    /// error; a peer that is still warming after a restart surfaces as the
+    /// typed retryable [`BasinError::PartitionWarming`] (SQLSTATE 40001) so
+    /// clients back off and retry rather than reading a partial view.
+    ///
+    /// Default impl FAILS CLOSED: a transport that predates the barrier (or a
+    /// test double that never wired it) must not let a multi-peer count
+    /// silently skip the drain — that is exactly the wrong-count bug the
+    /// barrier exists to kill.
+    async fn drain_table_for_read(
+        &self,
+        peer_base_url: &str,
+        _project: &ProjectId,
+        _table: &str,
+    ) -> Result<bool> {
+        Err(BasinError::wal(format!(
+            "tail-drain to peer {peer_base_url:?} is not configured on this \
+             partition-forward client (mn read barrier fails closed; the \
+             transport must implement drain_table_for_read)"
+        )))
+    }
 }
 
 /// Owner-side result of a forwarded partition write (#46 durability audit).
@@ -554,12 +619,34 @@ impl HttpPartitionForwardClient {
     /// `http://` scheme (the `BASIN_SHARD_PEERS` format) or be bare host:port;
     /// we only prepend `http://` when no scheme is present (6PN is plaintext).
     pub fn receive_url(peer_base_url: &str) -> String {
+        Self::peer_url(peer_base_url, PARTITION_FORWARD_RECEIVE_PATH)
+    }
+
+    /// Full tail-drain URL for `peer_base_url` (read barrier; see
+    /// [`TAIL_DRAIN_PATH`]). Same scheme handling as [`Self::receive_url`].
+    pub fn tail_drain_url(peer_base_url: &str) -> String {
+        Self::peer_url(peer_base_url, TAIL_DRAIN_PATH)
+    }
+
+    fn peer_url(peer_base_url: &str, path: &str) -> String {
         if peer_base_url.starts_with("http://") || peer_base_url.starts_with("https://") {
-            format!("{peer_base_url}{PARTITION_FORWARD_RECEIVE_PATH}")
+            format!("{peer_base_url}{path}")
         } else {
-            format!("http://{peer_base_url}{PARTITION_FORWARD_RECEIVE_PATH}")
+            format!("http://{peer_base_url}{path}")
         }
     }
+}
+
+/// One tail-drain request's wall-clock bound, from [`TAIL_DRAIN_TIMEOUT_ENV`]
+/// (default [`DEFAULT_TAIL_DRAIN_TIMEOUT_SECS`]). Unparseable / zero values
+/// fall back to the default — a typo'd knob must not mean "unbounded".
+fn tail_drain_timeout() -> std::time::Duration {
+    let secs = std::env::var(TAIL_DRAIN_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_TAIL_DRAIN_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
 }
 
 /// Whether a forwarded partition write must land DURABLE on its owner before
@@ -695,6 +782,91 @@ impl PartitionForwardClient for HttpPartitionForwardClient {
                 "partition-write response from {url:?} is not a result: {text:?} ({e})"
             ))
         })
+    }
+
+    async fn drain_table_for_read(
+        &self,
+        peer_base_url: &str,
+        project: &ProjectId,
+        table: &str,
+    ) -> Result<bool> {
+        let url = Self::tail_drain_url(peer_base_url);
+        // Same transport-retry posture as `forward_partition_write`: retry
+        // ONLY send/transport failures (dead pooled connection to a bounced
+        // peer, connect timeout, reset) with a fresh connection — a drain is
+        // idempotent (draining an already-drained tail is an O(1) no-op on
+        // the peer), so re-sending is always safe. A RETURNED status is a real
+        // decision and is never retried here; retryability of 503/warming is
+        // the caller's (the query surfaces SQLSTATE 40001 and the client
+        // retries the statement).
+        const MAX_DRAIN_ATTEMPTS: u32 = 5;
+        let timeout = tail_drain_timeout();
+        let mut attempt: u32 = 0;
+        let resp = loop {
+            attempt += 1;
+            let send_result = self
+                .http
+                .post(&url)
+                // Per-request bound: the peer commits real object-store PUTs
+                // before acking a dirty drain, so the default is generous
+                // (120 s) — but a wedged peer must FAIL the read loudly, not
+                // hang it (the SELECT-1-blocked-764s incident class).
+                .timeout(timeout)
+                .header(FORWARD_SECRET_HEADER, &self.secret)
+                .header(PARTITION_FORWARD_PROJECT_HEADER, project.to_string())
+                .header(PARTITION_FORWARD_TABLE_HEADER, table)
+                .header(PARTITION_FORWARD_HOP_HEADER, "1")
+                .send()
+                .await;
+            match send_result {
+                Ok(r) => break r,
+                Err(e) if attempt < MAX_DRAIN_ATTEMPTS => {
+                    tracing::warn!(
+                        url = %url, attempt, error = %e,
+                        "tail-drain POST transport error; retrying with a fresh connection"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100u64 * attempt as u64,
+                    ))
+                    .await;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(BasinError::wal(format!(
+                        "tail-drain POST to {url:?} failed after {attempt} attempts: {e} \
+                         (mn read barrier fails closed — the peer's tail could not be \
+                         confirmed drained, so the aggregate would under-count)"
+                    )));
+                }
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            // The peer signals boot-recovery / convergence-in-progress as
+            // 503 + E_PARTITION_WARMING; surface it as the TYPED retryable
+            // error so the router maps it to SQLSTATE 40001 (clients back
+            // off and retry) instead of a generic hard failure.
+            if status.as_u16() == 503 && detail.contains(TAIL_DRAIN_WARMING_CODE) {
+                return Err(BasinError::PartitionWarming(format!(
+                    "tail-drain peer {peer_base_url:?} is warming (table {table:?}): {detail}"
+                )));
+            }
+            return Err(BasinError::wal(format!(
+                "tail-drain to {url:?} returned {status}: {detail}"
+            )));
+        }
+        let text = resp.text().await.map_err(|e| {
+            BasinError::wal(format!("tail-drain response from {url:?} unreadable: {e}"))
+        })?;
+        serde_json::from_str::<TailDrainResponse>(text.trim())
+            .map(|r| r.had_tail)
+            .map_err(|e| {
+                BasinError::wal(format!(
+                    "tail-drain response from {url:?} is not a TailDrainResponse: \
+                     {text:?} ({e})"
+                ))
+            })
     }
 }
 

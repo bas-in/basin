@@ -456,6 +456,21 @@ fn bare_column(e: &Expr) -> Option<String> {
     }
 }
 
+/// Whether the multi-node metadata-aggregate read barrier is engaged
+/// (`BASIN_MN_READ_BARRIER`; default ON). `0` / `off` disables it — an
+/// operator escape hatch for a degraded cluster where an under-count is
+/// consciously preferred over failing reads while a peer is down. Read per
+/// call (not cached): the flag flips behaviour mid-process in tests and the
+/// check is one env read on a path that is about to do network I/O anyway.
+fn mn_read_barrier_enabled() -> bool {
+    !matches!(
+        std::env::var("BASIN_MN_READ_BARRIER")
+            .as_deref()
+            .map(str::trim),
+        Ok("0") | Ok("off")
+    )
+}
+
 /// Execute a recognised metadata-aggregate plan purely from catalog
 /// statistics. Builds a single-row `RecordBatch` whose schema is
 /// byte-identical to what `exec_select` would have returned for the same
@@ -540,6 +555,40 @@ pub(crate) async fn execute_metadata_aggregate(
     // committed. `BASIN_FASTAGG_BLOCKING_FLUSH=1` restores the legacy blocking
     // drain. See `InProcessShard::compact_all_for_read`.
     let prefetched_meta = if let Some(shard) = sess.engine.config().shard.as_ref() {
+        // MULTI-NODE READ BARRIER (mn2). On a multi-peer cluster, ingest fans
+        // out per partition to a deterministic OWNER node, so a peer can hold
+        // a table's rows in ITS in-memory tail — invisible to EVERY read path
+        // on this node (the local flush below drains only THIS node's resident
+        // partitions; the committed catalog is the only shared substrate, and
+        // the exec_select fallback is exactly as peer-blind). Without this
+        // barrier a `count(*)`/`max` here silently omits the peer's un-drained
+        // tail — the wrong-count class behind the purge-confirm livelock (#70:
+        // a DELETE → count-until-0 audit loop reads a stale answer forever)
+        // and the restart under-count (#28). So BEFORE answering, ask every
+        // non-self peer to drain its tail for this table (each peer gates on
+        // its own has_pending_tail — O(1) RAM-only when clean). FAIL-LOUD
+        // contract: on ANY peer failure we return the error — never Ok(None),
+        // because the fallback full scan cannot see peer tails either and
+        // would be confidently wrong; a loud, retryable error (warming maps to
+        // SQLSTATE 40001) is the only honest answer. Sequential loop is fine:
+        // clusters are a handful of peers and the clean path is one cheap RTT.
+        // `BASIN_MN_READ_BARRIER=0|off` disables (escape hatch, default ON).
+        let router = sess.engine.partition_router();
+        if !router.is_local_only() && mn_read_barrier_enabled() {
+            let client = sess.engine.partition_forward_client().ok_or_else(|| {
+                BasinError::wal(
+                    "mn read barrier: multi-peer BASIN_SHARD_PEERS is configured but no \
+                     partition-forward client is attached, so peers' un-drained tails \
+                     cannot be confirmed drained; refusing to answer a possibly-wrong \
+                     aggregate (set BASIN_FORWARD_SECRET to wire the transport)",
+                )
+            })?;
+            for peer in router.non_self_peers() {
+                client
+                    .drain_table_for_read(&peer, &sess.project, plan.table.as_str())
+                    .await?;
+            }
+        }
         shard.flush_to_parquet_for_read().await?;
         // #70: if the bounded read-drain timed out (or skipped locked
         // partitions) and this table STILL has un-drained tail rows, the

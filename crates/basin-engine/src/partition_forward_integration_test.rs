@@ -157,6 +157,30 @@ impl PartitionForwardClient for InProcDouble {
             durable_lsn: Some(lsn),
         })
     }
+
+    /// mn2 read barrier: mirrors the `/internal/v1/tail-drain` receive handler
+    /// exactly — gate on the peer's own `has_pending_tail` (O(1) when clean),
+    /// else a BLOCKING, scoped, fail-loud `flush_tables_for_read`, and only ack
+    /// `had_tail:true` after the catalog commit. Errors propagate to the
+    /// querying engine (its aggregate must fail loud, never answer wrong).
+    async fn drain_table_for_read(
+        &self,
+        peer_base_url: &str,
+        project: &ProjectId,
+        table: &str,
+    ) -> Result<bool> {
+        let engine = self
+            .peers
+            .get(peer_base_url)
+            .unwrap_or_else(|| panic!("no in-proc peer for {peer_base_url:?}"));
+        let shard = engine.shard().expect("peer engine has a shard");
+        let table = TableName::new(table.to_owned())?;
+        if !shard.has_pending_tail(project, &table).await {
+            return Ok(false);
+        }
+        shard.flush_tables_for_read(project, &table).await?;
+        Ok(true)
+    }
 }
 
 fn ids_batch(ids: &[i64]) -> RecordBatch {
@@ -193,7 +217,7 @@ async fn two_engine_partition_forward_lands_on_owner_and_scans_cross_node() {
     // forward seam is exercised regardless of the compiled-in default. The
     // lock (held for the whole body) serializes against the sibling test, which
     // also pins this env var, so neither flips the other's fan-out mid-run.
-    let _env = FANOUT_ENV_LOCK.lock().unwrap();
+    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
 
     let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -210,11 +234,15 @@ async fn two_engine_partition_forward_lands_on_owner_and_scans_cross_node() {
     eng_b.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_B));
 
     // A's forward transport delivers straight into B's engine (and, defensively,
-    // back to A — never used, A-owned partitions take the local path).
+    // back to A — never used, A-owned partitions take the local path). B gets
+    // the same transport: the mn2 read barrier makes EVERY multi-peer count
+    // fan a tail-drain out to its peers, so an engine that serves counts needs
+    // a drain-capable client wired (fail-closed otherwise, by design).
     let mut map = HashMap::new();
     map.insert(PEER_A.to_string(), eng_a.clone());
     map.insert(PEER_B.to_string(), eng_b.clone());
-    eng_a.attach_partition_forward_client(Arc::new(InProcDouble { peers: map }));
+    eng_a.attach_partition_forward_client(Arc::new(InProcDouble { peers: map.clone() }));
+    eng_b.attach_partition_forward_client(Arc::new(InProcDouble { peers: map }));
 
     // Create the table on A (DDL is catalog-level → visible to both engines via
     // the shared catalog).
@@ -354,7 +382,7 @@ async fn two_engine_partition_forward_lands_on_owner_and_scans_cross_node() {
         ("A", &sess_a),
         ("B", &eng_b.open_session(project).await.unwrap()),
     ] {
-        let res = sess.execute("SELECT count(*) AS n FROM t").await.unwrap();
+        let res = sess.execute("SELECT count(*) FROM t").await.unwrap();
         let n = match res {
             crate::ExecResult::Rows { batches, .. } => batches
                 .iter()
@@ -384,7 +412,7 @@ async fn two_engine_partition_forward_lands_on_owner_and_scans_cross_node() {
 /// even though a forward transport is installed (it must never be consulted).
 #[tokio::test]
 async fn back_compat_no_peers_keeps_fanout_local() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap();
+    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
 
     let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -532,7 +560,7 @@ impl PartitionForwardClient for LostAckDouble {
 /// sent (no dup, no loss).
 #[tokio::test]
 async fn lost_ack_retry_reuses_key_and_applies_exactly_once() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap();
+    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
 
     let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -631,7 +659,7 @@ async fn lost_ack_retry_reuses_key_and_applies_exactly_once() {
 /// the set.
 #[tokio::test]
 async fn copy_touched_set_covers_all_partitions_with_monotone_lsns() {
-    let _guard = FANOUT_ENV_LOCK.lock().unwrap();
+    let _guard = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // Pin a 4-way fan-out so the round-robin visits _default, s1, s2, s3.
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "4");
 
@@ -770,7 +798,7 @@ impl PartitionForwardClient for DurabilityProbingDouble {
 /// test does not require; here we assert the default (barrier ON) guarantee.
 #[tokio::test]
 async fn forwarded_copy_batch_is_durable_on_owner_before_ack() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap();
+    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
     // Barrier ON (default). Be explicit so the test is hermetic regardless of
     // ambient env; the flag is read once and cached, so this must match the
@@ -862,7 +890,7 @@ async fn forwarded_copy_batch_is_durable_on_owner_before_ack() {
 /// incident self-diagnosing: the audit's accounting is the smoking-gun signal.
 #[tokio::test]
 async fn copy_durability_audit_accounts_for_every_acked_row_across_nodes() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap();
+    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
     // The audit only proves owner-durability when the durable-on-forward gate is
     // ON (the process default). Assert it so the gate is meaningful.
@@ -1150,7 +1178,10 @@ fn wire_forwarding(eng_a: &Engine, eng_b: &Engine) {
     let mut map = HashMap::new();
     map.insert(PEER_A.to_string(), eng_a.clone());
     map.insert(PEER_B.to_string(), eng_b.clone());
-    eng_a.attach_partition_forward_client(Arc::new(InProcDouble { peers: map }));
+    // BOTH engines get the transport: the mn2 read barrier fans a tail-drain
+    // out from whichever engine serves a count, and fails closed without one.
+    eng_a.attach_partition_forward_client(Arc::new(InProcDouble { peers: map.clone() }));
+    eng_b.attach_partition_forward_client(Arc::new(InProcDouble { peers: map }));
 }
 
 /// Count rows in a single WAL payload. The WAL payload layout is
@@ -1172,8 +1203,12 @@ fn wal_payload_rows(payload: &[u8]) -> usize {
 /// `SELECT count(*)` through a session — the global committed-segment row count
 /// (the in-RAM tail is NOT counted; only committed catalog segments are).
 async fn select_count(sess: &crate::ProjectSession, table: &str) -> i64 {
+    // UN-aliased on purpose: `match_metadata_aggregate` only recognises bare
+    // `count(*)` projections, and the mn2 read barrier lives inside the
+    // metadata-aggregate path — an aliased count silently routes through the
+    // peer-blind exec_select scan and the barrier tests would test nothing.
     let res = sess
-        .execute(&format!("SELECT count(*) AS n FROM {table}"))
+        .execute(&format!("SELECT count(*) FROM {table}"))
         .await
         .unwrap();
     match res {
@@ -1215,7 +1250,7 @@ async fn select_count(sess: &crate::ProjectSession, table: &str) -> i64 {
 ///      exactly once.
 #[tokio::test]
 async fn two_node_restart_recovers_forwarded_wal_durable_tail() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap();
+    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
     basin_common::telemetry::try_init_for_tests();
 
@@ -1306,8 +1341,23 @@ async fn two_node_restart_recovers_forwarded_wal_durable_tail() {
     // local touched set — the barrier on A is sufficient.
     sess_a.await_copy_durable().await.unwrap();
 
-    // The wedge means NOTHING compacted on either node: global count(*) < N.
+    // The wedge means NOTHING compacted on either node. With the mn2 read
+    // barrier ON (the default), a count from A now FAILS LOUD: the barrier
+    // asks B to drain its forwarded tail, B's compaction PUT hits the wedged
+    // store and errors, and that error surfaces instead of a silent
+    // under-count — pin the fail-loud contract first.
+    let res = sess_a.execute("SELECT count(*) FROM t").await;
+    assert!(
+        res.is_err(),
+        "barrier ON: count(*) against a peer whose drain is wedged must fail \
+         loud, not answer a committed-only under-count"
+    );
+    // Then read the committed-only figure with the barrier disabled (the
+    // operator escape hatch) to keep the original precondition observable:
+    // the wedged store means count(*) < N.
+    std::env::set_var("BASIN_MN_READ_BARRIER", "0");
     let committed_before = select_count(&sess_a, "t").await;
+    std::env::remove_var("BASIN_MN_READ_BARRIER");
     assert!(
         committed_before < n,
         "precondition: wedged data store ⇒ count(*) must under-count \
@@ -1505,7 +1555,7 @@ impl PartitionForwardClient for AlwaysFailForward {
 /// ack-without-durability hole behind the live 14.19M loss.
 #[tokio::test]
 async fn forward_drop_fails_the_copy_fail_closed() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap();
+    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
 
     let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1608,7 +1658,7 @@ async fn forward_drop_fails_the_copy_fail_closed() {
 /// `write_batch_fanout` guard at executor.rs ~455.
 #[tokio::test]
 async fn forward_off_node_without_transport_fails_closed() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap();
+    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
 
     let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1656,6 +1706,263 @@ async fn forward_off_node_without_transport_fails_closed() {
         }
     }
     assert!(saw_b_owned, "router put no partitions on B — guard not exercised");
+
+    std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
+}
+
+// ── mn2 READ BARRIER: peer tails must be visible to metadata aggregates ──────
+
+/// THE mn2 read-barrier headline: a `count(*)` served on node A must include
+/// rows that are still sitting in node B's un-drained in-memory tail (B holds
+/// them because A's fan-out forwarded the B-owned partitions there). Pins BOTH
+/// sides of the fix:
+///   1. barrier OFF (`BASIN_MN_READ_BARRIER=0`) — the count UNDER-COUNTS,
+///      reproducing the bug the barrier kills (peer tails are invisible to
+///      every read path; only the shared committed catalog is);
+///   2. barrier ON (default) — the same count fans a tail-drain out to B first
+///      and returns the exact total.
+#[tokio::test]
+async fn count_from_non_owner_includes_peer_tail_rows() {
+    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
+
+    let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = Arc::new(InMemoryCatalog::new());
+    let eng_a = engine_for(cold.clone(), catalog.clone(), PEER_A).await;
+    let eng_b = engine_for(cold.clone(), catalog.clone(), PEER_B).await;
+    wire_forwarding(&eng_a, &eng_b);
+
+    let sess_a = eng_a.open_session(ProjectId::new()).await.unwrap();
+    let project = sess_a.project();
+    sess_a.execute("CREATE TABLE t (id BIGINT)").await.unwrap();
+    let table = TableName::new("t").unwrap();
+    let router = PartitionRouter::new(vec![PEER_A.to_string(), PEER_B.to_string()], PEER_A);
+
+    // Ingest via A only: B-owned partitions' rows end up in B's in-RAM tail
+    // (forwarded, durable on B, NOT yet compacted anywhere). No flush.
+    let per_batch = 10i64;
+    let mut total = 0i64;
+    let mut b_owned_rows = 0i64;
+    for i in 0..8usize {
+        let base = (i as i64) * 100;
+        let ids: Vec<i64> = (0..per_batch).map(|k| base + k).collect();
+        total += per_batch;
+        crate::executor::exec_ingest_batch(&sess_a, &table, ids_batch(&ids))
+            .await
+            .unwrap();
+        let part = if i == 0 {
+            PartitionKey::default_key()
+        } else {
+            PartitionKey::new(format!("s{i}")).unwrap()
+        };
+        if !router.desired_owner(&project, part.as_str()).is_self {
+            b_owned_rows += per_batch;
+        }
+    }
+    assert!(
+        b_owned_rows > 0,
+        "router put no partitions on B — the barrier has nothing to prove"
+    );
+
+    // (1) BUG SURFACE, barrier OFF: the count drains only A's local tail, so
+    // B's forwarded rows are invisible — under-count by exactly B's share.
+    // (Order matters: this must run BEFORE the barrier-on count, which drains
+    // B's tail into the shared catalog for good.)
+    std::env::set_var("BASIN_MN_READ_BARRIER", "0");
+    let blind = select_count(&sess_a, "t").await;
+    std::env::remove_var("BASIN_MN_READ_BARRIER");
+    assert_eq!(
+        blind,
+        total - b_owned_rows,
+        "barrier OFF pins the bug: count omits the {b_owned_rows} rows in \
+         B's un-drained tail (got {blind}, ingested {total})"
+    );
+
+    // (2) THE FIX, barrier ON (default): the count fans a tail-drain out to B
+    // first, so every forwarded row is committed (and counted) — exact total.
+    let with_barrier = select_count(&sess_a, "t").await;
+    assert_eq!(
+        with_barrier, total,
+        "barrier ON: count from the non-owner must include the peer's tail \
+         rows (got {with_barrier}, ingested {total})"
+    );
+
+    // And B's tail really was drained (the ack meant something).
+    let shard_b = eng_b.shard().unwrap();
+    assert!(
+        !shard_b.has_pending_tail(&project, &table).await,
+        "the barrier's drain must have committed B's tail"
+    );
+
+    std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
+}
+
+/// A forward transport whose WRITES work (delegating to [`InProcDouble`]) but
+/// whose read-barrier drain always fails — models a peer that accepts ingest
+/// but whose drain endpoint is unreachable/erroring at count time.
+struct FailingDrainDouble {
+    writes: InProcDouble,
+}
+
+#[async_trait]
+impl PartitionForwardClient for FailingDrainDouble {
+    async fn forward_partition_write(
+        &self,
+        peer_base_url: &str,
+        project: ProjectId,
+        table: &str,
+        partition_id: &str,
+        idem_key: &str,
+        batch: RecordBatch,
+    ) -> Result<ForwardWriteResult> {
+        self.writes
+            .forward_partition_write(peer_base_url, project, table, partition_id, idem_key, batch)
+            .await
+    }
+
+    async fn drain_table_for_read(
+        &self,
+        _peer_base_url: &str,
+        _project: &ProjectId,
+        _table: &str,
+    ) -> Result<bool> {
+        Err(basin_common::BasinError::wal(
+            "simulated: peer tail-drain unreachable".to_string(),
+        ))
+    }
+}
+
+/// FAIL-LOUD: when a peer's tail-drain fails, the count must ERROR — never
+/// fall through to a peer-blind answer (the committed catalog AND the full
+/// scan both omit the peer's tail, so any fallback is confidently wrong).
+#[tokio::test]
+async fn peer_drain_failure_fails_count_loud() {
+    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
+
+    let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = Arc::new(InMemoryCatalog::new());
+    let eng_a = engine_for(cold.clone(), catalog.clone(), PEER_A).await;
+    let eng_b = engine_for(cold.clone(), catalog.clone(), PEER_B).await;
+
+    let peers = vec![PEER_A.to_string(), PEER_B.to_string()];
+    eng_a.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_A));
+    eng_b.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_B));
+    let mut map = HashMap::new();
+    map.insert(PEER_A.to_string(), eng_a.clone());
+    map.insert(PEER_B.to_string(), eng_b.clone());
+    eng_a.attach_partition_forward_client(Arc::new(FailingDrainDouble {
+        writes: InProcDouble { peers: map },
+    }));
+
+    let sess_a = eng_a.open_session(ProjectId::new()).await.unwrap();
+    sess_a.execute("CREATE TABLE t (id BIGINT)").await.unwrap();
+    let table = TableName::new("t").unwrap();
+    // Ingest so B genuinely holds forwarded tail rows the count would omit.
+    for i in 0..8usize {
+        let base = (i as i64) * 100;
+        let ids: Vec<i64> = (0..10).map(|k| base + k).collect();
+        crate::executor::exec_ingest_batch(&sess_a, &table, ids_batch(&ids))
+            .await
+            .unwrap();
+    }
+
+    let res = sess_a.execute("SELECT count(*) FROM t").await;
+    let err = res.expect_err(
+        "count(*) with an un-drainable peer must fail LOUD, not answer \
+         a peer-blind (wrong) number",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tail-drain unreachable"),
+        "the surfaced error must be the peer drain failure, got: {msg}"
+    );
+
+    std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
+}
+
+/// A transport whose drain reports the peer as WARMING (mid-restart, durable
+/// state not yet converged) — the typed retryable error must survive the trip
+/// through the aggregate path so the router maps it to SQLSTATE 40001 and
+/// clients back off + retry rather than treating it as a hard failure.
+struct WarmingDrainDouble {
+    writes: InProcDouble,
+}
+
+#[async_trait]
+impl PartitionForwardClient for WarmingDrainDouble {
+    async fn forward_partition_write(
+        &self,
+        peer_base_url: &str,
+        project: ProjectId,
+        table: &str,
+        partition_id: &str,
+        idem_key: &str,
+        batch: RecordBatch,
+    ) -> Result<ForwardWriteResult> {
+        self.writes
+            .forward_partition_write(peer_base_url, project, table, partition_id, idem_key, batch)
+            .await
+    }
+
+    async fn drain_table_for_read(
+        &self,
+        peer_base_url: &str,
+        _project: &ProjectId,
+        _table: &str,
+    ) -> Result<bool> {
+        Err(basin_common::BasinError::PartitionWarming(format!(
+            "simulated: peer {peer_base_url} still converging after restart"
+        )))
+    }
+}
+
+/// Retryability: a warming peer fails the count with the TYPED
+/// `PartitionWarming` error (kind preserved end-to-end), not a generic one.
+#[tokio::test]
+async fn peer_warming_propagates() {
+    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
+
+    let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = Arc::new(InMemoryCatalog::new());
+    let eng_a = engine_for(cold.clone(), catalog.clone(), PEER_A).await;
+    let eng_b = engine_for(cold.clone(), catalog.clone(), PEER_B).await;
+
+    let peers = vec![PEER_A.to_string(), PEER_B.to_string()];
+    eng_a.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_A));
+    eng_b.attach_partition_router(PartitionRouter::new(peers.clone(), PEER_B));
+    let mut map = HashMap::new();
+    map.insert(PEER_A.to_string(), eng_a.clone());
+    map.insert(PEER_B.to_string(), eng_b.clone());
+    eng_a.attach_partition_forward_client(Arc::new(WarmingDrainDouble {
+        writes: InProcDouble { peers: map },
+    }));
+
+    let sess_a = eng_a.open_session(ProjectId::new()).await.unwrap();
+    sess_a.execute("CREATE TABLE t (id BIGINT)").await.unwrap();
+    let table = TableName::new("t").unwrap();
+    for i in 0..4usize {
+        let base = (i as i64) * 100;
+        let ids: Vec<i64> = (0..10).map(|k| base + k).collect();
+        crate::executor::exec_ingest_batch(&sess_a, &table, ids_batch(&ids))
+            .await
+            .unwrap();
+    }
+
+    let res = sess_a.execute("SELECT count(*) FROM t").await;
+    match res {
+        Err(basin_common::BasinError::PartitionWarming(msg)) => {
+            assert!(
+                msg.contains("converging after restart"),
+                "warming detail must survive: {msg}"
+            );
+        }
+        other => panic!(
+            "expected the typed retryable PartitionWarming (40001) to \
+             propagate through the aggregate path, got {other:?}"
+        ),
+    }
 
     std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
 }

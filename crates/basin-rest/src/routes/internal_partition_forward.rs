@@ -205,7 +205,13 @@ fn secrets_match(provided: &[u8], expected: &[u8]) -> bool {
 /// Rejects (401) when the header is absent, non-ASCII, or mismatched. The
 /// caller guarantees `expected` is `Some` (the route is only mounted with a
 /// secret), but we re-check defensively and fail closed if it is ever `None`.
-fn check_forward_secret(headers: &HeaderMap, expected: Option<&str>) -> Result<(), ApiError> {
+/// `pub(crate)`: shared with the tail-drain receive route
+/// ([`crate::routes::internal_tail_drain`]), which sits behind the identical
+/// fail-closed secret gate.
+pub(crate) fn check_forward_secret(
+    headers: &HeaderMap,
+    expected: Option<&str>,
+) -> Result<(), ApiError> {
     let expected = expected.ok_or_else(|| {
         ApiError::unauthenticated("partition-write endpoint is not configured (no shared secret)")
     })?;
@@ -221,7 +227,8 @@ fn check_forward_secret(headers: &HeaderMap, expected: Option<&str>) -> Result<(
 }
 
 /// Read a required ASCII header, mapping absent / non-ASCII to a 400.
-fn required_header<'h>(headers: &'h HeaderMap, name: &str) -> Result<&'h str, ApiError> {
+/// `pub(crate)`: shared with the tail-drain receive route.
+pub(crate) fn required_header<'h>(headers: &'h HeaderMap, name: &str) -> Result<&'h str, ApiError> {
     headers
         .get(name)
         .ok_or_else(|| ApiError::invalid(format!("missing {name} header")))?

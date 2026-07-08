@@ -436,6 +436,41 @@ impl Shard {
         self.inner.flush_to_parquet().await
     }
 
+    /// Scoped, BLOCKING read-barrier drain: synchronously compact every
+    /// resident partition whose in-memory tail holds rows for `(project,
+    /// table)`, committing through the catalog and truncating the WAL, and
+    /// PROPAGATE the first failure instead of swallowing it.
+    ///
+    /// This is the peer-side limb of the multi-node metadata-aggregate read
+    /// barrier (`/internal/v1/tail-drain`): a `count(*)`/`max` served on node
+    /// A cannot see node B's un-drained in-memory tail through any read path
+    /// (the committed catalog is the only shared substrate), so A asks B to
+    /// drain the table's tail before answering. Three deliberate differences
+    /// from the whole-shard drains:
+    ///
+    /// * **Scoped** — only partitions whose tail actually holds rows for this
+    ///   `(project, table)` are compacted (O(1) no-op when clean), so a read
+    ///   barrier never pays for co-resident projects' backlogs. Scope is
+    ///   PARTITION-level: the per-partition compaction drains the whole
+    ///   partition tail, so a table co-located in a dirty partition drains
+    ///   alongside it (harmless over-drain — extra commits, never a wrong
+    ///   answer); partitions holding nothing for the table are skipped.
+    /// * **Blocking** (`compact_one`, not the `try_lock` read variant) — the
+    ///   caller acked `had_tail: true` only means something if the tail is
+    ///   COMMITTED when this returns; skipping a locked partition would ack a
+    ///   drain that didn't happen.
+    /// * **Fail-loud** — `compact_all` logs-and-continues because its caller
+    ///   is a background tick that retries; here a swallowed error becomes a
+    ///   silently-wrong count on the querying node, so the first per-partition
+    ///   failure aborts the drain and surfaces to the peer as an error.
+    pub async fn flush_tables_for_read(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<()> {
+        self.inner.flush_tables_for_read(project, table).await
+    }
+
     /// Boot-time recovery for the durable-but-uncompacted tail.
     ///
     /// A row is made WAL-durable on the write path before it is compacted into
@@ -940,6 +975,19 @@ pub(crate) trait ShardImpl: Send + Sync {
     /// `flush_to_parquet`). Default delegates to the blocking `flush_to_parquet`
     /// for backends without a per-partition compaction lock.
     async fn flush_to_parquet_for_read(&self) -> Result<()> {
+        self.flush_to_parquet().await
+    }
+    /// Scoped, blocking, fail-loud drain of `(project, table)`'s resident
+    /// tail for the multi-node read barrier (see
+    /// [`Shard::flush_tables_for_read`]). Default delegates to the blocking
+    /// whole-shard `flush_to_parquet` — over-draining is always safe for
+    /// backends without a per-partition tail map (their drain is a no-op or
+    /// already table-agnostic); only the in-process backend narrows it.
+    async fn flush_tables_for_read(
+        &self,
+        _project: &ProjectId,
+        _table: &TableName,
+    ) -> Result<()> {
         self.flush_to_parquet().await
     }
     async fn run_tiering_sweep(&self) -> Result<()>;
