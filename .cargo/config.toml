@@ -6,6 +6,15 @@
 # step. CI relies on Swatinem/rust-cache instead. Set RUSTC_WRAPPER in
 # your local env if you want sccache for dev builds.
 incremental = false
+# tokio_unstable unlocks tokio's runtime diagnostics — specifically
+# `Handle::dump()` (async task backtraces), used by basin-server's
+# wedge-forensics debug listener to diagnose the recurring "every query
+# hangs incl SELECT 1" state (#72). "Unstable" means the API may change
+# between tokio minors, NOT that behavior changes: the cfg only compiles in
+# extra introspection; the scheduler is identical. Workspace-wide because
+# rustflags cannot be scoped per-crate; inert for crates that don't use the
+# APIs. Cost: a one-time full rebuild (cache invalidation).
+rustflags = ["--cfg", "tokio_unstable"]
 
 # Stack size for std::thread::spawn (including cargo-test worker threads and
 # tokio runtime worker threads spawned via tokio's default builder). The Rust
