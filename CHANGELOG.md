@@ -8,6 +8,17 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Fix: `ts_headline` no longer drops trailing punctuation
+
+`ts_headline('The quick brown fox.', to_tsquery('fox'))` returned
+`The quick brown <b>fox</b>` — the sentence-final period was silently dropped.
+The body tokeniser attached each separator as the *preceding* prefix of the
+next word, so any separator after the LAST word had nowhere to go. It now
+returns that trailing separator, and the whole-body render paths (HighlightAll,
+and bodies shorter than MinWords) append it — matching PostgreSQL, which
+preserves original punctuation when the headline reaches the end of the
+document. (`crates/basin-engine/src/fts_udf.rs`.)
+
 ## Unreleased — Reliability: a single heavy query can no longer OOM-kill the node
 
 A `SELECT count(DISTINCT id)` over a ~557M-row table crashed the whole engine:

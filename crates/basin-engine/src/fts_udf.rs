@@ -2201,8 +2201,13 @@ struct BodyWord {
 }
 
 /// Tokenise the body into `BodyWord`s, preserving all separators so the
-/// original surface form can be reconstructed.
-fn tokenize_body(body: &str) -> Vec<BodyWord> {
+/// original surface form can be reconstructed. Returns the words plus any
+/// TRAILING separator after the last word (e.g. a sentence-final period): each
+/// `BodyWord` only carries the separator that *precedes* it, so without this a
+/// body ending in punctuation would silently drop that punctuation on
+/// reconstruction. PG's `ts_headline` preserves it when the rendered headline
+/// reaches the end of the document.
+fn tokenize_body(body: &str) -> (Vec<BodyWord>, String) {
     let mut words: Vec<BodyWord> = Vec::new();
     let mut prefix = String::new();
     let mut word = String::new();
@@ -2221,9 +2226,14 @@ fn tokenize_body(body: &str) -> Vec<BodyWord> {
         }
     }
     if !word.is_empty() {
-        words.push(BodyWord { word, prefix });
+        words.push(BodyWord {
+            word,
+            prefix: std::mem::take(&mut prefix),
+        });
     }
-    words
+    // Whatever remains in `prefix` is the trailing separator after the last
+    // word (empty when the body ends on a word character).
+    (words, prefix)
 }
 
 /// Select the best fragment window(s) and apply highlighting.
@@ -2247,18 +2257,27 @@ fn headline_fragment(body: &str, query: &str, opts: &HeadlineOptions) -> String 
     };
 
     // Tokenise the body.
-    let words = tokenize_body(body);
+    let (words, trailing) = tokenize_body(body);
     let n = words.len();
 
-    // HighlightAll: return the whole body with highlights.
+    // HighlightAll: return the whole body with highlights. This reaches the end
+    // of the document, so the trailing separator (if any) is preserved.
     if opts.highlight_all || n == 0 {
-        return highlight_words(&words, &terms, &opts.start_sel, &opts.stop_sel);
+        return format!(
+            "{}{}",
+            highlight_words(&words, &terms, &opts.start_sel, &opts.stop_sel),
+            trailing
+        );
     }
 
     // If the body is shorter than MinWords there is only one window: the
-    // whole body.
+    // whole body (again reaching the document end → keep the trailing text).
     if n <= opts.min_words {
-        return highlight_words(&words, &terms, &opts.start_sel, &opts.stop_sel);
+        return format!(
+            "{}{}",
+            highlight_words(&words, &terms, &opts.start_sel, &opts.stop_sel),
+            trailing
+        );
     }
 
     // Build a bitmap: is word[i] a query hit?
