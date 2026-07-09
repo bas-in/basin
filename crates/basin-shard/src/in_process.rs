@@ -2334,6 +2334,23 @@ impl InProcessShard {
                 .expect("non-empty table tail");
 
             // Concatenate all batches for this table into one Parquet write.
+            //
+            // #72 follow-up (secondary worker-starvation source, deferred):
+            // this `concat_batches` — and the Vortex/Parquet encode it feeds in
+            // PHASE 2 — is CPU-bound and runs INLINE on the calling runtime
+            // worker. When the backpressure hard-flush (`write_batch_inner`)
+            // drives it, N concurrent COPY connections each pin a worker in
+            // encode while holding this partition's `compact_lock`, which can
+            // starve the cooperative pool. Wrapping the encode in
+            // `tokio::task::spawn_blocking` would move it off the worker, but
+            // PHASE 1 here is interleaved with `!Send` guard reads
+            // (`top_pattern_provider`) and `.await` catalog calls
+            // (`load_table`) INSIDE the `compact_lock`-held critical section
+            // that commits exactly-once, so hoisting just the encode out is not
+            // a localized change — it would restructure the commit path. Left
+            // as a follow-up rather than risk exactly-once; the PRIMARY #72 fix
+            // (read path no longer blocks behind this lock) removes the
+            // observable "SELECT 1 hangs" symptom on its own.
             let batches: Vec<RecordBatch> = entries.iter().map(|(_, b)| b.clone()).collect();
             let schema = batches[0].schema();
             let merged = arrow::compute::concat_batches(&schema, &batches)

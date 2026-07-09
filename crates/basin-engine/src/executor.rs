@@ -10650,8 +10650,52 @@ pub(crate) async fn exec_select(
     // When the shard is wired in we additionally flush the in-RAM tail to
     // Parquet first so the just-written rows land in object storage before
     // the catalog-driven refresh reads the file list.
+    //
+    // #72 worker-starvation fix. Two independent changes to this pre-flush:
+    //
+    //   (1) TABLELESS reads flush NOTHING. `SELECT 1` (and any query with no
+    //       table reference — `SELECT now()`, `SELECT pg_backend_pid()`, etc.)
+    //       has no in-RAM tail to make visible: it reads no committed file set
+    //       and the refresh loop below refreshes no base table. Yet the old
+    //       code drained EVERY resident partition (a full `flush_to_parquet()`
+    //       → `compact_all()`) before it. Under sustained COPY the ingest task
+    //       holds each partition's `compact_lock` across an inline encode +
+    //       object-store PUT, so a trivial `SELECT 1` would block UNBOUNDEDLY
+    //       behind that lock — the exact "even SELECT 1 hangs" wedge in #72.
+    //       `match_simple_select` / `match_metadata_aggregate` both decline a
+    //       FROM-less query, so it falls through to here; this is the ONLY
+    //       place to short-circuit it. If the statement touches no table, skip
+    //       the flush entirely — there is nothing to make fresh.
+    //
+    //   (2) Reads that DO touch a table use the BOUNDED, coalesced read-path
+    //       drain (`flush_to_parquet_for_read`) instead of the blocking,
+    //       unbounded `flush_to_parquet`. This mirrors the metadata-aggregate
+    //       fast path (`fast_aggregate::execute_metadata_aggregate` →
+    //       `flush_to_parquet_for_read`): a partition currently being compacted
+    //       by an in-flight write-path drain is skipped rather than waited on,
+    //       and a stalled drain (wedged PUT) is abandoned after
+    //       `BASIN_FASTAGG_COMPACT_TIMEOUT_MS` (default 300 ms) with the read
+    //       answered from committed catalog state. This is NOT new semantics:
+    //       the read still sees every row the write path has COMMITTED, and any
+    //       residual in-flight tail stays WAL-durable and converges via the
+    //       background compactor — identical to the guarantee the aggregate
+    //       path already documents. It only stops the general SELECT path from
+    //       inheriting an unbounded compaction/PUT latency, which the read-path
+    //       hardening previously protected ONLY the aggregate path from.
     if let Some(shard) = sess.engine.config().shard.as_ref() {
-        shard.flush_to_parquet().await?;
+        // Decide whether this statement reads any base/virtual table at all.
+        // `select_references_any_table` re-parses `sql` (cheap; the same parse
+        // `compute_select_refresh_set` does moments later) and returns false
+        // ONLY when it can prove the single top-level `Query` names no table
+        // after subtracting in-statement CTE names — i.e. a pure scalar/
+        // function projection. Anything it cannot prove tableless (parse
+        // failure, multi-statement, non-Query, or a genuine table/subquery/
+        // CTE-body reference) conservatively returns true, so we never skip a
+        // flush a real read needed. A tableless read has no tail to surface,
+        // so we skip the drain outright.
+        if select_references_any_table(sql) {
+            shard.flush_to_parquet_for_read().await?;
+        }
     }
     // Inv-E #132: accumulate live-file count during the existing refresh loop
     // so we can pick target_partitions below without an extra catalog round-trip.
@@ -11532,6 +11576,162 @@ fn collect_cte_names_in_table_factor(
 /// `all_tables` is the project's current base-table list (already fetched by
 /// the caller); the result is intersected against it so we never hand
 /// `refresh_table` a name it doesn't own.
+/// Cheap, catalog-free predicate: does this SELECT reference any table at all?
+///
+/// Used by `exec_select`'s #72 pre-flush gate to decide whether a shard drain
+/// is even needed. A statement that names no table — `SELECT 1`,
+/// `SELECT now()`, `SELECT pg_backend_pid()` — has no in-RAM tail to surface,
+/// so draining resident partitions before it is pure waste AND a wedge risk
+/// (the blocking drain can block behind an ingest-held `compact_lock`). We must
+/// NOT run any shard flush for those.
+///
+/// Returns `false` (tableless → skip the drain) when we can prove the statement
+/// reads nothing a shard tail can live under: it parses as exactly one top-level
+/// `Query`, and every SINGLE-IDENT table token it collects (walking FROM/JOIN,
+/// subqueries, CTE bodies) is an in-statement CTE name. Returns `true` — the
+/// SAFE direction, because a missed flush would serve stale data — when:
+///   - the SQL fails to parse or is not exactly one statement,
+///   - the single statement is not a plain `Query`,
+///   - any single-ident reference remains after subtracting CTE names (a real
+///     base table, a bare view name, or a CTE whose *body* reads a real table —
+///     that body's tables are collected too, so they keep the set non-empty).
+///
+/// This deliberately does NOT consult the catalog: it is a syntactic "is there
+/// a single-ident table token here" check, run on the hot path before the
+/// (async, catalog-touching) `compute_select_refresh_set`. Note the ref
+/// collector records only single-ident names (`collect_from_table_factor`
+/// gates on `name.0.len() == 1`), matching where a shard tail can actually
+/// live: an owned base table. Schema-qualified relations
+/// (`pg_catalog.*` / `information_schema.*`) are two-part names, so they are
+/// NOT collected and correctly count as tableless — those are synthesized
+/// providers with no shard tail, and skipping their drain is a harmless
+/// improvement over the pre-#72 blocking flush.
+fn select_references_any_table(sql: &str) -> bool {
+    let dialect = PostgreSqlDialect {};
+    let stmts = match Parser::parse_sql(&dialect, sql) {
+        Ok(s) => s,
+        // Unparseable / multi-statement: cannot prove tableless → flush.
+        Err(_) => return true,
+    };
+    if stmts.len() != 1 {
+        return true;
+    }
+    let Statement::Query(query) = &stmts[0] else {
+        // Not a plain Query (should not reach exec_select's SELECT path, but be
+        // conservative): cannot prove tableless → flush.
+        return true;
+    };
+
+    // Every table-shaped reference (base tables, view names, and CTE *names*
+    // used in a FROM, plus tables reached through subqueries and CTE bodies).
+    let refs = collect_table_refs_from_query(query);
+    if refs.is_empty() {
+        // No table token anywhere — genuinely tableless (`SELECT 1`).
+        return false;
+    }
+
+    // Subtract in-statement CTE names: `FROM cte` is not a base-table read.
+    // If a CTE's body reads a real table, that table is ALSO in `refs` (the
+    // collector recurses into CTE bodies), so it survives the subtraction and
+    // correctly keeps this `true`. A CTE that reads nothing real
+    // (`WITH x AS (SELECT 1) SELECT * FROM x`) leaves only the CTE name, which
+    // is subtracted → tableless.
+    let mut cte_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_cte_names(query, &mut cte_names);
+    refs.iter()
+        .any(|t| !cte_names.contains(&t.as_str().to_ascii_lowercase()))
+}
+
+#[cfg(test)]
+mod select_flush_gate_tests {
+    //! #72 flush-decision gate. `exec_select` runs a shard drain BEFORE every
+    //! read; the blocking variant could block a trivial `SELECT 1` behind an
+    //! ingest-held `compact_lock` (the "even SELECT 1 hangs" wedge). The fix
+    //! gates the drain on `select_references_any_table`: a tableless read
+    //! (`SELECT 1`) must skip it entirely, while any real table read still
+    //! takes the (now bounded, read-path) drain. These tests pin that gate's
+    //! decision so a future refactor can't silently reintroduce a drain on the
+    //! `SELECT 1` path.
+    use super::select_references_any_table;
+
+    #[test]
+    fn tableless_scalar_select_skips_flush() {
+        // The load-bearing case: `SELECT 1` names no table, so the shard drain
+        // must be skipped. If this ever returns true again, `SELECT 1` can
+        // block behind a wedged compaction under sustained ingest (#72).
+        assert!(!select_references_any_table("SELECT 1"));
+        assert!(!select_references_any_table("select 1 as x, 2 as y"));
+    }
+
+    #[test]
+    fn function_only_select_skips_flush() {
+        // Function projections read no catalog table → no tail to surface.
+        assert!(!select_references_any_table("SELECT now()"));
+        assert!(!select_references_any_table("SELECT pg_backend_pid()"));
+    }
+
+    #[test]
+    fn cte_reading_nothing_real_skips_flush() {
+        // A CTE whose body reads no real table leaves only the CTE name, which
+        // is subtracted → tableless.
+        assert!(!select_references_any_table(
+            "WITH x AS (SELECT 1) SELECT * FROM x"
+        ));
+    }
+
+    #[test]
+    fn real_table_read_requires_flush() {
+        // A genuine base-table read must drain (bounded) so the read sees
+        // committed rows.
+        assert!(select_references_any_table("SELECT * FROM events"));
+        assert!(select_references_any_table("SELECT count(*) FROM events"));
+    }
+
+    #[test]
+    fn cte_over_real_table_requires_flush() {
+        // The CTE name is subtracted, but the real table its body reads is
+        // ALSO collected (the ref walker recurses into CTE bodies) and
+        // survives, so the gate stays true.
+        assert!(select_references_any_table(
+            "WITH x AS (SELECT * FROM events) SELECT * FROM x"
+        ));
+    }
+
+    #[test]
+    fn subquery_table_requires_flush() {
+        // A table reached only through a scalar subquery still counts.
+        assert!(select_references_any_table(
+            "SELECT (SELECT count(*) FROM events)"
+        ));
+    }
+
+    #[test]
+    fn schema_qualified_reference_skips_flush() {
+        // `pg_catalog.*` / `information_schema.*` are schema-qualified
+        // (two-part) names. The ref collector only records single-ident table
+        // tokens (it cannot own a schema-qualified base table), so these are
+        // not collected and the gate reports tableless → skip the drain. That
+        // is CORRECT: these are synthesized providers with no shard tail to
+        // surface, so skipping the drain for them is a (harmless) improvement
+        // over the pre-#72 blocking flush. A single-ident base table is the
+        // only shape a shard tail can live under, and that shape IS collected
+        // (see `real_table_read_requires_flush`).
+        assert!(!select_references_any_table(
+            "SELECT * FROM pg_catalog.pg_class"
+        ));
+        assert!(!select_references_any_table(
+            "SELECT * FROM information_schema.tables"
+        ));
+    }
+
+    #[test]
+    fn unparseable_or_non_query_is_conservative() {
+        // Cannot prove tableless → flush (the safe direction).
+        assert!(select_references_any_table("SELECT FROM WHERE ???"));
+        assert!(select_references_any_table("SELECT 1; SELECT 2"));
+    }
+}
+
 async fn compute_select_refresh_set(
     sess: &ProjectSession,
     sql: &str,
