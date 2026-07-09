@@ -57,6 +57,21 @@ impl Node {
 
 }
 
+impl Drop for Node {
+    /// Teardown: abort the raft transport server task so its `TcpListener` and
+    /// serving loop don't outlive the test. Without this a test's nodes keep
+    /// serving (and their openraft background loops keep spinning) after the
+    /// test's `Vec<Node>` drops, so later tests in the SAME process inherit a
+    /// runtime clogged with dozens of leaked clusters — enough CPU starvation
+    /// that a large-batch replication catch-up stalls past its bound and flakes
+    /// (`large_entry_batch_round_trips_with_byte_fidelity` passed alone but
+    /// failed after siblings). `abort()` is sync so it is safe from `drop`; the
+    /// on-disk `TempDir` is cleaned by its own `Drop`.
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
 /// Reopen a previously-killed node from its on-disk state at the same address
 /// and rejoin it to the cluster, replacing the dead `Node` in `nodes`.
 async fn restart_node(nodes: &mut [Node], id: u64) {
@@ -462,7 +477,12 @@ async fn large_entry_batch_round_trips_with_byte_fidelity() {
     // wire round-trip (leader → AppendEntries → follower state machine).
     let follower = nodes.iter().find(|n| n.id != leader_id).unwrap();
     let hw = leader.wal.high_water(&proj, &part).await.unwrap();
-    let ok = wait_until(Duration::from_secs(10), || async {
+    // ~2.5 MiB replicates in <1 s alone, but this raft-net target runs several
+    // 3-node clusters back-to-back in ONE process; residual CPU load (openraft
+    // consensus loops whose async shutdown can't complete from a sync `Drop`)
+    // slows the large-batch catch-up. A generous bound keeps it robust — a
+    // genuinely stuck follower never catches up regardless.
+    let ok = wait_until(Duration::from_secs(30), || async {
         follower.wal.high_water(&proj, &part).await.unwrap() == hw
     })
     .await;
