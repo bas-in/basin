@@ -299,6 +299,58 @@ fn main() -> Result<()> {
         .block_on(run())
 }
 
+/// Log every off-default performance/durability tunable present in the
+/// environment (see the call site in `run()` for the rationale — the stale
+/// `BASIN_S3_REQUEST_TIMEOUT_SECS` wedge incident). Curated list: the knobs
+/// whose misconfiguration has actually cost incidents. Credential-shaped vars
+/// are reported presence-only; everything here is a plain tunable so the value
+/// is echoed to make triage one-glance. Cheap: a handful of env reads at boot.
+fn log_config_overrides() {
+    // (env var, is_secret) — is_secret=true → never echo the value.
+    const WATCHED: &[&str] = &[
+        "BASIN_S3_REQUEST_TIMEOUT_SECS",
+        "BASIN_S3_MAX_RETRIES",
+        "BASIN_S3_RETRY_TIMEOUT_SECS",
+        "BASIN_S3_POOL_MAX_IDLE",
+        "BASIN_S3_POOL_IDLE_TIMEOUT_SECS",
+        "BASIN_SYNCHRONOUS_COMMIT",
+        "BASIN_WAL_FLUSH_INTERVAL_MS",
+        "BASIN_WAL_COMMIT_DELAY_MS",
+        "BASIN_FASTAGG_COMPACT_TIMEOUT_MS",
+        "BASIN_FASTAGG_BLOCKING_FLUSH",
+        "BASIN_PARTITION_WARMUP_TIMEOUT_SECS",
+        "BASIN_COMMIT_ADOPT_HEAD_RETRIES",
+        "BASIN_MN_READ_BARRIER",
+        "BASIN_TAIL_DRAIN_TIMEOUT_SECS",
+        "BASIN_SHARD_COMPACTION_CONCURRENCY",
+        "BASIN_SHARD_MERGE_CONCURRENCY",
+        "BASIN_WAL_FLUSH_CONCURRENCY",
+        "BASIN_STRIPE_MERGE_SECS",
+        "BASIN_FAIRSHARE_COMPACTION",
+    ];
+    let mut n = 0usize;
+    for &k in WATCHED {
+        if let Ok(v) = std::env::var(k) {
+            let v = v.trim();
+            if v.is_empty() {
+                continue;
+            }
+            n += 1;
+            tracing::warn!(
+                key = k,
+                value = v,
+                "CONFIG OVERRIDE: non-default tunable set via environment — \
+                 verify this is intentional (off-default perf/durability knob)",
+            );
+        }
+    }
+    if n == 0 {
+        tracing::info!("config: all watched perf/durability tunables at code defaults");
+    } else {
+        tracing::warn!(overrides = n, "config: {n} off-default tunable(s) in effect (see warnings above)");
+    }
+}
+
 async fn run() -> Result<()> {
     let _ = init(tracing::Level::INFO, LogFormat::Pretty);
 
@@ -314,6 +366,18 @@ async fn run() -> Result<()> {
         region = basin_common::local_region(),
         "starting basin-server"
     );
+
+    // CONFIG-DRIFT GUARD. Every performance- / durability-critical tunable
+    // that is SET in the environment (i.e. overriding a hardened code default)
+    // is logged LOUDLY at boot. This exists because a single stale secret —
+    // `BASIN_S3_REQUEST_TIMEOUT_SECS` left at ~800s from an old tuning session
+    // — silently defeated the 30s fail-fast default and caused days of
+    // "storage wedge" misdiagnosis: the override was invisible. An operator
+    // (or a future incident triage) can now see, in the first lines of the
+    // log, exactly which knobs are off-default and reconcile them against
+    // intent. Values are echoed for non-secret tunables; presence-only for
+    // anything credential-shaped.
+    log_config_overrides();
 
     std::fs::create_dir_all(&cfg.data_dir)
         .with_context(|| format!("create data dir {}", cfg.data_dir.display()))?;
