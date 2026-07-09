@@ -8,6 +8,20 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Perf: file-merge runs on its own faster cadence so it keeps pace with ingest
+
+The file-count-bounding merge sweep was chained to the 60 s stripe-merge tick —
+it ran at most once a minute, and only after the (potentially long) stripe-merge
+pass. Under sustained ingest a hot partition accretes far more flush files in
+60 s than one bounded merge pass can drain, so its file count grows without
+bound, the segment baseline fold (and every other O(files) cost) grows with it,
+and ingest decays — the mechanism behind the ~550M single-table stall. File-merge
+now runs on its OWN, faster tick (`BASIN_FILE_MERGE_SECS`, default 10 s),
+decoupled from stripe-merge, so the per-partition file count stays bounded under
+load. The two sweeps still serialise on the same lock (cadence, not new
+concurrency); `BASIN_FILE_MERGE_SECS=0` restores the chained behaviour.
+(`crates/basin-shard/src/lib.rs`, `crates/basin-shard/src/in_process.rs`.)
+
 ## Unreleased — Perf: file-merge no longer re-reads the whole-table union every tick
 
 The per-partition file-merge sweep loaded table metadata with `load_table`,

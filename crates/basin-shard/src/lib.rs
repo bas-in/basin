@@ -46,6 +46,13 @@ const DEFAULT_CLEAN_SWEEP_SECS: u64 = 30;
 /// Default cadence of the stripe-merge compaction sweep, seconds
 /// (`BASIN_STRIPE_MERGE_SECS`). `0` disables the sweep entirely.
 const DEFAULT_STRIPE_MERGE_SECS: u64 = 60;
+/// Default file-merge sweep cadence in seconds (`BASIN_FILE_MERGE_SECS`). The
+/// file-count-bounding merge runs on its OWN, faster tick — decoupled from the
+/// 60 s stripe-merge — so a hot partition accreting flush files far faster than
+/// one stripe-cadence pass can drain still has its file count held under the
+/// ceiling (keeping the segment baseline fold and every other O(files) cost
+/// flat). `0` => fall back to the stripe-merge cadence.
+const DEFAULT_FILE_MERGE_SECS: u64 = 10;
 
 /// Default cadence of the quiesce-drain tick, seconds
 /// (`BASIN_QUIESCE_COMPACT_SECS`). This short tick runs `compact_all` ONLY
@@ -135,6 +142,13 @@ pub struct ShardConfig {
     /// (`BASIN_STRIPE_MERGE_SECS`); a zero duration (env value `0`)
     /// disables the sweep.
     pub stripe_merge_interval: Duration,
+    /// How often the background loop runs the file-count-bounding file-merge
+    /// sweep (coalescing sub-sealed-size flush files per partition). Decoupled
+    /// from and faster than `stripe_merge_interval` so file-merge keeps pace
+    /// with ingest under sustained load instead of running only once per
+    /// 60 s stripe cadence. `BASIN_FILE_MERGE_SECS`, default 10 s; `0` => fall
+    /// back to the stripe-merge cadence.
+    pub file_merge_interval: Duration,
     /// Read-freshness convergence: cadence of the quiesce-drain tick. This
     /// short tick runs `compact_all` ONLY when shard-wide ingest is idle
     /// (rolling rows/sec == 0) and a pending uncompacted tail exists, so the
@@ -223,6 +237,10 @@ impl ShardConfig {
             stripe_merge_interval: Duration::from_secs(env_secs(
                 "BASIN_STRIPE_MERGE_SECS",
                 DEFAULT_STRIPE_MERGE_SECS,
+            )),
+            file_merge_interval: Duration::from_secs(env_secs(
+                "BASIN_FILE_MERGE_SECS",
+                DEFAULT_FILE_MERGE_SECS,
             )),
             quiesce_compact_interval: Duration::from_secs(env_secs(
                 "BASIN_QUIESCE_COMPACT_SECS",

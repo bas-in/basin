@@ -4335,6 +4335,22 @@ impl ShardImpl for InProcessShard {
             } else {
                 std::time::Duration::from_secs(3600)
             });
+            // File-merge runs on its OWN, faster tick — DECOUPLED from the 60 s
+            // stripe-merge — so the per-partition file-count ceiling is held even
+            // when a hot partition accretes flush files faster than one stripe
+            // cadence can drain (the mechanism behind the 550M+ merge-falls-behind
+            // stall). Enabled only when compaction is on AND a non-zero
+            // BASIN_FILE_MERGE_SECS is set; otherwise file-merge stays chained to
+            // the stripe tick (fallback, `own_file_merge_tick == false`). Both
+            // sweeps still serialise on `stripe_merge_lock`, so the decoupled tick
+            // adds cadence, not new concurrency.
+            let own_file_merge_tick =
+                stripe_merge_enabled && !me.cfg.file_merge_interval.is_zero();
+            let mut file_merge_tick = tokio::time::interval(if own_file_merge_tick {
+                me.cfg.file_merge_interval
+            } else {
+                std::time::Duration::from_secs(3600)
+            });
             // Read-freshness convergence: a short tick that drains the residual
             // tail PROMPTLY once ingest goes idle, so `count(*)`/`max(id)`
             // (which read the catalog's segment-committed live files, NOT the
@@ -4398,6 +4414,7 @@ impl ShardImpl for InProcessShard {
             heartbeat_tick.tick().await;
             sweep_tick.tick().await;
             stripe_merge_tick.tick().await;
+            file_merge_tick.tick().await;
             quiesce_drain_tick.tick().await;
             autotune_tick.tick().await;
             loop {
@@ -4467,11 +4484,24 @@ impl ShardImpl for InProcessShard {
                         if let Err(e) = me.stripe_merge_sweep().await {
                             warn!(error = %e, "stripe-merge tick failed");
                         }
-                        // Same cadence/lock domain: bound the per-partition
-                        // file count so the segment baseline fold (and every
-                        // other O(files) cost) stays flat under sustained
-                        // ingest. Runs after stripe-merge so any disjoint-range
-                        // coalescing happens first.
+                        // Fallback ONLY: when file-merge has no dedicated tick
+                        // (BASIN_FILE_MERGE_SECS=0) keep it chained here, after
+                        // stripe-merge so any disjoint-range coalescing runs first.
+                        // When it has its own tick (the default) it runs far more
+                        // often below and is not duplicated here.
+                        if !own_file_merge_tick {
+                            if let Err(e) = me.file_merge_sweep().await {
+                                warn!(error = %e, "file-merge tick failed");
+                            }
+                        }
+                    }
+                    _ = file_merge_tick.tick(), if own_file_merge_tick => {
+                        // Dedicated, faster file-count-bounding sweep. Bounds the
+                        // per-partition file count so the segment baseline fold
+                        // (and every other O(files) cost) stays flat under
+                        // sustained ingest, without waiting for the 60 s stripe
+                        // cadence. Serialises with stripe-merge on
+                        // `stripe_merge_lock` — cadence, not new concurrency.
                         if let Err(e) = me.file_merge_sweep().await {
                             warn!(error = %e, "file-merge tick failed");
                         }
