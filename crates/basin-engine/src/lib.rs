@@ -182,6 +182,18 @@ pub(crate) struct EngineInner {
     /// `Arc` into its `CacheManagerConfig` so the cache outlives any single
     /// session. Capacity: 50 MiB (covers ~hundreds of Vortex/Parquet files).
     pub(crate) file_metadata_cache: Arc<dyn FileMetadataCache>,
+    /// Process-wide bounded query memory pool (DataFusion). Shared across ALL
+    /// sessions and plugged into every per-session `RuntimeEnv`, so the SUM of
+    /// concurrent query working-set memory is capped instead of unbounded.
+    /// Without it a single heavy aggregate (e.g. `count(DISTINCT id)` over
+    /// hundreds of millions of rows) grows its accumulator until the OS
+    /// OOM-kills the whole engine — one client can crash a shared node. With a
+    /// `FairSpillPool`, spillable operators (external sort, grouped aggregate)
+    /// spill to disk and complete; non-spillable ones (distinct accumulators)
+    /// fail cleanly with a retryable `ResourcesExhausted` error. Either way the
+    /// node never dies. Sized from detected container RAM; see
+    /// [`derive_query_memory_bytes`].
+    pub(crate) query_memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     /// Per-`(project, table)` query pattern history for adaptive sort
     /// (Phase 5.14.D2).  Records ORDER BY / GROUP BY column tuples observed
     /// at query time so the compactor (Phase 5.14.D1) can detect common
@@ -374,6 +386,94 @@ pub(crate) struct EngineInner {
         RwLock<Option<Arc<dyn crate::realtime_catalog::RealtimeChannelSource>>>,
 }
 
+/// Size the process-wide DataFusion query memory pool from detected container
+/// RAM. Query working sets (sort/aggregate/join buffers) get a bounded slice so
+/// they spill or fail cleanly instead of OOM-killing the node; the remainder is
+/// left for the ingest hot tail, object-store buffers, WAL, and allocator/OS
+/// overhead.
+///
+/// Default: `BASIN_QUERY_MEMORY_FRACTION` (percent, 10..=90; default 50) of
+/// `mem_bytes`. An explicit `BASIN_QUERY_MEMORY_BYTES` overrides the fraction
+/// entirely. Floored at 256 MiB so tiny/undetected environments still run.
+pub(crate) fn derive_query_memory_bytes(mem_bytes: u64) -> usize {
+    let explicit = std::env::var("BASIN_QUERY_MEMORY_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let fraction = std::env::var("BASIN_QUERY_MEMORY_FRACTION")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    derive_query_memory_bytes_inner(mem_bytes, explicit, fraction)
+}
+
+/// Pure core of [`derive_query_memory_bytes`] (env parsing lifted out so it is
+/// deterministically testable). Floor 256 MiB; explicit bytes win over the
+/// fraction; fraction clamped to 10..=90 percent; default 50 percent.
+fn derive_query_memory_bytes_inner(
+    mem_bytes: u64,
+    explicit_bytes: Option<u64>,
+    fraction_pct: Option<u64>,
+) -> usize {
+    const FLOOR: u64 = 256 * 1024 * 1024;
+    if let Some(bytes) = explicit_bytes {
+        return bytes.max(FLOOR) as usize;
+    }
+    let pct = fraction_pct.map(|p| p.clamp(10, 90)).unwrap_or(50);
+    let mem = if mem_bytes == 0 { FLOOR } else { mem_bytes };
+    // u128 intermediate: avoids overflow on large RAM and truncation error, so
+    // round fractions (e.g. 50% of 32 GiB) land on the exact byte count.
+    let sized = ((mem as u128 * pct as u128) / 100) as u64;
+    sized.max(FLOOR) as usize
+}
+
+#[cfg(test)]
+mod query_mem_tests {
+    use super::derive_query_memory_bytes_inner;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    #[test]
+    fn default_fraction_is_half_of_ram() {
+        // 32 GiB node → 16 GiB pool at the default 50%.
+        assert_eq!(
+            derive_query_memory_bytes_inner(32 * GIB, None, None),
+            (16 * GIB) as usize
+        );
+    }
+
+    #[test]
+    fn fraction_is_clamped_and_applied() {
+        assert_eq!(
+            derive_query_memory_bytes_inner(10 * GIB, None, Some(70)),
+            (7 * GIB) as usize
+        );
+        // Over-90 clamps to 90, not 100 (always leave headroom).
+        assert_eq!(
+            derive_query_memory_bytes_inner(10 * GIB, None, Some(200)),
+            (9 * GIB) as usize
+        );
+    }
+
+    #[test]
+    fn explicit_bytes_override_fraction() {
+        assert_eq!(
+            derive_query_memory_bytes_inner(64 * GIB, Some(2 * GIB), Some(80)),
+            (2 * GIB) as usize
+        );
+    }
+
+    #[test]
+    fn floored_at_256mib_for_tiny_or_undetected_ram() {
+        // Undetected RAM (0) and a tiny explicit value both floor to 256 MiB so
+        // the engine still starts and runs on constrained/test environments.
+        assert_eq!(derive_query_memory_bytes_inner(0, None, None), (256 * MIB) as usize);
+        assert_eq!(
+            derive_query_memory_bytes_inner(64 * GIB, Some(1), None),
+            (256 * MIB) as usize
+        );
+    }
+}
+
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Self {
         crate::cron_glue::install();
@@ -417,6 +517,18 @@ impl Engine {
             Arc::new(DefaultFilesMetadataCache::new(
                 CacheManagerConfig::default().metadata_cache_limit,
             ));
+        // Build the process-wide bounded query memory pool once. Sized from
+        // detected container RAM so the SUM of concurrent query working sets is
+        // capped — a single heavy aggregate can no longer OOM-kill the node.
+        let query_memory_bytes =
+            derive_query_memory_bytes(basin_common::autotune::detect_hardware().mem_bytes);
+        let query_memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = Arc::new(
+            datafusion::execution::memory_pool::FairSpillPool::new(query_memory_bytes),
+        );
+        tracing::info!(
+            query_memory_bytes,
+            "installed process-wide bounded query memory pool (FairSpillPool)"
+        );
         // Phase 5.14.C5: construct the process-wide memtable registry once.
         // Reads BASIN_MEMTABLE_* env vars for per-process budget overrides.
         // Integration with writes (C2), reads (C3), and flush (C4) is in
@@ -452,6 +564,7 @@ impl Engine {
             webhook_registry: crate::webhook_registry::WebhookRegistry::new(),
             udf_cache,
             file_metadata_cache,
+            query_memory_pool,
             query_history: Arc::new(crate::query_history::QueryHistory::new()),
             memtable_registry,
             next_tx_id: AtomicU64::new(1),

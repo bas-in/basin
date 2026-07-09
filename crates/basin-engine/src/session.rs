@@ -2752,6 +2752,10 @@ pub(crate) async fn open(
     ));
     let runtime_env = RuntimeEnvBuilder::new()
         .with_cache_manager(cache_cfg)
+        // Plug in the process-wide bounded memory pool so the SUM of concurrent
+        // query working sets is capped: a single heavy aggregate spills or fails
+        // cleanly instead of OOM-killing the shared node.
+        .with_memory_pool(engine.inner.query_memory_pool.clone())
         .build_arc()
         .map_err(|e| BasinError::internal(format!("RuntimeEnv build: {e}")))?;
     // Targeted defaults: install only the DF feature sets we actually

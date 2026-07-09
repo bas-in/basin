@@ -8,6 +8,23 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Reliability: a single heavy query can no longer OOM-kill the node
+
+A `SELECT count(DISTINCT id)` over a ~557M-row table crashed the whole engine:
+the per-session DataFusion `RuntimeEnv` installed no memory pool, so it inherited
+the **unbounded** default — a distinct accumulator (or any large aggregate/sort)
+grows until the OS OOM-kills the process, taking every other session on the node
+down with it. One client could deny service to all.
+
+Basin now builds one **process-wide bounded `FairSpillPool`** at engine start,
+sized from detected container RAM (`BASIN_QUERY_MEMORY_FRACTION`, default 50%; or
+an explicit `BASIN_QUERY_MEMORY_BYTES`; floored at 256 MiB), and plugs the same
+pool into **every** session's `RuntimeEnv`. The SUM of concurrent query working
+sets is now capped: spillable operators (external sort, grouped aggregate) spill
+to disk and complete; non-spillable ones (distinct accumulators) fail cleanly
+with a retryable `ResourcesExhausted` error. Either way the node stays up.
+(`crates/basin-engine/src/lib.rs`, `crates/basin-engine/src/session.rs`.)
+
 ## Unreleased — Fix: a torn/corrupt table can no longer lock a whole project out, and a DROP can no longer corrupt a same-name recreate
 
 A perfection test left a dev project unable to accept ANY pgwire connection.
