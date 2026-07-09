@@ -5742,6 +5742,123 @@ mod tests {
         assert_eq!(paths.len(), n, "no duplicate paths in unioned set");
     }
 
+    /// REPRO (#74 / #68): a SEPARATE reader node (its own `part_cache`) counting
+    /// a partition via `load_table().live_data_files()` must stay EXACT while a
+    /// writer node churns file-merge (and split-back) on that partition over the
+    /// SHARED store. The merge commits `removed=inputs, added=output` as ONE
+    /// per-partition snapshot delta, so a cross-node reader must resolve the new
+    /// head and fold it to the SAME row total — never a transient over-count
+    /// (inputs+output both live) nor under-count (neither). This isolates the
+    /// suspected multi-node union / partition-resolve inconsistency at the
+    /// catalog layer, with no shard/forwarding/barrier scaffolding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cross_node_read_stays_consistent_during_compaction() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let writer = Arc::new(ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX));
+        let reader = Arc::new(ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX));
+        let p = ProjectId::new();
+        let t = TableName::new("ingest").unwrap();
+        writer.create_namespace(&p).await.unwrap();
+        writer.create_table(&p, &t, &schema()).await.unwrap();
+
+        let pid = "s0";
+        const NFILES: u64 = 40;
+        const ROWS_PER: u64 = 10;
+        let expected: u64 = NFILES * ROWS_PER; // 400 — held fixed by merge↔split.
+
+        for i in 0..NFILES {
+            let exp = writer.current_snapshot_id_in_partition(&p, &t, pid).await.unwrap();
+            writer
+                .append_data_files_in_partition(&p, &t, pid, exp, vec![file(&format!("seed_{i}.parquet"), ROWS_PER)])
+                .await
+                .unwrap();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let gen = Arc::new(AtomicU64::new(0));
+
+        // Writer node: perpetual merge↔split churn (row total invariant).
+        let compactor = {
+            let writer = writer.clone();
+            let t = t.clone();
+            let stop = stop.clone();
+            let gen = gen.clone();
+            tokio::spawn(async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let (snap, files) = match writer.live_data_files_in_partition(&p, &t, pid).await {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let g = gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let removed: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+                    let total: u64 = files.iter().map(|f| f.row_count).sum();
+                    let added: Vec<DataFileRef> = if files.len() >= 2 {
+                        // Merge every input into one output (row total preserved).
+                        vec![file(&format!("merged_{g}.parquet"), total)]
+                    } else {
+                        // Split the single file into 4 (row total preserved) so the
+                        // next round has something to merge again.
+                        let q = total / 4;
+                        vec![
+                            file(&format!("split_{g}_0.parquet"), q),
+                            file(&format!("split_{g}_1.parquet"), q),
+                            file(&format!("split_{g}_2.parquet"), q),
+                            file(&format!("split_{g}_3.parquet"), total - 3 * q),
+                        ]
+                    };
+                    let _ = writer
+                        .replace_data_files_in_partition(&p, &t, pid, snap, removed, added)
+                        .await;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        // Reader node (separate instance / cache): count continuously.
+        let reader_task = {
+            let reader = reader.clone();
+            let t = t.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut bad: Vec<u64> = Vec::new();
+                let mut reads = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    match reader.load_table(&p, &t).await {
+                        Ok(meta) => {
+                            let sum: u64 = meta.live_data_files().iter().map(|f| f.row_count).sum();
+                            if sum != expected {
+                                bad.push(sum);
+                            }
+                        }
+                        Err(_) => bad.push(u64::MAX), // an errored read is also a violation
+                    }
+                    reads += 1;
+                    tokio::task::yield_now().await;
+                }
+                (reads, bad)
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = compactor.await;
+        let (reads, bad) = reader_task.await.unwrap();
+        eprintln!(
+            "cross_node_read: reads={reads} expected_total={expected} violations={}",
+            bad.len()
+        );
+        if !bad.is_empty() {
+            eprintln!("  bad samples: {:?}", &bad[..bad.len().min(15)]);
+        }
+        assert!(
+            bad.is_empty(),
+            "cross-node read must be exact during compaction; {} bad reads (e.g. {:?})",
+            bad.len(),
+            &bad[..bad.len().min(8)],
+        );
+    }
+
     // --- Test 2d: SAME-partition OCC still gives exactly one winner --------
     #[tokio::test]
     async fn same_partition_occ_one_winner() {

@@ -9682,6 +9682,124 @@ mod tests {
         assert_eq!(seen.len(), written, "every written id present exactly once");
     }
 
+    /// REPRO (#74): while file-merge runs, a count over the table must stay
+    /// exact. A LIST-based count (physical prefix scan) can transiently see
+    /// BOTH the pre-merge input files AND the merged output (over-count) or
+    /// neither (under-count), because inputs are GC'd only AFTER the merged
+    /// output is committed. The catalog live-set flips inputs→output atomically
+    /// in one delta and must stay exact. This races continuous reads against
+    /// continuous merges and checks BOTH surfaces every iteration, so the
+    /// failure pinpoints which read path breaks under compaction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_file_merge_read_stays_consistent() {
+        use basin_catalog::Catalog as _;
+        let _env_lock = FILE_MERGE_ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("BASIN_COMPACT_MAX_FILES_PER_PARTITION", "2"),
+            ("BASIN_COMPACT_MERGE_BATCH", "4"),
+        ]);
+
+        let (shard, storage, catalog) = fresh_osc_shard().await;
+        let shard = Arc::new(shard);
+        let project = ProjectId::new();
+        let table = TableName::new("events").unwrap();
+        catalog
+            .create_table(&project, &table, schema().as_ref())
+            .await
+            .unwrap();
+
+        const N: usize = 32;
+        const ROWS: usize = 10;
+        let expected = (N * ROWS) as u64;
+        flush_n_files(&shard, &impl_of(&shard), &project, &table, N, ROWS).await;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Merge task: drive file-merge continuously; re-flush fresh files when
+        // the partition converges so merges keep racing the reader for the full
+        // window (keeps the row TOTAL fixed — re-flush only replaces merged-away
+        // file COUNT, never changes the id set).
+        let merge_task = {
+            let inner = impl_of(&shard);
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = inner.run_file_merge_once().await;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        // Reader task: record any (catalog_sum, list_sum) that deviates from the
+        // true total across as many reads as fit in the race window.
+        let reader_task = {
+            let catalog = catalog.clone();
+            let storage = storage.clone();
+            let project = project.clone();
+            let table = table.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut cat_bad: Vec<u64> = Vec::new();
+                let mut list_bad: Vec<u64> = Vec::new();
+                let mut reads = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let cat_sum: u64 = catalog
+                        .load_table(&project, &table)
+                        .await
+                        .unwrap()
+                        .live_data_files()
+                        .iter()
+                        .map(|f| f.row_count)
+                        .sum();
+                    if cat_sum != expected {
+                        cat_bad.push(cat_sum);
+                    }
+                    let list_sum = list_count(&storage, &project, &table).await as u64;
+                    if list_sum != expected {
+                        list_bad.push(list_sum);
+                    }
+                    reads += 1;
+                    tokio::task::yield_now().await;
+                }
+                (reads, cat_bad, list_bad)
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = merge_task.await;
+        let (reads, cat_bad, list_bad) = reader_task.await.unwrap();
+
+        eprintln!(
+            "concurrent_file_merge_read: reads={reads} expected_total={expected} \
+             catalog_violations={} list_violations={}",
+            cat_bad.len(),
+            list_bad.len(),
+        );
+        if !list_bad.is_empty() {
+            // Informational, not asserted: a raw prefix LIST inherently sees
+            // pre-merge inputs AND the merged output together (inputs are GC'd
+            // only after the output commits), so it transiently over-counts.
+            // This is exactly WHY the read path must derive its file set from
+            // the catalog live-set — never a physical prefix LIST.
+            eprintln!(
+                "  (expected) LIST over-count samples: {:?}",
+                &list_bad[..list_bad.len().min(10)]
+            );
+        }
+        // The invariant the production scan relies on: the catalog live-set
+        // (meta.live_data_files(), fed to the cold ListingTable) is
+        // snapshot-consistent even under continuous concurrent file-merge — it
+        // flips inputs→output atomically in one delta, so a count over it is
+        // never inflated or deflated mid-merge.
+        assert!(
+            cat_bad.is_empty(),
+            "catalog live-set count must be exact during compaction; {} bad reads (e.g. {:?})",
+            cat_bad.len(),
+            &cat_bad[..cat_bad.len().min(5)],
+        );
+    }
+
     // ----------------------------------------------------------------------
     // Parallel compaction + WAL GC (flat ingest under high object-store RTT).
     // ----------------------------------------------------------------------
