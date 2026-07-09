@@ -3803,7 +3803,18 @@ impl InProcessShard {
             return Ok(false); // Under the ceiling — nothing to do.
         }
 
-        let meta = match self.cfg.catalog.load_table(project, table).await {
+        // META-only load (perf, #62): the file-merge hot loop runs per partition
+        // per tick and needs only META fields (schema, indexes, PK/cluster/sort,
+        // row-block/group, promoted-JSONB). The files to merge come from
+        // `live_data_files_in_partition` above — never from this `meta`. Using
+        // `load_table` here routed through `load_unioned`, an
+        // O(total-files-in-table) union that gets progressively slower as the
+        // partition accretes files (a direct contributor to the merge falling
+        // behind ingest in the 550M+ zone). `load_table_meta` reads only the
+        // single META manifest chain — O(1) in partition/file count. NOTE:
+        // `stripe_merge_table` deliberately keeps `load_table`; it consumes the
+        // unioned live set.
+        let meta = match self.cfg.catalog.load_table_meta(project, table).await {
             Ok(m) => m,
             Err(BasinError::NotFound(_)) => return Ok(false),
             Err(e) => return Err(e),

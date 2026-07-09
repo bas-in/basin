@@ -8,6 +8,18 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — Perf: file-merge no longer re-reads the whole-table union every tick
+
+The per-partition file-merge sweep loaded table metadata with `load_table`,
+which materialises the UNIONED live file set across every partition —
+O(total-files-in-table) — on every tick, purely to read schema/index/policy
+fields. As a partition accreted files at scale (the 550M+ zone of a large
+single-table ingest) this per-tick cost grew and helped merge fall behind
+ingest. The merge already sources the files it rewrites from the per-partition
+live set, never from this metadata, so it now uses `load_table_meta` (reads only
+the single META manifest chain — O(1) in partition/file count). Stripe-merge is
+unchanged; it legitimately consumes the union. (`crates/basin-shard/src/in_process.rs`.)
+
 ## Unreleased — Fix: `ts_headline` no longer drops trailing punctuation
 
 `ts_headline('The quick brown fox.', to_tsquery('fox'))` returned
