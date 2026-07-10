@@ -76,6 +76,30 @@ fn is_background_io() -> bool {
     BACKGROUND_IO.try_with(|b| *b).unwrap_or(false)
 }
 
+/// Process-wide cap on concurrent BACKGROUND (compaction / merge) object-store
+/// I/O. Demoting merge reads to Low (see [`BACKGROUND_IO`]) removes the
+/// priority INVERSION, but merge and live-ingest PUTs then share the Low pool
+/// as equals — so as a table grows and merge volume accumulates, merge still
+/// nibbles a fixed slice of ingest's bandwidth, stepping ingest r/s down
+/// (~0.73 flatness at 200M, measured). This semaphore bounds how many merge
+/// I/Os can be in flight at once, so merge can never consume more than N of any
+/// project's scheduler budget and live ingest keeps the rest — ingest r/s stays
+/// FLAT as the table grows (#78). Merge still makes steady progress at N-way
+/// concurrency; the sealed-file exclusion already bounds merge WORK per tick.
+/// Tunable via `BASIN_STORAGE_BG_CONCURRENCY` (default 6) so the flat-vs-keep-up
+/// balance can be dialled in from config without a rebuild.
+fn bg_io_semaphore() -> &'static Semaphore {
+    static SEM: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| {
+        let n = std::env::var("BASIN_STORAGE_BG_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(6);
+        Semaphore::new(n)
+    })
+}
+
 /// Wraps an [`ObjectStore`] so every RPC it forwards is gated on
 /// (a) the per-project liveness-floor semaphore, then (b) the cross-project
 /// EDF scheduler. Both fields are cheap-to-clone `Arc`s shared with
@@ -157,6 +181,20 @@ impl ObjectStore for ProjectScopedStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
+        // #78: cap concurrent BACKGROUND (merge) output writes too, so merge's
+        // PUTs can't crowd live ingest PUTs out of the shared Low pool. Live
+        // ingest / tail-drain PUTs run outside the background scope and are
+        // never capped here.
+        let _bg = if is_background_io() {
+            Some(
+                bg_io_semaphore()
+                    .acquire()
+                    .await
+                    .expect("bg io semaphore not closed"),
+            )
+        } else {
+            None
+        };
         let _floor = self.sem.acquire().await.expect("semaphore not closed");
         // PUT is bulk-shaped: bytes-on-the-wire scale with the payload,
         // and a small write is rare in our writer path (we batch into
@@ -204,6 +242,19 @@ impl ObjectStore for ProjectScopedStore {
         location: &ObjectPath,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        // #78: cap concurrent BACKGROUND (merge) reads so they can't crowd live
+        // ingest out of the shared Low pool. Acquired first and held for the
+        // whole RPC. No-op for foreground reads.
+        let _bg = if is_background_io() {
+            Some(
+                bg_io_semaphore()
+                    .acquire()
+                    .await
+                    .expect("bg io semaphore not closed"),
+            )
+        } else {
+            None
+        };
         let _floor = self.sem.acquire().await.expect("semaphore not closed");
         // Full-object GET is bulk-shaped on data files (Parquet bodies
         // are MB-shaped) and sub-MB on footers / sidecars. Without a
