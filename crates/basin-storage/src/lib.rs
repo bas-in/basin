@@ -58,6 +58,7 @@ pub use predicate::{
     evaluate as evaluate_predicate, evaluate_compound, evaluate_compound_for_pruning,
     CompoundPredicate, Predicate, PruneOutcome, ScalarValue,
 };
+pub use concurrency::with_background_io;
 pub use scheduler::{ProjectIoStats, Scheduler, DEFAULT_GLOBAL_BUDGET};
 pub use tier::Tier;
 pub use vector_index::{vector_index_segment_key_for_data_file, VectorHit};

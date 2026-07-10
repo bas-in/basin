@@ -3174,7 +3174,11 @@ impl InProcessShard {
                         None => None,
                     };
                     let _permit = permits.acquire_owned().await.expect("merge semaphore");
-                    let res = self.stripe_merge_table(&project, &table).await;
+                    // #78: BACKGROUND I/O — stripe-merge reads yield to ingest.
+                    let res = basin_storage::with_background_io(
+                        self.stripe_merge_table(&project, &table),
+                    )
+                    .await;
                     (project, table, res)
                 });
             }
@@ -3251,7 +3255,24 @@ impl InProcessShard {
             STRIPE_MERGE_MIN_FILES_DEFAULT,
         )
         .max(2) as usize;
-        let live = meta.live_data_files();
+        // BOUND WRITE-AMP / kill the O(table-size) re-touch (#78): exclude
+        // files that have already reached the sealed target size. A sealed file
+        // has its FINAL PK range and must never be re-sorted — otherwise
+        // stripe-merge re-reads + re-writes an ever-growing set of terminal cold
+        // files every tick, and (because those reads are full-object GETs
+        // scheduled at High priority) that I/O preempts live ingest writes,
+        // decaying ingest r/s as the table grows. Only sub-sealed flush files
+        // are candidates, exactly as file-merge already does (see
+        // `file_merge_partition`). Two sealed files with overlapping ranges stay
+        // overlapping — a keyset query may open 1-2 extra files, the same
+        // accepted trade file-merge makes. Config-reversible:
+        // BASIN_COMPACT_SEALED_BYTES=<huge> restores merge-everything.
+        let sealed_bytes = env_u64("BASIN_COMPACT_SEALED_BYTES", STRIPE_MERGE_TARGET_FILE_BYTES);
+        let live: Vec<DataFileRef> = meta
+            .live_data_files()
+            .into_iter()
+            .filter(|f| f.size_bytes < sealed_bytes)
+            .collect();
         if live.len() < min_files {
             return Ok(false);
         }
@@ -3736,7 +3757,13 @@ impl InProcessShard {
                         };
                         let _permit =
                             permits.acquire_owned().await.expect("merge semaphore");
-                        let res = self.file_merge_partition(&project, &table, &pid).await;
+                        // #78: run merge under BACKGROUND I/O so its data-file
+                        // reads are demoted below live ingest writes on the
+                        // shared object-store scheduler (no priority inversion).
+                        let res = basin_storage::with_background_io(
+                            self.file_merge_partition(&project, &table, &pid),
+                        )
+                        .await;
                         (project, table, pid, res)
                     });
                 }

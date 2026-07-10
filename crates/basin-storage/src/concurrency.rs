@@ -49,6 +49,33 @@ use tokio::sync::Semaphore;
 
 use crate::scheduler::{Priority, Scheduler};
 
+tokio::task_local! {
+    /// Marks the current async task's object-store RPCs as BACKGROUND
+    /// (compaction / merge). When set, full-object GETs are demoted from High to
+    /// Low priority so compaction reads never PREEMPT live ingest writes (also
+    /// Low) on the shared per-project EDF scheduler — the fix for the
+    /// compaction-vs-ingest priority INVERSION that decayed ingest r/s as a
+    /// table grows (#78: a full-object GET defaulted to High, so merge's
+    /// data-file body reads out-ranked ingest PUTs). Propagates through the
+    /// merge read/write chain because that path never `tokio::spawn`s.
+    static BACKGROUND_IO: bool;
+}
+
+/// Run `f` with its object-store RPCs marked background (see [`BACKGROUND_IO`]).
+/// Wrap compaction / merge work in this so its I/O yields to live ingest and
+/// ingest throughput stays flat as a table grows.
+pub async fn with_background_io<F>(f: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    BACKGROUND_IO.scope(true, f).await
+}
+
+#[inline]
+fn is_background_io() -> bool {
+    BACKGROUND_IO.try_with(|b| *b).unwrap_or(false)
+}
+
 /// Wraps an [`ObjectStore`] so every RPC it forwards is gated on
 /// (a) the per-project liveness-floor semaphore, then (b) the cross-project
 /// EDF scheduler. Both fields are cheap-to-clone `Arc`s shared with
@@ -182,7 +209,18 @@ impl ObjectStore for ProjectScopedStore {
         // are MB-shaped) and sub-MB on footers / sidecars. Without a
         // size hint, default to High so footers / metadata fetches stay
         // snappy; the engine's range-read path is the bulk channel.
-        let _slot = self.scheduler.acquire(self.project, Priority::High).await;
+        //
+        // #78: BACKGROUND (compaction / merge) reads are demoted to Low so their
+        // MB-shaped data-file body GETs never PREEMPT live ingest writes (also
+        // Low) — foreground reads keep High so query footers stay snappy. This
+        // removes the priority inversion where compaction I/O out-ranked live
+        // writes, decaying ingest r/s as a table grew.
+        let read_prio = if is_background_io() {
+            Priority::Low
+        } else {
+            Priority::High
+        };
+        let _slot = self.scheduler.acquire(self.project, read_prio).await;
         let is_head = options.head;
         let res = self.inner.get_opts(location, options).await;
         // Class-B: GET / HEAD. `GetOptions { head: true, .. }` is the
@@ -464,5 +502,198 @@ mod tests {
             .await
             .expect("get_opts (no registry)");
         let _ = got.bytes().await.unwrap();
+    }
+
+    // ── #78: compaction/merge reads must NOT preempt live ingest ──────────
+    //
+    // The priority INVERSION we fixed: a full-object GET defaults to
+    // Priority::High (footers / point reads want to stay snappy), but a
+    // compaction *merge* streams MB-shaped data-file bodies through the same
+    // GET path — so merge reads used to out-rank live ingest PUTs
+    // (Priority::Low) on the shared per-project EDF scheduler. As a table
+    // grew, more merge GETs starved ingest and write r/s decayed with table
+    // size. `with_background_io` demotes merge reads to Low so they share a
+    // lane with ingest PUTs instead of preempting them.
+
+    #[tokio::test]
+    async fn background_io_flag_scopes_and_resets() {
+        assert!(!is_background_io(), "default must be foreground");
+        with_background_io(async {
+            assert!(is_background_io(), "inside scope must be background");
+            // Propagates across an await point (same task, no spawn) — this
+            // is exactly why the merge read/write chain (spawn-free) inherits
+            // the flag.
+            tokio::task::yield_now().await;
+            assert!(is_background_io(), "still background after await");
+        })
+        .await;
+        assert!(!is_background_io(), "must reset to foreground after scope");
+    }
+
+    /// An `ObjectStore` decorator that blocks every GET on a semaphore the
+    /// test controls, so we can hold GETs in-flight and observe how the
+    /// scheduler placed them (which priority pool) — deterministically, with
+    /// no wall-clock timing. `entered` counts GETs that got PAST the scheduler
+    /// and reached this store (i.e. were dispatched, not left queued).
+    #[derive(Debug)]
+    struct GateStore {
+        inner: Arc<dyn ObjectStore>,
+        gate: Arc<Semaphore>,
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::fmt::Display for GateStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GateStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for GateStore {
+        async fn put_opts(
+            &self,
+            l: &ObjectPath,
+            p: PutPayload,
+            o: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &ObjectPath,
+            o: PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(
+            &self,
+            l: &ObjectPath,
+            o: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Block until the test releases a permit; consume it so each
+            // release admits exactly one GET.
+            self.gate.acquire().await.expect("gate closed").forget();
+            self.inner.get_opts(l, o).await
+        }
+        fn delete_stream(
+            &self,
+            locs: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locs)
+        }
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            o: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, o).await
+        }
+    }
+
+    #[tokio::test]
+    async fn background_reads_take_low_lane_not_high() {
+        // Budget 16 → High pool = 4, Low pool = 12 (see split_budget).
+        // Saturate High with 4 foreground GETs; a 5th foreground GET must
+        // QUEUE on High (there is no High-borrows-Low rule). A BACKGROUND
+        // GET, though, is demoted to Low and dispatches on the reserved Low
+        // pool — proving merge reads get their own lane and never queue
+        // behind / preempt foreground reads (and, being Low like ingest PUTs,
+        // never preempt ingest either). Before the fix the background GET
+        // would have been High and contended in the same pool as the
+        // foreground reads.
+        let project = ProjectId::new();
+        let gate = Arc::new(Semaphore::new(0));
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inner: Arc<dyn ObjectStore> = Arc::new(GateStore {
+            inner: Arc::new(InMemory::new()),
+            gate: gate.clone(),
+            entered: entered.clone(),
+        });
+        let sem = Arc::new(Semaphore::new(1024)); // floor wide open; scheduler is the gate
+        let scheduler = Scheduler::new(16);
+        let store = Arc::new(ProjectScopedStore::new(
+            inner,
+            sem,
+            scheduler.clone(),
+            project,
+            None,
+        ));
+
+        // Seed the object the GETs will read (PUT is not gated).
+        let path = ObjectPath::from("obj");
+        store
+            .put_opts(&path, PutPayload::from_static(b"v"), Default::default())
+            .await
+            .expect("seed put");
+
+        // 5 foreground GETs (High) + 1 background GET (demoted to Low).
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let s = store.clone();
+            let p = path.clone();
+            handles.push(tokio::spawn(async move {
+                let _ = s.get_opts(&p, Default::default()).await;
+            }));
+        }
+        {
+            let s = store.clone();
+            let p = path.clone();
+            handles.push(tokio::spawn(async move {
+                let _ = with_background_io(s.get_opts(&p, Default::default())).await;
+            }));
+        }
+
+        // Drive the runtime until steady state: 5 GETs dispatched (4 High +
+        // 1 Low) and reached the gate, with exactly 1 foreground GET left
+        // queued on High. High is hard-capped at 4, so the only way a 5th GET
+        // reaches the store is the BACKGROUND one dispatching on Low.
+        let mut settled = false;
+        let mut last = scheduler.project_stats(&project);
+        for _ in 0..100_000 {
+            tokio::task::yield_now().await;
+            last = scheduler.project_stats(&project);
+            let seen = entered.load(std::sync::atomic::Ordering::SeqCst);
+            if last.in_flight == 5 && last.queue_depth_high == 1 && seen == 5 {
+                settled = true;
+                break;
+            }
+        }
+        assert!(
+            settled,
+            "scheduler never reached steady state; last = {last:?}, entered = {}",
+            entered.load(std::sync::atomic::Ordering::SeqCst),
+        );
+
+        // The crux: with High capped at 4, a 5th GET reaching the store proves
+        // the background read dispatched on the Low pool.
+        assert_eq!(
+            last.queue_depth_low, 0,
+            "background read must NOT be queued — it owns the Low lane",
+        );
+        assert_eq!(
+            last.queue_depth_high, 1,
+            "exactly one foreground read stays queued behind saturated High",
+        );
+
+        // Release everything and let the tasks finish cleanly.
+        gate.add_permits(6);
+        for h in handles {
+            let _ = h.await;
+        }
     }
 }
