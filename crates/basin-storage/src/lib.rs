@@ -500,6 +500,54 @@ struct Inner {
     /// and ON, a project's warmed assignment routes its I/O to the assigned
     /// pooled bucket.
     bucket_pool: OnceLock<Arc<bucket_pool::BucketPool>>,
+    /// #78: epoch-keyed memo of the enriched per-(project,table) data-file set
+    /// for the constraint-enforcement hot path. A long PK-checked COPY calls
+    /// `list_data_files_with_stats` / `catalog_data_files` once per batch, and
+    /// each runs a full object-store LIST + an O(files) `load_table` clone —
+    /// so as a table accretes files the per-batch cost grows and drags sustained
+    /// ingest throughput down (the residual ~25% step-down measured at scale).
+    /// These memos return the cached set while `catalog.epoch()` is unchanged
+    /// and recompute only when a data-file commit bumps the epoch.
+    ///
+    /// Correctness: `Catalog::epoch()` is a process-global MONOTONIC counter
+    /// bumped by EVERY data-file commit (append AND replace, per-partition
+    /// tail-drain AND meta chain — see the catalog's `after_part_commit` /
+    /// `after_commit`, both of which end in `bump_epoch()`). So a hit
+    /// (`cached_epoch == current_epoch`) provably reflects the live file set:
+    /// since epoch never decreases, a set stored under epoch E can never be
+    /// served after any commit (the current epoch would be > E and never return
+    /// to E). It OVER-invalidates (epoch is global across all tables), which is
+    /// the correctness-safe direction — at worst an occasional extra LIST, never
+    /// a missed file (which would let a duplicate PK through). When no catalog
+    /// is attached (raw-`Storage` unit tests), epoch is `None` and the memo is
+    /// bypassed entirely. Bounded at [`FILE_SET_MEMO_MAX_ENTRIES`] to cap RAM.
+    /// std `Mutex`, held only for the map probe/insert, never across an await.
+    list_stats_memo: Mutex<HashMap<(ProjectId, TableName), (u64, Arc<Vec<DataFile>>)>>,
+    catalog_files_memo: Mutex<HashMap<(ProjectId, TableName), (u64, Arc<Option<Vec<DataFile>>>)>>,
+}
+
+/// Max distinct (project, table) entries held in the constraint-enforcement
+/// file-set memos ([`Inner::list_stats_memo`] / [`Inner::catalog_files_memo`]).
+/// Each entry can hold a large table's whole file set (~150 B/file), so this
+/// bounds worst-case resident RAM; on overflow the map is cleared (self-heals,
+/// costing a few re-LISTs) so a pathological many-big-tables workload degrades
+/// to the previous per-batch behaviour rather than growing unbounded.
+const FILE_SET_MEMO_MAX_ENTRIES: usize = 64;
+
+/// Insert `(key, val)` into a file-set memo, bounding it to
+/// [`FILE_SET_MEMO_MAX_ENTRIES`] entries. On overflow (map full and the key not
+/// already present) the map is cleared first, so worst-case RAM stays bounded;
+/// this self-heals — cleared entries re-fill on their next access at the cost of
+/// one extra LIST each. Generic over the value so both file-set memos share it.
+fn memo_insert_bounded<V>(
+    map: &mut HashMap<(ProjectId, TableName), V>,
+    key: (ProjectId, TableName),
+    val: V,
+) {
+    if map.len() >= FILE_SET_MEMO_MAX_ENTRIES && !map.contains_key(&key) {
+        map.clear();
+    }
+    map.insert(key, val);
 }
 
 /// Best-effort counters for the read path. See [`Inner::read_counters`].
@@ -793,6 +841,8 @@ impl Storage {
                 scheduler: Scheduler::new(resolve_global_budget()),
                 byo_object_stores: Mutex::new(HashMap::new()),
                 bucket_pool: OnceLock::new(),
+                list_stats_memo: Mutex::new(HashMap::new()),
+                catalog_files_memo: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -1729,7 +1779,26 @@ impl Storage {
         project: &ProjectId,
         table: &TableName,
     ) -> Option<Vec<DataFile>> {
-        self.catalog_live_data_files(project, table).await
+        // #78: memoize on catalog epoch so a long PK-checked COPY skips the
+        // per-batch O(files) `load_table` between commits. See `catalog_files_memo`.
+        let epoch = self.inner.catalog.get().map(|c| c.epoch());
+        if let Some(e) = epoch {
+            let hit = {
+                let map = self.inner.catalog_files_memo.lock().expect("memo poisoned");
+                map.get(&(*project, table.clone()))
+                    .filter(|(ce, _)| *ce == e)
+                    .map(|(_, v)| v.clone())
+            };
+            if let Some(v) = hit {
+                return (*v).clone();
+            }
+        }
+        let built = self.catalog_live_data_files(project, table).await;
+        if let Some(e) = epoch {
+            let mut map = self.inner.catalog_files_memo.lock().expect("memo poisoned");
+            memo_insert_bounded(&mut map, (*project, table.clone()), (e, Arc::new(built.clone())));
+        }
+        built
     }
 
     /// Like [`list_data_files`](Self::list_data_files) but populates each
@@ -1743,7 +1812,27 @@ impl Storage {
         project: &ProjectId,
         table: &TableName,
     ) -> Result<Vec<DataFile>> {
-        reader::list_data_files_with_stats(self, project, table).await
+        // #78: memoize on catalog epoch so a long PK-checked COPY skips the
+        // per-batch full-table LIST + O(files) stats build between commits.
+        // See `list_stats_memo` for the correctness argument.
+        let epoch = self.inner.catalog.get().map(|c| c.epoch());
+        if let Some(e) = epoch {
+            let hit = {
+                let map = self.inner.list_stats_memo.lock().expect("memo poisoned");
+                map.get(&(*project, table.clone()))
+                    .filter(|(ce, _)| *ce == e)
+                    .map(|(_, v)| v.clone())
+            };
+            if let Some(v) = hit {
+                return Ok((*v).clone());
+            }
+        }
+        let built = reader::list_data_files_with_stats(self, project, table).await?;
+        if let Some(e) = epoch {
+            let mut map = self.inner.list_stats_memo.lock().expect("memo poisoned");
+            memo_insert_bounded(&mut map, (*project, table.clone()), (e, Arc::new(built.clone())));
+        }
+        Ok(built)
     }
 
     /// Like [`read`](Self::read) but reads only the supplied `paths`
@@ -3088,6 +3177,65 @@ mod tests {
                 f.path
             );
         }
+    }
+
+    /// #78 CORRECTNESS: the epoch-keyed file-set memo on the constraint hot
+    /// path must NOT serve a stale set after a data-file commit. A stale hit
+    /// would let a PK check scan an out-of-date file set and admit a duplicate
+    /// PK = data corruption. Here a second `append_data_files` bumps the
+    /// catalog epoch; `catalog_data_files` MUST return the fresh 2-file set,
+    /// not the 1-file set memoized before the bump.
+    #[tokio::test]
+    async fn catalog_data_files_memo_invalidates_on_epoch_bump() {
+        use basin_catalog::{DataFileRef, InMemoryCatalog, SnapshotId};
+
+        basin_common::telemetry::try_init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let s = storage_in(&dir);
+        let catalog = Arc::new(InMemoryCatalog::new());
+        s.attach_catalog(catalog.clone());
+
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+        catalog.create_namespace(&project).await.unwrap();
+        catalog
+            .create_table(&project, &table, &small_schema())
+            .await
+            .unwrap();
+
+        let mk = |name: &str| DataFileRef {
+            path: format!("projects/{project}/tables/t/data/_default/{name}.vortex"),
+            size_bytes: 10,
+            row_count: 1,
+            column_stats: std::collections::BTreeMap::new(),
+            bloom_filters: std::collections::BTreeMap::new(),
+            hll_sketches: std::collections::BTreeMap::new(),
+            tdigest_sketches: std::collections::BTreeMap::new(),
+        };
+
+        // First append -> one live file. Warm the memo at this epoch.
+        let m1 = catalog
+            .append_data_files(&project, &table, SnapshotId::GENESIS, vec![mk("A")])
+            .await
+            .unwrap();
+        let after_a = s.catalog_data_files(&project, &table).await.unwrap();
+        assert_eq!(after_a.len(), 1, "memo warm: one file after the first append");
+        // A repeat call at the SAME epoch is a hit and returns the same set.
+        let hit = s.catalog_data_files(&project, &table).await.unwrap();
+        assert_eq!(hit.len(), 1, "same-epoch repeat must still be correct");
+
+        // Second append BUMPS the catalog epoch -> the memo MUST invalidate.
+        catalog
+            .append_data_files(&project, &table, m1.current_snapshot, vec![mk("B")])
+            .await
+            .unwrap();
+        let after_b = s.catalog_data_files(&project, &table).await.unwrap();
+        assert_eq!(
+            after_b.len(),
+            2,
+            "memo MUST reflect the new file after the epoch bump (no stale hit) \
+             — a stale 1-file hit here would be a duplicate-PK corruption hole",
+        );
     }
 
     // -----------------------------------------------------------------------
