@@ -248,6 +248,10 @@ mod engine_auth_store;
 #[cfg(feature = "wasm-fn")]
 mod fn_runtime;
 
+// #72/#78 forensics: dedicated-thread debug listener (task dumps + CPU
+// flamegraphs) that keeps answering when the main runtime is wedged.
+mod debug_listener;
+
 // #28 multi-node bulk ingest on Fly.io: per-machine self-id derivation +
 // dynamic Fly-DNS peer discovery for the partition write forwarder.
 mod shard_discovery;
@@ -353,6 +357,17 @@ fn log_config_overrides() {
 
 async fn run() -> Result<()> {
     let _ = init(tracing::Level::INFO, LogFormat::Pretty);
+
+    // #72/#78 forensics: hand THIS (main multi-thread) runtime's handle to a
+    // dedicated-thread debug listener so it can Handle::dump() / CPU-profile
+    // the main runtime even when every worker is blocked. No-op unless
+    // BASIN_DEBUG_PORT is set. The thread is detached for the whole process
+    // lifetime — it must stay alive THROUGH a wedged graceful drain.
+    if let Some(h) =
+        crate::debug_listener::spawn_debug_listener(tokio::runtime::Handle::current())
+    {
+        std::mem::forget(h);
+    }
 
     let cfg = Cfg::from_env()?;
     tracing::info!(
