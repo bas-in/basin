@@ -640,7 +640,16 @@ impl ReadCountersSnapshot {
 /// negligible against the bytes-per-project budget. Override at process start
 /// with `BASIN_STORAGE_PARQUET_META_CACHE_CAP` (positive `usize`); any
 /// unset / unparseable / zero value keeps the default.
-const DEFAULT_PARQUET_META_CACHE_CAP: usize = 16_384;
+///
+/// Sized to hold the whole live-file footprint of a large single table
+/// (#78): every PK-constrained COPY batch probes this cache once per live
+/// data file, so once the file count exceeds the cap the LRU thrashes and
+/// each batch re-pays footer GETs — a fixed step-down in ingest throughput at
+/// the crossover (~16k files ≈ 140M rows with small flush files). 131072
+/// footers cost O(hundreds of MB) resident (footers are Arc-shared, a few KB
+/// each) — affordable even on the 8 GB baseline node and negligible on the
+/// perf tiers — and covers ~1B+ rows before eviction begins.
+const DEFAULT_PARQUET_META_CACHE_CAP: usize = 131_072;
 
 /// Resolve the Parquet footer cache capacity, honoring
 /// `BASIN_STORAGE_PARQUET_META_CACHE_CAP` when present and parseable to a
@@ -672,7 +681,11 @@ const DEFAULT_HNSW_SEGMENT_CACHE_CAP: usize = 256;
 /// open exactly one data file. (Was 512 — too small for a many-file table, so
 /// cold OLAP re-fetched footers from the bucket on every query.) Override with
 /// `BASIN_STORAGE_VORTEX_FOOTER_CACHE_CAP` (positive `usize`).
-const DEFAULT_VORTEX_FOOTER_CACHE_CAP: usize = 16_384;
+// #78: raised to match the parquet meta cap. Vortex is the default format, so
+// on the write path this is the hot footer cache the per-batch PK check probes;
+// a 16k cap thrashed once a table crossed ~16k live files and stepped ingest
+// r/s down. See DEFAULT_PARQUET_META_CACHE_CAP.
+const DEFAULT_VORTEX_FOOTER_CACHE_CAP: usize = 131_072;
 
 /// Resolve the Vortex footer cache capacity, honoring
 /// `BASIN_STORAGE_VORTEX_FOOTER_CACHE_CAP` when present and parseable to a
@@ -693,8 +706,26 @@ pub fn resolve_vortex_footer_cache_cap() -> usize {
 /// parquet-meta cache also fits in the stats cache (no asymmetric eviction
 /// that would force one format to re-parse while the other stays warm). Each
 /// entry holds an `Arc<(u64, BTreeMap<..>)>` — a handful of columns of
-/// min/max bytes — so 16k entries is a small RAM footprint.
-const DEFAULT_DATA_FILE_STATS_CACHE_CAP: usize = 16_384;
+/// min/max bytes — so entries are a small RAM footprint. Raised to match the
+/// footer caches (#78): `list_data_files_with_stats` probes this per live file
+/// on EVERY PK-constrained COPY batch, so a 16k cap thrashed once a table
+/// crossed ~16k live files, stepping ingest r/s down. Override with
+/// `BASIN_STORAGE_DATA_FILE_STATS_CACHE_CAP` (positive `usize`).
+const DEFAULT_DATA_FILE_STATS_CACHE_CAP: usize = 131_072;
+
+/// Resolve the per-file data-file stats cache capacity, honoring
+/// `BASIN_STORAGE_DATA_FILE_STATS_CACHE_CAP` when present and parseable to a
+/// positive `usize`. Falls back to [`DEFAULT_DATA_FILE_STATS_CACHE_CAP`].
+pub fn resolve_data_file_stats_cache_cap() -> usize {
+    if let Ok(v) = std::env::var("BASIN_STORAGE_DATA_FILE_STATS_CACHE_CAP") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    DEFAULT_DATA_FILE_STATS_CACHE_CAP
+}
 
 impl Storage {
     pub fn new(cfg: StorageConfig) -> Self {
@@ -753,7 +784,7 @@ impl Storage {
                     resolve_vortex_footer_cache_cap(),
                 )),
                 data_file_stats_cache: Arc::new(metadata_cache::DataFileStatsCache::new(
-                    DEFAULT_DATA_FILE_STATS_CACHE_CAP,
+                    resolve_data_file_stats_cache_cap(),
                 )),
                 project_counters: OnceLock::new(),
                 encryption: OnceLock::new(),
@@ -3411,14 +3442,16 @@ mod tests {
         let prior = std::env::var(key).ok();
 
         std::env::remove_var(key);
-        assert_eq!(resolve_parquet_meta_cache_cap(), 16_384);
-        assert_eq!(DEFAULT_PARQUET_META_CACHE_CAP, 16_384);
+        // #78: default raised to 131072 so the write-path per-batch footer
+        // probe stays cache-resident well past ~16k live files (~140M rows).
+        assert_eq!(resolve_parquet_meta_cache_cap(), 131_072);
+        assert_eq!(DEFAULT_PARQUET_META_CACHE_CAP, 131_072);
 
         // Default propagates through Storage::new.
         {
             let dir = TempDir::new().unwrap();
             let s = storage_in(&dir);
-            assert_eq!(s.inner.parquet_meta_cache.cap(), 16_384);
+            assert_eq!(s.inner.parquet_meta_cache.cap(), 131_072);
         }
 
         // Explicit override is honored.
