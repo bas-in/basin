@@ -206,3 +206,89 @@ async fn pk_ascending_files_carry_pk_zonemap() {
         .await;
     assert!(err.is_err(), "a genuine duplicate PK (id=42) must still be rejected");
 }
+
+/// #78: the streaming existence check must stay correct with the batch
+/// key-range pushed into the per-file read and the bloom probe skipped
+/// (bulk chunks exceed `PK_STREAMING_SMALL_BATCH`, where a 1%-FPP bloom
+/// passes with P ≈ 1 anyway). Three shapes:
+///
+///   1. a bulk chunk overlapping an existing file WITH a real duplicate
+///      → rejected (the pushdown-pruned read still surfaces the dup row);
+///   2. a bulk chunk strictly BETWEEN two files' key ranges → accepted
+///      (zone-map prune, no read at all);
+///   3. a bulk chunk INSIDE a gappy file's [min,max] with no actual
+///      collision → accepted (the pushed range filter must not fabricate
+///      a match, and filtered-out rows must not hide one).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pk_streaming_pushdown_read_detects_dups_and_passes_clean() {
+    std::env::set_var("BASIN_PK_STREAMING_MIN_ROWS", "0");
+
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+    let schema = Arc::new(Schema::empty());
+    let cols = vec!["id".to_string(), "x".to_string()];
+    let rows = |ids: Vec<i64>| -> Vec<Vec<Option<String>>> {
+        ids.into_iter().map(|i| row(i, i % 7)).collect()
+    };
+
+    sess.execute("CREATE TABLE t2 (id BIGINT PRIMARY KEY, x INT)")
+        .await
+        .unwrap();
+
+    // File A: contiguous ids 1..=1000. File B: 2001..=3000 (disjoint).
+    // File C: odd ids 4001..=4999 (in-range gaps for shape 3).
+    for ids in [
+        (1..=1000).collect::<Vec<i64>>(),
+        (2001..=3000).collect(),
+        (4001..=4999).step_by(2).collect(),
+    ] {
+        let n = ids.len();
+        let loaded = sess
+            .ingest_csv_batch("t2", schema.clone(), Some(&cols), rows(ids))
+            .await
+            .expect("seed chunk must load");
+        assert_eq!(loaded as usize, n);
+    }
+
+    // Shape 1: bulk chunk (500 > PK_STREAMING_SMALL_BATCH) overlapping
+    // file A with genuine duplicates (900..=1000).
+    let dup = rows((900..=1399).collect());
+    let err = sess
+        .ingest_csv_batch("t2", schema.clone(), Some(&cols), dup)
+        .await
+        .expect_err("bulk chunk with a real dup must be rejected");
+    assert!(
+        err.to_string().contains("duplicate key"),
+        "expected a duplicate-key violation, got: {err}"
+    );
+
+    // Shape 2: bulk chunk strictly between file A and file B key ranges.
+    let between = rows((1201..=1700).collect());
+    let n = sess
+        .ingest_csv_batch("t2", schema.clone(), Some(&cols), between)
+        .await
+        .expect("chunk between existing key ranges must be accepted");
+    assert_eq!(n, 500);
+
+    // Shape 3: bulk chunk of EVEN ids inside file C's [4001,4999] span —
+    // overlaps the file, survives the zone-map prune, but collides with
+    // nothing.
+    let evens = rows((4002..=4998).step_by(2).collect());
+    let n = sess
+        .ingest_csv_batch("t2", schema.clone(), Some(&cols), evens)
+        .await
+        .expect("gap-filling chunk with no real collision must be accepted");
+    assert_eq!(n, 499);
+
+    // And a genuine collision inside file C still fires.
+    let dup_odd = rows((5001..=5499).chain(std::iter::once(4003)).collect());
+    let err = sess
+        .ingest_csv_batch("t2", schema.clone(), Some(&cols), dup_odd)
+        .await
+        .expect_err("bulk chunk containing an existing odd id must be rejected");
+    assert!(
+        err.to_string().contains("duplicate key"),
+        "expected a duplicate-key violation, got: {err}"
+    );
+}

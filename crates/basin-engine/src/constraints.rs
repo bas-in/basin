@@ -785,7 +785,7 @@ async fn enforce_pk_streaming(
         evaluate_compound_for_pruning, CompoundPredicate, Predicate, PruneOutcome, ScalarValue,
     };
 
-    let read_opts = basin_storage::ReadOptions {
+    let mut read_opts = basin_storage::ReadOptions {
         projection: Some(pk_columns.to_vec()),
         ..Default::default()
     };
@@ -819,6 +819,22 @@ async fn enforce_pk_streaming(
             return Ok(());
         }
         let col = pk_columns[0].clone();
+        // #78: push the SAME batch key-range down into every surviving file's
+        // read. Without it the existence scan decodes each file's ENTIRE PK
+        // column per incoming chunk, so once compaction has produced files
+        // whose [min,max] spans the keyspace (any interleaved / multi-range
+        // load), the per-chunk cost is O(rows_in_table) and bulk-ingest r/s
+        // decays with table size. Pushed, the reader serves the scan from
+        // Vortex chunk-level zone-map pruning (or the cached filtered decode),
+        // so only the chunks overlapping the batch's tight key range are
+        // decoded. Correctness is unchanged: a duplicate's key is inside
+        // [bmin,bmax] by construction, rows outside the range can never match
+        // the probe below, and reader pushdown falls back to a full decode on
+        // any error.
+        read_opts.filters = vec![
+            Predicate::Gt(col.clone(), ScalarValue::Int64(bmin.saturating_sub(1))),
+            Predicate::Lt(col.clone(), ScalarValue::Int64(bmax.saturating_add(1))),
+        ];
         Some(CompoundPredicate::And(vec![
             CompoundPredicate::Atom(Predicate::Gt(
                 col.clone(),
@@ -887,7 +903,18 @@ async fn enforce_pk_streaming(
         // PKs so the probe encoding (`i64::to_le_bytes`) exactly matches the
         // writer's bloom encoding — a false-positive only causes a needless read,
         // and a false-negative is impossible, so this can never miss a collision.
-        if single_i64_pk {
+        //
+        // #78: only probe for SMALL batches. The writer sizes blooms at
+        // `DEFAULT_BLOOM_FPP` = 1%, so probing K keys passes the file with
+        // P = 1 − 0.99^K — already ~72% at K=128 and indistinguishable from 1
+        // for a bulk COPY chunk. Above the small-batch bound the probe is
+        // O(K) hashing per file that virtually never prunes; skip straight to
+        // the range-pushdown read (which decodes only the overlapping chunks).
+        if single_i64_pk
+            && batch_keys_i64
+                .as_ref()
+                .is_some_and(|k| k.len() <= PK_STREAMING_SMALL_BATCH)
+        {
             if let Some(bytes) = f.bloom_filters.get(&pk_columns[0]) {
                 if let Some(bloom) = basin_storage::bloom_from_bytes(bytes) {
                     let keys = batch_keys_i64.as_ref().unwrap();
