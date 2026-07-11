@@ -625,12 +625,17 @@ pub(crate) async fn exec_copy_from_batch(
     }
 
     // Quick check: partitioned tables are not yet supported in this increment.
-    let meta = sess
-        .engine
-        .config()
-        .catalog
-        .load_table(&sess.project, &TableName::new(table_name.to_owned())?)
-        .await?;
+    //
+    // #78: this needs only META fields (partition_spec + schema), so use the
+    // meta-version-cached load. The previous full `load_table` here paid
+    // `load_unioned` — an object-store `list_partition_ids` LIST plus per-
+    // partition head resolves and delta-chain folds — ONCE PER COPY CHUNK,
+    // measured at ~42% of process CPU at 200M rows (32% in list_partition_ids
+    // alone) and growing with catalog depth: the residual bulk-ingest r/s
+    // decay after the sketch gate. Same fix (and same reasoning) as the
+    // cached META load `exec_ingest_batch_touched` already uses.
+    let table_name_t = TableName::new(table_name.to_owned())?;
+    let meta = crate::session::load_table_meta_cached_for_ingest(sess, &table_name_t).await?;
     if !matches!(meta.partition_spec, PartitionSpec::Unpartitioned) {
         return Err(BasinError::FeatureNotSupported(
             "COPY fast-path: partitioned tables not yet supported; \
