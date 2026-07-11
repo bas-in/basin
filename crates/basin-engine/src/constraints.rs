@@ -411,19 +411,55 @@ pub(crate) async fn enforce_pk_on_insert(
     if total_existing_rows > pk_streaming_min_rows()
         || batch.num_rows() <= PK_STREAMING_SMALL_BATCH
     {
-        return enforce_pk_streaming(
-            storage,
-            project,
-            table_name_str,
-            pk_columns,
-            &pk_idx,
-            single_i64_pk,
-            batch,
-            &data_files,
-            &tombstone_keys,
-            pk_dt_for_tombstone.as_ref(),
-        )
-        .await;
+        // The scan races compaction: a file can be merged away (catalog swap +
+        // object DELETE) between our LIST above and the per-file GET inside the
+        // scan, failing the read with a storage error mid-COPY (observed at
+        // sustained 150k+ r/s where merge churn is continuous). The vanished
+        // file's rows live in a merge OUTPUT our stale set does not contain,
+        // so skipping it could MISS a duplicate — the only correct recovery is
+        // to re-LIST and rescan. The merge's commit bumped the catalog epoch
+        // before the DELETE became visible, so a fresh LIST (and the epoch-
+        // keyed memo behind it) is guaranteed to see the post-swap set.
+        // Bounded retries: continuous merge churn could vanish a different
+        // file each pass; after the cap, surface the error (the client retries
+        // the chunk — never silently weaken the check).
+        let mut attempts = 0u32;
+        loop {
+            let res = enforce_pk_streaming(
+                storage,
+                project,
+                table_name_str,
+                pk_columns,
+                &pk_idx,
+                single_i64_pk,
+                batch,
+                &data_files,
+                &tombstone_keys,
+                pk_dt_for_tombstone.as_ref(),
+            )
+            .await;
+            match res {
+                Err(BasinError::Storage(msg)) if attempts < 3 && msg.contains("get vortex") => {
+                    attempts += 1;
+                    data_files = storage.list_data_files_with_stats(project, table).await?;
+                    if let Some(catalog_files) = storage.catalog_data_files(project, table).await {
+                        let mut blooms: std::collections::HashMap<String, _> = catalog_files
+                            .into_iter()
+                            .filter(|f| !f.bloom_filters.is_empty())
+                            .map(|f| (f.path.to_string(), f.bloom_filters))
+                            .collect();
+                        if !blooms.is_empty() {
+                            for f in data_files.iter_mut() {
+                                if let Some(b) = blooms.remove(f.path.as_ref()) {
+                                    f.bloom_filters = b;
+                                }
+                            }
+                        }
+                    }
+                }
+                other => return other,
+            }
+        }
     }
 
     // Tier 1 (projection pushdown) + Tier 2 (cross-batch memoization) +
