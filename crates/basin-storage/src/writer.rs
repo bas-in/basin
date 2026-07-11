@@ -347,7 +347,24 @@ pub(crate) async fn write_batch_with_options(
     // eligible columns in the batch. HLL covers cardinality-meaningful types
     // (int, string, bytes, date, timestamp); t-digest covers numeric types
     // (int, float, decimal). Both are keyed by column name.
-    let (hll_sketches, tdigest_sketches) = compute_sketches(batch_to_write);
+    //
+    // #78: OFF by default. Nothing consumes these per-file sketch bytes —
+    // every shard/engine DataFileRef construction catalogs EMPTY sketch maps,
+    // and the approx_* UDFs build their digests from rows at query time — yet
+    // computing them is O(rows) per write with a heavy constant (t-digest
+    // add() re-sorts its centroid buffer every 512 values). On a deep table
+    // the file-merge path re-pays that cost over every merge OUTPUT's full
+    // row count, which profiling showed as the dominant CPU at depth (~34% of
+    // process samples in centroid sorting; ~100% of merge-thread CPU) and the
+    // driver of the ingest-r/s-decays-with-table-size curve. Re-enable with
+    // BASIN_WRITE_SKETCHES=1; when a real consumer lands, reintroduce this as
+    // a mergeable fold of the INPUT files' sketches (O(centroids)), never a
+    // per-row recompute of merge outputs.
+    let (hll_sketches, tdigest_sketches) = if write_sketches_enabled() {
+        compute_sketches(batch_to_write)
+    } else {
+        (BTreeMap::new(), BTreeMap::new())
+    };
 
     // Envelope-encrypt the body if a provider is attached. The on-disk
     // layout in that case is `nonce(12) || ciphertext_with_tag` and a
@@ -908,6 +925,17 @@ fn merge_typed_stats(entry: &mut ColumnStats, stats: &parquet::file::statistics:
 /// Returns `(hll_sketches, tdigest_sketches)` keyed by column name.
 /// Columns that are all-null still produce a (zero-filled) sketch entry —
 /// the downstream merging path needs a consistent schema.
+/// #78 gate for [`compute_sketches`] on the write path. Default OFF — the
+/// sketch bytes are dropped at every cataloging site today, so the per-row
+/// compute is pure overhead (see the call-site comment in
+/// `write_batch_with_options` for the profiling evidence). `BASIN_WRITE_
+/// SKETCHES=1` re-enables. Read once and cached: the write hot path must not
+/// pay a getenv per file.
+fn write_sketches_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("BASIN_WRITE_SKETCHES").as_deref() == Ok("1"))
+}
+
 fn compute_sketches(
     batch: &RecordBatch,
 ) -> (BTreeMap<String, Vec<u8>>, BTreeMap<String, Vec<u8>>) {
