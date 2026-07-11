@@ -308,6 +308,23 @@ pub(crate) async fn write_batch_with_options(
         }
         FileFormat::Parquet => batch_to_write,
     };
+    // #72 Mechanism C: the encode below (BtrBlocks cascade for Vortex, the
+    // Parquet writer otherwise) is heavy CPU that runs on the polling runtime
+    // worker. Under a saturated-tail drain, `flush_concurrency` concurrent
+    // writes per partition × several partitions put EVERY worker into encode
+    // at once and the whole VM seizes at the OS level (observed at 522M rows:
+    // even a dedicated-OS-thread debug listener stopped being scheduled).
+    // Bound the number of concurrent encodes process-wide so most workers
+    // always stay free for acks, reads, and background loops. This is a
+    // semaphore, not spawn_blocking: the vortex write API is async, and
+    // nesting a current-thread runtime inside spawn_blocking is the exact
+    // deadlock triangle fast_select.rs documents. `BASIN_ENCODE_CONCURRENCY`
+    // overrides (default max(2, cores/2)); waiting here also back-pressures
+    // the drain wave, which the tail caps upstream already account for.
+    let _encode_permit = encode_permits()
+        .acquire()
+        .await
+        .expect("encode semaphore never closed");
     let bytes = match opts.file_format {
         FileFormat::Parquet => encode_parquet(batch_for_encode, opts)?,
         FileFormat::Vortex => {
@@ -319,6 +336,7 @@ pub(crate) async fn write_batch_with_options(
             .await?
         }
     };
+    drop(_encode_permit);
     let row_count = batch_to_write.num_rows() as u64;
 
     // Stats are extracted from the *plaintext* bytes regardless of whether
@@ -925,6 +943,27 @@ fn merge_typed_stats(entry: &mut ColumnStats, stats: &parquet::file::statistics:
 /// Returns `(hll_sketches, tdigest_sketches)` keyed by column name.
 /// Columns that are all-null still produce a (zero-filled) sketch entry —
 /// the downstream merging path needs a consistent schema.
+/// #72 Mechanism C: process-wide bound on concurrent file ENCODES (see the
+/// acquire site in `write_batch_with_options`). Permits default to
+/// max(2, available_parallelism/2) so a saturated drain can never pin every
+/// runtime worker in CPU-bound compression at once; `BASIN_ENCODE_
+/// CONCURRENCY` overrides (0 is clamped to 1).
+fn encode_permits() -> &'static tokio::sync::Semaphore {
+    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let default = (cores / 2).max(2);
+        let n = std::env::var("BASIN_ENCODE_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(default)
+            .max(1);
+        tokio::sync::Semaphore::new(n)
+    })
+}
+
 /// #78 gate for [`compute_sketches`] on the write path. Default OFF — the
 /// sketch bytes are dropped at every cataloging site today, so the per-row
 /// compute is pure overhead (see the call-site comment in
