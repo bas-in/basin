@@ -543,6 +543,11 @@ pub(crate) struct InProcessShard {
     /// and background loops run on update the SAME counter the metrics snapshot
     /// reads.
     ingest_rate: Arc<IngestRate>,
+    /// #78 Phase 1: monotone counter of background compaction sweeps, used by
+    /// `compact_all`'s min-flush gate to force a periodic full drain (the
+    /// escape hatch that bounds trickle-ingest cold-storage latency). Shared
+    /// across `share_clone`s so pooled handles count the same sweep sequence.
+    compact_sweep_seq: Arc<std::sync::atomic::AtomicU64>,
     /// #70: whether a DETACHED read-path drain (`compact_all_for_read` spawned
     /// by the bounded `flush_to_parquet_for_read`) is currently in flight.
     /// Shared across `share_clone`s so a tight count(*)-under-backlog loop
@@ -585,6 +590,7 @@ impl InProcessShard {
             held_leases: Arc::new(Mutex::new(HashMap::new())),
             draining: Arc::new(Mutex::new(HashSet::new())),
             ingest_rate: Arc::new(IngestRate::new()),
+            compact_sweep_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             read_drain_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             post_commit_barrier: Arc::new(std::sync::Mutex::new(None)),
@@ -631,6 +637,7 @@ impl InProcessShard {
             // Shared: the write path runs on a `share_clone` and must update the
             // same rolling counter the metrics snapshot reads.
             ingest_rate: self.ingest_rate.clone(),
+            compact_sweep_seq: self.compact_sweep_seq.clone(),
             // Shared (#70): read-drain coalescing must span every handle.
             read_drain_inflight: self.read_drain_inflight.clone(),
             // Test-only: SHARED across share_clones (like memtable_registry_cell)
@@ -1907,14 +1914,73 @@ impl InProcessShard {
     /// files, commit independent catalog snapshots), so fanning out
     /// the dispatch loop trades a little CPU bookkeeping for wall-clock
     /// proportional to (N / concurrency) instead of N.
-    async fn compact_all(&self) -> Result<()> {
-        use futures::stream::{FuturesUnordered, StreamExt as _};
-        use tokio::sync::Semaphore;
-
-        let mut snapshot: PartitionSnapshot = {
+    /// #78 Phase 1 (uniform, larger L0s): the BACKGROUND-TICK drain variant.
+    /// The plain tick flushed whatever accumulated since the last tick, so at
+    /// moderate ingest rates it emitted a stream of tiny data files (observed:
+    /// one ~10k-row file per COPY chunk). Every tiny file costs a catalog
+    /// commit, a LIST entry, and a later re-merge — the dominant background
+    /// load behind the ingest-decays-with-depth curve. This variant gates the
+    /// sweep so a small-and-still-hot tail keeps accumulating into a bigger
+    /// L0: a partition is drained only when its tail is big enough, it has
+    /// gone idle (burst ended), or on the periodic full-drain escape sweep
+    /// (so a continuous trickle still reaches cold storage at a bounded
+    /// cadence of `TICK_FULL_DRAIN_EVERY × compaction_interval`).
+    ///
+    /// ONLY the background tick uses this. Every other `compact_all` caller —
+    /// the explicit `flush_to_parquet` barrier (FK read-your-writes drains,
+    /// tests), the shutdown drain, the soft/hard-cap write-path flushes, and
+    /// the read-path drain — keeps full-drain semantics. The gated tail stays
+    /// readable throughout (`read_table_merging_tails` unions it into every
+    /// scan).
+    async fn compact_all_tick(&self) -> Result<()> {
+        let min_flush = tick_min_flush_bytes();
+        let force_all = min_flush == 0
+            || self
+                .compact_sweep_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % TICK_FULL_DRAIN_EVERY
+                == 0;
+        if force_all {
+            return self.compact_all().await;
+        }
+        let idle_flush = tick_idle_flush_window();
+        let snapshot: PartitionSnapshot = {
             let map = self.partitions.lock().await;
             map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
+        let mut due: PartitionSnapshot = Vec::with_capacity(snapshot.len());
+        for (key, state) in snapshot {
+            let (bytes, idle) = {
+                let g = state.read().await;
+                let bytes: usize = g
+                    .tail
+                    .values()
+                    .flatten()
+                    .map(|(_, b)| b.get_array_memory_size())
+                    .sum();
+                (bytes, g.last_active.elapsed())
+            };
+            // Small + recently written: let it grow. Empty or big or
+            // gone-idle: drain as before.
+            if bytes > 0 && bytes < min_flush && idle < idle_flush {
+                continue;
+            }
+            due.push((key, state));
+        }
+        self.compact_snapshot(due).await
+    }
+
+    async fn compact_all(&self) -> Result<()> {
+        let snapshot: PartitionSnapshot = {
+            let map = self.partitions.lock().await;
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        self.compact_snapshot(snapshot).await
+    }
+
+    async fn compact_snapshot(&self, mut snapshot: PartitionSnapshot) -> Result<()> {
+        use futures::stream::{FuturesUnordered, StreamExt as _};
+        use tokio::sync::Semaphore;
         // Owner-only compaction (multi-node). Only the lease holder may
         // compact + commit a partition; a non-owner compacting races the real
         // owner's catalog commit ("lost commit race at version N"). In no-lease
@@ -4488,7 +4554,7 @@ impl ShardImpl for InProcessShard {
                         }
                     }
                     _ = compact_tick.tick() => {
-                        if let Err(e) = me.compact_all().await {
+                        if let Err(e) = me.compact_all_tick().await {
                             warn!(error = %e, "compaction tick failed");
                         }
                     }
@@ -5191,6 +5257,29 @@ fn env_u64(var: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// #78 Phase 1: every Nth background sweep drains ALL partitions regardless
+/// of the min-flush gate, so a continuous trickle (which never grows the tail
+/// past the gate and never goes idle) still reaches cold storage at a bounded
+/// cadence of `N × compaction_interval`.
+const TICK_FULL_DRAIN_EVERY: u64 = 8;
+
+/// #78 Phase 1: minimum resident tail bytes before the TICK-driven drain
+/// flushes a partition (`BASIN_TICK_MIN_FLUSH_BYTES`; 0 disables the gate,
+/// restoring flush-every-tick). Default 8 MiB of Arrow memory — roughly one
+/// full `MAX_COMPACTION_ROWS` output file of narrow rows, well under the
+/// per-partition soft cap (64 MiB at the default fan-out) so the gate can
+/// never hold a tail past the caps that actually bound memory.
+fn tick_min_flush_bytes() -> usize {
+    env_u64("BASIN_TICK_MIN_FLUSH_BYTES", 8 * 1024 * 1024) as usize
+}
+
+/// #78 Phase 1: a partition idle (no writes) for at least this long is
+/// drained on the next sweep regardless of size, so a finished burst's tail
+/// reaches cold storage promptly (`BASIN_TICK_IDLE_FLUSH_SECS`, default 3).
+fn tick_idle_flush_window() -> Duration {
+    Duration::from_secs(env_u64("BASIN_TICK_IDLE_FLUSH_SECS", 3))
+}
+
 /// A decoded PK zone-map bound. Within one table every bound is the same
 /// variant (one column, one type), so the derived `PartialOrd` — which
 /// orders mismatched variants by discriminant — never sees a mixed compare
@@ -5418,6 +5507,30 @@ impl InProcessProjectHandle {
                             );
                         }
                     });
+                }
+            }
+
+            // #78 Phase 2 (soft admission): between the soft and hard caps,
+            // pace this writer with a graduated per-batch delay proportional
+            // to how deep the tail is into the band, so ingest converges onto
+            // drain throughput SMOOTHLY instead of slamming into the hard-cap
+            // synchronous flush — a multi-second ack stall that external
+            // proxies punish by reaping the connection mid-COPY (the observed
+            // mass-DROP mechanism). Same idea as RocksDB's delayed_write_rate
+            // / ClickHouse's parts_to_delay_insert: the stable operating
+            // point is ingest == sustainable drain rate; the ramp finds it
+            // instead of oscillating around it. Quadratic so the brake is
+            // gentle just past the soft cap and firm approaching the hard
+            // cap. `BASIN_SOFT_DELAY_MAX_MS` bounds the per-batch delay
+            // (default 250 ms; 0 disables and restores the pure cliff).
+            let hard = hard_tail_bytes();
+            let soft = max_tail_bytes();
+            let max_ms = env_u64("BASIN_SOFT_DELAY_MAX_MS", 250);
+            if max_ms > 0 && hard > soft && tail_bytes < hard {
+                let frac = (tail_bytes - soft) as f64 / (hard - soft) as f64;
+                let delay_ms = (max_ms as f64 * frac * frac) as u64;
+                if delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
             }
         }
@@ -10029,6 +10142,13 @@ mod tests {
 
         // 6 * 512k rows => 6 bounded output files, drained in one wave at
         // flush_concurrency>=6.
+        //
+        // #78 Phase 2: disable the soft-admission pacer for the build — its
+        // per-write sleeps in the soft/hard band otherwise hand the proactive
+        // soft-cap drain enough wall time to flush part of the backlog before
+        // `run_compaction_once` measures the wave, collapsing the
+        // serial-vs-concurrent timing difference this test asserts on.
+        std::env::set_var("BASIN_SOFT_DELAY_MAX_MS", "0");
         let per = MAX_COMPACTION_ROWS;
         let n = 6usize;
         for i in 0..n {
@@ -10037,6 +10157,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        std::env::remove_var("BASIN_SOFT_DELAY_MAX_MS");
 
         std::env::set_var("BASIN_SHARD_FLUSH_CONCURRENCY", flush_concurrency.to_string());
         let inner = impl_of(&shard);
@@ -11510,5 +11631,78 @@ mod tests {
         );
 
         std::env::remove_var("BASIN_SHARD_FLUSH_CONCURRENCY");
+    }
+
+    /// #78 Phase 1: the background-tick min-flush gate holds a small, hot
+    /// tail (no tiny L0 file per tick), while (a) the explicit
+    /// `flush_to_parquet` barrier still drains it on demand and (b) a tail
+    /// that has gone idle past the flush window drains on the next sweep.
+    /// Uses default gate thresholds — no env overrides, so it cannot race
+    /// sibling tests.
+    #[tokio::test]
+    async fn tick_min_flush_gate_holds_small_hot_tails() {
+        let (shard, _sd, _wd, storage, _cat, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+        let inner = impl_of(&shard);
+
+        // Sweep 0 is the boot escape sweep (always a full drain) — consume it
+        // while the shard is empty so the gated behaviour below is
+        // deterministic.
+        inner.compact_all_tick().await.unwrap();
+
+        let handle = shard.get(&project, &partition).await.unwrap();
+        handle
+            .write_batch(&table, batch(0, 1_000, "v-"))
+            .await
+            .unwrap();
+
+        // Gated sweep: a ~KBs tail written milliseconds ago is small + hot —
+        // it must be HELD, not flushed into a tiny file.
+        inner.compact_all_tick().await.unwrap();
+        let files = storage
+            .list_data_files(&project, &table)
+            .await
+            .unwrap_or_default();
+        assert!(
+            files.is_empty(),
+            "small hot tail must be held by the tick gate, got {} file(s)",
+            files.len()
+        );
+
+        // The tail is still readable while held.
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(rows_in(&read), 1_000, "held tail must stay readable");
+
+        // Explicit barrier: full-drain semantics are unchanged.
+        shard.flush_to_parquet().await.unwrap();
+        let files = storage
+            .list_data_files(&project, &table)
+            .await
+            .unwrap_or_default();
+        assert_eq!(
+            files.len(),
+            1,
+            "explicit flush_to_parquet must drain the held tail"
+        );
+
+        // Idle flush: a second small tail drains once the partition has been
+        // idle past the window, even on a gated sweep.
+        handle
+            .write_batch(&table, batch(1_000, 1_000, "v-"))
+            .await
+            .unwrap();
+        tokio::time::sleep(tick_idle_flush_window() + Duration::from_millis(250)).await;
+        inner.compact_all_tick().await.unwrap();
+        let files = storage
+            .list_data_files(&project, &table)
+            .await
+            .unwrap_or_default();
+        assert_eq!(
+            files.len(),
+            2,
+            "idle tail must flush on the next gated sweep"
+        );
     }
 }
