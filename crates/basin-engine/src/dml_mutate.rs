@@ -1570,7 +1570,7 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
                     )
                     .await?
                 } else {
-                    let kept = evaluate_and_partition_delete(
+                    let (kept, decoded_total) = evaluate_and_partition_delete(
                         &storage,
                         &sess.project,
                         &f.path,
@@ -1578,9 +1578,39 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
                         schema.as_ref(),
                     )
                     .await?;
+                    // ROW-CONSERVATION TRIPWIRE (1B-audit finding, CoW
+                    // variant): `removed` below is INFERRED as
+                    // catalog_rows − kept_rows, so a read that decodes this
+                    // file as empty/partial (poisoned cached decode /
+                    // truncated GET — under investigation) silently counts
+                    // every unseen row as "deleted" and the replace destroys
+                    // them (observed: a 3.9M-row file rewritten to nothing
+                    // by a 100k-key purge DELETE). The decode must account
+                    // for every catalog row before we may subtract.
+                    if decoded_total != f.row_count {
+                        return Err(BasinError::internal(format!(
+                            "DELETE CoW: file {} decoded {decoded_total} rows but catalog \
+                             says {} — refusing rewrite (would destroy rows); retry",
+                            f.path, f.row_count
+                        )));
+                    }
                     (kept, Vec::new(), None)
                 };
                 let kept_rows: usize = kept.iter().map(|b| b.num_rows()).sum();
+                // Same conservation tripwire for the CAPTURING path: its
+                // deleted rows are enumerated, so kept + deleted must account
+                // for every catalog row (the non-capturing path verified its
+                // decode total inline above).
+                if capture_events && kept_rows + deleted_rows.len() != f.row_count as usize {
+                    return Err(BasinError::internal(format!(
+                        "DELETE CoW (capturing): file {} decoded {} kept + {} deleted rows \
+                         but catalog says {} — refusing rewrite (would destroy rows); retry",
+                        f.path,
+                        kept_rows,
+                        deleted_rows.len(),
+                        f.row_count
+                    )));
+                }
                 let removed = (f.row_count as usize).saturating_sub(kept_rows);
                 if removed == 0 {
                     // Predicate matched no rows in this file even though
@@ -5725,11 +5755,13 @@ async fn evaluate_and_partition_delete(
     path: &object_store::path::Path,
     pred: &CompoundPredicate,
     catalog_schema: &Schema,
-) -> Result<Vec<RecordBatch>> {
+) -> Result<(Vec<RecordBatch>, u64)> {
     let mut stream = storage.read_file(project, path).await?;
     let mut kept = Vec::new();
+    let mut decoded_total: u64 = 0;
     while let Some(batch) = stream.next().await {
         let batch = reattach_catalog_metadata(catalog_schema, batch?)?;
+        decoded_total += batch.num_rows() as u64;
         let mask = evaluate_compound(&batch, pred)
             .map_err(|e| BasinError::internal(format!("delete predicate eval: {e}")))?;
         let inverse = invert_mask(&mask);
@@ -5739,7 +5771,7 @@ async fn evaluate_and_partition_delete(
             kept.push(kb);
         }
     }
-    Ok(kept)
+    Ok((kept, decoded_total))
 }
 
 /// One file's contribution to a bulk UPDATE: the original file path, the
