@@ -3405,11 +3405,42 @@ impl InProcessShard {
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?;
             if batches.is_empty() {
-                continue; // Zero-row file: nothing to carry, still replaced.
+                // ROW-CONSERVATION GUARD (same 1B-audit finding as the
+                // file-merge guards): this branch used to keep the file in
+                // the REMOVED set while carrying nothing into the output —
+                // when a read decodes a populated file as empty (read-time
+                // filtering, still under investigation), that silently
+                // destroyed its rows (multi-million-row losses observed).
+                // Only collapse a file the CATALOG also says is empty.
+                if f.row_count > 0 {
+                    tracing::error!(
+                        %project,
+                        %table,
+                        path = %f.path,
+                        catalog_rows = f.row_count,
+                        "stripe-merge: input decoded as ZERO rows but catalog says rows \
+                         exist; abandoning pass (would destroy data)",
+                    );
+                    return Ok(false);
+                }
+                continue; // Genuinely empty file: nothing to carry, still replaced.
             }
             let schema = batches[0].schema();
             let one = arrow::compute::concat_batches(&schema, &batches)
                 .map_err(|e| BasinError::storage(format!("stripe-merge concat: {e}")))?;
+            let decoded = one.num_rows() as u64;
+            if decoded != f.row_count {
+                tracing::error!(
+                    %project,
+                    %table,
+                    path = %f.path,
+                    catalog_rows = f.row_count,
+                    decoded_rows = decoded,
+                    "stripe-merge: input decoded row count != catalog row count; \
+                     abandoning pass (would lose rows)",
+                );
+                return Ok(false);
+            }
             let one = backfill_promoted_columns(one, &meta.promoted_jsonb_paths)?;
             per_file.push(one);
         }
