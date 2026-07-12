@@ -4008,8 +4008,31 @@ impl InProcessShard {
             }
         }
         let Some(schema) = schema else {
-            // Every selected input was zero-row: the swap still drops them,
-            // collapsing N empty files to none (count(*) unchanged: 0 rows).
+            // Every selected input DECODED as zero rows. Only treat that as a
+            // legitimate pure-removal (collapse N empty files to none) when
+            // the CATALOG also says the inputs hold zero rows. A 1B-run
+            // conservation audit caught this branch DESTROYING 7.49M rows
+            // across 15 commits: inputs whose catalog row_count was
+            // 110k-3.39M decoded as empty (read-time filtering — suspected
+            // ordering-unaware tombstone application to resent rows) and were
+            // then dropped with no replacement. Whatever the upstream cause,
+            // a merge must NEVER remove data it did not carry into an output:
+            // if the catalog says rows exist but the decode saw none, abort
+            // loudly and leave the inputs alone.
+            let catalog_rows: u64 = inputs.iter().map(|f| f.row_count).sum();
+            if catalog_rows > 0 {
+                tracing::error!(
+                    %project,
+                    %table,
+                    partition = %partition_id,
+                    inputs = inputs.len(),
+                    catalog_rows,
+                    "file-merge: inputs decoded as ZERO rows but catalog says rows exist; \
+                     refusing pure-removal (would destroy data) — investigate read-time \
+                     filtering (tombstone ordering / cache poisoning)",
+                );
+                return Ok(false);
+            }
             let removed: Vec<String> = inputs.iter().map(|f| f.path.clone()).collect();
             return self
                 .commit_file_merge(project, table, partition_id, snapshot, removed, Vec::new())
@@ -4026,6 +4049,22 @@ impl InProcessShard {
         drop(batches);
         let total_rows = merged.num_rows();
         if total_rows == 0 {
+            // Same data-destruction guard as the schema-less branch above:
+            // an all-rows-filtered concat may only drop inputs the CATALOG
+            // agrees are empty.
+            let catalog_rows: u64 = inputs.iter().map(|f| f.row_count).sum();
+            if catalog_rows > 0 {
+                tracing::error!(
+                    %project,
+                    %table,
+                    partition = %partition_id,
+                    inputs = inputs.len(),
+                    catalog_rows,
+                    "file-merge: concat produced ZERO rows but catalog says rows exist; \
+                     refusing pure-removal (would destroy data)",
+                );
+                return Ok(false);
+            }
             let removed: Vec<String> = inputs.iter().map(|f| f.path.clone()).collect();
             return self
                 .commit_file_merge(project, table, partition_id, snapshot, removed, Vec::new())
@@ -4097,6 +4136,30 @@ impl InProcessShard {
             }
         }
         drop(merged);
+
+        // ROW-CONSERVATION GUARD (same audit finding as the pure-removal
+        // guards above, partial-loss variant: 4 of the 19 violating commits
+        // removed inputs whose catalog rows exceeded the decoded output).
+        // The output of a row-preserving merge must carry EXACTLY the rows
+        // the catalog attributes to its inputs; any shortfall means read-time
+        // filtering dropped rows and committing would destroy them. Clean up
+        // the orphan outputs and abort; the inputs stay live.
+        let catalog_input_rows: u64 = inputs.iter().map(|f| f.row_count).sum();
+        if total_rows as u64 != catalog_input_rows {
+            tracing::error!(
+                %project,
+                %table,
+                partition = %partition_id,
+                catalog_input_rows,
+                decoded_rows = total_rows,
+                "file-merge: decoded row total != catalog input total; refusing commit \
+                 (would lose rows) — investigate read-time filtering",
+            );
+            for (df, _) in &outputs {
+                let _ = self.cfg.storage.delete_file(project, &df.path).await;
+            }
+            return Ok(false);
+        }
 
         let removed: Vec<String> = inputs.iter().map(|f| f.path.clone()).collect();
         let added: Vec<DataFileRef> = outputs
