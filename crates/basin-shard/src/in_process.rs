@@ -1884,8 +1884,18 @@ impl InProcessShard {
                         error = %e,
                         "promoted_column_backfill_sweep: catalog commit failed; skipping",
                     );
-                    // Best-effort: delete the orphaned new file.
-                    let _ = self.cfg.storage.delete_file(project, &new_file.path).await;
+                    // The commit may have LANDED and only its ack been lost (the
+                    // merge-path bug: PUT succeeds, response times out, the retry
+                    // collides with the version it wrote). Deleting the rewritten
+                    // file in that case destroys every row in it, invisibly —
+                    // the catalog still lists it live and still counts its rows.
+                    // Only reclaim it if the catalog does not reference it.
+                    self.delete_outputs_unless_live(
+                        project,
+                        table,
+                        &[new_file.path.to_string()],
+                    )
+                    .await;
                 }
             }
         }
