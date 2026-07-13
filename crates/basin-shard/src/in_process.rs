@@ -1513,9 +1513,19 @@ impl InProcessShard {
                         error = %e,
                         "tier migrate catalog swap failed; cold object orphaned (will be reaped on retry)",
                     );
-                    // Try to clean up the orphan cold copy. Failure here is
-                    // pure waste, not a correctness issue.
-                    let _ = storage.delete_file(project, &cold_file.path).await;
+                    // Try to clean up the orphan cold copy — but the swap may
+                    // have LANDED and only its ack been lost (the merge lost-ack
+                    // bug: the PUT succeeds, the response times out, the retry
+                    // collides with the version it wrote). If it did, the catalog
+                    // now points at THIS cold path and deleting it destroys every
+                    // row in the file while the catalog still counts them. Only
+                    // reclaim it if the catalog does not reference it.
+                    self.delete_outputs_unless_live(
+                        project,
+                        table,
+                        &[cold_file.path.to_string()],
+                    )
+                    .await;
                     continue;
                 }
             }
