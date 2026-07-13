@@ -5812,6 +5812,23 @@ async fn apply_update_to_file(
                 schema.as_ref(),
             )
             .await?;
+            // ROW-CONSERVATION TRIPWIRE (the DELETE CoW sibling of this check
+            // landed in 8b7465ad; UPDATE never got one). Every row of the file
+            // is rewritten here, so the output MUST carry every catalog row. If
+            // the read decoded the file as empty or partial — a poisoned/short
+            // GET, a truncated body accepted as Ok — we would replace a
+            // populated file with a fragment while reporting `f.row_count` rows
+            // updated, destroying every row we failed to see.
+            let carried = decoded_rows(&news);
+            if carried != f.row_count {
+                return Err(BasinError::storage(format!(
+                    "UPDATE rewrite of {}: read decoded {carried} rows but the catalog \
+                     attributes {} — refusing the rewrite (it would destroy the rows it \
+                     could not see)",
+                    f.path.as_ref(),
+                    f.row_count
+                )));
+            }
             Ok(Some(PerFileUpdate {
                 path: f.path.as_ref().to_string(),
                 rows_matched: f.row_count as usize,
@@ -5834,6 +5851,21 @@ async fn apply_update_to_file(
                 // pass through, no rewrite.
                 return Ok(None);
             }
+            // Same tripwire as the AllMatch arm: `news` carries EVERY decoded
+            // row (updated and untouched alike), so a short decode here rewrites
+            // the file down to the fragment it managed to read. The `matched ==
+            // 0` pass-through above only saves the fully-empty case — a partial
+            // decode with one match still destroys the rows it never saw.
+            let carried = decoded_rows(&news);
+            if carried != f.row_count {
+                return Err(BasinError::storage(format!(
+                    "UPDATE rewrite of {}: read decoded {carried} rows but the catalog \
+                     attributes {} — refusing the rewrite (it would destroy the rows it \
+                     could not see)",
+                    f.path.as_ref(),
+                    f.row_count
+                )));
+            }
             Ok(Some(PerFileUpdate {
                 path: f.path.as_ref().to_string(),
                 rows_matched: matched,
@@ -5842,6 +5874,13 @@ async fn apply_update_to_file(
         }
         (PruneOutcome::NoMatch, None) => unreachable!(),
     }
+}
+
+/// Total rows carried by a decoded/rewritten batch set. Used by the UPDATE
+/// row-conservation tripwires to compare what a read actually produced
+/// against what the catalog attributes to the file.
+fn decoded_rows(batches: &[RecordBatch]) -> u64 {
+    batches.iter().map(|b| b.num_rows() as u64).sum()
 }
 
 /// Read a single Parquet file and apply SET to every row (when `pred` is
