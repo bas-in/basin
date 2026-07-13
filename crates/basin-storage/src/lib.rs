@@ -26,6 +26,7 @@ mod metadata_cache;
 mod page_cache;
 mod paths;
 mod predicate;
+mod retry_store;
 mod reader;
 mod scheduler;
 mod stripe_router_store;
@@ -791,8 +792,16 @@ impl Storage {
         // for example), we fall back to the un-wrapped store and log
         // — the cache is a performance tier, not the durability
         // boundary.
+        // Retry transient read failures at the BOTTOM of the stack, so every
+        // reader inherits it — including the Vortex/DataFusion scan, which opens
+        // files through the ObjectStore handle directly and so never sees
+        // `reader::get_bytes_with_retry`. Without this, one mid-stream body
+        // error ("Generic S3 error: request or response body error", which
+        // Tigris hands out routinely under load) fails an entire table scan.
+        let base: Arc<dyn ObjectStore> =
+            Arc::new(retry_store::RetryingStore::new(cfg.object_store.clone()));
         let object_store = match cfg.disk_cache.clone() {
-            Some(dc) => match disk_cache::DiskCachedStore::new(cfg.object_store.clone(), dc) {
+            Some(dc) => match disk_cache::DiskCachedStore::new(base.clone(), dc) {
                 Ok(wrapped) => Arc::new(wrapped) as Arc<dyn ObjectStore>,
                 Err(e) => {
                     tracing::warn!(
@@ -800,10 +809,10 @@ impl Storage {
                         error = %e,
                         "disk_cache: setup failed; falling back to direct object store",
                     );
-                    cfg.object_store
+                    base
                 }
             },
-            None => cfg.object_store,
+            None => base,
         };
 
         let page_cache = cfg.page_cache.map(|pc| Arc::new(PageCache::new(pc)));
