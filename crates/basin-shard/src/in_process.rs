@@ -51,7 +51,7 @@ use basin_wal::Lsn;
 use bytes::Bytes;
 use futures::StreamExt;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 
 use crate::{
     LeaseMode, ProjectHandle, ProjectHandleImpl, ShardBackgroundHandle, ShardConfig, ShardImpl,
@@ -3122,6 +3122,74 @@ impl InProcessShard {
         }
     }
 
+    /// Delete merge OUTPUT files after a commit we believe failed — but NEVER
+    /// one the catalog now lists as live.
+    ///
+    /// A catalog commit can LAND server-side and still hand the client an error
+    /// or a conflict. The object-store PUT succeeds, the response is lost (under
+    /// load Tigris routinely answers 408 Request Timeout), and the client's own
+    /// retry then collides with the version it just wrote — surfacing as
+    /// `CommitConflict`. The conflict handler reloads, finds its `removed`
+    /// inputs no longer live (OUR commit removed them), concludes a peer
+    /// invalidated the merge, and "cleans up" the outputs.
+    ///
+    /// Those outputs are live in the catalog. Deleting them is unrecoverable
+    /// row loss of the worst kind: `count(*)` keeps reporting the rows (it sums
+    /// catalog row_counts) while no scan can ever produce them again (scans
+    /// enumerate the object store), and every row-conservation guard stays
+    /// silent because the catalog's arithmetic still balances. A 1B-row load
+    /// audited 60.48M rows short with all guards silent, and the bucket held
+    /// exactly 16 catalog-live files that had been deleted out from under it —
+    /// merge outputs, totalling 60,480,000 rows.
+    ///
+    /// Returns true if any output was live, i.e. the commit actually landed.
+    /// On a catalog read error nothing is deleted: an orphan is reclaimable,
+    /// a deleted live file is not.
+    async fn delete_outputs_unless_live(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+        paths: &[String],
+    ) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+        let live: HashSet<String> = match self.cfg.catalog.load_table(project, table).await {
+            Ok(m) => m.live_data_files().into_iter().map(|f| f.path).collect(),
+            Err(e) => {
+                warn!(
+                    %project,
+                    %table,
+                    error = %e,
+                    "merge cleanup: cannot read the live set; leaving outputs in place \
+                     (orphans are reclaimable, deleting a live file is not)",
+                );
+                return false;
+            }
+        };
+        let mut landed = false;
+        for p in paths {
+            if live.contains(p) {
+                landed = true;
+                error!(
+                    %project,
+                    %table,
+                    path = %p,
+                    "merge cleanup: the commit reported failure but this output is LIVE in the \
+                     catalog — the commit landed and its ack was lost. NOT deleting it \
+                     (deleting it would destroy every row it holds)",
+                );
+            } else {
+                let _ = self
+                    .cfg
+                    .storage
+                    .delete_file(project, &object_store::path::Path::from(p.as_str()))
+                    .await;
+            }
+        }
+        landed
+    }
+
     /// Spawn the deferred superseded-file delete (#50) on the runtime. No-op for
     /// an empty set. Replaces the immediate post-merge delete loop at the
     /// stripe-merge / file-merge sites.
@@ -3578,6 +3646,17 @@ impl InProcessShard {
                             .into_iter()
                             .map(|f| f.path)
                             .collect();
+                        // LOST ACK: the conflicting writer may be US. The commit
+                        // PUT can land server-side and still fail the client (a
+                        // 408 under load), and the retry then collides with the
+                        // version it wrote itself. Our outputs being live proves
+                        // the commit landed — report success. Without this the
+                        // check below sees our own removed inputs gone, calls it
+                        // a peer's REPLACE, and abandons the merge — deleting
+                        // outputs the catalog lists as live.
+                        if added.iter().all(|f| live_now.contains(&f.path)) {
+                            break 'commit Ok(true);
+                        }
                         if removed.iter().all(|p| live_now.contains(p)) {
                             snapshot = fresh.current_snapshot;
                             continue;
@@ -3591,11 +3670,17 @@ impl InProcessShard {
             Ok(false)
         };
 
+        let output_paths: Vec<String> = outputs.iter().map(|(df, _)| df.path.to_string()).collect();
         let committed = match commit_result {
             Ok(c) => c,
             Err(e) => {
-                for (df, _) in &outputs {
-                    let _ = self.cfg.storage.delete_file(project, &df.path).await;
+                // The commit may have landed anyway (lost ack) — only delete
+                // outputs the catalog does not list as live.
+                if self
+                    .delete_outputs_unless_live(project, table, &output_paths)
+                    .await
+                {
+                    return Ok(true);
                 }
                 return Err(e);
             }
@@ -3606,8 +3691,11 @@ impl InProcessShard {
                 %table,
                 "stripe-merge: lost the commit race; outputs abandoned, retrying next tick",
             );
-            for (df, _) in &outputs {
-                let _ = self.cfg.storage.delete_file(project, &df.path).await;
+            if self
+                .delete_outputs_unless_live(project, table, &output_paths)
+                .await
+            {
+                return Ok(true);
             }
             return Ok(false);
         }
@@ -4237,14 +4325,28 @@ impl InProcessShard {
                         {
                             Ok(v) => v,
                             Err(e) => {
-                                for (df, _) in &outputs {
-                                    let _ = self.cfg.storage.delete_file(project, &df.path).await;
+                                let paths: Vec<String> =
+                                    outputs.iter().map(|(df, _)| df.path.to_string()).collect();
+                                if self
+                                    .delete_outputs_unless_live(project, table, &paths)
+                                    .await
+                                {
+                                    break 'commit true;
                                 }
                                 return Err(e);
                             }
                         };
                         let live_now: HashSet<String> =
                             fresh_live.into_iter().map(|f| f.path).collect();
+                        // LOST ACK: the conflicting writer may be US — the commit
+                        // landed and its response was lost. Our outputs being live
+                        // proves it. Check this BEFORE the `removed` test below,
+                        // which would otherwise see our own inputs gone, read it
+                        // as a peer's REPLACE, and abandon a merge that in fact
+                        // succeeded — deleting live outputs.
+                        if added.iter().all(|f| live_now.contains(&f.path)) {
+                            break 'commit true;
+                        }
                         if removed.iter().all(|p| live_now.contains(p)) {
                             snap = fresh_snap;
                             continue;
@@ -4253,8 +4355,13 @@ impl InProcessShard {
                     }
                     Err(BasinError::CommitConflict(_)) => break 'commit false,
                     Err(e) => {
-                        for (df, _) in &outputs {
-                            let _ = self.cfg.storage.delete_file(project, &df.path).await;
+                        let paths: Vec<String> =
+                            outputs.iter().map(|(df, _)| df.path.to_string()).collect();
+                        if self
+                            .delete_outputs_unless_live(project, table, &paths)
+                            .await
+                        {
+                            break 'commit true;
                         }
                         return Err(e);
                     }
@@ -4270,10 +4377,16 @@ impl InProcessShard {
                 partition = %partition_id,
                 "file-merge: lost the commit race; outputs abandoned, retrying next tick",
             );
-            for (df, _) in &outputs {
-                let _ = self.cfg.storage.delete_file(project, &df.path).await;
+            let paths: Vec<String> = outputs.iter().map(|(df, _)| df.path.to_string()).collect();
+            if !self
+                .delete_outputs_unless_live(project, table, &paths)
+                .await
+            {
+                return Ok(false);
             }
-            return Ok(false);
+            // Outputs are live: the commit landed and the ack was lost. Fall
+            // through and finish the merge (index maintenance, input cleanup)
+            // exactly as a clean commit would.
         }
 
         self.reindex_and_reclaim_merge(project, table, &meta, &outputs, &removed)
