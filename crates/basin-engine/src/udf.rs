@@ -1540,37 +1540,53 @@ impl ScalarUDFImpl for PgSleepUdf {
             // (e.g. plain sync unit tests) — those calls never carry a deadline.
             const TICK: std::time::Duration = std::time::Duration::from_millis(50);
             let sleep_until = std::time::Instant::now() + total_dur;
-            let handle = tokio::runtime::Handle::try_current();
-            if let Ok(handle) = handle {
-                let cancel_err = tokio::task::block_in_place(|| -> Option<datafusion::common::DataFusionError> {
-                    loop {
-                        let now = std::time::Instant::now();
-                        if now >= sleep_until {
-                            break; // full sleep completed normally
-                        }
-                        // Check the statement deadline before sleeping the next tick.
-                        if let Some(deadline) = crate::executor::get_statement_deadline() {
-                            if now >= deadline {
-                                // Deadline has passed: flag and bail out.
-                                crate::executor::mark_pg_sleep_canceled();
-                                return Some(datafusion::common::DataFusionError::Execution(
-                                    "pg_sleep: interrupted by statement_timeout (SQLSTATE 57014)"
-                                        .to_string(),
-                                ));
-                            }
-                        }
-                        let remaining = sleep_until - now;
-                        let tick = remaining.min(TICK);
-                        handle.block_on(tokio::time::sleep(tick));
+
+            // The deadline-aware tick loop. Sleeps in short ticks so a
+            // statement_timeout can interrupt a long pg_sleep cooperatively.
+            let sleep_ticking = || -> Option<datafusion::common::DataFusionError> {
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= sleep_until {
+                        break; // full sleep completed normally
                     }
-                    None
-                });
-                if let Some(err) = cancel_err {
-                    return Err(err);
+                    if let Some(deadline) = crate::executor::get_statement_deadline() {
+                        if now >= deadline {
+                            crate::executor::mark_pg_sleep_canceled();
+                            return Some(datafusion::common::DataFusionError::Execution(
+                                "pg_sleep: interrupted by statement_timeout (SQLSTATE 57014)"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    let remaining = sleep_until - now;
+                    std::thread::sleep(remaining.min(TICK));
                 }
-            } else {
-                // No tokio runtime: plain blocking sleep; no deadline available.
-                std::thread::sleep(total_dur);
+                None
+            };
+
+            // `block_in_place` is ONLY legal on a multi-threaded runtime — it
+            // panics with "can call blocking only when running on the
+            // multi-threaded runtime" anywhere else. On the shard path the
+            // executor runs DataFusion inside `spawn_blocking` on its OWN
+            // CURRENT-THREAD runtime (executor.rs), so `Handle::try_current()`
+            // succeeds while `block_in_place` is illegal — and every pg_sleep,
+            // even a single uncontended one, panicked the query. Check the
+            // flavor, not just whether a runtime exists.
+            //
+            // On a current-thread runtime we are already on a dedicated blocking
+            // thread, so sleeping it directly starves nothing. On a multi-thread
+            // worker we still hand the worker back to tokio via block_in_place.
+            let cancel_err = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor())
+            {
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                    tokio::task::block_in_place(sleep_ticking)
+                }
+                // Current-thread runtime, or no runtime at all (plain sync unit
+                // tests): just sleep this thread, still honouring the deadline.
+                _ => sleep_ticking(),
+            };
+            if let Some(err) = cancel_err {
+                return Err(err);
             }
         }
 
@@ -6052,6 +6068,76 @@ mod jsonb_text_column_runtime_tests {
             arr.value(1),
             false,
             "second row should not contain {{\"a\":1}}"
+        );
+    }
+
+}
+
+#[cfg(test)]
+mod pg_sleep_runtime_tests {
+    use super::*;
+    use datafusion::logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility};
+
+    /// REGRESSION: pg_sleep must not panic on a CURRENT-THREAD runtime.
+    ///
+    /// On the shard path the executor runs DataFusion inside `spawn_blocking`
+    /// on its own current-thread runtime. `Handle::try_current()` succeeds
+    /// there, so the old code called `block_in_place` — which is legal ONLY on
+    /// a multi-threaded runtime and panics everywhere else with "can call
+    /// blocking only when running on the multi-threaded runtime". Every
+    /// pg_sleep on a sharded (i.e. every cloud) deployment therefore died,
+    /// even a single uncontended one:
+    ///
+    ///   SELECT pg_sleep(1)
+    ///   ERROR: internal: spawn_blocking join: task ... panicked with message
+    ///          "can call blocking only when running on the multi-threaded runtime"
+    ///
+    /// This reproduces that exact nesting: a blocking thread running a
+    /// current-thread runtime.
+    #[test]
+    fn pg_sleep_does_not_panic_on_a_current_thread_runtime() {
+        let outer = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let elapsed = outer.block_on(async {
+            tokio::task::spawn_blocking(|| {
+                // Exactly what executor.rs does on the shard path.
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let t0 = std::time::Instant::now();
+                    let udf = PgSleepUdf {
+                        signature: Signature::exact(
+                            vec![DataType::Float64],
+                            datafusion::logical_expr::Volatility::Volatile,
+                        ),
+                    };
+                    let args = datafusion::logical_expr::ScalarFunctionArgs {
+                        args: vec![datafusion::logical_expr::ColumnarValue::Scalar(
+                            datafusion::common::ScalarValue::Float64(Some(0.15)),
+                        )],
+                        arg_fields: vec![Arc::new(Field::new("s", DataType::Float64, true))],
+                        number_rows: 1,
+                        return_field: Arc::new(Field::new("pg_sleep", DataType::Utf8, true)),
+                        config_options: Arc::new(datafusion::config::ConfigOptions::default()),
+                    };
+                    // The panic under test happened HERE.
+                    udf.invoke_with_args(args).expect("pg_sleep must not panic");
+                    t0.elapsed()
+                })
+            })
+            .await
+            .expect("pg_sleep panicked the blocking task (the bug)")
+        });
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(140),
+            "pg_sleep must actually sleep (slept {elapsed:?})",
         );
     }
 }
