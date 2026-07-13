@@ -11044,6 +11044,111 @@ mod tests {
         }
     }
 
+    /// REGRESSION: a merge whose commit LANDED but whose ack was LOST must not
+    /// delete its own outputs.
+    ///
+    /// Production shape: the catalog commit PUT succeeds server-side, the
+    /// response times out (Tigris answers 408 under load), the object-store
+    /// client retries and collides with the version it just wrote — so the merge
+    /// sees `CommitConflict`/`Err` for a commit that actually succeeded. The old
+    /// cleanup then deleted the outputs. They were LIVE in the catalog, so their
+    /// rows kept being counted by `count(*)` (which sums catalog row_counts)
+    /// while no scan could ever produce them again (scans enumerate the object
+    /// store) — and no row-conservation guard fired, because the catalog's own
+    /// arithmetic still balanced. A 1B-row load lost 60,480,000 rows this way,
+    /// in 16 files.
+    ///
+    /// `delete_outputs_unless_live` is the invariant that makes that impossible:
+    /// it re-reads the live set and refuses to delete anything the catalog still
+    /// references, reporting `true` (the commit landed) instead.
+    #[tokio::test]
+    async fn merge_cleanup_never_deletes_a_live_output() {
+        let (shard, _sd, _wd, storage, catalog, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        // Land real, cataloged data files.
+        const N: usize = 2_000;
+        let handle = shard.get(&project, &partition).await.unwrap();
+        handle.write_batch(&table, batch(0, N, "v-")).await.unwrap();
+        let inner = impl_of(&shard);
+        inner.run_compaction_once().await.unwrap();
+
+        let live: Vec<String> = {
+            use basin_catalog::Catalog;
+            catalog
+                .load_table(&project, &table)
+                .await
+                .unwrap()
+                .live_data_files()
+                .into_iter()
+                .map(|f| f.path)
+                .collect()
+        };
+        assert!(!live.is_empty(), "compaction must have committed a data file");
+        assert_eq!(committed_count(&catalog, &project, &table).await, N as u64);
+
+        // Simulate the post-commit cleanup running against outputs whose commit
+        // LANDED: every path is live in the catalog.
+        let landed = inner
+            .delete_outputs_unless_live(&project, &table, &live)
+            .await;
+        assert!(
+            landed,
+            "a cleanup that sees its outputs live in the catalog must report the \
+             commit as LANDED (so the merge finishes instead of abandoning)",
+        );
+
+        // THE INVARIANT: nothing was deleted, and every row is still readable.
+        for p in &live {
+            let path = object_store::path::Path::from(p.as_str());
+            storage
+                .read_file(&project, &path)
+                .await
+                .unwrap_or_else(|e| panic!("live output {p} was DELETED by the cleanup: {e}"));
+        }
+        let read = handle.read(&table, ReadOptions::default()).await.unwrap();
+        assert_eq!(
+            distinct_ids(&read),
+            N,
+            "every row must survive a lost-ack cleanup — deleting a live output is \
+             unrecoverable row loss",
+        );
+        assert_eq!(committed_count(&catalog, &project, &table).await, N as u64);
+    }
+
+    /// The other half of the guard: an output the catalog does NOT reference is
+    /// a genuine orphan and IS reclaimed (and reported as "commit did not land").
+    #[tokio::test]
+    async fn merge_cleanup_still_reclaims_orphan_outputs() {
+        let (shard, _sd, _wd, _storage, catalog, _wal) = fresh_shard().await;
+        let project = ProjectId::new();
+        let partition = PartitionKey::default_key();
+        let table = TableName::new("events").unwrap();
+
+        let handle = shard.get(&project, &partition).await.unwrap();
+        handle.write_batch(&table, batch(0, 100, "v-")).await.unwrap();
+        let inner = impl_of(&shard);
+        inner.run_compaction_once().await.unwrap();
+
+        // A path the catalog never referenced — the true "commit never landed"
+        // case that the cleanup exists to reclaim.
+        let orphan = vec![format!(
+            "{}/tables/events/data/_default/2026/07/12/ORPHANNOTINCATALOG.vortex",
+            project
+        )];
+        let landed = inner
+            .delete_outputs_unless_live(&project, &table, &orphan)
+            .await;
+        assert!(
+            !landed,
+            "an output the catalog does not reference must NOT be reported as a \
+             landed commit",
+        );
+        assert_eq!(committed_count(&catalog, &project, &table).await, 100);
+    }
+
     /// REPRODUCTION of the multi-node restart-recovery data-visibility incident
     /// (object-store catalog, BASIN_LEASE_MODE=off): a durable fan-out COPY runs
     /// while the DATA object store is wedged so no partition tail ever compacts
