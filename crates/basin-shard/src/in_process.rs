@@ -205,6 +205,21 @@ fn hard_tail_bytes() -> usize {
     (HARD_TAIL_BYTES_TOTAL / fanout_partitions()).max(MIN_PER_PARTITION_TAIL_BYTES)
 }
 
+/// #69: at the hard cap, is THIS table's own tail over its fair share of the
+/// partition budget?
+///
+/// The hard cap bounds a PARTITION's resident tail, summed over every table in
+/// it. Stalling whoever happens to write next is wrong: a table whose tail
+/// cannot drain pins the partition at the cap indefinitely, and then every
+/// write to every OTHER table in it pays a synchronous compaction and queues on
+/// the partition compaction lock behind a flush that cannot help it — the
+/// convoy that starved a healthy table to 130 r/s until the stuck one was
+/// dropped. Backpressure has to land on whoever is actually consuming the
+/// budget, so a writer stalls only when its own table is over its share.
+fn over_fair_share(own_tail_bytes: usize, tables_with_tail: usize) -> bool {
+    own_tail_bytes >= hard_tail_bytes() / tables_with_tail.max(1)
+}
+
 /// Upper bound on the number of rows a single compaction flush folds into one
 /// immutable data file. Compaction drains a partition's tail in chunks of at
 /// most this many rows per output file, so the cost of one flush
@@ -5632,7 +5647,9 @@ impl InProcessProjectHandle {
                 .await?
         };
 
-        let tail_bytes = {
+        // Partition-wide resident tail bytes (the RAM bound), plus THIS table's
+        // own share of them and how many tables are holding tail at all (#69).
+        let (tail_bytes, own_tail_bytes, tables_with_tail) = {
             let mut guard = self.state.write().await;
             guard
                 .tail
@@ -5647,12 +5664,23 @@ impl InProcessProjectHandle {
             // Sum the resident (uncompacted) tail bytes across this partition's
             // tables. `get_array_memory_size` is O(columns) per batch and the
             // tail holds few (large) batches, so this is cheap.
-            guard
-                .tail
-                .values()
-                .flatten()
-                .map(|(_, b)| b.get_array_memory_size())
-                .sum::<usize>()
+            let mut total = 0usize;
+            let mut own = 0usize;
+            let mut holders = 0usize;
+            for (t, batches) in guard.tail.iter() {
+                let bytes: usize = batches
+                    .iter()
+                    .map(|(_, b)| b.get_array_memory_size())
+                    .sum();
+                if bytes > 0 {
+                    holders += 1;
+                }
+                if t == table {
+                    own = bytes;
+                }
+                total += bytes;
+            }
+            (total, own, holders.max(1))
         };
 
         // Feed the rolling ingest-rate counter (autoscaler `ingest_rows_per_sec`).
@@ -5758,6 +5786,42 @@ impl InProcessProjectHandle {
             }
         }
         if tail_bytes >= hard_tail_bytes() {
+            // #69 PER-TABLE ISOLATION. The hard cap is a PARTITION-wide RAM
+            // bound, summed over every table's tail — so a table whose tail
+            // cannot drain (a stalled or abandoned table) holds the partition at
+            // the cap forever, and then EVERY write to EVERY other table in it
+            // pays a synchronous compaction and queues on the partition
+            // compaction lock behind a flush it cannot help. That convoy is what
+            // starved a healthy table to 130 r/s until the dead one was dropped.
+            //
+            // Backpressure should fall on whoever is consuming the budget. Stall
+            // this writer only if ITS OWN table is over its fair share of the
+            // cap; otherwise the pressure belongs to someone else, so kick a
+            // NON-BLOCKING drain (it is already draining, or will) and let this
+            // writer proceed. Its rows are WAL-durable either way, and the
+            // offending table's own writers still pace themselves.
+            if !over_fair_share(own_tail_bytes, tables_with_tail) {
+                if let Err(e) = self
+                    .shard
+                    .compact_one_impl(
+                        &self.project,
+                        &self.partition,
+                        self.state.clone(),
+                        true, // skip_if_locked: never queue behind another flush
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        project = %self.project,
+                        partition = %self.partition,
+                        table = %table,
+                        error = %e,
+                        "non-blocking tail drain failed (another table holds the cap); \
+                         rows are WAL-durable, next tick retries",
+                    );
+                }
+                return Ok(lsn);
+            }
             // Phase 2 autotune OVERLOAD signal: hitting the hard cap means the
             // writer is about to BLOCK on a synchronous compaction because the
             // in-memory tail outran the compactor — i.e. compaction is not
@@ -11058,6 +11122,42 @@ mod tests {
             Ok(m) => m.live_data_files().iter().map(|f| f.row_count).sum(),
             Err(_) => 0,
         }
+    }
+
+    /// #69: the hard-cap stall must fall on the table that is consuming the
+    /// budget, not on whoever writes next.
+    ///
+    /// A partition's tail cap is summed over every table in it. When one table's
+    /// tail cannot drain it pins the partition at the cap forever — and the old
+    /// rule ("partition is at the cap ⇒ THIS writer flushes synchronously") then
+    /// made every write to every other table queue on the partition compaction
+    /// lock behind a doomed flush. That convoy starved a healthy table to
+    /// 130 r/s until the stuck one was dropped.
+    #[test]
+    fn hard_cap_stalls_only_the_table_over_its_fair_share() {
+        let hard = hard_tail_bytes();
+
+        // Sole table holding tail: its fair share is the whole cap, and it is at
+        // it — it IS the pressure, so it must pace itself.
+        assert!(over_fair_share(hard, 1));
+        assert!(!over_fair_share(hard / 2, 1));
+
+        // Two tables, and the OTHER one owns essentially all of the tail (the
+        // stuck/abandoned table). The innocent writer holds almost nothing, so
+        // it must NOT be made to stall behind a flush it cannot help.
+        assert!(
+            !over_fair_share(0, 2),
+            "a table holding no tail must never stall on another table's backlog",
+        );
+        assert!(!over_fair_share(hard / 2 - 1, 2));
+
+        // ...but the moment it exceeds its own half, it is a genuine consumer of
+        // the budget and pacing it is correct.
+        assert!(over_fair_share(hard / 2, 2));
+
+        // Fair share shrinks as more tables share the partition.
+        assert!(over_fair_share(hard / 4, 4));
+        assert!(!over_fair_share(hard / 4 - 1, 4));
     }
 
     /// REGRESSION: a merge whose commit LANDED but whose ack was LOST must not
