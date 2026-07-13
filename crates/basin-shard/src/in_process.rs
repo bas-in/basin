@@ -3681,18 +3681,21 @@ impl InProcessShard {
         };
 
         let output_paths: Vec<String> = outputs.iter().map(|(df, _)| df.path.to_string()).collect();
-        let committed = match commit_result {
+        // A commit that LANDED can still hand us an error or a conflict (lost
+        // ack). In that case the outputs are live in the catalog, and the merge
+        // really did succeed — so finish it exactly as a clean commit would
+        // (index maintenance + superseded-input cleanup below), rather than
+        // returning early and leaving stale index entries behind.
+        let mut committed = match commit_result {
             Ok(c) => c,
             Err(e) => {
-                // The commit may have landed anyway (lost ack) — only delete
-                // outputs the catalog does not list as live.
-                if self
+                if !self
                     .delete_outputs_unless_live(project, table, &output_paths)
                     .await
                 {
-                    return Ok(true);
+                    return Err(e);
                 }
-                return Err(e);
+                true
             }
         };
         if !committed {
@@ -3701,14 +3704,15 @@ impl InProcessShard {
                 %table,
                 "stripe-merge: lost the commit race; outputs abandoned, retrying next tick",
             );
-            if self
+            if !self
                 .delete_outputs_unless_live(project, table, &output_paths)
                 .await
             {
-                return Ok(true);
+                return Ok(false);
             }
-            return Ok(false);
+            committed = true;
         }
+        debug_assert!(committed);
 
         // ── Index registry maintenance — outputs are registered EXACTLY as
         // `compact_one` registers its compacted file (same helpers), and the
