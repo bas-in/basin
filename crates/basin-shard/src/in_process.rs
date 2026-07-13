@@ -3664,7 +3664,8 @@ impl InProcessShard {
                         // check below sees our own removed inputs gone, calls it
                         // a peer's REPLACE, and abandons the merge — deleting
                         // outputs the catalog lists as live.
-                        if added.iter().all(|f| live_now.contains(&f.path)) {
+                        if !added.is_empty() && added.iter().all(|f| live_now.contains(&f.path))
+                        {
                             break 'commit Ok(true);
                         }
                         if removed.iter().all(|p| live_now.contains(p)) {
@@ -4358,7 +4359,8 @@ impl InProcessShard {
                         // which would otherwise see our own inputs gone, read it
                         // as a peer's REPLACE, and abandon a merge that in fact
                         // succeeded — deleting live outputs.
-                        if added.iter().all(|f| live_now.contains(&f.path)) {
+                        if !added.is_empty() && added.iter().all(|f| live_now.contains(&f.path))
+                        {
                             break 'commit true;
                         }
                         if removed.iter().all(|p| live_now.contains(p)) {
