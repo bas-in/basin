@@ -7205,13 +7205,56 @@ async fn delete_objects_engine(
 
     let store_for_task = store.clone();
     let storage_for_task = storage.clone();
+    let catalog_for_task = engine.config().catalog.clone();
+    let table_for_task = table.clone();
     tokio::spawn(async move {
+        // LIVE-SET GUARD. These paths were handed to `replace_data_files`, and
+        // we only get here when it returned Ok — but "the commit succeeded" and
+        // "the catalog no longer references this path" are not the same claim.
+        // The commit fans out across the META chain and N partition segments,
+        // and it decides which chain owns each removed path by probing those
+        // segments. Deleting a file the catalog still lists as live is the one
+        // unrecoverable outcome in this system: its rows keep being counted
+        // (count(*) sums the catalog) while no scan can ever produce them again
+        // (scans enumerate the object store), and it is invisible to every
+        // row-conservation guard we have, because the catalog's own arithmetic
+        // still balances.
+        //
+        // So re-read the live set and delete only what the catalog agrees is
+        // dead. An orphaned object wastes space and is reclaimable; a deleted
+        // live object is gone. On any catalog error, skip the delete entirely —
+        // leaking an object always beats destroying one.
+        let live: std::collections::HashSet<String> =
+            match catalog_for_task.load_table(&project, &table_for_task).await {
+                Ok(meta) => meta.live_data_files().into_iter().map(|f| f.path).collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "basin_engine",
+                        error = %e,
+                        "post-replace delete: cannot read the live set; skipping the delete \
+                         (leaves orphans, never loses rows)"
+                    );
+                    return;
+                }
+            };
+        let (still_live, deletable): (Vec<ObjectPath>, Vec<ObjectPath>) =
+            all_paths.into_iter().partition(|p| live.contains(p.as_ref()));
+        if !still_live.is_empty() {
+            tracing::error!(
+                target: "basin_engine",
+                count = still_live.len(),
+                paths = ?still_live.iter().map(|p| p.as_ref()).collect::<Vec<_>>(),
+                "post-replace delete: REFUSING to delete files the catalog still lists as \
+                 live — the replace did not remove them from their owning chain; leaving \
+                 them in place"
+            );
+        }
         // Native batch path for the data files (S3 DeleteObjects on AWS,
         // 64-way buffer_unordered everywhere else) via the storage helper
         // so page-cache entries are invalidated atomically with the
         // physical deletes.
         if let Err(e) = storage_for_task
-            .bulk_delete_files(&project, all_paths.clone())
+            .bulk_delete_files(&project, deletable)
             .await
         {
             tracing::warn!(
