@@ -582,116 +582,171 @@ pub(crate) fn strip_schema_qualifiers_for_session(
     let schemas: Vec<String> = st.schemas.iter().cloned().collect();
     drop(st);
 
-    let mut result = sql.to_string();
-    for schema in &schemas {
-        // Bare form: `myschema.table` → `table`.
-        result = replace_schema_prefix(&result, schema);
-        // Quoted form: `"myschema".table` / `"myschema"."table"` — ORMs such
-        // as drizzle-kit emit the schema qualifier double-quoted. The closing
-        // quote separates the schema token from the `.`, so the bare-form pass
-        // above (needle `myschema.`) never matches; strip the `"<schema>".`
-        // prefix explicitly, leaving any quoting on the table name intact.
-        result = replace_quoted_schema_prefix(&result, schema);
-    }
-    result
-}
+    // THIS REWRITE MUST NOT REACH INSIDE A STRING LITERAL.
+    //
+    // It runs over the raw bytes of every SELECT/DML, and `public` is always in
+    // the session's schema set. The old version stripped any `<schema>.` whose
+    // preceding byte was not an identifier char — and `/` is not one — so
+    //
+    //     WHERE url = 'https://public.example.com/x'
+    //
+    // silently became 'https://example.com/x'. The query then ran against a
+    // value the user never wrote: wrong rows matched, wrong rows updated, wrong
+    // rows deleted, and nothing errored. So walk the SQL once, copying literals,
+    // dollar-quoted bodies, quoted identifiers and comments through VERBATIM,
+    // and only strip a qualifier when we are actually looking at code.
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0usize;
 
-/// Replace occurrences of `"<schema>".` (the double-quoted schema-qualifier
-/// form ORMs emit) with the empty string, leaving the following table token —
-/// quoted or bare — untouched. Matched case-sensitively for the quoted form
-/// because a double-quoted identifier in PG is case-sensitive; schema names
-/// Basin stores are lowercase, so a quoted qualifier that round-trips a schema
-/// created via `CREATE SCHEMA "drizzle"` is lowercase too. The opening quote
-/// must not be part of a longer quoted identifier — it must be preceded by a
-/// non-identifier, non-quote byte (or start-of-string).
-fn replace_quoted_schema_prefix(sql: &str, schema: &str) -> String {
-    let needle = format!("\"{schema}\".");
-    let nlen = needle.len();
-    let sql_bytes = sql.as_bytes();
-    let len = sql_bytes.len();
-
-    let mut out = String::with_capacity(sql.len());
-    let mut pos = 0usize;
-
-    while pos < len {
-        if pos + nlen <= len {
-            let candidate = &sql_bytes[pos..pos + nlen];
-            // The schema token inside the quotes is ASCII; compare
-            // case-insensitively so `"DRIZZLE".` also matches.
-            let matches = candidate.eq_ignore_ascii_case(needle.as_bytes());
-            if matches {
-                let prev_ok = if pos == 0 {
-                    true
-                } else {
-                    let prev = sql_bytes[pos - 1];
-                    !prev.is_ascii_alphanumeric() && prev != b'_' && prev != b'"'
-                };
-                if prev_ok {
-                    pos += nlen;
-                    continue;
-                }
+    while i < len {
+        // A qualifier can only start here if the previous byte can't be part of
+        // an identifier (otherwise `myapp.` inside `xmyapp.` would match).
+        let prev_ok = i == 0 || {
+            let p = bytes[i - 1];
+            !p.is_ascii_alphanumeric() && p != b'_' && p != b'"'
+        };
+        if prev_ok {
+            if let Some(n) = match_schema_qualifier(bytes, i, &schemas) {
+                i += n; // skip the qualifier — this is the whole point of the pass
+                continue;
             }
         }
-        let ch = sql[pos..].chars().next().unwrap();
-        out.push(ch);
-        pos += ch.len_utf8();
+
+        match bytes[i] {
+            // Single-quoted string literal. `''` is an embedded quote. An E'…'
+            // literal also honours backslash escapes.
+            b'\'' => {
+                let e_prefixed = i > 0 && (bytes[i - 1] == b'E' || bytes[i - 1] == b'e');
+                out.push('\'');
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\\' && e_prefixed && i + 1 < len {
+                        out.push_str(&sql[i..i + 2]);
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'\'' {
+                        if i + 1 < len && bytes[i + 1] == b'\'' {
+                            out.push_str("''");
+                            i += 2;
+                            continue;
+                        }
+                        out.push('\'');
+                        i += 1;
+                        break;
+                    }
+                    let ch = sql[i..].chars().next().expect("char boundary");
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+            // Quoted identifier. `""` is an embedded quote. (A `"schema".`
+            // qualifier was already handled above, before we got here.)
+            b'"' => {
+                out.push('"');
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'"' {
+                        if i + 1 < len && bytes[i + 1] == b'"' {
+                            out.push_str("\"\"");
+                            i += 2;
+                            continue;
+                        }
+                        out.push('"');
+                        i += 1;
+                        break;
+                    }
+                    let ch = sql[i..].chars().next().expect("char boundary");
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+            // Dollar-quoted body: $tag$ … $tag$ (function bodies, JSON blobs).
+            b'$' => match dollar_tag(bytes, i) {
+                Some(tag_len) => {
+                    let tag = &sql[i..i + tag_len];
+                    out.push_str(tag);
+                    i += tag_len;
+                    match sql[i..].find(tag) {
+                        Some(rel) => {
+                            out.push_str(&sql[i..i + rel + tag_len]);
+                            i += rel + tag_len;
+                        }
+                        None => {
+                            // Unterminated — copy the rest verbatim.
+                            out.push_str(&sql[i..]);
+                            i = len;
+                        }
+                    }
+                }
+                None => {
+                    out.push('$');
+                    i += 1;
+                }
+            },
+            // `-- …` to end of line.
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                let end = sql[i..].find('\n').map(|r| i + r).unwrap_or(len);
+                out.push_str(&sql[i..end]);
+                i = end;
+            }
+            // `/* … */`, which nests in Postgres.
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                let mut depth = 0usize;
+                let start = i;
+                while i < len {
+                    if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                out.push_str(&sql[start..i.min(len)]);
+            }
+            _ => {
+                let ch = sql[i..].chars().next().expect("char boundary");
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
     }
     out
 }
 
-/// Replace occurrences of `<schema>.` in `sql` with empty string, but only
-/// when the `<schema>` token starts at a position that is not part of a
-/// longer identifier (i.e., preceded by whitespace, `(`, `,`, or start-of-string).
-///
-/// The needle is always ASCII (schema names are lowercase identifiers), so
-/// byte-level indexing is safe for the needle comparison. We iterate char
-/// by char for correct UTF-8 handling of the surrounding SQL text.
-fn replace_schema_prefix(sql: &str, schema: &str) -> String {
-    // needle is always lowercase ASCII (schema names are validated identifiers).
-    let needle_lc = format!("{schema}.");
-    // Build a needle that we can compare case-insensitively. Since schema is
-    // ASCII-only, we can use eq_ignore_ascii_case on byte slices.
-    let nlen = needle_lc.len(); // byte length == char length (ASCII only)
-
-    let sql_bytes = sql.as_bytes();
-    let len = sql_bytes.len();
-
-    let mut out = String::with_capacity(sql.len());
-    let mut pos = 0usize; // byte position in `sql`
-
-    while pos < len {
-        // Try a match at `pos`. The needle is pure ASCII so byte offsets are
-        // char-aligned for the needle itself. We still must advance by full
-        // UTF-8 characters when no match.
-        if pos + nlen <= len {
-            // Only consider the match if the current position is at a char
-            // boundary (always true since we advance char by char below).
-            let candidate = &sql_bytes[pos..pos + nlen];
-            // Case-insensitive ASCII comparison.
-            let matches = candidate.eq_ignore_ascii_case(needle_lc.as_bytes());
-            if matches {
-                // Validate: preceding byte must not be an identifier char.
-                let prev_ok = if pos == 0 {
-                    true
-                } else {
-                    let prev = sql_bytes[pos - 1];
-                    // ASCII identifier chars: [a-zA-Z0-9_]
-                    !prev.is_ascii_alphanumeric() && prev != b'_'
-                };
-                if prev_ok {
-                    // Skip the schema prefix — advance past the needle.
-                    pos += nlen;
-                    continue;
-                }
+/// If a schema qualifier starts at `i` — bare (`app.`) or double-quoted
+/// (`"app".`, the form ORMs such as drizzle-kit emit) — return its byte length.
+/// Case-insensitive: schema names are ASCII identifiers stored lowercase.
+fn match_schema_qualifier(bytes: &[u8], i: usize, schemas: &[String]) -> Option<usize> {
+    for schema in schemas {
+        for needle in [format!("{schema}."), format!("\"{schema}\".")] {
+            let n = needle.len();
+            if i + n <= bytes.len() && bytes[i..i + n].eq_ignore_ascii_case(needle.as_bytes()) {
+                return Some(n);
             }
         }
-        // Advance one char (UTF-8 safe).
-        let ch = sql[pos..].chars().next().unwrap();
-        out.push(ch);
-        pos += ch.len_utf8();
     }
-    out
+    None
 }
+
+/// The `$tag$` opener at `i`, if there is one (`$$` counts, tag empty).
+fn dollar_tag(bytes: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+        j += 1;
+    }
+    (j < bytes.len() && bytes[j] == b'$').then_some(j - i + 1)
+}
+
+
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -918,5 +973,72 @@ mod resolution_tests {
         let ss = state();
         let err = table_name_from_object(&obj(&["badschema", "events"]), &ss).unwrap_err();
         assert!(matches!(err, BasinError::NotFound(_)));
+    }
+
+    /// THE STRIPPER MUST NOT REACH INSIDE STRING LITERALS.
+    ///
+    /// `strip_schema_qualifiers_for_session` runs over the raw bytes of EVERY
+    /// SELECT/DML before DataFusion sees it, and `public` is always in the
+    /// session's schema set. It removed any `<schema>.` whose preceding byte was
+    /// not an identifier char — and `/` is not an identifier char. So a URL in a
+    /// string literal had a chunk cut out of it: the query silently ran against
+    /// data the user never wrote, and comparisons against the value stopped
+    /// matching. Nothing errored.
+    #[test]
+    fn stripper_does_not_corrupt_string_literals() {
+        let ss = state();
+
+        let sql = "SELECT * FROM t WHERE url = 'https://public.example.com/x'";
+        let got = strip_schema_qualifiers_for_session(sql, &ss);
+        assert_eq!(
+            got, sql,
+            "a string literal must survive the schema stripper byte-for-byte"
+        );
+
+        // The same hazard for a user schema, and for the quoted ORM form.
+        ss.write().unwrap().insert("app".to_string());
+        let sql2 = "INSERT INTO t (msg) VALUES ('see app.example for details')";
+        assert_eq!(
+            strip_schema_qualifiers_for_session(sql2, &ss),
+            sql2,
+            "a user schema name inside a literal must not be stripped"
+        );
+
+        // ...while a REAL qualifier outside a literal is still stripped.
+        let sql3 = "SELECT * FROM app.events WHERE msg = 'app.events'";
+        assert_eq!(
+            strip_schema_qualifiers_for_session(sql3, &ss),
+            "SELECT * FROM events WHERE msg = 'app.events'",
+            "the qualifier is stripped, the literal is not"
+        );
+
+        // The quoted ORM form still works (drizzle-kit emits it) — that is the
+        // reason this rewrite exists at all.
+        assert_eq!(
+            strip_schema_qualifiers_for_session("SELECT * FROM \"app\".\"events\"", &ss),
+            "SELECT * FROM \"events\"",
+            "the quoted schema qualifier must still be stripped"
+        );
+
+        // An embedded quote ('') must not end the literal early and expose the
+        // rest of it to the stripper.
+        let sql4 = "SELECT 'it''s public.example.com' AS a, app.t.c FROM app.t";
+        assert_eq!(
+            strip_schema_qualifiers_for_session(sql4, &ss),
+            "SELECT 'it''s public.example.com' AS a, t.c FROM t",
+            "'' is an escaped quote, not the end of the literal"
+        );
+
+        // Comments and dollar-quoted bodies are not code either.
+        assert_eq!(
+            strip_schema_qualifiers_for_session("SELECT 1 -- see public.docs\n", &ss),
+            "SELECT 1 -- see public.docs\n",
+            "a line comment must not be rewritten"
+        );
+        assert_eq!(
+            strip_schema_qualifiers_for_session("SELECT $$app.raw$$ FROM app.t", &ss),
+            "SELECT $$app.raw$$ FROM t",
+            "a dollar-quoted body must not be rewritten"
+        );
     }
 }
