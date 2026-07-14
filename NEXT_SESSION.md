@@ -94,9 +94,9 @@ build/publish CI — Dockerfile + workflows exist), 5.32 (sample-app `npm` CI).
 - #54 — STUB-HUNT `a7e5a6b` findings (3 P0 + 7 P1 + 15 P2). Same.
 
 **E. Cross-repo (separate git repos, separate Cargo targets — zero contention):**
-- `/Users/pc/code/exo/basin-cli` — `TASKS.md`; ~5 tasks landed this session
+- `/Users/pc/code/basin-cli` — `TASKS.md`; ~5 tasks landed this session
   (dump/restore, gen-watch, cwd-fallback, projects tests). HTTP-API-client CLI.
-- `/Users/pc/code/exo/basin-cloud` — `TASKS.md`, T-127..T-144 (paired UI) + T-15x
+- `/Users/pc/code/basin-cloud` — `TASKS.md`, T-127..T-144 (paired UI) + T-15x
   backend; ~5 landed (T-154/155/156/157/158). Vite+React SPA + Axum `backend-rs`.
 
 ---

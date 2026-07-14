@@ -194,7 +194,7 @@ body as JSON, substitutes `payload` in the registered SQL body, executes.
 Compounding: ADR 0019 `docs/decisions/0019-declarative-baas-surface.md:153` promises:
 > TLS required by default; HTTP-only inbound webhooks rejected unless `BASIN_NET_ALLOW_PLAINTEXT_WEBHOOKS=true` (debug-only env, never set in prod).
 
-`grep -r BASIN_NET_ALLOW_PLAINTEXT_WEBHOOKS /Users/pc/code/exo/basin/crates /Users/pc/code/exo/basin/services` returns 0 hits. The flag is not implemented; nothing about the inbound handler examines the request scheme. Plaintext `http://` inbound is accepted with no extra log.
+`grep -r BASIN_NET_ALLOW_PLAINTEXT_WEBHOOKS /Users/pc/code/basin/crates /Users/pc/code/basin/services` returns 0 hits. The flag is not implemented; nothing about the inbound handler examines the request scheme. Plaintext `http://` inbound is accepted with no extra log.
 
 **Mitigation:** Either remove the inbound surface from the v0.1 ship, or add a per-webhook `secret` column + `X-Basin-Signature` HMAC verification with `subtle::ConstantTimeEq` before the SQL body runs. Wire the env-gate that ADR 0019 promises.
 
