@@ -341,20 +341,38 @@ pub(crate) async fn enforce_pk_on_insert(
     if data_files.is_empty() {
         return Ok(());
     }
-    if let Some(catalog_files) = storage.catalog_data_files(project, table).await {
-        let mut blooms: std::collections::HashMap<String, _> = catalog_files
-            .into_iter()
-            .filter(|f| !f.bloom_filters.is_empty())
-            .map(|f| (f.path.to_string(), f.bloom_filters))
-            .collect();
-        if !blooms.is_empty() {
-            for f in data_files.iter_mut() {
-                if let Some(b) = blooms.remove(f.path.as_ref()) {
-                    f.bloom_filters = b;
-                }
-            }
-        }
-    }
+    // PK BLOOM SOURCE (#78 OOM). The blooms are `BTreeMap<String, Vec<u8>>` of
+    // raw bloom bytes — megabytes per file on a keyed table. The old code
+    // OVERLAID them onto every listed file, on every COPY batch, by DEEP-CLONING
+    // the whole memoized catalog file list. At 272M rows that is gigabytes per
+    // 100k-row chunk, times 8 parallel COPY workers: it OOM-killed a 32 GB
+    // engine 112 times in one run and produced the "PK ingest decays with table
+    // size" curve we blamed on scan cost for months.
+    //
+    // Two facts make almost all of that work pointless:
+    //   1. the bloom is only PROBED for SMALL batches (see the
+    //      `<= PK_STREAMING_SMALL_BATCH` gate in `enforce_pk_streaming`) — a
+    //      bulk COPY chunk never looks at a bloom at all; and
+    //   2. even then it is only read, never mutated.
+    // So: build the bloom index only when a probe can actually happen, and
+    // BORROW it out of the memoized `Arc` instead of copying it.
+    let bloom_owner = if batch.num_rows() <= PK_STREAMING_SMALL_BATCH {
+        storage.catalog_data_files_shared(project, table).await
+    } else {
+        std::sync::Arc::new(None)
+    };
+    let bloom_idx: std::collections::HashMap<&str, &std::collections::BTreeMap<String, Vec<u8>>> =
+        bloom_owner
+            .as_ref()
+            .as_ref()
+            .map(|files| {
+                files
+                    .iter()
+                    .filter(|f| !f.bloom_filters.is_empty())
+                    .map(|f| (f.path.as_ref(), &f.bloom_filters))
+                    .collect()
+            })
+            .unwrap_or_default();
 
     // Pre-compute the tombstone set from the registry once, outside the file
     // loop.  We only attempt tombstone filtering for single-column PKs (the
@@ -434,28 +452,19 @@ pub(crate) async fn enforce_pk_on_insert(
                 single_i64_pk,
                 batch,
                 &data_files,
+                &bloom_idx,
                 &tombstone_keys,
                 pk_dt_for_tombstone.as_ref(),
             )
             .await;
             match res {
                 Err(BasinError::Storage(msg)) if attempts < 3 && msg.contains("get vortex") => {
+                    // Re-LIST after a merge swapped a file out from under us.
+                    // The bloom index is keyed by path off the memoized catalog
+                    // Arc, so it stays valid for whatever paths survive; no
+                    // re-overlay (and no multi-GB re-clone) is needed.
                     attempts += 1;
                     data_files = storage.list_data_files_with_stats(project, table).await?;
-                    if let Some(catalog_files) = storage.catalog_data_files(project, table).await {
-                        let mut blooms: std::collections::HashMap<String, _> = catalog_files
-                            .into_iter()
-                            .filter(|f| !f.bloom_filters.is_empty())
-                            .map(|f| (f.path.to_string(), f.bloom_filters))
-                            .collect();
-                        if !blooms.is_empty() {
-                            for f in data_files.iter_mut() {
-                                if let Some(b) = blooms.remove(f.path.as_ref()) {
-                                    f.bloom_filters = b;
-                                }
-                            }
-                        }
-                    }
                 }
                 other => return other,
             }
@@ -814,6 +823,7 @@ async fn enforce_pk_streaming(
     single_i64_pk: bool,
     batch: &RecordBatch,
     data_files: &[basin_storage::DataFile],
+    bloom_idx: &std::collections::HashMap<&str, &std::collections::BTreeMap<String, Vec<u8>>>,
     tombstone_keys: &std::collections::HashSet<Vec<u8>>,
     pk_dt_for_tombstone: Option<&DataType>,
 ) -> Result<()> {
@@ -951,7 +961,12 @@ async fn enforce_pk_streaming(
                 .as_ref()
                 .is_some_and(|k| k.len() <= PK_STREAMING_SMALL_BATCH)
         {
-            if let Some(bytes) = f.bloom_filters.get(&pk_columns[0]) {
+            let bloom_bytes = f.bloom_filters.get(&pk_columns[0]).or_else(|| {
+                bloom_idx
+                    .get(f.path.as_ref())
+                    .and_then(|b| b.get(&pk_columns[0]))
+            });
+            if let Some(bytes) = bloom_bytes {
                 if let Some(bloom) = basin_storage::bloom_from_bytes(bytes) {
                     let keys = batch_keys_i64.as_ref().unwrap();
                     let any_present =

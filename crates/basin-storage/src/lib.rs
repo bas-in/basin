@@ -1788,6 +1788,29 @@ impl Storage {
         project: &ProjectId,
         table: &TableName,
     ) -> Option<Vec<DataFile>> {
+        (*self.catalog_data_files_shared(project, table).await).clone()
+    }
+
+    /// Like [`catalog_data_files`](Self::catalog_data_files) but hands back the
+    /// memoized `Arc` instead of a DEEP COPY of it.
+    ///
+    /// `DataFile::bloom_filters` is a `BTreeMap<String, Vec<u8>>` of raw bloom
+    /// bytes — megabytes per file on a keyed table. Cloning the whole file list
+    /// therefore copies every bloom in the table, and the PK-enforcement path
+    /// called it once per COPY batch, per worker: at 272M rows that was
+    /// gigabytes per 100k-row chunk across 8 workers, and it OOM-killed a 32 GB
+    /// engine 112 times in one run (anon-rss 32.5 GB). The "PK ingest decays
+    /// with table size" result was never scan cost — it was this, thrashing on
+    /// OOM-restart.
+    ///
+    /// Callers that only READ the list (the PK bloom/zone-map prune) must take
+    /// this and borrow. `catalog_data_files` stays for the callers that need an
+    /// owned copy.
+    pub async fn catalog_data_files_shared(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Arc<Option<Vec<DataFile>>> {
         // #78: memoize on catalog epoch so a long PK-checked COPY skips the
         // per-batch O(files) `load_table` between commits. See `catalog_files_memo`.
         let epoch = self.inner.catalog.get().map(|c| c.epoch());
@@ -1799,13 +1822,13 @@ impl Storage {
                     .map(|(_, v)| v.clone())
             };
             if let Some(v) = hit {
-                return (*v).clone();
+                return v;
             }
         }
-        let built = self.catalog_live_data_files(project, table).await;
+        let built = Arc::new(self.catalog_live_data_files(project, table).await);
         if let Some(e) = epoch {
             let mut map = self.inner.catalog_files_memo.lock().expect("memo poisoned");
-            memo_insert_bounded(&mut map, (*project, table.clone()), (e, Arc::new(built.clone())));
+            memo_insert_bounded(&mut map, (*project, table.clone()), (e, built.clone()));
         }
         built
     }
