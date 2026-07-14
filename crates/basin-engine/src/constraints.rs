@@ -337,7 +337,13 @@ pub(crate) async fn enforce_pk_on_insert(
     // conservative and correct. The pruner is fail-safe throughout: empty
     // `column_stats` → `Mixed` (file read), empty `bloom_filters` → no prune
     // (file read), so an uncataloged file can never be wrongly skipped.
-    let mut data_files = storage.list_data_files_with_stats(project, table).await?;
+    // Candidate set from the CATALOG (zero RPCs) + any file this process wrote
+    // but has not yet seen committed — see `Storage::pk_candidate_files`. This
+    // used to be a full object-store LIST on every batch, on every worker: the
+    // single dominant cost of keyed ingest at depth (a PK 1B load decayed from
+    // 319k r/s to ~20k by 300M rows, and the LISTs were timing out against the
+    // store under the very load they were gating).
+    let mut data_files = storage.pk_candidate_files(project, table).await?;
     if data_files.is_empty() {
         return Ok(());
     }

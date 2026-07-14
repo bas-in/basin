@@ -525,7 +525,29 @@ struct Inner {
     /// std `Mutex`, held only for the map probe/insert, never across an await.
     list_stats_memo: Mutex<HashMap<(ProjectId, TableName), (u64, Arc<Vec<DataFile>>)>>,
     catalog_files_memo: Mutex<HashMap<(ProjectId, TableName), (u64, Arc<Option<Vec<DataFile>>>)>>,
+    /// Files this process has WRITTEN but not yet seen in the catalog's live
+    /// set. A file exists on the object store from the moment it is put, but it
+    /// only enters the catalog when its commit lands — so the PK check, which
+    /// sources its candidate files from the catalog to avoid a per-batch LIST
+    /// (see [`Storage::pk_candidate_files`]), needs this window covered or it
+    /// could miss a duplicate against a flushed-but-uncommitted file. Entries
+    /// are dropped as soon as the catalog reports the path live, so in steady
+    /// state this holds only the handful of files currently in flight.
+    uncommitted_files: Mutex<HashMap<(ProjectId, TableName), HashMap<String, DataFile>>>,
+    /// One-time per-table snapshot of on-store files the catalog does not know
+    /// about — orphans left by a previous process. See
+    /// [`Storage::pk_candidate_files`].
+    pk_orphan_baseline: Mutex<HashMap<(ProjectId, TableName), Arc<Vec<DataFile>>>>,
 }
+
+/// Per-table cap on [`Inner::uncommitted_files`]. Steady state is a handful of
+/// in-flight files; overflow means commits are failing, and rather than drop an
+/// entry (which would blind the PK check to a real file) we fall back to the
+/// authoritative LIST.
+const UNCOMMITTED_FILES_MAX_PER_TABLE: usize = 1024;
+
+/// Marks an overflowed [`Inner::uncommitted_files`] entry. Not a real path.
+const OVERFLOW_SENTINEL: &str = "\0overflow\0";
 
 /// Max distinct (project, table) entries held in the constraint-enforcement
 /// file-set memos ([`Inner::list_stats_memo`] / [`Inner::catalog_files_memo`]).
@@ -852,6 +874,8 @@ impl Storage {
                 bucket_pool: OnceLock::new(),
                 list_stats_memo: Mutex::new(HashMap::new()),
                 catalog_files_memo: Mutex::new(HashMap::new()),
+                uncommitted_files: Mutex::new(HashMap::new()),
+                pk_orphan_baseline: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -1701,7 +1725,10 @@ impl Storage {
         partition: &basin_common::PartitionKey,
         batch: &RecordBatch,
     ) -> Result<DataFile> {
-        writer::write_batch(self, project, table, partition, batch).await
+        let df = writer::write_batch(self, project, table, partition, batch).await?;
+        // Every path that puts a file must record it — see `pk_candidate_files`.
+        self.note_uncommitted_file(project, table, &df);
+        Ok(df)
     }
 
     /// Like [`write_batch`](Self::write_batch) but with explicit per-write
@@ -1718,7 +1745,149 @@ impl Storage {
         batch: &RecordBatch,
         opts: &WriteOptions,
     ) -> Result<DataFile> {
-        writer::write_batch_with_options(self, project, table, partition, batch, opts).await
+        let df = writer::write_batch_with_options(self, project, table, partition, batch, opts).await?;
+        // A file EXISTS the moment it is written, but it is not in the catalog
+        // until its commit lands. `pk_candidate_files` sources the PK check from
+        // the catalog (zero RPCs) instead of a per-batch LIST, so it needs this
+        // window covered or a duplicate key could slip in against a flushed-but-
+        // uncommitted file. Record it; the entry is dropped as soon as the
+        // catalog reports the path live.
+        self.note_uncommitted_file(project, table, &df);
+        Ok(df)
+    }
+
+    /// Remember a file this process just wrote but has not yet seen committed.
+    /// See [`pk_candidate_files`](Self::pk_candidate_files).
+    fn note_uncommitted_file(&self, project: &ProjectId, table: &TableName, df: &DataFile) {
+        let mut map = self.inner.uncommitted_files.lock().expect("memo poisoned");
+        let entry = map.entry((*project, table.clone())).or_default();
+        // Cap: in steady state a drain/merge output is committed within
+        // milliseconds and pruned below, so this stays tiny. If it ever grows
+        // past the cap (a table whose commits are all failing), we do NOT drop
+        // entries — dropping one would blind the PK check to a real file.
+        // `pk_candidate_files` sees the overflow and falls back to the LIST.
+        if entry.len() < UNCOMMITTED_FILES_MAX_PER_TABLE {
+            entry.insert(df.path.as_ref().to_string(), df.clone());
+        } else {
+            entry.insert(OVERFLOW_SENTINEL.to_string(), df.clone());
+        }
+    }
+
+
+    /// The files this process wrote that the catalog has not yet reported live.
+    fn uncommitted_files_for(&self, project: &ProjectId, table: &TableName) -> Vec<DataFile> {
+        let map = self.inner.uncommitted_files.lock().expect("memo poisoned");
+        map.get(&(*project, table.clone()))
+            .map(|e| {
+                e.iter()
+                    .filter(|(p, _)| p.as_str() != OVERFLOW_SENTINEL)
+                    .map(|(_, f)| f.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The file set the PRIMARY-KEY check must scan: every file that could hold
+    /// a colliding key.
+    ///
+    /// This used to be a full object-store LIST (`list_data_files_with_stats`)
+    /// on EVERY COPY batch, on EVERY worker. Measured on a 300M-row PK table:
+    /// 1,236 objects, 2 pages, 600-770ms per LIST when the store is idle — and
+    /// under ingest those same LISTs hit the store's request timeouts and retry,
+    /// costing seconds each. Eight workers x 10k-row batches / a ~4s LIST caps
+    /// ingest around 20k rows/s, which is exactly the floor a PK 1B load decayed
+    /// to (319k r/s at the start, ~20k by 300M). The existing epoch memo cannot
+    /// help: the epoch is global and every drain commit and merge bumps it, so
+    /// during ingest it is invalidated many times a second.
+    ///
+    /// The catalog can answer the same question with ZERO RPCs. It is not a
+    /// complete file index on its own (a file exists from the moment it is
+    /// written; a direct `write_batch` on a non-shard path never gets a catalog
+    /// row at all) — so the candidate set is the catalog's live files UNION the
+    /// files this process wrote and has not yet seen committed. A file is in one
+    /// or the other, so a duplicate key cannot be missed. When no catalog is
+    /// attached, or the uncommitted set overflowed, fall back to the LIST.
+    pub async fn pk_candidate_files(
+        &self,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> Result<Vec<DataFile>> {
+        let Some(catalog_files) = (*self.catalog_data_files_shared(project, table).await).clone()
+        else {
+            // No catalog attached (raw-`Storage` tests) or the catalog has no
+            // record of this table: the object store is the only source of
+            // truth. Still union the uncommitted writes — `list_data_files_with_stats`
+            // is itself memoized on the (global) catalog epoch, so between
+            // commits it can hand back a set that predates a file we just wrote.
+            let mut listed = self.list_data_files_with_stats(project, table).await?;
+            let known: std::collections::HashSet<String> =
+                listed.iter().map(|f| f.path.as_ref().to_string()).collect();
+            listed.extend(
+                self.uncommitted_files_for(project, table)
+                    .into_iter()
+                    .filter(|f| !known.contains(f.path.as_ref())),
+            );
+            return Ok(listed);
+        };
+
+        // Files this process did not write and the catalog does not know about:
+        // orphans a PREVIOUS process left on the store (written, never
+        // committed). The read path enumerates the object store, so their rows
+        // are visible to queries — which means the PK check must see them too,
+        // or it would admit a "duplicate" of a readable row. They cannot appear
+        // after startup (anything written from here on is tracked above), so we
+        // pay ONE LIST per table per process to capture them, not one per batch.
+        let baseline = {
+            let hit = {
+                let map = self.inner.pk_orphan_baseline.lock().expect("memo poisoned");
+                map.get(&(*project, table.clone())).cloned()
+            };
+            match hit {
+                Some(v) => v,
+                None => {
+                    let listed = self.list_data_files_with_stats(project, table).await?;
+                    let known: std::collections::HashSet<&str> =
+                        catalog_files.iter().map(|f| f.path.as_ref()).collect();
+                    let orphans: Vec<DataFile> = listed
+                        .into_iter()
+                        .filter(|f| !known.contains(f.path.as_ref()))
+                        .collect();
+                    let v = Arc::new(orphans);
+                    let mut map = self.inner.pk_orphan_baseline.lock().expect("memo poisoned");
+                    map.insert((*project, table.clone()), v.clone());
+                    v
+                }
+            }
+        };
+
+        let live: std::collections::HashSet<&str> =
+            catalog_files.iter().map(|f| f.path.as_ref()).collect();
+        // Lock scope holds no await: take what we need and release.
+        let (overflowed, extra) = {
+            let mut map = self.inner.uncommitted_files.lock().expect("memo poisoned");
+            match map.get_mut(&(*project, table.clone())) {
+                Some(entry) if entry.contains_key(OVERFLOW_SENTINEL) => (true, Vec::new()),
+                Some(entry) => {
+                    // Anything the catalog now calls live is no longer "uncommitted".
+                    entry.retain(|path, _| !live.contains(path.as_str()));
+                    (false, entry.values().cloned().collect::<Vec<DataFile>>())
+                }
+                None => (false, Vec::new()),
+            }
+        };
+        if overflowed {
+            return self.list_data_files_with_stats(project, table).await;
+        }
+
+        let mut out = catalog_files;
+        let mut seen: std::collections::HashSet<String> =
+            out.iter().map(|f| f.path.as_ref().to_string()).collect();
+        for f in baseline.iter().cloned().chain(extra) {
+            if seen.insert(f.path.as_ref().to_string()) {
+                out.push(f);
+            }
+        }
+        Ok(out)
     }
 
     /// Stream all rows for one project+table that match the read options.
@@ -3136,6 +3305,78 @@ mod tests {
     /// uncataloged on-disk files. Stats enrichment (skipping footer fetches
     /// for catalog-known files) is exercised separately by
     /// `tests/read_stats_pruning.rs`.
+    /// The PK check's candidate set may skip the per-batch LIST, but it may
+    /// NEVER skip a file that could hold a colliding key.
+    ///
+    /// Three ways a file can exist without being in the catalog's live set, all
+    /// of which must still be scanned:
+    ///   1. this process wrote it and the commit has not landed yet (the drain
+    ///      window — a file exists the instant it is put),
+    ///   2. a previous process left it behind (written, never committed), and
+    ///   3. it was written directly via `write_batch` (non-shard paths / tests)
+    ///      and will never get a catalog row at all.
+    /// Missing any of them lets a duplicate key through, which is the one thing
+    /// a PRIMARY KEY may not do.
+    #[tokio::test]
+    async fn pk_candidates_include_files_the_catalog_does_not_know() {
+        use basin_catalog::InMemoryCatalog;
+
+        basin_common::telemetry::try_init_for_tests();
+        let dir = TempDir::new().unwrap();
+        let project = ProjectId::new();
+        let table = TableName::new("t").unwrap();
+        let part = PartitionKey::default_key();
+
+        // A file left on the store by a PREVIOUS process: write it through one
+        // Storage, then build a fresh Storage over the same directory so its
+        // uncommitted-file tracking starts empty (case 2 / case 3).
+        {
+            let s0 = storage_in(&dir);
+            let catalog0 = Arc::new(InMemoryCatalog::new());
+            s0.attach_catalog(catalog0.clone());
+            catalog0.create_namespace(&project).await.unwrap();
+            catalog0.create_table(&project, &table, &small_schema()).await.unwrap();
+            s0.write_batch(&project, &table, &part, &small_batch(0, 3, "old-"))
+                .await
+                .unwrap();
+        }
+
+        let s = storage_in(&dir);
+        let catalog = Arc::new(InMemoryCatalog::new());
+        s.attach_catalog(catalog.clone());
+        catalog.create_namespace(&project).await.unwrap();
+        catalog.create_table(&project, &table, &small_schema()).await.unwrap();
+
+        // Warm the candidate set FIRST, so the one-time orphan LIST is already
+        // taken. Only the uncommitted-write tracking can cover a file written
+        // after this point — which is exactly the drain window in production
+        // (every flushed file appears while COPY batches are being checked).
+        let warm = s.pk_candidate_files(&project, &table).await.unwrap();
+        assert_eq!(warm.len(), 1, "the previous process's orphan must be seen");
+
+        // A file THIS process just wrote, not yet committed to the catalog (case 1).
+        let fresh = s
+            .write_batch(&project, &table, &part, &small_batch(3, 3, "new-"))
+            .await
+            .unwrap();
+
+        let candidates = s.pk_candidate_files(&project, &table).await.unwrap();
+        let paths: Vec<&str> = candidates.iter().map(|f| f.path.as_ref()).collect();
+
+        assert!(
+            paths.iter().any(|p| *p == fresh.path.as_ref()),
+            "the just-written, not-yet-committed file must be a PK candidate — \
+             skipping it lets a duplicate land against a flushed-but-uncommitted \
+             file. got {paths:?}"
+        );
+        assert_eq!(
+            candidates.len(),
+            2,
+            "both on-store files (the previous process's orphan and this \
+             process's uncommitted write) must be candidates; got {paths:?}"
+        );
+    }
+
     #[tokio::test]
     async fn list_data_files_lists_object_store_not_catalog() {
         use basin_catalog::{DataFileRef, InMemoryCatalog, SnapshotId};
