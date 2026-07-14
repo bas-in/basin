@@ -3038,6 +3038,7 @@ impl ObjectStoreCatalog {
 
 fn storage_err(ctx: &str, e: object_store::Error) -> BasinError {
     BasinError::catalog(format!("object-store catalog {ctx}: {e}"))
+
 }
 
 #[async_trait]
@@ -3214,31 +3215,49 @@ impl Catalog for ObjectStoreCatalog {
             // land exactly once.
             let meta_removed: Vec<String> = remaining.into_iter().collect();
 
+            // ── ONE logical swap, N physical chains (#78 DUPLICATE-ROW BUG).
+            //
+            // The adds land in ONE chain; every other chain that owns an input
+            // needs its own remove commit. Those commits are separate OCC
+            // operations against chains that live ingest is APPENDING to, so a
+            // `CommitConflict` on them is routine, not exceptional.
+            //
+            // This used to be a bare `?` in a loop with no retry: one lost race
+            // and the whole call returned Err with the ADDS ALREADY COMMITTED
+            // and the un-processed chains' inputs still live — so every row in
+            // them existed TWICE. Measured on a PK 1B load (flat78u): 131.59M
+            // duplicate rows, ~30% of the table, every id in [0,2M) present
+            // exactly twice. Nothing was lost; rows were re-materialized.
+            //
+            // Adds-before-removes is the right ORDER (the reverse would lose
+            // rows instead of duplicating them, which is worse), so the fix is
+            // to make the removes actually complete: retry each against a fresh
+            // snapshot, and if one still can't land, COMPENSATE — undo the adds
+            // and restore the inputs the add-commit removed, putting the table
+            // back exactly where it started. Duplicates are never left behind
+            // silently; if even the compensation fails we say so, loudly.
             if !meta_removed.is_empty() || by_partition.is_empty() {
                 // META chain owns some removed paths (or there were none in any
                 // partition) → commit the adds here together with META removes.
+                let undo = self
+                    .live_refs_for_paths_meta(project, &qtable, &meta_removed)
+                    .await;
                 self.commit_snapshot(
                     project,
                     &qtable,
                     expected_snapshot,
                     SnapshotOperation::Replace,
                     meta_removed,
-                    added_files,
+                    added_files.clone(),
                 )
                 .await?;
-                // Partition removes (if any) are committed without re-adding.
-                for (pid, paths) in by_partition {
-                    let (_pv, segment) = self.load_part_current(project, &qtable, generation, &pid).await?;
-                    self.commit_part_snapshot(
-                        project,
-                        &qtable,
-                        &pid,
-                        segment.current_snapshot,
-                        SnapshotOperation::Replace,
-                        paths,
-                        Vec::new(),
-                    )
-                    .await?;
+                if let Err(e) = self
+                    .finish_partition_removes(project, &qtable, generation, by_partition)
+                    .await
+                {
+                    self.compensate_meta_adds(project, &qtable, &added_files, undo, &e)
+                        .await;
+                    return Err(e);
                 }
             } else {
                 // All removed paths live in partition segments. Attach the adds
@@ -3246,6 +3265,16 @@ impl Catalog for ObjectStoreCatalog {
                 let mut iter = by_partition.into_iter();
                 let (first_pid, first_paths) = iter.next().expect("non-empty by_partition");
                 let (_pv, seg0) = self.load_part_current(project, &qtable, generation, &first_pid).await?;
+                // Capture the input refs this commit is about to retire, so the
+                // compensation below can put them back verbatim. The files
+                // themselves are still on the object store: physical deletion is
+                // deferred (superseded-delete grace) and refuses to touch a path
+                // the catalog still calls live.
+                let undo: Vec<DataFileRef> = seg0
+                    .live_data_files()
+                    .into_iter()
+                    .filter(|f| first_paths.contains(&f.path))
+                    .collect();
                 self.commit_part_snapshot(
                     project,
                     &qtable,
@@ -3253,21 +3282,19 @@ impl Catalog for ObjectStoreCatalog {
                     seg0.current_snapshot,
                     SnapshotOperation::Replace,
                     first_paths,
-                    added_files,
+                    added_files.clone(),
                 )
                 .await?;
-                for (pid, paths) in iter {
-                    let (_pv, segment) = self.load_part_current(project, &qtable, generation, &pid).await?;
-                    self.commit_part_snapshot(
-                        project,
-                        &qtable,
-                        &pid,
-                        segment.current_snapshot,
-                        SnapshotOperation::Replace,
-                        paths,
-                        Vec::new(),
+                let rest: HashMap<String, Vec<String>> = iter.collect();
+                if let Err(e) = self
+                    .finish_partition_removes(project, &qtable, generation, rest)
+                    .await
+                {
+                    self.compensate_part_adds(
+                        project, &qtable, generation, &first_pid, &added_files, undo, &e,
                     )
-                    .await?;
+                    .await;
+                    return Err(e);
                 }
             }
             // Return a fresh unioned read so the caller sees the complete set.
@@ -4769,6 +4796,169 @@ impl Catalog for ObjectStoreCatalog {
 }
 
 impl ObjectStoreCatalog {
+    /// The live [`DataFileRef`]s on the META chain for `paths`, captured so a
+    /// failed multi-chain replace can put them back (see `replace_data_files`).
+    async fn live_refs_for_paths_meta(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        paths: &[String],
+    ) -> Vec<DataFileRef> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        match self.load_current(project, qtable).await {
+            Ok((_v, manifest)) => manifest
+                .to_metadata(project, &qtable.name)
+                .live_data_files()
+                .into_iter()
+                .filter(|f| paths.contains(&f.path))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Commit the remove-only half of a multi-chain replace: for each partition
+    /// chain, retire the inputs it owns.
+    ///
+    /// Retries on `CommitConflict` against a FRESH snapshot, because these
+    /// chains are exactly the ones live ingest is appending to — losing the race
+    /// once is normal. Paths already gone from a chain (a concurrent merge beat
+    /// us to them) are dropped from the remove set rather than re-removed, and a
+    /// chain with nothing left to remove is a no-op success.
+    async fn finish_partition_removes(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        generation: u64,
+        by_partition: HashMap<String, Vec<String>>,
+    ) -> Result<()> {
+        const MAX_ATTEMPTS: u32 = 5;
+        for (pid, paths) in by_partition {
+            let mut attempt = 0;
+            loop {
+                let (_pv, segment) = self.load_part_current(project, qtable, generation, &pid).await?;
+                let live: std::collections::HashSet<String> = segment
+                    .live_data_files()
+                    .into_iter()
+                    .map(|f| f.path)
+                    .collect();
+                let still: Vec<String> =
+                    paths.iter().filter(|p| live.contains(*p)).cloned().collect();
+                if still.is_empty() {
+                    break; // nothing of ours left in this chain
+                }
+                match self
+                    .commit_part_snapshot(
+                        project,
+                        qtable,
+                        &pid,
+                        segment.current_snapshot,
+                        SnapshotOperation::Replace,
+                        still,
+                        Vec::new(),
+                    )
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(BasinError::CommitConflict(_)) if attempt + 1 < MAX_ATTEMPTS => {
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Undo the add-half of a multi-chain replace whose remove-half could not be
+    /// completed: retire the outputs and restore the inputs the add-commit
+    /// retired, leaving the table exactly as it was. Without this the outputs
+    /// stay live alongside inputs that were never removed — duplicate rows.
+    async fn compensate_part_adds(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        generation: u64,
+        pid: &str,
+        added_files: &[DataFileRef],
+        restore: Vec<DataFileRef>,
+        cause: &BasinError,
+    ) {
+        let added_paths: Vec<String> = added_files.iter().map(|f| f.path.clone()).collect();
+        for _ in 0..5 {
+            let Ok((_pv, segment)) = self.load_part_current(project, qtable, generation, pid).await
+            else {
+                break;
+            };
+            match self
+                .commit_part_snapshot(
+                    project,
+                    qtable,
+                    pid,
+                    segment.current_snapshot,
+                    SnapshotOperation::Replace,
+                    added_paths.clone(),
+                    restore.clone(),
+                )
+                .await
+            {
+                Ok(_) => return,
+                Err(BasinError::CommitConflict(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        tracing::error!(
+            %project,
+            table = %qtable,
+            partition = %pid,
+            outputs = ?added_paths,
+            cause = %cause,
+            "replace_data_files: could not complete the remove-half NOR undo the adds — the \
+             table's outputs are live alongside inputs that were never retired, so those rows \
+             are DUPLICATED (count > distinct). Manual reconciliation required.",
+        );
+    }
+
+    /// META-chain twin of [`compensate_part_adds`](Self::compensate_part_adds).
+    async fn compensate_meta_adds(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        added_files: &[DataFileRef],
+        restore: Vec<DataFileRef>,
+        cause: &BasinError,
+    ) {
+        let added_paths: Vec<String> = added_files.iter().map(|f| f.path.clone()).collect();
+        for _ in 0..5 {
+            let Ok((_v, manifest)) = self.load_current(project, qtable).await else {
+                break;
+            };
+            match self
+                .commit_snapshot(
+                    project,
+                    qtable,
+                    manifest.current_snapshot,
+                    SnapshotOperation::Replace,
+                    added_paths.clone(),
+                    restore.clone(),
+                )
+                .await
+            {
+                Ok(_) => return,
+                Err(BasinError::CommitConflict(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        tracing::error!(
+            %project,
+            table = %qtable,
+            outputs = ?added_paths,
+            cause = %cause,
+            "replace_data_files: could not complete the remove-half NOR undo the adds (META) — \
+             rows are DUPLICATED (count > distinct). Manual reconciliation required.",
+        );
+    }
     fn project_meta_key(&self, project: &ProjectId, name: &str) -> OsPath {
         OsPath::from(format!("{}{}/_project/{}", self.root, project, name))
     }
@@ -5507,6 +5697,184 @@ mod tests {
 
     fn cat() -> ObjectStoreCatalog {
         ObjectStoreCatalog::new(Arc::new(InMemory::new()))
+    }
+
+    /// An `InMemory` store that can be armed to fail every PUT whose key
+    /// contains a given substring. Used to reproduce the #78 duplicate-row bug:
+    /// a multi-chain `replace_data_files` commits the ADDS to one chain and then
+    /// needs a separate commit per remaining chain — if one of those fails, the
+    /// outputs are live while the un-retired inputs are ALSO live, and every row
+    /// in them exists twice.
+    #[derive(Debug)]
+    struct PutFailAfterArm {
+        inner: InMemory,
+        armed_for: std::sync::Mutex<Option<String>>,
+    }
+
+    impl PutFailAfterArm {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                armed_for: std::sync::Mutex::new(None),
+            }
+        }
+        fn arm(&self, needle: &str) {
+            *self.armed_for.lock().unwrap() = Some(needle.to_string());
+        }
+        fn should_fail(&self, location: &OsPath) -> bool {
+            self.armed_for
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|n| location.as_ref().contains(n))
+        }
+    }
+
+    impl std::fmt::Display for PutFailAfterArm {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PutFailAfterArm")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for PutFailAfterArm {
+        async fn put_opts(
+            &self,
+            location: &OsPath,
+            payload: object_store::PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if self.should_fail(location) {
+                return Err(object_store::Error::Generic {
+                    store: "PutFailAfterArm",
+                    source: "injected PUT failure".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &OsPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &OsPath,
+            opts: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, opts).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<OsPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<OsPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &OsPath,
+            to: &OsPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// #78 — A REPLACE THAT SPANS CHAINS MUST NEVER LEAVE ROWS LIVE TWICE.
+    ///
+    /// `replace_data_files` is the API stripe-merge / tiering / CoW sweeps use
+    /// when they don't know which chain owns a path. One logical swap becomes
+    /// SEVERAL physical commits: the adds go with the first chain's removes,
+    /// then one remove-commit per remaining chain. Those later commits race live
+    /// ingest on those chains, and they used to be a bare `?` in a loop with no
+    /// retry — so a single failure returned Err with the OUTPUTS ALREADY LIVE
+    /// and the other chains' inputs never retired. Every row in them was then
+    /// counted twice.
+    ///
+    /// This is not hypothetical: a PK 1B load (flat78u) ended with 131,590,000
+    /// duplicate rows — ~30% of the table, every id in [0,2M) present exactly
+    /// twice — while losing nothing. PK tables are the exposed ones because
+    /// stripe-merge (the cross-partition merger) only runs when a single-column
+    /// PK is the sort order.
+    ///
+    /// The call may still FAIL (the remove genuinely could not be committed) —
+    /// what it may not do is leave the table holding both copies.
+    #[tokio::test]
+    async fn multi_chain_replace_never_leaves_duplicate_rows() {
+        let store = Arc::new(PutFailAfterArm::new());
+        let c = ObjectStoreCatalog::new(store.clone() as Arc<dyn ObjectStore>);
+        let p = ProjectId::new();
+        let t = TableName::new("striped").unwrap();
+        c.create_namespace(&p).await.unwrap();
+        c.create_table(&p, &t, &schema()).await.unwrap();
+
+        // Two partition chains, 10 rows each — the shape a fanned-out COPY
+        // produces (ingest round-robins across partitions).
+        let s0 = c.current_snapshot_id_in_partition(&p, &t, "s0").await.unwrap();
+        c.append_data_files_in_partition(&p, &t, "s0", s0, vec![file("s0/a.vortex", 10)])
+            .await
+            .unwrap();
+        let s1 = c.current_snapshot_id_in_partition(&p, &t, "s1").await.unwrap();
+        c.append_data_files_in_partition(&p, &t, "s1", s1, vec![file("s1/b.vortex", 10)])
+            .await
+            .unwrap();
+
+        let head = c.current_snapshot_id(&p, &t).await.unwrap();
+
+        // The merge: read both inputs, write ONE 20-row output, swap them out.
+        // Arm the store so the SECOND chain's remove-commit cannot land — the
+        // production failure (OCC conflict against concurrent ingest, or a 408).
+        store.arm("/parts/s1/");
+        let res = c
+            .replace_data_files(
+                &p,
+                &t,
+                head,
+                vec!["s0/a.vortex".into(), "s1/b.vortex".into()],
+                vec![file("merged.vortex", 20)],
+            )
+            .await;
+
+        // Whatever the outcome, the live set must account for each row ONCE.
+        let live: Vec<DataFileRef> = c
+            .load_table(&p, &t)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .collect();
+        let paths: Vec<&str> = live.iter().map(|f| f.path.as_str()).collect();
+        let rows: u64 = live.iter().map(|f| f.row_count).sum();
+
+        assert_eq!(
+            rows, 20,
+            "live rows must stay 20 — got {rows} from {paths:?}. \
+             (merged.vortex live ALONGSIDE the inputs it merged = every row twice: \
+             this is the flat78u 131.59M-duplicate bug.)"
+        );
+        // Either the merge fully landed, or it fully unwound. Never half.
+        let merged_live = paths.contains(&"merged.vortex");
+        let inputs_live =
+            paths.contains(&"s0/a.vortex") || paths.contains(&"s1/b.vortex");
+        assert!(
+            merged_live ^ inputs_live,
+            "outputs and inputs must not both be live: {paths:?} (res={res:?})"
+        );
     }
 
     // --- Test 1: basic round-trip -----------------------------------------
