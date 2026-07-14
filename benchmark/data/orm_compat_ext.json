@@ -1,0 +1,577 @@
+{
+  "generated_at": "@1781275921",
+  "sections": [
+    {
+      "orm": "Prisma",
+      "total": 19,
+      "ok": 19,
+      "typed_error": 0,
+      "regression": 0,
+      "pass_rate_pct": 100.0,
+      "shapes": [
+        {
+          "sql": "SELECT \"members\".\"id\",\"members\".\"email\" FROM \"members\" ORDER BY \"members\".\"id\" ASC LIMIT 1 OFFSET 0",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\",\n               (SELECT COUNT(*) FROM \"events\" WHERE \"events\".\"member_id\" = \"members\".\"id\") AS \"_count_events\"\n           FROM \"members\" ORDER BY \"members\".\"id\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT COUNT(*) AS \"_count\", AVG(\"amount\") AS \"_avg_amount\", SUM(\"amount\") AS \"_sum_amount\" FROM \"events\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"member_id\", COUNT(*) AS \"_count\", SUM(\"amount\") AS \"_sum_amount\" FROM \"events\" GROUP BY \"member_id\" HAVING COUNT(*) > 0 ORDER BY \"member_id\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\" FROM \"members\" WHERE \"meta\"->>'plan' = 'pro'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\" FROM \"members\" WHERE \"meta\"#>>'{limits,0}' = '1'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\" FROM \"members\" WHERE \"role\" = 'ADMIN'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\" FROM \"members\" WHERE \"role\" IN ('ADMIN','OWNER')",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"members\" (\"id\",\"email\",\"role\") VALUES (50,'m50@x.com','USER'),(51,'m51@x.com','USER') ON CONFLICT DO NOTHING",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE \"members\" SET \"role\" = 'USER' WHERE \"role\" = 'OWNER'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "DELETE FROM \"members\" WHERE \"id\" IN (998,999)",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\",\"email\" FROM \"members\" WHERE \"deleted_at\" IS NULL ORDER BY \"id\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\",\"email\" FROM \"members\" WHERE \"id\" > $1 ORDER BY \"id\" ASC LIMIT $2 OFFSET $3",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\",\"email\" FROM \"members\" WHERE \"id\" = 1 LIMIT 1 FOR UPDATE",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"memberships\" (\"org_id\",\"user_id\",\"level\") VALUES (1,1,'admin')\n           ON CONFLICT (\"org_id\",\"user_id\") DO UPDATE SET \"level\" = EXCLUDED.\"level\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\", \"balance\"::numeric(12,2) * 1.1::numeric AS \"scaled\" FROM \"members\" WHERE \"balance\" IS NOT NULL",
+          "outcome": "ok"
+        },
+        {
+          "sql": "CREATE TYPE \"status_enum\" AS ENUM ('open','closed')",
+          "outcome": "ok"
+        },
+        {
+          "sql": "ALTER TYPE \"status_enum\" ADD VALUE 'archived'",
+          "outcome": "ok"
+        }
+      ]
+    },
+    {
+      "orm": "Drizzle",
+      "total": 16,
+      "ok": 13,
+      "typed_error": 3,
+      "regression": 0,
+      "pass_rate_pct": 81.25,
+      "shapes": [
+        {
+          "sql": "SELECT COUNT(DISTINCT \"role\") AS \"n\" FROM \"members\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"member_id\", COUNT(*) AS \"c\", SUM(\"amount\") AS \"s\", AVG(\"amount\") AS \"a\" FROM \"events\" GROUP BY \"member_id\" ORDER BY \"member_id\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\" FROM \"members\" WHERE \"role\" = 'USER' LIMIT 1 FOR UPDATE SKIP LOCKED",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\" FROM \"members\" WHERE \"id\" = 1 FOR UPDATE NOWAIT",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\" FROM \"members\" WHERE \"id\" = 1 FOR SHARE",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\" FROM \"members\" WHERE \"meta\"->>'plan' = 'free'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\" FROM \"members\" WHERE \"meta\" @> '{\"plan\":\"pro\"}'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\" FROM \"members\" WHERE \"tags\" && ARRAY['rust','python']",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: parse error: sql parser error: Expected: end of statement, found: arrays_overlap at Line: 1, Column: 40"
+        },
+        {
+          "sql": "SELECT \"id\" FROM \"members\" WHERE \"tags\" @> ARRAY['rust']",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: parse error: sql parser error: Expected: end of statement, found: list_has_all at Line: 1, Column: 40"
+        },
+        {
+          "sql": "UPDATE \"members\" SET \"version\" = \"version\" + 1 WHERE \"role\" = 'USER' RETURNING \"id\",\"version\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\",\"email\" FROM \"members\" WHERE (\"created_at\", \"id\") > ('2024-01-01 00:00:00+00'::timestamptz, 1) ORDER BY \"created_at\" ASC, \"id\" ASC LIMIT 5",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: plan: This feature is not implemented: Only identifiers and literals are supported in tuples"
+        },
+        {
+          "sql": "UPDATE \"members\" SET \"email\" = $1, \"version\" = \"version\" + 1 WHERE \"id\" = $2 AND \"version\" = $3",
+          "outcome": "ok"
+        },
+        {
+          "sql": "ALTER TABLE \"members\" ADD COLUMN \"nickname\" text",
+          "outcome": "ok"
+        },
+        {
+          "sql": "ALTER TABLE \"members\" DROP COLUMN \"nickname\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "CREATE INDEX \"members_role_idx\" ON \"members\" (\"role\")",
+          "outcome": "ok"
+        },
+        {
+          "sql": "ALTER TABLE \"members\" ADD CONSTRAINT \"members_email_uq\" UNIQUE (\"email\")",
+          "outcome": "ok"
+        }
+      ]
+    },
+    {
+      "orm": "Django",
+      "total": 25,
+      "ok": 19,
+      "typed_error": 6,
+      "regression": 0,
+      "pass_rate_pct": 76.0,
+      "shapes": [
+        {
+          "sql": "SELECT COUNT(*) AS \"__count\" FROM \"members\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT (1) AS \"a\" FROM \"members\" WHERE \"members\".\"role\" = 'ADMIN' LIMIT 1",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\",\"members\".\"created_at\" FROM \"members\" ORDER BY \"members\".\"created_at\" DESC LIMIT 1",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\" FROM \"members\" ORDER BY \"members\".\"id\" ASC LIMIT 1",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\" FROM \"members\" ORDER BY \"members\".\"id\" ASC",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"events\".\"member_id\", COUNT(\"events\".\"id\") AS \"n\", SUM(\"events\".\"amount\") AS \"total\", AVG(\"events\".\"amount\") AS \"avg\" FROM \"events\" GROUP BY \"events\".\"member_id\" ORDER BY \"events\".\"member_id\" ASC",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT DISTINCT ON (\"members\".\"role\") \"members\".\"role\",\"members\".\"id\" FROM \"members\" ORDER BY \"members\".\"role\" ASC, \"members\".\"id\" ASC",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: plan: Error during planning: SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\" FROM \"members\" WHERE \"members\".\"meta\" @> '{\"plan\": \"pro\"}'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\" FROM \"members\" WHERE \"members\".\"meta\" ? 'plan'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\" FROM \"members\" WHERE (\"members\".\"meta\" ->> 'plan') = 'pro'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\" FROM \"members\" WHERE \"members\".\"tags\" @> ARRAY['rust']::text[]",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: parse error: sql parser error: Expected: end of statement, found: list_has_all at Line: 1, Column: 60"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\" FROM \"members\" WHERE \"members\".\"tags\" && ARRAY['go','rust']::text[]",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: parse error: sql parser error: Expected: end of statement, found: arrays_overlap at Line: 1, Column: 60"
+        },
+        {
+          "sql": "SELECT \"events\".\"id\" FROM \"events\" WHERE (\"events\".\"occurred_at\")::date = '2024-03-01'",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: execute: External error: Failed to read Vortex file: projects/01KTY532K7GJNQPAYZXD15ZKKS/tables/events/data/_default/2026/06/12/01KTY532NW7SP6FG48MAK0TYAG.vortex:\n  While evaluating pruning predicate ((cast($.min as vortex.date[days](i32?)) > 2024-03-01) or (2024-03-01 > cast($.max as vortex.date[days](i32?)))) (derived from (cast($ as vortex.date[days](i32?)) = 2024-03-01)):\n  Other error: No CastKernel to cast canonical array vortex.primitive from i64? to vortex.date[days](i32?)"
+        },
+        {
+          "sql": "SELECT \"events\".\"id\" FROM \"events\" WHERE EXTRACT('year' FROM \"events\".\"occurred_at\") = 2024",
+          "outcome": "ok"
+        },
+        {
+          "sql": "BEGIN; SELECT \"members\".\"id\" FROM \"members\" WHERE \"members\".\"id\" = 1 FOR UPDATE; COMMIT;",
+          "outcome": "ok"
+        },
+        {
+          "sql": "BEGIN; SELECT \"events\".\"id\" FROM \"events\" WHERE \"events\".\"kind\" = 'purchase' ORDER BY \"events\".\"id\" ASC LIMIT 1 FOR UPDATE SKIP LOCKED; COMMIT;",
+          "outcome": "ok"
+        },
+        {
+          "sql": "BEGIN; SELECT \"members\".\"id\" FROM \"members\" WHERE \"members\".\"id\" = 1 FOR UPDATE NOWAIT; COMMIT;",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"members\" (\"id\",\"email\",\"role\") VALUES (60,'d60@x.com','USER'),(61,'d61@x.com','USER') ON CONFLICT DO NOTHING",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE \"members\" SET \"version\" = CASE WHEN \"id\" = 1 THEN 5 WHEN \"id\" = 2 THEN 6 ELSE \"version\" END WHERE \"id\" IN (1,2)",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE \"events\" SET \"amount\" = (\"events\".\"amount\" + 1.00) WHERE \"events\".\"kind\" = 'purchase'",
+          "outcome": "typed_error",
+          "sqlstate": "42601",
+          "message": "invalid schema: generated column expression failed to plan: Schema error: No field named events.amount. Valid fields are __basin_gen_src.id, __basin_gen_src.member_id, __basin_gen_src.kind, __basin_gen_src.amount, __basin_gen_src.occurred_at."
+        },
+        {
+          "sql": "ALTER TABLE \"events\" RENAME COLUMN \"kind\" TO \"event_kind\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "ALTER TABLE \"events\" RENAME COLUMN \"event_kind\" TO \"kind\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "ALTER TABLE \"events\" ALTER COLUMN \"kind\" TYPE varchar(255)",
+          "outcome": "ok"
+        },
+        {
+          "sql": "ALTER TABLE \"event_lines\" ADD CONSTRAINT \"event_lines_event_fk\" FOREIGN KEY (\"event_id\") REFERENCES \"events\" (\"id\")",
+          "outcome": "typed_error",
+          "sqlstate": "42601",
+          "message": "invalid schema: ALTER TABLE ADD CONSTRAINT: only CHECK and UNIQUE are supported in v0.1 (PRIMARY KEY / FOREIGN KEY additions after table creation are deferred)"
+        },
+        {
+          "sql": "ROLLBACK",
+          "outcome": "ok"
+        }
+      ]
+    },
+    {
+      "orm": "SQLAlchemy",
+      "total": 19,
+      "ok": 16,
+      "typed_error": 3,
+      "regression": 0,
+      "pass_rate_pct": 84.21052631578947,
+      "shapes": [
+        {
+          "sql": "SELECT \"members\".\"id\" FROM \"members\" WHERE \"members\".\"id\" = $1 FOR UPDATE",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\" FROM \"members\" WHERE \"members\".\"role\" = $1 LIMIT 1 FOR UPDATE SKIP LOCKED",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT count(*) AS \"count_1\" FROM \"members\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT EXISTS (SELECT 1 FROM \"members\" WHERE \"members\".\"role\" = 'ADMIN') AS \"anon_1\"",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: execute: This feature is not implemented: Physical plan does not support logical expression Exists(Exists { subquery: <subquery>, negated: false })"
+        },
+        {
+          "sql": "SELECT \"events\".\"member_id\", count(\"events\".\"id\") AS \"n\", sum(\"events\".\"amount\") AS \"s\" FROM \"events\" GROUP BY \"events\".\"member_id\" ORDER BY \"events\".\"member_id\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\" FROM \"members\" WHERE (\"members\".\"meta\" ->> $1) = $2",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\" FROM \"members\" WHERE \"members\".\"meta\" @> '{\"plan\": \"pro\"}'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\" FROM \"members\" WHERE \"members\".\"meta\" ? 'plan'",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\" FROM \"members\" WHERE \"members\".\"tags\" @> ARRAY['rust']",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: parse error: sql parser error: Expected: end of statement, found: list_has_all at Line: 1, Column: 60"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\" FROM \"members\" WHERE \"members\".\"tags\" && ARRAY['go']",
+          "outcome": "typed_error",
+          "sqlstate": "XX000",
+          "message": "internal: parse error: sql parser error: Expected: end of statement, found: arrays_overlap at Line: 1, Column: 60"
+        },
+        {
+          "sql": "SELECT \"events\".\"id\",\"events\".\"member_id\" FROM \"events\" WHERE \"events\".\"member_id\" IN (1, 2) ORDER BY \"events\".\"member_id\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"members\".\"id\", \"members\".\"balance\" + 0.01 AS \"bal\" FROM \"members\" WHERE \"members\".\"balance\" IS NOT NULL",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT date_trunc('month', \"events\".\"occurred_at\") AS \"m\", count(*) AS \"c\" FROM \"events\" GROUP BY date_trunc('month', \"events\".\"occurred_at\") ORDER BY \"m\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\" FROM \"members\" WHERE \"email\" = $1",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"memberships\" (\"org_id\",\"user_id\",\"level\") VALUES (1,2,'lead')\n           ON CONFLICT (\"org_id\",\"user_id\") DO UPDATE SET \"level\" = EXCLUDED.\"level\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "ALTER TABLE \"members\" ADD COLUMN \"phone\" varchar",
+          "outcome": "ok"
+        },
+        {
+          "sql": "ALTER TABLE \"members\" ALTER COLUMN \"phone\" TYPE text",
+          "outcome": "ok"
+        },
+        {
+          "sql": "ALTER TABLE \"members\" DROP COLUMN \"phone\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "CREATE INDEX \"ix_members_email\" ON \"members\" (\"email\")",
+          "outcome": "ok"
+        }
+      ]
+    },
+    {
+      "orm": "GORM",
+      "total": 14,
+      "ok": 14,
+      "typed_error": 0,
+      "regression": 0,
+      "pass_rate_pct": 100.0,
+      "shapes": [
+        {
+          "sql": "SELECT * FROM \"members\" WHERE \"id\" = $1 LIMIT 1 FOR UPDATE",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT * FROM \"members\" WHERE \"role\" = $1 LIMIT 1 FOR UPDATE SKIP LOCKED",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"member_id\", count(*) AS \"c\", sum(\"amount\") AS \"s\" FROM \"events\" GROUP BY \"member_id\" ORDER BY \"member_id\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT DISTINCT \"role\" FROM \"members\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT count(*) FROM \"members\" WHERE \"role\" = $1",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"members\" (\"id\",\"email\",\"role\") VALUES ($1,$2,$3),($4,$5,$6) RETURNING \"id\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"id\" FROM \"members\" WHERE \"meta\"->>'plan' = $1",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT * FROM \"members\" WHERE \"members\".\"deleted_at\" IS NULL ORDER BY \"members\".\"id\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE \"members\" SET \"deleted_at\" = '2024-06-01 00:00:00+00'::timestamptz WHERE \"id\" = 2 AND \"members\".\"deleted_at\" IS NULL",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE \"members\" SET \"balance\" = 5.5::numeric, \"version\" = \"version\" + 1 WHERE \"id\" = $1 AND \"version\" = $2",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"memberships\" (\"org_id\",\"user_id\",\"level\") VALUES ($1,$2,$3) ON CONFLICT (\"org_id\",\"user_id\") DO UPDATE SET \"level\"=\"excluded\".\"level\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT count(*) FROM pg_indexes WHERE tablename = $1 AND indexname = $2",
+          "outcome": "ok"
+        },
+        {
+          "sql": "CREATE INDEX IF NOT EXISTS \"idx_members_role\" ON \"members\" (\"role\")",
+          "outcome": "ok"
+        },
+        {
+          "sql": "ALTER TABLE \"members\" ADD \"country\" text",
+          "outcome": "ok"
+        }
+      ]
+    },
+    {
+      "orm": "TypeORM",
+      "total": 14,
+      "ok": 14,
+      "typed_error": 0,
+      "regression": 0,
+      "pass_rate_pct": 100.0,
+      "shapes": [
+        {
+          "sql": "SELECT \"m\".\"id\" AS \"m_id\" FROM \"members\" \"m\" WHERE \"m\".\"id\" = 1 FOR UPDATE",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"m\".\"id\" AS \"m_id\" FROM \"members\" \"m\" WHERE \"m\".\"role\" = 'USER' LIMIT 1 FOR UPDATE SKIP LOCKED",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"m\".\"id\" AS \"m_id\" FROM \"members\" \"m\" WHERE \"m\".\"id\" = 1 FOR SHARE",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT COUNT(DISTINCT(\"m\".\"id\")) AS \"cnt\" FROM \"members\" \"m\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"e\".\"member_id\" AS \"mid\", COUNT(*) AS \"c\", SUM(\"e\".\"amount\") AS \"s\" FROM \"events\" \"e\" GROUP BY \"e\".\"member_id\" ORDER BY \"e\".\"member_id\" ASC",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE \"members\" SET \"deleted_at\" = NOW() WHERE \"id\" = 2 AND \"deleted_at\" IS NULL",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"m\".\"id\" AS \"m_id\" FROM \"members\" \"m\" WHERE \"m\".\"deleted_at\" IS NULL",
+          "outcome": "ok"
+        },
+        {
+          "sql": "UPDATE \"members\" SET \"email\" = $1, \"version\" = \"version\" + 1 WHERE \"id\" = $2 AND \"version\" = $3",
+          "outcome": "ok"
+        },
+        {
+          "sql": "INSERT INTO \"memberships\" (\"org_id\",\"user_id\",\"level\") VALUES (1,2,'viewer') ON CONFLICT (\"org_id\",\"user_id\") DO UPDATE SET \"level\" = EXCLUDED.\"level\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"m\".\"id\" AS \"m_id\" FROM \"members\" \"m\" WHERE \"m\".\"id\" > $1 ORDER BY \"m\".\"id\" ASC LIMIT 5",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT \"m\".\"id\" AS \"m_id\", \"e\".\"id\" AS \"e_id\", \"el\".\"id\" AS \"el_id\", \"el\".\"label\" AS \"el_label\"\n           FROM \"members\" \"m\"\n           LEFT JOIN \"events\" \"e\" ON \"e\".\"member_id\" = \"m\".\"id\"\n           LEFT JOIN \"event_lines\" \"el\" ON \"el\".\"event_id\" = \"e\".\"id\"\n           ORDER BY \"m\".\"id\" ASC, \"e\".\"id\" ASC, \"el\".\"id\" ASC",
+          "outcome": "ok"
+        },
+        {
+          "sql": "ALTER TABLE \"members\" RENAME COLUMN \"balance\" TO \"bal\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "ALTER TABLE \"members\" RENAME COLUMN \"bal\" TO \"balance\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "DROP TABLE IF EXISTS \"memberships\"",
+          "outcome": "ok"
+        }
+      ]
+    },
+    {
+      "orm": "sqlx",
+      "total": 11,
+      "ok": 10,
+      "typed_error": 1,
+      "regression": 0,
+      "pass_rate_pct": 90.9090909090909,
+      "shapes": [
+        {
+          "sql": "SELECT id FROM \"events\" WHERE kind = $1 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT id FROM \"events\" ORDER BY id LIMIT 1 FOR NO KEY UPDATE SKIP LOCKED",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT member_id, COUNT(*) AS n, SUM(amount) AS total FROM \"events\" GROUP BY member_id ORDER BY member_id",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT id FROM \"members\" WHERE meta->>'plan' = $1",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT id FROM \"members\" WHERE balance > 50.0::numeric",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT $1::bytea AS \"blob\"",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT pg_try_advisory_lock(424242)",
+          "outcome": "ok"
+        },
+        {
+          "sql": "SELECT pg_advisory_unlock(424242)",
+          "outcome": "ok"
+        },
+        {
+          "sql": "CREATE INDEX CONCURRENTLY \"events_kind_idx\" ON \"events\" (\"kind\")",
+          "outcome": "typed_error",
+          "sqlstate": "0A000",
+          "message": "feature not supported: CREATE INDEX CONCURRENTLY is not supported in v0.1"
+        },
+        {
+          "sql": "CREATE INDEX \"events_kind_idx2\" ON \"events\" (\"kind\")",
+          "outcome": "ok"
+        },
+        {
+          "sql": "DROP TABLE IF EXISTS \"event_lines\"",
+          "outcome": "ok"
+        }
+      ]
+    }
+  ],
+  "total_shapes": 118,
+  "total_ok": 105,
+  "total_typed_error": 13,
+  "total_regression": 0
+}

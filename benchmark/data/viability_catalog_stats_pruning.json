@@ -21,10 +21,10 @@
       "range_gets": 0
     },
     "pre_a4_legacy_io_same_predicate": {
-      "gets": 2,
+      "gets": 0,
       "heads": 0,
       "lists": 2,
-      "range_gets": 0
+      "range_gets": 2
     },
     "predicates": {
       "all_out": "id = 1500 (outside both file ranges)",
@@ -37,5 +37,5 @@
       "range_gets": 0
     }
   },
-  "generated_at": "@1781202294"
+  "generated_at": "@1782509424"
 }
