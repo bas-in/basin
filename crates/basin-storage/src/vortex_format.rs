@@ -593,6 +593,23 @@ async fn decode_inner(
         vf
     };
 
+    // TRUNCATED-BODY / EMPTY-DECODE TRIPWIRE (#78). The file's own footer says
+    // how many rows it holds. Without a row-filter the scan MUST hand back
+    // exactly that many — anything less means we decoded a body that is not the
+    // file the catalog thinks it is (a short/empty GET body accepted as `Ok` by
+    // `object_store::collect_bytes`, most dangerously on the cached-footer path
+    // below, where a footer keyed by `(path, size_bytes)` is supplied from RAM
+    // and the truncated bytes are never themselves footer-parsed).
+    //
+    // A silent empty decode is the worst failure this engine can have: it reads
+    // as "this file legitimately has no rows", so it poisons every consumer at
+    // once — merges pure-remove the inputs, DELETE CoW rewrites them to nothing,
+    // and audits under-count — while the CATALOG arithmetic still balances, so
+    // every row-conservation guard stays silent. Fail the read loudly instead;
+    // the read path already retries a failed GET and re-resolves the path.
+    let footer_rows = vf.row_count();
+    let filter_pushed = filter.is_some();
+
     // Inferred (self-describing) full schema, normalised so Vortex's
     // `Utf8View`/`BinaryView` become Basin-canonical `Utf8`/`Binary` (the
     // engine downcasts to `StringArray` everywhere).
@@ -741,6 +758,20 @@ async fn decode_inner(
                 BasinError::storage(format!("vortex: execute_record_batch: {e}"))
             })?;
         batches.push(rb);
+    }
+
+    // See the tripwire note above `footer_rows`. Only meaningful without a
+    // pushed row-filter: a filter legitimately drops rows.
+    if !filter_pushed {
+        let decoded: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        if decoded != footer_rows {
+            return Err(BasinError::storage(format!(
+                "vortex: decoded {decoded} rows but the file footer declares {footer_rows} \
+                 ({path}) — truncated body or stale cached footer; refusing to serve a \
+                 short read",
+                path = path.map(|p| p.as_ref()).unwrap_or("<buffer>"),
+            )));
+        }
     }
 
     Ok(batches)
@@ -1442,6 +1473,66 @@ mod tests {
         let want = reference_eq_ids(&bytes, &schema, 999_999).await;
         assert!(want.is_empty(), "reference must be empty for an absent key");
         assert_eq!(got, want, "pushed Eq must yield the same empty row set");
+    }
+
+    /// A SHORT BODY MUST NEVER DECODE AS "this file has no rows" (#78).
+    ///
+    /// The dangerous shape: the footer cache is keyed by `(path, size_bytes)`,
+    /// so a truncated GET body for a path we've already read hands its footer
+    /// straight out of RAM — the short bytes are never themselves footer-parsed,
+    /// and the scan can yield a short (or empty) result as `Ok`. That result is
+    /// indistinguishable from a legitimately empty file, so it poisons every
+    /// consumer at once (merge pure-removes the input, DELETE CoW rewrites it to
+    /// nothing, audits under-count) while catalog arithmetic still balances and
+    /// every row-conservation guard stays silent.
+    ///
+    /// The decode must compare what it produced against the footer's own
+    /// `row_count` and fail loudly instead.
+    #[tokio::test]
+    async fn truncated_body_with_cached_footer_errors_never_reads_short() {
+        let (schema, batch) = multi_chunk_batch(4000, &[]);
+        let full = bytes::Bytes::from(encode(&batch, Some(256)).await.expect("encode"));
+        let size = full.len() as u64;
+        let path = object_store::path::Path::from("t/part-0.vortex");
+        let cache = crate::vortex_footer_cache::VortexFooterCache::new(8);
+
+        // Warm the footer cache off the intact file, and sanity-check the good path.
+        let (good, _) =
+            decode_with_cache(full.clone(), Some(schema.clone()), None, None, Some(&cache), &path, size)
+                .await
+                .expect("intact file decodes");
+        let n: usize = good.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(n, 4000, "intact decode must return every row");
+        assert!(cache.get(&path, size).is_some(), "footer must now be cached");
+
+        // Same path, same declared size — but a SHORT body. Every truncation
+        // must either fail loudly or return the file in full. What it must
+        // never do is hand back a short row set as `Ok`.
+        for cut in [0usize, 64, 512, 4096, full.len() / 8, full.len() / 4, full.len() / 2] {
+            let truncated = full.slice(0..cut.min(full.len()));
+            let res = decode_with_cache(
+                truncated,
+                Some(schema.clone()),
+                None,
+                None,
+                Some(&cache),
+                &path,
+                size,
+            )
+            .await;
+            match res {
+                Err(_) => {} // loud failure: correct.
+                Ok((batches, _)) => {
+                    let got: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    assert_eq!(
+                        got, 4000,
+                        "body truncated to {cut}B decoded as Ok with {got} rows (the file has \
+                         4000) — a short read served as truth: this is the empty-decode \
+                         poisoning shape that makes merges pure-remove live data"
+                    );
+                }
+            }
+        }
     }
 
     /// NULL values in a non-filter column must not perturb an Eq filter on the
