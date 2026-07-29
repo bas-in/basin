@@ -12,7 +12,7 @@ intermediary on the data path.
 ## Install
 
 ```sh
-go get github.com/bas-in/basin/sdk/basin-go
+go get github.com/bas-in/basin/sdks/go
 ```
 
 Requires Go 1.21+. Two optional external dependencies are pulled in only when
@@ -33,7 +33,7 @@ import (
     "context"
     "fmt"
 
-    basin "github.com/bas-in/basin/sdk/basin-go"
+    basin "github.com/bas-in/basin/sdks/go"
 )
 
 func main() {

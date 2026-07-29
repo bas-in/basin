@@ -96,10 +96,11 @@
   "homepage": "https://basin.run",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bas-in/basin-js.git"
+    "url": "https://github.com/bas-in/basin.git",
+    "directory": "sdks/js"
   },
   "bugs": {
-    "url": "https://github.com/bas-in/basin-js/issues"
+    "url": "https://github.com/bas-in/basin/issues"
   },
   "license": "MIT",
   "publishConfig": {

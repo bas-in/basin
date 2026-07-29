@@ -1,4 +1,4 @@
-module github.com/bas-in/basin/sdk/basin-go
+module github.com/bas-in/basin/sdks/go
 
 go 1.25.0
 

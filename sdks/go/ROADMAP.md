@@ -37,7 +37,7 @@ an engine change.
 
 ### 0.2.2 Publish to pkg.go.dev and the module proxy
 
-The module path `github.com/bas-in/basin/sdk/basin-go` is correct, but the
+The module path `github.com/bas-in/basin/sdks/go` is correct, but the
 module has not been tagged and pushed through `proxy.golang.org` yet. Until a
 `v0.1.0` tag exists and the module is indexed, `go get` works only against
 the git HEAD — not a stable release.
@@ -46,7 +46,7 @@ Outcome:
 - Tag `v0.1.0`, verify `pkg.go.dev` picks it up within a few minutes of the
   tag push.
 - Add a `CHANGELOG.md` that records what shipped in each tag.
-- CI: add a step that runs `go list -m github.com/bas-in/basin/sdk/basin-go`
+- CI: add a step that runs `go list -m github.com/bas-in/basin/sdks/go`
   to smoke-test that the module can be fetched from the proxy.
 
 ### 0.2.3 Typed error-code constants
@@ -124,6 +124,6 @@ only remaining pre-1.0 risks:
 - The `EnrollFactor` / `ChallengeFactor` return type is `any` — convenient but
   untyped. A `Factor` interface with a `FactorType() string` method would be a
   cleaner contract.
-- The module path (`github.com/bas-in/basin/sdk/basin-go`) may move to a
+- The module path (`github.com/bas-in/basin/sdks/go`) may move to a
   standalone repo (`github.com/bas-in/basin-go`) to match the other SDK repos.
   That is a breaking import path change; it must happen before `v1.0.0`.
