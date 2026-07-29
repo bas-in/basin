@@ -22,7 +22,7 @@ stores everything on the local filesystem inside the container volume.
 
 ### Option A — build locally (works today)
 
-The GHCR image (`ghcr.io/bas-in/basin-server:latest`) will be published on the
+The GHCR image (`ghcr.io/vul-os/basin-server:latest`) will be published on the
 first tagged release. Until then, build from the repo root:
 
 ```sh
@@ -45,7 +45,7 @@ docker run --rm \
   -p 5432:5432 \
   -v basin-data:/var/basin \
   --name basin \
-  ghcr.io/bas-in/basin-server:latest
+  ghcr.io/vul-os/basin-server:latest
 ```
 
 What these flags do:
@@ -123,7 +123,7 @@ SELECT COUNT(*) FROM smoke;
 
 ## 4. Using basin-cli
 
-[`basin-cli`](https://github.com/bas-in/basin-cli) is a separate operator
+[`basin-cli`](https://github.com/vul-os/basin/tree/main/cli) is a separate operator
 daily-driver CLI (Go, Apache-2.0). It talks to the basin-cloud control plane,
 not directly to a standalone `basin-server` container. For local development,
 `psql` and any Postgres-compatible driver are the easiest path.

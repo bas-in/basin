@@ -15,7 +15,7 @@ if a pattern works here, the chance every ORM that funnels through
 `tokio-postgres` / `asyncpg` / `pgjdbc` works is high.
 
 > Building a TypeScript/JavaScript app against Basin? Prefer the typed
-> [`basin-js`](https://github.com/bas-in/basin-js) client over hand-rolled
+> [`basin-js`](https://github.com/vul-os/basin/tree/main/sdks/js) client over hand-rolled
 > pgwire — it talks engine-direct (auth + REST) and ships as
 > `jsr:@bas-in/basin-js` and `npm:@bas-in/basin-js`.
 

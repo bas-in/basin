@@ -8,7 +8,7 @@ summary: "Cloud-side items that pair with OSS phases. Lives in this OSS repo as 
 # basin-cloud roadmap spec
 
 `basin-cloud` lives in a separate repository
-([`bas-in/basin-cloud`](https://github.com/bas-in/basin-cloud)) and has its
+([`bas-in/basin-cloud`](https://github.com/vul-os/basin-cloud)) and has its
 own roadmap.  This file is a **forward-spec** for cloud-side work that
 **pairs with OSS phases shipped here**.  When an item below is adopted into
 basin-cloud's own roadmap, this file gets a back-link to the cloud-repo
@@ -76,8 +76,8 @@ relative to the basin-cloud checkout.  If any are missing, the script
 Clone the OSS repos as siblings of basin-cloud before running:
   cd ..
   git clone https://github.com/vul-os/basin
-  git clone https://github.com/bas-in/basin-js
-  git clone https://github.com/bas-in/basin-cli
+  git clone https://github.com/vul-os/basin/tree/main/sdks/js
+  git clone https://github.com/vul-os/basin/tree/main/cli
 Then re-run `npm run dev:docs`.
 ```
 

@@ -12,8 +12,8 @@ control plane (dashboard, billing, anon-key minting); once you have a URL and
 key, every SDK call lands on the engine directly.
 
 Part of the Basin SDK family alongside
-[basin-js](https://github.com/bas-in/basin-js),
-[basin-py](https://github.com/bas-in/basin-py), and others.
+[basin-js](https://github.com/vul-os/basin/tree/main/sdks/js),
+[basin-py](https://github.com/vul-os/basin/tree/main/sdks/py), and others.
 
 **Requirements:** PHP 8.1+, [Guzzle](https://docs.guzzlephp.org/) 7.x
 (auto-installed).

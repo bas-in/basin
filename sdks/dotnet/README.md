@@ -14,8 +14,8 @@ change streams, RPC functions, and Arrow IPC transport are all first-class.
 conditional NuGet package you opt into only when you need it.
 
 Part of the Basin SDK family — identical surface across
-[basin-js](https://github.com/bas-in/basin-js),
-[basin-py](https://github.com/bas-in/basin-py),
+[basin-js](https://github.com/vul-os/basin/tree/main/sdks/js),
+[basin-py](https://github.com/vul-os/basin/tree/main/sdks/py),
 basin-dotnet, and [eight more languages](https://basin.run/docs/sdks).
 
 ## Install

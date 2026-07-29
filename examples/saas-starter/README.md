@@ -64,7 +64,7 @@ docker run --rm \
   -e BASIN_AUTH_ENABLED=1 \
   -e BASIN_AUTH_JWT_SECRET=0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20 \
   --name basin \
-  ghcr.io/bas-in/basin-server:latest
+  ghcr.io/vul-os/basin-server:latest
 ```
 
 **Option B — build from source (today):**

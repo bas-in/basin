@@ -16,7 +16,7 @@ use crate::global::GlobalFlags;
 use crate::version_check::{in_support_window, parse_semver};
 
 const UPDATE_HINT: &str =
-    "       update via `brew upgrade basin` or `go install github.com/bas-in/basin-cli@latest`.";
+    "       update via `brew upgrade basin` or `go install github.com/vul-os/basin/tree/main/cli@latest`.";
 
 fn unstamped(v: &str) -> bool {
     v.is_empty() || v == "dev"

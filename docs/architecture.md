@@ -11,10 +11,10 @@ This document describes how Basin is put together. It is the design reference
 that the code is built against. For the phased build plan see
 [`../TASK.md`](../TASK.md).
 
-> Integrating from app code? See [`basin-js`](https://github.com/bas-in/basin-js)
+> Integrating from app code? See [`basin-js`](https://github.com/vul-os/basin/tree/main/sdks/js)
 > (engine-direct TypeScript SDK). Running and operating a fleet? See
-> [`basin-cli`](https://github.com/bas-in/basin-cli) and
-> [`basin-cloud`](https://github.com/bas-in/basin-cloud).
+> [`basin-cli`](https://github.com/vul-os/basin/tree/main/cli) and
+> [`basin-cloud`](https://github.com/vul-os/basin-cloud).
 
 Basin is a bucket-native, multi-project, Postgres-compatible database. The whole
 system is organized around four ideas:

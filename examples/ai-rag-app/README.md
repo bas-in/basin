@@ -50,7 +50,7 @@ docker run --rm \
   -p 5432:5432 \
   -v basin-data:/var/basin \
   --name basin \
-  ghcr.io/bas-in/basin-server:latest
+  ghcr.io/vul-os/basin-server:latest
 ```
 
 Or build from the repo root (see `docs/quickstart-docker.md`):

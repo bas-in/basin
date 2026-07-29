@@ -25,7 +25,7 @@ import PackageDescription
 let package = Package(
     name: "MyApp",
     dependencies: [
-        .package(url: "https://github.com/bas-in/basin-swift", from: "0.1.0"),
+        .package(url: "https://github.com/vul-os/basin/tree/main/sdks/swift", from: "0.1.0"),
     ],
     targets: [
         .target(name: "MyApp", dependencies: [

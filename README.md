@@ -13,6 +13,10 @@
 </p>
 
 <p align="center">
+  <sub><img src="docs/assets/vulos-logo.png" height="14" alt="VulOS"> Part of <strong><a href="https://vulos.org">VulOS</a></strong> — the open, self-hostable web OS &amp; app suite. Runs standalone, or as an app hosted by the Vulos OS.</sub>
+</p>
+
+<p align="center">
   <a href="https://github.com/vul-os/basin/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/vul-os/basin/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://github.com/vul-os/basin/releases"><img alt="latest release" src="https://img.shields.io/github/v/release/vul-os/basin?include_prereleases&style=flat-square"></a>
   <a href="./CHANGELOG.md"><img alt="changelog" src="https://img.shields.io/badge/changelog-keep--a--changelog-blue?style=flat-square"></a>
@@ -430,14 +434,18 @@ Per the ADRs:
 
 ## Ecosystem
 
-Basin (this repo) is the data plane. Three sibling repos sit around it:
+Basin (this repo) is the data plane, and since the SDKs and the CLI were
+merged in it is also the monorepo for everything that talks to it. One
+sibling repo remains outside:
 
-- **[`bas-in/basin-cloud`](https://github.com/bas-in/basin-cloud)** — control plane and dashboard (Rust axum + sqlx backend + React/Vite SPA, Apache-2.0). Manages orgs, projects, billing; runs Basin engines on Fly Machines per project. Operators who want a managed UI use it. Operators running a single self-hosted engine do not — basin-server alone is sufficient.
-- **[`bas-in/basin-cli`](https://github.com/bas-in/basin-cli)** — operator daily-driver (Go, Apache-2.0, stdlib-only). `basin login`, `basin projects list`, `basin sql run`, release artefacts are Sigstore-signed. Talks to basin-cloud's `/v1/*` API. Includes `basin dev` local-stack launcher.
-- **[`bas-in/basin-js`](https://github.com/bas-in/basin-js)** — TypeScript SDK (MIT). Supabase-shaped `createClient(url, anonKey)` that talks **directly** to a Basin engine (pgwire + REST), not through basin-cloud. Browser, Node, Deno, Bun, Cloudflare Workers. Realtime subscriptions + Arrow IPC streaming. [`jsr:@bas-in/basin-js`](https://jsr.io/@bas-in/basin-js) and [`npm:@bas-in/basin-js`](https://www.npmjs.com/package/@bas-in/basin-js).
-- **Client SDKs (each its own repo alongside basin)** — `basin-js`, `basin-py` (async + sync, realtime + Arrow via pyarrow), `basin-go` (Arrow IPC), `basin-java`, `basin-rust`, `basin-ruby`, `basin-dotnet`, `basin-php`, `basin-dart`, `basin-swift`. All engine-direct (pgwire + REST). 10 SDKs total.
+- **[`vul-os/basin-cloud`](https://github.com/vul-os/basin-cloud)** — control plane and dashboard (Rust axum + sqlx backend + React/Vite SPA, Apache-2.0). Manages orgs, projects, billing; runs Basin engines on Fly Machines per project. Operators who want a managed UI use it. Operators running a single self-hosted engine do not — basin-server alone is sufficient. **The only component still in its own repo.**
 
-**Licensing rationale.** Server-side projects (basin engine, basin-cloud, basin-cli) are Apache-2.0 to carry the patent grant operators expect from infrastructure. Client SDKs (basin-js and future siblings) are MIT to match the norm of the SDK ecosystems they sit in.
+In this repo, alongside the engine:
+
+- **[`cli/`](./cli)** — operator daily-driver (Rust, Apache-2.0). `basin login`, `basin projects list`, `basin sql run`, release artefacts Sigstore-signed. Talks to basin-cloud's `/v1/*` API. Includes the `basin dev` local-stack launcher. Builds independently of the engine workspace.
+- **[`sdks/`](./sdks)** — ten engine-direct client SDKs (MIT), all speaking pgwire + REST straight to a Basin engine rather than through basin-cloud: [`js`](./sdks/js) (browser, Node, Deno, Bun, Workers; realtime + Arrow IPC), [`py`](./sdks/py) (async + sync, realtime + Arrow via pyarrow), [`go`](./sdks/go) (Arrow IPC), [`java`](./sdks/java), [`rust`](./sdks/rust), [`ruby`](./sdks/ruby), [`dotnet`](./sdks/dotnet), [`php`](./sdks/php), [`dart`](./sdks/dart), [`swift`](./sdks/swift).
+
+**Licensing rationale.** Server-side projects (basin engine, basin-cloud, the CLI) are Apache-2.0 to carry the patent grant operators expect from infrastructure. All ten client SDKs are MIT to match the norm of the SDK ecosystems they sit in.
 
 ---
 
@@ -491,6 +499,25 @@ open benchmark/index_localfs.html
 **Apache-2.0** — see [`LICENSE`](./LICENSE).
 
 Contributions welcome. The project is opinionated about scope ([`docs/decisions/`](./docs/decisions/)) — open an issue before writing a PR that adds new surface area. The OSS code is the database; commercial cloud orchestration lives in a separate private repo and never affects what OSS users get.
+
+---
+
+## Part of VulOS
+
+Basin is the **database layer** of [VulOS](https://vulos.org) — the open,
+self-hostable web OS and app suite. Apps running on the Vulos OS get a
+Postgres-compatible store whose per-project cost is O(bytes active) rather
+than O(projects provisioned), which is what makes hosting many small
+self-hosted apps on one box affordable.
+
+**Basin runs standalone.** It is a single binary speaking pgwire against any
+S3-compatible bucket, and it requires nothing else in the suite — no Vulos
+OS, no control plane, no account. Everything in this README's Quickstart
+works on a bare machine with no VulOS component installed. Being an app the
+OS can host is an option, never a dependency.
+
+For the rest of the suite and how the pieces fit, see
+[vulos.org](https://vulos.org).
 
 ---
 

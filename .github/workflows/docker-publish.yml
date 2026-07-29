@@ -30,7 +30,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  GHCR_IMAGE: ghcr.io/bas-in/basin-server
+  GHCR_IMAGE: ghcr.io/vul-os/basin-server
   DHUB_IMAGE: docker.io/basin/basin-server
   BASIN_PORT: 5432
 

@@ -56,7 +56,7 @@ docker run --rm \
 ```
 
 Once the published image ships, replace `basin-server` with
-`ghcr.io/bas-in/basin-server:latest` — the flags stay the same.
+`ghcr.io/vul-os/basin-server:latest` — the flags stay the same.
 
 Basin is ready when you see:
 

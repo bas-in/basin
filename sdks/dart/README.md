@@ -12,8 +12,8 @@ desktop) and pure **Dart** (CLI, server) from a single package —
 differences.
 
 basin_sdk is part of the Basin SDK family alongside
-[basin-js](https://github.com/bas-in/basin-js) (TypeScript) and
-[basin-py](https://github.com/bas-in/basin-py) (Python). All SDKs bind the
+[basin-js](https://github.com/vul-os/basin/tree/main/sdks/js) (TypeScript) and
+[basin-py](https://github.com/vul-os/basin/tree/main/sdks/py) (Python). All SDKs bind the
 same engine routes (pgwire + REST) so behaviour is consistent across
 languages.
 

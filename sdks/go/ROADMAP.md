@@ -125,5 +125,5 @@ only remaining pre-1.0 risks:
   untyped. A `Factor` interface with a `FactorType() string` method would be a
   cleaner contract.
 - The module path (`github.com/vul-os/basin/sdks/go`) may move to a
-  standalone repo (`github.com/bas-in/basin-go`) to match the other SDK repos.
+  standalone repo (`github.com/vul-os/basin/tree/main/sdks/go`) to match the other SDK repos.
   That is a breaking import path change; it must happen before `v1.0.0`.

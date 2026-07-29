@@ -12,19 +12,25 @@ no system dependencies, one self-contained file per subcommand.
 ### Homebrew (macOS, Linux)
 
 ```sh
-brew install bas-in/tap/basin
+brew install vul-os/tap/basin
 ```
 
 ### `cargo install`
 
+The CLI lives in the `cli/` subdirectory of the basin monorepo and is
+deliberately detached from the engine's Cargo workspace, so
+`cargo install --git` cannot resolve it — that flag only finds crates
+reachable from the repo's root manifest. Clone and install from the path:
+
 ```sh
-cargo install --git https://github.com/bas-in/basin-cli basin
+git clone https://github.com/vul-os/basin
+cargo install --path basin/cli
 ```
 
 ### Pre-built binaries
 
 Grab the right archive for your platform from the latest
-[GitHub release](https://github.com/bas-in/basin-cli/releases) and
+[GitHub release](https://github.com/vul-os/basin/releases) and
 drop the `basin` binary on your `PATH`.
 
 ## Authenticate
@@ -151,7 +157,7 @@ ART="basin_0.1.0_linux_amd64.tar.gz"
 cosign verify-blob \
   --certificate "${ART}.pem" \
   --signature   "${ART}.sig" \
-  --certificate-identity-regexp 'https://github.com/bas-in/basin-cli/\.github/workflows/release\.yml@refs/tags/v.*' \
+  --certificate-identity-regexp 'https://github.com/vul-os/basin/tree/main/cli/\.github/workflows/release\.yml@refs/tags/v.*' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   "${ART}"
 ```
