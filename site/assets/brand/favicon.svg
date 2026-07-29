@@ -1,0 +1,8 @@
+<svg width="64" height="64" viewBox="0 0 680 680" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Basin">
+  <rect width="680" height="680" rx="150" fill="#0F1115"/>
+  <g transform="translate(340, 348) scale(0.82)" fill="none" stroke="#FAF7F0" stroke-width="52" stroke-linecap="round">
+    <ellipse cx="0" cy="-110" rx="200" ry="44"/>
+    <path d="M -200 -110 Q -200 160, 0 160 Q 200 160, 200 -110"/>
+    <circle cx="0" cy="40" r="34" fill="#3B6F73" stroke="none"/>
+  </g>
+</svg>

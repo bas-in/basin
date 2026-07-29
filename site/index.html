@@ -1,0 +1,1031 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Basin — a Postgres-compatible database that lives on object storage</title>
+<meta name="description" content="Basin is a bucket-native, multi-tenant Postgres alternative. Projects are S3 prefixes, not databases, so operator cost is O(bytes active), not O(projects provisioned). One binary, pgwire on the front, Vortex-compressed columnar files on any S3-compatible bucket on the back.">
+<link rel="icon" href="./assets/brand/favicon.svg">
+<meta property="og:title" content="Basin — a Postgres-compatible database that lives on object storage">
+<meta property="og:description" content="Bucket-native, multi-tenant Postgres alternative. ~27× less RAM per connection. Apache-2.0.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://vulos.org/projects/basin/landing.html">
+<style>
+/* ─────────────────────────────────────────────────────────────────────
+   Basin — survey aesthetic.
+
+   The conceit is a USGS topographic survey sheet: contour isolines behind
+   the hero, elevation tags on the rules, corner ticks framing panels, and
+   monospace field-note captions throughout. Ink is the ground; paper is
+   the mark. Tokens below are lifted verbatim from the app's tokens.css so
+   this page and the product read as one system.
+   ───────────────────────────────────────────────────────────────────── */
+:root{
+  /* Palette */
+  --ink:#0F1115; --ink-2:#16191F; --ink-3:#1E2229;
+  --paper:#FAF7F0; --paper-2:#F2EDE2; --paper-3:#E8E1D0;
+  --basin-teal:#3B6F73; --basin-teal-2:#4F858A; --basin-teal-3:#60999E;
+  --basin-teal-deep:#2A5256;
+  --sediment-ochre:#C4732B; --sediment-ochre-2:#DA8638;
+  --graphite:#5C5C5C; --graphite-2:#3A3A3A; --graphite-3:#828282;
+  --moss:#8FB59B; --clay:#B8462E;
+
+  --ink-rgb:15 17 21;
+  --paper-rgb:250 247 240;
+  --basin-teal-rgb:59 111 115;
+  --sediment-ochre-rgb:196 115 43;
+  --graphite-rgb:92 92 92;
+
+  /* Typography */
+  --font-display:"Inter Display","Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --font-body:"Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --font-mono:"JetBrains Mono","IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+
+  --weight-regular:400; --weight-medium:500; --weight-semibold:600;
+  --weight-bold:700; --weight-black:900;
+
+  --lh-tight:1.05; --lh-snug:1.18; --lh-base:1.5; --lh-loose:1.7;
+  --tracking-tight:-.02em; --tracking-tighter:-.035em;
+  --tracking-mono-wide:.06em; --tracking-mono-wider:.14em;
+
+  /* Spacing */
+  --space-1:4px;  --space-2:8px;   --space-3:12px; --space-4:16px;
+  --space-5:20px; --space-6:24px;  --space-7:32px; --space-8:40px;
+  --space-9:48px; --space-10:64px; --space-11:80px; --space-12:96px;
+  --space-13:128px;
+
+  /* Layout */
+  --container:1200px; --container-narrow:920px; --container-wide:1440px;
+  --side-pad:clamp(20px,4vw,56px);
+
+  --radius-1:2px; --radius-2:4px; --radius-3:8px; --radius-4:12px;
+  --radius-pill:999px;
+  --hairline:1px solid rgb(var(--graphite-rgb)/.22);
+  --hairline-strong:1px solid rgb(var(--graphite-rgb)/.45);
+  --hairline-paper:1px solid rgb(var(--paper-rgb)/.14);
+
+  --ease-out:cubic-bezier(.2,.7,.2,1);
+  --dur-fast:140ms; --dur-base:240ms; --dur-slow:480ms;
+  --focus-ring:0 0 0 3px rgb(var(--basin-teal-rgb)/.45);
+}
+
+*,*::before,*::after{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--ink);color:var(--paper);
+  font-family:var(--font-body);font-size:16px;line-height:var(--lh-base);
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+}
+img,svg{max-width:100%;display:block}
+a{color:inherit;text-decoration:none}
+h1,h2,h3,h4{margin:0;font-family:var(--font-display);letter-spacing:var(--tracking-tighter);line-height:var(--lh-tight)}
+p{margin:0}
+ul{margin:0;padding:0;list-style:none}
+code{font-family:var(--font-mono);font-size:.92em}
+:focus-visible{outline:none;box-shadow:var(--focus-ring);border-radius:var(--radius-2)}
+
+.container{max-width:var(--container);margin:0 auto;padding-inline:var(--side-pad)}
+.container-wide{max-width:var(--container-wide);margin:0 auto;padding-inline:var(--side-pad)}
+.container-narrow{max-width:var(--container-narrow);margin:0 auto;padding-inline:var(--side-pad)}
+.mono{font-family:var(--font-mono)}
+.display{font-family:var(--font-display);font-weight:var(--weight-black)}
+
+/* Section rhythm — the section owns its padding; inner grids never add. */
+.section{padding-block:clamp(64px,7vw,var(--space-13));position:relative}
+/* The header is sticky at 64px, so an anchored section would otherwise
+   land with its eyebrow tucked underneath it. */
+.section[id]{scroll-margin-top:80px}
+.section-ink{background:var(--ink)}
+.section-paper{background:var(--paper);color:var(--ink)}
+.section-ink-2{background:var(--ink-2)}
+
+/* Eyebrow — the survey field label. */
+.eyebrow{
+  display:inline-flex;align-items:center;gap:var(--space-2);
+  font-family:var(--font-mono);font-size:.6875rem;font-weight:var(--weight-medium);
+  letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;
+  color:var(--basin-teal-3);
+}
+.eyebrow::before{
+  content:"";width:18px;height:1px;background:var(--basin-teal);display:inline-block;
+}
+.section-paper .eyebrow{color:var(--basin-teal-deep)}
+.section-paper .eyebrow::before{background:var(--basin-teal-deep)}
+
+.section-head{max-width:760px;margin-bottom:var(--space-10)}
+.section-head h2{
+  font-size:clamp(28px,3.6vw,46px);margin-top:var(--space-4);margin-bottom:var(--space-4);
+}
+.section-head p{color:rgb(var(--paper-rgb)/.62);font-size:1.0625rem;line-height:var(--lh-loose);max-width:66ch}
+.section-paper .section-head p{color:rgb(var(--ink-rgb)/.72)}
+
+/* ── Header ───────────────────────────────────────────────────────── */
+.site-header{
+  position:sticky;top:0;z-index:50;
+  background:rgb(var(--ink-rgb)/.78);backdrop-filter:blur(14px);
+  border-bottom:var(--hairline-paper);
+}
+.nav{display:flex;align-items:center;gap:var(--space-6);height:64px}
+.brand{display:flex;align-items:center;gap:10px;font-family:var(--font-display);font-weight:var(--weight-black);font-size:1.125rem;letter-spacing:var(--tracking-tighter)}
+.brand svg{width:26px;height:26px}
+.nav-spacer{flex:1}
+.nav-links{display:flex;align-items:center;gap:var(--space-6)}
+.nav-links a{
+  font-size:.875rem;font-weight:var(--weight-medium);color:rgb(var(--paper-rgb)/.6);
+  transition:color var(--dur-fast) var(--ease-out);
+}
+.nav-links a:hover{color:var(--paper)}
+.vulos-badge{
+  display:inline-flex;align-items:center;gap:var(--space-2);
+  padding:6px 12px;border:var(--hairline-paper);border-radius:var(--radius-pill);
+  font-family:var(--font-mono);font-size:.6875rem;letter-spacing:var(--tracking-mono-wide);
+  text-transform:uppercase;color:rgb(var(--paper-rgb)/.62);
+  transition:border-color var(--dur-fast),color var(--dur-fast);
+}
+.vulos-badge:hover{border-color:var(--basin-teal-3);color:var(--paper)}
+@media(max-width:900px){.nav-links{display:none}}
+
+/* ── Buttons ──────────────────────────────────────────────────────── */
+.btn{
+  display:inline-flex;align-items:center;gap:var(--space-2);
+  padding:12px 20px;border-radius:var(--radius-2);
+  font-size:.9375rem;font-weight:var(--weight-semibold);
+  border:1px solid transparent;cursor:pointer;
+  transition:transform var(--dur-fast) var(--ease-out),background var(--dur-fast),border-color var(--dur-fast);
+}
+.btn:hover{transform:translateY(-1px)}
+.btn-primary{background:var(--basin-teal);color:var(--paper)}
+.btn-primary:hover{background:var(--basin-teal-2)}
+.btn-outline{border-color:rgb(var(--paper-rgb)/.24);color:var(--paper)}
+.btn-outline:hover{border-color:var(--basin-teal-3);background:rgb(var(--basin-teal-rgb)/.12)}
+.section-paper .btn-outline{border-color:rgb(var(--ink-rgb)/.22);color:var(--ink)}
+.btn-arrow{transition:transform var(--dur-base) var(--ease-out)}
+.btn:hover .btn-arrow{transform:translateX(3px)}
+
+/* ── Hero ─────────────────────────────────────────────────────────── */
+.hero{position:relative;background:var(--ink);color:var(--paper);padding-top:var(--space-8);padding-bottom:clamp(48px,5vw,80px);overflow:hidden}
+.contour-bg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.hero-bg{
+  -webkit-mask-image:radial-gradient(ellipse 120% 110% at 50% 45%,rgb(0 0 0) 60%,transparent 100%);
+  mask-image:radial-gradient(ellipse 120% 110% at 50% 45%,rgb(0 0 0) 60%,transparent 100%);
+  opacity:.7;
+}
+.hero::before{
+  content:"";position:absolute;left:50%;bottom:-10%;transform:translateX(-50%);
+  width:min(1100px,100%);height:360px;
+  background:radial-gradient(ellipse at center,rgb(var(--basin-teal-rgb)/.16),transparent 60%);
+  pointer-events:none;z-index:0;
+}
+.hero-grid{
+  position:relative;z-index:1;display:grid;
+  grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);
+  gap:clamp(28px,3.5vw,56px);align-items:start;
+}
+.hero-copy{min-width:0;max-width:620px}
+.hero-eyebrow{margin-top:var(--space-2);margin-bottom:var(--space-3)}
+.hero-title{
+  font-size:clamp(36px,5.6vw,76px);line-height:.98;
+  letter-spacing:var(--tracking-tighter);font-weight:var(--weight-black);
+  display:flex;flex-direction:column;gap:2px;margin-bottom:var(--space-4);
+}
+.hero-line-1{color:var(--paper)}
+.hero-line-2{color:var(--basin-teal-3)}
+.hero-rule{display:flex;align-items:center;gap:var(--space-3);margin-bottom:var(--space-3)}
+.hero-rule span:first-child,.hero-rule span:last-child{
+  flex:1;height:1px;
+  background:linear-gradient(to right,transparent,rgb(var(--paper-rgb)/.28),transparent);
+}
+.hero-rule-tag{
+  font-size:.6875rem;letter-spacing:var(--tracking-mono-wide);
+  text-transform:uppercase;color:rgb(var(--paper-rgb)/.5);white-space:nowrap;
+}
+.hero-sub{
+  color:rgb(var(--paper-rgb)/.68);font-size:1.0625rem;line-height:var(--lh-loose);
+  max-width:56ch;margin-bottom:var(--space-7);
+}
+.hero-sub code{color:var(--sediment-ochre-2);background:rgb(var(--sediment-ochre-rgb)/.1);padding:1px 5px;border-radius:var(--radius-1)}
+.wobble{
+  background-image:linear-gradient(to right,var(--basin-teal-3),var(--basin-teal-3));
+  background-repeat:repeat-x;background-position:0 100%;background-size:100% 2px;
+  padding-bottom:2px;
+}
+.hero-ctas{display:flex;flex-wrap:wrap;gap:var(--space-3);margin-bottom:var(--space-9)}
+
+.hero-stats{
+  display:grid;grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:var(--space-5);border-top:var(--hairline-paper);padding-top:var(--space-5);margin:0;
+}
+.hero-stat dt{
+  font-family:var(--font-mono);font-size:.625rem;letter-spacing:var(--tracking-mono-wide);
+  text-transform:uppercase;color:rgb(var(--paper-rgb)/.44);margin-bottom:var(--space-2);
+}
+.hero-stat dd{
+  margin:0;font-family:var(--font-mono);font-size:1.0625rem;
+  font-weight:var(--weight-semibold);color:var(--paper);letter-spacing:var(--tracking-tight);
+}
+.hero-stat dd em{font-style:normal;color:var(--basin-teal-3)}
+
+/* Terminal panel with survey corner ticks. */
+.hero-side{position:relative}
+.hero-side-frame{position:relative;padding:var(--space-3)}
+.hero-side-corner{position:absolute;width:12px;height:12px;border:1px solid var(--basin-teal);opacity:.65}
+.hero-side-corner-tl{top:0;left:0;border-right:0;border-bottom:0}
+.hero-side-corner-tr{top:0;right:0;border-left:0;border-bottom:0}
+.hero-side-corner-bl{bottom:0;left:0;border-right:0;border-top:0}
+.hero-side-corner-br{bottom:0;right:0;border-left:0;border-top:0}
+.terminal{
+  background:var(--ink-2);border:var(--hairline);border-radius:var(--radius-3);
+  overflow:hidden;box-shadow:0 24px 60px rgb(0 0 0/.45);
+}
+.terminal-bar{
+  display:flex;align-items:center;gap:var(--space-2);
+  padding:10px var(--space-4);border-bottom:var(--hairline);background:var(--ink-3);
+}
+.terminal-dot{width:9px;height:9px;border-radius:50%;background:rgb(var(--paper-rgb)/.18)}
+.terminal-title{
+  margin-left:var(--space-2);font-family:var(--font-mono);font-size:.6875rem;
+  letter-spacing:var(--tracking-mono-wide);color:rgb(var(--paper-rgb)/.42);
+}
+.terminal-body{padding:var(--space-5);font-family:var(--font-mono);font-size:.8125rem;line-height:1.75;overflow-x:auto}
+.terminal-body .l{white-space:pre;display:block}
+.t-prompt{color:var(--basin-teal-3)}
+.t-kw{color:var(--sediment-ochre-2)}
+.t-str{color:var(--moss)}
+.t-com{color:rgb(var(--paper-rgb)/.34)}
+.t-out{color:rgb(var(--paper-rgb)/.66)}
+.hero-side-caption{
+  margin-top:var(--space-3);font-family:var(--font-mono);font-size:.6875rem;
+  color:rgb(var(--paper-rgb)/.4);letter-spacing:var(--tracking-mono-wide);
+}
+@media(max-width:1024px){
+  .hero-grid{grid-template-columns:minmax(0,1fr)}
+  .hero-stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+
+/* ── Ships-now strip ──────────────────────────────────────────────── */
+.ships{border-block:var(--hairline-paper);background:var(--ink-2)}
+.ships-inner{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-4) var(--space-8);padding-block:var(--space-6)}
+.ships-label{
+  font-family:var(--font-mono);font-size:.625rem;letter-spacing:var(--tracking-mono-wider);
+  text-transform:uppercase;color:rgb(var(--paper-rgb)/.4);
+}
+.ships-list{display:flex;flex-wrap:wrap;gap:var(--space-3) var(--space-6)}
+.ships-list li{
+  display:flex;align-items:center;gap:var(--space-2);
+  font-family:var(--font-mono);font-size:.8125rem;color:rgb(var(--paper-rgb)/.72);
+}
+.ships-list li::before{content:"▸";color:var(--basin-teal-3)}
+
+/* ── Sediment divider ─────────────────────────────────────────────── */
+.sediment{height:8px;display:flex;width:100%}
+.sediment i{flex:1;display:block}
+
+/* ── Feature grid ─────────────────────────────────────────────────── */
+.grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--space-6)}
+@media(max-width:900px){.grid-3{grid-template-columns:1fr}}
+.card{
+  position:relative;padding:var(--space-7);border:var(--hairline);
+  border-radius:var(--radius-3);background:var(--ink-2);
+  transition:border-color var(--dur-base) var(--ease-out),transform var(--dur-base) var(--ease-out);
+}
+.card:hover{border-color:rgb(var(--basin-teal-rgb)/.55);transform:translateY(-2px)}
+.card-num{
+  font-family:var(--font-mono);font-size:.625rem;letter-spacing:var(--tracking-mono-wider);
+  color:var(--basin-teal-3);display:block;margin-bottom:var(--space-4);
+}
+.card h3{font-size:1.1875rem;margin-bottom:var(--space-3);letter-spacing:var(--tracking-tight)}
+.card p{color:rgb(var(--paper-rgb)/.6);font-size:.9375rem;line-height:var(--lh-loose)}
+.card p code{color:var(--sediment-ochre-2)}
+
+/* ── Code section ─────────────────────────────────────────────────── */
+.code-grid{display:grid;grid-template-columns:minmax(0,.8fr) minmax(0,1.2fr);gap:clamp(24px,3vw,48px);align-items:start}
+@media(max-width:960px){.code-grid{grid-template-columns:1fr}}
+.code-side h3{font-size:1.25rem;margin-bottom:var(--space-4)}
+.code-side p{color:rgb(var(--paper-rgb)/.6);font-size:.9375rem;line-height:var(--lh-loose);margin-bottom:var(--space-5)}
+.code-side ul{display:flex;flex-direction:column;gap:var(--space-3)}
+.code-side li{
+  display:flex;gap:var(--space-3);font-size:.875rem;color:rgb(var(--paper-rgb)/.72);line-height:1.6;
+}
+.code-side li::before{content:"✓";color:var(--moss);font-family:var(--font-mono);flex-shrink:0}
+.code-side li code{color:var(--sediment-ochre-2)}
+.codeblock{border:var(--hairline);border-radius:var(--radius-3);overflow:hidden;background:var(--ink-2)}
+.codeblock-head{
+  display:flex;align-items:center;justify-content:space-between;gap:var(--space-4);
+  padding:10px var(--space-4);border-bottom:var(--hairline);background:var(--ink-3);
+}
+.codeblock-file{font-family:var(--font-mono);font-size:.6875rem;letter-spacing:var(--tracking-mono-wide);color:rgb(var(--paper-rgb)/.5)}
+.codeblock-tag{
+  font-family:var(--font-mono);font-size:.625rem;letter-spacing:var(--tracking-mono-wide);
+  text-transform:uppercase;color:var(--basin-teal-3);border:1px solid rgb(var(--basin-teal-rgb)/.4);
+  padding:2px 8px;border-radius:var(--radius-pill);
+}
+.codeblock-body{padding:var(--space-5);font-family:var(--font-mono);font-size:.8125rem;line-height:1.8;overflow-x:auto}
+.codeblock-body .l{white-space:pre;display:block}
+.codeblock-cap{
+  padding:10px var(--space-4);border-top:var(--hairline);
+  font-family:var(--font-mono);font-size:.6875rem;color:rgb(var(--paper-rgb)/.36);
+}
+
+/* ── Compatibility columns ────────────────────────────────────────── */
+.compat-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--space-6)}
+@media(max-width:900px){.compat-grid{grid-template-columns:1fr}}
+.compat-col{padding:var(--space-7);border:var(--hairline);border-radius:var(--radius-3);background:var(--ink-2)}
+.compat-col-yes{border-color:rgb(143 181 155/.34)}
+.compat-col-no{border-color:rgb(184 70 46/.3)}
+.compat-col-head{display:flex;align-items:center;gap:var(--space-3);margin-bottom:var(--space-6)}
+.compat-tag{
+  font-family:var(--font-mono);font-size:.625rem;letter-spacing:var(--tracking-mono-wider);
+  text-transform:uppercase;padding:3px 9px;border-radius:var(--radius-pill);
+}
+.compat-col-yes .compat-tag{background:rgb(143 181 155/.16);color:var(--moss)}
+.compat-col-no .compat-tag{background:rgb(184 70 46/.16);color:#DE7A63}
+.compat-col-rule{flex:1;height:1px;background:rgb(var(--paper-rgb)/.12)}
+.compat-col-head>span:last-child{font-family:var(--font-mono);font-size:.6875rem;color:rgb(var(--paper-rgb)/.4)}
+.compat-list{display:flex;flex-direction:column;gap:var(--space-4)}
+.compat-list li{display:flex;gap:var(--space-3);font-size:.875rem;line-height:1.65;color:rgb(var(--paper-rgb)/.68)}
+.compat-list strong{color:var(--paper);font-weight:var(--weight-semibold)}
+.compat-mark{font-family:var(--font-mono);flex-shrink:0}
+.compat-col-yes .compat-mark{color:var(--moss)}
+.compat-col-no .compat-mark{color:#DE7A63}
+
+/* ── Benchmarks ───────────────────────────────────────────────────── */
+.bench-table{width:100%;border-collapse:collapse;font-size:.875rem}
+.bench-table caption{
+  text-align:left;font-family:var(--font-mono);font-size:.6875rem;
+  letter-spacing:var(--tracking-mono-wide);color:rgb(var(--paper-rgb)/.4);
+  padding-bottom:var(--space-4);
+}
+.bench-table th{
+  text-align:left;font-family:var(--font-mono);font-size:.625rem;
+  letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;
+  color:rgb(var(--paper-rgb)/.42);font-weight:var(--weight-medium);
+  padding:var(--space-3) var(--space-4);border-bottom:var(--hairline-strong);
+}
+.bench-table td{padding:var(--space-3) var(--space-4);border-bottom:var(--hairline);vertical-align:top}
+.bench-table td:nth-child(2),.bench-table td:nth-child(3){font-family:var(--font-mono);font-size:.8125rem;color:rgb(var(--paper-rgb)/.74);white-space:nowrap}
+.bench-table tbody tr:hover{background:rgb(var(--paper-rgb)/.03)}
+.verdict{font-family:var(--font-mono);font-size:.8125rem;font-weight:var(--weight-semibold);white-space:nowrap}
+.verdict-win{color:var(--moss)}
+.verdict-loss{color:#DE7A63}
+.bench-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.bench-note{
+  margin-top:var(--space-6);padding:var(--space-5);border-left:2px solid var(--sediment-ochre);
+  background:rgb(var(--sediment-ochre-rgb)/.06);
+  font-size:.875rem;line-height:var(--lh-loose);color:rgb(var(--paper-rgb)/.66);
+}
+
+/* ── Comparison cards ─────────────────────────────────────────────── */
+.compare-list{display:flex;flex-direction:column;gap:var(--space-5)}
+.compare-item{
+  display:grid;grid-template-columns:minmax(0,180px) minmax(0,1fr);gap:var(--space-6);
+  padding:var(--space-6) 0;border-top:var(--hairline);
+}
+@media(max-width:800px){.compare-item{grid-template-columns:1fr;gap:var(--space-3)}}
+.compare-name{font-family:var(--font-display);font-weight:var(--weight-bold);font-size:1.0625rem;letter-spacing:var(--tracking-tight)}
+.compare-name span{
+  display:block;margin-top:var(--space-2);font-family:var(--font-mono);
+  font-size:.625rem;letter-spacing:var(--tracking-mono-wide);text-transform:uppercase;
+  color:var(--basin-teal-3);font-weight:var(--weight-regular);
+}
+.compare-body{color:rgb(var(--paper-rgb)/.66);font-size:.9375rem;line-height:var(--lh-loose)}
+.compare-body strong{color:var(--paper)}
+
+/* ── Quickstart ───────────────────────────────────────────────────── */
+.qs-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--space-6)}
+@media(max-width:900px){.qs-grid{grid-template-columns:1fr}}
+.qs-step{padding:var(--space-6);border:var(--hairline);border-radius:var(--radius-3);background:var(--ink-2)}
+.qs-step h3{font-size:1rem;margin-bottom:var(--space-3)}
+.qs-step p{font-size:.875rem;color:rgb(var(--paper-rgb)/.6);margin-bottom:var(--space-4);line-height:var(--lh-loose)}
+.qs-code{
+  background:var(--ink);border:var(--hairline);border-radius:var(--radius-2);
+  padding:var(--space-4);font-family:var(--font-mono);font-size:.78125rem;
+  line-height:1.75;overflow-x:auto;color:rgb(var(--paper-rgb)/.86);
+}
+.qs-code .l{white-space:pre;display:block}
+.qs-code .t-com{color:rgb(var(--paper-rgb)/.34)}
+
+/* ── Final CTA ────────────────────────────────────────────────────── */
+.cta{position:relative;overflow:hidden;background:var(--ink-2);text-align:center}
+.cta .container{position:relative;z-index:1}
+.cta h2{font-size:clamp(30px,4.4vw,56px);margin-bottom:var(--space-5)}
+.cta p{color:rgb(var(--paper-rgb)/.64);font-size:1.0625rem;line-height:var(--lh-loose);max-width:60ch;margin:0 auto var(--space-8)}
+.cta-actions{display:flex;flex-wrap:wrap;gap:var(--space-3);justify-content:center}
+
+/* ── Footer ───────────────────────────────────────────────────────── */
+.site-footer{background:var(--ink);border-top:var(--hairline-paper);padding-block:var(--space-10) var(--space-9)}
+.footer-grid{display:grid;grid-template-columns:minmax(0,1.4fr) repeat(3,minmax(0,1fr));gap:var(--space-8)}
+@media(max-width:900px){.footer-grid{grid-template-columns:1fr 1fr}}
+.footer-brand p{margin-top:var(--space-4);color:rgb(var(--paper-rgb)/.48);font-size:.875rem;line-height:var(--lh-loose);max-width:34ch}
+.footer-col h4{
+  font-family:var(--font-mono);font-size:.625rem;letter-spacing:var(--tracking-mono-wider);
+  text-transform:uppercase;color:rgb(var(--paper-rgb)/.4);margin-bottom:var(--space-4);font-weight:var(--weight-medium);
+}
+.footer-col ul{display:flex;flex-direction:column;gap:var(--space-3)}
+.footer-col a{font-size:.875rem;color:rgb(var(--paper-rgb)/.66);transition:color var(--dur-fast)}
+.footer-col a:hover{color:var(--paper)}
+.footer-vulos{
+  margin-top:var(--space-10);padding-top:var(--space-7);border-top:var(--hairline-paper);
+  display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-4);justify-content:space-between;
+}
+.footer-vulos-note{display:flex;align-items:center;gap:var(--space-3);font-size:.875rem;color:rgb(var(--paper-rgb)/.56);max-width:62ch;line-height:var(--lh-loose)}
+.footer-vulos-note svg{width:20px;height:20px;flex-shrink:0}
+.footer-vulos-note a{color:var(--basin-teal-3);font-weight:var(--weight-semibold)}
+.footer-legal{font-family:var(--font-mono);font-size:.6875rem;color:rgb(var(--paper-rgb)/.34);white-space:nowrap}
+
+/* ── Reveal on scroll ─────────────────────────────────────────────── */
+.reveal{opacity:0;transform:translateY(14px);transition:opacity var(--dur-slow) var(--ease-out),transform var(--dur-slow) var(--ease-out)}
+.reveal.is-visible{opacity:1;transform:none}
+@media(prefers-reduced-motion:reduce){
+  .reveal{opacity:1;transform:none;transition:none}
+  html{scroll-behavior:auto}
+  .btn:hover,.card:hover{transform:none}
+}
+</style>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container-wide nav">
+    <a class="brand" href="./index.html">
+      <svg viewBox="0 0 680 680" aria-hidden="true">
+        <g transform="translate(340,340)" fill="none" stroke="#FAF7F0" stroke-width="52" stroke-linecap="round">
+          <ellipse cx="0" cy="-110" rx="200" ry="44"/>
+          <path d="M -200 -110 Q -200 160, 0 160 Q 200 160, 200 -110"/>
+          <circle cx="0" cy="40" r="34" fill="#3B6F73" stroke="none"/>
+        </g>
+      </svg>
+      Basin
+    </a>
+    <div class="nav-spacer"></div>
+    <nav class="nav-links">
+      <a href="#architecture">Architecture</a>
+      <a href="#compat">Postgres compatibility</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#compare">Compare</a>
+      <a href="./docs.html">Docs</a>
+      <a href="https://github.com/vul-os/basin">GitHub</a>
+    </nav>
+    <a class="vulos-badge" href="https://vulos.org">Part of VulOS</a>
+  </div>
+</header>
+
+<main>
+
+  <!-- ── Hero ───────────────────────────────────────────────────── -->
+  <section class="hero" aria-labelledby="hero-h1">
+    <svg class="contour-bg hero-bg" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid slice" aria-hidden="true" role="presentation">
+      <g fill="none" stroke-linecap="round">
+<path d="M 0.00 50.93 C 33.33 53.27, 133.33 75.80, 200.00 64.94 C 266.67 54.07, 333.33 -10.70, 400.00 -14.27 C 466.67 -17.84, 533.33 35.15, 600.00 43.52 C 666.67 51.88, 733.33 14.78, 800.00 35.91 C 866.67 57.03, 933.33 166.63, 1000.00 170.28 C 1066.67 173.94, 1133.33 69.68, 1200.00 57.84 C 1266.67 45.99, 1333.33 100.26, 1400.00 99.21 C 1466.67 98.16, 1566.67 59.49, 1600.00 51.55" stroke="rgba(59, 111, 115, 1)" stroke-width="1.64" opacity="0.2558"/>
+<path d="M 0.00 96.10 C 33.33 96.62, 133.33 119.86, 200.00 99.22 C 266.67 78.58, 333.33 -29.19, 400.00 -27.75 C 466.67 -26.31, 533.33 89.44, 600.00 107.86 C 666.67 126.29, 733.33 60.23, 800.00 82.79 C 866.67 105.35, 933.33 247.52, 1000.00 243.25 C 1066.67 238.97, 1133.33 83.89, 1200.00 57.15 C 1266.67 30.41, 1333.33 85.15, 1400.00 82.82 C 1466.67 80.50, 1566.67 49.80, 1600.00 43.20" stroke="rgba(250, 247, 240, 1)" stroke-width="0.82" opacity="0.1017"/>
+<path d="M 0.00 142.46 C 33.33 149.33, 133.33 207.37, 200.00 183.70 C 266.67 160.02, 333.33 10.40, 400.00 0.38 C 466.67 -9.64, 533.33 121.35, 600.00 123.56 C 666.67 125.77, 733.33 -21.76, 800.00 13.65 C 866.67 49.07, 933.33 328.37, 1000.00 336.04 C 1066.67 343.72, 1133.33 86.39, 1200.00 59.73 C 1266.67 33.06, 1333.33 169.89, 1400.00 176.07 C 1466.67 182.24, 1566.67 110.00, 1600.00 96.79" stroke="rgba(250, 247, 240, 1)" stroke-width="0.81" opacity="0.1362"/>
+<path d="M 0.00 155.11 C 33.33 165.84, 133.33 235.25, 200.00 219.52 C 266.67 203.79, 333.33 70.87, 400.00 60.72 C 466.67 50.57, 533.33 148.48, 600.00 158.63 C 666.67 168.77, 733.33 85.61, 800.00 121.57 C 866.67 157.53, 933.33 367.09, 1000.00 374.37 C 1066.67 381.66, 1133.33 192.42, 1200.00 165.27 C 1266.67 138.12, 1333.33 220.77, 1400.00 211.48 C 1466.67 202.19, 1566.67 126.52, 1600.00 109.53" stroke="rgba(250, 247, 240, 1)" stroke-width="1.02" opacity="0.1090"/>
+<path d="M 0.00 261.96 C 33.33 265.22, 133.33 308.48, 200.00 281.56 C 266.67 254.65, 333.33 119.27, 400.00 100.47 C 466.67 81.67, 533.33 167.44, 600.00 168.76 C 666.67 170.08, 733.33 67.98, 800.00 108.39 C 866.67 148.80, 933.33 398.26, 1000.00 411.22 C 1066.67 424.19, 1133.33 210.46, 1200.00 186.19 C 1266.67 161.92, 1333.33 274.25, 1400.00 265.61 C 1466.67 256.97, 1566.67 156.23, 1600.00 134.35" stroke="rgba(59, 111, 115, 1)" stroke-width="1.83" opacity="0.3080"/>
+<path d="M 0.00 294.70 C 33.33 296.95, 133.33 338.62, 200.00 308.23 C 266.67 277.84, 333.33 128.65, 400.00 112.37 C 466.67 96.08, 533.33 195.81, 600.00 210.54 C 666.67 225.28, 733.33 163.51, 800.00 200.78 C 866.67 238.05, 933.33 423.43, 1000.00 434.13 C 1066.67 444.83, 1133.33 290.83, 1200.00 264.97 C 1266.67 239.12, 1333.33 291.13, 1400.00 278.99 C 1466.67 266.85, 1566.67 206.61, 1600.00 192.13" stroke="rgba(250, 247, 240, 1)" stroke-width="1.56" opacity="0.1054"/>
+<path d="M 0.00 297.47 C 33.33 302.95, 133.33 345.85, 200.00 330.38 C 266.67 314.91, 333.33 211.94, 400.00 204.67 C 466.67 197.40, 533.33 276.88, 600.00 286.76 C 666.67 296.64, 733.33 230.56, 800.00 263.96 C 866.67 297.36, 933.33 481.65, 1000.00 487.14 C 1066.67 492.63, 1133.33 319.78, 1200.00 296.89 C 1266.67 274.01, 1333.33 357.53, 1400.00 349.84 C 1466.67 342.15, 1566.67 267.26, 1600.00 250.74" stroke="rgba(250, 247, 240, 1)" stroke-width="1.48" opacity="0.1405"/>
+<path d="M 0.00 362.33 C 33.33 372.64, 133.33 439.40, 200.00 424.15 C 266.67 408.90, 333.33 283.58, 400.00 270.83 C 466.67 258.08, 533.33 343.53, 600.00 347.66 C 666.67 351.79, 733.33 274.14, 800.00 295.60 C 866.67 317.07, 933.33 470.29, 1000.00 476.44 C 1066.67 482.59, 1133.33 348.23, 1200.00 332.50 C 1266.67 316.78, 1333.33 378.47, 1400.00 382.10 C 1466.67 385.74, 1566.67 358.93, 1600.00 354.30" stroke="rgba(250, 247, 240, 1)" stroke-width="1.12" opacity="0.0934"/>
+<path d="M 0.00 401.94 C 33.33 403.11, 133.33 424.59, 200.00 409.00 C 266.67 393.41, 333.33 315.60, 400.00 308.42 C 466.67 301.23, 533.33 356.78, 600.00 365.89 C 666.67 375.00, 733.33 327.58, 800.00 363.09 C 866.67 398.61, 933.33 577.55, 1000.00 578.98 C 1066.67 580.42, 1133.33 400.04, 1200.00 371.68 C 1266.67 343.32, 1333.33 414.27, 1400.00 408.83 C 1466.67 403.39, 1566.67 350.66, 1600.00 339.03" stroke="rgba(59, 111, 115, 1)" stroke-width="1.65" opacity="0.2551"/>
+<path d="M 0.00 472.44 C 33.33 474.13, 133.33 495.26, 200.00 482.55 C 266.67 469.83, 333.33 406.77, 400.00 396.15 C 466.67 385.53, 533.33 418.67, 600.00 418.83 C 666.67 418.99, 733.33 377.14, 800.00 397.10 C 866.67 417.06, 933.33 534.53, 1000.00 538.60 C 1066.67 542.67, 1133.33 433.05, 1200.00 421.54 C 1266.67 410.04, 1333.33 466.64, 1400.00 469.56 C 1466.67 472.48, 1566.67 444.16, 1600.00 439.08" stroke="rgba(250, 247, 240, 1)" stroke-width="1.12" opacity="0.1416"/>
+<path d="M 0.00 497.18 C 33.33 502.85, 133.33 539.34, 200.00 531.18 C 266.67 523.02, 333.33 454.46, 400.00 448.22 C 466.67 441.98, 533.33 493.05, 600.00 493.73 C 666.67 494.40, 733.33 436.58, 800.00 452.27 C 866.67 467.95, 933.33 584.49, 1000.00 587.84 C 1066.67 591.19, 1133.33 485.33, 1200.00 472.36 C 1266.67 459.38, 1333.33 506.81, 1400.00 510.00 C 1466.67 513.18, 1566.67 494.55, 1600.00 491.46" stroke="rgba(250, 247, 240, 1)" stroke-width="0.82" opacity="0.0930"/>
+<path d="M 0.00 561.21 C 33.33 569.25, 133.33 632.29, 200.00 609.47 C 266.67 586.65, 333.33 441.06, 400.00 424.30 C 466.67 407.54, 533.33 503.47, 600.00 508.90 C 666.67 514.33, 733.33 435.07, 800.00 456.86 C 866.67 478.64, 933.33 633.92, 1000.00 639.61 C 1066.67 645.31, 1133.33 502.51, 1200.00 491.03 C 1266.67 479.55, 1333.33 567.71, 1400.00 570.73 C 1466.67 573.75, 1566.67 519.42, 1600.00 509.16" stroke="rgba(250, 247, 240, 1)" stroke-width="1.19" opacity="0.1092"/>
+<path d="M 0.00 565.78 C 33.33 573.99, 133.33 629.33, 200.00 615.02 C 266.67 600.72, 333.33 491.28, 400.00 479.94 C 466.67 468.59, 533.33 536.19, 600.00 546.93 C 666.67 557.68, 733.33 521.04, 800.00 544.38 C 866.67 567.72, 933.33 681.66, 1000.00 687.00 C 1066.67 692.33, 1133.33 590.17, 1200.00 576.38 C 1266.67 562.59, 1333.33 609.20, 1400.00 604.26 C 1466.67 599.33, 1566.67 556.35, 1600.00 546.77" stroke="rgba(59, 111, 115, 1)" stroke-width="1.41" opacity="0.3405"/>
+<path d="M 0.00 607.59 C 33.33 618.10, 133.33 691.43, 200.00 670.67 C 266.67 649.90, 333.33 499.05, 400.00 483.00 C 466.67 466.95, 533.33 564.99, 600.00 574.37 C 666.67 583.75, 733.33 508.82, 800.00 539.28 C 866.67 569.75, 933.33 751.03, 1000.00 757.16 C 1066.67 763.29, 1133.33 596.25, 1200.00 576.06 C 1266.67 555.88, 1333.33 634.54, 1400.00 636.07 C 1466.67 637.59, 1566.67 593.68, 1600.00 585.20" stroke="rgba(250, 247, 240, 1)" stroke-width="0.84" opacity="0.1587"/>
+<path d="M 0.00 681.85 C 33.33 683.26, 133.33 706.37, 200.00 690.27 C 266.67 674.18, 333.33 591.17, 400.00 585.26 C 466.67 579.36, 533.33 647.79, 600.00 654.85 C 666.67 661.90, 733.33 606.07, 800.00 627.58 C 866.67 649.09, 933.33 777.13, 1000.00 783.90 C 1066.67 790.66, 1133.33 683.20, 1200.00 668.17 C 1266.67 653.13, 1333.33 695.86, 1400.00 693.69 C 1466.67 691.51, 1566.67 661.55, 1600.00 655.12" stroke="rgba(250, 247, 240, 1)" stroke-width="1.31" opacity="0.1467"/>
+<path d="M 0.00 696.59 C 33.33 700.04, 133.33 727.27, 200.00 717.33 C 266.67 707.40, 333.33 638.49, 400.00 636.98 C 466.67 635.47, 533.33 696.80, 600.00 708.27 C 666.67 719.73, 733.33 680.73, 800.00 705.78 C 866.67 730.83, 933.33 861.54, 1000.00 858.59 C 1066.67 855.64, 1133.33 710.45, 1200.00 688.09 C 1266.67 665.74, 1333.33 730.76, 1400.00 724.47 C 1466.67 718.17, 1566.67 662.67, 1600.00 650.31" stroke="rgba(250, 247, 240, 1)" stroke-width="1.55" opacity="0.1425"/>
+<path d="M 0.00 731.27 C 33.33 743.07, 133.33 825.05, 200.00 802.08 C 266.67 779.12, 333.33 612.76, 400.00 593.48 C 466.67 574.20, 533.33 670.29, 600.00 686.42 C 666.67 702.54, 733.33 653.08, 800.00 690.22 C 866.67 727.36, 933.33 904.62, 1000.00 909.28 C 1066.67 913.94, 1133.33 742.43, 1200.00 718.17 C 1266.67 693.92, 1333.33 773.00, 1400.00 763.76 C 1466.67 754.52, 1566.67 679.56, 1600.00 662.72" stroke="rgba(59, 111, 115, 1)" stroke-width="1.07" opacity="0.2701"/>
+<path d="M 0.00 798.95 C 33.33 806.87, 133.33 873.56, 200.00 846.48 C 266.67 819.40, 333.33 645.17, 400.00 636.49 C 466.67 627.81, 533.33 776.26, 600.00 794.42 C 666.67 812.58, 733.33 715.40, 800.00 745.45 C 866.67 775.49, 933.33 970.39, 1000.00 974.69 C 1066.67 978.98, 1133.33 799.35, 1200.00 771.20 C 1266.67 743.05, 1333.33 818.03, 1400.00 805.79 C 1466.67 793.55, 1566.67 715.78, 1600.00 697.77" stroke="rgba(250, 247, 240, 1)" stroke-width="0.86" opacity="0.1085"/>
+      </g>
+    </svg>
+
+    <div class="hero-grid container-wide">
+      <div class="hero-copy">
+        <div class="hero-eyebrow eyebrow"><span>Survey — object-storage stratum</span></div>
+        <h1 id="hero-h1" class="display hero-title">
+          <span class="hero-line-1">A database that lives</span>
+          <span class="hero-line-2">on the bucket.</span>
+        </h1>
+
+        <div class="hero-rule" aria-hidden="true">
+          <span></span>
+          <span class="hero-rule-tag mono">elev. O(bytes active)</span>
+          <span></span>
+        </div>
+
+        <p class="hero-sub">
+          Basin is a <span class="wobble">bucket-native, multi-tenant</span> Postgres
+          alternative. Projects are <code>S3 prefixes</code>, not databases — so operator
+          cost tracks bytes actually stored, not databases provisioned. One binary,
+          pgwire on the front, Vortex-compressed columnar files on any S3-compatible
+          bucket on the back. Your Postgres drivers just work.
+        </p>
+
+        <div class="hero-ctas">
+          <a class="btn btn-primary" href="#quickstart">
+            Run Basin locally <span class="btn-arrow" aria-hidden="true">→</span>
+          </a>
+          <a class="btn btn-outline" href="https://github.com/vul-os/basin">View source</a>
+        </div>
+
+        <dl class="hero-stats mono">
+          <div class="hero-stat">
+            <dt>RAM per connection</dt>
+            <dd>310 <em>KiB</em></dd>
+          </div>
+          <div class="hero-stat">
+            <dt>vs Postgres 18</dt>
+            <dd>~27<em>×</em> less</dd>
+          </div>
+          <div class="hero-stat">
+            <dt>LATERAL JOIN</dt>
+            <dd>462<em>×</em> faster</dd>
+          </div>
+          <div class="hero-stat">
+            <dt>SQL fragments pass</dt>
+            <dd>863<em>/975</em></dd>
+          </div>
+        </dl>
+      </div>
+
+      <div class="hero-side">
+        <div class="hero-side-frame">
+          <span class="hero-side-corner hero-side-corner-tl" aria-hidden="true"></span>
+          <span class="hero-side-corner hero-side-corner-tr" aria-hidden="true"></span>
+          <span class="hero-side-corner hero-side-corner-bl" aria-hidden="true"></span>
+          <span class="hero-side-corner hero-side-corner-br" aria-hidden="true"></span>
+          <div class="terminal">
+            <div class="terminal-bar">
+              <span class="terminal-dot"></span><span class="terminal-dot"></span><span class="terminal-dot"></span>
+              <span class="terminal-title">psql — basin</span>
+            </div>
+            <div class="terminal-body">
+<span class="l"><span class="t-prompt">$</span> psql <span class="t-str">'postgres://alice@localhost:5433/alice'</span></span>
+<span class="l"><span class="t-out">psql (18.0, server basin/0.1.9)</span></span>
+<span class="l"><span class="t-out">Type "help" for help.</span></span>
+<span class="l"> </span>
+<span class="l"><span class="t-prompt">alice=&gt;</span> <span class="t-kw">CREATE TABLE</span> events (</span>
+<span class="l">           id    bigserial <span class="t-kw">PRIMARY KEY</span>,</span>
+<span class="l">           kind  text <span class="t-kw">NOT NULL</span>,</span>
+<span class="l">           at    timestamptz <span class="t-kw">DEFAULT</span> now()</span>
+<span class="l">         );</span>
+<span class="l"><span class="t-out">CREATE TABLE</span></span>
+<span class="l"> </span>
+<span class="l"><span class="t-prompt">alice=&gt;</span> <span class="t-kw">SELECT</span> kind, count(*) <span class="t-kw">FROM</span> events</span>
+<span class="l">         <span class="t-kw">GROUP BY</span> kind <span class="t-kw">ORDER BY</span> 2 <span class="t-kw">DESC</span>;</span>
+<span class="l"><span class="t-out">   kind    | count </span></span>
+<span class="l"><span class="t-out">-----------+-------</span></span>
+<span class="l"><span class="t-out"> pageview  | 41822</span></span>
+<span class="l"><span class="t-out"> signup    |  1190</span></span>
+<span class="l"><span class="t-com">(2 rows)  -- scanned from Vortex on S3</span></span>
+            </div>
+          </div>
+        </div>
+        <p class="hero-side-caption mono">
+          <span aria-hidden="true">↑</span> ordinary pgwire — no driver changes
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Ships-now strip ────────────────────────────────────────── -->
+  <div class="ships">
+    <div class="container-wide ships-inner">
+      <span class="ships-label">Ships today</span>
+      <ul class="ships-list">
+        <li>pgwire v3</li>
+        <li>Row-Level Security</li>
+        <li>Vector search (HNSW)</li>
+        <li>Iceberg catalog</li>
+        <li>REST + Auth</li>
+        <li>Wasm functions</li>
+        <li>HTAP hot tier</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="sediment" aria-hidden="true">
+    <i style="background:#3B6F73"></i><i style="background:#4F858A"></i>
+    <i style="background:#5C5C5C"></i><i style="background:#C4732B"></i>
+    <i style="background:#8FB59B"></i><i style="background:#2A5256"></i>
+  </div>
+
+  <!-- ── Architecture ───────────────────────────────────────────── -->
+  <section id="architecture" class="section section-ink" aria-labelledby="arch-h2">
+    <div class="container">
+      <div class="section-head reveal">
+        <span class="eyebrow">Architecture · the shape</span>
+        <h2 id="arch-h2" class="display">Isolation is the storage layout, not a policy.</h2>
+        <p>
+          A new project doesn't fork a process, doesn't book a VM, and doesn't draw a
+          monthly minimum. It's a bucket prefix the engine refuses to read across. That
+          one decision is where the RAM, the cost curve, and the tenant ceiling all come from.
+        </p>
+      </div>
+
+      <div class="grid-3">
+        <article class="card reveal">
+          <span class="card-num mono">01 / prefix</span>
+          <h3>Projects are prefixes</h3>
+          <p>
+            The connection URL identifies a project, resolved once at connection accept.
+            After that it's ordinary SQL — no per-query auth, no row-scoping boilerplate.
+            Adding a tenant writes no new heap pages and books no connection slot.
+          </p>
+        </article>
+        <article class="card reveal">
+          <span class="card-num mono">02 / columnar</span>
+          <h3>Vortex on object storage</h3>
+          <p>
+            Data lands as Vortex-compressed columnar files (Parquet opt-in per table)
+            on any S3-compatible bucket, with a file-backed WAL in front. Bytes at rest
+            compound: <code>102×</code> smaller than Postgres on real S3 at 100k rows.
+          </p>
+        </article>
+        <article class="card reveal">
+          <span class="card-num mono">03 / one binary</span>
+          <h3>One process, whole surface</h3>
+          <p>
+            pgwire, REST, auth, RLS, vector search, cron and Wasm functions are one
+            binary. <code>310 KiB</code> of RAM per held-open connection means a
+            connection-heavy front end stops being the thing that sizes your box.
+          </p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Code ───────────────────────────────────────────────────── -->
+  <section class="section section-ink-2" aria-labelledby="code-h2">
+    <div class="container">
+      <div class="section-head reveal">
+        <span class="eyebrow">Code · psql session</span>
+        <h2 id="code-h2" class="display">The same SQL your app already speaks.</h2>
+        <p>
+          Basin speaks pgwire and parses with <code>libpg_query</code> — the actual
+          PostgreSQL parser, vendored. Your ORM doesn't know the difference because,
+          at parse time, there isn't one.
+        </p>
+      </div>
+
+      <div class="code-grid">
+        <div class="code-side reveal">
+          <h3>What you get for free</h3>
+          <p>
+            Schema migrations, connection pools and per-row scoping collapse into the
+            basin itself. The isolation isn't an extension — it's the storage shape.
+          </p>
+          <ul>
+            <li>Project bound at connection accept — no per-query auth</li>
+            <li>No row-level security policy boilerplate</li>
+            <li>Same <code>EXPLAIN</code>, same <code>pg_stat_statements</code></li>
+            <li>Migrations: <code>sqlx</code>, <code>flyway</code>, <code>prisma</code></li>
+          </ul>
+        </div>
+
+        <div class="codeblock reveal">
+          <div class="codeblock-head">
+            <span class="codeblock-file mono">project_isolation.sql</span>
+            <span class="codeblock-tag">psql</span>
+          </div>
+          <div class="codeblock-body">
+<span class="l"><span class="t-com">-- Two projects, one engine, one bucket.</span></span>
+<span class="l"><span class="t-com">-- The prefix is the boundary.</span></span>
+<span class="l"> </span>
+<span class="l"><span class="t-prompt">alice=&gt;</span> <span class="t-kw">SELECT</span> count(*) <span class="t-kw">FROM</span> events;</span>
+<span class="l"><span class="t-out"> count </span></span>
+<span class="l"><span class="t-out">-------</span></span>
+<span class="l"><span class="t-out"> 43012</span></span>
+<span class="l"> </span>
+<span class="l"><span class="t-prompt">bob=&gt;</span>   <span class="t-kw">SELECT</span> count(*) <span class="t-kw">FROM</span> events;</span>
+<span class="l"><span class="t-out"> count </span></span>
+<span class="l"><span class="t-out">-------</span></span>
+<span class="l"><span class="t-out">     0</span></span>
+<span class="l"> </span>
+<span class="l"><span class="t-com">-- Same table name. Different prefix.</span></span>
+<span class="l"><span class="t-com">-- No policy was written to make this true.</span></span>
+<span class="l"> </span>
+<span class="l"><span class="t-prompt">bob=&gt;</span>   <span class="t-kw">ALTER TABLE</span> events <span class="t-kw">ENABLE ROW LEVEL SECURITY</span>;</span>
+<span class="l"><span class="t-out">ALTER TABLE</span></span>
+          </div>
+          <div class="codeblock-cap mono">pgwire v3 · server basin/0.1.9</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Postgres compatibility ─────────────────────────────────── -->
+  <section id="compat" class="section section-ink" aria-labelledby="compat-h2">
+    <div class="container">
+      <div class="section-head reveal">
+        <span class="eyebrow">What we do · what we don't</span>
+        <h2 id="compat-h2" class="display">Postgres-compatible, with edges.</h2>
+        <p>
+          Postgres-compatible, not Postgres. <strong>863 of 975 SQL fragments</strong>
+          pass on the default configuration (88.5%). Every "no" below has a written
+          rationale and the trigger that would change our mind.
+        </p>
+      </div>
+
+      <div class="compat-grid">
+        <div class="compat-col compat-col-yes reveal">
+          <header class="compat-col-head">
+            <span class="compat-tag">supported</span>
+            <span class="compat-col-rule" aria-hidden="true"></span>
+            <span>your driver, unchanged</span>
+          </header>
+          <ul class="compat-list">
+            <li><span class="compat-mark" aria-hidden="true">✓</span><span><strong>pgwire v3</strong> — simple + extended query, TLS, COPY, prepared statements, binary params</span></li>
+            <li><span class="compat-mark" aria-hidden="true">✓</span><span><strong>SQL surface</strong> — CREATE/INSERT/UPDATE/DELETE, joins, ORDER BY, LIMIT, ALTER TABLE, GENERATED columns, CHECK / PRIMARY KEY / FOREIGN KEY (single-shard)</span></li>
+            <li><span class="compat-mark" aria-hidden="true">✓</span><span><strong>Row-Level Security</strong> — ENABLE ROW LEVEL SECURITY + CREATE POLICY, plan-layer enforcement</span></li>
+            <li><span class="compat-mark" aria-hidden="true">✓</span><span><strong>Native vector search</strong> — vector(N) + HNSW, pgvector-compatible operators</span></li>
+            <li><span class="compat-mark" aria-hidden="true">✓</span><span><strong>Extension equivalents</strong> — pgcrypto, uuid-ossp, pg_trgm, basin-cron, basin-net, basin-geo (PostGIS subset), basin-cv (continuous aggregates)</span></li>
+            <li><span class="compat-mark" aria-hidden="true">✓</span><span><strong>LANGUAGE sql</strong> functions + CALL procedures, planning-time inlined</span></li>
+          </ul>
+        </div>
+
+        <div class="compat-col compat-col-no reveal">
+          <header class="compat-col-head">
+            <span class="compat-tag">not supported</span>
+            <span class="compat-col-rule" aria-hidden="true"></span>
+            <span>by design</span>
+          </header>
+          <ul class="compat-list">
+            <li><span class="compat-mark" aria-hidden="true">×</span><span><strong>Replication protocol</strong> — wrong shape for object-store storage; logical decoding / CDC out of scope.</span></li>
+            <li><span class="compat-mark" aria-hidden="true">×</span><span><strong>PL/pgSQL, PL/Python, PL/Perl</strong> — no alt-language stored procedures. Use LANGUAGE sql + change-event reactors instead.</span></li>
+            <li><span class="compat-mark" aria-hidden="true">×</span><span><strong>Loadable .so extensions</strong> — no upstream extension binaries. The common ones ship as Basin-flavored crates with the same SQL semantics.</span></li>
+            <li><span class="compat-mark" aria-hidden="true">×</span><span><strong>postgres_fdw / dblink</strong> — no foreign-PG query federation. Use basin-net for HTTP-shaped cross-system reads.</span></li>
+            <li><span class="compat-mark" aria-hidden="true">×</span><span><strong>Types</strong> — INTERVAL, MONEY, XML, full geometric (LINESTRING / POLYGON) on the wire are not shipped; basin-geo covers the Point + box subset.</span></li>
+            <li><span class="compat-mark" aria-hidden="true">×</span><span><strong>Cross-region 2PC</strong> — Spanner-class distributed transactions are out of scope.</span></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Benchmarks ─────────────────────────────────────────────── -->
+  <section id="benchmarks" class="section section-ink-2" aria-labelledby="bench-h2">
+    <div class="container">
+      <div class="section-head reveal">
+        <span class="eyebrow">Benchmarks · wins and losses</span>
+        <h2 id="bench-h2" class="display">Measured, including where we lose.</h2>
+        <p>
+          1M rows on LocalFS, no index on either side, default configuration — no
+          non-default flags. Postgres is the right answer for microsecond point
+          mutations, and the table says so.
+        </p>
+      </div>
+
+      <div class="bench-scroll reveal">
+        <table class="bench-table">
+          <caption>Basin (Vortex) vs Postgres 18 · 1M rows, LocalFS, single idle box</caption>
+          <thead>
+            <tr><th scope="col">Workload</th><th scope="col">Basin</th><th scope="col">Postgres 18</th><th scope="col">Verdict</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>RAM per held-open connection</td><td>310 KiB</td><td>8,257 KiB</td><td class="verdict verdict-win">~27× less</td></tr>
+            <tr><td>Connections under 1,000-conn flood</td><td>1,000 held</td><td>100 held / 900 refused</td><td class="verdict verdict-win">structural</td></tr>
+            <tr><td>LATERAL JOIN (correlated derived table)</td><td>6.7 ms</td><td>3,080 ms</td><td class="verdict verdict-win">462× faster</td></tr>
+            <tr><td>Star join (events ⋈ users ⋈ categories)</td><td>11.6 ms</td><td>3,040 ms</td><td class="verdict verdict-win">261× faster</td></tr>
+            <tr><td>Correlated subquery in SELECT p50</td><td>49 ms</td><td>5,510 ms</td><td class="verdict verdict-win">113× faster</td></tr>
+            <tr><td>Range scan p50 (~1k rows)</td><td>0.40 ms</td><td>32 ms</td><td class="verdict verdict-win">81× faster</td></tr>
+            <tr><td>Bulk INSERT 1,000,000 rows</td><td>2,080 ms</td><td>8,100 ms</td><td class="verdict verdict-win">3.9× faster</td></tr>
+            <tr><td>Point query p50 (unindexed PK)</td><td>0.50 ms</td><td>0.002 ms</td><td class="verdict verdict-loss">slower</td></tr>
+            <tr><td>Single-row UPDATE p50</td><td>1.24 ms</td><td>0.012 ms</td><td class="verdict verdict-loss">slower</td></tr>
+            <tr><td>COUNT(*) full table p50</td><td>95 ms</td><td>29 ms</td><td class="verdict verdict-loss">slower</td></tr>
+            <tr><td>Deep top-K sort (ORDER BY … LIMIT 1000)</td><td>161 ms</td><td>53 ms</td><td class="verdict verdict-loss">slower</td></tr>
+            <tr><td>On-disk bytes (1M rows, LocalFS)</td><td>321 MB</td><td>306 MB</td><td class="verdict verdict-loss">~5% larger</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="bench-note reveal">
+        <strong>Read the losses as the shape, not the footnote.</strong> Basin trades
+        microsecond point mutations for columnar scans and bytes-at-rest. The on-disk
+        row is an honest flip on this card — Basin is still 1.9× smaller at 100k rows
+        and <strong>102× smaller on real S3</strong>, where compression compounds
+        against block storage. Published numbers use the default configuration; the
+        HTAP fast paths are always on.
+      </p>
+    </div>
+  </section>
+
+  <!-- ── Compare ────────────────────────────────────────────────── -->
+  <section id="compare" class="section section-ink" aria-labelledby="cmp-h2">
+    <div class="container">
+      <div class="section-head reveal">
+        <span class="eyebrow">Compare · where each one wins</span>
+        <h2 id="cmp-h2" class="display">When Basin is the wrong answer.</h2>
+        <p>
+          Every database here is good at something Basin isn't. The useful question is
+          which shape your workload actually has.
+        </p>
+      </div>
+
+      <div class="compare-list">
+        <div class="compare-item reveal">
+          <div class="compare-name">Postgres<span>Aurora · RDS</span></div>
+          <p class="compare-body">
+            The right answer for <strong>single-project, high-frequency OLTP</strong> and
+            anything needing microsecond point-mutation latency at 1M+ rows. Basin isn't
+            trying to be Postgres on those shapes. Basin wins on many-isolated-projects,
+            append-shaped data, bulk ingest, columnar analytical scans, and the
+            RAM-per-connection economics for connection-heavy front ends.
+          </p>
+        </div>
+        <div class="compare-item reveal">
+          <div class="compare-name">Neon<span>serverless PG</span></div>
+          <p class="compare-body">
+            Serverless Postgres with branching — terrific for <strong>single-DB
+            workloads</strong> that want copy-on-write forks. Basin matches the branching
+            story (Iceberg forks are zero-copy too) but stores on plain S3 rather than a
+            managed page server, so per-project cost tracks bytes rather than a
+            provisioned pool.
+          </p>
+        </div>
+        <div class="compare-item reveal">
+          <div class="compare-name">Supabase<span>BaaS in a box</span></div>
+          <p class="compare-body">
+            Postgres + Auth + Edge Functions + Storage + Realtime. Basin covers the
+            SQL + Auth + REST surface in one binary, with <code>auth.uid()</code> /
+            <code>auth.role()</code> / <code>auth.jwt()</code> working identically. The
+            difference is the data layer: Vortex/Parquet on S3 instead of a Postgres heap
+            on block storage. Edge Functions, Realtime and Storage are out of scope.
+          </p>
+        </div>
+        <div class="compare-item reveal">
+          <div class="compare-name">Nile<span>multi-tenant PG</span></div>
+          <p class="compare-body">
+            Same problem space, built on real PostgreSQL with per-tenant virtual
+            databases — which buys real PG semantics, real OLTP, real JSONB, real
+            extensions and PL/pgSQL, exactly where Basin still trails.
+            <strong>If your workload is point-mutation-heavy and JSONB-heavy with under
+            1k tenants, Nile is probably the easier answer today.</strong> Basin's
+            structural answer is substrate economics: cold or low-traffic tenants stay
+            near-zero because cost is O(bytes-on-S3) with shared compute.
+          </p>
+        </div>
+        <div class="compare-item reveal">
+          <div class="compare-name">Turso<span>libSQL · edge</span></div>
+          <p class="compare-body">
+            The right answer for <strong>edge-distributed apps</strong> with many tiny
+            SQLite-class databases. Basin is for centralized apps that want Postgres SQL
+            on cheap object storage with a wire protocol ORMs already speak.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Quickstart ─────────────────────────────────────────────── -->
+  <section id="quickstart" class="section section-ink-2" aria-labelledby="qs-h2">
+    <div class="container">
+      <div class="section-head reveal">
+        <span class="eyebrow">Quickstart · self-host</span>
+        <h2 id="qs-h2" class="display">One binary. No object store required to start.</h2>
+        <p>
+          Point Basin at a data directory and run. Local development needs no external
+          bucket — the same binary that runs on your laptop is the one that runs on S3.
+        </p>
+      </div>
+
+      <div class="qs-grid">
+        <div class="qs-step reveal">
+          <h3>Docker — under five minutes</h3>
+          <p>No Rust toolchain. pgwire comes up and <code>psql</code> connects.</p>
+          <div class="qs-code">
+<span class="l">docker run --rm \</span>
+<span class="l">  -p 5432:5432 \</span>
+<span class="l">  -v basin-data:/var/basin \</span>
+<span class="l">  --name basin \</span>
+<span class="l">  basin-server</span>
+          </div>
+        </div>
+        <div class="qs-step reveal">
+          <h3>From source</h3>
+          <p>Durable WAL and Vortex columnar files under your data dir; in-memory catalog for fast iteration.</p>
+          <div class="qs-code">
+<span class="l"><span class="t-com"># pgwire on 127.0.0.1:5433</span></span>
+<span class="l">BASIN_DATA_DIR=/tmp/basin \</span>
+<span class="l">  cargo run -p basin-server</span>
+<span class="l"> </span>
+<span class="l"><span class="t-com"># then, from anywhere:</span></span>
+<span class="l">psql postgres://localhost:5433</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Final CTA ──────────────────────────────────────────────── -->
+  <section class="section cta" aria-labelledby="cta-h2">
+    <div class="container-narrow">
+      <h2 id="cta-h2" class="display reveal">Pre-alpha, built in the open.</h2>
+      <p class="reveal">
+        Basin is being built in public — use it today to evaluate the cost shape,
+        prototype multi-tenant patterns, or contribute. The benchmarks publish wins
+        <em>and</em> losses, and the roadmap says what isn't done.
+      </p>
+      <div class="cta-actions reveal">
+        <a class="btn btn-primary" href="https://github.com/vul-os/basin">
+          Read the source <span class="btn-arrow" aria-hidden="true">→</span>
+        </a>
+        <a class="btn btn-outline" href="./docs.html">Documentation</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a class="brand" href="./index.html">
+          <svg viewBox="0 0 680 680" aria-hidden="true">
+            <g transform="translate(340,340)" fill="none" stroke="#FAF7F0" stroke-width="52" stroke-linecap="round">
+              <ellipse cx="0" cy="-110" rx="200" ry="44"/>
+              <path d="M -200 -110 Q -200 160, 0 160 Q 200 160, 200 -110"/>
+              <circle cx="0" cy="40" r="34" fill="#3B6F73" stroke="none"/>
+            </g>
+          </svg>
+          Basin
+        </a>
+        <p>
+          Bucket-native, multi-tenant Postgres alternative. Apache-2.0, written in Rust,
+          self-hostable on any S3-compatible bucket.
+        </p>
+      </div>
+
+      <div class="footer-col">
+        <h4>Project</h4>
+        <ul>
+          <li><a href="https://github.com/vul-os/basin">Source</a></li>
+          <li><a href="https://github.com/vul-os/basin/releases">Releases</a></li>
+          <li><a href="https://github.com/vul-os/basin/blob/main/CHANGELOG.md">Changelog</a></li>
+          <li><a href="https://github.com/vul-os/basin/blob/main/ROADMAP.md">Roadmap</a></li>
+        </ul>
+      </div>
+
+      <div class="footer-col">
+        <h4>Docs</h4>
+        <ul>
+          <li><a href="./docs.html">Documentation</a></li>
+          <li><a href="./docs.html#quickstart">Quickstart</a></li>
+          <li><a href="./docs.html#architecture">Architecture</a></li>
+          <li><a href="./docs.html#compatibility">SQL compatibility</a></li>
+        </ul>
+      </div>
+
+      <div class="footer-col">
+        <h4>Clients</h4>
+        <ul>
+          <li><a href="https://github.com/vul-os/basin/tree/main/sdks">Ten SDKs</a></li>
+          <li><a href="https://github.com/vul-os/basin/tree/main/cli">CLI</a></li>
+          <li><a href="https://github.com/vul-os/basin/tree/main/examples">Examples</a></li>
+          <li><a href="https://github.com/vul-os/basin/blob/main/CONTRIBUTING.md">Contributing</a></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="footer-vulos">
+      <p class="footer-vulos-note">
+        <svg viewBox="0 0 680 680" aria-hidden="true">
+          <g transform="translate(340,340)" fill="none" stroke="#60999E" stroke-width="56" stroke-linecap="round">
+            <ellipse cx="0" cy="-110" rx="200" ry="44"/>
+            <path d="M -200 -110 Q -200 160, 0 160 Q 200 160, 200 -110"/>
+          </g>
+        </svg>
+        <span>
+          Part of <a href="https://vulos.org">VulOS</a> — the open, self-hostable web OS
+          &amp; app suite. Basin runs standalone and requires nothing else in the suite;
+          being an app the OS can host is an option, never a dependency.
+        </span>
+      </p>
+      <span class="footer-legal">Apache-2.0 · pre-alpha</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+/* Reveal-on-scroll — same IntersectionObserver contract the app uses:
+   reveal once, then stop observing. Honours prefers-reduced-motion by
+   leaving every element in its visible resting state (the CSS media
+   query already neutralises the transform). */
+(function () {
+  if (!('IntersectionObserver' in window)) {
+    document.querySelectorAll('.reveal').forEach(function (el) { el.classList.add('is-visible') })
+    return
+  }
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    document.querySelectorAll('.reveal').forEach(function (el) { el.classList.add('is-visible') })
+    return
+  }
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) { e.target.classList.add('is-visible'); io.unobserve(e.target) }
+    })
+  }, { rootMargin: '-8% 0px -6% 0px', threshold: 0.06 })
+  document.querySelectorAll('.reveal').forEach(function (el) { io.observe(el) })
+})()
+</script>
+
+</body>
+</html>

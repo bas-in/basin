@@ -1,0 +1,14 @@
+<svg width="520" height="128" viewBox="0 0 520 128" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Basin">
+  <!-- Wordmark for dark (ink) surfaces: mark + "Basin" set tight, with
+       the contour-survey underline the site uses as its signature rule. -->
+  <g transform="translate(64, 62) scale(0.145)" fill="none" stroke="#FAF7F0" stroke-width="44" stroke-linecap="round">
+    <ellipse cx="0" cy="-110" rx="200" ry="44"/>
+    <path d="M -200 -110 Q -200 160, 0 160 Q 200 160, 200 -110"/>
+    <circle cx="0" cy="40" r="32" fill="#3B6F73" stroke="none"/>
+  </g>
+  <text x="126" y="80"
+        font-family="'Inter Display','Inter',ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+        font-size="62" font-weight="900" letter-spacing="-2.2" fill="#FAF7F0">Basin</text>
+  <path d="M 128 98 C 168 92, 208 104, 248 98 C 288 92, 328 104, 368 98"
+        fill="none" stroke="#3B6F73" stroke-width="3" stroke-linecap="round" opacity="0.85"/>
+</svg>

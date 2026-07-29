@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Basin — documentation</title>
+<meta name="description" content="Documentation for Basin: quickstart, architecture, SQL compatibility, multi-project isolation, client SDKs, and operations. Postgres-compatible, bucket-native, Apache-2.0.">
+<link rel="icon" href="./assets/brand/favicon.svg">
+<meta property="og:title" content="Basin — documentation">
+<meta property="og:description" content="Quickstart, architecture, SQL compatibility, SDKs and operations for Basin.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://vulos.org/projects/basin/docs.html">
+<style>
+/* Same survey system as landing.html — kept inline so this page stands
+   alone when opened directly rather than through the vulos.org frame. */
+:root{
+  --ink:#0F1115; --ink-2:#16191F; --ink-3:#1E2229;
+  --paper:#FAF7F0; --paper-2:#F2EDE2; --paper-3:#E8E1D0;
+  --basin-teal:#3B6F73; --basin-teal-2:#4F858A; --basin-teal-3:#60999E;
+  --basin-teal-deep:#2A5256;
+  --sediment-ochre:#C4732B; --sediment-ochre-2:#DA8638;
+  --graphite:#5C5C5C; --graphite-3:#828282;
+  --moss:#8FB59B; --clay:#B8462E;
+
+  --ink-rgb:15 17 21;
+  --paper-rgb:250 247 240;
+  --basin-teal-rgb:59 111 115;
+  --sediment-ochre-rgb:196 115 43;
+  --graphite-rgb:92 92 92;
+
+  --font-display:"Inter Display","Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --font-body:"Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --font-mono:"JetBrains Mono","IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+
+  --weight-medium:500; --weight-semibold:600; --weight-bold:700; --weight-black:900;
+  --lh-base:1.5; --lh-loose:1.7;
+  --tracking-tight:-.02em; --tracking-tighter:-.035em;
+  --tracking-mono-wide:.06em; --tracking-mono-wider:.14em;
+
+  --space-1:4px;  --space-2:8px;   --space-3:12px; --space-4:16px;
+  --space-5:20px; --space-6:24px;  --space-7:32px; --space-8:40px;
+  --space-9:48px; --space-10:64px; --space-11:80px; --space-12:96px;
+
+  --container:1200px; --container-wide:1440px;
+  --side-pad:clamp(20px,4vw,56px);
+  --radius-2:4px; --radius-3:8px; --radius-pill:999px;
+  --hairline:1px solid rgb(var(--graphite-rgb)/.22);
+  --hairline-paper:1px solid rgb(var(--paper-rgb)/.14);
+  --ease-out:cubic-bezier(.2,.7,.2,1);
+  --dur-fast:140ms; --dur-base:240ms;
+  --focus-ring:0 0 0 3px rgb(var(--basin-teal-rgb)/.45);
+}
+*,*::before,*::after{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--ink);color:var(--paper);font-family:var(--font-body);font-size:16px;line-height:var(--lh-base);-webkit-font-smoothing:antialiased}
+svg{max-width:100%;display:block}
+a{color:inherit;text-decoration:none}
+h1,h2,h3{margin:0;font-family:var(--font-display);letter-spacing:var(--tracking-tighter);line-height:1.08}
+p{margin:0}
+ul{margin:0;padding:0;list-style:none}
+code{font-family:var(--font-mono);font-size:.92em}
+:focus-visible{outline:none;box-shadow:var(--focus-ring);border-radius:var(--radius-2)}
+
+.container{max-width:var(--container);margin:0 auto;padding-inline:var(--side-pad)}
+.container-wide{max-width:var(--container-wide);margin:0 auto;padding-inline:var(--side-pad)}
+.mono{font-family:var(--font-mono)}
+.display{font-family:var(--font-display);font-weight:var(--weight-black)}
+
+.eyebrow{
+  display:inline-flex;align-items:center;gap:var(--space-2);
+  font-family:var(--font-mono);font-size:.6875rem;font-weight:var(--weight-medium);
+  letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;color:var(--basin-teal-3);
+}
+.eyebrow::before{content:"";width:18px;height:1px;background:var(--basin-teal);display:inline-block}
+
+/* Header — identical to the landing so the two read as one site. */
+.site-header{position:sticky;top:0;z-index:50;background:rgb(var(--ink-rgb)/.78);backdrop-filter:blur(14px);border-bottom:var(--hairline-paper)}
+.nav{display:flex;align-items:center;gap:var(--space-6);height:64px}
+.brand{display:flex;align-items:center;gap:10px;font-family:var(--font-display);font-weight:var(--weight-black);font-size:1.125rem;letter-spacing:var(--tracking-tighter)}
+.brand svg{width:26px;height:26px}
+.nav-spacer{flex:1}
+.nav-links{display:flex;align-items:center;gap:var(--space-6)}
+.nav-links a{font-size:.875rem;font-weight:var(--weight-medium);color:rgb(var(--paper-rgb)/.6);transition:color var(--dur-fast) var(--ease-out)}
+.nav-links a:hover,.nav-links a[aria-current="page"]{color:var(--paper)}
+.vulos-badge{
+  display:inline-flex;align-items:center;gap:var(--space-2);padding:6px 12px;
+  border:var(--hairline-paper);border-radius:var(--radius-pill);
+  font-family:var(--font-mono);font-size:.6875rem;letter-spacing:var(--tracking-mono-wide);
+  text-transform:uppercase;color:rgb(var(--paper-rgb)/.62);
+  transition:border-color var(--dur-fast),color var(--dur-fast);
+}
+.vulos-badge:hover{border-color:var(--basin-teal-3);color:var(--paper)}
+@media(max-width:900px){.nav-links{display:none}}
+
+/* Masthead */
+.docs-head{padding-block:var(--space-11) var(--space-9);border-bottom:var(--hairline-paper);background:var(--ink-2)}
+.docs-head h1{font-size:clamp(32px,4.6vw,56px);margin:var(--space-4) 0}
+.docs-head p{color:rgb(var(--paper-rgb)/.64);font-size:1.0625rem;line-height:var(--lh-loose);max-width:64ch}
+
+/* Layout: sticky rail + content */
+.docs-layout{display:grid;grid-template-columns:minmax(0,220px) minmax(0,1fr);gap:clamp(32px,5vw,72px);padding-block:var(--space-10) var(--space-12)}
+@media(max-width:900px){.docs-layout{grid-template-columns:1fr;gap:var(--space-8)}}
+.docs-rail{position:sticky;top:88px;align-self:start}
+@media(max-width:900px){.docs-rail{position:static}}
+.docs-rail h2{
+  font-family:var(--font-mono);font-size:.625rem;letter-spacing:var(--tracking-mono-wider);
+  text-transform:uppercase;color:rgb(var(--paper-rgb)/.4);margin-bottom:var(--space-4);font-weight:var(--weight-medium);
+}
+.docs-rail ul{display:flex;flex-direction:column;gap:var(--space-3)}
+.docs-rail a{font-size:.875rem;color:rgb(var(--paper-rgb)/.62);transition:color var(--dur-fast)}
+.docs-rail a:hover{color:var(--basin-teal-3)}
+
+.docs-section{margin-bottom:var(--space-12);scroll-margin-top:88px}
+.docs-section:last-child{margin-bottom:0}
+.docs-section>h2{font-size:clamp(24px,2.6vw,34px);margin:var(--space-3) 0 var(--space-4)}
+.docs-section>p{color:rgb(var(--paper-rgb)/.66);font-size:.9875rem;line-height:var(--lh-loose);max-width:70ch;margin-bottom:var(--space-6)}
+.docs-section>p code{color:var(--sediment-ochre-2)}
+
+/* Link cards */
+.doc-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--space-4)}
+@media(max-width:700px){.doc-list{grid-template-columns:1fr}}
+.doc-card{
+  display:block;padding:var(--space-5);border:var(--hairline);border-radius:var(--radius-3);
+  background:var(--ink-2);
+  transition:border-color var(--dur-base) var(--ease-out),transform var(--dur-base) var(--ease-out);
+}
+.doc-card:hover{border-color:rgb(var(--basin-teal-rgb)/.55);transform:translateY(-2px)}
+.doc-card h3{font-size:.9875rem;margin-bottom:var(--space-2);letter-spacing:var(--tracking-tight)}
+.doc-card p{font-size:.8125rem;color:rgb(var(--paper-rgb)/.56);line-height:1.6}
+.doc-card .path{
+  display:block;margin-top:var(--space-3);font-family:var(--font-mono);font-size:.6875rem;
+  color:var(--basin-teal-3);letter-spacing:var(--tracking-mono-wide);
+}
+
+/* Code */
+.code{
+  background:var(--ink-2);border:var(--hairline);border-radius:var(--radius-3);
+  padding:var(--space-5);font-family:var(--font-mono);font-size:.8125rem;line-height:1.8;
+  overflow-x:auto;color:rgb(var(--paper-rgb)/.86);margin-bottom:var(--space-6);
+}
+.code .l{white-space:pre;display:block}
+.t-com{color:rgb(var(--paper-rgb)/.34)}
+.t-kw{color:var(--sediment-ochre-2)}
+.t-str{color:var(--moss)}
+.t-prompt{color:var(--basin-teal-3)}
+
+/* Table */
+.tbl-scroll{overflow-x:auto;margin-bottom:var(--space-6)}
+table{width:100%;border-collapse:collapse;font-size:.875rem}
+th{
+  text-align:left;font-family:var(--font-mono);font-size:.625rem;letter-spacing:var(--tracking-mono-wider);
+  text-transform:uppercase;color:rgb(var(--paper-rgb)/.42);font-weight:var(--weight-medium);
+  padding:var(--space-3) var(--space-4);border-bottom:1px solid rgb(var(--graphite-rgb)/.45);
+}
+td{padding:var(--space-3) var(--space-4);border-bottom:var(--hairline);vertical-align:top;color:rgb(var(--paper-rgb)/.72)}
+td code{color:var(--sediment-ochre-2)}
+td:first-child{white-space:nowrap}
+
+.note{
+  padding:var(--space-5);border-left:2px solid var(--sediment-ochre);
+  background:rgb(var(--sediment-ochre-rgb)/.06);font-size:.875rem;line-height:var(--lh-loose);
+  color:rgb(var(--paper-rgb)/.66);margin-bottom:var(--space-6);
+}
+.note strong{color:var(--paper)}
+
+/* Footer */
+.site-footer{background:var(--ink);border-top:var(--hairline-paper);padding-block:var(--space-9)}
+.footer-vulos{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-4);justify-content:space-between}
+.footer-vulos-note{display:flex;align-items:center;gap:var(--space-3);font-size:.875rem;color:rgb(var(--paper-rgb)/.56);max-width:62ch;line-height:var(--lh-loose)}
+.footer-vulos-note svg{width:20px;height:20px;flex-shrink:0}
+.footer-vulos-note a{color:var(--basin-teal-3);font-weight:var(--weight-semibold)}
+.footer-legal{font-family:var(--font-mono);font-size:.6875rem;color:rgb(var(--paper-rgb)/.34);white-space:nowrap}
+
+@media(prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  .doc-card:hover{transform:none}
+}
+</style>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container-wide nav">
+    <a class="brand" href="./index.html">
+      <svg viewBox="0 0 680 680" aria-hidden="true">
+        <g transform="translate(340,340)" fill="none" stroke="#FAF7F0" stroke-width="52" stroke-linecap="round">
+          <ellipse cx="0" cy="-110" rx="200" ry="44"/>
+          <path d="M -200 -110 Q -200 160, 0 160 Q 200 160, 200 -110"/>
+          <circle cx="0" cy="40" r="34" fill="#3B6F73" stroke="none"/>
+        </g>
+      </svg>
+      Basin
+    </a>
+    <div class="nav-spacer"></div>
+    <nav class="nav-links">
+      <a href="./index.html">Overview</a>
+      <a href="./docs.html" aria-current="page">Docs</a>
+      <a href="./index.html#benchmarks">Benchmarks</a>
+      <a href="./index.html#compare">Compare</a>
+      <a href="https://github.com/vul-os/basin">GitHub</a>
+    </nav>
+    <a class="vulos-badge" href="https://vulos.org">Part of VulOS</a>
+  </div>
+</header>
+
+<div class="docs-head">
+  <div class="container">
+    <span class="eyebrow">Documentation · field guide</span>
+    <h1 class="display">Basin documentation</h1>
+    <p>
+      Everything below lives in the repository under <code>docs/</code> and is versioned
+      with the engine, so it never drifts from the binary you're running. This page is
+      the map; the links go to the source of truth.
+    </p>
+  </div>
+</div>
+
+<div class="container docs-layout">
+
+  <aside class="docs-rail">
+    <h2>On this page</h2>
+    <ul>
+      <li><a href="#quickstart">Quickstart</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#compatibility">SQL compatibility</a></li>
+      <li><a href="#multi-project">Multi-project</a></li>
+      <li><a href="#batteries">Batteries included</a></li>
+      <li><a href="#sdks">Client SDKs</a></li>
+      <li><a href="#operations">Operations</a></li>
+      <li><a href="#decisions">Design decisions</a></li>
+    </ul>
+  </aside>
+
+  <main>
+
+    <section id="quickstart" class="docs-section">
+      <span class="eyebrow">01 · start here</span>
+      <h2 class="display">Quickstart</h2>
+      <p>
+        Basin is one binary. Point it at a data directory and run — local development
+        needs no external object store, and the same binary that runs on your laptop is
+        the one that runs against S3.
+      </p>
+
+      <div class="code">
+<span class="l"><span class="t-com"># Docker — pgwire on :5432, no Rust toolchain</span></span>
+<span class="l">docker run --rm -p 5432:5432 -v basin-data:/var/basin --name basin basin-server</span>
+<span class="l"> </span>
+<span class="l"><span class="t-com"># From source — pgwire on :5433</span></span>
+<span class="l">BASIN_DATA_DIR=/tmp/basin cargo run -p basin-server</span>
+<span class="l"> </span>
+<span class="l"><span class="t-com"># Connect with any Postgres client</span></span>
+<span class="l">psql <span class="t-str">'postgres://alice@127.0.0.1:5433/alice'</span></span>
+      </div>
+
+      <div class="doc-list">
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/quickstart-docker.md">
+          <h3>5-Minute Docker Quickstart</h3>
+          <p>One <code>docker run</code>, connect via psql, no toolchain required.</p>
+          <span class="path">docs/quickstart-docker.md</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/tutorial.md">
+          <h3>Getting started tutorial</h3>
+          <p>CRUD, auth, RLS policies, the REST API and a frontend snippet — ~15 minutes.</p>
+          <span class="path">docs/tutorial.md</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/examples">
+          <h3>Reference applications</h3>
+          <p>A multi-tenant SaaS starter and an AI/RAG app, both runnable.</p>
+          <span class="path">examples/</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/deployment.md">
+          <h3>Deployment</h3>
+          <p>Production-shaped boot: WAL, shard owner, pool, JWT auth and REST in one process.</p>
+          <span class="path">docs/deployment.md</span>
+        </a>
+      </div>
+    </section>
+
+    <section id="architecture" class="docs-section">
+      <span class="eyebrow">02 · how it works</span>
+      <h2 class="display">Architecture</h2>
+      <p>
+        pgwire on the front, Vortex-compressed columnar files on an S3-compatible bucket
+        on the back, with a file-backed WAL between them. A project is a bucket prefix
+        the engine refuses to read across, resolved once at connection accept.
+      </p>
+
+      <div class="doc-list">
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/architecture.md">
+          <h3>Architecture overview</h3>
+          <p>The full path from a wire message to bytes on object storage.</p>
+          <span class="path">docs/architecture.md</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/htap-guide.md">
+          <h3>HTAP hot tier</h3>
+          <p>The UPDATE/DELETE fast paths, on by default, and what they cost.</p>
+          <span class="path">docs/htap-guide.md</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/scaling/object-storage.md">
+          <h3>Object-storage scaling</h3>
+          <p>How throughput behaves as buckets, prefixes and files multiply.</p>
+          <span class="path">docs/scaling/object-storage.md</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/CAPABILITIES.md">
+          <h3>Capability matrix</h3>
+          <p>Feature-by-feature status, honestly marked shipped or not.</p>
+          <span class="path">CAPABILITIES.md</span>
+        </a>
+      </div>
+    </section>
+
+    <section id="compatibility" class="docs-section">
+      <span class="eyebrow">03 · the wire</span>
+      <h2 class="display">SQL compatibility</h2>
+      <p>
+        Basin parses with <code>libpg_query</code> — the actual PostgreSQL parser,
+        vendored — so at parse time your ORM cannot tell the difference.
+        <strong>863 of 975 SQL fragments pass on the default configuration (88.5%).</strong>
+        Basin is Postgres-compatible, not Postgres; the gaps are documented rather than
+        papered over.
+      </p>
+
+      <div class="tbl-scroll">
+        <table>
+          <thead><tr><th scope="col">Area</th><th scope="col">Status</th></tr></thead>
+          <tbody>
+            <tr><td>pgwire v3</td><td>Simple + extended query, TLS, COPY, prepared statements, binary params</td></tr>
+            <tr><td>Row-Level Security</td><td><code>ENABLE ROW LEVEL SECURITY</code> + <code>CREATE POLICY</code>, enforced at the plan layer</td></tr>
+            <tr><td>Vector search</td><td><code>vector(N)</code> + HNSW, pgvector-compatible operators</td></tr>
+            <tr><td>Extensions</td><td>Equivalents for pgcrypto, uuid-ossp, pg_trgm, plus basin-cron / net / geo / cv</td></tr>
+            <tr><td>Stored procedures</td><td><code>LANGUAGE sql</code> + <code>CALL</code> only — no PL/pgSQL, PL/Python or PL/Perl</td></tr>
+            <tr><td>Replication</td><td>Not supported — wrong shape for object-store storage; CDC out of scope</td></tr>
+            <tr><td>Federation</td><td>No <code>postgres_fdw</code> / <code>dblink</code>; use basin-net for HTTP-shaped reads</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="doc-list">
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/sql-support.md">
+          <h3>SQL support matrix</h3>
+          <p>Generated from the test suite — the ground truth, never hand-edited.</p>
+          <span class="path">docs/sql-support.md</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/sql-compatibility.md">
+          <h3>Compatibility notes</h3>
+          <p>Where behaviour diverges from Postgres and why.</p>
+          <span class="path">docs/sql-compatibility.md</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/orm-compat.md">
+          <h3>ORM compatibility</h3>
+          <p>Drizzle, Prisma, SQLAlchemy, Diesel, SeaORM and friends.</p>
+          <span class="path">docs/orm-compat.md</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/migration-tools.md">
+          <h3>Migration tools</h3>
+          <p><code>sqlx</code>, <code>flyway</code>, <code>golang-migrate</code>.</p>
+          <span class="path">docs/migration-tools.md</span>
+        </a>
+      </div>
+    </section>
+
+    <section id="multi-project" class="docs-section">
+      <span class="eyebrow">04 · isolation</span>
+      <h2 class="display">Multi-project</h2>
+      <p>
+        The connection URL names the project. After accept, ordinary SQL — no per-query
+        auth, no row-scoping boilerplate. Adding a tenant writes no new heap pages and
+        books no connection slot, which is where the cost shape comes from.
+      </p>
+      <div class="doc-list">
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/multi-project.md">
+          <h3>Multi-project isolation</h3>
+          <p>How prefixes bound a project and what crosses the boundary (nothing).</p>
+          <span class="path">docs/multi-project.md</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/import.md">
+          <h3>Importing data</h3>
+          <p>Getting an existing Postgres database into Basin.</p>
+          <span class="path">docs/import.md</span>
+        </a>
+      </div>
+    </section>
+
+    <section id="batteries" class="docs-section">
+      <span class="eyebrow">05 · included</span>
+      <h2 class="display">Batteries included</h2>
+      <p>
+        Auth, REST, cron, webhooks, Wasm functions, vector search and an Iceberg catalog
+        are all in the same binary — not sidecars to deploy and version separately.
+      </p>
+      <div class="doc-list">
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/batteries.md">
+          <h3>What ships in the box</h3>
+          <p>The full list, with the ADR that scoped each one.</p>
+          <span class="path">docs/batteries.md</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/functions.md">
+          <h3>Wasm functions</h3>
+          <p>Server-side functions with the sandbox boundary spelled out.</p>
+          <span class="path">docs/functions.md</span>
+        </a>
+      </div>
+    </section>
+
+    <section id="sdks" class="docs-section">
+      <span class="eyebrow">06 · clients</span>
+      <h2 class="display">Client SDKs</h2>
+      <p>
+        Ten engine-direct SDKs, all MIT-licensed and all speaking pgwire + REST straight
+        to a Basin engine. They live in the monorepo under <code>sdks/</code> and are
+        versioned alongside the engine they target.
+      </p>
+      <div class="doc-list">
+        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/sdks/js">
+          <h3>JavaScript / TypeScript</h3>
+          <p>Browser, Node, Deno, Bun and Workers. Realtime subscriptions + Arrow IPC.</p>
+          <span class="path">sdks/js</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/sdks/py">
+          <h3>Python</h3>
+          <p>Async and sync clients, realtime, Arrow via pyarrow.</p>
+          <span class="path">sdks/py</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/sdks/go">
+          <h3>Go</h3>
+          <p>Arrow IPC streaming against the engine.</p>
+          <span class="path">sdks/go</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/sdks">
+          <h3>Rust, Java, Ruby, .NET, PHP, Dart, Swift</h3>
+          <p>Six more first-party clients with the same surface.</p>
+          <span class="path">sdks/</span>
+        </a>
+      </div>
+    </section>
+
+    <section id="operations" class="docs-section">
+      <span class="eyebrow">07 · running it</span>
+      <h2 class="display">Operations</h2>
+      <p>
+        Basin is meant to be self-hosted on your own box and your own bucket. Runbooks
+        and operator guides are versioned in the repository next to the code they cover.
+      </p>
+      <div class="doc-list">
+        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/docs/operators">
+          <h3>Operator guides</h3>
+          <p>Quotas, compatibility checks and day-two concerns.</p>
+          <span class="path">docs/operators/</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/docs/runbooks">
+          <h3>Runbooks</h3>
+          <p>Procedures for the situations you'd rather not improvise.</p>
+          <span class="path">docs/runbooks/</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/benchmark/BENCHMARKS.md">
+          <h3>Benchmark methodology</h3>
+          <p>How the numbers are produced, and why losses are published too.</p>
+          <span class="path">benchmark/BENCHMARKS.md</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/SECURITY.md">
+          <h3>Security policy</h3>
+          <p>Reporting process and supported versions.</p>
+          <span class="path">SECURITY.md</span>
+        </a>
+      </div>
+    </section>
+
+    <section id="decisions" class="docs-section">
+      <span class="eyebrow">08 · why</span>
+      <h2 class="display">Design decisions</h2>
+      <p>
+        Basin is opinionated about scope, and the reasoning is written down. Every "no"
+        in the compatibility table has a one-page rationale that includes the trigger
+        which would change our mind.
+      </p>
+      <div class="note">
+        <strong>Open an issue before a PR that adds new surface area.</strong> The ADRs
+        exist so scope arguments happen once, in writing, rather than in review.
+      </div>
+      <div class="doc-list">
+        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/docs/decisions">
+          <h3>Architecture decision records</h3>
+          <p>The numbered ADRs, including the ones that closed doors deliberately.</p>
+          <span class="path">docs/decisions/</span>
+        </a>
+        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/CONTRIBUTING.md">
+          <h3>Contributing</h3>
+          <p>How to build, test and land a change.</p>
+          <span class="path">CONTRIBUTING.md</span>
+        </a>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<footer class="site-footer">
+  <div class="container footer-vulos">
+    <p class="footer-vulos-note">
+      <svg viewBox="0 0 680 680" aria-hidden="true">
+        <g transform="translate(340,340)" fill="none" stroke="#60999E" stroke-width="56" stroke-linecap="round">
+          <ellipse cx="0" cy="-110" rx="200" ry="44"/>
+          <path d="M -200 -110 Q -200 160, 0 160 Q 200 160, 200 -110"/>
+        </g>
+      </svg>
+      <span>
+        Part of <a href="https://vulos.org">VulOS</a> — the open, self-hostable web OS
+        &amp; app suite. Basin runs standalone and requires nothing else in the suite.
+      </span>
+    </p>
+    <span class="footer-legal">Apache-2.0 · pre-alpha</span>
+  </div>
+</footer>
+
+</body>
+</html>
