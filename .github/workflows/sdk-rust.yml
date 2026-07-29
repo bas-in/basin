@@ -1,13 +1,30 @@
-name: test
+name: sdk-rust
 
+# Monorepo port of the old bas-in/basin-rust `test` workflow. sdks/rust is a
+# standalone crate (its own empty [workspace] table), so cargo here resolves
+# against sdks/rust/Cargo.toml, not the engine workspace at the repo root.
 on:
   push:
-    branches: [main]
+    branches: [main, master]
+    paths:
+      - "sdks/rust/**"
+      - ".github/workflows/sdk-rust.yml"
   pull_request:
-    branches: [main]
+    branches: [main, master]
+    paths:
+      - "sdks/rust/**"
+      - ".github/workflows/sdk-rust.yml"
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: sdks/rust
 
 jobs:
   check:
@@ -19,6 +36,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      # `workspaces` is repo-root-relative and keeps this cache separate from
+      # the engine's, so the two never invalidate each other.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdks/rust
 
       - name: fmt
         run: cargo fmt --check
@@ -41,6 +64,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdks/rust
 
       - name: clippy (all features)
         run: cargo clippy --all-targets --all-features -- -D warnings

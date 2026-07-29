@@ -1,0 +1,40 @@
+name: sdk-js-release
+
+# Tag prefix matters: the engine's release.yml owns bare `v*`, so in a single
+# repo an unprefixed tag would fire the engine release, the CLI release, and
+# this npm publish all at once off one push. Each publishable component gets
+# its own namespace -- `js-v*` here, `cli-v*` for the CLI, bare `v*` reserved
+# for the engine.
+on:
+  push:
+    tags:
+      - "js-v*"
+
+permissions:
+  contents: read
+  id-token: write   # required for npm provenance
+
+defaults:
+  run:
+    working-directory: sdks/js
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+          cache-dependency-path: sdks/js/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      # Publishes whatever name package.json declares. Nothing has ever been
+      # pushed to npm under this package, so the name is still an open choice.
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

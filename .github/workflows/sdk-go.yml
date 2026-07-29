@@ -1,13 +1,28 @@
-name: test
+name: sdk-go
 
+# Monorepo port of the old bas-in/basin-go `test` workflow.
 on:
   push:
-    branches: [main]
+    branches: [main, master]
+    paths:
+      - "sdks/go/**"
+      - ".github/workflows/sdk-go.yml"
   pull_request:
-    branches: [main]
+    branches: [main, master]
+    paths:
+      - "sdks/go/**"
+      - ".github/workflows/sdk-go.yml"
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: sdks/go
 
 jobs:
   test:
@@ -23,6 +38,9 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           cache: true
+          # setup-go looks for go.sum from the repo root, not from
+          # defaults.run.working-directory.
+          cache-dependency-path: sdks/go/go.sum
       - name: vet
         run: go vet ./...
       - name: build
@@ -38,6 +56,8 @@ jobs:
         with:
           go-version: stable
           cache: true
+          cache-dependency-path: sdks/go/go.sum
       - uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+          working-directory: sdks/go

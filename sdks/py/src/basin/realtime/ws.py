@@ -93,7 +93,11 @@ class WsConnection:
 
     async def _run(self) -> None:
         try:
-            import websockets  # type: ignore[import-not-found]
+            # `unused-ignore` is listed too because whether the import
+            # resolves depends on the optional [realtime] extra: without it
+            # mypy needs the import-not-found suppression, with it installed
+            # that suppression is itself unused and strict mode flags it.
+            import websockets  # type: ignore[import-not-found,unused-ignore]
         except ImportError as exc:
             raise BasinError(
                 "not_implemented",

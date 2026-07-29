@@ -1,0 +1,41 @@
+name: sdk-dart
+
+# Monorepo port of the old bas-in/basin-dart `test` workflow.
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "sdks/dart/**"
+      - ".github/workflows/sdk-dart.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "sdks/dart/**"
+      - ".github/workflows/sdk-dart.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: sdks/dart
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - run: dart pub get
+      - run: dart analyze
+      - run: dart test

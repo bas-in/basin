@@ -1,13 +1,28 @@
-name: test
+name: sdk-php
 
+# Monorepo port of the old bas-in/basin-php `test` workflow.
 on:
   push:
-    branches: [main]
+    branches: [main, master]
+    paths:
+      - "sdks/php/**"
+      - ".github/workflows/sdk-php.yml"
   pull_request:
-    branches: [main]
+    branches: [main, master]
+    paths:
+      - "sdks/php/**"
+      - ".github/workflows/sdk-php.yml"
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: sdks/php
 
 jobs:
   test:
