@@ -9,4 +9,10 @@ dist/
 # Rust
 /target
 Cargo.lock merge=union
+
+# Compiled CLI binaries. `/basin-cli` was already ignored, but an 8.2 MB
+# build output of that name had been committed twice before the rule
+# existed; it was stripped from history when the repos were merged. The
+# release binary is named `basin`, so ignore that too.
 /basin-cli
+/basin
