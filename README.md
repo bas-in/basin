@@ -1,15 +1,14 @@
 <p align="center">
-  <img src="./basin.svg" alt="Basin" width="180">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./basin-dark.svg">
+    <img src="./basin.svg" alt="Basin" width="96">
+  </picture>
 </p>
 
 <h1 align="center">Basin</h1>
 
 <p align="center">
-  <strong>Bucket-native, multi-tenant Postgres alternative.</strong><br>
-  RAM-per-connection is ~30× cheaper than Postgres. Projects are S3 prefixes,
-  not databases — operator cost is O(bytes active), not O(projects
-  provisioned). One binary, pgwire on the front, Vortex-compressed columnar
-  files on any S3-compatible bucket on the back.
+  <strong>Bucket-native, multi-tenant Postgres alternative.</strong>
 </p>
 
 <p align="center">
@@ -28,6 +27,11 @@
   <a href="./docs/sql-support.md"><img alt="SQL support matrix" src="https://img.shields.io/badge/SQL_support-matrix-blue?style=flat-square"></a>
   <a href="./LICENSE"><img alt="license: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-lightgrey?style=flat-square"></a>
 </p>
+
+RAM-per-connection is ~30× cheaper than Postgres. Projects are S3 prefixes,
+not databases — operator cost is O(bytes active), not O(projects
+provisioned). One binary, pgwire on the front, Vortex-compressed columnar
+files on any S3-compatible bucket on the back.
 
 > **Pre-alpha — public eval.** Basin is being built in the open. Use it
 > today to evaluate cost economics, prototype multi-tenant patterns, or
