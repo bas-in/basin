@@ -3,7 +3,7 @@
 The SDK implements the full Basin REST surface: query builder, auth (including
 MFA and OAuth), storage, SQL/Wasm functions, and realtime WebSocket with
 presence. The gap list below is grounded in the Basin
-[SDK parity matrix](https://github.com/bas-in/basin/blob/main/docs/sdk-parity.md).
+[SDK parity matrix](https://github.com/vul-os/basin/blob/main/docs/sdk-parity.md).
 Items are ordered by impact.
 
 ---

@@ -220,7 +220,7 @@ via `psql`) and `--seed=<path>` (runs a seed SQL file via `psql`).
 
 **Prerequisites (binary mode):** build `basin-server` from the engine repo:
 ```
-cargo build --release -p basin-server  # in bas-in/basin checkout
+cargo build --release -p basin-server  # in vul-os/basin checkout
 export BASIN_SERVER_BIN=/path/to/target/release/basin-server
 ```
 
@@ -269,7 +269,7 @@ unique platform surface:
 ## What stays blocked upstream (summary for handoff)
 
 1. **PITR `restore --as-of`** — requires engine v0.2 physical GC. File issue in
-   `bas-in/basin` once GC ships; open basin-cli command in the same PR.
+   `vul-os/basin` once GC ships; open basin-cli command in the same PR.
 
 2. **`basin dev` Docker mode — full zero-config** — works today when the user
    has the engine repo checked out as a sibling (`../basin/dev/docker-compose.yml`).

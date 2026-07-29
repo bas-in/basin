@@ -12,7 +12,7 @@
 //!
 //!   Prerequisites:
 //!   - `basin-server` binary built from the engine repo
-//!     (`cargo build --release -p basin-server` in `bas-in/basin`)
+//!     (`cargo build --release -p basin-server` in `vul-os/basin`)
 //!     OR the path set via BASIN_SERVER_BIN / --server-bin.
 //!
 //! ## Docker mode (--docker)
@@ -178,7 +178,7 @@ fn resolve_server_bin(flag: Option<&String>) -> CliResult<PathBuf> {
              then add target/release/ to your PATH, or set BASIN_SERVER_BIN=/path/to/basin-server\n\
            • Or use --docker to run via Docker Compose (requires Docker ≥ 24).\n\
          \n\
-         Engine repo: https://github.com/bas-in/basin"
+         Engine repo: https://github.com/vul-os/basin"
     ))
 }
 
@@ -225,7 +225,7 @@ fn resolve_compose_file(flag: Option<&String>) -> CliResult<PathBuf> {
            BASIN_COMPOSE_FILE=<path>     environment variable\n\
            ../basin/dev/docker-compose.yml  (engine repo sibling checkout)\n\
          \n\
-         Engine repo: https://github.com/bas-in/basin"
+         Engine repo: https://github.com/vul-os/basin"
     ))
 }
 
@@ -616,7 +616,7 @@ fn dev_usage() {
             "Prerequisites (binary mode):",
             "  basin-server binary on PATH or set via --server-bin / BASIN_SERVER_BIN.",
             "  Build it with: cargo build --release -p basin-server",
-            "  Engine repo: https://github.com/bas-in/basin",
+            "  Engine repo: https://github.com/vul-os/basin",
             "",
             "Prerequisites (Docker mode, --docker):",
             "  Docker ≥ 24 with Compose v2 bundled, and the engine repo checked out",

@@ -4,7 +4,7 @@ Go client for [Basin](https://basin.run) — a cloud-native HTAP database with
 a PostgreSQL wire-compatible interface and an HTTP REST API.
 
 Speaks **directly** to a deployed
-[`basin-engine`](https://github.com/bas-in/basin) (the open-source Rust core,
+[`basin-engine`](https://github.com/vul-os/basin) (the open-source Rust core,
 Apache-2.0) over HTTP: auth, PostgREST-style table queries, object storage,
 realtime WebSocket change streams, Arrow IPC, and RPC functions. No cloud
 intermediary on the data path.
@@ -12,7 +12,7 @@ intermediary on the data path.
 ## Install
 
 ```sh
-go get github.com/bas-in/basin/sdks/go
+go get github.com/vul-os/basin/sdks/go
 ```
 
 Requires Go 1.21+. Two optional external dependencies are pulled in only when
@@ -33,7 +33,7 @@ import (
     "context"
     "fmt"
 
-    basin "github.com/bas-in/basin/sdks/go"
+    basin "github.com/vul-os/basin/sdks/go"
 )
 
 func main() {

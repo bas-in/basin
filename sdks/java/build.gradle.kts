@@ -54,7 +54,7 @@ publishing {
             pom {
                 name.set("Basin Java SDK")
                 description.set("JVM client for Basin: auth, query, storage, realtime, functions.")
-                url.set("https://github.com/bas-in/basin")
+                url.set("https://github.com/vul-os/basin")
                 licenses {
                     license {
                         name.set("Apache-2.0")

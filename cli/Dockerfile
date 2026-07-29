@@ -13,9 +13,9 @@
 #   - The `nonroot` tag runs as UID 65532 by default.
 #
 # Usage on the operator side:
-#   docker run --rm ghcr.io/bas-in/basin:latest version
+#   docker run --rm ghcr.io/vul-os/basin:latest version
 #   docker run --rm -v ~/.config/basin:/home/nonroot/.config/basin \
-#     ghcr.io/bas-in/basin:latest projects list
+#     ghcr.io/vul-os/basin:latest projects list
 
 FROM gcr.io/distroless/static-debian12:nonroot
 

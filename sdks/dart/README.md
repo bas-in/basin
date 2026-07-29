@@ -4,7 +4,7 @@ Official Dart / Flutter client for [Basin](https://basin.run) — the
 open-source Postgres-compatible data platform.
 
 Speaks directly to a deployed
-[`basin-engine`](https://github.com/bas-in/basin) (Apache-2.0 Rust core):
+[`basin-engine`](https://github.com/vul-os/basin) (Apache-2.0 Rust core):
 auth, PostgREST-style table queries, object storage, SQL/Wasm functions, and
 realtime WebSocket subscriptions. Works on **Flutter** (iOS, Android, Web,
 desktop) and pure **Dart** (CLI, server) from a single package —

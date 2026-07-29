@@ -5792,7 +5792,7 @@ SQL fragments tested: {total} total / {green} green (across all three configurat
     out.push_str("## Missing something?\n\n");
     out.push_str(
         "If you tried PG syntax that's not in this matrix, \
-[open an issue](https://github.com/bas-in/basin/issues/new?template=sql_compatibility.yml&title=Missing+SQL+syntax%3A+) \
+[open an issue](https://github.com/vul-os/basin/issues/new?template=sql_compatibility.yml&title=Missing+SQL+syntax%3A+) \
 — we triage compatibility gaps within 48 hours.\n\n",
     );
     out.push_str(

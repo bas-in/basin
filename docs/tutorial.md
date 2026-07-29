@@ -41,7 +41,7 @@ build the image from the repo root (takes about five minutes on the first
 run; subsequent builds are fast because Docker caches the Cargo layer):
 
 ```sh
-git clone https://github.com/bas-in/basin.git
+git clone https://github.com/vul-os/basin.git
 cd basin
 
 # Build the image.

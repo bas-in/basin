@@ -91,7 +91,7 @@ hands the request to the compiled Wasm component.
 
 The `basin:functions` package exports four interfaces. WIT lives at
 `crates/basin-fn/wit/basin-fn.wit`. All four are wired in the host
-([`crates/basin-fn/src/host.rs`](https://github.com/bas-in/basin/blob/main/crates/basin-fn/src/host.rs)).
+([`crates/basin-fn/src/host.rs`](https://github.com/vul-os/basin/blob/main/crates/basin-fn/src/host.rs)).
 
 ### `basin:functions/query`
 
@@ -178,7 +178,7 @@ record response {
 ```
 
 The mount is JWT-gated. Unknown function names return 404
-([`fn_v1_unknown_function_returns_404`](https://github.com/bas-in/basin/blob/main/tests/integration/tests/fn_handler.rs)).
+([`fn_v1_unknown_function_returns_404`](https://github.com/vul-os/basin/blob/main/tests/integration/tests/fn_handler.rs)).
 A function that traps surfaces as a 500 with the trap message; a
 function that returns `Err(String)` surfaces the same way.
 
@@ -232,7 +232,7 @@ DROP FUNCTION hello();
 ```
 
 The runtime (`FunctionRuntime` in
-[`crates/basin-fn/src/runtime.rs`](https://github.com/bas-in/basin/blob/main/crates/basin-fn/src/runtime.rs))
+[`crates/basin-fn/src/runtime.rs`](https://github.com/vul-os/basin/blob/main/crates/basin-fn/src/runtime.rs))
 caches a compiled `HandlerHarness` per `(project, name, version)` tuple
 so a redeploy atomically invalidates the cached entry. Concurrent
 invocations of the same name share one compiled harness; a redeploy
@@ -269,11 +269,11 @@ The choice is load-bearing for the project's scope:
 
 ## See also
 
-- [`crates/basin-fn/wit/basin-fn.wit`](https://github.com/bas-in/basin/blob/main/crates/basin-fn/wit/basin-fn.wit) — the canonical WIT
-- [`tests/integration/tests/fn_handler.rs`](https://github.com/bas-in/basin/blob/main/tests/integration/tests/fn_handler.rs) — `/fn/v1/:name` integration test
-- [`tests/integration/tests/fn_javascript.rs`](https://github.com/bas-in/basin/blob/main/tests/integration/tests/fn_javascript.rs) — `LANGUAGE javascript` catalog + RLS-in-function tests
-- [`tests/integration/tests/wasm_functions_differential.rs`](https://github.com/bas-in/basin/blob/main/tests/integration/tests/wasm_functions_differential.rs) — function ≡ SQL differential
-- [`tests/integration/tests/wasm_functions_soak.rs`](https://github.com/bas-in/basin/blob/main/tests/integration/tests/wasm_functions_soak.rs) — 100-project concurrent soak (short variant; 1-hour `#[ignore]` variant for releases)
+- [`crates/basin-fn/wit/basin-fn.wit`](https://github.com/vul-os/basin/blob/main/crates/basin-fn/wit/basin-fn.wit) — the canonical WIT
+- [`tests/integration/tests/fn_handler.rs`](https://github.com/vul-os/basin/blob/main/tests/integration/tests/fn_handler.rs) — `/fn/v1/:name` integration test
+- [`tests/integration/tests/fn_javascript.rs`](https://github.com/vul-os/basin/blob/main/tests/integration/tests/fn_javascript.rs) — `LANGUAGE javascript` catalog + RLS-in-function tests
+- [`tests/integration/tests/wasm_functions_differential.rs`](https://github.com/vul-os/basin/blob/main/tests/integration/tests/wasm_functions_differential.rs) — function ≡ SQL differential
+- [`tests/integration/tests/wasm_functions_soak.rs`](https://github.com/vul-os/basin/blob/main/tests/integration/tests/wasm_functions_soak.rs) — 100-project concurrent soak (short variant; 1-hour `#[ignore]` variant for releases)
 - [ADR 0019 — Declarative BaaS surface](./decisions/0019-declarative-baas-surface.md) — "Wasm, not V8" decision
 - [ADR 0018 — Subsystem feature flags](./decisions/0018-subsystem-feature-flags.md) — the `component-model` Cargo feature; minimal builds drop the wasmtime runtime
 - [`basin-cli-design.md`](./basin-cli-design.md) — `basin functions deploy` CLI shape

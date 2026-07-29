@@ -4360,13 +4360,13 @@ Phase 6 production-hardening entry batch.
 - `basin-cloud` and `basin-billing` workspace crates (moved to `basin-cloud` repo)
 - `CLOUD_ROADMAP.md` (canonical copy lives in `basin-cloud` repo)
 
-[Unreleased]: https://github.com/bas-in/basin/compare/v0.1.9...HEAD
-[0.1.9]: https://github.com/bas-in/basin/compare/v0.1.8...v0.1.9
-[0.1.8]: https://github.com/bas-in/basin/compare/v0.1.7...v0.1.8
-[0.1.7]: https://github.com/bas-in/basin/compare/v0.1.6...v0.1.7
-[0.1.6]: https://github.com/bas-in/basin/compare/v0.1.5...v0.1.6
-[0.1.5]: https://github.com/bas-in/basin/compare/v0.1.4...v0.1.5
-[0.1.4]: https://github.com/bas-in/basin/compare/v0.1.3...v0.1.4
-[0.1.3]: https://github.com/bas-in/basin/compare/v0.1.2...v0.1.3
-[0.1.2]: https://github.com/bas-in/basin/compare/v0.1.1...v0.1.2
-[0.1.1]: https://github.com/bas-in/basin/releases/tag/v0.1.1
+[Unreleased]: https://github.com/vul-os/basin/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/vul-os/basin/compare/v0.1.8...v0.1.9
+[0.1.8]: https://github.com/vul-os/basin/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/vul-os/basin/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/vul-os/basin/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/vul-os/basin/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/vul-os/basin/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/vul-os/basin/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/vul-os/basin/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/vul-os/basin/releases/tag/v0.1.1

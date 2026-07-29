@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.74"
 license = "Apache-2.0"
 description = "Basin Cloud control plane CLI"
-repository = "https://github.com/bas-in/basin"
+repository = "https://github.com/vul-os/basin"
 
 # Standalone crate — deliberately NOT a member of the engine workspace at
 # ../Cargo.toml. The CLI depends only on registry crates (never on the

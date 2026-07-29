@@ -1,4 +1,4 @@
-module github.com/bas-in/basin/sdks/go
+module github.com/vul-os/basin/sdks/go
 
 go 1.25.0
 

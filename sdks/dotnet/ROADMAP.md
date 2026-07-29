@@ -135,7 +135,7 @@ Once 0.2–0.6 land:
 ## Known gaps vs. the parity matrix
 
 For context, the SDK parity matrix at
-[`basin/docs/sdk-parity.md`](https://github.com/bas-in/basin/blob/main/docs/sdk-parity.md)
+[`basin/docs/sdk-parity.md`](https://github.com/vul-os/basin/blob/main/docs/sdk-parity.md)
 identifies one dotnet-specific gap and several uniform absences across all SDKs:
 
 **Dotnet-specific (actionable):**

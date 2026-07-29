@@ -4,7 +4,7 @@ description: >-
   object storage, and realtime WebSocket.
 version: 0.1.0
 homepage: https://basin.run
-repository: https://github.com/bas-in/basin
+repository: https://github.com/vul-os/basin
 
 environment:
   sdk: ">=3.0.0 <4.0.0"

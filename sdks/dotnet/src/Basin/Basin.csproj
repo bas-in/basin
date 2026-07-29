@@ -12,7 +12,7 @@
     <Version>0.1.0</Version>
     <Authors>Basin</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <RepositoryUrl>https://github.com/bas-in/basin</RepositoryUrl>
+    <RepositoryUrl>https://github.com/vul-os/basin</RepositoryUrl>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>

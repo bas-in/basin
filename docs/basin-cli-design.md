@@ -242,7 +242,7 @@ release.
 **Distribution channels:**
 
 - **GitHub Releases** — all binaries + signatures; primary source of truth.
-- **Homebrew tap** (`bas-in/homebrew-basin`) — `brew install bas-in/basin/basin`. The tap formula is auto-updated by GoReleaser's `brews:` block.
+- **Homebrew tap** (`bas-in/homebrew-basin`) — `brew install vul-os/basin/basin`. The tap formula is auto-updated by GoReleaser's `brews:` block.
 - **apt repo** — `.deb` packages built by GoReleaser's `nfpms:` block; hosted on a GitHub Pages–backed apt repo under `bas-in/apt`.
 - **`go install`** — `go install github.com/bas-in/basin-cli/cmd/basin@latest` for Go developers who prefer source builds.
 

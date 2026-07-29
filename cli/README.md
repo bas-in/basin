@@ -162,7 +162,7 @@ mismatched tag, edited binary — fails closed.
 ## Self-hosted OSS engine
 
 If you are running a bare `basin-server` (the open-source OSS engine at
-[`bas-in/basin`](https://github.com/bas-in/basin)) without basin-cloud,
+[`vul-os/basin`](https://github.com/vul-os/basin)) without basin-cloud,
 only a subset of `basin` commands will work:
 
 | Command group | Works against OSS `basin-server`? |

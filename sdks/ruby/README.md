@@ -2,7 +2,7 @@
 
 Official Ruby client for [Basin](https://basin.run) — a Postgres-native BaaS
 with an open-source Rust engine. Speaks directly to a deployed
-[`basin-engine`](https://github.com/bas-in/basin) over its HTTP surfaces:
+[`basin-engine`](https://github.com/vul-os/basin) over its HTTP surfaces:
 REST data API, auth, object storage, realtime WebSocket subscriptions, and
 serverless functions.
 

@@ -96,11 +96,11 @@
   "homepage": "https://basin.run",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bas-in/basin.git",
+    "url": "https://github.com/vul-os/basin.git",
     "directory": "sdks/js"
   },
   "bugs": {
-    "url": "https://github.com/bas-in/basin/issues"
+    "url": "https://github.com/vul-os/basin/issues"
   },
   "license": "MIT",
   "publishConfig": {

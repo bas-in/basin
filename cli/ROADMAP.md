@@ -150,7 +150,7 @@ Full table CRUD + CSV · `rows insert/update/delete` · `rls enable/disable` + p
 | First Homebrew tap publish | Needs v0.1.0 tag push + `bas-in/homebrew-tap` repo created |
 | AUR `basin-bin` package | Needs AUR account + `AUR_KEY` secret |
 | Scoop bucket | Needs `bas-in/scoop-bucket` repo + `SCOOP_TAP_TOKEN` secret |
-| `ghcr.io/bas-in/basin` Docker image | Fires automatically on first v* tag |
+| `ghcr.io/vul-os/basin` Docker image | Fires automatically on first v* tag |
 | `basin dev --docker` zero-config | Needs `ghcr.io/bas-in/basin-server` published |
 | Cross-version replay fixtures (N-1/N/N+1) | Future work once cloud minor version ticks |
 

@@ -13,8 +13,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/bas-in/basin/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/bas-in/basin/actions/workflows/ci.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/bas-in/basin/releases"><img alt="latest release" src="https://img.shields.io/github/v/release/bas-in/basin?include_prereleases&style=flat-square"></a>
+  <a href="https://github.com/vul-os/basin/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/vul-os/basin/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/vul-os/basin/releases"><img alt="latest release" src="https://img.shields.io/github/v/release/vul-os/basin?include_prereleases&style=flat-square"></a>
   <a href="./CHANGELOG.md"><img alt="changelog" src="https://img.shields.io/badge/changelog-keep--a--changelog-blue?style=flat-square"></a>
   <a href="./WEDGE.md"><img alt="status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square"></a>
   <a href="./benchmark/BENCHMARKS.md"><img alt="honest benchmarks" src="https://img.shields.io/badge/benchmarks-honest_wins_and_losses-blue?style=flat-square"></a>
@@ -178,7 +178,7 @@ This is the *and-the-rest-of-the-stack-is-here* line. The structural primitive (
 
 | Surface | Status |
 |---|---|
-| **sqllogictest** (curated PG-style suite) | **100% (50/50)** as of [`b7114e8`](https://github.com/bas-in/basin/commit/b7114e8) |
+| **sqllogictest** (curated PG-style suite) | **100% (50/50)** as of [`b7114e8`](https://github.com/vul-os/basin/commit/b7114e8) |
 | **ORM corpus** (Drizzle / Prisma / sqlx / Diesel / TypeORM, 99 representative shapes) | **100% (102/102)** on the 2026-06-11 integrity run — Drizzle 100%, sqlx 95%, Diesel 95%, TypeORM 94%, Prisma 90%; all 5 failures are typed errors, 0 regressions. `pg_index` / `pg_sequence` / `pg_enum` introspection now populated, so ORM startup/migration introspection (Prisma, Drizzle, SQLAlchemy, ActiveRecord, sqlx, Django, Hibernate) resolves cleanly. |
 | **Live ORM suite** (Django, GORM, and the above, end-to-end wire) | **138/139** as of 2026-06-12 — 7 ORMs (Django savepoint-per-atomic, MigrationRecorder, contenttypes, FOR UPDATE; GORM pgx extended-protocol AutoMigrate, RETURNING, batch, upsert; Drizzle, Prisma, sqlx, Diesel, TypeORM). One remaining typed error: `ALTER TABLE … ADD CONSTRAINT UNIQUE`. ORM migration compatibility improvements landed 2026-06-14: **`DEFERRABLE INITIALLY DEFERRED` foreign keys** are now accepted and treated as deferred (child rows may precede parents in a migration transaction — the Django/Rails migration pattern); **`ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY`** is now enforced (ORMs wire FKs in a follow-up ALTER after CREATE TABLE); Drizzle `VALUES (DEFAULT, …)`, SQLAlchemy `INSERT … SELECT` into integer identity PKs, `INSERT … SELECT … RETURNING`, Django `F()` UPDATE expressions (`SET col = "t"."col" + 1`), schema-qualified FK references, and gorm's extended-protocol `RowDescription` binary-format fix all landed as targeted SQL-shape fixes (`orm_sql_shapes.rs`). |
 | **Per-fragment SQL matrix** ([`docs/sql-support.md`](./docs/sql-support.md), 975 fragments tested) | **~88.5% Default config / ~91.5% non-excluded** (863/975) |

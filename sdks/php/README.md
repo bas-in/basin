@@ -5,7 +5,7 @@ database engine with built-in auth, object storage, serverless functions, and
 realtime change subscriptions.
 
 Talks **directly** to a deployed
-[`basin-engine`](https://github.com/bas-in/basin) (the open-source Rust core,
+[`basin-engine`](https://github.com/vul-os/basin) (the open-source Rust core,
 Apache-2.0) over REST + WebSocket — auth, PostgREST-style table queries,
 object storage, RPC functions, and live table events. Basin Cloud is the
 control plane (dashboard, billing, anon-key minting); once you have a URL and

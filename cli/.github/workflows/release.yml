@@ -164,7 +164,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/bas-in/basin
+          images: ghcr.io/vul-os/basin
           tags: |
             type=semver,pattern={{version}}
             type=raw,value=latest

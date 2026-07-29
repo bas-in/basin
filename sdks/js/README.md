@@ -1,7 +1,7 @@
 # @bas-in/basin-js
 
 Isomorphic JavaScript / TypeScript client for [Basin](https://basin.run).
-Speaks **directly** to a deployed [`basin-engine`](https://github.com/bas-in/basin)
+Speaks **directly** to a deployed [`basin-engine`](https://github.com/vul-os/basin)
 (the open-source Rust core, Apache-2.0) — auth, PostgREST-shaped table
 queries, object storage, realtime subscriptions, RPC functions, and admin
 project tooling.

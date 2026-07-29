@@ -642,7 +642,7 @@ fn render_readme(name: &str) -> String {
         r#"# {name}
 
 Basin WASM handler function. Implements the `basin-functions-handler` WIT world
-from [`crates/basin-fn/wit/basin-fn.wit`](https://github.com/bas-in/basin/blob/main/crates/basin-fn/wit/basin-fn.wit).
+from [`crates/basin-fn/wit/basin-fn.wit`](https://github.com/vul-os/basin/blob/main/crates/basin-fn/wit/basin-fn.wit).
 
 ## ABI contract
 
@@ -726,7 +726,7 @@ JWT `sub` of whoever hit the endpoint.
 
 ## Why Wasm, not V8?
 
-See [ADR 0019](https://github.com/bas-in/basin/blob/main/docs/decisions/0019-declarative-baas-surface.md).
+See [ADR 0019](https://github.com/vul-os/basin/blob/main/docs/decisions/0019-declarative-baas-surface.md).
 "#,
         name = name,
         slug = name.replace('-', "_"),

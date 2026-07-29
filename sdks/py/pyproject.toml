@@ -27,8 +27,8 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://basin.run"
-Source = "https://github.com/bas-in/basin/tree/main/sdks/py"
-Issues = "https://github.com/bas-in/basin/issues"
+Source = "https://github.com/vul-os/basin/tree/main/sdks/py"
+Issues = "https://github.com/vul-os/basin/issues"
 
 [project.optional-dependencies]
 pydantic = ["pydantic>=2.0"]

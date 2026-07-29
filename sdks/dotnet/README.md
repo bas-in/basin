@@ -4,7 +4,7 @@ Official .NET client for [Basin](https://basin.run) — a cloud-native HTAP
 database with a PostgreSQL wire-compatible interface and an HTTP REST API.
 
 Speaks **directly** to a deployed
-[`basin-engine`](https://github.com/bas-in/basin) (the open-source Rust core,
+[`basin-engine`](https://github.com/vul-os/basin) (the open-source Rust core,
 Apache-2.0). Auth, PostgREST-shaped table queries, object storage, realtime
 change streams, RPC functions, and Arrow IPC transport are all first-class.
 

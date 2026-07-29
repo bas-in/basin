@@ -75,7 +75,7 @@ relative to the basin-cloud checkout.  If any are missing, the script
 [basin-cloud dev:docs] ../basin-js not found.
 Clone the OSS repos as siblings of basin-cloud before running:
   cd ..
-  git clone https://github.com/bas-in/basin
+  git clone https://github.com/vul-os/basin
   git clone https://github.com/bas-in/basin-js
   git clone https://github.com/bas-in/basin-cli
 Then re-run `npm run dev:docs`.

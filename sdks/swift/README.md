@@ -1,7 +1,7 @@
 # basin-swift
 
 Swift client SDK for [Basin](https://basin.run) — speaks directly to a deployed
-[`basin-engine`](https://github.com/bas-in/basin) (the open-source Rust core)
+[`basin-engine`](https://github.com/vul-os/basin) (the open-source Rust core)
 over REST and WebSocket. Covers auth, PostgREST-style table queries, NDJSON
 streaming, object storage, realtime subscriptions, and RPC functions.
 
