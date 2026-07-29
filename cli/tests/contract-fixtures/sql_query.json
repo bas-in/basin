@@ -1,0 +1,22 @@
+{
+  "name": "sql_query",
+  "description": "POST /v1/projects/{ref}/sql/query with an inline SELECT returns a QueryResult; table render prints the column header and the row value.",
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/v1/projects/p_x/sql/query"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "columns": ["?col"],
+          "rows": [[1]],
+          "elapsed_ms": 1
+        }
+      }
+    }
+  ],
+  "command": ["sql", "--project=p_x", "-e", "SELECT 1"],
+  "expect_stdout_contains": ["?col", "1"]
+}

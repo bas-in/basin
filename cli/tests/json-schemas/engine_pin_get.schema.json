@@ -1,0 +1,29 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "pin": {
+      "additionalProperties": true,
+      "properties": {
+        "pinned_at": {
+          "type": "string"
+        },
+        "pinned_by": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pinned_at",
+        "pinned_by",
+        "version"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "pin"
+  ],
+  "type": "object"
+}

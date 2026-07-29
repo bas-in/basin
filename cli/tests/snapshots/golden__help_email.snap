@@ -1,0 +1,16 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage project email templates and view allowance.
+
+USAGE
+  basin email [args]
+
+FLAGS / SUBCOMMANDS
+  templates get    [--project=<ref>]                           Get all email templates.
+  templates put    --kind=<k> --subject=<s> --body=<b>        Update a template kind.
+                   [--project=<ref>]
+  templates delete [--project=<ref>] [--yes]                  Reset templates to defaults.
+  templates test   --kind=<k> --to=<email> [--project=<ref>]  Send a test email.
+  allowance        [--project=<ref>]                           Show email send allowance.

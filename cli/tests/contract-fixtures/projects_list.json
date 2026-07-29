@@ -1,0 +1,35 @@
+{
+  "name": "projects_list",
+  "description": "GET /v1/orgs/{slug}/projects returns the projects envelope; table render prints each project's name and ref.",
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/v1/orgs/acme/projects"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "projects": [
+            {
+              "ref": "p_x",
+              "name": "staging",
+              "region": "us-east",
+              "status": "active",
+              "created_at": "2026-01-01T00:00:00Z"
+            },
+            {
+              "ref": "p_y",
+              "name": "prod",
+              "region": "us-east",
+              "status": "active",
+              "created_at": "2026-01-02T00:00:00Z"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "command": ["--org=acme", "projects", "list"],
+  "expect_stdout_contains": ["staging", "p_x", "prod", "p_y"]
+}

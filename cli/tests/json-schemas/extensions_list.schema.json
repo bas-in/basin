@@ -1,0 +1,36 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "extensions": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "installed": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "description",
+          "installed",
+          "name",
+          "version"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "extensions"
+  ],
+  "type": "object"
+}

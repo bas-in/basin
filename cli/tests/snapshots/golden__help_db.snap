@@ -1,0 +1,17 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Database workflow: push / pull / diff / reset / url / dump / lint.
+
+USAGE
+  basin db [args]
+
+FLAGS / SUBCOMMANDS
+  push   [--project=<ref>]                     Apply local migrations to the remote project.
+  pull   [--project=<ref>] [--force]           Write remote migrations to ./basin/migrations/.
+  diff   [--project=<ref>]                     Generate a new migration from schema drift.
+  reset  [--project=<ref>] [--yes]             Snapshot → rollback all → re-apply + seed.
+  url    [--project=<ref>] [--reveal] [--rotate] [--yes]  Print the pgwire DSN.
+  dump   [--project=<ref>] [--schema-only|--data-only]    pg_dump-shaped output to stdout.
+  lint   [--project=<ref>]                     Dry-run each ./basin/migrations/*.sql file.

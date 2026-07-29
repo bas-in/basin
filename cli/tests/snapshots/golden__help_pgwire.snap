@@ -1,0 +1,15 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage pgwire credentials and engine JWT keys.
+
+USAGE
+  basin pgwire [args]
+
+FLAGS / SUBCOMMANDS
+  show         [--project=<ref>]            Show pgwire metadata (password masked).
+  reveal       [--project=<ref>]            Print the full connection DSN (shown ONCE).
+  rotate       [--project=<ref>] [--yes]    Rotate the pgwire password (new DSN shown ONCE).
+  engine-keys list   [--project=<ref>]      List engine JWT keys (masked).
+  engine-keys rotate [--project=<ref>] [--yes]  Rotate engine JWT keys.

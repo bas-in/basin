@@ -1,0 +1,14 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Get / set / delete the engine version pin for a project.
+
+USAGE
+  basin engine-pin [args]
+
+FLAGS / SUBCOMMANDS
+  get    [--project=<ref>]                      Show the current engine version pin.
+  put    --version=<v> [--project=<ref>] [--yes] Pin the engine to a specific version.
+  delete [--project=<ref>] [--yes]               Unpin the engine version.
+  events [--project=<ref>] [--limit=N]           List pin audit events.

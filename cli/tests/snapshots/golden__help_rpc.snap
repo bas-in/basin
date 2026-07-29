@@ -1,0 +1,17 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Invoke a user-defined database function via PostgREST RPC.
+
+USAGE
+  basin rpc [args]
+
+FLAGS / SUBCOMMANDS
+  <fn>                     Function name (required).
+  --arg k=v               Pass a typed argument (repeatable).
+  --body @file.json       Pass a raw JSON body from file.
+  --project=<ref>         Project ref.
+  
+  Type inference for --arg: 'true'/'false' → bool; integers → number; else string.
+  Scalar result is printed bare; table result is pretty-printed JSON.

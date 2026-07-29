@@ -1,0 +1,40 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "domains": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "cert_status": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cert_status",
+          "created_at",
+          "hostname",
+          "id",
+          "status"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "domains"
+  ],
+  "type": "object"
+}

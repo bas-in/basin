@@ -1,0 +1,15 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage project OAuth provider configuration.
+
+USAGE
+  basin oauth-providers [args]
+
+FLAGS / SUBCOMMANDS
+  list                                                          List configured OAuth providers.
+  get    <provider>                                             Show one provider config.
+  set    <provider> --client-id=<id> --client-secret=<s>       Configure a provider.
+         [--enabled=true|false] [--scopes=<csv>] [--project=<ref>]
+  delete <provider> [--project=<ref>] [--yes]                  Remove a provider config.

@@ -1,0 +1,17 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+List / get / create / delete / pause / resume / transfer projects.
+
+USAGE
+  basin projects [args]
+
+FLAGS / SUBCOMMANDS
+  list      [--org <slug>]                               List projects.
+  get       <ref>                                        Show one project.
+  create    <name> --org <slug> [--region <code>]        Create a project.
+  delete    <ref> [--yes]                                Delete a project (confirm by name).
+  pause     <ref>                                        Pause a project's data plane.
+  resume    <ref>                                        Resume a paused project.
+  transfers <list|create|cancel>  [--project=<ref>]      Manage project org-transfers.

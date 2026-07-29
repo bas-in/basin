@@ -1,0 +1,18 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage OAuth applications for an org.
+
+USAGE
+  basin oauth-apps [args]
+
+FLAGS / SUBCOMMANDS
+  list                 --org=<slug>                                                 List OAuth apps.
+  get    <id>          --org=<slug>                                                 Show one OAuth app.
+  create               --org=<slug> --name=<n> --redirect-uri=<u> [--scopes=<csv>] Create an OAuth app (client_secret shown ONCE).
+  patch  <id>          --org=<slug> [--name=<n>] [--redirect-uri=<u>] [--scopes=<csv>]  Update an app.
+  rotate <id>          --org=<slug> [--yes]                                        Rotate client_secret (shown ONCE).
+  disable <id>         --org=<slug>                                                 Disable an OAuth app.
+  enable  <id>         --org=<slug>                                                 Enable an OAuth app.
+  delete  <id>         --org=<slug> [--yes]                                        Delete an OAuth app.

@@ -1,0 +1,12 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Forget the locally-stored personal access token.
+
+USAGE
+  basin logout [args]
+
+FLAGS / SUBCOMMANDS
+  --org=<slug>   Wipe the per-org entry. Default wipes default_token.
+  --all          Wipe every stored token.

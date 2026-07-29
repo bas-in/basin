@@ -1,0 +1,57 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "orgs": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "plan": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "plan",
+          "slug"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "user": {
+      "additionalProperties": true,
+      "properties": {
+        "email": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "email",
+        "id",
+        "name"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "orgs",
+    "user"
+  ],
+  "type": "object"
+}

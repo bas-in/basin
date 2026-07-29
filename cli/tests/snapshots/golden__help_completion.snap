@@ -1,0 +1,13 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Print a shell completion script for bash, zsh, or fish.
+
+USAGE
+  basin completion [args]
+
+FLAGS / SUBCOMMANDS
+  bash    Print bash completion.
+  zsh     Print zsh completion.
+  fish    Print fish completion.

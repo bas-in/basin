@@ -1,0 +1,16 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage saved SQL queries and query history.
+
+USAGE
+  basin queries [args]
+
+FLAGS / SUBCOMMANDS
+  save    --name=<n> --sql=<s> [--description=<d>] [--public=bool] [--project=<ref>]  Save a query.
+  list    [--project=<ref>]                                                            List saved queries.
+  get     <id>                                                                         Get a saved query by ID.
+  fork    <id> [--name=<n>] [--project=<ref>]                                         Fork a saved query.
+  delete  <id> [--project=<ref>] [--yes]                                              Delete a saved query.
+  history [--project=<ref>] [--limit=N] [--clear --yes]                               List or clear history.

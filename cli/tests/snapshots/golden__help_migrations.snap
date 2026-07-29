@@ -1,0 +1,16 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage project migrations (DDL snapshots).
+
+USAGE
+  basin migrations [args]
+
+FLAGS / SUBCOMMANDS
+  list                  --project <ref>          List all migrations, newest first.
+  apply <id>            --project <ref>          Apply (roll forward to) a migration.
+  new   <name>                                   Create a new local migration file.
+  get   <id>            --project <ref>          Show a single migration's details.
+  diff                  --project <ref>          Show schema drift vs applied migrations.
+  rollback <id>         --project <ref> [--yes]  Roll back a migration.

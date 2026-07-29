@@ -1,0 +1,20 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+List, show, create, update, delete organizations and manage branding.
+
+USAGE
+  basin orgs [args]
+
+FLAGS / SUBCOMMANDS
+  list                                                       List orgs the caller can see.
+  show <slug>                                                Show one org by slug.
+  create --slug=<s> --name=<n> [--plan=free|pro]            Create a new org.
+  update <slug> [--name=<n>] [--plan=<p>]                   Update an org.
+  delete <slug> [--yes]                                      Delete an org (destructive).
+  branding get <slug>                                        Get org branding.
+  branding put <slug> [--logo-url=...] [--primary-color=...] [--secondary-color=...]  Set org branding.
+  branding delete <slug>                                     Remove org branding.
+  ownership-transfers <list|create|cancel|accept|decline>   Manage org-owner handovers.
+  incoming-project-transfers <list|accept|decline>          Manage inbound project handovers.

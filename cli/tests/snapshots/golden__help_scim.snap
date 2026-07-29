@@ -1,0 +1,14 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage SCIM provisioning config and tokens for an org.
+
+USAGE
+  basin scim [args]
+
+FLAGS / SUBCOMMANDS
+  config get          --org=<slug>                  Show SCIM provisioning config.
+  tokens list         --org=<slug>                  List SCIM provisioning tokens.
+  tokens create       --org=<slug> --name=<n>       Mint a SCIM token (secret shown ONCE).
+  tokens revoke <id>  --org=<slug> [--yes]          Revoke a SCIM token.

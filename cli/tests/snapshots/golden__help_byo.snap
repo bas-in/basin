@@ -1,0 +1,13 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Manage bring-your-own infra surfaces (bucket, KMS, engine).
+
+USAGE
+  basin byo [args]
+
+FLAGS / SUBCOMMANDS
+  bucket  get|put|probe|delete                 [--project=<ref>]   Manage a customer-owned object storage bucket.
+  kms     get|put|rotate|verify|audit|delete|cache-stats  [--project=<ref>]  Manage a customer-managed KMS key.
+  engine  get|put|probe|delete                 [--project=<ref>]   Manage a self-hosted Basin engine.

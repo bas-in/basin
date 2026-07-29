@@ -1,0 +1,20 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Deploy JS/TS edge functions to the Wasm component runtime (engine 5.11.W).
+
+USAGE
+  basin functions [args]
+
+FLAGS / SUBCOMMANDS
+  deploy <entry.ts> [--name <n>]   Compile TS/JS → Wasm component and register it.
+  list                             List deployed functions.
+  logs <name> [--limit <n>]        Tail a function's invocation logs.
+  delete <name>                    Delete a deployed function.
+  
+  Functions run as WebAssembly components, not V8 (see ADR 0019).
+  Compile toolchain: componentize-js (fallback javy) — install with
+    npm i -g @bytecodealliance/componentize-js   or   brew install javy
+  
+  Global: --project=<ref>  --json

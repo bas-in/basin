@@ -1,0 +1,31 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Restore a project — from a cloud backup/PITR, a self-hosted engine snapshot, or by replaying a dump file.
+
+USAGE
+  basin restore [args]
+
+FLAGS / SUBCOMMANDS
+  Cloud backup restore (default; calls POST /v1/projects/:ref/backups/restore):
+    --snapshot=<id>       Restore from a specific backup snapshot (source_kind=snapshot).
+    --as-of=<rfc3339>     Point-in-time restore to a timestamp (source_kind=timestamp).
+    --yes                 Skip the confirmation prompt.
+    --project=<ref>       Project ref (required, or auto-detected from ./basin/config.toml).
+  
+  Self-hosted engine mode (BASIN_MODE=engine or global --engine flag):
+    --snapshot=<engine_snapshot_id>  Restore from engine_snapshot_id returned by `basin snapshots create`.
+    --as-of=<rfc3339>                Point-in-time restore on the engine.
+    --project=<ulid>                 Engine project ULID (not a cloud ref).
+    Requires BASIN_ADMIN_TOKEN or --admin-token with is_admin:true JWT.
+    Calls POST /admin/v1/projects/:id/restore on the engine.
+  
+  Dump-file replay (inverse of `basin dump`):
+    dump.sql              Path to the dump file produced by `basin dump`.
+                          Use `-` to read from stdin (or pipe: basin dump ... | basin restore ...).
+    --project=<ref>       Project ref (required, or auto-detected from ./basin/config.toml).
+  
+  Mode is selected automatically:
+    --snapshot / --as-of present → engine restore (engine mode) or cloud restore (cloud mode).
+    File path / stdin present    → dump-file replay (cloud mode only).

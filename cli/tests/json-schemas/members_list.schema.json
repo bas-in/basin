@@ -1,0 +1,28 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "members": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "email",
+          "role"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "members"
+  ],
+  "type": "object"
+}

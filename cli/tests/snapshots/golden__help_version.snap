@@ -1,0 +1,5 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+basin 0.1.0 built unknown for macos/aarch64

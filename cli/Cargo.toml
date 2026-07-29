@@ -1,0 +1,54 @@
+[package]
+name = "basin-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "Apache-2.0"
+description = "Basin Cloud control plane CLI"
+repository = "https://github.com/bas-in/basin-cli"
+
+# The daily-driver binary is `basin` (matches the flyctl→fly / supabase
+# convention of one short word), distinct from the engine admin `basinctl`.
+[[bin]]
+name = "basin"
+path = "src/main.rs"
+
+[dependencies]
+# clap (builder API, used per-command with no_binary_name) replaces Go's
+# hand-rolled flag.FlagSet. reqwest blocking + rustls-tls is the HTTP
+# transport (rustls avoids an OpenSSL system dep for cross-compiled
+# release binaries). serde/serde_json shape the {data,error} envelopes.
+# chrono parses the RFC3339 timestamps cached in config.json.
+clap = "4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+# tokio + tokio-postgres + rustyline back the `basin tx` interactive
+# transaction REPL (TASKS.md #349). Single-thread tokio runtime is
+# plenty for one pgwire connection; rustyline gives in-session line
+# editing + history (no persistent history file, scope-tight).
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+tokio-postgres = "0.7"
+rustyline = "14"
+
+# proptest is the stable-toolchain property-based testing crate we use as
+# a fuzz substitute (Rust nightly's `cargo-fuzz` would otherwise be a
+# nightly-only dependency). See `tests/fuzz_proptest.rs` for the targets.
+# insta is the snapshot-test framework backing `tests/golden.rs` — the
+# Rust analogue of Go's `-update-golden` flag (refresh on intentional UX
+# change via `cargo insta accept` or `INSTA_UPDATE=always cargo test`).
+[dev-dependencies]
+proptest = "1.5"
+insta = { version = "1", features = ["filters"] }
+# jsonschema validates each --json output shape against a checked-in
+# lockfile so unintended shape drift is caught at PR time (TASKS.md 366).
+# Pinned to the 0.18 line — default features pull in `reqwest`/`fancy_regex`
+# but it builds cleanly against the rest of the dep tree. Used only in
+# `tests/json_schemas.rs`.
+jsonschema = { version = "0.18", default-features = false }
+
+[profile.release]
+strip = true
+lto = "thin"

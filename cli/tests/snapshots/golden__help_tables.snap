@@ -1,0 +1,19 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+List / describe / manage tables and their columns.
+
+USAGE
+  basin tables [args]
+
+FLAGS / SUBCOMMANDS
+  list        --project <ref>                                 List tables.
+  describe    <name> --project <ref>                          Show columns + RLS.
+  show-rows   <name> --project <ref> [--page N --page-size N] Paginated rows.
+  create      <name> --column=<spec>... [--project <ref>]     Create a table.
+  alter       <name> [--add-column=<spec>]... [--drop-column=<col>]... [--project <ref>]  Alter a table.
+  drop        <name> [--yes] [--project <ref>]                Drop a table.
+  import-csv  <name> [--file=<path>] [--header=true|false] [--project <ref>]  Import CSV.
+  export-csv  <name> [--project <ref>]                        Export CSV to stdout.
+  columns     add|alter|drop <table> ...                      Manage columns.

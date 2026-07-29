@@ -1,0 +1,13 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Bind this directory to a remote project.
+
+USAGE
+  basin link [args]
+
+FLAGS / SUBCOMMANDS
+  --project=<ref>   Project ref to link (required).
+  --org=<slug>      Org slug (optional, for disambiguation).
+  --force           Overwrite an existing project binding.

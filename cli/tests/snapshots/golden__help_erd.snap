@@ -1,0 +1,13 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Export the project Entity-Relationship Diagram.
+
+USAGE
+  basin erd [args]
+
+FLAGS / SUBCOMMANDS
+  export [--project=<ref>] [--format=svg|dot|json] [--output=<path>]
+    --format  Output format: svg (default), dot, or json.
+    --output  Write to this path (defaults to stdout).

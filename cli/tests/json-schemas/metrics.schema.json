@@ -1,0 +1,32 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "metrics": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "unit": {
+            "type": "string"
+          },
+          "value": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "name",
+          "unit",
+          "value"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "metrics"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,11 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+List the native extension catalog for a project.
+
+USAGE
+  basin extensions [args]
+
+FLAGS / SUBCOMMANDS
+  list [--project=<ref>]   List available extensions (read-only).

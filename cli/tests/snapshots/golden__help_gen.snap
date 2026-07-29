@@ -1,0 +1,11 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Code-generation utilities.
+
+USAGE
+  basin gen [args]
+
+FLAGS / SUBCOMMANDS
+  types <lang>   Generate typed database interfaces (ts/go/py/ruby/rust/java/csharp/php/dart/swift).

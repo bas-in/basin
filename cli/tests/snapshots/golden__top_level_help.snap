@@ -1,0 +1,102 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+basin — manage basin-cloud projects from the terminal.
+
+USAGE
+  basin [global flags] <command> [args]
+
+GLOBAL FLAGS
+  --api-url=<url>        Override the API endpoint (default https://api.basin.run).
+  --token=<pat>          Use this PAT instead of the on-disk config.
+  --org=<slug>           Use the per-org token from the config file.
+  --engine               Target a self-hosted OSS engine instead of basin.run cloud.
+  --admin-token=<jwt>    Admin JWT (is_admin:true) for engine-direct mode.
+  --json                 Emit machine-readable JSON.
+  -q, --quiet            Suppress non-essential output.
+  --no-color             Disable ANSI colour in tables.
+  -h, --help             Show this help.
+
+ENVIRONMENT
+  BASIN_TOKEN            Same as --token.
+  BASIN_API              Same as --api-url.
+  BASIN_MODE=engine      Same as --engine (route to self-hosted OSS engine).
+  BASIN_ADMIN_TOKEN      Same as --admin-token (is_admin:true JWT for /admin/v1/* routes).
+  XDG_CONFIG_HOME        Where to look for config.json (default ~/.config).
+  NO_COLOR               Disable ANSI colour (any non-empty value).
+
+SELF-HOSTED OSS ENGINE
+  Point the CLI at a self-hosted basin-server and set engine mode:
+    export BASIN_API=http://localhost:3000
+    export BASIN_MODE=engine
+    export BASIN_ADMIN_TOKEN=<jwt-with-is_admin-true>
+  The following commands then target the engine admin API directly:
+    snapshots create / snapshots restore   → /admin/v1/projects/:id/snapshot|restore
+    restore --snapshot / --as-of           → /admin/v1/projects/:id/restore
+    branches create --dst-project=<ulid>   → /admin/v1/projects/:id/fork
+  All other commands continue to target the cloud control plane.
+
+COMMANDS
+  login              Sign in by pasting a personal access token.
+  logout             Forget the locally-stored token.
+  whoami             Print the active user + accessible orgs.
+  orgs               List / get / create / update / delete orgs + branding.
+  members            List / invite / remove / role-change org members.
+  invitations        List / resend / revoke pending org invitations.
+  projects           List / get / create / delete / pause / resume projects.
+  dev                Start a local basin-server instance for development.
+  stop               Stop the local basin-server stack (Docker Compose mode).
+  init               Scaffold a basin project directory (./basin/).
+  link               Bind ./basin/ to a remote project (writes project_ref).
+  status             Show the linked project + migration drift summary.
+  unlink             Remove the project binding from ./basin/config.toml.
+  sql                Run a SQL query against a project.
+  tx                 Open an interactive transaction REPL (begin/commit/rollback).
+  dump               Export a project's schema + data (pg_dump-shaped, plain or custom format).
+  restore            Replay a dump file into a project (inverse of `basin dump`).
+  migrate-from-pg    Guided Postgres → Basin migration with --dry-run + --resume (T27.1).
+  rpc                Invoke a user-defined database function (T26.4).
+  db                 Push / pull / diff / reset / url / dump / lint the project database.
+  tables             List / describe / create / alter / drop tables + CSV import/export.
+  rows               Insert / update / delete rows in a project table.
+  storage            Manage object storage buckets and objects (engine 5.17).
+  functions          Deploy JS/TS edge functions to the Wasm component runtime (5.11.W).
+  rls                Enable / disable RLS + manage row-level security policies.
+  migrations         List / apply / new / get / diff / rollback DDL migrations.
+  branches           List / create / get / merge / delete / events on project branches.
+  gen                Generate typed bindings (ts/go/py/ruby/rust/java/csharp/php/dart/swift) from schema.
+  snapshots          List / create / restore project snapshots.
+  backups            Manage backup policy / snapshots / restore jobs.
+  logs               Stream live project logs (or poll history).
+  realtime           Subscribe to table event streams over SSE (T26.1).
+  api-keys           List / create / rotate / revoke project-scoped API keys.
+  pgwire             Show / reveal / rotate pgwire credentials and engine JWT keys.
+  domains            Add / verify / cert / list / remove custom project domains.
+  webhooks           Manage project webhooks: create / patch / test / redeliver / deliveries.
+  alerts             Manage alert rules + view fired events.
+  audit              List org audit events (--org=<slug> required).
+  activity           List project activity events.
+  metrics            Show project or org metrics (--range / --metric).
+  erd                Export project ERD (svg / dot / json).
+  queries            Save / list / get / fork / delete / history SQL queries.
+  engine-pin         Get / put / delete / events on the project's engine version pin.
+  extensions         List the project's installed engine extensions.
+  oauth-providers    List / get / set / delete project OAuth providers.
+  email              Manage project email templates + view allowance.
+  byo                Configure bring-your-own bucket / kms / engine.
+  saml               Get / put / test / enable / disable org SAML SSO.
+  scim               SCIM config + provisioning tokens.
+  oauth-apps         Manage org OAuth applications (clients).
+  explain            Run EXPLAIN [ANALYZE] on a SQL statement via the cloud proxy.
+  index-advisor      Show JSONB index recommendations for the project's tables.
+  replication-slots  List / create / drop logical replication slots (CDC / Debezium).
+  docs               Open docs.basin.run for a given subcommand.
+  secrets            List / set / remove project env-overrides.
+  tokens             Manage org-scoped personal access tokens.
+  config             Read or write CLI config (telemetry, default org).
+  completion         Print a shell completion script for bash, zsh, or fish.
+  version            Print binary version + build metadata.
+  help               Show help for the CLI or a subcommand.
+
+Run `basin help <command>` for command-specific flags.

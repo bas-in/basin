@@ -1,0 +1,12 @@
+---
+source: tests/golden.rs
+expression: stdout
+---
+Fetch project or org-level metrics.
+
+USAGE
+  basin metrics [args]
+
+FLAGS / SUBCOMMANDS
+  [--project=<ref>] [--org=<slug>] [--range=24h|7d|30d] [--metric=<name>]
+  Exactly one of --project (or working project) and --org must be set.
