@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="Basin">
+  <title>Basin</title>
+  <rect width="128" height="128" rx="28" fill="#0E2A2B"/>
+  <!-- basin rim -->
+  <ellipse cx="64" cy="40" rx="37" ry="12" fill="none" stroke="#FAF7F0" stroke-width="7"/>
+  <!-- bowl walls -->
+  <path d="M27 40 L27 68 a37 24 0 0 0 74 0 L101 40" fill="none" stroke="#FAF7F0" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- stored data: layered strata in the reservoir -->
+  <path d="M34 57 a30 10 0 0 0 60 0" fill="none" stroke="#60999E" stroke-width="6" stroke-linecap="round"/>
+  <path d="M40 74 a24 8 0 0 0 48 0" fill="none" stroke="#DE7A63" stroke-width="6" stroke-linecap="round"/>
+</svg>
