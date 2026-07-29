@@ -1,0 +1,5 @@
+*.tfstate*
+.terraform/
+.terraform.lock.hcl
+terraform-provider-basin
+dist/
