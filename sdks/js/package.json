@@ -1,0 +1,119 @@
+{
+  "name": "@bas-in/basin-js",
+  "version": "0.0.1",
+  "description": "Isomorphic JavaScript / TypeScript client for the Basin platform. Auth, table queries, storage.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./auth": {
+      "types": "./dist/auth/index.d.ts",
+      "import": "./dist/auth/index.js",
+      "require": "./dist/auth/index.cjs"
+    },
+    "./storage": {
+      "types": "./dist/storage/index.d.ts",
+      "import": "./dist/storage/index.js",
+      "require": "./dist/storage/index.cjs"
+    },
+    "./postgrest": {
+      "types": "./dist/postgrest/index.d.ts",
+      "import": "./dist/postgrest/index.js",
+      "require": "./dist/postgrest/index.cjs"
+    },
+    "./realtime": {
+      "types": "./dist/realtime/index.d.ts",
+      "import": "./dist/realtime/index.js",
+      "require": "./dist/realtime/index.cjs"
+    },
+    "./functions": {
+      "types": "./dist/functions/index.d.ts",
+      "import": "./dist/functions/index.js",
+      "require": "./dist/functions/index.cjs"
+    },
+    "./admin": {
+      "types": "./dist/admin/index.d.ts",
+      "import": "./dist/admin/index.js",
+      "require": "./dist/admin/index.cjs"
+    },
+    "./openapi": {
+      "types": "./dist/openapi/index.d.ts",
+      "import": "./dist/openapi/index.js",
+      "require": "./dist/openapi/index.cjs"
+    },
+    "./ssr": {
+      "types": "./dist/ssr/index.d.ts",
+      "import": "./dist/ssr/index.js",
+      "require": "./dist/ssr/index.cjs"
+    },
+    "./functions-sdk": {
+      "types": "./dist/functions-sdk/index.d.ts",
+      "import": "./dist/functions-sdk/index.js",
+      "require": "./dist/functions-sdk/index.cjs"
+    },
+    "./codegen": {
+      "types": "./dist/src/codegen/index.d.ts",
+      "import": "./dist/src/codegen/index.js",
+      "require": "./dist/src/codegen/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "basin-js-gen-types": "./dist/bin/gen-types.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --max-warnings=0",
+    "format": "prettier --write \"src/**/*.ts\""
+  },
+  "keywords": [
+    "basin",
+    "database",
+    "sdk",
+    "postgres",
+    "pgwire",
+    "vector"
+  ],
+  "homepage": "https://basin.run",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bas-in/basin-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bas-in/basin-js/issues"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@typescript-eslint/eslint-plugin": "^8.59.4",
+    "@typescript-eslint/parser": "^8.59.4",
+    "eslint": "^9.18.0",
+    "prettier": "^3.4.2",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
