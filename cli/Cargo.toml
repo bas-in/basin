@@ -5,7 +5,14 @@ edition = "2021"
 rust-version = "1.74"
 license = "Apache-2.0"
 description = "Basin Cloud control plane CLI"
-repository = "https://github.com/bas-in/basin-cli"
+repository = "https://github.com/bas-in/basin"
+
+# Standalone crate — deliberately NOT a member of the engine workspace at
+# ../Cargo.toml. The CLI depends only on registry crates (never on the
+# engine crates), ships on its own release cadence, and keeps its own
+# Cargo.lock; the empty table below detaches it so `cargo` works inside
+# this directory. Same arrangement as sdks/rust/.
+[workspace]
 
 # The daily-driver binary is `basin` (matches the flyctl→fly / supabase
 # convention of one short word), distinct from the engine admin `basinctl`.
