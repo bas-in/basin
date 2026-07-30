@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./basin-dark.svg">
-    <img src="./basin.svg" alt="Basin" width="96">
+    <img src="brand/logo.svg" alt="Basin" width="96">
   </picture>
 </p>
 
@@ -534,6 +534,16 @@ open benchmark/index_localfs.html
 ```
 
 ---
+
+## Brand
+
+The mark in [`brand/`](brand/) is the source of truth. Every icon this repo
+ships — favicon, PWA and app icons, the mark in the README and on the site — is
+rendered from `brand/logo.svg` rather than redrawn, so there is one approved
+drawing and no second copy to drift.
+
+Copy it outward, never edit a derived copy, and never edit `brand/` to match
+something downstream.
 
 ## License
 
