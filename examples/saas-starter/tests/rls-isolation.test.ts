@@ -7,10 +7,19 @@
  * their own user — they have no membership in org B.
  *
  * How it works:
- * 1. Connect to Basin with a privileged (service) connection via postgres.js
- *    to set up two orgs, two users, their memberships, and their todos.
- *    (The service connection bypasses RLS — Basin's 'basin' default user has
- *    no RLS restrictions in the default dev config.)
+ * 1. Connect to Basin over pgwire via postgres.js to set up two orgs, two
+ *    users, their memberships, and their todos.
+ *
+ *    NOTE — Basin has NO privileged RLS bypass, contrary to what this comment
+ *    used to claim. A pgwire session with no JWT is *anonymous*: `auth.uid()`
+ *    is NULL, so a `USING (... = auth.uid())` policy matches nothing and the
+ *    session reads zero rows. See `rls_with_auth_uid_filters_per_user` in
+ *    tests/integration/tests/auth_rls_uid.rs. Consequently this seeding must
+ *    happen BEFORE the SELECT policies are in force, or from a session whose
+ *    uid the policies admit — `npm run setup` ordering matters, and if seeding
+ *    starts failing that is why. The `beforeAll` below now throws on a setup
+ *    error instead of warning, so this cannot silently produce an empty
+ *    fixture that makes the isolation assertions trivially true.
  *
  * 2. Sign in as alice via basin-auth (POST /auth/v1/signin) to get a JWT.
  *
@@ -26,8 +35,22 @@
  *   - basin-auth enabled (BASIN_AUTH_ENABLED=1)
  *   - Schema migrated + RLS policies applied (npm run setup)
  *
- * Without a live Basin instance the tests are skipped (BASIN_SKIP_LIVE_TESTS=1
- * or the server is unreachable).
+ * ── WHY THIS FILE IS SHAPED THE WAY IT IS ─────────────────────────────────
+ * An earlier revision began every test with
+ *
+ *     if (!(await isBasinReachable())) return console.log("[skip] ...");
+ *
+ * which is a PASS, not a skip. In CI — where nothing starts Basin — the suite
+ * reported `Tests: 4 passed, 4 total`, including the line "Org-A JWT cannot
+ * read Org-B todos", while making zero requests. A green tick asserting
+ * cross-tenant isolation that had never once been exercised is worse than no
+ * test: it retires the question.
+ *
+ * So: there is exactly ONE way to not run these, and it is explicit.
+ * `BASIN_SKIP_LIVE_TESTS=1` marks the suite skipped, and jest then *reports*
+ * it as skipped rather than passed. Any other reason for not reaching Basin —
+ * server down, auth off, schema not migrated — is a FAILURE with a message
+ * naming the missing prerequisite.
  */
 
 import postgres from "postgres";
@@ -52,6 +75,41 @@ async function isBasinReachable(): Promise<boolean> {
   }
 }
 
+/**
+ * Fail — do not skip — when Basin is not reachable.
+ *
+ * Reaching here means the caller did NOT set BASIN_SKIP_LIVE_TESTS=1 (the guard
+ * at the top of the suite would have short-circuited), so it believes a live
+ * Basin is available. It isn't, and the only honest outcome is red.
+ */
+async function requireBasin(): Promise<void> {
+  if (await isBasinReachable()) return;
+  throw new Error(
+    `Basin is not reachable at ${BASIN_URL}, and BASIN_SKIP_LIVE_TESTS is not set.\n` +
+      `These tests assert per-tenant RLS isolation and cannot do that against nothing.\n` +
+      `  Start Basin:      docker run --rm -p 5432:5432 basin-server\n` +
+      `  Migrate + policies: npm run setup\n` +
+      `  Or, to declare out loud that isolation is NOT being verified in this run:\n` +
+      `                    BASIN_SKIP_LIVE_TESTS=1 npm test\n` +
+      `(That marks the suite skipped. It never reports as passed.)`
+  );
+}
+
+/** Assert a basin-rest result set is a real array, not a null from a failed call. */
+function requireRows<T>(rows: T[] | null | undefined, what: string): T[] {
+  if (rows == null) {
+    throw new Error(
+      `${what}: basin-rest returned no row set (null/undefined), which means the ` +
+        `request failed rather than returning zero rows. An empty-result assertion ` +
+        `would have passed here while proving nothing about RLS.`
+    );
+  }
+  if (!Array.isArray(rows)) {
+    throw new Error(`${what}: expected an array of rows, got ${typeof rows}`);
+  }
+  return rows;
+}
+
 // ---------------------------------------------------------------------------
 // Test suite
 // ---------------------------------------------------------------------------
@@ -69,24 +127,22 @@ describe("Per-tenant RLS isolation (org A cannot see org B's todos)", () => {
   const bobEmail = `bob-rls-test-${Date.now()}@example.com`;
   const password = "hunter2hunter2";
 
-  // Skip early if explicitly opted out
+  // The ONLY sanctioned way to not run these. `test.skip` makes jest report
+  // the suite as skipped; it can never be mistaken for four passing isolation
+  // assertions the way an early `return` inside each test was.
   if (SKIP) {
-    test.skip("BASIN_SKIP_LIVE_TESTS=1 — skipping live tests", () => {});
+    test.skip(
+      "BASIN_SKIP_LIVE_TESTS=1 — per-tenant RLS isolation NOT verified in this run",
+      () => {}
+    );
     return;
   }
 
   beforeAll(async () => {
-    // Check server reachability before doing any setup
-    const reachable = await isBasinReachable();
-    if (!reachable) {
-      console.warn(
-        "\n  [rls-isolation] Basin not reachable at " +
-          BASIN_URL +
-          " — skipping live tests.\n" +
-          "  Start Basin with: docker run --rm -p 5432:5432 basin-server\n" +
-          "  Or set BASIN_SKIP_LIVE_TESTS=1 to suppress this warning.\n"
-      );
-    }
+    // Reachability is a prerequisite, not a condition. Throwing here fails the
+    // whole suite with one clear message instead of letting each test decide to
+    // pass quietly.
+    await requireBasin();
 
     sql = postgres(DATABASE_URL, { max: 2 });
 
@@ -103,11 +159,16 @@ describe("Per-tenant RLS isolation (org A cannot see org B's todos)", () => {
           body: JSON.stringify({ email, password: pass }),
         });
       } catch {
-        // Server unreachable — beforeAll will continue; tests will skip below
+        // Signup failing is not fatal on its own (409 on re-run is normal, and
+        // the sign-in assertions below are what actually gate the tests). It is
+        // NOT a reason to pass, though: requireBasin() already established the
+        // server is up, and every test signs in explicitly and throws if it
+        // cannot.
       }
     }
 
-    // Insert test data using the privileged service connection (bypasses RLS)
+    // Seed over pgwire. This is NOT an RLS bypass (there is none) — it relies on
+    // the SELECT policies not yet filtering these writes; see the note above.
     try {
       // Upsert users
       await sql`
@@ -152,7 +213,13 @@ describe("Per-tenant RLS isolation (org A cannot see org B's todos)", () => {
         ON CONFLICT DO NOTHING
       `;
     } catch (err) {
-      console.warn("  [rls-isolation] Setup DB error:", err);
+      // Do NOT swallow this. A failed setup means the assertions below would
+      // run against an empty schema, where "Alice cannot see Bob's todo" is
+      // trivially true. That is exactly how a vacuous pass gets manufactured.
+      throw new Error(
+        `RLS test setup failed, so the isolation assertions cannot be trusted: ${err}\n` +
+          `  Migrate the schema and apply policies first: npm run setup`
+      );
     }
   });
 
@@ -165,20 +232,19 @@ describe("Per-tenant RLS isolation (org A cannot see org B's todos)", () => {
   // -------------------------------------------------------------------------
 
   test("Alice can see her org (Acme) todos", async () => {
-    if (!(await isBasinReachable())) {
-      return console.log("  [skip] Basin not reachable");
-    }
+    await requireBasin();
 
     const client = createCompatClient(BASIN_URL);
     const { data: signInData, error: signInError } =
       await client.auth.signInWithPassword({ email: aliceEmail, password });
 
     if (signInError) {
-      console.warn(
-        "  [skip] Could not sign in as alice (auth may require email verification):",
-        signInError.message
+      throw new Error(
+        `Could not sign in as alice: ${signInError.message}\n` +
+          `  Without a session there is no JWT, so no RLS policy is exercised and ` +
+          `this test would otherwise pass by doing nothing. If basin-auth requires ` +
+          `email verification, disable it for the test environment.`
       );
-      return;
     }
     expect(signInData?.session?.accessToken).toBeTruthy();
 
@@ -187,32 +253,32 @@ describe("Per-tenant RLS isolation (org A cannot see org B's todos)", () => {
       .select("id, org_id, title");
 
     expect(error).toBeNull();
-    expect(todos).not.toBeNull();
+    const rows = requireRows(todos, "alice todos");
 
-    // Alice must see at least her own todo
-    const aliceTodo = todos?.find((t) => t.title === "Alice secret todo");
+    // Positive assertion FIRST. It is what proves the query worked at all; the
+    // negative assertion below is meaningless without it, because a request
+    // that returns nothing also "hides" Bob's row.
+    const aliceTodo = rows.find((t) => t.title === "Alice secret todo");
     expect(aliceTodo).toBeDefined();
 
     // Alice must NOT see Bob's todo (different org, no membership)
-    const bobTodo = todos?.find((t) => t.title === "Bob private todo");
+    const bobTodo = rows.find((t) => t.title === "Bob private todo");
     expect(bobTodo).toBeUndefined();
   });
 
   test("Bob can see his org (Globex) todos", async () => {
-    if (!(await isBasinReachable())) {
-      return console.log("  [skip] Basin not reachable");
-    }
+    await requireBasin();
 
     const client = createCompatClient(BASIN_URL);
     const { data: signInData, error: signInError } =
       await client.auth.signInWithPassword({ email: bobEmail, password });
 
     if (signInError) {
-      console.warn(
-        "  [skip] Could not sign in as bob (auth may require email verification):",
-        signInError.message
+      throw new Error(
+        `Could not sign in as bob: ${signInError.message}\n` +
+          `  Without a session there is no JWT, so no RLS policy is exercised and ` +
+          `this test would otherwise pass by doing nothing.`
       );
-      return;
     }
     expect(signInData?.session?.accessToken).toBeTruthy();
 
@@ -221,21 +287,19 @@ describe("Per-tenant RLS isolation (org A cannot see org B's todos)", () => {
       .select("id, org_id, title");
 
     expect(error).toBeNull();
-    expect(todos).not.toBeNull();
+    const rows = requireRows(todos, "bob todos");
 
-    // Bob must see his own todo
-    const bobTodo = todos?.find((t) => t.title === "Bob private todo");
+    // Positive first, for the same reason as the Alice case.
+    const bobTodo = rows.find((t) => t.title === "Bob private todo");
     expect(bobTodo).toBeDefined();
 
     // Bob must NOT see Alice's todo
-    const aliceTodo = todos?.find((t) => t.title === "Alice secret todo");
+    const aliceTodo = rows.find((t) => t.title === "Alice secret todo");
     expect(aliceTodo).toBeUndefined();
   });
 
   test("Unauthenticated request returns empty or 401 (no data leakage)", async () => {
-    if (!(await isBasinReachable())) {
-      return console.log("  [skip] Basin not reachable");
-    }
+    await requireBasin();
 
     // Make a raw request without a JWT
     const res = await fetch(`${BASIN_URL}/rest/v1/todos`, {
@@ -256,16 +320,29 @@ describe("Per-tenant RLS isolation (org A cannot see org B's todos)", () => {
   });
 
   test("Org-A JWT cannot read Org-B todos via direct org_id filter", async () => {
-    if (!(await isBasinReachable())) {
-      return console.log("  [skip] Basin not reachable");
-    }
+    await requireBasin();
 
     const client = createCompatClient(BASIN_URL);
     const { data, error } = await client.auth.signInWithPassword({
       email: aliceEmail,
       password,
     });
-    if (error || !data) return console.log("  [skip] sign-in failed");
+    if (error || !data) {
+      throw new Error(
+        `Could not sign in as alice: ${error?.message ?? "no session returned"}\n` +
+          `  This test asserts an empty result set, which is also what a failed ` +
+          `request produces — so it must not be allowed to run without a session.`
+      );
+    }
+
+    // Control: Alice's own org must be readable in this same session. Without
+    // this, the assertion below passes just as happily when basin-rest is
+    // returning nothing for every query.
+    const { data: ownTodos } = await client
+      .from<{ id: string; org_id: string }>("todos")
+      .select("id, org_id")
+      .eq("org_id", acmeOrgId ?? "");
+    expect(requireRows(ownTodos, "alice own-org control query").length).toBeGreaterThan(0);
 
     // Alice tries to explicitly filter by globex's org_id
     const { data: todos } = await client
@@ -275,7 +352,8 @@ describe("Per-tenant RLS isolation (org A cannot see org B's todos)", () => {
 
     // RLS policy fires AFTER any client-supplied filter, so even with the
     // explicit org_id filter, Alice gets zero rows because she has no
-    // membership in Globex.
-    expect(todos ?? []).toHaveLength(0);
+    // membership in Globex. `requireRows` rather than `todos ?? []`: the old
+    // form turned a failed request into a pass.
+    expect(requireRows(todos, "alice cross-org query")).toHaveLength(0);
   });
 });

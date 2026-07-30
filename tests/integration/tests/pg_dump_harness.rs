@@ -2,9 +2,45 @@
 //!
 //! **Task:** TASK.md Phase 5.22.A — pg_dump / pg_restore compatibility and
 //! cross-PG migration test harness.
-//! **Test-first convention:** this file lands BEFORE any dump/restore
-//! implementation. Every test is `#[ignore]`d until the implementation tasks
-//! 5.22.B-E close the corresponding slices.
+//! **Test-first convention:** this file landed BEFORE any dump/restore
+//! implementation.
+//!
+//! ## Coverage status — READ THIS BEFORE TRUSTING A GREEN RUN
+//!
+//! **No slice in this file currently executes.** All four need
+//! `BASIN_LOCAL_URL` and/or `REAL_PG_URL`, and even with those set they would
+//! fail on the CLI contract, three ways over:
+//!
+//!   * They shell out to a binary called `basin-cli`. The CLI's binary is
+//!     `basin` (`[[bin]] name = "basin"` in `cli/Cargo.toml`).
+//!   * They pass `dump --url <pg-url> --table <t>`. The shipped
+//!     `basin dump` (`cli/src/commands/dump.rs`) takes
+//!     `--project/--format/--file` and has no `--url` or `--table`.
+//!   * `basin dump` assembles its output from
+//!     `POST /v1/projects/{ref}/sql/query` on the control plane, so it needs a
+//!     linked project and a token — not a bare pgwire URL, which is what these
+//!     slices provide.
+//!
+//! Until those are reconciled, a passing `cargo test --test pg_dump_harness`
+//! means "four slices declined to run", not "pg_dump compat works".
+//!
+//! Two things previously conspired to hide that:
+//!
+//!  1. This header claimed every test was `#[ignore]`d. None of them were.
+//!     The CI job therefore ran `-- --ignored`, which runs *only* ignored
+//!     tests, and reported
+//!     `test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out`
+//!     — a green check named "pg_dump/psql round-trip" that executed zero
+//!     tests. The `--ignored` flag is gone from the workflow.
+//!  2. `require_env` returns `None` and the slice returns `Ok`, so even when
+//!     the tests do run they pass by declining. `BASIN_REQUIRE_PG_DUMP_ENV=1`
+//!     (set it once the env is genuinely complete) turns every such decline
+//!     into a panic, so a caller that believes it provisioned the world gets
+//!     told when it did not.
+//!
+//! `scripts/check-pg-dump-harness.sh` is what CI runs: it fails closed if zero
+//! tests execute, and if the number of declined slices ever differs from the
+//! committed baseline — so this file cannot quietly get better or worse.
 //!
 //! ## Named slices
 //!
@@ -22,15 +58,20 @@
 //! | `BASIN_LOCAL_URL`| slices 1, 4 (Basin round-trip + ORM)    | `postgres://user:pw@127.0.0.1:5433/db` |
 //! | `REAL_PG_URL`    | slices 2, 3 (cross-PG migration)        | `postgres://postgres:pw@127.0.0.1:5432/postgres` |
 //!
-//! Tests skip cleanly (exit 0, printed skip notice) when the required env var
-//! is absent. This keeps the default `cargo test` run at 0/0/4 (skipped).
+//! | `BASIN_REQUIRE_PG_DUMP_ENV` | set to `1` to make a missing var a hard failure instead of a decline | `1` |
+//!
+//! Without `BASIN_REQUIRE_PG_DUMP_ENV=1` a slice with a missing var prints a
+//! `SKIP` notice and returns, so a developer without postgres client tools
+//! still gets a usable `cargo test`. With it, the same condition panics.
 //!
 //! ## How to flip a slice green
 //!
-//! Once 5.22.B/C/D/E land, drop the `#[ignore]` on the relevant slice (or
-//! replace it with a targeted `#[ignore = "gated on #NNN"]` if only part of
-//! the slice is resolved), set the required env vars, and confirm
-//! `cargo test --test pg_dump_harness` passes without `--ignored`.
+//! Land the `basin-cli dump` / `basin-cli restore` subcommands (5.22.B-E), set
+//! the required env vars plus `BASIN_REQUIRE_PG_DUMP_ENV=1`, and confirm
+//! `cargo test --test pg_dump_harness` passes. Then lower
+//! `EXPECTED_DECLINED_SLICES` in `scripts/check-pg-dump-harness.sh` to match —
+//! that constant is the thing stopping this harness from drifting back to
+//! silently covering nothing.
 //!
 //! ## CLI tools required
 //!
@@ -48,12 +89,32 @@ use std::process::Command;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-/// Return the value of `var` or print a skip notice and return `None`.
+/// Return the value of `var`, or decline the slice.
+///
 /// Callers use `let Some(url) = require_env("VAR") else { return; }`.
+///
+/// Declining prints a `SKIP` line that `scripts/check-pg-dump-harness.sh`
+/// counts, so "this slice did nothing" is visible in the gate rather than only
+/// in a log nobody reads. When `BASIN_REQUIRE_PG_DUMP_ENV=1` the caller is
+/// asserting the environment is complete, and a missing var is then a bug in
+/// the caller — so it panics instead of declining. Without that opt-in a bare
+/// `cargo test` on a laptop with no postgres client tools still works.
 fn require_env(var: &str) -> Option<String> {
     match std::env::var(var) {
         Ok(v) if !v.trim().is_empty() => Some(v),
         _ => {
+            let strict = matches!(
+                std::env::var("BASIN_REQUIRE_PG_DUMP_ENV").as_deref(),
+                Ok("1")
+            );
+            assert!(
+                !strict,
+                "[pg_dump_harness] env var {var} is not set, but \
+                 BASIN_REQUIRE_PG_DUMP_ENV=1 declares the environment complete. \
+                 Either provision {var} (a live database URL) or unset \
+                 BASIN_REQUIRE_PG_DUMP_ENV — do not let the slice pass by \
+                 declining to run."
+            );
             println!(
                 "[pg_dump_harness] SKIP — env var {var} not set. \
                  Set it to a live database URL to run this slice."

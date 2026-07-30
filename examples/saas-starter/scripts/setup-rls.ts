@@ -4,10 +4,14 @@
  * Run AFTER the initial migration (npm run db:migrate).
  * Run: npm run db:setup
  *
- * This script runs with a privileged connection (no RLS restrictions) so it
- * can enable RLS on each table and install policies.  In production you would
- * scope this to a service role that has ALTER TABLE + CREATE POLICY rights but
- * not end-user read/write.
+ * This script connects over pgwire to enable RLS on each table and install
+ * policies. It is NOT a privileged RLS bypass — Basin has none. An
+ * unauthenticated pgwire session has `auth.uid() IS NULL`, so once the policies
+ * below are in force that same session reads zero rows from the tables it just
+ * configured (see tests/integration/tests/auth_rls_uid.rs). Run this AFTER the
+ * migration and BEFORE seeding, or seed from a session the policies admit.
+ * In production you would scope this to a service role that has ALTER TABLE +
+ * CREATE POLICY rights but not end-user read/write.
  *
  * Environment variables:
  *   DATABASE_URL — defaults to postgres://basin@localhost:5432/postgres

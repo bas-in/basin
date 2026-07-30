@@ -1,27 +1,35 @@
 //! Phase 5.29.A — time-series hypertable test harness.
 //!
 //! **Task:** TASK.md Phase 5.29.A — Hypertable harness (RED).
-//! **Test-first convention:** this file lands BEFORE any hypertable
-//! implementation. Every test is `#[ignore]`d until the implementation tasks
-//! 5.29.B-F close the corresponding slices.
+//! **Test-first convention:** this file landed BEFORE any hypertable
+//! implementation, with every test `#[ignore]`d. Slices 5.29.B–F have since
+//! closed and their `#[ignore]`s came off — so the blanket "every test is
+//! ignored" this comment used to assert is **no longer true**, and stating it
+//! anyway is how `hypertable-soak.yml` came to run
+//! `hypertable_orm_compat -- --ignored` (which runs only ignored tests) and
+//! report a green check that executed zero tests, nightly, for months.
+//!
+//! The per-slice column below is the source of truth; keep it accurate.
 //!
 //! ## Named slices
 //!
-//! | Test fn                              | Slice            | Closed by |
-//! |--------------------------------------|------------------|-----------|
-//! | `hypertable_create_and_autopartition`| auto-partition   | 5.29.B    |
-//! | `hypertable_query_routing`           | query routing    | 5.29.C    |
-//! | `hypertable_add_retention_policy`    | retention        | 5.29.D    |
-//! | `hypertable_compression_tier_down`   | tier-down        | 5.29.E    |
-//! | `hypertable_orm_compat`              | ORM compat       | 5.29.F    |
-//! | `hypertable_1b_row_write_soak`       | soak             | 5.29.F    |
+//! | Test fn                              | Slice            | Closed by | `#[ignore]`? |
+//! |--------------------------------------|------------------|-----------|--------------|
+//! | `hypertable_create_and_autopartition`| auto-partition   | 5.29.B    | no           |
+//! | `hypertable_query_routing`           | query routing    | 5.29.C    | no           |
+//! | `hypertable_add_retention_policy`    | retention        | 5.29.D    | no           |
+//! | `hypertable_compression_tier_down`   | tier-down        | 5.29.E    | no           |
+//! | `hypertable_orm_compat`              | ORM compat       | 5.29.F    | no           |
+//! | `hypertable_1b_row_write_soak`       | soak             | 5.29.F    | yes — too slow for CI |
 //!
 //! ## How to flip a slice green
 //!
 //! Once the corresponding phase task lands, drop the `#[ignore]` on the
 //! relevant slice (or replace it with a targeted `#[ignore = "gated on #NNN"]`
-//! if only part of the slice is resolved), and confirm
-//! `cargo test --test hypertable_harness` passes without `--ignored`.
+//! if only part of the slice is resolved), confirm
+//! `cargo test --test hypertable_harness` passes without `--ignored`, update
+//! the `#[ignore]?` column above, and check whether any workflow still opts
+//! that test in with `-- --ignored` — if it does, that step now runs nothing.
 
 #![allow(clippy::print_stdout)]
 
