@@ -75,7 +75,12 @@ verifying.
   silently produced nothing usable is now red rather than green. Its own verdict
   logic has a 10-case `--selftest` that CI runs on every push, alongside
   `verify.sh --selftest`; the `verify-script` job now also syntax-checks and
-  ShellChecks every gate script rather than only `verify.sh`.
+  ShellChecks every gate script rather than only `verify.sh` — all six under
+  `scripts/`, plus the four fail-closed harnesses under
+  `tests/integration/scripts/` that `docker-smoke.yml` and
+  `tutorial-and-samples.yml` invoke, which had never been linted by anything.
+  All ten are currently clean; the point is that they cannot stop being clean
+  unnoticed.
 
 - **`sdk-dart` → test step.** `dart test` collected **zero of the Dart SDK's 96
   tests**, on every run since the SDK was imported. `package:test` only loads
@@ -91,6 +96,97 @@ verifying.
   closed on "No tests ran.", on an unreadable count, and on zero. **The 96
   assertions are executing for the first time — if any of them is wrong, this
   job is expected to go red, and that red is the finding, not a regression.**
+
+### Found, not fixed — `ci.yml`'s `test` job is RED on `main`: 12 deterministic failures
+
+`cargo test --workspace --exclude basin-integration-tests --no-fail-fast --locked`
+— the exact command `ci.yml` runs — reported **3,090 passed / 11 failed / 16
+ignored across 95 test binaries** before the run was cut short on a long-running
+`vortex_vs_parquet_size_matrix` shape. Every failure was then **reproduced by
+running the prebuilt test binary directly, single-threaded, with no other load**,
+so none of these is a contention flake (the box was busy during the full run, and
+that was ruled out deliberately). Re-running in isolation surfaced a 12th
+(`tablesample::system_repeatable_…`) that the threaded run did not report.
+
+None of the affected files is new — `enum_ordinal_sort.rs` dates to the Phase 2
+`tenant → project` rename — so these are long-standing, not a regression from
+this audit's commits.
+
+**The one that is a live correctness bug, not a harness gap** —
+`crates/basin-engine/tests/enum_ordinal_sort.rs`, 3 of 4 failing: **ENUM columns
+sort and compare alphabetically instead of by declaration order.**
+
+```
+ORDER BY status  →  got [cancelled, paid, pending, shipped]
+                    want [pending, paid, shipped, cancelled]
+WHERE status > 'pending'
+                 →  got [shipped]
+                    want [paid, shipped, cancelled]
+```
+
+In PostgreSQL an enum's order is its declaration order; Basin is using the label
+text. This returns *silently wrong rows and wrong row order* to a query that
+raises no error, which is the worst shape a compatibility gap can have. It is
+not reflected in the ~88.5% SQL-compatibility figure in the README's Status
+table, and `docs/sql-support.md` is generated from `sql_support_matrix.rs`, which
+does not cover it.
+
+The rest, for triage:
+
+| Test | File | Direction |
+|---|---|---|
+| `keyset_*` ×4 | `basin-engine/tests/keyset_pagination_probe.rs` | wrong results |
+| `bernoulli_repeatable_…`, `system_repeatable_…` | `basin-engine/tests/tablesample.rs` | `REPEATABLE` not deterministic across fresh sessions |
+| `update_out_of_with_check_rejected_valid_ok` | `basin-engine/tests/rls_with_check.rs` | **fails safe** — the valid UPDATE is *rejected*, `InvalidSchema("WHERE clause not representable in v0.1: true")`; the out-of-policy rejection half works |
+| `resume_after_restart_from_cursor` | `basin-cdc/tests/kafka_sink.rs:275` | resume delivered `[]`, expected `[3, 4]` |
+| `resume_from_cursor_after_worker_restart` | `basin-cdc/tests/phase2_webhooks.rs:344` | resume delivered `[3, 4, 3, 4]` — duplicates, expected `[3, 4]` |
+
+The two CDC ones are delivery-semantics failures on the resume path (one loses
+events, one double-delivers); they reproduce in isolation too.
+
+### Found, not fixed — two more CI gates are RED on `main`, and have been long enough to read as noise
+
+The audit above was about gates that passed while checking nothing. These are the
+mirror image: gates that check the right thing and have simply been failing.
+Both are the same mechanism the `docker-smoke` `FROM rust:1.85` breakage already
+demonstrated in this repo — a job pinned to `@stable`, where `stable` moved and
+the job went red and stayed there. Neither is fixed here, because both fixes are
+mass edits that would bury the rest of this audit in diff; both are measured
+exactly so the next session can act rather than re-derive.
+
+- **`ci.yml` → `fmt`.** `cargo fmt --all -- --check` fails on **539 files**.
+  Confirmed pre-existing and not an artifact of any in-flight work: **zero** of
+  the 539 appear in `git status`, and `rustfmt --check` on a pristine
+  `git archive HEAD` copy of `crates/basin-auth/src/jwt.rs` reproduces it. There
+  is no `rustfmt.toml`, and it is not a style-edition question — `--style-edition`
+  2015/2018/2021 all report the same 4 hunks in that file (2024 reports 5). So
+  the committed tree was formatted by an older rustfmt and never re-normalised:
+  under `rustfmt 1.8.0-stable (rustc 1.94.0)`, which is what
+  `dtolnay/rust-toolchain@stable` installs today, the check cannot pass.
+  Fix is `cargo fmt --all` and a review of the resulting whole-tree diff.
+
+- **`cli.yml` → `clippy`, and its missing `--all-targets`.** Two separate
+  problems:
+
+  `cargo clippy --locked -- -D warnings` — the exact command in the workflow —
+  exits 101 with **6 errors** in `basin-cli` (lib): `if_same_then_else`
+  ×2 (`commands/gen.rs:1078`, `:1125`), `double_ended_iterator_last` ×2
+  (`commands/migrate_from_pg.rs:337`, `:411`), `manual_pattern_char_comparison`
+  (`:388`), `manual_strip` (`commands/storage.rs:735`). All six are mechanical;
+  none is a correctness defect. The two `if_same_then_else` sites are
+  `if nullable { "mixed" } else { "mixed" }` and the Dart `"dynamic"` equivalent
+  — redundant rather than wrong, since both languages' types already admit null.
+
+  Separately, that command omits `--all-targets`, so **test code in the CLI is
+  not linted at all** — `--all-targets` surfaces 16 errors rather than 6. The
+  extra ten are in `#[cfg(test)]` blocks, and one of them,
+  `clippy::approx_constant` at `commands/dump.rs:421`, is **deny-by-default**:
+  it would fail even without `-D warnings`, if anything ever linted that target.
+  (It is a false alarm on the merits — the `3.14` is a JSON float fixture for
+  `sql_literal`, not an attempt at π — but a deny-by-default lint going
+  permanently unevaluated is the point.) The engine's own clippy job does pass
+  `--all-targets`, and `ci.yml` documents that choice explicitly; `cli.yml` just
+  never got it.
 
 ### Found, not fixed — ~470 lines of orphaned cold-path tombstone code in basin-engine
 

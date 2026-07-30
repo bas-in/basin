@@ -83,21 +83,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The set below is every shell script a CI job invokes: the scripts/
+      # gates, plus the harnesses docker-smoke.yml and tutorial-and-samples.yml
+      # run. Kept as an explicit glob list rather than "find every .sh" so a new
+      # script is a deliberate addition — but if you add one a workflow calls,
+      # add it here.
       - name: Syntax check
         run: |
           set -euo pipefail
-          for f in scripts/verify.sh scripts/check-*.sh scripts/build-docs-index.sh; do
+          for f in scripts/verify.sh scripts/check-*.sh scripts/build-docs-index.sh \
+                   tests/integration/scripts/*.sh; do
             bash -n "$f"
           done
       # Lints every script a CI job depends on, not just verify.sh. A gate whose
       # own wrapper has an unquoted expansion or a silently-swallowed pipeline
-      # is a gate that can stop gating without anything going red.
+      # is a gate that can stop gating without anything going red — and four of
+      # this repo's fail-closed harnesses live under tests/integration/scripts/,
+      # outside what this job used to look at.
       - name: ShellCheck
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck scripts/verify.sh scripts/check-*.sh scripts/build-docs-index.sh
+          shellcheck scripts/verify.sh scripts/check-*.sh scripts/build-docs-index.sh \
+                     tests/integration/scripts/*.sh
       # Each case is a synthetic origin broken in exactly one way; the matrix
       # asserts the exit code AND that a diagnostic was printed, because
       # "aborted with no message" was the real-world bug being guarded against.
