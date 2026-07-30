@@ -55,6 +55,7 @@ const FAST_DEFAULT_ROW_BLOCK_SIZE: usize = 32_768;
 /// Encode with the legacy aggressive cascade ([`EncodingMode::Best`]). Kept as
 /// a thin wrapper so existing call sites and tests that don't care about the
 /// 2-pass selector stay byte-identical to the pre-#92 path.
+#[cfg(test)]
 pub(crate) async fn encode(batch: &RecordBatch, row_block_size: Option<u32>) -> Result<Vec<u8>> {
     encode_with_mode(batch, row_block_size, EncodingMode::Best).await
 }
@@ -273,18 +274,6 @@ pub(crate) fn column_stats_from_batch(
 /// any other type leaves min/max `None` (no prune participation) rather
 /// than risk an encoding mismatch that could wrongly prune a matching
 /// file. The Vortex⇆Parquet differential harness is the correctness gate.
-pub(crate) async fn footer_meta(
-    bytes: bytes::Bytes,
-) -> Result<(
-    u64,
-    std::collections::BTreeMap<String, crate::data_file::ColumnStats>,
-)> {
-    let vf = session()
-        .open_options()
-        .open_buffer(bytes)
-        .map_err(|e| BasinError::storage(format!("vortex: open_buffer (footer): {e}")))?;
-    Ok(stats_from_vortex_file(&vf))
-}
 
 /// LEVER 2: footer/stats read that issues only **tail range GETs** against the
 /// object store instead of fetching the whole file. Vortex footers live at the
@@ -298,7 +287,7 @@ pub(crate) async fn footer_meta(
 /// the LIST result, so no HEAD round-trip is needed either.
 ///
 /// Returns the same `(row_count, column_stats)` shape (and the identical
-/// type-gated `ColumnStats` byte contract) as [`footer_meta`]; the
+/// type-gated `ColumnStats` byte contract) as the in-memory path used to; the
 /// Vortex⇆Parquet differential harness is the correctness gate for both.
 pub(crate) async fn footer_meta_from_store(
     store: Arc<dyn object_store::ObjectStore>,
@@ -326,7 +315,7 @@ pub(crate) async fn footer_meta_from_store(
 }
 
 /// Extract `(row_count, column_stats)` from an already-opened [`VortexFile`].
-/// Shared by the in-memory ([`footer_meta`]) and tail-range
+/// Shared by the tail-range
 /// ([`footer_meta_from_store`]) footer paths so both emit byte-identical
 /// `ColumnStats`.
 fn stats_from_vortex_file(
@@ -443,6 +432,7 @@ fn stats_from_vortex_file(
 /// iff a filter was supplied AND `decode_inner` succeeded with pushdown active
 /// (i.e. did not fall back to a full decode). Callers use this to decide
 /// whether the Arrow post-filter pass can be skipped.
+#[cfg(test)]
 pub(crate) async fn decode(
     bytes: bytes::Bytes,
     schema: Option<Arc<Schema>>,

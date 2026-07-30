@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tracing::info;
 
-use crate::{connect, time_exec, Args, ConnConfig, Metric, WorkloadReport};
+use crate::{connect, Args, ConnConfig, Metric, WorkloadReport};
 
 const TABLE: &str = "e2e_handoff_marker";
 

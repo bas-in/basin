@@ -75,7 +75,7 @@ use crate::{
     mime,
     model::{Bucket, BucketId, Object},
     paths,
-    rls::{CallerCtx, ObjectPolicy, ObjectPolicyCommand, ObjectRlsStore},
+    rls::{ObjectPolicy, ObjectPolicyCommand, ObjectRlsStore},
 };
 
 // ---------------------------------------------------------------------------

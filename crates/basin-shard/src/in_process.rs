@@ -10170,7 +10170,6 @@ mod tests {
     /// failure pinpoints which read path breaks under compaction.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_file_merge_read_stays_consistent() {
-        use basin_catalog::Catalog as _;
         let _env_lock = FILE_MERGE_ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::set(&[
             ("BASIN_COMPACT_MAX_FILES_PER_PARTITION", "2"),

@@ -17,12 +17,21 @@
 //! }
 //! ```
 //!
-//! Priority is derived at the `ProjectScopedStore` boundary:
+//! Priority is derived at the `ProjectScopedStore` boundary (see
+//! `concurrency.rs`). It is derived from operation *class* and from whether the
+//! caller is background work — NOT from range size:
 //!
-//! - `head` / small `get_range` (< [`PRIORITY_RANGE_BYTES_THRESHOLD`])
-//!   / `list` / `delete` / `copy` / full `get_opts` → **High** (point-shaped).
-//! - `put` / `put_multipart` / large `get_range` (≥ threshold) → **Low**
-//!   (bulk-shaped).
+//! - `head` / `list` / `delete` / `copy` / foreground `get_opts` / `get_range`
+//!   → **High** (point-shaped; query footers stay snappy).
+//! - `put` / `put_multipart`, and any read issued under `is_background_io()`
+//!   (compaction / merge) → **Low** (bulk-shaped). Demoting background reads is
+//!   what removes the #78 priority inversion where compaction I/O out-ranked
+//!   live ingest writes.
+//!
+//! An earlier design flipped High→Low on a range-size threshold
+//! (`PRIORITY_RANGE_BYTES_THRESHOLD`, 256 KiB). That constant is gone: nothing
+//! read it, and describing a rule the code does not implement is worse than
+//! describing nothing.
 //!
 //! ADR 0008 doesn't fully specify the deadline-budget formula. We use a
 //! priority-class formula (rather than a recent-throughput one) because
@@ -111,9 +120,6 @@ impl Priority {
         }
     }
 }
-
-/// Range size at which `concurrency.rs` heuristics flip High→Low.
-pub(crate) const PRIORITY_RANGE_BYTES_THRESHOLD: usize = 256 * 1024;
 
 /// Public lock-free view of one project's live I/O accounting. Used by
 /// the engine layer for noisy-project detection.

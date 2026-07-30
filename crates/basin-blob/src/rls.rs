@@ -329,7 +329,7 @@ pub fn filter_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Bucket, BucketId, Object};
+    use crate::model::{BucketId, Object};
     use basin_common::ProjectId;
     use uuid::Uuid;
 

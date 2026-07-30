@@ -2784,7 +2784,7 @@ mod tests {
     use object_store::local::LocalFileSystem;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-        ObjectStoreExt, PutMultipartOpts, PutOptions, PutPayload, PutResult,
+        PutMultipartOpts, PutOptions, PutPayload, PutResult,
     };
     use tempfile::TempDir;
 
