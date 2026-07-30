@@ -68,7 +68,8 @@ columns, backed by `parking_lot::RwLock<BTreeMap<RowKey, MemRowValue>>`.
 ### Multi-project isolation
 
 Follows the same pattern as `ProjectCounterRegistry`
-(see [the multi-project isolation feedback note](../../memory/feedback_multitenant_isolation.md)):
+(from the multi-project isolation feedback review; the note itself was a
+working file outside this repository and is not tracked here):
 **shared heavy resource + cheap per-project primitive.**
 
 - **Shared heavy resource:** one `MemTableRegistry` per process. Lazy

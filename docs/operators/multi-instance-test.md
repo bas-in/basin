@@ -1,3 +1,10 @@
+---
+title: "Multi-instance lease, handoff and budget smoke harness"
+nav_section: operations
+sidebar_position: 21
+summary: "What the multi_instance_smoke harness proves about lease-based ownership, partition routing and heartbeat budgets (ADR 0023), and how to run it."
+---
+
 # Multi-Instance Lease / Handoff / Budget Smoke Harness
 
 **Task:** #51  

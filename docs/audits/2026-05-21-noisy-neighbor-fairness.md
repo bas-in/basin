@@ -1,5 +1,8 @@
 ---
-title: "Noisy-neighbor / fairness audit — single-instance + load-balanced"
+title: "Noisy-neighbor / fairness audit — single-instance and load-balanced"
+nav_section: meta
+sidebar_position: 62
+summary: "Read-only fairness audit: how one hot project degrades its neighbours on a single instance and behind a load balancer, and where the accounting gaps are."
 date: 2026-05-21
 scope: read-only
 related:

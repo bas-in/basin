@@ -2325,7 +2325,7 @@ We need our own, with two properties Postgres doesn't have:
    specific customer's data.  Drives roadmap evidence, not guesswork.
 
 OSS side ships the data-collection layer.  Cloud side
-([basin-cloud-roadmap.md](./docs/basin-cloud-roadmap.md)) ships the ingest
+(tracked in the cloud repo's own roadmap) ships the ingest
 pipeline + UI + cross-customer roll-ups.
 
 Privacy invariant: literals are stripped at the LogicalPlan layer before
@@ -2385,7 +2385,7 @@ Privacy and anonymisation model: [ADR 0017](./docs/decisions/0017-query-shape-pr
       Estimate: ~1 week. Depends on 5.16.B + 5.16.C.
 
 Sub-items 5.16.E – 5.16.H live in the basin-cloud repo
-(see [`docs/basin-cloud-roadmap.md`](./docs/basin-cloud-roadmap.md)
+(tracked in the cloud repo's own roadmap
 Phase 5.16-cloud):
 
 - 5.16.E — Cloud ingest pipeline (OTLP receiver → ClickHouse / VictoriaMetrics)

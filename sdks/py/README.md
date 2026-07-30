@@ -1,7 +1,7 @@
 # basin-py
 
-The Python SDK for [basin](../basin) — a basin-native, async-first client on
-`httpx` that mirrors [`basin-js`](../basin-js) method-for-method while
+The Python SDK for [basin](../..) — a basin-native, async-first client on
+`httpx` that mirrors [`basin-js`](../js) method-for-method while
 following Python idiom (an optional sync facade, `async for` iterators,
 `pyiceberg` interop).
 

@@ -1,3 +1,10 @@
+---
+title: "SDK toolchain coverage and local validation status"
+nav_section: meta
+sidebar_position: 40
+summary: "Which SDK toolchains are installed locally versus validated only in CI, and what that means for how each SDK change is reviewed."
+---
+
 # SDK toolchain coverage & local validation status
 
 Basin ships ten client SDKs (`sdk/`). They are validated in two places: a

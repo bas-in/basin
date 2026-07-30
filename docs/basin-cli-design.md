@@ -2,16 +2,27 @@
 title: "basin-cli v0.1 design spec"
 nav_section: meta
 sidebar_position: 30
-summary: "Forward-spec for basin-cli — operator daily-driver Go CLI. Lives in bas-in/basin-cli when that repo is bootstrapped. This is the design contract."
+summary: "Historical design spec for the basin CLI. Superseded by the shipped implementation in cli/ — kept for the rationale, not as a description of the code."
 ---
 
 # basin-cli v0.1 design spec
 
-**Status:** Forward-spec. The `bas-in/basin-cli` repository does not yet exist.
-This document is the design contract it will be bootstrapped from, per Phase
-5.15.D of the [WEDGE roadmap](../WEDGE.md). It lives here so that the OSS
-engine repo is the single source of truth for cross-repo design decisions until
-the target repo exists.
+> **Status: HISTORICAL — superseded by the shipped CLI in [`cli/`](../cli/).**
+>
+> This document was written as a forward-spec for a CLI that would live in a
+> separate `bas-in/basin-cli` repository. That never happened, and the parts of
+> this document that describe *how* the CLI is built are now wrong. Read it for
+> the command-surface rationale; read the code for what exists.
+>
+> | This document says | What actually shipped |
+> |---|---|
+> | Repository `bas-in/basin-cli` "does not yet exist" | Lives in this repo at [`cli/`](../cli/) — a standalone crate, detached from the engine workspace. `bas-in/basin-cli` was never created and the org 404s. |
+> | Written in **Go**, stdlib-only, no Cobra/Viper | Written in **Rust**, using `clap`, `reqwest`, `tokio-postgres`, `rustyline`. See [`cli/Cargo.toml`](../cli/Cargo.toml). |
+> | Release artefacts signed via **GoReleaser** | Released by [`.github/workflows/cli-release.yml`](../.github/workflows/cli-release.yml): `cargo build --release` per target, uploaded by `taiki-e/upload-rust-binary-action`, signed keyless with **cosign** (Sigstore OIDC — no long-lived key). |
+> | Binary name `basin-cli` | Binary is `basin`; the engine admin tool is `basinctl`. |
+>
+> Live docs for the shipped CLI: [`cli/README.md`](../cli/README.md),
+> [`cli/PARITY.md`](../cli/PARITY.md), [`cli/decisions.md`](../cli/decisions.md).
 
 ---
 
@@ -270,7 +281,8 @@ basin-auth's role hierarchy being fleshed out beyond the flat `roles[]` claim.
 **Audit log access.** `basin audit tail <project>` and `basin audit export
 <project> --since <timestamp>`. Depends on the basin-cloud audit pipeline
 (Phase 5.16 cloud-side companion items in
-[`docs/basin-cloud-roadmap.md`](./basin-cloud-roadmap.md)).
+the cloud repo's own roadmap — `docs/basin-cloud-roadmap.md` was removed from
+this repo in `39fb9f64`, since a cloud roadmap does not belong in the OSS tree).
 
 **IDE plugins.** VSCode extension and JetBrains plugin that wrap basin-cli
 commands behind a GUI. These are separate projects; basin-cli's `--json` output

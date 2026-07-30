@@ -2,7 +2,7 @@
 title: "ADR 0022 — System-schema namespacing (reserved schemas first-class; user schemas stay flat)"
 nav_section: decisions
 sidebar_position: 22
-summary: "Make the system namespaces (auth, storage, cron, net, realtime, public, pg_catalog, information_schema) real reserved schemas with honest (schema, table) keying + introspection + search_path. User-defined schemas stay flat-aliased to public — projects already own the project-membership/isolation axis, so arbitrary user schemas are a redundant second isolation boundary with ~zero wedge benefit."
+summary: "Makes the system namespaces real reserved schemas with honest (schema, table) keying, introspection and search_path. User-defined schemas stay flat-aliased to public — projects already own isolation."
 tags: [catalog, schema, baas, oss, pg-compat]
 ---
 

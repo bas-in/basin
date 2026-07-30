@@ -2,14 +2,14 @@
 title: "Frontmatter spec for Basin OSS docs"
 nav_section: meta
 sidebar_position: 0
-summary: "YAML frontmatter contract every markdown file under docs/ obeys, so basin-cloud can fetch + render the whole OSS doc set."
+summary: "YAML frontmatter contract every markdown file under docs/ obeys, so the docs site can fetch and render the whole OSS doc set."
 ---
 
 # Frontmatter spec for Basin OSS docs
 
 Every markdown file under `docs/` in this repo (and in future OSS sibling
 repos `basin-js`, `basin-cli`) MUST begin with a YAML frontmatter block.
-The block lets `basin-cloud` build-time-fetch every product's docs and
+The block lets the docs site build-time-fetch every product's docs and
 render them in a unified nav tree without per-file overrides.
 
 This spec is Phase 5.15.A — see [`../TASK.md`](../TASK.md) Phase 5.15.
@@ -33,7 +33,7 @@ tags: [storage, performance]             # optional, free-form
 | Field | Required | Type | Notes |
 |---|---|---|---|
 | `title` | yes | string | Shown in the rendered site's H1 + browser tab. Should be the same string as the `# Heading` in the body so GitHub direct rendering still looks right. |
-| `nav_section` | yes | enum | One of: `overview`, `architecture`, `storage`, `sql`, `deployment`, `operations`, `decisions`, `meta`, `reference`. Drives the top-level nav grouping in basin-cloud. |
+| `nav_section` | yes | enum | One of: `overview`, `architecture`, `storage`, `sql`, `deployment`, `operations`, `decisions`, `meta`, `reference`. Drives the top-level nav grouping on the docs site. |
 | `sidebar_position` | yes | int ≥ 0 | Order within `nav_section`. Lower = earlier. Gaps allowed (use multiples of 10 so insertions are cheap). |
 | `summary` | yes | string ≤ 200 chars | Shown in nav previews + search results. Should make sense out of context. |
 | `version_since` | no | semver | If present, doc applies only from this OSS version onward. Rendered site hides on older version views. |
@@ -59,7 +59,7 @@ tags: [storage, performance]             # optional, free-form
 Inside a single repo, use relative paths: `[architecture](./architecture.md)`.
 
 For cross-product links (one OSS repo to another), use the `[[product:path]]`
-syntax which basin-cloud resolves at render time:
+syntax which the docs site resolves at render time:
 
 ```markdown
 See [[basin-js:auth/login]] for the JS client equivalent.
@@ -117,10 +117,10 @@ this spec, and fails the PR if any file:
 ## Out of scope
 
 - **Translation / localisation** — frontmatter doesn't carry locale; a
-  future locale-routing layer in basin-cloud handles it.
+  future locale-routing layer on the docs site handles it.
 - **Author attribution** — git history is the source of truth.
 - **Last-updated timestamps** — git history is the source of truth;
-  basin-cloud's renderer can fetch and display the most recent commit
+  the docs site's renderer can fetch and display the most recent commit
   date if it wants to.
 - **Custom routing** — the rendered URL is derived from
   `nav_section` + file path. Files can't override their own URL slug

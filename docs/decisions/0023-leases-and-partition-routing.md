@@ -2,7 +2,7 @@
 title: "ADR 0023 — Lease-based ownership + partition-level routing + heartbeat budgets"
 nav_section: decisions
 sidebar_position: 23
-summary: "Convert per-(project,partition) ownership from a hash on ProjectId into a lease in the catalog Postgres. Stateless replicas + partition-level routing + heartbeat-reconciled budgets fix hot-project pinning and multi-instance cap-bypass in one architecture, without a central coordinator service or distributed counters on the hot path. The architectural commitment for Basin's multi-replica scale-out."
+summary: "Converts per-(project,partition) ownership from a hash on ProjectId into a catalog lease. Stateless replicas, partition-level routing and heartbeat-reconciled budgets, with no central coordinator."
 tags: [architecture, scaling, multi-project, hot-tier]
 ---
 

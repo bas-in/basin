@@ -1,3 +1,10 @@
+---
+title: "PostGIS R-tree spatial index — design"
+nav_section: architecture
+sidebar_position: 45
+summary: "How a GIST-equivalent R-tree spatial index ships in basin-geo, for PostGIS-shape workloads at 1M+ geometries. Design only; pending review."
+---
+
 # PostGIS R-tree Spatial Index — Design Doc
 
 **Status:** Pending user review. Gate for task #139 (PG-Wave 4 IMPL).

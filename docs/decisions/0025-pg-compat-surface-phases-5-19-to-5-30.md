@@ -2,7 +2,7 @@
 title: "ADR 0025 — Postgres-compatibility surface decisions: JSONB GIN indexing, full-text search, citext, and session timeouts (Phases 5.19–5.30)"
 nav_section: decisions
 sidebar_position: 25
-summary: "Documents the shared architectural patterns behind four Postgres-compatibility features that landed together in Phases 5.19–5.30: JSONB GIN indexing, full-text search (tsvector/tsquery), citext, and the session-timeout trio (statement_timeout, lock_timeout, idle_in_transaction_session_timeout). The unifying mechanisms are the BASIN_TYPE Arrow-metadata sidecar for logical-type-on-physical-storage, shared GIN posting-list infrastructure across JSONB and FTS, PG-accurate SQLSTATE mapping, and the test-first harness convention of landing red tests that are un-ignored slice-by-slice."
+summary: "Shared patterns behind four Postgres-compat features that landed together: the BASIN_TYPE metadata sidecar, GIN posting lists shared by JSONB and FTS, PG-accurate SQLSTATEs, test-first harnesses."
 tags: [pg-compat, gin, fts, citext, timeouts, types, engine]
 ---
 

@@ -1,3 +1,10 @@
+---
+title: "Migration-tool compatibility"
+nav_section: reference
+sidebar_position: 32
+summary: "Using standard Postgres migration tools (Flyway, golang-migrate, Alembic, others) against Basin, with the integration test that covers each."
+---
+
 # Basin — migration-tool compatibility
 
 Consolidated reference for using standard Postgres migration tools against Basin.

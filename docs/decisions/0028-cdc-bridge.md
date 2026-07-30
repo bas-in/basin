@@ -2,7 +2,7 @@
 title: "ADR 0028 — CDC bridge: commit-path capture, WAL-resumable streams, phased sinks"
 nav_section: decisions
 sidebar_position: 28
-summary: "Basin's CDC gap: customers need change streams out to Kafka, webhooks, and Postgres logical-replication consumers. This ADR picks the capture seam (post-commit ChangeEventSink, not WAL tail), solves tx-visibility and the unlogged fast-path gap, locks the LSN-cursor resumability model, defines retention interaction with WAL truncation, and sequences five independently shippable phases from webhook-stream to pgoutput wire compat."
+summary: "Picks the CDC capture seam (post-commit ChangeEventSink, not WAL tail), locks the LSN-cursor resumability model, and sequences five shippable phases from webhook-stream to pgoutput wire compat."
 tags: [cdc, replication, streaming, wal, realtime, kafka]
 ---
 

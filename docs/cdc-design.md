@@ -1,8 +1,8 @@
 ---
 title: "CDC bridge — design specification"
-nav_section: design
+nav_section: architecture
 sidebar_position: 99
-summary: "Detailed design for Basin's change-data-capture bridge: capture seam analysis, WAL fast-path gap documentation, durable ring wire format, cursor/retention model, and per-phase implementation details."
+summary: "Design for Basin's CDC bridge: capture seam, the WAL fast-path gap, durable ring wire format, cursor and retention model, and per-phase implementation detail."
 tags: [cdc, design, streaming, wal]
 ---
 

@@ -1,3 +1,10 @@
+---
+title: "Basin SDK feature-parity matrix"
+nav_section: reference
+sidebar_position: 31
+summary: "Side-by-side public surface of the ten Basin client SDKs, with the source path backing each cell."
+---
+
 # Basin SDK Feature-Parity Matrix
 
 This matrix compares the public surface of all ten Basin client SDKs, each now

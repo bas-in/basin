@@ -1,3 +1,10 @@
+---
+title: "Wasm functions — performance, governance and adversarial audit (2026-05-21)"
+nav_section: meta
+sidebar_position: 61
+summary: "Read-only audit of crates/basin-fn: sandbox escape surface, resource governance, scheduling fairness and performance findings."
+---
+
 # Wasm-functions performance + governance + adversarial audit
 
 **Date:** 2026-05-21

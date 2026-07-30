@@ -2,7 +2,7 @@
 title: "ADR 0026 — lock_timeout / 55P03 under Basin's optimistic concurrency (no row-lock manager)"
 nav_section: decisions
 sidebar_position: 26
-summary: "Basin uses optimistic, copy-on-write concurrency for row writes — conflicts surface at commit as SQLSTATE 40001 (serialization_failure), never by blocking on a row lock. We will NOT build a PostgreSQL-style pessimistic row-lock manager. Therefore `lock_timeout` (SQLSTATE 55P03, lock_not_available) governs only the locks that actually block in Basin: advisory locks (`pg_advisory_lock`) and table/DDL locks. Phase 5.28.B is rescoped accordingly: make advisory-lock acquisition genuinely block + honor `lock_timeout`, and document the optimistic-concurrency contract for row writes."
+summary: "Row writes stay optimistic and copy-on-write: conflicts surface at commit as SQLSTATE 40001, never as a row-lock block. lock_timeout governs only advisory and table/DDL locks, which do block."
 tags: [concurrency, locking, pgwire-compat, timeouts]
 ---
 

@@ -2,7 +2,7 @@
 title: "ADR 0020 — Auth v2: OAuth providers + MFA"
 nav_section: decisions
 sidebar_position: 20
-summary: "Lifts ADR 0005's OAuth + MFA deferral. OSS basin-auth ships OAuth2/OIDC (provider presets + generic OIDC config) and MFA (TOTP + WebAuthn/passkeys together), with an AAL claim in the JWT. Cloud builds provider-registration UI only — no new primitives."
+summary: "Lifts ADR 0005's deferral: OSS basin-auth ships OAuth2/OIDC (provider presets plus generic config) and MFA (TOTP and WebAuthn/passkeys) with an AAL claim in the JWT. No new cloud-only primitives."
 tags: [auth, security, oauth, mfa, oss]
 ---
 

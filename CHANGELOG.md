@@ -8,6 +8,190 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
+## Unreleased — CI integrity: five green gates that verified nothing now fail closed
+
+Five CI checks were passing while executing zero assertions. All five are
+fixed, and each one is now guarded by something that fails when it stops
+verifying.
+
+- **`Tutorial & Sample Apps Smoke` → tutorial job.**
+  `tests/integration/scripts/tutorial-smoke.sh` was written to skip until
+  `docs/tutorial.md` existed. The tutorial landed; the script then fell straight
+  through a commented-out TODO block to `log "All tutorial assertions passed."`
+  and exited 0, having asserted nothing, on every push. It now replays the
+  tutorial's psql steps — the round-trip, the schema, the four RLS owner
+  policies, and that RLS is actually enforced against an unauthenticated
+  session — against a live Basin,
+  and refuses to print success unless at least 9 assertions ran. An
+  unreachable server, a missing tutorial, or tutorial text drifting away from
+  the harness are all failures, not skips. The job moved to `docker-smoke.yml`,
+  where a Basin container is already running, so it costs no extra build. What
+  it does NOT cover — reading as a specific user, which needs a running
+  basin-auth — is named in the script rather than skipped silently.
+
+- **`Tutorial & Sample Apps Smoke` → SaaS Starter job.**
+  `examples/saas-starter/tests/rls-isolation.test.ts` reported
+  `Tests: 4 passed, 4 total` — including "Org-A JWT cannot read Org-B todos" —
+  while every test early-returned on `[skip] Basin not reachable`, because
+  nothing in CI started Basin. A green cross-tenant-isolation assertion that had
+  never once run is worse than no test. Reachability is now a prerequisite that
+  throws; `BASIN_SKIP_LIVE_TESTS=1` is the single explicit opt-out and makes
+  jest report the suite **skipped** rather than passed (the workflow sets it, so
+  the run now says out loud that isolation is not covered there). Also fixed
+  `expect(todos ?? []).toHaveLength(0)`, which passed whenever the request
+  failed and returned null — the cross-org test now asserts a positive control
+  in the same session first. Both sample smoke scripts additionally fail on a
+  runner reporting zero tests.
+
+- **`External-Tool Compat` → pg_dump job.**
+  The step ran `-- --ignored`, which runs *only* `#[ignore]`d tests. Nothing in
+  `pg_dump_harness.rs` is ignored (its own doc comment claimed otherwise), so
+  the job reported `0 passed; 0 failed; 4 filtered out` — green, zero tests.
+  `scripts/check-pg-dump-harness.sh` now runs it without the flag and fails
+  closed when no test executes, when the summary is unparseable, and when the
+  number of slices declining for want of a database URL drifts from a committed
+  baseline. The job is renamed to what it actually verifies: the four slices
+  still cannot run, because they invoke a `basin-cli dump --url/--table`
+  contract the shipped CLI does not offer.
+
+- **`Hypertable Soak` → 5.29.F ORM-compat step.** The same `--ignored` defect as
+  the pg_dump job, in a second workflow, and it survived the pass that fixed the
+  first. `hypertable_1b_row_write_soak` *is* `#[ignore]`d, so the soak step was
+  fine — but `hypertable_orm_compat` is a plain `#[tokio::test]`
+  (`hypertable_harness.rs:674`), so opting it in with `-- --ignored` filtered it
+  out and the step reported `0 passed; 0 failed; 5 filtered out`, nightly. Two
+  comments asserted the opposite and are why nobody looked: the workflow header
+  said "both `#[ignore]`d by default", and the harness's own module doc said
+  "Every test is `#[ignore]`d until 5.29.B-F close" — written when that was
+  true, left in place after five of the six `#[ignore]`s came off. Both are
+  corrected, and the harness doc now carries a per-slice `#[ignore]?` column
+  plus an instruction to re-check the workflows whenever one is dropped.
+
+  New `scripts/check-test-executes.sh` wraps both steps (and the Flyway and
+  golang-migrate steps, which had no zero-test guard either) and fails closed on
+  a zero-test run, an unparseable or absent `test result:` line, and — for the
+  external-tool harnesses — on the runtime `SKIP` those tests print and pass on
+  when the binary they drive is missing from PATH, so an install step that
+  silently produced nothing usable is now red rather than green. Its own verdict
+  logic has a 10-case `--selftest` that CI runs on every push, alongside
+  `verify.sh --selftest`; the `verify-script` job now also syntax-checks and
+  ShellChecks every gate script rather than only `verify.sh`.
+
+- **`sdk-dart` → test step.** `dart test` collected **zero of the Dart SDK's 96
+  tests**, on every run since the SDK was imported. `package:test` only loads
+  files under `test/` whose names end in `_test.dart`; all seven were named
+  `test_<area>.dart` — Python's convention, not Dart's — so the runner's glob
+  matched nothing, printed "No tests ran." and exited 0. `dart analyze` in the
+  same job kept type-checking them, which is why seven files of genuinely good
+  offline tests (MockClient for HTTP, a hand-written `FakeWebSocketChannel` for
+  realtime — no network, nothing to skip) stayed compiling and plausible while
+  asserting nothing. The files are renamed to the runner's convention
+  (`auth_test.dart`, `query_test.dart`, …; no file imports another, so the
+  rename is mechanical), and the step now reads the reporter's `+N` and fails
+  closed on "No tests ran.", on an unreadable count, and on zero. **The 96
+  assertions are executing for the first time — if any of them is wrong, this
+  job is expected to go red, and that red is the finding, not a regression.**
+
+### Fixed — the getting-started tutorial documented two things that are not true
+
+Rewriting the tutorial harness to actually run the tutorial surfaced two
+user-facing errors in `docs/tutorial.md`, both in the RLS section a new user hits
+in their first fifteen minutes:
+
+- **`SET request.jwt.claims` does not exist in Basin.** The tutorial presented it
+  as "a development introspection tool for testing RLS policies directly in
+  psql" under a heading that said "always works today". `grep -rIn 'jwt.claims'
+  crates/ services/` finds no implementation; it is a PostgREST/Supabase GUC
+  Basin never adopted. The section now documents what does work: the pgwire
+  session's identity comes from the **JWT in the username field**, verified by
+  `auth_context_from_username` in `crates/basin-router/src/protocol.rs`.
+
+- **There is no privileged pgwire bypass of RLS.** The tutorial said "All three
+  rows are visible here because you are connected as the privileged project
+  user". A plain psql session carries no JWT, so `auth.uid()` is NULL, so a
+  `USING (user_id = auth.uid())` policy matches nothing and the session sees
+  **zero** rows — enabling RLS locks the operator out too. That is the correct
+  fail-closed behaviour and is what `rls_with_auth_uid_filters_per_user`
+  (`tests/integration/tests/auth_rls_uid.rs`) has always asserted; only the
+  tutorial disagreed. The seed/inspect steps now come before `ENABLE ROW LEVEL
+  SECURITY`, with the lockout called out.
+
+The harness asserts both halves — rows readable before RLS, nothing readable
+after, and an unpoliced table unaffected — so a regression that made RLS fail
+*open* would now be caught by the tutorial's own CI job.
+
+### Fixed — the MSRV claim, and the one gate that was honestly red
+
+`rust-version` said **1.85** while the lockfile's floor is **1.92**
+(cranelift 0.131 via wasmtime; vortex-error 0.71 needs 1.91). Nothing caught it
+because every CI job installed a pinned toolchain that `rust-toolchain.toml`
+then silently overrode — the runner logs said so outright:
+`the toolchain 'stable-...' is currently in use (overridden by .../rust-toolchain.toml)`.
+So the pin named a toolchain no job ran on. The dead `RUST_TOOLCHAIN: 1.83.0`
+env is gone from all four workflows, `rust-version` is corrected to 1.92, and a
+new `msrv floor` CI job recomputes the graph floor from `cargo metadata` and
+fails on drift.
+
+The one place the stale pin *was* honoured was the Dockerfile's
+`FROM rust:1.85` builder, so `Docker Smoke` had been failing with
+`error: rustc 1.85.1 is not supported by the following packages: vortex-error@0.71.0 requires rustc 1.91.0`
+long enough to read as background noise. The builder now takes a
+`RUST_VERSION` arg (1.92).
+
+### Added — release integrity
+
+Releases published per-asset `.sha256` files and nothing else: no manifest, no
+signature, no attestation, and no script a user could run. A per-asset digest
+served from the same origin as the asset proves only that the origin is
+self-consistent.
+
+Adopting `vul-os/ephor`'s release template: the release job now emits a
+`SHA256SUMS` covering every staged asset (refusing to publish an empty or
+under-covering manifest), verifies it with the same `scripts/verify.sh` users
+run, proves that verifier still refuses 24 kinds of broken release, and attaches
+a sigstore build-provenance attestation minted from the workflow's OIDC identity
+— no long-lived key, no new secret, no new hosted service. Release notes now
+carry the verify snippet, and a `verify-script` CI job runs the refusal matrix
+on every push.
+
+### Fixed — CLI self-update probed a repository that does not exist
+
+`basin`'s self-update check queried
+`api.github.com/repos/bas-in/basin-cli/releases/latest`. That repo 404s (the CLI
+moved into this monorepo under `cli/`), so every probe collapsed to
+"compatibility unknown" and the notice could never fire. It now queries
+`vul-os/basin`'s releases **list** and selects the newest `cli-v*` tag —
+`/releases/latest` would have returned the engine's `v0.1.9` and told a CLI at
+0.1.0 to upgrade to it. Four unit tests pin the endpoint and the tag selection.
+
+### Fixed — docs
+
+`docs/` frontmatter validation and the docs-index check were both red (29
+violations: 14 files with no frontmatter, two `nav_section` values outside the
+spec's enum, ten over-long summaries, and a stale `docs/README.md`). All green.
+`docs/sql-support.md` gets its frontmatter from its generator
+(`sql_support_matrix.rs`) rather than by hand, since the next test run
+overwrites the file.
+
+Sixteen broken relative links fixed, including four pointing at
+`docs/basin-cloud-roadmap.md` (deleted one commit earlier) and three at
+`gen_types_map.go` / `cmd_gen.go` (gone since the CLI's Go→Rust rewrite). New
+`docs links resolve` CI job, which also fails if it finds zero links to check.
+`docs/basin-cli-design.md` is relabelled HISTORICAL with a table of what it says
+versus what shipped — it described a Go, stdlib-only, GoReleaser-signed binary
+in a repo that was never created.
+
+### Removed — dead code
+
+- `vortex_format::footer_meta` — zero call sites; superseded by the tail-range
+  `footer_meta_from_store`. Its stale `[`footer_meta`]` rustdoc links fixed.
+- `vortex_format::encode` / `decode` — production paths use `encode_with_mode`
+  / `decode_with_cache`; these are now `#[cfg(test)]`, which is what they were.
+- `scheduler::PRIORITY_RANGE_BYTES_THRESHOLD` — unread, and the module doc
+  described a range-size priority rule the code replaced with `is_background_io()`.
+- Five unused imports (`basin-blob` ×2, `basin-storage`, `basin-shard`,
+  `basin-e2e-runner`).
+
 ## Unreleased — Perf: file-merge runs on its own faster cadence so it keeps pace with ingest
 
 The file-count-bounding merge sweep was chained to the 60 s stripe-merge tick —

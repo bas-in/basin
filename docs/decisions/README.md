@@ -90,6 +90,7 @@ table.
 | 0017 | Query-shape stats privacy + stability | Accepted 2026-05-19 | xxhash3 64-bit seeded; literal-stripping at LogicalPlan; per-customer template uses real names; cross-project template anonymised (`t1.c0` form); k-anonymity ≥ 5; ADR for Phase 5.16 |
 | 0018 | Subsystem feature flags + minimal-build target | Proposed 2026-05-19 | Gate optional subsystems (auth, rest, webhooks, future realtime/wasm-udf) behind Cargo features; OSS users get a minimal pgwire-only binary; basin-cloud and default OSS build keep the kitchen sink |
 | 0019 | Declarative BaaS surface: inbound webhooks + RPC mount | Accepted 2026-05-19 | Close the BaaS gap with CREATE INBOUND WEBHOOK and POST /rpc/<fn> composing with existing reactors; no V8/Deno edge-function runtime; covers ~95% of edge-function use cases as declarative SQL |
+| 0020 | Auth v2: OAuth providers + MFA | Accepted | Lifts ADR 0005's deferral: OSS basin-auth ships OAuth2/OIDC (provider presets + generic OIDC) and MFA (TOTP + WebAuthn/passkeys) with an AAL claim in the JWT; cloud adds provider-registration UI only. (NOTE: number collides with the WAL-markers ADR below — second pre-existing dup from parallel authoring. See the numbering note under this table.) |
 | 0020 | WAL transaction markers + replay suppression | Accepted 2026-05-19 | WAL adopts explicit Begin/Commit/Rollback markers for HTAP memtable integration; replay discards entries inside rolled-back or crash-interrupted transactions; pre-marker WAL files replay identically |
 | 0021 | YAML frontmatter as the docs metadata contract | Accepted 2026-05-20 | All `docs/**/*.md` files carry YAML frontmatter (title, nav_section, sidebar_position, summary, optional version bounds); MDX and sidecar TOML rejected; enables basin-cloud fetch pipeline and CI lint |
 | 0021 | Object storage (catalog-backed blobs) | Accepted 2026-05-20 | Supabase-style blobs as `storage.objects` rows; RLS-gated; bytes in object_store; HMAC signed URLs; new basin-blob crate. (NOTE: number collides with the frontmatter ADR above — pre-existing dup from parallel authoring; renumber one in a cleanup pass.) |
@@ -100,3 +101,15 @@ table.
 | 0026 | lock_timeout / 55P03 under optimistic concurrency | Accepted | Advisory locks block + honor lock_timeout; row writes use optimistic CAS with 40001; no row-lock manager |
 | 0027 | Binary/columnar JSONB representation | Accepted | Per-batch top-level key index; phased path to full binary JSONB |
 | 0028 | CDC bridge: commit-path capture, WAL-resumable streams, phased sinks | Accepted 2026-06-12 | Post-commit ChangeEventSink is the capture seam; durable CDC ring in Tigris; 5-phase plan: SSE stream → webhook → Kafka → wal2json → pgoutput; WAL fast-path UPDATE/DELETE gap documented and gated with regression test |
+| 0029 | Substrate + suite convergence: what Basin shares and what it does not | Accepted 2026-07-30 | Adopts the suite's release-verification pattern (SHA256SUMS manifest + `scripts/verify.sh` + sigstore provenance, copied from `vul-os/ephor`). Records, with grep evidence, that Basin has no HLC, no CRDT (reaffirming 0010), no cryptographic node identity (openraft NodeId + operator TLS) and no capability tokens (JWT + RLS is the authorization primitive) — each a design consequence, with the trigger that would change it |
+
+### A note on the duplicate numbers
+
+**0020** and **0021** are each used twice (`0020-auth-v2-oauth-mfa` /
+`0020-wal-transaction-markers`, and `0021-docs-frontmatter-yaml` /
+`0021-object-storage`), from parallel authoring. They are recorded here rather
+than renumbered: an ADR number appears in inbound links, commit messages and
+other ADRs' cross-reference lists, so renumbering trades a cosmetic
+inconsistency for a set of broken references — the same trade as renaming an
+applied migration. **New ADRs must continue from the highest number in use
+(next: 0030)**, and this table is the place to check what that is.

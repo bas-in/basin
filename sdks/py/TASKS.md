@@ -12,7 +12,7 @@ Conventions:
 - **Status:** `[ ]` pending, `[~]` in-progress (agent claimed), `[x]` done
 - **Files:** paths relative to repo root (`src/basin/…`)
 - **Mirror basin-js.** Method names + route shapes must match
-  [`../basin-js`](../basin-js) exactly. When unsure, read the equivalent
+  [`../basin-js`](../js) exactly. When unsure, read the equivalent
   `basin-js/src/**` file — port behaviour, not just signatures.
 - **Async-first.** Implement the coroutine in the async client; the sync
   facade delegates. Never two parallel implementations.

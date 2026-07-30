@@ -89,7 +89,32 @@ It builds binaries for:
 - `aarch64-apple-darwin` (macos-latest)
 
 Each archive contains `basin-server`, `basinctl`, README, LICENSE, and
-CHANGELOG. A `.tar.gz.sha256` companion ships for verification.
+CHANGELOG.
+
+The release job then, in order:
+
+1. **Emits `SHA256SUMS`** over every staged asset in `dist/`. It refuses to
+   publish if `dist/` is empty, or if the manifest's line count does not equal
+   the asset count — an under-covering manifest looks exactly like a complete
+   one, so coverage is asserted rather than assumed.
+2. **Verifies that manifest with `scripts/verify.sh --dir dist`** — the same
+   script users run. A producer/consumer format disagreement surfaces here, in a
+   red release job, rather than in a user's terminal after the release is public.
+3. **Runs `scripts/verify.sh --selftest`**, proving the verifier's 24 refusal
+   paths still fire on this runner before anything is published.
+4. **Attaches a sigstore build-provenance attestation** over `dist/*` (including
+   `SHA256SUMS`, so the attestation transitively covers every asset it names),
+   signed with a short-lived certificate minted from the workflow's OIDC token.
+   **No long-lived signing key exists and none should be created.**
+5. **Prepends the verification snippet** to the release notes.
+
+If any of those steps fails, nothing is published. Do not "unblock" a release by
+removing a step — see `RELEASE-TEMPLATE.md` for what the contract is and why.
+
+Per-asset `.tar.gz.sha256` sidecars are still produced by the build job and
+published, but `SHA256SUMS` is the manifest verification uses. A per-asset digest
+served from the same origin as the asset only proves the origin agrees with
+itself.
 
 ### 8. Polish the GitHub Release
 

@@ -1,3 +1,10 @@
+---
+title: "Multi-bucket storage pool — design"
+nav_section: storage
+sidebar_position: 40
+summary: "Bucket registry, deterministic project-to-bucket assignment, partition striping and crash-safe online consolidation behind BASIN_BUCKET_POOL (default OFF)."
+---
+
 # Multi-bucket storage pool — design
 
 Status: **Stages 1–2 + online consolidation implemented (flag-gated, default

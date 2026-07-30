@@ -1,6 +1,6 @@
 ---
 title: "Dev-stack operator runbook"
-nav_section: operators
+nav_section: operations
 sidebar_position: 10
 summary: "Single-command local Basin environment: catalog Postgres 16 + MinIO + basin-server replicas. Includes E2E runner for perf, noisy-neighbor, and lease-handoff scenarios."
 tags: [ops, dev, docker, e2e]

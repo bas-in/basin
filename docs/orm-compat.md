@@ -1,3 +1,10 @@
+---
+title: "ORM compatibility — Basin pgwire coverage"
+nav_section: reference
+sidebar_position: 30
+summary: "Which SQL shapes popular ORMs emit that Basin handles, which return a typed error, and which are future work. Derived from tests/integration/tests/orm_compat.rs."
+---
+
 # ORM Compatibility — Basin pgwire coverage
 
 This document summarises which SQL shapes emitted by popular ORMs Basin handles

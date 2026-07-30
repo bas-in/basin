@@ -191,9 +191,9 @@ CREATE POLICY notes_owner_delete ON notes
 
 Insert a couple of rows to have data ready for the REST step:
 
+Seed some rows. Do this **before** enabling RLS — see the note below.
+
 ```sql
--- Direct inserts bypass RLS (you are the privileged pgwire user).
--- In production, app code always goes through basin-rest with a JWT.
 INSERT INTO users (id, email, display_name) VALUES
   ('user_alice', 'alice@example.com', 'Alice'),
   ('user_bob',   'bob@example.com',   'Bob');
@@ -204,15 +204,25 @@ INSERT INTO notes (user_id, title, body) VALUES
   ('user_bob',   'Bob note',    'Only Bob sees this');
 ```
 
-Query without a JWT (privileged pgwire session bypasses RLS):
-
 ```sql
 SELECT id, user_id, title FROM notes ORDER BY created_at;
 ```
 
-All three rows are visible here because you are connected as the privileged
-project user via pgwire, not through basin-rest. The RLS policies fire when
-requests arrive over the REST API carrying a JWT.
+> **There is no privileged bypass. Read this before you enable RLS.**
+>
+> A plain `psql` session carries **no JWT**, so `auth.uid()` is `NULL`, so
+> `USING (user_id = auth.uid())` matches nothing and the session sees **zero
+> rows** — not all of them. Enabling RLS locks *you* out too, which is the
+> fail-closed behaviour you want from a security feature but is surprising the
+> first time.
+>
+> So: seed and inspect data first, enable RLS second. To read the table again
+> afterwards you need a session whose `auth.uid()` matches — see below — or you
+> can `ALTER TABLE notes DISABLE ROW LEVEL SECURITY` while iterating.
+>
+> This is asserted by `rls_with_auth_uid_filters_per_user` in
+> `tests/integration/tests/auth_rls_uid.rs`, and by the tutorial's own CI
+> harness (`tests/integration/scripts/tutorial-smoke.sh`).
 
 ---
 
@@ -275,16 +285,23 @@ and extracts `auth.uid()` from the `sub` claim, which the RLS policies use.
 
 ## 5. CRUD over psql and the REST API
 
-### psql path (always works today)
+### psql path — pass the JWT as the username
 
-You can set the JWT claim in psql to simulate what basin-rest does
-automatically, which is useful for debugging RLS policies:
+Basin has **no `SET request.jwt.claims`**. PostgREST and Supabase expose that
+GUC as a debugging escape hatch; Basin does not implement it, and setting it
+does nothing. Earlier revisions of this tutorial documented it. They were wrong.
+
+The pgwire session's identity comes from the **JWT in the username field**, which
+`basin-router` verifies at connect time
+(`auth_context_from_username` in `crates/basin-router/src/protocol.rs`). So to
+query as Alice, connect as Alice's token — using `$JWT` from step 4:
+
+```sh
+psql -h 127.0.0.1 -p 5432 -U "$JWT"
+```
 
 ```sql
--- Set the JWT sub claim so auth.uid() resolves to alice's id.
-SET request.jwt.claims = '{"sub":"user_alice"}';
-
--- Now the RLS policy fires: only Alice's notes are visible.
+-- auth.uid() now resolves to Alice's `sub`, so the policy admits her rows only.
 SELECT id, title FROM notes;
 ```
 
@@ -298,21 +315,18 @@ Expected output (only Alice's two rows):
 (2 rows)
 ```
 
-```sql
--- Switch to Bob's claim — Bob's note is now visible instead.
-SET request.jwt.claims = '{"sub":"user_bob"}';
-SELECT id, title FROM notes;
-```
+Reconnect with Bob's token and the same query returns Bob's single row instead.
 
-> `SET request.jwt.claims` is a development introspection tool for testing
-> RLS policies directly in psql. In production, basin-rest injects the JWT
-> context automatically from the `Authorization` header on every request.
-
-Reset the session before continuing:
-
-```sql
-RESET request.jwt.claims;
-```
+> **This needs basin-auth running** (`BASIN_AUTH_ENABLED=1` plus a JWT secret).
+> With no auth service configured — which is the default of the quickstart
+> container in step 1 — every session is anonymous, `auth.uid()` is `NULL`, and
+> an RLS-enabled table returns zero rows to everyone. There is no way to read an
+> RLS-protected table from a plain psql session on an auth-less server, by
+> design.
+>
+> `auth.uid()` and `auth_uid()` are the same function; both forms work
+> (`auth_uid_schema_form_equals_flat_form` in
+> `tests/integration/tests/auth_rls_uid.rs`).
 
 ### REST API path (basin-rest)
 

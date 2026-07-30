@@ -2,7 +2,7 @@
 title: "Importing from PostgreSQL"
 nav_section: operations
 sidebar_position: 21
-summary: "basinctl import-from-postgres: one-command schema + data migration from a running PostgreSQL into Basin — DDL translation, binary COPY streaming with CSV fallback, parallel tables, row-count verification, and a loud skip report for everything Basin does differently."
+summary: "basinctl import-from-postgres: one-command schema + data migration from a running PostgreSQL, with DDL translation, binary COPY streaming, row-count verification and a loud skip report."
 tags: [migration, import, copy, onboarding]
 ---
 

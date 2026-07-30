@@ -1,3 +1,10 @@
+---
+title: "Security audit — 2026-05-21"
+nav_section: meta
+sidebar_position: 60
+summary: "Read-only security audit of crates/ and services/basin-server at main: findings, severities and follow-ups."
+---
+
 # Basin OSS — comprehensive security audit
 
 **Date:** 2026-05-21

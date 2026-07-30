@@ -1,3 +1,10 @@
+---
+title: "Multi-bucket throughput striping — design"
+nav_section: storage
+sidebar_position: 41
+summary: "Striping one hot project's data across multiple pooled buckets for write bandwidth. Extends the multi-bucket pool design; config-driven, flag-gated, default OFF."
+---
+
 # Multi-bucket throughput striping — single-project write-bandwidth design
 
 Status: **Design + Stage-2a routing seam implemented + production real-bucket

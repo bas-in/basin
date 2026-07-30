@@ -2,7 +2,7 @@
 title: "ADR 0021 — Object storage (catalog-backed blobs)"
 nav_section: decisions
 sidebar_position: 21
-summary: "Supabase-style blob storage. Objects are rows in a storage.objects system table, access control reuses the RLS engine, bytes live in the same object_store the engine uses, signed URLs are HMAC over (path, expiry). New basin-blob crate. Cloud builds quota/billing/CDN/image-transforms."
+summary: "Blob storage as rows in a storage.objects system table: access control reuses the RLS engine, bytes live in the engine's object_store, signed URLs are HMAC over (path, expiry). New basin-blob crate."
 tags: [storage, security, baas, oss]
 ---
 

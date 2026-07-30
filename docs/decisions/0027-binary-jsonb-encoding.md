@@ -2,7 +2,7 @@
 title: "ADR 0027 — Binary / columnar JSONB representation (faster scalar extraction)"
 nav_section: decisions
 sidebar_position: 27
-summary: "Basin's JSONB scalar extraction (->>, ->, #>, jsonb_typeof, jsonb_array_length) runs 100-2200x slower than PostgreSQL at 1M rows. Root cause: Basin stores JSONB as raw JSON text bytes and every UDF call walks those bytes per-row. This ADR decides the structural fix — a sequence of incremental improvements culminating in a hybrid binary-blob + promoted-columns representation — and records the first shippable increment: a per-batch top-level key index that eliminates redundant byte scanning when multiple UDF calls are applied to the same JSONB column in one query."
+summary: "JSONB extraction is 100-2200x slower than PostgreSQL at 1M rows: JSONB is stored as JSON text and re-walked per row. Decides the hybrid binary-blob + promoted-columns fix and its first increment."
 tags: [jsonb, performance, encoding, storage]
 ---
 

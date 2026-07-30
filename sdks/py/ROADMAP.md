@@ -6,7 +6,7 @@ but exposes basin's distinctive capabilities — cursor pagination, NDJSON
 streaming, OpenAPI introspection, per-project credential admin, the Iceberg
 catalog — as first-class features rather than ports of someone else's surface.
 
-This repo is the Python sibling of [`basin-js`](../basin-js). The public shape
+This repo is the Python sibling of [`basin-js`](../js). The public shape
 is already settled in basin-js; **basin-py mirrors it 1:1** so docs and support
 don't fork. Where the languages differ, we follow Python idiom (async-first on
 `httpx`, an optional sync facade, `async for` instead of `AsyncIterable`,

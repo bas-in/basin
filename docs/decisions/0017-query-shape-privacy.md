@@ -8,7 +8,7 @@ tags: [observability, privacy, security]
 
 # 0017 — Query-shape stats: privacy + cross-process stability
 
-- **Status:** Accepted (2026-05-19) — implementation Phase 5.16.A–D (OSS) and 5.16.E–H (basin-cloud), see [TASK.md](../../TASK.md) Phase 5.16 + [basin-cloud-roadmap.md](../basin-cloud-roadmap.md).
+- **Status:** Accepted (2026-05-19) — implementation Phase 5.16.A–D (OSS) and 5.16.E–H (basin-cloud), see [TASK.md](../../TASK.md) Phase 5.16; the cloud-side items live in the cloud repo's own roadmap.
 - **Tags:** observability, privacy, security, htap
 - **Supersedes:** none
 - **Cross-references:** [ADR 0013 (auth per-project schema)](./0013-auth-per-project-schema.md), [ADR 0016 (HTAP hot tier)](./0016-htap-hot-tier-architecture.md)

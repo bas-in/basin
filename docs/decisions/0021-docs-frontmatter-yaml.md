@@ -16,18 +16,18 @@ tags: [docs, meta, tooling]
 ## Context
 
 Basin's `docs/` directory is growing past the point where contributors can
-find things by scanning filenames. The `basin-cloud` unified docs site needs
+find things by scanning filenames. The unified docs site needs
 to pull each OSS repo's `docs/` at build time and render a coherent nav tree
 across products (Basin OSS, `basin-js`, `basin-cli`). That pull-and-render
 pipeline needs stable, machine-parseable metadata per file — at minimum:
 page title, navigation section, ordering within that section, and a short
 summary for search indexing.
 
-Without a metadata contract, `basin-cloud` would have to infer page titles
+Without a metadata contract, the docs site would have to infer page titles
 from heading text (fragile), guess nav placement from directory structure
 (doesn't survive doc reorganisations), and produce no search summaries at
 all. Every OSS contributor would need to consult a separate config file
-in the `basin-cloud` repo to add or rename a doc, coupling two repos
+in the docs-site repo to add or rename a doc, coupling two repos
 unnecessarily.
 
 Three formats were in scope: YAML frontmatter embedded in the markdown
@@ -88,8 +88,8 @@ can live next to the prose.
    temptation is to add `<Callout type="warning">` or
    `<VersionBadge since="0.4.0" />` inline. These component names are
    coupling: the OSS repo now depends on whatever component library
-   `basin-cloud` exports. A YAML frontmatter approach keeps the OSS side
-   plain markdown; `basin-cloud` applies presentation entirely at render
+   the docs site exports. A YAML frontmatter approach keeps the OSS side
+   plain markdown; the docs site applies presentation entirely at render
    time on its own side.
 
 ### Sidecar TOML rejected
@@ -112,7 +112,7 @@ mistake.
 
 3. **Two-file invariant is fragile.** If someone adds `new-guide.md` and
    forgets `new-guide.toml`, the CI linter produces a confusing error at
-   build time in `basin-cloud` rather than a clear error at PR time in the
+   build time in the docs site rather than a clear error at PR time in the
    OSS repo. The single-file approach makes the invariant trivially
    checkable: every `.md` file either has a frontmatter block or it
    doesn't.
@@ -148,7 +148,7 @@ than a structural risk.
   be migrated by adding the frontmatter block. The spec is the checklist.
 - **Phase 5.15.C (top-level index):** the `docs/README.md` index can be
   generated from frontmatter fields rather than maintained by hand.
-- **`basin-cloud` fetch pipeline:** the build-time fetcher can parse every
+- **Docs-site fetch pipeline:** the build-time fetcher can parse every
   OSS repo's docs without per-file config in the cloud repo. The nav tree
   is fully self-describing from the frontmatter.
 - **Version-gated docs:** `version_since` / `version_until` let the cloud
@@ -170,7 +170,7 @@ than a structural risk.
 
 ## Trigger to reconsider
 
-If `basin-cloud` switches its docs renderer to one that requires MDX
+If the docs site switches its docs renderer to one that requires MDX
 natively and has no YAML-frontmatter ingestion path, the trade-off flips:
 MDX would become the lower-friction format. Until then, the renderer
 portability and GitHub rendering benefits of YAML frontmatter outweigh the

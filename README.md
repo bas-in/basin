@@ -481,7 +481,44 @@ tests/integration/  cross-crate viability + scaling + Postgres comparisons
 
 ---
 
+## Verify a release before you run it
+
+Every tagged release publishes a `SHA256SUMS` manifest covering **every**
+asset, plus a sigstore build-provenance attestation minted from the release
+workflow's OIDC identity (no long-lived signing key exists, and none should).
+`scripts/verify.sh` is what you run before executing bytes you pulled off the
+internet:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/vul-os/basin/v0.1.9/scripts/verify.sh
+bash verify.sh --tag v0.1.9 --attest basin-0.1.9-x86_64-unknown-linux-gnu.tar.gz
+```
+
+It fetches the manifest, looks up the **exact** entry for the asset you named,
+downloads it and compares digests. It fails closed: a missing or HTML-substituted
+manifest, a manifest with no entry for your asset, a truncated download and a
+digest mismatch each exit non-zero with their own diagnostic. There is no
+`--skip-verify`. `--attest` additionally checks the build provenance (needs the
+`gh` CLI); without it the script prints that provenance was **not** checked
+rather than implying it was.
+
+`bash scripts/verify.sh --selftest` runs the 24-case refusal matrix against a
+synthetic broken origin — CI runs it on every push, so a verifier that has
+quietly stopped refusing shows up as a red build rather than as a green one.
+
+The CLI's own release (`cli-v*` tags) is additionally cosign-signed keyless;
+see [`.github/workflows/cli-release.yml`](./.github/workflows/cli-release.yml)
+for the `cosign verify-blob` invocation.
+
+---
+
 ## Build and test
+
+Minimum supported Rust version is **1.92** — not a preference, but the floor
+the resolved dependency graph imposes (cranelift 0.131 via wasmtime declares
+1.92; vortex-error 0.71 declares 1.91), and `cargo` hard-errors below it. CI's
+`msrv floor` job recomputes that from `cargo metadata` and fails if
+`rust-version` drifts below it.
 
 ```sh
 # Workspace build:

@@ -1,3 +1,10 @@
+---
+title: "HN write-up — draft"
+nav_section: meta
+sidebar_position: 90
+summary: "Internal launch-post draft. Numbers must be re-verified against a fresh benchmark run before posting; do not cite figures the linked card no longer shows."
+---
+
 # HN write-up — DRAFT (review before posting)
 
 > Internal draft. Numbers are from the LocalFS differential bench

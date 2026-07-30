@@ -2,7 +2,7 @@
 title: "ADR 0024 — UUID-as-Decimal256 storage encoding (C1 workaround pending Vortex FixedSizeBinary support)"
 nav_section: decisions
 sidebar_position: 24
-summary: "Until Vortex supports FixedSizeBinary(N) encoding, basin-storage transparently translates UUID columns (Arrow FixedSizeBinary(16)) to Decimal256(39, 0) at the storage boundary on write and back on read, using a per-column `BASIN_TYPE=\"uuid\"` sidecar in field metadata. The translation is invisible above the storage trait — engine, planner, pgwire, REST all keep seeing UUIDs. When the upstream Vortex PR lands, the translation layer is deleted with zero callsite churn."
+summary: "Until Vortex supports FixedSizeBinary(N), basin-storage maps UUID columns to Decimal256(39,0) at the storage boundary via a BASIN_TYPE field-metadata sidecar. Invisible above the storage trait."
 tags: [storage, types, vortex, workaround]
 ---
 

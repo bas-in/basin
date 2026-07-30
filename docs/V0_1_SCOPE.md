@@ -1,3 +1,10 @@
+---
+title: "Basin v0.1 — scope cut-off"
+nav_section: overview
+sidebar_position: 5
+summary: "Source of truth for what ships in v0.1 and what is parked: required items, shipped items, and explicit non-goals."
+---
+
 # Basin v0.1 — Scope Cut-Off
 
 **Status:** Pre-alpha. Target release: TBD. This doc is the source of truth

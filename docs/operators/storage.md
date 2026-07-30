@@ -401,8 +401,8 @@ PUTs (flush, compaction) fail with ObjectStore errors:
 
 ## Cross-references
 
-- [ADR 0008 — Per-project fair-share I/O scheduler](../decisions/0008-io-scheduler.md)
-- [ADR 0016 — HTAP hot-tier architecture](../decisions/0016-htap-hottier.md)
+- [ADR 0008 — Noisy-neighbor fairness / per-project fair-share I/O](../decisions/0008-noisy-neighbor-fairness.md)
+- [ADR 0016 — HTAP hot-tier architecture](../decisions/0016-htap-hot-tier-architecture.md)
 - [Lease ownership runbook](./lease-ownership.md) — the `memtable_bytes` cap connects to the lease budget system.
 - `crates/basin-storage/src/scheduler.rs` — `DEFAULT_GLOBAL_BUDGET` constant and per-project stats.
 - `crates/basin-hottier/src/budget.rs` — all `BASIN_MEMTABLE_*` env-var constants.

@@ -1,3 +1,10 @@
+---
+title: "Operator guide: per-project usage and external quotas"
+nav_section: operations
+sidebar_position: 20
+summary: "Reading the basin_project_usage view to drive external quota enforcement, billing aggregation and throttling decisions."
+---
+
 # Operator guide: per-project usage and external quotas
 
 Basin exposes a per-project SQL view, `basin_project_usage`, that surfaces the
