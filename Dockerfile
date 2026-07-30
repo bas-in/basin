@@ -1,6 +1,19 @@
 # Phase 5.31.B — multi-stage production Dockerfile for basin-server.
 #
-# Builder : rust:1.85-slim-bookworm  (matches workspace rust-version = "1.85")
+# Builder : rust:${RUST_VERSION}-slim-bookworm
+#           RUST_VERSION must be >= the workspace `rust-version` in Cargo.toml,
+#           which is the *resolved graph's* floor, not a preference: cranelift
+#           0.131 (via wasmtime, via basin-fn) declares rust-version 1.92 and
+#           vortex-error 0.71 declares 1.91, and cargo hard-errors below either.
+#           This was pinned at 1.85 while the lockfile needed 1.92, so every
+#           Docker Smoke run failed with
+#             error: rustc 1.85.1 is not supported by the following packages:
+#               vortex-error@0.71.0 requires rustc 1.91.0
+#           Bump this together with Cargo.toml's rust-version; the msrv-floor
+#           CI job fails closed if they drift apart again.
+#           bookworm (not trixie) so the builder's glibc is not newer than the
+#           runtime stage's — a trixie builder produces a binary bookworm-slim
+#           cannot load.
 # Runtime : debian:bookworm-slim     (~30 MB base + glibc + libgcc + netcat;
 #                                     distroless/cc was preferred but has no
 #                                     shell/netcat for the HEALTHCHECK TCP probe)
@@ -16,7 +29,8 @@
 #                                           set to "basin=*" to match smoke PGUSER=basin
 
 # ─── Stage 1: builder ────────────────────────────────────────────────────────
-FROM rust:1.85-slim-bookworm AS builder
+ARG RUST_VERSION=1.92
+FROM rust:${RUST_VERSION}-slim-bookworm AS builder
 
 # Native build deps:
 #   clang/cmake — required by pg_query crate (libpg_query, C build)
