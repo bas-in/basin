@@ -92,6 +92,91 @@ verifying.
   assertions are executing for the first time — if any of them is wrong, this
   job is expected to go red, and that red is the finding, not a regression.**
 
+### Found, not fixed — ~470 lines of orphaned cold-path tombstone code in basin-engine
+
+Recorded here rather than deleted: removing engine code is the owner's call, and
+an audit pass should not guess at intent. The evidence, so the next reader does
+not have to re-derive it.
+
+`cargo build --workspace` emitted 78 dead-code warnings when measured at
+`87aa2c2f` (a few of which `a66be57d` has since removed). Most are one-off
+helpers, but four of them form a single self-consistent island — a cold-tier
+DELETE tombstone path that is fully written, partly tested, and never reachable.
+Line numbers below re-verified against `2f01d0f8`:
+
+| Item | Where | Status |
+|---|---|---|
+| `TombstoneFilteringTable` | `basin-engine/src/hot_tombstone.rs:1096` | never constructed |
+| `maybe_wrap_with_tombstone_filter` | `basin-engine/src/hot_tombstone.rs:1055` | never used |
+| `TombstoneColdTable` | `basin-engine/src/tombstone_cold_scan.rs:60` | never constructed |
+| `TombstoneColdScanExec` | `basin-engine/src/tombstone_cold_scan.rs:236` | only constructed by `TombstoneColdTable::scan`, itself unreachable |
+
+`tombstone_cold_scan.rs`'s module doc says `TombstoneColdTable` is "Registered by
+`refresh_table` (and its qualified / with-extra variants)".
+`grep -n 'TombstoneColdTable\|TombstoneFilteringTable' crates/basin-engine/src/session.rs`
+returns nothing — the registration was never written. The module also describes
+itself as replacing the older `TombstoneFilteringTable` wrapper; both the old
+path and its replacement are dead, so what actually happened is that neither was
+wired.
+
+Its two `#[test]`s pass without executing a line of the module they live in:
+both call `filter_batch`, which is defined in `hot_tombstone.rs` and re-exported
+into scope by `use super::*`. Green tests inside a dead module are worth naming
+— they are why this read as live code.
+
+**No product claim is affected.** The merge-on-read path README and
+[ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md) describe is
+`TombstoneFilterExec` + `UpdateOverlayExec`, constructed at
+`basin-engine/src/session.rs:4024` and `:4036`, and that is live and covered.
+The island is a second, abandoned implementation of the cold-only case.
+
+Note that CI cannot catch this class today: `ci.yml`'s clippy job runs
+`cargo clippy --workspace --all-targets` in advisory mode (no `-D warnings`) by
+deliberate, documented choice, so all 78 warnings are non-blocking.
+
+### Fixed — the CLI's documented `cosign verify-blob` could never succeed
+
+`cli/README.md` told users to verify the signed CLI archives against the
+certificate identity
+
+```
+https://github.com/vul-os/basin/tree/main/cli/\.github/workflows/release\.yml@refs/tags/v.*
+```
+
+which matches no certificate `cli-release.yml` has ever minted, for three
+independent reasons. The Fulcio SAN for a GitHub Actions OIDC token is
+`https://github.com/<owner>/<repo>/.github/workflows/<file>@<ref>`: there is no
+`tree/<branch>/` segment; the workflow was hoisted out of `cli/` to the repo
+root and renamed `cli-release.yml` (`e5a429d0`); and this workflow fires on
+`cli-v*` tags, so the ref is `refs/tags/cli-v…`, which `refs/tags/v.*` does not
+match. `cosign verify-blob` would refuse every signature it was pointed at.
+
+Failing closed is the right direction to be wrong in — an unverifiable artifact
+is better than a falsely-verified one — but the README asserted "A successful
+run prints `Verified OK`", and no reader following it could ever get there. The
+identity is corrected in both `cli/README.md` and the `cli-release.yml` comment
+that is the other half of the same instruction, with the SAN's shape spelled out
+so the next rename is caught.
+
+### Fixed — the product site sat outside every link gate, and had a dead link
+
+`site/index.html`'s footer linked "Roadmap" to `ROADMAP.md`, a file that has
+never existed in this repo. Nothing caught it: `check-doc-links.sh` walked only
+`.md` files and skipped absolute URLs, and `site/*.html` — served from
+vulos.org, so it cannot use relative paths — reaches repo content exclusively
+through absolute `https://github.com/vul-os/basin/blob/main/<path>` URLs. That
+whole class was external in form and internal in fact, and unchecked.
+
+The link is repointed at [`WEDGE.md`](./WEDGE.md), which is the roadmap
+(its own H1 reads "wedge-deepening roadmap"). `check-doc-links.sh` now also
+resolves self-referential GitHub links — in markdown and in `site/*.html` — 
+against the working tree, with no network call, and fails closed if it finds
+zero of them. It matches only text already extracted as a link target
+(markdown `](…)` or HTML `href=`), never raw file text, so the cosign
+`--certificate-identity-regexp` value in `cli/README.md` — a github.com pattern
+that is not a link — is not mistaken for one. Verified: 619 relative links and
+54 self-referential GitHub links across 164 markdown and 2 HTML files.
+
 ### Fixed — the getting-started tutorial documented two things that are not true
 
 Rewriting the tutorial harness to actually run the tutorial surfaced two

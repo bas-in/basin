@@ -95,9 +95,15 @@ jobs:
   #   cosign verify-blob --certificate basin_<ver>_<target>.tar.gz.pem \
   #     --signature basin_<ver>_<target>.tar.gz.sig \
   #     --certificate-identity-regexp \
-  #       'https://github.com/vul-os/basin/.github/workflows/cli-release.yml' \
+  #       '^https://github\.com/vul-os/basin/\.github/workflows/cli-release\.yml@refs/tags/cli-v.*$' \
   #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   #     basin_<ver>_<target>.tar.gz
+  #
+  # The identity is the Fulcio SAN: repo-root-relative workflow path, `@`, then
+  # the triggering ref — `refs/tags/cli-v*` here, since this workflow only fires
+  # on `cli-v*` (bare `v*` is the engine's release). Keep this and cli/README.md
+  # in step; the README's copy named a `tree/main/cli/.../release.yml@refs/tags/v.*`
+  # identity that matched no certificate this job has ever minted.
   sign:
     name: cosign keyless signing
     runs-on: ubuntu-latest

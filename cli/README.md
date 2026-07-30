@@ -157,13 +157,27 @@ ART="basin_0.1.0_linux_amd64.tar.gz"
 cosign verify-blob \
   --certificate "${ART}.pem" \
   --signature   "${ART}.sig" \
-  --certificate-identity-regexp 'https://github.com/vul-os/basin/tree/main/cli/\.github/workflows/release\.yml@refs/tags/v.*' \
+  --certificate-identity-regexp '^https://github\.com/vul-os/basin/\.github/workflows/cli-release\.yml@refs/tags/cli-v.*$' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   "${ART}"
 ```
 
 A successful run prints `Verified OK`. Anything else — wrong issuer,
 mismatched tag, edited binary — fails closed.
+
+> The identity above must match the SAN Fulcio puts in the certificate, which
+> for a GitHub Actions OIDC token is
+> `https://github.com/<owner>/<repo>/.github/workflows/<file>@<ref>` — no
+> `tree/<branch>/` segment, the workflow path relative to the **repo root**, and
+> the **tag that triggered the run**. This block previously named
+> `tree/main/cli/.github/workflows/release.yml@refs/tags/v.*`, which was wrong
+> three times over: the SAN has no `tree/main` segment, the workflow was hoisted
+> out of `cli/` to the repo root and renamed `cli-release.yml`, and CLI releases
+> are tagged `cli-v*` (the bare `v*` namespace belongs to the engine release).
+> `cosign verify-blob` therefore refused every signature it was ever pointed at.
+> Failing closed is the right direction to be wrong in — but the documented
+> command could not print `Verified OK`, so nobody could complete a verification
+> by following it.
 
 ## Self-hosted OSS engine
 
