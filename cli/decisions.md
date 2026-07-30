@@ -6,7 +6,7 @@ way it is. Append-only — entries get superseded, never deleted.
 
 Format: each entry is dated, names the decision, lists the considered
 alternatives, and writes down the "trigger" that would change our
-mind. Inspired by [`basin/docs/decisions/`](../basin/docs/decisions/).
+mind. Inspired by [`docs/decisions/`](../docs/decisions/).
 
 ---
 

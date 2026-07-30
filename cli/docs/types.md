@@ -11,8 +11,11 @@ for your application code. No new cloud endpoint is needed — the CLI assembles
 source code from the same `information_schema` a developer can query themselves.
 
 The type-mapping opinions (nullable forms, JSONB representation, vector dimensions)
-live in [`gen_types_map.go`](../gen_types_map.go). Each language has its own
-emitter in [`cmd_gen.go`](../cmd_gen.go).
+live in the `type_table()` mapping in
+[`src/commands/gen.rs`](../src/commands/gen.rs); each language has its own
+`emit_*` function in the same file. (Those two responsibilities lived in
+`gen_types_map.go` and `cmd_gen.go` in the Go implementation this command was
+ported from; neither file exists any more.)
 
 ---
 
@@ -133,7 +136,8 @@ basin gen types python --output=./app/models/database.py
 ## Engine type → target type mapping table
 
 The full mapping is defined in
-[`gen_types_map.go`](../gen_types_map.go). This table is the canonical source of
+the `type_table()` mapping in [`src/commands/gen.rs`](../src/commands/gen.rs).
+This table is the canonical source of
 truth; the doc below is a summary. The `MapType(pg PgType, lang LangTarget)`
 function returns the mapping; callers fall back to `string` / `any` / `Any` with a
 `// WARNING: unknown pg type` comment in the generated file when a type is absent.
@@ -212,7 +216,7 @@ you update the type-mapping table or an emitter:
 
 - **`cmd_gen_test.go`** — TypeScript / Go / Python emitters, nullable mapping,
   JSONB mapping, `vector` mapping, snapshot tests against `testdata/expected.{ts,go,py}`.
-- **`gen_types_map.go`** — the mapping table itself. Every type in the table is
+- **`type_table()` in `src/commands/gen.rs`** — the mapping table itself. Every type in the table is
   exercised by the emitter tests.
 
 ---
