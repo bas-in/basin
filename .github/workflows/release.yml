@@ -7,7 +7,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: 1.83.0
+  # No RUST_TOOLCHAIN pin: rust-toolchain.toml (channel = "stable") overrides
+  # anything a workflow installs, so the old `RUST_TOOLCHAIN: 1.83.0` named a
+  # toolchain no job ever ran on. See the note in ci.yml.
   # Strip debug info from release artifacts entirely — saves ~30% of
   # link time and ~50% of artifact size. The default workspace
   # `[profile.release]` keeps `debug = 1` for developers; CI overrides
@@ -53,9 +55,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
       # Cache target/ keyed on Cargo.lock + target triple. duckdb-bundled
@@ -94,15 +95,90 @@ jobs:
             ${{ steps.package.outputs.checksum }}
 
   release:
-    name: Create GitHub Release
+    name: Create GitHub Release (checksummed + attested)
     runs-on: ubuntu-latest
     needs: [build]
+    permissions:
+      contents: write       # create the Release and upload assets
+      id-token: write       # mint the OIDC token the attestation is signed with
+      attestations: write   # record the attestation against this repo
     steps:
       - uses: actions/checkout@v4
+      # Everything that will be published lands in dist/ and nothing else does.
+      # The manifest covers that directory, so "published" and "covered" are the
+      # same set by construction rather than two hand-maintained lists.
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      # Previously this job published per-asset `.sha256` files and nothing
+      # else: no manifest, no signature, no attestation, and no script a user
+      # could run. A per-asset digest fetched from the same origin as the asset
+      # proves only that the origin is self-consistent. Pattern adopted from
+      # vul-os/ephor's RELEASE-TEMPLATE.md.
+      - name: Emit SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+
+          # Portable listing (no `find -printf`): the staging dir is flat by
+          # construction, one line per asset, LC_ALL=C sorted so the manifest is
+          # reproducible. Per-asset .sha256 sidecars are excluded — they are
+          # superseded by this manifest and vouching for them adds nothing.
+          mapfile -t ASSETS < <(find . -maxdepth 1 -type f \
+            ! -name SHA256SUMS ! -name '*.sha256' -exec basename {} \; | LC_ALL=C sort)
+
+          # FAIL CLOSED. A build that produced nothing must be a red release,
+          # not a green one with an empty manifest. An empty SHA256SUMS vouches
+          # for nothing while looking exactly like one that vouched for
+          # everything.
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "::error::dist/ contains no artifacts — refusing to publish a release whose manifest would vouch for nothing."
+            exit 1
+          fi
+
+          : > SHA256SUMS
+          for a in "${ASSETS[@]}"; do
+            sha256sum "$a" >> SHA256SUMS
+          done
+
+          # COVERAGE ASSERTION. Without it the step is trivially satisfiable: a
+          # one-line manifest "covers" a ten-asset release and every later check
+          # still passes. Pin line count to asset count.
+          LINES="$(wc -l < SHA256SUMS | tr -d ' ')"
+          if [ "$LINES" -ne "${#ASSETS[@]}" ]; then
+            echo "::error::SHA256SUMS has ${LINES} line(s) for ${#ASSETS[@]} staged artifact(s) — the manifest does not cover the release."
+            exit 1
+          fi
+
+          echo "SHA256SUMS covers ${#ASSETS[@]} artifact(s):"
+          cat SHA256SUMS
+          printf '%s\n' "${ASSETS[@]}" > /tmp/release-assets.txt
+
+      # The producer checked by the consumer. If verify.sh and the emit step
+      # ever disagree about the format, it surfaces in a red release job rather
+      # than in a user's terminal after the release is public.
+      - name: Verify SHA256SUMS with the same script users run
+        run: |
+          set -euo pipefail
+          mapfile -t ASSETS < /tmp/release-assets.txt
+          bash scripts/verify.sh --dir dist "${ASSETS[@]}"
+
+      # Proves the verifier's refusals still fire on this runner, on this
+      # release, before anything is published. A verifier whose failure paths
+      # are never exercised is a verifier that has probably stopped failing.
+      - name: Prove the verifier still refuses broken releases
+        run: bash scripts/verify.sh --selftest
+
+      # Short-lived sigstore cert minted from this job's OIDC identity. No
+      # secret is referenced and none needs to exist. Attests every file in
+      # dist/, including SHA256SUMS itself — so the attestation on the manifest
+      # transitively covers every asset the manifest names.
+      - name: Attest build provenance (sigstore via OIDC — no long-lived key)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*"
 
       - name: Extract release notes from CHANGELOG.md
         id: notes
@@ -120,12 +196,37 @@ jobs:
             echo "(No CHANGELOG entry found — see commit history for changes.)" >> release_notes.md
           fi
 
+          # Prepend the verification instructions. A verifier nobody is told
+          # about is a verifier nobody runs.
+          {
+            echo "### Verify before you run this"
+            echo
+            echo '```sh'
+            echo "curl -fsSLO https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/scripts/verify.sh"
+            echo "bash verify.sh --tag ${GITHUB_REF_NAME} --attest basin-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            echo '```'
+            echo
+            echo "\`verify.sh\` fetches \`SHA256SUMS\`, looks up the exact entry for the"
+            echo "asset and compares digests; it exits non-zero, with a distinct"
+            echo "diagnostic, on a missing or malformed manifest, a missing entry, a"
+            echo "truncated download or a digest mismatch. There is no skip path."
+            echo "\`--attest\` additionally checks the sigstore build provenance (needs"
+            echo "the \`gh\` CLI); without it, provenance is NOT checked and the script"
+            echo "says so."
+            echo
+            echo "---"
+            echo
+            cat release_notes.md
+          } > release_body.md
+          mv release_body.md release_notes.md
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          # Publish the directory, not a hand-listed set of names — the same
+          # directory SHA256SUMS covers.
           files: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
+            dist/*
           body_path: release_notes.md
           draft: false
           prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}

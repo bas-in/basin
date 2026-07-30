@@ -1,15 +1,29 @@
-# Phase 5.32.A — CI harness for the Basin tutorial and sample applications.
+# CI harness for the Basin sample applications (Phase 5.32).
 #
-# LANDING STATE: This workflow lands RED until the following phases complete:
-#   5.32.B  docs/tutorial.md authored          (tutorial-smoke job)
-#   5.32.C  examples/saas-starter/ scaffolded  (saas-starter-smoke job)
-#   5.32.D  examples/ai-rag-app/ scaffolded    (ai-rag-app-smoke job)
+# HISTORY WORTH KEEPING — this workflow was, for months, a green tick that
+# verified nothing:
 #
-# Until those artifacts exist, each job script detects the missing path and
-# exits 0 with a skip message — so this workflow itself stays green, but
-# the downstream real assertions are exercised once the artifacts land.
+#   * Its three job scripts each began with "if the artifact doesn't exist yet,
+#     exit 0 with a skip message". All three artifacts landed. Two of those
+#     skips became dead code guarding an impossible condition; the third
+#     (tutorial-smoke) fell through to a commented-out TODO block and printed
+#     "All tutorial assertions passed" having asserted nothing.
+#   * The SaaS Starter's RLS suite reported `Tests: 4 passed, 4 total`,
+#     including "Org-A JWT cannot read Org-B todos", while every one of those
+#     tests early-returned on `[skip] Basin not reachable` — because nothing
+#     here starts Basin.
+#
+# What changed: the skips are gone, the sample scripts fail closed on a
+# zero-test run, the live RLS slices are now *explicitly* opted out below (jest
+# reports them SKIPPED, not passed), and the tutorial smoke moved to
+# docker-smoke.yml where a real Basin container is already running — see
+# tests/integration/scripts/tutorial-smoke.sh.
+#
+# WHAT A GREEN RUN HERE MEANS: `npm ci`, a non-empty test run, `tsc --noEmit`
+# and `vite build` all succeeded for both sample apps. It does NOT mean
+# per-tenant isolation was verified. Docker Smoke is where that is checked.
 
-name: Tutorial & Sample Apps Smoke
+name: Sample Apps Smoke
 
 on:
   pull_request:
@@ -22,26 +36,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Explicit, and deliberately not a default inside the test file. Nothing in
+  # this workflow starts Basin or basin-auth, so the live slices cannot run;
+  # saying so here makes jest print them as skipped instead of passed. Remove
+  # this — and stand up Basin + `npm run setup` — to actually cover RLS here.
+  BASIN_SKIP_LIVE_TESTS: "1"
+
 jobs:
-  # ── Tutorial smoke ────────────────────────────────────────────────────────
-  # Runs every command in docs/tutorial.md top-to-bottom and asserts output.
-  # Skips cleanly until 5.32.B lands.
-  tutorial-smoke:
-    name: Tutorial smoke
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Run tutorial smoke
-        run: bash tests/integration/scripts/tutorial-smoke.sh
-
   # ── SaaS Starter smoke ────────────────────────────────────────────────────
-  # npm ci + npm test + npm run build for examples/saas-starter/.
-  # Skips cleanly until 5.32.C lands.
   saas-starter-smoke:
-    name: SaaS Starter smoke
+    name: SaaS Starter smoke (build + unit; live RLS slices skipped)
     runs-on: ubuntu-latest
 
     steps:
@@ -58,8 +63,9 @@ jobs:
         run: bash tests/integration/scripts/sample-saas-starter-smoke.sh
 
   # ── AI RAG App smoke ──────────────────────────────────────────────────────
-  # npm ci + npm test + npm run build for examples/ai-rag-app/.
-  # Skips cleanly until 5.32.D lands.
+  # This app's suite is genuinely offline: chunking, pgvector literal encoding,
+  # cosine ranking and context assembly are all pure functions. It needs no
+  # server and is unaffected by BASIN_SKIP_LIVE_TESTS.
   ai-rag-app-smoke:
     name: AI RAG App smoke
     runs-on: ubuntu-latest

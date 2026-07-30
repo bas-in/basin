@@ -25,13 +25,22 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-  RUST_TOOLCHAIN: 1.83.0
+  # No RUST_TOOLCHAIN pin: rust-toolchain.toml (channel = "stable") overrides
+  # anything a workflow installs, so the old `RUST_TOOLCHAIN: 1.83.0` named a
+  # toolchain no job ever ran on. See the note in ci.yml.
   CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
 
 jobs:
-  # ── 5.22.A — pg_dump / psql round-trip ─────────────────────────────────────
+  # ── 5.22.A — pg_dump harness ────────────────────────────────────────────────
+  # Named for what it verifies. The four round-trip slices do NOT run: they
+  # invoke a `basin-cli dump --url ... --table ...` contract the shipped CLI
+  # does not offer (binary is `basin`; `dump` takes --project/--format/--file
+  # and talks to the control plane). A green tick here means the harness
+  # compiles, executes and declines honestly — the wrapper pins the declined
+  # count so that cannot quietly change. Do not rename this back to
+  # "round-trip" until a round-trip actually happens.
   pg-dump-round-trip:
-    name: "5.22.A — pg_dump/psql round-trip"
+    name: "5.22.A — pg_dump harness (slices pending a CLI dump contract)"
     runs-on: ubuntu-latest
 
     services:
@@ -57,9 +66,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y postgresql-client
 
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -71,12 +78,14 @@ jobs:
           # BASIN_LOCAL_URL is not set here; the Basin-round-trip slices
           # will skip cleanly (require_env() prints a notice and returns).
 
-      - name: Run pg_dump harness (--ignored to opt in to external-tool tests)
-        run: |
-          cargo test \
-            -p basin-integration-tests \
-            --test pg_dump_harness \
-            -- --ignored --nocapture
+      # NOT a bare `cargo test`, and NOT `-- --ignored`. `--ignored` runs only
+      # `#[ignore]`d tests; nothing in this harness is ignored, so that flag
+      # made this job report `0 passed; 4 filtered out` — green, zero tests —
+      # on every push since the workflow landed. The wrapper fails closed when
+      # no test executes and when the number of slices that decline for want of
+      # a database URL drifts from the committed baseline.
+      - name: Run pg_dump harness (fail-closed wrapper)
+        run: ./scripts/check-pg-dump-harness.sh
 
   # ── 5.25.B — Flyway compat ─────────────────────────────────────────────────
   flyway-compat:
@@ -94,17 +103,22 @@ jobs:
           # The archive unpacks as flyway-10.21.0/
           echo "/opt/flyway-10.21.0" >> $GITHUB_PATH
 
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-external-flyway"
 
-      - name: Run Flyway compat harness (--ignored to opt in to external-tool tests)
+      # `--ignored` IS correct here: flyway_migrate_10_migrations carries
+      # #[ignore] (migration_tool_flyway.rs:112), so this opts it in. The
+      # wrapper is what makes that verifiable — it fails closed on a zero-test
+      # run, and on the harness's own runtime SKIP, which fires when `flyway`
+      # is not on PATH. Without it, an install step that silently produced no
+      # usable binary would still be green: the test runs, prints
+      # "[flyway_migrate_10_migrations] SKIP", returns, and passes.
+      - name: Run Flyway compat harness (fail-closed wrapper)
         run: |
-          cargo test \
+          ./scripts/check-test-executes.sh "5.25.B Flyway" -- \
             -p basin-integration-tests \
             --test migration_tool_flyway \
             -- --ignored --nocapture
@@ -124,17 +138,17 @@ jobs:
             | tar xz -C /usr/local/bin migrate
           migrate -version
 
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-external-golang-migrate"
 
-      - name: Run golang-migrate compat harness (--ignored to opt in to external-tool tests)
+      # As above: #[ignore]d test opted in with --ignored, wrapped so that a
+      # zero-test run or the harness's "migrate not on PATH" SKIP is red.
+      - name: Run golang-migrate compat harness (fail-closed wrapper)
         run: |
-          cargo test \
+          ./scripts/check-test-executes.sh "5.25.C golang-migrate" -- \
             -p basin-integration-tests \
             --test migration_tool_golang_migrate \
             -- --ignored --nocapture

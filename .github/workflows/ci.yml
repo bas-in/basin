@@ -15,11 +15,20 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Don't fetch the full crates.io index — sparse is the default on 1.83
-  # but we set it explicitly so older runners behave the same way.
+  # Don't fetch the full crates.io index — sparse is the default on modern
+  # toolchains but we set it explicitly so older runners behave the same way.
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-  # Pin to the toolchain the team develops against. Bump deliberately.
-  RUST_TOOLCHAIN: 1.83.0
+  # NOTE — there is deliberately NO `RUST_TOOLCHAIN` pin here any more.
+  # `rust-toolchain.toml` (channel = "stable") is the single source of truth and
+  # rustup honours it over anything a workflow installs. The previous
+  # `RUST_TOOLCHAIN: 1.83.0` + `dtolnay/rust-toolchain@master with: toolchain:`
+  # pair installed 1.83.0 and then never used it — the runner logs said so
+  # outright:
+  #   info: note that the toolchain 'stable-x86_64-unknown-linux-gnu' is
+  #   currently in use (overridden by '.../rust-toolchain.toml')
+  # So the pin described a toolchain no job ran on, while the workspace's
+  # `rust-version` (then 1.85, actually 1.92) went unverified in both
+  # directions. The `msrv-floor` job below now checks the MSRV claim directly.
   # Strip debug info from CI dev builds. Free GitHub runners have ~7GB
   # RAM and the workspace's test binaries (each statically links ~200
   # crates) routinely OOM the linker on full debug info. `line-tables-
@@ -40,9 +49,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -66,14 +74,78 @@ jobs:
           python-version: "3.11"
       - run: bash ./scripts/build-docs-index.sh --check
 
+  verify-script:
+    # A guard that has quietly stopped failing is indistinguishable, from a
+    # green CI run, from one that works. So the refusal paths of the scripts
+    # this repo's other gates are built out of are exercised on every push, not
+    # only when they happen to be invoked for real.
+    name: Gate scripts — lint & failure matrices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: |
+          set -euo pipefail
+          for f in scripts/verify.sh scripts/check-*.sh scripts/build-docs-index.sh; do
+            bash -n "$f"
+          done
+      # Lints every script a CI job depends on, not just verify.sh. A gate whose
+      # own wrapper has an unquoted expansion or a silently-swallowed pipeline
+      # is a gate that can stop gating without anything going red.
+      - name: ShellCheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck scripts/verify.sh scripts/check-*.sh scripts/build-docs-index.sh
+      # Each case is a synthetic origin broken in exactly one way; the matrix
+      # asserts the exit code AND that a diagnostic was printed, because
+      # "aborted with no message" was the real-world bug being guarded against.
+      - name: Release verifier — failure matrix (synthetic origin)
+        run: bash scripts/verify.sh --selftest
+      # Same idea for the zero-test guard: its verdict function is driven
+      # against synthetic `cargo test` output covering each refusal, so the
+      # wrapper that stands between "0 tests ran" and a green tick cannot itself
+      # rot into a no-op.
+      - name: Zero-test guard — failure matrix (synthetic runs)
+        run: bash scripts/check-test-executes.sh --selftest
+
+  msrv-floor:
+    # Asserts that Cargo.toml's `rust-version` is not below the floor the
+    # resolved graph imposes. This is the gate that was missing when the
+    # workspace claimed 1.85 for months against a lockfile that needed 1.92 —
+    # a claim only the Dockerfile ever tested, in a workflow that had been red
+    # long enough to read as background noise.
+    name: msrv floor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: ./scripts/check-msrv-floor.sh
+
+  docs-links:
+    # Sixteen relative links were dead before this gate existed, four of them
+    # pointing at a doc deleted one commit earlier. Fails closed, including on
+    # "found zero links to check".
+    name: docs links resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: ./scripts/check-doc-links.sh
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -96,9 +168,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           # Distinct key from clippy so the larger test-incremental
@@ -131,9 +201,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: dtolnay/rust-toolchain@stable
       # Cache cargo bin/registry so `cargo install cargo-audit` doesn't
       # rebuild from source on every push (~3-4 min saved).
       - uses: Swatinem/rust-cache@v2

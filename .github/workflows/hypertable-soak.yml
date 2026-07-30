@@ -5,9 +5,29 @@ name: Hypertable Soak
 # This job is heavy (~3-5 days of spec time, run in minutes on a large runner
 # with SSD-backed object store).  It is gated behind workflow_dispatch and a
 # nightly schedule so it does NOT run on every push.  The soak harness lives
-# in `tests/integration/tests/hypertable_harness.rs` and the relevant test
-# functions are `hypertable_1b_row_write_soak` and `hypertable_orm_compat`
-# (both `#[ignore]`d by default; we opt in with `-- --ignored`).
+# in `tests/integration/tests/hypertable_harness.rs`.
+#
+# THE BUG THAT WAS HERE — this workflow ran, nightly, for as long as it has
+# existed, and one of its two steps executed zero tests every single time:
+#
+#   cargo test ... --test hypertable_harness hypertable_orm_compat -- --ignored
+#
+# `--ignored` runs ONLY `#[ignore]`d tests. `hypertable_1b_row_write_soak` is
+# ignored (hypertable_harness.rs:875) so that step was fine; `hypertable_orm_compat`
+# is NOT (it is a plain `#[tokio::test]` at hypertable_harness.rs:674), so the
+# ORM-compat step reported
+#
+#   test result: ok. 0 passed; 0 failed; 0 ignored; 5 filtered out
+#
+# and exited 0 — a green "5.29.F — ORM compat" check that ran nothing. The
+# header comment above claimed "both `#[ignore]`d by default", and the harness
+# file's own doc comment claimed every test in it was ignored; neither was true,
+# which is how it survived. Same defect class as the one
+# `scripts/check-pg-dump-harness.sh` was written for.
+#
+# Both steps now go through `scripts/check-test-executes.sh`, which fails closed
+# on a zero-test run and on a runtime SKIP, so this cannot silently return to
+# verifying nothing.
 #
 # Task wired here:
 #   5.29.F — ORM compat + 1B-row soak slice
@@ -22,7 +42,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-  RUST_TOOLCHAIN: 1.83.0
+  # No RUST_TOOLCHAIN pin: rust-toolchain.toml (channel = "stable") overrides
+  # anything a workflow installs, so the old `RUST_TOOLCHAIN: 1.83.0` named a
+  # toolchain no job ever ran on. See the note in ci.yml.
   # Full debug info for soak runs — OOM risk is lower on larger runners and
   # having line info is valuable for profiling soak failures.
   CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
@@ -37,25 +59,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "ci-hypertable-soak"
 
-      - name: Run hypertable ORM-compat slice (--ignored to opt in)
+      # NO `--ignored` here: hypertable_orm_compat carries no #[ignore], and
+      # `--ignored` would filter it out and run nothing. See the header.
+      - name: Run hypertable ORM-compat slice (fail-closed wrapper)
         run: |
-          cargo test \
+          ./scripts/check-test-executes.sh "5.29.F ORM compat" -- \
             -p basin-integration-tests \
             --test hypertable_harness \
             hypertable_orm_compat \
-            -- --ignored --nocapture
+            -- --nocapture
 
-      - name: Run hypertable 1B-row soak (--ignored to opt in)
+      # `--ignored` IS correct here — hypertable_1b_row_write_soak is
+      # #[ignore]d ("too slow for CI; run manually"). The wrapper asserts it
+      # actually ran, so a future edit that drops the #[ignore] turns this into
+      # a red build rather than a silent zero-test pass.
+      - name: Run hypertable 1B-row soak (--ignored to opt in; fail-closed wrapper)
         run: |
-          cargo test \
+          ./scripts/check-test-executes.sh "5.29.F 1B-row soak" -- \
             -p basin-integration-tests \
             --test hypertable_harness \
             hypertable_1b_row_write_soak \

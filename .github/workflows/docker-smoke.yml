@@ -1,6 +1,21 @@
-# Phase 5.31.A — CI smoke harness for the Basin Docker image.
-# DEPENDENCY: This workflow WILL FAIL until 5.31.B lands the Dockerfile at the
-# repo root. That is the expected "lands red" state for this phase.
+# CI smoke harness for the Basin Docker image (Phase 5.31.A).
+#
+# The Dockerfile it builds landed long ago, so the old "expected to land red"
+# note here is gone. What kept this workflow red instead was a stale toolchain
+# pin — `FROM rust:1.85` against a lockfile whose floor is 1.92 —
+#
+#   error: rustc 1.85.1 is not supported by the following packages:
+#     vortex-error@0.71.0 requires rustc 1.91.0
+#
+# which meant the ONE gate that actually built and ran the server had been
+# failing for so long it read as background noise. The Dockerfile now takes a
+# RUST_VERSION arg, and ci.yml's `msrv-floor` job fails closed if the declared
+# MSRV drifts below the graph again.
+#
+# This is also where docs/tutorial.md is verified: a Basin container is already
+# running here, so tutorial-smoke.sh replays the tutorial's psql steps against
+# it rather than paying for a second engine build (it used to live in
+# tutorial-and-samples.yml, where there was no server and it asserted nothing).
 
 name: Docker Smoke
 
@@ -90,6 +105,23 @@ jobs:
             -e PGDATABASE=basin \
             postgres:16 \
             bash /smoke.sh
+
+      # Replays docs/tutorial.md's psql steps (schema, RLS policies, and the
+      # per-tenant isolation checks under request.jwt.claims) against the same
+      # container. Fails closed: unreachable server, missing tutorial, drifted
+      # tutorial text, or fewer assertions than expected are all red.
+      - name: Verify docs/tutorial.md against the running container
+        if: matrix.platform == 'linux/amd64'
+        run: |
+          docker run --rm \
+            --network host \
+            -v "${{ github.workspace }}:/repo:ro" \
+            -e PGHOST=127.0.0.1 \
+            -e PGPORT=${{ env.BASIN_PORT }} \
+            -e PGUSER=basin \
+            -e PGDATABASE=basin \
+            postgres:16 \
+            bash /repo/tests/integration/scripts/tutorial-smoke.sh
 
       - name: Dump Basin logs on failure
         if: failure() && matrix.platform == 'linux/amd64'

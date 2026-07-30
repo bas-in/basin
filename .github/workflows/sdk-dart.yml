@@ -1,6 +1,17 @@
 name: sdk-dart
 
 # Monorepo port of the old bas-in/basin-dart `test` workflow.
+#
+# THE BUG THAT WAS HERE — `dart test` collected zero of this SDK's 96 tests.
+# package:test only loads files under `test/` whose names end in `_test.dart`;
+# all seven files here were named `test_<area>.dart` (Python's convention, not
+# Dart's), so the runner matched nothing on every run since the SDK landed.
+# `dart analyze` still type-checked them, which is why they stayed compiling and
+# plausible-looking while asserting nothing.
+#
+# The files are renamed to the runner's convention, and the test step below
+# fails closed on a zero-test run so a future file added under the wrong name
+# turns the count red instead of quietly shrinking coverage.
 on:
   push:
     branches: [main, master]
@@ -38,4 +49,36 @@ jobs:
           sdk: stable
       - run: dart pub get
       - run: dart analyze
-      - run: dart test
+      # NOT a bare `dart test`. package:test reports "No tests ran." and exits
+      # 0 when its glob matches nothing, which is exactly how this job stayed
+      # green over 96 uncollected tests. The count is extracted from the
+      # reporter's "+N" and required to be non-zero.
+      - name: test (fail closed on a zero-test run)
+        run: |
+          set -euo pipefail
+          OUT="$(mktemp)"
+          set +e
+          dart test 2>&1 | tee "$OUT"
+          STATUS="${PIPESTATUS[0]}"
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::dart test exited $STATUS"
+            exit 1
+          fi
+          if grep -q 'No tests ran' "$OUT"; then
+            echo "::error::dart test ran no tests. package:test only loads test/*_test.dart — check the filenames."
+            exit 1
+          fi
+          # Ends in `|| true` and is then tested for emptiness: under `set -e` +
+          # `pipefail` a grep matching nothing would kill the step before the
+          # guard meant to report it.
+          COUNT="$(grep -oE '\+[0-9]+' "$OUT" | tail -1 | tr -d '+' || true)"
+          if [ -z "$COUNT" ]; then
+            echo "::error::could not read a test count out of the dart test output — refusing to pass on an unread run."
+            exit 1
+          fi
+          echo "dart test executed $COUNT test(s)"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::dart test executed 0 tests."
+            exit 1
+          fi
