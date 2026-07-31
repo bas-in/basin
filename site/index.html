@@ -147,14 +147,6 @@ code{font-family:var(--font-mono);font-size:.92em}
   transition:color var(--dur-fast) var(--ease-out);
 }
 .nav-links a:hover{color:var(--paper)}
-.vulos-badge{
-  display:inline-flex;align-items:center;gap:var(--space-2);
-  padding:6px 12px;border:var(--hairline-paper);border-radius:var(--radius-pill);
-  font-family:var(--font-mono);font-size:.6875rem;letter-spacing:var(--tracking-mono-wide);
-  text-transform:uppercase;color:rgb(var(--paper-rgb)/.62);
-  transition:border-color var(--dur-fast),color var(--dur-fast);
-}
-.vulos-badge:hover{border-color:var(--basin-teal-3);color:var(--paper)}
 @media(max-width:900px){.nav-links{display:none}}
 
 /* ── Buttons ──────────────────────────────────────────────────────── */
@@ -435,13 +427,12 @@ code{font-family:var(--font-mono);font-size:.92em}
 .footer-col ul{display:flex;flex-direction:column;gap:var(--space-3)}
 .footer-col a{font-size:.875rem;color:rgb(var(--paper-rgb)/.66);transition:color var(--dur-fast)}
 .footer-col a:hover{color:var(--paper)}
-.footer-vulos{
+.footer-suite{
   margin-top:var(--space-10);padding-top:var(--space-7);border-top:var(--hairline-paper);
   display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-4);justify-content:space-between;
 }
-.footer-vulos-note{display:flex;align-items:center;gap:var(--space-3);font-size:.875rem;color:rgb(var(--paper-rgb)/.56);max-width:62ch;line-height:var(--lh-loose)}
-.footer-vulos-note svg{width:20px;height:20px;flex-shrink:0}
-.footer-vulos-note a{color:var(--basin-teal-3);font-weight:var(--weight-semibold)}
+.licence-note{font-size:.875rem;color:rgb(var(--paper-rgb)/.62);margin-top:var(--space-5)}
+.licence-note strong{color:var(--paper);font-weight:var(--weight-semibold)}
 .footer-legal{font-family:var(--font-mono);font-size:.6875rem;color:rgb(var(--paper-rgb)/.34);white-space:nowrap}
 
 /* ── Reveal on scroll ─────────────────────────────────────────────── */
@@ -452,6 +443,17 @@ code{font-family:var(--font-mono);font-size:.92em}
   html{scroll-behavior:auto}
   .btn:hover,.card:hover{transform:none}
 }
+
+  /* ── Vulos suite chrome — identical on every product landing ───────────────
+     Two elements, and only two: a logo-only home button in the top bar, and
+     one line in the footer. Deliberately free of repo variables so the block
+     is byte-identical across the suite and can be diffed as one thing. */
+  .vulos-home { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 9px; flex: 0 0 auto; opacity: .72; transition: opacity .15s ease, transform .15s ease; }
+  .vulos-home:hover, .vulos-home:focus-visible { opacity: 1; transform: translateY(-1px); }
+  .vulos-home img { display: block; width: 22px; height: 22px; border-radius: 6px; }
+  .vulos-foot { display: inline-flex; align-items: center; gap: 9px; font-size: 13.5px; line-height: 1.45; text-decoration: none; color: inherit; opacity: .85; transition: opacity .15s ease; }
+  .vulos-foot:hover { opacity: 1; text-decoration: none; }
+  .vulos-foot img { display: block; width: 18px; height: 18px; border-radius: 5px; flex: 0 0 auto; }
 </style>
 </head>
 <body>
@@ -477,7 +479,9 @@ code{font-family:var(--font-mono);font-size:.92em}
       <a href="./docs.html">Docs</a>
       <a href="https://github.com/vul-os/basin">GitHub</a>
     </nav>
-    <a class="vulos-badge" href="https://vulos.org">Part of VulOS</a>
+    <a class="vulos-home" href="https://vulos.org" target="_blank" rel="noopener" title="Vulos — open, self-hostable software" aria-label="Vulos — open, self-hostable software">
+      <img src="./assets/vulos-logo.png" alt="" width="22" height="22">
+    </a>
   </div>
 </header>
 
@@ -941,6 +945,7 @@ code{font-family:var(--font-mono);font-size:.92em}
         </a>
         <a class="btn btn-outline" href="./docs.html">Documentation</a>
       </div>
+      <p class="reveal licence-note">Licensed <strong>Apache-2.0</strong>. Written in Rust, self-hostable on any S3-compatible bucket.</p>
     </div>
   </section>
 
@@ -961,8 +966,8 @@ code{font-family:var(--font-mono);font-size:.92em}
           Basin
         </a>
         <p>
-          Bucket-native, multi-tenant Postgres alternative. Apache-2.0, written in Rust,
-          self-hostable on any S3-compatible bucket.
+          Bucket-native, multi-tenant Postgres alternative, self-hostable on any
+          S3-compatible bucket.
         </p>
       </div>
 
@@ -997,21 +1002,12 @@ code{font-family:var(--font-mono);font-size:.92em}
       </div>
     </div>
 
-    <div class="footer-vulos">
-      <p class="footer-vulos-note">
-        <svg viewBox="0 0 680 680" aria-hidden="true">
-          <g transform="translate(340,340)" fill="none" stroke="#60999E" stroke-width="56" stroke-linecap="round">
-            <ellipse cx="0" cy="-110" rx="200" ry="44"/>
-            <path d="M -200 -110 Q -200 160, 0 160 Q 200 160, 200 -110"/>
-          </g>
-        </svg>
-        <span>
-          Part of <a href="https://vulos.org">VulOS</a> — the open, self-hostable web OS
-          &amp; app suite. Basin runs standalone and requires nothing else in the suite;
-          being an app the OS can host is an option, never a dependency.
-        </span>
-      </p>
-      <span class="footer-legal">Apache-2.0 · pre-alpha</span>
+    <div class="footer-suite">
+      <a class="vulos-foot" href="https://vulos.org" target="_blank" rel="noopener">
+        <img src="./assets/vulos-logo.png" alt="" width="18" height="18">
+        <span>Part of <strong>Vulos</strong> — open, self-hostable software</span>
+      </a>
+      <span class="footer-legal">pre-alpha</span>
     </div>
   </div>
 </footer>
