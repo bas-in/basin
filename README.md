@@ -1,8 +1,9 @@
+<!-- One asset, both themes: brand/logo.svg is a self-contained tile (ink #0E2A2B
+     ground, bone #FAF7F0 strokes), so it reads on GitHub light and dark alike.
+     Do not add a prefers-color-scheme variant — a second drawing is a second
+     mark, and a second mark drifts. See the Brand section below. -->
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./basin-dark.svg">
-    <img src="brand/logo.svg" alt="Basin" width="96">
-  </picture>
+  <img src="./brand/logo.svg" alt="Basin" width="96" height="96">
 </p>
 
 <h1 align="center">Basin</h1>
@@ -365,7 +366,7 @@ The full capability matrix (with what's planned and what's deferred): [`CAPABILI
 | **5** | Analytical path — single DataFusion engine, Vortex/Parquet pushdown + per-file bloom + catalog pruning, continuous pre-aggregation, `APPROX_COUNT_DISTINCT`/`APPROX_PERCENTILE` UDFs | **v0.1 shipped** |
 | **5.0a** | Vortex storage format — ~1.95× smaller than ZSTD Parquet; `aggregate_full` ~15–40× via catalog-stats metadata path; per-file blooms flip `point_eq` from a loss to a win at every scale | **shipped as the DEFAULT** ([ADR 0015](./docs/decisions/0015-vortex-storage-format.md)), zero-regression vs Parquet baseline. Parquet first-class per-table via `WITH (basin.file_format='parquet')`. HTAP hot-tier ([ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md)) is Phase 5.14.C — closes the residual OLTP point-read and the UPDATE/DELETE write floor. |
 | **5.14** | Durable Basin moat — per-file catalog blooms (shipped), `APPROX_COUNT_DISTINCT` + `APPROX_PERCENTILE` UDFs (shipped), catalog-aware `WindowExec` sort-elision (shipped), **HTAP hot tier on by default (`bed431c`)** — DELETE + UPDATE fast paths default-ON, kill-switch `BASIN_HOTTIER_FASTPATH_DISABLE=1`, merge-on-read via TombstoneFilterExec + UpdateOverlayExec wired in both DataFusion (`HtapUnionTable::scan`) and fast_select paths, gate-matrix locked by 16 tests, C6 differential harness extended with Mode D fastpath-on, TxCommit WAL marker (ADR 0020 §6) emitted explicitly with backward-compat replay. The 3-month investment that is **not** subsumed by upstream Vortex / DataFusion improvements. | **shipped** |
-| **5.15** | Unified docs platform — OSS-repo markdown with YAML frontmatter ([spec](./docs/frontmatter-spec.md)), `basin-cloud` webapp consumes via `npm run dev:docs` build-time fetch | **OSS side shipped** (5.15.A/B/C, frontmatter spec + 24-doc migration + top-level index + CI gate); `basin-cloud` webapp side (5.15.E–I) deferred to that repo |
+| **5.15** | Unified docs platform — OSS-repo markdown with YAML frontmatter ([spec](./docs/frontmatter-spec.md)) that a downstream docs site can fetch at build time | **shipped** (5.15.A/B/C, frontmatter spec + 24-doc migration + top-level index + CI gate). The docs *site* that consumes this feed is not part of this repo and is out of scope here |
 | **5.5** | Sharding axes — partitioning, compute sharding, tiered storage | **shipped** |
 | **5.6** | RLS with `CREATE POLICY` (UNION / CTE coverage) | **shipped** |
 | **5.7** | Caches + bloom + A4 catalog stats + B1 secondary B-tree indexes + B2 cluster-by + B3 row-group sizing | **shipped**; the per-row-group GIN-on-tsvector (`@@`, 5.20.E) and GIN-on-jsonb (`@>`) read-path wiring has since shipped too |
@@ -439,17 +440,12 @@ Per the ADRs:
 ## Ecosystem
 
 Basin (this repo) is the data plane, and since the SDKs and the CLI were
-merged in it is also the monorepo for everything that talks to it. One
-sibling repo remains outside:
+merged in it is also the monorepo for everything that talks to it:
 
-- **[`vul-os/basin-cloud`](https://github.com/vul-os/basin-cloud)** — control plane and dashboard (Rust axum + sqlx backend + React/Vite SPA, Apache-2.0). Manages orgs, projects, billing; runs Basin engines on Fly Machines per project. Operators who want a managed UI use it. Operators running a single self-hosted engine do not — basin-server alone is sufficient. **The only component still in its own repo.**
+- **[`cli/`](./cli)** — operator daily-driver (Rust, Apache-2.0). `basin login`, `basin projects list`, `basin sql run`, release artefacts Sigstore-signed. Talks to a control-plane `/v1/*` API endpoint. Includes the `basin dev` local-stack launcher. Builds independently of the engine workspace.
+- **[`sdks/`](./sdks)** — ten engine-direct client SDKs (MIT), all speaking pgwire + REST straight to a Basin engine, with no control plane on the data path: [`js`](./sdks/js) (browser, Node, Deno, Bun, Workers; realtime + Arrow IPC), [`py`](./sdks/py) (async + sync, realtime + Arrow via pyarrow), [`go`](./sdks/go) (Arrow IPC), [`java`](./sdks/java), [`rust`](./sdks/rust), [`ruby`](./sdks/ruby), [`dotnet`](./sdks/dotnet), [`php`](./sdks/php), [`dart`](./sdks/dart), [`swift`](./sdks/swift).
 
-In this repo, alongside the engine:
-
-- **[`cli/`](./cli)** — operator daily-driver (Rust, Apache-2.0). `basin login`, `basin projects list`, `basin sql run`, release artefacts Sigstore-signed. Talks to basin-cloud's `/v1/*` API. Includes the `basin dev` local-stack launcher. Builds independently of the engine workspace.
-- **[`sdks/`](./sdks)** — ten engine-direct client SDKs (MIT), all speaking pgwire + REST straight to a Basin engine rather than through basin-cloud: [`js`](./sdks/js) (browser, Node, Deno, Bun, Workers; realtime + Arrow IPC), [`py`](./sdks/py) (async + sync, realtime + Arrow via pyarrow), [`go`](./sdks/go) (Arrow IPC), [`java`](./sdks/java), [`rust`](./sdks/rust), [`ruby`](./sdks/ruby), [`dotnet`](./sdks/dotnet), [`php`](./sdks/php), [`dart`](./sdks/dart), [`swift`](./sdks/swift).
-
-**Licensing rationale.** Server-side projects (basin engine, basin-cloud, the CLI) are Apache-2.0 to carry the patent grant operators expect from infrastructure. All ten client SDKs are MIT to match the norm of the SDK ecosystems they sit in.
+**Licensing rationale.** Server-side projects (the Basin engine and the CLI) are Apache-2.0 to carry the patent grant operators expect from infrastructure. All ten client SDKs are MIT to match the norm of the SDK ecosystems they sit in.
 
 ---
 
