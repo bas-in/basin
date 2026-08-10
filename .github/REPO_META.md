@@ -52,6 +52,7 @@ unset OR point at the rendered benchmark dashboard:
 
 ## Social preview image
 
-Use `basin.svg` (already at repo root) rendered at 1280×640. The
-existing svg works as the social card; rasterize with `rsvg-convert` /
-`inkscape` or just upload the svg through GitHub's image picker.
+Use `brand/logo.svg` rendered at 1280×640. `brand/logo.png` is the
+512×512 raster derived from it if you want a bitmap without rendering.
+Rasterize with `rsvg-convert` / `inkscape`, or upload the svg through
+GitHub's image picker.
