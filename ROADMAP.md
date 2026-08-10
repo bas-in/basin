@@ -1,7 +1,7 @@
 # Roadmap
 
 **Basin is pre-alpha.** There has been no v0.1 release. The tags that exist
-(`v0.1.1` … `v0.1.9`) are development snapshots, not a stable line — the
+(`v0.1.1` … `v0.1.10`) are development snapshots, not a stable line — the
 pre-1.0 contract is that minor versions can break the public API and patch
 versions are bug-fix only. Use Basin today to evaluate the cost economics,
 to prototype multi-tenant patterns, or to contribute; do not put a business

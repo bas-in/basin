@@ -36,7 +36,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 # The floor the resolved dependency graph actually imposes, not an aspiration.
 # cranelift-* 0.134 (wasmtime 47, via basin-fn) declares rust-version 1.94 and

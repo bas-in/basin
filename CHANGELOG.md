@@ -8,7 +8,7 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
-## [Unreleased]
+## [0.1.10] - 2026-08-10
 
 Every wave of work since v0.1.9, newest first. Each line is the entry's own
 headline; the full write-up for each is in the engineering-log section that

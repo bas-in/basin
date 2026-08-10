@@ -466,8 +466,8 @@ workflow's OIDC identity (no long-lived signing key exists, and none should).
 internet:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/vul-os/basin/v0.1.9/scripts/verify.sh
-bash verify.sh --tag v0.1.9 --attest basin-0.1.9-x86_64-unknown-linux-gnu.tar.gz
+curl -fsSLO https://raw.githubusercontent.com/vul-os/basin/v0.1.10/scripts/verify.sh
+bash verify.sh --tag v0.1.10 --attest basin-0.1.10-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 It fetches the manifest, looks up the **exact** entry for the asset you named,
