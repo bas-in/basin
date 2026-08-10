@@ -90,7 +90,7 @@ neither is installed, the TOML is silently skipped and env vars are used.
 ```sh
 export NEON_DATABASE_URL='postgres://user:pass@ep-xxx.eu-central-1.aws.neon.tech/neondb'
 export SUPABASE_DATABASE_URL='postgres://postgres:pass@db.xxx.supabase.co:5432/postgres'
-export BASIN_DATABASE_URL='postgres://user:pass@basin-cloud-fra.fly.dev:5432/db'
+export BASIN_DATABASE_URL='postgres://user:pass@basin-engine-fra.fly.dev:5432/db'
 export REGION_LABEL=fra
 ```
 
@@ -248,19 +248,13 @@ This writes:
 open benchmark/index_three_way.html
 ```
 
-### Step 3 — mirror to basin-cloud (cloud landing page)
+### Step 3 — mirror to a site that renders the results
 
-The basin-cloud `public/benchmarks/data_three_way/` directory is a target for
-the `copy-benchmark-data.mjs` script.  After the OSS bundle step, run:
-
-```sh
-cd ../basin-cloud
-node scripts/copy-benchmark-data.mjs
-```
-
-This mirrors the JSON (including `compare_three_way_fra.json` and `manifest.json`)
-from `basin/benchmark/data_three_way/` to
-`basin-cloud/public/benchmarks/data_three_way/`.  The landing page's benchmark
+A downstream site can mirror the bundled JSON into its own
+`public/benchmarks/data_three_way/` directory — that mirroring step lives in
+the site's repo, not here.  It copies the JSON (including
+`compare_three_way_fra.json` and `manifest.json`) out of
+`basin/benchmark/data_three_way/`.  The landing page's benchmark
 selector will then show the "3-way Frankfurt" option; it is **hidden** when the
 directory is empty (the `.gitkeep` placeholder does not trigger the selector).
 

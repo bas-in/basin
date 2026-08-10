@@ -154,7 +154,7 @@ Winner (p50): **{{WINNER_Q3_P50}}**
 ```sh
 export NEON_DATABASE_URL='postgres://user:pass@ep-xxx.eu-central-1.aws.neon.tech/neondb'
 export SUPABASE_DATABASE_URL='postgres://postgres:pass@db.xxx.supabase.co:5432/postgres'
-export BASIN_DATABASE_URL='postgres://user:pass@basin-cloud-fra.example.com:5432/db'
+export BASIN_DATABASE_URL='postgres://user:pass@basin-engine-fra.example.com:5432/db'
 export REGION_LABEL=fra
 export ROW_COUNT=100000
 export ITERATIONS=10
