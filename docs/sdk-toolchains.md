@@ -7,7 +7,7 @@ summary: "Which SDK toolchains are installed locally versus validated only in CI
 
 # SDK toolchain coverage & local validation status
 
-Basin ships ten client SDKs (`sdk/`). They are validated in two places: a
+Basin ships ten client SDKs (`sdks/`). They are validated in two places: a
 developer's local box and CI. **Not every SDK's toolchain is installed on every
 box**, so some SDK changes are validated by *building and running their tests*
 locally while others are only *reviewed by inspection* locally and must rely on
