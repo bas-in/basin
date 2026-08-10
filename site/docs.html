@@ -4,14 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Basin — documentation</title>
-<meta name="description" content="Documentation for Basin: quickstart, architecture, SQL compatibility, multi-project isolation, client SDKs, and operations. Postgres-compatible, bucket-native, Apache-2.0.">
+<meta name="description" content="Field guide to Basin: install and run, connect, the SQL surface, projects as bucket prefixes, storage format, the batteries in the binary, client SDKs, configuration and operations. Postgres-compatible, bucket-native, Apache-2.0.">
 <link rel="canonical" href="https://vulos.org/projects/basin/docs.html">
 <meta name="color-scheme" content="dark light">
 <link rel="icon" href="./assets/brand/favicon.svg">
+<meta name="theme-color" content="#FAF7F0" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0F1115" media="(prefers-color-scheme: dark)">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Basin">
 <meta property="og:title" content="Basin — documentation">
-<meta property="og:description" content="Quickstart, architecture, SQL compatibility, SDKs and operations for Basin.">
+<meta property="og:description" content="Install, connect, SQL surface, storage format, batteries, SDKs and operations for Basin.">
 <meta property="og:url" content="https://vulos.org/projects/basin/docs.html">
 <meta property="og:image" content="https://vulos.org/projects/basin/assets/og-card.png">
 <meta property="og:image:type" content="image/png">
@@ -20,12 +22,29 @@
 <meta property="og:image:alt" content="Basin — a Postgres-compatible database that lives on object storage.">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Basin — documentation">
-<meta name="twitter:description" content="Quickstart, architecture, SQL compatibility, SDKs and operations for Basin.">
+<meta name="twitter:description" content="Install, connect, SQL surface, storage format, batteries, SDKs and operations for Basin.">
 <meta name="twitter:image" content="https://vulos.org/projects/basin/assets/og-card.png">
+<script>try{var t=localStorage.getItem('basin-theme');if(t)document.documentElement.dataset.theme=t;}catch(e){}</script>
 <style>
-/* Same survey system as landing.html — kept inline so this page stands
-   alone when opened directly rather than through the vulos.org frame. */
+/* ─────────────────────────────────────────────────────────────────────
+   Basin documentation — the survey sheet.
+
+   Same conceit as the landing: a USGS topographic survey. Contour
+   isolines behind the rail head, elevation tags on the section rules,
+   monospace field labels. Dark is the ink ground; light is the paper the
+   sheet was actually printed on, so both schemes are first-class rather
+   than one being an afterthought.
+
+   Layout is a FIXED left rail plus a flowing content column. Fixed, not
+   sticky, deliberately: position:sticky silently degrades the moment any
+   ancestor becomes a scroll container, and the usual way that happens is
+   someone setting overflow-x:hidden on html or body — which forces
+   overflow-y:auto. overflow-x:clip below is the sideways-bleed guard that
+   does NOT create a scroll container.
+   ───────────────────────────────────────────────────────────────────── */
+
 :root{
+  /* ── Ink ground (default) ───────────────────────────────────────── */
   --ink:#0F1115; --ink-2:#16191F; --ink-3:#1E2229;
   --paper:#FAF7F0; --paper-2:#F2EDE2; --paper-3:#E8E1D0;
   --basin-teal:#3B6F73; --basin-teal-2:#4F858A; --basin-teal-3:#60999E;
@@ -40,484 +59,2154 @@
   --sediment-ochre-rgb:196 115 43;
   --graphite-rgb:92 92 92;
 
+  /* Semantic surfaces — these are what components reference, so the
+     light scheme only has to redefine this short block. */
+  --bg:var(--ink);
+  --bg-rail:#12151A;
+  --bg-panel:var(--ink-2);
+  --bg-code:#101319;
+  --bg-inset:rgb(var(--paper-rgb)/.035);
+  --fg:var(--paper);
+  --fg-2:rgb(var(--paper-rgb)/.72);
+  --fg-3:rgb(var(--paper-rgb)/.52);
+  --fg-4:rgb(var(--paper-rgb)/.36);
+  --line:rgb(var(--paper-rgb)/.11);
+  --line-2:rgb(var(--paper-rgb)/.20);
+  --accent:var(--basin-teal-3);
+  --accent-2:var(--sediment-ochre-2);
+  --accent-soft:rgb(var(--basin-teal-rgb)/.16);
+  --contour:rgb(var(--paper-rgb)/.055);
+  --shadow:0 18px 44px -22px rgb(0 0 0/.75);
+  --code-shadow:inset 0 1px 0 rgb(var(--paper-rgb)/.04);
+  --ok:#8FB59B; --bad:#E07A62;
+
+  /* highlight.js palette — ink ground */
+  --hl-comment:#6C7580;
+  --hl-keyword:#DA8638;
+  --hl-string:#8FB59B;
+  --hl-number:#E2B87A;
+  --hl-attr:#79B4B9;
+  --hl-title:#EBD9BF;
+  --hl-meta:#8FA2AE;
+  --hl-punct:rgb(var(--paper-rgb)/.60);
+  --hl-add:#93E6A0; --hl-add-bg:rgb(110 220 140/.13);
+  --hl-del:#F5947C; --hl-del-bg:rgb(240 120 90/.13);
+
   --font-display:"Inter Display","Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
   --font-body:"Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
   --font-mono:"JetBrains Mono","IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
 
   --weight-medium:500; --weight-semibold:600; --weight-bold:700; --weight-black:900;
-  --lh-base:1.5; --lh-loose:1.7;
   --tracking-tight:-.02em; --tracking-tighter:-.035em;
   --tracking-mono-wide:.06em; --tracking-mono-wider:.14em;
 
-  --space-1:4px;  --space-2:8px;   --space-3:12px; --space-4:16px;
-  --space-5:20px; --space-6:24px;  --space-7:32px; --space-8:40px;
-  --space-9:48px; --space-10:64px; --space-11:80px; --space-12:96px;
-
-  --container:1200px; --container-wide:1440px;
-  --side-pad:clamp(20px,4vw,56px);
-  --radius-2:4px; --radius-3:8px; --radius-pill:999px;
-  --hairline:1px solid rgb(var(--graphite-rgb)/.22);
-  --hairline-paper:1px solid rgb(var(--paper-rgb)/.14);
+  --rail:288px;
+  --radius-2:4px; --radius-3:8px; --radius-4:12px; --radius-pill:999px;
   --ease-out:cubic-bezier(.2,.7,.2,1);
   --dur-fast:140ms; --dur-base:240ms;
-  --focus-ring:0 0 0 3px rgb(var(--basin-teal-rgb)/.45);
+  --focus-ring:0 0 0 3px rgb(var(--basin-teal-rgb)/.55);
 }
+
+/* ── Paper ground. The media block comes after the base block, and the
+   explicit [data-theme] block after that, so source order — not
+   specificity — decides. A media query adds ZERO specificity; relying on
+   it to "win" is the classic way these pages break. ──────────────── */
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]){
+    --bg:#FBF8F1;
+    --bg-rail:#F3EEE2;
+    --bg-panel:#FFFDF8;
+    --bg-code:#26221C;
+    --bg-inset:rgb(var(--ink-rgb)/.035);
+    --fg:#14161B;
+    --fg-2:rgb(var(--ink-rgb)/.76);
+    --fg-3:rgb(var(--ink-rgb)/.58);
+    --fg-4:rgb(var(--ink-rgb)/.42);
+    --line:rgb(var(--ink-rgb)/.13);
+    --line-2:rgb(var(--ink-rgb)/.24);
+    --accent:var(--basin-teal-deep);
+    --accent-2:#9C5417;
+    --accent-soft:rgb(var(--basin-teal-rgb)/.13);
+    --contour:rgb(var(--basin-teal-rgb)/.10);
+    --shadow:0 14px 34px -20px rgb(40 30 15/.34);
+    --code-shadow:none;
+    --ok:#2E6B47; --bad:#A5361C;
+  }
+}
+:root[data-theme="light"]{
+  --bg:#FBF8F1;
+  --bg-rail:#F3EEE2;
+  --bg-panel:#FFFDF8;
+  --bg-code:#26221C;
+  --bg-inset:rgb(var(--ink-rgb)/.035);
+  --fg:#14161B;
+  --fg-2:rgb(var(--ink-rgb)/.76);
+  --fg-3:rgb(var(--ink-rgb)/.58);
+  --fg-4:rgb(var(--ink-rgb)/.42);
+  --line:rgb(var(--ink-rgb)/.13);
+  --line-2:rgb(var(--ink-rgb)/.24);
+  --accent:var(--basin-teal-deep);
+  --accent-2:#9C5417;
+  --accent-soft:rgb(var(--basin-teal-rgb)/.13);
+  --contour:rgb(var(--basin-teal-rgb)/.10);
+  --shadow:0 14px 34px -20px rgb(40 30 15/.34);
+  --code-shadow:none;
+  --ok:#2E6B47; --bad:#A5361C;
+}
+
 *,*::before,*::after{box-sizing:border-box}
-html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
-body{margin:0;background:var(--ink);color:var(--paper);font-family:var(--font-body);font-size:16px;line-height:var(--lh-base);-webkit-font-smoothing:antialiased}
-svg{max-width:100%;display:block}
+html{
+  -webkit-text-size-adjust:100%;
+  scroll-behavior:smooth;
+  scroll-padding-top:28px;
+  /* clip, never hidden — hidden would make html a scroll container */
+  overflow-x:clip;
+}
+body{
+  margin:0;background:var(--bg);color:var(--fg);
+  font-family:var(--font-body);font-size:16px;line-height:1.5;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+  overflow-x:clip;
+}
+img,svg{max-width:100%;height:auto;display:block}
 a{color:inherit;text-decoration:none}
-h1,h2,h3{margin:0;font-family:var(--font-display);letter-spacing:var(--tracking-tighter);line-height:1.08}
+h1,h2,h3,h4{margin:0;font-family:var(--font-display);letter-spacing:var(--tracking-tighter);line-height:1.12}
 p{margin:0}
-ul{margin:0;padding:0;list-style:none}
-code{font-family:var(--font-mono);font-size:.92em}
+ul,ol{margin:0;padding:0}
+code{font-family:var(--font-mono);font-size:.9em}
 :focus-visible{outline:none;box-shadow:var(--focus-ring);border-radius:var(--radius-2)}
 
-.container{max-width:var(--container);margin:0 auto;padding-inline:var(--side-pad)}
-.container-wide{max-width:var(--container-wide);margin:0 auto;padding-inline:var(--side-pad)}
-.mono{font-family:var(--font-mono)}
-.display{font-family:var(--font-display);font-weight:var(--weight-black)}
-
-.eyebrow{
-  display:inline-flex;align-items:center;gap:var(--space-2);
-  font-family:var(--font-mono);font-size:.6875rem;font-weight:var(--weight-medium);
-  letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;color:var(--basin-teal-3);
+/* ── Reading progress ─────────────────────────────────────────────── */
+#progress{
+  position:fixed;top:0;left:0;height:2px;width:0;z-index:80;
+  background:linear-gradient(90deg,var(--basin-teal),var(--sediment-ochre));
+  transition:width 90ms linear;pointer-events:none;
 }
-.eyebrow::before{content:"";width:18px;height:1px;background:var(--basin-teal);display:inline-block}
 
-/* Header — identical to the landing so the two read as one site. */
-.site-header{position:sticky;top:0;z-index:50;background:rgb(var(--ink-rgb)/.78);backdrop-filter:blur(14px);border-bottom:var(--hairline-paper)}
-.nav{display:flex;align-items:center;gap:var(--space-6);height:64px}
-.brand{display:flex;align-items:center;gap:10px;font-family:var(--font-display);font-weight:var(--weight-black);font-size:1.125rem;letter-spacing:var(--tracking-tighter)}
-.brand svg{width:26px;height:26px}
-.nav-spacer{flex:1}
-.nav-links{display:flex;align-items:center;gap:var(--space-6)}
-.nav-links a{font-size:.875rem;font-weight:var(--weight-medium);color:rgb(var(--paper-rgb)/.6);transition:color var(--dur-fast) var(--ease-out)}
-.nav-links a:hover,.nav-links a[aria-current="page"]{color:var(--paper)}
-.vulos-badge{
-  display:inline-flex;align-items:center;gap:var(--space-2);padding:6px 12px;
-  border:var(--hairline-paper);border-radius:var(--radius-pill);
+/* ── Fixed rail ───────────────────────────────────────────────────── */
+.rail{
+  position:fixed;top:0;left:0;bottom:0;width:var(--rail);z-index:60;
+  display:flex;flex-direction:column;
+  background:var(--bg-rail);border-right:1px solid var(--line);
+}
+.rail-head{position:relative;padding:22px 22px 16px;border-bottom:1px solid var(--line);overflow:hidden;flex:0 0 auto}
+.rail-head .contours{position:absolute;inset:-30% -20% auto -20%;height:220px;opacity:1;pointer-events:none}
+.rail-head .contours path{fill:none;stroke:var(--contour);stroke-width:1.1}
+.mark{position:relative;display:flex;align-items:center;gap:11px}
+.mark svg.glyph{width:30px;height:30px;flex:0 0 auto}
+.mark .name{font-family:var(--font-display);font-weight:var(--weight-black);font-size:1.2rem;letter-spacing:var(--tracking-tighter)}
+.mark .kind{
+  display:block;font-family:var(--font-mono);font-size:.5625rem;font-weight:var(--weight-medium);
+  letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;color:var(--fg-4);margin-top:2px;
+}
+.rail-meta{position:relative;display:flex;gap:6px;flex-wrap:wrap;margin-top:14px}
+.tag{
+  font-family:var(--font-mono);font-size:.5625rem;letter-spacing:var(--tracking-mono-wide);
+  text-transform:uppercase;padding:3px 7px;border-radius:var(--radius-pill);
+  border:1px solid var(--line-2);color:var(--fg-3);white-space:nowrap;
+}
+.tag.on{border-color:rgb(var(--sediment-ochre-rgb)/.5);color:var(--accent-2)}
+
+.rail-filter{position:relative;padding:12px 16px;border-bottom:1px solid var(--line);flex:0 0 auto}
+.rail-filter input{
+  width:100%;font:inherit;font-size:.8125rem;color:var(--fg);
+  background:var(--bg-inset);border:1px solid var(--line);border-radius:var(--radius-3);
+  padding:8px 10px 8px 30px;
+}
+.rail-filter input::placeholder{color:var(--fg-4)}
+.rail-filter svg{position:absolute;left:26px;top:50%;transform:translateY(-50%);width:14px;height:14px;stroke:var(--fg-4);fill:none;stroke-width:1.8}
+
+.rail-nav{flex:1 1 auto;overflow-y:auto;padding:14px 12px 4px;scrollbar-width:thin;min-height:0}
+.rail-nav .grp{
+  font-family:var(--font-mono);font-size:.5625rem;letter-spacing:var(--tracking-mono-wider);
+  text-transform:uppercase;color:var(--fg-4);padding:14px 10px 6px;
+}
+.rail-nav .grp:first-child{padding-top:2px}
+.rail-nav a{
+  display:block;position:relative;font-size:.8125rem;line-height:1.35;color:var(--fg-3);
+  padding:6px 10px 6px 13px;border-radius:var(--radius-2);
+  transition:color var(--dur-fast) var(--ease-out),background var(--dur-fast) var(--ease-out);
+}
+.rail-nav a::before{
+  content:"";position:absolute;left:2px;top:50%;transform:translateY(-50%);
+  width:2px;height:0;border-radius:2px;background:var(--accent);
+  transition:height var(--dur-base) var(--ease-out);
+}
+.rail-nav a:hover{color:var(--fg);background:var(--bg-inset)}
+.rail-nav a.on{color:var(--fg);font-weight:var(--weight-semibold);background:var(--accent-soft)}
+.rail-nav a.on::before{height:16px}
+.rail-nav a.hide{display:none}
+.rail-nav .grp.hide{display:none}
+.rail-nav .no-hit{display:none;padding:10px;font-size:.8125rem;color:var(--fg-4)}
+.rail-nav .no-hit.show{display:block}
+
+.rail-foot{
+  flex:0 0 auto;display:flex;align-items:center;gap:10px;
+  padding:12px 16px;border-top:1px solid var(--line);
+}
+.rail-foot .spacer{flex:1}
+.icon-btn{
+  display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;
+  border-radius:var(--radius-3);border:1px solid var(--line);background:transparent;
+  color:var(--fg-3);cursor:pointer;transition:color var(--dur-fast),border-color var(--dur-fast);
+}
+.icon-btn:hover{color:var(--fg);border-color:var(--line-2)}
+.icon-btn svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.rail-foot a.txt{font-size:.75rem;color:var(--fg-3);transition:color var(--dur-fast)}
+.rail-foot a.txt:hover{color:var(--fg)}
+
+/* Theme glyph swap — attribute rules last so a forced theme always wins */
+.moon{display:block}.sun{display:none}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]) .moon{display:none}
+  :root:not([data-theme="dark"]) .sun{display:block}
+}
+:root[data-theme="light"] .moon{display:none}
+:root[data-theme="light"] .sun{display:block}
+:root[data-theme="dark"] .moon{display:block}
+:root[data-theme="dark"] .sun{display:none}
+
+/* ── Rail drawer toggle (narrow only) ─────────────────────────────── */
+.rail-toggle{
+  display:none;position:fixed;left:14px;top:14px;z-index:70;
+  align-items:center;gap:8px;height:40px;padding:0 14px;
+  border-radius:var(--radius-pill);border:1px solid var(--line-2);
+  background:var(--bg-panel);color:var(--fg);cursor:pointer;
   font-family:var(--font-mono);font-size:.6875rem;letter-spacing:var(--tracking-mono-wide);
-  text-transform:uppercase;color:rgb(var(--paper-rgb)/.62);
-  transition:border-color var(--dur-fast),color var(--dur-fast);
+  text-transform:uppercase;box-shadow:var(--shadow);
 }
-.vulos-badge:hover{border-color:var(--basin-teal-3);color:var(--paper)}
-@media(max-width:900px){.nav-links{display:none}}
+.rail-toggle svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round}
+.scrim{display:none;position:fixed;inset:0;z-index:55;background:rgb(0 0 0/.5);backdrop-filter:blur(2px)}
+.scrim.on{display:block}
 
-/* Masthead */
-.docs-head{padding-block:var(--space-11) var(--space-9);border-bottom:var(--hairline-paper);background:var(--ink-2)}
-.docs-head h1{font-size:clamp(32px,4.6vw,56px);margin:var(--space-4) 0}
-.docs-head p{color:rgb(var(--paper-rgb)/.64);font-size:1.0625rem;line-height:var(--lh-loose);max-width:64ch}
+/* ── Content ──────────────────────────────────────────────────────── */
+.main{margin-left:var(--rail);min-width:0}
+.wrap{max-width:920px;margin:0 auto;padding:0 clamp(20px,4.2vw,64px) 96px;min-width:0}
 
-/* Layout: sticky rail + content */
-.docs-layout{display:grid;grid-template-columns:minmax(0,220px) minmax(0,1fr);gap:clamp(32px,5vw,72px);padding-block:var(--space-10) var(--space-12)}
-@media(max-width:900px){.docs-layout{grid-template-columns:1fr;gap:var(--space-8)}}
-.docs-rail{position:sticky;top:88px;align-self:start}
-@media(max-width:900px){.docs-rail{position:static}}
-.docs-rail h2{
-  font-family:var(--font-mono);font-size:.625rem;letter-spacing:var(--tracking-mono-wider);
-  text-transform:uppercase;color:rgb(var(--paper-rgb)/.4);margin-bottom:var(--space-4);font-weight:var(--weight-medium);
+.masthead{padding:clamp(48px,7vw,84px) 0 clamp(28px,3.5vw,40px);border-bottom:1px solid var(--line)}
+.eyebrow{
+  display:inline-flex;align-items:center;gap:8px;
+  font-family:var(--font-mono);font-size:.625rem;font-weight:var(--weight-medium);
+  letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;color:var(--accent);
 }
-.docs-rail ul{display:flex;flex-direction:column;gap:var(--space-3)}
-.docs-rail a{font-size:.875rem;color:rgb(var(--paper-rgb)/.62);transition:color var(--dur-fast)}
-.docs-rail a:hover{color:var(--basin-teal-3)}
+.eyebrow::before{content:"";width:18px;height:1px;background:currentColor;display:inline-block;flex:0 0 auto}
+.masthead h1{font-size:clamp(34px,5.2vw,56px);margin:16px 0 18px}
+.masthead .lede{color:var(--fg-2);font-size:1.0625rem;line-height:1.7;max-width:62ch}
+.masthead .lede strong{color:var(--fg)}
 
-.docs-section{margin-bottom:var(--space-12);scroll-margin-top:88px}
-.docs-section:last-child{margin-bottom:0}
-.docs-section>h2{font-size:clamp(24px,2.6vw,34px);margin:var(--space-3) 0 var(--space-4)}
-.docs-section>p{color:rgb(var(--paper-rgb)/.66);font-size:.9875rem;line-height:var(--lh-loose);max-width:70ch;margin-bottom:var(--space-6)}
-.docs-section>p code{color:var(--sediment-ochre-2)}
+.quickbar{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+.quickbar a{
+  display:inline-flex;align-items:center;gap:7px;padding:7px 13px;border-radius:var(--radius-pill);
+  border:1px solid var(--line-2);font-size:.8125rem;color:var(--fg-2);
+  transition:border-color var(--dur-fast),color var(--dur-fast),background var(--dur-fast);
+}
+.quickbar a:hover{border-color:var(--accent);color:var(--fg);background:var(--accent-soft)}
+.quickbar a .n{font-family:var(--font-mono);font-size:.625rem;color:var(--fg-4);letter-spacing:var(--tracking-mono-wide)}
 
-/* Link cards */
-.doc-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--space-4)}
-@media(max-width:700px){.doc-list{grid-template-columns:1fr}}
-.doc-card{
-  display:block;padding:var(--space-5);border:var(--hairline);border-radius:var(--radius-3);
-  background:var(--ink-2);
+section.doc{padding-block:clamp(40px,5vw,60px);border-bottom:1px solid var(--line);scroll-margin-top:24px}
+section.doc:last-of-type{border-bottom:0}
+section.doc>h2{font-size:clamp(25px,3.1vw,34px);margin:14px 0 18px;scroll-margin-top:24px}
+section.doc h3{
+  font-size:1.0625rem;margin:34px 0 12px;letter-spacing:var(--tracking-tight);
+  font-weight:var(--weight-bold);
+}
+section.doc h3:first-of-type{margin-top:26px}
+section.doc p{color:var(--fg-2);font-size:1rem;line-height:1.75;max-width:70ch;margin-bottom:16px}
+section.doc p:last-child{margin-bottom:0}
+section.doc p code,section.doc li code,td code,th code{
+  background:var(--bg-inset);border:1px solid var(--line);border-radius:var(--radius-2);
+  padding:1px 5px;color:var(--accent-2);white-space:nowrap;
+}
+section.doc a.link{color:var(--accent);text-decoration:underline;text-underline-offset:3px;text-decoration-thickness:1px;text-decoration-color:var(--accent-soft)}
+section.doc a.link:hover{text-decoration-color:currentColor}
+section.doc strong{color:var(--fg);font-weight:var(--weight-semibold)}
+
+ul.bullets{list-style:none;margin:0 0 18px;max-width:70ch}
+ul.bullets li{position:relative;padding-left:20px;margin-bottom:9px;color:var(--fg-2);line-height:1.7;font-size:.9688rem}
+ul.bullets li::before{content:"";position:absolute;left:2px;top:.68em;width:7px;height:1px;background:var(--accent)}
+ul.bullets li:last-child{margin-bottom:0}
+
+/* ── Code ─────────────────────────────────────────────────────────── */
+.codeblock{
+  position:relative;margin:0 0 20px;border:1px solid var(--line);border-radius:var(--radius-4);
+  background:var(--bg-code);overflow:hidden;box-shadow:var(--code-shadow);
+}
+.codeblock .bar{
+  display:flex;align-items:center;gap:10px;padding:7px 12px 7px 14px;
+  border-bottom:1px solid rgb(250 247 240/.09);background:rgb(250 247 240/.03);
+}
+.codeblock .lang{
+  font-family:var(--font-mono);font-size:.5625rem;letter-spacing:var(--tracking-mono-wider);
+  text-transform:uppercase;color:rgb(250 247 240/.45);
+}
+.codeblock .cap{font-family:var(--font-mono);font-size:.625rem;color:rgb(250 247 240/.34);letter-spacing:.02em;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.codeblock .bar .spacer{flex:1}
+.copy{
+  border:1px solid rgb(250 247 240/.14);background:transparent;color:rgb(250 247 240/.5);
+  font-family:var(--font-mono);font-size:.5625rem;letter-spacing:var(--tracking-mono-wide);
+  text-transform:uppercase;padding:3px 8px;border-radius:var(--radius-2);cursor:pointer;
+  transition:color var(--dur-fast),border-color var(--dur-fast);flex:0 0 auto;
+}
+.copy:hover{color:#FAF7F0;border-color:rgb(250 247 240/.36)}
+.copy.done{color:var(--moss);border-color:rgb(143 181 155/.5)}
+.codeblock pre{margin:0;padding:15px 18px;overflow-x:auto;min-width:0}
+.codeblock code{
+  font-family:var(--font-mono);font-size:.8125rem;line-height:1.72;
+  color:rgb(250 247 240/.88);display:block;white-space:pre;
+}
+
+.hljs-comment,.hljs-quote{color:var(--hl-comment);font-style:italic}
+.hljs-keyword,.hljs-selector-tag,.hljs-literal,.hljs-section,.hljs-doctag,.hljs-name,.hljs-tag,.hljs-type,.hljs-built_in{color:var(--hl-keyword)}
+.hljs-string,.hljs-regexp,.hljs-symbol,.hljs-addition{color:var(--hl-string)}
+.hljs-number,.hljs-bullet,.hljs-char.escape_{color:var(--hl-number)}
+.hljs-attr,.hljs-attribute,.hljs-property,.hljs-variable,.hljs-template-variable,.hljs-selector-attr,.hljs-selector-id,.hljs-selector-class{color:var(--hl-attr)}
+.hljs-title,.hljs-title.class_,.hljs-title.function_,.hljs-function{color:var(--hl-title)}
+.hljs-meta,.hljs-meta .hljs-keyword,.hljs-meta .hljs-string{color:var(--hl-meta)}
+.hljs-punctuation,.hljs-operator,.hljs-params,.hljs-subst{color:var(--hl-punct)}
+.hljs-link{color:var(--hl-attr);text-decoration:underline}
+.hljs-addition{color:var(--hl-add);background:var(--hl-add-bg);display:inline-block;width:100%}
+.hljs-deletion{color:var(--hl-del);background:var(--hl-del-bg);display:inline-block;width:100%}
+.hljs-emphasis{font-style:italic}
+.hljs-strong{font-weight:600}
+
+/* ── Tables ───────────────────────────────────────────────────────── */
+.table-wrap{overflow-x:auto;margin:0 0 20px;border:1px solid var(--line);border-radius:var(--radius-4);min-width:0}
+table{width:100%;border-collapse:collapse;font-size:.875rem;min-width:min(560px,100%)}
+th{
+  text-align:left;font-family:var(--font-mono);font-size:.5625rem;letter-spacing:var(--tracking-mono-wider);
+  text-transform:uppercase;color:var(--fg-4);font-weight:var(--weight-medium);
+  padding:10px 14px;border-bottom:1px solid var(--line-2);background:var(--bg-inset);white-space:nowrap;
+}
+td{padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--fg-2);line-height:1.6}
+tbody tr:last-child td{border-bottom:0}
+td:first-child{color:var(--fg)}
+.yes{color:var(--ok);font-weight:var(--weight-semibold)}
+.no{color:var(--bad);font-weight:var(--weight-semibold)}
+.part{color:var(--accent-2);font-weight:var(--weight-semibold)}
+
+/* ── Callouts ─────────────────────────────────────────────────────── */
+.note{
+  position:relative;padding:15px 18px 15px 19px;margin:0 0 20px;max-width:74ch;
+  border-left:2px solid var(--accent);background:var(--accent-soft);
+  border-radius:0 var(--radius-3) var(--radius-3) 0;
+  font-size:.9062rem;line-height:1.7;color:var(--fg-2);
+}
+.note strong{color:var(--fg)}
+.note .lbl{
+  display:block;font-family:var(--font-mono);font-size:.5625rem;letter-spacing:var(--tracking-mono-wider);
+  text-transform:uppercase;color:var(--accent);margin-bottom:6px;
+}
+.note.warn{border-left-color:var(--sediment-ochre);background:rgb(var(--sediment-ochre-rgb)/.10)}
+.note.warn .lbl{color:var(--accent-2)}
+.note p{margin-bottom:10px;font-size:inherit;color:inherit}
+.note p:last-child{margin-bottom:0}
+
+/* ── Cards ────────────────────────────────────────────────────────── */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:12px;margin:0 0 20px}
+.card{
+  display:block;padding:15px 16px;border:1px solid var(--line);border-radius:var(--radius-4);
+  background:var(--bg-panel);min-width:0;
   transition:border-color var(--dur-base) var(--ease-out),transform var(--dur-base) var(--ease-out);
 }
-.doc-card:hover{border-color:rgb(var(--basin-teal-rgb)/.55);transform:translateY(-2px)}
-.doc-card h3{font-size:.9875rem;margin-bottom:var(--space-2);letter-spacing:var(--tracking-tight)}
-.doc-card p{font-size:.8125rem;color:rgb(var(--paper-rgb)/.56);line-height:1.6}
-.doc-card .path{
-  display:block;margin-top:var(--space-3);font-family:var(--font-mono);font-size:.6875rem;
-  color:var(--basin-teal-3);letter-spacing:var(--tracking-mono-wide);
+.card:hover{border-color:var(--accent);transform:translateY(-2px)}
+.card h4{font-size:.9375rem;margin-bottom:5px;letter-spacing:var(--tracking-tight)}
+.card p{font-size:.8125rem;color:var(--fg-3);line-height:1.6;margin:0}
+.card .path{
+  display:block;margin-top:9px;font-family:var(--font-mono);font-size:.625rem;
+  color:var(--accent);letter-spacing:var(--tracking-mono-wide);overflow-wrap:anywhere;
 }
 
-/* Code */
-.code{
-  background:var(--ink-2);border:var(--hairline);border-radius:var(--radius-3);
-  padding:var(--space-5);font-family:var(--font-mono);font-size:.8125rem;line-height:1.8;
-  overflow-x:auto;color:rgb(var(--paper-rgb)/.86);margin-bottom:var(--space-6);
-}
-.code .l{white-space:pre;display:block}
-.t-com{color:rgb(var(--paper-rgb)/.34)}
-.t-kw{color:var(--sediment-ochre-2)}
-.t-str{color:var(--moss)}
-.t-prompt{color:var(--basin-teal-3)}
+/* ── Stat strip ───────────────────────────────────────────────────────
+   Explicit 3-up rather than auto-fit: the container's background IS the
+   1px gap, so an auto-fit track that leaves a cell empty paints a solid
+   grey rectangle where nothing should be. Both strips hold exactly three
+   figures, so three columns or three rows always fills. */
+.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:var(--radius-4);overflow:hidden;margin:0 0 20px}
+@media(max-width:760px){.stats{grid-template-columns:1fr}}
+/* `>` matters: a bare `.stats div` also matches the .v and .k children, so
+   every figure was carrying the cell's padding a second time. */
+.stats>div{background:var(--bg-panel);padding:14px 16px;min-width:0}
+.stats .v{font-family:var(--font-display);font-weight:var(--weight-black);font-size:1.375rem;letter-spacing:var(--tracking-tighter);color:var(--fg)}
+.stats .k{font-family:var(--font-mono);font-size:.5625rem;letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;color:var(--fg-4);margin-top:5px}
 
-/* Table */
-.tbl-scroll{overflow-x:auto;margin-bottom:var(--space-6)}
-table{width:100%;border-collapse:collapse;font-size:.875rem}
-th{
-  text-align:left;font-family:var(--font-mono);font-size:.625rem;letter-spacing:var(--tracking-mono-wider);
-  text-transform:uppercase;color:rgb(var(--paper-rgb)/.42);font-weight:var(--weight-medium);
-  padding:var(--space-3) var(--space-4);border-bottom:1px solid rgb(var(--graphite-rgb)/.45);
-}
-td{padding:var(--space-3) var(--space-4);border-bottom:var(--hairline);vertical-align:top;color:rgb(var(--paper-rgb)/.72)}
-td code{color:var(--sediment-ochre-2)}
-td:first-child{white-space:nowrap}
+/* ── Definition rows ──────────────────────────────────────────────── */
+dl.defs{margin:0 0 20px}
+dl.defs div{display:grid;grid-template-columns:minmax(0,190px) minmax(0,1fr);gap:6px 20px;padding:11px 0;border-bottom:1px solid var(--line)}
+dl.defs div:last-child{border-bottom:0}
+dl.defs dt{font-family:var(--font-mono);font-size:.75rem;color:var(--accent-2);overflow-wrap:anywhere;margin:0}
+dl.defs dd{margin:0;font-size:.9062rem;color:var(--fg-2);line-height:1.65;min-width:0}
+@media(max-width:640px){dl.defs div{grid-template-columns:1fr;gap:4px}}
 
-.note{
-  padding:var(--space-5);border-left:2px solid var(--sediment-ochre);
-  background:rgb(var(--sediment-ochre-rgb)/.06);font-size:.875rem;line-height:var(--lh-loose);
-  color:rgb(var(--paper-rgb)/.66);margin-bottom:var(--space-6);
+/* ── Narrow: rail becomes a drawer ────────────────────────────────── */
+@media(max-width:1080px){
+  /* The Contents pill is fixed over the top-left corner, so an anchored
+     section must land below it or its eyebrow reads as clipped. */
+  html{scroll-padding-top:66px}
+  section.doc,section.doc>h2{scroll-margin-top:6px}
+  .main{margin-left:0}
+  .rail{
+    transform:translateX(-100%);visibility:hidden;
+    width:min(320px,88vw);box-shadow:var(--shadow);
+    transition:transform var(--dur-base) var(--ease-out),visibility var(--dur-base);
+  }
+  .rail.open{transform:none;visibility:visible}
+  .rail-toggle{display:inline-flex}
+  .masthead{padding-top:84px}
+  .wrap{max-width:760px}
 }
-.note strong{color:var(--paper)}
-
-/* Footer */
-.site-footer{background:var(--ink);border-top:var(--hairline-paper);padding-block:var(--space-9)}
-.footer-vulos{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-4);justify-content:space-between}
-.footer-vulos-note{display:flex;align-items:center;gap:var(--space-3);font-size:.875rem;color:rgb(var(--paper-rgb)/.56);max-width:62ch;line-height:var(--lh-loose)}
-.footer-vulos-note svg{width:20px;height:20px;flex-shrink:0}
-.footer-vulos-note a{color:var(--basin-teal-3);font-weight:var(--weight-semibold)}
-.footer-legal{font-family:var(--font-mono);font-size:.6875rem;color:rgb(var(--paper-rgb)/.34);white-space:nowrap}
+@media(max-width:520px){
+  body{font-size:15px}
+  .codeblock code{font-size:.75rem}
+  .rail-toggle{left:10px;top:10px;padding:0 11px;height:36px}
+  .masthead{padding-top:72px}
+}
 
 @media(prefers-reduced-motion:reduce){
   html{scroll-behavior:auto}
-  .doc-card:hover{transform:none}
+  *,*::before,*::after{transition-duration:1ms !important;animation-duration:1ms !important}
+  .card:hover{transform:none}
 }
+@media print{.rail,.rail-toggle,#progress,.scrim{display:none}.main{margin-left:0}}
 
-  /* ── Vulos suite chrome — identical on every product landing ───────────────
-     Two elements, and only two: a logo-only home button in the top bar, and
-     one line in the footer. Deliberately free of repo variables so the block
-     is byte-identical across the suite and can be diffed as one thing. */
-  .vulos-home { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 9px; flex: 0 0 auto; opacity: .72; transition: opacity .15s ease, transform .15s ease; }
-  .vulos-home:hover, .vulos-home:focus-visible { opacity: 1; transform: translateY(-1px); }
-  .vulos-home img { display: block; width: 22px; height: 22px; border-radius: 6px; }
-  .vulos-foot { display: inline-flex; align-items: center; gap: 9px; font-size: 13.5px; line-height: 1.45; text-decoration: none; color: inherit; opacity: .85; transition: opacity .15s ease; }
-  .vulos-foot:hover { opacity: 1; text-decoration: none; }
-  .vulos-foot img { display: block; width: 18px; height: 18px; border-radius: 5px; flex: 0 0 auto; }
+/* ── Suite chrome — the one home mark, logo only ──────────────────── */
+.vulos-home { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 9px; flex: 0 0 auto; opacity: .72; transition: opacity .15s ease, transform .15s ease; }
+.vulos-home:hover, .vulos-home:focus-visible { opacity: 1; transform: translateY(-1px); }
+.vulos-home img { display: block; width: 22px; height: 22px; border-radius: 6px; }
 </style>
 </head>
 <body>
 
-<header class="site-header">
-  <div class="container-wide nav">
-    <a class="brand" href="./index.html">
-      <svg viewBox="0 0 680 680" aria-hidden="true">
-        <g transform="translate(340,340)" fill="none" stroke="#FAF7F0" stroke-width="52" stroke-linecap="round">
+<div id="progress"></div>
+
+<button class="rail-toggle" id="railToggle" type="button" aria-expanded="false" aria-controls="rail">
+  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+  Contents
+</button>
+<div class="scrim" id="scrim"></div>
+
+<aside class="rail" id="rail">
+  <div class="rail-head">
+    <svg class="contours" viewBox="0 0 320 220" aria-hidden="true" preserveAspectRatio="none">
+      <path d="M-20 60 Q 60 20 140 58 T 340 44"/>
+      <path d="M-20 88 Q 60 46 140 84 T 340 70"/>
+      <path d="M-20 116 Q 60 74 140 112 T 340 98"/>
+      <path d="M-20 144 Q 60 102 140 140 T 340 126"/>
+      <path d="M-20 172 Q 60 130 140 168 T 340 154"/>
+      <path d="M-20 200 Q 60 158 140 196 T 340 182"/>
+    </svg>
+    <a class="mark" href="./index.html">
+      <svg class="glyph" viewBox="0 0 680 680" aria-hidden="true">
+        <g transform="translate(340,340)" fill="none" stroke="currentColor" stroke-width="52" stroke-linecap="round">
           <ellipse cx="0" cy="-110" rx="200" ry="44"/>
           <path d="M -200 -110 Q -200 160, 0 160 Q 200 160, 200 -110"/>
           <circle cx="0" cy="40" r="34" fill="#3B6F73" stroke="none"/>
         </g>
       </svg>
-      Basin
+      <span>
+        <span class="name">Basin</span>
+        <span class="kind">Field guide</span>
+      </span>
     </a>
-    <div class="nav-spacer"></div>
-    <nav class="nav-links">
-      <a href="./index.html">Overview</a>
-      <a href="./docs.html" aria-current="page">Docs</a>
-      <a href="./index.html#benchmarks">Benchmarks</a>
-      <a href="./index.html#compare">Compare</a>
-      <a href="https://github.com/vul-os/basin">GitHub</a>
-    </nav>
+    <div class="rail-meta">
+      <span class="tag on">Pre-alpha</span>
+      <span class="tag">v0.1.9</span>
+      <span class="tag">Apache-2.0</span>
+    </div>
+  </div>
+
+  <div class="rail-filter">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M16.5 16.5 21 21"/></svg>
+    <input id="navFilter" type="search" placeholder="Filter sections…" aria-label="Filter sections">
+  </div>
+
+  <nav class="rail-nav" id="railNav" aria-label="Documentation sections">
+    <div class="grp">Getting started</div>
+    <a href="#overview">What Basin is</a>
+    <a href="#status">Status &amp; scope</a>
+    <a href="#install">Install &amp; run</a>
+    <a href="#connect">Connect</a>
+    <a href="#first-queries">First queries</a>
+
+    <div class="grp">SQL</div>
+    <a href="#sql-surface">SQL surface</a>
+    <a href="#compatibility">Compatibility &amp; gaps</a>
+    <a href="#types-indexes">Types &amp; indexes</a>
+    <a href="#rls">Row-Level Security</a>
+
+    <div class="grp">Data &amp; storage</div>
+    <a href="#projects">Projects &amp; isolation</a>
+    <a href="#storage">Storage format</a>
+    <a href="#durability">WAL &amp; durability</a>
+    <a href="#hot-tier">HTAP hot tier</a>
+    <a href="#time-travel">Snapshots &amp; forks</a>
+
+    <div class="grp">Batteries</div>
+    <a href="#auth">Auth</a>
+    <a href="#rest">REST API</a>
+    <a href="#realtime">Realtime</a>
+    <a href="#blob">Blob storage</a>
+    <a href="#vector">Vector search</a>
+    <a href="#extensions">Extension equivalents</a>
+    <a href="#functions">Wasm functions</a>
+    <a href="#not-shipped">Deliberate omissions</a>
+
+    <div class="grp">Clients</div>
+    <a href="#sdks">Client SDKs</a>
+    <a href="#orms">ORMs &amp; migrations</a>
+    <a href="#cli">Command line</a>
+
+    <div class="grp">Operations</div>
+    <a href="#configuration">Configuration</a>
+    <a href="#object-storage">Object storage</a>
+    <a href="#deployment">Deployment</a>
+    <a href="#observability">Observability</a>
+    <a href="#benchmarks">Benchmarks</a>
+
+    <div class="grp">Reference</div>
+    <a href="#crates">Crate map</a>
+    <a href="#decisions">Design decisions</a>
+    <a href="#contributing">Contributing</a>
+
+    <p class="no-hit" id="noHit">No section matches.</p>
+  </nav>
+
+  <div class="rail-foot">
+    <button class="icon-btn" id="themeBtn" type="button" aria-label="Toggle colour scheme" title="Toggle colour scheme">
+      <svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5Z"/></svg>
+      <svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.4 5.4l1.6 1.6M17 17l1.6 1.6M18.6 5.4 17 7M7 17l-1.6 1.6"/></svg>
+    </button>
+    <a class="txt" href="./index.html">Overview</a>
+    <a class="txt" href="https://github.com/vul-os/basin">GitHub</a>
+    <span class="spacer"></span>
     <a class="vulos-home" href="https://vulos.org" target="_blank" rel="noopener" title="Vulos — open, self-hostable software" aria-label="Vulos — open, self-hostable software"><img src="./assets/vulos-logo.png" alt="" width="22" height="22"></a>
+  </div>
+</aside>
+
+<div class="main">
+<div class="wrap">
+
+<header class="masthead">
+  <span class="eyebrow">Documentation · field guide</span>
+  <h1>Basin, from first run to production</h1>
+  <p class="lede">
+    Basin is a <strong>bucket-native, multi-project, Postgres-compatible database</strong>.
+    One Rust binary: pgwire on the front, Vortex-compressed columnar files on any
+    S3-compatible bucket on the back, a file-backed WAL in between. A project is a
+    bucket prefix rather than a provisioned database, so operator cost is
+    <em>O(bytes active)</em> rather than <em>O(projects provisioned)</em>.
+  </p>
+  <div class="quickbar">
+    <a href="#install"><span class="n">01</span> Run it in 60 seconds</a>
+    <a href="#sql-surface"><span class="n">06</span> What SQL works</a>
+    <a href="#configuration"><span class="n">26</span> Every env var</a>
+    <a href="#benchmarks"><span class="n">30</span> The honest numbers</a>
   </div>
 </header>
 
-<div class="docs-head">
-  <div class="container">
-    <span class="eyebrow">Documentation · field guide</span>
-    <h1 class="display">Basin documentation</h1>
+<!-- ══ GETTING STARTED ══════════════════════════════════════════════ -->
+
+<section class="doc" id="overview">
+  <span class="eyebrow">01 · orientation</span>
+  <h2>What Basin is</h2>
+  <p>
+    Basin speaks the PostgreSQL wire protocol, so <code>psql</code>, <code>tokio-postgres</code>,
+    <code>asyncpg</code>, JDBC, Diesel and SeaORM connect to it without a shim. Underneath it is
+    not Postgres at all: tables are columnar files in an object store, described by an
+    Iceberg-style catalog, with a write-ahead log in front for durability and an in-memory
+    hot tier for recent writes.
+  </p>
+  <p>
+    Two properties are structurally true regardless of workload, and they are the reason the
+    project exists. Both are measured, and both are published with their losses alongside.
+  </p>
+
+  <div class="stats">
+    <div><div class="v">~310 KiB</div><div class="k">RAM per held-open connection · Postgres ~8.1 MiB</div></div>
+    <div><div class="v">~2 KiB</div><div class="k">RAM per idle project · 2.16 KiB over 1,000 projects</div></div>
+    <div><div class="v">1,000 / 0</div><div class="k">Connections held / refused under a 1,000-conn flood</div></div>
+  </div>
+
+  <ul class="bullets">
+    <li><strong>A pure-Rust async server does not fork a backend per connection.</strong> Basin holds 1,000 connections where Postgres holds 100 and refuses 900. That is not a tuning result; it is the difference between a tokio server and a forking daemon.</li>
+    <li><strong>A new project is a bucket prefix, not a provisioned database.</strong> Idle projects cost their bytes and nothing else. Ten thousand projects is the same architecture and the same binary as one.</li>
+  </ul>
+
+  <p>
+    Everything else in the binary — native vector search, auth, a PostgREST-shaped API,
+    realtime, blob storage, Wasm functions, <code>pg_cron</code>/<code>pg_net</code>/<code>pg_trgm</code>/PostGIS
+    subsets as native crates — exists to make those two wins reachable from real applications
+    rather than from a benchmark harness.
+  </p>
+
+  <div class="cards">
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/README.md">
+      <h4>README</h4>
+      <p>The full pitch, the benchmark tables, and the comparison against Postgres, Neon, Supabase and Nile.</p>
+      <span class="path">README.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/CAPABILITIES.md">
+      <h4>Capability matrix</h4>
+      <p>Feature-by-feature status with the SQLSTATE returned for every shape that is not supported.</p>
+      <span class="path">CAPABILITIES.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/docs/architecture.md">
+      <h4>Architecture (design intent)</h4>
+      <p>The four-layer design doc. Read it as intent — parts of it describe v0.2 shapes that are not shipped yet.</p>
+      <span class="path">docs/architecture.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/docs/V0_1_SCOPE.md">
+      <h4>v0.1 scope</h4>
+      <p>The cut-off: what is required, what shipped, and what was parked on purpose.</p>
+      <span class="path">docs/V0_1_SCOPE.md</span>
+    </a>
+  </div>
+</section>
+
+<section class="doc" id="status">
+  <span class="eyebrow">02 · honesty</span>
+  <h2>Status &amp; scope</h2>
+  <p>
+    Basin is <strong>pre-alpha and built in the open</strong>. The workspace version is
+    <code>0.1.9</code>, which is also the newest release tag; a substantial amount of unreleased
+    work sits on top of it on <code>main</code>. Use it today to evaluate the cost economics,
+    to prototype multi-project patterns, or to contribute — not to hold data you cannot lose.
+  </p>
+  <div class="note warn">
+    <span class="lbl">Read this before you trust a doc</span>
     <p>
-      Everything below lives in the repository under <code>docs/</code> and is versioned
-      with the engine, so it never drifts from the binary you're running. This page is
-      the map; the links go to the source of truth.
+      The repository's design documents describe intent as well as shipped behaviour, and in a
+      few places they have drifted. <code>docs/architecture.md</code> still calls Parquet the
+      canonical format and describes Raft as the durability boundary; neither matches the
+      default build. Several operator pages reference a Prometheus <code>/metrics</code>
+      endpoint that does not exist in this repository. Where this page and a repository doc
+      disagree, this page has been checked against the source.
     </p>
   </div>
+  <p>
+    The licence split matters if you are vendoring: the <strong>engine, services and CLI are
+    Apache-2.0</strong>; all ten <strong>client SDKs are MIT</strong>. Every crate in the
+    workspace carries <code>#![forbid(unsafe_code)]</code>.
+  </p>
+</section>
+
+<section class="doc" id="install">
+  <span class="eyebrow">03 · start here</span>
+  <h2>Install &amp; run</h2>
+  <p>
+    Basin is one binary and one data directory. Local development needs no external object
+    store and no external database — the same binary that runs on your laptop is the one that
+    runs against S3, with different environment variables.
+  </p>
+
+  <h3>Docker</h3>
+  <p>
+    The image needs no Rust toolchain. The first build takes a few minutes because the Cargo
+    dependency layer is cold; subsequent builds are cached.
+  </p>
+  <div class="codeblock" data-cap="docs/quickstart-docker.md">
+    <pre><code class="language-bash"># Build the image from the repo root.
+docker build -t basin-server .
+
+# Run it. pgwire on :5432, data persisted in a named volume.
+docker run --rm \
+  -p 5432:5432 \
+  -v basin-data:/var/basin \
+  --name basin \
+  basin-server</code></pre>
+  </div>
+  <p>
+    You are ready when the log prints
+    <code>INFO basin_server: pgwire listener is accept-ready bind=0.0.0.0:5432</code>.
+    The image ships a healthcheck (<code>nc -z 127.0.0.1 5432</code>) on a ten-second interval.
+    The release workflow publishes <code>ghcr.io/vul-os/basin-server</code> on every
+    <code>v*</code> tag.
+  </p>
+  <div class="note">
+    <span class="lbl">Port already taken</span>
+    <p>Postgres probably owns 5432 on your machine. Remap the host side and leave the container alone: <code>docker run --rm -p 5433:5432 -v basin-data:/var/basin --name basin basin-server</code>.</p>
+  </div>
+
+  <h3>From source</h3>
+  <p>
+    Requires the toolchain pinned in <code>rust-toolchain.toml</code>. The default bind from
+    source is <code>127.0.0.1:5433</code> — deliberately not 5432, so a local Postgres and a
+    local Basin can run side by side.
+  </p>
+  <div class="codeblock" data-cap="README.md">
+    <pre><code class="language-bash">BASIN_DATA_DIR=/tmp/basin cargo run -p basin-server</code></pre>
+  </div>
+  <p>
+    That gives you pgwire on <code>127.0.0.1:5433</code>, a durable WAL plus Vortex columnar
+    files under <code>/tmp/basin/</code>, and a <strong>volatile in-memory catalog</strong> —
+    fast to iterate against, and gone on restart. Point <code>BASIN_CATALOG</code> at
+    <code>object_store</code> or a Postgres DSN the moment you want metadata to survive a
+    restart. See <a class="link" href="#configuration">Configuration</a>.
+  </p>
+
+  <h3>Build and test the workspace</h3>
+  <div class="codeblock">
+    <pre><code class="language-bash">cargo build --workspace
+cargo test  --workspace</code></pre>
+  </div>
+</section>
+
+<section class="doc" id="connect">
+  <span class="eyebrow">04 · the wire</span>
+  <h2>Connect</h2>
+  <p>
+    Any PostgreSQL client works. The username selects the project — Basin parses the project
+    out of the username at connection accept, so there is no per-query tenant argument and no
+    global lookup table on the hot path.
+  </p>
+  <div class="codeblock">
+    <pre><code class="language-bash"># Against the Docker container (default user `basin`)
+psql -h 127.0.0.1 -p 5432 -U basin
+
+# Against a from-source server started with BASIN_PROJECTS='alice=*,bob=*'
+psql -h 127.0.0.1 -p 5433 -U alice</code></pre>
+  </div>
+
+  <h3>Declaring projects</h3>
+  <p>
+    <code>BASIN_PROJECTS</code> takes comma-separated <code>user=project_id</code> pairs, where
+    <code>*</code> asks Basin to allocate a ULID. The image defaults to
+    <code>basin=*</code>.
+  </p>
+  <div class="codeblock">
+    <pre><code class="language-bash">docker run --rm \
+  -p 5432:5432 \
+  -v basin-data:/var/basin \
+  -e BASIN_PROJECTS="alice=*,bob=*" \
+  basin-server</code></pre>
+  </div>
+
+  <h3>Provisioned credentials</h3>
+  <p>
+    With <code>basin-auth</code> enabled, <code>POST /admin/v1/projects</code> mints a project
+    and returns a connection URL of the form
+    <code>postgres://&lt;user&gt;:&lt;password&gt;@host:5433/&lt;db&gt;</code>. The username is
+    the project ULID plus a short suffix, so the project identity is carried by the credential
+    itself. Rotation is <code>POST /admin/v1/projects/{user}/rotate</code>, and the old password
+    stops working immediately. A bad password fails with SQLSTATE <code>28P01</code>, exactly
+    as Postgres would.
+  </p>
+
+  <h3>TLS</h3>
+  <p>
+    Point <code>BASIN_TLS_CERT_PATH</code> and <code>BASIN_TLS_KEY_PATH</code> (or their
+    <code>_PEM</code> variants) at a certificate and the listener negotiates TLS over the
+    standard pgwire <code>SSLRequest</code> handshake — <code>sslmode=require</code> on the
+    client side.
+  </p>
+</section>
+
+<section class="doc" id="first-queries">
+  <span class="eyebrow">05 · hello, table</span>
+  <h2>First queries</h2>
+  <p>
+    Nothing about the first five minutes is Basin-specific. Create a table, insert rows, query
+    them. The interesting part is what is happening underneath: the insert lands in the WAL and
+    the in-memory hot tier, and a compactor later folds it into a columnar file under the
+    project's bucket prefix.
+  </p>
+  <div class="codeblock" data-cap="psql">
+    <pre><code class="language-sql">CREATE TABLE events (
+  id         BIGSERIAL PRIMARY KEY,
+  user_id    UUID        NOT NULL,
+  kind       TEXT        NOT NULL,
+  payload    JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO events (user_id, kind, payload) VALUES
+  (gen_random_uuid(), 'signup', '{"plan":"free"}'),
+  (gen_random_uuid(), 'login',  '{"ip":"10.0.0.4"}');
+
+SELECT kind, count(*) AS n
+FROM   events
+WHERE  created_at > now() - INTERVAL '7 days'
+GROUP  BY kind
+ORDER  BY n DESC;</code></pre>
+  </div>
+  <p>
+    Prepared statements, the extended query protocol, cursors, <code>COPY</code> and binary
+    parameter binding all work — including native binary binding for JSONB, UUID, BYTEA and
+    array types. <code>NUMERIC</code> binds over the text wire format; binary varlena for
+    numerics is deferred.
+  </p>
+  <p>
+    Look at what landed on disk. The extension tells you which format the table chose:
+  </p>
+  <div class="codeblock">
+    <pre><code class="language-bash">find /tmp/basin/projects -name '*.vortex'
+# /tmp/basin/projects/01HABCD…/tables/events/data/2026/05/01/01HEFG….vortex</code></pre>
+  </div>
+  <div class="cards">
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/docs/tutorial.md">
+      <h4>Tutorial</h4>
+      <p>Longer walkthrough: CRUD, auth, RLS, REST and a frontend snippet. Note that its auth/REST steps assume those subsystems are switched on — they are off by default.</p>
+      <span class="path">docs/tutorial.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/tree/main/examples">
+      <h4>Example apps</h4>
+      <p>A multi-project SaaS starter and an AI/RAG application, both runnable from the repo.</p>
+      <span class="path">examples/</span>
+    </a>
+  </div>
+</section>
+
+<!-- ══ SQL ══════════════════════════════════════════════════════════ -->
+
+<section class="doc" id="sql-surface">
+  <span class="eyebrow">06 · the dialect</span>
+  <h2>SQL surface</h2>
+  <p>
+    The support matrix is generated by the test suite, never hand-edited. Every fragment is run
+    end-to-end against a fresh server in three parser configurations, and the result is written
+    back into <code>docs/sql-support.md</code>.
+  </p>
+  <div class="stats">
+    <div><div class="v">975</div><div class="k">SQL fragments in the corpus</div></div>
+    <div><div class="v">872</div><div class="k">Run end-to-end per configuration · 89.4%</div></div>
+    <div><div class="v">27</div><div class="k">Explicitly out of scope, not gaps</div></div>
+  </div>
+  <p>
+    Excluding the 27 deliberate exclusions, <strong>872 of 948 fragments (92.0%) execute
+    end-to-end</strong>, and the count is identical across all three parser configurations —
+    2,616 green cells over three columns. Regenerate it yourself:
+  </p>
+  <div class="codeblock">
+    <pre><code class="language-bash">cargo test -p basin-integration-tests --test sql_support_matrix -- --nocapture</code></pre>
+  </div>
+
+  <h3>What works</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th scope="col">Area</th><th scope="col">Detail</th></tr></thead>
+      <tbody>
+        <tr><td>Wire protocol</td><td>pgwire v3 — simple and extended query, TLS, <code>COPY</code>, prepared statements, cursors, binary parameters</td></tr>
+        <tr><td>DDL</td><td><code>CREATE TABLE</code> (incl. <code>CREATE TABLE AS … WITH NO DATA</code>), <code>ALTER TABLE</code>, <code>CREATE INDEX</code>, views, materialized views</td></tr>
+        <tr><td>DML</td><td>Multi-row <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, <code>ON CONFLICT DO NOTHING / DO UPDATE</code>, <code>MERGE INTO</code></td></tr>
+        <tr><td>Queries</td><td>Joins, CTEs, <code>WITH RECURSIVE</code>, window functions, <code>GROUPING SETS</code>, subqueries, <code>DISTINCT ON</code>, <code>UNION</code>/<code>INTERSECT</code>/<code>EXCEPT</code></td></tr>
+        <tr><td>Types</td><td>JSONB (binary-encoded), UUID, BYTEA, arrays, <code>TIMESTAMPTZ</code>, <code>NUMERIC</code>, <code>TSVECTOR</code>, <code>citext</code>, <code>vector(N)</code></td></tr>
+        <tr><td>Sessions</td><td><code>PREPARE</code>/<code>EXECUTE</code>, <code>DECLARE</code>/<code>FETCH</code>/<code>MOVE</code>, <code>LISTEN</code>/<code>NOTIFY</code>/<code>UNLISTEN</code>, <code>EXPLAIN</code> and <code>EXPLAIN ANALYZE</code></td></tr>
+        <tr><td>Security</td><td><code>ENABLE ROW LEVEL SECURITY</code> + <code>CREATE POLICY</code>, enforced at the logical-plan layer</td></tr>
+        <tr><td>Functions</td><td><code>CREATE FUNCTION … LANGUAGE sql</code> and <code>… LANGUAGE wasm</code>, <code>CALL</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>The parser</h3>
+  <p>
+    Basin's shipping front end is <code>sqlparser-rs</code>. <code>libpg_query</code> — the real
+    PostgreSQL grammar, vendored — is the <em>canonical</em> parser per
+    <a class="link" href="https://github.com/vul-os/basin/blob/main/docs/decisions/0014-pg-query-as-canonical-parser.md">ADR&nbsp;0014</a>
+    and is available behind <code>BASIN_PG_QUERY=1</code>, with a further
+    <code>BASIN_PG_QUERY_PLAN=1</code> stage that translates the Postgres AST straight to a
+    DataFusion logical plan for single-table <code>SELECT</code>. The migration is in progress;
+    <code>CAPABILITIES.md</code> marks it as such rather than as done.
+  </p>
+</section>
+
+<section class="doc" id="compatibility">
+  <span class="eyebrow">07 · the gaps</span>
+  <h2>Compatibility &amp; gaps</h2>
+  <p>
+    Basin is Postgres-<em>compatible</em>, not Postgres. Two categories of divergence exist and
+    they should be read differently: deliberate exclusions, which have an ADR and a stated
+    trigger that would reopen them, and real gaps, which are bugs with a version attached.
+  </p>
+
+  <h3>Deliberate exclusions</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th scope="col">Not supported</th><th scope="col">Why, and what replaces it</th></tr></thead>
+      <tbody>
+        <tr><td><code>CREATE EXTENSION</code></td><td>Loadable <code>.so</code> extensions run outside the project-scoped I/O wrappers and break the bucket-prefix IAM boundary. The common ones ship natively instead — see <a class="link" href="#extensions">extension equivalents</a>.</td></tr>
+        <tr><td>PL/pgSQL, triggers</td><td>Replaced by SQL-bodied and Wasm functions plus the change-event primitive. Cursor loops and <code>EXCEPTION</code> handling inside a trigger body are an explicit non-goal.</td></tr>
+        <tr><td>Streaming replication</td><td>Wrong shape for object-store storage — the bucket is already the replicated artefact. Change data is delivered by the realtime layer and the CDC ring.</td></tr>
+        <tr><td><code>postgres_fdw</code>, <code>dblink</code></td><td>No federation. <code>basin-net</code> covers HTTP-shaped outbound reads from SQL.</td></tr>
+        <tr><td>PostGIS beyond POINT</td><td>LINESTRING, POLYGON and GiST geo-indexes are not in the box; <code>ST_DWithin</code> and <code>ST_Distance</code> on POINT are.</td></tr>
+        <tr><td><code>pgvector</code> IVF-flat</td><td>HNSW only, and the text wire format only — the pgvector binary wire format is a non-goal.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Real gaps</h3>
+  <p>
+    These parse and plan but fail, or are rejected before execution. They are v0.2 targets and
+    each is listed per-fragment in the generated matrix.
+  </p>
+  <ul class="bullets">
+    <li><code>LATERAL</code> joins — a correlated lateral subquery in <code>FROM</code> fails at execution.</li>
+    <li><code>WITH RECURSIVE</code> combined with DML, e.g. <code>WITH RECURSIVE … DELETE</code>.</li>
+    <li>Advanced window frames: <code>RANGE INTERVAL</code> mode, <code>GROUPS</code> mode, and the <code>EXCLUDE</code> clause.</li>
+    <li><code>JSON_AGG(t)</code> over a whole-row table reference.</li>
+    <li><code>EXCLUDE USING gist</code> exclusion constraints on <code>CREATE TABLE</code>.</li>
+    <li><code>INSERT … SELECT</code> as a single statement is rejected with an honest SQLSTATE; materialize the <code>SELECT</code> and insert the rows.</li>
+    <li><code>UPDATE … SET col = &lt;expression&gt;</code> is partial — the right-hand side must currently be a literal or a single bind parameter — and <code>UPDATE … WHERE col IN (SELECT …)</code> is rejected.</li>
+  </ul>
+  <div class="note">
+    <span class="lbl">ORM reality check</span>
+    <p>
+      <code>tests/integration/tests/orm_smoke.rs</code> drives seven query patterns that real
+      ORMs emit through the extended-query protocol — multi-row parameterised inserts, a cached
+      prepared statement over 100 bind/execute cycles, mixed-type predicates, NULL round-trips,
+      parameterised <code>LIMIT</code>, quote-bearing text, and <code>BYTEA</code> round-trips.
+      All seven pass.
+    </p>
+  </div>
+</section>
+
+<section class="doc" id="types-indexes">
+  <span class="eyebrow">08 · shapes on disk</span>
+  <h2>Types &amp; indexes</h2>
+  <p>
+    Indexes in Basin are catalog metadata over columnar files rather than heap-pointing btrees,
+    so the vocabulary is familiar but the mechanics differ. Point-query pruning leans on
+    per-file catalog statistics and bloom filters as much as on any secondary structure.
+  </p>
+  <div class="codeblock" data-cap="Index shapes that work">
+    <pre><code class="language-sql">-- Plain, partial and expression indexes
+CREATE INDEX idx ON t (id);
+CREATE INDEX idx_active ON t (id) WHERE id > 0;
+CREATE INDEX idx_lower ON t (LOWER(name));
+
+-- GIN, for JSONB containment and full-text
+CREATE INDEX idx_gin ON t USING gin (name);
+
+-- HNSW, for vector similarity
+CREATE INDEX ON docs USING hnsw (embedding vector_cosine_ops);</code></pre>
+  </div>
+
+  <h3>Table-level storage hints</h3>
+  <p>
+    Basin exposes its physical layout through <code>WITH</code> options and
+    <code>ALTER TABLE</code> rather than through knobs in a config file, so the choice travels
+    with the schema:
+  </p>
+  <dl class="defs">
+    <div><dt>basin.file_format</dt><dd><code>'vortex'</code> (default) or <code>'parquet'</code>, fixed at <code>CREATE TABLE</code> time and persisted in the catalog.</dd></div>
+    <div><dt>CLUSTER BY (…)</dt><dd>Physical clustering key, so range scans over that column touch fewer files.</dd></div>
+    <div><dt>SET BLOOM FILTERS ON</dt><dd>Per-file bloom filters, which is what turns a point lookup from a scan into a prune.</dd></div>
+    <div><dt>SET row_group_rows</dt><dd>Row-group size — the granularity at which the reader can skip.</dd></div>
+    <div><dt>SET cold_after</dt><dd>How long before a partition is treated as cold and evicted from the hot tier.</dd></div>
+  </dl>
+
+  <h3>Full-text search</h3>
+  <p>
+    <code>to_tsvector</code>, <code>to_tsquery</code>, the <code>@@</code> match operator,
+    <code>ts_rank</code> and <code>ts_rank_cd</code> are native, including a generated
+    <code>TSVECTOR</code> column indexed with GIN:
+  </p>
+  <div class="codeblock">
+    <pre><code class="language-sql">CREATE TABLE doc (
+  body TEXT,
+  ts   TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', body)) STORED
+);
+CREATE INDEX ON doc USING gin (ts);
+
+SELECT body, ts_rank(ts, to_tsquery('quick & fox')) AS rank
+FROM   doc
+WHERE  ts @@ to_tsquery('quick & fox')
+ORDER  BY rank DESC;</code></pre>
+  </div>
+</section>
+
+<section class="doc" id="rls">
+  <span class="eyebrow">09 · row visibility</span>
+  <h2>Row-Level Security</h2>
+  <p>
+    <code>ALTER TABLE … ENABLE ROW LEVEL SECURITY</code> and <code>CREATE POLICY</code> behave as
+    they do in Postgres, with the predicate injected at the logical-plan layer rather than
+    filtered after the fact. <code>auth.uid()</code>, <code>auth.role()</code> and
+    <code>auth.jwt()</code> are SQL session functions populated from the verified JWT at
+    connection open, so Supabase-shaped policies transfer unchanged.
+  </p>
+  <div class="codeblock" data-cap="docs/batteries.md">
+    <pre><code class="language-sql">CREATE TABLE notes (
+  id        BIGSERIAL PRIMARY KEY,
+  owner_id  UUID NOT NULL DEFAULT auth.uid(),
+  body      TEXT NOT NULL
+);
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "own rows" ON notes FOR ALL USING (owner_id = auth.uid());</code></pre>
+  </div>
+  <p>
+    Both the schema-qualified <code>auth.uid()</code> and the underscore <code>auth_uid()</code>
+    spellings resolve. An anonymous session returns <code>NULL</code> and <code>'anon'</code>,
+    matching Supabase behaviour.
+  </p>
+  <div class="note">
+    <span class="lbl">How it is tested</span>
+    <p>
+      <code>tests/integration/tests/security.rs</code> runs 1,000-iteration cross-project fuzzes
+      plus four explicit bypass shapes including UNION and CTE constructions. A P0 RLS bypass via
+      UNION + CTE was found by that suite during development and fixed before the release tag —
+      which is the argument for the suite existing, not an argument that the surface is
+      finished.
+    </p>
+  </div>
+</section>
+
+<!-- ══ DATA & STORAGE ═══════════════════════════════════════════════ -->
+
+<section class="doc" id="projects">
+  <span class="eyebrow">10 · isolation</span>
+  <h2>Projects &amp; isolation</h2>
+  <p>
+    <strong>One project is one bucket prefix.</strong> A project's data lives under
+    <code>projects/&lt;project_id&gt;/…</code> in your object store, and that prefix is the IAM
+    boundary. Cross-project access is not a software check that could be wrong in some edge
+    case; it is a bucket-policy denial. The engine resolves the project once, at connection
+    accept, and refuses to read across the prefix afterwards.
+  </p>
+  <ul class="bullets">
+    <li><strong>Idle projects cost only their bytes.</strong> No backend process, no warm pool, no provisioned compute — around 2 KiB of resident RAM per idle project.</li>
+    <li><strong>Active projects share a compute pool.</strong> The shard owner holds in-memory state for many projects per process and evicts on idle, with a five-minute default.</li>
+    <li><strong>Per-project fairness is enforced.</strong> A semaphore caps each project at 16 concurrent storage operations, and an earliest-deadline-first scheduler prioritises latency-sensitive operations (HEAD, list, small range reads) over bulk PUTs, so one bursting customer cannot starve the rest.</li>
+    <li><strong>Auth is per project.</strong> Identity tables live in the project's own <code>auth</code> schema. Cross-project user federation is an explicit non-goal for v0.1 — the project <em>is</em> the isolation primitive.</li>
+  </ul>
+  <div class="note warn">
+    <span class="lbl">The honest counter-example</span>
+    <p>
+      Deleting a project at small scale is <em>slower</em> than Postgres. <code>DROP SCHEMA
+      CASCADE</code> is a few catalog rows and an <code>unlink</code>; Basin's deletion is
+      O(file count). The prefix-delete advantage shows up on multi-gigabyte projects on real
+      object storage, not on a 100k-row table on tmpfs.
+    </p>
+  </div>
+  <div class="cards">
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/docs/multi-project.md">
+      <h4>Multi-project SaaS</h4>
+      <p>The full model: membership, isolation primitives, the scheduler and the cost arithmetic.</p>
+      <span class="path">docs/multi-project.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/docs/import.md">
+      <h4>Importing from Postgres</h4>
+      <p>Type mapping, DDL translation and the streaming COPY path with per-object skip reporting.</p>
+      <span class="path">docs/import.md</span>
+    </a>
+  </div>
+</section>
+
+<section class="doc" id="storage">
+  <span class="eyebrow">11 · bytes</span>
+  <h2>Storage format</h2>
+  <p>
+    <strong>Vortex is the default on-disk format</strong>, and has been since ADR&nbsp;0015 was
+    updated. Parquet remains first-class and selectable per table, which is the right choice when
+    something outside Basin — Athena, Spark, DuckDB, an Iceberg reader — has to read the files
+    directly.
+  </p>
+  <div class="codeblock">
+    <pre><code class="language-sql">-- Vortex is the default; state it explicitly if you like.
+CREATE TABLE events (…) WITH (basin.file_format = 'vortex');
+
+-- Parquet, for read-compat with external engines.
+CREATE TABLE exports (…) WITH (basin.file_format = 'parquet');</code></pre>
+  </div>
+  <p>
+    Vortex measures <strong>1.95× smaller on disk</strong> than ZSTD Parquet on Basin's own
+    cards. It is not uniformly better: it currently <strong>trails on point-lookup latency</strong>
+    (about 0.65× after catalog-stats file pruning) and on <code>ORDER BY … LIMIT</code> (about
+    0.38×), because native vortex-datafusion execution is still maturing.
+  </p>
+
+  <h3>Layout</h3>
+  <div class="codeblock" data-cap="on-disk prefix shape">
+    <pre><code class="language-plaintext">projects/{project_id}/
+  tables/{table}/
+    data/{yyyy}/{mm}/{dd}/{ulid}.vortex      # or .parquet
+    metadata/                                # Iceberg-style snapshots + manifests
+_catalog/                                    # when BASIN_CATALOG=object_store</code></pre>
+  </div>
+  <p>
+    The catalog is Iceberg-style: tables, snapshots and manifests. It can live in memory
+    (volatile, the default), in the object store itself under
+    <code>BASIN_CATALOG_PREFIX</code>, or in an external Postgres. The
+    <code>object_store</code> backend is the one worth knowing about — it gives you a durable,
+    shared catalog with leases and <strong>no external database to provision</strong>.
+  </p>
+</section>
+
+<section class="doc" id="durability">
+  <span class="eyebrow">12 · what survives</span>
+  <h2>WAL &amp; durability</h2>
+  <p>
+    Writes land in a file-backed write-ahead log before they are visible, and a compactor folds
+    WAL segments into columnar files asynchronously. The WAL directory is
+    <code>BASIN_WAL_DIR</code> and it wants a durable volume — ideally NVMe.
+  </p>
+  <p>
+    <strong>The default acknowledges an INSERT before fsync</strong>, with a bounded loss window
+    of at most 200 ms. This is the single most important thing to understand before comparing
+    Basin's write numbers to anyone else's, because most published Postgres numbers are
+    fsync-durable per commit. If you want that guarantee, ask for it:
+  </p>
+  <div class="codeblock">
+    <pre><code class="language-sql">SET basin.synchronous_commit = on;</code></pre>
+  </div>
+  <p>
+    That gives group-committed fsync durability per statement. Measured cost in Basin's probe
+    harness: about 2% on the 10k-row bulk INSERT, because group commit amortises one fsync
+    across a statement group.
+  </p>
+  <dl class="defs">
+    <div><dt>BASIN_WAL_MODE</dt><dd><code>local</code> (default) is a single-node, file-backed WAL. <code>raft</code> enables the openraft path — today a single-process simulation; cross-process distributed WAL is v0.2.</dd></div>
+    <div><dt>BASIN_WAL_BACKEND</dt><dd>Where WAL segments go. Unset mirrors <code>BASIN_STORAGE_BACKEND</code>; set it to <code>local</code> to keep the WAL on disk while table data lives in a bucket.</dd></div>
+    <div><dt>BASIN_SYNCHRONOUS_COMMIT</dt><dd>Process-wide default for the session setting above.</dd></div>
+    <div><dt>BASIN_DATA_FSYNC</dt><dd>Whether data-file writes are fsynced.</dd></div>
+  </dl>
+  <div class="cards">
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/docs/runbooks/durability.md">
+      <h4>Durability reference</h4>
+      <p>What is durable when, stated per layer rather than per marketing claim.</p>
+      <span class="path">docs/runbooks/durability.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/docs/runbooks/failover.md">
+      <h4>Failover runbook</h4>
+      <p>Node loss and recovery.</p>
+      <span class="path">docs/runbooks/failover.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/docs/runbooks/restore.md">
+      <h4>Restore runbook</h4>
+      <p>Getting a project back from snapshots.</p>
+      <span class="path">docs/runbooks/restore.md</span>
+    </a>
+  </div>
+</section>
+
+<section class="doc" id="hot-tier">
+  <span class="eyebrow">13 · recent writes</span>
+  <h2>HTAP hot tier</h2>
+  <p>
+    A columnar file on object storage is a wonderful thing to scan and a miserable thing to
+    update one row of. The hot tier is the answer: a row-format, LSM-style memtable in front of
+    the columnar files, holding recent writes and tombstones, merged into reads.
+  </p>
+  <p>
+    The UPDATE and DELETE fast paths are <strong>on by default</strong> as of the Phase 5.14
+    closure. If they misbehave in your workload you can roll them back without a redeploy by
+    setting <code>BASIN_HOTTIER_FASTPATH_DISABLE=1</code> — the kill switch is documented in
+    <a class="link" href="https://github.com/vul-os/basin/blob/main/docs/decisions/0016-htap-hot-tier-architecture.md">ADR&nbsp;0016</a>.
+  </p>
+  <p>
+    The shape this buys, from the 2026-06-11 integrity cards: point-query p50 is sub-millisecond
+    at every scale (0.06 ms at 10k rows, 0.12 ms at 100k, 0.50 ms at 1M) and single-row UPDATE
+    p50 lands at 0.33 / 0.64 / 1.24 ms across the same scales. Postgres, with a primary-key
+    btree, is still microsecond-class on those shapes. Read
+    <a class="link" href="#benchmarks">Benchmarks</a> before drawing a conclusion.
+  </p>
+</section>
+
+<section class="doc" id="time-travel">
+  <span class="eyebrow">14 · history</span>
+  <h2>Snapshots &amp; forks</h2>
+  <p>
+    Because the catalog is Iceberg-style, table history is a first-class object rather than a
+    backup product. Two catalog operations matter:
+  </p>
+  <dl class="defs">
+    <div><dt>rollback_to_snapshot</dt><dd><code>Catalog::rollback_to_snapshot(project, table, snapshot_id)</code> rewinds a table to a previous snapshot.</dd></div>
+    <div><dt>fork_table</dt><dd><code>Catalog::fork_table(project, src, dst)</code> clones a table's metadata and snapshot history into a sibling that diverges on the next commit. Zero data copied until divergence.</dd></div>
+  </dl>
+  <div class="note warn">
+    <span class="lbl">Not yet SQL</span>
+    <p>
+      These are catalog APIs. <code>AS OF SNAPSHOT</code> and <code>AS OF TIMESTAMP</code> are
+      <strong>not accepted by the parser today</strong> — the SQL surface for time travel is
+      planned, not shipped. If you read "time travel" elsewhere and assumed a query clause, this
+      is the correction.
+    </p>
+  </div>
+</section>
+
+<!-- ══ BATTERIES ════════════════════════════════════════════════════ -->
+
+<section class="doc" id="auth">
+  <span class="eyebrow">15 · identity</span>
+  <h2>Auth</h2>
+  <p>
+    <code>basin-auth</code> ships signup, signin, magic links, JWT issuance with refresh-token
+    rotation, OAuth providers, MFA factors and per-project API keys. Identity tables —
+    <code>users</code>, <code>sessions</code>, <code>refresh_tokens</code>,
+    <code>oauth_identities</code> — live in the project's own <code>auth</code> schema, so an RLS
+    policy can reference them without a cross-project hop.
+  </p>
+  <!-- No language class: highlight.js's http grammar colours nothing without a
+       full request line, and a chip claiming "http" over uncoloured text is the
+       exact failure this page is meant to avoid. The verbs are marked directly. -->
+  <div class="codeblock" data-cap="HTTP surface — Supabase-shaped">
+    <pre><code><span class="hljs-keyword">POST</span> /auth/v1/signup           <span class="hljs-comment">{ email, password }</span>
+<span class="hljs-keyword">POST</span> /auth/v1/token?grant_type=password
+<span class="hljs-keyword">POST</span> /auth/v1/token?grant_type=refresh_token
+<span class="hljs-keyword">POST</span> /auth/v1/magiclink        <span class="hljs-comment">{ email }</span>
+<span class="hljs-keyword">POST</span> /auth/v1/logout
+<span class="hljs-keyword">GET</span>  /auth/v1/user</code></pre>
+  </div>
+  <p>
+    Turning it on takes <code>BASIN_AUTH_ENABLED=1</code>, a JWT secret, and SMTP settings if you
+    want email verification, magic links or password reset to actually deliver.
+  </p>
+  <div class="note warn">
+    <span class="lbl">Off by default</span>
+    <p>
+      Auth and REST are <strong>disabled</strong> in the default build and in the Docker image.
+      Some pages in the repository imply the quickstart container serves
+      <code>/auth/v1/…</code> on the pgwire port; it does not. REST listens on its own bind
+      (<code>BASIN_REST_BIND</code>, default <code>127.0.0.1:5434</code>) and only starts when
+      auth is on.
+    </p>
+  </div>
+</section>
+
+<section class="doc" id="rest">
+  <span class="eyebrow">16 · http</span>
+  <h2>REST API</h2>
+  <p>
+    Every table is reachable as a PostgREST-compatible surface. No codegen step, no schema
+    mirror file — create a table and the endpoints exist.
+  </p>
+  <div class="codeblock" data-cap="crates/basin-rest">
+    <pre><code><span class="hljs-keyword">GET</span>    /rest/v1/&lt;table&gt;?select=*&amp;owner_id=eq.&lt;uuid&gt;
+<span class="hljs-keyword">POST</span>   /rest/v1/&lt;table&gt;          <span class="hljs-comment">(body: row or [row, …])</span>
+<span class="hljs-keyword">PATCH</span>  /rest/v1/&lt;table&gt;?id=eq.42
+<span class="hljs-keyword">DELETE</span> /rest/v1/&lt;table&gt;?id=eq.42
+<span class="hljs-keyword">POST</span>   /rest/v1/rpc/&lt;fn&gt;         <span class="hljs-comment">(body: JSON named arguments)</span>
+<span class="hljs-keyword">GET</span>    /rest/v1/_openapi.json    <span class="hljs-comment">(OpenAPI 3.0, auto-generated)</span></code></pre>
+  </div>
+  <p>
+    Filters, ordering, keyset cursor pagination, NDJSON streaming responses,
+    <code>Prefer: return=representation</code>, batch inserts and <code>on_conflict=…</code>
+    upsert all follow the PostgREST shape. JWTs from <code>basin-auth</code> flow into SQL
+    session state, so RLS gates an HTTP request exactly as it gates a pgwire query. The RPC
+    mount dispatches to functions created with <code>LANGUAGE sql</code> or
+    <code>LANGUAGE wasm</code>.
+  </p>
+  <div class="note">
+    <span class="lbl">Fail-closed by construction</span>
+    <p>
+      Setting <code>BASIN_REST_ENABLED=1</code> without <code>BASIN_AUTH_ENABLED=1</code> makes
+      the server <strong>refuse to start</strong>, per
+      <a class="link" href="https://github.com/vul-os/basin/blob/main/docs/decisions/0006-rest-api-layer.md">ADR&nbsp;0006</a>.
+      A REST stack without auth is the largest data-leak class the project knows how to ship,
+      so it is a startup error rather than a warning in a log nobody reads.
+    </p>
+  </div>
+</section>
+
+<section class="doc" id="realtime">
+  <span class="eyebrow">17 · push</span>
+  <h2>Realtime</h2>
+  <p>
+    Row-change events stream over SSE for browsers or WebSocket for richer clients. Presence
+    channels — <code>track</code>, <code>untrack</code>, <code>presence_state</code>,
+    <code>presence_diff</code> — ride the same WebSocket multiplex.
+  </p>
+  <div class="codeblock" data-cap="browser">
+    <pre><code class="language-javascript">// Server-sent events: one table, no handshake to write.
+const es = new EventSource("/realtime/v1/sse/proj_abc/notes");
+es.addEventListener("message", (e) =&gt; applyChange(JSON.parse(e.data)));
+
+// WebSocket multiplex: many tables plus presence on one socket.
+const ws = new WebSocket("wss://example.com/realtime/v1/ws/proj_abc");
+ws.onopen = () =&gt; {
+  ws.send(JSON.stringify({ type: "subscribe", table: "notes" }));
+  ws.send(JSON.stringify({ type: "subscribe", table: "audit_log" }));
+  ws.send(JSON.stringify({ type: "presence.track", room: "doc:42",
+                           payload: { user: "alice" } }));
+};
+ws.onmessage = (m) =&gt; console.log(JSON.parse(m.data));</code></pre>
+  </div>
+  <p>
+    Subscriber-side filter pushdown evaluates the predicate at the sink before bytes reach the
+    wire, so a fanout that only cares about <code>WHERE owner_id = $1</code> does not pay the
+    serialize-then-drop cost. A per-project realtime memory budget keeps one runaway subscriber
+    from starving its siblings. Default binds are <code>127.0.0.1:5435</code> for SSE and
+    <code>127.0.0.1:5436</code> for WebSocket.
+  </p>
+  <p>
+    Separately, <code>LISTEN</code>/<code>NOTIFY</code> works at the SQL level with
+    Postgres-accurate transaction buffering: a <code>NOTIFY</code> inside a transaction is queued
+    and fanned out on <code>COMMIT</code>, discarded on <code>ROLLBACK</code>, channel names are
+    case-insensitive, and <code>pg_listening_channels()</code> reflects session state. Use
+    <code>LISTEN</code>/<code>NOTIFY</code> for in-database pub/sub and the realtime layer for
+    push to web clients.
+  </p>
+  <div class="note warn">
+    <span class="lbl">Harness-gated</span>
+    <p>
+      The implementation is complete and single-client smoke tests run on every commit, but a
+      few cross-client soak slices are still <code>#[ignore]</code>-gated. That is a coverage
+      gap, not a known correctness gap — worth knowing which one you are relying on.
+    </p>
+  </div>
+</section>
+
+<section class="doc" id="blob">
+  <span class="eyebrow">18 · files</span>
+  <h2>Blob storage</h2>
+  <p>
+    <code>basin-blob</code> is a catalog-backed object store with a public
+    <code>/storage/v1/</code> REST surface, wired end to end.
+  </p>
+  <ul class="bullets">
+    <li><strong>Buckets</strong> — create, get, delete; deleting a bucket purges orphaned objects.</li>
+    <li><strong>Objects</strong> — upload with server-side MIME sniffing, download, prefix list with paging, single delete and bulk delete by prefix.</li>
+    <li><strong>Public fast path</strong> — <code>GET /storage/v1/object/public/:project/:bucket/*path</code> serves objects in public buckets with no JWT.</li>
+    <li><strong>Signed URLs</strong> — HMAC-SHA256 over <code>(project, bucket, path, expiry)</code>, constant-time verification, and independent signing-key rotation that invalidates outstanding tokens.</li>
+    <li><strong>Per-object RLS</strong> — owner / role / true / false predicates with Postgres permissive OR-merge semantics, enforced on both download and list.</li>
+    <li><strong>Quota accounting</strong> — a per-project <code>bytes_written_total</code> counter, incremented on upload and decremented on delete.</li>
+  </ul>
+  <p>
+    Deferred to a later version: <code>HEAD</code> and <code>COPY</code> object operations,
+    resumable multipart/TUS uploads, image transforms, object versioning and cross-project
+    object sharing. Quota <em>enforcement</em> — rejecting writes past a limit — is deliberately
+    above this crate rather than inside it.
+  </p>
+</section>
+
+<section class="doc" id="vector">
+  <span class="eyebrow">19 · similarity</span>
+  <h2>Vector search</h2>
+  <p>
+    <code>vector(N)</code> is a native column type, not an extension and not a sidecar. The HNSW
+    index lives per file alongside the columnar data. The planner auto-routes
+    <code>ORDER BY x &lt;-&gt; $1 LIMIT k</code> to the HNSW probe, so there is no separate
+    "use the index" query to write.
+  </p>
+  <div class="codeblock" data-cap="docs/batteries.md">
+    <pre><code class="language-sql">CREATE TABLE docs (
+  id        BIGSERIAL PRIMARY KEY,
+  text      TEXT NOT NULL,
+  embedding vector(1536) NOT NULL
+);
+CREATE INDEX ON docs USING hnsw (embedding vector_cosine_ops);
+
+SELECT id, text FROM docs
+ORDER BY embedding &lt;-&gt; $1::vector
+LIMIT 10;</code></pre>
+  </div>
+  <p>
+    Operators match pgvector: <code>&lt;-&gt;</code> for L2, <code>&lt;#&gt;</code> for negative
+    inner product, <code>&lt;=&gt;</code> for cosine distance. Existing pgvector client code
+    works, but <code>CREATE EXTENSION pgvector</code> is rejected — the type is already there.
+    IVF-flat and the pgvector <em>binary</em> wire format are explicit non-goals.
+  </p>
+</section>
+
+<section class="doc" id="extensions">
+  <span class="eyebrow">20 · the usual suspects</span>
+  <h2>Extension equivalents</h2>
+  <p>
+    The handful of extensions that real applications actually reach for are compiled into the
+    binary as native crates. No <code>CREATE EXTENSION</code> step, no per-project
+    <code>.so</code> install, no shared-library version skew across a fleet.
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th scope="col">Postgres extension</th><th scope="col">Basin equivalent</th><th scope="col">Crate</th></tr></thead>
+      <tbody>
+        <tr><td><code>pg_cron</code></td><td><code>cron.schedule(…)</code> plus the scheduler</td><td><code>basin-cron</code></td></tr>
+        <tr><td><code>pg_net</code>, <code>http</code></td><td><code>net.http_get</code> / <code>net.http_post</code> UDFs</td><td><code>basin-net</code></td></tr>
+        <tr><td><code>pg_trgm</code></td><td><code>%</code> similarity operator and trigram index</td><td><code>basin-trgm</code></td></tr>
+        <tr><td>PostGIS (POINT subset)</td><td><code>ST_DWithin</code>, <code>ST_Distance</code> on POINT</td><td><code>basin-geo</code></td></tr>
+        <tr><td>TimescaleDB continuous aggregates</td><td>Continuous materialized views</td><td><code>basin-cv</code></td></tr>
+        <tr><td><code>pgcrypto</code>, <code>uuid-ossp</code></td><td><code>gen_random_uuid</code>, <code>crypt</code>, <code>digest</code>, …</td><td>core engine</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="codeblock" data-cap="a scheduled job and a continuous aggregate">
+    <pre><code class="language-sql">SELECT cron.schedule(
+  'gc-old-notes',
+  '0 3 * * *',
+  'DELETE FROM notes WHERE created_at &lt; now() - INTERVAL ''90 days'''
+);
+
+CREATE MATERIALIZED VIEW notes_per_day
+WITH (basin.cv = 'continuous', basin.refresh = '1 day')
+AS
+SELECT owner_id, date_trunc('day', created_at) AS day, count(*) AS n
+FROM   notes
+GROUP  BY 1, 2;</code></pre>
+  </div>
+</section>
+
+<section class="doc" id="functions">
+  <span class="eyebrow">21 · compute</span>
+  <h2>Wasm functions</h2>
+  <p>
+    In-engine compute runs as WebAssembly, sandboxed by <code>wasmtime</code>. The function body
+    is a bare Wasm module — anything targeting <code>wasm32-unknown-unknown</code> that respects
+    the host ABI, so Rust, Zig, Go or AssemblyScript all work.
+  </p>
+  <div class="codeblock">
+    <pre><code class="language-sql">CREATE FUNCTION square(n INT) RETURNS INT
+LANGUAGE wasm AS '&lt;base64-encoded-wasm-module&gt;';
+
+SELECT square(5);  -- → 25</code></pre>
+  </div>
+  <p>
+    v0.1 covers scalar arguments and returns of <code>i32</code>, <code>i64</code>,
+    <code>f64</code>, <code>text</code>, <code>bytea</code> and <code>timestamptz</code>. Resource
+    caps land per call — a linear-memory ceiling, an instruction budget via Wasmtime epoch
+    interruption, and a fuel limit — so a runaway function is interrupted rather than pinning a
+    thread.
+  </p>
+  <p>
+    Variable-length values cross the host/guest boundary over a <code>(ptr, len)</code>
+    linear-memory ABI: the module exports <code>memory</code>, <code>basin_alloc(i32) -&gt; i32</code>
+    and <code>basin_dealloc(i32, i32)</code>; the host writes bytes into guest memory and the
+    guest packs its return as a <code>(ptr &lt;&lt; 32) | len</code> <code>i64</code>, with
+    <code>len = -1</code> signalling SQL <code>NULL</code>.
+  </p>
+  <ul class="bullets">
+    <li><strong>No dedicated JSONB argument type.</strong> Declare the argument <code>text</code> and parse the canonical JSON bytes inside the module.</li>
+    <li><strong>Execution is per row.</strong> Vectorized whole-array invocation is deferred. For bulk string or JSONB transforms prefer <code>LANGUAGE sql</code> — the SQL surface already covers <code>regexp_match</code>, <code>jsonb_path_query</code>, <code>jsonb_set</code>, <code>format</code>, <code>encode</code>/<code>decode</code> and the rest of that family.</li>
+  </ul>
+</section>
+
+<section class="doc" id="not-shipped">
+  <span class="eyebrow">22 · the noes</span>
+  <h2>Deliberate omissions</h2>
+  <p>
+    Every "no" in Basin has a one-page rationale that includes the trigger which would change
+    the answer. Three are worth stating on this page because they are the ones people assume are
+    coming.
+  </p>
+  <h3>Edge functions on a V8 isolate pool</h3>
+  <p>
+    Not shipped, not on the roadmap. The compute-close-to-data case is covered by two primitives
+    that do not require an isolate pool: in-engine Wasm UDFs for per-row compute in the same
+    process as the data, and declarative inbound webhooks plus the RPC mount, which cover most of
+    the BaaS edge-function taxonomy as SQL. A geographically distributed V8 pool is a different
+    product with a different operational shape.
+  </p>
+  <h3>Triggers and PL/pgSQL</h3>
+  <p>
+    Not shipped. Declarative lifecycle columns, SQL-bodied reactors and
+    <code>LANGUAGE sql</code>/<code>LANGUAGE wasm</code> functions cover audit-log-on-INSERT,
+    computed-column refresh and fanout-on-UPDATE. Cursor-driven loops and
+    <code>EXCEPTION</code> handling inside a trigger body are the explicit remainder, and they
+    are a non-goal.
+  </p>
+  <h3>Loadable extensions</h3>
+  <p>
+    Not shipped. An <code>.so</code> extension can read any project's pages out of shared memory,
+    runs outside Basin's project-scoped I/O wrappers, and turns "one binary, one bill" into a
+    dependency tree to patch. That is three broken invariants for one feature.
+  </p>
+</section>
+
+<!-- ══ CLIENTS ══════════════════════════════════════════════════════ -->
+
+<section class="doc" id="sdks">
+  <span class="eyebrow">23 · clients</span>
+  <h2>Client SDKs</h2>
+  <p>
+    <strong>Ten first-party SDKs</strong>, all MIT-licensed, all talking to a Basin engine
+    directly over REST and pgwire. They live in the monorepo under <code>sdks/</code> and are
+    versioned alongside the engine they target: <strong>Dart, .NET, Go, Java, JavaScript/TypeScript,
+    PHP, Python, Ruby, Rust and Swift</strong>. Each carries its own tests, README and roadmap.
+  </p>
+  <div class="codeblock" data-cap="sdks/js">
+    <pre><code class="language-typescript">import { createClient } from "@bas-in/basin-js";
+
+const basin = createClient(process.env.BASIN_URL!, process.env.BASIN_ANON_KEY!);
+
+await basin.auth.signInWithPassword({ email: "you@example.com", password: "…" });
+
+const { data, error } = await basin
+  .from&lt;{ id: number; name: string; price: number }&gt;("products")
+  .select("id, name, price")
+  .eq("active", true)
+  .order("price", { ascending: true })
+  .limit(10);
+
+basin
+  .channel("orders-feed")
+  .on("postgres_changes", { event: "INSERT", table: "orders" }, (payload) =&gt; {
+    console.log("new order:", payload.new);
+  })
+  .subscribe();</code></pre>
+  </div>
+  <div class="codeblock" data-cap="sdks/py">
+    <pre><code class="language-python">from basin import create_client
+
+client = create_client(BASIN_URL, BASIN_ANON_KEY)
+
+res = await client.from_("users").select("*").eq("active", True).limit(50)
+
+# Cursor pagination with NDJSON streaming — a basin-specific affordance.
+async for row in client.from_("events").select().paginate():
+    ...
+
+await client.auth.sign_in_with_password(email=..., password=...)
+await client.functions.invoke("monthly_rollup", {"month": "2026-05"})</code></pre>
+  </div>
+
+  <h3>Parity, honestly</h3>
+  <p>
+    <code>docs/sdk-parity.md</code> is a capability-by-language grid, and the point of it is the
+    holes. Filters, ordering, keyset pagination, CRUD, RPC, the full auth surface including MFA
+    and OAuth, API keys, realtime change events with reconnect and replay, storage and a typed
+    error model are <strong>uniform across all ten</strong>. These are not:
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th scope="col">Capability</th><th scope="col">Where it exists</th></tr></thead>
+      <tbody>
+        <tr><td>Arrow IPC transport</td><td class="part">5 of 10 — .NET, Go, JS, Python, Rust (feature-gated)</td></tr>
+        <tr><td>NDJSON streaming</td><td class="part">5 of 10 — Dart, JS, PHP, Python, Ruby</td></tr>
+        <tr><td>SQLSTATE on errors</td><td class="part">4 of 10 — .NET, Go, Java, Rust</td></tr>
+        <tr><td>Presence send (<code>track</code>/<code>untrack</code>)</td><td class="part">9 of 10 — Rust exposes a read-only event stream only</td></tr>
+        <tr><td>Realtime transport</td><td class="part">PHP needs an optional WebSocket package installed separately</td></tr>
+        <tr><td>Richer PostgREST filters (<code>or</code>, <code>not</code>, <code>like</code>, embeds)</td><td class="no">0 of 10</td></tr>
+        <tr><td>Transactions / <code>BEGIN</code>–<code>COMMIT</code></td><td class="no">0 of 10 — use pgwire directly</td></tr>
+        <tr><td><code>COPY</code> / bulk-insert path</td><td class="no">0 of 10</td></tr>
+        <tr><td>Vector / similarity search helpers</td><td class="no">0 of 10 — use SQL via RPC</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    Package names are <code>@bas-in/basin-js</code> (npm and JSR) and <code>basin-sdk</code> on
+    PyPI, importable as <code>basin</code>. Both are v0.x; the Python distribution is not
+    published yet, so build it from <code>sdks/py</code> in the meantime.
+  </p>
+</section>
+
+<section class="doc" id="orms">
+  <span class="eyebrow">24 · existing code</span>
+  <h2>ORMs &amp; migrations</h2>
+  <p>
+    Because the extended query protocol is real, ORMs that funnel through
+    <code>tokio-postgres</code>, <code>asyncpg</code> or <code>pgjdbc</code> mostly work without
+    knowing what they are talking to. Diesel, SeaORM, Prisma, SQLAlchemy and ActiveRecord are the
+    shapes the smoke test models.
+  </p>
+  <div class="cards">
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/docs/orm-compat.md">
+      <h4>ORM compatibility</h4>
+      <p>Per-ORM notes and the patterns that need adjusting.</p>
+      <span class="path">docs/orm-compat.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/docs/migration-tools.md">
+      <h4>Migration tools</h4>
+      <p><code>sqlx</code>, <code>flyway</code> and <code>golang-migrate</code> against Basin.</p>
+      <span class="path">docs/migration-tools.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/docs/sql-compatibility.md">
+      <h4>Compatibility survey</h4>
+      <p>The seven ORM protocol patterns and their results.</p>
+      <span class="path">docs/sql-compatibility.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/docs/sql-support.md">
+      <h4>Generated matrix</h4>
+      <p>Every fragment, every configuration, regenerated by the test suite.</p>
+      <span class="path">docs/sql-support.md</span>
+    </a>
+  </div>
+</section>
+
+<section class="doc" id="cli">
+  <span class="eyebrow">25 · terminal</span>
+  <h2>Command line</h2>
+  <p>
+    <code>basinctl</code> is the administrative CLI for a running engine. It takes a connection
+    string from <code>--url</code> or <code>BASIN_URL</code> and does the things you reach for at
+    2am.
+  </p>
+  <div class="codeblock" data-cap="services/basinctl">
+    <pre><code class="language-bash">basinctl ping postgres://alice@127.0.0.1:5433/alice   # SELECT 1, prints "OK in <ms>"
+basinctl tables                                       # SHOW TABLES
+basinctl query "SELECT count(*) FROM events"
+basinctl version                                      # version + git short SHA
+
+# Migrate schema and data from a live PostgreSQL.
+basinctl import-from-postgres --source postgres://…
+
+# Scaffold, build and deploy a Wasm function.
+basinctl fn new hello && basinctl fn build && basinctl fn deploy</code></pre>
+  </div>
+  <p>
+    <code>import-from-postgres</code> enumerates schemas and tables through
+    <code>information_schema</code>, translates DDL into Basin's dialect (<code>serial</code>
+    becomes a <code>BIGINT</code> identity; <code>uuid</code>, <code>jsonb</code>,
+    <code>citext</code> and <code>vector</code> pass through), skips what it cannot represent
+    with a loud per-object report, then streams rows with binary <code>COPY</code> — falling back
+    to CSV for types binary COPY rejects — and verifies row counts at the end.
+  </p>
+  <p>
+    <code>basinctl reset-auth --yes</code> drops the auth namespace and nothing else, for test
+    environments and broken-state recovery; the next server restart rebootstraps an empty schema.
+  </p>
+  <div class="note">
+    <span class="lbl">A second binary exists</span>
+    <p>
+      The repository also carries <code>cli/</code>, a separate Rust binary named
+      <code>basin</code> aimed at a hosted control-plane API rather than at an engine. Self-hosting
+      needs only <code>basinctl</code>. Note that two docs pages describe this CLI as a Go
+      binary — it is Rust; <code>cli/Cargo.toml</code> is the ground truth.
+    </p>
+  </div>
+</section>
+
+<!-- ══ OPERATIONS ═══════════════════════════════════════════════════ -->
+
+<section class="doc" id="configuration">
+  <span class="eyebrow">26 · knobs</span>
+  <h2>Configuration</h2>
+  <p>
+    <strong>All server configuration is environment variables.</strong> There is no server
+    config file — the <code>.basin-test*.toml</code> files at the repository root are integration
+    test and benchmark fixtures read via <code>BASIN_TEST_CONFIG</code>, not something
+    <code>basin-server</code> ever loads.
+  </p>
+
+  <h3>Core</h3>
+  <dl class="defs">
+    <div><dt>BASIN_BIND</dt><dd>pgwire listen address. <code>127.0.0.1:5433</code> from source, <code>0.0.0.0:5432</code> in the image.</dd></div>
+    <div><dt>BASIN_DATA_DIR</dt><dd>Data root. Mount a volume here for persistence; <code>/var/basin</code> in the image.</dd></div>
+    <div><dt>BASIN_PROJECTS</dt><dd>Comma-separated <code>user=project_id</code> pairs; <code>*</code> allocates a ULID.</dd></div>
+    <div><dt>BASIN_CATALOG</dt><dd><code>memory</code> (default, volatile), <code>object_store</code> (durable and shared, no external database), or a <code>postgres://…</code> DSN.</dd></div>
+    <div><dt>BASIN_CATALOG_PREFIX</dt><dd>Bucket prefix for the object-store catalog. Default <code>_catalog</code>.</dd></div>
+    <div><dt>BASIN_CATALOG_SCHEMA</dt><dd>Schema name for the Postgres catalog. Default <code>basin_catalog</code>.</dd></div>
+    <div><dt>BASIN_WAL_DIR</dt><dd>WAL directory. Wants a durable volume. In raft mode, log/vote/snapshot persist under <code>${BASIN_WAL_DIR}/raft</code>.</dd></div>
+    <div><dt>BASIN_SHARD_ENABLED</dt><dd><code>1</code> routes writes through the WAL and compactor. Off by default.</dd></div>
+    <div><dt>BASIN_POOL_ENABLED</dt><dd><code>1</code> enables the native session pool, which caches warm sessions for short-lived clients. Off by default.</dd></div>
+    <div><dt>BASIN_MAX_CONNECTIONS</dt><dd>Connection ceiling.</dd></div>
+    <div><dt>BASIN_TLS_CERT_PATH / _KEY_PATH</dt><dd>TLS material; <code>_PEM</code> variants take the contents inline.</dd></div>
+  </dl>
+
+  <h3>Subsystems</h3>
+  <dl class="defs">
+    <div><dt>BASIN_AUTH_ENABLED</dt><dd>Turns on <code>basin-auth</code>. Pair with <code>BASIN_AUTH_JWT_SECRET</code> and the <code>BASIN_AUTH_SMTP_*</code> family.</dd></div>
+    <div><dt>BASIN_REST_ENABLED / BASIN_REST_BIND</dt><dd>REST layer and its own listen address, default <code>127.0.0.1:5434</code>. Requires auth to be on or the process refuses to start.</dd></div>
+    <div><dt>BASIN_REALTIME_BIND / _WS_BIND</dt><dd>SSE and WebSocket binds, defaults <code>127.0.0.1:5435</code> and <code>127.0.0.1:5436</code>.</dd></div>
+    <div><dt>BASIN_HOTTIER_FASTPATH_DISABLE</dt><dd><code>1</code> rolls back the UPDATE/DELETE fast paths without a redeploy.</dd></div>
+    <div><dt>BASIN_PG_QUERY / _PLAN</dt><dd>Opt into the <code>libpg_query</code> parser and the Postgres-AST-to-DataFusion planner.</dd></div>
+    <div><dt>BASIN_QUERY_COST_LIMIT_ROWS</dt><dd>Per-query row budget.</dd></div>
+    <div><dt>BASIN_CDC_RETENTION_HOURS</dt><dd>How long the change-data ring holds events.</dd></div>
+    <div><dt>BASIN_DISK_CACHE_* / BASIN_PAGE_CACHE_MAX_BYTES</dt><dd>The NVMe disk cache and in-memory page cache that keep hot files off the object store.</dd></div>
+  </dl>
+  <p>
+    That is the load-bearing subset. The full surface is roughly 110 <code>BASIN_*</code>
+    variables; <code>services/basin-server/src/main.rs</code> documents them at the top of the
+    file, which is the only place guaranteed to be current.
+  </p>
+</section>
+
+<section class="doc" id="object-storage">
+  <span class="eyebrow">27 · the bucket</span>
+  <h2>Object storage</h2>
+  <p>
+    The same binary runs against the local filesystem, S3, or any S3-compatible store. Only the
+    environment changes.
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th scope="col">Basin key</th><th scope="col">AWS fallback</th><th scope="col">Required</th><th scope="col">Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>BASIN_STORAGE_BACKEND</code></td><td>—</td><td class="part">inferred</td><td><code>local</code>, <code>s3</code> or <code>tigris</code></td></tr>
+        <tr><td><code>BASIN_STORAGE_BUCKET</code></td><td><code>BUCKET_NAME</code></td><td class="yes">yes</td><td></td></tr>
+        <tr><td><code>BASIN_STORAGE_ENDPOINT</code></td><td><code>AWS_ENDPOINT_URL_S3</code></td><td>no</td><td>Tigris defaults to <code>https://fly.storage.tigris.dev</code></td></tr>
+        <tr><td><code>BASIN_STORAGE_REGION</code></td><td><code>AWS_REGION</code></td><td>no</td><td>Defaults: <code>auto</code> for Tigris, <code>us-east-1</code> for S3</td></tr>
+        <tr><td><code>BASIN_STORAGE_ACCESS_KEY_ID</code></td><td><code>AWS_ACCESS_KEY_ID</code></td><td class="yes">yes</td><td></td></tr>
+        <tr><td><code>BASIN_STORAGE_SECRET_ACCESS_KEY</code></td><td><code>AWS_SECRET_ACCESS_KEY</code></td><td class="yes">yes</td><td></td></tr>
+        <tr><td><code>BASIN_STORAGE_SESSION_TOKEN</code></td><td>—</td><td>no</td><td>STS deployments only</td></tr>
+        <tr><td><code>BASIN_STORAGE_ROOT_PREFIX</code></td><td>—</td><td>no</td><td>Sub-prefix inside the bucket</td></tr>
+        <tr><td><code>BASIN_STORAGE_ALLOW_HTTP</code></td><td>—</td><td>no</td><td>Required for a plaintext endpoint — otherwise a non-HTTPS endpoint is a hard error</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    If <code>BASIN_STORAGE_BACKEND</code> is unset but <code>AWS_ENDPOINT_URL_S3</code> is
+    present, the provider is inferred from the endpoint host — a <code>tigris.dev</code> host
+    means Tigris, anything else means S3. Where both a canonical key and an AWS fallback are set,
+    the <code>BASIN_STORAGE_*</code> key wins. Both behaviours are covered by unit tests rather
+    than by hope.
+  </p>
+  <p>
+    Client tuning lives alongside: <code>BASIN_S3_POOL_MAX_IDLE</code> (64),
+    <code>BASIN_S3_POOL_IDLE_TIMEOUT_SECS</code> (20), <code>BASIN_S3_MAX_RETRIES</code> (3),
+    <code>BASIN_S3_RETRY_TIMEOUT_SECS</code> (30) and
+    <code>BASIN_S3_REQUEST_TIMEOUT_SECS</code> (30).
+  </p>
+</section>
+
+<section class="doc" id="deployment">
+  <span class="eyebrow">28 · production</span>
+  <h2>Deployment</h2>
+  <p>
+    The recommended shape is <strong>one Basin cluster per region, not per customer</strong>, with
+    the object store in the same metro as the compute — single-digit-to-low-tens-of-milliseconds
+    RTT, and ideally zero egress fees. Multi-region is a deployment decision, not a code path.
+  </p>
+  <div class="codeblock" data-cap="README.md — production-shaped boot">
+    <pre><code class="language-bash">BASIN_BIND=127.0.0.1:5433 \
+BASIN_CATALOG=postgres://postgres@127.0.0.1:5432/postgres \
+BASIN_DATA_DIR=/tmp/basin \
+BASIN_WAL_DIR=/tmp/basin/wal \
+BASIN_PROJECTS='alice=*,bob=*' \
+BASIN_SHARD_ENABLED=1 \
+BASIN_POOL_ENABLED=1 \
+BASIN_AUTH_ENABLED=1 \
+  BASIN_AUTH_JWT_SECRET=$(openssl rand -hex 32) \
+  BASIN_AUTH_SMTP_HOST=smtp.example.com BASIN_AUTH_SMTP_PORT=587 \
+  BASIN_AUTH_SMTP_USERNAME=u BASIN_AUTH_SMTP_PASSWORD=p \
+  BASIN_AUTH_SMTP_FROM=noreply@example.com BASIN_AUTH_SMTP_TLS=starttls \
+BASIN_REST_ENABLED=1 BASIN_REST_BIND=127.0.0.1:5434 \
+cargo run -p basin-server</code></pre>
+  </div>
+  <p>
+    The required set for production-shaped durability is <code>BASIN_BIND</code>, a durable
+    <code>BASIN_CATALOG</code>, <code>BASIN_DATA_DIR</code> or <code>BASIN_STORAGE_BACKEND</code>,
+    <code>BASIN_WAL_DIR</code>, <code>BASIN_PROJECTS</code>, and <code>BASIN_AUTH_ENABLED</code>
+    if you want auth. Everything else is optional.
+  </p>
+
+  <h3>Multi-node</h3>
+  <p>
+    Raft and lease knobs turn a single process into a cluster. Treat this as the v0.2 edge of the
+    project rather than as a settled surface — the shipped default is a single-node file-backed
+    WAL.
+  </p>
+  <dl class="defs">
+    <div><dt>BASIN_WAL_MODE</dt><dd><code>local</code> (default) or <code>raft</code>.</dd></div>
+    <div><dt>BASIN_NODE_ID / BASIN_RAFT_BIND</dt><dd>Node identity and the raft listen address.</dd></div>
+    <div><dt>BASIN_RAFT_PEERS</dt><dd>Peer list, e.g. <code>1@10.0.0.1:6010,2@10.0.0.2:6010,3@10.0.0.3:6010</code>.</dd></div>
+    <div><dt>BASIN_RAFT_TLS_*</dt><dd><code>_CERT</code>, <code>_KEY</code>, <code>_CA</code>, <code>_DOMAIN</code> — default domain <code>basin-raft</code>.</dd></div>
+    <div><dt>BASIN_LEASE_MODE</dt><dd><code>off</code> or <code>required</code>, with <code>BASIN_LEASE_TTL_SECS</code> (15) and <code>BASIN_LEASE_RENEW_SECS</code> (5).</dd></div>
+  </dl>
+
+  <h3>Verifying a release</h3>
+  <div class="codeblock">
+    <pre><code class="language-bash">curl -fsSLO https://raw.githubusercontent.com/vul-os/basin/v0.1.9/scripts/verify.sh
+bash verify.sh --tag v0.1.9 --attest basin-0.1.9-x86_64-unknown-linux-gnu.tar.gz</code></pre>
+  </div>
+</section>
+
+<section class="doc" id="observability">
+  <span class="eyebrow">29 · day two</span>
+  <h2>Observability</h2>
+  <p>
+    Be precise about what exists here, because the repository's own operator pages over-promise.
+    Tracing is OpenTelemetry — <code>tracing-opentelemetry</code> with an OTLP exporter. On the
+    REST bind there are two routes:
+  </p>
+  <dl class="defs">
+    <div><dt>GET /health</dt><dd>Liveness.</dd></div>
+    <div><dt>GET /metrics/inflight</dt><dd>A process-global in-flight and latency snapshot, designed to be polled every ~15 s by a scaler that scales on p99 or in-flight count.</dd></div>
+    <div><dt>GET /admin/v1/usage</dt><dd>Per-project usage counters; <code>/admin/v1/projects/:project_id/usage</code> for one project.</dd></div>
+  </dl>
+  <div class="note warn">
+    <span class="lbl">There is no Prometheus <code>/metrics</code> endpoint</span>
+    <p>
+      Several pages under <code>docs/operators/</code> and one design document describe a
+      Prometheus scrape endpoint and name metrics such as <code>basin_memtable_bytes</code> or
+      <code>basin_page_cache_hits_total</code>. No <code>/metrics</code> route is registered
+      anywhere in this repository, and no Prometheus exporter crate is a dependency. Those
+      documents describe an external exporter or unbuilt work. Plan your monitoring against OTLP
+      and <code>/metrics/inflight</code>.
+    </p>
+  </div>
+
+  <h3>Operator guides</h3>
+  <div class="cards">
+    <a class="card" href="https://github.com/vul-os/basin/tree/main/docs/operators">
+      <h4>Operator runbooks</h4>
+      <p>Storage, realtime, session pool, lease ownership, quotas, Wasm functions, the dev stack and the three-way pg-compat differential.</p>
+      <span class="path">docs/operators/</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/tree/main/docs/runbooks">
+      <h4>Incident runbooks</h4>
+      <p>Durability reference, failover, restore.</p>
+      <span class="path">docs/runbooks/</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/tree/main/docs/scaling">
+      <h4>Scaling notes</h4>
+      <p>Object-storage throughput, read replicas, shard split and rebalance.</p>
+      <span class="path">docs/scaling/</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/tree/main/docs/audits">
+      <h4>Audits</h4>
+      <p>Security, noisy-neighbour fairness, and Wasm-function performance and governance.</p>
+      <span class="path">docs/audits/</span>
+    </a>
+  </div>
+</section>
+
+<section class="doc" id="benchmarks">
+  <span class="eyebrow">30 · measurement</span>
+  <h2>Benchmarks</h2>
+  <p>
+    Basin publishes <strong>every</strong> head-to-head number, wins and losses, regenerated from
+    integration tests. The picture is workload-dependent and the losses are the interesting part,
+    so here is the shape rather than a highlight reel.
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th scope="col">Shape (1M rows, LocalFS, no index either side)</th><th scope="col">Basin</th><th scope="col">Postgres 18</th></tr></thead>
+      <tbody>
+        <tr><td>LATERAL JOIN (correlated derived table)</td><td class="yes">6.7 ms</td><td>3,080 ms</td></tr>
+        <tr><td>Star join (events ⋈ users ⋈ categories)</td><td class="yes">11.6 ms</td><td>3,040 ms</td></tr>
+        <tr><td>Range scan p50 (~1k rows)</td><td class="yes">0.40 ms</td><td>32 ms</td></tr>
+        <tr><td>Bulk INSERT 1,000,000 rows</td><td class="yes">2,080 ms</td><td>8,100 ms</td></tr>
+        <tr><td>Point query p50 (unindexed PK)</td><td class="no">0.50 ms</td><td>0.002 ms</td></tr>
+        <tr><td>Single-row UPDATE p50</td><td class="no">1.24 ms</td><td>0.012 ms</td></tr>
+        <tr><td>Deep top-K sort (<code>ORDER BY … LIMIT 1000</code>)</td><td class="no">161 ms</td><td>53 ms</td></tr>
+        <tr><td>Bulk UPDATE (~1/3 of rows)</td><td class="no">9.4 s</td><td>3.4 s</td></tr>
+        <tr><td>On-disk bytes (users + events)</td><td class="no">321 MB</td><td>306 MB</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    Read those numbers with three caveats attached, all of which the project states itself.
+    First, they come from a single idle-box local session on 2026-06-11, not a controlled lab.
+    Second, <strong>Basin's default acknowledges writes before fsync while the Postgres numbers
+    are fsync-durable per commit</strong> — see <a class="link" href="#durability">durability</a>.
+    Third, the on-disk row is an honest flip: Basin is 5% larger on this card, 1.9× smaller at
+    100k rows, and 102× smaller on the real-S3 card. A single number from any of these tables,
+    quoted without its scale and its card, is misinformation.
+  </p>
+  <div class="cards">
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/benchmark/BENCHMARKS.md">
+      <h4>Methodology</h4>
+      <p>How the numbers are produced, the robust estimator, and why losses are published.</p>
+      <span class="path">benchmark/BENCHMARKS.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/benchmark/RESULTS_localfs.md">
+      <h4>LocalFS results</h4>
+      <p>The per-scale matrix at 10k, 100k and 1M rows.</p>
+      <span class="path">benchmark/RESULTS_localfs.md</span>
+    </a>
+  </div>
+</section>
+
+<!-- ══ REFERENCE ════════════════════════════════════════════════════ -->
+
+<section class="doc" id="crates">
+  <span class="eyebrow">31 · the map</span>
+  <h2>Crate map</h2>
+  <p>
+    Twenty-seven crates under <code>crates/</code> plus four services under
+    <code>services/</code>. Descriptions below are each crate's own module documentation.
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th scope="col">Crate</th><th scope="col">What it is</th></tr></thead>
+      <tbody>
+        <tr><td><code>basin-router</code></td><td>pgwire v3 front end</td></tr>
+        <tr><td><code>basin-engine</code></td><td>Single-process SQL execution engine — DataFusion planner, per-project sessions</td></tr>
+        <tr><td><code>basin-shard</code></td><td>Stateful shard owner, with the WAL-to-columnar compactor</td></tr>
+        <tr><td><code>basin-wal</code></td><td>Write-ahead log for the shard owner</td></tr>
+        <tr><td><code>basin-storage</code></td><td>Project-aware columnar-on-object-store substrate</td></tr>
+        <tr><td><code>basin-catalog</code></td><td>Typed Iceberg-style catalog client used by the rest of the workspace</td></tr>
+        <tr><td><code>basin-hottier</code></td><td>Row-format LSM-style hot-tier memtable for recent writes</td></tr>
+        <tr><td><code>basin-pool</code></td><td>Native session pool, keyed on <code>(ProjectId, ClientKey)</code></td></tr>
+        <tr><td><code>basin-placement</code></td><td><code>(project_id, partition_key) → shard_owner_node</code> map</td></tr>
+        <tr><td><code>basin-auth</code></td><td>Auth: signup, signin, JWT, OAuth, MFA, API keys</td></tr>
+        <tr><td><code>basin-rest</code></td><td>PostgREST-compatible HTTP layer</td></tr>
+        <tr><td><code>basin-realtime</code></td><td>WebSocket and SSE change-event fanout</td></tr>
+        <tr><td><code>basin-blob</code></td><td>Catalog-backed object storage</td></tr>
+        <tr><td><code>basin-vector</code></td><td>Native vector search primitives — HNSW</td></tr>
+        <tr><td><code>basin-fn</code></td><td>Wasm component-model host ABI</td></tr>
+        <tr><td><code>basin-cron</code></td><td><code>pg_cron</code>-compatible scheduler</td></tr>
+        <tr><td><code>basin-net</code></td><td>Postgres <code>http</code> / <code>pg_net</code> SQL surface</td></tr>
+        <tr><td><code>basin-trgm</code></td><td><code>pg_trgm</code>-compatible subset for fuzzy text matching</td></tr>
+        <tr><td><code>basin-geo</code></td><td>PostGIS-compatible subset for the most common geo predicates</td></tr>
+        <tr><td><code>basin-cv</code></td><td>TimescaleDB-style continuous aggregates</td></tr>
+        <tr><td><code>basin-cdc</code></td><td>Durable change-data-capture ring plus SSE stream</td></tr>
+        <tr><td><code>basin-webhooks</code></td><td>Disk-backed, idempotency-keyed webhook fanout</td></tr>
+        <tr><td><code>basin-sketch</code></td><td>Probabilistic data-structure types shared across the workspace</td></tr>
+        <tr><td><code>basin-iceberg-rest</code></td><td>Lakekeeper-compatible Iceberg REST catalog server</td></tr>
+        <tr><td><code>basin-autoscale</code></td><td>Engine shard autoscale controller library</td></tr>
+        <tr><td><code>basin-common</code></td><td>Types, errors and telemetry shared by every crate</td></tr>
+        <tr><td><code>basin-bench-harness</code></td><td>Unified benchmark harness</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    Built on Apache Arrow, Apache Iceberg, Vortex, Apache Parquet, Apache DataFusion, Tokio,
+    <code>pgwire-rs</code> and openraft.
+  </p>
+</section>
+
+<section class="doc" id="decisions">
+  <span class="eyebrow">32 · why</span>
+  <h2>Design decisions</h2>
+  <p>
+    Twenty-nine numbered ADRs record the arguments, including the ones that closed doors. Each
+    "no" carries the trigger that would reopen it, which is the part that makes them useful
+    rather than decorative.
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th scope="col">ADR</th><th scope="col">Decision</th></tr></thead>
+      <tbody>
+        <tr><td>0002</td><td>No Postgres extension support</td></tr>
+        <tr><td>0003</td><td>Native vector search — supersedes part of 0002</td></tr>
+        <tr><td>0005 · 0013 · 0020</td><td>Auth system, per-project auth schema, OAuth + MFA</td></tr>
+        <tr><td>0006</td><td>REST API layer, and its fail-closed dependency on auth</td></tr>
+        <tr><td>0008</td><td>Noisy-neighbour fairness on bounded backends</td></tr>
+        <tr><td>0011</td><td>Cross-shard 2PC — structurally rejected until there is demand</td></tr>
+        <tr><td>0012</td><td>Change-event sink as the trigger / webhook primitive</td></tr>
+        <tr><td>0014</td><td><code>libpg_query</code> as the canonical parser</td></tr>
+        <tr><td>0015</td><td>Vortex storage format — now the default</td></tr>
+        <tr><td>0016</td><td>HTAP hot-tier architecture</td></tr>
+        <tr><td>0019</td><td>Declarative BaaS surface: inbound webhooks and the RPC mount</td></tr>
+        <tr><td>0021</td><td>Object storage — catalog-backed blobs</td></tr>
+        <tr><td>0023</td><td>Lease-based ownership, partition routing, heartbeat budgets</td></tr>
+        <tr><td>0025 · 0026</td><td>Postgres-compat surface: JSONB GIN, full-text, citext, session timeouts</td></tr>
+        <tr><td>0028</td><td>CDC bridge architecture</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note">
+    <span class="lbl">Two numbering collisions</span>
+    <p>
+      ADR numbers 0020 and 0021 are each used twice — <code>0020-auth-v2-oauth-mfa</code> and
+      <code>0020-wal-transaction-markers</code>, <code>0021-docs-frontmatter-yaml</code> and
+      <code>0021-object-storage</code>. Cite by filename rather than by number.
+    </p>
+  </div>
+  <div class="cards">
+    <a class="card" href="https://github.com/vul-os/basin/tree/main/docs/decisions">
+      <h4>All ADRs</h4>
+      <p>The full numbered set, including the superseded ones.</p>
+      <span class="path">docs/decisions/</span>
+    </a>
+  </div>
+</section>
+
+<section class="doc" id="contributing">
+  <span class="eyebrow">33 · joining in</span>
+  <h2>Contributing</h2>
+  <p>
+    Open an issue before a pull request that adds new surface area. The ADRs exist so that scope
+    arguments happen once, in writing, rather than in review — a patch that reopens a settled
+    "no" is a conversation, not a diff.
+  </p>
+  <div class="cards">
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/CONTRIBUTING.md">
+      <h4>Contributing guide</h4>
+      <p>How to build, test and land a change.</p>
+      <span class="path">CONTRIBUTING.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/SECURITY.md">
+      <h4>Security policy</h4>
+      <p>Reporting process and supported versions.</p>
+      <span class="path">SECURITY.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/CHANGELOG.md">
+      <h4>Changelog</h4>
+      <p>Every wave, in order, including the ones that removed things.</p>
+      <span class="path">CHANGELOG.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/blob/main/LICENSE">
+      <h4>Licence</h4>
+      <p>Apache-2.0 for the engine, services and CLI. The ten client SDKs are MIT.</p>
+      <span class="path">LICENSE</span>
+    </a>
+  </div>
+</section>
+
+</div>
 </div>
 
-<div class="container docs-layout">
+<script src="./assets/vendor/highlight.min.js"></script>
+<script>
+(function(){
+  'use strict';
 
-  <aside class="docs-rail">
-    <h2>On this page</h2>
-    <ul>
-      <li><a href="#quickstart">Quickstart</a></li>
-      <li><a href="#architecture">Architecture</a></li>
-      <li><a href="#compatibility">SQL compatibility</a></li>
-      <li><a href="#multi-project">Multi-project</a></li>
-      <li><a href="#batteries">Batteries included</a></li>
-      <li><a href="#sdks">Client SDKs</a></li>
-      <li><a href="#operations">Operations</a></li>
-      <li><a href="#decisions">Design decisions</a></li>
-    </ul>
-  </aside>
+  /* ── 1 · code blocks: language chip, caption, copy, highlighting ──
+     A <code class="language-sql"> with no registered grammar renders as
+     plain text and looks identical to success in the HTML source, so the
+     chip is derived from what hljs actually resolved, not from the class
+     attribute. If a grammar is missing, the chip says so. */
+  document.querySelectorAll('.codeblock').forEach(function(block){
+    var pre  = block.querySelector('pre');
+    var code = block.querySelector('code');
+    if (!pre || !code) return;
 
-  <main>
+    var m = /language-([\w+-]+)/.exec(code.className);
+    var want = m ? m[1] : '';
+    var known = !!(want && window.hljs && hljs.getLanguage(want));
 
-    <section id="quickstart" class="docs-section">
-      <span class="eyebrow">01 · start here</span>
-      <h2 class="display">Quickstart</h2>
-      <p>
-        Basin is one binary. Point it at a data directory and run — local development
-        needs no external object store, and the same binary that runs on your laptop is
-        the one that runs against S3.
-      </p>
+    var bar = document.createElement('div');
+    bar.className = 'bar';
 
-      <div class="code">
-<span class="l"><span class="t-com"># Docker — pgwire on :5432, no Rust toolchain</span></span>
-<span class="l">docker run --rm -p 5432:5432 -v basin-data:/var/basin --name basin basin-server</span>
-<span class="l"> </span>
-<span class="l"><span class="t-com"># From source — pgwire on :5433</span></span>
-<span class="l">BASIN_DATA_DIR=/tmp/basin cargo run -p basin-server</span>
-<span class="l"> </span>
-<span class="l"><span class="t-com"># Connect with any Postgres client</span></span>
-<span class="l">psql <span class="t-str">'postgres://alice@127.0.0.1:5433/alice'</span></span>
-      </div>
+    var lang = document.createElement('span');
+    lang.className = 'lang';
+    lang.textContent = known ? want : (want ? want + ' (no grammar)' : 'text');
+    bar.appendChild(lang);
 
-      <div class="doc-list">
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/quickstart-docker.md">
-          <h3>5-Minute Docker Quickstart</h3>
-          <p>One <code>docker run</code>, connect via psql, no toolchain required.</p>
-          <span class="path">docs/quickstart-docker.md</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/tutorial.md">
-          <h3>Getting started tutorial</h3>
-          <p>CRUD, auth, RLS policies, the REST API and a frontend snippet — ~15 minutes.</p>
-          <span class="path">docs/tutorial.md</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/examples">
-          <h3>Reference applications</h3>
-          <p>A multi-tenant SaaS starter and an AI/RAG app, both runnable.</p>
-          <span class="path">examples/</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/deployment.md">
-          <h3>Deployment</h3>
-          <p>Production-shaped boot: WAL, shard owner, pool, JWT auth and REST in one process.</p>
-          <span class="path">docs/deployment.md</span>
-        </a>
-      </div>
-    </section>
+    var cap = block.getAttribute('data-cap');
+    if (cap) {
+      var c = document.createElement('span');
+      c.className = 'cap';
+      c.textContent = cap;
+      bar.appendChild(c);
+    }
 
-    <section id="architecture" class="docs-section">
-      <span class="eyebrow">02 · how it works</span>
-      <h2 class="display">Architecture</h2>
-      <p>
-        pgwire on the front, Vortex-compressed columnar files on an S3-compatible bucket
-        on the back, with a file-backed WAL between them. A project is a bucket prefix
-        the engine refuses to read across, resolved once at connection accept.
-      </p>
+    var sp = document.createElement('span');
+    sp.className = 'spacer';
+    bar.appendChild(sp);
 
-      <div class="doc-list">
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/architecture.md">
-          <h3>Architecture overview</h3>
-          <p>The full path from a wire message to bytes on object storage.</p>
-          <span class="path">docs/architecture.md</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/htap-guide.md">
-          <h3>HTAP hot tier</h3>
-          <p>The UPDATE/DELETE fast paths, on by default, and what they cost.</p>
-          <span class="path">docs/htap-guide.md</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/scaling/object-storage.md">
-          <h3>Object-storage scaling</h3>
-          <p>How throughput behaves as buckets, prefixes and files multiply.</p>
-          <span class="path">docs/scaling/object-storage.md</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/CAPABILITIES.md">
-          <h3>Capability matrix</h3>
-          <p>Feature-by-feature status, honestly marked shipped or not.</p>
-          <span class="path">CAPABILITIES.md</span>
-        </a>
-      </div>
-    </section>
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'copy';
+    btn.textContent = 'Copy';
+    btn.addEventListener('click', function(){
+      var text = code.textContent;
+      var done = function(){
+        btn.textContent = 'Copied';
+        btn.classList.add('done');
+        setTimeout(function(){ btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1400);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function(){});
+      } else {
+        var ta = document.createElement('textarea');
+        ta.value = text; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); done(); } catch (e) {}
+        document.body.removeChild(ta);
+      }
+    });
+    bar.appendChild(btn);
 
-    <section id="compatibility" class="docs-section">
-      <span class="eyebrow">03 · the wire</span>
-      <h2 class="display">SQL compatibility</h2>
-      <p>
-        Basin parses with <code>libpg_query</code> — the actual PostgreSQL parser,
-        vendored — so at parse time your ORM cannot tell the difference.
-        <strong>863 of 975 SQL fragments pass on the default configuration (88.5%).</strong>
-        Basin is Postgres-compatible, not Postgres; the gaps are documented rather than
-        papered over.
-      </p>
+    block.insertBefore(bar, pre);
 
-      <div class="tbl-scroll">
-        <table>
-          <thead><tr><th scope="col">Area</th><th scope="col">Status</th></tr></thead>
-          <tbody>
-            <tr><td>pgwire v3</td><td>Simple + extended query, TLS, COPY, prepared statements, binary params</td></tr>
-            <tr><td>Row-Level Security</td><td><code>ENABLE ROW LEVEL SECURITY</code> + <code>CREATE POLICY</code>, enforced at the plan layer</td></tr>
-            <tr><td>Vector search</td><td><code>vector(N)</code> + HNSW, pgvector-compatible operators</td></tr>
-            <tr><td>Extensions</td><td>Equivalents for pgcrypto, uuid-ossp, pg_trgm, plus basin-cron / net / geo / cv</td></tr>
-            <tr><td>Stored procedures</td><td><code>LANGUAGE sql</code> + <code>CALL</code> only — no PL/pgSQL, PL/Python or PL/Perl</td></tr>
-            <tr><td>Replication</td><td>Not supported — wrong shape for object-store storage; CDC out of scope</td></tr>
-            <tr><td>Federation</td><td>No <code>postgres_fdw</code> / <code>dblink</code>; use basin-net for HTTP-shaped reads</td></tr>
-          </tbody>
-        </table>
-      </div>
+    if (known) {
+      try { hljs.highlightElement(code); }
+      catch (e) { code.classList.add('hljs'); }
+    } else {
+      code.classList.add('hljs');
+    }
+  });
 
-      <div class="doc-list">
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/sql-support.md">
-          <h3>SQL support matrix</h3>
-          <p>Generated from the test suite — the ground truth, never hand-edited.</p>
-          <span class="path">docs/sql-support.md</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/sql-compatibility.md">
-          <h3>Compatibility notes</h3>
-          <p>Where behaviour diverges from Postgres and why.</p>
-          <span class="path">docs/sql-compatibility.md</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/orm-compat.md">
-          <h3>ORM compatibility</h3>
-          <p>Drizzle, Prisma, SQLAlchemy, Diesel, SeaORM and friends.</p>
-          <span class="path">docs/orm-compat.md</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/migration-tools.md">
-          <h3>Migration tools</h3>
-          <p><code>sqlx</code>, <code>flyway</code>, <code>golang-migrate</code>.</p>
-          <span class="path">docs/migration-tools.md</span>
-        </a>
-      </div>
-    </section>
+  /* ── 2 · rail drawer (narrow viewports) ───────────────────────── */
+  var rail   = document.getElementById('rail');
+  var toggle = document.getElementById('railToggle');
+  var scrim  = document.getElementById('scrim');
 
-    <section id="multi-project" class="docs-section">
-      <span class="eyebrow">04 · isolation</span>
-      <h2 class="display">Multi-project</h2>
-      <p>
-        The connection URL names the project. After accept, ordinary SQL — no per-query
-        auth, no row-scoping boilerplate. Adding a tenant writes no new heap pages and
-        books no connection slot, which is where the cost shape comes from.
-      </p>
-      <div class="doc-list">
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/multi-project.md">
-          <h3>Multi-project isolation</h3>
-          <p>How prefixes bound a project and what crosses the boundary (nothing).</p>
-          <span class="path">docs/multi-project.md</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/import.md">
-          <h3>Importing data</h3>
-          <p>Getting an existing Postgres database into Basin.</p>
-          <span class="path">docs/import.md</span>
-        </a>
-      </div>
-    </section>
+  function closeRail(){
+    rail.classList.remove('open');
+    scrim.classList.remove('on');
+    toggle.setAttribute('aria-expanded', 'false');
+  }
+  function openRail(){
+    rail.classList.add('open');
+    scrim.classList.add('on');
+    toggle.setAttribute('aria-expanded', 'true');
+  }
+  toggle.addEventListener('click', function(){
+    rail.classList.contains('open') ? closeRail() : openRail();
+  });
+  scrim.addEventListener('click', closeRail);
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'Escape') closeRail();
+  });
 
-    <section id="batteries" class="docs-section">
-      <span class="eyebrow">05 · included</span>
-      <h2 class="display">Batteries included</h2>
-      <p>
-        Auth, REST, cron, webhooks, Wasm functions, vector search and an Iceberg catalog
-        are all in the same binary — not sidecars to deploy and version separately.
-      </p>
-      <div class="doc-list">
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/batteries.md">
-          <h3>What ships in the box</h3>
-          <p>The full list, with the ADR that scoped each one.</p>
-          <span class="path">docs/batteries.md</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/docs/functions.md">
-          <h3>Wasm functions</h3>
-          <p>Server-side functions with the sandbox boundary spelled out.</p>
-          <span class="path">docs/functions.md</span>
-        </a>
-      </div>
-    </section>
+  /* ── 3 · theme ────────────────────────────────────────────────── */
+  function isDark(){
+    var t = document.documentElement.dataset.theme;
+    return t ? t === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+  document.getElementById('themeBtn').addEventListener('click', function(){
+    var next = isDark() ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem('basin-theme', next); } catch (e) {}
+  });
 
-    <section id="sdks" class="docs-section">
-      <span class="eyebrow">06 · clients</span>
-      <h2 class="display">Client SDKs</h2>
-      <p>
-        Ten engine-direct SDKs, all MIT-licensed and all speaking pgwire + REST straight
-        to a Basin engine. They live in the monorepo under <code>sdks/</code> and are
-        versioned alongside the engine they target.
-      </p>
-      <div class="doc-list">
-        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/sdks/js">
-          <h3>JavaScript / TypeScript</h3>
-          <p>Browser, Node, Deno, Bun and Workers. Realtime subscriptions + Arrow IPC.</p>
-          <span class="path">sdks/js</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/sdks/py">
-          <h3>Python</h3>
-          <p>Async and sync clients, realtime, Arrow via pyarrow.</p>
-          <span class="path">sdks/py</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/sdks/go">
-          <h3>Go</h3>
-          <p>Arrow IPC streaming against the engine.</p>
-          <span class="path">sdks/go</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/sdks">
-          <h3>Rust, Java, Ruby, .NET, PHP, Dart, Swift</h3>
-          <p>Six more first-party clients with the same surface.</p>
-          <span class="path">sdks/</span>
-        </a>
-      </div>
-    </section>
+  /* ── 4 · nav filter ───────────────────────────────────────────── */
+  var nav    = document.getElementById('railNav');
+  var links  = Array.prototype.slice.call(nav.querySelectorAll('a[href^="#"]'));
+  var groups = Array.prototype.slice.call(nav.querySelectorAll('.grp'));
+  var noHit  = document.getElementById('noHit');
+  var filter = document.getElementById('navFilter');
 
-    <section id="operations" class="docs-section">
-      <span class="eyebrow">07 · running it</span>
-      <h2 class="display">Operations</h2>
-      <p>
-        Basin is meant to be self-hosted on your own box and your own bucket. Runbooks
-        and operator guides are versioned in the repository next to the code they cover.
-      </p>
-      <div class="doc-list">
-        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/docs/operators">
-          <h3>Operator guides</h3>
-          <p>Quotas, compatibility checks and day-two concerns.</p>
-          <span class="path">docs/operators/</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/docs/runbooks">
-          <h3>Runbooks</h3>
-          <p>Procedures for the situations you'd rather not improvise.</p>
-          <span class="path">docs/runbooks/</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/benchmark/BENCHMARKS.md">
-          <h3>Benchmark methodology</h3>
-          <p>How the numbers are produced, and why losses are published too.</p>
-          <span class="path">benchmark/BENCHMARKS.md</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/SECURITY.md">
-          <h3>Security policy</h3>
-          <p>Reporting process and supported versions.</p>
-          <span class="path">SECURITY.md</span>
-        </a>
-      </div>
-    </section>
+  filter.addEventListener('input', function(){
+    var q = filter.value.trim().toLowerCase();
+    var hits = 0;
+    links.forEach(function(a){
+      var hit = !q || a.textContent.toLowerCase().indexOf(q) !== -1;
+      a.classList.toggle('hide', !hit);
+      if (hit) hits++;
+    });
+    // Hide a group heading whose every link is filtered out.
+    groups.forEach(function(g){
+      var any = false, n = g.nextElementSibling;
+      while (n && n.tagName === 'A') {
+        if (!n.classList.contains('hide')) { any = true; break; }
+        n = n.nextElementSibling;
+      }
+      g.classList.toggle('hide', !any);
+    });
+    noHit.classList.toggle('show', hits === 0);
+  });
 
-    <section id="decisions" class="docs-section">
-      <span class="eyebrow">08 · why</span>
-      <h2 class="display">Design decisions</h2>
-      <p>
-        Basin is opinionated about scope, and the reasoning is written down. Every "no"
-        in the compatibility table has a one-page rationale that includes the trigger
-        which would change our mind.
-      </p>
-      <div class="note">
-        <strong>Open an issue before a PR that adds new surface area.</strong> The ADRs
-        exist so scope arguments happen once, in writing, rather than in review.
-      </div>
-      <div class="doc-list">
-        <a class="doc-card" href="https://github.com/vul-os/basin/tree/main/docs/decisions">
-          <h3>Architecture decision records</h3>
-          <p>The numbered ADRs, including the ones that closed doors deliberately.</p>
-          <span class="path">docs/decisions/</span>
-        </a>
-        <a class="doc-card" href="https://github.com/vul-os/basin/blob/main/CONTRIBUTING.md">
-          <h3>Contributing</h3>
-          <p>How to build, test and land a change.</p>
-          <span class="path">CONTRIBUTING.md</span>
-        </a>
-      </div>
-    </section>
+  /* ── 5 · scroll spy + reading progress ────────────────────────
+     IntersectionObserver alone mis-fires at the top and bottom of the
+     document (the first and last sections can both be out of the
+     observation band), so the active link is computed from measured
+     positions on scroll instead — cheap, and correct at both ends. */
+  var sections = Array.prototype.slice.call(document.querySelectorAll('section.doc[id]'));
+  var byId = {};
+  links.forEach(function(a){ byId[a.getAttribute('href').slice(1)] = a; });
 
-  </main>
-</div>
+  var bar = document.getElementById('progress');
+  var current = null;
+  var ticking = false;
 
+  function sync(){
+    ticking = false;
+
+    var doc = document.documentElement;
+    var max = doc.scrollHeight - doc.clientHeight;
+    bar.style.width = (max > 0 ? Math.min(100, (window.scrollY / max) * 100) : 0) + '%';
+
+    var probe = window.scrollY + doc.clientHeight * 0.28;
+    var active = sections.length ? sections[0].id : null;
+    for (var i = 0; i < sections.length; i++) {
+      if (sections[i].offsetTop <= probe) active = sections[i].id;
+    }
+    // At the very bottom, the last section is active regardless of probe.
+    if (max > 0 && window.scrollY >= max - 2 && sections.length) {
+      active = sections[sections.length - 1].id;
+    }
+    if (active === current) return;
+
+    if (current && byId[current]) byId[current].classList.remove('on');
+    current = active;
+    var link = byId[current];
+    if (link) {
+      link.classList.add('on');
+      // Keep the active link inside the rail's own scroll box.
+      var box = link.getBoundingClientRect();
+      var pane = nav.getBoundingClientRect();
+      if (box.top < pane.top + 8 || box.bottom > pane.bottom - 8) {
+        nav.scrollTop += box.top - pane.top - pane.height / 2 + box.height / 2;
+      }
+    }
+  }
+
+  function onScroll(){
+    if (!ticking) { ticking = true; requestAnimationFrame(sync); }
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll);
+  sync();
+
+  // Tapping a link on a narrow screen should close the drawer.
+  links.forEach(function(a){
+    a.addEventListener('click', function(){
+      if (window.matchMedia('(max-width:1080px)').matches) closeRail();
+    });
+  });
+})();
+</script>
 
 </body>
 </html>
