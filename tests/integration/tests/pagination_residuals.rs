@@ -28,7 +28,8 @@
 //! all three shapes — run them explicitly on an idle box
 //! (`cargo test -p basin-integration-tests --test pagination_residuals -- \
 //!  --ignored --nocapture`). They are NOT correctness gates and never assert a
-//! latency bound (the box is shared; see CLAUDE.md timing-fragility note).
+//! latency bound: the box is shared, and a wall-clock timing taken next to a
+//! noisy neighbour is indicative, not authoritative.
 //!
 //! Fairness: no bench-keyed table / column / literal names — generic `paging`
 //! table with `id` / `bucket` / `label` columns and ordinary literals.

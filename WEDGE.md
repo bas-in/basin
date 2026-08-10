@@ -40,7 +40,7 @@ env vars; defaults preserve the original PoC behaviour.
 
 > **PRIORITY UPDATE — 2026-05-25.** The technical critical path is complete
 > (HTAP hot tier, fastpaths default-on, JSONB `->>` selective-read pushdown
-> all shipped — see CHANGELOG 2026-05-25 and NEXT_WAVES.md). The binding
+> all shipped — see the CHANGELOG entry for 2026-05-25). The binding
 > constraint is now **distribution / first reference customer**, not engine
 > work. So the live #1 is **Phase 0 customer interviews** (item #4 below) —
 > the engine phases (5.14/5.15/5.16) are largely shipped or deferred. The
