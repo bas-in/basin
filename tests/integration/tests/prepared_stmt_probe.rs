@@ -177,10 +177,7 @@ async fn measure_extended(client: &Client, table: &str, n: usize) -> f64 {
     for i in 0..n {
         let k: i64 = ((i as i64) * (10_000 / n as i64)) % 10_000;
         let t0 = Instant::now();
-        let _ = client
-            .query(&stmt, &[&k])
-            .await
-            .expect("extended query");
+        let _ = client.query(&stmt, &[&k]).await.expect("extended query");
         times.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -247,14 +244,13 @@ async fn prepared_stmt_probe() {
                 rt.block_on(async move {
                     let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_owned());
                     for u in [user.as_str(), "postgres"] {
-                        let conn_str =
-                            format!("host=127.0.0.1 port=5432 user={u} dbname=postgres");
+                        let conn_str = format!("host=127.0.0.1 port=5432 user={u} dbname=postgres");
                         if let Ok((cl, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
-                            tokio::spawn(async move { let _ = conn.await; });
+                            tokio::spawn(async move {
+                                let _ = conn.await;
+                            });
                             let _ = cl
-                                .simple_query(&format!(
-                                    "DROP SCHEMA IF EXISTS {schema} CASCADE"
-                                ))
+                                .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
                                 .await;
                             break;
                         }
@@ -295,9 +291,7 @@ async fn prepared_stmt_probe() {
         .await;
     {
         let ws = pg_client
-            .prepare(&format!(
-                "SELECT * FROM {schema}.{TABLE} WHERE id = $1"
-            ))
+            .prepare(&format!("SELECT * FROM {schema}.{TABLE} WHERE id = $1"))
             .await
             .unwrap();
         let k: i64 = 1;
@@ -324,12 +318,7 @@ async fn prepared_stmt_probe() {
 // Schema-qualified variants for Postgres (the Basin server has its own
 // namespace so unqualified names work there).
 
-async fn measure_simple_qualified(
-    client: &Client,
-    schema: &str,
-    table: &str,
-    n: usize,
-) -> f64 {
+async fn measure_simple_qualified(client: &Client, schema: &str, table: &str, n: usize) -> f64 {
     let mut times = Vec::with_capacity(n);
     for i in 0..n {
         let k = ((i as i64) * (10_000 / n as i64)) % 10_000;
@@ -342,12 +331,7 @@ async fn measure_simple_qualified(
     percentile(&times, 0.50)
 }
 
-async fn measure_extended_qualified(
-    client: &Client,
-    schema: &str,
-    table: &str,
-    n: usize,
-) -> f64 {
+async fn measure_extended_qualified(client: &Client, schema: &str, table: &str, n: usize) -> f64 {
     let sql = format!("SELECT * FROM {schema}.{table} WHERE id = $1");
     let stmt = client
         .prepare(&sql)

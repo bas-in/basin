@@ -62,11 +62,10 @@ fn run_quiet_degradation<'a>(
     cfg: &'a BenchConfig,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<(PathBuf, bool, Value)>> + 'a>> {
     Box::pin(async move {
-        let noisy = cfg
-            .workload
-            .noisy
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("noisy knobs required for noisy-neighbor profile"))?;
+        let noisy =
+            cfg.workload.noisy.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("noisy knobs required for noisy-neighbor profile")
+            })?;
 
         // Project[0] is noisy; remainder are quiet.
         let noisy_project = h.projects[0];
@@ -104,7 +103,10 @@ fn run_quiet_degradation<'a>(
             let table = table.clone();
             let stop = stop.clone();
             noisy_set.spawn(async move {
-                let session = engine.open_session(noisy_project).await.expect("noisy session");
+                let session = engine
+                    .open_session(noisy_project)
+                    .await
+                    .expect("noisy session");
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = session
                         .execute(&format!("SELECT COUNT(*) FROM {}", table))

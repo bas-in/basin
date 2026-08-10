@@ -293,11 +293,7 @@ async fn update_overlay_pushes_pk_filter_retains_non_pk_filter() {
     // ── Correctness: result rows ──────────────────────────────────────────
     //
     // PK predicate after overlay: id=42 still has its overlay-set v=99.
-    let by_pk_v: Vec<i64> = match sess
-        .execute("SELECT v FROM t WHERE id = 42")
-        .await
-        .unwrap()
-    {
+    let by_pk_v: Vec<i64> = match sess.execute("SELECT v FROM t WHERE id = 42").await.unwrap() {
         ExecResult::Rows { batches, .. } => batches
             .iter()
             .flat_map(|b| {
@@ -336,7 +332,10 @@ async fn update_overlay_pushes_pk_filter_retains_non_pk_filter() {
     // (i.e. k in [900, 999]) PLUS no overlay (id=42 has v=99). 100 rows.
     let big = ids(&sess, "SELECT id FROM t WHERE v >= 9000 ORDER BY id").await;
     let expected: Vec<i64> = (900..1000).collect();
-    assert_eq!(big, expected, "range on non-PK column composes with overlay");
+    assert_eq!(
+        big, expected,
+        "range on non-PK column composes with overlay"
+    );
 
     // PK-range read: `id < 100` → 100 rows, with id=42's v=99 (overlay), not 420.
     let small_ids = ids(&sess, "SELECT id FROM t WHERE id < 100 ORDER BY id").await;

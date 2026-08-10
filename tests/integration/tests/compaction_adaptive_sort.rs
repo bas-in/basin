@@ -36,9 +36,7 @@ fn shuffled_batch(schema: Arc<Schema>) -> RecordBatch {
     const N: usize = 200;
     let ids: Int64Array = (0..N as i64).collect();
     // Assign score as (i * 7 + 3) mod N — pseudo-random, not sorted by score.
-    let scores: Int64Array = (0..N as i64)
-        .map(|i| (i * 7 + 3) % N as i64)
-        .collect();
+    let scores: Int64Array = (0..N as i64).map(|i| (i * 7 + 3) % N as i64).collect();
     RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(scores)]).unwrap()
 }
 
@@ -82,9 +80,7 @@ async fn compaction_adaptive_sort_applies_observed_pattern() {
     let wal_dir = TempDir::new().unwrap();
 
     let storage = Storage::new(StorageConfig {
-        object_store: Arc::new(
-            LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
-        ),
+        object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
         root_prefix: None,
         disk_cache: None,
         page_cache: None,
@@ -92,9 +88,7 @@ async fn compaction_adaptive_sort_applies_observed_pattern() {
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let wal: Arc<dyn Wal> = Arc::new(
         LocalWal::open(WalConfig {
-            object_store: Arc::new(
-                LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap(),
-            ),
+            object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
@@ -164,26 +158,17 @@ async fn compaction_adaptive_sort_applies_observed_pattern() {
         Field::new("score", DataType::Int64, false),
     ]));
     let ids: Int64Array = (200..400i64).collect();
-    let scores: Int64Array = (200..400i64)
-        .map(|i| (i * 13 + 7) % 200)
-        .collect();
-    let new_batch =
-        RecordBatch::try_new(schema2, vec![Arc::new(ids), Arc::new(scores)]).unwrap();
+    let scores: Int64Array = (200..400i64).map(|i| (i * 13 + 7) % 200).collect();
+    let new_batch = RecordBatch::try_new(schema2, vec![Arc::new(ids), Arc::new(scores)]).unwrap();
     handle.write_batch(&table, new_batch).await.unwrap();
 
     // ── 6. Trigger compaction and verify sort order ──────────────────────────
     shard.flush_to_parquet().await.unwrap();
 
-    let batches = handle
-        .read(&table, ReadOptions::default())
-        .await
-        .unwrap();
+    let batches = handle.read(&table, ReadOptions::default()).await.unwrap();
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert!(
-        total_rows > 0,
-        "expected rows after compaction, got 0"
-    );
+    assert!(total_rows > 0, "expected rows after compaction, got 0");
 
     // The second batch (ids 200..400) was written after the QueryHistory
     // threshold was met and after `adaptive_sort_override = true` was in

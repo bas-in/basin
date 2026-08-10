@@ -262,20 +262,14 @@ impl TableProvider for RealtimeChannelsProvider {
 
         let n = channel_names.len();
 
-        let channel_name_arr: ArrayRef =
-            Arc::new(StringArray::from(channel_names));
-        let channel_type_arr: ArrayRef =
-            Arc::new(StringArray::from(channel_types));
-        let subscriber_count_arr: ArrayRef =
-            Arc::new(Int64Array::from(subscriber_counts));
+        let channel_name_arr: ArrayRef = Arc::new(StringArray::from(channel_names));
+        let channel_type_arr: ArrayRef = Arc::new(StringArray::from(channel_types));
+        let subscriber_count_arr: ArrayRef = Arc::new(Int64Array::from(subscriber_counts));
         // member_count: all NULL (presence not tracked yet)
-        let member_count_arr: ArrayRef =
-            Arc::new(Int64Array::from(vec![None::<i64>; n]));
+        let member_count_arr: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>; n]));
         // created_at: all NULL (creation timestamp not tracked)
-        let created_at_arr: ArrayRef = Arc::new(
-            TimestampMicrosecondArray::from(vec![None::<i64>; n])
-                .with_timezone(SNAP_TZ),
-        );
+        let created_at_arr: ArrayRef =
+            Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>; n]).with_timezone(SNAP_TZ));
 
         let batch = RecordBatch::try_new(
             Arc::clone(&self.schema),
@@ -368,11 +362,9 @@ impl TableProvider for RealtimeStatsProvider {
         let bytes_per_sec_arr: ArrayRef = Arc::new(Float64Array::from(vec![0.0_f64]));
         let memory_budget_arr: ArrayRef =
             Arc::new(Int64Array::from(vec![budget.memory_budget_bytes]));
-        let memory_used_arr: ArrayRef =
-            Arc::new(Int64Array::from(vec![budget.memory_used_bytes]));
-        let captured_at_arr: ArrayRef = Arc::new(
-            TimestampMicrosecondArray::from(vec![now_us]).with_timezone(SNAP_TZ),
-        );
+        let memory_used_arr: ArrayRef = Arc::new(Int64Array::from(vec![budget.memory_used_bytes]));
+        let captured_at_arr: ArrayRef =
+            Arc::new(TimestampMicrosecondArray::from(vec![now_us]).with_timezone(SNAP_TZ));
 
         let batch = RecordBatch::try_new(
             Arc::clone(&self.schema),
@@ -415,12 +407,7 @@ pub(crate) fn register_realtime_providers(
     source: Option<Arc<dyn RealtimeChannelSource>>,
     notify: Arc<crate::notify_registry::NotifyRegistry>,
 ) -> DfResult<()> {
-    let catalog_name = ctx
-        .state()
-        .config_options()
-        .catalog
-        .default_catalog
-        .clone();
+    let catalog_name = ctx.state().config_options().catalog.default_catalog.clone();
     let df_catalog = match ctx.catalog(&catalog_name) {
         Some(c) => c,
         None => {
@@ -432,26 +419,20 @@ pub(crate) fn register_realtime_providers(
 
     let rt_schema = Arc::new(MemorySchemaProvider::new());
 
-    let channels_provider: Arc<dyn TableProvider> = Arc::new(
-        RealtimeChannelsProvider::new(project, source.clone(), notify),
-    );
+    let channels_provider: Arc<dyn TableProvider> = Arc::new(RealtimeChannelsProvider::new(
+        project,
+        source.clone(),
+        notify,
+    ));
     let stats_provider: Arc<dyn TableProvider> =
         Arc::new(RealtimeStatsProvider::new(project, source));
 
     rt_schema
         .register_table("channels".to_string(), channels_provider)
-        .map_err(|e| {
-            DataFusionError::Internal(format!(
-                "basin_realtime.channels register: {e}"
-            ))
-        })?;
+        .map_err(|e| DataFusionError::Internal(format!("basin_realtime.channels register: {e}")))?;
     rt_schema
         .register_table("stats".to_string(), stats_provider)
-        .map_err(|e| {
-            DataFusionError::Internal(format!(
-                "basin_realtime.stats register: {e}"
-            ))
-        })?;
+        .map_err(|e| DataFusionError::Internal(format!("basin_realtime.stats register: {e}")))?;
 
     // Use `basin_realtime` as the schema name to match the SQL queries issued
     // by the cloud handler (`FROM basin_realtime.channels`). DataFusion
@@ -459,11 +440,7 @@ pub(crate) fn register_realtime_providers(
     // `schema.table` reference resolves against the default catalog.
     df_catalog
         .register_schema("basin_realtime", rt_schema)
-        .map_err(|e| {
-            DataFusionError::Internal(format!(
-                "basin_realtime schema register: {e}"
-            ))
-        })?;
+        .map_err(|e| DataFusionError::Internal(format!("basin_realtime schema register: {e}")))?;
 
     Ok(())
 }
@@ -505,7 +482,8 @@ mod tests {
         notify: Arc<NotifyRegistry>,
     ) -> SessionContext {
         let ctx = SessionContext::new();
-        register_realtime_providers(&ctx, project, source, notify).expect("registration must succeed");
+        register_realtime_providers(&ctx, project, source, notify)
+            .expect("registration must succeed");
         ctx
     }
 
@@ -650,7 +628,11 @@ mod tests {
         let b = &batches[0];
         let budget = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let used = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-        let eps = b.column(2).as_any().downcast_ref::<datafusion::arrow::array::Float64Array>().unwrap();
+        let eps = b
+            .column(2)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap();
         assert_eq!(budget.value(0), 16 * 1024 * 1024);
         assert_eq!(used.value(0), 1024);
         // Rate columns are flagged missing — must be 0.0

@@ -180,12 +180,7 @@ impl LeaseRegistry for PartitionedRegistry {
             .await
     }
 
-    async fn release(
-        &self,
-        project: &ProjectId,
-        partition_id: &str,
-        holder: &str,
-    ) -> Result<bool> {
+    async fn release(&self, project: &ProjectId, partition_id: &str, holder: &str) -> Result<bool> {
         // Release is tolerant: even a partitioned replica's local cleanup is
         // allowed to fire (it is a best-effort row drop).
         self.inner.release(project, partition_id, holder).await
@@ -316,7 +311,10 @@ async fn lost_lease_fences_writes_reads_continue_then_recovers() {
     registry.partition("replica-a").await;
     let deadline = Instant::now() + Duration::from_secs(3);
     let fencing_err = loop {
-        match handle.write_batch(&table, batch(1000, 1, "a-mid-loss-")).await {
+        match handle
+            .write_batch(&table, batch(1000, 1, "a-mid-loss-"))
+            .await
+        {
             Err(e) => break e,
             Ok(()) => {
                 assert!(
@@ -492,13 +490,19 @@ async fn off_mode_without_registry_is_unchanged() {
     // single-replica deployment every existing test and demo runs.
     let shard = Shard::new(ShardConfig::new(storage, catalog.clone(), wal.clone()));
     let handle = shard.get(&project, &partition).await.unwrap();
-    handle.write_batch(&table, batch(0, 4, "solo-")).await.unwrap();
+    handle
+        .write_batch(&table, batch(0, 4, "solo-"))
+        .await
+        .unwrap();
     let rows = handle.read(&table, ReadOptions::default()).await.unwrap();
     assert_eq!(rows_in(&rows), 4);
 
     // No lease row was ever created.
     assert_eq!(
-        catalog.owner_of(&project, partition.as_str()).await.unwrap(),
+        catalog
+            .owner_of(&project, partition.as_str())
+            .await
+            .unwrap(),
         None,
         "no-lease mode must not touch the lease table",
     );

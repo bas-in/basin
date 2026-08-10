@@ -116,11 +116,7 @@ fn sequential_batch(start: i64, len: i64) -> RecordBatch {
     let strs: StringArray = (start..start + len)
         .map(|v| Some(format!("s{v}")))
         .collect();
-    RecordBatch::try_new(
-        table_schema(),
-        vec![Arc::new(ids), Arc::new(strs)],
-    )
-    .unwrap()
+    RecordBatch::try_new(table_schema(), vec![Arc::new(ids), Arc::new(strs)]).unwrap()
 }
 
 /// Build a RecordBatch with 1M rows whose `c1` values are drawn from
@@ -149,11 +145,7 @@ fn shuffled_gap_batch() -> RecordBatch {
 
     let id_arr: Int64Array = ids.iter().copied().collect();
     let str_arr: StringArray = ids.iter().map(|v| Some(format!("s{v}"))).collect();
-    RecordBatch::try_new(
-        table_schema(),
-        vec![Arc::new(id_arr), Arc::new(str_arr)],
-    )
-    .unwrap()
+    RecordBatch::try_new(table_schema(), vec![Arc::new(id_arr), Arc::new(str_arr)]).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -269,9 +261,7 @@ async fn bloom_no_false_negatives() {
         let cnt = extract_count(&batches);
         if cnt != 1 {
             false_negatives += 1;
-            eprintln!(
-                "[catalog_blooms FN] FALSE NEGATIVE: c1={v} → count={cnt} (expected 1)"
-            );
+            eprintln!("[catalog_blooms FN] FALSE NEGATIVE: c1={v} → count={cnt} (expected 1)");
         }
     }
 

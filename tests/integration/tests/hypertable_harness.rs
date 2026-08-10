@@ -125,7 +125,9 @@ async fn hypertable_create_and_autopartition() {
     // Expected after 5.29.B: the call succeeds and the catalog records the
     // hypertable metadata (partition column = 'ts', interval = '1 day').
     let ht_result = sess
-        .execute("SELECT create_hypertable('metrics', 'ts', chunk_time_interval => INTERVAL '1 day')")
+        .execute(
+            "SELECT create_hypertable('metrics', 'ts', chunk_time_interval => INTERVAL '1 day')",
+        )
         .await;
     println!("[5.29.A auto-partition] create_hypertable result: {ht_result:?}");
     assert!(
@@ -338,8 +340,8 @@ async fn hypertable_query_routing() {
             .join("\n");
 
         // Count "Chunk Scan" or equivalent node occurrences.
-        let chunk_scan_count = plan_text.matches("Chunk Scan").count()
-            + plan_text.matches("chunk_scan").count();
+        let chunk_scan_count =
+            plan_text.matches("Chunk Scan").count() + plan_text.matches("chunk_scan").count();
 
         println!(
             "[5.29.A query-routing] chunk scan nodes in plan: {chunk_scan_count} (expected ≤ 2)"
@@ -447,9 +449,7 @@ async fn hypertable_add_retention_policy() {
     // The 2023 rows are in chunks that are years old — they must be dropped.
     // The 2099 rows are future-dated — they must survive.
     let policy_result = sess
-        .execute(
-            "SELECT add_retention_policy('retention_metrics', INTERVAL '30 days')",
-        )
+        .execute("SELECT add_retention_policy('retention_metrics', INTERVAL '30 days')")
         .await;
     println!("[5.29.A retention] add_retention_policy result: {policy_result:?}");
     assert!(
@@ -628,9 +628,7 @@ async fn hypertable_compression_tier_down() {
         "TIER-DOWN: at least 3 chunks (the old days) must be compressed. \
          Closed by 5.29.E. got={compressed_count}"
     );
-    println!(
-        "[5.29.A tier-down] compressed chunks: {compressed_count} (expected ≥ 3) ✓"
-    );
+    println!("[5.29.A tier-down] compressed chunks: {compressed_count} (expected ≥ 3) ✓");
 
     // ── Verify transparent query across hot + cold chunks ─────────────────
     // A full-range query must return all 10 rows regardless of compression.
@@ -952,9 +950,7 @@ async fn hypertable_1b_row_write_soak() {
             let sub_us = epoch_us % 1_000_000;
             // Format: '2024-…+00' using epoch arithmetic (simplified).
             // We use a literal offset computation for determinism.
-            let ts = format!(
-                "TO_TIMESTAMP({epoch_s}) + INTERVAL '{sub_us} microseconds'"
-            );
+            let ts = format!("TO_TIMESTAMP({epoch_s}) + INTERVAL '{sub_us} microseconds'");
             values.push(format!("({i}, {ts}, {:.6})", (i as f64).sin()));
         }
 

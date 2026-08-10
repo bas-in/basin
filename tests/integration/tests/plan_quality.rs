@@ -353,10 +353,7 @@ async fn window_lag_correctness_and_single_sort() {
     );
     // Exactly one SortExec in the physical plan (the single sort the window
     // reuses). More than one would indicate a redundant re-sort.
-    let phys = plan
-        .split("[physical_plan]")
-        .nth(1)
-        .unwrap_or(&plan);
+    let phys = plan.split("[physical_plan]").nth(1).unwrap_or(&plan);
     let sort_count = phys.matches("SortExec").count();
     assert_eq!(
         sort_count, 1,
@@ -474,7 +471,11 @@ async fn like_prefix_pushes_predicate_and_limit() {
 
     // Correctness: every returned status starts with 'pending'.
     let res = sess.execute(q).await.unwrap();
-    assert_eq!(row_count(&res), 20, "LIMIT 20 with ~1% selectivity over 12k rows");
+    assert_eq!(
+        row_count(&res),
+        20,
+        "LIMIT 20 with ~1% selectivity over 12k rows"
+    );
     let ExecResult::Rows { batches, .. } = res else {
         panic!("expected Rows");
     };

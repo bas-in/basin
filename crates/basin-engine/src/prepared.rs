@@ -1251,7 +1251,10 @@ fn int_width(dt: &DataType) -> u8 {
 }
 
 fn is_float(dt: &DataType) -> bool {
-    matches!(dt, DataType::Float16 | DataType::Float32 | DataType::Float64)
+    matches!(
+        dt,
+        DataType::Float16 | DataType::Float32 | DataType::Float64
+    )
 }
 
 fn float_width(dt: &DataType) -> u8 {
@@ -1669,8 +1672,7 @@ fn pin_array_pair(
 /// `pin_array_pair` may have set.  No-op when the form doesn't match.
 fn pin_array_pair_via_cast(placeholder_side: &Expr, _other_side: &Expr, out: &mut [DataType]) {
     if let Expr::Cast {
-        kind:
-            CastKind::Cast | CastKind::DoubleColon | CastKind::TryCast | CastKind::SafeCast,
+        kind: CastKind::Cast | CastKind::DoubleColon | CastKind::TryCast | CastKind::SafeCast,
         expr: inner,
         data_type,
         ..
@@ -2205,10 +2207,7 @@ fn subst_expr(expr: &mut Expr, params: &[ScalarParam]) -> Result<()> {
             }
         }
         Expr::Between {
-            expr: e,
-            low,
-            high,
-            ..
+            expr: e, low, high, ..
         } => {
             subst_expr(e, params)?;
             subst_expr(low, params)?;
@@ -2282,7 +2281,9 @@ fn subst_expr(expr: &mut Expr, params: &[ScalarParam]) -> Result<()> {
 /// post-substitution guard so the fast path can never dispatch an unbound
 /// placeholder.
 fn stmt_has_placeholder(stmt: &Statement) -> bool {
-    scan_placeholders(&stmt.to_string()).map(|n| n > 0).unwrap_or(true)
+    scan_placeholders(&stmt.to_string())
+        .map(|n| n > 0)
+        .unwrap_or(true)
 }
 
 /// Substitute `$N` placeholders with literal SQL forms of `params[N-1]`.
@@ -3047,11 +3048,7 @@ mod tests {
 
     #[test]
     fn substitute_array_empty() {
-        let out = substitute(
-            "SELECT $1",
-            &[ScalarParam::Array(vec![])],
-        )
-        .unwrap();
+        let out = substitute("SELECT $1", &[ScalarParam::Array(vec![])]).unwrap();
         assert_eq!(out, "SELECT ARRAY[]");
     }
 

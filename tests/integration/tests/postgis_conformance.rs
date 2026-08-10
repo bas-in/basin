@@ -171,10 +171,7 @@ async fn single_bool(sess: &basin_engine::ProjectSession, sql: &str) -> bool {
     }
 }
 
-async fn single_bool_nullable(
-    sess: &basin_engine::ProjectSession,
-    sql: &str,
-) -> Option<bool> {
+async fn single_bool_nullable(sess: &basin_engine::ProjectSession, sql: &str) -> Option<bool> {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().unwrap_or_else(|| panic!("no batch: {sql}"));
@@ -184,7 +181,11 @@ async fn single_bool_nullable(
                 .downcast_ref::<BooleanArray>()
                 .unwrap_or_else(|| panic!("expected Boolean column for: {sql}"));
             assert!(arr.len() >= 1, "no rows from: {sql}");
-            if arr.is_null(0) { None } else { Some(arr.value(0)) }
+            if arr.is_null(0) {
+                None
+            } else {
+                Some(arr.value(0))
+            }
         }
         Ok(other) => panic!("non-rows for {sql}: {other:?}"),
         Err(e) => panic!("error for {sql}: {e}"),
@@ -243,22 +244,14 @@ async fn st_astext_roundtrip_wkt() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Eiffel Tower: lon = 2.2945°E, lat = 48.8584°N.
-    let got = single_string(
-        &sess,
-        "SELECT ST_AsText(ST_MakePoint(2.2945, 48.8584))",
-    )
-    .await;
+    let got = single_string(&sess, "SELECT ST_AsText(ST_MakePoint(2.2945, 48.8584))").await;
     assert_eq!(
         got, "POINT(2.2945 48.8584)",
         "ST_AsText must return 'POINT(x y)' WKT; got={got:?}"
     );
 
     // Negative coordinates (western hemisphere / southern hemisphere).
-    let nyc = single_string(
-        &sess,
-        "SELECT ST_AsText(ST_MakePoint(-74.006, 40.7128))",
-    )
-    .await;
+    let nyc = single_string(&sess, "SELECT ST_AsText(ST_MakePoint(-74.006, 40.7128))").await;
     assert!(
         nyc.starts_with("POINT("),
         "ST_AsText for NYC must start with POINT(; got={nyc:?}"
@@ -321,20 +314,17 @@ async fn st_geomfromtext_invalid_wkt_errors() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     for bad in &[
-        "POINT()",               // missing coordinates
-        "POINT(1.0)",            // single coordinate (Y missing)
-        "POINT(1 2 3)",          // Z coordinate (2-D only)
-        "LINESTRING(0 0 0, 1 1 1)", // Z coordinates (2-D only)
-        "not_a_wkt",             // garbage
+        "POINT()",                        // missing coordinates
+        "POINT(1.0)",                     // single coordinate (Y missing)
+        "POINT(1 2 3)",                   // Z coordinate (2-D only)
+        "LINESTRING(0 0 0, 1 1 1)",       // Z coordinates (2-D only)
+        "not_a_wkt",                      // garbage
         "TRIANGLE((0 0, 1 0, 0 1, 0 0))", // unknown geometry tag
     ] {
         let r = sess
             .execute(&format!("SELECT ST_AsText(ST_GeomFromText('{bad}'))"))
             .await;
-        assert!(
-            r.is_err(),
-            "ST_GeomFromText({bad:?}) must error; got={r:?}"
-        );
+        assert!(r.is_err(), "ST_GeomFromText({bad:?}) must error; got={r:?}");
     }
     // LINESTRING / POLYGON / MULTI* WKT now parse as first-class geometry
     // (the general WKB codec replaced the POINT-only ST_GeomFromText). What
@@ -344,7 +334,10 @@ async fn st_geomfromtext_invalid_wkt_errors() {
         "SELECT ST_AsText(ST_GeomFromText('LINESTRING(0 0, 1 1)'))",
     )
     .await;
-    assert_eq!(ls, "LINESTRING(0 0, 1 1)", "LINESTRING WKT must round-trip; got={ls:?}");
+    assert_eq!(
+        ls, "LINESTRING(0 0, 1 1)",
+        "LINESTRING WKT must round-trip; got={ls:?}"
+    );
     println!("[geo ST_GeomFromText] invalid WKT → error; LINESTRING now valid ✓");
 }
 
@@ -366,22 +359,14 @@ async fn st_asgeojson_full_envelope() {
 
     // Use exact-decimal coordinates so the compact float formatter doesn't add
     // decimal noise (1.5 → "1.5", not "1.5000000000000000").
-    let got = single_string(
-        &sess,
-        "SELECT ST_AsGeoJSON(ST_MakePoint(1.5, 2.5))",
-    )
-    .await;
+    let got = single_string(&sess, "SELECT ST_AsGeoJSON(ST_MakePoint(1.5, 2.5))").await;
     assert_eq!(
         got, r#"{"type":"Point","coordinates":[1.5,2.5]}"#,
         "ST_AsGeoJSON must match RFC 7946 envelope (compact, lon-first); got={got:?}"
     );
 
     // Negative coordinates preserved.
-    let neg = single_string(
-        &sess,
-        "SELECT ST_AsGeoJSON(ST_MakePoint(-73.985, 40.748))",
-    )
-    .await;
+    let neg = single_string(&sess, "SELECT ST_AsGeoJSON(ST_MakePoint(-73.985, 40.748))").await;
     assert!(
         neg.contains("-73.985") && neg.contains("40.748"),
         "ST_AsGeoJSON: coordinates must be preserved; got={neg:?}"
@@ -437,19 +422,30 @@ async fn st_geomfromgeojson_wrong_type_errors() {
         r#"SELECT ST_AsText(ST_GeomFromGeoJSON('{"type":"LineString","coordinates":[[0,0],[1,1]]}'))"#,
     )
     .await;
-    assert_eq!(ls, "LINESTRING(0 0, 1 1)", "LineString GeoJSON must round-trip; got={ls:?}");
+    assert_eq!(
+        ls, "LINESTRING(0 0, 1 1)",
+        "LineString GeoJSON must round-trip; got={ls:?}"
+    );
 
     // Missing 'type' field — still an error.
     let r2 = sess
         .execute(r#"SELECT ST_AsText(ST_GeomFromGeoJSON('{"coordinates":[1,2]}'))"#)
         .await;
-    assert!(r2.is_err(), "ST_GeomFromGeoJSON without type field must error");
+    assert!(
+        r2.is_err(),
+        "ST_GeomFromGeoJSON without type field must error"
+    );
 
     // Unknown geometry type — still an error.
     let r3 = sess
-        .execute(r#"SELECT ST_AsText(ST_GeomFromGeoJSON('{"type":"Nonesuch","coordinates":[1,2]}'))"#)
+        .execute(
+            r#"SELECT ST_AsText(ST_GeomFromGeoJSON('{"type":"Nonesuch","coordinates":[1,2]}'))"#,
+        )
         .await;
-    assert!(r3.is_err(), "ST_GeomFromGeoJSON with unknown type must error; got={r3:?}");
+    assert!(
+        r3.is_err(),
+        "ST_GeomFromGeoJSON with unknown type must error; got={r3:?}"
+    );
     println!("[geo ST_GeomFromGeoJSON] missing/unknown type → error; LineString now valid ✓");
 }
 
@@ -524,7 +520,10 @@ async fn st_x_y_null_safe() {
     exec(&sess, "CREATE TABLE nullpts (id BIGINT, geom POINT)").await;
     exec(&sess, "INSERT INTO nullpts VALUES (1, NULL)").await;
 
-    match sess.execute("SELECT ST_X(geom) FROM nullpts WHERE id = 1").await {
+    match sess
+        .execute("SELECT ST_X(geom) FROM nullpts WHERE id = 1")
+        .await
+    {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().expect("batch");
             assert!(b.column(0).is_null(0), "ST_X(NULL) must return NULL");
@@ -685,7 +684,10 @@ async fn st_dwithin_basic_truth_table() {
             1100.0)",
     )
     .await;
-    assert!(within, "ST_DWithin: point ≈1 002 m away must be within 1 100 m radius");
+    assert!(
+        within,
+        "ST_DWithin: point ≈1 002 m away must be within 1 100 m radius"
+    );
 
     // Same point but radius only 900 m → must be outside.
     let outside = single_bool(
@@ -696,7 +698,10 @@ async fn st_dwithin_basic_truth_table() {
             900.0)",
     )
     .await;
-    assert!(!outside, "ST_DWithin: point ≈1 002 m away must NOT be within 900 m radius");
+    assert!(
+        !outside,
+        "ST_DWithin: point ≈1 002 m away must NOT be within 900 m radius"
+    );
     println!("[geo ST_DWithin] basic truth table ✓");
 }
 
@@ -712,7 +717,10 @@ async fn st_dwithin_coincident_always_within() {
         "SELECT ST_DWithin(ST_MakePoint(5.0, 5.0), ST_MakePoint(5.0, 5.0), 0.0001)",
     )
     .await;
-    assert!(r, "ST_DWithin: coincident points must always be within any radius > 0");
+    assert!(
+        r,
+        "ST_DWithin: coincident points must always be within any radius > 0"
+    );
 
     // Zero radius on coincident points: distance = 0, radius = 0 → 0 <= 0 → true.
     let zero_r = single_bool(
@@ -750,9 +758,7 @@ async fn st_dwithin_boundary_inclusive() {
     // With radius == distance, must be within.
     let at_boundary = single_bool(
         &sess,
-        &format!(
-            "SELECT ST_DWithin(ST_MakePoint(0.0, 0.0), ST_MakePoint(0.0, 0.001), {approx_m})"
-        ),
+        &format!("SELECT ST_DWithin(ST_MakePoint(0.0, 0.0), ST_MakePoint(0.0, 0.001), {approx_m})"),
     )
     .await;
     assert!(
@@ -789,7 +795,11 @@ async fn st_dwithin_where_clause_filter() {
     let (engine, _dir) = make_engine();
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE spatial_pts (id BIGINT NOT NULL, geom POINT)").await;
+    exec(
+        &sess,
+        "CREATE TABLE spatial_pts (id BIGINT NOT NULL, geom POINT)",
+    )
+    .await;
     exec(
         &sess,
         "INSERT INTO spatial_pts VALUES \
@@ -990,7 +1000,10 @@ async fn st_numpoints_of_point_is_one() {
     let (engine, _dir) = make_engine();
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    match sess.execute("SELECT ST_NumPoints(ST_MakePoint(1.0, 2.0))").await {
+    match sess
+        .execute("SELECT ST_NumPoints(ST_MakePoint(1.0, 2.0))")
+        .await
+    {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().expect("batch");
             let arr = b
@@ -1064,8 +1077,14 @@ async fn st_startpoint_endpoint_identity_for_point() {
     )
     .await;
     // PG/PostGIS ST_AsText strips trailing ".0": POINT(1.0 2.0) → "POINT(1 2)"
-    assert_eq!(start, "POINT(1 2)", "ST_StartPoint(POINT) must be identity; got={start:?}");
-    assert_eq!(end, "POINT(1 2)", "ST_EndPoint(POINT) must be identity; got={end:?}");
+    assert_eq!(
+        start, "POINT(1 2)",
+        "ST_StartPoint(POINT) must be identity; got={start:?}"
+    );
+    assert_eq!(
+        end, "POINT(1 2)",
+        "ST_EndPoint(POINT) must be identity; got={end:?}"
+    );
     println!("[geo ST_StartPoint/ST_EndPoint] identity ✓");
 }
 
@@ -1116,7 +1135,10 @@ async fn st_makeenvelope_callable() {
     let r5 = sess
         .execute("SELECT ST_AsText(ST_MakeEnvelope(0.0, 0.0, 10.0, 10.0, 4326))")
         .await;
-    assert!(r5.is_ok(), "ST_MakeEnvelope (5-arg with SRID) must not error; got={r5:?}");
+    assert!(
+        r5.is_ok(),
+        "ST_MakeEnvelope (5-arg with SRID) must not error; got={r5:?}"
+    );
     println!("[geo ST_MakeEnvelope] callable ✓");
 }
 
@@ -1140,8 +1162,8 @@ async fn basin_bbox_contains_point_truth_table() {
     let cases: &[(f64, f64, bool)] = &[
         (3.0, 3.0, true),
         (0.0, 3.0, false),
-        (1.0, 1.0, true),   // min corner (boundary inclusive)
-        (5.0, 5.0, true),   // max corner (boundary inclusive)
+        (1.0, 1.0, true), // min corner (boundary inclusive)
+        (5.0, 5.0, true), // max corner (boundary inclusive)
         (5.001, 5.0, false),
         (3.0, 0.999, false), // y too small
     ];
@@ -1185,7 +1207,8 @@ async fn st_srid_default_is_4326() {
                 .downcast_ref::<Int32Array>()
                 .expect("Int32");
             assert_eq!(
-                arr.value(0), 4326,
+                arr.value(0),
+                4326,
                 "ST_SRID(ST_MakePoint) must return 4326 (Basin default); got={}",
                 arr.value(0)
             );
@@ -1271,7 +1294,10 @@ async fn st_transform_unknown_srid_errors() {
     let r = sess
         .execute("SELECT ST_X(ST_Transform(ST_MakePoint(1.0, 2.0), 99999))")
         .await;
-    assert!(r.is_err(), "ST_Transform to unknown SRID must error; got={r:?}");
+    assert!(
+        r.is_err(),
+        "ST_Transform to unknown SRID must error; got={r:?}"
+    );
     println!("[geo ST_Transform] unknown SRID → error ✓");
 }
 
@@ -1287,11 +1313,7 @@ async fn st_geogfromtext_alias_works() {
     let (engine, _dir) = make_engine();
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let g1 = single_string(
-        &sess,
-        "SELECT ST_AsText(ST_GeogFromText('POINT(1.0 2.0)'))",
-    )
-    .await;
+    let g1 = single_string(&sess, "SELECT ST_AsText(ST_GeogFromText('POINT(1.0 2.0)'))").await;
     let g2 = single_string(
         &sess,
         "SELECT ST_AsText(ST_GeographyFromText('POINT(1.0 2.0)'))",
@@ -1299,7 +1321,10 @@ async fn st_geogfromtext_alias_works() {
     .await;
     // PG/PostGIS ST_AsText strips trailing ".0": POINT(1.0 2.0) → "POINT(1 2)"
     assert_eq!(g1, "POINT(1 2)", "ST_GeogFromText must work; got={g1:?}");
-    assert_eq!(g2, "POINT(1 2)", "ST_GeographyFromText must work; got={g2:?}");
+    assert_eq!(
+        g2, "POINT(1 2)",
+        "ST_GeographyFromText must work; got={g2:?}"
+    );
     println!("[geo geography aliases] ✓");
 }
 
@@ -1315,7 +1340,11 @@ async fn point_column_table_insert_select_filter() {
     let (engine, _dir) = make_engine();
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE cities (id BIGINT NOT NULL, name TEXT, loc POINT)").await;
+    exec(
+        &sess,
+        "CREATE TABLE cities (id BIGINT NOT NULL, name TEXT, loc POINT)",
+    )
+    .await;
     exec(
         &sess,
         "INSERT INTO cities VALUES \
@@ -1332,11 +1361,7 @@ async fn point_column_table_insert_select_filter() {
     assert_eq!(total, 5, "5 rows must be in the table; got={total}");
 
     // ST_AsText round-trip for London.
-    let london_wkt = single_string(
-        &sess,
-        "SELECT ST_AsText(loc) FROM cities WHERE id = 1",
-    )
-    .await;
+    let london_wkt = single_string(&sess, "SELECT ST_AsText(loc) FROM cities WHERE id = 1").await;
     assert!(
         london_wkt.starts_with("POINT("),
         "London WKT must start with POINT(; got={london_wkt:?}"
@@ -1370,18 +1395,18 @@ async fn point_column_st_asgeojson_over_table() {
     let (engine, _dir) = make_engine();
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE geo_tbl (id BIGINT NOT NULL, geom POINT)").await;
+    exec(
+        &sess,
+        "CREATE TABLE geo_tbl (id BIGINT NOT NULL, geom POINT)",
+    )
+    .await;
     exec(
         &sess,
         "INSERT INTO geo_tbl VALUES (1, ST_MakePoint(3.0, 4.0))",
     )
     .await;
 
-    let geojson = single_string(
-        &sess,
-        "SELECT ST_AsGeoJSON(geom) FROM geo_tbl WHERE id = 1",
-    )
-    .await;
+    let geojson = single_string(&sess, "SELECT ST_AsGeoJSON(geom) FROM geo_tbl WHERE id = 1").await;
     assert_eq!(
         geojson,
         r#"{"type":"Point","coordinates":[3.0,4.0]}"#,
@@ -1407,7 +1432,11 @@ async fn order_by_distance_limit_k() {
     let (engine, _dir) = make_engine();
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE dist_cities (id BIGINT NOT NULL, loc POINT)").await;
+    exec(
+        &sess,
+        "CREATE TABLE dist_cities (id BIGINT NOT NULL, loc POINT)",
+    )
+    .await;
     exec(
         &sess,
         "INSERT INTO dist_cities VALUES \
@@ -1442,7 +1471,12 @@ async fn order_by_distance_limit_k() {
                     }
                 }
             }
-            assert_eq!(ids.len(), 3, "ORDER BY ST_Distance LIMIT 3 must return 3 rows; got {:?}", ids);
+            assert_eq!(
+                ids.len(),
+                3,
+                "ORDER BY ST_Distance LIMIT 3 must return 3 rows; got {:?}",
+                ids
+            );
             assert_eq!(
                 ids[0], 2,
                 "Row 0 must be Paris (id=2, 0 km); got ids={ids:?}"
@@ -1561,10 +1595,7 @@ async fn invalid_inputs_produce_typed_errors() {
 
     for sql in &bad_inputs {
         let r = sess.execute(sql).await;
-        assert!(
-            r.is_err(),
-            "Invalid input must error: {sql:?}; got={r:?}"
-        );
+        assert!(r.is_err(), "Invalid input must error: {sql:?}; got={r:?}");
     }
 
     // POLYGON / MULTIPOINT are now first-class supported geometries (general
@@ -1658,14 +1689,16 @@ async fn geom_geojson_roundtrip_and_ordering() {
     );
 
     // Full round-trip GeoJSON → geometry → GeoJSON for a polygon with a hole.
-    let poly_json =
-        r#"{"type":"Polygon","coordinates":[[[0.0,0.0],[4.0,0.0],[4.0,4.0],[0.0,4.0],[0.0,0.0]],[[1.0,1.0],[2.0,1.0],[2.0,2.0],[1.0,1.0]]]}"#;
+    let poly_json = r#"{"type":"Polygon","coordinates":[[[0.0,0.0],[4.0,0.0],[4.0,4.0],[0.0,4.0],[0.0,0.0]],[[1.0,1.0],[2.0,1.0],[2.0,2.0],[1.0,1.0]]]}"#;
     let back = single_string(
         &sess,
         &format!("SELECT ST_AsGeoJSON(ST_GeomFromGeoJSON('{poly_json}'))"),
     )
     .await;
-    assert_eq!(back, poly_json, "Polygon GeoJSON must round-trip exactly; got={back:?}");
+    assert_eq!(
+        back, poly_json,
+        "Polygon GeoJSON must round-trip exactly; got={back:?}"
+    );
     println!("[geo gen GeoJSON] round-trip + type-first ordering ✓");
 }
 
@@ -1685,12 +1718,13 @@ async fn geom_wkb_ewkb_roundtrip() {
         // ST_AsEWKB embeds SRID 4326; ST_GeomFromWKB canonicalises back to WKB.
         let got = single_string(
             &sess,
-            &format!(
-                "SELECT ST_AsText(ST_GeomFromWKB(ST_AsEWKB(ST_GeomFromText('{wkt}'))))"
-            ),
+            &format!("SELECT ST_AsText(ST_GeomFromWKB(ST_AsEWKB(ST_GeomFromText('{wkt}'))))"),
         )
         .await;
-        assert_eq!(&got, wkt, "WKB/EWKB round-trip must recover {wkt:?}; got={got:?}");
+        assert_eq!(
+            &got, wkt,
+            "WKB/EWKB round-trip must recover {wkt:?}; got={got:?}"
+        );
     }
     println!("[geo gen WKB/EWKB] round-trip ✓");
 }
@@ -1717,7 +1751,11 @@ async fn geom_geometrytype_strings() {
             &format!("SELECT ST_GeometryType(ST_GeomFromText('{wkt}'))"),
         )
         .await;
-        assert_eq!(&got.as_str(), ty, "ST_GeometryType({wkt:?}) expected {ty}; got={got:?}");
+        assert_eq!(
+            &got.as_str(),
+            ty,
+            "ST_GeometryType({wkt:?}) expected {ty}; got={got:?}"
+        );
     }
     println!("[geo gen ST_GeometryType] ✓");
 }
@@ -1735,7 +1773,10 @@ async fn geom_length_planar_known() {
     )
     .await;
     // |(0,0)->(3,4)| = 5 (3-4-5 triangle); |(3,4)->(6,4)| = 3. Total = 8.
-    assert!((len - 8.0).abs() < 1e-9, "ST_Length must be 8.0 (5 + 3); got={len}");
+    assert!(
+        (len - 8.0).abs() < 1e-9,
+        "ST_Length must be 8.0 (5 + 3); got={len}"
+    );
     println!("[geo gen ST_Length] linestring = 8.0 ✓");
 }
 
@@ -1751,7 +1792,10 @@ async fn geom_area_planar_unit_square_and_hole() {
         "SELECT ST_Area(ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'))",
     )
     .await;
-    assert!((unit - 1.0).abs() < 1e-12, "ST_Area(unit square) must be 1.0; got={unit}");
+    assert!(
+        (unit - 1.0).abs() < 1e-12,
+        "ST_Area(unit square) must be 1.0; got={unit}"
+    );
 
     // 4x4 square (area 16) with a 1x1 hole (area 1) → 15.
     let holed = single_f64(
@@ -1759,7 +1803,10 @@ async fn geom_area_planar_unit_square_and_hole() {
         "SELECT ST_Area(ST_GeomFromText('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1))'))",
     )
     .await;
-    assert!((holed - 15.0).abs() < 1e-9, "ST_Area(4x4 minus 1x1 hole) must be 15.0; got={holed}");
+    assert!(
+        (holed - 15.0).abs() < 1e-9,
+        "ST_Area(4x4 minus 1x1 hole) must be 15.0; got={holed}"
+    );
 
     // MultiPolygon area sums the parts: two unit squares → 2.0.
     let multi = single_f64(
@@ -1767,7 +1814,10 @@ async fn geom_area_planar_unit_square_and_hole() {
         "SELECT ST_Area(ST_GeomFromText('MULTIPOLYGON(((0 0, 1 0, 1 1, 0 1, 0 0)), ((5 5, 6 5, 6 6, 5 6, 5 5)))'))",
     )
     .await;
-    assert!((multi - 2.0).abs() < 1e-12, "ST_Area(2 unit squares) must be 2.0; got={multi}");
+    assert!(
+        (multi - 2.0).abs() < 1e-12,
+        "ST_Area(2 unit squares) must be 2.0; got={multi}"
+    );
     println!("[geo gen ST_Area] unit-square=1, holed=15, multi=2 ✓");
 }
 
@@ -1783,7 +1833,10 @@ async fn geom_centroid_triangle() {
         "SELECT ST_AsText(ST_Centroid(ST_GeomFromText('POLYGON((0 0, 3 0, 0 3, 0 0))')))",
     )
     .await;
-    assert_eq!(wkt, "POINT(1 1)", "triangle centroid must be (1,1); got={wkt:?}");
+    assert_eq!(
+        wkt, "POINT(1 1)",
+        "triangle centroid must be (1,1); got={wkt:?}"
+    );
     println!("[geo gen ST_Centroid] triangle → POINT(1 1) ✓");
 }
 
@@ -1828,11 +1881,16 @@ async fn geom_numgeometries_and_geometryn() {
         &format!("SELECT ST_AsText(ST_GeometryN(ST_GeomFromText('{mp}'), 2))"),
     )
     .await;
-    assert_eq!(g2, "POINT(1 1)", "ST_GeometryN(.., 2) must be the 2nd member; got={g2:?}");
+    assert_eq!(
+        g2, "POINT(1 1)",
+        "ST_GeometryN(.., 2) must be the 2nd member; got={g2:?}"
+    );
 
     // Out-of-range index → NULL.
     match sess
-        .execute(&format!("SELECT ST_AsText(ST_GeometryN(ST_GeomFromText('{mp}'), 9))"))
+        .execute(&format!(
+            "SELECT ST_AsText(ST_GeometryN(ST_GeomFromText('{mp}'), 9))"
+        ))
         .await
     {
         Ok(ExecResult::Rows { batches, .. }) => {
@@ -1851,7 +1909,10 @@ async fn geom_numgeometries_and_geometryn() {
         "SELECT ST_NumGeometries(ST_GeomFromText('POINT(5 6)'))",
     )
     .await;
-    assert_eq!(single_n, 1, "ST_NumGeometries(POINT) must be 1; got={single_n}");
+    assert_eq!(
+        single_n, 1,
+        "ST_NumGeometries(POINT) must be 1; got={single_n}"
+    );
     println!("[geo gen multipart] ST_NumGeometries / ST_GeometryN ✓");
 }
 
@@ -1875,7 +1936,10 @@ async fn geom_linestring_vertex_accessors() {
         &format!("SELECT ST_AsText(ST_PointN(ST_GeomFromText('{ls}'), 2))"),
     )
     .await;
-    assert_eq!(p2, "POINT(3 4)", "ST_PointN(.., 2) must be the 2nd vertex; got={p2:?}");
+    assert_eq!(
+        p2, "POINT(3 4)",
+        "ST_PointN(.., 2) must be the 2nd vertex; got={p2:?}"
+    );
 
     let start = single_string(
         &sess,
@@ -1887,8 +1951,14 @@ async fn geom_linestring_vertex_accessors() {
         &format!("SELECT ST_AsText(ST_EndPoint(ST_GeomFromText('{ls}')))"),
     )
     .await;
-    assert_eq!(start, "POINT(0 0)", "ST_StartPoint must be first vertex; got={start:?}");
-    assert_eq!(end, "POINT(6 4)", "ST_EndPoint must be last vertex; got={end:?}");
+    assert_eq!(
+        start, "POINT(0 0)",
+        "ST_StartPoint must be first vertex; got={start:?}"
+    );
+    assert_eq!(
+        end, "POINT(6 4)",
+        "ST_EndPoint must be last vertex; got={end:?}"
+    );
     println!("[geo gen line accessors] ST_NumPoints/ST_PointN/Start/End ✓");
 }
 
@@ -2019,7 +2089,10 @@ async fn geom_null_and_empty_handling() {
         "SELECT ST_NumGeometries(ST_GeomFromText('GEOMETRYCOLLECTION()'))",
     )
     .await;
-    assert_eq!(n, 0, "ST_NumGeometries(empty collection) must be 0; got={n}");
+    assert_eq!(
+        n, 0,
+        "ST_NumGeometries(empty collection) must be 0; got={n}"
+    );
     println!("[geo gen NULL/empty] handled ✓");
 }
 
@@ -2044,6 +2117,9 @@ async fn geom_invalid_wkb_typed_error() {
                 decode('0101000000000000000000F03F000000000000004000', 'hex')))",
         )
         .await;
-    assert!(r2.is_err(), "WKB with trailing bytes must error; got={r2:?}");
+    assert!(
+        r2.is_err(),
+        "WKB with trailing bytes must error; got={r2:?}"
+    );
     println!("[geo gen invalid WKB] typed error ✓");
 }

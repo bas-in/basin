@@ -34,8 +34,7 @@ const PG_EPOCH_DAYS_FROM_UNIX: i32 = 10957;
 /// encoding here and by the matching parameter DECODE in `protocol.rs`
 /// (`decode_param_binary`'s TIMESTAMP / TIMESTAMPTZ arms rebase with the
 /// same constant in the opposite direction).
-pub(crate) const PG_EPOCH_MICROS_FROM_UNIX: i64 =
-    (PG_EPOCH_DAYS_FROM_UNIX as i64) * 86_400_000_000;
+pub(crate) const PG_EPOCH_MICROS_FROM_UNIX: i64 = (PG_EPOCH_DAYS_FROM_UNIX as i64) * 86_400_000_000;
 
 /// Field-metadata key that basin-engine uses to mark logical types not
 /// directly representable in Arrow (today: `JSONB`, `UUID`). Kept in sync
@@ -252,19 +251,19 @@ pub(crate) fn arrow_to_pg_type(dt: &DataType) -> Type {
         // rejecting it with `WrongType` against a TEXT slot.  Element type
         // is read from the List's inner field; anything we don't have an
         // array OID for falls through to TEXT.
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::FixedSizeList(field, _) => match field.data_type() {
-            DataType::Int64 | DataType::UInt32 | DataType::UInt64 => Type::INT8_ARRAY,
-            DataType::Int32 => Type::INT4_ARRAY,
-            DataType::Int16 | DataType::Int8 | DataType::UInt8 | DataType::UInt16 => {
-                Type::INT2_ARRAY
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+            match field.data_type() {
+                DataType::Int64 | DataType::UInt32 | DataType::UInt64 => Type::INT8_ARRAY,
+                DataType::Int32 => Type::INT4_ARRAY,
+                DataType::Int16 | DataType::Int8 | DataType::UInt8 | DataType::UInt16 => {
+                    Type::INT2_ARRAY
+                }
+                DataType::Boolean => Type::BOOL_ARRAY,
+                DataType::Float64 => Type::FLOAT8_ARRAY,
+                DataType::Utf8 | DataType::LargeUtf8 => Type::TEXT_ARRAY,
+                _ => Type::TEXT,
             }
-            DataType::Boolean => Type::BOOL_ARRAY,
-            DataType::Float64 => Type::FLOAT8_ARRAY,
-            DataType::Utf8 | DataType::LargeUtf8 => Type::TEXT_ARRAY,
-            _ => Type::TEXT,
-        },
+        }
         // Everything else gets formatted as text.
         _ => Type::TEXT,
     }
@@ -1302,7 +1301,11 @@ fn format_pg_array_text(elems: &dyn Array) -> String {
             DataType::LargeUtf8 => {
                 push_quoted_array_elem(&mut s, elems.as_string::<i64>().value(i))
             }
-            DataType::Boolean => s.push(if elems.as_boolean().value(i) { 't' } else { 'f' }),
+            DataType::Boolean => s.push(if elems.as_boolean().value(i) {
+                't'
+            } else {
+                'f'
+            }),
             DataType::Int64 => {
                 let _ = write!(s, "{}", elems.as_primitive::<Int64Type>().value(i));
             }
@@ -1940,8 +1943,7 @@ mod tests {
         // created_at: TIMESTAMPTZ (OID 1184, 8 bytes)
         assert_eq!(rd.fields[3].name, "created_at");
         assert_eq!(
-            rd.fields[3].type_id,
-            1184,
+            rd.fields[3].type_id, 1184,
             "TIMESTAMPTZ must be OID 1184, got {}",
             rd.fields[3].type_id
         );

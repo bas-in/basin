@@ -58,9 +58,7 @@ fn every_preset_provider_can_register_in_cache() {
             p.userinfo_url
         );
         assert!(
-            !p.authorize_url.is_empty()
-                && !p.token_url.is_empty()
-                && !p.userinfo_url.is_empty(),
+            !p.authorize_url.is_empty() && !p.token_url.is_empty() && !p.userinfo_url.is_empty(),
             "{name}: endpoints must all be non-empty"
         );
 

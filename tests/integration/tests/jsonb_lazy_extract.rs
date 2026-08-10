@@ -223,14 +223,12 @@ async fn hash_path_extract() {
     );
     // #>> leaf string -> text
     assert_eq!(
-        one_text(&sess, &format!("SELECT '{doc}'::jsonb #>> '{{a,b,c}}'"))
-            .await,
+        one_text(&sess, &format!("SELECT '{doc}'::jsonb #>> '{{a,b,c}}'")).await,
         Some("deep".to_string())
     );
     // #> path into array element by index
     assert_eq!(
-        one_text(&sess, &format!("SELECT '{doc}'::jsonb #>> '{{arr,1,x}}'"))
-            .await,
+        one_text(&sess, &format!("SELECT '{doc}'::jsonb #>> '{{arr,1,x}}'")).await,
         Some("2".to_string())
     );
     // missing path -> NULL
@@ -329,7 +327,10 @@ async fn edge_payloads_over_column() {
         // 1: unicode + emoji string values
         (1, r#"{"name":"café ☃","emoji":"😀","note":"naïve résumé"}"#),
         // 2: escaped chars inside string values
-        (2, r#"{"path":"a\\b\\c","quote":"he said \"hi\"","tab":"x\ty"}"#),
+        (
+            2,
+            r#"{"path":"a\\b\\c","quote":"he said \"hi\"","tab":"x\ty"}"#,
+        ),
         // 3: duplicate keys — last wins (serde / PG jsonb)
         (3, r#"{"k":1,"k":2,"k":3}"#),
         // 4: number spectrum
@@ -376,11 +377,7 @@ async fn edge_payloads_over_column() {
 
     // 3: duplicate key — last value wins
     assert_eq!(
-        one_int(
-            &sess,
-            "SELECT (p ->> 'k')::bigint FROM docs WHERE id = 3"
-        )
-        .await,
+        one_int(&sess, "SELECT (p ->> 'k')::bigint FROM docs WHERE id = 3").await,
         Some(3)
     );
 
@@ -405,9 +402,12 @@ async fn edge_payloads_over_column() {
     );
     // typeof of an empty object
     assert_eq!(
-        one_text(&sess, "SELECT jsonb_typeof(p -> 'empty') FROM docs WHERE id = 5")
-            .await
-            .as_deref(),
+        one_text(
+            &sess,
+            "SELECT jsonb_typeof(p -> 'empty') FROM docs WHERE id = 5"
+        )
+        .await
+        .as_deref(),
         Some("object")
     );
     // ? key presence over a column

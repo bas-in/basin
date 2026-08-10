@@ -170,11 +170,7 @@ pub trait MfaStore: AuthStore {
 
     async fn insert_mfa_factor(&self, schema: &str, row: &MfaFactorRow) -> Result<()>;
 
-    async fn load_mfa_factor(
-        &self,
-        schema: &str,
-        factor_id: Uuid,
-    ) -> Result<Option<MfaFactorRow>>;
+    async fn load_mfa_factor(&self, schema: &str, factor_id: Uuid) -> Result<Option<MfaFactorRow>>;
 
     async fn list_mfa_factors(
         &self,
@@ -284,11 +280,7 @@ impl MfaStore for PostgresAuthStore {
         Ok(())
     }
 
-    async fn load_mfa_factor(
-        &self,
-        schema: &str,
-        factor_id: Uuid,
-    ) -> Result<Option<MfaFactorRow>> {
+    async fn load_mfa_factor(&self, schema: &str, factor_id: Uuid) -> Result<Option<MfaFactorRow>> {
         let client = self.client.lock().await;
         let sql = format!(
             "SELECT id, user_id, project_id, factor_type, status, secret_enc, friendly_name,
@@ -474,9 +466,8 @@ impl MfaStore for PostgresAuthStore {
 
     async fn consume_recovery_code(&self, schema: &str, code_id: i64) -> Result<()> {
         let client = self.client.lock().await;
-        let sql = format!(
-            "UPDATE {schema}_mfa_recovery_codes SET consumed_at = now() WHERE id = $1"
-        );
+        let sql =
+            format!("UPDATE {schema}_mfa_recovery_codes SET consumed_at = now() WHERE id = $1");
         client
             .execute(&sql, &[&code_id])
             .await
@@ -707,11 +698,8 @@ fn percent_encode(s: &str) -> String {
 /// arithmetically valid. On success the accepted step is returned; the caller
 /// MUST persist it as the new `min_step`.
 pub fn verify_totp(secret_b32: &str, code: &str, min_step: u64) -> Result<u64> {
-    let secret_bytes = base32::decode(
-        base32::Alphabet::RFC4648 { padding: false },
-        secret_b32,
-    )
-    .ok_or_else(|| BasinError::InvalidIdent("invalid TOTP secret encoding".into()))?;
+    let secret_bytes = base32::decode(base32::Alphabet::RFC4648 { padding: false }, secret_b32)
+        .ok_or_else(|| BasinError::InvalidIdent("invalid TOTP secret encoding".into()))?;
 
     let code_stripped = code.replace(' ', "");
     if code_stripped.len() != 6 || !code_stripped.chars().all(|c| c.is_ascii_digit()) {
@@ -727,7 +715,11 @@ pub fn verify_totp(secret_b32: &str, code: &str, min_step: u64) -> Result<u64> {
     let current_step = now_secs / 30;
 
     // Check current step and ±1 window, newest first so a fresh code wins.
-    for step in [current_step + 1, current_step, current_step.saturating_sub(1)] {
+    for step in [
+        current_step + 1,
+        current_step,
+        current_step.saturating_sub(1),
+    ] {
         // Replay guard: a step at or below the last consumed step is a reuse.
         if step <= min_step {
             continue;
@@ -782,8 +774,7 @@ pub fn generate_recovery_codes() -> (Vec<String>, Vec<String>) {
         // Use bcrypt (same as password hashing — argon2 not in workspace yet)
         // with cost 4 for speed. Recovery codes are high-entropy so cost 4
         // is still plenty strong against offline attacks.
-        let hash =
-            bcrypt::hash(&plain, 4).unwrap_or_else(|_| format!("HASH_FAILED:{plain}"));
+        let hash = bcrypt::hash(&plain, 4).unwrap_or_else(|_| format!("HASH_FAILED:{plain}"));
         plaintexts.push(plain);
         hashes.push(hash);
     }
@@ -925,9 +916,7 @@ where
     require_factor_type(&factor, FactorType::Totp)?;
 
     if factor.status == FactorStatus::Verified {
-        return Err(BasinError::InvalidIdent(
-            "factor already verified".into(),
-        ));
+        return Err(BasinError::InvalidIdent("factor already verified".into()));
     }
 
     let secret = enc.decrypt(&factor.secret_enc)?;
@@ -936,7 +925,8 @@ where
     if let Some(pg) = mfa_store {
         pg.verify_mfa_factor(schema, factor_id).await?;
         // Burn this step so the enrollment code can't be replayed.
-        pg.set_factor_last_used_step(schema, factor_id, step).await?;
+        pg.set_factor_last_used_step(schema, factor_id, step)
+            .await?;
     } else {
         inner.mfa_cache.verify_factor_sync(factor_id);
         inner
@@ -945,7 +935,8 @@ where
     }
 
     // Issue recovery codes only at first verified factor.
-    let recovery = maybe_issue_recovery_codes(inner, mfa_store, schema, user_id, project_id).await?;
+    let recovery =
+        maybe_issue_recovery_codes(inner, mfa_store, schema, user_id, project_id).await?;
     Ok(recovery)
 }
 
@@ -1020,7 +1011,8 @@ where
     // Persist the accepted step BEFORE issuing tokens: a replay of the same
     // code (same or lower step) is now rejected for the validity window.
     if let Some(pg) = mfa_store {
-        pg.set_factor_last_used_step(schema, factor.id, step).await?;
+        pg.set_factor_last_used_step(schema, factor.id, step)
+            .await?;
     } else {
         inner
             .mfa_cache
@@ -1205,7 +1197,9 @@ struct AuthData {
 
 fn parse_auth_data(bytes: &[u8]) -> Result<AuthData> {
     if bytes.len() < 37 {
-        return Err(BasinError::InvalidIdent("authenticatorData too short".into()));
+        return Err(BasinError::InvalidIdent(
+            "authenticatorData too short".into(),
+        ));
     }
     let mut rp_id_hash = [0u8; 32];
     rp_id_hash.copy_from_slice(&bytes[0..32]);
@@ -1320,7 +1314,9 @@ fn check_client_data(
         .ct_eq(expected_challenge.as_bytes())
         .into();
     if !challenge_ok {
-        return Err(BasinError::InvalidIdent("WebAuthn challenge mismatch".into()));
+        return Err(BasinError::InvalidIdent(
+            "WebAuthn challenge mismatch".into(),
+        ));
     }
     let origin = cd
         .get("origin")
@@ -1375,15 +1371,23 @@ fn verify_attestation(
                 _ => None,
             })
             .ok_or_else(|| BasinError::InvalidIdent("attestationObject missing authData".into()))?,
-        _ => return Err(BasinError::InvalidIdent("attestationObject not a map".into())),
+        _ => {
+            return Err(BasinError::InvalidIdent(
+                "attestationObject not a map".into(),
+            ))
+        }
     };
 
     let auth_data = parse_auth_data(&auth_data_bytes)?;
     if auth_data.rp_id_hash != sha256(WEBAUTHN_RP_ID.as_bytes()) {
-        return Err(BasinError::InvalidIdent("WebAuthn rpIdHash mismatch".into()));
+        return Err(BasinError::InvalidIdent(
+            "WebAuthn rpIdHash mismatch".into(),
+        ));
     }
     if auth_data.flags & FLAG_UP == 0 {
-        return Err(BasinError::InvalidIdent("WebAuthn user-present flag unset".into()));
+        return Err(BasinError::InvalidIdent(
+            "WebAuthn user-present flag unset".into(),
+        ));
     }
     if auth_data.flags & FLAG_AT == 0 {
         return Err(BasinError::InvalidIdent(
@@ -1439,10 +1443,14 @@ fn verify_assertion(
     let auth_data = parse_auth_data(&auth_data_bytes)?;
 
     if auth_data.rp_id_hash != sha256(WEBAUTHN_RP_ID.as_bytes()) {
-        return Err(BasinError::InvalidIdent("WebAuthn rpIdHash mismatch".into()));
+        return Err(BasinError::InvalidIdent(
+            "WebAuthn rpIdHash mismatch".into(),
+        ));
     }
     if auth_data.flags & FLAG_UP == 0 {
-        return Err(BasinError::InvalidIdent("WebAuthn user-present flag unset".into()));
+        return Err(BasinError::InvalidIdent(
+            "WebAuthn user-present flag unset".into(),
+        ));
     }
 
     let sig_b64 = response
@@ -1500,7 +1508,8 @@ where
     // (type/challenge/origin), the rpIdHash + user-present flag, and parses the
     // COSE P-256 public key. A hand-built JSON without a valid attested
     // credential structure is rejected here.
-    let (stored, initial_counter) = verify_attestation(attestation_json, &challenge.challenge_data)?;
+    let (stored, initial_counter) =
+        verify_attestation(attestation_json, &challenge.challenge_data)?;
 
     // Persist the credential (credential id + public key), encrypted.
     let stored_json = serde_json::to_string(&stored)
@@ -1523,7 +1532,8 @@ where
         }
     }
 
-    let recovery = maybe_issue_recovery_codes(inner, mfa_store, schema, user_id, project_id).await?;
+    let recovery =
+        maybe_issue_recovery_codes(inner, mfa_store, schema, user_id, project_id).await?;
     Ok(recovery)
 }
 
@@ -1819,9 +1829,7 @@ fn require_factor_type(factor: &MfaFactorRow, expected: FactorType) -> Result<()
 
 fn require_factor_verified(factor: &MfaFactorRow) -> Result<()> {
     if factor.status != FactorStatus::Verified {
-        return Err(BasinError::InvalidIdent(
-            "factor not yet verified".into(),
-        ));
+        return Err(BasinError::InvalidIdent("factor not yet verified".into()));
     }
     Ok(())
 }
@@ -1911,70 +1919,240 @@ async fn issue_aal2_tokens(
 
 #[cfg(any(test, feature = "test-utils"))]
 const _: () = {
-    use std::collections::HashMap;
+    use crate::store::{
+        ApiKeyRow, AuthMagicLinkRow, AuthStore, AuthUser, EmailTokenRow, MagicLinkEmailTokenRow,
+        ProjectCredentialRow, RefreshRevocationRow,
+    };
+    use crate::UserId;
     use async_trait::async_trait;
     use basin_common::{ProjectId, Result};
     use chrono::{DateTime, Utc};
+    use std::collections::HashMap;
     use uuid::Uuid;
-    use crate::store::{
-        ApiKeyRow, AuthMagicLinkRow, AuthStore, AuthUser, EmailTokenRow,
-        MagicLinkEmailTokenRow, ProjectCredentialRow, RefreshRevocationRow,
-    };
-    use crate::UserId;
 
     #[async_trait]
     impl AuthStore for MfaCache {
-        async fn migrate(&self, _: &str) -> Result<()> { panic!("MfaCache stub") }
-        async fn create_user(&self, _: &ProjectId, _: &str, _: &str, _: UserId) -> Result<UserId> { panic!("MfaCache stub") }
-        async fn find_user_by_email(&self, _: &ProjectId, _: &str) -> Result<Option<AuthUser>> { panic!("MfaCache stub") }
-        async fn find_user_by_id(&self, _: &ProjectId, _: UserId) -> Result<Option<AuthUser>> { panic!("MfaCache stub") }
-        async fn any_user_by_email(&self, _: &str) -> Result<Option<()>> { panic!("MfaCache stub") }
-        async fn latest_user_by_email(&self, _: &str) -> Result<Option<(UserId, ProjectId)>> { panic!("MfaCache stub") }
-        async fn mark_email_verified(&self, _: &ProjectId, _: UserId) -> Result<()> { panic!("MfaCache stub") }
-        async fn mark_email_verified_if_null(&self, _: &ProjectId, _: UserId) -> Result<()> { panic!("MfaCache stub") }
-        async fn update_password(&self, _: &ProjectId, _: UserId, _: &str) -> Result<()> { panic!("MfaCache stub") }
-        async fn insert_email_token(&self, _: &ProjectId, _: UserId, _: &str, _: &str, _: DateTime<Utc>) -> Result<()> { panic!("MfaCache stub") }
-        async fn find_email_token(&self, _: &ProjectId, _: &str) -> Result<Option<EmailTokenRow>> { panic!("MfaCache stub") }
-        async fn find_magic_link_email_token(&self, _: &ProjectId, _: &str) -> Result<Option<MagicLinkEmailTokenRow>> { panic!("MfaCache stub") }
-        async fn consume_email_token(&self, _: &ProjectId, _: &str) -> Result<u64> { panic!("MfaCache stub") }
-        async fn insert_refresh_revocation(&self, _: &str, _: UserId, _: DateTime<Utc>) -> Result<u64> { panic!("MfaCache stub") }
-        async fn upsert_refresh_revocation(&self, _: &str, _: UserId, _: DateTime<Utc>) -> Result<()> { panic!("MfaCache stub") }
-        async fn list_refresh_revocations(&self, _: UserId) -> Result<Vec<RefreshRevocationRow>> { panic!("MfaCache stub") }
-        async fn upsert_blanket_revocation(&self, _: &str, _: UserId, _: DateTime<Utc>) -> Result<()> { panic!("MfaCache stub") }
-        async fn insert_api_key(&self, _: &ProjectId, _: UserId, _: &str, _: &str, _: &str) -> Result<(i64, DateTime<Utc>)> { panic!("MfaCache stub") }
-        async fn find_api_keys_by_hash(&self, _: &str) -> Result<Vec<ApiKeyRow>> { panic!("MfaCache stub") }
-        async fn touch_api_key(&self, _: i64) -> Result<()> { panic!("MfaCache stub") }
-        async fn revoke_api_key(&self, _: &ProjectId, _: i64) -> Result<()> { panic!("MfaCache stub") }
-        async fn list_api_keys(&self, _: &ProjectId, _: UserId) -> Result<Vec<crate::api_keys::ApiKeyDescriptor>> { panic!("MfaCache stub") }
-        async fn upsert_session_setting(&self, _: &ProjectId, _: UserId, _: &str, _: &str) -> Result<()> { panic!("MfaCache stub") }
-        async fn list_session_settings(&self, _: &ProjectId, _: UserId) -> Result<HashMap<String, String>> { panic!("MfaCache stub") }
-        async fn insert_project_credential(&self, _: &ProjectId, _: &str, _: &str, _: &str) -> Result<bool> { panic!("MfaCache stub") }
-        async fn find_project_credential(&self, _: &str) -> Result<Option<ProjectCredentialRow>> { panic!("MfaCache stub") }
-        async fn rotate_project_credential(&self, _: &str, _: &str) -> Result<Option<ProjectCredentialRow>> { panic!("MfaCache stub") }
-        async fn list_project_credentials(&self, _: &ProjectId) -> Result<Vec<crate::project_credentials::ProjectCredentialDescriptor>> { panic!("MfaCache stub") }
-        async fn list_legacy_project_credentials(&self) -> Result<Vec<(ProjectId, String)>> { panic!("MfaCache stub") }
-        async fn delete_project_credential(&self, _: &str) -> Result<()> { panic!("MfaCache stub") }
-        async fn insert_auth_magic_link(&self, _: &str, _: &str, _: DateTime<Utc>) -> Result<()> { panic!("MfaCache stub") }
-        async fn list_active_auth_magic_links(&self) -> Result<Vec<AuthMagicLinkRow>> { panic!("MfaCache stub") }
-        async fn consume_auth_magic_link(&self, _: i64) -> Result<u64> { panic!("MfaCache stub") }
-        async fn mark_email_verified_by_user_id(&self, _: UserId) -> Result<()> { panic!("MfaCache stub") }
+        async fn migrate(&self, _: &str) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn create_user(&self, _: &ProjectId, _: &str, _: &str, _: UserId) -> Result<UserId> {
+            panic!("MfaCache stub")
+        }
+        async fn find_user_by_email(&self, _: &ProjectId, _: &str) -> Result<Option<AuthUser>> {
+            panic!("MfaCache stub")
+        }
+        async fn find_user_by_id(&self, _: &ProjectId, _: UserId) -> Result<Option<AuthUser>> {
+            panic!("MfaCache stub")
+        }
+        async fn any_user_by_email(&self, _: &str) -> Result<Option<()>> {
+            panic!("MfaCache stub")
+        }
+        async fn latest_user_by_email(&self, _: &str) -> Result<Option<(UserId, ProjectId)>> {
+            panic!("MfaCache stub")
+        }
+        async fn mark_email_verified(&self, _: &ProjectId, _: UserId) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn mark_email_verified_if_null(&self, _: &ProjectId, _: UserId) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn update_password(&self, _: &ProjectId, _: UserId, _: &str) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn insert_email_token(
+            &self,
+            _: &ProjectId,
+            _: UserId,
+            _: &str,
+            _: &str,
+            _: DateTime<Utc>,
+        ) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn find_email_token(&self, _: &ProjectId, _: &str) -> Result<Option<EmailTokenRow>> {
+            panic!("MfaCache stub")
+        }
+        async fn find_magic_link_email_token(
+            &self,
+            _: &ProjectId,
+            _: &str,
+        ) -> Result<Option<MagicLinkEmailTokenRow>> {
+            panic!("MfaCache stub")
+        }
+        async fn consume_email_token(&self, _: &ProjectId, _: &str) -> Result<u64> {
+            panic!("MfaCache stub")
+        }
+        async fn insert_refresh_revocation(
+            &self,
+            _: &str,
+            _: UserId,
+            _: DateTime<Utc>,
+        ) -> Result<u64> {
+            panic!("MfaCache stub")
+        }
+        async fn upsert_refresh_revocation(
+            &self,
+            _: &str,
+            _: UserId,
+            _: DateTime<Utc>,
+        ) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn list_refresh_revocations(&self, _: UserId) -> Result<Vec<RefreshRevocationRow>> {
+            panic!("MfaCache stub")
+        }
+        async fn upsert_blanket_revocation(
+            &self,
+            _: &str,
+            _: UserId,
+            _: DateTime<Utc>,
+        ) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn insert_api_key(
+            &self,
+            _: &ProjectId,
+            _: UserId,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(i64, DateTime<Utc>)> {
+            panic!("MfaCache stub")
+        }
+        async fn find_api_keys_by_hash(&self, _: &str) -> Result<Vec<ApiKeyRow>> {
+            panic!("MfaCache stub")
+        }
+        async fn touch_api_key(&self, _: i64) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn revoke_api_key(&self, _: &ProjectId, _: i64) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn list_api_keys(
+            &self,
+            _: &ProjectId,
+            _: UserId,
+        ) -> Result<Vec<crate::api_keys::ApiKeyDescriptor>> {
+            panic!("MfaCache stub")
+        }
+        async fn upsert_session_setting(
+            &self,
+            _: &ProjectId,
+            _: UserId,
+            _: &str,
+            _: &str,
+        ) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn list_session_settings(
+            &self,
+            _: &ProjectId,
+            _: UserId,
+        ) -> Result<HashMap<String, String>> {
+            panic!("MfaCache stub")
+        }
+        async fn insert_project_credential(
+            &self,
+            _: &ProjectId,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<bool> {
+            panic!("MfaCache stub")
+        }
+        async fn find_project_credential(&self, _: &str) -> Result<Option<ProjectCredentialRow>> {
+            panic!("MfaCache stub")
+        }
+        async fn rotate_project_credential(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<ProjectCredentialRow>> {
+            panic!("MfaCache stub")
+        }
+        async fn list_project_credentials(
+            &self,
+            _: &ProjectId,
+        ) -> Result<Vec<crate::project_credentials::ProjectCredentialDescriptor>> {
+            panic!("MfaCache stub")
+        }
+        async fn list_legacy_project_credentials(&self) -> Result<Vec<(ProjectId, String)>> {
+            panic!("MfaCache stub")
+        }
+        async fn delete_project_credential(&self, _: &str) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn insert_auth_magic_link(&self, _: &str, _: &str, _: DateTime<Utc>) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn list_active_auth_magic_links(&self) -> Result<Vec<AuthMagicLinkRow>> {
+            panic!("MfaCache stub")
+        }
+        async fn consume_auth_magic_link(&self, _: i64) -> Result<u64> {
+            panic!("MfaCache stub")
+        }
+        async fn mark_email_verified_by_user_id(&self, _: UserId) -> Result<()> {
+            panic!("MfaCache stub")
+        }
     }
 
     #[async_trait]
     impl MfaStore for MfaCache {
-        async fn insert_mfa_factor(&self, _: &str, _: &MfaFactorRow) -> Result<()> { panic!("MfaCache stub") }
-        async fn load_mfa_factor(&self, _: &str, _: Uuid) -> Result<Option<MfaFactorRow>> { panic!("MfaCache stub") }
-        async fn list_mfa_factors(&self, _: &str, _: Uuid, _: &ProjectId) -> Result<Vec<MfaFactorRow>> { panic!("MfaCache stub") }
-        async fn verify_mfa_factor(&self, _: &str, _: Uuid) -> Result<()> { panic!("MfaCache stub") }
-        async fn set_factor_last_used_step(&self, _: &str, _: Uuid, _: u64) -> Result<()> { panic!("MfaCache stub") }
-        async fn delete_mfa_factor(&self, _: &str, _: Uuid) -> Result<()> { panic!("MfaCache stub") }
-        async fn insert_mfa_challenge(&self, _: &str, _: &MfaChallengeRow) -> Result<()> { panic!("MfaCache stub") }
-        async fn consume_mfa_challenge(&self, _: &str, _: Uuid) -> Result<Option<MfaChallengeRow>> { panic!("MfaCache stub") }
-        async fn insert_recovery_codes(&self, _: &str, _: Uuid, _: &ProjectId, _: &[String]) -> Result<()> { panic!("MfaCache stub") }
-        async fn count_recovery_codes(&self, _: &str, _: Uuid, _: &ProjectId) -> Result<i64> { panic!("MfaCache stub") }
-        async fn list_active_recovery_code_hashes(&self, _: &str, _: Uuid, _: &ProjectId) -> Result<Vec<(i64, String)>> { panic!("MfaCache stub") }
-        async fn consume_recovery_code(&self, _: &str, _: i64) -> Result<()> { panic!("MfaCache stub") }
-        async fn update_webauthn_credential(&self, _: &str, _: Uuid, _: &str) -> Result<()> { panic!("MfaCache stub") }
+        async fn insert_mfa_factor(&self, _: &str, _: &MfaFactorRow) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn load_mfa_factor(&self, _: &str, _: Uuid) -> Result<Option<MfaFactorRow>> {
+            panic!("MfaCache stub")
+        }
+        async fn list_mfa_factors(
+            &self,
+            _: &str,
+            _: Uuid,
+            _: &ProjectId,
+        ) -> Result<Vec<MfaFactorRow>> {
+            panic!("MfaCache stub")
+        }
+        async fn verify_mfa_factor(&self, _: &str, _: Uuid) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn set_factor_last_used_step(&self, _: &str, _: Uuid, _: u64) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn delete_mfa_factor(&self, _: &str, _: Uuid) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn insert_mfa_challenge(&self, _: &str, _: &MfaChallengeRow) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn consume_mfa_challenge(&self, _: &str, _: Uuid) -> Result<Option<MfaChallengeRow>> {
+            panic!("MfaCache stub")
+        }
+        async fn insert_recovery_codes(
+            &self,
+            _: &str,
+            _: Uuid,
+            _: &ProjectId,
+            _: &[String],
+        ) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn count_recovery_codes(&self, _: &str, _: Uuid, _: &ProjectId) -> Result<i64> {
+            panic!("MfaCache stub")
+        }
+        async fn list_active_recovery_code_hashes(
+            &self,
+            _: &str,
+            _: Uuid,
+            _: &ProjectId,
+        ) -> Result<Vec<(i64, String)>> {
+            panic!("MfaCache stub")
+        }
+        async fn consume_recovery_code(&self, _: &str, _: i64) -> Result<()> {
+            panic!("MfaCache stub")
+        }
+        async fn update_webauthn_credential(&self, _: &str, _: Uuid, _: &str) -> Result<()> {
+            panic!("MfaCache stub")
+        }
     }
 };
 
@@ -2010,8 +2188,7 @@ mod tests {
     fn totp_verify_with_known_secret() {
         // RFC 6238 test vector: secret = b"12345678901234567890" as base32.
         let secret_bytes = b"12345678901234567890";
-        let secret_b32 =
-            base32::encode(base32::Alphabet::RFC4648 { padding: false }, secret_bytes);
+        let secret_b32 = base32::encode(base32::Alphabet::RFC4648 { padding: false }, secret_bytes);
 
         // Compute the TOTP for step 0 (T=0, step = 0/30 = 0).
         let expected = totp_at_step(secret_bytes, 0).unwrap();
@@ -2169,8 +2346,8 @@ mod security_tests {
 
     /// Compute the TOTP code valid right now and the step it belongs to.
     fn current_code_and_step(secret_b32: &str) -> (String, u64) {
-        let secret = base32::decode(base32::Alphabet::RFC4648 { padding: false }, secret_b32)
-            .unwrap();
+        let secret =
+            base32::decode(base32::Alphabet::RFC4648 { padding: false }, secret_b32).unwrap();
         let step = Utc::now().timestamp() as u64 / 30;
         let n = totp_at_step(&secret, step).unwrap();
         (format!("{n:06}"), step)
@@ -2210,14 +2387,18 @@ mod security_tests {
         let step = Utc::now().timestamp() as u64 / 30;
 
         // Burn the current step.
-        let _ = verify_totp(&secret, &format!("{:06}", totp_at_step(&secret_bytes, step).unwrap()), 0)
-            .expect("current accepted");
+        let _ = verify_totp(
+            &secret,
+            &format!("{:06}", totp_at_step(&secret_bytes, step).unwrap()),
+            0,
+        )
+        .expect("current accepted");
 
         // The next step is within the +1 skew window and is > min_step, so it
         // verifies even though the current step is now burned.
         let next_code = format!("{:06}", totp_at_step(&secret_bytes, step + 1).unwrap());
-        let accepted = verify_totp(&secret, &next_code, step)
-            .expect("next-window code must be accepted");
+        let accepted =
+            verify_totp(&secret, &next_code, step).expect("next-window code must be accepted");
         assert_eq!(accepted, step + 1);
     }
 
@@ -2295,9 +2476,18 @@ mod security_tests {
             let x = point.x().unwrap().to_vec();
             let y = point.y().unwrap().to_vec();
             let map = Value::Map(vec![
-                (Value::Integer(Integer::from(1)), Value::Integer(Integer::from(2))), // kty EC2
-                (Value::Integer(Integer::from(3)), Value::Integer(Integer::from(-7))), // alg ES256
-                (Value::Integer(Integer::from(-1)), Value::Integer(Integer::from(1))), // crv P-256
+                (
+                    Value::Integer(Integer::from(1)),
+                    Value::Integer(Integer::from(2)),
+                ), // kty EC2
+                (
+                    Value::Integer(Integer::from(3)),
+                    Value::Integer(Integer::from(-7)),
+                ), // alg ES256
+                (
+                    Value::Integer(Integer::from(-1)),
+                    Value::Integer(Integer::from(1)),
+                ), // crv P-256
                 (Value::Integer(Integer::from(-2)), Value::Bytes(x)),
                 (Value::Integer(Integer::from(-3)), Value::Bytes(y)),
             ]);

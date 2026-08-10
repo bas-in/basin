@@ -135,8 +135,9 @@ impl TableProvider for BasinProjectUsageProvider {
 
         let project_id_arr: ArrayRef =
             Arc::new(StringArray::from(vec![Some(project_id_str.as_str())]));
-        let bytes_read_arr: ArrayRef =
-            Arc::new(Int64Array::from(vec![u64_to_i64_sat(snap.bytes_read_total)]));
+        let bytes_read_arr: ArrayRef = Arc::new(Int64Array::from(vec![u64_to_i64_sat(
+            snap.bytes_read_total,
+        )]));
         let bytes_written_arr: ArrayRef = Arc::new(Int64Array::from(vec![u64_to_i64_sat(
             snap.bytes_written_total,
         )]));
@@ -154,9 +155,8 @@ impl TableProvider for BasinProjectUsageProvider {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros().min(i64::MAX as u128) as i64)
             .unwrap_or_default();
-        let snapshot_at_arr: ArrayRef = Arc::new(
-            TimestampMicrosecondArray::from(vec![now_micros]).with_timezone(SNAPSHOT_TZ),
-        );
+        let snapshot_at_arr: ArrayRef =
+            Arc::new(TimestampMicrosecondArray::from(vec![now_micros]).with_timezone(SNAPSHOT_TZ));
 
         let batch = RecordBatch::try_new(
             Arc::clone(&self.schema),
@@ -190,9 +190,7 @@ pub(crate) fn register_basin_project_usage(
 ) -> DfResult<()> {
     let provider = Arc::new(BasinProjectUsageProvider::new(registry, project));
     ctx.register_table("basin_project_usage", provider)
-        .map_err(|e| {
-            DataFusionError::Internal(format!("register basin_project_usage: {e}"))
-        })?;
+        .map_err(|e| DataFusionError::Internal(format!("register basin_project_usage: {e}")))?;
     Ok(())
 }
 
@@ -212,7 +210,8 @@ mod tests {
 
         let provider = BasinProjectUsageProvider::new(registry, project);
         let ctx = datafusion::prelude::SessionContext::new();
-        ctx.register_table("basin_project_usage", Arc::new(provider)).unwrap();
+        ctx.register_table("basin_project_usage", Arc::new(provider))
+            .unwrap();
         let df = ctx
             .sql(
                 "SELECT project_id, bytes_written_total, class_a_ops_total, cpu_seconds_total \
@@ -255,7 +254,11 @@ mod tests {
 
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
         let row = &batches[0];
-        let pid = row.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let pid = row
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         let bw = row.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(pid.value(0), a.to_string());
         assert_eq!(bw.value(0), 0, "project A must NOT see project B's bytes");

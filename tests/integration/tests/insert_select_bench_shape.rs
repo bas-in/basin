@@ -72,7 +72,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -164,7 +168,10 @@ fn col_via_cast<T>(
     let mut out = Vec::new();
     for b in batches {
         let idx = b.schema().index_of(name).unwrap_or_else(|_| {
-            panic!("column {name:?} missing from result schema {:?}", b.schema())
+            panic!(
+                "column {name:?} missing from result schema {:?}",
+                b.schema()
+            )
         });
         let arr = arrow::compute::cast(b.column(idx), canon)
             .unwrap_or_else(|e| panic!("cast column {name:?} to {canon:?}: {e}"));
@@ -281,11 +288,27 @@ async fn insert_select_star_round_trips_jsonb_events() {
     .await;
 
     let ids = col_i64(&dst, "id");
-    assert_eq!(ids.len(), ROWS as usize, "events_copy must hold all 1k rows");
+    assert_eq!(
+        ids.len(),
+        ROWS as usize,
+        "events_copy must hold all 1k rows"
+    );
     assert_eq!(col_i64(&src, "id"), ids, "id mismatch");
-    assert_eq!(col_i64(&src, "user_id"), col_i64(&dst, "user_id"), "user_id mismatch");
-    assert_eq!(col_f64(&src, "amount"), col_f64(&dst, "amount"), "amount mismatch");
-    assert_eq!(col_str(&src, "status"), col_str(&dst, "status"), "status mismatch");
+    assert_eq!(
+        col_i64(&src, "user_id"),
+        col_i64(&dst, "user_id"),
+        "user_id mismatch"
+    );
+    assert_eq!(
+        col_f64(&src, "amount"),
+        col_f64(&dst, "amount"),
+        "amount mismatch"
+    );
+    assert_eq!(
+        col_str(&src, "status"),
+        col_str(&dst, "status"),
+        "status mismatch"
+    );
     assert_eq!(
         col_i64(&src, "created_at"),
         col_i64(&dst, "created_at"),

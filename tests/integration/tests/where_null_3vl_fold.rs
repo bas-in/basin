@@ -55,9 +55,12 @@ async fn seed_table(sess: &basin_engine::ProjectSession, n: i64) {
         .await
         .unwrap();
     let values: Vec<String> = (1..=n).map(|k| format!("({k},{k})")).collect();
-    sess.execute(&format!("INSERT INTO t (id, v) VALUES {}", values.join(",")))
-        .await
-        .unwrap();
+    sess.execute(&format!(
+        "INSERT INTO t (id, v) VALUES {}",
+        values.join(",")
+    ))
+    .await
+    .unwrap();
 }
 
 fn row_total(batches: &[RecordBatch]) -> usize {
@@ -89,7 +92,11 @@ async fn col_eq_null_returns_empty_rows_without_scan() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected Rows, got {other:?}"),
     };
-    assert_eq!(row_total(&batches), 0, "v = NULL must return zero rows under 3VL");
+    assert_eq!(
+        row_total(&batches),
+        0,
+        "v = NULL must return zero rows under 3VL"
+    );
 }
 
 #[tokio::test]
@@ -107,7 +114,11 @@ async fn null_eq_col_mirror_form_also_folds() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected Rows, got {other:?}"),
     };
-    assert_eq!(row_total(&batches), 0, "NULL = v must fold the same as v = NULL");
+    assert_eq!(
+        row_total(&batches),
+        0,
+        "NULL = v must fold the same as v = NULL"
+    );
 }
 
 #[tokio::test]
@@ -125,7 +136,11 @@ async fn col_ne_null_returns_empty_rows() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected Rows, got {other:?}"),
     };
-    assert_eq!(row_total(&batches), 0, "v <> NULL must return zero rows under 3VL");
+    assert_eq!(
+        row_total(&batches),
+        0,
+        "v <> NULL must return zero rows under 3VL"
+    );
 }
 
 #[tokio::test]
@@ -171,9 +186,18 @@ async fn aggregate_under_null_eq_returns_empty_relation_answer() {
     // count is non-null Int64 with value 0; min/max/sum are NULL.
     let count = first_i64(&batches, 0).expect("count(*) is non-null");
     assert_eq!(count, 0);
-    assert!(first_i64(&batches, 1).is_none(), "MIN over empty must be NULL");
-    assert!(first_i64(&batches, 2).is_none(), "MAX over empty must be NULL");
-    assert!(first_i64(&batches, 3).is_none(), "SUM over empty must be NULL");
+    assert!(
+        first_i64(&batches, 1).is_none(),
+        "MIN over empty must be NULL"
+    );
+    assert!(
+        first_i64(&batches, 2).is_none(),
+        "MAX over empty must be NULL"
+    );
+    assert!(
+        first_i64(&batches, 3).is_none(),
+        "SUM over empty must be NULL"
+    );
 }
 
 /// Schema-shape assertion: even though no row is returned, the output
@@ -195,11 +219,8 @@ async fn schema_of_empty_result_matches_projection() {
         ExecResult::Rows { schema, .. } => schema,
         other => panic!("expected Rows, got {other:?}"),
     };
-    let expected: Arc<Schema> = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int64,
-        false,
-    )]));
+    let expected: Arc<Schema> =
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     assert_eq!(
         schema.fields().len(),
         1,

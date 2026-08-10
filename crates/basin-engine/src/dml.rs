@@ -23,8 +23,9 @@ use basin_catalog::PartitionSpec;
 use basin_common::{BasinError, PartitionKey, Result};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use sqlparser::ast::ValueWithSpan;
-use sqlparser::ast::{FunctionArg, FunctionArgExpr, 
-    DataType as SqlDataType, Expr, FunctionArguments, TypedString, UnaryOperator, Value,
+use sqlparser::ast::{
+    DataType as SqlDataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, TypedString,
+    UnaryOperator, Value,
 };
 
 use crate::types::{
@@ -436,8 +437,10 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 // constructor — both produce the 21-byte little-endian
                 // WKB blob that round-trips through ST_X / ST_Y and the
                 // pgwire encoder.
-                let mut b =
-                    FixedSizeBinaryBuilder::with_capacity(rows.len(), basin_geo::POINT_WKB_LEN as i32);
+                let mut b = FixedSizeBinaryBuilder::with_capacity(
+                    rows.len(),
+                    basin_geo::POINT_WKB_LEN as i32,
+                );
                 for row in rows {
                     match coerce_point(&row[col_idx], field.name())? {
                         Some(bytes) => {
@@ -527,9 +530,7 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
             // yet and are left for follow-up. Nested-list element types and
             // less common element types (JSONB, TIMESTAMPTZ, UUID, ...) are
             // also out of scope for this pass.
-            DataType::List(child) => {
-                build_list_column(rows, col_idx, field, child)?
-            }
+            DataType::List(child) => build_list_column(rows, col_idx, field, child)?,
             other => {
                 return Err(BasinError::InvalidSchema(format!(
                     "unsupported Arrow column type for INSERT: {other:?}"
@@ -1243,7 +1244,12 @@ pub(crate) fn encode_jsonb_v2(json_bytes: &[u8]) -> std::result::Result<Vec<u8>,
     //   1 (version) + 4 (num_entries) +
     //   sum_i (2 + key_i.len() + 4 + 4) +
     //   json_bytes.len()
-    let header_size = 1 + 4 + entries.iter().map(|(k, _, _)| 2 + k.len() + 4 + 4).sum::<usize>();
+    let header_size = 1
+        + 4
+        + entries
+            .iter()
+            .map(|(k, _, _)| 2 + k.len() + 4 + 4)
+            .sum::<usize>();
     let total = header_size + json_bytes.len();
 
     let mut out = Vec::with_capacity(total);
@@ -1723,7 +1729,12 @@ fn parse_wkt_point(s: &str, col: &str) -> Result<[u8; basin_geo::POINT_WKB_LEN]>
 
 /// Range / multirange constructor names recognized on the INSERT path.
 const RANGE_CTOR_FNS: &[&str] = &[
-    "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange",
+    "int4range",
+    "int8range",
+    "numrange",
+    "daterange",
+    "tsrange",
+    "tstzrange",
 ];
 const MULTIRANGE_CTOR_FNS: &[&str] = &["int4multirange", "int8multirange", "nummultirange"];
 
@@ -2844,11 +2855,7 @@ fn coerce_timestamp_micros(expr: &Expr) -> Result<Option<i64>> {
             data_type,
             value: ValueWithSpan { value: v, .. },
             ..
-        }) if matches!(
-            data_type,
-            SqlDataType::Timestamp(_, _) | SqlDataType::Date
-        ) =>
-        {
+        }) if matches!(data_type, SqlDataType::Timestamp(_, _) | SqlDataType::Date) => {
             let s: &str = match v {
                 Value::SingleQuotedString(s)
                 | Value::DoubleQuotedString(s)
@@ -3442,7 +3449,10 @@ mod tests {
         assert_eq!(p("{a,b}"), vec![Some("a".into()), Some("b".into())]);
         assert_eq!(p("{ a , b }"), vec![Some("a".into()), Some("b".into())]);
         // unquoted NULL → null element; quoted "NULL" → literal string.
-        assert_eq!(p("{a,NULL,b}"), vec![Some("a".into()), None, Some("b".into())]);
+        assert_eq!(
+            p("{a,NULL,b}"),
+            vec![Some("a".into()), None, Some("b".into())]
+        );
         assert_eq!(p(r#"{"NULL"}"#), vec![Some("NULL".into())]);
         // quoted elements: embedded comma + escapes preserved.
         assert_eq!(
@@ -3450,9 +3460,15 @@ mod tests {
             vec![Some("x,y".into()), Some("a\"b".into()), Some("c\\d".into())]
         );
         // numeric elements stay as text (coerced per child type downstream).
-        assert_eq!(p("{1,2,3}"), vec![Some("1".into()), Some("2".into()), Some("3".into())]);
+        assert_eq!(
+            p("{1,2,3}"),
+            vec![Some("1".into()), Some("2".into()), Some("3".into())]
+        );
         // multi-byte UTF-8 survives char-based parsing.
-        assert_eq!(p("{café,naïve}"), vec![Some("café".into()), Some("naïve".into())]);
+        assert_eq!(
+            p("{café,naïve}"),
+            vec![Some("café".into()), Some("naïve".into())]
+        );
         // malformed → error, not panic.
         assert!(parse_pg_array_literal("not-an-array", "c").is_err());
     }
@@ -3486,7 +3502,10 @@ mod tests {
         // Already-sorted input (Change A fast path) is unchanged.
         assert_eq!(canon_bytes(r#"{"a":1,"b":2}"#), r#"{"a":1,"b":2}"#);
         // Nested objects are canonicalised recursively.
-        assert_eq!(canon_bytes(r#"{"z":{"y":2,"x":1}}"#), r#"{"z":{"x":1,"y":2}}"#);
+        assert_eq!(
+            canon_bytes(r#"{"z":{"y":2,"x":1}}"#),
+            r#"{"z":{"x":1,"y":2}}"#
+        );
         // Duplicate top-level keys: last value wins.
         assert_eq!(canon_bytes(r#"{"a":1,"a":2}"#), r#"{"a":2}"#);
         // Duplicate keys, reversed-on-arrival ordering: still last wins.
@@ -3520,17 +3539,17 @@ mod tests {
             use serde_json::Value;
             match v {
                 Value::Object(map) => {
-                    let sorted: std::collections::BTreeMap<String, Value> =
-                        map.into_iter().map(|(k, val)| (k, reference(val))).collect();
+                    let sorted: std::collections::BTreeMap<String, Value> = map
+                        .into_iter()
+                        .map(|(k, val)| (k, reference(val)))
+                        .collect();
                     let mut out = serde_json::Map::with_capacity(sorted.len());
                     for (k, vv) in sorted {
                         out.insert(k, vv);
                     }
                     Value::Object(out)
                 }
-                Value::Array(items) => {
-                    Value::Array(items.into_iter().map(reference).collect())
-                }
+                Value::Array(items) => Value::Array(items.into_iter().map(reference).collect()),
                 other => other,
             }
         }

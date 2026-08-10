@@ -318,7 +318,10 @@ async fn refresh_rotation(store: &Arc<dyn AuthStore>) {
         .list_refresh_revocations(user_id)
         .await
         .expect("list after jti_b");
-    assert!(rows2.iter().any(|r| r.token_hash == jti_a), "jti_a still present");
+    assert!(
+        rows2.iter().any(|r| r.token_hash == jti_a),
+        "jti_a still present"
+    );
     assert!(rows2.iter().any(|r| r.token_hash == jti_b), "jti_b present");
 
     // Duplicate insert of jti_a → 0 rows (ON CONFLICT DO NOTHING), no error.
@@ -381,11 +384,11 @@ async fn refresh_blanket_revocation(store: &Arc<dyn AuthStore>) {
         .list_refresh_revocations(user_id)
         .await
         .expect("list after second upsert");
-    let count = rows2
-        .iter()
-        .filter(|r| r.token_hash == blanket_key)
-        .count();
-    assert_eq!(count, 1, "duplicate upsert must not create two sentinel rows");
+    let count = rows2.iter().filter(|r| r.token_hash == blanket_key).count();
+    assert_eq!(
+        count, 1,
+        "duplicate upsert must not create two sentinel rows"
+    );
 }
 
 /// Self-routing malformed inputs: `parse_project_from_pgwire_user` must return
@@ -397,11 +400,11 @@ fn project_credential_malformed_inputs() {
         "",
         "short",
         "project_a1b2c3d4",                  // legacy format
-        "01JBAS1NAVTH00000000000000",         // 26 chars, no underscore
-        "01JBAS1NAVTH00000000000000-suffix",  // wrong separator
-        "01JBAS1NAVTH00000000000000_",        // nothing after underscore
-        "../etc/passwd",                       // path injection
-        "'; DROP TABLE users; --",            // SQL injection
+        "01JBAS1NAVTH00000000000000",        // 26 chars, no underscore
+        "01JBAS1NAVTH00000000000000-suffix", // wrong separator
+        "01JBAS1NAVTH00000000000000_",       // nothing after underscore
+        "../etc/passwd",                     // path injection
+        "'; DROP TABLE users; --",           // SQL injection
     ];
 
     for input in bad {

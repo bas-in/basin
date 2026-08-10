@@ -258,7 +258,10 @@ async fn htap_union_update_overlay_count_unchanged() {
     exec(&sess, "INSERT INTO t (id, val) VALUES (5, 50)").await;
 
     let cnt = count_rows(&sess, "t").await;
-    assert_eq!(cnt, 5, "UPDATE must not inflate COUNT(*); expected cold+in_tx=5");
+    assert_eq!(
+        cnt, 5,
+        "UPDATE must not inflate COUNT(*); expected cold+in_tx=5"
+    );
 
     exec(&sess, "ROLLBACK").await;
 }

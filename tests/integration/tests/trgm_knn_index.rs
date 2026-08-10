@@ -47,7 +47,11 @@ fn engine_in(dir: &TempDir) -> Engine {
         page_cache: None,
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    Engine::new(EngineConfig { storage, catalog, shard: None })
+    Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    })
 }
 
 async fn build_engine_with_shard() -> (TempDir, TempDir, Engine, Shard, Arc<dyn Wal>) {
@@ -71,7 +75,11 @@ async fn build_engine_with_shard() -> (TempDir, TempDir, Engine, Shard, Arc<dyn 
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let engine = Engine::new(EngineConfig {
         storage: storage.clone(),
         catalog: catalog.clone(),
@@ -108,7 +116,11 @@ async fn rows_for(sess: &ProjectSession, sql: &str) -> Vec<(i64, String)> {
             .downcast_ref::<arrow_array::StringArray>()
             .unwrap_or_else(|| panic!("expected Utf8 name from {sql:?}"));
         for r in 0..b.num_rows() {
-            let nm = if names.is_null(r) { String::new() } else { names.value(r).to_string() };
+            let nm = if names.is_null(r) {
+                String::new()
+            } else {
+                names.value(r).to_string()
+            };
             out.push((ids.value(r), nm));
         }
     }
@@ -118,8 +130,9 @@ async fn rows_for(sess: &ProjectSession, sql: &str) -> Vec<(i64, String)> {
 /// Deterministic synthetic name. ~1/13 rows carry the rare token "zephyrine";
 /// many carry "smith"/"smyth". Mixed alphabet for a realistic trigram space.
 fn name_for(i: i64) -> String {
-    const FIRST: &[&str] =
-        &["alice", "alyce", "bob", "carol", "dave", "erin", "frank", "grace"];
+    const FIRST: &[&str] = &[
+        "alice", "alyce", "bob", "carol", "dave", "erin", "frank", "grace",
+    ];
     const LAST: &[&str] = &["smith", "smyth", "jones", "brown", "taylor"];
     let first = FIRST[(i as usize) % FIRST.len()];
     let last = LAST[((i as usize) / FIRST.len()) % LAST.len()];
@@ -148,11 +161,19 @@ async fn seed(dir: &TempDir, with_index: bool) -> (Engine, ProjectSession, Proje
             let nm = name_for(i).replace('\'', "''");
             vals.push(format!("({i}, '{nm}')"));
         }
-        exec(&sess, &format!("INSERT INTO people (id, name) VALUES {}", vals.join(", "))).await;
+        exec(
+            &sess,
+            &format!("INSERT INTO people (id, name) VALUES {}", vals.join(", ")),
+        )
+        .await;
         off = hi;
     }
     if with_index {
-        exec(&sess, "CREATE INDEX people_trgm ON people USING gin (name gin_trgm_ops)").await;
+        exec(
+            &sess,
+            "CREATE INDEX people_trgm ON people USING gin (name gin_trgm_ops)",
+        )
+        .await;
     }
     (eng, sess, project)
 }
@@ -199,8 +220,11 @@ fn assert_topk_equiv(got: &[(i64, String)], oracle: &[(i64, String)], needle: &s
     // unambiguous and must match as a set; the boundary tier may differ.
     let boundary = g.last().unwrap().0;
     let below = |v: &[(f32, i64)]| -> Vec<i64> {
-        let mut ids: Vec<i64> =
-            v.iter().filter(|(d, _)| *d < boundary).map(|(_, id)| *id).collect();
+        let mut ids: Vec<i64> = v
+            .iter()
+            .filter(|(d, _)| *d < boundary)
+            .map(|(_, id)| *id)
+            .collect();
         ids.sort_unstable();
         ids
     };
@@ -242,12 +266,19 @@ async fn assert_knn_exact(needle: &str, k: usize) {
     let mut prev = f32::MIN;
     for (_, nm) in &indexed {
         let d = dist(nm, needle);
-        assert!(d + 1e-6 >= prev, "indexed order not non-decreasing for `{q}`: {d} < {prev}");
+        assert!(
+            d + 1e-6 >= prev,
+            "indexed order not non-decreasing for `{q}`: {d} < {prev}"
+        );
         prev = d;
     }
 
     // The fast path engaged.
-    assert_eq!(after, before + 1, "trgm-kNN fast path must engage for `{q}`");
+    assert_eq!(
+        after,
+        before + 1,
+        "trgm-kNN fast path must engage for `{q}`"
+    );
 }
 
 #[tokio::test]
@@ -275,7 +306,11 @@ async fn many_candidates_literal_lhs() {
     let (ieng, isess, _ip) = seed(&idir, true).await;
     let before = ieng.trgm_knn_routing_count();
     let indexed = rows_for(&isess, q).await;
-    assert_eq!(ieng.trgm_knn_routing_count(), before + 1, "literal-LHS must engage");
+    assert_eq!(
+        ieng.trgm_knn_routing_count(),
+        before + 1,
+        "literal-LHS must engage"
+    );
     assert_topk_equiv(&indexed, &oracle, "smith", "literal-LHS kNN");
 }
 
@@ -331,13 +366,25 @@ async fn k_equals_table_size() {
 async fn seed_pk(dir: &TempDir, with_index: bool) -> (Engine, ProjectSession) {
     let eng = engine_in(dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
-    exec(&sess, "CREATE TABLE pk_people (id bigint PRIMARY KEY, name text)").await;
+    exec(
+        &sess,
+        "CREATE TABLE pk_people (id bigint PRIMARY KEY, name text)",
+    )
+    .await;
     for i in 0..ROWS {
         let nm = name_for(i).replace('\'', "''");
-        exec(&sess, &format!("INSERT INTO pk_people (id, name) VALUES ({i}, '{nm}')")).await;
+        exec(
+            &sess,
+            &format!("INSERT INTO pk_people (id, name) VALUES ({i}, '{nm}')"),
+        )
+        .await;
     }
     if with_index {
-        exec(&sess, "CREATE INDEX pk_people_trgm ON pk_people USING gin (name gin_trgm_ops)").await;
+        exec(
+            &sess,
+            "CREATE INDEX pk_people_trgm ON pk_people USING gin (name gin_trgm_ops)",
+        )
+        .await;
     }
     (eng, sess)
 }
@@ -351,7 +398,11 @@ async fn overlay_present_declines_but_exact() {
 
     let idir = TempDir::new().unwrap();
     let (ieng, isess) = seed_pk(&idir, true).await;
-    exec(&isess, "UPDATE pk_people SET name = 'zephyrine alice smith' WHERE id = 1").await;
+    exec(
+        &isess,
+        "UPDATE pk_people SET name = 'zephyrine alice smith' WHERE id = 1",
+    )
+    .await;
     let before = ieng.trgm_knn_routing_count();
     let indexed = rows_for(&isess, q).await;
     // Declined: the fast-path counter must NOT advance while an overlay exists.
@@ -363,7 +414,11 @@ async fn overlay_present_declines_but_exact() {
 
     let odir = TempDir::new().unwrap();
     let (_oe, osess) = seed_pk(&odir, false).await;
-    exec(&osess, "UPDATE pk_people SET name = 'zephyrine alice smith' WHERE id = 1").await;
+    exec(
+        &osess,
+        "UPDATE pk_people SET name = 'zephyrine alice smith' WHERE id = 1",
+    )
+    .await;
     let oracle = rows_for(&osess, q).await;
 
     assert_topk_equiv(&indexed, &oracle, "zephyrine", "overlay-present kNN");
@@ -427,10 +482,18 @@ async fn post_flush_and_compaction_matches_oracle() {
     exec(&sess, "CREATE TABLE people (id bigint, name text)").await;
     for i in 0..ROWS {
         let nm = name_for(i).replace('\'', "''");
-        exec(&sess, &format!("INSERT INTO people (id, name) VALUES ({i}, '{nm}')")).await;
+        exec(
+            &sess,
+            &format!("INSERT INTO people (id, name) VALUES ({i}, '{nm}')"),
+        )
+        .await;
     }
     shard.flush_to_parquet().await.unwrap();
-    exec(&sess, "CREATE INDEX people_trgm ON people USING gin (name gin_trgm_ops)").await;
+    exec(
+        &sess,
+        "CREATE INDEX people_trgm ON people USING gin (name gin_trgm_ops)",
+    )
+    .await;
 
     for (needle, k) in [("smith", 10usize), ("zephyrine", 50), ("smyth", 1)] {
         let q = format!("SELECT id, name FROM people ORDER BY name <-> '{needle}' LIMIT {k}");

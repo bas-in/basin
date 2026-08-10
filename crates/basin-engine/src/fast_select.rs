@@ -31,8 +31,8 @@ use basin_storage::{
 };
 use sqlparser::ast::ValueWithSpan;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    ObjectName, Query, SelectItem, SetExpr, Statement, TableFactor, UnaryOperator, Value,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, ObjectName,
+    Query, SelectItem, SetExpr, Statement, TableFactor, UnaryOperator, Value,
 };
 
 use crate::{ExecResult, ProjectSession};
@@ -923,12 +923,8 @@ fn match_query(q: &Query) -> Option<SimpleSelectPlan> {
     // If we cannot build a top-K candidate for it here (no LIMIT, OFFSET
     // present, k over the cap), bail to DataFusion: the single-column path
     // below would silently drop the secondary tie-break key.
-    let topk_late = build_topk_late_candidate(
-        order_by.as_ref(),
-        topk_second.as_ref(),
-        limit,
-        offset,
-    );
+    let topk_late =
+        build_topk_late_candidate(order_by.as_ref(), topk_second.as_ref(), limit, offset);
     if topk_second.is_some() && topk_late.is_none() {
         return None;
     }
@@ -1233,9 +1229,7 @@ fn parse_single_col_agg_arg(func: &sqlparser::ast::Function) -> Option<String> {
         return None;
     }
     match &args[0] {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => {
-            Some(id.value.clone())
-        }
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => Some(id.value.clone()),
         _ => None,
     }
 }
@@ -1359,8 +1353,10 @@ fn parse_where_into(expr: &Expr, out: &mut ParsedWhere) -> Option<()> {
             ScalarValue::Int64(v) => v.checked_add(1)?,
             _ => return None,
         };
-        out.predicates.push(Predicate::Gt(col.clone(), ScalarValue::Int64(lo)));
-        out.predicates.push(Predicate::Lt(col, ScalarValue::Int64(hi)));
+        out.predicates
+            .push(Predicate::Gt(col.clone(), ScalarValue::Int64(lo)));
+        out.predicates
+            .push(Predicate::Lt(col, ScalarValue::Int64(hi)));
         return Some(());
     }
 
@@ -1445,7 +1441,6 @@ fn parse_where_into(expr: &Expr, out: &mut ParsedWhere) -> Option<()> {
     Some(())
 }
 
-
 /// Parse a single `<col> <op> <literal>` predicate where `<op>` is one of
 /// `=`, `>`, `<`, `>=`, `<=` (and their mirror forms). Anything else returns
 /// `None` and falls back to the DataFusion path.
@@ -1464,13 +1459,14 @@ fn parse_predicate(expr: &Expr) -> Option<Predicate> {
 
     // (col, literal, flipped): flipped=true means the user wrote `lit op col`
     // so we have to invert the comparison direction.
-    let (col, lit, flipped) = if let (Some(c), Some(v)) = (as_identifier(left), literal_value(right)) {
-        (c, v, false)
-    } else if let (Some(c), Some(v)) = (as_identifier(right), literal_value(left)) {
-        (c, v, true)
-    } else {
-        return None;
-    };
+    let (col, lit, flipped) =
+        if let (Some(c), Some(v)) = (as_identifier(left), literal_value(right)) {
+            (c, v, false)
+        } else if let (Some(c), Some(v)) = (as_identifier(right), literal_value(left)) {
+            (c, v, true)
+        } else {
+            return None;
+        };
 
     // Map the SQL operator (accounting for col/literal order flip) to a
     // `Predicate` variant. `>=` / `<=` use the predecessor/successor trick for
@@ -1661,7 +1657,6 @@ fn literal_value(e: &Expr) -> Option<ScalarValue> {
     }
 }
 
-
 /// A transaction's pinned read-view, threaded into the fast path so an in-tx
 /// SELECT reads AT the pin (snapshot-stable / REPEATABLE-READ-ish) instead of
 /// the moving live head.
@@ -1753,8 +1748,15 @@ pub(crate) async fn execute_simple_select_pinned(
     include_deleted: bool,
     request: Option<PinnedReadRequest>,
 ) -> Result<ExecResult> {
-    execute_simple_select_inner(sess, plan, prefetched_meta, raw_sql, include_deleted, request)
-        .await
+    execute_simple_select_inner(
+        sess,
+        plan,
+        prefetched_meta,
+        raw_sql,
+        include_deleted,
+        request,
+    )
+    .await
 }
 
 /// S4 commit 5a — pre-flush PK residency probe.
@@ -2040,12 +2042,19 @@ async fn execute_simple_select_inner(
         table: &TableName,
         head: basin_catalog::SnapshotId,
     ) -> PinnedReadView {
-        let current_hot_seq = sess.engine.memtable_registry().hot_tier_seq(&sess.project, table);
-        let hot_watermark = crate::session::tx_hot_seq_watermark_for(&sess.state, table, current_hot_seq)
-            .expect("FirstTouch implies an active transaction");
+        let current_hot_seq = sess
+            .engine
+            .memtable_registry()
+            .hot_tier_seq(&sess.project, table);
+        let hot_watermark =
+            crate::session::tx_hot_seq_watermark_for(&sess.state, table, current_hot_seq)
+                .expect("FirstTouch implies an active transaction");
         let snapshot = crate::session::tx_read_snapshot_for(&sess.state, table, head)
             .expect("FirstTouch implies an active transaction");
-        PinnedReadView { snapshot, hot_watermark }
+        PinnedReadView {
+            snapshot,
+            hot_watermark,
+        }
     }
 
     // ── S4 pre-flush PK residency probe (read-own-insert, zero file opens) ───
@@ -2398,8 +2407,7 @@ async fn execute_simple_select_inner(
             // cannot plan — `fallback_sql` lowers them back to the
             // always-correct `json_get_text(...)` UDF form (see its doc).
             let fb = fallback_sql(raw_sql);
-            return crate::executor::exec_select(sess, &fb, include_deleted, Some(raw_sql))
-                .await;
+            return crate::executor::exec_select(sess, &fb, include_deleted, Some(raw_sql)).await;
         }
         // Every file carries the shadow column(s).  Extend the working schema
         // with a `Utf8` field per shadow column so the projection / validation
@@ -2448,9 +2456,7 @@ async fn execute_simple_select_inner(
                         ProjectionItem::Column(c) => Some(
                             meta.schema
                                 .index_of(c)
-                                .map_err(|_| {
-                                    BasinError::UndefinedColumn(c.to_string())
-                                }),
+                                .map_err(|_| BasinError::UndefinedColumn(c.to_string())),
                         ),
                         _ => None,
                     })
@@ -2591,17 +2597,14 @@ async fn execute_simple_select_inner(
         }
     }
     let plan = plan;
-    let post_read_shrinking = !plan.is_null_cols.is_empty()
-        || !plan.in_list_preds.is_empty()
-        || overlay_active;
-    let pushdown_limit = if plan.order_by.is_none()
-        && plan.aggregates.is_none()
-        && !post_read_shrinking
-    {
-        plan.limit
-    } else {
-        None
-    };
+    let post_read_shrinking =
+        !plan.is_null_cols.is_empty() || !plan.in_list_preds.is_empty() || overlay_active;
+    let pushdown_limit =
+        if plan.order_by.is_none() && plan.aggregates.is_none() && !post_read_shrinking {
+            plan.limit
+        } else {
+            None
+        };
 
     // ── Keyset-pagination per-file LIMIT pushdown ────────────────────────────
     //
@@ -2756,8 +2759,14 @@ async fn execute_simple_select_inner(
         let mut max_v: Option<i64> = None;
         for v in vals {
             if let ScalarValue::Int64(n) = v {
-                min_v = Some(match min_v { None => *n, Some(cur) => cur.min(*n) });
-                max_v = Some(match max_v { None => *n, Some(cur) => cur.max(*n) });
+                min_v = Some(match min_v {
+                    None => *n,
+                    Some(cur) => cur.min(*n),
+                });
+                max_v = Some(match max_v {
+                    None => *n,
+                    Some(cur) => cur.max(*n),
+                });
             }
         }
         if let (Some(lo), Some(hi)) = (min_v, max_v) {
@@ -2857,9 +2866,7 @@ async fn execute_simple_select_inner(
                             // and any consumer (pgwire encoder, concat) breaks.
                             let padded: Vec<RecordBatch> = batches
                                 .into_iter()
-                                .map(|b| {
-                                    crate::hot_tombstone::pad_batch_to_schema(b, &meta.schema)
-                                })
+                                .map(|b| crate::hot_tombstone::pad_batch_to_schema(b, &meta.schema))
                                 .collect::<Result<_>>()?;
                             (meta.schema.clone(), padded)
                         }
@@ -2887,11 +2894,9 @@ async fn execute_simple_select_inner(
                                     idxs.push(i);
                                 }
                                 // Project each decoded memtable batch.
-                                let schema = Arc::new(
-                                    meta.schema
-                                        .project(&idxs)
-                                        .map_err(|e| BasinError::internal(format!("project schema: {e}")))?,
-                                );
+                                let schema = Arc::new(meta.schema.project(&idxs).map_err(|e| {
+                                    BasinError::internal(format!("project schema: {e}"))
+                                })?);
                                 let projected: Vec<RecordBatch> = batches
                                     .into_iter()
                                     .map(|b| {
@@ -2956,62 +2961,69 @@ async fn execute_simple_select_inner(
     // would cache the pinned historical row under current-epoch keys and leak it
     // back to auto-commit reads. Setting `pk_cache_ctx = None` disables both the
     // GET (`pk_cache_hit`) and the INSERT downstream (both gate on this `Some`).
-    let pk_cache_ctx: Option<(basin_hottier::RowKey, u64, u64, u64)> =
-        if pinned.is_none()
-            && !meta.rls_enabled
-            && meta.pk_columns.len() == 1
-            && plan.aggregates.is_none()
-            && plan.in_list_preds.is_empty()
-            && plan.is_null_cols.is_empty()
-            && plan.predicates.len() == 1
-            && plan
-                .projection
-                .as_ref()
-                .map(|items| {
-                    items
-                        .iter()
-                        .all(|it| matches!(it, ProjectionItem::Column(_)))
-                })
-                .unwrap_or(true)
-        {
-            let pk_col = &meta.pk_columns[0];
-            match &plan.predicates[0] {
-                Predicate::Eq(col, val) if col == pk_col => {
-                    if let Ok(pk_idx) = meta.schema.index_of(col) {
-                        let pk_dt = meta.schema.field(pk_idx).data_type().clone();
-                        crate::dml_mutate::pk_scalar_to_row_key(val, &pk_dt).map(|rk| {
-                            let hot_epoch = sess
-                                .engine
-                                .memtable_registry()
-                                .hot_tier_epoch(&sess.project, &plan.table);
-                            let snap = meta.current_snapshot.0;
-                            let proj_hash =
-                                crate::pk_row_cache::hash_read_cols(plan.read_cols.as_deref());
-                            (rk, hot_epoch, snap, proj_hash)
-                        })
-                    } else {
-                        None
-                    }
+    let pk_cache_ctx: Option<(basin_hottier::RowKey, u64, u64, u64)> = if pinned.is_none()
+        && !meta.rls_enabled
+        && meta.pk_columns.len() == 1
+        && plan.aggregates.is_none()
+        && plan.in_list_preds.is_empty()
+        && plan.is_null_cols.is_empty()
+        && plan.predicates.len() == 1
+        && plan
+            .projection
+            .as_ref()
+            .map(|items| {
+                items
+                    .iter()
+                    .all(|it| matches!(it, ProjectionItem::Column(_)))
+            })
+            .unwrap_or(true)
+    {
+        let pk_col = &meta.pk_columns[0];
+        match &plan.predicates[0] {
+            Predicate::Eq(col, val) if col == pk_col => {
+                if let Ok(pk_idx) = meta.schema.index_of(col) {
+                    let pk_dt = meta.schema.field(pk_idx).data_type().clone();
+                    crate::dml_mutate::pk_scalar_to_row_key(val, &pk_dt).map(|rk| {
+                        let hot_epoch = sess
+                            .engine
+                            .memtable_registry()
+                            .hot_tier_epoch(&sess.project, &plan.table);
+                        let snap = meta.current_snapshot.0;
+                        let proj_hash =
+                            crate::pk_row_cache::hash_read_cols(plan.read_cols.as_deref());
+                        (rk, hot_epoch, snap, proj_hash)
+                    })
+                } else {
+                    None
                 }
-                _ => None,
             }
-        } else {
-            None
-        };
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     // PK row cache GET: on a valid dual-watermark hit, serve the cached cold-row
     // batches directly and skip the secondary-index probe, file pruning, and
     // Parquet decode entirely. The cached batches are in `read_cols` order (the
     // shape the cold read produced), exactly what the projection code below
     // expects — so a hit short-circuits straight into the shared projection.
-    let pk_cache_hit: Option<Vec<RecordBatch>> = pk_cache_ctx.as_ref().and_then(
-        |(rk, hot_epoch, snap, proj_hash)| {
-            sess.engine
-                .pk_row_cache()
-                .get(&sess.project, &plan.table, rk, *hot_epoch, *snap, *proj_hash)
-                .map(|arc| (*arc).clone())
-        },
-    );
+    let pk_cache_hit: Option<Vec<RecordBatch>> =
+        pk_cache_ctx
+            .as_ref()
+            .and_then(|(rk, hot_epoch, snap, proj_hash)| {
+                sess.engine
+                    .pk_row_cache()
+                    .get(
+                        &sess.project,
+                        &plan.table,
+                        rk,
+                        *hot_epoch,
+                        *snap,
+                        *proj_hash,
+                    )
+                    .map(|arc| (*arc).clone())
+            });
 
     // ── Phase 5.7 B1: secondary index probe ─────────────────────────────────
     //
@@ -3039,97 +3051,98 @@ async fn execute_simple_select_inner(
         /// Per-file row-group allowlist for the reader (deduped).
         rg_selection: std::collections::HashMap<String, Vec<u32>>,
     }
-    let secondary_index_file_allowlist: Option<Option<SecondaryIndexHit>> = if crate::session::table_has_live_overlay(&sess.engine, &sess.project, &plan.table) {
-        // Overlay guard (mirrors the GIN/FTS empty-probe guards): while a
-        // hot-tier overlay is live the B-tree location registry is NOT
-        // maintained for override / tombstone writes — only the cold CoW
-        // commit paths and `materialize_overlay_for_table` re-register files,
-        // and the latter only on drain. A positive HIT's cold-file allowlist
-        // can therefore exclude a file (or an overlay override row) that holds
-        // a live match, so the pruned read would drop rows. Decline the probe
-        // and fall through to the overlay-aware scan; pruning re-engages once
-        // the overlay drains and the registry is complete again.
-        None
-    } else {
-        let registry = sess.engine.secondary_index_registry();
-        let mut result: Option<Option<SecondaryIndexHit>> = None;
+    let secondary_index_file_allowlist: Option<Option<SecondaryIndexHit>> =
+        if crate::session::table_has_live_overlay(&sess.engine, &sess.project, &plan.table) {
+            // Overlay guard (mirrors the GIN/FTS empty-probe guards): while a
+            // hot-tier overlay is live the B-tree location registry is NOT
+            // maintained for override / tombstone writes — only the cold CoW
+            // commit paths and `materialize_overlay_for_table` re-register files,
+            // and the latter only on drain. A positive HIT's cold-file allowlist
+            // can therefore exclude a file (or an overlay override row) that holds
+            // a live match, so the pruned read would drop rows. Decline the probe
+            // and fall through to the overlay-aware scan; pruning re-engages once
+            // the overlay drains and the registry is complete again.
+            None
+        } else {
+            let registry = sess.engine.secondary_index_registry();
+            let mut result: Option<Option<SecondaryIndexHit>> = None;
 
-        if plan.aggregates.is_none() {
-            for pred in &plan.predicates {
-                if let Predicate::Eq(col, val) = pred {
-                    // Check if the table has a declared index on this column.
-                    let has_index = meta.indexes.iter().any(|idx| {
-                        idx.columns.len() == 1
-                            && !idx.columns[0].starts_with("expr:")
-                            && idx.columns[0] == col.as_str()
-                    });
-                    if !has_index {
-                        continue;
-                    }
-
-                    // Try to load from disk if not yet in RAM.
-                    if !registry.is_loaded(&sess.project, &plan.table, col) {
-                        crate::secondary_index::load_index(
-                            registry,
-                            &sess.engine.config().storage,
-                            &sess.project,
-                            &plan.table,
-                            col,
-                        )
-                        .await;
-                    }
-
-                    // Now probe the in-RAM index for full locations.
-                    if let Some(key_text) = crate::secondary_index::scalar_to_key(val) {
-                        if let Some(locs) = registry.probe_locations(
-                            &sess.project,
-                            &plan.table,
-                            col,
-                            &key_text,
-                        ) {
-                            // Build file allowlist and per-file row-group map.
-                            // Dedup same (file, rg) pairs — multiple rows in the
-                            // same row group still only need one row-group entry.
-                            let mut rg_map: std::collections::HashMap<String, Vec<u32>> =
-                                std::collections::HashMap::new();
-                            for loc in &locs {
-                                let rgs = rg_map.entry(loc.file_path.clone()).or_default();
-                                if !rgs.contains(&loc.row_group) {
-                                    rgs.push(loc.row_group);
-                                }
-                            }
-                            let allowlist: std::collections::HashSet<String> =
-                                rg_map.keys().cloned().collect();
-                            result = Some(Some(SecondaryIndexHit { allowlist, rg_selection: rg_map }));
+            if plan.aggregates.is_none() {
+                for pred in &plan.predicates {
+                    if let Predicate::Eq(col, val) = pred {
+                        // Check if the table has a declared index on this column.
+                        let has_index = meta.indexes.iter().any(|idx| {
+                            idx.columns.len() == 1
+                                && !idx.columns[0].starts_with("expr:")
+                                && idx.columns[0] == col.as_str()
+                        });
+                        if !has_index {
+                            continue;
                         }
-                        // Probe MISS (`probe_locations` → `None`): the registry
-                        // collapses "key indexed-then-deleted" and "key never
-                        // indexed / index incomplete" into the SAME `None`, and
-                        // its documented contract is that callers MUST treat
-                        // `None` as "unknown — fall through to full scan". The
-                        // in-RAM B-tree index can legitimately be INCOMPLETE for
-                        // a present key: it is built fire-and-forget by the
-                        // auto-index advisor (and by `CREATE INDEX`) over a point-
-                        // in-time file set, is FIFO-evicted past
-                        // `MAX_INDEX_ENTRIES_PER_COL`, and does not retroactively
-                        // cover rows written before it existed. The previous
-                        // `result = Some(None)` ("definitely empty") short-circuit
-                        // therefore DROPPED live rows whenever a queried key was
-                        // simply not (yet) in the index — e.g. a point read of a
-                        // freshly-inserted non-PK value after the advisor fired
-                        // (`prepared_select_point_reads`). We never set a negative
-                        // result here: a miss leaves `result = None`, falling
-                        // through to the zone-map/bloom prune + full cold read,
-                        // which is always correct. The POSITIVE allowlist above
-                        // (a HIT) is still used only to PRUNE, and the existing
-                        // per-file re-check filters any superset.
+
+                        // Try to load from disk if not yet in RAM.
+                        if !registry.is_loaded(&sess.project, &plan.table, col) {
+                            crate::secondary_index::load_index(
+                                registry,
+                                &sess.engine.config().storage,
+                                &sess.project,
+                                &plan.table,
+                                col,
+                            )
+                            .await;
+                        }
+
+                        // Now probe the in-RAM index for full locations.
+                        if let Some(key_text) = crate::secondary_index::scalar_to_key(val) {
+                            if let Some(locs) =
+                                registry.probe_locations(&sess.project, &plan.table, col, &key_text)
+                            {
+                                // Build file allowlist and per-file row-group map.
+                                // Dedup same (file, rg) pairs — multiple rows in the
+                                // same row group still only need one row-group entry.
+                                let mut rg_map: std::collections::HashMap<String, Vec<u32>> =
+                                    std::collections::HashMap::new();
+                                for loc in &locs {
+                                    let rgs = rg_map.entry(loc.file_path.clone()).or_default();
+                                    if !rgs.contains(&loc.row_group) {
+                                        rgs.push(loc.row_group);
+                                    }
+                                }
+                                let allowlist: std::collections::HashSet<String> =
+                                    rg_map.keys().cloned().collect();
+                                result = Some(Some(SecondaryIndexHit {
+                                    allowlist,
+                                    rg_selection: rg_map,
+                                }));
+                            }
+                            // Probe MISS (`probe_locations` → `None`): the registry
+                            // collapses "key indexed-then-deleted" and "key never
+                            // indexed / index incomplete" into the SAME `None`, and
+                            // its documented contract is that callers MUST treat
+                            // `None` as "unknown — fall through to full scan". The
+                            // in-RAM B-tree index can legitimately be INCOMPLETE for
+                            // a present key: it is built fire-and-forget by the
+                            // auto-index advisor (and by `CREATE INDEX`) over a point-
+                            // in-time file set, is FIFO-evicted past
+                            // `MAX_INDEX_ENTRIES_PER_COL`, and does not retroactively
+                            // cover rows written before it existed. The previous
+                            // `result = Some(None)` ("definitely empty") short-circuit
+                            // therefore DROPPED live rows whenever a queried key was
+                            // simply not (yet) in the index — e.g. a point read of a
+                            // freshly-inserted non-PK value after the advisor fired
+                            // (`prepared_select_point_reads`). We never set a negative
+                            // result here: a miss leaves `result = None`, falling
+                            // through to the zone-map/bloom prune + full cold read,
+                            // which is always correct. The POSITIVE allowlist above
+                            // (a HIT) is still used only to PRUNE, and the existing
+                            // per-file re-check filters any superset.
+                        }
+                        break; // Only use one index column per query.
                     }
-                    break; // Only use one index column per query.
                 }
             }
-        }
-        result
-    };
+            result
+        };
 
     // Wire the row-group selection from the secondary index probe into the
     // ReadOptions so the Parquet reader can skip non-matching row groups.
@@ -3195,10 +3208,7 @@ async fn execute_simple_select_inner(
     // every surviving row so no false negatives escape.
 
     /// Build the empty-result response for a definitive all-files-pruned miss.
-    fn empty_probe_result(
-        plan: &SimpleSelectPlan,
-        meta: &TableMetadata,
-    ) -> ExecResult {
+    fn empty_probe_result(plan: &SimpleSelectPlan, meta: &TableMetadata) -> ExecResult {
         let output_schema = match &plan.projection {
             None => meta.schema.clone(),
             Some(items) => {
@@ -3270,34 +3280,31 @@ async fn execute_simple_select_inner(
     }
 
     let pk_probe_paths: Option<Vec<object_store::path::Path>> = if
-        // PK row cache hit: the cached batches already answer this point query;
-        // skip the zone-map + bloom probe (and its possible Absent early-return)
-        // entirely so the warm path is a pure in-RAM HashMap lookup. The cache's
-        // valid watermark guarantees the cold files are unchanged, so the probe
-        // would only re-derive what we already hold.
-        pk_cache_hit.is_some() {
+    // PK row cache hit: the cached batches already answer this point query;
+    // skip the zone-map + bloom probe (and its possible Absent early-return)
+    // entirely so the warm path is a pure in-RAM HashMap lookup. The cache's
+    // valid watermark guarantees the cold files are unchanged, so the probe
+    // would only re-derive what we already hold.
+    pk_cache_hit.is_some() {
         None
     } else if
-        // Small-tail merge-on-read: the PK point-probe prunes to cold-file
-        // candidates AND can EARLY-RETURN an empty result when its bloom finds
-        // the key in no cold file. With the flush skipped, a just-INSERTed PK
-        // can live only in the un-flushed tail — which the probe's cold blooms
-        // do not see — so this gate is disabled when we are merging the tail on
-        // read. The read then routes through the tail-merging `handle.read`,
-        // preserving read-own-write for tail-only PKs.
-        tail_merge_via_shard_read {
+    // Small-tail merge-on-read: the PK point-probe prunes to cold-file
+    // candidates AND can EARLY-RETURN an empty result when its bloom finds
+    // the key in no cold file. With the flush skipped, a just-INSERTed PK
+    // can live only in the un-flushed tail — which the probe's cold blooms
+    // do not see — so this gate is disabled when we are merging the tail on
+    // read. The read then routes through the tail-merging `handle.read`,
+    // preserving read-own-write for tail-only PKs.
+    tail_merge_via_shard_read {
         None
-    } else if
-        plan.aggregates.is_none()
+    } else if plan.aggregates.is_none()
         && plan.is_null_cols.is_empty()
         && meta.pk_columns.len() == 1
     {
         let pk_col = &meta.pk_columns[0];
 
         // ── Single Eq probe (`WHERE pk = <lit>`) ────────────────────────────
-        if plan.predicates.len() == 1
-            && plan.in_list_preds.is_empty()
-        {
+        if plan.predicates.len() == 1 && plan.in_list_preds.is_empty() {
             if let Predicate::Eq(col, val) = &plan.predicates[0] {
                 if col == pk_col {
                     match crate::index_probe::pk_point_probe(
@@ -3385,36 +3392,35 @@ async fn execute_simple_select_inner(
     // keyset column is not Int64, or ANY live file lacks a decodable Int64
     // min/max — the branch then keeps the existing open-all-candidates
     // behaviour, which is always correct.
-    let keyset_zone_maps: Option<
-        std::collections::HashMap<object_store::path::Path, (i64, i64)>,
-    > = match (keyset_per_file_limit, plan.order_by.as_ref()) {
-        (Some(_), Some((kcol, _)))
-            if meta
-                .schema
-                .field_with_name(kcol)
-                .map(|f| matches!(f.data_type(), arrow_schema::DataType::Int64))
-                .unwrap_or(false) =>
-        {
-            let mut m = std::collections::HashMap::with_capacity(live_files.len());
-            let mut complete = true;
-            for f in &live_files {
-                let cs = f.column_stats.get(kcol.as_str());
-                let mn = cs.and_then(|c| decode_stat_i64(c.min_bytes.as_deref()));
-                let mx = cs.and_then(|c| decode_stat_i64(c.max_bytes.as_deref()));
-                match (mn, mx) {
-                    (Some(mn), Some(mx)) => {
-                        m.insert(object_store::path::Path::from(f.path.as_str()), (mn, mx));
-                    }
-                    _ => {
-                        complete = false;
-                        break;
+    let keyset_zone_maps: Option<std::collections::HashMap<object_store::path::Path, (i64, i64)>> =
+        match (keyset_per_file_limit, plan.order_by.as_ref()) {
+            (Some(_), Some((kcol, _)))
+                if meta
+                    .schema
+                    .field_with_name(kcol)
+                    .map(|f| matches!(f.data_type(), arrow_schema::DataType::Int64))
+                    .unwrap_or(false) =>
+            {
+                let mut m = std::collections::HashMap::with_capacity(live_files.len());
+                let mut complete = true;
+                for f in &live_files {
+                    let cs = f.column_stats.get(kcol.as_str());
+                    let mn = cs.and_then(|c| decode_stat_i64(c.min_bytes.as_deref()));
+                    let mx = cs.and_then(|c| decode_stat_i64(c.max_bytes.as_deref()));
+                    match (mn, mx) {
+                        (Some(mn), Some(mx)) => {
+                            m.insert(object_store::path::Path::from(f.path.as_str()), (mn, mx));
+                        }
+                        _ => {
+                            complete = false;
+                            break;
+                        }
                     }
                 }
+                complete.then_some(m)
             }
-            complete.then_some(m)
-        }
-        _ => None,
-    };
+            _ => None,
+        };
 
     // Convert each live file's path string to an `ObjectPath` for
     // `storage.read_paths`.
@@ -3493,9 +3499,7 @@ async fn execute_simple_select_inner(
                                         let bytes = v.to_le_bytes();
                                         !filter.contains(bytes.as_ref())
                                     }
-                                    ScalarValue::Utf8(s) => {
-                                        !filter.contains(s.as_bytes())
-                                    }
+                                    ScalarValue::Utf8(s) => !filter.contains(s.as_bytes()),
                                     // Other types: no bloom encoding defined —
                                     // fall through (do not prune).
                                     _ => false,
@@ -3602,9 +3606,7 @@ async fn execute_simple_select_inner(
                     v.push((p.clone(), *mn, *mx));
                 }
                 v.sort_by_key(|(_, mn, mx)| (*mn, *mx));
-                v.windows(2)
-                    .all(|w| w[0].2 < w[1].1)
-                    .then_some(v)
+                v.windows(2).all(|w| w[0].2 < w[1].1).then_some(v)
             });
         if let Some(files) = ordered_disjoint {
             use arrow_array::Array;
@@ -3633,16 +3635,12 @@ async fn execute_simple_select_inner(
                 let collected: Vec<Result<RecordBatch>> = stream.collect().await;
                 let file_batches = collected.into_iter().collect::<Result<Vec<_>>>()?;
                 for b in &file_batches {
-                    match b
-                        .schema()
-                        .index_of(kcol)
-                        .ok()
-                        .and_then(|ci| {
-                            b.column(ci)
-                                .as_any()
-                                .downcast_ref::<arrow_array::Int64Array>()
-                                .cloned()
-                        }) {
+                    match b.schema().index_of(kcol).ok().and_then(|ci| {
+                        b.column(ci)
+                            .as_any()
+                            .downcast_ref::<arrow_array::Int64Array>()
+                            .cloned()
+                    }) {
                         Some(arr) if arr.null_count() == 0 => {
                             keys.extend(arr.values().iter().copied());
                         }
@@ -3659,8 +3657,7 @@ async fn execute_simple_select_inner(
                             // per_file_limit), so a select_nth on a scratch
                             // copy is cheap.
                             let mut scratch = keys.clone();
-                            let (_, kth, _) =
-                                scratch.select_nth_unstable(per_file_limit - 1);
+                            let (_, kth, _) = scratch.select_nth_unstable(per_file_limit - 1);
                             if *next_min > *kth {
                                 break;
                             }
@@ -3957,7 +3954,11 @@ async fn execute_simple_select_inner(
             )
             .map_err(|e| BasinError::internal(format!("tombstone filter: {e}")))?;
             crate::hot_tombstone::apply_update_overlay_to_batches(
-                batches, &updates, pk_col, &pk_dt, &plan.predicates,
+                batches,
+                &updates,
+                pk_col,
+                &pk_dt,
+                &plan.predicates,
             )
             .map_err(|e| BasinError::internal(format!("update overlay: {e}")))?
         } else {
@@ -4032,98 +4033,96 @@ async fn execute_simple_select_inner(
     // index. For lists that include computed items we evaluate the
     // arithmetic expressions per-batch and rebuild each batch with the
     // user-requested output columns and aliases.
-    let (projected_schema, batches): (Arc<Schema>, Vec<RecordBatch>) =
-        match &plan.projection {
-            None => {
-                // `SELECT *`: the declared output schema is the CURRENT catalog
-                // schema. Pad each batch up to it so a row read from a data file
-                // (or overlay) written before an `ALTER TABLE ADD COLUMN` gains
-                // the new trailing columns as NULL — the declared schema and the
-                // batch columns must agree for every downstream consumer.
-                let padded: Vec<RecordBatch> = batches
+    let (projected_schema, batches): (Arc<Schema>, Vec<RecordBatch>) = match &plan.projection {
+        None => {
+            // `SELECT *`: the declared output schema is the CURRENT catalog
+            // schema. Pad each batch up to it so a row read from a data file
+            // (or overlay) written before an `ALTER TABLE ADD COLUMN` gains
+            // the new trailing columns as NULL — the declared schema and the
+            // batch columns must agree for every downstream consumer.
+            let padded: Vec<RecordBatch> = batches
+                .into_iter()
+                .map(|b| crate::hot_tombstone::pad_batch_to_schema(b, &meta.schema))
+                .collect::<Result<_>>()?;
+            (meta.schema.clone(), padded)
+        }
+        Some(items) => {
+            // Check whether any item is a Computed variant.
+            let has_computed = items
+                .iter()
+                .any(|it| matches!(it, ProjectionItem::Computed { .. }));
+
+            if has_computed {
+                // Build the output schema from the projection list.
+                // Computed columns get the alias as name and the type
+                // determined by the first non-empty batch (we verify
+                // Int64/Float64 above so it is safe to infer at runtime).
+                let out_schema = build_computed_schema(items, &batches, &meta.schema)?;
+                let out_schema = Arc::new(out_schema);
+
+                let evaluated: Vec<RecordBatch> = batches
                     .into_iter()
-                    .map(|b| crate::hot_tombstone::pad_batch_to_schema(b, &meta.schema))
-                    .collect::<Result<_>>()?;
-                (meta.schema.clone(), padded)
-            }
-            Some(items) => {
-                // Check whether any item is a Computed variant.
-                let has_computed = items
+                    .map(|b| evaluate_computed_projections(&b, items, &out_schema))
+                    .collect::<Result<Vec<_>>>()?;
+
+                (out_schema, evaluated)
+            } else {
+                // Plain column list — build output schema from the full table
+                // schema and re-project each batch to the requested columns.
+                //
+                // `read_cols` (the columns handed to `read_paths_with_schema`)
+                // is the union of the user-requested columns and all filter
+                // columns, sorted alphabetically. The storage layer returns
+                // batches whose columns are in that sorted order. We must
+                // re-project each batch so the output matches the SELECT list
+                // order and contains only the user-requested columns.
+                let col_names: Vec<&str> = items
                     .iter()
-                    .any(|it| matches!(it, ProjectionItem::Computed { .. }));
-
-                if has_computed {
-                    // Build the output schema from the projection list.
-                    // Computed columns get the alias as name and the type
-                    // determined by the first non-empty batch (we verify
-                    // Int64/Float64 above so it is safe to infer at runtime).
-                    let out_schema =
-                        build_computed_schema(items, &batches, &meta.schema)?;
-                    let out_schema = Arc::new(out_schema);
-
-                    let evaluated: Vec<RecordBatch> = batches
-                        .into_iter()
-                        .map(|b| evaluate_computed_projections(&b, items, &out_schema))
-                        .collect::<Result<Vec<_>>>()?;
-
-                    (out_schema, evaluated)
-                } else {
-                    // Plain column list — build output schema from the full table
-                    // schema and re-project each batch to the requested columns.
-                    //
-                    // `read_cols` (the columns handed to `read_paths_with_schema`)
-                    // is the union of the user-requested columns and all filter
-                    // columns, sorted alphabetically. The storage layer returns
-                    // batches whose columns are in that sorted order. We must
-                    // re-project each batch so the output matches the SELECT list
-                    // order and contains only the user-requested columns.
-                    let col_names: Vec<&str> = items
-                        .iter()
-                        .map(|item| match item {
-                            ProjectionItem::Column(c) => c.as_str(),
-                            ProjectionItem::Computed { .. } => unreachable!(),
-                        })
-                        .collect();
-                    let idxs: Vec<usize> = col_names
-                        .iter()
-                        .map(|c| {
-                            meta.schema.index_of(c).map_err(|_| {
-                                BasinError::UndefinedColumn(c.to_string())
-                            })
-                        })
-                        .collect::<Result<_>>()?;
-                    let schema = Arc::new(
+                    .map(|item| match item {
+                        ProjectionItem::Column(c) => c.as_str(),
+                        ProjectionItem::Computed { .. } => unreachable!(),
+                    })
+                    .collect();
+                let idxs: Vec<usize> = col_names
+                    .iter()
+                    .map(|c| {
                         meta.schema
-                            .project(&idxs)
-                            .map_err(|e| BasinError::internal(format!("project schema: {e}")))?,
-                    );
-                    // Project each batch: find each requested column by NAME in
-                    // the batch schema (which reflects read_cols order, not the
-                    // full table schema order) and assemble a new RecordBatch.
-                    let projected: Vec<RecordBatch> = batches
-                        .into_iter()
-                        .map(|b| {
-                            let cols: Result<Vec<_>> = col_names
-                                .iter()
-                                .map(|c| {
-                                    b.schema()
-                                        .index_of(c)
-                                        .map(|i| b.column(i).clone())
-                                        .map_err(|_| {
-                                            BasinError::InvalidSchema(format!(
-                                                "batch missing column {c}"
-                                            ))
-                                        })
-                                })
-                                .collect();
-                            RecordBatch::try_new(schema.clone(), cols?)
-                                .map_err(|e| BasinError::internal(format!("project batch: {e}")))
-                        })
-                        .collect::<Result<_>>()?;
-                    (schema, projected)
-                }
+                            .index_of(c)
+                            .map_err(|_| BasinError::UndefinedColumn(c.to_string()))
+                    })
+                    .collect::<Result<_>>()?;
+                let schema = Arc::new(
+                    meta.schema
+                        .project(&idxs)
+                        .map_err(|e| BasinError::internal(format!("project schema: {e}")))?,
+                );
+                // Project each batch: find each requested column by NAME in
+                // the batch schema (which reflects read_cols order, not the
+                // full table schema order) and assemble a new RecordBatch.
+                let projected: Vec<RecordBatch> = batches
+                    .into_iter()
+                    .map(|b| {
+                        let cols: Result<Vec<_>> = col_names
+                            .iter()
+                            .map(|c| {
+                                b.schema()
+                                    .index_of(c)
+                                    .map(|i| b.column(i).clone())
+                                    .map_err(|_| {
+                                        BasinError::InvalidSchema(format!(
+                                            "batch missing column {c}"
+                                        ))
+                                    })
+                            })
+                            .collect();
+                        RecordBatch::try_new(schema.clone(), cols?)
+                            .map_err(|e| BasinError::internal(format!("project batch: {e}")))
+                    })
+                    .collect::<Result<_>>()?;
+                (schema, projected)
             }
-        };
+        }
+    };
 
     // Normalize cold scan batches to the catalog-typed projected_schema:
     // Vortex decode narrows LargeBinary (JSONB) to Binary, while memtable
@@ -4216,9 +4215,9 @@ fn infer_expr_output_type(
     fn walk(expr: &Expr, schema: &Arc<Schema>) -> Result<DataType> {
         match expr {
             Expr::Identifier(id) => {
-                let idx = schema
-                    .index_of(&id.value)
-                    .map_err(|_| BasinError::InvalidSchema(format!("unknown column {}", id.value)))?;
+                let idx = schema.index_of(&id.value).map_err(|_| {
+                    BasinError::InvalidSchema(format!("unknown column {}", id.value))
+                })?;
                 Ok(schema.field(idx).data_type().clone())
             }
             Expr::Value(ValueWithSpan {
@@ -4402,10 +4401,7 @@ fn cast_to_f64(arr: &arrow_array::ArrayRef) -> std::result::Result<arrow_array::
 /// kernels for integer arithmetic (matching DataFusion's wrapping-i64
 /// semantics). Returns `Err` on kernel errors (e.g. division by zero, type
 /// mismatch) so the caller can propagate as a `BasinError`.
-fn eval_arithmetic_expr(
-    expr: &Expr,
-    batch: &RecordBatch,
-) -> std::result::Result<EvalVal, String> {
+fn eval_arithmetic_expr(expr: &Expr, batch: &RecordBatch) -> std::result::Result<EvalVal, String> {
     match expr {
         Expr::Identifier(id) => {
             let idx = batch
@@ -4493,10 +4489,11 @@ fn evaluate_computed_projections(
                 })?;
                 columns.push(batch.column(idx).clone());
             }
-            ProjectionItem::Computed { sql_expr, alias, .. } => {
-                let val = eval_arithmetic_expr(sql_expr, batch).map_err(|e| {
-                    BasinError::internal(format!("compute expr for {alias}: {e}"))
-                })?;
+            ProjectionItem::Computed {
+                sql_expr, alias, ..
+            } => {
+                let val = eval_arithmetic_expr(sql_expr, batch)
+                    .map_err(|e| BasinError::internal(format!("compute expr for {alias}: {e}")))?;
                 columns.push(val.into_array());
             }
         }
@@ -4505,7 +4502,6 @@ fn evaluate_computed_projections(
     RecordBatch::try_new(out_schema.clone(), columns)
         .map_err(|e| BasinError::internal(format!("computed projection batch: {e}")))
 }
-
 
 /// The single effective cluster column the writer physically sorts every cold
 /// file on, or `None` when the table is not single-column clustered.
@@ -4661,7 +4657,8 @@ async fn try_topk_late_materialize(
             // The existing single-column path can't honour the PK tie-break;
             // route the whole statement to DataFusion, which sorts both keys.
             let fb = fallback_sql(raw_sql);
-            let res = crate::executor::exec_select(sess, &fb, include_deleted, Some(raw_sql)).await?;
+            let res =
+                crate::executor::exec_select(sess, &fb, include_deleted, Some(raw_sql)).await?;
             Ok(Some(res))
         } else {
             Ok(None)
@@ -4675,11 +4672,7 @@ async fn try_topk_late_materialize(
         _ => return decline(sess, tk.pk_tiebreak, raw_sql, include_deleted).await,
     };
     // Env cap disabled or pinned / overlay / tail-merge → decline.
-    if topk_late_max_k() == 0
-        || pinned
-        || overlay_active
-        || tail_merge_via_shard_read
-    {
+    if topk_late_max_k() == 0 || pinned || overlay_active || tail_merge_via_shard_read {
         return decline(sess, tk.pk_tiebreak, raw_sql, include_deleted).await;
     }
     // Identity must be the single PK column, and (for the phase-2 InInt64
@@ -4818,7 +4811,9 @@ async fn try_topk_late_materialize(
                 Some(phase1_schema.clone()),
             )
             .await?;
-        stream.collect::<Vec<Result<RecordBatch>>>().await
+        stream
+            .collect::<Vec<Result<RecordBatch>>>()
+            .await
             .into_iter()
             .collect::<Result<Vec<_>>>()?
     };
@@ -4838,8 +4833,12 @@ async fn try_topk_late_materialize(
     };
 
     // Bounded top-`limit` over the narrow batches → winning PK values.
-    let p1_sort_i = phase1_schema.index_of(&tk.sort_col).expect("sort col in phase1");
-    let p1_pk_i = phase1_schema.index_of(&tk.pk_col).expect("pk col in phase1");
+    let p1_sort_i = phase1_schema
+        .index_of(&tk.sort_col)
+        .expect("sort col in phase1");
+    let p1_pk_i = phase1_schema
+        .index_of(&tk.pk_col)
+        .expect("pk col in phase1");
     let total_p1: usize = phase1_batches.iter().map(|b| b.num_rows()).sum();
     if total_p1 == 0 {
         // Empty after filtering — return an empty result in the output schema
@@ -4940,7 +4939,9 @@ async fn try_topk_late_materialize(
                 Some(meta.schema.clone()),
             )
             .await?;
-        stream.collect::<Vec<Result<RecordBatch>>>().await
+        stream
+            .collect::<Vec<Result<RecordBatch>>>()
+            .await
             .into_iter()
             .collect::<Result<Vec<_>>>()?
     };
@@ -4960,13 +4961,19 @@ async fn try_topk_late_materialize(
     // helper shape: the slow path projects AFTER the read using
     // `plan.projection`; we do the same here on the (≤ limit) winner rows, then
     // a final two-key sort produces the exact global order.
-    let (out_schema, out_batches) =
-        topk_project_batches(plan, meta, phase2_batches)?;
+    let (out_schema, out_batches) = topk_project_batches(plan, meta, phase2_batches)?;
 
     // Final re-sort of the ≤ limit winners by (sort_col [, pk]). The output
     // already contains only the winners (phase-2 fetched exactly them), so this
     // is a tiny O(k log k) sort over k rows.
-    let result = topk_resort_window(out_batches, &out_schema, &tk.sort_col, tk.ascending, tk.pk_tiebreak.then_some(tk.pk_col.as_str()), limit)?;
+    let result = topk_resort_window(
+        out_batches,
+        &out_schema,
+        &tk.sort_col,
+        tk.ascending,
+        tk.pk_tiebreak.then_some(tk.pk_col.as_str()),
+        limit,
+    )?;
 
     sess.engine.note_topk_late_fast_select();
     Ok(Some(ExecResult::Rows {
@@ -5063,9 +5070,13 @@ fn topk_phase1_file_skip(
     // max. Sort so the most promising files come first.
     decodable.sort_by(|a, b| {
         if ascending {
-            a.best.partial_cmp(&b.best).unwrap_or(std::cmp::Ordering::Equal)
+            a.best
+                .partial_cmp(&b.best)
+                .unwrap_or(std::cmp::Ordering::Equal)
         } else {
-            b.best.partial_cmp(&a.best).unwrap_or(std::cmp::Ordering::Equal)
+            b.best
+                .partial_cmp(&a.best)
+                .unwrap_or(std::cmp::Ordering::Equal)
         }
     });
     // The `limit`-th best key bound: walk accumulating rows; the file at which
@@ -5233,8 +5244,7 @@ fn topk_resort_window(
         .collect();
     let columns: Vec<arrow_array::ArrayRef> = (0..schema.fields().len())
         .map(|i| {
-            let per_batch: Vec<&dyn Array> =
-                batches.iter().map(|b| b.column(i).as_ref()).collect();
+            let per_batch: Vec<&dyn Array> = batches.iter().map(|b| b.column(i).as_ref()).collect();
             arrow::compute::interleave(&per_batch, &pairs)
                 .map_err(|e| BasinError::internal(format!("topk re-sort interleave {i}: {e}")))
         })
@@ -5275,7 +5285,7 @@ fn apply_order_by_limit(
     offset: usize,
     schema: &Arc<Schema>,
 ) -> Result<Vec<RecordBatch>> {
-    use arrow::compute::{SortOptions, concat, interleave, sort_to_indices};
+    use arrow::compute::{concat, interleave, sort_to_indices, SortOptions};
     use arrow_array::Array;
 
     if batches.is_empty() || limit == 0 {
@@ -5295,8 +5305,8 @@ fn apply_order_by_limit(
     let key_window = limit.saturating_add(offset);
     let key_cols: Vec<&dyn arrow_array::Array> =
         batches.iter().map(|b| b.column(col_idx).as_ref()).collect();
-    let merged_key = concat(&key_cols)
-        .map_err(|e| BasinError::internal(format!("order_by key concat: {e}")))?;
+    let merged_key =
+        concat(&key_cols).map_err(|e| BasinError::internal(format!("order_by key concat: {e}")))?;
 
     // nulls_first=false: NULLs sort LAST (DataFusion default for ASC).
     // For DESC, NULLs sort FIRST (DataFusion default), so nulls_first=true.
@@ -5378,9 +5388,9 @@ fn apply_is_null_filter(
         // Build an AND mask over all IS NULL columns.
         let mut mask: Option<arrow_array::BooleanArray> = None;
         for col_name in is_null_cols {
-            let col = batch
-                .column_by_name(col_name)
-                .ok_or_else(|| BasinError::InvalidSchema(format!("IS NULL: unknown column {col_name}")))?;
+            let col = batch.column_by_name(col_name).ok_or_else(|| {
+                BasinError::InvalidSchema(format!("IS NULL: unknown column {col_name}"))
+            })?;
             let col_mask = arrow_is_null(col.as_ref())
                 .map_err(|e| BasinError::internal(format!("is_null kernel: {e}")))?;
             mask = Some(match mask {
@@ -5473,7 +5483,10 @@ impl CompiledInPred {
                 // panicking.  Real schemas always match their declared type.
                 let Some(i64_arr) = arr.as_any().downcast_ref::<arrow_array::Int64Array>() else {
                     // Return all-false — no row can match.
-                    return Ok(arrow_array::BooleanArray::from(vec![false; batch.num_rows()]));
+                    return Ok(arrow_array::BooleanArray::from(vec![
+                        false;
+                        batch.num_rows()
+                    ]));
                 };
                 let mask: arrow_array::BooleanArray = i64_arr
                     .iter()
@@ -5488,7 +5501,10 @@ impl CompiledInPred {
                     .map_err(|_| BasinError::InvalidSchema(format!("IN: unknown column {col}")))?;
                 let arr = batch.column(col_idx);
                 let Some(str_arr) = arr.as_any().downcast_ref::<arrow_array::StringArray>() else {
-                    return Ok(arrow_array::BooleanArray::from(vec![false; batch.num_rows()]));
+                    return Ok(arrow_array::BooleanArray::from(vec![
+                        false;
+                        batch.num_rows()
+                    ]));
                 };
                 let mask: arrow_array::BooleanArray = str_arr
                     .iter()
@@ -5597,10 +5613,10 @@ fn apply_aggregates(
     aggs: &[AggregateFn],
     _table_schema: &Arc<Schema>,
 ) -> Result<ExecResult> {
-    use arrow::compute::min as arrow_min;
     use arrow::compute::max as arrow_max;
+    use arrow::compute::min as arrow_min;
     use arrow::compute::sum as arrow_sum;
-    use arrow_array::{Int64Array, ArrayRef};
+    use arrow_array::{ArrayRef, Int64Array};
     use arrow_schema::{DataType, Field};
 
     // Coerce an aggregate input column to Int64 for the i64 accumulator path.
@@ -5619,9 +5635,8 @@ fn apply_aggregates(
                 .expect("Int64 downcast")
                 .clone()),
             DataType::Int8 | DataType::Int16 | DataType::Int32 => {
-                let casted = arrow::compute::cast(arr, &DataType::Int64).map_err(|e| {
-                    BasinError::internal(format!("{op}: cast {col} to Int64: {e}"))
-                })?;
+                let casted = arrow::compute::cast(arr, &DataType::Int64)
+                    .map_err(|e| BasinError::internal(format!("{op}: cast {col} to Int64: {e}")))?;
                 Ok(casted
                     .as_any()
                     .downcast_ref::<Int64Array>()
@@ -5851,7 +5866,10 @@ mod tests {
         ));
         assert!(!batch_matches_predicates(
             &b,
-            &[Predicate::Eq("name".into(), ScalarValue::Utf8("bye".into()))]
+            &[Predicate::Eq(
+                "name".into(),
+                ScalarValue::Utf8("bye".into())
+            )]
         ));
     }
 
@@ -5973,8 +5991,7 @@ mod tests {
 
     #[test]
     fn matches_order_by_limit_with_inequality() {
-        let stmt =
-            parse_one("SELECT * FROM t WHERE id >= 6000 ORDER BY id DESC LIMIT 10");
+        let stmt = parse_one("SELECT * FROM t WHERE id >= 6000 ORDER BY id DESC LIMIT 10");
         let plan = match_simple_select(&stmt).expect("fast path should match");
         assert_eq!(plan.limit, Some(10));
         assert_eq!(plan.order_by, Some(("id".to_string(), false)));
@@ -6071,8 +6088,7 @@ mod tests {
     #[test]
     fn rejects_four_atom_conjunction() {
         // Four atoms (BETWEEN = 2 + two more) exceeds the cap → DataFusion.
-        let stmt =
-            parse_one("SELECT * FROM t WHERE id BETWEEN 1 AND 10 AND k > 2 AND s = 'x'");
+        let stmt = parse_one("SELECT * FROM t WHERE id BETWEEN 1 AND 10 AND k > 2 AND s = 'x'");
         assert!(match_simple_select(&stmt).is_none());
     }
 
@@ -6115,8 +6131,7 @@ mod tests {
 
     #[test]
     fn matches_aggregate_count_sum_with_between() {
-        let stmt =
-            parse_one("SELECT COUNT(*), SUM(id) FROM t WHERE id BETWEEN 100 AND 200");
+        let stmt = parse_one("SELECT COUNT(*), SUM(id) FROM t WHERE id BETWEEN 100 AND 200");
         let plan = match_simple_select(&stmt).expect("fast path should match");
         let aggs = plan.aggregates.as_deref().expect("should be aggregate");
         assert_eq!(aggs.len(), 2);
@@ -6190,7 +6205,10 @@ mod tests {
         assert_eq!(col, "name");
         assert_eq!(
             vals,
-            &[ScalarValue::Utf8("alice".to_string()), ScalarValue::Utf8("bob".to_string())]
+            &[
+                ScalarValue::Utf8("alice".to_string()),
+                ScalarValue::Utf8("bob".to_string())
+            ]
         );
     }
 
@@ -6225,11 +6243,18 @@ mod tests {
     fn matches_100_element_in_list_with_multi_col_projection() {
         // Exactly the bench shape: SELECT id, user_id, amount FROM events WHERE id IN (...)
         // with 100 integer values.
-        let vals: String = (0..100i64).map(|k| (k * 7 + 1).to_string()).collect::<Vec<_>>().join(",");
+        let vals: String = (0..100i64)
+            .map(|k| (k * 7 + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!("SELECT id, user_id, amount FROM events WHERE id IN ({vals})");
         let stmt = parse_one(&sql);
-        let plan = match_simple_select(&stmt).expect("100-element IN-list with multi-col projection must match fast path");
-        assert!(plan.predicates.is_empty(), "no Predicate atoms — only in_list_preds");
+        let plan = match_simple_select(&stmt)
+            .expect("100-element IN-list with multi-col projection must match fast path");
+        assert!(
+            plan.predicates.is_empty(),
+            "no Predicate atoms — only in_list_preds"
+        );
         assert_eq!(plan.in_list_preds.len(), 1);
         let (col, vals_out) = &plan.in_list_preds[0];
         assert_eq!(col, "id");
@@ -6344,13 +6369,16 @@ mod tests {
             Field::new("id", DataType::Int64, true),
             Field::new("name", DataType::Utf8, true),
         ]));
-        let ids: Int64Array = vec![
-            Some(1), Some(2), Some(3), Some(50), None, Some(99),
-        ]
-        .into_iter()
-        .collect();
+        let ids: Int64Array = vec![Some(1), Some(2), Some(3), Some(50), None, Some(99)]
+            .into_iter()
+            .collect();
         let names: StringArray = vec![
-            Some("alice"), Some("bob"), Some("carol"), Some("dave"), Some("eve"), None,
+            Some("alice"),
+            Some("bob"),
+            Some("carol"),
+            Some("dave"),
+            Some("eve"),
+            None,
         ]
         .into_iter()
         .collect();
@@ -6388,9 +6416,13 @@ mod tests {
         assert_eq!(got, expected);
 
         // Verify the filter actually removes the NULL row.
-        let filtered = apply_in_list_filter(vec![batch], &[
-            ("id".to_string(), (1..=100).map(ScalarValue::Int64).collect()),
-        ])
+        let filtered = apply_in_list_filter(
+            vec![batch],
+            &[(
+                "id".to_string(),
+                (1..=100).map(ScalarValue::Int64).collect(),
+            )],
+        )
         .unwrap();
         let total_rows: usize = filtered.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 5, "5 non-null matching rows expected");
@@ -6436,10 +6468,7 @@ mod tests {
     /// have rejected such a query before it reaches the filter.
     #[test]
     fn in_list_falls_back_for_mixed_types() {
-        let vals_mixed = vec![
-            ScalarValue::Int64(1),
-            ScalarValue::Utf8("x".to_string()),
-        ];
+        let vals_mixed = vec![ScalarValue::Int64(1), ScalarValue::Utf8("x".to_string())];
         let cp_mixed = CompiledInPred::compile("id".to_string(), vals_mixed);
         assert!(
             matches!(cp_mixed, CompiledInPred::Fallback(_, _)),
@@ -6448,10 +6477,7 @@ mod tests {
 
         // A list containing a Boolean value is also not Int64 or Utf8 — falls
         // through to Fallback.
-        let vals_bool = vec![
-            ScalarValue::Boolean(true),
-            ScalarValue::Boolean(false),
-        ];
+        let vals_bool = vec![ScalarValue::Boolean(true), ScalarValue::Boolean(false)];
         let cp_bool = CompiledInPred::compile("flag".to_string(), vals_bool);
         assert!(
             matches!(cp_bool, CompiledInPred::Fallback(_, _)),

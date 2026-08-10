@@ -149,7 +149,12 @@ impl IvfFlatIndex {
     /// nearest cells. `probes` is clamped to `[1, num_lists]`. Candidates from
     /// the probed cells are ranked by *exact* distance, so the returned rows
     /// are exactly ordered among the retrieved candidates.
-    pub fn search(&self, query: &[f32], k: usize, probes: usize) -> Result<Vec<IvfFlatSearchResult>> {
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        probes: usize,
+    ) -> Result<Vec<IvfFlatSearchResult>> {
         if query.len() != self.dim {
             return Err(BasinError::Internal(format!(
                 "query dim {} != index dim {}",
@@ -325,7 +330,10 @@ mod tests {
         assert_eq!(idx.num_lists(), 16);
         // Every point must be in some list — total assignments == count.
         let total: usize = idx.lists.iter().map(|l| l.len()).sum();
-        assert_eq!(total, 500, "every point must be assigned to exactly one cell");
+        assert_eq!(
+            total, 500,
+            "every point must be assigned to exactly one cell"
+        );
     }
 
     #[test]
@@ -388,15 +396,27 @@ mod tests {
         let r4 = recall_at(4);
         let r_all = recall_at(lists);
         println!("[ivfflat] recall@10 probes=1:{r1:.3} probes=4:{r4:.3} probes=all:{r_all:.3}");
-        assert!(r4 >= r1 - 1e-9, "more probes must not lower recall: r1={r1} r4={r4}");
+        assert!(
+            r4 >= r1 - 1e-9,
+            "more probes must not lower recall: r1={r1} r4={r4}"
+        );
         assert!(r_all >= r4 - 1e-9, "all-cells probe must not lower recall");
         // Probing every cell is exhaustive → recall must be 1.0.
-        assert!((r_all - 1.0).abs() < 1e-9, "all-cells probe must be exact, got {r_all}");
+        assert!(
+            (r_all - 1.0).abs() < 1e-9,
+            "all-cells probe must be exact, got {r_all}"
+        );
         // On clustered data the single-probe default already recovers most of
         // the true top-k (a few probes reach the ≥0.7 the conformance suite
         // gates on); pin a meaningful floor here.
-        assert!(r1 >= 0.5, "single-probe recall on clustered data too low: {r1}");
-        assert!(r4 >= 0.7, "4-probe recall on clustered data should clear 0.7: {r4}");
+        assert!(
+            r1 >= 0.5,
+            "single-probe recall on clustered data too low: {r1}"
+        );
+        assert!(
+            r4 >= 0.7,
+            "4-probe recall on clustered data should clear 0.7: {r4}"
+        );
     }
 
     #[test]
@@ -415,13 +435,19 @@ mod tests {
         let q = rand_vec(999_999, dim);
         let res = idx.search(&q, 10, 4).unwrap();
         for w in res.windows(2) {
-            assert!(w[0].distance <= w[1].distance + 1e-6, "results not exactly ordered");
+            assert!(
+                w[0].distance <= w[1].distance + 1e-6,
+                "results not exactly ordered"
+            );
         }
         // And each returned distance must equal the true distance to that id.
         for r in &res {
             let v = &pts.iter().find(|(id, _)| *id == r.id).unwrap().1;
             let exact = Distance::L2.apply(&q, v);
-            assert!((exact - r.distance).abs() < 1e-5, "reported distance not exact");
+            assert!(
+                (exact - r.distance).abs() < 1e-5,
+                "reported distance not exact"
+            );
         }
     }
 
@@ -448,7 +474,11 @@ mod tests {
             b.insert(i, rand_vec(i, dim)).unwrap();
         }
         let idx = b.build(100);
-        assert!(idx.num_lists() <= 3, "lists must clamp to n; got {}", idx.num_lists());
+        assert!(
+            idx.num_lists() <= 3,
+            "lists must clamp to n; got {}",
+            idx.num_lists()
+        );
 
         // Empty index is queryable and returns nothing.
         let empty = IvfFlatIndexBuilder::new(Distance::L2, dim).build(4);

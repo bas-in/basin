@@ -24,7 +24,14 @@ use basin_wal::{LocalWal, Wal, WalConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
-async fn build() -> (TempDir, TempDir, Engine, Shard, basin_shard::ShardBackgroundHandle, Arc<dyn Wal>) {
+async fn build() -> (
+    TempDir,
+    TempDir,
+    Engine,
+    Shard,
+    basin_shard::ShardBackgroundHandle,
+    Arc<dyn Wal>,
+) {
     let sd = TempDir::new().unwrap();
     let wd = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
@@ -45,7 +52,11 @@ async fn build() -> (TempDir, TempDir, Engine, Shard, basin_shard::ShardBackgrou
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -59,7 +70,11 @@ async fn int_at(sess: &basin_engine::ProjectSession, sql: &str) -> i64 {
     match sess.execute(sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => {
             let b = &batches[0];
-            b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0)
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
         }
         _ => panic!("expected rows"),
     }
@@ -69,7 +84,11 @@ async fn float_at(sess: &basin_engine::ProjectSession, sql: &str) -> f64 {
     match sess.execute(sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => {
             let b = &batches[0];
-            b.column(0).as_any().downcast_ref::<Float64Array>().unwrap().value(0)
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0)
         }
         _ => panic!("expected rows"),
     }
@@ -91,7 +110,9 @@ async fn rmw_update_through_hot_tier_is_correct() {
 
     // 1. Repeated RMW must accumulate (each read sees the latest overlay).
     for _ in 0..3 {
-        sess.execute("UPDATE t SET v = v + 1 WHERE id = 1").await.unwrap();
+        sess.execute("UPDATE t SET v = v + 1 WHERE id = 1")
+            .await
+            .unwrap();
     }
     assert_eq!(
         int_at(&sess, "SELECT v FROM t WHERE id = 1").await,
@@ -100,27 +121,60 @@ async fn rmw_update_through_hot_tier_is_correct() {
     );
 
     // 2. Multi-row RMW.
-    sess.execute("UPDATE t SET v = v + 5 WHERE id < 3").await.unwrap();
-    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 1").await, 18, "id1: 13+5");
-    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 2").await, 25, "id2: 20+5");
-    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 3").await, 30, "id3 untouched");
+    sess.execute("UPDATE t SET v = v + 5 WHERE id < 3")
+        .await
+        .unwrap();
+    assert_eq!(
+        int_at(&sess, "SELECT v FROM t WHERE id = 1").await,
+        18,
+        "id1: 13+5"
+    );
+    assert_eq!(
+        int_at(&sess, "SELECT v FROM t WHERE id = 2").await,
+        25,
+        "id2: 20+5"
+    );
+    assert_eq!(
+        int_at(&sess, "SELECT v FROM t WHERE id = 3").await,
+        30,
+        "id3 untouched"
+    );
 
     // 3. Float RMW.
-    sess.execute("UPDATE t SET amt = amt * 2 WHERE id = 3").await.unwrap();
-    assert!((float_at(&sess, "SELECT amt FROM t WHERE id = 3").await - 7.0).abs() < 1e-9, "3.5*2");
+    sess.execute("UPDATE t SET amt = amt * 2 WHERE id = 3")
+        .await
+        .unwrap();
+    assert!(
+        (float_at(&sess, "SELECT amt FROM t WHERE id = 3").await - 7.0).abs() < 1e-9,
+        "3.5*2"
+    );
 
     // 4. SET = CASE WHEN (expression RHS, non-arithmetic).
     sess.execute("UPDATE t SET v = CASE WHEN v > 20 THEN 0 ELSE v END WHERE id = 3")
         .await
         .unwrap();
-    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 3").await, 0, "30>20 -> 0");
+    assert_eq!(
+        int_at(&sess, "SELECT v FROM t WHERE id = 3").await,
+        0,
+        "30>20 -> 0"
+    );
 
     // 5. RMW referencing another column.
-    sess.execute("UPDATE t SET v = id + 100 WHERE id = 2").await.unwrap();
-    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 2").await, 102, "id(2)+100");
+    sess.execute("UPDATE t SET v = id + 100 WHERE id = 2")
+        .await
+        .unwrap();
+    assert_eq!(
+        int_at(&sess, "SELECT v FROM t WHERE id = 2").await,
+        102,
+        "id(2)+100"
+    );
 
     // 6. Full-table check: row count unchanged, no rows lost/duplicated.
-    assert_eq!(int_at(&sess, "SELECT COUNT(*) FROM t").await, 3, "no rows lost/duplicated");
+    assert_eq!(
+        int_at(&sess, "SELECT COUNT(*) FROM t").await,
+        3,
+        "no rows lost/duplicated"
+    );
 
     bg.shutdown().await;
     wal.close().await.unwrap();
@@ -138,14 +192,23 @@ async fn count_star_after_scalar_hot_update_is_correct() {
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO t VALUES (1, 10), (2, 20)").await.unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap();
     shard.flush_to_parquet().await.unwrap();
     let c0 = int_at(&sess, "SELECT COUNT(*) FROM t").await;
-    sess.execute("UPDATE t SET v = 99 WHERE id = 1").await.unwrap(); // scalar -> overlay
+    sess.execute("UPDATE t SET v = 99 WHERE id = 1")
+        .await
+        .unwrap(); // scalar -> overlay
     let c1 = int_at(&sess, "SELECT COUNT(*) FROM t").await;
-    println!("[count-overlay] COUNT before update={c0} after scalar hot update={c1} (want 2 and 2)");
+    println!(
+        "[count-overlay] COUNT before update={c0} after scalar hot update={c1} (want 2 and 2)"
+    );
     assert_eq!(c0, 2, "baseline");
-    assert_eq!(c1, 2, "COUNT(*) must stay 2 after a hot-tier UPDATE (replace, not insert)");
+    assert_eq!(
+        c1, 2,
+        "COUNT(*) must stay 2 after a hot-tier UPDATE (replace, not insert)"
+    );
     wal.close().await.unwrap();
 }
 
@@ -195,8 +258,12 @@ async fn overlay_memo_survives_materialize_retag() {
     shard.flush_to_parquet().await.unwrap();
 
     // Hot overlay: two RMW overrides (fast path is default-ON).
-    sess.execute("UPDATE t SET v = v + 1 WHERE id = 1").await.unwrap();
-    sess.execute("UPDATE t SET v = v + 1 WHERE id = 2").await.unwrap();
+    sess.execute("UPDATE t SET v = v + 1 WHERE id = 1")
+        .await
+        .unwrap();
+    sess.execute("UPDATE t SET v = v + 1 WHERE id = 2")
+        .await
+        .unwrap();
     // Warm the memo with a bulk read while both overrides are outstanding.
     assert_eq!(
         ints_ordered(&sess, "SELECT v FROM t ORDER BY id").await,
@@ -207,7 +274,9 @@ async fn overlay_memo_survives_materialize_retag() {
     // `abs(v)` is not on the RMW allowlist → cold copy-on-write path → it
     // materializes the overlay into cold first and `mark_flushed` re-tags the
     // two `Update` entries to `Row` (no epoch bump, update_count 2 → 0).
-    sess.execute("UPDATE t SET v = abs(v) WHERE id = 3").await.unwrap();
+    sess.execute("UPDATE t SET v = abs(v) WHERE id = 3")
+        .await
+        .unwrap();
 
     // Values must be exactly the post-materialize state on both read paths:
     // the former overrides now live in cold, id=3 got the cold-path abs().
@@ -219,7 +288,11 @@ async fn overlay_memo_survives_materialize_retag() {
     assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 1").await, 11);
     assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 2").await, 21);
     assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 3").await, 30);
-    assert_eq!(int_at(&sess, "SELECT COUNT(*) FROM t").await, 3, "no rows lost/duplicated");
+    assert_eq!(
+        int_at(&sess, "SELECT COUNT(*) FROM t").await,
+        3,
+        "no rows lost/duplicated"
+    );
 
     wal.close().await.unwrap();
 }
@@ -246,15 +319,25 @@ async fn scalar_overlay_then_cold_range_update_composes() {
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO t VALUES (1, 10), (2, 20)").await.unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap();
     shard.flush_to_parquet().await.unwrap();
 
     // Scalar hot-tier UPDATE (PK-eq, literal) -> memtable overlay sets id=1 v=99.
-    sess.execute("UPDATE t SET v = 99 WHERE id = 1").await.unwrap();
-    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 1").await, 99, "overlay applied");
+    sess.execute("UPDATE t SET v = 99 WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        int_at(&sess, "SELECT v FROM t WHERE id = 1").await,
+        99,
+        "overlay applied"
+    );
 
     // Range UPDATE (cold copy-on-write path) on the same row.
-    sess.execute("UPDATE t SET v = v + 1 WHERE id < 2").await.unwrap();
+    sess.execute("UPDATE t SET v = v + 1 WHERE id < 2")
+        .await
+        .unwrap();
     // Correct result: 99 + 1 = 100. If the cold path rewrote stale cold (10->11)
     // and the overlay shadows it, we'd wrongly read 99 (cold-path update lost).
     assert_eq!(

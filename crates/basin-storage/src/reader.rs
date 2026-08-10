@@ -11,8 +11,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{
-    ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter, RowSelection,
-    RowSelector,
+    ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
 };
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
@@ -847,8 +846,14 @@ pub(crate) async fn read(
         let paths =
             resolve_table_read_paths(storage, project, table, &opts, catalog_schema.as_ref())
                 .await?;
-        let stream =
-            read_paths_inner(storage, project, paths, opts.clone(), catalog_schema.clone()).await?;
+        let stream = read_paths_inner(
+            storage,
+            project,
+            paths,
+            opts.clone(),
+            catalog_schema.clone(),
+        )
+        .await?;
         // Peek the first item so a pre-emission supersede 404 triggers a
         // re-resolve instead of failing the query.
         let mut peekable = stream.peekable();
@@ -1369,10 +1374,7 @@ async fn read_one(
         {
             let unfiltered_cache_disabled =
                 std::env::var("BASIN_UNFILTERED_DECODE_CACHE_DISABLE").as_deref() == Ok("1");
-            if !opts.filters.is_empty()
-                && !unfiltered_cache_disabled
-                && catalog_schema.is_some()
-            {
+            if !opts.filters.is_empty() && !unfiltered_cache_disabled && catalog_schema.is_some() {
                 if let Some(pc) = page_cache.as_ref() {
                     let read_proj = vortex_read_projection(opts.as_ref());
                     let unfiltered_key = CacheKey {
@@ -1498,21 +1500,19 @@ async fn read_one(
         // DISABLE=1` reverts to the prior (no inferred-schema push) behaviour.
         let selective_decode_disabled =
             std::env::var("BASIN_VORTEX_SELECTIVE_DECODE_DISABLE").as_deref() == Ok("1");
-        let inferred_schema: Option<Arc<Schema>> = if catalog_schema.is_none()
-            && !opts.filters.is_empty()
-            && !selective_decode_disabled
-        {
-            crate::vortex_format::infer_arrow_schema(
-                &bytes,
-                Some(&vortex_cache),
-                Some(&path),
-                size_bytes,
-            )
-            .ok()
-            .map(Arc::new)
-        } else {
-            None
-        };
+        let inferred_schema: Option<Arc<Schema>> =
+            if catalog_schema.is_none() && !opts.filters.is_empty() && !selective_decode_disabled {
+                crate::vortex_format::infer_arrow_schema(
+                    &bytes,
+                    Some(&vortex_cache),
+                    Some(&path),
+                    size_bytes,
+                )
+                .ok()
+                .map(Arc::new)
+            } else {
+                None
+            };
         let filter_schema: Option<&Schema> = match catalog_schema.as_deref() {
             Some(s) => Some(s),
             None => inferred_schema.as_deref(),
@@ -1563,18 +1563,14 @@ async fn read_one(
         // Utf8 `status = '…'` predicate), the pushdown path decodes the whole
         // file anyway, so the unfiltered reuse path is strictly better whenever
         // the decode can be cached.
-        let (push_filter, all_filters_pushed) =
-            vortex_filter_expr(&opts.filters, filter_schema);
+        let (push_filter, all_filters_pushed) = vortex_filter_expr(&opts.filters, filter_schema);
         // A-priori expansion estimate of the unfiltered decode.
         let est_decode = size_bytes.saturating_mul(VORTEX_UNFILTERED_DECODE_EXPANSION);
         let per_shard = page_cache
             .as_ref()
             .map(|pc| pc.per_shard_budget())
             .unwrap_or(0);
-        let total = page_cache
-            .as_ref()
-            .map(|pc| pc.total_budget())
-            .unwrap_or(0);
+        let total = page_cache.as_ref().map(|pc| pc.total_budget()).unwrap_or(0);
         // Eligibility budget:
         //   * pushable filter → must fit one shard a priori (modest factor);
         //     a larger file keeps pushdown + native chunk pruning.
@@ -1686,10 +1682,13 @@ async fn read_one(
         // defence in depth — it is cheap on the few surviving rows and removes
         // any doubt about inferred-type vs catalog-type semantics, leaving this
         // change a pure prune optimisation with an identical final row set.
-        let apply_filter =
-            !(all_filters_pushed && decode_used_filter && catalog_schema.is_some());
-        let batches =
-            vortex_project_and_filter(batches, opts.as_ref(), catalog_schema.as_ref(), apply_filter)?;
+        let apply_filter = !(all_filters_pushed && decode_used_filter && catalog_schema.is_some());
+        let batches = vortex_project_and_filter(
+            batches,
+            opts.as_ref(),
+            catalog_schema.as_ref(),
+            apply_filter,
+        )?;
 
         // Page-cache write-through, keyed by the same (path, projection)
         // cache key the Parquet path uses, so a repeat of the identical
@@ -1788,9 +1787,8 @@ async fn read_one(
     let (builder, file_size) = if let Some(cached) = meta_cache.get(&path) {
         let size = cached.size;
         let reader = ParquetObjectReader::new(store, path.clone()).with_file_size(size);
-        let arrow_meta =
-            ArrowReaderMetadata::try_new(cached.meta, page_index_opts)
-                .map_err(|e| BasinError::storage(format!("rehydrate parquet meta {path}: {e}")))?;
+        let arrow_meta = ArrowReaderMetadata::try_new(cached.meta, page_index_opts)
+            .map_err(|e| BasinError::storage(format!("rehydrate parquet meta {path}: {e}")))?;
         (
             ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta),
             size,
@@ -1806,10 +1804,9 @@ async fn read_one(
             .map_err(|e| BasinError::storage(format!("head {path}: {e}")))?;
         let size = head.size;
         let mut reader = ParquetObjectReader::new(store, path.clone()).with_file_size(size);
-        let arrow_meta =
-            load_parquet_meta_with_retry(&mut reader)
-                .await
-                .map_err(|e| BasinError::storage(format!("open parquet {path}: {e}")))?;
+        let arrow_meta = load_parquet_meta_with_retry(&mut reader)
+            .await
+            .map_err(|e| BasinError::storage(format!("open parquet {path}: {e}")))?;
         meta_cache.insert(
             path.clone(),
             CachedParquetMeta {
@@ -2124,11 +2121,7 @@ fn predicate_excludes_group_by_idx(
 ///
 /// Returns `true` for "this row group can be skipped". `false` is always
 /// safe (caller will read the file and let the per-row filter decide).
-fn prune_starts_with_row_group(
-    stats: &Statistics,
-    prefix: &str,
-    case_insensitive: bool,
-) -> bool {
+fn prune_starts_with_row_group(stats: &Statistics, prefix: &str, case_insensitive: bool) -> bool {
     // ASCII-fold pruning would need both min and max folded plus careful
     // handling of code points where lowercasing changes byte length.
     // Conservatively bail — the per-row filter still gets the win.
@@ -2234,13 +2227,12 @@ async fn finalize_encrypted_stream(
     let mut bytes_reader = BytesFileReader {
         bytes: bytes::Bytes::from(plaintext),
     };
-    let arrow_meta =
-        ArrowReaderMetadata::load_async(
-            &mut bytes_reader,
-            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
-        )
-        .await
-        .map_err(|e| BasinError::storage(format!("open encrypted parquet {path}: {e}")))?;
+    let arrow_meta = ArrowReaderMetadata::load_async(
+        &mut bytes_reader,
+        ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
+    )
+    .await
+    .map_err(|e| BasinError::storage(format!("open encrypted parquet {path}: {e}")))?;
 
     let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(bytes_reader, arrow_meta);
     finalize_pipeline(
@@ -2510,10 +2502,7 @@ fn build_row_tier_selection(
                 }
                 // Coalesce a contiguous run of selected offsets.
                 let run_start = pos;
-                while oi < row_offsets.len()
-                    && row_offsets[oi] < end
-                    && row_offsets[oi] == pos
-                {
+                while oi < row_offsets.len() && row_offsets[oi] < end && row_offsets[oi] == pos {
                     pos += 1;
                     oi += 1;
                 }
@@ -2543,10 +2532,7 @@ fn build_row_tier_selection(
 /// Look up the row-tier offset allowlist for `path` in the read options.
 /// Returns `None` when no row selection is set or the file is absent (a file
 /// without a row-tier entry decodes every surviving row — the safe default).
-fn row_tier_offsets_for_file<'a>(
-    opts: &'a ReadOptions,
-    path: &ObjectPath,
-) -> Option<&'a Vec<u64>> {
+fn row_tier_offsets_for_file<'a>(opts: &'a ReadOptions, path: &ObjectPath) -> Option<&'a Vec<u64>> {
     opts.row_selection.as_ref()?.get(path.as_ref())
 }
 
@@ -2585,12 +2571,14 @@ fn page_excluded_by_predicate(
             }
         }
         // --- Int32 column vs Int64 scalar (widen to i64) ---
-        (Predicate::Gt(_, ScalarValue::Int64(v)), ColumnIndexMetaData::INT32(idx)) => {
-            idx.max_values().get(page_i).map_or(false, |max| (*max as i64) <= *v)
-        }
-        (Predicate::Lt(_, ScalarValue::Int64(v)), ColumnIndexMetaData::INT32(idx)) => {
-            idx.min_values().get(page_i).map_or(false, |min| (*min as i64) >= *v)
-        }
+        (Predicate::Gt(_, ScalarValue::Int64(v)), ColumnIndexMetaData::INT32(idx)) => idx
+            .max_values()
+            .get(page_i)
+            .map_or(false, |max| (*max as i64) <= *v),
+        (Predicate::Lt(_, ScalarValue::Int64(v)), ColumnIndexMetaData::INT32(idx)) => idx
+            .min_values()
+            .get(page_i)
+            .map_or(false, |min| (*min as i64) >= *v),
         (Predicate::Eq(_, ScalarValue::Int64(v)), ColumnIndexMetaData::INT32(idx)) => {
             let min = idx.min_values().get(page_i).map(|x| *x as i64);
             let max = idx.max_values().get(page_i).map(|x| *x as i64);
@@ -2907,9 +2895,7 @@ where
                 // result would later satisfy unlimited / larger-N callers from
                 // a too-short entry, corrupting query results. Skip the
                 // write-through whenever a LIMIT is in effect.
-                if let (Some(pc), Some(key), true) =
-                    (page_cache, cache_key, opts.limit.is_none())
-                {
+                if let (Some(pc), Some(key), true) = (page_cache, cache_key, opts.limit.is_none()) {
                     if !pc.has_capacity() {
                         return Ok(mapped.boxed());
                     }
@@ -3019,12 +3005,8 @@ where
     // rule out a predicate match. Critical for IN-list queries: the
     // bounding-range atoms (Gt(min-1), Lt(max+1)) synthesised by the engine
     // target only a narrow band of pages in an otherwise large row group.
-    let page_selection = build_page_row_selection(
-        builder.metadata(),
-        &kept,
-        &opts.filters,
-        &arrow_schema,
-    );
+    let page_selection =
+        build_page_row_selection(builder.metadata(), &kept, &opts.filters, &arrow_schema);
     if let Some((_, rows_sel)) = &page_selection {
         counters
             .rows_selected_by_page_index
@@ -3352,7 +3334,11 @@ fn vortex_project_and_filter_limited(
     // instead of an O(n) Arrow filter over every wide column. Any *other*
     // residual filters are still applied (as a mask) on the small taken batch.
     // The whole optimisation is reverted by `BASIN_SORTED_SKIP_DISABLE=1`.
-    let sorted_skip = if apply_filter { sorted_skip_plan(opts) } else { None };
+    let sorted_skip = if apply_filter {
+        sorted_skip_plan(opts)
+    } else {
+        None
+    };
 
     for batch in batches {
         if let Some(lim) = limit {
@@ -3737,14 +3723,15 @@ fn catalog_schema_uuid_to_decimal256(schema: &Schema) -> Schema {
         .fields()
         .iter()
         .map(|f| {
-            let is_uuid_fsb = matches!(
-                f.data_type(),
-                arrow_schema::DataType::FixedSizeBinary(16)
-            ) && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str())
-                == Some(BASIN_TYPE_UUID);
+            let is_uuid_fsb = matches!(f.data_type(), arrow_schema::DataType::FixedSizeBinary(16))
+                && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID);
             if is_uuid_fsb {
-                Field::new(f.name(), arrow_schema::DataType::Decimal256(39, 0), f.is_nullable())
-                    .with_metadata(f.metadata().clone())
+                Field::new(
+                    f.name(),
+                    arrow_schema::DataType::Decimal256(39, 0),
+                    f.is_nullable(),
+                )
+                .with_metadata(f.metadata().clone())
             } else {
                 f.as_ref().clone()
             }
@@ -3804,9 +3791,12 @@ fn decimal256_to_uuid_fsb(batch: RecordBatch) -> RecordBatch {
             });
             let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(rows, 16)
                 .expect("FixedSizeBinary(16) construction cannot fail");
-            let new_field =
-                Field::new(f.name(), arrow_schema::DataType::FixedSizeBinary(16), f.is_nullable())
-                    .with_metadata(f.metadata().clone());
+            let new_field = Field::new(
+                f.name(),
+                arrow_schema::DataType::FixedSizeBinary(16),
+                f.is_nullable(),
+            )
+            .with_metadata(f.metadata().clone());
             new_fields.push(new_field);
             new_cols.push(Arc::new(arr));
         } else {
@@ -3838,8 +3828,12 @@ fn catalog_schema_point_to_large_binary(schema: &Schema) -> Schema {
             ) && f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str())
                 == Some(BASIN_TYPE_POINT);
             if is_point_fsb {
-                Field::new(f.name(), arrow_schema::DataType::LargeBinary, f.is_nullable())
-                    .with_metadata(f.metadata().clone())
+                Field::new(
+                    f.name(),
+                    arrow_schema::DataType::LargeBinary,
+                    f.is_nullable(),
+                )
+                .with_metadata(f.metadata().clone())
             } else {
                 f.as_ref().clone()
             }
@@ -3853,7 +3847,9 @@ fn catalog_schema_point_to_large_binary(schema: &Schema) -> Schema {
 /// rebuild the `FixedSizeBinary(21)` layout so the rest of basin keeps
 /// seeing the canonical POINT physical type.
 fn large_binary_to_point_fsb(batch: RecordBatch) -> RecordBatch {
-    use arrow_array::{Array, BinaryArray, BinaryViewArray, FixedSizeBinaryArray, LargeBinaryArray};
+    use arrow_array::{
+        Array, BinaryArray, BinaryViewArray, FixedSizeBinaryArray, LargeBinaryArray,
+    };
 
     let schema = batch.schema();
     // Vortex 0.71 surfaces the on-disk LargeBinary column as either
@@ -4082,10 +4078,7 @@ fn synthesise_missing_columns(
 /// row-groups). Returns `Some(&allow)` when the caller's prune decision
 /// applies to this file. Membership is checked with a `HashSet`-style probe
 /// by the caller (small surviving lists are typical: a Vec scan is fine).
-fn rowgroup_allow_for_file<'a>(
-    opts: &'a ReadOptions,
-    path: &ObjectPath,
-) -> Option<&'a Vec<u32>> {
+fn rowgroup_allow_for_file<'a>(opts: &'a ReadOptions, path: &ObjectPath) -> Option<&'a Vec<u32>> {
     let map = opts.row_group_selection.as_ref()?;
     map.get(path.as_ref())
 }
@@ -4226,7 +4219,9 @@ mod tests {
         let mk = |ids: Vec<i64>| {
             let id = Int64Array::from(ids.clone());
             let pay = StringArray::from(
-                ids.iter().map(|v| Some(format!("p{v}"))).collect::<Vec<_>>(),
+                ids.iter()
+                    .map(|v| Some(format!("p{v}")))
+                    .collect::<Vec<_>>(),
             );
             let sc = Float64Array::from(ids.iter().map(|v| Some(*v as f64)).collect::<Vec<_>>());
             RecordBatch::try_new(
@@ -4236,7 +4231,7 @@ mod tests {
             .unwrap()
         };
         vec![
-            mk(vec![1, 4, 7, 10]),   // chunk 0
+            mk(vec![1, 4, 7, 10]),    // chunk 0
             mk(vec![13, 16, 19, 22]), // chunk 1
             mk(vec![25, 28, 31, 34]), // chunk 2
         ]
@@ -4350,7 +4345,10 @@ mod tests {
             sorted_by: Some("id".into()),
             ..ReadOptions::default()
         };
-        assert!(sorted_skip_plan(&opts).is_none(), "kill switch disables plan");
+        assert!(
+            sorted_skip_plan(&opts).is_none(),
+            "kill switch disables plan"
+        );
         let out =
             vortex_project_and_filter_limited(sorted_chunks(), &opts, None, true, None).unwrap();
         std::env::remove_var("BASIN_SORTED_SKIP_DISABLE");
@@ -4826,8 +4824,14 @@ mod tests {
             page_cache: Some(crate::PageCacheConfig::new(16)),
         });
         let table_s = TableName::new("big").unwrap();
-        let path_s =
-            write_vortex(&storage_small, &project, &table_s, &pk_batch(0, 12), Some(4)).await;
+        let path_s = write_vortex(
+            &storage_small,
+            &project,
+            &table_s,
+            &pk_batch(0, 12),
+            Some(4),
+        )
+        .await;
         let ids_s = read_eq_ids(&storage_small, &project, &path_s, schema.clone(), 7).await;
         assert_eq!(ids_s, vec![7], "result still correct on the bypass path");
         assert!(
@@ -4843,8 +4847,7 @@ mod tests {
         std::env::set_var(key_env, "1");
         let storage_ks = paged_storage(64 * 1024 * 1024);
         let table_k = TableName::new("ks").unwrap();
-        let path_k =
-            write_vortex(&storage_ks, &project, &table_k, &pk_batch(0, 12), Some(4)).await;
+        let path_k = write_vortex(&storage_ks, &project, &table_k, &pk_batch(0, 12), Some(4)).await;
         let ids_k = read_eq_ids(&storage_ks, &project, &path_k, schema.clone(), 6).await;
         assert_eq!(ids_k, vec![6], "result correct with kill switch on");
         assert!(
@@ -4864,13 +4867,11 @@ mod tests {
         let table_p = TableName::new("par").unwrap();
 
         std::env::remove_var(key_env);
-        let path_unf =
-            write_vortex(&storage_unf, &project, &table_p, &batch, Some(4)).await;
+        let path_unf = write_vortex(&storage_unf, &project, &table_p, &batch, Some(4)).await;
         // The pushdown-path file is written ONCE under the kill switch; the
         // env var only affects the READ path, so writing it here is fine.
         std::env::set_var(key_env, "1");
-        let path_push =
-            write_vortex(&storage_push, &project, &table_p, &batch, Some(4)).await;
+        let path_push = write_vortex(&storage_push, &project, &table_p, &batch, Some(4)).await;
         std::env::remove_var(key_env);
 
         // Keys: present-with-note, present-NULL-note (id%3==0 → 100/103/106/109),
@@ -4881,12 +4882,14 @@ mod tests {
             let warm = read_eq_ids(&storage_unf, &project, &path_unf, schema.clone(), eq).await;
 
             std::env::set_var(key_env, "1");
-            let pushed =
-                read_eq_ids(&storage_push, &project, &path_push, schema.clone(), eq).await;
+            let pushed = read_eq_ids(&storage_push, &project, &path_push, schema.clone(), eq).await;
             std::env::remove_var(key_env);
 
             assert_eq!(cold, warm, "cold vs warm disagree for Eq(id,{eq})");
-            assert_eq!(cold, pushed, "unfiltered vs pushdown disagree for Eq(id,{eq})");
+            assert_eq!(
+                cold, pushed,
+                "unfiltered vs pushdown disagree for Eq(id,{eq})"
+            );
             let expected: Vec<i64> = if (100..112).contains(&eq) {
                 vec![eq]
             } else {
@@ -5094,7 +5097,8 @@ mod tests {
 
         // Warm the shared entry on the paged storage (serve-only policy:
         // only an unfiltered scan populates it).
-        let warmup = read_unfiltered_ids(&storage_cache, &project, &path_cache, schema.clone()).await;
+        let warmup =
+            read_unfiltered_ids(&storage_cache, &project, &path_cache, schema.clone()).await;
         assert_eq!(warmup.len(), 12);
 
         let keys = [300i64, 303, 306, 309, 305, 99_999];
@@ -5265,10 +5269,7 @@ mod tests {
 
     /// Paged storage over a SHARED object store, so a cache-less reference
     /// storage can read the very same file.
-    fn paged_storage_over(
-        store: Arc<object_store::memory::InMemory>,
-        max_bytes: u64,
-    ) -> Storage {
+    fn paged_storage_over(store: Arc<object_store::memory::InMemory>, max_bytes: u64) -> Storage {
         Storage::new(StorageConfig {
             object_store: store,
             root_prefix: None,
@@ -5426,7 +5427,10 @@ mod tests {
             .await,
         );
         assert_canonical(&unf2, &schema);
-        assert_eq!(unf2, unf, "unfiltered scan after filtered reads is unchanged");
+        assert_eq!(
+            unf2, unf,
+            "unfiltered scan after filtered reads is unchanged"
+        );
     }
 
     /// The filter/projection/restamp tail (`vortex_project_and_filter`) is
@@ -5493,8 +5497,7 @@ mod tests {
 
         let opts = ReadOptions::default();
         let once =
-            vortex_project_and_filter_limited(vec![raw], &opts, Some(&schema), true, None)
-                .unwrap();
+            vortex_project_and_filter_limited(vec![raw], &opts, Some(&schema), true, None).unwrap();
         assert_eq!(once.len(), 1);
         assert_eq!(
             once[0], canonical,
@@ -5531,8 +5534,8 @@ mod tests {
         let path = write_vortex(&storage, &project, &table, &batch, Some(4)).await;
 
         // 1) Schema-less unfiltered read populates ONLY the raw entry.
-        let raw = read_semantic_batches(&storage, &project, &path, None, ReadOptions::default())
-            .await;
+        let raw =
+            read_semantic_batches(&storage, &project, &path, None, ReadOptions::default()).await;
         assert_eq!(raw.iter().map(RecordBatch::num_rows).sum::<usize>(), 12);
         let pc = storage.page_cache().unwrap();
         let raw_key = CacheKey {
@@ -5587,8 +5590,7 @@ mod tests {
         //    read must keep returning its own cold-path (raw)
         //    representation, not the canonical one.
         let raw_again = concat_all(
-            &read_semantic_batches(&storage, &project, &path, None, ReadOptions::default())
-                .await,
+            &read_semantic_batches(&storage, &project, &path, None, ReadOptions::default()).await,
         );
         let raw_reference = concat_all(
             &read_semantic_batches(&storage_ref, &project, &path, None, ReadOptions::default())
@@ -6031,7 +6033,9 @@ mod tests {
     /// file then serves it; the read-open retry must absorb the 404.
     #[tokio::test]
     async fn read_survives_file_vanishing_then_reappearing() {
-        let _env = READ_OPEN_RETRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = READ_OPEN_RETRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Pin an explicit retry budget so a concurrently-restored env from the
         // sibling test can't bleed in. Default-equivalent value.
         std::env::set_var("BASIN_READ_OPEN_MAX_RETRIES", "5");
@@ -6073,7 +6077,10 @@ mod tests {
             let b = b.expect("read must not surface the injected 404 — it must retry");
             rows += b.num_rows();
         }
-        assert_eq!(rows, 100, "all rows returned despite the file vanishing then reappearing");
+        assert_eq!(
+            rows, 100,
+            "all rows returned despite the file vanishing then reappearing"
+        );
         std::env::remove_var("BASIN_READ_OPEN_MAX_RETRIES");
     }
 
@@ -6082,7 +6089,9 @@ mod tests {
     /// because of the retry, not because the fault never fired.
     #[tokio::test]
     async fn read_without_retry_budget_surfaces_the_404() {
-        let _env = READ_OPEN_RETRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = READ_OPEN_RETRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("BASIN_READ_OPEN_MAX_RETRIES", "0");
         let inner = Arc::new(InMemory::new());
         let writer = Storage::new(StorageConfig {

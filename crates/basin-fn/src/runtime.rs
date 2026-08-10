@@ -97,8 +97,7 @@ pub struct FunctionRecord {
 /// We hand-roll the boxing (rather than use `async_trait`) so this crate
 /// doesn't grow a new dev-dep: `Pin<Box<dyn Future + Send>>` is exactly
 /// what `async_trait` expands to, just spelled out.
-pub type LookupFuture<'a> =
-    Pin<Box<dyn Future<Output = Option<FunctionRecord>> + Send + 'a>>;
+pub type LookupFuture<'a> = Pin<Box<dyn Future<Output = Option<FunctionRecord>> + Send + 'a>>;
 
 /// Trait the runtime calls to find a function by `(project, name)`.
 ///
@@ -116,8 +115,7 @@ pub trait FunctionStore: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Boxed future returned by `FunctionGovernance::check`.
-pub type GovernanceFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+pub type GovernanceFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
 /// Per-invocation governance gate (Phase 5.11.W5).
 ///
@@ -305,9 +303,9 @@ impl FunctionRuntime {
         match join {
             Ok(Ok(resp)) => InvokeResult::Ok(resp),
             Ok(Err(e)) => InvokeResult::RuntimeError(format!("{e:#}")),
-            Err(join_err) => InvokeResult::RuntimeError(format!(
-                "function-runtime join failure: {join_err}"
-            )),
+            Err(join_err) => {
+                InvokeResult::RuntimeError(format!("function-runtime join failure: {join_err}"))
+            }
         }
     }
 
@@ -315,10 +313,7 @@ impl FunctionRuntime {
     ///
     /// Uses a read-lock fast-path; on miss, takes the write-lock and
     /// re-checks (in case a concurrent caller already compiled it).
-    async fn harness_for(
-        &self,
-        record: &FunctionRecord,
-    ) -> Result<Arc<HandlerHarness>, String> {
+    async fn harness_for(&self, record: &FunctionRecord) -> Result<Arc<HandlerHarness>, String> {
         let key = CacheKey {
             project: record.project.clone(),
             name: record.name.clone(),

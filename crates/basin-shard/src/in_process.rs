@@ -516,17 +516,15 @@ pub(crate) struct InProcessShard {
     /// `Shard::set_gin_rowgroup_registry` (before the compaction loop
     /// starts); read by `compact_one` to re-index compacted files.
     /// `None` until the engine wires it in (safe: compactor skips indexing).
-    gin_rowgroup_registry: std::sync::RwLock<
-        Option<Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry>>,
-    >,
+    gin_rowgroup_registry:
+        std::sync::RwLock<Option<Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry>>>,
     /// JSONB posting-list registry (Inv-W5 / W9 — replaces the bloom for
     /// `@>` containment).  Same lifecycle as `gin_rowgroup_registry`:
     /// wired once at engine startup, read by `compact_one` to build the
     /// per-`(key, value)` posting list for newly written files.  `None`
     /// until the engine wires it in.
-    jsonb_posting_registry: std::sync::RwLock<
-        Option<Arc<basin_storage::index::jsonb_posting::JsonbPostingRegistry>>,
-    >,
+    jsonb_posting_registry:
+        std::sync::RwLock<Option<Arc<basin_storage::index::jsonb_posting::JsonbPostingRegistry>>>,
     /// Secondary B-tree index sink (FIX 2).  Same lifecycle as
     /// `gin_rowgroup_registry`: wired once at engine startup via
     /// `Shard::set_secondary_index_registry`, read by `compact_one` to
@@ -578,8 +576,7 @@ pub(crate) struct InProcessShard {
     /// `read_flush_cancelled_mid_commit_does_not_duplicate_rows` reproduction is
     /// timing-free. `None` (and a zero-cost `Option` check) in production.
     #[cfg(test)]
-    post_commit_barrier:
-        Arc<std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
+    post_commit_barrier: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
     /// Test-only fault injector for #48: the number of upcoming compaction
     /// catalog commits to turn into an AMBIGUOUS result — the append applies
     /// durably but `commit_with_retry` sees a synthetic transient error, exactly
@@ -773,10 +770,7 @@ impl InProcessShard {
                     // fail closed because no epoch is recorded — the write
                     // path refuses epoch-less writes with `LeaseNotHeld`.
                     if let Some(m) = &self.cfg.lease_metrics {
-                        m.record_acquire(
-                            &self.cfg.replica_id,
-                            basin_common::AcquireResult::Failed,
-                        );
+                        m.record_acquire(&self.cfg.replica_id, basin_common::AcquireResult::Failed);
                     }
                     warn!(
                         %project,
@@ -802,19 +796,13 @@ impl InProcessShard {
                 // label is reserved for when the registry trait grows a
                 // discriminator (follow-on; cheap additive change).
                 if let Some(m) = &self.cfg.lease_metrics {
-                    m.record_acquire(
-                        &self.cfg.replica_id,
-                        basin_common::AcquireResult::Acquired,
-                    );
+                    m.record_acquire(&self.cfg.replica_id, basin_common::AcquireResult::Acquired);
                 }
                 Ok(())
             }
             None => {
                 if let Some(m) = &self.cfg.lease_metrics {
-                    m.record_acquire(
-                        &self.cfg.replica_id,
-                        basin_common::AcquireResult::Failed,
-                    );
+                    m.record_acquire(&self.cfg.replica_id, basin_common::AcquireResult::Failed);
                 }
                 if self.cfg.lease_mode == LeaseMode::Required {
                     // Required mode: a peer holds a live lease. Serve the
@@ -1020,11 +1008,7 @@ impl InProcessShard {
     /// Look up the per-partition state (if resident) and run `compact_one`.
     /// Used by [`Self::yield_partition`]. Returns `Ok` if the partition is
     /// not resident — nothing to drain.
-    async fn compact_one_keyed(
-        &self,
-        project: &ProjectId,
-        partition: &PartitionKey,
-    ) -> Result<()> {
+    async fn compact_one_keyed(&self, project: &ProjectId, partition: &PartitionKey) -> Result<()> {
         let state = {
             let map = self.partitions.lock().await;
             match map.get(&(*project, partition.clone())) {
@@ -1154,10 +1138,7 @@ impl InProcessShard {
                 }
                 Ok(false) => {
                     if let Some(m) = &self.cfg.lease_metrics {
-                        m.record_renew(
-                            &self.cfg.replica_id,
-                            basin_common::RenewResult::Expired,
-                        );
+                        m.record_renew(&self.cfg.replica_id, basin_common::RenewResult::Expired);
                     }
                     false
                 }
@@ -1267,7 +1248,14 @@ impl InProcessShard {
         // exposing it to the map; that way concurrent callers either see the
         // empty slot (and replay themselves) or see a fully replayed state.
         let mut state = PartitionState::new(*project, partition.clone());
-        replay_wal_into(&self.cfg.wal, &self.cfg.catalog, project, partition, &mut state).await?;
+        replay_wal_into(
+            &self.cfg.wal,
+            &self.cfg.catalog,
+            project,
+            partition,
+            &mut state,
+        )
+        .await?;
 
         let arc = Arc::new(RwLock::new(state));
         let mut map = self.partitions.lock().await;
@@ -1520,12 +1508,8 @@ impl InProcessShard {
                     // now points at THIS cold path and deleting it destroys every
                     // row in the file while the catalog still counts them. Only
                     // reclaim it if the catalog does not reference it.
-                    self.delete_outputs_unless_live(
-                        project,
-                        table,
-                        &[cold_file.path.to_string()],
-                    )
-                    .await;
+                    self.delete_outputs_unless_live(project, table, &[cold_file.path.to_string()])
+                        .await;
                     continue;
                 }
             }
@@ -1636,10 +1620,8 @@ impl InProcessShard {
         let file_format = shard_map_file_format(meta.file_format);
 
         // The shadow-column names we expect every file to carry after the sweep.
-        let expected_shadows: Vec<String> = promoted_paths
-            .iter()
-            .map(|p| p.shadow_col_name())
-            .collect();
+        let expected_shadows: Vec<String> =
+            promoted_paths.iter().map(|p| p.shadow_col_name()).collect();
 
         // Bloom the PK / declared sort columns exactly like `compact_one`
         // (#212), PLUS every promoted shadow column. The pre-fix sweep wrote
@@ -1693,12 +1675,7 @@ impl InProcessShard {
         for file in &files {
             // Collect all batches from this file via read_file.
             // read_file reads the raw Arrow data regardless of predicate pushdown.
-            let stream = match self
-                .cfg
-                .storage
-                .read_file(project, &file.path)
-                .await
-            {
+            let stream = match self.cfg.storage.read_file(project, &file.path).await {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(
@@ -1766,13 +1743,7 @@ impl InProcessShard {
             let new_file = match self
                 .cfg
                 .storage
-                .write_batch_with_options(
-                    project,
-                    table,
-                    &partition,
-                    &backfilled,
-                    &write_opts,
-                )
+                .write_batch_with_options(project, table, &partition, &backfilled, &write_opts)
                 .await
             {
                 Ok(f) => f,
@@ -1887,12 +1858,7 @@ impl InProcessShard {
                     }
 
                     // Delete the old file best-effort (same pattern as tiering sweep).
-                    if let Err(e) = self
-                        .cfg
-                        .storage
-                        .delete_file(project, &file.path)
-                        .await
-                    {
+                    if let Err(e) = self.cfg.storage.delete_file(project, &file.path).await {
                         warn!(
                             path = %file.path,
                             error = %e,
@@ -1915,12 +1881,8 @@ impl InProcessShard {
                     // file in that case destroys every row in it, invisibly —
                     // the catalog still lists it live and still counts its rows.
                     // Only reclaim it if the catalog does not reference it.
-                    self.delete_outputs_unless_live(
-                        project,
-                        table,
-                        &[new_file.path.to_string()],
-                    )
-                    .await;
+                    self.delete_outputs_unless_live(project, table, &[new_file.path.to_string()])
+                        .await;
                 }
             }
         }
@@ -2030,9 +1992,8 @@ impl InProcessShard {
                 let h = self.held_leases.lock().await;
                 h.keys().cloned().collect()
             };
-            snapshot.retain(|((project, partition), _)| {
-                held.contains(&(*project, partition.clone()))
-            });
+            snapshot
+                .retain(|((project, partition), _)| held.contains(&(*project, partition.clone())));
         }
         if snapshot.is_empty() {
             return Ok(());
@@ -2121,9 +2082,8 @@ impl InProcessShard {
                 let h = self.held_leases.lock().await;
                 h.keys().cloned().collect()
             };
-            snapshot.retain(|((project, partition), _)| {
-                held.contains(&(*project, partition.clone()))
-            });
+            snapshot
+                .retain(|((project, partition), _)| held.contains(&(*project, partition.clone())));
         }
         if snapshot.is_empty() {
             return Ok(());
@@ -2287,7 +2247,8 @@ impl InProcessShard {
         partition: &PartitionKey,
         state: Arc<RwLock<PartitionState>>,
     ) -> Result<()> {
-        self.compact_one_impl(project, partition, state, false).await
+        self.compact_one_impl(project, partition, state, false)
+            .await
     }
 
     /// Per-partition compaction body. `skip_if_locked == true` makes the
@@ -2362,552 +2323,562 @@ impl InProcessShard {
         // disk-size workloads (see `compaction_encoding_mode`).
         let compaction_encoding = compaction_encoding_mode();
         loop {
-        // Snapshot a bounded prefix of each table's tail under the inner read
-        // lock as a flat list of CHUNKS (each chunk ≤ `MAX_COMPACTION_ROWS`
-        // rows = one output file). We take up to `flush_concurrency` chunks
-        // per wave so the file writes below can be issued CONCURRENTLY against
-        // the object store — a single no-PK COPY has just one table, so the
-        // parallelism that lets compaction keep pace with ingest comes from
-        // flushing several of that one table's chunks at once, not from many
-        // tables. Holding the read lock briefly is fine; the lock is
-        // per-partition and we drop it before any I/O. Capping rows per chunk
-        // bounds each concat + encode; capping chunks per wave bounds the
-        // per-wave memory and in-flight PUTs.
-        let tail_snapshot: Vec<(TableName, Vec<(Lsn, RecordBatch)>)> = {
-            let guard = state.read().await;
-            let mut chunks: Vec<(TableName, Vec<(Lsn, RecordBatch)>)> = Vec::new();
-            'outer: for (t, v) in guard.tail.iter().filter(|(_, v)| !v.is_empty()) {
-                let mut taken = Vec::new();
-                let mut rows = 0usize;
-                for (lsn, b) in v.iter() {
-                    // Always take at least one batch per chunk so a single
-                    // oversized batch still makes progress; close the chunk
-                    // once it would exceed the per-file row budget and start a
-                    // new one (still the same table) so the writes parallelise.
-                    if !taken.is_empty() && rows + b.num_rows() > MAX_COMPACTION_ROWS {
-                        chunks.push((t.clone(), std::mem::take(&mut taken)));
-                        rows = 0;
+            // Snapshot a bounded prefix of each table's tail under the inner read
+            // lock as a flat list of CHUNKS (each chunk ≤ `MAX_COMPACTION_ROWS`
+            // rows = one output file). We take up to `flush_concurrency` chunks
+            // per wave so the file writes below can be issued CONCURRENTLY against
+            // the object store — a single no-PK COPY has just one table, so the
+            // parallelism that lets compaction keep pace with ingest comes from
+            // flushing several of that one table's chunks at once, not from many
+            // tables. Holding the read lock briefly is fine; the lock is
+            // per-partition and we drop it before any I/O. Capping rows per chunk
+            // bounds each concat + encode; capping chunks per wave bounds the
+            // per-wave memory and in-flight PUTs.
+            let tail_snapshot: Vec<(TableName, Vec<(Lsn, RecordBatch)>)> = {
+                let guard = state.read().await;
+                let mut chunks: Vec<(TableName, Vec<(Lsn, RecordBatch)>)> = Vec::new();
+                'outer: for (t, v) in guard.tail.iter().filter(|(_, v)| !v.is_empty()) {
+                    let mut taken = Vec::new();
+                    let mut rows = 0usize;
+                    for (lsn, b) in v.iter() {
+                        // Always take at least one batch per chunk so a single
+                        // oversized batch still makes progress; close the chunk
+                        // once it would exceed the per-file row budget and start a
+                        // new one (still the same table) so the writes parallelise.
+                        if !taken.is_empty() && rows + b.num_rows() > MAX_COMPACTION_ROWS {
+                            chunks.push((t.clone(), std::mem::take(&mut taken)));
+                            rows = 0;
+                            if chunks.len() >= flush_concurrency {
+                                break 'outer;
+                            }
+                        }
+                        rows += b.num_rows();
+                        taken.push((*lsn, b.clone()));
+                    }
+                    if !taken.is_empty() {
+                        chunks.push((t.clone(), taken));
                         if chunks.len() >= flush_concurrency {
                             break 'outer;
                         }
                     }
-                    rows += b.num_rows();
-                    taken.push((*lsn, b.clone()));
                 }
-                if !taken.is_empty() {
-                    chunks.push((t.clone(), taken));
-                    if chunks.len() >= flush_concurrency {
-                        break 'outer;
-                    }
-                }
-            }
-            chunks
-        };
-
-        if tail_snapshot.is_empty() {
-            break;
-        }
-
-        let mut drained_per_table: HashMap<TableName, Lsn> = HashMap::new();
-
-        // PHASE 1 (sequential, cheap, no object-store I/O): for each chunk
-        // resolve the per-table write config (cached), pick sort columns, build
-        // the WriteOptions and the backfilled merged batch. This touches the
-        // `!Send` top-pattern-provider guard and the per-call cfg cache, so it
-        // stays on this task. The output is a list of self-contained write
-        // plans that PHASE 2 can hand to concurrent writer tasks.
-        struct ChunkWritePlan {
-            table: TableName,
-            max_lsn: Lsn,
-            merged: RecordBatch,
-            write_opts: basin_storage::WriteOptions,
-            gin_indexes: Vec<basin_catalog::SecondaryIndex>,
-            effective_rg_size: usize,
-            used_adaptive_sort: bool,
-        }
-        let mut plans: Vec<ChunkWritePlan> = Vec::with_capacity(tail_snapshot.len());
-
-        for (table, entries) in tail_snapshot {
-            let max_lsn = entries
-                .iter()
-                .map(|(lsn, _)| *lsn)
-                .max()
-                .expect("non-empty table tail");
-
-            // Concatenate all batches for this table into one Parquet write.
-            //
-            // #72 follow-up (secondary worker-starvation source, deferred):
-            // this `concat_batches` — and the Vortex/Parquet encode it feeds in
-            // PHASE 2 — is CPU-bound and runs INLINE on the calling runtime
-            // worker. When the backpressure hard-flush (`write_batch_inner`)
-            // drives it, N concurrent COPY connections each pin a worker in
-            // encode while holding this partition's `compact_lock`, which can
-            // starve the cooperative pool. Wrapping the encode in
-            // `tokio::task::spawn_blocking` would move it off the worker, but
-            // PHASE 1 here is interleaved with `!Send` guard reads
-            // (`top_pattern_provider`) and `.await` catalog calls
-            // (`load_table`) INSIDE the `compact_lock`-held critical section
-            // that commits exactly-once, so hoisting just the encode out is not
-            // a localized change — it would restructure the commit path. Left
-            // as a follow-up rather than risk exactly-once; the PRIMARY #72 fix
-            // (read path no longer blocks behind this lock) removes the
-            // observable "SELECT 1 hangs" symptom on its own.
-            let batches: Vec<RecordBatch> = entries.iter().map(|(_, b)| b.clone()).collect();
-            let schema = batches[0].schema();
-            let merged = arrow::compute::concat_batches(&schema, &batches)
-                .map_err(|e| BasinError::storage(format!("concat batches: {e}")))?;
-
-            // Resolve per-table metadata: on-disk format, cluster columns,
-            // adaptive-sort override, GIN indexes, and row-group size.
-            // A missing catalog row is unusual but non-fatal; fall back to
-            // safe defaults so the whole compaction tick doesn't error out.
-            // #204: `pk_default_cluster_cols` is the single-column PK the file
-            // should be sorted by when the table declares no explicit
-            // clustering — sorting by it makes per-row-group / zone ranges
-            // disjoint so the reader's min/max prune isolates `WHERE pk = $1`.
-            //
-            // PERF: resolved ONCE per table per `compact_one` via
-            // `table_cfg_cache` (see its declaration above) — this metadata is
-            // table-level config that does not change while we drain the tail,
-            // and `load_table` clones the full O(files) snapshot chain. Loading
-            // it per flushed file made a saturated-tail backpressure drain cost
-            // O(files²); the cache makes it one chain clone per table.
-            if !table_cfg_cache.contains_key(&table) {
-                let resolved = match self.cfg.catalog.load_table(project, &table).await {
-                    Ok(m) => {
-                        let pk_default = m.default_cluster_cols();
-                        // #212: bloom the single-column PK (plus any declared
-                        // sort-by columns, mirroring the engine INSERT path) so
-                        // `pk_point_probe` can rule compacted stripe files in or
-                        // out without opening them. Round-robin striping spreads
-                        // PKs across every stripe, so without per-file blooms a
-                        // point UPDATE's cold pre-image read visits ~all of them.
-                        let mut bloom = m.global_sort_order.clone().unwrap_or_default();
-                        if let [pk] = m.pk_columns.as_slice() {
-                            if !bloom.contains(pk) {
-                                bloom.push(pk.clone());
-                            }
-                        }
-                        // ADR 0027 Phase 4: bloom every promoted shadow column
-                        // too (the compactor backfills them into the merged
-                        // batch below), so equality on `__promoted$col$key` —
-                        // the rewritten `payload->>'k' = 'literal'` lookup —
-                        // can rule freshly-compacted files in or out without
-                        // opening them.
-                        for p in &m.promoted_jsonb_paths {
-                            let s = p.shadow_col_name();
-                            if !bloom.contains(&s) {
-                                bloom.push(s);
-                            }
-                        }
-                        ResolvedTableCompactCfg {
-                            file_format: shard_map_file_format(m.file_format),
-                            declared_cluster_cols: m.cluster_columns,
-                            adaptive_sort_override: m.adaptive_sort_override.unwrap_or(false),
-                            gin_indexes: m.indexes.clone(),
-                            row_group_rows: m.row_group_rows,
-                            row_block_size: m.row_block_size,
-                            promoted_paths: m.promoted_jsonb_paths,
-                            pk_default_cluster_cols: pk_default,
-                            bloom_cols: bloom,
-                        }
-                    }
-                    Err(_) => ResolvedTableCompactCfg::default(),
-                };
-                table_cfg_cache.insert(table.clone(), resolved);
-            }
-            let cfg_entry = table_cfg_cache.get(&table).expect("just inserted");
-            let file_format = cfg_entry.file_format;
-            let declared_cluster_cols = cfg_entry.declared_cluster_cols.clone();
-            let adaptive_sort_override = cfg_entry.adaptive_sort_override;
-            let gin_indexes = cfg_entry.gin_indexes.clone();
-            let row_group_rows = cfg_entry.row_group_rows;
-            let row_block_size = cfg_entry.row_block_size;
-            let promoted_paths = cfg_entry.promoted_paths.clone();
-            let pk_default_cluster_cols = cfg_entry.pk_default_cluster_cols.clone();
-            let bloom_cols = cfg_entry.bloom_cols.clone();
-
-            // Phase 5.14.D2: consult the query-pattern history and decide
-            // which columns to sort the output file by.  Use a block scope so
-            // the !Send RwLockReadGuard is always dropped before any await.
-            let observed: Option<Vec<String>> = {
-                let guard = self
-                    .top_pattern_provider
-                    .read()
-                    .expect("top_pattern_provider lock poisoned");
-                guard.as_ref().and_then(|p| p.top_pattern(project, &table))
+                chunks
             };
 
-            // Record divergence for Phase 5.16.G when applicable.
-            if let Some(ref obs) = observed {
-                if !declared_cluster_cols.is_empty() && obs != &declared_cluster_cols {
-                    let provider_clone: Option<Arc<dyn TopPatternProvider>> = {
-                        let guard = self
-                            .top_pattern_provider
-                            .read()
-                            .expect("top_pattern_provider lock poisoned");
-                        guard.as_ref().cloned()
+            if tail_snapshot.is_empty() {
+                break;
+            }
+
+            let mut drained_per_table: HashMap<TableName, Lsn> = HashMap::new();
+
+            // PHASE 1 (sequential, cheap, no object-store I/O): for each chunk
+            // resolve the per-table write config (cached), pick sort columns, build
+            // the WriteOptions and the backfilled merged batch. This touches the
+            // `!Send` top-pattern-provider guard and the per-call cfg cache, so it
+            // stays on this task. The output is a list of self-contained write
+            // plans that PHASE 2 can hand to concurrent writer tasks.
+            struct ChunkWritePlan {
+                table: TableName,
+                max_lsn: Lsn,
+                merged: RecordBatch,
+                write_opts: basin_storage::WriteOptions,
+                gin_indexes: Vec<basin_catalog::SecondaryIndex>,
+                effective_rg_size: usize,
+                used_adaptive_sort: bool,
+            }
+            let mut plans: Vec<ChunkWritePlan> = Vec::with_capacity(tail_snapshot.len());
+
+            for (table, entries) in tail_snapshot {
+                let max_lsn = entries
+                    .iter()
+                    .map(|(lsn, _)| *lsn)
+                    .max()
+                    .expect("non-empty table tail");
+
+                // Concatenate all batches for this table into one Parquet write.
+                //
+                // #72 follow-up (secondary worker-starvation source, deferred):
+                // this `concat_batches` — and the Vortex/Parquet encode it feeds in
+                // PHASE 2 — is CPU-bound and runs INLINE on the calling runtime
+                // worker. When the backpressure hard-flush (`write_batch_inner`)
+                // drives it, N concurrent COPY connections each pin a worker in
+                // encode while holding this partition's `compact_lock`, which can
+                // starve the cooperative pool. Wrapping the encode in
+                // `tokio::task::spawn_blocking` would move it off the worker, but
+                // PHASE 1 here is interleaved with `!Send` guard reads
+                // (`top_pattern_provider`) and `.await` catalog calls
+                // (`load_table`) INSIDE the `compact_lock`-held critical section
+                // that commits exactly-once, so hoisting just the encode out is not
+                // a localized change — it would restructure the commit path. Left
+                // as a follow-up rather than risk exactly-once; the PRIMARY #72 fix
+                // (read path no longer blocks behind this lock) removes the
+                // observable "SELECT 1 hangs" symptom on its own.
+                let batches: Vec<RecordBatch> = entries.iter().map(|(_, b)| b.clone()).collect();
+                let schema = batches[0].schema();
+                let merged = arrow::compute::concat_batches(&schema, &batches)
+                    .map_err(|e| BasinError::storage(format!("concat batches: {e}")))?;
+
+                // Resolve per-table metadata: on-disk format, cluster columns,
+                // adaptive-sort override, GIN indexes, and row-group size.
+                // A missing catalog row is unusual but non-fatal; fall back to
+                // safe defaults so the whole compaction tick doesn't error out.
+                // #204: `pk_default_cluster_cols` is the single-column PK the file
+                // should be sorted by when the table declares no explicit
+                // clustering — sorting by it makes per-row-group / zone ranges
+                // disjoint so the reader's min/max prune isolates `WHERE pk = $1`.
+                //
+                // PERF: resolved ONCE per table per `compact_one` via
+                // `table_cfg_cache` (see its declaration above) — this metadata is
+                // table-level config that does not change while we drain the tail,
+                // and `load_table` clones the full O(files) snapshot chain. Loading
+                // it per flushed file made a saturated-tail backpressure drain cost
+                // O(files²); the cache makes it one chain clone per table.
+                if !table_cfg_cache.contains_key(&table) {
+                    let resolved = match self.cfg.catalog.load_table(project, &table).await {
+                        Ok(m) => {
+                            let pk_default = m.default_cluster_cols();
+                            // #212: bloom the single-column PK (plus any declared
+                            // sort-by columns, mirroring the engine INSERT path) so
+                            // `pk_point_probe` can rule compacted stripe files in or
+                            // out without opening them. Round-robin striping spreads
+                            // PKs across every stripe, so without per-file blooms a
+                            // point UPDATE's cold pre-image read visits ~all of them.
+                            let mut bloom = m.global_sort_order.clone().unwrap_or_default();
+                            if let [pk] = m.pk_columns.as_slice() {
+                                if !bloom.contains(pk) {
+                                    bloom.push(pk.clone());
+                                }
+                            }
+                            // ADR 0027 Phase 4: bloom every promoted shadow column
+                            // too (the compactor backfills them into the merged
+                            // batch below), so equality on `__promoted$col$key` —
+                            // the rewritten `payload->>'k' = 'literal'` lookup —
+                            // can rule freshly-compacted files in or out without
+                            // opening them.
+                            for p in &m.promoted_jsonb_paths {
+                                let s = p.shadow_col_name();
+                                if !bloom.contains(&s) {
+                                    bloom.push(s);
+                                }
+                            }
+                            ResolvedTableCompactCfg {
+                                file_format: shard_map_file_format(m.file_format),
+                                declared_cluster_cols: m.cluster_columns,
+                                adaptive_sort_override: m.adaptive_sort_override.unwrap_or(false),
+                                gin_indexes: m.indexes.clone(),
+                                row_group_rows: m.row_group_rows,
+                                row_block_size: m.row_block_size,
+                                promoted_paths: m.promoted_jsonb_paths,
+                                pk_default_cluster_cols: pk_default,
+                                bloom_cols: bloom,
+                            }
+                        }
+                        Err(_) => ResolvedTableCompactCfg::default(),
                     };
-                    if let Some(p) = provider_clone {
-                        p.record_cluster_delta(project, &table, obs, &declared_cluster_cols);
+                    table_cfg_cache.insert(table.clone(), resolved);
+                }
+                let cfg_entry = table_cfg_cache.get(&table).expect("just inserted");
+                let file_format = cfg_entry.file_format;
+                let declared_cluster_cols = cfg_entry.declared_cluster_cols.clone();
+                let adaptive_sort_override = cfg_entry.adaptive_sort_override;
+                let gin_indexes = cfg_entry.gin_indexes.clone();
+                let row_group_rows = cfg_entry.row_group_rows;
+                let row_block_size = cfg_entry.row_block_size;
+                let promoted_paths = cfg_entry.promoted_paths.clone();
+                let pk_default_cluster_cols = cfg_entry.pk_default_cluster_cols.clone();
+                let bloom_cols = cfg_entry.bloom_cols.clone();
+
+                // Phase 5.14.D2: consult the query-pattern history and decide
+                // which columns to sort the output file by.  Use a block scope so
+                // the !Send RwLockReadGuard is always dropped before any await.
+                let observed: Option<Vec<String>> = {
+                    let guard = self
+                        .top_pattern_provider
+                        .read()
+                        .expect("top_pattern_provider lock poisoned");
+                    guard.as_ref().and_then(|p| p.top_pattern(project, &table))
+                };
+
+                // Record divergence for Phase 5.16.G when applicable.
+                if let Some(ref obs) = observed {
+                    if !declared_cluster_cols.is_empty() && obs != &declared_cluster_cols {
+                        let provider_clone: Option<Arc<dyn TopPatternProvider>> = {
+                            let guard = self
+                                .top_pattern_provider
+                                .read()
+                                .expect("top_pattern_provider lock poisoned");
+                            guard.as_ref().cloned()
+                        };
+                        if let Some(p) = provider_clone {
+                            p.record_cluster_delta(project, &table, obs, &declared_cluster_cols);
+                        }
                     }
                 }
-            }
 
-            let (sort_cols, used_adaptive_sort): (Vec<String>, bool) = match (
-                declared_cluster_cols.is_empty(),
-                observed.as_ref(),
-                adaptive_sort_override,
-            ) {
-                (true, Some(obs), _) => (obs.clone(), true),
-                (false, Some(obs), true) => (obs.clone(), true),
-                (false, None, true) => (declared_cluster_cols, false),
-                (false, _, false) => (declared_cluster_cols, false),
-                // #204: no declared clustering and no observed query pattern —
-                // fall back to the single-column PK (empty when the table has
-                // no prunable single-column PK) so the flushed file is
-                // PK-sorted and its zone / row-group ranges are disjoint.
-                (true, None, _) => (pk_default_cluster_cols, false),
-            };
+                let (sort_cols, used_adaptive_sort): (Vec<String>, bool) = match (
+                    declared_cluster_cols.is_empty(),
+                    observed.as_ref(),
+                    adaptive_sort_override,
+                ) {
+                    (true, Some(obs), _) => (obs.clone(), true),
+                    (false, Some(obs), true) => (obs.clone(), true),
+                    (false, None, true) => (declared_cluster_cols, false),
+                    (false, _, false) => (declared_cluster_cols, false),
+                    // #204: no declared clustering and no observed query pattern —
+                    // fall back to the single-column PK (empty when the table has
+                    // no prunable single-column PK) so the flushed file is
+                    // PK-sorted and its zone / row-group ranges are disjoint.
+                    (true, None, _) => (pk_default_cluster_cols, false),
+                };
 
-            let write_opts = basin_storage::WriteOptions {
-                file_format,
-                cluster_columns: sort_cols,
-                // Honour the table's row-group size (set via
-                // `WITH (basin.row_block_size = N)` at CREATE TABLE time or
-                // via `SET row_group_rows`).  Without this the compactor
-                // always writes at the default 65 536-row cap, preventing
-                // multi-row-group layouts even when the table was configured
-                // with a smaller block size.
-                row_block_size,
-                max_row_group_size: row_group_rows,
-                bloom_columns: bloom_cols,
-                // Default `Best`; `BASIN_SHARD_COMPACTION_FAST_ENCODE=1` opts
-                // the ingest hot path into the cheaper `Fast` cascade. No-op
-                // for Parquet tables (their ZSTD-1 path ignores this).
-                encoding_mode: compaction_encoding,
-                ..Default::default()
-            };
-            // ADR 0027 Phase 4 backfill: extend the merged batch with shadow
-            // columns for any promoted JSONB paths, so rows written BEFORE the
-            // path was promoted also carry the shadow value in the compacted
-            // file (otherwise they'd read NULL via DataFusion's missing-column
-            // fill). No-op when the table has no promoted paths.
-            let merged = backfill_promoted_columns(merged, &promoted_paths)?;
-            // The effective row-group size mirrors the writer's priority:
-            // row_block_size (WITH clause) > row_group_rows (ALTER TABLE) > default.
-            let effective_rg_size = row_block_size
-                .map(|v| v as usize)
-                .or(row_group_rows)
-                .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE);
-            plans.push(ChunkWritePlan {
-                table,
-                max_lsn,
-                merged,
-                write_opts,
-                gin_indexes,
-                effective_rg_size,
-                used_adaptive_sort,
-            });
-        }
-
-        // PHASE 2a (CONCURRENT, latency-bound): write every chunk's data file
-        // to the object store at once, bounded by `flush_concurrency`. This is
-        // the change that lets compaction keep pace with ingest: a single PUT
-        // is RTT-bound, so serial writes capped compaction throughput below
-        // ingest and let the tail fill; issuing `flush_concurrency` PUTs at
-        // once makes compaction throughput scale with parallel PUT BANDWIDTH.
-        // The storage layer's per-project permit pool further bounds the real
-        // in-flight PUT count, so this never floods the store. Each task only
-        // writes the file (no catalog mutation), so the writes are independent
-        // and cannot conflict.
-        let written: Vec<(usize, basin_storage::DataFile)> = {
-            use futures::stream::{FuturesUnordered, StreamExt as _};
-            let mut futs = FuturesUnordered::new();
-            for (idx, plan) in plans.iter().enumerate() {
-                let storage = self.cfg.storage.clone();
-                let table = plan.table.clone();
-                let merged = plan.merged.clone();
-                let write_opts = plan.write_opts.clone();
-                let partition = partition.clone();
-                let project = *project;
-                futs.push(async move {
-                    let res = storage
-                        .write_batch_with_options(&project, &table, &partition, &merged, &write_opts)
-                        .await;
-                    (idx, res)
+                let write_opts = basin_storage::WriteOptions {
+                    file_format,
+                    cluster_columns: sort_cols,
+                    // Honour the table's row-group size (set via
+                    // `WITH (basin.row_block_size = N)` at CREATE TABLE time or
+                    // via `SET row_group_rows`).  Without this the compactor
+                    // always writes at the default 65 536-row cap, preventing
+                    // multi-row-group layouts even when the table was configured
+                    // with a smaller block size.
+                    row_block_size,
+                    max_row_group_size: row_group_rows,
+                    bloom_columns: bloom_cols,
+                    // Default `Best`; `BASIN_SHARD_COMPACTION_FAST_ENCODE=1` opts
+                    // the ingest hot path into the cheaper `Fast` cascade. No-op
+                    // for Parquet tables (their ZSTD-1 path ignores this).
+                    encoding_mode: compaction_encoding,
+                    ..Default::default()
+                };
+                // ADR 0027 Phase 4 backfill: extend the merged batch with shadow
+                // columns for any promoted JSONB paths, so rows written BEFORE the
+                // path was promoted also carry the shadow value in the compacted
+                // file (otherwise they'd read NULL via DataFusion's missing-column
+                // fill). No-op when the table has no promoted paths.
+                let merged = backfill_promoted_columns(merged, &promoted_paths)?;
+                // The effective row-group size mirrors the writer's priority:
+                // row_block_size (WITH clause) > row_group_rows (ALTER TABLE) > default.
+                let effective_rg_size = row_block_size
+                    .map(|v| v as usize)
+                    .or(row_group_rows)
+                    .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE);
+                plans.push(ChunkWritePlan {
+                    table,
+                    max_lsn,
+                    merged,
+                    write_opts,
+                    gin_indexes,
+                    effective_rg_size,
+                    used_adaptive_sort,
                 });
             }
-            // The per-wave snapshot already caps `plans.len()` at
-            // `flush_concurrency`, so all these futures in flight at once is
-            // exactly the intended bound; the storage layer's per-project
-            // permit pool is the final guard on real in-flight PUTs. We fail
-            // the whole wave on the first write error (the data is still in the
-            // tail + WAL and no catalog commit has happened yet, so the next
-            // tick retries — nothing is dropped or double-committed).
-            let mut out: Vec<(usize, basin_storage::DataFile)> = Vec::with_capacity(plans.len());
-            while let Some((idx, res)) = futs.next().await {
-                out.push((idx, res?));
+
+            // PHASE 2a (CONCURRENT, latency-bound): write every chunk's data file
+            // to the object store at once, bounded by `flush_concurrency`. This is
+            // the change that lets compaction keep pace with ingest: a single PUT
+            // is RTT-bound, so serial writes capped compaction throughput below
+            // ingest and let the tail fill; issuing `flush_concurrency` PUTs at
+            // once makes compaction throughput scale with parallel PUT BANDWIDTH.
+            // The storage layer's per-project permit pool further bounds the real
+            // in-flight PUT count, so this never floods the store. Each task only
+            // writes the file (no catalog mutation), so the writes are independent
+            // and cannot conflict.
+            let written: Vec<(usize, basin_storage::DataFile)> = {
+                use futures::stream::{FuturesUnordered, StreamExt as _};
+                let mut futs = FuturesUnordered::new();
+                for (idx, plan) in plans.iter().enumerate() {
+                    let storage = self.cfg.storage.clone();
+                    let table = plan.table.clone();
+                    let merged = plan.merged.clone();
+                    let write_opts = plan.write_opts.clone();
+                    let partition = partition.clone();
+                    let project = *project;
+                    futs.push(async move {
+                        let res = storage
+                            .write_batch_with_options(
+                                &project,
+                                &table,
+                                &partition,
+                                &merged,
+                                &write_opts,
+                            )
+                            .await;
+                        (idx, res)
+                    });
+                }
+                // The per-wave snapshot already caps `plans.len()` at
+                // `flush_concurrency`, so all these futures in flight at once is
+                // exactly the intended bound; the storage layer's per-project
+                // permit pool is the final guard on real in-flight PUTs. We fail
+                // the whole wave on the first write error (the data is still in the
+                // tail + WAL and no catalog commit has happened yet, so the next
+                // tick retries — nothing is dropped or double-committed).
+                let mut out: Vec<(usize, basin_storage::DataFile)> =
+                    Vec::with_capacity(plans.len());
+                while let Some((idx, res)) = futs.next().await {
+                    out.push((idx, res?));
+                }
+                out
+            };
+            // Re-pair writes with their plans, sorted by plan index so the
+            // sequential commit below runs in deterministic (ascending-LSN) order.
+            let mut written_by_idx: Vec<Option<basin_storage::DataFile>> =
+                (0..plans.len()).map(|_| None).collect();
+            for (idx, df) in written {
+                written_by_idx[idx] = Some(df);
             }
-            out
-        };
-        // Re-pair writes with their plans, sorted by plan index so the
-        // sequential commit below runs in deterministic (ascending-LSN) order.
-        let mut written_by_idx: Vec<Option<basin_storage::DataFile>> =
-            (0..plans.len()).map(|_| None).collect();
-        for (idx, df) in written {
-            written_by_idx[idx] = Some(df);
-        }
 
-        // PHASE 2b (SEQUENTIAL): commit each written file to the catalog and
-        // build its sidecar indexes. Commits MUST be serial per table — the
-        // catalog append is a CAS against the current snapshot, so two
-        // concurrent appends would conflict-loop; running them in order keeps
-        // the fast path conflict-free and avoids any double-commit. The
-        // expensive (RTT-bound) work already happened concurrently in 2a; the
-        // commit is an in-process catalog CAS.
-        // Take every written file for this wave up front (keep the DataFiles
-        // alive so the per-file sidecar indexing below can reference their
-        // paths), then commit them grouped by table in ONE append per table.
-        let wave_data_files: Vec<basin_storage::DataFile> = (0..plans.len())
-            .map(|i| {
-                written_by_idx[i]
-                    .take()
-                    .expect("every plan has a corresponding written file")
-            })
-            .collect();
-
-        // Group plan indices by table (a wave's chunks are usually one table,
-        // but the snapshot can span several within the partition), build the
-        // file refs, and commit each table's whole file set in ONE catalog
-        // append (#39: amortizes the per-commit segment+head PUTs across the
-        // wave instead of 2 PUTs per file). Commit serially per table so the
-        // per-partition CAS stays conflict-free.
-        let mut idx_by_table: HashMap<TableName, Vec<usize>> = HashMap::new();
-        for (idx, plan) in plans.iter().enumerate() {
-            idx_by_table.entry(plan.table.clone()).or_default().push(idx);
-        }
-        for (table, idxs) in &idx_by_table {
-            let files: Vec<DataFileRef> = idxs
-                .iter()
-                .map(|&i| {
-                    let df = &wave_data_files[i];
-                    DataFileRef {
-                        path: df.path.as_ref().to_string(),
-                        size_bytes: df.size_bytes,
-                        row_count: df.row_count,
-                        column_stats: df.column_stats.clone(),
-                        bloom_filters: df.bloom_filters.clone(),
-                        hll_sketches: ::std::collections::BTreeMap::new(),
-                        tdigest_sketches: ::std::collections::BTreeMap::new(),
-                    }
+            // PHASE 2b (SEQUENTIAL): commit each written file to the catalog and
+            // build its sidecar indexes. Commits MUST be serial per table — the
+            // catalog append is a CAS against the current snapshot, so two
+            // concurrent appends would conflict-loop; running them in order keeps
+            // the fast path conflict-free and avoids any double-commit. The
+            // expensive (RTT-bound) work already happened concurrently in 2a; the
+            // commit is an in-process catalog CAS.
+            // Take every written file for this wave up front (keep the DataFiles
+            // alive so the per-file sidecar indexing below can reference their
+            // paths), then commit them grouped by table in ONE append per table.
+            let wave_data_files: Vec<basin_storage::DataFile> = (0..plans.len())
+                .map(|i| {
+                    written_by_idx[i]
+                        .take()
+                        .expect("every plan has a corresponding written file")
                 })
                 .collect();
-            // Representative batch (first plan's) for the create-table-on-first
-            // -commit path; schema is identical across a table's chunks.
-            let wave_rows: u64 = files.iter().map(|f| f.row_count as u64).sum();
-            self.commit_with_retry(project, table, partition, &plans[idxs[0]].merged, files)
-                .await?;
-            // Phase 2 autotune: feed the process-global committed-rows/s signal
-            // (one relaxed atomic add per committed wave — NOT per row). Read
-            // only by the adaptive controller's tick task, which is spawned only
-            // under BASIN_AUTOTUNE; off → this counter is written but never
-            // observed (no-op).
-            basin_common::autotune::record_committed_rows(wave_rows);
-        }
 
-        // Test-only: suspend INSIDE the committed-but-unpruned window (after the
-        // wave's catalog commit, before the tail prune below). A reproduction
-        // can drop this future here — exactly where the read-path bounded
-        // timeout used to cancel — to prove the prune/watermark advance is not
-        // skipped. No-op in production (the cell is always `None`).
-        #[cfg(test)]
-        {
-            let barrier = self
-                .post_commit_barrier
-                .lock()
-                .expect("post_commit_barrier lock poisoned")
-                .clone();
-            if let Some(sem) = barrier {
-                // Acquire one permit, then immediately drop it: the test gates
-                // progress by withholding permits until it is ready to let the
-                // prune proceed. If the future is cancelled while parked here,
-                // the prune never runs — the cancellation-window reproduction.
-                let _ = sem.acquire().await;
+            // Group plan indices by table (a wave's chunks are usually one table,
+            // but the snapshot can span several within the partition), build the
+            // file refs, and commit each table's whole file set in ONE catalog
+            // append (#39: amortizes the per-commit segment+head PUTs across the
+            // wave instead of 2 PUTs per file). Commit serially per table so the
+            // per-partition CAS stays conflict-free.
+            let mut idx_by_table: HashMap<TableName, Vec<usize>> = HashMap::new();
+            for (idx, plan) in plans.iter().enumerate() {
+                idx_by_table
+                    .entry(plan.table.clone())
+                    .or_default()
+                    .push(idx);
             }
-        }
+            for (table, idxs) in &idx_by_table {
+                let files: Vec<DataFileRef> = idxs
+                    .iter()
+                    .map(|&i| {
+                        let df = &wave_data_files[i];
+                        DataFileRef {
+                            path: df.path.as_ref().to_string(),
+                            size_bytes: df.size_bytes,
+                            row_count: df.row_count,
+                            column_stats: df.column_stats.clone(),
+                            bloom_filters: df.bloom_filters.clone(),
+                            hll_sketches: ::std::collections::BTreeMap::new(),
+                            tdigest_sketches: ::std::collections::BTreeMap::new(),
+                        }
+                    })
+                    .collect();
+                // Representative batch (first plan's) for the create-table-on-first
+                // -commit path; schema is identical across a table's chunks.
+                let wave_rows: u64 = files.iter().map(|f| f.row_count as u64).sum();
+                self.commit_with_retry(project, table, partition, &plans[idxs[0]].merged, files)
+                    .await?;
+                // Phase 2 autotune: feed the process-global committed-rows/s signal
+                // (one relaxed atomic add per committed wave — NOT per row). Read
+                // only by the adaptive controller's tick task, which is spawned only
+                // under BASIN_AUTOTUNE; off → this counter is written but never
+                // observed (no-op).
+                basin_common::autotune::record_committed_rows(wave_rows);
+            }
 
-        // Per-file sidecar indexing + drain bookkeeping (after the commits).
-        for (idx, plan) in plans.iter().enumerate() {
-            let table = &plan.table;
-            let merged = &plan.merged;
-            let gin_indexes = &plan.gin_indexes;
-            let effective_rg_size = plan.effective_rg_size;
-            let data_file = &wave_data_files[idx];
-
-            // Re-index the compacted file's JSONB GIN columns into the
-            // row-group bloom registry so the engine's `@>` row-group prune
-            // fires on compacted files. This is the ONLY place GIN row-group
-            // summaries are populated on the shard path (INSERT writes go
-            // directly to WAL+tail). Correctness: the registry is a
-            // conservative superset (bloom false positives are fine;
-            // `jsonb_contains` re-checks every surviving row at read time).
-            reindex_compacted_file_gin(
-                &self.gin_rowgroup_registry,
-                project,
-                table,
-                gin_indexes,
-                effective_rg_size,
-                merged,
-                data_file.path.as_ref().as_ref(),
-            );
-
-            // FIX 2(a) — register the compacted file's single-column B-tree
-            // index values into the secondary-index registry so point queries
-            // on an indexed column can prune to this file.
-            reindex_compacted_file_secondary(
-                &self.secondary_index_registry,
-                project,
-                table,
-                gin_indexes,
-                effective_rg_size,
-                merged,
-                data_file.path.as_ref().as_ref(),
-            );
-
-            // Inv-W5 / W9: build the JSONB posting list for any GIN index on a
-            // JSONB column. Best-effort: a sidecar write failure is logged but
-            // does not abort the commit (queries fall back to bloom/full scan).
-            if let Err(e) = reindex_compacted_file_jsonb_posting(
-                &self.jsonb_posting_registry,
-                self.cfg.storage.clone(),
-                project,
-                table,
-                gin_indexes,
-                effective_rg_size,
-                merged,
-                data_file.path.as_ref(),
-            )
-            .await
+            // Test-only: suspend INSIDE the committed-but-unpruned window (after the
+            // wave's catalog commit, before the tail prune below). A reproduction
+            // can drop this future here — exactly where the read-path bounded
+            // timeout used to cancel — to prove the prune/watermark advance is not
+            // skipped. No-op in production (the cell is always `None`).
+            #[cfg(test)]
             {
-                tracing::warn!(
-                    project = %project,
-                    table = %table,
-                    file = %data_file.path.as_ref(),
-                    error = %e,
-                    "Inv-W5: JSONB posting-list sidecar write failed; @> falls back to bloom prune"
-                );
-            }
-
-            // PG-Wave-α: write `.rtree` sidecars for any GIST index on a POINT
-            // column. Best-effort: a sidecar write failure is logged but does
-            // not abort the compaction commit (the data is already catalogued).
-            if let Err(e) = reindex_compacted_file_rtree(
-                self.cfg.storage.clone(),
-                project,
-                table,
-                gin_indexes,
-                effective_rg_size as u32,
-                merged,
-                data_file.path.as_ref(),
-            )
-            .await
-            {
-                tracing::warn!(
-                    project = %project,
-                    table = %table,
-                    file = %data_file.path.as_ref(),
-                    error = %e,
-                    "PG-Wave-α R-tree sidecar write failed; queries fall back to full scan"
-                );
-            }
-
-            if plan.used_adaptive_sort {
-                any_adaptive_sort = true;
-            }
-
-            let max_lsn = plan.max_lsn;
-            let entry = drained_per_table.entry(table.clone()).or_insert(max_lsn);
-            if *entry < max_lsn {
-                *entry = max_lsn;
-            }
-            max_lsn_overall = Some(match max_lsn_overall {
-                Some(prev) if prev >= max_lsn => prev,
-                _ => max_lsn,
-            });
-        }
-
-        // Apply the drain: clear only the (lsn, batch) entries we actually
-        // committed in THIS pass. Entries beyond the per-pass row budget (and
-        // new writes that landed during compaction, with higher LSNs) stay in
-        // the tail and are picked up by the next loop iteration / tick.
-        //
-        // While we hold the write lock, also compute the partition-wide
-        // "committed-through" floor for the PER-WAVE watermark persist below:
-        // the largest LSN strictly below which NO table has any remaining
-        // (uncommitted) tail entry. Every entry at or below it has been
-        // committed to the catalog this drain, so it is a safe replay floor —
-        // advancing the watermark to it cannot strand (lose) an uncommitted
-        // lower-LSN entry of a table that this wave didn't snapshot.
-        let wave_safe_floor: Option<Lsn> = {
-            let mut guard = state.write().await;
-            for (table, max_lsn) in &drained_per_table {
-                if let Some(v) = guard.tail.get_mut(table) {
-                    v.retain(|(lsn, _)| *lsn > *max_lsn);
-                }
-                if guard.last_compacted_lsn < *max_lsn {
-                    guard.last_compacted_lsn = *max_lsn;
+                let barrier = self
+                    .post_commit_barrier
+                    .lock()
+                    .expect("post_commit_barrier lock poisoned")
+                    .clone();
+                if let Some(sem) = barrier {
+                    // Acquire one permit, then immediately drop it: the test gates
+                    // progress by withholding permits until it is ready to let the
+                    // prune proceed. If the future is cancelled while parked here,
+                    // the prune never runs — the cancellation-window reproduction.
+                    let _ = sem.acquire().await;
                 }
             }
-            // Lowest LSN still sitting in ANY table's tail after this drain.
-            let min_remaining = guard
-                .tail
-                .values()
-                .flat_map(|v| v.iter().map(|(lsn, _)| *lsn))
-                .min();
-            match min_remaining {
-                // Some entries remain: only LSNs strictly below the lowest
-                // remaining one are fully committed -> floor = min_remaining-1.
-                Some(min) if min > Lsn::ZERO => Some(Lsn(min.0 - 1)),
-                Some(_) => None,
-                // Tail fully drained: everything committed so far is safe; use
-                // the highest LSN we committed across the whole drain.
-                None => max_lsn_overall,
-            }
-        };
-        // PER-WAVE durable watermark (duplicate-row crash-window fix). The
-        // catalog commits above are visible now; if a LATER wave's write/commit
-        // fails (e.g. a wedged data PUT) the whole `compact_one_impl` aborts via
-        // `?` BEFORE the end-of-drain watermark persist below — leaving THIS
-        // wave's already-committed rows uncovered by the persisted watermark. A
-        // restart would then replay them from the stale floor and re-commit a
-        // SECOND file for rows already in the cold tier (the observed
-        // count(*) > count(DISTINCT id) incident). Persisting the safe floor
-        // after every wave closes that window: replay always starts strictly
-        // above the highest fully-committed LSN. Monotonic (GREATEST upsert) and
-        // best-effort — a failure here is non-fatal (the end-of-drain persist
-        // and the next tick both retry); we deliberately do NOT truncate the WAL
-        // here (truncate stays at the end, after the full drain).
-        if let Some(floor) = wave_safe_floor {
-            if let Err(e) = self
-                .cfg
-                .catalog
-                .set_compaction_watermark(project, partition.as_str(), floor.0)
+
+            // Per-file sidecar indexing + drain bookkeeping (after the commits).
+            for (idx, plan) in plans.iter().enumerate() {
+                let table = &plan.table;
+                let merged = &plan.merged;
+                let gin_indexes = &plan.gin_indexes;
+                let effective_rg_size = plan.effective_rg_size;
+                let data_file = &wave_data_files[idx];
+
+                // Re-index the compacted file's JSONB GIN columns into the
+                // row-group bloom registry so the engine's `@>` row-group prune
+                // fires on compacted files. This is the ONLY place GIN row-group
+                // summaries are populated on the shard path (INSERT writes go
+                // directly to WAL+tail). Correctness: the registry is a
+                // conservative superset (bloom false positives are fine;
+                // `jsonb_contains` re-checks every surviving row at read time).
+                reindex_compacted_file_gin(
+                    &self.gin_rowgroup_registry,
+                    project,
+                    table,
+                    gin_indexes,
+                    effective_rg_size,
+                    merged,
+                    data_file.path.as_ref().as_ref(),
+                );
+
+                // FIX 2(a) — register the compacted file's single-column B-tree
+                // index values into the secondary-index registry so point queries
+                // on an indexed column can prune to this file.
+                reindex_compacted_file_secondary(
+                    &self.secondary_index_registry,
+                    project,
+                    table,
+                    gin_indexes,
+                    effective_rg_size,
+                    merged,
+                    data_file.path.as_ref().as_ref(),
+                );
+
+                // Inv-W5 / W9: build the JSONB posting list for any GIN index on a
+                // JSONB column. Best-effort: a sidecar write failure is logged but
+                // does not abort the commit (queries fall back to bloom/full scan).
+                if let Err(e) = reindex_compacted_file_jsonb_posting(
+                    &self.jsonb_posting_registry,
+                    self.cfg.storage.clone(),
+                    project,
+                    table,
+                    gin_indexes,
+                    effective_rg_size,
+                    merged,
+                    data_file.path.as_ref(),
+                )
                 .await
-            {
-                warn!(
-                    %project,
-                    %partition,
-                    floor = floor.0,
-                    error = %e,
-                    "per-wave compaction watermark persist failed; relying on \
-                     end-of-drain persist / next tick (replay stays duplicate-safe \
-                     via the existing floor)",
-                );
+                {
+                    tracing::warn!(
+                        project = %project,
+                        table = %table,
+                        file = %data_file.path.as_ref(),
+                        error = %e,
+                        "Inv-W5: JSONB posting-list sidecar write failed; @> falls back to bloom prune"
+                    );
+                }
+
+                // PG-Wave-α: write `.rtree` sidecars for any GIST index on a POINT
+                // column. Best-effort: a sidecar write failure is logged but does
+                // not abort the compaction commit (the data is already catalogued).
+                if let Err(e) = reindex_compacted_file_rtree(
+                    self.cfg.storage.clone(),
+                    project,
+                    table,
+                    gin_indexes,
+                    effective_rg_size as u32,
+                    merged,
+                    data_file.path.as_ref(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        project = %project,
+                        table = %table,
+                        file = %data_file.path.as_ref(),
+                        error = %e,
+                        "PG-Wave-α R-tree sidecar write failed; queries fall back to full scan"
+                    );
+                }
+
+                if plan.used_adaptive_sort {
+                    any_adaptive_sort = true;
+                }
+
+                let max_lsn = plan.max_lsn;
+                let entry = drained_per_table.entry(table.clone()).or_insert(max_lsn);
+                if *entry < max_lsn {
+                    *entry = max_lsn;
+                }
+                max_lsn_overall = Some(match max_lsn_overall {
+                    Some(prev) if prev >= max_lsn => prev,
+                    _ => max_lsn,
+                });
             }
-        }
-        // Loop back to drain the next bounded prefix. The snapshot at the top
-        // returns empty once the tail is fully drained, breaking the loop.
+
+            // Apply the drain: clear only the (lsn, batch) entries we actually
+            // committed in THIS pass. Entries beyond the per-pass row budget (and
+            // new writes that landed during compaction, with higher LSNs) stay in
+            // the tail and are picked up by the next loop iteration / tick.
+            //
+            // While we hold the write lock, also compute the partition-wide
+            // "committed-through" floor for the PER-WAVE watermark persist below:
+            // the largest LSN strictly below which NO table has any remaining
+            // (uncommitted) tail entry. Every entry at or below it has been
+            // committed to the catalog this drain, so it is a safe replay floor —
+            // advancing the watermark to it cannot strand (lose) an uncommitted
+            // lower-LSN entry of a table that this wave didn't snapshot.
+            let wave_safe_floor: Option<Lsn> = {
+                let mut guard = state.write().await;
+                for (table, max_lsn) in &drained_per_table {
+                    if let Some(v) = guard.tail.get_mut(table) {
+                        v.retain(|(lsn, _)| *lsn > *max_lsn);
+                    }
+                    if guard.last_compacted_lsn < *max_lsn {
+                        guard.last_compacted_lsn = *max_lsn;
+                    }
+                }
+                // Lowest LSN still sitting in ANY table's tail after this drain.
+                let min_remaining = guard
+                    .tail
+                    .values()
+                    .flat_map(|v| v.iter().map(|(lsn, _)| *lsn))
+                    .min();
+                match min_remaining {
+                    // Some entries remain: only LSNs strictly below the lowest
+                    // remaining one are fully committed -> floor = min_remaining-1.
+                    Some(min) if min > Lsn::ZERO => Some(Lsn(min.0 - 1)),
+                    Some(_) => None,
+                    // Tail fully drained: everything committed so far is safe; use
+                    // the highest LSN we committed across the whole drain.
+                    None => max_lsn_overall,
+                }
+            };
+            // PER-WAVE durable watermark (duplicate-row crash-window fix). The
+            // catalog commits above are visible now; if a LATER wave's write/commit
+            // fails (e.g. a wedged data PUT) the whole `compact_one_impl` aborts via
+            // `?` BEFORE the end-of-drain watermark persist below — leaving THIS
+            // wave's already-committed rows uncovered by the persisted watermark. A
+            // restart would then replay them from the stale floor and re-commit a
+            // SECOND file for rows already in the cold tier (the observed
+            // count(*) > count(DISTINCT id) incident). Persisting the safe floor
+            // after every wave closes that window: replay always starts strictly
+            // above the highest fully-committed LSN. Monotonic (GREATEST upsert) and
+            // best-effort — a failure here is non-fatal (the end-of-drain persist
+            // and the next tick both retry); we deliberately do NOT truncate the WAL
+            // here (truncate stays at the end, after the full drain).
+            if let Some(floor) = wave_safe_floor {
+                if let Err(e) = self
+                    .cfg
+                    .catalog
+                    .set_compaction_watermark(project, partition.as_str(), floor.0)
+                    .await
+                {
+                    warn!(
+                        %project,
+                        %partition,
+                        floor = floor.0,
+                        error = %e,
+                        "per-wave compaction watermark persist failed; relying on \
+                         end-of-drain persist / next tick (replay stays duplicate-safe \
+                         via the existing floor)",
+                    );
+                }
+            }
+            // Loop back to drain the next bounded prefix. The snapshot at the top
+            // returns empty once the tail is fully drained, breaking the loop.
         }
 
         // DURABILITY (compaction watermark — duplicate-row crash-window fix).
@@ -3689,8 +3660,7 @@ impl InProcessShard {
                         // check below sees our own removed inputs gone, calls it
                         // a peer's REPLACE, and abandons the merge — deleting
                         // outputs the catalog lists as live.
-                        if !added.is_empty() && added.iter().all(|f| live_now.contains(&f.path))
-                        {
+                        if !added.is_empty() && added.iter().all(|f| live_now.contains(&f.path)) {
                             break 'commit Ok(true);
                         }
                         if removed.iter().all(|p| live_now.contains(p)) {
@@ -3980,8 +3950,7 @@ impl InProcessShard {
                             Some(s) => Some(s.acquire_owned().await.expect("fairshare permit")),
                             None => None,
                         };
-                        let _permit =
-                            permits.acquire_owned().await.expect("merge semaphore");
+                        let _permit = permits.acquire_owned().await.expect("merge semaphore");
                         // #78: run merge under BACKGROUND I/O so its data-file
                         // reads are demoted below live ingest writes on the
                         // shared object-store scheduler (no priority inversion).
@@ -4034,8 +4003,8 @@ impl InProcessShard {
             COMPACT_MAX_FILES_PER_PARTITION_DEFAULT,
         )
         .max(2) as usize;
-        let batch_cap = env_u64("BASIN_COMPACT_MERGE_BATCH", COMPACT_MERGE_BATCH_DEFAULT).max(2)
-            as usize;
+        let batch_cap =
+            env_u64("BASIN_COMPACT_MERGE_BATCH", COMPACT_MERGE_BATCH_DEFAULT).max(2) as usize;
         let max_bytes = env_u64(
             "BASIN_COMPACT_MERGE_MAX_BYTES",
             COMPACT_MERGE_MAX_BYTES_DEFAULT,
@@ -4232,9 +4201,7 @@ impl InProcessShard {
 
         // Aim for ~target bytes per output (estimated from input bytes), and
         // ALWAYS strictly fewer outputs than inputs so the count drops.
-        let n_out = (input_bytes
-            .div_ceil(STRIPE_MERGE_TARGET_FILE_BYTES)
-            .max(1) as usize)
+        let n_out = (input_bytes.div_ceil(STRIPE_MERGE_TARGET_FILE_BYTES).max(1) as usize)
             .min(inputs.len() - 1)
             .max(1);
         let rows_per = total_rows.div_ceil(n_out);
@@ -4384,8 +4351,7 @@ impl InProcessShard {
                         // which would otherwise see our own inputs gone, read it
                         // as a peer's REPLACE, and abandon a merge that in fact
                         // succeeded — deleting live outputs.
-                        if !added.is_empty() && added.iter().all(|f| live_now.contains(&f.path))
-                        {
+                        if !added.is_empty() && added.iter().all(|f| live_now.contains(&f.path)) {
                             break 'commit true;
                         }
                         if removed.iter().all(|p| live_now.contains(p)) {
@@ -4685,8 +4651,7 @@ impl ShardImpl for InProcessShard {
             // the stripe tick (fallback, `own_file_merge_tick == false`). Both
             // sweeps still serialise on `stripe_merge_lock`, so the decoupled tick
             // adds cadence, not new concurrency.
-            let own_file_merge_tick =
-                stripe_merge_enabled && !me.cfg.file_merge_interval.is_zero();
+            let own_file_merge_tick = stripe_merge_enabled && !me.cfg.file_merge_interval.is_zero();
             let mut file_merge_tick = tokio::time::interval(if own_file_merge_tick {
                 me.cfg.file_merge_interval
             } else {
@@ -4741,13 +4706,12 @@ impl ShardImpl for InProcessShard {
             let autotune_enabled = autotune_state.is_some();
             // Placeholder cadence when disabled keeps `interval` away from a
             // zero duration and the arm is `if autotune_enabled`-guarded anyway.
-            let mut autotune_tick = tokio::time::interval(std::time::Duration::from_secs(
-                if autotune_enabled {
+            let mut autotune_tick =
+                tokio::time::interval(std::time::Duration::from_secs(if autotune_enabled {
                     basin_common::autotune::tick_interval_secs()
                 } else {
                     3600
-                },
-            ));
+                }));
             // First firing of `interval` is immediate; skip it so the loops
             // align with their configured cadence.
             evict_tick.tick().await;
@@ -5678,10 +5642,7 @@ impl InProcessProjectHandle {
             let mut own = 0usize;
             let mut holders = 0usize;
             for (t, batches) in guard.tail.iter() {
-                let bytes: usize = batches
-                    .iter()
-                    .map(|(_, b)| b.get_array_memory_size())
-                    .sum();
+                let bytes: usize = batches.iter().map(|(_, b)| b.get_array_memory_size()).sum();
                 if bytes > 0 {
                     holders += 1;
                 }
@@ -6205,10 +6166,7 @@ fn parse_nextval_sequence(default_expr: &str) -> Option<String> {
     let inner = after_paren.split(')').next()?.trim();
     // Strip an optional `::regclass` cast, then surrounding quotes.
     let inner = inner.split("::").next().unwrap_or(inner).trim();
-    let unquoted = inner
-        .trim_matches('\'')
-        .trim_matches('"')
-        .trim();
+    let unquoted = inner.trim_matches('\'').trim_matches('"').trim();
     if unquoted.is_empty() {
         None
     } else {
@@ -6400,9 +6358,7 @@ fn evaluate_predicate(
     // O(log k) membership; NULLs never match.
     if let Predicate::InInt64(_, keys) = predicate {
         let arr = col.as_primitive_opt::<Int64Type>().ok_or_else(|| {
-            BasinError::storage(format!(
-                "InInt64 predicate on non-Int64 column {col_name}"
-            ))
+            BasinError::storage(format!("InInt64 predicate on non-Int64 column {col_name}"))
         })?;
         let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
         for i in 0..arr.len() {
@@ -6431,10 +6387,19 @@ fn evaluate_predicate(
         (Predicate::Eq(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, ==),
         (Predicate::Gt(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, >),
         (Predicate::Lt(_, _), ScalarValue::Float64(v)) => cmp_primitive!(Float64Type, *v, <),
-        (Predicate::StartsWith { case_insensitive, .. }, ScalarValue::Utf8(v)) => {
+        (
+            Predicate::StartsWith {
+                case_insensitive, ..
+            },
+            ScalarValue::Utf8(v),
+        ) => {
             let arr = col.as_string::<i32>();
             let ci = *case_insensitive;
-            let needle_lc = if ci { v.to_ascii_lowercase() } else { String::new() };
+            let needle_lc = if ci {
+                v.to_ascii_lowercase()
+            } else {
+                String::new()
+            };
             let mut b = arrow_array::builder::BooleanBuilder::with_capacity(arr.len());
             for i in 0..arr.len() {
                 if arr.is_null(i) {
@@ -6665,14 +6630,7 @@ fn reindex_compacted_file_gin(
         }
         let col_name = &idx.columns[0];
         basin_storage::index::gin_rowgroup::index_batch_jsonb_gin(
-            &registry,
-            project,
-            table,
-            col_name,
-            opclass,
-            batch,
-            file_path,
-            rg_size,
+            &registry, project, table, col_name, opclass, batch, file_path, rg_size,
         );
     }
 }
@@ -6769,12 +6727,8 @@ fn reindex_compacted_file_secondary(
         extract_typed!(Float64Array, |v: f64| format!("{v:?}"));
         extract_typed!(StringArray, |v: &str| v.to_string());
         extract_typed!(LargeStringArray, |v: &str| v.to_string());
-        extract_typed!(BooleanArray, |v: bool| if v {
-            "t"
-        } else {
-            "f"
-        }
-        .to_string());
+        extract_typed!(BooleanArray, |v: bool| if v { "t" } else { "f" }
+            .to_string());
 
         if !entries.is_empty() {
             registry.insert_batch_locations(project, table, col_name, entries);
@@ -6839,15 +6793,10 @@ async fn reindex_compacted_file_rtree(
             // NULL.
             continue;
         }
-        let bytes = basin_storage::index::rtree::serialize_rtree(&rtree).map_err(|e| {
-            basin_common::BasinError::storage(format!("R-tree serialize: {e}"))
-        })?;
+        let bytes = basin_storage::index::rtree::serialize_rtree(&rtree)
+            .map_err(|e| basin_common::BasinError::storage(format!("R-tree serialize: {e}")))?;
         let Some(sidecar) = basin_storage::index::rtree::rtree_segment_key_for_data_file(
-            None,
-            project,
-            table,
-            col_name,
-            file_path,
+            None, project, table, col_name, file_path,
         ) else {
             tracing::debug!(
                 project = %project,
@@ -6865,9 +6814,7 @@ async fn reindex_compacted_file_rtree(
             )
             .await
             .map_err(|e| {
-                basin_common::BasinError::storage(format!(
-                    "R-tree sidecar put {sidecar}: {e}"
-                ))
+                basin_common::BasinError::storage(format!("R-tree sidecar put {sidecar}: {e}"))
             })?;
     }
     Ok(())
@@ -7044,8 +6991,14 @@ mod tests {
 
     #[test]
     fn decode_le_int_max_widths() {
-        assert_eq!(decode_le_int_max(&Some(7i64.to_le_bytes().to_vec())), Some(7));
-        assert_eq!(decode_le_int_max(&Some(9i32.to_le_bytes().to_vec())), Some(9));
+        assert_eq!(
+            decode_le_int_max(&Some(7i64.to_le_bytes().to_vec())),
+            Some(7)
+        );
+        assert_eq!(
+            decode_le_int_max(&Some(9i32.to_le_bytes().to_vec())),
+            Some(9)
+        );
         assert_eq!(decode_le_int_max(&None), None);
         assert_eq!(decode_le_int_max(&Some(vec![1, 2, 3])), None); // odd width → skip
     }
@@ -7356,9 +7309,7 @@ mod tests {
         let storage_dir = TempDir::new().unwrap();
         let wal_dir = TempDir::new().unwrap();
         let storage = Storage::new(StorageConfig {
-            object_store: Arc::new(
-                LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
-            ),
+            object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
             root_prefix: None,
             disk_cache: None,
             page_cache: None,
@@ -7368,9 +7319,7 @@ mod tests {
         // synchronous (group-commit) path, never from a racing 50 ms tick.
         let wal: Arc<dyn Wal> = Arc::new(
             LocalWal::open(WalConfig {
-                object_store: Arc::new(
-                    LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap(),
-                ),
+                object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
                 root_prefix: None,
                 flush_interval: Duration::from_secs(3600),
                 flush_max_bytes: u64::MAX,
@@ -7514,10 +7463,7 @@ mod tests {
 
         // Tail fully drained.
         let guard = state.read().await;
-        assert!(
-            guard.tail_is_empty(),
-            "tail must be empty after the drain",
-        );
+        assert!(guard.tail_is_empty(), "tail must be empty after the drain",);
     }
 
     #[tokio::test]
@@ -7844,7 +7790,11 @@ mod tests {
         assert_eq!(file_rows, total, "every row must land exactly once");
 
         let read = handle.read(&table, ReadOptions::default()).await.unwrap();
-        assert_eq!(rows_in(&read), total, "all rows readable after multi-pass drain");
+        assert_eq!(
+            rows_in(&read),
+            total,
+            "all rows readable after multi-pass drain"
+        );
     }
 
     /// Regression for the concurrent-compaction over-count (#95).
@@ -7921,7 +7871,10 @@ mod tests {
         h2.write_batch(&table_a, batch(10, 5, "a-")).await.unwrap();
         h3.write_batch(&table_b, batch(0, 7, "b-")).await.unwrap();
 
-        shard.flush_tables_for_read(&project, &table_a).await.unwrap();
+        shard
+            .flush_tables_for_read(&project, &table_a)
+            .await
+            .unwrap();
 
         // A: fully committed (no pending tail; every row in cold files).
         assert!(
@@ -7933,7 +7886,10 @@ mod tests {
             .await
             .unwrap();
         let rows_a: usize = files_a.iter().map(|f| f.row_count as usize).sum();
-        assert_eq!(rows_a, 15, "every tail row of the drained table is committed");
+        assert_eq!(
+            rows_a, 15,
+            "every tail row of the drained table is committed"
+        );
 
         // B (in a partition holding nothing for A): untouched — still
         // pending, nothing committed.
@@ -7951,7 +7907,10 @@ mod tests {
         );
 
         // A clean re-run is a no-op Ok (the O(1)-when-clean contract).
-        shard.flush_tables_for_read(&project, &table_a).await.unwrap();
+        shard
+            .flush_tables_for_read(&project, &table_a)
+            .await
+            .unwrap();
     }
 
     /// Read-path latency bound: `flush_to_parquet_for_read` (the metadata
@@ -8048,10 +8007,7 @@ mod tests {
             let handle = shard.get(&project, &partition).await.unwrap();
             for j in 0..ROWS_PER_PARTITION {
                 handle
-                    .write_batch(
-                        &table,
-                        batch((i * ROWS_PER_PARTITION + j) as i64, 1, "v-"),
-                    )
+                    .write_batch(&table, batch((i * ROWS_PER_PARTITION + j) as i64, 1, "v-"))
                     .await
                     .unwrap();
             }
@@ -8144,11 +8100,7 @@ mod tests {
         // exactly once, regardless of which partition it landed in.
         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
         for b in &read {
-            let ids = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
             for k in 0..ids.len() {
                 assert!(seen.insert(ids.value(k)), "duplicate id across partitions");
             }
@@ -8175,9 +8127,15 @@ mod tests {
         let table = TableName::new("events").unwrap();
 
         // id=42 written to `_default`, and a SECOND id=42 written to `s1`.
-        let h0 = shard.get(&project, &PartitionKey::default_key()).await.unwrap();
+        let h0 = shard
+            .get(&project, &PartitionKey::default_key())
+            .await
+            .unwrap();
         h0.write_batch(&table, batch(42, 1, "a-")).await.unwrap();
-        let h1 = shard.get(&project, &PartitionKey::new("s1").unwrap()).await.unwrap();
+        let h1 = shard
+            .get(&project, &PartitionKey::new("s1").unwrap())
+            .await
+            .unwrap();
         h1.write_batch(&table, batch(42, 1, "b-")).await.unwrap();
 
         shard.flush_to_parquet().await.unwrap();
@@ -8397,8 +8355,8 @@ mod tests {
             .unwrap(),
         );
         let registry: Arc<dyn basin_catalog::LeaseRegistry> = catalog.clone();
-        let mut cfg = ShardConfig::new(storage, catalog, wal)
-            .with_lease_registry(registry, replica_id);
+        let mut cfg =
+            ShardConfig::new(storage, catalog, wal).with_lease_registry(registry, replica_id);
         cfg.lease_ttl = ttl;
         cfg.lease_renew_interval = Duration::from_millis(50);
         (crate::Shard::new(cfg), storage_dir, wal_dir)
@@ -8416,8 +8374,8 @@ mod tests {
     ) -> crate::Shard {
         basin_common::telemetry::try_init_for_tests();
         let registry: Arc<dyn basin_catalog::LeaseRegistry> = catalog.clone();
-        let mut cfg = ShardConfig::new(storage, catalog, wal)
-            .with_lease_registry(registry, replica_id);
+        let mut cfg =
+            ShardConfig::new(storage, catalog, wal).with_lease_registry(registry, replica_id);
         cfg.lease_ttl = ttl;
         cfg.lease_renew_interval = Duration::from_millis(50);
         crate::Shard::new(cfg)
@@ -8444,7 +8402,10 @@ mod tests {
         }
 
         // The registry confirms A is the owner at epoch 1.
-        let owner = catalog.owner_of(&project, partition.as_str()).await.unwrap();
+        let owner = catalog
+            .owner_of(&project, partition.as_str())
+            .await
+            .unwrap();
         assert_eq!(owner, Some(("replica-a".to_string(), 1)));
     }
 
@@ -8488,7 +8449,13 @@ mod tests {
     /// Build a shared (storage, wal, catalog) triple for multi-replica tests
     /// where the replicas must agree on the durable substrate AND the lease
     /// registry (the same `InMemoryCatalog` is both).
-    async fn shared_substrate() -> (Storage, Arc<dyn Wal>, Arc<InMemoryCatalog>, TempDir, TempDir) {
+    async fn shared_substrate() -> (
+        Storage,
+        Arc<dyn Wal>,
+        Arc<InMemoryCatalog>,
+        TempDir,
+        TempDir,
+    ) {
         let storage_dir = TempDir::new().unwrap();
         let wal_dir = TempDir::new().unwrap();
         let storage_fs = LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap();
@@ -8576,7 +8543,8 @@ mod tests {
         // "dropping partition state" path was taken).
         inner_a.run_heartbeat_once().await;
         assert_eq!(
-            shard_a.stats().resident_partitions, 1,
+            shard_a.stats().resident_partitions,
+            1,
             "A keeps p resident after B's read + a heartbeat",
         );
     }
@@ -8610,7 +8578,12 @@ mod tests {
         // Force the lease loss: let A's lease expire, then B steals it.
         tokio::time::sleep(Duration::from_millis(30)).await;
         catalog
-            .acquire(&project, part.as_str(), "replica-b", Duration::from_secs(30))
+            .acquire(
+                &project,
+                part.as_str(),
+                "replica-b",
+                Duration::from_secs(30),
+            )
             .await
             .unwrap()
             .expect("B steals after A's TTL expiry");
@@ -8621,7 +8594,8 @@ mod tests {
 
         // State is dropped (tail was committed) and the lease is no longer held.
         assert_eq!(
-            shard_a.stats().resident_partitions, 0,
+            shard_a.stats().resident_partitions,
+            0,
             "state dropped only AFTER a successful flush",
         );
         assert_eq!(inner_a.lease_epoch(&project, &part).await, None);
@@ -8640,7 +8614,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            rows_in(&rows), 50,
+            rows_in(&rows),
+            50,
             "the un-flushed tail must be flushed+committed on lease loss (zero loss)",
         );
     }
@@ -8678,7 +8653,8 @@ mod tests {
             held.remove(&(project, part.clone()));
         }
         assert_eq!(
-            shard_b.stats().resident_partitions, 1,
+            shard_b.stats().resident_partitions,
+            1,
             "B still has p resident (dirty tail) but no longer holds the lease",
         );
 
@@ -8702,7 +8678,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            rows_in(&rows), 0,
+            rows_in(&rows),
+            0,
             "non-owner B must not compact/commit p's tail (owner-only gate)",
         );
 
@@ -8717,7 +8694,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            rows_in(&rows), 50,
+            rows_in(&rows),
+            50,
             "the lease holder compacts + commits its own partition",
         );
     }
@@ -8735,7 +8713,10 @@ mod tests {
         assert_eq!(inner.lease_epoch(&project, &partition).await, None);
 
         let handle = shard.get(&project, &partition).await.unwrap();
-        handle.write_batch(&table, batch(0, 10, "v-")).await.unwrap();
+        handle
+            .write_batch(&table, batch(0, 10, "v-"))
+            .await
+            .unwrap();
         // Heartbeat is a no-op with no registry.
         inner.run_heartbeat_once().await;
         let read = handle.read(&table, ReadOptions::default()).await.unwrap();
@@ -8814,7 +8795,10 @@ mod tests {
         assert_eq!(shard_a.stats().resident_partitions, 0);
         // The catalog confirms there is no live owner (lease released).
         assert_eq!(
-            catalog.owner_of(&project, partition.as_str()).await.unwrap(),
+            catalog
+                .owner_of(&project, partition.as_str())
+                .await
+                .unwrap(),
             None,
         );
 
@@ -8843,9 +8827,14 @@ mod tests {
         // [`Self::yield_partition`] docstring.)
         let inner_b = impl_of(&shard_b);
         let epoch_b = inner_b.lease_epoch(&project, &partition).await.unwrap();
-        assert!(epoch_b > 0, "B must hold a granted lease, got epoch {epoch_b}");
+        assert!(
+            epoch_b > 0,
+            "B must hold a granted lease, got epoch {epoch_b}"
+        );
         // B can write the partition (new lease → new appends accepted).
-        hb.write_batch(&table, batch(100, 2, "post-")).await.unwrap();
+        hb.write_batch(&table, batch(100, 2, "post-"))
+            .await
+            .unwrap();
 
         // WAL handoff marker is durable and observable on the shared WAL.
         let events = wal
@@ -8904,10 +8893,7 @@ mod tests {
             let mut d = inner.draining.lock().await;
             d.remove(&(project, partition.clone()));
         }
-        handle
-            .write_batch(&table, batch(0, 5, "x-"))
-            .await
-            .unwrap();
+        handle.write_batch(&table, batch(0, 5, "x-")).await.unwrap();
         let read = handle.read(&table, ReadOptions::default()).await.unwrap();
         assert_eq!(rows_in(&read), 5);
     }
@@ -8958,7 +8944,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, WalEvent::Handoff { .. }))
             .count();
-        assert_eq!(handoff_count, 1, "exactly one handoff marker; got {events:?}");
+        assert_eq!(
+            handoff_count, 1,
+            "exactly one handoff marker; got {events:?}"
+        );
 
         // `replay_wal` must yield one WalEntry per data event — markers
         // are filtered out, no entries are synthesised or dropped.
@@ -9005,14 +8994,16 @@ mod tests {
 
         // Project cap: 60 RestQps across all replicas combined.
         coord
-            .set_project_budget(&project, ProjectBudget::default().with(CapKind::RestQps, 60))
+            .set_project_budget(
+                &project,
+                ProjectBudget::default().with(CapKind::RestQps, 60),
+            )
             .await
             .unwrap();
 
         // Three "replicas": each gets its own (shard, partition, slice
         // gate, slice view). Each holds a distinct partition's lease.
-        let mut shards: Vec<(crate::Shard, SliceGate, PartitionKey, TempDir, TempDir)> =
-            Vec::new();
+        let mut shards: Vec<(crate::Shard, SliceGate, PartitionKey, TempDir, TempDir)> = Vec::new();
         for i in 0..3 {
             let storage_dir = TempDir::new().unwrap();
             let wal_dir = TempDir::new().unwrap();
@@ -9072,11 +9063,7 @@ mod tests {
         let mut admitted = 0u64;
         for (_shard, gate, _part, _sd, _wd) in &shards {
             for _ in 0..40 {
-                if gate
-                    .try_consume(project, CapKind::RestQps, 1)
-                    .await
-                    .is_ok()
-                {
+                if gate.try_consume(project, CapKind::RestQps, 1).await.is_ok() {
                     admitted += 1;
                 }
             }
@@ -9331,8 +9318,7 @@ mod tests {
 
         // Build a small batch: 8 POINT rows (x=0..8, y=0..8).
         let mut ids = Int64Builder::with_capacity(8);
-        let mut pts =
-            FixedSizeBinaryBuilder::with_capacity(8, basin_geo::POINT_WKB_LEN as i32);
+        let mut pts = FixedSizeBinaryBuilder::with_capacity(8, basin_geo::POINT_WKB_LEN as i32);
         for i in 0..8i64 {
             ids.append_value(i);
             let bytes = basin_geo::encode_point(&basin_geo::Point::new(i as f64, i as f64));
@@ -9828,7 +9814,10 @@ mod tests {
             M * ROWS,
             "no rows lost or duplicated across merges"
         );
-        assert!(shard.stats().file_merges >= 1, "at least one merge committed");
+        assert!(
+            shard.stats().file_merges >= 1,
+            "at least one merge committed"
+        );
 
         // Full row set identical: read every live file, collect ids, expect the
         // exact dense range [0, M*ROWS).
@@ -10348,10 +10337,8 @@ mod tests {
         fn list(
             &self,
             prefix: Option<&object_store::path::Path>,
-        ) -> futures::stream::BoxStream<
-            'static,
-            object_store::Result<object_store::ObjectMeta>,
-        > {
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
             self.inner.list(prefix)
         }
         async fn list_with_delimiter(
@@ -10455,7 +10442,10 @@ mod tests {
         }
         std::env::remove_var("BASIN_SOFT_DELAY_MAX_MS");
 
-        std::env::set_var("BASIN_SHARD_FLUSH_CONCURRENCY", flush_concurrency.to_string());
+        std::env::set_var(
+            "BASIN_SHARD_FLUSH_CONCURRENCY",
+            flush_concurrency.to_string(),
+        );
         let inner = impl_of(&shard);
         let started = Instant::now();
         inner.run_compaction_once().await.unwrap();
@@ -10541,9 +10531,7 @@ mod tests {
             async move {
                 let w: Arc<dyn Wal> = Arc::new(
                     LocalWal::open(WalConfig {
-                        object_store: Arc::new(
-                            LocalFileSystem::new_with_prefix(dir).unwrap(),
-                        ),
+                        object_store: Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap()),
                         root_prefix: None,
                         flush_interval: Duration::from_millis(20),
                         flush_max_bytes: 256 * 1024,
@@ -10566,8 +10554,11 @@ mod tests {
 
         {
             let wal = open_wal().await;
-            let shard =
-                crate::Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+            let shard = crate::Shard::new(ShardConfig::new(
+                storage.clone(),
+                catalog.clone(),
+                wal.clone(),
+            ));
             let handle = shard.get(&project, &partition).await.unwrap();
             let inner = impl_of(&shard);
 
@@ -10577,10 +10568,7 @@ mod tests {
             for wave in 0..5 {
                 for j in 0..4 {
                     handle
-                        .write_batch(
-                            &table,
-                            batch(((wave * 4 + j) * per) as i64, per, "v-"),
-                        )
+                        .write_batch(&table, batch(((wave * 4 + j) * per) as i64, per, "v-"))
                         .await
                         .unwrap();
                     total_committed += per;
@@ -10812,14 +10800,17 @@ mod tests {
                 object_store: crashy,
                 root_prefix: None,
                 flush_interval: Duration::from_secs(3600), // never auto-flush
-                flush_max_bytes: 1024 * 1024 * 1024,        // never pressure-flush
+                flush_max_bytes: 1024 * 1024 * 1024,       // never pressure-flush
                 commit_delay: Duration::from_millis(1),
             })
             .await
             .unwrap(),
         );
-        let shard =
-            crate::Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+        let shard = crate::Shard::new(ShardConfig::new(
+            storage.clone(),
+            catalog.clone(),
+            wal.clone(),
+        ));
 
         let mut acked = 0usize;
         for i in 0..n_batches {
@@ -10863,8 +10854,11 @@ mod tests {
             .await
             .unwrap(),
         );
-        let shard2 =
-            crate::Shard::new(ShardConfig::new(fx.storage.clone(), fx.catalog.clone(), wal2));
+        let shard2 = crate::Shard::new(ShardConfig::new(
+            fx.storage.clone(),
+            fx.catalog.clone(),
+            wal2,
+        ));
         let mut recovered: Vec<RecordBatch> = Vec::new();
         for part in &fx.parts {
             let h = shard2.get(&fx.project, part).await.unwrap();
@@ -10956,8 +10950,11 @@ mod tests {
             .await
             .unwrap(),
         );
-        let shard =
-            crate::Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+        let shard = crate::Shard::new(ShardConfig::new(
+            storage.clone(),
+            catalog.clone(),
+            wal.clone(),
+        ));
         let mut acked = 0usize;
         for i in 0..n_batches {
             let part = &parts[i % fanout];
@@ -11125,7 +11122,11 @@ mod tests {
     /// Total committed (segment) row count for `(project, table)` — exactly what
     /// the `count(*)` fast-aggregate path reads (`Catalog::live_data_files`).
     /// The in-memory tail is NOT counted (it is not yet a committed segment).
-    async fn committed_count(catalog: &Arc<InMemoryCatalog>, project: &ProjectId, table: &TableName) -> u64 {
+    async fn committed_count(
+        catalog: &Arc<InMemoryCatalog>,
+        project: &ProjectId,
+        table: &TableName,
+    ) -> u64 {
         use basin_catalog::Catalog;
         match catalog.load_table(project, table).await {
             Ok(m) => m.live_data_files().iter().map(|f| f.row_count).sum(),
@@ -11211,7 +11212,10 @@ mod tests {
                 .map(|f| f.path)
                 .collect()
         };
-        assert!(!live.is_empty(), "compaction must have committed a data file");
+        assert!(
+            !live.is_empty(),
+            "compaction must have committed a data file"
+        );
         assert_eq!(committed_count(&catalog, &project, &table).await, N as u64);
 
         // Simulate the post-commit cleanup running against outputs whose commit
@@ -11253,7 +11257,10 @@ mod tests {
         let table = TableName::new("events").unwrap();
 
         let handle = shard.get(&project, &partition).await.unwrap();
-        handle.write_batch(&table, batch(0, 100, "v-")).await.unwrap();
+        handle
+            .write_batch(&table, batch(0, 100, "v-"))
+            .await
+            .unwrap();
         let inner = impl_of(&shard);
         inner.run_compaction_once().await.unwrap();
 
@@ -11344,8 +11351,11 @@ mod tests {
             .unwrap(),
         );
 
-        let shard =
-            crate::Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+        let shard = crate::Shard::new(ShardConfig::new(
+            storage.clone(),
+            catalog.clone(),
+            wal.clone(),
+        ));
 
         // Durable fan-out COPY: every batch is ack-after-durable (synchronous
         // commit). Round-robin whole 10k-row batches across the 4 stripes.
@@ -11425,8 +11435,11 @@ mod tests {
         // PUTs can now succeed.
         wedged.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let shard2 =
-            crate::Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal2.clone()));
+        let shard2 = crate::Shard::new(ShardConfig::new(
+            storage.clone(),
+            catalog.clone(),
+            wal2.clone(),
+        ));
 
         // BUG REPRODUCTION: without recover_all, no write to the lost
         // partitions, the resident map is empty, so count(*) still under-counts
@@ -11667,8 +11680,11 @@ mod tests {
             .unwrap(),
         );
 
-        let shard =
-            crate::Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+        let shard = crate::Shard::new(ShardConfig::new(
+            storage.clone(),
+            catalog.clone(),
+            wal.clone(),
+        ));
 
         // Durable writes: ids 1..=N, all in one partition.
         let handle = shard.get(&project, &partition).await.unwrap();
@@ -11741,15 +11757,16 @@ mod tests {
         // The data store is healthy on restart (the wedge cleared) so recovery's
         // compaction can commit the replayed tail.
         let storage2 = Storage::new(StorageConfig {
-            object_store: Arc::new(
-                LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
-            ),
+            object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
             root_prefix: None,
             disk_cache: None,
             page_cache: None,
         });
-        let shard2 =
-            crate::Shard::new(ShardConfig::new(storage2.clone(), catalog.clone(), wal2.clone()));
+        let shard2 = crate::Shard::new(ShardConfig::new(
+            storage2.clone(),
+            catalog.clone(),
+            wal2.clone(),
+        ));
 
         // Boot recovery: replay + drain every WAL-known partition.
         shard2.recover_all().await.unwrap();
@@ -11870,11 +11887,8 @@ mod tests {
         // regression (re-introducing the synchronous await of the wedged PUT)
         // trips the watchdog instead of hanging the suite.
         let started = std::time::Instant::now();
-        let res = tokio::time::timeout(
-            Duration::from_secs(5),
-            shard.flush_to_parquet_for_read(),
-        )
-        .await;
+        let res =
+            tokio::time::timeout(Duration::from_secs(5), shard.flush_to_parquet_for_read()).await;
         let elapsed = started.elapsed();
         assert!(
             res.is_ok(),
@@ -11961,11 +11975,8 @@ mod tests {
         // its wave already committed but not yet pruned. Pre-fix, the elapsed
         // timeout would instead DROP the drain future here — releasing the lock
         // with the tail un-pruned.
-        let res = tokio::time::timeout(
-            Duration::from_secs(5),
-            shard.flush_to_parquet_for_read(),
-        )
-        .await;
+        let res =
+            tokio::time::timeout(Duration::from_secs(5), shard.flush_to_parquet_for_read()).await;
         assert!(
             res.is_ok() && res.unwrap().is_ok(),
             "read-path flush must return promptly from committed state even while \
@@ -11996,11 +12007,7 @@ mod tests {
              re-commit the un-pruned tail",
         );
         let read = handle.read(&table, ReadOptions::default()).await.unwrap();
-        assert_eq!(
-            distinct_ids(&read),
-            N,
-            "count(DISTINCT id) must equal N",
-        );
+        assert_eq!(distinct_ids(&read), N, "count(DISTINCT id) must equal N",);
         assert_eq!(
             rows_in(&read),
             N,

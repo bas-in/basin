@@ -75,10 +75,14 @@ pub(crate) enum SegmentRecord {
     Entry(EntryRecord),
     /// Marks the start of a logical transaction. Must be paired with either a
     /// matching `TxCommit` (commit) or `TxRollback` (discard).
-    TxBegin { tx_id: u64 },
+    TxBegin {
+        tx_id: u64,
+    },
     /// Marks that all entries since the matching `TxBegin { tx_id }` should be
     /// discarded during replay.
-    TxRollback { tx_id: u64 },
+    TxRollback {
+        tx_id: u64,
+    },
     /// Phase 6.X.C (ADR 0023) — voluntary lease-handoff marker. The outgoing
     /// leaseholder writes this as the last record before releasing the lease;
     /// it records `to_holder` (the candidate replica id) and `at_epoch` (the
@@ -86,7 +90,10 @@ pub(crate) enum SegmentRecord {
     /// informational no-op by the replay path — handoff doesn't change any
     /// row state, it's purely an observability + audit hook. New owners replay
     /// data entries normally and see the marker as a recovery breadcrumb.
-    Handoff { to_holder: String, at_epoch: i64 },
+    Handoff {
+        to_holder: String,
+        at_epoch: i64,
+    },
     /// ADR 0020 §6 — explicit commit marker. Paired with the matching
     /// `TxBegin { tx_id }` to signal that the transaction committed durably.
     /// Replay honours entries between `TxBegin(tx_id)` and `TxCommit(tx_id)`.
@@ -94,7 +101,9 @@ pub(crate) enum SegmentRecord {
     /// is treated as crashed-mid-tx and its entries are discarded (new
     /// behaviour) or committed under the legacy implicit-commit rule (old
     /// segments written before this variant existed).
-    TxCommit { tx_id: u64 },
+    TxCommit {
+        tx_id: u64,
+    },
 }
 
 pub(crate) const FORMAT_VERSION: u16 = 1;
@@ -178,12 +187,21 @@ pub(crate) fn iter_frames(buf: &[u8]) -> FrameIter<'_> {
 #[derive(Debug, Clone)]
 pub(crate) enum DecodedRecord {
     Entry(EntryRecord),
-    TxBegin { tx_id: u64 },
-    TxRollback { tx_id: u64 },
+    TxBegin {
+        tx_id: u64,
+    },
+    TxRollback {
+        tx_id: u64,
+    },
     /// Phase 6.X.C — handoff marker. See [`SegmentRecord::Handoff`].
-    Handoff { to_holder: String, at_epoch: i64 },
+    Handoff {
+        to_holder: String,
+        at_epoch: i64,
+    },
     /// ADR 0020 §6 — explicit commit marker. See [`SegmentRecord::TxCommit`].
-    TxCommit { tx_id: u64 },
+    TxCommit {
+        tx_id: u64,
+    },
 }
 
 /// Parse a length-prefixed segment buffer into header + decoded records.
@@ -191,9 +209,7 @@ pub(crate) enum DecodedRecord {
 /// Unlike [`decode_segment`], this variant preserves transaction marker records
 /// (`TxBegin`, `TxRollback`) so the replay path can filter rolled-back entries.
 /// Use this path whenever transaction-aware processing is required.
-pub(crate) fn decode_segment_full(
-    buf: &[u8],
-) -> Result<(SegmentHeader, Vec<DecodedRecord>)> {
+pub(crate) fn decode_segment_full(buf: &[u8]) -> Result<(SegmentHeader, Vec<DecodedRecord>)> {
     let mut header: Option<SegmentHeader> = None;
     let mut records: Vec<DecodedRecord> = Vec::new();
 
@@ -453,6 +469,9 @@ mod tests {
             }
             other => panic!("expected Handoff, got {other:?}"),
         }
-        assert!(matches!(records[4], DecodedRecord::TxRollback { tx_id: 11 }));
+        assert!(matches!(
+            records[4],
+            DecodedRecord::TxRollback { tx_id: 11 }
+        ));
     }
 }

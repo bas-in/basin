@@ -555,8 +555,7 @@ impl DiskCachedStore {
                     if try_read_cached(&state, &full_key, &full_fs).await.is_none() {
                         if let Ok(g) = inner.get_opts(&loc, GetOptions::default()).await {
                             if let Ok(full) = g.bytes().await {
-                                store_fragment_into(&state, &full_key, &full_fs, &loc, &full)
-                                    .await;
+                                store_fragment_into(&state, &full_key, &full_fs, &loc, &full).await;
                             }
                         }
                     }

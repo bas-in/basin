@@ -88,9 +88,7 @@ impl ObjectUsing {
             Some(Self::True)
         } else if lower == "false" {
             Some(Self::False)
-        } else if lower == "owner = auth.uid()"
-            || lower == "auth.uid() = owner"
-        {
+        } else if lower == "owner = auth.uid()" || lower == "auth.uid() = owner" {
             Some(Self::OwnerEqAuthUid)
         } else {
             None
@@ -173,12 +171,7 @@ impl ObjectRlsStore {
     /// Create a policy for `table` in `project`.
     ///
     /// Returns `false` if a policy with the same name already exists.
-    pub fn create_policy(
-        &self,
-        project: &ProjectId,
-        table: &str,
-        policy: ObjectPolicy,
-    ) -> bool {
+    pub fn create_policy(&self, project: &ProjectId, table: &str, policy: ObjectPolicy) -> bool {
         let mut guard = self.inner.write().unwrap();
         let entry = guard
             .entry((project.to_string(), table.to_string()))
@@ -212,9 +205,7 @@ impl ObjectRlsStore {
         role: &str,
     ) -> (bool, Vec<ObjectPolicy>) {
         let guard = self.inner.read().unwrap();
-        if let Some((enabled, policies)) =
-            guard.get(&(project.to_string(), table.to_string()))
-        {
+        if let Some((enabled, policies)) = guard.get(&(project.to_string(), table.to_string())) {
             if !enabled {
                 return (false, Vec::new());
             }
@@ -315,9 +306,9 @@ pub fn filter_objects(
     objects
         .into_iter()
         .filter(|obj| {
-            applicable.iter().any(|p| {
-                p.using.evaluate(obj, caller.uid, &caller.role)
-            })
+            applicable
+                .iter()
+                .any(|p| p.using.evaluate(obj, caller.uid, &caller.role))
         })
         .collect()
 }
@@ -357,7 +348,8 @@ mod tests {
             applies_to_roles: vec![],
             using: ObjectUsing::OwnerEqAuthUid,
         };
-        let result = check_object_access(true, &[policy], &obj, &caller, ObjectPolicyCommand::Select);
+        let result =
+            check_object_access(true, &[policy], &obj, &caller, ObjectPolicyCommand::Select);
         assert!(result.is_ok());
     }
 
@@ -373,7 +365,8 @@ mod tests {
             applies_to_roles: vec![],
             using: ObjectUsing::OwnerEqAuthUid,
         };
-        let result = check_object_access(true, &[policy], &obj, &caller, ObjectPolicyCommand::Select);
+        let result =
+            check_object_access(true, &[policy], &obj, &caller, ObjectPolicyCommand::Select);
         assert!(result.is_err());
     }
 
@@ -381,8 +374,7 @@ mod tests {
     fn no_policy_applies_deny_all() {
         let obj = make_object(None);
         let caller = CallerCtx::anonymous();
-        let result =
-            check_object_access(true, &[], &obj, &caller, ObjectPolicyCommand::Select);
+        let result = check_object_access(true, &[], &obj, &caller, ObjectPolicyCommand::Select);
         assert!(result.is_err());
     }
 
@@ -391,8 +383,7 @@ mod tests {
         let obj = make_object(None);
         let caller = CallerCtx::anonymous();
         // Even with no policies, RLS off → permit.
-        let result =
-            check_object_access(false, &[], &obj, &caller, ObjectPolicyCommand::Select);
+        let result = check_object_access(false, &[], &obj, &caller, ObjectPolicyCommand::Select);
         assert!(result.is_ok());
     }
 
@@ -419,8 +410,12 @@ mod tests {
         let project = ProjectId::new();
 
         // Not enabled by default.
-        let (enabled, _) =
-            store.applicable(&project, "objects", ObjectPolicyCommand::Select, "authenticated");
+        let (enabled, _) = store.applicable(
+            &project,
+            "objects",
+            ObjectPolicyCommand::Select,
+            "authenticated",
+        );
         assert!(!enabled);
 
         store.set_enabled(&project, "objects", true);
@@ -434,15 +429,23 @@ mod tests {
         // Duplicate name is rejected.
         assert!(!store.create_policy(&project, "objects", policy));
 
-        let (enabled, applicable) =
-            store.applicable(&project, "objects", ObjectPolicyCommand::Select, "authenticated");
+        let (enabled, applicable) = store.applicable(
+            &project,
+            "objects",
+            ObjectPolicyCommand::Select,
+            "authenticated",
+        );
         assert!(enabled);
         assert_eq!(applicable.len(), 1);
 
         // Drop removes the policy.
         assert!(store.drop_policy(&project, "objects", "p1"));
-        let (_, applicable) =
-            store.applicable(&project, "objects", ObjectPolicyCommand::Select, "authenticated");
+        let (_, applicable) = store.applicable(
+            &project,
+            "objects",
+            ObjectPolicyCommand::Select,
+            "authenticated",
+        );
         assert!(applicable.is_empty());
     }
 

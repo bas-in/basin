@@ -423,9 +423,7 @@ async fn merge_rls_enforced_on_update_insert_delete() {
         .await
         .unwrap();
     admin
-        .execute(
-            "CREATE POLICY own ON acct FOR ALL TO PUBLIC USING (owner = current_user)",
-        )
+        .execute("CREATE POLICY own ON acct FOR ALL TO PUBLIC USING (owner = current_user)")
         .await
         .unwrap();
     // Seed: one row owned by alice, one by bob (admin bypasses? no — insert as each).
@@ -582,5 +580,8 @@ async fn merge_returning_rejected_typed() {
              WHEN MATCHED THEN UPDATE SET v = s.sv RETURNING id",
         )
         .await;
-    assert!(res.is_err(), "MERGE ... RETURNING must not silently succeed");
+    assert!(
+        res.is_err(),
+        "MERGE ... RETURNING must not silently succeed"
+    );
 }

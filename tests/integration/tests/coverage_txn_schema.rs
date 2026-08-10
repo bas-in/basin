@@ -469,7 +469,10 @@ async fn schema_alter_add_column_not_null_with_default_allowed() {
     match res {
         ExecResult::Rows { batches, .. } => {
             let n: usize = batches.iter().map(|b| b.num_rows()).sum();
-            assert_eq!(n, 1, "the inserted row must be returned with the new columns");
+            assert_eq!(
+                n, 1,
+                "the inserted row must be returned with the new columns"
+            );
         }
         other => panic!("expected rows from SELECT, got {other:?}"),
     }
@@ -502,9 +505,17 @@ async fn insert_explicit_default_keyword_applies_column_default() {
         .expect("explicit DEFAULT in a no-column-list INSERT must apply the column default");
 
     // The DEFAULT (7) was applied to the NOT NULL column, not NULL.
-    let got = count_rows_result(sess.execute("SELECT COUNT(*) FROM t WHERE n = 7").await.unwrap());
+    let got = count_rows_result(
+        sess.execute("SELECT COUNT(*) FROM t WHERE n = 7")
+            .await
+            .unwrap(),
+    );
     assert_eq!(got, 2, "both rows must have n defaulted to 7");
-    let s_got = count_rows_result(sess.execute("SELECT COUNT(*) FROM t WHERE s = 'x'").await.unwrap());
+    let s_got = count_rows_result(
+        sess.execute("SELECT COUNT(*) FROM t WHERE s = 'x'")
+            .await
+            .unwrap(),
+    );
     assert_eq!(s_got, 2, "both rows must have s defaulted to 'x'");
 }
 

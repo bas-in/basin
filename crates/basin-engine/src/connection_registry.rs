@@ -119,12 +119,18 @@ impl ConnectionRegistry {
         // the registry so we can return it through the ConnectionHandle.
         let cancel_notify = info.cancel_notify.clone();
         {
-            let mut map = self.inner.lock().expect("ConnectionRegistry mutex poisoned");
+            let mut map = self
+                .inner
+                .lock()
+                .expect("ConnectionRegistry mutex poisoned");
             map.entry(*project).or_default().push(info);
         }
         // Register the pid in the cancel_notifies map and the catalog registry.
         {
-            let mut cn = self.cancel_notifies.lock().expect("cancel_notifies poisoned");
+            let mut cn = self
+                .cancel_notifies
+                .lock()
+                .expect("cancel_notifies poisoned");
             cn.insert(pid, cancel_notify.clone());
         }
         self.cancel_registry.register(pid);
@@ -150,7 +156,10 @@ impl ConnectionRegistry {
     pub fn notify_cancel(&self, pid: i32) -> bool {
         let notified = self.cancel_registry.cancel(pid);
         if notified {
-            let cn = self.cancel_notifies.lock().expect("cancel_notifies poisoned");
+            let cn = self
+                .cancel_notifies
+                .lock()
+                .expect("cancel_notifies poisoned");
             if let Some(notify) = cn.get(&pid) {
                 notify.notify_one();
             }
@@ -161,7 +170,10 @@ impl ConnectionRegistry {
     /// Update the `query` and `state` for the session identified by `pid`
     /// within `project`. Called at the start of each `execute()` invocation.
     pub fn set_query(&self, project: &ProjectId, pid: i32, query: Option<&str>) {
-        let mut map = self.inner.lock().expect("ConnectionRegistry mutex poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .expect("ConnectionRegistry mutex poisoned");
         if let Some(entries) = map.get_mut(project) {
             for entry in entries.iter_mut() {
                 if entry.pid == pid {
@@ -183,7 +195,10 @@ impl ConnectionRegistry {
     /// Called from `PgStatActivityLiveProvider::scan()` — holds the lock
     /// only for the `clone()` call, then releases immediately.
     pub fn snapshot(&self, project: &ProjectId) -> Vec<SessionInfo> {
-        let map = self.inner.lock().expect("ConnectionRegistry mutex poisoned");
+        let map = self
+            .inner
+            .lock()
+            .expect("ConnectionRegistry mutex poisoned");
         map.get(project).cloned().unwrap_or_default()
     }
 }

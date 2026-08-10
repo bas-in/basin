@@ -99,13 +99,10 @@ async fn single_row_insert_tx_keyed_by_pk() {
     exec(&sess, "COMMIT").await;
 
     let table = TableName::new("t").unwrap();
-    let entry = eng
-        .memtable_registry()
-        .get(&sess.project(), &table)
-        .expect(
-            "registry entry must exist after BEGIN…INSERT…COMMIT; \
+    let entry = eng.memtable_registry().get(&sess.project(), &table).expect(
+        "registry entry must exist after BEGIN…INSERT…COMMIT; \
              htap_promote_to_registry is invoked on COMMIT",
-        );
+    );
 
     // The row must be findable via the PK-encoded key (not a counter key).
     let pk_key = pk_key_i64(42);
@@ -132,7 +129,11 @@ async fn multi_row_insert_tx_each_keyed_by_pk() {
     .await;
 
     exec(&sess, "BEGIN").await;
-    exec(&sess, "INSERT INTO m (id, v) VALUES (1, 10), (2, 20), (3, 30)").await;
+    exec(
+        &sess,
+        "INSERT INTO m (id, v) VALUES (1, 10), (2, 20), (3, 30)",
+    )
+    .await;
     exec(&sess, "COMMIT").await;
 
     let table = TableName::new("m").unwrap();
@@ -175,10 +176,7 @@ async fn select_after_committed_insert_finds_row() {
     // Auto-commit INSERT — row lands in cold tier Parquet.
     exec(&sess, "INSERT INTO s (id, v) VALUES (99, 9900)").await;
 
-    let result = sess
-        .execute("SELECT v FROM s WHERE id = 99")
-        .await
-        .unwrap();
+    let result = sess.execute("SELECT v FROM s WHERE id = 99").await.unwrap();
     match result {
         ExecResult::Rows { batches, .. } => {
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -208,10 +206,7 @@ async fn update_after_tx_insert_uses_pk_key() {
     // Now UPDATE via fastpath — must find the cold-tier row and overlay it.
     exec(&sess, "UPDATE u SET v = 9999 WHERE id = 7").await;
 
-    let result = sess
-        .execute("SELECT v FROM u WHERE id = 7")
-        .await
-        .unwrap();
+    let result = sess.execute("SELECT v FROM u WHERE id = 7").await.unwrap();
     match result {
         ExecResult::Rows { batches, .. } => {
             use arrow_array::Int64Array;

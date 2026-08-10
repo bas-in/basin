@@ -336,8 +336,7 @@ async fn accept_loop(
     // Global connection admission ceiling — the OOM backstop against a raw TCP
     // connection flood. Resolved once at startup; enforced at accept *before*
     // a per-connection task is spawned (see `max_connections_from_env`).
-    let max_conns =
-        max_connections_from_env().map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+    let max_conns = max_connections_from_env().map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
     if let Some(sem) = &max_conns {
         tracing::info!(
             max_connections = sem.available_permits(),
@@ -652,13 +651,21 @@ mod admission_tests {
         // Env is process-global; this test owns BASIN_PGWIRE_MAX_CONNECTIONS and
         // is the only reader, so it restores the var when done.
         std::env::remove_var("BASIN_PGWIRE_MAX_CONNECTIONS");
-        assert_eq!(max_connections_from_env(), Some(8192), "safe finite default");
+        assert_eq!(
+            max_connections_from_env(),
+            Some(8192),
+            "safe finite default"
+        );
 
         std::env::set_var("BASIN_PGWIRE_MAX_CONNECTIONS", "0");
         assert_eq!(max_connections_from_env(), None, "0 disables the ceiling");
 
         std::env::set_var("BASIN_PGWIRE_MAX_CONNECTIONS", "3");
-        assert_eq!(max_connections_from_env(), Some(3), "explicit ceiling honoured");
+        assert_eq!(
+            max_connections_from_env(),
+            Some(3),
+            "explicit ceiling honoured"
+        );
 
         std::env::set_var("BASIN_PGWIRE_MAX_CONNECTIONS", "notanumber");
         assert_eq!(

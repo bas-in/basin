@@ -37,20 +37,12 @@ use tempfile::TempDir;
 /// Build a shard+engine pair using local filesystem storage.
 /// Engine::new wires the GIN row-group registry and query-history adapter
 /// into the shard automatically.
-async fn build_engine_with_shard() -> (
-    TempDir,
-    TempDir,
-    Engine,
-    Shard,
-    Arc<dyn Wal>,
-) {
+async fn build_engine_with_shard() -> (TempDir, TempDir, Engine, Shard, Arc<dyn Wal>) {
     let storage_dir = TempDir::new().unwrap();
     let wal_dir = TempDir::new().unwrap();
 
     let storage = Storage::new(StorageConfig {
-        object_store: Arc::new(
-            LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
-        ),
+        object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
         root_prefix: None,
         disk_cache: None,
         page_cache: None,
@@ -58,9 +50,7 @@ async fn build_engine_with_shard() -> (
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let wal: Arc<dyn Wal> = Arc::new(
         LocalWal::open(WalConfig {
-            object_store: Arc::new(
-                LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap(),
-            ),
+            object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
@@ -69,7 +59,11 @@ async fn build_engine_with_shard() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     // Engine::new wires GIN row-group registry and query history into the shard.
     let engine = Engine::new(EngineConfig {
         storage: storage.clone(),
@@ -151,7 +145,12 @@ async fn gin_count_star_at_gt_rowgroup_pruned() {
     let (_storage_dir, _wal_dir, engine, shard, wal) = build_engine_with_shard().await;
 
     let project = ProjectId::new();
-    engine.config().catalog.create_namespace(&project).await.unwrap();
+    engine
+        .config()
+        .catalog
+        .create_namespace(&project)
+        .await
+        .unwrap();
     let sess = engine.open_session(project).await.unwrap();
 
     sess.execute(
@@ -188,7 +187,12 @@ async fn gin_count_star_at_gt_rowgroup_pruned() {
     shard.flush_to_parquet().await.unwrap();
 
     let table = TableName::new("events").unwrap();
-    let meta = engine.config().catalog.load_table(&project, &table).await.unwrap();
+    let meta = engine
+        .config()
+        .catalog
+        .load_table(&project, &table)
+        .await
+        .unwrap();
     let live_files = meta.live_data_files();
     let compacted_path = live_files[0].path.to_string();
     let rg_registry = engine.gin_rowgroup_registry_for_test();
@@ -202,11 +206,9 @@ async fn gin_count_star_at_gt_rowgroup_pruned() {
     // "purchase", so the purchase count must increase by exactly one. This puts
     // a hot overlay row (writer's `LargeBinary` JSONB) into the read path that
     // unions with the cold (`Binary`) compacted batches.
-    sess.execute(
-        "UPDATE events SET payload = '{\"category\":\"purchase\",\"id\":1}' WHERE id = 1",
-    )
-    .await
-    .unwrap();
+    sess.execute("UPDATE events SET payload = '{\"category\":\"purchase\",\"id\":1}' WHERE id = 1")
+        .await
+        .unwrap();
     expected_purchase += 1;
 
     // ── COUNT(*) matching needle — must equal the purchase count, NOT panic. ──
@@ -266,7 +268,9 @@ async fn gin_count_star_at_gt_rowgroup_pruned() {
     let absent_ids = {
         let s = engine.open_session(project).await.unwrap();
         let result = s
-            .execute(r#"SELECT id FROM events WHERE payload @> '{"category":"nonexistent"}'::jsonb"#)
+            .execute(
+                r#"SELECT id FROM events WHERE payload @> '{"category":"nonexistent"}'::jsonb"#,
+            )
             .await
             .unwrap();
         match result {
@@ -289,7 +293,12 @@ async fn gin_compaction_reindex_fires_rowgroup_prune() {
     let (_storage_dir, _wal_dir, engine, shard, wal) = build_engine_with_shard().await;
 
     let project = ProjectId::new();
-    engine.config().catalog.create_namespace(&project).await.unwrap();
+    engine
+        .config()
+        .catalog
+        .create_namespace(&project)
+        .await
+        .unwrap();
     let sess = engine.open_session(project).await.unwrap();
 
     // ── 2. CREATE TABLE with small row_block_size + GIN index ────────────────
@@ -304,11 +313,9 @@ async fn gin_compaction_reindex_fires_rowgroup_prune() {
     )
     .await
     .unwrap();
-    sess.execute(
-        "CREATE INDEX docs_gin ON docs USING gin (doc)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE INDEX docs_gin ON docs USING gin (doc)")
+        .await
+        .unwrap();
 
     // ── 3. INSERT rows via SQL (shard path: WAL + tail) ──────────────────────
     // First batch: 200 rows all with tag="batch_a".
@@ -349,7 +356,12 @@ async fn gin_compaction_reindex_fires_rowgroup_prune() {
     // ── 5. Assert the row-group registry has a sealed entry for the file ─────
     // load_table gives us the live file set; there should be exactly one file.
     let table = TableName::new("docs").unwrap();
-    let meta = engine.config().catalog.load_table(&project, &table).await.unwrap();
+    let meta = engine
+        .config()
+        .catalog
+        .load_table(&project, &table)
+        .await
+        .unwrap();
     let live_files = meta.live_data_files();
     assert_eq!(
         live_files.len(),

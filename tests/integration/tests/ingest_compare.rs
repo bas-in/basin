@@ -55,7 +55,14 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 /// Standard in-process engine (Shard + WAL + LocalFileSystem).
-async fn build() -> (TempDir, TempDir, Engine, Shard, basin_shard::ShardBackgroundHandle, Arc<dyn Wal>) {
+async fn build() -> (
+    TempDir,
+    TempDir,
+    Engine,
+    Shard,
+    basin_shard::ShardBackgroundHandle,
+    Arc<dyn Wal>,
+) {
     let sd = TempDir::new().unwrap();
     let wd = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
@@ -76,9 +83,17 @@ async fn build() -> (TempDir, TempDir, Engine, Shard, basin_shard::ShardBackgrou
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
-    let engine = Engine::new(EngineConfig { storage, catalog, shard: Some(shard.clone()) });
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: Some(shard.clone()),
+    });
     (sd, wd, engine, shard, bg, wal)
 }
 
@@ -161,7 +176,11 @@ async fn copy_ingest_compare() {
             let amount = 1.0 + (k % 10000) as f64 * 0.01;
             s.push_str(&format!(
                 "{},{},{},{},{}\n",
-                k, k % (total_rows / 10).max(1), amount, status, EPOCH + k
+                k,
+                k % (total_rows / 10).max(1),
+                amount,
+                status,
+                EPOCH + k
             ));
         }
         s
@@ -175,7 +194,11 @@ async fn copy_ingest_compare() {
             let amount = 1.0 + (k % 10000) as f64 * 0.01;
             s.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\n",
-                k, k % (total_rows / 10).max(1), amount, status, EPOCH + k
+                k,
+                k % (total_rows / 10).max(1),
+                amount,
+                status,
+                EPOCH + k
             ));
         }
         s
@@ -186,12 +209,17 @@ async fn copy_ingest_compare() {
         let mut s = String::with_capacity((hi - lo) as usize * 60);
         s.push_str("INSERT INTO events VALUES ");
         for k in lo..hi {
-            if k > lo { s.push(','); }
+            if k > lo {
+                s.push(',');
+            }
             let status = status_for(k);
             let amount = 1.0 + (k % 10000) as f64 * 0.01;
             s.push_str(&format!(
                 "({},{},{},'{status}',{})",
-                k, k % (total_rows / 10).max(1), amount, EPOCH + k
+                k,
+                k % (total_rows / 10).max(1),
+                amount,
+                EPOCH + k
             ));
         }
         s
@@ -216,7 +244,9 @@ async fn copy_ingest_compare() {
         let mut id = 0i64;
         while id < total_rows {
             let hi = (id + insert_batch).min(total_rows);
-            sess.execute(&make_values(id, hi)).await.expect("basin insert values");
+            sess.execute(&make_values(id, hi))
+                .await
+                .expect("basin insert values");
             id = hi;
         }
         let elapsed = t.elapsed().as_secs_f64();
@@ -259,9 +289,17 @@ async fn copy_ingest_compare() {
         let elapsed = t.elapsed().as_secs_f64();
         bg.shutdown().await;
         wal.close().await.unwrap();
-        if ok { total_rows as f64 / elapsed } else { f64::NAN }
+        if ok {
+            total_rows as f64 / elapsed
+        } else {
+            f64::NAN
+        }
     };
-    let copy_text_label = if basin_copy_text_rps.is_nan() { "N/A (path not wired)" } else { "" };
+    let copy_text_label = if basin_copy_text_rps.is_nan() {
+        "N/A (path not wired)"
+    } else {
+        ""
+    };
     eprintln!("[copy] basin COPY text:   {basin_copy_text_rps:.0} rows/sec {copy_text_label}");
 
     // C3: Basin COPY CSV format
@@ -281,14 +319,21 @@ async fn copy_ingest_compare() {
             );
             match sess.execute(&copy_sql).await {
                 Ok(_) => {}
-                Err(_) => { ok = false; break; }
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
             }
             id = hi;
         }
         let elapsed = t.elapsed().as_secs_f64();
         bg.shutdown().await;
         wal.close().await.unwrap();
-        if ok { total_rows as f64 / elapsed } else { f64::NAN }
+        if ok {
+            total_rows as f64 / elapsed
+        } else {
+            f64::NAN
+        }
     };
     eprintln!("[copy] basin COPY csv:    {basin_copy_csv_rps:.0} rows/sec");
 
@@ -299,7 +344,8 @@ async fn copy_ingest_compare() {
         let sess = engine.open_session(project).await.unwrap();
         sess.execute(events_ddl).await.unwrap();
         // Binary COPY via SQL surface: send a minimal probe to detect support.
-        let probe = "COPY events (id, user_id, amount, status, created_at) FROM STDIN WITH (FORMAT binary)";
+        let probe =
+            "COPY events (id, user_id, amount, status, created_at) FROM STDIN WITH (FORMAT binary)";
         let rps = match sess.execute(probe).await {
             Ok(_) => {
                 // Binary path is wired; run the full measurement using VALUES fallback
@@ -335,144 +381,178 @@ async fn copy_ingest_compare() {
     }
 
     // ── PG twin ───────────────────────────────────────────────────────────────
-    let (pg_insert_rps, pg_copy_text_rps, pg_copy_csv_rps) =
-        if let Some((pg, cs)) = try_connect().await {
-            let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
-            let schema = format!("basin_copy_{suffix}");
-            let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-            pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.unwrap();
+    let (pg_insert_rps, pg_copy_text_rps, pg_copy_csv_rps) = if let Some((pg, cs)) =
+        try_connect().await
+    {
+        let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
+        let schema = format!("basin_copy_{suffix}");
+        let _guard = SchemaGuard {
+            schema: schema.clone(),
+            conn_str: cs,
+        };
+        pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .unwrap();
 
-            // PG C1: INSERT VALUES (10k-row batches)
-            pg.simple_query(&format!(
-                "CREATE TABLE {schema}.events (\
+        // PG C1: INSERT VALUES (10k-row batches)
+        pg.simple_query(&format!(
+            "CREATE TABLE {schema}.events (\
                     id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL, \
                     amount DOUBLE PRECISION NOT NULL, status TEXT NOT NULL, \
                     created_at BIGINT NOT NULL)"
-            )).await.unwrap();
-            let insert_batch = 10_000i64;
-            let t = Instant::now();
-            let mut pg_id = 0i64;
-            while pg_id < total_rows {
-                let hi = (pg_id + insert_batch).min(total_rows);
-                let mut stmt = format!("INSERT INTO {schema}.events VALUES ");
-                for k in pg_id..hi {
-                    if k > pg_id { stmt.push(','); }
-                    let status = status_for(k);
-                    let amount = 1.0 + (k % 10000) as f64 * 0.01;
-                    stmt.push_str(&format!(
-                        "({},{},{},'{status}',{})",
-                        k, k % (total_rows / 10).max(1), amount, EPOCH + k
-                    ));
+        ))
+        .await
+        .unwrap();
+        let insert_batch = 10_000i64;
+        let t = Instant::now();
+        let mut pg_id = 0i64;
+        while pg_id < total_rows {
+            let hi = (pg_id + insert_batch).min(total_rows);
+            let mut stmt = format!("INSERT INTO {schema}.events VALUES ");
+            for k in pg_id..hi {
+                if k > pg_id {
+                    stmt.push(',');
                 }
-                pg.simple_query(&stmt).await.expect("pg insert values");
-                pg_id = hi;
+                let status = status_for(k);
+                let amount = 1.0 + (k % 10000) as f64 * 0.01;
+                stmt.push_str(&format!(
+                    "({},{},{},'{status}',{})",
+                    k,
+                    k % (total_rows / 10).max(1),
+                    amount,
+                    EPOCH + k
+                ));
             }
-            let pg_ins_rps = total_rows as f64 / t.elapsed().as_secs_f64();
-            eprintln!("[copy] pg   INSERT VALUES: {pg_ins_rps:.0} rows/sec");
+            pg.simple_query(&stmt).await.expect("pg insert values");
+            pg_id = hi;
+        }
+        let pg_ins_rps = total_rows as f64 / t.elapsed().as_secs_f64();
+        eprintln!("[copy] pg   INSERT VALUES: {pg_ins_rps:.0} rows/sec");
 
-            // PG C2: COPY text via COPY … FROM STDIN
-            pg.simple_query(&format!("TRUNCATE {schema}.events")).await.unwrap();
-            let t = Instant::now();
-            let mut pg_id = 0i64;
-            while pg_id < total_rows {
-                let hi = (pg_id + chunk).min(total_rows);
-                let body = make_text(pg_id, hi);
-                let copy_stmt = format!(
-                    "COPY {schema}.events (id, user_id, amount, status, created_at) FROM STDIN"
-                );
-                match pg.copy_in::<_, Bytes>(&copy_stmt).await {
-                    Ok(sink) => {
-                        futures::pin_mut!(sink);
-                        let _ = sink.send(Bytes::from(body.into_bytes())).await;
-                        let _ = sink.as_mut().finish().await;
-                    }
-                    Err(_) => { break; }
+        // PG C2: COPY text via COPY … FROM STDIN
+        pg.simple_query(&format!("TRUNCATE {schema}.events"))
+            .await
+            .unwrap();
+        let t = Instant::now();
+        let mut pg_id = 0i64;
+        while pg_id < total_rows {
+            let hi = (pg_id + chunk).min(total_rows);
+            let body = make_text(pg_id, hi);
+            let copy_stmt = format!(
+                "COPY {schema}.events (id, user_id, amount, status, created_at) FROM STDIN"
+            );
+            match pg.copy_in::<_, Bytes>(&copy_stmt).await {
+                Ok(sink) => {
+                    futures::pin_mut!(sink);
+                    let _ = sink.send(Bytes::from(body.into_bytes())).await;
+                    let _ = sink.as_mut().finish().await;
                 }
-                pg_id = hi;
+                Err(_) => {
+                    break;
+                }
             }
-            let pg_txt_rps = if pg_id >= total_rows {
-                total_rows as f64 / t.elapsed().as_secs_f64()
-            } else {
-                f64::NAN
-            };
-            eprintln!("[copy] pg   COPY text:    {pg_txt_rps:.0} rows/sec");
+            pg_id = hi;
+        }
+        let pg_txt_rps = if pg_id >= total_rows {
+            total_rows as f64 / t.elapsed().as_secs_f64()
+        } else {
+            f64::NAN
+        };
+        eprintln!("[copy] pg   COPY text:    {pg_txt_rps:.0} rows/sec");
 
-            // PG C3: COPY CSV
-            pg.simple_query(&format!("TRUNCATE {schema}.events")).await.unwrap();
-            let t = Instant::now();
-            let mut pg_id = 0i64;
-            while pg_id < total_rows {
-                let hi = (pg_id + chunk).min(total_rows);
-                let body = make_csv(pg_id, hi);
-                let copy_stmt = format!(
+        // PG C3: COPY CSV
+        pg.simple_query(&format!("TRUNCATE {schema}.events"))
+            .await
+            .unwrap();
+        let t = Instant::now();
+        let mut pg_id = 0i64;
+        while pg_id < total_rows {
+            let hi = (pg_id + chunk).min(total_rows);
+            let body = make_csv(pg_id, hi);
+            let copy_stmt = format!(
                     "COPY {schema}.events (id, user_id, amount, status, created_at) FROM STDIN WITH (FORMAT csv)"
                 );
-                match pg.copy_in::<_, Bytes>(&copy_stmt).await {
-                    Ok(sink) => {
-                        futures::pin_mut!(sink);
-                        let _ = sink.send(Bytes::from(body.into_bytes())).await;
-                        let _ = sink.as_mut().finish().await;
-                    }
-                    Err(_) => { break; }
+            match pg.copy_in::<_, Bytes>(&copy_stmt).await {
+                Ok(sink) => {
+                    futures::pin_mut!(sink);
+                    let _ = sink.send(Bytes::from(body.into_bytes())).await;
+                    let _ = sink.as_mut().finish().await;
                 }
-                pg_id = hi;
+                Err(_) => {
+                    break;
+                }
             }
-            let pg_csv_rps = if pg_id >= total_rows {
-                total_rows as f64 / t.elapsed().as_secs_f64()
-            } else {
-                f64::NAN
-            };
-            eprintln!("[copy] pg   COPY csv:     {pg_csv_rps:.0} rows/sec");
-
-            std::mem::forget(_guard);
-            (pg_ins_rps, pg_txt_rps, pg_csv_rps)
+            pg_id = hi;
+        }
+        let pg_csv_rps = if pg_id >= total_rows {
+            total_rows as f64 / t.elapsed().as_secs_f64()
         } else {
-            eprintln!("[copy] PG unavailable — Basin-only ingest numbers");
-            (f64::NAN, f64::NAN, f64::NAN)
+            f64::NAN
         };
+        eprintln!("[copy] pg   COPY csv:     {pg_csv_rps:.0} rows/sec");
+
+        std::mem::forget(_guard);
+        (pg_ins_rps, pg_txt_rps, pg_csv_rps)
+    } else {
+        eprintln!("[copy] PG unavailable — Basin-only ingest numbers");
+        (f64::NAN, f64::NAN, f64::NAN)
+    };
 
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let nan_null = |v: f64| if v.is_nan() { serde_json::Value::Null } else { json!(v) };
+    let nan_null = |v: f64| {
+        if v.is_nan() {
+            serde_json::Value::Null
+        } else {
+            json!(v)
+        }
+    };
     let ratio = |b: f64, p: f64| -> serde_json::Value {
-        if b.is_finite() && p.is_finite() && p > 1e-9 { json!(b / p) } else { serde_json::Value::Null }
+        if b.is_finite() && p.is_finite() && p > 1e-9 {
+            json!(b / p)
+        } else {
+            serde_json::Value::Null
+        }
     };
 
-    write_artifact("copy_ingest_compare.json", &json!({
-        "card": "copy_ingest_compare",
-        "generated_at": format!("@{ts}"),
-        "config": { "total_rows": total_rows, "chunk": chunk },
-        "cells": [
-            {
-                "format": "INSERT VALUES (reference)",
-                "basin_rps": nan_null(basin_insert_rps),
-                "pg_rps": nan_null(pg_insert_rps),
-                "basin_over_pg": ratio(basin_insert_rps, pg_insert_rps),
-            },
-            {
-                "format": "COPY text",
-                "basin_rps": nan_null(basin_copy_text_rps),
-                "pg_rps": nan_null(pg_copy_text_rps),
-                "basin_over_pg": ratio(basin_copy_text_rps, pg_copy_text_rps),
-                "note": if basin_copy_text_rps.is_nan() { "basin: COPY text path not wired via in-process session" } else { "" },
-            },
-            {
-                "format": "COPY csv",
-                "basin_rps": nan_null(basin_copy_csv_rps),
-                "pg_rps": nan_null(pg_copy_csv_rps),
-                "basin_over_pg": ratio(basin_copy_csv_rps, pg_copy_csv_rps),
-            },
-            {
-                "format": "COPY binary",
-                "basin_rps": serde_json::Value::Null,
-                "pg_rps": serde_json::Value::Null,
-                "note": "binary COPY requires pgwire framing; not measurable via in-process sess.execute()",
-            },
-        ],
-    }));
+    write_artifact(
+        "copy_ingest_compare.json",
+        &json!({
+            "card": "copy_ingest_compare",
+            "generated_at": format!("@{ts}"),
+            "config": { "total_rows": total_rows, "chunk": chunk },
+            "cells": [
+                {
+                    "format": "INSERT VALUES (reference)",
+                    "basin_rps": nan_null(basin_insert_rps),
+                    "pg_rps": nan_null(pg_insert_rps),
+                    "basin_over_pg": ratio(basin_insert_rps, pg_insert_rps),
+                },
+                {
+                    "format": "COPY text",
+                    "basin_rps": nan_null(basin_copy_text_rps),
+                    "pg_rps": nan_null(pg_copy_text_rps),
+                    "basin_over_pg": ratio(basin_copy_text_rps, pg_copy_text_rps),
+                    "note": if basin_copy_text_rps.is_nan() { "basin: COPY text path not wired via in-process session" } else { "" },
+                },
+                {
+                    "format": "COPY csv",
+                    "basin_rps": nan_null(basin_copy_csv_rps),
+                    "pg_rps": nan_null(pg_copy_csv_rps),
+                    "basin_over_pg": ratio(basin_copy_csv_rps, pg_copy_csv_rps),
+                },
+                {
+                    "format": "COPY binary",
+                    "basin_rps": serde_json::Value::Null,
+                    "pg_rps": serde_json::Value::Null,
+                    "note": "binary COPY requires pgwire framing; not measurable via in-process sess.execute()",
+                },
+            ],
+        }),
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -508,7 +588,11 @@ async fn durability_modes() {
 
     // ── Basin async (D1) ──────────────────────────────────────────────────────
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     sess.execute(
         "CREATE TABLE audit_log (\
             id BIGINT NOT NULL PRIMARY KEY, \
@@ -534,22 +618,21 @@ async fn durability_modes() {
     }
     let b_async_p50 = common::median(&basin_async_samples);
     let b_async_p99 = common::percentile(&basin_async_samples, 99.0);
-    eprintln!(
-        "[durability] Basin async: p50={b_async_p50:.3}ms p99={b_async_p99:.3}ms"
-    );
+    eprintln!("[durability] Basin async: p50={b_async_p50:.3}ms p99={b_async_p99:.3}ms");
 
     // ── Basin sync (D2) ───────────────────────────────────────────────────────
     // New project + fresh session so we don't mix async/sync row ids.
     let project_sync = ProjectId::new();
     let sess_sync = instance.engine.open_session(project_sync).await.unwrap();
-    sess_sync.execute(
-        "CREATE TABLE audit_log (\
+    sess_sync
+        .execute(
+            "CREATE TABLE audit_log (\
             id BIGINT NOT NULL PRIMARY KEY, \
             event TEXT NOT NULL, \
             ts BIGINT NOT NULL)",
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap();
     sess_sync
         .execute("SET basin.synchronous_commit = on")
         .await
@@ -589,7 +672,8 @@ async fn durability_modes() {
     let sync_count = match count_res {
         ExecResult::Rows { batches, .. } => {
             use arrow_array::{Array, Int64Array};
-            batches.first()
+            batches
+                .first()
                 .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
                 .map(|a| a.value(0))
                 .unwrap_or(0)
@@ -606,12 +690,19 @@ async fn durability_modes() {
         if let Some((pg, cs)) = try_connect().await {
             let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
             let schema = format!("basin_dur_{suffix}");
-            let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-            pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.unwrap();
+            let _guard = SchemaGuard {
+                schema: schema.clone(),
+                conn_str: cs,
+            };
+            pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+                .await
+                .unwrap();
             pg.simple_query(&format!(
                 "CREATE TABLE {schema}.audit_log (\
                     id BIGINT PRIMARY KEY, event TEXT NOT NULL, ts BIGINT NOT NULL)"
-            )).await.unwrap();
+            ))
+            .await
+            .unwrap();
 
             // PG D1: default synchronous_commit = local
             let _ = pg.simple_query("SET synchronous_commit = local").await;
@@ -621,7 +712,9 @@ async fn durability_modes() {
                 pg.simple_query(&format!(
                     "INSERT INTO {schema}.audit_log VALUES ({i}, 'click', {})",
                     1_700_000_000i64 + i
-                )).await.expect("pg async insert");
+                ))
+                .await
+                .expect("pg async insert");
                 pg_async.push(t.elapsed().as_secs_f64() * 1000.0);
             }
             let pa50 = common::median(&pg_async);
@@ -629,15 +722,20 @@ async fn durability_modes() {
             eprintln!("[durability] PG async:  p50={pa50:.3}ms p99={pa99:.3}ms");
 
             // PG D2: synchronous_commit = on (full fsync)
-            pg.simple_query("SET synchronous_commit = on").await.expect("pg set sync");
+            pg.simple_query("SET synchronous_commit = on")
+                .await
+                .expect("pg set sync");
             let mut pg_sync: Vec<f64> = Vec::with_capacity(n_iters);
             let offset = n_iters as i64;
             for i in 0..n_iters as i64 {
                 let t = Instant::now();
                 pg.simple_query(&format!(
                     "INSERT INTO {schema}.audit_log VALUES ({}, 'click', {})",
-                    offset + i, 1_700_000_000i64 + offset + i
-                )).await.expect("pg sync insert");
+                    offset + i,
+                    1_700_000_000i64 + offset + i
+                ))
+                .await
+                .expect("pg sync insert");
                 pg_sync.push(t.elapsed().as_secs_f64() * 1000.0);
             }
             let ps50 = common::median(&pg_sync);
@@ -671,37 +769,46 @@ async fn durability_modes() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let nan_null = |v: f64| if v.is_nan() { serde_json::Value::Null } else { json!(v) };
+    let nan_null = |v: f64| {
+        if v.is_nan() {
+            serde_json::Value::Null
+        } else {
+            json!(v)
+        }
+    };
 
-    write_artifact("durability_modes.json", &json!({
-        "card": "durability_modes",
-        "generated_at": format!("@{ts}"),
-        "config": {
-            "n_iters": n_iters,
-            "basin_data_fsync_knob": serde_json::Value::Null,
-            "note": "BASIN_DATA_FSYNC not yet queryable via session GUC; measuring basin.synchronous_commit axis only",
-        },
-        "basin": {
-            "async_commit_d1": { "p50_ms": b_async_p50, "p99_ms": b_async_p99 },
-            "sync_commit_d2":  { "p50_ms": b_sync_p50,  "p99_ms": b_sync_p99  },
-            "sync_overhead_multiplier_p99": b_overhead,
-        },
-        "postgres": {
-            "async_commit_d1": {
-                "p50_ms": nan_null(pg_async_p50),
-                "p99_ms": nan_null(pg_async_p99),
+    write_artifact(
+        "durability_modes.json",
+        &json!({
+            "card": "durability_modes",
+            "generated_at": format!("@{ts}"),
+            "config": {
+                "n_iters": n_iters,
+                "basin_data_fsync_knob": serde_json::Value::Null,
+                "note": "BASIN_DATA_FSYNC not yet queryable via session GUC; measuring basin.synchronous_commit axis only",
             },
-            "sync_commit_d2": {
-                "p50_ms": nan_null(pg_sync_p50),
-                "p99_ms": nan_null(pg_sync_p99),
+            "basin": {
+                "async_commit_d1": { "p50_ms": b_async_p50, "p99_ms": b_async_p99 },
+                "sync_commit_d2":  { "p50_ms": b_sync_p50,  "p99_ms": b_sync_p99  },
+                "sync_overhead_multiplier_p99": b_overhead,
             },
-            "sync_overhead_multiplier_p99": if pg_async_p99.is_finite() && pg_async_p99 > 1e-9 {
-                json!(pg_sync_p99 / pg_async_p99)
-            } else {
-                serde_json::Value::Null
+            "postgres": {
+                "async_commit_d1": {
+                    "p50_ms": nan_null(pg_async_p50),
+                    "p99_ms": nan_null(pg_async_p99),
+                },
+                "sync_commit_d2": {
+                    "p50_ms": nan_null(pg_sync_p50),
+                    "p99_ms": nan_null(pg_sync_p99),
+                },
+                "sync_overhead_multiplier_p99": if pg_async_p99.is_finite() && pg_async_p99 > 1e-9 {
+                    json!(pg_sync_p99 / pg_async_p99)
+                } else {
+                    serde_json::Value::Null
+                },
             },
-        },
-    }));
+        }),
+    );
 
     if let Some(bg) = instance.bg.take() {
         bg.shutdown().await;

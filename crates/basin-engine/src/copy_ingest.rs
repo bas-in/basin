@@ -164,10 +164,7 @@ fn parse_bytea(s: &str, col: &str) -> Result<Vec<u8>> {
     // PG hex-escape: \xDEADBEEF
     if let Some(hex) = s.strip_prefix("\\x") {
         return hex::decode(hex).map_err(|_| {
-            BasinError::InvalidSchema(format!(
-                "invalid bytea hex {:?} for column {col}",
-                s
-            ))
+            BasinError::InvalidSchema(format!("invalid bytea hex {:?} for column {col}", s))
         });
     }
     // Raw UTF-8 bytes (test/simple use-cases).
@@ -176,11 +173,9 @@ fn parse_bytea(s: &str, col: &str) -> Result<Vec<u8>> {
 
 fn parse_jsonb(s: &str, col: &str) -> Result<Vec<u8>> {
     let s = s.trim();
-    let v: serde_json::Value = serde_json::from_str(s).map_err(|e| {
-        BasinError::InvalidSchema(format!("invalid JSON for column {col}: {e}"))
-    })?;
-    serde_json::to_vec(&v)
-        .map_err(|e| BasinError::internal(format!("jsonb re-serialise: {e}")))
+    let v: serde_json::Value = serde_json::from_str(s)
+        .map_err(|e| BasinError::InvalidSchema(format!("invalid JSON for column {col}: {e}")))?;
+    serde_json::to_vec(&v).map_err(|e| BasinError::internal(format!("jsonb re-serialise: {e}")))
 }
 
 fn parse_decimal128(s: &str, precision: u8, scale: i8, col: &str) -> Result<i128> {
@@ -211,15 +206,13 @@ fn validate_utf8_cell(s: &str, field: &Field) -> Result<()> {
     if field_is_inet(field) {
         // Accept either bare IP ("192.168.1.1") or CIDR-notation ("192.168.1.0/24").
         let ip_part = s.split('/').next().unwrap_or(s);
-        ip_part
-            .parse::<std::net::IpAddr>()
-            .map_err(|_| {
-                BasinError::InvalidSchema(format!(
-                    "invalid INET address {:?} for column {}",
-                    s,
-                    field.name()
-                ))
-            })?;
+        ip_part.parse::<std::net::IpAddr>().map_err(|_| {
+            BasinError::InvalidSchema(format!(
+                "invalid INET address {:?} for column {}",
+                s,
+                field.name()
+            ))
+        })?;
     }
     if field_is_bit(field) {
         let n = bit_fixed_len(field) as usize;
@@ -296,7 +289,10 @@ pub(crate) fn batch_from_csv_rows(
                 let mut b = Int64Builder::with_capacity(rows.len());
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; b.append_null(); }
+                        None => {
+                            null_check(field)?;
+                            b.append_null();
+                        }
                         Some(s) => b.append_value(parse_i64(s, field.name())?),
                     }
                 }
@@ -306,7 +302,10 @@ pub(crate) fn batch_from_csv_rows(
                 let mut b = Int32Builder::with_capacity(rows.len());
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; b.append_null(); }
+                        None => {
+                            null_check(field)?;
+                            b.append_null();
+                        }
                         Some(s) => {
                             let v = parse_i64(s, field.name())?;
                             let v32 = i32::try_from(v).map_err(|_| {
@@ -325,7 +324,10 @@ pub(crate) fn batch_from_csv_rows(
                 let mut b = Int16Builder::with_capacity(rows.len());
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; b.append_null(); }
+                        None => {
+                            null_check(field)?;
+                            b.append_null();
+                        }
                         Some(s) => {
                             let v = parse_i64(s, field.name())?;
                             let v16 = i16::try_from(v).map_err(|_| {
@@ -344,7 +346,10 @@ pub(crate) fn batch_from_csv_rows(
                 let mut b = Float64Builder::with_capacity(rows.len());
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; b.append_null(); }
+                        None => {
+                            null_check(field)?;
+                            b.append_null();
+                        }
                         Some(s) => b.append_value(parse_f64(s, field.name())?),
                     }
                 }
@@ -354,7 +359,10 @@ pub(crate) fn batch_from_csv_rows(
                 let mut b = Float32Builder::with_capacity(rows.len());
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; b.append_null(); }
+                        None => {
+                            null_check(field)?;
+                            b.append_null();
+                        }
                         Some(s) => b.append_value(parse_f64(s, field.name())? as f32),
                     }
                 }
@@ -364,7 +372,10 @@ pub(crate) fn batch_from_csv_rows(
                 let mut b = BooleanBuilder::with_capacity(rows.len());
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; b.append_null(); }
+                        None => {
+                            null_check(field)?;
+                            b.append_null();
+                        }
                         Some(s) => b.append_value(parse_bool(s, field.name())?),
                     }
                 }
@@ -375,7 +386,10 @@ pub(crate) fn batch_from_csv_rows(
                     .with_data_type(field.data_type().clone());
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; b.append_null(); }
+                        None => {
+                            null_check(field)?;
+                            b.append_null();
+                        }
                         Some(s) => b.append_value(parse_timestamp_micros(s, field.name())?),
                     }
                 }
@@ -385,7 +399,10 @@ pub(crate) fn batch_from_csv_rows(
                 let mut b = Date32Builder::with_capacity(rows.len());
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; b.append_null(); }
+                        None => {
+                            null_check(field)?;
+                            b.append_null();
+                        }
                         Some(s) => b.append_value(parse_date32(s, field.name())?),
                     }
                 }
@@ -395,7 +412,10 @@ pub(crate) fn batch_from_csv_rows(
                 let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 16);
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; b.append_null(); }
+                        None => {
+                            null_check(field)?;
+                            b.append_null();
+                        }
                         Some(s) => b.append_value(&parse_bytea(s, field.name())?),
                     }
                 }
@@ -405,7 +425,10 @@ pub(crate) fn batch_from_csv_rows(
                 let mut b = LargeBinaryBuilder::with_capacity(rows.len(), rows.len() * 32);
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; b.append_null(); }
+                        None => {
+                            null_check(field)?;
+                            b.append_null();
+                        }
                         Some(s) => b.append_value(&parse_jsonb(s, field.name())?),
                     }
                 }
@@ -415,7 +438,10 @@ pub(crate) fn batch_from_csv_rows(
                 let mut b = LargeBinaryBuilder::with_capacity(rows.len(), rows.len() * 16);
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; b.append_null(); }
+                        None => {
+                            null_check(field)?;
+                            b.append_null();
+                        }
                         Some(s) => b.append_value(&parse_bytea(s, field.name())?),
                     }
                 }
@@ -425,7 +451,10 @@ pub(crate) fn batch_from_csv_rows(
                 let mut b = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; b.append_null(); }
+                        None => {
+                            null_check(field)?;
+                            b.append_null();
+                        }
                         Some(s) => {
                             let bytes = parse_uuid(s, field.name())?;
                             b.append_value(bytes).map_err(|e| {
@@ -452,7 +481,10 @@ pub(crate) fn batch_from_csv_rows(
                 let mut row_iter: Vec<Option<Vec<Option<f32>>>> = Vec::with_capacity(rows.len());
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; row_iter.push(None); }
+                        None => {
+                            null_check(field)?;
+                            row_iter.push(None);
+                        }
                         Some(s) => {
                             let v = crate::types::parse_vector_literal(s)?;
                             if v.len() != dim_usize {
@@ -466,9 +498,9 @@ pub(crate) fn batch_from_csv_rows(
                         }
                     }
                 }
-                Arc::new(FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                    row_iter, *dim,
-                ))
+                Arc::new(
+                    FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(row_iter, *dim),
+                )
             }
             DataType::Decimal128(p, s) => {
                 let (p, s) = (*p, *s);
@@ -476,7 +508,10 @@ pub(crate) fn batch_from_csv_rows(
                 let mut values: Vec<Option<i128>> = Vec::with_capacity(rows.len());
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; values.push(None); }
+                        None => {
+                            null_check(field)?;
+                            values.push(None);
+                        }
                         Some(text) => {
                             let stripped = if is_money {
                                 text.trim().trim_start_matches(|c: char| {
@@ -505,7 +540,10 @@ pub(crate) fn batch_from_csv_rows(
                 let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
                 for row in rows {
                     match &row[col_idx] {
-                        None => { null_check(field)?; b.append_null(); }
+                        None => {
+                            null_check(field)?;
+                            b.append_null();
+                        }
                         Some(s) => {
                             validate_utf8_cell(s, field)?;
                             b.append_value(s);
@@ -740,23 +778,16 @@ async fn apply_column_defaults_to_batch(
         .iter()
         .map(|n| sqlparser::ast::Ident::new(n.clone()))
         .collect();
-    let mut null_rows: Vec<Vec<sqlparser::ast::Expr>> =
-        vec![vec![null_expr(); n_cols]; n_rows];
+    let mut null_rows: Vec<Vec<sqlparser::ast::Expr>> = vec![vec![null_expr(); n_cols]; n_rows];
 
     // apply_column_defaults is private to executor.rs; call via the public
     // wrapper added in executor.rs for this purpose.
-    crate::executor::apply_column_defaults_pub(
-        sess,
-        schema.as_ref(),
-        &col_idents,
-        &mut null_rows,
-    )
-    .await?;
+    crate::executor::apply_column_defaults_pub(sess, schema.as_ref(), &col_idents, &mut null_rows)
+        .await?;
 
     // Splice defaults back: for unlisted columns that had a DEFAULT,
     // build a single-column batch from the filled Expr values.
-    let mut new_columns: Vec<std::sync::Arc<dyn arrow_array::Array>> =
-        Vec::with_capacity(n_cols);
+    let mut new_columns: Vec<std::sync::Arc<dyn arrow_array::Array>> = Vec::with_capacity(n_cols);
     for (col_idx, field) in schema.fields().iter().enumerate() {
         let col_name_lower = field.name().to_ascii_lowercase();
         if supplied_set.contains(&col_name_lower) {

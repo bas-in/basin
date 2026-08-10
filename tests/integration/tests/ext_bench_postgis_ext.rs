@@ -45,7 +45,10 @@ const QUERY_X: f64 = 5.0;
 const QUERY_Y: f64 = 5.0;
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn write_artifact(file: &str, value: &serde_json::Value) {
@@ -62,7 +65,10 @@ fn write_artifact(file: &str, value: &serde_json::Value) {
     if let Ok(bytes) = serde_json::to_vec_pretty(value) {
         let _ = std::fs::write(&tmp, &bytes);
         let _ = std::fs::rename(&tmp, &path);
-        eprintln!("[ext_bench_postgis_ext] artifact written: {}", path.display());
+        eprintln!(
+            "[ext_bench_postgis_ext] artifact written: {}",
+            path.display()
+        );
     }
 }
 
@@ -140,10 +146,15 @@ async fn basin_p50(sess: &basin_engine::ProjectSession, sql: &str, n: usize) -> 
 }
 
 async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f64> {
-    let _ = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await;
+    let _ = pg
+        .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+        .await;
     let mut s = Vec::with_capacity(n);
     for _ in 0..n {
-        if let Ok(rs) = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await {
+        if let Ok(rs) = pg
+            .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+            .await
+        {
             for m in &rs {
                 if let SimpleQueryMessage::Row(r) = m {
                     if let Some(line) = r.get(0) {
@@ -160,7 +171,11 @@ async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f6
             }
         }
     }
-    if s.is_empty() { None } else { Some(median(&s)) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(median(&s))
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -173,7 +188,11 @@ async fn ext_bench_postgis_ext() {
     let points = build_points(rows);
 
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     sess.execute("CREATE TABLE pts (id BIGINT, geom POINT) WITH (basin.file_format='parquet')")
         .await
         .unwrap();
@@ -194,7 +213,9 @@ async fn ext_bench_postgis_ext() {
         i = end;
     }
     instance.shard.flush_to_parquet().await.unwrap();
-    let _ = sess.execute("CREATE INDEX idx_pts_geom ON pts USING gist(geom)").await;
+    let _ = sess
+        .execute("CREATE INDEX idx_pts_geom ON pts USING gist(geom)")
+        .await;
     if let Some(bg) = instance.bg.take() {
         bg.shutdown().await;
     }
@@ -205,7 +226,12 @@ async fn ext_bench_postgis_ext() {
          FROM pts ORDER BY d LIMIT 10"
     );
     let ge1_b = basin_p50(&sess, &ge1_sql, samples).await;
-    let ge1_sup = sess.execute(&ge1_sql).await.map(|r| rows_of(&r)).unwrap_or(0) > 0;
+    let ge1_sup = sess
+        .execute(&ge1_sql)
+        .await
+        .map(|r| rows_of(&r))
+        .unwrap_or(0)
+        > 0;
 
     println!("[ext_bench_postgis_ext] Basin: GE1(dist-order,sup={ge1_sup})={ge1_b:?}");
 
@@ -224,9 +250,18 @@ async fn ext_bench_postgis_ext() {
             pg_available = true;
             let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
             let schema = format!("basin_ext_geox_{suffix}");
-            let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-            pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.ok();
-            pg.simple_query(&format!("CREATE TABLE {schema}.pts (id BIGINT, geom geometry(Point))")).await.ok();
+            let _guard = SchemaGuard {
+                schema: schema.clone(),
+                conn_str: cs,
+            };
+            pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+                .await
+                .ok();
+            pg.simple_query(&format!(
+                "CREATE TABLE {schema}.pts (id BIGINT, geom geometry(Point))"
+            ))
+            .await
+            .ok();
             let mut p = 0usize;
             while p < points.len() {
                 let end = (p + batch).min(points.len());
@@ -237,17 +272,31 @@ async fn ext_bench_postgis_ext() {
                     }
                     v.push_str(&format!("({id}, ST_MakePoint({x},{y}))"));
                 }
-                pg.simple_query(&format!("INSERT INTO {schema}.pts (id, geom) VALUES {v}")).await.ok();
+                pg.simple_query(&format!("INSERT INTO {schema}.pts (id, geom) VALUES {v}"))
+                    .await
+                    .ok();
                 p = end;
             }
-            pg.simple_query(&format!("CREATE INDEX pts_geom_gist ON {schema}.pts USING gist(geom)")).await.ok();
+            pg.simple_query(&format!(
+                "CREATE INDEX pts_geom_gist ON {schema}.pts USING gist(geom)"
+            ))
+            .await
+            .ok();
             pg.simple_query(&format!("ANALYZE {schema}.pts")).await.ok();
 
-            pg_ge1 = pg_p50(&pg, &format!(
-                "SELECT id, ST_Distance(geom, ST_MakePoint({QUERY_X},{QUERY_Y})) AS d \
-                 FROM {schema}.pts ORDER BY d LIMIT 10"), samples).await;
+            pg_ge1 = pg_p50(
+                &pg,
+                &format!(
+                    "SELECT id, ST_Distance(geom, ST_MakePoint({QUERY_X},{QUERY_Y})) AS d \
+                 FROM {schema}.pts ORDER BY d LIMIT 10"
+                ),
+                samples,
+            )
+            .await;
 
-            let _ = pg.simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+            let _ = pg
+                .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                .await;
             std::mem::forget(_guard);
         } else {
             eprintln!("[ext_bench_postgis_ext] PG lacks postgis — Basin-only card");
@@ -256,23 +305,29 @@ async fn ext_bench_postgis_ext() {
         eprintln!("[ext_bench_postgis_ext] PG unavailable — Basin-only card");
     }
 
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("ext_bench_postgis_ext.json", &json!({
-        "card": "ext_bench_postgis_ext",
-        "family": "postgis",
-        "generated_at": format!("@{ts}"),
-        "pg_available": pg_available,
-        "pg_extension_available": pg_available,
-        "config": { "rows": rows, "samples": samples },
-        "shapes": [
-            { "label": "GE1: ST_Distance ORDER BY LIMIT 10 (ranked nearest, distance projection)",
-              "basin_supported": ge1_sup, "basin_p50_ms": opt_ms(ge1_b), "pg_p50_ms": opt_ms(pg_ge1),
-              "basin_over_pg": ratio(ge1_b, pg_ge1) },
-        ],
-        "note": "Coverage-expansion card for PostGIS: the ranked 'sort by distance' top-N \
-                 (ST_Distance projection + ORDER BY), the shape every nearest-N UI runs — \
-                 distinct from the base card's <-> KNN probe and DWithin COUNT. Spatial \
-                 JOIN, polygon-containment-at-scale and the KNN index path are deferred to \
-                 a post-merge expansion once the geometry-types feature lands.",
-    }));
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "ext_bench_postgis_ext.json",
+        &json!({
+            "card": "ext_bench_postgis_ext",
+            "family": "postgis",
+            "generated_at": format!("@{ts}"),
+            "pg_available": pg_available,
+            "pg_extension_available": pg_available,
+            "config": { "rows": rows, "samples": samples },
+            "shapes": [
+                { "label": "GE1: ST_Distance ORDER BY LIMIT 10 (ranked nearest, distance projection)",
+                  "basin_supported": ge1_sup, "basin_p50_ms": opt_ms(ge1_b), "pg_p50_ms": opt_ms(pg_ge1),
+                  "basin_over_pg": ratio(ge1_b, pg_ge1) },
+            ],
+            "note": "Coverage-expansion card for PostGIS: the ranked 'sort by distance' top-N \
+                     (ST_Distance projection + ORDER BY), the shape every nearest-N UI runs — \
+                     distinct from the base card's <-> KNN probe and DWithin COUNT. Spatial \
+                     JOIN, polygon-containment-at-scale and the KNN index path are deferred to \
+                     a post-merge expansion once the geometry-types feature lands.",
+        }),
+    );
 }

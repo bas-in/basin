@@ -18,7 +18,9 @@ use anyhow::Result;
 use rand::Rng;
 use tracing::info;
 
-use crate::{connect, percentile, time_exec, time_query_f64, Args, ConnConfig, Metric, WorkloadReport};
+use crate::{
+    connect, percentile, time_exec, time_query_f64, Args, ConnConfig, Metric, WorkloadReport,
+};
 
 const TABLE: &str = "e2e_perf_events";
 
@@ -74,7 +76,10 @@ async fn run_inner(args: &Args) -> Result<WorkloadReport> {
     info!("perf: single-row INSERT p50/p99 (100 samples)...");
     let mut insert_samples: Vec<f64> = Vec::with_capacity(100);
     for i in 1001i64..=1100 {
-        let sql = format!("INSERT INTO {TABLE} VALUES ({i}, 'bench', {})", i as f64 * 0.001);
+        let sql = format!(
+            "INSERT INTO {TABLE} VALUES ({i}, 'bench', {})",
+            i as f64 * 0.001
+        );
         let d = time_exec(&client, &sql).await?;
         insert_samples.push(d.as_secs_f64() * 1000.0);
     }
@@ -137,9 +142,7 @@ async fn run_inner(args: &Args) -> Result<WorkloadReport> {
         Metric::latency_ms_with_budget("UPDATE p99", update_p99, UPDATE_P99_BUDGET_MS),
     ];
 
-    let passed = metrics
-        .iter()
-        .all(|m| m.passed.unwrap_or(true));
+    let passed = metrics.iter().all(|m| m.passed.unwrap_or(true));
 
     Ok(WorkloadReport {
         name: "perf".into(),

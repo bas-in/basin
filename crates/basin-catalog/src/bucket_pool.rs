@@ -293,6 +293,9 @@ mod tests {
             let pid = format!("partition-{i}");
             seen[stripe_slot(&pid, k)] = true;
         }
-        assert!(seen.iter().all(|&b| b), "stripe map must spread across all buckets");
+        assert!(
+            seen.iter().all(|&b| b),
+            "stripe map must spread across all buckets"
+        );
     }
 }

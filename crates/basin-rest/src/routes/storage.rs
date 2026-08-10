@@ -173,12 +173,10 @@ fn blob_err_to_api(e: BlobError) -> ApiError {
         BlobError::MimeTypeNotAllowed(mt) => {
             ApiError::invalid(format!("mime type not allowed: {mt}"))
         }
-        BlobError::PayloadTooLarge { size, limit } => {
-            ApiError::new(
-                crate::errors::ErrorCode::PayloadTooLarge,
-                format!("payload too large: {size} bytes exceeds limit of {limit}"),
-            )
-        }
+        BlobError::PayloadTooLarge { size, limit } => ApiError::new(
+            crate::errors::ErrorCode::PayloadTooLarge,
+            format!("payload too large: {size} bytes exceeds limit of {limit}"),
+        ),
         BlobError::ObjectStore(e) => ApiError::internal(format!("object store error: {e}")),
         BlobError::Serde(e) => ApiError::invalid(format!("serialisation error: {e}")),
         BlobError::Catalog(msg) => ApiError::internal(format!("blob catalog error: {msg}")),
@@ -350,11 +348,19 @@ pub(crate) async fn download_object(
     // 5.17.C: Enforce RLS unless the bucket is public.
     if !bucket_meta.public {
         let caller = CallerCtx::authenticated(claims.user_id);
-        let (rls_enabled, applicable) = state
-            .blob_store
-            .objects_rls_applicable(&project, ObjectPolicyCommand::Select, &caller.role);
-        blob_rls::check_object_access(rls_enabled, &applicable, &meta, &caller, ObjectPolicyCommand::Select)
-            .map_err(|msg| ApiError::forbidden(msg))?;
+        let (rls_enabled, applicable) = state.blob_store.objects_rls_applicable(
+            &project,
+            ObjectPolicyCommand::Select,
+            &caller.role,
+        );
+        blob_rls::check_object_access(
+            rls_enabled,
+            &applicable,
+            &meta,
+            &caller,
+            ObjectPolicyCommand::Select,
+        )
+        .map_err(|msg| ApiError::forbidden(msg))?;
     }
 
     let mut builder = axum::http::Response::builder().status(StatusCode::OK);
@@ -362,10 +368,7 @@ pub(crate) async fn download_object(
     if let Some(ref ct) = meta.mime_type {
         builder = builder.header(header::CONTENT_TYPE, ct.as_str());
     } else {
-        builder = builder.header(
-            header::CONTENT_TYPE,
-            "application/octet-stream",
-        );
+        builder = builder.header(header::CONTENT_TYPE, "application/octet-stream");
     }
     builder = builder.header(header::ETAG, &meta.etag);
     builder = builder.header(header::CONTENT_LENGTH, data.len().to_string());
@@ -390,9 +393,11 @@ pub(crate) async fn delete_object(
 
     // 5.17.C: Fetch the object metadata to evaluate RLS before deleting.
     let caller = CallerCtx::authenticated(claims.user_id);
-    let (rls_enabled, applicable) = state
-        .blob_store
-        .objects_rls_applicable(&project, ObjectPolicyCommand::Delete, &caller.role);
+    let (rls_enabled, applicable) = state.blob_store.objects_rls_applicable(
+        &project,
+        ObjectPolicyCommand::Delete,
+        &caller.role,
+    );
 
     if rls_enabled {
         // Load the object row to evaluate the USING predicate.
@@ -401,8 +406,14 @@ pub(crate) async fn delete_object(
             .get_object(&project, &bucket, &path)
             .await
             .map_err(blob_err_to_api)?;
-        blob_rls::check_object_access(rls_enabled, &applicable, &meta, &caller, ObjectPolicyCommand::Delete)
-            .map_err(|msg| ApiError::forbidden(msg))?;
+        blob_rls::check_object_access(
+            rls_enabled,
+            &applicable,
+            &meta,
+            &caller,
+            ObjectPolicyCommand::Delete,
+        )
+        .map_err(|msg| ApiError::forbidden(msg))?;
     }
 
     state
@@ -469,11 +480,19 @@ pub(crate) async fn download_public_object(
     // they would be on the authenticated path.  This closes the alias bypass
     // where the public path silently skipped all policy evaluation.
     let caller = CallerCtx::anonymous();
-    let (rls_enabled, applicable) = state
-        .blob_store
-        .objects_rls_applicable(&project, ObjectPolicyCommand::Select, &caller.role);
-    blob_rls::check_object_access(rls_enabled, &applicable, &obj_meta, &caller, ObjectPolicyCommand::Select)
-        .map_err(|msg| ApiError::forbidden(msg))?;
+    let (rls_enabled, applicable) = state.blob_store.objects_rls_applicable(
+        &project,
+        ObjectPolicyCommand::Select,
+        &caller.role,
+    );
+    blob_rls::check_object_access(
+        rls_enabled,
+        &applicable,
+        &obj_meta,
+        &caller,
+        ObjectPolicyCommand::Select,
+    )
+    .map_err(|msg| ApiError::forbidden(msg))?;
 
     let mut builder = axum::http::Response::builder().status(StatusCode::OK);
 
@@ -530,9 +549,11 @@ pub(crate) async fn list_objects(
         objects
     } else {
         let caller = CallerCtx::authenticated(claims.user_id);
-        let (rls_enabled, applicable) = state
-            .blob_store
-            .objects_rls_applicable(&project, ObjectPolicyCommand::Select, &caller.role);
+        let (rls_enabled, applicable) = state.blob_store.objects_rls_applicable(
+            &project,
+            ObjectPolicyCommand::Select,
+            &caller.role,
+        );
         blob_rls::filter_objects(rls_enabled, &applicable, objects, &caller)
     };
 
@@ -572,9 +593,11 @@ pub(crate) async fn bulk_delete_objects(
 
     // 5.17.C: Build RLS context once for the entire bulk operation.
     let caller = CallerCtx::authenticated(claims.user_id);
-    let (rls_enabled, applicable) = state
-        .blob_store
-        .objects_rls_applicable(&project, ObjectPolicyCommand::Delete, &caller.role);
+    let (rls_enabled, applicable) = state.blob_store.objects_rls_applicable(
+        &project,
+        ObjectPolicyCommand::Delete,
+        &caller.role,
+    );
 
     let mut deleted = 0usize;
     for prefix in &body.prefixes {

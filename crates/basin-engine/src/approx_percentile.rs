@@ -141,10 +141,7 @@ fn numeric_to_f64(arr: &dyn Array, idx: usize) -> DFResult<f64> {
         Float32 => cast_prim!(Float32Array),
         Float64 => cast_prim!(Float64Array),
         other => {
-            return exec_err!(
-                "APPROX_PERCENTILE: unsupported column type {:?}",
-                other
-            );
+            return exec_err!("APPROX_PERCENTILE: unsupported column type {:?}", other);
         }
     }
 
@@ -167,10 +164,7 @@ impl ApproxPercentileUdaf {
         // Float64 literal.  We use a custom TypeSignature to document the
         // intent even though at runtime we validate the first arg ourselves.
         Self {
-            signature: Signature::new(
-                TypeSignature::Any(2),
-                Volatility::Immutable,
-            ),
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
         }
     }
 }
@@ -192,7 +186,10 @@ impl AggregateUDFImpl for ApproxPercentileUdaf {
         Ok(DataType::Float64)
     }
 
-    fn accumulator(&self, args: AccumulatorArgs) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
+    fn accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
         // The second argument must be a Float64 literal.  Extract it by
         // evaluating the PhysicalExpr against an empty batch so the accumulator
         // captures `p` at plan time.
@@ -226,15 +223,11 @@ impl AggregateUDFImpl for ApproxPercentileUdaf {
                 }
             }
         } else {
-            return exec_err!(
-                "APPROX_PERCENTILE: requires two arguments: (col, percentile)"
-            );
+            return exec_err!("APPROX_PERCENTILE: requires two arguments: (col, percentile)");
         };
 
         if !(0.0..=1.0).contains(&p) {
-            return exec_err!(
-                "APPROX_PERCENTILE: percentile p={p} must be in [0.0, 1.0]"
-            );
+            return exec_err!("APPROX_PERCENTILE: percentile p={p} must be in [0.0, 1.0]");
         }
 
         Ok(Box::new(ApproxPercentileAccumulator::new(p)))
@@ -285,7 +278,10 @@ impl AggregateUDFImpl for ApproxPercentileContUdaf {
     fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
         self.inner.return_type(arg_types)
     }
-    fn accumulator(&self, args: AccumulatorArgs) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
+    fn accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
         self.inner.accumulator(args)
     }
     fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<FieldRef>> {

@@ -65,7 +65,10 @@ async fn seed_events(sess: &basin_engine::ProjectSession) {
             r#"{"category":"purchase","device":{"os":"ios","version":"1.2.3"}}"#,
         ),
         (2, r#"{"category":"signup","device":{"os":"android"}}"#),
-        (3, r#"{"category":"click","device":{"os":"ios","version":"9.9.9"}}"#),
+        (
+            3,
+            r#"{"category":"click","device":{"os":"ios","version":"9.9.9"}}"#,
+        ),
     ];
     for (id, payload) in rows {
         sess.execute(&format!("INSERT INTO events VALUES ({id}, '{payload}')"))

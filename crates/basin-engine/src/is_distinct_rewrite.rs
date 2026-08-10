@@ -98,14 +98,17 @@
 //!   happen via `DistinctOn::try_new`, which validates the prefix, but the
 //!   fields are `pub` so we re-verify defensively).
 
-use datafusion::common::{Column, Result, tree_node::{Transformed, TreeNode}};
+use datafusion::common::{
+    tree_node::{Transformed, TreeNode},
+    Column, Result,
+};
 use datafusion::functions_aggregate::first_last::first_value;
 use datafusion::logical_expr::expr_rewriter::{normalize_cols, normalize_sorts};
 use datafusion::logical_expr::{
-    Aggregate, BinaryExpr, Distinct, DistinctOn, Expr, LogicalPlan, LogicalPlanBuilder, Operator,
-    col,
+    col, Aggregate, BinaryExpr, Distinct, DistinctOn, Expr, LogicalPlan, LogicalPlanBuilder,
+    Operator,
 };
-use datafusion::optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder};
+use datafusion::optimizer::{optimizer::ApplyOrder, OptimizerConfig, OptimizerRule};
 
 /// Rewrites `a IS DISTINCT FROM b` / `a IS NOT DISTINCT FROM b` to pushable
 /// conjunctions/disjunctions of `IS NULL`, `IS NOT NULL`, and `= / !=`
@@ -232,8 +235,7 @@ fn lower_distinct_on(node: DistinctOn) -> Result<Transformed<LogicalPlan>> {
                 Slot::Key(p) => *p,
                 Slot::Agg(i) => group_cnt + *i,
             };
-            col(agg_columns[idx].clone())
-                .alias_qualified(old_qualifier.cloned(), old_field.name())
+            col(agg_columns[idx].clone()).alias_qualified(old_qualifier.cloned(), old_field.name())
         })
         .collect();
 
@@ -281,12 +283,14 @@ fn rewrite_is_distinct_expr(expr: Expr) -> Result<Transformed<Expr>> {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::Result;
     use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
-    use datafusion::logical_expr::{col, BinaryExpr, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator};
+    use datafusion::logical_expr::{
+        col, BinaryExpr, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator,
+    };
     use datafusion::optimizer::OptimizerContext;
+    use std::sync::Arc;
 
     fn make_scan() -> Arc<LogicalTableSource> {
         let schema = Arc::new(Schema::new(vec![
@@ -307,7 +311,9 @@ mod tests {
             .filter(predicate)?
             .build()?;
 
-        let result = IsDistinctRewrite.rewrite(plan, &OptimizerContext::new())?.data;
+        let result = IsDistinctRewrite
+            .rewrite(plan, &OptimizerContext::new())?
+            .data;
         let pred = match &result {
             LogicalPlan::Filter(Filter { predicate, .. }) => format!("{predicate:?}"),
             other => panic!("Expected Filter, got: {other:?}"),
@@ -333,7 +339,9 @@ mod tests {
             .filter(predicate)?
             .build()?;
 
-        let result = IsDistinctRewrite.rewrite(plan, &OptimizerContext::new())?.data;
+        let result = IsDistinctRewrite
+            .rewrite(plan, &OptimizerContext::new())?
+            .data;
         let pred = match &result {
             LogicalPlan::Filter(Filter { predicate, .. }) => format!("{predicate:?}"),
             other => panic!("Expected Filter, got: {other:?}"),
@@ -409,7 +417,10 @@ mod tests {
         // The per-aggregate ORDER BY is trimmed to the non-key tail —
         // `ORDER BY [t.user_id …]` must not appear inside any aggregate.
         assert!(!agg.contains("ORDER BY [t.user_id"), "plan:\n{s}");
-        assert!(agg.contains("ORDER BY [t.created_at DESC NULLS FIRST]"), "plan:\n{s}");
+        assert!(
+            agg.contains("ORDER BY [t.created_at DESC NULLS FIRST]"),
+            "plan:\n{s}"
+        );
         // The stock rule's outer sort on the ON prefix is preserved.
         assert!(s.contains("Sort: t.user_id ASC NULLS LAST"), "plan:\n{s}");
 
@@ -452,16 +463,15 @@ mod tests {
     #[test]
     fn distinct_on_without_order_by_left_untouched() -> Result<()> {
         let plan = LogicalPlanBuilder::scan("t", make_events_scan(), None)?
-            .distinct_on(
-                vec![col("user_id")],
-                vec![col("user_id"), col("id")],
-                None,
-            )?
+            .distinct_on(vec![col("user_id")], vec![col("user_id"), col("id")], None)?
             .build()?;
 
         let result = IsDistinctRewrite.rewrite(plan, &OptimizerContext::new())?;
         assert!(!result.transformed);
-        assert!(matches!(result.data, LogicalPlan::Distinct(Distinct::On(_))));
+        assert!(matches!(
+            result.data,
+            LogicalPlan::Distinct(Distinct::On(_))
+        ));
         Ok(())
     }
 
@@ -522,7 +532,10 @@ mod tests {
         assert_eq!(agg.matches("first_value(").count(), 1, "plan:\n{s}");
         assert!(!agg.contains("ORDER BY [t.user_id"), "plan:\n{s}");
         assert!(!agg.contains("ORDER BY [t.amount"), "plan:\n{s}");
-        assert!(agg.contains("ORDER BY [t.created_at DESC NULLS FIRST]"), "plan:\n{s}");
+        assert!(
+            agg.contains("ORDER BY [t.created_at DESC NULLS FIRST]"),
+            "plan:\n{s}"
+        );
 
         let new_fields: Vec<String> = result
             .data
@@ -533,7 +546,11 @@ mod tests {
             .collect();
         assert_eq!(
             new_fields,
-            vec!["user_id".to_string(), "amount".to_string(), "id".to_string()]
+            vec![
+                "user_id".to_string(),
+                "amount".to_string(),
+                "id".to_string()
+            ]
         );
         Ok(())
     }

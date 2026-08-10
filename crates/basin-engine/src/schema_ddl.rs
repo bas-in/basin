@@ -218,10 +218,7 @@ pub(crate) struct ResolvedName {
 /// `ddl_verb` is woven into the error message ("CREATE TABLE",
 /// "DROP INDEX", …) so the client sees which operation was rejected;
 /// the SQLSTATE on the wire is always `42501` (insufficient_privilege).
-pub(crate) fn guard_reserved_schema_for_user_ddl(
-    name: &ObjectName,
-    ddl_verb: &str,
-) -> Result<()> {
+pub(crate) fn guard_reserved_schema_for_user_ddl(name: &ObjectName, ddl_verb: &str) -> Result<()> {
     // Only two-part names carry a schema qualifier; bare names are always
     // fine (they resolve to `public` per the back-compat default).
     if name.0.len() < 2 {
@@ -746,8 +743,6 @@ fn dollar_tag(bytes: &[u8], i: usize) -> Option<usize> {
     (j < bytes.len() && bytes[j] == b'$').then_some(j - i + 1)
 }
 
-
-
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Extract the schema name string from a `SchemaName`. `AUTHORIZATION
@@ -901,12 +896,7 @@ mod resolution_tests {
     fn unqualified_resolves_to_public_when_present_there() {
         let ss = state();
         // public.t exists → resolution must pick public (pg_catalog has no t).
-        let qt = resolve_qualified_name(
-            &obj(&["t"]),
-            &ss,
-            exists_in(&[("public", "t")]),
-        )
-        .unwrap();
+        let qt = resolve_qualified_name(&obj(&["t"]), &ss, exists_in(&[("public", "t")])).unwrap();
         assert_eq!(qt.to_string(), "public.t");
     }
 

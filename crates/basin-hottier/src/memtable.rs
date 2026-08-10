@@ -1116,7 +1116,7 @@ mod tests {
         let mt = MemTable::new();
         mt.insert(key(1), row(0x01)); // seq 1
         mt.upsert(key(1), row(0x02)); // seq 2 (older v1 retained)
-        // Auto-commit (None) sees the newest version.
+                                      // Auto-commit (None) sees the newest version.
         match mt.get_with_seq(&key(1), None).unwrap() {
             MemRowValue::Row { bytes, .. } => assert_eq!(bytes[0], 0x02),
             _ => panic!("expected newest Row"),
@@ -1155,7 +1155,7 @@ mod tests {
         let mt = MemTable::new();
         mt.insert(key(1), row(0x01)); // seq 1
         mt.upsert(key(1), row(0x02)); // seq 2
-        // Pinned at seq 1: snapshot yields the historical v1, not the newest.
+                                      // Pinned at seq 1: snapshot yields the historical v1, not the newest.
         let snap = mt.snapshot_with_seq(Some(1));
         assert_eq!(snap.len(), 1);
         match &snap[0].1 {
@@ -1188,7 +1188,7 @@ mod tests {
         mt.upsert(key(1), row(0xA1)); // seq 2
         mt.upsert(key(1), row(0xA2)); // seq 3
         mt.upsert(key(1), row(0xA3)); // seq 4
-        // Newest wins for plain reads.
+                                      // Newest wins for plain reads.
         match mt.get(&key(1)).unwrap() {
             MemRowValue::Row { bytes, .. } => assert_eq!(bytes[0], 0xA3),
             _ => panic!(),

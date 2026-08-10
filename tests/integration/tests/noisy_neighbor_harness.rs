@@ -54,6 +54,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use basin_catalog::InMemoryCatalog;
 use basin_common::{ProjectId, TableName};
 use basin_engine::{Engine, EngineConfig};
@@ -63,8 +64,7 @@ use basin_realtime::{
     budget::{BudgetError, BudgetTracker},
     ChannelKey, ChannelRegistry,
 };
-use async_trait::async_trait;
-use basin_router::{ConnectionLimiter, ConnectionLimitProvider, PgRateLimit};
+use basin_router::{ConnectionLimitProvider, ConnectionLimiter, PgRateLimit};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use tokio::task::JoinSet;
@@ -111,8 +111,8 @@ async fn a_htap_hard_cap_isolates_noisy_project() {
 
     // Tiny caps so the noisy project exhausts quickly.
     let cfg = MemTableConfig {
-        project_hard_cap_bytes: 4 * 1024,  // 4 KiB hard cap
-        project_soft_cap_bytes: 2 * 1024,  // 2 KiB soft cap
+        project_hard_cap_bytes: 4 * 1024, // 4 KiB hard cap
+        project_soft_cap_bytes: 2 * 1024, // 2 KiB soft cap
         ..MemTableConfig::default()
     };
     let reg = MemTableRegistry::new_with_config(cfg);
@@ -134,9 +134,7 @@ async fn a_htap_hard_cap_isolates_noisy_project() {
         "FAIRNESS: noisy project must hit HardCapReached after exhausting cap; \
          granted={granted}, hard_cap_hits={hard_cap_hits}"
     );
-    println!(
-        "[scenario_A] noisy project: granted={granted}, hard_cap_hits={hard_cap_hits}"
-    );
+    println!("[scenario_A] noisy project: granted={granted}, hard_cap_hits={hard_cap_hits}");
 
     // Quiet project can still reserve bytes — its bucket is completely independent.
     let quiet_outcome = reg.try_reserve_bytes(&quiet, 1024);
@@ -205,9 +203,7 @@ async fn b_connection_limit_enforces_ceiling() {
         rejected, CAP,
         "rejected count must equal the cap at the time of rejection"
     );
-    println!(
-        "[scenario_B] noisy project rejected at {rejected} connections (cap={CAP}) — correct"
-    );
+    println!("[scenario_B] noisy project rejected at {rejected} connections (cap={CAP}) — correct");
 
     // Quiet project is unaffected: its counter is independent.
     let quiet_guard = limiter
@@ -294,8 +290,12 @@ async fn d_realtime_budget_isolates_per_project() {
     let quiet = ProjectId::new();
 
     // Fill the noisy project's cap with two 512-byte reservations.
-    let guard1 = tracker.try_reserve(noisy, 512).expect("first 512 must succeed");
-    let guard2 = tracker.try_reserve(noisy, 512).expect("second 512 must succeed");
+    let guard1 = tracker
+        .try_reserve(noisy, 512)
+        .expect("first 512 must succeed");
+    let guard2 = tracker
+        .try_reserve(noisy, 512)
+        .expect("second 512 must succeed");
 
     // Now the noisy project is at capacity — next reservation must fail.
     let err = tracker
@@ -382,9 +382,7 @@ async fn e_cron_per_project_job_cap_enforced() {
         matches!(err, ScheduleError::JobCapExceeded { .. }),
         "expected JobCapExceeded, got {err:?}"
     );
-    println!(
-        "[scenario_E] noisy project correctly rejected at {max} jobs: {err}"
-    );
+    println!("[scenario_E] noisy project correctly rejected at {max} jobs: {err}");
 
     // Quiet project is unaffected — can schedule freely.
     store
@@ -451,9 +449,7 @@ async fn f_net_allowlist_deny_all_default() {
         "FAIRNESS: project B must NOT benefit from project A's allowlist entry — \
          allowlists are per-project isolation boundaries"
     );
-    println!(
-        "[scenario_F] project A allowed; project B still denied — allowlists are per-project"
-    );
+    println!("[scenario_F] project A allowed; project B still denied — allowlists are per-project");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -489,9 +485,7 @@ async fn g_net_rate_limit_per_project_isolation() {
         "FAIRNESS: 200 outbound checks at default rate must throttle at least once; \
          got {throttled}"
     );
-    println!(
-        "[scenario_G] noisy project throttled {throttled}/200 outbound calls — correct"
-    );
+    println!("[scenario_G] noisy project throttled {throttled}/200 outbound calls — correct");
 
     // Quiet project's bucket is independent — first check must pass.
     let quiet_result = rl.check(&quiet);
@@ -500,7 +494,9 @@ async fn g_net_rate_limit_per_project_isolation() {
         "FAIRNESS: quiet project must not be rate-limited by noisy project's exhausted bucket; \
          got {quiet_result:?}"
     );
-    println!("[scenario_G] quiet project admitted on first check — per-project isolation confirmed");
+    println!(
+        "[scenario_G] quiet project admitted on first check — per-project isolation confirmed"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -558,8 +554,7 @@ async fn h_realtime_channel_count_visible() {
     println!("[scenario_H] channel_count after prune: {count_after_prune}");
 
     assert_eq!(
-        count_after_prune,
-        0,
+        count_after_prune, 0,
         "FAIRNESS: prune() must evict dead channel entries; \
          before_prune={count_before_prune}, after_prune={count_after_prune}"
     );
@@ -634,9 +629,7 @@ async fn i_cross_project_row_isolation_under_contention() {
                 // Alternate writes and reads.
                 if op_idx % 3 == 0 {
                     let id = (task_id as i64) * 10_000 + op_idx as i64 + 1;
-                    let sql = format!(
-                        "INSERT INTO events VALUES ({id}, '{expected_marker}')"
-                    );
+                    let sql = format!("INSERT INTO events VALUES ({id}, '{expected_marker}')");
                     let s = sess.lock().await;
                     let _ = s.execute(&sql).await;
                 } else {
@@ -677,8 +670,7 @@ async fn i_cross_project_row_isolation_under_contention() {
         OPS_PER_TASK
     );
     assert_eq!(
-        leaks_observed,
-        0,
+        leaks_observed, 0,
         "FAIRNESS: {leaks_observed} cross-project row leak(s) detected — \
          wedge invariant violated under concurrent write contention"
     );

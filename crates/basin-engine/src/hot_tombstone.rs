@@ -33,14 +33,14 @@ use arrow_schema::{DataType, SchemaRef};
 use basin_common::{ProjectId, TableName};
 use basin_hottier::{MemRowValue, MemTableRegistry, RowKey};
 use datafusion::common::Result as DFResult;
-use datafusion::execution::context::TaskContext;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::config::ConfigOptions;
+use datafusion::execution::context::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::filter_pushdown::{
     ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
     FilterPushdownPropagation,
 };
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     SendableRecordBatchStream,
@@ -838,8 +838,8 @@ pub(crate) fn apply_update_overlay_to_batches(
         _ => {
             let schema = appended[0].schema();
             if appended.iter().all(|b| b.schema() == schema) {
-                let merged = arrow_select::concat::concat_batches(&schema, &appended)
-                    .map_err(|e| {
+                let merged =
+                    arrow_select::concat::concat_batches(&schema, &appended).map_err(|e| {
                         datafusion::common::DataFusionError::ArrowError(Box::new(e), None)
                     })?;
                 out.push(merged);
@@ -966,8 +966,7 @@ pub(crate) fn normalize_batch_to_schema(
     use arrow_array::ArrayRef;
     let read_schema = batch.schema();
     let mut changed = false;
-    let mut fields: Vec<Arc<arrow_schema::Field>> =
-        Vec::with_capacity(read_schema.fields().len());
+    let mut fields: Vec<Arc<arrow_schema::Field>> = Vec::with_capacity(read_schema.fields().len());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(read_schema.fields().len());
     for (idx, f) in read_schema.fields().iter().enumerate() {
         let col = batch.column(idx).clone();
@@ -1177,7 +1176,11 @@ impl datafusion::catalog::TableProvider for TombstoneFilteringTable {
             let cold_plan = self.cold.scan(state, projection, filters, limit).await?;
             return Ok(cold_plan);
         };
-        let pk_dt = self.catalog_schema.field(pk_idx_in_schema).data_type().clone();
+        let pk_dt = self
+            .catalog_schema
+            .field(pk_idx_in_schema)
+            .data_type()
+            .clone();
 
         // If the caller's projection omits the PK column we must add it so the
         // tombstone filter / update overlay has the key bytes to compare. We
@@ -1337,15 +1340,17 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
         let tombstones: HashSet<Vec<u8>> = [2i64, 4]
             .iter()
-            .map(|v| RowKey::builder().append_i64(*v).finish().as_bytes().to_vec())
+            .map(|v| {
+                RowKey::builder()
+                    .append_i64(*v)
+                    .finish()
+                    .as_bytes()
+                    .to_vec()
+            })
             .collect();
         let out = filter_batch(&batch, "id", &DataType::Int64, &tombstones).unwrap();
         assert_eq!(out.num_rows(), 3);
-        let col = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(col.value(0), 1);
         assert_eq!(col.value(1), 3);
         assert_eq!(col.value(2), 5);
@@ -1366,7 +1371,13 @@ mod tests {
         .unwrap();
         let tombstones: HashSet<Vec<u8>> = [2i64, 5]
             .iter()
-            .map(|v| RowKey::builder().append_i64(*v).finish().as_bytes().to_vec())
+            .map(|v| {
+                RowKey::builder()
+                    .append_i64(*v)
+                    .finish()
+                    .as_bytes()
+                    .to_vec()
+            })
             .collect();
         let out =
             apply_tombstone_filter_to_batches(vec![b1, b2], &tombstones, "id", &DataType::Int64)
@@ -1378,8 +1389,8 @@ mod tests {
     #[test]
     fn apply_tombstone_filter_to_batches_empty_snapshot_is_passthrough() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let b = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
-            .unwrap();
+        let b =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
         let empty: HashSet<Vec<u8>> = HashSet::new();
         let out =
             apply_tombstone_filter_to_batches(vec![b.clone()], &empty, "id", &DataType::Int64)
@@ -1395,7 +1406,13 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
         let tombstones: HashSet<Vec<u8>> = [1i64]
             .iter()
-            .map(|v| RowKey::builder().append_i64(*v).finish().as_bytes().to_vec())
+            .map(|v| {
+                RowKey::builder()
+                    .append_i64(*v)
+                    .finish()
+                    .as_bytes()
+                    .to_vec()
+            })
             .collect();
         let out = filter_batch(&batch, "id", &DataType::Int64, &tombstones).unwrap();
         assert_eq!(out.num_rows(), 2);
@@ -1475,9 +1492,8 @@ mod tests {
     #[test]
     fn normalize_is_noop_when_types_match() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let b =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
-                .unwrap();
+        let b = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
+            .unwrap();
         let out = normalize_batch_to_schema(b, schema.as_ref());
         assert_eq!(out.num_rows(), 2);
         assert_eq!(out.schema().field(0).data_type(), &DataType::Int64);

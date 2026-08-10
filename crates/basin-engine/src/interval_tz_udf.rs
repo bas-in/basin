@@ -919,11 +919,7 @@ fn extract_lhs_expr(s: &str) -> (&str, &str) {
         }
         // `i` now points at the matching `(`. Back up over any identifier
         // that precedes the `(` (function name).
-        while i > 0
-            && !chars[i - 1].is_whitespace()
-            && chars[i - 1] != ','
-            && chars[i - 1] != '('
-        {
+        while i > 0 && !chars[i - 1].is_whitespace() && chars[i - 1] != ',' && chars[i - 1] != '(' {
             i -= 1;
         }
     } else if chars[i - 1] == '\'' {
@@ -943,20 +939,12 @@ fn extract_lhs_expr(s: &str) -> (&str, &str) {
             i -= 1;
         }
         // Back up over a word (type name like TIMESTAMP, DATE, etc.).
-        while i > 0
-            && !chars[i - 1].is_whitespace()
-            && chars[i - 1] != ','
-            && chars[i - 1] != '('
-        {
+        while i > 0 && !chars[i - 1].is_whitespace() && chars[i - 1] != ',' && chars[i - 1] != '(' {
             i -= 1;
         }
     } else {
         // Plain identifier or function-call without visible parens.
-        while i > 0
-            && !chars[i - 1].is_whitespace()
-            && chars[i - 1] != ','
-            && chars[i - 1] != '('
-        {
+        while i > 0 && !chars[i - 1].is_whitespace() && chars[i - 1] != ',' && chars[i - 1] != '(' {
             i -= 1;
         }
     }
@@ -1085,7 +1073,8 @@ mod tests {
         // The LHS extraction must not swallow the leading `(`, which would turn
         // the call into `at_time_zone(("t"."col", 'tz'))` — a single struct arg
         // that fails coercion against the (timestamp, text) signature.
-        let sql = "SELECT 1 WHERE (\"t\".\"col\" AT TIME ZONE 'America/Chicago')::date = '2024-03-01'";
+        let sql =
+            "SELECT 1 WHERE (\"t\".\"col\" AT TIME ZONE 'America/Chicago')::date = '2024-03-01'";
         let out = rewrite_at_time_zone(sql);
         assert!(
             out.contains("(at_time_zone(\"t\".\"col\", 'America/Chicago'))::date"),

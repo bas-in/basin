@@ -98,8 +98,8 @@ fn diesel_available() -> bool {
 
 /// Absolute path to the diesel migrations fixture directory.
 fn fixture_migrations_dir() -> PathBuf {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR must be set by cargo test");
+    let manifest =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by cargo test");
     PathBuf::from(manifest)
         .join("fixtures")
         .join("migration-tool-scaffold")
@@ -113,7 +113,11 @@ fn fixture_migrations_dir() -> PathBuf {
 /// `--migration-dir` pointing at the fixture directory.
 ///
 /// Returns `(stdout, stderr, success)`.
-fn run_diesel_migration(database_url: &str, migrations_dir: &PathBuf, args: &[&str]) -> (String, String, bool) {
+fn run_diesel_migration(
+    database_url: &str,
+    migrations_dir: &PathBuf,
+    args: &[&str],
+) -> (String, String, bool) {
     let output = Command::new("diesel")
         .arg("migration")
         .args(args)
@@ -173,9 +177,7 @@ async fn diesel_migration_run_revert() {
     let port = server.addr.port();
     let user = &server.project_slug;
 
-    println!(
-        "[diesel] Basin in-process server at 127.0.0.1:{port}, user={user}"
-    );
+    println!("[diesel] Basin in-process server at 127.0.0.1:{port}, user={user}");
 
     // ── Locate fixture migrations directory ───────────────────────────────────
     let migrations_dir = fixture_migrations_dir();
@@ -187,9 +189,7 @@ async fn diesel_migration_run_revert() {
 
     // Diesel uses a postgres:// DSN as DATABASE_URL.
     // sslmode=disable required because the in-process Basin server has no TLS.
-    let db_url = format!(
-        "postgres://{user}:ignored@127.0.0.1:{port}/basin?sslmode=disable"
-    );
+    let db_url = format!("postgres://{user}:ignored@127.0.0.1:{port}/basin?sslmode=disable");
 
     // ── (a) diesel migration run ──────────────────────────────────────────────
     //
@@ -246,7 +246,10 @@ async fn diesel_migration_run_revert() {
         history_rows.len(),
         history_rows
             .iter()
-            .map(|r| { let v: &str = r.get(0); v.to_owned() })
+            .map(|r| {
+                let v: &str = r.get(0);
+                v.to_owned()
+            })
             .collect::<Vec<_>>()
     );
 

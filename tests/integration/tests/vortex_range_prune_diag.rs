@@ -63,7 +63,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -197,9 +201,7 @@ async fn vortex_range_prune_signature() {
     // EXPLAIN both range queries to see WHY the JSONB-projection query prunes
     // (~1ms) while the plain-projection query scans the chunk (~17ms).
     for q in [q_lt_100, q_json] {
-        if let Ok(ExecResult::Rows { batches, .. }) =
-            sess.execute(&format!("EXPLAIN {q}")).await
-        {
+        if let Ok(ExecResult::Rows { batches, .. }) = sess.execute(&format!("EXPLAIN {q}")).await {
             use arrow_array::{Array, StringArray};
             let mut plan = String::new();
             for b in &batches {
@@ -364,7 +366,9 @@ async fn vortex_range_prune_signature() {
     // Force cold: rewrite files once more so the footer/page cache is stale
     // for the next read (mirrors the JSONB sweep rewriting files pre-timing).
     shard.flush_to_parquet().await.unwrap();
-    let _ = shard.run_promoted_column_backfill_sweep(&project, &table).await;
+    let _ = shard
+        .run_promoted_column_backfill_sweep(&project, &table)
+        .await;
 
     // IN-list: 2 raw samples, no warm-up.
     let s1 = {
@@ -389,9 +393,17 @@ async fn vortex_range_prune_signature() {
         t.elapsed().as_secs_f64() * 1000.0
     };
 
-    println!("[vortex-prune-diag] PHASE 4 — EXACT bench measurement (n=2, no warm-up, median=max):");
-    println!("  IN-list  samples=[{s1:.3}, {s2:.3}]ms  bench_p50={:.3}ms", bench_p50(s1, s2));
-    println!("  JSONB    samples=[{j1:.3}, {j2:.3}]ms  bench_p50={:.3}ms", bench_p50(j1, j2));
+    println!(
+        "[vortex-prune-diag] PHASE 4 — EXACT bench measurement (n=2, no warm-up, median=max):"
+    );
+    println!(
+        "  IN-list  samples=[{s1:.3}, {s2:.3}]ms  bench_p50={:.3}ms",
+        bench_p50(s1, s2)
+    );
+    println!(
+        "  JSONB    samples=[{j1:.3}, {j2:.3}]ms  bench_p50={:.3}ms",
+        bench_p50(j1, j2)
+    );
     println!(
         "\n  => cold first read dominates the n=2 median. Warm best-of-N (above): \
          IN-list {in3:.3}ms, JSONB {json3:.3}ms.\n"

@@ -78,8 +78,11 @@ impl TDigest {
             return;
         }
 
-        self.centroids
-            .sort_unstable_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap_or(std::cmp::Ordering::Equal));
+        self.centroids.sort_unstable_by(|a, b| {
+            a.mean
+                .partial_cmp(&b.mean)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let n = self.total_weight;
         let mut merged: Vec<Centroid> = Vec::with_capacity(self.centroids.len());

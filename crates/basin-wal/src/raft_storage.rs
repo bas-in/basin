@@ -462,9 +462,7 @@ impl DiskRaftStorage {
                                 RaftLogRecord::Entry { index, entry_json } => {
                                     let entry: Entry<C> = serde_json::from_slice(&entry_json)
                                         .map_err(|e| {
-                                            BasinError::wal(format!(
-                                                "raft log entry decode: {e}"
-                                            ))
+                                            BasinError::wal(format!("raft log entry decode: {e}"))
                                         })?;
                                     entries.insert(index, entry);
                                 }
@@ -482,12 +480,13 @@ impl DiskRaftStorage {
                                 "raft log: torn tail frame (crash mid-append); \
                                  truncating back to the last whole frame",
                             );
-                            let f = OpenOptions::new()
-                                .write(true)
-                                .open(&log_path)
-                                .map_err(|e| {
-                                    BasinError::wal(format!("raft log open for repair: {e}"))
-                                })?;
+                            let f =
+                                OpenOptions::new()
+                                    .write(true)
+                                    .open(&log_path)
+                                    .map_err(|e| {
+                                        BasinError::wal(format!("raft log open for repair: {e}"))
+                                    })?;
                             f.set_len(good_up_to as u64).map_err(|e| {
                                 BasinError::wal(format!("raft log tail truncate: {e}"))
                             })?;
@@ -979,7 +978,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         let mut store = DiskRaftStorage::open(dir.path()).unwrap();
-        let entries: Vec<Entry<C>> = (1..=5).map(|i| entry(1, i, &format!("payload-{i}"))).collect();
+        let entries: Vec<Entry<C>> = (1..=5)
+            .map(|i| entry(1, i, &format!("payload-{i}")))
+            .collect();
         append(&mut store, entries).await;
 
         // Read back pre-drop.
@@ -1042,7 +1043,10 @@ mod tests {
         append(&mut store, entries).await;
 
         // Leader conflict: drop everything from index 6 (inclusive).
-        store.delete_conflict_logs_since(log_id(1, 6)).await.unwrap();
+        store
+            .delete_conflict_logs_since(log_id(1, 6))
+            .await
+            .unwrap();
         let got = all_entries(&mut store).await;
         assert_eq!(got.len(), 5, "indexes 6..=10 deleted");
         let state = store.get_log_state().await.unwrap();
@@ -1202,7 +1206,11 @@ mod tests {
         append(&mut store, entries.clone()).await;
         let responses = store.apply_to_state_machine(&entries).await.unwrap();
         assert_eq!(responses.len(), 3);
-        assert_eq!(responses[2].lsn(), Lsn(3), "state machine assigns LSNs 1..=3");
+        assert_eq!(
+            responses[2].lsn(),
+            Lsn(3),
+            "state machine assigns LSNs 1..=3"
+        );
 
         // Snapshot, then purge the whole applied prefix.
         let snap = store.build_snapshot().await.unwrap();
@@ -1268,7 +1276,11 @@ mod tests {
             .await;
         assert_eq!(floor2, None, "stale watermark does not advance the floor");
         let pointer = store.manifest_pointer().await;
-        assert_eq!(pointer.watermark(&project, &partition), 3, "watermark stays at 3");
+        assert_eq!(
+            pointer.watermark(&project, &partition),
+            3,
+            "watermark stays at 3"
+        );
         assert_eq!(pointer.catalog_snapshot_id, "cat-42");
         assert_eq!(pointer.last_log_index, 3);
 
@@ -1276,13 +1288,19 @@ mod tests {
         let snap = store.build_snapshot().await.unwrap();
         let blob = snap.snapshot.into_inner();
         let decoded: StateMachineData = serde_json::from_slice(&blob).unwrap();
-        assert_eq!(decoded.manifest, pointer, "snapshot carries the manifest pointer");
+        assert_eq!(
+            decoded.manifest, pointer,
+            "snapshot carries the manifest pointer"
+        );
 
         // Install that snapshot on a fresh follower store: the manifest
         // pointer must arrive with full fidelity.
         let dir2 = TempDir::new().unwrap();
         let mut follower = DiskRaftStorage::open(dir2.path()).unwrap();
-        assert_eq!(follower.manifest_pointer().await, ManifestPointer::default());
+        assert_eq!(
+            follower.manifest_pointer().await,
+            ManifestPointer::default()
+        );
         follower
             .install_snapshot(&snap.meta, Box::new(Cursor::new(blob)))
             .await

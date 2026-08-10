@@ -140,8 +140,7 @@ impl Bucket {
     /// Returns `true` if the `allowed_mime_types` list is empty (= allow all)
     /// or if the list contains `mime_type`.
     pub fn allows_mime_type(&self, mime_type: &str) -> bool {
-        self.allowed_mime_types.is_empty()
-            || self.allowed_mime_types.iter().any(|m| m == mime_type)
+        self.allowed_mime_types.is_empty() || self.allowed_mime_types.iter().any(|m| m == mime_type)
     }
 
     /// Check whether the payload `size` (bytes) fits within this bucket's

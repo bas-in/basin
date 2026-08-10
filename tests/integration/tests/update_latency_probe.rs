@@ -60,7 +60,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -92,9 +96,11 @@ async fn update_latency_probe() {
         let table = format!("t{scale}");
         // Single-column PK so the fast-path UPDATE + #204 single-column-PK sort
         // apply.
-        sess.execute(&format!("CREATE TABLE {table} (id BIGINT PRIMARY KEY, v BIGINT)"))
-            .await
-            .unwrap();
+        sess.execute(&format!(
+            "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v BIGINT)"
+        ))
+        .await
+        .unwrap();
         // Seed up to `scale` via the engine INSERT path (NOT raw
         // storage.write_batch) in 10k batches — each batch is a disjoint id
         // range, so after flush it becomes one Parquet file with a tight PK
@@ -143,7 +149,9 @@ async fn update_latency_probe() {
             let newval = 1_000_000_000i64 + i as i64;
             let t0 = Instant::now();
             let res = sess
-                .execute(&format!("UPDATE {table} SET v = {newval} WHERE id = {target}"))
+                .execute(&format!(
+                    "UPDATE {table} SET v = {newval} WHERE id = {target}"
+                ))
                 .await
                 .unwrap();
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -190,9 +198,11 @@ async fn rmw_update_latency_probe() {
     let batch = 10_000i64;
     for scale in [100_000i64, 1_000_000] {
         let table = format!("rmw{scale}");
-        sess.execute(&format!("CREATE TABLE {table} (id BIGINT PRIMARY KEY, v BIGINT)"))
-            .await
-            .unwrap();
+        sess.execute(&format!(
+            "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v BIGINT)"
+        ))
+        .await
+        .unwrap();
         let mut id = 0i64;
         while id < scale {
             let lo = id;

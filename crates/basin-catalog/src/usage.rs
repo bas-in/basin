@@ -125,8 +125,7 @@ impl UsageSnapshotConfig {
         if let Some(ref ep) = self.otlp_endpoint {
             return ep.clone();
         }
-        std::env::var("BASIN_OTLP_ENDPOINT")
-            .unwrap_or_else(|_| "http://localhost:4318".to_string())
+        std::env::var("BASIN_OTLP_ENDPOINT").unwrap_or_else(|_| "http://localhost:4318".to_string())
     }
 
     /// Resolve the cloud metering URL.  Returns `None` when neither the
@@ -331,10 +330,8 @@ async fn post_metering_batch(client: &reqwest::Client, url: &str, counters: &[Pr
                     attempt,
                     "metering endpoint returned 5xx; retrying after back-off",
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    500 * u64::from(attempt),
-                ))
-                .await;
+                tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)))
+                    .await;
                 // continue loop for retry
             }
             Ok(r) => {
@@ -406,7 +403,10 @@ mod tests {
         // Second tick: no new ops → inactive.
         let snaps = collect_snapshots(&registry, &[p], &state, now);
         let snap = snaps.iter().find(|s| s.project_id == p).unwrap();
-        assert_eq!(snap.active_hours, 0.0, "second tick without new ops should be inactive");
+        assert_eq!(
+            snap.active_hours, 0.0,
+            "second tick without new ops should be inactive"
+        );
     }
 
     #[test]
@@ -477,7 +477,10 @@ mod tests {
         handle.abort();
 
         let rows = captured.lock().unwrap();
-        assert!(!rows.is_empty(), "persist_fn should have been called at least once");
+        assert!(
+            !rows.is_empty(),
+            "persist_fn should have been called at least once"
+        );
         let row = rows.iter().find(|r| r.project_id == p);
         assert!(row.is_some(), "project should appear in persisted rows");
     }

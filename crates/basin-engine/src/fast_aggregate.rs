@@ -245,7 +245,11 @@ fn match_query(q: &Query) -> Option<MetadataAggregatePlan> {
 /// `IS NULL`, a second column, a non-integer literal, or any other shape
 /// returns `None` — keeping the recogniser conservative.
 pub(crate) fn parse_range_bound(expr: &Expr) -> Option<RangeBound> {
-    let mut acc = RangeBound { column: String::new(), lo: None, hi: None };
+    let mut acc = RangeBound {
+        column: String::new(),
+        lo: None,
+        hi: None,
+    };
     collect_range(expr, &mut acc)?;
     if acc.column.is_empty() {
         return None; // no comparison contributed a column
@@ -352,11 +356,18 @@ fn column_name(e: &Expr) -> Option<String> {
 fn int_literal(e: &Expr) -> Option<i64> {
     use sqlparser::ast::{UnaryOperator, Value, ValueWithSpan};
     match e {
-        Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => s.parse::<i64>().ok(),
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
-            int_literal(expr).and_then(|v| v.checked_neg())
-        }
-        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => int_literal(expr),
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(s, _),
+            ..
+        }) => s.parse::<i64>().ok(),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => int_literal(expr).and_then(|v| v.checked_neg()),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => int_literal(expr),
         Expr::Nested(inner) => int_literal(inner),
         _ => None,
     }
@@ -626,7 +637,10 @@ pub(crate) async fn execute_metadata_aggregate(
     // once a row is tombstoned, so a live tombstone forces a full scan for them.
     let overlay_tombstones = metadata_aggregate_overlay_tombstones(sess, &plan.table);
     if overlay_tombstones > 0
-        && plan.aggs.iter().any(|(k, _)| !matches!(k, AggKind::CountStar))
+        && plan
+            .aggs
+            .iter()
+            .any(|(k, _)| !matches!(k, AggKind::CountStar))
     {
         return Ok(None);
     }
@@ -845,8 +859,7 @@ fn filter_files_in_range(
         // rather than dropping on a `below`/`above` shortcut that could fire
         // before the overlap is ruled out.
         let inside = rb.lo.map_or(true, |lo| fmin >= lo) && rb.hi.map_or(true, |hi| fmax < hi);
-        let outside =
-            rb.lo.map_or(false, |lo| fmax < lo) || rb.hi.map_or(false, |hi| fmin >= hi);
+        let outside = rb.lo.map_or(false, |lo| fmax < lo) || rb.hi.map_or(false, |hi| fmin >= hi);
         if inside {
             // `inside` and `outside` are mutually exclusive for a valid range
             // (lo < hi, guaranteed by parse_range_bound) and a consistent
@@ -1254,7 +1267,11 @@ pub(crate) fn match_groupby_low_card(stmt: &Statement) -> Option<GroupByCountSta
         aggs.push(agg);
     }
 
-    Some(GroupByCountStarPlan { table, key_col, aggs })
+    Some(GroupByCountStarPlan {
+        table,
+        key_col,
+        aggs,
+    })
 }
 
 /// Match a single per-group aggregate in a low-card GROUP BY projection.
@@ -1390,7 +1407,12 @@ pub(crate) async fn execute_groupby_low_card(
     };
 
     // Verify the key column exists and is Int64 (the only type we handle).
-    let key_field = match meta.schema.fields().iter().find(|f| f.name() == &plan.key_col) {
+    let key_field = match meta
+        .schema
+        .fields()
+        .iter()
+        .find(|f| f.name() == &plan.key_col)
+    {
         Some(f) => f.clone(),
         None => return Ok(None),
     };
@@ -1617,9 +1639,7 @@ pub(crate) async fn execute_groupby_low_card(
                             let acc = &s.cols[ci];
                             if acc.non_null == 0 {
                                 vals.push(None);
-                            } else if acc.sum_i < i64::MIN as i128
-                                || acc.sum_i > i64::MAX as i128
-                            {
+                            } else if acc.sum_i < i64::MIN as i128 || acc.sum_i > i64::MAX as i128 {
                                 return Ok(None);
                             } else {
                                 vals.push(Some(acc.sum_i as i64));
@@ -1687,9 +1707,7 @@ fn build_gb_out_schema(
     fields.push(key_field.clone());
     for (kind, out_name) in aggs {
         let field = match kind {
-            GbAgg::CountStar | GbAgg::CountCol(_) => {
-                Field::new(out_name, DataType::Int64, false)
-            }
+            GbAgg::CountStar | GbAgg::CountCol(_) => Field::new(out_name, DataType::Int64, false),
             GbAgg::SumCol(c) => {
                 let ty = val_cols
                     .iter()
@@ -1784,7 +1802,10 @@ mod tests {
         // `100 <= id` ≡ `id >= 100`; `id < 500` upper bound.
         let stmt = parse_one("SELECT COUNT(*) FROM t WHERE 100 <= id AND id < 500");
         let rb = match_metadata_aggregate(&stmt).unwrap().range.unwrap();
-        assert_eq!((rb.column.as_str(), rb.lo, rb.hi), ("id", Some(100), Some(500)));
+        assert_eq!(
+            (rb.column.as_str(), rb.lo, rb.hi),
+            ("id", Some(100), Some(500))
+        );
     }
 
     #[test]
@@ -1803,31 +1824,22 @@ mod tests {
 
     #[test]
     fn range_rejects_or_and_equality() {
+        assert!(match_metadata_aggregate(&parse_one(
+            "SELECT COUNT(*) FROM t WHERE id > 1 OR id < 9"
+        ))
+        .is_none());
         assert!(
-            match_metadata_aggregate(&parse_one(
-                "SELECT COUNT(*) FROM t WHERE id > 1 OR id < 9"
-            ))
-            .is_none()
-        );
-        assert!(
-            match_metadata_aggregate(&parse_one("SELECT COUNT(*) FROM t WHERE id = 5"))
-                .is_none()
+            match_metadata_aggregate(&parse_one("SELECT COUNT(*) FROM t WHERE id = 5")).is_none()
         );
     }
 
     #[test]
     fn range_rejects_non_integer_literal() {
         assert!(
-            match_metadata_aggregate(&parse_one(
-                "SELECT COUNT(*) FROM t WHERE id < 5.5"
-            ))
-            .is_none()
+            match_metadata_aggregate(&parse_one("SELECT COUNT(*) FROM t WHERE id < 5.5")).is_none()
         );
         assert!(
-            match_metadata_aggregate(&parse_one(
-                "SELECT COUNT(*) FROM t WHERE id > 'x'"
-            ))
-            .is_none()
+            match_metadata_aggregate(&parse_one("SELECT COUNT(*) FROM t WHERE id > 'x'")).is_none()
         );
     }
 
@@ -1874,7 +1886,11 @@ mod tests {
     }
 
     fn rb(lo: Option<i64>, hi: Option<i64>) -> RangeBound {
-        RangeBound { column: "id".into(), lo, hi }
+        RangeBound {
+            column: "id".into(),
+            lo,
+            hi,
+        }
     }
 
     #[test]
@@ -2012,9 +2028,7 @@ mod tests {
         let files = vec![file_with(999_999, 100, 0, 500_000)];
         assert!(filter_files_in_range(&files, &rb(None, Some(500_000)), &sc).is_none());
         assert!(filter_files_in_range(&files, &rb(Some(500_000), None), &sc).is_none());
-        assert!(
-            filter_files_in_range(&files, &rb(Some(0), Some(1_000_000)), &sc).is_none()
-        );
+        assert!(filter_files_in_range(&files, &rb(Some(0), Some(1_000_000)), &sc).is_none());
     }
 
     #[test]
@@ -2084,8 +2098,7 @@ mod tests {
 
     #[test]
     fn groupby_matches_sum_count_avg_with_df_names() {
-        let stmt =
-            parse_one("SELECT k, COUNT(*), SUM(v), COUNT(v), AVG(v) FROM t GROUP BY k");
+        let stmt = parse_one("SELECT k, COUNT(*), SUM(v), COUNT(v), AVG(v) FROM t GROUP BY k");
         let plan = match_groupby_low_card(&stmt).expect("should match");
         assert_eq!(plan.key_col, "k");
         assert_eq!(
@@ -2104,7 +2117,10 @@ mod tests {
         // The named non-selective shape: `SELECT k, SUM(v) ... GROUP BY k`.
         let stmt = parse_one("SELECT k, SUM(v) FROM t GROUP BY k");
         let plan = match_groupby_low_card(&stmt).expect("should match");
-        assert_eq!(plan.aggs, vec![(GbAgg::SumCol("v".into()), "sum(t.v)".to_string())]);
+        assert_eq!(
+            plan.aggs,
+            vec![(GbAgg::SumCol("v".into()), "sum(t.v)".to_string())]
+        );
     }
 
     #[test]
@@ -2139,8 +2155,7 @@ mod tests {
 
     #[test]
     fn groupby_rejects_having() {
-        let stmt =
-            parse_one("SELECT k, COUNT(*) FROM t GROUP BY k HAVING COUNT(*) > 10");
+        let stmt = parse_one("SELECT k, COUNT(*) FROM t GROUP BY k HAVING COUNT(*) > 10");
         assert!(match_groupby_low_card(&stmt).is_none());
     }
 
@@ -2164,9 +2179,7 @@ mod tests {
 
     #[test]
     fn groupby_rejects_cte() {
-        let stmt = parse_one(
-            "WITH cte AS (SELECT 1) SELECT k, COUNT(*) FROM t GROUP BY k",
-        );
+        let stmt = parse_one("WITH cte AS (SELECT 1) SELECT k, COUNT(*) FROM t GROUP BY k");
         assert!(match_groupby_low_card(&stmt).is_none());
     }
 
@@ -2186,8 +2199,7 @@ mod tests {
 
     #[test]
     fn groupby_rejects_join() {
-        let stmt =
-            parse_one("SELECT a.k, COUNT(*) FROM a JOIN b ON a.id = b.id GROUP BY a.k");
+        let stmt = parse_one("SELECT a.k, COUNT(*) FROM a JOIN b ON a.id = b.id GROUP BY a.k");
         assert!(match_groupby_low_card(&stmt).is_none());
     }
 }

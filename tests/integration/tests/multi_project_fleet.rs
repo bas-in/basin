@@ -220,9 +220,7 @@ async fn measure_victims(
 #[ignore = "multi-project fleet benchmark: N-project seed + noisy-load phases (tens of minutes); run via benchmark/run/scale-suite.sh on an idle box"]
 async fn multi_project_fleet() {
     let n_projects = env_usize("BASIN_FLEET_PROJECTS", 50).max(2);
-    let n_noisy = env_usize("BASIN_FLEET_NOISY", 8)
-        .max(1)
-        .min(n_projects - 1);
+    let n_noisy = env_usize("BASIN_FLEET_NOISY", 8).max(1).min(n_projects - 1);
     let n_victims = env_usize("BASIN_FLEET_VICTIMS", 4)
         .max(1)
         .min(n_projects - n_noisy);

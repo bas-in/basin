@@ -898,13 +898,7 @@ pub trait SecondaryIndexSink: Send + Sync {
     /// Remove every index location that references `file_path` for
     /// `(project, table, col)`. Used when a compaction replaces files.
     /// Mirrors `ProjectIndexRegistry::remove_file_from_index`.
-    fn remove_file(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-        col: &str,
-        file_path: &str,
-    );
+    fn remove_file(&self, project: &ProjectId, table: &TableName, col: &str, file_path: &str);
 }
 
 /// Driver the shard hands each resident project to during
@@ -1002,11 +996,7 @@ pub(crate) trait ShardImpl: Send + Sync {
     /// whole-shard `flush_to_parquet` — over-draining is always safe for
     /// backends without a per-partition tail map (their drain is a no-op or
     /// already table-agnostic); only the in-process backend narrows it.
-    async fn flush_tables_for_read(
-        &self,
-        _project: &ProjectId,
-        _table: &TableName,
-    ) -> Result<()> {
+    async fn flush_tables_for_read(&self, _project: &ProjectId, _table: &TableName) -> Result<()> {
         self.flush_to_parquet().await
     }
     async fn run_tiering_sweep(&self) -> Result<()>;

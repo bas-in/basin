@@ -468,7 +468,10 @@ impl PresenceRegistry {
                         joins: vec![],
                         leaves: vec![ev_entry],
                     });
-                    evicted.entry(channel_name.clone()).or_default().push(cid.clone());
+                    evicted
+                        .entry(channel_name.clone())
+                        .or_default()
+                        .push(cid.clone());
                 }
             }
         }
@@ -656,10 +659,7 @@ mod tests {
 
     #[tokio::test]
     async fn evict_stale_removes_idle_clients() {
-        let cfg = PresenceConfig::for_test(
-            Duration::from_millis(50),
-            Duration::from_millis(200),
-        );
+        let cfg = PresenceConfig::for_test(Duration::from_millis(50), Duration::from_millis(200));
         let reg = PresenceRegistry::new(cfg);
         let p = project();
         let mut rx = reg.subscribe(p, "room:1");
@@ -688,15 +688,15 @@ mod tests {
                 }
             }
         }
-        assert!(saw_eviction, "should have received eviction diff with 'idle' in leaves");
+        assert!(
+            saw_eviction,
+            "should have received eviction diff with 'idle' in leaves"
+        );
     }
 
     #[tokio::test]
     async fn heartbeat_prevents_eviction() {
-        let cfg = PresenceConfig::for_test(
-            Duration::from_millis(80),
-            Duration::from_millis(200),
-        );
+        let cfg = PresenceConfig::for_test(Duration::from_millis(80), Duration::from_millis(200));
         let reg = PresenceRegistry::new(cfg);
         let p = project();
         reg.track(p, "room:1", "active", serde_json::json!({}));
@@ -717,10 +717,7 @@ mod tests {
 
     #[tokio::test]
     async fn eviction_task_runs_automatically() {
-        let cfg = PresenceConfig::for_test(
-            Duration::from_millis(50),
-            Duration::from_millis(60),
-        );
+        let cfg = PresenceConfig::for_test(Duration::from_millis(50), Duration::from_millis(60));
         let reg = PresenceRegistry::new(cfg);
         let p = project();
         let mut rx = reg.subscribe(p, "room:1");
@@ -750,7 +747,10 @@ mod tests {
                 }
             }
         }
-        assert!(saw_eviction, "background eviction task should have evicted 'stale' within deadline");
+        assert!(
+            saw_eviction,
+            "background eviction task should have evicted 'stale' within deadline"
+        );
     }
 
     // --- wire format -------------------------------------------------------

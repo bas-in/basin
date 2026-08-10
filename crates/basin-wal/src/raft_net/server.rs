@@ -60,8 +60,8 @@ impl RaftTransportService {
 
 /// Wrap a successful openraft response into the envelope.
 fn ok_envelope<T: serde::Serialize>(resp: &T) -> std::result::Result<RaftRpcResponse, Status> {
-    let bytes = codec::encode(resp)
-        .map_err(|e| Status::internal(format!("encode raft response: {e}")))?;
+    let bytes =
+        codec::encode(resp).map_err(|e| Status::internal(format!("encode raft response: {e}")))?;
     Ok(RaftRpcResponse {
         result: Some(raft_rpc_response::Result::Ok(bytes)),
     })

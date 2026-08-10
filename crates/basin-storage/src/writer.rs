@@ -358,8 +358,7 @@ pub(crate) async fn write_batch_with_options(
     // Phase 5.14.A2: compute per-column fastbloom filters for columns named
     // in WriteOptions::bloom_columns. Only Int64 and Utf8 are supported in
     // phase 1; other types are silently skipped (no entry in bloom_filters).
-    let bloom_filters =
-        compute_bloom_filters(batch_to_write, &opts.bloom_columns, row_count);
+    let bloom_filters = compute_bloom_filters(batch_to_write, &opts.bloom_columns, row_count);
 
     // Phase 5.14.B2: compute per-column HLL and t-digest sketches for all
     // eligible columns in the batch. HLL covers cardinality-meaningful types
@@ -557,10 +556,7 @@ fn uuid_fsb_to_decimal256(batch: &RecordBatch) -> Option<RecordBatch> {
     use arrow_buffer::i256;
 
     let schema = batch.schema();
-    let needs_xlate = schema
-        .fields()
-        .iter()
-        .any(|f| field_is_uuid_fsb(f));
+    let needs_xlate = schema.fields().iter().any(|f| field_is_uuid_fsb(f));
     if !needs_xlate {
         return None;
     }
@@ -594,12 +590,8 @@ fn uuid_fsb_to_decimal256(batch: &RecordBatch) -> Option<RecordBatch> {
             let arr = Decimal256Array::from(values)
                 .with_precision_and_scale(39, 0)
                 .expect("Decimal256(39, 0) precision is valid");
-            let new_field = Field::new(
-                f.name(),
-                DataType::Decimal256(39, 0),
-                f.is_nullable(),
-            )
-            .with_metadata(f.metadata().clone());
+            let new_field = Field::new(f.name(), DataType::Decimal256(39, 0), f.is_nullable())
+                .with_metadata(f.metadata().clone());
             new_fields.push(new_field);
             new_cols.push(std::sync::Arc::new(arr));
         } else {
@@ -654,8 +646,10 @@ fn point_fsb_to_large_binary(batch: &RecordBatch) -> Option<RecordBatch> {
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .expect("POINT column must be FixedSizeBinaryArray");
             let len = src.len();
-            let mut builder =
-                arrow_array::builder::LargeBinaryBuilder::with_capacity(len, len * basin_geo::POINT_WKB_LEN);
+            let mut builder = arrow_array::builder::LargeBinaryBuilder::with_capacity(
+                len,
+                len * basin_geo::POINT_WKB_LEN,
+            );
             for r in 0..len {
                 if src.is_null(r) {
                     builder.append_null();
@@ -975,9 +969,7 @@ fn write_sketches_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("BASIN_WRITE_SKETCHES").as_deref() == Ok("1"))
 }
 
-fn compute_sketches(
-    batch: &RecordBatch,
-) -> (BTreeMap<String, Vec<u8>>, BTreeMap<String, Vec<u8>>) {
+fn compute_sketches(batch: &RecordBatch) -> (BTreeMap<String, Vec<u8>>, BTreeMap<String, Vec<u8>>) {
     use arrow_array::cast::AsArray;
     use arrow_array::Array;
     use arrow_schema::DataType;
@@ -1107,8 +1099,8 @@ fn compute_sketches(
                             }
                         }
                         TimeUnit::Millisecond => {
-                            let arr = col
-                                .as_primitive::<arrow_array::types::TimestampMillisecondType>();
+                            let arr =
+                                col.as_primitive::<arrow_array::types::TimestampMillisecondType>();
                             for i in 0..arr.len() {
                                 if arr.is_valid(i) {
                                     hll.insert(&arr.value(i).to_le_bytes());
@@ -1116,8 +1108,8 @@ fn compute_sketches(
                             }
                         }
                         TimeUnit::Microsecond => {
-                            let arr = col
-                                .as_primitive::<arrow_array::types::TimestampMicrosecondType>();
+                            let arr =
+                                col.as_primitive::<arrow_array::types::TimestampMicrosecondType>();
                             for i in 0..arr.len() {
                                 if arr.is_valid(i) {
                                     hll.insert(&arr.value(i).to_le_bytes());
@@ -1125,8 +1117,8 @@ fn compute_sketches(
                             }
                         }
                         TimeUnit::Nanosecond => {
-                            let arr = col
-                                .as_primitive::<arrow_array::types::TimestampNanosecondType>();
+                            let arr =
+                                col.as_primitive::<arrow_array::types::TimestampNanosecondType>();
                             for i in 0..arr.len() {
                                 if arr.is_valid(i) {
                                     hll.insert(&arr.value(i).to_le_bytes());
@@ -1338,8 +1330,9 @@ fn compute_bloom_filters(
         // getrandom for its seed, which would make every deserialized probe
         // use a different hash function from the one used at insert time,
         // producing near-100% false-negative rates.
-        let mut filter =
-            BloomFilter::with_false_pos(DEFAULT_BLOOM_FPP).seed(&0u128).expected_items(n_items);
+        let mut filter = BloomFilter::with_false_pos(DEFAULT_BLOOM_FPP)
+            .seed(&0u128)
+            .expected_items(n_items);
 
         match col.data_type() {
             DataType::Int64 => {
@@ -1400,7 +1393,9 @@ pub fn bloom_from_bytes(bytes: &[u8]) -> Option<fastbloom::BloomFilter> {
     // `compute_bloom_filters`. Without a matching seed the hasher diverges
     // from the one used during insert, making contains() unreliable.
     Some(
-        fastbloom::BloomFilter::from_vec(words).seed(&0u128).hashes(num_hashes),
+        fastbloom::BloomFilter::from_vec(words)
+            .seed(&0u128)
+            .hashes(num_hashes),
     )
 }
 
@@ -1574,16 +1569,31 @@ mod tests {
         assert!(tdigests.contains_key("id"), "id must have t-digest sketch");
 
         // Float64: t-digest only, no HLL
-        assert!(!hlls.contains_key("score"), "score (Float64) must NOT have HLL sketch");
-        assert!(tdigests.contains_key("score"), "score (Float64) must have t-digest sketch");
+        assert!(
+            !hlls.contains_key("score"),
+            "score (Float64) must NOT have HLL sketch"
+        );
+        assert!(
+            tdigests.contains_key("score"),
+            "score (Float64) must have t-digest sketch"
+        );
 
         // Utf8: HLL only, no t-digest
         assert!(hlls.contains_key("label"), "label must have HLL sketch");
-        assert!(!tdigests.contains_key("label"), "label (Utf8) must NOT have t-digest sketch");
+        assert!(
+            !tdigests.contains_key("label"),
+            "label (Utf8) must NOT have t-digest sketch"
+        );
 
         // Boolean: neither
-        assert!(!hlls.contains_key("flag"), "flag (Boolean) must NOT have HLL sketch");
-        assert!(!tdigests.contains_key("flag"), "flag (Boolean) must NOT have t-digest sketch");
+        assert!(
+            !hlls.contains_key("flag"),
+            "flag (Boolean) must NOT have HLL sketch"
+        );
+        assert!(
+            !tdigests.contains_key("flag"),
+            "flag (Boolean) must NOT have t-digest sketch"
+        );
 
         // Validate byte lengths are non-zero and round-trip correctly.
         let hll_bytes = hlls.get("id").unwrap();
@@ -1615,11 +1625,7 @@ mod tests {
             .map(|i| Some(format!("lbl_{}", i % N_DISTINCT_LABELS)))
             .collect();
 
-        let b = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(id_arr), Arc::new(label_arr)],
-        )
-        .unwrap();
+        let b = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(label_arr)]).unwrap();
 
         let (hlls, tdigests) = compute_sketches(&b);
 

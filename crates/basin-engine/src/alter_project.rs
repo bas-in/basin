@@ -46,9 +46,7 @@ use crate::ProjectSession;
 ///
 /// The check is deliberately conservative: only statements that start with
 /// `ALTER PROJECT` (case-insensitive) trigger the path.
-pub(crate) fn match_alter_project_memtable_cap(
-    sql: &str,
-) -> Result<Option<(String, u64)>> {
+pub(crate) fn match_alter_project_memtable_cap(sql: &str) -> Result<Option<(String, u64)>> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
 
@@ -133,10 +131,9 @@ pub(crate) async fn exec_alter_project_memtable_cap(
         .await?
         .unwrap_or_default();
 
-    config.provider_extras.insert(
-        "basin.memtable_hard_cap".into(),
-        hard_cap_bytes.to_string(),
-    );
+    config
+        .provider_extras
+        .insert("basin.memtable_hard_cap".into(), hard_cap_bytes.to_string());
 
     catalog
         .set_project_storage_config(project, config)
@@ -373,17 +370,14 @@ mod tests {
 
     #[test]
     fn alter_table_returns_none() {
-        let r =
-            match_alter_project_memtable_cap("ALTER TABLE t SET cold_after = 3600").unwrap();
+        let r = match_alter_project_memtable_cap("ALTER TABLE t SET cold_after = 3600").unwrap();
         assert!(r.is_none());
     }
 
     #[test]
     fn unrecognised_set_key_returns_none() {
-        let r = match_alter_project_memtable_cap(
-            "ALTER PROJECT proj SET basin.some_other_key = 1",
-        )
-        .unwrap();
+        let r = match_alter_project_memtable_cap("ALTER PROJECT proj SET basin.some_other_key = 1")
+            .unwrap();
         assert!(r.is_none());
     }
 
@@ -405,17 +399,13 @@ mod tests {
 
     #[test]
     fn partitions_match_case_insensitive_with_semicolon() {
-        let r = match_alter_project_partitions(
-            "alter project Whale set partitions = 8;",
-        )
-        .unwrap();
+        let r = match_alter_project_partitions("alter project Whale set partitions = 8;").unwrap();
         assert_eq!(r, Some(("Whale".into(), 8)));
     }
 
     #[test]
     fn partitions_zero_rejected() {
-        let err =
-            match_alter_project_partitions("ALTER PROJECT p SET partitions = 0").unwrap_err();
+        let err = match_alter_project_partitions("ALTER PROJECT p SET partitions = 0").unwrap_err();
         match err {
             BasinError::InvalidSchema(msg) => assert!(msg.contains("must be >= 1"), "got: {msg}"),
             other => panic!("expected InvalidSchema, got {other:?}"),
@@ -434,9 +424,7 @@ mod tests {
 
     #[test]
     fn partitions_garbage_rejected() {
-        assert!(
-            match_alter_project_partitions("ALTER PROJECT p SET partitions = NaN").is_err()
-        );
+        assert!(match_alter_project_partitions("ALTER PROJECT p SET partitions = NaN").is_err());
     }
 
     #[test]
@@ -452,10 +440,14 @@ mod tests {
 
     #[test]
     fn partitions_non_alter_project_returns_none() {
-        assert!(match_alter_project_partitions("SELECT 1").unwrap().is_none());
-        assert!(match_alter_project_partitions("ALTER TABLE t ADD COLUMN x INT")
+        assert!(match_alter_project_partitions("SELECT 1")
             .unwrap()
             .is_none());
+        assert!(
+            match_alter_project_partitions("ALTER TABLE t ADD COLUMN x INT")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

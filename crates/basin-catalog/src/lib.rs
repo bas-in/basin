@@ -25,22 +25,22 @@
 
 #![forbid(unsafe_code)]
 
-/// Phase 6.X.D — heartbeat-reconciled per-project budgets (ADR 0023).
-pub mod budgets;
 /// Bounded multi-bucket storage-pool records (#36, Stage 1).
 pub mod bucket_pool;
-/// ADR 0028 Phase 2 — per-project CDC webhook subscriptions + delivery cursor.
-pub mod cdc_webhooks;
+/// Phase 6.X.D — heartbeat-reconciled per-project budgets (ADR 0023).
+pub mod budgets;
 /// ADR 0028 Phase 3 — per-project CDC Kafka/Redpanda sink configs + cursor.
 pub mod cdc_kafka;
 /// ADR 0028 Phase 5 — per-project durable logical-replication slot cursors.
 pub mod cdc_slots;
+/// ADR 0028 Phase 2 — per-project CDC webhook subscriptions + delivery cursor.
+pub mod cdc_webhooks;
 mod domains;
 mod enums;
 mod functions;
 mod in_memory;
-pub mod info_schema;
 mod inbound_webhooks;
+pub mod info_schema;
 /// Phase 6.X.A — partition-lease primitive (ADR 0023 foundation).
 pub mod leases;
 mod metadata;
@@ -51,7 +51,11 @@ pub mod object_store_catalog;
 mod postgres;
 mod procedures;
 mod project_storage_config;
+/// Phase 5.21.E — publication registry (CREATE/ALTER/DROP PUBLICATION).
+pub mod publications;
 mod reactors;
+/// Phase 5.21.B — logical replication slot registry.
+pub mod replication_slots;
 /// Phase 5.18.A — reserved schema enum + back-compat resolution helpers.
 pub mod reserved_schema;
 mod rest;
@@ -61,49 +65,44 @@ mod snapshot;
 /// HTTP POST to `/internal/v1/metering/counters`.
 pub mod usage;
 mod views;
-/// Phase 5.21.B — logical replication slot registry.
-pub mod replication_slots;
-/// Phase 5.21.E — publication registry (CREATE/ALTER/DROP PUBLICATION).
-pub mod publications;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use basin_common::{ChangeOp, ProjectId, QualifiedTableName, Result, SchemaName, TableName};
 
-pub use cdc_webhooks::{
-    validate_registration as validate_cdc_webhook, CdcWebhookDef, CdcWebhookError, CdcWebhookRow,
-    CdcWebhookState,
+pub use bucket_pool::{
+    BucketAssignment, BucketRegistry, BucketRegistryEntry, BucketTier, MigrationIntent,
+    MigrationPhase,
+};
+pub use budgets::{
+    BudgetCoordinator, CapKind, InMemoryBudgetCoordinator, ProjectBudget, SliceBudget,
+    SliceBudgetView, SliceGate, UsageDelta, UsageSnapshot, SLICE_UNSET,
 };
 pub use cdc_kafka::{
     validate_registration as validate_cdc_kafka_sink, CdcKafkaError, CdcKafkaSinkDef,
     CdcKafkaSinkRow, CdcKafkaSinkState, PartitionKey,
 };
 pub use cdc_slots::{
-    validate_registration as validate_cdc_slot, CdcSlotDef, CdcSlotError, CdcSlotRow,
-    CdcSlotState, SlotPlugin,
+    validate_registration as validate_cdc_slot, CdcSlotDef, CdcSlotError, CdcSlotRow, CdcSlotState,
+    SlotPlugin,
+};
+pub use cdc_webhooks::{
+    validate_registration as validate_cdc_webhook, CdcWebhookDef, CdcWebhookError, CdcWebhookRow,
+    CdcWebhookState,
 };
 pub use domains::{DomainDef, DomainError, BASIN_DOMAIN_KEY};
 pub use enums::{EnumError, EnumTypeDef, BASIN_ENUM_TYPE_KEY};
-pub use reserved_schema::{resolve_qualified, resolve_schema, ReservedSchema};
-pub use inbound_webhooks::{InboundWebhookDef, InboundWebhookError};
 pub use functions::{
     SqlArgType, SqlFunctionArg, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType,
 };
 pub use in_memory::InMemoryCatalog;
-pub use replication_slots::{lsn_to_pgtext, Lsn, PendingFrame, SlotRegistry, SlotSnapshot};
-pub use publications::{Publication, PublicationRegistry, PublicationTable};
-pub use budgets::{
-    BudgetCoordinator, CapKind, InMemoryBudgetCoordinator, ProjectBudget, SliceBudget,
-    SliceBudgetView, SliceGate, UsageDelta, UsageSnapshot, SLICE_UNSET,
-};
-pub use leases::{
-    Lease, LeaseRegistry, DEFAULT_LEASE_RENEW_SECS, DEFAULT_LEASE_TTL_SECS,
-};
+pub use inbound_webhooks::{InboundWebhookDef, InboundWebhookError};
+pub use leases::{Lease, LeaseRegistry, DEFAULT_LEASE_RENEW_SECS, DEFAULT_LEASE_TTL_SECS};
 pub use metadata::{
     CaggPolicy, CheckConstraint, ColumnStats, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec,
-    Policy, PolicyCommand, PromotedJsonbPath, RefAction, S3Config, SecondaryIndex, TableFileFormat,
-    TableMetadata, ProjectMetadata, UniqueConstraint,
+    Policy, PolicyCommand, ProjectMetadata, PromotedJsonbPath, RefAction, S3Config, SecondaryIndex,
+    TableFileFormat, TableMetadata, UniqueConstraint,
 };
 pub use object_store_catalog::{
     build_object_store_backend, object_store_backend_selected, LeaseClock, ObjectStoreCatalog,
@@ -112,12 +111,11 @@ pub use object_store_catalog::{
 };
 pub use postgres::PostgresCatalog;
 pub use procedures::{ProcedureError, SqlProcedureDef};
-pub use bucket_pool::{
-    BucketAssignment, BucketRegistry, BucketRegistryEntry, BucketTier, MigrationIntent,
-    MigrationPhase,
-};
 pub use project_storage_config::ProjectStorageConfig;
+pub use publications::{Publication, PublicationRegistry, PublicationTable};
 pub use reactors::{ReactorDef, ReactorError, ReactorOps};
+pub use replication_slots::{lsn_to_pgtext, Lsn, PendingFrame, SlotRegistry, SlotSnapshot};
+pub use reserved_schema::{resolve_qualified, resolve_schema, ReservedSchema};
 pub use rest::RestCatalog;
 pub use sequences::SequenceDef;
 pub use snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
@@ -413,11 +411,7 @@ pub trait Catalog: Send + Sync {
     /// shared-bucket behaviour. Default impl returns
     /// `Internal("not implemented")` so non-default backends opt in
     /// explicitly.
-    async fn set_project_metadata(
-        &self,
-        project: &ProjectId,
-        meta: ProjectMetadata,
-    ) -> Result<()> {
+    async fn set_project_metadata(&self, project: &ProjectId, meta: ProjectMetadata) -> Result<()> {
         let _ = (project, meta);
         Err(basin_common::BasinError::Internal(
             "set_project_metadata not implemented for this catalog backend".into(),
@@ -540,10 +534,7 @@ pub trait Catalog: Send + Sync {
     ///
     /// Returns `Ok(None)` so non-overriding backends always take the
     /// fail-closed default path.
-    async fn get_project_max_connections(
-        &self,
-        project: &ProjectId,
-    ) -> Result<Option<u32>> {
+    async fn get_project_max_connections(&self, project: &ProjectId) -> Result<Option<u32>> {
         let _ = project;
         Ok(None)
     }
@@ -679,8 +670,14 @@ pub trait Catalog: Send + Sync {
         added_files: Vec<DataFileRef>,
     ) -> Result<TableMetadata> {
         let _ = partition_id;
-        self.replace_data_files(project, table, expected_snapshot, removed_paths, added_files)
-            .await
+        self.replace_data_files(
+            project,
+            table,
+            expected_snapshot,
+            removed_paths,
+            added_files,
+        )
+        .await
     }
 
     /// Enumerate the partition ids that currently hold at least one live data
@@ -2181,10 +2178,7 @@ pub trait Catalog: Send + Sync {
     /// how the state machine advances `phase`. Because each phase is
     /// idempotent, an overwrite that races a crash is safe to re-apply. Default
     /// impl returns `Internal("not implemented")`.
-    async fn put_migration_intent(
-        &self,
-        intent: &bucket_pool::MigrationIntent,
-    ) -> Result<()> {
+    async fn put_migration_intent(&self, intent: &bucket_pool::MigrationIntent) -> Result<()> {
         let _ = intent;
         Err(basin_common::BasinError::Internal(
             "put_migration_intent not implemented for this catalog backend".into(),
@@ -2609,11 +2603,7 @@ pub trait Catalog: Send + Sync {
     ///   no longer in any live snapshot.
     ///
     /// Default impl: single pass over `list_tables` + `load_table`.
-    async fn gc_orphaned_files(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-    ) -> Result<GcReport> {
+    async fn gc_orphaned_files(&self, project: &ProjectId, table: &TableName) -> Result<GcReport> {
         let meta = self.load_table(project, table).await?;
 
         // Universe: all paths ever recorded in this table's snapshot history
@@ -2669,6 +2659,4 @@ pub trait Catalog: Send + Sync {
             live_paths,
         })
     }
-
 }
-

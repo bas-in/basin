@@ -27,9 +27,7 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_common::{PartitionKey, ProjectId, TableName};
-use basin_storage::{
-    FileFormat, ReadOptions, Storage, StorageConfig, WriteOptions,
-};
+use basin_storage::{FileFormat, ReadOptions, Storage, StorageConfig, WriteOptions};
 use futures::stream::StreamExt;
 use object_store::memory::InMemory;
 
@@ -46,7 +44,9 @@ fn schema() -> Arc<Schema> {
 /// stays tiny but still has real columnar data.
 fn build_batch(start: i64, len: usize) -> RecordBatch {
     let ids: Int64Array = (start..start + len as i64).collect();
-    let payloads: Vec<String> = (0..len).map(|i| format!("p-{:06}", start + i as i64)).collect();
+    let payloads: Vec<String> = (0..len)
+        .map(|i| format!("p-{:06}", start + i as i64))
+        .collect();
     let payload_arr: StringArray = payloads.iter().map(|s| Some(s.as_str())).collect();
     RecordBatch::try_new(schema(), vec![Arc::new(ids), Arc::new(payload_arr)]).unwrap()
 }
@@ -135,15 +135,8 @@ async fn row_group_selection_keeps_only_listed_row_groups() {
     // 4 row-groups of 1000 rows each. Total 4000 rows, ids [0, 4000).
     let rows_per_rg: usize = 1000;
     let n_row_groups: usize = 4;
-    let path = write_multi_rg_file(
-        &storage,
-        &project,
-        &table,
-        &part,
-        rows_per_rg,
-        n_row_groups,
-    )
-    .await;
+    let path =
+        write_multi_rg_file(&storage, &project, &table, &part, rows_per_rg, n_row_groups).await;
 
     // Baseline: no selection => all 4000 rows. Proves the writer actually
     // produced the multi-rg file we expected (otherwise the prune
@@ -218,8 +211,7 @@ async fn row_group_selection_keeps_only_listed_row_groups() {
         // None of the middle row-groups' ids may have leaked in.
         for &v in &ids {
             let in_rg0 = (0..rows_per_rg as i64).contains(&v);
-            let in_rg3 =
-                (3 * rows_per_rg as i64..4 * rows_per_rg as i64).contains(&v);
+            let in_rg3 = (3 * rows_per_rg as i64..4 * rows_per_rg as i64).contains(&v);
             assert!(
                 in_rg0 || in_rg3,
                 "id {v} leaked from a pruned row group (expected rg 0 or rg 3 only)"
@@ -312,7 +304,11 @@ async fn file_absent_from_selection_is_scanned_in_full() {
     let from_a: Vec<i64> = ids.iter().copied().filter(|&v| v < 10_000).collect();
     let from_b: Vec<i64> = ids.iter().copied().filter(|&v| v >= 10_000).collect();
     assert_eq!(from_a.len(), 500, "file A must yield rg=0 only");
-    assert_eq!(from_b.len(), 2000, "file B (absent from map) must yield all");
+    assert_eq!(
+        from_b.len(),
+        2000,
+        "file B (absent from map) must yield all"
+    );
     assert_eq!(*from_a.first().unwrap(), 0);
     assert_eq!(*from_a.last().unwrap(), 499);
     assert_eq!(*from_b.first().unwrap(), 10_000);

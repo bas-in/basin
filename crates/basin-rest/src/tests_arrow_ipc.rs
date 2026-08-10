@@ -82,19 +82,11 @@ async fn arrow_get_table() {
         addr,
         "GET",
         "/rest/v1/arw?order=id.asc",
-        &[
-            ("Authorization", &bearer),
-            ("Accept", ARROW_MIME),
-        ],
+        &[("Authorization", &bearer), ("Accept", ARROW_MIME)],
         None,
     )
     .await;
-    assert_eq!(
-        r.status,
-        200,
-        "body: {}",
-        String::from_utf8_lossy(&r.body)
-    );
+    assert_eq!(r.status, 200, "body: {}", String::from_utf8_lossy(&r.body));
     assert_eq!(
         r.header("content-type"),
         Some(ARROW_MIME),
@@ -157,7 +149,9 @@ async fn arrow_i64_extremes_fidelity() {
     let min = i64::MIN;
     let max = i64::MAX;
     session
-        .execute(&format!("INSERT INTO extremes VALUES ({min}), (-1), (0), (1), ({max})"))
+        .execute(&format!(
+            "INSERT INTO extremes VALUES ({min}), (-1), (0), (1), ({max})"
+        ))
         .await
         .unwrap();
 
@@ -168,10 +162,7 @@ async fn arrow_i64_extremes_fidelity() {
         addr,
         "GET",
         "/rest/v1/extremes?order=v.asc",
-        &[
-            ("Authorization", &bearer),
-            ("Accept", ARROW_MIME),
-        ],
+        &[("Authorization", &bearer), ("Accept", ARROW_MIME)],
         None,
     )
     .await;
@@ -256,10 +247,7 @@ async fn arrow_timestamp_fidelity() {
         addr,
         "GET",
         "/rest/v1/ts_table?order=id.asc",
-        &[
-            ("Authorization", &bearer),
-            ("Accept", ARROW_MIME),
-        ],
+        &[("Authorization", &bearer), ("Accept", ARROW_MIME)],
         None,
     )
     .await;
@@ -332,10 +320,7 @@ async fn arrow_no_accept_still_json() {
         addr,
         "GET",
         "/rest/v1/plain?order=id.asc",
-        &[
-            ("Authorization", &bearer),
-            ("Accept", "application/json"),
-        ],
+        &[("Authorization", &bearer), ("Accept", "application/json")],
         None,
     )
     .await;
@@ -465,7 +450,10 @@ async fn arrow_pagination_cursor_in_header() {
         .unwrap();
     let values: Vec<String> = (1i64..=30).map(|i| format!("({i})")).collect();
     session
-        .execute(&format!("INSERT INTO arrow_pages VALUES {}", values.join(", ")))
+        .execute(&format!(
+            "INSERT INTO arrow_pages VALUES {}",
+            values.join(", ")
+        ))
         .await
         .unwrap();
 
@@ -477,10 +465,7 @@ async fn arrow_pagination_cursor_in_header() {
         addr,
         "GET",
         "/rest/v1/arrow_pages?limit=10&order=id.asc",
-        &[
-            ("Authorization", &bearer),
-            ("Accept", ARROW_MIME),
-        ],
+        &[("Authorization", &bearer), ("Accept", ARROW_MIME)],
         None,
     )
     .await;
@@ -501,17 +486,12 @@ async fn arrow_pagination_cursor_in_header() {
 
     // Page 2 using the cursor.
     let cursor_val = cursor.unwrap();
-    let path2 = format!(
-        "/rest/v1/arrow_pages?limit=10&order=id.asc&cursor={cursor_val}"
-    );
+    let path2 = format!("/rest/v1/arrow_pages?limit=10&order=id.asc&cursor={cursor_val}");
     let r2 = http_request(
         addr,
         "GET",
         &path2,
-        &[
-            ("Authorization", &bearer),
-            ("Accept", ARROW_MIME),
-        ],
+        &[("Authorization", &bearer), ("Accept", ARROW_MIME)],
         None,
     )
     .await;

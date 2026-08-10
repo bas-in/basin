@@ -711,9 +711,7 @@ fn dtype_needs_conversion(dt: &df_schema::DataType) -> bool {
         | df_schema::DataType::BinaryView => true,
         df_schema::DataType::List(child)
         | df_schema::DataType::LargeList(child)
-        | df_schema::DataType::FixedSizeList(child, _) => {
-            dtype_needs_conversion(child.data_type())
-        }
+        | df_schema::DataType::FixedSizeList(child, _) => dtype_needs_conversion(child.data_type()),
         _ => false,
     }
 }

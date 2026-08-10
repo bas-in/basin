@@ -41,11 +41,12 @@ pub mod registry;
 pub mod row_key;
 
 pub use budget::{FlushPolicy, GlobalPressureScheduler, MemTableConfig};
-pub use flush::{FlushBackend, FlushTask, FlushTrigger, ImmediateFlushRequest, RowBytes, WrittenFile};
+pub use flush::{
+    FlushBackend, FlushTask, FlushTrigger, ImmediateFlushRequest, RowBytes, WrittenFile,
+};
 pub use memtable::{MemRowValue, MemTable};
 pub use merge::merge_scan;
 pub use registry::{
-    FlushRequest, MemTableEntry, MemTableRegistry, OverlayMemo, ProjectMemState,
-    ReservationOutcome,
+    FlushRequest, MemTableEntry, MemTableRegistry, OverlayMemo, ProjectMemState, ReservationOutcome,
 };
 pub use row_key::{RowKey, RowKeyBuilder};

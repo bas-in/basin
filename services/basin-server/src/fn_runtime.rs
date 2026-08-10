@@ -26,11 +26,11 @@
 
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use basin_catalog::{Catalog, SqlFunctionLanguage};
 use basin_common::ProjectId;
 use basin_fn::runtime::{FunctionRecord, FunctionRuntime, FunctionStore, LookupFuture};
 use basin_rest::{FunctionInvoker, InvokeRequest, InvokeResponse};
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
 // ---------------------------------------------------------------------------
 // CatalogFunctionStore
@@ -65,15 +65,13 @@ impl FunctionStore for CatalogFunctionStore {
             };
 
             let fns = self.catalog.list_sql_functions(&project_id).await;
-            let def = fns
-                .into_iter()
-                .find(|f| {
-                    f.name == name
-                        && matches!(
-                            f.language,
-                            SqlFunctionLanguage::Javascript | SqlFunctionLanguage::Wasm
-                        )
-                })?;
+            let def = fns.into_iter().find(|f| {
+                f.name == name
+                    && matches!(
+                        f.language,
+                        SqlFunctionLanguage::Javascript | SqlFunctionLanguage::Wasm
+                    )
+            })?;
 
             // Decode the base64 body to raw Wasm component bytes.
             let body = match B64.decode(def.body.trim().as_bytes()) {
@@ -110,8 +108,7 @@ pub struct CatalogInvoker {
 
 impl CatalogInvoker {
     pub fn new(catalog: Arc<dyn Catalog>) -> Self {
-        let store: Arc<dyn FunctionStore> =
-            Arc::new(CatalogFunctionStore::new(catalog));
+        let store: Arc<dyn FunctionStore> = Arc::new(CatalogFunctionStore::new(catalog));
         Self {
             runtime: Arc::new(FunctionRuntime::new(store)),
         }
@@ -126,9 +123,9 @@ impl FunctionInvoker for CatalogInvoker {
         name: &str,
         req: InvokeRequest,
     ) -> Result<Option<InvokeResponse>, String> {
-        use basin_fn::runtime::InvokeResult;
         use basin_fn::engine::InvocationContext;
         use basin_fn::handler::HandlerRequest;
+        use basin_fn::runtime::InvokeResult;
 
         let hr = HandlerRequest {
             method: req.method,
@@ -168,5 +165,7 @@ impl FunctionInvoker for CatalogInvoker {
 pub fn install_catalog_invoker(catalog: Arc<dyn Catalog>) {
     let invoker = Arc::new(CatalogInvoker::new(catalog));
     basin_rest::set_global_invoker(invoker);
-    tracing::info!("fn-runtime: catalog-backed FunctionInvoker installed (LANGUAGE javascript/wasm)");
+    tracing::info!(
+        "fn-runtime: catalog-backed FunctionInvoker installed (LANGUAGE javascript/wasm)"
+    );
 }

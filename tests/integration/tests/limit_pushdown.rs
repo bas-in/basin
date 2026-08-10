@@ -29,8 +29,8 @@ use std::time::Instant;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use basin_storage::{Predicate, ReadOptions, ScalarValue, Storage, StorageConfig, WriteOptions};
 use basin_common::{PartitionKey, ProjectId, TableName};
+use basin_storage::{Predicate, ReadOptions, ScalarValue, Storage, StorageConfig, WriteOptions};
 use futures::StreamExt;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -44,7 +44,9 @@ fn schema() -> Arc<Schema> {
 
 fn batch(start: i64, len: i64) -> RecordBatch {
     let ks: Int64Array = (start..start + len).collect();
-    let vs: StringArray = (start..start + len).map(|i| Some(format!("row-{i}"))).collect();
+    let vs: StringArray = (start..start + len)
+        .map(|i| Some(format!("row-{i}")))
+        .collect();
     RecordBatch::try_new(schema(), vec![Arc::new(ks), Arc::new(vs)]).unwrap()
 }
 
@@ -144,7 +146,11 @@ async fn limit_pushdown_with_predicate_returns_exactly_n_matches() {
             .downcast_ref::<Int64Array>()
             .unwrap();
         for i in 0..col.len() {
-            assert!(col.value(i) > 100, "predicate not honoured: {}", col.value(i));
+            assert!(
+                col.value(i) > 100,
+                "predicate not honoured: {}",
+                col.value(i)
+            );
         }
     }
 }
@@ -195,13 +201,7 @@ async fn limit_pushdown_is_faster_than_full_scan_at_scale() {
 
     // Warm the page cache once at scale so the second measurement isn't
     // dominated by first-touch costs unrelated to the LIMIT pushdown.
-    let _warm = collect_rows(
-        &storage,
-        &project,
-        &table,
-        ReadOptions::default(),
-    )
-    .await;
+    let _warm = collect_rows(&storage, &project, &table, ReadOptions::default()).await;
 
     let full_start = Instant::now();
     let full = collect_rows(&storage, &project, &table, ReadOptions::default()).await;

@@ -47,7 +47,10 @@ use ulid::Ulid;
 const PG_URL: &str = "host=127.0.0.1 port=5432 user=pc dbname=postgres";
 
 fn unique_schema() -> String {
-    format!("basin_fn_handler_test_{}", Ulid::new().to_string().to_lowercase())
+    format!(
+        "basin_fn_handler_test_{}",
+        Ulid::new().to_string().to_lowercase()
+    )
 }
 
 struct SchemaGuard {
@@ -349,7 +352,9 @@ struct WasmInvoker {
 
 impl WasmInvoker {
     fn new() -> Self {
-        Self { by_name: Mutex::new(HashMap::new()) }
+        Self {
+            by_name: Mutex::new(HashMap::new()),
+        }
     }
 
     fn register(&self, project: ProjectId, name: &str, harness: Arc<HandlerHarness>) {
@@ -372,7 +377,9 @@ impl FunctionInvoker for WasmInvoker {
             let guard = self.by_name.lock().unwrap();
             guard.get(&(project, name.to_string())).cloned()
         };
-        let Some(harness) = harness else { return Ok(None) };
+        let Some(harness) = harness else {
+            return Ok(None);
+        };
 
         let handler_req = HandlerRequest {
             method: req.method,

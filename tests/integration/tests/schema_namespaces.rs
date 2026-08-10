@@ -57,11 +57,8 @@ async fn rows(sess: &ProjectSession, sql: &str) -> (Vec<String>, Vec<Vec<String>
         Ok(ExecResult::Rows { schema, batches }) => {
             // Headers come from the result's top-level schema so an empty
             // result set (zero batches) still reports the projected columns.
-            let mut headers: Vec<String> = schema
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect();
+            let mut headers: Vec<String> =
+                schema.fields().iter().map(|f| f.name().clone()).collect();
             let mut out: Vec<Vec<String>> = Vec::new();
             for b in &batches {
                 if headers.is_empty() {
@@ -418,7 +415,11 @@ async fn drizzle_migrate_sequence_end_to_end() {
         )"#,
     )
     .await;
-    exec(&sess, r#"INSERT INTO "d_users" ("email", "name") VALUES ('alice@drizzle.test', 'Alice')"#).await;
+    exec(
+        &sess,
+        r#"INSERT INTO "d_users" ("email", "name") VALUES ('alice@drizzle.test', 'Alice')"#,
+    )
+    .await;
     let (_, ru) = rows(&sess, r#"SELECT email FROM "d_users""#).await;
     assert_eq!(ru.len(), 1, "user table DDL + DML via drizzle sequence");
 

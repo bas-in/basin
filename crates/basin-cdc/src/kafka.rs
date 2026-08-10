@@ -377,8 +377,11 @@ async fn run_supervisor(
     loop {
         tick.tick().await;
         let rows = catalog.list_cdc_kafka_sinks(&project).await;
-        let live_ids: std::collections::HashSet<String> =
-            rows.iter().filter(|r| r.def.active).map(|r| r.def.id.clone()).collect();
+        let live_ids: std::collections::HashSet<String> = rows
+            .iter()
+            .filter(|r| r.def.active)
+            .map(|r| r.def.id.clone())
+            .collect();
 
         tasks.retain(|id, h| {
             if !live_ids.contains(id) || h.is_finished() {

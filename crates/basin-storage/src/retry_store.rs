@@ -315,6 +315,9 @@ mod tests {
             Ok(r) => r.bytes().await.map(|_| ()),
             Err(e) => Err(e),
         };
-        assert!(res.is_err(), "a body that never recovers must surface an error");
+        assert!(
+            res.is_err(),
+            "a body that never recovers must surface an error"
+        );
     }
 }

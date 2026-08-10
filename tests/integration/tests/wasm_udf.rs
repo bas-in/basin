@@ -139,10 +139,10 @@ async fn add_i32_round_trip() {
     let sess = eng.open_session(project).await.unwrap();
 
     let body = wat_to_b64(ADD_WAT);
-    let ddl = format!(
-        "CREATE FUNCTION add(a INT, b INT) RETURNS INT LANGUAGE wasm AS '{body}'"
-    );
-    sess.execute(&ddl).await.expect("CREATE FUNCTION should succeed");
+    let ddl = format!("CREATE FUNCTION add(a INT, b INT) RETURNS INT LANGUAGE wasm AS '{body}'");
+    sess.execute(&ddl)
+        .await
+        .expect("CREATE FUNCTION should succeed");
 
     // Open a fresh session so the UDF is loaded from catalog (not just held in memory).
     let sess2 = eng.open_session(project).await.unwrap();
@@ -173,10 +173,11 @@ async fn double_it_bigint_round_trip() {
     let sess = eng.open_session(project).await.unwrap();
 
     let body = wat_to_b64(DOUBLE_IT_WAT);
-    let ddl = format!(
-        "CREATE FUNCTION double_it(n BIGINT) RETURNS BIGINT LANGUAGE wasm AS '{body}'"
-    );
-    sess.execute(&ddl).await.expect("CREATE FUNCTION should succeed");
+    let ddl =
+        format!("CREATE FUNCTION double_it(n BIGINT) RETURNS BIGINT LANGUAGE wasm AS '{body}'");
+    sess.execute(&ddl)
+        .await
+        .expect("CREATE FUNCTION should succeed");
 
     let sess2 = eng.open_session(project).await.unwrap();
     let res = sess2
@@ -207,7 +208,9 @@ async fn scale_f64_round_trip() {
     let ddl = format!(
         "CREATE FUNCTION scale(x DOUBLE PRECISION) RETURNS DOUBLE PRECISION LANGUAGE wasm AS '{body}'"
     );
-    sess.execute(&ddl).await.expect("CREATE FUNCTION should succeed");
+    sess.execute(&ddl)
+        .await
+        .expect("CREATE FUNCTION should succeed");
 
     let sess2 = eng.open_session(project).await.unwrap();
     let res = sess2
@@ -248,10 +251,10 @@ async fn cpu_cap_kills_runaway_loop() {
     let sess = eng.open_session(project).await.unwrap();
 
     let body = wat_to_b64(LOOP_FOREVER_WAT);
-    let ddl = format!(
-        "CREATE FUNCTION loop_forever() RETURNS INT LANGUAGE wasm AS '{body}'"
-    );
-    sess.execute(&ddl).await.expect("CREATE FUNCTION should succeed");
+    let ddl = format!("CREATE FUNCTION loop_forever() RETURNS INT LANGUAGE wasm AS '{body}'");
+    sess.execute(&ddl)
+        .await
+        .expect("CREATE FUNCTION should succeed");
 
     let sess2 = eng.open_session(project).await.unwrap();
     let err = sess2
@@ -280,18 +283,25 @@ async fn drop_function_removes_wasm_udf() {
     let sess = eng.open_session(project).await.unwrap();
 
     let body = wat_to_b64(ADD_WAT);
-    let ddl = format!(
-        "CREATE FUNCTION add(a INT, b INT) RETURNS INT LANGUAGE wasm AS '{body}'"
-    );
-    sess.execute(&ddl).await.expect("CREATE FUNCTION should succeed");
+    let ddl = format!("CREATE FUNCTION add(a INT, b INT) RETURNS INT LANGUAGE wasm AS '{body}'");
+    sess.execute(&ddl)
+        .await
+        .expect("CREATE FUNCTION should succeed");
 
     // Open a fresh session so the UDF is loaded from catalog and available.
     // (WASM UDFs are registered at session-open time, not when CREATE FUNCTION runs.)
     let sess2 = eng.open_session(project).await.unwrap();
-    let res = sess2.execute("SELECT add(1, 2)").await.expect("should work before DROP");
+    let res = sess2
+        .execute("SELECT add(1, 2)")
+        .await
+        .expect("should work before DROP");
     match res {
         ExecResult::Rows { batches, .. } => {
-            assert_eq!(scalar_i64(&batches, 0), 3, "add(1,2) should be 3 before DROP");
+            assert_eq!(
+                scalar_i64(&batches, 0),
+                3,
+                "add(1,2) should be 3 before DROP"
+            );
         }
         other => panic!("unexpected: {other:?}"),
     }
@@ -333,10 +343,11 @@ async fn wasm_udf_multi_project_isolation() {
     // Register `add` for project A.
     let sess_a_ddl = eng_a.open_session(project_a).await.unwrap();
     let body = wat_to_b64(ADD_WAT);
-    let ddl = format!(
-        "CREATE FUNCTION add(a INT, b INT) RETURNS INT LANGUAGE wasm AS '{body}'"
-    );
-    sess_a_ddl.execute(&ddl).await.expect("project A CREATE FUNCTION");
+    let ddl = format!("CREATE FUNCTION add(a INT, b INT) RETURNS INT LANGUAGE wasm AS '{body}'");
+    sess_a_ddl
+        .execute(&ddl)
+        .await
+        .expect("project A CREATE FUNCTION");
 
     // Project A can use the UDF — open a fresh session so the UDF is loaded from catalog.
     // (WASM UDFs are registered at session-open time, not when CREATE FUNCTION runs.)

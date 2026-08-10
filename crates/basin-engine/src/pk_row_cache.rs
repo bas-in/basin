@@ -55,8 +55,8 @@
 //! a shard, so same-key requests always land on the same shard and different
 //! keys scatter. Process-global, lives on the engine handle.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -199,7 +199,12 @@ impl PkRowCache {
     /// Construct with explicit shard count + total byte budget. Per-project
     /// waterline / share-cap take their env-or-default values.
     pub fn new(num_shards: usize, max_bytes: u64) -> Self {
-        Self::with_partition(num_shards, max_bytes, waterline_from_env(), max_share_pct_from_env())
+        Self::with_partition(
+            num_shards,
+            max_bytes,
+            waterline_from_env(),
+            max_share_pct_from_env(),
+        )
     }
 
     /// Construct with every knob explicit. Used by tests to pin deterministic,
@@ -373,7 +378,9 @@ impl PkRowCache {
                 // Keep the per-project accounting in sync with the stale evict.
                 self.adjust_project_bytes(project, 0, freed);
             }
-            self.counters.stale_evictions.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .stale_evictions
+                .fetch_add(1, Ordering::Relaxed);
             self.counters.misses.fetch_add(1, Ordering::Relaxed);
             None
         }
@@ -567,7 +574,9 @@ impl PkRowCache {
             }
         }
         if freed > 0 {
-            self.counters.current_bytes.fetch_sub(freed, Ordering::Relaxed);
+            self.counters
+                .current_bytes
+                .fetch_sub(freed, Ordering::Relaxed);
             self.adjust_project_bytes(project, 0, freed);
         }
     }
@@ -596,7 +605,9 @@ impl PkRowCache {
             }
         }
         if freed > 0 {
-            self.counters.current_bytes.fetch_sub(freed, Ordering::Relaxed);
+            self.counters
+                .current_bytes
+                .fetch_sub(freed, Ordering::Relaxed);
         }
         // Every entry for this project is gone; zero its accounting directly.
         if let Ok(mut map) = self.project_bytes.lock() {
@@ -608,16 +619,16 @@ impl PkRowCache {
     /// never call while holding a shard lock.
     #[allow(dead_code)]
     fn total_bytes(&self) -> u64 {
-        self.shards
-            .iter()
-            .map(|s| s.lock().unwrap().bytes)
-            .sum()
+        self.shards.iter().map(|s| s.lock().unwrap().bytes).sum()
     }
 
     /// Number of cached entries across all shards. Observability / test helper.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.shards.iter().map(|s| s.lock().unwrap().lru.len()).sum()
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap().lru.len())
+            .sum()
     }
 
     /// Number of cached entries for a specific project across all shards.
@@ -948,7 +959,11 @@ mod tests {
         // Invalidating A leaves B's accounting untouched.
         c.invalidate_project(&pa);
         assert_eq!(c.project_bytes(&pa), 0, "A drained");
-        assert_eq!(c.project_bytes(&pb), b0, "B's bytes survive A's invalidation");
+        assert_eq!(
+            c.project_bytes(&pb),
+            b0,
+            "B's bytes survive A's invalidation"
+        );
     }
 
     /// THE noisy-neighbour property: project A floods a tiny single-shard cache

@@ -42,10 +42,7 @@ pub enum GeoError {
     /// we list in `epsg_table`; surfaces a clear error if a future
     /// entry has a typo.
     #[error("ST_Transform: failed to build projection for SRID {srid}: {reason}")]
-    ProjBuildError {
-        srid: u32,
-        reason: String,
-    },
+    ProjBuildError { srid: u32, reason: String },
     /// `proj4rs` ran the transform but rejected the result (e.g. point
     /// out of the projection's valid domain). PostGIS returns the row
     /// unchanged in this case — we surface as an explicit error so the
@@ -96,10 +93,8 @@ pub fn st_transform_xy(
     if src_srid == dst_srid {
         return Ok((x, y));
     }
-    let src_str = proj_string_for_srid(src_srid)
-        .ok_or(GeoError::UnknownSrid { srid: src_srid })?;
-    let dst_str = proj_string_for_srid(dst_srid)
-        .ok_or(GeoError::UnknownSrid { srid: dst_srid })?;
+    let src_str = proj_string_for_srid(src_srid).ok_or(GeoError::UnknownSrid { srid: src_srid })?;
+    let dst_str = proj_string_for_srid(dst_srid).ok_or(GeoError::UnknownSrid { srid: dst_srid })?;
     let src = proj4rs::Proj::from_proj_string(&src_str).map_err(|e| GeoError::ProjBuildError {
         srid: src_srid,
         reason: format!("{e:?}"),
@@ -118,15 +113,13 @@ pub fn st_transform_xy(
         x_work = x_work.to_radians();
         y_work = y_work.to_radians();
     }
-    let (mut ox, mut oy) =
-        proj4rs::adaptors::transform_vertex_2d(&src, &dst, (x_work, y_work)).map_err(|e| {
-            GeoError::TransformFailed {
-                x,
-                y,
-                src_srid,
-                dst_srid,
-                reason: format!("{e:?}"),
-            }
+    let (mut ox, mut oy) = proj4rs::adaptors::transform_vertex_2d(&src, &dst, (x_work, y_work))
+        .map_err(|e| GeoError::TransformFailed {
+            x,
+            y,
+            src_srid,
+            dst_srid,
+            reason: format!("{e:?}"),
         })?;
     if dst.is_latlong() {
         ox = ox.to_degrees();
@@ -220,8 +213,7 @@ mod tests {
         // project to WGS84, project back.
         let easting = 448_252.001_f64;
         let northing = 5_411_954.910_f64;
-        let (lon, lat) =
-            st_transform_xy(easting, northing, 32631, 4326).expect("UTM31N→WGS84");
+        let (lon, lat) = st_transform_xy(easting, northing, 32631, 4326).expect("UTM31N→WGS84");
         // Eiffel ≈ (2.2945, 48.8584). 1e-5 deg tolerance ≈ 1.1 m;
         // proj4rs UTM↔WGS84 round-trips to floating-point noise.
         assert!((lon - 2.2945).abs() < 1e-4, "lon got {lon}");

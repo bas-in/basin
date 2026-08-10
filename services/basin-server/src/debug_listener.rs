@@ -63,7 +63,10 @@ pub fn spawn_debug_listener(main_handle: Handle) -> Option<std::thread::JoinHand
         .name("basin-debug".into())
         .spawn(move || {
             // OWN current-thread runtime, isolated from the main pool.
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
                     eprintln!("basin-debug: failed to build runtime: {e}");

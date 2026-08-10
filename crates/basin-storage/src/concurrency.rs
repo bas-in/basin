@@ -442,7 +442,10 @@ mod tests {
             .await
             .expect("get_opts(head=true)");
         let s = registry.snapshot(&project).unwrap();
-        assert_eq!(s.class_b_ops_total, 2, "HEAD-as-GET should also bump Class-B");
+        assert_eq!(
+            s.class_b_ops_total, 2,
+            "HEAD-as-GET should also bump Class-B"
+        );
 
         // 1 LIST — Class-B == 3.
         let listed: Vec<_> = store.list(None).collect().await;
@@ -616,11 +619,7 @@ mod tests {
         ) -> object_store::Result<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(l, o).await
         }
-        async fn get_opts(
-            &self,
-            l: &ObjectPath,
-            o: GetOptions,
-        ) -> object_store::Result<GetResult> {
+        async fn get_opts(&self, l: &ObjectPath, o: GetOptions) -> object_store::Result<GetResult> {
             self.entered
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // Block until the test releases a permit; consume it so each

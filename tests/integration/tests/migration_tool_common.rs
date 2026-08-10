@@ -90,8 +90,7 @@ pub async fn spawn_basin_server_with_slug(project_slug: &str) -> EphemeralBasin 
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    let catalog: Arc<dyn basin_catalog::Catalog> =
-        Arc::new(basin_catalog::InMemoryCatalog::new());
+    let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(basin_catalog::InMemoryCatalog::new());
     let engine = basin_engine::Engine::new(basin_engine::EngineConfig {
         storage,
         catalog,
@@ -313,11 +312,7 @@ pub async fn run_crud_battery(conn_str: &str, battery: &[CrudQuery]) {
                         .map(|_| "<non-text>".to_owned())
                         .unwrap_or_default()
                 });
-            assert_eq!(
-                first_value, expected,
-                "[{}] first-column mismatch",
-                q.label
-            );
+            assert_eq!(first_value, expected, "[{}] first-column mismatch", q.label);
         }
     }
 }

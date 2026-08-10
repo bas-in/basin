@@ -58,14 +58,20 @@ impl FunctionHost {
     /// Build a host with no per-Store memory limiter. Engine-level
     /// `memory_reservation` is the only memory cap.
     pub fn new(ctx: FunctionCallContext) -> Self {
-        Self { ctx, memory_limiter: None }
+        Self {
+            ctx,
+            memory_limiter: None,
+        }
     }
 
     /// Build a host carrying a [`MemoryLimiter`] for the per-Store cap.
     /// Used by [`crate::ComponentHarness`] / [`crate::HandlerHarness`] when
     /// they are constructed with governance.
     pub fn with_limiter(ctx: FunctionCallContext, limiter: MemoryLimiter) -> Self {
-        Self { ctx, memory_limiter: Some(limiter) }
+        Self {
+            ctx,
+            memory_limiter: Some(limiter),
+        }
     }
 
     /// Closure-style accessor used by [`wasmtime::Store::limiter`]. Returns
@@ -93,15 +99,11 @@ impl FunctionHost {
 impl query::Host for FunctionHost {
     fn exec(&mut self, sql: String) -> Result<Vec<query::Row>, String> {
         tracing::debug!(sql = %sql, "basin:fn/query exec");
-        self.ctx
-            .invocation
-            .query
-            .exec_sql(&sql)
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|r| query::Row { columns: r.columns })
-                    .collect()
-            })
+        self.ctx.invocation.query.exec_sql(&sql).map(|rows| {
+            rows.into_iter()
+                .map(|r| query::Row { columns: r.columns })
+                .collect()
+        })
     }
 }
 
@@ -149,8 +151,8 @@ impl log::Host for FunctionHost {
         match lvl {
             log::Level::Trace => tracing::trace!(target: "basin_fn::guest", "{}", msg),
             log::Level::Debug => tracing::debug!(target: "basin_fn::guest", "{}", msg),
-            log::Level::Info  => tracing::info!(target: "basin_fn::guest", "{}", msg),
-            log::Level::Warn  => tracing::warn!(target: "basin_fn::guest", "{}", msg),
+            log::Level::Info => tracing::info!(target: "basin_fn::guest", "{}", msg),
+            log::Level::Warn => tracing::warn!(target: "basin_fn::guest", "{}", msg),
             log::Level::Error => tracing::error!(target: "basin_fn::guest", "{}", msg),
         }
     }

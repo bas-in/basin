@@ -75,10 +75,7 @@ enum Outcome {
 }
 
 /// Run `sql` through `sess` and classify the result.
-async fn classify(
-    sess: &basin_engine::ProjectSession,
-    sql: &str,
-) -> Outcome {
+async fn classify(sess: &basin_engine::ProjectSession, sql: &str) -> Outcome {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { .. }) | Ok(ExecResult::Empty { .. }) => Outcome::Succeeded,
         Err(e) => {
@@ -588,7 +585,9 @@ async fn bug_lateral_outer_ref_panics() {
     let dir = TempDir::new().unwrap();
     let eng = make_engine(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
-    sess.execute("CREATE TABLE items (id BIGINT)").await.unwrap();
+    sess.execute("CREATE TABLE items (id BIGINT)")
+        .await
+        .unwrap();
     sess.execute("CREATE TABLE tags (item_id BIGINT, tag TEXT)")
         .await
         .unwrap();
@@ -640,7 +639,9 @@ async fn bug_fast_select_text_alias_internal() {
     sess.execute("CREATE TABLE t (id BIGINT, label TEXT)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO t VALUES (1, 'hello')").await.unwrap();
+    sess.execute("INSERT INTO t VALUES (1, 'hello')")
+        .await
+        .unwrap();
     let res = sess
         .execute("SELECT id AS \"MyID\", label AS \"MyLabel\" FROM t LIMIT 1")
         .await;

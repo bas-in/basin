@@ -273,7 +273,10 @@ impl TableProvider for InfoSchemaColumnsProvider {
         //    query `WHERE table_schema = 'pg_catalog' AND table_name = '…'`
         //    receive the canonical column set (Phase 5.23.C/D).
         let pg_views: &[(&str, Arc<arrow_schema::Schema>)] = &[
-            ("pg_stat_activity", InfoSchemaQuery::pg_stat_activity_schema()),
+            (
+                "pg_stat_activity",
+                InfoSchemaQuery::pg_stat_activity_schema(),
+            ),
             ("pg_locks", InfoSchemaQuery::pg_locks_schema()),
             ("pg_class", InfoSchemaQuery::pg_class_schema()),
             ("pg_attribute", InfoSchemaQuery::pg_attribute_schema()),
@@ -293,9 +296,18 @@ impl TableProvider for InfoSchemaColumnsProvider {
             ("pg_tables", InfoSchemaQuery::pg_tables_schema()),
             ("pg_settings", InfoSchemaQuery::pg_settings_schema()),
             ("pg_description", InfoSchemaQuery::pg_description_schema()),
-            ("pg_stat_user_tables", InfoSchemaQuery::pg_stat_user_tables_schema()),
-            ("pg_stat_user_indexes", InfoSchemaQuery::pg_stat_user_indexes_schema()),
-            ("pg_stat_database", InfoSchemaQuery::pg_stat_database_schema()),
+            (
+                "pg_stat_user_tables",
+                InfoSchemaQuery::pg_stat_user_tables_schema(),
+            ),
+            (
+                "pg_stat_user_indexes",
+                InfoSchemaQuery::pg_stat_user_indexes_schema(),
+            ),
+            (
+                "pg_stat_database",
+                InfoSchemaQuery::pg_stat_database_schema(),
+            ),
         ];
 
         let pg_catalog_batch = pg_catalog_view_columns_batch(pg_views)
@@ -1864,15 +1876,18 @@ impl TableProvider for PgStatActivityLiveProvider {
             let n = sessions.len();
             // Pre-allocate owned strings to avoid temporary lifetime issues.
             let project_str = self.project.to_string();
-            let app_names: Vec<String> =
-                sessions.iter().map(|s| s.application_name.clone()).collect();
+            let app_names: Vec<String> = sessions
+                .iter()
+                .map(|s| s.application_name.clone())
+                .collect();
             let states: Vec<String> = sessions.iter().map(|s| s.state.clone()).collect();
-            let queries: Vec<Option<String>> =
-                sessions.iter().map(|s| s.query.clone()).collect();
+            let queries: Vec<Option<String>> = sessions.iter().map(|s| s.query.clone()).collect();
             let columns: Vec<ArrayRef> = vec![
                 Arc::new(Int64Array::from(vec![None::<i64>; n])), // datid (synthetic)
                 Arc::new(StringArray::from(vec![Some("basin"); n])),
-                Arc::new(Int32Array::from(sessions.iter().map(|s| s.pid).collect::<Vec<_>>())),
+                Arc::new(Int32Array::from(
+                    sessions.iter().map(|s| s.pid).collect::<Vec<_>>(),
+                )),
                 Arc::new(Int64Array::from(vec![None::<i64>; n])), // usesysid (synthetic)
                 Arc::new(StringArray::from(vec![Some(project_str.as_str()); n])),
                 Arc::new(StringArray::from(
@@ -1896,18 +1911,12 @@ impl TableProvider for PgStatActivityLiveProvider {
                 Arc::new(StringArray::from(vec![None::<&str>; n])), // wait_event_type
                 Arc::new(StringArray::from(vec![None::<&str>; n])), // wait_event
                 Arc::new(StringArray::from(
-                    states
-                        .iter()
-                        .map(|s| Some(s.as_str()))
-                        .collect::<Vec<_>>(),
+                    states.iter().map(|s| Some(s.as_str())).collect::<Vec<_>>(),
                 )), // state
-                Arc::new(Int64Array::from(vec![None::<i64>; n])), // backend_xid
-                Arc::new(Int64Array::from(vec![None::<i64>; n])), // backend_xmin
+                Arc::new(Int64Array::from(vec![None::<i64>; n])),   // backend_xid
+                Arc::new(Int64Array::from(vec![None::<i64>; n])),   // backend_xmin
                 Arc::new(StringArray::from(
-                    queries
-                        .iter()
-                        .map(|q| q.as_deref())
-                        .collect::<Vec<_>>(),
+                    queries.iter().map(|q| q.as_deref()).collect::<Vec<_>>(),
                 )), // query
                 Arc::new(StringArray::from(vec![Some("client backend"); n])), // backend_type
             ];
@@ -2021,18 +2030,18 @@ impl TableProvider for PgLocksLiveProvider {
                 Arc::new(Int64Array::from(
                     entries.iter().map(|e| e.relation).collect::<Vec<_>>(),
                 )), // relation
-                Arc::new(Int32Array::from(vec![None::<i32>; n])),   // page
-                Arc::new(Int16Array::from(vec![None::<i16>; n])),   // tuple
+                Arc::new(Int32Array::from(vec![None::<i32>; n])), // page
+                Arc::new(Int16Array::from(vec![None::<i16>; n])), // tuple
                 Arc::new(StringArray::from(
                     entries
                         .iter()
                         .map(|e| e.virtualxid.as_deref())
                         .collect::<Vec<_>>(),
                 )), // virtualxid
-                Arc::new(Int64Array::from(vec![None::<i64>; n])),   // transactionid
-                Arc::new(Int64Array::from(vec![None::<i64>; n])),   // classid
-                Arc::new(Int64Array::from(vec![None::<i64>; n])),   // objid
-                Arc::new(Int16Array::from(vec![None::<i16>; n])),   // objsubid
+                Arc::new(Int64Array::from(vec![None::<i64>; n])), // transactionid
+                Arc::new(Int64Array::from(vec![None::<i64>; n])), // classid
+                Arc::new(Int64Array::from(vec![None::<i64>; n])), // objid
+                Arc::new(Int16Array::from(vec![None::<i16>; n])), // objsubid
                 Arc::new(StringArray::from(
                     entries
                         .iter()
@@ -2049,10 +2058,7 @@ impl TableProvider for PgLocksLiveProvider {
                         .collect::<Vec<_>>(),
                 )), // mode
                 Arc::new(BooleanArray::from(
-                    entries
-                        .iter()
-                        .map(|e| Some(e.granted))
-                        .collect::<Vec<_>>(),
+                    entries.iter().map(|e| Some(e.granted)).collect::<Vec<_>>(),
                 )), // granted
                 Arc::new(BooleanArray::from(vec![Some(true); n])), // fastpath
             ];
@@ -2133,8 +2139,11 @@ pub(crate) fn register_info_schema_providers(
     let pg_attribute_provider: Arc<dyn TableProvider> =
         Arc::new(PgAttributeProvider::new(catalog.clone(), project)?);
     pg_catalog_schema.register_table("pg_attribute".to_string(), pg_attribute_provider)?;
-    let pg_namespace_provider: Arc<dyn TableProvider> =
-        Arc::new(PgNamespaceProvider::new(catalog.clone(), project, Arc::clone(&schema_state))?);
+    let pg_namespace_provider: Arc<dyn TableProvider> = Arc::new(PgNamespaceProvider::new(
+        catalog.clone(),
+        project,
+        Arc::clone(&schema_state),
+    )?);
     pg_catalog_schema.register_table("pg_namespace".to_string(), pg_namespace_provider)?;
     let pg_proc_provider: Arc<dyn TableProvider> =
         Arc::new(PgProcProvider::new(catalog.clone(), project)?);
@@ -2154,8 +2163,11 @@ pub(crate) fn register_info_schema_providers(
     let views_provider: Arc<dyn TableProvider> =
         Arc::new(InfoSchemaViewsProvider::new(catalog.clone(), project)?);
     info_schema.register_table("views".to_string(), views_provider)?;
-    let schemata_provider: Arc<dyn TableProvider> =
-        Arc::new(InfoSchemaSchemataProvider::new(catalog.clone(), project, Arc::clone(&schema_state))?);
+    let schemata_provider: Arc<dyn TableProvider> = Arc::new(InfoSchemaSchemataProvider::new(
+        catalog.clone(),
+        project,
+        Arc::clone(&schema_state),
+    )?);
     info_schema.register_table("schemata".to_string(), schemata_provider)?;
 
     // Phase 5.11.M Tier 3 (constraint introspection):
@@ -2245,8 +2257,11 @@ pub(crate) fn register_info_schema_providers(
     )?;
     // Phase 5.23.D: use the live provider backed by LockRegistry so that
     // `pg_locks` reflects real held/waiting locks for the calling project.
-    let pg_locks_provider: Arc<dyn TableProvider> =
-        Arc::new(PgLocksLiveProvider::new(catalog.clone(), project, lock_registry)?);
+    let pg_locks_provider: Arc<dyn TableProvider> = Arc::new(PgLocksLiveProvider::new(
+        catalog.clone(),
+        project,
+        lock_registry,
+    )?);
     pg_catalog_schema.register_table("pg_locks".to_string(), pg_locks_provider)?;
     // Phase 5.23.C: use the live provider backed by ConnectionRegistry so that
     // `pg_stat_activity` reflects the current session list for the project.
@@ -2457,15 +2472,13 @@ pub(crate) fn register_cdc_providers(
         crate::replication::slot_udf::PgReplicationSlotsProvider::new(slot_registry, project),
     );
     // Ignore already-exists errors (idempotent registration).
-    let _ = pg_catalog_schema
-        .register_table("pg_replication_slots".to_string(), repl_slots);
+    let _ = pg_catalog_schema.register_table("pg_replication_slots".to_string(), repl_slots);
 
-    let pub_provider: std::sync::Arc<dyn TableProvider> = std::sync::Arc::new(
-        crate::replication::slot_udf::PgPublicationProvider::new(
+    let pub_provider: std::sync::Arc<dyn TableProvider> =
+        std::sync::Arc::new(crate::replication::slot_udf::PgPublicationProvider::new(
             publication_registry.clone(),
             project,
-        ),
-    );
+        ));
     let _ = pg_catalog_schema.register_table("pg_publication".to_string(), pub_provider);
 
     let pub_tables_provider: std::sync::Arc<dyn TableProvider> = std::sync::Arc::new(
@@ -2474,8 +2487,8 @@ pub(crate) fn register_cdc_providers(
             project,
         ),
     );
-    let _ = pg_catalog_schema
-        .register_table("pg_publication_tables".to_string(), pub_tables_provider);
+    let _ =
+        pg_catalog_schema.register_table("pg_publication_tables".to_string(), pub_tables_provider);
 
     Ok(())
 }

@@ -36,8 +36,13 @@ use tempfile::TempDir;
 /// Shard-backed engine over tempdir storage + WAL (mirrors `gin_scale.rs`).
 /// A shard lets us `flush_to_parquet()` deterministically so each INSERT lands
 /// in its OWN cold file — giving the per-file prune multiple files to narrow.
-async fn shard_engine() -> (Engine, Arc<dyn basin_catalog::Catalog>, TempDir, TempDir, basin_shard::Shard)
-{
+async fn shard_engine() -> (
+    Engine,
+    Arc<dyn basin_catalog::Catalog>,
+    TempDir,
+    TempDir,
+    basin_shard::Shard,
+) {
     let storage_dir = TempDir::new().unwrap();
     let wal_dir = TempDir::new().unwrap();
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
@@ -90,8 +95,16 @@ async fn id_name_rows(sess: &ProjectSession, sql: &str) -> Vec<(i64, String)> {
     };
     let mut out = Vec::new();
     for b in &batches {
-        let id = b.column(0).as_any().downcast_ref::<Int64Array>().expect("id Int64");
-        let name = b.column(1).as_any().downcast_ref::<StringArray>().expect("name Utf8");
+        let id = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id Int64");
+        let name = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name Utf8");
         for r in 0..b.num_rows() {
             out.push((id.value(r), name.value(r).to_string()));
         }
@@ -103,9 +116,17 @@ async fn id_name_rows(sess: &ProjectSession, sql: &str) -> Vec<(i64, String)> {
 /// `valb (id BIGINT, name TEXT)` PARQUET (text min/max stats), 4 rows, one row
 /// per cold file (each INSERT flushed) so the prune has 4 files to narrow.
 async fn seed_valb(sess: &ProjectSession, shard: &basin_shard::Shard) {
-    exec(sess, "CREATE TABLE valb (id BIGINT, name TEXT) WITH (basin.file_format='parquet')").await;
+    exec(
+        sess,
+        "CREATE TABLE valb (id BIGINT, name TEXT) WITH (basin.file_format='parquet')",
+    )
+    .await;
     for (id, name) in [(1, "amy"), (2, "bob"), (3, "cat"), (4, "dan")] {
-        exec(sess, &format!("INSERT INTO valb (id, name) VALUES ({id}, '{name}')")).await;
+        exec(
+            sess,
+            &format!("INSERT INTO valb (id, name) VALUES ({id}, '{name}')"),
+        )
+        .await;
         shard.flush_to_parquet().await.unwrap();
     }
 }
@@ -127,7 +148,10 @@ async fn int_eq_out_of_domain_is_empty_not_error() {
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed_valb(&sess, &shard).await;
     let got = id_name_rows(&sess, "SELECT id, name FROM valb WHERE id = 99").await;
-    assert!(got.is_empty(), "out-of-domain int eq must be empty, got {got:?}");
+    assert!(
+        got.is_empty(),
+        "out-of-domain int eq must be empty, got {got:?}"
+    );
 }
 
 #[tokio::test]
@@ -174,7 +198,10 @@ async fn string_range_all_pruned_is_empty_not_error() {
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
     seed_valb(&sess, &shard).await;
     let got = id_name_rows(&sess, "SELECT id, name FROM valb WHERE name >= 'zzz'").await;
-    assert!(got.is_empty(), "all-pruned string range must be empty, got {got:?}");
+    assert!(
+        got.is_empty(),
+        "all-pruned string range must be empty, got {got:?}"
+    );
 }
 
 /// Control: no WHERE → the prune is a no-op (bails on a missing predicate). The
@@ -252,8 +279,16 @@ async fn id_cat_rows(sess: &ProjectSession, sql: &str) -> Vec<(i64, String)> {
     };
     let mut out = Vec::new();
     for b in &batches {
-        let id = b.column(0).as_any().downcast_ref::<Int64Array>().expect("id Int64");
-        let cat = b.column(1).as_any().downcast_ref::<StringArray>().expect("cat Utf8");
+        let id = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id Int64");
+        let cat = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("cat Utf8");
         for r in 0..b.num_rows() {
             out.push((id.value(r), cat.value(r).to_string()));
         }
@@ -297,5 +332,8 @@ async fn promoted_jsonb_all_pruned_is_empty_not_error() {
         "SELECT id, payload->>'category' AS category FROM epj WHERE name >= 'zzz'",
     )
     .await;
-    assert!(got.is_empty(), "all-pruned promoted-JSONB query must be empty, got {got:?}");
+    assert!(
+        got.is_empty(),
+        "all-pruned promoted-JSONB query must be empty, got {got:?}"
+    );
 }

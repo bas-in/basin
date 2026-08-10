@@ -254,11 +254,12 @@ impl ScalarUDFImpl for RegexpReplaceUdf {
             } else {
                 ""
             };
-            let re = crate::string_dt_udf::get_or_compile_regex(pat, flags)
-                .map_err(|e| DataFusionError::Execution(format!(
+            let re = crate::string_dt_udf::get_or_compile_regex(pat, flags).map_err(|e| {
+                DataFusionError::Execution(format!(
                     "regexp_replace: invalid regular expression {:?}: {e}",
                     pat
-                )))?;
+                ))
+            })?;
 
             // Translate PG back-references \1..\9 → ${1}..${9} for the regex crate.
             let repl = translate_backrefs(repl_raw);

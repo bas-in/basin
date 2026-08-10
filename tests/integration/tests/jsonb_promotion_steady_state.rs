@@ -52,7 +52,11 @@ async fn build() -> (TempDir, TempDir, Engine, Shard, Arc<dyn Wal>) {
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let engine = Engine::new(EngineConfig {
         storage,
         catalog,
@@ -121,9 +125,12 @@ async fn jsonb_promotion_steady_state_speedup() {
     for _ in 0..3 {
         let _ = time_query(&sess, q).await;
     }
-    let promoted = engine
-        .jsonb_promotion_registry_for_test()
-        .is_promoted(&sess.project(), &basin_common::TableName::new("events").unwrap(), "payload", "kind");
+    let promoted = engine.jsonb_promotion_registry_for_test().is_promoted(
+        &sess.project(),
+        &basin_common::TableName::new("events").unwrap(),
+        "payload",
+        "kind",
+    );
     println!("[steady-state] path promoted after threshold: {promoted}");
 
     // --- 3. Force a compaction so the backfill materialises the shadow column
@@ -156,7 +163,10 @@ async fn jsonb_promotion_steady_state_speedup() {
     );
 
     // Correctness: post-promotion result must still return the rows.
-    assert!(rows_post > 0, "promoted-column query must still return rows");
+    assert!(
+        rows_post > 0,
+        "promoted-column query must still return rows"
+    );
     // The promoted path should be at least as fast (allow noise; the point is
     // it's not slower — real speedup is reported above).
     assert!(
@@ -278,7 +288,10 @@ async fn jsonb_promotion_where_eq_and_group_by_steady_state() {
         let t0 = Instant::now();
         let c = count_of(&sess, q_eq).await;
         post_eq.push(t0.elapsed().as_secs_f64() * 1000.0);
-        assert_eq!(c, expected_eq, "post-sweep WHERE-eq count must be unchanged");
+        assert_eq!(
+            c, expected_eq,
+            "post-sweep WHERE-eq count must be unchanged"
+        );
     }
     post_eq.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let post_eq_p50 = post_eq[post_eq.len() / 2];
@@ -288,7 +301,10 @@ async fn jsonb_promotion_where_eq_and_group_by_steady_state() {
     );
 
     let (post_gb_ms, post_gb_rows) = time_query(&sess, q_gb).await;
-    assert_eq!(post_gb_rows, pre_gb_rows, "GROUP BY group count must be unchanged");
+    assert_eq!(
+        post_gb_rows, pre_gb_rows,
+        "GROUP BY group count must be unchanged"
+    );
 
     println!(
         "[steady-state/eq+gb] WHERE ->>='k7' @ {n} rows: UDF p50={pre_eq_p50:.3}ms → \

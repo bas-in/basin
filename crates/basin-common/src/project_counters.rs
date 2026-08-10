@@ -270,7 +270,10 @@ impl LeaseMetrics {
     /// heartbeat loop can hold one handle and bump without re-locking.
     fn for_replica(&self, replica: &str) -> Arc<ReplicaLeaseCounters> {
         {
-            let map = self.replicas.read().expect("lease metrics replicas poisoned");
+            let map = self
+                .replicas
+                .read()
+                .expect("lease metrics replicas poisoned");
             if let Some(c) = map.get(replica) {
                 return c.clone();
             }
@@ -287,7 +290,10 @@ impl LeaseMetrics {
     fn over_cap_counter(&self, project: &ProjectId, cap: CapLabel) -> Arc<AtomicU64> {
         let key = (*project, cap);
         {
-            let map = self.over_cap.read().expect("lease metrics over_cap poisoned");
+            let map = self
+                .over_cap
+                .read()
+                .expect("lease metrics over_cap poisoned");
             if let Some(c) = map.get(&key) {
                 return c.clone();
             }
@@ -373,7 +379,10 @@ impl LeaseMetrics {
     /// production there's one entry; in tests there's one per simulated
     /// replica.
     pub fn snapshot_replicas(&self) -> HashMap<String, ReplicaLeaseSnapshot> {
-        let map = self.replicas.read().expect("lease metrics replicas poisoned");
+        let map = self
+            .replicas
+            .read()
+            .expect("lease metrics replicas poisoned");
         map.iter()
             .map(|(k, v)| {
                 let handoff = v
@@ -406,7 +415,10 @@ impl LeaseMetrics {
     /// label strings so the exporter can hand the result to its sink
     /// without a lookup table.
     pub fn snapshot_over_cap(&self) -> Vec<((ProjectId, &'static str), u64)> {
-        let map = self.over_cap.read().expect("lease metrics over_cap poisoned");
+        let map = self
+            .over_cap
+            .read()
+            .expect("lease metrics over_cap poisoned");
         map.iter()
             .map(|((p, c), v)| ((*p, c.as_str()), v.load(Ordering::Relaxed)))
             .collect()

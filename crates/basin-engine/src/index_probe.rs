@@ -180,7 +180,10 @@ fn row_tier_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        !matches!(std::env::var("BASIN_GIN_ROW_TIER").ok().as_deref(), Some("0") | Some("false"))
+        !matches!(
+            std::env::var("BASIN_GIN_ROW_TIER").ok().as_deref(),
+            Some("0") | Some("false")
+        )
     })
 }
 
@@ -385,7 +388,10 @@ impl TermPostingList {
             }
             // A `u32` offset caps a file at ~4.29B rows; clamp defensively.
             let off32 = off.min(u32::MAX as u64) as u32;
-            self.row_build.entry(term.to_string()).or_default().push(off32);
+            self.row_build
+                .entry(term.to_string())
+                .or_default()
+                .push(off32);
         }
 
         match self.entries.get_mut(term) {
@@ -420,8 +426,10 @@ impl TermPostingList {
     /// because at least one of their terms is no longer in the posting list.
     fn evict_oldest(&mut self) -> HashSet<String> {
         let evict_count = (self.insert_order.len() / 4).max(1);
-        let to_evict: Vec<String> =
-            self.insert_order.drain(..evict_count.min(self.insert_order.len())).collect();
+        let to_evict: Vec<String> = self
+            .insert_order
+            .drain(..evict_count.min(self.insert_order.len()))
+            .collect();
         let mut evicted_files: HashSet<String> = HashSet::new();
         for k in &to_evict {
             if let Some(set) = self.entries.remove(k) {
@@ -479,7 +487,8 @@ impl TermPostingList {
         }
         self.row_entries.retain(|_, blocks| !blocks.is_empty());
         self.row_tier_cost = self.row_tier_cost.saturating_sub(row_freed);
-        self.row_insert_order.retain(|(_, f)| f.as_ref() != file_path);
+        self.row_insert_order
+            .retain(|(_, f)| f.as_ref() != file_path);
         self.row_tier_files.remove(file_path);
         self.row_tier_dense_terms.remove(file_path);
         // A removed file is gone; clear any eviction taint so a CoW replacement
@@ -618,7 +627,8 @@ impl TermPostingList {
         }
         // Compact the consumed prefix of the FIFO order.
         if idx > 0 {
-            self.row_insert_order.drain(..idx.min(self.row_insert_order.len()));
+            self.row_insert_order
+                .drain(..idx.min(self.row_insert_order.len()));
         }
         freed
     }
@@ -665,10 +675,12 @@ impl TermPostingList {
             if dense_for_file.is_some_and(|s| s.contains(term)) {
                 continue;
             }
-            let block = self
-                .row_entries
-                .get(term)
-                .and_then(|blocks| blocks.iter().find(|(f, _)| f.as_ref() == file).map(|(_, v)| v));
+            let block = self.row_entries.get(term).and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find(|(f, _)| f.as_ref() == file)
+                    .map(|(_, v)| v)
+            });
             match block {
                 None => {
                     // Term has no row block for this file and is not dense:
@@ -707,12 +719,7 @@ impl TermPostingList {
     /// * `RowProbe::Absent` — every needle trigram is provably absent from this
     ///   sealed file (no posting and not dense): no row can share even one
     ///   needle trigram, so none can match (`min_shared >= 1`). Fully prunable.
-    fn probe_trgm_row_offsets(
-        &self,
-        terms: &[String],
-        file: &str,
-        min_shared: usize,
-    ) -> RowProbe {
+    fn probe_trgm_row_offsets(&self, terms: &[String], file: &str, min_shared: usize) -> RowProbe {
         let min_shared = min_shared.max(1);
         let dense_for_file = self
             .row_tier_dense_terms
@@ -730,10 +737,12 @@ impl TermPostingList {
             if dense_for_file.is_some_and(|s| s.contains(term)) {
                 return RowProbe::Full;
             }
-            let block = self
-                .row_entries
-                .get(term)
-                .and_then(|blocks| blocks.iter().find(|(f, _)| f.as_ref() == file).map(|(_, v)| v));
+            let block = self.row_entries.get(term).and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find(|(f, _)| f.as_ref() == file)
+                    .map(|(_, v)| v)
+            });
             if let Some(offs) = block {
                 any_present = true;
                 for &o in offs {
@@ -933,7 +942,11 @@ fn compact_value(v: &Value) -> String {
         Value::Array(_) | Value::Object(_) => {
             // For nested complex values use a truncated JSON repr as the term.
             let s = v.to_string();
-            if s.len() > 200 { s[..200].to_string() } else { s }
+            if s.len() > 200 {
+                s[..200].to_string()
+            } else {
+                s
+            }
         }
     }
 }
@@ -1102,9 +1115,18 @@ impl GinIndexRegistry {
         table: &TableName,
         col: &str,
     ) -> Arc<Mutex<TermPostingList>> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
-        let mut map = self.inner.lock().expect("GinIndexRegistry outer lock poisoned");
-        map.entry(key).or_insert_with(|| Arc::new(Mutex::new(TermPostingList::new()))).clone()
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
+        let mut map = self
+            .inner
+            .lock()
+            .expect("GinIndexRegistry outer lock poisoned");
+        map.entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(TermPostingList::new())))
+            .clone()
     }
 
     fn get(
@@ -1113,8 +1135,15 @@ impl GinIndexRegistry {
         table: &TableName,
         col: &str,
     ) -> Option<Arc<Mutex<TermPostingList>>> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
-        let map = self.inner.lock().expect("GinIndexRegistry outer lock poisoned");
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
+        let map = self
+            .inner
+            .lock()
+            .expect("GinIndexRegistry outer lock poisoned");
         map.get(&key).cloned()
     }
 
@@ -1269,7 +1298,11 @@ impl GinIndexRegistry {
     /// posting list is (or was) partial.  Exposed for tests and diagnostics.
     pub fn has_evicted(&self, project: &ProjectId, table: &TableName, col: &str) -> bool {
         match self.get(project, table, col) {
-            Some(arc) => arc.lock().expect("TermPostingList lock poisoned").eviction_warned,
+            Some(arc) => {
+                arc.lock()
+                    .expect("TermPostingList lock poisoned")
+                    .eviction_warned
+            }
             None => false,
         }
     }
@@ -1389,7 +1422,11 @@ impl GinIndexRegistry {
         };
         let list = arc.lock().expect("TermPostingList lock poisoned");
         // Snapshot indexed_files UNDER the posting-list lock (see doc above).
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         let indexed: HashSet<String> = match self.indexed_files.lock() {
             Ok(map) => map.get(&key).cloned().unwrap_or_default(),
             Err(_) => return GinScanSet::NoIndex,
@@ -1406,9 +1443,10 @@ impl GinIndexRegistry {
             // posting hit for this file.  A term absent from the map entirely
             // provably does not occur in any indexed file (it was never
             // inserted, or its eviction un-marked the files that had it).
-            let all_terms_hit = terms
-                .iter()
-                .all(|t| list.probe_term(t).is_some_and(|s| s.contains(path.as_str())));
+            let all_terms_hit = terms.iter().all(|t| {
+                list.probe_term(t)
+                    .is_some_and(|s| s.contains(path.as_str()))
+            });
             if all_terms_hit {
                 scan.push(path.clone());
             }
@@ -1469,7 +1507,11 @@ impl GinIndexRegistry {
             None => return GinScanSet::NoIndex,
         };
         let list = arc.lock().expect("TermPostingList lock poisoned");
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         let indexed: HashSet<String> = match self.indexed_files.lock() {
             Ok(map) => map.get(&key).cloned().unwrap_or_default(),
             Err(_) => return GinScanSet::NoIndex,
@@ -1488,7 +1530,10 @@ impl GinIndexRegistry {
             // had it — and an un-marked file took the forced-candidate branch).
             let mut shared = 0usize;
             for t in &terms {
-                if list.probe_term(t).is_some_and(|s| s.contains(path.as_str())) {
+                if list
+                    .probe_term(t)
+                    .is_some_and(|s| s.contains(path.as_str()))
+                {
                     shared += 1;
                     if shared >= min_shared {
                         break;
@@ -1552,7 +1597,11 @@ impl GinIndexRegistry {
         // full scan was meant to recover. Only row-narrow coarse-complete files;
         // coarse-incomplete ones fall through to full decode (the caller already
         // forced them into the candidate set).
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         let indexed: HashSet<String> = match self.indexed_files.lock() {
             Ok(map) => map.get(&key).cloned().unwrap_or_default(),
             Err(_) => return plan,
@@ -1622,7 +1671,11 @@ impl GinIndexRegistry {
 
         let arc = self.get(project, table, col)?;
         let list = arc.lock().expect("TermPostingList lock poisoned");
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         let indexed: HashSet<String> = match self.indexed_files.lock() {
             Ok(map) => map.get(&key).cloned().unwrap_or_default(),
             Err(_) => return None,
@@ -1661,13 +1714,7 @@ impl GinIndexRegistry {
     /// Also removes `file_path` from the indexed-files completeness set so
     /// future probes do not erroneously claim full coverage after this file
     /// is gone.
-    pub fn remove_file(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-        col: &str,
-        file_path: &str,
-    ) {
+    pub fn remove_file(&self, project: &ProjectId, table: &TableName, col: &str, file_path: &str) {
         let mut removed_pairs = 0usize;
         if let Some(arc) = self.get(project, table, col) {
             let mut list = arc.lock().expect("TermPostingList lock poisoned");
@@ -1678,7 +1725,11 @@ impl GinIndexRegistry {
         // above before touching project_pairs).
         self.adjust_project_pairs(project, 0, removed_pairs);
         // Remove from completeness tracking.
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         if let Ok(mut map) = self.indexed_files.lock() {
             if let Some(set) = map.get_mut(&key) {
                 set.remove(file_path);
@@ -1697,7 +1748,11 @@ impl GinIndexRegistry {
         col: &str,
         file_path: &str,
     ) {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         // Completeness gate: a file whose terms were dropped by eviction since it
         // was built is INCOMPLETE and must NOT be sealed — sealing it would let a
         // probe trust missing terms and prune a file (or its own rows) that match.
@@ -1708,13 +1763,19 @@ impl GinIndexRegistry {
         // unsealed below so the file decodes in full.
         let tainted = self
             .get(project, table, col)
-            .map(|arc| arc.lock().expect("TermPostingList lock poisoned").is_eviction_tainted(file_path))
+            .map(|arc| {
+                arc.lock()
+                    .expect("TermPostingList lock poisoned")
+                    .is_eviction_tainted(file_path)
+            })
             .unwrap_or(false);
         if tainted {
             return;
         }
         if let Ok(mut map) = self.indexed_files.lock() {
-            map.entry(key.clone()).or_default().insert(file_path.to_string());
+            map.entry(key.clone())
+                .or_default()
+                .insert(file_path.to_string());
         }
         // Seal the ROW tier for this file: apply the density cap, finalise the
         // surviving offset lists, then enforce the per-project row-tier budget
@@ -1825,7 +1886,11 @@ impl GinIndexRegistry {
         table: &TableName,
         col: &str,
     ) -> HashSet<String> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         if let Ok(map) = self.indexed_files.lock() {
             map.get(&key).cloned().unwrap_or_default()
         } else {
@@ -1977,21 +2042,22 @@ impl GinIndexRegistry {
                     Large(&'a arrow_array::LargeStringArray),
                     View(&'a arrow_array::StringViewArray),
                 }
-                let arr = if let Some(a) =
-                    col_arr.as_any().downcast_ref::<arrow_array::StringArray>()
-                {
-                    Some(StrCol::Small(a))
-                } else if let Some(a) =
-                    col_arr.as_any().downcast_ref::<arrow_array::LargeStringArray>()
-                {
-                    Some(StrCol::Large(a))
-                } else if let Some(a) =
-                    col_arr.as_any().downcast_ref::<arrow_array::StringViewArray>()
-                {
-                    Some(StrCol::View(a))
-                } else {
-                    None
-                };
+                let arr =
+                    if let Some(a) = col_arr.as_any().downcast_ref::<arrow_array::StringArray>() {
+                        Some(StrCol::Small(a))
+                    } else if let Some(a) = col_arr
+                        .as_any()
+                        .downcast_ref::<arrow_array::LargeStringArray>()
+                    {
+                        Some(StrCol::Large(a))
+                    } else if let Some(a) = col_arr
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringViewArray>()
+                    {
+                        Some(StrCol::View(a))
+                    } else {
+                        None
+                    };
                 match arr {
                     Some(arr) => {
                         let n = match &arr {
@@ -2007,15 +2073,21 @@ impl GinIndexRegistry {
                             };
                             if let Some(text) = val {
                                 self.index_text_row(
-                                    project, table, col, text, new_file_path, row as u64,
+                                    project,
+                                    table,
+                                    col,
+                                    text,
+                                    new_file_path,
+                                    row as u64,
                                 );
                             }
                         }
                     }
                     None => coverage_ok = false,
                 }
-            } else if let Some(arr) =
-                col_arr.as_any().downcast_ref::<arrow_array::LargeBinaryArray>()
+            } else if let Some(arr) = col_arr
+                .as_any()
+                .downcast_ref::<arrow_array::LargeBinaryArray>()
             {
                 for row in 0..arr.len() {
                     if arr.is_null(row) {
@@ -2197,7 +2269,12 @@ pub async fn detect_gin_containment(
         return None;
     }
     let table_name = match &select.from[0].relation {
-        sqlparser::ast::TableFactor::Table { name, alias: None, args: None, .. } => {
+        sqlparser::ast::TableFactor::Table {
+            name,
+            alias: None,
+            args: None,
+            ..
+        } => {
             if name.0.len() != 1 {
                 return None;
             }
@@ -2273,11 +2350,12 @@ pub async fn detect_gin_containment(
     // Catalog lookup: table must have a GIN index on `col_name`.
     let meta = catalog.load_table(project, &table).await.ok()?;
     let gin_index = meta.indexes.iter().find(|idx| {
-        idx.access_method == "gin"
-            && idx.columns.len() == 1
-            && idx.columns[0] == col_name
+        idx.access_method == "gin" && idx.columns.len() == 1 && idx.columns[0] == col_name
     })?;
-    let opclass = gin_index.opclass.clone().unwrap_or_else(|| "jsonb_ops".to_string());
+    let opclass = gin_index
+        .opclass
+        .clone()
+        .unwrap_or_else(|| "jsonb_ops".to_string());
 
     // Parse needle to validate it's valid JSON.
     let needle_bytes = needle_str.as_bytes().to_vec();
@@ -2350,7 +2428,12 @@ pub async fn detect_trgm_similarity(
         return None;
     }
     let table_name = match &select.from[0].relation {
-        sqlparser::ast::TableFactor::Table { name, alias: None, args: None, .. } => {
+        sqlparser::ast::TableFactor::Table {
+            name,
+            alias: None,
+            args: None,
+            ..
+        } => {
             if name.0.len() != 1 {
                 return None;
             }
@@ -2392,7 +2475,11 @@ pub async fn detect_trgm_similarity(
             && idx.opclass.as_deref() == Some("gin_trgm_ops")
     })?;
 
-    Some(TrgmSimilarityPlan { table, col: col_name, needle })
+    Some(TrgmSimilarityPlan {
+        table,
+        col: col_name,
+        needle,
+    })
 }
 
 /// True when every projected item is a bare (un-aliased, un-windowed)
@@ -2498,7 +2585,12 @@ pub async fn detect_gin_key_probe(
         return None;
     }
     let table_name = match &select.from[0].relation {
-        sqlparser::ast::TableFactor::Table { name, alias: None, args: None, .. } => {
+        sqlparser::ast::TableFactor::Table {
+            name,
+            alias: None,
+            args: None,
+            ..
+        } => {
             if name.0.len() != 1 {
                 return None;
             }
@@ -2518,17 +2610,24 @@ pub async fn detect_gin_key_probe(
     // Catalog lookup: must have a GIN index on `col_name` with `jsonb_ops`.
     let meta = catalog.load_table(project, &table).await.ok()?;
     let gin_index = meta.indexes.iter().find(|idx| {
-        idx.access_method == "gin"
-            && idx.columns.len() == 1
-            && idx.columns[0] == col_name
+        idx.access_method == "gin" && idx.columns.len() == 1 && idx.columns[0] == col_name
     })?;
-    let opclass = gin_index.opclass.clone().unwrap_or_else(|| "jsonb_ops".to_string());
+    let opclass = gin_index
+        .opclass
+        .clone()
+        .unwrap_or_else(|| "jsonb_ops".to_string());
     // Key probes only accelerate jsonb_ops (which stores key: terms).
     if opclass != "jsonb_ops" {
         return None;
     }
 
-    Some(GinKeyPlan { table, col: col_name, opclass, keys, require_all })
+    Some(GinKeyPlan {
+        table,
+        col: col_name,
+        opclass,
+        keys,
+        require_all,
+    })
 }
 
 /// Extract `(col_name, keys, require_all)` from a WHERE clause containing
@@ -2582,7 +2681,10 @@ fn extract_key_probe_where(
 fn extract_single_string_literal(expr: &sqlparser::ast::Expr) -> Option<String> {
     use sqlparser::ast::{Expr, Value, ValueWithSpan};
     match expr {
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => Some(s.clone()),
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        }) => Some(s.clone()),
         Expr::Cast { expr: inner, .. } => extract_single_string_literal(inner),
         _ => None,
     }
@@ -2604,10 +2706,17 @@ fn extract_key_array_literal(expr: &sqlparser::ast::Expr) -> Option<Vec<String>>
                     keys.push(k);
                 }
             }
-            if keys.is_empty() { None } else { Some(keys) }
+            if keys.is_empty() {
+                None
+            } else {
+                Some(keys)
+            }
         }
         // `'{k1,k2}'` — PG text-array literal as a quoted string.
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        }) => {
             let s = s.trim();
             if s.starts_with('{') && s.ends_with('}') {
                 let keys: Vec<String> = s[1..s.len() - 1]
@@ -2615,7 +2724,11 @@ fn extract_key_array_literal(expr: &sqlparser::ast::Expr) -> Option<Vec<String>>
                     .map(|k| k.trim().trim_matches('"').to_string())
                     .filter(|k| !k.is_empty())
                     .collect();
-                if keys.is_empty() { None } else { Some(keys) }
+                if keys.is_empty() {
+                    None
+                } else {
+                    Some(keys)
+                }
             } else {
                 None
             }
@@ -2640,9 +2753,10 @@ fn extract_json_literal(expr: &sqlparser::ast::Expr) -> Option<String> {
 pub(crate) fn extract_json_literal_for_prune(expr: &sqlparser::ast::Expr) -> Option<String> {
     use sqlparser::ast::{Expr, Value, ValueWithSpan};
     match expr {
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
-            Some(s.clone())
-        }
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        }) => Some(s.clone()),
         // `'literal'::jsonb` cast
         Expr::Cast { expr: inner, .. } => extract_json_literal_for_prune(inner),
         _ => None,
@@ -2650,9 +2764,7 @@ pub(crate) fn extract_json_literal_for_prune(expr: &sqlparser::ast::Expr) -> Opt
 }
 
 /// Extract a simple projection (either `*` → `None`, or a list of bare column names).
-fn extract_simple_projection(
-    items: &[sqlparser::ast::SelectItem],
-) -> Option<Option<Vec<String>>> {
+fn extract_simple_projection(items: &[sqlparser::ast::SelectItem]) -> Option<Option<Vec<String>>> {
     if items.len() == 1 {
         if let sqlparser::ast::SelectItem::Wildcard(_) = &items[0] {
             return Some(None); // SELECT *
@@ -2734,7 +2846,12 @@ pub async fn detect_tsvector_match(
         return None;
     }
     let table_name = match &select.from[0].relation {
-        sqlparser::ast::TableFactor::Table { name, alias: None, args: None, .. } => {
+        sqlparser::ast::TableFactor::Table {
+            name,
+            alias: None,
+            args: None,
+            ..
+        } => {
             if name.0.len() != 1 {
                 return None;
             }
@@ -2760,10 +2877,17 @@ pub async fn detect_tsvector_match(
         idx.access_method == "gin"
             && idx.columns.len() == 1
             && idx.columns[0] == col_name
-            && idx.opclass.as_deref().map_or(false, |op| op == "tsvector_ops")
+            && idx
+                .opclass
+                .as_deref()
+                .map_or(false, |op| op == "tsvector_ops")
     })?;
 
-    Some(GinFtsPlan { table, col: col_name, tsquery_str })
+    Some(GinFtsPlan {
+        table,
+        col: col_name,
+        tsquery_str,
+    })
 }
 
 /// Extract `(col_name, tsquery_text)` from a WHERE clause of the form
@@ -2771,9 +2895,7 @@ pub async fn detect_tsvector_match(
 ///
 /// `tsquery_text` is the canonical tsquery string used for posting-list probing
 /// (e.g. `"'cat' & 'dog'"`).
-fn extract_fts_where(
-    selection: &Option<sqlparser::ast::Expr>,
-) -> Option<(String, String)> {
+fn extract_fts_where(selection: &Option<sqlparser::ast::Expr>) -> Option<(String, String)> {
     use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Value, ValueWithSpan};
 
     let expr = selection.as_ref()?;
@@ -2847,7 +2969,10 @@ fn extract_tsquery_from_expr(expr: &sqlparser::ast::Expr) -> Option<String> {
             // A non-literal config (parameter, column) → None → full scan.
             let (config, body_str) = match args.len() {
                 1 => (None, arg_literal(args.first()?)?),
-                2 => (Some(arg_literal(args.first()?)?), arg_literal(args.last()?)?),
+                2 => (
+                    Some(arg_literal(args.first()?)?),
+                    arg_literal(args.last()?)?,
+                ),
                 _ => return None,
             };
             // Delegate to the same `to_tsquery_text` canonicalisation the
@@ -2855,8 +2980,7 @@ fn extract_tsquery_from_expr(expr: &sqlparser::ast::Expr) -> Option<String> {
             // under non-simple configs).  The structural probe in
             // `gin_tsvector` parses this canonical form.
             let canonical =
-                crate::fts_udf::to_tsquery_text(&fn_name, config.as_deref(), &body_str)
-                    .ok()?;
+                crate::fts_udf::to_tsquery_text(&fn_name, config.as_deref(), &body_str).ok()?;
             Some(canonical)
         }
         // `'fox & dog'::tsquery` bare cast — canonicalise exactly like the
@@ -2868,9 +2992,10 @@ fn extract_tsquery_from_expr(expr: &sqlparser::ast::Expr) -> Option<String> {
         // `tsvector_match_udf(col, 'fox')`, which parses the RHS with the
         // raw (unstemmed) tsquery grammar.  Canonicalise with that same
         // grammar so probe lexemes match the evaluator's terms.
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
-            crate::fts_udf::canonicalize_tsquery_text(s).ok()
-        }
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        }) => crate::fts_udf::canonicalize_tsquery_text(s).ok(),
         _ => None,
     }
 }
@@ -2880,7 +3005,10 @@ fn extract_tsquery_from_expr(expr: &sqlparser::ast::Expr) -> Option<String> {
 fn extract_string_literal(expr: &sqlparser::ast::Expr) -> Option<String> {
     use sqlparser::ast::{Expr, Value, ValueWithSpan};
     match expr {
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => Some(s.clone()),
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        }) => Some(s.clone()),
         Expr::Cast { expr: inner, .. } => extract_string_literal(inner),
         _ => None,
     }
@@ -2963,7 +3091,12 @@ pub async fn detect_range_index_probe(
         return None;
     }
     let table_name = match &select.from[0].relation {
-        sqlparser::ast::TableFactor::Table { name, alias: None, args: None, .. } => {
+        sqlparser::ast::TableFactor::Table {
+            name,
+            alias: None,
+            args: None,
+            ..
+        } => {
             if name.0.len() != 1 {
                 return None;
             }
@@ -2975,23 +3108,28 @@ pub async fn detect_range_index_probe(
     let table = TableName::new(table_name).ok()?;
 
     // Parse WHERE `col op rhs` where op ∈ { @>, <@, && }.
-    let (col_name, op, point, range_literal) =
-        extract_range_where(&select.selection)?;
+    let (col_name, op, point, range_literal) = extract_range_where(&select.selection)?;
 
     // Catalog lookup: the column must have a GIST index.
     let meta = catalog.load_table(project, &table).await.ok()?;
     let _gist_index = meta.indexes.iter().find(|idx| {
-        idx.access_method == "gist"
-            && idx.columns.len() == 1
-            && idx.columns[0] == col_name
+        idx.access_method == "gist" && idx.columns.len() == 1 && idx.columns[0] == col_name
     })?;
 
     // Additionally verify the column itself is a range type (defensive).
-    let _range_field = meta.schema.fields().iter().find(|f| {
-        f.name() == &col_name && crate::types::field_is_range(f)
-    })?;
+    let _range_field = meta
+        .schema
+        .fields()
+        .iter()
+        .find(|f| f.name() == &col_name && crate::types::field_is_range(f))?;
 
-    Some(IntervalIndexPlan { table, col: col_name, op, point, range_literal })
+    Some(IntervalIndexPlan {
+        table,
+        col: col_name,
+        op,
+        point,
+        range_literal,
+    })
 }
 
 /// Parse the WHERE clause for a single range operator predicate.
@@ -3072,7 +3210,10 @@ fn extract_col_name(expr: &sqlparser::ast::Expr) -> Option<String> {
 fn extract_numeric_literal(expr: &sqlparser::ast::Expr) -> Option<f64> {
     use sqlparser::ast::{Expr, Value, ValueWithSpan};
     match expr {
-        Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => s.parse().ok(),
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(s, _),
+            ..
+        }) => s.parse().ok(),
         Expr::UnaryOp {
             op: sqlparser::ast::UnaryOperator::Minus,
             expr: inner,
@@ -3087,7 +3228,10 @@ fn extract_numeric_literal(expr: &sqlparser::ast::Expr) -> Option<f64> {
 fn extract_range_literal_str(expr: &sqlparser::ast::Expr) -> Option<String> {
     use sqlparser::ast::{Expr, Value, ValueWithSpan};
     match expr {
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        }) => {
             // Must look like a PG range literal: starts with `[` or `(` or `empty`.
             let trimmed = s.trim();
             if trimmed.starts_with('[')
@@ -3260,23 +3404,21 @@ pub(crate) fn pk_point_probe_multi(
     // min/max range-overlap test would be a strictly weaker superset that
     // keeps middle files no key lands in — not used.) Non-Int64 lists keep
     // the OR-of-Eq compound prune verbatim.
-    let sorted_int_keys: Option<Vec<i64>> = if pk_vals
-        .iter()
-        .all(|v| matches!(v, ScalarValue::Int64(_)))
-    {
-        let mut ks: Vec<i64> = pk_vals
-            .iter()
-            .filter_map(|v| match v {
-                ScalarValue::Int64(n) => Some(*n),
-                _ => None,
-            })
-            .collect();
-        ks.sort_unstable();
-        ks.dedup();
-        Some(ks)
-    } else {
-        None
-    };
+    let sorted_int_keys: Option<Vec<i64>> =
+        if pk_vals.iter().all(|v| matches!(v, ScalarValue::Int64(_))) {
+            let mut ks: Vec<i64> = pk_vals
+                .iter()
+                .filter_map(|v| match v {
+                    ScalarValue::Int64(n) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            ks.sort_unstable();
+            ks.dedup();
+            Some(ks)
+        } else {
+            None
+        };
     // 8-byte little-endian Int64 stat decode — the writer's min_bytes /
     // max_bytes encoding for Int64 columns (see ColumnStats docs).
     fn stat_i64(b: Option<&[u8]>) -> Option<i64> {
@@ -3291,9 +3433,7 @@ pub(crate) fn pk_point_probe_multi(
     } else {
         let alts: Vec<CompoundPredicate> = pk_vals
             .iter()
-            .map(|v| {
-                CompoundPredicate::Atom(Predicate::Eq(pk_col.to_string(), v.clone()))
-            })
+            .map(|v| CompoundPredicate::Atom(Predicate::Eq(pk_col.to_string(), v.clone())))
             .collect();
         Some(if alts.len() == 1 {
             alts.into_iter().next().unwrap()
@@ -3529,7 +3669,11 @@ pub enum TrigramCandidates {
 /// because basin-engine does not depend on basin-trgm).
 pub fn trigrams_for_pattern(pattern: &str, case_insensitive: bool) -> Vec<[u8; 3]> {
     fn fold(b: u8, ci: bool) -> u8 {
-        if ci { b.to_ascii_lowercase() } else { b }
+        if ci {
+            b.to_ascii_lowercase()
+        } else {
+            b
+        }
     }
     let mut out: Vec<[u8; 3]> = Vec::new();
     let mut run: Vec<u8> = Vec::new();
@@ -3750,7 +3894,12 @@ pub enum SpatialPredicate {
     /// the degree-equivalent of `radius_m` on every side; surviving rows are
     /// re-checked by the residual `st_dwithin` UDF (the engine keeps a
     /// FilterExec above the scan).
-    DWithin { col: String, x: f64, y: f64, radius_m: f64 },
+    DWithin {
+        col: String,
+        x: f64,
+        y: f64,
+        radius_m: f64,
+    },
     /// `ST_Contains(bbox_literal, col)` (a BOX2D-shaped rectangle) — EXACT
     /// at row-group granularity.  The R-tree envelope test is the predicate.
     BboxIntersects {
@@ -3787,11 +3936,17 @@ pub fn detect_spatial_predicate(expr: &sqlparser::ast::Expr) -> Option<SpatialPr
         // Recurse into `AND` and pick the first matching arm (today the
         // pushdown only fires for a single spatial predicate at a time;
         // multiple spatial predicates would compose via FilterExec residue).
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
-            detect_spatial_predicate(left).or_else(|| detect_spatial_predicate(right))
-        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => detect_spatial_predicate(left).or_else(|| detect_spatial_predicate(right)),
         // `col = ST_MakePoint(x, y)` (and commutative).
-        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
             let (col, x, y) = match (extract_col_name(left), extract_make_point(right)) {
                 (Some(c), Some((x, y))) => (c, x, y),
                 _ => match (extract_make_point(left), extract_col_name(right)) {
@@ -3836,7 +3991,12 @@ fn detect_spatial_function(f: &sqlparser::ast::Function) -> Option<SpatialPredic
                     _ => return None,
                 },
             };
-            Some(SpatialPredicate::DWithin { col, x, y, radius_m })
+            Some(SpatialPredicate::DWithin {
+                col,
+                x,
+                y,
+                radius_m,
+            })
         }
         ("st_contains", 2) => {
             // `ST_Contains(box, col)` — the engine has no BOX2D literal
@@ -3846,7 +4006,13 @@ fn detect_spatial_function(f: &sqlparser::ast::Function) -> Option<SpatialPredic
             let (env, col_e) = (unwrap(args[0])?, unwrap(args[1])?);
             let col = extract_col_name(col_e)?;
             let (min_x, min_y, max_x, max_y) = extract_envelope(env)?;
-            Some(SpatialPredicate::BboxIntersects { col, min_x, min_y, max_x, max_y })
+            Some(SpatialPredicate::BboxIntersects {
+                col,
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            })
         }
         _ => None,
     }
@@ -4015,12 +4181,13 @@ pub async fn detect_knn_predicate(
 
     // LIMIT k — constant positive integer.
     let k = match query.ext_limit() {
-        Some(Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
-            match s.parse::<i64>() {
-                Ok(n) if n > 0 => n as usize,
-                _ => return None,
-            }
-        }
+        Some(Expr::Value(ValueWithSpan {
+            value: Value::Number(s, _),
+            ..
+        })) => match s.parse::<i64>() {
+            Ok(n) if n > 0 => n as usize,
+            _ => return None,
+        },
         _ => return None,
     };
 
@@ -4079,7 +4246,12 @@ pub async fn detect_knn_predicate(
         return None;
     }
     let table_name = match &select.from[0].relation {
-        TableFactor::Table { name, alias: None, args: None, .. } => {
+        TableFactor::Table {
+            name,
+            alias: None,
+            args: None,
+            ..
+        } => {
             if name.0.len() != 1 {
                 return None;
             }
@@ -4102,7 +4274,14 @@ pub async fn detect_knn_predicate(
         return None;
     }
 
-    Some(SpatialKnnPlan { projection, table, col, qx, qy, k })
+    Some(SpatialKnnPlan {
+        projection,
+        table,
+        col,
+        qx,
+        qy,
+        k,
+    })
 }
 
 /// Rewrite the first `<col> <-> <rhs>` into `__basin_vop_l2(<col>, <rhs>)`,
@@ -4336,12 +4515,13 @@ pub async fn detect_trgm_knn(
 
     // LIMIT k — constant positive integer.
     let k = match query.ext_limit() {
-        Some(Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. })) => {
-            match s.parse::<i64>() {
-                Ok(n) if n > 0 => n as usize,
-                _ => return None,
-            }
-        }
+        Some(Expr::Value(ValueWithSpan {
+            value: Value::Number(s, _),
+            ..
+        })) => match s.parse::<i64>() {
+            Ok(n) if n > 0 => n as usize,
+            _ => return None,
+        },
         _ => return None,
     };
 
@@ -4400,7 +4580,12 @@ pub async fn detect_trgm_knn(
         return None;
     }
     let table_name = match &select.from[0].relation {
-        TableFactor::Table { name, alias: None, args: None, .. } => {
+        TableFactor::Table {
+            name,
+            alias: None,
+            args: None,
+            ..
+        } => {
             if name.0.len() != 1 {
                 return None;
             }
@@ -4445,7 +4630,13 @@ pub async fn detect_trgm_knn(
     // Confirm the column exists (a dropped/renamed column → fall back).
     meta.schema.field_with_name(&col).ok()?;
 
-    Some(TrgmKnnPlan { projection, table, col, needle, k })
+    Some(TrgmKnnPlan {
+        projection,
+        table,
+        col,
+        needle,
+        k,
+    })
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -4473,7 +4664,10 @@ mod tests {
         let order = q.order_by.as_ref().expect("order by");
         let exprs = order.ext_exprs();
         match &exprs[0].expr {
-            Expr::BinaryOp { op: BinaryOperator::LtDashGt, .. } => {}
+            Expr::BinaryOp {
+                op: BinaryOperator::LtDashGt,
+                ..
+            } => {}
             other => panic!("expected LtDashGt binop, got {other:?}"),
         }
         // Sanity: the SELECT body parsed too.
@@ -4485,16 +4679,13 @@ mod tests {
         let v = json!({"tag": "nested", "id": 42});
         let terms = extract_terms(&v, "jsonb_ops");
         assert!(terms.contains(&"key:tag".to_string()), "terms={terms:?}");
-        assert!(terms.contains(&"kv:tag=\"nested\"".to_string()), "terms={terms:?}");
+        assert!(
+            terms.contains(&"kv:tag=\"nested\"".to_string()),
+            "terms={terms:?}"
+        );
         assert!(terms.contains(&"key:id".to_string()), "terms={terms:?}");
         assert!(terms.contains(&"kv:id=42".to_string()), "terms={terms:?}");
     }
-
-
-
-
-
-
 
     #[test]
     fn extract_terms_jsonb_path_ops_flat() {
@@ -4530,14 +4721,26 @@ mod tests {
 
         // Index one document that matches.
         let doc = br#"{"tag":"nested","id":42}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_ops", doc, "f1.parquet", 0, 0);
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            doc,
+            "f1.parquet",
+            0,
+            0,
+        );
 
         // Probe for {"tag":"nested"} — should find f1.parquet.
         let needle = br#"{"tag":"nested"}"#;
         let result = registry.probe_containment(&project, &table, "payload", "jsonb_ops", needle);
         match result {
             ProbeResult::FileCandidates(files) => {
-                assert!(files.contains("f1.parquet"), "expected f1.parquet in {files:?}");
+                assert!(
+                    files.contains("f1.parquet"),
+                    "expected f1.parquet in {files:?}"
+                );
             }
             other => panic!("expected FileCandidates, got {other:?}"),
         }
@@ -4551,7 +4754,16 @@ mod tests {
 
         // Index a document that does NOT contain the needle.
         let doc = br#"{"role":"user"}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_ops", doc, "f1.parquet", 0, 0);
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            doc,
+            "f1.parquet",
+            0,
+            0,
+        );
 
         // Probe for {"tag":"nested"} — must not find f1.parquet.
         let needle = br#"{"tag":"nested"}"#;
@@ -4573,11 +4785,29 @@ mod tests {
 
         // f1 has both "role":"admin" AND "tenant":"acme".
         let doc1 = br#"{"role":"admin","tenant":"acme"}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_ops", doc1, "f1.parquet", 0, 0);
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            doc1,
+            "f1.parquet",
+            0,
+            0,
+        );
 
         // f2 has only "role":"admin".
         let doc2 = br#"{"role":"admin"}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_ops", doc2, "f2.parquet", 0, 0);
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            doc2,
+            "f2.parquet",
+            0,
+            0,
+        );
 
         // Probe for compound needle: {"role":"admin","tenant":"acme"}.
         // f1 has both terms; f2 is missing "kv:tenant=..." so the AND-merge
@@ -4586,8 +4816,14 @@ mod tests {
         let result = registry.probe_containment(&project, &table, "payload", "jsonb_ops", needle);
         match result {
             ProbeResult::FileCandidates(files) => {
-                assert!(files.contains("f1.parquet"), "f1 should be in candidates: {files:?}");
-                assert!(!files.contains("f2.parquet"), "f2 should be excluded: {files:?}");
+                assert!(
+                    files.contains("f1.parquet"),
+                    "f1 should be in candidates: {files:?}"
+                );
+                assert!(
+                    !files.contains("f2.parquet"),
+                    "f2 should be excluded: {files:?}"
+                );
             }
             ProbeResult::NoIndex => {
                 // Acceptable: if any term was evicted or missing the registry
@@ -4604,7 +4840,16 @@ mod tests {
         let table = TableName::new("t").unwrap();
 
         let doc = br#"{"tag":"nested"}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_ops", doc, "f1.parquet", 0, 0);
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            doc,
+            "f1.parquet",
+            0,
+            0,
+        );
 
         registry.remove_file(&project, &table, "payload", "f1.parquet");
 
@@ -4627,14 +4872,25 @@ mod tests {
 
         // Index a doc that has the key "tag".
         let doc = br#"{"tag":"nested","id":1}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_ops", doc, "f1.parquet", 0, 0);
-
-        let result = registry.probe_key_existence(
-            &project, &table, "payload", "jsonb_ops", &["tag"], true,
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            doc,
+            "f1.parquet",
+            0,
+            0,
         );
+
+        let result =
+            registry.probe_key_existence(&project, &table, "payload", "jsonb_ops", &["tag"], true);
         match result {
             ProbeResult::FileCandidates(files) => {
-                assert!(files.contains("f1.parquet"), "expected f1.parquet in {files:?}");
+                assert!(
+                    files.contains("f1.parquet"),
+                    "expected f1.parquet in {files:?}"
+                );
             }
             other => panic!("expected FileCandidates, got {other:?}"),
         }
@@ -4648,11 +4904,19 @@ mod tests {
 
         // Index a doc that has "role" but NOT "tag".
         let doc = br#"{"role":"admin"}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_ops", doc, "f1.parquet", 0, 0);
-
-        let result = registry.probe_key_existence(
-            &project, &table, "payload", "jsonb_ops", &["tag"], true,
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            doc,
+            "f1.parquet",
+            0,
+            0,
         );
+
+        let result =
+            registry.probe_key_existence(&project, &table, "payload", "jsonb_ops", &["tag"], true);
         // "key:tag" not in index → NoIndex (conservative).
         assert!(
             matches!(result, ProbeResult::NoIndex | ProbeResult::Empty),
@@ -4668,20 +4932,46 @@ mod tests {
 
         // f1 has both "id" and "tag".
         let doc1 = br#"{"id":1,"tag":"x"}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_ops", doc1, "f1.parquet", 0, 0);
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            doc1,
+            "f1.parquet",
+            0,
+            0,
+        );
 
         // f2 has only "id".
         let doc2 = br#"{"id":2}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_ops", doc2, "f2.parquet", 0, 0);
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            doc2,
+            "f2.parquet",
+            0,
+            0,
+        );
 
         // ?& ["id","tag"] — f2 lacks "tag", should be excluded.
         let result = registry.probe_key_existence(
-            &project, &table, "payload", "jsonb_ops", &["id", "tag"], true,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            &["id", "tag"],
+            true,
         );
         match result {
             ProbeResult::FileCandidates(files) => {
                 assert!(files.contains("f1.parquet"), "f1 should match {files:?}");
-                assert!(!files.contains("f2.parquet"), "f2 should be excluded {files:?}");
+                assert!(
+                    !files.contains("f2.parquet"),
+                    "f2 should be excluded {files:?}"
+                );
             }
             ProbeResult::NoIndex => {
                 // Conservative fall-through is also acceptable.
@@ -4698,15 +4988,38 @@ mod tests {
 
         // f1 has "nullable".
         let doc1 = br#"{"nullable":null}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_ops", doc1, "f1.parquet", 0, 0);
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            doc1,
+            "f1.parquet",
+            0,
+            0,
+        );
 
         // f2 has "large".
         let doc2 = br#"{"large":"x"}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_ops", doc2, "f2.parquet", 0, 0);
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            doc2,
+            "f2.parquet",
+            0,
+            0,
+        );
 
         // ?| ["nullable","large"] — both files should match.
         let result = registry.probe_key_existence(
-            &project, &table, "payload", "jsonb_ops", &["nullable", "large"], false,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            &["nullable", "large"],
+            false,
         );
         match result {
             ProbeResult::FileCandidates(files) => {
@@ -4728,12 +5041,29 @@ mod tests {
 
         // Even if a doc is indexed, jsonb_path_ops doesn't support key probes.
         let doc = br#"{"tag":"nested"}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_path_ops", doc, "f1.parquet", 0, 0);
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_path_ops",
+            doc,
+            "f1.parquet",
+            0,
+            0,
+        );
 
         let result = registry.probe_key_existence(
-            &project, &table, "payload", "jsonb_path_ops", &["tag"], true,
+            &project,
+            &table,
+            "payload",
+            "jsonb_path_ops",
+            &["tag"],
+            true,
         );
-        assert!(matches!(result, ProbeResult::NoIndex), "path_ops key probe must return NoIndex");
+        assert!(
+            matches!(result, ProbeResult::NoIndex),
+            "path_ops key probe must return NoIndex"
+        );
     }
 
     // ── Phase 5.19.C+ — per-file eviction correctness ───────────────────────
@@ -4803,7 +5133,9 @@ mod tests {
         assert_eq!(pl.total_count, 3);
         assert_eq!(pl.remove_file("f1.parquet"), 2, "two pairs referenced f1");
         assert_eq!(pl.total_count, 1);
-        assert!(pl.probe_term("t1").is_some_and(|s| s.contains("f2.parquet")));
+        assert!(pl
+            .probe_term("t1")
+            .is_some_and(|s| s.contains("f2.parquet")));
         assert!(pl.probe_term("t2").is_some_and(|s| s.is_empty()));
     }
 
@@ -4820,14 +5152,26 @@ mod tests {
 
         // f1: fully indexed, contains {"role":"admin"}.
         registry.index_row(
-            &project, &table, "payload", "jsonb_ops",
-            br#"{"role":"admin"}"#, "f1.parquet", 0, 0,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            br#"{"role":"admin"}"#,
+            "f1.parquet",
+            0,
+            0,
         );
         registry.mark_file_indexed(&project, &table, "payload", "f1.parquet");
         // f2: fully indexed, contains {"role":"user"}.
         registry.index_row(
-            &project, &table, "payload", "jsonb_ops",
-            br#"{"role":"user"}"#, "f2.parquet", 0, 0,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            br#"{"role":"user"}"#,
+            "f2.parquet",
+            0,
+            0,
         );
         registry.mark_file_indexed(&project, &table, "payload", "f2.parquet");
         // f3: NOT marked indexed (e.g. written before the index existed).
@@ -4838,11 +5182,19 @@ mod tests {
             "f3.parquet".to_string(),
         ];
         let scan = registry.probe_containment_scan_set(
-            &project, &table, "payload", "jsonb_ops", br#"{"role":"admin"}"#, &live,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            br#"{"role":"admin"}"#,
+            &live,
         );
         match scan {
             GinScanSet::ScanFiles(files) => {
-                assert!(files.contains(&"f1.parquet".to_string()), "hit kept: {files:?}");
+                assert!(
+                    files.contains(&"f1.parquet".to_string()),
+                    "hit kept: {files:?}"
+                );
                 assert!(
                     !files.contains(&"f2.parquet".to_string()),
                     "indexed miss pruned: {files:?}"
@@ -4866,14 +5218,25 @@ mod tests {
         let table = TableName::new("t").unwrap();
 
         registry.index_row(
-            &project, &table, "payload", "jsonb_ops",
-            br#"{"role":"admin"}"#, "f1.parquet", 0, 0,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            br#"{"role":"admin"}"#,
+            "f1.parquet",
+            0,
+            0,
         );
         registry.mark_file_indexed(&project, &table, "payload", "f1.parquet");
 
         let live = vec!["f1.parquet".to_string(), "f2.parquet".to_string()];
         let scan = registry.probe_containment_scan_set(
-            &project, &table, "payload", "jsonb_ops", br#"{"zzz":"nope"}"#, &live,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            br#"{"zzz":"nope"}"#,
+            &live,
         );
         match scan {
             GinScanSet::ScanFiles(files) => {
@@ -4896,8 +5259,14 @@ mod tests {
         let table = TableName::new("t").unwrap();
 
         registry.index_row(
-            &project, &table, "payload", "jsonb_ops",
-            br#"{"role":"admin"}"#, "f1.parquet", 0, 0,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            br#"{"role":"admin"}"#,
+            "f1.parquet",
+            0,
+            0,
         );
         registry.mark_file_indexed(&project, &table, "payload", "f1.parquet");
 
@@ -4924,7 +5293,12 @@ mod tests {
 
         let live = vec!["f1.parquet".to_string()];
         let scan = registry.probe_containment_scan_set(
-            &project, &table, "payload", "jsonb_ops", br#"{"role":"admin"}"#, &live,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            br#"{"role":"admin"}"#,
+            &live,
         );
         match scan {
             GinScanSet::ScanFiles(files) => {
@@ -4956,11 +5330,21 @@ mod tests {
         let project = ProjectId::new();
         let table = TableName::new("t").unwrap();
         registry.index_row(
-            &project, &table, "payload", "jsonb_ops",
-            br#"{"a":{"x":1,"y":2}}"#, "f1.parquet", 0, 0,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            br#"{"a":{"x":1,"y":2}}"#,
+            "f1.parquet",
+            0,
+            0,
         );
         let result = registry.probe_containment(
-            &project, &table, "payload", "jsonb_ops", br#"{"a":{"x":1}}"#,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            br#"{"a":{"x":1}}"#,
         );
         match result {
             ProbeResult::FileCandidates(files) => {
@@ -4989,8 +5373,14 @@ mod tests {
         let project = ProjectId::new();
         let table = TableName::new("t").unwrap();
         registry.index_row(
-            &project, &table, "payload", "jsonb_ops",
-            br#"{"a":1}"#, "f1.parquet", 0, 0,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            br#"{"a":1}"#,
+            "f1.parquet",
+            0,
+            0,
         );
         assert!(!registry.has_evicted(&project, &table, "payload"));
 
@@ -5022,18 +5412,42 @@ mod tests {
 
         // Index f1 and mark it as fully indexed.
         let doc1 = br#"{"role":"admin"}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_ops", doc1, "f1.parquet", 0, 0);
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            doc1,
+            "f1.parquet",
+            0,
+            0,
+        );
         registry.mark_file_indexed(&project, &table, "payload", "f1.parquet");
 
         // Index f2 and mark it as fully indexed.
         let doc2 = br#"{"role":"user"}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_ops", doc2, "f2.parquet", 0, 0);
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            doc2,
+            "f2.parquet",
+            0,
+            0,
+        );
         registry.mark_file_indexed(&project, &table, "payload", "f2.parquet");
 
         // Both files must be indexed before any eviction.
         let indexed = registry.indexed_files_for(&project, &table, "payload");
-        assert!(indexed.contains("f1.parquet"), "f1 should be indexed: {indexed:?}");
-        assert!(indexed.contains("f2.parquet"), "f2 should be indexed: {indexed:?}");
+        assert!(
+            indexed.contains("f1.parquet"),
+            "f1 should be indexed: {indexed:?}"
+        );
+        assert!(
+            indexed.contains("f2.parquet"),
+            "f2 should be indexed: {indexed:?}"
+        );
 
         // Simulate removal of f1 (compaction scenario — not eviction).
         registry.remove_file(&project, &table, "payload", "f1.parquet");
@@ -5112,7 +5526,10 @@ mod tests {
             &pk_schema(),
         );
         match outcome {
-            PkProbeOutcome::Candidates { paths, files_pruned } => {
+            PkProbeOutcome::Candidates {
+                paths,
+                files_pruned,
+            } => {
                 assert_eq!(files_pruned, 1, "f0 should be pruned by zone-map");
                 assert_eq!(paths.len(), 1);
                 assert_eq!(paths[0].as_ref(), "f1.parquet");
@@ -5165,7 +5582,10 @@ mod tests {
         ];
         let outcome = pk_point_probe_multi("pk", &vals, &files, &pk_schema());
         match outcome {
-            PkProbeOutcome::Candidates { paths, files_pruned } => {
+            PkProbeOutcome::Candidates {
+                paths,
+                files_pruned,
+            } => {
                 assert_eq!(files_pruned, 1, "f2 should be pruned by zone-map");
                 let path_strs: Vec<&str> = paths.iter().map(|p| p.as_ref()).collect();
                 assert!(path_strs.contains(&"f0.parquet"), "f0 must be a candidate");
@@ -5197,7 +5617,10 @@ mod tests {
         let vals = vec![basin_storage::ScalarValue::Int64(150)];
         let outcome = pk_point_probe_multi("pk", &vals, &files, &pk_schema());
         match outcome {
-            PkProbeOutcome::Candidates { paths, files_pruned } => {
+            PkProbeOutcome::Candidates {
+                paths,
+                files_pruned,
+            } => {
                 assert_eq!(files_pruned, 1, "f0 should be pruned");
                 assert_eq!(paths.len(), 1);
                 assert_eq!(paths[0].as_ref(), "f1.parquet");
@@ -5218,7 +5641,16 @@ mod tests {
 
         // Index a document in f1.
         let doc = br#"{"tag":"v1"}"#;
-        registry.index_row(&project, &table, "payload", "jsonb_ops", doc, "f1.parquet", 0, 0);
+        registry.index_row(
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            doc,
+            "f1.parquet",
+            0,
+            0,
+        );
 
         // Remove f1 (simulating DELETE path).
         registry.remove_file(&project, &table, "payload", "f1.parquet");
@@ -5235,17 +5667,27 @@ mod tests {
 
         // Rebuild f2 entries.
         registry.rebuild_file_entries(
-            &project, &table, "payload", "jsonb_ops", &[batch], "f2.parquet",
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            &[batch],
+            "f2.parquet",
         );
 
         // Now probe for "tag": should find f2, not f1.
-        let result = registry.probe_key_existence(
-            &project, &table, "payload", "jsonb_ops", &["tag"], true,
-        );
+        let result =
+            registry.probe_key_existence(&project, &table, "payload", "jsonb_ops", &["tag"], true);
         match result {
             ProbeResult::FileCandidates(files) => {
-                assert!(files.contains("f2.parquet"), "f2 should be in candidates: {files:?}");
-                assert!(!files.contains("f1.parquet"), "f1 should NOT be in candidates: {files:?}");
+                assert!(
+                    files.contains("f2.parquet"),
+                    "f2 should be in candidates: {files:?}"
+                );
+                assert!(
+                    !files.contains("f1.parquet"),
+                    "f1 should NOT be in candidates: {files:?}"
+                );
             }
             ProbeResult::NoIndex => {
                 // Conservative acceptable.
@@ -5275,7 +5717,12 @@ mod tests {
         // Empty batch set — e.g. a CoW replacement whose every row was
         // deleted. Must be marked (empty posting set is sound).
         registry.rebuild_file_entries(
-            &project, &table, "payload", "jsonb_ops", &[], "empty.parquet",
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            &[],
+            "empty.parquet",
         );
         assert!(
             registry
@@ -5294,7 +5741,12 @@ mod tests {
         let arr = LargeBinaryArray::from_opt_vec(vec![None, None]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
         registry.rebuild_file_entries(
-            &project, &table, "payload", "jsonb_ops", &[batch], "nulls.parquet",
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            &[batch],
+            "nulls.parquet",
         );
         assert!(
             registry
@@ -5305,15 +5757,16 @@ mod tests {
 
         // Rows present but the JSONB column is MISSING from the batch —
         // coverage cannot be claimed; the mark must be withheld.
-        let other_schema = Arc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
+        let other_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ids = Int64Array::from(vec![1i64, 2]);
         let bad = RecordBatch::try_new(other_schema, vec![Arc::new(ids)]).unwrap();
         registry.rebuild_file_entries(
-            &project, &table, "payload", "jsonb_ops", &[bad], "uncovered.parquet",
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            &[bad],
+            "uncovered.parquet",
         );
         assert!(
             !registry
@@ -5343,7 +5796,12 @@ mod tests {
         // Probe `@> {"role":"admin"}` — only rg1 holds it.
         let needle = br#"{"role":"admin"}"#;
         let out = rowgroup_prune_for_containment(
-            &reg, &project, &table, "payload", "jsonb_ops", needle,
+            &reg,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            needle,
             &[file.to_string()],
         );
         match out {
@@ -5362,19 +5820,32 @@ mod tests {
         let table = TableName::new("docs").unwrap();
         let file = "f1.parquet";
         reg.index_row(
-            &project, &table, "payload",
-            &extract_terms(&json!({"role": "user"}), "jsonb_ops"), file, 0,
+            &project,
+            &table,
+            "payload",
+            &extract_terms(&json!({"role": "user"}), "jsonb_ops"),
+            file,
+            0,
         );
         reg.mark_file_indexed(&project, &table, "payload", file);
 
         let needle = br#"{"role":"ghost"}"#;
         let out = rowgroup_prune_for_containment(
-            &reg, &project, &table, "payload", "jsonb_ops", needle,
+            &reg,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            needle,
             &[file.to_string()],
         );
         match out {
             RowGroupPrune::PerFile(m) => {
-                assert_eq!(m.get(file), Some(&Vec::<u32>::new()), "file must be prunable");
+                assert_eq!(
+                    m.get(file),
+                    Some(&Vec::<u32>::new()),
+                    "file must be prunable"
+                );
             }
             other => panic!("expected PerFile (empty), got {other:?}"),
         }
@@ -5389,7 +5860,12 @@ mod tests {
         // Never indexed → no summarised candidate → Unknown (caller reads whole).
         let needle = br#"{"role":"admin"}"#;
         let out = rowgroup_prune_for_containment(
-            &reg, &project, &table, "payload", "jsonb_ops", needle,
+            &reg,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            needle,
             &["ghost.parquet".to_string()],
         );
         assert_eq!(out, RowGroupPrune::Unknown);
@@ -5403,12 +5879,21 @@ mod tests {
         let table = TableName::new("docs").unwrap();
         let file = "f1.parquet";
         reg.index_row(
-            &project, &table, "payload",
-            &extract_terms(&json!({"k": "v"}), "jsonb_ops"), file, 0,
+            &project,
+            &table,
+            "payload",
+            &extract_terms(&json!({"k": "v"}), "jsonb_ops"),
+            file,
+            0,
         );
         reg.mark_file_indexed(&project, &table, "payload", file);
         let out = rowgroup_prune_for_containment(
-            &reg, &project, &table, "payload", "jsonb_ops", b"{}",
+            &reg,
+            &project,
+            &table,
+            "payload",
+            "jsonb_ops",
+            b"{}",
             &[file.to_string()],
         );
         assert_eq!(out, RowGroupPrune::Unknown, "empty needle prunes nothing");
@@ -5449,7 +5934,10 @@ mod tests {
             TrigramCandidates::All => panic!("expected pruned set"),
         };
         // Superset must include the true matches (1, 2). Re-check narrows.
-        assert!(set.contains(&1) && set.contains(&2), "missing true matches: {set:?}");
+        assert!(
+            set.contains(&1) && set.contains(&2),
+            "missing true matches: {set:?}"
+        );
         let matched: Vec<u64> = rows()
             .into_iter()
             .filter(|(id, t)| set.contains(id) && like_matches(t, "%@gmail.com", false))
@@ -5480,15 +5968,23 @@ mod tests {
         let cand = trigram_candidates(rows(), "%zzz%", false);
         match cand {
             TrigramCandidates::Some(s) => assert!(s.is_empty(), "no row has 'zzz': {s:?}"),
-            TrigramCandidates::All => panic!("'zzz' is a usable trigram; expected pruned empty set"),
+            TrigramCandidates::All => {
+                panic!("'zzz' is a usable trigram; expected pruned empty set")
+            }
         }
     }
 
     #[test]
     fn trigram_candidates_short_pattern_falls_back_to_all() {
         // `%a%` has no literal run ≥ 3 → cannot prune → All (scan everything).
-        assert_eq!(trigram_candidates(rows(), "%a%", false), TrigramCandidates::All);
-        assert_eq!(trigram_candidates(rows(), "_b_", false), TrigramCandidates::All);
+        assert_eq!(
+            trigram_candidates(rows(), "%a%", false),
+            TrigramCandidates::All
+        );
+        assert_eq!(
+            trigram_candidates(rows(), "_b_", false),
+            TrigramCandidates::All
+        );
     }
 
     #[test]
@@ -5527,11 +6023,15 @@ mod tests {
 
     #[test]
     fn detect_dwithin_col_lhs() {
-        let w = parse_where(
-            "SELECT * FROM t WHERE ST_DWithin(geom, ST_MakePoint(2.3, 48.8), 1000)",
-        );
+        let w =
+            parse_where("SELECT * FROM t WHERE ST_DWithin(geom, ST_MakePoint(2.3, 48.8), 1000)");
         match detect_spatial_predicate(&w) {
-            Some(SpatialPredicate::DWithin { col, x, y, radius_m }) => {
+            Some(SpatialPredicate::DWithin {
+                col,
+                x,
+                y,
+                radius_m,
+            }) => {
                 assert_eq!(col, "geom");
                 assert!((x - 2.3).abs() < 1e-9);
                 assert!((y - 48.8).abs() < 1e-9);
@@ -5543,11 +6043,14 @@ mod tests {
 
     #[test]
     fn detect_dwithin_col_rhs_commutative() {
-        let w = parse_where(
-            "SELECT * FROM t WHERE ST_DWithin(ST_MakePoint(0.0, 0.0), p, 500)",
-        );
+        let w = parse_where("SELECT * FROM t WHERE ST_DWithin(ST_MakePoint(0.0, 0.0), p, 500)");
         match detect_spatial_predicate(&w) {
-            Some(SpatialPredicate::DWithin { col, x, y, radius_m }) => {
+            Some(SpatialPredicate::DWithin {
+                col,
+                x,
+                y,
+                radius_m,
+            }) => {
                 assert_eq!(col, "p");
                 assert_eq!(x, 0.0);
                 assert_eq!(y, 0.0);
@@ -5576,7 +6079,13 @@ mod tests {
             "SELECT * FROM t WHERE ST_Contains(ST_MakeEnvelope(0.0, 0.0, 10.0, 10.0), geom)",
         );
         match detect_spatial_predicate(&w) {
-            Some(SpatialPredicate::BboxIntersects { col, min_x, min_y, max_x, max_y }) => {
+            Some(SpatialPredicate::BboxIntersects {
+                col,
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            }) => {
                 assert_eq!(col, "geom");
                 assert_eq!(min_x, 0.0);
                 assert_eq!(min_y, 0.0);
@@ -5610,9 +6119,8 @@ mod tests {
     #[test]
     fn detect_no_match_non_literal_radius() {
         // Non-literal radius (a column) can't be pruned.
-        let w = parse_where(
-            "SELECT * FROM t WHERE ST_DWithin(geom, ST_MakePoint(0.0, 0.0), some_col)",
-        );
+        let w =
+            parse_where("SELECT * FROM t WHERE ST_DWithin(geom, ST_MakePoint(0.0, 0.0), some_col)");
         assert!(detect_spatial_predicate(&w).is_none());
     }
 
@@ -5667,8 +6175,26 @@ mod tests {
         let doc_a = serde_json::to_vec(&json!({"tag": "a", "id": 1})).unwrap();
         let doc_b = serde_json::to_vec(&json!({"tag": "b", "id": 2})).unwrap();
 
-        registry.index_row(&pa, &table, "payload", "jsonb_ops", &doc_a, "a1.parquet", 0, 0);
-        registry.index_row(&pb, &table, "payload", "jsonb_ops", &doc_b, "b1.parquet", 0, 0);
+        registry.index_row(
+            &pa,
+            &table,
+            "payload",
+            "jsonb_ops",
+            &doc_a,
+            "a1.parquet",
+            0,
+            0,
+        );
+        registry.index_row(
+            &pb,
+            &table,
+            "payload",
+            "jsonb_ops",
+            &doc_b,
+            "b1.parquet",
+            0,
+            0,
+        );
 
         let a_count = registry.project_pair_count(&pa);
         let b_count = registry.project_pair_count(&pb);
@@ -5835,8 +6361,8 @@ mod tests {
         let p = ProjectId::new();
         let opclass = "jsonb_ops";
         let file = "projects/x/data/f.parquet"; // path string is opaque here
-        // 4 rows. row0 {tag:"x"}, row1 {tag:"y"}, row2 {tag:"x",extra:1},
-        // row3 {tag:"y"}.  Needle {tag:"x"} → rows {0,2}.
+                                                // 4 rows. row0 {tag:"x"}, row1 {tag:"y"}, row2 {tag:"x",extra:1},
+                                                // row3 {tag:"y"}.  Needle {tag:"x"} → rows {0,2}.
         let docs = [
             serde_json::json!({"tag":"x"}),
             serde_json::json!({"tag":"y"}),
@@ -5851,18 +6377,34 @@ mod tests {
 
         let needle = serde_json::to_vec(&serde_json::json!({"tag":"x"})).unwrap();
         let plan = registry.probe_row_selection(
-            &p, &table, "payload", opclass, &needle, &[file.to_string()],
+            &p,
+            &table,
+            "payload",
+            opclass,
+            &needle,
+            &[file.to_string()],
         );
         // tag=x is selective (2/4 = 50% <= 60% cap) → row offsets kept.
         let offs = plan.row_offsets.get(file).expect("row offsets present");
-        assert!(offs.contains(&0) && offs.contains(&2), "superset of true matches {offs:?}");
-        assert!(!offs.contains(&1) && !offs.contains(&3), "non-matching rows excluded");
+        assert!(
+            offs.contains(&0) && offs.contains(&2),
+            "superset of true matches {offs:?}"
+        );
+        assert!(
+            !offs.contains(&1) && !offs.contains(&3),
+            "non-matching rows excluded"
+        );
         assert!(plan.prunable.is_empty());
 
         // A needle naming a key that never appears prunes the file.
         let needle2 = serde_json::to_vec(&serde_json::json!({"absent":true})).unwrap();
         let plan2 = registry.probe_row_selection(
-            &p, &table, "payload", opclass, &needle2, &[file.to_string()],
+            &p,
+            &table,
+            "payload",
+            opclass,
+            &needle2,
+            &[file.to_string()],
         );
         assert!(plan2.prunable.contains(file), "absent term prunes file");
     }

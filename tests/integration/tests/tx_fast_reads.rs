@@ -62,7 +62,11 @@ async fn open_engine_with_shard() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -101,7 +105,10 @@ async fn point_v(sess: &ProjectSession, table: &str, k: i64) -> Option<i64> {
     match sess.execute(&sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => {
             let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-            assert!(total <= 1, "PK point read returned {total} rows for {sql:?}");
+            assert!(
+                total <= 1,
+                "PK point read returned {total} rows for {sql:?}"
+            );
             if total == 0 {
                 return None;
             }
@@ -202,7 +209,11 @@ async fn in_tx_point_read_survives_concurrent_delete() {
     a.execute("BEGIN").await.unwrap();
     let c1 = count(&a, "SELECT COUNT(*) FROM t").await;
     assert_eq!(c1, 50);
-    assert_eq!(point_v(&a, "t", 12).await, Some(120), "A pinned read of k=12");
+    assert_eq!(
+        point_v(&a, "t", 12).await,
+        Some(120),
+        "A pinned read of k=12"
+    );
 
     // B deletes k=12 (hot-tier tombstone) and commits.
     b.execute("DELETE FROM t WHERE id = 12").await.unwrap();
@@ -244,15 +255,23 @@ async fn own_write_to_other_table_keeps_fast_reads_on_untouched_table() {
     // Pin both tables' read-views.
     assert_eq!(count(&a, "SELECT COUNT(*) FROM t").await, 30);
     assert_eq!(count(&a, "SELECT COUNT(*) FROM other").await, 30);
-    assert_eq!(point_v(&a, "t", 5).await, Some(50), "A pinned read of t.k=5");
+    assert_eq!(
+        point_v(&a, "t", 5).await,
+        Some(50),
+        "A pinned read of t.k=5"
+    );
 
     // A writes to `other` (this tx now has an overlay/pending entry for
     // `other`, but `t` is still untouched).
-    a.execute("UPDATE other SET v = 1 WHERE id = 0").await.unwrap();
+    a.execute("UPDATE other SET v = 1 WHERE id = 0")
+        .await
+        .unwrap();
 
     // B commits a concurrent UPDATE to t.k=5; A must NOT see it (fast read on
     // the untouched `t` still honours the pin).
-    b.execute("UPDATE t SET v = 7777 WHERE id = 5").await.unwrap();
+    b.execute("UPDATE t SET v = 7777 WHERE id = 5")
+        .await
+        .unwrap();
 
     let v1 = point_v(&a, "t", 5).await;
     assert_eq!(
@@ -262,7 +281,11 @@ async fn own_write_to_other_table_keeps_fast_reads_on_untouched_table() {
          saw {v1:?}"
     );
     // Read-your-own-writes on the touched table still holds (routes to DataFusion).
-    assert_eq!(point_v(&a, "other", 0).await, Some(1), "A sees its own write to other");
+    assert_eq!(
+        point_v(&a, "other", 0).await,
+        Some(1),
+        "A sees its own write to other"
+    );
 
     a.execute("COMMIT").await.unwrap();
 }
@@ -291,8 +314,14 @@ async fn first_touch_pins_and_serves_fast() {
     assert_eq!(v0, Some(30), "first-touch point read (fast-path-pinned)");
 
     // B commits a concurrent UPDATE after A pinned on first touch.
-    b.execute("UPDATE t SET v = 555 WHERE id = 3").await.unwrap();
-    assert_eq!(point_v(&b, "t", 3).await, Some(555), "B sees its own update");
+    b.execute("UPDATE t SET v = 555 WHERE id = 3")
+        .await
+        .unwrap();
+    assert_eq!(
+        point_v(&b, "t", 3).await,
+        Some(555),
+        "B sees its own update"
+    );
 
     // SECOND read of the SAME row: now `AlreadyPinned`, still fast, and must
     // STILL return the OLD value captured at first touch (snapshot stable).
@@ -305,10 +334,18 @@ async fn first_touch_pins_and_serves_fast() {
 
     // A different row read at the SAME pin must also see the pre-update value
     // (the pin covers the whole table, not just the first-read key).
-    assert_eq!(point_v(&a, "t", 4).await, Some(40), "sibling row at the pin");
+    assert_eq!(
+        point_v(&a, "t", 4).await,
+        Some(40),
+        "sibling row at the pin"
+    );
 
     a.execute("COMMIT").await.unwrap();
-    assert_eq!(point_v(&a, "t", 3).await, Some(555), "post-COMMIT sees live head");
+    assert_eq!(
+        point_v(&a, "t", 3).await,
+        Some(555),
+        "post-COMMIT sees live head"
+    );
 }
 
 /// First touch where ANOTHER session committed an UPDATE BEFORE A's tx begins:
@@ -325,8 +362,14 @@ async fn first_touch_pins_at_post_flush_head() {
 
     seed(&a, "t", 40).await;
     // B commits an UPDATE BEFORE A's tx begins — A must see this committed value.
-    b.execute("UPDATE t SET v = 111 WHERE id = 9").await.unwrap();
-    assert_eq!(point_v(&b, "t", 9).await, Some(111), "B sees its own update");
+    b.execute("UPDATE t SET v = 111 WHERE id = 9")
+        .await
+        .unwrap();
+    assert_eq!(
+        point_v(&b, "t", 9).await,
+        Some(111),
+        "B sees its own update"
+    );
 
     a.execute("BEGIN").await.unwrap();
     // First touch pins at the current (post-flush) head — sees B's committed 111.
@@ -341,11 +384,23 @@ async fn first_touch_pins_at_post_flush_head() {
     let _ = count(&b, "SELECT COUNT(*) FROM t").await;
 
     // A's pinned read of the existing key stays stable, and B's new row is hidden.
-    assert_eq!(point_v(&a, "t", 9).await, Some(111), "pinned read stable across concurrent INSERT");
-    assert_eq!(point_v(&a, "t", 10001).await, None, "B's post-pin row hidden from A");
+    assert_eq!(
+        point_v(&a, "t", 9).await,
+        Some(111),
+        "pinned read stable across concurrent INSERT"
+    );
+    assert_eq!(
+        point_v(&a, "t", 10001).await,
+        None,
+        "B's post-pin row hidden from A"
+    );
 
     a.execute("COMMIT").await.unwrap();
-    assert_eq!(point_v(&a, "t", 10001).await, Some(7), "post-COMMIT sees B's row");
+    assert_eq!(
+        point_v(&a, "t", 10001).await,
+        Some(7),
+        "post-COMMIT sees B's row"
+    );
 }
 
 /// A concurrent INSERT (flushed to a new cold snapshot, advancing the head)
@@ -375,12 +430,24 @@ async fn concurrent_insert_flush_does_not_move_pinned_point_read() {
     // A's pinned point read of an EXISTING key stays stable (reads at the pin's
     // historical snapshot, not the advanced head).
     let v1 = point_v(&a, "t", 9).await;
-    assert_eq!(v1, Some(90), "pinned point read stable across concurrent INSERT; saw {v1:?}");
+    assert_eq!(
+        v1,
+        Some(90),
+        "pinned point read stable across concurrent INSERT; saw {v1:?}"
+    );
     // The new row is invisible to A's pinned tx.
-    assert_eq!(point_v(&a, "t", 10001).await, None, "B's new row hidden from A's pin");
+    assert_eq!(
+        point_v(&a, "t", 10001).await,
+        None,
+        "B's new row hidden from A's pin"
+    );
 
     a.execute("COMMIT").await.unwrap();
-    assert_eq!(point_v(&a, "t", 10001).await, Some(1), "post-COMMIT A sees B's row");
+    assert_eq!(
+        point_v(&a, "t", 10001).await,
+        Some(1),
+        "post-COMMIT A sees B's row"
+    );
 }
 
 /// Smoke timing: print the in-tx point-read latency. Not asserted (no baseline
@@ -407,9 +474,7 @@ async fn in_tx_point_read_timing_smoke() {
     }
     let elapsed = start.elapsed();
     let p_avg = elapsed / iters;
-    println!(
-        "in_tx fast point read: {iters} iters in {elapsed:?} (avg {p_avg:?}/read)"
-    );
+    println!("in_tx fast point read: {iters} iters in {elapsed:?} (avg {p_avg:?}/read)");
 
     a.execute("COMMIT").await.unwrap();
 }

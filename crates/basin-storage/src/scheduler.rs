@@ -215,7 +215,6 @@ impl ProjectQueue {
         }
     }
 
-
     /// Earliest deadline across queued waiters; None if queue is empty.
     fn head_deadline(&self) -> Option<Instant> {
         match (self.high.front(), self.low.front()) {

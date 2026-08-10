@@ -192,7 +192,11 @@ async fn tb_epoch_alignment_5min() {
     // 2024-01-15 10:35:00+00 (on boundary)
     exec(&sess, "INSERT INTO t5 VALUES ('2024-01-15 10:35:00+00')").await;
     // 2024-01-15 10:34:59.999999+00 (1µs before the 10:35 boundary)
-    exec(&sess, "INSERT INTO t5 VALUES ('2024-01-15 10:34:59.999999+00')").await;
+    exec(
+        &sess,
+        "INSERT INTO t5 VALUES ('2024-01-15 10:34:59.999999+00')",
+    )
+    .await;
 
     let buckets = row_count(
         &sess,
@@ -638,7 +642,9 @@ async fn create_hypertable_accepted() {
     )
     .await;
     let r = sess
-        .execute("SELECT create_hypertable('ht_basic', 'ts', chunk_time_interval => INTERVAL '1 day')")
+        .execute(
+            "SELECT create_hypertable('ht_basic', 'ts', chunk_time_interval => INTERVAL '1 day')",
+        )
         .await;
     assert!(
         r.is_ok(),
@@ -804,7 +810,11 @@ async fn hypertable_compress_chunk_accepted() {
         "ALTER TABLE ht_cc SET (timescaledb.compress, timescaledb.compress_orderby = 'ts DESC')",
     )
     .await;
-    exec(&sess, "INSERT INTO ht_cc VALUES (1, '2024-01-01 10:00:00+00')").await;
+    exec(
+        &sess,
+        "INSERT INTO ht_cc VALUES (1, '2024-01-01 10:00:00+00')",
+    )
+    .await;
 
     let r = sess
         .execute(

@@ -5823,133 +5823,133 @@ To suggest an addition to the matrix, edit `tests/integration/tests/sql_support_
 #[test]
 fn sql_support_matrix() {
     basin_integration_tests::big_stack::run(async {
-    basin_common::telemetry::try_init_for_tests();
+        basin_common::telemetry::try_init_for_tests();
 
-    // ── Pass 0: Default (no env vars) ────────────────────────────────────────
-    // Unset both gates to ensure a clean state
-    std::env::remove_var("BASIN_PG_QUERY");
-    std::env::remove_var("BASIN_PG_QUERY_PLAN");
-    let pass0 = run_pass().await;
+        // ── Pass 0: Default (no env vars) ────────────────────────────────────────
+        // Unset both gates to ensure a clean state
+        std::env::remove_var("BASIN_PG_QUERY");
+        std::env::remove_var("BASIN_PG_QUERY_PLAN");
+        let pass0 = run_pass().await;
 
-    // ── Pass 1: BASIN_PG_QUERY=1 ─────────────────────────────────────────────
-    std::env::set_var("BASIN_PG_QUERY", "1");
-    std::env::remove_var("BASIN_PG_QUERY_PLAN");
-    let pass1 = run_pass().await;
+        // ── Pass 1: BASIN_PG_QUERY=1 ─────────────────────────────────────────────
+        std::env::set_var("BASIN_PG_QUERY", "1");
+        std::env::remove_var("BASIN_PG_QUERY_PLAN");
+        let pass1 = run_pass().await;
 
-    // ── Pass 2: BASIN_PG_QUERY=1 + BASIN_PG_QUERY_PLAN=1 ────────────────────
-    std::env::set_var("BASIN_PG_QUERY", "1");
-    std::env::set_var("BASIN_PG_QUERY_PLAN", "1");
-    let pass2 = run_pass().await;
+        // ── Pass 2: BASIN_PG_QUERY=1 + BASIN_PG_QUERY_PLAN=1 ────────────────────
+        std::env::set_var("BASIN_PG_QUERY", "1");
+        std::env::set_var("BASIN_PG_QUERY_PLAN", "1");
+        let pass2 = run_pass().await;
 
-    // Clean up env for other tests running in process
-    std::env::remove_var("BASIN_PG_QUERY");
-    std::env::remove_var("BASIN_PG_QUERY_PLAN");
+        // Clean up env for other tests running in process
+        std::env::remove_var("BASIN_PG_QUERY");
+        std::env::remove_var("BASIN_PG_QUERY_PLAN");
 
-    // ── Assemble MatrixRow vec ────────────────────────────────────────────────
-    assert_eq!(pass0.len(), MATRIX.len());
-    assert_eq!(pass1.len(), MATRIX.len());
-    assert_eq!(pass2.len(), MATRIX.len());
+        // ── Assemble MatrixRow vec ────────────────────────────────────────────────
+        assert_eq!(pass0.len(), MATRIX.len());
+        assert_eq!(pass1.len(), MATRIX.len());
+        assert_eq!(pass2.len(), MATRIX.len());
 
-    let matrix_rows: Vec<MatrixRow> = MATRIX
-        .iter()
-        .zip(pass0.iter())
-        .zip(pass1.iter())
-        .zip(pass2.iter())
-        .map(|(((entry, p0), p1), p2)| {
-            let notes = if p0.0 != Outcome::Ok {
-                p0.1.clone()
-            } else if p1.0 != Outcome::Ok {
-                p1.1.clone()
-            } else {
-                p2.1.clone()
-            };
-            MatrixRow {
-                category: entry.0,
-                sql: entry.1,
-                outcomes: [p0.0.clone(), p1.0.clone(), p2.0.clone()],
-                notes,
-            }
-        })
-        .collect();
-
-    // ── Print summary ─────────────────────────────────────────────────────────
-    let total = matrix_rows.len();
-    for (pass_idx, pass_label) in [
-        (0usize, "Default"),
-        (1usize, "+PG_QUERY"),
-        (2usize, "+PG_QUERY+PG_PLAN"),
-    ] {
-        let ok = matrix_rows
+        let matrix_rows: Vec<MatrixRow> = MATRIX
             .iter()
-            .filter(|r| r.outcomes[pass_idx] == Outcome::Ok)
-            .count();
-        let exec_fail = matrix_rows
-            .iter()
-            .filter(|r| r.outcomes[pass_idx] == Outcome::ExecFailed)
-            .count();
-        let plan_rej = matrix_rows
-            .iter()
-            .filter(|r| r.outcomes[pass_idx] == Outcome::PlannerRejected)
-            .count();
-        let parse_rej = matrix_rows
-            .iter()
-            .filter(|r| r.outcomes[pass_idx] == Outcome::ParserRejected)
-            .count();
-        let oos = matrix_rows
-            .iter()
-            .filter(|r| r.outcomes[pass_idx] == Outcome::OutOfScope)
-            .count();
-        println!(
+            .zip(pass0.iter())
+            .zip(pass1.iter())
+            .zip(pass2.iter())
+            .map(|(((entry, p0), p1), p2)| {
+                let notes = if p0.0 != Outcome::Ok {
+                    p0.1.clone()
+                } else if p1.0 != Outcome::Ok {
+                    p1.1.clone()
+                } else {
+                    p2.1.clone()
+                };
+                MatrixRow {
+                    category: entry.0,
+                    sql: entry.1,
+                    outcomes: [p0.0.clone(), p1.0.clone(), p2.0.clone()],
+                    notes,
+                }
+            })
+            .collect();
+
+        // ── Print summary ─────────────────────────────────────────────────────────
+        let total = matrix_rows.len();
+        for (pass_idx, pass_label) in [
+            (0usize, "Default"),
+            (1usize, "+PG_QUERY"),
+            (2usize, "+PG_QUERY+PG_PLAN"),
+        ] {
+            let ok = matrix_rows
+                .iter()
+                .filter(|r| r.outcomes[pass_idx] == Outcome::Ok)
+                .count();
+            let exec_fail = matrix_rows
+                .iter()
+                .filter(|r| r.outcomes[pass_idx] == Outcome::ExecFailed)
+                .count();
+            let plan_rej = matrix_rows
+                .iter()
+                .filter(|r| r.outcomes[pass_idx] == Outcome::PlannerRejected)
+                .count();
+            let parse_rej = matrix_rows
+                .iter()
+                .filter(|r| r.outcomes[pass_idx] == Outcome::ParserRejected)
+                .count();
+            let oos = matrix_rows
+                .iter()
+                .filter(|r| r.outcomes[pass_idx] == Outcome::OutOfScope)
+                .count();
+            println!(
             "Pass {pass_label}: ✅ {ok}  🛠 {exec_fail}  📜 {plan_rej}  ❌ {parse_rej}  🚫 {oos}  (total {total})"
         );
-    }
+        }
 
-    // ── Write docs/sql-support.md ─────────────────────────────────────────────
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Format as a human-readable UTC string
-    let timestamp = format!("{ts} (Unix epoch)");
+        // ── Write docs/sql-support.md ─────────────────────────────────────────────
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Format as a human-readable UTC string
+        let timestamp = format!("{ts} (Unix epoch)");
 
-    let md = generate_markdown(&matrix_rows, &timestamp, total);
+        let md = generate_markdown(&matrix_rows, &timestamp, total);
 
-    // The docs/ dir is at workspace root; find it relative to CARGO_MANIFEST_DIR.
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| "tests/integration".to_string());
-    // Walk up from tests/integration to workspace root
-    let workspace_root = std::path::PathBuf::from(&manifest_dir)
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+        // The docs/ dir is at workspace root; find it relative to CARGO_MANIFEST_DIR.
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| "tests/integration".to_string());
+        // Walk up from tests/integration to workspace root
+        let workspace_root = std::path::PathBuf::from(&manifest_dir)
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    let docs_dir = workspace_root.join("docs");
-    let out_path = docs_dir.join("sql-support.md");
+        let docs_dir = workspace_root.join("docs");
+        let out_path = docs_dir.join("sql-support.md");
 
-    std::fs::create_dir_all(&docs_dir).expect("create docs/");
-    std::fs::write(&out_path, &md).unwrap_or_else(|e| {
-        eprintln!("Warning: could not write {}: {e}", out_path.display());
-    });
+        std::fs::create_dir_all(&docs_dir).expect("create docs/");
+        std::fs::write(&out_path, &md).unwrap_or_else(|e| {
+            eprintln!("Warning: could not write {}: {e}", out_path.display());
+        });
 
-    println!("Wrote {}", out_path.display());
+        println!("Wrote {}", out_path.display());
 
-    // ── Sanity assertions ─────────────────────────────────────────────────────
-    // The matrix must have at least 900 rows (post 2026-05-21 expansion;
-    // floor was 550 before +200 fragments landed). Guards against an
-    // accidental fragment deletion regressing coverage.
-    assert!(
-        total >= 900,
-        "expected at least 900 SQL fragments, got {total}"
-    );
-    // At least some rows must succeed in the default config.
-    let default_ok = matrix_rows
-        .iter()
-        .filter(|r| r.outcomes[0] == Outcome::Ok)
-        .count();
-    assert!(
-        default_ok >= 20,
-        "expected at least 20 OK rows in default config, got {default_ok}"
-    );
+        // ── Sanity assertions ─────────────────────────────────────────────────────
+        // The matrix must have at least 900 rows (post 2026-05-21 expansion;
+        // floor was 550 before +200 fragments landed). Guards against an
+        // accidental fragment deletion regressing coverage.
+        assert!(
+            total >= 900,
+            "expected at least 900 SQL fragments, got {total}"
+        );
+        // At least some rows must succeed in the default config.
+        let default_ok = matrix_rows
+            .iter()
+            .filter(|r| r.outcomes[0] == Outcome::Ok)
+            .count();
+        assert!(
+            default_ok >= 20,
+            "expected at least 20 OK rows in default config, got {default_ok}"
+        );
     });
 }

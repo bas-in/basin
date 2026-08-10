@@ -396,8 +396,7 @@ pub fn apple_client_secret(static_secret: &str) -> Result<String> {
     match (team_id, key_id, pem) {
         (Some(team_id), Some(key_id), Some(pem)) => {
             // Use the cached JWT from env-based credentials.
-            let cache_mutex = APPLE_CLIENT_SECRET_CACHE
-                .get_or_init(|| std::sync::Mutex::new(None));
+            let cache_mutex = APPLE_CLIENT_SECRET_CACHE.get_or_init(|| std::sync::Mutex::new(None));
 
             let mut guard = cache_mutex
                 .lock()
@@ -484,7 +483,9 @@ pub fn verify_state_hmac(
 ) -> Result<()> {
     let parts: Vec<&str> = state.splitn(2, '.').collect();
     if parts.len() != 2 {
-        return Err(BasinError::InvalidIdent("invalid oauth state format".into()));
+        return Err(BasinError::InvalidIdent(
+            "invalid oauth state format".into(),
+        ));
     }
     let (nonce, presented_sig) = (parts[0], parts[1]);
     let msg = format!("{project_id}:{provider}:{nonce}");
@@ -537,9 +538,8 @@ pub fn validate_redirect_to(redirect_to: &str, allowed_origins: &[String]) -> Re
     }
 
     // Parse the candidate URL and extract its origin.
-    let candidate = url::Url::parse(redirect_to).map_err(|e| {
-        BasinError::InvalidIdent(format!("redirect_to is not a valid URL: {e}"))
-    })?;
+    let candidate = url::Url::parse(redirect_to)
+        .map_err(|e| BasinError::InvalidIdent(format!("redirect_to is not a valid URL: {e}")))?;
     let candidate_origin = candidate.origin();
 
     for entry in allowed_origins {
@@ -686,7 +686,9 @@ impl EncryptionProvider for PlaintextEncryption {
         ciphertext
             .strip_prefix("plain:")
             .map(|s| s.to_owned())
-            .ok_or_else(|| BasinError::internal("PlaintextEncryption: unexpected ciphertext format"))
+            .ok_or_else(|| {
+                BasinError::internal("PlaintextEncryption: unexpected ciphertext format")
+            })
     }
 }
 
@@ -767,8 +769,12 @@ pub trait OAuthStore: AuthStore {
     ) -> Result<i64>;
 
     /// Update `last_sign_in_at` + `email_verified` for an existing identity.
-    async fn touch_identity(&self, schema: &str, identity_id: i64, email_verified: bool)
-        -> Result<()>;
+    async fn touch_identity(
+        &self,
+        schema: &str,
+        identity_id: i64,
+        email_verified: bool,
+    ) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,10 +1112,12 @@ impl OAuthStateCache {
         let mut map = self.states.lock().unwrap();
         match map.remove(state_hash) {
             Some(entry) if entry.expires_at > Instant::now() => Ok(entry.row),
-            Some(_expired) => {
-                Err(BasinError::InvalidIdent("oauth state not found or expired".into()))
-            }
-            None => Err(BasinError::InvalidIdent("oauth state not found or expired".into())),
+            Some(_expired) => Err(BasinError::InvalidIdent(
+                "oauth state not found or expired".into(),
+            )),
+            None => Err(BasinError::InvalidIdent(
+                "oauth state not found or expired".into(),
+            )),
         }
     }
 
@@ -1185,9 +1193,10 @@ impl OAuthStateCache {
         // Check by verified email for linking.
         if email_verified {
             let idents = self.identities.lock().unwrap();
-            if let Some(ident) = idents.iter().find(|i| {
-                i.project_id == project_id.to_string() && i.email == email
-            }) {
+            if let Some(ident) = idents
+                .iter()
+                .find(|i| i.project_id == project_id.to_string() && i.email == email)
+            {
                 let user_id = ident.user_id;
                 drop(idents);
                 let mut idents = self.identities.lock().unwrap();
@@ -1258,7 +1267,11 @@ pub(crate) struct ResolvedProvider {
 // ---------------------------------------------------------------------------
 
 fn non_empty_or<'a>(s: &'a str, fallback: &'a str) -> &'a str {
-    if s.is_empty() { fallback } else { s }
+    if s.is_empty() {
+        fallback
+    } else {
+        s
+    }
 }
 
 /// Resolve provider endpoints from DB row + preset defaults + optional OIDC
@@ -1374,7 +1387,9 @@ where
             })?;
         resolve_provider_config(&row, provider).await?
     } else {
-        inner.oauth_state_cache.load_mock_provider(project_id, provider)?
+        inner
+            .oauth_state_cache
+            .load_mock_provider(project_id, provider)?
     };
 
     // 2. Validate redirect_to against the per-project allowlist.
@@ -1536,7 +1551,9 @@ where
             })?;
         resolve_provider_config(&row, provider).await?
     } else {
-        inner.oauth_state_cache.load_mock_provider(&project_id, provider)?
+        inner
+            .oauth_state_cache
+            .load_mock_provider(&project_id, provider)?
     };
 
     let decrypted_secret = enc.decrypt(&resolved.client_secret_enc)?;
@@ -1608,7 +1625,14 @@ where
     } else {
         inner
             .oauth_state_cache
-            .link_or_create(inner, &project_id, provider, &provider_user_id, &email, verified)
+            .link_or_create(
+                inner,
+                &project_id,
+                provider,
+                &provider_user_id,
+                &email,
+                verified,
+            )
             .await?
     };
 
@@ -1973,9 +1997,18 @@ mod tests {
             "nonce.sig",
             "s256_challenge",
         );
-        assert!(url.starts_with(p.authorize_url), "{name}: url prefix mismatch");
-        assert!(url.contains("response_type=code"), "{name}: missing response_type");
-        assert!(url.contains("client_id=client_xyz"), "{name}: missing client_id");
+        assert!(
+            url.starts_with(p.authorize_url),
+            "{name}: url prefix mismatch"
+        );
+        assert!(
+            url.contains("response_type=code"),
+            "{name}: missing response_type"
+        );
+        assert!(
+            url.contains("client_id=client_xyz"),
+            "{name}: missing client_id"
+        );
         assert!(url.contains("state=nonce.sig"), "{name}: missing state");
         assert!(
             url.contains("code_challenge=s256_challenge"),
@@ -1992,7 +2025,10 @@ mod tests {
         check_provider("microsoft", "login.microsoftonline.com", "openid");
         // Alias.
         let alias = preset("azure_ad").unwrap();
-        assert_eq!(alias.authorize_url, preset("microsoft").unwrap().authorize_url);
+        assert_eq!(
+            alias.authorize_url,
+            preset("microsoft").unwrap().authorize_url
+        );
     }
 
     #[test]
@@ -2021,7 +2057,10 @@ mod tests {
         check_provider("twitter_x", "twitter.com", "users.read");
         // `twitter` alias resolves to the same preset.
         let alias = preset("twitter").unwrap();
-        assert_eq!(alias.authorize_url, preset("twitter_x").unwrap().authorize_url);
+        assert_eq!(
+            alias.authorize_url,
+            preset("twitter_x").unwrap().authorize_url
+        );
     }
 
     #[test]
@@ -2207,14 +2246,20 @@ mod tests {
         let allow = vec!["https://example.com".to_string()];
         // http vs https: different origins.
         let result = validate_redirect_to("http://example.com/cb", &allow);
-        assert!(result.is_err(), "http must not match an https allowlist entry");
+        assert!(
+            result.is_err(),
+            "http must not match an https allowlist entry"
+        );
     }
 
     #[test]
     fn redirect_to_port_mismatch_rejected() {
         let allow = vec!["https://example.com:8080".to_string()];
         let result = validate_redirect_to("https://example.com/cb", &allow);
-        assert!(result.is_err(), "default port must not match explicit port 8080");
+        assert!(
+            result.is_err(),
+            "default port must not match explicit port 8080"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2227,7 +2272,13 @@ mod tests {
         // Use a 1-nanosecond TTL so entries expire instantly.
         let cache = OAuthStateCache::with_ttl(Duration::from_nanos(1));
         let project = ProjectId::new();
-        cache.insert_state_sync("hash1", &project, "google", "verifier", "https://app.example.com");
+        cache.insert_state_sync(
+            "hash1",
+            &project,
+            "google",
+            "verifier",
+            "https://app.example.com",
+        );
 
         // Sleep just long enough to guarantee expiry (1ns TTL + a short pause).
         std::thread::sleep(Duration::from_millis(10));
@@ -2294,7 +2345,13 @@ mod tests {
         // Insert a fresh entry — this should trigger the lazy sweep.
         let cache_long = OAuthStateCache::with_ttl(Duration::from_secs(600));
         let project2 = ProjectId::new();
-        cache_long.insert_state_sync("fresh_after_sweep", &project2, "google", "v", "https://y.example.com");
+        cache_long.insert_state_sync(
+            "fresh_after_sweep",
+            &project2,
+            "google",
+            "v",
+            "https://y.example.com",
+        );
 
         // Expired entries must be gone from the original cache.
         assert!(cache.consume_state_sync("expired_0").is_err());

@@ -164,12 +164,15 @@ fn make_batch(start: usize, len: usize) -> RecordBatch {
         .map(|i| (i % RANK_DISTINCT) as i64)
         .collect::<Vec<_>>()
         .into();
-    RecordBatch::try_new(schema, vec![
-        Arc::new(ids),
-        Arc::new(scores),
-        Arc::new(tags),
-        Arc::new(ranks),
-    ])
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(scores),
+            Arc::new(tags),
+            Arc::new(ranks),
+        ],
+    )
     .unwrap()
 }
 
@@ -285,10 +288,7 @@ impl ExactRefs {
 // then query approx functions and check bounds.
 // ---------------------------------------------------------------------------
 
-async fn run_one_file_count(
-    file_count: usize,
-    exact: &ExactRefs,
-) -> FileCountResult {
+async fn run_one_file_count(file_count: usize, exact: &ExactRefs) -> FileCountResult {
     let dir = TempDir::new().unwrap();
     let engine = build_engine(&dir);
     let project = ProjectId::new();
@@ -337,27 +337,35 @@ async fn run_one_file_count(
 
     // id: all TOTAL_ROWS distinct
     let hll_id = extract_i64(
-        &query_rows(&sess, &format!(
-            "SELECT APPROX_COUNT_DISTINCT(id) FROM {table_name}"
-        )).await
+        &query_rows(
+            &sess,
+            &format!("SELECT APPROX_COUNT_DISTINCT(id) FROM {table_name}"),
+        )
+        .await,
     );
     let hll_id_err = (hll_id as f64 - exact.distinct_id as f64).abs() / exact.distinct_id as f64;
 
     // tag: 50_000 distinct
     let hll_tag = extract_i64(
-        &query_rows(&sess, &format!(
-            "SELECT APPROX_COUNT_DISTINCT(tag) FROM {table_name}"
-        )).await
+        &query_rows(
+            &sess,
+            &format!("SELECT APPROX_COUNT_DISTINCT(tag) FROM {table_name}"),
+        )
+        .await,
     );
-    let hll_tag_err = (hll_tag as f64 - exact.distinct_tag as f64).abs() / exact.distinct_tag as f64;
+    let hll_tag_err =
+        (hll_tag as f64 - exact.distinct_tag as f64).abs() / exact.distinct_tag as f64;
 
     // rank: 1_000 distinct
     let hll_rank = extract_i64(
-        &query_rows(&sess, &format!(
-            "SELECT APPROX_COUNT_DISTINCT(rank) FROM {table_name}"
-        )).await
+        &query_rows(
+            &sess,
+            &format!("SELECT APPROX_COUNT_DISTINCT(rank) FROM {table_name}"),
+        )
+        .await,
     );
-    let hll_rank_err = (hll_rank as f64 - exact.distinct_rank as f64).abs() / exact.distinct_rank as f64;
+    let hll_rank_err =
+        (hll_rank as f64 - exact.distinct_rank as f64).abs() / exact.distinct_rank as f64;
 
     // ── t-digest checks ─────────────────────────────────────────────────────
 
@@ -367,9 +375,11 @@ async fn run_one_file_count(
     for (idx, &p) in PERCENTILES.iter().enumerate() {
         // score (Float64)
         let approx_score = extract_f64(
-            &query_rows(&sess, &format!(
-                "SELECT APPROX_PERCENTILE(score, {p}) FROM {table_name}"
-            )).await
+            &query_rows(
+                &sess,
+                &format!("SELECT APPROX_PERCENTILE(score, {p}) FROM {table_name}"),
+            )
+            .await,
         );
         let exact_score = exact.score_percentiles[idx];
         let score_abs_err = (approx_score - exact_score).abs() / exact.score_range;
@@ -377,9 +387,11 @@ async fn run_one_file_count(
 
         // rank (Int64)
         let approx_rank = extract_f64(
-            &query_rows(&sess, &format!(
-                "SELECT APPROX_PERCENTILE(rank, {p}) FROM {table_name}"
-            )).await
+            &query_rows(
+                &sess,
+                &format!("SELECT APPROX_PERCENTILE(rank, {p}) FROM {table_name}"),
+            )
+            .await,
         );
         let exact_rank = exact.rank_percentiles[idx];
         let rank_abs_err = (approx_rank - exact_rank).abs() / exact.rank_range;
@@ -458,8 +470,7 @@ async fn sketch_merge_differential() {
     for (idx, &p) in PERCENTILES.iter().enumerate() {
         println!(
             "[sketches] exact p={p}: score={:.4} rank={:.4}",
-            exact.score_percentiles[idx],
-            exact.rank_percentiles[idx],
+            exact.score_percentiles[idx], exact.rank_percentiles[idx],
         );
     }
 
@@ -480,7 +491,10 @@ async fn sketch_merge_differential() {
         if r.hll_id_err > HLL_MAX_REL_ERR {
             failures.push(format!(
                 "file_count={fc} HLL(id): est={} exact={} rel_err={:.4} > {:.4} ({}%)",
-                r.hll_id, exact.distinct_id, r.hll_id_err, HLL_MAX_REL_ERR,
+                r.hll_id,
+                exact.distinct_id,
+                r.hll_id_err,
+                HLL_MAX_REL_ERR,
                 HLL_MAX_REL_ERR * 100.0
             ));
         }
@@ -489,7 +503,10 @@ async fn sketch_merge_differential() {
         if r.hll_tag_err > HLL_MAX_REL_ERR {
             failures.push(format!(
                 "file_count={fc} HLL(tag): est={} exact={} rel_err={:.4} > {:.4} ({}%)",
-                r.hll_tag, exact.distinct_tag, r.hll_tag_err, HLL_MAX_REL_ERR,
+                r.hll_tag,
+                exact.distinct_tag,
+                r.hll_tag_err,
+                HLL_MAX_REL_ERR,
                 HLL_MAX_REL_ERR * 100.0
             ));
         }
@@ -498,7 +515,10 @@ async fn sketch_merge_differential() {
         if r.hll_rank_err > HLL_MAX_REL_ERR {
             failures.push(format!(
                 "file_count={fc} HLL(rank): est={} exact={} rel_err={:.4} > {:.4} ({}%)",
-                r.hll_rank, exact.distinct_rank, r.hll_rank_err, HLL_MAX_REL_ERR,
+                r.hll_rank,
+                exact.distinct_rank,
+                r.hll_rank_err,
+                HLL_MAX_REL_ERR,
                 HLL_MAX_REL_ERR * 100.0
             ));
         }
@@ -509,7 +529,8 @@ async fn sketch_merge_differential() {
                 failures.push(format!(
                     "file_count={fc} t-digest(score, p={p}): \
                      abs_err={:.4} > {:.4} ({}%)",
-                    r.score_errs[idx], TDIGEST_MAX_ABS_ERR,
+                    r.score_errs[idx],
+                    TDIGEST_MAX_ABS_ERR,
                     TDIGEST_MAX_ABS_ERR * 100.0
                 ));
             }
@@ -517,7 +538,8 @@ async fn sketch_merge_differential() {
                 failures.push(format!(
                     "file_count={fc} t-digest(rank, p={p}): \
                      abs_err={:.4} > {:.4} ({}%)",
-                    r.rank_errs[idx], TDIGEST_MAX_ABS_ERR,
+                    r.rank_errs[idx],
+                    TDIGEST_MAX_ABS_ERR,
                     TDIGEST_MAX_ABS_ERR * 100.0
                 ));
             }
@@ -544,19 +566,16 @@ async fn sketch_merge_differential() {
             r.hll_id_err * 100.0,
             r.hll_tag_err * 100.0,
             r.hll_rank_err * 100.0,
-            r.score_errs[0] * 100.0,  // p50
-            r.score_errs[3] * 100.0,  // p99
-            r.rank_errs[0] * 100.0,   // p50
-            r.rank_errs[3] * 100.0,   // p99
+            r.score_errs[0] * 100.0, // p50
+            r.score_errs[3] * 100.0, // p99
+            r.rank_errs[0] * 100.0,  // p50
+            r.rank_errs[3] * 100.0,  // p99
         );
     }
 
     if !failures.is_empty() {
         let msg = failures.join("\n  ");
-        panic!(
-            "[sketches] {} gate violation(s):\n  {msg}",
-            failures.len()
-        );
+        panic!("[sketches] {} gate violation(s):\n  {msg}", failures.len());
     }
 
     println!("[sketches] ALL GATES PASSED");

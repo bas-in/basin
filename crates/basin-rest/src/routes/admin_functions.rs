@@ -64,7 +64,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use basin_catalog::{Catalog, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType, SqlArgType};
+use basin_catalog::{Catalog, SqlArgType, SqlFunctionDef, SqlFunctionLanguage, SqlReturnType};
 use basin_common::ProjectId;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -170,7 +170,7 @@ pub struct InvocationRecord {
 #[derive(Clone, Debug, Serialize)]
 pub struct VersionRecord {
     pub version: i64,
-    pub deployed_at: String,   // RFC3339
+    pub deployed_at: String, // RFC3339
     pub size_bytes: usize,
     /// `true` for the currently-active version.
     pub active: bool,
@@ -301,10 +301,7 @@ impl FunctionRegistry {
         let deployed_at = SystemTime::now();
         let mut map = self.inner.write().await;
         let project_map = map.entry(project).or_default();
-        let version = project_map
-            .get(&name)
-            .map(|e| e.version + 1)
-            .unwrap_or(1);
+        let version = project_map.get(&name).map(|e| e.version + 1).unwrap_or(1);
         project_map.insert(
             name.clone(),
             FunctionEntry {
@@ -763,15 +760,10 @@ pub(crate) async fn list_functions(
 }
 
 fn deploy_rfc3339(t: SystemTime) -> String {
-    let dur = t
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    chrono::DateTime::<chrono::Utc>::from_timestamp(
-        dur.as_secs() as i64,
-        dur.subsec_nanos(),
-    )
-    .map(|dt| dt.to_rfc3339())
-    .unwrap_or_else(|| "1970-01-01T00:00:00Z".into())
+    let dur = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    chrono::DateTime::<chrono::Utc>::from_timestamp(dur.as_secs() as i64, dur.subsec_nanos())
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".into())
 }
 
 // ---------------------------------------------------------------------------

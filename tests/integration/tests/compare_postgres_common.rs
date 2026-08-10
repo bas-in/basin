@@ -575,11 +575,7 @@ pub async fn build_basin_engine() -> BasinInstance {
     }
 }
 
-async fn basin_timed(
-    sess: &basin_engine::ProjectSession,
-    sql: &str,
-    expect_rows: bool,
-) -> f64 {
+async fn basin_timed(sess: &basin_engine::ProjectSession, sql: &str, expect_rows: bool) -> f64 {
     let started = Instant::now();
     let res = sess.execute(sql).await.unwrap();
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
@@ -599,10 +595,7 @@ async fn basin_timed(
 ///
 /// Row-count assertion is skipped for empty-allowed shapes (LIKE prefix,
 /// EXISTS) — the timing is still meaningful even on a zero-row result.
-async fn basin_timed_try(
-    sess: &basin_engine::ProjectSession,
-    sql: &str,
-) -> Option<f64> {
+async fn basin_timed_try(sess: &basin_engine::ProjectSession, sql: &str) -> Option<f64> {
     let started = Instant::now();
     match sess.execute(sql).await {
         Ok(_) => Some(started.elapsed().as_secs_f64() * 1000.0),
@@ -618,11 +611,7 @@ async fn basin_timed_try(
 /// Robust estimate of N samples, retrying on per-sample failure. If FEWER
 /// than half the samples succeed, returns `None` (treat the whole shape as
 /// unsupported). See `robust_estimate` for the median-vs-min estimator policy.
-async fn basin_p50_try(
-    sess: &basin_engine::ProjectSession,
-    sql: &str,
-    n: usize,
-) -> Option<f64> {
+async fn basin_p50_try(sess: &basin_engine::ProjectSession, sql: &str, n: usize) -> Option<f64> {
     // Symmetric warm-up: one untimed execute before the timed window. The
     // small-sample suites take only `samples_for(rows) == 3` samples at 1M,
     // so without warm-up the FIRST sample pays Basin's one-time cold cost
@@ -781,7 +770,9 @@ async fn run_pg_core_suite(
             "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT * FROM {schema}.events WHERE id = {target_id}"
         );
         let r = pg.simple_query(&q).await.expect("explain point");
-        if let Some(ms) = parse_pg_exec_time(&r) { point.push(ms); }
+        if let Some(ms) = parse_pg_exec_time(&r) {
+            point.push(ms);
+        }
     }
 
     let mut range: Vec<f64> = Vec::with_capacity(s_latency);
@@ -791,7 +782,9 @@ async fn run_pg_core_suite(
              WHERE created_at BETWEEN to_timestamp({range_lo_ts}) AND to_timestamp({range_hi_ts})"
         );
         let r = pg.simple_query(&q).await.expect("explain range");
-        if let Some(ms) = parse_pg_exec_time(&r) { range.push(ms); }
+        if let Some(ms) = parse_pg_exec_time(&r) {
+            range.push(ms);
+        }
     }
 
     let mut agg: Vec<f64> = Vec::with_capacity(s7);
@@ -801,7 +794,9 @@ async fn run_pg_core_suite(
              FROM {schema}.events GROUP BY user_id ORDER BY 2 DESC LIMIT 10"
         );
         let r = pg.simple_query(&q).await.expect("explain agg");
-        if let Some(ms) = parse_pg_exec_time(&r) { agg.push(ms); }
+        if let Some(ms) = parse_pg_exec_time(&r) {
+            agg.push(ms);
+        }
     }
 
     let mut join: Vec<f64> = Vec::with_capacity(s5);
@@ -812,7 +807,9 @@ async fn run_pg_core_suite(
              GROUP BY u.email ORDER BY 2 DESC LIMIT 20"
         );
         let r = pg.simple_query(&q).await.expect("explain join");
-        if let Some(ms) = parse_pg_exec_time(&r) { join.push(ms); }
+        if let Some(ms) = parse_pg_exec_time(&r) {
+            join.push(ms);
+        }
     }
 
     let mut ilike: Vec<f64> = Vec::with_capacity(s5);
@@ -822,7 +819,9 @@ async fn run_pg_core_suite(
              WHERE email ILIKE '%@gmail.com'"
         );
         let r = pg.simple_query(&q).await.expect("explain ilike");
-        if let Some(ms) = parse_pg_exec_time(&r) { ilike.push(ms); }
+        if let Some(ms) = parse_pg_exec_time(&r) {
+            ilike.push(ms);
+        }
     }
 
     let mut page: Vec<f64> = Vec::with_capacity(s5);
@@ -832,7 +831,9 @@ async fn run_pg_core_suite(
              FROM {schema}.events ORDER BY created_at DESC LIMIT 50 OFFSET 100"
         );
         let r = pg.simple_query(&q).await.expect("explain pagination");
-        if let Some(ms) = parse_pg_exec_time(&r) { page.push(ms); }
+        if let Some(ms) = parse_pg_exec_time(&r) {
+            page.push(ms);
+        }
     }
 
     // Heavy-write shapes: single-row UPDATE, bulk UPDATE, DELETE. At >1M
@@ -851,7 +852,9 @@ async fn run_pg_core_suite(
                  SET email = '{new_email}' WHERE id = {uid}"
             );
             let r = pg.simple_query(&q).await.expect("explain upd1");
-            if let Some(ms) = parse_pg_exec_time(&r) { v.push(ms); }
+            if let Some(ms) = parse_pg_exec_time(&r) {
+                v.push(ms);
+            }
         }
         v
     };
@@ -883,11 +886,11 @@ async fn run_pg_core_suite(
 
     let mut count: Vec<f64> = Vec::with_capacity(s5);
     for _ in 0..s5 {
-        let q = format!(
-            "EXPLAIN (ANALYZE, FORMAT TEXT) SELECT COUNT(*) FROM {schema}.events"
-        );
+        let q = format!("EXPLAIN (ANALYZE, FORMAT TEXT) SELECT COUNT(*) FROM {schema}.events");
         let r = pg.simple_query(&q).await.expect("explain count");
-        if let Some(ms) = parse_pg_exec_time(&r) { count.push(ms); }
+        if let Some(ms) = parse_pg_exec_time(&r) {
+            count.push(ms);
+        }
     }
 
     let mut trunc: Vec<f64> = Vec::with_capacity(s5);
@@ -897,7 +900,9 @@ async fn run_pg_core_suite(
                     SUM(amount) FROM {schema}.events GROUP BY 1 ORDER BY 1"
         );
         let r = pg.simple_query(&q).await.expect("explain date_trunc");
-        if let Some(ms) = parse_pg_exec_time(&r) { trunc.push(ms); }
+        if let Some(ms) = parse_pg_exec_time(&r) {
+            trunc.push(ms);
+        }
     }
 
     let mut olap_join: Vec<f64> = Vec::with_capacity(s5);
@@ -909,7 +914,9 @@ async fn run_pg_core_suite(
              GROUP BY u.email ORDER BY 2 DESC LIMIT 10"
         );
         let r = pg.simple_query(&q).await.expect("explain olap join");
-        if let Some(ms) = parse_pg_exec_time(&r) { olap_join.push(ms); }
+        if let Some(ms) = parse_pg_exec_time(&r) {
+            olap_join.push(ms);
+        }
     }
 
     PgCoreResults {
@@ -921,7 +928,11 @@ async fn run_pg_core_suite(
         join_p50: robust_estimate(&join),
         ilike_p50: robust_estimate(&ilike),
         page_p50: robust_estimate(&page),
-        upd1_p50: if upd1.is_empty() { f64::NAN } else { robust_estimate(&upd1) },
+        upd1_p50: if upd1.is_empty() {
+            f64::NAN
+        } else {
+            robust_estimate(&upd1)
+        },
         bulk_upd_ms,
         delete_ms,
         count_p50: robust_estimate(&count),
@@ -1180,7 +1191,11 @@ async fn run_basin_core_suite(
         join_p50: robust_estimate(&join),
         ilike_p50: robust_estimate(&ilike),
         page_p50: robust_estimate(&page),
-        upd1_p50: if upd1.is_empty() { f64::NAN } else { robust_estimate(&upd1) },
+        upd1_p50: if upd1.is_empty() {
+            f64::NAN
+        } else {
+            robust_estimate(&upd1)
+        },
         bulk_upd_ms,
         delete_ms,
         count_p50: robust_estimate(&count),
@@ -1248,23 +1263,28 @@ async fn run_extended_suite(
 
     // -- #16 COUNT(DISTINCT user_id) ----------------------------------------
     let count_distinct = pair(
-        pg, sess,
+        pg,
+        sess,
         format!("SELECT COUNT(DISTINCT user_id) FROM {schema}.events"),
         "SELECT COUNT(DISTINCT user_id) FROM events",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #17 LIKE prefix ----------------------------------------------------
     let like_prefix = pair(
-        pg, sess,
+        pg,
+        sess,
         format!("SELECT id FROM {schema}.events WHERE status LIKE 'pending%' LIMIT 100"),
         "SELECT id FROM events WHERE status LIKE 'pending%' LIMIT 100",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #18 Multi-col GROUP BY + HAVING + ORDER + LIMIT --------------------
     let groupby_having = pair(
-        pg, sess,
+        pg,
+        sess,
         format!(
             "SELECT user_id, status, COUNT(*) FROM {schema}.events \
              GROUP BY 1, 2 HAVING COUNT(*) > 5 ORDER BY 3 DESC LIMIT 20"
@@ -1272,11 +1292,13 @@ async fn run_extended_suite(
         "SELECT user_id, status, COUNT(*) FROM events \
          GROUP BY 1, 2 HAVING COUNT(*) > 5 ORDER BY 3 DESC LIMIT 20",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #19 Window LAG OVER (PARTITION BY ... ORDER BY ...) ----------------
     let window_lag = pair(
-        pg, sess,
+        pg,
+        sess,
         format!(
             "SELECT id, amount, LAG(amount) OVER (PARTITION BY user_id ORDER BY created_at) \
              FROM {schema}.events LIMIT 1000"
@@ -1284,7 +1306,8 @@ async fn run_extended_suite(
         "SELECT id, amount, LAG(amount) OVER (PARTITION BY user_id ORDER BY created_at) \
          FROM events LIMIT 1000",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #20 Recursive CTE (Fibonacci to n=30) ------------------------------
     let rec_cte = "WITH RECURSIVE fib(n, a, b) AS (\
@@ -1296,7 +1319,8 @@ async fn run_extended_suite(
 
     // -- #21 Correlated subquery in SELECT list -----------------------------
     let correlated_sub = pair(
-        pg, sess,
+        pg,
+        sess,
         format!(
             "SELECT u.email, (SELECT COUNT(*) FROM {schema}.events e WHERE e.user_id = u.id) \
                 AS n_events \
@@ -1305,11 +1329,13 @@ async fn run_extended_suite(
         "SELECT u.email, (SELECT COUNT(*) FROM events e WHERE e.user_id = u.id) AS n_events \
          FROM users u LIMIT 100",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #22 EXISTS in WHERE ------------------------------------------------
     let exists_in_where = pair(
-        pg, sess,
+        pg,
+        sess,
         format!(
             "SELECT u.id FROM {schema}.users u \
              WHERE EXISTS (SELECT 1 FROM {schema}.events e \
@@ -1318,13 +1344,15 @@ async fn run_extended_suite(
         "SELECT u.id FROM users u \
          WHERE EXISTS (SELECT 1 FROM events e WHERE e.user_id = u.id AND e.amount > 90)",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #23 3-table JOIN (categories ⋈ events ⋈ users via BETWEEN) ---------
     // BETWEEN-join is intentionally expensive — measures predicate-pushdown
     // coverage when the join key is a range, not equality.
     let join3_between = pair(
-        pg, sess,
+        pg,
+        sess,
         format!(
             "SELECT c.name, SUM(e.amount) FROM {schema}.categories c \
              JOIN {schema}.events e ON e.amount BETWEEN c.min_amt AND c.max_amt \
@@ -1336,11 +1364,13 @@ async fn run_extended_suite(
          JOIN users u ON e.user_id = u.id \
          GROUP BY 1",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #24 UNION ALL of two filtered scans --------------------------------
     let union_all = pair(
-        pg, sess,
+        pg,
+        sess,
         format!(
             "SELECT id, 'paid' AS kind FROM {schema}.events WHERE status = 'paid' \
              UNION ALL \
@@ -1350,11 +1380,13 @@ async fn run_extended_suite(
          UNION ALL \
          SELECT id, 'pending' FROM events WHERE status = 'pending'",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #25 ORDER BY NULLS LAST + LIMIT ------------------------------------
     let order_nulls_last = pair(
-        pg, sess,
+        pg,
+        sess,
         format!(
             "SELECT id, last_login FROM {schema}.users \
              ORDER BY last_login DESC NULLS LAST LIMIT 50"
@@ -1362,11 +1394,13 @@ async fn run_extended_suite(
         "SELECT id, last_login FROM users \
          ORDER BY last_login DESC NULLS LAST LIMIT 50",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #26 Top-N per group (MAX) ------------------------------------------
     let top_n_per_group = pair(
-        pg, sess,
+        pg,
+        sess,
         format!(
             "SELECT user_id, MAX(amount) FROM {schema}.events \
              GROUP BY user_id ORDER BY 2 DESC LIMIT 10"
@@ -1374,15 +1408,18 @@ async fn run_extended_suite(
         "SELECT user_id, MAX(amount) FROM events \
          GROUP BY user_id ORDER BY 2 DESC LIMIT 10",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #27 Numeric range filter on doubles --------------------------------
     let numeric_range = pair(
-        pg, sess,
+        pg,
+        sess,
         format!("SELECT COUNT(*) FROM {schema}.events WHERE amount BETWEEN 25.5 AND 75.5"),
         "SELECT COUNT(*) FROM events WHERE amount BETWEEN 25.5 AND 75.5",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     ExtendedResults {
         count_distinct,
@@ -1538,27 +1575,33 @@ async fn run_jsonb_suite(
 
     // -- #28 `->` get key COLD ----------------------------------------------
     let get_key_cold = pair(
-        pg, sess,
+        pg,
+        sess,
         format!("SELECT payload->'category' FROM {schema}.events WHERE id < 100"),
         "SELECT payload->'category' FROM events WHERE id < 100",
         1,
-    ).await;
+    )
+    .await;
 
     // -- #29 `->>` get text COLD --------------------------------------------
     let get_text_cold = pair(
-        pg, sess,
+        pg,
+        sess,
         format!("SELECT payload->>'category' FROM {schema}.events WHERE id < 100"),
         "SELECT payload->>'category' FROM events WHERE id < 100",
         1,
-    ).await;
+    )
+    .await;
 
     // -- #30 `->` deep path COLD --------------------------------------------
     let deep_path_cold = pair(
-        pg, sess,
+        pg,
+        sess,
         format!("SELECT payload->'device'->>'version' FROM {schema}.events WHERE id < 100"),
         "SELECT payload->'device'->>'version' FROM events WHERE id < 100",
         1,
-    ).await;
+    )
+    .await;
 
     // =======================================================================
     // WARM-UP loop — run the JSONB read queries JSONB_WARMUP_ITERS times on
@@ -1594,7 +1637,9 @@ async fn run_jsonb_suite(
     ];
     for _ in 0..JSONB_WARMUP_ITERS {
         for (pg_sql, basin_sql) in &warmup_sqls {
-            let _ = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {pg_sql}")).await;
+            let _ = pg
+                .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {pg_sql}"))
+                .await;
             let _ = sess.execute(basin_sql).await;
         }
     }
@@ -1661,34 +1706,41 @@ async fn run_jsonb_suite(
 
     // -- #28 `->` get key STEADY-STATE --------------------------------------
     let get_key_steady = pair(
-        pg, sess,
+        pg,
+        sess,
         format!("SELECT payload->'category' FROM {schema}.events WHERE id < 100"),
         "SELECT payload->'category' FROM events WHERE id < 100",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #29 `->>` get text STEADY-STATE ------------------------------------
     let get_text_steady = pair(
-        pg, sess,
+        pg,
+        sess,
         format!("SELECT payload->>'category' FROM {schema}.events WHERE id < 100"),
         "SELECT payload->>'category' FROM events WHERE id < 100",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #30 `->` deep path STEADY-STATE ------------------------------------
     let deep_path_steady = pair(
-        pg, sess,
+        pg,
+        sess,
         format!("SELECT payload->'device'->>'version' FROM {schema}.events WHERE id < 100"),
         "SELECT payload->'device'->>'version' FROM events WHERE id < 100",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #31 `@>` containment -----------------------------------------------
     // Full-table predicate. PG uses GIN if indexed (we don't index here, so
     // it's a seq scan — same as Basin's seq path). Selectivity ≈ 1/3 of
     // events (category cycles 0/1/2 → 'purchase').
     let contains = pair(
-        pg, sess,
+        pg,
+        sess,
         format!(
             "SELECT COUNT(*) FROM {schema}.events \
              WHERE payload @> '{{\"category\":\"purchase\"}}'::jsonb"
@@ -1696,45 +1748,50 @@ async fn run_jsonb_suite(
         "SELECT COUNT(*) FROM events \
          WHERE payload @> '{\"category\":\"purchase\"}'::jsonb",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #32 `?` key existence ----------------------------------------------
     // Every row has 'metadata' key → selectivity 100% (worst case for a
     // key-exists probe; surfaces the per-row JSONB decode cost cleanly).
     let key_exists = pair(
-        pg, sess,
+        pg,
+        sess,
         format!("SELECT COUNT(*) FROM {schema}.events WHERE payload ? 'metadata'"),
         "SELECT COUNT(*) FROM events WHERE payload ? 'metadata'",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #33 `#>` path get --------------------------------------------------
     let path_get = pair(
-        pg, sess,
+        pg,
+        sess,
         format!("SELECT payload #> '{{device,os}}' FROM {schema}.events WHERE id < 100"),
         "SELECT payload #> '{device,os}' FROM events WHERE id < 100",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #34 jsonb_array_length(payload->'tags') ----------------------------
     let array_length = pair(
-        pg, sess,
-        format!(
-            "SELECT jsonb_array_length(payload->'tags') FROM {schema}.events WHERE id < 100"
-        ),
+        pg,
+        sess,
+        format!("SELECT jsonb_array_length(payload->'tags') FROM {schema}.events WHERE id < 100"),
         "SELECT jsonb_array_length(payload->'tags') FROM events WHERE id < 100",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #35 jsonb_typeof(payload->'metadata') ------------------------------
     let typeof_fn = pair(
-        pg, sess,
-        format!(
-            "SELECT jsonb_typeof(payload->'metadata') FROM {schema}.events WHERE id < 100"
-        ),
+        pg,
+        sess,
+        format!("SELECT jsonb_typeof(payload->'metadata') FROM {schema}.events WHERE id < 100"),
         "SELECT jsonb_typeof(payload->'metadata') FROM events WHERE id < 100",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #36 JSONB filter + aggregate ---------------------------------------
     // GROUP BY category, SUM the per-event score. The score field is JSON
@@ -1742,7 +1799,8 @@ async fn run_jsonb_suite(
     // on both sides to do arithmetic. This is the real-world analytics
     // pattern for document-store workloads.
     let filter_agg = pair(
-        pg, sess,
+        pg,
+        sess,
         format!(
             "SELECT payload->>'category', SUM((payload->'metadata'->>'score')::float) \
              FROM {schema}.events GROUP BY 1"
@@ -1750,7 +1808,8 @@ async fn run_jsonb_suite(
         "SELECT payload->>'category', SUM((payload->'metadata'->>'score')::float) \
          FROM events GROUP BY 1",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     // -- #37 jsonb_set UPDATE — write-path STRUCTURAL mutation --------------
     // Single-shot (no median) — repeated UPDATE on the same rows is
@@ -1793,9 +1852,8 @@ async fn run_jsonb_suite(
     // an explicit "index did X" delta per engine. See `contains_with_gin`
     // and `basin_gin_ddl_ok` field docs on JsonbResults.
     // =======================================================================
-    let pg_gin_ddl = format!(
-        "CREATE INDEX events_payload_gin ON {schema}.events USING gin (payload)"
-    );
+    let pg_gin_ddl =
+        format!("CREATE INDEX events_payload_gin ON {schema}.events USING gin (payload)");
     pg.simple_query(&pg_gin_ddl)
         .await
         .expect("pg create gin index");
@@ -1804,12 +1862,12 @@ async fn run_jsonb_suite(
     // exists end-to-end as of Phase 5.19.B; the probe-prune wiring is
     // Phase 5.24.D / #105. If the DDL fails we record the gap and reuse
     // the pre-index timing so the ratio is exactly 1.0 (visible no-op).
-    let basin_gin_sql =
-        "CREATE INDEX events_payload_gin ON events USING gin (payload)";
+    let basin_gin_sql = "CREATE INDEX events_payload_gin ON events USING gin (payload)";
     let basin_gin_ddl_ok = sess.execute(basin_gin_sql).await.is_ok();
 
     let contains_with_gin = pair(
-        pg, sess,
+        pg,
+        sess,
         format!(
             "SELECT COUNT(*) FROM {schema}.events \
              WHERE payload @> '{{\"category\":\"purchase\"}}'::jsonb"
@@ -1817,7 +1875,8 @@ async fn run_jsonb_suite(
         "SELECT COUNT(*) FROM events \
          WHERE payload @> '{\"category\":\"purchase\"}'::jsonb",
         ext_samples,
-    ).await;
+    )
+    .await;
 
     JsonbResults {
         get_key_cold,
@@ -1946,7 +2005,9 @@ async fn run_robustness_suite(
     // shapes (#45-#47) and `eq NULL` (#46) returns 0 rows by construction.
     {
         let mut stmt = String::with_capacity(2000 * 40);
-        stmt.push_str(&format!("INSERT INTO {schema}.rstress (id, v, note) VALUES "));
+        stmt.push_str(&format!(
+            "INSERT INTO {schema}.rstress (id, v, note) VALUES "
+        ));
         for i in 0..2000i64 {
             if i > 0 {
                 stmt.push(',');
@@ -2135,7 +2196,10 @@ async fn run_robustness_suite(
                         idx * 50 + 200
                     )
                 } else {
-                    format!("SELECT id, v FROM {schema}.rstress WHERE id = {}", idx * 100)
+                    format!(
+                        "SELECT id, v FROM {schema}.rstress WHERE id = {}",
+                        idx * 100
+                    )
                 };
                 client.simple_query(&q).await.is_ok()
             }
@@ -2433,10 +2497,7 @@ async fn run_robustness_suite(
                         .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ")
                         .await;
                     let c1 = a
-                        .query_one(
-                            &format!("SELECT COUNT(*) FROM {schema_owned}.rstress"),
-                            &[],
-                        )
+                        .query_one(&format!("SELECT COUNT(*) FROM {schema_owned}.rstress"), &[])
                         .await
                         .map(|r| r.get::<_, i64>(0))
                         .unwrap_or(-1);
@@ -2446,10 +2507,7 @@ async fn run_robustness_suite(
                         ))
                         .await;
                     let c2 = a
-                        .query_one(
-                            &format!("SELECT COUNT(*) FROM {schema_owned}.rstress"),
-                            &[],
-                        )
+                        .query_one(&format!("SELECT COUNT(*) FROM {schema_owned}.rstress"), &[])
                         .await
                         .map(|r| r.get::<_, i64>(0))
                         .unwrap_or(-1);
@@ -3029,11 +3087,7 @@ async fn run_oltp_extra_suite(
                 if i > 0 {
                     stmt.push(',');
                 }
-                stmt.push_str(&format!(
-                    "({i}, {}, '{}')",
-                    (i as f64) * 0.5,
-                    status_for(i)
-                ));
+                stmt.push_str(&format!("({i}, {}, '{}')", (i as f64) * 0.5, status_for(i)));
             }
             sess.execute(&stmt).await.is_ok()
         }
@@ -3050,15 +3104,16 @@ async fn run_oltp_extra_suite(
          VALUES (42, 99.5, 'active') \
          ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount, status = EXCLUDED.status"
     );
-    let upsert_basin_sql =
-        "INSERT INTO oltp_extra (id, amount, status) \
+    let upsert_basin_sql = "INSERT INTO oltp_extra (id, amount, status) \
          VALUES (42, 99.5, 'active') \
          ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount, status = EXCLUDED.status";
     let upsert = if pg_scratch_ok && basin_scratch_ok {
         pair(pg, sess, upsert_pg_sql, upsert_basin_sql, n).await
     } else {
         let p = if pg_scratch_ok {
-            pg_p50_explain(pg, &upsert_pg_sql, n).await.unwrap_or(f64::INFINITY)
+            pg_p50_explain(pg, &upsert_pg_sql, n)
+                .await
+                .unwrap_or(f64::INFINITY)
         } else {
             f64::INFINITY
         };
@@ -3082,9 +3137,7 @@ async fn run_oltp_extra_suite(
     let large_in_list = pair(
         pg,
         sess,
-        format!(
-            "SELECT id, user_id, amount FROM {schema}.events WHERE id IN ({in_list})"
-        ),
+        format!("SELECT id, user_id, amount FROM {schema}.events WHERE id IN ({in_list})"),
         &format!("SELECT id, user_id, amount FROM events WHERE id IN ({in_list})"),
         n,
     )
@@ -3140,8 +3193,7 @@ async fn run_oltp_extra_suite(
             WHEN amount < 150 THEN 'mid' \
             ELSE 'high' END"
     );
-    let conditional_update_basin_sql =
-        "UPDATE oltp_extra SET status = CASE \
+    let conditional_update_basin_sql = "UPDATE oltp_extra SET status = CASE \
             WHEN amount < 50 THEN 'low' \
             WHEN amount < 150 THEN 'mid' \
             ELSE 'high' END";
@@ -3206,9 +3258,7 @@ async fn run_oltp_extra_suite(
     let json_eq_lookup = pair(
         pg,
         sess,
-        format!(
-            "SELECT COUNT(*) FROM {schema}.events WHERE payload->>'category' = 'purchase'"
-        ),
+        format!("SELECT COUNT(*) FROM {schema}.events WHERE payload->>'category' = 'purchase'"),
         "SELECT COUNT(*) FROM events WHERE payload->>'category' = 'purchase'",
         n,
     )
@@ -3323,13 +3373,19 @@ async fn run_oltp_extra_suite(
          ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount, status = EXCLUDED.status \
          RETURNING id"
     );
-    let insert_returning_basin_sql =
-        "INSERT INTO oltp_extra (id, amount, status) \
+    let insert_returning_basin_sql = "INSERT INTO oltp_extra (id, amount, status) \
          VALUES (600, 7.25, 'new') \
          ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount, status = EXCLUDED.status \
          RETURNING id";
     let insert_returning = if pg_scratch_ok && basin_scratch_ok {
-        pair(pg, sess, insert_returning_pg_sql, insert_returning_basin_sql, n).await
+        pair(
+            pg,
+            sess,
+            insert_returning_pg_sql,
+            insert_returning_basin_sql,
+            n,
+        )
+        .await
     } else {
         let p = if pg_scratch_ok {
             pg_p50_explain(pg, &insert_returning_pg_sql, n)
@@ -3358,7 +3414,14 @@ async fn run_oltp_extra_suite(
     let update_returning_basin_sql =
         "UPDATE oltp_extra SET status = 'paid' WHERE id = 7 RETURNING id, status";
     let update_returning = if pg_scratch_ok && basin_scratch_ok {
-        pair(pg, sess, update_returning_pg_sql, update_returning_basin_sql, n).await
+        pair(
+            pg,
+            sess,
+            update_returning_pg_sql,
+            update_returning_basin_sql,
+            n,
+        )
+        .await
     } else {
         let p = if pg_scratch_ok {
             pg_p50_explain(pg, &update_returning_pg_sql, n)
@@ -3464,22 +3527,20 @@ async fn run_oltp_extra_suite(
             // not route through `basin_timed_try`, so wire the same eprintln
             // here): print the exact statement + error that aborts the txn.
             let debug_gap = std::env::var("BASIN_DEBUG_GAP").is_ok();
-            let mut step = |label: &'static str,
-                            r: std::result::Result<
-                                basin_engine::ExecResult,
-                                basin_common::BasinError,
-                            >|
-             -> bool {
-                match r {
-                    Ok(_) => true,
-                    Err(e) => {
-                        if debug_gap {
-                            eprintln!("[GAP] select_for_update step={label}\n      err={e:?}");
+            let mut step =
+                |label: &'static str,
+                 r: std::result::Result<basin_engine::ExecResult, basin_common::BasinError>|
+                 -> bool {
+                    match r {
+                        Ok(_) => true,
+                        Err(e) => {
+                            if debug_gap {
+                                eprintln!("[GAP] select_for_update step={label}\n      err={e:?}");
+                            }
+                            false
                         }
-                        false
                     }
-                }
-            };
+                };
             let started = Instant::now();
             let mut ok = step("BEGIN", sess.execute("BEGIN").await);
             ok = ok
@@ -3526,9 +3587,7 @@ async fn run_oltp_extra_suite(
                 .is_ok();
             if ddl {
                 let mut stmt = String::with_capacity(1000 * 16);
-                stmt.push_str(&format!(
-                    "INSERT INTO {schema}.del_scratch (id, v) VALUES "
-                ));
+                stmt.push_str(&format!("INSERT INTO {schema}.del_scratch (id, v) VALUES "));
                 for i in 0..1000i64 {
                     if i > 0 {
                         stmt.push(',');
@@ -3986,9 +4045,7 @@ async fn run_olap_suite(
     let high_card_groupby = pair(
         pg,
         sess,
-        format!(
-            "SELECT user_id, COUNT(*), SUM(amount) FROM {schema}.events GROUP BY user_id"
-        ),
+        format!("SELECT user_id, COUNT(*), SUM(amount) FROM {schema}.events GROUP BY user_id"),
         "SELECT user_id, COUNT(*), SUM(amount) FROM events GROUP BY user_id",
         n,
     )
@@ -4001,9 +4058,7 @@ async fn run_olap_suite(
     let approx_distinct = pair(
         pg,
         sess,
-        format!(
-            "SELECT status, COUNT(DISTINCT user_id) FROM {schema}.events GROUP BY status"
-        ),
+        format!("SELECT status, COUNT(DISTINCT user_id) FROM {schema}.events GROUP BY status"),
         "SELECT status, COUNT(DISTINCT user_id) FROM events GROUP BY status",
         n,
     )
@@ -4226,9 +4281,7 @@ async fn run_dml_pipeline_suite(
     let large_result_stream = pair(
         pg,
         sess,
-        format!(
-            "SELECT id, user_id, amount, status FROM {schema}.events WHERE id < {stream_cap}"
-        ),
+        format!("SELECT id, user_id, amount, status FROM {schema}.events WHERE id < {stream_cap}"),
         &format!("SELECT id, user_id, amount, status FROM events WHERE id < {stream_cap}"),
         n,
     )
@@ -4309,7 +4362,11 @@ async fn run_dml_pipeline_suite(
                     }
                     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
                     sess.close_statement(&handle).await;
-                    if ok { Some(elapsed) } else { None }
+                    if ok {
+                        Some(elapsed)
+                    } else {
+                        None
+                    }
                 }
                 Err(_) => None,
             }
@@ -4396,8 +4453,7 @@ async fn run_dml_pipeline_suite(
              WHEN MATCHED THEN UPDATE SET v = s.v \
              WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)"
         );
-        let merge_basin_sql =
-            "MERGE INTO merge_t t USING merge_s s ON t.id = s.id \
+        let merge_basin_sql = "MERGE INTO merge_t t USING merge_s s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET v = s.v \
              WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)";
         let p = if pg_merge_ok {
@@ -4763,9 +4819,7 @@ async fn run_dml_pipeline_suite(
                         for i in 0..25i64 {
                             let point = (idx as i64 * 101 + i * 7) % 2000;
                             let lo = (idx as i64 * 50 + i * 13) % 1800;
-                            let q1 = format!(
-                                "SELECT id, v FROM {schema}.mixrw WHERE id = {point}"
-                            );
+                            let q1 = format!("SELECT id, v FROM {schema}.mixrw WHERE id = {point}");
                             if client.simple_query(&q1).await.is_err() {
                                 return false;
                             }
@@ -4783,9 +4837,7 @@ async fn run_dml_pipeline_suite(
                         let w = (idx - READERS) as i64;
                         for i in 0..50i64 {
                             let key = w * 500 + i;
-                            let q = format!(
-                                "UPDATE {schema}.mixrw SET v = v + 1 WHERE id = {key}"
-                            );
+                            let q = format!("UPDATE {schema}.mixrw SET v = v + 1 WHERE id = {key}");
                             if client.simple_query(&q).await.is_err() {
                                 return false;
                             }
@@ -4919,8 +4971,8 @@ pub async fn run_full_compare(
             // there's no `Send`-bound issue; `AssertUnwindSafe` covers the
             // borrows of `&str` args that don't impl `UnwindSafe` (they're
             // not actually unwind-unsafe — they're plain `&str`).
-            let outcome: std::thread::Result<()> = std::panic::catch_unwind(
-                std::panic::AssertUnwindSafe(|| {
+            let outcome: std::thread::Result<()> =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     rt.block_on(run_full_compare_inner(
                         rows,
                         basin_format,
@@ -4929,8 +4981,7 @@ pub async fn run_full_compare(
                         &claim,
                         &schema_prefix,
                     ));
-                }),
-            );
+                }));
             if let Err(panic_payload) = outcome {
                 let msg = panic_message(&panic_payload);
                 let note = format!(
@@ -5123,10 +5174,10 @@ async fn run_full_compare_inner(
     // GROUP BY produces exactly 5 groups.
     let max_amt = ((row_count - 1) as f64) * 0.5;
     let cat_rows: [(i64, &str, f64, f64); 5] = [
-        (1, "micro",  0.0,            max_amt * 0.20),
-        (2, "small",  max_amt * 0.20 + 0.001, max_amt * 0.40),
+        (1, "micro", 0.0, max_amt * 0.20),
+        (2, "small", max_amt * 0.20 + 0.001, max_amt * 0.40),
         (3, "medium", max_amt * 0.40 + 0.001, max_amt * 0.60),
-        (4, "large",  max_amt * 0.60 + 0.001, max_amt * 0.80),
+        (4, "large", max_amt * 0.60 + 0.001, max_amt * 0.80),
         (5, "xlarge", max_amt * 0.80 + 0.001, max_amt + 1.0),
     ];
     {
@@ -5171,7 +5222,9 @@ async fn run_full_compare_inner(
                 EPOCH + id
             ));
         }
-        pg.simple_query(&stmt).await.expect("pg insert events batch");
+        pg.simple_query(&stmt)
+            .await
+            .expect("pg insert events batch");
         row_idx += batch as i64;
     }
     let pg_insert_ms = pg_insert_started.elapsed().as_secs_f64() * 1000.0;
@@ -5195,7 +5248,7 @@ async fn run_full_compare_inner(
     let target_id: i64 = row_count / 2 + 7;
     let range_lo_ts = EPOCH + row_count / 4;
     let range_hi_ts = range_lo_ts + 1_000; // ~1 000-row range
-    // Used as a "rows older than N" cut for bulk UPDATE / pagination filter.
+                                           // Used as a "rows older than N" cut for bulk UPDATE / pagination filter.
     let pagination_threshold = EPOCH + row_count / 3;
     // OLAP "last N days" filter — the synthetic clock advances 1 second per
     // row, so "last 30 days" only matches anything when ROWS ≥ 30·86400. At
@@ -5369,7 +5422,9 @@ async fn run_full_compare_inner(
                 EPOCH + id
             ));
         }
-        sess.execute(&stmt).await.expect("basin insert events batch");
+        sess.execute(&stmt)
+            .await
+            .expect("basin insert events batch");
         row_idx += batch as i64;
     }
     let basin_insert_ms = basin_insert_started.elapsed().as_secs_f64() * 1000.0;
@@ -5635,10 +5690,7 @@ async fn run_full_compare_inner(
     );
     let row = |label: &str, b: f64, p: f64| {
         if b.is_nan() || p.is_nan() {
-            println!(
-                "{label:>34} {:>14} {:>14} {:>16}",
-                "SKIP", "SKIP", "-"
-            );
+            println!("{label:>34} {:>14} {:>14} {:>16}", "SKIP", "SKIP", "-");
         } else {
             println!(
                 "{label:>34} {:>14.3} {:>14.3} {:>16}",
@@ -5657,50 +5709,117 @@ async fn run_full_compare_inner(
     row("ilike_pattern_p50_ms", basin_ilike_p50, pg_ilike_p50);
     row("pagination_p50_ms", basin_page_p50, pg_page_p50);
     row("single_row_update_p50_ms", basin_upd1_p50, pg_upd1_p50);
-    row("bulk_update_ms (~1/3 rows)", basin_bulk_upd_ms, pg_bulk_upd_ms);
+    row(
+        "bulk_update_ms (~1/3 rows)",
+        basin_bulk_upd_ms,
+        pg_bulk_upd_ms,
+    );
     row("delete_where_in_10_ms", basin_delete_ms, pg_delete_ms);
-    row(&format!("bulk_insert_{rows}_ms"), basin_insert_ms, pg_insert_ms);
+    row(
+        &format!("bulk_insert_{rows}_ms"),
+        basin_insert_ms,
+        pg_insert_ms,
+    );
     row("cold_start_first_query_ms", basin_cold_ms, pg_cold_ms);
     row("count_star_p50_ms", basin_count_p50, pg_count_p50);
     row("date_trunc_groupby_p50_ms", basin_trunc_p50, pg_trunc_p50);
-    row("analytics_join_p50_ms", basin_olap_join_p50, pg_olap_join_p50);
+    row(
+        "analytics_join_p50_ms",
+        basin_olap_join_p50,
+        pg_olap_join_p50,
+    );
 
     // Extended-shape rows: print the value if Basin succeeded, else "GAP".
-    let row_opt = |label: &str, b: Option<f64>, p: f64| {
-        match b {
-            Some(bv) => println!(
-                "{label:>34} {:>14.3} {:>14.3} {:>16}",
-                bv,
-                p,
-                format!("{:.2}x", p / bv.max(1e-9))
-            ),
-            None => println!(
-                "{label:>34} {:>14} {:>14.3} {:>16}",
-                "GAP", p, "-"
-            ),
-        }
+    let row_opt = |label: &str, b: Option<f64>, p: f64| match b {
+        Some(bv) => println!(
+            "{label:>34} {:>14.3} {:>14.3} {:>16}",
+            bv,
+            p,
+            format!("{:.2}x", p / bv.max(1e-9))
+        ),
+        None => println!("{label:>34} {:>14} {:>14.3} {:>16}", "GAP", p, "-"),
     };
-    row_opt("count_distinct_p50_ms", ext.count_distinct.0, ext.count_distinct.1);
+    row_opt(
+        "count_distinct_p50_ms",
+        ext.count_distinct.0,
+        ext.count_distinct.1,
+    );
     row_opt("like_prefix_p50_ms", ext.like_prefix.0, ext.like_prefix.1);
-    row_opt("groupby_having_p50_ms", ext.groupby_having.0, ext.groupby_having.1);
+    row_opt(
+        "groupby_having_p50_ms",
+        ext.groupby_having.0,
+        ext.groupby_having.1,
+    );
     row_opt("window_lag_p50_ms", ext.window_lag.0, ext.window_lag.1);
-    row_opt("recursive_cte_fib30_p50_ms", ext.recursive_cte.0, ext.recursive_cte.1);
-    row_opt("correlated_subq_p50_ms", ext.correlated_sub.0, ext.correlated_sub.1);
-    row_opt("exists_in_where_p50_ms", ext.exists_in_where.0, ext.exists_in_where.1);
-    row_opt("join_3table_between_p50_ms", ext.join3_between.0, ext.join3_between.1);
+    row_opt(
+        "recursive_cte_fib30_p50_ms",
+        ext.recursive_cte.0,
+        ext.recursive_cte.1,
+    );
+    row_opt(
+        "correlated_subq_p50_ms",
+        ext.correlated_sub.0,
+        ext.correlated_sub.1,
+    );
+    row_opt(
+        "exists_in_where_p50_ms",
+        ext.exists_in_where.0,
+        ext.exists_in_where.1,
+    );
+    row_opt(
+        "join_3table_between_p50_ms",
+        ext.join3_between.0,
+        ext.join3_between.1,
+    );
     row_opt("union_all_p50_ms", ext.union_all.0, ext.union_all.1);
-    row_opt("order_by_nulls_last_p50_ms", ext.order_nulls_last.0, ext.order_nulls_last.1);
-    row_opt("top_n_per_group_p50_ms", ext.top_n_per_group.0, ext.top_n_per_group.1);
-    row_opt("numeric_range_p50_ms", ext.numeric_range.0, ext.numeric_range.1);
+    row_opt(
+        "order_by_nulls_last_p50_ms",
+        ext.order_nulls_last.0,
+        ext.order_nulls_last.1,
+    );
+    row_opt(
+        "top_n_per_group_p50_ms",
+        ext.top_n_per_group.0,
+        ext.top_n_per_group.1,
+    );
+    row_opt(
+        "numeric_range_p50_ms",
+        ext.numeric_range.0,
+        ext.numeric_range.1,
+    );
 
     // JSONB-shape rows: cold + steady-state pairs for the read shapes, then
     // the write shape labeled as structural.
-    row_opt("jsonb_get_key_cold_p50_ms", jb.get_key_cold.0, jb.get_key_cold.1);
-    row_opt("jsonb_get_key_steady_p50_ms", jb.get_key_steady.0, jb.get_key_steady.1);
-    row_opt("jsonb_get_text_cold_p50_ms", jb.get_text_cold.0, jb.get_text_cold.1);
-    row_opt("jsonb_get_text_steady_p50_ms", jb.get_text_steady.0, jb.get_text_steady.1);
-    row_opt("jsonb_deep_path_cold_p50_ms", jb.deep_path_cold.0, jb.deep_path_cold.1);
-    row_opt("jsonb_deep_path_steady_p50_ms", jb.deep_path_steady.0, jb.deep_path_steady.1);
+    row_opt(
+        "jsonb_get_key_cold_p50_ms",
+        jb.get_key_cold.0,
+        jb.get_key_cold.1,
+    );
+    row_opt(
+        "jsonb_get_key_steady_p50_ms",
+        jb.get_key_steady.0,
+        jb.get_key_steady.1,
+    );
+    row_opt(
+        "jsonb_get_text_cold_p50_ms",
+        jb.get_text_cold.0,
+        jb.get_text_cold.1,
+    );
+    row_opt(
+        "jsonb_get_text_steady_p50_ms",
+        jb.get_text_steady.0,
+        jb.get_text_steady.1,
+    );
+    row_opt(
+        "jsonb_deep_path_cold_p50_ms",
+        jb.deep_path_cold.0,
+        jb.deep_path_cold.1,
+    );
+    row_opt(
+        "jsonb_deep_path_steady_p50_ms",
+        jb.deep_path_steady.0,
+        jb.deep_path_steady.1,
+    );
     row_opt("jsonb_contains_no_gin_p50_ms", jb.contains.0, jb.contains.1);
     row_opt(
         "jsonb_contains_with_gin_p50_ms",
@@ -5718,90 +5837,290 @@ async fn run_full_compare_inner(
             "gin_at_contains_speedup_x",
             basin_ratio,
             pg_ratio,
-            if basin_ratio >= pg_ratio { "basin >= pg" } else { "basin < pg" }
+            if basin_ratio >= pg_ratio {
+                "basin >= pg"
+            } else {
+                "basin < pg"
+            }
         );
     }
     row_opt("jsonb_key_exists_p50_ms", jb.key_exists.0, jb.key_exists.1);
     row_opt("jsonb_path_get_p50_ms", jb.path_get.0, jb.path_get.1);
-    row_opt("jsonb_array_length_p50_ms", jb.array_length.0, jb.array_length.1);
+    row_opt(
+        "jsonb_array_length_p50_ms",
+        jb.array_length.0,
+        jb.array_length.1,
+    );
     row_opt("jsonb_typeof_p50_ms", jb.typeof_fn.0, jb.typeof_fn.1);
     row_opt("jsonb_filter_agg_p50_ms", jb.filter_agg.0, jb.filter_agg.1);
-    row_opt("jsonb_set_update_structural_cow_ms", jb.jsonb_set_update.0, jb.jsonb_set_update.1);
+    row_opt(
+        "jsonb_set_update_structural_cow_ms",
+        jb.jsonb_set_update.0,
+        jb.jsonb_set_update.1,
+    );
 
     // Robustness-breadth rows (#38-#62) — same Option-or-GAP rendering.
-    row_opt("concurrent_insert_8x1000_ms", rb.concurrent_insert.0, rb.concurrent_insert.1);
-    row_opt("concurrent_select_16_ms", rb.concurrent_select.0, rb.concurrent_select.1);
-    row_opt("rmw_contention_8_ms", rb.rmw_contention.0, rb.rmw_contention.1);
-    row_opt("txn_insert_x100_ms", rb.txn_insert_throughput.0, rb.txn_insert_throughput.1);
-    row_opt("rollback_drops_rows_ms", rb.rollback_drops_rows.0, rb.rollback_drops_rows.1);
-    row_opt("savepoint_rollback_ms", rb.savepoint_rollback.0, rb.savepoint_rollback.1);
-    row_opt("snapshot_isolation_ms", rb.snapshot_isolation.0, rb.snapshot_isolation.1);
+    row_opt(
+        "concurrent_insert_8x1000_ms",
+        rb.concurrent_insert.0,
+        rb.concurrent_insert.1,
+    );
+    row_opt(
+        "concurrent_select_16_ms",
+        rb.concurrent_select.0,
+        rb.concurrent_select.1,
+    );
+    row_opt(
+        "rmw_contention_8_ms",
+        rb.rmw_contention.0,
+        rb.rmw_contention.1,
+    );
+    row_opt(
+        "txn_insert_x100_ms",
+        rb.txn_insert_throughput.0,
+        rb.txn_insert_throughput.1,
+    );
+    row_opt(
+        "rollback_drops_rows_ms",
+        rb.rollback_drops_rows.0,
+        rb.rollback_drops_rows.1,
+    );
+    row_opt(
+        "savepoint_rollback_ms",
+        rb.savepoint_rollback.0,
+        rb.savepoint_rollback.1,
+    );
+    row_opt(
+        "snapshot_isolation_ms",
+        rb.snapshot_isolation.0,
+        rb.snapshot_isolation.1,
+    );
     row_opt("where_is_null_p50_ms", rb.is_null.0, rb.is_null.1);
-    row_opt("where_eq_null_3vl_p50_ms", rb.eq_null_3vl.0, rb.eq_null_3vl.1);
-    row_opt("count_col_vs_star_p50_ms", rb.count_col_vs_star.0, rb.count_col_vs_star.1);
+    row_opt(
+        "where_eq_null_3vl_p50_ms",
+        rb.eq_null_3vl.0,
+        rb.eq_null_3vl.1,
+    );
+    row_opt(
+        "count_col_vs_star_p50_ms",
+        rb.count_col_vs_star.0,
+        rb.count_col_vs_star.1,
+    );
     row_opt("not_in_null_p50_ms", rb.not_in_null.0, rb.not_in_null.1);
     row_opt("not_exists_p50_ms", rb.not_exists.0, rb.not_exists.1);
-    row_opt("scalar_subquery_p50_ms", rb.scalar_subquery.0, rb.scalar_subquery.1);
-    row_opt("derived_table_p50_ms", rb.derived_table.0, rb.derived_table.1);
+    row_opt(
+        "scalar_subquery_p50_ms",
+        rb.scalar_subquery.0,
+        rb.scalar_subquery.1,
+    );
+    row_opt(
+        "derived_table_p50_ms",
+        rb.derived_table.0,
+        rb.derived_table.1,
+    );
     row_opt("intersect_p50_ms", rb.intersect.0, rb.intersect.1);
     row_opt("except_p50_ms", rb.except.0, rb.except.1);
     row_opt("union_dedup_p50_ms", rb.union_dedup.0, rb.union_dedup.1);
-    row_opt("array_agg_orderby_p50_ms", rb.array_agg_orderby.0, rb.array_agg_orderby.1);
+    row_opt(
+        "array_agg_orderby_p50_ms",
+        rb.array_agg_orderby.0,
+        rb.array_agg_orderby.1,
+    );
     row_opt("string_agg_p50_ms", rb.string_agg.0, rb.string_agg.1);
     row_opt("count_filter_p50_ms", rb.count_filter.0, rb.count_filter.1);
-    row_opt("case_10_branches_p50_ms", rb.case_10_branches.0, rb.case_10_branches.1);
-    row_opt("regexp_string_fns_p50_ms", rb.regexp_string_fns.0, rb.regexp_string_fns.1);
-    row_opt("multicol_order_mixed_p50_ms", rb.multicol_order_mixed.0, rb.multicol_order_mixed.1);
+    row_opt(
+        "case_10_branches_p50_ms",
+        rb.case_10_branches.0,
+        rb.case_10_branches.1,
+    );
+    row_opt(
+        "regexp_string_fns_p50_ms",
+        rb.regexp_string_fns.0,
+        rb.regexp_string_fns.1,
+    );
+    row_opt(
+        "multicol_order_mixed_p50_ms",
+        rb.multicol_order_mixed.0,
+        rb.multicol_order_mixed.1,
+    );
     row_opt("lateral_join_p50_ms", rb.lateral_join.0, rb.lateral_join.1);
     row_opt("any_array_p50_ms", rb.any_array.0, rb.any_array.1);
 
     // OLTP-extra rows (#63-#77) — same Option-or-GAP rendering.
     row_opt("upsert_p50_ms", oe.upsert.0, oe.upsert.1);
-    row_opt("large_in_list_100_p50_ms", oe.large_in_list.0, oe.large_in_list.1);
-    row_opt("rank_partition_p50_ms", oe.rank_partition.0, oe.rank_partition.1);
+    row_opt(
+        "large_in_list_100_p50_ms",
+        oe.large_in_list.0,
+        oe.large_in_list.1,
+    );
+    row_opt(
+        "rank_partition_p50_ms",
+        oe.rank_partition.0,
+        oe.rank_partition.1,
+    );
     row_opt("distinct_on_p50_ms", oe.distinct_on.0, oe.distinct_on.1);
-    row_opt("conditional_update_p50_ms", oe.conditional_update.0, oe.conditional_update.1);
-    row_opt("composite_range_p50_ms", oe.composite_range.0, oe.composite_range.1);
-    row_opt("json_eq_lookup_p50_ms", oe.json_eq_lookup.0, oe.json_eq_lookup.1);
-    row_opt("string_concat_p50_ms", oe.string_concat.0, oe.string_concat.1);
+    row_opt(
+        "conditional_update_p50_ms",
+        oe.conditional_update.0,
+        oe.conditional_update.1,
+    );
+    row_opt(
+        "composite_range_p50_ms",
+        oe.composite_range.0,
+        oe.composite_range.1,
+    );
+    row_opt(
+        "json_eq_lookup_p50_ms",
+        oe.json_eq_lookup.0,
+        oe.json_eq_lookup.1,
+    );
+    row_opt(
+        "string_concat_p50_ms",
+        oe.string_concat.0,
+        oe.string_concat.1,
+    );
     row_opt("hour_bucket_p50_ms", oe.hour_bucket.0, oe.hour_bucket.1);
     row_opt("window_lead_p50_ms", oe.window_lead.0, oe.window_lead.1);
-    row_opt("keyset_pagination_p50_ms", oe.keyset_pagination.0, oe.keyset_pagination.1);
-    row_opt("limit_no_order_p50_ms", oe.limit_no_order.0, oe.limit_no_order.1);
-    row_opt("insert_returning_p50_ms", oe.insert_returning.0, oe.insert_returning.1);
-    row_opt("update_returning_p50_ms", oe.update_returning.0, oe.update_returning.1);
-    row_opt("bulk_upsert_50_p50_ms", oe.bulk_upsert_50.0, oe.bulk_upsert_50.1);
+    row_opt(
+        "keyset_pagination_p50_ms",
+        oe.keyset_pagination.0,
+        oe.keyset_pagination.1,
+    );
+    row_opt(
+        "limit_no_order_p50_ms",
+        oe.limit_no_order.0,
+        oe.limit_no_order.1,
+    );
+    row_opt(
+        "insert_returning_p50_ms",
+        oe.insert_returning.0,
+        oe.insert_returning.1,
+    );
+    row_opt(
+        "update_returning_p50_ms",
+        oe.update_returning.0,
+        oe.update_returning.1,
+    );
+    row_opt(
+        "bulk_upsert_50_p50_ms",
+        oe.bulk_upsert_50.0,
+        oe.bulk_upsert_50.1,
+    );
     // OLTP-extra batch 2 (#90-#95) — same Option-or-GAP rendering.
-    row_opt("select_for_update_txn_ms", oe.select_for_update.0, oe.select_for_update.1);
-    row_opt("bulk_delete_range_ms", oe.bulk_delete_range.0, oe.bulk_delete_range.1);
-    row_opt("fk_cascade_delete_ms", oe.fk_cascade_delete.0, oe.fk_cascade_delete.1);
+    row_opt(
+        "select_for_update_txn_ms",
+        oe.select_for_update.0,
+        oe.select_for_update.1,
+    );
+    row_opt(
+        "bulk_delete_range_ms",
+        oe.bulk_delete_range.0,
+        oe.bulk_delete_range.1,
+    );
+    row_opt(
+        "fk_cascade_delete_ms",
+        oe.fk_cascade_delete.0,
+        oe.fk_cascade_delete.1,
+    );
     row_opt("in_list_1000_p50_ms", oe.in_list_1000.0, oe.in_list_1000.1);
-    row_opt("count_filtered_low_card_p50_ms", oe.count_filtered_low_card.0, oe.count_filtered_low_card.1);
-    row_opt("point_join_lookup_p50_ms", oe.point_join_lookup.0, oe.point_join_lookup.1);
+    row_opt(
+        "count_filtered_low_card_p50_ms",
+        oe.count_filtered_low_card.0,
+        oe.count_filtered_low_card.1,
+    );
+    row_opt(
+        "point_join_lookup_p50_ms",
+        oe.point_join_lookup.0,
+        oe.point_join_lookup.1,
+    );
 
     // OLAP rows (#78-#89) — same Option-or-GAP rendering.
     row_opt("rollup_agg_p50_ms", ol.rollup_agg.0, ol.rollup_agg.1);
     row_opt("cube_agg_p50_ms", ol.cube_agg.0, ol.cube_agg.1);
-    row_opt("grouping_sets_p50_ms", ol.grouping_sets.0, ol.grouping_sets.1);
-    row_opt("percentile_cont_p50_ms", ol.percentile_cont.0, ol.percentile_cont.1);
-    row_opt("window_frame_rows_p50_ms", ol.window_frame_rows.0, ol.window_frame_rows.1);
-    row_opt("topn_per_group_window_p50_ms", ol.topn_per_group_window.0, ol.topn_per_group_window.1);
-    row_opt("high_card_groupby_p50_ms", ol.high_card_groupby.0, ol.high_card_groupby.1);
-    row_opt("approx_distinct_p50_ms", ol.approx_distinct.0, ol.approx_distinct.1);
-    row_opt("full_sort_high_card_p50_ms", ol.full_sort_high_card.0, ol.full_sort_high_card.1);
+    row_opt(
+        "grouping_sets_p50_ms",
+        ol.grouping_sets.0,
+        ol.grouping_sets.1,
+    );
+    row_opt(
+        "percentile_cont_p50_ms",
+        ol.percentile_cont.0,
+        ol.percentile_cont.1,
+    );
+    row_opt(
+        "window_frame_rows_p50_ms",
+        ol.window_frame_rows.0,
+        ol.window_frame_rows.1,
+    );
+    row_opt(
+        "topn_per_group_window_p50_ms",
+        ol.topn_per_group_window.0,
+        ol.topn_per_group_window.1,
+    );
+    row_opt(
+        "high_card_groupby_p50_ms",
+        ol.high_card_groupby.0,
+        ol.high_card_groupby.1,
+    );
+    row_opt(
+        "approx_distinct_p50_ms",
+        ol.approx_distinct.0,
+        ol.approx_distinct.1,
+    );
+    row_opt(
+        "full_sort_high_card_p50_ms",
+        ol.full_sort_high_card.0,
+        ol.full_sort_high_card.1,
+    );
     row_opt("case_pivot_p50_ms", ol.case_pivot.0, ol.case_pivot.1);
-    row_opt("star_join_agg_p50_ms", ol.star_join_agg.0, ol.star_join_agg.1);
-    row_opt("delta_window_lag_filter_p50_ms", ol.delta_window_lag_filter.0, ol.delta_window_lag_filter.1);
+    row_opt(
+        "star_join_agg_p50_ms",
+        ol.star_join_agg.0,
+        ol.star_join_agg.1,
+    );
+    row_opt(
+        "delta_window_lag_filter_p50_ms",
+        ol.delta_window_lag_filter.0,
+        ol.delta_window_lag_filter.1,
+    );
 
     // DML-pipeline rows (#96-#103) — same Option-or-GAP rendering.
-    row_opt("large_result_stream_100k_p50_ms", dp.large_result_stream.0, dp.large_result_stream.1);
-    row_opt("prepared_insert_100x_ms", dp.prepared_insert_100.0, dp.prepared_insert_100.1);
+    row_opt(
+        "large_result_stream_100k_p50_ms",
+        dp.large_result_stream.0,
+        dp.large_result_stream.1,
+    );
+    row_opt(
+        "prepared_insert_100x_ms",
+        dp.prepared_insert_100.0,
+        dp.prepared_insert_100.1,
+    );
     row_opt("merge_upsert_p50_ms", dp.merge_upsert.0, dp.merge_upsert.1);
-    row_opt("bulk_upsert_1000_p50_ms", dp.bulk_upsert_1000.0, dp.bulk_upsert_1000.1);
-    row_opt("insert_select_10k_ms", dp.insert_select_10k.0, dp.insert_select_10k.1);
-    row_opt("update_from_join_p50_ms", dp.update_from_join.0, dp.update_from_join.1);
-    row_opt("delete_using_join_ms", dp.delete_using_join.0, dp.delete_using_join.1);
-    row_opt("mixed_rw_8r4w_wall_ms", dp.mixed_rw_concurrency.0, dp.mixed_rw_concurrency.1);
+    row_opt(
+        "bulk_upsert_1000_p50_ms",
+        dp.bulk_upsert_1000.0,
+        dp.bulk_upsert_1000.1,
+    );
+    row_opt(
+        "insert_select_10k_ms",
+        dp.insert_select_10k.0,
+        dp.insert_select_10k.1,
+    );
+    row_opt(
+        "update_from_join_p50_ms",
+        dp.update_from_join.0,
+        dp.update_from_join.1,
+    );
+    row_opt(
+        "delete_using_join_ms",
+        dp.delete_using_join.0,
+        dp.delete_using_join.1,
+    );
+    row_opt(
+        "mixed_rw_8r4w_wall_ms",
+        dp.mixed_rw_concurrency.0,
+        dp.mixed_rw_concurrency.1,
+    );
     // Derived combined throughput for the mixed shape (fixed 600-op fan-out):
     // ops/sec = total ops / joined wall-clock. Print-only — the emitted
     // metric stays wall-clock ms so `which_wins` keeps its lower-is-better
@@ -5828,36 +6147,35 @@ async fn run_full_compare_inner(
     // with " (scale-skipped)" and leave both fields as NaN so serde emits
     // null (dashboard renders as `—`). `which_wins` and the ratio text are
     // both skipped — there's no meaningful comparison to draw.
-    let mk = |label: &str, basin: f64, postgres: f64, unit: &str, with_ratio: bool| -> CompareMetric {
-        if basin.is_nan() || postgres.is_nan() {
-            return CompareMetric {
-                label: format!("{label} (scale-skipped)"),
-                basin: f64::NAN,
-                postgres: f64::NAN,
+    let mk =
+        |label: &str, basin: f64, postgres: f64, unit: &str, with_ratio: bool| -> CompareMetric {
+            if basin.is_nan() || postgres.is_nan() {
+                return CompareMetric {
+                    label: format!("{label} (scale-skipped)"),
+                    basin: f64::NAN,
+                    postgres: f64::NAN,
+                    unit: unit.into(),
+                    better: WhichWins::Tie,
+                    ratio_text: Some("skipped: too expensive at this scale".into()),
+                };
+            }
+            CompareMetric {
+                label: label.into(),
+                basin,
+                postgres,
                 unit: unit.into(),
-                better: WhichWins::Tie,
-                ratio_text: Some("skipped: too expensive at this scale".into()),
-            };
-        }
-        CompareMetric {
-            label: label.into(),
-            basin,
-            postgres,
-            unit: unit.into(),
-            better: which_wins(basin, postgres),
-            ratio_text: if with_ratio {
-                Some(format!("pg / basin = {:.2}x", postgres / basin.max(1e-9)))
-            } else {
-                None
-            },
-        }
-    };
+                better: which_wins(basin, postgres),
+                ratio_text: if with_ratio {
+                    Some(format!("pg / basin = {:.2}x", postgres / basin.max(1e-9)))
+                } else {
+                    None
+                },
+            }
+        };
 
     let bulk_label = format!("Bulk UPDATE (~{bulk_update_rows} rows)");
     let insert_label = format!("Bulk INSERT {rows} rows");
-    let olap_label = format!(
-        "Analytics JOIN+WHERE (last {olap_window}s window)"
-    );
+    let olap_label = format!("Analytics JOIN+WHERE (last {olap_window}s window)");
 
     // mk_ext: extended-shape variant. If Basin succeeded → normal row.
     // If Basin errored (Option::None) → label gets a "(basin gap)" suffix,
@@ -5904,38 +6222,154 @@ async fn run_full_compare_inner(
 
     let metrics = vec![
         // On-disk
-        mk("On-disk bytes (users + events)", basin_disk_f, pg_disk_f, "bytes", true),
+        mk(
+            "On-disk bytes (users + events)",
+            basin_disk_f,
+            pg_disk_f,
+            "bytes",
+            true,
+        ),
         // SaaS / OLTP
         mk("Point query p50", basin_point_p50, pg_point_p50, "ms", true),
         mk("Point query p99", basin_point_p99, pg_point_p99, "ms", true),
-        mk("Range scan p50 (~1k rows)", basin_range_p50, pg_range_p50, "ms", true),
+        mk(
+            "Range scan p50 (~1k rows)",
+            basin_range_p50,
+            pg_range_p50,
+            "ms",
+            true,
+        ),
         mk("Range scan p99", basin_range_p99, pg_range_p99, "ms", true),
-        mk("Aggregate GROUP BY user_id p50", basin_agg_p50, pg_agg_p50, "ms", true),
-        mk("2-table JOIN GROUP BY p50", basin_join_p50, pg_join_p50, "ms", true),
-        mk("ILIKE '%@gmail.com' p50", basin_ilike_p50, pg_ilike_p50, "ms", true),
-        mk("Pagination ORDER BY LIMIT/OFFSET p50", basin_page_p50, pg_page_p50, "ms", true),
-        mk("Single-row UPDATE p50", basin_upd1_p50, pg_upd1_p50, "ms", true),
+        mk(
+            "Aggregate GROUP BY user_id p50",
+            basin_agg_p50,
+            pg_agg_p50,
+            "ms",
+            true,
+        ),
+        mk(
+            "2-table JOIN GROUP BY p50",
+            basin_join_p50,
+            pg_join_p50,
+            "ms",
+            true,
+        ),
+        mk(
+            "ILIKE '%@gmail.com' p50",
+            basin_ilike_p50,
+            pg_ilike_p50,
+            "ms",
+            true,
+        ),
+        mk(
+            "Pagination ORDER BY LIMIT/OFFSET p50",
+            basin_page_p50,
+            pg_page_p50,
+            "ms",
+            true,
+        ),
+        mk(
+            "Single-row UPDATE p50",
+            basin_upd1_p50,
+            pg_upd1_p50,
+            "ms",
+            true,
+        ),
         mk(&bulk_label, basin_bulk_upd_ms, pg_bulk_upd_ms, "ms", false),
-        mk("DELETE WHERE id IN (10 rows)", basin_delete_ms, pg_delete_ms, "ms", false),
+        mk(
+            "DELETE WHERE id IN (10 rows)",
+            basin_delete_ms,
+            pg_delete_ms,
+            "ms",
+            false,
+        ),
         mk(&insert_label, basin_insert_ms, pg_insert_ms, "ms", false),
-        mk("Cold-start first query", basin_cold_ms, pg_cold_ms, "ms", true),
+        mk(
+            "Cold-start first query",
+            basin_cold_ms,
+            pg_cold_ms,
+            "ms",
+            true,
+        ),
         // OLAP
-        mk("COUNT(*) full table p50", basin_count_p50, pg_count_p50, "ms", true),
-        mk("DATE_TRUNC day + SUM GROUP BY p50", basin_trunc_p50, pg_trunc_p50, "ms", true),
-        mk(&olap_label, basin_olap_join_p50, pg_olap_join_p50, "ms", true),
+        mk(
+            "COUNT(*) full table p50",
+            basin_count_p50,
+            pg_count_p50,
+            "ms",
+            true,
+        ),
+        mk(
+            "DATE_TRUNC day + SUM GROUP BY p50",
+            basin_trunc_p50,
+            pg_trunc_p50,
+            "ms",
+            true,
+        ),
+        mk(
+            &olap_label,
+            basin_olap_join_p50,
+            pg_olap_join_p50,
+            "ms",
+            true,
+        ),
         // Extended shapes (perf-coverage probes)
-        mk_ext("COUNT(DISTINCT user_id) p50", ext.count_distinct.0, ext.count_distinct.1),
-        mk_ext("LIKE 'pending%' prefix p50", ext.like_prefix.0, ext.like_prefix.1),
-        mk_ext("Multi-col GROUP BY + HAVING p50", ext.groupby_having.0, ext.groupby_having.1),
-        mk_ext("Window LAG OVER PARTITION p50", ext.window_lag.0, ext.window_lag.1),
-        mk_ext("Recursive CTE Fibonacci(30) p50", ext.recursive_cte.0, ext.recursive_cte.1),
-        mk_ext("Correlated subquery in SELECT p50", ext.correlated_sub.0, ext.correlated_sub.1),
-        mk_ext("EXISTS in WHERE p50", ext.exists_in_where.0, ext.exists_in_where.1),
-        mk_ext("3-table JOIN BETWEEN p50", ext.join3_between.0, ext.join3_between.1),
+        mk_ext(
+            "COUNT(DISTINCT user_id) p50",
+            ext.count_distinct.0,
+            ext.count_distinct.1,
+        ),
+        mk_ext(
+            "LIKE 'pending%' prefix p50",
+            ext.like_prefix.0,
+            ext.like_prefix.1,
+        ),
+        mk_ext(
+            "Multi-col GROUP BY + HAVING p50",
+            ext.groupby_having.0,
+            ext.groupby_having.1,
+        ),
+        mk_ext(
+            "Window LAG OVER PARTITION p50",
+            ext.window_lag.0,
+            ext.window_lag.1,
+        ),
+        mk_ext(
+            "Recursive CTE Fibonacci(30) p50",
+            ext.recursive_cte.0,
+            ext.recursive_cte.1,
+        ),
+        mk_ext(
+            "Correlated subquery in SELECT p50",
+            ext.correlated_sub.0,
+            ext.correlated_sub.1,
+        ),
+        mk_ext(
+            "EXISTS in WHERE p50",
+            ext.exists_in_where.0,
+            ext.exists_in_where.1,
+        ),
+        mk_ext(
+            "3-table JOIN BETWEEN p50",
+            ext.join3_between.0,
+            ext.join3_between.1,
+        ),
         mk_ext("UNION ALL two scans p50", ext.union_all.0, ext.union_all.1),
-        mk_ext("ORDER BY NULLS LAST + LIMIT p50", ext.order_nulls_last.0, ext.order_nulls_last.1),
-        mk_ext("Top-N per group (MAX) p50", ext.top_n_per_group.0, ext.top_n_per_group.1),
-        mk_ext("Numeric range BETWEEN p50", ext.numeric_range.0, ext.numeric_range.1),
+        mk_ext(
+            "ORDER BY NULLS LAST + LIMIT p50",
+            ext.order_nulls_last.0,
+            ext.order_nulls_last.1,
+        ),
+        mk_ext(
+            "Top-N per group (MAX) p50",
+            ext.top_n_per_group.0,
+            ext.top_n_per_group.1,
+        ),
+        mk_ext(
+            "Numeric range BETWEEN p50",
+            ext.numeric_range.0,
+            ext.numeric_range.1,
+        ),
         // JSONB document-store shapes — first-class JSONB head-to-head vs PG.
         // Uses the same `mk_ext` Option-or-gap helper as #16-#27; "(basin gap)"
         // suffix and -1.0 sentinel surface unsupported ops cleanly.
@@ -5949,13 +6383,41 @@ async fn run_full_compare_inner(
         // the cost after the background compactor has run (which every deployment
         // experiences). PG's two numbers will typically be equal (binary JSONB
         // has no warm-up transition); that equality is visible in the data.
-        mk_ext("JSONB -> get key p50 (cold, first-query)", jb.get_key_cold.0, jb.get_key_cold.1),
-        mk_ext("JSONB -> get key p50 (steady-state, promoted)", jb.get_key_steady.0, jb.get_key_steady.1),
-        mk_ext("JSONB ->> get text p50 (cold, first-query)", jb.get_text_cold.0, jb.get_text_cold.1),
-        mk_ext("JSONB ->> get text p50 (steady-state, promoted)", jb.get_text_steady.0, jb.get_text_steady.1),
-        mk_ext("JSONB -> deep path p50 (cold, first-query)", jb.deep_path_cold.0, jb.deep_path_cold.1),
-        mk_ext("JSONB -> deep path p50 (steady-state, promoted)", jb.deep_path_steady.0, jb.deep_path_steady.1),
-        mk_ext("JSONB @> contains p50 (no GIN index)", jb.contains.0, jb.contains.1),
+        mk_ext(
+            "JSONB -> get key p50 (cold, first-query)",
+            jb.get_key_cold.0,
+            jb.get_key_cold.1,
+        ),
+        mk_ext(
+            "JSONB -> get key p50 (steady-state, promoted)",
+            jb.get_key_steady.0,
+            jb.get_key_steady.1,
+        ),
+        mk_ext(
+            "JSONB ->> get text p50 (cold, first-query)",
+            jb.get_text_cold.0,
+            jb.get_text_cold.1,
+        ),
+        mk_ext(
+            "JSONB ->> get text p50 (steady-state, promoted)",
+            jb.get_text_steady.0,
+            jb.get_text_steady.1,
+        ),
+        mk_ext(
+            "JSONB -> deep path p50 (cold, first-query)",
+            jb.deep_path_cold.0,
+            jb.deep_path_cold.1,
+        ),
+        mk_ext(
+            "JSONB -> deep path p50 (steady-state, promoted)",
+            jb.deep_path_steady.0,
+            jb.deep_path_steady.1,
+        ),
+        mk_ext(
+            "JSONB @> contains p50 (no GIN index)",
+            jb.contains.0,
+            jb.contains.1,
+        ),
         // Paired with the no-index row above + the derived ratio below.
         // PG always uses GIN here; Basin uses GIN after #105 lands the
         // probe→prune wiring. Pre-#105 the timing barely moves and the
@@ -6002,95 +6464,347 @@ async fn run_full_compare_inner(
         },
         mk_ext("JSONB ? key exists p50", jb.key_exists.0, jb.key_exists.1),
         mk_ext("JSONB #> path get p50", jb.path_get.0, jb.path_get.1),
-        mk_ext("JSONB jsonb_array_length(tags) p50", jb.array_length.0, jb.array_length.1),
-        mk_ext("JSONB jsonb_typeof(metadata) p50", jb.typeof_fn.0, jb.typeof_fn.1),
-        mk_ext("JSONB filter+agg (GROUP BY ->>category) p50", jb.filter_agg.0, jb.filter_agg.1),
+        mk_ext(
+            "JSONB jsonb_array_length(tags) p50",
+            jb.array_length.0,
+            jb.array_length.1,
+        ),
+        mk_ext(
+            "JSONB jsonb_typeof(metadata) p50",
+            jb.typeof_fn.0,
+            jb.typeof_fn.1,
+        ),
+        mk_ext(
+            "JSONB filter+agg (GROUP BY ->>category) p50",
+            jb.filter_agg.0,
+            jb.filter_agg.1,
+        ),
         // #37 is a structural cost (copy-on-write JSONB rewrite), not a tunable
         // performance regression. The label is explicit so readers understand.
-        mk_ext("JSONB jsonb_set UPDATE (10 rows, structural: CoW rewrite)", jb.jsonb_set_update.0, jb.jsonb_set_update.1),
+        mk_ext(
+            "JSONB jsonb_set UPDATE (10 rows, structural: CoW rewrite)",
+            jb.jsonb_set_update.0,
+            jb.jsonb_set_update.1,
+        ),
         // Robustness-breadth shapes (#38-#62) — same Option-or-gap helper.
         // CONCURRENT / TXN (7)
-        mk_ext("Concurrent INSERT 8x1000 rows", rb.concurrent_insert.0, rb.concurrent_insert.1),
-        mk_ext("Concurrent SELECT 16 sessions mixed", rb.concurrent_select.0, rb.concurrent_select.1),
-        mk_ext("Read-modify-write contention 8 sessions", rb.rmw_contention.0, rb.rmw_contention.1),
-        mk_ext("BEGIN; INSERT x100; COMMIT throughput", rb.txn_insert_throughput.0, rb.txn_insert_throughput.1),
-        mk_ext("ROLLBACK drops rows (txn correctness)", rb.rollback_drops_rows.0, rb.rollback_drops_rows.1),
-        mk_ext("Savepoint nest + ROLLBACK TO", rb.savepoint_rollback.0, rb.savepoint_rollback.1),
-        mk_ext("Long-txn snapshot isolation", rb.snapshot_isolation.0, rb.snapshot_isolation.1),
+        mk_ext(
+            "Concurrent INSERT 8x1000 rows",
+            rb.concurrent_insert.0,
+            rb.concurrent_insert.1,
+        ),
+        mk_ext(
+            "Concurrent SELECT 16 sessions mixed",
+            rb.concurrent_select.0,
+            rb.concurrent_select.1,
+        ),
+        mk_ext(
+            "Read-modify-write contention 8 sessions",
+            rb.rmw_contention.0,
+            rb.rmw_contention.1,
+        ),
+        mk_ext(
+            "BEGIN; INSERT x100; COMMIT throughput",
+            rb.txn_insert_throughput.0,
+            rb.txn_insert_throughput.1,
+        ),
+        mk_ext(
+            "ROLLBACK drops rows (txn correctness)",
+            rb.rollback_drops_rows.0,
+            rb.rollback_drops_rows.1,
+        ),
+        mk_ext(
+            "Savepoint nest + ROLLBACK TO",
+            rb.savepoint_rollback.0,
+            rb.savepoint_rollback.1,
+        ),
+        mk_ext(
+            "Long-txn snapshot isolation",
+            rb.snapshot_isolation.0,
+            rb.snapshot_isolation.1,
+        ),
         // NULL / 3VL (3)
         mk_ext("WHERE x IS NULL", rb.is_null.0, rb.is_null.1),
-        mk_ext("WHERE x = NULL returns 0 (3VL)", rb.eq_null_3vl.0, rb.eq_null_3vl.1),
-        mk_ext("COUNT(col) vs COUNT(*) NULL handling", rb.count_col_vs_star.0, rb.count_col_vs_star.1),
+        mk_ext(
+            "WHERE x = NULL returns 0 (3VL)",
+            rb.eq_null_3vl.0,
+            rb.eq_null_3vl.1,
+        ),
+        mk_ext(
+            "COUNT(col) vs COUNT(*) NULL handling",
+            rb.count_col_vs_star.0,
+            rb.count_col_vs_star.1,
+        ),
         // SUBQUERY (4)
-        mk_ext("NOT IN (NULL in subquery, 3VL)", rb.not_in_null.0, rb.not_in_null.1),
+        mk_ext(
+            "NOT IN (NULL in subquery, 3VL)",
+            rb.not_in_null.0,
+            rb.not_in_null.1,
+        ),
         mk_ext("NOT EXISTS", rb.not_exists.0, rb.not_exists.1),
-        mk_ext("Scalar subquery in SELECT list", rb.scalar_subquery.0, rb.scalar_subquery.1),
-        mk_ext("Derived table (subquery in FROM)", rb.derived_table.0, rb.derived_table.1),
+        mk_ext(
+            "Scalar subquery in SELECT list",
+            rb.scalar_subquery.0,
+            rb.scalar_subquery.1,
+        ),
+        mk_ext(
+            "Derived table (subquery in FROM)",
+            rb.derived_table.0,
+            rb.derived_table.1,
+        ),
         // SET OPS (3)
         mk_ext("INTERSECT", rb.intersect.0, rb.intersect.1),
         mk_ext("EXCEPT", rb.except.0, rb.except.1),
         mk_ext("UNION (dedup)", rb.union_dedup.0, rb.union_dedup.1),
         // AGG / STRING / ARRAY (5)
-        mk_ext("ARRAY_AGG + ORDER BY in aggregate", rb.array_agg_orderby.0, rb.array_agg_orderby.1),
+        mk_ext(
+            "ARRAY_AGG + ORDER BY in aggregate",
+            rb.array_agg_orderby.0,
+            rb.array_agg_orderby.1,
+        ),
         mk_ext("STRING_AGG", rb.string_agg.0, rb.string_agg.1),
-        mk_ext("COUNT(*) FILTER (WHERE ...)", rb.count_filter.0, rb.count_filter.1),
-        mk_ext("CASE WHEN 10 branches", rb.case_10_branches.0, rb.case_10_branches.1),
-        mk_ext("regexp_match / substring / split_part", rb.regexp_string_fns.0, rb.regexp_string_fns.1),
+        mk_ext(
+            "COUNT(*) FILTER (WHERE ...)",
+            rb.count_filter.0,
+            rb.count_filter.1,
+        ),
+        mk_ext(
+            "CASE WHEN 10 branches",
+            rb.case_10_branches.0,
+            rb.case_10_branches.1,
+        ),
+        mk_ext(
+            "regexp_match / substring / split_part",
+            rb.regexp_string_fns.0,
+            rb.regexp_string_fns.1,
+        ),
         // RANGE / INDEX (3)
-        mk_ext("Multi-col ORDER BY mixed ASC/DESC + LIMIT", rb.multicol_order_mixed.0, rb.multicol_order_mixed.1),
-        mk_ext("LATERAL JOIN (correlated derived table)", rb.lateral_join.0, rb.lateral_join.1),
+        mk_ext(
+            "Multi-col ORDER BY mixed ASC/DESC + LIMIT",
+            rb.multicol_order_mixed.0,
+            rb.multicol_order_mixed.1,
+        ),
+        mk_ext(
+            "LATERAL JOIN (correlated derived table)",
+            rb.lateral_join.0,
+            rb.lateral_join.1,
+        ),
         mk_ext("WHERE col = ANY(int[])", rb.any_array.0, rb.any_array.1),
         // OLTP-extra shapes (#63-#77) — close residual OLTP coverage gaps.
         // Same Option-or-gap helper as the other extended suites.
-        mk_ext("UPSERT (INSERT ON CONFLICT DO UPDATE)", oe.upsert.0, oe.upsert.1),
-        mk_ext("Large IN-list (~100 values)", oe.large_in_list.0, oe.large_in_list.1),
-        mk_ext("RANK() OVER (PARTITION BY) p50", oe.rank_partition.0, oe.rank_partition.1),
-        mk_ext("DISTINCT ON first-row per group p50", oe.distinct_on.0, oe.distinct_on.1),
-        mk_ext("Conditional UPDATE (SET = CASE WHEN)", oe.conditional_update.0, oe.conditional_update.1),
-        mk_ext("Composite range (created_at AND amount)", oe.composite_range.0, oe.composite_range.1),
-        mk_ext("JSON pseudo-secondary lookup (->>='…') p50", oe.json_eq_lookup.0, oe.json_eq_lookup.1),
-        mk_ext("String concatenation (email || id) p50", oe.string_concat.0, oe.string_concat.1),
-        mk_ext("Hour-bucket time aggregation p50", oe.hour_bucket.0, oe.hour_bucket.1),
-        mk_ext("Window LEAD() OVER (PARTITION BY) p50", oe.window_lead.0, oe.window_lead.1),
-        mk_ext("Keyset pagination (WHERE id > … ORDER BY LIMIT) p50", oe.keyset_pagination.0, oe.keyset_pagination.1),
-        mk_ext("LIMIT without ORDER BY (early-exit scan) p50", oe.limit_no_order.0, oe.limit_no_order.1),
-        mk_ext("INSERT … RETURNING id (single row)", oe.insert_returning.0, oe.insert_returning.1),
-        mk_ext("UPDATE … RETURNING (single row)", oe.update_returning.0, oe.update_returning.1),
-        mk_ext("Bulk UPSERT (50 rows, one statement)", oe.bulk_upsert_50.0, oe.bulk_upsert_50.1),
+        mk_ext(
+            "UPSERT (INSERT ON CONFLICT DO UPDATE)",
+            oe.upsert.0,
+            oe.upsert.1,
+        ),
+        mk_ext(
+            "Large IN-list (~100 values)",
+            oe.large_in_list.0,
+            oe.large_in_list.1,
+        ),
+        mk_ext(
+            "RANK() OVER (PARTITION BY) p50",
+            oe.rank_partition.0,
+            oe.rank_partition.1,
+        ),
+        mk_ext(
+            "DISTINCT ON first-row per group p50",
+            oe.distinct_on.0,
+            oe.distinct_on.1,
+        ),
+        mk_ext(
+            "Conditional UPDATE (SET = CASE WHEN)",
+            oe.conditional_update.0,
+            oe.conditional_update.1,
+        ),
+        mk_ext(
+            "Composite range (created_at AND amount)",
+            oe.composite_range.0,
+            oe.composite_range.1,
+        ),
+        mk_ext(
+            "JSON pseudo-secondary lookup (->>='…') p50",
+            oe.json_eq_lookup.0,
+            oe.json_eq_lookup.1,
+        ),
+        mk_ext(
+            "String concatenation (email || id) p50",
+            oe.string_concat.0,
+            oe.string_concat.1,
+        ),
+        mk_ext(
+            "Hour-bucket time aggregation p50",
+            oe.hour_bucket.0,
+            oe.hour_bucket.1,
+        ),
+        mk_ext(
+            "Window LEAD() OVER (PARTITION BY) p50",
+            oe.window_lead.0,
+            oe.window_lead.1,
+        ),
+        mk_ext(
+            "Keyset pagination (WHERE id > … ORDER BY LIMIT) p50",
+            oe.keyset_pagination.0,
+            oe.keyset_pagination.1,
+        ),
+        mk_ext(
+            "LIMIT without ORDER BY (early-exit scan) p50",
+            oe.limit_no_order.0,
+            oe.limit_no_order.1,
+        ),
+        mk_ext(
+            "INSERT … RETURNING id (single row)",
+            oe.insert_returning.0,
+            oe.insert_returning.1,
+        ),
+        mk_ext(
+            "UPDATE … RETURNING (single row)",
+            oe.update_returning.0,
+            oe.update_returning.1,
+        ),
+        mk_ext(
+            "Bulk UPSERT (50 rows, one statement)",
+            oe.bulk_upsert_50.0,
+            oe.bulk_upsert_50.1,
+        ),
         // OLTP-extra batch 2 (#90-#95) — multi-statement txn, destructive
         // single-shot writes, big IN-list, selective count, point+FK hydrate.
-        mk_ext("SELECT … FOR UPDATE + UPDATE (one txn)", oe.select_for_update.0, oe.select_for_update.1),
-        mk_ext("Bulk DELETE range (id BETWEEN, 1k scratch)", oe.bulk_delete_range.0, oe.bulk_delete_range.1),
-        mk_ext("FK ON DELETE CASCADE", oe.fk_cascade_delete.0, oe.fk_cascade_delete.1),
-        mk_ext("Large IN-list (1000 values)", oe.in_list_1000.0, oe.in_list_1000.1),
-        mk_ext("Selective low-card COUNT (status filter)", oe.count_filtered_low_card.0, oe.count_filtered_low_card.1),
-        mk_ext("Point query + FK hydrate (events ⋈ users)", oe.point_join_lookup.0, oe.point_join_lookup.1),
+        mk_ext(
+            "SELECT … FOR UPDATE + UPDATE (one txn)",
+            oe.select_for_update.0,
+            oe.select_for_update.1,
+        ),
+        mk_ext(
+            "Bulk DELETE range (id BETWEEN, 1k scratch)",
+            oe.bulk_delete_range.0,
+            oe.bulk_delete_range.1,
+        ),
+        mk_ext(
+            "FK ON DELETE CASCADE",
+            oe.fk_cascade_delete.0,
+            oe.fk_cascade_delete.1,
+        ),
+        mk_ext(
+            "Large IN-list (1000 values)",
+            oe.in_list_1000.0,
+            oe.in_list_1000.1,
+        ),
+        mk_ext(
+            "Selective low-card COUNT (status filter)",
+            oe.count_filtered_low_card.0,
+            oe.count_filtered_low_card.1,
+        ),
+        mk_ext(
+            "Point query + FK hydrate (events ⋈ users)",
+            oe.point_join_lookup.0,
+            oe.point_join_lookup.1,
+        ),
         // OLAP shapes (#78-#89) — analytical workloads (rollups, ordered-set
         // aggregates, window frames, star joins). Same Option-or-gap helper.
-        mk_ext("ROLLUP(status, user_id%10) SUM p50", ol.rollup_agg.0, ol.rollup_agg.1),
-        mk_ext("CUBE(status, user_id%10) SUM p50", ol.cube_agg.0, ol.cube_agg.1),
-        mk_ext("GROUPING SETS ((status),(user%10),()) p50", ol.grouping_sets.0, ol.grouping_sets.1),
-        mk_ext("PERCENTILE_CONT(0.5) per status p50", ol.percentile_cont.0, ol.percentile_cont.1),
-        mk_ext("Window frame SUM (5 PRECEDING) p50", ol.window_frame_rows.0, ol.window_frame_rows.1),
-        mk_ext("Top-N per group ROW_NUMBER rn<=3 p50", ol.topn_per_group_window.0, ol.topn_per_group_window.1),
-        mk_ext("High-card GROUP BY user_id (no limit) p50", ol.high_card_groupby.0, ol.high_card_groupby.1),
-        mk_ext("COUNT(DISTINCT user_id) per status p50", ol.approx_distinct.0, ol.approx_distinct.1),
-        mk_ext("Deep top-K sort ORDER BY amount LIMIT 1000 p50", ol.full_sort_high_card.0, ol.full_sort_high_card.1),
-        mk_ext("Manual CASE pivot per user p50", ol.case_pivot.0, ol.case_pivot.1),
-        mk_ext("Star join (events ⋈ users ⋈ categories) p50", ol.star_join_agg.0, ol.star_join_agg.1),
-        mk_ext("Window LAG delta + post-filter p50", ol.delta_window_lag_filter.0, ol.delta_window_lag_filter.1),
+        mk_ext(
+            "ROLLUP(status, user_id%10) SUM p50",
+            ol.rollup_agg.0,
+            ol.rollup_agg.1,
+        ),
+        mk_ext(
+            "CUBE(status, user_id%10) SUM p50",
+            ol.cube_agg.0,
+            ol.cube_agg.1,
+        ),
+        mk_ext(
+            "GROUPING SETS ((status),(user%10),()) p50",
+            ol.grouping_sets.0,
+            ol.grouping_sets.1,
+        ),
+        mk_ext(
+            "PERCENTILE_CONT(0.5) per status p50",
+            ol.percentile_cont.0,
+            ol.percentile_cont.1,
+        ),
+        mk_ext(
+            "Window frame SUM (5 PRECEDING) p50",
+            ol.window_frame_rows.0,
+            ol.window_frame_rows.1,
+        ),
+        mk_ext(
+            "Top-N per group ROW_NUMBER rn<=3 p50",
+            ol.topn_per_group_window.0,
+            ol.topn_per_group_window.1,
+        ),
+        mk_ext(
+            "High-card GROUP BY user_id (no limit) p50",
+            ol.high_card_groupby.0,
+            ol.high_card_groupby.1,
+        ),
+        mk_ext(
+            "COUNT(DISTINCT user_id) per status p50",
+            ol.approx_distinct.0,
+            ol.approx_distinct.1,
+        ),
+        mk_ext(
+            "Deep top-K sort ORDER BY amount LIMIT 1000 p50",
+            ol.full_sort_high_card.0,
+            ol.full_sort_high_card.1,
+        ),
+        mk_ext(
+            "Manual CASE pivot per user p50",
+            ol.case_pivot.0,
+            ol.case_pivot.1,
+        ),
+        mk_ext(
+            "Star join (events ⋈ users ⋈ categories) p50",
+            ol.star_join_agg.0,
+            ol.star_join_agg.1,
+        ),
+        mk_ext(
+            "Window LAG delta + post-filter p50",
+            ol.delta_window_lag_filter.0,
+            ol.delta_window_lag_filter.1,
+        ),
         // DML-pipeline shapes (#96-#103) — join DML, INSERT..SELECT pipeline,
         // MERGE (expected basin gap until MERGE lands), 1000-row bulk upsert,
         // large-result drain, prepared bind-direct latency, mixed-workload
         // concurrency. Same Option-or-gap helper as the other suites.
-        mk_ext("Large result stream (100k-row drain) p50", dp.large_result_stream.0, dp.large_result_stream.1),
-        mk_ext("Prepared INSERT 100x bind/execute (in-process vs wire)", dp.prepared_insert_100.0, dp.prepared_insert_100.1),
-        mk_ext("MERGE INTO matched/not-matched upsert p50", dp.merge_upsert.0, dp.merge_upsert.1),
-        mk_ext("Bulk UPSERT (1000 rows, one statement)", dp.bulk_upsert_1000.0, dp.bulk_upsert_1000.1),
-        mk_ext("INSERT ... SELECT (10k-row pipeline)", dp.insert_select_10k.0, dp.insert_select_10k.1),
-        mk_ext("UPDATE ... FROM (join update, 200 rows)", dp.update_from_join.0, dp.update_from_join.1),
-        mk_ext("DELETE ... USING (join delete, one user)", dp.delete_using_join.0, dp.delete_using_join.1),
-        mk_ext("Mixed read-write concurrency 8R+4W (600 ops)", dp.mixed_rw_concurrency.0, dp.mixed_rw_concurrency.1),
+        mk_ext(
+            "Large result stream (100k-row drain) p50",
+            dp.large_result_stream.0,
+            dp.large_result_stream.1,
+        ),
+        mk_ext(
+            "Prepared INSERT 100x bind/execute (in-process vs wire)",
+            dp.prepared_insert_100.0,
+            dp.prepared_insert_100.1,
+        ),
+        mk_ext(
+            "MERGE INTO matched/not-matched upsert p50",
+            dp.merge_upsert.0,
+            dp.merge_upsert.1,
+        ),
+        mk_ext(
+            "Bulk UPSERT (1000 rows, one statement)",
+            dp.bulk_upsert_1000.0,
+            dp.bulk_upsert_1000.1,
+        ),
+        mk_ext(
+            "INSERT ... SELECT (10k-row pipeline)",
+            dp.insert_select_10k.0,
+            dp.insert_select_10k.1,
+        ),
+        mk_ext(
+            "UPDATE ... FROM (join update, 200 rows)",
+            dp.update_from_join.0,
+            dp.update_from_join.1,
+        ),
+        mk_ext(
+            "DELETE ... USING (join delete, one user)",
+            dp.delete_using_join.0,
+            dp.delete_using_join.1,
+        ),
+        mk_ext(
+            "Mixed read-write concurrency 8R+4W (600 ops)",
+            dp.mixed_rw_concurrency.0,
+            dp.mixed_rw_concurrency.1,
+        ),
     ];
 
     report_postgres_compare(id, name, claim, true, metrics, None);

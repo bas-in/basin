@@ -28,10 +28,19 @@ pub(crate) struct ClosedSegment {
 #[derive(Debug, Clone)]
 pub(crate) enum BufferRecord {
     Entry(EntryRecord),
-    TxBegin { lsn: Lsn, tx_id: u64 },
-    TxRollback { lsn: Lsn, tx_id: u64 },
+    TxBegin {
+        lsn: Lsn,
+        tx_id: u64,
+    },
+    TxRollback {
+        lsn: Lsn,
+        tx_id: u64,
+    },
     /// ADR 0020 §6 — explicit commit marker. See [`crate::segment::SegmentRecord::TxCommit`].
-    TxCommit { lsn: Lsn, tx_id: u64 },
+    TxCommit {
+        lsn: Lsn,
+        tx_id: u64,
+    },
     /// Phase 6.X.C — voluntary lease-handoff marker. Replay treats it as
     /// informational; the marker exists so the new owner / audit logs see
     /// the boundary.

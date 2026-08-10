@@ -159,11 +159,7 @@ impl ChannelRing {
         if after_seq > 0 && after_seq + 1 < oldest_seq {
             // Drain everything we still have (best-effort) so the client
             // resumes the live stream from `newest_seq` afterwards.
-            let events = self
-                .deque
-                .iter()
-                .map(|s| Arc::clone(&s.event))
-                .collect();
+            let events = self.deque.iter().map(|s| Arc::clone(&s.event)).collect();
             return DrainOutcome::Gap {
                 events,
                 oldest_seq,
@@ -177,10 +173,7 @@ impl ChannelRing {
             .filter(|s| s.event.seq > after_seq)
             .map(|s| Arc::clone(&s.event))
             .collect();
-        DrainOutcome::Replay {
-            events,
-            newest_seq,
-        }
+        DrainOutcome::Replay { events, newest_seq }
     }
 }
 
@@ -279,12 +272,9 @@ impl ReplayRingRegistry {
     /// call from the broadcast publish hot path: the critical section is
     /// O(1) and never crosses an `.await`.
     pub fn record(&self, key: &ChannelKey, event: Arc<ChangeEvent>) {
-        let entry = self
-            .rings
-            .entry(key.clone())
-            .or_insert_with(|| {
-                parking_lot_mutex::Mutex::new(ChannelRing::new(self.capacity, self.ttl))
-            });
+        let entry = self.rings.entry(key.clone()).or_insert_with(|| {
+            parking_lot_mutex::Mutex::new(ChannelRing::new(self.capacity, self.ttl))
+        });
         // unwrap: the mutex is never poisoned because the critical section
         // does not panic (it only pushes / pops a VecDeque).
         let mut ring = entry.value().lock().expect("replay ring mutex poisoned");

@@ -190,9 +190,7 @@ async fn soak_latency_stability() {
     let window_secs = 10u64;
     let n_windows = (soak_secs / window_secs).max(1) as usize;
 
-    eprintln!(
-        "[soak] config: soak_secs={soak_secs} seed_rows={seed_rows} windows={n_windows}"
-    );
+    eprintln!("[soak] config: soak_secs={soak_secs} seed_rows={seed_rows} windows={n_windows}");
 
     // ── Basin engine setup ───────────────────────────────────────────────────
     let (_sd, _wd, engine, _shard, _bg, wal) = build().await;
@@ -246,7 +244,9 @@ async fn soak_latency_stability() {
         Some((pg, cs)) => {
             let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
             let schema = format!("basin_soak_{suffix}");
-            pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.expect("pg schema");
+            pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+                .await
+                .expect("pg schema");
             pg.simple_query(&format!(
                 "CREATE TABLE {schema}.events (\
                     id BIGINT PRIMARY KEY, \
@@ -264,7 +264,9 @@ async fn soak_latency_stability() {
                 let hi = (pg_id + batch).min(seed_rows);
                 let mut stmt = format!("INSERT INTO {schema}.events VALUES ");
                 for k in pg_id..hi {
-                    if k > pg_id { stmt.push(','); }
+                    if k > pg_id {
+                        stmt.push(',');
+                    }
                     let status = status_for(k);
                     let amount = 1.0 + (k % 10000) as f64 * 0.01;
                     stmt.push_str(&format!(
@@ -299,8 +301,11 @@ async fn soak_latency_stability() {
     let basin_errors = Arc::new(AtomicU64::new(0));
 
     // Per-window latency accumulators: Vec<Mutex<Vec<f64>>> with n_windows slots.
-    let basin_windows: Arc<Vec<std::sync::Mutex<Vec<f64>>>> =
-        Arc::new((0..n_windows).map(|_| std::sync::Mutex::new(Vec::new())).collect());
+    let basin_windows: Arc<Vec<std::sync::Mutex<Vec<f64>>>> = Arc::new(
+        (0..n_windows)
+            .map(|_| std::sync::Mutex::new(Vec::new()))
+            .collect(),
+    );
 
     let soak_start = Instant::now();
     let total_dur = Duration::from_secs(soak_secs);
@@ -315,16 +320,21 @@ async fn soak_latency_stability() {
         while !bd.load(Ordering::Relaxed) {
             let id_val = (next_u64(&mut rng) as i64).abs() % seed_rows;
             let t = Instant::now();
-            match sess_r.execute(&format!(
-                "SELECT id, user_id, amount FROM events WHERE id = {id_val}"
-            )).await {
+            match sess_r
+                .execute(&format!(
+                    "SELECT id, user_id, amount FROM events WHERE id = {id_val}"
+                ))
+                .await
+            {
                 Ok(_) => {
                     let ms = t.elapsed().as_secs_f64() * 1000.0;
-                    let w = (soak_start.elapsed().as_secs() / window_secs)
-                        .min(n_windows as u64 - 1) as usize;
+                    let w = (soak_start.elapsed().as_secs() / window_secs).min(n_windows as u64 - 1)
+                        as usize;
                     bw[w].lock().unwrap().push(ms);
                 }
-                Err(_) => { be.fetch_add(1, Ordering::Relaxed); }
+                Err(_) => {
+                    be.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     });
@@ -340,7 +350,9 @@ async fn soak_latency_stability() {
             let mut stmt = String::from("INSERT INTO events VALUES ");
             for k in 0..100i64 {
                 let rid = next_id + k;
-                if k > 0 { stmt.push(','); }
+                if k > 0 {
+                    stmt.push(',');
+                }
                 stmt.push_str(&format!(
                     "({rid},{},1.0,'pending',{},'{{}}' )",
                     rid % 50000,
@@ -364,9 +376,12 @@ async fn soak_latency_stability() {
         while !bd3.load(Ordering::Relaxed) {
             let id_val = (next_u64(&mut rng) as i64).abs() % seed_rows;
             let new_amt = 9.99 + (next_u64(&mut rng) % 100) as f64 * 0.01;
-            if let Err(_) = sess_u.execute(&format!(
-                "UPDATE events SET amount = {new_amt} WHERE id = {id_val}"
-            )).await {
+            if let Err(_) = sess_u
+                .execute(&format!(
+                    "UPDATE events SET amount = {new_amt} WHERE id = {id_val}"
+                ))
+                .await
+            {
                 be3.fetch_add(1, Ordering::Relaxed);
             }
             tokio::time::sleep(Duration::from_millis(100)).await; // ~10/sec
@@ -376,8 +391,11 @@ async fn soak_latency_stability() {
     // PG reader task (wall-clock, no EXPLAIN ANALYZE overhead)
     // Uses the schema seeded above (`pg_soak_schema`); opens its own connection
     // so the reader doesn't share a connection with other tasks.
-    let pg_windows: Arc<Vec<std::sync::Mutex<Vec<f64>>>> =
-        Arc::new((0..n_windows).map(|_| std::sync::Mutex::new(Vec::new())).collect());
+    let pg_windows: Arc<Vec<std::sync::Mutex<Vec<f64>>>> = Arc::new(
+        (0..n_windows)
+            .map(|_| std::sync::Mutex::new(Vec::new()))
+            .collect(),
+    );
     let pg_task = if pg_avail {
         let pwc = pg_conn_str.clone();
         let sch = pg_soak_schema.clone();
@@ -388,14 +406,18 @@ async fn soak_latency_stability() {
                 Ok(v) => v,
                 Err(_) => return,
             };
-            tokio::spawn(async move { let _ = pgr_conn.await; });
+            tokio::spawn(async move {
+                let _ = pgr_conn.await;
+            });
             let mut rng: u64 = 0xABCD_1234;
             while !bd4.load(Ordering::Relaxed) {
                 let id_val = (next_u64(&mut rng) as i64).abs() % seed_rows;
                 let t = Instant::now();
-                let _ = pgr.simple_query(&format!(
-                    "SELECT id, user_id, amount FROM {sch}.events WHERE id = {id_val}"
-                )).await;
+                let _ = pgr
+                    .simple_query(&format!(
+                        "SELECT id, user_id, amount FROM {sch}.events WHERE id = {id_val}"
+                    ))
+                    .await;
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 let elapsed_s = soak_start.elapsed().as_secs();
                 let w = (elapsed_s / window_secs).min(n_windows as u64 - 1) as usize;
@@ -414,7 +436,9 @@ async fn soak_latency_stability() {
     let _ = basin_reader.await;
     let _ = basin_writer.await;
     let _ = basin_updater.await;
-    if let Some(t) = pg_task { let _ = t.await; }
+    if let Some(t) = pg_task {
+        let _ = t.await;
+    }
 
     let total_errors = basin_errors.load(Ordering::Relaxed);
     assert_eq!(
@@ -432,16 +456,28 @@ async fn soak_latency_stability() {
     for w in 0..n_windows {
         let mut bs: Vec<f64> = basin_windows[w].lock().unwrap().clone();
         let mut ps: Vec<f64> = pg_windows[w].lock().unwrap().clone();
-        let b50 = if bs.is_empty() { f64::NAN } else {
+        let b50 = if bs.is_empty() {
+            f64::NAN
+        } else {
             bs.sort_by(|a, b| a.partial_cmp(b).unwrap());
             median(&bs)
         };
-        let b99 = if bs.is_empty() { f64::NAN } else { percentile(&bs, 99.0) };
-        let p50 = if ps.is_empty() { f64::NAN } else {
+        let b99 = if bs.is_empty() {
+            f64::NAN
+        } else {
+            percentile(&bs, 99.0)
+        };
+        let p50 = if ps.is_empty() {
+            f64::NAN
+        } else {
             ps.sort_by(|a, b| a.partial_cmp(b).unwrap());
             median(&ps)
         };
-        let p99 = if ps.is_empty() { f64::NAN } else { percentile(&ps, 99.0) };
+        let p99 = if ps.is_empty() {
+            f64::NAN
+        } else {
+            percentile(&ps, 99.0)
+        };
         let n_b = bs.len();
         let n_p = ps.len();
         basin_p50s.push(b50);
@@ -469,8 +505,17 @@ async fn soak_latency_stability() {
 
     // Latency drift ratio: p99 in last non-empty window / p99 in first non-empty window.
     // Informational — not gated (environment-sensitive). Asserted loose bound only.
-    let first_basin_p99 = basin_p99s.iter().find(|v| v.is_finite()).copied().unwrap_or(f64::NAN);
-    let last_basin_p99 = basin_p99s.iter().rev().find(|v| v.is_finite()).copied().unwrap_or(f64::NAN);
+    let first_basin_p99 = basin_p99s
+        .iter()
+        .find(|v| v.is_finite())
+        .copied()
+        .unwrap_or(f64::NAN);
+    let last_basin_p99 = basin_p99s
+        .iter()
+        .rev()
+        .find(|v| v.is_finite())
+        .copied()
+        .unwrap_or(f64::NAN);
     let drift_ratio = if first_basin_p99 > 1e-9 {
         last_basin_p99 / first_basin_p99
     } else {
@@ -501,25 +546,30 @@ async fn soak_latency_stability() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    write_artifact("soak_latency_stability.json", &json!({
-        "card": "soak_latency_stability",
-        "generated_at": format!("@{ts}"),
-        "config": {
-            "soak_secs": soak_secs,
-            "seed_rows": seed_rows,
-            "window_secs": window_secs,
-            "n_windows": n_windows,
-        },
-        "drift_ratio_informational": if drift_ratio.is_nan() { serde_json::Value::Null } else { json!(drift_ratio) },
-        "total_basin_errors": total_errors,
-        "pg_available": pg_avail,
-        "windows": json_windows,
-    }));
+    write_artifact(
+        "soak_latency_stability.json",
+        &json!({
+            "card": "soak_latency_stability",
+            "generated_at": format!("@{ts}"),
+            "config": {
+                "soak_secs": soak_secs,
+                "seed_rows": seed_rows,
+                "window_secs": window_secs,
+                "n_windows": n_windows,
+            },
+            "drift_ratio_informational": if drift_ratio.is_nan() { serde_json::Value::Null } else { json!(drift_ratio) },
+            "total_basin_errors": total_errors,
+            "pg_available": pg_avail,
+            "windows": json_windows,
+        }),
+    );
 
     // Cleanup PG schema now that measurement is complete.
     if pg_avail && !pg_soak_schema.is_empty() {
         if let Ok((pgc, f)) = tokio_postgres::connect(&pg_conn_str, NoTls).await {
-            tokio::spawn(async move { let _ = f.await; });
+            tokio::spawn(async move {
+                let _ = f.await;
+            });
             let _ = pgc
                 .simple_query(&format!("DROP SCHEMA IF EXISTS {pg_soak_schema} CASCADE"))
                 .await;
@@ -558,17 +608,22 @@ async fn background_interference() {
 
     // ── Phase A: quiesced ────────────────────────────────────────────────────
     let mut instance = build_basin_engine().await;
-    let sess_a = instance.engine.open_session(instance.project).await.unwrap();
-    sess_a.execute(
-        "CREATE TABLE events (\
+    let sess_a = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
+    sess_a
+        .execute(
+            "CREATE TABLE events (\
             id BIGINT NOT NULL PRIMARY KEY, \
             user_id BIGINT NOT NULL, \
             amount DOUBLE PRECISION NOT NULL, \
             status TEXT NOT NULL, \
             created_at BIGINT NOT NULL)",
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap();
 
     eprintln!("[interf] seeding phase A ({seed_rows} rows) ...");
     let batch = 10_000i64;
@@ -577,7 +632,9 @@ async fn background_interference() {
         let hi = (id + batch).min(seed_rows);
         let mut stmt = String::from("INSERT INTO events VALUES ");
         for k in id..hi {
-            if k > id { stmt.push(','); }
+            if k > id {
+                stmt.push(',');
+            }
             let status = status_for(k);
             let amount = 0.5 + (k % 99) as f64;
             stmt.push_str(&format!(
@@ -599,13 +656,18 @@ async fn background_interference() {
     let mut rng: u64 = 0xA1B2C3D4;
     let mut phase_a_samples: Vec<f64> = Vec::with_capacity(samples);
     // One warm-up pass
-    let _ = sess_a.execute(&format!("SELECT id, amount FROM events WHERE id = 42")).await;
+    let _ = sess_a
+        .execute(&format!("SELECT id, amount FROM events WHERE id = 42"))
+        .await;
     for _ in 0..samples {
         let id_val = (next_u64(&mut rng) as i64).abs() % seed_rows;
         let t = Instant::now();
-        let res = sess_a.execute(&format!(
-            "SELECT id, user_id, amount FROM events WHERE id = {id_val}"
-        )).await.expect("phase A query");
+        let res = sess_a
+            .execute(&format!(
+                "SELECT id, user_id, amount FROM events WHERE id = {id_val}"
+            ))
+            .await
+            .expect("phase A query");
         phase_a_samples.push(t.elapsed().as_secs_f64() * 1000.0);
         // correctness: row must exist
         assert!(
@@ -623,23 +685,26 @@ async fn background_interference() {
     let (_sd_b, _wd_b, engine_b, shard_b, bg_b, wal_b) = build().await;
     let project_b = ProjectId::new();
     let sess_b = engine_b.open_session(project_b).await.unwrap();
-    sess_b.execute(
-        "CREATE TABLE events (\
+    sess_b
+        .execute(
+            "CREATE TABLE events (\
             id BIGINT NOT NULL PRIMARY KEY, \
             user_id BIGINT NOT NULL, \
             amount DOUBLE PRECISION NOT NULL, \
             status TEXT NOT NULL, \
             created_at BIGINT NOT NULL)",
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap();
     eprintln!("[interf] seeding phase B ({seed_rows} rows, bg ALIVE) ...");
     id = 0;
     while id < seed_rows {
         let hi = (id + batch).min(seed_rows);
         let mut stmt = String::from("INSERT INTO events VALUES ");
         for k in id..hi {
-            if k > id { stmt.push(','); }
+            if k > id {
+                stmt.push(',');
+            }
             let status = status_for(k);
             let amount = 0.5 + (k % 99) as f64;
             stmt.push_str(&format!(
@@ -655,13 +720,18 @@ async fn background_interference() {
 
     rng = 0xB1C2D3E4;
     let mut phase_b_samples: Vec<f64> = Vec::with_capacity(samples);
-    let _ = sess_b.execute("SELECT id, amount FROM events WHERE id = 42").await;
+    let _ = sess_b
+        .execute("SELECT id, amount FROM events WHERE id = 42")
+        .await;
     for _ in 0..samples {
         let id_val = (next_u64(&mut rng) as i64).abs() % seed_rows;
         let t = Instant::now();
-        let res = sess_b.execute(&format!(
-            "SELECT id, user_id, amount FROM events WHERE id = {id_val}"
-        )).await.expect("phase B query");
+        let res = sess_b
+            .execute(&format!(
+                "SELECT id, user_id, amount FROM events WHERE id = {id_val}"
+            ))
+            .await
+            .expect("phase B query");
         phase_b_samples.push(t.elapsed().as_secs_f64() * 1000.0);
         assert!(
             row_count_of(&res) <= 1,
@@ -677,16 +747,17 @@ async fn background_interference() {
     let (_sd_c, _wd_c, engine_c, _shard_c, _bg_c, wal_c) = build().await;
     let project_c = ProjectId::new();
     let sess_c = Arc::new(engine_c.open_session(project_c).await.unwrap());
-    sess_c.execute(
-        "CREATE TABLE events (\
+    sess_c
+        .execute(
+            "CREATE TABLE events (\
             id BIGINT NOT NULL PRIMARY KEY, \
             user_id BIGINT NOT NULL, \
             amount DOUBLE PRECISION NOT NULL, \
             status TEXT NOT NULL, \
             created_at BIGINT NOT NULL)",
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap();
     // Seed same baseline rows
     eprintln!("[interf] seeding phase C ({seed_rows} rows, bg ALIVE) ...");
     id = 0;
@@ -694,7 +765,9 @@ async fn background_interference() {
         let hi = (id + batch).min(seed_rows);
         let mut stmt = String::from("INSERT INTO events VALUES ");
         for k in id..hi {
-            if k > id { stmt.push(','); }
+            if k > id {
+                stmt.push(',');
+            }
             let status = status_for(k);
             let amount = 0.5 + (k % 99) as f64;
             stmt.push_str(&format!(
@@ -717,7 +790,9 @@ async fn background_interference() {
             let mut stmt = String::from("INSERT INTO events VALUES ");
             for k in 0..1000i64 {
                 let rid = next_id + k;
-                if k > 0 { stmt.push(','); }
+                if k > 0 {
+                    stmt.push(',');
+                }
                 stmt.push_str(&format!(
                     "({rid},{},1.0,'pending',{})",
                     rid % 50000,
@@ -732,13 +807,18 @@ async fn background_interference() {
 
     rng = 0xC1D2E3F4;
     let mut phase_c_samples: Vec<f64> = Vec::with_capacity(samples);
-    let _ = sess_c.execute("SELECT id, amount FROM events WHERE id = 42").await;
+    let _ = sess_c
+        .execute("SELECT id, amount FROM events WHERE id = 42")
+        .await;
     for _ in 0..samples {
         let id_val = (next_u64(&mut rng) as i64).abs() % seed_rows;
         let t = Instant::now();
-        let res = sess_c.execute(&format!(
-            "SELECT id, user_id, amount FROM events WHERE id = {id_val}"
-        )).await.expect("phase C query");
+        let res = sess_c
+            .execute(&format!(
+                "SELECT id, user_id, amount FROM events WHERE id = {id_val}"
+            ))
+            .await
+            .expect("phase C query");
         phase_c_samples.push(t.elapsed().as_secs_f64() * 1000.0);
         assert!(
             row_count_of(&res) <= 1,
@@ -756,20 +836,29 @@ async fn background_interference() {
     let (pg_b_p50, pg_b_p99) = if let Some((pg, cs)) = try_connect().await {
         let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
         let schema = format!("basin_interf_{suffix}");
-        let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-        pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.expect("pg schema");
+        let _guard = SchemaGuard {
+            schema: schema.clone(),
+            conn_str: cs,
+        };
+        pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .expect("pg schema");
         pg.simple_query(&format!(
             "CREATE TABLE {schema}.events (\
                 id BIGINT PRIMARY KEY, user_id BIGINT, \
                 amount DOUBLE PRECISION, status TEXT, created_at BIGINT)"
-        )).await.expect("pg create");
+        ))
+        .await
+        .expect("pg create");
         // Seed PG identically
         let mut pg_id = 0i64;
         while pg_id < seed_rows {
             let hi = (pg_id + batch).min(seed_rows);
             let mut stmt = format!("INSERT INTO {schema}.events VALUES ");
             for k in pg_id..hi {
-                if k > pg_id { stmt.push(','); }
+                if k > pg_id {
+                    stmt.push(',');
+                }
                 let status = status_for(k);
                 let amount = 0.5 + (k % 99) as f64;
                 stmt.push_str(&format!(
@@ -784,13 +873,17 @@ async fn background_interference() {
         // Measure PG with autovacuum running (no explicit quiesce)
         let mut pg_samples: Vec<f64> = Vec::with_capacity(samples);
         rng = 0xD1E2F3A4;
-        let _ = pg.simple_query(&format!("SELECT id FROM {schema}.events WHERE id = 42")).await;
+        let _ = pg
+            .simple_query(&format!("SELECT id FROM {schema}.events WHERE id = 42"))
+            .await;
         for _ in 0..samples {
             let id_val = (next_u64(&mut rng) as i64).abs() % seed_rows;
             let t = Instant::now();
-            let _ = pg.simple_query(&format!(
-                "SELECT id, user_id, amount FROM {schema}.events WHERE id = {id_val}"
-            )).await;
+            let _ = pg
+                .simple_query(&format!(
+                    "SELECT id, user_id, amount FROM {schema}.events WHERE id = {id_val}"
+                ))
+                .await;
             pg_samples.push(t.elapsed().as_secs_f64() * 1000.0);
         }
         let pp50 = median(&pg_samples);
@@ -819,24 +912,27 @@ async fn background_interference() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    write_artifact("background_interference.json", &json!({
-        "card": "background_interference",
-        "generated_at": format!("@{ts}"),
-        "config": { "seed_rows": seed_rows, "samples_per_phase": samples },
-        "basin": {
-            "phase_a_quiesced":  { "p50_ms": a_p50, "p99_ms": a_p99 },
-            "phase_b_compacting": { "p50_ms": b_p50, "p99_ms": b_p99 },
-            "phase_c_bulk_ingest": { "p50_ms": c_p50, "p99_ms": c_p99 },
-            "b_over_a_p99_ratio": if a_p99 > 1e-9 { json!(b_p99 / a_p99) } else { serde_json::Value::Null },
-            "c_over_a_p99_ratio": if a_p99 > 1e-9 { json!(c_p99 / a_p99) } else { serde_json::Value::Null },
-        },
-        "postgres": {
-            "autovacuum_live": {
-                "p50_ms": if pg_b_p50.is_nan() { serde_json::Value::Null } else { json!(pg_b_p50) },
-                "p99_ms": if pg_b_p99.is_nan() { serde_json::Value::Null } else { json!(pg_b_p99) },
+    write_artifact(
+        "background_interference.json",
+        &json!({
+            "card": "background_interference",
+            "generated_at": format!("@{ts}"),
+            "config": { "seed_rows": seed_rows, "samples_per_phase": samples },
+            "basin": {
+                "phase_a_quiesced":  { "p50_ms": a_p50, "p99_ms": a_p99 },
+                "phase_b_compacting": { "p50_ms": b_p50, "p99_ms": b_p99 },
+                "phase_c_bulk_ingest": { "p50_ms": c_p50, "p99_ms": c_p99 },
+                "b_over_a_p99_ratio": if a_p99 > 1e-9 { json!(b_p99 / a_p99) } else { serde_json::Value::Null },
+                "c_over_a_p99_ratio": if a_p99 > 1e-9 { json!(c_p99 / a_p99) } else { serde_json::Value::Null },
+            },
+            "postgres": {
+                "autovacuum_live": {
+                    "p50_ms": if pg_b_p50.is_nan() { serde_json::Value::Null } else { json!(pg_b_p50) },
+                    "p99_ms": if pg_b_p99.is_nan() { serde_json::Value::Null } else { json!(pg_b_p99) },
+                }
             }
-        }
-    }));
+        }),
+    );
 
     bg_b.shutdown().await;
     wal_b.close().await.unwrap();
@@ -868,7 +964,11 @@ async fn n_plus_one_storm() {
 
     // ── Basin setup ──────────────────────────────────────────────────────────
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
 
     sess.execute(&format!(
         "CREATE TABLE users (id BIGINT NOT NULL PRIMARY KEY, email TEXT NOT NULL)"
@@ -889,7 +989,9 @@ async fn n_plus_one_storm() {
     {
         let mut stmt = String::from("INSERT INTO users VALUES ");
         for u in 0..n_users {
-            if u > 0 { stmt.push(','); }
+            if u > 0 {
+                stmt.push(',');
+            }
             stmt.push_str(&format!("({u},'{}')", email_for(u)));
         }
         sess.execute(&stmt).await.unwrap();
@@ -902,9 +1004,15 @@ async fn n_plus_one_storm() {
         let hi = (id + batch).min(seed_rows);
         let mut stmt = String::from("INSERT INTO events VALUES ");
         for k in id..hi {
-            if k > id { stmt.push(','); }
+            if k > id {
+                stmt.push(',');
+            }
             let uid = k % n_users;
-            stmt.push_str(&format!("({k},{uid},{:.2},{})", 1.0 + (k % 99) as f64, EPOCH + k));
+            stmt.push_str(&format!(
+                "({k},{uid},{:.2},{})",
+                1.0 + (k % 99) as f64,
+                EPOCH + k
+            ));
         }
         sess.execute(&stmt).await.expect("basin seed events");
         id = hi;
@@ -923,34 +1031,50 @@ async fn n_plus_one_storm() {
     let parent_ids: Vec<i64> = match sess.execute(&fetch_parents_sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => {
             use arrow_array::{Array, Int64Array};
-            batches.iter().flat_map(|b| {
-                let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-                (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
-            }).collect()
+            batches
+                .iter()
+                .flat_map(|b| {
+                    let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                    (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+                })
+                .collect()
         }
         _ => panic!("expected rows from parent fetch"),
     };
-    assert_eq!(parent_ids.len(), n_parents, "must fetch exactly {n_parents} parent rows");
+    assert_eq!(
+        parent_ids.len(),
+        n_parents,
+        "must fetch exactly {n_parents} parent rows"
+    );
 
     // Step 2: N individual child SELECTs (ORM lazy-load pattern)
     let basin_n1_start = Instant::now();
     let mut total_child_rows = 0usize;
     for &uid in &parent_ids {
-        let res = sess.execute(&format!(
-            "SELECT id, amount FROM events WHERE user_id = {uid} LIMIT 10"
-        )).await.expect("basin child select");
+        let res = sess
+            .execute(&format!(
+                "SELECT id, amount FROM events WHERE user_id = {uid} LIMIT 10"
+            ))
+            .await
+            .expect("basin child select");
         total_child_rows += row_count_of(&res);
     }
     let basin_n1_ms = basin_n1_start.elapsed().as_secs_f64() * 1000.0;
-    assert!(total_child_rows > 0, "basin N+1: expected some child rows across {n_parents} parents");
+    assert!(
+        total_child_rows > 0,
+        "basin N+1: expected some child rows across {n_parents} parents"
+    );
 
     // JOIN equivalent
     let basin_join_start = Instant::now();
-    let join_res = sess.execute(
-        "SELECT u.id, e.id, e.amount \
+    let join_res = sess
+        .execute(
+            "SELECT u.id, e.id, e.amount \
          FROM users u JOIN events e ON e.user_id = u.id \
-         LIMIT 1000"
-    ).await.expect("basin join");
+         LIMIT 1000",
+        )
+        .await
+        .expect("basin join");
     let basin_join_ms = basin_join_start.elapsed().as_secs_f64() * 1000.0;
     let join_rows = row_count_of(&join_res);
     assert!(join_rows > 0, "basin join must return rows");
@@ -964,21 +1088,32 @@ async fn n_plus_one_storm() {
     let (pg_n1_ms, pg_join_ms) = if let Some((pg, cs)) = try_connect().await {
         let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
         let schema = format!("basin_n1_{suffix}");
-        let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-        pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.unwrap();
+        let _guard = SchemaGuard {
+            schema: schema.clone(),
+            conn_str: cs,
+        };
+        pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .unwrap();
         pg.simple_query(&format!(
             "CREATE TABLE {schema}.users (id BIGINT PRIMARY KEY, email TEXT)"
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
         pg.simple_query(&format!(
             "CREATE TABLE {schema}.events (\
                 id BIGINT PRIMARY KEY, user_id BIGINT, \
                 amount DOUBLE PRECISION, created_at BIGINT)"
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
         // Seed PG users
         {
             let mut stmt = format!("INSERT INTO {schema}.users VALUES ");
             for u in 0..n_users {
-                if u > 0 { stmt.push(','); }
+                if u > 0 {
+                    stmt.push(',');
+                }
                 stmt.push_str(&format!("({u},'{}')", email_for(u)));
             }
             pg.simple_query(&stmt).await.unwrap();
@@ -989,39 +1124,50 @@ async fn n_plus_one_storm() {
             let hi = (pg_id + batch).min(seed_rows);
             let mut stmt = format!("INSERT INTO {schema}.events VALUES ");
             for k in pg_id..hi {
-                if k > pg_id { stmt.push(','); }
+                if k > pg_id {
+                    stmt.push(',');
+                }
                 let uid = k % n_users;
-                stmt.push_str(&format!("({k},{uid},{:.2},{})", 1.0 + (k % 99) as f64, EPOCH + k));
+                stmt.push_str(&format!(
+                    "({k},{uid},{:.2},{})",
+                    1.0 + (k % 99) as f64,
+                    EPOCH + k
+                ));
             }
             pg.simple_query(&stmt).await.unwrap();
             pg_id = hi;
         }
 
         // Warm-up
-        let _ = pg.simple_query(&format!("SELECT id FROM {schema}.users LIMIT 5")).await;
+        let _ = pg
+            .simple_query(&format!("SELECT id FROM {schema}.users LIMIT 5"))
+            .await;
 
         // PG N+1 loop (same parent ids)
         let pg_n1_start = Instant::now();
         for &uid in &parent_ids {
-            let _ = pg.simple_query(&format!(
-                "SELECT id, amount FROM {schema}.events WHERE user_id = {uid} LIMIT 10"
-            )).await.expect("pg child select");
+            let _ = pg
+                .simple_query(&format!(
+                    "SELECT id, amount FROM {schema}.events WHERE user_id = {uid} LIMIT 10"
+                ))
+                .await
+                .expect("pg child select");
         }
         let pn1 = pg_n1_start.elapsed().as_secs_f64() * 1000.0;
 
         // PG JOIN equivalent
         let pg_join_start = Instant::now();
-        let _ = pg.simple_query(&format!(
-            "SELECT u.id, e.id, e.amount \
+        let _ = pg
+            .simple_query(&format!(
+                "SELECT u.id, e.id, e.amount \
              FROM {schema}.users u JOIN {schema}.events e ON e.user_id = u.id \
              LIMIT 1000"
-        )).await.expect("pg join");
+            ))
+            .await
+            .expect("pg join");
         let pj = pg_join_start.elapsed().as_secs_f64() * 1000.0;
 
-        println!(
-            "[n+1] PG:    n+1 total={:.2}ms | join={:.2}ms",
-            pn1, pj
-        );
+        println!("[n+1] PG:    n+1 total={:.2}ms | join={:.2}ms", pn1, pj);
         std::mem::forget(_guard);
         (pn1, pj)
     } else {
@@ -1045,25 +1191,28 @@ async fn n_plus_one_storm() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    write_artifact("n_plus_one_storm.json", &json!({
-        "card": "n_plus_one_storm",
-        "generated_at": format!("@{ts}"),
-        "config": { "n_parents": n_parents, "seed_rows": seed_rows },
-        "basin": {
-            "n_plus_one_total_ms": basin_n1_ms,
-            "join_equivalent_ms": basin_join_ms,
-            "n_plus_one_over_join": basin_n1_ms / basin_join_ms.max(1e-9),
-        },
-        "postgres": {
-            "n_plus_one_total_ms": if pg_n1_ms.is_nan() { serde_json::Value::Null } else { json!(pg_n1_ms) },
-            "join_equivalent_ms": if pg_join_ms.is_nan() { serde_json::Value::Null } else { json!(pg_join_ms) },
-        },
-        "basin_over_pg_n1_ratio": if pg_n1_ms.is_finite() && pg_n1_ms > 1e-9 {
-            json!(basin_n1_ms / pg_n1_ms)
-        } else {
-            serde_json::Value::Null
-        },
-    }));
+    write_artifact(
+        "n_plus_one_storm.json",
+        &json!({
+            "card": "n_plus_one_storm",
+            "generated_at": format!("@{ts}"),
+            "config": { "n_parents": n_parents, "seed_rows": seed_rows },
+            "basin": {
+                "n_plus_one_total_ms": basin_n1_ms,
+                "join_equivalent_ms": basin_join_ms,
+                "n_plus_one_over_join": basin_n1_ms / basin_join_ms.max(1e-9),
+            },
+            "postgres": {
+                "n_plus_one_total_ms": if pg_n1_ms.is_nan() { serde_json::Value::Null } else { json!(pg_n1_ms) },
+                "join_equivalent_ms": if pg_join_ms.is_nan() { serde_json::Value::Null } else { json!(pg_join_ms) },
+            },
+            "basin_over_pg_n1_ratio": if pg_n1_ms.is_finite() && pg_n1_ms > 1e-9 {
+                json!(basin_n1_ms / pg_n1_ms)
+            } else {
+                serde_json::Value::Null
+            },
+        }),
+    );
 
     instance.wal.close().await.unwrap();
 }
@@ -1097,16 +1246,17 @@ async fn read_scaling_curve() {
     let project = instance.project;
     let sess_seed = engine.open_session(project).await.unwrap();
 
-    sess_seed.execute(
-        "CREATE TABLE events (\
+    sess_seed
+        .execute(
+            "CREATE TABLE events (\
             id BIGINT NOT NULL PRIMARY KEY, \
             user_id BIGINT NOT NULL, \
             amount DOUBLE PRECISION NOT NULL, \
             status TEXT NOT NULL, \
             created_at BIGINT NOT NULL)",
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap();
 
     eprintln!("[scale] seeding {ROWS} rows ...");
     let batch = 10_000i64;
@@ -1115,7 +1265,9 @@ async fn read_scaling_curve() {
         let hi = (id + batch).min(ROWS);
         let mut stmt = String::from("INSERT INTO events VALUES ");
         for k in id..hi {
-            if k > id { stmt.push(','); }
+            if k > id {
+                stmt.push(',');
+            }
             stmt.push_str(&format!(
                 "({k},{},{},'{}',{})",
                 k % 100_000,
@@ -1138,12 +1290,16 @@ async fn read_scaling_curve() {
     let (pg_avail, pg_schema, pg_cs) = if let Some((pg, cs)) = try_connect().await {
         let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
         let schema = format!("basin_scale_{suffix}");
-        pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.unwrap();
+        pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .unwrap();
         pg.simple_query(&format!(
             "CREATE TABLE {schema}.events (\
                 id BIGINT PRIMARY KEY, user_id BIGINT, \
                 amount DOUBLE PRECISION, status TEXT, created_at BIGINT)"
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
         pg.simple_query("SET work_mem = '4MB'").await.unwrap();
         // Seed PG
         eprintln!("[scale] seeding PG {ROWS} rows ...");
@@ -1152,7 +1308,9 @@ async fn read_scaling_curve() {
             let hi = (pg_id + batch).min(ROWS);
             let mut stmt = format!("INSERT INTO {schema}.events VALUES ");
             for k in pg_id..hi {
-                if k > pg_id { stmt.push(','); }
+                if k > pg_id {
+                    stmt.push(',');
+                }
                 stmt.push_str(&format!(
                     "({k},{},{},'{}',{})",
                     k % 100_000,
@@ -1195,16 +1353,20 @@ async fn read_scaling_curve() {
                     let until = Instant::now() + deadline;
                     while Instant::now() < until {
                         let id_val = (next_u64(&mut rng) as i64).abs() % ROWS;
-                        let _ = sess.execute(&format!(
-                            "SELECT id, user_id, amount FROM events WHERE id = {id_val}"
-                        )).await;
+                        let _ = sess
+                            .execute(&format!(
+                                "SELECT id, user_id, amount FROM events WHERE id = {id_val}"
+                            ))
+                            .await;
                         count += 1;
                     }
                     count
                 });
             }
             let mut total: u64 = 0;
-            while let Some(r) = set.join_next().await { total += r.unwrap(); }
+            while let Some(r) = set.join_next().await {
+                total += r.unwrap();
+            }
             total as f64 / window_secs as f64
         };
 
@@ -1221,22 +1383,28 @@ async fn read_scaling_curve() {
                         Ok(v) => v,
                         Err(_) => return 0u64,
                     };
-                    tokio::spawn(async move { let _ = pgconn.await; });
+                    tokio::spawn(async move {
+                        let _ = pgconn.await;
+                    });
                     let mut rng: u64 = (task_idx as u64).wrapping_mul(0xB6B6B6B6).wrapping_add(1);
                     let mut count: u64 = 0;
                     let until = Instant::now() + deadline;
                     while Instant::now() < until {
                         let id_val = ((next_u64(&mut rng) % ROWS as u64) + 1) as i64;
-                        let _ = pgc.simple_query(&format!(
-                            "SELECT id, user_id, amount FROM {sch}.events WHERE id = {id_val}"
-                        )).await;
+                        let _ = pgc
+                            .simple_query(&format!(
+                                "SELECT id, user_id, amount FROM {sch}.events WHERE id = {id_val}"
+                            ))
+                            .await;
                         count += 1;
                     }
                     count
                 });
             }
             let mut total: u64 = 0;
-            while let Some(r) = set.join_next().await { total += r.unwrap(); }
+            while let Some(r) = set.join_next().await {
+                total += r.unwrap();
+            }
             total as f64 / window_secs as f64
         } else {
             f64::NAN
@@ -1244,16 +1412,33 @@ async fn read_scaling_curve() {
 
         println!(
             "[scale] C={:>2}: basin={:.1} qps | pg={:.1} qps | ratio={:.2}x",
-            c, b_total, p_total,
-            if p_total.is_finite() && p_total > 1e-9 { b_total / p_total } else { f64::NAN },
+            c,
+            b_total,
+            p_total,
+            if p_total.is_finite() && p_total > 1e-9 {
+                b_total / p_total
+            } else {
+                f64::NAN
+            },
         );
-        curve.push(CurvePoint { c, basin_qps: b_total, pg_qps: p_total });
+        curve.push(CurvePoint {
+            c,
+            basin_qps: b_total,
+            pg_qps: p_total,
+        });
     }
 
     // ── Assertions ────────────────────────────────────────────────────────────
     let qps_c1 = curve.first().map(|r| r.basin_qps).unwrap_or(0.0);
-    let peak_qps = curve.iter().map(|r| r.basin_qps).fold(f64::NEG_INFINITY, f64::max);
-    let peak_ratio = if qps_c1 > 1e-9 { peak_qps / qps_c1 } else { 0.0 };
+    let peak_qps = curve
+        .iter()
+        .map(|r| r.basin_qps)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let peak_ratio = if qps_c1 > 1e-9 {
+        peak_qps / qps_c1
+    } else {
+        0.0
+    };
     assert!(
         peak_ratio >= 3.0,
         "read_scaling_curve: peak Basin QPS {peak_qps:.1} = {peak_ratio:.2}× QPS(C=1) {qps_c1:.1}; expected ≥3×"
@@ -1289,23 +1474,30 @@ async fn read_scaling_curve() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    write_artifact("read_scaling_curve.json", &json!({
-        "card": "read_scaling_curve",
-        "generated_at": format!("@{ts}"),
-        "config": {
-            "seed_rows": ROWS,
-            "window_secs": window_secs,
-            "concurrencies": CONCURRENCIES.as_slice(),
-        },
-        "peak_speedup_vs_c1": peak_ratio,
-        "curve": json_curve,
-    }));
+    write_artifact(
+        "read_scaling_curve.json",
+        &json!({
+            "card": "read_scaling_curve",
+            "generated_at": format!("@{ts}"),
+            "config": {
+                "seed_rows": ROWS,
+                "window_secs": window_secs,
+                "concurrencies": CONCURRENCIES.as_slice(),
+            },
+            "peak_speedup_vs_c1": peak_ratio,
+            "curve": json_curve,
+        }),
+    );
 
     // Clean up PG schema (async-safe path: open a fresh connection)
     if pg_avail && !pg_schema.is_empty() {
         if let Ok((pgc, f)) = tokio_postgres::connect(&pg_cs, NoTls).await {
-            tokio::spawn(async move { let _ = f.await; });
-            let _ = pgc.simple_query(&format!("DROP SCHEMA IF EXISTS {pg_schema} CASCADE")).await;
+            tokio::spawn(async move {
+                let _ = f.await;
+            });
+            let _ = pgc
+                .simple_query(&format!("DROP SCHEMA IF EXISTS {pg_schema} CASCADE"))
+                .await;
         }
     }
 

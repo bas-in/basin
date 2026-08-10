@@ -75,7 +75,11 @@ async fn build_two_project_engine() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -143,9 +147,7 @@ async fn cross_project_dml_isolation() {
     let _ = b.execute("DROP TABLE secrets").await;
 
     // 1f. B tries ALTER A's table — must fail.
-    let _ = b
-        .execute("ALTER TABLE secrets ADD COLUMN owner TEXT")
-        .await;
+    let _ = b.execute("ALTER TABLE secrets ADD COLUMN owner TEXT").await;
 
     // After every attempt, A's secret is still intact.
     let still = a.execute("SELECT payload FROM secrets").await.unwrap();
@@ -177,7 +179,9 @@ async fn cross_project_dml_isolation() {
                     .as_any()
                     .downcast_ref::<arrow_array::StringArray>()
                     .unwrap();
-                (0..arr.len()).map(|i| arr.value(i).to_string()).collect::<Vec<_>>()
+                (0..arr.len())
+                    .map(|i| arr.value(i).to_string())
+                    .collect::<Vec<_>>()
             })
             .collect(),
         _ => panic!("expected rows"),
@@ -199,7 +203,9 @@ async fn cross_project_dml_isolation() {
                     .as_any()
                     .downcast_ref::<arrow_array::StringArray>()
                     .unwrap();
-                (0..arr.len()).map(|i| arr.value(i).to_string()).collect::<Vec<_>>()
+                (0..arr.len())
+                    .map(|i| arr.value(i).to_string())
+                    .collect::<Vec<_>>()
             })
             .collect(),
         _ => panic!("expected rows"),

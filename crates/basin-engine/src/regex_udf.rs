@@ -106,11 +106,12 @@ impl ScalarUDFImpl for SubstringRegexUdf {
             let pat = patterns.value(i);
 
             // Compile pattern (cached process-globally to avoid per-row cost).
-            let re = crate::string_dt_udf::get_or_compile_regex(pat, "")
-                .map_err(|e| DataFusionError::Execution(format!(
+            let re = crate::string_dt_udf::get_or_compile_regex(pat, "").map_err(|e| {
+                DataFusionError::Execution(format!(
                     "substring_regex: invalid regular expression {:?}: {e}",
                     pat
-                )))?;
+                ))
+            })?;
 
             // Find the first match.
             if let Some(caps) = re.captures(text) {

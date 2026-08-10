@@ -56,9 +56,7 @@ async fn build_engine() -> (
     let storage_dir = TempDir::new().unwrap();
     let wal_dir = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
-        object_store: Arc::new(
-            LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
-        ),
+        object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
         root_prefix: None,
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
@@ -66,9 +64,7 @@ async fn build_engine() -> (
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let wal: Arc<dyn Wal> = Arc::new(
         LocalWal::open(WalConfig {
-            object_store: Arc::new(
-                LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap(),
-            ),
+            object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
@@ -77,7 +73,11 @@ async fn build_engine() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -96,7 +96,9 @@ fn two_col_schema() -> Arc<Schema> {
 
 fn sequential_batch(start: i64, len: i64) -> RecordBatch {
     let ids: Int64Array = (start..start + len).collect();
-    let payloads: StringArray = (start..start + len).map(|v| Some(format!("p{v}"))).collect();
+    let payloads: StringArray = (start..start + len)
+        .map(|v| Some(format!("p{v}")))
+        .collect();
     RecordBatch::try_new(two_col_schema(), vec![Arc::new(ids), Arc::new(payloads)]).unwrap()
 }
 
@@ -162,8 +164,22 @@ async fn point_lookup_on_shard_prunes_all_files_for_absent_key() {
         .unwrap()
         .current_snapshot;
     snap = seed_cold_file(&engine, &project, &table, sequential_batch(0, 1000), snap).await;
-    snap = seed_cold_file(&engine, &project, &table, sequential_batch(2000, 1000), snap).await;
-    let _ = seed_cold_file(&engine, &project, &table, sequential_batch(4000, 1000), snap).await;
+    snap = seed_cold_file(
+        &engine,
+        &project,
+        &table,
+        sequential_batch(2000, 1000),
+        snap,
+    )
+    .await;
+    let _ = seed_cold_file(
+        &engine,
+        &project,
+        &table,
+        sequential_batch(4000, 1000),
+        snap,
+    )
+    .await;
 
     let before = engine.blooms_skipped_count();
 

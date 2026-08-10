@@ -221,11 +221,7 @@ pub(crate) async fn execute_knn_plan(
 
     // Ascending distance; total order via total_cmp (no NaN — Haversine is
     // finite and clamped). Stable secondary key (batch, row) for determinism.
-    scored.sort_by(|a, b| {
-        a.0.total_cmp(&b.0)
-            .then(a.1.cmp(&b.1))
-            .then(a.2.cmp(&b.2))
-    });
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     scored.truncate(plan.k);
 
     // Materialise the top-k rows: group surviving row indices by batch (in
@@ -303,15 +299,16 @@ fn project_batch(batch: &RecordBatch, cols: &Option<Vec<String>>) -> Result<Reco
 }
 
 /// Empty result with the user's projected schema (zero rows).
-fn empty_result(
-    table_schema: &Schema,
-    projection: &Option<Vec<String>>,
-) -> Result<ExecResult> {
+fn empty_result(table_schema: &Schema, projection: &Option<Vec<String>>) -> Result<ExecResult> {
     let df_schema = crate::convert::schema_ws_to_df(table_schema)
         .map_err(|e| BasinError::internal(format!("knn empty schema: {e}")))?;
     let names: Vec<String> = match projection {
         Some(c) => c.clone(),
-        None => df_schema.fields().iter().map(|f| f.name().clone()).collect(),
+        None => df_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect(),
     };
     let fields = names
         .iter()
@@ -323,7 +320,10 @@ fn empty_result(
         })
         .collect::<Result<Vec<_>>>()?;
     let schema = Arc::new(Schema::new(
-        fields.iter().map(|f| f.as_ref().clone()).collect::<Vec<_>>(),
+        fields
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect::<Vec<_>>(),
     ));
     let cols = fields
         .iter()

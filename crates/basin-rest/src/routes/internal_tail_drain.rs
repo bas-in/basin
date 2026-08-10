@@ -73,10 +73,9 @@ pub(crate) async fn post_tail_drain(
     // its own peers (A→B→A would spin, and the querying node already fans out
     // to every peer itself).
     let hop = required_header(&headers, PARTITION_FORWARD_HOP_HEADER)?;
-    let hop: u32 = hop
-        .trim()
-        .parse()
-        .map_err(|_| ApiError::invalid(format!("{PARTITION_FORWARD_HOP_HEADER} is not a number")))?;
+    let hop: u32 = hop.trim().parse().map_err(|_| {
+        ApiError::invalid(format!("{PARTITION_FORWARD_HOP_HEADER} is not a number"))
+    })?;
     if hop != 1 {
         return Err(ApiError::invalid(format!(
             "tail-drain hop must be 1 (got {hop}); the receiver never re-fans-out"
@@ -117,9 +116,7 @@ pub(crate) async fn post_tail_drain(
     // `Shard::flush_tables_for_read`). Only after the catalog commit do we ack
     // `had_tail:true` — the ack MEANS "the tail is now in committed segments".
     match shard.flush_tables_for_read(&project, &table).await {
-        Ok(()) => {
-            Ok((StatusCode::OK, Json(TailDrainResponse { had_tail: true })).into_response())
-        }
+        Ok(()) => Ok((StatusCode::OK, Json(TailDrainResponse { had_tail: true })).into_response()),
         // Typed retryable warming (boot convergence / lease handoff in
         // flight): 503 + machine-readable code so the client re-surfaces the
         // typed `PartitionWarming` (SQLSTATE 40001) instead of a hard error.

@@ -533,8 +533,16 @@ async fn cross_project_isolation_pg_namespace() {
         .await,
         "oid",
     );
-    assert_eq!(oids_a.len(), 1, "exactly one 'public' namespace row per project");
-    assert_eq!(oids_b.len(), 1, "exactly one 'public' namespace row per project");
+    assert_eq!(
+        oids_a.len(),
+        1,
+        "exactly one 'public' namespace row per project"
+    );
+    assert_eq!(
+        oids_b.len(),
+        1,
+        "exactly one 'public' namespace row per project"
+    );
     assert_ne!(
         oids_a[0], oids_b[0],
         "two projects must hash to disjoint namespace oids"

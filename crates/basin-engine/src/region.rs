@@ -178,11 +178,7 @@ pub(crate) async fn region_write_gate_insert(
 }
 
 /// Shared tail: forward to the registered forwarder, or raise WrongRegion.
-async fn forward_or_reject(
-    sess: &ProjectSession,
-    home: &str,
-    sql: &str,
-) -> Result<ExecResult> {
+async fn forward_or_reject(sess: &ProjectSession, home: &str, sql: &str) -> Result<ExecResult> {
     // A non-home write inside an explicit transaction is never forwarded
     // (cross-region transactional semantics are a non-goal). Fail loud.
     if in_explicit_transaction(sess) {

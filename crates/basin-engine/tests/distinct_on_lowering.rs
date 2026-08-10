@@ -78,7 +78,11 @@ fn col_ts_opt(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<Option<i6
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         for i in 0..arr.len() {
-            out.push(if arr.is_null(i) { None } else { Some(arr.value(i)) });
+            out.push(if arr.is_null(i) {
+                None
+            } else {
+                Some(arr.value(i))
+            });
         }
     }
     out
@@ -202,12 +206,20 @@ async fn distinct_on_ties_are_row_coherent() {
 
     // Group u1: winner must be one of the tied rows (11 or 12), at the max
     // timestamp, with amount from the SAME row.
-    assert!(ids[0] == 11 || ids[0] == 12, "u1 winner must be a tied-max row, got {}", ids[0]);
+    assert!(
+        ids[0] == 11 || ids[0] == 12,
+        "u1 winner must be a tied-max row, got {}",
+        ids[0]
+    );
     assert_eq!(amounts[0], ids[0] * 10, "u1 columns mixed across tied rows");
     assert_eq!(ts[0], Some(micros("2026-01-01T00:00:09Z")));
 
     // Group u2: all three rows tie; winner arbitrary but coherent.
-    assert!((21..=23).contains(&ids[1]), "u2 winner must be a tied row, got {}", ids[1]);
+    assert!(
+        (21..=23).contains(&ids[1]),
+        "u2 winner must be a tied row, got {}",
+        ids[1]
+    );
     assert_eq!(amounts[1], ids[1] * 10, "u2 columns mixed across tied rows");
     assert_eq!(ts[1], Some(micros("2026-01-02T00:00:05Z")));
 }
@@ -459,10 +471,7 @@ async fn distinct_on_lowering_fires_in_engine_plan() {
     );
     // The ON column is projected from the group key — never aggregated.
     for (idx, _) in plan.match_indices("first_value(") {
-        let arg_end = plan[idx..]
-            .find(')')
-            .map(|e| idx + e)
-            .unwrap_or(plan.len());
+        let arg_end = plan[idx..].find(')').map(|e| idx + e).unwrap_or(plan.len());
         let arg = &plan[idx..arg_end];
         assert!(
             !arg.contains("user_id"),

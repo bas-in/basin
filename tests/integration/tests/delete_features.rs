@@ -64,7 +64,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -328,7 +332,10 @@ async fn cascade_delete_children_and_grandchildren() {
 
     // Delete parent 1: cascade should remove children 10,11 and grandchildren
     // 100,101,110 — but leave parent 2's subtree intact.
-    let res = sess.execute("DELETE FROM parent WHERE id = 1").await.unwrap();
+    let res = sess
+        .execute("DELETE FROM parent WHERE id = 1")
+        .await
+        .unwrap();
     match res {
         ExecResult::Empty { tag } => assert_eq!(tag, "DELETE 1", "one parent row deleted"),
         other => panic!("DELETE returned non-Empty: {other:?}"),
@@ -373,16 +380,25 @@ async fn cascade_delete_zero_children() {
         .await
         .unwrap();
     // child references parent 2 only — parent 1 has no children.
-    sess.execute("INSERT INTO child VALUES (20,2)").await.unwrap();
+    sess.execute("INSERT INTO child VALUES (20,2)")
+        .await
+        .unwrap();
     shard.flush_to_parquet().await.unwrap();
 
-    let res = sess.execute("DELETE FROM parent WHERE id = 1").await.unwrap();
+    let res = sess
+        .execute("DELETE FROM parent WHERE id = 1")
+        .await
+        .unwrap();
     match res {
         ExecResult::Empty { tag } => assert_eq!(tag, "DELETE 1"),
         other => panic!("DELETE returned non-Empty: {other:?}"),
     }
     assert_eq!(count(&sess, "parent").await, 1, "parent 2 survives");
-    assert_eq!(count(&sess, "child").await, 1, "child untouched (0 children)");
+    assert_eq!(
+        count(&sess, "child").await,
+        1,
+        "child untouched (0 children)"
+    );
 
     bg.shutdown().await;
     wal.close().await.unwrap();
@@ -422,7 +438,11 @@ async fn non_cascade_fk_rejects_parent_delete() {
         "NO ACTION parent delete must be rejected (PG 23503); got: {msg}"
     );
     // Parent and child both survive — the delete was rejected, not partial.
-    assert_eq!(count(&sess, "parent").await, 1, "parent survives the reject");
+    assert_eq!(
+        count(&sess, "parent").await,
+        1,
+        "parent survives the reject"
+    );
     assert_eq!(count(&sess, "child").await, 1, "child survives the reject");
 
     bg.shutdown().await;

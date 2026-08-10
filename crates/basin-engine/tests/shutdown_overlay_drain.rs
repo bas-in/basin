@@ -38,10 +38,7 @@ fn disable_background_reconciler() {
 
 /// Build an engine over a SHARED catalog + storage dir so a second engine can
 /// be opened to model a process restart.
-fn engine_over(
-    catalog: Arc<dyn basin_catalog::Catalog>,
-    dir: &std::path::Path,
-) -> Engine {
+fn engine_over(catalog: Arc<dyn basin_catalog::Catalog>, dir: &std::path::Path) -> Engine {
     let fs = LocalFileSystem::new_with_prefix(dir).unwrap();
     let storage = basin_storage::Storage::new(basin_storage::StorageConfig {
         object_store: Arc::new(fs),

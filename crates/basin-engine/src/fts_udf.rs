@@ -108,29 +108,134 @@ use rust_stemmers::{Algorithm, Stemmer};
 /// for O(log n) lookup).  No contractions (apostrophe tokens are never
 /// produced by `tokenize()`, so contractions would be unreachable anyway).
 pub(crate) const STOPWORDS: &[&str] = &[
-    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
-    "any", "are", "as", "at",
-    "be", "because", "been", "before", "being", "below", "between", "both", "but", "by",
-    "cannot", "could",
-    "did", "do", "does", "doing", "down", "during",
+    "a",
+    "about",
+    "above",
+    "after",
+    "again",
+    "against",
+    "all",
+    "am",
+    "an",
+    "and",
+    "any",
+    "are",
+    "as",
+    "at",
+    "be",
+    "because",
+    "been",
+    "before",
+    "being",
+    "below",
+    "between",
+    "both",
+    "but",
+    "by",
+    "cannot",
+    "could",
+    "did",
+    "do",
+    "does",
+    "doing",
+    "down",
+    "during",
     "each",
-    "few", "for", "from", "further",
-    "get", "got",
-    "had", "has", "have", "having", "he", "her", "here", "hers", "herself", "him",
-    "himself", "his", "how",
-    "i", "if", "in", "into", "is", "it", "its", "itself",
+    "few",
+    "for",
+    "from",
+    "further",
+    "get",
+    "got",
+    "had",
+    "has",
+    "have",
+    "having",
+    "he",
+    "her",
+    "here",
+    "hers",
+    "herself",
+    "him",
+    "himself",
+    "his",
+    "how",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "itself",
     "just",
-    "me", "more", "most", "my", "myself",
-    "no", "nor", "not",
-    "of", "off", "on", "once", "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own",
-    "s", "same", "she", "should", "so", "some", "such",
-    "than", "that", "the", "their", "theirs", "them", "themselves", "then", "there", "these",
-    "they", "this", "those", "through", "to", "too",
-    "under", "until", "up",
+    "me",
+    "more",
+    "most",
+    "my",
+    "myself",
+    "no",
+    "nor",
+    "not",
+    "of",
+    "off",
+    "on",
+    "once",
+    "only",
+    "or",
+    "other",
+    "our",
+    "ours",
+    "ourselves",
+    "out",
+    "over",
+    "own",
+    "s",
+    "same",
+    "she",
+    "should",
+    "so",
+    "some",
+    "such",
+    "than",
+    "that",
+    "the",
+    "their",
+    "theirs",
+    "them",
+    "themselves",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "through",
+    "to",
+    "too",
+    "under",
+    "until",
+    "up",
     "very",
-    "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why",
-    "will", "with", "would",
-    "you", "your", "yours", "yourself", "yourselves",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "whom",
+    "why",
+    "will",
+    "with",
+    "would",
+    "you",
+    "your",
+    "yours",
+    "yourself",
+    "yourselves",
 ];
 
 fn is_stopword(w: &str) -> bool {
@@ -573,14 +678,12 @@ impl TsQuery {
                 }
             }
             TsQuery::Not(q) => TsQuery::Not(Box::new(q.stem_terms(lang))),
-            TsQuery::And(a, b) => TsQuery::And(
-                Box::new(a.stem_terms(lang)),
-                Box::new(b.stem_terms(lang)),
-            ),
-            TsQuery::Or(a, b) => TsQuery::Or(
-                Box::new(a.stem_terms(lang)),
-                Box::new(b.stem_terms(lang)),
-            ),
+            TsQuery::And(a, b) => {
+                TsQuery::And(Box::new(a.stem_terms(lang)), Box::new(b.stem_terms(lang)))
+            }
+            TsQuery::Or(a, b) => {
+                TsQuery::Or(Box::new(a.stem_terms(lang)), Box::new(b.stem_terms(lang)))
+            }
             TsQuery::Phrase(a, b, n) => TsQuery::Phrase(
                 Box::new(a.stem_terms(lang)),
                 Box::new(b.stem_terms(lang)),
@@ -981,8 +1084,9 @@ pub(crate) fn to_tsquery_text(
         // `to_tsvector` document side — required for `@@` matching AND for
         // GIN posting-list probe soundness (the probe consumes this
         // canonical form via `index_probe::detect_tsvector_match`).
-        "to_tsquery" => TsQuery::parse_to_tsquery(body)?
-            .map(|q| q.stem_terms(FtsLanguage::from_config(config))),
+        "to_tsquery" => {
+            TsQuery::parse_to_tsquery(body)?.map(|q| q.stem_terms(FtsLanguage::from_config(config)))
+        }
         "phraseto_tsquery" => TsQuery::phraseto(body, config),
         _ => TsQuery::plainto(body, config),
     };
@@ -1128,7 +1232,12 @@ fn sig_rank_cd() -> Signature {
             // (weights, tsvector, tsquery) — weights float32 array, ignored
             TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8]),
             // (weights, tsvector, tsquery, normalization_int32)
-            TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8, DataType::Int32]),
+            TypeSignature::Exact(vec![
+                DataType::Utf8,
+                DataType::Utf8,
+                DataType::Utf8,
+                DataType::Int32,
+            ]),
         ],
         Volatility::Immutable,
     )
@@ -1167,7 +1276,9 @@ fn arg_strings(arg: &ColumnarValue, n: usize) -> DFResult<StringArray> {
 /// batch — e.g. the ts_headline options / config disambiguator.
 fn first_non_null_string(arg: &ColumnarValue, n: usize) -> Option<String> {
     let arr = arg_strings(arg, n).ok()?;
-    (0..arr.len()).find(|&i| !arr.is_null(i)).map(|i| arr.value(i).to_owned())
+    (0..arr.len())
+        .find(|&i| !arr.is_null(i))
+        .map(|i| arr.value(i).to_owned())
 }
 
 /// Heuristic: does this string look like a ts_headline *options* string
@@ -1275,9 +1386,7 @@ impl ScalarUDFImpl for ToTsqueryUdf {
                 // (same pipeline as to_tsvector) — see `to_tsquery_text`.
                 "to_tsquery" => TsQuery::parse_to_tsquery(text)
                     .map_err(|e| {
-                        datafusion::common::DataFusionError::Execution(format!(
-                            "to_tsquery: {e}"
-                        ))
+                        datafusion::common::DataFusionError::Execution(format!("to_tsquery: {e}"))
                     })?
                     .map(|q| q.stem_terms(FtsLanguage::from_config(cfg))),
                 "phraseto_tsquery" => TsQuery::phraseto(text, cfg),
@@ -1518,8 +1627,7 @@ impl ScalarUDFImpl for TsRankUdf {
                     // lexemes. A vector with no stored positions (bare-cast /
                     // stripped form) has zero counted positions, so we fall back
                     // to distinct-lexeme counting to keep those inputs scoring.
-                    let total_positions: usize =
-                        v.entries.iter().map(|(_, ps)| ps.len()).sum();
+                    let total_positions: usize = v.entries.iter().map(|(_, ps)| ps.len()).sum();
                     let terms = query_terms(&q);
                     if total_positions > 0 {
                         let hit_positions: usize = v
@@ -1678,14 +1786,11 @@ impl ScalarUDFImpl for TsRankCdUdf {
                     "ts_rank_cd: normalization arg: {e}"
                 ))
             })?;
-            let ints = arr
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| {
-                    datafusion::common::DataFusionError::Execution(
-                        "ts_rank_cd: normalization arg must be Int32".into(),
-                    )
-                })?;
+            let ints = arr.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                datafusion::common::DataFusionError::Execution(
+                    "ts_rank_cd: normalization arg must be Int32".into(),
+                )
+            })?;
             (0..n)
                 .map(|i| if ints.is_null(i) { 0 } else { ints.value(i) })
                 .collect()
@@ -1703,9 +1808,7 @@ impl ScalarUDFImpl for TsRankCdUdf {
             let q = TsQuery::parse_to_tsquery(tq.value(i)).ok().flatten();
             let norm = norm_flags[i];
             let score = match q {
-                Some(q) if q.matches(&v) => {
-                    ts_rank_cd_score(&v, &q, norm)
-                }
+                Some(q) if q.matches(&v) => ts_rank_cd_score(&v, &q, norm),
                 _ => 0.0f32,
             };
             out.push(score);
@@ -1750,10 +1853,7 @@ fn ts_rank_cd_score(v: &TsVector, q: &TsQuery, norm: i32) -> f32 {
     let n_terms = terms_vec.len();
 
     // Check that all required terms have at least one position in the vector.
-    let term_positions: Vec<&[u32]> = terms_vec
-        .iter()
-        .map(|t| v.positions(t))
-        .collect();
+    let term_positions: Vec<&[u32]> = terms_vec.iter().map(|t| v.positions(t)).collect();
 
     if term_positions.iter().any(|ps| ps.is_empty()) {
         // One or more positive terms have no stored positions — cannot form covers.
@@ -2099,7 +2199,11 @@ impl ScalarUDFImpl for TsHeadlineUdf {
                 continue;
             }
             let body = bodies.value(i);
-            let query = if queries.is_null(i) { "" } else { queries.value(i) };
+            let query = if queries.is_null(i) {
+                ""
+            } else {
+                queries.value(i)
+            };
             let opts_str: Option<&str> = match &opts_arr {
                 Some(Ok(arr)) if !arr.is_null(i) => Some(arr.value(i)),
                 _ => None,
@@ -2175,8 +2279,10 @@ impl HeadlineOptions {
                 "startsel" => opts.start_sel = val.to_string(),
                 "stopsel" => opts.stop_sel = val.to_string(),
                 "highlightall" => {
-                    opts.highlight_all =
-                        matches!(val.to_ascii_lowercase().as_str(), "true" | "on" | "1" | "yes");
+                    opts.highlight_all = matches!(
+                        val.to_ascii_lowercase().as_str(),
+                        "true" | "on" | "1" | "yes"
+                    );
                 }
                 _ => {} // unknown key — silently ignored (PG behaviour)
             }
@@ -2290,7 +2396,11 @@ fn headline_fragment(body: &str, query: &str, opts: &HeadlineOptions) -> String 
     // the document when there are no matching terms).
     if !hits.iter().any(|&h| h) {
         let end = opts.min_words.min(n);
-        let suffix = if n > end { format!(" {}", ELLIPSIS) } else { String::new() };
+        let suffix = if n > end {
+            format!(" {}", ELLIPSIS)
+        } else {
+            String::new()
+        };
         return format!(
             "{}{}",
             highlight_words(&words[..end], &terms, &opts.start_sel, &opts.stop_sel),
@@ -2305,13 +2415,7 @@ fn headline_fragment(body: &str, query: &str, opts: &HeadlineOptions) -> String 
     if opts.max_fragments == 0 {
         // Single best window.
         let (start, end) = best_window(&hits, n, window_size, opts.min_words);
-        render_fragments(
-            &[start..end],
-            &words,
-            n,
-            &terms,
-            opts,
-        )
+        render_fragments(&[start..end], &words, n, &terms, opts)
     } else {
         // Multiple non-overlapping windows.
         let mut chosen: Vec<std::ops::Range<usize>> = Vec::new();
@@ -2581,7 +2685,10 @@ mod tests {
         assert!(is_stopword("a"));
         assert!(!is_stopword("fox"));
         // Digit-hyphen-digit stays as one token.
-        assert_eq!(tokenize("version 2024-01-15"), vec!["version", "2024-01-15"]);
+        assert_eq!(
+            tokenize("version 2024-01-15"),
+            vec!["version", "2024-01-15"]
+        );
         // Possessive stripping.
         assert_eq!(tokenize("John's"), vec!["john"]);
     }
@@ -2811,6 +2918,9 @@ mod tests {
         assert!(q.matches(&v), "to_tsquery('runs') must match doc 'running'");
         // And the unstemmed cast form does NOT match — same divergence as PG.
         let raw = TsQuery::parse_to_tsquery("runs").unwrap().unwrap();
-        assert!(!raw.matches(&v), "'runs'::tsquery (unstemmed) must not match");
+        assert!(
+            !raw.matches(&v),
+            "'runs'::tsquery (unstemmed) must not match"
+        );
     }
 }

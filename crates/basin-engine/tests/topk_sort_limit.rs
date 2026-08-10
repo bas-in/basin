@@ -174,7 +174,9 @@ async fn explain_topk_fetch_reaches_sort_with_update_delete_overlay() {
     sess.execute("UPDATE topk_ev SET amount = 999 WHERE id = 2")
         .await
         .unwrap();
-    sess.execute("DELETE FROM topk_ev WHERE id = 6").await.unwrap();
+    sess.execute("DELETE FROM topk_ev WHERE id = 6")
+        .await
+        .unwrap();
 
     let plan = explain_text(
         &sess,
@@ -207,7 +209,9 @@ async fn order_by_limit_reflects_overlay_update_and_delete() {
     sess.execute("UPDATE topk_ev SET amount = 999 WHERE id = 2")
         .await
         .unwrap();
-    sess.execute("DELETE FROM topk_ev WHERE id = 6").await.unwrap();
+    sess.execute("DELETE FROM topk_ev WHERE id = 6")
+        .await
+        .unwrap();
 
     let batches = rows(
         &sess,
@@ -232,11 +236,9 @@ async fn order_by_limit_ties_resolved_by_id_tiebreaker() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TABLE tied_topk (id BIGINT NOT NULL PRIMARY KEY, amount BIGINT NOT NULL)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE tied_topk (id BIGINT NOT NULL PRIMARY KEY, amount BIGINT NOT NULL)")
+        .await
+        .unwrap();
     // All five rows tie on amount.
     sess.execute("INSERT INTO tied_topk VALUES (1, 7), (2, 7), (3, 7)")
         .await

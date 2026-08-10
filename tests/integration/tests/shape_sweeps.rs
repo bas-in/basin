@@ -56,7 +56,14 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 /// Standard in-process engine (Shard + WAL + LocalFileSystem).
-async fn build() -> (TempDir, TempDir, Engine, Shard, basin_shard::ShardBackgroundHandle, Arc<dyn Wal>) {
+async fn build() -> (
+    TempDir,
+    TempDir,
+    Engine,
+    Shard,
+    basin_shard::ShardBackgroundHandle,
+    Arc<dyn Wal>,
+) {
     let sd = TempDir::new().unwrap();
     let wd = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
@@ -77,9 +84,17 @@ async fn build() -> (TempDir, TempDir, Engine, Shard, basin_shard::ShardBackgrou
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
-    let engine = Engine::new(EngineConfig { storage, catalog, shard: Some(shard.clone()) });
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: Some(shard.clone()),
+    });
     (sd, wd, engine, shard, bg, wal)
 }
 
@@ -143,7 +158,11 @@ async fn in_list_sweep() {
 
     // ── Basin setup ──────────────────────────────────────────────────────────
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     sess.execute(
         "CREATE TABLE events (\
             id BIGINT NOT NULL PRIMARY KEY, \
@@ -162,7 +181,9 @@ async fn in_list_sweep() {
         let hi = (id + batch).min(ROWS);
         let mut stmt = String::from("INSERT INTO events VALUES ");
         for k in id..hi {
-            if k > id { stmt.push(','); }
+            if k > id {
+                stmt.push(',');
+            }
             let status = status_for(k);
             stmt.push_str(&format!(
                 "({k},{},{},'{status}',{})",
@@ -175,7 +196,9 @@ async fn in_list_sweep() {
         id = hi;
     }
     instance.shard.flush_to_parquet().await.unwrap();
-    if let Some(bg) = instance.bg.take() { bg.shutdown().await; }
+    if let Some(bg) = instance.bg.take() {
+        bg.shutdown().await;
+    }
 
     // Helper: build an IN-list of `n` scattered ids
     let make_in_list = |n: usize, seed: u64| -> Vec<i64> {
@@ -194,7 +217,10 @@ async fn in_list_sweep() {
     };
 
     let ids_to_sql = |ids: &[i64]| -> String {
-        ids.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+        ids.iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
     };
 
     // ── Measure Basin ────────────────────────────────────────────────────────
@@ -209,10 +235,10 @@ async fn in_list_sweep() {
     let mut results: Vec<ShapeResult> = Vec::new();
 
     let shapes: Vec<(&'static str, usize, bool)> = vec![
-        ("IN(10) scattered",        10,   false),
-        ("IN(100) scattered",       100,  false),
-        ("IN(1000) scattered",      1000, false),
-        ("IN(50) contiguous band",  50,   true),  // contiguous
+        ("IN(10) scattered", 10, false),
+        ("IN(100) scattered", 100, false),
+        ("IN(1000) scattered", 1000, false),
+        ("IN(50) contiguous band", 50, true), // contiguous
     ];
 
     for (label, n, contiguous) in &shapes {
@@ -226,10 +252,12 @@ async fn in_list_sweep() {
         } else {
             make_in_list(n, 0xDEAD)
         };
-        let _ = sess.execute(&format!(
-            "SELECT id, user_id, amount FROM events WHERE id IN ({})",
-            ids_to_sql(&probe_ids)
-        )).await;
+        let _ = sess
+            .execute(&format!(
+                "SELECT id, user_id, amount FROM events WHERE id IN ({})",
+                ids_to_sql(&probe_ids)
+            ))
+            .await;
 
         for s in 0..samples {
             let ids = if contiguous {
@@ -273,13 +301,20 @@ async fn in_list_sweep() {
     if let Some((pg, cs)) = try_connect().await {
         let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
         let schema = format!("basin_inlist_{suffix}");
-        let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-        pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.unwrap();
+        let _guard = SchemaGuard {
+            schema: schema.clone(),
+            conn_str: cs,
+        };
+        pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .unwrap();
         pg.simple_query(&format!(
             "CREATE TABLE {schema}.events (\
                 id BIGINT PRIMARY KEY, user_id BIGINT, \
                 amount DOUBLE PRECISION, status TEXT, created_at BIGINT)"
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
         pg.simple_query("SET work_mem = '4MB'").await.unwrap();
 
         let mut pg_id = 0i64;
@@ -287,11 +322,15 @@ async fn in_list_sweep() {
             let hi = (pg_id + batch).min(ROWS);
             let mut stmt = format!("INSERT INTO {schema}.events VALUES ");
             for k in pg_id..hi {
-                if k > pg_id { stmt.push(','); }
+                if k > pg_id {
+                    stmt.push(',');
+                }
                 let status = status_for(k);
                 stmt.push_str(&format!(
                     "({k},{},{},'{status}',{})",
-                    k % 100_000, 0.5 + (k % 100) as f64, EPOCH + k,
+                    k % 100_000,
+                    0.5 + (k % 100) as f64,
+                    EPOCH + k,
                 ));
             }
             pg.simple_query(&stmt).await.unwrap();
@@ -309,10 +348,12 @@ async fn in_list_sweep() {
             } else {
                 make_in_list(n, 0xBEEF)
             };
-            let _ = pg.simple_query(&format!(
-                "SELECT id, user_id, amount FROM {schema}.events WHERE id IN ({})",
-                ids_to_sql(&probe_ids)
-            )).await;
+            let _ = pg
+                .simple_query(&format!(
+                    "SELECT id, user_id, amount FROM {schema}.events WHERE id IN ({})",
+                    ids_to_sql(&probe_ids)
+                ))
+                .await;
 
             for s in 0..samples {
                 let ids = if contiguous {
@@ -322,13 +363,19 @@ async fn in_list_sweep() {
                     make_in_list(n, 0xDEEF + s as u64)
                 };
                 let t = Instant::now();
-                let res = pg.simple_query(&format!(
-                    "SELECT id, user_id, amount FROM {schema}.events WHERE id IN ({})",
-                    ids_to_sql(&ids)
-                )).await.expect("pg in_list");
+                let res = pg
+                    .simple_query(&format!(
+                        "SELECT id, user_id, amount FROM {schema}.events WHERE id IN ({})",
+                        ids_to_sql(&ids)
+                    ))
+                    .await
+                    .expect("pg in_list");
                 pg_samples.push(t.elapsed().as_secs_f64() * 1000.0);
                 // Verify row count parity with Basin (use same ids)
-                let pg_rows: usize = res.iter().filter(|m| matches!(m, SimpleQueryMessage::Row(_))).count();
+                let pg_rows: usize = res
+                    .iter()
+                    .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
+                    .count();
                 let _ = pg_rows; // counts checked; exact match may vary by PG version
             }
 
@@ -355,13 +402,19 @@ async fn in_list_sweep() {
         } else { serde_json::Value::Null },
     })).collect();
 
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("in_list_sweep.json", &json!({
-        "card": "in_list_sweep",
-        "generated_at": format!("@{ts}"),
-        "config": { "rows": ROWS, "samples": samples },
-        "shapes": json_rows,
-    }));
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "in_list_sweep.json",
+        &json!({
+            "card": "in_list_sweep",
+            "generated_at": format!("@{ts}"),
+            "config": { "rows": ROWS, "samples": samples },
+            "shapes": json_rows,
+        }),
+    );
 
     instance.wal.close().await.unwrap();
 }
@@ -412,7 +465,11 @@ async fn wide_row_sweep() {
 
     // ── Basin setup ──────────────────────────────────────────────────────────
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     sess.execute(wide_ddl).await.unwrap();
 
     // Seed: one INSERT per batch of 5k rows; each row has all 50 columns filled.
@@ -424,15 +481,30 @@ async fn wide_row_sweep() {
         let mut stmt = String::with_capacity((hi - id) as usize * 512);
         stmt.push_str("INSERT INTO wide_events VALUES ");
         for k in id..hi {
-            if k > id { stmt.push(','); }
+            if k > id {
+                stmt.push(',');
+            }
             // 20 text cols
-            let texts: String = (1..=20).map(|c| format!("'txt{c}_{k}'")).collect::<Vec<_>>().join(",");
+            let texts: String = (1..=20)
+                .map(|c| format!("'txt{c}_{k}'"))
+                .collect::<Vec<_>>()
+                .join(",");
             // 15 double cols
-            let doubles: String = (0..15).map(|c| format!("{:.4}", 1.0 + (k * 15 + c) as f64 * 0.001)).collect::<Vec<_>>().join(",");
+            let doubles: String = (0..15)
+                .map(|c| format!("{:.4}", 1.0 + (k * 15 + c) as f64 * 0.001))
+                .collect::<Vec<_>>()
+                .join(",");
             // 10 bigint cols
-            let ints: String = (0..10).map(|c| format!("{}", k * 10 + c)).collect::<Vec<_>>().join(",");
+            let ints: String = (0..10)
+                .map(|c| format!("{}", k * 10 + c))
+                .collect::<Vec<_>>()
+                .join(",");
             // 4 bool cols
-            let bools = if k % 2 == 0 { "true,false,true,false" } else { "false,true,false,true" };
+            let bools = if k % 2 == 0 {
+                "true,false,true,false"
+            } else {
+                "false,true,false,true"
+            };
             stmt.push_str(&format!(
                 "({k},{texts},{doubles},{ints},{bools},'{{\"v\":{k}}}')"
             ));
@@ -441,14 +513,22 @@ async fn wide_row_sweep() {
         id = hi;
     }
     instance.shard.flush_to_parquet().await.unwrap();
-    if let Some(bg) = instance.bg.take() { bg.shutdown().await; }
+    if let Some(bg) = instance.bg.take() {
+        bg.shutdown().await;
+    }
     eprintln!("[wide] basin seed complete");
 
     // ── Measure Basin ─────────────────────────────────────────────────────────
     // Warm-up (symmetric projection matching)
     let target = rows / 2;
-    let _ = sess.execute(&format!("SELECT * FROM wide_events WHERE id = {target}")).await;
-    let _ = sess.execute(&format!("SELECT id, col01 FROM wide_events WHERE id = {target}")).await;
+    let _ = sess
+        .execute(&format!("SELECT * FROM wide_events WHERE id = {target}"))
+        .await;
+    let _ = sess
+        .execute(&format!(
+            "SELECT id, col01 FROM wide_events WHERE id = {target}"
+        ))
+        .await;
 
     let mut w1_samples: Vec<f64> = Vec::with_capacity(samples);
     let mut w2_samples: Vec<f64> = Vec::with_capacity(samples);
@@ -456,17 +536,28 @@ async fn wide_row_sweep() {
     for _ in 0..samples {
         let id_val = (next_u64(&mut rng) as i64).abs() % rows;
         let t = Instant::now();
-        let _ = sess.execute(&format!("SELECT * FROM wide_events WHERE id = {id_val}")).await.expect("W1");
+        let _ = sess
+            .execute(&format!("SELECT * FROM wide_events WHERE id = {id_val}"))
+            .await
+            .expect("W1");
         w1_samples.push(t.elapsed().as_secs_f64() * 1000.0);
 
         let t = Instant::now();
-        let _ = sess.execute(&format!("SELECT id, col01 FROM wide_events WHERE id = {id_val}")).await.expect("W2");
+        let _ = sess
+            .execute(&format!(
+                "SELECT id, col01 FROM wide_events WHERE id = {id_val}"
+            ))
+            .await
+            .expect("W2");
         w2_samples.push(t.elapsed().as_secs_f64() * 1000.0);
     }
 
     // W3/W4 are full-table scans — one shot each (expensive, single measurement)
     let t = Instant::now();
-    let _ = sess.execute("SELECT id, col01 FROM wide_events").await.expect("W3");
+    let _ = sess
+        .execute("SELECT id, col01 FROM wide_events")
+        .await
+        .expect("W3");
     let w3_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     let t = Instant::now();
@@ -490,15 +581,19 @@ async fn wide_row_sweep() {
     );
 
     // ── PG twin ───────────────────────────────────────────────────────────────
-    let (pg_w1_p50, pg_w2_p50, pg_w3_ms, pg_w4_ms) =
-        if let Some((pg, cs)) = try_connect().await {
-            let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
-            let schema = format!("basin_wide_{suffix}");
-            let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-            pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.unwrap();
-            pg.simple_query("SET work_mem = '4MB'").await.unwrap();
-            pg.simple_query(&format!(
-                "CREATE TABLE {schema}.wide_events (\
+    let (pg_w1_p50, pg_w2_p50, pg_w3_ms, pg_w4_ms) = if let Some((pg, cs)) = try_connect().await {
+        let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
+        let schema = format!("basin_wide_{suffix}");
+        let _guard = SchemaGuard {
+            schema: schema.clone(),
+            conn_str: cs,
+        };
+        pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .unwrap();
+        pg.simple_query("SET work_mem = '4MB'").await.unwrap();
+        pg.simple_query(&format!(
+            "CREATE TABLE {schema}.wide_events (\
                     id BIGINT PRIMARY KEY, \
                     col01 TEXT, col02 TEXT, col03 TEXT, col04 TEXT, col05 TEXT, \
                     col06 TEXT, col07 TEXT, col08 TEXT, col09 TEXT, col10 TEXT, \
@@ -513,95 +608,146 @@ async fn wide_row_sweep() {
                     col41 BIGINT, col42 BIGINT, col43 BIGINT, col44 BIGINT, col45 BIGINT, \
                     col46 BOOLEAN, col47 BOOLEAN, col48 BOOLEAN, col49 BOOLEAN, \
                     payload JSONB)"
-            )).await.unwrap();
+        ))
+        .await
+        .unwrap();
 
-            let mut pg_id = 0i64;
-            while pg_id < rows {
-                let hi = (pg_id + batch).min(rows);
-                let mut stmt = format!("INSERT INTO {schema}.wide_events VALUES ");
-                for k in pg_id..hi {
-                    if k > pg_id { stmt.push(','); }
-                    let texts: String = (1..=20).map(|c| format!("'txt{c}_{k}'")).collect::<Vec<_>>().join(",");
-                    let doubles: String = (0..15).map(|c| format!("{:.4}", 1.0 + (k * 15 + c) as f64 * 0.001)).collect::<Vec<_>>().join(",");
-                    let ints: String = (0..10).map(|c| format!("{}", k * 10 + c)).collect::<Vec<_>>().join(",");
-                    let bools = if k % 2 == 0 { "true,false,true,false" } else { "false,true,false,true" };
-                    stmt.push_str(&format!("({k},{texts},{doubles},{ints},{bools},'{{\"v\":{k}}}')"));
+        let mut pg_id = 0i64;
+        while pg_id < rows {
+            let hi = (pg_id + batch).min(rows);
+            let mut stmt = format!("INSERT INTO {schema}.wide_events VALUES ");
+            for k in pg_id..hi {
+                if k > pg_id {
+                    stmt.push(',');
                 }
-                pg.simple_query(&stmt).await.unwrap();
-                pg_id = hi;
+                let texts: String = (1..=20)
+                    .map(|c| format!("'txt{c}_{k}'"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let doubles: String = (0..15)
+                    .map(|c| format!("{:.4}", 1.0 + (k * 15 + c) as f64 * 0.001))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let ints: String = (0..10)
+                    .map(|c| format!("{}", k * 10 + c))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let bools = if k % 2 == 0 {
+                    "true,false,true,false"
+                } else {
+                    "false,true,false,true"
+                };
+                stmt.push_str(&format!(
+                    "({k},{texts},{doubles},{ints},{bools},'{{\"v\":{k}}}')"
+                ));
             }
+            pg.simple_query(&stmt).await.unwrap();
+            pg_id = hi;
+        }
 
-            let _ = pg.simple_query(&format!("SELECT * FROM {schema}.wide_events WHERE id = {target}")).await;
-            let _ = pg.simple_query(&format!("SELECT id, col01 FROM {schema}.wide_events WHERE id = {target}")).await;
+        let _ = pg
+            .simple_query(&format!(
+                "SELECT * FROM {schema}.wide_events WHERE id = {target}"
+            ))
+            .await;
+        let _ = pg
+            .simple_query(&format!(
+                "SELECT id, col01 FROM {schema}.wide_events WHERE id = {target}"
+            ))
+            .await;
 
-            let mut pg_w1: Vec<f64> = Vec::with_capacity(samples);
-            let mut pg_w2: Vec<f64> = Vec::with_capacity(samples);
-            rng = 0xABC_DEF; // same ids as Basin
-            for _ in 0..samples {
-                let id_val = (next_u64(&mut rng) as i64).abs() % rows;
-                let t = Instant::now();
-                let _ = pg.simple_query(&format!("SELECT * FROM {schema}.wide_events WHERE id = {id_val}")).await;
-                pg_w1.push(t.elapsed().as_secs_f64() * 1000.0);
-
-                let t = Instant::now();
-                let _ = pg.simple_query(&format!("SELECT id, col01 FROM {schema}.wide_events WHERE id = {id_val}")).await;
-                pg_w2.push(t.elapsed().as_secs_f64() * 1000.0);
-            }
+        let mut pg_w1: Vec<f64> = Vec::with_capacity(samples);
+        let mut pg_w2: Vec<f64> = Vec::with_capacity(samples);
+        rng = 0xABC_DEF; // same ids as Basin
+        for _ in 0..samples {
+            let id_val = (next_u64(&mut rng) as i64).abs() % rows;
+            let t = Instant::now();
+            let _ = pg
+                .simple_query(&format!(
+                    "SELECT * FROM {schema}.wide_events WHERE id = {id_val}"
+                ))
+                .await;
+            pg_w1.push(t.elapsed().as_secs_f64() * 1000.0);
 
             let t = Instant::now();
-            let _ = pg.simple_query(&format!("SELECT id, col01 FROM {schema}.wide_events")).await;
-            let pw3 = t.elapsed().as_secs_f64() * 1000.0;
+            let _ = pg
+                .simple_query(&format!(
+                    "SELECT id, col01 FROM {schema}.wide_events WHERE id = {id_val}"
+                ))
+                .await;
+            pg_w2.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
 
-            let t = Instant::now();
-            let _ = pg.simple_query(&format!("SELECT * FROM {schema}.wide_events")).await;
-            let pw4 = t.elapsed().as_secs_f64() * 1000.0;
+        let t = Instant::now();
+        let _ = pg
+            .simple_query(&format!("SELECT id, col01 FROM {schema}.wide_events"))
+            .await;
+        let pw3 = t.elapsed().as_secs_f64() * 1000.0;
 
-            let pw1 = median(&pg_w1);
-            let pw2 = median(&pg_w2);
-            println!("[wide] PG W1 (SELECT * point):   p50={pw1:.3}ms");
-            println!("[wide] PG W2 (2-col point):      p50={pw2:.3}ms");
-            println!("[wide] PG W3 (2-col scan):       {pw3:.1}ms");
-            println!("[wide] PG W4 (SELECT * scan):    {pw4:.1}ms");
-            std::mem::forget(_guard);
-            (pw1, pw2, pw3, pw4)
+        let t = Instant::now();
+        let _ = pg
+            .simple_query(&format!("SELECT * FROM {schema}.wide_events"))
+            .await;
+        let pw4 = t.elapsed().as_secs_f64() * 1000.0;
+
+        let pw1 = median(&pg_w1);
+        let pw2 = median(&pg_w2);
+        println!("[wide] PG W1 (SELECT * point):   p50={pw1:.3}ms");
+        println!("[wide] PG W2 (2-col point):      p50={pw2:.3}ms");
+        println!("[wide] PG W3 (2-col scan):       {pw3:.1}ms");
+        println!("[wide] PG W4 (SELECT * scan):    {pw4:.1}ms");
+        std::mem::forget(_guard);
+        (pw1, pw2, pw3, pw4)
+    } else {
+        eprintln!("[wide] PG unavailable — Basin-only");
+        (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
+    };
+
+    let nan_null = |v: f64| {
+        if v.is_nan() {
+            serde_json::Value::Null
         } else {
-            eprintln!("[wide] PG unavailable — Basin-only");
-            (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
-        };
-
-    let nan_null = |v: f64| if v.is_nan() { serde_json::Value::Null } else { json!(v) };
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("wide_row_sweep.json", &json!({
-        "card": "wide_row_sweep",
-        "generated_at": format!("@{ts}"),
-        "config": { "rows": rows, "cols": 50, "samples": samples },
-        "shapes": [
-            {
-                "label": "W1: SELECT * WHERE id=? (50 cols)",
-                "basin_p50_ms": basin_w1_p50,
-                "pg_p50_ms": nan_null(pg_w1_p50),
-                "basin_over_pg": if pg_w1_p50.is_finite() && pg_w1_p50 > 1e-9 { json!(basin_w1_p50 / pg_w1_p50) } else { serde_json::Value::Null },
-            },
-            {
-                "label": "W2: SELECT id, col01 WHERE id=? (2 cols)",
-                "basin_p50_ms": basin_w2_p50,
-                "pg_p50_ms": nan_null(pg_w2_p50),
-                "basin_over_pg": if pg_w2_p50.is_finite() && pg_w2_p50 > 1e-9 { json!(basin_w2_p50 / pg_w2_p50) } else { serde_json::Value::Null },
-            },
-            {
-                "label": "W3: SELECT id, col01 FROM ... (full scan, 2 cols)",
-                "basin_ms": w3_ms,
-                "pg_ms": nan_null(pg_w3_ms),
-            },
-            {
-                "label": "W4: SELECT * FROM ... (full scan, 50 cols)",
-                "basin_ms": w4_ms,
-                "pg_ms": nan_null(pg_w4_ms),
-            },
-        ],
-        "basin_projection_speedup_w1_over_w2": proj_ratio,
-        "note": "W1/W2 ratio > 1 confirms column projection pushdown working; higher is better",
-    }));
+            json!(v)
+        }
+    };
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "wide_row_sweep.json",
+        &json!({
+            "card": "wide_row_sweep",
+            "generated_at": format!("@{ts}"),
+            "config": { "rows": rows, "cols": 50, "samples": samples },
+            "shapes": [
+                {
+                    "label": "W1: SELECT * WHERE id=? (50 cols)",
+                    "basin_p50_ms": basin_w1_p50,
+                    "pg_p50_ms": nan_null(pg_w1_p50),
+                    "basin_over_pg": if pg_w1_p50.is_finite() && pg_w1_p50 > 1e-9 { json!(basin_w1_p50 / pg_w1_p50) } else { serde_json::Value::Null },
+                },
+                {
+                    "label": "W2: SELECT id, col01 WHERE id=? (2 cols)",
+                    "basin_p50_ms": basin_w2_p50,
+                    "pg_p50_ms": nan_null(pg_w2_p50),
+                    "basin_over_pg": if pg_w2_p50.is_finite() && pg_w2_p50 > 1e-9 { json!(basin_w2_p50 / pg_w2_p50) } else { serde_json::Value::Null },
+                },
+                {
+                    "label": "W3: SELECT id, col01 FROM ... (full scan, 2 cols)",
+                    "basin_ms": w3_ms,
+                    "pg_ms": nan_null(pg_w3_ms),
+                },
+                {
+                    "label": "W4: SELECT * FROM ... (full scan, 50 cols)",
+                    "basin_ms": w4_ms,
+                    "pg_ms": nan_null(pg_w4_ms),
+                },
+            ],
+            "basin_projection_speedup_w1_over_w2": proj_ratio,
+            "note": "W1/W2 ratio > 1 confirms column projection pushdown working; higher is better",
+        }),
+    );
 
     instance.wal.close().await.unwrap();
 }
@@ -632,7 +778,11 @@ async fn pagination_sweep() {
 
     // ── Basin setup ──────────────────────────────────────────────────────────
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     sess.execute(
         "CREATE TABLE events (\
             id BIGINT NOT NULL PRIMARY KEY, \
@@ -651,7 +801,9 @@ async fn pagination_sweep() {
         let hi = (id + batch).min(ROWS);
         let mut stmt = String::from("INSERT INTO events VALUES ");
         for k in id..hi {
-            if k > id { stmt.push(','); }
+            if k > id {
+                stmt.push(',');
+            }
             let status = status_for(k);
             stmt.push_str(&format!(
                 "({k},{},{},'{status}',{})",
@@ -664,7 +816,9 @@ async fn pagination_sweep() {
         id = hi;
     }
     instance.shard.flush_to_parquet().await.unwrap();
-    if let Some(bg) = instance.bg.take() { bg.shutdown().await; }
+    if let Some(bg) = instance.bg.take() {
+        bg.shutdown().await;
+    }
 
     // Keyset cursor: pick a cursor at ~depth 100k from the end of the range.
     // created_at = EPOCH + id, so OFFSET 100k from descending end = EPOCH + ROWS - 100_000.
@@ -721,13 +875,20 @@ async fn pagination_sweep() {
     if let Some((pg, cs)) = try_connect().await {
         let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
         let schema = format!("basin_pagi_{suffix}");
-        let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-        pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.unwrap();
+        let _guard = SchemaGuard {
+            schema: schema.clone(),
+            conn_str: cs,
+        };
+        pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .unwrap();
         pg.simple_query(&format!(
             "CREATE TABLE {schema}.events (\
                 id BIGINT PRIMARY KEY, user_id BIGINT, \
                 amount DOUBLE PRECISION, status TEXT, created_at BIGINT)"
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
         pg.simple_query("SET work_mem = '4MB'").await.unwrap();
         pg.simple_query("SET enable_seqscan = on").await.unwrap();
 
@@ -736,11 +897,15 @@ async fn pagination_sweep() {
             let hi = (pg_id + batch).min(ROWS);
             let mut stmt = format!("INSERT INTO {schema}.events VALUES ");
             for k in pg_id..hi {
-                if k > pg_id { stmt.push(','); }
+                if k > pg_id {
+                    stmt.push(',');
+                }
                 let status = status_for(k);
                 stmt.push_str(&format!(
                     "({k},{},{},'{status}',{})",
-                    k % 100_000, 0.5 + (k % 100) as f64, EPOCH + k,
+                    k % 100_000,
+                    0.5 + (k % 100) as f64,
+                    EPOCH + k,
                 ));
             }
             pg.simple_query(&stmt).await.unwrap();
@@ -794,27 +959,50 @@ async fn pagination_sweep() {
         f64::NAN
     };
 
-    let nan_null = |v: f64| if v.is_nan() { serde_json::Value::Null } else { json!(v) };
-    let shape_labels = ["P1 OFFSET 100", "P2 OFFSET 10000", "P3 OFFSET 100000", "P4 keyset"];
-    let json_shapes: Vec<serde_json::Value> = shape_labels.iter().enumerate().map(|(i, l)| json!({
-        "label": l,
-        "basin_p50_ms": basin_p50s[i],
-        "pg_p50_ms": nan_null(pg_p50s[i]),
-        "basin_over_pg": if pg_p50s[i].is_finite() && pg_p50s[i] > 1e-9 {
-            json!(basin_p50s[i] / pg_p50s[i])
-        } else { serde_json::Value::Null },
-    })).collect();
+    let nan_null = |v: f64| {
+        if v.is_nan() {
+            serde_json::Value::Null
+        } else {
+            json!(v)
+        }
+    };
+    let shape_labels = [
+        "P1 OFFSET 100",
+        "P2 OFFSET 10000",
+        "P3 OFFSET 100000",
+        "P4 keyset",
+    ];
+    let json_shapes: Vec<serde_json::Value> = shape_labels
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            json!({
+                "label": l,
+                "basin_p50_ms": basin_p50s[i],
+                "pg_p50_ms": nan_null(pg_p50s[i]),
+                "basin_over_pg": if pg_p50s[i].is_finite() && pg_p50s[i] > 1e-9 {
+                    json!(basin_p50s[i] / pg_p50s[i])
+                } else { serde_json::Value::Null },
+            })
+        })
+        .collect();
 
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("pagination_sweep.json", &json!({
-        "card": "pagination_sweep",
-        "generated_at": format!("@{ts}"),
-        "config": { "rows": ROWS, "samples": samples, "keyset_cursor": keyset_cursor },
-        "shapes": json_shapes,
-        "basin_deep_offset_penalty_p3_over_p4": basin_deep_penalty,
-        "pg_deep_offset_penalty_p3_over_p4": nan_null(pg_deep_penalty),
-        "note": "P3/P4 ratio > 1 shows deep-offset cost; keyset pagination avoids full sort",
-    }));
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "pagination_sweep.json",
+        &json!({
+            "card": "pagination_sweep",
+            "generated_at": format!("@{ts}"),
+            "config": { "rows": ROWS, "samples": samples, "keyset_cursor": keyset_cursor },
+            "shapes": json_shapes,
+            "basin_deep_offset_penalty_p3_over_p4": basin_deep_penalty,
+            "pg_deep_offset_penalty_p3_over_p4": nan_null(pg_deep_penalty),
+            "note": "P3/P4 ratio > 1 shows deep-offset cost; keyset pagination avoids full sort",
+        }),
+    );
 
     instance.wal.close().await.unwrap();
 }

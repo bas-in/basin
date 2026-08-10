@@ -49,4 +49,4 @@
 
 pub mod scaler;
 
-pub use scaler::{ScaleDecision, Scaler, ScalerConfig, ProjectSnapshot};
+pub use scaler::{ProjectSnapshot, ScaleDecision, Scaler, ScalerConfig};

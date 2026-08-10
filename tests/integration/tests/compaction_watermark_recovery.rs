@@ -276,8 +276,7 @@ async fn legacy_catalog_without_watermark_replays_correctly() {
         .unwrap();
     assert_eq!(wm, None, "fresh partition has no watermark");
 
-    let wal: Arc<dyn Wal> =
-        Arc::new(LocalWal::open(quiet_wal_cfg(wal_dir.path())).await.unwrap());
+    let wal: Arc<dyn Wal> = Arc::new(LocalWal::open(quiet_wal_cfg(wal_dir.path())).await.unwrap());
     let shard = Shard::new(ShardConfig::new(
         storage.clone(),
         catalog.clone(),
@@ -304,7 +303,10 @@ async fn watermark_is_monotonic() {
     let part = "default";
 
     assert_eq!(
-        catalog.get_compaction_watermark(&project, part).await.unwrap(),
+        catalog
+            .get_compaction_watermark(&project, part)
+            .await
+            .unwrap(),
         None,
     );
 
@@ -313,7 +315,10 @@ async fn watermark_is_monotonic() {
         .await
         .unwrap();
     assert_eq!(
-        catalog.get_compaction_watermark(&project, part).await.unwrap(),
+        catalog
+            .get_compaction_watermark(&project, part)
+            .await
+            .unwrap(),
         Some(10),
     );
 
@@ -323,7 +328,10 @@ async fn watermark_is_monotonic() {
         .await
         .unwrap();
     assert_eq!(
-        catalog.get_compaction_watermark(&project, part).await.unwrap(),
+        catalog
+            .get_compaction_watermark(&project, part)
+            .await
+            .unwrap(),
         Some(10),
         "watermark must never rewind",
     );
@@ -334,7 +342,10 @@ async fn watermark_is_monotonic() {
         .await
         .unwrap();
     assert_eq!(
-        catalog.get_compaction_watermark(&project, part).await.unwrap(),
+        catalog
+            .get_compaction_watermark(&project, part)
+            .await
+            .unwrap(),
         Some(99),
     );
 }

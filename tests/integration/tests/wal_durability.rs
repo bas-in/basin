@@ -73,7 +73,10 @@ async fn durable_append_survives_immediate_reopen() {
     // No flush(), no close() — simulate the writer being killed right after
     // the ack.
     let recovered = reopen_wal(dir.path()).await;
-    let entries = recovered.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+    let entries = recovered
+        .read_from(&project, &part, Lsn::ZERO)
+        .await
+        .unwrap();
     assert_eq!(
         entries.len(),
         1,
@@ -101,7 +104,10 @@ async fn async_append_is_ram_only_until_flush() {
 
     {
         let crash_view = reopen_wal(dir.path()).await;
-        let entries = crash_view.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+        let entries = crash_view
+            .read_from(&project, &part, Lsn::ZERO)
+            .await
+            .unwrap();
         assert!(
             entries.is_empty(),
             "async append is ack-before-durable: a kill inside the flush \
@@ -112,7 +118,10 @@ async fn async_append_is_ram_only_until_flush() {
 
     wal.flush().await.unwrap();
     let recovered = reopen_wal(dir.path()).await;
-    let entries = recovered.read_from(&project, &part, Lsn::ZERO).await.unwrap();
+    let entries = recovered
+        .read_from(&project, &part, Lsn::ZERO)
+        .await
+        .unwrap();
     assert_eq!(entries.len(), 1, "flushed async append must survive reopen");
     recovered.close().await.unwrap();
     wal.close().await.unwrap();
@@ -128,18 +137,18 @@ async fn async_append_is_ram_only_until_flush() {
 async fn build_engine(wal_dir: &TempDir, storage_dir: &TempDir) -> (Engine, Arc<dyn Wal>) {
     basin_common::telemetry::try_init_for_tests();
     let storage = Storage::new(StorageConfig {
-        object_store: Arc::new(
-            LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
-        ),
+        object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
         root_prefix: None,
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let wal: Arc<dyn Wal> = Arc::new(
-        LocalWal::open(quiet_wal_cfg(wal_dir.path())).await.unwrap(),
-    );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let wal: Arc<dyn Wal> = Arc::new(LocalWal::open(quiet_wal_cfg(wal_dir.path())).await.unwrap());
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let engine = Engine::new(EngineConfig {
         storage,
         catalog,

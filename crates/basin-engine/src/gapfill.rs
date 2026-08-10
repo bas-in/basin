@@ -210,8 +210,13 @@ pub(crate) fn match_gapfill(sql: &str) -> Result<Option<GapfillRequest>, BasinEr
     // Build the rewritten SQL: gapfill→time_bucket (2-arg), strip locf and
     // interpolate wrappers.
     let rewritten = rewrite_sql(
-        sql, call_start, args_text, &interval_text, &ts_expr,
-        has_locf, has_interp,
+        sql,
+        call_start,
+        args_text,
+        &interval_text,
+        &ts_expr,
+        has_locf,
+        has_interp,
     )?;
 
     // Parse per-aggregate fill modes from the SELECT clause.
@@ -408,7 +413,8 @@ pub(crate) fn densify(
     // group_key: Vec<ScalarKey>; value: row index pointer (batch, row).
     let mut present: BTreeMap<(Vec<ScalarKey>, i64), (usize, usize)> = BTreeMap::new();
     let mut group_order: Vec<Vec<ScalarKey>> = Vec::new();
-    let mut seen_groups: std::collections::HashSet<Vec<ScalarKey>> = std::collections::HashSet::new();
+    let mut seen_groups: std::collections::HashSet<Vec<ScalarKey>> =
+        std::collections::HashSet::new();
 
     for (bi, batch) in batches.iter().enumerate() {
         let bucket_us = timestamp_column_to_us(batch.column(bucket_idx), unit)?;
@@ -458,7 +464,11 @@ pub(crate) fn densify(
             // If no fill_modes recorded (pre-fill-mode queries or all-NULL),
             // fall back to Locf when has_locf is set, else Null.
             let mode = if req.fill_modes.is_empty() {
-                if req.has_locf { FillMode::Locf } else { FillMode::Null }
+                if req.has_locf {
+                    FillMode::Locf
+                } else {
+                    FillMode::Null
+                }
             } else {
                 fill_iter.next().unwrap_or(FillMode::Null)
             };
@@ -533,12 +543,10 @@ pub(crate) fn densify(
                     // Synthetic (gap) row.
                     for (ai, &ac) in agg_cols.iter().enumerate() {
                         match agg_fill_modes[ai] {
-                            FillMode::Locf => {
-                                match &carry[ai] {
-                                    Some(sk) => builders[ac].push_scalar(sk),
-                                    None => builders[ac].push_null(),
-                                }
-                            }
+                            FillMode::Locf => match &carry[ai] {
+                                Some(sk) => builders[ac].push_scalar(sk),
+                                None => builders[ac].push_null(),
+                            },
                             FillMode::Interpolate | FillMode::Null => {
                                 // Both stay NULL in phase 1; interpolate will
                                 // patch in phase 2.
@@ -654,10 +662,14 @@ fn scalar_to_f64(sk: &ScalarKey) -> Option<f64> {
 fn f64_to_scalar(v: f64, dt: &DataType) -> Option<ScalarKey> {
     match dt {
         DataType::Float64 | DataType::Float32 => Some(ScalarKey::Float(v.to_bits())),
-        DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8
-        | DataType::UInt64 | DataType::UInt32 | DataType::UInt16 | DataType::UInt8 => {
-            Some(ScalarKey::Int(v.round() as i64))
-        }
+        DataType::Int64
+        | DataType::Int32
+        | DataType::Int16
+        | DataType::Int8
+        | DataType::UInt64
+        | DataType::UInt32
+        | DataType::UInt16
+        | DataType::UInt8 => Some(ScalarKey::Int(v.round() as i64)),
         _ => None,
     }
 }
@@ -691,9 +703,12 @@ fn classify_group_columns(
             continue;
         }
         // Count distinct (value, bucket) and detect recurrence across buckets.
-        let mut value_buckets: std::collections::HashMap<ScalarKey, std::collections::HashSet<i64>> =
-            std::collections::HashMap::new();
-        let mut distinct_vals: std::collections::HashSet<ScalarKey> = std::collections::HashSet::new();
+        let mut value_buckets: std::collections::HashMap<
+            ScalarKey,
+            std::collections::HashSet<i64>,
+        > = std::collections::HashMap::new();
+        let mut distinct_vals: std::collections::HashSet<ScalarKey> =
+            std::collections::HashSet::new();
         for batch in batches {
             let bucket_us = timestamp_column_to_us(batch.column(bucket_idx), unit)?;
             for row in 0..batch.num_rows() {
@@ -791,7 +806,11 @@ fn timestamp_column_to_us(arr: &ArrayRef, unit: TimeUnit) -> Result<Vec<Option<i
                 .downcast_ref::<TimestampNanosecondArray>()
                 .ok_or_else(|| BasinError::InvalidSchema("gapfill: ts ns downcast".into()))?;
             for i in 0..n {
-                out.push(if a.is_null(i) { None } else { Some(a.value(i) / 1_000) });
+                out.push(if a.is_null(i) {
+                    None
+                } else {
+                    Some(a.value(i) / 1_000)
+                });
             }
         }
         TimeUnit::Millisecond => {
@@ -800,7 +819,11 @@ fn timestamp_column_to_us(arr: &ArrayRef, unit: TimeUnit) -> Result<Vec<Option<i
                 .downcast_ref::<TimestampMillisecondArray>()
                 .ok_or_else(|| BasinError::InvalidSchema("gapfill: ts ms downcast".into()))?;
             for i in 0..n {
-                out.push(if a.is_null(i) { None } else { Some(a.value(i) * 1_000) });
+                out.push(if a.is_null(i) {
+                    None
+                } else {
+                    Some(a.value(i) * 1_000)
+                });
             }
         }
         TimeUnit::Second => {
@@ -916,10 +939,14 @@ trait ColBuilder {
 
 fn make_builder(dt: &DataType) -> Result<Box<dyn ColBuilder>, BasinError> {
     match dt {
-        DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 | DataType::UInt64
-        | DataType::UInt32 | DataType::UInt16 | DataType::UInt8 => {
-            Ok(Box::new(IntBuilder { vals: Vec::new() }))
-        }
+        DataType::Int64
+        | DataType::Int32
+        | DataType::Int16
+        | DataType::Int8
+        | DataType::UInt64
+        | DataType::UInt32
+        | DataType::UInt16
+        | DataType::UInt8 => Ok(Box::new(IntBuilder { vals: Vec::new() })),
         DataType::Float64 | DataType::Float32 => Ok(Box::new(FloatBuilder { vals: Vec::new() })),
         DataType::Boolean => Ok(Box::new(BoolColBuilder { vals: Vec::new() })),
         DataType::Utf8 | DataType::LargeUtf8 => Ok(Box::new(StrBuilder { vals: Vec::new() })),
@@ -948,31 +975,49 @@ impl ColBuilder for IntBuilder {
             _ => None,
         });
     }
-    fn finish(self: Box<Self>, dt: &DataType, _tz: &Option<Arc<str>>) -> Result<ArrayRef, BasinError> {
+    fn finish(
+        self: Box<Self>,
+        dt: &DataType,
+        _tz: &Option<Arc<str>>,
+    ) -> Result<ArrayRef, BasinError> {
         use arrow_array::*;
         let v = self.vals;
         Ok(match dt {
             DataType::Int64 => Arc::new(Int64Array::from(v)) as ArrayRef,
             DataType::Int32 => Arc::new(Int32Array::from(
-                v.into_iter().map(|o| o.map(|x| x as i32)).collect::<Vec<_>>(),
+                v.into_iter()
+                    .map(|o| o.map(|x| x as i32))
+                    .collect::<Vec<_>>(),
             )),
             DataType::Int16 => Arc::new(Int16Array::from(
-                v.into_iter().map(|o| o.map(|x| x as i16)).collect::<Vec<_>>(),
+                v.into_iter()
+                    .map(|o| o.map(|x| x as i16))
+                    .collect::<Vec<_>>(),
             )),
             DataType::Int8 => Arc::new(Int8Array::from(
-                v.into_iter().map(|o| o.map(|x| x as i8)).collect::<Vec<_>>(),
+                v.into_iter()
+                    .map(|o| o.map(|x| x as i8))
+                    .collect::<Vec<_>>(),
             )),
             DataType::UInt64 => Arc::new(UInt64Array::from(
-                v.into_iter().map(|o| o.map(|x| x as u64)).collect::<Vec<_>>(),
+                v.into_iter()
+                    .map(|o| o.map(|x| x as u64))
+                    .collect::<Vec<_>>(),
             )),
             DataType::UInt32 => Arc::new(UInt32Array::from(
-                v.into_iter().map(|o| o.map(|x| x as u32)).collect::<Vec<_>>(),
+                v.into_iter()
+                    .map(|o| o.map(|x| x as u32))
+                    .collect::<Vec<_>>(),
             )),
             DataType::UInt16 => Arc::new(UInt16Array::from(
-                v.into_iter().map(|o| o.map(|x| x as u16)).collect::<Vec<_>>(),
+                v.into_iter()
+                    .map(|o| o.map(|x| x as u16))
+                    .collect::<Vec<_>>(),
             )),
             DataType::UInt8 => Arc::new(UInt8Array::from(
-                v.into_iter().map(|o| o.map(|x| x as u8)).collect::<Vec<_>>(),
+                v.into_iter()
+                    .map(|o| o.map(|x| x as u8))
+                    .collect::<Vec<_>>(),
             )),
             _ => return Err(BasinError::InvalidSchema("gapfill int finish".into())),
         })
@@ -993,13 +1038,19 @@ impl ColBuilder for FloatBuilder {
             _ => None,
         });
     }
-    fn finish(self: Box<Self>, dt: &DataType, _tz: &Option<Arc<str>>) -> Result<ArrayRef, BasinError> {
+    fn finish(
+        self: Box<Self>,
+        dt: &DataType,
+        _tz: &Option<Arc<str>>,
+    ) -> Result<ArrayRef, BasinError> {
         use arrow_array::*;
         let v = self.vals;
         Ok(match dt {
             DataType::Float64 => Arc::new(Float64Array::from(v)) as ArrayRef,
             DataType::Float32 => Arc::new(Float32Array::from(
-                v.into_iter().map(|o| o.map(|x| x as f32)).collect::<Vec<_>>(),
+                v.into_iter()
+                    .map(|o| o.map(|x| x as f32))
+                    .collect::<Vec<_>>(),
             )),
             _ => return Err(BasinError::InvalidSchema("gapfill float finish".into())),
         })
@@ -1019,7 +1070,11 @@ impl ColBuilder for BoolColBuilder {
             _ => None,
         });
     }
-    fn finish(self: Box<Self>, _dt: &DataType, _tz: &Option<Arc<str>>) -> Result<ArrayRef, BasinError> {
+    fn finish(
+        self: Box<Self>,
+        _dt: &DataType,
+        _tz: &Option<Arc<str>>,
+    ) -> Result<ArrayRef, BasinError> {
         use arrow_array::BooleanArray;
         Ok(Arc::new(BooleanArray::from(self.vals)) as ArrayRef)
     }
@@ -1038,7 +1093,11 @@ impl ColBuilder for StrBuilder {
             _ => None,
         });
     }
-    fn finish(self: Box<Self>, dt: &DataType, _tz: &Option<Arc<str>>) -> Result<ArrayRef, BasinError> {
+    fn finish(
+        self: Box<Self>,
+        dt: &DataType,
+        _tz: &Option<Arc<str>>,
+    ) -> Result<ArrayRef, BasinError> {
         use arrow_array::{LargeStringArray, StringArray};
         let v = self.vals;
         Ok(match dt {
@@ -1075,7 +1134,11 @@ impl ColBuilder for TsBuilder {
         };
         self.vals.push(Some(native));
     }
-    fn finish(self: Box<Self>, dt: &DataType, tz: &Option<Arc<str>>) -> Result<ArrayRef, BasinError> {
+    fn finish(
+        self: Box<Self>,
+        dt: &DataType,
+        tz: &Option<Arc<str>>,
+    ) -> Result<ArrayRef, BasinError> {
         let v = self.vals;
         let unit = match dt {
             DataType::Timestamp(u, _) => *u,
@@ -1261,7 +1324,12 @@ fn parse_iso_us(inner: &str) -> Option<i64> {
         return Some(dt.with_timezone(&Utc).timestamp_micros());
     }
     // Naive datetime with space or 'T'.
-    for fmt in &["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
+    for fmt in &[
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
         if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(t, fmt) {
             return Some(Utc.from_utc_datetime(&ndt).timestamp_micros());
         }

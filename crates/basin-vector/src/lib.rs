@@ -24,6 +24,4 @@ mod ivfflat;
 
 pub use distance::{cosine_distance, dot_product, l2_distance, Distance};
 pub use index::{HnswIndex, HnswIndexBuilder, HnswSearchResult};
-pub use ivfflat::{
-    IvfFlatIndex, IvfFlatIndexBuilder, IvfFlatSearchResult, DEFAULT_PROBES,
-};
+pub use ivfflat::{IvfFlatIndex, IvfFlatIndexBuilder, IvfFlatSearchResult, DEFAULT_PROBES};

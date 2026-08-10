@@ -157,9 +157,7 @@ const BATCH: i64 = 2_000;
 async fn build(sess: &ProjectSession, table: &str, with: &str, total_rows: i64) {
     exec(
         sess,
-        &format!(
-            "CREATE TABLE {table} (id BIGINT, k BIGINT, s TEXT, f DOUBLE, b BOOLEAN){with}"
-        ),
+        &format!("CREATE TABLE {table} (id BIGINT, k BIGINT, s TEXT, f DOUBLE, b BOOLEAN){with}"),
     )
     .await;
     let mut written = 0i64;
@@ -183,7 +181,11 @@ async fn build(sess: &ProjectSession, table: &str, with: &str, total_rows: i64) 
             } else {
                 "false".to_string()
             };
-            vals.push_str(&format!("({id}, {}, {s}, {}, {bb})", id % 17, id as f64 * 1.5));
+            vals.push_str(&format!(
+                "({id}, {}, {s}, {}, {bb})",
+                id % 17,
+                id as f64 * 1.5
+            ));
         }
         exec(
             sess,
@@ -225,7 +227,13 @@ async fn vortex_vs_parquet_many_shapes() {
 
     let total = n_batches() * rows_per_batch();
     let nb = (total + BATCH - 1) / BATCH;
-    build(&sess, "tp", " WITH (basin.file_format='parquet', basin.sort_by='id')", total).await;
+    build(
+        &sess,
+        "tp",
+        " WITH (basin.file_format='parquet', basin.sort_by='id')",
+        total,
+    )
+    .await;
     build(&sess, "tv", " WITH (basin.sort_by='id')", total).await; // default = Vortex; sort_by enables file_sort_order
     build_dim(&sess, "dp", " WITH (basin.file_format='parquet')").await;
     build_dim(&sess, "dv", "").await;
@@ -251,7 +259,10 @@ async fn vortex_vs_parquet_many_shapes() {
             "range_between",
             format!("SELECT * FROM {{Q}} WHERE id BETWEEN {lo} AND {hi}"),
         ),
-        ("inequality_gt", "SELECT id, k FROM {Q} WHERE k > 10".to_string()),
+        (
+            "inequality_gt",
+            "SELECT id, k FROM {Q} WHERE k > 10".to_string(),
+        ),
         ("is_null", "SELECT * FROM {Q} WHERE s IS NULL".to_string()),
         ("string_eq", "SELECT * FROM {Q} WHERE s = 'v3'".to_string()),
         (
@@ -266,7 +277,10 @@ async fn vortex_vs_parquet_many_shapes() {
             "aggregate_filtered",
             format!("SELECT COUNT(*), SUM(id) FROM {{Q}} WHERE id BETWEEN {lo} AND {hi}"),
         ),
-        ("group_by", "SELECT k, COUNT(*) FROM {Q} GROUP BY k".to_string()),
+        (
+            "group_by",
+            "SELECT k, COUNT(*) FROM {Q} GROUP BY k".to_string(),
+        ),
         (
             "order_by_limit",
             "SELECT * FROM {Q} ORDER BY id LIMIT 20".to_string(),
@@ -322,7 +336,10 @@ async fn vortex_vs_parquet_many_shapes() {
             "or_predicate",
             "SELECT * FROM {Q} WHERE k = 1 OR k = 9 OR k = 13".to_string(),
         ),
-        ("like_prefix", "SELECT * FROM {Q} WHERE s LIKE 'v1%'".to_string()),
+        (
+            "like_prefix",
+            "SELECT * FROM {Q} WHERE s LIKE 'v1%'".to_string(),
+        ),
         ("not_eq", "SELECT * FROM {Q} WHERE k <> 7".to_string()),
         (
             "multi_group_by",
@@ -332,7 +349,10 @@ async fn vortex_vs_parquet_many_shapes() {
             "high_card_group_by",
             "SELECT id, COUNT(*) FROM {Q} GROUP BY id".to_string(),
         ),
-        ("count_distinct", "SELECT COUNT(DISTINCT k) FROM {Q}".to_string()),
+        (
+            "count_distinct",
+            "SELECT COUNT(DISTINCT k) FROM {Q}".to_string(),
+        ),
         ("distinct_rows", "SELECT DISTINCT k, b FROM {Q}".to_string()),
         (
             "having",
@@ -340,21 +360,15 @@ async fn vortex_vs_parquet_many_shapes() {
         ),
         (
             "window_row_number",
-            format!(
-                "SELECT id, ROW_NUMBER() OVER (ORDER BY id) rn FROM {{Q}} WHERE id < {lo}"
-            ),
+            format!("SELECT id, ROW_NUMBER() OVER (ORDER BY id) rn FROM {{Q}} WHERE id < {lo}"),
         ),
         (
             "window_partition_sum",
-            format!(
-                "SELECT id, SUM(k) OVER (PARTITION BY b) sw FROM {{Q}} WHERE id < {lo}"
-            ),
+            format!("SELECT id, SUM(k) OVER (PARTITION BY b) sw FROM {{Q}} WHERE id < {lo}"),
         ),
         (
             "subquery_from",
-            format!(
-                "SELECT COUNT(*) FROM (SELECT k FROM {{Q}} WHERE id BETWEEN {lo} AND {hi}) t"
-            ),
+            format!("SELECT COUNT(*) FROM (SELECT k FROM {{Q}} WHERE id BETWEEN {lo} AND {hi}) t"),
         ),
         (
             "order_by_multi",
@@ -487,9 +501,7 @@ async fn vortex_vs_parquet_many_shapes() {
         ),
         (
             "string_agg",
-            format!(
-                "SELECT b, string_agg(s, ',') FROM {{Q}} WHERE id < {lo} GROUP BY b"
-            ),
+            format!("SELECT b, string_agg(s, ',') FROM {{Q}} WHERE id < {lo} GROUP BY b"),
         ),
         (
             "generate_series_join",
@@ -654,18 +666,15 @@ async fn vortex_vs_parquet_many_shapes() {
         ),
         (
             "math_chain",
-            "SELECT SUM(ROUND(SQRT(ABS(f)) + MOD(id, 7), 3)) FROM {Q}"
-                .to_string(),
+            "SELECT SUM(ROUND(SQRT(ABS(f)) + MOD(id, 7), 3)) FROM {Q}".to_string(),
         ),
         (
             "abs_mod_filter",
-            "SELECT COUNT(*) FROM {Q} WHERE ABS(MOD(id, 100)) BETWEEN 10 AND 50"
-                .to_string(),
+            "SELECT COUNT(*) FROM {Q} WHERE ABS(MOD(id, 100)) BETWEEN 10 AND 50".to_string(),
         ),
         (
             "stddev_grouped",
-            "SELECT k, STDDEV(f) sd FROM {Q} GROUP BY k ORDER BY k"
-                .to_string(),
+            "SELECT k, STDDEV(f) sd FROM {Q} GROUP BY k ORDER BY k".to_string(),
         ),
         (
             "min_max_float",
@@ -676,13 +685,11 @@ async fn vortex_vs_parquet_many_shapes() {
         ),
         (
             "intersect_all",
-            "SELECT k FROM {Q} INTERSECT ALL SELECT dk FROM {D} ORDER BY k LIMIT 50"
-                .to_string(),
+            "SELECT k FROM {Q} INTERSECT ALL SELECT dk FROM {D} ORDER BY k LIMIT 50".to_string(),
         ),
         (
             "except_all",
-            "SELECT k FROM {Q} EXCEPT ALL SELECT dk FROM {D} ORDER BY k LIMIT 50"
-                .to_string(),
+            "SELECT k FROM {Q} EXCEPT ALL SELECT dk FROM {D} ORDER BY k LIMIT 50".to_string(),
         ),
         (
             "order_by_expr",
@@ -693,8 +700,7 @@ async fn vortex_vs_parquet_many_shapes() {
         ),
         (
             "group_by_expr_mod",
-            "SELECT (k % 5) g, COUNT(*) c FROM {Q} GROUP BY (k % 5) ORDER BY g"
-                .to_string(),
+            "SELECT (k % 5) g, COUNT(*) c FROM {Q} GROUP BY (k % 5) ORDER BY g".to_string(),
         ),
         (
             "self_join_multi_col",
@@ -723,13 +729,11 @@ async fn vortex_vs_parquet_many_shapes() {
         ),
         (
             "is_distinct_from",
-            "SELECT COUNT(*) FROM {Q} WHERE b IS DISTINCT FROM TRUE"
-                .to_string(),
+            "SELECT COUNT(*) FROM {Q} WHERE b IS DISTINCT FROM TRUE".to_string(),
         ),
         (
             "multi_col_distinct",
-            "SELECT COUNT(*) FROM (SELECT DISTINCT k, b FROM {Q}) t"
-                .to_string(),
+            "SELECT COUNT(*) FROM (SELECT DISTINCT k, b FROM {Q}) t".to_string(),
         ),
         (
             "group_by_ordinal",
@@ -757,8 +761,7 @@ async fn vortex_vs_parquet_many_shapes() {
         ),
         (
             "limit_offset_large",
-            "SELECT id, k FROM {Q} ORDER BY id LIMIT 100 OFFSET 1000"
-                .to_string(),
+            "SELECT id, k FROM {Q} ORDER BY id LIMIT 100 OFFSET 1000".to_string(),
         ),
     ];
 
@@ -802,9 +805,7 @@ async fn vortex_vs_parquet_many_shapes() {
             // Exactly one format errors → a real Vortex/Parquet behaviour
             // divergence. That IS a correctness bug — fail loudly.
             (pr, vr) => {
-                panic!(
-                    "CORRECTNESS DIVERGENCE on `{label}`: parquet={pr:?} vortex={vr:?}"
-                );
+                panic!("CORRECTNESS DIVERGENCE on `{label}`: parquet={pr:?} vortex={vr:?}");
             }
         }
     }
@@ -876,7 +877,10 @@ fn matrix_shapes(lo: i64, hi: i64, mid: i64) -> Vec<(&'static str, String)> {
             format!("SELECT COUNT(*), SUM(id) FROM {{Q}} WHERE id BETWEEN {lo} AND {hi}"),
         ),
         ("group_by", "SELECT k, COUNT(*) FROM {Q} GROUP BY k".into()),
-        ("order_by_limit", "SELECT * FROM {Q} ORDER BY id LIMIT 20".into()),
+        (
+            "order_by_limit",
+            "SELECT * FROM {Q} ORDER BY id LIMIT 20".into(),
+        ),
         (
             "inner_join",
             format!(
@@ -928,7 +932,13 @@ async fn vortex_vs_parquet_size_matrix() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
         let sess = eng.open_session(ProjectId::new()).await.unwrap();
-        build(&sess, "tp", " WITH (basin.file_format='parquet', basin.sort_by='id')", sz).await;
+        build(
+            &sess,
+            "tp",
+            " WITH (basin.file_format='parquet', basin.sort_by='id')",
+            sz,
+        )
+        .await;
         build(&sess, "tv", " WITH (basin.sort_by='id')", sz).await;
         build_dim(&sess, "dp", " WITH (basin.file_format='parquet')").await;
         build_dim(&sess, "dv", "").await;
@@ -947,9 +957,9 @@ async fn vortex_vs_parquet_size_matrix() {
                     ratios[li][si] = Some(if vm > 0.0 { pm / vm } else { f64::NAN });
                 }
                 (Err(_), Err(_)) => { /* Basin SQL gap — leave None */ }
-                (pr, vr) => panic!(
-                    "CORRECTNESS DIVERGENCE `{label}` @ {sz}: parquet={pr:?} vortex={vr:?}"
-                ),
+                (pr, vr) => {
+                    panic!("CORRECTNESS DIVERGENCE `{label}` @ {sz}: parquet={pr:?} vortex={vr:?}")
+                }
             }
         }
         // dir/eng/sess are loop-scoped → dropped here (per-size isolation).

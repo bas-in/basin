@@ -45,7 +45,11 @@ fn engine_and_writer(dir: &TempDir) -> (Engine, CdcRingWriter) {
 /// Drain the durable ring for a project until it has at least `want` records or
 /// we run out of patience. Post-commit sinks dispatch on a spawned task, so we
 /// poll instead of assuming synchronous delivery.
-async fn drain_ring(writer: &CdcRingWriter, project: &ProjectId, want: usize) -> Vec<basin_cdc::CdcRecord> {
+async fn drain_ring(
+    writer: &CdcRingWriter,
+    project: &ProjectId,
+    want: usize,
+) -> Vec<basin_cdc::CdcRecord> {
     for _ in 0..200 {
         writer.flush_all_for_test().await;
         let recs = writer.ring_for(project).replay_after(0).await.unwrap();
@@ -70,17 +74,29 @@ async fn hot_tier_update_captured() {
     let project = ProjectId::new();
     let sess = engine.open_session(project).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").await.unwrap();
+    sess.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO t VALUES (1, 0)").await.unwrap();
-    sess.execute("UPDATE t SET v = 1 WHERE id = 1").await.unwrap();
+    sess.execute("UPDATE t SET v = 1 WHERE id = 1")
+        .await
+        .unwrap();
 
     let recs = drain_ring(&writer, &project, 2).await;
     let upd = recs
         .iter()
         .find(|r| r.op_name() == "update")
         .expect("an update event must be captured (hot-tier fast path)");
-    assert_eq!(upd.before.as_ref().unwrap()["v"].as_i64(), Some(0), "before.v");
-    assert_eq!(upd.after.as_ref().unwrap()["v"].as_i64(), Some(1), "after.v");
+    assert_eq!(
+        upd.before.as_ref().unwrap()["v"].as_i64(),
+        Some(0),
+        "before.v"
+    );
+    assert_eq!(
+        upd.after.as_ref().unwrap()["v"].as_i64(),
+        Some(1),
+        "after.v"
+    );
 }
 
 /// Test 2: hot-tier DELETE emits a CDC event carrying the before image and a
@@ -94,8 +110,12 @@ async fn hot_tier_delete_captured() {
     let project = ProjectId::new();
     let sess = engine.open_session(project).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").await.unwrap();
-    sess.execute("INSERT INTO t VALUES (2, 'bob')").await.unwrap();
+    sess.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (2, 'bob')")
+        .await
+        .unwrap();
     sess.execute("DELETE FROM t WHERE id = 2").await.unwrap();
 
     let recs = drain_ring(&writer, &project, 2).await;
@@ -103,7 +123,11 @@ async fn hot_tier_delete_captured() {
         .iter()
         .find(|r| r.op_name() == "delete")
         .expect("a delete event must be captured (hot-tier fast path)");
-    assert_eq!(del.before.as_ref().unwrap()["name"].as_str(), Some("bob"), "before.name");
+    assert_eq!(
+        del.before.as_ref().unwrap()["name"].as_str(),
+        Some("bob"),
+        "before.name"
+    );
     assert!(del.after.is_none(), "delete after image is null");
 }
 
@@ -123,18 +147,28 @@ async fn in_tx_multi_statement_committed_in_order_and_rollback_emits_nothing() {
     let project = ProjectId::new();
     let sess = engine.open_session(project).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").await.unwrap();
-    sess.execute("INSERT INTO t VALUES (3, 10), (4, 100)").await.unwrap();
+    sess.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (3, 10), (4, 100)")
+        .await
+        .unwrap();
 
     // --- ROLLBACK path emits nothing -------------------------------------
     sess.execute("BEGIN").await.unwrap();
-    sess.execute("UPDATE t SET v = 999 WHERE id = 3").await.unwrap();
+    sess.execute("UPDATE t SET v = 999 WHERE id = 3")
+        .await
+        .unwrap();
     sess.execute("ROLLBACK").await.unwrap();
 
     // --- committed multi-statement tx ------------------------------------
     sess.execute("BEGIN").await.unwrap();
-    sess.execute("UPDATE t SET v = 20 WHERE id = 3").await.unwrap();
-    sess.execute("UPDATE t SET v = 200 WHERE id = 4").await.unwrap();
+    sess.execute("UPDATE t SET v = 20 WHERE id = 3")
+        .await
+        .unwrap();
+    sess.execute("UPDATE t SET v = 200 WHERE id = 4")
+        .await
+        .unwrap();
     sess.execute("COMMIT").await.unwrap();
 
     // 2 inserts + 2 committed updates = 4. The rolled-back update (v=999)
@@ -145,7 +179,8 @@ async fn in_tx_multi_statement_committed_in_order_and_rollback_emits_nothing() {
         recs.iter().filter(|r| r.op_name() == "update").collect();
     assert_eq!(updates.len(), 2, "exactly the two committed updates");
     assert!(
-        recs.iter().all(|r| r.after.as_ref().and_then(|a| a["v"].as_i64()) != Some(999)),
+        recs.iter()
+            .all(|r| r.after.as_ref().and_then(|a| a["v"].as_i64()) != Some(999)),
         "rolled-back mutation (v=999) must never appear in the CDC ring",
     );
 
@@ -177,7 +212,10 @@ async fn in_tx_multi_statement_committed_in_order_and_rollback_emits_nothing() {
         .find(|r| r.before.as_ref().unwrap()["id"].as_i64() == Some(4))
         .unwrap()
         .seq;
-    assert!(id3_seq < id4_seq, "tx statements captured in execution order");
+    assert!(
+        id3_seq < id4_seq,
+        "tx statements captured in execution order"
+    );
 }
 
 /// Replay-from-cursor returns exactly the missed events.
@@ -188,16 +226,24 @@ async fn replay_from_cursor_exact() {
     let project = ProjectId::new();
     let sess = engine.open_session(project).await.unwrap();
 
-    sess.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").await.unwrap();
+    sess.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .await
+        .unwrap();
     for i in 1..=5 {
-        sess.execute(&format!("INSERT INTO t VALUES ({i}, {i})")).await.unwrap();
+        sess.execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+            .await
+            .unwrap();
     }
     let all = drain_ring(&writer, &project, 5).await;
     assert!(all.len() >= 5);
 
     // Resume after the 2nd inserted row's seq → exactly the later events.
     let cursor = all[1].seq;
-    let missed = writer.ring_for(&project).replay_after(cursor).await.unwrap();
+    let missed = writer
+        .ring_for(&project)
+        .replay_after(cursor)
+        .await
+        .unwrap();
     assert!(
         missed.iter().all(|r| r.seq > cursor),
         "replay returns only seq > cursor",
@@ -219,7 +265,9 @@ async fn cross_project_isolation_end_to_end() {
     let sa = engine.open_session(a).await.unwrap();
     let sb = engine.open_session(b).await.unwrap();
     for s in [&sa, &sb] {
-        s.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").await.unwrap();
+        s.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .await
+            .unwrap();
     }
     sa.execute("INSERT INTO t VALUES (1, 11)").await.unwrap();
     sa.execute("INSERT INTO t VALUES (2, 22)").await.unwrap();

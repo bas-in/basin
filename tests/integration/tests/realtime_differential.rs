@@ -200,7 +200,9 @@ async fn run_shape_differential(shape: &SmokeShape, seq_base: u64) {
     let ev_b = make_event(project, table, seq_base + 1, shape);
     sink_b.publish(&ev_b).await.expect("path-b publish");
 
-    let delivered_b = rx_b.try_recv().expect("path-b: subscriber must receive event");
+    let delivered_b = rx_b
+        .try_recv()
+        .expect("path-b: subscriber must receive event");
     let fp_b = fingerprint(&delivered_b);
 
     // Ground truth uses seq_base; path-b used seq_base+1. We normalise seq to
@@ -243,7 +245,9 @@ async fn run_shape_differential(shape: &SmokeShape, seq_base: u64) {
     let ev_c = make_event(project, table, seq_base + 2, shape);
     sink_c.publish(&ev_c).await.expect("path-c publish");
 
-    let delivered_c = rx_c.try_recv().expect("path-c: subscriber must receive event");
+    let delivered_c = rx_c
+        .try_recv()
+        .expect("path-c: subscriber must receive event");
     let fp_c = fingerprint(&delivered_c);
 
     assert_eq!(
@@ -356,7 +360,10 @@ async fn realtime_differential_filter_pushdown() {
 
     // Filtered (paid): only seq=2 gets through.
     let ep = rx_paid.try_recv().unwrap();
-    assert_eq!(ep.seq, 2, "WS filtered path: only paid event (seq=2) must arrive");
+    assert_eq!(
+        ep.seq, 2,
+        "WS filtered path: only paid event (seq=2) must arrive"
+    );
     assert!(
         rx_paid.try_recv().is_err(),
         "WS filtered path: no extra events after paid"
@@ -410,14 +417,24 @@ async fn realtime_differential_cross_project_isolation() {
     sink.publish(&ev_b).await.unwrap();
 
     // A's subscriber sees only A's event.
-    let got_a = rx_a.try_recv().expect("project-A subscriber must receive its event");
+    let got_a = rx_a
+        .try_recv()
+        .expect("project-A subscriber must receive its event");
     assert_eq!(got_a.project, project_a);
-    assert!(rx_a.try_recv().is_err(), "project-A subscriber must not see project-B's event");
+    assert!(
+        rx_a.try_recv().is_err(),
+        "project-A subscriber must not see project-B's event"
+    );
 
     // B's subscriber sees only B's event.
-    let got_b = rx_b.try_recv().expect("project-B subscriber must receive its event");
+    let got_b = rx_b
+        .try_recv()
+        .expect("project-B subscriber must receive its event");
     assert_eq!(got_b.project, project_b);
-    assert!(rx_b.try_recv().is_err(), "project-B subscriber must not see project-A's event");
+    assert!(
+        rx_b.try_recv().is_err(),
+        "project-B subscriber must not see project-A's event"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -458,9 +475,13 @@ async fn realtime_differential_multi_subscriber_fanout() {
 
     // rx1 and rx2 (unfiltered) get all 3.
     for expected_seq in 1u64..=3 {
-        let e = rx1.try_recv().unwrap_or_else(|_| panic!("rx1: missing seq={expected_seq}"));
+        let e = rx1
+            .try_recv()
+            .unwrap_or_else(|_| panic!("rx1: missing seq={expected_seq}"));
         assert_eq!(e.seq, expected_seq, "rx1 seq mismatch");
-        let e2 = rx2.try_recv().unwrap_or_else(|_| panic!("rx2: missing seq={expected_seq}"));
+        let e2 = rx2
+            .try_recv()
+            .unwrap_or_else(|_| panic!("rx2: missing seq={expected_seq}"));
         assert_eq!(e2.seq, expected_seq, "rx2 seq mismatch");
     }
     assert!(rx1.try_recv().is_err(), "rx1: no extra events");
@@ -483,7 +504,7 @@ async fn realtime_differential_multi_subscriber_fanout() {
 /// the subscriber set is a subset of published events, never a superset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn realtime_differential_budget_enforced() {
-    use basin_realtime::{BudgetTracker, estimate_event_size};
+    use basin_realtime::{estimate_event_size, BudgetTracker};
 
     let project = ProjectId::new();
     let table = "orders";
@@ -520,7 +541,9 @@ async fn realtime_differential_budget_enforced() {
             causation_user: None,
         };
         // Publish must not fail even when budget is full (fire-and-forget).
-        sink.publish(&ev).await.expect("publish must not error on budget full");
+        sink.publish(&ev)
+            .await
+            .expect("publish must not error on budget full");
     }
 
     // Subscriber receives at most one event (the first that fit the budget).
@@ -602,7 +625,11 @@ async fn realtime_differential_reconnect_resume_replays_missed_events() {
     while let Ok(ev) = rx_live.try_recv() {
         seen.push(ev.seq);
     }
-    assert_eq!(seen, vec![1, 2, 3], "phase-1 live receiver must see seq 1..=3");
+    assert_eq!(
+        seen,
+        vec![1, 2, 3],
+        "phase-1 live receiver must see seq 1..=3"
+    );
 
     // --- Phase 2: client disconnects. ----------------------------------------
     // Dropping the receiver simulates the TCP close / EventSource cleanup.
@@ -647,7 +674,11 @@ async fn realtime_differential_reconnect_resume_replays_missed_events() {
          during the disconnect (closes #54 P0 SSE/WS silent replay loss); \
          got {replayed:?}"
     );
-    assert_eq!(outcome.newest_seq(), 8, "cursor advance target must be the newest seq");
+    assert_eq!(
+        outcome.newest_seq(),
+        8,
+        "cursor advance target must be the newest seq"
+    );
 
     // --- Phase 5: handoff to live stream — events newer than `newest_seq` go
     //              straight through the live receiver, no duplication. -------
@@ -663,7 +694,9 @@ async fn realtime_differential_reconnect_resume_replays_missed_events() {
         causation_user: None,
     };
     sink.publish(&ev9).await.expect("publish must not fail");
-    let got = rx_resumed.try_recv().expect("live receiver must get post-reconnect event");
+    let got = rx_resumed
+        .try_recv()
+        .expect("live receiver must get post-reconnect event");
     assert_eq!(got.seq, 9, "live stream resumes from seq=9 after replay");
     assert!(
         rx_resumed.try_recv().is_err(),
@@ -672,12 +705,11 @@ async fn realtime_differential_reconnect_resume_replays_missed_events() {
 
     // Sanity: explicit Gap shape is reachable when the ring is too small.
     // (Belt-and-braces: proves the Gap variant isn't dead code.)
-    let small_sink = RealtimeSink::new().with_replay_rings(
-        basin_realtime::ReplayRingRegistry::with_capacity(
+    let small_sink =
+        RealtimeSink::new().with_replay_rings(basin_realtime::ReplayRingRegistry::with_capacity(
             2,
             basin_realtime::DEFAULT_REPLAY_RING_TTL,
-        ),
-    );
+        ));
     for seq in 1u64..=5 {
         let ev = ChangeEvent {
             project,
@@ -703,8 +735,15 @@ async fn realtime_differential_reconnect_resume_replays_missed_events() {
         "cursor predating evicted events must surface as Gap, not silent loss; got {gap_outcome:?}"
     );
     match gap_outcome {
-        DrainOutcome::Gap { oldest_seq, newest_seq, .. } => {
-            assert!(oldest_seq > 1, "oldest_seq={oldest_seq} must be past the cursor (1)");
+        DrainOutcome::Gap {
+            oldest_seq,
+            newest_seq,
+            ..
+        } => {
+            assert!(
+                oldest_seq > 1,
+                "oldest_seq={oldest_seq} must be past the cursor (1)"
+            );
             assert_eq!(newest_seq, 5);
         }
         _ => unreachable!(),

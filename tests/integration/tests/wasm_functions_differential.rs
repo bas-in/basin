@@ -50,9 +50,9 @@ use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use basin_fn::{
-    FunctionCallContext, FunctionHost, QueryExecutor,
     engine::{InvocationContext, MockHttpClient, QueryRow, StubSecretStore},
     harness_bindings::basin::functions::query,
+    FunctionCallContext, FunctionHost, QueryExecutor,
 };
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -173,10 +173,7 @@ async fn direct_rows(session: &ProjectSession, sql: &str) -> Result<Vec<QueryRow
 /// `exec` is sync and we hold a runtime handle inside the executor.
 async fn function_rows(session: Arc<ProjectSession>, sql: &str) -> Result<Vec<QueryRow>, String> {
     let handle = tokio::runtime::Handle::current();
-    let executor: Arc<dyn QueryExecutor> = Arc::new(SessionQueryExecutor {
-        session,
-        handle,
-    });
+    let executor: Arc<dyn QueryExecutor> = Arc::new(SessionQueryExecutor { session, handle });
     let ctx = FunctionCallContext::new(InvocationContext {
         query: executor,
         secrets: Arc::new(StubSecretStore),
@@ -187,12 +184,11 @@ async fn function_rows(session: Arc<ProjectSession>, sql: &str) -> Result<Vec<Qu
     // The WIT `query::Row` is shape-identical to our `QueryRow` (single
     // `columns: Vec<(String, String)>` field). Convert at the boundary so
     // the rest of the differential plumbing stays in one row type.
-    let inner: Result<Vec<query::Row>, String> =
-        tokio::task::spawn_blocking(move || {
-            <FunctionHost as query::Host>::exec(&mut host, sql_owned)
-        })
-        .await
-        .map_err(|e| format!("join: {e}"))?;
+    let inner: Result<Vec<query::Row>, String> = tokio::task::spawn_blocking(move || {
+        <FunctionHost as query::Host>::exec(&mut host, sql_owned)
+    })
+    .await
+    .map_err(|e| format!("join: {e}"))?;
     inner.map(|rows| {
         rows.into_iter()
             .map(|r| QueryRow { columns: r.columns })
@@ -352,14 +348,15 @@ async fn error_propagation_invalid_sql_matches() {
     // Both surfaces must mention the missing table — the runtime is not
     // allowed to swallow the engine's diagnostic.
     assert!(
-        fn_err.contains("does_not_exist_table_42") || fn_err.to_lowercase().contains("not found")
+        fn_err.contains("does_not_exist_table_42")
+            || fn_err.to_lowercase().contains("not found")
             || fn_err.to_lowercase().contains("table"),
         "function-side error must reference the missing table: {fn_err}"
     );
     assert!(
-        sql_err.contains("does_not_exist_table_42") || sql_err.to_lowercase().contains("not found")
+        sql_err.contains("does_not_exist_table_42")
+            || sql_err.to_lowercase().contains("not found")
             || sql_err.to_lowercase().contains("table"),
         "direct SQL error must reference the missing table: {sql_err}"
     );
 }
-

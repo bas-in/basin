@@ -147,8 +147,8 @@ fn prisma_available() -> bool {
 
 /// Absolute path to the prisma fixture directory.
 fn fixture_dir() -> PathBuf {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR must be set by cargo test");
+    let manifest =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by cargo test");
     PathBuf::from(manifest)
         .join("fixtures")
         .join("migration-tool-scaffold")
@@ -259,9 +259,7 @@ async fn prisma_db_push_and_query() {
     let port = server.addr.port();
     let user = &server.project_slug;
 
-    println!(
-        "[prisma] Basin in-process server at 127.0.0.1:{port}, user={user}"
-    );
+    println!("[prisma] Basin in-process server at 127.0.0.1:{port}, user={user}");
 
     // ── Locate fixture directory ───────────────────────────────────────────────
     let source_dir = fixture_dir();
@@ -280,9 +278,7 @@ async fn prisma_db_push_and_query() {
 
     // prisma db push / introspect use a postgres:// DSN via DATABASE_URL.
     // sslmode=disable is required because the in-process Basin server has no TLS.
-    let db_url = format!(
-        "postgres://{user}:ignored@127.0.0.1:{port}/basin?sslmode=disable"
-    );
+    let db_url = format!("postgres://{user}:ignored@127.0.0.1:{port}/basin?sslmode=disable");
 
     // ── (a) prisma db push ────────────────────────────────────────────────────
     //

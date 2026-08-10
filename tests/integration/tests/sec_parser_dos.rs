@@ -171,18 +171,12 @@ async fn regex_redos_catastrophic_alternation() {
     // We accept either fast-completion OR a QueryCanceled within 3 s.
     let sql = format!("SELECT '{input}' ~ '{pattern}'");
 
-    println!(
-        "[sec_parser_dos] regex_redos_catastrophic_alternation: sql={sql:?}"
-    );
+    println!("[sec_parser_dos] regex_redos_catastrophic_alternation: sql={sql:?}");
 
     // Outer timeout: 3 s. If the engine doesn't respond within 3 s it is
     // hanging on catastrophic backtracking.
     let t0 = Instant::now();
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(3),
-        sess.execute(&sql),
-    )
-    .await;
+    let outcome = tokio::time::timeout(Duration::from_secs(3), sess.execute(&sql)).await;
     let elapsed = t0.elapsed();
 
     println!(
@@ -232,9 +226,7 @@ async fn regex_redos_catastrophic_alternation() {
                 "SECURITY P1 (#53): regex ReDoS returned BasinError::Internal (XX000) \
                  — expected graceful handling. Error: {e:?}"
             );
-            println!(
-                "[sec_parser_dos] PASS: regex ReDoS returned typed error in {elapsed:?}: {e}"
-            );
+            println!("[sec_parser_dos] PASS: regex ReDoS returned typed error in {elapsed:?}: {e}");
         }
     }
 }

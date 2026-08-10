@@ -59,13 +59,13 @@ async fn scalar_f32(sess: &basin_engine::ProjectSession, sql: &str) -> f32 {
             if let Some(arr) = col.as_any().downcast_ref::<Float32Array>() {
                 return arr.value(0);
             }
-            if let Some(arr) = col
-                .as_any()
-                .downcast_ref::<arrow_array::Float64Array>()
-            {
+            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Float64Array>() {
                 return arr.value(0) as f32;
             }
-            panic!("expected Float32 or Float64 column for:\n  {sql}\n  got type: {:?}", col.data_type())
+            panic!(
+                "expected Float32 or Float64 column for:\n  {sql}\n  got type: {:?}",
+                col.data_type()
+            )
         }
         Ok(ExecResult::Empty { .. }) => panic!("expected Rows, got Empty for:\n  {sql}"),
         Err(e) => panic!("execute failed for:\n  {sql}\n  error: {e}"),
@@ -151,7 +151,10 @@ async fn sql_similarity_identical_strings_score_one() {
     let sess = engine.open_session(project).await.unwrap();
 
     let v = scalar_f32(&sess, "SELECT similarity('word', 'word')").await;
-    assert!(approx_eq(v, 1.0), "similarity('word','word') = {v}, expected 1.0");
+    assert!(
+        approx_eq(v, 1.0),
+        "similarity('word','word') = {v}, expected 1.0"
+    );
 }
 
 /// `SELECT similarity('', '')` → 0.0.
@@ -212,7 +215,10 @@ async fn sql_word_similarity_no_match_near_zero() {
     let sess = engine.open_session(project).await.unwrap();
 
     let v = scalar_f32(&sess, "SELECT word_similarity('xyz', 'alice smith')").await;
-    assert!(v < 0.2, "word_similarity('xyz','alice smith') = {v}, expected < 0.2");
+    assert!(
+        v < 0.2,
+        "word_similarity('xyz','alice smith') = {v}, expected < 0.2"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -266,11 +272,7 @@ async fn sql_show_trgm_empty_string_returns_empty_list() {
                 .downcast_ref::<ListArray>()
                 .expect("show_trgm must return a ListArray");
             let values = list_arr.value(0);
-            assert_eq!(
-                values.len(),
-                0,
-                "show_trgm('') must return an empty list"
-            );
+            assert_eq!(values.len(), 0, "show_trgm('') must return an empty list");
         }
         Ok(ExecResult::Empty { .. }) => panic!("expected Rows, got Empty"),
         Err(e) => panic!("show_trgm('') failed: {e}"),
@@ -298,8 +300,7 @@ async fn sql_percent_operator_default_threshold() {
         .unwrap();
 
     // Default threshold = 0.3. 'alyce' and 'alice' should both match 'alice'.
-    let count_sql =
-        "SELECT COUNT(*) FROM names WHERE name % 'alice'";
+    let count_sql = "SELECT COUNT(*) FROM names WHERE name % 'alice'";
     match sess.execute(count_sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let batch = batches.first().expect("expected batch");
@@ -339,7 +340,9 @@ async fn sql_percent_operator_raised_threshold() {
         .unwrap();
 
     // Raise threshold so only very similar strings match.
-    exec_ok(&sess, "SET pg_trgm.similarity_threshold = 0.9").await.unwrap();
+    exec_ok(&sess, "SET pg_trgm.similarity_threshold = 0.9")
+        .await
+        .unwrap();
 
     let count_sql = "SELECT COUNT(*) FROM names2 WHERE name % 'alice'";
     match sess.execute(count_sql).await {
@@ -415,7 +418,10 @@ async fn sql_integer_column_modulo_in_where_works() {
 
     // Column % column: rows where n is divisible by d → 2,4 (n%2), 6 (6%3).
     let divisible = scalar_i64(&sess, "SELECT COUNT(*) FROM nums WHERE n % d = 0").await;
-    assert_eq!(divisible, 3, "n % d = 0 should match 2,4,6 (got {divisible})");
+    assert_eq!(
+        divisible, 3,
+        "n % d = 0 should match 2,4,6 (got {divisible})"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -431,7 +437,10 @@ async fn sql_percent_inside_string_literal_preserved() {
     let sess = engine.open_session(project).await.unwrap();
 
     let v = scalar_text(&sess, "SELECT '50%'").await;
-    assert_eq!(v, "50%", "percent inside string literal should be preserved, got {v:?}");
+    assert_eq!(
+        v, "50%",
+        "percent inside string literal should be preserved, got {v:?}"
+    );
 }
 
 /// A `<->` inside a tsquery string literal must survive unchanged.
@@ -578,12 +587,11 @@ async fn sql_set_show_similarity_threshold_round_trip() {
     let project = ProjectId::new();
     let sess = engine.open_session(project).await.unwrap();
 
-    exec_ok(&sess, "SET pg_trgm.similarity_threshold = 0.5").await.unwrap();
+    exec_ok(&sess, "SET pg_trgm.similarity_threshold = 0.5")
+        .await
+        .unwrap();
     let v = scalar_text(&sess, "SHOW pg_trgm.similarity_threshold").await;
-    assert!(
-        v.starts_with("0.5"),
-        "after SET 0.5, SHOW returned {v:?}"
-    );
+    assert!(v.starts_with("0.5"), "after SET 0.5, SHOW returned {v:?}");
 }
 
 /// `SET pg_trgm.word_similarity_threshold = 0.8` then `SHOW` reflects 0.8.
@@ -594,12 +602,11 @@ async fn sql_set_show_word_similarity_threshold_round_trip() {
     let project = ProjectId::new();
     let sess = engine.open_session(project).await.unwrap();
 
-    exec_ok(&sess, "SET pg_trgm.word_similarity_threshold = 0.8").await.unwrap();
+    exec_ok(&sess, "SET pg_trgm.word_similarity_threshold = 0.8")
+        .await
+        .unwrap();
     let v = scalar_text(&sess, "SHOW pg_trgm.word_similarity_threshold").await;
-    assert!(
-        v.starts_with("0.8"),
-        "after SET 0.8, SHOW returned {v:?}"
-    );
+    assert!(v.starts_with("0.8"), "after SET 0.8, SHOW returned {v:?}");
 }
 
 /// After `SET pg_trgm.similarity_threshold = 0.5`, `%` uses the new threshold.
@@ -627,7 +634,11 @@ async fn sql_set_threshold_affects_percent_operator() {
     {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().unwrap();
-            b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0)
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
         }
         _ => panic!("query failed"),
     };
@@ -635,7 +646,9 @@ async fn sql_set_threshold_affects_percent_operator() {
     assert!(count_default >= 1, "at least 'alice' must match itself");
 
     // Raise threshold to 0.99 — only near-identical strings pass.
-    exec_ok(&sess, "SET pg_trgm.similarity_threshold = 0.99").await.unwrap();
+    exec_ok(&sess, "SET pg_trgm.similarity_threshold = 0.99")
+        .await
+        .unwrap();
 
     let count_high = match sess
         .execute("SELECT COUNT(*) FROM thresh_test WHERE name % 'alice'")
@@ -643,7 +656,11 @@ async fn sql_set_threshold_affects_percent_operator() {
     {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().unwrap();
-            b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0)
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
         }
         _ => panic!("query failed"),
     };

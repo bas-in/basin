@@ -358,10 +358,7 @@ impl BucketPool {
     /// the primary store. Without it, the pool conservatively keeps every
     /// not-yet-assigned project on the primary (never stripes blind).
     pub fn set_default_store(&self, store: Arc<dyn ObjectStore>) {
-        *self
-            .default_store
-            .write()
-            .expect("default_store poisoned") = Some(store);
+        *self.default_store.write().expect("default_store poisoned") = Some(store);
     }
 
     /// Register the storage layer's configured root key prefix (e.g. `mn5`) so
@@ -459,7 +456,10 @@ impl BucketPool {
         if !self.config.enabled {
             return None;
         }
-        let cache = self.assignment_cache.read().expect("assignment_cache poisoned");
+        let cache = self
+            .assignment_cache
+            .read()
+            .expect("assignment_cache poisoned");
         let stripe = cache.get(project)?;
         if stripe.is_empty() {
             return None;

@@ -73,9 +73,7 @@ pub(crate) async fn exec_create_function(
         SqlFunctionLanguage::Sql
     } else if lang.eq_ignore_ascii_case("wasm") {
         SqlFunctionLanguage::Wasm
-    } else if lang.eq_ignore_ascii_case("javascript")
-        || lang.eq_ignore_ascii_case("js")
-    {
+    } else if lang.eq_ignore_ascii_case("javascript") || lang.eq_ignore_ascii_case("js") {
         SqlFunctionLanguage::Javascript
     } else {
         return Err(BasinError::InvalidSchema(format!(
@@ -170,8 +168,7 @@ pub(crate) async fn exec_create_function(
     }
     // Mutual-recursion check only applies to SQL bodies.
     if fn_lang == SqlFunctionLanguage::Sql {
-        let existing_map =
-            collect_project_function_map(&catalog, &sess.project, &fn_name).await;
+        let existing_map = collect_project_function_map(&catalog, &sess.project, &fn_name).await;
         validate_no_mutual_recursion(&validated, &existing_map)?;
     }
     catalog.register_sql_function(validated).await?;

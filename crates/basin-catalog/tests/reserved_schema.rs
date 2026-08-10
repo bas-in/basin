@@ -11,9 +11,7 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
-use basin_catalog::{
-    resolve_qualified, resolve_schema, Catalog, InMemoryCatalog, ReservedSchema,
-};
+use basin_catalog::{resolve_qualified, resolve_schema, Catalog, InMemoryCatalog, ReservedSchema};
 use basin_common::{ProjectId, QualifiedTableName, SchemaName, TableName};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,7 +185,10 @@ async fn in_memory_auth_users_distinct_from_public_users() {
     let am = cat.load_table_qualified(&proj, &auth_users).await.unwrap();
     assert_eq!(am.table.as_str(), "users");
 
-    let pm = cat.load_table_qualified(&proj, &public_users).await.unwrap();
+    let pm = cat
+        .load_table_qualified(&proj, &public_users)
+        .await
+        .unwrap();
     assert_eq!(pm.table.as_str(), "users");
 
     // They are independent entries: drop one, the other still exists.
@@ -234,7 +235,10 @@ async fn in_memory_public_qualified_equals_unqualified() {
 
     // Load via public-qualified API — must succeed and point to same entry.
     let public_events = QualifiedTableName::new(schema("public"), table("events"));
-    let meta = cat.load_table_qualified(&proj, &public_events).await.unwrap();
+    let meta = cat
+        .load_table_qualified(&proj, &public_events)
+        .await
+        .unwrap();
     assert_eq!(meta.table.as_str(), "events");
 }
 
@@ -282,8 +286,14 @@ async fn in_memory_list_tables_qualified_spans_schemas() {
 
     let all = cat.list_tables_qualified(&proj).await.unwrap();
     assert!(all.contains(&auth_users), "auth.users missing: {all:?}");
-    assert!(all.contains(&storage_objects), "storage.objects missing: {all:?}");
-    assert!(all.contains(&public_orders), "public.orders missing: {all:?}");
+    assert!(
+        all.contains(&storage_objects),
+        "storage.objects missing: {all:?}"
+    );
+    assert!(
+        all.contains(&public_orders),
+        "public.orders missing: {all:?}"
+    );
 }
 
 /// `create_namespace` pre-seeds all 8 reserved schemas.
@@ -296,9 +306,7 @@ async fn in_memory_create_namespace_seeds_all_reserved_schemas() {
     let schemas = cat.list_schemas(&proj).await.unwrap();
     for &reserved in ReservedSchema::ALL {
         assert!(
-            schemas
-                .iter()
-                .any(|s| s.as_str() == reserved.as_str()),
+            schemas.iter().any(|s| s.as_str() == reserved.as_str()),
             "reserved schema {:?} missing from list_schemas after create_namespace",
             reserved
         );
@@ -326,10 +334,7 @@ async fn in_memory_create_table_in_every_reserved_schema() {
         cat.load_table_qualified(&proj, &qtable)
             .await
             .unwrap_or_else(|e| {
-                panic!(
-                    "load_table_qualified failed for schema {:?}: {e}",
-                    reserved
-                )
+                panic!("load_table_qualified failed for schema {:?}: {e}", reserved)
             });
     }
 }

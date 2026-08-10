@@ -168,10 +168,7 @@ async fn create_snapshot_materialized_view_succeeds() {
     }
 
     // The snapshot rows are immediately queryable.
-    let res = sess
-        .execute("SELECT id FROM mv ORDER BY id")
-        .await
-        .unwrap();
+    let res = sess.execute("SELECT id FROM mv ORDER BY id").await.unwrap();
     let batches = match res {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected Rows, got: {other:?}"),

@@ -39,7 +39,10 @@ async fn data_put_is_fsynced_without_marker() {
 
     // The storage writer's exact call shape: a plain `put` with a payload.
     store
-        .put(&path, PutPayload::from_bytes(Bytes::from_static(b"coldfile")))
+        .put(
+            &path,
+            PutPayload::from_bytes(Bytes::from_static(b"coldfile")),
+        )
         .await
         .unwrap();
 

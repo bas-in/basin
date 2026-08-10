@@ -848,7 +848,11 @@ impl RaftWal {
     /// network/catalog layer reads it to decide which catalog snapshot to
     /// fetch and from which LSN to resume log replay. See `APPLY.md`.
     pub async fn durable_watermark(&self, project: &ProjectId, partition: &PartitionKey) -> Lsn {
-        Lsn(self.storage.manifest_pointer().await.watermark(project, partition))
+        Lsn(self
+            .storage
+            .manifest_pointer()
+            .await
+            .watermark(project, partition))
     }
 
     /// Propose a **batch** of appends as one raft entry (multi-node commit 4).
@@ -922,9 +926,9 @@ impl WalMode {
         match std::env::var("BASIN_WAL_MODE") {
             Ok(v) => Self::parse(&v),
             Err(std::env::VarError::NotPresent) => Ok(WalMode::Local),
-            Err(std::env::VarError::NotUnicode(_)) => Err(BasinError::wal(
-                "BASIN_WAL_MODE is not valid unicode",
-            )),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(BasinError::wal("BASIN_WAL_MODE is not valid unicode"))
+            }
         }
     }
 }
@@ -975,7 +979,9 @@ impl DurabilityBackend for RaftDurability {
     }
 
     async fn commit_batch(&self, batch: Vec<BasinRaftItem>) -> Result<Vec<Lsn>> {
-        self.wal.propose_batch(BasinRaftRequest { items: batch }).await
+        self.wal
+            .propose_batch(BasinRaftRequest { items: batch })
+            .await
     }
 }
 
@@ -1010,7 +1016,12 @@ impl DurabilityBackend for LocalDurability {
             // local path already takes today, so the bytes are unchanged.
             let lsn = self
                 .wal
-                .append_fenced_durable(&item.project, &item.partition, Bytes::from(item.payload), None)
+                .append_fenced_durable(
+                    &item.project,
+                    &item.partition,
+                    Bytes::from(item.payload),
+                    None,
+                )
                 .await?;
             lsns.push(lsn);
         }

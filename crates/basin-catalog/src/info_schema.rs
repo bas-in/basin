@@ -734,10 +734,7 @@ impl InfoSchemaQuery {
                     .map(|n| n.to_string())
                     .collect::<Vec<_>>()
                     .join(" ");
-                let is_unique = meta
-                    .unique_constraints
-                    .iter()
-                    .any(|u| u.name == idx.name);
+                let is_unique = meta.unique_constraints.iter().any(|u| u.name == idx.name);
                 indexrelids.push(index_oid(project, name, &idx.name));
                 indrelids.push(relid);
                 indnatts.push(idx.columns.len() as i16);
@@ -4304,10 +4301,7 @@ impl InfoSchemaQuery {
     /// `cfgowner` is the project's role oid (same value as `pg_authid.oid`).
     /// `cfgparser` is `3722` — PG's well-known OID for the built-in default
     /// text-search parser.
-    pub async fn pg_ts_config(
-        _catalog: &dyn Catalog,
-        project: &ProjectId,
-    ) -> Result<RecordBatch> {
+    pub async fn pg_ts_config(_catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
         let cfgnamespace = namespace_oid_for(project, PG_CATALOG_SCHEMA);
         let cfgowner = role_oid_for(project);
 
@@ -4466,7 +4460,7 @@ impl InfoSchemaQuery {
             pronamespace: ns_oid,
             prokind: PROKIND_FUNCTION.to_string(),
             pronargs: 1i16,
-            prorettype: 16i64, // bool OID
+            prorettype: 16i64,             // bool OID
             proargtypes: "23".to_string(), // int4 OID
             prosrc: "-- built-in".to_string(),
             prolang: PROLANG_SQL,
@@ -5122,15 +5116,13 @@ mod tests_5_18_d {
     use basin_common::{ProjectId, QualifiedTableName, SchemaName, TableName};
 
     use crate::reserved_schema::ReservedSchema;
-    use crate::InMemoryCatalog;
     use crate::Catalog;
+    use crate::InMemoryCatalog;
 
     use super::InfoSchemaQuery;
 
     fn minimal_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]))
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
     }
 
     fn qtable(schema: &str, table: &str) -> QualifiedTableName {
@@ -5361,7 +5353,10 @@ mod tests_5_18_d {
         let mut expected: Vec<&str> = ReservedSchema::ALL.iter().map(|r| r.as_str()).collect();
         expected.sort();
 
-        assert_eq!(names, expected, "pg_namespace must cover every reserved schema");
+        assert_eq!(
+            names, expected,
+            "pg_namespace must cover every reserved schema"
+        );
     }
 
     /// `pg_namespace` oids must be stable across two calls (deterministic).
@@ -5376,13 +5371,24 @@ mod tests_5_18_d {
 
         // Collect oid→name maps for both calls.
 
-        let oids1 = batch1.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let oids2 = batch2.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let oids1 = batch1
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let oids2 = batch2
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
 
         let oids1_vec: Vec<i64> = (0..oids1.len()).map(|i| oids1.value(i)).collect();
         let oids2_vec: Vec<i64> = (0..oids2.len()).map(|i| oids2.value(i)).collect();
 
-        assert_eq!(oids1_vec, oids2_vec, "pg_namespace oids must be stable across calls");
+        assert_eq!(
+            oids1_vec, oids2_vec,
+            "pg_namespace oids must be stable across calls"
+        );
     }
 
     // ── pg_class.relnamespace ─────────────────────────────────────────────────
@@ -5405,7 +5411,11 @@ mod tests_5_18_d {
 
         // Find the namespace oid for "auth".
 
-        let ns_oids = pg_ns_batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ns_oids = pg_ns_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         let ns_names = pg_ns_batch
             .column(1)
             .as_any()
@@ -5456,8 +5466,11 @@ mod tests_5_18_d {
         let pg_class_batch = InfoSchemaQuery::pg_class(&cat, &p).await.unwrap();
         let pg_ns_batch = InfoSchemaQuery::pg_namespace(&cat, &p).await.unwrap();
 
-
-        let ns_oids = pg_ns_batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ns_oids = pg_ns_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         let ns_names = pg_ns_batch
             .column(1)
             .as_any()

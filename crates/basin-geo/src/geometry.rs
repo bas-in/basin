@@ -332,7 +332,11 @@ fn decode_geom(
                 let (g, _) = decode_geom(cur, srid)?;
                 match g {
                     Geometry::Point(p) => pts.push(p),
-                    _ => return Err(GeomError::BadType { got: WKB_MULTIPOINT }),
+                    _ => {
+                        return Err(GeomError::BadType {
+                            got: WKB_MULTIPOINT,
+                        })
+                    }
                 }
             }
             Geometry::MultiPoint(MultiPoint(pts))
@@ -793,12 +797,8 @@ pub fn encode_geojson(g: &Geometry<f64>) -> String {
         ),
         Geometry::LineString(ls) => wrap("LineString", "coordinates", &ring_json(ls)),
         Geometry::Polygon(poly) => wrap("Polygon", "coordinates", &polygon_json(poly)),
-        Geometry::Rect(r) => {
-            wrap("Polygon", "coordinates", &polygon_json(&r.to_polygon()))
-        }
-        Geometry::Triangle(t) => {
-            wrap("Polygon", "coordinates", &polygon_json(&t.to_polygon()))
-        }
+        Geometry::Rect(r) => wrap("Polygon", "coordinates", &polygon_json(&r.to_polygon())),
+        Geometry::Triangle(t) => wrap("Polygon", "coordinates", &polygon_json(&t.to_polygon())),
         Geometry::MultiPoint(mp) => wrap(
             "MultiPoint",
             "coordinates",
@@ -888,7 +888,9 @@ fn geojson_value(v: &serde_json::Value) -> Result<Geometry<f64>, GeomError> {
             }
             Ok(Geometry::GeometryCollection(GeometryCollection(members)))
         }
-        other => Err(GeomError::GeoJson(format!("unknown geometry type {other:?}"))),
+        other => Err(GeomError::GeoJson(format!(
+            "unknown geometry type {other:?}"
+        ))),
     }
 }
 
@@ -1022,12 +1024,10 @@ mod tests {
                 GLineString::new(vec![Coord { x: 0.0, y: 0.0 }, Coord { x: 1.0, y: 1.0 }]),
                 GLineString::new(vec![Coord { x: 2.0, y: 2.0 }, Coord { x: 3.0, y: 3.0 }]),
             ])),
-            Geometry::MultiPolygon(MultiPolygon(vec![
-                match sample_polygon() {
-                    Geometry::Polygon(p) => p,
-                    _ => unreachable!(),
-                },
-            ])),
+            Geometry::MultiPolygon(MultiPolygon(vec![match sample_polygon() {
+                Geometry::Polygon(p) => p,
+                _ => unreachable!(),
+            }])),
             Geometry::GeometryCollection(GeometryCollection(vec![
                 Geometry::Point(GPoint(Coord { x: 9.0, y: 8.0 })),
                 sample_linestring(),
@@ -1056,7 +1056,10 @@ mod tests {
     fn truncated_wkb_errors() {
         let mut bytes = encode_wkb(&sample_linestring());
         bytes.truncate(bytes.len() - 4);
-        assert!(matches!(decode_any(&bytes), Err(GeomError::Truncated { .. })));
+        assert!(matches!(
+            decode_any(&bytes),
+            Err(GeomError::Truncated { .. })
+        ));
     }
 
     #[test]
@@ -1081,10 +1084,7 @@ mod tests {
 
     #[test]
     fn wkt_rejects_z_coordinate() {
-        assert!(matches!(
-            decode_wkt("POINT(1 2 3)"),
-            Err(GeomError::Wkt(_))
-        ));
+        assert!(matches!(decode_wkt("POINT(1 2 3)"), Err(GeomError::Wkt(_))));
     }
 
     #[test]

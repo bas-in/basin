@@ -2651,7 +2651,13 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
                 } else {
                     child_table.clone()
                 };
-                (fk_ref, corr.child_col, corr.outer_ref, child_decl, extra_where)
+                (
+                    fk_ref,
+                    corr.child_col,
+                    corr.outer_ref,
+                    child_decl,
+                    extra_where,
+                )
             } else {
                 // Multi-table path: keep the full FROM clause, detect FK from WHERE.
                 // Reject subqueries inside the FROM clause (too complex).
@@ -2661,11 +2667,8 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
                     continue;
                 }
                 let (fk_tbl_alias, child_col_uq, outer_ref, extra_where) =
-                    match parse_corr_predicate_multi_table(
-                        where_body,
-                        &where_body_lower,
-                        &cl_lower,
-                    ) {
+                    match parse_corr_predicate_multi_table(where_body, &where_body_lower, &cl_lower)
+                    {
                         Some(quad) => quad,
                         None => {
                             search_from = ljl_end;
@@ -2674,7 +2677,13 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
                     };
                 let fk_ref = format!("{}.{}", fk_tbl_alias, child_col_uq);
                 // Keep the original child clause (preserving case) as the FROM body.
-                (fk_ref, child_col_uq, outer_ref, child_clause.clone(), extra_where)
+                (
+                    fk_ref,
+                    child_col_uq,
+                    outer_ref,
+                    child_clause.clone(),
+                    extra_where,
+                )
             };
 
         // Find the subquery alias after the closing `)`.
@@ -3522,7 +3531,8 @@ pub(crate) fn rewrite_lateral_order_limit(sql: &str) -> String {
 
         // Parse: SELECT <proj> FROM <child> WHERE <pred> ORDER BY <order> LIMIT <n>
         let sel_offset = if body_lower.trim_start().starts_with("select ") {
-            body_lower.trim_start().len() - body_lower.trim_start().trim_start_matches("select ").len()
+            body_lower.trim_start().len()
+                - body_lower.trim_start().trim_start_matches("select ").len()
             // simpler: 7 characters after skipping leading whitespace
         } else {
             search_from = lat_end;
@@ -3555,7 +3565,8 @@ pub(crate) fn rewrite_lateral_order_limit(sql: &str) -> String {
 
         // After WHERE: find ORDER BY at depth 0.
         let where_body_start = where_pos + 6; // skip "where "
-        let Some(orderby_pos) = find_keyword_at_depth0(&body_lower, "order by", where_body_start) else {
+        let Some(orderby_pos) = find_keyword_at_depth0(&body_lower, "order by", where_body_start)
+        else {
             search_from = lat_end;
             continue;
         };
@@ -3579,7 +3590,7 @@ pub(crate) fn rewrite_lateral_order_limit(sql: &str) -> String {
 
         // After ORDER BY: find LIMIT at depth 0.
         let orderby_body_start = orderby_pos + 9; // skip "order by "
-        // But ORDER BY might be "order by " (8+1) — let's find LIMIT after orderby_pos.
+                                                  // But ORDER BY might be "order by " (8+1) — let's find LIMIT after orderby_pos.
         let Some(limit_pos) = find_keyword_at_depth0(&body_lower, "limit", orderby_pos + 8) else {
             search_from = lat_end;
             continue;
@@ -3730,12 +3741,9 @@ pub(crate) fn rewrite_lateral_order_limit(sql: &str) -> String {
             format!("{}, {}, {}", proj_str, fk_qualified, window_expr)
         };
 
-        let new_on = format!(
-            "{sub_alias}.{fk_col} = {outer_ref} AND {sub_alias}.{rn_col} <= {limit_n}"
-        );
-        let new_subquery = format!(
-            "(SELECT {sub_proj} FROM {child_decl}) {sub_alias}"
-        );
+        let new_on =
+            format!("{sub_alias}.{fk_col} = {outer_ref} AND {sub_alias}.{rn_col} <= {limit_n}");
+        let new_subquery = format!("(SELECT {sub_proj} FROM {child_decl}) {sub_alias}");
 
         // Build the replacement string.
         let (replace_from, replacement) = match join_type {
@@ -3758,7 +3766,10 @@ pub(crate) fn rewrite_lateral_order_limit(sql: &str) -> String {
                     search_from = lat_end;
                     continue;
                 };
-                (join_marker_start, format!("INNER JOIN {new_subquery} ON {new_on}"))
+                (
+                    join_marker_start,
+                    format!("INNER JOIN {new_subquery} ON {new_on}"),
+                )
             }
             _ => {
                 // COMMA form.
@@ -5372,8 +5383,8 @@ pub(crate) fn rewrite_citext_cast(sql: &str) -> String {
 
     // Collect (position, is_string_literal_lhs) for each `::citext` occurrence.
     struct Occurrence {
-        pos: usize,        // byte offset of `::`
-        lit_start: usize,  // byte offset of the opening `'` (0 if not a literal)
+        pos: usize,       // byte offset of `::`
+        lit_start: usize, // byte offset of the opening `'` (0 if not a literal)
         is_literal: bool,
     }
     let mut occurrences: Vec<Occurrence> = Vec::new();
@@ -5403,7 +5414,11 @@ pub(crate) fn rewrite_citext_cast(sql: &str) -> String {
                     if t_bytes[i] == b'\'' {
                         // Two consecutive `'` inside a literal — skip one.
                         if i > 0 && t_bytes[i - 1] == b'\'' {
-                            if i >= 2 { i -= 2; } else { break; }
+                            if i >= 2 {
+                                i -= 2;
+                            } else {
+                                break;
+                            }
                         } else {
                             // This is the opening quote.
                             found_open = true;
@@ -5422,10 +5437,18 @@ pub(crate) fn rewrite_citext_cast(sql: &str) -> String {
                         is_literal: true,
                     });
                 } else {
-                    occurrences.push(Occurrence { pos: abs, lit_start: 0, is_literal: false });
+                    occurrences.push(Occurrence {
+                        pos: abs,
+                        lit_start: 0,
+                        is_literal: false,
+                    });
                 }
             } else {
-                occurrences.push(Occurrence { pos: abs, lit_start: 0, is_literal: false });
+                occurrences.push(Occurrence {
+                    pos: abs,
+                    lit_start: 0,
+                    is_literal: false,
+                });
             }
         }
         start = abs + needle.len();
@@ -5448,7 +5471,7 @@ pub(crate) fn rewrite_citext_cast(sql: &str) -> String {
             // `out[..occ.pos]` still matches `sql[..occ.pos]` at this point.
             let lhs_trimmed = out[..occ.pos].trim_end();
             let open_in_lhs = occ.lit_start; // offset within lhs_trimmed
-            // Absolute byte position of the opening quote in `out`.
+                                             // Absolute byte position of the opening quote in `out`.
             let open_abs = open_in_lhs; // lhs_trimmed is a prefix of out
             let end_of_cast = occ.pos + needle.len(); // byte after `::citext`
             let literal = &out[open_abs..lhs_trimmed.len()]; // e.g. `'Foo'`
@@ -6247,7 +6270,11 @@ const JSONB_SRF_NAMES: &[&str] = &[
 /// rewritten — correct-or-noop. Anything with a WHERE/JOIN/alias/extra columns
 /// is left for the normal planner.
 pub(crate) fn rewrite_system_fn_from_table(sql: &str) -> String {
-    let lower = sql.trim().trim_end_matches(';').trim_end().to_ascii_lowercase();
+    let lower = sql
+        .trim()
+        .trim_end_matches(';')
+        .trim_end()
+        .to_ascii_lowercase();
     if !lower.starts_with("select") {
         return sql.to_string();
     }
@@ -6688,8 +6715,8 @@ pub(crate) fn rewrite_vector_col_text_cast(sql: &str) -> String {
             } else {
                 0
             };
-            let is_ident = ident_len > 0
-                && (first_byte.is_ascii_alphabetic() || first_byte == b'_');
+            let is_ident =
+                ident_len > 0 && (first_byte.is_ascii_alphabetic() || first_byte == b'_');
             // SQL keyword literals like `NULL` / `TRUE` / `FALSE` are
             // syntactically identifiers but semantically not column refs;
             // wrapping them in `vector_to_text(…)` causes
@@ -6766,8 +6793,7 @@ pub(crate) fn rewrite_vector_cast(sql: &str) -> String {
         {
             // Make sure this isn't `::vectorfoo` (i.e. longer identifier).
             let after = i + 8;
-            if after < bytes.len()
-                && (bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_')
+            if after < bytes.len() && (bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_')
             {
                 // Not `::vector` alone — copy as-is and continue.
                 out.push(bytes[i] as char);
@@ -6891,24 +6917,25 @@ pub(crate) fn rewrite_jsonb_arrow_op_spacing(sql: &str) -> String {
         }
         // Detect the four PG JSON path operators.  Longest-first so `->>`
         // wins over `->` and `#>>` wins over `#>`.
-        let op: Option<&'static str> = if b == b'-' && i + 2 < len && bytes[i + 1] == b'>' && bytes[i + 2] == b'>' {
-            Some("->>")
-        } else if b == b'-' && i + 1 < len && bytes[i + 1] == b'>' {
-            // Skip `-` that is part of `<-` / `<->` etc. (vector ops) — the
-            // previous char is `<`, so leave it alone.
-            if i > 0 && (bytes[i - 1] == b'<' || out.as_bytes().last() == Some(&b'<')) {
-                None
+        let op: Option<&'static str> =
+            if b == b'-' && i + 2 < len && bytes[i + 1] == b'>' && bytes[i + 2] == b'>' {
+                Some("->>")
+            } else if b == b'-' && i + 1 < len && bytes[i + 1] == b'>' {
+                // Skip `-` that is part of `<-` / `<->` etc. (vector ops) — the
+                // previous char is `<`, so leave it alone.
+                if i > 0 && (bytes[i - 1] == b'<' || out.as_bytes().last() == Some(&b'<')) {
+                    None
+                } else {
+                    Some("->")
+                }
+            } else if b == b'#' && i + 2 < len && bytes[i + 1] == b'>' && bytes[i + 2] == b'>' {
+                Some("#>>")
+            } else if b == b'#' && i + 1 < len && bytes[i + 1] == b'>' {
+                // Watch out for `#-` (already JSON path-delete) and `##` etc.
+                Some("#>")
             } else {
-                Some("->")
-            }
-        } else if b == b'#' && i + 2 < len && bytes[i + 1] == b'>' && bytes[i + 2] == b'>' {
-            Some("#>>")
-        } else if b == b'#' && i + 1 < len && bytes[i + 1] == b'>' {
-            // Watch out for `#-` (already JSON path-delete) and `##` etc.
-            Some("#>")
-        } else {
-            None
-        };
+                None
+            };
         let Some(op_str) = op else {
             out.push(b as char);
             i += 1;
@@ -7189,12 +7216,14 @@ pub(crate) fn extract_from_alias_table_map(sql: &str) -> std::collections::HashM
             let p = bytes[i - 1];
             !(p.is_ascii_alphanumeric() || p == b'_')
         };
-        let kw_len = if prev_ok && lower_bytes[i..].starts_with(b"from")
+        let kw_len = if prev_ok
+            && lower_bytes[i..].starts_with(b"from")
             && i + 4 < len
             && bytes[i + 4].is_ascii_whitespace()
         {
             4
-        } else if prev_ok && lower_bytes[i..].starts_with(b"join")
+        } else if prev_ok
+            && lower_bytes[i..].starts_with(b"join")
             && i + 4 < len
             && bytes[i + 4].is_ascii_whitespace()
         {
@@ -7927,7 +7956,10 @@ mod tests {
         // The array `&&` overlap path must NOT be hijacked by the bbox pass.
         let sql = "SELECT * FROM t WHERE tags && ARRAY[1,2]";
         let out = rewrite_array_operators(sql);
-        assert!(out.contains("arrays_overlap(tags, ARRAY[1,2])"), "got: {out}");
+        assert!(
+            out.contains("arrays_overlap(tags, ARRAY[1,2])"),
+            "got: {out}"
+        );
         assert!(!out.contains("ST_Contains"), "got: {out}");
         assert!(!out.contains("ST_X"), "got: {out}");
     }
@@ -9051,13 +9083,34 @@ mod tests {
                    ORDER BY t.id";
         let out = rlol(sql);
         let out_lower = out.to_ascii_lowercase();
-        assert!(!out_lower.contains("lateral"), "LATERAL must be gone: {out}");
-        assert!(out_lower.contains("left join"), "must remain LEFT JOIN: {out}");
-        assert!(out_lower.contains("row_number()"), "must have ROW_NUMBER(): {out}");
-        assert!(out_lower.contains("partition by"), "must have PARTITION BY: {out}");
-        assert!(out_lower.contains("__basin_rn"), "must have rn alias: {out}");
-        assert!(out_lower.contains("__basin_rn <= 1"), "must filter rn <= 1: {out}");
-        assert!(!out_lower.contains("on true"), "ON true must be replaced: {out}");
+        assert!(
+            !out_lower.contains("lateral"),
+            "LATERAL must be gone: {out}"
+        );
+        assert!(
+            out_lower.contains("left join"),
+            "must remain LEFT JOIN: {out}"
+        );
+        assert!(
+            out_lower.contains("row_number()"),
+            "must have ROW_NUMBER(): {out}"
+        );
+        assert!(
+            out_lower.contains("partition by"),
+            "must have PARTITION BY: {out}"
+        );
+        assert!(
+            out_lower.contains("__basin_rn"),
+            "must have rn alias: {out}"
+        );
+        assert!(
+            out_lower.contains("__basin_rn <= 1"),
+            "must filter rn <= 1: {out}"
+        );
+        assert!(
+            !out_lower.contains("on true"),
+            "ON true must be replaced: {out}"
+        );
     }
 
     #[test]
@@ -9067,9 +9120,18 @@ mod tests {
                    FROM t, LATERAL (SELECT v FROM u WHERE u.tid = t.id ORDER BY v DESC LIMIT 3) sub";
         let out = rlol(sql);
         let out_lower = out.to_ascii_lowercase();
-        assert!(!out_lower.contains("lateral"), "LATERAL must be gone: {out}");
-        assert!(out_lower.contains("inner join"), "comma → INNER JOIN: {out}");
-        assert!(out_lower.contains("__basin_rn <= 3"), "must filter rn <= 3: {out}");
+        assert!(
+            !out_lower.contains("lateral"),
+            "LATERAL must be gone: {out}"
+        );
+        assert!(
+            out_lower.contains("inner join"),
+            "comma → INNER JOIN: {out}"
+        );
+        assert!(
+            out_lower.contains("__basin_rn <= 3"),
+            "must filter rn <= 3: {out}"
+        );
     }
 
     #[test]
@@ -9079,9 +9141,18 @@ mod tests {
                    FROM t JOIN LATERAL (SELECT v FROM u WHERE u.tid = t.id ORDER BY v LIMIT 1) sub ON true";
         let out = rlol(sql);
         let out_lower = out.to_ascii_lowercase();
-        assert!(!out_lower.contains("lateral"), "LATERAL must be gone: {out}");
-        assert!(out_lower.contains("inner join"), "must be INNER JOIN: {out}");
-        assert!(out_lower.contains("row_number()"), "must have ROW_NUMBER(): {out}");
+        assert!(
+            !out_lower.contains("lateral"),
+            "LATERAL must be gone: {out}"
+        );
+        assert!(
+            out_lower.contains("inner join"),
+            "must be INNER JOIN: {out}"
+        );
+        assert!(
+            out_lower.contains("row_number()"),
+            "must have ROW_NUMBER(): {out}"
+        );
     }
 
     #[test]
@@ -9126,12 +9197,18 @@ mod tests {
                    ) sub ON true";
         let out = rlol(sql);
         let out_lower = out.to_ascii_lowercase();
-        assert!(!out_lower.contains("lateral"), "LATERAL must be gone: {out}");
+        assert!(
+            !out_lower.contains("lateral"),
+            "LATERAL must be gone: {out}"
+        );
         // t_id is already in the projection — should not appear twice from the prepend path.
         let count_tid = out_lower.matches("t_id,").count() + out_lower.matches(", t_id").count();
         // Allow at most one extra reference in the ON clause (sub.t_id = t.id).
         // The key invariant is the window subquery projection does NOT prepend an extra `u.t_id`.
-        assert!(out_lower.contains("partition by u.t_id"), "PARTITION BY must use qualified FK: {out}");
+        assert!(
+            out_lower.contains("partition by u.t_id"),
+            "PARTITION BY must use qualified FK: {out}"
+        );
     }
 
     #[test]
@@ -9201,7 +9278,10 @@ mod tests {
         // Both the `->'a'` and `->>'b'` operators get spaces inserted around
         // them — the chained form must keep both legible.
         assert!(out.contains("body -> 'a'"), "got: {out}");
-        assert!(out.contains("'a' ->> 'b'") || out.contains("'a' ->>'b'") || out.contains(" ->> 'b'"), "got: {out}");
+        assert!(
+            out.contains("'a' ->> 'b'") || out.contains("'a' ->>'b'") || out.contains(" ->> 'b'"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -9282,8 +9362,14 @@ mod tests {
             "should expand wildcard: {out}"
         );
         assert!(out.contains("'id', o.\"id\""), "id key/val: {out}");
-        assert!(out.contains("'userId', o.\"userId\""), "userId key/val: {out}");
-        assert!(out.contains("'status', o.\"status\""), "status key/val: {out}");
+        assert!(
+            out.contains("'userId', o.\"userId\""),
+            "userId key/val: {out}"
+        );
+        assert!(
+            out.contains("'status', o.\"status\""),
+            "status key/val: {out}"
+        );
         assert!(out.contains("'total', o.\"total\""), "total key/val: {out}");
         // The qualified wildcard must be gone.
         assert!(!out.contains("o.*)"), "qualified wildcard removed: {out}");
@@ -9299,7 +9385,10 @@ mod tests {
             "should expand jsonb_agg wildcard: {out}"
         );
         assert!(out.contains("'id', o.\"id\""), "id pair: {out}");
-        assert!(out.contains("'user_id', o.\"user_id\""), "user_id pair: {out}");
+        assert!(
+            out.contains("'user_id', o.\"user_id\""),
+            "user_id pair: {out}"
+        );
     }
 
     #[test]
@@ -9385,7 +9474,10 @@ mod tests {
             out.contains("arrays_overlap(\"t\".\"tags\", (ARRAY['go', 'rust'])::varchar(50)[])"),
             "got: {out}"
         );
-        assert!(!out.contains("range_overlaps"), "must not route to range: {out}");
+        assert!(
+            !out.contains("range_overlaps"),
+            "must not route to range: {out}"
+        );
     }
 
     #[test]

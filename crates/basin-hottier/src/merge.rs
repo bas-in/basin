@@ -232,11 +232,7 @@ mod tests {
     /// Build a one-row `RecordBatch` with `id = n`.
     fn cold_batch(n: i64) -> RecordBatch {
         let schema = schema();
-        RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![n])) as _],
-        )
-        .unwrap()
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![n])) as _]).unwrap()
     }
 
     /// Encode a one-row `RecordBatch` as IPC bytes (memtable format).
@@ -294,10 +290,7 @@ mod tests {
     #[test]
     fn cold_only_emits_in_pk_order() {
         let mem: Vec<(RowKey, MemRowValue)> = vec![];
-        let cold = vec![
-            (key(10), cold_batch(10)),
-            (key(20), cold_batch(20)),
-        ];
+        let cold = vec![(key(10), cold_batch(10)), (key(20), cold_batch(20))];
         let out: Vec<_> = merge_scan(mem, cold).collect();
         assert_eq!(out.len(), 2);
         assert_eq!(id(&out[0]), 10);

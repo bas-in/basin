@@ -171,15 +171,16 @@ impl JwtKeys {
         // Access tokens have no `aud`; refresh validation requires it below.
         // Require exp + nbf; iat is validated manually in `verify` because
         // jsonwebtoken's required_spec_claims only enforces exp/nbf/aud/iss/sub.
-        validation.required_spec_claims =
-            ["exp", "nbf"].iter().map(|s| s.to_string()).collect();
+        validation.required_spec_claims = ["exp", "nbf"].iter().map(|s| s.to_string()).collect();
         // Enable nbf enforcement (defaults to false in jsonwebtoken).
         validation.validate_nbf = true;
         // 60-second leeway for exp + nbf to absorb minor clock skew.
         validation.leeway = 60;
         let mut refresh_validation = Validation::new(Algorithm::HS256);
-        refresh_validation.required_spec_claims =
-            ["exp", "nbf", "aud"].iter().map(|s| s.to_string()).collect();
+        refresh_validation.required_spec_claims = ["exp", "nbf", "aud"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         refresh_validation.validate_nbf = true;
         refresh_validation.leeway = 60;
         refresh_validation.set_audience(&[REFRESH_AUDIENCE]);
@@ -270,7 +271,17 @@ impl JwtKeys {
         now: DateTime<Utc>,
         ttl: Duration,
     ) -> Result<(String, DateTime<Utc>)> {
-        self.issue_full(project, user, email, roles, is_admin, Aal::Aal1, vec![], now, ttl)
+        self.issue_full(
+            project,
+            user,
+            email,
+            roles,
+            is_admin,
+            Aal::Aal1,
+            vec![],
+            now,
+            ttl,
+        )
     }
 
     /// Issue an access token with full AAL/AMR control (used by MFA challenge
@@ -492,10 +503,9 @@ impl JwtKeys {
             Ok(d) => d,
             Err(primary_err) => match &self.previous_decoding {
                 Some(prev_key) => {
-                    decode::<RefreshWireClaims>(token, prev_key, &self.refresh_validation)
-                        .map_err(|_| {
-                            BasinError::internal(format!("refresh jwt verify: {primary_err}"))
-                        })?
+                    decode::<RefreshWireClaims>(token, prev_key, &self.refresh_validation).map_err(
+                        |_| BasinError::internal(format!("refresh jwt verify: {primary_err}")),
+                    )?
                 }
                 None => {
                     return Err(BasinError::internal(format!(

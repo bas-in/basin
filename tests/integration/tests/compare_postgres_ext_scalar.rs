@@ -161,7 +161,11 @@ async fn ext_scalar_shapes() {
     // the standard events shape so the NULL/COALESCE/boolean shapes have real
     // columns. Both engines get byte-identical data.
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     sess.execute(
         "CREATE TABLE events (\
             id BIGINT NOT NULL PRIMARY KEY, \
@@ -244,7 +248,10 @@ async fn ext_scalar_shapes() {
             "T5 concat projection (full drain)",
             "SELECT email || ':' || id::text AS k FROM events",
         ),
-        mk("T6 SELECT DISTINCT status", "SELECT DISTINCT status FROM events"),
+        mk(
+            "T6 SELECT DISTINCT status",
+            "SELECT DISTINCT status FROM events",
+        ),
         mk(
             "T7 distinct-then-count subquery",
             "SELECT COUNT(*) FROM (SELECT DISTINCT status FROM events) s",

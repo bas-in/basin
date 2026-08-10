@@ -579,11 +579,9 @@ async fn fast_path_bulk_delete_is_materially_faster_than_slow_path() {
         }
         sess.execute(&stmt).await.unwrap();
         let start = Instant::now();
-        sess.execute(
-            "DELETE FROM pk_perf_single WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)",
-        )
-        .await
-        .unwrap();
+        sess.execute("DELETE FROM pk_perf_single WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)")
+            .await
+            .unwrap();
         start.elapsed().as_secs_f64() * 1000.0
     };
 
@@ -1287,10 +1285,7 @@ async fn fast_path_delete_with_no_tombstones_is_zero_overhead() {
          A row count != 5 means the tombstone filter is dropping live rows"
     );
     assert_eq!(col_i64(&batches, "id"), vec![1, 2, 3, 4, 5]);
-    assert_eq!(
-        col_string(&batches, "name"),
-        vec!["a", "b", "c", "d", "e"]
-    );
+    assert_eq!(col_string(&batches, "name"), vec!["a", "b", "c", "d", "e"]);
 
     // Defence in depth: prove the registry actually contains zero
     // tombstones for this table, so the read path is short-circuiting
@@ -1364,18 +1359,14 @@ async fn bulk_upsert_all_conflict() {
     sess.execute(&seed).await.unwrap();
 
     // Upsert the same 50 ids with amount=99.
-    let mut upsert = String::from(
-        "INSERT INTO upsert_all (id, amount) VALUES ",
-    );
+    let mut upsert = String::from("INSERT INTO upsert_all (id, amount) VALUES ");
     for i in 100i64..150 {
         if i > 100 {
             upsert.push(',');
         }
         upsert.push_str(&format!("({i}, 99)"));
     }
-    upsert.push_str(
-        " ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount",
-    );
+    upsert.push_str(" ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount");
 
     let res = sess
         .execute(&upsert)
@@ -1503,11 +1494,9 @@ async fn bulk_upsert_do_nothing() {
     let (_dir, eng) = open_engine().await;
     let sess = session(&eng).await;
 
-    sess.execute(
-        "CREATE TABLE upsert_nothing (id BIGINT NOT NULL PRIMARY KEY, val TEXT NOT NULL)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE upsert_nothing (id BIGINT NOT NULL PRIMARY KEY, val TEXT NOT NULL)")
+        .await
+        .unwrap();
 
     // Seed ids 1..5.
     sess.execute(
@@ -1753,9 +1742,12 @@ async fn fast_path_absent_key_delete_update_oracle() {
     let mut oracle: std::collections::BTreeSet<i64> = (1..=100).collect();
     {
         let vals: Vec<String> = (1..=100).map(|i| format!("({i}, {})", i * 10)).collect();
-        sess.execute(&format!("INSERT INTO adv (id, x) VALUES {}", vals.join(", ")))
-            .await
-            .unwrap();
+        sess.execute(&format!(
+            "INSERT INTO adv (id, x) VALUES {}",
+            vals.join(", ")
+        ))
+        .await
+        .unwrap();
     }
     assert_eq!(count_star(&sess, "adv").await, 100);
     assert_eq!(surviving_ids(&sess, "adv").await, oracle);

@@ -200,8 +200,8 @@ fn cmd_build(path: Option<&Path>) -> Result<()> {
 /// crate — basinctl has no TOML dependency. We use a simple line scan that
 /// handles the common unquoted/single-quoted/double-quoted name field.
 fn read_crate_name(cargo_toml: &Path) -> Result<String> {
-    let text = fs::read_to_string(cargo_toml)
-        .with_context(|| format!("read {}", cargo_toml.display()))?;
+    let text =
+        fs::read_to_string(cargo_toml).with_context(|| format!("read {}", cargo_toml.display()))?;
 
     let mut in_package = false;
     for line in text.lines() {
@@ -243,11 +243,8 @@ async fn cmd_deploy(
     // Resolve auth token: --token > BASIN_ADMIN_TOKEN.
     let token = match token {
         Some(t) => t.to_string(),
-        None => std::env::var("BASIN_ADMIN_TOKEN").map_err(|_| {
-            anyhow!(
-                "no auth token: pass --token or set BASIN_ADMIN_TOKEN"
-            )
-        })?,
+        None => std::env::var("BASIN_ADMIN_TOKEN")
+            .map_err(|_| anyhow!("no auth token: pass --token or set BASIN_ADMIN_TOKEN"))?,
     };
 
     // Resolve .wasm path.
@@ -256,19 +253,16 @@ async fn cmd_deploy(
         None => {
             // Try the standard cargo output location relative to cwd.
             let slug = name.replace('-', "_");
-            PathBuf::from(format!(
-                "target/wasm32-wasip1/release/{slug}.wasm"
-            ))
+            PathBuf::from(format!("target/wasm32-wasip1/release/{slug}.wasm"))
         }
     };
 
-    let wasm_bytes = fs::read(&wasm_path)
-        .with_context(|| {
-            format!(
-                "read {}: run `basinctl fn build` first, or pass --path",
-                wasm_path.display()
-            )
-        })?;
+    let wasm_bytes = fs::read(&wasm_path).with_context(|| {
+        format!(
+            "read {}: run `basinctl fn build` first, or pass --path",
+            wasm_path.display()
+        )
+    })?;
 
     if wasm_bytes.is_empty() {
         bail!("{} is empty", wasm_path.display());
@@ -276,7 +270,11 @@ async fn cmd_deploy(
 
     let b64 = base64_encode(&wasm_bytes);
 
-    println!("deploying {} ({} bytes) → {rest_url}", name, wasm_bytes.len());
+    println!(
+        "deploying {} ({} bytes) → {rest_url}",
+        name,
+        wasm_bytes.len()
+    );
 
     let resp = deploy_request(rest_url, &token, name, &b64).await?;
     println!("deployed: name={name} version={}", resp.version);
@@ -295,8 +293,16 @@ fn base64_encode(input: &[u8]) -> String {
         let val = (b0 << 16) | (b1 << 8) | b2;
         out.push(TABLE[((val >> 18) & 0x3f) as usize] as char);
         out.push(TABLE[((val >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 { TABLE[((val >> 6) & 0x3f) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[(val & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TABLE[((val >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(val & 0x3f) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -411,7 +417,9 @@ fn parse_base_url(url: &str) -> Result<(String, u16, String)> {
 
     let (host, port) = if let Some(idx) = hostport.rfind(':') {
         let h = &hostport[..idx];
-        let p: u16 = hostport[idx + 1..].parse().context("invalid port in REST URL")?;
+        let p: u16 = hostport[idx + 1..]
+            .parse()
+            .context("invalid port in REST URL")?;
         (h.to_string(), p)
     } else {
         (hostport.to_string(), default_port)
@@ -467,9 +475,7 @@ fn validate_fn_name(name: &str) -> Result<()> {
     }
     let first = name.chars().next().unwrap();
     if !first.is_alphabetic() && first != '_' {
-        bail!(
-            "function name {name:?} must start with a letter or underscore (SQL identifier)"
-        );
+        bail!("function name {name:?} must start with a letter or underscore (SQL identifier)");
     }
     for c in name.chars() {
         if !c.is_alphanumeric() && c != '_' {
@@ -483,8 +489,7 @@ fn validate_fn_name(name: &str) -> Result<()> {
 }
 
 fn write_file(path: PathBuf, content: &str) -> Result<()> {
-    fs::write(&path, content)
-        .with_context(|| format!("write {}", path.display()))
+    fs::write(&path, content).with_context(|| format!("write {}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -634,7 +639,8 @@ fn json_str(s: &str) -> String {
     out.push('"');
     out
 }
-"#.to_string()
+"#
+    .to_string()
 }
 
 fn render_readme(name: &str) -> String {
@@ -758,10 +764,10 @@ mod tests {
     #[test]
     fn invalid_names() {
         for name in &[
-            "",            // empty
-            "2bad",        // starts with digit
-            "has space",   // space
-            "has-hyphen",  // hyphen is invalid in SQL ident
+            "",              // empty
+            "2bad",          // starts with digit
+            "has space",     // space
+            "has-hyphen",    // hyphen is invalid in SQL ident
             &"x".repeat(64), // too long
         ] {
             assert!(
@@ -800,7 +806,10 @@ mod tests {
 
         let toml = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
         assert!(toml.contains("name = \"my_fn\""), "Cargo.toml missing name");
-        assert!(toml.contains("basin-functions-handler"), "Cargo.toml missing WIT world");
+        assert!(
+            toml.contains("basin-functions-handler"),
+            "Cargo.toml missing WIT world"
+        );
     }
 
     #[test]
@@ -823,8 +832,14 @@ mod tests {
         scaffold_rust("greet", &dir).unwrap();
 
         let readme = std::fs::read_to_string(dir.join("README.md")).unwrap();
-        assert!(readme.contains("basin-functions-handler"), "README missing WIT world");
-        assert!(readme.contains("wasm32-wasip1"), "README missing target triple");
+        assert!(
+            readme.contains("basin-functions-handler"),
+            "README missing WIT world"
+        );
+        assert!(
+            readme.contains("wasm32-wasip1"),
+            "README missing target triple"
+        );
         assert!(readme.contains("/fn/v1/"), "README missing invoke URL");
     }
 

@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, Int64Array, StringArray, RecordBatch};
+use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::{BasinError, ProjectId};
 use basin_engine::{Engine, EngineConfig, ExecResult};
@@ -108,11 +108,9 @@ async fn composite_pk_upsert_do_update() {
     .expect("composite pk upsert should succeed");
 
     let batches = rows(
-        sess.execute(
-            "SELECT order_id, item_id, qty FROM order_items ORDER BY order_id, item_id",
-        )
-        .await
-        .unwrap(),
+        sess.execute("SELECT order_id, item_id, qty FROM order_items ORDER BY order_id, item_id")
+            .await
+            .unwrap(),
     );
     assert_eq!(col_i64(&batches, "order_id"), vec![1, 1, 1]);
     assert_eq!(col_i64(&batches, "item_id"), vec![1, 2, 3]);
@@ -258,9 +256,7 @@ async fn conflict_target_mismatch_42p10() {
         .unwrap();
 
     let err = sess
-        .execute(
-            "INSERT INTO t VALUES (1, 2) ON CONFLICT (a, b) DO UPDATE SET b = EXCLUDED.b",
-        )
+        .execute("INSERT INTO t VALUES (1, 2) ON CONFLICT (a, b) DO UPDATE SET b = EXCLUDED.b")
         .await
         .unwrap_err();
     assert!(
@@ -292,11 +288,9 @@ async fn multirow_mixed_conflict_no_conflict() {
     .await
     .unwrap();
     // Seed two rows.
-    sess.execute(
-        "INSERT INTO events VALUES ('web', '2024-01-01', 10), ('app', '2024-01-01', 5)",
-    )
-    .await
-    .unwrap();
+    sess.execute("INSERT INTO events VALUES ('web', '2024-01-01', 10), ('app', '2024-01-01', 5)")
+        .await
+        .unwrap();
 
     // Upsert 3 rows: 2 conflict (web, app), 1 fresh (cli).
     sess.execute(
@@ -490,11 +484,9 @@ async fn on_conflict_on_constraint_implicit_pkey_name() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TABLE widgets (id BIGINT PRIMARY KEY, name TEXT NOT NULL)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE widgets (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO widgets VALUES (1, 'original')")
         .await
         .unwrap();

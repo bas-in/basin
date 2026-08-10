@@ -62,7 +62,9 @@ pub(crate) fn mark_pg_sleep_canceled() {
 pub(crate) fn take_pg_sleep_canceled() -> bool {
     PG_SLEEP_CANCELED.with(|c| {
         let v = c.get();
-        if v { c.set(false); }
+        if v {
+            c.set(false);
+        }
         v
     })
 }
@@ -80,7 +82,9 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::convert::{batch_df_to_ws, batch_ws_to_df, schema_df_to_ws};
-use crate::ddl::{extract_create_table_cluster_by, extract_exclude_using_gist, partition_spec_from_ast};
+use crate::ddl::{
+    extract_create_table_cluster_by, extract_exclude_using_gist, partition_spec_from_ast,
+};
 use crate::dml::{batch_from_rows, group_rows_by_partition};
 use crate::events::{
     build_row_json, dispatch_post_commit, dispatch_pre_commit, make_event, registry_has_any,
@@ -196,10 +200,7 @@ pub(crate) fn parse_cache_contains_for_test(sql: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) fn parse_cache_cap_for_test() -> usize {
-    parse_cache()
-        .lock()
-        .map(|g| g.cap().get())
-        .unwrap_or(0)
+    parse_cache().lock().map(|g| g.cap().get()).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -373,8 +374,8 @@ fn fanout_partition_count() -> usize {
 
 /// Per-`(project, table)` round-robin cursor for bulk-ingest partition
 /// fan-out. Process-global; an idle table costs one `AtomicUsize`.
-fn fanout_cursors() -> &'static dashmap::DashMap<(basin_common::ProjectId, String), std::sync::atomic::AtomicUsize>
-{
+fn fanout_cursors(
+) -> &'static dashmap::DashMap<(basin_common::ProjectId, String), std::sync::atomic::AtomicUsize> {
     static CURSORS: OnceLock<
         dashmap::DashMap<(basin_common::ProjectId, String), std::sync::atomic::AtomicUsize>,
     > = OnceLock::new();
@@ -454,7 +455,13 @@ async fn write_batch_fanout(
                 // an owner LSN, not awaitable here) — the audit, not the barrier,
                 // is what consumes the forwarded landing.
                 let res = forward_partition_to_owner(
-                    engine, &client, &owner.base_url, project, table, &part, batch,
+                    engine,
+                    &client,
+                    &owner.base_url,
+                    project,
+                    table,
+                    &part,
+                    batch,
                 )
                 .await?;
                 return Ok(res.durable_lsn.map(|lsn| crate::CopyLanding {
@@ -535,7 +542,9 @@ async fn forward_partition_to_owner(
             // owner already applied the batch on attempt 1 (lost-ack case), it
             // dedups and returns the original rowcount instead of writing twice.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let owner = engine.partition_router().desired_owner(project, part.as_str());
+            let owner = engine
+                .partition_router()
+                .desired_owner(project, part.as_str());
             client
                 .forward_partition_write(
                     &owner.base_url,
@@ -619,14 +628,17 @@ mod fanout_tests {
         std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "1");
         assert_eq!(fanout_partition_count(), 1);
         std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "0");
-        assert_eq!(fanout_partition_count(), FANOUT_PARTITIONS_DEFAULT, "0 is clamped to default");
+        assert_eq!(
+            fanout_partition_count(),
+            FANOUT_PARTITIONS_DEFAULT,
+            "0 is clamped to default"
+        );
         std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
         assert_eq!(fanout_partition_count(), FANOUT_PARTITIONS_DEFAULT);
         if let Some(v) = prev {
             std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", v);
         }
     }
-
 }
 
 /// Dispatch `LISTEN` / `UNLISTEN` / `NOTIFY` through the engine's SQL
@@ -637,10 +649,7 @@ mod fanout_tests {
 /// `LISTEN` / `UNLISTEN` take effect immediately (they are not transactional
 /// in PG either — the docs explicitly state subscriptions are session state
 /// not txn state).
-async fn exec_pubsub(
-    sess: &ProjectSession,
-    ps: crate::pg_ast::PubSubStmt,
-) -> Result<ExecResult> {
+async fn exec_pubsub(sess: &ProjectSession, ps: crate::pg_ast::PubSubStmt) -> Result<ExecResult> {
     use crate::pg_ast::PubSubStmt;
     let registry = sess.engine.notify_registry();
     match ps {
@@ -734,7 +743,9 @@ pub(crate) fn needs_rewrite_pipeline(sql: &str) -> bool {
         // `<%` — trgm word-similarity operator `a <% b` (2-byte window catches it;
         // also catches `<->` via the existing `<-` window below).
         .any(|w| matches!(w, b"::" | b"->" | b"<-" | b"<#" | b"<=" | b"B'" | b"<%"))
-        || bytes.iter().any(|&b| matches!(b, b'@' | b'~' | b'?' | b'&' | b'|' | b'#' | b'(' | b'%'));
+        || bytes
+            .iter()
+            .any(|&b| matches!(b, b'@' | b'~' | b'?' | b'&' | b'|' | b'#' | b'(' | b'%'));
     if has_symbol_marker {
         return true;
     }
@@ -1163,10 +1174,12 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         if kinds.len() == 1 {
             use crate::pg_ast::StmtKind;
             let kind = kinds[0];
-            if matches!(kind, StmtKind::Listen | StmtKind::Notify | StmtKind::Unlisten) {
+            if matches!(
+                kind,
+                StmtKind::Listen | StmtKind::Notify | StmtKind::Unlisten
+            ) {
                 let node = tree.stmts().next().expect("kinds[0] implies stmts[0]");
-                let ps = crate::pg_ast::pubsub_stmt(node)
-                    .expect("pubsub stmt kind must classify");
+                let ps = crate::pg_ast::pubsub_stmt(node).expect("pubsub stmt kind must classify");
                 return exec_pubsub(sess, ps).await;
             }
         }
@@ -1241,8 +1254,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     // this buffer is dropped instead (see the Rollback arm), so
                     // nothing leaks. Empty unless a sink was attached during the
                     // transaction.
-                    let tx_change_events =
-                        crate::session::tx_change_events_take_all(&sess.state);
+                    let tx_change_events = crate::session::tx_change_events_take_all(&sess.state);
 
                     // Promote committed HTAP batches to the process-wide
                     // registry. Promotion stays PRE-commit (visibility: other
@@ -1264,8 +1276,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     if !tx_overlay.is_empty() {
                         let registry = sess.engine.memtable_registry();
                         for (table, entries) in &tx_overlay {
-                            let entry =
-                                registry.get_or_create(sess.project, table.clone());
+                            let entry = registry.get_or_create(sess.project, table.clone());
                             for (key, value) in entries {
                                 entry.memtable.insert(key.clone(), value.clone());
                             }
@@ -1277,10 +1288,8 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                     // dominated `BEGIN; INSERT x100; COMMIT` cost.  Each table's
                     // files (htap-derived + any UPDATE/DELETE pending files) are
                     // committed together so the catalog snapshot advances once.
-                    let mut buffered_files: std::collections::HashMap<
-                        TableName,
-                        Vec<DataFileRef>,
-                    > = std::collections::HashMap::new();
+                    let mut buffered_files: std::collections::HashMap<TableName, Vec<DataFileRef>> =
+                        std::collections::HashMap::new();
                     for (table, batches) in &htap_rows {
                         if batches.is_empty() {
                             continue;
@@ -1293,17 +1302,14 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         // statement kind — it's a transaction control
                         // intercepted before the dispatch table-meta-cache
                         // invalidation block).
-                        let meta = match crate::session::load_table_meta_cached_err(
-                            sess, table,
-                        )
-                        .await
-                        {
-                            Ok(m) => m,
-                            Err(e) => {
-                                crate::session::tx_set_aborted(&sess.state);
-                                return Err(e);
-                            }
-                        };
+                        let meta =
+                            match crate::session::load_table_meta_cached_err(sess, table).await {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    crate::session::tx_set_aborted(&sess.state);
+                                    return Err(e);
+                                }
+                            };
                         // Concat all buffered batches into one.  `concat_batches`
                         // shares Arrow buffers where possible; for the typical
                         // single-row-per-INSERT shape this is a cheap copy.
@@ -1338,13 +1344,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                             .engine
                             .config()
                             .storage
-                            .write_batch_with_options(
-                                &sess.project,
-                                table,
-                                &part,
-                                &combined,
-                                &opts,
-                            )
+                            .write_batch_with_options(&sess.project, table, &part, &combined, &opts)
                             .await
                         {
                             Ok(d) => d,
@@ -1429,13 +1429,11 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                                 if registry.config().retain_secs > 0 {
                                     if let Some(acks) = promote_clean_acks.get(table) {
                                         if !acks.is_empty() {
-                                            if let Some(entry) =
-                                                registry.get(&sess.project, table)
+                                            if let Some(entry) = registry.get(&sess.project, table)
                                             {
                                                 let freed = entry.memtable.mark_flushed(acks);
                                                 if freed > 0 {
-                                                    registry
-                                                        .release_bytes(&sess.project, freed);
+                                                    registry.release_bytes(&sess.project, freed);
                                                 }
                                             }
                                         }
@@ -1511,8 +1509,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                         let events: Vec<ChangeEvent> = tx_change_events
                             .into_iter()
                             .map(|ev| {
-                                let seq =
-                                    sess.engine.next_event_seq(&sess.project, &ev.table);
+                                let seq = sess.engine.next_event_seq(&sess.project, &ev.table);
                                 make_event(
                                     &sess.project,
                                     &ev.table,
@@ -1585,10 +1582,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                                             table,
                                         );
                                         let htap_batches =
-                                            crate::session::tx_htap_batches_for(
-                                                &sess.state,
-                                                table,
-                                            );
+                                            crate::session::tx_htap_batches_for(&sess.state, table);
                                         let _ = crate::session::refresh_table_with_htap(
                                             &sess.engine,
                                             &sess.project,
@@ -1770,10 +1764,8 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             if matches!(kind, crate::pg_ast::StmtKind::CreateDomain) {
                 if let Some(node) = tree.stmts().next() {
                     if let Some(pg_query::NodeEnum::CreateDomainStmt(ref cds)) = node.node {
-                        let (name, base, check) =
-                            crate::type_ddl::match_create_domain_ast(cds)?;
-                        return crate::type_ddl::exec_create_domain(sess, &name, base, check)
-                            .await;
+                        let (name, base, check) = crate::type_ddl::match_create_domain_ast(cds)?;
+                        return crate::type_ddl::exec_create_domain(sess, &name, base, check).await;
                     }
                 }
             }
@@ -1782,11 +1774,9 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             if matches!(kind, crate::pg_ast::StmtKind::DropDomain) {
                 if let Some(node) = tree.stmts().next() {
                     if let Some(pg_query::NodeEnum::DropStmt(ref ds)) = node.node {
-                        if let Some((name, if_exists)) =
-                            crate::type_ddl::match_drop_domain_ast(ds)?
+                        if let Some((name, if_exists)) = crate::type_ddl::match_drop_domain_ast(ds)?
                         {
-                            return crate::type_ddl::exec_drop_domain(sess, &name, if_exists)
-                                .await;
+                            return crate::type_ddl::exec_drop_domain(sess, &name, if_exists).await;
                         }
                     }
                 }
@@ -1832,13 +1822,9 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             if matches!(kind, crate::pg_ast::StmtKind::CreateSequence) {
                 if let Some(node) = tree.stmts().next() {
                     if let Some(pg_query::NodeEnum::CreateSeqStmt(ref css)) = node.node {
-                        if let Some(intent) =
-                            crate::seq_ddl::match_create_sequence_ast(css)?
-                        {
-                            return crate::seq_ddl::exec_create_sequence_pre_screen(
-                                sess, intent,
-                            )
-                            .await;
+                        if let Some(intent) = crate::seq_ddl::match_create_sequence_ast(css)? {
+                            return crate::seq_ddl::exec_create_sequence_pre_screen(sess, intent)
+                                .await;
                         }
                     }
                 }
@@ -1858,12 +1844,8 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             if matches!(kind, crate::pg_ast::StmtKind::AlterSchemaRename) {
                 if let Some(node) = tree.stmts().next() {
                     if let Some(pg_query::NodeEnum::RenameStmt(ref rs)) = node.node {
-                        let (old, new) =
-                            crate::schema_ddl::match_alter_schema_rename_ast(rs)?;
-                        return crate::schema_ddl::exec_alter_schema_rename(
-                            sess, &old, &new,
-                        )
-                        .await;
+                        let (old, new) = crate::schema_ddl::match_alter_schema_rename_ast(rs)?;
+                        return crate::schema_ddl::exec_alter_schema_rename(sess, &old, &new).await;
                     }
                 }
             }
@@ -1872,12 +1854,9 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             if matches!(kind, crate::pg_ast::StmtKind::AlterFunctionRename) {
                 if let Some(node) = tree.stmts().next() {
                     if let Some(pg_query::NodeEnum::RenameStmt(ref rs)) = node.node {
-                        let (old, new) =
-                            crate::function_ddl::match_alter_function_rename_ast(rs)?;
-                        return crate::function_ddl::exec_alter_function_rename(
-                            sess, &old, &new,
-                        )
-                        .await;
+                        let (old, new) = crate::function_ddl::match_alter_function_rename_ast(rs)?;
+                        return crate::function_ddl::exec_alter_function_rename(sess, &old, &new)
+                            .await;
                     }
                 }
             }
@@ -1951,26 +1930,38 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             // `DISCARD TEMP` map to the prepared-statement / (best-effort)
             // sub-resets; `RESET ALL` resets only the GUCs.
             {
-                let upper = sql.trim().trim_end_matches(';').trim_end().to_ascii_uppercase();
+                let upper = sql
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim_end()
+                    .to_ascii_uppercase();
                 if matches!(kind, crate::pg_ast::StmtKind::Discard) {
                     match upper.as_str() {
                         "DISCARD PLANS" => {
                             sess.state.prepared.clear_all().await;
-                            return Ok(ExecResult::Empty { tag: "DISCARD PLANS".into() });
+                            return Ok(ExecResult::Empty {
+                                tag: "DISCARD PLANS".into(),
+                            });
                         }
                         "DISCARD SEQUENCES" => {
-                            return Ok(ExecResult::Empty { tag: "DISCARD SEQUENCES".into() });
+                            return Ok(ExecResult::Empty {
+                                tag: "DISCARD SEQUENCES".into(),
+                            });
                         }
                         "DISCARD TEMP" | "DISCARD TEMPORARY" => {
                             // Basin has no session-scoped temp schema to drop here;
                             // the native pool tracks temp-table names and drops them
                             // at checkout. Accept with the PG tag.
-                            return Ok(ExecResult::Empty { tag: "DISCARD TEMP".into() });
+                            return Ok(ExecResult::Empty {
+                                tag: "DISCARD TEMP".into(),
+                            });
                         }
                         _ => {
                             // DISCARD ALL — full DISCARD-ALL reset.
                             sess.reset_for_pool_reuse().await;
-                            return Ok(ExecResult::Empty { tag: "DISCARD ALL".into() });
+                            return Ok(ExecResult::Empty {
+                                tag: "DISCARD ALL".into(),
+                            });
                         }
                     }
                 }
@@ -1979,7 +1970,9 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
                 // advisory / LISTEN — that is `DISCARD ALL`).
                 if matches!(kind, crate::pg_ast::StmtKind::VariableSet) && upper == "RESET ALL" {
                     sess.state.reset_gucs();
-                    return Ok(ExecResult::Empty { tag: "RESET".into() });
+                    return Ok(ExecResult::Empty {
+                        tag: "RESET".into(),
+                    });
                 }
             }
 
@@ -1990,9 +1983,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             // WriteForwarder is registered, delegate (the home region executes
             // and returns the result); otherwise fail loud with WrongRegion.
             if kind.is_write_kind() {
-                if let Some(result) =
-                    crate::region::region_write_gate(sess, kind, sql).await?
-                {
+                if let Some(result) = crate::region::region_write_gate(sess, kind, sql).await? {
                     return Ok(result);
                 }
             }
@@ -2033,9 +2024,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     }
 
     // ── Phase 5.29.D: SELECT add_retention_policy('table', INTERVAL '…') ───
-    if let Some((rp_table, rp_interval)) =
-        crate::hypertable::match_add_retention_policy(raw_sql)
-    {
+    if let Some((rp_table, rp_interval)) = crate::hypertable::match_add_retention_policy(raw_sql) {
         return exec_add_retention_policy(sess, &rp_table, &rp_interval).await;
     }
 
@@ -2078,7 +2067,10 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         return match inner {
             ExecResult::Rows { schema, batches } => {
                 let dense = crate::gapfill::densify(&schema, &batches, &req)?;
-                Ok(ExecResult::Rows { schema, batches: dense })
+                Ok(ExecResult::Rows {
+                    schema,
+                    batches: dense,
+                })
             }
             other => Ok(other),
         };
@@ -2088,12 +2080,8 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     if let Some((project_name, hard_cap_bytes)) =
         crate::alter_project::match_alter_project_memtable_cap(sql)?
     {
-        crate::alter_project::exec_alter_project_memtable_cap(
-            sess,
-            &project_name,
-            hard_cap_bytes,
-        )
-        .await?;
+        crate::alter_project::exec_alter_project_memtable_cap(sess, &project_name, hard_cap_bytes)
+            .await?;
         return Ok(ExecResult::Empty {
             tag: "ALTER PROJECT".into(),
         });
@@ -2236,7 +2224,11 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             sess.engine.config().catalog.as_ref(),
         )
         .await?;
-        let schema = Arc::new(Schema::new(vec![Field::new("secret", DataType::Utf8, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "secret",
+            DataType::Utf8,
+            false,
+        )]));
         let arr: ArrayRef = Arc::new(StringArray::from(vec![secret_hex]));
         let batch = RecordBatch::try_new(schema.clone(), vec![arr])
             .map_err(|e| BasinError::Internal(format!("build CREATE INBOUND WEBHOOK row: {e}")))?;
@@ -2245,7 +2237,17 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             batches: vec![batch],
         });
     }
-    if let Some(i) = crate::inbound_webhook_ddl::match_drop_inbound_webhook(sql)? { crate::inbound_webhook_ddl::exec_drop_inbound_webhook(i, &sess.project, sess.engine.config().catalog.as_ref()).await?; return Ok(ExecResult::Empty { tag: "DROP INBOUND WEBHOOK".into() }); }
+    if let Some(i) = crate::inbound_webhook_ddl::match_drop_inbound_webhook(sql)? {
+        crate::inbound_webhook_ddl::exec_drop_inbound_webhook(
+            i,
+            &sess.project,
+            sess.engine.config().catalog.as_ref(),
+        )
+        .await?;
+        return Ok(ExecResult::Empty {
+            tag: "DROP INBOUND WEBHOOK".into(),
+        });
+    }
 
     // DROP MATERIALIZED VIEW [IF EXISTS] <name> — sqlparser's DROP parser
     // does not recognise MATERIALIZED VIEW, so we handle the full
@@ -2260,9 +2262,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
         crate::replication::slot_udf::match_create_replication_slot(sql)
     {
         return crate::replication::slot_udf::exec_create_replication_slot(
-            sess,
-            &slot_name,
-            &plugin,
+            sess, &slot_name, &plugin,
         )
         .await;
     }
@@ -2337,8 +2337,7 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // before sqlparser sees the SQL (sqlparser 0.61 has no TableConstraint::Exclude
     // variant). The parsed specs are threaded into `exec_create_table` so the
     // constraint is persisted as a sentinel CheckConstraint and enforced on INSERT.
-    let (excl_stripped, exclude_specs) =
-        extract_exclude_using_gist(lifecycle_stripped.as_str());
+    let (excl_stripped, exclude_specs) = extract_exclude_using_gist(lifecycle_stripped.as_str());
     let sql_owned = excl_stripped;
     let sql = sql_owned.as_str();
 
@@ -2477,12 +2476,9 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // confirms the ORDER BY column carries `BASIN_TYPE=POINT`; a vector column
     // returns None and brute-force takes over (correctness preserved). An
     // `Ok(None)` from `execute_knn_plan` (sidecar coverage gap) also falls back.
-    if let Some(knn_plan) = crate::index_probe::detect_knn_predicate(
-        sql,
-        &sess.project,
-        &sess.engine.config().catalog,
-    )
-    .await
+    if let Some(knn_plan) =
+        crate::index_probe::detect_knn_predicate(sql, &sess.project, &sess.engine.config().catalog)
+            .await
     {
         match crate::rtree_knn_scan::execute_knn_plan(sess, knn_plan).await {
             Ok(Some(res)) => return Ok(res),
@@ -2505,12 +2501,8 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     // scan + sort takes over (correctness preserved). `execute_trgm_knn_plan`
     // declines (`Ok(None)`) on a live overlay / no usable index / needle too
     // short, also falling back.
-    if let Some(knn_plan) = crate::index_probe::detect_trgm_knn(
-        sql,
-        &sess.project,
-        &sess.engine.config().catalog,
-    )
-    .await
+    if let Some(knn_plan) =
+        crate::index_probe::detect_trgm_knn(sql, &sess.project, &sess.engine.config().catalog).await
     {
         match crate::trgm_knn_scan::execute_trgm_knn_plan(sess, knn_plan).await {
             Ok(Some(res)) => return Ok(res),
@@ -2993,10 +2985,7 @@ async fn dispatch_parsed_statement(
             } else if var_name == "statement_timeout" {
                 // Wire `SET statement_timeout = …` to the per-session override.
                 // Accept both string literals ('5s', '500ms') and bare integers (5000).
-                let raw = values
-                    .first()
-                    .map(|v| v.to_string())
-                    .unwrap_or_default();
+                let raw = values.first().map(|v| v.to_string()).unwrap_or_default();
                 crate::session::set_statement_timeout(&sess.state, &raw)?;
                 Ok(ExecResult::Empty { tag: "SET".into() })
             } else if var_name == "lock_timeout" {
@@ -3042,10 +3031,7 @@ async fn dispatch_parsed_statement(
                 let trimmed = raw.trim().trim_matches('\'').trim_matches('"').trim();
                 match trimmed.parse::<f32>() {
                     Ok(v) => {
-                        crate::session::set_session_trgm_word_similarity_threshold(
-                            &sess.state,
-                            v,
-                        );
+                        crate::session::set_session_trgm_word_similarity_threshold(&sess.state, v);
                         Ok(ExecResult::Empty { tag: "SET".into() })
                     }
                     Err(_) => Err(basin_common::BasinError::InvalidSchema(format!(
@@ -3165,8 +3151,7 @@ async fn dispatch_parsed_statement(
                     // the TTL window skip both catalog round-trips. Any DDL
                     // / DML in this session has already invalidated the cache
                     // (see invalidation block at the top of `execute`).
-                    let cached =
-                        crate::session::load_table_meta_cached(sess, &plan.table).await;
+                    let cached = crate::session::load_table_meta_cached(sess, &plan.table).await;
                     let (table_meta, is_view) = match cached {
                         Some((arc, vp)) => (Some((*arc).clone()), vp),
                         None => (None, false),
@@ -3206,11 +3191,10 @@ async fn dispatch_parsed_statement(
                         // from counters. This turns the post-UPDATE/DELETE
                         // COUNT(*) from a full-table scan back into O(files).
                         if !is_view && !has_rls && !has_soft_delete {
-                            if let Some(result) =
-                                crate::fast_aggregate::execute_metadata_aggregate(
-                                    sess, plan, table_meta,
-                                )
-                                .await?
+                            if let Some(result) = crate::fast_aggregate::execute_metadata_aggregate(
+                                sess, plan, table_meta,
+                            )
+                            .await?
                             {
                                 return Ok(result);
                             }
@@ -3228,8 +3212,7 @@ async fn dispatch_parsed_statement(
                 if let Some(plan) = crate::fast_aggregate::match_groupby_low_card(&stmt) {
                     // Inv-OLTP-point (#149): same per-session cache as the
                     // metadata-aggregate path above.
-                    let cached =
-                        crate::session::load_table_meta_cached(sess, &plan.table).await;
+                    let cached = crate::session::load_table_meta_cached(sess, &plan.table).await;
                     let (table_meta, is_view) = match cached {
                         Some((arc, vp)) => (Some((*arc).clone()), vp),
                         None => (None, false),
@@ -3244,11 +3227,10 @@ async fn dispatch_parsed_statement(
                         let has_soft_delete =
                             crate::types::soft_delete_column(meta.schema.as_ref()).is_some();
                         if !is_view && !has_rls && !has_soft_delete {
-                            if let Some(result) =
-                                crate::fast_aggregate::execute_groupby_low_card(
-                                    sess, plan, table_meta,
-                                )
-                                .await?
+                            if let Some(result) = crate::fast_aggregate::execute_groupby_low_card(
+                                sess, plan, table_meta,
+                            )
+                            .await?
                             {
                                 return Ok(result);
                             }
@@ -3287,8 +3269,7 @@ async fn dispatch_parsed_statement(
                 // async catalog round-trips. The OLTP point-query loop —
                 // identical SELECT shape repeated — hits the cache after
                 // the first miss; the TTL is 500ms by default.
-                let cached =
-                    crate::session::load_table_meta_cached(sess, &plan.table).await;
+                let cached = crate::session::load_table_meta_cached(sess, &plan.table).await;
                 let (table_meta, is_view) = match cached {
                     Some((arc, vp)) => (Some((*arc).clone()), vp),
                     None => (None, false),
@@ -3336,9 +3317,10 @@ async fn dispatch_parsed_statement(
                             })
                             .unwrap_or(false)
                     };
-                    let has_citext_predicate = plan.predicates.iter().any(|pred| {
-                        schema_field_is_citext(pred.column())
-                    });
+                    let has_citext_predicate = plan
+                        .predicates
+                        .iter()
+                        .any(|pred| schema_field_is_citext(pred.column()));
                     let has_citext_order_by = plan
                         .order_by
                         .as_ref()
@@ -3416,11 +3398,10 @@ async fn dispatch_parsed_statement(
                     // cannot honour the pin Ok-falls back to DataFusion.
                     let in_tx_request: Option<crate::fast_select::PinnedReadRequest> = if in_txn {
                         let table = &plan.table;
-                        let untouched =
-                            crate::session::tx_pending_files_for(&sess.state, table).is_empty()
-                                && crate::session::tx_htap_batches_for(&sess.state, table)
-                                    .is_empty()
-                                && crate::session::tx_overlay_peek(&sess.state, table).is_empty();
+                        let untouched = crate::session::tx_pending_files_for(&sess.state, table)
+                            .is_empty()
+                            && crate::session::tx_htap_batches_for(&sess.state, table).is_empty()
+                            && crate::session::tx_overlay_peek(&sess.state, table).is_empty();
                         match (
                             untouched,
                             crate::session::tx_read_snapshot_peek(&sess.state, table),
@@ -3553,7 +3534,10 @@ async fn dispatch_parsed_statement(
                                 .await
                         {
                             let schema = Arc::new(arrow_schema::Schema::empty());
-                            return Ok(ExecResult::Rows { schema, batches: vec![] });
+                            return Ok(ExecResult::Rows {
+                                schema,
+                                batches: vec![],
+                            });
                         }
                     }
                     // FileCandidates: the DataFusion path still executes; the
@@ -3568,8 +3552,10 @@ async fn dispatch_parsed_statement(
             // Advisory-only: `Empty` short-circuits; anything else falls
             // through to the DataFusion / UDF path for correctness.
             if !crate::session::tx_is_active(&sess.state)
-                && (raw_sql.contains(" ? ") || raw_sql.contains(" ?'")
-                    || raw_sql.contains("?&") || raw_sql.contains("?|"))
+                && (raw_sql.contains(" ? ")
+                    || raw_sql.contains(" ?'")
+                    || raw_sql.contains("?&")
+                    || raw_sql.contains("?|"))
             {
                 if let Some(key_plan) = crate::index_probe::detect_gin_key_probe(
                     raw_sql,
@@ -3599,7 +3585,10 @@ async fn dispatch_parsed_statement(
                             .await
                         {
                             let schema = Arc::new(arrow_schema::Schema::empty());
-                            return Ok(ExecResult::Rows { schema, batches: vec![] });
+                            return Ok(ExecResult::Rows {
+                                schema,
+                                batches: vec![],
+                            });
                         }
                     }
                     // FileCandidates / NoIndex: fall through to DataFusion for correctness.
@@ -3641,7 +3630,10 @@ async fn dispatch_parsed_statement(
                             .await
                         {
                             let schema = Arc::new(arrow_schema::Schema::empty());
-                            return Ok(ExecResult::Rows { schema, batches: vec![] });
+                            return Ok(ExecResult::Rows {
+                                schema,
+                                batches: vec![],
+                            });
                         }
                     }
                     // FileCandidates / NoIndex: fall through to DataFusion for correctness.
@@ -3704,7 +3696,10 @@ async fn dispatch_parsed_statement(
                     if let ProbeResult::Empty = interval_result {
                         // Interval tree guarantees no rows match — short-circuit.
                         let schema = Arc::new(arrow_schema::Schema::empty());
-                        return Ok(ExecResult::Rows { schema, batches: vec![] });
+                        return Ok(ExecResult::Rows {
+                            schema,
+                            batches: vec![],
+                        });
                     }
                     // FileCandidates / NoIndex: fall through to DataFusion for correctness.
                 }
@@ -3739,16 +3734,19 @@ async fn dispatch_parsed_statement(
                 })
             } else if var_name == "lock_timeout" {
                 // Phase 5.28.D: SHOW lock_timeout
-                let val = crate::session::format_pg_duration(
-                    crate::session::session_lock_timeout(&sess.state),
-                );
+                let val = crate::session::format_pg_duration(crate::session::session_lock_timeout(
+                    &sess.state,
+                ));
                 Ok(make_show_result("lock_timeout", &val))
             } else if var_name == "idle_in_transaction_session_timeout" {
                 // Phase 5.28.D: SHOW idle_in_transaction_session_timeout
                 let val = crate::session::format_pg_duration(
                     crate::session::session_idle_in_transaction_timeout(&sess.state),
                 );
-                Ok(make_show_result("idle_in_transaction_session_timeout", &val))
+                Ok(make_show_result(
+                    "idle_in_transaction_session_timeout",
+                    &val,
+                ))
             } else if var_name == "basin_synchronous_commit" || var_name == "synchronous_commit" {
                 // SHOW joins dotted names with `_`, so `basin.synchronous_commit`
                 // arrives as `basin_synchronous_commit`.
@@ -3760,7 +3758,10 @@ async fn dispatch_parsed_statement(
                 // SHOW pg_trgm.similarity_threshold
                 // sqlparser joins dotted names with `_`, so both forms must match.
                 let v = crate::session::session_trgm_similarity_threshold(&sess.state);
-                Ok(make_show_result("pg_trgm.similarity_threshold", &format!("{v}")))
+                Ok(make_show_result(
+                    "pg_trgm.similarity_threshold",
+                    &format!("{v}"),
+                ))
             } else if var_name == "pg_trgm_word_similarity_threshold"
                 || var_name == "pg_trgm.word_similarity_threshold"
             {
@@ -4036,20 +4037,18 @@ async fn rewrite_promoted_cols_for_query(sql: &str, sess: &ProjectSession) -> St
     let catalog = sess.engine.config().catalog.as_ref();
     let project = &sess.project;
     // Parse to extract bare table references from FROM clauses.
-    let table_refs: Vec<String> = sqlparser::parser::Parser::parse_sql(
-        &sqlparser::dialect::PostgreSqlDialect {},
-        sql,
-    )
-    .ok()
-    .and_then(|mut stmts| stmts.pop())
-    .and_then(|stmt| {
-        if let sqlparser::ast::Statement::Query(q) = stmt {
-            Some(crate::session::collect_table_refs(&q))
-        } else {
-            None
-        }
-    })
-    .unwrap_or_default();
+    let table_refs: Vec<String> =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)
+            .ok()
+            .and_then(|mut stmts| stmts.pop())
+            .and_then(|stmt| {
+                if let sqlparser::ast::Statement::Query(q) = stmt {
+                    Some(crate::session::collect_table_refs(&q))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
 
     // Accumulate the promoted paths that are SAFE to rewrite (every live file
     // for the owning table carries the shadow column, and no uncovered hot-tier
@@ -4057,8 +4056,12 @@ async fn rewrite_promoted_cols_for_query(sql: &str, sess: &ProjectSession) -> St
     // their `json_get_text` form.
     let mut all_paths: Vec<basin_catalog::PromotedJsonbPath> = Vec::new();
     for table_str in table_refs {
-        let Ok(table_name) = basin_common::TableName::new(table_str) else { continue; };
-        let Ok(meta) = catalog.load_table(project, &table_name).await else { continue; };
+        let Ok(table_name) = basin_common::TableName::new(table_str) else {
+            continue;
+        };
+        let Ok(meta) = catalog.load_table(project, &table_name).await else {
+            continue;
+        };
         if meta.promoted_jsonb_paths.is_empty() {
             continue;
         }
@@ -4847,8 +4850,7 @@ async fn exec_create_index(
 ) -> Result<ExecResult> {
     use crate::index_extras::{
         log_expression_column_notice, log_include_notice, log_metadata_only_notice,
-        log_partial_index_notice, log_using_notice, parse_index_columns,
-        IndexColumn,
+        log_partial_index_notice, log_using_notice, parse_index_columns, IndexColumn,
     };
 
     // CONCURRENTLY is still unsupported — reject explicitly.
@@ -4999,10 +5001,17 @@ async fn exec_create_index(
                     // Look up the table metadata to check the column type.
                     // We already verified the table exists above; if load fails just
                     // fall back to jsonb_ops (safe).
-                    if let Ok(meta) = sess.engine.config().catalog.load_table(&sess.project, &table).await {
-                        meta.schema.fields().iter().any(|f| {
-                            f.name() == col_name && crate::types::field_is_tsvector(f)
-                        })
+                    if let Ok(meta) = sess
+                        .engine
+                        .config()
+                        .catalog
+                        .load_table(&sess.project, &table)
+                        .await
+                    {
+                        meta.schema
+                            .fields()
+                            .iter()
+                            .any(|f| f.name() == col_name && crate::types::field_is_tsvector(f))
                     } else {
                         false
                     }
@@ -5042,38 +5051,37 @@ async fn exec_create_index(
     // queries use the HNSW fast path regardless).
     // WITH (m = 16, ef_construction = 64) and WITH (lists = N) are accepted and
     // logged; they are stored in the catalog opclass string for future use.
-    let vector_opclass: Option<String> = if access_method_str == "hnsw"
-        || access_method_str == "ivfflat"
-    {
-        let raw_opclass = ci
-            .columns
-            .first()
-            .and_then(|c| c.operator_class.as_ref())
-            .map(|oc| {
-                oc.0.iter()
-                    .map(|part| part.id_val().to_lowercase())
-                    .collect::<Vec<_>>()
-                    .join(".")
-            });
-        match raw_opclass.as_deref() {
-            None | Some("vector_l2_ops") => Some("vector_l2_ops".to_string()),
-            Some("vector_cosine_ops") => Some("vector_cosine_ops".to_string()),
-            Some("vector_ip_ops") => Some("vector_ip_ops".to_string()),
-            Some(other) => {
-                // Unknown opclass — accept with a warning (pgvector DDL portability).
-                tracing::warn!(
-                    index = %index_name,
-                    opclass = %other,
-                    "CREATE INDEX USING {access_method_str}: unknown vector opclass; \
-                     expected one of: vector_l2_ops, vector_cosine_ops, vector_ip_ops. \
-                     Defaulting to vector_l2_ops."
-                );
-                Some("vector_l2_ops".to_string())
+    let vector_opclass: Option<String> =
+        if access_method_str == "hnsw" || access_method_str == "ivfflat" {
+            let raw_opclass = ci
+                .columns
+                .first()
+                .and_then(|c| c.operator_class.as_ref())
+                .map(|oc| {
+                    oc.0.iter()
+                        .map(|part| part.id_val().to_lowercase())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                });
+            match raw_opclass.as_deref() {
+                None | Some("vector_l2_ops") => Some("vector_l2_ops".to_string()),
+                Some("vector_cosine_ops") => Some("vector_cosine_ops".to_string()),
+                Some("vector_ip_ops") => Some("vector_ip_ops".to_string()),
+                Some(other) => {
+                    // Unknown opclass — accept with a warning (pgvector DDL portability).
+                    tracing::warn!(
+                        index = %index_name,
+                        opclass = %other,
+                        "CREATE INDEX USING {access_method_str}: unknown vector opclass; \
+                         expected one of: vector_l2_ops, vector_cosine_ops, vector_ip_ops. \
+                         Defaulting to vector_l2_ops."
+                    );
+                    Some("vector_l2_ops".to_string())
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // Phase 5.26.D: extract HNSW build parameters from the `WITH (...)` clause.
     // pgvector canonical DDL: `WITH (m = 16, ef_construction = 64)`.  We parse
@@ -5327,12 +5335,8 @@ async fn exec_create_index(
     // drained overlay short-circuits O(1), so the retries are cheap.
     let mut overlay_settled = false;
     for attempt in 0..3u32 {
-        match crate::dml_mutate::materialize_overlay_for_table(
-            &sess.engine,
-            sess.project,
-            &table,
-        )
-        .await
+        match crate::dml_mutate::materialize_overlay_for_table(&sess.engine, sess.project, &table)
+            .await
         {
             Ok(()) => {
                 overlay_settled = true;
@@ -5525,7 +5529,13 @@ async fn backfill_index_over_live_files(
         return;
     }
 
-    let meta = match sess.engine.config().catalog.load_table(&sess.project, table).await {
+    let meta = match sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.project, table)
+        .await
+    {
         Ok(m) => m,
         Err(_) => return,
     };
@@ -5553,10 +5563,7 @@ async fn backfill_index_over_live_files(
             projection: Some(vec![col_name.to_string()]),
             ..Default::default()
         };
-        let mut stream = match storage
-            .read_file_with_options(&project, &path, opts)
-            .await
-        {
+        let mut stream = match storage.read_file_with_options(&project, &path, opts).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -5593,15 +5600,26 @@ async fn backfill_index_over_live_files(
             had_data = true;
             if is_plain_gin {
                 backfill_gin_batch(
-                    sess, table, col_name, opclass, &batch, &f.path, rg_size, file_row_off,
+                    sess,
+                    table,
+                    col_name,
+                    opclass,
+                    &batch,
+                    &f.path,
+                    rg_size,
+                    file_row_off,
                 );
             } else if is_trgm_gin {
-                backfill_trgm_batch(
-                    sess, table, col_name, &batch, &f.path, file_row_off,
-                );
+                backfill_trgm_batch(sess, table, col_name, &batch, &f.path, file_row_off);
             } else if is_fts_gin {
                 backfill_fts_batch(
-                    sess, table, col_name, &batch, &f.path, rg_size, file_row_off,
+                    sess,
+                    table,
+                    col_name,
+                    &batch,
+                    &f.path,
+                    rg_size,
+                    file_row_off,
                 );
             } else {
                 backfill_btree_batch(
@@ -5628,18 +5646,18 @@ async fn backfill_index_over_live_files(
             // trusts this file. A read error above leaves it un-sealed → forced
             // full scan for this file (correct, just unpruned). The row tier is
             // sealed inside `mark_file_indexed` (density cap + budget).
-            sess.engine.gin_index_registry().mark_file_indexed(
-                &project, table, col_name, &f.path,
-            );
+            sess.engine
+                .gin_index_registry()
+                .mark_file_indexed(&project, table, col_name, &f.path);
         } else if is_plain_gin {
             // Seal the file in both GIN registries so the read-path
             // completeness guards (`is_file_indexed`) pass for this file.
-            sess.engine.gin_rowgroup_registry().mark_file_indexed(
-                &project, table, col_name, &f.path,
-            );
-            sess.engine.gin_index_registry().mark_file_indexed(
-                &project, table, col_name, &f.path,
-            );
+            sess.engine
+                .gin_rowgroup_registry()
+                .mark_file_indexed(&project, table, col_name, &f.path);
+            sess.engine
+                .gin_index_registry()
+                .mark_file_indexed(&project, table, col_name, &f.path);
             // Persist the file-level posting list as a sidecar so the
             // `apply_jsonb_posting_pruning_for_query` lazy-load path (which
             // reads sidecars when its registry is cold) also sees this file.
@@ -5650,9 +5668,9 @@ async fn backfill_index_over_live_files(
             // the indexed-files completeness set before they trust the
             // posting list.  A read error above leaves the file un-sealed →
             // forced full scan for this table (correct, just unpruned).
-            sess.engine.gin_fts_registry().mark_file_indexed(
-                &project, table, col_name, &f.path,
-            );
+            sess.engine
+                .gin_fts_registry()
+                .mark_file_indexed(&project, table, col_name, &f.path);
         }
     }
 
@@ -5736,7 +5754,14 @@ fn backfill_gin_batch(
         }
         // File-level posting list (drives the posting-list prune path).
         posting_registry.index_row(
-            &project, table, col_name, opclass, bytes, file_path, row_group, file_row as u64,
+            &project,
+            table,
+            col_name,
+            opclass,
+            bytes,
+            file_path,
+            row_group,
+            file_row as u64,
         );
     }
 }
@@ -5798,7 +5823,13 @@ fn backfill_fts_batch(
         let file_row = file_row_off + row;
         let row_group = (file_row / rg_size) as u32;
         fts_registry.index_row(
-            &project, table, col_name, tsv_str, file_path, row_group, file_row as u64,
+            &project,
+            table,
+            col_name,
+            tsv_str,
+            file_path,
+            row_group,
+            file_row as u64,
         );
     }
 }
@@ -5904,7 +5935,8 @@ pub(crate) fn backfill_btree_batch(
     extract_typed!(Float64Array, |v: f64| format!("{v:?}"));
     extract_typed!(StringArray, |v: &str| v.to_string());
     extract_typed!(LargeStringArray, |v: &str| v.to_string());
-    extract_typed!(BooleanArray, |v: bool| if v { "t" } else { "f" }.to_string());
+    extract_typed!(BooleanArray, |v: bool| if v { "t" } else { "f" }
+        .to_string());
 
     if !entries.is_empty() {
         registry.insert_batch(project, table, col_name, entries);
@@ -5928,12 +5960,21 @@ async fn backfill_write_jsonb_posting_sidecar(
     // sidecar reflects the just-backfilled file. We read the JSONB column once
     // more here; for the common small-table CREATE INDEX this is cheap.
     let Some(sidecar) = basin_storage::index::jsonb_posting::posting_sidecar_key_for_data_file(
-        &sess.project, table, col_name, file_path,
+        &sess.project,
+        table,
+        col_name,
+        file_path,
     ) else {
         return;
     };
     // Load the table schema to find the JSONB column index.
-    let meta = match sess.engine.config().catalog.load_table(&sess.project, table).await {
+    let meta = match sess
+        .engine
+        .config()
+        .catalog
+        .load_table(&sess.project, table)
+        .await
+    {
         Ok(m) => m,
         Err(_) => return,
     };
@@ -5949,7 +5990,10 @@ async fn backfill_write_jsonb_posting_sidecar(
         projection: Some(vec![col_name.to_string()]),
         ..Default::default()
     };
-    let mut stream = match storage.read_file_with_options(&sess.project, &path, opts).await {
+    let mut stream = match storage
+        .read_file_with_options(&sess.project, &path, opts)
+        .await
+    {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -5958,7 +6002,15 @@ async fn backfill_write_jsonb_posting_sidecar(
         let Ok(col_idx) = batch.schema().index_of(col_name) else {
             continue;
         };
-        registry.index_batch(&sess.project, table, col_name, &batch, col_idx, rg_size, file_path);
+        registry.index_batch(
+            &sess.project,
+            table,
+            col_name,
+            &batch,
+            col_idx,
+            rg_size,
+            file_path,
+        );
     }
     if let Some(bytes) = registry.serialize_file(&sess.project, table, col_name, file_path) {
         use object_store::ObjectStoreExt as _;
@@ -6135,10 +6187,7 @@ pub(crate) static INSERTS_PREPARSE_FASTPATH: std::sync::atomic::AtomicU64 =
 /// * RLS WITH CHECK, constraints, generated columns, shard/write paths,
 ///   audit, secondary indexes — all inside `exec_insert_prebuilt`, shared
 ///   verbatim with the normal path.
-async fn try_insert_preparse(
-    sess: &ProjectSession,
-    raw_sql: &str,
-) -> Option<Result<ExecResult>> {
+async fn try_insert_preparse(sess: &ProjectSession, raw_sql: &str) -> Option<Result<ExecResult>> {
     // Gate 2 first (cheapest): the O(prefix) classifier bails on the first
     // non-INSERT token, so non-INSERT statements (point SELECTs etc.) pay no
     // lock at all here.
@@ -6156,13 +6205,7 @@ async fn try_insert_preparse(
     }
 
     // Gate 3: stale pending-OVERRIDING stash → decline (peek, don't take).
-    if sess
-        .state
-        .pending_overriding
-        .lock()
-        .ok()?
-        .is_some()
-    {
+    if sess.state.pending_overriding.lock().ok()?.is_some() {
         return None;
     }
 
@@ -6331,13 +6374,7 @@ pub(crate) async fn try_insert_bind_direct(
     }
 
     // Gate 2: stale pending-OVERRIDING stash → decline (peek, don't take).
-    if sess
-        .state
-        .pending_overriding
-        .lock()
-        .ok()?
-        .is_some()
-    {
+    if sess.state.pending_overriding.lock().ok()?.is_some() {
         return None;
     }
 
@@ -6685,12 +6722,8 @@ async fn exec_insert(
         && !matches!(meta.partition_spec, PartitionSpec::RangeMonthly { .. })
     {
         raw_sql
-            .and_then(|raw| {
-                crate::values_fast::try_fast_insert(raw, schema.as_ref(), &ins.columns)
-            })
-            .and_then(|batches| {
-                arrow::compute::concat_batches(&schema, batches.iter()).ok()
-            })
+            .and_then(|raw| crate::values_fast::try_fast_insert(raw, schema.as_ref(), &ins.columns))
+            .and_then(|batches| arrow::compute::concat_batches(&schema, batches.iter()).ok())
     } else {
         None
     };
@@ -7030,10 +7063,8 @@ async fn exec_insert_prebuilt(
 
     // ADR 0027 Phase 4: materialise promoted JSONB shadow columns into the
     // batch before writing to storage.  No-op when no paths are promoted.
-    let batch = crate::promoted_columns::materialize_promoted_columns(
-        &batch,
-        &meta.promoted_jsonb_paths,
-    )?;
+    let batch =
+        crate::promoted_columns::materialize_promoted_columns(&batch, &meta.promoted_jsonb_paths)?;
 
     // Shard-enabled path. The shard owner appends to its WAL, acks once durable,
     // and lets its background compactor drain into Parquet + commit through the
@@ -7066,7 +7097,7 @@ async fn exec_insert_prebuilt(
                 sess.session_pid,
                 sess.synchronous_commit(),
             )
-                .await?;
+            .await?;
             // S4 commit 4a: the rows are durably acked by the shard WAL — keep
             // small OLTP inserts resident in the hot tier as CLEAN entries
             // (`insert_clean`) so the very next point read is served from
@@ -8286,7 +8317,9 @@ fn validate_conflict_target_columns(
         }
     }
 
-    Err(BasinError::AmbiguousConflictTarget(conflict_cols.join(", ")))
+    Err(BasinError::AmbiguousConflictTarget(
+        conflict_cols.join(", "),
+    ))
 }
 
 /// Resolve an `ON CONFLICT ON CONSTRAINT <name>` target to its column list.
@@ -8512,8 +8545,7 @@ async fn filter_rows_do_nothing(
                 }
                 continue;
             }
-            let fast_exists =
-                fast_pk_exists_check(sess, table, meta, cols, &row).await?;
+            let fast_exists = fast_pk_exists_check(sess, table, meta, cols, &row).await?;
             let exists = match fast_exists {
                 Some(b) => b,
                 None => {
@@ -8736,8 +8768,15 @@ async fn try_on_conflict_do_update(
     // Validate that the resolved column set actually matches a constraint.
     // (The ON CONSTRAINT path already validated via resolve_constraint_name;
     //  the Columns path needs explicit validation here.)
-    if matches!(&on_conflict.conflict_target, Some(ConflictTarget::Columns(_))) {
-        validate_conflict_target_columns(&meta.pk_columns, &meta.unique_constraints, &conflict_cols)?;
+    if matches!(
+        &on_conflict.conflict_target,
+        Some(ConflictTarget::Columns(_))
+    ) {
+        validate_conflict_target_columns(
+            &meta.pk_columns,
+            &meta.unique_constraints,
+            &conflict_cols,
+        )?;
     }
 
     // Expand all rows to schema-width and apply column defaults once.
@@ -8748,9 +8787,9 @@ async fn try_on_conflict_do_update(
     let conflict_idxs: Vec<usize> = conflict_cols
         .iter()
         .map(|c| {
-            schema
-                .index_of(c)
-                .map_err(|_| BasinError::InvalidSchema(format!("ON CONFLICT: unknown column {c:?}")))
+            schema.index_of(c).map_err(|_| {
+                BasinError::InvalidSchema(format!("ON CONFLICT: unknown column {c:?}"))
+            })
         })
         .collect::<Result<_>>()?;
 
@@ -8809,10 +8848,7 @@ async fn try_on_conflict_do_update(
     // CASE expression, which is unsupported). When `do_update.selection` is
     // present, fall straight through to the per-row path, which appends the
     // rewritten filter as `AND (…)` to each single-row UPDATE.
-    if rows_expanded.len() > 1
-        && conflict_cols.len() == 1
-        && do_update.selection.is_none()
-    {
+    if rows_expanded.len() > 1 && conflict_cols.len() == 1 && do_update.selection.is_none() {
         match try_batched_do_update(
             sess,
             table,
@@ -8891,8 +8927,10 @@ async fn try_on_conflict_do_update(
         let exists = match fast_exists {
             Some(b) => b,
             None => {
-                let check_sql =
-                    format!("SELECT 1 FROM {} WHERE {} LIMIT 1", table_quoted, where_clause);
+                let check_sql = format!(
+                    "SELECT 1 FROM {} WHERE {} LIMIT 1",
+                    table_quoted, where_clause
+                );
                 // Session dispatcher, not raw ctx.sql — see the DO NOTHING
                 // twin above: a stale registered provider must not decide
                 // conflict existence.
@@ -8946,8 +8984,7 @@ async fn try_on_conflict_do_update(
         let where_filter: Option<String> = match do_update.selection.as_ref() {
             None => None,
             Some(sel) => {
-                let rewritten =
-                    rewrite_do_update_expr(sel.clone(), &table_bare, &excluded_map);
+                let rewritten = rewrite_do_update_expr(sel.clone(), &table_bare, &excluded_map);
                 match eval_constant_predicate(&rewritten) {
                     // Fully constant and false → this row's UPDATE is skipped.
                     Some(false) => {
@@ -9193,10 +9230,13 @@ fn rewrite_do_update_expr(
                             arg: FunctionArgExpr::Expr(e),
                             ..
                         } => {
-                            let owned = std::mem::replace(e, Expr::Value(sqlparser::ast::ValueWithSpan {
-                                value: sqlparser::ast::Value::Null,
-                                span: sqlparser::tokenizer::Span::empty(),
-                            }));
+                            let owned = std::mem::replace(
+                                e,
+                                Expr::Value(sqlparser::ast::ValueWithSpan {
+                                    value: sqlparser::ast::Value::Null,
+                                    span: sqlparser::tokenizer::Span::empty(),
+                                }),
+                            );
                             *e = rewrite_do_update_expr(owned, table_name_lower, excluded_map);
                         }
                         _ => {}
@@ -9295,12 +9335,12 @@ fn fold_const_expr(e: &Expr) -> Option<ConstVal> {
             fold_const_expr(inner)?,
             ConstVal::Null
         ))),
-        Expr::IsTrue(inner) => {
-            Some(ConstVal::Bool(fold_const_expr(inner)? == ConstVal::Bool(true)))
-        }
-        Expr::IsNotTrue(inner) => {
-            Some(ConstVal::Bool(fold_const_expr(inner)? != ConstVal::Bool(true)))
-        }
+        Expr::IsTrue(inner) => Some(ConstVal::Bool(
+            fold_const_expr(inner)? == ConstVal::Bool(true),
+        )),
+        Expr::IsNotTrue(inner) => Some(ConstVal::Bool(
+            fold_const_expr(inner)? != ConstVal::Bool(true),
+        )),
         Expr::IsFalse(inner) => Some(ConstVal::Bool(
             fold_const_expr(inner)? == ConstVal::Bool(false),
         )),
@@ -9756,10 +9796,7 @@ async fn try_batched_do_update(
                 .map(|(ai, col)| {
                     let mut arms = String::new();
                     for (ri, rendered) in chunk {
-                        arms.push_str(&format!(
-                            " WHEN {rendered} THEN {}",
-                            row_set_rhs[*ri][ai]
-                        ));
+                        arms.push_str(&format!(" WHEN {rendered} THEN {}", row_set_rhs[*ri][ai]));
                     }
                     // ELSE is unreachable (the WHERE restricts to the arm
                     // keys) but keeps the expression total.
@@ -9960,9 +9997,9 @@ async fn apply_column_defaults(
                                 .with_empty_span(),
                         )
                     }
-                    None => sqlparser::ast::Expr::Value(
-                        sqlparser::ast::Value::Null.with_empty_span(),
-                    ),
+                    None => {
+                        sqlparser::ast::Expr::Value(sqlparser::ast::Value::Null.with_empty_span())
+                    }
                 },
             };
         }
@@ -10316,10 +10353,7 @@ fn write_options_for(meta: &TableMetadata, in_tx: bool) -> WriteOptions {
         // declared via `WITH (basin.sort_by = '...')`. The writer builds a
         // fastbloom per column and stores it in DataFile::bloom_filters so
         // the reader can skip files on point_eq miss without opening them.
-        bloom_columns: meta
-            .global_sort_order
-            .clone()
-            .unwrap_or_default(),
+        bloom_columns: meta.global_sort_order.clone().unwrap_or_default(),
         // Always-on Vortex fast-write mode for non-tx direct bulk INSERTs:
         // every non-tx direct INSERT runs through the minimal cascade
         // (~3-4x faster encode at ~1.5x disk size). The next compaction
@@ -11021,8 +11055,7 @@ pub(crate) async fn exec_select(
         // (a mismatch could prune tighter than the predicate — never allowed).
         // Decline inside a transaction (pending files the registry hasn't seen).
         if !crate::session::tx_is_active(&sess.state) {
-            let trgm_threshold =
-                crate::session::session_trgm_similarity_threshold(&sess.state);
+            let trgm_threshold = crate::session::session_trgm_similarity_threshold(&sess.state);
             crate::session::apply_trgm_pruning_for_query(
                 &sess.engine,
                 &sess.project,
@@ -11104,9 +11137,8 @@ pub(crate) async fn exec_select(
         let raw = first_scan(df.logical_plan()).unwrap_or("_multi_table_");
         // Sanitise: TableName::new validates idents; fall back to sentinel on
         // failure (e.g. DataFusion internal scans, subquery aliases, etc.).
-        TableName::new(raw).unwrap_or_else(|_| {
-            TableName::new("_multi_table_").expect("sentinel is valid")
-        })
+        TableName::new(raw)
+            .unwrap_or_else(|_| TableName::new("_multi_table_").expect("sentinel is valid"))
     };
     let exec_start = std::time::Instant::now();
 
@@ -11180,8 +11212,7 @@ pub(crate) async fn exec_select(
     // per-thread slot so `PgSleepUdf` can observe it cooperatively.
     // The deadline is computed here (= now + timeout) so both the shard and
     // non-shard paths share the same reference point.
-    let statement_deadline: Option<Instant> =
-        timeout.map(|d| Instant::now() + d);
+    let statement_deadline: Option<Instant> = timeout.map(|d| Instant::now() + d);
     // Aggregate / GROUP-BY / UNION-ALL partitioning note (investigated; no
     // Basin lever). A cluster of GROUP-BY-shaped queries runs several× slower
     // than PostgreSQL at 10k rows, with the gap NARROWING as the table grows
@@ -11226,23 +11257,7 @@ pub(crate) async fn exec_select(
                 let fut = datafusion::physical_plan::collect(plan, task_ctx);
                 match timeout {
                     Some(d) => match tokio::time::timeout(d, fut).await {
-                        Ok(res) => res
-                            .map(Some)
-                            .map_err(|e| {
-                                if take_pg_sleep_canceled() {
-                                    BasinError::query_canceled(
-                                        "pg_sleep: interrupted by statement_timeout",
-                                    )
-                                } else {
-                                    map_df_exec_error(e)
-                                }
-                            }),
-                        Err(_) => Ok(None),
-                    },
-                    None => fut
-                        .await
-                        .map(Some)
-                        .map_err(|e| {
+                        Ok(res) => res.map(Some).map_err(|e| {
                             if take_pg_sleep_canceled() {
                                 BasinError::query_canceled(
                                     "pg_sleep: interrupted by statement_timeout",
@@ -11251,6 +11266,15 @@ pub(crate) async fn exec_select(
                                 map_df_exec_error(e)
                             }
                         }),
+                        Err(_) => Ok(None),
+                    },
+                    None => fut.await.map(Some).map_err(|e| {
+                        if take_pg_sleep_canceled() {
+                            BasinError::query_canceled("pg_sleep: interrupted by statement_timeout")
+                        } else {
+                            map_df_exec_error(e)
+                        }
+                    }),
                 }
             });
             set_statement_deadline(None);
@@ -11285,12 +11309,12 @@ pub(crate) async fn exec_select(
                         res = &mut fut => Some(res),
                         _ = cancel_notify.notified() => None,
                     }
-                }).await {
+                })
+                .await
+                {
                     Ok(Some(res)) => res.map_err(|e| {
                         if take_pg_sleep_canceled() {
-                            BasinError::query_canceled(
-                                "pg_sleep: interrupted by statement_timeout",
-                            )
+                            BasinError::query_canceled("pg_sleep: interrupted by statement_timeout")
                         } else {
                             map_df_exec_error(e)
                         }
@@ -11304,10 +11328,13 @@ pub(crate) async fn exec_select(
                     }
                     Err(_) => {
                         // Statement timeout fired.
-                        return { set_statement_deadline(None); Err(canceled()) };
+                        return {
+                            set_statement_deadline(None);
+                            Err(canceled())
+                        };
                     }
                 }
-            },
+            }
             None => {
                 tokio::pin!(fut);
                 let outcome = tokio::select! {
@@ -11317,9 +11344,7 @@ pub(crate) async fn exec_select(
                 match outcome {
                     Some(res) => res.map_err(|e| {
                         if take_pg_sleep_canceled() {
-                            BasinError::query_canceled(
-                                "pg_sleep: interrupted by statement_timeout",
-                            )
+                            BasinError::query_canceled("pg_sleep: interrupted by statement_timeout")
                         } else {
                             map_df_exec_error(e)
                         }
@@ -11331,7 +11356,7 @@ pub(crate) async fn exec_select(
                         ));
                     }
                 }
-            },
+            }
         };
         set_statement_deadline(None);
         result?
@@ -11816,7 +11841,13 @@ async fn compute_select_refresh_set(
 /// that and leave it unregistered, so a missing table is never masked as
 /// present — the caller's retry plan still fails and surfaces the normal 42P01.
 pub(crate) async fn refresh_select_tables_on_miss(sess: &ProjectSession, sql: &str) {
-    let all_tables = match sess.engine.config().catalog.list_tables(&sess.project).await {
+    let all_tables = match sess
+        .engine
+        .config()
+        .catalog
+        .list_tables(&sess.project)
+        .await
+    {
         Ok(t) => t,
         Err(_) => return,
     };
@@ -12204,7 +12235,11 @@ async fn exec_show_tables(sess: &ProjectSession) -> Result<ExecResult> {
 /// Phase 5.28.D: build a single-row/single-column `ExecResult::Rows` for `SHOW <var>`.
 /// Column name is the variable name; value is `val`.
 pub(crate) fn make_show_result(col_name: &str, val: &str) -> ExecResult {
-    let schema = Arc::new(Schema::new(vec![Field::new(col_name, DataType::Utf8, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        col_name,
+        DataType::Utf8,
+        false,
+    )]));
     let arr = StringArray::from(vec![val]);
     let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr) as ArrayRef])
         .expect("make_show_result: infallible");
@@ -12417,9 +12452,7 @@ fn pg_style_nullary_fn_column_names(schema: &Arc<Schema>) -> Arc<Schema> {
             if let Some(stripped) = f.name().strip_suffix("()") {
                 // Strip an optional schema qualifier (`pg_catalog.version`).
                 let base = stripped.rsplit('.').next().unwrap_or(stripped);
-                if !base.is_empty()
-                    && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
+                if !base.is_empty() && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                     changed = true;
                     return f.as_ref().clone().with_name(base.to_string());
                 }
@@ -12475,7 +12508,10 @@ pub(crate) async fn reattach_enum_oids(
                         crate::types::BASIN_ENUM_TYPE_KEY.to_string(),
                         enum_name.clone(),
                     );
-                    md.insert(crate::types::BASIN_ENUM_OID_KEY.to_string(), oid.to_string());
+                    md.insert(
+                        crate::types::BASIN_ENUM_OID_KEY.to_string(),
+                        oid.to_string(),
+                    );
                     return f.clone().with_metadata(md);
                 }
             }
@@ -13065,10 +13101,8 @@ async fn materialize_recursive_ctes(
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let provider =
-            MemTable::try_new(plan_schema.clone(), vec![recast_batches]).map_err(|e| {
-                BasinError::internal(format!("MemTable for CTE {cte_name:?}: {e}"))
-            })?;
+        let provider = MemTable::try_new(plan_schema.clone(), vec![recast_batches])
+            .map_err(|e| BasinError::internal(format!("MemTable for CTE {cte_name:?}: {e}")))?;
 
         let _ = sess.ctx.deregister_table(&cte_name);
         sess.ctx
@@ -13416,7 +13450,12 @@ fn record_query_patterns(sess: &ProjectSession, query: &sqlparser::ast::Query) {
         return;
     }
     let table_name = match &from.relation {
-        TableFactor::Table { name, alias: None, args: None, .. } => {
+        TableFactor::Table {
+            name,
+            alias: None,
+            args: None,
+            ..
+        } => {
             if name.0.len() != 1 {
                 return;
             }
@@ -13437,9 +13476,7 @@ fn record_query_patterns(sess: &ProjectSession, query: &sqlparser::ast::Query) {
             .iter()
             .filter_map(|ob| match &ob.expr {
                 Expr::Identifier(ident) => Some(ident.value.clone()),
-                Expr::CompoundIdentifier(parts) if parts.len() == 1 => {
-                    Some(parts[0].value.clone())
-                }
+                Expr::CompoundIdentifier(parts) if parts.len() == 1 => Some(parts[0].value.clone()),
                 _ => None,
             })
             .collect();
@@ -13452,9 +13489,7 @@ fn record_query_patterns(sess: &ProjectSession, query: &sqlparser::ast::Query) {
             .iter()
             .filter_map(|e| match e {
                 Expr::Identifier(ident) => Some(ident.value.clone()),
-                Expr::CompoundIdentifier(parts) if parts.len() == 1 => {
-                    Some(parts[0].value.clone())
-                }
+                Expr::CompoundIdentifier(parts) if parts.len() == 1 => Some(parts[0].value.clone()),
                 _ => None,
             })
             .collect();
@@ -13510,11 +13545,7 @@ fn enforce_intra_tx_uniqueness(
         // allocation that dominates the O(k²) cost for large bulk-INSERT
         // transactions. Mirrors the same pattern in constraints.rs.
         let single_i64_pk = pk_columns.len() == 1
-            && batch
-                .schema()
-                .field(pk_idx_curr[0])
-                .data_type()
-                == &DataType::Int64;
+            && batch.schema().field(pk_idx_curr[0]).data_type() == &DataType::Int64;
 
         if single_i64_pk {
             use arrow_array::Array as _;
@@ -13585,9 +13616,7 @@ fn enforce_intra_tx_uniqueness(
                 }
             }
             for row in 0..batch.num_rows() {
-                if let Some(k) =
-                    crate::constraints::pk_tuple_for_row(batch, &pk_idx_curr, row)?
-                {
+                if let Some(k) = crate::constraints::pk_tuple_for_row(batch, &pk_idx_curr, row)? {
                     if existing.contains(&k) {
                         return Err(BasinError::UniqueViolation(format!(
                             "duplicate key value violates unique constraint \
@@ -13616,8 +13645,7 @@ fn enforce_intra_tx_uniqueness(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut existing: std::collections::HashSet<Vec<String>> =
-            std::collections::HashSet::new();
+        let mut existing: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
         for rb in &prior {
             let idx: Vec<usize> = u
                 .columns
@@ -13682,8 +13710,8 @@ async fn htap_emit_wal_begin_lazy(sess: &ProjectSession) -> u64 {
 fn encode_batch_to_ipc(batch: &arrow_array::RecordBatch) -> Vec<u8> {
     use arrow::ipc::writer::StreamWriter;
     let mut buf = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut buf, batch.schema_ref())
-        .expect("IPC StreamWriter init");
+    let mut writer =
+        StreamWriter::try_new(&mut buf, batch.schema_ref()).expect("IPC StreamWriter init");
     writer.write(batch).expect("IPC write");
     writer.finish().expect("IPC finish");
     buf
@@ -13817,12 +13845,8 @@ fn write_through_insert_residency(
 /// double-flush them while they keep serving point reads as residency.
 async fn htap_promote_to_registry(
     sess: &ProjectSession,
-    htap_rows: &std::collections::HashMap<
-        basin_common::TableName,
-        Vec<arrow_array::RecordBatch>,
-    >,
-) -> Result<std::collections::HashMap<basin_common::TableName, Vec<(basin_hottier::RowKey, u64)>>>
-{
+    htap_rows: &std::collections::HashMap<basin_common::TableName, Vec<arrow_array::RecordBatch>>,
+) -> Result<std::collections::HashMap<basin_common::TableName, Vec<(basin_hottier::RowKey, u64)>>> {
     let mut clean_acks: std::collections::HashMap<
         basin_common::TableName,
         Vec<(basin_hottier::RowKey, u64)>,
@@ -14094,7 +14118,10 @@ fn promote_tombstone_overrides_on_reinsert(
             continue;
         };
         // Only act when the current registry value IS a tombstone.
-        if matches!(entry.memtable.get(&key), Some(basin_hottier::MemRowValue::Tombstone)) {
+        if matches!(
+            entry.memtable.get(&key),
+            Some(basin_hottier::MemRowValue::Tombstone)
+        ) {
             // Encode this row as IPC and write as Update, replacing the tombstone.
             // `Update` semantics: suppresses the stale cold-tier row at this PK
             // and provides the new value to merge-on-read.
@@ -14187,15 +14214,38 @@ async fn maintain_secondary_indexes_on_insert(
                     .or(meta.row_group_rows)
                     .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE)
                     .max(1);
-                maintain_gin_fts_index_on_insert(fts_registry, &sess.project, table, col_name, batch, file_path, rg_size);
+                maintain_gin_fts_index_on_insert(
+                    fts_registry,
+                    &sess.project,
+                    table,
+                    col_name,
+                    batch,
+                    file_path,
+                    rg_size,
+                );
             } else if opclass == "gin_trgm_ops" {
                 // Trigram GIN index — populate the file-level trigram posting
                 // list + row tier from the TEXT column. Extraction matches
                 // `similarity()` (basin_trgm padding/case-fold).
-                maintain_gin_trgm_index_on_insert(gin_registry, &sess.project, table, col_name, batch, file_path);
+                maintain_gin_trgm_index_on_insert(
+                    gin_registry,
+                    &sess.project,
+                    table,
+                    col_name,
+                    batch,
+                    file_path,
+                );
             } else {
                 // Phase 5.19.C: JSONB GIN index — populate JSONB posting list.
-                maintain_gin_index_on_insert(gin_registry, &sess.project, table, col_name, opclass, batch, file_path);
+                maintain_gin_index_on_insert(
+                    gin_registry,
+                    &sess.project,
+                    table,
+                    col_name,
+                    opclass,
+                    batch,
+                    file_path,
+                );
                 // C2: also populate the per-row-group bloom-filter registry.
                 // The Parquet writer splits a batch into row-groups of
                 // `meta.row_group_rows` (default DEFAULT_MAX_ROW_GROUP_SIZE)
@@ -14205,7 +14255,16 @@ async fn maintain_secondary_indexes_on_insert(
                 let rg_size = meta
                     .row_group_rows
                     .unwrap_or(basin_storage::DEFAULT_MAX_ROW_GROUP_SIZE);
-                maintain_gin_rowgroup_index_on_insert(rg_registry, &sess.project, table, col_name, opclass, batch, file_path, rg_size);
+                maintain_gin_rowgroup_index_on_insert(
+                    rg_registry,
+                    &sess.project,
+                    table,
+                    col_name,
+                    opclass,
+                    batch,
+                    file_path,
+                    rg_size,
+                );
             }
             // GIN posting list is RAM-only (5.19.E handles persistence); skip
             // the flush call.  Continue to also populate the B-tree registry
@@ -14219,15 +14278,19 @@ async fn maintain_secondary_indexes_on_insert(
         // allows point-containment and overlap probes at file-level granularity.
         if idx.access_method == "gist" {
             let interval_registry = sess.engine.interval_registry();
-            maintain_gist_index_on_insert(interval_registry, &sess.project, table, col_name, batch, file_path);
+            maintain_gist_index_on_insert(
+                interval_registry,
+                &sess.project,
+                table,
+                col_name,
+                batch,
+                file_path,
+            );
             continue;
         }
 
         let entries = crate::secondary_index::extract_entries_from_batch(
-            batch,
-            col_name,
-            file_path,
-            0, // row_group 0 — single batch write
+            batch, col_name, file_path, 0, // row_group 0 — single batch write
         );
         if !entries.is_empty() {
             registry.insert_batch(&sess.project, table, col_name, entries);
@@ -14264,7 +14327,9 @@ fn maintain_gin_index_on_insert(
                 continue;
             }
             let bytes = arr.value(row);
-            gin_registry.index_row(project, table, col_name, opclass, bytes, file_path, 0, row as u64);
+            gin_registry.index_row(
+                project, table, col_name, opclass, bytes, file_path, 0, row as u64,
+            );
         }
         // Phase 5.19.C: mark this file as fully indexed so the completeness
         // guard in the probe path can safely prune to FileCandidates.
@@ -14492,7 +14557,9 @@ async fn touch_hypertable_chunks_from_insert(
     };
 
     // Check if it's a hypertable.
-    let Some(time_col) = sess.engine.hypertable_registry()
+    let Some(time_col) = sess
+        .engine
+        .hypertable_registry()
         .time_column(&sess.project, &table)
         .await
     else {
@@ -14513,25 +14580,40 @@ async fn touch_hypertable_chunks_from_insert(
     // explicit column list to locate the time column.
     let Some(col_idx) = time_col_idx else {
         // No explicit column list. Try to get it from the table schema.
-        if let Ok(meta) = sess.engine.config().catalog
-            .load_table(&sess.project, &match basin_common::TableName::new(table.as_str()) {
-                Ok(n) => n,
-                Err(_) => return,
-            })
+        if let Ok(meta) = sess
+            .engine
+            .config()
+            .catalog
+            .load_table(
+                &sess.project,
+                &match basin_common::TableName::new(table.as_str()) {
+                    Ok(n) => n,
+                    Err(_) => return,
+                },
+            )
             .await
         {
             let schema = meta.schema.clone();
-            let idx = schema.fields().iter().position(|f| {
-                f.name().eq_ignore_ascii_case(&time_col)
-            });
+            let idx = schema
+                .fields()
+                .iter()
+                .position(|f| f.name().eq_ignore_ascii_case(&time_col));
             if let Some(sidx) = idx {
                 // Scan values using schema index.
-                let Some(ref source) = ins.source else { return; };
-                let SetExpr::Values(vals) = source.body.as_ref() else { return; };
+                let Some(ref source) = ins.source else {
+                    return;
+                };
+                let SetExpr::Values(vals) = source.body.as_ref() else {
+                    return;
+                };
                 for row in &vals.rows {
-                    if sidx >= row.len() { continue; }
+                    if sidx >= row.len() {
+                        continue;
+                    }
                     if let Some(ts) = expr_to_datetime(&row[sidx]) {
-                        let _ = sess.engine.hypertable_registry()
+                        let _ = sess
+                            .engine
+                            .hypertable_registry()
                             .touch_chunk(&sess.project, &table, ts)
                             .await;
                     }
@@ -14542,12 +14624,20 @@ async fn touch_hypertable_chunks_from_insert(
     };
 
     // Scan VALUES rows and extract timestamp from the time column.
-    let Some(ref source) = ins.source else { return; };
-    let SetExpr::Values(vals) = source.body.as_ref() else { return; };
+    let Some(ref source) = ins.source else {
+        return;
+    };
+    let SetExpr::Values(vals) = source.body.as_ref() else {
+        return;
+    };
     for row in &vals.rows {
-        if col_idx >= row.len() { continue; }
+        if col_idx >= row.len() {
+            continue;
+        }
         if let Some(ts) = expr_to_datetime(&row[col_idx]) {
-            let _ = sess.engine.hypertable_registry()
+            let _ = sess
+                .engine
+                .hypertable_registry()
                 .touch_chunk(&sess.project, &table, ts)
                 .await;
         }
@@ -14569,13 +14659,13 @@ fn normalize_pg_timestamp(s: &str) -> String {
     };
     // Detect a trailing offset of the form +HH or -HH (3 chars, no colon)
     // We look for the last '+' or '-' that appears after position 10 (after the date part).
-    let tz_plus  = s[10..].rfind('+').map(|p| p + 10);
+    let tz_plus = s[10..].rfind('+').map(|p| p + 10);
     let tz_minus = s[10..].rfind('-').map(|p| p + 10);
     let tz_pos = match (tz_plus, tz_minus) {
         (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None)    => Some(a),
-        (None, Some(b))    => Some(b),
-        (None, None)       => None,
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
     };
     if let Some(pos) = tz_pos {
         let suffix = &s[pos..];
@@ -14592,8 +14682,8 @@ fn normalize_pg_timestamp(s: &str) -> String {
 }
 
 fn expr_to_datetime(expr: &sqlparser::ast::Expr) -> Option<chrono::DateTime<chrono::Utc>> {
-    use sqlparser::ast::{Expr, Value, ValueWithSpan};
     use chrono::DateTime;
+    use sqlparser::ast::{Expr, Value, ValueWithSpan};
 
     match expr {
         Expr::Value(ValueWithSpan {
@@ -14602,11 +14692,11 @@ fn expr_to_datetime(expr: &sqlparser::ast::Expr) -> Option<chrono::DateTime<chro
         }) => {
             // Try multiple PG/ISO timestamp formats, most specific first.
             let formats: &[&str] = &[
-                "%Y-%m-%d %H:%M:%S%.f%:z",  // '2024-01-01 12:00:00.000000+00:00'
-                "%Y-%m-%d %H:%M:%S%:z",     // '2024-01-01 12:00:00+00:00'
-                "%Y-%m-%d %H:%M:%S%z",      // '2024-01-01 12:00:00+0000'
-                "%Y-%m-%dT%H:%M:%S%:z",     // ISO-8601 with colon
-                "%Y-%m-%dT%H:%M:%SZ",       // ISO-8601 Zulu
+                "%Y-%m-%d %H:%M:%S%.f%:z", // '2024-01-01 12:00:00.000000+00:00'
+                "%Y-%m-%d %H:%M:%S%:z",    // '2024-01-01 12:00:00+00:00'
+                "%Y-%m-%d %H:%M:%S%z",     // '2024-01-01 12:00:00+0000'
+                "%Y-%m-%dT%H:%M:%S%:z",    // ISO-8601 with colon
+                "%Y-%m-%dT%H:%M:%SZ",      // ISO-8601 Zulu
             ];
             let mut result = DateTime::parse_from_rfc3339(s)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
@@ -14651,10 +14741,11 @@ async fn exec_create_hypertable(
     time_col: &str,
     interval_text: &str,
 ) -> Result<ExecResult> {
-    let secs = crate::hypertable::parse_interval_secs(interval_text)
-        .ok_or_else(|| BasinError::InvalidSchema(format!(
+    let secs = crate::hypertable::parse_interval_secs(interval_text).ok_or_else(|| {
+        BasinError::InvalidSchema(format!(
             "create_hypertable: could not parse interval '{interval_text}'"
-        )))?;
+        ))
+    })?;
     sess.engine
         .hypertable_registry()
         .register(&sess.project, table, time_col.to_string(), secs)
@@ -14662,10 +14753,10 @@ async fn exec_create_hypertable(
         .map_err(|e| BasinError::InvalidSchema(e))?;
     // Return a single-row result mimicking TimescaleDB's create_hypertable().
     let schema = Arc::new(arrow_schema::Schema::new(vec![
-        arrow_schema::Field::new("hypertable_id",   arrow_schema::DataType::Int64,  false),
-        arrow_schema::Field::new("schema_name",     arrow_schema::DataType::Utf8,   false),
-        arrow_schema::Field::new("table_name",      arrow_schema::DataType::Utf8,   false),
-        arrow_schema::Field::new("created",         arrow_schema::DataType::Boolean, false),
+        arrow_schema::Field::new("hypertable_id", arrow_schema::DataType::Int64, false),
+        arrow_schema::Field::new("schema_name", arrow_schema::DataType::Utf8, false),
+        arrow_schema::Field::new("table_name", arrow_schema::DataType::Utf8, false),
+        arrow_schema::Field::new("created", arrow_schema::DataType::Boolean, false),
     ]));
     let batch = arrow_array::RecordBatch::try_new(
         schema.clone(),
@@ -14677,7 +14768,10 @@ async fn exec_create_hypertable(
         ],
     )
     .map_err(|e| BasinError::internal(format!("create_hypertable result: {e}")))?;
-    Ok(ExecResult::Rows { schema, batches: vec![batch] })
+    Ok(ExecResult::Rows {
+        schema,
+        batches: vec![batch],
+    })
 }
 
 /// Execute `SELECT add_retention_policy('table', INTERVAL '...')`.
@@ -14687,24 +14781,30 @@ async fn exec_add_retention_policy(
     table: &str,
     interval_text: &str,
 ) -> Result<ExecResult> {
-    let secs = crate::hypertable::parse_interval_secs(interval_text)
-        .ok_or_else(|| BasinError::InvalidSchema(format!(
+    let secs = crate::hypertable::parse_interval_secs(interval_text).ok_or_else(|| {
+        BasinError::InvalidSchema(format!(
             "add_retention_policy: could not parse interval '{interval_text}'"
-        )))?;
+        ))
+    })?;
     sess.engine
         .hypertable_registry()
         .set_retention(&sess.project, table, secs)
         .await
         .map_err(|e| BasinError::InvalidSchema(e))?;
-    let schema = Arc::new(arrow_schema::Schema::new(vec![
-        arrow_schema::Field::new("job_id", arrow_schema::DataType::Int64, false),
-    ]));
+    let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "job_id",
+        arrow_schema::DataType::Int64,
+        false,
+    )]));
     let batch = arrow_array::RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(arrow_array::Int64Array::from(vec![1i64])) as ArrayRef],
     )
     .map_err(|e| BasinError::internal(format!("add_retention_policy result: {e}")))?;
-    Ok(ExecResult::Rows { schema, batches: vec![batch] })
+    Ok(ExecResult::Rows {
+        schema,
+        batches: vec![batch],
+    })
 }
 
 /// Execute `SELECT drop_chunks('table', older_than => INTERVAL/TIMESTAMP)`.
@@ -14733,23 +14833,26 @@ async fn exec_drop_chunks(
     // Resolve the cutoff timestamp.
     let cutoff: chrono::DateTime<Utc> = match &cutoff_spec {
         DropChunksCutoff::Interval(iv_text) => {
-            let secs = crate::hypertable::parse_interval_secs(iv_text)
-                .ok_or_else(|| BasinError::InvalidSchema(format!(
+            let secs = crate::hypertable::parse_interval_secs(iv_text).ok_or_else(|| {
+                BasinError::InvalidSchema(format!(
                     "drop_chunks: could not parse interval '{iv_text}'"
-                )))?;
+                ))
+            })?;
             Utc::now() - chrono::Duration::seconds(secs as i64)
         }
         DropChunksCutoff::Timestamp(ts_text) => {
             // Accept ISO-8601 / PG-style timestamp strings.
-            parse_cutoff_timestamp(ts_text)
-                .ok_or_else(|| BasinError::InvalidSchema(format!(
+            parse_cutoff_timestamp(ts_text).ok_or_else(|| {
+                BasinError::InvalidSchema(format!(
                     "drop_chunks: could not parse timestamp '{ts_text}'"
-                )))?
+                ))
+            })?
         }
     };
 
     // Drop chunk metadata and collect the names of dropped chunks.
-    let dropped = sess.engine
+    let dropped = sess
+        .engine
         .hypertable_registry()
         .drop_chunks_before(&sess.project, table, cutoff)
         .await
@@ -14757,28 +14860,33 @@ async fn exec_drop_chunks(
 
     if !dropped.is_empty() {
         // Issue a physical DELETE for rows in the dropped range.
-        if let Some(time_col) = sess.engine.hypertable_registry()
+        if let Some(time_col) = sess
+            .engine
+            .hypertable_registry()
             .time_column(&sess.project, table)
             .await
         {
             let cutoff_us = cutoff.timestamp_micros();
-            let delete_sql = format!(
-                "DELETE FROM \"{table}\" WHERE \"{time_col}\" < {cutoff_us}"
-            );
+            let delete_sql = format!("DELETE FROM \"{table}\" WHERE \"{time_col}\" < {cutoff_us}");
             let _ = exec_retention_delete(sess, &delete_sql).await;
         }
     }
 
-    let schema = Arc::new(arrow_schema::Schema::new(vec![
-        arrow_schema::Field::new("chunks_dropped", arrow_schema::DataType::Int64, false),
-    ]));
+    let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "chunks_dropped",
+        arrow_schema::DataType::Int64,
+        false,
+    )]));
     let n = dropped.len() as i64;
     let batch = arrow_array::RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(arrow_array::Int64Array::from(vec![n])) as ArrayRef],
     )
     .map_err(|e| BasinError::internal(format!("drop_chunks result: {e}")))?;
-    Ok(ExecResult::Rows { schema, batches: vec![batch] })
+    Ok(ExecResult::Rows {
+        schema,
+        batches: vec![batch],
+    })
 }
 
 /// Parse a timestamp string in a variety of formats to `DateTime<Utc>`.
@@ -14822,60 +14930,67 @@ fn parse_cutoff_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 /// Execute `SELECT run_retention_policy('table')`.
 /// Drops chunks that fall outside the retention window, then issues a physical
 /// DELETE so the base table's rows are also removed.
-async fn exec_run_retention_policy(
-    sess: &ProjectSession,
-    table: &str,
-) -> Result<ExecResult> {
+async fn exec_run_retention_policy(sess: &ProjectSession, table: &str) -> Result<ExecResult> {
     // Read the retention window, compute the cutoff, then delegate to the
     // shared drop_chunks_before core (same path as exec_drop_chunks).
-    let Some(retention_secs) = get_retention_secs_from_registry(
-        sess.engine.hypertable_registry(),
-        &sess.project,
-        table,
-    ).await else {
+    let Some(retention_secs) =
+        get_retention_secs_from_registry(sess.engine.hypertable_registry(), &sess.project, table)
+            .await
+    else {
         // No retention policy set — return 0 chunks dropped.
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("chunks_dropped", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "chunks_dropped",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
         let batch = arrow_array::RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(arrow_array::Int64Array::from(vec![0i64])) as ArrayRef],
         )
         .map_err(|e| BasinError::internal(format!("run_retention_policy result: {e}")))?;
-        return Ok(ExecResult::Rows { schema, batches: vec![batch] });
+        return Ok(ExecResult::Rows {
+            schema,
+            batches: vec![batch],
+        });
     };
 
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(retention_secs as i64);
 
-    let dropped = sess.engine
+    let dropped = sess
+        .engine
         .hypertable_registry()
         .drop_chunks_before(&sess.project, table, cutoff)
         .await
         .map_err(|e| BasinError::InvalidSchema(e))?;
 
     if !dropped.is_empty() {
-        if let Some(time_col) = sess.engine.hypertable_registry()
+        if let Some(time_col) = sess
+            .engine
+            .hypertable_registry()
             .time_column(&sess.project, table)
             .await
         {
             let cutoff_us = cutoff.timestamp_micros();
-            let delete_sql = format!(
-                "DELETE FROM \"{table}\" WHERE \"{time_col}\" < {cutoff_us}"
-            );
+            let delete_sql = format!("DELETE FROM \"{table}\" WHERE \"{time_col}\" < {cutoff_us}");
             let _ = exec_retention_delete(sess, &delete_sql).await;
         }
     }
 
-    let schema = Arc::new(arrow_schema::Schema::new(vec![
-        arrow_schema::Field::new("chunks_dropped", arrow_schema::DataType::Int64, false),
-    ]));
+    let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "chunks_dropped",
+        arrow_schema::DataType::Int64,
+        false,
+    )]));
     let n = dropped.len() as i64;
     let batch = arrow_array::RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(arrow_array::Int64Array::from(vec![n])) as ArrayRef],
     )
     .map_err(|e| BasinError::internal(format!("run_retention_policy result: {e}")))?;
-    Ok(ExecResult::Rows { schema, batches: vec![batch] })
+    Ok(ExecResult::Rows {
+        schema,
+        batches: vec![batch],
+    })
 }
 
 /// Issue a DELETE SQL statement for the retention path without going through
@@ -14890,7 +15005,9 @@ async fn exec_retention_delete(sess: &ProjectSession, sql: &str) -> Result<ExecR
         Some(sqlparser::ast::Statement::Delete(del)) => {
             crate::dml_mutate::exec_delete(sess, del).await
         }
-        _ => Ok(ExecResult::Empty { tag: "DELETE 0".into() }),
+        _ => Ok(ExecResult::Empty {
+            tag: "DELETE 0".into(),
+        }),
     }
 }
 
@@ -14919,15 +15036,18 @@ async fn exec_compress_chunk(
                 .compress_chunk(&sess.project, &chunk_name)
                 .await;
         }
-        CompressChunkIntent::AllForTable { hypertable_name, before_ts } => {
+        CompressChunkIntent::AllForTable {
+            hypertable_name,
+            before_ts,
+        } => {
             // Mark all chunks for this table (optionally before a cutoff) compressed.
-            let chunks = sess.engine
+            let chunks = sess
+                .engine
                 .hypertable_registry()
                 .snapshot_chunks(&sess.project, &hypertable_name)
                 .await;
-            let cutoff: Option<chrono::DateTime<chrono::Utc>> = before_ts
-                .as_deref()
-                .and_then(|s| s.parse().ok());
+            let cutoff: Option<chrono::DateTime<chrono::Utc>> =
+                before_ts.as_deref().and_then(|s| s.parse().ok());
             for c in &chunks {
                 let should_compress = match cutoff {
                     Some(co) => c.range_end <= co,
@@ -14945,15 +15065,20 @@ async fn exec_compress_chunk(
             // No target table info — noop compress (safe fallback).
         }
     }
-    let schema = Arc::new(arrow_schema::Schema::new(vec![
-        arrow_schema::Field::new("compress_chunk", arrow_schema::DataType::Utf8, true),
-    ]));
+    let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "compress_chunk",
+        arrow_schema::DataType::Utf8,
+        true,
+    )]));
     let batch = arrow_array::RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(arrow_array::StringArray::from(vec![Option::<&str>::None])) as ArrayRef],
     )
     .map_err(|e| BasinError::internal(format!("compress_chunk result: {e}")))?;
-    Ok(ExecResult::Rows { schema, batches: vec![batch] })
+    Ok(ExecResult::Rows {
+        schema,
+        batches: vec![batch],
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -15577,8 +15702,8 @@ mod auto_commit_ryow_tests {
 // suite (`tests/integration/tests/values_fast_ingest.rs`).
 #[cfg(test)]
 mod preparse_fastpath_tests {
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
 
     use arrow_array::Int64Array;
     use basin_catalog::{Catalog, InMemoryCatalog};
@@ -15610,7 +15735,9 @@ mod preparse_fastpath_tests {
             ExecResult::Rows { batches, .. } => batches,
             ExecResult::Empty { tag } => panic!("expected Rows, got Empty({tag})"),
         };
-        batches.first().expect("no batch")
+        batches
+            .first()
+            .expect("no batch")
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -15735,7 +15862,10 @@ mod preparse_fastpath_tests {
             "engagement counter must advance for the in-tx statement"
         );
         let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
-        assert_eq!(n, 2, "engaged in-tx rows must be visible inside the transaction");
+        assert_eq!(
+            n, 2,
+            "engaged in-tx rows must be visible inside the transaction"
+        );
         sess.execute("ROLLBACK").await.unwrap();
         let n = count_from_result(sess.execute("SELECT COUNT(*) FROM t").await.unwrap());
         assert_eq!(n, 0, "ROLLBACK must drop the engaged in-tx rows");
@@ -15816,8 +15946,8 @@ mod preparse_fastpath_tests {
 // (`values_fast_ingest.rs` prepared variants, `prepared_insert_fast.rs`).
 #[cfg(test)]
 mod bind_direct_fastpath_tests {
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
 
     use arrow_array::Int64Array;
     use basin_catalog::{Catalog, InMemoryCatalog};
@@ -15825,7 +15955,7 @@ mod bind_direct_fastpath_tests {
     use object_store::local::LocalFileSystem;
     use tempfile::TempDir;
 
-    use super::{BindInsertPlan, INSERTS_BIND_DIRECT_FASTPATH, try_insert_bind_direct};
+    use super::{try_insert_bind_direct, BindInsertPlan, INSERTS_BIND_DIRECT_FASTPATH};
     use crate::prepared::ScalarParam;
     use crate::{Engine, EngineConfig, ExecResult};
 
@@ -16136,7 +16266,10 @@ mod statement_timeout_tests {
 
         // The connection must remain usable: a fast query on the same session
         // succeeds immediately after the cancellation.
-        let res = sess.execute("SELECT 1").await.expect("session still usable");
+        let res = sess
+            .execute("SELECT 1")
+            .await
+            .expect("session still usable");
         assert!(matches!(res, ExecResult::Rows { .. }));
     }
 
@@ -16440,7 +16573,11 @@ mod statement_timeout_guc_tests {
             page_cache: None,
         });
         let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-        Engine::new(EngineConfig { storage, catalog, shard: None })
+        Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        })
     }
 
     /// `SET statement_timeout = '5s'` must be accepted and stored on the session.
@@ -16533,7 +16670,10 @@ mod statement_timeout_guc_tests {
             .execute("SELECT pg_sleep(0)")
             .await
             .expect("pg_sleep(0) must be registered and callable");
-        assert!(matches!(res, ExecResult::Rows { .. }), "expected Rows result");
+        assert!(
+            matches!(res, ExecResult::Rows { .. }),
+            "expected Rows result"
+        );
     }
 }
 
@@ -16648,7 +16788,10 @@ mod pg_cancel_backend_tests {
                 .as_any()
                 .downcast_ref::<arrow_array::BooleanArray>()
                 .expect("result column must be boolean");
-            assert!(col.value(0), "pg_cancel_backend must return true for a live pid");
+            assert!(
+                col.value(0),
+                "pg_cancel_backend must return true for a live pid"
+            );
         } else {
             panic!("expected Rows from pg_cancel_backend");
         }
@@ -16680,7 +16823,10 @@ mod pg_cancel_backend_tests {
                 .as_any()
                 .downcast_ref::<arrow_array::BooleanArray>()
                 .expect("result column must be boolean");
-            assert!(!col.value(0), "pg_cancel_backend must return false for unknown pid");
+            assert!(
+                !col.value(0),
+                "pg_cancel_backend must return false for unknown pid"
+            );
         } else {
             panic!("expected Rows from pg_cancel_backend");
         }
@@ -16715,7 +16861,11 @@ mod lock_timeout_guc_tests {
             page_cache: None,
         });
         let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-        Engine::new(EngineConfig { storage, catalog, shard: None })
+        Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        })
     }
 
     /// `SET lock_timeout = '500ms'` must be accepted and stored on the session.
@@ -16774,9 +16924,7 @@ mod lock_timeout_guc_tests {
         let dir = TempDir::new().unwrap();
         let eng = make_engine(&dir);
         let sess = eng.open_session(ProjectId::new()).await.unwrap();
-        sess.execute("SET lock_timeout = '300ms'")
-            .await
-            .unwrap();
+        sess.execute("SET lock_timeout = '300ms'").await.unwrap();
         let res = sess
             .execute("SHOW lock_timeout")
             .await
@@ -17014,7 +17162,10 @@ mod table_meta_cache_tests {
             "first SELECT populates the cache for the touched table"
         );
         assert!(
-            sess.state.table_meta_cache.get_fresh(&tbl, sess.engine.config().catalog.epoch()).is_some(),
+            sess.state
+                .table_meta_cache
+                .get_fresh(&tbl, sess.engine.config().catalog.epoch())
+                .is_some(),
             "first SELECT must leave a fresh cache entry"
         );
 
@@ -17030,7 +17181,10 @@ mod table_meta_cache_tests {
             "second SELECT must reuse the cached entry — no new keys"
         );
         assert!(
-            sess.state.table_meta_cache.get_fresh(&tbl, sess.engine.config().catalog.epoch()).is_some(),
+            sess.state
+                .table_meta_cache
+                .get_fresh(&tbl, sess.engine.config().catalog.epoch())
+                .is_some(),
             "cache entry stays fresh inside the TTL window"
         );
     }
@@ -17063,7 +17217,10 @@ mod table_meta_cache_tests {
             .unwrap();
         let tbl = TableName::new("pkidx").unwrap();
         assert!(
-            sess.state.table_meta_cache.get_fresh(&tbl, sess.engine.config().catalog.epoch()).is_some(),
+            sess.state
+                .table_meta_cache
+                .get_fresh(&tbl, sess.engine.config().catalog.epoch())
+                .is_some(),
             "SELECT must populate the cache"
         );
 
@@ -17111,9 +17268,7 @@ mod table_meta_cache_tests {
     /// `OnceLock`.
     #[tokio::test]
     async fn table_meta_cache_ttl_expires() {
-        let _g = crate::session::test_meta_cache_ttl_override::install(
-            Duration::from_millis(1),
-        );
+        let _g = crate::session::test_meta_cache_ttl_override::install(Duration::from_millis(1));
 
         let dir = TempDir::new().unwrap();
         let eng = make_engine(&dir);
@@ -17140,7 +17295,10 @@ mod table_meta_cache_tests {
         // The entry exists in the map (insert succeeded) but is stale
         // → `get_fresh` returns `None`. Underlying LRU is unchanged
         // until the next `insert`, which is the documented behaviour.
-        let stale = sess.state.table_meta_cache.get_fresh(&tbl, sess.engine.config().catalog.epoch());
+        let stale = sess
+            .state
+            .table_meta_cache
+            .get_fresh(&tbl, sess.engine.config().catalog.epoch());
         assert!(
             stale.is_none(),
             "1ms TTL must expire after 20ms sleep — got {stale:?}"
@@ -17502,8 +17660,8 @@ mod upsert_fastpath_tests {
 // (which the fast path is required to reproduce byte-for-byte).
 #[cfg(test)]
 mod point_select_bind_direct_tests {
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
 
     use basin_catalog::{Catalog, InMemoryCatalog};
     use basin_common::ProjectId;
@@ -17548,11 +17706,9 @@ mod point_select_bind_direct_tests {
                     let opts = arrow::util::display::FormatOptions::default();
                     for r in 0..b.num_rows() {
                         for c in 0..b.num_columns() {
-                            let fmt = arrow::util::display::ArrayFormatter::try_new(
-                                b.column(c),
-                                &opts,
-                            )
-                            .unwrap();
+                            let fmt =
+                                arrow::util::display::ArrayFormatter::try_new(b.column(c), &opts)
+                                    .unwrap();
                             out.push_str(&fmt.value(r).to_string());
                             out.push('|');
                         }
@@ -17657,7 +17813,10 @@ mod point_select_bind_direct_tests {
         // converter DECLINES `Null` (it is the always_empty shape, a different
         // path), so this falls through to the normal route, which returns zero
         // rows. We assert the fallback result is empty (correctness preserved).
-        let (h, _s) = sess.prepare("SELECT k, v FROM kv WHERE k = $1").await.unwrap();
+        let (h, _s) = sess
+            .prepare("SELECT k, v FROM kv WHERE k = $1")
+            .await
+            .unwrap();
         let bound = sess.bind(&h, vec![ScalarParam::Null]).await.unwrap();
         match sess.execute_bound(bound).await.unwrap() {
             ExecResult::Rows { batches, .. } => {
@@ -17709,12 +17868,18 @@ mod point_select_bind_direct_tests {
         sess.execute("INSERT INTO t (id, s) VALUES (1, 'a')")
             .await
             .unwrap();
-        let (handle, _s) = sess.prepare("SELECT id, s FROM t WHERE id = $1").await.unwrap();
+        let (handle, _s) = sess
+            .prepare("SELECT id, s FROM t WHERE id = $1")
+            .await
+            .unwrap();
 
         sess.execute("BEGIN").await.unwrap();
         // In-tx → the bind-direct path declines (pin machinery lives on the
         // normal route); the fallback returns the row.
-        let bound = sess.bind(&handle, vec![ScalarParam::Int8(1)]).await.unwrap();
+        let bound = sess
+            .bind(&handle, vec![ScalarParam::Int8(1)])
+            .await
+            .unwrap();
         let res = sess.execute_bound(bound).await.unwrap();
         match res {
             ExecResult::Rows { batches, .. } => {
@@ -17742,14 +17907,36 @@ mod point_select_bind_direct_tests {
             .unwrap();
 
         // First execute engages and returns row 1.
-        let b1 = sess.bind(&handle, vec![ScalarParam::Int8(1)]).await.unwrap();
+        let b1 = sess
+            .bind(&handle, vec![ScalarParam::Int8(1)])
+            .await
+            .unwrap();
         let r1 = sess.execute_bound(b1).await.unwrap();
-        assert_eq!(rows_repr(&r1), rows_repr(&sess.execute("SELECT id, s FROM t WHERE id = 1").await.unwrap()));
+        assert_eq!(
+            rows_repr(&r1),
+            rows_repr(
+                &sess
+                    .execute("SELECT id, s FROM t WHERE id = 1")
+                    .await
+                    .unwrap()
+            )
+        );
 
         // Re-bind a DIFFERENT param on the SAME prepared statement → row 2.
-        let b2 = sess.bind(&handle, vec![ScalarParam::Int8(2)]).await.unwrap();
+        let b2 = sess
+            .bind(&handle, vec![ScalarParam::Int8(2)])
+            .await
+            .unwrap();
         let r2 = sess.execute_bound(b2).await.unwrap();
-        assert_eq!(rows_repr(&r2), rows_repr(&sess.execute("SELECT id, s FROM t WHERE id = 2").await.unwrap()));
+        assert_eq!(
+            rows_repr(&r2),
+            rows_repr(
+                &sess
+                    .execute("SELECT id, s FROM t WHERE id = 2")
+                    .await
+                    .unwrap()
+            )
+        );
 
         // DDL that adds a column: the cached plan's read_cols/projection are
         // still valid (they reference existing columns); the path must keep
@@ -17757,11 +17944,19 @@ mod point_select_bind_direct_tests {
         sess.execute("ALTER TABLE t ADD COLUMN extra TEXT")
             .await
             .unwrap();
-        let b3 = sess.bind(&handle, vec![ScalarParam::Int8(1)]).await.unwrap();
+        let b3 = sess
+            .bind(&handle, vec![ScalarParam::Int8(1)])
+            .await
+            .unwrap();
         let r3 = sess.execute_bound(b3).await.unwrap();
         assert_eq!(
             rows_repr(&r3),
-            rows_repr(&sess.execute("SELECT id, s FROM t WHERE id = 1").await.unwrap()),
+            rows_repr(
+                &sess
+                    .execute("SELECT id, s FROM t WHERE id = 1")
+                    .await
+                    .unwrap()
+            ),
             "point SELECT must re-resolve against the post-DDL schema"
         );
     }
@@ -17787,9 +17982,11 @@ mod point_select_bind_direct_tests {
         sess.execute("CREATE TABLE m (id BIGINT PRIMARY KEY, amt NUMERIC(10,2), doc JSONB)")
             .await
             .unwrap();
-        sess.execute("INSERT INTO m (id, amt, doc) VALUES (1, 12.34, '{\"k\":1}'), (2, 0.50, '{\"k\":2}')")
-            .await
-            .unwrap();
+        sess.execute(
+            "INSERT INTO m (id, amt, doc) VALUES (1, 12.34, '{\"k\":1}'), (2, 0.50, '{\"k\":2}')",
+        )
+        .await
+        .unwrap();
         assert_bind_eq_text(
             &sess,
             "SELECT id, amt, doc FROM m WHERE id = $1",
@@ -17835,7 +18032,9 @@ mod point_select_bind_direct_tests {
             .unwrap();
         let via_bind = sess.execute_bound(bound).await.unwrap();
         let via_text = sess
-            .execute(&format!("SELECT ts, s FROM ev WHERE ts = '{ts_lit}'::timestamptz"))
+            .execute(&format!(
+                "SELECT ts, s FROM ev WHERE ts = '{ts_lit}'::timestamptz"
+            ))
             .await
             .unwrap();
         assert_eq!(
@@ -17855,9 +18054,11 @@ mod point_select_bind_direct_tests {
             .await
             .unwrap();
         for i in 0..1000_i64 {
-            sess.execute(&format!("INSERT INTO t (id, s, n) VALUES ({i}, 'row-{i}', {i})"))
-                .await
-                .unwrap();
+            sess.execute(&format!(
+                "INSERT INTO t (id, s, n) VALUES ({i}, 'row-{i}', {i})"
+            ))
+            .await
+            .unwrap();
         }
         let (handle, _s) = sess
             .prepare("SELECT id, s, n FROM t WHERE id = $1")
@@ -17866,9 +18067,15 @@ mod point_select_bind_direct_tests {
 
         const N: i64 = 10_000;
         // Warm both paths once.
-        let bw = sess.bind(&handle, vec![ScalarParam::Int8(0)]).await.unwrap();
+        let bw = sess
+            .bind(&handle, vec![ScalarParam::Int8(0)])
+            .await
+            .unwrap();
         let _ = sess.execute_bound(bw).await.unwrap();
-        let _ = sess.execute("SELECT id, s, n FROM t WHERE id = 0").await.unwrap();
+        let _ = sess
+            .execute("SELECT id, s, n FROM t WHERE id = 0")
+            .await
+            .unwrap();
 
         let t_text = std::time::Instant::now();
         for i in 0..N {
@@ -17883,7 +18090,10 @@ mod point_select_bind_direct_tests {
         let t_bind = std::time::Instant::now();
         for i in 0..N {
             let k = i % 1000;
-            let bound = sess.bind(&handle, vec![ScalarParam::Int8(k)]).await.unwrap();
+            let bound = sess
+                .bind(&handle, vec![ScalarParam::Int8(k)])
+                .await
+                .unwrap();
             let _ = sess.execute_bound(bound).await.unwrap();
         }
         let bind = t_bind.elapsed();
@@ -17912,8 +18122,8 @@ mod update_bind_direct_tests {
     //! engagement counter advances AND that the bind path is byte-for-byte
     //! identical to the text route for every SET-value type, the missing-row
     //! shape, post-DDL re-resolve, RLS tables, and inside an explicit tx.
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
 
     use basin_catalog::{Catalog, InMemoryCatalog};
     use basin_common::ProjectId;
@@ -18084,7 +18294,10 @@ mod update_bind_direct_tests {
             "INSERT INTO ta (id, ts) VALUES (1, '2020-01-01T00:00:00+00')",
             "INSERT INTO tb (id, ts) VALUES (1, '2020-01-01T00:00:00+00')",
             "UPDATE ta SET ts = $2 WHERE id = $1",
-            vec![ScalarParam::Int8(1), ScalarParam::Timestamptz(1_767_323_045_000_000)],
+            vec![
+                ScalarParam::Int8(1),
+                ScalarParam::Timestamptz(1_767_323_045_000_000),
+            ],
             "UPDATE tb SET ts = '2026-01-02T03:04:05+00'::timestamptz WHERE id = 1",
             "SELECT ts FROM ta WHERE id = 1",
             "SELECT ts FROM tb WHERE id = 1",
@@ -18295,7 +18508,10 @@ mod update_bind_direct_tests {
             .bind(&handle, vec![ScalarParam::Int8(1), ScalarParam::Int8(111)])
             .await
             .unwrap();
-        assert_eq!(tag_of(&sess.execute_bound(bound).await.unwrap()), "UPDATE 1");
+        assert_eq!(
+            tag_of(&sess.execute_bound(bound).await.unwrap()),
+            "UPDATE 1"
+        );
         // Visible within the tx.
         assert_eq!(
             dump(&sess, "SELECT id, n FROM t WHERE id = 1").await,
@@ -18339,7 +18555,10 @@ mod update_bind_direct_tests {
             .await
             .unwrap();
         let _ = sess.execute_bound(bw).await.unwrap();
-        let _ = sess.execute("UPDATE t SET n = 0 WHERE id = 0").await.unwrap();
+        let _ = sess
+            .execute("UPDATE t SET n = 0 WHERE id = 0")
+            .await
+            .unwrap();
 
         let t_text = std::time::Instant::now();
         for i in 0..N {

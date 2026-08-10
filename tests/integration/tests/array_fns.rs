@@ -635,7 +635,10 @@ async fn insert_pg_curly_array_literals() {
         vec!["c", "d"],
     );
     // Empty array unnests to zero rows.
-    let empty = match sess.execute("SELECT unnest(tags) FROM arr_t WHERE id = 1").await {
+    let empty = match sess
+        .execute("SELECT unnest(tags) FROM arr_t WHERE id = 1")
+        .await
+    {
         Ok(ExecResult::Rows { batches, .. }) => batches.iter().map(|b| b.num_rows()).sum::<usize>(),
         Ok(ExecResult::Empty { .. }) => 0,
         other => panic!("unexpected for empty-array unnest: {other:?}"),
@@ -643,6 +646,12 @@ async fn insert_pg_curly_array_literals() {
     assert_eq!(empty, 0, "empty array must unnest to zero rows");
     // Quoted comma + NULL element preserved.
     let id3 = multi_str(&sess, "SELECT unnest(tags) FROM arr_t WHERE id = 3").await;
-    assert!(id3.contains(&"x,y".to_string()), "quoted-comma element preserved, got {id3:?}");
-    assert!(id3.contains(&"<NULL>".to_string()), "NULL element preserved, got {id3:?}");
+    assert!(
+        id3.contains(&"x,y".to_string()),
+        "quoted-comma element preserved, got {id3:?}"
+    );
+    assert!(
+        id3.contains(&"<NULL>".to_string()),
+        "NULL element preserved, got {id3:?}"
+    );
 }

@@ -56,13 +56,17 @@ async fn session(engine: &Engine) -> ProjectSession {
 /// `build_basin_engine()` in `compare_postgres_common.rs`). The shard write
 /// path is a separate INSERT codepath from the legacy synchronous one; the
 /// bench-shape `-1.0` (ROLLBACK leak) was reported only on this path.
-async fn open_engine_with_shard() -> (TempDir, TempDir, Engine, basin_shard::ShardBackgroundHandle, Arc<dyn Wal>) {
+async fn open_engine_with_shard() -> (
+    TempDir,
+    TempDir,
+    Engine,
+    basin_shard::ShardBackgroundHandle,
+    Arc<dyn Wal>,
+) {
     let storage_dir = TempDir::new().unwrap();
     let wal_dir = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
-        object_store: Arc::new(
-            LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
-        ),
+        object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
         root_prefix: None,
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
@@ -70,9 +74,7 @@ async fn open_engine_with_shard() -> (TempDir, TempDir, Engine, basin_shard::Sha
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let wal: Arc<dyn Wal> = Arc::new(
         LocalWal::open(WalConfig {
-            object_store: Arc::new(
-                LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap(),
-            ),
+            object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
@@ -81,7 +83,11 @@ async fn open_engine_with_shard() -> (TempDir, TempDir, Engine, basin_shard::Sha
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -165,7 +171,10 @@ async fn rollback_preserves_earlier_committed_inserts() {
     // rows (the other way the same bug could manifest).
     let n1 = count(&sess, "SELECT COUNT(*) FROM t WHERE id = 1").await;
     let n3 = count(&sess, "SELECT COUNT(*) FROM t WHERE id = 3").await;
-    assert_eq!(n1, 1, "id=1 was committed and must survive ROLLBACK of a later txn");
+    assert_eq!(
+        n1, 1,
+        "id=1 was committed and must survive ROLLBACK of a later txn"
+    );
     assert_eq!(n3, 0, "id=3 was inserted then rolled back — must be gone");
 }
 
@@ -186,7 +195,10 @@ async fn within_tx_reads_see_uncommitted_then_rollback_clears() {
         .unwrap();
     // Read-your-own-writes within the txn — PG semantics.
     let in_tx = count(&sess, "SELECT COUNT(*) FROM t").await;
-    assert_eq!(in_tx, 3, "within-tx SELECT must see uncommitted rows; saw {in_tx}");
+    assert_eq!(
+        in_tx, 3,
+        "within-tx SELECT must see uncommitted rows; saw {in_tx}"
+    );
 
     sess.execute("ROLLBACK").await.unwrap();
 
@@ -216,17 +228,25 @@ async fn rollback_undoes_update() {
         .unwrap();
 
     sess.execute("BEGIN").await.unwrap();
-    sess.execute("UPDATE t SET v = 999 WHERE id = 1").await.unwrap();
+    sess.execute("UPDATE t SET v = 999 WHERE id = 1")
+        .await
+        .unwrap();
     // Within-tx read sees the override.
     let in_tx = count(&sess, "SELECT COUNT(*) FROM t WHERE v = 999").await;
-    assert_eq!(in_tx, 1, "within-tx SELECT must see the UPDATE; saw {in_tx}");
+    assert_eq!(
+        in_tx, 1,
+        "within-tx SELECT must see the UPDATE; saw {in_tx}"
+    );
     sess.execute("ROLLBACK").await.unwrap();
 
     // Post-rollback: original 100 must be back, 999 must be gone.
     let still_100 = count(&sess, "SELECT COUNT(*) FROM t WHERE id = 1 AND v = 100").await;
     let leaked_999 = count(&sess, "SELECT COUNT(*) FROM t WHERE v = 999").await;
     assert_eq!(still_100, 1, "ROLLBACK must restore v=100 for id=1");
-    assert_eq!(leaked_999, 0, "ROLLBACK must drop v=999; saw {leaked_999} survivors");
+    assert_eq!(
+        leaked_999, 0,
+        "ROLLBACK must drop v=999; saw {leaked_999} survivors"
+    );
 }
 
 // ─── 5. ROLLBACK after DELETE: deleted rows must reappear ─────────────────
@@ -249,11 +269,17 @@ async fn rollback_undoes_delete() {
     sess.execute("BEGIN").await.unwrap();
     sess.execute("DELETE FROM t WHERE id = 2").await.unwrap();
     let in_tx = count(&sess, "SELECT COUNT(*) FROM t").await;
-    assert_eq!(in_tx, 2, "within-tx SELECT must reflect the DELETE; saw {in_tx}");
+    assert_eq!(
+        in_tx, 2,
+        "within-tx SELECT must reflect the DELETE; saw {in_tx}"
+    );
     sess.execute("ROLLBACK").await.unwrap();
 
     let after = count(&sess, "SELECT COUNT(*) FROM t").await;
-    assert_eq!(after, 3, "ROLLBACK must restore the deleted row; saw {after}");
+    assert_eq!(
+        after, 3,
+        "ROLLBACK must restore the deleted row; saw {after}"
+    );
     let id2 = count(&sess, "SELECT COUNT(*) FROM t WHERE id = 2").await;
     assert_eq!(id2, 1, "id=2 must reappear after ROLLBACK of the DELETE");
 }
@@ -288,7 +314,9 @@ async fn rollback_undoes_update_even_with_hottier_fastpath_envvar_on() {
     sess.execute("INSERT INTO t VALUES (1, 100)").await.unwrap();
 
     sess.execute("BEGIN").await.unwrap();
-    sess.execute("UPDATE t SET v = 999 WHERE id = 1").await.unwrap();
+    sess.execute("UPDATE t SET v = 999 WHERE id = 1")
+        .await
+        .unwrap();
     sess.execute("ROLLBACK").await.unwrap();
 
     let still_100 = count(&sess, "SELECT COUNT(*) FROM t WHERE id = 1 AND v = 100").await;
@@ -395,7 +423,10 @@ async fn bench_shape_rollback_drops_rows_exact_repro() {
 
     // Sanity: warmup committed 100 rows.
     let warm = count(&sess, "SELECT COUNT(*) FROM txnins").await;
-    assert_eq!(warm, 100, "warmup should have committed 100 rows; saw {warm}");
+    assert_eq!(
+        warm, 100,
+        "warmup should have committed 100 rows; saw {warm}"
+    );
 
     // #42 the test: BEGIN; INSERT (999999); ROLLBACK.
     sess.execute("BEGIN").await.unwrap();
@@ -412,7 +443,10 @@ async fn bench_shape_rollback_drops_rows_exact_repro() {
     );
     // And the committed 100 must still be intact.
     let total = count(&sess, "SELECT COUNT(*) FROM txnins").await;
-    assert_eq!(total, 100, "committed 100 rows must survive ROLLBACK; saw {total}");
+    assert_eq!(
+        total, 100,
+        "committed 100 rows must survive ROLLBACK; saw {total}"
+    );
 }
 
 // ─── 10. SAVEPOINT + ROLLBACK TO on shard-path INSERT ─────────────────────
@@ -446,7 +480,10 @@ async fn shard_path_savepoint_rollback_to_partial() {
 
     let a = count(&sess, "SELECT COUNT(*) FROM t WHERE id = 888001").await;
     let b = count(&sess, "SELECT COUNT(*) FROM t WHERE id = 888002").await;
-    assert_eq!(a, 1, "row inserted before SAVEPOINT must survive COMMIT; saw {a}");
+    assert_eq!(
+        a, 1,
+        "row inserted before SAVEPOINT must survive COMMIT; saw {a}"
+    );
     assert_eq!(
         b, 0,
         "row inserted after SAVEPOINT must be dropped by ROLLBACK TO; saw {b}"

@@ -62,7 +62,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use basin_catalog::{CdcWebhookDef, CdcWebhookRow, Catalog};
+use basin_catalog::{Catalog, CdcWebhookDef, CdcWebhookRow};
 use basin_common::ProjectId;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -178,8 +178,7 @@ pub fn mint_secret_hex() -> String {
 /// (non-hex) is treated as raw UTF-8 bytes so signing never panics.
 pub fn sign_body(secret_hex: &str, body: &[u8]) -> String {
     let key = hex::decode(secret_hex).unwrap_or_else(|_| secret_hex.as_bytes().to_vec());
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key)
-        .expect("HMAC accepts any key length");
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key).expect("HMAC accepts any key length");
     mac.update(body);
     hex::encode(mac.finalize().into_bytes())
 }
@@ -374,8 +373,11 @@ async fn run_supervisor(
     loop {
         tick.tick().await;
         let rows = catalog.list_cdc_webhooks(&project).await;
-        let live_ids: std::collections::HashSet<String> =
-            rows.iter().filter(|r| r.def.active).map(|r| r.def.id.clone()).collect();
+        let live_ids: std::collections::HashSet<String> = rows
+            .iter()
+            .filter(|r| r.def.active)
+            .map(|r| r.def.id.clone())
+            .collect();
 
         // Reap tasks for endpoints that are gone or no longer active.
         tasks.retain(|id, h| {

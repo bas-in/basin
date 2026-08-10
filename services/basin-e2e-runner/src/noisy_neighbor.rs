@@ -14,8 +14,8 @@
 //!   PASS — Bob's p99 stayed within budget during Alice's burst.
 //!   FAIL — Bob's p99 exceeded budget; indicates a fairness regression.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -156,7 +156,10 @@ async fn run_inner(args: &Args) -> Result<WorkloadReport> {
 
     // Wait for Alice to complete.
     alice_handle.await??;
-    info!("noisy-neighbor: Alice burst complete; Bob collected {} samples", bob_samples.len());
+    info!(
+        "noisy-neighbor: Alice burst complete; Bob collected {} samples",
+        bob_samples.len()
+    );
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
     bob.simple_query(&format!("DROP TABLE IF EXISTS {BOB_TABLE}"))

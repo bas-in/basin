@@ -47,7 +47,10 @@ mod common;
 use common::{build_basin_engine, median, payload_for, try_connect, SchemaGuard};
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn write_artifact(file: &str, value: &serde_json::Value) {
@@ -115,10 +118,15 @@ async fn basin_p50(sess: &basin_engine::ProjectSession, sql: &str, n: usize) -> 
 }
 
 async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f64> {
-    let _ = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await;
+    let _ = pg
+        .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+        .await;
     let mut s = Vec::with_capacity(n);
     for _ in 0..n {
-        if let Ok(rs) = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await {
+        if let Ok(rs) = pg
+            .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+            .await
+        {
             for m in &rs {
                 if let SimpleQueryMessage::Row(r) = m {
                     if let Some(line) = r.get(0) {
@@ -135,21 +143,42 @@ async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f6
             }
         }
     }
-    if s.is_empty() { None } else { Some(median(&s)) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(median(&s))
+    }
 }
 
 async fn pg_count(pg: &tokio_postgres::Client, sql: &str) -> i64 {
-    pg.query_one(sql, &[]).await.map(|r| r.get::<usize, i64>(0)).unwrap_or(-1)
+    pg.query_one(sql, &[])
+        .await
+        .map(|r| r.get::<usize, i64>(0))
+        .unwrap_or(-1)
 }
 
 /// Seed a `(id, payload)` JSONB table on Basin. Returns ingest seconds.
-async fn seed_basin_jsonb(sess: &basin_engine::ProjectSession, table: &str, rows: usize, with_gin: bool) -> (f64, bool) {
-    sess.execute(&format!("CREATE TABLE {table} (id BIGINT NOT NULL, payload JSONB NOT NULL)")).await.unwrap();
+async fn seed_basin_jsonb(
+    sess: &basin_engine::ProjectSession,
+    table: &str,
+    rows: usize,
+    with_gin: bool,
+) -> (f64, bool) {
+    sess.execute(&format!(
+        "CREATE TABLE {table} (id BIGINT NOT NULL, payload JSONB NOT NULL)"
+    ))
+    .await
+    .unwrap();
     let mut gin_ok = false;
     if with_gin {
         // Build GIN BEFORE the inserts so the write path pays the index cost
         // (this is what J6 "write-with-GIN overhead" measures).
-        gin_ok = sess.execute(&format!("CREATE INDEX {table}_gin ON {table} USING gin (payload)")).await.is_ok();
+        gin_ok = sess
+            .execute(&format!(
+                "CREATE INDEX {table}_gin ON {table} USING gin (payload)"
+            ))
+            .await
+            .is_ok();
     }
     let batch = 5_000usize;
     let mut off = 0usize;
@@ -180,15 +209,27 @@ async fn ext_bench_jsonb_gin() {
 
     // ── Basin: plain table (J6 baseline) ─────────────────────────────────────
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
 
     // J6 baseline: ingest WITHOUT a GIN index.
     let (plain_ingest_s, _) = seed_basin_jsonb(&sess, "docs_plain", rows, false).await;
-    let basin_plain_rate = if plain_ingest_s > 0.0 { rows as f64 / plain_ingest_s } else { 0.0 };
+    let basin_plain_rate = if plain_ingest_s > 0.0 {
+        rows as f64 / plain_ingest_s
+    } else {
+        0.0
+    };
 
     // J6 overhead: ingest WITH a GIN index from the start.
     let (gin_ingest_s, gin_ddl_ok) = seed_basin_jsonb(&sess, "docs_gin", rows, true).await;
-    let basin_gin_rate = if gin_ingest_s > 0.0 { rows as f64 / gin_ingest_s } else { 0.0 };
+    let basin_gin_rate = if gin_ingest_s > 0.0 {
+        rows as f64 / gin_ingest_s
+    } else {
+        0.0
+    };
     let basin_write_overhead_pct = if basin_gin_rate > 0.0 && basin_plain_rate > 0.0 {
         (basin_plain_rate / basin_gin_rate - 1.0) * 100.0
     } else {
@@ -198,8 +239,15 @@ async fn ext_bench_jsonb_gin() {
     // J5: GIN build time over the plain table (build the index after the fact).
     let j5_build_s = {
         let t = Instant::now();
-        let ok = sess.execute("CREATE INDEX docs_plain_gin ON docs_plain USING gin (payload)").await.is_ok();
-        if ok { Some(t.elapsed().as_secs_f64()) } else { None }
+        let ok = sess
+            .execute("CREATE INDEX docs_plain_gin ON docs_plain USING gin (payload)")
+            .await
+            .is_ok();
+        if ok {
+            Some(t.elapsed().as_secs_f64())
+        } else {
+            None
+        }
     };
 
     instance.shard.flush_to_parquet().await.unwrap();
@@ -223,15 +271,30 @@ async fn ext_bench_jsonb_gin() {
     let j4_sql = "SELECT count(*) FROM docs_gin WHERE jsonb_path_exists(payload, '$.tags[*] ? (@ == \"blue\")')";
 
     let j1_b = basin_p50(&sess, j1_sql, samples).await;
-    let j1_count = sess.execute(j1_sql).await.map(|r| basin_count(&r)).unwrap_or(-1);
+    let j1_count = sess
+        .execute(j1_sql)
+        .await
+        .map(|r| basin_count(&r))
+        .unwrap_or(-1);
     let j2_b = basin_p50(&sess, j2_sql, samples).await;
-    let j2_count = sess.execute(j2_sql).await.map(|r| basin_count(&r)).unwrap_or(-1);
+    let j2_count = sess
+        .execute(j2_sql)
+        .await
+        .map(|r| basin_count(&r))
+        .unwrap_or(-1);
     let j3_b = basin_p50(&sess, j3_sql, samples).await;
-    let j3_count = sess.execute(j3_sql).await.map(|r| basin_count(&r)).unwrap_or(-1);
+    let j3_count = sess
+        .execute(j3_sql)
+        .await
+        .map(|r| basin_count(&r))
+        .unwrap_or(-1);
     let j4_b = basin_p50(&sess, j4_sql, samples).await;
     let j4_supported = j4_b.is_some();
     let j4_count = if j4_supported {
-        sess.execute(j4_sql).await.map(|r| basin_count(&r)).unwrap_or(-1)
+        sess.execute(j4_sql)
+            .await
+            .map(|r| basin_count(&r))
+            .unwrap_or(-1)
     } else {
         -1
     };
@@ -257,13 +320,24 @@ async fn ext_bench_jsonb_gin() {
         pg_available = true;
         let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
         let schema = format!("basin_ext_jsonb_{suffix}");
-        let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-        pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.ok();
+        let _guard = SchemaGuard {
+            schema: schema.clone(),
+            conn_str: cs,
+        };
+        pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .ok();
         pg.simple_query("SET work_mem = '32MB'").await.ok();
-        pg.simple_query("SET maintenance_work_mem = '128MB'").await.ok();
+        pg.simple_query("SET maintenance_work_mem = '128MB'")
+            .await
+            .ok();
 
         // J6 baseline ingest (no index).
-        pg.simple_query(&format!("CREATE TABLE {schema}.docs_plain (id BIGINT, payload JSONB NOT NULL)")).await.ok();
+        pg.simple_query(&format!(
+            "CREATE TABLE {schema}.docs_plain (id BIGINT, payload JSONB NOT NULL)"
+        ))
+        .await
+        .ok();
         let seed_pg = |client_off: usize, client_hi: usize| {
             let mut stmt = String::with_capacity((client_hi - client_off) * 256);
             for k in client_off..client_hi {
@@ -280,24 +354,50 @@ async fn ext_bench_jsonb_gin() {
         let mut po = 0usize;
         while po < rows {
             let hi = (po + batch).min(rows);
-            pg.simple_query(&format!("INSERT INTO {schema}.docs_plain VALUES {}", seed_pg(po, hi))).await.ok();
+            pg.simple_query(&format!(
+                "INSERT INTO {schema}.docs_plain VALUES {}",
+                seed_pg(po, hi)
+            ))
+            .await
+            .ok();
             po = hi;
         }
         let p1s = p1start.elapsed().as_secs_f64();
-        pg_plain_rate = if p1s > 0.0 { Some(rows as f64 / p1s) } else { None };
+        pg_plain_rate = if p1s > 0.0 {
+            Some(rows as f64 / p1s)
+        } else {
+            None
+        };
 
         // J6 with-GIN ingest.
-        pg.simple_query(&format!("CREATE TABLE {schema}.docs_gin (id BIGINT, payload JSONB NOT NULL)")).await.ok();
-        pg.simple_query(&format!("CREATE INDEX docs_gin_gin ON {schema}.docs_gin USING gin (payload)")).await.ok();
+        pg.simple_query(&format!(
+            "CREATE TABLE {schema}.docs_gin (id BIGINT, payload JSONB NOT NULL)"
+        ))
+        .await
+        .ok();
+        pg.simple_query(&format!(
+            "CREATE INDEX docs_gin_gin ON {schema}.docs_gin USING gin (payload)"
+        ))
+        .await
+        .ok();
         let p2start = Instant::now();
         let mut po = 0usize;
         while po < rows {
             let hi = (po + batch).min(rows);
-            pg.simple_query(&format!("INSERT INTO {schema}.docs_gin VALUES {}", seed_pg(po, hi))).await.ok();
+            pg.simple_query(&format!(
+                "INSERT INTO {schema}.docs_gin VALUES {}",
+                seed_pg(po, hi)
+            ))
+            .await
+            .ok();
             po = hi;
         }
         let p2s = p2start.elapsed().as_secs_f64();
-        pg_gin_rate = if p2s > 0.0 { Some(rows as f64 / p2s) } else { None };
+        pg_gin_rate = if p2s > 0.0 {
+            Some(rows as f64 / p2s)
+        } else {
+            None
+        };
         if let (Some(plain), Some(gin)) = (pg_plain_rate, pg_gin_rate) {
             if gin > 0.0 {
                 pg_write_overhead_pct = Some((plain / gin - 1.0) * 100.0);
@@ -306,27 +406,42 @@ async fn ext_bench_jsonb_gin() {
 
         // J5 GIN build time over docs_plain.
         let b5 = Instant::now();
-        pg.simple_query(&format!("CREATE INDEX docs_plain_gin ON {schema}.docs_plain USING gin (payload)")).await.ok();
+        pg.simple_query(&format!(
+            "CREATE INDEX docs_plain_gin ON {schema}.docs_plain USING gin (payload)"
+        ))
+        .await
+        .ok();
         pg_j5_build_s = Some(b5.elapsed().as_secs_f64());
-        pg.simple_query(&format!("ANALYZE {schema}.docs_gin")).await.ok();
+        pg.simple_query(&format!("ANALYZE {schema}.docs_gin"))
+            .await
+            .ok();
 
         pg_j1_count = pg_count(&pg, &format!(
             "SELECT count(*)::bigint FROM {schema}.docs_gin WHERE payload @> '{{\"category\":\"purchase\",\"metadata\":{{\"campaign\":\"referral\"}}}}'")).await;
         pg_j2_count = pg_count(&pg, &format!(
             "SELECT count(*)::bigint FROM {schema}.docs_gin WHERE payload @> '{{\"category\":\"purchase\"}}'")).await;
-        pg_j3_count = pg_count(&pg, &format!(
-            "SELECT count(*)::bigint FROM {schema}.docs_gin WHERE payload ? 'metadata'")).await;
+        pg_j3_count = pg_count(
+            &pg,
+            &format!("SELECT count(*)::bigint FROM {schema}.docs_gin WHERE payload ? 'metadata'"),
+        )
+        .await;
 
         pg_j1 = pg_p50(&pg, &format!(
             "SELECT count(*) FROM {schema}.docs_gin WHERE payload @> '{{\"category\":\"purchase\",\"metadata\":{{\"campaign\":\"referral\"}}}}'"), samples).await;
         pg_j2 = pg_p50(&pg, &format!(
             "SELECT count(*) FROM {schema}.docs_gin WHERE payload @> '{{\"category\":\"purchase\"}}'"), samples).await;
-        pg_j3 = pg_p50(&pg, &format!(
-            "SELECT count(*) FROM {schema}.docs_gin WHERE payload ? 'metadata'"), samples).await;
+        pg_j3 = pg_p50(
+            &pg,
+            &format!("SELECT count(*) FROM {schema}.docs_gin WHERE payload ? 'metadata'"),
+            samples,
+        )
+        .await;
         pg_j4 = pg_p50(&pg, &format!(
             "SELECT count(*) FROM {schema}.docs_gin WHERE jsonb_path_exists(payload, '$.tags[*] ? (@ == \"blue\")')"), samples).await;
 
-        let _ = pg.simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+        let _ = pg
+            .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await;
         std::mem::forget(_guard);
     } else {
         eprintln!("[ext_bench_jsonb_gin] PG unavailable — Basin-only card");
@@ -335,56 +450,71 @@ async fn ext_bench_jsonb_gin() {
     // ── Correctness cross-check ───────────────────────────────────────────────
     if pg_available {
         if j1_count >= 0 && pg_j1_count >= 0 {
-            assert_eq!(j1_count, pg_j1_count, "J1 @> rare count mismatch: basin {j1_count} != pg {pg_j1_count}");
+            assert_eq!(
+                j1_count, pg_j1_count,
+                "J1 @> rare count mismatch: basin {j1_count} != pg {pg_j1_count}"
+            );
         }
         if j2_count >= 0 && pg_j2_count >= 0 {
-            assert_eq!(j2_count, pg_j2_count, "J2 @> common count mismatch: basin {j2_count} != pg {pg_j2_count}");
+            assert_eq!(
+                j2_count, pg_j2_count,
+                "J2 @> common count mismatch: basin {j2_count} != pg {pg_j2_count}"
+            );
         }
         if j3_count >= 0 && pg_j3_count >= 0 {
-            assert_eq!(j3_count, pg_j3_count, "J3 ? existence count mismatch: basin {j3_count} != pg {pg_j3_count}");
+            assert_eq!(
+                j3_count, pg_j3_count,
+                "J3 ? existence count mismatch: basin {j3_count} != pg {pg_j3_count}"
+            );
         }
     }
 
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("ext_bench_jsonb_gin.json", &json!({
-        "card": "ext_bench_jsonb_gin",
-        "family": "jsonb_gin",
-        "generated_at": format!("@{ts}"),
-        "pg_available": pg_available,
-        "pg_extension_available": pg_available,
-        "basin_gin_ddl_ok": gin_ddl_ok,
-        "config": { "rows": rows, "samples": samples },
-        "build": {
-            "label": "J5: GIN build time over payloads (s)",
-            "basin_build_s": j5_build_s,
-            "pg_build_s": pg_j5_build_s,
-        },
-        "write_overhead": {
-            "label": "J6: write-with-GIN ingest overhead (%)",
-            "basin_plain_rows_per_s": basin_plain_rate,
-            "basin_gin_rows_per_s": basin_gin_rate,
-            "basin_overhead_pct": if basin_write_overhead_pct.is_finite() { json!(basin_write_overhead_pct) } else { serde_json::Value::Null },
-            "pg_plain_rows_per_s": pg_plain_rate,
-            "pg_gin_rows_per_s": pg_gin_rate,
-            "pg_overhead_pct": pg_write_overhead_pct,
-        },
-        "shapes": [
-            { "label": "J1: @> rare needle (low density)", "basin_p50_ms": opt_ms(j1_b), "pg_p50_ms": opt_ms(pg_j1),
-              "basin_over_pg": ratio(j1_b, pg_j1), "basin_hits": j1_count, "pg_hits": pg_j1_count,
-              "basin_uses_gin": gin_ddl_ok, "pg_uses_gin": pg_available },
-            { "label": "J2: @> common needle (high density)", "basin_p50_ms": opt_ms(j2_b), "pg_p50_ms": opt_ms(pg_j2),
-              "basin_over_pg": ratio(j2_b, pg_j2), "basin_hits": j2_count, "pg_hits": pg_j2_count },
-            { "label": "J3: ? key existence", "basin_p50_ms": opt_ms(j3_b), "pg_p50_ms": opt_ms(pg_j3),
-              "basin_over_pg": ratio(j3_b, pg_j3), "basin_hits": j3_count, "pg_hits": pg_j3_count },
-            { "label": "J4: jsonb_path_exists deep filter", "basin_supported": j4_supported,
-              "basin_p50_ms": opt_ms(j4_b), "pg_p50_ms": opt_ms(pg_j4), "basin_over_pg": ratio(j4_b, pg_j4),
-              "basin_hits": j4_count },
-        ],
-        "note": "JSONB-GIN is core PostgreSQL (no extension). Basin uses a per-(key,value) \
-                 posting-list row-group prune behind CREATE INDEX … USING gin (payload); PG \
-                 uses a jsonb_ops GIN index. @> / ? counts are hard-asserted equal across \
-                 engines. J6 measures ingest-rate degradation from maintaining the GIN index \
-                 (plain-table ingest vs with-GIN ingest). jsonb_path_exists is probed — if \
-                 Basin cannot plan it the shape records basin_supported:false (card never fails).",
-    }));
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "ext_bench_jsonb_gin.json",
+        &json!({
+            "card": "ext_bench_jsonb_gin",
+            "family": "jsonb_gin",
+            "generated_at": format!("@{ts}"),
+            "pg_available": pg_available,
+            "pg_extension_available": pg_available,
+            "basin_gin_ddl_ok": gin_ddl_ok,
+            "config": { "rows": rows, "samples": samples },
+            "build": {
+                "label": "J5: GIN build time over payloads (s)",
+                "basin_build_s": j5_build_s,
+                "pg_build_s": pg_j5_build_s,
+            },
+            "write_overhead": {
+                "label": "J6: write-with-GIN ingest overhead (%)",
+                "basin_plain_rows_per_s": basin_plain_rate,
+                "basin_gin_rows_per_s": basin_gin_rate,
+                "basin_overhead_pct": if basin_write_overhead_pct.is_finite() { json!(basin_write_overhead_pct) } else { serde_json::Value::Null },
+                "pg_plain_rows_per_s": pg_plain_rate,
+                "pg_gin_rows_per_s": pg_gin_rate,
+                "pg_overhead_pct": pg_write_overhead_pct,
+            },
+            "shapes": [
+                { "label": "J1: @> rare needle (low density)", "basin_p50_ms": opt_ms(j1_b), "pg_p50_ms": opt_ms(pg_j1),
+                  "basin_over_pg": ratio(j1_b, pg_j1), "basin_hits": j1_count, "pg_hits": pg_j1_count,
+                  "basin_uses_gin": gin_ddl_ok, "pg_uses_gin": pg_available },
+                { "label": "J2: @> common needle (high density)", "basin_p50_ms": opt_ms(j2_b), "pg_p50_ms": opt_ms(pg_j2),
+                  "basin_over_pg": ratio(j2_b, pg_j2), "basin_hits": j2_count, "pg_hits": pg_j2_count },
+                { "label": "J3: ? key existence", "basin_p50_ms": opt_ms(j3_b), "pg_p50_ms": opt_ms(pg_j3),
+                  "basin_over_pg": ratio(j3_b, pg_j3), "basin_hits": j3_count, "pg_hits": pg_j3_count },
+                { "label": "J4: jsonb_path_exists deep filter", "basin_supported": j4_supported,
+                  "basin_p50_ms": opt_ms(j4_b), "pg_p50_ms": opt_ms(pg_j4), "basin_over_pg": ratio(j4_b, pg_j4),
+                  "basin_hits": j4_count },
+            ],
+            "note": "JSONB-GIN is core PostgreSQL (no extension). Basin uses a per-(key,value) \
+                     posting-list row-group prune behind CREATE INDEX … USING gin (payload); PG \
+                     uses a jsonb_ops GIN index. @> / ? counts are hard-asserted equal across \
+                     engines. J6 measures ingest-rate degradation from maintaining the GIN index \
+                     (plain-table ingest vs with-GIN ingest). jsonb_path_exists is probed — if \
+                     Basin cannot plan it the shape records basin_supported:false (card never fails).",
+        }),
+    );
 }

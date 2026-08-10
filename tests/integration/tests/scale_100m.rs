@@ -253,7 +253,9 @@ async fn scale_100m() {
     {
         Ok(_) => true,
         Err(e) => {
-            eprintln!("[100m] GIN index unavailable on this schema — containment shape skipped: {e:?}");
+            eprintln!(
+                "[100m] GIN index unavailable on this schema — containment shape skipped: {e:?}"
+            );
             false
         }
     };
@@ -387,7 +389,11 @@ async fn scale_100m() {
 
     // ── 2. Selective range filter — exact result + pruning stats ─────────────
     {
-        let window: i64 = if rows >= 4_000 { 1_000 } else { (rows / 4).max(1) };
+        let window: i64 = if rows >= 4_000 {
+            1_000
+        } else {
+            (rows / 4).max(1)
+        };
         let step = (rows / (2 * samples as i64).max(1)).max(1);
         let _ = probe(format!(
             "SELECT id, v FROM t WHERE id BETWEEN {} AND {} ORDER BY id",
@@ -594,10 +600,12 @@ async fn scale_100m() {
         // Correctness: v started equal to id; the first slice's anchor row
         // must have been incremented by at least one and at most `samples`
         // (clamping at tiny N can overlap slices) of the updates.
-        let v_after = ids_of(&sess
-            .execute(&format!("SELECT v FROM t WHERE id = {base}"))
-            .await
-            .unwrap());
+        let v_after = ids_of(
+            &sess
+                .execute(&format!("SELECT v FROM t WHERE id = {base}"))
+                .await
+                .unwrap(),
+        );
         assert_eq!(v_after.len(), 1, "anchor row must still exist after UPDATE");
         assert!(
             v_after[0] > base && v_after[0] <= base + samples as i64,

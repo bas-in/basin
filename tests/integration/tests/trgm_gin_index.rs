@@ -53,7 +53,11 @@ fn engine_in(dir: &TempDir) -> Engine {
         page_cache: None,
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    Engine::new(EngineConfig { storage, catalog, shard: None })
+    Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    })
 }
 
 async fn build_engine_with_shard() -> (TempDir, TempDir, Engine, Shard, Arc<dyn Wal>) {
@@ -77,7 +81,11 @@ async fn build_engine_with_shard() -> (TempDir, TempDir, Engine, Shard, Arc<dyn 
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let engine = Engine::new(EngineConfig {
         storage: storage.clone(),
         catalog: catalog.clone(),
@@ -119,8 +127,9 @@ async fn ids_for(sess: &ProjectSession, sql: &str) -> Vec<i64> {
 /// Deterministic synthetic name; ~1/13 rows carry the rare needle "zephyrine",
 /// many carry "smith"/"smyth". Mixed alphabet so trigram space is realistic.
 fn name_for(i: i64) -> String {
-    const FIRST: &[&str] =
-        &["alice", "alyce", "bob", "carol", "dave", "erin", "frank", "grace"];
+    const FIRST: &[&str] = &[
+        "alice", "alyce", "bob", "carol", "dave", "erin", "frank", "grace",
+    ];
     const LAST: &[&str] = &["smith", "smyth", "jones", "brown", "taylor"];
     let first = FIRST[(i as usize) % FIRST.len()];
     let last = LAST[((i as usize) / FIRST.len()) % LAST.len()];
@@ -149,11 +158,19 @@ async fn seed(dir: &TempDir, with_index: bool) -> (Engine, ProjectSession, Proje
             let nm = name_for(i).replace('\'', "''");
             vals.push(format!("({i}, '{nm}')"));
         }
-        exec(&sess, &format!("INSERT INTO people (id, name) VALUES {}", vals.join(", "))).await;
+        exec(
+            &sess,
+            &format!("INSERT INTO people (id, name) VALUES {}", vals.join(", ")),
+        )
+        .await;
         off = hi;
     }
     if with_index {
-        exec(&sess, "CREATE INDEX people_trgm ON people USING gin (name gin_trgm_ops)").await;
+        exec(
+            &sess,
+            "CREATE INDEX people_trgm ON people USING gin (name gin_trgm_ops)",
+        )
+        .await;
     }
     (eng, sess, project)
 }
@@ -163,7 +180,11 @@ async fn oracle_ids(query_tail: &str, threshold: f32) -> Vec<i64> {
     let dir = TempDir::new().unwrap();
     let (_eng, sess, _p) = seed(&dir, false).await;
     if (threshold - 0.3).abs() > f32::EPSILON {
-        exec(&sess, &format!("SET pg_trgm.similarity_threshold = {threshold}")).await;
+        exec(
+            &sess,
+            &format!("SET pg_trgm.similarity_threshold = {threshold}"),
+        )
+        .await;
     }
     ids_for(&sess, &format!("SELECT id FROM people WHERE {query_tail}")).await
 }
@@ -173,7 +194,11 @@ async fn indexed_ids(query_tail: &str, threshold: f32) -> Vec<i64> {
     let dir = TempDir::new().unwrap();
     let (_eng, sess, _p) = seed(&dir, true).await;
     if (threshold - 0.3).abs() > f32::EPSILON {
-        exec(&sess, &format!("SET pg_trgm.similarity_threshold = {threshold}")).await;
+        exec(
+            &sess,
+            &format!("SET pg_trgm.similarity_threshold = {threshold}"),
+        )
+        .await;
     }
     ids_for(&sess, &format!("SELECT id FROM people WHERE {query_tail}")).await
 }
@@ -242,17 +267,31 @@ async fn overlay_present_declines_but_correct() {
     let dir = TempDir::new().unwrap();
     let (_eng, sess, _p) = seed(&dir, true).await;
     // Flip id=1 to carry "zephyrine" (it did not before: 1 % 13 != 0).
-    exec(&sess, "UPDATE people SET name = 'zephyrine alice smith' WHERE id = 1").await;
+    exec(
+        &sess,
+        "UPDATE people SET name = 'zephyrine alice smith' WHERE id = 1",
+    )
+    .await;
     let got = ids_for(&sess, "SELECT id FROM people WHERE name % 'zephyrine'").await;
 
     // Oracle: rebuild the same data + the same update with NO index.
     let odir = TempDir::new().unwrap();
     let (_oe, osess, _op) = seed(&odir, false).await;
-    exec(&osess, "UPDATE people SET name = 'zephyrine alice smith' WHERE id = 1").await;
+    exec(
+        &osess,
+        "UPDATE people SET name = 'zephyrine alice smith' WHERE id = 1",
+    )
+    .await;
     let oracle = ids_for(&osess, "SELECT id FROM people WHERE name % 'zephyrine'").await;
 
-    assert_eq!(got, oracle, "overlay-present read must equal full-scan oracle");
-    assert!(got.contains(&1), "the updated row must appear in the match set");
+    assert_eq!(
+        got, oracle,
+        "overlay-present read must equal full-scan oracle"
+    );
+    assert!(
+        got.contains(&1),
+        "the updated row must appear in the match set"
+    );
 }
 
 #[tokio::test]
@@ -286,11 +325,19 @@ async fn post_flush_and_compaction_matches_oracle() {
     exec(&sess, "CREATE TABLE people (id bigint, name text)").await;
     for i in 0..ROWS {
         let nm = name_for(i).replace('\'', "''");
-        exec(&sess, &format!("INSERT INTO people (id, name) VALUES ({i}, '{nm}')")).await;
+        exec(
+            &sess,
+            &format!("INSERT INTO people (id, name) VALUES ({i}, '{nm}')"),
+        )
+        .await;
     }
     // Compact into Parquet, THEN build the index (backfill over cold files).
     shard.flush_to_parquet().await.unwrap();
-    exec(&sess, "CREATE INDEX people_trgm ON people USING gin (name gin_trgm_ops)").await;
+    exec(
+        &sess,
+        "CREATE INDEX people_trgm ON people USING gin (name gin_trgm_ops)",
+    )
+    .await;
 
     let table = TableName::new("people").unwrap();
     let reg = engine.gin_index_registry_for_test();
@@ -299,11 +346,14 @@ async fn post_flush_and_compaction_matches_oracle() {
         "post-compaction backfill must seal the compacted file"
     );
 
-    for tail in ["name % 'smith'", "name % 'zephyrine'", "name % 'alyce smyth'"] {
+    for tail in [
+        "name % 'smith'",
+        "name % 'zephyrine'",
+        "name % 'alyce smyth'",
+    ] {
         let got = ids_for(&sess, &format!("SELECT id FROM people WHERE {tail}")).await;
         let oracle = oracle_ids(tail, 0.3).await;
         assert_eq!(got, oracle, "post-compaction `{tail}` must equal oracle");
     }
     wal.close().await.unwrap();
 }
-

@@ -423,11 +423,7 @@ async fn admin_functions_deploy_list_cpu_delete_round_trip() {
     .await;
     assert_eq!(r.status, 200);
     let arr = r.json().as_array().cloned().unwrap_or_default();
-    assert!(
-        arr.is_empty(),
-        "no deploys yet → list empty, got {:?}",
-        arr
-    );
+    assert!(arr.is_empty(), "no deploys yet → list empty, got {:?}", arr);
 
     // 2. Deploy a tiny component.
     let body = serde_json::json!({
@@ -444,7 +440,8 @@ async fn admin_functions_deploy_list_cpu_delete_round_trip() {
     )
     .await;
     assert_eq!(
-        r.status, 201,
+        r.status,
+        201,
         "deploy should 201, got {} body: {}",
         r.status,
         String::from_utf8_lossy(&r.body)
@@ -499,7 +496,10 @@ async fn admin_functions_deploy_list_cpu_delete_round_trip() {
     let v = r.json();
     assert_eq!(v["name"], "hello");
     let lines = v["lines"].as_array().expect("lines array");
-    assert!(lines.is_empty(), "logs stub should return [] until basin-fn buffers");
+    assert!(
+        lines.is_empty(),
+        "logs stub should return [] until basin-fn buffers"
+    );
 
     // 6. Redeploy bumps version.
     let body = serde_json::json!({
@@ -528,7 +528,8 @@ async fn admin_functions_deploy_list_cpu_delete_round_trip() {
     )
     .await;
     assert_eq!(
-        r.status, 204,
+        r.status,
+        204,
         "delete should 204, got {} body: {}",
         r.status,
         String::from_utf8_lossy(&r.body)
@@ -717,9 +718,7 @@ async fn admin_functions_invoke_meters_cpu_and_logs() {
     let auth2 = ("Authorization", bearer_str.as_str());
 
     // Install the instrumented invoker globally so `/fn/v1/:name` routes here.
-    let harness = Arc::new(
-        HandlerHarness::new(&handler_bytes).expect("compile handler harness"),
-    );
+    let harness = Arc::new(HandlerHarness::new(&handler_bytes).expect("compile handler harness"));
     let invoker = Arc::new(InstrumentedInvoker::new(fn_registry));
     invoker.register(project, "meter_fn", harness);
     set_global_invoker(invoker);
@@ -740,7 +739,8 @@ async fn admin_functions_invoke_meters_cpu_and_logs() {
     )
     .await;
     assert_eq!(
-        r.status, 201,
+        r.status,
+        201,
         "deploy should 201; got {} body: {}",
         r.status,
         String::from_utf8_lossy(&r.body)
@@ -748,14 +748,7 @@ async fn admin_functions_invoke_meters_cpu_and_logs() {
 
     // 2. Invoke the function 3 times via `/fn/v1/meter_fn`.
     for i in 0..3 {
-        let r = http_request(
-            addr,
-            "POST",
-            "/fn/v1/meter_fn",
-            &[auth2],
-            Some(b"{}"),
-        )
-        .await;
+        let r = http_request(addr, "POST", "/fn/v1/meter_fn", &[auth2], Some(b"{}")).await;
         assert_eq!(
             r.status, 200,
             "invocation {} should 200; got {}",
@@ -775,10 +768,7 @@ async fn admin_functions_invoke_meters_cpu_and_logs() {
     assert_eq!(r.status, 200);
     let v = r.json();
     let cpu = v["cpu_ms"].as_u64().expect("cpu_ms field");
-    assert!(
-        cpu > 0,
-        "cpu_ms must be > 0 after 3 invocations; got {cpu}"
-    );
+    assert!(cpu > 0, "cpu_ms must be > 0 after 3 invocations; got {cpu}");
 
     // 4. logs must be non-empty (one entry per invocation).
     let r = http_request(
@@ -834,7 +824,10 @@ async fn admin_project_usage_returns_counters() {
         String::from_utf8_lossy(&r.body)
     );
     let j = r.json();
-    assert_eq!(j["project_id"].as_str(), Some(fx.project.to_string().as_str()));
+    assert_eq!(
+        j["project_id"].as_str(),
+        Some(fx.project.to_string().as_str())
+    );
     for k in [
         "ops_total",
         "bytes_read_total",
@@ -853,7 +846,10 @@ async fn admin_project_usage_returns_counters() {
 
     // No admin token → must not return usage.
     let r2 = http_request(fx.running.local_addr, "GET", &path, &[], None).await;
-    assert_ne!(r2.status, 200, "usage without an admin token must be rejected");
+    assert_ne!(
+        r2.status, 200,
+        "usage without an admin token must be rejected"
+    );
 }
 
 /// `GET /admin/v1/projects/:id/tables` lists the project's tables as JSON. A
@@ -881,14 +877,23 @@ async fn admin_project_tables_lists_tables() {
         String::from_utf8_lossy(&r.body)
     );
     let j = r.json();
-    assert_eq!(j["project_id"].as_str(), Some(fx.project.to_string().as_str()));
+    assert_eq!(
+        j["project_id"].as_str(),
+        Some(fx.project.to_string().as_str())
+    );
     assert!(
-        j["tables"].as_array().map(|a| a.is_empty()).unwrap_or(false),
+        j["tables"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(false),
         "fresh project must report an empty tables array, got {j}"
     );
 
     let r2 = http_request(fx.running.local_addr, "GET", &path, &[], None).await;
-    assert_ne!(r2.status, 200, "tables without an admin token must be rejected");
+    assert_ne!(
+        r2.status, 200,
+        "tables without an admin token must be rejected"
+    );
 }
 
 /// `DELETE /admin/v1/projects/:id` deprovisions: after provisioning credentials
@@ -913,7 +918,12 @@ async fn admin_delete_project_deprovisions() {
         Some(body.as_bytes()),
     )
     .await;
-    assert_eq!(r.status, 201, "provision must succeed; body={:?}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        201,
+        "provision must succeed; body={:?}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     // Credentials present.
     let r = http_request(addr, "GET", &creds_path, &[auth], None).await;
@@ -950,8 +960,18 @@ async fn admin_delete_project_deprovisions() {
     );
 
     // No admin token → rejected.
-    let r2 = http_request(addr, "DELETE", &format!("/admin/v1/projects/{}", fx.project), &[], None).await;
-    assert_ne!(r2.status, 204, "delete without an admin token must be rejected");
+    let r2 = http_request(
+        addr,
+        "DELETE",
+        &format!("/admin/v1/projects/{}", fx.project),
+        &[],
+        None,
+    )
+    .await;
+    assert_ne!(
+        r2.status, 204,
+        "delete without an admin token must be rejected"
+    );
 }
 
 /// `GET /admin/v1/projects` enumerates all provisioned projects. Provision two,
@@ -1010,5 +1030,8 @@ async fn admin_list_projects_enumerates() {
 
     // No admin token → rejected.
     let r2 = http_request(addr, "GET", "/admin/v1/projects", &[], None).await;
-    assert_ne!(r2.status, 200, "list projects without an admin token must be rejected");
+    assert_ne!(
+        r2.status, 200,
+        "list projects without an admin token must be rejected"
+    );
 }

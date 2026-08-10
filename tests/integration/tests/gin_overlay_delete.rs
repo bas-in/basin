@@ -217,7 +217,11 @@ async fn seed_gin_table(sess: &ProjectSession) {
          (8, 'active', '{\"b\":2,\"grp\":\"two\"}')",
     )
     .await;
-    exec(sess, "CREATE INDEX docs_payload_gin ON docs USING gin (payload)").await;
+    exec(
+        sess,
+        "CREATE INDEX docs_payload_gin ON docs USING gin (payload)",
+    )
+    .await;
 }
 
 /// Drain `docs`'s overlay through `materialize_overlay_for_table` (the routine
@@ -291,7 +295,11 @@ async fn gin_point_delete_routes_tombstone_and_serves_containment() {
         "deleted row must be excluded from @> DURING the overlay window"
     );
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"grp\":\"one\"}'").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload @> '{\"grp\":\"one\"}'"
+        )
+        .await,
         vec![2, 3, 4],
         "deleted row must be excluded from the grp:one needle too"
     );
@@ -301,7 +309,10 @@ async fn gin_point_delete_routes_tombstone_and_serves_containment() {
         Vec::<i64>::new(),
         "deleted row must be gone from a point read"
     );
-    assert_eq!(ids_for(&sess, "SELECT id FROM docs").await, vec![2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(
+        ids_for(&sess, "SELECT id FROM docs").await,
+        vec![2, 3, 4, 5, 6, 7, 8]
+    );
 
     // DRAIN: settle the overlay through materialize_overlay_for_table.
     force_materialize_drain(&sess).await;
@@ -344,7 +355,11 @@ async fn gin_delete_using_join_routes_tombstone_and_serves_containment() {
     let table = TableName::new("docs").unwrap();
     seed_gin_table(&sess).await;
     // Source table naming the PKs to delete: ids 5 and 6 (both in file 2).
-    exec(&sess, "CREATE TABLE doomed (id BIGINT NOT NULL PRIMARY KEY)").await;
+    exec(
+        &sess,
+        "CREATE TABLE doomed (id BIGINT NOT NULL PRIMARY KEY)",
+    )
+    .await;
     exec(&sess, "INSERT INTO doomed VALUES (5), (6)").await;
 
     let paths_before = live_paths(&eng, &project, &table).await;

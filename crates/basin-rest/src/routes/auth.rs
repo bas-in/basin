@@ -78,9 +78,7 @@ impl AesGcmEncryption {
             ))
         })?;
         let bytes = hex::decode(hex_str.trim()).map_err(|e| {
-            ApiError::internal(format!(
-                "{AUTH_ENCRYPTION_KEY_ENV} is not valid hex: {e}"
-            ))
+            ApiError::internal(format!("{AUTH_ENCRYPTION_KEY_ENV} is not valid hex: {e}"))
         })?;
         if bytes.len() != 32 {
             return Err(ApiError::internal(format!(
@@ -148,9 +146,12 @@ impl EncryptionProvider for AesGcmEncryption {
         let cipher = Aes256Gcm::new(key);
         let nonce = Nonce::from_slice(nonce_bytes);
 
-        let plain = cipher
-            .decrypt(nonce, ct)
-            .map_err(|_| BasinError::internal("aes-gcm decrypt: authentication failed (wrong key or tampered ciphertext)".to_owned()))?;
+        let plain = cipher.decrypt(nonce, ct).map_err(|_| {
+            BasinError::internal(
+                "aes-gcm decrypt: authentication failed (wrong key or tampered ciphertext)"
+                    .to_owned(),
+            )
+        })?;
 
         String::from_utf8(plain)
             .map_err(|e| BasinError::internal(format!("aes-gcm decrypt: utf8: {e}")))
@@ -606,12 +607,7 @@ pub(crate) async fn oauth_authorize(
     let result = state
         .cfg
         .auth
-        .begin_oauth_authorize(
-            None::<&PgStore>,
-            &project_id,
-            &provider,
-            &q.redirect_to,
-        )
+        .begin_oauth_authorize(None::<&PgStore>, &project_id, &provider, &q.redirect_to)
         .await
         .map_err(ApiError::from)?;
 
@@ -1023,8 +1019,7 @@ mod tests {
     use std::sync::Mutex;
 
     /// A known 32-byte test key as a hex string (64 chars).
-    const TEST_KEY_HEX: &str =
-        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const TEST_KEY_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
     /// Process-wide mutex so tests that mutate the env var don't race each
     /// other.  Cargo runs unit tests on multiple threads; any test that
@@ -1073,11 +1068,7 @@ mod tests {
         );
 
         // Ciphertext must differ from the input.
-        assert_ne!(
-            ct.as_str(),
-            secret,
-            "ciphertext must differ from plaintext"
-        );
+        assert_ne!(ct.as_str(), secret, "ciphertext must differ from plaintext");
     }
 
     #[test]

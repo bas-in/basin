@@ -269,7 +269,11 @@ async fn prepared_insert_null_binds() {
         .query_one("SELECT score FROM events WHERE id = $1", &[&1_i64])
         .await
         .expect("read null row");
-    assert_eq!(null_row.get::<_, Option<i64>>(0), None, "NULL bind preserved");
+    assert_eq!(
+        null_row.get::<_, Option<i64>>(0),
+        None,
+        "NULL bind preserved"
+    );
 
     let val_row = client
         .query_one("SELECT score FROM events WHERE id = $1", &[&2_i64])
@@ -400,9 +404,18 @@ async fn interleaved_prepares() {
         .expect("prepare ins_two");
 
     // Interleave executes against the three distinct prepared statements.
-    client.execute(&ins, &[&1_i64, &"three-col", &9_i64]).await.unwrap();
-    client.execute(&ins_two, &[&2_i64, &"two-col"]).await.unwrap();
-    client.execute(&ins, &[&3_i64, &"three-col-b", &11_i64]).await.unwrap();
+    client
+        .execute(&ins, &[&1_i64, &"three-col", &9_i64])
+        .await
+        .unwrap();
+    client
+        .execute(&ins_two, &[&2_i64, &"two-col"])
+        .await
+        .unwrap();
+    client
+        .execute(&ins, &[&3_i64, &"three-col-b", &11_i64])
+        .await
+        .unwrap();
 
     let r1 = client.query_one(&sel, &[&1_i64]).await.unwrap();
     assert_eq!(r1.get::<_, &str>(0), "three-col");
@@ -515,7 +528,11 @@ async fn prepared_literal_10k_insert_matches_simple() {
         ))
         .await
         .expect("prepare literal insert");
-    assert_eq!(stmt.params().len(), 0, "literal statement has no parameters");
+    assert_eq!(
+        stmt.params().len(),
+        0,
+        "literal statement has no parameters"
+    );
     let affected = client
         .execute(&stmt, &[])
         .await
@@ -656,9 +673,7 @@ async fn prepared_timestamptz_systemtime_and_chrono_binds() {
         .expect("chrono bind insert");
     // Control row via the simple protocol with the equivalent literal.
     client
-        .simple_query(
-            "INSERT INTO ts_binds (id, at) VALUES (3, '2026-01-02 03:04:05.123456+00')",
-        )
+        .simple_query("INSERT INTO ts_binds (id, at) VALUES (3, '2026-01-02 03:04:05.123456+00')")
         .await
         .expect("simple control insert");
 
@@ -749,7 +764,14 @@ async fn prepared_multi_row_param_template() {
         let n = client
             .execute(
                 &stmt,
-                &[&a, &format!("m-{a}"), &(a * 7), &b, &format!("m-{b}"), &(b * 7)],
+                &[
+                    &a,
+                    &format!("m-{a}"),
+                    &(a * 7),
+                    &b,
+                    &format!("m-{b}"),
+                    &(b * 7),
+                ],
             )
             .await
             .unwrap_or_else(|e| panic!("2-row execute {batch}: {e}"));

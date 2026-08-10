@@ -171,11 +171,7 @@ fn change_event_to_sse(event: &ChangeEvent) -> Option<Event> {
             return None;
         }
     };
-    Some(
-        Event::default()
-            .id(event.seq.to_string())
-            .data(data),
-    )
+    Some(Event::default().id(event.seq.to_string()).data(data))
 }
 
 /// Error response helper — returns a plain SSE-compatible HTTP error before
@@ -191,7 +187,12 @@ fn extract_bearer(headers: &HeaderMap) -> Result<&str, Response> {
         .get(AUTHORIZATION)
         .ok_or_else(|| err_response(StatusCode::UNAUTHORIZED, "missing Authorization header"))?
         .to_str()
-        .map_err(|_| err_response(StatusCode::UNAUTHORIZED, "Authorization header is not ASCII"))?;
+        .map_err(|_| {
+            err_response(
+                StatusCode::UNAUTHORIZED,
+                "Authorization header is not ASCII",
+            )
+        })?;
 
     let token = auth_hdr
         .strip_prefix("Bearer ")
@@ -226,7 +227,10 @@ fn extract_bearer(headers: &HeaderMap) -> Result<&str, Response> {
 /// row-level ownership check.
 fn rls_permits(event: &ChangeEvent, subscriber_user_id: &str, subscriber_roles: &[String]) -> bool {
     // Admin-role subscribers see everything for their project.
-    if subscriber_roles.iter().any(|r| r == "admin" || r == "service_role") {
+    if subscriber_roles
+        .iter()
+        .any(|r| r == "admin" || r == "service_role")
+    {
         return true;
     }
     match &event.causation_user {
@@ -261,13 +265,12 @@ pub async fn sse_handler(
         .map_err(|_| err_response(StatusCode::UNAUTHORIZED, "invalid or expired JWT"))?;
 
     // --- 2. Parse + validate path params -----------------------------------
-    let project_id: ProjectId = project_str.parse().map_err(|_| {
-        err_response(StatusCode::BAD_REQUEST, "invalid project id in path")
-    })?;
+    let project_id: ProjectId = project_str
+        .parse()
+        .map_err(|_| err_response(StatusCode::BAD_REQUEST, "invalid project id in path"))?;
 
-    let table_name: TableName = TableName::new(&table_str).map_err(|_| {
-        err_response(StatusCode::BAD_REQUEST, "invalid table name in path")
-    })?;
+    let table_name: TableName = TableName::new(&table_str)
+        .map_err(|_| err_response(StatusCode::BAD_REQUEST, "invalid table name in path"))?;
 
     // --- 3. Cross-project isolation ----------------------------------------
     if claims.project_id != project_id {
@@ -352,17 +355,16 @@ pub async fn sse_handler(
     let roles_clone = subscriber_roles.clone();
 
     // Replay stream: convert Vec<Arc<ChangeEvent>> to a stream of SSE events.
-    let replay_stream = stream::iter(replay_events)
-        .filter_map(move |arc_event| {
-            let uid = uid_clone.clone();
-            let roles = roles_clone.clone();
-            async move {
-                if !rls_permits(&arc_event, &uid, &roles) {
-                    return None;
-                }
-                change_event_to_sse(&arc_event).map(Ok)
+    let replay_stream = stream::iter(replay_events).filter_map(move |arc_event| {
+        let uid = uid_clone.clone();
+        let roles = roles_clone.clone();
+        async move {
+            if !rls_permits(&arc_event, &uid, &roles) {
+                return None;
             }
-        });
+            change_event_to_sse(&arc_event).map(Ok)
+        }
+    });
 
     // Live stream: poll the broadcast receiver, filtering by RLS.
     let uid_live = subscriber_user_id.clone();

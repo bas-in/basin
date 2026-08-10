@@ -292,7 +292,10 @@ async fn resume_from_cursor_after_worker_restart() {
 
     let rx = ReceiverState::new();
     let (url, _srv) = spawn_receiver(rx.clone()).await;
-    catalog.register_cdc_webhook(def(project, "wh1", &url)).await.unwrap();
+    catalog
+        .register_cdc_webhook(def(project, "wh1", &url))
+        .await
+        .unwrap();
 
     // First two events, delivered by the first worker instance.
     publish_all(
@@ -341,7 +344,11 @@ async fn resume_from_cursor_after_worker_restart() {
             new_seqs.push(r["seq"].as_u64().unwrap());
         }
     }
-    assert_eq!(new_seqs, vec![3, 4], "resume delivered only the missed events");
+    assert_eq!(
+        new_seqs,
+        vec![3, 4],
+        "resume delivered only the missed events"
+    );
     d2.abort();
 }
 
@@ -357,7 +364,10 @@ async fn retry_backoff_on_500_then_success() {
     // Fail the first 3 attempts with 500, then ack.
     rx.fail_first.store(3, Ordering::SeqCst);
     let (url, _srv) = spawn_receiver(rx.clone()).await;
-    catalog.register_cdc_webhook(def(project, "wh1", &url)).await.unwrap();
+    catalog
+        .register_cdc_webhook(def(project, "wh1", &url))
+        .await
+        .unwrap();
 
     publish_all(&writer, &[ev(project, "t", ChangeOp::Insert, 1)]).await;
 
@@ -387,7 +397,10 @@ async fn ordering_preserved_under_interleaved_commits() {
 
     let rx = ReceiverState::new();
     let (url, _srv) = spawn_receiver(rx.clone()).await;
-    catalog.register_cdc_webhook(def(project, "wh1", &url)).await.unwrap();
+    catalog
+        .register_cdc_webhook(def(project, "wh1", &url))
+        .await
+        .unwrap();
 
     let http: Arc<dyn basin_cdc::WebhookHttp> = Arc::new(ReqwestHttp::new());
     let d = spawn_webhook_dispatcher(writer.clone(), catalog.clone(), project, fast_cfg(), http);
@@ -416,7 +429,11 @@ async fn ordering_preserved_under_interleaved_commits() {
             all.push(r["seq"].as_u64().unwrap());
         }
     }
-    assert_eq!(all, (1..=20).collect::<Vec<u64>>(), "delivered in seq order");
+    assert_eq!(
+        all,
+        (1..=20).collect::<Vec<u64>>(),
+        "delivered in seq order"
+    );
     d.abort();
 }
 
@@ -478,7 +495,10 @@ async fn auto_disable_after_max_delivery_age() {
     let rx = ReceiverState::new();
     rx.status.store(500, Ordering::SeqCst); // permanently failing endpoint.
     let (url, _srv) = spawn_receiver(rx.clone()).await;
-    catalog.register_cdc_webhook(def(project, "wh1", &url)).await.unwrap();
+    catalog
+        .register_cdc_webhook(def(project, "wh1", &url))
+        .await
+        .unwrap();
 
     publish_all(&writer, &[ev(project, "t", ChangeOp::Insert, 1)]).await;
 
@@ -525,8 +545,14 @@ async fn cross_endpoint_isolation_500ing_endpoint_does_not_delay_healthy_one() {
     let rx_good = ReceiverState::new();
     let (url_good, _s2) = spawn_receiver(rx_good.clone()).await;
 
-    catalog.register_cdc_webhook(def(project, "bad", &url_bad)).await.unwrap();
-    catalog.register_cdc_webhook(def(project, "good", &url_good)).await.unwrap();
+    catalog
+        .register_cdc_webhook(def(project, "bad", &url_bad))
+        .await
+        .unwrap();
+    catalog
+        .register_cdc_webhook(def(project, "good", &url_good))
+        .await
+        .unwrap();
 
     publish_all(
         &writer,
@@ -584,18 +610,33 @@ async fn catalog_round_trip_in_memory() {
     let rows = catalog.list_cdc_webhooks(&project).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].def.url, "https://example.com/hook");
-    assert_eq!(rows[0].def.tables.as_deref(), Some(&["orders".to_string()][..]));
+    assert_eq!(
+        rows[0].def.tables.as_deref(),
+        Some(&["orders".to_string()][..])
+    );
     assert_eq!(rows[0].state.last_seq, 0, "fresh cursor");
 
     // Ack advances the cursor monotonically; a lower ack never rewinds it.
-    catalog.record_cdc_webhook_ack(&project, "wh1", 10, "200").await.unwrap();
-    catalog.record_cdc_webhook_ack(&project, "wh1", 5, "200").await.unwrap();
+    catalog
+        .record_cdc_webhook_ack(&project, "wh1", 10, "200")
+        .await
+        .unwrap();
+    catalog
+        .record_cdc_webhook_ack(&project, "wh1", 5, "200")
+        .await
+        .unwrap();
     let rows = catalog.list_cdc_webhooks(&project).await;
-    assert_eq!(rows[0].state.last_seq, 10, "GREATEST cursor — never rewinds");
+    assert_eq!(
+        rows[0].state.last_seq, 10,
+        "GREATEST cursor — never rewinds"
+    );
     assert_eq!(rows[0].state.retry_count, 0, "ack resets retry_count");
 
     // Failure bumps retry_count + records status, does NOT advance the cursor.
-    catalog.record_cdc_webhook_failure(&project, "wh1", 3, "500").await.unwrap();
+    catalog
+        .record_cdc_webhook_failure(&project, "wh1", 3, "500")
+        .await
+        .unwrap();
     let rows = catalog.list_cdc_webhooks(&project).await;
     assert_eq!(rows[0].state.retry_count, 3);
     assert_eq!(rows[0].state.last_status.as_deref(), Some("500"));

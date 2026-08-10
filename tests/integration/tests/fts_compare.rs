@@ -89,8 +89,18 @@ const VOCAB: usize = 2000;
 fn word(i: usize) -> String {
     // Mix a few recognisable root words so PG English stemming actually fires,
     // which makes F1/F2 correctness more interesting than pure synthetic tokens.
-    let roots = ["database", "query", "index", "table", "column", "row",
-                 "schema", "transaction", "storage", "cache"];
+    let roots = [
+        "database",
+        "query",
+        "index",
+        "table",
+        "column",
+        "row",
+        "schema",
+        "transaction",
+        "storage",
+        "cache",
+    ];
     let root = roots[i % roots.len()];
     format!("{root}{}", i / roots.len())
 }
@@ -140,7 +150,11 @@ async fn fts_head_to_head() {
 
     // ── Basin setup ──────────────────────────────────────────────────────────
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
 
     // Basin FTS table: body TEXT, no separate tsv column (inline tsvector).
     sess.execute(
@@ -160,7 +174,9 @@ async fn fts_head_to_head() {
         let mut stmt = String::with_capacity((hi - offset) * 256);
         stmt.push_str("INSERT INTO articles VALUES ");
         for k in offset..hi {
-            if k > offset { stmt.push(','); }
+            if k > offset {
+                stmt.push(',');
+            }
             let body = body_for(k);
             // Escape single-quotes in body (none expected with our word() fn, but safe).
             let body_escaped = body.replace('\'', "''");
@@ -176,11 +192,21 @@ async fn fts_head_to_head() {
     eprintln!("[fts] basin seed complete");
 
     // Attempt Basin GIN DDL (record success/failure for the artifact).
-    let basin_gin_ddl_ok = sess.execute(
-        "CREATE INDEX articles_tsv_gin ON articles \
-         USING GIN (to_tsvector('english', body))"
-    ).await.is_ok();
-    eprintln!("[fts] basin GIN DDL: {}", if basin_gin_ddl_ok { "ok" } else { "not wired (gap)" });
+    let basin_gin_ddl_ok = sess
+        .execute(
+            "CREATE INDEX articles_tsv_gin ON articles \
+         USING GIN (to_tsvector('english', body))",
+        )
+        .await
+        .is_ok();
+    eprintln!(
+        "[fts] basin GIN DDL: {}",
+        if basin_gin_ddl_ok {
+            "ok"
+        } else {
+            "not wired (gap)"
+        }
+    );
 
     // ── Basin shape measurements ──────────────────────────────────────────────
     // F1: single-term match
@@ -270,10 +296,7 @@ async fn fts_head_to_head() {
                     let res = sess.execute(&f3_sql).await.expect("basin F3");
                     s.push(t.elapsed().as_secs_f64() * 1000.0);
                     let got = row_count_of(&res);
-                    assert!(
-                        got <= 20,
-                        "fts F3: expected ≤20 rows (LIMIT 20), got {got}"
-                    );
+                    assert!(got <= 20, "fts F3: expected ≤20 rows (LIMIT 20), got {got}");
                 }
                 let p50 = median(&s);
                 println!("[fts] Basin F3 (ranked top-20): p50={p50:.3}ms");
@@ -291,8 +314,13 @@ async fn fts_head_to_head() {
         if let Some((pg, cs)) = try_connect().await {
             let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
             let schema = format!("basin_fts_{suffix}");
-            let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-            pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.unwrap();
+            let _guard = SchemaGuard {
+                schema: schema.clone(),
+                conn_str: cs,
+            };
+            pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+                .await
+                .unwrap();
             pg.simple_query("SET work_mem = '4MB'").await.unwrap();
 
             // PG schema: body TEXT + pre-built tsv TSVECTOR column + GIN index.
@@ -301,7 +329,9 @@ async fn fts_head_to_head() {
                     id BIGINT PRIMARY KEY, \
                     body TEXT NOT NULL, \
                     tsv TSVECTOR)"
-            )).await.unwrap();
+            ))
+            .await
+            .unwrap();
 
             // Seed articles (same deterministic bodies)
             let mut pg_off = 0usize;
@@ -309,7 +339,9 @@ async fn fts_head_to_head() {
                 let hi = (pg_off + batch).min(rows);
                 let mut stmt = format!("INSERT INTO {schema}.articles (id, body) VALUES ");
                 for k in pg_off..hi {
-                    if k > pg_off { stmt.push(','); }
+                    if k > pg_off {
+                        stmt.push(',');
+                    }
                     let body = body_for(k);
                     let body_escaped = body.replace('\'', "''");
                     stmt.push_str(&format!("({k},'{body_escaped}')"));
@@ -321,10 +353,14 @@ async fn fts_head_to_head() {
             // Build tsvector column and GIN index
             pg.simple_query(&format!(
                 "UPDATE {schema}.articles SET tsv = to_tsvector('english', body)"
-            )).await.expect("pg build tsv");
+            ))
+            .await
+            .expect("pg build tsv");
             pg.simple_query(&format!(
                 "CREATE INDEX articles_tsv_gin ON {schema}.articles USING GIN (tsv)"
-            )).await.expect("pg create gin");
+            ))
+            .await
+            .expect("pg create gin");
             eprintln!("[fts] PG GIN index built");
 
             // PG queries: use pre-built tsv column + GIN index.
@@ -349,11 +385,23 @@ async fn fts_head_to_head() {
             let _ = pg.simple_query(&pg_f3_sql).await;
 
             // Count hits (correctness reference)
-            let pgf1_count: usize = pg.simple_query(&pg_f1_sql).await
-                .map(|rows| rows.iter().filter(|m| matches!(m, SimpleQueryMessage::Row(_))).count())
+            let pgf1_count: usize = pg
+                .simple_query(&pg_f1_sql)
+                .await
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
+                        .count()
+                })
                 .unwrap_or(0);
-            let pgf2_count: usize = pg.simple_query(&pg_f2_sql).await
-                .map(|rows| rows.iter().filter(|m| matches!(m, SimpleQueryMessage::Row(_))).count())
+            let pgf2_count: usize = pg
+                .simple_query(&pg_f2_sql)
+                .await
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
+                        .count()
+                })
                 .unwrap_or(0);
 
             // F1
@@ -427,55 +475,61 @@ async fn fts_head_to_head() {
         }
     };
 
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("fts_head_to_head.json", &json!({
-        "card": "fts_head_to_head",
-        "generated_at": format!("@{ts}"),
-        "config": {
-            "rows": rows,
-            "samples": samples,
-            "query_term_f1": QUERY_TERM,
-            "query_term_f2": QUERY_TERM_MULTI,
-            "vocab_size": VOCAB,
-        },
-        "basin_gin_ddl_ok": basin_gin_ddl_ok,
-        "shapes": [
-            {
-                "label": "F1: single-term @@ (no ranking)",
-                "basin_p50_ms": opt_ms(basin_f1_p50),
-                "pg_p50_ms": opt_ms(pg_f1_p50),
-                "basin_over_pg": ratio(basin_f1_p50, pg_f1_p50),
-                "basin_hits": basin_f1_count,
-                "pg_hits": pg_f1_count,
-                "pg_uses_gin": true,
-                "basin_uses_gin": basin_gin_ddl_ok,
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "fts_head_to_head.json",
+        &json!({
+            "card": "fts_head_to_head",
+            "generated_at": format!("@{ts}"),
+            "config": {
+                "rows": rows,
+                "samples": samples,
+                "query_term_f1": QUERY_TERM,
+                "query_term_f2": QUERY_TERM_MULTI,
+                "vocab_size": VOCAB,
             },
-            {
-                "label": "F2: multi-term AND @@ (no ranking)",
-                "basin_p50_ms": opt_ms(basin_f2_p50),
-                "pg_p50_ms": opt_ms(pg_f2_p50),
-                "basin_over_pg": ratio(basin_f2_p50, pg_f2_p50),
-                "basin_hits": basin_f2_count,
-                "pg_hits": pg_f2_count,
-                "pg_uses_gin": true,
-                "basin_uses_gin": basin_gin_ddl_ok,
+            "basin_gin_ddl_ok": basin_gin_ddl_ok,
+            "shapes": [
+                {
+                    "label": "F1: single-term @@ (no ranking)",
+                    "basin_p50_ms": opt_ms(basin_f1_p50),
+                    "pg_p50_ms": opt_ms(pg_f1_p50),
+                    "basin_over_pg": ratio(basin_f1_p50, pg_f1_p50),
+                    "basin_hits": basin_f1_count,
+                    "pg_hits": pg_f1_count,
+                    "pg_uses_gin": true,
+                    "basin_uses_gin": basin_gin_ddl_ok,
+                },
+                {
+                    "label": "F2: multi-term AND @@ (no ranking)",
+                    "basin_p50_ms": opt_ms(basin_f2_p50),
+                    "pg_p50_ms": opt_ms(pg_f2_p50),
+                    "basin_over_pg": ratio(basin_f2_p50, pg_f2_p50),
+                    "basin_hits": basin_f2_count,
+                    "pg_hits": pg_f2_count,
+                    "pg_uses_gin": true,
+                    "basin_uses_gin": basin_gin_ddl_ok,
+                },
+                {
+                    "label": "F3: ts_rank ORDER BY LIMIT 20",
+                    "basin_p50_ms": opt_ms(basin_f3_p50),
+                    "pg_p50_ms": opt_ms(pg_f3_p50),
+                    "basin_over_pg": ratio(basin_f3_p50, pg_f3_p50),
+                    "pg_uses_gin": true,
+                    "basin_uses_gin": basin_gin_ddl_ok,
+                },
+            ],
+            "note": if basin_gin_ddl_ok {
+                "Basin GIN-backed tsvector DDL succeeded; index may not yet be used for @@ queries"
+            } else {
+                "Basin GIN-backed tsvector DDL not yet wired; Basin uses seq-scan tsvector; \
+                 timing gap vs PG GIN is expected and documented"
             },
-            {
-                "label": "F3: ts_rank ORDER BY LIMIT 20",
-                "basin_p50_ms": opt_ms(basin_f3_p50),
-                "pg_p50_ms": opt_ms(pg_f3_p50),
-                "basin_over_pg": ratio(basin_f3_p50, pg_f3_p50),
-                "pg_uses_gin": true,
-                "basin_uses_gin": basin_gin_ddl_ok,
-            },
-        ],
-        "note": if basin_gin_ddl_ok {
-            "Basin GIN-backed tsvector DDL succeeded; index may not yet be used for @@ queries"
-        } else {
-            "Basin GIN-backed tsvector DDL not yet wired; Basin uses seq-scan tsvector; \
-             timing gap vs PG GIN is expected and documented"
-        },
-    }));
+        }),
+    );
 
     instance.wal.close().await.unwrap();
 }

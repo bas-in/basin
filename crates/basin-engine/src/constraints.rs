@@ -248,12 +248,8 @@ pub(crate) async fn enforce_pk_on_insert(
 
     // Tier 3 fast-path detection: single Int64 PK. Avoids the `Vec<String>`
     // allocation per cold row when probing the existing set.
-    let single_i64_pk = pk_columns.len() == 1
-        && batch
-            .schema()
-            .field(pk_idx[0])
-            .data_type()
-            == &DataType::Int64;
+    let single_i64_pk =
+        pk_columns.len() == 1 && batch.schema().field(pk_idx[0]).data_type() == &DataType::Int64;
 
     // 1. Intra-batch dup check.
     //
@@ -432,8 +428,7 @@ pub(crate) async fn enforce_pk_on_insert(
     // (single-column PKs), so a serial/above-range insert reads ~0 files. This is
     // shape-agnostic: it handles single-i64 and composite/text PKs the same way.
     let total_existing_rows: u64 = data_files.iter().map(|f| f.row_count).sum();
-    if total_existing_rows > pk_streaming_min_rows()
-        || batch.num_rows() <= PK_STREAMING_SMALL_BATCH
+    if total_existing_rows > pk_streaming_min_rows() || batch.num_rows() <= PK_STREAMING_SMALL_BATCH
     {
         // The scan races compaction: a file can be merged away (catalog swap +
         // object DELETE) between our LIST above and the per-file GET inside the
@@ -608,17 +603,16 @@ pub(crate) async fn enforce_pk_on_insert(
                 .iter()
                 .filter(|f| !entry_arc.files.contains(f.path.as_ref()))
                 .collect();
-            let entry = Arc::try_unwrap(entry_arc)
-                .unwrap_or_else(|shared| (*shared).clone_for_extend());
+            let entry =
+                Arc::try_unwrap(entry_arc).unwrap_or_else(|shared| (*shared).clone_for_extend());
             if single_i64_pk {
-                let base_i64 = entry.set_i64.map(|arc| {
-                    Arc::try_unwrap(arc).unwrap_or_else(|shared| (*shared).clone())
-                });
+                let base_i64 = entry
+                    .set_i64
+                    .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|shared| (*shared).clone()));
                 let base_i64 = base_i64.unwrap_or_default();
                 (std::collections::HashSet::new(), Some(base_i64), new_files)
             } else {
-                let base = Arc::try_unwrap(entry.set)
-                    .unwrap_or_else(|shared| (*shared).clone());
+                let base = Arc::try_unwrap(entry.set).unwrap_or_else(|shared| (*shared).clone());
                 (base, None, new_files)
             }
         }
@@ -628,7 +622,11 @@ pub(crate) async fn enforce_pk_on_insert(
             } else {
                 None
             };
-            (std::collections::HashSet::new(), ex_i64, data_files.iter().collect())
+            (
+                std::collections::HashSet::new(),
+                ex_i64,
+                data_files.iter().collect(),
+            )
         }
     };
     for f in scan_files {
@@ -892,7 +890,10 @@ async fn enforce_pk_streaming(
                 col.clone(),
                 ScalarValue::Int64(bmin.saturating_sub(1)),
             )),
-            CompoundPredicate::Atom(Predicate::Lt(col, ScalarValue::Int64(bmax.saturating_add(1)))),
+            CompoundPredicate::Atom(Predicate::Lt(
+                col,
+                ScalarValue::Int64(bmax.saturating_add(1)),
+            )),
         ]))
     } else {
         None
@@ -975,8 +976,9 @@ async fn enforce_pk_streaming(
             if let Some(bytes) = bloom_bytes {
                 if let Some(bloom) = basin_storage::bloom_from_bytes(bytes) {
                     let keys = batch_keys_i64.as_ref().unwrap();
-                    let any_present =
-                        keys.iter().any(|k| bloom.contains(k.to_le_bytes().as_ref()));
+                    let any_present = keys
+                        .iter()
+                        .any(|k| bloom.contains(k.to_le_bytes().as_ref()));
                     if !any_present {
                         continue;
                     }
@@ -1003,7 +1005,9 @@ async fn enforce_pk_streaming(
                     .column(rb_pk_idx[0])
                     .as_any()
                     .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| BasinError::internal("Int64Array downcast (cold PK, streaming)"))?;
+                    .ok_or_else(|| {
+                        BasinError::internal("Int64Array downcast (cold PK, streaming)")
+                    })?;
                 for row in 0..rb.num_rows() {
                     if arr.is_null(row) {
                         continue;
@@ -1121,7 +1125,11 @@ pub(crate) async fn enforce_unique_on_insert(
         None
     } else {
         pk_columns.first().and_then(|c| {
-            batch.schema().field_with_name(c).ok().map(|f| f.data_type().clone())
+            batch
+                .schema()
+                .field_with_name(c)
+                .ok()
+                .map(|f| f.data_type().clone())
         })
     };
     for u in unique_constraints {
@@ -1205,8 +1213,7 @@ pub(crate) async fn verify_unique_over_existing(
                 .collect();
             let Some(rb_idx) = rb_idx else { continue };
             for row in 0..rb.num_rows() {
-                let Some(k) = pk_tuple_for_row_citext(&rb, &rb_idx, row, &citext_positions)?
-                else {
+                let Some(k) = pk_tuple_for_row_citext(&rb, &rb_idx, row, &citext_positions)? else {
                     continue;
                 };
                 if !seen.insert(k.clone()) {
@@ -1306,7 +1313,11 @@ async fn enforce_one_unique(
         .enumerate()
         .filter_map(|(pos, &arr_idx)| {
             let field = batch_schema.field(arr_idx);
-            if field_is_citext(field) { Some(pos) } else { None }
+            if field_is_citext(field) {
+                Some(pos)
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -1353,7 +1364,9 @@ async fn enforce_one_unique(
             let rb_pk_idx: Option<usize> = if tombstone_keys.is_empty() || pk_dt.is_none() {
                 None
             } else {
-                pk_columns.first().and_then(|c| rb.schema().index_of(c).ok())
+                pk_columns
+                    .first()
+                    .and_then(|c| rb.schema().index_of(c).ok())
             };
             // Reuse `citext_positions` derived from the INSERT batch's schema
             // (which HAS Arrow field metadata) rather than re-deriving from the
@@ -1379,9 +1392,7 @@ async fn enforce_one_unique(
                         }
                     }
                 }
-                if let Some(k) =
-                    pk_tuple_for_row_citext(&rb, &rb_idx, row, &citext_positions)?
-                {
+                if let Some(k) = pk_tuple_for_row_citext(&rb, &rb_idx, row, &citext_positions)? {
                     existing.insert(k);
                 }
             }
@@ -1640,15 +1651,8 @@ pub(crate) async fn enforce_check_constraints(
         // Phase 5.24.F: sentinel predicates encode EXCLUDE USING gist constraints.
         // Route them to the exclusion enforcer instead of DataFusion evaluation.
         if let Some(spec) = crate::ddl::parse_exclusion_sentinel(&c.predicate) {
-            enforce_one_exclusion_constraint(
-                storage,
-                project,
-                table,
-                table_name_str,
-                &spec,
-                batch,
-            )
-            .await?;
+            enforce_one_exclusion_constraint(storage, project, table, table_name_str, &spec, batch)
+                .await?;
             continue;
         }
 
@@ -1916,9 +1920,8 @@ fn ranges_overlap(a: &str, b: &str) -> bool {
                 return Some(ts as f64);
             }
             // Try chrono naive datetime.
-            if let Ok(dt) =
-                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
+            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
             {
                 return Some(dt.and_utc().timestamp_micros() as f64);
             }
@@ -1941,14 +1944,22 @@ fn ranges_overlap(a: &str, b: &str) -> bool {
     // a ends before b starts?
     let a_before_b = match (a_hi, b_lo) {
         (Some(ah), Some(bl)) => {
-            if a_ui && b_li { ah < bl } else { ah <= bl }
+            if a_ui && b_li {
+                ah < bl
+            } else {
+                ah <= bl
+            }
         }
         _ => false,
     };
     // b ends before a starts?
     let b_before_a = match (b_hi, a_lo) {
         (Some(bh), Some(al)) => {
-            if b_ui && a_li { bh < al } else { bh <= al }
+            if b_ui && a_li {
+                bh < al
+            } else {
+                bh <= al
+            }
         }
         _ => false,
     };
@@ -2442,7 +2453,11 @@ mod tests {
             page_cache: None,
         });
         let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
-        let eng = Engine::new(EngineConfig { storage, catalog, shard: None });
+        let eng = Engine::new(EngineConfig {
+            storage,
+            catalog,
+            shard: None,
+        });
         let project = ProjectId::new();
         let sess = eng.open_session(project).await.unwrap();
         let schema = Arc::new(Schema::empty());
@@ -2458,7 +2473,12 @@ mod tests {
         let chunks = 6u64;
         for c in 0..chunks {
             let batch: Vec<Vec<Option<String>>> = (c * chunk_rows..(c + 1) * chunk_rows)
-                .map(|i| vec![Some((i as i64 + 1).to_string()), Some(((i % 7) as i64).to_string())])
+                .map(|i| {
+                    vec![
+                        Some((i as i64 + 1).to_string()),
+                        Some(((i % 7) as i64).to_string()),
+                    ]
+                })
                 .collect();
             let n = sess
                 .ingest_csv_batch("t", schema.clone(), Some(&cols), batch)

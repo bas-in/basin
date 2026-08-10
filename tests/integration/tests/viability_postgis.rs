@@ -209,17 +209,13 @@ async fn st_intersects_sql_end_to_end() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TABLE t (p POINT) WITH (basin.file_format='parquet')",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE t (p POINT) WITH (basin.file_format='parquet')")
+        .await
+        .unwrap();
 
-    sess.execute(
-        "INSERT INTO t VALUES (ST_MakePoint(1.0, 2.0)), (ST_MakePoint(3.0, 4.0))",
-    )
-    .await
-    .unwrap();
+    sess.execute("INSERT INTO t VALUES (ST_MakePoint(1.0, 2.0)), (ST_MakePoint(3.0, 4.0))")
+        .await
+        .unwrap();
 
     let result = sess
         .execute("SELECT ST_Intersects(p, ST_MakePoint(1.0, 2.0)) FROM t ORDER BY ST_X(p)")
@@ -297,10 +293,7 @@ async fn st_asgeojson_sql_format() {
         got.starts_with("{\"type\":\"Point\",\"coordinates\":["),
         "unexpected format: {got}"
     );
-    assert!(
-        got.ends_with("]}"),
-        "expected GeoJSON to end with ']}}'"
-    );
+    assert!(got.ends_with("]}"), "expected GeoJSON to end with ']}}'");
     // Coordinates must contain the input values.
     assert!(got.contains("2.2945"), "missing lon in {got}");
     assert!(got.contains("48.8584"), "missing lat in {got}");
@@ -364,11 +357,9 @@ async fn st_geojson_table_round_trip() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TABLE gj (p POINT) WITH (basin.file_format='parquet')",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE gj (p POINT) WITH (basin.file_format='parquet')")
+        .await
+        .unwrap();
 
     sess.execute(
         "INSERT INTO gj VALUES \

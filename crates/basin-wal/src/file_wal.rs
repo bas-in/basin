@@ -63,9 +63,9 @@ use ulid::Ulid;
 
 use crate::fsync::DurablePut;
 use crate::segment::{
-    decode_segment, decode_segment_full, entry_record, frame_into, handoff_record,
-    tx_begin_record, tx_commit_record, tx_rollback_record, DecodedRecord, EntryRecord,
-    SegmentHeader, SegmentRecord, FORMAT_VERSION,
+    decode_segment, decode_segment_full, entry_record, frame_into, handoff_record, tx_begin_record,
+    tx_commit_record, tx_rollback_record, DecodedRecord, EntryRecord, SegmentHeader, SegmentRecord,
+    FORMAT_VERSION,
 };
 use crate::state::{BufferRecord, ClosedSegment, PartitionState};
 use crate::{Lsn, WalConfig, WalEntry, WalEvent, WalImpl};
@@ -1006,9 +1006,7 @@ impl WalImpl for FileWal {
                 .object_store
                 .get(&seg.path)
                 .await
-                .map_err(|e| {
-                    BasinError::storage(format!("wal read_events get {}: {e}", seg.path))
-                })?
+                .map_err(|e| BasinError::storage(format!("wal read_events get {}: {e}", seg.path)))?
                 .bytes()
                 .await
                 .map_err(|e| {
@@ -1047,12 +1045,8 @@ impl WalImpl for FileWal {
             match record {
                 BufferRecord::Entry(e) => events.push(WalEvent::Entry(into_public_entry(e))),
                 BufferRecord::TxBegin { tx_id, .. } => events.push(WalEvent::Begin { tx_id }),
-                BufferRecord::TxRollback { tx_id, .. } => {
-                    events.push(WalEvent::Rollback { tx_id })
-                }
-                BufferRecord::TxCommit { tx_id, .. } => {
-                    events.push(WalEvent::Commit { tx_id })
-                }
+                BufferRecord::TxRollback { tx_id, .. } => events.push(WalEvent::Rollback { tx_id }),
+                BufferRecord::TxCommit { tx_id, .. } => events.push(WalEvent::Commit { tx_id }),
                 BufferRecord::Handoff {
                     to_holder,
                     at_epoch,
@@ -1332,7 +1326,11 @@ mod tests {
         let wal = LocalWal::open(cfg).await.unwrap();
         assert_eq!(wal.high_water(&project, &part).await.unwrap(), Lsn(12));
         let all = wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
-        assert_eq!(all.len(), 12, "await_durable must make every async append durable");
+        assert_eq!(
+            all.len(),
+            12,
+            "await_durable must make every async append durable"
+        );
         wal.close().await.unwrap();
     }
 
@@ -1933,7 +1931,8 @@ mod tests {
         h.wal.append(&project, &part, payload(6)).await.unwrap();
 
         // Heal the store; the retry flush must persist everything in order.
-        h.fail_puts.store(false, std::sync::atomic::Ordering::SeqCst);
+        h.fail_puts
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         h.wal.flush().await.unwrap();
         let all = h.wal.read_from(&project, &part, Lsn::ZERO).await.unwrap();
         assert_eq!(all.len(), 6);

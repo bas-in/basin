@@ -128,9 +128,11 @@ pub(crate) async fn register_kafka_sink(
             .map(|o| o.trim().to_ascii_lowercase())
             .collect::<Vec<_>>()
     });
-    let tables = req
-        .tables
-        .map(|v| v.into_iter().map(|t| t.trim().to_string()).collect::<Vec<_>>());
+    let tables = req.tables.map(|v| {
+        v.into_iter()
+            .map(|t| t.trim().to_string())
+            .collect::<Vec<_>>()
+    });
     let partition_key = req
         .partition_key
         .as_deref()

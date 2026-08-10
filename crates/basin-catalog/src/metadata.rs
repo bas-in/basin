@@ -820,7 +820,6 @@ impl TableMetadata {
     }
 }
 
-
 #[cfg(test)]
 mod default_cluster_cols_tests {
     use super::*;
@@ -860,7 +859,10 @@ mod default_cluster_cols_tests {
 
     #[test]
     fn composite_pk_is_skipped() {
-        let m = with_pk(&["a", "b"], &[("a", DataType::Int64), ("b", DataType::Int64)]);
+        let m = with_pk(
+            &["a", "b"],
+            &[("a", DataType::Int64), ("b", DataType::Int64)],
+        );
         assert!(m.default_cluster_cols().is_empty());
     }
 

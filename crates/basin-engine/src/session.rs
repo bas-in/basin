@@ -40,11 +40,11 @@ use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
-use datafusion::logical_expr::{col, SortExpr};
 use datafusion::datasource::MemTable;
 use datafusion::execution::cache::cache_manager::CacheManagerConfig;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::{SessionStateBuilder, SessionStateDefaults};
+use datafusion::logical_expr::{col, SortExpr};
 use datafusion::prelude::SessionContext;
 use sqlparser::ast::ValueWithSpan;
 use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor, Value};
@@ -92,24 +92,40 @@ pub(crate) fn parse_pg_duration(raw: &str) -> Option<std::time::Duration> {
     // "Nms"
     if let Some(n) = s.strip_suffix("ms") {
         if let Ok(ms) = n.trim().parse::<u64>() {
-            return if ms == 0 { None } else { Some(std::time::Duration::from_millis(ms)) };
+            return if ms == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_millis(ms))
+            };
         }
     }
     // "Ns" or "Nsec"
     if let Some(n) = s.strip_suffix("sec").or_else(|| s.strip_suffix('s')) {
         if let Ok(sec) = n.trim().parse::<u64>() {
-            return if sec == 0 { None } else { Some(std::time::Duration::from_secs(sec)) };
+            return if sec == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs(sec))
+            };
         }
     }
     // "Nmin"
     if let Some(n) = s.strip_suffix("min") {
         if let Ok(min) = n.trim().parse::<u64>() {
-            return if min == 0 { None } else { Some(std::time::Duration::from_secs(min * 60)) };
+            return if min == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs(min * 60))
+            };
         }
     }
     // bare integer → milliseconds
     if let Ok(ms) = s.parse::<u64>() {
-        return if ms == 0 { None } else { Some(std::time::Duration::from_millis(ms)) };
+        return if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        };
     }
     None
 }
@@ -221,14 +237,12 @@ pub(crate) fn parse_statement_timeout_guc(raw: &str) -> Result<Option<std::time:
     // Try string with unit suffix (case-insensitive).
     // Walk backwards to split numeric prefix from unit suffix.
     let (num_part, unit_part) = {
-        let idx = s
-            .find(|c: char| c.is_ascii_alphabetic())
-            .unwrap_or(s.len());
+        let idx = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
         (&s[..idx], s[idx..].trim())
     };
-    let count: f64 = num_part
-        .parse()
-        .map_err(|_| BasinError::InvalidSchema(format!("invalid statement_timeout value: {raw}")))?;
+    let count: f64 = num_part.parse().map_err(|_| {
+        BasinError::InvalidSchema(format!("invalid statement_timeout value: {raw}"))
+    })?;
     let ms = match unit_part.to_ascii_lowercase().as_str() {
         "ms" | "msec" | "millisecond" | "milliseconds" => count,
         "s" | "sec" | "second" | "seconds" => count * 1_000.0,
@@ -253,9 +267,7 @@ pub(crate) fn parse_statement_timeout_guc(raw: &str) -> Result<Option<std::time:
 ///
 /// Priority: per-session override (if set) → process-wide default
 /// (`BASIN_STATEMENT_TIMEOUT_MS` env / [`statement_timeout`]).
-pub(crate) fn session_statement_timeout(
-    state: &SessionState,
-) -> Option<std::time::Duration> {
+pub(crate) fn session_statement_timeout(state: &SessionState) -> Option<std::time::Duration> {
     let v = state
         .statement_timeout_ms
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -544,8 +556,10 @@ pub(crate) struct TxState {
     /// write-path gate therefore disables the tx fast path whenever any
     /// savepoint is active (see `tx_overlay_fastpath_blocked`), routing those
     /// statements to the cold copy-on-write path which DOES honour savepoints.
-    pub(crate) tx_overlay:
-        HashMap<TableName, std::collections::BTreeMap<basin_hottier::RowKey, basin_hottier::MemRowValue>>,
+    pub(crate) tx_overlay: HashMap<
+        TableName,
+        std::collections::BTreeMap<basin_hottier::RowKey, basin_hottier::MemRowValue>,
+    >,
     /// Hot-tier MVCC sequence watermark pinned per table for this transaction's
     /// read-view. Captured at the SAME first-touch moment as the cold
     /// `read_snapshots` pin (inside `load_table_for_read`, after the read's own
@@ -667,7 +681,6 @@ pub(crate) struct SessionState {
     pub(crate) statement_timeout_ms: std::sync::atomic::AtomicI64,
 
     // ── Phase 5.28 session-level GUCs ────────────────────────────────────────
-
     /// `SET lock_timeout = '500ms'` per-session override.
     /// `None` = disabled (0). Atomically readable by the lock-wait primitive.
     /// Uses `std::sync::Mutex` so the SET handler can update it synchronously.
@@ -675,8 +688,7 @@ pub(crate) struct SessionState {
 
     /// `SET idle_in_transaction_session_timeout = '30s'` per-session override.
     /// `None` = disabled (0). The reaper reads this.
-    pub(crate) idle_in_transaction_session_timeout:
-        std::sync::Mutex<Option<std::time::Duration>>,
+    pub(crate) idle_in_transaction_session_timeout: std::sync::Mutex<Option<std::time::Duration>>,
 
     /// `SET basin.synchronous_commit = on|off` per-session durability mode.
     ///
@@ -692,7 +704,6 @@ pub(crate) struct SessionState {
     pub(crate) synchronous_commit: std::sync::atomic::AtomicBool,
 
     // ── pg_trgm session-level GUCs ────────────────────────────────────────────
-
     /// `SET pg_trgm.similarity_threshold = <float>` per-session threshold for
     /// the `%` operator.  Defaults to `basin_trgm::DEFAULT_SIMILARITY_THRESHOLD`
     /// (0.3, matching the PG default).  Stored as an `AtomicU32` holding the
@@ -849,8 +860,7 @@ impl Drop for SessionState {
 #[derive(Default)]
 pub(crate) struct ListenState {
     /// Active subscriptions, keyed by lowercased channel name.
-    pub(crate) subscriptions:
-        HashMap<String, Arc<crate::notify_registry::ListenSubscription>>,
+    pub(crate) subscriptions: HashMap<String, Arc<crate::notify_registry::ListenSubscription>>,
     /// Notifications buffered while a transaction is open. Drained and
     /// dispatched to the engine `NotifyRegistry` on COMMIT; cleared on
     /// ROLLBACK. Auto-commit `NOTIFY` bypasses this buffer entirely and
@@ -881,9 +891,7 @@ impl SessionState {
             statement_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
             lock_timeout: std::sync::Mutex::new(None),
             idle_in_transaction_session_timeout: std::sync::Mutex::new(None),
-            synchronous_commit: std::sync::atomic::AtomicBool::new(
-                synchronous_commit_env_default(),
-            ),
+            synchronous_commit: std::sync::atomic::AtomicBool::new(synchronous_commit_env_default()),
             trgm_similarity_threshold: std::sync::atomic::AtomicU32::new(
                 basin_trgm::DEFAULT_SIMILARITY_THRESHOLD.to_bits(),
             ),
@@ -924,9 +932,7 @@ impl SessionState {
             statement_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
             lock_timeout: std::sync::Mutex::new(None),
             idle_in_transaction_session_timeout: std::sync::Mutex::new(None),
-            synchronous_commit: std::sync::atomic::AtomicBool::new(
-                synchronous_commit_env_default(),
-            ),
+            synchronous_commit: std::sync::atomic::AtomicBool::new(synchronous_commit_env_default()),
             trgm_similarity_threshold: std::sync::atomic::AtomicU32::new(
                 basin_trgm::DEFAULT_SIMILARITY_THRESHOLD.to_bits(),
             ),
@@ -984,7 +990,10 @@ impl SessionState {
 
         // lock_timeout → None (also mirror into the advisory-lock manager, the
         // same way `set_session_lock_timeout` keeps the two in sync).
-        *self.lock_timeout.lock().expect("lock_timeout lock poisoned") = None;
+        *self
+            .lock_timeout
+            .lock()
+            .expect("lock_timeout lock poisoned") = None;
         self.advisory.set_lock_timeout(None);
 
         // idle_in_transaction_session_timeout → None.
@@ -1206,7 +1215,10 @@ impl TableMetaCache {
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.inner.lock().expect("table_meta_cache lock poisoned").len()
+        self.inner
+            .lock()
+            .expect("table_meta_cache lock poisoned")
+            .len()
     }
 }
 
@@ -1474,7 +1486,10 @@ impl ProviderCache {
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.inner.lock().expect("provider_cache lock poisoned").len()
+        self.inner
+            .lock()
+            .expect("provider_cache lock poisoned")
+            .len()
     }
 }
 
@@ -1522,14 +1537,17 @@ impl HeadProbeCache {
     }
 
     pub(crate) fn insert(&self, table: TableName, snapshot: SnapshotId, catalog_epoch: u64) {
-        self.inner.lock().expect("head_probe_cache lock poisoned").put(
-            table,
-            HeadProbeEntry {
-                snapshot,
-                inserted_at: Instant::now(),
-                catalog_epoch,
-            },
-        );
+        self.inner
+            .lock()
+            .expect("head_probe_cache lock poisoned")
+            .put(
+                table,
+                HeadProbeEntry {
+                    snapshot,
+                    inserted_at: Instant::now(),
+                    catalog_epoch,
+                },
+            );
     }
 
     pub(crate) fn invalidate_all(&self) {
@@ -1604,14 +1622,17 @@ impl DmlFlagsCache {
     }
 
     pub(crate) fn insert(&self, table: TableName, flags: DmlFlags, catalog_epoch: u64) {
-        self.inner.lock().expect("dml_flags_cache lock poisoned").put(
-            table,
-            DmlFlagsEntry {
-                flags,
-                inserted_at: Instant::now(),
-                catalog_epoch,
-            },
-        );
+        self.inner
+            .lock()
+            .expect("dml_flags_cache lock poisoned")
+            .put(
+                table,
+                DmlFlagsEntry {
+                    flags,
+                    inserted_at: Instant::now(),
+                    catalog_epoch,
+                },
+            );
     }
 
     pub(crate) fn invalidate_all(&self) {
@@ -2067,10 +2088,7 @@ pub(crate) fn tx_read_snapshot_for(
 /// SELECT gate, which runs before any tail flush) must use this and fall to
 /// the DataFusion path when no pin exists yet, so the pin is always captured
 /// by `load_table_for_read` after the read's own flush.
-pub(crate) fn tx_read_snapshot_peek(
-    state: &SessionState,
-    table: &TableName,
-) -> Option<SnapshotId> {
+pub(crate) fn tx_read_snapshot_peek(state: &SessionState, table: &TableName) -> Option<SnapshotId> {
     let tx = state.tx_state.lock().expect("tx_state lock poisoned");
     if !tx.active {
         return None;
@@ -2116,10 +2134,7 @@ pub(crate) fn tx_hot_seq_watermark_for(
 /// for `table`. Returns `None` outside a transaction or before the table's
 /// first touch. Used by the overlay read path to filter post-snapshot
 /// registry writes without re-pinning.
-pub(crate) fn tx_hot_seq_watermark_peek(
-    state: &SessionState,
-    table: &TableName,
-) -> Option<u64> {
+pub(crate) fn tx_hot_seq_watermark_peek(state: &SessionState, table: &TableName) -> Option<u64> {
     let tx = state.tx_state.lock().expect("tx_state lock poisoned");
     if !tx.active {
         return None;
@@ -2281,8 +2296,7 @@ pub(crate) fn tx_pending_files_for(state: &SessionState, table: &TableName) -> V
 /// both maps to find every table whose visible state changed.
 pub(crate) fn tx_touched_tables(state: &SessionState) -> Vec<TableName> {
     let tx = state.tx_state.lock().expect("tx_state lock poisoned");
-    let mut set: std::collections::HashSet<TableName> =
-        tx.pending_files.keys().cloned().collect();
+    let mut set: std::collections::HashSet<TableName> = tx.pending_files.keys().cloned().collect();
     set.extend(tx.htap_rows.keys().cloned());
     set.into_iter().collect()
 }
@@ -2387,16 +2401,16 @@ pub(crate) fn tx_overlay_put(
     value: basin_hottier::MemRowValue,
 ) {
     let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
-    tx.tx_overlay.entry(table.clone()).or_default().insert(key, value);
+    tx.tx_overlay
+        .entry(table.clone())
+        .or_default()
+        .insert(key, value);
 }
 
 /// Clone this transaction's overlay map for `table` (for in-tx reads).
 /// Empty map when none. Returned by value so the read path can merge it on
 /// top of the shared-registry snapshot without holding the tx lock.
-pub(crate) fn tx_overlay_peek(
-    state: &SessionState,
-    table: &TableName,
-) -> TxOverlayTable {
+pub(crate) fn tx_overlay_peek(state: &SessionState, table: &TableName) -> TxOverlayTable {
     let tx = state.tx_state.lock().expect("tx_state lock poisoned");
     // Fast-out for the auto-commit read hot path: outside a tx the overlay is
     // always empty, so skip the clone+lookup entirely.
@@ -2409,9 +2423,7 @@ pub(crate) fn tx_overlay_peek(
 /// Drain and return the entire tx-overlay on COMMIT so the executor can write
 /// each entry into the shared `MemTableRegistry`. Mirrors `tx_htap_take_all`:
 /// call this BEFORE `tx_commit` (which clears `TxState`).
-pub(crate) fn tx_overlay_take_all(
-    state: &SessionState,
-) -> HashMap<TableName, TxOverlayTable> {
+pub(crate) fn tx_overlay_take_all(state: &SessionState) -> HashMap<TableName, TxOverlayTable> {
     let mut tx = state.tx_state.lock().expect("tx_state lock poisoned");
     std::mem::take(&mut tx.tx_overlay)
 }
@@ -2474,10 +2486,7 @@ pub(crate) fn session_lock_timeout(state: &SessionState) -> Option<std::time::Du
 /// Updates both the `SessionState.lock_timeout` field (for any callers that
 /// read it directly) and `advisory.lock_timeout` (used by the blocking
 /// `pg_advisory_lock` UDF — ADR 0026).
-pub(crate) fn set_session_lock_timeout(
-    state: &SessionState,
-    d: Option<std::time::Duration>,
-) {
+pub(crate) fn set_session_lock_timeout(state: &SessionState, d: Option<std::time::Duration>) {
     *state
         .lock_timeout
         .lock()
@@ -2613,11 +2622,7 @@ pub(crate) fn set_session_trgm_word_similarity_threshold(state: &SessionState, v
 
 /// Read the session's `basin.read_tier` (default `Primary`).
 pub(crate) fn session_read_tier(state: &SessionState) -> ReadTier {
-    ReadTier::from_u8(
-        state
-            .read_tier
-            .load(std::sync::atomic::Ordering::Relaxed),
-    )
+    ReadTier::from_u8(state.read_tier.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Set `basin.read_tier` for this session.
@@ -2645,18 +2650,12 @@ impl ProjectSession {
 /// Touch the session's last-active timestamp. Called at the start of every
 /// `execute()` so the idle-in-txn reaper sees fresh activity.
 pub(crate) fn touch_last_active(state: &SessionState) {
-    *state
-        .last_active
-        .lock()
-        .expect("last_active lock poisoned") = std::time::Instant::now();
+    *state.last_active.lock().expect("last_active lock poisoned") = std::time::Instant::now();
 }
 
 /// Read the session's last-active timestamp.
 pub(crate) fn last_active(state: &SessionState) -> std::time::Instant {
-    *state
-        .last_active
-        .lock()
-        .expect("last_active lock poisoned")
+    *state.last_active.lock().expect("last_active lock poisoned")
 }
 
 #[instrument(skip(engine, current_user, auth_context), fields(project = %project))]
@@ -2734,10 +2733,7 @@ pub(crate) async fn open(
         0,
         std::sync::Arc::new(crate::union_scan_collapse::UnionScanCollapse),
     );
-    optimizer_rules.insert(
-        0,
-        std::sync::Arc::new(crate::nullif_rewrite::NullifRewrite),
-    );
+    optimizer_rules.insert(0, std::sync::Arc::new(crate::nullif_rewrite::NullifRewrite));
     optimizer_rules.insert(
         0,
         std::sync::Arc::new(crate::is_distinct_rewrite::IsDistinctRewrite),
@@ -2747,9 +2743,8 @@ pub(crate) async fn open(
     // metadata cache. Vortex/Parquet footer parses survive session recycling —
     // the dominant cost behind scale regressions at 100k rows / 50 files.
     // DefaultFilesMetadataCache validates entries via size + last_modified.
-    let cache_cfg = CacheManagerConfig::default().with_file_metadata_cache(Some(
-        engine.inner.file_metadata_cache.clone(),
-    ));
+    let cache_cfg = CacheManagerConfig::default()
+        .with_file_metadata_cache(Some(engine.inner.file_metadata_cache.clone()));
     let runtime_env = RuntimeEnvBuilder::new()
         .with_cache_manager(cache_cfg)
         // Plug in the process-wide bounded memory pool so the SUM of concurrent
@@ -2768,17 +2763,11 @@ pub(crate) async fn open(
     let state = SessionStateBuilder::new()
         .with_config(session_cfg)
         .with_runtime_env(runtime_env)
-        .with_table_factories(
-            SessionStateDefaults::default_table_factories(),
-        )
+        .with_table_factories(SessionStateDefaults::default_table_factories())
         .with_file_formats(SessionStateDefaults::default_file_formats())
         .with_expr_planners(SessionStateDefaults::default_expr_planners())
-        .with_window_functions(
-            SessionStateDefaults::default_window_functions(),
-        )
-        .with_table_function_list(
-            SessionStateDefaults::default_table_functions(),
-        )
+        .with_window_functions(SessionStateDefaults::default_window_functions())
+        .with_table_function_list(SessionStateDefaults::default_table_functions())
         // Inject our prepended optimizer rule list (cloned from the
         // engine-wide cache).
         .with_optimizer_rules(optimizer_rules)
@@ -2908,18 +2897,16 @@ pub(crate) async fn open(
         let catalog_name = ctx.state().config_options().catalog.default_catalog.clone();
         if let Some(df_catalog) = ctx.catalog(&catalog_name) {
             let ts_schema = Arc::new(MemorySchemaProvider::new());
-            let chunks_provider: Arc<dyn TableProvider> = Arc::new(
-                crate::hypertable_provider::ChunksProvider::new(
+            let chunks_provider: Arc<dyn TableProvider> =
+                Arc::new(crate::hypertable_provider::ChunksProvider::new(
                     engine.hypertable_registry().clone(),
                     project,
-                ),
-            );
-            let hypertables_provider: Arc<dyn TableProvider> = Arc::new(
-                crate::hypertable_provider::HypertablesProvider::new(
+                ));
+            let hypertables_provider: Arc<dyn TableProvider> =
+                Arc::new(crate::hypertable_provider::HypertablesProvider::new(
                     engine.hypertable_registry().clone(),
                     project,
-                ),
-            );
+                ));
             let _ = ts_schema.register_table("chunks".to_string(), chunks_provider);
             let _ = ts_schema.register_table("hypertables".to_string(), hypertables_provider);
             let _ = df_catalog.register_schema("timescaledb_information", ts_schema);
@@ -2944,17 +2931,16 @@ pub(crate) async fn open(
     {
         let rt_source = engine.realtime_source();
         let notify = Arc::new(engine.notify_registry().clone());
-        if let Err(e) = crate::realtime_catalog::register_realtime_providers(
-            &ctx,
-            project,
-            rt_source,
-            notify,
-        ) {
+        if let Err(e) =
+            crate::realtime_catalog::register_realtime_providers(&ctx, project, rt_source, notify)
+        {
             tracing::warn!("register_realtime_providers: {e}");
         }
     }
 
-    let state = Arc::new(SessionState::new_with_schema_state(Arc::clone(&schema_state)));
+    let state = Arc::new(SessionState::new_with_schema_state(Arc::clone(
+        &schema_state,
+    )));
 
     // Phase 5.28.C: register with the idle-in-txn reaper.
     let (reaper_id, reaped_flag) = engine.reaper_registry().register(state.clone());
@@ -3016,7 +3002,11 @@ pub(crate) async fn open(
     // `refresh_table` on the query path), so a table that fails to warm here but
     // is later repaired (or whose transient error clears) still becomes queryable
     // without reconnecting.
-    let qtables = engine.config().catalog.list_tables_qualified(&project).await?;
+    let qtables = engine
+        .config()
+        .catalog
+        .list_tables_qualified(&project)
+        .await?;
     for qtable in qtables {
         if let Err(e) = refresh_table_qualified(&engine, &project, &ctx, &state, &qtable).await {
             tracing::warn!(
@@ -3052,21 +3042,16 @@ pub(crate) async fn open(
     // ADR 0026: wire the LockRegistry + project + pid into the advisory-lock
     // manager so that held advisory locks appear in `pg_locks` and the session
     // pid is correctly reported.
-    state.advisory.set_registry(
-        engine.lock_registry().clone(),
-        project,
-        session_pid,
-    );
+    state
+        .advisory
+        .set_registry(engine.lock_registry().clone(), project, session_pid);
 
     // Phase 5.31.A: register a per-session `pg_cancel_backend(pid)` UDF.
     // This captures the engine handle and session_pid so that calling
     // `SELECT pg_cancel_backend(N)` from another session resolves through
     // the engine's cancel_backend path, which fires the target's notify and
     // returns SQLSTATE 57014 to the target's running query.
-    crate::cancel_udf::register_pg_cancel_backend_udf(
-        &ctx,
-        engine.clone(),
-    );
+    crate::cancel_udf::register_pg_cancel_backend_udf(&ctx, engine.clone());
 
     // SQL pub-sub introspection: `pg_listening_channels()` reports the
     // channels this session is currently listening on. Per-session because
@@ -3432,7 +3417,9 @@ async fn refresh_table_inner(
     state: &Arc<SessionState>,
     table: &TableName,
 ) -> Result<usize> {
-    let tref = || TableReference::Bare { table: table.as_str().into() };
+    let tref = || TableReference::Bare {
+        table: table.as_str().into(),
+    };
 
     // ── Provider cache fast path (Fix B+C) ──────────────────────────────────
     //
@@ -3465,7 +3452,11 @@ async fn refresh_table_inner(
                 ctx.register_table(tref(), hit.provider).map_err(|e| {
                     BasinError::internal(format!("register_table cached {table}: {e}"))
                 })?;
-                state.snapshots.lock().await.insert(table.clone(), live_head);
+                state
+                    .snapshots
+                    .lock()
+                    .await
+                    .insert(table.clone(), live_head);
                 if hit.partitioned {
                     state
                         .has_partitioned_table
@@ -3489,9 +3480,10 @@ async fn refresh_table_inner(
     // the Parquet files but are kept OUT of the user-visible catalog schema
     // (so `information_schema.columns` stays clean).  DataFusion's
     // ListingTable picks them up via the extended schema below.
-    let df_schema = Arc::new(
-        extend_schema_with_promoted_cols(base_df_schema, &meta.promoted_jsonb_paths)
-    );
+    let df_schema = Arc::new(extend_schema_with_promoted_cols(
+        base_df_schema,
+        &meta.promoted_jsonb_paths,
+    ));
 
     // Drop any stale registration before re-registering. `deregister_table`
     // returns Ok(None) for the first-time path, which is exactly what we want.
@@ -3555,7 +3547,9 @@ async fn refresh_table_inner(
     // drains, and the key needs no hot-tier epoch component.
     if auto_commit {
         let fill_epoch = engine.config().catalog.epoch();
-        state.head_probe_cache.insert(table.clone(), live_head, fill_epoch);
+        state
+            .head_probe_cache
+            .insert(table.clone(), live_head, fill_epoch);
         state.provider_cache.insert(
             ProviderCacheKey {
                 table: table.clone(),
@@ -3589,7 +3583,6 @@ async fn refresh_table_inner(
     Ok(live_files.len())
 }
 
-
 /// Phase 5.18.C — schema-qualified variant of [`refresh_table`].
 ///
 /// Loads the table from the catalog using `load_table_qualified` (so the
@@ -3618,7 +3611,10 @@ pub(crate) async fn refresh_table_qualified(
         .load_table_qualified(project, qtable)
         .await?;
     let base_df_schema = schema_ws_to_df(meta.schema.as_ref())?;
-    let df_schema = Arc::new(extend_schema_with_promoted_cols(base_df_schema, &meta.promoted_jsonb_paths));
+    let df_schema = Arc::new(extend_schema_with_promoted_cols(
+        base_df_schema,
+        &meta.promoted_jsonb_paths,
+    ));
 
     // Register under the bare table name so that DataFusion can find the
     // table after schema-qualifier stripping. The schema part is handled at
@@ -3698,7 +3694,9 @@ pub(crate) async fn refresh_table_with_extra(
     // pending (in-tx) `extra_files` below remain visible (read-your-own-writes).
     let (meta, live_head) = load_table_for_read(engine, project, state, table).await?;
     let df_schema = Arc::new(schema_ws_to_df(meta.schema.as_ref())?);
-    let tref = || TableReference::Bare { table: table.as_str().into() };
+    let tref = || TableReference::Bare {
+        table: table.as_str().into(),
+    };
     let _ = ctx.deregister_table(tref());
 
     // Combine catalog live files + pending (in-tx) files.
@@ -3773,7 +3771,9 @@ pub(crate) async fn refresh_table_with_htap(
     // session's own uncommitted writes and stay visible below.
     let (meta, live_head) = load_table_for_read(engine, project, state, table).await?;
     let df_schema = Arc::new(schema_ws_to_df(meta.schema.as_ref())?);
-    let tref = || TableReference::Bare { table: table.as_str().into() };
+    let tref = || TableReference::Bare {
+        table: table.as_str().into(),
+    };
     let _ = ctx.deregister_table(tref());
 
     // Combine catalog live files + pending (in-tx) files.
@@ -3809,10 +3809,10 @@ pub(crate) async fn refresh_table_with_htap(
         let cfg = ListingTableConfig::new_with_multi_paths(urls)
             .with_listing_options(listing_options)
             .with_schema(df_schema.clone());
-        let listing_provider = Arc::new(
-            ListingTable::try_new(cfg)
-                .map_err(|e| BasinError::internal(format!("ListingTable::try_new {table}: {e}")))?,
-        );
+        let listing_provider =
+            Arc::new(ListingTable::try_new(cfg).map_err(|e| {
+                BasinError::internal(format!("ListingTable::try_new {table}: {e}"))
+            })?);
         let union_provider = HtapUnionTable::new(
             listing_provider,
             Arc::new(htap_provider),
@@ -3940,11 +3940,10 @@ impl datafusion::catalog::TableProvider for HtapUnionTable {
         filters: &[datafusion::logical_expr::Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        use datafusion::physical_plan::union::UnionExec;
         use crate::hot_tombstone::{
-            snapshot_tombstones, snapshot_updates,
-            TombstoneFilterExec, UpdateOverlayExec,
+            snapshot_tombstones, snapshot_updates, TombstoneFilterExec, UpdateOverlayExec,
         };
+        use datafusion::physical_plan::union::UnionExec;
 
         let registry = self.engine.memtable_registry();
         // Filter the shared-registry overlay to this transaction's pinned
@@ -3973,8 +3972,8 @@ impl datafusion::catalog::TableProvider for HtapUnionTable {
         // Single-PK gate: fast-path DELETE/UPDATE only writes to single-column-PK
         // tables. Composite-PK or no-PK tables can never have tombstones/updates in
         // the registry, so skip the overhead.
-        let apply_overlay = (self.pk_columns.len() == 1)
-            && (!tombs.is_empty() || !updates.is_empty());
+        let apply_overlay =
+            (self.pk_columns.len() == 1) && (!tombs.is_empty() || !updates.is_empty());
 
         if !apply_overlay {
             // Zero-overhead pass-through: no tombstones and no UPDATE overrides.
@@ -4017,17 +4016,16 @@ impl datafusion::catalog::TableProvider for HtapUnionTable {
             .await?;
 
         // Apply tombstone row-filter (no-op when no tombstones).
-        let mut filtered: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
-            if tombs.is_empty() {
-                cold_plan
-            } else {
-                Arc::new(TombstoneFilterExec::new(
-                    cold_plan,
-                    pk_col.clone(),
-                    pk_dt.clone(),
-                    Arc::new(tombs),
-                ))
-            };
+        let mut filtered: Arc<dyn datafusion::physical_plan::ExecutionPlan> = if tombs.is_empty() {
+            cold_plan
+        } else {
+            Arc::new(TombstoneFilterExec::new(
+                cold_plan,
+                pk_col.clone(),
+                pk_dt.clone(),
+                Arc::new(tombs),
+            ))
+        };
 
         // Apply UPDATE override overlay: suppress overridden cold rows and
         // append the post-SET row images. The overlay reprojects overrides to
@@ -4101,17 +4099,25 @@ impl datafusion::catalog::TableProvider for HtapUnionTable {
         &self,
         filters: &[&datafusion::logical_expr::Expr],
     ) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
-        use datafusion::logical_expr::TableProviderFilterPushDown as Pd;
         use crate::hot_tombstone::{snapshot_tombstones, snapshot_updates};
+        use datafusion::logical_expr::TableProviderFilterPushDown as Pd;
         let cold = self.cold.supports_filters_pushdown(filters)?;
 
         // Determine whether an overlay is actually live for THIS read view,
         // mirroring `scan`'s `apply_overlay` decision (same watermark, same tx
         // overlay merge). Only a live, applicable overlay forces `Inexact`.
-        let mut tombs =
-            snapshot_tombstones(self.engine.memtable_registry().as_ref(), &self.project, &self.table, self.hot_seq_watermark);
-        let mut updates =
-            snapshot_updates(self.engine.memtable_registry().as_ref(), &self.project, &self.table, self.hot_seq_watermark);
+        let mut tombs = snapshot_tombstones(
+            self.engine.memtable_registry().as_ref(),
+            &self.project,
+            &self.table,
+            self.hot_seq_watermark,
+        );
+        let mut updates = snapshot_updates(
+            self.engine.memtable_registry().as_ref(),
+            &self.project,
+            &self.table,
+            self.hot_seq_watermark,
+        );
         if !self.tx_overlay.is_empty() {
             crate::hot_tombstone::merge_tx_overlay(&mut tombs, &mut updates, &self.tx_overlay);
         }
@@ -4264,7 +4270,10 @@ fn decode_stats_i64(b: &[u8]) -> Option<i64> {
 ///   absent from the file.
 enum SelectivePredicate {
     /// Existing Int64 half-open range `[lo, hi)` (at least one bound set).
-    IntRange { column: String, rb: crate::fast_aggregate::RangeBound },
+    IntRange {
+        column: String,
+        rb: crate::fast_aggregate::RangeBound,
+    },
     /// `col = <int>` on an Int64 column.
     IntEq { column: String, lit: i64 },
     /// `col IN (<int>, ...)` on an Int64 column (non-empty, deduped).
@@ -4322,11 +4331,18 @@ fn ident_column(e: &Expr) -> Option<String> {
 fn expr_int_literal(e: &Expr) -> Option<i64> {
     use sqlparser::ast::UnaryOperator;
     match e {
-        Expr::Value(ValueWithSpan { value: Value::Number(s, _), .. }) => s.parse::<i64>().ok(),
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
-            expr_int_literal(expr).and_then(|v| v.checked_neg())
-        }
-        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => expr_int_literal(expr),
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(s, _),
+            ..
+        }) => s.parse::<i64>().ok(),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => expr_int_literal(expr).and_then(|v| v.checked_neg()),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => expr_int_literal(expr),
         Expr::Nested(inner) => expr_int_literal(inner),
         _ => None,
     }
@@ -4338,9 +4354,10 @@ fn expr_int_literal(e: &Expr) -> Option<i64> {
 /// encoding that might not match the stored UTF-8 stat bytes).
 fn expr_str_literal(e: &Expr) -> Option<Vec<u8>> {
     match e {
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
-            Some(s.clone().into_bytes())
-        }
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        }) => Some(s.clone().into_bytes()),
         Expr::Nested(inner) => expr_str_literal(inner),
         _ => None,
     }
@@ -4364,7 +4381,10 @@ fn recognise_selective_predicate(where_expr: &Expr) -> Option<SelectivePredicate
     //    range can't drop anything, so the caller's `lo|hi` check still applies.
     if let Some(rb) = crate::fast_aggregate::parse_range_bound(where_expr) {
         if rb.lo.is_some() || rb.hi.is_some() {
-            return Some(SelectivePredicate::IntRange { column: rb.column.clone(), rb });
+            return Some(SelectivePredicate::IntRange {
+                column: rb.column.clone(),
+                rb,
+            });
         }
     }
 
@@ -4372,22 +4392,36 @@ fn recognise_selective_predicate(where_expr: &Expr) -> Option<SelectivePredicate
     // string range only — an AND-conjunction on one column.
     match unwrap_nested(where_expr) {
         // Equality: `col = lit` or `lit = col`.
-        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
             let (col, lit_expr) = match (ident_column(left), ident_column(right)) {
                 (Some(c), None) => (c, right.as_ref()),
                 (None, Some(c)) => (c, left.as_ref()),
                 _ => return None,
             };
             if let Some(v) = expr_int_literal(lit_expr) {
-                return Some(SelectivePredicate::IntEq { column: col, lit: v });
+                return Some(SelectivePredicate::IntEq {
+                    column: col,
+                    lit: v,
+                });
             }
             if let Some(s) = expr_str_literal(lit_expr) {
-                return Some(SelectivePredicate::StrEq { column: col, lit: s });
+                return Some(SelectivePredicate::StrEq {
+                    column: col,
+                    lit: s,
+                });
             }
             None
         }
         // `col IN (a, b, ...)` — reject `NOT IN` and subquery forms.
-        Expr::InList { expr, list, negated: false } => {
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
             let col = ident_column(expr)?;
             if list.is_empty() {
                 return None;
@@ -4413,7 +4447,11 @@ fn recognise_selective_predicate(where_expr: &Expr) -> Option<SelectivePredicate
             if acc.lo.is_none() && acc.hi.is_none() {
                 return None;
             }
-            Some(SelectivePredicate::StrRange { column, lo: acc.lo, hi: acc.hi })
+            Some(SelectivePredicate::StrRange {
+                column,
+                lo: acc.lo,
+                hi: acc.hi,
+            })
         }
     }
 }
@@ -4441,7 +4479,12 @@ struct StrRangeAcc {
 /// literal, an unsupported operator, equality).
 fn collect_str_range(expr: &Expr, acc: &mut StrRangeAcc) -> Result<(), ()> {
     let expr = unwrap_nested(expr);
-    if let Expr::BinaryOp { left, op: BinaryOperator::And, right } = expr {
+    if let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::And,
+        right,
+    } = expr
+    {
         collect_str_range(left, acc)?;
         collect_str_range(right, acc)?;
         return Ok(());
@@ -4542,9 +4585,7 @@ fn int_eq_could_be_present(f: &DataFileRef, column: &str, lit: i64) -> bool {
 /// ordering the writer's `ByteArray` stat merge preserves.
 fn str_eq_could_be_present(f: &DataFileRef, column: &str, lit: &[u8]) -> bool {
     if let Some(cs) = f.column_stats.get(column) {
-        if let (Some(fmin), Some(fmax)) =
-            (cs.min_bytes.as_deref(), cs.max_bytes.as_deref())
-        {
+        if let (Some(fmin), Some(fmax)) = (cs.min_bytes.as_deref(), cs.max_bytes.as_deref()) {
             if fmin <= fmax && (lit < fmin || lit > fmax) {
                 return false;
             }
@@ -4577,16 +4618,12 @@ fn file_survives_selective(f: &DataFileRef, pred: &SelectivePredicate) -> bool {
                 None => true,
             }
         }
-        SelectivePredicate::IntEq { column, lit } => {
-            int_eq_could_be_present(f, column, *lit)
-        }
+        SelectivePredicate::IntEq { column, lit } => int_eq_could_be_present(f, column, *lit),
         SelectivePredicate::IntIn { column, lits } => {
             // Keep iff ANY value could be present.
             lits.iter().any(|v| int_eq_could_be_present(f, column, *v))
         }
-        SelectivePredicate::StrEq { column, lit } => {
-            str_eq_could_be_present(f, column, lit)
-        }
+        SelectivePredicate::StrEq { column, lit } => str_eq_could_be_present(f, column, lit),
         SelectivePredicate::StrIn { column, lits } => {
             lits.iter().any(|v| str_eq_could_be_present(f, column, v))
         }
@@ -4599,10 +4636,18 @@ fn file_survives_selective(f: &DataFileRef, pred: &SelectivePredicate) -> bool {
                         //   below: fmax < lo            (exclusive-lo: fmax <= lo)
                         //   above: fmin > hi            (exclusive-hi: fmin >= hi)
                         let below = lo.as_ref().is_some_and(|(lv, incl)| {
-                            if *incl { fmax < lv.as_slice() } else { fmax <= lv.as_slice() }
+                            if *incl {
+                                fmax < lv.as_slice()
+                            } else {
+                                fmax <= lv.as_slice()
+                            }
                         });
                         let above = hi.as_ref().is_some_and(|(hv, incl)| {
-                            if *incl { fmin > hv.as_slice() } else { fmin >= hv.as_slice() }
+                            if *incl {
+                                fmin > hv.as_slice()
+                            } else {
+                                fmin >= hv.as_slice()
+                            }
                         });
                         !(below || above)
                     }
@@ -4748,7 +4793,11 @@ pub(crate) async fn apply_minmax_file_pruning_for_query(
     // whole pass a no-op (full scan), since the stats byte-encoding contract is
     // type-specific.
     let want_ty = pred.required_type();
-    match base_df_schema.fields().iter().find(|f| f.name() == pred.column()) {
+    match base_df_schema
+        .fields()
+        .iter()
+        .find(|f| f.name() == pred.column())
+    {
         Some(f) if *f.data_type() == want_ty => {}
         _ => return Ok(()),
     }
@@ -4824,7 +4873,9 @@ fn register_empty_table(
 ) -> Result<()> {
     let provider = MemTable::try_new(df_schema, vec![vec![]])
         .map_err(|e| BasinError::internal(format!("empty MemTable::try_new (pruned): {e}")))?;
-    let tref = TableReference::Bare { table: table.as_str().into() };
+    let tref = TableReference::Bare {
+        table: table.as_str().into(),
+    };
     let _ = ctx.deregister_table(tref.clone());
     ctx.register_table(tref, Arc::new(provider))
         .map_err(|e| BasinError::internal(format!("register_table empty (pruned): {e}")))?;
@@ -4855,8 +4906,7 @@ async fn register_pruned_listing_table(
     let (file_format, file_ext) = listing_file_format(file_format);
     let mut listing_options = ListingOptions::new(file_format).with_file_extension(file_ext);
     if let Some(sort_cols) = global_sort_order {
-        listing_options =
-            listing_options.with_file_sort_order(build_file_sort_order(sort_cols));
+        listing_options = listing_options.with_file_sort_order(build_file_sort_order(sort_cols));
     }
 
     let mut urls: Vec<ListingTableUrl> = Vec::with_capacity(paths.len());
@@ -4879,7 +4929,9 @@ async fn register_pruned_listing_table(
     let provider = ListingTable::try_new(cfg)
         .map_err(|e| BasinError::internal(format!("ListingTable::try_new (pruned): {e}")))?;
 
-    let tref = TableReference::Bare { table: table.as_str().into() };
+    let tref = TableReference::Bare {
+        table: table.as_str().into(),
+    };
     let _ = ctx.deregister_table(tref.clone());
     ctx.register_table(tref, Arc::new(provider))
         .map_err(|e| BasinError::internal(format!("register_table pruned: {e}")))?;
@@ -4957,16 +5009,13 @@ pub(crate) async fn apply_gin_pruning_for_query(
 
     // Parse and detect a GIN containment plan (same detector used by the
     // Empty short-circuit path in executor.rs).
-    let gin_plan = match crate::index_probe::detect_gin_containment(
-        sql,
-        project,
-        &engine.config().catalog,
-    )
-    .await
-    {
-        Some(p) => p,
-        None => return Ok(()), // query shape not recognised → full scan
-    };
+    let gin_plan =
+        match crate::index_probe::detect_gin_containment(sql, project, &engine.config().catalog)
+            .await
+        {
+            Some(p) => p,
+            None => return Ok(()), // query shape not recognised → full scan
+        };
 
     // Live-overlay gate (the dml_mutate.rs UPDATE fast-path gate's blocker
     // #2): every registration below — `GinRowGroupPrunedTable` on the
@@ -4983,7 +5032,12 @@ pub(crate) async fn apply_gin_pruning_for_query(
 
     // Fetch the live file set from the catalog.  Needed both for the
     // file-level completeness guard and the row-group-direct path.
-    let meta = match engine.config().catalog.load_table(project, &gin_plan.table).await {
+    let meta = match engine
+        .config()
+        .catalog
+        .load_table(project, &gin_plan.table)
+        .await
+    {
         Ok(m) => m,
         Err(_) => return Ok(()), // can't verify completeness → full scan
     };
@@ -4992,8 +5046,7 @@ pub(crate) async fn apply_gin_pruning_for_query(
         // No live files — the Empty short-circuit handles this; nothing to prune.
         return Ok(());
     }
-    let live_paths: Vec<String> =
-        live_files.iter().map(|f| f.path.to_string()).collect();
+    let live_paths: Vec<String> = live_files.iter().map(|f| f.path.to_string()).collect();
 
     // ── Direct row-group prune path (for compaction-indexed files) ────────────
     //
@@ -5044,7 +5097,9 @@ pub(crate) async fn apply_gin_pruning_for_query(
                     live_paths.clone(),
                     rg_map,
                 );
-                let tref = TableReference::Bare { table: gin_plan.table.as_str().into() };
+                let tref = TableReference::Bare {
+                    table: gin_plan.table.as_str().into(),
+                };
                 let _ = ctx.deregister_table(tref.clone());
                 ctx.register_table(tref, Arc::new(provider))
                     .map_err(|e| BasinError::internal(format!("register rg-pruned table: {e}")))?;
@@ -5198,7 +5253,12 @@ pub(crate) async fn apply_gin_pruning_for_query(
             Err(_) => {
                 // Schema conversion failed — fall through to file-level prune.
                 return register_pruned_listing_table_if_narrowed(
-                    engine, ctx, &gin_plan.table, &meta, &candidate_paths, &live_files,
+                    engine,
+                    ctx,
+                    &gin_plan.table,
+                    &meta,
+                    &candidate_paths,
+                    &live_files,
                 )
                 .await;
             }
@@ -5213,7 +5273,9 @@ pub(crate) async fn apply_gin_pruning_for_query(
             rg_map.unwrap_or_default(),
             row_selection_map,
         );
-        let tref = TableReference::Bare { table: gin_plan.table.as_str().into() };
+        let tref = TableReference::Bare {
+            table: gin_plan.table.as_str().into(),
+        };
         let _ = ctx.deregister_table(tref.clone());
         ctx.register_table(tref, Arc::new(provider))
             .map_err(|e| BasinError::internal(format!("register rg-pruned table: {e}")))?;
@@ -5222,7 +5284,12 @@ pub(crate) async fn apply_gin_pruning_for_query(
 
     // No row-group summaries and no row tier — fall back to file-level prune.
     register_pruned_listing_table_if_narrowed(
-        engine, ctx, &gin_plan.table, &meta, &candidate_paths, &live_files,
+        engine,
+        ctx,
+        &gin_plan.table,
+        &meta,
+        &candidate_paths,
+        &live_files,
     )
     .await
 }
@@ -5292,16 +5359,13 @@ pub(crate) async fn apply_gin_fts_pruning_for_query(
     }
 
     // Detect the FTS predicate shape.
-    let fts_plan = match crate::index_probe::detect_tsvector_match(
-        sql,
-        project,
-        &engine.config().catalog,
-    )
-    .await
-    {
-        Some(p) => p,
-        None => return Ok(()), // query shape not recognised → full scan
-    };
+    let fts_plan =
+        match crate::index_probe::detect_tsvector_match(sql, project, &engine.config().catalog)
+            .await
+        {
+            Some(p) => p,
+            None => return Ok(()), // query shape not recognised → full scan
+        };
 
     // Live-overlay gate — same blocker as `apply_gin_pruning_for_query`
     // above: the registrations below (`GinRowGroupPrunedTable`, the pruned
@@ -5337,7 +5401,12 @@ pub(crate) async fn apply_gin_fts_pruning_for_query(
     };
 
     // Completeness guard: fetch the live file set from the catalog.
-    let meta = match engine.config().catalog.load_table(project, &fts_plan.table).await {
+    let meta = match engine
+        .config()
+        .catalog
+        .load_table(project, &fts_plan.table)
+        .await
+    {
         Ok(m) => m,
         Err(_) => return Ok(()), // can't verify completeness → full scan
     };
@@ -5347,11 +5416,10 @@ pub(crate) async fn apply_gin_fts_pruning_for_query(
     }
 
     // Check coverage: every live file must appear in the indexed-files set.
-    let indexed = engine.gin_fts_registry().indexed_files_for(
-        project,
-        &fts_plan.table,
-        &fts_plan.col,
-    );
+    let indexed =
+        engine
+            .gin_fts_registry()
+            .indexed_files_for(project, &fts_plan.table, &fts_plan.col);
     let all_covered = live_files.iter().all(|f| indexed.contains(f.path.as_str()));
     if !all_covered {
         // At least one live file is not in the posting list → full scan.
@@ -5387,7 +5455,10 @@ pub(crate) async fn apply_gin_fts_pruning_for_query(
     // conservative superset of the posting-list rows that touched the
     // query lexemes; the full `@@` UDF re-evaluates every emitted row.
     let df_schema = match schema_ws_to_df(&meta.schema) {
-        Ok(s) => Arc::new(extend_schema_with_promoted_cols(s, &meta.promoted_jsonb_paths)),
+        Ok(s) => Arc::new(extend_schema_with_promoted_cols(
+            s,
+            &meta.promoted_jsonb_paths,
+        )),
         Err(_) => {
             // Schema conversion failed — we cannot build a provider whose
             // schema matches the original registration, so re-registering
@@ -5408,7 +5479,9 @@ pub(crate) async fn apply_gin_fts_pruning_for_query(
         pruned_paths,
         rg_map_live,
     );
-    let tref = TableReference::Bare { table: fts_plan.table.as_str().into() };
+    let tref = TableReference::Bare {
+        table: fts_plan.table.as_str().into(),
+    };
     let _ = ctx.deregister_table(tref.clone());
     ctx.register_table(tref, Arc::new(provider))
         .map_err(|e| BasinError::internal(format!("register fts rg-pruned table: {e}")))?;
@@ -5454,16 +5527,13 @@ pub(crate) async fn apply_trgm_pruning_for_query(
         return Ok(());
     }
 
-    let plan = match crate::index_probe::detect_trgm_similarity(
-        sql,
-        project,
-        &engine.config().catalog,
-    )
-    .await
-    {
-        Some(p) => p,
-        None => return Ok(()), // shape not recognised → full scan
-    };
+    let plan =
+        match crate::index_probe::detect_trgm_similarity(sql, project, &engine.config().catalog)
+            .await
+        {
+            Some(p) => p,
+            None => return Ok(()), // shape not recognised → full scan
+        };
 
     // Live-overlay gate — same blocker as `apply_gin_pruning_for_query`: the
     // pruned registrations replace the overlay-aware provider with a bare cold
@@ -5472,7 +5542,12 @@ pub(crate) async fn apply_trgm_pruning_for_query(
         return Ok(());
     }
 
-    let meta = match engine.config().catalog.load_table(project, &plan.table).await {
+    let meta = match engine
+        .config()
+        .catalog
+        .load_table(project, &plan.table)
+        .await
+    {
         Ok(m) => m,
         Err(_) => return Ok(()),
     };
@@ -5533,7 +5608,12 @@ pub(crate) async fn apply_trgm_pruning_for_query(
             Ok(s) => Arc::new(s),
             Err(_) => {
                 return register_pruned_listing_table_if_narrowed(
-                    engine, ctx, &plan.table, &meta, &candidate_paths, &live_files,
+                    engine,
+                    ctx,
+                    &plan.table,
+                    &meta,
+                    &candidate_paths,
+                    &live_files,
                 )
                 .await;
             }
@@ -5548,7 +5628,9 @@ pub(crate) async fn apply_trgm_pruning_for_query(
             Default::default(),
             row_selection_map,
         );
-        let tref = TableReference::Bare { table: plan.table.as_str().into() };
+        let tref = TableReference::Bare {
+            table: plan.table.as_str().into(),
+        };
         let _ = ctx.deregister_table(tref.clone());
         ctx.register_table(tref, Arc::new(provider))
             .map_err(|e| BasinError::internal(format!("register trgm row-pruned table: {e}")))?;
@@ -5557,7 +5639,12 @@ pub(crate) async fn apply_trgm_pruning_for_query(
 
     // No row tier — fall back to file-level prune.
     register_pruned_listing_table_if_narrowed(
-        engine, ctx, &plan.table, &meta, &candidate_paths, &live_files,
+        engine,
+        ctx,
+        &plan.table,
+        &meta,
+        &candidate_paths,
+        &live_files,
     )
     .await
 }
@@ -5596,7 +5683,12 @@ async fn detect_jsonb_containment_for_prune(
         return None;
     }
     let table_name = match &select.from[0].relation {
-        TableFactor::Table { name, alias: None, args: None, .. } => {
+        TableFactor::Table {
+            name,
+            alias: None,
+            args: None,
+            ..
+        } => {
             if name.0.len() != 1 {
                 return None;
             }
@@ -5614,11 +5706,12 @@ async fn detect_jsonb_containment_for_prune(
     // `jsonb_ops` (the only opclass our posting-list registry indexes for).
     let meta = catalog.load_table(project, &table).await.ok()?;
     let gin_index = meta.indexes.iter().find(|idx| {
-        idx.access_method == "gin"
-            && idx.columns.len() == 1
-            && idx.columns[0] == col_name
+        idx.access_method == "gin" && idx.columns.len() == 1 && idx.columns[0] == col_name
     })?;
-    let opclass = gin_index.opclass.clone().unwrap_or_else(|| "jsonb_ops".to_string());
+    let opclass = gin_index
+        .opclass
+        .clone()
+        .unwrap_or_else(|| "jsonb_ops".to_string());
     if opclass != "jsonb_ops" {
         // `jsonb_path_ops` uses hashed paths — the posting list's `(key,
         // value)` atom shape doesn't apply directly.  Skip and let the
@@ -5722,16 +5815,11 @@ pub(crate) async fn apply_jsonb_posting_pruning_for_query(
     // FROM table + WHERE shape — the projection doesn't change which
     // files we open.  We use a relaxed detector that ignores projection
     // and any trailing clauses (ORDER BY, LIMIT, etc.).
-    let gin_plan = match detect_jsonb_containment_for_prune(
-        sql,
-        project,
-        &engine.config().catalog,
-    )
-    .await
-    {
-        Some(p) => p,
-        None => return Ok(()),
-    };
+    let gin_plan =
+        match detect_jsonb_containment_for_prune(sql, project, &engine.config().catalog).await {
+            Some(p) => p,
+            None => return Ok(()),
+        };
 
     // Live-overlay gate — same blocker-#2 reasoning as
     // `apply_gin_pruning_for_query` above: `JsonbPostingPrunedTable` is a bare
@@ -5748,7 +5836,12 @@ pub(crate) async fn apply_jsonb_posting_pruning_for_query(
         Err(_) => return Ok(()),
     };
 
-    let meta = match engine.config().catalog.load_table(project, &gin_plan.table).await {
+    let meta = match engine
+        .config()
+        .catalog
+        .load_table(project, &gin_plan.table)
+        .await
+    {
         Ok(m) => m,
         Err(_) => return Ok(()),
     };
@@ -5756,8 +5849,7 @@ pub(crate) async fn apply_jsonb_posting_pruning_for_query(
     if live_files.is_empty() {
         return Ok(());
     }
-    let live_paths: Vec<String> =
-        live_files.iter().map(|f| f.path.to_string()).collect();
+    let live_paths: Vec<String> = live_files.iter().map(|f| f.path.to_string()).collect();
 
     // Lazy sidecar load: for each live file not in the registry, fetch the
     // bincode sidecar and ingest it.  Phase 5.19.F: a missing or unparseable
@@ -5769,14 +5861,12 @@ pub(crate) async fn apply_jsonb_posting_pruning_for_query(
         if registry.is_file_indexed(project, &gin_plan.table, &gin_plan.col, p) {
             continue;
         }
-        let Some(sidecar) =
-            basin_storage::index::jsonb_posting::posting_sidecar_key_for_data_file(
-                project,
-                &gin_plan.table,
-                &gin_plan.col,
-                p,
-            )
-        else {
+        let Some(sidecar) = basin_storage::index::jsonb_posting::posting_sidecar_key_for_data_file(
+            project,
+            &gin_plan.table,
+            &gin_plan.col,
+            p,
+        ) else {
             continue; // non-canonical path → uncovered (full scan of this file)
         };
         use object_store::ObjectStoreExt as _;
@@ -5854,7 +5944,9 @@ pub(crate) async fn apply_jsonb_posting_pruning_for_query(
         live_paths,
         rg_map_live,
     );
-    let tref = TableReference::Bare { table: gin_plan.table.as_str().into() };
+    let tref = TableReference::Bare {
+        table: gin_plan.table.as_str().into(),
+    };
     let _ = ctx.deregister_table(tref.clone());
     ctx.register_table(tref, Arc::new(provider))
         .map_err(|e| BasinError::internal(format!("register jsonb-posting-pruned table: {e}")))?;
@@ -5888,16 +5980,13 @@ pub(crate) async fn apply_gist_pruning_for_query(
     }
 
     // Detect the range predicate shape.
-    let plan = match crate::index_probe::detect_range_index_probe(
-        sql,
-        project,
-        &engine.config().catalog,
-    )
-    .await
-    {
-        Some(p) => p,
-        None => return Ok(()), // query shape not recognised → full scan
-    };
+    let plan =
+        match crate::index_probe::detect_range_index_probe(sql, project, &engine.config().catalog)
+            .await
+        {
+            Some(p) => p,
+            None => return Ok(()), // query shape not recognised → full scan
+        };
 
     // Probe the interval tree.
     use basin_common::types::range::{IndexInterval, RangeValue};
@@ -5908,7 +5997,9 @@ pub(crate) async fn apply_gist_pruning_for_query(
                 Some(p) => p,
                 None => return Ok(()),
             };
-            engine.interval_registry().probe_contains_point(project, &plan.table, &plan.col, pt)
+            engine
+                .interval_registry()
+                .probe_contains_point(project, &plan.table, &plan.col, pt)
         }
         crate::index_probe::RangeOp::ContainsRange
         | crate::index_probe::RangeOp::Overlaps
@@ -5925,7 +6016,9 @@ pub(crate) async fn apply_gist_pruning_for_query(
                 Some(iv) => iv,
                 None => return Ok(()), // infinite-bound → full scan
             };
-            engine.interval_registry().probe_overlaps(project, &plan.table, &plan.col, &iv)
+            engine
+                .interval_registry()
+                .probe_overlaps(project, &plan.table, &plan.col, &iv)
         }
     };
 
@@ -5937,7 +6030,12 @@ pub(crate) async fn apply_gist_pruning_for_query(
     };
 
     // Completeness guard: fetch the live file set from the catalog.
-    let meta = match engine.config().catalog.load_table(project, &plan.table).await {
+    let meta = match engine
+        .config()
+        .catalog
+        .load_table(project, &plan.table)
+        .await
+    {
         Ok(m) => m,
         Err(_) => return Ok(()), // can't verify completeness → full scan
     };
@@ -5947,11 +6045,9 @@ pub(crate) async fn apply_gist_pruning_for_query(
     }
 
     // Check coverage: every live file must appear in the indexed-files set.
-    let indexed = engine.interval_registry().indexed_files_for(
-        project,
-        &plan.table,
-        &plan.col,
-    );
+    let indexed = engine
+        .interval_registry()
+        .indexed_files_for(project, &plan.table, &plan.col);
     let all_covered = live_files.iter().all(|f| indexed.contains(f.path.as_str()));
     if !all_covered {
         // At least one live file is not in the interval tree → full scan.
@@ -6053,7 +6149,12 @@ pub(crate) async fn apply_rtree_pruning_for_query(
         return Ok(());
     }
     let table_name = match &select.from[0].relation {
-        TableFactor::Table { name, alias: None, args: None, .. } => {
+        TableFactor::Table {
+            name,
+            alias: None,
+            args: None,
+            ..
+        } => {
             if name.0.len() != 1 {
                 return Ok(());
             }
@@ -6082,9 +6183,7 @@ pub(crate) async fn apply_rtree_pruning_for_query(
     };
     let col_name = pred.column().to_string();
     let has_gist = meta.indexes.iter().any(|idx| {
-        idx.access_method == "gist"
-            && idx.columns.len() == 1
-            && idx.columns[0] == col_name
+        idx.access_method == "gist" && idx.columns.len() == 1 && idx.columns[0] == col_name
     });
     if !has_gist {
         return Ok(());
@@ -6110,11 +6209,7 @@ pub(crate) async fn apply_rtree_pruning_for_query(
             continue;
         }
         let Some(sidecar) = basin_storage::index::rtree::rtree_segment_key_for_data_file(
-            None,
-            project,
-            &table,
-            &col_name,
-            p,
+            None, project, &table, &col_name, p,
         ) else {
             // Non-canonical path → can't compute sidecar key → full scan.
             return Ok(());
@@ -6158,9 +6253,13 @@ pub(crate) async fn apply_rtree_pruning_for_query(
             let r_deg = radius_m / M_PER_DEG;
             AABB::from_corners([*x - r_deg, *y - r_deg], [*x + r_deg, *y + r_deg])
         }
-        crate::index_probe::SpatialPredicate::BboxIntersects { min_x, min_y, max_x, max_y, .. } => {
-            AABB::from_corners([*min_x, *min_y], [*max_x, *max_y])
-        }
+        crate::index_probe::SpatialPredicate::BboxIntersects {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            ..
+        } => AABB::from_corners([*min_x, *min_y], [*max_x, *max_y]),
         crate::index_probe::SpatialPredicate::PointEq { x, y, .. } => {
             AABB::from_corners([*x, *y], [*x, *y])
         }
@@ -6189,7 +6288,9 @@ pub(crate) async fn apply_rtree_pruning_for_query(
         live_paths.clone(),
         rg_map,
     );
-    let tref = TableReference::Bare { table: table.as_str().into() };
+    let tref = TableReference::Bare {
+        table: table.as_str().into(),
+    };
     let _ = ctx.deregister_table(tref.clone());
     ctx.register_table(tref, Arc::new(provider))
         .map_err(|e| BasinError::internal(format!("register rtree-pruned table: {e}")))?;
@@ -6460,7 +6561,11 @@ fn extend_schema_with_promoted_cols(
     for path in paths {
         let name = crate::promoted_columns::shadow_col_name(&path.source_col, &path.json_key);
         if base.field_with_name(&name).is_err() {
-            fields.push(arrow_schema::Field::new(&name, arrow_schema::DataType::Utf8, true));
+            fields.push(arrow_schema::Field::new(
+                &name,
+                arrow_schema::DataType::Utf8,
+                true,
+            ));
         }
     }
     arrow_schema::Schema::new_with_metadata(fields, base.metadata().clone())
@@ -6482,16 +6587,14 @@ mod tests {
         let dirty = SessionState::new();
 
         // Mutate every settable GUC away from its default.
-        dirty
-            .schema_state
-            .write()
-            .unwrap()
-            .search_path = vec!["tenant_x".to_string(), "public".to_string()];
+        dirty.schema_state.write().unwrap().search_path =
+            vec!["tenant_x".to_string(), "public".to_string()];
         dirty.statement_timeout_ms.store(5_000, Relaxed);
         *dirty.lock_timeout.lock().unwrap() = Some(Duration::from_millis(500));
-        dirty.advisory.set_lock_timeout(Some(Duration::from_millis(500)));
-        *dirty.idle_in_transaction_session_timeout.lock().unwrap() =
-            Some(Duration::from_secs(30));
+        dirty
+            .advisory
+            .set_lock_timeout(Some(Duration::from_millis(500)));
+        *dirty.idle_in_transaction_session_timeout.lock().unwrap() = Some(Duration::from_secs(30));
         // Flip synchronous_commit to the opposite of the env default so the
         // assertion is meaningful regardless of BASIN_SYNCHRONOUS_COMMIT.
         let flipped = !synchronous_commit_env_default();
@@ -6690,11 +6793,7 @@ mod tests {
         });
         let table = TableName::new("off_t".to_string()).unwrap();
         let warmed = |sess: &crate::ProjectSession| {
-            sess.state
-                .prewarmed_tables
-                .lock()
-                .unwrap()
-                .contains(&table)
+            sess.state.prewarmed_tables.lock().unwrap().contains(&table)
         };
 
         // FLAG OFF (default): a cold load must NOT mark the table warmed.
@@ -6709,7 +6808,9 @@ mod tests {
             .await
             .unwrap();
         let sess_off2 = engine.open_session(sess_off.project).await.unwrap();
-        let _ = sess_off2.execute("SELECT id, n FROM off_t WHERE id = 1").await;
+        let _ = sess_off2
+            .execute("SELECT id, n FROM off_t WHERE id = 1")
+            .await;
         assert!(
             !warmed(&sess_off2),
             "flag OFF must not mark the table warmed"
@@ -6720,7 +6821,9 @@ mod tests {
         std::env::set_var("BASIN_PREWARM_PROVIDERS", "1");
         let sess_on = engine.open_session(sess_off.project).await.unwrap();
         assert!(!warmed(&sess_on), "fresh session starts un-warmed");
-        let _ = sess_on.execute("SELECT id, n FROM off_t WHERE id = 1").await;
+        let _ = sess_on
+            .execute("SELECT id, n FROM off_t WHERE id = 1")
+            .await;
         assert!(
             warmed(&sess_on),
             "flag ON: first cold meta miss must mark the table warmed"
@@ -6728,7 +6831,9 @@ mod tests {
         let set_len_after_cold = sess_on.state.prewarmed_tables.lock().unwrap().len();
         // Repeat load on the SAME session+table: the de-dup set is unchanged
         // (no second fire).
-        let _ = sess_on.execute("SELECT id, n FROM off_t WHERE id = 1").await;
+        let _ = sess_on
+            .execute("SELECT id, n FROM off_t WHERE id = 1")
+            .await;
         assert_eq!(
             sess_on.state.prewarmed_tables.lock().unwrap().len(),
             set_len_after_cold,
@@ -7286,7 +7391,10 @@ mod tests {
     fn parse_pg_duration_ms_suffix() {
         assert_eq!(parse_pg_duration("500ms"), Some(Duration::from_millis(500)));
         assert_eq!(parse_pg_duration("100ms"), Some(Duration::from_millis(100)));
-        assert_eq!(parse_pg_duration("1000ms"), Some(Duration::from_millis(1000)));
+        assert_eq!(
+            parse_pg_duration("1000ms"),
+            Some(Duration::from_millis(1000))
+        );
     }
 
     #[test]
@@ -7729,7 +7837,9 @@ mod ingest_meta_cache_tests {
             });
             let sess = seed_eng.open_session(project).await.unwrap();
             sess.execute("CREATE TABLE good (id BIGINT)").await.unwrap();
-            sess.execute("CREATE TABLE p100m (id BIGINT)").await.unwrap();
+            sess.execute("CREATE TABLE p100m (id BIGINT)")
+                .await
+                .unwrap();
         }
         let good = TableName::new("good").unwrap();
         let bad = TableName::new("p100m").unwrap();
@@ -7742,7 +7852,13 @@ mod ingest_meta_cache_tests {
             .await
             .unwrap();
         catalog
-            .append_data_files_in_partition(&project, &good, "s5", exp, vec![data_file("good/part.parquet", 100)])
+            .append_data_files_in_partition(
+                &project,
+                &good,
+                "s5",
+                exp,
+                vec![data_file("good/part.parquet", 100)],
+            )
             .await
             .unwrap();
         let mut exp = catalog
@@ -7751,7 +7867,13 @@ mod ingest_meta_cache_tests {
             .unwrap();
         for i in 0..2 {
             catalog
-                .append_data_files_in_partition(&project, &bad, "s5", exp, vec![data_file(&format!("p100m/part{i}.parquet"), 100)])
+                .append_data_files_in_partition(
+                    &project,
+                    &bad,
+                    "s5",
+                    exp,
+                    vec![data_file(&format!("p100m/part{i}.parquet"), 100)],
+                )
                 .await
                 .unwrap();
             exp = catalog
@@ -7773,7 +7895,8 @@ mod ingest_meta_cache_tests {
                 baseline_key = Some(loc);
             }
         }
-        let baseline_key = baseline_key.expect("precondition: p100m has a v1 baseline segment to delete");
+        let baseline_key =
+            baseline_key.expect("precondition: p100m has a v1 baseline segment to delete");
         let store_dyn: &dyn ObjectStore = store.as_ref();
         store_dyn.delete(&baseline_key).await.unwrap();
 
@@ -7803,13 +7926,13 @@ mod ingest_meta_cache_tests {
             .expect("session-open must not fail because one table is torn");
 
         // The trivial query works (the connection is usable).
-        sess.execute("SELECT 1").await.expect("SELECT 1 works on a session opened past a torn table");
+        sess.execute("SELECT 1")
+            .await
+            .expect("SELECT 1 works on a session opened past a torn table");
 
         // The healthy table queries fine.
         let n = match sess.execute("SELECT count(*) FROM good").await.unwrap() {
-            ExecResult::Rows { batches, .. } => {
-                batches.iter().map(|b| b.num_rows()).sum::<usize>()
-            }
+            ExecResult::Rows { batches, .. } => batches.iter().map(|b| b.num_rows()).sum::<usize>(),
             other => panic!("expected rows, got {other:?}"),
         };
         assert_eq!(n, 1, "the healthy table returns its single count row");
@@ -7822,6 +7945,8 @@ mod ingest_meta_cache_tests {
 
         // And the session is still usable afterwards — the torn-table error did
         // not poison the connection.
-        sess.execute("SELECT 1").await.expect("session still usable after a torn-table query error");
+        sess.execute("SELECT 1")
+            .await
+            .expect("session still usable after a torn-table query error");
     }
 }

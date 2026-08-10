@@ -41,8 +41,7 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use basin_catalog::{
     BudgetCoordinator, CapKind, InMemoryBudgetCoordinator, InMemoryCatalog, Lease, LeaseRegistry,
-    ProjectBudget, SliceBudget, SliceBudgetView, SliceGate, UsageDelta, UsageSnapshot,
-    SLICE_UNSET,
+    ProjectBudget, SliceBudget, SliceBudgetView, SliceGate, UsageDelta, UsageSnapshot, SLICE_UNSET,
 };
 use basin_common::{BasinError, PartitionKey, ProjectId, Result, TableName};
 use basin_shard::{Shard, ShardConfig};
@@ -356,7 +355,10 @@ async fn dual_leaseholder_fence_rejects_lower_epoch() {
     // before the steal + the epoch-7 winner). Three rejected appends consumed
     // no LSN — corrupted state is impossible.
     wal.flush().await.unwrap();
-    let durable = wal.read_from(&project, &partition, Lsn::ZERO).await.unwrap();
+    let durable = wal
+        .read_from(&project, &partition, Lsn::ZERO)
+        .await
+        .unwrap();
     assert_eq!(
         durable.len(),
         3,
@@ -408,11 +410,7 @@ impl PartitionedRegistry {
     }
 
     async fn is_partitioned(&self, holder: &str) -> bool {
-        self.partitioned
-            .read()
-            .await
-            .iter()
-            .any(|h| h == holder)
+        self.partitioned.read().await.iter().any(|h| h == holder)
     }
 }
 
@@ -451,12 +449,7 @@ impl LeaseRegistry for PartitionedRegistry {
             .await
     }
 
-    async fn release(
-        &self,
-        project: &ProjectId,
-        partition_id: &str,
-        holder: &str,
-    ) -> Result<bool> {
+    async fn release(&self, project: &ProjectId, partition_id: &str, holder: &str) -> Result<bool> {
         // Release is tolerant: even a partitioned replica's local cleanup is
         // allowed (it's a no-op on the coordinator if the lease has already
         // moved). Tests rely on this; production tolerates it too.
@@ -630,11 +623,7 @@ struct FailingCoordinator;
 
 #[async_trait]
 impl BudgetCoordinator for FailingCoordinator {
-    async fn set_project_budget(
-        &self,
-        _project: &ProjectId,
-        _budget: ProjectBudget,
-    ) -> Result<()> {
+    async fn set_project_budget(&self, _project: &ProjectId, _budget: ProjectBudget) -> Result<()> {
         Err(BasinError::catalog("coordinator down (test)"))
     }
 
@@ -648,11 +637,7 @@ impl BudgetCoordinator for FailingCoordinator {
         Err(BasinError::catalog("coordinator down (test)"))
     }
 
-    async fn forget_partition(
-        &self,
-        _project: &ProjectId,
-        _partition_id: &str,
-    ) -> Result<()> {
+    async fn forget_partition(&self, _project: &ProjectId, _partition_id: &str) -> Result<()> {
         Err(BasinError::catalog("coordinator down (test)"))
     }
 
@@ -727,12 +712,7 @@ async fn failing_coordinator_keeps_slice_view_stale_and_gate_admits() {
     let coord = FailingCoordinator;
     for _ in 0..1000 {
         let _ = coord
-            .push_heartbeat(
-                &project,
-                "_default",
-                "replica-a",
-                UsageDelta::zero(),
-            )
+            .push_heartbeat(&project, "_default", "replica-a", UsageDelta::zero())
             .await;
     }
     // View still unset → gate must admit unconditionally.
@@ -742,11 +722,7 @@ async fn failing_coordinator_keeps_slice_view_stale_and_gate_admits() {
     // coordinator failure, this loop would fail well before 10k.
     let mut admitted = 0u64;
     for _ in 0..10_000 {
-        if gate
-            .try_consume(project, CapKind::RestQps, 1)
-            .await
-            .is_ok()
-        {
+        if gate.try_consume(project, CapKind::RestQps, 1).await.is_ok() {
             admitted += 1;
         }
     }
@@ -768,11 +744,17 @@ async fn failing_coordinator_keeps_slice_view_stale_and_gate_admits() {
         .push_heartbeat(&project, "_default", "replica-a", UsageDelta::zero())
         .await
         .unwrap();
-    view.set_slice(project, CapKind::RestQps, slice.get(CapKind::RestQps).unwrap_or(0))
-        .await;
+    view.set_slice(
+        project,
+        CapKind::RestQps,
+        slice.get(CapKind::RestQps).unwrap_or(0),
+    )
+    .await;
     gate.refill_from_view().await;
     assert!(
-        gate.try_consume(project, CapKind::RestQps, 1).await.is_err(),
+        gate.try_consume(project, CapKind::RestQps, 1)
+            .await
+            .is_err(),
         "with a healthy coordinator + slice=0, the gate MUST reject",
     );
 }
@@ -840,13 +822,11 @@ async fn handoff_mid_write_is_atomic() {
     }
     // All 50 rows are acked (written to the in-memory state / WAL).
     // We deliberately do NOT flush to Parquet here: the yield must do it.
-    let pre_yield_rows = rows_in(
-        &handle_a
-            .read(&table, ReadOptions::default())
-            .await
-            .unwrap(),
+    let pre_yield_rows = rows_in(&handle_a.read(&table, ReadOptions::default()).await.unwrap());
+    assert_eq!(
+        pre_yield_rows, 50,
+        "A must see its 50 acked rows before yield"
     );
-    assert_eq!(pre_yield_rows, 50, "A must see its 50 acked rows before yield");
 
     // ── Voluntary yield: A hands off to B; measure stall ─────────────────
     let t0 = Instant::now();
@@ -855,9 +835,7 @@ async fn handoff_mid_write_is_atomic() {
         .await
         .unwrap();
     let stall = t0.elapsed();
-    println!(
-        "lease_failure_paths handoff_mid_write_is_atomic: stall={stall:?}"
-    );
+    println!("lease_failure_paths handoff_mid_write_is_atomic: stall={stall:?}");
     assert!(
         stall < Duration::from_millis(500),
         "handoff stall {stall:?} exceeded ADR 0023 < 500 ms p99 target \
@@ -866,7 +844,10 @@ async fn handoff_mid_write_is_atomic() {
 
     // After yield, A's lease is gone from the catalog.
     assert_eq!(
-        catalog.owner_of(&project, partition.as_str()).await.unwrap(),
+        catalog
+            .owner_of(&project, partition.as_str())
+            .await
+            .unwrap(),
         None,
         "A must have released the lease after yield_partition",
     );
@@ -907,13 +888,10 @@ async fn handoff_mid_write_is_atomic() {
         .unwrap();
     let marker_count = events
         .iter()
-        .filter(|e| {
-            matches!(e, WalEvent::Handoff { to_holder, .. } if to_holder == "replica-b")
-        })
+        .filter(|e| matches!(e, WalEvent::Handoff { to_holder, .. } if to_holder == "replica-b"))
         .count();
     assert_eq!(
-        marker_count,
-        1,
+        marker_count, 1,
         "WAL must carry exactly one handoff marker to replica-b; got events={events:?}",
     );
 

@@ -84,7 +84,9 @@ fn two_col_schema() -> Arc<Schema> {
 /// Build a batch with `id` values `[start, start+len)` and a derived payload.
 fn sequential_batch(start: i64, len: i64) -> RecordBatch {
     let ids: Int64Array = (start..start + len).collect();
-    let payloads: StringArray = (start..start + len).map(|v| Some(format!("p{v}"))).collect();
+    let payloads: StringArray = (start..start + len)
+        .map(|v| Some(format!("p{v}")))
+        .collect();
     RecordBatch::try_new(two_col_schema(), vec![Arc::new(ids), Arc::new(payloads)]).unwrap()
 }
 
@@ -184,13 +186,21 @@ async fn point_lookup_absent_key_returns_empty_and_skips_files() {
 
     // Out-of-range key: every file pruned by zone-map.
     let rows = query_rows(&sess, "SELECT * FROM t WHERE id = 999999").await;
-    assert_eq!(row_count(&rows), 0, "out-of-range key must return zero rows");
+    assert_eq!(
+        row_count(&rows),
+        0,
+        "out-of-range key must return zero rows"
+    );
 
     // In-range-but-absent key (150 falls in the [100,200) gap, inside the
     // overall min/max so zone-map alone cannot prune f0/f1, but the bloom on
     // `id` proves it absent). Must still return zero rows.
     let rows = query_rows(&sess, "SELECT * FROM t WHERE id = 150").await;
-    assert_eq!(row_count(&rows), 0, "in-range absent key must return zero rows");
+    assert_eq!(
+        row_count(&rows),
+        0,
+        "in-range absent key must return zero rows"
+    );
 
     let after = engine.blooms_skipped_count();
     assert!(
@@ -286,8 +296,14 @@ async fn point_lookup_many_files_returns_single_row() {
         .current_snapshot;
     for f in 0..10i64 {
         let start = f * 1_000;
-        snap = write_and_commit(&engine, &project, &table, sequential_batch(start, 1_000), snap)
-            .await;
+        snap = write_and_commit(
+            &engine,
+            &project,
+            &table,
+            sequential_batch(start, 1_000),
+            snap,
+        )
+        .await;
     }
 
     // A key in the middle of file 7 must resolve to exactly one row.

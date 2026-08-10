@@ -73,8 +73,7 @@ pub(crate) struct StatelessUdfCache {
     /// bumps for the 27 stateless rules — no per-session struct
     /// allocation) and prepends Basin's custom rules.  Replaces a
     /// `datafusion::optimizer::Optimizer::default()` call per session.
-    pub(crate) optimizer_rules:
-        Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>>,
+    pub(crate) optimizer_rules: Vec<Arc<dyn datafusion::optimizer::OptimizerRule + Send + Sync>>,
 }
 
 /// Engine configuration.
@@ -244,14 +243,12 @@ pub(crate) struct EngineInner {
     /// `apply_gin_pruning_for_query`) to narrow file-level candidates to the
     /// specific row-groups that *might* contain a matching row, so the Parquet
     /// reader can skip the rest.
-    pub(crate) gin_rowgroup_registry:
-        Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry>,
+    pub(crate) gin_rowgroup_registry: Arc<basin_storage::index::gin_rowgroup::GinRowGroupRegistry>,
     /// Phase 5.20.E: process-wide GIN posting-list registry for tsvector
     /// columns.  One `LexemePostingList` per `(project, table, col)` populated
     /// at INSERT time for tsvector columns with a GIN index.  Probed at query
     /// time to prune file candidates before the full `@@` re-evaluation.
-    pub(crate) gin_fts_registry:
-        Arc<basin_storage::index::gin_tsvector::GinTsvectorRegistry>,
+    pub(crate) gin_fts_registry: Arc<basin_storage::index::gin_tsvector::GinTsvectorRegistry>,
 
     /// Inv-W5 / W9: process-wide JSONB `(key, value)` posting-list
     /// registry.  One [`basin_storage::index::jsonb_posting::JsonbPostingRegistry`]
@@ -267,8 +264,7 @@ pub(crate) struct EngineInner {
     /// with a GIST index.  One [`IntervalTree`] per `(project, table, col)`
     /// populated at INSERT time.  Probed at query time for `@>` / `&&` / `<@`
     /// predicates to prune files before the full UDF re-evaluation.
-    pub(crate) interval_registry:
-        Arc<basin_storage::index::interval::IntervalRegistry>,
+    pub(crate) interval_registry: Arc<basin_storage::index::interval::IntervalRegistry>,
 
     /// PG-Wave-β: process-wide R-tree registry for POINT columns with a
     /// `USING gist` index.  One parsed `rstar::RTree<SpatialEntry>` per
@@ -327,15 +323,13 @@ pub(crate) struct EngineInner {
     /// access-frequency registry.  Records JSON-path hits at query time and
     /// triggers `catalog.promote_jsonb_path` when a path crosses
     /// [`crate::jsonb_promotion::AUTO_PROMOTE_MIN_HITS`].
-    pub(crate) jsonb_promotion_registry:
-        Arc<crate::jsonb_promotion::JsonbPromotionRegistry>,
+    pub(crate) jsonb_promotion_registry: Arc<crate::jsonb_promotion::JsonbPromotionRegistry>,
 
     /// Self-driving physical layout (step 1): per-`(project, table, column)`
     /// non-PK equality-predicate access-frequency registry. Records Eq-predicate
     /// hits at query time and fires a one-shot `CREATE INDEX` when a column
     /// crosses [`crate::index_advisor::AUTO_INDEX_MIN_HITS`].
-    pub(crate) index_advisor_registry:
-        Arc<crate::index_advisor::IndexAdvisorRegistry>,
+    pub(crate) index_advisor_registry: Arc<crate::index_advisor::IndexAdvisorRegistry>,
 
     /// Bulk-INSERT PK / UNIQUE constraint-set memoization cache (Tier 2 of
     /// the bulk-INSERT perf fix). Keyed by `(project, table)` with the
@@ -466,7 +460,10 @@ mod query_mem_tests {
     fn floored_at_256mib_for_tiny_or_undetected_ram() {
         // Undetected RAM (0) and a tiny explicit value both floor to 256 MiB so
         // the engine still starts and runs on constrained/test environments.
-        assert_eq!(derive_query_memory_bytes_inner(0, None, None), (256 * MIB) as usize);
+        assert_eq!(
+            derive_query_memory_bytes_inner(0, None, None),
+            (256 * MIB) as usize
+        );
         assert_eq!(
             derive_query_memory_bytes_inner(64 * GIB, Some(1), None),
             (256 * MIB) as usize
@@ -513,10 +510,9 @@ impl Engine {
         // plugs this Arc into a fresh per-session RuntimeEnv so Vortex/Parquet
         // footer data persists across session recycling. 50 MiB covers hundreds
         // of small files; the LRU evicts cold entries when the limit is reached.
-        let file_metadata_cache: Arc<dyn FileMetadataCache> =
-            Arc::new(DefaultFilesMetadataCache::new(
-                CacheManagerConfig::default().metadata_cache_limit,
-            ));
+        let file_metadata_cache: Arc<dyn FileMetadataCache> = Arc::new(
+            DefaultFilesMetadataCache::new(CacheManagerConfig::default().metadata_cache_limit),
+        );
         // Build the process-wide bounded query memory pool once. Sized from
         // detected container RAM so the SUM of concurrent query working sets is
         // capped — a single heavy aggregate can no longer OOM-kill the node.
@@ -569,9 +565,7 @@ impl Engine {
             memtable_registry,
             next_tx_id: AtomicU64::new(1),
             query_stats: Arc::new(crate::query_stats::QueryStatRegistry::new()),
-            secondary_index_registry: Arc::new(
-                crate::secondary_index::ProjectIndexRegistry::new(),
-            ),
+            secondary_index_registry: Arc::new(crate::secondary_index::ProjectIndexRegistry::new()),
             secondary_index_skipped: crate::secondary_index::IndexSkipCounter::new(),
             gin_index_registry: Arc::new(crate::index_probe::GinIndexRegistry::new()),
             gin_rowgroup_registry: Arc::new(
@@ -583,12 +577,8 @@ impl Engine {
             jsonb_posting_registry: Arc::new(
                 basin_storage::index::jsonb_posting::JsonbPostingRegistry::new(),
             ),
-            interval_registry: Arc::new(
-                basin_storage::index::interval::IntervalRegistry::new(),
-            ),
-            rtree_registry: Arc::new(
-                basin_storage::index::rtree::RTreeRegistry::new(),
-            ),
+            interval_registry: Arc::new(basin_storage::index::interval::IntervalRegistry::new()),
+            rtree_registry: Arc::new(basin_storage::index::rtree::RTreeRegistry::new()),
             reaper_registry: crate::session_reaper::SessionReaperRegistry::new(),
             lock_registry: basin_shard::LockRegistry::new(),
             connection_registry: crate::connection_registry::ConnectionRegistry::new(),
@@ -605,9 +595,7 @@ impl Engine {
                 crate::jsonb_promotion::JsonbPromotionRegistry::new(),
             ),
             // Self-driving physical layout: auto-index advisor registry.
-            index_advisor_registry: Arc::new(
-                crate::index_advisor::IndexAdvisorRegistry::new(),
-            ),
+            index_advisor_registry: Arc::new(crate::index_advisor::IndexAdvisorRegistry::new()),
             // Tier 2 bulk-INSERT PK set cache.
             pk_set_cache: Arc::new(crate::constraints::PkSetCache::new()),
             pk_row_cache: Arc::new(crate::pk_row_cache::PkRowCache::from_env()),
@@ -646,10 +634,9 @@ impl Engine {
             // FIX 2 — wire the secondary B-tree index registry into the
             // compactor (via the `SecondaryIndexSink` trait object) so newly
             // compacted files register their single-column index values.
-            shard.set_secondary_index_registry(
-                inner.secondary_index_registry.clone()
-                    as Arc<dyn basin_shard::SecondaryIndexSink>,
-            );
+            shard
+                .set_secondary_index_registry(inner.secondary_index_registry.clone()
+                    as Arc<dyn basin_shard::SecondaryIndexSink>);
         }
         attach_reactor_sink(&inner, catalog);
         let engine = Self { inner };
@@ -1169,7 +1156,9 @@ impl Engine {
     /// actually engaged (rather than falling back to the DataFusion / UDF
     /// path).
     pub fn promoted_fast_select_count(&self) -> u64 {
-        self.inner.promoted_fast_select_count.load(Ordering::Relaxed)
+        self.inner
+            .promoted_fast_select_count
+            .load(Ordering::Relaxed)
     }
 
     /// Crate-private hook bumped once each time a `ORDER BY <text_col> <->
@@ -1289,9 +1278,7 @@ impl Engine {
     /// Public accessor for integration tests that need to inspect the GIN
     /// posting-list registry (e.g. to verify that posting-budget eviction
     /// fired and the index degraded to per-file coverage).
-    pub fn gin_index_registry_for_test(
-        &self,
-    ) -> Arc<crate::index_probe::GinIndexRegistry> {
+    pub fn gin_index_registry_for_test(&self) -> Arc<crate::index_probe::GinIndexRegistry> {
         self.inner.gin_index_registry.clone()
     }
 
@@ -1386,17 +1373,13 @@ impl Engine {
 
     /// Process-wide R-tree registry for POINT columns with a `USING gist`
     /// index. Returns a reference to the shared `Arc`; cloning it is cheap.
-    pub(crate) fn rtree_registry(
-        &self,
-    ) -> &Arc<basin_storage::index::rtree::RTreeRegistry> {
+    pub(crate) fn rtree_registry(&self) -> &Arc<basin_storage::index::rtree::RTreeRegistry> {
         &self.inner.rtree_registry
     }
 
     /// Public accessor for integration tests that need to seed or inspect
     /// the R-tree registry directly (used by the spatial viability bench).
-    pub fn rtree_registry_for_test(
-        &self,
-    ) -> Arc<basin_storage::index::rtree::RTreeRegistry> {
+    pub fn rtree_registry_for_test(&self) -> Arc<basin_storage::index::rtree::RTreeRegistry> {
         self.inner.rtree_registry.clone()
     }
 
@@ -1676,7 +1659,8 @@ pub(crate) struct CopyDurabilityAudit {
     pub(crate) rows_durable_confirmed: u64,
     /// One record per touched partition (last write wins for the LSN/owner;
     /// rows summed). Keyed by partition so the map stays O(partitions).
-    pub(crate) partitions: std::collections::HashMap<basin_common::PartitionKey, CopyPartitionAudit>,
+    pub(crate) partitions:
+        std::collections::HashMap<basin_common::PartitionKey, CopyPartitionAudit>,
 }
 
 /// Audit record for ONE partition a COPY touched (#46).
@@ -1908,9 +1892,14 @@ impl ProjectSession {
         column_names: Option<&[String]>,
         rows: Vec<Vec<Option<String>>>,
     ) -> Result<u64> {
-        let (rows_written, landing) =
-            crate::copy_ingest::exec_copy_from_batch(self, table_name, full_schema, column_names, rows)
-                .await?;
+        let (rows_written, landing) = crate::copy_ingest::exec_copy_from_batch(
+            self,
+            table_name,
+            full_schema,
+            column_names,
+            rows,
+        )
+        .await?;
 
         // #46 DURABILITY AUDIT: fold every batch's landing into the per-COPY
         // accounting — local AND forwarded — so end-of-COPY can prove every
@@ -2017,7 +2006,9 @@ impl ProjectSession {
             .values()
             .filter(|p| p.durable_lsn.is_none())
             .count();
-        let row_gap = audit.rows_acked.saturating_sub(audit.rows_durable_confirmed);
+        let row_gap = audit
+            .rows_acked
+            .saturating_sub(audit.rows_durable_confirmed);
 
         // Compact per-partition summary: {owner, durable_lsn, forwarded, rows}.
         // O(partitions), bounded by the fan-out width.
@@ -2122,15 +2113,13 @@ impl Drop for ProjectSession {
     fn drop(&mut self) {
         // Phase 5.28.C: deregister from the idle-in-txn reaper so the entry
         // is not kept alive after the session ends.
-        self.engine
-            .reaper_registry()
-            .deregister(self.reaper_id);
+        self.engine.reaper_registry().deregister(self.reaper_id);
     }
 }
 
 pub use crate::pk_row_cache::PkRowCacheCountersSnapshot;
-pub use crate::region::{ForwardContext, WriteForwarder};
 pub use crate::prepared::{BoundStatement, ScalarParam, StatementHandle, StatementSchema};
+pub use crate::region::{ForwardContext, WriteForwarder};
 /// Re-export the secondary B-tree index registry + location type so
 /// integration tests can probe the registry directly (FIX 2 verification).
 pub use crate::secondary_index::{IndexLocation, ProjectIndexRegistry};
@@ -2154,30 +2143,21 @@ pub enum ExecResult {
 mod advisory_lock;
 mod alter;
 mod alter_project;
-/// Phase 5.31.A — `pg_cancel_backend(pid)` per-session UDF.
-pub(crate) mod cancel_udf;
-/// Phase 5.21 — Logical CDC / pgoutput replication infrastructure.
-pub(crate) mod replication;
-pub mod connection_registry;
-/// Phase 5.29.B-D — TimescaleDB-style hypertable registry and SQL matchers.
-pub(crate) mod hypertable;
-/// Phase 5.29.C — virtual `timescaledb_information.chunks` table provider.
-pub(crate) mod hypertable_provider;
-/// Phase 5.22.B/C — pg_dump-compatible plain + custom binary dump.
-pub mod dump;
-pub(crate) mod operators;
-/// Phase 5.30.C/E — schema-aware citext logical-plan rewrite.
-mod citext_analyzer;
 mod any_all_rewrite;
-pub(crate) mod copy_ingest;
 mod approx_count_distinct;
 mod approx_percentile;
-mod catalog_window_exec;
-mod constraints;
-mod constraint_union;
-mod convert;
-mod cost_check;
 mod cagg;
+/// Phase 5.31.A — `pg_cancel_backend(pid)` per-session UDF.
+pub(crate) mod cancel_udf;
+mod catalog_window_exec;
+/// Phase 5.30.C/E — schema-aware citext logical-plan rewrite.
+mod citext_analyzer;
+pub mod connection_registry;
+mod constraint_union;
+mod constraints;
+mod convert;
+pub(crate) mod copy_ingest;
+mod cost_check;
 mod cron_glue;
 mod cursor;
 mod cv_ddl;
@@ -2187,83 +2167,89 @@ mod datetime_more_udf;
 mod ddl;
 mod dml;
 mod dml_mutate;
-/// Phase 5.x — `MERGE INTO` (Postgres 15+) execution. Compiles each per-row
-/// WHEN action to ordinary INSERT/UPDATE/DELETE driven through the normal
-/// statement pipeline, inheriting RLS, constraints, fast paths, and atomicity.
-mod merge;
-pub mod overlay_reconcile;
-mod values_fast;
+/// Phase 5.22.B/C — pg_dump-compatible plain + custom binary dump.
+pub mod dump;
 mod enum_ordinal;
 mod events;
 mod executor;
 mod explain;
 mod fast_aggregate;
 mod fast_select;
-mod point_join;
-mod hot_tombstone;
-mod tombstone_cold_scan;
 mod fts_udf;
-mod gapfill;
-mod gin_rowgroup_scan;
-mod jsonb_posting_scan;
-mod rtree_rowgroup_scan;
-/// PG-Wave KNN — nearest-neighbour spatial top-k execution.
-mod rtree_knn_scan;
-mod is_distinct_rewrite;
 mod function_ddl;
+mod gapfill;
 mod generated_cols;
-pub mod inbound_webhook_ddl;
-pub mod inflight_metrics;
 mod geo_glue;
+mod gin_rowgroup_scan;
+mod hot_tombstone;
+/// Phase 5.29.B-D — TimescaleDB-style hypertable registry and SQL matchers.
+pub(crate) mod hypertable;
+/// Phase 5.29.C — virtual `timescaledb_information.chunks` table provider.
+pub(crate) mod hypertable_provider;
+pub mod inbound_webhook_ddl;
+pub mod index_advisor;
 mod index_extras;
 pub(crate) mod index_probe;
-pub(crate) mod secondary_index;
 mod inet_udf;
+pub mod inflight_metrics;
 mod info_schema_provider;
 mod interval_tz_udf;
+mod is_distinct_rewrite;
 mod json_build_udf;
 mod jsonb_modify_udf;
 mod jsonb_path_udf;
+mod jsonb_posting_scan;
+pub mod jsonb_promotion;
 mod jsonb_udf;
 mod lifecycle;
-pub mod promoted_columns;
+/// Phase 5.x — `MERGE INTO` (Postgres 15+) execution. Compiles each per-row
+/// WHEN action to ordinary INSERT/UPDATE/DELETE driven through the normal
+/// statement pipeline, inheriting RLS, constraints, fast paths, and atomicity.
+mod merge;
 mod net_glue;
 mod noisy_detector;
+pub mod noop_accept;
 mod notify_registry;
 mod nullif_rewrite;
-pub mod noop_accept;
+pub(crate) mod operators;
+pub mod overlay_reconcile;
+/// #28 two-engine integration test for transparent per-partition write
+/// forwarding (compiled only under `cfg(test)`).
+#[cfg(test)]
+mod partition_forward_integration_test;
+/// Multi-region v0.2 (ADR 0009): concrete `WriteForwarder` impls (fly-replay /
+/// http-forward) compiled into the engine binary and registered at startup.
+pub mod partition_router;
 mod pg_agg_udf;
 pub mod pg_ast;
 mod pg_catalog_udf;
 mod pg_operators;
 pub mod pg_plan;
 mod pg_scalar_aliases;
-mod prepared;
 mod pk_row_cache;
+mod point_join;
+mod prepared;
+mod procedure_ddl;
+pub(crate) mod project_usage_view;
+pub mod promoted_columns;
 mod query_history;
-pub mod jsonb_promotion;
-pub mod index_advisor;
 pub mod query_shape;
 pub mod query_stats;
 pub mod query_stats_export;
-pub(crate) mod project_usage_view;
-pub mod realtime_catalog;
-mod procedure_ddl;
 mod range_udf;
 pub mod reactor_ddl;
 mod reactor_sink;
-pub mod region;
-/// Multi-region v0.2 (ADR 0009): concrete `WriteForwarder` impls (fly-replay /
-/// http-forward) compiled into the engine binary and registered at startup.
-pub mod partition_router;
-pub mod write_forwarder;
-/// #28 two-engine integration test for transparent per-partition write
-/// forwarding (compiled only under `cfg(test)`).
-#[cfg(test)]
-mod partition_forward_integration_test;
+pub mod realtime_catalog;
 mod regex_udf;
+pub mod region;
+/// Phase 5.21 — Logical CDC / pgoutput replication infrastructure.
+pub(crate) mod replication;
 mod rls;
+/// PG-Wave KNN — nearest-neighbour spatial top-k execution.
+mod rtree_knn_scan;
+mod rtree_rowgroup_scan;
 mod schema_ddl;
+pub(crate) mod secondary_index;
 mod select_advanced;
 mod seq_ddl;
 mod seq_udf;
@@ -2273,6 +2259,7 @@ mod sort_streaming_limit;
 mod sql_functions;
 mod string_dt_udf;
 mod string_more_udf;
+mod tombstone_cold_scan;
 mod trgm_glue;
 mod trgm_knn_scan;
 mod truncate;
@@ -2280,6 +2267,7 @@ mod type_ddl;
 mod types;
 mod udf;
 mod union_scan_collapse;
+mod values_fast;
 mod vector_planner;
 mod vector_search;
 mod view_ddl;
@@ -2288,6 +2276,7 @@ pub(crate) mod wasm_udf;
 pub mod webhook_ddl;
 pub mod webhook_registry;
 mod window_extras;
+pub mod write_forwarder;
 
 pub use webhook_ddl::{
     exec_subscribe_webhook, exec_unsubscribe_webhook, match_alter_table_subscribe_webhook,
@@ -4412,7 +4401,9 @@ mod tests {
         let other = basin_common::TableName::new("hist_test").unwrap();
         let small_proj = ProjectId::new();
         assert!(
-            eng.query_history().top_pattern(&small_proj, &other).is_none(),
+            eng.query_history()
+                .top_pattern(&small_proj, &other)
+                .is_none(),
             "unseen project must return None"
         );
     }
@@ -4503,11 +4494,9 @@ mod tests {
         sess.execute("CREATE TABLE scores (id BIGINT NOT NULL, score BIGINT NOT NULL)")
             .await
             .unwrap();
-        sess.execute(
-            "INSERT INTO scores VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)",
-        )
-        .await
-        .unwrap();
+        sess.execute("INSERT INTO scores VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)")
+            .await
+            .unwrap();
 
         let res = sess
             .execute(
@@ -4522,10 +4511,9 @@ mod tests {
             .unwrap();
 
         let (ids, sums) = match res {
-            ExecResult::Rows { batches, .. } => (
-                col_i64(&batches, "id"),
-                col_i64(&batches, "running_sum"),
-            ),
+            ExecResult::Rows { batches, .. } => {
+                (col_i64(&batches, "id"), col_i64(&batches, "running_sum"))
+            }
             other => panic!("unexpected: {other:?}"),
         };
         assert_eq!(ids, vec![1, 2, 3, 4, 5], "ids");
@@ -4580,7 +4568,8 @@ mod tests {
         assert!(
             snap_a.cpu_micros_total > snap_b.cpu_micros_total,
             "A({} micros) should exceed B({} micros) after {n_queries}x more work",
-            snap_a.cpu_micros_total, snap_b.cpu_micros_total,
+            snap_a.cpu_micros_total,
+            snap_b.cpu_micros_total,
         );
     }
 
@@ -4651,8 +4640,8 @@ mod tests {
             .unwrap();
         match res {
             ExecResult::Rows { batches, .. } => {
-                use arrow_array::types::Int64Type;
                 use arrow_array::cast::AsArray;
+                use arrow_array::types::Int64Type;
                 batches[0].column(0).as_primitive::<Int64Type>().value(0) as u64
             }
             _ => panic!("expected Rows"),
@@ -4666,9 +4655,7 @@ mod tests {
         let opts = crate::dump::DumpOptions::new();
 
         // Dump.
-        let sql = crate::dump::dump_plain(&eng, project, &opts)
-            .await
-            .unwrap();
+        let sql = crate::dump::dump_plain(&eng, project, &opts).await.unwrap();
 
         // Sanity checks on the dump script.
         assert!(!sql.is_empty(), "dump must not be empty");
@@ -4782,14 +4769,16 @@ mod tests {
         let sess = eng.open_session(project).await.unwrap();
 
         // Create a table and insert rows with various JSONB patterns.
-        sess.execute("CREATE TABLE events (id BIGINT, payload JSONB)").await.unwrap();
+        sess.execute("CREATE TABLE events (id BIGINT, payload JSONB)")
+            .await
+            .unwrap();
         let inserts = vec![
             r#"INSERT INTO events VALUES (1, '{"category":"books","price":9.99}')"#,
-            r#"INSERT INTO events VALUES (2, '{"price":1.0}')"#,          // absent key
-            r#"INSERT INTO events VALUES (3, '{"category":null}')"#,       // JSON null → SQL NULL
-            r#"INSERT INTO events VALUES (4, '{"category":42}')"#,         // numeric value
-            r#"INSERT INTO events VALUES (5, '{"category":"café"}')"#,     // unicode
-            r#"INSERT INTO events VALUES (6, NULL)"#,                      // NULL JSONB row
+            r#"INSERT INTO events VALUES (2, '{"price":1.0}')"#, // absent key
+            r#"INSERT INTO events VALUES (3, '{"category":null}')"#, // JSON null → SQL NULL
+            r#"INSERT INTO events VALUES (4, '{"category":42}')"#, // numeric value
+            r#"INSERT INTO events VALUES (5, '{"category":"café"}')"#, // unicode
+            r#"INSERT INTO events VALUES (6, NULL)"#,            // NULL JSONB row
         ];
         for sql in &inserts {
             sess.execute(sql).await.unwrap();
@@ -4806,7 +4795,11 @@ mod tests {
                 let arr = b.column_by_name("cat").unwrap();
                 let sa = arr.as_any().downcast_ref::<StringArray>().unwrap();
                 for i in 0..sa.len() {
-                    out.push(if sa.is_null(i) { None } else { Some(sa.value(i).to_string()) });
+                    out.push(if sa.is_null(i) {
+                        None
+                    } else {
+                        Some(sa.value(i).to_string())
+                    });
                 }
             }
             out
@@ -4815,19 +4808,30 @@ mod tests {
         // Now promote the path and re-run the SAME query.
         eng.config()
             .catalog
-            .promote_jsonb_path(&project, &basin_common::TableName::new("events").unwrap(), "payload", "category")
+            .promote_jsonb_path(
+                &project,
+                &basin_common::TableName::new("events").unwrap(),
+                "payload",
+                "category",
+            )
             .await
             .unwrap();
 
         // Re-insert data so the promoted column is written into new files.
         // (Old files without the shadow column fall back to the UDF path.)
         sess.execute("DROP TABLE events").await.unwrap();
-        sess.execute("CREATE TABLE events (id BIGINT, payload JSONB)").await.unwrap();
+        sess.execute("CREATE TABLE events (id BIGINT, payload JSONB)")
+            .await
+            .unwrap();
         for sql in &inserts {
             sess.execute(sql).await.unwrap();
         }
 
-        let ExecResult::Rows { batches: promo_batches, .. } = sess.execute(baseline_sql).await.unwrap() else {
+        let ExecResult::Rows {
+            batches: promo_batches,
+            ..
+        } = sess.execute(baseline_sql).await.unwrap()
+        else {
             panic!("expected query result");
         };
         let promo_cats: Vec<Option<String>> = {
@@ -4836,7 +4840,11 @@ mod tests {
                 let arr = b.column_by_name("cat").unwrap();
                 let sa = arr.as_any().downcast_ref::<StringArray>().unwrap();
                 for i in 0..sa.len() {
-                    out.push(if sa.is_null(i) { None } else { Some(sa.value(i).to_string()) });
+                    out.push(if sa.is_null(i) {
+                        None
+                    } else {
+                        Some(sa.value(i).to_string())
+                    });
                 }
             }
             out
@@ -4872,12 +4880,15 @@ mod tests {
         let eng_udf = engine_in(&dir_udf);
         let project_udf = ProjectId::new();
         let sess_udf = eng_udf.open_session(project_udf).await.unwrap();
-        sess_udf.execute("CREATE TABLE bench_events (id BIGINT, payload JSONB)").await.unwrap();
+        sess_udf
+            .execute("CREATE TABLE bench_events (id BIGINT, payload JSONB)")
+            .await
+            .unwrap();
         // Batch-insert N rows.
         {
             let vals: String = (0..N)
                 .map(|i| {
-                    let cat = ["electronics","books","clothing","food","sports"][i % 5];
+                    let cat = ["electronics", "books", "clothing", "food", "sports"][i % 5];
                     format!("({i}, '{{\"category\":\"{cat}\",\"score\":{i},\"active\":true}}')")
                 })
                 .collect::<Vec<_>>()
@@ -4899,7 +4910,10 @@ mod tests {
         let project_promo = ProjectId::new();
         let sess_promo = eng_promo.open_session(project_promo).await.unwrap();
         // Create the table first so the catalog knows it exists.
-        sess_promo.execute("CREATE TABLE bench_events (id BIGINT, payload JSONB)").await.unwrap();
+        sess_promo
+            .execute("CREATE TABLE bench_events (id BIGINT, payload JSONB)")
+            .await
+            .unwrap();
         // Then declare the promotion — subsequent INSERTs will materialise the shadow column.
         eng_promo
             .config()
@@ -4915,7 +4929,7 @@ mod tests {
         {
             let vals: String = (0..N)
                 .map(|i| {
-                    let cat = ["electronics","books","clothing","food","sports"][i % 5];
+                    let cat = ["electronics", "books", "clothing", "food", "sports"][i % 5];
                     format!("({i}, '{{\"category\":\"{cat}\",\"score\":{i},\"active\":true}}')")
                 })
                 .collect::<Vec<_>>()
@@ -4985,13 +4999,15 @@ mod tests {
                             .as_any()
                             .downcast_ref::<Float64Array>()
                             .unwrap();
-                        (0..a.len()).map(move |i| {
-                            if a.is_null(i) {
-                                None
-                            } else {
-                                Some(a.value(i))
-                            }
-                        })
+                        (0..a.len()).map(
+                            move |i| {
+                                if a.is_null(i) {
+                                    None
+                                } else {
+                                    Some(a.value(i))
+                                }
+                            },
+                        )
                     })
                     .collect();
                 let ys: Vec<Option<f64>> = batches
@@ -5003,13 +5019,15 @@ mod tests {
                             .as_any()
                             .downcast_ref::<Float64Array>()
                             .unwrap();
-                        (0..a.len()).map(move |i| {
-                            if a.is_null(i) {
-                                None
-                            } else {
-                                Some(a.value(i))
-                            }
-                        })
+                        (0..a.len()).map(
+                            move |i| {
+                                if a.is_null(i) {
+                                    None
+                                } else {
+                                    Some(a.value(i))
+                                }
+                            },
+                        )
                     })
                     .collect();
                 assert_eq!(xs, vec![Some(1.0), Some(3.5), None]);

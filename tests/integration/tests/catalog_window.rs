@@ -201,10 +201,7 @@ fn normalized(batches: &[RecordBatch]) -> Vec<String> {
 
 /// Run `EXPLAIN <sql>` on `sess` and return the plan text lines joined by
 /// newline.
-async fn explain_text(
-    sess: &basin_engine::ProjectSession,
-    sql: &str,
-) -> String {
+async fn explain_text(sess: &basin_engine::ProjectSession, sql: &str) -> String {
     let res = sess
         .execute(&format!("EXPLAIN {sql}"))
         .await
@@ -243,9 +240,7 @@ fn shapes(lo: i64) -> Vec<(&'static str, String)> {
         ),
         (
             "window_partition_sum",
-            format!(
-                "SELECT id, SUM(k) OVER (PARTITION BY b) sw FROM {{T}} WHERE id < {lo}"
-            ),
+            format!("SELECT id, SUM(k) OVER (PARTITION BY b) sw FROM {{T}} WHERE id < {lo}"),
         ),
         (
             "lag_lead_window",
@@ -284,9 +279,7 @@ async fn build_d2() -> (Engine, Shard, TempDir, TempDir, Arc<dyn Wal>) {
     let storage_dir = TempDir::new().unwrap();
     let wal_dir = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
-        object_store: Arc::new(
-            LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
-        ),
+        object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
         root_prefix: None,
         disk_cache: None,
         page_cache: None,
@@ -294,9 +287,7 @@ async fn build_d2() -> (Engine, Shard, TempDir, TempDir, Arc<dyn Wal>) {
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let wal: Arc<dyn Wal> = Arc::new(
         LocalWal::open(WalConfig {
-            object_store: Arc::new(
-                LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap(),
-            ),
+            object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
@@ -305,7 +296,11 @@ async fn build_d2() -> (Engine, Shard, TempDir, TempDir, Arc<dyn Wal>) {
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let engine = Engine::new(EngineConfig {
         storage,
         catalog,
@@ -364,11 +359,7 @@ async fn seed_baseline(sess: &basin_engine::ProjectSession) {
 /// 3. Write the real data batch via the shard handle.
 /// 4. Flush → the compactor now has both the dominant pattern AND pending data,
 ///    so it applies the adaptive sort and bumps `compactions_with_adaptive_sort`.
-async fn seed_d2(
-    sess: &basin_engine::ProjectSession,
-    shard: &Shard,
-    project: &ProjectId,
-) {
+async fn seed_d2(sess: &basin_engine::ProjectSession, shard: &Shard, project: &ProjectId) {
     sess.execute(&format!(
         "CREATE TABLE {TABLE} (\
             id BIGINT, k BIGINT, s TEXT, f DOUBLE PRECISION, b BOOLEAN\
@@ -510,10 +501,7 @@ async fn insert_via_sql_chunked(
 
 // ── Query helpers ─────────────────────────────────────────────────────────────
 
-async fn run_shape(
-    sess: &basin_engine::ProjectSession,
-    sql: &str,
-) -> Vec<String> {
+async fn run_shape(sess: &basin_engine::ProjectSession, sql: &str) -> Vec<String> {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => normalized(&batches),
         Ok(other) => panic!("non-rows result for {sql:?}: {other:?}"),
@@ -569,14 +557,16 @@ async fn d2_d3_differential_zero_rows_diff_vs_baseline() {
         let d3_rows = run_shape(&d3_sess, &d3_sql).await;
 
         assert_eq!(
-            d2_rows, base_rows,
+            d2_rows,
+            base_rows,
             "D2 diverges from baseline on shape `{label}`:\n  \
              baseline rows: {}\n  d2 rows: {}",
             base_rows.len(),
             d2_rows.len()
         );
         assert_eq!(
-            d3_rows, base_rows,
+            d3_rows,
+            base_rows,
             "D3 diverges from baseline on shape `{label}`:\n  \
              baseline rows: {}\n  d3 rows: {}",
             base_rows.len(),

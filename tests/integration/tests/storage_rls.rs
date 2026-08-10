@@ -126,7 +126,13 @@ fn auth_cfg(schema: &str) -> AuthConfig {
 }
 
 /// Spin up a REST server. Returns None if Postgres is unreachable.
-async fn try_serve() -> Option<(RunningRest, RestService, AuthService, StubMailer, SchemaGuard)> {
+async fn try_serve() -> Option<(
+    RunningRest,
+    RestService,
+    AuthService,
+    StubMailer,
+    SchemaGuard,
+)> {
     let schema = unique_schema();
     let cfg = auth_cfg(&schema);
     let mailer = StubMailer::new(cfg.smtp.from_email.clone());
@@ -271,8 +277,7 @@ async fn rls_owner_eq_auth_uid_filters_list_and_download() {
     let bob_bearer = format!("Bearer {}", bob_tokens.access_token);
 
     // Create a private bucket (as alice).
-    let bucket_body =
-        serde_json::to_vec(&json!({"name": "private-rls", "public": false})).unwrap();
+    let bucket_body = serde_json::to_vec(&json!({"name": "private-rls", "public": false})).unwrap();
     let r = raw(
         addr,
         "POST",
@@ -284,7 +289,12 @@ async fn rls_owner_eq_auth_uid_filters_list_and_download() {
         Some(&bucket_body),
     )
     .await;
-    assert_eq!(r.status, 201, "create bucket: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        201,
+        "create bucket: {}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     // Enable RLS + owner policy via blob_store directly.
     svc.blob_store().set_objects_rls_enabled(&project, true);
@@ -310,7 +320,12 @@ async fn rls_owner_eq_auth_uid_filters_list_and_download() {
         Some(b"alice content"),
     )
     .await;
-    assert_eq!(r.status, 200, "alice upload: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "alice upload: {}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     // Bob uploads bob.txt.
     let r = raw(
@@ -324,7 +339,12 @@ async fn rls_owner_eq_auth_uid_filters_list_and_download() {
         Some(b"bob content"),
     )
     .await;
-    assert_eq!(r.status, 200, "bob upload: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "bob upload: {}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     // --- List ---
 
@@ -341,10 +361,23 @@ async fn rls_owner_eq_auth_uid_filters_list_and_download() {
         Some(&list_body),
     )
     .await;
-    assert_eq!(r.status, 200, "alice list: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "alice list: {}",
+        String::from_utf8_lossy(&r.body)
+    );
     let alice_list: Vec<Value> = serde_json::from_slice(&r.body).unwrap();
-    assert_eq!(alice_list.len(), 1, "alice should see exactly 1 object; got {}", alice_list.len());
-    assert_eq!(alice_list[0]["path"], "alice.txt", "alice should see alice.txt");
+    assert_eq!(
+        alice_list.len(),
+        1,
+        "alice should see exactly 1 object; got {}",
+        alice_list.len()
+    );
+    assert_eq!(
+        alice_list[0]["path"], "alice.txt",
+        "alice should see alice.txt"
+    );
 
     // Bob lists → should see only bob.txt.
     let r = raw(
@@ -358,9 +391,19 @@ async fn rls_owner_eq_auth_uid_filters_list_and_download() {
         Some(&list_body),
     )
     .await;
-    assert_eq!(r.status, 200, "bob list: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "bob list: {}",
+        String::from_utf8_lossy(&r.body)
+    );
     let bob_list: Vec<Value> = serde_json::from_slice(&r.body).unwrap();
-    assert_eq!(bob_list.len(), 1, "bob should see exactly 1 object; got {}", bob_list.len());
+    assert_eq!(
+        bob_list.len(),
+        1,
+        "bob should see exactly 1 object; got {}",
+        bob_list.len()
+    );
     assert_eq!(bob_list[0]["path"], "bob.txt", "bob should see bob.txt");
 
     // --- Download ---
@@ -419,7 +462,9 @@ async fn rls_owner_eq_auth_uid_filters_list_and_download() {
         r.status
     );
 
-    println!("[storage_rls] owner=auth.uid() filter PASS: alice sees 1, bob sees 1, cross-access denied");
+    println!(
+        "[storage_rls] owner=auth.uid() filter PASS: alice sees 1, bob sees 1, cross-access denied"
+    );
 }
 
 /// Public bucket: authenticated reads bypass the owner policy; anonymous
@@ -609,7 +654,12 @@ async fn rls_cross_project_isolation() {
         Some(b"project-a-secret"),
     )
     .await;
-    assert_eq!(r.status, 200, "alice upload: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "alice upload: {}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     // Bob's JWT binds him to project-B — listing /storage/v1/object/list/shared-name
     // uses his JWT's project_id, so he sees project-B's (empty) bucket.
@@ -625,7 +675,12 @@ async fn rls_cross_project_isolation() {
         Some(&list_body),
     )
     .await;
-    assert_eq!(r.status, 200, "bob list: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "bob list: {}",
+        String::from_utf8_lossy(&r.body)
+    );
     let bob_items: Vec<Value> = serde_json::from_slice(&r.body).unwrap();
     assert_eq!(
         bob_items.len(),
@@ -650,7 +705,9 @@ async fn rls_cross_project_isolation() {
         r.status
     );
 
-    println!("[storage_rls] cross-project isolation PASS: project-B sees only its own (empty) bucket");
+    println!(
+        "[storage_rls] cross-project isolation PASS: project-B sees only its own (empty) bucket"
+    );
 }
 
 /// Delete is also RLS-gated: user can delete only their own objects.
@@ -667,8 +724,7 @@ async fn rls_delete_gated_by_policy() {
     let alice_bearer = format!("Bearer {}", alice_tokens.access_token);
     let bob_bearer = format!("Bearer {}", bob_tokens.access_token);
 
-    let bucket_body =
-        serde_json::to_vec(&json!({"name": "del-bucket", "public": false})).unwrap();
+    let bucket_body = serde_json::to_vec(&json!({"name": "del-bucket", "public": false})).unwrap();
     raw(
         addr,
         "POST",

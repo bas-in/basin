@@ -270,7 +270,15 @@ fn pg_dump_basin_to_basin_round_trip() {
     // ── Step 2: dump via basin-cli ────────────────────────────────────────
     let dump_sql = run_cmd(
         "basin-cli",
-        &["dump", "--url", &basin_url, "--table", "dump_rt_users", "--table", "dump_rt_orders"],
+        &[
+            "dump",
+            "--url",
+            &basin_url,
+            "--table",
+            "dump_rt_users",
+            "--table",
+            "dump_rt_orders",
+        ],
     );
     println!(
         "[5.22.A round-trip] dump captured ({} bytes)",
@@ -325,9 +333,7 @@ fn pg_dump_basin_to_basin_round_trip() {
         ],
     );
     let user_count: u64 = user_count_raw.trim().parse().unwrap_or_else(|_| {
-        panic!(
-            "ROUND-TRIP: could not parse user count from psql output: {user_count_raw:?}"
-        )
+        panic!("ROUND-TRIP: could not parse user count from psql output: {user_count_raw:?}")
     });
     assert_eq!(
         user_count, 3,
@@ -347,9 +353,7 @@ fn pg_dump_basin_to_basin_round_trip() {
         ],
     );
     let order_count: u64 = order_count_raw.trim().parse().unwrap_or_else(|_| {
-        panic!(
-            "ROUND-TRIP: could not parse order count from psql output: {order_count_raw:?}"
-        )
+        panic!("ROUND-TRIP: could not parse order count from psql output: {order_count_raw:?}")
     });
     assert_eq!(
         order_count, 3,
@@ -420,9 +424,7 @@ fn pg_dump_basin_to_real_pg_via_pg_restore() {
         return;
     };
 
-    println!(
-        "[5.22.A pg_restore] BASIN_LOCAL_URL={basin_url}  REAL_PG_URL={real_pg_url}"
-    );
+    println!("[5.22.A pg_restore] BASIN_LOCAL_URL={basin_url}  REAL_PG_URL={real_pg_url}");
 
     // ── Step 1: seed Basin ────────────────────────────────────────────────
     let setup_sql = "\
@@ -468,9 +470,7 @@ fn pg_dump_basin_to_real_pg_via_pg_restore() {
         "PG_RESTORE COMPAT: basin-cli dump must create the output file at {dump_path_str} \
          — closed by 5.22.C"
     );
-    let dump_size = std::fs::metadata(&dump_path)
-        .expect("stat dump file")
-        .len();
+    let dump_size = std::fs::metadata(&dump_path).expect("stat dump file").len();
     assert!(
         dump_size > 0,
         "PG_RESTORE COMPAT: dump file must be non-empty — closed by 5.22.C. size={dump_size}"
@@ -492,7 +492,13 @@ fn pg_dump_basin_to_real_pg_via_pg_restore() {
     // `pg_restore -d $REAL_PG_URL $dump_path_str`
     run_cmd(
         "pg_restore",
-        &["--dbname", &real_pg_url, "--no-owner", "--no-privileges", dump_path_str],
+        &[
+            "--dbname",
+            &real_pg_url,
+            "--no-owner",
+            "--no-privileges",
+            dump_path_str,
+        ],
     );
     println!("[5.22.A pg_restore] pg_restore completed");
 
@@ -509,9 +515,7 @@ fn pg_dump_basin_to_real_pg_via_pg_restore() {
         ],
     );
     let item_count: u64 = item_count_raw.trim().parse().unwrap_or_else(|_| {
-        panic!(
-            "PG_RESTORE COMPAT: could not parse item count: {item_count_raw:?}"
-        )
+        panic!("PG_RESTORE COMPAT: could not parse item count: {item_count_raw:?}")
     });
     assert_eq!(
         item_count, 3,
@@ -532,9 +536,7 @@ fn pg_dump_basin_to_real_pg_via_pg_restore() {
         ],
     );
     let price: i64 = price_raw.trim().parse().unwrap_or_else(|_| {
-        panic!(
-            "PG_RESTORE COMPAT: could not parse price_cents: {price_raw:?}"
-        )
+        panic!("PG_RESTORE COMPAT: could not parse price_cents: {price_raw:?}")
     });
     assert_eq!(
         price, 1999,
@@ -542,9 +544,7 @@ fn pg_dump_basin_to_real_pg_via_pg_restore() {
          got={price}"
     );
 
-    println!(
-        "[5.22.A pg_restore] PASSED — items={item_count}, SKU-001.price_cents={price}"
-    );
+    println!("[5.22.A pg_restore] PASSED — items={item_count}, SKU-001.price_cents={price}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -585,9 +585,7 @@ fn pg_dump_real_pg_to_basin_migration() {
         return;
     };
 
-    println!(
-        "[5.22.A migration] REAL_PG_URL={real_pg_url}  BASIN_LOCAL_URL={basin_url}"
-    );
+    println!("[5.22.A migration] REAL_PG_URL={real_pg_url}  BASIN_LOCAL_URL={basin_url}");
 
     // ── Step 1: seed real PG with a migration-representative schema ───────
     // Schema covers: ENUM type, sequences (via BIGSERIAL), FK, CHECK,
@@ -687,9 +685,7 @@ fn pg_dump_real_pg_to_basin_migration() {
         ],
     );
     let inv_count: u64 = inv_count_raw.trim().parse().unwrap_or_else(|_| {
-        panic!(
-            "MIGRATION: could not parse invoice count from Basin: {inv_count_raw:?}"
-        )
+        panic!("MIGRATION: could not parse invoice count from Basin: {inv_count_raw:?}")
     });
     assert_eq!(
         inv_count, 3,
@@ -709,9 +705,7 @@ fn pg_dump_real_pg_to_basin_migration() {
         ],
     );
     let line_count: u64 = line_count_raw.trim().parse().unwrap_or_else(|_| {
-        panic!(
-            "MIGRATION: could not parse line_item count from Basin: {line_count_raw:?}"
-        )
+        panic!("MIGRATION: could not parse line_item count from Basin: {line_count_raw:?}")
     });
     assert_eq!(
         line_count, 2,
@@ -732,9 +726,7 @@ fn pg_dump_real_pg_to_basin_migration() {
         ],
     );
     let paid_count: u64 = paid_count_raw.trim().parse().unwrap_or_else(|_| {
-        panic!(
-            "MIGRATION: could not parse paid invoice count: {paid_count_raw:?}"
-        )
+        panic!("MIGRATION: could not parse paid invoice count: {paid_count_raw:?}")
     });
     assert_eq!(
         paid_count, 1,
@@ -915,7 +907,10 @@ fn pg_dump_orm_load_post_restore() {
         spend_raw.contains("bob"),
         "ORM-LOAD (JOIN+GROUP BY): bob must appear in result — closed by 5.22.E."
     );
-    println!("[5.22.A orm-load] JOIN+GROUP BY aggregate: {}", spend_raw.trim());
+    println!(
+        "[5.22.A orm-load] JOIN+GROUP BY aggregate: {}",
+        spend_raw.trim()
+    );
 
     // Drizzle: db.select().from(orders).orderBy(desc(orders.amount)).limit(2)
     // Prisma:  prisma.orm_orders.findMany({ orderBy: { amount: 'desc' }, take: 2 })
@@ -941,7 +936,10 @@ fn pg_dump_orm_load_post_restore() {
         "ORM-LOAD (ORDER BY DESC LIMIT): second amount must be 100.00 — closed by 5.22.E. \
          output={top2_raw:?}"
     );
-    println!("[5.22.A orm-load] ORDER BY DESC LIMIT 2: {}", top2_raw.trim());
+    println!(
+        "[5.22.A orm-load] ORDER BY DESC LIMIT 2: {}",
+        top2_raw.trim()
+    );
 
     // Drizzle: db.select().from(orders).where(gte(orders.amount, 100)).offset(0).limit(10)
     // Expected: 2 rows (100.00 + 250.00; the 75.00 and 40.00 are below threshold).
@@ -956,9 +954,10 @@ fn pg_dump_orm_load_post_restore() {
             "SELECT COUNT(*) FROM orm_orders WHERE amount >= 100",
         ],
     );
-    let big_orders: u64 = big_orders_raw.trim().parse().unwrap_or_else(|_| {
-        panic!("ORM-LOAD: cannot parse big_orders count: {big_orders_raw:?}")
-    });
+    let big_orders: u64 = big_orders_raw
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("ORM-LOAD: cannot parse big_orders count: {big_orders_raw:?}"));
     assert_eq!(
         big_orders, 2,
         "ORM-LOAD (WHERE amount >= 100): expected 2, got={big_orders} — closed by 5.22.E."

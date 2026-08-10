@@ -929,8 +929,7 @@ async fn add_constraint(
                     )));
                 }
             }
-            let ref_cols: Vec<String> =
-                referred_columns.iter().map(|i| i.value.clone()).collect();
+            let ref_cols: Vec<String> = referred_columns.iter().map(|i| i.value.clone()).collect();
             // Implicit-PK / partial spec (no referred columns, or a count
             // mismatch): accept the syntax but drop the catalog row — resolving
             // the referenced PK needs an async lookup the CREATE path also
@@ -953,7 +952,10 @@ async fn add_constraint(
                 let on_delete_act = crate::ddl::referential_action_from_ast(*on_delete)?;
                 let on_update_act = crate::ddl::referential_action_from_ast(*on_update)?;
                 let initially_deferred = characteristics.as_ref().is_some_and(|c| {
-                    matches!(c.initially, Some(sqlparser::ast::DeferrableInitial::Deferred))
+                    matches!(
+                        c.initially,
+                        Some(sqlparser::ast::DeferrableInitial::Deferred)
+                    )
                 });
                 let mut fks = meta.foreign_keys.clone();
                 fks.push(ForeignKeyDef {

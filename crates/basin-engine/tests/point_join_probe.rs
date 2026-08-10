@@ -162,7 +162,10 @@ async fn basic_hydrate_probe_then_lookup() {
     assert_eq!(row_count(&batches), 1);
     assert_eq!(i64_col(&batches, "id"), vec![Some(2)]);
     assert_eq!(str_col(&batches, "payload"), vec![Some("p2".to_string())]);
-    assert_eq!(str_col(&batches, "email"), vec![Some("bob@x.com".to_string())]);
+    assert_eq!(
+        str_col(&batches, "email"),
+        vec![Some("bob@x.com".to_string())]
+    );
 }
 
 #[tokio::test]
@@ -183,7 +186,10 @@ async fn basic_hydrate_lookup_columns_first() {
         ExecResult::Rows { batches, .. } => batches,
         _ => unreachable!(),
     };
-    assert_eq!(str_col(&batches, "email"), vec![Some("alice@x.com".to_string())]);
+    assert_eq!(
+        str_col(&batches, "email"),
+        vec![Some("alice@x.com".to_string())]
+    );
     assert_eq!(i64_col(&batches, "id"), vec![Some(1)]);
 }
 
@@ -209,7 +215,10 @@ async fn wildcard_expansion_probe_star() {
     assert_eq!(i64_col(&batches, "id"), vec![Some(3)]);
     assert_eq!(i64_col(&batches, "user_id"), vec![Some(30)]);
     assert_eq!(str_col(&batches, "payload"), vec![Some("p3".to_string())]);
-    assert_eq!(str_col(&batches, "email"), vec![Some("carol@x.com".to_string())]);
+    assert_eq!(
+        str_col(&batches, "email"),
+        vec![Some("carol@x.com".to_string())]
+    );
 }
 
 #[tokio::test]
@@ -230,7 +239,10 @@ async fn alias_as_naming() {
         _ => unreachable!(),
     };
     assert_eq!(i64_col(&batches, "event_id"), vec![Some(1)]);
-    assert_eq!(str_col(&batches, "contact"), vec![Some("alice@x.com".to_string())]);
+    assert_eq!(
+        str_col(&batches, "contact"),
+        vec![Some("alice@x.com".to_string())]
+    );
 }
 
 #[tokio::test]
@@ -257,13 +269,21 @@ async fn lookup_miss_zero_rows_inner() {
     seed(&sess).await;
 
     // Event id=5 points at a non-existent user — INNER JOIN drops it.
-    exec(&sess, "INSERT INTO events (id, user_id, payload) VALUES (5, 999, 'dangling')").await;
+    exec(
+        &sess,
+        "INSERT INTO events (id, user_id, payload) VALUES (5, 999, 'dangling')",
+    )
+    .await;
     let batches = rows(
         &sess,
         "SELECT e.id, u.email FROM events e JOIN users u ON e.user_id = u.id WHERE e.id = 5",
     )
     .await;
-    assert_eq!(row_count(&batches), 0, "dangling FK must drop under INNER JOIN");
+    assert_eq!(
+        row_count(&batches),
+        0,
+        "dangling FK must drop under INNER JOIN"
+    );
 }
 
 #[tokio::test]
@@ -290,7 +310,11 @@ async fn overlay_update_lookup_row_visible_in_join() {
     seed(&sess).await;
 
     // Update the joined user's email via the fast UPDATE path (memtable overlay).
-    exec(&sess, "UPDATE users SET email = 'alice2@x.com' WHERE id = 10").await;
+    exec(
+        &sess,
+        "UPDATE users SET email = 'alice2@x.com' WHERE id = 10",
+    )
+    .await;
 
     let batches = rows(
         &sess,
@@ -321,7 +345,11 @@ async fn tombstone_delete_lookup_row_drops_join() {
         "SELECT e.id, u.email FROM events e JOIN users u ON e.user_id = u.id WHERE e.id = 2",
     )
     .await;
-    assert_eq!(row_count(&batches), 0, "deleted lookup row must drop the join result");
+    assert_eq!(
+        row_count(&batches),
+        0,
+        "deleted lookup row must drop the join result"
+    );
 }
 
 #[tokio::test]
@@ -330,13 +358,21 @@ async fn string_pk_join() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
-    exec(&sess, "CREATE TABLE accts (code TEXT PRIMARY KEY, name TEXT)").await;
+    exec(
+        &sess,
+        "CREATE TABLE accts (code TEXT PRIMARY KEY, name TEXT)",
+    )
+    .await;
     exec(
         &sess,
         "CREATE TABLE txns (id BIGINT PRIMARY KEY, acct_code TEXT, amount BIGINT)",
     )
     .await;
-    exec(&sess, "INSERT INTO accts (code, name) VALUES ('A', 'Anvil'), ('B', 'Bolt')").await;
+    exec(
+        &sess,
+        "INSERT INTO accts (code, name) VALUES ('A', 'Anvil'), ('B', 'Bolt')",
+    )
+    .await;
     exec(
         &sess,
         "INSERT INTO txns (id, acct_code, amount) VALUES (1, 'A', 100), (2, 'B', 200)",
@@ -362,7 +398,11 @@ async fn point_join_latency_100k() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT)").await;
+    exec(
+        &sess,
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT)",
+    )
+    .await;
     exec(
         &sess,
         "CREATE TABLE events (id BIGINT PRIMARY KEY, user_id BIGINT, payload TEXT)",

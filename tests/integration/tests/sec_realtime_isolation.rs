@@ -64,7 +64,9 @@ async fn cross_project_realtime_subscription_isolation() {
         seq: 1,
         causation_user: None,
     };
-    sink.publish(&ev_a).await.expect("project A publish must succeed");
+    sink.publish(&ev_a)
+        .await
+        .expect("project A publish must succeed");
 
     // Project A MUST receive its own event.
     let got_a = rx_a
@@ -170,13 +172,19 @@ async fn same_project_fanout_unaffected_by_isolation() {
     sink.publish(&ev).await.expect("publish must succeed");
 
     // All three same-project subscribers must receive the event.
-    let e1 = rx1.try_recv().expect("rx1 (same-project SSE) must receive event");
+    let e1 = rx1
+        .try_recv()
+        .expect("rx1 (same-project SSE) must receive event");
     assert_eq!(e1.seq, 1, "rx1: wrong seq");
 
-    let e2 = rx2.try_recv().expect("rx2 (same-project SSE dup) must receive event");
+    let e2 = rx2
+        .try_recv()
+        .expect("rx2 (same-project SSE dup) must receive event");
     assert_eq!(e2.seq, 1, "rx2: wrong seq");
 
-    let e3 = rx3.try_recv().expect("rx3 (same-project WS) must receive event");
+    let e3 = rx3
+        .try_recv()
+        .expect("rx3 (same-project WS) must receive event");
     assert_eq!(e3.seq, 1, "rx3: wrong seq");
 
     println!(

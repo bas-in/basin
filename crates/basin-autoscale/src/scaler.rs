@@ -174,10 +174,13 @@ impl Scaler {
         let cfg = &self.config;
 
         // Initialise state for new projects at min_shards.
-        let state = self.state.entry(project_id).or_insert_with(|| ProjectState {
-            shard_count: cfg.min_shards,
-            ..Default::default()
-        });
+        let state = self
+            .state
+            .entry(project_id)
+            .or_insert_with(|| ProjectState {
+                shard_count: cfg.min_shards,
+                ..Default::default()
+            });
 
         // Normalise cpu_ms to a percentage of the per-tick budget.
         let cpu_pct = if cfg.cpu_budget_ms_per_tick == 0 {
@@ -188,9 +191,7 @@ impl Scaler {
 
         let now = Utc::now();
         let cooldown_elapsed = state.last_action.map_or(true, |t| {
-            let elapsed = (now - t)
-                .to_std()
-                .unwrap_or(Duration::ZERO);
+            let elapsed = (now - t).to_std().unwrap_or(Duration::ZERO);
             elapsed >= cfg.cooldown
         });
 
@@ -261,10 +262,7 @@ impl Scaler {
     /// and reads the actual current shard count from the catalog before
     /// beginning tick evaluation.
     pub fn set_shard_count(&mut self, project_id: ProjectId, count: u32) {
-        self.state
-            .entry(project_id)
-            .or_default()
-            .shard_count = count;
+        self.state.entry(project_id).or_default().shard_count = count;
     }
 }
 

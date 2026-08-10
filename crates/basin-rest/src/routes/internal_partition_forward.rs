@@ -250,10 +250,9 @@ pub(crate) async fn post_partition_write(
     // locally and never re-forward, so anything other than 1 is rejected
     // (prevents an A→B→A forward loop if owner resolution ever disagreed).
     let hop = required_header(&headers, PARTITION_FORWARD_HOP_HEADER)?;
-    let hop: u32 = hop
-        .trim()
-        .parse()
-        .map_err(|_| ApiError::invalid(format!("{PARTITION_FORWARD_HOP_HEADER} is not a number")))?;
+    let hop: u32 = hop.trim().parse().map_err(|_| {
+        ApiError::invalid(format!("{PARTITION_FORWARD_HOP_HEADER} is not a number"))
+    })?;
     if hop != 1 {
         return Err(ApiError::invalid(format!(
             "partition-write hop must be 1 (got {hop}); the receiver never re-forwards"
@@ -344,7 +343,10 @@ pub(crate) async fn post_partition_write(
     // write is async (ack-before-durable), symmetric with the local async path.
     let durable = basin_engine::write_forwarder::forward_lands_durable();
     let apply = async {
-        let handle = shard.get(&project, &partition).await.map_err(ApiError::from)?;
+        let handle = shard
+            .get(&project, &partition)
+            .await
+            .map_err(ApiError::from)?;
         // #46 durability audit: capture the WAL LSN the batch landed at. With
         // durable-on-forward engaged (the default), `write_batch_opts_lsn(...,
         // true)` returns ONLY after the owner's WAL group-committed through this
@@ -487,7 +489,10 @@ mod tests {
         // key (before record_applied) must NOT also Apply — it sees the in-flight
         // entry and dedups, so two simultaneous retries can't both write.
         let w = fresh_window();
-        assert!(matches!(w.claim("k", 100), IdemClaim::Apply), "first claims");
+        assert!(
+            matches!(w.claim("k", 100), IdemClaim::Apply),
+            "first claims"
+        );
         match w.claim("k", 100) {
             IdemClaim::InFlightDuplicate(n) => assert_eq!(n, 100),
             _ => panic!("concurrent second claim must dedup as InFlightDuplicate"),
@@ -525,13 +530,19 @@ mod tests {
         let g = w.inner.lock().unwrap();
         assert!(g.map.len() <= IDEM_WINDOW, "window stays bounded");
         assert!(!g.map.contains_key("k0"), "oldest key evicted FIFO");
-        assert!(g.map.contains_key(&format!("k{}", IDEM_WINDOW + 9)), "newest retained");
+        assert!(
+            g.map.contains_key(&format!("k{}", IDEM_WINDOW + 9)),
+            "newest retained"
+        );
     }
 
     #[test]
     fn required_header_present_and_absent() {
         let mut h = HeaderMap::new();
-        h.insert(PARTITION_FORWARD_TABLE_HEADER, HeaderValue::from_static("t"));
+        h.insert(
+            PARTITION_FORWARD_TABLE_HEADER,
+            HeaderValue::from_static("t"),
+        );
         assert_eq!(
             required_header(&h, PARTITION_FORWARD_TABLE_HEADER).unwrap(),
             "t"

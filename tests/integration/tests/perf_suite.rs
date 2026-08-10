@@ -164,7 +164,11 @@ async fn build_fact(sess: &ProjectSession, table: &str, with: &str, total_rows: 
             } else {
                 "false".to_string()
             };
-            vals.push_str(&format!("({id}, {}, {s}, {}, {bb})", id % 17, id as f64 * 1.5));
+            vals.push_str(&format!(
+                "({id}, {}, {s}, {}, {bb})",
+                id % 17,
+                id as f64 * 1.5
+            ));
         }
         exec(
             sess,
@@ -188,7 +192,11 @@ async fn build_dim(sess: &ProjectSession, table: &str, with: &str) {
         }
         vals.push_str(&format!("({dk}, 'lbl{dk}', {})", dk as f64 * 2.5));
     }
-    exec(sess, &format!("INSERT INTO {table} (dk, label, w) VALUES {vals}")).await;
+    exec(
+        sess,
+        &format!("INSERT INTO {table} (dk, label, w) VALUES {vals}"),
+    )
+    .await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -235,8 +243,8 @@ async fn percentile_ms(sess: &ProjectSession, sql: &str, reps: usize, q: f64) ->
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn repo_root() -> PathBuf {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR")
-        .unwrap_or_else(|_| "tests/integration".to_string());
+    let manifest =
+        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| "tests/integration".to_string());
     PathBuf::from(&manifest)
         .parent()
         .and_then(|p| p.parent())
@@ -340,7 +348,13 @@ async fn perf_fast_tier() {
     // Build a Vortex (default) fact + dim and a Parquet fact + dim so the
     // vortex-vs-parquet ratio shapes have both formats on hand.
     build_fact(&sess, "tv", " WITH (basin.sort_by='id')", FAST_ROWS).await;
-    build_fact(&sess, "tp", " WITH (basin.file_format='parquet', basin.sort_by='id')", FAST_ROWS).await;
+    build_fact(
+        &sess,
+        "tp",
+        " WITH (basin.file_format='parquet', basin.sort_by='id')",
+        FAST_ROWS,
+    )
+    .await;
     build_dim(&sess, "dv", "").await;
     build_dim(&sess, "dp", " WITH (basin.file_format='parquet')").await;
 
@@ -360,21 +374,53 @@ async fn perf_fast_tier() {
         // Bars: observed honest p50 ≈ 1ms, p99 ≈ 5-120ms. Ceilings at
         // 200ms / 500ms give large headroom over shared-CI jitter while
         // still catching a 10×-class point-lookup regression.
-        rows.push(PerfRow { category: "point_query", shape: "point_eq_hot".into(), metric: "p50_ms", value: p50, threshold: 200.0, lower_is_better: true, tier: Tier::Fast });
-        rows.push(PerfRow { category: "point_query", shape: "point_eq_hot".into(), metric: "p99_ms", value: p99, threshold: 500.0, lower_is_better: true, tier: Tier::Fast });
+        rows.push(PerfRow {
+            category: "point_query",
+            shape: "point_eq_hot".into(),
+            metric: "p50_ms",
+            value: p50,
+            threshold: 200.0,
+            lower_is_better: true,
+            tier: Tier::Fast,
+        });
+        rows.push(PerfRow {
+            category: "point_query",
+            shape: "point_eq_hot".into(),
+            metric: "p99_ms",
+            value: p99,
+            threshold: 500.0,
+            lower_is_better: true,
+            tier: Tier::Fast,
+        });
     }
     // Point query that misses (id out of range) — should still be cheap
     // because file-level min/max pruning skips every file.
     {
         let sql = format!("SELECT * FROM tv WHERE id = {}", FAST_ROWS * 10);
         let p99 = percentile_ms(&sess, &sql, REPS, 0.99).await;
-        rows.push(PerfRow { category: "point_query", shape: "point_eq_miss".into(), metric: "p99_ms", value: p99, threshold: 500.0, lower_is_better: true, tier: Tier::Fast });
+        rows.push(PerfRow {
+            category: "point_query",
+            shape: "point_eq_miss".into(),
+            metric: "p99_ms",
+            value: p99,
+            threshold: 500.0,
+            lower_is_better: true,
+            tier: Tier::Fast,
+        });
     }
     // Range scan with a selective predicate.
     {
         let sql = format!("SELECT id, k FROM tv WHERE id BETWEEN {lo} AND {hi}");
         let p99 = percentile_ms(&sess, &sql, REPS, 0.99).await;
-        rows.push(PerfRow { category: "point_query", shape: "range_between".into(), metric: "p99_ms", value: p99, threshold: 800.0, lower_is_better: true, tier: Tier::Fast });
+        rows.push(PerfRow {
+            category: "point_query",
+            shape: "range_between".into(),
+            metric: "p99_ms",
+            value: p99,
+            threshold: 800.0,
+            lower_is_better: true,
+            tier: Tier::Fast,
+        });
     }
 
     // ── Full scan throughput (rows/sec) ─────────────────────────────────────
@@ -385,7 +431,15 @@ async fn perf_fast_tier() {
         let sql = "SELECT * FROM tv";
         let ms = median_ms(&sess, sql, REPS).await;
         let rps = (FAST_ROWS as f64) / (ms / 1000.0).max(1e-9);
-        rows.push(PerfRow { category: "scan", shape: "full_scan".into(), metric: "rows_per_sec", value: rps, threshold: 50_000.0, lower_is_better: false, tier: Tier::Fast });
+        rows.push(PerfRow {
+            category: "scan",
+            shape: "full_scan".into(),
+            metric: "rows_per_sec",
+            value: rps,
+            threshold: 50_000.0,
+            lower_is_better: false,
+            tier: Tier::Fast,
+        });
     }
     // Metadata-only aggregate — COUNT(*) should be near-instant (catalog
     // row count, no scan). Observed honest ≈ 0.1ms; bar at 200ms guards
@@ -393,7 +447,15 @@ async fn perf_fast_tier() {
     {
         let sql = "SELECT COUNT(*) FROM tv";
         let p99 = percentile_ms(&sess, sql, REPS, 0.99).await;
-        rows.push(PerfRow { category: "scan", shape: "count_star".into(), metric: "p99_ms", value: p99, threshold: 200.0, lower_is_better: true, tier: Tier::Fast });
+        rows.push(PerfRow {
+            category: "scan",
+            shape: "count_star".into(),
+            metric: "p99_ms",
+            value: p99,
+            threshold: 200.0,
+            lower_is_better: true,
+            tier: Tier::Fast,
+        });
     }
 
     // ── GROUP BY scaling (cardinality) ──────────────────────────────────────
@@ -404,17 +466,41 @@ async fn perf_fast_tier() {
     {
         let sql = "SELECT k, COUNT(*) FROM tv GROUP BY k";
         let ms = median_ms(&sess, sql, REPS).await;
-        rows.push(PerfRow { category: "groupby", shape: "low_card_17".into(), metric: "p50_ms", value: ms, threshold: 1_000.0, lower_is_better: true, tier: Tier::Fast });
+        rows.push(PerfRow {
+            category: "groupby",
+            shape: "low_card_17".into(),
+            metric: "p50_ms",
+            value: ms,
+            threshold: 1_000.0,
+            lower_is_better: true,
+            tier: Tier::Fast,
+        });
     }
     {
         let sql = "SELECT id, COUNT(*) FROM tv GROUP BY id";
         let ms = median_ms(&sess, sql, REPS).await;
-        rows.push(PerfRow { category: "groupby", shape: "high_card_per_id".into(), metric: "p50_ms", value: ms, threshold: 2_000.0, lower_is_better: true, tier: Tier::Fast });
+        rows.push(PerfRow {
+            category: "groupby",
+            shape: "high_card_per_id".into(),
+            metric: "p50_ms",
+            value: ms,
+            threshold: 2_000.0,
+            lower_is_better: true,
+            tier: Tier::Fast,
+        });
     }
     {
         let sql = "SELECT k, b, COUNT(*) FROM tv GROUP BY k, b";
         let ms = median_ms(&sess, sql, REPS).await;
-        rows.push(PerfRow { category: "groupby", shape: "multi_key".into(), metric: "p50_ms", value: ms, threshold: 1_500.0, lower_is_better: true, tier: Tier::Fast });
+        rows.push(PerfRow {
+            category: "groupby",
+            shape: "multi_key".into(),
+            metric: "p50_ms",
+            value: ms,
+            threshold: 1_500.0,
+            lower_is_better: true,
+            tier: Tier::Fast,
+        });
     }
 
     // ── JOIN scaling ────────────────────────────────────────────────────────
@@ -423,12 +509,28 @@ async fn perf_fast_tier() {
     {
         let sql = format!("SELECT a.id, d.label FROM tv a JOIN dv d ON a.k = d.dk WHERE a.id BETWEEN {lo} AND {hi}");
         let ms = median_ms(&sess, &sql, REPS).await;
-        rows.push(PerfRow { category: "join", shape: "inner_join_filtered".into(), metric: "p50_ms", value: ms, threshold: 3_000.0, lower_is_better: true, tier: Tier::Fast });
+        rows.push(PerfRow {
+            category: "join",
+            shape: "inner_join_filtered".into(),
+            metric: "p50_ms",
+            value: ms,
+            threshold: 3_000.0,
+            lower_is_better: true,
+            tier: Tier::Fast,
+        });
     }
     {
         let sql = "SELECT a.id, d.label FROM tv a LEFT JOIN dv d ON a.k = d.dk";
         let ms = median_ms(&sess, sql, REPS).await;
-        rows.push(PerfRow { category: "join", shape: "left_join_full".into(), metric: "p50_ms", value: ms, threshold: 3_000.0, lower_is_better: true, tier: Tier::Fast });
+        rows.push(PerfRow {
+            category: "join",
+            shape: "left_join_full".into(),
+            metric: "p50_ms",
+            value: ms,
+            threshold: 3_000.0,
+            lower_is_better: true,
+            tier: Tier::Fast,
+        });
     }
 
     // ── Vortex vs Parquet ratios (ratio = parquet_ms / vortex_ms) ───────────
@@ -443,7 +545,10 @@ async fn perf_fast_tier() {
     // engine-crate `vortex_vs_parquet_smoke`, which is allowed to be noisy.
     for (shape, tmpl) in [
         ("full_scan", "SELECT * FROM {Q}"),
-        ("aggregate_full", "SELECT COUNT(*), SUM(id), MIN(k), MAX(k) FROM {Q}"),
+        (
+            "aggregate_full",
+            "SELECT COUNT(*), SUM(id), MIN(k), MAX(k) FROM {Q}",
+        ),
         ("group_by", "SELECT k, COUNT(*) FROM {Q} GROUP BY k"),
     ] {
         let q_parquet = tmpl.replace("{Q}", "tp");
@@ -451,7 +556,15 @@ async fn perf_fast_tier() {
         let p_ms = median_ms(&sess, &q_parquet, REPS).await.max(1e-6);
         let v_ms = median_ms(&sess, &q_vortex, REPS).await.max(1e-6);
         let ratio = p_ms / v_ms;
-        rows.push(PerfRow { category: "vortex_ratio", shape: shape.to_string(), metric: "ratio", value: ratio, threshold: 0.2, lower_is_better: false, tier: Tier::Fast });
+        rows.push(PerfRow {
+            category: "vortex_ratio",
+            shape: shape.to_string(),
+            metric: "ratio",
+            value: ratio,
+            threshold: 0.2,
+            lower_is_better: false,
+            tier: Tier::Fast,
+        });
     }
 
     // ── basin_stat_statements overhead (Phase 5.16 acceptance gate) ─────────
@@ -479,13 +592,25 @@ async fn perf_fast_tier() {
         // *absolute* tail stays bounded (≤ 150ms p99, same as the point
         // query bar) which is the real gate; the percent is reported for
         // the dashboard and is not the failing condition here.
-        rows.push(PerfRow { category: "overhead", shape: "stat_statements_p99".into(), metric: "p99_ms", value: p99_live, threshold: 150.0, lower_is_better: true, tier: Tier::Fast });
+        rows.push(PerfRow {
+            category: "overhead",
+            shape: "stat_statements_p99".into(),
+            metric: "p99_ms",
+            value: p99_live,
+            threshold: 150.0,
+            lower_is_better: true,
+            tier: Tier::Fast,
+        });
         println!("[perf_suite] stat_statements observed p99/p50 spread = {overhead_pct:.2}% (reported, not gated; Phase 5.16 gate is ≤1% on a dedicated perf box)");
     }
 
     write_csv(&rows, "perf_suite.csv");
     print_summary(&rows);
-    assert!(rows.len() >= 15, "expected ≥15 fast-tier perf shapes, got {}", rows.len());
+    assert!(
+        rows.len() >= 15,
+        "expected ≥15 fast-tier perf shapes, got {}",
+        rows.len()
+    );
     assert_all_passed(&rows);
 }
 

@@ -122,9 +122,18 @@ impl SoftAuthenticator {
         let x = point.x().unwrap().to_vec();
         let y = point.y().unwrap().to_vec();
         let map = Value::Map(vec![
-            (Value::Integer(Integer::from(1)), Value::Integer(Integer::from(2))),
-            (Value::Integer(Integer::from(3)), Value::Integer(Integer::from(-7))),
-            (Value::Integer(Integer::from(-1)), Value::Integer(Integer::from(1))),
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Integer(Integer::from(2)),
+            ),
+            (
+                Value::Integer(Integer::from(3)),
+                Value::Integer(Integer::from(-7)),
+            ),
+            (
+                Value::Integer(Integer::from(-1)),
+                Value::Integer(Integer::from(1)),
+            ),
             (Value::Integer(Integer::from(-2)), Value::Bytes(x)),
             (Value::Integer(Integer::from(-3)), Value::Bytes(y)),
         ]);
@@ -164,7 +173,10 @@ impl SoftAuthenticator {
         let att_obj = Value::Map(vec![
             (Value::Text("fmt".into()), Value::Text("none".into())),
             (Value::Text("attStmt".into()), Value::Map(vec![])),
-            (Value::Text("authData".into()), Value::Bytes(self.auth_data(sign_count, true))),
+            (
+                Value::Text("authData".into()),
+                Value::Bytes(self.auth_data(sign_count, true)),
+            ),
         ]);
         let mut obj_buf = Vec::new();
         ciborium::ser::into_writer(&att_obj, &mut obj_buf).unwrap();
@@ -298,7 +310,10 @@ async fn webauthn_verify_wrong_challenge_rejected() {
         .await;
     assert!(err.is_err());
     assert!(
-        err.unwrap_err().to_string().to_lowercase().contains("challenge"),
+        err.unwrap_err()
+            .to_string()
+            .to_lowercase()
+            .contains("challenge"),
         "error must mention challenge"
     );
 }
@@ -343,7 +358,14 @@ async fn webauthn_challenge_step_up_issues_aal2() {
     let assertion = auth.assertion(&req_challenge, 2);
 
     let result = svc
-        .verify_webauthn_challenge(None::<&MfaCache>, &enc, &project, uid, challenge_id, &assertion)
+        .verify_webauthn_challenge(
+            None::<&MfaCache>,
+            &enc,
+            &project,
+            uid,
+            challenge_id,
+            &assertion,
+        )
         .await
         .expect("verify_webauthn_challenge");
 

@@ -260,10 +260,7 @@ async fn update_same_row_twice_latest_wins() {
         Some(200),
         "second UPDATE must overwrite the first override"
     );
-    assert_eq!(
-        all_rows(&sess, "t").await,
-        vec![(1, 10), (2, 200), (3, 30)]
-    );
+    assert_eq!(all_rows(&sess, "t").await, vec![(1, 10), (2, 200), (3, 30)]);
 }
 
 /// UPDATE then DELETE the same PK → the row is gone (override then tombstone).
@@ -341,11 +338,10 @@ async fn update_returning_fastpath_returns_new_values() {
     let sess = open(&eng).await;
     seed(&sess, "t", 5).await;
 
-    let result = with_fastpath_on(
-        sess.execute("UPDATE t SET val = 888 WHERE id = 3 RETURNING id, val"),
-    )
-    .await
-    .unwrap_or_else(|e| panic!("UPDATE … RETURNING failed: {e:?}"));
+    let result =
+        with_fastpath_on(sess.execute("UPDATE t SET val = 888 WHERE id = 3 RETURNING id, val"))
+            .await
+            .unwrap_or_else(|e| panic!("UPDATE … RETURNING failed: {e:?}"));
 
     let batches = match result {
         ExecResult::Rows { batches, .. } => batches,
@@ -359,7 +355,11 @@ async fn update_returning_fastpath_returns_new_values() {
     let id_col = b.column_by_name("id").expect("id column in RETURNING");
     let val_col = b.column_by_name("val").expect("val column in RETURNING");
     assert_eq!(int_value(id_col, 0), 3, "RETURNING id must be 3");
-    assert_eq!(int_value(val_col, 0), 888, "RETURNING val must be the new value 888");
+    assert_eq!(
+        int_value(val_col, 0),
+        888,
+        "RETURNING val must be the new value 888"
+    );
 
     // Confirm the overlay is still correct on a subsequent read.
     assert_eq!(scalar_at(&sess, "t", "val", 3).await, Some(888));
@@ -374,11 +374,9 @@ async fn update_returning_star_fastpath() {
     let sess = open(&eng).await;
     seed(&sess, "t", 3).await;
 
-    let result = with_fastpath_on(
-        sess.execute("UPDATE t SET val = 777 WHERE id = 2 RETURNING *"),
-    )
-    .await
-    .unwrap_or_else(|e| panic!("UPDATE … RETURNING * failed: {e:?}"));
+    let result = with_fastpath_on(sess.execute("UPDATE t SET val = 777 WHERE id = 2 RETURNING *"))
+        .await
+        .unwrap_or_else(|e| panic!("UPDATE … RETURNING * failed: {e:?}"));
 
     let batches = match result {
         ExecResult::Rows { batches, .. } => batches,
@@ -410,11 +408,10 @@ async fn update_returning_expression_falls_back_cold() {
 
     // Even with the fast-path env set, `val + 1` is not a plain column ref
     // so routing falls through to the cold copy-on-write path.
-    let result = with_fastpath_on(
-        sess.execute("UPDATE t SET val = 50 WHERE id = 1 RETURNING val + 1"),
-    )
-    .await
-    .unwrap_or_else(|e| panic!("UPDATE … RETURNING expr failed: {e:?}"));
+    let result =
+        with_fastpath_on(sess.execute("UPDATE t SET val = 50 WHERE id = 1 RETURNING val + 1"))
+            .await
+            .unwrap_or_else(|e| panic!("UPDATE … RETURNING expr failed: {e:?}"));
 
     let batches = match result {
         ExecResult::Rows { batches, .. } => batches,
@@ -525,8 +522,16 @@ async fn rmw_case_when_fastpath() {
     })
     .await;
 
-    assert_eq!(scalar_at(&sess, "t", "val", 2).await, Some(20), "20>25 false → unchanged");
-    assert_eq!(scalar_at(&sess, "t", "val", 4).await, Some(0), "40>25 true → 0");
+    assert_eq!(
+        scalar_at(&sess, "t", "val", 2).await,
+        Some(20),
+        "20>25 false → unchanged"
+    );
+    assert_eq!(
+        scalar_at(&sess, "t", "val", 4).await,
+        Some(0),
+        "40>25 true → 0"
+    );
     assert_eq!(count_rows(&sess, "t").await, 5);
 }
 
@@ -572,7 +577,10 @@ async fn rmw_case_when_int32_pk_no_crossed_values() {
     for _ in 0..20 {
         // id=2: 20 > 25 false → unchanged 20. Must NOT cross to id=4's 0.
         let v2 = point_select_exactly_one(&sess, "t", "val", 2).await;
-        assert_eq!(v2, 20, "id=2 must read its own value, never id=4's post-image");
+        assert_eq!(
+            v2, 20,
+            "id=2 must read its own value, never id=4's post-image"
+        );
         // id=4: 40 > 25 true → 0. Must NOT cross to id=2's 20.
         let v4 = point_select_exactly_one(&sess, "t", "val", 4).await;
         assert_eq!(v4, 0, "id=4 must read its own value, never id=2's value");
@@ -592,12 +600,7 @@ async fn rmw_case_when_int32_pk_no_crossed_values() {
 /// `SELECT <col> FROM <table> WHERE id = <id>` asserting the result has EXACTLY
 /// one row across all batches (a crossed-value bug surfaced as a SECOND appended
 /// override row for the non-matching key). Returns the single value.
-async fn point_select_exactly_one(
-    sess: &ProjectSession,
-    table: &str,
-    col: &str,
-    id: i64,
-) -> i64 {
+async fn point_select_exactly_one(sess: &ProjectSession, table: &str, col: &str, id: i64) -> i64 {
     let sql = format!("SELECT {col} FROM {table} WHERE id = {id}");
     let batches = match sess.execute(&sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => batches,
@@ -624,7 +627,11 @@ async fn rmw_null_propagation() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
-    exec(&sess, "CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)").await;
+    exec(
+        &sess,
+        "CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)",
+    )
+    .await;
     exec(&sess, "INSERT INTO n (id, v) VALUES (1, NULL), (2, 7)").await;
 
     with_fastpath_on(async {
@@ -659,7 +666,11 @@ async fn rmw_cross_column() {
         "CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT)",
     )
     .await;
-    exec(&sess, "INSERT INTO c (id, a, b) VALUES (1, 5, 100), (2, 6, 200)").await;
+    exec(
+        &sess,
+        "INSERT INTO c (id, a, b) VALUES (1, 5, 100), (2, 6, 200)",
+    )
+    .await;
 
     with_fastpath_on(exec(&sess, "UPDATE c SET a = b + 1 WHERE id = 1")).await;
 
@@ -699,7 +710,10 @@ async fn rmw_bulk_64_keys_expr_matches_slow_path() {
     seed(&sess, "tf", 70).await;
     seed(&sess, "ts", 70).await;
 
-    let in_list = (1..=64).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+    let in_list = (1..=64)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     let set = "val = CASE WHEN val > 320 THEN val * 2 ELSE val + 1 END";
     with_fastpath_on(exec(
         &sess,
@@ -748,7 +762,9 @@ async fn rmw_bulk_multi_expr_jsonb_case_arith_matches_slow_path() {
     for t in ["jf", "js"] {
         exec(
             &sess,
-            &format!("CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, val BIGINT, payload JSONB)"),
+            &format!(
+                "CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, val BIGINT, payload JSONB)"
+            ),
         )
         .await;
         for i in 1..=8 {
@@ -839,13 +855,23 @@ async fn rmw_bulk_mixed_null_preimages_match_slow_path() {
         .await;
         exec(
             &sess,
-            &format!("INSERT INTO {t} (id, val) VALUES (1, NULL), (2, 7), (3, NULL), (4, 9), (5, 11)"),
+            &format!(
+                "INSERT INTO {t} (id, val) VALUES (1, NULL), (2, 7), (3, NULL), (4, 9), (5, 11)"
+            ),
         )
         .await;
     }
 
-    with_fastpath_on(exec(&sess, "UPDATE nf SET val = val + 1 WHERE id IN (1, 2, 3, 4)")).await;
-    with_fastpath_off(exec(&sess, "UPDATE ns SET val = val + 1 WHERE id IN (1, 2, 3, 4)")).await;
+    with_fastpath_on(exec(
+        &sess,
+        "UPDATE nf SET val = val + 1 WHERE id IN (1, 2, 3, 4)",
+    ))
+    .await;
+    with_fastpath_off(exec(
+        &sess,
+        "UPDATE ns SET val = val + 1 WHERE id IN (1, 2, 3, 4)",
+    ))
+    .await;
 
     for i in 1..=5 {
         assert_eq!(
@@ -854,11 +880,23 @@ async fn rmw_bulk_mixed_null_preimages_match_slow_path() {
             "id={i}: fast NULL-ness must match slow path"
         );
     }
-    assert_eq!(is_null_at(&sess, "nf", "val", 1).await, Some(true), "NULL+1 stays NULL");
+    assert_eq!(
+        is_null_at(&sess, "nf", "val", 1).await,
+        Some(true),
+        "NULL+1 stays NULL"
+    );
     assert_eq!(scalar_at(&sess, "nf", "val", 2).await, Some(8), "7+1");
-    assert_eq!(is_null_at(&sess, "nf", "val", 3).await, Some(true), "NULL+1 stays NULL");
+    assert_eq!(
+        is_null_at(&sess, "nf", "val", 3).await,
+        Some(true),
+        "NULL+1 stays NULL"
+    );
     assert_eq!(scalar_at(&sess, "nf", "val", 4).await, Some(10), "9+1");
-    assert_eq!(scalar_at(&sess, "nf", "val", 5).await, Some(11), "id=5 untouched");
+    assert_eq!(
+        scalar_at(&sess, "nf", "val", 5).await,
+        Some(11),
+        "id=5 untouched"
+    );
     assert_eq!(count_rows(&sess, "nf").await, 5);
 }
 
@@ -913,7 +951,11 @@ async fn rmw_unsupported_falls_back_cold() {
     let dir = TempDir::new().unwrap();
     let eng = engine_in(&dir);
     let sess = open(&eng).await;
-    exec(&sess, "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)").await;
+    exec(
+        &sess,
+        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)",
+    )
+    .await;
     exec(&sess, "INSERT INTO u (id, v) VALUES (1, -5), (2, 9)").await;
 
     // `abs(v)` is a function call → excluded from the allowlist → cold path,

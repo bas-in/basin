@@ -184,7 +184,9 @@ pub fn validate_registration(
         ));
     }
     if topic.trim().is_empty() {
-        return Err(CdcKafkaError::InvalidTopic("topic must be non-empty".into()));
+        return Err(CdcKafkaError::InvalidTopic(
+            "topic must be non-empty".into(),
+        ));
     }
     if let Some(ops) = ops {
         for op in ops {
@@ -227,7 +229,11 @@ mod tests {
 
     #[test]
     fn partition_key_round_trips() {
-        for pk in [PartitionKey::RowPk, PartitionKey::Project, PartitionKey::Table] {
+        for pk in [
+            PartitionKey::RowPk,
+            PartitionKey::Project,
+            PartitionKey::Table,
+        ] {
             assert_eq!(PartitionKey::parse(pk.as_str()), Some(pk));
         }
         assert_eq!(PartitionKey::parse("PK"), Some(PartitionKey::RowPk));
@@ -294,6 +300,8 @@ mod tests {
             validate_registration("b:9092", "t", None, Some("hashmod")),
             Err(CdcKafkaError::InvalidPartitionKey(_))
         ));
-        assert!(validate_registration("b:9092", "t", Some(&["UPDATE".into()]), Some("row_pk")).is_ok());
+        assert!(
+            validate_registration("b:9092", "t", Some(&["UPDATE".into()]), Some("row_pk")).is_ok()
+        );
     }
 }

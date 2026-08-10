@@ -210,8 +210,7 @@ async fn s3_scaling_data_size() {
     // data_growth_factor), which still catches a catastrophic linear/super-
     // linear regression. The bytes-per-row storage-efficiency check (the card's
     // real claim) stays hard in both regimes.
-    let data_growth_factor =
-        *SCALES.last().unwrap() as f64 / *SCALES.first().unwrap() as f64;
+    let data_growth_factor = *SCALES.last().unwrap() as f64 / *SCALES.first().unwrap() as f64;
     let latency_regime = cfg.latency_inject().is_some();
     let point_pass = if latency_regime {
         point_ratio <= BAR_POINT_RATIO

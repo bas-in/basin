@@ -144,9 +144,7 @@ async fn try_query_in_tx(sess: &ProjectSession, sql: &str) -> Result<Vec<String>
         let _ = sess.execute("RELEASE SAVEPOINT c6_probe").await;
     } else {
         // Rollback to savepoint to un-abort the transaction.
-        let _ = sess
-            .execute("ROLLBACK TO SAVEPOINT c6_probe")
-            .await;
+        let _ = sess.execute("ROLLBACK TO SAVEPOINT c6_probe").await;
     }
 
     result
@@ -263,7 +261,11 @@ async fn seed_cold(sess: &ProjectSession, fact: &str, dim: &str, total_rows: i64
     }
 
     let dv = dim_values();
-    exec_ok(sess, &format!("INSERT INTO {dim} (dk, label, w) VALUES {dv}")).await;
+    exec_ok(
+        sess,
+        &format!("INSERT INTO {dim} (dk, label, w) VALUES {dv}"),
+    )
+    .await;
 }
 
 /// **Mode B — hot only**: `BEGIN`, insert all rows (pending Vortex files +
@@ -297,7 +299,11 @@ async fn seed_hot(sess: &ProjectSession, fact: &str, dim: &str, total_rows: i64)
     }
 
     let dv = dim_values();
-    exec_ok(sess, &format!("INSERT INTO {dim} (dk, label, w) VALUES {dv}")).await;
+    exec_ok(
+        sess,
+        &format!("INSERT INTO {dim} (dk, label, w) VALUES {dv}"),
+    )
+    .await;
 
     // Transaction is left open: queries within the tx see pending files via
     // refresh_table_with_extra. Caller issues ROLLBACK when done.
@@ -319,7 +325,11 @@ async fn seed_split(sess: &ProjectSession, fact: &str, dim: &str, total_rows: i6
 
     // Dimension table: committed (same as Mode A).
     let dv = dim_values();
-    exec_ok(sess, &format!("INSERT INTO {dim} (dk, label, w) VALUES {dv}")).await;
+    exec_ok(
+        sess,
+        &format!("INSERT INTO {dim} (dk, label, w) VALUES {dv}"),
+    )
+    .await;
 
     // First half committed (auto-commit).
     let cold_rows = total_rows / 2;
@@ -373,7 +383,10 @@ fn all_shapes(total: i64) -> Vec<(&'static str, String)> {
             "range_between",
             format!("SELECT * FROM {{Q}} WHERE id BETWEEN {lo} AND {hi}"),
         ),
-        ("inequality_gt", "SELECT id, k FROM {Q} WHERE k > 10".to_string()),
+        (
+            "inequality_gt",
+            "SELECT id, k FROM {Q} WHERE k > 10".to_string(),
+        ),
         ("is_null", "SELECT * FROM {Q} WHERE s IS NULL".to_string()),
         ("string_eq", "SELECT * FROM {Q} WHERE s = 'v3'".to_string()),
         (
@@ -388,7 +401,10 @@ fn all_shapes(total: i64) -> Vec<(&'static str, String)> {
             "aggregate_filtered",
             format!("SELECT COUNT(*), SUM(id) FROM {{Q}} WHERE id BETWEEN {lo} AND {hi}"),
         ),
-        ("group_by", "SELECT k, COUNT(*) FROM {Q} GROUP BY k".to_string()),
+        (
+            "group_by",
+            "SELECT k, COUNT(*) FROM {Q} GROUP BY k".to_string(),
+        ),
         (
             "order_by_limit",
             "SELECT * FROM {Q} ORDER BY id LIMIT 20".to_string(),
@@ -444,7 +460,10 @@ fn all_shapes(total: i64) -> Vec<(&'static str, String)> {
             "or_predicate",
             "SELECT * FROM {Q} WHERE k = 1 OR k = 9 OR k = 13".to_string(),
         ),
-        ("like_prefix", "SELECT * FROM {Q} WHERE s LIKE 'v1%'".to_string()),
+        (
+            "like_prefix",
+            "SELECT * FROM {Q} WHERE s LIKE 'v1%'".to_string(),
+        ),
         ("not_eq", "SELECT * FROM {Q} WHERE k <> 7".to_string()),
         (
             "multi_group_by",
@@ -454,7 +473,10 @@ fn all_shapes(total: i64) -> Vec<(&'static str, String)> {
             "high_card_group_by",
             "SELECT id, COUNT(*) FROM {Q} GROUP BY id".to_string(),
         ),
-        ("count_distinct", "SELECT COUNT(DISTINCT k) FROM {Q}".to_string()),
+        (
+            "count_distinct",
+            "SELECT COUNT(DISTINCT k) FROM {Q}".to_string(),
+        ),
         ("distinct_rows", "SELECT DISTINCT k, b FROM {Q}".to_string()),
         (
             "having",
@@ -462,21 +484,15 @@ fn all_shapes(total: i64) -> Vec<(&'static str, String)> {
         ),
         (
             "window_row_number",
-            format!(
-                "SELECT id, ROW_NUMBER() OVER (ORDER BY id) rn FROM {{Q}} WHERE id < {lo}"
-            ),
+            format!("SELECT id, ROW_NUMBER() OVER (ORDER BY id) rn FROM {{Q}} WHERE id < {lo}"),
         ),
         (
             "window_partition_sum",
-            format!(
-                "SELECT id, SUM(k) OVER (PARTITION BY b) sw FROM {{Q}} WHERE id < {lo}"
-            ),
+            format!("SELECT id, SUM(k) OVER (PARTITION BY b) sw FROM {{Q}} WHERE id < {lo}"),
         ),
         (
             "subquery_from",
-            format!(
-                "SELECT COUNT(*) FROM (SELECT k FROM {{Q}} WHERE id BETWEEN {lo} AND {hi}) t"
-            ),
+            format!("SELECT COUNT(*) FROM (SELECT k FROM {{Q}} WHERE id BETWEEN {lo} AND {hi}) t"),
         ),
         (
             "order_by_multi",
@@ -608,9 +624,7 @@ fn all_shapes(total: i64) -> Vec<(&'static str, String)> {
         ),
         (
             "string_agg",
-            format!(
-                "SELECT b, string_agg(s, ',') FROM {{Q}} WHERE id < {lo} GROUP BY b"
-            ),
+            format!("SELECT b, string_agg(s, ',') FROM {{Q}} WHERE id < {lo} GROUP BY b"),
         ),
         (
             "generate_series_join",
@@ -770,18 +784,15 @@ fn all_shapes(total: i64) -> Vec<(&'static str, String)> {
         ),
         (
             "math_chain",
-            "SELECT SUM(ROUND(SQRT(ABS(f)) + MOD(id, 7), 3)) FROM {Q}"
-                .to_string(),
+            "SELECT SUM(ROUND(SQRT(ABS(f)) + MOD(id, 7), 3)) FROM {Q}".to_string(),
         ),
         (
             "abs_mod_filter",
-            "SELECT COUNT(*) FROM {Q} WHERE ABS(MOD(id, 100)) BETWEEN 10 AND 50"
-                .to_string(),
+            "SELECT COUNT(*) FROM {Q} WHERE ABS(MOD(id, 100)) BETWEEN 10 AND 50".to_string(),
         ),
         (
             "stddev_grouped",
-            "SELECT k, STDDEV(f) sd FROM {Q} GROUP BY k ORDER BY k"
-                .to_string(),
+            "SELECT k, STDDEV(f) sd FROM {Q} GROUP BY k ORDER BY k".to_string(),
         ),
         (
             "min_max_float",
@@ -792,13 +803,11 @@ fn all_shapes(total: i64) -> Vec<(&'static str, String)> {
         ),
         (
             "intersect_all",
-            "SELECT k FROM {Q} INTERSECT ALL SELECT dk FROM {D} ORDER BY k LIMIT 50"
-                .to_string(),
+            "SELECT k FROM {Q} INTERSECT ALL SELECT dk FROM {D} ORDER BY k LIMIT 50".to_string(),
         ),
         (
             "except_all",
-            "SELECT k FROM {Q} EXCEPT ALL SELECT dk FROM {D} ORDER BY k LIMIT 50"
-                .to_string(),
+            "SELECT k FROM {Q} EXCEPT ALL SELECT dk FROM {D} ORDER BY k LIMIT 50".to_string(),
         ),
         (
             "order_by_expr",
@@ -809,8 +818,7 @@ fn all_shapes(total: i64) -> Vec<(&'static str, String)> {
         ),
         (
             "group_by_expr_mod",
-            "SELECT (k % 5) g, COUNT(*) c FROM {Q} GROUP BY (k % 5) ORDER BY g"
-                .to_string(),
+            "SELECT (k % 5) g, COUNT(*) c FROM {Q} GROUP BY (k % 5) ORDER BY g".to_string(),
         ),
         (
             "self_join_multi_col",
@@ -839,13 +847,11 @@ fn all_shapes(total: i64) -> Vec<(&'static str, String)> {
         ),
         (
             "is_distinct_from",
-            "SELECT COUNT(*) FROM {Q} WHERE b IS DISTINCT FROM TRUE"
-                .to_string(),
+            "SELECT COUNT(*) FROM {Q} WHERE b IS DISTINCT FROM TRUE".to_string(),
         ),
         (
             "multi_col_distinct",
-            "SELECT COUNT(*) FROM (SELECT DISTINCT k, b FROM {Q}) t"
-                .to_string(),
+            "SELECT COUNT(*) FROM (SELECT DISTINCT k, b FROM {Q}) t".to_string(),
         ),
         (
             "group_by_ordinal",
@@ -873,8 +879,7 @@ fn all_shapes(total: i64) -> Vec<(&'static str, String)> {
         ),
         (
             "limit_offset_large",
-            "SELECT id, k FROM {Q} ORDER BY id LIMIT 100 OFFSET 1000"
-                .to_string(),
+            "SELECT id, k FROM {Q} ORDER BY id LIMIT 100 OFFSET 1000".to_string(),
         ),
     ]
 }
@@ -931,17 +936,17 @@ async fn seed_fastpath(
         written += n;
     }
     let dv = dim_values();
-    exec_ok(sess, &format!("INSERT INTO {dim} (dk, label, w) VALUES {dv}")).await;
+    exec_ok(
+        sess,
+        &format!("INSERT INTO {dim} (dk, label, w) VALUES {dv}"),
+    )
+    .await;
 
     // Fastpath mutations: env vars must already be set by the caller.
     let del_id = total_rows / 4;
     let upd_id = total_rows / 4 + 1;
 
-    exec_ok(
-        sess,
-        &format!("DELETE FROM {fact} WHERE id = {del_id}"),
-    )
-    .await;
+    exec_ok(sess, &format!("DELETE FROM {fact} WHERE id = {del_id}")).await;
     exec_ok(
         sess,
         &format!("UPDATE {fact} SET f = -1.0 WHERE id = {upd_id}"),
@@ -996,8 +1001,7 @@ async fn run_differential(total_rows: i64) -> (usize, usize) {
     // ── Run all shapes ────────────────────────────────────────────────────────
     let shapes = all_shapes(total_rows);
     let n_shapes = shapes.len();
-    let (mut tested, mut skipped, mut diverged, mut diverged_d) =
-        (0usize, 0usize, 0usize, 0usize);
+    let (mut tested, mut skipped, mut diverged, mut diverged_d) = (0usize, 0usize, 0usize, 0usize);
 
     println!(
         "\n[C6 hottier-differential — {total_rows} rows, {} shapes × 4 modes]\n\
@@ -1021,9 +1025,7 @@ async fn run_differential(total_rows: i64) -> (usize, usize) {
     // shape that Mode A succeeds on. An error in Mode D where Mode A
     // succeeds is always a regression.
 
-    println!(
-        "[C6/D] fastpath mutations: DELETE id={del_id}, UPDATE id={upd_id} SET f=-1.0"
-    );
+    println!("[C6/D] fastpath mutations: DELETE id={del_id}, UPDATE id={upd_id} SET f=-1.0");
 
     for (label, tmpl) in &shapes {
         let q = tmpl.replace("{Q}", "q").replace("{D}", "d");
@@ -1090,11 +1092,11 @@ async fn run_differential(total_rows: i64) -> (usize, usize) {
             // Mode D errors where A/B/C succeed → regression in fastpath-on path.
             (Ok(_), Ok(_), Ok(_), Err(e_d)) => {
                 diverged += 1;
-                eprintln!(
-                    "[C6] MODE-D ERROR on shape `{label}` (A/B/C ok, D err):\n  {e_d}"
+                eprintln!("[C6] MODE-D ERROR on shape `{label}` (A/B/C ok, D err):\n  {e_d}");
+                println!(
+                    "{label:<30}{:>10}{:>10}{:>10}{:>10}  *** D-ERR ***",
+                    "ok", "ok", "ok", "err"
                 );
-                println!("{label:<30}{:>10}{:>10}{:>10}{:>10}  *** D-ERR ***",
-                    "ok", "ok", "ok", "err");
             }
             // Mixed A/B/C (Mode D outcome irrelevant for A/B/C gate).
             (ra, rb, rc, rd) => {
@@ -1111,10 +1113,26 @@ async fn run_differential(total_rows: i64) -> (usize, usize) {
                 }
                 println!(
                     "{label:<30}{:>10}{:>10}{:>10}{:>10}  *** MIXED ERR ***",
-                    if ra.is_ok() { "ok".to_string() } else { "err".to_string() },
-                    if rb.is_ok() { "ok".to_string() } else { "err".to_string() },
-                    if rc.is_ok() { "ok".to_string() } else { "err".to_string() },
-                    if rd.is_ok() { "ok".to_string() } else { "err".to_string() },
+                    if ra.is_ok() {
+                        "ok".to_string()
+                    } else {
+                        "err".to_string()
+                    },
+                    if rb.is_ok() {
+                        "ok".to_string()
+                    } else {
+                        "err".to_string()
+                    },
+                    if rc.is_ok() {
+                        "ok".to_string()
+                    } else {
+                        "err".to_string()
+                    },
+                    if rd.is_ok() {
+                        "ok".to_string()
+                    } else {
+                        "err".to_string()
+                    },
                 );
             }
         }
@@ -1143,8 +1161,7 @@ async fn run_differential(total_rows: i64) -> (usize, usize) {
     );
 
     assert_eq!(
-        diverged,
-        0,
+        diverged, 0,
         "[C6] {diverged} shape(s) produced different results across A/B/C modes. \
          See stderr for details."
     );
@@ -1210,9 +1227,7 @@ async fn run_fastpath_differential(total_rows: i64) -> (usize, usize, usize) {
             (Ok(_), Err(e)) => {
                 err_count += 1;
                 diverged += 1;
-                eprintln!(
-                    "[C6/D] ERROR on shape `{label}`: A ok, D err: {e}"
-                );
+                eprintln!("[C6/D] ERROR on shape `{label}`: A ok, D err: {e}");
                 println!("{label:<30}{:>10}{:>10}  *** D-ERR ***", "ok", "err");
             }
             (Err(_), Ok(rows_d)) => {
@@ -1287,8 +1302,7 @@ async fn hottier_differential_fastpath_on_10k() {
     let (ok, err_count, diverged) = run_fastpath_differential(total).await;
     // Phase 1 gate: no engine errors under fastpath-on.
     assert_eq!(
-        err_count,
-        0,
+        err_count, 0,
         "[C6/D] {err_count} shape(s) returned engine errors under fastpath-on. \
          See stderr for details. ({ok} ok, {diverged} differ from mode_a)"
     );

@@ -250,14 +250,11 @@ impl ExecutionPlan for JsonbPostingScanExec {
                 .await;
             match result {
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(DataFusionError::External(Box::new(e))))
-                        .await;
+                    let _ = tx.send(Err(DataFusionError::External(Box::new(e)))).await;
                 }
                 Ok(mut inner) => {
                     while let Some(item) = inner.next().await {
-                        let df_item =
-                            item.map_err(|e| DataFusionError::External(Box::new(e)));
+                        let df_item = item.map_err(|e| DataFusionError::External(Box::new(e)));
                         if tx.send(df_item).await.is_err() {
                             break;
                         }
@@ -267,6 +264,9 @@ impl ExecutionPlan for JsonbPostingScanExec {
         });
 
         let stream = futures::stream::poll_fn(move |cx| rx.poll_recv(cx));
-        Ok(Box::pin(RecordBatchStreamAdapter::new(output_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
     }
 }

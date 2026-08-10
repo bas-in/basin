@@ -114,7 +114,11 @@ pub fn derive_tuning(cpus: usize, mem_bytes: u64) -> Tuning {
     let global_budget = (24 * cpus).clamp(32, 1024);
 
     // Memory cap: limit the in-flight ingest segments so we don't OOM.
-    let mem = if mem_bytes == 0 { FALLBACK_MEM_BYTES } else { mem_bytes };
+    let mem = if mem_bytes == 0 {
+        FALLBACK_MEM_BYTES
+    } else {
+        mem_bytes
+    };
     let inflight_budget = (mem / MEM_FRACTION_DENOM / TYPICAL_SEGMENT_BYTES).max(1);
     let inflight_budget = usize::try_from(inflight_budget).unwrap_or(usize::MAX);
 
@@ -683,7 +687,10 @@ impl AdaptiveController {
             // Overloaded: compaction can't keep pace. Back off one step
             // immediately, regardless of throughput.
             self.direction = -1;
-            self.cur_fanout = self.cur_fanout.saturating_sub(self.step).max(self.min_fanout);
+            self.cur_fanout = self
+                .cur_fanout
+                .saturating_sub(self.step)
+                .max(self.min_fanout);
             self.sustain = 0;
             reason = "overload, backing off";
         } else if sm > self.best_at_cur * (1.0 + self.clear_margin) {
@@ -749,7 +756,9 @@ impl AdaptiveController {
         if self.direction >= 0 {
             (self.cur_fanout + self.step).min(self.max_fanout)
         } else {
-            self.cur_fanout.saturating_sub(self.step).max(self.min_fanout)
+            self.cur_fanout
+                .saturating_sub(self.step)
+                .max(self.min_fanout)
         }
     }
 
@@ -905,16 +914,25 @@ mod tests {
         for rps in [
             50_000.0, 60_000.0, 75_000.0, 95_000.0, 120_000.0, 150_000.0, 190_000.0, 240_000.0,
         ] {
-            c.observe(Sample { rows_per_sec: rps, overload: 0.1 });
+            c.observe(Sample {
+                rows_per_sec: rps,
+                overload: 0.1,
+            });
         }
         let peak_fanout = c.fanout();
-        assert!(peak_fanout > 8, "should have climbed above the start (got {peak_fanout})");
+        assert!(
+            peak_fanout > 8,
+            "should have climbed above the start (got {peak_fanout})"
+        );
 
         // Now throughput collapses (over-fanned: CPU saturated). No clear win
         // at the peak and not clearly better than best-at-derived, so the
         // controller anchors back down toward derived.
         for rps in [40_000.0, 38_000.0, 37_000.0, 36_000.0, 35_000.0] {
-            c.observe(Sample { rows_per_sec: rps, overload: 0.2 });
+            c.observe(Sample {
+                rows_per_sec: rps,
+                overload: 0.2,
+            });
         }
         assert!(
             c.fanout() < peak_fanout,
@@ -925,7 +943,10 @@ mod tests {
         // Feed a long flat plateau: with no clear win it must converge to the
         // derived baseline and settle there, not oscillate.
         for _ in 0..20 {
-            c.observe(Sample { rows_per_sec: 39_000.0, overload: 0.2 });
+            c.observe(Sample {
+                rows_per_sec: 39_000.0,
+                overload: 0.2,
+            });
         }
         assert_eq!(
             c.fanout(),
@@ -993,29 +1014,44 @@ mod tests {
 
         // Establish a stable baseline at derived first.
         for _ in 0..3 {
-            c.observe(Sample { rows_per_sec: 50_000.0, overload: 0.0 });
+            c.observe(Sample {
+                rows_per_sec: 50_000.0,
+                overload: 0.0,
+            });
         }
         assert_eq!(c.fanout(), 8, "settled at derived on the flat baseline");
 
         // A genuine, large, sustained improvement (well over CLEAR_MARGIN, held
         // many ticks) drives — and holds — fan-out above derived.
         for _ in 0..12 {
-            c.observe(Sample { rows_per_sec: 120_000.0, overload: 0.0 });
+            c.observe(Sample {
+                rows_per_sec: 120_000.0,
+                overload: 0.0,
+            });
         }
         let up = c.fanout();
-        assert!(up > 8, "clear sustained win must move fan-out up (got {up})");
+        assert!(
+            up > 8,
+            "clear sustained win must move fan-out up (got {up})"
+        );
 
         // The win persists: hold the higher throughput and the controller does
         // NOT anchor back, because it clearly beats best-at-derived.
         for _ in 0..20 {
-            c.observe(Sample { rows_per_sec: 120_000.0, overload: 0.0 });
+            c.observe(Sample {
+                rows_per_sec: 120_000.0,
+                overload: 0.0,
+            });
         }
         assert!(
             c.fanout() >= up,
             "must stay up while the win holds (was {up}, now {})",
             c.fanout()
         );
-        assert!(c.fanout() > 8, "must not anchor back to derived during a real win");
+        assert!(
+            c.fanout() > 8,
+            "must not anchor back to derived during a real win"
+        );
     }
 
     /// No-op proof: `autotune_enabled` is false unless `BASIN_AUTOTUNE` is an
@@ -1052,7 +1088,10 @@ mod tests {
     fn controller_backs_off_on_overload() {
         let mut c = AdaptiveController::new(16, 2, 24);
         let before = c.fanout();
-        c.observe(Sample { rows_per_sec: 100_000.0, overload: 0.9 });
+        c.observe(Sample {
+            rows_per_sec: 100_000.0,
+            overload: 0.9,
+        });
         assert!(c.fanout() < before, "overload must force back-off");
     }
 
@@ -1122,7 +1161,10 @@ mod tests {
             c.observe(s);
         }
         let peak = c.fanout();
-        assert!(peak > 8, "should climb above the derived start (got {peak})");
+        assert!(
+            peak > 8,
+            "should climb above the derived start (got {peak})"
+        );
 
         // Over-fanned: throughput collapses (CPU saturated) AND stalls appear.
         for (rows, stalls) in [(700_000u64, 8u64), (650_000, 10), (640_000, 11)] {
@@ -1180,7 +1222,10 @@ mod tests {
         // The controller's bounds are the FLUSH bounds derived from its seed.
         let min_flush = (seed / 2).max(FLUSH_FLOOR);
         let max_flush = (seed * 2).max(min_flush + 2);
-        assert_eq!(c.min_fanout, min_flush, "lower bound is max(FLUSH_FLOOR, seed/2)");
+        assert_eq!(
+            c.min_fanout, min_flush,
+            "lower bound is max(FLUSH_FLOOR, seed/2)"
+        );
         assert_eq!(c.max_fanout, max_flush, "upper bound is 2× seed");
 
         // The seed must be the derived FLUSH value, never the derived fan-out.
@@ -1208,6 +1253,10 @@ mod tests {
         // There is NO runtime fan-out override surface at all (the symbol does
         // not even exist); the only live ingest knob is flush concurrency, and
         // it is a no-op until the tick task publishes.
-        assert_eq!(RUNTIME_FLUSH.load(Ordering::Relaxed), 0, "no-op until published");
+        assert_eq!(
+            RUNTIME_FLUSH.load(Ordering::Relaxed),
+            0,
+            "no-op until published"
+        );
     }
 }

@@ -685,9 +685,14 @@ impl Accumulator for VectorAvgAccumulator {
     fn evaluate(&mut self) -> DFResult<ScalarValue> {
         // Use the running-sum width when present, else the plan-declared dim so
         // an all-NULL group still emits a FixedSizeList of the expected width.
-        let dim = self.sum.as_ref().map(|s| s.len()).unwrap_or(self.declared_dim);
+        let dim = self
+            .sum
+            .as_ref()
+            .map(|s| s.len())
+            .unwrap_or(self.declared_dim);
         let field = Arc::new(Field::new("item", DataType::Float32, true));
-        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dim as i32).with_field(field);
+        let mut builder =
+            FixedSizeListBuilder::new(Float32Builder::new(), dim as i32).with_field(field);
         match (&self.sum, self.count) {
             (Some(sum), n) if n > 0 => {
                 for &s in sum {
@@ -741,7 +746,9 @@ impl Accumulator for VectorAvgAccumulator {
         let counts = states[1]
             .as_any()
             .downcast_ref::<Int64Array>()
-            .ok_or_else(|| DataFusionError::Execution("vector_avg merge: count not Int64".into()))?;
+            .ok_or_else(|| {
+                DataFusionError::Execution("vector_avg merge: count not Int64".into())
+            })?;
         for i in 0..sums.len() {
             if sums.is_null(i) || counts.is_null(i) {
                 continue;
@@ -886,7 +893,11 @@ impl ScalarUDFImpl for VectorNormUdf {
             match view.row(i)? {
                 None => out.append_null(),
                 Some(v) => {
-                    let norm: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                    let norm: f64 = v
+                        .iter()
+                        .map(|&x| (x as f64) * (x as f64))
+                        .sum::<f64>()
+                        .sqrt();
                     out.append_value(norm);
                 }
             }
@@ -962,8 +973,8 @@ impl ScalarUDFImpl for VectorToTextUdf {
             // ergonomic (`embedding::text` → bracket notation) intact while
             // making the rewriter safe to fire on any bare identifier.
             _ => {
-                let casted = datafusion::arrow::compute::cast(&arr, &DataType::Utf8)
-                    .map_err(|e| {
+                let casted =
+                    datafusion::arrow::compute::cast(&arr, &DataType::Utf8).map_err(|e| {
                         DataFusionError::Execution(format!(
                             "vector_to_text: fallback cast to Utf8 failed for {:?}: {e}",
                             arr.data_type()
@@ -1136,7 +1147,12 @@ fn find_first_op(s: &str) -> Option<(usize, usize, &'static str)> {
 /// that will be handled by the range-operator rewriter.
 fn operand_looks_like_range(expr: &str) -> bool {
     const RANGE_CTOR_KWS: &[&str] = &[
-        "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange",
+        "int4range",
+        "int8range",
+        "numrange",
+        "daterange",
+        "tsrange",
+        "tstzrange",
     ];
     let lower = expr.to_ascii_lowercase();
     if RANGE_CTOR_KWS.iter().any(|kw| lower.starts_with(kw)) {
@@ -1147,11 +1163,15 @@ fn operand_looks_like_range(expr: &str) -> bool {
         let inner = &expr[1..];
         let mut k = 0;
         let bytes = inner.as_bytes();
-        while k < bytes.len() && bytes[k] == b' ' { k += 1; }
+        while k < bytes.len() && bytes[k] == b' ' {
+            k += 1;
+        }
         if k < bytes.len() && (bytes[k] == b'[' || bytes[k] == b'(') {
             // Find the closing quote.
             let mut end = k;
-            while end < bytes.len() && bytes[end] != b'\'' { end += 1; }
+            while end < bytes.len() && bytes[end] != b'\'' {
+                end += 1;
+            }
             return inner.as_bytes()[k..end].contains(&b',');
         }
     }
@@ -1502,9 +1522,17 @@ impl ScalarUDFImpl for PgSleepUdf {
                     // For array inputs take the first element's value.
                     use datafusion::arrow::array::{Float64Array, Int64Array};
                     if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-                        if arr.len() > 0 && !a.is_null(0) { a.value(0) } else { 0.0 }
+                        if arr.len() > 0 && !a.is_null(0) {
+                            a.value(0)
+                        } else {
+                            0.0
+                        }
                     } else if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-                        if arr.len() > 0 && !a.is_null(0) { a.value(0) as f64 } else { 0.0 }
+                        if arr.len() > 0 && !a.is_null(0) {
+                            a.value(0) as f64
+                        } else {
+                            0.0
+                        }
                     } else {
                         0.0
                     }
@@ -5136,7 +5164,8 @@ fn rewrite_json_at_gt(s: &str) -> String {
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
             }
-            let looks_json = j < bytes.len() && (bytes[j] == b'\'' || bytes[j] == b'{' || bytes[j] == b'[');
+            let looks_json =
+                j < bytes.len() && (bytes[j] == b'\'' || bytes[j] == b'{' || bytes[j] == b'[');
             // Detect PG range literals: single-quoted strings whose content
             // starts with `[` or `(` and contains a comma — e.g. `'[1,10)'`.
             // These are NOT JSON and should NOT be rewritten to jsonb_contains.
@@ -6070,7 +6099,6 @@ mod jsonb_text_column_runtime_tests {
             "second row should not contain {{\"a\":1}}"
         );
     }
-
 }
 
 #[cfg(test)]

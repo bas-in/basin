@@ -108,7 +108,11 @@ async fn alter_add_foreign_key_registers_and_enforces() {
     let (_dir, engine) = open_engine().await;
     let sess = open_session(&engine).await;
 
-    exec_ok(&sess, "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)").await;
+    exec_ok(
+        &sess,
+        "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)",
+    )
+    .await;
     exec_ok(
         &sess,
         "CREATE TABLE child (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT)",
@@ -149,7 +153,11 @@ async fn deferred_foreign_key_allows_child_before_parent() {
     let (_dir, engine) = open_engine().await;
     let sess = open_session(&engine).await;
 
-    exec_ok(&sess, "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)").await;
+    exec_ok(
+        &sess,
+        "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)",
+    )
+    .await;
     exec_ok(
         &sess,
         "CREATE TABLE child (id BIGINT NOT NULL PRIMARY KEY, parent_id BIGINT)",
@@ -185,7 +193,11 @@ async fn enum_insert_with_cast_label() {
 
     // The two cast spellings drivers emit.
     exec_ok(&sess, r#"INSERT INTO accounts VALUES (1, 'USER'::"Role")"#).await;
-    exec_ok(&sess, r#"INSERT INTO accounts VALUES (2, CAST('ADMIN' AS "Role"))"#).await;
+    exec_ok(
+        &sess,
+        r#"INSERT INTO accounts VALUES (2, CAST('ADMIN' AS "Role"))"#,
+    )
+    .await;
 
     // Label validation still applies through the cast.
     let err = exec_err(&sess, r#"INSERT INTO accounts VALUES (3, 'GUEST'::"Role")"#).await;
@@ -234,7 +246,10 @@ async fn enum_column_select_carries_oid_metadata() {
                 .expect("enum column must carry BASIN_ENUM_OID after reattach")
                 .parse()
                 .expect("enum oid parses as u32");
-            assert!(oid >= 16384, "enum oid must be in the user-object range, got {oid}");
+            assert!(
+                oid >= 16384,
+                "enum oid must be in the user-object range, got {oid}"
+            );
             assert_eq!(
                 f.metadata().get("BASIN_ENUM_TYPE").map(String::as_str),
                 Some("Role"),

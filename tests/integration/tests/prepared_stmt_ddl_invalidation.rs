@@ -68,9 +68,11 @@ async fn exec(sess: &ProjectSession, sql: &str) {
 /// Names of the columns in the result schema, in order.
 fn col_names(res: &ExecResult) -> Vec<String> {
     match res {
-        ExecResult::Rows { schema, .. } => {
-            schema.fields().iter().map(|f| f.name().to_string()).collect()
-        }
+        ExecResult::Rows { schema, .. } => schema
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect(),
         ExecResult::Empty { .. } => vec![],
     }
 }
@@ -98,7 +100,10 @@ async fn prepared_select_star_sees_added_column_after_alter() {
 
     // Execute once on the OLD shape — two columns.
     {
-        let bound = sess.bind(&handle, vec![ScalarParam::Int8(1)]).await.unwrap();
+        let bound = sess
+            .bind(&handle, vec![ScalarParam::Int8(1)])
+            .await
+            .unwrap();
         let res = sess.execute_bound(bound).await.expect("execute pre-ALTER");
         assert_eq!(
             col_names(&res),
@@ -113,7 +118,10 @@ async fn prepared_select_star_sees_added_column_after_alter() {
 
     // Execute the SAME prepared handle again. PG re-plans `*`; the result must
     // now include `extra`. A 2-column result here is the staleness bug.
-    let bound = sess.bind(&handle, vec![ScalarParam::Int8(1)]).await.unwrap();
+    let bound = sess
+        .bind(&handle, vec![ScalarParam::Int8(1)])
+        .await
+        .unwrap();
     let res = sess.execute_bound(bound).await.expect("execute post-ALTER");
     let names = col_names(&res);
     assert!(
@@ -183,8 +191,18 @@ async fn prepared_insert_picks_up_default_of_added_column() {
     match res {
         ExecResult::Rows { batches, .. } => {
             let b = batches.iter().find(|b| b.num_rows() > 0).expect("a row");
-            let id = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
-            let v = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+            let id = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0);
+            let v = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0);
             let status = b
                 .column(2)
                 .as_any()
@@ -290,7 +308,10 @@ async fn prepared_insert_on_dropped_column_errors_not_silent() {
             .value(0),
         other => panic!("count got {other:?}"),
     };
-    assert_eq!(total, 1, "the failed prepared INSERT must not have written a row");
+    assert_eq!(
+        total, 1,
+        "the failed prepared INSERT must not have written a row"
+    );
 
     println!("[gap#3] prepared INSERT on a dropped column errors (typed), no silent write ✓");
 }
@@ -320,8 +341,14 @@ async fn prepared_param_select_sees_added_column_value() {
     exec(&sess, "ALTER TABLE t ADD COLUMN label TEXT").await;
     exec(&sess, "UPDATE t SET label = 'tagged' WHERE id = 1").await;
 
-    let bound = sess.bind(&handle, vec![ScalarParam::Int8(1)]).await.unwrap();
-    let res = sess.execute_bound(bound).await.expect("execute post-ALTER+UPDATE");
+    let bound = sess
+        .bind(&handle, vec![ScalarParam::Int8(1)])
+        .await
+        .unwrap();
+    let res = sess
+        .execute_bound(bound)
+        .await
+        .expect("execute post-ALTER+UPDATE");
     match res {
         ExecResult::Rows { schema, batches } => {
             assert!(
@@ -379,7 +406,10 @@ async fn execute_result_schema_is_authoritative_over_cached_describe() {
     // We do NOT assert it equals the new shape — we assert that EXECUTE's result
     // schema reflects the CURRENT shape, which is what the wire/result actually
     // carries.
-    let bound = sess.bind(&handle, vec![ScalarParam::Int8(1)]).await.unwrap();
+    let bound = sess
+        .bind(&handle, vec![ScalarParam::Int8(1)])
+        .await
+        .unwrap();
     let res = sess.execute_bound(bound).await.expect("execute");
     let exec_cols = col_names(&res);
 

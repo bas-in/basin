@@ -20,7 +20,14 @@ use basin_wal::{LocalWal, Wal, WalConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
-async fn build() -> (TempDir, TempDir, Engine, Shard, basin_shard::ShardBackgroundHandle, Arc<dyn Wal>) {
+async fn build() -> (
+    TempDir,
+    TempDir,
+    Engine,
+    Shard,
+    basin_shard::ShardBackgroundHandle,
+    Arc<dyn Wal>,
+) {
     let sd = TempDir::new().unwrap();
     let wd = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
@@ -41,9 +48,17 @@ async fn build() -> (TempDir, TempDir, Engine, Shard, basin_shard::ShardBackgrou
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
-    let engine = Engine::new(EngineConfig { storage, catalog, shard: Some(shard.clone()) });
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: Some(shard.clone()),
+    });
     (sd, wd, engine, shard, bg, wal)
 }
 
@@ -103,11 +118,22 @@ async fn selective_filter_does_not_leak_tombstoned_row() {
     // Sanity: full-table read also excludes both tombstones.
     let all = ids(&sess, "SELECT id FROM t ORDER BY id").await;
     assert_eq!(all.len(), 998, "two rows deleted -> 998 remain");
-    assert!(!all.contains(&42) && !all.contains(&500), "both tombstones suppressed");
+    assert!(
+        !all.contains(&42) && !all.contains(&500),
+        "both tombstones suppressed"
+    );
 
     // Range that excludes the tombstone: id BETWEEN 200 AND 300 -> untouched.
-    let mid = ids(&sess, "SELECT id FROM t WHERE id >= 200 AND id < 300 ORDER BY id").await;
-    assert_eq!(mid, (200..300).collect::<Vec<_>>(), "unrelated range intact");
+    let mid = ids(
+        &sess,
+        "SELECT id FROM t WHERE id >= 200 AND id < 300 ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        mid,
+        (200..300).collect::<Vec<_>>(),
+        "unrelated range intact"
+    );
 
     bg.shutdown().await;
     wal.close().await.unwrap();

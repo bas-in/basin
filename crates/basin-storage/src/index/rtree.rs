@@ -281,9 +281,7 @@ pub fn rtree_segment_key_for_data_file(
 /// access avoids the bincode decode hot-path cost. Engine wave β will
 /// populate this lazily from object-store reads.
 pub struct RTreeRegistry {
-    inner: std::sync::Mutex<
-        std::collections::HashMap<RegKey, Arc<std::sync::Mutex<FileRTrees>>>,
-    >,
+    inner: std::sync::Mutex<std::collections::HashMap<RegKey, Arc<std::sync::Mutex<FileRTrees>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -300,7 +298,9 @@ struct FileRTrees {
 
 impl RTreeRegistry {
     pub fn new() -> Self {
-        Self { inner: std::sync::Mutex::new(std::collections::HashMap::new()) }
+        Self {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     fn get_or_create(
@@ -314,7 +314,10 @@ impl RTreeRegistry {
             table: table.clone(),
             col: col.to_string(),
         };
-        let mut map = self.inner.lock().expect("RTreeRegistry outer lock poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .expect("RTreeRegistry outer lock poisoned");
         map.entry(key)
             .or_insert_with(|| Arc::new(std::sync::Mutex::new(FileRTrees::default())))
             .clone()
@@ -347,7 +350,10 @@ impl RTreeRegistry {
         query_bbox: AABB<[f64; 2]>,
     ) -> Option<Vec<RowGroupId>> {
         let arc = {
-            let map = self.inner.lock().expect("RTreeRegistry outer lock poisoned");
+            let map = self
+                .inner
+                .lock()
+                .expect("RTreeRegistry outer lock poisoned");
             map.get(&RegKey {
                 project: *project,
                 table: table.clone(),
@@ -397,7 +403,10 @@ impl RTreeRegistry {
         query_bbox: AABB<[f64; 2]>,
     ) -> Option<Vec<(RowGroupId, u32)>> {
         let arc = {
-            let map = self.inner.lock().expect("RTreeRegistry outer lock poisoned");
+            let map = self
+                .inner
+                .lock()
+                .expect("RTreeRegistry outer lock poisoned");
             map.get(&RegKey {
                 project: *project,
                 table: table.clone(),
@@ -438,7 +447,10 @@ impl RTreeRegistry {
         take: usize,
     ) -> Option<Vec<(RowGroupId, u32, f64, f64)>> {
         let arc = {
-            let map = self.inner.lock().expect("RTreeRegistry outer lock poisoned");
+            let map = self
+                .inner
+                .lock()
+                .expect("RTreeRegistry outer lock poisoned");
             map.get(&RegKey {
                 project: *project,
                 table: table.clone(),
@@ -453,7 +465,12 @@ impl RTreeRegistry {
             .take(take)
             .map(|e| {
                 // For a POINT the envelope is zero-area, so min == max == coord.
-                (e.row_group_id, e.row_id_in_group, e.min_corner[0], e.min_corner[1])
+                (
+                    e.row_group_id,
+                    e.row_id_in_group,
+                    e.min_corner[0],
+                    e.min_corner[1],
+                )
             })
             .collect();
         Some(out)
@@ -461,20 +478,17 @@ impl RTreeRegistry {
 
     /// Drop the segment for `file_path` (called on compaction so
     /// superseded files don't keep their stale R-tree resident).
-    pub fn remove_file(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-        col: &str,
-        file_path: &str,
-    ) {
+    pub fn remove_file(&self, project: &ProjectId, table: &TableName, col: &str, file_path: &str) {
         let key = RegKey {
             project: *project,
             table: table.clone(),
             col: col.to_string(),
         };
         let arc = {
-            let map = self.inner.lock().expect("RTreeRegistry outer lock poisoned");
+            let map = self
+                .inner
+                .lock()
+                .expect("RTreeRegistry outer lock poisoned");
             map.get(&key).cloned()
         };
         if let Some(arc) = arc {
@@ -497,7 +511,10 @@ impl RTreeRegistry {
             col: col.to_string(),
         };
         let arc = {
-            let map = self.inner.lock().expect("RTreeRegistry outer lock poisoned");
+            let map = self
+                .inner
+                .lock()
+                .expect("RTreeRegistry outer lock poisoned");
             map.get(&key).cloned()
         };
         match arc {
@@ -528,10 +545,8 @@ mod tests {
 
     fn make_point_batch(points: &[(i64, f64, f64)]) -> RecordBatch {
         let ids: Int64Array = points.iter().map(|(id, _, _)| *id).collect();
-        let mut wkb_b = FixedSizeBinaryBuilder::with_capacity(
-            points.len(),
-            basin_geo::POINT_WKB_LEN as i32,
-        );
+        let mut wkb_b =
+            FixedSizeBinaryBuilder::with_capacity(points.len(), basin_geo::POINT_WKB_LEN as i32);
         for (_, x, y) in points {
             let bytes = basin_geo::encode_point(&basin_geo::Point::new(*x, *y));
             wkb_b.append_value(bytes).unwrap();
@@ -585,10 +600,8 @@ mod tests {
         assert_eq!(restored.size(), rtree.size());
 
         let q = AABB::from_corners([0.0, 0.0], [40.0, 100.0]);
-        let before: Vec<SpatialEntry> = rtree
-            .locate_in_envelope_intersecting(&q)
-            .copied()
-            .collect();
+        let before: Vec<SpatialEntry> =
+            rtree.locate_in_envelope_intersecting(&q).copied().collect();
         let after: Vec<SpatialEntry> = restored
             .locate_in_envelope_intersecting(&q)
             .copied()
@@ -649,7 +662,13 @@ mod tests {
 
         // Query near origin → only rg 0.
         let near = reg
-            .candidate_row_groups(&project, &table, col, file, AABB::from_corners([-1.0, -1.0], [1.0, 1.0]))
+            .candidate_row_groups(
+                &project,
+                &table,
+                col,
+                file,
+                AABB::from_corners([-1.0, -1.0], [1.0, 1.0]),
+            )
             .expect("file is indexed");
         assert_eq!(near, vec![0]);
 
@@ -669,7 +688,13 @@ mod tests {
         reg.remove_file(&project, &table, col, file);
         assert!(!reg.is_file_indexed(&project, &table, col, file));
         assert!(reg
-            .candidate_row_groups(&project, &table, col, file, AABB::from_corners([0.0, 0.0], [200.0, 200.0]))
+            .candidate_row_groups(
+                &project,
+                &table,
+                col,
+                file,
+                AABB::from_corners([0.0, 0.0], [200.0, 200.0])
+            )
             .is_none());
     }
 
@@ -714,7 +739,11 @@ mod tests {
             .map(|e| e.row_id_in_group)
             .collect();
         ids.sort_unstable();
-        assert_eq!(ids, vec![0, 1, 3], "boundary-inclusive: corner+edge+interior, not the disjoint point");
+        assert_eq!(
+            ids,
+            vec![0, 1, 3],
+            "boundary-inclusive: corner+edge+interior, not the disjoint point"
+        );
 
         // Fully-containing query: a huge box swallows everything.
         let q_all = AABB::from_corners([-1000.0, -1000.0], [1000.0, 1000.0]);

@@ -142,10 +142,7 @@ async fn spawn_server() -> Option<ServerAddrs> {
     let sse_addr = sse_probe.local_addr().ok()?;
     drop(sse_probe);
 
-    let auth_schema = format!(
-        "basin_sse_test_{}",
-        Ulid::new().to_string().to_lowercase()
-    );
+    let auth_schema = format!("basin_sse_test_{}", Ulid::new().to_string().to_lowercase());
 
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.env("BASIN_BIND", pg_addr.to_string())
@@ -312,8 +309,11 @@ async fn obtain_jwt(
     }
 
     // 2. Bypass SMTP: mark all users in the schema as verified.
-    let Ok(Ok((client, conn))) =
-        tokio::time::timeout(Duration::from_secs(5), tokio_postgres::connect(PG_URL, NoTls)).await
+    let Ok(Ok((client, conn))) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(PG_URL, NoTls),
+    )
+    .await
     else {
         return None;
     };

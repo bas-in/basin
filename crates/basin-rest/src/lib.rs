@@ -119,8 +119,7 @@ pub use errors::ErrorCode;
 // (integration tests for W2; W6's catalog-backed runtime later) can install
 // a [`FunctionInvoker`] without taking a `pub(crate)` path into `routes`.
 pub use routes::fn_handler::{
-    set_global_invoker, FunctionInvoker, InvokeRequest, InvokeResponse,
-    NoopFunctionInvoker,
+    set_global_invoker, FunctionInvoker, InvokeRequest, InvokeResponse, NoopFunctionInvoker,
 };
 
 // Feature 2: realtime co-mount public surface.

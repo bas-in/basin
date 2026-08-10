@@ -60,7 +60,9 @@ fn two_col_schema() -> Arc<Schema> {
 
 fn sequential_batch(start: i64, len: i64) -> RecordBatch {
     let ids: Int64Array = (start..start + len).collect();
-    let payloads: StringArray = (start..start + len).map(|v| Some(format!("p{v}"))).collect();
+    let payloads: StringArray = (start..start + len)
+        .map(|v| Some(format!("p{v}")))
+        .collect();
     RecordBatch::try_new(two_col_schema(), vec![Arc::new(ids), Arc::new(payloads)]).unwrap()
 }
 
@@ -119,11 +121,7 @@ fn ids_sorted(batches: &[RecordBatch]) -> Vec<i64> {
     let mut out = Vec::new();
     for b in batches {
         let idx = b.schema().index_of("id").unwrap();
-        let arr = b
-            .column(idx)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let arr = b.column(idx).as_any().downcast_ref::<Int64Array>().unwrap();
         for i in 0..arr.len() {
             out.push(arr.value(i));
         }
@@ -141,11 +139,9 @@ async fn setup_multifile_table(
     let table = TableName::new("t").unwrap();
     let sess = engine.open_session(project).await.unwrap();
 
-    sess.execute(
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, payload TEXT) WITH (basin.sort_by='id')",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, payload TEXT) WITH (basin.sort_by='id')")
+        .await
+        .unwrap();
 
     // Three disjoint cold-tier files:
     //   f0: ids [0,  100)
@@ -189,7 +185,11 @@ async fn in_list_all_absent_prunes_all_files() {
 
     // 150, 350, 999 all fall in the gaps between the three files.
     let rows = query_rows(&sess, "SELECT * FROM t WHERE id IN (150, 350, 999)").await;
-    assert_eq!(row_count(&rows), 0, "all-absent IN-list must return zero rows");
+    assert_eq!(
+        row_count(&rows),
+        0,
+        "all-absent IN-list must return zero rows"
+    );
 
     let after = engine.blooms_skipped_count();
     assert!(
@@ -209,7 +209,11 @@ async fn in_list_spanning_all_files_returns_all_matching_rows() {
     // One value per file; absent value 150 must not appear.
     let rows = query_rows(&sess, "SELECT * FROM t WHERE id IN (10, 150, 250, 450)").await;
     let ids = ids_sorted(&rows);
-    assert_eq!(ids, vec![10, 250, 450], "three matching rows across three files");
+    assert_eq!(
+        ids,
+        vec![10, 250, 450],
+        "three matching rows across three files"
+    );
 }
 
 // ── Test 4: `= ANY('{…}'::int[])` shape behaves identically to IN ────────────
@@ -244,7 +248,11 @@ async fn in_list_out_of_range_prunes_all_files_and_returns_empty() {
 
     // All values are above the max stored id (499) — zone-map proves absent.
     let rows = query_rows(&sess, "SELECT * FROM t WHERE id IN (1000, 2000, 9999)").await;
-    assert_eq!(row_count(&rows), 0, "out-of-range IN-list must return zero rows");
+    assert_eq!(
+        row_count(&rows),
+        0,
+        "out-of-range IN-list must return zero rows"
+    );
 
     let after = engine.blooms_skipped_count();
     assert!(
@@ -294,8 +302,16 @@ async fn in_list_1000_keys_narrow_range_prunes_outer_files_exact_boundaries() {
     // Boundary correctness: the IN-list min (200) and the largest existing key
     // (299) are both present and correct.
     let got = ids_sorted(&rows);
-    assert_eq!(got.first().copied(), Some(200), "min boundary key must be returned");
-    assert_eq!(got.last().copied(), Some(499), "max existing key must be returned");
+    assert_eq!(
+        got.first().copied(),
+        Some(200),
+        "min boundary key must be returned"
+    );
+    assert_eq!(
+        got.last().copied(),
+        Some(499),
+        "max existing key must be returned"
+    );
 }
 
 // ── Test 7: a 1000-key IN whose span is ENTIRELY inside one file ──────────────
@@ -311,11 +327,9 @@ async fn in_list_1000_keys_interior_span_boundary_keys_exact() {
     let project = ProjectId::new();
     let table = TableName::new("t").unwrap();
     let sess = engine.open_session(project).await.unwrap();
-    sess.execute(
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, payload TEXT) WITH (basin.sort_by='id')",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, payload TEXT) WITH (basin.sort_by='id')")
+        .await
+        .unwrap();
 
     // Two files: f0 [0, 5000), f1 [5000, 10000).
     let mut snap = engine
@@ -326,7 +340,14 @@ async fn in_list_1000_keys_interior_span_boundary_keys_exact() {
         .unwrap()
         .current_snapshot;
     snap = seed_cold_file(&engine, &project, &table, sequential_batch(0, 5000), snap).await;
-    let _ = seed_cold_file(&engine, &project, &table, sequential_batch(5000, 5000), snap).await;
+    let _ = seed_cold_file(
+        &engine,
+        &project,
+        &table,
+        sequential_batch(5000, 5000),
+        snap,
+    )
+    .await;
 
     // 1000 keys, all interior to f0: min=1000, max=1999 (contiguous), every key
     // exists.  Span [1000,1999] does NOT overlap f1 ([5000,10000)) → f1 pruned.
@@ -344,8 +365,16 @@ async fn in_list_1000_keys_interior_span_boundary_keys_exact() {
         "every key in a dense interior 1000-key IN-list must be returned"
     );
     let got = ids_sorted(&rows);
-    assert_eq!(got.first().copied(), Some(1000), "IN-list min boundary present");
-    assert_eq!(got.last().copied(), Some(1999), "IN-list max boundary present");
+    assert_eq!(
+        got.first().copied(),
+        Some(1000),
+        "IN-list min boundary present"
+    );
+    assert_eq!(
+        got.last().copied(),
+        Some(1999),
+        "IN-list max boundary present"
+    );
     assert!(
         after >= before + 1,
         "zone-map range prune must skip f1 whose [5000,10000) is above the span \
@@ -415,11 +444,9 @@ async fn utf8_pk_in_list_is_correct_and_unaffected_by_range_fastpath() {
     let project = ProjectId::new();
     let table = TableName::new("kv").unwrap();
     let sess = engine.open_session(project).await.unwrap();
-    sess.execute(
-        "CREATE TABLE kv (k TEXT PRIMARY KEY, v BIGINT) WITH (basin.sort_by='k')",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v BIGINT) WITH (basin.sort_by='k')")
+        .await
+        .unwrap();
 
     // Two disjoint string files by lexical range:
     //   f0: "a".."e"   f1: "p".."t"
@@ -463,13 +490,20 @@ async fn utf8_pk_in_list_is_correct_and_unaffected_by_range_fastpath() {
                 .downcast_ref::<StringArray>()
                 .unwrap()
                 .clone();
-            (0..arr.len()).map(move |i| arr.value(i).to_string()).collect::<Vec<_>>()
+            (0..arr.len())
+                .map(move |i| arr.value(i).to_string())
+                .collect::<Vec<_>>()
         })
         .collect();
     got.sort();
     assert_eq!(
         got,
-        vec!["a".to_string(), "c".to_string(), "r".to_string(), "t".to_string()],
+        vec![
+            "a".to_string(),
+            "c".to_string(),
+            "r".to_string(),
+            "t".to_string()
+        ],
         "Utf8 PK IN-list must return exactly the existing keys incl. lexical min/max"
     );
 }
@@ -486,9 +520,7 @@ async fn build_shard_engine() -> (
     let storage_dir = TempDir::new().unwrap();
     let wal_dir = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
-        object_store: Arc::new(
-            LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
-        ),
+        object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
         root_prefix: None,
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
@@ -496,9 +528,7 @@ async fn build_shard_engine() -> (
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let wal: Arc<dyn Wal> = Arc::new(
         LocalWal::open(WalConfig {
-            object_store: Arc::new(
-                LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap(),
-            ),
+            object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
@@ -507,7 +537,11 @@ async fn build_shard_engine() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -596,7 +630,9 @@ async fn in_list_on_shard_path_prunes_files_and_returns_correct_rows() {
                 .downcast_ref::<Int64Array>()
                 .unwrap()
                 .clone();
-            (0..arr.len()).map(move |i| arr.value(i)).collect::<Vec<_>>()
+            (0..arr.len())
+                .map(move |i| arr.value(i))
+                .collect::<Vec<_>>()
         })
         .collect();
     ids.sort_unstable();
@@ -658,7 +694,11 @@ async fn build_shard_engine_with_handle() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -678,9 +718,11 @@ async fn in_list_latency_probe() {
 
     let scale = 1_000_000i64;
     let table = "inlist1m";
-    sess.execute(&format!("CREATE TABLE {table} (id BIGINT PRIMARY KEY, v BIGINT)"))
-        .await
-        .unwrap();
+    sess.execute(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v BIGINT)"
+    ))
+    .await
+    .unwrap();
 
     // Seed 1M rows via the engine INSERT path in 10k batches — each disjoint id
     // range becomes one cold file with a tight PK zone-map after flush.
@@ -725,7 +767,11 @@ async fn in_list_latency_probe() {
         let t0 = Instant::now();
         let rows = query_rows(&sess, &sql).await;
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(row_count(&rows), 1000, "each iteration must return all 1000 rows");
+        assert_eq!(
+            row_count(&rows),
+            1000,
+            "each iteration must return all 1000 rows"
+        );
         assert!(ms.is_finite());
         times.push(ms);
     }

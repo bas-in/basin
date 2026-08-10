@@ -188,6 +188,8 @@ mod tests {
             validate_registration("https://x", Some(&["frobnicate".into()])),
             Err(CdcWebhookError::InvalidOp(_))
         ));
-        assert!(validate_registration("https://x", Some(&["insert".into(), "UPDATE".into()])).is_ok());
+        assert!(
+            validate_registration("https://x", Some(&["insert".into(), "UPDATE".into()])).is_ok()
+        );
     }
 }

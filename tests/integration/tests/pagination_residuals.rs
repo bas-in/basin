@@ -188,9 +188,8 @@ async fn offset_pages_desc_unique_key_match_ground_truth() {
     let limit = 50usize;
     for page in 0..5usize {
         let offset = page * limit;
-        let sql = format!(
-            "SELECT id, bucket FROM paging ORDER BY id DESC LIMIT {limit} OFFSET {offset}"
-        );
+        let sql =
+            format!("SELECT id, bucket FROM paging ORDER BY id DESC LIMIT {limit} OFFSET {offset}");
         let got = select_id_bucket(&sess, &sql).await;
         let want = ground_truth_page(N, N, /*by_bucket*/ false, offset, limit);
         assert_eq!(
@@ -230,7 +229,11 @@ async fn offset_pages_desc_ties_cover_correct_buckets() {
             "SELECT id, bucket FROM paging ORDER BY bucket DESC LIMIT {limit} OFFSET {offset}"
         );
         let got = select_id_bucket(&sess, &sql).await;
-        assert_eq!(got.len(), limit, "page {page} must return exactly {limit} rows");
+        assert_eq!(
+            got.len(),
+            limit,
+            "page {page} must return exactly {limit} rows"
+        );
 
         // Non-increasing bucket key within the page.
         for w in got.windows(2) {
@@ -258,7 +261,11 @@ async fn offset_pages_desc_ties_cover_correct_buckets() {
         let total = ids.len();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(total, ids.len(), "page {page}: no id may repeat within a page");
+        assert_eq!(
+            total,
+            ids.len(),
+            "page {page}: no id may repeat within a page"
+        );
     }
 }
 
@@ -273,7 +280,11 @@ async fn offset_beyond_end_returns_empty() {
 
     let sql = "SELECT id, bucket FROM paging ORDER BY id DESC LIMIT 50 OFFSET 1000000";
     let got = select_id_bucket(&sess, sql).await;
-    assert!(got.is_empty(), "OFFSET past the end must yield zero rows, got {}", got.len());
+    assert!(
+        got.is_empty(),
+        "OFFSET past the end must yield zero rows, got {}",
+        got.len()
+    );
 
     // Boundary: OFFSET exactly at N returns empty; OFFSET = N-10 returns 10.
     let at_end = format!("SELECT id, bucket FROM paging ORDER BY id DESC LIMIT 50 OFFSET {N}");
@@ -283,9 +294,16 @@ async fn offset_beyond_end_returns_empty() {
         N - 10
     );
     let tail = select_id_bucket(&sess, &near_end).await;
-    assert_eq!(tail.len(), 10, "OFFSET N-10 with LIMIT 50 must return the last 10 rows");
+    assert_eq!(
+        tail.len(),
+        10,
+        "OFFSET N-10 with LIMIT 50 must return the last 10 rows"
+    );
     let want = ground_truth_page(N, N, false, (N - 10) as usize, 50);
-    assert_eq!(tail, want, "the final partial page must equal the ground-truth tail");
+    assert_eq!(
+        tail, want,
+        "the final partial page must equal the ground-truth tail"
+    );
 }
 
 /// An UPDATE that lands a row INSIDE the paged window must be reflected: the
@@ -305,7 +323,11 @@ async fn offset_window_reflects_update_overlay() {
     // (max existing bucket is TIE_GROUPS-1 = 99), so it must appear on the very
     // first `bucket DESC` page regardless of tie order.
     let new_bucket = TIE_GROUPS + 5; // 105
-    exec(&sess, &format!("UPDATE paging SET bucket = {new_bucket} WHERE id = 42")).await;
+    exec(
+        &sess,
+        &format!("UPDATE paging SET bucket = {new_bucket} WHERE id = 42"),
+    )
+    .await;
 
     let sql = "SELECT id, bucket FROM paging ORDER BY bucket DESC LIMIT 50 OFFSET 0";
     let got = select_id_bucket(&sess, sql).await;
@@ -318,7 +340,10 @@ async fn offset_window_reflects_update_overlay() {
     );
     // It must appear exactly once.
     let appearances = got.iter().filter(|(id, _)| *id == 42).count();
-    assert_eq!(appearances, 1, "updated row must not be duplicated (cold + overlay)");
+    assert_eq!(
+        appearances, 1,
+        "updated row must not be duplicated (cold + overlay)"
+    );
 
     // A second page (OFFSET 50) must NOT contain id=42 again.
     let page2 = select_id_bucket(
@@ -419,7 +444,10 @@ async fn keyset_pages_reconstruct_full_ascending_sequence() {
         }
     }
     let expected: Vec<i64> = (1..=N).collect();
-    assert_eq!(seen, expected, "keyset walk must reproduce 1..=N with no gaps/repeats");
+    assert_eq!(
+        seen, expected,
+        "keyset walk must reproduce 1..=N with no gaps/repeats"
+    );
 }
 
 /// Keyset with an OFFSET on top: `WHERE id > $1 ORDER BY id ASC LIMIT m OFFSET n`
@@ -441,7 +469,10 @@ async fn keyset_with_offset_skips_window_prefix() {
     )
     .await;
     let want: Vec<(i64, i64)> = (1026..=1035).map(|k| (k, k)).collect();
-    assert_eq!(got, want, "keyset+offset must skip the first 25 of the window");
+    assert_eq!(
+        got, want,
+        "keyset+offset must skip the first 25 of the window"
+    );
 }
 
 // ── 4. Small live overlay no longer disables the LIMIT pushdowns ────────────────
@@ -494,9 +525,17 @@ async fn keyset_engages_and_stays_exact_with_live_overlay() {
 
     // Plant the overlay INSIDE the keyset window: 3 fast-path DELETE
     // tombstones + 2 fast-path UPDATE overrides right past the cursor.
-    exec(&sess, "DELETE FROM paging WHERE id IN (25001, 25003, 25005)").await;
+    exec(
+        &sess,
+        "DELETE FROM paging WHERE id IN (25001, 25003, 25005)",
+    )
+    .await;
     exec(&sess, "UPDATE paging SET bucket = -1 WHERE id = 25002").await;
-    exec(&sess, "UPDATE paging SET label = 'patched' WHERE id = 25004").await;
+    exec(
+        &sess,
+        "UPDATE paging SET label = 'patched' WHERE id = 25004",
+    )
+    .await;
     let (upd, tomb) = paging_overlay_counts(&eng, project);
     assert_eq!(
         (upd, tomb),
@@ -515,10 +554,12 @@ async fn keyset_engages_and_stays_exact_with_live_overlay() {
     // Ground truth: ascending ids > 25000, minus the three deleted, with
     // id=25002 carrying its overridden bucket (-1); every other row keeps
     // bucket = id (tie_groups = N).
-    let want: Vec<(i64, i64)> = [25002, 25004, 25006, 25007, 25008, 25009, 25010, 25011, 25012, 25013]
-        .into_iter()
-        .map(|id| (id, if id == 25002 { -1 } else { id }))
-        .collect();
+    let want: Vec<(i64, i64)> = [
+        25002, 25004, 25006, 25007, 25008, 25009, 25010, 25011, 25012, 25013,
+    ]
+    .into_iter()
+    .map(|id| (id, if id == 25002 { -1 } else { id }))
+    .collect();
     assert_eq!(
         got, want,
         "keyset page under live overlay must suppress tombstoned rows, \
@@ -536,9 +577,8 @@ async fn keyset_engages_and_stays_exact_with_live_overlay() {
     let mut cursor = 24_990i64;
     let mut seen: Vec<i64> = Vec::new();
     for _ in 0..5 {
-        let sql = format!(
-            "SELECT id, bucket FROM paging WHERE id > {cursor} ORDER BY id ASC LIMIT 7"
-        );
+        let sql =
+            format!("SELECT id, bucket FROM paging WHERE id > {cursor} ORDER BY id ASC LIMIT 7");
         let page = select_id_bucket(&sess, &sql).await;
         assert_eq!(page.len(), 7, "every page in this range is full");
         for w in page.windows(2) {
@@ -614,7 +654,11 @@ async fn limit_no_order_engages_and_stays_exact_with_live_overlay() {
     let total = ids.len();
     ids.sort_unstable();
     ids.dedup();
-    assert_eq!(total, ids.len(), "no duplicate rows under LIMIT with overlay");
+    assert_eq!(
+        total,
+        ids.len(),
+        "no duplicate rows under LIMIT with overlay"
+    );
     assert_eq!(
         eng.unordered_limit_fast_select_count(),
         before + 1,

@@ -82,10 +82,7 @@ fn col_binary<'a>(batch: &'a arrow_array::RecordBatch, col: usize) -> &'a Binary
         .expect("BinaryArray")
 }
 
-fn col_ts<'a>(
-    batch: &'a arrow_array::RecordBatch,
-    col: usize,
-) -> &'a TimestampMicrosecondArray {
+fn col_ts<'a>(batch: &'a arrow_array::RecordBatch, col: usize) -> &'a TimestampMicrosecondArray {
     batch
         .column(col)
         .as_any()
@@ -162,9 +159,7 @@ async fn wasm_udf_text_arg_round_trip() {
           (call $pack (local.get $ret) (local.get $len)))
     "#;
     let body = wat_to_b64(&module_wat(user_func));
-    let ddl = format!(
-        "CREATE FUNCTION echo_text(s TEXT) RETURNS TEXT LANGUAGE wasm AS '{body}'"
-    );
+    let ddl = format!("CREATE FUNCTION echo_text(s TEXT) RETURNS TEXT LANGUAGE wasm AS '{body}'");
     sess.execute(&ddl).await.expect("CREATE FUNCTION");
 
     let sess2 = eng.open_session(project).await.unwrap();
@@ -426,9 +421,7 @@ async fn wasm_udf_timestamptz_passthrough() {
     // Construct a fixed micros-since-epoch input: 2024-01-15T00:00:00Z =
     // 1705276800 sec = 1705276800000000 micros.
     let res = sess2
-        .execute(
-            "SELECT shift_one_day(TIMESTAMP WITH TIME ZONE '2024-01-15 00:00:00 UTC')",
-        )
+        .execute("SELECT shift_one_day(TIMESTAMP WITH TIME ZONE '2024-01-15 00:00:00 UTC')")
         .await
         .expect("SELECT shift_one_day");
     let batches = rows(res);
@@ -478,9 +471,7 @@ async fn wasm_udf_text_null_handling() {
         .await
         .expect("CREATE TABLE");
     sess2
-        .execute(
-            "INSERT INTO t VALUES (1, 'a'), (2, NULL), (3, 'cee')",
-        )
+        .execute("INSERT INTO t VALUES (1, 'a'), (2, NULL), (3, 'cee')")
         .await
         .expect("INSERT");
 

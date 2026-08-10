@@ -144,11 +144,13 @@ fn bench_txn_round_trip_latency(c: &mut Criterion) {
     rt.block_on(async {
         let leased = pool.acquire(project, None).await.unwrap();
         let s = leased.session();
-        s.execute("CREATE TABLE bench_rows (id BIGINT)").await.unwrap();
+        s.execute("CREATE TABLE bench_rows (id BIGINT)")
+            .await
+            .unwrap();
         s.execute("INSERT INTO bench_rows SELECT g FROM generate_series(1, 10) g")
             .await
             .ok(); // generate_series may not be implemented yet — ignore.
-        // Fallback: insert 10 rows manually.
+                   // Fallback: insert 10 rows manually.
         for i in 1i64..=10 {
             s.execute(&format!("INSERT INTO bench_rows VALUES ({i})"))
                 .await
@@ -170,7 +172,9 @@ fn bench_txn_round_trip_latency(c: &mut Criterion) {
         rt.block_on(async {
             let leased = pool2.acquire(project2, None).await.unwrap();
             let s = leased.session();
-            s.execute("CREATE TABLE bench_rows2 (id BIGINT)").await.unwrap();
+            s.execute("CREATE TABLE bench_rows2 (id BIGINT)")
+                .await
+                .unwrap();
             for i in 1i64..=3 {
                 s.execute(&format!("INSERT INTO bench_rows2 VALUES ({i})"))
                     .await
@@ -232,8 +236,12 @@ fn bench_concurrent_clients(c: &mut Criterion) {
     rt.block_on(async {
         let leased = pool.acquire(project, None).await.unwrap();
         let s = leased.session();
-        s.execute("CREATE TABLE concurrent_bench (id BIGINT)").await.unwrap();
-        s.execute("INSERT INTO concurrent_bench VALUES (1)").await.ok();
+        s.execute("CREATE TABLE concurrent_bench (id BIGINT)")
+            .await
+            .unwrap();
+        s.execute("INSERT INTO concurrent_bench VALUES (1)")
+            .await
+            .ok();
     });
 
     let mut group = c.benchmark_group("pool_txn_mode");

@@ -88,8 +88,8 @@ fn migrate_available() -> bool {
 
 /// Absolute path to the golang-migrate fixture directory.
 fn fixture_dir() -> PathBuf {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR must be set by cargo test");
+    let manifest =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by cargo test");
     PathBuf::from(manifest)
         .join("fixtures")
         .join("migration-tool-scaffold")
@@ -104,7 +104,11 @@ fn fixture_dir() -> PathBuf {
 /// `fixture_path` is passed as `-path`.
 ///
 /// Returns `(stdout, stderr, success)`.
-fn run_migrate(database_url: &str, fixture_path: &PathBuf, args: &[&str]) -> (String, String, bool) {
+fn run_migrate(
+    database_url: &str,
+    fixture_path: &PathBuf,
+    args: &[&str],
+) -> (String, String, bool) {
     let output = Command::new("migrate")
         .arg("-path")
         .arg(fixture_path)
@@ -170,9 +174,7 @@ async fn golang_migrate_up_down_version_force() {
     let port = server.addr.port();
     let user = &server.project_slug;
 
-    println!(
-        "[golang_migrate] Basin in-process server at 127.0.0.1:{port}, user={user}"
-    );
+    println!("[golang_migrate] Basin in-process server at 127.0.0.1:{port}, user={user}");
 
     // ── Locate fixture directory ───────────────────────────────────────────────
     let fixture_path = fixture_dir();
@@ -187,9 +189,7 @@ async fn golang_migrate_up_down_version_force() {
     //
     // Note: `sslmode=disable` is required because Basin's in-process server
     // is started without TLS.
-    let db_url = format!(
-        "postgres://{user}:ignored@127.0.0.1:{port}/basin?sslmode=disable"
-    );
+    let db_url = format!("postgres://{user}:ignored@127.0.0.1:{port}/basin?sslmode=disable");
 
     // ── (a) migrate up ────────────────────────────────────────────────────────
     //
@@ -362,8 +362,7 @@ async fn golang_migrate_up_down_version_force() {
     //
     // `migrate version` should print the current version (5) to stdout/stderr
     // and exit 0.
-    let (stdout_ver, stderr_ver, success_ver) =
-        run_migrate(&db_url, &fixture_path, &["version"]);
+    let (stdout_ver, stderr_ver, success_ver) = run_migrate(&db_url, &fixture_path, &["version"]);
     println!("[golang_migrate version stdout]\n{stdout_ver}");
     if !stderr_ver.is_empty() {
         eprintln!("[golang_migrate version stderr]\n{stderr_ver}");
@@ -529,6 +528,8 @@ async fn golang_migrate_up_down_version_force() {
          force should always set dirty=false"
     );
 
-    println!("[golang_migrate] migrate force 1: schema_migrations version=1, dirty=false — correct");
+    println!(
+        "[golang_migrate] migrate force 1: schema_migrations version=1, dirty=false — correct"
+    );
     println!("[golang_migrate_up_down_version_force] PASSED");
 }

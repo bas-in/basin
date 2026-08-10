@@ -91,15 +91,11 @@ fn first_string(result: &ExecResult) -> Option<String> {
                 }
                 let col = batch.column(0);
                 use arrow::array::Array;
-                if let Some(s) = col
-                    .as_any()
-                    .downcast_ref::<arrow_array::StringArray>()
-                {
+                if let Some(s) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
                     return Some(s.value(0).to_string());
                 }
                 return Some(
-                    arrow::util::display::array_value_to_string(col, 0)
-                        .unwrap_or_default(),
+                    arrow::util::display::array_value_to_string(col, 0).unwrap_or_default(),
                 );
             }
             None
@@ -139,10 +135,7 @@ async fn set_local_search_path_does_not_bleed_across_projects() {
     // In the future TxnModePool the same physical connection will be shared
     // across distinct ProjectIds; today we simulate it with a shared key.
     {
-        let leased = pool
-            .acquire(project, None)
-            .await
-            .unwrap();
+        let leased = pool.acquire(project, None).await.unwrap();
         let s = leased.session();
         s.execute("BEGIN").await.unwrap();
         s.execute("SET LOCAL search_path = 'alice_secret'")
@@ -155,10 +148,7 @@ async fn set_local_search_path_does_not_bleed_across_projects() {
     // "Bob" checkout: must get the same physical slot (same key, single slot)
     // but must NOT see Alice's search_path.
     {
-        let leased = pool
-            .acquire(project, None)
-            .await
-            .unwrap();
+        let leased = pool.acquire(project, None).await.unwrap();
         let s = leased.session();
         s.execute("BEGIN").await.unwrap();
         let result = s.execute("SHOW search_path").await;
@@ -209,10 +199,7 @@ async fn parallel_checkouts_no_search_path_cross_contamination() {
         // Alice: set a unique-per-round schema name.
         // Both Alice and Bob use client_key = None so they share the slot.
         {
-            let leased = pool
-                .acquire(project, None)
-                .await
-                .unwrap();
+            let leased = pool.acquire(project, None).await.unwrap();
             let s = leased.session();
             s.execute("BEGIN").await.unwrap();
             s.execute(&format!("SET LOCAL search_path = '{schema}'"))
@@ -223,10 +210,7 @@ async fn parallel_checkouts_no_search_path_cross_contamination() {
 
         // Bob: immediately after Alice on the same single slot.
         {
-            let leased = pool
-                .acquire(project, None)
-                .await
-                .unwrap();
+            let leased = pool.acquire(project, None).await.unwrap();
             let s = leased.session();
             s.execute("BEGIN").await.unwrap();
             let result = s.execute("SHOW search_path").await;

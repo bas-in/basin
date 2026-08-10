@@ -132,7 +132,13 @@ fn auth_cfg(schema: &str) -> AuthConfig {
 /// Spin up a REST server backed by live PG. Returns None if PG is unreachable.
 async fn try_serve(
     max_body_bytes: usize,
-) -> Option<(RunningRest, RestService, AuthService, StubMailer, SchemaGuard)> {
+) -> Option<(
+    RunningRest,
+    RestService,
+    AuthService,
+    StubMailer,
+    SchemaGuard,
+)> {
     let schema = unique_schema();
     let cfg = auth_cfg(&schema);
     let mailer = StubMailer::new(cfg.smtp.from_email.clone());
@@ -314,7 +320,12 @@ async fn upload_download_round_trip() {
         Some(&bucket_body),
     )
     .await;
-    assert_eq!(resp.status, 201, "create bucket: {}", String::from_utf8_lossy(&resp.body));
+    assert_eq!(
+        resp.status,
+        201,
+        "create bucket: {}",
+        String::from_utf8_lossy(&resp.body)
+    );
 
     // Upload an object.
     let payload = b"hello from basin-blob!";
@@ -329,7 +340,12 @@ async fn upload_download_round_trip() {
         Some(payload),
     )
     .await;
-    assert_eq!(resp.status, 200, "upload: {}", String::from_utf8_lossy(&resp.body));
+    assert_eq!(
+        resp.status,
+        200,
+        "upload: {}",
+        String::from_utf8_lossy(&resp.body)
+    );
     let obj_json = resp.json();
     assert_eq!(obj_json["path"], "greet/hello.txt");
     assert_eq!(obj_json["size"], payload.len() as u64);
@@ -343,7 +359,12 @@ async fn upload_download_round_trip() {
         None,
     )
     .await;
-    assert_eq!(resp.status, 200, "download: {}", String::from_utf8_lossy(&resp.body));
+    assert_eq!(
+        resp.status,
+        200,
+        "download: {}",
+        String::from_utf8_lossy(&resp.body)
+    );
     assert_eq!(resp.body, payload);
 }
 
@@ -458,7 +479,8 @@ async fn public_bucket_without_jwt_returns_200() {
     )
     .await;
     assert_eq!(
-        r.status, 200,
+        r.status,
+        200,
         "expected 200 from public bucket; got {}: {}",
         r.status,
         String::from_utf8_lossy(&r.body)
@@ -584,8 +606,7 @@ async fn signed_url_mint_and_download() {
     let bearer = format!("Bearer {jwt}");
 
     // Create a private bucket.
-    let bucket_body =
-        serde_json::to_vec(&json!({"name": "sign-bucket", "public": false})).unwrap();
+    let bucket_body = serde_json::to_vec(&json!({"name": "sign-bucket", "public": false})).unwrap();
     let r = raw_request(
         addr,
         "POST",
@@ -597,7 +618,12 @@ async fn signed_url_mint_and_download() {
         Some(&bucket_body),
     )
     .await;
-    assert_eq!(r.status, 201, "create bucket: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        201,
+        "create bucket: {}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     // Upload an object (JWT required).
     let payload = b"signed-url-content";
@@ -612,7 +638,12 @@ async fn signed_url_mint_and_download() {
         Some(payload),
     )
     .await;
-    assert_eq!(r.status, 200, "upload: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "upload: {}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     // Mint a signed URL (JWT required, expires_in = 300 seconds).
     let sign_body = serde_json::to_vec(&json!({"expires_in": 300})).unwrap();
@@ -627,18 +658,30 @@ async fn signed_url_mint_and_download() {
         Some(&sign_body),
     )
     .await;
-    assert_eq!(r.status, 200, "mint signed URL: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "mint signed URL: {}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     let resp_json = r.json();
     let signed_url = resp_json["signedUrl"].as_str().expect("signedUrl field");
     assert!(!signed_url.is_empty(), "signedUrl must not be empty");
-    assert!(signed_url.contains("token="), "signedUrl must contain token");
-    assert!(signed_url.contains("expires="), "signedUrl must contain expires");
+    assert!(
+        signed_url.contains("token="),
+        "signedUrl must contain token"
+    );
+    assert!(
+        signed_url.contains("expires="),
+        "signedUrl must contain expires"
+    );
 
     // Download via the signed URL — no JWT.
     let r = raw_request(addr, "GET", signed_url, &[], None).await;
     assert_eq!(
-        r.status, 200,
+        r.status,
+        200,
         "signed download: {}",
         String::from_utf8_lossy(&r.body)
     );
@@ -708,7 +751,11 @@ async fn signed_url_tampered_token_returns_403() {
         let token_start = pos + "token=".len();
         let mut s = signed_url.clone();
         // Replace leading two chars of token hex with "ff" (unless already ff).
-        let replacement = if s[token_start..].starts_with("ff") { "00" } else { "ff" };
+        let replacement = if s[token_start..].starts_with("ff") {
+            "00"
+        } else {
+            "ff"
+        };
         s.replace_range(token_start..token_start + 2, replacement);
         s
     } else {

@@ -1436,10 +1436,9 @@ mod tests {
     #[test]
     fn ast_match_alter_sequence_if_exists_multi_opts() {
         use pg_query::NodeEnum;
-        let r = pg_query::parse(
-            "ALTER SEQUENCE IF EXISTS myseq INCREMENT BY 2 MAXVALUE 1000 NO CYCLE",
-        )
-        .unwrap();
+        let r =
+            pg_query::parse("ALTER SEQUENCE IF EXISTS myseq INCREMENT BY 2 MAXVALUE 1000 NO CYCLE")
+                .unwrap();
         let stmt = r.protobuf.stmts.first().unwrap().stmt.as_ref().unwrap();
         let NodeEnum::AlterSeqStmt(ref ass) = stmt.node.as_ref().unwrap() else {
             panic!("expected AlterSeqStmt");

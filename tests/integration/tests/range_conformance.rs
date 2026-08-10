@@ -152,15 +152,26 @@ async fn bool_col(sess: &basin_engine::ProjectSession, sql: &str) -> Vec<bool> {
 /// Return the single boolean scalar from `sql`.  Panics if not exactly one row.
 async fn scalar_bool(sess: &basin_engine::ProjectSession, sql: &str) -> bool {
     let v = bool_col(sess, sql).await;
-    assert_eq!(v.len(), 1, "expected exactly 1 row for: {sql}\ngot {}", v.len());
+    assert_eq!(
+        v.len(),
+        1,
+        "expected exactly 1 row for: {sql}\ngot {}",
+        v.len()
+    );
     v[0]
 }
 
 /// Return the single string scalar from `sql`.  Panics if not exactly one row.
 async fn scalar_str(sess: &basin_engine::ProjectSession, sql: &str) -> String {
     let v = string_col(sess, sql).await;
-    assert_eq!(v.len(), 1, "expected exactly 1 row for: {sql}\ngot {}", v.len());
-    v[0].clone().unwrap_or_else(|| panic!("expected non-NULL string for: {sql}"))
+    assert_eq!(
+        v.len(),
+        1,
+        "expected exactly 1 row for: {sql}\ngot {}",
+        v.len()
+    );
+    v[0].clone()
+        .unwrap_or_else(|| panic!("expected non-NULL string for: {sql}"))
 }
 
 /// Count rows returned by `sql`.
@@ -192,8 +203,14 @@ async fn range_ctor_int4range_default_bounds() {
     let v = parse_range_json(&s);
     assert_eq!(v["l"], 1, "int4range(1,10): lower bound must be 1");
     assert_eq!(v["u"], 10, "int4range(1,10): upper bound must be 10");
-    assert_eq!(v["li"], true, "int4range(1,10): lower must be inclusive (default '[)')");
-    assert_eq!(v["ui"], false, "int4range(1,10): upper must be exclusive (default '[)')");
+    assert_eq!(
+        v["li"], true,
+        "int4range(1,10): lower must be inclusive (default '[)')"
+    );
+    assert_eq!(
+        v["ui"], false,
+        "int4range(1,10): upper must be exclusive (default '[)')"
+    );
 }
 
 /// `int4range(1, 10, '[]')` — explicit closed bounds.
@@ -261,10 +278,7 @@ async fn range_canonicalization_int4range_closed_eq_half_open() {
     let (eng, _dir) = make_engine();
     let sess = open_session(&eng).await;
 
-    let result = scalar_bool(
-        &sess,
-        "SELECT '[1,9]'::int4range = '[1,10)'::int4range",
-    ).await;
+    let result = scalar_bool(&sess, "SELECT '[1,9]'::int4range = '[1,10)'::int4range").await;
     assert!(
         result,
         "PG canonicalization: '[1,9]'::int4range must equal '[1,10)'::int4range \
@@ -280,10 +294,7 @@ async fn range_canonicalization_int4range_exclusive_lower() {
     let (eng, _dir) = make_engine();
     let sess = open_session(&eng).await;
 
-    let result = scalar_bool(
-        &sess,
-        "SELECT '(0,10)'::int4range = '[1,10)'::int4range",
-    ).await;
+    let result = scalar_bool(&sess, "SELECT '(0,10)'::int4range = '[1,10)'::int4range").await;
     assert!(
         result,
         "PG canonicalization: '(0,10)'::int4range must equal '[1,10)'::int4range \
@@ -302,7 +313,8 @@ async fn range_canonicalization_daterange() {
     let result = scalar_bool(
         &sess,
         "SELECT '[2024-01-01,2024-01-30]'::daterange = '[2024-01-01,2024-01-31)'::daterange",
-    ).await;
+    )
+    .await;
     assert!(
         result,
         "PG canonicalization: '[2024-01-01,2024-01-30]'::daterange must equal \
@@ -317,10 +329,7 @@ async fn range_canonicalization_different_ranges_not_equal() {
     let (eng, _dir) = make_engine();
     let sess = open_session(&eng).await;
 
-    let result = scalar_bool(
-        &sess,
-        "SELECT '[1,5)'::int4range = '[1,10)'::int4range",
-    ).await;
+    let result = scalar_bool(&sess, "SELECT '[1,5)'::int4range = '[1,10)'::int4range").await;
     assert!(
         !result,
         "PG: '[1,5)'::int4range must NOT equal '[1,10)'::int4range"
@@ -361,7 +370,10 @@ async fn range_accessor_lower_inc_default() {
     let sess = open_session(&eng).await;
 
     let v = scalar_bool(&sess, "SELECT lower_inc(int4range(1, 5))").await;
-    assert!(v, "lower_inc(int4range(1,5)): default bounds are '[)' so lower is inclusive");
+    assert!(
+        v,
+        "lower_inc(int4range(1,5)): default bounds are '[)' so lower is inclusive"
+    );
 }
 
 /// `upper_inc(int4range(1, 5))` → false (default bounds are `[)` — exclusive upper).
@@ -372,7 +384,10 @@ async fn range_accessor_upper_inc_default() {
     let sess = open_session(&eng).await;
 
     let v = scalar_bool(&sess, "SELECT upper_inc(int4range(1, 5))").await;
-    assert!(!v, "upper_inc(int4range(1,5)): default bounds are '[)' so upper is exclusive");
+    assert!(
+        !v,
+        "upper_inc(int4range(1,5)): default bounds are '[)' so upper is exclusive"
+    );
 }
 
 /// `lower_inc(int4range(1, 5, '[]'))` → true.
@@ -406,7 +421,10 @@ async fn range_accessor_lower_inf_null_lower() {
     let sess = open_session(&eng).await;
 
     let v = scalar_bool(&sess, "SELECT lower_inf(int4range(NULL, 10))").await;
-    assert!(v, "lower_inf(int4range(NULL,10)) must be true (NULL lower = -inf)");
+    assert!(
+        v,
+        "lower_inf(int4range(NULL,10)) must be true (NULL lower = -inf)"
+    );
 }
 
 /// `upper_inf(int4range(1, NULL))` → true.
@@ -418,7 +436,10 @@ async fn range_accessor_upper_inf_null_upper() {
     let sess = open_session(&eng).await;
 
     let v = scalar_bool(&sess, "SELECT upper_inf(int4range(1, NULL))").await;
-    assert!(v, "upper_inf(int4range(1,NULL)) must be true (NULL upper = +inf)");
+    assert!(
+        v,
+        "upper_inf(int4range(1,NULL)) must be true (NULL upper = +inf)"
+    );
 }
 
 /// `lower_inf(int4range(1, 10))` → false (finite lower bound).
@@ -429,7 +450,10 @@ async fn range_accessor_lower_inf_finite() {
     let sess = open_session(&eng).await;
 
     let v = scalar_bool(&sess, "SELECT lower_inf(int4range(1, 10))").await;
-    assert!(!v, "lower_inf(int4range(1,10)) must be false (finite lower)");
+    assert!(
+        !v,
+        "lower_inf(int4range(1,10)) must be false (finite lower)"
+    );
 }
 
 /// `isempty` on a range where lo == hi with default `[)` bounds.
@@ -457,7 +481,10 @@ async fn range_accessor_isempty_non_empty() {
     let sess = open_session(&eng).await;
 
     let v = scalar_bool(&sess, "SELECT isempty(int4range(1, 5))").await;
-    assert!(!v, "isempty(int4range(1,5)): non-empty range must return false");
+    assert!(
+        !v,
+        "isempty(int4range(1,5)): non-empty range must return false"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -481,15 +508,24 @@ async fn range_contains_elem_basic() {
 
     // 10 ∉ [1,10) → false (exclusive upper)
     let at_upper = scalar_bool(&sess, "SELECT range_contains_elem(int4range(1, 10), 10)").await;
-    assert!(!at_upper, "range_contains_elem([1,10), 10) must be false (exclusive upper)");
+    assert!(
+        !at_upper,
+        "range_contains_elem([1,10), 10) must be false (exclusive upper)"
+    );
 
     // 0 ∉ [1,10) → false (below lower)
     let below_lower = scalar_bool(&sess, "SELECT range_contains_elem(int4range(1, 10), 0)").await;
-    assert!(!below_lower, "range_contains_elem([1,10), 0) must be false (below lower)");
+    assert!(
+        !below_lower,
+        "range_contains_elem([1,10), 0) must be false (below lower)"
+    );
 
     // 1 ∈ [1,10) → true (inclusive lower)
     let at_lower = scalar_bool(&sess, "SELECT range_contains_elem(int4range(1, 10), 1)").await;
-    assert!(at_lower, "range_contains_elem([1,10), 1) must be true (inclusive lower)");
+    assert!(
+        at_lower,
+        "range_contains_elem([1,10), 1) must be true (inclusive lower)"
+    );
 
     // 9 ∈ [1,10) → true (last integer in range)
     let last_int = scalar_bool(&sess, "SELECT range_contains_elem(int4range(1, 10), 9)").await;
@@ -523,22 +559,31 @@ async fn range_contains_range_basic() {
     let sub = scalar_bool(
         &sess,
         "SELECT range_contains_range(int4range(1, 10), int4range(2, 8))",
-    ).await;
+    )
+    .await;
     assert!(sub, "range_contains_range([1,10),[2,8)) must be true");
 
     // [2,15) ⊄ [1,10)
     let exceeds = scalar_bool(
         &sess,
         "SELECT range_contains_range(int4range(1, 10), int4range(2, 15))",
-    ).await;
-    assert!(!exceeds, "range_contains_range([1,10),[2,15)) must be false (15 exceeds upper)");
+    )
+    .await;
+    assert!(
+        !exceeds,
+        "range_contains_range([1,10),[2,15)) must be false (15 exceeds upper)"
+    );
 
     // [1,10) ⊆ [1,10) (exact match)
     let exact = scalar_bool(
         &sess,
         "SELECT range_contains_range(int4range(1, 10), int4range(1, 10))",
-    ).await;
-    assert!(exact, "range_contains_range([1,10),[1,10)) must be true (exact match)");
+    )
+    .await;
+    assert!(
+        exact,
+        "range_contains_range([1,10),[1,10)) must be true (exact match)"
+    );
 }
 
 /// Containment via `@>` with PG text literals (rewriter uses literal detection).
@@ -548,10 +593,7 @@ async fn range_at_gt_range_operator_literal() {
     let (eng, _dir) = make_engine();
     let sess = open_session(&eng).await;
 
-    let v = scalar_bool(
-        &sess,
-        "SELECT '[1,10)'::int4range @> '[2,8)'::int4range",
-    ).await;
+    let v = scalar_bool(&sess, "SELECT '[1,10)'::int4range @> '[2,8)'::int4range").await;
     assert!(
         v,
         "'[1,10)'::int4range @> '[2,8)'::int4range must be true ([2,8) ⊆ [1,10))"
@@ -567,24 +609,23 @@ async fn range_contained_by_operator() {
     let sess = open_session(&eng).await;
 
     // 5 <@ [1,10) via explicit UDF (elem<@range rewrite reverses the args)
-    let elem_in = scalar_bool(
-        &sess,
-        "SELECT range_contains_elem(int4range(1, 10), 5)",
-    ).await;
+    let elem_in = scalar_bool(&sess, "SELECT range_contains_elem(int4range(1, 10), 5)").await;
     assert!(elem_in, "5 is contained in [1,10)");
 
     // [2,8) <@ [1,10) via range_contains_range with args swapped
     let range_in = scalar_bool(
         &sess,
         "SELECT range_contains_range(int4range(1, 10), int4range(2, 8))",
-    ).await;
+    )
+    .await;
     assert!(range_in, "[2,8) is contained in [1,10)");
 
     // [2,15) is NOT contained in [1,10)
     let not_in = scalar_bool(
         &sess,
         "SELECT range_contains_range(int4range(1, 10), int4range(2, 15))",
-    ).await;
+    )
+    .await;
     assert!(!not_in, "[2,15) must NOT be contained in [1,10)");
 }
 
@@ -603,8 +644,12 @@ async fn range_overlaps_basic_true() {
     let v = scalar_bool(
         &sess,
         "SELECT range_overlaps(int4range(1, 5), int4range(3, 8))",
-    ).await;
-    assert!(v, "range_overlaps([1,5),[3,8)) must be true (overlap at [3,5))");
+    )
+    .await;
+    assert!(
+        v,
+        "range_overlaps([1,5),[3,8)) must be true (overlap at [3,5))"
+    );
 }
 
 /// Adjacent ranges do NOT overlap.
@@ -619,7 +664,8 @@ async fn range_overlaps_adjacent_is_false() {
     let v = scalar_bool(
         &sess,
         "SELECT range_overlaps(int4range(1, 5), int4range(5, 10))",
-    ).await;
+    )
+    .await;
     assert!(
         !v,
         "range_overlaps([1,5),[5,10)) must be FALSE — adjacent ranges do NOT \
@@ -637,7 +683,8 @@ async fn range_overlaps_disjoint_false() {
     let v = scalar_bool(
         &sess,
         "SELECT range_overlaps(int4range(1, 5), int4range(6, 10))",
-    ).await;
+    )
+    .await;
     assert!(!v, "range_overlaps([1,5),[6,10)) must be false (disjoint)");
 }
 
@@ -651,8 +698,12 @@ async fn range_overlaps_nested() {
     let v = scalar_bool(
         &sess,
         "SELECT range_overlaps(int4range(1, 10), int4range(3, 7))",
-    ).await;
-    assert!(v, "range_overlaps([1,10),[3,7)) must be true (inner is nested)");
+    )
+    .await;
+    assert!(
+        v,
+        "range_overlaps([1,10),[3,7)) must be true (inner is nested)"
+    );
 }
 
 /// `&&` operator rewrite (both operands are range constructors).
@@ -666,7 +717,10 @@ async fn range_overlap_operator_rewrite() {
     assert!(v, "int4range(1,10) && int4range(5,15) must be true");
 
     let v2 = scalar_bool(&sess, "SELECT int4range(1, 5) && int4range(5, 10)").await;
-    assert!(!v2, "int4range(1,5) && int4range(5,10) must be false (adjacent, no overlap)");
+    assert!(
+        !v2,
+        "int4range(1,5) && int4range(5,10) must be false (adjacent, no overlap)"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -684,14 +738,19 @@ async fn range_strictly_left() {
     let v_true = scalar_bool(
         &sess,
         "SELECT range_strictly_left(int4range(1, 5), int4range(7, 10))",
-    ).await;
+    )
+    .await;
     assert!(v_true, "range_strictly_left([1,5),[7,10)) must be true");
 
     let v_false = scalar_bool(
         &sess,
         "SELECT range_strictly_left(int4range(1, 5), int4range(4, 10))",
-    ).await;
-    assert!(!v_false, "range_strictly_left([1,5),[4,10)) must be false (overlap at 4)");
+    )
+    .await;
+    assert!(
+        !v_false,
+        "range_strictly_left([1,5),[4,10)) must be false (overlap at 4)"
+    );
 }
 
 /// `<<` operator rewrite.
@@ -719,14 +778,19 @@ async fn range_strictly_right() {
     let v_true = scalar_bool(
         &sess,
         "SELECT range_strictly_right(int4range(7, 10), int4range(1, 5))",
-    ).await;
+    )
+    .await;
     assert!(v_true, "range_strictly_right([7,10),[1,5)) must be true");
 
     let v_false = scalar_bool(
         &sess,
         "SELECT range_strictly_right(int4range(4, 10), int4range(1, 5))",
-    ).await;
-    assert!(!v_false, "range_strictly_right([4,10),[1,5)) must be false (overlap)");
+    )
+    .await;
+    assert!(
+        !v_false,
+        "range_strictly_right([4,10),[1,5)) must be false (overlap)"
+    );
 }
 
 /// `>>` operator rewrite.
@@ -750,14 +814,22 @@ async fn range_not_extends_right() {
     let v_true = scalar_bool(
         &sess,
         "SELECT range_not_extends_right(int4range(1, 5), int4range(3, 10))",
-    ).await;
-    assert!(v_true, "range_not_extends_right([1,5),[3,10)) must be true (5 ≤ 10)");
+    )
+    .await;
+    assert!(
+        v_true,
+        "range_not_extends_right([1,5),[3,10)) must be true (5 ≤ 10)"
+    );
 
     let v_false = scalar_bool(
         &sess,
         "SELECT range_not_extends_right(int4range(1, 10), int4range(3, 7))",
-    ).await;
-    assert!(!v_false, "range_not_extends_right([1,10),[3,7)) must be false (10 > 7)");
+    )
+    .await;
+    assert!(
+        !v_false,
+        "range_not_extends_right([1,10),[3,7)) must be false (10 > 7)"
+    );
 }
 
 /// `&<` operator rewrite.
@@ -785,14 +857,22 @@ async fn range_not_extends_left() {
     let v_true = scalar_bool(
         &sess,
         "SELECT range_not_extends_left(int4range(5, 10), int4range(1, 7))",
-    ).await;
-    assert!(v_true, "range_not_extends_left([5,10),[1,7)) must be true (5 ≥ 1)");
+    )
+    .await;
+    assert!(
+        v_true,
+        "range_not_extends_left([5,10),[1,7)) must be true (5 ≥ 1)"
+    );
 
     let v_false = scalar_bool(
         &sess,
         "SELECT range_not_extends_left(int4range(1, 10), int4range(3, 7))",
-    ).await;
-    assert!(!v_false, "range_not_extends_left([1,10),[3,7)) must be false (1 < 3)");
+    )
+    .await;
+    assert!(
+        !v_false,
+        "range_not_extends_left([1,10),[3,7)) must be false (1 < 3)"
+    );
 }
 
 /// `&>` operator rewrite.
@@ -818,7 +898,8 @@ async fn range_adjacent_basic() {
     let v_adj = scalar_bool(
         &sess,
         "SELECT range_adjacent(int4range(1, 5), int4range(5, 10))",
-    ).await;
+    )
+    .await;
     assert!(
         v_adj,
         "range_adjacent([1,5),[5,10)) must be true (touch at 5 with no gap)"
@@ -828,7 +909,8 @@ async fn range_adjacent_basic() {
     let v_gap = scalar_bool(
         &sess,
         "SELECT range_adjacent(int4range(1, 5), int4range(6, 10))",
-    ).await;
+    )
+    .await;
     assert!(
         !v_gap,
         "range_adjacent([1,5),[6,10)) must be false (gap at 5)"
@@ -838,7 +920,8 @@ async fn range_adjacent_basic() {
     let v_overlap = scalar_bool(
         &sess,
         "SELECT range_adjacent(int4range(1, 5), int4range(3, 10))",
-    ).await;
+    )
+    .await;
     assert!(
         !v_overlap,
         "range_adjacent([1,5),[3,10)) must be false (overlapping ranges are not adjacent)"
@@ -856,7 +939,10 @@ async fn range_adjacent_operator() {
     assert!(v, "int4range(1,5) -|- int4range(5,10) must be true");
 
     let v2 = scalar_bool(&sess, "SELECT int4range(1, 5) -|- int4range(6, 10)").await;
-    assert!(!v2, "int4range(1,5) -|- int4range(6,10) must be false (gap)");
+    assert!(
+        !v2,
+        "int4range(1,5) -|- int4range(6,10) must be false (gap)"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -878,26 +964,33 @@ async fn range_union_overlapping() {
     exec_ok(
         &sess,
         "INSERT INTO r_union_test SELECT int4range(1, 5) + int4range(3, 10)",
-    ).await;
+    )
+    .await;
 
     // The union [1,10) must contain 1, 9 but not 10.
     let contains_1 = row_count(
         &sess,
         "SELECT v FROM r_union_test WHERE range_contains_elem(v, 1)",
-    ).await;
+    )
+    .await;
     assert_eq!(contains_1, 1, "union [1,10) must contain 1");
 
     let contains_9 = row_count(
         &sess,
         "SELECT v FROM r_union_test WHERE range_contains_elem(v, 9)",
-    ).await;
+    )
+    .await;
     assert_eq!(contains_9, 1, "union [1,10) must contain 9");
 
     let contains_10 = row_count(
         &sess,
         "SELECT v FROM r_union_test WHERE range_contains_elem(v, 10)",
-    ).await;
-    assert_eq!(contains_10, 0, "union [1,10) must NOT contain 10 (exclusive upper)");
+    )
+    .await;
+    assert_eq!(
+        contains_10, 0,
+        "union [1,10) must NOT contain 10 (exclusive upper)"
+    );
 }
 
 /// Range union via `+` operator rewrite.
@@ -930,20 +1023,40 @@ async fn range_intersection_overlapping() {
     exec_ok(
         &sess,
         "INSERT INTO r_inter_test SELECT int4range(1, 10) * int4range(3, 7)",
-    ).await;
+    )
+    .await;
 
     // [3,7) must contain 3 and 6, not 2 or 7.
-    let c3 = row_count(&sess, "SELECT v FROM r_inter_test WHERE range_contains_elem(v, 3)").await;
+    let c3 = row_count(
+        &sess,
+        "SELECT v FROM r_inter_test WHERE range_contains_elem(v, 3)",
+    )
+    .await;
     assert_eq!(c3, 1, "intersection [3,7) must contain 3");
 
-    let c6 = row_count(&sess, "SELECT v FROM r_inter_test WHERE range_contains_elem(v, 6)").await;
+    let c6 = row_count(
+        &sess,
+        "SELECT v FROM r_inter_test WHERE range_contains_elem(v, 6)",
+    )
+    .await;
     assert_eq!(c6, 1, "intersection [3,7) must contain 6");
 
-    let c2 = row_count(&sess, "SELECT v FROM r_inter_test WHERE range_contains_elem(v, 2)").await;
+    let c2 = row_count(
+        &sess,
+        "SELECT v FROM r_inter_test WHERE range_contains_elem(v, 2)",
+    )
+    .await;
     assert_eq!(c2, 0, "intersection [3,7) must NOT contain 2");
 
-    let c7 = row_count(&sess, "SELECT v FROM r_inter_test WHERE range_contains_elem(v, 7)").await;
-    assert_eq!(c7, 0, "intersection [3,7) must NOT contain 7 (exclusive upper)");
+    let c7 = row_count(
+        &sess,
+        "SELECT v FROM r_inter_test WHERE range_contains_elem(v, 7)",
+    )
+    .await;
+    assert_eq!(
+        c7, 0,
+        "intersection [3,7) must NOT contain 7 (exclusive upper)"
+    );
 }
 
 /// Intersection of disjoint ranges → empty.
@@ -957,13 +1070,15 @@ async fn range_intersection_disjoint_empty() {
     exec_ok(
         &sess,
         "INSERT INTO r_inter_disjoint SELECT int4range(1, 5) * int4range(7, 10)",
-    ).await;
+    )
+    .await;
 
     // The result is empty — no element is in it.
     let c5 = row_count(
         &sess,
         "SELECT v FROM r_inter_disjoint WHERE range_contains_elem(v, 5)",
-    ).await;
+    )
+    .await;
     assert_eq!(c5, 0, "disjoint intersection must not contain any element");
 }
 
@@ -979,20 +1094,43 @@ async fn range_difference_prefix() {
     exec_ok(
         &sess,
         "INSERT INTO r_diff_test SELECT int4range(1, 10) - int4range(1, 5)",
-    ).await;
+    )
+    .await;
 
     // [5,10) must contain 5 and 9, not 4 or 10.
-    let c5 = row_count(&sess, "SELECT v FROM r_diff_test WHERE range_contains_elem(v, 5)").await;
+    let c5 = row_count(
+        &sess,
+        "SELECT v FROM r_diff_test WHERE range_contains_elem(v, 5)",
+    )
+    .await;
     assert_eq!(c5, 1, "difference [5,10) must contain 5");
 
-    let c9 = row_count(&sess, "SELECT v FROM r_diff_test WHERE range_contains_elem(v, 9)").await;
+    let c9 = row_count(
+        &sess,
+        "SELECT v FROM r_diff_test WHERE range_contains_elem(v, 9)",
+    )
+    .await;
     assert_eq!(c9, 1, "difference [5,10) must contain 9");
 
-    let c4 = row_count(&sess, "SELECT v FROM r_diff_test WHERE range_contains_elem(v, 4)").await;
-    assert_eq!(c4, 0, "difference [5,10) must NOT contain 4 (removed prefix)");
+    let c4 = row_count(
+        &sess,
+        "SELECT v FROM r_diff_test WHERE range_contains_elem(v, 4)",
+    )
+    .await;
+    assert_eq!(
+        c4, 0,
+        "difference [5,10) must NOT contain 4 (removed prefix)"
+    );
 
-    let c10 = row_count(&sess, "SELECT v FROM r_diff_test WHERE range_contains_elem(v, 10)").await;
-    assert_eq!(c10, 0, "difference [5,10) must NOT contain 10 (exclusive upper)");
+    let c10 = row_count(
+        &sess,
+        "SELECT v FROM r_diff_test WHERE range_contains_elem(v, 10)",
+    )
+    .await;
+    assert_eq!(
+        c10, 0,
+        "difference [5,10) must NOT contain 10 (exclusive upper)"
+    );
 }
 
 /// Difference that completely removes the range → empty.
@@ -1006,13 +1144,11 @@ async fn range_difference_self_is_empty() {
     exec_ok(
         &sess,
         "INSERT INTO r_diff_self SELECT int4range(1, 5) - int4range(1, 5)",
-    ).await;
+    )
+    .await;
 
     // The result is empty; isempty must return true.
-    let is_empty = row_count(
-        &sess,
-        "SELECT v FROM r_diff_self WHERE isempty(v)",
-    ).await;
+    let is_empty = row_count(&sess, "SELECT v FROM r_diff_self WHERE isempty(v)").await;
     assert_eq!(is_empty, 1, "self-difference must produce an empty range");
 }
 
@@ -1032,17 +1168,36 @@ async fn range_merge_disjoint() {
     exec_ok(
         &sess,
         "INSERT INTO r_merge_test SELECT range_merge(int4range(1, 5), int4range(7, 10))",
-    ).await;
+    )
+    .await;
 
     // Hull [1,10) must contain 1, 6, 9 but not 10.
-    let c1 = row_count(&sess, "SELECT v FROM r_merge_test WHERE range_contains_elem(v, 1)").await;
+    let c1 = row_count(
+        &sess,
+        "SELECT v FROM r_merge_test WHERE range_contains_elem(v, 1)",
+    )
+    .await;
     assert_eq!(c1, 1, "merge hull [1,10) must contain 1");
 
-    let c6 = row_count(&sess, "SELECT v FROM r_merge_test WHERE range_contains_elem(v, 6)").await;
-    assert_eq!(c6, 1, "merge hull [1,10) must contain 6 (gap filled in hull)");
+    let c6 = row_count(
+        &sess,
+        "SELECT v FROM r_merge_test WHERE range_contains_elem(v, 6)",
+    )
+    .await;
+    assert_eq!(
+        c6, 1,
+        "merge hull [1,10) must contain 6 (gap filled in hull)"
+    );
 
-    let c10 = row_count(&sess, "SELECT v FROM r_merge_test WHERE range_contains_elem(v, 10)").await;
-    assert_eq!(c10, 0, "merge hull [1,10) must NOT contain 10 (exclusive upper)");
+    let c10 = row_count(
+        &sess,
+        "SELECT v FROM r_merge_test WHERE range_contains_elem(v, 10)",
+    )
+    .await;
+    assert_eq!(
+        c10, 0,
+        "merge hull [1,10) must NOT contain 10 (exclusive upper)"
+    );
 }
 
 /// `range_merge` with overlapping ranges is the bounding range.
@@ -1056,12 +1211,21 @@ async fn range_merge_overlapping() {
     exec_ok(
         &sess,
         "INSERT INTO r_merge_ov SELECT range_merge(int4range(1, 7), int4range(3, 10))",
-    ).await;
+    )
+    .await;
 
-    let c1 = row_count(&sess, "SELECT v FROM r_merge_ov WHERE range_contains_elem(v, 1)").await;
+    let c1 = row_count(
+        &sess,
+        "SELECT v FROM r_merge_ov WHERE range_contains_elem(v, 1)",
+    )
+    .await;
     assert_eq!(c1, 1, "merge [1,10) must contain 1");
 
-    let c9 = row_count(&sess, "SELECT v FROM r_merge_ov WHERE range_contains_elem(v, 9)").await;
+    let c9 = row_count(
+        &sess,
+        "SELECT v FROM r_merge_ov WHERE range_contains_elem(v, 9)",
+    )
+    .await;
     assert_eq!(c9, 1, "merge [1,10) must contain 9");
 }
 
@@ -1093,11 +1257,19 @@ async fn range_union_with_empty_identity() {
     exec_ok(
         &sess,
         "INSERT INTO r_empty_id SELECT range_union(int4range(1, 10), 'empty')",
-    ).await;
+    )
+    .await;
 
     // Result should be [1,10).
-    let c5 = row_count(&sess, "SELECT v FROM r_empty_id WHERE range_contains_elem(v, 5)").await;
-    assert_eq!(c5, 1, "union with empty should preserve the non-empty range (contains 5)");
+    let c5 = row_count(
+        &sess,
+        "SELECT v FROM r_empty_id WHERE range_contains_elem(v, 5)",
+    )
+    .await;
+    assert_eq!(
+        c5, 1,
+        "union with empty should preserve the non-empty range (contains 5)"
+    );
 }
 
 /// Intersection of a range with empty → empty.
@@ -1111,7 +1283,8 @@ async fn range_intersection_with_empty_is_empty() {
     exec_ok(
         &sess,
         "INSERT INTO r_inter_empty SELECT range_intersection(int4range(1, 10), 'empty')",
-    ).await;
+    )
+    .await;
 
     let is_empty = row_count(&sess, "SELECT v FROM r_inter_empty WHERE isempty(v)").await;
     assert_eq!(is_empty, 1, "intersection with empty range must be empty");
@@ -1144,7 +1317,10 @@ async fn range_empty_pg_semantics() {
         "SELECT range_contains_range(int4range(1, 10), 'empty')",
     )
     .await;
-    assert!(contains_empty, "PG: every range contains the empty range (@> empty = t)");
+    assert!(
+        contains_empty,
+        "PG: every range contains the empty range (@> empty = t)"
+    );
 
     // empty @> non-empty → false
     let empty_contains = scalar_bool(
@@ -1152,7 +1328,10 @@ async fn range_empty_pg_semantics() {
         "SELECT range_contains_range('empty', int4range(1, 10))",
     )
     .await;
-    assert!(!empty_contains, "PG: empty range contains no non-empty range");
+    assert!(
+        !empty_contains,
+        "PG: empty range contains no non-empty range"
+    );
 
     // empty @> empty → true
     let empty_contains_empty =
@@ -1160,14 +1339,16 @@ async fn range_empty_pg_semantics() {
     assert!(empty_contains_empty, "PG: empty @> empty = t");
 
     // range_contains_elem(empty, x) → false
-    let elem_in_empty =
-        scalar_bool(&sess, "SELECT range_contains_elem('empty', 5)").await;
+    let elem_in_empty = scalar_bool(&sess, "SELECT range_contains_elem('empty', 5)").await;
     assert!(!elem_in_empty, "PG: empty range contains no element");
 
     // anything && empty → false
     let overlaps_empty =
         scalar_bool(&sess, "SELECT range_overlaps(int4range(1, 10), 'empty')").await;
-    assert!(!overlaps_empty, "PG: empty range overlaps nothing (&& empty = f)");
+    assert!(
+        !overlaps_empty,
+        "PG: empty range overlaps nothing (&& empty = f)"
+    );
     let empty_overlaps =
         scalar_bool(&sess, "SELECT range_overlaps('empty', int4range(1, 10))").await;
     assert!(!empty_overlaps, "PG: empty && anything = f (symmetric)");
@@ -1180,23 +1361,20 @@ async fn range_empty_pg_semantics() {
         "range_not_extends_right",
         "range_not_extends_left",
     ] {
-        let lhs_empty = scalar_bool(
-            &sess,
-            &format!("SELECT {udf}('empty', int4range(1, 10))"),
-        )
-        .await;
+        let lhs_empty =
+            scalar_bool(&sess, &format!("SELECT {udf}('empty', int4range(1, 10))")).await;
         assert!(!lhs_empty, "PG: {udf}(empty, r) must be false");
-        let rhs_empty = scalar_bool(
-            &sess,
-            &format!("SELECT {udf}(int4range(1, 10), 'empty')"),
-        )
-        .await;
+        let rhs_empty =
+            scalar_bool(&sess, &format!("SELECT {udf}(int4range(1, 10), 'empty')")).await;
         assert!(!rhs_empty, "PG: {udf}(r, empty) must be false");
     }
 
     // isempty on a degenerate constructor result: int4range(5,5) → [5,5) is empty.
     let degenerate_empty = scalar_bool(&sess, "SELECT isempty(int4range(5, 5))").await;
-    assert!(degenerate_empty, "PG: isempty(int4range(5,5)) = t ([5,5) has no points)");
+    assert!(
+        degenerate_empty,
+        "PG: isempty(int4range(5,5)) = t ([5,5) has no points)"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1213,7 +1391,8 @@ async fn multirange_constructor_smoke() {
     let s = scalar_str(
         &sess,
         "SELECT int4multirange(int4range(1, 5), int4range(10, 15))",
-    ).await;
+    )
+    .await;
     // Basin stores multirange as a JSON array.
     let v: serde_json::Value = serde_json::from_str(&s)
         .unwrap_or_else(|e| panic!("multirange not valid JSON: {s:?}\nerror: {e}"));
@@ -1234,29 +1413,45 @@ async fn multirange_contains_elem() {
     let in1 = scalar_bool(
         &sess,
         "SELECT multirange_contains_elem(int4multirange(int4range(1, 5), int4range(10, 15)), 3)",
-    ).await;
-    assert!(in1, "multirange_contains_elem({{[1,5),[10,15)}}, 3) must be true");
+    )
+    .await;
+    assert!(
+        in1,
+        "multirange_contains_elem({{[1,5),[10,15)}}, 3) must be true"
+    );
 
     // 12 ∈ [10,15) → true
     let in2 = scalar_bool(
         &sess,
         "SELECT multirange_contains_elem(int4multirange(int4range(1, 5), int4range(10, 15)), 12)",
-    ).await;
-    assert!(in2, "multirange_contains_elem({{[1,5),[10,15)}}, 12) must be true");
+    )
+    .await;
+    assert!(
+        in2,
+        "multirange_contains_elem({{[1,5),[10,15)}}, 12) must be true"
+    );
 
     // 7 ∉ either range → false
     let out1 = scalar_bool(
         &sess,
         "SELECT multirange_contains_elem(int4multirange(int4range(1, 5), int4range(10, 15)), 7)",
-    ).await;
-    assert!(!out1, "multirange_contains_elem({{[1,5),[10,15)}}, 7) must be false (gap)");
+    )
+    .await;
+    assert!(
+        !out1,
+        "multirange_contains_elem({{[1,5),[10,15)}}, 7) must be false (gap)"
+    );
 
     // 5 ∉ [1,5) and ∉ [10,15) → false (5 is exclusive upper of first range)
     let out2 = scalar_bool(
         &sess,
         "SELECT multirange_contains_elem(int4multirange(int4range(1, 5), int4range(10, 15)), 5)",
-    ).await;
-    assert!(!out2, "multirange_contains_elem({{[1,5),[10,15)}}, 5) must be false (exclusive upper)");
+    )
+    .await;
+    assert!(
+        !out2,
+        "multirange_contains_elem({{[1,5),[10,15)}}, 5) must be false (exclusive upper)"
+    );
 }
 
 /// `int4multirange @> scalar` via `@>` operator rewrite.
@@ -1266,17 +1461,14 @@ async fn multirange_at_gt_operator() {
     let (eng, _dir) = make_engine();
     let sess = open_session(&eng).await;
 
-    let v = scalar_bool(
-        &sess,
-        "SELECT int4multirange(int4range(1, 5)) @> 3",
-    ).await;
+    let v = scalar_bool(&sess, "SELECT int4multirange(int4range(1, 5)) @> 3").await;
     assert!(v, "int4multirange(int4range(1,5)) @> 3 must be true");
 
-    let v2 = scalar_bool(
-        &sess,
-        "SELECT int4multirange(int4range(1, 5)) @> 5",
-    ).await;
-    assert!(!v2, "int4multirange(int4range(1,5)) @> 5 must be false (exclusive upper)");
+    let v2 = scalar_bool(&sess, "SELECT int4multirange(int4range(1, 5)) @> 5").await;
+    assert!(
+        !v2,
+        "int4multirange(int4range(1,5)) @> 5 must be false (exclusive upper)"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1295,12 +1487,25 @@ async fn range_table_insert_and_filter() {
     exec_ok(
         &sess,
         "CREATE TABLE events (id BIGSERIAL PRIMARY KEY, during INT4RANGE)",
-    ).await;
+    )
+    .await;
 
     // Insert three non-overlapping ranges.
-    exec_ok(&sess, "INSERT INTO events (during) VALUES (int4range(0, 10))").await;
-    exec_ok(&sess, "INSERT INTO events (during) VALUES (int4range(20, 30))").await;
-    exec_ok(&sess, "INSERT INTO events (during) VALUES (int4range(40, 50))").await;
+    exec_ok(
+        &sess,
+        "INSERT INTO events (during) VALUES (int4range(0, 10))",
+    )
+    .await;
+    exec_ok(
+        &sess,
+        "INSERT INTO events (during) VALUES (int4range(20, 30))",
+    )
+    .await;
+    exec_ok(
+        &sess,
+        "INSERT INTO events (during) VALUES (int4range(40, 50))",
+    )
+    .await;
 
     // All 3 rows were inserted.
     let total = row_count(&sess, "SELECT id FROM events").await;
@@ -1310,7 +1515,8 @@ async fn range_table_insert_and_filter() {
     let filtered = row_count(
         &sess,
         "SELECT id FROM events WHERE range_contains_elem(during, 5)",
-    ).await;
+    )
+    .await;
     assert_eq!(
         filtered, 1,
         "WHERE range_contains_elem(during, 5): only [0,10) contains 5"
@@ -1320,8 +1526,12 @@ async fn range_table_insert_and_filter() {
     let none = row_count(
         &sess,
         "SELECT id FROM events WHERE range_contains_elem(during, 15)",
-    ).await;
-    assert_eq!(none, 0, "no range contains 15 (gap between [0,10) and [20,30))");
+    )
+    .await;
+    assert_eq!(
+        none, 0,
+        "no range contains 15 (gap between [0,10) and [20,30))"
+    );
 }
 
 /// INSERT using PG text-literal `'[lo,hi)'` syntax, then query.
@@ -1333,7 +1543,8 @@ async fn range_table_insert_text_literal() {
     exec_ok(
         &sess,
         "CREATE TABLE slots (id BIGSERIAL PRIMARY KEY, r INT4RANGE)",
-    ).await;
+    )
+    .await;
 
     exec_ok(&sess, "INSERT INTO slots (r) VALUES ('[1,10)')").await;
     exec_ok(&sess, "INSERT INTO slots (r) VALUES ('[20,30)')").await;
@@ -1345,7 +1556,8 @@ async fn range_table_insert_text_literal() {
     let n = row_count(
         &sess,
         "SELECT id FROM slots WHERE range_contains_elem(r, 5)",
-    ).await;
+    )
+    .await;
     assert_eq!(n, 1, "only '[1,10)' contains 5");
 }
 
@@ -1363,13 +1575,15 @@ async fn range_table_multi_type_columns() {
             nums    NUMRANGE,
             dates   DATERANGE
         )",
-    ).await;
+    )
+    .await;
 
     exec_ok(
         &sess,
         "INSERT INTO schedules (ints, nums, dates) VALUES \
          (int4range(1, 10), numrange(1.0, 2.5), daterange('2024-01-01', '2024-01-31'))",
-    ).await;
+    )
+    .await;
 
     let n = row_count(&sess, "SELECT id FROM schedules").await;
     assert_eq!(n, 1, "multi-type range table: expected 1 row after insert");
@@ -1384,8 +1598,13 @@ async fn range_table_lower_upper_roundtrip() {
     exec_ok(
         &sess,
         "CREATE TABLE bounds_check (id BIGSERIAL PRIMARY KEY, r INT4RANGE)",
-    ).await;
-    exec_ok(&sess, "INSERT INTO bounds_check (r) VALUES (int4range(7, 42))").await;
+    )
+    .await;
+    exec_ok(
+        &sess,
+        "INSERT INTO bounds_check (r) VALUES (int4range(7, 42))",
+    )
+    .await;
 
     let lo = scalar_str(&sess, "SELECT lower(r) FROM bounds_check LIMIT 1").await;
     let hi = scalar_str(&sess, "SELECT upper(r) FROM bounds_check LIMIT 1").await;

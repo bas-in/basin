@@ -158,11 +158,7 @@ pub(crate) async fn execute_trgm_knn_plan(
 
     // Ascending distance; total order via total_cmp. Stable secondary key
     // (batch, row) for deterministic output across runs.
-    scored.sort_by(|a, b| {
-        a.0.total_cmp(&b.0)
-            .then(a.1.cmp(&b.1))
-            .then(a.2.cmp(&b.2))
-    });
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
 
     // ── Boundary fill: when the candidate files hold fewer than k rows in
     // total, the answer is short of k. The remaining slots are arbitrary
@@ -190,11 +186,7 @@ pub(crate) async fn execute_trgm_knn_plan(
         // Re-sort so the appended fill rows sit after the near rows (all near
         // rows have distance < 1 ≤ fill distance, so this only orders within
         // the distance-1 tier deterministically).
-        scored.sort_by(|a, b| {
-            a.0.total_cmp(&b.0)
-                .then(a.1.cmp(&b.1))
-                .then(a.2.cmp(&b.2))
-        });
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     }
     // Final exact top-k cut (covers both the no-fill path — candidate rows >= k
     // — and the post-fill path).
@@ -274,12 +266,7 @@ async fn read_fill_rows(
         let paths = vec![ObjectPath::from(path.as_str())];
         let opts = ReadOptions::default();
         let mut stream = storage
-            .read_paths_with_schema(
-                &sess.project,
-                paths,
-                opts,
-                Some(catalog_schema.clone()),
-            )
+            .read_paths_with_schema(&sess.project, paths, opts, Some(catalog_schema.clone()))
             .await?;
         while let Some(item) = stream.next().await {
             if need == 0 {
@@ -371,15 +358,16 @@ fn project_batch(batch: &RecordBatch, cols: &Option<Vec<String>>) -> Result<Reco
 
 /// Empty result with the user's projected schema (zero rows). Mirrors
 /// [`crate::rtree_knn_scan`]'s `empty_result`.
-fn empty_result(
-    table_schema: &Schema,
-    projection: &Option<Vec<String>>,
-) -> Result<ExecResult> {
+fn empty_result(table_schema: &Schema, projection: &Option<Vec<String>>) -> Result<ExecResult> {
     let df_schema = crate::convert::schema_ws_to_df(table_schema)
         .map_err(|e| BasinError::internal(format!("trgm knn empty schema: {e}")))?;
     let names: Vec<String> = match projection {
         Some(c) => c.clone(),
-        None => df_schema.fields().iter().map(|f| f.name().clone()).collect(),
+        None => df_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect(),
     };
     let fields = names
         .iter()
@@ -391,7 +379,10 @@ fn empty_result(
         })
         .collect::<Result<Vec<_>>>()?;
     let schema = Arc::new(Schema::new(
-        fields.iter().map(|f| f.as_ref().clone()).collect::<Vec<_>>(),
+        fields
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect::<Vec<_>>(),
     ));
     let cols = fields
         .iter()

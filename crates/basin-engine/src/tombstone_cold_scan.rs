@@ -128,15 +128,12 @@ impl datafusion::catalog::TableProvider for TombstoneColdTable {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Resolve the PK column index in the catalog schema.
-        let pk_idx_in_schema = self
-            .schema
-            .index_of(&self.pk_column)
-            .map_err(|_| {
-                DataFusionError::Plan(format!(
-                    "TombstoneColdTable: PK column '{}' not in schema for table '{}'",
-                    self.pk_column, self.table
-                ))
-            })?;
+        let pk_idx_in_schema = self.schema.index_of(&self.pk_column).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "TombstoneColdTable: PK column '{}' not in schema for table '{}'",
+                self.pk_column, self.table
+            ))
+        })?;
 
         // If the caller's projection omits the PK column, augment it so the
         // tombstone filter has the key bytes to compare. We then strip the
@@ -346,9 +343,7 @@ impl ExecutionPlan for TombstoneColdScanExec {
                 .await;
             match result {
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(DataFusionError::External(Box::new(e))))
-                        .await;
+                    let _ = tx.send(Err(DataFusionError::External(Box::new(e)))).await;
                 }
                 Ok(mut inner) => {
                     while let Some(item) = inner.next().await {
@@ -365,7 +360,10 @@ impl ExecutionPlan for TombstoneColdScanExec {
         });
 
         let stream = futures::stream::poll_fn(move |cx| rx.poll_recv(cx));
-        Ok(Box::pin(RecordBatchStreamAdapter::new(output_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
     }
 }
 
@@ -387,7 +385,13 @@ mod tests {
     fn tombstone_set(ids: &[i64]) -> Arc<HashSet<Vec<u8>>> {
         Arc::new(
             ids.iter()
-                .map(|v| RowKey::builder().append_i64(*v).finish().as_bytes().to_vec())
+                .map(|v| {
+                    RowKey::builder()
+                        .append_i64(*v)
+                        .finish()
+                        .as_bytes()
+                        .to_vec()
+                })
                 .collect(),
         )
     }
@@ -399,11 +403,7 @@ mod tests {
         let tombstones = tombstone_set(&[2, 4]);
         let out = filter_batch(&batch, "id", &DataType::Int64, &tombstones).unwrap();
         assert_eq!(out.num_rows(), 3);
-        let col = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(col.value(0), 1);
         assert_eq!(col.value(1), 3);
         assert_eq!(col.value(2), 5);

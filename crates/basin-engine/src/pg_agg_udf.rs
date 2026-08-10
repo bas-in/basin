@@ -619,9 +619,7 @@ impl AggregateUDFImpl for PgArrayAggUdaf {
 /// `ordering_fields` are named exactly like DataFusion's `ordering_fields`
 /// helper (`expr.to_string()`, nullable) so the emitted partial-state struct
 /// columns match the schema declared by the delegated `state_fields`.
-fn ordered_fast_path_fields(
-    args: &AccumulatorArgs,
-) -> Option<(Vec<FieldRef>, Vec<SortOptions>)> {
+fn ordered_fast_path_fields(args: &AccumulatorArgs) -> Option<(Vec<FieldRef>, Vec<SortOptions>)> {
     let field = &args.expr_fields[0];
     let ignore_nulls = args.ignore_nulls && field.is_nullable();
     if args.is_distinct || args.order_bys.is_empty() || ignore_nulls {
@@ -955,10 +953,7 @@ impl OrderedArrayAggGroupsAccumulator {
     /// a group has no rows.
     fn empty_orderings_list(&self, len: usize) -> DFResult<ArrayRef> {
         let struct_fields = Fields::from(self.ordering_fields.clone());
-        let field = Arc::new(Field::new_list_field(
-            DataType::Struct(struct_fields),
-            true,
-        ));
+        let field = Arc::new(Field::new_list_field(DataType::Struct(struct_fields), true));
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32; len + 1]));
         let empty_cols: Vec<ArrayRef> = self
             .ordering_fields
@@ -998,15 +993,15 @@ impl OrderedArrayAggGroupsAccumulator {
                 }
             }
         }
-        let values = self.interleave_chunk_col(&interleave_idx, &self.value_type, |k| {
-            &self.value_chunks[k]
-        })?;
+        let values = self
+            .interleave_chunk_col(&interleave_idx, &self.value_type, |k| &self.value_chunks[k])?;
         let mut ord_cols = Vec::with_capacity(self.sort_options.len());
         for j in 0..self.sort_options.len() {
-            let col =
-                self.interleave_chunk_col(&interleave_idx, self.ordering_fields[j].data_type(), |k| {
-                    &self.ordering_chunks[k][j]
-                })?;
+            let col = self.interleave_chunk_col(
+                &interleave_idx,
+                self.ordering_fields[j].data_type(),
+                |k| &self.ordering_chunks[k][j],
+            )?;
             ord_cols.push(col);
         }
         Ok((UInt32Array::from(group_ids), values, ord_cols))
@@ -1067,11 +1062,7 @@ impl GroupsAccumulator for OrderedArrayAggGroupsAccumulator {
         if entries.is_empty() {
             return Ok(());
         }
-        self.push_chunk(
-            Arc::clone(input),
-            values[1..1 + n_ord].to_vec(),
-            entries,
-        );
+        self.push_chunk(Arc::clone(input), values[1..1 + n_ord].to_vec(), entries);
         Ok(())
     }
 
@@ -1141,9 +1132,8 @@ impl GroupsAccumulator for OrderedArrayAggGroupsAccumulator {
         let (offsets, nulls) = build_list_offsets(&counts);
 
         // Values list column.
-        let values_flat = self.interleave_chunk_col(&interleave_idx, &self.value_type, |k| {
-            &self.value_chunks[k]
-        })?;
+        let values_flat = self
+            .interleave_chunk_col(&interleave_idx, &self.value_type, |k| &self.value_chunks[k])?;
         let vfield = Arc::new(Field::new_list_field(self.value_type.clone(), true));
         let values_list: ArrayRef = Arc::new(ListArray::new(
             vfield,
@@ -1168,12 +1158,12 @@ impl GroupsAccumulator for OrderedArrayAggGroupsAccumulator {
                 struct_cols.push(col);
             }
             let struct_fields = Fields::from(self.ordering_fields.clone());
-            let struct_arr: ArrayRef =
-                Arc::new(StructArray::try_new(struct_fields.clone(), struct_cols, None)?);
-            let sfield = Arc::new(Field::new_list_field(
-                DataType::Struct(struct_fields),
-                true,
-            ));
+            let struct_arr: ArrayRef = Arc::new(StructArray::try_new(
+                struct_fields.clone(),
+                struct_cols,
+                None,
+            )?);
+            let sfield = Arc::new(Field::new_list_field(DataType::Struct(struct_fields), true));
             Arc::new(ListArray::new(sfield, offsets, struct_arr, nulls))
         };
 
@@ -1224,8 +1214,7 @@ impl GroupsAccumulator for OrderedArrayAggGroupsAccumulator {
                     structs.len()
                 );
             }
-            let entries: Vec<(u32, u32)> =
-                (0..len as u32).map(|r| (group_idx as u32, r)).collect();
+            let entries: Vec<(u32, u32)> = (0..len as u32).map(|r| (group_idx as u32, r)).collect();
             self.push_chunk(vals, structs.columns().to_vec(), entries);
         }
         Ok(())
@@ -1283,10 +1272,8 @@ impl OrderedArrayAggGroupsAccumulator {
                 let old_orderings = std::mem::take(&mut self.ordering_chunks);
                 let old_entries = std::mem::take(&mut self.entries);
                 self.approx_bytes = 0;
-                for ((vals, ords), ents) in old_values
-                    .into_iter()
-                    .zip(old_orderings)
-                    .zip(old_entries)
+                for ((vals, ords), ents) in
+                    old_values.into_iter().zip(old_orderings).zip(old_entries)
                 {
                     let retained: Vec<(u32, u32)> = ents
                         .into_iter()
@@ -2164,7 +2151,10 @@ mod ordered_array_agg_tests {
     /// Extract per-group `Vec<ScalarValue>` (or `None` for a NULL group) from a
     /// `List<item>` result array.
     fn list_groups(arr: &ArrayRef) -> Vec<Option<Vec<ScalarValue>>> {
-        let list = arr.as_any().downcast_ref::<ListArray>().expect("List result");
+        let list = arr
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("List result");
         (0..list.len())
             .map(|i| {
                 if list.is_null(i) {
@@ -2221,10 +2211,15 @@ mod ordered_array_agg_tests {
         let o = opts(true, true);
         let mut acc = make_groups_acc(DataType::Utf8, o);
         // group 0: ("a",2) ("c",1) ; group 1: ("b",4) ("d",3)
-        let vals: ArrayRef =
-            Arc::new(ArrowStringArray::from(vec![Some("a"), Some("b"), Some("c"), Some("d")]));
+        let vals: ArrayRef = Arc::new(ArrowStringArray::from(vec![
+            Some("a"),
+            Some("b"),
+            Some("c"),
+            Some("d"),
+        ]));
         let keys: ArrayRef = Arc::new(Int64Array::from(vec![2i64, 4, 1, 3]));
-        acc.update_batch(&[vals, keys], &[0, 1, 0, 1], None, 2).unwrap();
+        acc.update_batch(&[vals, keys], &[0, 1, 0, 1], None, 2)
+            .unwrap();
         let out = acc.evaluate(EmitTo::All).unwrap();
         let got = list_groups(&out);
 
@@ -2240,7 +2235,11 @@ mod ordered_array_agg_tests {
             Arc::new(ArrowStringArray::from(vec![Some("b"), Some("d")])),
             Arc::new(Int64Array::from(vec![4i64, 3])),
         );
-        assert_eq!(got, vec![g0, g1], "grouped output must match per-group oracle");
+        assert_eq!(
+            got,
+            vec![g0, g1],
+            "grouped output must match per-group oracle"
+        );
     }
 
     /// NULL *values* are kept (PG semantics) and NULL sort keys honour
@@ -2250,8 +2249,7 @@ mod ordered_array_agg_tests {
         let o = opts(false, false); // ASC NULLS LAST
         let mut acc = make_groups_acc(DataType::Utf8, o);
         // single group 0: ("x",NULL) (NULL,1) ("y",2)
-        let vals: ArrayRef =
-            Arc::new(ArrowStringArray::from(vec![Some("x"), None, Some("y")]));
+        let vals: ArrayRef = Arc::new(ArrowStringArray::from(vec![Some("x"), None, Some("y")]));
         let keys: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(1i64), Some(2)]));
         acc.update_batch(&[Arc::clone(&vals), Arc::clone(&keys)], &[0, 0, 0], None, 1)
             .unwrap();
@@ -2260,7 +2258,11 @@ mod ordered_array_agg_tests {
         assert_eq!(got, vec![oracle]);
         // The NULL value must still be present in the aggregate.
         assert!(
-            got[0].as_ref().unwrap().iter().any(|s| matches!(s, ScalarValue::Utf8(None))),
+            got[0]
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|s| matches!(s, ScalarValue::Utf8(None))),
             "NULL value dropped — violates PG array_agg semantics"
         );
     }
@@ -2344,12 +2346,17 @@ mod ordered_array_agg_tests {
     #[test]
     fn groups_acc_state_merge_roundtrip() {
         let o = opts(true, true); // DESC
-        // Direct (single-phase) reference.
+                                  // Direct (single-phase) reference.
         let mut direct = make_groups_acc(DataType::Int64, o);
         let vals: ArrayRef = Arc::new(Int64Array::from(vec![5i64, 9, 1, 7]));
         let keys: ArrayRef = Arc::new(Int64Array::from(vec![5i64, 9, 1, 7]));
         direct
-            .update_batch(&[Arc::clone(&vals), Arc::clone(&keys)], &[0, 1, 0, 1], None, 2)
+            .update_batch(
+                &[Arc::clone(&vals), Arc::clone(&keys)],
+                &[0, 1, 0, 1],
+                None,
+                2,
+            )
             .unwrap();
         let direct_out = list_groups(&direct.evaluate(EmitTo::All).unwrap());
 
@@ -2361,12 +2368,13 @@ mod ordered_array_agg_tests {
         let state = partial.state(EmitTo::All).unwrap();
         assert_eq!(state.len(), 2, "state must be [List<item>, List<Struct>]");
         let mut final_acc = make_groups_acc(DataType::Int64, o);
-        final_acc
-            .merge_batch(&state, &[0, 1], None, 2)
-            .unwrap();
+        final_acc.merge_batch(&state, &[0, 1], None, 2).unwrap();
         let merged_out = list_groups(&final_acc.evaluate(EmitTo::All).unwrap());
 
-        assert_eq!(merged_out, direct_out, "two-phase result must match single-phase");
+        assert_eq!(
+            merged_out, direct_out,
+            "two-phase result must match single-phase"
+        );
     }
 
     /// `EmitTo::First(n)` emits the first n groups, renumbers the rest down by
@@ -3031,9 +3039,15 @@ impl LastAggUdaf {
 }
 
 impl AggregateUDFImpl for FirstAggUdaf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "first" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "first"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
 
     fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
         // Return type = type of the first (value) argument.
@@ -3043,13 +3057,26 @@ impl AggregateUDFImpl for FirstAggUdaf {
     fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<Arc<Field>>> {
         // State: two UTF-8 fields — best_value (JSON-encoded) and best_ts (i64 µs as string).
         Ok(vec![
-            Arc::new(Field::new(format!("{}_val",  args.name), DataType::Utf8, true)),
-            Arc::new(Field::new(format!("{}_ts",   args.name), DataType::Int64, true)),
+            Arc::new(Field::new(
+                format!("{}_val", args.name),
+                DataType::Utf8,
+                true,
+            )),
+            Arc::new(Field::new(
+                format!("{}_ts", args.name),
+                DataType::Int64,
+                true,
+            )),
         ])
     }
 
-    fn accumulator(&self, args: AccumulatorArgs) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
-        let value_type = args.expr_fields.first()
+    fn accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
+        let value_type = args
+            .expr_fields
+            .first()
             .map(|f| f.data_type().clone())
             .unwrap_or(DataType::Null);
         Ok(Box::new(FirstLastAccumulator {
@@ -3062,9 +3089,15 @@ impl AggregateUDFImpl for FirstAggUdaf {
 }
 
 impl AggregateUDFImpl for LastAggUdaf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "last" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "last"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
 
     fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
         Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
@@ -3072,13 +3105,26 @@ impl AggregateUDFImpl for LastAggUdaf {
 
     fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<Arc<Field>>> {
         Ok(vec![
-            Arc::new(Field::new(format!("{}_val",  args.name), DataType::Utf8, true)),
-            Arc::new(Field::new(format!("{}_ts",   args.name), DataType::Int64, true)),
+            Arc::new(Field::new(
+                format!("{}_val", args.name),
+                DataType::Utf8,
+                true,
+            )),
+            Arc::new(Field::new(
+                format!("{}_ts", args.name),
+                DataType::Int64,
+                true,
+            )),
         ])
     }
 
-    fn accumulator(&self, args: AccumulatorArgs) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
-        let value_type = args.expr_fields.first()
+    fn accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
+        let value_type = args
+            .expr_fields
+            .first()
             .map(|f| f.data_type().clone())
             .unwrap_or(DataType::Null);
         Ok(Box::new(FirstLastAccumulator {
@@ -3116,28 +3162,30 @@ impl FirstLastAccumulator {
     /// Returns None if the slot is null or the type is unsupported.
     fn extract_ts_us(arr: &dyn Array, i: usize) -> Option<i64> {
         use datafusion::arrow::array::*;
-        if arr.is_null(i) { return None; }
+        if arr.is_null(i) {
+            return None;
+        }
         match arr.data_type() {
-            DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                arr.as_any().downcast_ref::<TimestampMicrosecondArray>()
-                    .map(|a| a.value(i))
-            }
-            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                arr.as_any().downcast_ref::<TimestampNanosecondArray>()
-                    .map(|a| a.value(i) / 1_000)
-            }
-            DataType::Timestamp(TimeUnit::Millisecond, _) => {
-                arr.as_any().downcast_ref::<TimestampMillisecondArray>()
-                    .map(|a| a.value(i) * 1_000)
-            }
-            DataType::Timestamp(TimeUnit::Second, _) => {
-                arr.as_any().downcast_ref::<TimestampSecondArray>()
-                    .map(|a| a.value(i) * 1_000_000)
-            }
-            DataType::Int64 => {
-                arr.as_any().downcast_ref::<Int64Array>()
-                    .map(|a| a.value(i))
-            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => arr
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .map(|a| a.value(i)),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => arr
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .map(|a| a.value(i) / 1_000),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => arr
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .map(|a| a.value(i) * 1_000),
+            DataType::Timestamp(TimeUnit::Second, _) => arr
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .map(|a| a.value(i) * 1_000_000),
+            DataType::Int64 => arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|a| a.value(i)),
             _ => None,
         }
     }
@@ -3146,11 +3194,17 @@ impl FirstLastAccumulator {
     fn consider(&mut self, value: ScalarValue, ts_us: i64) {
         let is_better = match self.best_ts {
             None => true,
-            Some(cur) => if self.want_min { ts_us < cur } else { ts_us > cur },
+            Some(cur) => {
+                if self.want_min {
+                    ts_us < cur
+                } else {
+                    ts_us > cur
+                }
+            }
         };
         if is_better {
             self.best_value = Some(value);
-            self.best_ts    = Some(ts_us);
+            self.best_ts = Some(ts_us);
         }
     }
 }
@@ -3161,10 +3215,12 @@ impl datafusion::logical_expr::Accumulator for FirstLastAccumulator {
             return exec_err!("first/last requires 2 arguments (value, ts)");
         }
         let val_arr = &values[0];
-        let ts_arr  = &values[1];
+        let ts_arr = &values[1];
         for i in 0..val_arr.len() {
             // Ignore rows where ts is NULL (Timescale spec).
-            let Some(ts_us) = Self::extract_ts_us(ts_arr.as_ref(), i) else { continue; };
+            let Some(ts_us) = Self::extract_ts_us(ts_arr.as_ref(), i) else {
+                continue;
+            };
             let sv = ScalarValue::try_from_array(val_arr.as_ref(), i)?;
             self.consider(sv, ts_us);
         }
@@ -3174,14 +3230,12 @@ impl datafusion::logical_expr::Accumulator for FirstLastAccumulator {
     fn evaluate(&mut self) -> DFResult<ScalarValue> {
         Ok(match &self.best_value {
             Some(sv) => sv.clone(),
-            None => ScalarValue::try_from(&self.value_type)
-                .unwrap_or(ScalarValue::Null),
+            None => ScalarValue::try_from(&self.value_type).unwrap_or(ScalarValue::Null),
         })
     }
 
     fn size(&self) -> usize {
-        std::mem::size_of_val(self)
-            + self.best_value.as_ref().map(|sv| sv.size()).unwrap_or(0)
+        std::mem::size_of_val(self) + self.best_value.as_ref().map(|sv| sv.size()).unwrap_or(0)
     }
 
     fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
@@ -3205,12 +3259,14 @@ impl datafusion::logical_expr::Accumulator for FirstLastAccumulator {
             return Ok(());
         }
         let val_arr = states[0].as_any().downcast_ref::<StrArr>();
-        let ts_arr  = states[1].as_any().downcast_ref::<Int64Array>();
+        let ts_arr = states[1].as_any().downcast_ref::<Int64Array>();
         let (Some(val_arr), Some(ts_arr)) = (val_arr, ts_arr) else {
             return Ok(());
         };
         for i in 0..val_arr.len() {
-            if ts_arr.is_null(i) { continue; }
+            if ts_arr.is_null(i) {
+                continue;
+            }
             let ts_us = ts_arr.value(i);
             let sv = if val_arr.is_null(i) {
                 ScalarValue::try_from(&self.value_type).unwrap_or(ScalarValue::Null)
@@ -3233,21 +3289,27 @@ fn scalar_value_to_json_string(sv: &ScalarValue) -> String {
         ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
             serde_json::to_string(s).unwrap_or_else(|_| "null".to_string())
         }
-        ScalarValue::Boolean(Some(b)) => if *b { "true".to_string() } else { "false".to_string() },
-        ScalarValue::Int8(Some(v))   => v.to_string(),
-        ScalarValue::Int16(Some(v))  => v.to_string(),
-        ScalarValue::Int32(Some(v))  => v.to_string(),
-        ScalarValue::Int64(Some(v))  => v.to_string(),
-        ScalarValue::UInt8(Some(v))  => v.to_string(),
+        ScalarValue::Boolean(Some(b)) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        ScalarValue::Int8(Some(v)) => v.to_string(),
+        ScalarValue::Int16(Some(v)) => v.to_string(),
+        ScalarValue::Int32(Some(v)) => v.to_string(),
+        ScalarValue::Int64(Some(v)) => v.to_string(),
+        ScalarValue::UInt8(Some(v)) => v.to_string(),
         ScalarValue::UInt16(Some(v)) => v.to_string(),
         ScalarValue::UInt32(Some(v)) => v.to_string(),
         ScalarValue::UInt64(Some(v)) => v.to_string(),
         ScalarValue::Float32(Some(v)) => v.to_string(),
         ScalarValue::Float64(Some(v)) => v.to_string(),
         ScalarValue::TimestampMicrosecond(Some(v), _) => v.to_string(),
-        ScalarValue::TimestampNanosecond(Some(v), _)  => v.to_string(),
+        ScalarValue::TimestampNanosecond(Some(v), _) => v.to_string(),
         ScalarValue::TimestampMillisecond(Some(v), _) => v.to_string(),
-        ScalarValue::TimestampSecond(Some(v), _)      => v.to_string(),
+        ScalarValue::TimestampSecond(Some(v), _) => v.to_string(),
         _ => "null".to_string(),
     }
 }
@@ -3263,14 +3325,12 @@ fn json_to_scalar_value(s: &str, target_type: &DataType) -> ScalarValue {
                 .unwrap_or_else(|| s.to_owned());
             ScalarValue::Utf8(Some(inner))
         }
-        DataType::Boolean => {
-            ScalarValue::Boolean(Some(s == "true"))
-        }
-        DataType::Int8   => ScalarValue::Int8(s.parse().ok()),
-        DataType::Int16  => ScalarValue::Int16(s.parse().ok()),
-        DataType::Int32  => ScalarValue::Int32(s.parse().ok()),
-        DataType::Int64  => ScalarValue::Int64(s.parse().ok()),
-        DataType::UInt8  => ScalarValue::UInt8(s.parse().ok()),
+        DataType::Boolean => ScalarValue::Boolean(Some(s == "true")),
+        DataType::Int8 => ScalarValue::Int8(s.parse().ok()),
+        DataType::Int16 => ScalarValue::Int16(s.parse().ok()),
+        DataType::Int32 => ScalarValue::Int32(s.parse().ok()),
+        DataType::Int64 => ScalarValue::Int64(s.parse().ok()),
+        DataType::UInt8 => ScalarValue::UInt8(s.parse().ok()),
         DataType::UInt16 => ScalarValue::UInt16(s.parse().ok()),
         DataType::UInt32 => ScalarValue::UInt32(s.parse().ok()),
         DataType::UInt64 => ScalarValue::UInt64(s.parse().ok()),
@@ -3306,11 +3366,21 @@ mod first_last_tests {
     use std::sync::Arc;
 
     fn make_first_acc(value_type: DataType) -> FirstLastAccumulator {
-        FirstLastAccumulator { value_type, best_value: None, best_ts: None, want_min: true }
+        FirstLastAccumulator {
+            value_type,
+            best_value: None,
+            best_ts: None,
+            want_min: true,
+        }
     }
 
     fn make_last_acc(value_type: DataType) -> FirstLastAccumulator {
-        FirstLastAccumulator { value_type, best_value: None, best_ts: None, want_min: false }
+        FirstLastAccumulator {
+            value_type,
+            best_value: None,
+            best_ts: None,
+            want_min: false,
+        }
     }
 
     /// first() over {(v=10, ts=100), (v=20, ts=50)} → 20 (ts=50 is minimum).
@@ -3339,10 +3409,17 @@ mod first_last_tests {
         let mut acc = make_first_acc(DataType::Int32);
         let vals: ArrayRef = Arc::new(Int32Array::from(vec![Some(1i32), Some(2), Some(3)]));
         // Row 0 has NULL ts → should be ignored; min ts is row 1 (ts=10).
-        let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![None, Some(10i64), Some(20)]));
+        let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            None,
+            Some(10i64),
+            Some(20),
+        ]));
         acc.update_batch(&[vals, ts]).unwrap();
-        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int32(Some(2)),
-            "row with NULL ts must be ignored; first = value at ts=10");
+        assert_eq!(
+            acc.evaluate().unwrap(),
+            ScalarValue::Int32(Some(2)),
+            "row with NULL ts must be ignored; first = value at ts=10"
+        );
     }
 
     /// Empty group → NULL.
@@ -3372,8 +3449,11 @@ mod first_last_tests {
         // Both rows have the same ts; first in batch order (99) should win.
         let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![1000i64, 1000]));
         acc.update_batch(&[vals, ts]).unwrap();
-        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int32(Some(99)),
-            "tie: first arrival (index 0 = 99) must win");
+        assert_eq!(
+            acc.evaluate().unwrap(),
+            ScalarValue::Int32(Some(99)),
+            "tie: first arrival (index 0 = 99) must win"
+        );
     }
 
     /// State/merge round-trip for first().
@@ -3395,17 +3475,32 @@ mod first_last_tests {
 
         // Merge states.
         let val_state: ArrayRef = Arc::new(datafusion::arrow::array::StringArray::from(vec![
-            match &state1[0] { ScalarValue::Utf8(Some(s)) => s.as_str(), _ => "" },
-            match &state2[0] { ScalarValue::Utf8(Some(s)) => s.as_str(), _ => "" },
+            match &state1[0] {
+                ScalarValue::Utf8(Some(s)) => s.as_str(),
+                _ => "",
+            },
+            match &state2[0] {
+                ScalarValue::Utf8(Some(s)) => s.as_str(),
+                _ => "",
+            },
         ]));
         let ts_state: ArrayRef = Arc::new(datafusion::arrow::array::Int64Array::from(vec![
-            match &state1[1] { ScalarValue::Int64(Some(v)) => *v, _ => 0 },
-            match &state2[1] { ScalarValue::Int64(Some(v)) => *v, _ => 0 },
+            match &state1[1] {
+                ScalarValue::Int64(Some(v)) => *v,
+                _ => 0,
+            },
+            match &state2[1] {
+                ScalarValue::Int64(Some(v)) => *v,
+                _ => 0,
+            },
         ]));
         let mut merged = make_first_acc(DataType::Int32);
         merged.merge_batch(&[val_state, ts_state]).unwrap();
         // first() should pick v=7 (ts=100 is minimum).
-        assert_eq!(merged.evaluate().unwrap(), ScalarValue::Int32(Some(7)),
-            "merge: first should pick the value at minimum ts");
+        assert_eq!(
+            merged.evaluate().unwrap(),
+            ScalarValue::Int32(Some(7)),
+            "merge: first should pick the value at minimum ts"
+        );
     }
 }

@@ -302,7 +302,10 @@ pub enum ForwardRoute {
     Replay { home_region: String, token: String },
     /// `http-forward` mode: forward the statement to this peer base URL
     /// (`host:port`) over 6PN HTTP.
-    HttpPeer { home_region: String, base_url: String },
+    HttpPeer {
+        home_region: String,
+        base_url: String,
+    },
 }
 
 // ─── HTTP forward client seam ──────────────────────────────────────────────
@@ -413,9 +416,7 @@ impl ForwardClient for HttpForwardClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| {
-                BasinError::wal(format!("http-forward POST to {url:?} failed: {e}"))
-            })?;
+            .map_err(|e| BasinError::wal(format!("http-forward POST to {url:?} failed: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
             let detail = resp.text().await.unwrap_or_default();
@@ -424,7 +425,9 @@ impl ForwardClient for HttpForwardClient {
             )));
         }
         let wire: ForwardExecResult = resp.json().await.map_err(|e| {
-            BasinError::wal(format!("http-forward response from {url:?} is not a ForwardExecResult: {e}"))
+            BasinError::wal(format!(
+                "http-forward response from {url:?} is not a ForwardExecResult: {e}"
+            ))
         })?;
         wire.into_exec_result()
     }
@@ -755,10 +758,8 @@ impl PartitionForwardClient for HttpPartitionForwardClient {
                         url = %url, attempt, error = %e,
                         "partition-write POST transport error; retrying with a fresh connection"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        100u64 * attempt as u64,
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100u64 * attempt as u64))
+                        .await;
                     continue;
                 }
                 Err(e) => {
@@ -776,7 +777,9 @@ impl PartitionForwardClient for HttpPartitionForwardClient {
             )));
         }
         let text = resp.text().await.map_err(|e| {
-            BasinError::wal(format!("partition-write response from {url:?} unreadable: {e}"))
+            BasinError::wal(format!(
+                "partition-write response from {url:?} unreadable: {e}"
+            ))
         })?;
         parse_forward_write_response(&text).map_err(|e| {
             BasinError::wal(format!(
@@ -826,10 +829,8 @@ impl PartitionForwardClient for HttpPartitionForwardClient {
                         url = %url, attempt, error = %e,
                         "tail-drain POST transport error; retrying with a fresh connection"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        100u64 * attempt as u64,
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100u64 * attempt as u64))
+                        .await;
                     continue;
                 }
                 Err(e) => {
@@ -998,7 +999,9 @@ impl RegionWriteForwarder {
         // unchanged regardless of the secret.
         let client: Arc<dyn ForwardClient> = match mode {
             ForwardMode::HttpForward => match forward_secret_from_env() {
-                Some(secret) if !peers.is_empty() => Arc::new(HttpForwardClient::with_secret(secret)),
+                Some(secret) if !peers.is_empty() => {
+                    Arc::new(HttpForwardClient::with_secret(secret))
+                }
                 _ => Arc::new(UnconfiguredForwardClient),
             },
             _ => Arc::new(UnconfiguredForwardClient),
@@ -1133,10 +1136,8 @@ mod tests {
 
     #[test]
     fn peers_parse_and_resolve() {
-        let r = PeerRegistry::parse(
-            "fra@basin-fra.internal:5432, sin@basin-sin.internal:5432 ,",
-        )
-        .expect("parse");
+        let r = PeerRegistry::parse("fra@basin-fra.internal:5432, sin@basin-sin.internal:5432 ,")
+            .expect("parse");
         assert_eq!(r.len(), 2);
         assert_eq!(r.base_url("fra"), Some("basin-fra.internal:5432"));
         assert_eq!(r.base_url("sin"), Some("basin-sin.internal:5432"));
@@ -1184,7 +1185,10 @@ mod tests {
 
     #[test]
     fn route_http_forward_picks_peer() {
-        let f = fwd(ForwardMode::HttpForward, "fra@host-fra:5432,sin@host-sin:5432");
+        let f = fwd(
+            ForwardMode::HttpForward,
+            "fra@host-fra:5432,sin@host-sin:5432",
+        );
         let r = f.route(proj(), "sin", "jnb", "tok").expect("http route");
         assert_eq!(
             r,
@@ -1257,8 +1261,11 @@ mod tests {
                 current_user: &str,
                 sql: &str,
             ) -> Result<ExecResult> {
-                *self.seen.lock().unwrap() =
-                    Some((base_url.to_string(), current_user.to_string(), sql.to_string()));
+                *self.seen.lock().unwrap() = Some((
+                    base_url.to_string(),
+                    current_user.to_string(),
+                    sql.to_string(),
+                ));
                 Ok(ExecResult::Empty {
                     tag: "INSERT 0 1".into(),
                 })
@@ -1440,18 +1447,10 @@ mod tests {
                 assert_eq!(batches.len(), 1);
                 let b = &batches[0];
                 assert_eq!(b.num_rows(), 2);
-                let ids = b
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap();
+                let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
                 assert_eq!(ids.value(0), 1);
                 assert_eq!(ids.value(1), 42);
-                let names = b
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
+                let names = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
                 assert_eq!(names.value(0), "alice");
                 assert!(names.is_null(1));
             }

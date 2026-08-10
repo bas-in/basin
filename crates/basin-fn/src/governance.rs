@@ -425,10 +425,10 @@ impl FunctionGovernance {
         // LruCache requires a non-zero capacity. Floor at 1 so a malformed
         // env override doesn't panic; a cap of 1 just thrashes (acceptable
         // failure mode versus a process abort).
-        let sem_cap = NonZeroUsize::new(caps.project_semaphore_cap.max(1))
-            .expect("max(1) is non-zero");
-        let wasm_runtime = WasmRuntime::new(caps.worker_threads)
-            .expect("dedicated wasm runtime construction");
+        let sem_cap =
+            NonZeroUsize::new(caps.project_semaphore_cap.max(1)).expect("max(1) is non-zero");
+        let wasm_runtime =
+            WasmRuntime::new(caps.worker_threads).expect("dedicated wasm runtime construction");
         Arc::new(Self {
             engine,
             caps,
@@ -622,7 +622,10 @@ mod tests {
         let c = FunctionCaps::defaults();
         assert_eq!(c.cpu_ticks, DEFAULT_CPU_TICKS);
         assert_eq!(c.memory_max_bytes, DEFAULT_MEMORY_MAX_BYTES);
-        assert_eq!(c.wall_timeout, Duration::from_millis(DEFAULT_WALL_TIMEOUT_MS));
+        assert_eq!(
+            c.wall_timeout,
+            Duration::from_millis(DEFAULT_WALL_TIMEOUT_MS)
+        );
         assert_eq!(c.project_concurrency, DEFAULT_PROJECT_CONCURRENCY);
         assert_eq!(c.project_semaphore_cap, DEFAULT_PROJECT_SEMAPHORE_CAP);
         assert_eq!(c.worker_threads, DEFAULT_WORKER_THREADS);
@@ -633,12 +636,12 @@ mod tests {
         // Inject a synthetic env so we don't mutate process state (which is
         // `unsafe` under Rust 2024 and would trip `forbid(unsafe_code)`).
         let lookup = |k: &str| match k {
-            "BASIN_FN_CPU_TICKS"           => Some("7".to_string()),
-            "BASIN_FN_MEM_MB"              => Some("8".to_string()),
-            "BASIN_FN_WALL_MS"             => Some("1234".to_string()),
+            "BASIN_FN_CPU_TICKS" => Some("7".to_string()),
+            "BASIN_FN_MEM_MB" => Some("8".to_string()),
+            "BASIN_FN_WALL_MS" => Some("1234".to_string()),
             "BASIN_FN_PROJECT_CONCURRENCY" => Some("3".to_string()),
-            "BASIN_FN_PROJECT_SEM_CAP"     => Some("42".to_string()),
-            "BASIN_FN_WORKER_THREADS"      => Some("9".to_string()),
+            "BASIN_FN_PROJECT_SEM_CAP" => Some("42".to_string()),
+            "BASIN_FN_WORKER_THREADS" => Some("9".to_string()),
             _ => None,
         };
         let c = FunctionCaps::from_lookup(lookup);

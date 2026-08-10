@@ -223,7 +223,11 @@ async fn scale_10m_smoke() {
     // invariant `scale_invariants.rs` pins at 100k, two orders of magnitude up.
     let key = SCALE / 2 + 137;
     let (res, d, wall) = probe(format!("SELECT v FROM t WHERE id = {key}")).await;
-    assert_eq!(row_count(&res), 1, "point SELECT must return exactly the row");
+    assert_eq!(
+        row_count(&res),
+        1,
+        "point SELECT must return exactly the row"
+    );
     assert!(
         d.files_opened <= 2,
         "10M point SELECT opened {} files; design bound is <=2 (zone-map prune) — \

@@ -105,10 +105,9 @@ pub(crate) async fn resolve_subqueries_in_expr(sess: &ProjectSession, expr: Expr
             negated,
         } => {
             let sql = subquery.to_string();
-            let df =
-                sess.ctx.sql(&sql).await.map_err(|e| {
-                    crate::executor::map_df_plan_error("IN (SELECT …) – plan failed", &e)
-                })?;
+            let df = sess.ctx.sql(&sql).await.map_err(|e| {
+                crate::executor::map_df_plan_error("IN (SELECT …) – plan failed", &e)
+            })?;
             let df_batches = df.collect().await.map_err(|e| {
                 BasinError::internal(format!("IN (SELECT …) – execute failed: {e}"))
             })?;
@@ -167,10 +166,9 @@ pub(crate) async fn resolve_subqueries_in_expr(sess: &ProjectSession, expr: Expr
         // per-outer-row sub-execution and are deferred as a follow-up.
         Expr::Subquery(subquery) => {
             let sql = subquery.to_string();
-            let df =
-                sess.ctx.sql(&sql).await.map_err(|e| {
-                    crate::executor::map_df_plan_error("scalar subquery – plan failed", &e)
-                })?;
+            let df = sess.ctx.sql(&sql).await.map_err(|e| {
+                crate::executor::map_df_plan_error("scalar subquery – plan failed", &e)
+            })?;
             let df_batches = df.collect().await.map_err(|e| {
                 BasinError::internal(format!("scalar subquery – execute failed: {e}"))
             })?;
@@ -252,7 +250,9 @@ fn parse_sql_expr_fragment(fragment: &str) -> Result<Expr> {
     use sqlparser::parser::Parser;
     let probe = format!("SELECT {fragment}");
     let mut stmts = Parser::parse_sql(&PostgreSqlDialect {}, &probe).map_err(|e| {
-        BasinError::InvalidSchema(format!("could not parse RLS USING fragment {fragment:?}: {e}"))
+        BasinError::InvalidSchema(format!(
+            "could not parse RLS USING fragment {fragment:?}: {e}"
+        ))
     })?;
     let stmt = stmts.pop().ok_or_else(|| {
         BasinError::internal(format!("empty parse result for RLS fragment {fragment:?}"))
@@ -416,9 +416,7 @@ use crate::{ExecResult, ProjectSession};
 /// Implement the storage-layer `GinRegistry` trait for `GinIndexRegistry` so
 /// the `GinPostingListMaintainer` in `basin-storage` can drive maintenance
 /// without a compile-time dependency on `basin-engine` types.
-impl basin_storage::index::index_maint::GinRegistry
-    for crate::index_probe::GinIndexRegistry
-{
+impl basin_storage::index::index_maint::GinRegistry for crate::index_probe::GinIndexRegistry {
     fn remove_file(
         &self,
         project: &basin_common::ProjectId,
@@ -439,7 +437,13 @@ impl basin_storage::index::index_maint::GinRegistry
         new_file_path: &str,
     ) {
         crate::index_probe::GinIndexRegistry::rebuild_file_entries(
-            self, project, table, col, opclass, batches, new_file_path,
+            self,
+            project,
+            table,
+            col,
+            opclass,
+            batches,
+            new_file_path,
         );
     }
 }
@@ -491,11 +495,7 @@ impl basin_storage::index::index_maint::GinRegistry
 /// Any other shape (composite atoms, AND/OR, range comparisons, non-PK
 /// column references, function calls, sub-selects) yields `None` so the
 /// caller falls back to the existing copy-on-write rewrite.
-fn predicate_resolves_to_pk_list(
-    expr: &Expr,
-    pk_col: &str,
-    table_name: &str,
-) -> Option<Vec<Expr>> {
+fn predicate_resolves_to_pk_list(expr: &Expr, pk_col: &str, table_name: &str) -> Option<Vec<Expr>> {
     match expr {
         Expr::Nested(inner) => predicate_resolves_to_pk_list(inner, pk_col, table_name),
         Expr::BinaryOp {
@@ -624,10 +624,7 @@ pub(crate) fn hottier_fastpath_enabled(per_shape_key: &str) -> bool {
 ///     path (which merges the htap tail).
 ///
 /// Caller must already have checked `tx_is_active`.
-pub(crate) fn tx_fastpath_eligible_for_table(
-    sess: &ProjectSession,
-    table: &TableName,
-) -> bool {
+pub(crate) fn tx_fastpath_eligible_for_table(sess: &ProjectSession, table: &TableName) -> bool {
     if crate::session::tx_overlay_fastpath_blocked(&sess.state) {
         return false;
     }
@@ -1016,8 +1013,10 @@ async fn resolve_present_pk_keys(
     }
 
     // 2. Cold-tier fill for keys still unresolved (no overlay/memtable entry).
-    let missing: Vec<&basin_hottier::RowKey> =
-        order.iter().filter(|k| !live.contains_key(k.as_bytes())).collect();
+    let missing: Vec<&basin_hottier::RowKey> = order
+        .iter()
+        .filter(|k| !live.contains_key(k.as_bytes()))
+        .collect();
     if !missing.is_empty() {
         let pk_col = &meta.pk_columns[0];
         let pk_idx = schema.index_of(pk_col).map_err(|_| {
@@ -1033,8 +1032,7 @@ async fn resolve_present_pk_keys(
         let catalog_files = meta.live_data_files();
         let pruned_paths: Option<std::collections::HashSet<String>> = match probe_scalars.as_ref() {
             Some(scalars) => {
-                let mut paths: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
+                let mut paths: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for scalar in scalars {
                     if let crate::index_probe::PkProbeOutcome::Candidates { paths: cands, .. } =
                         crate::index_probe::pk_point_probe(
@@ -1062,7 +1060,9 @@ async fn resolve_present_pk_keys(
             missing.iter().map(|k| k.as_bytes().to_vec()).collect();
         let mut found_cold: HashSet<Vec<u8>> = HashSet::new();
 
-        let data_files = storage.list_data_files_with_stats(&sess.project, table).await?;
+        let data_files = storage
+            .list_data_files_with_stats(&sess.project, table)
+            .await?;
         let data_files = filter_to_live_data_files(sess, table, data_files).await?;
         'files: for f in &data_files {
             if found_cold.len() == missing_bytes.len() {
@@ -1089,9 +1089,11 @@ async fn resolve_present_pk_keys(
                 let batch = batch?;
                 let pk_array = batch.column(pk_idx);
                 for row in 0..batch.num_rows() {
-                    let Some(rk) =
-                        crate::hot_tombstone::array_value_to_row_key(pk_array.as_ref(), row, &pk_dt)
-                    else {
+                    let Some(rk) = crate::hot_tombstone::array_value_to_row_key(
+                        pk_array.as_ref(),
+                        row,
+                        &pk_dt,
+                    ) else {
                         continue;
                     };
                     let kb = rk.as_bytes().to_vec();
@@ -1196,8 +1198,7 @@ async fn capture_pre_images_for_keys(
         let catalog_files = meta.live_data_files();
         let pruned_paths: Option<std::collections::HashSet<String>> = match probe_scalars.as_ref() {
             Some(scalars) => {
-                let mut paths: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
+                let mut paths: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for scalar in scalars {
                     if let crate::index_probe::PkProbeOutcome::Candidates { paths: cands, .. } =
                         crate::index_probe::pk_point_probe(
@@ -1221,7 +1222,9 @@ async fn capture_pre_images_for_keys(
             _ => None,
         };
 
-        let data_files = storage.list_data_files_with_stats(&sess.project, table).await?;
+        let data_files = storage
+            .list_data_files_with_stats(&sess.project, table)
+            .await?;
         let data_files = filter_to_live_data_files(sess, table, data_files).await?;
         'files: for f in &data_files {
             if current.len() == want.len() {
@@ -1248,9 +1251,11 @@ async fn capture_pre_images_for_keys(
                 let batch = reattach_catalog_metadata(schema.as_ref(), batch?)?;
                 let pk_array = batch.column(pk_idx);
                 for row in 0..batch.num_rows() {
-                    let Some(rk) =
-                        crate::hot_tombstone::array_value_to_row_key(pk_array.as_ref(), row, &pk_dt)
-                    else {
+                    let Some(rk) = crate::hot_tombstone::array_value_to_row_key(
+                        pk_array.as_ref(),
+                        row,
+                        &pk_dt,
+                    ) else {
                         continue;
                     };
                     let kb = rk.as_bytes().to_vec();
@@ -1514,7 +1519,11 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
 
     let pred = match predicate_expr {
         None => None,
-        Some(e) => Some(parse_compound_predicate(e, schema.as_ref(), table.as_str())?),
+        Some(e) => Some(parse_compound_predicate(
+            e,
+            schema.as_ref(),
+            table.as_str(),
+        )?),
     };
 
     let audit_table = crate::types::audit_table_name(schema.as_ref()).map(|s| s.to_string());
@@ -1814,10 +1823,21 @@ pub(crate) async fn exec_delete(sess: &ProjectSession, delete: Delete) -> Result
                         use arrow_array::Array;
                         if let Ok(col_idx) = batch.schema().index_of(col) {
                             let col_arr = batch.column(col_idx);
-                            if let Some(arr) = col_arr.as_any().downcast_ref::<arrow_array::StringArray>() {
+                            if let Some(arr) =
+                                col_arr.as_any().downcast_ref::<arrow_array::StringArray>()
+                            {
                                 for row in 0..arr.len() {
-                                    if arr.is_null(row) { continue; }
-                                    ireg.index_row(&sess.project, &table, col, arr.value(row), &new_file.path, 0);
+                                    if arr.is_null(row) {
+                                        continue;
+                                    }
+                                    ireg.index_row(
+                                        &sess.project,
+                                        &table,
+                                        col,
+                                        arr.value(row),
+                                        &new_file.path,
+                                        0,
+                                    );
                                 }
                             }
                         }
@@ -2094,12 +2114,7 @@ fn rmw_rhs_is_fast_path_eligible(expr: &Expr, schema: &Schema) -> bool {
 /// `now()` / `random()` / `gen_random_uuid()` are NOT here (volatile);
 /// `upper()` etc. are omitted not because they're unsafe but because they
 /// aren't in the hot-shape benchmark battery and "when in doubt, exclude".
-const RMW_FN_ALLOWLIST: &[&str] = &[
-    "jsonb_set",
-    "jsonb_insert",
-    "jsonb_strip_nulls",
-    "coalesce",
-];
+const RMW_FN_ALLOWLIST: &[&str] = &["jsonb_set", "jsonb_insert", "jsonb_strip_nulls", "coalesce"];
 
 /// Return `true` when `f` is an allowlisted, Immutable, row-local function call
 /// (name in `RMW_FN_ALLOWLIST`) whose every positional argument is itself
@@ -2976,8 +2991,7 @@ async fn hot_tier_update_by_pk(
         let catalog_files = meta.live_data_files();
         let pruned_paths: Option<std::collections::HashSet<String>> = match probe_scalars.as_ref() {
             Some(scalars) => {
-                let mut paths: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
+                let mut paths: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for scalar in scalars {
                     match crate::index_probe::pk_point_probe(
                         pk_col,
@@ -2990,9 +3004,7 @@ async fn hot_tier_update_by_pk(
                             // assignment loop below will skip it as
                             // "PK matched no live row".
                         }
-                        crate::index_probe::PkProbeOutcome::Candidates {
-                            paths: cands, ..
-                        } => {
+                        crate::index_probe::PkProbeOutcome::Candidates { paths: cands, .. } => {
                             for p in cands {
                                 paths.insert(p.to_string());
                             }
@@ -3014,13 +3026,13 @@ async fn hot_tier_update_by_pk(
         // conjunction, so per-key equality cannot express an OR across keys.
         // The per-row PK match below remains the source of truth either way.
         let single_eq: Option<basin_storage::Predicate> = match probe_scalars.as_deref() {
-            Some([scalar]) => {
-                Some(basin_storage::Predicate::Eq(pk_col.clone(), scalar.clone()))
-            }
+            Some([scalar]) => Some(basin_storage::Predicate::Eq(pk_col.clone(), scalar.clone())),
             _ => None,
         };
 
-        let data_files = storage.list_data_files_with_stats(&sess.project, table).await?;
+        let data_files = storage
+            .list_data_files_with_stats(&sess.project, table)
+            .await?;
         // Defense-in-depth (#94/#95): drop any files the cold-path
         // lister returned that the catalog already considers removed.
         let data_files = filter_to_live_data_files(sess, table, data_files).await?;
@@ -3054,9 +3066,11 @@ async fn hot_tier_update_by_pk(
                 let batch = reattach_catalog_metadata(schema.as_ref(), batch?)?;
                 let pk_array = batch.column(pk_idx);
                 for row in 0..batch.num_rows() {
-                    let Some(rk) =
-                        crate::hot_tombstone::array_value_to_row_key(pk_array.as_ref(), row, &pk_dt)
-                    else {
+                    let Some(rk) = crate::hot_tombstone::array_value_to_row_key(
+                        pk_array.as_ref(),
+                        row,
+                        &pk_dt,
+                    ) else {
                         continue;
                     };
                     let kb = rk.as_bytes().to_vec();
@@ -3515,8 +3529,8 @@ fn pk_row_key_to_scalar(
 fn encode_single_row_ipc(batch: &RecordBatch) -> Vec<u8> {
     use arrow::ipc::writer::StreamWriter;
     let mut buf = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut buf, batch.schema_ref())
-        .expect("IPC StreamWriter init");
+    let mut writer =
+        StreamWriter::try_new(&mut buf, batch.schema_ref()).expect("IPC StreamWriter init");
     writer.write(batch).expect("IPC write");
     writer.finish().expect("IPC finish");
     buf
@@ -3785,7 +3799,11 @@ pub(crate) async fn exec_update(
 
     let pred = match &selection {
         None => None,
-        Some(e) => Some(parse_compound_predicate(e, schema.as_ref(), table.as_str())?),
+        Some(e) => Some(parse_compound_predicate(
+            e,
+            schema.as_ref(),
+            table.as_str(),
+        )?),
     };
 
     let audit_table = crate::types::audit_table_name(schema.as_ref()).map(|s| s.to_string());
@@ -3805,10 +3823,8 @@ pub(crate) async fn exec_update(
     // RETURNING takes the parallel branch and skips the per-row
     // before/after RowChange JSON that nothing would consume.
     let want_returning_rows = returning.is_some();
-    let capture_events = sinks_attached(sess)
-        || audit_table.is_some()
-        || has_generated_cols
-        || want_returning_rows;
+    let capture_events =
+        sinks_attached(sess) || audit_table.is_some() || has_generated_cols || want_returning_rows;
 
     // Walk files. Unlike DELETE, an AllMatch UPDATE still has to read the
     // file to apply SET to every row.
@@ -3874,8 +3890,7 @@ pub(crate) async fn exec_update(
                     }
                     updated_total += f.row_count as usize;
                     replaced_paths.push(f.path.as_ref().to_string());
-                    replacement_groups
-                        .push((f.path.as_ref().to_string(), new_batches.clone()));
+                    replacement_groups.push((f.path.as_ref().to_string(), new_batches.clone()));
                     capture_update_events(&befores, &new_batches, None, &mut event_payloads)?;
                     if want_returning_rows {
                         // AllMatch: every row matches; the unfiltered
@@ -3927,8 +3942,7 @@ pub(crate) async fn exec_update(
                     }
                     updated_total += rows_matched;
                     replaced_paths.push(f.path.as_ref().to_string());
-                    replacement_groups
-                        .push((f.path.as_ref().to_string(), new_batches.clone()));
+                    replacement_groups.push((f.path.as_ref().to_string(), new_batches.clone()));
                     capture_update_events(
                         &befores,
                         &new_batches,
@@ -4206,10 +4220,21 @@ pub(crate) async fn exec_update(
                         use arrow_array::Array;
                         if let Ok(col_idx) = batch.schema().index_of(col) {
                             let col_arr = batch.column(col_idx);
-                            if let Some(arr) = col_arr.as_any().downcast_ref::<arrow_array::StringArray>() {
+                            if let Some(arr) =
+                                col_arr.as_any().downcast_ref::<arrow_array::StringArray>()
+                            {
                                 for row in 0..arr.len() {
-                                    if arr.is_null(row) { continue; }
-                                    ireg.index_row(&sess.project, &table, col, arr.value(row), &new_file.path, 0);
+                                    if arr.is_null(row) {
+                                        continue;
+                                    }
+                                    ireg.index_row(
+                                        &sess.project,
+                                        &table,
+                                        col,
+                                        arr.value(row),
+                                        &new_file.path,
+                                        0,
+                                    );
                                 }
                             }
                         }
@@ -4645,18 +4670,25 @@ async fn exec_update_from(
         // type match. `cast` is the same coercion the single-table write path
         // relies on (via `apply_assignments`) to land catalog-typed rows.
         // Under `capture_events` columns N+1..=2N carry the OLD target row.
-        let expected_cols = if capture_events { 2 * ncols + 1 } else { ncols + 1 };
+        let expected_cols = if capture_events {
+            2 * ncols + 1
+        } else {
+            ncols + 1
+        };
         if batch.num_columns() != expected_cols {
             return Err(BasinError::internal(format!(
                 "UPDATE … FROM: join projected {} columns, expected {} (pk + {} target cols{})",
                 batch.num_columns(),
                 expected_cols,
                 ncols,
-                if capture_events { " + N pre-image cols" } else { "" }
+                if capture_events {
+                    " + N pre-image cols"
+                } else {
+                    ""
+                }
             )));
         }
-        let mut post_cols: Vec<arrow_array::ArrayRef> =
-            Vec::with_capacity(schema.fields().len());
+        let mut post_cols: Vec<arrow_array::ArrayRef> = Vec::with_capacity(schema.fields().len());
         for (idx, field) in schema.fields().iter().enumerate() {
             let col = batch.column(idx + 1);
             let coerced = if col.data_type() == field.data_type() {
@@ -4726,9 +4758,7 @@ async fn exec_update_from(
             // a later duplicate PK row carries the same pre-image, so last-wins
             // would be identical — `or_insert` is just cheaper.
             if let Some(ref pb) = pre_batch {
-                pre_by_key
-                    .entry(kb)
-                    .or_insert_with(|| pb.slice(row, 1));
+                pre_by_key.entry(kb).or_insert_with(|| pb.slice(row, 1));
             }
         }
     }
@@ -5014,10 +5044,7 @@ async fn exec_delete_via_df_rowset(
         .list_data_files_with_stats(&sess.project, table)
         .await?;
     let live_files = filter_to_live_data_files(sess, table, listed_files).await?;
-    let total_rows_before: usize = live_files
-        .iter()
-        .map(|f| f.row_count as usize)
-        .sum();
+    let total_rows_before: usize = live_files.iter().map(|f| f.row_count as usize).sum();
 
     if total_rows_before == 0 {
         return Ok(ExecResult::Empty {
@@ -6139,11 +6166,7 @@ pub(crate) async fn materialize_overlay_for_table(
         return Ok(());
     }
 
-    let meta = engine
-        .config()
-        .catalog
-        .load_table(&project, table)
-        .await?;
+    let meta = engine.config().catalog.load_table(&project, table).await?;
     // The overlay is only ever written for single-PK tables; defensively skip
     // (and clear) otherwise so we never wedge.
     if meta.pk_columns.len() != 1 {
@@ -6173,8 +6196,13 @@ pub(crate) async fn materialize_overlay_for_table(
         .map(|v| v.as_slice())
         .chain(updates.keys().map(|v| v.as_slice()))
         .collect();
-    let narrowed_paths: Option<std::collections::HashSet<String>> =
-        narrow_materialize_files(&overlay_keys, &pk_col, &pk_dt, &live_all, meta.schema.as_ref());
+    let narrowed_paths: Option<std::collections::HashSet<String>> = narrow_materialize_files(
+        &overlay_keys,
+        &pk_col,
+        &pk_dt,
+        &live_all,
+        meta.schema.as_ref(),
+    );
     let live: Vec<DataFileRef> = match &narrowed_paths {
         Some(allow) => live_all
             .iter()
@@ -6556,9 +6584,7 @@ fn narrow_materialize_files(
         scalars.push(s);
     }
     match crate::index_probe::pk_point_probe_multi(pk_col, &scalars, live_files, schema) {
-        crate::index_probe::PkProbeOutcome::Absent { .. } => {
-            Some(std::collections::HashSet::new())
-        }
+        crate::index_probe::PkProbeOutcome::Absent { .. } => Some(std::collections::HashSet::new()),
         crate::index_probe::PkProbeOutcome::Candidates { paths, .. } => {
             Some(paths.into_iter().map(|p| p.to_string()).collect())
         }
@@ -6590,11 +6616,8 @@ async fn filter_to_live_data_files(
         .catalog
         .load_table(&sess.project, table)
         .await?;
-    let live: std::collections::HashSet<String> = meta
-        .live_data_files()
-        .into_iter()
-        .map(|f| f.path)
-        .collect();
+    let live: std::collections::HashSet<String> =
+        meta.live_data_files().into_iter().map(|f| f.path).collect();
     Ok(listed
         .into_iter()
         .filter(|f| live.contains(f.path.as_ref()))
@@ -6766,10 +6789,7 @@ async fn maintain_btree_secondary_on_replace(
             let n = batches
                 .iter()
                 .map(|b| {
-                    crate::hot_tombstone::normalize_batch_to_schema(
-                        b.clone(),
-                        meta.schema.as_ref(),
-                    )
+                    crate::hot_tombstone::normalize_batch_to_schema(b.clone(), meta.schema.as_ref())
                 })
                 .collect();
             (path.clone(), n)
@@ -6779,8 +6799,7 @@ async fn maintain_btree_secondary_on_replace(
         if !registry.is_loaded(&sess.project, table, col) {
             // Pull the persisted sidecar into RAM first — maintenance must
             // apply to the FULL index, never seed a partial one.
-            crate::secondary_index::load_index(registry, storage, &sess.project, table, col)
-                .await;
+            crate::secondary_index::load_index(registry, storage, &sess.project, table, col).await;
             if !registry.is_loaded(&sess.project, table, col) {
                 continue;
             }
@@ -6837,11 +6856,7 @@ async fn write_replacement_engine(
     // row-group size) on the rewrite path too; otherwise the
     // copy-on-write replacement file would silently lose the table's
     // configured pruning aids.
-    let meta = engine
-        .config()
-        .catalog
-        .load_table(&project, table)
-        .await?;
+    let meta = engine.config().catalog.load_table(&project, table).await?;
     // ADR 0027 Phase 4: extend the replacement schema + batches with promoted
     // shadow column(s) so the rewritten file carries them (see
     // `extend_replacement_with_shadow_cols`). No-op when nothing is promoted.
@@ -7009,9 +7024,7 @@ async fn write_replacement_per_file(
                 // `events.payload` concat failure at scale ≥10k.
                 let batches: Vec<RecordBatch> = batches
                     .into_iter()
-                    .map(|b| {
-                        crate::hot_tombstone::normalize_batch_to_schema(b, schema.as_ref())
-                    })
+                    .map(|b| crate::hot_tombstone::normalize_batch_to_schema(b, schema.as_ref()))
                     .collect();
                 let merged = if batches.len() == 1 {
                     batches.into_iter().next().unwrap()
@@ -7191,13 +7204,9 @@ async fn delete_objects_engine(
     for p in paths {
         all_paths.push(object_store::path::Path::from(p.as_str()));
         for column in &vector_columns {
-            if let Some(sidecar) = vector_index_segment_key_for_data_file(
-                root.as_ref(),
-                &project,
-                table,
-                column,
-                p,
-            ) {
+            if let Some(sidecar) =
+                vector_index_segment_key_for_data_file(root.as_ref(), &project, table, column, p)
+            {
                 sidecars.push(sidecar);
             }
         }
@@ -7237,8 +7246,9 @@ async fn delete_objects_engine(
                     return;
                 }
             };
-        let (still_live, deletable): (Vec<ObjectPath>, Vec<ObjectPath>) =
-            all_paths.into_iter().partition(|p| live.contains(p.as_ref()));
+        let (still_live, deletable): (Vec<ObjectPath>, Vec<ObjectPath>) = all_paths
+            .into_iter()
+            .partition(|p| live.contains(p.as_ref()));
         if !still_live.is_empty() {
             tracing::error!(
                 target: "basin_engine",
@@ -9262,8 +9272,7 @@ mod tests {
     fn scalar_from_array_large_utf8_quote_escaped() {
         use arrow_array::LargeStringArray;
         let arr = LargeStringArray::from(vec!["O'Brien"]);
-        let lit =
-            scalar_from_array(&arr, 0, &DataType::LargeUtf8).expect("LargeUtf8 must succeed");
+        let lit = scalar_from_array(&arr, 0, &DataType::LargeUtf8).expect("LargeUtf8 must succeed");
         assert_eq!(lit, "'O''Brien'", "single-quote must be doubled: {lit}");
     }
 
@@ -9274,7 +9283,10 @@ mod tests {
         // Day 0 = 1970-01-01; day 1 = 1970-01-02.
         let arr = Date32Array::from(vec![1i32]);
         let lit = scalar_from_array(&arr, 0, &DataType::Date32).expect("Date32 must succeed");
-        assert_eq!(lit, "'1970-01-02'", "Date32 must render as quoted ISO date: {lit}");
+        assert_eq!(
+            lit, "'1970-01-02'",
+            "Date32 must render as quoted ISO date: {lit}"
+        );
     }
 
     /// A Binary PK renders as a PostgreSQL hex-escape bytea literal.
@@ -9283,7 +9295,10 @@ mod tests {
         use arrow_array::BinaryArray;
         let arr = BinaryArray::from(vec![b"\xde\xad\xbe\xef".as_slice()]);
         let lit = scalar_from_array(&arr, 0, &DataType::Binary).expect("Binary must succeed");
-        assert_eq!(lit, "'\\xdeadbeef'", "Binary must render as hex-escaped literal: {lit}");
+        assert_eq!(
+            lit, "'\\xdeadbeef'",
+            "Binary must render as hex-escaped literal: {lit}"
+        );
     }
 
     /// A NULL value renders as `NULL` regardless of type.
@@ -9408,8 +9423,8 @@ mod tests {
                 span: sqlparser::tokenizer::Span::empty(),
             })),
         };
-        let pred = parse_compound_predicate(&expr, &schema, "users")
-            .expect("qualified eq must parse");
+        let pred =
+            parse_compound_predicate(&expr, &schema, "users").expect("qualified eq must parse");
         match pred {
             CompoundPredicate::Atom(Predicate::Eq(col, _)) => assert_eq!(col, "id"),
             other => panic!("expected Atom(Eq(…)), got {other:?}"),
@@ -9576,8 +9591,8 @@ mod tests {
             list: vec![num_expr("1"), num_expr("2")],
             negated: false,
         };
-        let got = predicate_resolves_to_pk_list(&e, "id", "users")
-            .expect("qualified IN must resolve");
+        let got =
+            predicate_resolves_to_pk_list(&e, "id", "users").expect("qualified IN must resolve");
         assert_eq!(got.len(), 2);
     }
 
@@ -9749,7 +9764,10 @@ mod tests {
         use basin_storage::ScalarValue;
         let overflowed: i64 = i64::from(i32::MAX) + 1;
         let k = pk_scalar_to_row_key(&ScalarValue::Int64(overflowed), &DataType::Int32);
-        assert!(k.is_none(), "Int32 narrowing must reject overflowed literal");
+        assert!(
+            k.is_none(),
+            "Int32 narrowing must reject overflowed literal"
+        );
     }
 
     /// Utf8 PK → null-terminated bytes (matches cold sort).
@@ -9788,9 +9806,9 @@ mod tests {
         use sqlparser::parser::Parser;
         let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
         match stmts.into_iter().next().unwrap() {
-            sqlparser::ast::Statement::Update(sqlparser::ast::Update {
-                assignments, ..
-            }) => assignments,
+            sqlparser::ast::Statement::Update(sqlparser::ast::Update { assignments, .. }) => {
+                assignments
+            }
             other => panic!("expected UPDATE, got {other:?}"),
         }
     }
@@ -9830,8 +9848,7 @@ mod tests {
         // The prepared-statement layer substitutes $1 -> 5 before SQL reaches
         // dml_mutate, so the parser sees `balance - 5` (a BinaryOp with a
         // column on the left). This pins that shape to the Expr path.
-        let asgs =
-            parse_set_assignments("UPDATE accounts SET balance = balance - 5 WHERE id = 1");
+        let asgs = parse_set_assignments("UPDATE accounts SET balance = balance - 5 WHERE id = 1");
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("balance", DataType::Int64, false),
@@ -9853,9 +9870,7 @@ mod tests {
     /// `NOW()`) falls through to Expr where DataFusion evaluates it.
     #[test]
     fn parse_assignments_now_function_uses_expr_path() {
-        let asgs = parse_set_assignments(
-            "UPDATE rows SET updated_at = NOW() WHERE id = 1",
-        );
+        let asgs = parse_set_assignments("UPDATE rows SET updated_at = NOW() WHERE id = 1");
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new(
@@ -9899,9 +9914,8 @@ mod tests {
     /// references. Same routing target as the rest.
     #[test]
     fn parse_assignments_coalesce_uses_expr_path() {
-        let asgs = parse_set_assignments(
-            "UPDATE t SET name = COALESCE(nickname, name) WHERE id = 1",
-        );
+        let asgs =
+            parse_set_assignments("UPDATE t SET name = COALESCE(nickname, name) WHERE id = 1");
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("nickname", DataType::Utf8, true),
@@ -10130,7 +10144,10 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("auth"), "must name offending schema: {msg}");
         assert!(msg.contains("public"), "must mention 'public': {msg}");
-        assert!(msg.contains("search_path"), "must mention search_path: {msg}");
+        assert!(
+            msg.contains("search_path"),
+            "must mention search_path: {msg}"
+        );
     }
 
     /// `DELETE FROM "auth"."t" WHERE id = 1` — same as above.
@@ -10141,7 +10158,10 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("auth"), "must name offending schema: {msg}");
         assert!(msg.contains("public"), "must mention 'public': {msg}");
-        assert!(msg.contains("search_path"), "must mention search_path: {msg}");
+        assert!(
+            msg.contains("search_path"),
+            "must mention search_path: {msg}"
+        );
     }
 
     // ── narrow_materialize_files (row-targeted UPDATE rewrite) ────────────────
@@ -10226,7 +10246,10 @@ mod tests {
         assert_eq!(out.len(), 2, "two files should match: {out:?}");
         assert!(out.contains("a.parquet"), "expected a.parquet in {out:?}");
         assert!(out.contains("c.parquet"), "expected c.parquet in {out:?}");
-        assert!(!out.contains("b.parquet"), "b.parquet should be pruned in {out:?}");
+        assert!(
+            !out.contains("b.parquet"),
+            "b.parquet should be pruned in {out:?}"
+        );
     }
 
     /// An overlay row whose PK is outside the zone-map range of every live
@@ -10293,23 +10316,15 @@ mod tests {
     fn materialize_narrowing_composite_pk_works() {
         // Use a Decimal PK type — pk_row_key_to_scalar returns None for it,
         // so the narrowing helper must return None (fall back to full set).
-        let schema = arrow_schema::Schema::new(vec![Field::new(
-            "id",
-            DataType::Decimal128(10, 0),
-            false,
-        )]);
+        let schema =
+            arrow_schema::Schema::new(vec![Field::new("id", DataType::Decimal128(10, 0), false)]);
         let files = vec![i64_pk_file_ref("a.parquet", 0, 999)];
         // The key bytes don't matter — decoding will reject the type before
         // the probe even runs.
         let key = vec![0u8; 8];
         let keys: Vec<&[u8]> = vec![key.as_slice()];
-        let out = narrow_materialize_files(
-            &keys,
-            "id",
-            &DataType::Decimal128(10, 0),
-            &files,
-            &schema,
-        );
+        let out =
+            narrow_materialize_files(&keys, "id", &DataType::Decimal128(10, 0), &files, &schema);
         assert!(
             out.is_none(),
             "unsupported PK type must fall back to full set (None): got {out:?}"
@@ -10511,7 +10526,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(matched, 1, "physical read must surface the one matching row");
+        assert_eq!(
+            matched, 1,
+            "physical read must surface the one matching row"
+        );
 
         // 4096 rows / 512-row groups = 8 row-groups; the point key lives in
         // one, so a PK-sorted file lets the reader prune the other 7 by stats.

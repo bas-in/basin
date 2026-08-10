@@ -299,8 +299,7 @@ pub fn parse_txt_response(msg: &[u8]) -> String {
             break;
         }
         let rtype = u16::from_be_bytes([msg[after_name], msg[after_name + 1]]);
-        let rdlength =
-            u16::from_be_bytes([msg[after_name + 8], msg[after_name + 9]]) as usize;
+        let rdlength = u16::from_be_bytes([msg[after_name + 8], msg[after_name + 9]]) as usize;
         let rdata_start = after_name + 10;
         let rdata_end = rdata_start + rdlength;
         if rdata_end > msg.len() {
@@ -468,18 +467,10 @@ mod tests {
 
     #[test]
     fn peer_urls_sorted_and_order_independent() {
-        let a = peer_urls_from_machine_ids(
-            &["m3".into(), "m1".into(), "m2".into()],
-            "app",
-            5434,
-            None,
-        );
-        let b = peer_urls_from_machine_ids(
-            &["m2".into(), "m3".into(), "m1".into()],
-            "app",
-            5434,
-            None,
-        );
+        let a =
+            peer_urls_from_machine_ids(&["m3".into(), "m1".into(), "m2".into()], "app", 5434, None);
+        let b =
+            peer_urls_from_machine_ids(&["m2".into(), "m3".into(), "m1".into()], "app", 5434, None);
         assert_eq!(a, b, "sorted list must be order-independent");
         assert_eq!(
             a,
@@ -494,12 +485,7 @@ mod tests {
     #[test]
     fn self_machine_id_always_present_and_deduped() {
         // self already in the discovered set → no duplicate.
-        let urls = peer_urls_from_machine_ids(
-            &["m1".into(), "m2".into()],
-            "app",
-            5434,
-            Some("m1"),
-        );
+        let urls = peer_urls_from_machine_ids(&["m1".into(), "m2".into()], "app", 5434, Some("m1"));
         assert_eq!(urls.len(), 2);
         // self NOT in the discovered set → appended.
         let urls = peer_urls_from_machine_ids(&["m2".into()], "app", 5434, Some("m1"));
@@ -516,18 +502,10 @@ mod tests {
     fn fnv1a_owner_mapping_identical_across_input_orders() {
         // Two routers built from the same machine set discovered in different
         // orders must resolve identical owners (the sort is what guarantees it).
-        let set_a = peer_urls_from_machine_ids(
-            &["mc".into(), "ma".into(), "mb".into()],
-            "app",
-            5434,
-            None,
-        );
-        let set_b = peer_urls_from_machine_ids(
-            &["mb".into(), "mc".into(), "ma".into()],
-            "app",
-            5434,
-            None,
-        );
+        let set_a =
+            peer_urls_from_machine_ids(&["mc".into(), "ma".into(), "mb".into()], "app", 5434, None);
+        let set_b =
+            peer_urls_from_machine_ids(&["mb".into(), "mc".into(), "ma".into()], "app", 5434, None);
         let ra = PartitionRouter::new(set_a, "http://ma.vm.app.internal:5434");
         let rb = PartitionRouter::new(set_b, "http://mb.vm.app.internal:5434");
         let p = ProjectId::from_ulid(ulid::Ulid(0xdead_beef));
@@ -566,7 +544,7 @@ mod tests {
         assert_eq!(&q[0..2], &[0x12, 0x34]); // ID
         assert_eq!(&q[2..4], &[0x01, 0x00]); // flags RD
         assert_eq!(&q[4..6], &[0x00, 0x01]); // QDCOUNT=1
-        // QNAME labels: 3"vms" 3"app" 8"internal" 0
+                                             // QNAME labels: 3"vms" 3"app" 8"internal" 0
         let qname = &q[12..];
         assert_eq!(qname[0], 3);
         assert_eq!(&qname[1..4], b"vms");
@@ -648,12 +626,8 @@ mod tests {
         // Scaling from 2 → 3 nodes must reassign at least some partition to the
         // new node (proves the router reflects the new set).
         let two = peer_urls_from_machine_ids(&["ma".into(), "mb".into()], "app", 5434, None);
-        let three = peer_urls_from_machine_ids(
-            &["ma".into(), "mb".into(), "mc".into()],
-            "app",
-            5434,
-            None,
-        );
+        let three =
+            peer_urls_from_machine_ids(&["ma".into(), "mb".into(), "mc".into()], "app", 5434, None);
         assert!(peer_set_changed(&two, &three));
         let r3 = PartitionRouter::new(three, "http://mc.vm.app.internal:5434");
         let mut mc_owns = 0;

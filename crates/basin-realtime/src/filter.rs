@@ -140,20 +140,14 @@ fn eval_expr(expr: &Expr, event: &ChangeEvent) -> Result<Lit, String> {
             eval_binary(op, &l, &r)
         }
         Expr::IsNull(inner) => Ok(Lit::Bool(matches!(eval_expr(inner, event)?, Lit::Null))),
-        Expr::IsNotNull(inner) => {
-            Ok(Lit::Bool(!matches!(eval_expr(inner, event)?, Lit::Null)))
-        }
+        Expr::IsNotNull(inner) => Ok(Lit::Bool(!matches!(eval_expr(inner, event)?, Lit::Null))),
         Expr::IsTrue(inner) => Ok(Lit::Bool(truthy(&eval_expr(inner, event)?))),
         Expr::IsFalse(inner) => Ok(Lit::Bool(!truthy(&eval_expr(inner, event)?))),
         other => Err(format!("unsupported expression: {other}")),
     }
 }
 
-fn eval_binary(
-    op: &sqlparser::ast::BinaryOperator,
-    l: &Lit,
-    r: &Lit,
-) -> Result<Lit, String> {
+fn eval_binary(op: &sqlparser::ast::BinaryOperator, l: &Lit, r: &Lit) -> Result<Lit, String> {
     use sqlparser::ast::BinaryOperator::*;
     match op {
         And => Ok(Lit::Bool(truthy(l) && truthy(r))),
@@ -191,9 +185,7 @@ fn cmp_ord(l: &Lit, r: &Lit) -> Result<std::cmp::Ordering, String> {
     match (l, r) {
         (Lit::Null, _) | (_, Lit::Null) => Err("ordering comparison against NULL".into()),
         (Lit::Int(a), Lit::Int(b)) => Ok(a.cmp(b)),
-        (Lit::Float(a), Lit::Float(b)) => {
-            a.partial_cmp(b).ok_or_else(|| "NaN compare".into())
-        }
+        (Lit::Float(a), Lit::Float(b)) => a.partial_cmp(b).ok_or_else(|| "NaN compare".into()),
         (Lit::Int(a), Lit::Float(b)) => (*a as f64)
             .partial_cmp(b)
             .ok_or_else(|| "NaN compare".into()),
@@ -319,7 +311,10 @@ mod tests {
     fn paid_status_filter_rejects_non_matching_event() {
         let f = Filter::new("NEW.status = 'paid'").unwrap();
         let event = make_event(json!({"status": "pending", "amount": 99}));
-        assert!(!f.matches(&event).unwrap(), "pending order must not pass filter");
+        assert!(
+            !f.matches(&event).unwrap(),
+            "pending order must not pass filter"
+        );
     }
 
     // ---- numeric comparison -----------------------------------------------

@@ -62,11 +62,11 @@ fn chunks_schema() -> Arc<Schema> {
 
 fn hypertables_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("hypertable_name",     DataType::Utf8,  false),
-        Field::new("hypertable_schema",   DataType::Utf8,  false),
-        Field::new("num_chunks",          DataType::Int64, false),
+        Field::new("hypertable_name", DataType::Utf8, false),
+        Field::new("hypertable_schema", DataType::Utf8, false),
+        Field::new("num_chunks", DataType::Int64, false),
         Field::new("chunk_interval_secs", DataType::Int64, false),
-        Field::new("retention_secs",      DataType::Int64, false),
+        Field::new("retention_secs", DataType::Int64, false),
     ]))
 }
 
@@ -91,9 +91,7 @@ impl ChunksProvider {
     }
 
     /// Build the record batch by querying the registry.
-    async fn build_batch(
-        &self,
-    ) -> DfResult<datafusion::arrow::record_batch::RecordBatch> {
+    async fn build_batch(&self) -> DfResult<datafusion::arrow::record_batch::RecordBatch> {
         let rows = self.registry.snapshot_all_chunks(&self.project).await;
 
         let mut ht_names: Vec<String> = Vec::with_capacity(rows.len());
@@ -149,11 +147,8 @@ impl TableProvider for ChunksProvider {
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let batch = self.build_batch().await?;
         let batches = vec![vec![batch]];
-        let exec = MemorySourceConfig::try_new_exec(
-            &batches,
-            self.schema.clone(),
-            projection.cloned(),
-        )?;
+        let exec =
+            MemorySourceConfig::try_new_exec(&batches, self.schema.clone(), projection.cloned())?;
         Ok(exec)
     }
 }
@@ -182,11 +177,11 @@ impl HypertablesProvider {
     async fn build_batch(&self) -> DfResult<datafusion::arrow::record_batch::RecordBatch> {
         let rows = self.registry.snapshot_hypertables(&self.project).await;
 
-        let mut names:           Vec<String> = Vec::with_capacity(rows.len());
-        let mut schemas:         Vec<String> = Vec::with_capacity(rows.len());
-        let mut num_chunks:      Vec<i64>    = Vec::with_capacity(rows.len());
-        let mut interval_secs:   Vec<i64>    = Vec::with_capacity(rows.len());
-        let mut retention_secs:  Vec<i64>    = Vec::with_capacity(rows.len());
+        let mut names: Vec<String> = Vec::with_capacity(rows.len());
+        let mut schemas: Vec<String> = Vec::with_capacity(rows.len());
+        let mut num_chunks: Vec<i64> = Vec::with_capacity(rows.len());
+        let mut interval_secs: Vec<i64> = Vec::with_capacity(rows.len());
+        let mut retention_secs: Vec<i64> = Vec::with_capacity(rows.len());
 
         for (name, ht) in &rows {
             names.push(name.clone());
@@ -234,11 +229,8 @@ impl TableProvider for HypertablesProvider {
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let batch = self.build_batch().await?;
         let batches = vec![vec![batch]];
-        let exec = MemorySourceConfig::try_new_exec(
-            &batches,
-            self.schema.clone(),
-            projection.cloned(),
-        )?;
+        let exec =
+            MemorySourceConfig::try_new_exec(&batches, self.schema.clone(), projection.cloned())?;
         Ok(exec)
     }
 }

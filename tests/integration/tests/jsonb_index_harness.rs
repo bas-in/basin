@@ -142,9 +142,7 @@ async fn jsonb_diff_1m_row_seed() {
     // Expected after 5.19.C: planner uses index for @> / <@ probes.
     // Expected after 5.19.D: planner uses index for ? / ?& / ?| / -> probes.
     let gin_ddl_result = sess
-        .execute(
-            "CREATE INDEX jsonb_diff_gin_idx ON jsonb_diff USING gin (payload jsonb_path_ops)",
-        )
+        .execute("CREATE INDEX jsonb_diff_gin_idx ON jsonb_diff USING gin (payload jsonb_path_ops)")
         .await;
     println!("[5.19.A diff] GIN DDL result: {gin_ddl_result:?}");
     // We do not assert success here because 5.19.B is not yet landed —
@@ -179,9 +177,7 @@ async fn jsonb_diff_1m_row_seed() {
                 // Family 2 — JSONB-null inside object
                 // JSON: {"id":N,"nullable":null,"active":false,"tag":"nulls"}
                 2 => {
-                    format!(
-                        "{{\"id\":{i},\"nullable\":null,\"active\":false,\"tag\":\"nulls\"}}"
-                    )
+                    format!("{{\"id\":{i},\"nullable\":null,\"active\":false,\"tag\":\"nulls\"}}")
                 }
                 // Family 3 — empty object (edge case)
                 3 => "{}".to_owned(),
@@ -200,9 +196,9 @@ async fn jsonb_diff_1m_row_seed() {
         }
 
         let sql = format!("INSERT INTO jsonb_diff VALUES {}", values.join(", "));
-        sess.execute(&sql).await.unwrap_or_else(|e| {
-            panic!("INSERT batch at offset {inserted} failed: {e}")
-        });
+        sess.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("INSERT batch at offset {inserted} failed: {e}"));
 
         inserted += take;
     }
@@ -262,8 +258,8 @@ async fn jsonb_diff_1m_row_seed() {
     // Total: family_count(0) + family_count(1) + family_count(2) +
     //        family_count(4) + family_count(5)
     let has_key_tag = row_count(&sess, "SELECT id FROM jsonb_diff WHERE payload ? 'tag'").await;
-    let expected_has_tag = family_count(0) + family_count(1) + family_count(2)
-        + family_count(4) + family_count(5);
+    let expected_has_tag =
+        family_count(0) + family_count(1) + family_count(2) + family_count(4) + family_count(5);
     println!("[5.19.A diff] ? 'tag': got={has_key_tag}, expected={expected_has_tag}");
     assert_eq!(
         has_key_tag, expected_has_tag,
@@ -279,7 +275,9 @@ async fn jsonb_diff_1m_row_seed() {
     )
     .await;
     let expected_any_key = family_count(2) + family_count(4); // families 2 and 4
-    println!("[5.19.A diff] ?| ['nullable','large']: got={has_any_key}, expected={expected_any_key}");
+    println!(
+        "[5.19.A diff] ?| ['nullable','large']: got={has_any_key}, expected={expected_any_key}"
+    );
     assert_eq!(
         has_any_key, expected_any_key,
         "DIFF(?|): ?| any-key-existence must return families 2 and 4; \
@@ -295,8 +293,7 @@ async fn jsonb_diff_1m_row_seed() {
         "SELECT id FROM jsonb_diff WHERE payload ?& array['id', 'tag']",
     )
     .await;
-    let expected_all_keys = family_count(0) + family_count(1) + family_count(2)
-        + family_count(4);
+    let expected_all_keys = family_count(0) + family_count(1) + family_count(2) + family_count(4);
     println!("[5.19.A diff] ?& ['id','tag']: got={has_all_keys}, expected={expected_all_keys}");
     assert_eq!(
         has_all_keys, expected_all_keys,
@@ -328,7 +325,9 @@ async fn jsonb_diff_1m_row_seed() {
         "SELECT id FROM jsonb_diff WHERE payload ->> 'tag' = 'nested'",
     )
     .await;
-    println!("[5.19.A diff] ->> 'tag'='nested': got={text_extract_count}, expected={expected_nested}");
+    println!(
+        "[5.19.A diff] ->> 'tag'='nested': got={text_extract_count}, expected={expected_nested}"
+    );
     assert_eq!(
         text_extract_count, expected_nested,
         "DIFF(->>): ->> text extraction must return exactly the 'nested' family; \
@@ -436,17 +435,13 @@ async fn jsonb_index_perf_gate() {
     let sess = engine.open_session(project).await.unwrap();
 
     // ── Two tables: one with index, one without ─────────────────────────────
-    sess.execute(
-        "CREATE TABLE jsonb_perf_indexed (id BIGINT NOT NULL, payload JSONB)",
-    )
-    .await
-    .expect("CREATE TABLE jsonb_perf_indexed");
+    sess.execute("CREATE TABLE jsonb_perf_indexed (id BIGINT NOT NULL, payload JSONB)")
+        .await
+        .expect("CREATE TABLE jsonb_perf_indexed");
 
-    sess.execute(
-        "CREATE TABLE jsonb_perf_noindex (id BIGINT NOT NULL, payload JSONB)",
-    )
-    .await
-    .expect("CREATE TABLE jsonb_perf_noindex");
+    sess.execute("CREATE TABLE jsonb_perf_noindex (id BIGINT NOT NULL, payload JSONB)")
+        .await
+        .expect("CREATE TABLE jsonb_perf_noindex");
 
     // GIN index on the first table (closed by 5.19.B; the DDL may fail until
     // then, but the perf assertion below is what defines "done").
@@ -469,14 +464,22 @@ async fn jsonb_index_perf_gate() {
         let mut values: Vec<String> = Vec::with_capacity(take);
         for i in inserted..(inserted + take) {
             let role = if i % 2 == 0 { "admin" } else { "user" };
-            values.push(format!(r#"({i}, '{{"role":"{role}","tenant":"acme","seq":{i}}}')"#));
+            values.push(format!(
+                r#"({i}, '{{"role":"{role}","tenant":"acme","seq":{i}}}')"#
+            ));
         }
-        let sql = format!("INSERT INTO jsonb_perf_indexed VALUES {}", values.join(", "));
+        let sql = format!(
+            "INSERT INTO jsonb_perf_indexed VALUES {}",
+            values.join(", ")
+        );
         sess.execute(&sql)
             .await
             .unwrap_or_else(|e| panic!("INSERT indexed batch at {inserted}: {e}"));
 
-        let sql2 = format!("INSERT INTO jsonb_perf_noindex VALUES {}", values.join(", "));
+        let sql2 = format!(
+            "INSERT INTO jsonb_perf_noindex VALUES {}",
+            values.join(", ")
+        );
         sess.execute(&sql2)
             .await
             .unwrap_or_else(|e| panic!("INSERT noindex batch at {inserted}: {e}"));
@@ -517,7 +520,8 @@ async fn jsonb_index_perf_gate() {
             indexed_rows,
             PERF_ROW_COUNT / 2,
             "PERF: indexed @> must return exactly half the rows (role=admin). \
-             got={indexed_rows}, expected={}", PERF_ROW_COUNT / 2
+             got={indexed_rows}, expected={}",
+            PERF_ROW_COUNT / 2
         );
 
         let t1 = Instant::now();
@@ -530,7 +534,8 @@ async fn jsonb_index_perf_gate() {
             noscan_rows,
             PERF_ROW_COUNT / 2,
             "PERF: full-scan @> must return the same count as indexed. \
-             got={noscan_rows}, expected={}", PERF_ROW_COUNT / 2
+             got={noscan_rows}, expected={}",
+            PERF_ROW_COUNT / 2
         );
     }
 
@@ -645,7 +650,8 @@ async fn jsonb_orm_compat() {
     assert!(
         prisma_gin.is_ok(),
         "ORM COMPAT (Prisma): CREATE INDEX … USING GIN must be accepted by the engine. \
-         Closed by 5.19.B. error: {:?}", prisma_gin.unwrap_err()
+         Closed by 5.19.B. error: {:?}",
+        prisma_gin.unwrap_err()
     );
 
     // Step 3: Prisma INSERT (uses parameter binding via pgwire, here as literal)
@@ -702,11 +708,9 @@ async fn jsonb_orm_compat() {
     .expect("Diesel DDL: CREATE TABLE orm_diesel_posts");
 
     // Diesel migration: ADD COLUMN
-    sess.execute(
-        r#"ALTER TABLE "orm_diesel_posts" ADD COLUMN "payload" JSONB"#,
-    )
-    .await
-    .expect("Diesel DDL: ADD COLUMN payload JSONB");
+    sess.execute(r#"ALTER TABLE "orm_diesel_posts" ADD COLUMN "payload" JSONB"#)
+        .await
+        .expect("Diesel DDL: ADD COLUMN payload JSONB");
 
     // Diesel migration: CREATE INDEX … USING GIN
     let diesel_gin = sess
@@ -719,7 +723,8 @@ async fn jsonb_orm_compat() {
     assert!(
         diesel_gin.is_ok(),
         "ORM COMPAT (Diesel): CREATE INDEX … USING GIN must be accepted. \
-         Closed by 5.19.B. error: {:?}", diesel_gin.unwrap_err()
+         Closed by 5.19.B. error: {:?}",
+        diesel_gin.unwrap_err()
     );
 
     // Diesel INSERT (literal; Diesel actually uses $1 params via pgwire)
@@ -788,7 +793,8 @@ async fn jsonb_orm_compat() {
     assert!(
         sqlx_gin.is_ok(),
         "ORM COMPAT (sqlx): CREATE INDEX … USING GIN (col jsonb_path_ops) must be \
-         accepted. Closed by 5.19.B. error: {:?}", sqlx_gin.unwrap_err()
+         accepted. Closed by 5.19.B. error: {:?}",
+        sqlx_gin.unwrap_err()
     );
 
     // sqlx INSERT (literal equivalent of $1 param binding)
@@ -828,7 +834,9 @@ async fn jsonb_orm_compat() {
         "ORM COMPAT (sqlx): -> 'meta' IS NOT NULL must match 2 rows (login events have meta). \
          Closed by 5.19.D. got={sqlx_has_meta}"
     );
-    println!("[5.19.A orm] sqlx -> 'meta' IS NOT NULL: matched {sqlx_has_meta} rows (expected 2) ✓");
+    println!(
+        "[5.19.A orm] sqlx -> 'meta' IS NOT NULL: matched {sqlx_has_meta} rows (expected 2) ✓"
+    );
 
     // sqlx nested text extraction: `WHERE payload ->> 'type' = 'logout'`
     let sqlx_logout = row_count(
@@ -906,9 +914,7 @@ async fn gin_containment_correctness() {
 
     // GIN index — expected to succeed after 5.19.B.
     let gin_ddl = sess
-        .execute(
-            "CREATE INDEX gin_ct_gin_idx ON gin_ct USING gin (payload jsonb_path_ops)",
-        )
+        .execute("CREATE INDEX gin_ct_gin_idx ON gin_ct USING gin (payload jsonb_path_ops)")
         .await;
     assert!(
         gin_ddl.is_ok(),
@@ -972,9 +978,7 @@ async fn gin_containment_correctness() {
     )
     .await;
     let expected_nested = family_count(0);
-    println!(
-        "[5.19.C] @> 'nested': got={contains_nested}, expected={expected_nested}"
-    );
+    println!("[5.19.C] @> 'nested': got={contains_nested}, expected={expected_nested}");
     assert_eq!(
         contains_nested, expected_nested,
         "CONTAINMENT(@>): @> must return exactly the 'nested' family. \
@@ -990,15 +994,10 @@ async fn gin_containment_correctness() {
     // the superset.  Non-empty objects have at least one kv-pair that is
     // absent from `{"":""}`.
     // Expected: exactly the family-3 count (empty objects).
-    let contained_by = row_count(
-        &sess,
-        r#"SELECT id FROM gin_ct WHERE payload <@ '{"":""}'"#,
-    )
-    .await;
+    let contained_by =
+        row_count(&sess, r#"SELECT id FROM gin_ct WHERE payload <@ '{"":""}'"#).await;
     let expected_contained = family_count(3);
-    println!(
-        "[5.19.C] <@: got={contained_by}, expected={expected_contained}"
-    );
+    println!("[5.19.C] <@: got={contained_by}, expected={expected_contained}");
     assert_eq!(
         contained_by, expected_contained,
         "CONTAINMENT(<@): <@ must return only the empty-object family. \

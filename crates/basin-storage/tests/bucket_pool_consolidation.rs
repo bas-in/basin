@@ -89,8 +89,7 @@ async fn seed_objects(
 ) -> BTreeMap<String, Vec<u8>> {
     let mut map = BTreeMap::new();
     for i in 0..n {
-        let key =
-            format!("projects/{project}/tables/t/data/p{i}/2026/06/27/file-{i}.vortex");
+        let key = format!("projects/{project}/tables/t/data/p{i}/2026/06/27/file-{i}.vortex");
         let body = format!("object-{i}-body").into_bytes();
         store
             .put(&OsPath::from(key.clone()), PutPayload::from(body.clone()))
@@ -102,16 +101,19 @@ async fn seed_objects(
 }
 
 /// The full (key → bytes) contents of `store` under the project prefix.
-async fn contents(
-    store: &Arc<dyn ObjectStore>,
-    project: &ProjectId,
-) -> BTreeMap<String, Vec<u8>> {
+async fn contents(store: &Arc<dyn ObjectStore>, project: &ProjectId) -> BTreeMap<String, Vec<u8>> {
     let prefix = OsPath::from(format!("projects/{project}/"));
     let mut out = BTreeMap::new();
     let mut s = store.list(Some(&prefix));
     while let Some(item) = s.next().await {
         let meta = item.unwrap();
-        let bytes = store.get(&meta.location).await.unwrap().bytes().await.unwrap();
+        let bytes = store
+            .get(&meta.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
         out.insert(meta.location.to_string(), bytes.to_vec());
     }
     out
@@ -159,13 +161,22 @@ async fn assert_converged(
     let store_b = resolver.store_for("B");
 
     let b = contents(&store_b, project).await;
-    assert_eq!(&b, live, "B must hold exactly the project's live set (no lost, no doubled)");
+    assert_eq!(
+        &b, live,
+        "B must hold exactly the project's live set (no lost, no doubled)"
+    );
 
     let a = contents(&store_a, project).await;
-    assert!(a.is_empty(), "A must hold none of the project's objects after migration");
+    assert!(
+        a.is_empty(),
+        "A must hold none of the project's objects after migration"
+    );
 
     let assign = cat.get_bucket_assignment(project).await.unwrap().unwrap();
-    assert_eq!(assign.bucket_id, "B", "assignment must point at B post-cutover");
+    assert_eq!(
+        assign.bucket_id, "B",
+        "assignment must point at B post-cutover"
+    );
 
     assert!(
         cat.get_migration_intent(project).await.unwrap().is_none(),
@@ -188,7 +199,9 @@ async fn migrate_converges_exactly_once_no_crash() {
     let project = ProjectId::new();
     let (cat, live) = setup(&resolver, &project, 1, 0, 12).await;
 
-    pool.consolidate_project(&project, "A", "B", cat.as_ref()).await.unwrap();
+    pool.consolidate_project(&project, "A", "B", cat.as_ref())
+        .await
+        .unwrap();
 
     assert_converged(&resolver, &cat, &project, &live).await;
 }
@@ -214,7 +227,11 @@ async fn migrate_with_late_write_to_a_is_drained() {
     };
     cat.put_migration_intent(&intent).await.unwrap();
     let err = pool
-        .run_migration(&intent, cat.as_ref(), CrashPoint::After(MigrationPhase::Copy))
+        .run_migration(
+            &intent,
+            cat.as_ref(),
+            CrashPoint::After(MigrationPhase::Copy),
+        )
         .await
         .unwrap_err();
     assert!(err.is_crash());
@@ -233,7 +250,9 @@ async fn migrate_with_late_write_to_a_is_drained() {
     // write so B ends with the FULL live set.
     pool.invalidate_all();
     let resumed = cat.get_migration_intent(&project).await.unwrap().unwrap();
-    pool.run_migration(&resumed, cat.as_ref(), CrashPoint::None).await.unwrap();
+    pool.run_migration(&resumed, cat.as_ref(), CrashPoint::None)
+        .await
+        .unwrap();
 
     assert_converged(&resolver, &cat, &project, &live).await;
 }
@@ -298,8 +317,7 @@ async fn crash_at_every_phase_boundary_converges() {
             assert!(guard < 16, "resume must converge for {cp:?}");
         }
 
-        assert_converged(&resolver, &cat, &project, &live)
-            .await;
+        assert_converged(&resolver, &cat, &project, &live).await;
     }
 }
 
@@ -323,7 +341,10 @@ async fn cutover_is_atomic_before_or_after_the_flip() {
         cat.put_migration_intent(&intent).await.unwrap();
         // Copy+verify already happened conceptually; do them so B is ready.
         pool.run_migration(
-            &MigrationIntent { phase: MigrationPhase::Copy, ..intent.clone() },
+            &MigrationIntent {
+                phase: MigrationPhase::Copy,
+                ..intent.clone()
+            },
             cat.as_ref(),
             CrashPoint::After(MigrationPhase::Verify),
         )
@@ -333,7 +354,11 @@ async fn cutover_is_atomic_before_or_after_the_flip() {
         let at_cutover = cat.get_migration_intent(&project).await.unwrap().unwrap();
         assert_eq!(at_cutover.phase, MigrationPhase::Cutover);
         let err = pool
-            .run_migration(&at_cutover, cat.as_ref(), CrashPoint::Before(MigrationPhase::Cutover))
+            .run_migration(
+                &at_cutover,
+                cat.as_ref(),
+                CrashPoint::Before(MigrationPhase::Cutover),
+            )
             .await
             .unwrap_err();
         assert!(err.is_crash());
@@ -345,7 +370,9 @@ async fn cutover_is_atomic_before_or_after_the_flip() {
         pool.invalidate_all();
         let mut guard = 0;
         while let Some(resume) = cat.get_migration_intent(&project).await.unwrap() {
-            pool.run_migration(&resume, cat.as_ref(), CrashPoint::None).await.unwrap();
+            pool.run_migration(&resume, cat.as_ref(), CrashPoint::None)
+                .await
+                .unwrap();
             pool.invalidate_all();
             guard += 1;
             assert!(guard < 16);
@@ -368,13 +395,21 @@ async fn cutover_is_atomic_before_or_after_the_flip() {
             phase: MigrationPhase::Copy,
         };
         cat.put_migration_intent(&seed).await.unwrap();
-        pool.run_migration(&seed, cat.as_ref(), CrashPoint::After(MigrationPhase::Verify))
-            .await
-            .unwrap_err();
+        pool.run_migration(
+            &seed,
+            cat.as_ref(),
+            CrashPoint::After(MigrationPhase::Verify),
+        )
+        .await
+        .unwrap_err();
         let at_cutover = cat.get_migration_intent(&project).await.unwrap().unwrap();
         // Crash AFTER the flip (intent advances to Drain, assignment is B).
         let err = pool
-            .run_migration(&at_cutover, cat.as_ref(), CrashPoint::After(MigrationPhase::Cutover))
+            .run_migration(
+                &at_cutover,
+                cat.as_ref(),
+                CrashPoint::After(MigrationPhase::Cutover),
+            )
             .await
             .unwrap_err();
         assert!(err.is_crash());
@@ -384,7 +419,9 @@ async fn cutover_is_atomic_before_or_after_the_flip() {
         pool.invalidate_all();
         let mut guard = 0;
         while let Some(resume) = cat.get_migration_intent(&project).await.unwrap() {
-            pool.run_migration(&resume, cat.as_ref(), CrashPoint::None).await.unwrap();
+            pool.run_migration(&resume, cat.as_ref(), CrashPoint::None)
+                .await
+                .unwrap();
             pool.invalidate_all();
             guard += 1;
             assert!(guard < 16);
@@ -409,7 +446,9 @@ async fn bucket_reclaimed_only_when_provably_empty() {
     let store_a = resolver.store_for("A");
     let other_live = seed_objects(&store_a, &other, 4).await;
 
-    pool.consolidate_project(&project, "A", "B", cat.as_ref()).await.unwrap();
+    pool.consolidate_project(&project, "A", "B", cat.as_ref())
+        .await
+        .unwrap();
 
     // B holds exactly `project`'s live set.
     let b = contents(&resolver.store_for("B"), &project).await;
@@ -419,7 +458,9 @@ async fn bucket_reclaimed_only_when_provably_empty() {
     assert_eq!(contents(&store_a, &other).await, other_live);
     // A's bucket is NOT reclaimed (assigned_count still 1 > 0).
     let registry = cat.get_bucket_registry().await.unwrap();
-    let a = registry.get("A").expect("A must survive while it holds another project");
+    let a = registry
+        .get("A")
+        .expect("A must survive while it holds another project");
     assert_eq!(a.assigned_count, 1, "A still holds one live project");
 }
 
@@ -436,11 +477,17 @@ async fn vacuumed_project_reclaims_its_bucket() {
     // 1); B is the dense target.
     let registry = cat.get_bucket_registry().await.unwrap();
     let candidates = BucketPool::reclaim_candidates(&registry, 1);
-    assert_eq!(candidates, vec!["A".to_string()], "A is the reclaim candidate");
+    assert_eq!(
+        candidates,
+        vec!["A".to_string()],
+        "A is the reclaim candidate"
+    );
     let target = BucketPool::consolidation_target(&registry, "A").unwrap();
     assert_eq!(target, "B", "densest non-source bucket is the target");
 
-    pool.consolidate_project(&project, "A", &target, cat.as_ref()).await.unwrap();
+    pool.consolidate_project(&project, "A", &target, cat.as_ref())
+        .await
+        .unwrap();
     assert_converged(&resolver, &cat, &project, &live).await;
 }
 
@@ -499,7 +546,9 @@ async fn flag_off_consolidation_is_a_noop() {
     let (cat, live) = setup(&resolver, &project, 1, 0, 5).await;
 
     // consolidate + resume both no-op.
-    pool.consolidate_project(&project, "A", "B", cat.as_ref()).await.unwrap();
+    pool.consolidate_project(&project, "A", "B", cat.as_ref())
+        .await
+        .unwrap();
     assert_eq!(pool.resume_migrations(cat.as_ref()).await.unwrap(), 0);
 
     // Nothing moved: A still holds the live set, B is empty, no intent, A still
@@ -508,7 +557,11 @@ async fn flag_off_consolidation_is_a_noop() {
     assert!(resolver.store_for("B").list(None).next().await.is_none());
     assert!(cat.get_migration_intent(&project).await.unwrap().is_none());
     assert_eq!(
-        cat.get_bucket_assignment(&project).await.unwrap().unwrap().bucket_id,
+        cat.get_bucket_assignment(&project)
+            .await
+            .unwrap()
+            .unwrap()
+            .bucket_id,
         "A"
     );
 }
@@ -570,6 +623,9 @@ async fn resume_migrations_drives_all_inflight_to_completion() {
     assert!(cat.get_migration_intent(&p1).await.unwrap().is_none());
     assert!(cat.get_migration_intent(&p2).await.unwrap().is_none());
     let reg = cat.get_bucket_registry().await.unwrap();
-    assert!(reg.get("A").is_none() && reg.get("B").is_none(), "A,B reclaimed");
+    assert!(
+        reg.get("A").is_none() && reg.get("B").is_none(),
+        "A,B reclaimed"
+    );
     assert!(reg.get("C").is_some(), "C remains");
 }

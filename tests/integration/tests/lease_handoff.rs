@@ -68,8 +68,7 @@ fn shared_shard(
     replica_id: &str,
 ) -> Shard {
     let registry: Arc<dyn LeaseRegistry> = catalog.clone();
-    let mut cfg = ShardConfig::new(storage, catalog, wal)
-        .with_lease_registry(registry, replica_id);
+    let mut cfg = ShardConfig::new(storage, catalog, wal).with_lease_registry(registry, replica_id);
     cfg.lease_ttl = Duration::from_secs(15);
     cfg.lease_renew_interval = Duration::from_millis(50);
     Shard::new(cfg)
@@ -118,7 +117,10 @@ async fn two_replicas_handoff_under_load_completes_in_under_500ms() {
             .unwrap();
     }
     let pre_handoff_rows = rows_in(&ha.read(&table, ReadOptions::default()).await.unwrap());
-    assert_eq!(pre_handoff_rows, 50, "A must see its 50 acked rows pre-yield");
+    assert_eq!(
+        pre_handoff_rows, 50,
+        "A must see its 50 acked rows pre-yield"
+    );
 
     // ── Voluntary yield: A hands off to B; measure stall ──────────────────
     let t0 = Instant::now();
@@ -136,7 +138,10 @@ async fn two_replicas_handoff_under_load_completes_in_under_500ms() {
 
     // A no longer holds the lease — the catalog row is gone.
     assert_eq!(
-        catalog.owner_of(&project, partition.as_str()).await.unwrap(),
+        catalog
+            .owner_of(&project, partition.as_str())
+            .await
+            .unwrap(),
         None,
         "A must have released the lease",
     );

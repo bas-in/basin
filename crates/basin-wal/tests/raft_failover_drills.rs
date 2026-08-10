@@ -314,7 +314,9 @@ async fn drill_kill_leader_elects_new_and_continues_writes() {
 
     // Zero-data-loss: every acked write present on a surviving node.
     let survivor = node_by_id(&nodes, new_leader_id);
-    acked.assert_all_present(survivor.as_ref(), &project, &part).await;
+    acked
+        .assert_all_present(survivor.as_ref(), &project, &part)
+        .await;
 
     close_all(&nodes).await;
 }

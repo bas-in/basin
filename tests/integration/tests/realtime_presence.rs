@@ -143,10 +143,7 @@ async fn spawn_server() -> Option<ServerAddrs> {
     let ws_addr = ws_probe.local_addr().ok()?;
     drop(ws_probe);
 
-    let auth_schema = format!(
-        "basin_pres_test_{}",
-        Ulid::new().to_string().to_lowercase()
-    );
+    let auth_schema = format!("basin_pres_test_{}", Ulid::new().to_string().to_lowercase());
 
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.env("BASIN_BIND", pg_addr.to_string())
@@ -309,8 +306,11 @@ async fn obtain_jwt(
         return None;
     }
 
-    let Ok(Ok((client, conn))) =
-        tokio::time::timeout(Duration::from_secs(5), tokio_postgres::connect(PG_URL, NoTls)).await
+    let Ok(Ok((client, conn))) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(PG_URL, NoTls),
+    )
+    .await
     else {
         return None;
     };
@@ -355,11 +355,7 @@ async fn obtain_jwt(
 // WebSocket helpers (mirrors realtime_ws.rs)
 // ---------------------------------------------------------------------------
 
-async fn ws_connect(
-    addr: std::net::SocketAddr,
-    path: &str,
-    jwt: &str,
-) -> Option<TcpStream> {
+async fn ws_connect(addr: std::net::SocketAddr, path: &str, jwt: &str) -> Option<TcpStream> {
     let mut sock = TcpStream::connect(addr).await.ok()?;
     let ws_key = "dGhlIHNhbXBsZSBub25jZQ==";
     let req = format!(
@@ -407,7 +403,10 @@ async fn ws_send_text(sock: &mut TcpStream, text: &str) -> bool {
 
     let mut frame = Vec::with_capacity(2 + 4 + payload.len());
     frame.push(0x81); // FIN + text opcode
-    assert!(payload.len() < 126, "test helper only supports short frames");
+    assert!(
+        payload.len() < 126,
+        "test helper only supports short frames"
+    );
     frame.push(0x80 | payload.len() as u8);
     frame.extend_from_slice(&mask);
     for (i, b) in payload.iter().enumerate() {
@@ -559,7 +558,10 @@ async fn presence_two_clients_join_and_one_leaves() {
     })
     .await;
     let state_a = frames_a.iter().find(|v| v["type"] == "presence_state");
-    assert!(state_a.is_some(), "A should receive presence_state; got: {frames_a:?}");
+    assert!(
+        state_a.is_some(),
+        "A should receive presence_state; got: {frames_a:?}"
+    );
 
     // Client B sends presence_track.
     let track_b = r#"{"type":"presence_track","channel":"room:1","client_id":"client-b","metadata":{"name":"Bob"}}"#;
@@ -571,14 +573,20 @@ async fn presence_two_clients_join_and_one_leaves() {
     })
     .await;
     let state_b = frames_b.iter().find(|v| v["type"] == "presence_state");
-    assert!(state_b.is_some(), "B should receive presence_state; got: {frames_b:?}");
+    assert!(
+        state_b.is_some(),
+        "B should receive presence_state; got: {frames_b:?}"
+    );
 
     let presences_b = &state_b.unwrap()["presences"];
     let a_in_b = presences_b
         .as_array()
         .map(|arr| arr.iter().any(|e| e["client_id"] == "client-a"))
         .unwrap_or(false);
-    assert!(a_in_b, "B's presence_state should contain client-a; presences: {presences_b:?}");
+    assert!(
+        a_in_b,
+        "B's presence_state should contain client-a; presences: {presences_b:?}"
+    );
 
     // A should receive a presence_diff with B in joins.
     let diff_frames_a = ws_collect_text_frames(&mut sock_a, Duration::from_secs(5), |v| {
@@ -671,7 +679,8 @@ async fn presence_channel_isolation() {
     };
 
     // A joins room:1.
-    let track_a_r1 = r#"{"type":"presence_track","channel":"room:1","client_id":"iso-a","metadata":{}}"#;
+    let track_a_r1 =
+        r#"{"type":"presence_track","channel":"room:1","client_id":"iso-a","metadata":{}}"#;
     assert!(ws_send_text(&mut sock_a, track_a_r1).await);
 
     // Drain A's state frame for room:1.
@@ -681,7 +690,8 @@ async fn presence_channel_isolation() {
     .await;
 
     // B joins room:2.
-    let track_b_r2 = r#"{"type":"presence_track","channel":"room:2","client_id":"iso-b","metadata":{}}"#;
+    let track_b_r2 =
+        r#"{"type":"presence_track","channel":"room:2","client_id":"iso-b","metadata":{}}"#;
     assert!(ws_send_text(&mut sock_b, track_b_r2).await);
 
     // Allow a moment for presence events to propagate.
@@ -695,9 +705,7 @@ async fn presence_channel_isolation() {
     })
     .await;
 
-    let saw_room2 = spurious_frames
-        .iter()
-        .any(|v| v["channel"] == "room:2");
+    let saw_room2 = spurious_frames.iter().any(|v| v["channel"] == "room:2");
     assert!(
         !saw_room2,
         "client on room:1 should NOT see events for room:2; got: {spurious_frames:?}"

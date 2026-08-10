@@ -168,8 +168,8 @@ mod tests {
 
         // Decode with arrow_ipc reader and verify schema + values.
         let cursor = std::io::Cursor::new(buf);
-        let mut reader = arrow_ipc::reader::StreamReader::try_new(cursor, None)
-            .expect("StreamReader::try_new");
+        let mut reader =
+            arrow_ipc::reader::StreamReader::try_new(cursor, None).expect("StreamReader::try_new");
         assert_eq!(reader.schema().fields().len(), 2);
         assert_eq!(reader.schema().field(0).name(), "id");
         assert_eq!(reader.schema().field(1).name(), "name");
@@ -202,8 +202,7 @@ mod tests {
         .unwrap();
         let buf = encode_ipc(&schema, &[batch]);
         let cursor = std::io::Cursor::new(buf);
-        let mut reader =
-            arrow_ipc::reader::StreamReader::try_new(cursor, None).unwrap();
+        let mut reader = arrow_ipc::reader::StreamReader::try_new(cursor, None).unwrap();
         let decoded = reader.next().unwrap().unwrap();
         let col = decoded
             .column(0)
@@ -233,8 +232,7 @@ mod tests {
         .unwrap();
         let buf = encode_ipc(&schema, &[batch]);
         let cursor = std::io::Cursor::new(buf);
-        let mut reader =
-            arrow_ipc::reader::StreamReader::try_new(cursor, None).unwrap();
+        let mut reader = arrow_ipc::reader::StreamReader::try_new(cursor, None).unwrap();
         let decoded = reader.next().unwrap().unwrap();
         let col = decoded
             .column(0)
@@ -250,22 +248,14 @@ mod tests {
     fn wants_arrow_detect() {
         let mut headers = HeaderMap::new();
         assert!(!wants_arrow(&headers), "no Accept → JSON");
-        headers.insert(
-            header::ACCEPT,
-            HeaderValue::from_static("application/json"),
-        );
+        headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
         assert!(!wants_arrow(&headers), "Accept: JSON → still JSON");
-        headers.insert(
-            header::ACCEPT,
-            HeaderValue::from_static(ARROW_STREAM_MIME),
-        );
+        headers.insert(header::ACCEPT, HeaderValue::from_static(ARROW_STREAM_MIME));
         assert!(wants_arrow(&headers), "Accept: arrow stream → IPC");
         // Multiple values (q-factor notation)
         headers.insert(
             header::ACCEPT,
-            HeaderValue::from_static(
-                "application/json,application/vnd.apache.arrow.stream;q=0.9",
-            ),
+            HeaderValue::from_static("application/json,application/vnd.apache.arrow.stream;q=0.9"),
         );
         assert!(wants_arrow(&headers), "multi-value accept with arrow → IPC");
     }

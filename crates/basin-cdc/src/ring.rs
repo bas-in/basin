@@ -122,7 +122,11 @@ impl ProjectRing {
     }
 
     /// Build a ring honouring the configured `root_prefix`.
-    pub fn with_root(project: ProjectId, store: Arc<dyn ObjectStore>, root: Option<String>) -> Self {
+    pub fn with_root(
+        project: ProjectId,
+        store: Arc<dyn ObjectStore>,
+        root: Option<String>,
+    ) -> Self {
         Self {
             project,
             store,
@@ -148,11 +152,10 @@ impl ProjectRing {
         let first_seq = records[0].seq;
         let last_seq = records[records.len() - 1].seq;
         let (key_str, key) = segment_key(self.root(), &self.project, first_seq);
-        let body = encode_segment(records)
-            .map_err(|e| object_store::Error::Generic {
-                store: "cdc",
-                source: Box::new(e),
-            })?;
+        let body = encode_segment(records).map_err(|e| object_store::Error::Generic {
+            store: "cdc",
+            source: Box::new(e),
+        })?;
         let payload = PutPayload::from_bytes(Bytes::from(body));
 
         let mut attempt = 0;
@@ -180,7 +183,8 @@ impl ProjectRing {
             }
         }
 
-        self.update_index_after_write(&key_str, first_seq, last_seq).await;
+        self.update_index_after_write(&key_str, first_seq, last_seq)
+            .await;
         Ok(key_str)
     }
 
@@ -205,7 +209,10 @@ impl ProjectRing {
         };
         if let Err(e) = self
             .store
-            .put(&index_key(self.root(), &self.project), PutPayload::from_bytes(Bytes::from(body)))
+            .put(
+                &index_key(self.root(), &self.project),
+                PutPayload::from_bytes(Bytes::from(body)),
+            )
             .await
         {
             // Index is a seek hint, not the durability contract — a failed
@@ -245,7 +252,10 @@ impl ProjectRing {
 
     /// Replay every record with `seq > after_seq`, in seq order, from the
     /// durable ring. Used for cursor resume.
-    pub async fn replay_after(&self, after_seq: u64) -> Result<Vec<CdcRecord>, object_store::Error> {
+    pub async fn replay_after(
+        &self,
+        after_seq: u64,
+    ) -> Result<Vec<CdcRecord>, object_store::Error> {
         let keys = self.list_segment_keys().await?;
         let mut out: Vec<CdcRecord> = Vec::new();
         for key in keys {

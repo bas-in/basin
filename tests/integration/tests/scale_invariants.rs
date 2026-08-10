@@ -163,7 +163,11 @@ async fn scale_invariants() {
     // key has never been read, so this is a cold lookup.
     let key = scale / 2 + 137; // arbitrary interior, non-boundary key
     let (res, d) = probe(format!("SELECT v FROM t WHERE id = {key}")).await;
-    assert_eq!(row_count(&res), 1, "point SELECT must return exactly the row");
+    assert_eq!(
+        row_count(&res),
+        1,
+        "point SELECT must return exactly the row"
+    );
     // INVARIANT: a PK point lookup opens O(1) files independent of table size.
     // Whole-file column_stats min/max pruning drops every file whose id zone
     // map excludes `key`, leaving the single file whose [min,max] contains it
@@ -192,7 +196,11 @@ async fn scale_invariants() {
     // ── 2. Repeated-key point SELECT (cache hit) ─────────────────────────────
     // The SAME key, same projection, same filter → identical page-cache key.
     let (res, d) = probe(format!("SELECT v FROM t WHERE id = {key}")).await;
-    assert_eq!(row_count(&res), 1, "repeated point SELECT must still return the row");
+    assert_eq!(
+        row_count(&res),
+        1,
+        "repeated point SELECT must still return the row"
+    );
     // INVARIANT: a repeat of an identical point read is served entirely from
     // the in-RAM page cache — ZERO cold file opens and ZERO new decode. This is
     // the steady-state read cost of a hot key: O(1) and storage-free. If
@@ -535,9 +543,7 @@ async fn scale_invariants() {
                 e.memtable
                     .snapshot()
                     .iter()
-                    .filter(|(_, v)| {
-                        matches!(v, basin_hottier::MemRowValue::Update { .. })
-                    })
+                    .filter(|(_, v)| matches!(v, basin_hottier::MemRowValue::Update { .. }))
                     .count()
             })
             .unwrap_or(0)
@@ -795,8 +801,7 @@ async fn keyset_short_circuit_scale_invariants() {
     // (5_000) exceeds the page's 100th key (100), so the traversal stops.
     // This is the gate that distinguishes the ordered traversal from the old
     // open-every-candidate fan-out (which would open all 6).
-    let (res, d) = probe("SELECT id, v FROM pages WHERE id > 0 ORDER BY id LIMIT 100".into())
-        .await;
+    let (res, d) = probe("SELECT id, v FROM pages WHERE id > 0 ORDER BY id LIMIT 100".into()).await;
     assert_eq!(
         ids_of(&res),
         (1..=100).collect::<Vec<i64>>(),
@@ -818,10 +823,8 @@ async fn keyset_short_circuit_scale_invariants() {
     // cursor 12_345 → page 12_346..=12_395 lives entirely in band 2
     // (10_000..15_000). Zone maps prune bands 0-1 (max <= cursor); the ordered
     // traversal stops after band 2 (next min 15_000 > kth key 12_395).
-    let (res, d) = probe(
-        "SELECT id, v FROM pages WHERE id > 12345 ORDER BY id LIMIT 50".into(),
-    )
-    .await;
+    let (res, d) =
+        probe("SELECT id, v FROM pages WHERE id > 12345 ORDER BY id LIMIT 50".into()).await;
     assert_eq!(
         ids_of(&res),
         (12_346..=12_395).collect::<Vec<i64>>(),
@@ -838,10 +841,8 @@ async fn keyset_short_circuit_scale_invariants() {
     // and band 3 (15_000.., 31 rows). Band 2 alone under-fills the page, so
     // the traversal must continue into band 3 and then stop — exactly 2 opens,
     // and the page must be seam-free (no gap, no repeat at the boundary).
-    let (res, d) = probe(
-        "SELECT id, v FROM pages WHERE id > 14980 ORDER BY id LIMIT 50".into(),
-    )
-    .await;
+    let (res, d) =
+        probe("SELECT id, v FROM pages WHERE id > 14980 ORDER BY id LIMIT 50".into()).await;
     assert_eq!(
         ids_of(&res),
         (14_981..=15_030).collect::<Vec<i64>>(),
@@ -858,10 +859,8 @@ async fn keyset_short_circuit_scale_invariants() {
     // all WITHOUT opening, leaving only the last band. This is the prompt-side
     // half of the invariant: prune handles the bands behind the cursor, the
     // short-circuit handles the bands ahead of the page.
-    let (res, d) = probe(
-        "SELECT id, v FROM pages WHERE id > 25100 ORDER BY id LIMIT 50".into(),
-    )
-    .await;
+    let (res, d) =
+        probe("SELECT id, v FROM pages WHERE id > 25100 ORDER BY id LIMIT 50".into()).await;
     assert_eq!(
         ids_of(&res),
         (25_101..=25_150).collect::<Vec<i64>>(),
@@ -876,10 +875,8 @@ async fn keyset_short_circuit_scale_invariants() {
 
     // ── 5. Empty page (cursor beyond the table max) ──────────────────────────
     // Every band's max <= cursor → all files pruned, zero opens, zero rows.
-    let (res, d) = probe(
-        "SELECT id, v FROM pages WHERE id > 99999 ORDER BY id LIMIT 50".into(),
-    )
-    .await;
+    let (res, d) =
+        probe("SELECT id, v FROM pages WHERE id > 99999 ORDER BY id LIMIT 50".into()).await;
     assert!(
         ids_of(&res).is_empty(),
         "cursor beyond the max id must yield an empty page"
@@ -908,10 +905,8 @@ async fn keyset_short_circuit_scale_invariants() {
     })
     .await
     .unwrap();
-    let (res, d) = probe(
-        "SELECT id, v FROM pages WHERE id > 29990 ORDER BY id LIMIT 50".into(),
-    )
-    .await;
+    let (res, d) =
+        probe("SELECT id, v FROM pages WHERE id > 29990 ORDER BY id LIMIT 50".into()).await;
     assert_eq!(
         ids_of(&res),
         (29_991..=30_040).collect::<Vec<i64>>(),
@@ -1200,8 +1195,7 @@ async fn gin_containment_effectiveness_io() {
         }
     };
 
-    let needle_sql =
-        r#"SELECT COUNT(*) FROM ging WHERE payload @> '{"cat":"needle"}'::jsonb"#;
+    let needle_sql = r#"SELECT COUNT(*) FROM ging WHERE payload @> '{"cat":"needle"}'::jsonb"#;
     // Band 3 covers ids 6_000..7_999; every 100th id matches → 20 rows.
     let expected: i64 = PER_FILE / 100;
 

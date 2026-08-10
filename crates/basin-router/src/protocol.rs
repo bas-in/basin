@@ -81,7 +81,9 @@ use tokio::sync::Mutex;
 
 use crate::error::error_response;
 use crate::resolver::ProjectResolver;
-use crate::types::{arrow_to_pg_type, encode_batches, row_description, row_description_with_formats};
+use crate::types::{
+    arrow_to_pg_type, encode_batches, row_description, row_description_with_formats,
+};
 
 /// The PostgreSQL `server_version` Basin advertises in the pgwire startup
 /// ParameterStatus. MUST stay a real PG-style version whose major component is
@@ -466,26 +468,28 @@ where
         ReplicationCommand::StartReplication { .. } => {
             // Honest deferral — never fake a CopyBoth stream.
             vec![
-                PgWireBackendMessage::ErrorResponse(pgwire::messages::response::ErrorResponse::from(
-                    pgwire::error::ErrorInfo::new(
+                PgWireBackendMessage::ErrorResponse(
+                    pgwire::messages::response::ErrorResponse::from(pgwire::error::ErrorInfo::new(
                         "ERROR".to_owned(),
                         "0A000".to_owned(), // feature_not_supported
-                        format!("START_REPLICATION streaming not yet wired: {START_REPLICATION_WIRING}"),
-                    ),
-                )),
+                        format!(
+                            "START_REPLICATION streaming not yet wired: {START_REPLICATION_WIRING}"
+                        ),
+                    )),
+                ),
                 PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)),
             ]
         }
         ReplicationCommand::TimelineHistory { .. } => {
             // Basin has a single synthetic timeline (1); no history file.
             vec![
-                PgWireBackendMessage::ErrorResponse(pgwire::messages::response::ErrorResponse::from(
-                    pgwire::error::ErrorInfo::new(
+                PgWireBackendMessage::ErrorResponse(
+                    pgwire::messages::response::ErrorResponse::from(pgwire::error::ErrorInfo::new(
                         "ERROR".to_owned(),
                         "0A000".to_owned(),
                         "TIMELINE_HISTORY: Basin has a single synthetic timeline (1)".to_owned(),
-                    ),
-                )),
+                    )),
+                ),
                 PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)),
             ]
         }
@@ -764,9 +768,9 @@ fn decode_param_text(
                 match raw {
                     None => out.push(ScalarParam::Null),
                     Some(t) => {
-                        let v: i64 = t
-                            .parse()
-                            .map_err(|e: std::num::ParseIntError| parse_err("int array element", &e))?;
+                        let v: i64 = t.parse().map_err(|e: std::num::ParseIntError| {
+                            parse_err("int array element", &e)
+                        })?;
                         out.push(ScalarParam::Int8(v));
                     }
                 }
@@ -2199,13 +2203,8 @@ where
             let full_schema = std::sync::Arc::new(arrow_schema::Schema::new(
                 table_cols.iter().cloned().collect::<Vec<_>>(),
             ));
-            let mut state = crate::copy::CopyInState::new(
-                table.clone(),
-                full_schema,
-                cols,
-                with_header,
-                opts,
-            );
+            let mut state =
+                crate::copy::CopyInState::new(table.clone(), full_schema, cols, with_header, opts);
             if let Some(list) = columns.clone() {
                 state = state.with_column_list(list);
             }
@@ -4370,8 +4369,8 @@ mod tests {
     #[test]
     fn decode_param_binary_numeric_nan_rejected() {
         let body = numeric_body(0, 0xC000, 0, &[]);
-        let err = super::decode_param_binary(&body, &Type::NUMERIC)
-            .expect_err("NaN must be rejected");
+        let err =
+            super::decode_param_binary(&body, &Type::NUMERIC).expect_err("NaN must be rejected");
         match err {
             PgWireError::UserError(info) => assert_eq!(info.code, "22P03"),
             other => panic!("expected UserError, got {other:?}"),

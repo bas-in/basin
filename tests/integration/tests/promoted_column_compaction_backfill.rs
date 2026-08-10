@@ -36,10 +36,7 @@ use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
 /// Execute SQL and collect all string values from the first column.
-async fn query_string_col(
-    sess: &basin_engine::ProjectSession,
-    sql: &str,
-) -> Vec<Option<String>> {
+async fn query_string_col(sess: &basin_engine::ProjectSession, sql: &str) -> Vec<Option<String>> {
     let result = sess.execute(sql).await.unwrap();
     let batches = match result {
         basin_engine::ExecResult::Rows { batches, .. } => batches,
@@ -72,9 +69,7 @@ async fn promoted_column_compaction_backfill() {
     let wal_dir = TempDir::new().unwrap();
 
     let storage = Storage::new(StorageConfig {
-        object_store: Arc::new(
-            LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
-        ),
+        object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
         root_prefix: None,
         disk_cache: None,
         page_cache: None,
@@ -82,9 +77,7 @@ async fn promoted_column_compaction_backfill() {
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let wal: Arc<dyn Wal> = Arc::new(
         LocalWal::open(WalConfig {
-            object_store: Arc::new(
-                LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap(),
-            ),
+            object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
@@ -198,16 +191,14 @@ async fn promoted_column_compaction_backfill() {
 
     // Row 3: event_type absent → None (NULL)
     assert_eq!(
-        shadow_vals[2],
-        None,
+        shadow_vals[2], None,
         "row 3 (absent key) should be NULL, got {:?}",
         shadow_vals[2]
     );
 
     // Row 4: event_type = null → None (NULL)
     assert_eq!(
-        shadow_vals[3],
-        None,
+        shadow_vals[3], None,
         "row 4 (JSON null value) should be NULL, got {:?}",
         shadow_vals[3]
     );
@@ -259,9 +250,7 @@ async fn promoted_column_cold_file_sweep() {
     let wal_dir = TempDir::new().unwrap();
 
     let storage = Storage::new(StorageConfig {
-        object_store: Arc::new(
-            LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
-        ),
+        object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
         root_prefix: None,
         disk_cache: None,
         page_cache: None,
@@ -269,9 +258,7 @@ async fn promoted_column_cold_file_sweep() {
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let wal: Arc<dyn Wal> = Arc::new(
         LocalWal::open(WalConfig {
-            object_store: Arc::new(
-                LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap(),
-            ),
+            object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,

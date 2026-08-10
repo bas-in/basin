@@ -67,7 +67,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -126,7 +130,10 @@ async fn pk_cache_hit_returns_correct_row() {
     let _ = engine.memtable_registry().evict_clean(&project, u64::MAX);
 
     // First read: cache MISS → cold decode → populate.
-    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 1").await, Some(100));
+    assert_eq!(
+        int_at(&sess, "SELECT v FROM t WHERE id = 1").await,
+        Some(100)
+    );
     let after_first = engine.pk_row_cache_counters();
     assert!(
         after_first.inserts >= 1,
@@ -135,7 +142,10 @@ async fn pk_cache_hit_returns_correct_row() {
     );
 
     // Second identical read: cache HIT, same value.
-    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 1").await, Some(100));
+    assert_eq!(
+        int_at(&sess, "SELECT v FROM t WHERE id = 1").await,
+        Some(100)
+    );
     let after_second = engine.pk_row_cache_counters();
     assert!(
         after_second.hits >= 1,
@@ -159,8 +169,13 @@ async fn pk_cache_invalidated_by_update() {
     sess.execute("INSERT INTO t VALUES (1, 10)").await.unwrap();
     shard.flush_to_parquet().await.unwrap();
 
-    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 1").await, Some(10)); // warm
-    sess.execute("UPDATE t SET v = 99 WHERE id = 1").await.unwrap(); // hot overlay → epoch bump
+    assert_eq!(
+        int_at(&sess, "SELECT v FROM t WHERE id = 1").await,
+        Some(10)
+    ); // warm
+    sess.execute("UPDATE t SET v = 99 WHERE id = 1")
+        .await
+        .unwrap(); // hot overlay → epoch bump
     assert_eq!(
         int_at(&sess, "SELECT v FROM t WHERE id = 1").await,
         Some(99),
@@ -186,7 +201,10 @@ async fn pk_cache_invalidated_by_delete() {
     shard.flush_to_parquet().await.unwrap();
 
     // Warm the cache for id=1.
-    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 1").await, Some(10));
+    assert_eq!(
+        int_at(&sess, "SELECT v FROM t WHERE id = 1").await,
+        Some(10)
+    );
 
     // DELETE id=1 (fast-path tombstone; bumps hot_tier_epoch).
     sess.execute("DELETE FROM t WHERE id = 1").await.unwrap();
@@ -198,7 +216,10 @@ async fn pk_cache_invalidated_by_delete() {
         "DELETE must invalidate the cache — a stale cached row here is the #159 bug"
     );
     // id=2 untouched.
-    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 2").await, Some(20));
+    assert_eq!(
+        int_at(&sess, "SELECT v FROM t WHERE id = 2").await,
+        Some(20)
+    );
 
     bg.shutdown().await;
     wal.close().await.unwrap();
@@ -223,7 +244,10 @@ async fn pk_cache_invalidated_by_cold_write() {
     shard.flush_to_parquet().await.unwrap();
 
     // Warm id=1.
-    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 1").await, Some(10));
+    assert_eq!(
+        int_at(&sess, "SELECT v FROM t WHERE id = 1").await,
+        Some(10)
+    );
 
     // Range UPDATE (predicate, not PK-eq literal) → cold copy-on-write rewrite +
     // new snapshot commit. This touches id=1.
@@ -263,8 +287,14 @@ async fn pk_cache_bypassed_under_rls() {
     let bob = engine.open_session_as(project, "bob").await.unwrap();
 
     // BEFORE RLS: warm the cache with the raw rows via point lookups (no policy).
-    assert_eq!(rows_seen(&alice, "SELECT v FROM orders WHERE id = 1").await, 1);
-    assert_eq!(rows_seen(&alice, "SELECT v FROM orders WHERE id = 2").await, 1);
+    assert_eq!(
+        rows_seen(&alice, "SELECT v FROM orders WHERE id = 1").await,
+        1
+    );
+    assert_eq!(
+        rows_seen(&alice, "SELECT v FROM orders WHERE id = 2").await,
+        1
+    );
 
     // Enable RLS with owner_id = current_user.
     admin
@@ -296,7 +326,10 @@ async fn pk_cache_bypassed_under_rls() {
         0,
         "RLS-bypass: bob must NOT see alice's row (id=1)"
     );
-    assert_eq!(rows_seen(&bob, "SELECT v FROM orders WHERE id = 2").await, 1);
+    assert_eq!(
+        rows_seen(&bob, "SELECT v FROM orders WHERE id = 2").await,
+        1
+    );
 
     bg.shutdown().await;
     wal.close().await.unwrap();
@@ -322,7 +355,10 @@ async fn pk_cache_ddl_invalidates() {
     let _ = engine.memtable_registry().evict_clean(&project, u64::MAX);
 
     // Warm — the cache now holds id=1's cold row for THIS project.
-    assert_eq!(int_at(&sess, "SELECT v FROM t WHERE id = 1").await, Some(10));
+    assert_eq!(
+        int_at(&sess, "SELECT v FROM t WHERE id = 1").await,
+        Some(10)
+    );
     assert_eq!(
         engine.pk_row_cache_entries(project),
         1,

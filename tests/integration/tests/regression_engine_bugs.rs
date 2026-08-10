@@ -1401,7 +1401,11 @@ async fn tombstone_cold_scan_projection_order_parquet() {
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let eng = Engine::new(EngineConfig {
         storage: storage.clone(),
         catalog: catalog.clone(),
@@ -1421,7 +1425,10 @@ async fn tombstone_cold_scan_projection_order_parquet() {
     let mut vals = Vec::new();
     for id in 0..40i64 {
         let amount = (id as f64) * 0.5; // mix of whole + half values
-        vals.push(format!("({id},{id},{amount},'a',{},'{{}}')", 100000 + id * 10000));
+        vals.push(format!(
+            "({id},{id},{amount},'a',{},'{{}}')",
+            100000 + id * 10000
+        ));
     }
     sess.execute(&format!("INSERT INTO events VALUES {}", vals.join(",")))
         .await

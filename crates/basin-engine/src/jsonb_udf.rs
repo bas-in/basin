@@ -564,23 +564,23 @@ fn strip_version_tag(bytes: &[u8]) -> &[u8] {
             if bytes.len() < 5 {
                 return bytes;
             }
-            let num_entries = u32::from_le_bytes(
-                bytes[1..5].try_into().unwrap_or([0; 4])
-            ) as usize;
+            let num_entries = u32::from_le_bytes(bytes[1..5].try_into().unwrap_or([0; 4])) as usize;
             let mut p = 5usize;
             for _ in 0..num_entries {
                 if p + 2 > bytes.len() {
                     return bytes;
                 }
-                let kl = u16::from_le_bytes(
-                    bytes[p..p + 2].try_into().unwrap_or([0; 2])
-                ) as usize;
+                let kl = u16::from_le_bytes(bytes[p..p + 2].try_into().unwrap_or([0; 2])) as usize;
                 p += 2 + kl + 4 + 4; // key + val_start + val_end
                 if p > bytes.len() {
                     return bytes;
                 }
             }
-            if p <= bytes.len() { &bytes[p..] } else { bytes }
+            if p <= bytes.len() {
+                &bytes[p..]
+            } else {
+                bytes
+            }
         }
         _ => bytes,
     }
@@ -1125,9 +1125,7 @@ fn parse_string(b: &[u8], p: &mut usize) -> Result<String, ()> {
                                 let low = parse_hex4(b, *p + 3)?;
                                 *p += 6;
                                 if (0xDC00..=0xDFFF).contains(&low) {
-                                    let c = 0x10000
-                                        + ((cp - 0xD800) << 10)
-                                        + (low - 0xDC00);
+                                    let c = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
                                     out.push(char::from_u32(c).ok_or(())?);
                                 } else {
                                     return Err(());
@@ -1251,7 +1249,10 @@ fn raw_get_key<'a>(doc: &RawJson<'a>, key: &str) -> Result<Option<&'a [u8]>, ()>
 fn raw_walk_path<'a>(bytes: &'a [u8], segments: &[String]) -> Result<Option<&'a [u8]>, ()> {
     let mut cur: &'a [u8] = RawJson::new(bytes).b;
     for seg in segments {
-        let node = RawJson { b: cur, v2_table: None };
+        let node = RawJson {
+            b: cur,
+            v2_table: None,
+        };
         let next = match node.top_type() {
             Some(RawType::Object) => node.member(seg)?,
             Some(RawType::Array) => match seg.parse::<usize>() {
@@ -2502,8 +2503,8 @@ fn jsonb_extract_path_fallback(
     segs: &[String],
     fn_name: &str,
 ) -> DFResult<Option<Value>> {
-    let mut cur = jsonb_to_value(bytes)
-        .map_err(|e| DataFusionError::Execution(format!("{fn_name}: {e}")))?;
+    let mut cur =
+        jsonb_to_value(bytes).map_err(|e| DataFusionError::Execution(format!("{fn_name}: {e}")))?;
     for key_str in segs {
         cur = match cur {
             Value::Object(mut map) => match map.remove(key_str.as_str()) {
@@ -4223,7 +4224,9 @@ impl ScalarUDFImpl for JsonGetUdf {
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
                 .ok_or_else(|| {
-                    DataFusionError::Execution("json_get: downcast to LargeBinaryArray failed".into())
+                    DataFusionError::Execution(
+                        "json_get: downcast to LargeBinaryArray failed".into(),
+                    )
                 })?;
             return with_batch_index(lb, |idx| -> DFResult<ColumnarValue> {
                 for i in 0..n {
@@ -4246,7 +4249,9 @@ impl ScalarUDFImpl for JsonGetUdf {
                             match doc.top_type() {
                                 Some(RawType::Array) => match key.parse::<i64>() {
                                     Ok(idx_val) => match doc.index(idx_val) {
-                                        Ok(Some(slice)) => out.push(Some(value_to_jsonb(&raw_slice_to_value(slice)?)?)),
+                                        Ok(Some(slice)) => out.push(Some(value_to_jsonb(
+                                            &raw_slice_to_value(slice)?,
+                                        )?)),
                                         Ok(None) => out.push(None),
                                         Err(()) => {
                                             let v = jsonb_get_fallback(bytes, &key, "json_get")?;
@@ -4259,13 +4264,17 @@ impl ScalarUDFImpl for JsonGetUdf {
                             }
                         }
                         Ok(None) => out.push(None), // null row
-                        Ok(Some(slice)) => out.push(Some(value_to_jsonb(&raw_slice_to_value(slice)?)?)),
+                        Ok(Some(slice)) => {
+                            out.push(Some(value_to_jsonb(&raw_slice_to_value(slice)?)?))
+                        }
                         Err(()) => {
                             // Non-indexed row (non-object or malformed) — RawJson fallback.
                             let bytes = lb.value(i);
                             let doc = RawJson::new(bytes);
                             match raw_get_key(&doc, &key) {
-                                Ok(Some(slice)) => out.push(Some(value_to_jsonb(&raw_slice_to_value(slice)?)?)),
+                                Ok(Some(slice)) => {
+                                    out.push(Some(value_to_jsonb(&raw_slice_to_value(slice)?)?))
+                                }
                                 Ok(None) => out.push(None),
                                 Err(()) => {
                                     let v = jsonb_get_fallback(bytes, &key, "json_get")?;
@@ -4322,9 +4331,8 @@ impl ScalarUDFImpl for JsonGetUdf {
 /// the byte-scanner reports malformed input. Identical semantics to the
 /// historical full-parse path.
 fn jsonb_get_fallback(bytes: &[u8], key: &str, fn_name: &str) -> DFResult<Option<Value>> {
-    let doc = jsonb_to_value(bytes).map_err(|e| {
-        DataFusionError::Execution(format!("{fn_name}: {e}"))
-    })?;
+    let doc =
+        jsonb_to_value(bytes).map_err(|e| DataFusionError::Execution(format!("{fn_name}: {e}")))?;
     Ok(match &doc {
         Value::Object(map) => map.get(key).cloned(),
         Value::Array(arr) => key
@@ -4419,12 +4427,15 @@ impl ScalarUDFImpl for JsonGetTextUdf {
                                         Ok(Some(slice)) => out.push(raw_slice_to_text(slice)?),
                                         Ok(None) => out.push(None),
                                         Err(()) => {
-                                            let child = jsonb_get_fallback(bytes, &key, "json_get_text")?;
+                                            let child =
+                                                jsonb_get_fallback(bytes, &key, "json_get_text")?;
                                             out.push(match child {
                                                 None => None,
                                                 Some(Value::String(s)) => Some(s),
                                                 Some(Value::Null) => None,
-                                                Some(v) => Some(serde_json::to_string(&v).unwrap_or_default()),
+                                                Some(v) => Some(
+                                                    serde_json::to_string(&v).unwrap_or_default(),
+                                                ),
                                             });
                                         }
                                     },
@@ -4448,7 +4459,9 @@ impl ScalarUDFImpl for JsonGetTextUdf {
                                         None => None,
                                         Some(Value::String(s)) => Some(s),
                                         Some(Value::Null) => None,
-                                        Some(v) => Some(serde_json::to_string(&v).unwrap_or_default()),
+                                        Some(v) => {
+                                            Some(serde_json::to_string(&v).unwrap_or_default())
+                                        }
                                     });
                                 }
                             }
@@ -4549,12 +4562,10 @@ impl ScalarUDFImpl for JsonPathExtractUdf {
             match raw_walk_path(bytes, &segments) {
                 Ok(Some(slice)) => out.push(Some(value_to_jsonb(&raw_slice_to_value(slice)?)?)),
                 Ok(None) => out.push(None),
-                Err(()) => {
-                    match jsonb_path_fallback(bytes, &segments, "json_path_extract")? {
-                        Some(v) => out.push(Some(value_to_jsonb(&v)?)),
-                        None => out.push(None),
-                    }
-                }
+                Err(()) => match jsonb_path_fallback(bytes, &segments, "json_path_extract")? {
+                    Some(v) => out.push(Some(value_to_jsonb(&v)?)),
+                    None => out.push(None),
+                },
             }
         }
         let result = LargeBinaryArray::from_iter(out.iter().map(|o| o.as_deref()));
@@ -4570,8 +4581,8 @@ fn jsonb_path_fallback(
     segments: &[String],
     fn_name: &str,
 ) -> DFResult<Option<Value>> {
-    let doc = jsonb_to_value(bytes)
-        .map_err(|e| DataFusionError::Execution(format!("{fn_name}: {e}")))?;
+    let doc =
+        jsonb_to_value(bytes).map_err(|e| DataFusionError::Execution(format!("{fn_name}: {e}")))?;
     let mut cur = doc;
     for seg in segments {
         let tmp = std::mem::replace(&mut cur, Value::Null);
@@ -4714,8 +4725,7 @@ impl ScalarUDFImpl for JsonbContainsUdf {
             // parse the row's value for the rare column-vs-column form.
             let row_needle: Option<Value> = if needle_is_scalar {
                 if scalar_needle.is_none() {
-                    scalar_needle =
-                        Some(extract_jsonb_value(&right_arr, i, "jsonb_contains")?);
+                    scalar_needle = Some(extract_jsonb_value(&right_arr, i, "jsonb_contains")?);
                 }
                 None
             } else {
@@ -5694,7 +5704,13 @@ fn extract_key_list(arr: &ArrayRef, i: usize) -> Option<Vec<String>> {
             match sa {
                 Some(sa) => Some(
                     (0..sa.len())
-                        .filter_map(|j| if sa.is_null(j) { None } else { Some(sa.value(j).to_string()) })
+                        .filter_map(|j| {
+                            if sa.is_null(j) {
+                                None
+                            } else {
+                                Some(sa.value(j).to_string())
+                            }
+                        })
                         .collect(),
                 ),
                 None => Some(vec![]),
@@ -5708,7 +5724,13 @@ fn extract_key_list(arr: &ArrayRef, i: usize) -> Option<Vec<String>> {
             match sa {
                 Some(sa) => Some(
                     (0..sa.len())
-                        .filter_map(|j| if sa.is_null(j) { None } else { Some(sa.value(j).to_string()) })
+                        .filter_map(|j| {
+                            if sa.is_null(j) {
+                                None
+                            } else {
+                                Some(sa.value(j).to_string())
+                            }
+                        })
                         .collect(),
                 ),
                 None => Some(vec![]),
@@ -6266,10 +6288,12 @@ mod perf_bench {
         let arr: ArrayRef = Arc::new(LargeBinaryArray::from_iter(
             rows.iter().map(|r| Some(r.as_slice())),
         ));
-        let k1: ArrayRef =
-            Arc::new(StringArray::from_iter_values(std::iter::repeat("user").take(N)));
-        let k2: ArrayRef =
-            Arc::new(StringArray::from_iter_values(std::iter::repeat("name").take(N)));
+        let k1: ArrayRef = Arc::new(StringArray::from_iter_values(
+            std::iter::repeat("user").take(N),
+        ));
+        let k2: ArrayRef = Arc::new(StringArray::from_iter_values(
+            std::iter::repeat("name").take(N),
+        ));
         let keys = [k1, k2];
 
         // SLOW: pre-optimization shape — per-row downcast + key `to_string()`.
@@ -6291,8 +6315,10 @@ mod perf_bench {
 
         // FAST: hoisted downcast + &str key access.
         let tj = TypedJsonbArray::new(&arr, "b").unwrap();
-        let kt: Vec<TypedStringRef<'_>> =
-            keys.iter().map(|k| TypedStringRef::new(k, "b").unwrap()).collect();
+        let kt: Vec<TypedStringRef<'_>> = keys
+            .iter()
+            .map(|k| TypedStringRef::new(k, "b").unwrap())
+            .collect();
         let t1 = Instant::now();
         for row in 0..N {
             let v = jsonb_extract_path_row_typed(&tj, row, &kt, "b").unwrap();
@@ -6387,7 +6413,10 @@ mod perf_bench {
         if std::env::var("BASIN_JSONB_BENCH").as_deref() != Ok("1") {
             return;
         }
-        let small = parity_payloads().into_iter().max_by_key(|s| s.len()).unwrap();
+        let small = parity_payloads()
+            .into_iter()
+            .max_by_key(|s| s.len())
+            .unwrap();
         let large = {
             let mut items = String::new();
             for i in 0..512 {
@@ -6528,7 +6557,8 @@ mod perf_bench {
         payloads.push(r#"{"k":1,"k":2,"k":3}"#.to_string());
         payloads.push(r#"{"a\"b":"v1","c\\d":"v2","e/f":"v3"}"#.to_string());
         payloads.push(r#"{"emoji":"😀","bmp":"é ☃"}"#.to_string());
-        payloads.push(r#"{"arr":[10,20,30,40],"nested":{"deep":{"x":[true,null,"s"]}}}"#.to_string());
+        payloads
+            .push(r#"{"arr":[10,20,30,40],"nested":{"deep":{"x":[true,null,"s"]}}}"#.to_string());
         payloads.push(r#"{"empty_obj":{},"empty_arr":[],"n":null}"#.to_string());
         payloads.push(r#"[{"id":0},{"id":1},{"id":2}]"#.to_string());
 
@@ -6575,15 +6605,17 @@ mod perf_bench {
                     Some(slice) => Some(raw_slice_to_value(slice).unwrap()),
                     None => None,
                 };
-                assert_eq!(got_path, oracle_path(bytes, &segs), "#> seg={key:?} payload={p}");
+                assert_eq!(
+                    got_path,
+                    oracle_path(bytes, &segs),
+                    "#> seg={key:?} payload={p}"
+                );
 
                 // ? (jsonb_has_key)
                 let has = RawJson::new(bytes).has_key(key).unwrap();
                 let has_oracle = match &v {
                     Value::Object(m) => m.contains_key(key),
-                    Value::Array(a) => {
-                        a.iter().any(|e| matches!(e, Value::String(s) if s == key))
-                    }
+                    Value::Array(a) => a.iter().any(|e| matches!(e, Value::String(s) if s == key)),
                     _ => false,
                 };
                 assert_eq!(has, has_oracle, "? key={key:?} payload={p}");
@@ -6666,7 +6698,10 @@ mod perf_bench {
             return;
         }
         // ~1KB arbitrary nested doc (last of the parity battery).
-        let payload = parity_payloads().into_iter().max_by_key(|s| s.len()).unwrap();
+        let payload = parity_payloads()
+            .into_iter()
+            .max_by_key(|s| s.len())
+            .unwrap();
         let bytes = payload.as_bytes();
         eprintln!("payload size: {} bytes", bytes.len());
         // Probe the LAST top-level key (worst case for the scanner: it must
@@ -6739,9 +6774,10 @@ mod perf_bench {
         payloads.push(r#"{"k":1,"k":2,"k":3}"#.to_string()); // duplicate keys: last wins
         payloads.push(r#"{"a\"b":"v1","c\\d":"v2","e/f":"v3"}"#.to_string()); // escaped keys
         payloads.push(r#"{"emoji":"😀","bmp":"é ☃"}"#.to_string()); // unicode
-        payloads.push(r#"{"arr":[10,20,30,40],"nested":{"deep":{"x":[true,null,"s"]}}}"#.to_string());
+        payloads
+            .push(r#"{"arr":[10,20,30,40],"nested":{"deep":{"x":[true,null,"s"]}}}"#.to_string());
         payloads.push(r#"{"empty_obj":{},"empty_arr":[],"n":null}"#.to_string()); // empty containers
-        // Non-object roots: the index must leave these as None (RawJson fallback).
+                                                                                  // Non-object roots: the index must leave these as None (RawJson fallback).
         payloads.push(r#"[{"id":0},{"id":1}]"#.to_string()); // array root
         payloads.push(r#"null"#.to_string()); // null root
         payloads.push(r#"42"#.to_string()); // number root
@@ -6751,26 +6787,20 @@ mod perf_bench {
             let v = jsonb_to_value(bytes).unwrap();
 
             // Derive probe keys generically from the document structure.
-            let mut keys = vec![
-                "0".to_string(),
-                "1".to_string(),
-                "__absent__".to_string(),
-            ];
+            let mut keys = vec!["0".to_string(), "1".to_string(), "__absent__".to_string()];
             probe_keys(&v, &mut keys);
             keys.sort();
             keys.dedup();
 
             // Build the batch index for a single-row LargeBinaryArray.
-            let arr = LargeBinaryArray::from_iter(
-                std::iter::once(Some(bytes)),
-            );
+            let arr = LargeBinaryArray::from_iter(std::iter::once(Some(bytes)));
             let idx = JsonbBatchIndex::build(&arr);
 
             // For object-root documents: each key lookup must match RawJson::member.
             if matches!(v, Value::Object(_)) {
-                let row_idx = idx.rows[0].as_ref().expect(
-                    "object-root document must produce a non-None index entry",
-                );
+                let row_idx = idx.rows[0]
+                    .as_ref()
+                    .expect("object-root document must produce a non-None index entry");
                 for key in &keys {
                     // Oracle: RawJson::member.
                     let oracle_slice = RawJson::new(bytes).member(key).unwrap();
@@ -6867,7 +6897,10 @@ mod perf_bench {
         const N: usize = 100_000;
 
         // ~1 KB arbitrary nested document (last of the parity battery).
-        let template = parity_payloads().into_iter().max_by_key(|s| s.len()).unwrap();
+        let template = parity_payloads()
+            .into_iter()
+            .max_by_key(|s| s.len())
+            .unwrap();
         let v = jsonb_to_value(template.as_bytes()).unwrap();
         // Extract up to 4 top-level keys generically (no names hardcoded).
         let probe_keys_top: Vec<String> = match &v {
@@ -6968,15 +7001,9 @@ mod perf_bench {
         payloads.push(r#"{"arr":[10,20,30],"obj":{"x":1},"n":null,"b":true}"#.to_string());
         payloads.push(r#"{"empty_obj":{},"empty_arr":[]}"#.to_string());
         payloads.push(r#"{}"#.to_string()); // empty object
-        // Non-object roots: encoder must fall back (return Err), so these are
-        // tested to verify that encode_jsonb_v2 rejects them.
-        let non_objects = [
-            r#"[1,2,3]"#,
-            r#"null"#,
-            r#"42"#,
-            r#""string""#,
-            r#"true"#,
-        ];
+                                            // Non-object roots: encoder must fall back (return Err), so these are
+                                            // tested to verify that encode_jsonb_v2 rejects them.
+        let non_objects = [r#"[1,2,3]"#, r#"null"#, r#"42"#, r#""string""#, r#"true"#];
         for doc in &non_objects {
             let bytes = doc.as_bytes();
             assert!(
@@ -7000,10 +7027,7 @@ mod perf_bench {
             assert_eq!(encoded[0], 0x02, "Phase 2 tag must be 0x02: payload={p}");
 
             // Derive probe keys generically from the document structure.
-            let mut keys = vec![
-                "0".to_string(),
-                "__absent__".to_string(),
-            ];
+            let mut keys = vec!["0".to_string(), "__absent__".to_string()];
             probe_keys(&v, &mut keys);
             keys.sort();
             keys.dedup();
@@ -7058,7 +7082,10 @@ mod perf_bench {
         const N: usize = 100_000;
 
         // Use the largest payload from the parity battery (~1KB).
-        let template = parity_payloads().into_iter().max_by_key(|s| s.len()).unwrap();
+        let template = parity_payloads()
+            .into_iter()
+            .max_by_key(|s| s.len())
+            .unwrap();
         let json_bytes = template.as_bytes();
         eprintln!("payload: {} bytes", json_bytes.len());
 
@@ -7145,10 +7172,10 @@ mod raw_contains_tests {
     /// falls back to the reference path there, so refusal is correct; for
     /// same-shape pairs it must answer, and the answer must match.
     fn assert_parity(doc: &str, needle: &str) {
-        let dv: Value = serde_json::from_str(doc)
-            .unwrap_or_else(|e| panic!("bad doc {doc:?}: {e}"));
-        let nv: Value = serde_json::from_str(needle)
-            .unwrap_or_else(|e| panic!("bad needle {needle:?}: {e}"));
+        let dv: Value =
+            serde_json::from_str(doc).unwrap_or_else(|e| panic!("bad doc {doc:?}: {e}"));
+        let nv: Value =
+            serde_json::from_str(needle).unwrap_or_else(|e| panic!("bad needle {needle:?}: {e}"));
         let expected = json_contains(&dv, &nv);
         match raw_contains(doc.as_bytes(), &nv) {
             Ok(got) => assert_eq!(
@@ -7167,7 +7194,10 @@ mod raw_contains_tests {
         let mut tagged = vec![0x01u8];
         tagged.extend_from_slice(doc.as_bytes());
         match raw_contains(&tagged, &nv) {
-            Ok(got) => assert_eq!(got, expected, "0x01-tagged parity: doc={doc} needle={needle}"),
+            Ok(got) => assert_eq!(
+                got, expected,
+                "0x01-tagged parity: doc={doc} needle={needle}"
+            ),
             Err(()) => {
                 let mismatch = std::mem::discriminant(&dv) != std::mem::discriminant(&nv);
                 assert!(mismatch, "tagged refusal on same-shape pair: doc={doc}");
@@ -7208,11 +7238,20 @@ mod raw_contains_tests {
         assert_parity(r#"{"a":{"x":1,"y":2}}"#, r#"{"a":{"x":1,"y":2}}"#);
         assert_parity(r#"{"a":{"x":1,"y":2}}"#, r#"{"a":{"z":3}}"#);
         assert_parity(r#"{"a":{"x":1,"y":2}}"#, r#"{"a":{}}"#);
-        assert_parity(r#"{"a":{"x":{"deep":[1,2]}},"b":0}"#, r#"{"a":{"x":{"deep":[2]}}}"#);
+        assert_parity(
+            r#"{"a":{"x":{"deep":[1,2]}},"b":0}"#,
+            r#"{"a":{"x":{"deep":[2]}}}"#,
+        );
         assert_parity(r#"{"a":{"x":1}}"#, r#"{"a":1}"#); // object vs scalar
         assert_parity(r#"{"a":1}"#, r#"{"a":{"x":1}}"#); // scalar vs object
-        assert_parity(r#"{"a":{"b":{"c":{"d":null}}}}"#, r#"{"a":{"b":{"c":{"d":null}}}}"#);
-        assert_parity(r#"{"a":{"b":{"c":{"d":null}}}}"#, r#"{"a":{"b":{"c":{"d":0}}}}"#);
+        assert_parity(
+            r#"{"a":{"b":{"c":{"d":null}}}}"#,
+            r#"{"a":{"b":{"c":{"d":null}}}}"#,
+        );
+        assert_parity(
+            r#"{"a":{"b":{"c":{"d":null}}}}"#,
+            r#"{"a":{"b":{"c":{"d":0}}}}"#,
+        );
     }
 
     #[test]
@@ -7224,14 +7263,8 @@ mod raw_contains_tests {
         assert_parity(r#"{"t":[]}"#, r#"{"t":[]}"#);
         assert_parity(r#"{"t":[]}"#, r#"{"t":[1]}"#);
         // Arrays of objects: element containment is recursive.
-        assert_parity(
-            r#"{"t":[{"k":1,"x":9},{"k":2}]}"#,
-            r#"{"t":[{"k":1}]}"#,
-        );
-        assert_parity(
-            r#"{"t":[{"k":1,"x":9},{"k":2}]}"#,
-            r#"{"t":[{"k":3}]}"#,
-        );
+        assert_parity(r#"{"t":[{"k":1,"x":9},{"k":2}]}"#, r#"{"t":[{"k":1}]}"#);
+        assert_parity(r#"{"t":[{"k":1,"x":9},{"k":2}]}"#, r#"{"t":[{"k":3}]}"#);
         // Duplicate needle elements; nested arrays.
         assert_parity(r#"{"t":[[1,2],[3]]}"#, r#"{"t":[[1]]}"#);
         assert_parity(r#"{"t":[[1,2],[3]]}"#, r#"{"t":[[4]]}"#);
@@ -7261,8 +7294,14 @@ mod raw_contains_tests {
         assert_parity(r#"{"n":-0}"#, r#"{"n":0}"#);
         assert_parity(r#"{"n":0}"#, r#"{"n":-0}"#);
         assert_parity(r#"{"n":-1}"#, r#"{"n":-1}"#);
-        assert_parity(r#"{"n":9223372036854775807}"#, r#"{"n":9223372036854775807}"#);
-        assert_parity(r#"{"n":18446744073709551615}"#, r#"{"n":18446744073709551615}"#);
+        assert_parity(
+            r#"{"n":9223372036854775807}"#,
+            r#"{"n":9223372036854775807}"#,
+        );
+        assert_parity(
+            r#"{"n":18446744073709551615}"#,
+            r#"{"n":18446744073709551615}"#,
+        );
         assert_parity(r#"{"n":0.1}"#, r#"{"n":0.1}"#);
         assert_parity(r#"{"n":0.30000000000000004}"#, r#"{"n":0.3}"#);
     }
@@ -7286,10 +7325,19 @@ mod raw_contains_tests {
         // Escaped keys must match raw needle keys and vice versa.
         assert_parity(r#"{"k\u00e9y":"v"}"#, r#"{"kéy":"v"}"#);
         assert_parity(r#"{"kéy":"v"}"#, r#"{"k\u00e9y":"v"}"#);
-        assert_parity(r#"{"na\u00efve":"résumé"}"#, r#"{"naïve":"r\u00e9sum\u00e9"}"#);
+        assert_parity(
+            r#"{"na\u00efve":"résumé"}"#,
+            r#"{"naïve":"r\u00e9sum\u00e9"}"#,
+        );
         // Unicode in nested structures.
-        assert_parity(r#"{"a":{"\u65e5\u672c":"\u8a9e"}}"#, r#"{"a":{"日本":"語"}}"#);
-        assert_parity(r#"{"a":{"日本":"語"}}"#, r#"{"a":{"\u65e5\u672c":"\u8aa4"}}"#);
+        assert_parity(
+            r#"{"a":{"\u65e5\u672c":"\u8a9e"}}"#,
+            r#"{"a":{"日本":"語"}}"#,
+        );
+        assert_parity(
+            r#"{"a":{"日本":"語"}}"#,
+            r#"{"a":{"\u65e5\u672c":"\u8aa4"}}"#,
+        );
     }
 
     #[test]
@@ -7314,17 +7362,25 @@ mod raw_contains_tests {
         // ADR 0027 Phase 2 (0x02) encoded docs route through RawJson::new's
         // header skip; containment must agree with the bare-JSON reference.
         let cases = [
-            (r#"{"tag":"a","n":1,"nested":{"x":[1,2]}}"#, r#"{"tag":"a"}"#),
-            (r#"{"tag":"a","n":1,"nested":{"x":[1,2]}}"#, r#"{"nested":{"x":[2]}}"#),
-            (r#"{"tag":"a","n":1,"nested":{"x":[1,2]}}"#, r#"{"tag":"b"}"#),
+            (
+                r#"{"tag":"a","n":1,"nested":{"x":[1,2]}}"#,
+                r#"{"tag":"a"}"#,
+            ),
+            (
+                r#"{"tag":"a","n":1,"nested":{"x":[1,2]}}"#,
+                r#"{"nested":{"x":[2]}}"#,
+            ),
+            (
+                r#"{"tag":"a","n":1,"nested":{"x":[1,2]}}"#,
+                r#"{"tag":"b"}"#,
+            ),
             (r#"{"tag":"a","n":1}"#, r#"{"n":1}"#),
         ];
         for (doc, needle) in cases {
             let dv: Value = serde_json::from_str(doc).unwrap();
             let nv: Value = serde_json::from_str(needle).unwrap();
             let expected = json_contains(&dv, &nv);
-            let encoded = crate::dml::encode_jsonb_v2(doc.as_bytes())
-                .expect("v2 encode");
+            let encoded = crate::dml::encode_jsonb_v2(doc.as_bytes()).expect("v2 encode");
             match raw_contains(&encoded, &nv) {
                 Ok(got) => assert_eq!(got, expected, "v2 parity: doc={doc} needle={needle}"),
                 Err(()) => panic!("v2 fast path refused object/object pair: doc={doc}"),
@@ -7337,12 +7393,12 @@ mod raw_contains_tests {
         let nv: Value = serde_json::from_str(r#"{"a":1}"#).unwrap();
         // Structurally broken docs must Err (fall back), never Ok(false/true).
         for bad in [
-            "{\"a\":1",          // unterminated object
-            "{\"a\" 1}",         // missing colon
-            "{\"a\":1,}",        // trailing comma (serde rejects)
-            "{a:1}",             // unquoted key
-            "",                  // empty
-            "@@@@",              // garbage
+            "{\"a\":1",   // unterminated object
+            "{\"a\" 1}",  // missing colon
+            "{\"a\":1,}", // trailing comma (serde rejects)
+            "{a:1}",      // unquoted key
+            "",           // empty
+            "@@@@",       // garbage
         ] {
             match raw_contains(bad.as_bytes(), &nv) {
                 Err(()) => {}
@@ -7366,7 +7422,10 @@ mod raw_contains_tests {
         struct Lcg(u64);
         impl Lcg {
             fn next(&mut self) -> u64 {
-                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 self.0 >> 33
             }
             fn pick(&mut self, n: usize) -> usize {
@@ -7446,13 +7505,13 @@ mod raw_contains_tests {
             let expected = json_contains(&doc, &needle);
             match raw_contains(doc_text.as_bytes(), &needle) {
                 Ok(got) => assert_eq!(
-                    got, expected,
+                    got,
+                    expected,
                     "round {round}: doc={doc_text} needle={}",
                     serde_json::to_string(&needle).unwrap()
                 ),
                 Err(()) => {
-                    let mismatch = std::mem::discriminant(&doc)
-                        != std::mem::discriminant(&needle);
+                    let mismatch = std::mem::discriminant(&doc) != std::mem::discriminant(&needle);
                     assert!(
                         mismatch,
                         "round {round}: refused same-shape pair doc={doc_text} needle={}",

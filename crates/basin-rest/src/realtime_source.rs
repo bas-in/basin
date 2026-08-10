@@ -20,9 +20,7 @@
 use std::sync::Arc;
 
 use basin_common::ProjectId;
-use basin_engine::realtime_catalog::{
-    BroadcastChannelRow, BudgetSnapshot, RealtimeChannelSource,
-};
+use basin_engine::realtime_catalog::{BroadcastChannelRow, BudgetSnapshot, RealtimeChannelSource};
 use basin_realtime::{BudgetTracker, ChannelRegistry};
 
 /// Combined view of `ChannelRegistry` (broadcast channels) and `BudgetTracker`
@@ -64,9 +62,7 @@ impl RealtimeChannelSource for RealtimeSinkSource {
 /// Extracts the registry and budget tracker from the sink so that the engine's
 /// virtual tables (`basin_realtime.channels`, `basin_realtime.stats`) see the
 /// same live state as the post-commit fanout path.
-pub fn make_realtime_source(
-    sink: &basin_realtime::RealtimeSink,
-) -> Arc<dyn RealtimeChannelSource> {
+pub fn make_realtime_source(sink: &basin_realtime::RealtimeSink) -> Arc<dyn RealtimeChannelSource> {
     Arc::new(RealtimeSinkSource::new(
         sink.registry().clone(),
         sink.budget().clone(),
@@ -77,9 +73,9 @@ pub fn make_realtime_source(
 mod tests {
     use super::*;
     use basin_common::ProjectId;
+    use basin_common::{ChangeEvent, ChangeOp, TableName};
     use basin_engine::realtime_catalog::RealtimeChannelSource;
     use basin_realtime::{ChannelKey, RealtimeSink};
-    use basin_common::{ChangeEvent, ChangeOp, TableName};
     use chrono::Utc;
 
     fn make_sink() -> RealtimeSink {
@@ -157,10 +153,9 @@ mod tests {
         let sink = make_sink();
         let project_a = ProjectId::new();
         let project_b = ProjectId::new();
-        let _rx = sink.registry().subscribe(ChannelKey::new(
-            project_a,
-            TableName::new("tbl").unwrap(),
-        ));
+        let _rx = sink
+            .registry()
+            .subscribe(ChannelKey::new(project_a, TableName::new("tbl").unwrap()));
 
         let source = make_realtime_source(&sink);
         // project_a has one channel, project_b has none.

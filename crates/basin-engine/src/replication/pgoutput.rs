@@ -47,11 +47,7 @@ use crate::replication::lsn;
 /// The frame `data` strings start with the standard pgoutput message type
 /// byte (B / R / I / U / D / C) so callers can assert on the message type
 /// without a full binary decode.
-pub fn encode_change_event(
-    event: &ChangeEvent,
-    commit_seq: u64,
-    xid: u32,
-) -> [PendingFrame; 4] {
+pub fn encode_change_event(event: &ChangeEvent, commit_seq: u64, xid: u32) -> [PendingFrame; 4] {
     let begin_lsn = lsn::lsn_for_frame(commit_seq, 0);
     let relation_lsn = lsn::lsn_for_frame(commit_seq, 1);
     let change_lsn = lsn::lsn_for_frame(commit_seq, 2);
@@ -72,9 +68,7 @@ pub fn encode_change_event(
     let relation_frame = PendingFrame {
         lsn: relation_lsn,
         xid,
-        data: format!(
-            "R rel_id=0 schema=public table={table_name} replica_identity=d"
-        ),
+        data: format!("R rel_id=0 schema=public table={table_name} replica_identity=d"),
     };
 
     // I / U / D — data change
@@ -209,10 +203,26 @@ mod tests {
         let event = make_insert_event();
         let frames = encode_change_event(&event, 1, 100);
         assert_eq!(frames.len(), 4);
-        assert!(frames[0].data.starts_with('B'), "expected BEGIN: {}", frames[0].data);
-        assert!(frames[1].data.starts_with('R'), "expected RELATION: {}", frames[1].data);
-        assert!(frames[2].data.starts_with('I'), "expected INSERT: {}", frames[2].data);
-        assert!(frames[3].data.starts_with('C'), "expected COMMIT: {}", frames[3].data);
+        assert!(
+            frames[0].data.starts_with('B'),
+            "expected BEGIN: {}",
+            frames[0].data
+        );
+        assert!(
+            frames[1].data.starts_with('R'),
+            "expected RELATION: {}",
+            frames[1].data
+        );
+        assert!(
+            frames[2].data.starts_with('I'),
+            "expected INSERT: {}",
+            frames[2].data
+        );
+        assert!(
+            frames[3].data.starts_with('C'),
+            "expected COMMIT: {}",
+            frames[3].data
+        );
     }
 
     #[test]

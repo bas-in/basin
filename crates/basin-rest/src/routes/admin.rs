@@ -16,11 +16,11 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use basin_catalog::{S3Config, ProjectMetadata};
+use basin_catalog::{ProjectMetadata, S3Config};
 use basin_common::ProjectId;
+use hex;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use hex;
 
 // P2-1: new key length requirement for blob signing key rotation.
 const BLOB_SIGNING_KEY_MIN_BYTES: usize = 32;
@@ -158,7 +158,12 @@ pub(crate) async fn get_all_usage(
 ) -> Result<Response, ApiError> {
     let claims = authorize(&state, &headers).await?;
     require_admin(&claims)?;
-    let projects = state.cfg.auth.list_projects().await.map_err(ApiError::from)?;
+    let projects = state
+        .cfg
+        .auth
+        .list_projects()
+        .await
+        .map_err(ApiError::from)?;
     let mut rows: Vec<(u64, Value)> = projects
         .iter()
         .map(|p| {
@@ -198,7 +203,12 @@ pub(crate) async fn list_projects(
 ) -> Result<Response, ApiError> {
     let claims = authorize(&state, &headers).await?;
     require_admin(&claims)?;
-    let projects = state.cfg.auth.list_projects().await.map_err(ApiError::from)?;
+    let projects = state
+        .cfg
+        .auth
+        .list_projects()
+        .await
+        .map_err(ApiError::from)?;
     let ids: Vec<String> = projects.iter().map(|p| p.to_string()).collect();
     Ok((StatusCode::OK, Json(json!({ "projects": ids }))).into_response())
 }
@@ -260,7 +270,10 @@ pub(crate) async fn delete_project(
         .await
         .map_err(ApiError::from)?;
     // 2. Catalog rows (tables, snapshots, namespace).
-    catalog.drop_namespace(&project).await.map_err(ApiError::from)?;
+    catalog
+        .drop_namespace(&project)
+        .await
+        .map_err(ApiError::from)?;
     // 3. pgwire credentials.
     state
         .cfg
@@ -293,7 +306,9 @@ pub(crate) async fn rotate_project(
 
     // Pre-check: new-format pgwire_user encodes the project ULID as its first
     // 26 characters. If present, enforce binding before touching the DB.
-    if let Some(ulid_prefix) = basin_auth::project_credentials::parse_project_from_pgwire_user(&pgwire_user) {
+    if let Some(ulid_prefix) =
+        basin_auth::project_credentials::parse_project_from_pgwire_user(&pgwire_user)
+    {
         let path_project: ProjectId = ulid_prefix
             .parse()
             .map_err(|e| ApiError::invalid(format!("invalid project_id in pgwire_user: {e}")))?;
@@ -509,11 +524,7 @@ pub(crate) async fn register_byo_bucket(
     // calling here.
     engine_cfg
         .storage
-        .register_byo_object_store_from_config_with_secret(
-            project,
-            &cfg,
-            &req.secret_access_key,
-        )
+        .register_byo_object_store_from_config_with_secret(project, &cfg, &req.secret_access_key)
         .map_err(ApiError::from)?;
 
     Ok(StatusCode::NO_CONTENT.into_response())

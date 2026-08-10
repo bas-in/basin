@@ -548,7 +548,9 @@ impl AdvisorySessionLocks {
     /// The project namespace as a `u128` (`0` until `set_registry`).
     fn project_namespace(&self) -> u128 {
         let lo = self.project_ns.load(std::sync::atomic::Ordering::Relaxed) as u128;
-        let hi = self.project_ns_hi.load(std::sync::atomic::Ordering::Relaxed) as u128;
+        let hi = self
+            .project_ns_hi
+            .load(std::sync::atomic::Ordering::Relaxed) as u128;
         (hi << 64) | lo
     }
 
@@ -1349,7 +1351,8 @@ mod tests {
         });
 
         b.set_lock_timeout(Some(Duration::from_millis(500)));
-        b.block_lock(key, false).expect("B must acquire after A releases");
+        b.block_lock(key, false)
+            .expect("B must acquire after A releases");
         b.session_unlock(key);
     }
 
@@ -1373,7 +1376,8 @@ mod tests {
         // Explicit zero timeout — wait indefinitely.
         b.set_lock_timeout(Some(Duration::ZERO));
         assert_eq!(b.effective_timeout(), None);
-        b.block_lock(key, false).expect("must acquire once A releases");
+        b.block_lock(key, false)
+            .expect("must acquire once A releases");
         b.session_unlock(key);
     }
 
@@ -1399,7 +1403,10 @@ mod tests {
 
         // Both acquire the same numeric key concurrently.
         assert!(p1.try_lock(key, false));
-        assert!(p2.try_lock(key, false), "different project must not contend");
+        assert!(
+            p2.try_lock(key, false),
+            "different project must not contend"
+        );
 
         // Within p1, a *second* session in the same project IS excluded.
         let p1b = session_in_project(0x1111_1111_1111_1111_2222_2222_2222_2222);
@@ -1470,7 +1477,10 @@ mod tests {
 
         // Now A's wait on k2 can complete: A ACQUIRES.
         let ra = ah.join().unwrap();
-        assert!(ra.is_ok(), "surviving waiter A must acquire after B aborts: {ra:?}");
+        assert!(
+            ra.is_ok(),
+            "surviving waiter A must acquire after B aborts: {ra:?}"
+        );
 
         a.release_all_on_session_end();
     }
@@ -1647,8 +1657,14 @@ mod tests {
         // A third session can now take A's former keys (all released).
         let c = AdvisorySessionLocks::new();
         assert!(c.try_lock(k2, false), "victim's k2 must be free");
-        assert!(c.try_lock(extra, false), "victim's unrelated lock must be free");
-        assert!(c.try_lock(k1, false), "B's k1 must be free after its cleanup");
+        assert!(
+            c.try_lock(extra, false),
+            "victim's unrelated lock must be free"
+        );
+        assert!(
+            c.try_lock(k1, false),
+            "B's k1 must be free after its cleanup"
+        );
         c.session_unlock(k2);
         c.session_unlock(extra);
         c.session_unlock(k1);

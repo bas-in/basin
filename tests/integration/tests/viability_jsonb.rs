@@ -79,17 +79,14 @@ fn extract_json_payload(stored: &[u8]) -> &[u8] {
             if stored.len() < 5 {
                 return stored;
             }
-            let num_entries = u32::from_le_bytes(
-                stored[1..5].try_into().unwrap_or([0; 4]),
-            ) as usize;
+            let num_entries =
+                u32::from_le_bytes(stored[1..5].try_into().unwrap_or([0; 4])) as usize;
             let mut p = 5usize;
             for _ in 0..num_entries {
                 if p + 2 > stored.len() {
                     return stored;
                 }
-                let kl = u16::from_le_bytes(
-                    stored[p..p + 2].try_into().unwrap_or([0; 2]),
-                ) as usize;
+                let kl = u16::from_le_bytes(stored[p..p + 2].try_into().unwrap_or([0; 2])) as usize;
                 p += 2 + kl + 4 + 4;
                 if p > stored.len() {
                     return stored;
@@ -208,10 +205,10 @@ async fn viability_jsonb() {
 
     // Parse the stored bytes back into JSON values for the semantic checks.
     // Use extract_json_payload to strip any version tag (ADR 0027 Phase 2).
-    let alice_json: serde_json::Value =
-        serde_json::from_slice(extract_json_payload(&rows[0].1)).expect("alice payload not valid JSON");
-    let bob_json: serde_json::Value =
-        serde_json::from_slice(extract_json_payload(&rows[1].1)).expect("bob payload not valid JSON");
+    let alice_json: serde_json::Value = serde_json::from_slice(extract_json_payload(&rows[0].1))
+        .expect("alice payload not valid JSON");
+    let bob_json: serde_json::Value = serde_json::from_slice(extract_json_payload(&rows[1].1))
+        .expect("bob payload not valid JSON");
 
     // Logical content checks (the "round-trip passed" half of the bar).
     assert_eq!(rows[0].0, 1, "first row should be id=1");

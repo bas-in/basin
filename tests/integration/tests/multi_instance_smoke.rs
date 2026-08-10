@@ -267,21 +267,17 @@ async fn b_voluntary_handoff_within_adr_0023_budget() {
         let partition = PartitionKey::default_key();
 
         // Replica A acquires the partition and writes some rows.
-        let handle_a = shard_a.get(&iter_project, &partition).await.unwrap_or_else(|e| {
-            panic!("iter {i}: shard_a.get failed: {e}")
-        });
+        let handle_a = shard_a
+            .get(&iter_project, &partition)
+            .await
+            .unwrap_or_else(|e| panic!("iter {i}: shard_a.get failed: {e}"));
         for j in 0..5i64 {
             handle_a
                 .write_batch(&table, batch(j * 10, 10, "pre-handoff"))
                 .await
                 .unwrap_or_else(|e| panic!("iter {i}: write_batch failed: {e}"));
         }
-        let pre_rows = rows_in(
-            &handle_a
-                .read(&table, ReadOptions::default())
-                .await
-                .unwrap(),
-        );
+        let pre_rows = rows_in(&handle_a.read(&table, ReadOptions::default()).await.unwrap());
         assert_eq!(pre_rows, 50, "iter {i}: A must see 50 pre-handoff rows");
 
         // Measure voluntary yield: A flushes its memtable + transfers epoch + WAL marker.
@@ -294,15 +290,11 @@ async fn b_voluntary_handoff_within_adr_0023_budget() {
         latencies.push(stall);
 
         // B acquires the freed partition and must see ALL of A's pre-handoff rows.
-        let handle_b = shard_b.get(&iter_project, &partition).await.unwrap_or_else(|e| {
-            panic!("iter {i}: shard_b.get failed after handoff: {e}")
-        });
-        let post_rows = rows_in(
-            &handle_b
-                .read(&table, ReadOptions::default())
-                .await
-                .unwrap(),
-        );
+        let handle_b = shard_b
+            .get(&iter_project, &partition)
+            .await
+            .unwrap_or_else(|e| panic!("iter {i}: shard_b.get failed after handoff: {e}"));
+        let post_rows = rows_in(&handle_b.read(&table, ReadOptions::default()).await.unwrap());
         assert_eq!(
             post_rows, 50,
             "iter {i}: B must see A's 50 pre-handoff rows (no data loss)",
@@ -379,7 +371,12 @@ async fn c_per_project_cap_is_slice_not_n_times_per_replica() {
     let partitions: Vec<String> = (0..N).map(|i| format!("cap-part-{i}")).collect();
     for (i, partition) in partitions.iter().enumerate() {
         coordinator
-            .push_heartbeat(&project, partition, &format!("replica-{i}"), UsageDelta::zero())
+            .push_heartbeat(
+                &project,
+                partition,
+                &format!("replica-{i}"),
+                UsageDelta::zero(),
+            )
             .await
             .unwrap();
     }
@@ -389,7 +386,12 @@ async fn c_per_project_cap_is_slice_not_n_times_per_replica() {
     let mut slices: Vec<u64> = Vec::with_capacity(N);
     for (i, partition) in partitions.iter().enumerate() {
         let slice = coordinator
-            .push_heartbeat(&project, partition, &format!("replica-{i}"), UsageDelta::zero())
+            .push_heartbeat(
+                &project,
+                partition,
+                &format!("replica-{i}"),
+                UsageDelta::zero(),
+            )
             .await
             .unwrap();
         let s = slice.get(CapKind::MemtableBytes).unwrap_or(u64::MAX);
@@ -488,7 +490,10 @@ async fn d_killed_replica_leases_reassigned_no_data_loss() {
     for (i, partition) in partitions.iter().enumerate() {
         let shard = shards[i].as_ref().unwrap();
         let handle = shard.get(&project, partition).await.unwrap_or_else(|e| {
-            panic!("replica {i} failed to acquire partition {}: {e}", partition.as_str())
+            panic!(
+                "replica {i} failed to acquire partition {}: {e}",
+                partition.as_str()
+            )
         });
         // Write 10 rows. These are the "committed writes" that must survive.
         handle
@@ -543,8 +548,7 @@ async fn d_killed_replica_leases_reassigned_no_data_loss() {
             .unwrap(),
     );
     assert_eq!(
-        rows_after_takeover,
-        10,
+        rows_after_takeover, 10,
         "DATA LOSS: after takeover, new leaseholder sees {rows_after_takeover} rows, \
          expected 10 (the killed replica's committed writes). WAL replay may be broken.",
     );
@@ -565,8 +569,7 @@ async fn d_killed_replica_leases_reassigned_no_data_loss() {
             .unwrap(),
     );
     assert_eq!(
-        rows_with_new,
-        15,
+        rows_with_new, 15,
         "TAKEOVER: after acquiring orphaned partition, rescuer write landed \
          but row count unexpected: {rows_with_new} (expected 15)",
     );
@@ -604,9 +607,10 @@ async fn d_killed_replica_leases_reassigned_no_data_loss() {
     // Other surviving partitions must still be intact.
     for i in 1..P {
         let shard = shards[i].as_ref().expect("shard still alive");
-        let h = shard.get(&project, &partitions[i]).await.unwrap_or_else(|e| {
-            panic!("replica {i} lost its partition: {e}")
-        });
+        let h = shard
+            .get(&project, &partitions[i])
+            .await
+            .unwrap_or_else(|e| panic!("replica {i} lost its partition: {e}"));
         let row_count = rows_in(&h.read(&table, ReadOptions::default()).await.unwrap());
         assert_eq!(
             row_count, 10,
@@ -675,9 +679,10 @@ async fn e_concurrent_multi_shard_cross_project_isolation() {
 
         tasks.spawn(async move {
             let (project, shard) = &shards[idx];
-            let handle = shard.get(project, &partition).await.unwrap_or_else(|e| {
-                panic!("project {idx}: get partition failed: {e}")
-            });
+            let handle = shard
+                .get(project, &partition)
+                .await
+                .unwrap_or_else(|e| panic!("project {idx}: get partition failed: {e}"));
 
             let sentinel = idx.to_string();
             // Write WRITES_PER_PROJECT batches with the project's sentinel tag.
@@ -685,11 +690,7 @@ async fn e_concurrent_multi_shard_cross_project_isolation() {
                 handle
                     .write_batch(
                         &table,
-                        batch(
-                            (idx as i64) * 10_000 + w as i64,
-                            1,
-                            &sentinel,
-                        ),
+                        batch((idx as i64) * 10_000 + w as i64, 1, &sentinel),
                     )
                     .await
                     .unwrap_or_else(|e| panic!("project {idx} write {w}: {e}"));
@@ -726,8 +727,7 @@ async fn e_concurrent_multi_shard_cross_project_isolation() {
          ({PROJECTS} projects × {WRITES_PER_PROJECT} writes, N_REPLICAS={N_REPLICAS} shards)"
     );
     assert_eq!(
-        leak_count,
-        0,
+        leak_count, 0,
         "ISOLATION: {leak_count} cross-project row leak(s) in concurrent multi-shard scenario. \
          Wedge invariant violated.",
     );
@@ -802,7 +802,10 @@ async fn f_budget_resliced_when_partition_count_grows() {
     // all of them; each push returns floor(12_000 / 3) = 4_000.
     let expected_per_slice = PROJECT_CAP / 3;
     let mut round2_slices = Vec::new();
-    for (i, part) in ["partition-0", "partition-1", "partition-2"].iter().enumerate() {
+    for (i, part) in ["partition-0", "partition-1", "partition-2"]
+        .iter()
+        .enumerate()
+    {
         let s = coordinator
             .push_heartbeat(&project, part, &format!("replica-{i}"), UsageDelta::zero())
             .await

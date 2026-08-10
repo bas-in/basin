@@ -478,7 +478,12 @@ impl AuthService {
         let creds = project_credentials::list(&self.inner, project).await?;
         let mut removed = 0usize;
         for c in &creds {
-            match self.inner.store.delete_project_credential(&c.pgwire_user).await {
+            match self
+                .inner
+                .store
+                .delete_project_credential(&c.pgwire_user)
+                .await
+            {
                 Ok(()) => removed += 1,
                 // Already gone (idempotent) — count it as removed and continue.
                 Err(basin_common::BasinError::NotFound(_)) => removed += 1,
@@ -570,8 +575,7 @@ impl AuthService {
     where
         S: oauth::OAuthStore,
     {
-        oauth::begin_authorize(&self.inner, oauth_store, project_id, provider, redirect_to)
-            .await
+        oauth::begin_authorize(&self.inner, oauth_store, project_id, provider, redirect_to).await
     }
 
     /// Handle an OAuth callback. Returns tokens + redirect_to.
@@ -642,7 +646,15 @@ impl AuthService {
     where
         S: mfa::MfaStore,
     {
-        mfa::enroll_totp(&self.inner, mfa_store, enc, project_id, user_id, friendly_name).await
+        mfa::enroll_totp(
+            &self.inner,
+            mfa_store,
+            enc,
+            project_id,
+            user_id,
+            friendly_name,
+        )
+        .await
     }
 
     /// Confirm TOTP enrollment. Returns plaintext recovery codes on first factor.
@@ -659,7 +671,13 @@ impl AuthService {
         S: mfa::MfaStore,
     {
         mfa::verify_totp_factor(
-            &self.inner, mfa_store, enc, project_id, user_id, factor_id, code,
+            &self.inner,
+            mfa_store,
+            enc,
+            project_id,
+            user_id,
+            factor_id,
+            code,
         )
         .await
     }
@@ -692,7 +710,13 @@ impl AuthService {
         S: mfa::MfaStore,
     {
         mfa::verify_totp_challenge(
-            &self.inner, mfa_store, enc, project_id, user_id, challenge_id, code,
+            &self.inner,
+            mfa_store,
+            enc,
+            project_id,
+            user_id,
+            challenge_id,
+            code,
         )
         .await
     }
@@ -726,7 +750,13 @@ impl AuthService {
         S: mfa::MfaStore,
     {
         mfa::verify_webauthn_factor(
-            &self.inner, mfa_store, enc, project_id, user_id, factor_id, challenge_id,
+            &self.inner,
+            mfa_store,
+            enc,
+            project_id,
+            user_id,
+            factor_id,
+            challenge_id,
             attestation_json,
         )
         .await
@@ -761,7 +791,13 @@ impl AuthService {
         S: mfa::MfaStore,
     {
         mfa::verify_webauthn_challenge(
-            &self.inner, mfa_store, enc, project_id, user_id, challenge_id, assertion_json,
+            &self.inner,
+            mfa_store,
+            enc,
+            project_id,
+            user_id,
+            challenge_id,
+            assertion_json,
         )
         .await
     }
@@ -793,7 +829,12 @@ impl AuthService {
         S: mfa::MfaStore,
     {
         mfa::unenroll_factor(
-            &self.inner, mfa_store, project_id, user_id, factor_id, caller_aal,
+            &self.inner,
+            mfa_store,
+            project_id,
+            user_id,
+            factor_id,
+            caller_aal,
         )
         .await
     }

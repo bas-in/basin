@@ -204,7 +204,10 @@ async fn ordered_delivery_with_topic_and_value() {
     )
     .await;
 
-    catalog.register_cdc_kafka_sink(def(project, "s1")).await.unwrap();
+    catalog
+        .register_cdc_kafka_sink(def(project, "s1"))
+        .await
+        .unwrap();
     let producer = MockProducer::new();
     let p: Arc<dyn KafkaProducer> = Arc::new(producer.clone());
     let d = spawn_kafka_dispatcher(writer.clone(), catalog.clone(), project, fast_cfg(), p);
@@ -224,7 +227,11 @@ async fn ordered_delivery_with_topic_and_value() {
 
     // Status is "ok" after the ack.
     assert_eq!(
-        sink_state(&catalog, &project, "s1").await.unwrap().last_status.as_deref(),
+        sink_state(&catalog, &project, "s1")
+            .await
+            .unwrap()
+            .last_status
+            .as_deref(),
         Some("ok")
     );
     d.abort();
@@ -236,7 +243,10 @@ async fn resume_after_restart_from_cursor() {
     let writer = CdcRingWriter::with_config(storage_in(&dir), CdcConfig::default());
     let project = ProjectId::new();
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    catalog.register_cdc_kafka_sink(def(project, "s1")).await.unwrap();
+    catalog
+        .register_cdc_kafka_sink(def(project, "s1"))
+        .await
+        .unwrap();
 
     publish_all(
         &writer,
@@ -249,7 +259,13 @@ async fn resume_after_restart_from_cursor() {
 
     let producer = MockProducer::new();
     let p: Arc<dyn KafkaProducer> = Arc::new(producer.clone());
-    let d1 = spawn_kafka_dispatcher(writer.clone(), catalog.clone(), project, fast_cfg(), Arc::clone(&p));
+    let d1 = spawn_kafka_dispatcher(
+        writer.clone(),
+        catalog.clone(),
+        project,
+        fast_cfg(),
+        Arc::clone(&p),
+    );
     wait_last_seq(&catalog, &project, "s1", 2).await;
     d1.abort();
 
@@ -272,7 +288,11 @@ async fn resume_after_restart_from_cursor() {
 
     assert!(delivered_before >= 1, "first worker delivered 1,2");
     let resumed = producer2.delivered_seqs().await;
-    assert_eq!(resumed, vec![3, 4], "resume delivered only the missed events");
+    assert_eq!(
+        resumed,
+        vec![3, 4],
+        "resume delivered only the missed events"
+    );
     d2.abort();
 }
 
@@ -282,7 +302,10 @@ async fn retry_backoff_on_producer_error_then_success() {
     let writer = CdcRingWriter::with_config(storage_in(&dir), CdcConfig::default());
     let project = ProjectId::new();
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    catalog.register_cdc_kafka_sink(def(project, "s1")).await.unwrap();
+    catalog
+        .register_cdc_kafka_sink(def(project, "s1"))
+        .await
+        .unwrap();
 
     publish_all(&writer, &[ev(project, "t", ChangeOp::Insert, 1, 1)]).await;
 
@@ -292,8 +315,15 @@ async fn retry_backoff_on_producer_error_then_success() {
     let d = spawn_kafka_dispatcher(writer.clone(), catalog.clone(), project, fast_cfg(), p);
 
     wait_last_seq(&catalog, &project, "s1", 1).await;
-    assert!(producer.calls.load(Ordering::SeqCst) >= 4, "retried past the failures");
-    assert_eq!(producer.delivered_seqs().await, vec![1], "exactly one acked batch");
+    assert!(
+        producer.calls.load(Ordering::SeqCst) >= 4,
+        "retried past the failures"
+    );
+    assert_eq!(
+        producer.delivered_seqs().await,
+        vec![1],
+        "exactly one acked batch"
+    );
     d.abort();
 }
 
@@ -341,7 +371,10 @@ async fn partition_key_determinism_across_ops_for_a_row() {
     let writer = CdcRingWriter::with_config(storage_in(&dir), CdcConfig::default());
     let project = ProjectId::new();
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    catalog.register_cdc_kafka_sink(def(project, "s1")).await.unwrap();
+    catalog
+        .register_cdc_kafka_sink(def(project, "s1"))
+        .await
+        .unwrap();
 
     // Row id=7 gets insert, update; row id=8 gets insert.
     publish_all(
@@ -381,7 +414,10 @@ async fn tx_group_contiguity_preserved() {
     let writer = CdcRingWriter::with_config(storage_in(&dir), CdcConfig::default());
     let project = ProjectId::new();
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    catalog.register_cdc_kafka_sink(def(project, "s1")).await.unwrap();
+    catalog
+        .register_cdc_kafka_sink(def(project, "s1"))
+        .await
+        .unwrap();
 
     // Two "commits": seqs 1-3 (txA) and 4-6 (txB), interleaved into separate
     // ring flushes to exercise the cross-segment ordering.
@@ -410,7 +446,11 @@ async fn tx_group_contiguity_preserved() {
     wait_last_seq(&catalog, &project, "s1", 6).await;
 
     let seqs = producer.delivered_seqs().await;
-    assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6], "commits stay contiguous + ordered");
+    assert_eq!(
+        seqs,
+        vec![1, 2, 3, 4, 5, 6],
+        "commits stay contiguous + ordered"
+    );
     d.abort();
 }
 
@@ -452,7 +492,10 @@ async fn cross_project_isolation() {
     let a_batches = prod_a.produced.lock().await.clone();
     for batch in &a_batches {
         for r in batch {
-            assert!(r.topic.contains(&a.to_string()), "A sink only sees A topics");
+            assert!(
+                r.topic.contains(&a.to_string()),
+                "A sink only sees A topics"
+            );
             assert!(!r.topic.contains(&b.to_string()));
         }
     }
@@ -466,7 +509,10 @@ async fn auto_disable_after_max_delivery_age() {
     let writer = CdcRingWriter::with_config(storage_in(&dir), CdcConfig::default());
     let project = ProjectId::new();
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    catalog.register_cdc_kafka_sink(def(project, "s1")).await.unwrap();
+    catalog
+        .register_cdc_kafka_sink(def(project, "s1"))
+        .await
+        .unwrap();
 
     publish_all(&writer, &[ev(project, "t", ChangeOp::Insert, 1, 1)]).await;
 
@@ -520,25 +566,43 @@ async fn catalog_round_trip_in_memory() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].def.topic, "basin.{project}.{table}");
     assert_eq!(rows[0].def.partition_key, PartitionKey::Project);
-    assert_eq!(rows[0].def.tables.as_deref(), Some(&["orders".to_string()][..]));
+    assert_eq!(
+        rows[0].def.tables.as_deref(),
+        Some(&["orders".to_string()][..])
+    );
     assert_eq!(rows[0].state.last_seq, 0, "fresh cursor");
 
     // Ack advances monotonically; a lower ack never rewinds.
-    catalog.record_cdc_kafka_ack(&project, "s1", 10, "ok").await.unwrap();
-    catalog.record_cdc_kafka_ack(&project, "s1", 5, "ok").await.unwrap();
+    catalog
+        .record_cdc_kafka_ack(&project, "s1", 10, "ok")
+        .await
+        .unwrap();
+    catalog
+        .record_cdc_kafka_ack(&project, "s1", 5, "ok")
+        .await
+        .unwrap();
     let rows = catalog.list_cdc_kafka_sinks(&project).await;
-    assert_eq!(rows[0].state.last_seq, 10, "GREATEST cursor — never rewinds");
+    assert_eq!(
+        rows[0].state.last_seq, 10,
+        "GREATEST cursor — never rewinds"
+    );
     assert_eq!(rows[0].state.retry_count, 0, "ack resets retry_count");
 
     // Failure bumps retry_count + records status, does NOT advance the cursor.
-    catalog.record_cdc_kafka_failure(&project, "s1", 3, "broker down").await.unwrap();
+    catalog
+        .record_cdc_kafka_failure(&project, "s1", 3, "broker down")
+        .await
+        .unwrap();
     let rows = catalog.list_cdc_kafka_sinks(&project).await;
     assert_eq!(rows[0].state.retry_count, 3);
     assert_eq!(rows[0].state.last_status.as_deref(), Some("broker down"));
     assert_eq!(rows[0].state.last_seq, 10);
 
     // Disable clears active + stamps disabled_at, retaining the row.
-    catalog.disable_cdc_kafka_sink(&project, "s1").await.unwrap();
+    catalog
+        .disable_cdc_kafka_sink(&project, "s1")
+        .await
+        .unwrap();
     let rows = catalog.list_cdc_kafka_sinks(&project).await;
     assert!(!rows[0].def.active);
     assert!(rows[0].state.disabled_at.is_some());

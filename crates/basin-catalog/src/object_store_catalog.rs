@@ -79,12 +79,12 @@ use object_store::{path::Path as OsPath, ObjectStore, ObjectStoreExt, PutMode, P
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::functions::SqlFunctionDef;
 use crate::leases::{Lease, LeaseRegistry};
 use crate::metadata::{
     CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, ProjectMetadata,
     PromotedJsonbPath, SecondaryIndex, TableFileFormat, TableMetadata, UniqueConstraint,
 };
-use crate::functions::SqlFunctionDef;
 use crate::sequences::{compute_next, SequenceDef, SequenceError};
 use crate::snapshot::{Snapshot, SnapshotId, SnapshotOperation, SnapshotSummary};
 use crate::Catalog;
@@ -126,7 +126,8 @@ fn chunk_cache_cap() -> std::num::NonZeroUsize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_CHUNK_CACHE_CAP);
-    std::num::NonZeroUsize::new(n).unwrap_or(std::num::NonZeroUsize::new(DEFAULT_CHUNK_CACHE_CAP).unwrap())
+    std::num::NonZeroUsize::new(n)
+        .unwrap_or(std::num::NonZeroUsize::new(DEFAULT_CHUNK_CACHE_CAP).unwrap())
 }
 
 /// The full, serialisable state of one table at one catalog version.
@@ -727,7 +728,12 @@ impl ObjectStoreCatalog {
         )
     }
 
-    fn manifest_key(&self, project: &ProjectId, qtable: &QualifiedTableName, version: u64) -> OsPath {
+    fn manifest_key(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        version: u64,
+    ) -> OsPath {
         OsPath::from(format!(
             "{}v{version:020}.json",
             self.table_dir(project, qtable)
@@ -774,7 +780,12 @@ impl ObjectStoreCatalog {
     /// Prefix under which a table's partition segment dirs for ONE generation
     /// live. The drop-time purge lists exactly this prefix (the generation that
     /// was current at drop) so it cannot reach a later recreate's tree.
-    fn parts_root(&self, project: &ProjectId, qtable: &QualifiedTableName, generation: u64) -> String {
+    fn parts_root(
+        &self,
+        project: &ProjectId,
+        qtable: &QualifiedTableName,
+        generation: u64,
+    ) -> String {
         format!(
             "{}parts/{}",
             self.table_dir(project, qtable),
@@ -803,7 +814,10 @@ impl ObjectStoreCatalog {
         generation: u64,
         partition_id: &str,
     ) -> OsPath {
-        OsPath::from(format!("{}HEAD", self.part_dir(project, qtable, generation, partition_id)))
+        OsPath::from(format!(
+            "{}HEAD",
+            self.part_dir(project, qtable, generation, partition_id)
+        ))
     }
 
     fn part_cache_key(
@@ -834,11 +848,7 @@ impl ObjectStoreCatalog {
     /// `cron.job` resolve by bare name after DataFusion schema stripping). If
     /// not found in any schema — or ambiguous across schemas — fall back to
     /// `public` so the downstream lookup produces the expected NotFound error.
-    async fn resolve_qtable(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-    ) -> QualifiedTableName {
+    async fn resolve_qtable(&self, project: &ProjectId, table: &TableName) -> QualifiedTableName {
         let pub_qtable = QualifiedTableName::in_public(table.clone());
         // Fast path: a live `public` manifest exists. During sustained ingest the
         // table is overwhelmingly in `public` and its manifest head is already in
@@ -856,7 +866,13 @@ impl ObjectStoreCatalog {
         {
             return pub_qtable;
         }
-        if self.resolve_head_version(project, &pub_qtable).await.ok().flatten().is_some() {
+        if self
+            .resolve_head_version(project, &pub_qtable)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
             return pub_qtable;
         }
         // Search non-public schemas for a table with this bare name.
@@ -996,7 +1012,10 @@ impl ObjectStoreCatalog {
             }
             other => storage_err("get manifest", other),
         })?;
-        let bytes = res.bytes().await.map_err(|e| storage_err("read manifest", e))?;
+        let bytes = res
+            .bytes()
+            .await
+            .map_err(|e| storage_err("read manifest", e))?;
         serde_json::from_slice(&bytes)
             .map_err(|e| BasinError::catalog(format!("decode manifest {project}/{qtable}: {e}")))
     }
@@ -1041,7 +1060,10 @@ impl ObjectStoreCatalog {
         // Record the freshly-resolved head so the next hot commit can skip the
         // resolve. Safe because every manifest mutation rewrites this entry
         // (after_commit) or clears it (invalidate).
-        self.meta_head_cache.lock().await.insert(ck.clone(), version);
+        self.meta_head_cache
+            .lock()
+            .await
+            .insert(ck.clone(), version);
         {
             let cache = self.cache.lock().await;
             if let Some(entry) = cache.get(&ck) {
@@ -1086,7 +1108,11 @@ impl ObjectStoreCatalog {
             mode: PutMode::Create,
             ..Default::default()
         };
-        match self.store.put_opts(&key, Bytes::from(bytes).into(), opts).await {
+        match self
+            .store
+            .put_opts(&key, Bytes::from(bytes).into(), opts)
+            .await
+        {
             Ok(_) => Ok(true),
             Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
             Err(e) => Err(storage_err("put manifest", e)),
@@ -1117,7 +1143,10 @@ impl ObjectStoreCatalog {
         let ck = self.cache_key(project, qtable);
         // Keep the META-head cache in lockstep with the manifest-body cache: this
         // is a manifest write, so the head now points at `version`.
-        self.meta_head_cache.lock().await.insert(ck.clone(), version);
+        self.meta_head_cache
+            .lock()
+            .await
+            .insert(ck.clone(), version);
         let mut cache = self.cache.lock().await;
         cache.insert(
             ck,
@@ -1260,14 +1289,24 @@ impl ObjectStoreCatalog {
         generation: u64,
         partition_id: &str,
     ) -> Result<Option<u64>> {
-        match self.store.get(&self.part_head_key(project, qtable, generation, partition_id)).await {
+        match self
+            .store
+            .get(&self.part_head_key(project, qtable, generation, partition_id))
+            .await
+        {
             Ok(res) => {
                 if let Ok(bytes) = res.bytes().await {
                     if let Ok(s) = std::str::from_utf8(&bytes) {
                         if let Ok(v) = s.trim().parse::<u64>() {
                             if self
                                 .store
-                                .head(&self.part_segment_key(project, qtable, generation, partition_id, v))
+                                .head(&self.part_segment_key(
+                                    project,
+                                    qtable,
+                                    generation,
+                                    partition_id,
+                                    v,
+                                ))
                                 .await
                                 .is_ok()
                             {
@@ -1288,7 +1327,13 @@ impl ObjectStoreCatalog {
                                 // LIST scan below to recover the true max version.
                                 if self
                                     .store
-                                    .head(&self.part_segment_key(project, qtable, generation, partition_id, v + 1))
+                                    .head(&self.part_segment_key(
+                                        project,
+                                        qtable,
+                                        generation,
+                                        partition_id,
+                                        v + 1,
+                                    ))
                                     .await
                                     .is_err()
                                 {
@@ -1314,7 +1359,9 @@ impl ObjectStoreCatalog {
             let key = meta.location.as_ref();
             // Only count segments DIRECTLY under this partition dir (the file
             // name is the only remaining path component after the prefix).
-            let Some(rest) = key.strip_prefix(trimmed) else { continue };
+            let Some(rest) = key.strip_prefix(trimmed) else {
+                continue;
+            };
             let rest = rest.trim_start_matches('/');
             if rest.contains('/') {
                 continue;
@@ -1333,11 +1380,7 @@ impl ObjectStoreCatalog {
             // pointer path instead of depending on LIST forever (a blind or
             // slow LIST here is what regresses commits to expected=0).
             let head_key = self.part_head_key(project, qtable, generation, partition_id);
-            if let Err(e) = self
-                .store
-                .put(&head_key, v.to_string().into())
-                .await
-            {
+            if let Err(e) = self.store.put(&head_key, v.to_string().into()).await {
                 tracing::debug!(
                     %project, table = %qtable, partition_id, version = v, error = %e,
                     "partition head-pointer read-repair PUT failed (best-effort)",
@@ -1362,9 +1405,14 @@ impl ObjectStoreCatalog {
             )),
             other => storage_err("get partition segment", other),
         })?;
-        let bytes = res.bytes().await.map_err(|e| storage_err("read partition segment", e))?;
+        let bytes = res
+            .bytes()
+            .await
+            .map_err(|e| storage_err("read partition segment", e))?;
         serde_json::from_slice(&bytes).map_err(|e| {
-            BasinError::catalog(format!("decode partition segment {project}/{qtable}/{partition_id}: {e}"))
+            BasinError::catalog(format!(
+                "decode partition segment {project}/{qtable}/{partition_id}: {e}"
+            ))
         })
     }
 
@@ -1530,7 +1578,8 @@ impl ObjectStoreCatalog {
         // (zero store reads) or by GETting the misses below. Chunk objects are
         // immutable + content-addressed, so a cache hit on `hash` is ALWAYS the
         // exact bytes the store holds — no version/staleness reasoning needed.
-        let mut cached: Vec<Option<Arc<Vec<DataFileRef>>>> = (0..refs.len()).map(|_| None).collect();
+        let mut cached: Vec<Option<Arc<Vec<DataFileRef>>>> =
+            (0..refs.len()).map(|_| None).collect();
         {
             let mut cache = self.chunk_cache.lock().await;
             for (idx, r) in refs.iter().enumerate() {
@@ -1638,7 +1687,9 @@ impl ObjectStoreCatalog {
                     Err(object_store::Error::NotFound { .. }) => {
                         return Err(storage_err("put baseline chunk", e));
                     }
-                    Err(he) => return Err(storage_err("verify baseline chunk after ambiguous put", he)),
+                    Err(he) => {
+                        return Err(storage_err("verify baseline chunk after ambiguous put", he))
+                    }
                 }
             }
         }
@@ -1728,7 +1779,8 @@ impl ObjectStoreCatalog {
             return Ok((entry.version, entry.segment.clone()));
         }
         // Cold cache (first touch / post-invalidation): authoritative resolve.
-        self.load_part_current(project, qtable, generation, partition_id).await
+        self.load_part_current(project, qtable, generation, partition_id)
+            .await
     }
 
     /// Write partition segment `version` via create-if-absent. `true` = won.
@@ -1786,10 +1838,9 @@ impl ObjectStoreCatalog {
                 // Ambiguous PUT: disambiguate by reading back the object.
                 match self.store.get(&key).await {
                     Ok(res) => {
-                        let landed = res
-                            .bytes()
-                            .await
-                            .map_err(|ge| storage_err("read partition segment after ambiguous put", ge))?;
+                        let landed = res.bytes().await.map_err(|ge| {
+                            storage_err("read partition segment after ambiguous put", ge)
+                        })?;
                         if landed.as_ref() == bytes.as_slice() {
                             // Our write landed despite the error — converge.
                             Ok(true)
@@ -1804,7 +1855,10 @@ impl ObjectStoreCatalog {
                     Err(object_store::Error::NotFound { .. }) => {
                         Err(storage_err("put partition segment", e))
                     }
-                    Err(ge) => Err(storage_err("verify partition segment after ambiguous put", ge)),
+                    Err(ge) => Err(storage_err(
+                        "verify partition segment after ambiguous put",
+                        ge,
+                    )),
                 }
             }
         }
@@ -1848,10 +1902,8 @@ impl ObjectStoreCatalog {
                 }
                 Err(e) => {
                     if attempt + 1 < 3 {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            20u64 << attempt,
-                        ))
-                        .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(20u64 << attempt))
+                            .await;
                     } else {
                         tracing::warn!(
                             %project, %qtable, partition_id, version, error = %e,
@@ -2140,8 +2192,14 @@ impl ObjectStoreCatalog {
                     let mut fresh: Vec<BaselineChunkRef> = Vec::new();
                     for batch in all.chunks(target as usize) {
                         fresh.push(
-                            self.seal_baseline_chunk(project, qtable, generation, partition_id, batch)
-                                .await?,
+                            self.seal_baseline_chunk(
+                                project,
+                                qtable,
+                                generation,
+                                partition_id,
+                                batch,
+                            )
+                            .await?,
                         );
                     }
                     // After a full re-chunk every chunk is ~TARGET and FROZEN;
@@ -2169,7 +2227,13 @@ impl ObjectStoreCatalog {
                             .filter_map(|p| new_live.get(p).cloned())
                             .collect();
                         let cref = self
-                            .seal_baseline_chunk(project, qtable, generation, partition_id, &tail_files)
+                            .seal_baseline_chunk(
+                                project,
+                                qtable,
+                                generation,
+                                partition_id,
+                                &tail_files,
+                            )
                             .await?;
                         let tail_full = tail_files.len() as u64 >= target;
                         chunks.push(cref.clone());
@@ -2250,8 +2314,15 @@ impl ObjectStoreCatalog {
                 open_tail: next_open_tail,
                 tombstones: next_tombstones,
             };
-            self.after_part_commit(project, qtable, generation, partition_id, new_version, next_live)
-                .await;
+            self.after_part_commit(
+                project,
+                qtable,
+                generation,
+                partition_id,
+                new_version,
+                next_live,
+            )
+            .await;
             // FLAT-SCALE: do NOT build the unioned table metadata here. The
             // sustained-ingest hot path (`Shard::commit_with_retry`) discards
             // this return value entirely — it commits per partition and reads
@@ -2269,7 +2340,8 @@ impl ObjectStoreCatalog {
             // intended contract for the cheap commit return.
             Ok(manifest.to_metadata(project, &qtable.name))
         } else {
-            self.invalidate_part(project, qtable, generation, partition_id).await;
+            self.invalidate_part(project, qtable, generation, partition_id)
+                .await;
             Err(BasinError::CommitConflict(format!(
                 "{project}/{qtable}[{partition_id}]: lost commit race at partition version {new_version}"
             )))
@@ -2393,9 +2465,13 @@ impl ObjectStoreCatalog {
             let meta = item.map_err(|e| storage_err("list partitions", e))?;
             let key = meta.location.as_ref();
             // key = {parts_root}{partition_id}/v{M}.json (or /HEAD).
-            let Some(rest) = key.strip_prefix(trimmed) else { continue };
+            let Some(rest) = key.strip_prefix(trimmed) else {
+                continue;
+            };
             let rest = rest.trim_start_matches('/');
-            let Some(seg) = rest.split('/').next() else { continue };
+            let Some(seg) = rest.split('/').next() else {
+                continue;
+            };
             if seg.is_empty() {
                 continue;
             }
@@ -2441,7 +2517,9 @@ impl ObjectStoreCatalog {
             .1
             .parts_generation;
         for pid in self.list_partition_ids(src_project, src, src_gen).await? {
-            let (_v, segment) = self.load_part_current(src_project, src, src_gen, &pid).await?;
+            let (_v, segment) = self
+                .load_part_current(src_project, src, src_gen, &pid)
+                .await?;
             let live = segment.live_data_files();
             if live.is_empty() {
                 continue;
@@ -2676,7 +2754,10 @@ impl ObjectStoreCatalog {
         // table already has a v0 manifest. If that v0 is a tombstone (dropped),
         // a recreate is allowed by writing a fresh genesis at the next version.
         let manifest = TableManifest::genesis(schema.clone());
-        if self.put_manifest_create(project, qtable, 0, &manifest).await? {
+        if self
+            .put_manifest_create(project, qtable, 0, &manifest)
+            .await?
+        {
             let meta = manifest.to_metadata(project, table);
             self.after_commit(project, qtable, 0, manifest).await;
             return Ok(meta);
@@ -2766,8 +2847,7 @@ impl ObjectStoreCatalog {
             let entry = ReadSnapshotEntry {
                 meta_version,
                 meta: Arc::new(meta.clone()),
-                expires_at: std::time::Instant::now()
-                    + std::time::Duration::from_millis(ttl_ms),
+                expires_at: std::time::Instant::now() + std::time::Duration::from_millis(ttl_ms),
             };
             self.read_snapshot_cache.lock().await.insert(ck, entry);
             return Ok(meta);
@@ -2845,7 +2925,8 @@ impl ObjectStoreCatalog {
         // warm catalog can't serve the pre-drop folded views: the manifest body +
         // META head (`invalidate`) and every partition's folded segment
         // (`invalidate_all_parts`).
-        self.purge_part_segments(project, qtable, dropped_generation).await;
+        self.purge_part_segments(project, qtable, dropped_generation)
+            .await;
         self.invalidate(project, qtable).await;
         self.invalidate_all_parts(project, qtable).await;
         Ok(())
@@ -2890,7 +2971,8 @@ impl ObjectStoreCatalog {
         }
         self.after_commit(project, new, dst.version, dst).await;
         // Carry over any per-partition data-file segments (sharded ingest data).
-        self.copy_partition_segments(project, old, project, new).await?;
+        self.copy_partition_segments(project, old, project, new)
+            .await?;
         self.mutate_manifest(project, old, |m| m.dropped = true)
             .await?;
         Ok(())
@@ -2917,7 +2999,9 @@ impl ObjectStoreCatalog {
         let generation = manifest.parts_generation;
         let partition_ids = self.list_partition_ids(project, qtable, generation).await?;
         for pid in &partition_ids {
-            let (_pv, segment) = self.load_part_current(project, qtable, generation, pid).await?;
+            let (_pv, segment) = self
+                .load_part_current(project, qtable, generation, pid)
+                .await?;
             if !segment.live_data_files().is_empty() {
                 return Ok(SnapshotId(1));
             }
@@ -3038,7 +3122,6 @@ impl ObjectStoreCatalog {
 
 fn storage_err(ctx: &str, e: object_store::Error) -> BasinError {
     BasinError::catalog(format!("object-store catalog {ctx}: {e}"))
-
 }
 
 #[async_trait]
@@ -3183,14 +3266,23 @@ impl Catalog for ObjectStoreCatalog {
             // Resolve the current partition generation once; every partition
             // probe below reads only this generation's segment chains (the
             // per-partition `commit_part_snapshot` re-resolves it itself).
-            let generation = self.load_current(project, &qtable).await?.1.parts_generation;
+            let generation = self
+                .load_current(project, &qtable)
+                .await?
+                .1
+                .parts_generation;
             let mut by_partition: HashMap<String, Vec<String>> = HashMap::new();
             let mut remaining: HashSet<String> = removed_paths.iter().cloned().collect();
-            for pid in self.list_partition_ids(project, &qtable, generation).await? {
+            for pid in self
+                .list_partition_ids(project, &qtable, generation)
+                .await?
+            {
                 if remaining.is_empty() {
                     break;
                 }
-                let (_pv, segment) = self.load_part_current(project, &qtable, generation, &pid).await?;
+                let (_pv, segment) = self
+                    .load_part_current(project, &qtable, generation, &pid)
+                    .await?;
                 let live: HashSet<String> = segment
                     .live_data_files()
                     .into_iter()
@@ -3264,7 +3356,9 @@ impl Catalog for ObjectStoreCatalog {
                 // to the FIRST partition commit, the rest are pure removes.
                 let mut iter = by_partition.into_iter();
                 let (first_pid, first_paths) = iter.next().expect("non-empty by_partition");
-                let (_pv, seg0) = self.load_part_current(project, &qtable, generation, &first_pid).await?;
+                let (_pv, seg0) = self
+                    .load_part_current(project, &qtable, generation, &first_pid)
+                    .await?;
                 // Capture the input refs this commit is about to retire, so the
                 // compensation below can put them back verbatim. The files
                 // themselves are still on the object store: physical deletion is
@@ -3291,7 +3385,13 @@ impl Catalog for ObjectStoreCatalog {
                     .await
                 {
                     self.compensate_part_adds(
-                        project, &qtable, generation, &first_pid, &added_files, undo, &e,
+                        project,
+                        &qtable,
+                        generation,
+                        &first_pid,
+                        &added_files,
+                        undo,
+                        &e,
                     )
                     .await;
                     return Err(e);
@@ -3323,8 +3423,14 @@ impl Catalog for ObjectStoreCatalog {
         let qtable = self.resolve_qtable(project, table).await;
         // Confirm the table exists (NotFound if absent/tombstoned) and read its
         // current partition generation.
-        let generation = self.load_current(project, &qtable).await?.1.parts_generation;
-        let (v, segment) = self.load_part_current(project, &qtable, generation, partition_id).await?;
+        let generation = self
+            .load_current(project, &qtable)
+            .await?
+            .1
+            .parts_generation;
+        let (v, segment) = self
+            .load_part_current(project, &qtable, generation, partition_id)
+            .await?;
         // MONOTONIC EXPECTED-SNAPSHOT GUARD (#67): "the store shows no
         // segment" is NOT proof that none has ever existed — a blind/unwarmed
         // store view (cold node, unwarmed pool routing, transient empty LIST
@@ -3422,9 +3528,18 @@ impl Catalog for ObjectStoreCatalog {
         // matching OCC chain. META-chain (single-node OLTP) files are not
         // enumerated here — they are coalesced by copy-on-write / stripe-merge.
         let mut out = Vec::new();
-        let generation = self.load_current(project, &qtable).await?.1.parts_generation;
-        for pid in self.list_partition_ids(project, &qtable, generation).await? {
-            let (_v, segment) = self.load_part_current(project, &qtable, generation, &pid).await?;
+        let generation = self
+            .load_current(project, &qtable)
+            .await?
+            .1
+            .parts_generation;
+        for pid in self
+            .list_partition_ids(project, &qtable, generation)
+            .await?
+        {
+            let (_v, segment) = self
+                .load_part_current(project, &qtable, generation, &pid)
+                .await?;
             if !segment.live_data_files().is_empty() {
                 out.push(pid);
             }
@@ -3439,8 +3554,14 @@ impl Catalog for ObjectStoreCatalog {
         partition_id: &str,
     ) -> Result<(SnapshotId, Vec<DataFileRef>)> {
         let qtable = self.resolve_qtable(project, table).await;
-        let generation = self.load_current(project, &qtable).await?.1.parts_generation;
-        let (_v, segment) = self.load_part_current(project, &qtable, generation, partition_id).await?;
+        let generation = self
+            .load_current(project, &qtable)
+            .await?
+            .1
+            .parts_generation;
+        let (_v, segment) = self
+            .load_part_current(project, &qtable, generation, partition_id)
+            .await?;
         Ok((segment.current_snapshot, segment.live_data_files()))
     }
 
@@ -3515,8 +3636,10 @@ impl Catalog for ObjectStoreCatalog {
         columns: Vec<String>,
     ) -> Result<()> {
         let qtable = self.resolve_qtable(project, table).await;
-        self.mutate_manifest(project, &qtable, |m| m.bloom_filter_columns = columns.clone())
-            .await?;
+        self.mutate_manifest(project, &qtable, |m| {
+            m.bloom_filter_columns = columns.clone()
+        })
+        .await?;
         Ok(())
     }
 
@@ -3734,11 +3857,7 @@ impl Catalog for ObjectStoreCatalog {
     // project prefix; Overwrite is fine — last writer wins, mirrors the
     // in-memory backend's replace-on-set semantics). ----
 
-    async fn set_project_metadata(
-        &self,
-        project: &ProjectId,
-        meta: ProjectMetadata,
-    ) -> Result<()> {
+    async fn set_project_metadata(&self, project: &ProjectId, meta: ProjectMetadata) -> Result<()> {
         self.put_project_json(project, "metadata.json", &meta).await
     }
 
@@ -3999,9 +4118,7 @@ impl Catalog for ObjectStoreCatalog {
         }
     }
 
-    async fn list_migration_intents(
-        &self,
-    ) -> Result<Vec<crate::bucket_pool::MigrationIntent>> {
+    async fn list_migration_intents(&self) -> Result<Vec<crate::bucket_pool::MigrationIntent>> {
         use futures::StreamExt;
         let prefix = OsPath::from(format!("{}_bucket_pool/migrations/", self.root));
         let mut stream = self.store.list(Some(&prefix));
@@ -4085,7 +4202,9 @@ impl Catalog for ObjectStoreCatalog {
             let Ok(res) = self.store.get(&meta.location).await else {
                 continue;
             };
-            let Ok(bytes) = res.bytes().await else { continue };
+            let Ok(bytes) = res.bytes().await else {
+                continue;
+            };
             if let Ok(def) = serde_json::from_slice::<SqlFunctionDef>(&bytes) {
                 out.push(def);
             }
@@ -4165,7 +4284,10 @@ impl Catalog for ObjectStoreCatalog {
         let _ = self.store.delete(&self.seq_def_key(project, name)).await;
         self.seq_purge(project, name).await?;
         // Forget any node-local cursor.
-        self.seq_local.lock().await.remove(&(*project, name.to_string()));
+        self.seq_local
+            .lock()
+            .await
+            .remove(&(*project, name.to_string()));
         self.bump_epoch();
         Ok(())
     }
@@ -4250,7 +4372,10 @@ impl Catalog for ObjectStoreCatalog {
                 last: stored_last,
                 started: true,
             };
-            if self.seq_put_hwm_create(project, name, version + 1, &next_hwm).await? {
+            if self
+                .seq_put_hwm_create(project, name, version + 1, &next_hwm)
+                .await?
+            {
                 self.bump_epoch();
                 // Drop any node-local reserved block: it may straddle the new
                 // mark. The next nextval re-reserves from the persisted mark.
@@ -4364,8 +4489,7 @@ impl Catalog for ObjectStoreCatalog {
     async fn list_schemas(&self, project: &ProjectId) -> Result<Vec<SchemaName>> {
         // Union of: the explicitly-created set (so an empty schema survives),
         // `public` (always present), and any schema implied by a live table.
-        let mut set: std::collections::BTreeSet<SchemaName> =
-            std::collections::BTreeSet::new();
+        let mut set: std::collections::BTreeSet<SchemaName> = std::collections::BTreeSet::new();
         set.insert(SchemaName::public());
         if let Some(stored) = self
             .get_project_json::<Vec<String>>(project, "schemas.json")
@@ -4398,7 +4522,8 @@ impl Catalog for ObjectStoreCatalog {
         let s = schema.to_string();
         if !stored.iter().any(|e| e == &s) {
             stored.push(s);
-            self.put_project_json(project, "schemas.json", &stored).await?;
+            self.put_project_json(project, "schemas.json", &stored)
+                .await?;
         }
         Ok(())
     }
@@ -4423,8 +4548,8 @@ impl Catalog for ObjectStoreCatalog {
             .filter(|qt| &qt.schema == schema)
             .collect();
         // Exist iff in the explicit set or implied by a live table.
-        let exists = stored.iter().any(|e| e == &schema.to_string())
-            || !tables_in_schema.is_empty();
+        let exists =
+            stored.iter().any(|e| e == &schema.to_string()) || !tables_in_schema.is_empty();
         if !exists {
             return Err(BasinError::not_found(format!(
                 "{project}: schema {schema:?}"
@@ -4445,7 +4570,8 @@ impl Catalog for ObjectStoreCatalog {
             .into_iter()
             .filter(|e| e != &schema.to_string())
             .collect();
-        self.put_project_json(project, "schemas.json", &remaining).await?;
+        self.put_project_json(project, "schemas.json", &remaining)
+            .await?;
         Ok(())
     }
 
@@ -4601,9 +4727,11 @@ impl Catalog for ObjectStoreCatalog {
                 )));
             }
         }
-        self.after_commit(project, dst, forked.version, forked.clone()).await;
+        self.after_commit(project, dst, forked.version, forked.clone())
+            .await;
         // Carry over any per-partition data-file segments (sharded ingest data).
-        self.copy_partition_segments(project, src, project, dst).await?;
+        self.copy_partition_segments(project, src, project, dst)
+            .await?;
         self.load_unioned(project, dst, &forked).await
     }
 
@@ -4713,8 +4841,10 @@ impl Catalog for ObjectStoreCatalog {
         qtable: &QualifiedTableName,
         columns: Vec<String>,
     ) -> Result<()> {
-        self.mutate_manifest(project, qtable, |m| m.bloom_filter_columns = columns.clone())
-            .await?;
+        self.mutate_manifest(project, qtable, |m| {
+            m.bloom_filter_columns = columns.clone()
+        })
+        .await?;
         Ok(())
     }
 
@@ -4837,14 +4967,19 @@ impl ObjectStoreCatalog {
         for (pid, paths) in by_partition {
             let mut attempt = 0;
             loop {
-                let (_pv, segment) = self.load_part_current(project, qtable, generation, &pid).await?;
+                let (_pv, segment) = self
+                    .load_part_current(project, qtable, generation, &pid)
+                    .await?;
                 let live: std::collections::HashSet<String> = segment
                     .live_data_files()
                     .into_iter()
                     .map(|f| f.path)
                     .collect();
-                let still: Vec<String> =
-                    paths.iter().filter(|p| live.contains(*p)).cloned().collect();
+                let still: Vec<String> = paths
+                    .iter()
+                    .filter(|p| live.contains(*p))
+                    .cloned()
+                    .collect();
                 if still.is_empty() {
                     break; // nothing of ours left in this chain
                 }
@@ -4887,7 +5022,9 @@ impl ObjectStoreCatalog {
     ) {
         let added_paths: Vec<String> = added_files.iter().map(|f| f.path.clone()).collect();
         for _ in 0..5 {
-            let Ok((_pv, segment)) = self.load_part_current(project, qtable, generation, pid).await
+            let Ok((_pv, segment)) = self
+                .load_part_current(project, qtable, generation, pid)
+                .await
             else {
                 break;
             };
@@ -4967,7 +5104,10 @@ impl ObjectStoreCatalog {
     /// a single global prefix so `list_migration_intents` LISTs every in-flight
     /// migration in one shot (resume-on-restart + bounded-concurrency).
     fn migration_intent_key(&self, project: &ProjectId) -> OsPath {
-        OsPath::from(format!("{}_bucket_pool/migrations/{}.json", self.root, project))
+        OsPath::from(format!(
+            "{}_bucket_pool/migrations/{}.json",
+            self.root, project
+        ))
     }
 
     async fn put_project_json<T: Serialize>(
@@ -5000,7 +5140,10 @@ impl ObjectStoreCatalog {
     ) -> Result<Option<T>> {
         match self.store.get(&self.project_meta_key(project, name)).await {
             Ok(res) => {
-                let bytes = res.bytes().await.map_err(|e| storage_err("read project meta", e))?;
+                let bytes = res
+                    .bytes()
+                    .await
+                    .map_err(|e| storage_err("read project meta", e))?;
                 let v = serde_json::from_slice(&bytes)
                     .map_err(|e| BasinError::catalog(format!("decode {name}: {e}")))?;
                 Ok(Some(v))
@@ -5109,7 +5252,11 @@ impl ObjectStoreCatalog {
     }
 
     async fn seq_is_tombstoned(&self, project: &ProjectId, name: &str) -> Result<bool> {
-        match self.store.head(&self.seq_tombstone_key(project, name)).await {
+        match self
+            .store
+            .head(&self.seq_tombstone_key(project, name))
+            .await
+        {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(storage_err("head sequence tombstone", e)),
@@ -5139,11 +5286,7 @@ impl ObjectStoreCatalog {
     /// Highest high-water-mark version present, with its decoded record.
     /// Returns `(version, hwm)`; `version == 0` with `started == false`
     /// genesis when no hwm object exists yet.
-    async fn seq_read_hwm(
-        &self,
-        project: &ProjectId,
-        name: &str,
-    ) -> Result<(u64, SeqHwm)> {
+    async fn seq_read_hwm(&self, project: &ProjectId, name: &str) -> Result<(u64, SeqHwm)> {
         use futures::StreamExt;
         let prefix = OsPath::from(format!("{}hwm/", self.seq_dir(project, name)));
         let mut stream = self.store.list(Some(&prefix));
@@ -5196,7 +5339,11 @@ impl ObjectStoreCatalog {
         };
         match self
             .store
-            .put_opts(&self.seq_hwm_key(project, name, version), Bytes::from(bytes).into(), opts)
+            .put_opts(
+                &self.seq_hwm_key(project, name, version),
+                Bytes::from(bytes).into(),
+                opts,
+            )
             .await
         {
             Ok(_) => Ok(true),
@@ -5322,7 +5469,13 @@ pub fn build_object_store_backend(
 /// Make a partition id safe for an object key segment.
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -5431,11 +5584,7 @@ impl ObjectStoreLeaseRegistry {
     }
 
     /// Read the highest epoch record for `(project, partition)`, or `None`.
-    async fn read_max(
-        &self,
-        project: &ProjectId,
-        partition: &str,
-    ) -> Result<Option<LeaseRecord>> {
+    async fn read_max(&self, project: &ProjectId, partition: &str) -> Result<Option<LeaseRecord>> {
         use futures::StreamExt;
         let prefix = OsPath::from(self.partition_dir(project, partition));
         let mut stream = self.store.list(Some(&prefix));
@@ -5457,7 +5606,10 @@ impl ObjectStoreLeaseRegistry {
             .get(&self.epoch_key(project, partition, ep))
             .await
             .map_err(|e| storage_err("get lease record", e))?;
-        let bytes = res.bytes().await.map_err(|e| storage_err("read lease", e))?;
+        let bytes = res
+            .bytes()
+            .await
+            .map_err(|e| storage_err("read lease", e))?;
         let rec: LeaseRecord = serde_json::from_slice(&bytes)
             .map_err(|e| BasinError::catalog(format!("decode lease: {e}")))?;
         Ok(Some(rec))
@@ -5603,12 +5755,7 @@ impl LeaseRegistry for ObjectStoreLeaseRegistry {
         }
     }
 
-    async fn release(
-        &self,
-        project: &ProjectId,
-        partition_id: &str,
-        holder: &str,
-    ) -> Result<bool> {
+    async fn release(&self, project: &ProjectId, partition_id: &str, holder: &str) -> Result<bool> {
         // Best-effort: write a tombstone epoch (expired) so owner_of reports no
         // live owner. We do not delete the history (immutable epoch log).
         let Some(current) = self.read_max(project, partition_id).await? else {
@@ -5825,11 +5972,17 @@ mod tests {
 
         // Two partition chains, 10 rows each — the shape a fanned-out COPY
         // produces (ingest round-robins across partitions).
-        let s0 = c.current_snapshot_id_in_partition(&p, &t, "s0").await.unwrap();
+        let s0 = c
+            .current_snapshot_id_in_partition(&p, &t, "s0")
+            .await
+            .unwrap();
         c.append_data_files_in_partition(&p, &t, "s0", s0, vec![file("s0/a.vortex", 10)])
             .await
             .unwrap();
-        let s1 = c.current_snapshot_id_in_partition(&p, &t, "s1").await.unwrap();
+        let s1 = c
+            .current_snapshot_id_in_partition(&p, &t, "s1")
+            .await
+            .unwrap();
         c.append_data_files_in_partition(&p, &t, "s1", s1, vec![file("s1/b.vortex", 10)])
             .await
             .unwrap();
@@ -5869,8 +6022,7 @@ mod tests {
         );
         // Either the merge fully landed, or it fully unwound. Never half.
         let merged_live = paths.contains(&"merged.vortex");
-        let inputs_live =
-            paths.contains(&"s0/a.vortex") || paths.contains(&"s1/b.vortex");
+        let inputs_live = paths.contains(&"s0/a.vortex") || paths.contains(&"s1/b.vortex");
         assert!(
             merged_live ^ inputs_live,
             "outputs and inputs must not both be live: {paths:?} (res={res:?})"
@@ -5921,7 +6073,10 @@ mod tests {
         // `load_table_at_snapshot` falls back to FeatureNotSupported, and the
         // caller serves a current read instead of the wrong point-in-time.
         let at2 = c.load_table_at_snapshot(&p, &t, SnapshotId(2)).await;
-        assert!(matches!(at2, Err(BasinError::FeatureNotSupported(_))), "got {at2:?}");
+        assert!(
+            matches!(at2, Err(BasinError::FeatureNotSupported(_))),
+            "got {at2:?}"
+        );
     }
 
     // --- Test 2: same-CHAIN contention (META chain, back-compat path) ------
@@ -5964,7 +6119,9 @@ mod tests {
                 }));
             }
             for h in handles {
-                h.await.unwrap().expect("internal RMW retry lands every commit");
+                h.await
+                    .unwrap()
+                    .expect("internal RMW retry lands every commit");
             }
             total_committed_files += RACERS as u64;
         }
@@ -5998,7 +6155,12 @@ mod tests {
                 loop {
                     let expected = c.current_snapshot_id(&p, &t).await.unwrap();
                     match c
-                        .append_data_files(&p, &t, expected, vec![file(&format!("w{r}.parquet"), 1)])
+                        .append_data_files(
+                            &p,
+                            &t,
+                            expected,
+                            vec![file(&format!("w{r}.parquet"), 1)],
+                        )
                         .await
                     {
                         Ok(_) => break,
@@ -6028,8 +6190,14 @@ mod tests {
     #[tokio::test]
     async fn multi_writer_cross_partition_no_contention() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let node_a = Arc::new(ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX));
-        let node_b = Arc::new(ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX));
+        let node_a = Arc::new(ObjectStoreCatalog::with_prefix(
+            store.clone(),
+            DEFAULT_CATALOG_PREFIX,
+        ));
+        let node_b = Arc::new(ObjectStoreCatalog::with_prefix(
+            store.clone(),
+            DEFAULT_CATALOG_PREFIX,
+        ));
         let p = ProjectId::new();
         let t = TableName::new("ingest").unwrap();
         node_a.create_namespace(&p).await.unwrap();
@@ -6091,7 +6259,11 @@ mod tests {
             0,
             "cross-partition commits must NEVER contend"
         );
-        assert_eq!(committed.load(SeqCst), expected_total, "all commits succeed");
+        assert_eq!(
+            committed.load(SeqCst),
+            expected_total,
+            "all commits succeed"
+        );
 
         // Fresh third instance: unioned read sees every partition's files.
         let node_c = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
@@ -6123,8 +6295,14 @@ mod tests {
     async fn cross_node_read_stays_consistent_during_compaction() {
         use std::sync::atomic::{AtomicBool, AtomicU64};
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let writer = Arc::new(ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX));
-        let reader = Arc::new(ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX));
+        let writer = Arc::new(ObjectStoreCatalog::with_prefix(
+            store.clone(),
+            DEFAULT_CATALOG_PREFIX,
+        ));
+        let reader = Arc::new(ObjectStoreCatalog::with_prefix(
+            store.clone(),
+            DEFAULT_CATALOG_PREFIX,
+        ));
         let p = ProjectId::new();
         let t = TableName::new("ingest").unwrap();
         writer.create_namespace(&p).await.unwrap();
@@ -6136,9 +6314,18 @@ mod tests {
         let expected: u64 = NFILES * ROWS_PER; // 400 — held fixed by merge↔split.
 
         for i in 0..NFILES {
-            let exp = writer.current_snapshot_id_in_partition(&p, &t, pid).await.unwrap();
+            let exp = writer
+                .current_snapshot_id_in_partition(&p, &t, pid)
+                .await
+                .unwrap();
             writer
-                .append_data_files_in_partition(&p, &t, pid, exp, vec![file(&format!("seed_{i}.parquet"), ROWS_PER)])
+                .append_data_files_in_partition(
+                    &p,
+                    &t,
+                    pid,
+                    exp,
+                    vec![file(&format!("seed_{i}.parquet"), ROWS_PER)],
+                )
                 .await
                 .unwrap();
         }
@@ -6154,7 +6341,8 @@ mod tests {
             let gen = gen.clone();
             tokio::spawn(async move {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    let (snap, files) = match writer.live_data_files_in_partition(&p, &t, pid).await {
+                    let (snap, files) = match writer.live_data_files_in_partition(&p, &t, pid).await
+                    {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
@@ -6239,7 +6427,10 @@ mod tests {
 
         // Two commits to the SAME partition with the SAME expected version:
         // exactly one wins, the other gets a per-partition CommitConflict.
-        let expected = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        let expected = c
+            .current_snapshot_id_in_partition(&p, &t, "p0")
+            .await
+            .unwrap();
         let c1 = c.clone();
         let c2 = c.clone();
         let (p1, p2) = (p, p);
@@ -6263,11 +6454,17 @@ mod tests {
         assert_eq!(conflicts, 1, "the other gets a per-partition conflict");
 
         // The loser retries against the now-current partition version and lands.
-        let exp2 = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        let exp2 = c
+            .current_snapshot_id_in_partition(&p, &t, "p0")
+            .await
+            .unwrap();
         c.append_data_files_in_partition(&p, &t, "p0", exp2, vec![file("c.parquet", 1)])
             .await
             .unwrap();
-        assert_eq!(c.load_table(&p, &t).await.unwrap().live_data_files().len(), 2);
+        assert_eq!(
+            c.load_table(&p, &t).await.unwrap().live_data_files().len(),
+            2
+        );
     }
 
     // --- Test 2c-flat-1: COMMIT IS O(1) — delta size independent of file count
@@ -6292,27 +6489,52 @@ mod tests {
         // Seed 200 files via 200 single-file commits to one partition.
         const SEED: usize = 200;
         for i in 0..SEED {
-            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
-            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file(&format!("seed{i}.parquet"), 1)])
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, "p0")
                 .await
                 .unwrap();
+            c.append_data_files_in_partition(
+                &p,
+                &t,
+                "p0",
+                exp,
+                vec![file(&format!("seed{i}.parquet"), 1)],
+            )
+            .await
+            .unwrap();
         }
 
         // The folded live set has all 200 files (correctness).
-        assert_eq!(c.load_table(&p, &t).await.unwrap().live_data_files().len(), SEED);
+        assert_eq!(
+            c.load_table(&p, &t).await.unwrap().live_data_files().len(),
+            SEED
+        );
 
         // The NEXT commit writes a delta object carrying ONLY the 1 added file.
-        let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &t, "p0")
+            .await
+            .unwrap();
         c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file("hot.parquet", 1)])
             .await
             .unwrap();
-        let head_v = c.resolve_part_head_version(&p, &qt, 0, "p0").await.unwrap().unwrap();
+        let head_v = c
+            .resolve_part_head_version(&p, &qt, 0, "p0")
+            .await
+            .unwrap()
+            .unwrap();
         let key = c.part_segment_key(&p, &qt, 0, "p0", head_v);
         let bytes = c.store.get(&key).await.unwrap().bytes().await.unwrap();
         let obj: PartSegmentObject = serde_json::from_slice(&bytes).unwrap();
 
-        assert!(obj.base_version.is_some(), "hot commit is a delta, not a baseline");
-        assert!(obj.baseline.is_none(), "delta carries no cumulative baseline");
+        assert!(
+            obj.base_version.is_some(),
+            "hot commit is a delta, not a baseline"
+        );
+        assert!(
+            obj.baseline.is_none(),
+            "delta carries no cumulative baseline"
+        );
         assert_eq!(
             obj.delta.data_files.len(),
             1,
@@ -6352,13 +6574,29 @@ mod tests {
 
         // Build a segment chain of several commits on partition p0.
         for i in 0..4 {
-            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
-            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file(&format!("f{i}.parquet"), 1)])
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, "p0")
                 .await
                 .unwrap();
+            c.append_data_files_in_partition(
+                &p,
+                &t,
+                "p0",
+                exp,
+                vec![file(&format!("f{i}.parquet"), 1)],
+            )
+            .await
+            .unwrap();
         }
-        let head_v = c.resolve_part_head_version(&p, &qt, 0, "p0").await.unwrap().unwrap();
-        assert!(head_v >= 4, "seeded at least 4 segment versions, got {head_v}");
+        let head_v = c
+            .resolve_part_head_version(&p, &qt, 0, "p0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            head_v >= 4,
+            "seeded at least 4 segment versions, got {head_v}"
+        );
 
         // SIMULATE THE LOST HEAD WRITE: roll the on-store head pointer back to an
         // earlier version whose segment still exists, exactly as if the PUT that
@@ -6369,7 +6607,10 @@ mod tests {
             .put_opts(
                 &c.part_head_key(&p, &qt, 0, "p0"),
                 Bytes::from(stale.to_string()).into(),
-                PutOptions { mode: PutMode::Overwrite, ..Default::default() },
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -6377,24 +6618,45 @@ mod tests {
 
         // The resolver must NOT trust the stale pointer: `stale+1` exists, so it
         // recovers the true max segment via the LIST fallback.
-        let resolved = c.resolve_part_head_version(&p, &qt, 0, "p0").await.unwrap().unwrap();
-        assert_eq!(resolved, head_v, "resolver heals a stale head pointer to the true max segment");
+        let resolved = c
+            .resolve_part_head_version(&p, &qt, 0, "p0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resolved, head_v,
+            "resolver heals a stale head pointer to the true max segment"
+        );
 
         // The decisive assertion: a subsequent commit SUCCEEDS instead of looping
         // on "lost commit race at partition version N".
-        let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &t, "p0")
+            .await
+            .unwrap();
         c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file("after-heal.parquet", 1)])
             .await
             .expect("commit must succeed after head-pointer heal, not livelock");
 
         // No rows lost or shadowed: every committed file is in the folded live set.
         let live: std::collections::BTreeSet<String> = c
-            .load_table(&p, &t).await.unwrap()
-            .live_data_files().into_iter().map(|f| f.path).collect();
+            .load_table(&p, &t)
+            .await
+            .unwrap()
+            .live_data_files()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
         for i in 0..4 {
-            assert!(live.contains(&format!("f{i}.parquet")), "f{i}.parquet present after heal");
+            assert!(
+                live.contains(&format!("f{i}.parquet")),
+                "f{i}.parquet present after heal"
+            );
         }
-        assert!(live.contains("after-heal.parquet"), "post-heal commit present");
+        assert!(
+            live.contains("after-heal.parquet"),
+            "post-heal commit present"
+        );
     }
 
     // --- Ambiguous-PUT exactly-once: a 408-after-landed must NOT double-count --
@@ -6437,9 +6699,7 @@ mod tests {
             opts: PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
             if matches!(opts.mode, PutMode::Create)
-                && self
-                    .armed
-                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
             {
                 // Land the write, then report a timeout as if the response were
                 // lost — the ambiguous PUT. Overwrite-mode so the inner write
@@ -6448,7 +6708,10 @@ mod tests {
                     .put_opts(
                         location,
                         payload,
-                        PutOptions { mode: PutMode::Overwrite, ..Default::default() },
+                        PutOptions {
+                            mode: PutMode::Overwrite,
+                            ..Default::default()
+                        },
                     )
                     .await?;
                 return Err(object_store::Error::Generic {
@@ -6517,20 +6780,28 @@ mod tests {
 
         // Seed one clean commit so the next is a normal delta (the create whose
         // PUT we will make ambiguous), exercising the steady-state ingest path.
-        let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &t, "p0")
+            .await
+            .unwrap();
         c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file("seed.parquet", 10)])
             .await
             .unwrap();
 
         // ARM the ambiguous PUT: the NEXT segment-create lands but errors.
-        wrapper.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        wrapper
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         // The wave's file (rows the loader sent exactly once). Under the OLD
         // code this commit returns the injected storage error → the shard never
         // truncates the WAL → re-flush of these rows under a new path → double
         // count. The FIX makes `put_part_segment_create` read the landed object
         // back and converge, so the commit SUCCEEDS exactly once.
-        let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &t, "p0")
+            .await
+            .unwrap();
         let wave = vec![file("wave.parquet", 25)];
         c.append_data_files_in_partition(&p, &t, "p0", exp, wave.clone())
             .await
@@ -6544,12 +6815,19 @@ mod tests {
         let fresh = ObjectStoreCatalog::with_prefix(inner.clone(), DEFAULT_CATALOG_PREFIX);
         let live = fresh.load_table(&p, &t).await.unwrap().live_data_files();
         let total_rows: u64 = live.iter().map(|f| f.row_count).sum();
-        assert_eq!(total_rows, 35, "count(*) must equal seed(10)+wave(25), not double-count");
+        assert_eq!(
+            total_rows, 35,
+            "count(*) must equal seed(10)+wave(25), not double-count"
+        );
         let mut paths: Vec<String> = live.iter().map(|f| f.path.clone()).collect();
         paths.sort();
         let n = paths.len();
         paths.dedup();
-        assert_eq!(paths.len(), n, "no duplicate file references in the live set");
+        assert_eq!(
+            paths.len(),
+            n,
+            "no duplicate file references in the live set"
+        );
         assert_eq!(n, 2, "exactly the two committed files are live");
     }
 
@@ -6571,14 +6849,24 @@ mod tests {
         // earlier file and add a compacted one. Crosses the K=5 baseline several
         // times, so the fold must traverse baselines + deltas correctly.
         for i in 0..30usize {
-            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, "p0")
+                .await
+                .unwrap();
             if i > 0 && i % 4 == 0 {
                 // Replace: remove the two oldest present files, add one merged.
                 let to_remove: Vec<String> = reference.iter().take(2).cloned().collect();
                 let added = file(&format!("merged{i}.parquet"), 5);
-                c.replace_data_files_in_partition(&p, &t, "p0", exp, to_remove.clone(), vec![added.clone()])
-                    .await
-                    .unwrap();
+                c.replace_data_files_in_partition(
+                    &p,
+                    &t,
+                    "p0",
+                    exp,
+                    to_remove.clone(),
+                    vec![added.clone()],
+                )
+                .await
+                .unwrap();
                 for r in &to_remove {
                     reference.remove(r);
                 }
@@ -6600,7 +6888,10 @@ mod tests {
             .into_iter()
             .map(|f| f.path)
             .collect();
-        assert_eq!(live, reference, "folded live set must equal the replay reference");
+        assert_eq!(
+            live, reference,
+            "folded live set must equal the replay reference"
+        );
     }
 
     // --- Test 2c-flat-3: SEGMENT COMPACTION writes a baseline every K ----------
@@ -6620,21 +6911,44 @@ mod tests {
 
         const N: usize = 30; // > several K cycles
         for i in 0..N {
-            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
-            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file(&format!("c{i}.parquet"), 1)])
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, "p0")
                 .await
                 .unwrap();
+            c.append_data_files_in_partition(
+                &p,
+                &t,
+                "p0",
+                exp,
+                vec![file(&format!("c{i}.parquet"), 1)],
+            )
+            .await
+            .unwrap();
         }
 
         // Correct total after compaction.
-        assert_eq!(c.load_table(&p, &t).await.unwrap().live_data_files().len(), N);
+        assert_eq!(
+            c.load_table(&p, &t).await.unwrap().live_data_files().len(),
+            N
+        );
 
         // Read fold depth is bounded by K: a fresh instance folding the chain
         // walks at most K-1 deltas back to a baseline.
-        let head_v = c.resolve_part_head_version(&p, &qt, 0, "p0").await.unwrap().unwrap();
+        let head_v = c
+            .resolve_part_head_version(&p, &qt, 0, "p0")
+            .await
+            .unwrap()
+            .unwrap();
         let fresh = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
-        let folded = fresh.fold_part_chain(&p, &qt, 0, "p0", head_v).await.unwrap();
-        assert_eq!(folded.live.size(), N, "compacted fold is still exactly correct");
+        let folded = fresh
+            .fold_part_chain(&p, &qt, 0, "p0", head_v)
+            .await
+            .unwrap();
+        assert_eq!(
+            folded.live.size(),
+            N,
+            "compacted fold is still exactly correct"
+        );
         assert!(
             folded.deltas_since_baseline < K,
             "fold depth {} must stay < K={K} (bounded read cost)",
@@ -6652,7 +6966,10 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_baseline, "segment compaction wrote at least one baseline");
+        assert!(
+            saw_baseline,
+            "segment compaction wrote at least one baseline"
+        );
     }
 
     // --- Test 2c-flat-4: per-commit store-GET count is BOUNDED in file count --
@@ -6701,7 +7018,8 @@ mod tests {
         fn reset(&self) {
             self.gets.store(0, std::sync::atomic::Ordering::Relaxed);
             self.lists.store(0, std::sync::atomic::Ordering::Relaxed);
-            self.chunk_gets.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.chunk_gets
+                .store(0, std::sync::atomic::Ordering::Relaxed);
         }
         fn reads(&self) -> usize {
             self.gets.load(std::sync::atomic::Ordering::Relaxed)
@@ -6738,7 +7056,8 @@ mod tests {
                 self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let k = location.as_ref();
                 if k.contains("/chunks/") && k.ends_with(".json") {
-                    self.chunk_gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.chunk_gets
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             self.inner.get_opts(location, options).await
@@ -6754,14 +7073,16 @@ mod tests {
             prefix: Option<&OsPath>,
         ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
-            self.lists.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.list(prefix)
         }
         async fn list_with_delimiter(
             &self,
             prefix: Option<&OsPath>,
         ) -> object_store::Result<object_store::ListResult> {
-            self.lists.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.list_with_delimiter(prefix).await
         }
         async fn copy_opts(
@@ -6796,9 +7117,15 @@ mod tests {
                 .current_snapshot_id_in_partition(&p, &t, &pid)
                 .await
                 .unwrap();
-            c.append_data_files_in_partition(&p, &t, &pid, exp, vec![file(&format!("s{i}.parquet"), 1)])
-                .await
-                .unwrap();
+            c.append_data_files_in_partition(
+                &p,
+                &t,
+                &pid,
+                exp,
+                vec![file(&format!("s{i}.parquet"), 1)],
+            )
+            .await
+            .unwrap();
         }
 
         // Measure exactly one steady-state commit (caches warm from seeding).
@@ -6933,12 +7260,28 @@ mod tests {
         c.create_namespace(&p).await.unwrap();
         c.create_table(&p, &t, &schema()).await.unwrap();
         for i in 0..n {
-            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
-            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file(&format!("f{i}.parquet"), 1)])
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, "p0")
                 .await
                 .unwrap();
+            c.append_data_files_in_partition(
+                &p,
+                &t,
+                "p0",
+                exp,
+                vec![file(&format!("f{i}.parquet"), 1)],
+            )
+            .await
+            .unwrap();
         }
-        let max = probe.seg_put_bytes.lock().unwrap().iter().copied().max().unwrap_or(0);
+        let max = probe
+            .seg_put_bytes
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
         max
     }
 
@@ -7064,10 +7407,19 @@ mod tests {
 
         const N: usize = 80; // several frozen chunks at TARGET=8
         for i in 0..N {
-            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
-            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file(&format!("r{i}.parquet"), 1)])
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, "p0")
                 .await
                 .unwrap();
+            c.append_data_files_in_partition(
+                &p,
+                &t,
+                "p0",
+                exp,
+                vec![file(&format!("r{i}.parquet"), 1)],
+            )
+            .await
+            .unwrap();
         }
 
         let puts = probe.chunk_puts.lock().unwrap().clone();
@@ -7142,10 +7494,19 @@ mod tests {
         // Enough appends to seal several FROZEN chunks at TARGET=8.
         const N: usize = 80;
         for i in 0..N {
-            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
-            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file(&format!("r{i}.parquet"), 1)])
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, "p0")
                 .await
                 .unwrap();
+            c.append_data_files_in_partition(
+                &p,
+                &t,
+                "p0",
+                exp,
+                vec![file(&format!("r{i}.parquet"), 1)],
+            )
+            .await
+            .unwrap();
         }
 
         // The reference live set, from the warm catalog.
@@ -7173,7 +7534,10 @@ mod tests {
             .map(|f| f.path)
             .collect();
         let chunk_gets_first = counting.chunk_gets();
-        assert_eq!(cold1, warm, "first cold fold must reconstruct the exact live set");
+        assert_eq!(
+            cold1, warm,
+            "first cold fold must reconstruct the exact live set"
+        );
         assert!(
             chunk_gets_first >= 2,
             "first cold fold must GET the frozen baseline chunk objects (cold chunk cache); \
@@ -7196,7 +7560,10 @@ mod tests {
             .map(|f| f.path)
             .collect();
         let chunk_gets_second = counting.chunk_gets();
-        assert_eq!(cold2, warm, "second cold fold must reconstruct the exact live set");
+        assert_eq!(
+            cold2, warm,
+            "second cold fold must reconstruct the exact live set"
+        );
 
         // The decisive assertion: a re-fold that references the SAME immutable
         // content-addressed chunk objects performs ZERO chunk-object GETs — every
@@ -7232,20 +7599,36 @@ mod tests {
         const PARTS: usize = 3;
         for i in 0..PARTS {
             let pid = i.to_string();
-            let exp = c.current_snapshot_id_in_partition(&p, &t, &pid).await.unwrap();
-            c.append_data_files_in_partition(&p, &t, &pid, exp, vec![file(&format!("seed{i}.parquet"), 1)])
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, &pid)
                 .await
                 .unwrap();
+            c.append_data_files_in_partition(
+                &p,
+                &t,
+                &pid,
+                exp,
+                vec![file(&format!("seed{i}.parquet"), 1)],
+            )
+            .await
+            .unwrap();
         }
 
         // First read PRIMES the snapshot (pays the full resolve).
         let first = c.load_table(&p, &t).await.unwrap();
-        assert_eq!(first.live_data_files().len(), PARTS, "primed view = seed set");
+        assert_eq!(
+            first.live_data_files().len(),
+            PARTS,
+            "primed view = seed set"
+        );
 
         // CHURN: commit a fresh file to partition 0. This advances partition 0's
         // version (version-keyed part_cache now MISSES) but does NOT touch the
         // META manifest, so the bounded-staleness snapshot stays valid.
-        let exp = c.current_snapshot_id_in_partition(&p, &t, "0").await.unwrap();
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &t, "0")
+            .await
+            .unwrap();
         c.append_data_files_in_partition(&p, &t, "0", exp, vec![file("churn.parquet", 1)])
             .await
             .unwrap();
@@ -7259,7 +7642,11 @@ mod tests {
             // Still the pre-churn view: the churn file is intentionally not yet
             // visible (staleness bounded by the TTL), but the snapshot is a real
             // internally-consistent committed view of exactly PARTS files.
-            assert_eq!(m.live_data_files().len(), PARTS, "within-TTL read = primed snapshot");
+            assert_eq!(
+                m.live_data_files().len(),
+                PARTS,
+                "within-TTL read = primed snapshot"
+            );
         }
         assert_eq!(
             counting.reads(),
@@ -7300,7 +7687,10 @@ mod tests {
         c.create_table(&p, &t, &schema()).await.unwrap();
 
         // Prime an (empty) snapshot.
-        assert_eq!(c.load_table(&p, &t).await.unwrap().live_data_files().len(), 0);
+        assert_eq!(
+            c.load_table(&p, &t).await.unwrap().live_data_files().len(),
+            0
+        );
 
         // A single-node META-chain append advances the META version and runs
         // through `after_commit`, which drops the snapshot. Despite the long
@@ -7321,18 +7711,35 @@ mod tests {
         let t0 = TableName::new("disabled").unwrap();
         c0.create_namespace(&p0).await.unwrap();
         c0.create_table(&p0, &t0, &schema()).await.unwrap();
-        let exp = c0.current_snapshot_id_in_partition(&p0, &t0, "0").await.unwrap();
+        let exp = c0
+            .current_snapshot_id_in_partition(&p0, &t0, "0")
+            .await
+            .unwrap();
         c0.append_data_files_in_partition(&p0, &t0, "0", exp, vec![file("d0.parquet", 1)])
             .await
             .unwrap();
-        assert_eq!(c0.load_table(&p0, &t0).await.unwrap().live_data_files().len(), 1);
+        assert_eq!(
+            c0.load_table(&p0, &t0)
+                .await
+                .unwrap()
+                .live_data_files()
+                .len(),
+            1
+        );
         // A churn commit is visible on the VERY NEXT read (no snapshot at all).
-        let exp = c0.current_snapshot_id_in_partition(&p0, &t0, "0").await.unwrap();
+        let exp = c0
+            .current_snapshot_id_in_partition(&p0, &t0, "0")
+            .await
+            .unwrap();
         c0.append_data_files_in_partition(&p0, &t0, "0", exp, vec![file("d1.parquet", 1)])
             .await
             .unwrap();
         assert_eq!(
-            c0.load_table(&p0, &t0).await.unwrap().live_data_files().len(),
+            c0.load_table(&p0, &t0)
+                .await
+                .unwrap()
+                .live_data_files()
+                .len(),
             2,
             "with the snapshot disabled (TTL=0) every read must be exact"
         );
@@ -7358,16 +7765,26 @@ mod tests {
 
         const N: usize = 2000;
         for i in 0..N {
-            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, "p0")
+                .await
+                .unwrap();
             // Every 7th commit (after warmup) is a Replace that removes a few of
             // the OLDEST live files (some sealed into chunks → tombstones) and
             // adds a merged one — drives tombstone growth → eventual re-chunk.
             if i > 0 && i % 7 == 0 && reference.len() >= 4 {
                 let to_remove: Vec<String> = reference.iter().take(4).cloned().collect();
                 let added = file(&format!("m{i}.parquet"), 5);
-                c.replace_data_files_in_partition(&p, &t, "p0", exp, to_remove.clone(), vec![added.clone()])
-                    .await
-                    .unwrap();
+                c.replace_data_files_in_partition(
+                    &p,
+                    &t,
+                    "p0",
+                    exp,
+                    to_remove.clone(),
+                    vec![added.clone()],
+                )
+                .await
+                .unwrap();
                 for r in &to_remove {
                     reference.remove(r);
                 }
@@ -7390,7 +7807,10 @@ mod tests {
             .into_iter()
             .map(|f| f.path)
             .collect();
-        assert_eq!(warm, reference, "warm folded live set must equal the replay reference");
+        assert_eq!(
+            warm, reference,
+            "warm folded live set must equal the replay reference"
+        );
 
         // Cold catalog (fresh instance, empty caches) must fold to the identical set.
         let fresh = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
@@ -7402,8 +7822,15 @@ mod tests {
             .into_iter()
             .map(|f| f.path)
             .collect();
-        assert_eq!(cold.len(), reference.len(), "cold fold count must match reference");
-        assert_eq!(cold, reference, "cold fold path set must EXACTLY match the reference");
+        assert_eq!(
+            cold.len(),
+            reference.len(),
+            "cold fold count must match reference"
+        );
+        assert_eq!(
+            cold, reference,
+            "cold fold path set must EXACTLY match the reference"
+        );
     }
 
     // COLUMN-STATS SURVIVE the chunked-baseline round-trip. The #41 metadata
@@ -7433,7 +7860,10 @@ mod tests {
 
         const N: usize = 400;
         for i in 0..N {
-            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, "p0")
+                .await
+                .unwrap();
             // Give each file a DISTINCT, wide-ish id range so a dropped/zeroed
             // stat would be obvious (every file's stats differ).
             let lo = (i as i64) * 1000;
@@ -7442,7 +7872,12 @@ mod tests {
                 let victims: Vec<String> = reference.keys().take(3).cloned().collect();
                 let added = file_with_stats(&format!("m{i}.parquet"), 5, lo, hi, 0);
                 c.replace_data_files_in_partition(
-                    &p, &t, "p0", exp, victims.clone(), vec![added.clone()],
+                    &p,
+                    &t,
+                    "p0",
+                    exp,
+                    victims.clone(),
+                    vec![added.clone()],
                 )
                 .await
                 .unwrap();
@@ -7463,18 +7898,29 @@ mod tests {
         // Cold catalog (fresh instance, empty caches): fold purely from objects.
         let fresh = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
         let live = fresh.load_table(&p, &t).await.unwrap().live_data_files();
-        assert_eq!(live.len(), reference.len(), "cold fold file count must match");
+        assert_eq!(
+            live.len(),
+            reference.len(),
+            "cold fold file count must match"
+        );
 
         for f in &live {
             let (rows, lo, hi, nulls) = *reference
                 .get(&f.path)
                 .unwrap_or_else(|| panic!("unexpected file {} in cold fold", f.path));
             assert_eq!(f.row_count, rows, "row_count drifted for {}", f.path);
-            let cs = f
-                .column_stats
-                .get("id")
-                .unwrap_or_else(|| panic!("column_stats for `id` DROPPED on {} through the chunk round-trip", f.path));
-            assert_eq!(cs.null_count, Some(nulls), "null_count drifted for {}", f.path);
+            let cs = f.column_stats.get("id").unwrap_or_else(|| {
+                panic!(
+                    "column_stats for `id` DROPPED on {} through the chunk round-trip",
+                    f.path
+                )
+            });
+            assert_eq!(
+                cs.null_count,
+                Some(nulls),
+                "null_count drifted for {}",
+                f.path
+            );
             assert_eq!(
                 cs.min_bytes,
                 Some(lo.to_le_bytes().to_vec()),
@@ -7513,7 +7959,10 @@ mod tests {
 
         // Build up a healthy live set first.
         for i in 0..200usize {
-            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, "p0")
+                .await
+                .unwrap();
             let added = file(&format!("a{i}.parquet"), 1);
             c.append_data_files_in_partition(&p, &t, "p0", exp, vec![added.clone()])
                 .await
@@ -7523,12 +7972,22 @@ mod tests {
         // Now churn heavily: remove an old file and add a new one each commit, so
         // tombstones pile up and trip the rechunk valve (tomb*4 > live).
         for i in 0..400usize {
-            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
-            let victim = reference.iter().next().cloned().unwrap();
-            let added = file(&format!("c{i}.parquet"), 1);
-            c.replace_data_files_in_partition(&p, &t, "p0", exp, vec![victim.clone()], vec![added.clone()])
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, "p0")
                 .await
                 .unwrap();
+            let victim = reference.iter().next().cloned().unwrap();
+            let added = file(&format!("c{i}.parquet"), 1);
+            c.replace_data_files_in_partition(
+                &p,
+                &t,
+                "p0",
+                exp,
+                vec![victim.clone()],
+                vec![added.clone()],
+            )
+            .await
+            .unwrap();
             reference.remove(&victim);
             reference.insert(added.path);
         }
@@ -7537,7 +7996,11 @@ mod tests {
         // fresh ~TARGET chunks, so it (a) DROPS the tombstone set to empty after
         // tombstones had accumulated, and/or (b) reduces the chunk-ref count vs
         // the previous baseline. We detect either signal.
-        let head_v = c.resolve_part_head_version(&p, &qt, 0, "p0").await.unwrap().unwrap();
+        let head_v = c
+            .resolve_part_head_version(&p, &qt, 0, "p0")
+            .await
+            .unwrap()
+            .unwrap();
         let mut saw_rechunk = false;
         let mut max_tomb = 0usize;
         let mut prev_chunks: Option<usize> = None;
@@ -7557,7 +8020,10 @@ mod tests {
             }
         }
         eprintln!("#27 rechunk valve: head_v={head_v} max_tombstones_seen={max_tomb} saw_rechunk={saw_rechunk}");
-        assert!(saw_rechunk, "re-chunk valve must fire under heavy churn (chunk-count drop or absorbed tombstones)");
+        assert!(
+            saw_rechunk,
+            "re-chunk valve must fire under heavy churn (chunk-count drop or absorbed tombstones)"
+        );
 
         // Exactly correct from a cold catalog.
         let fresh = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
@@ -7569,7 +8035,10 @@ mod tests {
             .into_iter()
             .map(|f| f.path)
             .collect();
-        assert_eq!(cold, reference, "cold fold after re-chunk must be exactly correct");
+        assert_eq!(
+            cold, reference,
+            "cold fold after re-chunk must be exactly correct"
+        );
     }
 
     // CRASH / AMBIGUOUS-PUT safety for CHUNK objects: a chunk Create that LANDS
@@ -7593,7 +8062,10 @@ mod tests {
         c.create_table(&p, &t, &schema()).await.unwrap();
 
         // Commit 1 = genesis baseline (seals a chunk). Disarmed.
-        let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &t, "p0")
+            .await
+            .unwrap();
         c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file("g0.parquet", 10)])
             .await
             .unwrap();
@@ -7602,8 +8074,13 @@ mod tests {
         // chunk FIRST (that is the create we make ambiguous), then writes the
         // segment object. The seal must converge (chunk is content-addressed and
         // already present), so the whole commit succeeds.
-        wrapper.armed.store(true, std::sync::atomic::Ordering::SeqCst);
-        let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        wrapper
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &t, "p0")
+            .await
+            .unwrap();
         c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file("g1.parquet", 25)])
             .await
             .expect("ambiguous CHUNK put that LANDED must converge, not fail the commit");
@@ -7613,12 +8090,19 @@ mod tests {
         let fresh = ObjectStoreCatalog::with_prefix(inner.clone(), DEFAULT_CATALOG_PREFIX);
         let live = fresh.load_table(&p, &t).await.unwrap().live_data_files();
         let total_rows: u64 = live.iter().map(|f| f.row_count).sum();
-        assert_eq!(total_rows, 35, "cold fold must see g0(10)+g1(25) exactly once");
+        assert_eq!(
+            total_rows, 35,
+            "cold fold must see g0(10)+g1(25) exactly once"
+        );
         let mut paths: Vec<String> = live.iter().map(|f| f.path.clone()).collect();
         paths.sort();
         let n = paths.len();
         paths.dedup();
-        assert_eq!(paths.len(), n, "no duplicate file refs after ambiguous chunk put");
+        assert_eq!(
+            paths.len(),
+            n,
+            "no duplicate file refs after ambiguous chunk put"
+        );
         assert_eq!(n, 2, "exactly the two committed files are live");
     }
 
@@ -7642,7 +8126,10 @@ mod tests {
             c.create_namespace(&p).await.unwrap();
             c.create_table(&p, &t, &schema()).await.unwrap();
             for i in 0..10usize {
-                let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+                let exp = c
+                    .current_snapshot_id_in_partition(&p, &t, "p0")
+                    .await
+                    .unwrap();
                 let added = file(&format!("legacy{i}.parquet"), 1);
                 c.append_data_files_in_partition(&p, &t, "p0", exp, vec![added.clone()])
                     .await
@@ -7657,13 +8144,23 @@ mod tests {
         {
             let c = ObjectStoreCatalog::with_chunk_config(store.clone(), K, true, 1024, 1024);
             for i in 10..40usize {
-                let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+                let exp = c
+                    .current_snapshot_id_in_partition(&p, &t, "p0")
+                    .await
+                    .unwrap();
                 if i % 5 == 0 {
                     let victim = reference.iter().next().cloned().unwrap();
                     let added = file(&format!("mix{i}.parquet"), 1);
-                    c.replace_data_files_in_partition(&p, &t, "p0", exp, vec![victim.clone()], vec![added.clone()])
-                        .await
-                        .unwrap();
+                    c.replace_data_files_in_partition(
+                        &p,
+                        &t,
+                        "p0",
+                        exp,
+                        vec![victim.clone()],
+                        vec![added.clone()],
+                    )
+                    .await
+                    .unwrap();
                     reference.remove(&victim);
                     reference.insert(added.path);
                 } else {
@@ -7685,7 +8182,10 @@ mod tests {
             .into_iter()
             .map(|f| f.path)
             .collect();
-        assert_eq!(cold, reference, "mixed legacy-inline + chunked chain must fold exactly");
+        assert_eq!(
+            cold, reference,
+            "mixed legacy-inline + chunked chain must fold exactly"
+        );
     }
 
     // --- Redundant-resolve elimination: per-commit ROUND TRIPS drop ----------
@@ -7761,7 +8261,8 @@ mod tests {
             options: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
             if options.head {
-                self.heads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.heads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else {
                 self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -7778,14 +8279,16 @@ mod tests {
             prefix: Option<&OsPath>,
         ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
-            self.lists.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.list(prefix)
         }
         async fn list_with_delimiter(
             &self,
             prefix: Option<&OsPath>,
         ) -> object_store::Result<object_store::ListResult> {
-            self.lists.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.list_with_delimiter(prefix).await
         }
         async fn copy_opts(
@@ -7810,16 +8313,28 @@ mod tests {
         // Warm the caches the way the engine hot path does: a few prior commits
         // so the META-head and partition caches are populated (steady state).
         for i in 0..3 {
-            let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
-            c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file(&format!("w{i}.parquet"), 1)])
+            let exp = c
+                .current_snapshot_id_in_partition(&p, &t, "p0")
                 .await
                 .unwrap();
+            c.append_data_files_in_partition(
+                &p,
+                &t,
+                "p0",
+                exp,
+                vec![file(&format!("w{i}.parquet"), 1)],
+            )
+            .await
+            .unwrap();
         }
 
         // Measure ONE steady-state commit cycle exactly as `commit_with_retry`
         // drives it: resolve the partition snapshot, then append.
         counting.reset();
-        let exp = c.current_snapshot_id_in_partition(&p, &t, "p0").await.unwrap();
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &t, "p0")
+            .await
+            .unwrap();
         let read_rts_after_resolve = counting.read_rts();
         c.append_data_files_in_partition(&p, &t, "p0", exp, vec![file("hot.parquet", 1)])
             .await
@@ -7867,7 +8382,11 @@ mod tests {
             assert!(live.contains(&format!("w{i}.parquet")));
         }
         assert!(live.contains("hot.parquet"));
-        assert_eq!(live.len(), 4, "no over/under count after redundant-resolve removal");
+        assert_eq!(
+            live.len(),
+            4,
+            "no over/under count after redundant-resolve removal"
+        );
     }
 
     // --- Exactly-once gate: concurrent multi-partition ingest + compaction ----
@@ -7883,7 +8402,10 @@ mod tests {
     async fn concurrent_multipart_ingest_plus_compaction_exactly_once() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         // Small K so compaction baselines fire frequently during the run.
-        let c = Arc::new(ObjectStoreCatalog::with_part_compact_every(store.clone(), 4));
+        let c = Arc::new(ObjectStoreCatalog::with_part_compact_every(
+            store.clone(),
+            4,
+        ));
         let p = ProjectId::new();
         let t = TableName::new("xo").unwrap();
         c.create_namespace(&p).await.unwrap();
@@ -7986,7 +8508,10 @@ mod tests {
         let mut all_landed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for h in appenders {
             for path in h.await.unwrap() {
-                assert!(all_landed.insert(path.clone()), "a path was committed twice: {path}");
+                assert!(
+                    all_landed.insert(path.clone()),
+                    "a path was committed twice: {path}"
+                );
             }
         }
         merger.await.unwrap();
@@ -8019,10 +8544,19 @@ mod tests {
         // final append lands first try (no livelock / wedged chain).
         for part in 0..PARTS {
             let pid = part.to_string();
-            let exp = cold.current_snapshot_id_in_partition(&p, &t, &pid).await.unwrap();
-            cold.append_data_files_in_partition(&p, &t, &pid, exp, vec![file(&format!("final-{part}.parquet"), 1)])
+            let exp = cold
+                .current_snapshot_id_in_partition(&p, &t, &pid)
                 .await
-                .expect("post-run commit lands without livelock");
+                .unwrap();
+            cold.append_data_files_in_partition(
+                &p,
+                &t,
+                &pid,
+                exp,
+                vec![file(&format!("final-{part}.parquet"), 1)],
+            )
+            .await
+            .expect("post-run commit lands without livelock");
         }
     }
 
@@ -8045,7 +8579,10 @@ mod tests {
             .await
             .unwrap();
         // Partition-segment file (sharded ingest style).
-        let exp = c.current_snapshot_id_in_partition(&p, &t, "s0").await.unwrap();
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &t, "s0")
+            .await
+            .unwrap();
         c.append_data_files_in_partition(&p, &t, "s0", exp, vec![file("part.parquet", 3)])
             .await
             .unwrap();
@@ -8269,7 +8806,12 @@ mod tests {
 
         // Seed two files.
         let m = c
-            .append_data_files(&p, &t, SnapshotId::GENESIS, vec![file("a.parquet", 5), file("b.parquet", 5)])
+            .append_data_files(
+                &p,
+                &t,
+                SnapshotId::GENESIS,
+                vec![file("a.parquet", 5), file("b.parquet", 5)],
+            )
             .await
             .unwrap();
         let head = m.current_snapshot;
@@ -8277,7 +8819,13 @@ mod tests {
         // Replace a.parquet -> c.parquet (the META-chain back-compat path now
         // resolves its OCC internally, so the passed `head` is informational).
         let m2 = c
-            .replace_data_files(&p, &t, head, vec!["a.parquet".into()], vec![file("c.parquet", 5)])
+            .replace_data_files(
+                &p,
+                &t,
+                head,
+                vec!["a.parquet".into()],
+                vec![file("c.parquet", 5)],
+            )
             .await
             .unwrap();
         let live: Vec<String> = m2.live_data_files().into_iter().map(|f| f.path).collect();
@@ -8287,7 +8835,13 @@ mod tests {
 
         // A second replace lands too (internal RMW); the live set tracks it.
         let m3 = c
-            .replace_data_files(&p, &t, head, vec!["b.parquet".into()], vec![file("d.parquet", 5)])
+            .replace_data_files(
+                &p,
+                &t,
+                head,
+                vec!["b.parquet".into()],
+                vec![file("d.parquet", 5)],
+            )
             .await
             .unwrap();
         let live3: Vec<String> = m3.live_data_files().into_iter().map(|f| f.path).collect();
@@ -8452,7 +9006,10 @@ mod tests {
             .await
             .unwrap()
             .expect("node B steals the expired lease");
-        assert_eq!(stolen.epoch, 2, "stolen epoch strictly increases across nodes");
+        assert_eq!(
+            stolen.epoch, 2,
+            "stolen epoch strictly increases across nodes"
+        );
         let (owner2, epoch2) = lease_a.owner_of(&p, part).await.unwrap().unwrap();
         assert_eq!(owner2, "nodeB");
         assert_eq!(epoch2, 2);
@@ -8473,8 +9030,7 @@ mod tests {
 
         let users = TableName::new("users").unwrap();
         let pub_users = QualifiedTableName::in_public(users.clone());
-        let auth_users =
-            QualifiedTableName::new(SchemaName::new("auth").unwrap(), users.clone());
+        let auth_users = QualifiedTableName::new(SchemaName::new("auth").unwrap(), users.clone());
 
         // Two tables, SAME bare name, DIFFERENT schemas, over ONE store.
         c.create_table_qualified(&p, &pub_users, Arc::new(schema()))
@@ -8718,8 +9274,14 @@ mod tests {
             let vb = node_b.nextval(&p, "s").await.unwrap();
             assert!(va >= 1, "in range");
             assert!(vb >= 1, "in range");
-            assert!(seen.insert(va), "no duplicate values across two nodes: {va}");
-            assert!(seen.insert(vb), "no duplicate values across two nodes: {vb}");
+            assert!(
+                seen.insert(va),
+                "no duplicate values across two nodes: {va}"
+            );
+            assert!(
+                seen.insert(vb),
+                "no duplicate values across two nodes: {vb}"
+            );
         }
         assert_eq!(seen.len(), 400, "every value distinct across both nodes");
     }
@@ -8798,7 +9360,10 @@ mod tests {
         let node_b = ObjectStoreCatalog::new(store.clone());
         let p = ProjectId::new();
         // Sequence def created on A is looked up on B.
-        node_a.create_sequence(seq_def(p, "s", 10, 5)).await.unwrap();
+        node_a
+            .create_sequence(seq_def(p, "s", 10, 5))
+            .await
+            .unwrap();
         assert_eq!(
             node_b.lookup_sequence(&p, "s").await.unwrap().start,
             10,
@@ -8871,9 +9436,16 @@ mod tests {
         let node_b = ObjectStoreCatalog::new(store.clone());
         let p = ProjectId::new();
         // Default before any set.
-        assert!(node_b.get_project_storage_config(&p).await.unwrap().is_none());
+        assert!(node_b
+            .get_project_storage_config(&p)
+            .await
+            .unwrap()
+            .is_none());
         let cfg = ProjectStorageConfig::default();
-        node_a.set_project_storage_config(&p, cfg.clone()).await.unwrap();
+        node_a
+            .set_project_storage_config(&p, cfg.clone())
+            .await
+            .unwrap();
         assert_eq!(
             node_b.get_project_storage_config(&p).await.unwrap(),
             Some(cfg)
@@ -8890,7 +9462,12 @@ mod tests {
         let node_b = ObjectStoreCatalog::new(store.clone());
 
         // Empty registry by default; persisted registry round-trips to a peer.
-        assert!(node_b.get_bucket_registry().await.unwrap().buckets.is_empty());
+        assert!(node_b
+            .get_bucket_registry()
+            .await
+            .unwrap()
+            .buckets
+            .is_empty());
         let registry = BucketRegistry {
             buckets: vec![BucketRegistryEntry {
                 bucket_id: "pool-0000".into(),
@@ -8975,7 +9552,10 @@ mod tests {
         node_a.put_migration_intent(&i2).await.unwrap();
 
         // A peer node reads the same intent (resume-on-restart) and LISTs both.
-        assert_eq!(node_b.get_migration_intent(&p1).await.unwrap(), Some(i1.clone()));
+        assert_eq!(
+            node_b.get_migration_intent(&p1).await.unwrap(),
+            Some(i1.clone())
+        );
         let mut listed = node_b.list_migration_intents().await.unwrap();
         listed.sort_by_key(|m| m.project);
         let mut expected = vec![i1.clone(), i2.clone()];
@@ -8983,7 +9563,10 @@ mod tests {
         assert_eq!(listed, expected, "LIST must return every in-flight intent");
 
         // Overwrite advances the phase (the state-machine advance step).
-        let advanced = MigrationIntent { phase: MigrationPhase::Verify, ..i1.clone() };
+        let advanced = MigrationIntent {
+            phase: MigrationPhase::Verify,
+            ..i1.clone()
+        };
         node_a.put_migration_intent(&advanced).await.unwrap();
         assert_eq!(
             node_b.get_migration_intent(&p1).await.unwrap(),
@@ -9017,15 +9600,9 @@ mod tests {
             name: "ingest_meta_id_check".into(),
             predicate: "id > 0".into(),
         };
-        c.set_table_constraints(
-            &p,
-            &t,
-            vec!["id".into()],
-            vec![check.clone()],
-            Vec::new(),
-        )
-        .await
-        .unwrap();
+        c.set_table_constraints(&p, &t, vec!["id".into()], vec![check.clone()], Vec::new())
+            .await
+            .unwrap();
 
         // Append a pile of data files across MANY distinct partitions: a full
         // `load_table` would LIST `parts/` and GET each of these segments.
@@ -9147,12 +9724,19 @@ mod tests {
 
         // Land a partition-sharded data file (mirrors the engine's INSERT
         // route on dev). One file, 1 row.
-        let exp = c.current_snapshot_id_in_partition(&p, &t, "s0").await.unwrap();
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &t, "s0")
+            .await
+            .unwrap();
         c.append_data_files_in_partition(&p, &t, "s0", exp, vec![file("pre_drop.parquet", 1)])
             .await
             .unwrap();
         let before = c.load_table(&p, &t).await.unwrap();
-        assert_eq!(before.live_data_files().len(), 1, "precondition: 1 file live");
+        assert_eq!(
+            before.live_data_files().len(),
+            1,
+            "precondition: 1 file live"
+        );
 
         c.drop_table(&p, &t).await.unwrap();
         c.create_table(&p, &t, &schema()).await.unwrap();
@@ -9160,8 +9744,16 @@ mod tests {
         let after = c.load_table(&p, &t).await.unwrap();
         let live = after.live_data_files();
         let rows: u64 = live.iter().map(|f| f.row_count).sum();
-        assert_eq!(after.current_snapshot, SnapshotId::GENESIS, "recreated table is genesis");
-        assert_eq!(live.len(), 0, "no stale data file survives drop+recreate (warm)");
+        assert_eq!(
+            after.current_snapshot,
+            SnapshotId::GENESIS,
+            "recreated table is genesis"
+        );
+        assert_eq!(
+            live.len(),
+            0,
+            "no stale data file survives drop+recreate (warm)"
+        );
         assert_eq!(rows, 0, "count(*) fast-aggregate sees zero rows (warm)");
     }
 
@@ -9176,7 +9768,10 @@ mod tests {
         let t = TableName::new("t").unwrap();
         writer.create_namespace(&p).await.unwrap();
         writer.create_table(&p, &t, &schema()).await.unwrap();
-        let exp = writer.current_snapshot_id_in_partition(&p, &t, "s0").await.unwrap();
+        let exp = writer
+            .current_snapshot_id_in_partition(&p, &t, "s0")
+            .await
+            .unwrap();
         writer
             .append_data_files_in_partition(&p, &t, "s0", exp, vec![file("pre_drop.parquet", 7)])
             .await
@@ -9190,7 +9785,11 @@ mod tests {
         let after = cold.load_table(&p, &t).await.unwrap();
         let live = after.live_data_files();
         let rows: u64 = live.iter().map(|f| f.row_count).sum();
-        assert_eq!(live.len(), 0, "no stale segment persisted under reused prefix");
+        assert_eq!(
+            live.len(),
+            0,
+            "no stale segment persisted under reused prefix"
+        );
         assert_eq!(rows, 0, "cold count(*) sees zero rows");
     }
 
@@ -9203,7 +9802,10 @@ mod tests {
         let t = TableName::new("t").unwrap();
         c.create_namespace(&p).await.unwrap();
         c.create_table(&p, &t, &schema()).await.unwrap();
-        let exp = c.current_snapshot_id_in_partition(&p, &t, "s0").await.unwrap();
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &t, "s0")
+            .await
+            .unwrap();
         c.append_data_files_in_partition(&p, &t, "s0", exp, vec![file("old.parquet", 999)])
             .await
             .unwrap();
@@ -9212,8 +9814,15 @@ mod tests {
         c.create_table(&p, &t, &schema()).await.unwrap();
 
         // Insert into the recreated table (same partition id reused).
-        let exp = c.current_snapshot_id_in_partition(&p, &t, "s0").await.unwrap();
-        assert_eq!(exp, SnapshotId::GENESIS, "recreated partition starts at genesis");
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &t, "s0")
+            .await
+            .unwrap();
+        assert_eq!(
+            exp,
+            SnapshotId::GENESIS,
+            "recreated partition starts at genesis"
+        );
         c.append_data_files_in_partition(&p, &t, "s0", exp, vec![file("new.parquet", 3)])
             .await
             .unwrap();
@@ -9236,7 +9845,10 @@ mod tests {
         c.create_namespace(&p).await.unwrap();
         c.create_table(&p, &dropped, &schema()).await.unwrap();
         c.create_table(&p, &fresh, &schema()).await.unwrap();
-        let exp = c.current_snapshot_id_in_partition(&p, &fresh, "s0").await.unwrap();
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &fresh, "s0")
+            .await
+            .unwrap();
         c.append_data_files_in_partition(&p, &fresh, "s0", exp, vec![file("keep.parquet", 5)])
             .await
             .unwrap();
@@ -9279,13 +9891,25 @@ mod tests {
         c.create_table(&p, &t, &schema()).await.unwrap();
 
         // Original life: a few partition-sharded commits (generation 0).
-        let mut exp = c.current_snapshot_id_in_partition(&p, &t, "s5").await.unwrap();
+        let mut exp = c
+            .current_snapshot_id_in_partition(&p, &t, "s5")
+            .await
+            .unwrap();
         for i in 0..3 {
-            c.append_data_files_in_partition(&p, &t, "s5", exp, vec![file(&format!("old{i}.parquet"), 10)])
+            c.append_data_files_in_partition(
+                &p,
+                &t,
+                "s5",
+                exp,
+                vec![file(&format!("old{i}.parquet"), 10)],
+            )
+            .await
+            .unwrap();
+            // The per-table union id is synthetic; re-resolve the PARTITION head.
+            exp = c
+                .current_snapshot_id_in_partition(&p, &t, "s5")
                 .await
                 .unwrap();
-            // The per-table union id is synthetic; re-resolve the PARTITION head.
-            exp = c.current_snapshot_id_in_partition(&p, &t, "s5").await.unwrap();
         }
 
         // The dropped table is generation 0.
@@ -9297,21 +9921,45 @@ mod tests {
 
         // The recreate stamped a FRESH higher generation.
         let new_gen = c.load_current(&p, &qt).await.unwrap().1.parts_generation;
-        assert_eq!(new_gen, dropped_gen + 1, "recreate bumps the partition generation");
+        assert_eq!(
+            new_gen,
+            dropped_gen + 1,
+            "recreate bumps the partition generation"
+        );
 
         // Recreated life: build a delta chain (baseline + several deltas) under
         // the new generation, reusing the SAME partition id `s5`.
-        let mut exp = c.current_snapshot_id_in_partition(&p, &t, "s5").await.unwrap();
-        assert_eq!(exp, SnapshotId::GENESIS, "recreated partition starts at genesis");
+        let mut exp = c
+            .current_snapshot_id_in_partition(&p, &t, "s5")
+            .await
+            .unwrap();
+        assert_eq!(
+            exp,
+            SnapshotId::GENESIS,
+            "recreated partition starts at genesis"
+        );
         for i in 0..6 {
-            c.append_data_files_in_partition(&p, &t, "s5", exp, vec![file(&format!("new{i}.parquet"), 4)])
+            c.append_data_files_in_partition(
+                &p,
+                &t,
+                "s5",
+                exp,
+                vec![file(&format!("new{i}.parquet"), 4)],
+            )
+            .await
+            .unwrap();
+            exp = c
+                .current_snapshot_id_in_partition(&p, &t, "s5")
                 .await
                 .unwrap();
-            exp = c.current_snapshot_id_in_partition(&p, &t, "s5").await.unwrap();
         }
         let before_race = c.load_table(&p, &t).await.unwrap();
         let n_files = before_race.live_data_files().len();
-        let n_rows: u64 = before_race.live_data_files().iter().map(|f| f.row_count).sum();
+        let n_rows: u64 = before_race
+            .live_data_files()
+            .iter()
+            .map(|f| f.row_count)
+            .sum();
         assert_eq!(n_files, 6, "precondition: recreated table has its 6 files");
         assert_eq!(n_rows, 24, "precondition: recreated table has its 24 rows");
 
@@ -9323,16 +9971,30 @@ mod tests {
 
         // The recreated chain is intact: the fold does NOT error (no torn chain)
         // and the row count is exactly the recreate's own.
-        let after_race = c.load_table(&p, &t).await.expect("recreated chain still folds (not torn)");
+        let after_race = c
+            .load_table(&p, &t)
+            .await
+            .expect("recreated chain still folds (not torn)");
         let live = after_race.live_data_files();
         let rows: u64 = live.iter().map(|f| f.row_count).sum();
-        assert_eq!(live.len(), 6, "recreated table's files survive the stale purge");
+        assert_eq!(
+            live.len(),
+            6,
+            "recreated table's files survive the stale purge"
+        );
         assert_eq!(rows, 24, "recreated table's rows survive the stale purge");
 
         // COLD: a fresh catalog over the same store reads the same intact set.
         let cold = ObjectStoreCatalog::with_prefix(store.clone(), DEFAULT_CATALOG_PREFIX);
-        let cold_after = cold.load_table(&p, &t).await.expect("cold fold of recreated chain succeeds");
-        assert_eq!(cold_after.live_data_files().len(), 6, "cold read: 6 files intact");
+        let cold_after = cold
+            .load_table(&p, &t)
+            .await
+            .expect("cold fold of recreated chain succeeds");
+        assert_eq!(
+            cold_after.live_data_files().len(),
+            6,
+            "cold read: 6 files intact"
+        );
     }
 
     /// The other half of the #44 contract still holds WITH generations: after a
@@ -9346,7 +10008,10 @@ mod tests {
         let t = TableName::new("p100m").unwrap();
         c.create_namespace(&p).await.unwrap();
         c.create_table(&p, &t, &schema()).await.unwrap();
-        let exp = c.current_snapshot_id_in_partition(&p, &t, "s5").await.unwrap();
+        let exp = c
+            .current_snapshot_id_in_partition(&p, &t, "s5")
+            .await
+            .unwrap();
         c.append_data_files_in_partition(&p, &t, "s5", exp, vec![file("pre.parquet", 100)])
             .await
             .unwrap();
@@ -9355,7 +10020,15 @@ mod tests {
         c.create_table(&p, &t, &schema()).await.unwrap();
 
         let after = c.load_table(&p, &t).await.unwrap();
-        assert_eq!(after.current_snapshot, SnapshotId::GENESIS, "recreated table is genesis");
-        assert_eq!(after.live_data_files().len(), 0, "recreated table starts empty");
+        assert_eq!(
+            after.current_snapshot,
+            SnapshotId::GENESIS,
+            "recreated table is genesis"
+        );
+        assert_eq!(
+            after.live_data_files().len(),
+            0,
+            "recreated table starts empty"
+        );
     }
 }

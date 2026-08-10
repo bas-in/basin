@@ -349,7 +349,10 @@ impl ScalarUDFImpl for WasmUdfImpl {
         &self.signature
     }
 
-    fn return_type(&self, _arg_types: &[ArrowDataType]) -> datafusion::error::Result<ArrowDataType> {
+    fn return_type(
+        &self,
+        _arg_types: &[ArrowDataType],
+    ) -> datafusion::error::Result<ArrowDataType> {
         Ok(self.return_type.clone())
     }
 
@@ -383,9 +386,7 @@ impl ScalarUDFImpl for WasmUdfImpl {
                 // If two threads race, the loser's `pre` is dropped and we use
                 // the winner's — both are equivalent (same module bytes).
                 let _ = self.instance_pre.set(pre);
-                self.instance_pre
-                    .get()
-                    .expect("instance_pre was just set")
+                self.instance_pre.get().expect("instance_pre was just set")
             }
         };
 
@@ -417,10 +418,7 @@ impl ScalarUDFImpl for WasmUdfImpl {
             &args.args,
         )
         .map_err(|e| {
-            datafusion::error::DataFusionError::Execution(format!(
-                "WASM UDF {}: {e}",
-                self.name
-            ))
+            datafusion::error::DataFusionError::Execution(format!("WASM UDF {}: {e}", self.name))
         })
     }
 }
@@ -483,42 +481,48 @@ fn invoke_typed(
     // guest's allocator + memory. Look them up once and pass into the row
     // loop. They are *not* required for purely-numeric calls — back-compat
     // with the legacy minimal WAT modules that don't export `basin_alloc`.
-    let needs_alloc = arg_types.iter().copied().any(is_dynamic_bytes)
-        || is_dynamic_bytes(return_type);
+    let needs_alloc =
+        arg_types.iter().copied().any(is_dynamic_bytes) || is_dynamic_bytes(return_type);
 
     let alloc = if needs_alloc {
-        Some(instance
-            .get_typed_func::<i32, i32>(store.as_context_mut(), "basin_alloc")
-            .map_err(|_| {
-                BasinError::InvalidSchema(format!(
-                    "WASM UDF {fn_name}: module uses dynamic-size types but does not \
+        Some(
+            instance
+                .get_typed_func::<i32, i32>(store.as_context_mut(), "basin_alloc")
+                .map_err(|_| {
+                    BasinError::InvalidSchema(format!(
+                        "WASM UDF {fn_name}: module uses dynamic-size types but does not \
                      export `basin_alloc(i32) -> i32`; see basin-engine::wasm_udf docs"
-                ))
-            })?)
+                    ))
+                })?,
+        )
     } else {
         None
     };
     let dealloc = if needs_alloc {
-        Some(instance
-            .get_typed_func::<(i32, i32), ()>(store.as_context_mut(), "basin_dealloc")
-            .map_err(|_| {
-                BasinError::InvalidSchema(format!(
-                    "WASM UDF {fn_name}: module uses dynamic-size types but does not \
+        Some(
+            instance
+                .get_typed_func::<(i32, i32), ()>(store.as_context_mut(), "basin_dealloc")
+                .map_err(|_| {
+                    BasinError::InvalidSchema(format!(
+                        "WASM UDF {fn_name}: module uses dynamic-size types but does not \
                      export `basin_dealloc(i32, i32)`; see basin-engine::wasm_udf docs"
-                ))
-            })?)
+                    ))
+                })?,
+        )
     } else {
         None
     };
     let memory = if needs_alloc {
-        Some(instance
-            .get_memory(store.as_context_mut(), "memory")
-            .ok_or_else(|| {
-                BasinError::InvalidSchema(format!(
-                    "WASM UDF {fn_name}: module uses dynamic-size types but does not \
+        Some(
+            instance
+                .get_memory(store.as_context_mut(), "memory")
+                .ok_or_else(|| {
+                    BasinError::InvalidSchema(format!(
+                        "WASM UDF {fn_name}: module uses dynamic-size types but does not \
                      export `memory`; see basin-engine::wasm_udf docs"
-                ))
-            })?)
+                    ))
+                })?,
+        )
     } else {
         None
     };
@@ -1020,14 +1024,18 @@ enum OutputBuilder {
 impl OutputBuilder {
     fn new(t: SqlArgType, capacity: usize) -> Self {
         match t {
-            SqlArgType::Int | SqlArgType::BigInt => {
-                OutputBuilder::Int64 { b: Int64Builder::with_capacity(capacity) }
-            }
-            SqlArgType::Double => {
-                OutputBuilder::Float64 { b: Float64Builder::with_capacity(capacity) }
-            }
-            SqlArgType::Text => OutputBuilder::Text { b: StringBuilder::with_capacity(capacity, capacity * 16) },
-            SqlArgType::Bytea => OutputBuilder::Bytea { b: BinaryBuilder::with_capacity(capacity, capacity * 16) },
+            SqlArgType::Int | SqlArgType::BigInt => OutputBuilder::Int64 {
+                b: Int64Builder::with_capacity(capacity),
+            },
+            SqlArgType::Double => OutputBuilder::Float64 {
+                b: Float64Builder::with_capacity(capacity),
+            },
+            SqlArgType::Text => OutputBuilder::Text {
+                b: StringBuilder::with_capacity(capacity, capacity * 16),
+            },
+            SqlArgType::Bytea => OutputBuilder::Bytea {
+                b: BinaryBuilder::with_capacity(capacity, capacity * 16),
+            },
             SqlArgType::TimestampTz => OutputBuilder::TimestampTz {
                 b: TimestampMicrosecondBuilder::with_capacity(capacity).with_timezone("UTC"),
             },
@@ -1036,7 +1044,9 @@ impl OutputBuilder {
             },
             // Fallback for any types not covered above — should never be
             // reached because make_wasm_scalar_udf gates on sql_arg_to_arrow.
-            _ => OutputBuilder::Int64 { b: Int64Builder::with_capacity(capacity) },
+            _ => OutputBuilder::Int64 {
+                b: Int64Builder::with_capacity(capacity),
+            },
         }
     }
 
@@ -1086,8 +1096,14 @@ impl OutputBuilder {
             OutputBuilder::Int64 { mut b } => {
                 let arr: Int64Array = b.finish();
                 if scalar_call {
-                    let v = if arr.is_null(0) { None } else { Some(arr.value(0)) };
-                    Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Int64(v)))
+                    let v = if arr.is_null(0) {
+                        None
+                    } else {
+                        Some(arr.value(0))
+                    };
+                    Ok(ColumnarValue::Scalar(
+                        datafusion::scalar::ScalarValue::Int64(v),
+                    ))
                 } else {
                     Ok(ColumnarValue::Array(Arc::new(arr)))
                 }
@@ -1095,8 +1111,14 @@ impl OutputBuilder {
             OutputBuilder::Float64 { mut b } => {
                 let arr: Float64Array = b.finish();
                 if scalar_call {
-                    let v = if arr.is_null(0) { None } else { Some(arr.value(0)) };
-                    Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Float64(v)))
+                    let v = if arr.is_null(0) {
+                        None
+                    } else {
+                        Some(arr.value(0))
+                    };
+                    Ok(ColumnarValue::Scalar(
+                        datafusion::scalar::ScalarValue::Float64(v),
+                    ))
                 } else {
                     Ok(ColumnarValue::Array(Arc::new(arr)))
                 }
@@ -1104,8 +1126,14 @@ impl OutputBuilder {
             OutputBuilder::Text { mut b } => {
                 let arr: StringArray = b.finish();
                 if scalar_call {
-                    let v = if arr.is_null(0) { None } else { Some(arr.value(0).to_string()) };
-                    Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(v)))
+                    let v = if arr.is_null(0) {
+                        None
+                    } else {
+                        Some(arr.value(0).to_string())
+                    };
+                    Ok(ColumnarValue::Scalar(
+                        datafusion::scalar::ScalarValue::Utf8(v),
+                    ))
                 } else {
                     Ok(ColumnarValue::Array(Arc::new(arr)))
                 }
@@ -1113,8 +1141,14 @@ impl OutputBuilder {
             OutputBuilder::Bytea { mut b } => {
                 let arr: BinaryArray = b.finish();
                 if scalar_call {
-                    let v = if arr.is_null(0) { None } else { Some(arr.value(0).to_vec()) };
-                    Ok(ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Binary(v)))
+                    let v = if arr.is_null(0) {
+                        None
+                    } else {
+                        Some(arr.value(0).to_vec())
+                    };
+                    Ok(ColumnarValue::Scalar(
+                        datafusion::scalar::ScalarValue::Binary(v),
+                    ))
                 } else {
                     Ok(ColumnarValue::Array(Arc::new(arr)))
                 }
@@ -1122,9 +1156,16 @@ impl OutputBuilder {
             OutputBuilder::TimestampTz { mut b } => {
                 let arr: TimestampMicrosecondArray = b.finish();
                 if scalar_call {
-                    let v = if arr.is_null(0) { None } else { Some(arr.value(0)) };
+                    let v = if arr.is_null(0) {
+                        None
+                    } else {
+                        Some(arr.value(0))
+                    };
                     Ok(ColumnarValue::Scalar(
-                        datafusion::scalar::ScalarValue::TimestampMicrosecond(v, Some("UTC".into())),
+                        datafusion::scalar::ScalarValue::TimestampMicrosecond(
+                            v,
+                            Some("UTC".into()),
+                        ),
                     ))
                 } else {
                     Ok(ColumnarValue::Array(Arc::new(arr)))
@@ -1133,7 +1174,11 @@ impl OutputBuilder {
             OutputBuilder::Timestamp { mut b } => {
                 let arr: TimestampMicrosecondArray = b.finish();
                 if scalar_call {
-                    let v = if arr.is_null(0) { None } else { Some(arr.value(0)) };
+                    let v = if arr.is_null(0) {
+                        None
+                    } else {
+                        Some(arr.value(0))
+                    };
                     Ok(ColumnarValue::Scalar(
                         datafusion::scalar::ScalarValue::TimestampMicrosecond(v, None),
                     ))
@@ -1168,9 +1213,10 @@ pub(crate) fn sql_arg_to_arrow(t: SqlArgType) -> Option<ArrowDataType> {
         SqlArgType::Double => Some(ArrowDataType::Float64),
         SqlArgType::Text => Some(ArrowDataType::Utf8),
         SqlArgType::Bytea => Some(ArrowDataType::Binary),
-        SqlArgType::TimestampTz => {
-            Some(ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
-        }
+        SqlArgType::TimestampTz => Some(ArrowDataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        )),
         SqlArgType::Timestamp => Some(ArrowDataType::Timestamp(TimeUnit::Microsecond, None)),
         _ => None, // Boolean / Date / composite — not yet wired for WASM UDFs
     }
@@ -1209,10 +1255,7 @@ pub(crate) fn make_wasm_scalar_udf(def: &SqlFunctionDef) -> Option<Arc<ScalarUDF
         SqlReturnType::Table(_) => return None, // RETURNS TABLE not supported for WASM
     };
 
-    let sig = Signature::new(
-        TypeSignature::Exact(arg_arrow_types),
-        Volatility::Volatile,
-    );
+    let sig = Signature::new(TypeSignature::Exact(arg_arrow_types), Volatility::Volatile);
 
     let udf_impl = WasmUdfImpl {
         name: def.name.clone(),
@@ -1546,8 +1589,8 @@ mod tests {
         let (ptr, len) =
             write_bytes_to_guest("echo", &mut store, &alloc, &memory, payload).expect("write");
         assert_eq!(len as usize, payload.len());
-        let out = read_bytes_from_guest("echo", &mut store, &memory, ptr, len as usize)
-            .expect("read");
+        let out =
+            read_bytes_from_guest("echo", &mut store, &memory, ptr, len as usize).expect("read");
         assert_eq!(out, payload);
     }
 
@@ -1571,14 +1614,19 @@ mod tests {
             vec![0xff; 1024],
         ];
         for payload in payloads {
-            let (ptr, len) = write_bytes_to_guest("echo", &mut store, &alloc, &memory, &payload)
-                .expect("write");
+            let (ptr, len) =
+                write_bytes_to_guest("echo", &mut store, &alloc, &memory, &payload).expect("write");
             assert_eq!(len as usize, payload.len());
             // Empty payload still gets a valid (>=0) ptr from the bump allocator.
             assert!(ptr >= 0, "ptr must be non-negative");
             let out = read_bytes_from_guest("echo", &mut store, &memory, ptr, len as usize)
                 .expect("read");
-            assert_eq!(out, payload, "round-trip mismatch for {} bytes", payload.len());
+            assert_eq!(
+                out,
+                payload,
+                "round-trip mismatch for {} bytes",
+                payload.len()
+            );
         }
     }
 
@@ -1710,8 +1758,14 @@ mod tests {
     fn sql_arg_to_arrow_covers_new_types() {
         // Regression: the new types must each return a concrete Arrow type
         // so make_wasm_scalar_udf doesn't silently drop the function.
-        assert!(matches!(sql_arg_to_arrow(SqlArgType::Text), Some(ArrowDataType::Utf8)));
-        assert!(matches!(sql_arg_to_arrow(SqlArgType::Bytea), Some(ArrowDataType::Binary)));
+        assert!(matches!(
+            sql_arg_to_arrow(SqlArgType::Text),
+            Some(ArrowDataType::Utf8)
+        ));
+        assert!(matches!(
+            sql_arg_to_arrow(SqlArgType::Bytea),
+            Some(ArrowDataType::Binary)
+        ));
         assert!(matches!(
             sql_arg_to_arrow(SqlArgType::TimestampTz),
             Some(ArrowDataType::Timestamp(TimeUnit::Microsecond, _))

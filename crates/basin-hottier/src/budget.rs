@@ -462,9 +462,7 @@ mod tests {
     fn scheduler_respects_limit() {
         let sched = GlobalPressureScheduler::default();
         // 5 GiB total — above threshold.
-        let projects: Vec<(u64, u64)> = (0..10)
-            .map(|i| (i, (i + 1) * 512 * 1024 * 1024))
-            .collect();
+        let projects: Vec<(u64, u64)> = (0..10).map(|i| (i, (i + 1) * 512 * 1024 * 1024)).collect();
         let candidates = sched
             .pick_flush_candidates(&projects, 3)
             .expect("must return candidates under pressure");
@@ -477,7 +475,9 @@ mod tests {
         // Exactly at threshold — not under pressure.
         let at_threshold = vec![(1u64, DEFAULT_GLOBAL_PRESSURE_THRESHOLD_BYTES)];
         assert!(!sched.is_under_pressure(&at_threshold));
-        assert!(sched.pick_flush_candidates(&at_threshold, usize::MAX).is_none());
+        assert!(sched
+            .pick_flush_candidates(&at_threshold, usize::MAX)
+            .is_none());
 
         // One byte over — under pressure.
         let over_threshold = vec![(1u64, DEFAULT_GLOBAL_PRESSURE_THRESHOLD_BYTES + 1)];

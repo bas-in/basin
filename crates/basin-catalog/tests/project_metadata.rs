@@ -5,8 +5,8 @@
 //! silently if Postgres is not reachable, mirroring the pattern used by the
 //! rest of the basin-catalog suite.
 
-use basin_catalog::{Catalog, InMemoryCatalog, S3Config, ProjectMetadata};
 use basin_catalog::usage::{spawn_usage_snapshot_task, UsageSnapshotConfig};
+use basin_catalog::{Catalog, InMemoryCatalog, ProjectMetadata, S3Config};
 use basin_common::ProjectCounterRegistry;
 use basin_common::ProjectId;
 use std::sync::Arc;

@@ -17,9 +17,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use basin_auth::project_credentials::parse_project_from_pgwire_user;
 use basin_auth::store::postgres::PostgresAuthStore;
 use basin_auth::store::AuthStore;
-use basin_auth::project_credentials::parse_project_from_pgwire_user;
 use basin_auth::tokens;
 use basin_common::{BasinError, ProjectId};
 use chrono::Utc;
@@ -168,10 +168,7 @@ async fn user_uniqueness_per_project(store: &Arc<dyn AuthStore>) {
     let dup = store
         .create_user(&project_a, &email, &hash, Uuid::new_v4())
         .await;
-    assert!(
-        dup.is_err(),
-        "duplicate (project, email) must fail, got Ok"
-    );
+    assert!(dup.is_err(), "duplicate (project, email) must fail, got Ok");
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +214,10 @@ async fn cross_project_same_email(store: &Arc<dyn AuthStore>) {
         .find_user_by_email(&ProjectId::new(), &email)
         .await
         .expect("find in unrelated project must not error");
-    assert!(not_found.is_none(), "user must not be visible in wrong project");
+    assert!(
+        not_found.is_none(),
+        "user must not be visible in wrong project"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -306,7 +306,10 @@ async fn refresh_rotation(store: &Arc<dyn AuthStore>) {
         .list_refresh_revocations(user_id)
         .await
         .expect("list after jti_b");
-    assert!(rows2.iter().any(|r| r.token_hash == jti_a), "jti_a still present");
+    assert!(
+        rows2.iter().any(|r| r.token_hash == jti_a),
+        "jti_a still present"
+    );
     assert!(rows2.iter().any(|r| r.token_hash == jti_b), "jti_b present");
 
     // Duplicate insert of jti_a → 0 rows (ON CONFLICT DO NOTHING), no error.
@@ -373,7 +376,10 @@ async fn refresh_blanket_revocation(store: &Arc<dyn AuthStore>) {
         .await
         .expect("list after second upsert");
     let count = rows2.iter().filter(|r| r.token_hash == blanket_key).count();
-    assert_eq!(count, 1, "duplicate upsert must not create two sentinel rows");
+    assert_eq!(
+        count, 1,
+        "duplicate upsert must not create two sentinel rows"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +422,10 @@ async fn api_key_lifecycle(store: &Arc<dyn AuthStore>) {
         .expect("find_api_keys_by_hash");
     assert!(!rows.is_empty(), "must return the inserted key");
     let row = rows.iter().find(|r| r.id == id).expect("row by id");
-    assert!(row.revoked_at.is_none(), "key must not be revoked initially");
+    assert!(
+        row.revoked_at.is_none(),
+        "key must not be revoked initially"
+    );
     assert_eq!(row.user_id, user_id);
 
     // Revoke.
@@ -462,8 +471,8 @@ async fn project_credential_self_routing(store: &Arc<dyn AuthStore>) {
         .expect("insert_project_credential");
 
     // Positive: parse recovers the project id.
-    let parsed = parse_project_from_pgwire_user(&pgwire_user)
-        .expect("valid pgwire_user must parse");
+    let parsed =
+        parse_project_from_pgwire_user(&pgwire_user).expect("valid pgwire_user must parse");
     assert_eq!(
         parsed,
         project.to_string().as_str(),
@@ -490,12 +499,12 @@ fn project_credential_malformed_inputs() {
     let bad: &[&str] = &[
         "",
         "short",
-        "project_a1b2c3d4",                     // legacy format
-        "01JBAS1NAVTH00000000000000",            // 26 chars, no underscore
-        "01JBAS1NAVTH00000000000000-suffix",     // wrong separator
-        "01JBAS1NAVTH00000000000000_",           // underscore at 26 but nothing after
-        "../etc/passwd",                          // path injection
-        "'; DROP TABLE users; --",               // SQL injection
+        "project_a1b2c3d4",                  // legacy format
+        "01JBAS1NAVTH00000000000000",        // 26 chars, no underscore
+        "01JBAS1NAVTH00000000000000-suffix", // wrong separator
+        "01JBAS1NAVTH00000000000000_",       // underscore at 26 but nothing after
+        "../etc/passwd",                     // path injection
+        "'; DROP TABLE users; --",           // SQL injection
     ];
 
     for input in bad {

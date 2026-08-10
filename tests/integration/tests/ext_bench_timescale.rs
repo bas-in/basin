@@ -45,7 +45,10 @@ use common::{build_basin_engine, median, try_connect, BasinInstance, SchemaGuard
 const EPOCH: i64 = 1_700_000_000;
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn write_artifact(file: &str, value: &serde_json::Value) {
@@ -125,10 +128,15 @@ async fn basin_p50(sess: &basin_engine::ProjectSession, sql: &str, n: usize) -> 
 }
 
 async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f64> {
-    let _ = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await;
+    let _ = pg
+        .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+        .await;
     let mut s = Vec::with_capacity(n);
     for _ in 0..n {
-        if let Ok(rs) = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await {
+        if let Ok(rs) = pg
+            .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+            .await
+        {
             for m in &rs {
                 if let SimpleQueryMessage::Row(r) = m {
                     if let Some(line) = r.get(0) {
@@ -145,7 +153,11 @@ async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f6
             }
         }
     }
-    if s.is_empty() { None } else { Some(median(&s)) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(median(&s))
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -157,19 +169,29 @@ async fn ext_bench_timescale() {
 
     // ── Basin: plain-table ingest + bucket shapes ────────────────────────────
     let mut instance: BasinInstance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
 
     let plain_ingest_s = seed_basin_series(&sess, "metrics", rows).await;
-    let basin_plain_rate = if plain_ingest_s > 0.0 { rows as f64 / plain_ingest_s } else { 0.0 };
+    let basin_plain_rate = if plain_ingest_s > 0.0 {
+        rows as f64 / plain_ingest_s
+    } else {
+        0.0
+    };
 
     // Hypertable twin (TS6): create_hypertable is accepted-DDL on Basin.
     let hyper_create_ok = {
         let _ = sess.execute(
             "CREATE TABLE metrics_ht (id BIGINT NOT NULL, ts TIMESTAMPTZ NOT NULL, device BIGINT NOT NULL, value DOUBLE PRECISION NOT NULL)"
         ).await;
-        sess.execute("SELECT create_hypertable('metrics_ht', 'ts', chunk_time_interval => INTERVAL '1 day')")
-            .await
-            .is_ok()
+        sess.execute(
+            "SELECT create_hypertable('metrics_ht', 'ts', chunk_time_interval => INTERVAL '1 day')",
+        )
+        .await
+        .is_ok()
     };
     let basin_hyper_rate = if hyper_create_ok {
         let batch = 10_000usize;
@@ -192,7 +214,11 @@ async fn ext_bench_timescale() {
             off = hi;
         }
         let s = start.elapsed().as_secs_f64();
-        if s > 0.0 { Some(rows as f64 / s) } else { None }
+        if s > 0.0 {
+            Some(rows as f64 / s)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -248,7 +274,10 @@ async fn ext_bench_timescale() {
     let (ts5_b, basin_native_drop_chunks) = {
         let drop_interval = "'24 hours'";
         let t = Instant::now();
-        match sess.execute(&format!("SELECT drop_chunks('metrics', {drop_interval})")).await {
+        match sess
+            .execute(&format!("SELECT drop_chunks('metrics', {drop_interval})"))
+            .await
+        {
             Ok(_) => {
                 let elapsed = t.elapsed().as_secs_f64() * 1000.0;
                 (Some(elapsed), true)
@@ -256,7 +285,12 @@ async fn ext_bench_timescale() {
             Err(e) => {
                 eprintln!("[ext_bench_timescale] TS5 native drop_chunks unavailable ({e}), falling back to DELETE");
                 let t2 = Instant::now();
-                match sess.execute(&format!("DELETE FROM metrics WHERE ts < to_timestamp({cutoff})")).await {
+                match sess
+                    .execute(&format!(
+                        "DELETE FROM metrics WHERE ts < to_timestamp({cutoff})"
+                    ))
+                    .await
+                {
                     Ok(_) => (Some(t2.elapsed().as_secs_f64() * 1000.0), false),
                     Err(e2) => {
                         eprintln!("[ext_bench_timescale] TS5 DELETE also unsupported: {e2}");
@@ -289,12 +323,20 @@ async fn ext_bench_timescale() {
         pg_available = true;
         let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
         let schema = format!("basin_ext_ts_{suffix}");
-        let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-        pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.ok();
+        let _guard = SchemaGuard {
+            schema: schema.clone(),
+            conn_str: cs,
+        };
+        pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .ok();
         pg.simple_query("SET work_mem = '64MB'").await.ok();
         // TimescaleDB may or may not be installed; the bucket/first/last
         // comparators run on plain PG either way (we use PG-equivalent SQL).
-        pg_timescale_ext = pg.simple_query("CREATE EXTENSION IF NOT EXISTS timescaledb").await.is_ok();
+        pg_timescale_ext = pg
+            .simple_query("CREATE EXTENSION IF NOT EXISTS timescaledb")
+            .await
+            .is_ok();
 
         pg.simple_query(&format!(
             "CREATE TABLE {schema}.metrics (id BIGINT, ts TIMESTAMPTZ NOT NULL, device BIGINT NOT NULL, value DOUBLE PRECISION NOT NULL)"
@@ -315,12 +357,20 @@ async fn ext_bench_timescale() {
                 let value = (k % 1000) as f64 * 0.5;
                 v.push_str(&format!("({k}, to_timestamp({ts}), {device}, {value})"));
             }
-            pg.simple_query(&format!("INSERT INTO {schema}.metrics VALUES {v}")).await.ok();
+            pg.simple_query(&format!("INSERT INTO {schema}.metrics VALUES {v}"))
+                .await
+                .ok();
             po = hi;
         }
         let pg_s = pgstart.elapsed().as_secs_f64();
-        pg_plain_rate = if pg_s > 0.0 { Some(rows as f64 / pg_s) } else { None };
-        pg.simple_query(&format!("ANALYZE {schema}.metrics")).await.ok();
+        pg_plain_rate = if pg_s > 0.0 {
+            Some(rows as f64 / pg_s)
+        } else {
+            None
+        };
+        pg.simple_query(&format!("ANALYZE {schema}.metrics"))
+            .await
+            .ok();
 
         // Hypertable ingest (only when timescaledb installed) — fresh twin.
         if pg_timescale_ext {
@@ -344,11 +394,17 @@ async fn ext_bench_timescale() {
                     let value = (k % 1000) as f64 * 0.5;
                     v.push_str(&format!("({k}, to_timestamp({ts}), {device}, {value})"));
                 }
-                pg.simple_query(&format!("INSERT INTO {schema}.metrics_ht VALUES {v}")).await.ok();
+                pg.simple_query(&format!("INSERT INTO {schema}.metrics_ht VALUES {v}"))
+                    .await
+                    .ok();
                 ho = hi;
             }
             let hs = hstart.elapsed().as_secs_f64();
-            pg_hyper_rate = if hs > 0.0 { Some(rows as f64 / hs) } else { None };
+            pg_hyper_rate = if hs > 0.0 {
+                Some(rows as f64 / hs)
+            } else {
+                None
+            };
         }
 
         // TS1/2/3: time_bucket works on PG only when timescaledb is installed;
@@ -374,71 +430,97 @@ async fn ext_bench_timescale() {
             "SELECT {b3} AS b, COUNT(*) AS n, SUM(value) AS s FROM {schema}.metrics GROUP BY b ORDER BY b"), samples).await;
 
         // TS4: PG-equivalent first/last via DISTINCT ON (the idiomatic PG way).
-        pg_ts4 = pg_p50(&pg, &format!(
-            "SELECT device, \
+        pg_ts4 = pg_p50(
+            &pg,
+            &format!(
+                "SELECT device, \
              (ARRAY_AGG(value ORDER BY ts ASC))[1] AS first_value, \
              (ARRAY_AGG(value ORDER BY ts DESC))[1] AS last_value \
-             FROM {schema}.metrics GROUP BY device ORDER BY device"), samples).await;
+             FROM {schema}.metrics GROUP BY device ORDER BY device"
+            ),
+            samples,
+        )
+        .await;
 
         // TS7: timescale chunks view (only when installed).
         if pg_timescale_ext {
-            pg_ts7 = pg_p50(&pg, "SELECT count(*) FROM timescaledb_information.chunks", samples).await;
+            pg_ts7 = pg_p50(
+                &pg,
+                "SELECT count(*) FROM timescaledb_information.chunks",
+                samples,
+            )
+            .await;
         }
 
         // TS5: DELETE WHERE ts<cutoff — single shot on a disposable copy.
-        pg.simple_query(&format!("CREATE TABLE {schema}.metrics_del AS TABLE {schema}.metrics")).await.ok();
+        pg.simple_query(&format!(
+            "CREATE TABLE {schema}.metrics_del AS TABLE {schema}.metrics"
+        ))
+        .await
+        .ok();
         {
             let t = Instant::now();
-            let _ = pg.simple_query(&format!(
-                "DELETE FROM {schema}.metrics_del WHERE ts < to_timestamp({cutoff})")).await;
+            let _ = pg
+                .simple_query(&format!(
+                    "DELETE FROM {schema}.metrics_del WHERE ts < to_timestamp({cutoff})"
+                ))
+                .await;
             pg_ts5 = Some(t.elapsed().as_secs_f64() * 1000.0);
         }
 
-        let _ = pg.simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+        let _ = pg
+            .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await;
         std::mem::forget(_guard);
     } else {
         eprintln!("[ext_bench_timescale] PG unavailable — Basin-only card");
     }
 
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("ext_bench_timescale.json", &json!({
-        "card": "ext_bench_timescale",
-        "family": "timescaledb",
-        "generated_at": format!("@{ts}"),
-        "pg_available": pg_available,
-        "pg_extension_available": pg_timescale_ext,
-        "basin_hypertable_ddl_ok": hyper_create_ok,
-        "config": { "rows": rows, "samples": samples },
-        "ingest": [
-            { "label": "TS6a: plain-table ingest (rows/s)", "basin_rows_per_s": basin_plain_rate, "pg_rows_per_s": pg_plain_rate },
-            { "label": "TS6b: hypertable ingest (rows/s)", "basin_rows_per_s": basin_hyper_rate, "pg_rows_per_s": pg_hyper_rate },
-        ],
-        "shapes": [
-            { "label": "TS1: time_bucket('1 minute') GROUP BY", "basin_p50_ms": opt_ms(ts1_b), "pg_p50_ms": opt_ms(pg_ts1),
-              "basin_over_pg": ratio(ts1_b, pg_ts1), "pg_bucket": if pg_timescale_ext { "time_bucket" } else { "date_trunc (PG-equivalent)" } },
-            { "label": "TS2: time_bucket('1 hour') GROUP BY", "basin_p50_ms": opt_ms(ts2_b), "pg_p50_ms": opt_ms(pg_ts2),
-              "basin_over_pg": ratio(ts2_b, pg_ts2) },
-            { "label": "TS3: time_bucket('1 day') GROUP BY", "basin_p50_ms": opt_ms(ts3_b), "pg_p50_ms": opt_ms(pg_ts3),
-              "basin_over_pg": ratio(ts3_b, pg_ts3) },
-            { "label": "TS4: first/last per device",
-              "basin_native_first_last": basin_native_first_last,
-              "basin_supported": ts4_supported, "basin_p50_ms": opt_ms(ts4_b), "pg_p50_ms": opt_ms(pg_ts4),
-              "basin_over_pg": ratio(ts4_b, pg_ts4),
-              "basin_method": if basin_native_first_last { "native first(v,ts)/last(v,ts)" } else { "fallback: ARRAY_AGG PG-equivalent" } },
-            { "label": "TS5: retention",
-              "basin_native_drop_chunks": basin_native_drop_chunks,
-              "basin_ms": opt_ms(ts5_b), "pg_ms": opt_ms(pg_ts5), "single_shot": true,
-              "basin_method": if basin_native_drop_chunks { "native drop_chunks('metrics','24 hours')" } else { "fallback: DELETE WHERE ts<cutoff" } },
-            { "label": "TS7: chunks-view query overhead", "basin_supported": ts7_supported,
-              "basin_p50_ms": opt_ms(ts7_b), "pg_p50_ms": opt_ms(pg_ts7) },
-        ],
-        "note": "TS4 probes native first(v,ts)/last(v,ts) aggregates (commit 985d041) first; \
-                 falls back to ARRAY_AGG PG-equivalent if unavailable — basin_native_first_last \
-                 records which path ran. TS5 probes native drop_chunks first; falls back to \
-                 DELETE WHERE ts<cutoff — basin_native_drop_chunks records which path ran. \
-                 PG side is unchanged: PG has no Timescale so TS4 uses ARRAY_AGG and TS5 uses \
-                 DELETE on the PG side regardless. When TimescaleDB is installed PG uses \
-                 time_bucket and the chunks view; otherwise PG falls back to date_trunc. \
-                 Hypertable ingest is compared on both engines.",
-    }));
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "ext_bench_timescale.json",
+        &json!({
+            "card": "ext_bench_timescale",
+            "family": "timescaledb",
+            "generated_at": format!("@{ts}"),
+            "pg_available": pg_available,
+            "pg_extension_available": pg_timescale_ext,
+            "basin_hypertable_ddl_ok": hyper_create_ok,
+            "config": { "rows": rows, "samples": samples },
+            "ingest": [
+                { "label": "TS6a: plain-table ingest (rows/s)", "basin_rows_per_s": basin_plain_rate, "pg_rows_per_s": pg_plain_rate },
+                { "label": "TS6b: hypertable ingest (rows/s)", "basin_rows_per_s": basin_hyper_rate, "pg_rows_per_s": pg_hyper_rate },
+            ],
+            "shapes": [
+                { "label": "TS1: time_bucket('1 minute') GROUP BY", "basin_p50_ms": opt_ms(ts1_b), "pg_p50_ms": opt_ms(pg_ts1),
+                  "basin_over_pg": ratio(ts1_b, pg_ts1), "pg_bucket": if pg_timescale_ext { "time_bucket" } else { "date_trunc (PG-equivalent)" } },
+                { "label": "TS2: time_bucket('1 hour') GROUP BY", "basin_p50_ms": opt_ms(ts2_b), "pg_p50_ms": opt_ms(pg_ts2),
+                  "basin_over_pg": ratio(ts2_b, pg_ts2) },
+                { "label": "TS3: time_bucket('1 day') GROUP BY", "basin_p50_ms": opt_ms(ts3_b), "pg_p50_ms": opt_ms(pg_ts3),
+                  "basin_over_pg": ratio(ts3_b, pg_ts3) },
+                { "label": "TS4: first/last per device",
+                  "basin_native_first_last": basin_native_first_last,
+                  "basin_supported": ts4_supported, "basin_p50_ms": opt_ms(ts4_b), "pg_p50_ms": opt_ms(pg_ts4),
+                  "basin_over_pg": ratio(ts4_b, pg_ts4),
+                  "basin_method": if basin_native_first_last { "native first(v,ts)/last(v,ts)" } else { "fallback: ARRAY_AGG PG-equivalent" } },
+                { "label": "TS5: retention",
+                  "basin_native_drop_chunks": basin_native_drop_chunks,
+                  "basin_ms": opt_ms(ts5_b), "pg_ms": opt_ms(pg_ts5), "single_shot": true,
+                  "basin_method": if basin_native_drop_chunks { "native drop_chunks('metrics','24 hours')" } else { "fallback: DELETE WHERE ts<cutoff" } },
+                { "label": "TS7: chunks-view query overhead", "basin_supported": ts7_supported,
+                  "basin_p50_ms": opt_ms(ts7_b), "pg_p50_ms": opt_ms(pg_ts7) },
+            ],
+            "note": "TS4 probes native first(v,ts)/last(v,ts) aggregates (commit 985d041) first; \
+                     falls back to ARRAY_AGG PG-equivalent if unavailable — basin_native_first_last \
+                     records which path ran. TS5 probes native drop_chunks first; falls back to \
+                     DELETE WHERE ts<cutoff — basin_native_drop_chunks records which path ran. \
+                     PG side is unchanged: PG has no Timescale so TS4 uses ARRAY_AGG and TS5 uses \
+                     DELETE on the PG side regardless. When TimescaleDB is installed PG uses \
+                     time_bucket and the chunks view; otherwise PG falls back to date_trunc. \
+                     Hypertable ingest is compared on both engines.",
+        }),
+    );
 }

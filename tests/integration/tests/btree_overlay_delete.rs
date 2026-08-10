@@ -219,7 +219,11 @@ async fn btree_point_delete_routes_tombstone_and_serves_allowlist_reads() {
         vec![1, 2, 3, 4, 5]
     );
     let files_before = live_paths(&eng, &project, &table).await;
-    assert_eq!(files_before.len(), 2, "two cold files expected from two INSERTs");
+    assert_eq!(
+        files_before.len(),
+        2,
+        "two cold files expected from two INSERTs"
+    );
 
     // DELETE id=1 (file 1, grp=100) on the fast path → tombstone overlay.
     with_delete_fastpath_on(async {
@@ -272,7 +276,9 @@ async fn btree_point_delete_routes_tombstone_and_serves_allowlist_reads() {
         "untouched-file rows must be unaffected"
     );
     assert!(
-        ids_for(&sess, "SELECT id FROM docs WHERE id = 1").await.is_empty(),
+        ids_for(&sess, "SELECT id FROM docs WHERE id = 1")
+            .await
+            .is_empty(),
         "the deleted row must stay gone after the drain"
     );
     assert_eq!(

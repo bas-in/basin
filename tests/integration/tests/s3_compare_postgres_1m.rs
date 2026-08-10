@@ -108,7 +108,8 @@ fn which_wins(basin: f64, postgres: f64) -> WhichWins {
 }
 
 const CARD_NAME: &str = "Basin (real S3) vs Postgres 18 (no index, 1M rows)";
-const CARD_CLAIM: &str = "On audit-log data at 1M rows, Basin uses much less disk than Postgres heap \
+const CARD_CLAIM: &str =
+    "On audit-log data at 1M rows, Basin uses much less disk than Postgres heap \
      and matches or beats unindexed point queries — even paying the S3 round-trip. \
      The `sync_insert` metric is the durable-write cost with the WAL flushed to S3 \
      before ack (the default insert metric runs the WAL in RAM).";
@@ -295,8 +296,7 @@ async fn s3_compare_postgres_1m() {
     // WAL stays in RAM — same rationale as s3_shard_insert_path; the durable
     // cost is captured separately by the `sync_insert` variant below.
     let wal_ram: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let (engine, storage, wal, bg) =
-        build_engine(object_store.clone(), &run_prefix, wal_ram).await;
+    let (engine, storage, wal, bg) = build_engine(object_store.clone(), &run_prefix, wal_ram).await;
     let project = ProjectId::new();
     let sess = engine.open_session(project).await.unwrap();
     sess.execute(
@@ -362,10 +362,11 @@ async fn s3_compare_postgres_1m() {
         let mut total = 0u64;
         while let Some(meta) = stream.next().await {
             match meta {
-                Ok(m) if {
-                    let loc = m.location.as_ref();
-                    loc.ends_with(".vortex") || loc.ends_with(".parquet")
-                } =>
+                Ok(m)
+                    if {
+                        let loc = m.location.as_ref();
+                        loc.ends_with(".vortex") || loc.ends_with(".parquet")
+                    } =>
                 {
                     total += m.size as u64;
                 }

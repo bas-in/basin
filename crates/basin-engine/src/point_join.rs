@@ -210,14 +210,16 @@ pub(crate) fn match_point_join(stmt: &Statement) -> Option<PointJoinPlan> {
     // probe/lookup roles are assigned later from the WHERE side. We normalise
     // the ON columns so `left_join_col` is the column on the LEFT FROM table
     // and `right_join_col` is the column on the RIGHT FROM table.
-    let (left_join_col, right_join_col) =
-        match (resolve_side(&lq, &left, &right), resolve_side(&rq, &left, &right)) {
-            // First operand → left table, second → right table.
-            (Some(Side::Probe), Some(Side::Lookup)) => (lc, rc),
-            // First operand → right table, second → left table.
-            (Some(Side::Lookup), Some(Side::Probe)) => (rc, lc),
-            _ => return None,
-        };
+    let (left_join_col, right_join_col) = match (
+        resolve_side(&lq, &left, &right),
+        resolve_side(&rq, &left, &right),
+    ) {
+        // First operand → left table, second → right table.
+        (Some(Side::Probe), Some(Side::Lookup)) => (lc, rc),
+        // First operand → right table, second → left table.
+        (Some(Side::Lookup), Some(Side::Probe)) => (rc, lc),
+        _ => return None,
+    };
 
     // WHERE clause: single `qualifier.col = literal` (or unqualified col that
     // resolves to exactly one side). The side it lands on is the PROBE side.
@@ -235,21 +237,11 @@ pub(crate) fn match_point_join(stmt: &Statement) -> Option<PointJoinPlan> {
 
     // Assemble probe / lookup roles from `where_side`.
     let (probe_tref, lookup_tref, probe_join_col, lookup_key_col) = match where_side {
-        Side::Probe => (
-            &left,
-            &right,
-            left_join_col.clone(),
-            right_join_col.clone(),
-        ),
+        Side::Probe => (&left, &right, left_join_col.clone(), right_join_col.clone()),
         Side::Lookup => {
             // WHERE landed on the right table — that table is the probe. Swap
             // roles: the right side becomes probe, left becomes lookup.
-            (
-                &right,
-                &left,
-                right_join_col.clone(),
-                left_join_col.clone(),
-            )
+            (&right, &left, right_join_col.clone(), left_join_col.clone())
         }
     };
 
@@ -333,10 +325,9 @@ fn equi_pair(expr: &Expr) -> Option<(String, String, String, String)> {
 /// is folded to match the FROM-clause qualifier comparison.
 fn compound_col(expr: &Expr) -> Option<(String, String)> {
     match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some((
-            parts[0].value.to_ascii_lowercase(),
-            parts[1].value.clone(),
-        )),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            Some((parts[0].value.to_ascii_lowercase(), parts[1].value.clone()))
+        }
         _ => None,
     }
 }
@@ -426,8 +417,7 @@ fn parse_join_projection(
                     return None;
                 }
                 // `qualifier.*` — single-part object name.
-                let sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(obj) = name
-                else {
+                let sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(obj) = name else {
                     return None;
                 };
                 if obj.0.len() != 1 {
@@ -598,7 +588,12 @@ pub(crate) async fn execute_point_join(
 
     // Extract the join key value from the probe row. A NULL join key matches no
     // row under INNER-JOIN semantics → empty result.
-    let join_key = match extract_scalar(&probe_batch, &plan.probe_join_col, &lookup_meta, &plan.lookup_key_col) {
+    let join_key = match extract_scalar(
+        &probe_batch,
+        &plan.probe_join_col,
+        &lookup_meta,
+        &plan.lookup_key_col,
+    ) {
         ExtractedKey::Value(v) => v,
         ExtractedKey::Null => {
             return Ok(Some(empty_result(&plan, &probe_meta, &lookup_meta)?));
@@ -662,7 +657,14 @@ pub(crate) async fn execute_point_join(
     };
 
     // ── Stitch one output row ─────────────────────────────────────────────────
-    stitch(&plan, &probe_meta, &lookup_meta, &probe_batch, &lookup_batch).map(Some)
+    stitch(
+        &plan,
+        &probe_meta,
+        &lookup_meta,
+        &probe_batch,
+        &lookup_batch,
+    )
+    .map(Some)
 }
 
 /// Returns the list of THIS-side output columns (in projection order, wildcards
@@ -822,7 +824,11 @@ fn output_schema(
     for item in &plan.projection {
         match item {
             JoinProjItem::Wildcard(side) => {
-                let meta = if *side == Side::Probe { probe_meta } else { lookup_meta };
+                let meta = if *side == Side::Probe {
+                    probe_meta
+                } else {
+                    lookup_meta
+                };
                 for f in meta.schema.fields() {
                     fields.push(f.clone());
                 }
@@ -832,13 +838,16 @@ fn output_schema(
                 col,
                 out_name,
             } => {
-                let meta = if *side == Side::Probe { probe_meta } else { lookup_meta };
-                let src = meta
-                    .schema
-                    .field_with_name(col)
-                    .map_err(|_| basin_common::BasinError::InvalidSchema(format!(
+                let meta = if *side == Side::Probe {
+                    probe_meta
+                } else {
+                    lookup_meta
+                };
+                let src = meta.schema.field_with_name(col).map_err(|_| {
+                    basin_common::BasinError::InvalidSchema(format!(
                         "point-join: unknown column {col}"
-                    )))?;
+                    ))
+                })?;
                 // Preserve the source field's type/nullability, rename to out_name.
                 fields.push(Arc::new(
                     Field::new(out_name, src.data_type().clone(), src.is_nullable())
@@ -935,8 +944,9 @@ mod tests {
 
     #[test]
     fn matches_canonical_orm_hydrate() {
-        let stmt =
-            parse("SELECT e.*, u.email FROM events e JOIN users u ON e.user_id = u.id WHERE e.id = 1");
+        let stmt = parse(
+            "SELECT e.*, u.email FROM events e JOIN users u ON e.user_id = u.id WHERE e.id = 1",
+        );
         let plan = match_point_join(&stmt).expect("canonical hydrate must match");
         assert_eq!(plan.probe_table.as_str(), "events");
         assert_eq!(plan.probe_pk_col, "id");
@@ -944,7 +954,10 @@ mod tests {
         assert_eq!(plan.lookup_table.as_str(), "users");
         assert_eq!(plan.lookup_key_col, "id");
         assert_eq!(plan.projection.len(), 2);
-        assert!(matches!(plan.projection[0], JoinProjItem::Wildcard(Side::Probe)));
+        assert!(matches!(
+            plan.projection[0],
+            JoinProjItem::Wildcard(Side::Probe)
+        ));
     }
 
     #[test]
@@ -968,7 +981,11 @@ mod tests {
         );
         let plan = match_point_join(&stmt).expect("aliased projection must match");
         match &plan.projection[0] {
-            JoinProjItem::Column { out_name, col, side } => {
+            JoinProjItem::Column {
+                out_name,
+                col,
+                side,
+            } => {
                 assert_eq!(out_name, "eid");
                 assert_eq!(col, "id");
                 assert_eq!(*side, Side::Probe);
@@ -1007,8 +1024,7 @@ mod tests {
 
     #[test]
     fn rejects_unqualified_where() {
-        let stmt =
-            parse("SELECT e.* FROM events e JOIN users u ON e.user_id = u.id WHERE id = 1");
+        let stmt = parse("SELECT e.* FROM events e JOIN users u ON e.user_id = u.id WHERE id = 1");
         assert!(match_point_join(&stmt).is_none());
     }
 

@@ -422,7 +422,9 @@ async fn provider_cache_second_query_smoke_timing() {
     let r2 = scalar_i64(&sess, &sum_sql("t")).await;
     let ms2 = t2.elapsed().as_secs_f64() * 1000.0;
 
-    println!("provider_cache smoke: query1={ms1:.3}ms query2={ms2:.3}ms (cache HIT expected on both)");
+    println!(
+        "provider_cache smoke: query1={ms1:.3}ms query2={ms2:.3}ms (cache HIT expected on both)"
+    );
 
     assert_eq!(r1, expected, "first query result wrong");
     assert_eq!(r2, expected, "second query result wrong");

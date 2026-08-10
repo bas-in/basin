@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use basin_common::{ChangeEvent, ChangeEventSink, ChangeOp, ProjectId, TableName};
-use basin_realtime::{BudgetTracker, ChannelKey, RealtimeSink, estimate_event_size};
+use basin_realtime::{estimate_event_size, BudgetTracker, ChannelKey, RealtimeSink};
 use chrono::Utc;
 
 // ---------------------------------------------------------------------------
@@ -264,9 +264,7 @@ impl SoakResult {
         assert_eq!(
             self.non_noisy_delivered, expected_delivered,
             "non-noisy projects: delivered({}) must equal published({}) × conns({})",
-            self.non_noisy_delivered,
-            self.non_noisy_published,
-            self.conns_per_project,
+            self.non_noisy_delivered, self.non_noisy_published, self.conns_per_project,
         );
 
         println!(
@@ -307,7 +305,13 @@ async fn soak_short_10_projects_5_conns() {
         "soak_short: starting — {n_projects} projects × {conns_per_project} conns × {events_per_project} events"
     );
 
-    let result = run_soak(n_projects, conns_per_project, events_per_project, budget_bytes).await;
+    let result = run_soak(
+        n_projects,
+        conns_per_project,
+        events_per_project,
+        budget_bytes,
+    )
+    .await;
     result.assert_invariants();
 
     let elapsed = start.elapsed();
@@ -361,7 +365,13 @@ async fn soak_long_100_projects_10_conns() {
         "soak_long: starting — {n_projects} projects × {conns_per_project} conns × {events_per_project} events"
     );
 
-    let result = run_soak(n_projects, conns_per_project, events_per_project, budget_bytes).await;
+    let result = run_soak(
+        n_projects,
+        conns_per_project,
+        events_per_project,
+        budget_bytes,
+    )
+    .await;
     result.assert_invariants();
 
     let elapsed = start.elapsed();
@@ -428,7 +438,10 @@ async fn soak_budget_isolation_noisy_does_not_starve_others() {
     let noisy_handle = tokio::spawn(async move {
         for seq in 1..=n_events * 10 {
             let ev = make_event(noisy, table, seq, ChangeOp::Insert);
-            noisy_sink2.publish(&ev).await.expect("noisy publish must not error");
+            noisy_sink2
+                .publish(&ev)
+                .await
+                .expect("noisy publish must not error");
             if seq % 20 == 0 {
                 tokio::task::yield_now().await;
             }
@@ -438,7 +451,10 @@ async fn soak_budget_isolation_noisy_does_not_starve_others() {
     let sink2 = Arc::clone(&sink);
     for seq in 1..=n_events {
         let ev = make_event(normal, table, seq, ChangeOp::Insert);
-        sink2.publish(&ev).await.expect("normal publish must not error");
+        sink2
+            .publish(&ev)
+            .await
+            .expect("normal publish must not error");
         if seq % 10 == 0 {
             tokio::task::yield_now().await;
         }

@@ -24,9 +24,7 @@
 //! - Per-customer salting (cross-project aggregates require a shared key space)
 
 use datafusion::common::Column;
-use datafusion::logical_expr::{
-    expr::AggregateFunction, BinaryExpr, Expr, LogicalPlan, Operator,
-};
+use datafusion::logical_expr::{expr::AggregateFunction, BinaryExpr, Expr, LogicalPlan, Operator};
 use datafusion::logical_expr::{JoinType, SortExpr};
 use xxhash_rust::xxh3::Xxh3;
 
@@ -115,7 +113,11 @@ fn hash_plan(h: &mut Xxh3, plan: &LogicalPlan) {
         LogicalPlan::Limit(lim) => {
             // Hash presence of skip/fetch, not the literal values.
             h.update(if lim.skip.is_some() { b"\x01" } else { b"\x00" });
-            h.update(if lim.fetch.is_some() { b"\x01" } else { b"\x00" });
+            h.update(if lim.fetch.is_some() {
+                b"\x01"
+            } else {
+                b"\x00"
+            });
         }
         // For all other plan types (Window, Union, Subquery, SubqueryAlias,
         // EmptyRelation, etc.) the discriminant hash is sufficient to
@@ -230,7 +232,11 @@ fn hash_expr(h: &mut Xxh3, expr: &Expr) {
         Expr::Like(like) | Expr::SimilarTo(like) => {
             hash_expr(h, &like.expr);
             h.update(if like.negated { b"\x01" } else { b"\x00" });
-            h.update(if like.case_insensitive { b"\x01" } else { b"\x00" });
+            h.update(if like.case_insensitive {
+                b"\x01"
+            } else {
+                b"\x00"
+            });
             // The pattern is usually a literal and will be erased.
             hash_expr(h, &like.pattern);
         }
@@ -493,7 +499,10 @@ mod tests {
         let ctx = ctx_with_t().await;
         let h1 = QueryShapeHash::of(&plan_for(&ctx, "SELECT a, b FROM t WHERE c = 5").await);
         let h2 = QueryShapeHash::of(&plan_for(&ctx, "SELECT a, b FROM t WHERE c = 99").await);
-        assert_eq!(h1, h2, "different literals must produce the same shape hash");
+        assert_eq!(
+            h1, h2,
+            "different literals must produce the same shape hash"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -523,8 +532,7 @@ mod tests {
     async fn different_predicates_different_hash() {
         let ctx = ctx_with_t().await;
         let h1 = QueryShapeHash::of(&plan_for(&ctx, "SELECT a FROM t WHERE c = 5").await);
-        let h2 =
-            QueryShapeHash::of(&plan_for(&ctx, "SELECT a FROM t WHERE c = 5 AND b = 3").await);
+        let h2 = QueryShapeHash::of(&plan_for(&ctx, "SELECT a FROM t WHERE c = 5 AND b = 3").await);
         assert_ne!(
             h1, h2,
             "different predicate structure must produce different hash"
@@ -537,10 +545,8 @@ mod tests {
     #[tokio::test]
     async fn commutative_and_or() {
         let ctx = ctx_with_t().await;
-        let h1 =
-            QueryShapeHash::of(&plan_for(&ctx, "SELECT a FROM t WHERE a = 1 AND b = 2").await);
-        let h2 =
-            QueryShapeHash::of(&plan_for(&ctx, "SELECT a FROM t WHERE b = 2 AND a = 1").await);
+        let h1 = QueryShapeHash::of(&plan_for(&ctx, "SELECT a FROM t WHERE a = 1 AND b = 2").await);
+        let h2 = QueryShapeHash::of(&plan_for(&ctx, "SELECT a FROM t WHERE b = 2 AND a = 1").await);
         assert_eq!(
             h1, h2,
             "AND conjuncts in different order must produce the same hash"
@@ -563,8 +569,7 @@ mod tests {
     #[tokio::test]
     async fn cross_process_stability() {
         let ctx = ctx_with_t().await;
-        let plan =
-            plan_for(&ctx, "SELECT a, b FROM t WHERE c = 42 ORDER BY e LIMIT 10").await;
+        let plan = plan_for(&ctx, "SELECT a, b FROM t WHERE c = 42 ORDER BY e LIMIT 10").await;
         let hash = QueryShapeHash::of(&plan);
 
         // Pinned on first run; any change to hashing logic will break this test.

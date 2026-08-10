@@ -66,9 +66,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 // Use DataFusion's bundled Arrow (v53) throughout this file so RecordBatch
 // and arrays feed directly into MemorySourceConfig without a ws→df conversion.
-use datafusion::arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, StringArray, UInt64Array,
-};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
@@ -272,13 +270,19 @@ impl TableProvider for BasinStatStatementsProvider {
         // Build one DataFusion-Arrow array per column.
         // StringArray::from accepts Vec<Option<&str>>.
         let shape_hashes: ArrayRef = Arc::new(StringArray::from(
-            rows.iter().map(|r| Some(r.shape_hash.as_str())).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| Some(r.shape_hash.as_str()))
+                .collect::<Vec<_>>(),
         ));
         let projects: ArrayRef = Arc::new(StringArray::from(
-            rows.iter().map(|r| Some(r.project_id.as_str())).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| Some(r.project_id.as_str()))
+                .collect::<Vec<_>>(),
         ));
         let table_names: ArrayRef = Arc::new(StringArray::from(
-            rows.iter().map(|r| Some(r.table_name.as_str())).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| Some(r.table_name.as_str()))
+                .collect::<Vec<_>>(),
         ));
         let observe_counts: ArrayRef = Arc::new(UInt64Array::from(
             rows.iter().map(|r| r.observe_count).collect::<Vec<_>>(),
@@ -346,9 +350,7 @@ pub(crate) fn register_basin_stat_statements(
     // This matches how user tables are exposed: `SELECT * FROM basin_stat_statements`
     // without a schema qualifier works out of the box.
     ctx.register_table("basin_stat_statements", provider)
-        .map_err(|e| {
-            DataFusionError::Internal(format!("register basin_stat_statements: {e}"))
-        })?;
+        .map_err(|e| DataFusionError::Internal(format!("register basin_stat_statements: {e}")))?;
     Ok(())
 }
 
@@ -410,8 +412,16 @@ pub(crate) mod tests {
         assert_eq!(row.shape_hash, format!("{:016x}", 1u64));
         assert_eq!(row.observe_count, 11);
         assert_eq!(row.fast_path_hits, 1);
-        assert!(row.p50_ms >= 0.0 && row.p50_ms < 10.0, "p50_ms={}", row.p50_ms);
-        assert!(row.p99_ms >= 0.0 && row.p99_ms < 10.0, "p99_ms={}", row.p99_ms);
+        assert!(
+            row.p50_ms >= 0.0 && row.p50_ms < 10.0,
+            "p50_ms={}",
+            row.p50_ms
+        );
+        assert!(
+            row.p99_ms >= 0.0 && row.p99_ms < 10.0,
+            "p99_ms={}",
+            row.p99_ms
+        );
         assert!(!row.regression_alert, "no regression expected");
     }
 
@@ -452,7 +462,9 @@ pub(crate) mod tests {
 
         let reg = Arc::new(reg);
         let rows = reg.snapshot_all();
-        let row = rows.iter().find(|r| r.shape_hash == format!("{:016x}", 77u64))
+        let row = rows
+            .iter()
+            .find(|r| r.shape_hash == format!("{:016x}", 77u64))
             .expect("shape row not found");
         assert!(row.regression_alert, "regression_alert should be true");
     }
@@ -485,7 +497,8 @@ pub(crate) mod tests {
 
         // Execute a scan via a DataFusion session context (simplest integration).
         let ctx = datafusion::prelude::SessionContext::new();
-        ctx.register_table("basin_stat_statements", Arc::new(provider)).unwrap();
+        ctx.register_table("basin_stat_statements", Arc::new(provider))
+            .unwrap();
         let df = ctx
             .sql("SELECT shape_hash, observe_count FROM basin_stat_statements ORDER BY shape_hash")
             .await

@@ -68,14 +68,28 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage: storage.clone(),
         catalog: catalog.clone(),
         shard: Some(shard.clone()),
     });
-    (sd, wd, engine, shard, bg, wal, catalog, storage, object_store)
+    (
+        sd,
+        wd,
+        engine,
+        shard,
+        bg,
+        wal,
+        catalog,
+        storage,
+        object_store,
+    )
 }
 
 fn row_count(res: ExecResult) -> usize {
@@ -204,9 +218,7 @@ async fn delete_project_removes_physical_files() {
     while let Some(_obj) = s.next().await {
         before_count += 1;
     }
-    println!(
-        "[sec_catalog_leakage] objects before delete: {before_count} under {prefix_str}"
-    );
+    println!("[sec_catalog_leakage] objects before delete: {before_count} under {prefix_str}");
     // The exact count varies with the storage layout; just demand >0.
     assert!(
         before_count > 0,

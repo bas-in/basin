@@ -133,11 +133,14 @@ fn decode_snapshot_id(s: &str) -> Result<BTreeMap<TableName, SnapshotId>, ApiErr
         .map_err(|_| ApiError::invalid("engine_snapshot_id: invalid JSON payload"))?;
     let mut map = BTreeMap::new();
     for (k, v) in obj {
-        let table = TableName::new(&k)
-            .map_err(|e| ApiError::invalid(format!("engine_snapshot_id: bad table name {k:?}: {e}")))?;
-        let id_u64 = v
-            .as_u64()
-            .ok_or_else(|| ApiError::invalid(format!("engine_snapshot_id: snapshot id for {k} must be a u64")))?;
+        let table = TableName::new(&k).map_err(|e| {
+            ApiError::invalid(format!("engine_snapshot_id: bad table name {k:?}: {e}"))
+        })?;
+        let id_u64 = v.as_u64().ok_or_else(|| {
+            ApiError::invalid(format!(
+                "engine_snapshot_id: snapshot id for {k} must be a u64"
+            ))
+        })?;
         map.insert(table, SnapshotId(id_u64));
     }
     Ok(map)
@@ -334,9 +337,7 @@ pub(crate) async fn restore_project(
         }
         let as_of = chrono::DateTime::parse_from_rfc3339(as_of_str)
             .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|e| {
-                ApiError::invalid(format!("as_of: invalid RFC-3339 timestamp: {e}"))
-            })?;
+            .map_err(|e| ApiError::invalid(format!("as_of: invalid RFC-3339 timestamp: {e}")))?;
 
         let results = catalog
             .rollback_to_snapshot_project_wide(&project, as_of)
@@ -410,11 +411,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// Helper: create a table, insert one batch (append), return table name.
-    async fn seed_table(
-        cat: &Arc<InMemoryCatalog>,
-        project: &ProjectId,
-        name: &str,
-    ) -> TableName {
+    async fn seed_table(cat: &Arc<InMemoryCatalog>, project: &ProjectId, name: &str) -> TableName {
         use arrow_schema::{DataType, Field, Schema};
         let table = TableName::new(name).unwrap();
         let schema = Schema::new(vec![Field::new("v", DataType::Int64, false)]);
@@ -446,7 +443,12 @@ mod tests {
             tdigest_sketches: Default::default(),
         };
         let meta_orders = cat
-            .append_data_files(&project, &t_orders, SnapshotId::GENESIS, vec![dummy.clone()])
+            .append_data_files(
+                &project,
+                &t_orders,
+                SnapshotId::GENESIS,
+                vec![dummy.clone()],
+            )
             .await
             .expect("append orders");
         let meta_users = cat
@@ -501,7 +503,10 @@ mod tests {
         }
 
         // 5. Confirm orders rolled back to snapshot 1.
-        let after = cat.load_table(&project, &t_orders).await.expect("load after");
+        let after = cat
+            .load_table(&project, &t_orders)
+            .await
+            .expect("load after");
         assert_eq!(
             after.current_snapshot, meta_orders.current_snapshot,
             "orders should be back at the captured head"

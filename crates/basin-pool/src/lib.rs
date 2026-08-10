@@ -260,10 +260,9 @@ impl SessionPool {
                             // at open time; this assertion catches any regression
                             // where open_session returns a session for the wrong
                             // project.
-                            if let Err(e) = tenant_isolation::assert_project_tag(
-                                &session,
-                                key.project,
-                            ) {
+                            if let Err(e) =
+                                tenant_isolation::assert_project_tag(&session, key.project)
+                            {
                                 // Drop the session outside the lock, then release
                                 // the reserved slot so capacity is not leaked.
                                 drop(session);
@@ -769,10 +768,18 @@ mod tests {
         // After releasing both, each project should be able to hit its own
         // cached slot — and the project tag must still match.
         let sa2 = pool.acquire(project_a, None).await.unwrap();
-        assert_eq!(sa2.project(), project_a, "project A cache hit must keep tag");
+        assert_eq!(
+            sa2.project(),
+            project_a,
+            "project A cache hit must keep tag"
+        );
 
         let sb2 = pool.acquire(project_b, None).await.unwrap();
-        assert_eq!(sb2.project(), project_b, "project B cache hit must keep tag");
+        assert_eq!(
+            sb2.project(),
+            project_b,
+            "project B cache hit must keep tag"
+        );
 
         let stats = pool.stats();
         assert_eq!(stats.hits, 2, "both second acquires should be cache hits");
@@ -862,7 +869,12 @@ mod tests {
                 .expect("SELECT from temp table must succeed during same checkout");
             match result {
                 basin_engine::ExecResult::Rows { batches, .. } => {
-                    let total: usize = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>().iter().sum();
+                    let total: usize = batches
+                        .iter()
+                        .map(|b| b.num_rows())
+                        .collect::<Vec<_>>()
+                        .iter()
+                        .sum();
                     assert_eq!(total, 1, "expected 1 row in temp table during checkout");
                 }
                 other => panic!("expected Rows, got {other:?}"),
@@ -884,9 +896,7 @@ mod tests {
             );
 
             // The temp table must no longer exist after the scrub.
-            let result = s2
-                .execute("SELECT id FROM _pool_test_tmp")
-                .await;
+            let result = s2.execute("SELECT id FROM _pool_test_tmp").await;
             assert!(
                 result.is_err(),
                 "temp table must NOT be visible after pool return; \

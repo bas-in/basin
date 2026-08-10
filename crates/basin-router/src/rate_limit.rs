@@ -151,7 +151,10 @@ impl PgRateLimit {
     /// just reads the map.
     pub fn set_project_qps(&self, project: ProjectId, qps: u32) {
         {
-            let map = self.overrides.read().expect("pg rate-limit overrides poisoned");
+            let map = self
+                .overrides
+                .read()
+                .expect("pg rate-limit overrides poisoned");
             if map.get(&project).map(|(q, _)| *q) == Some(qps) {
                 return;
             }
@@ -199,7 +202,10 @@ impl PgRateLimit {
         }
         // Per-project override bucket takes precedence over the global keyed one.
         {
-            let map = self.overrides.read().expect("pg rate-limit overrides poisoned");
+            let map = self
+                .overrides
+                .read()
+                .expect("pg rate-limit overrides poisoned");
             if let Some((_, lim)) = map.get(project) {
                 return lim.check().map(|_| ()).map_err(|_| ());
             }
@@ -239,7 +245,10 @@ impl PgRateLimit {
             }
         }
         {
-            let map = self.overrides.read().expect("pg rate-limit overrides poisoned");
+            let map = self
+                .overrides
+                .read()
+                .expect("pg rate-limit overrides poisoned");
             if let Some((_, lim)) = map.get(project) {
                 return lim.check().map(|_| ()).map_err(|_| ());
             }

@@ -32,9 +32,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use basin_engine::write_forwarder::{
-    ForwardExecResult, ForwardRequest, FORWARD_SECRET_HEADER,
-};
+use basin_engine::write_forwarder::{ForwardExecResult, ForwardRequest, FORWARD_SECRET_HEADER};
 
 use crate::errors::ApiError;
 use crate::server::Inner;

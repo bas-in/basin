@@ -543,11 +543,9 @@ fn render_source(source: &TableFactor) -> Result<String> {
 
 fn assignment_target_col(a: &sqlparser::ast::Assignment) -> Result<String> {
     match &a.target {
-        sqlparser::ast::AssignmentTarget::ColumnName(name) => Ok(name
-            .0
-            .last()
-            .map(|i| i.to_string())
-            .unwrap_or_default()),
+        sqlparser::ast::AssignmentTarget::ColumnName(name) => {
+            Ok(name.0.last().map(|i| i.to_string()).unwrap_or_default())
+        }
         sqlparser::ast::AssignmentTarget::Tuple(_) => Err(BasinError::feature_not_supported(
             "MERGE UPDATE tuple assignment targets are not supported",
         )),
@@ -631,10 +629,14 @@ fn render_scalar(
             let d = epoch + chrono::Duration::days(days as i64);
             Ok(format!("'{}'", d.format("%Y-%m-%d")))
         }
-        DataType::Binary => Ok(format!("'\\x{}'", hex::encode(arr.as_binary::<i32>().value(row)))),
-        DataType::LargeBinary => {
-            Ok(format!("'\\x{}'", hex::encode(arr.as_binary::<i64>().value(row))))
-        }
+        DataType::Binary => Ok(format!(
+            "'\\x{}'",
+            hex::encode(arr.as_binary::<i32>().value(row))
+        )),
+        DataType::LargeBinary => Ok(format!(
+            "'\\x{}'",
+            hex::encode(arr.as_binary::<i64>().value(row))
+        )),
         other => Err(BasinError::feature_not_supported(format!(
             "MERGE: unsupported column type {other:?} in a projected value (v0.1)"
         ))),

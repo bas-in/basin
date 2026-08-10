@@ -146,11 +146,21 @@ fn bearer(headers: &HeaderMap) -> Result<&str, Response> {
         .get(AUTHORIZATION)
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "missing Authorization header"))?
         .to_str()
-        .map_err(|_| err(StatusCode::UNAUTHORIZED, "Authorization header is not ASCII"))?;
+        .map_err(|_| {
+            err(
+                StatusCode::UNAUTHORIZED,
+                "Authorization header is not ASCII",
+            )
+        })?;
     let token = h
         .strip_prefix("Bearer ")
         .or_else(|| h.strip_prefix("bearer "))
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "Authorization must be `Bearer <token>`"))?
+        .ok_or_else(|| {
+            err(
+                StatusCode::UNAUTHORIZED,
+                "Authorization must be `Bearer <token>`",
+            )
+        })?
         .trim();
     if token.is_empty() {
         return Err(err(StatusCode::UNAUTHORIZED, "empty bearer token"));
@@ -300,7 +310,10 @@ pub async fn cdc_stream_handler(
                         return Some((ev, (rx, high, f)));
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(lagged = n, "cdc SSE live tail lagged; client should reconnect with Last-Event-ID");
+                        warn!(
+                            lagged = n,
+                            "cdc SSE live tail lagged; client should reconnect with Last-Event-ID"
+                        );
                         let c = Ok(Event::default().comment(format!("lagged:{n}")));
                         return Some((c, (rx, high, f)));
                     }

@@ -23,11 +23,11 @@ use crate::cdc_webhooks::{CdcWebhookDef, CdcWebhookRow, CdcWebhookState};
 use crate::domains::{self, DomainDef, DomainError};
 use crate::enums::{self, EnumError, EnumTypeDef};
 use crate::functions::SqlFunctionDef;
+use crate::inbound_webhooks::{self, InboundWebhookDef, InboundWebhookError};
 use crate::metadata::{
     CheckConstraint, CvDef, DataFileRef, ForeignKeyDef, PartitionSpec, Policy, ProjectMetadata,
     PromotedJsonbPath, SecondaryIndex, TableFileFormat, TableMetadata, UniqueConstraint,
 };
-use crate::inbound_webhooks::{self, InboundWebhookDef, InboundWebhookError};
 use crate::procedures::{self, ProcedureError, SqlProcedureDef};
 use crate::project_storage_config::ProjectStorageConfig;
 use crate::reactors::{self, ReactorDef, ReactorError};
@@ -457,11 +457,7 @@ impl InMemoryCatalog {
     ///
     /// This method is SYNCHRONOUS after lock acquisition (no await inside the
     /// critical section) to avoid holding the tables mutex across awaits.
-    async fn resolve_qtable(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-    ) -> QualifiedTableName {
+    async fn resolve_qtable(&self, project: &ProjectId, table: &TableName) -> QualifiedTableName {
         let pub_qtable = QualifiedTableName::in_public(table.clone());
         let tables = self.tables.read().await;
         if tables.contains_key(&(*project, pub_qtable.clone())) {
@@ -1012,13 +1008,14 @@ impl Catalog for InMemoryCatalog {
         self.bump_epoch();
         let qtable = self.resolve_qtable(project, table).await;
         let tables = self.tables.read().await;
-        let entry = tables.get(&(*project, qtable)).ok_or_else(|| {
-            BasinError::not_found(format!("{project}: table {table}"))
-        })?;
+        let entry = tables
+            .get(&(*project, qtable))
+            .ok_or_else(|| BasinError::not_found(format!("{project}: table {table}")))?;
         let mut state = entry.lock().await;
-        let already = state.promoted_jsonb_paths.iter().any(|p| {
-            p.source_col == source_col && p.json_key == json_key
-        });
+        let already = state
+            .promoted_jsonb_paths
+            .iter()
+            .any(|p| p.source_col == source_col && p.json_key == json_key);
         if !already {
             state.promoted_jsonb_paths.push(PromotedJsonbPath {
                 source_col: source_col.to_string(),
@@ -1605,18 +1602,18 @@ impl Catalog for InMemoryCatalog {
         Ok(())
     }
 
-    async fn list_migration_intents(
-        &self,
-    ) -> Result<Vec<crate::bucket_pool::MigrationIntent>> {
-        Ok(self.bucket_migrations.lock().await.values().cloned().collect())
+    async fn list_migration_intents(&self) -> Result<Vec<crate::bucket_pool::MigrationIntent>> {
+        Ok(self
+            .bucket_migrations
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect())
     }
 
     #[instrument(skip(self, meta), fields(project = %project))]
-    async fn set_project_metadata(
-        &self,
-        project: &ProjectId,
-        meta: ProjectMetadata,
-    ) -> Result<()> {
+    async fn set_project_metadata(&self, project: &ProjectId, meta: ProjectMetadata) -> Result<()> {
         self.bump_epoch();
         let mut map = self.project_metadata.lock().await;
         map.insert(*project, meta);
@@ -2049,7 +2046,10 @@ impl Catalog for InMemoryCatalog {
         use std::collections::HashSet;
 
         // Snapshot all per-table Arc handles for this project in one pass.
-        let handles: Vec<(QualifiedTableName, std::sync::Arc<tokio::sync::Mutex<TableState>>)> = {
+        let handles: Vec<(
+            QualifiedTableName,
+            std::sync::Arc<tokio::sync::Mutex<TableState>>,
+        )> = {
             let tables = self.tables.read().await;
             tables
                 .iter()
@@ -2101,7 +2101,8 @@ impl Catalog for InMemoryCatalog {
             // Compute live_data_files inline: replay snapshots in id order.
             let mut ordered: Vec<&crate::snapshot::Snapshot> = guard.snapshots.iter().collect();
             ordered.sort_by_key(|s| s.id);
-            let mut live_map: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
+            let mut live_map: std::collections::HashMap<String, ()> =
+                std::collections::HashMap::new();
             for snap in ordered {
                 if snap.id > guard.current {
                     break;
@@ -2632,7 +2633,13 @@ impl Catalog for InMemoryCatalog {
         if_not_exists: bool,
     ) -> Result<()> {
         self.create_index_qualified_with_method(
-            project, qtable, name, columns, if_not_exists, "btree", None,
+            project,
+            qtable,
+            name,
+            columns,
+            if_not_exists,
+            "btree",
+            None,
         )
         .await
     }
@@ -2853,9 +2860,9 @@ fn inbound_webhook_err_to_basin(e: InboundWebhookError) -> BasinError {
         InboundWebhookError::InvalidBody(msg) => {
             BasinError::InvalidSchema(format!("inbound webhook body: {msg}"))
         }
-        InboundWebhookError::MultiStatementBody => BasinError::InvalidSchema(
-            "inbound webhook body must be a single SQL statement".into(),
-        ),
+        InboundWebhookError::MultiStatementBody => {
+            BasinError::InvalidSchema("inbound webhook body must be a single SQL statement".into())
+        }
         InboundWebhookError::NotFound => BasinError::NotFound("inbound webhook not found".into()),
     }
 }
@@ -2895,9 +2902,7 @@ impl crate::leases::LeaseRegistry for InMemoryCatalog {
             // First grant: no row yet. Epoch starts at 1.
             None => (true, 1),
             // We already hold it (or it's expired): (re)grant + bump epoch.
-            Some(row) if row.holder == holder || row.expires_at <= now => {
-                (true, row.epoch + 1)
-            }
+            Some(row) if row.holder == holder || row.expires_at <= now => (true, row.epoch + 1),
             // A different, non-expired holder owns it: lose the race.
             Some(_) => (false, 0),
         };
@@ -2949,12 +2954,7 @@ impl crate::leases::LeaseRegistry for InMemoryCatalog {
     }
 
     #[instrument(skip(self), fields(project = %project, partition = %partition_id, holder = %holder))]
-    async fn release(
-        &self,
-        project: &ProjectId,
-        partition_id: &str,
-        holder: &str,
-    ) -> Result<bool> {
+    async fn release(&self, project: &ProjectId, partition_id: &str, holder: &str) -> Result<bool> {
         let key = (*project, partition_id.to_string());
         let mut map = self.leases.lock().await;
         match map.get(&key) {
@@ -3132,9 +3132,14 @@ mod tests {
         cat.create_table(&t, &tbl, &schema()).await.unwrap();
 
         // Snapshot 1: one file (10 rows).
-        cat.append_data_files(&t, &tbl, SnapshotId::GENESIS, vec![file("p/1.parquet", 10, 100)])
-            .await
-            .unwrap();
+        cat.append_data_files(
+            &t,
+            &tbl,
+            SnapshotId::GENESIS,
+            vec![file("p/1.parquet", 10, 100)],
+        )
+        .await
+        .unwrap();
         // Snapshot 2: a second file (5 rows).
         cat.append_data_files(&t, &tbl, SnapshotId(1), vec![file("p/2.parquet", 5, 50)])
             .await
@@ -3153,14 +3158,20 @@ mod tests {
             .unwrap();
         assert_eq!(at1.current_snapshot, SnapshotId(1));
         let at1_rows: u64 = at1.live_data_files().iter().map(|f| f.row_count).sum();
-        assert_eq!(at1_rows, 10, "snapshot-1 view must not see the file added at snapshot 2");
+        assert_eq!(
+            at1_rows, 10,
+            "snapshot-1 view must not see the file added at snapshot 2"
+        );
 
         // Pinned at genesis: no files.
         let at0 = cat
             .load_table_at_snapshot(&t, &tbl, SnapshotId::GENESIS)
             .await
             .unwrap();
-        assert!(at0.live_data_files().is_empty(), "genesis view has no files");
+        assert!(
+            at0.live_data_files().is_empty(),
+            "genesis view has no files"
+        );
 
         // Asking for current head is identity.
         let at_head = cat
@@ -3172,9 +3183,7 @@ mod tests {
         // A snapshot id that was never minted → FeatureNotSupported (caller
         // degrades to a read-committed current read rather than serving wrong
         // point-in-time).
-        let missing = cat
-            .load_table_at_snapshot(&t, &tbl, SnapshotId(99))
-            .await;
+        let missing = cat.load_table_at_snapshot(&t, &tbl, SnapshotId(99)).await;
         assert!(
             matches!(missing, Err(BasinError::FeatureNotSupported(_))),
             "unminted snapshot must return FeatureNotSupported, got {missing:?}"
@@ -3764,7 +3773,11 @@ mod tests {
         .await
         .unwrap(); // must not error
         let after3 = cat.load_table(&t, &tbl).await.unwrap();
-        assert_eq!(after3.indexes.len(), 2, "IF NOT EXISTS must not add a duplicate");
+        assert_eq!(
+            after3.indexes.len(),
+            2,
+            "IF NOT EXISTS must not add a duplicate"
+        );
     }
 
     /// Migration Manager v0.2: project-wide list returns every table's
@@ -4649,12 +4662,16 @@ mod tests {
         // the fork (dst) still references them in its live set.
         let report = cat.gc_orphaned_files(&p, &src).await.unwrap();
         assert!(
-            !report.orphaned_paths.contains(&"shared_a.parquet".to_string()),
+            !report
+                .orphaned_paths
+                .contains(&"shared_a.parquet".to_string()),
             "shared_a.parquet must not be orphaned while fork exists: {:?}",
             report.orphaned_paths
         );
         assert!(
-            !report.orphaned_paths.contains(&"shared_b.parquet".to_string()),
+            !report
+                .orphaned_paths
+                .contains(&"shared_b.parquet".to_string()),
             "shared_b.parquet must not be orphaned while fork exists: {:?}",
             report.orphaned_paths
         );
@@ -4756,10 +4773,7 @@ mod tests {
         assert_eq!(rc, 2, "shared file should have refcount 2 (src + dst)");
 
         // rc_only_src is also in both live sets → 2.
-        let rc2 = cat
-            .file_refcount(&p, "rc_only_src.parquet")
-            .await
-            .unwrap();
+        let rc2 = cat.file_refcount(&p, "rc_only_src.parquet").await.unwrap();
         assert_eq!(rc2, 2, "src-only file shared via fork → refcount 2");
 
         // Rollback source to GENESIS — rc_only_src drops from src's live set
@@ -4769,10 +4783,7 @@ mod tests {
             .unwrap();
 
         // rc_only_src now only in dst → refcount 1.
-        let rc3 = cat
-            .file_refcount(&p, "rc_only_src.parquet")
-            .await
-            .unwrap();
+        let rc3 = cat.file_refcount(&p, "rc_only_src.parquet").await.unwrap();
         assert_eq!(
             rc3, 1,
             "after rollback, rc_only_src only in dst → refcount 1"
@@ -4780,10 +4791,7 @@ mod tests {
 
         // Drop the fork table entirely — rc_only_src now has refcount 0.
         cat.drop_table(&p, &dst).await.unwrap();
-        let rc4 = cat
-            .file_refcount(&p, "rc_only_src.parquet")
-            .await
-            .unwrap();
+        let rc4 = cat.file_refcount(&p, "rc_only_src.parquet").await.unwrap();
         assert_eq!(rc4, 0, "after fork drop, rc_only_src has refcount 0");
     }
 

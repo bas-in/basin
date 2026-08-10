@@ -165,8 +165,7 @@ async fn build_ext_engine_local() -> ExtBasinInstance {
 async fn build_ext_engine_s3() -> ExtBasinInstance {
     use crate::test_config::BasinTestConfig;
 
-    let cfg = BasinTestConfig::load()
-        .expect("load .basin-test.toml for BASIN_BENCH_STORE=s3");
+    let cfg = BasinTestConfig::load().expect("load .basin-test.toml for BASIN_BENCH_STORE=s3");
     let object_store = cfg
         .build_object_store("ext_bench_s3")
         .expect("build s3 object store")

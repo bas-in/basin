@@ -49,7 +49,10 @@ mod common;
 use common::{build_basin_engine, median, try_connect, SchemaGuard};
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn write_artifact(file: &str, value: &serde_json::Value) {
@@ -180,14 +183,22 @@ async fn basin_p50(sess: &basin_engine::ProjectSession, sql: &str, n: usize) -> 
 }
 
 async fn pg_count(pg: &tokio_postgres::Client, sql: &str) -> i64 {
-    pg.query_one(sql, &[]).await.map(|r| r.get::<usize, i64>(0)).unwrap_or(-1)
+    pg.query_one(sql, &[])
+        .await
+        .map(|r| r.get::<usize, i64>(0))
+        .unwrap_or(-1)
 }
 
 async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f64> {
-    let _ = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await;
+    let _ = pg
+        .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+        .await;
     let mut s = Vec::with_capacity(n);
     for _ in 0..n {
-        if let Ok(rs) = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await {
+        if let Ok(rs) = pg
+            .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+            .await
+        {
             for m in &rs {
                 if let SimpleQueryMessage::Row(r) = m {
                     if let Some(line) = r.get(0) {
@@ -204,7 +215,11 @@ async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f6
             }
         }
     }
-    if s.is_empty() { None } else { Some(median(&s)) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(median(&s))
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -219,7 +234,11 @@ async fn ext_bench_postgis() {
 
     // ── Basin: G1 ingest ──────────────────────────────────────────────────────
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     sess.execute("CREATE TABLE pts (id BIGINT, geom POINT) WITH (basin.file_format='parquet')")
         .await
         .unwrap();
@@ -242,13 +261,21 @@ async fn ext_bench_postgis() {
         i = end;
     }
     let basin_ingest_s = ingest_start.elapsed().as_secs_f64();
-    let basin_ingest_rate = if basin_ingest_s > 0.0 { rows as f64 / basin_ingest_s } else { 0.0 };
+    let basin_ingest_rate = if basin_ingest_s > 0.0 {
+        rows as f64 / basin_ingest_s
+    } else {
+        0.0
+    };
 
     let gist_ok = sess
         .execute("CREATE INDEX idx_pts_geom ON pts USING gist(geom)")
         .await
         .is_ok();
-    instance.shard.flush_to_parquet().await.expect("flush (builds R-tree sidecar)");
+    instance
+        .shard
+        .flush_to_parquet()
+        .await
+        .expect("flush (builds R-tree sidecar)");
     if let Some(bg) = instance.bg.take() {
         bg.shutdown().await;
     }
@@ -266,25 +293,38 @@ async fn ext_bench_postgis() {
     let g4_sql = format!(
         "SELECT count(*) FROM pts WHERE ST_DWithin(geom, ST_MakePoint({QUERY_X},{QUERY_Y}), {RADIUS_M})"
     );
-    let g5_sql = format!(
-        "SELECT id FROM pts ORDER BY geom <-> ST_MakePoint({QUERY_X},{QUERY_Y}) LIMIT 10"
-    );
-    let g6_sql = format!(
-        "SELECT count(*) FROM pts WHERE ST_Contains(ST_GeomFromText('{poly}'), geom)"
-    );
+    let g5_sql =
+        format!("SELECT id FROM pts ORDER BY geom <-> ST_MakePoint({QUERY_X},{QUERY_Y}) LIMIT 10");
+    let g6_sql =
+        format!("SELECT count(*) FROM pts WHERE ST_Contains(ST_GeomFromText('{poly}'), geom)");
 
     let g2_b = basin_p50(&sess, &g2_sql, samples).await;
-    let g2_count = sess.execute(&g2_sql).await.map(|r| basin_count(&r)).unwrap_or(-1);
+    let g2_count = sess
+        .execute(&g2_sql)
+        .await
+        .map(|r| basin_count(&r))
+        .unwrap_or(-1);
     let g3_b = basin_p50(&sess, &g3_sql, samples).await;
-    let g3_count = sess.execute(&g3_sql).await.map(|r| basin_count(&r)).unwrap_or(-1);
+    let g3_count = sess
+        .execute(&g3_sql)
+        .await
+        .map(|r| basin_count(&r))
+        .unwrap_or(-1);
     let g4_b = basin_p50(&sess, &g4_sql, samples).await;
-    let g4_count = sess.execute(&g4_sql).await.map(|r| basin_count(&r)).unwrap_or(-1);
+    let g4_count = sess
+        .execute(&g4_sql)
+        .await
+        .map(|r| basin_count(&r))
+        .unwrap_or(-1);
     let g5_b = basin_p50(&sess, &g5_sql, samples).await;
     let g5_supported = g5_b.is_some();
     let g6_b = basin_p50(&sess, &g6_sql, samples).await;
     let g6_supported = g6_b.is_some();
     let g6_count = if g6_supported {
-        sess.execute(&g6_sql).await.map(|r| basin_count(&r)).unwrap_or(-1)
+        sess.execute(&g6_sql)
+            .await
+            .map(|r| basin_count(&r))
+            .unwrap_or(-1)
     } else {
         -1
     };
@@ -308,16 +348,29 @@ async fn ext_bench_postgis() {
         pg_available = true;
         let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
         let schema = format!("basin_ext_geo_{suffix}");
-        let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
+        let _guard = SchemaGuard {
+            schema: schema.clone(),
+            conn_str: cs,
+        };
 
-        pg_ext_ok = pg.simple_query("CREATE EXTENSION IF NOT EXISTS postgis").await.is_ok();
-        eprintln!("[ext_bench_postgis] PG postgis: {}", if pg_ext_ok { "ok" } else { "UNAVAILABLE" });
+        pg_ext_ok = pg
+            .simple_query("CREATE EXTENSION IF NOT EXISTS postgis")
+            .await
+            .is_ok();
+        eprintln!(
+            "[ext_bench_postgis] PG postgis: {}",
+            if pg_ext_ok { "ok" } else { "UNAVAILABLE" }
+        );
 
         if pg_ext_ok {
-            pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.ok();
+            pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+                .await
+                .ok();
             pg.simple_query(&format!(
                 "CREATE TABLE {schema}.pts (id BIGINT, geom geometry(Point,4326))"
-            )).await.ok();
+            ))
+            .await
+            .ok();
 
             let pgstart = Instant::now();
             let mut j = 0usize;
@@ -330,34 +383,65 @@ async fn ext_bench_postgis() {
                     }
                     vals.push_str(&format!("({id}, ST_SetSRID(ST_MakePoint({x},{y}),4326))"));
                 }
-                pg.simple_query(&format!("INSERT INTO {schema}.pts (id, geom) VALUES {vals}")).await.ok();
+                pg.simple_query(&format!(
+                    "INSERT INTO {schema}.pts (id, geom) VALUES {vals}"
+                ))
+                .await
+                .ok();
                 j = end;
             }
             let pg_s = pgstart.elapsed().as_secs_f64();
-            pg_ingest_rate = if pg_s > 0.0 { Some(rows as f64 / pg_s) } else { None };
-            pg.simple_query(&format!("CREATE INDEX ON {schema}.pts USING GIST(geom)")).await.ok();
+            pg_ingest_rate = if pg_s > 0.0 {
+                Some(rows as f64 / pg_s)
+            } else {
+                None
+            };
+            pg.simple_query(&format!("CREATE INDEX ON {schema}.pts USING GIST(geom)"))
+                .await
+                .ok();
             pg.simple_query(&format!("ANALYZE {schema}.pts")).await.ok();
 
             // G2 selective bbox
             pg_g2_count = pg_count(&pg, &format!(
                 "SELECT count(*)::bigint FROM {schema}.pts WHERE geom && ST_MakeEnvelope({},{},{},{},4326)",
                 BBOX_SEL.0, BBOX_SEL.1, BBOX_SEL.2, BBOX_SEL.3)).await;
-            pg_g2 = pg_p50(&pg, &format!(
+            pg_g2 = pg_p50(
+                &pg,
+                &format!(
                 "SELECT count(*) FROM {schema}.pts WHERE geom && ST_MakeEnvelope({},{},{},{},4326)",
-                BBOX_SEL.0, BBOX_SEL.1, BBOX_SEL.2, BBOX_SEL.3), samples).await;
+                BBOX_SEL.0, BBOX_SEL.1, BBOX_SEL.2, BBOX_SEL.3),
+                samples,
+            )
+            .await;
             // G3 wide bbox
-            pg_g3 = pg_p50(&pg, &format!(
+            pg_g3 = pg_p50(
+                &pg,
+                &format!(
                 "SELECT count(*) FROM {schema}.pts WHERE geom && ST_MakeEnvelope({},{},{},{},4326)",
-                BBOX_WIDE.0, BBOX_WIDE.1, BBOX_WIDE.2, BBOX_WIDE.3), samples).await;
+                BBOX_WIDE.0, BBOX_WIDE.1, BBOX_WIDE.2, BBOX_WIDE.3),
+                samples,
+            )
+            .await;
             // G4 radius — FAIRNESS: ::geography cast so PG measures metres;
             // use_spheroid=>false forces PostGIS onto the sphere (haversine),
             // matching Basin's ST_DWithin implementation exactly.
-            pg_g4_count = pg_count(&pg, &format!(
-                "SELECT count(*)::bigint FROM {schema}.pts WHERE ST_DWithin(geom::geography, \
-                 ST_SetSRID(ST_MakePoint({QUERY_X},{QUERY_Y}),4326)::geography, {RADIUS_M}, false)")).await;
-            pg_g4 = pg_p50(&pg, &format!(
-                "SELECT count(*) FROM {schema}.pts WHERE ST_DWithin(geom::geography, \
-                 ST_SetSRID(ST_MakePoint({QUERY_X},{QUERY_Y}),4326)::geography, {RADIUS_M}, false)"), samples).await;
+            pg_g4_count = pg_count(
+                &pg,
+                &format!(
+                    "SELECT count(*)::bigint FROM {schema}.pts WHERE ST_DWithin(geom::geography, \
+                 ST_SetSRID(ST_MakePoint({QUERY_X},{QUERY_Y}),4326)::geography, {RADIUS_M}, false)"
+                ),
+            )
+            .await;
+            pg_g4 = pg_p50(
+                &pg,
+                &format!(
+                    "SELECT count(*) FROM {schema}.pts WHERE ST_DWithin(geom::geography, \
+                 ST_SetSRID(ST_MakePoint({QUERY_X},{QUERY_Y}),4326)::geography, {RADIUS_M}, false)"
+                ),
+                samples,
+            )
+            .await;
             // G5 nearest-neighbour
             pg_g5 = pg_p50(&pg, &format!(
                 "SELECT id FROM {schema}.pts ORDER BY geom <-> ST_SetSRID(ST_MakePoint({QUERY_X},{QUERY_Y}),4326) LIMIT 10"),
@@ -369,7 +453,9 @@ async fn ext_bench_postgis() {
                 "SELECT count(*) FROM {schema}.pts WHERE ST_Contains(ST_SetSRID(ST_GeomFromText('{poly}'),4326), geom)"),
                 samples).await;
 
-            let _ = pg.simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+            let _ = pg
+                .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                .await;
         }
         std::mem::forget(_guard);
     } else {
@@ -379,53 +465,68 @@ async fn ext_bench_postgis() {
     // ── Correctness cross-check (counts must match when both ran) ────────────
     if pg_ext_ok {
         if g2_count >= 0 && pg_g2_count >= 0 {
-            assert_eq!(g2_count, pg_g2_count, "G2 bbox count mismatch: basin {g2_count} != pg {pg_g2_count}");
+            assert_eq!(
+                g2_count, pg_g2_count,
+                "G2 bbox count mismatch: basin {g2_count} != pg {pg_g2_count}"
+            );
         }
         if g4_count >= 0 && pg_g4_count >= 0 {
-            assert_eq!(g4_count, pg_g4_count, "G4 radius count mismatch: basin {g4_count} != pg {pg_g4_count}");
+            assert_eq!(
+                g4_count, pg_g4_count,
+                "G4 radius count mismatch: basin {g4_count} != pg {pg_g4_count}"
+            );
         }
         if g6_supported && g6_count >= 0 && pg_g6_count >= 0 {
-            assert_eq!(g6_count, pg_g6_count, "G6 point-in-polygon count mismatch: basin {g6_count} != pg {pg_g6_count}");
+            assert_eq!(
+                g6_count, pg_g6_count,
+                "G6 point-in-polygon count mismatch: basin {g6_count} != pg {pg_g6_count}"
+            );
         }
     }
 
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("ext_bench_postgis.json", &json!({
-        "card": "ext_bench_postgis",
-        "family": "postgis",
-        "generated_at": format!("@{ts}"),
-        "pg_available": pg_available,
-        "pg_extension_available": pg_ext_ok,
-        "basin_gist_ddl_ok": gist_ok,
-        "config": {
-            "rows": rows, "samples": samples, "tiles_per_axis": TILES_PER_AXIS,
-            "radius_m": RADIUS_M, "polygon_vertices": 50,
-        },
-        "ingest": {
-            "label": "G1: point ingest with geo column (rows/s)",
-            "basin_rows_per_s": basin_ingest_rate,
-            "pg_rows_per_s": pg_ingest_rate,
-        },
-        "shapes": [
-            { "label": "G2: bbox && — selective box", "basin_p50_ms": opt_ms(g2_b), "pg_p50_ms": opt_ms(pg_g2),
-              "basin_over_pg": ratio(g2_b, pg_g2), "basin_hits": g2_count, "pg_hits": pg_g2_count,
-              "basin_uses_index": gist_ok, "pg_uses_gist": pg_ext_ok },
-            { "label": "G3: bbox && — wide box", "basin_p50_ms": opt_ms(g3_b), "pg_p50_ms": opt_ms(pg_g3),
-              "basin_over_pg": ratio(g3_b, pg_g3), "basin_hits": g3_count },
-            { "label": "G4: radius ST_DWithin count (metres)", "basin_p50_ms": opt_ms(g4_b), "pg_p50_ms": opt_ms(pg_g4),
-              "basin_over_pg": ratio(g4_b, pg_g4), "basin_hits": g4_count, "pg_hits": pg_g4_count },
-            { "label": "G5: nearest-neighbour <-> ORDER BY LIMIT 10", "basin_supported": g5_supported,
-              "basin_p50_ms": opt_ms(g5_b), "pg_p50_ms": opt_ms(pg_g5), "basin_over_pg": ratio(g5_b, pg_g5) },
-            { "label": "G6: point-in-polygon (~50-vertex)", "basin_supported": g6_supported,
-              "basin_p50_ms": opt_ms(g6_b), "pg_p50_ms": opt_ms(pg_g6), "basin_over_pg": ratio(g6_b, pg_g6),
-              "basin_hits": g6_count, "pg_hits": pg_g6_count },
-        ],
-        "note": "PG uses geometry(Point,4326) + GIST; Basin uses POINT + USING gist R-tree \
-                 row-group prune. FAIRNESS: PG ST_DWithin operands cast to ::geography with \
-                 use_spheroid=false (spherical haversine) so BOTH engines use the same \
-                 distance model and the same radius. bbox/radius/polygon counts \
-                 hard-asserted equal across engines when PostGIS is available. \
-                 Unsupported Basin shapes record basin_supported:false and a PG-only timing \
-                 (the card never fails because a shape is unimplemented).",
-    }));
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "ext_bench_postgis.json",
+        &json!({
+            "card": "ext_bench_postgis",
+            "family": "postgis",
+            "generated_at": format!("@{ts}"),
+            "pg_available": pg_available,
+            "pg_extension_available": pg_ext_ok,
+            "basin_gist_ddl_ok": gist_ok,
+            "config": {
+                "rows": rows, "samples": samples, "tiles_per_axis": TILES_PER_AXIS,
+                "radius_m": RADIUS_M, "polygon_vertices": 50,
+            },
+            "ingest": {
+                "label": "G1: point ingest with geo column (rows/s)",
+                "basin_rows_per_s": basin_ingest_rate,
+                "pg_rows_per_s": pg_ingest_rate,
+            },
+            "shapes": [
+                { "label": "G2: bbox && — selective box", "basin_p50_ms": opt_ms(g2_b), "pg_p50_ms": opt_ms(pg_g2),
+                  "basin_over_pg": ratio(g2_b, pg_g2), "basin_hits": g2_count, "pg_hits": pg_g2_count,
+                  "basin_uses_index": gist_ok, "pg_uses_gist": pg_ext_ok },
+                { "label": "G3: bbox && — wide box", "basin_p50_ms": opt_ms(g3_b), "pg_p50_ms": opt_ms(pg_g3),
+                  "basin_over_pg": ratio(g3_b, pg_g3), "basin_hits": g3_count },
+                { "label": "G4: radius ST_DWithin count (metres)", "basin_p50_ms": opt_ms(g4_b), "pg_p50_ms": opt_ms(pg_g4),
+                  "basin_over_pg": ratio(g4_b, pg_g4), "basin_hits": g4_count, "pg_hits": pg_g4_count },
+                { "label": "G5: nearest-neighbour <-> ORDER BY LIMIT 10", "basin_supported": g5_supported,
+                  "basin_p50_ms": opt_ms(g5_b), "pg_p50_ms": opt_ms(pg_g5), "basin_over_pg": ratio(g5_b, pg_g5) },
+                { "label": "G6: point-in-polygon (~50-vertex)", "basin_supported": g6_supported,
+                  "basin_p50_ms": opt_ms(g6_b), "pg_p50_ms": opt_ms(pg_g6), "basin_over_pg": ratio(g6_b, pg_g6),
+                  "basin_hits": g6_count, "pg_hits": pg_g6_count },
+            ],
+            "note": "PG uses geometry(Point,4326) + GIST; Basin uses POINT + USING gist R-tree \
+                     row-group prune. FAIRNESS: PG ST_DWithin operands cast to ::geography with \
+                     use_spheroid=false (spherical haversine) so BOTH engines use the same \
+                     distance model and the same radius. bbox/radius/polygon counts \
+                     hard-asserted equal across engines when PostGIS is available. \
+                     Unsupported Basin shapes record basin_supported:false and a PG-only timing \
+                     (the card never fails because a shape is unimplemented).",
+        }),
+    );
 }

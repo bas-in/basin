@@ -322,7 +322,10 @@ async fn prisma_runtime_crud() {
         "select_where_id_param",
         true,
         client
-            .query("SELECT id, email, name FROM \"User\" WHERE id = $1", &[&1_i64])
+            .query(
+                "SELECT id, email, name FROM \"User\" WHERE id = $1",
+                &[&1_i64],
+            )
             .await,
     );
 
@@ -345,9 +348,7 @@ async fn prisma_runtime_crud() {
         client
             .execute(
                 "INSERT INTO \"User\" (id, email, name) VALUES ($1,$2,$3),($4,$5,$6)",
-                &[
-                    &2_i64, &"b@x.com", &"Bob", &3_i64, &"c@x.com", &"Cara",
-                ],
+                &[&2_i64, &"b@x.com", &"Bob", &3_i64, &"c@x.com", &"Cara"],
             )
             .await,
     );
@@ -534,9 +535,7 @@ async fn activerecord_migration_flow() {
         "create_schema_migrations",
         true,
         client
-            .batch_execute(
-                "CREATE TABLE schema_migrations (version TEXT NOT NULL)",
-            )
+            .batch_execute("CREATE TABLE schema_migrations (version TEXT NOT NULL)")
             .await,
     );
     f.record(
@@ -591,9 +590,7 @@ async fn activerecord_migration_flow() {
     f.record(
         "pg_advisory_unlock",
         true,
-        client
-            .query("SELECT pg_advisory_unlock(424242)", &[])
-            .await,
+        client.query("SELECT pg_advisory_unlock(424242)", &[]).await,
     );
 
     f.finish();
@@ -628,9 +625,7 @@ async fn sqlx_describe_flow() {
     );
 
     // Describe a parameterized SELECT (Parse + Describe, no Execute).
-    let sel = client
-        .prepare("SELECT id, name FROM t WHERE id = $1")
-        .await;
+    let sel = client.prepare("SELECT id, name FROM t WHERE id = $1").await;
     match &sel {
         Ok(stmt) => {
             f.record_check(
@@ -783,9 +778,7 @@ async fn drizzle_batch_flow() {
     // fast-select is a separate storage limitation; avoid it here).
     let read = client.query("SELECT id, payload FROM docs", &[]).await;
     let roundtrip_ok = match &read {
-        Ok(rows) if rows.len() == 1 => {
-            rows[0].get::<_, serde_json::Value>(1) == payload
-        }
+        Ok(rows) if rows.len() == 1 => rows[0].get::<_, serde_json::Value>(1) == payload,
         _ => false,
     };
     f.record("select_jsonb_roundtrip", true, read);
@@ -832,7 +825,9 @@ async fn hibernate_sequence_flow() {
     );
 
     // nextval() to allocate an id (Hibernate's pre-INSERT allocation).
-    let nv = client.query_one("SELECT nextval($1)", &[&"hibernate_seq"]).await;
+    let nv = client
+        .query_one("SELECT nextval($1)", &[&"hibernate_seq"])
+        .await;
     // nextval bound-param shape can differ from the literal form used in
     // type_ddl/sequences (those call nextval('lit')). Treat the *literal* form
     // as the supported baseline below; the param form is a best-effort probe.
@@ -855,7 +850,9 @@ async fn hibernate_sequence_flow() {
     f.record(
         "currval_literal",
         true,
-        client.query_one("SELECT currval('hibernate_seq')", &[]).await,
+        client
+            .query_one("SELECT currval('hibernate_seq')", &[])
+            .await,
     );
 
     // INSERT using the allocated id, with RETURNING (getGeneratedKeys path).
@@ -931,7 +928,11 @@ async fn count_gaps_for_all_flows() -> u64 {
             match $fut.await {
                 Ok(_) => {}
                 Err(e) => {
-                    println!("[orm-compat] census/{}: GAP({})", $label, short_err(&e.to_string()));
+                    println!(
+                        "[orm-compat] census/{}: GAP({})",
+                        $label,
+                        short_err(&e.to_string())
+                    );
                     gaps += 1;
                 }
             }
@@ -1087,9 +1088,7 @@ async fn count_gaps_for_all_flows() -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zzz_orm_flow_gap_ceiling() {
     let gaps = count_gaps_for_all_flows().await;
-    println!(
-        "[orm-compat] GAP CEILING: observed {gaps} gap(s), ceiling {RECORDED_GAP_CEILING}"
-    );
+    println!("[orm-compat] GAP CEILING: observed {gaps} gap(s), ceiling {RECORDED_GAP_CEILING}");
     assert!(
         gaps <= RECORDED_GAP_CEILING,
         "ORM-flow gap count regressed: {gaps} gaps observed but ceiling is \

@@ -118,10 +118,7 @@ fn points_schema() -> Arc<Schema> {
 /// row-group covers approximately one tile.
 fn build_point_batch(n: usize) -> RecordBatch {
     let ids: Int64Array = (0..n as i64).collect();
-    let mut geom_b = FixedSizeBinaryBuilder::with_capacity(
-        n,
-        basin_geo::POINT_WKB_LEN as i32,
-    );
+    let mut geom_b = FixedSizeBinaryBuilder::with_capacity(n, basin_geo::POINT_WKB_LEN as i32);
     // Deterministic LCG. Output ∈ [0, 2^31).
     let mut state: u64 = 0xCAFEBABE;
     let mut next_unit = || {
@@ -159,16 +156,13 @@ fn build_point_batch(n: usize) -> RecordBatch {
 }
 
 /// Run the `ST_DWithin` count query and return `(elapsed_ms, count)`.
-async fn time_count(
-    engine: &Engine,
-    project: ProjectId,
-    sql: &str,
-) -> (f64, u64) {
+async fn time_count(engine: &Engine, project: ProjectId, sql: &str) -> (f64, u64) {
     let sess = engine.open_session(project).await.unwrap();
     let t0 = Instant::now();
-    let res = sess.execute(sql).await.unwrap_or_else(|e| {
-        panic!("execute({sql:?}): {e:?}")
-    });
+    let res = sess
+        .execute(sql)
+        .await
+        .unwrap_or_else(|e| panic!("execute({sql:?}): {e:?}"));
     let elapsed = t0.elapsed();
     let batches = match res {
         ExecResult::Rows { batches, .. } => batches,
@@ -233,9 +227,7 @@ async fn viability_large_spatial_dwithin() {
     let seed_elapsed_s = seed_t0.elapsed().as_secs_f64();
     println!(
         "[VIABILITY large_spatial_dwithin] wrote {} rows in {:.2}s → {}",
-        data_file.row_count,
-        seed_elapsed_s,
-        data_file.path,
+        data_file.row_count, seed_elapsed_s, data_file.path,
     );
 
     let data_path = data_file.path.as_ref().to_string();
@@ -303,11 +295,7 @@ async fn viability_large_spatial_dwithin() {
     );
     let bytes = basin_storage::index::rtree::serialize_rtree(&rtree).unwrap();
     let sidecar_key = basin_storage::index::rtree::rtree_segment_key_for_data_file(
-        None,
-        &project,
-        &table,
-        col_name,
-        &data_path,
+        None, &project, &table, col_name, &data_path,
     )
     .expect("canonical data path");
     {
@@ -359,8 +347,7 @@ async fn viability_large_spatial_dwithin() {
     // PostgreSQL (the BTree pages are also pulled in on first probe).
     let (indexed_cold_ms, indexed_cold_count) =
         time_count(&engine_indexed, project, &dwithin_sql).await;
-    let (indexed_ms, indexed_count) =
-        time_count(&engine_indexed, project, &dwithin_sql).await;
+    let (indexed_ms, indexed_count) = time_count(&engine_indexed, project, &dwithin_sql).await;
     println!(
         "[VIABILITY large_spatial_dwithin] indexed (cold): {indexed_cold_ms:.2} ms, \
          hits={indexed_cold_count}"

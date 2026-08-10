@@ -246,7 +246,10 @@ pub(crate) fn register_pg_scalar_aliases(ctx: &SessionContext) {
     // Registered under both the bare and `pg_catalog.`-qualified names because
     // clients use either (mirrors `pg_catalog.pg_cancel_backend`).
     const VERSION_BANNER: &str = "PostgreSQL 15.0 (Basin) on basin, 64-bit";
-    ctx.register_udf(ScalarUDF::from(ConstTextUdf::new("version", VERSION_BANNER)));
+    ctx.register_udf(ScalarUDF::from(ConstTextUdf::new(
+        "version",
+        VERSION_BANNER,
+    )));
     ctx.register_udf(ScalarUDF::from(ConstTextUdf::new(
         "pg_catalog.version",
         VERSION_BANNER,

@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use basin_common::{BasinError, PartitionKey, ProjectId};
 use basin_wal::{
-    BasinRaftItem, BasinRaftRequest, DurabilityBackend, Lsn, RaftDurability, RaftWal, RaftWalConfig,
-    SimCluster, Wal, WalMode,
+    BasinRaftItem, BasinRaftRequest, DurabilityBackend, Lsn, RaftDurability, RaftWal,
+    RaftWalConfig, SimCluster, Wal, WalMode,
 };
 use bytes::Bytes;
 use openraft::BasicNode;
@@ -483,7 +483,14 @@ async fn flush_watermark_purges_log_and_bounds_it() {
             .await
             .unwrap();
     }
-    wait_for_high_water(wal.as_ref(), &project, &part, Lsn(200), Duration::from_secs(10)).await;
+    wait_for_high_water(
+        wal.as_ref(),
+        &project,
+        &part,
+        Lsn(200),
+        Duration::from_secs(10),
+    )
+    .await;
     let bytes_before = raft_log_bytes(&dir, 1);
     assert!(bytes_before > 0, "log file should hold entries");
 
@@ -515,7 +522,10 @@ async fn flush_watermark_purges_log_and_bounds_it() {
         .record_flush_watermark(&project, &part, Lsn(150), "cat-1")
         .await
         .unwrap();
-    assert!(purged2.is_none(), "non-advancing watermark does not re-purge");
+    assert!(
+        purged2.is_none(),
+        "non-advancing watermark does not re-purge"
+    );
 
     wal.close().await.unwrap();
 }
@@ -628,22 +638,49 @@ async fn batched_proposal_commits_on_quorum() {
         })
         .collect();
     let lsns = backend.commit_batch(batch).await.unwrap();
-    assert_eq!(lsns, vec![Lsn(1), Lsn(2), Lsn(3), Lsn(4), Lsn(5)], "monotonic per-partition LSNs in batch order");
+    assert_eq!(
+        lsns,
+        vec![Lsn(1), Lsn(2), Lsn(3), Lsn(4), Lsn(5)],
+        "monotonic per-partition LSNs in batch order"
+    );
 
     // durable_lsn (quorum-committed) covers the whole batch on every node.
     for node in &nodes {
-        wait_for_high_water(node.as_ref(), &project, &part_a, Lsn(5), Duration::from_secs(10)).await;
+        wait_for_high_water(
+            node.as_ref(),
+            &project,
+            &part_a,
+            Lsn(5),
+            Duration::from_secs(10),
+        )
+        .await;
     }
 
     // A mixed-partition batch keeps each partition's LSN sequence independent.
     let part_b = PartitionKey::new("partition-b").unwrap();
     let mixed = vec![
-        BasinRaftItem { project, partition: part_a.clone(), payload: b"a6".to_vec() },
-        BasinRaftItem { project, partition: part_b.clone(), payload: b"b1".to_vec() },
-        BasinRaftItem { project, partition: part_a.clone(), payload: b"a7".to_vec() },
+        BasinRaftItem {
+            project,
+            partition: part_a.clone(),
+            payload: b"a6".to_vec(),
+        },
+        BasinRaftItem {
+            project,
+            partition: part_b.clone(),
+            payload: b"b1".to_vec(),
+        },
+        BasinRaftItem {
+            project,
+            partition: part_a.clone(),
+            payload: b"a7".to_vec(),
+        },
     ];
     let lsns = backend.commit_batch(mixed).await.unwrap();
-    assert_eq!(lsns, vec![Lsn(6), Lsn(1), Lsn(7)], "per-partition LSNs assigned in item order");
+    assert_eq!(
+        lsns,
+        vec![Lsn(6), Lsn(1), Lsn(7)],
+        "per-partition LSNs assigned in item order"
+    );
 
     // Empty batch is a no-op.
     assert!(backend.commit_batch(Vec::new()).await.unwrap().is_empty());
@@ -668,15 +705,16 @@ async fn no_quorum_fails_typed() {
 
     let project = ProjectId::new();
     let part = PartitionKey::default_key();
-    let item = BasinRaftItem { project, partition: part, payload: b"x".to_vec() };
+    let item = BasinRaftItem {
+        project,
+        partition: part,
+        payload: b"x".to_vec(),
+    };
 
-    let err = tokio::time::timeout(
-        Duration::from_secs(3),
-        backend.commit_batch(vec![item]),
-    )
-    .await
-    .expect("write should fail fast, not hang, with no leader")
-    .expect_err("write without quorum must error");
+    let err = tokio::time::timeout(Duration::from_secs(3), backend.commit_batch(vec![item]))
+        .await
+        .expect("write should fail fast, not hang, with no leader")
+        .expect_err("write without quorum must error");
 
     assert!(
         matches!(err, BasinError::RaftNoQuorum(_)),
@@ -700,8 +738,16 @@ async fn single_node_raft_write_to_durable() {
     // A quorum of one: each proposal commits the moment it is fsync'd locally.
     let lsns = backend
         .commit_batch(vec![
-            BasinRaftItem { project, partition: part.clone(), payload: b"one".to_vec() },
-            BasinRaftItem { project, partition: part.clone(), payload: b"two".to_vec() },
+            BasinRaftItem {
+                project,
+                partition: part.clone(),
+                payload: b"one".to_vec(),
+            },
+            BasinRaftItem {
+                project,
+                partition: part.clone(),
+                payload: b"two".to_vec(),
+            },
         ])
         .await
         .unwrap();
@@ -727,7 +773,11 @@ async fn single_proposal_is_batch_of_one() {
     let part = PartitionKey::default_key();
 
     let lsns = wal
-        .propose_batch(BasinRaftRequest::single(project, part.clone(), b"solo".to_vec()))
+        .propose_batch(BasinRaftRequest::single(
+            project,
+            part.clone(),
+            b"solo".to_vec(),
+        ))
         .await
         .unwrap();
     assert_eq!(lsns, vec![Lsn(1)]);

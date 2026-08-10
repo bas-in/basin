@@ -249,8 +249,8 @@ pub(crate) fn field_to_pg_type(field: &arrow_schema::Field) -> String {
         BASIN_CHARLEN_KEY, BASIN_ENUM_TYPE_KEY, BASIN_TYPE_BIT_PREFIX, BASIN_TYPE_CIDR,
         BASIN_TYPE_CITEXT, BASIN_TYPE_DATERANGE, BASIN_TYPE_INET, BASIN_TYPE_INT4RANGE,
         BASIN_TYPE_INT8RANGE, BASIN_TYPE_JSONB, BASIN_TYPE_KEY, BASIN_TYPE_MACADDR,
-        BASIN_TYPE_MACADDR8, BASIN_TYPE_MONEY, BASIN_TYPE_NUMRANGE, BASIN_TYPE_TSRANGE,
-        BASIN_TYPE_TSTZRANGE, BASIN_TYPE_TSVECTOR, BASIN_TYPE_TSQUERY, BASIN_TYPE_UUID,
+        BASIN_TYPE_MACADDR8, BASIN_TYPE_MONEY, BASIN_TYPE_NUMRANGE, BASIN_TYPE_TSQUERY,
+        BASIN_TYPE_TSRANGE, BASIN_TYPE_TSTZRANGE, BASIN_TYPE_TSVECTOR, BASIN_TYPE_UUID,
         BASIN_TYPE_VARBIT_PREFIX, BASIN_TYPE_XML,
     };
     use arrow_schema::{DataType, IntervalUnit};
@@ -335,9 +335,7 @@ pub(crate) fn field_to_pg_type(field: &arrow_schema::Field) -> String {
         DataType::Time32(_) | DataType::Time64(_) => "TIME".to_string(),
         DataType::FixedSizeBinary(16) => "UUID".to_string(), // UUID fallback
         // Arrays: drill into the element type.
-        DataType::List(elem)
-        | DataType::LargeList(elem)
-        | DataType::FixedSizeList(elem, _) => {
+        DataType::List(elem) | DataType::LargeList(elem) | DataType::FixedSizeList(elem, _) => {
             let elem_field = elem.as_ref().clone();
             let elem_pg = field_to_pg_type(&elem_field);
             format!("{elem_pg}[]")

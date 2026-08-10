@@ -205,9 +205,7 @@ pub(crate) async fn exec_call(sess: &ProjectSession, call: Function) -> Result<E
         ))
         .await
         .map_err(|e| {
-            BasinError::InvalidSchema(format!(
-                "CALL {proc_name}: failed to push savepoint: {e}"
-            ))
+            BasinError::InvalidSchema(format!("CALL {proc_name}: failed to push savepoint: {e}"))
         })?;
     } else {
         // No outer transaction — start an implicit one.
@@ -985,15 +983,12 @@ pub(crate) fn match_create_procedure_ast(
                  all arguments must be named in v0.1"
             )));
         }
-        let type_name = fp
-            .arg_type
-            .as_ref()
-            .ok_or_else(|| {
-                BasinError::InvalidSchema(format!(
-                    "CREATE PROCEDURE {name}: argument {:?} has no type in AST",
-                    fp.name
-                ))
-            })?;
+        let type_name = fp.arg_type.as_ref().ok_or_else(|| {
+            BasinError::InvalidSchema(format!(
+                "CREATE PROCEDURE {name}: argument {:?} has no type in AST",
+                fp.name
+            ))
+        })?;
         let dt = type_name_to_arg(type_name, &name, &fp.name)?;
         args.push(SqlFunctionArg {
             name: fp.name.clone(),

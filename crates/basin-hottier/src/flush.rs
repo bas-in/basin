@@ -318,9 +318,7 @@ impl FlushWorker {
     /// Periodic tick: evaluate all three triggers across every (project, table).
     async fn tick(&mut self) {
         // ── Global pressure check ──────────────────────────────────────────────
-        let project_bytes: Vec<(ProjectId, u64)> = self
-            .registry
-            .projects_snapshot();
+        let project_bytes: Vec<(ProjectId, u64)> = self.registry.projects_snapshot();
 
         if let Some(candidates) = self
             .scheduler
@@ -344,9 +342,7 @@ impl FlushWorker {
         // This is handled implicitly below; the per-project bytes check covers it.
 
         // ── Per-table size + age sweep ─────────────────────────────────────────
-        let table_keys: Vec<(ProjectId, TableName)> = self
-            .registry
-            .table_keys_snapshot();
+        let table_keys: Vec<(ProjectId, TableName)> = self.registry.table_keys_snapshot();
 
         let age_threshold = Duration::from_secs(self.config.memtable_max_age_secs);
         let table_cap = self.config.table_soft_cap_bytes;
@@ -472,10 +468,7 @@ impl FlushWorker {
 
         // ── Step 3: write new rows ─────────────────────────────────────────────
         let written_file: Option<WrittenFile> = if !live_rows.is_empty() {
-            let file = self
-                .backend
-                .write_rows(project, table, live_rows)
-                .await?;
+            let file = self.backend.write_rows(project, table, live_rows).await?;
             Some(file)
         } else {
             None
@@ -683,11 +676,15 @@ mod tests {
         let p = proj();
 
         let small = reg.get_or_create(p, tbl("small"));
-        small.memtable.insert(key(1), MemRowValue::row(vec![0u8; 10], 0));
+        small
+            .memtable
+            .insert(key(1), MemRowValue::row(vec![0u8; 10], 0));
 
         let large = reg.get_or_create(p, tbl("large"));
         for i in 0..10i64 {
-            large.memtable.insert(key(i), MemRowValue::row(vec![0u8; 200], 0));
+            large
+                .memtable
+                .insert(key(i), MemRowValue::row(vec![0u8; 200], 0));
         }
 
         let result = reg.largest_table_for_project(&p);
@@ -822,7 +819,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Verify the noop backend received the rows and tombstone.
-        assert_eq!(*flushed_rows.lock().await, 10, "expected 10 live rows flushed");
+        assert_eq!(
+            *flushed_rows.lock().await,
+            10,
+            "expected 10 live rows flushed"
+        );
         assert_eq!(*tombstones.lock().await, 1, "expected 1 tombstone applied");
 
         // S4 age-based residency: flushed rows are RETAINED CLEAN (readable,
@@ -930,11 +931,7 @@ mod tests {
         // Wait several ticks.
         tokio::time::sleep(Duration::from_millis(250)).await;
 
-        assert_eq!(
-            *flushed_rows.lock().await,
-            0,
-            "paused task must not flush"
-        );
+        assert_eq!(*flushed_rows.lock().await, 0, "paused task must not flush");
 
         task.resume();
         // After resume, the next tick should flush.

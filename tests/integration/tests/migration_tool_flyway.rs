@@ -75,8 +75,8 @@ fn flyway_available() -> bool {
 /// Absolute path to the flyway SQL fixtures bundled with the test suite.
 fn fixture_sql_dir() -> PathBuf {
     // CARGO_MANIFEST_DIR is the crate root of `basin-integration-tests`.
-    let manifest = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR must be set by cargo test");
+    let manifest =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by cargo test");
     PathBuf::from(manifest)
         .join("fixtures")
         .join("migration-tool-scaffold")
@@ -127,9 +127,7 @@ async fn flyway_migrate_10_migrations() {
     let port = server.addr.port();
     let user = &server.project_slug;
 
-    println!(
-        "[flyway] Basin in-process server at 127.0.0.1:{port}, user={user}"
-    );
+    println!("[flyway] Basin in-process server at 127.0.0.1:{port}, user={user}");
 
     // ── Locate fixture SQL directory ───────────────────────────────────────────
     let sql_dir = fixture_sql_dir();
@@ -224,9 +222,7 @@ async fn flyway_migrate_10_migrations() {
     );
 
     // Verify each row's version and success flag.
-    let expected_versions = [
-        "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-    ];
+    let expected_versions = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
     for (i, row) in history_rows.iter().enumerate() {
         let rank: i32 = row.get(0);
         let version: &str = row.get(1);

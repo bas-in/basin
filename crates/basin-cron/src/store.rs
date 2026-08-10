@@ -588,10 +588,7 @@ mod namespace_tests {
     #[test]
     fn legacy_names_derive_from_canonical_with_schema_prefix() {
         // Verify the mapping: canonical → schema_canonical (the old flat form).
-        assert_eq!(
-            format!("{RESERVED_SCHEMA}_{JOB_TABLE}"),
-            LEGACY_JOB_TABLE
-        );
+        assert_eq!(format!("{RESERVED_SCHEMA}_{JOB_TABLE}"), LEGACY_JOB_TABLE);
         assert_eq!(
             format!("{RESERVED_SCHEMA}_{RUN_DETAILS_TABLE}"),
             LEGACY_RUN_DETAILS_TABLE

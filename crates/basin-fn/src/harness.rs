@@ -23,15 +23,15 @@
 
 use std::sync::Arc;
 
-use wasmtime::{Config, Engine, Store};
 use wasmtime::component::Component;
+use wasmtime::{Config, Engine, Store};
 
 use basin_common::ids::ProjectId;
 use basin_common::telemetry::ProjectCounterRegistry;
 
 use crate::engine::InvocationContext;
 use crate::governance::{FunctionGovernance, MemoryLimiter};
-use crate::host::{FunctionCallContext, FunctionHost, add_host_to_linker};
+use crate::host::{add_host_to_linker, FunctionCallContext, FunctionHost};
 
 // ---------------------------------------------------------------------------
 // bindgen! — generates BasinFunctions + basin::functions::{query,http,…}
@@ -61,8 +61,7 @@ fn component_engine() -> Arc<Engine> {
     COMPONENT_ENGINE
         .get_or_init(|| {
             let mut cfg = Config::new();
-            cfg.wasm_component_model(true)
-                .epoch_interruption(true);
+            cfg.wasm_component_model(true).epoch_interruption(true);
             let engine = Engine::new(&cfg).expect("wasmtime Engine::new failed");
             Arc::new(engine)
         })
@@ -153,7 +152,13 @@ impl ComponentHarness {
             wasmtime::component::Linker::new(&engine);
         add_host_to_linker(&mut linker)?;
 
-        Ok(Self { engine, component, linker, governance, counters: None })
+        Ok(Self {
+            engine,
+            component,
+            linker,
+            governance,
+            counters: None,
+        })
     }
 
     /// Attach a per-project counter registry so [`Self::run_with`] bumps
@@ -231,19 +236,14 @@ impl ComponentHarness {
         let result = gov
             .invoke_with_caps(project, move || {
                 let call_ctx = FunctionCallContext::new(ctx);
-                let host = FunctionHost::with_limiter(
-                    call_ctx,
-                    MemoryLimiter::new(caps.memory_max_bytes),
-                );
+                let host =
+                    FunctionHost::with_limiter(call_ctx, MemoryLimiter::new(caps.memory_max_bytes));
                 let mut store = Store::new(&me.engine, host);
                 // Install the per-Store memory limiter + CPU trap. The closure
                 // reaches the limiter through `FunctionHost::limiter_mut`.
-                gov_inner.prepare_store_with_limiter(
-                    &mut store,
-                    |h: &mut FunctionHost| h.limiter_mut(),
-                );
-                let bindings =
-                    BasinFunctions::instantiate(&mut store, &me.component, &me.linker)?;
+                gov_inner
+                    .prepare_store_with_limiter(&mut store, |h: &mut FunctionHost| h.limiter_mut());
+                let bindings = BasinFunctions::instantiate(&mut store, &me.component, &me.linker)?;
                 Ok(bindings.call_run(&mut store)?)
             })
             .await;

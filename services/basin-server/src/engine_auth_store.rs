@@ -232,10 +232,7 @@ fn get_text(batch: &arrow_array::RecordBatch, row: usize, col: usize) -> Option<
     // DataFusion may return Utf8View (StringViewArray) for certain expressions
     // (e.g. string functions, projections over Parquet Utf8View columns). Fall
     // through to this path so TEXT columns are always readable.
-    if let Some(a) = c
-        .as_any()
-        .downcast_ref::<arrow_array::StringViewArray>()
-    {
+    if let Some(a) = c.as_any().downcast_ref::<arrow_array::StringViewArray>() {
         return Some(a.value(row).to_string());
     }
     None
@@ -712,9 +709,8 @@ impl AuthStore for EngineAuthStore {
         let (user_id, expires_at, consumed_at, purpose) = token_row;
 
         // Look up the user's email.
-        let sql_user = format!(
-            "SELECT email FROM {T_USERS} WHERE user_id = $1 AND project_id = $2"
-        );
+        let sql_user =
+            format!("SELECT email FROM {T_USERS} WHERE user_id = $1 AND project_id = $2");
         let (_, user_batches) = self
             .query_params(
                 &sql_user,
@@ -938,9 +934,8 @@ impl AuthStore for EngineAuthStore {
         if n == 0 {
             // Check if the key exists at all (to distinguish NotFound vs.
             // already-revoked).
-            let sql_exists = format!(
-                "SELECT 1 FROM {T_API_KEYS} WHERE id = $1 AND project_id = $2"
-            );
+            let sql_exists =
+                format!("SELECT 1 FROM {T_API_KEYS} WHERE id = $1 AND project_id = $2");
             let (_, batches) = self
                 .query_params(
                     &sql_exists,

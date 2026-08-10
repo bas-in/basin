@@ -74,14 +74,10 @@ async fn run_inner(args: &Args) -> Result<WorkloadReport> {
     // ── Setup ────────────────────────────────────────────────────────────────
     r0.simple_query(&format!("DROP TABLE IF EXISTS {TABLE}"))
         .await?;
-    r0.simple_query(&format!(
-        "CREATE TABLE {TABLE} (id BIGINT, marker TEXT)"
-    ))
-    .await?;
-    r0.simple_query(&format!(
-        "INSERT INTO {TABLE} VALUES (1, 'handoff-marker')"
-    ))
-    .await?;
+    r0.simple_query(&format!("CREATE TABLE {TABLE} (id BIGINT, marker TEXT)"))
+        .await?;
+    r0.simple_query(&format!("INSERT INTO {TABLE} VALUES (1, 'handoff-marker')"))
+        .await?;
     info!("handoff: marker row written via replica-0");
 
     // Ensure replica-1 can see the table before we kill replica-0.

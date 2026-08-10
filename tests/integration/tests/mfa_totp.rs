@@ -100,18 +100,21 @@ impl Drop for SchemaGuard {
             };
             rt.block_on(async {
                 use tokio_postgres::NoTls;
-                let Ok((client, conn)) =
-                    tokio::time::timeout(Duration::from_secs(2), tokio_postgres::connect(PG_URL, NoTls))
-                        .await
-                        .map(|r| r.ok())
-                        .ok()
-                        .flatten()
-                        .map(Ok::<_, ()>)
-                        .unwrap_or(Err(()))
-                else {
+                let Ok((client, conn)) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    tokio_postgres::connect(PG_URL, NoTls),
+                )
+                .await
+                .map(|r| r.ok())
+                .ok()
+                .flatten()
+                .map(Ok::<_, ()>)
+                .unwrap_or(Err(())) else {
                     return;
                 };
-                tokio::spawn(async move { let _ = conn.await; });
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
                 let _ = client
                     .batch_execute(&format!(
                         "DROP TABLE IF EXISTS {schema}_mfa_recovery_codes CASCADE; \
@@ -282,10 +285,14 @@ async fn totp_enroll_issues_recovery_codes() {
         .expect("enroll");
 
     // Compute valid TOTP for current step using the service's enrollment secret.
-    let secret_dec = enc.decrypt(&svc.mfa_cache()
-        .load_factor_sync(enrollment.factor_id)
-        .unwrap()
-        .secret_enc).unwrap();
+    let secret_dec = enc
+        .decrypt(
+            &svc.mfa_cache()
+                .load_factor_sync(enrollment.factor_id)
+                .unwrap()
+                .secret_enc,
+        )
+        .unwrap();
     let secret_bytes2 =
         base32::decode(base32::Alphabet::RFC4648 { padding: false }, &secret_dec).unwrap();
     let step = chrono::Utc::now().timestamp() as u64 / 30;
@@ -303,7 +310,10 @@ async fn totp_enroll_issues_recovery_codes() {
         .await
         .expect("verify_totp_factor");
 
-    assert!(codes.is_some(), "first enrollment must issue recovery codes");
+    assert!(
+        codes.is_some(),
+        "first enrollment must issue recovery codes"
+    );
     assert_eq!(codes.unwrap().len(), 8);
     let _ = secret_bytes; // quiet
 }
@@ -381,8 +391,7 @@ async fn aal2_required_to_unenroll() {
         .await
         .expect("enroll");
 
-    svc.mfa_cache()
-        .verify_factor_sync(enrollment.factor_id);
+    svc.mfa_cache().verify_factor_sync(enrollment.factor_id);
 
     let err = svc
         .unenroll_factor(
@@ -459,14 +468,7 @@ async fn totp_challenge_step_up_issues_aal2() {
     let code2 = compute_totp_code(&secret_bytes, step + 1);
 
     let result = svc
-        .verify_totp_challenge(
-            None::<&MfaCache>,
-            &enc,
-            &project,
-            uid,
-            challenge_id,
-            &code2,
-        )
+        .verify_totp_challenge(None::<&MfaCache>, &enc, &project, uid, challenge_id, &code2)
         .await
         .expect("verify_totp_challenge");
 

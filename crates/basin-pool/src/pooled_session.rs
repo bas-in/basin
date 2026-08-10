@@ -87,7 +87,6 @@ impl PooledSession {
         }
         Ok(result)
     }
-
 }
 
 impl Drop for PooledSession {

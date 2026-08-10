@@ -102,68 +102,64 @@ fn row_count(batches: &[arrow_array::RecordBatch]) -> usize {
 #[test]
 fn archive_project_round_trip() {
     basin_integration_tests::big_stack::run(async {
-    let dir = TempDir::new().unwrap();
-    let eng = engine_in(&dir);
-    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    // Set up source and archive tables.
-    sess.execute(
-        "CREATE TABLE projects (id BIGINT NOT NULL, name TEXT NOT NULL)",
-    )
-    .await
-    .unwrap();
-    sess.execute(
-        "CREATE TABLE archive (id BIGINT NOT NULL, name TEXT NOT NULL)",
-    )
-    .await
-    .unwrap();
+        // Set up source and archive tables.
+        sess.execute("CREATE TABLE projects (id BIGINT NOT NULL, name TEXT NOT NULL)")
+            .await
+            .unwrap();
+        sess.execute("CREATE TABLE archive (id BIGINT NOT NULL, name TEXT NOT NULL)")
+            .await
+            .unwrap();
 
-    // Seed three projects.
-    sess.execute("INSERT INTO projects VALUES (42, 'alpha'), (99, 'beta'), (7, 'gamma')")
-        .await
-        .unwrap();
+        // Seed three projects.
+        sess.execute("INSERT INTO projects VALUES (42, 'alpha'), (99, 'beta'), (7, 'gamma')")
+            .await
+            .unwrap();
 
-    // Register the archive procedure.
-    sess.execute(
-        "CREATE PROCEDURE archive_project(pid BIGINT) LANGUAGE sql AS $$ \
+        // Register the archive procedure.
+        sess.execute(
+            "CREATE PROCEDURE archive_project(pid BIGINT) LANGUAGE sql AS $$ \
          INSERT INTO archive SELECT id, name FROM projects WHERE id = pid; \
          DELETE FROM projects WHERE id = pid \
          $$",
-    )
-    .await
-    .unwrap();
-
-    // Call it for project 42.
-    let res = sess.execute("CALL archive_project(42)").await.unwrap();
-    match res {
-        ExecResult::Empty { tag } => assert_eq!(tag, "CALL 2"),
-        other => panic!("unexpected result: {other:?}"),
-    }
-
-    // archive should contain exactly project 42.
-    let res = sess
-        .execute("SELECT id, name FROM archive ORDER BY id")
+        )
         .await
         .unwrap();
-    let batches = match res {
-        ExecResult::Rows { batches, .. } => batches,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(col_i64(&batches, "id"), vec![42]);
-    assert_eq!(col_str(&batches, "name"), vec!["alpha"]);
 
-    // projects should no longer contain project 42.
-    let res = sess
-        .execute("SELECT id FROM projects ORDER BY id")
-        .await
-        .unwrap();
-    let batches = match res {
-        ExecResult::Rows { batches, .. } => batches,
-        other => panic!("{other:?}"),
-    };
-    let ids = col_i64(&batches, "id");
-    assert!(!ids.contains(&42), "project 42 should be gone: {ids:?}");
-    assert_eq!(ids.len(), 2, "99 and 7 should remain: {ids:?}");
+        // Call it for project 42.
+        let res = sess.execute("CALL archive_project(42)").await.unwrap();
+        match res {
+            ExecResult::Empty { tag } => assert_eq!(tag, "CALL 2"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        // archive should contain exactly project 42.
+        let res = sess
+            .execute("SELECT id, name FROM archive ORDER BY id")
+            .await
+            .unwrap();
+        let batches = match res {
+            ExecResult::Rows { batches, .. } => batches,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(col_i64(&batches, "id"), vec![42]);
+        assert_eq!(col_str(&batches, "name"), vec!["alpha"]);
+
+        // projects should no longer contain project 42.
+        let res = sess
+            .execute("SELECT id FROM projects ORDER BY id")
+            .await
+            .unwrap();
+        let batches = match res {
+            ExecResult::Rows { batches, .. } => batches,
+            other => panic!("{other:?}"),
+        };
+        let ids = col_i64(&batches, "id");
+        assert!(!ids.contains(&42), "project 42 should be gone: {ids:?}");
+        assert_eq!(ids.len(), 2, "99 and 7 should remain: {ids:?}");
     });
 }
 
@@ -176,68 +172,65 @@ fn archive_project_round_trip() {
 #[test]
 fn multi_project_isolation() {
     basin_integration_tests::big_stack::run(async {
-    let dir = TempDir::new().unwrap();
-    let cat: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let eng_a = shared_engine(&dir, cat.clone());
-    let eng_b = shared_engine(&dir, cat.clone());
+        let dir = TempDir::new().unwrap();
+        let cat: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
+        let eng_a = shared_engine(&dir, cat.clone());
+        let eng_b = shared_engine(&dir, cat.clone());
 
-    let project_a = ProjectId::new();
-    let project_b = ProjectId::new();
-    let sess_a = eng_a.open_session(project_a).await.unwrap();
-    let sess_b = eng_b.open_session(project_b).await.unwrap();
+        let project_a = ProjectId::new();
+        let project_b = ProjectId::new();
+        let sess_a = eng_a.open_session(project_a).await.unwrap();
+        let sess_b = eng_b.open_session(project_b).await.unwrap();
 
-    // Set up project A.
-    sess_a
-        .execute("CREATE TABLE projects (id BIGINT NOT NULL, name TEXT NOT NULL)")
-        .await
-        .unwrap();
-    sess_a
-        .execute("CREATE TABLE archive (id BIGINT NOT NULL, name TEXT NOT NULL)")
-        .await
-        .unwrap();
-    sess_a
-        .execute("INSERT INTO projects VALUES (1, 'one')")
-        .await
-        .unwrap();
-    sess_a
-        .execute(
-            "CREATE PROCEDURE archive_project(pid BIGINT) LANGUAGE sql AS $$ \
+        // Set up project A.
+        sess_a
+            .execute("CREATE TABLE projects (id BIGINT NOT NULL, name TEXT NOT NULL)")
+            .await
+            .unwrap();
+        sess_a
+            .execute("CREATE TABLE archive (id BIGINT NOT NULL, name TEXT NOT NULL)")
+            .await
+            .unwrap();
+        sess_a
+            .execute("INSERT INTO projects VALUES (1, 'one')")
+            .await
+            .unwrap();
+        sess_a
+            .execute(
+                "CREATE PROCEDURE archive_project(pid BIGINT) LANGUAGE sql AS $$ \
              INSERT INTO archive SELECT id, name FROM projects WHERE id = pid; \
              DELETE FROM projects WHERE id = pid \
              $$",
-        )
-        .await
-        .unwrap();
+            )
+            .await
+            .unwrap();
 
-    // Project B cannot see project A's procedure.
-    let err = sess_b
-        .execute("CALL archive_project(1)")
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, BasinError::NotFound(_)),
-        "expected NotFound for project B calling project A's procedure, got: {err:?}"
-    );
+        // Project B cannot see project A's procedure.
+        let err = sess_b.execute("CALL archive_project(1)").await.unwrap_err();
+        assert!(
+            matches!(err, BasinError::NotFound(_)),
+            "expected NotFound for project B calling project A's procedure, got: {err:?}"
+        );
 
-    // Project A's procedure still works correctly.
-    sess_a.execute("CALL archive_project(1)").await.unwrap();
+        // Project A's procedure still works correctly.
+        sess_a.execute("CALL archive_project(1)").await.unwrap();
 
-    let res = sess_a
-        .execute("SELECT id FROM archive ORDER BY id")
-        .await
-        .unwrap();
-    let batches = match res {
-        ExecResult::Rows { batches, .. } => batches,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(col_i64(&batches, "id"), vec![1]);
+        let res = sess_a
+            .execute("SELECT id FROM archive ORDER BY id")
+            .await
+            .unwrap();
+        let batches = match res {
+            ExecResult::Rows { batches, .. } => batches,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(col_i64(&batches, "id"), vec![1]);
 
-    // Isolation: project A's archive is not accessible from project B.
-    let err = sess_b.execute("SELECT * FROM archive").await.unwrap_err();
-    assert!(
-        matches!(err, BasinError::NotFound(_)) || format!("{err}").contains("not found"),
-        "expected cross-project table access to fail, got: {err:?}"
-    );
+        // Isolation: project A's archive is not accessible from project B.
+        let err = sess_b.execute("SELECT * FROM archive").await.unwrap_err();
+        assert!(
+            matches!(err, BasinError::NotFound(_)) || format!("{err}").contains("not found"),
+            "expected cross-project table access to fail, got: {err:?}"
+        );
     });
 }
 
@@ -252,50 +245,50 @@ fn multi_project_isolation() {
 #[test]
 fn failure_mid_procedure_rolls_back() {
     basin_integration_tests::big_stack::run(async {
-    let dir = TempDir::new().unwrap();
-    let eng = engine_in(&dir);
-    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE audit_log (id BIGINT NOT NULL, action TEXT NOT NULL)")
-        .await
-        .unwrap();
+        sess.execute("CREATE TABLE audit_log (id BIGINT NOT NULL, action TEXT NOT NULL)")
+            .await
+            .unwrap();
 
-    // The procedure inserts an audit record then tries to insert into a
-    // nonexistent table — the second INSERT fails, rolling the first back.
-    sess.execute(
-        "CREATE PROCEDURE log_then_fail(eid BIGINT) LANGUAGE sql AS $$ \
+        // The procedure inserts an audit record then tries to insert into a
+        // nonexistent table — the second INSERT fails, rolling the first back.
+        sess.execute(
+            "CREATE PROCEDURE log_then_fail(eid BIGINT) LANGUAGE sql AS $$ \
          INSERT INTO audit_log VALUES (eid, 'started'); \
          INSERT INTO nonexistent_table VALUES (eid) \
          $$",
-    )
-    .await
-    .unwrap();
-
-    let err = sess.execute("CALL log_then_fail(99)").await.unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("statement #2")
-            || msg.contains("nonexistent_table")
-            || msg.contains("not found"),
-        "unexpected error shape: {msg}"
-    );
-
-    // The INSERT from the first statement must be rolled back —
-    // audit_log must remain empty.
-    let res = sess
-        .execute("SELECT id FROM audit_log ORDER BY id")
+        )
         .await
         .unwrap();
-    let batches = match res {
-        ExecResult::Rows { batches, .. } => batches,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(
-        row_count(&batches),
-        0,
-        "first INSERT must be rolled back; got {} rows",
-        row_count(&batches)
-    );
+
+        let err = sess.execute("CALL log_then_fail(99)").await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("statement #2")
+                || msg.contains("nonexistent_table")
+                || msg.contains("not found"),
+            "unexpected error shape: {msg}"
+        );
+
+        // The INSERT from the first statement must be rolled back —
+        // audit_log must remain empty.
+        let res = sess
+            .execute("SELECT id FROM audit_log ORDER BY id")
+            .await
+            .unwrap();
+        let batches = match res {
+            ExecResult::Rows { batches, .. } => batches,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            row_count(&batches),
+            0,
+            "first INSERT must be rolled back; got {} rows",
+            row_count(&batches)
+        );
     });
 }
 
@@ -311,57 +304,57 @@ fn failure_mid_procedure_rolls_back() {
 #[test]
 fn call_inside_outer_transaction_procedure_writes_rolled_back() {
     basin_integration_tests::big_stack::run(async {
-    let dir = TempDir::new().unwrap();
-    let eng = engine_in(&dir);
-    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE log (msg TEXT NOT NULL)")
-        .await
-        .unwrap();
+        sess.execute("CREATE TABLE log (msg TEXT NOT NULL)")
+            .await
+            .unwrap();
 
-    // A procedure that inserts one row then fails.
-    sess.execute(
-        "CREATE PROCEDURE fail_proc() LANGUAGE sql AS $$ \
+        // A procedure that inserts one row then fails.
+        sess.execute(
+            "CREATE PROCEDURE fail_proc() LANGUAGE sql AS $$ \
          INSERT INTO log VALUES ('inside_proc'); \
          INSERT INTO missing_table VALUES ('boom') \
          $$",
-    )
-    .await
-    .unwrap();
-
-    // Begin an outer transaction and insert a row.
-    sess.execute("BEGIN").await.unwrap();
-    sess.execute("INSERT INTO log VALUES ('outer_before')")
+        )
         .await
         .unwrap();
 
-    // CALL the failing procedure — it should roll back its own INSERT
-    // via the internal savepoint, then propagate the error. The outer
-    // transaction enters the aborted state (same as any statement failure
-    // in a transaction block — consistent with PostgreSQL behavior).
-    let err = sess.execute("CALL fail_proc()").await.unwrap_err();
-    assert!(
-        format!("{err}").contains("missing_table")
-            || format!("{err}").contains("not found")
-            || format!("{err}").contains("statement #2"),
-        "unexpected error: {err}"
-    );
+        // Begin an outer transaction and insert a row.
+        sess.execute("BEGIN").await.unwrap();
+        sess.execute("INSERT INTO log VALUES ('outer_before')")
+            .await
+            .unwrap();
 
-    // Recover from the aborted outer transaction via ROLLBACK.
-    sess.execute("ROLLBACK").await.unwrap();
+        // CALL the failing procedure — it should roll back its own INSERT
+        // via the internal savepoint, then propagate the error. The outer
+        // transaction enters the aborted state (same as any statement failure
+        // in a transaction block — consistent with PostgreSQL behavior).
+        let err = sess.execute("CALL fail_proc()").await.unwrap_err();
+        assert!(
+            format!("{err}").contains("missing_table")
+                || format!("{err}").contains("not found")
+                || format!("{err}").contains("statement #2"),
+            "unexpected error: {err}"
+        );
 
-    // After ROLLBACK, the outer transaction's INSERT ('outer_before') and
-    // the procedure's INSERT ('inside_proc') are both gone.
-    let res = sess.execute("SELECT msg FROM log").await.unwrap();
-    let batches = match res {
-        ExecResult::Rows { batches, .. } => batches,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(
-        row_count(&batches),
-        0,
-        "both the outer and procedure INSERTs must be rolled back"
-    );
+        // Recover from the aborted outer transaction via ROLLBACK.
+        sess.execute("ROLLBACK").await.unwrap();
+
+        // After ROLLBACK, the outer transaction's INSERT ('outer_before') and
+        // the procedure's INSERT ('inside_proc') are both gone.
+        let res = sess.execute("SELECT msg FROM log").await.unwrap();
+        let batches = match res {
+            ExecResult::Rows { batches, .. } => batches,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            row_count(&batches),
+            0,
+            "both the outer and procedure INSERTs must be rolled back"
+        );
     });
 }
 
@@ -375,37 +368,37 @@ fn call_inside_outer_transaction_procedure_writes_rolled_back() {
 #[test]
 fn successful_call_inside_outer_tx_rolls_back_with_outer() {
     basin_integration_tests::big_stack::run(async {
-    let dir = TempDir::new().unwrap();
-    let eng = engine_in(&dir);
-    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let eng = engine_in(&dir);
+        let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE log (msg TEXT NOT NULL)")
+        sess.execute("CREATE TABLE log (msg TEXT NOT NULL)")
+            .await
+            .unwrap();
+
+        sess.execute(
+            "CREATE PROCEDURE add_log(m TEXT) LANGUAGE sql AS $$ \
+         INSERT INTO log VALUES (m) \
+         $$",
+        )
         .await
         .unwrap();
 
-    sess.execute(
-        "CREATE PROCEDURE add_log(m TEXT) LANGUAGE sql AS $$ \
-         INSERT INTO log VALUES (m) \
-         $$",
-    )
-    .await
-    .unwrap();
+        // Begin an outer transaction, call the procedure, then roll back.
+        sess.execute("BEGIN").await.unwrap();
+        sess.execute("CALL add_log('inside_proc')").await.unwrap();
+        sess.execute("ROLLBACK").await.unwrap();
 
-    // Begin an outer transaction, call the procedure, then roll back.
-    sess.execute("BEGIN").await.unwrap();
-    sess.execute("CALL add_log('inside_proc')").await.unwrap();
-    sess.execute("ROLLBACK").await.unwrap();
-
-    // The procedure's INSERT should be gone after the outer rollback.
-    let res = sess.execute("SELECT msg FROM log").await.unwrap();
-    let batches = match res {
-        ExecResult::Rows { batches, .. } => batches,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(
-        row_count(&batches),
-        0,
-        "log must be empty after outer ROLLBACK"
-    );
+        // The procedure's INSERT should be gone after the outer rollback.
+        let res = sess.execute("SELECT msg FROM log").await.unwrap();
+        let batches = match res {
+            ExecResult::Rows { batches, .. } => batches,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            row_count(&batches),
+            0,
+            "log must be empty after outer ROLLBACK"
+        );
     });
 }

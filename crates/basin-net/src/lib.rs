@@ -84,8 +84,8 @@ mod types;
 
 pub use client::HttpClient;
 pub use guards::{
-    check_url_safety, is_denied_ip, AllowList, GuardConfig, RateLimit,
-    RebindingGuardedResolver, IMDS_V4, IMDS_V6,
+    check_url_safety, is_denied_ip, AllowList, GuardConfig, RateLimit, RebindingGuardedResolver,
+    IMDS_V4, IMDS_V6,
 };
 #[cfg(feature = "engine-store")]
 pub use queue::{RequestQueue, RequestQueueHandle};

@@ -389,7 +389,9 @@ impl S3LikeConfig {
                 }
                 b = b.with_allow_http(true);
             } else if !ep.starts_with("https://") {
-                return Err(format!("BASIN_STORAGE_ENDPOINT must be http(s) (got {ep:?})"));
+                return Err(format!(
+                    "BASIN_STORAGE_ENDPOINT must be http(s) (got {ep:?})"
+                ));
             }
             // A CUSTOM endpoint (Tigris, MinIO, Wasabi, …) must use PATH-STYLE so
             // the bucket lands in the URL path `{endpoint}/{bucket}/{key}` rather
@@ -658,7 +660,10 @@ mod tests {
     fn request_timeout_defaults_and_overrides() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _g = clean_env_with(&[]);
-        assert_eq!(resolve_request_timeout_secs(), DEFAULT_S3_REQUEST_TIMEOUT_SECS);
+        assert_eq!(
+            resolve_request_timeout_secs(),
+            DEFAULT_S3_REQUEST_TIMEOUT_SECS
+        );
         assert_eq!(resolve_request_timeout_secs(), 30);
         drop(_g);
         let _g2 = clean_env_with(&[("BASIN_S3_REQUEST_TIMEOUT_SECS", "20")]);
@@ -666,20 +671,26 @@ mod tests {
         drop(_g2);
         // Zero / garbage → default.
         let _g3 = clean_env_with(&[("BASIN_S3_REQUEST_TIMEOUT_SECS", "0")]);
-        assert_eq!(resolve_request_timeout_secs(), DEFAULT_S3_REQUEST_TIMEOUT_SECS);
+        assert_eq!(
+            resolve_request_timeout_secs(),
+            DEFAULT_S3_REQUEST_TIMEOUT_SECS
+        );
         drop(_g3);
         let _g4 = clean_env_with(&[("BASIN_S3_REQUEST_TIMEOUT_SECS", "nope")]);
-        assert_eq!(resolve_request_timeout_secs(), DEFAULT_S3_REQUEST_TIMEOUT_SECS);
+        assert_eq!(
+            resolve_request_timeout_secs(),
+            DEFAULT_S3_REQUEST_TIMEOUT_SECS
+        );
     }
 
     #[test]
     fn pool_idle_timeout_defaults_short_for_stale_keepalive_eviction() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _g = clean_env_with(&[]); // clears BASIN_S3_POOL_IDLE_TIMEOUT_SECS
-        // The wedge fix: the idle-eviction timeout must default SHORT (20s),
-        // not the old hardcoded 90s, so an idle keep-alive is dropped before
-        // the S3 server half-closes it and we reuse a dead socket ("error
-        // sending request").
+                                      // The wedge fix: the idle-eviction timeout must default SHORT (20s),
+                                      // not the old hardcoded 90s, so an idle keep-alive is dropped before
+                                      // the S3 server half-closes it and we reuse a dead socket ("error
+                                      // sending request").
         assert_eq!(
             resolve_pool_idle_timeout_secs(),
             DEFAULT_S3_POOL_IDLE_TIMEOUT_SECS

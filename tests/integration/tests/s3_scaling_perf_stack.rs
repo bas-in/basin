@@ -308,7 +308,11 @@ async fn s3_scaling_perf_stack() {
     // cache stack must not REGRESS p50 (≥0.8× allowing noise) with p99 bounded.
     let latency_regime = cfg.latency_inject().is_some();
     let bar_d_ok = dist_d.p99_ms < BAR_D_MAX_P99_MS;
-    let speedup_bar = if latency_regime { BAR_SPEEDUP } else { BAR_SPEEDUP_LOOPBACK };
+    let speedup_bar = if latency_regime {
+        BAR_SPEEDUP
+    } else {
+        BAR_SPEEDUP_LOOPBACK
+    };
     let bar_speedup_ok = speedup >= speedup_bar;
     let pass = bar_d_ok && bar_speedup_ok;
 
@@ -332,7 +336,11 @@ async fn s3_scaling_perf_stack() {
         "[S3 perf_stack] speedup a→d (p50) = {:.1}× (bar ≥ {:.1}× [{}]); d p99 < {:.0}ms? {}",
         speedup,
         speedup_bar,
-        if latency_regime { "latency" } else { "loopback" },
+        if latency_regime {
+            "latency"
+        } else {
+            "loopback"
+        },
         BAR_D_MAX_P99_MS,
         bar_d_ok,
     );
@@ -412,7 +420,11 @@ async fn s3_scaling_perf_stack() {
          (a.p50={:.2}ms, d.p50={:.2}ms)",
         speedup,
         speedup_bar,
-        if latency_regime { "latency" } else { "loopback" },
+        if latency_regime {
+            "latency"
+        } else {
+            "loopback"
+        },
         dist_a.p50_ms,
         dist_d.p50_ms,
     );

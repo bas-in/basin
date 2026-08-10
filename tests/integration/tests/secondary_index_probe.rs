@@ -84,7 +84,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -173,7 +177,12 @@ async fn seed_partitioned(
         let mut stmt = String::with_capacity(rows_per_part as usize * 28);
         stmt.push_str(&format!("INSERT INTO {table} VALUES "));
         // Two sentinel rows pin this file's bucket zone-map to [MIN, MAX].
-        stmt.push_str(&format!("({},{},{BUCKET_MIN},{}),", base, base % 1_000, base));
+        stmt.push_str(&format!(
+            "({},{},{BUCKET_MIN},{}),",
+            base,
+            base % 1_000,
+            base
+        ));
         stmt.push_str(&format!(
             "({},{},{BUCKET_MAX},{}),",
             base + 1,
@@ -359,7 +368,10 @@ async fn secondary_index_probe() {
         .unwrap_or_else(|e| panic!("CREATE INDEX bucket on t_indexed: {e}"));
 
     // Warm-up the spread path before timing.
-    let _ = sess.execute("SELECT * FROM t_indexed WHERE user_id = 42").await.unwrap();
+    let _ = sess
+        .execute("SELECT * FROM t_indexed WHERE user_id = 42")
+        .await
+        .unwrap();
 
     // ── SPREAD case (user_id): index present, pruning structurally idle ───────
     //
@@ -412,7 +424,9 @@ async fn secondary_index_probe() {
     // make every file's bucket zone-map span [MIN, MAX], so min/max pruning
     // cannot help here — this is a true full scan.
     let _ = sess
-        .execute(&format!("SELECT * FROM t_part WHERE bucket = {probe_bucket}"))
+        .execute(&format!(
+            "SELECT * FROM t_part WHERE bucket = {probe_bucket}"
+        ))
         .await
         .unwrap();
     let (part_base_p50, part_base_p99) =
@@ -428,7 +442,9 @@ async fn secondary_index_probe() {
         .await
         .unwrap_or_else(|e| panic!("CREATE INDEX bucket on t_part: {e}"));
     let _ = sess
-        .execute(&format!("SELECT * FROM t_part WHERE bucket = {probe_bucket}"))
+        .execute(&format!(
+            "SELECT * FROM t_part WHERE bucket = {probe_bucket}"
+        ))
         .await
         .unwrap();
 

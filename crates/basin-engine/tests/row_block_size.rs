@@ -93,11 +93,7 @@ async fn vortex_row_block_size_round_trip() {
          WITH (basin.file_format='vortex', basin.row_block_size=512)",
     )
     .await;
-    exec_ok(
-        &sess,
-        "INSERT INTO v (id, val) VALUES (10, 'x'), (20, 'y')",
-    )
-    .await;
+    exec_ok(&sess, "INSERT INTO v (id, val) VALUES (10, 'x'), (20, 'y')").await;
 
     let batches = rows(&sess, "SELECT id, val FROM v ORDER BY id").await;
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -201,8 +197,7 @@ async fn absent_option_defaults_to_none() {
         .await
         .unwrap();
     assert_eq!(
-        meta.row_block_size,
-        None,
+        meta.row_block_size, None,
         "catalog must carry None when option is absent"
     );
 

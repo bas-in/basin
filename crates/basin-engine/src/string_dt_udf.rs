@@ -1171,9 +1171,8 @@ static REGEX_CACHE: OnceLock<Mutex<RegexCache>> = OnceLock::new();
 
 fn regex_cache() -> &'static Mutex<RegexCache> {
     REGEX_CACHE.get_or_init(|| {
-        let cap = std::num::NonZeroUsize::new(regex_cache_cap()).unwrap_or(
-            std::num::NonZeroUsize::new(DEFAULT_REGEX_CACHE_CAP).unwrap(),
-        );
+        let cap = std::num::NonZeroUsize::new(regex_cache_cap())
+            .unwrap_or(std::num::NonZeroUsize::new(DEFAULT_REGEX_CACHE_CAP).unwrap());
         Mutex::new(lru::LruCache::new(cap))
     })
 }
@@ -1184,13 +1183,8 @@ fn regex_cache() -> &'static Mutex<RegexCache> {
 /// (astronomically unlikely) would simply yield a wrong but non-silent result
 /// (the regex match would fail or succeed differently), so the tradeoff is fine.
 /// `flags` must be the normalised flag string (e.g. `"i"`, `"gi"`, `""`).
-pub(crate) fn get_or_compile_regex(
-    pattern: &str,
-    flags: &str,
-) -> DFResult<Arc<regex::Regex>> {
-    let key = xxhash_rust::xxh3::xxh3_64(
-        format!("{pattern}\x00{flags}").as_bytes(),
-    );
+pub(crate) fn get_or_compile_regex(pattern: &str, flags: &str) -> DFResult<Arc<regex::Regex>> {
+    let key = xxhash_rust::xxh3::xxh3_64(format!("{pattern}\x00{flags}").as_bytes());
     let cache = regex_cache();
     {
         let mut guard = cache.lock().expect("regex cache mutex poisoned");
@@ -1260,7 +1254,10 @@ mod regex_cache_tests {
     fn regex_cache_hit_returns_same_arc() {
         let a = get_or_compile_regex("[0-9]+", "").unwrap();
         let b = get_or_compile_regex("[0-9]+", "").unwrap();
-        assert!(Arc::ptr_eq(&a, &b), "second lookup must return the cached Arc");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "second lookup must return the cached Arc"
+        );
     }
 
     #[test]

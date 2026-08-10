@@ -113,7 +113,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage: storage.clone(),
@@ -238,7 +242,9 @@ async fn run_ts_ingest(rows: i64, batch: i64) {
     // create_hypertable is accepted-DDL on Basin (ext_bench_timescale.rs). If
     // rejected, we ingest into the plain table and record hypertable_ok=false.
     let hypertable_ok = sess
-        .execute("SELECT create_hypertable('metrics', 'ts', chunk_time_interval => INTERVAL '1 day')")
+        .execute(
+            "SELECT create_hypertable('metrics', 'ts', chunk_time_interval => INTERVAL '1 day')",
+        )
         .await
         .is_ok();
     if !hypertable_ok {
@@ -288,7 +294,9 @@ async fn run_ts_ingest(rows: i64, batch: i64) {
     }
     let ingest_s = seed_started.elapsed().as_secs_f64();
     let sustained_rate = rows as f64 / ingest_s.max(1e-9);
-    eprintln!("[ts-ingest] sustained ingest: {rows} rows in {ingest_s:.1}s = {sustained_rate:.0} rows/s");
+    eprintln!(
+        "[ts-ingest] sustained ingest: {rows} rows in {ingest_s:.1}s = {sustained_rate:.0} rows/s"
+    );
 
     // ── Flush: WAL-tail-to-cold drain (the Timescale chunk-flush story) ──────
     let flush_started = Instant::now();
@@ -345,7 +353,10 @@ async fn run_ts_ingest(rows: i64, batch: i64) {
 
     // ── Artifact ─────────────────────────────────────────────────────────────
     let win_min = window_rates.iter().cloned().fold(f64::INFINITY, f64::min);
-    let win_max = window_rates.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let win_max = window_rates
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
     let win_median = median(&window_rates);
     let epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)

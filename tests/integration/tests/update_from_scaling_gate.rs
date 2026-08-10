@@ -88,7 +88,11 @@ async fn build() -> Built {
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -99,7 +103,9 @@ async fn build() -> Built {
 }
 
 async fn exec(sess: &ProjectSession, sql: &str) -> ExecResult {
-    sess.execute(sql).await.unwrap_or_else(|e| panic!("exec failed: {sql}\n  -> {e:?}"))
+    sess.execute(sql)
+        .await
+        .unwrap_or_else(|e| panic!("exec failed: {sql}\n  -> {e:?}"))
 }
 
 fn tag_of(res: &ExecResult) -> String {
@@ -188,7 +194,11 @@ async fn seed_events(sess: &ProjectSession, shard: &Shard, total_rows: i64) -> i
         id = hi;
         files += 1;
     }
-    exec(sess, "CREATE INDEX events_payload_gin ON events USING gin (payload)").await;
+    exec(
+        sess,
+        "CREATE INDEX events_payload_gin ON events USING gin (payload)",
+    )
+    .await;
     files
 }
 
@@ -292,7 +302,11 @@ async fn update_from_is_scale_invariant() {
             "non-matched row id={below} val must be untouched"
         );
         assert_eq!(
-            text_at(&sess, &format!("SELECT status FROM events WHERE id = {below}")).await,
+            text_at(
+                &sess,
+                &format!("SELECT status FROM events WHERE id = {below}")
+            )
+            .await,
             "pending",
             "non-matched row id={below} status must be untouched"
         );
@@ -311,9 +325,7 @@ async fn update_from_is_scale_invariant() {
              — a per-row-loop regression is >100× over this",
         );
 
-        println!(
-            "[update-from-gate] total={total} files={files} matched={MATCHED} t={ms:.1}ms"
-        );
+        println!("[update-from-gate] total={total} files={files} matched={MATCHED} t={ms:.1}ms");
 
         bg.shutdown().await;
         wal.close().await.unwrap();
@@ -422,13 +434,25 @@ async fn cold_point_delete_btree_is_pruned_and_correct() {
 
     // Five PKs scattered across distinct files (ROWS_PER_FILE apart).
     let ids: Vec<i64> = (0..5).map(|k| k * ROWS_PER_FILE + 123).collect();
-    let in_list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+    let in_list = ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let t0 = Instant::now();
-    let res = exec(&sess, &format!("DELETE FROM events WHERE id IN ({in_list})")).await;
+    let res = exec(
+        &sess,
+        &format!("DELETE FROM events WHERE id IN ({in_list})"),
+    )
+    .await;
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    assert_eq!(tag_of(&res), "DELETE 5", "must delete exactly the 5 scattered PKs");
+    assert_eq!(
+        tag_of(&res),
+        "DELETE 5",
+        "must delete exactly the 5 scattered PKs"
+    );
     assert_eq!(
         int_at(&sess, "SELECT COUNT(*) FROM events").await,
         total - 5,

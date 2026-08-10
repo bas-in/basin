@@ -85,10 +85,7 @@ fn ten_k_project_fuzz_heap_under_4_gib() {
     }
 
     // Global heap invariant.
-    let registry_total = projects
-        .iter()
-        .map(|p| reg.project_bytes(p))
-        .sum::<u64>();
+    let registry_total = projects.iter().map(|p| reg.project_bytes(p)).sum::<u64>();
 
     assert!(
         registry_total <= MAX_TOTAL_HEAP_BYTES,

@@ -94,10 +94,5 @@ fn bench_range_scan(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_insert,
-    bench_point_lookup,
-    bench_range_scan
-);
+criterion_group!(benches, bench_insert, bench_point_lookup, bench_range_scan);
 criterion_main!(benches);

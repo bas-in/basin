@@ -375,7 +375,10 @@ async fn check_pk_against_union(
     // Cold-tier scan.
     let pk_dt_for_tombstone =
         pk_arrow_dt_for_tombstone(&ctx.project, &ctx.table, ctx.catalog, pk_columns).await;
-    let data_files = ctx.storage.list_data_files_with_stats(&ctx.project, &ctx.table).await?;
+    let data_files = ctx
+        .storage
+        .list_data_files_with_stats(&ctx.project, &ctx.table)
+        .await?;
     for f in &data_files {
         let mut stream = ctx.storage.read_file(&ctx.project, &f.path).await?;
         while let Some(rb) = stream.next().await {
@@ -501,7 +504,10 @@ async fn check_unique_against_union(
 
     // Cold-tier scan.
     let pk_dt = pk_arrow_dt_for_tombstone(&ctx.project, &ctx.table, ctx.catalog, pk_columns).await;
-    let data_files = ctx.storage.list_data_files_with_stats(&ctx.project, &ctx.table).await?;
+    let data_files = ctx
+        .storage
+        .list_data_files_with_stats(&ctx.project, &ctx.table)
+        .await?;
     for f in &data_files {
         let mut stream = ctx.storage.read_file(&ctx.project, &f.path).await?;
         while let Some(rb) = stream.next().await {
@@ -847,11 +853,8 @@ mod tests {
             ]));
             let id_arr = Int64Array::from(vec![id]);
             let name_arr = StringArray::from(vec![name]);
-            let batch = RecordBatch::try_new(
-                schema,
-                vec![Arc::new(id_arr), Arc::new(name_arr)],
-            )
-            .unwrap();
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(name_arr)]).unwrap();
             let part = PartitionKey::default_key();
             let df = self
                 .storage
@@ -888,17 +891,13 @@ mod tests {
             ]));
             let id_arr = Int64Array::from(vec![id]);
             let name_arr = StringArray::from(vec![name]);
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(id_arr), Arc::new(name_arr)],
-            )
-            .unwrap();
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(id_arr), Arc::new(name_arr)])
+                    .unwrap();
             let bytes = encode_batch_ipc(&batch);
             let key = RowKey::builder().append_i64(id).finish();
             let entry = self.registry.get_or_create(self.project, table.clone());
-            entry
-                .memtable
-                .insert(key, MemRowValue::row(bytes, 0));
+            entry.memtable.insert(key, MemRowValue::row(bytes, 0));
         }
 
         /// Write a tombstone keyed by the single-column id into the memtable.
@@ -949,14 +948,10 @@ mod tests {
         fx.cold_insert(&table, 1, Some("alice")).await;
         let meta = fx.catalog.load_table(&fx.project, &table).await.unwrap();
         let batch = new_row_batch(2, Some("alice"));
-        let err = check_constraints_memtable_and_cold(
-            &fx.ctx(&table),
-            &meta,
-            &batch,
-            &WriteKind::Insert,
-        )
-        .await
-        .unwrap_err();
+        let err =
+            check_constraints_memtable_and_cold(&fx.ctx(&table), &meta, &batch, &WriteKind::Insert)
+                .await
+                .unwrap_err();
         assert!(matches!(err, BasinError::UniqueViolation(_)), "got {err:?}");
     }
 
@@ -980,14 +975,10 @@ mod tests {
         fx.hot_insert(&table, 1, Some("alice"));
         let meta = fx.catalog.load_table(&fx.project, &table).await.unwrap();
         let batch = new_row_batch(2, Some("alice"));
-        let err = check_constraints_memtable_and_cold(
-            &fx.ctx(&table),
-            &meta,
-            &batch,
-            &WriteKind::Insert,
-        )
-        .await
-        .unwrap_err();
+        let err =
+            check_constraints_memtable_and_cold(&fx.ctx(&table), &meta, &batch, &WriteKind::Insert)
+                .await
+                .unwrap_err();
         assert!(matches!(err, BasinError::UniqueViolation(_)), "got {err:?}");
     }
 
@@ -1013,13 +1004,9 @@ mod tests {
         // A new row with the same UNIQUE value as the now-tombstoned cold
         // row must pass.
         let batch = new_row_batch(2, Some("alice"));
-        let res = check_constraints_memtable_and_cold(
-            &fx.ctx(&table),
-            &meta,
-            &batch,
-            &WriteKind::Insert,
-        )
-        .await;
+        let res =
+            check_constraints_memtable_and_cold(&fx.ctx(&table), &meta, &batch, &WriteKind::Insert)
+                .await;
         assert!(res.is_ok(), "expected Ok, got {res:?}");
     }
 
@@ -1034,14 +1021,10 @@ mod tests {
         fx.hot_insert(&table, 7, Some("anything"));
         let meta = fx.catalog.load_table(&fx.project, &table).await.unwrap();
         let batch = new_row_batch(7, Some("different"));
-        let err = check_constraints_memtable_and_cold(
-            &fx.ctx(&table),
-            &meta,
-            &batch,
-            &WriteKind::Insert,
-        )
-        .await
-        .unwrap_err();
+        let err =
+            check_constraints_memtable_and_cold(&fx.ctx(&table), &meta, &batch, &WriteKind::Insert)
+                .await
+                .unwrap_err();
         // PK collisions surface as UniqueViolation (SQLSTATE 23505) — no
         // separate PrimaryKeyViolation variant in basin_common.
         assert!(matches!(err, BasinError::UniqueViolation(_)), "got {err:?}");
@@ -1081,14 +1064,10 @@ mod tests {
         // Try to insert into orders with id=1 — must fail because users:1 is
         // tombstoned.
         let batch = new_row_batch(1, Some("o1"));
-        let err = check_constraints_memtable_and_cold(
-            &fx.ctx(&child),
-            &meta,
-            &batch,
-            &WriteKind::Insert,
-        )
-        .await
-        .unwrap_err();
+        let err =
+            check_constraints_memtable_and_cold(&fx.ctx(&child), &meta, &batch, &WriteKind::Insert)
+                .await
+                .unwrap_err();
         assert!(
             matches!(err, BasinError::ForeignKeyViolation(_)),
             "got {err:?}"
@@ -1123,13 +1102,9 @@ mod tests {
             .await;
         let meta = fx.catalog.load_table(&fx.project, &child).await.unwrap();
         let batch = new_row_batch(1, Some("o1"));
-        let res = check_constraints_memtable_and_cold(
-            &fx.ctx(&child),
-            &meta,
-            &batch,
-            &WriteKind::Insert,
-        )
-        .await;
+        let res =
+            check_constraints_memtable_and_cold(&fx.ctx(&child), &meta, &batch, &WriteKind::Insert)
+                .await;
         assert!(res.is_ok(), "expected Ok, got {res:?}");
     }
 
@@ -1162,13 +1137,9 @@ mod tests {
             .await;
         let meta = fx.catalog.load_table(&fx.project, &child).await.unwrap();
         let batch = new_row_batch(42, Some("o42"));
-        let res = check_constraints_memtable_and_cold(
-            &fx.ctx(&child),
-            &meta,
-            &batch,
-            &WriteKind::Insert,
-        )
-        .await;
+        let res =
+            check_constraints_memtable_and_cold(&fx.ctx(&child), &meta, &batch, &WriteKind::Insert)
+                .await;
         assert!(res.is_ok(), "expected Ok, got {res:?}");
     }
 

@@ -44,11 +44,11 @@ fn malformed_jwt_rejected() {
     for junk in [
         "",
         "not-a-token",
-        "aaa.bbb",                            // only 2 segments
-        "aaa.bbb.ccc.ddd",                    // 4 segments
-        "...",                                // empty segments
-        "\0\0\0.\0\0\0.\0\0\0",               // NULs
-        "💣.💣.💣",                              // multibyte garbage
+        "aaa.bbb",              // only 2 segments
+        "aaa.bbb.ccc.ddd",      // 4 segments
+        "...",                  // empty segments
+        "\0\0\0.\0\0\0.\0\0\0", // NULs
+        "💣.💣.💣",             // multibyte garbage
     ] {
         assert!(
             keys.verify(junk).is_err(),

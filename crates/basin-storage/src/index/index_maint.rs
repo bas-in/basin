@@ -79,7 +79,10 @@ impl<'a, R: GinRegistry> GinPostingListMaintainer<'a, R> {
             .filter(|idx| idx.access_method == "gin" && idx.columns.len() == 1)
             .map(|idx| {
                 let col = idx.columns[0].clone();
-                let opclass = idx.opclass.clone().unwrap_or_else(|| "jsonb_ops".to_string());
+                let opclass = idx
+                    .opclass
+                    .clone()
+                    .unwrap_or_else(|| "jsonb_ops".to_string());
                 (col, opclass)
             })
             .collect();
@@ -87,7 +90,12 @@ impl<'a, R: GinRegistry> GinPostingListMaintainer<'a, R> {
         if gin_columns.is_empty() {
             return None;
         }
-        Some(Self { registry, project, table, gin_columns })
+        Some(Self {
+            registry,
+            project,
+            table,
+            gin_columns,
+        })
     }
 
     /// Remove all posting entries for `file_path`.
@@ -96,7 +104,8 @@ impl<'a, R: GinRegistry> GinPostingListMaintainer<'a, R> {
     /// AllMatch UPDATE where the file is replaced).
     pub fn on_file_removed(&self, file_path: &str) {
         for (col, _opclass) in &self.gin_columns {
-            self.registry.remove_file(self.project, self.table, col, file_path);
+            self.registry
+                .remove_file(self.project, self.table, col, file_path);
         }
     }
 
@@ -116,7 +125,8 @@ impl<'a, R: GinRegistry> GinPostingListMaintainer<'a, R> {
         for (col, opclass) in &self.gin_columns {
             // Purge old entries first so there's no window where both old and
             // new entries co-exist in the posting list.
-            self.registry.remove_file(self.project, self.table, col, old_file_path);
+            self.registry
+                .remove_file(self.project, self.table, col, old_file_path);
             // Rebuild from the replacement batches.
             self.registry.rebuild_file_entries(
                 self.project,

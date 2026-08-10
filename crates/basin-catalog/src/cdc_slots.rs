@@ -114,7 +114,9 @@ pub enum CdcSlotError {
 /// Validate a slot registration: non-empty name, known plugin token.
 pub fn validate_registration(slot_name: &str, plugin: &str) -> Result<(), CdcSlotError> {
     if slot_name.trim().is_empty() {
-        return Err(CdcSlotError::InvalidName("slot name must be non-empty".into()));
+        return Err(CdcSlotError::InvalidName(
+            "slot name must be non-empty".into(),
+        ));
     }
     // Postgres slot names are lower-case alnum + underscore; we accept the same
     // so a name minted here round-trips through a PG-shaped consumer.

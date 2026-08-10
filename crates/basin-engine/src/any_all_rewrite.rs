@@ -37,14 +37,16 @@
 
 use std::sync::Arc;
 
-use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
+use datafusion::common::{
+    tree_node::{Transformed, TreeNode},
+    Column, Result,
+};
 use datafusion::logical_expr::{
-    Expr, LogicalPlan, LogicalPlanBuilder, Operator,
     expr::{BinaryExpr, Case, SetComparison, SetQuantifier},
     expr_fn::scalar_subquery,
-    lit,
+    lit, Expr, LogicalPlan, LogicalPlanBuilder, Operator,
 };
-use datafusion::common::{Column, Result, tree_node::{Transformed, TreeNode}};
+use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 /// Whether we use MIN or MAX for a given `(quantifier, op)` pair.
 #[derive(Debug, Clone, Copy)]
@@ -143,10 +145,7 @@ fn try_rewrite(set_cmp: SetComparison) -> Result<Transformed<Expr>> {
 
     // 5. Column reference for the single output field of the subquery.
     let (qualifier, field) = subq_schema.qualified_field(0);
-    let col_expr = Expr::Column(Column::new(
-        qualifier.map(|q| q.clone()),
-        field.name(),
-    ));
+    let col_expr = Expr::Column(Column::new(qualifier.map(|q| q.clone()), field.name()));
 
     // 6. Wrap the subquery plan in Aggregate(agg(col)).
     let agg_expr = match agg_kind {
@@ -229,15 +228,13 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::logical_expr::{
-        lit,
-        logical_plan::builder::LogicalTableSource,
-        LogicalPlan, LogicalPlanBuilder,
-    };
-    use datafusion::logical_expr::expr::{BinaryExpr, SetComparison, SetQuantifier};
-    use datafusion::logical_expr::Operator;
     use datafusion::common::tree_node::Transformed;
     use datafusion::common::Column;
+    use datafusion::logical_expr::expr::{BinaryExpr, SetComparison, SetQuantifier};
+    use datafusion::logical_expr::Operator;
+    use datafusion::logical_expr::{
+        lit, logical_plan::builder::LogicalTableSource, LogicalPlan, LogicalPlanBuilder,
+    };
 
     /// Build a simple in-memory table scan for testing.
     fn make_scan(table: &str, fields: Vec<(&str, DataType)>) -> Arc<LogicalPlan> {
@@ -257,9 +254,7 @@ mod tests {
     }
 
     /// Build a `Subquery` wrapper (uncorrelated) around a plan.
-    fn make_subquery(
-        plan: Arc<LogicalPlan>,
-    ) -> datafusion::logical_expr::logical_plan::Subquery {
+    fn make_subquery(plan: Arc<LogicalPlan>) -> datafusion::logical_expr::logical_plan::Subquery {
         datafusion::logical_expr::logical_plan::Subquery {
             subquery: plan,
             outer_ref_columns: vec![],
@@ -317,7 +312,10 @@ mod tests {
 
         // The subquery plan must be an Aggregate.
         let LogicalPlan::Aggregate(agg) = sq.subquery.as_ref() else {
-            panic!("Expected Aggregate in ScalarSubquery, got: {:?}", sq.subquery);
+            panic!(
+                "Expected Aggregate in ScalarSubquery, got: {:?}",
+                sq.subquery
+            );
         };
 
         // The aggregate expression must contain "min".

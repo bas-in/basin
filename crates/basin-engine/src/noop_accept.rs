@@ -146,7 +146,11 @@ pub(crate) fn try_accept_as_noop(kind: StmtKind, sql: &str) -> Option<ExecResult
         // divergence as the `Deallocate` arm above. The tag echoes the
         // variant (PG replies `DISCARD ALL`, `DISCARD PLANS`, …).
         StmtKind::Discard => {
-            let upper = sql.trim().trim_end_matches(';').trim_end().to_ascii_uppercase();
+            let upper = sql
+                .trim()
+                .trim_end_matches(';')
+                .trim_end()
+                .to_ascii_uppercase();
             let tag = match upper.as_str() {
                 "DISCARD PLANS" => "DISCARD PLANS",
                 "DISCARD SEQUENCES" => "DISCARD SEQUENCES",

@@ -1470,9 +1470,7 @@ pub fn reject_unsupported(tree: &ParseTree) -> Result<()> {
                 .collect();
             // Only reject if there are exclusion constraints AND at least one
             // uses an index method OTHER than gist (the unsupported case).
-            let has_non_gist_exclusion = exclusions
-                .iter()
-                .any(|m| !m.eq_ignore_ascii_case("gist"));
+            let has_non_gist_exclusion = exclusions.iter().any(|m| !m.eq_ignore_ascii_case("gist"));
             if has_non_gist_exclusion {
                 return Err(BasinError::FeatureNotSupported(
                     "EXCLUDE constraint is not supported (SQLSTATE 0A000): \
@@ -2624,7 +2622,7 @@ fn parse_curly_array_cast(inner: &str) -> Option<String> {
     }
     let q_end = q_end?;
     let body = &inner[1..q_end]; // between the quotes
-    // Body must be `{…}`.
+                                 // Body must be `{…}`.
     if !(body.starts_with('{') && body.ends_with('}')) {
         return None;
     }
@@ -2645,9 +2643,7 @@ fn parse_curly_array_cast(inner: &str) -> Option<String> {
     // `int4`, `int8`, `text`, `varchar`). Stop at `[`.
     let tn_bytes = after.as_bytes();
     let mut k = 0usize;
-    while k < tn_bytes.len()
-        && (tn_bytes[k].is_ascii_alphanumeric() || tn_bytes[k] == b'_')
-    {
+    while k < tn_bytes.len() && (tn_bytes[k].is_ascii_alphanumeric() || tn_bytes[k] == b'_') {
         k += 1;
     }
     if k == 0 {
@@ -2685,7 +2681,10 @@ mod any_curly_array_tests {
         let sql = "SELECT id FROM t WHERE id = ANY('{1,2,3}'::int[])";
         let out = lower(sql);
         assert!(out.contains("IN (1,2,3)"), "got: {out}");
-        assert!(!out.to_ascii_lowercase().contains("any"), "ANY should be gone: {out}");
+        assert!(
+            !out.to_ascii_lowercase().contains("any"),
+            "ANY should be gone: {out}"
+        );
     }
 
     #[test]

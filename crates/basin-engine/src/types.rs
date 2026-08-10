@@ -927,9 +927,9 @@ pub(crate) fn arrow_data_type(sql: &SqlDataType) -> Result<DataType> {
                 // these bytes as a POINT logical value rather than opaque
                 // bytea. ST_MakePoint / ST_X / ST_Y UDFs in `geo_glue` round-
                 // trip the same 21-byte encoding.
-                "POINT" if modifiers.is_empty() => Ok(DataType::FixedSizeBinary(
-                    basin_geo::POINT_WKB_LEN as i32,
-                )),
+                "POINT" if modifiers.is_empty() => {
+                    Ok(DataType::FixedSizeBinary(basin_geo::POINT_WKB_LEN as i32))
+                }
                 // ── GEOMETRY(POINT [, srid]) ─────────────────────────────
                 // PostGIS-style parameterised geometry. Today we accept
                 // exactly the POINT subtype; LineString / Polygon are
@@ -1116,9 +1116,7 @@ pub(crate) struct GeometryModifiers {
 /// missing subtype, non-integer SRID, too many modifiers). Keeping the
 /// surface narrow now means a future widening to LineString/Polygon is
 /// an additive change here rather than a parser revamp.
-pub(crate) fn parse_geometry_modifiers(
-    modifiers: &[String],
-) -> Result<GeometryModifiers> {
+pub(crate) fn parse_geometry_modifiers(modifiers: &[String]) -> Result<GeometryModifiers> {
     if modifiers.is_empty() || modifiers.len() > 2 {
         return Err(BasinError::InvalidSchema(format!(
             "GEOMETRY type: expected GEOMETRY(POINT) or GEOMETRY(POINT, srid), got {} modifier(s)",
@@ -1163,7 +1161,9 @@ pub(crate) fn geometry_srid_marker(sql: &SqlDataType) -> Option<u32> {
     if kw != "GEOMETRY" {
         return None;
     }
-    parse_geometry_modifiers(modifiers).ok().and_then(|m| m.srid)
+    parse_geometry_modifiers(modifiers)
+        .ok()
+        .and_then(|m| m.srid)
 }
 
 /// Pull the dimensionality out of `vector(N)`'s modifier list. sqlparser

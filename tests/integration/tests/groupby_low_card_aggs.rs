@@ -131,13 +131,19 @@ async fn groupby_sum_count_avg_with_nulls_is_exact() {
     // Output schema: DataFusion-equivalent names / types / nullability.
     if let ExecResult::Rows { schema, .. } = &res {
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, vec!["k", "count(*)", "sum(t.v)", "count(t.v)", "avg(t.v)"]);
+        assert_eq!(
+            names,
+            vec!["k", "count(*)", "sum(t.v)", "count(t.v)", "avg(t.v)"]
+        );
         assert_eq!(schema.field(1).data_type(), &arrow_schema::DataType::Int64);
         assert!(!schema.field(1).is_nullable()); // count(*)
         assert_eq!(schema.field(2).data_type(), &arrow_schema::DataType::Int64);
         assert!(schema.field(2).is_nullable()); // sum(int) nullable
         assert!(!schema.field(3).is_nullable()); // count(col)
-        assert_eq!(schema.field(4).data_type(), &arrow_schema::DataType::Float64);
+        assert_eq!(
+            schema.field(4).data_type(),
+            &arrow_schema::DataType::Float64
+        );
         assert!(schema.field(4).is_nullable()); // avg
     }
 
@@ -181,9 +187,15 @@ async fn groupby_float_sum_avg_with_nulls_is_exact() {
     if let ExecResult::Rows { schema, .. } = &res {
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["k", "sum(t.f)", "avg(t.f)"]);
-        assert_eq!(schema.field(1).data_type(), &arrow_schema::DataType::Float64);
+        assert_eq!(
+            schema.field(1).data_type(),
+            &arrow_schema::DataType::Float64
+        );
         assert!(schema.field(1).is_nullable());
-        assert_eq!(schema.field(2).data_type(), &arrow_schema::DataType::Float64);
+        assert_eq!(
+            schema.field(2).data_type(),
+            &arrow_schema::DataType::Float64
+        );
     }
 
     let rows = collect_rows(&res);

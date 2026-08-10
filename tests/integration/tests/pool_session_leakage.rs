@@ -123,7 +123,9 @@ async fn set_local_does_not_survive_pool_return() {
         let leased = pool.acquire(project, None).await.unwrap();
         let s = leased.session();
         s.execute("BEGIN").await.unwrap();
-        s.execute("SET LOCAL search_path = 'leakage_sentinel'").await.unwrap();
+        s.execute("SET LOCAL search_path = 'leakage_sentinel'")
+            .await
+            .unwrap();
         s.execute("COMMIT").await.unwrap();
     }
 
@@ -133,17 +135,16 @@ async fn set_local_does_not_survive_pool_return() {
         let s = leased.session();
         let result = s.execute("SHOW search_path").await.unwrap();
         let path = match &result {
-            ExecResult::Rows { batches, .. } => {
-                batches.iter()
-                    .flat_map(|b| {
-                        b.column(0)
-                            .as_any()
-                            .downcast_ref::<arrow_array::StringArray>()
-                            .map(|a| a.value(0).to_string())
-                    })
-                    .next()
-                    .unwrap_or_default()
-            }
+            ExecResult::Rows { batches, .. } => batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                        .map(|a| a.value(0).to_string())
+                })
+                .next()
+                .unwrap_or_default(),
             ExecResult::Empty { .. } => String::new(),
         };
         assert!(
@@ -177,8 +178,12 @@ async fn open_cursor_does_not_survive_pool_return() {
     {
         let leased = pool.acquire(project, None).await.unwrap();
         let s = leased.session();
-        s.execute("CREATE TABLE leak_rows (id BIGINT)").await.unwrap();
-        s.execute("INSERT INTO leak_rows VALUES (1), (2)").await.unwrap();
+        s.execute("CREATE TABLE leak_rows (id BIGINT)")
+            .await
+            .unwrap();
+        s.execute("INSERT INTO leak_rows VALUES (1), (2)")
+            .await
+            .unwrap();
     }
 
     // Checkout 1: declare cursor, commit (does NOT close cursor in session-mode).
@@ -186,7 +191,9 @@ async fn open_cursor_does_not_survive_pool_return() {
         let leased = pool.acquire(project, None).await.unwrap();
         let s = leased.session();
         s.execute("BEGIN").await.unwrap();
-        s.execute("DECLARE leaked_cur CURSOR FOR SELECT id FROM leak_rows").await.unwrap();
+        s.execute("DECLARE leaked_cur CURSOR FOR SELECT id FROM leak_rows")
+            .await
+            .unwrap();
         s.execute("COMMIT").await.unwrap();
         // In txn-mode pool, COMMIT + return should destroy the cursor.
     }
@@ -249,9 +256,13 @@ async fn listen_subscription_does_not_survive_pool_return() {
         let s = leased.session();
         // pg_listening_channels() returns the set of channels this session
         // is listening on. It must be empty.
-        let result = s.execute("SELECT * FROM pg_listening_channels()").await.unwrap();
+        let result = s
+            .execute("SELECT * FROM pg_listening_channels()")
+            .await
+            .unwrap();
         assert_eq!(
-            row_count(&result), 0,
+            row_count(&result),
+            0,
             "5.27.E CONTRACT VIOLATION: LISTEN subscription 'leaked_channel' \
              survived pool return. \
              Implement UNLISTEN * in reset_for_pool_return() (Phase 5.27.E)."
@@ -292,21 +303,23 @@ async fn advisory_lock_does_not_survive_pool_return() {
     {
         let leased = pool.acquire(project, None).await.unwrap();
         let s = leased.session();
-        let result = s.execute("SELECT pg_try_advisory_lock(12345)").await.unwrap();
+        let result = s
+            .execute("SELECT pg_try_advisory_lock(12345)")
+            .await
+            .unwrap();
         // pg_try_advisory_lock returns TRUE if the lock was successfully acquired.
         // If the previous checkout still holds it, this returns FALSE.
         let acquired = match &result {
-            ExecResult::Rows { batches, .. } => {
-                batches.iter()
-                    .flat_map(|b| {
-                        b.column(0)
-                            .as_any()
-                            .downcast_ref::<arrow_array::BooleanArray>()
-                            .map(|a| a.value(0))
-                    })
-                    .next()
-                    .unwrap_or(false)
-            }
+            ExecResult::Rows { batches, .. } => batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<arrow_array::BooleanArray>()
+                        .map(|a| a.value(0))
+                })
+                .next()
+                .unwrap_or(false),
             ExecResult::Empty { .. } => false,
         };
         assert!(
@@ -352,8 +365,12 @@ async fn temp_table_does_not_survive_pool_return() {
     {
         let leased = pool.acquire(project, None).await.unwrap();
         let s = leased.session();
-        s.execute("CREATE TEMP TABLE leaked_temp (val TEXT)").await.unwrap();
-        s.execute("INSERT INTO leaked_temp VALUES ('secret_row')").await.unwrap();
+        s.execute("CREATE TEMP TABLE leaked_temp (val TEXT)")
+            .await
+            .unwrap();
+        s.execute("INSERT INTO leaked_temp VALUES ('secret_row')")
+            .await
+            .unwrap();
     }
 
     // Checkout 2: the temp table must not be visible.

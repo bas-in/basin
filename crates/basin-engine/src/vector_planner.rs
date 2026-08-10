@@ -1039,9 +1039,8 @@ mod tests {
 
     #[test]
     fn parse_hnsw_params_zero_is_error() {
-        let with = parse_with(
-            "CREATE INDEX i ON t USING hnsw (embedding vector_l2_ops) WITH (m = 0)",
-        );
+        let with =
+            parse_with("CREATE INDEX i ON t USING hnsw (embedding vector_l2_ops) WITH (m = 0)");
         assert!(parse_hnsw_with_params(&with).is_err());
     }
 

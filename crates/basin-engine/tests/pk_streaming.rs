@@ -24,7 +24,11 @@ fn engine_in(dir: &TempDir) -> Engine {
         page_cache: None,
     });
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
-    Engine::new(EngineConfig { storage, catalog, shard: None })
+    Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    })
 }
 
 fn row(id: i64, x: i64) -> Vec<Option<String>> {
@@ -44,7 +48,9 @@ async fn pk_streaming_is_correct() {
     let cols = vec!["id".to_string(), "x".to_string()];
 
     sess.execute("DROP TABLE IF EXISTS t").await.unwrap();
-    sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, x INT)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, x INT)")
+        .await
+        .unwrap();
 
     // Seed ids 1..=30_000 across 3 separate chunks (each becomes its own data
     // file). Every chunk after the first runs the streaming check against the
@@ -101,7 +107,10 @@ async fn pk_streaming_is_correct() {
         }
         _ => -1,
     };
-    assert_eq!(cnt, 30_001, "final row count after rejected dups + one insert");
+    assert_eq!(
+        cnt, 30_001,
+        "final row count after rejected dups + one insert"
+    );
 }
 
 /// Per-chunk PK enforcement cost must stay independent of table size for an
@@ -133,7 +142,9 @@ async fn pk_ascending_files_carry_pk_zonemap() {
     let cols = vec!["id".to_string(), "x".to_string()];
 
     sess.execute("DROP TABLE IF EXISTS t").await.unwrap();
-    sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, x INT)").await.unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, x INT)")
+        .await
+        .unwrap();
 
     // Load 5 ascending chunks of 10k rows each (ids 1..=50_000). Each chunk is
     // committed as its own data file with a disjoint, increasing PK range.
@@ -204,7 +215,10 @@ async fn pk_ascending_files_carry_pk_zonemap() {
     let err = sess
         .ingest_csv_batch("t", schema.clone(), Some(&cols), dup)
         .await;
-    assert!(err.is_err(), "a genuine duplicate PK (id=42) must still be rejected");
+    assert!(
+        err.is_err(),
+        "a genuine duplicate PK (id=42) must still be rejected"
+    );
 }
 
 /// #78: the streaming existence check must stay correct with the batch

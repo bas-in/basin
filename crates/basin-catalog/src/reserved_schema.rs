@@ -180,13 +180,25 @@ mod tests {
 
     #[test]
     fn from_str_all_reserved_schemas() {
-        assert_eq!(ReservedSchema::from_str("public"), Some(ReservedSchema::Public));
+        assert_eq!(
+            ReservedSchema::from_str("public"),
+            Some(ReservedSchema::Public)
+        );
         assert_eq!(ReservedSchema::from_str("auth"), Some(ReservedSchema::Auth));
-        assert_eq!(ReservedSchema::from_str("storage"), Some(ReservedSchema::Storage));
+        assert_eq!(
+            ReservedSchema::from_str("storage"),
+            Some(ReservedSchema::Storage)
+        );
         assert_eq!(ReservedSchema::from_str("cron"), Some(ReservedSchema::Cron));
         assert_eq!(ReservedSchema::from_str("net"), Some(ReservedSchema::Net));
-        assert_eq!(ReservedSchema::from_str("realtime"), Some(ReservedSchema::Realtime));
-        assert_eq!(ReservedSchema::from_str("pg_catalog"), Some(ReservedSchema::PgCatalog));
+        assert_eq!(
+            ReservedSchema::from_str("realtime"),
+            Some(ReservedSchema::Realtime)
+        );
+        assert_eq!(
+            ReservedSchema::from_str("pg_catalog"),
+            Some(ReservedSchema::PgCatalog)
+        );
         assert_eq!(
             ReservedSchema::from_str("information_schema"),
             Some(ReservedSchema::InformationSchema)
@@ -262,7 +274,10 @@ mod tests {
         assert_eq!(resolve_schema(Some("net")).as_str(), "net");
         assert_eq!(resolve_schema(Some("realtime")).as_str(), "realtime");
         assert_eq!(resolve_schema(Some("pg_catalog")).as_str(), "pg_catalog");
-        assert_eq!(resolve_schema(Some("information_schema")).as_str(), "information_schema");
+        assert_eq!(
+            resolve_schema(Some("information_schema")).as_str(),
+            "information_schema"
+        );
     }
 
     #[test]

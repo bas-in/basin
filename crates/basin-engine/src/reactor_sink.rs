@@ -106,7 +106,9 @@ impl ReactorSink {
             let session = engine.open_session_as(project, user).await?;
             session.execute(&sql).await
         });
-        handle.await.map_err(|e| BasinError::internal(format!("reactor task panicked: {e}")))?
+        handle
+            .await
+            .map_err(|e| BasinError::internal(format!("reactor task panicked: {e}")))?
     }
 
     /// Evaluate the (rewritten) predicate by wrapping it in

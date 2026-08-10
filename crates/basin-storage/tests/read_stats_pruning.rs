@@ -442,7 +442,10 @@ async fn list_with_catalog_stats_skips_footer_gets() {
     let catalog = InMemoryCatalog::new();
     // Re-register into the SAME storage's attached catalog by building a fresh
     // storage that shares the counting store but a catalog we control.
-    catalog.create_table(&project, &table, &schema()).await.unwrap();
+    catalog
+        .create_table(&project, &table, &schema())
+        .await
+        .unwrap();
     register_files_in_catalog(&catalog, &project, &table, &written).await;
     let storage2 = Storage::new(StorageConfig {
         object_store: counting.clone(),
@@ -463,7 +466,8 @@ async fn list_with_catalog_stats_skips_footer_gets() {
         c.gets + c.range_gets + c.heads
     };
     assert_eq!(
-        catalog_io, 0,
+        catalog_io,
+        0,
         "catalog-stats listing must skip ALL footer fetches; counts={:?}",
         counting.snapshot()
     );
@@ -474,11 +478,7 @@ async fn list_with_catalog_stats_skips_footer_gets() {
     );
 
     // 5. Differential safety: catalog-stats listing == footer listing, per file.
-    assert_eq!(
-        catalog_listed.len(),
-        footer_listed.len(),
-        "same file count"
-    );
+    assert_eq!(catalog_listed.len(), footer_listed.len(), "same file count");
     let mut footer_by_path: std::collections::HashMap<String, &DataFile> = footer_listed
         .iter()
         .map(|f| (f.path.as_ref().to_string(), f))
@@ -518,7 +518,10 @@ async fn list_partial_catalog_stats_falls_back_per_file() {
 
     // Register only the FIRST two files in the catalog.
     let catalog = InMemoryCatalog::new();
-    catalog.create_table(&project, &table, &schema()).await.unwrap();
+    catalog
+        .create_table(&project, &table, &schema())
+        .await
+        .unwrap();
     register_files_in_catalog(&catalog, &project, &table, &written[..2]).await;
     let storage2 = Storage::new(StorageConfig {
         object_store: counting.clone(),
@@ -562,10 +565,7 @@ async fn list_partial_catalog_stats_falls_back_per_file() {
 #[tokio::test]
 async fn catalog_stats_roundtrip_postgres() {
     const PG_URL: &str = "host=127.0.0.1 port=5432 user=pc dbname=postgres";
-    let schema_name = format!(
-        "basin_test_a4_{}",
-        ulid_lower()
-    );
+    let schema_name = format!("basin_test_a4_{}", ulid_lower());
     let cat = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         PostgresCatalog::connect_with_schema(PG_URL, &schema_name),
@@ -615,7 +615,8 @@ async fn catalog_stats_roundtrip_postgres() {
     };
     assert_eq!(listed.len(), 3, "three files round-tripped from PG");
     assert_eq!(
-        io, 0,
+        io,
+        0,
         "PG-persisted stats must skip footer fetches too; counts={:?}",
         counting.snapshot()
     );

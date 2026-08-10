@@ -59,20 +59,23 @@ use arrow_array::{Array, ArrayRef, Decimal256Array, FixedSizeBinaryArray, Record
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::Result as DFResult;
-use datafusion::common::Statistics;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Precision;
+use datafusion::common::Result as DFResult;
+use datafusion::common::Statistics;
 use datafusion::datasource::file_format::FileFormat;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::execution::context::TaskContext;
+use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, LexRequirement};
-use datafusion_datasource::TableSchema;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::PhysicalExpr;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_format::FileMeta;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
-use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
+use datafusion_datasource::source::DataSourceExec;
+use datafusion_datasource::TableSchema;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -81,14 +84,11 @@ use datafusion_physical_plan::filter_pushdown::{
 };
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::SortOrderPushdownResult;
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties, Partitioning,
+    DisplayAs, DisplayFormatType, ExecutionPlanProperties, Partitioning, PlanProperties,
     SendableRecordBatchStream,
 };
-use datafusion_physical_plan::SortOrderPushdownResult;
-use datafusion::physical_expr::PhysicalSortExpr;
-use datafusion::execution::context::TaskContext;
-use datafusion::physical_plan::PhysicalExpr;
 use futures::stream::Stream;
 use object_store::{ObjectMeta, ObjectStore};
 
@@ -286,7 +286,9 @@ impl FileFormat for BasinVortexFormat {
         } else {
             self.inner.file_source(table_schema)
         };
-        Arc::new(UdfPushdownGuard { inner: inner_source })
+        Arc::new(UdfPushdownGuard {
+            inner: inner_source,
+        })
     }
 
     /// ADR-0024 + UDF guard: calls `VortexFormat::create_physical_plan` normally
@@ -323,7 +325,10 @@ impl FileFormat for BasinVortexFormat {
             conf
         };
 
-        let inner_plan = self.inner.create_physical_plan(state, unwrapped_conf).await?;
+        let inner_plan = self
+            .inner
+            .create_physical_plan(state, unwrapped_conf)
+            .await?;
 
         // Re-wrap the VortexSource inside the DataSourceExec with UdfPushdownGuard
         // so that the ProjectionPushdown optimizer (which runs after this method
@@ -406,7 +411,8 @@ impl FileSource for UdfPushdownGuard {
         base_config: &FileScanConfig,
         partition: usize,
     ) -> DFResult<Arc<dyn datafusion_datasource::file_stream::FileOpener>> {
-        self.inner.create_file_opener(object_store, base_config, partition)
+        self.inner
+            .create_file_opener(object_store, base_config, partition)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -457,9 +463,9 @@ impl FileSource for UdfPushdownGuard {
         // Delegate to the inner source and re-wrap the returned updated_node in
         // a new UdfPushdownGuard so the guard survives filter-pushdown rewrites.
         let inner_result = self.inner.try_pushdown_filters(filters, config)?;
-        let updated_node = inner_result.updated_node.map(|updated| {
-            Arc::new(UdfPushdownGuard { inner: updated }) as Arc<dyn FileSource>
-        });
+        let updated_node = inner_result
+            .updated_node
+            .map(|updated| Arc::new(UdfPushdownGuard { inner: updated }) as Arc<dyn FileSource>);
         Ok(FilterPushdownPropagation {
             filters: inner_result.filters,
             updated_node,
@@ -474,7 +480,9 @@ impl FileSource for UdfPushdownGuard {
         let result = self.inner.try_pushdown_sort(order, eq_properties)?;
         // Re-wrap any returned inner source in UdfPushdownGuard.
         Ok(result.map(|inner_source| {
-            Arc::new(UdfPushdownGuard { inner: inner_source }) as Arc<dyn FileSource>
+            Arc::new(UdfPushdownGuard {
+                inner: inner_source,
+            }) as Arc<dyn FileSource>
         }))
     }
 
@@ -521,7 +529,8 @@ fn rewrap_datasource_with_guard(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn Executi
         return plan;
     };
     // Already guarded — don't double-wrap.
-    if fsc.file_source()
+    if fsc
+        .file_source()
         .as_any()
         .downcast_ref::<UdfPushdownGuard>()
         .is_some()
@@ -660,8 +669,12 @@ fn swap_point_binary_to_fsb(schema: &Schema) -> Schema {
         .iter()
         .map(|f| {
             if field_is_point_binary(f) {
-                Field::new(f.name(), DataType::FixedSizeBinary(POINT_FSB_LEN), f.is_nullable())
-                    .with_metadata(f.metadata().clone())
+                Field::new(
+                    f.name(),
+                    DataType::FixedSizeBinary(POINT_FSB_LEN),
+                    f.is_nullable(),
+                )
+                .with_metadata(f.metadata().clone())
             } else {
                 f.as_ref().clone()
             }
@@ -702,18 +715,19 @@ fn restore_point_columns(batch: RecordBatch) -> DFResult<RecordBatch> {
                 }
             };
             let rows = (0..len).map(|r| value_at(r).map(|b| b.to_vec()));
-            let arr =
-                FixedSizeBinaryArray::try_from_sparse_iter_with_size(rows, POINT_FSB_LEN).map_err(
-                    |e| {
-                        datafusion::common::DataFusionError::Internal(format!(
-                            "point restore: FixedSizeBinaryArray construction for '{}': {e}",
-                            f.name()
-                        ))
-                    },
-                )?;
-            let new_field =
-                Field::new(f.name(), DataType::FixedSizeBinary(POINT_FSB_LEN), f.is_nullable())
-                    .with_metadata(f.metadata().clone());
+            let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(rows, POINT_FSB_LEN)
+                .map_err(|e| {
+                    datafusion::common::DataFusionError::Internal(format!(
+                        "point restore: FixedSizeBinaryArray construction for '{}': {e}",
+                        f.name()
+                    ))
+                })?;
+            let new_field = Field::new(
+                f.name(),
+                DataType::FixedSizeBinary(POINT_FSB_LEN),
+                f.is_nullable(),
+            )
+            .with_metadata(f.metadata().clone());
             new_fields.push(new_field);
             new_cols.push(Arc::new(arr) as ArrayRef);
         } else {
@@ -769,15 +783,14 @@ fn restore_uuid_columns(batch: RecordBatch) -> DFResult<RecordBatch> {
                     Some(buf)
                 }
             });
-            let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(rows, 16)
-                .map_err(|e| {
+            let arr =
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(rows, 16).map_err(|e| {
                     datafusion::common::DataFusionError::Internal(format!(
                         "uuid restore: FixedSizeBinaryArray construction: {e}"
                     ))
                 })?;
-            let new_field =
-                Field::new(f.name(), DataType::FixedSizeBinary(16), f.is_nullable())
-                    .with_metadata(f.metadata().clone());
+            let new_field = Field::new(f.name(), DataType::FixedSizeBinary(16), f.is_nullable())
+                .with_metadata(f.metadata().clone());
             new_fields.push(new_field);
             new_cols.push(Arc::new(arr) as ArrayRef);
         } else {
@@ -790,9 +803,8 @@ fn restore_uuid_columns(batch: RecordBatch) -> DFResult<RecordBatch> {
         new_fields,
         schema.metadata().clone(),
     ));
-    RecordBatch::try_new(new_schema, new_cols).map_err(|e| {
-        datafusion::common::DataFusionError::ArrowError(Box::new(e), None)
-    })
+    RecordBatch::try_new(new_schema, new_cols)
+        .map_err(|e| datafusion::common::DataFusionError::ArrowError(Box::new(e), None))
 }
 
 // ---------------------------------------------------------------------------
@@ -821,7 +833,11 @@ impl UuidDecimal256RestoreExec {
     fn new(inner: Arc<dyn ExecutionPlan>) -> Self {
         let output_schema = Arc::new(swap_uuid_decimal256_to_fsb16(inner.schema().as_ref()));
         let props = Arc::new(Self::compute_properties(&inner, Arc::clone(&output_schema)));
-        Self { inner, output_schema, props }
+        Self {
+            inner,
+            output_schema,
+            props,
+        }
     }
 
     fn compute_properties(inner: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
@@ -869,7 +885,9 @@ impl ExecutionPlan for UuidDecimal256RestoreExec {
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(UuidDecimal256RestoreExec::new(children.swap_remove(0))))
+        Ok(Arc::new(UuidDecimal256RestoreExec::new(
+            children.swap_remove(0),
+        )))
     }
 
     // ── Physical filter pushdown (transparent passthrough) ───────────────────
@@ -946,7 +964,11 @@ impl PointFsbRestoreExec {
     fn new(inner: Arc<dyn ExecutionPlan>) -> Self {
         let output_schema = Arc::new(swap_point_binary_to_fsb(inner.schema().as_ref()));
         let props = Arc::new(Self::compute_properties(&inner, Arc::clone(&output_schema)));
-        Self { inner, output_schema, props }
+        Self {
+            inner,
+            output_schema,
+            props,
+        }
     }
 
     fn compute_properties(inner: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
@@ -1036,9 +1058,7 @@ fn promote_utf8_dtype(dt: &DataType) -> DataType {
         DataType::Binary => DataType::BinaryView,
         DataType::List(f) => DataType::List(promote_utf8_field(f).into()),
         DataType::LargeList(f) => DataType::LargeList(promote_utf8_field(f).into()),
-        DataType::FixedSizeList(f, n) => {
-            DataType::FixedSizeList(promote_utf8_field(f).into(), *n)
-        }
+        DataType::FixedSizeList(f, n) => DataType::FixedSizeList(promote_utf8_field(f).into(), *n),
         DataType::Struct(fields) => {
             let promoted: Fields = fields.iter().map(|f| promote_utf8_field(f)).collect();
             DataType::Struct(promoted)
@@ -1068,10 +1088,10 @@ fn promote_utf8_to_view_schema(schema: &Schema) -> Schema {
 mod tests {
     use super::*;
 
-    use datafusion::common::Statistics;
     use datafusion::common::stats::Precision;
-    use object_store::ObjectMeta;
+    use datafusion::common::Statistics;
     use object_store::path::Path;
+    use object_store::ObjectMeta;
 
     /// Verify that the W2-1 patch replaces `Precision::Absent` with
     /// `Precision::Inexact(object.size)` and never overwrites a value that
@@ -1146,8 +1166,8 @@ mod tests {
     /// can be constructed without panicking.
     #[test]
     fn construction_succeeds() {
-        use vortex::VortexSessionDefault as _;
         use vortex::session::VortexSession;
+        use vortex::VortexSessionDefault as _;
         use vortex_datafusion::VortexFormat;
         use vortex_datafusion::VortexTableOptions;
 

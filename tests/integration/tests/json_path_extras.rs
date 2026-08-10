@@ -304,12 +304,7 @@ async fn test_json_object_keys() {
 #[tokio::test]
 async fn test_json_each() {
     let (engine, project) = make_engine().await;
-    let s = all_strings_concat(
-        &engine,
-        project,
-        "SELECT json_each('{\"x\":1,\"y\":2}')",
-    )
-    .await;
+    let s = all_strings_concat(&engine, project, "SELECT json_each('{\"x\":1,\"y\":2}')").await;
     let s = s.expect("json_each result");
     assert!(s.contains('x') && s.contains('y'), "json_each output: {s}");
 }

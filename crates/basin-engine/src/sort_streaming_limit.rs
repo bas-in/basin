@@ -53,9 +53,9 @@
 
 use std::sync::Arc;
 
+use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Result;
-use datafusion::common::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::limit::GlobalLimitExec;
@@ -177,10 +177,7 @@ fn is_prefix_of(prefix: &LexOrdering, full_order: &LexOrdering) -> bool {
     if full_order.len() < prefix.len() {
         return false;
     }
-    prefix
-        .iter()
-        .zip(full_order.iter())
-        .all(|(p, f)| p == f)
+    prefix.iter().zip(full_order.iter()).all(|(p, f)| p == f)
 }
 
 // ---------------------------------------------------------------------------
@@ -195,16 +192,16 @@ mod tests {
 
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion::common::config::ConfigOptions;
     use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion::physical_plan::limit::GlobalLimitExec;
     use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::sorts::sort::SortExec;
-    use datafusion::common::config::ConfigOptions;
+    use datafusion::physical_plan::ExecutionPlanProperties;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_datasource::source::DataSourceExec;
-    use datafusion_physical_expr::LexOrdering;
     use datafusion_physical_expr::expressions::Column;
+    use datafusion_physical_expr::LexOrdering;
     use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_plan::Partitioning;
 
@@ -263,8 +260,7 @@ mod tests {
         let scan = make_scan(Arc::clone(&schema), ordering.clone(), 4);
         // Simulate EnforceDistribution inserting a RepartitionExec.
         let repart = Arc::new(
-            RepartitionExec::try_new(Arc::clone(&scan), Partitioning::RoundRobinBatch(4))
-                .unwrap(),
+            RepartitionExec::try_new(Arc::clone(&scan), Partitioning::RoundRobinBatch(4)).unwrap(),
         );
         let sort = Arc::new(
             SortExec::new(ordering.clone(), repart as Arc<dyn ExecutionPlan>)
@@ -309,9 +305,7 @@ mod tests {
         let ordering = LexOrdering::new(vec![id_asc.clone()]).unwrap();
 
         let scan = make_scan(Arc::clone(&schema), ordering.clone(), 4);
-        let sort = Arc::new(
-            SortExec::new(ordering.clone(), scan).with_fetch(Some(20)),
-        );
+        let sort = Arc::new(SortExec::new(ordering.clone(), scan).with_fetch(Some(20)));
         let global = Arc::new(GlobalLimitExec::new(
             sort as Arc<dyn ExecutionPlan>,
             0,
@@ -348,9 +342,7 @@ mod tests {
 
         // Sort asks for k ASC — no match.
         let sort_ordering = LexOrdering::new(vec![k_asc.clone()]).unwrap();
-        let sort = Arc::new(
-            SortExec::new(sort_ordering, scan).with_fetch(Some(1100)),
-        );
+        let sort = Arc::new(SortExec::new(sort_ordering, scan).with_fetch(Some(1100)));
         let global = Arc::new(GlobalLimitExec::new(
             sort as Arc<dyn ExecutionPlan>,
             1000,

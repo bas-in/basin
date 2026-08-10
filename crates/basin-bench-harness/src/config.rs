@@ -37,10 +37,7 @@ pub enum StorageBackend {
     Tigris { bucket: String, region: String },
     /// Locally-hosted SeaweedFS S3 gateway. Started out-of-band; the harness
     /// only configures the client.
-    SeaweedFs {
-        bucket: String,
-        endpoint: String,
-    },
+    SeaweedFs { bucket: String, endpoint: String },
 }
 
 impl StorageBackend {

@@ -43,11 +43,18 @@ fn engine_in(dir: &TempDir) -> Engine {
         page_cache: None,
     });
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
-    Engine::new(EngineConfig { storage, catalog, shard: None })
+    Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    })
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// One table shape: how to create it, the COPY column list, and a per-row CSV
@@ -86,7 +93,10 @@ fn gen_composite(i: usize) -> Vec<Option<String>> {
     vec![s(i / 100), s(i % 100), s(format!("v{i}"))]
 }
 fn gen_jsonb_only(i: usize) -> Vec<Option<String>> {
-    vec![s(i + 1), s(format!("{{\"a\":{},\"b\":\"{:08x}\"}}", i % 1000, i))]
+    vec![
+        s(i + 1),
+        s(format!("{{\"a\":{},\"b\":\"{:08x}\"}}", i % 1000, i)),
+    ]
 }
 fn gen_numeric_only(i: usize) -> Vec<Option<String>> {
     vec![s(i + 1), s(format!("{}.{:02}", i % 1_000_000, i % 100))]
@@ -204,7 +214,10 @@ async fn shape_matrix() {
     let empty_schema = Arc::new(Schema::empty()); // engine uses the catalog schema
 
     println!("\n=== Basin engine shape-matrix bench — {rows} rows/shape, {chunk}/chunk ===");
-    println!("{:<16} {:>12} {:>14}   ops (median ms)", "shape", "ingest s", "ingest r/s");
+    println!(
+        "{:<16} {:>12} {:>14}   ops (median ms)",
+        "shape", "ingest s", "ingest r/s"
+    );
     println!("{}", "-".repeat(78));
 
     let mut slow: Vec<String> = Vec::new();
@@ -217,7 +230,9 @@ async fn shape_matrix() {
         }
         let table = format!("sm_{}", shp.name);
         let create = shp.create.replace("{T}", &table);
-        sess.execute(&format!("DROP TABLE IF EXISTS {table}")).await.unwrap();
+        sess.execute(&format!("DROP TABLE IF EXISTS {table}"))
+            .await
+            .unwrap();
         sess.execute(&create).await.unwrap();
 
         let cols: Vec<String> = shp.cols.iter().map(|c| c.to_string()).collect();
@@ -232,7 +247,10 @@ async fn shape_matrix() {
             let batch: Vec<Vec<Option<String>>> =
                 (seeded..seeded + n).map(|i| (shp.gen)(i)).collect();
             let c0 = Instant::now();
-            match sess.ingest_csv_batch(&table, empty_schema.clone(), Some(&cols), batch).await {
+            match sess
+                .ingest_csv_batch(&table, empty_schema.clone(), Some(&cols), batch)
+                .await
+            {
                 Ok(ingested) => {
                     assert_eq!(ingested as usize, n, "[{}] ingested count", shp.name);
                     chunk_ms.push(c0.elapsed().as_secs_f64() * 1000.0);
@@ -247,7 +265,10 @@ async fn shape_matrix() {
         let ingest_s = t0.elapsed().as_secs_f64();
 
         if let Some(e) = ingest_err {
-            println!("{:<16} {:>12} {:>14}   INGEST-ERR: {}", shp.name, "—", "—", e);
+            println!(
+                "{:<16} {:>12} {:>14}   INGEST-ERR: {}",
+                shp.name, "—", "—", e
+            );
             slow.push(format!("{}: {}", shp.name, e));
             continue;
         }
@@ -274,7 +295,10 @@ async fn shape_matrix() {
             _ => -1,
         };
         if cnt as usize != rows {
-            slow.push(format!("{}: count(*) = {} != {} seeded", shp.name, cnt, rows));
+            slow.push(format!(
+                "{}: count(*) = {} != {} seeded",
+                shp.name, cnt, rows
+            ));
         }
 
         // ---- timed ops (errors recorded, not fatal) ----
@@ -291,12 +315,18 @@ async fn shape_matrix() {
         }
 
         let flag = if growth > 3.0 { " ⚠O(n²)?" } else { "" };
-        println!("{:<16} {:>12.2} {:>14}   {}{}", shp.name, ingest_s, rps, op_str, flag);
+        println!(
+            "{:<16} {:>12.2} {:>14}   {}{}",
+            shp.name, ingest_s, rps, op_str, flag
+        );
         if sla_rps > 0 && rps < sla_rps {
             slow.push(format!("{} ({} r/s < {} SLA)", shp.name, rps, sla_rps));
         }
         if growth > 3.0 {
-            slow.push(format!("{} (per-chunk grew {:.1}x — superlinear ingest)", shp.name, growth));
+            slow.push(format!(
+                "{} (per-chunk grew {:.1}x — superlinear ingest)",
+                shp.name, growth
+            ));
         }
     }
 

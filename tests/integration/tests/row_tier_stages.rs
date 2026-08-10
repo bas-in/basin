@@ -62,7 +62,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -156,11 +160,19 @@ async fn s1_fresh_insert_count_not_inflated_across_flush() {
 
     // Five committed inserts via the registry-promotion (BEGIN…COMMIT) path.
     for i in 1..=5i64 {
-        tx_insert(&sess, &format!("INSERT INTO t (id, v) VALUES ({i}, {})", i * 10)).await;
+        tx_insert(
+            &sess,
+            &format!("INSERT INTO t (id, v) VALUES ({i}, {})", i * 10),
+        )
+        .await;
     }
 
     // Hot tier: COUNT must be exactly 5 (no counter-keyed duplicates).
-    assert_eq!(count_star(&sess, "t").await, 5, "hot-tier COUNT(*) inflated");
+    assert_eq!(
+        count_star(&sess, "t").await,
+        5,
+        "hot-tier COUNT(*) inflated"
+    );
     for i in 1..=5i64 {
         assert_eq!(
             int_col(&sess, &format!("SELECT v FROM t WHERE id = {i}"), "v").await,
@@ -383,7 +395,11 @@ async fn delete_of_fresh_inserted_key_is_gone() {
         int_col(&sess, "SELECT v FROM t WHERE id = 10", "v").await,
         Some(100)
     );
-    assert_eq!(count_star(&sess, "t").await, 1, "COUNT after DELETE must be 1");
+    assert_eq!(
+        count_star(&sess, "t").await,
+        1,
+        "COUNT after DELETE must be 1"
+    );
 
     bg.shutdown().await;
     wal.close().await.unwrap();

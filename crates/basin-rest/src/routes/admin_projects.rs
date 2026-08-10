@@ -282,7 +282,10 @@ pub(crate) async fn set_project_rate_limit(
         .map_err(|e| ApiError::invalid(format!("invalid project_id: {e}")))?;
     assert_admin_for_path_project(&claims, &project)?;
     if req.qps <= 0 || req.qps > u32::MAX as i64 {
-        return Err(ApiError::invalid(format!("qps must be in 1..={}", u32::MAX)));
+        return Err(ApiError::invalid(format!(
+            "qps must be in 1..={}",
+            u32::MAX
+        )));
     }
     let qps = req.qps as u32;
     state
@@ -502,8 +505,14 @@ mod tests {
         cat.set_project_max_connections(&a, 100).await.unwrap();
         cat.set_project_max_connections(&b, 200).await.unwrap();
 
-        assert_eq!(cat.get_project_max_connections(&a).await.unwrap(), Some(100));
-        assert_eq!(cat.get_project_max_connections(&b).await.unwrap(), Some(200));
+        assert_eq!(
+            cat.get_project_max_connections(&a).await.unwrap(),
+            Some(100)
+        );
+        assert_eq!(
+            cat.get_project_max_connections(&b).await.unwrap(),
+            Some(200)
+        );
     }
 
     /// Lowering a ceiling stores the new (lower) value.

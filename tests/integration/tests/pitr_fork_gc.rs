@@ -273,9 +273,7 @@ async fn cross_project_gc_isolation() {
     // GC for project A: path is orphaned.
     let report_a = cat.gc_orphaned_files(&proj_a, &tbl_a).await.unwrap();
     assert!(
-        report_a
-            .orphaned_paths
-            .contains(&shared_name.to_string()),
+        report_a.orphaned_paths.contains(&shared_name.to_string()),
         "proj_a GC must orphan path after rollback: {:?}",
         report_a.orphaned_paths
     );

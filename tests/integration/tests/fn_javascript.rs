@@ -38,9 +38,9 @@ use basin_catalog::{Catalog, InMemoryCatalog, SqlFunctionLanguage};
 use basin_common::ProjectId;
 use basin_engine::{AuthContext, Engine, EngineConfig, ExecResult, ProjectSession};
 use basin_fn::{
-    FunctionCallContext, FunctionHost, QueryExecutor,
     engine::{InvocationContext, MockHttpClient, QueryRow, StubSecretStore},
     harness_bindings::basin::functions::query,
+    FunctionCallContext, FunctionHost, QueryExecutor,
 };
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -140,7 +140,9 @@ async fn javascript_alter_rename_preserves_language_and_body() {
         .expect("ALTER FUNCTION RENAME TO must succeed for LANGUAGE javascript");
 
     assert!(
-        cat.lookup_sql_function(&project, "old_greet").await.is_none(),
+        cat.lookup_sql_function(&project, "old_greet")
+            .await
+            .is_none(),
         "old name must be gone after RENAME"
     );
     let renamed = cat

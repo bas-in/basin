@@ -126,8 +126,14 @@ async fn flag_off_is_a_noop_identical_to_today() {
     for _ in 0..4 {
         let p = ProjectId::new();
         projects.push(p);
-        storage_a.write_batch(&p, &table, &part, &small_batch()).await.unwrap();
-        storage_b.write_batch(&p, &table, &part, &small_batch()).await.unwrap();
+        storage_a
+            .write_batch(&p, &table, &part, &small_batch())
+            .await
+            .unwrap();
+        storage_b
+            .write_batch(&p, &table, &part, &small_batch())
+            .await
+            .unwrap();
     }
 
     // Both default stores hold the same set of keys; the per-bucket resolver
@@ -183,14 +189,21 @@ async fn flag_on_spreads_is_stable_and_round_trips() {
     let mut projects = Vec::new();
     for _ in 0..4 {
         let p = ProjectId::new();
-        storage.write_batch(&p, &table, &part, &small_batch()).await.unwrap();
+        storage
+            .write_batch(&p, &table, &part, &small_batch())
+            .await
+            .unwrap();
         projects.push(p);
     }
 
     // Each project got a distinct bucket (spread), all under its prefix.
     let mut assigned: Vec<String> = Vec::new();
     for p in &projects {
-        let a = cat.get_bucket_assignment(p).await.unwrap().expect("assigned");
+        let a = cat
+            .get_bucket_assignment(p)
+            .await
+            .unwrap()
+            .expect("assigned");
         assigned.push(a.bucket_id.clone());
         let store = resolver.store_for(&a.bucket_id);
         let keys = list_keys(&store).await;
@@ -202,7 +215,11 @@ async fn flag_on_spreads_is_stable_and_round_trips() {
         );
     }
     let distinct: std::collections::HashSet<_> = assigned.iter().collect();
-    assert_eq!(distinct.len(), 4, "four projects should spread to four buckets");
+    assert_eq!(
+        distinct.len(),
+        4,
+        "four projects should spread to four buckets"
+    );
 
     // The default store must hold NOTHING — every write was routed to a pooled
     // bucket, not the single shared store.
@@ -219,7 +236,10 @@ async fn flag_on_spreads_is_stable_and_round_trips() {
         .unwrap();
     let batches: Vec<_> = stream.collect().await;
     let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
-    assert_eq!(total, 16, "round-trip through assigned bucket must read back rows");
+    assert_eq!(
+        total, 16,
+        "round-trip through assigned bucket must read back rows"
+    );
 
     // Simulated restart: drop the per-process cache; the SAME catalog must
     // re-yield the SAME assignments (re-read, not recomputed).
@@ -262,7 +282,10 @@ async fn flag_on_stops_growing_at_ceiling_then_packs() {
     let mut per_bucket: HashMap<String, usize> = HashMap::new();
     for _ in 0..6 {
         let p = ProjectId::new();
-        storage.write_batch(&p, &table, &part, &small_batch()).await.unwrap();
+        storage
+            .write_batch(&p, &table, &part, &small_batch())
+            .await
+            .unwrap();
         let a = cat.get_bucket_assignment(&p).await.unwrap().unwrap();
         *per_bucket.entry(a.bucket_id).or_default() += 1;
     }
@@ -276,7 +299,10 @@ async fn flag_on_stops_growing_at_ceiling_then_packs() {
     assert_eq!(per_bucket.values().sum::<usize>(), 6);
     // Dense, balanced packing: 6 across 2 buckets → 3 each (least-full pick).
     for (_id, n) in &per_bucket {
-        assert_eq!(*n, 3, "projects past the ceiling pack into the least-full bucket");
+        assert_eq!(
+            *n, 3,
+            "projects past the ceiling pack into the least-full bucket"
+        );
     }
 }
 
@@ -290,7 +316,12 @@ async fn flag_on_stops_growing_at_ceiling_then_packs() {
 fn build_striped(
     stripe: usize,
     max_buckets: usize,
-) -> (Storage, Arc<InMemoryCatalog>, Arc<BucketPool>, Arc<InMemoryResolver>) {
+) -> (
+    Storage,
+    Arc<InMemoryCatalog>,
+    Arc<BucketPool>,
+    Arc<InMemoryResolver>,
+) {
     let default_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let (storage, cat) = build_storage_with_default(default_store);
     let resolver = Arc::new(InMemoryResolver::default());
@@ -317,7 +348,9 @@ async fn striped_partitions_distribute_and_are_stable() {
 
     // Warm the assignment: a width-4 stripe of distinct buckets is allocated +
     // persisted on first ensure.
-    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&project, cat.as_ref())
+        .await
+        .unwrap();
     let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
     assert_eq!(a.stripe.len(), 4, "stripe width must equal config.stripe");
     let distinct: std::collections::HashSet<_> = a.stripe.iter().collect();
@@ -329,7 +362,9 @@ async fn striped_partitions_distribute_and_are_stable() {
     let mut covered: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
     for i in 0..64 {
         let pid = format!("partition-{i}");
-        let store = pool.store_for_partition(&project, &pid).expect("warmed stripe");
+        let store = pool
+            .store_for_partition(&project, &pid)
+            .expect("warmed stripe");
         covered.insert(Arc::as_ptr(&store) as *const ());
     }
     assert_eq!(
@@ -342,10 +377,14 @@ async fn striped_partitions_distribute_and_are_stable() {
     // SAME catalog, and assert every partition resolves to its slot-derived
     // bucket store (deterministic + stable, re-read not recomputed).
     pool.invalidate_all();
-    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&project, cat.as_ref())
+        .await
+        .unwrap();
     for i in 0..64 {
         let pid = format!("partition-{i}");
-        let store = pool.store_for_partition(&project, &pid).expect("re-warmed stripe");
+        let store = pool
+            .store_for_partition(&project, &pid)
+            .expect("re-warmed stripe");
         let bucket_id = &a.stripe[basin_catalog::bucket_pool::stripe_slot(&pid, a.stripe.len())];
         let expected = resolver.store_for(bucket_id);
         assert_eq!(
@@ -363,7 +402,9 @@ async fn striped_partitions_distribute_and_are_stable() {
 async fn striped_write_then_read_same_partition_round_trips() {
     let (storage, cat, pool, resolver) = build_striped(4, 8);
     let project = ProjectId::new();
-    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&project, cat.as_ref())
+        .await
+        .unwrap();
     let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
 
     for i in 0..8 {
@@ -413,7 +454,9 @@ async fn striped_write_then_read_same_partition_round_trips() {
 async fn striped_union_read_aggregates_all_buckets() {
     let (storage, cat, pool, resolver) = build_striped(4, 8);
     let project = ProjectId::new();
-    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&project, cat.as_ref())
+        .await
+        .unwrap();
     let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
 
     let mut written: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -444,7 +487,10 @@ async fn striped_union_read_aggregates_all_buckets() {
             );
         }
     }
-    assert_eq!(union, written, "union read must equal exactly the written set");
+    assert_eq!(
+        union, written,
+        "union read must equal exactly the written set"
+    );
     assert_eq!(union.len(), 40, "union read count must be exact");
 
     // No single bucket holds the whole table (proves the spread is real).
@@ -467,11 +513,21 @@ async fn striped_assignment_cas_is_exactly_once_across_nodes() {
 
     let resolver = Arc::new(InMemoryResolver::default());
     let pool_a = BucketPool::new(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 3 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 3,
+        },
         resolver.clone(),
     );
     let pool_b = BucketPool::new(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 3 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 3,
+        },
         resolver.clone(),
     );
 
@@ -484,7 +540,11 @@ async fn striped_assignment_cas_is_exactly_once_across_nodes() {
     rb.unwrap();
 
     // Exactly one durable assignment, a valid width-3 distinct stripe.
-    let durable = node_a.get_bucket_assignment(&project).await.unwrap().unwrap();
+    let durable = node_a
+        .get_bucket_assignment(&project)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(durable.stripe.len(), 3, "durable stripe width");
     let distinct: std::collections::HashSet<_> = durable.stripe.iter().collect();
     assert_eq!(distinct.len(), 3, "durable stripe buckets distinct");
@@ -536,7 +596,12 @@ async fn wired_write_then_read_round_trips_across_stripe() {
     storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
     let resolver = Arc::new(InMemoryResolver::default());
     let pool = Arc::new(BucketPool::new(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 4,
+        },
         resolver.clone(),
     ));
     storage.attach_bucket_pool(pool.clone());
@@ -545,7 +610,9 @@ async fn wired_write_then_read_round_trips_across_stripe() {
     let table = TableName::new("t").unwrap();
 
     // Warm so we can read the durable stripe + assert physical placement.
-    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&project, cat.as_ref())
+        .await
+        .unwrap();
     let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
     assert_eq!(a.stripe.len(), 4);
 
@@ -565,7 +632,12 @@ async fn wired_write_then_read_round_trips_across_stripe() {
         let prefix = format!("projects/{project}/tables/t/data/{}/", part.as_str());
         let keys = list_keys(&resolver.store_for(expected_bucket)).await;
         let here = keys.iter().filter(|k| k.starts_with(&prefix)).count();
-        assert_eq!(here, 1, "partition {} file must be in slot bucket {expected_bucket}", part.as_str());
+        assert_eq!(
+            here,
+            1,
+            "partition {} file must be in slot bucket {expected_bucket}",
+            part.as_str()
+        );
         *per_bucket_files.entry(expected_bucket.clone()).or_default() += 1;
         for (j, other) in a.stripe.iter().enumerate() {
             if j == slot {
@@ -574,7 +646,8 @@ async fn wired_write_then_read_round_trips_across_stripe() {
             let ok = list_keys(&resolver.store_for(other)).await;
             assert!(
                 !ok.iter().any(|k| k.starts_with(&prefix)),
-                "partition {} must not appear in sibling bucket {other}", part.as_str()
+                "partition {} must not appear in sibling bucket {other}",
+                part.as_str()
             );
         }
     }
@@ -585,7 +658,10 @@ async fn wired_write_then_read_round_trips_across_stripe() {
         "striped writes must never touch the single default store"
     );
     // The spread is real: more than one bucket holds data files.
-    assert!(per_bucket_files.len() > 1, "data files must spread across >1 bucket");
+    assert!(
+        per_bucket_files.len() > 1,
+        "data files must spread across >1 bucket"
+    );
 
     // Union READ through the real `Storage::read` entry point returns EXACTLY
     // the rows written, aggregated across all stripe buckets.
@@ -605,7 +681,11 @@ async fn wired_write_then_read_round_trips_across_stripe() {
 
     // `list_data_files` (the union LIST) sees every file across the stripe.
     let listed = storage.list_data_files(&project, &table).await.unwrap();
-    assert_eq!(listed.len(), 24, "union LIST must find every striped data file");
+    assert_eq!(
+        listed.len(),
+        24,
+        "union LIST must find every striped data file"
+    );
 }
 
 /// Cold-catalog restart: drop the per-process cache, re-warm from the SAME
@@ -625,7 +705,12 @@ async fn wired_read_after_restart_resolves_same_buckets() {
     storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
     let resolver = Arc::new(InMemoryResolver::default());
     let pool = Arc::new(BucketPool::new(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 3 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 3,
+        },
         resolver.clone(),
     ));
     storage.attach_bucket_pool(pool.clone());
@@ -635,7 +720,10 @@ async fn wired_read_after_restart_resolves_same_buckets() {
     let mut total = 0i64;
     for i in 0..18 {
         let part = PartitionKey::new(format!("p{i}")).unwrap();
-        storage.write_batch(&project, &table, &part, &batch_rows(5)).await.unwrap();
+        storage
+            .write_batch(&project, &table, &part, &batch_rows(5))
+            .await
+            .unwrap();
         total += 5;
     }
 
@@ -667,7 +755,12 @@ async fn wired_flag_off_data_path_is_a_noop() {
     let (storage, _cat) = build_storage_with_default(default_store.clone());
     let resolver = Arc::new(InMemoryResolver::default());
     let pool_off = Arc::new(BucketPool::new(
-        PoolConfig { enabled: false, max_buckets: 8, watermark: 1, stripe: 4 },
+        PoolConfig {
+            enabled: false,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 4,
+        },
         resolver.clone(),
     ));
     storage.attach_bucket_pool(pool_off);
@@ -677,13 +770,20 @@ async fn wired_flag_off_data_path_is_a_noop() {
     let mut total = 0i64;
     for i in 0..12 {
         let part = PartitionKey::new(format!("p{i}")).unwrap();
-        storage.write_batch(&project, &table, &part, &batch_rows(6)).await.unwrap();
+        storage
+            .write_batch(&project, &table, &part, &batch_rows(6))
+            .await
+            .unwrap();
         total += 6;
     }
 
     // Everything is on the single default store; no pooled bucket was created.
     let keys = list_keys(&default_store).await;
-    assert_eq!(keys.len(), 12, "flag OFF: all 12 data files on the single store");
+    assert_eq!(
+        keys.len(),
+        12,
+        "flag OFF: all 12 data files on the single store"
+    );
     assert!(
         resolver.stores.lock().unwrap().is_empty(),
         "flag OFF must never resolve a pooled bucket (seam fully inert)"
@@ -699,7 +799,10 @@ async fn wired_flag_off_data_path_is_a_noop() {
         .iter()
         .map(|b| b.as_ref().unwrap().num_rows() as i64)
         .sum();
-    assert_eq!(read_total, total, "flag OFF: read returns every row from the single store");
+    assert_eq!(
+        read_total, total,
+        "flag OFF: read returns every row from the single store"
+    );
 }
 
 /// The catalog-stays-on-primary / data-stripes invariant, proven with a real
@@ -727,7 +830,12 @@ async fn wired_catalog_stays_on_primary_data_stripes() {
     storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
     let resolver = Arc::new(InMemoryResolver::default());
     let pool = Arc::new(BucketPool::new(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 4,
+        },
         resolver.clone(),
     ));
     storage.attach_bucket_pool(pool.clone());
@@ -742,12 +850,17 @@ async fn wired_catalog_stays_on_primary_data_stripes() {
 
     // Warm the (striped) assignment — this also persists the bucket registry +
     // assignment to the catalog/primary store, another catalog-on-primary fact.
-    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&project, cat.as_ref())
+        .await
+        .unwrap();
 
     // Write the data through the real writer (which stripes the data file).
     for i in 0..16 {
         let part = PartitionKey::new(format!("p{i}")).unwrap();
-        storage.write_batch(&project, &table, &part, &batch_rows(4)).await.unwrap();
+        storage
+            .write_batch(&project, &table, &part, &batch_rows(4))
+            .await
+            .unwrap();
     }
 
     // PRIMARY store: holds catalog objects, holds NO striped data file.
@@ -778,7 +891,10 @@ async fn wired_catalog_stays_on_primary_data_stripes() {
             data_files_on_stripe += 1;
         }
     }
-    assert_eq!(data_files_on_stripe, 16, "all 16 data files must be on the stripe buckets");
+    assert_eq!(
+        data_files_on_stripe, 16,
+        "all 16 data files must be on the stripe buckets"
+    );
 }
 
 /// Striped DROP TABLE: `delete_table_prefix` must free the table's data files
@@ -798,19 +914,29 @@ async fn wired_drop_table_frees_striped_data_across_buckets() {
     storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
     let resolver = Arc::new(InMemoryResolver::default());
     let pool = Arc::new(BucketPool::new(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 4,
+        },
         resolver.clone(),
     ));
     storage.attach_bucket_pool(pool.clone());
 
     let project = ProjectId::new();
     let table = TableName::new("t").unwrap();
-    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&project, cat.as_ref())
+        .await
+        .unwrap();
     let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
 
     for i in 0..20 {
         let part = PartitionKey::new(format!("p{i}")).unwrap();
-        storage.write_batch(&project, &table, &part, &batch_rows(3)).await.unwrap();
+        storage
+            .write_batch(&project, &table, &part, &batch_rows(3))
+            .await
+            .unwrap();
     }
     // Pre-drop: data files exist across the stripe.
     let pre: usize = {
@@ -844,7 +970,9 @@ async fn wired_drop_table_frees_striped_data_across_buckets() {
 async fn stripe_width_one_is_single_bucket() {
     let (_storage, cat, pool, _resolver) = build_striped(1, 8);
     let project = ProjectId::new();
-    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&project, cat.as_ref())
+        .await
+        .unwrap();
     let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
     assert_eq!(a.stripe.len(), 1, "width-1 stripe");
 
@@ -855,7 +983,11 @@ async fn stripe_width_one_is_single_bucket() {
         let s = pool.store_for_partition(&project, &pid).unwrap();
         ptrs.insert(Arc::as_ptr(&s) as *const ());
     }
-    assert_eq!(ptrs.len(), 1, "width-1 must route every partition to one store");
+    assert_eq!(
+        ptrs.len(),
+        1,
+        "width-1 must route every partition to one store"
+    );
 
     let primary = pool.routed_store(&project).unwrap();
     assert_eq!(
@@ -931,7 +1063,12 @@ async fn configured_real_buckets_prepopulate_and_carry_endpoint_region() {
     let cat = Arc::new(InMemoryCatalog::new());
     let resolver = Arc::new(RealNameResolver::default());
     let pool = Arc::new(BucketPool::new_with_buckets(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 3 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 3,
+        },
         configured_buckets(),
         resolver.clone(),
     ));
@@ -940,25 +1077,41 @@ async fn configured_real_buckets_prepopulate_and_carry_endpoint_region() {
     // order, each carrying the REAL name + configured endpoint/region.
     pool.prepopulate_registry(cat.as_ref()).await.unwrap();
     let registry = cat.get_bucket_registry().await.unwrap();
-    assert_eq!(registry.buckets.len(), 4, "all configured buckets pre-seeded");
+    assert_eq!(
+        registry.buckets.len(),
+        4,
+        "all configured buckets pre-seeded"
+    );
     for (i, b) in registry.buckets.iter().enumerate() {
         assert_eq!(b.bucket_id, format!("pool-{i:04}"));
-        assert_eq!(b.bucket_name, format!("basin-pool-{i}"), "real provider name");
+        assert_eq!(
+            b.bucket_name,
+            format!("basin-pool-{i}"),
+            "real provider name"
+        );
         assert_eq!(b.endpoint, POOL_ENDPOINT, "configured endpoint, not empty");
         assert_eq!(b.region, POOL_REGION, "configured region, not empty");
-        assert!(b.credentials_ref.is_none(), "creds via process-default keys");
+        assert!(
+            b.credentials_ref.is_none(),
+            "creds via process-default keys"
+        );
     }
 
     // Pre-seed again: idempotent — same registry, no duplicate entries.
     pool.prepopulate_registry(cat.as_ref()).await.unwrap();
     let registry2 = cat.get_bucket_registry().await.unwrap();
-    assert_eq!(registry2.buckets, registry.buckets, "prepopulate is idempotent");
+    assert_eq!(
+        registry2.buckets, registry.buckets,
+        "prepopulate is idempotent"
+    );
 
     // A striped project picks among the configured buckets; resolving its
     // stripe builds stores keyed by the REAL bucket names with the configured
     // endpoint/region.
     let project = ProjectId::new();
-    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&project, cat.as_ref())
+        .await
+        .unwrap();
     let a = cat.get_bucket_assignment(&project).await.unwrap().unwrap();
     assert_eq!(a.stripe.len(), 3, "stripe width");
     for id in &a.stripe {
@@ -968,9 +1121,15 @@ async fn configured_real_buckets_prepopulate_and_carry_endpoint_region() {
     // Force store resolution for every stripe bucket.
     let _ = pool.routed_stores(&project).expect("warmed stripe");
     let resolved = resolver.resolved.lock().unwrap();
-    assert!(!resolved.is_empty(), "resolver consulted for the real buckets");
+    assert!(
+        !resolved.is_empty(),
+        "resolver consulted for the real buckets"
+    );
     for (name, endpoint, region) in resolved.iter() {
-        assert!(name.starts_with("basin-pool-"), "resolved by REAL name: {name}");
+        assert!(
+            name.starts_with("basin-pool-"),
+            "resolved by REAL name: {name}"
+        );
         assert_eq!(endpoint, POOL_ENDPOINT, "resolver saw configured endpoint");
         assert_eq!(region, POOL_REGION, "resolver saw configured region");
     }
@@ -988,12 +1147,22 @@ async fn configured_real_buckets_converge_across_nodes() {
     let node_b: Arc<dyn Catalog> = Arc::new(ObjectStoreCatalog::new(store.clone()));
     let resolver = Arc::new(RealNameResolver::default());
     let pool_a = BucketPool::new_with_buckets(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 3 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 3,
+        },
         configured_buckets(),
         resolver.clone(),
     );
     let pool_b = BucketPool::new_with_buckets(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 3 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 3,
+        },
         configured_buckets(),
         resolver.clone(),
     );
@@ -1003,7 +1172,10 @@ async fn configured_real_buckets_converge_across_nodes() {
     pool_b.prepopulate_registry(node_b.as_ref()).await.unwrap();
     let reg_a = node_a.get_bucket_registry().await.unwrap();
     let reg_b = node_b.get_bucket_registry().await.unwrap();
-    assert_eq!(reg_a.buckets, reg_b.buckets, "registries converge across nodes");
+    assert_eq!(
+        reg_a.buckets, reg_b.buckets,
+        "registries converge across nodes"
+    );
     assert_eq!(reg_a.buckets.len(), 4);
 
     // Both nodes route a given partition of the same project to the same real
@@ -1036,7 +1208,12 @@ async fn configured_real_buckets_cap_growth_at_list_length() {
     let resolver = Arc::new(RealNameResolver::default());
     // Only 2 real buckets, but stripe=4 requested.
     let pool = Arc::new(BucketPool::new_with_buckets(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 4,
+        },
         BucketPoolBuckets {
             names: vec!["basin-pool-0".into(), "basin-pool-1".into()],
             endpoint: POOL_ENDPOINT.into(),
@@ -1046,11 +1223,20 @@ async fn configured_real_buckets_cap_growth_at_list_length() {
         resolver.clone(),
     ));
     let project = ProjectId::new();
-    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&project, cat.as_ref())
+        .await
+        .unwrap();
     let registry = cat.get_bucket_registry().await.unwrap();
-    assert_eq!(registry.buckets.len(), 2, "never grow past the configured list");
+    assert_eq!(
+        registry.buckets.len(),
+        2,
+        "never grow past the configured list"
+    );
     for b in &registry.buckets {
-        assert!(b.bucket_name.starts_with("basin-pool-"), "only real buckets registered");
+        assert!(
+            b.bucket_name.starts_with("basin-pool-"),
+            "only real buckets registered"
+        );
         assert_eq!(b.endpoint, POOL_ENDPOINT);
     }
 }
@@ -1066,7 +1252,12 @@ async fn no_real_buckets_or_flag_off_is_a_noop() {
     let cat = Arc::new(InMemoryCatalog::new());
     let resolver = Arc::new(RealNameResolver::default());
     let pool = Arc::new(BucketPool::new_with_buckets(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 1 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 1,
+        },
         BucketPoolBuckets::default(),
         resolver.clone(),
     ));
@@ -1080,13 +1271,26 @@ async fn no_real_buckets_or_flag_off_is_a_noop() {
     let cat_off = Arc::new(InMemoryCatalog::new());
     let resolver_off = Arc::new(RealNameResolver::default());
     let pool_off = Arc::new(BucketPool::new_with_buckets(
-        PoolConfig { enabled: false, max_buckets: 8, watermark: 1, stripe: 1 },
+        PoolConfig {
+            enabled: false,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 1,
+        },
         configured_buckets(),
         resolver_off.clone(),
     ));
-    pool_off.prepopulate_registry(cat_off.as_ref()).await.unwrap();
+    pool_off
+        .prepopulate_registry(cat_off.as_ref())
+        .await
+        .unwrap();
     assert!(
-        cat_off.get_bucket_registry().await.unwrap().buckets.is_empty(),
+        cat_off
+            .get_bucket_registry()
+            .await
+            .unwrap()
+            .buckets
+            .is_empty(),
         "flag OFF: prepopulate must not seed the registry"
     );
     assert!(
@@ -1104,19 +1308,36 @@ async fn empty_list_keeps_legacy_bootstrap_entry_shape() {
     let cat = Arc::new(InMemoryCatalog::new());
     let resolver = Arc::new(RealNameResolver::default());
     let pool = Arc::new(BucketPool::new_with_buckets(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 1 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 1,
+        },
         BucketPoolBuckets::default(),
         resolver.clone(),
     ));
     let project = ProjectId::new();
-    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&project, cat.as_ref())
+        .await
+        .unwrap();
     let registry = cat.get_bucket_registry().await.unwrap();
-    assert_eq!(registry.buckets.len(), 1, "lazy bootstrap registers one entry");
+    assert_eq!(
+        registry.buckets.len(),
+        1,
+        "lazy bootstrap registers one entry"
+    );
     let b = &registry.buckets[0];
     assert_eq!(b.bucket_id, "pool-0000");
     assert_eq!(b.bucket_name, "pool-0000", "legacy generated name");
-    assert!(b.endpoint.is_empty(), "legacy bootstrap entry has EMPTY endpoint");
-    assert!(b.region.is_empty(), "legacy bootstrap entry has EMPTY region");
+    assert!(
+        b.endpoint.is_empty(),
+        "legacy bootstrap entry has EMPTY endpoint"
+    );
+    assert!(
+        b.region.is_empty(),
+        "legacy bootstrap entry has EMPTY region"
+    );
 }
 
 // ===========================================================================
@@ -1146,7 +1367,12 @@ async fn reserved_auth_project_never_pool_routed_resolves_from_primary() {
     let resolver = Arc::new(InMemoryResolver::default());
     // Pool ON with a real width-4 stripe — exactly the dev config that broke auth.
     let pool = Arc::new(BucketPool::new(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 4,
+        },
         resolver.clone(),
     ));
     storage.attach_bucket_pool(pool.clone());
@@ -1158,11 +1384,17 @@ async fn reserved_auth_project_never_pool_routed_resolves_from_primary() {
     let part = PartitionKey::default_key();
 
     // Write the reserved project's "credential" rows through the real entry point.
-    storage.write_batch(&reserved, &table, &part, &small_batch()).await.unwrap();
+    storage
+        .write_batch(&reserved, &table, &part, &small_batch())
+        .await
+        .unwrap();
 
     // It was NEVER assigned to the pool (the credential lookup is not pool-routed).
     assert!(
-        cat.get_bucket_assignment(&reserved).await.unwrap().is_none(),
+        cat.get_bucket_assignment(&reserved)
+            .await
+            .unwrap()
+            .is_none(),
         "reserved auth project must never get a pool assignment"
     );
     // The sync routing path returns no warmed stripe → falls back to primary.
@@ -1189,7 +1421,10 @@ async fn reserved_auth_project_never_pool_routed_resolves_from_primary() {
         .unwrap();
     let batches: Vec<_> = stream.collect().await;
     let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
-    assert_eq!(total, 16, "reserved auth project must read its rows back from primary");
+    assert_eq!(
+        total, 16,
+        "reserved auth project must read its rows back from primary"
+    );
 }
 
 /// An EXISTING project whose data already lives on the primary bucket is PINNED
@@ -1211,10 +1446,16 @@ async fn existing_primary_project_is_pinned_new_project_stripes() {
     let existing = ProjectId::new();
     let table = TableName::new("t").unwrap();
     let part = PartitionKey::default_key();
-    storage_off.write_batch(&existing, &table, &part, &small_batch()).await.unwrap();
+    storage_off
+        .write_batch(&existing, &table, &part, &small_batch())
+        .await
+        .unwrap();
     let existing_prefix = format!("projects/{existing}/");
     assert!(
-        list_keys(&primary).await.iter().any(|k| k.starts_with(&existing_prefix)),
+        list_keys(&primary)
+            .await
+            .iter()
+            .any(|k| k.starts_with(&existing_prefix)),
         "existing project's data must be on the primary while OFF"
     );
 
@@ -1228,16 +1469,30 @@ async fn existing_primary_project_is_pinned_new_project_stripes() {
     storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
     let resolver = Arc::new(InMemoryResolver::default());
     let pool = Arc::new(BucketPool::new(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 4,
+        },
         resolver.clone(),
     ));
     storage.attach_bucket_pool(pool.clone());
 
     // The existing project: warming pins it to primary (not striped), so its
     // reads still resolve its existing primary data.
-    pool.ensure_assignment(&existing, cat.as_ref()).await.unwrap();
-    let a = cat.get_bucket_assignment(&existing).await.unwrap().expect("pinned assignment");
-    assert_eq!(a.bucket_id, PRIMARY_PIN_BUCKET_ID, "existing project must be pinned to primary");
+    pool.ensure_assignment(&existing, cat.as_ref())
+        .await
+        .unwrap();
+    let a = cat
+        .get_bucket_assignment(&existing)
+        .await
+        .unwrap()
+        .expect("pinned assignment");
+    assert_eq!(
+        a.bucket_id, PRIMARY_PIN_BUCKET_ID,
+        "existing project must be pinned to primary"
+    );
     assert_eq!(a.stripe, vec![PRIMARY_PIN_BUCKET_ID.to_string()]);
     let stream = storage
         .read(&existing, &table, basin_storage::ReadOptions::default())
@@ -1245,9 +1500,14 @@ async fn existing_primary_project_is_pinned_new_project_stripes() {
         .unwrap();
     let batches: Vec<_> = stream.collect().await;
     let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
-    assert_eq!(total, 16, "pinned existing project must still read its primary data");
+    assert_eq!(
+        total, 16,
+        "pinned existing project must still read its primary data"
+    );
     // Its routed store is the primary store (raw backing), not a pool bucket.
-    let routed = pool.routed_store(&existing).expect("pinned project has a warmed route");
+    let routed = pool
+        .routed_store(&existing)
+        .expect("pinned project has a warmed route");
     assert_eq!(
         Arc::as_ptr(&routed) as *const (),
         Arc::as_ptr(&primary) as *const (),
@@ -1256,12 +1516,28 @@ async fn existing_primary_project_is_pinned_new_project_stripes() {
 
     // A genuinely-new project (no pre-pool primary data) DOES stripe to pool buckets.
     let fresh = ProjectId::new();
-    storage.write_batch(&fresh, &table, &part, &small_batch()).await.unwrap();
-    let fa = cat.get_bucket_assignment(&fresh).await.unwrap().expect("new project assigned");
-    assert_ne!(fa.bucket_id, PRIMARY_PIN_BUCKET_ID, "a new project must NOT be pinned");
-    assert!(fa.stripe.iter().all(|b| b.starts_with("pool-")), "new project stripes to pool buckets");
+    storage
+        .write_batch(&fresh, &table, &part, &small_batch())
+        .await
+        .unwrap();
+    let fa = cat
+        .get_bucket_assignment(&fresh)
+        .await
+        .unwrap()
+        .expect("new project assigned");
+    assert_ne!(
+        fa.bucket_id, PRIMARY_PIN_BUCKET_ID,
+        "a new project must NOT be pinned"
+    );
     assert!(
-        !list_keys(&primary).await.iter().any(|k| k.starts_with(&format!("projects/{fresh}/"))),
+        fa.stripe.iter().all(|b| b.starts_with("pool-")),
+        "new project stripes to pool buckets"
+    );
+    assert!(
+        !list_keys(&primary)
+            .await
+            .iter()
+            .any(|k| k.starts_with(&format!("projects/{fresh}/"))),
         "a new project's data must stripe off the primary store"
     );
 
@@ -1294,25 +1570,43 @@ async fn primary_pin_is_stable_across_restart() {
     let part = PartitionKey::default_key();
 
     // Seed primary data BEFORE attaching the pool so the project is "existing".
-    storage.write_batch(&existing, &table, &part, &small_batch()).await.unwrap();
+    storage
+        .write_batch(&existing, &table, &part, &small_batch())
+        .await
+        .unwrap();
 
     let resolver = Arc::new(InMemoryResolver::default());
     let pool = Arc::new(BucketPool::new(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 4,
+        },
         resolver.clone(),
     ));
     storage.attach_bucket_pool(pool.clone());
-    pool.ensure_assignment(&existing, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&existing, cat.as_ref())
+        .await
+        .unwrap();
     assert_eq!(
-        cat.get_bucket_assignment(&existing).await.unwrap().unwrap().bucket_id,
+        cat.get_bucket_assignment(&existing)
+            .await
+            .unwrap()
+            .unwrap()
+            .bucket_id,
         PRIMARY_PIN_BUCKET_ID
     );
 
     // Simulated restart: drop the per-process cache; re-warm from the SAME
     // catalog. The pinned record must re-yield a primary route.
     pool.invalidate_all();
-    pool.ensure_assignment(&existing, cat.as_ref()).await.unwrap();
-    let routed = pool.routed_store(&existing).expect("re-warmed pinned route");
+    pool.ensure_assignment(&existing, cat.as_ref())
+        .await
+        .unwrap();
+    let routed = pool
+        .routed_store(&existing)
+        .expect("re-warmed pinned route");
     assert_eq!(
         Arc::as_ptr(&routed) as *const (),
         Arc::as_ptr(&primary) as *const (),
@@ -1354,7 +1648,10 @@ async fn existing_project_with_root_prefix_is_pinned_not_striped() {
         .unwrap();
     let rooted_prefix = format!("{ROOT_PREFIX}/projects/{existing}/");
     assert!(
-        list_keys(&primary).await.iter().any(|k| k.starts_with(&rooted_prefix)),
+        list_keys(&primary)
+            .await
+            .iter()
+            .any(|k| k.starts_with(&rooted_prefix)),
         "existing project's data must live under the ROOT-PREFIXED key space while OFF"
     );
 
@@ -1368,7 +1665,12 @@ async fn existing_project_with_root_prefix_is_pinned_not_striped() {
     storage.attach_catalog(cat.clone() as Arc<dyn Catalog>);
     let resolver = Arc::new(InMemoryResolver::default());
     let pool = Arc::new(BucketPool::new(
-        PoolConfig { enabled: true, max_buckets: 8, watermark: 1, stripe: 4 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 8,
+            watermark: 1,
+            stripe: 4,
+        },
         resolver.clone(),
     ));
     // `attach_bucket_pool` threads BOTH the default store AND the root prefix
@@ -1377,7 +1679,9 @@ async fn existing_project_with_root_prefix_is_pinned_not_striped() {
 
     // Warming must PIN the existing project to primary — its root-prefixed data
     // is found by the probe — not stripe it to empty pool buckets.
-    pool.ensure_assignment(&existing, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&existing, cat.as_ref())
+        .await
+        .unwrap();
     let a = cat
         .get_bucket_assignment(&existing)
         .await
@@ -1404,8 +1708,15 @@ async fn existing_project_with_root_prefix_is_pinned_not_striped() {
     // probe correctly finds nothing under `{root}/projects/{fresh}/`.
     let fresh = ProjectId::new();
     pool.ensure_assignment(&fresh, cat.as_ref()).await.unwrap();
-    let fa = cat.get_bucket_assignment(&fresh).await.unwrap().expect("fresh assigned");
-    assert_ne!(fa.bucket_id, PRIMARY_PIN_BUCKET_ID, "a fresh project must NOT be pinned");
+    let fa = cat
+        .get_bucket_assignment(&fresh)
+        .await
+        .unwrap()
+        .expect("fresh assigned");
+    assert_ne!(
+        fa.bucket_id, PRIMARY_PIN_BUCKET_ID,
+        "a fresh project must NOT be pinned"
+    );
     assert!(
         fa.stripe.iter().all(|b| b.starts_with("pool-")),
         "a fresh project must stripe across pool buckets"
@@ -1481,7 +1792,12 @@ impl BucketResolver for RecordingResolver {
 #[tokio::test]
 async fn pooled_project_resolves_real_bucket_names_not_root_prefix() {
     const ROOT_PREFIX: &str = "mn5";
-    let pool_names = ["basin-pool-0", "basin-pool-1", "basin-pool-2", "basin-pool-3"];
+    let pool_names = [
+        "basin-pool-0",
+        "basin-pool-1",
+        "basin-pool-2",
+        "basin-pool-3",
+    ];
 
     // Storage with a root prefix set (so data keys are `{root}/projects/...`).
     let default_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1499,11 +1815,21 @@ async fn pooled_project_resolves_real_bucket_names_not_root_prefix() {
         names: pool_names.iter().map(|s| s.to_string()).collect(),
         endpoint: "https://fly.storage.tigris.dev".to_string(),
         region: "auto".to_string(),
-        creds_refs: vec!["POOL0".into(), "POOL1".into(), "POOL2".into(), "POOL3".into()],
+        creds_refs: vec![
+            "POOL0".into(),
+            "POOL1".into(),
+            "POOL2".into(),
+            "POOL3".into(),
+        ],
     };
     let resolver = Arc::new(RecordingResolver::default());
     let pool = Arc::new(BucketPool::new_with_buckets(
-        PoolConfig { enabled: true, max_buckets: 4, watermark: 1, stripe: 4 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 4,
+            watermark: 1,
+            stripe: 4,
+        },
         buckets,
         resolver.clone(),
     ));
@@ -1513,13 +1839,18 @@ async fn pooled_project_resolves_real_bucket_names_not_root_prefix() {
     pool.prepopulate_registry(cat.as_ref()).await.unwrap();
 
     let project = ProjectId::new();
-    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&project, cat.as_ref())
+        .await
+        .unwrap();
 
     // (A) Every entry the resolver was handed carries a REAL pool bucket name —
     // never the root prefix. This is the seam the production S3 resolver builds
     // `with_bucket_name(&entry.bucket_name)` against.
     let resolved = resolver.resolved_bucket_names();
-    assert!(!resolved.is_empty(), "the stripe must resolve at least one bucket");
+    assert!(
+        !resolved.is_empty(),
+        "the stripe must resolve at least one bucket"
+    );
     for name in &resolved {
         assert_ne!(
             name, ROOT_PREFIX,
@@ -1556,7 +1887,10 @@ async fn pooled_project_resolves_real_bucket_names_not_root_prefix() {
             found_any = true;
         }
     }
-    assert!(found_any, "the write must have produced at least one pooled data file");
+    assert!(
+        found_any,
+        "the write must have produced at least one pooled data file"
+    );
 }
 
 /// LIVE-PATH GATE (dev v142+): a FRESH project must stripe across the configured
@@ -1573,7 +1907,12 @@ async fn pooled_project_resolves_real_bucket_names_not_root_prefix() {
 #[tokio::test]
 async fn fresh_project_stripes_to_pool_buckets_with_empty_registry() {
     const ROOT_PREFIX: &str = "mn5";
-    let pool_names = ["basin-pool-0", "basin-pool-1", "basin-pool-2", "basin-pool-3"];
+    let pool_names = [
+        "basin-pool-0",
+        "basin-pool-1",
+        "basin-pool-2",
+        "basin-pool-3",
+    ];
 
     // The PRIMARY/default store backs the catalog (exactly the live shape: the
     // object-store catalog lives on the primary bucket). We watch it to prove no
@@ -1594,11 +1933,21 @@ async fn fresh_project_stripes_to_pool_buckets_with_empty_registry() {
         names: pool_names.iter().map(|s| s.to_string()).collect(),
         endpoint: "https://fly.storage.tigris.dev".to_string(),
         region: "auto".to_string(),
-        creds_refs: vec!["POOL0".into(), "POOL1".into(), "POOL2".into(), "POOL3".into()],
+        creds_refs: vec![
+            "POOL0".into(),
+            "POOL1".into(),
+            "POOL2".into(),
+            "POOL3".into(),
+        ],
     };
     let resolver = Arc::new(RecordingResolver::default());
     let pool = Arc::new(BucketPool::new_with_buckets(
-        PoolConfig { enabled: true, max_buckets: 4, watermark: 1, stripe: 4 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 4,
+            watermark: 1,
+            stripe: 4,
+        },
         buckets,
         resolver.clone(),
     ));
@@ -1614,7 +1963,9 @@ async fn fresh_project_stripes_to_pool_buckets_with_empty_registry() {
 
     // Assign a FRESH project (no pre-pool data anywhere).
     let project = ProjectId::new();
-    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&project, cat.as_ref())
+        .await
+        .unwrap();
 
     // It must NOT be pinned to primary — a fresh project stripes.
     let a = cat
@@ -1635,7 +1986,10 @@ async fn fresh_project_stripes_to_pool_buckets_with_empty_registry() {
     // Every resolved entry carries a REAL pool bucket name (non-empty endpoint),
     // never the root prefix / empty-endpoint primary bootstrap.
     let resolved = resolver.resolved_bucket_names();
-    assert!(!resolved.is_empty(), "the stripe must resolve at least one bucket");
+    assert!(
+        !resolved.is_empty(),
+        "the stripe must resolve at least one bucket"
+    );
     for name in &resolved {
         assert!(
             pool_names.contains(&name.as_str()),
@@ -1691,7 +2045,12 @@ async fn fresh_project_stripes_to_pool_buckets_with_empty_registry() {
 async fn stale_empty_endpoint_registry_is_refreshed_to_real_buckets() {
     use basin_catalog::bucket_pool::BucketRegistry;
 
-    let pool_names = ["basin-pool-0", "basin-pool-1", "basin-pool-2", "basin-pool-3"];
+    let pool_names = [
+        "basin-pool-0",
+        "basin-pool-1",
+        "basin-pool-2",
+        "basin-pool-3",
+    ];
     let cat = Arc::new(InMemoryCatalog::new());
 
     // Simulate the legacy lazy-bootstrap registry: placeholder entries with
@@ -1714,11 +2073,21 @@ async fn stale_empty_endpoint_registry_is_refreshed_to_real_buckets() {
         names: pool_names.iter().map(|s| s.to_string()).collect(),
         endpoint: "https://fly.storage.tigris.dev".to_string(),
         region: "auto".to_string(),
-        creds_refs: vec!["POOL0".into(), "POOL1".into(), "POOL2".into(), "POOL3".into()],
+        creds_refs: vec![
+            "POOL0".into(),
+            "POOL1".into(),
+            "POOL2".into(),
+            "POOL3".into(),
+        ],
     };
     let resolver = Arc::new(RecordingResolver::default());
     let pool = Arc::new(BucketPool::new_with_buckets(
-        PoolConfig { enabled: true, max_buckets: 4, watermark: 1, stripe: 4 },
+        PoolConfig {
+            enabled: true,
+            max_buckets: 4,
+            watermark: 1,
+            stripe: 4,
+        },
         buckets,
         resolver.clone(),
     ));
@@ -1751,7 +2120,9 @@ async fn stale_empty_endpoint_registry_is_refreshed_to_real_buckets() {
     // endpoint), so the production resolver builds real-bucket stores — not the
     // empty-endpoint primary fallback.
     let project = ProjectId::new();
-    pool.ensure_assignment(&project, cat.as_ref()).await.unwrap();
+    pool.ensure_assignment(&project, cat.as_ref())
+        .await
+        .unwrap();
     let _ = pool.routed_stores(&project).expect("warmed stripe");
     let resolved = resolver.resolved_bucket_names();
     assert!(!resolved.is_empty());

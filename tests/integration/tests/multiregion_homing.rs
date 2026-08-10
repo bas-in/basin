@@ -198,7 +198,10 @@ async fn read_tier_set_show_reset() {
     assert_eq!(read_first_string(&shown), "primary");
 
     // A bad value errors rather than silently downgrading consistency.
-    let err = s.execute("SET basin.read_tier = 'banana'").await.unwrap_err();
+    let err = s
+        .execute("SET basin.read_tier = 'banana'")
+        .await
+        .unwrap_err();
     assert!(matches!(err, BasinError::InvalidSchema(_)));
 }
 

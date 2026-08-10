@@ -149,10 +149,7 @@ async fn status_for_id(sess: &basin_engine::ProjectSession, id: i64) -> String {
     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
         return arr.value(0).to_string();
     }
-    if let Some(arr) = col
-        .as_any()
-        .downcast_ref::<arrow_array::LargeStringArray>()
-    {
+    if let Some(arr) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
         return arr.value(0).to_string();
     }
     panic!("status column unexpected type {:?}", col.data_type());
@@ -274,14 +271,19 @@ async fn jsonb_overlay_then_bulk_update_and_select_succeed() {
     // A selective SELECT * with a predicate + LIMIT must succeed and return
     // catalog-typed JSONB (the scan-path Binary/LargeBinary GAP).
     let res = sess
-        .execute("SELECT id, status, payload FROM events WHERE created_at < 50 ORDER BY id LIMIT 10")
+        .execute(
+            "SELECT id, status, payload FROM events WHERE created_at < 50 ORDER BY id LIMIT 10",
+        )
         .await
         .expect("filtered SELECT * must succeed (scan-path Binary/LargeBinary GAP)");
     let ExecResult::Rows { batches, .. } = res else {
         panic!("SELECT returned non-Rows");
     };
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total, 10, "ORDER BY id LIMIT 10 must return exactly 10 rows");
+    assert_eq!(
+        total, 10,
+        "ORDER BY id LIMIT 10 must return exactly 10 rows"
+    );
 
     // COUNT(*) WHERE over the JSONB table must succeed.
     assert_eq!(

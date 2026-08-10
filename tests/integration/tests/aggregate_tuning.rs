@@ -74,7 +74,12 @@ fn collect_col_i64(res: &ExecResult, col: usize) -> Vec<i64> {
             .column(col)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap_or_else(|| panic!("column {col} not Int64Array (it is {:?})", b.column(col).data_type()));
+            .unwrap_or_else(|| {
+                panic!(
+                    "column {col} not Int64Array (it is {:?})",
+                    b.column(col).data_type()
+                )
+            });
         for i in 0..arr.len() {
             if arr.is_null(i) {
                 continue;
@@ -125,11 +130,9 @@ async fn explain_text(sess: &basin_engine::ProjectSession, sql: &str) -> String 
 /// "small input" (10k-class) so the per-query overhead this file studies
 /// dominates — exactly the scale where Basin's gap to PG is widest.
 async fn seed(sess: &basin_engine::ProjectSession) {
-    sess.execute(
-        "CREATE TABLE acct (id BIGINT NOT NULL, email TEXT NOT NULL)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE acct (id BIGINT NOT NULL, email TEXT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute(
         "CREATE TABLE evt (\
             id BIGINT NOT NULL, \
@@ -192,14 +195,15 @@ async fn agg_group_by_single_col() {
     // 8 accounts, 400 fact rows evenly distributed → 50 each.
     assert_eq!(row_count(&res), 8, "8 groups expected");
     let counts = collect_col_i64(&res, 1);
-    assert_eq!(counts, vec![50; 8], "each account has 50 rows; got {counts:?}");
+    assert_eq!(
+        counts,
+        vec![50; 8],
+        "each account has 50 rows; got {counts:?}"
+    );
     // Per-account SUM(amount): amounts cycle 1..=100, account a gets rows
     // i where i%8==a. Just assert the grand total via a second query to keep
     // this robust to ordering.
-    let total = sess
-        .execute("SELECT SUM(amount) FROM evt")
-        .await
-        .unwrap();
+    let total = sess.execute("SELECT SUM(amount) FROM evt").await.unwrap();
     let grand = collect_col_i64(&total, 0);
     let sums = collect_col_i64(&res, 2);
     assert_eq!(
@@ -228,7 +232,11 @@ async fn agg_two_table_join_group_by() {
 
     assert_eq!(row_count(&res), 8, "8 accounts → 8 groups");
     let counts = collect_col_i64(&res, 1);
-    assert_eq!(counts, vec![50; 8], "each account joined 50 rows; got {counts:?}");
+    assert_eq!(
+        counts,
+        vec![50; 8],
+        "each account joined 50 rows; got {counts:?}"
+    );
 }
 
 /// Shape (14): bucketed rollup + SUM GROUP BY (PG would use DATE_TRUNC; we use
@@ -242,9 +250,7 @@ async fn agg_bucket_rollup_sum() {
     seed(&sess).await;
 
     let res = sess
-        .execute(
-            "SELECT day AS d, SUM(amount) AS s FROM evt GROUP BY day ORDER BY d",
-        )
+        .execute("SELECT day AS d, SUM(amount) AS s FROM evt GROUP BY day ORDER BY d")
         .await
         .expect("rollup must execute");
 
@@ -278,7 +284,11 @@ async fn agg_multi_col_group_by_having() {
         counts.iter().all(|&c| c > 5),
         "HAVING must filter to groups with > 5; got {counts:?}"
     );
-    assert_eq!(counts.iter().sum::<i64>(), 400, "all 400 rows accounted for");
+    assert_eq!(
+        counts.iter().sum::<i64>(),
+        400,
+        "all 400 rows accounted for"
+    );
 }
 
 /// Shape (24): UNION ALL of two filtered scans of the same table.
@@ -326,20 +336,13 @@ async fn small_input_aggregate_is_single_partition() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
     seed(&sess).await;
 
-    let plan = explain_text(
-        &sess,
-        "SELECT acct_id, COUNT(*) FROM evt GROUP BY acct_id",
-    )
-    .await;
+    let plan = explain_text(&sess, "SELECT acct_id, COUNT(*) FROM evt GROUP BY acct_id").await;
     println!("=== GROUP BY physical plan ===\n{plan}");
 
     // The physical plan section starts after "physical_plan". Assert NO
     // RepartitionExec exchange was inserted — that is the over-partitioning
     // overhead we ruled out as a lever.
-    let phys = plan
-        .split("physical_plan")
-        .nth(1)
-        .unwrap_or(&plan);
+    let phys = plan.split("physical_plan").nth(1).unwrap_or(&plan);
     assert!(
         !phys.contains("RepartitionExec"),
         "small-input aggregate must NOT fan out via RepartitionExec; plan:\n{plan}"

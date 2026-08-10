@@ -52,7 +52,6 @@ use std::sync::{Arc, Mutex};
 use basin_common::{BasinError, ProjectId, Result, TableName};
 use tracing::{debug, warn};
 
-
 /// Serialisation magic for the index file format.
 const MAGIC: [u8; 4] = *b"BIDX";
 /// Current format version.
@@ -321,7 +320,14 @@ pub fn decode_index(data: &[u8]) -> Result<ColumnIndex> {
                 .to_string();
             let row_group = read_u32!();
             let row = read_u64!();
-            idx.insert(key.clone(), IndexLocation { file_path, row_group, row });
+            idx.insert(
+                key.clone(),
+                IndexLocation {
+                    file_path,
+                    row_group,
+                    row,
+                },
+            );
         }
     }
     // v2 trailer: indexed-file coverage set (read AFTER inserts, since insert's
@@ -332,7 +338,9 @@ pub fn decode_index(data: &[u8]) -> Result<ColumnIndex> {
             let flen = read_u32!() as usize;
             let fb = read_bytes!(flen);
             let f = std::str::from_utf8(fb)
-                .map_err(|e| BasinError::internal(format!("secondary index: bad coverage utf8: {e}")))?
+                .map_err(|e| {
+                    BasinError::internal(format!("secondary index: bad coverage utf8: {e}"))
+                })?
                 .to_string();
             idx.indexed_files.insert(f);
         }
@@ -384,9 +392,15 @@ impl ProjectIndexRegistry {
         table: &TableName,
         col: &str,
     ) -> Arc<Mutex<ColumnIndex>> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         let mut map = self.inner.lock().expect("index registry lock poisoned");
-        map.entry(key).or_insert_with(|| Arc::new(Mutex::new(ColumnIndex::new()))).clone()
+        map.entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(ColumnIndex::new())))
+            .clone()
     }
 
     /// Probe the index for `(project, table, col)` with an exact-match key.
@@ -406,8 +420,12 @@ impl ProjectIndexRegistry {
     ) -> Option<Vec<String>> {
         let arc = {
             let map = self.inner.lock().expect("index registry lock poisoned");
-            map.get(&RegKey { project: *project, table: table.clone(), col: col.to_string() })?
-                .clone()
+            map.get(&RegKey {
+                project: *project,
+                table: table.clone(),
+                col: col.to_string(),
+            })?
+            .clone()
         };
         let idx = arc.lock().expect("column index lock poisoned");
         idx.probe(key)
@@ -428,8 +446,12 @@ impl ProjectIndexRegistry {
     ) -> Option<Vec<IndexLocation>> {
         let arc = {
             let map = self.inner.lock().expect("index registry lock poisoned");
-            map.get(&RegKey { project: *project, table: table.clone(), col: col.to_string() })?
-                .clone()
+            map.get(&RegKey {
+                project: *project,
+                table: table.clone(),
+                col: col.to_string(),
+            })?
+            .clone()
         };
         let idx = arc.lock().expect("column index lock poisoned");
         idx.probe_locations(key)
@@ -565,8 +587,12 @@ impl ProjectIndexRegistry {
     ) -> Option<Vec<u8>> {
         let arc = {
             let map = self.inner.lock().expect("index registry lock poisoned");
-            map.get(&RegKey { project: *project, table: table.clone(), col: col.to_string() })?
-                .clone()
+            map.get(&RegKey {
+                project: *project,
+                table: table.clone(),
+                col: col.to_string(),
+            })?
+            .clone()
         };
         let idx = arc.lock().expect("column index lock poisoned");
         Some(encode_index(&idx))
@@ -594,19 +620,20 @@ impl basin_shard::SecondaryIndexSink for ProjectIndexRegistry {
         let mapped: Vec<(String, IndexLocation)> = entries
             .into_iter()
             .map(|(key, file_path, row_group, row)| {
-                (key, IndexLocation { file_path, row_group, row })
+                (
+                    key,
+                    IndexLocation {
+                        file_path,
+                        row_group,
+                        row,
+                    },
+                )
             })
             .collect();
         self.insert_batch(project, table, col, mapped);
     }
 
-    fn remove_file(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-        col: &str,
-        file_path: &str,
-    ) {
+    fn remove_file(&self, project: &ProjectId, table: &TableName, col: &str, file_path: &str) {
         self.remove_file_from_index(project, table, col, file_path);
     }
 }
@@ -774,7 +801,8 @@ pub fn extract_entries_from_batch(
     extract_typed!(Float64Array, col, |v: f64| format!("{v:?}"));
     extract_typed!(StringArray, col, |v: &str| v.to_string());
     extract_typed!(LargeStringArray, col, |v: &str| v.to_string());
-    extract_typed!(BooleanArray, col, |v: bool| if v { "t" } else { "f" }.to_string());
+    extract_typed!(BooleanArray, col, |v: bool| if v { "t" } else { "f" }
+        .to_string());
 
     out
 }
@@ -796,11 +824,14 @@ pub struct IndexSkipCounter {
 
 impl IndexSkipCounter {
     pub const fn new() -> Self {
-        Self { count: std::sync::atomic::AtomicU64::new(0) }
+        Self {
+            count: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     pub fn increment(&self) {
-        self.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn load(&self) -> u64 {
@@ -871,7 +902,11 @@ mod tests {
         let mut idx = ColumnIndex::new();
         idx.insert(
             "k".to_string(),
-            IndexLocation { file_path: "f1.parquet".to_string(), row_group: 0, row: 0 },
+            IndexLocation {
+                file_path: "f1.parquet".to_string(),
+                row_group: 0,
+                row: 0,
+            },
         );
         idx.mark_file_indexed("f1.parquet");
         idx.mark_file_indexed("f2.parquet");
@@ -896,7 +931,11 @@ mod tests {
         let mut idx = ColumnIndex::new();
         idx.insert(
             "k".to_string(),
-            IndexLocation { file_path: "f1.parquet".to_string(), row_group: 0, row: 0 },
+            IndexLocation {
+                file_path: "f1.parquet".to_string(),
+                row_group: 0,
+                row: 0,
+            },
         );
         // Build a v1 blob: same as encode_index but version byte = 1 and no trailer.
         let mut v1 = Vec::new();
@@ -916,7 +955,10 @@ mod tests {
         }
         let decoded = decode_index(&v1).unwrap();
         assert_eq!(decoded.entries.len(), 1);
-        assert!(decoded.indexed_files().is_empty(), "v1 must decode as uncovered");
+        assert!(
+            decoded.indexed_files().is_empty(),
+            "v1 must decode as uncovered"
+        );
     }
 
     #[test]
@@ -924,7 +966,11 @@ mod tests {
         let mut idx = ColumnIndex::new();
         idx.insert(
             "hello".to_string(),
-            IndexLocation { file_path: "f1.parquet".to_string(), row_group: 0, row: 0 },
+            IndexLocation {
+                file_path: "f1.parquet".to_string(),
+                row_group: 0,
+                row: 0,
+            },
         );
         let files = idx.probe("hello").unwrap();
         assert_eq!(files, vec!["f1.parquet".to_string()]);
@@ -935,15 +981,27 @@ mod tests {
         let mut idx = ColumnIndex::new();
         idx.insert(
             "k1".to_string(),
-            IndexLocation { file_path: "f1.parquet".to_string(), row_group: 0, row: 0 },
+            IndexLocation {
+                file_path: "f1.parquet".to_string(),
+                row_group: 0,
+                row: 0,
+            },
         );
         idx.insert(
             "k1".to_string(),
-            IndexLocation { file_path: "f2.parquet".to_string(), row_group: 0, row: 1 },
+            IndexLocation {
+                file_path: "f2.parquet".to_string(),
+                row_group: 0,
+                row: 1,
+            },
         );
         idx.insert(
             "k2".to_string(),
-            IndexLocation { file_path: "f1.parquet".to_string(), row_group: 0, row: 2 },
+            IndexLocation {
+                file_path: "f1.parquet".to_string(),
+                row_group: 0,
+                row: 2,
+            },
         );
         let removed = idx.remove_file("f1.parquet");
         assert_eq!(removed, 2);
@@ -978,7 +1036,11 @@ mod tests {
         let mut idx = ColumnIndex::new();
         idx.insert(
             "val".to_string(),
-            IndexLocation { file_path: "f1.parquet".to_string(), row_group: 2, row: 5 },
+            IndexLocation {
+                file_path: "f1.parquet".to_string(),
+                row_group: 2,
+                row: 5,
+            },
         );
         let locs = idx.probe_locations("val").unwrap();
         assert_eq!(locs.len(), 1);
@@ -993,15 +1055,27 @@ mod tests {
         let mut idx = ColumnIndex::new();
         idx.insert(
             "k".to_string(),
-            IndexLocation { file_path: "f1.parquet".to_string(), row_group: 0, row: 1 },
+            IndexLocation {
+                file_path: "f1.parquet".to_string(),
+                row_group: 0,
+                row: 1,
+            },
         );
         idx.insert(
             "k".to_string(),
-            IndexLocation { file_path: "f1.parquet".to_string(), row_group: 3, row: 7 },
+            IndexLocation {
+                file_path: "f1.parquet".to_string(),
+                row_group: 3,
+                row: 7,
+            },
         );
         idx.insert(
             "k".to_string(),
-            IndexLocation { file_path: "f2.parquet".to_string(), row_group: 1, row: 0 },
+            IndexLocation {
+                file_path: "f2.parquet".to_string(),
+                row_group: 1,
+                row: 0,
+            },
         );
         let locs = idx.probe_locations("k").unwrap();
         assert_eq!(locs.len(), 3);
@@ -1009,7 +1083,10 @@ mod tests {
         let mut rg_map: std::collections::HashMap<String, Vec<u32>> =
             std::collections::HashMap::new();
         for l in &locs {
-            rg_map.entry(l.file_path.clone()).or_default().push(l.row_group);
+            rg_map
+                .entry(l.file_path.clone())
+                .or_default()
+                .push(l.row_group);
         }
         let mut f1_rgs = rg_map["f1.parquet"].clone();
         f1_rgs.sort_unstable();
@@ -1023,21 +1100,32 @@ mod tests {
         // Two rows in the same (file, row_group) — different rows.
         idx.insert(
             "x".to_string(),
-            IndexLocation { file_path: "f.parquet".to_string(), row_group: 0, row: 10 },
+            IndexLocation {
+                file_path: "f.parquet".to_string(),
+                row_group: 0,
+                row: 10,
+            },
         );
         idx.insert(
             "x".to_string(),
-            IndexLocation { file_path: "f.parquet".to_string(), row_group: 0, row: 20 },
+            IndexLocation {
+                file_path: "f.parquet".to_string(),
+                row_group: 0,
+                row: 20,
+            },
         );
         let locs = idx.probe_locations("x").unwrap();
         assert_eq!(locs.len(), 2); // Two raw location entries...
-        // ...but when deduped by (file, rg) → only one row-group entry.
-        let mut rg_set: std::collections::HashSet<(String, u32)> =
-            std::collections::HashSet::new();
+                                   // ...but when deduped by (file, rg) → only one row-group entry.
+        let mut rg_set: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
         for l in &locs {
             rg_set.insert((l.file_path.clone(), l.row_group));
         }
-        assert_eq!(rg_set.len(), 1, "same (file, rg) should collapse to one row-group entry");
+        assert_eq!(
+            rg_set.len(),
+            1,
+            "same (file, rg) should collapse to one row-group entry"
+        );
     }
 
     #[test]

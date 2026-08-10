@@ -64,13 +64,20 @@ pub struct MockSecretStore {
 impl MockSecretStore {
     /// Build an empty store (all lookups return `Err`).
     pub fn empty() -> Self {
-        Self { secrets: std::collections::HashMap::new() }
+        Self {
+            secrets: std::collections::HashMap::new(),
+        }
     }
 
     /// Build a store pre-seeded with `(name, value)` pairs.
-    pub fn with_secrets(pairs: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>) -> Self {
+    pub fn with_secrets(
+        pairs: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
         Self {
-            secrets: pairs.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+            secrets: pairs
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
         }
     }
 }
@@ -143,7 +150,9 @@ impl MockHttpClient {
 
     /// Always fails with the given error string.
     pub fn err(msg: impl Into<String>) -> Self {
-        Self { response: Err(msg.into()) }
+        Self {
+            response: Err(msg.into()),
+        }
     }
 }
 

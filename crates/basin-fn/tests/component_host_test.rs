@@ -21,11 +21,11 @@
 use std::sync::{Arc, Mutex};
 
 use basin_fn::{
-    ComponentHarness, FunctionCallContext, FunctionHost, QueryExecutor,
     engine::{
-        InvocationContext, MockHttpClient, MockQueryExecutor, MockSecretStore,
-        QueryRow, StubSecretStore,
+        InvocationContext, MockHttpClient, MockQueryExecutor, MockSecretStore, QueryRow,
+        StubSecretStore,
     },
+    ComponentHarness, FunctionCallContext, FunctionHost, QueryExecutor,
 };
 
 // Pull the generated bindings for direct trait impl tests.
@@ -43,7 +43,12 @@ struct RecordingExecutor {
 impl RecordingExecutor {
     fn new() -> (Self, Arc<Mutex<Vec<String>>>) {
         let calls = Arc::new(Mutex::new(vec![]));
-        (Self { calls: calls.clone() }, calls)
+        (
+            Self {
+                calls: calls.clone(),
+            },
+            calls,
+        )
     }
 }
 
@@ -78,7 +83,11 @@ fn host_query_exec_returns_rows() {
 
     // Verify SQL was forwarded to the executor.
     let recorded = calls.lock().unwrap();
-    assert_eq!(recorded.as_slice(), &["SELECT 1"], "executor should have seen SELECT 1");
+    assert_eq!(
+        recorded.as_slice(),
+        &["SELECT 1"],
+        "executor should have seen SELECT 1"
+    );
 
     // Verify row shape.
     assert_eq!(rows.len(), 1, "should return exactly one row");
@@ -104,9 +113,12 @@ fn host_query_exec_propagates_error() {
         http: Arc::new(MockHttpClient::err("not configured")),
     });
     let mut host = FunctionHost::new(ctx);
-    let err = <FunctionHost as query::Host>::exec(&mut host, "SELECT secret".to_string())
-        .unwrap_err();
-    assert!(err.contains("permission denied"), "error message should propagate");
+    let err =
+        <FunctionHost as query::Host>::exec(&mut host, "SELECT secret".to_string()).unwrap_err();
+    assert!(
+        err.contains("permission denied"),
+        "error message should propagate"
+    );
 }
 
 /// `basin:functions/log` — fully wired: each level maps to a tracing call.
@@ -174,7 +186,11 @@ fn host_http_fetch_returns_response() {
     let resp = <FunctionHost as http::Host>::fetch(&mut host, req)
         .expect("mock http client should return Ok");
     assert_eq!(resp.status, 200, "status should be 200");
-    assert_eq!(resp.body, b"hello from mock".to_vec(), "body should round-trip");
+    assert_eq!(
+        resp.body,
+        b"hello from mock".to_vec(),
+        "body should round-trip"
+    );
 }
 
 /// `basin:functions/secret` — not-found path: unknown name returns an error.
@@ -187,8 +203,8 @@ fn host_secret_get_unknown_name_returns_error() {
     });
     let mut host = FunctionHost::new(ctx);
 
-    let err = <FunctionHost as secret::Host>::get(&mut host, "MISSING_KEY".to_string())
-        .unwrap_err();
+    let err =
+        <FunctionHost as secret::Host>::get(&mut host, "MISSING_KEY".to_string()).unwrap_err();
     assert!(
         !err.is_empty() && err.contains("MISSING_KEY"),
         "unknown secret should return a descriptive error, got: {err}"
@@ -308,8 +324,7 @@ fn component_harness_end_to_end() {
     let wasm_bytes = wat::parse_str(GUEST_WAT).expect("WAT component should parse without error");
 
     // Build the harness (pre-compiles the component, registers all imports).
-    let harness = ComponentHarness::new(&wasm_bytes)
-        .expect("ComponentHarness::new should succeed");
+    let harness = ComponentHarness::new(&wasm_bytes).expect("ComponentHarness::new should succeed");
 
     // Run with a recording executor so we can verify the path is wired.
     let (exec, _calls) = RecordingExecutor::new();

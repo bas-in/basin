@@ -317,8 +317,7 @@ where
     >,
 {
     // Encode request payload (a local serialisation bug, not a network fault).
-    let payload =
-        codec::encode(req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+    let payload = codec::encode(req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
     let wire = RaftRpcRequest { payload };
 
     let channel = net.channel().await?;
@@ -344,14 +343,15 @@ where
     match response.result {
         Some(raft_rpc_response::Result::Ok(bytes)) => {
             // Peer answered with a protocol response — decode it.
-            codec::decode::<Resp>(&bytes)
-                .map_err(|e| RPCError::Network(NetworkError::new(&e)))
+            codec::decode::<Resp>(&bytes).map_err(|e| RPCError::Network(NetworkError::new(&e)))
         }
         Some(raft_rpc_response::Result::RaftError(bytes)) => {
             // Peer is alive but its raft instance returned an error.
             let raft_err: RaftError<NodeId, E> = codec::decode_raft_error(&bytes)
                 .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-            Err(RPCError::RemoteError(RemoteError::new(net.target, raft_err)))
+            Err(RPCError::RemoteError(RemoteError::new(
+                net.target, raft_err,
+            )))
         }
         None => Err(RPCError::Network(NetworkError::new(&EmptyEnvelope(
             net.target,
@@ -505,7 +505,10 @@ mod tests {
 
     #[test]
     fn upgrades_http_scheme() {
-        assert_eq!(upgrade_to_https("http://10.0.0.1:6010"), "https://10.0.0.1:6010");
+        assert_eq!(
+            upgrade_to_https("http://10.0.0.1:6010"),
+            "https://10.0.0.1:6010"
+        );
     }
 
     #[test]

@@ -33,8 +33,6 @@ pub use error::{BlobError, Result};
 pub use mime::sniff as mime_sniff;
 pub use model::{Bucket, BucketId, Object, ObjectId};
 pub use postgres::PostgresBlobCatalog;
-pub use rls::{
-    CallerCtx, ObjectPolicy, ObjectPolicyCommand, ObjectRlsStore, ObjectUsing,
-};
+pub use rls::{CallerCtx, ObjectPolicy, ObjectPolicyCommand, ObjectRlsStore, ObjectUsing};
 pub use signing::BlobSigningSecret;
 pub use store::{BlobCatalog, BlobStore};

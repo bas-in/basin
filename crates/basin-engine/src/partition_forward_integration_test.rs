@@ -79,18 +79,15 @@ async fn shard_for(
         .unwrap(),
     );
     let registry: Arc<dyn basin_catalog::LeaseRegistry> = catalog.clone();
-    let cfg = basin_shard::ShardConfig::new(
-        storage,
-        catalog as Arc<dyn basin_catalog::Catalog>,
-        wal,
-    )
-    .with_lease_registry(registry, replica_id)
-    // Required mode is the multi-node enforcement shape: the lease HOLDER is
-    // the single writer, and a non-owner `shard.get` serves a read-only handle
-    // (reads continue) instead of hard-erroring. This is what lets engine B
-    // scan an A-owned partition (and vice versa) without a `CommitConflict`,
-    // while still guaranteeing single-writer via the lease CAS on write.
-    .with_lease_mode(basin_shard::LeaseMode::Required);
+    let cfg =
+        basin_shard::ShardConfig::new(storage, catalog as Arc<dyn basin_catalog::Catalog>, wal)
+            .with_lease_registry(registry, replica_id)
+            // Required mode is the multi-node enforcement shape: the lease HOLDER is
+            // the single writer, and a non-owner `shard.get` serves a read-only handle
+            // (reads continue) instead of hard-erroring. This is what lets engine B
+            // scan an A-owned partition (and vice versa) without a `CommitConflict`,
+            // while still guaranteeing single-writer via the lease CAS on write.
+            .with_lease_mode(basin_shard::LeaseMode::Required);
     basin_shard::Shard::new(cfg)
 }
 
@@ -217,7 +214,9 @@ async fn two_engine_partition_forward_lands_on_owner_and_scans_cross_node() {
     // forward seam is exercised regardless of the compiled-in default. The
     // lock (held for the whole body) serializes against the sibling test, which
     // also pins this env var, so neither flips the other's fan-out mid-run.
-    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = FANOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
 
     let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -248,10 +247,7 @@ async fn two_engine_partition_forward_lands_on_owner_and_scans_cross_node() {
     // the shared catalog).
     let sess_a = eng_a.open_session(ProjectId::new()).await.unwrap();
     let project = sess_a.project();
-    sess_a
-        .execute("CREATE TABLE t (id BIGINT)")
-        .await
-        .unwrap();
+    sess_a.execute("CREATE TABLE t (id BIGINT)").await.unwrap();
 
     let table = TableName::new("t").unwrap();
     let router = PartitionRouter::new(peers.clone(), PEER_A);
@@ -304,12 +300,14 @@ async fn two_engine_partition_forward_lands_on_owner_and_scans_cross_node() {
         let on_b = tail_rows(&shard_b, &project, part, &table).await;
         let on_a = tail_rows(&shard_a, &project, part, &table).await;
         assert_eq!(
-            on_b, per_batch as usize,
+            on_b,
+            per_batch as usize,
             "B-owned partition {} must hold its {per_batch} rows on B",
             part.as_str()
         );
         assert_eq!(
-            on_a, 0,
+            on_a,
+            0,
             "B-owned partition {} must NOT have landed on A",
             part.as_str()
         );
@@ -319,12 +317,14 @@ async fn two_engine_partition_forward_lands_on_owner_and_scans_cross_node() {
         let on_a = tail_rows(&shard_a, &project, part, &table).await;
         let on_b = tail_rows(&shard_b, &project, part, &table).await;
         assert_eq!(
-            on_a, per_batch as usize,
+            on_a,
+            per_batch as usize,
             "A-owned partition {} must hold its rows locally on A",
             part.as_str()
         );
         assert_eq!(
-            on_b, 0,
+            on_b,
+            0,
             "A-owned partition {} must NOT have landed on B",
             part.as_str()
         );
@@ -369,7 +369,11 @@ async fn two_engine_partition_forward_lands_on_owner_and_scans_cross_node() {
         };
         total += tail_rows(owner_shard, &project, part, &table).await;
     }
-    assert_eq!(total, all_ids.len(), "total rows must equal what we ingested");
+    assert_eq!(
+        total,
+        all_ids.len(),
+        "total rows must equal what we ingested"
+    );
 
     // (b) Cross-node scan: flush BOTH shards' tails to the shared cold store,
     //     then a SELECT from EITHER engine returns ALL rows (read fan-in via
@@ -387,11 +391,7 @@ async fn two_engine_partition_forward_lands_on_owner_and_scans_cross_node() {
             crate::ExecResult::Rows { batches, .. } => batches
                 .iter()
                 .flat_map(|b| {
-                    let col = b
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap();
+                    let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
                     (0..b.num_rows()).map(|i| col.value(i)).collect::<Vec<_>>()
                 })
                 .next()
@@ -412,7 +412,9 @@ async fn two_engine_partition_forward_lands_on_owner_and_scans_cross_node() {
 /// even though a forward transport is installed (it must never be consulted).
 #[tokio::test]
 async fn back_compat_no_peers_keeps_fanout_local() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = FANOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
 
     let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -560,7 +562,9 @@ impl PartitionForwardClient for LostAckDouble {
 /// sent (no dup, no loss).
 #[tokio::test]
 async fn lost_ack_retry_reuses_key_and_applies_exactly_once() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = FANOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
 
     let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -606,7 +610,10 @@ async fn lost_ack_retry_reuses_key_and_applies_exactly_once() {
             forwarded_any = true;
         }
     }
-    assert!(forwarded_any, "router put no partitions on B — no forward exercised");
+    assert!(
+        forwarded_any,
+        "router put no partitions on B — no forward exercised"
+    );
 
     // A retry happened (a key appears twice in keys_seen) and EVERY retry reused
     // the SAME key (each distinct key applied exactly once).
@@ -619,7 +626,10 @@ async fn lost_ack_retry_reuses_key_and_applies_exactly_once() {
             seen >= 2,
             "key {k} should have been seen at least twice (attempt + lost-ack retry)"
         );
-        assert_eq!(rows, per_batch as u64, "each batch applies its full rowcount once");
+        assert_eq!(
+            rows, per_batch as u64,
+            "each batch applies its full rowcount once"
+        );
     }
 
     // Owner B holds each forwarded partition's rows EXACTLY once (no dup from
@@ -640,7 +650,8 @@ async fn lost_ack_retry_reuses_key_and_applies_exactly_once() {
         };
         let n = tail_rows(owner_shard, &project, &part, &table).await;
         assert_eq!(
-            n, per_batch as usize,
+            n,
+            per_batch as usize,
             "partition {} must hold its rows EXACTLY once (no dup from the lost-ack retry)",
             part.as_str()
         );
@@ -659,7 +670,9 @@ async fn lost_ack_retry_reuses_key_and_applies_exactly_once() {
 /// the set.
 #[tokio::test]
 async fn copy_touched_set_covers_all_partitions_with_monotone_lsns() {
-    let _guard = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = FANOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Pin a 4-way fan-out so the round-robin visits _default, s1, s2, s3.
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "4");
 
@@ -702,7 +715,9 @@ async fn copy_touched_set_covers_all_partitions_with_monotone_lsns() {
             PartitionKey::new(format!("s{}", i % fanout)).unwrap()
         };
         let g = sess.copy_touched.lock().await;
-        let cur = *g.get(&part).expect("touched set must include the written partition");
+        let cur = *g
+            .get(&part)
+            .expect("touched set must include the written partition");
         if let Some(prev) = prev_lsn_per_part.get(&part) {
             assert!(
                 cur > *prev,
@@ -717,7 +732,11 @@ async fn copy_touched_set_covers_all_partitions_with_monotone_lsns() {
     // Every one of the 4 fan-out partitions must be present in the touched set.
     {
         let g = sess.copy_touched.lock().await;
-        assert_eq!(g.len(), fanout, "touched set must cover all {fanout} partitions");
+        assert_eq!(
+            g.len(),
+            fanout,
+            "touched set must cover all {fanout} partitions"
+        );
         for i in 0..fanout {
             let part = if i == 0 {
                 PartitionKey::default_key()
@@ -798,7 +817,9 @@ impl PartitionForwardClient for DurabilityProbingDouble {
 /// test does not require; here we assert the default (barrier ON) guarantee.
 #[tokio::test]
 async fn forwarded_copy_batch_is_durable_on_owner_before_ack() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = FANOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
     // Barrier ON (default). Be explicit so the test is hermetic regardless of
     // ambient env; the flag is read once and cached, so this must match the
@@ -867,16 +888,19 @@ async fn forwarded_copy_batch_is_durable_on_owner_before_ack() {
     assert!(!landed.is_empty(), "no batches were forwarded to B");
     for (part, lsn) in landed {
         let handle = shard_b.get(&project, &part).await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_millis(250), handle.await_durable(lsn))
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "forwarded batch on B partition {} is NOT durable through {lsn:?} \
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            handle.await_durable(lsn),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "forwarded batch on B partition {} is NOT durable through {lsn:?} \
                      after the forward returned — durable-on-forward violated",
-                    part.as_str()
-                )
-            })
-            .unwrap();
+                part.as_str()
+            )
+        })
+        .unwrap();
     }
 
     std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
@@ -890,7 +914,9 @@ async fn forwarded_copy_batch_is_durable_on_owner_before_ack() {
 /// incident self-diagnosing: the audit's accounting is the smoking-gun signal.
 #[tokio::test]
 async fn copy_durability_audit_accounts_for_every_acked_row_across_nodes() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = FANOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
     // The audit only proves owner-durability when the durable-on-forward gate is
     // ON (the process default). Assert it so the gate is meaningful.
@@ -981,14 +1007,16 @@ async fn copy_durability_audit_accounts_for_every_acked_row_across_nodes() {
         if rec.forwarded {
             forwarded_seen = true;
             assert_eq!(
-                rec.owner, PEER_B,
+                rec.owner,
+                PEER_B,
                 "forwarded partition {} must report owner B",
                 part.as_str()
             );
         } else {
             local_seen = true;
             assert_eq!(
-                rec.owner, "local",
+                rec.owner,
+                "local",
                 "local partition {} must report owner=local",
                 part.as_str()
             );
@@ -1013,8 +1041,14 @@ async fn copy_durability_audit_accounts_for_every_acked_row_across_nodes() {
     // empty — no leakage into a subsequent COPY on the same session.
     sess_a.await_copy_durable().await.unwrap();
     let after = sess_a.copy_audit_snapshot().await;
-    assert_eq!(after.rows_acked, 0, "await_copy_durable must drain the audit");
-    assert!(after.partitions.is_empty(), "audit partitions must be cleared");
+    assert_eq!(
+        after.rows_acked, 0,
+        "await_copy_durable must drain the audit"
+    );
+    assert!(
+        after.partitions.is_empty(),
+        "audit partitions must be cleared"
+    );
 
     std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
 }
@@ -1195,9 +1229,7 @@ fn wal_payload_rows(payload: &[u8]) -> usize {
     let tlen = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
     let ipc = &payload[4 + tlen..];
     let reader = StreamReader::try_new(Cursor::new(ipc), None).expect("ipc reader");
-    reader
-        .map(|b| b.expect("ipc batch").num_rows())
-        .sum()
+    reader.map(|b| b.expect("ipc batch").num_rows()).sum()
 }
 
 /// `SELECT count(*)` through a session — the global committed-segment row count
@@ -1215,11 +1247,7 @@ async fn select_count(sess: &crate::ProjectSession, table: &str) -> i64 {
         crate::ExecResult::Rows { batches, .. } => batches
             .iter()
             .flat_map(|b| {
-                let col = b
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap();
+                let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
                 (0..b.num_rows()).map(|i| col.value(i)).collect::<Vec<_>>()
             })
             .next()
@@ -1250,7 +1278,9 @@ async fn select_count(sess: &crate::ProjectSession, table: &str) -> i64 {
 ///      exactly once.
 #[tokio::test]
 async fn two_node_restart_recovers_forwarded_wal_durable_tail() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = FANOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
     basin_common::telemetry::try_init_for_tests();
 
@@ -1487,7 +1517,9 @@ async fn two_node_restart_recovers_forwarded_wal_durable_tail() {
     // it must read back exactly once.
     let probe_id = n - 3;
     let res = sess_a2
-        .execute(&format!("SELECT count(*) AS n FROM t WHERE id = {probe_id}"))
+        .execute(&format!(
+            "SELECT count(*) AS n FROM t WHERE id = {probe_id}"
+        ))
         .await
         .unwrap();
     let hits = match res {
@@ -1555,7 +1587,9 @@ impl PartitionForwardClient for AlwaysFailForward {
 /// ack-without-durability hole behind the live 14.19M loss.
 #[tokio::test]
 async fn forward_drop_fails_the_copy_fail_closed() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = FANOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
 
     let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1658,7 +1692,9 @@ async fn forward_drop_fails_the_copy_fail_closed() {
 /// `write_batch_fanout` guard at executor.rs ~455.
 #[tokio::test]
 async fn forward_off_node_without_transport_fails_closed() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = FANOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
 
     let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1705,7 +1741,10 @@ async fn forward_off_node_without_transport_fails_closed() {
             res.unwrap();
         }
     }
-    assert!(saw_b_owned, "router put no partitions on B — guard not exercised");
+    assert!(
+        saw_b_owned,
+        "router put no partitions on B — guard not exercised"
+    );
 
     std::env::remove_var("BASIN_SHARD_PARTITIONS_PER_TABLE");
 }
@@ -1723,7 +1762,9 @@ async fn forward_off_node_without_transport_fails_closed() {
 ///      and returns the exact total.
 #[tokio::test]
 async fn count_from_non_owner_includes_peer_tail_rows() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = FANOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
 
     let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1837,7 +1878,9 @@ impl PartitionForwardClient for FailingDrainDouble {
 /// scan both omit the peer's tail, so any fallback is confidently wrong).
 #[tokio::test]
 async fn peer_drain_failure_fails_count_loud() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = FANOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
 
     let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1921,7 +1964,9 @@ impl PartitionForwardClient for WarmingDrainDouble {
 /// `PartitionWarming` error (kind preserved end-to-end), not a generic one.
 #[tokio::test]
 async fn peer_warming_propagates() {
-    let _env = FANOUT_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = FANOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("BASIN_SHARD_PARTITIONS_PER_TABLE", "8");
 
     let cold: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

@@ -192,7 +192,9 @@ async fn schemata_lists_all_reserved_schemas() {
     }
 
     // Collect schema names and verify all reserved schemas present.
-    let mut names: Vec<&str> = (0..schema_name_col.len()).map(|i| schema_name_col.value(i)).collect();
+    let mut names: Vec<&str> = (0..schema_name_col.len())
+        .map(|i| schema_name_col.value(i))
+        .collect();
     names.sort();
     let mut expected: Vec<&str> = ReservedSchema::ALL.iter().map(|r| r.as_str()).collect();
     expected.sort();

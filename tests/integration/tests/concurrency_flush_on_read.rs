@@ -194,11 +194,19 @@ async fn read_own_write_through_every_fast_path() {
     let server = start_server_with_shard().await;
     let c = connect(server.addr, "alice").await;
 
-    exec(&c, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").await;
+    exec(
+        &c,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)",
+    )
+    .await;
 
     // Seed a cold base so there ARE cold files (flush forced by this scan).
     for i in 1..=10i64 {
-        exec(&c, &format!("INSERT INTO t (id, v) VALUES ({i}, {})", i * 10)).await;
+        exec(
+            &c,
+            &format!("INSERT INTO t (id, v) VALUES ({i}, {})", i * 10),
+        )
+        .await;
     }
     // Force a flush so rows 1..=10 are cold Parquet, tail empty.
     let _ = scalar_i64(&c, "SELECT count(*) FROM t").await;
@@ -213,13 +221,22 @@ async fn read_own_write_through_every_fast_path() {
 
     // Full scan: 11 rows.
     let all = query_rows(&c, "SELECT id FROM t").await;
-    assert_eq!(all.len(), 11, "full scan RYOW: want 11 rows, got {}", all.len());
+    assert_eq!(
+        all.len(),
+        11,
+        "full scan RYOW: want 11 rows, got {}",
+        all.len()
+    );
 
     // COUNT(*): 11.
     assert_eq!(scalar_i64(&c, "SELECT count(*) FROM t").await, 11);
 
     // Keyset pagination (ASC, k > $1): the new row id=11 must appear.
-    let ks = query_rows(&c, "SELECT id FROM t WHERE id > 5 ORDER BY id ASC LIMIT 100").await;
+    let ks = query_rows(
+        &c,
+        "SELECT id FROM t WHERE id > 5 ORDER BY id ASC LIMIT 100",
+    )
+    .await;
     let ids: Vec<i64> = ks
         .iter()
         .map(|r| r[0].as_deref().unwrap().parse().unwrap())
@@ -261,7 +278,11 @@ async fn read_own_write_under_concurrent_writers() {
             let base = (w as i64) * 1000;
             for i in 0..PER_WRITER {
                 let id = base + i;
-                exec(&c, &format!("INSERT INTO churn (id, v) VALUES ({id}, {})", id * 2)).await;
+                exec(
+                    &c,
+                    &format!("INSERT INTO churn (id, v) VALUES ({id}, {})", id * 2),
+                )
+                .await;
                 // RYOW on the very next statement, every fast path:
                 let got = query_rows(&c, &format!("SELECT v FROM churn WHERE id = {id}")).await;
                 assert_eq!(
@@ -317,7 +338,11 @@ async fn small_tail_merge_on_read_unions_cold_and_tail() {
     let server = start_server_with_shard().await;
     let c = connect(server.addr, "alice").await;
 
-    exec(&c, "CREATE TABLE m (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").await;
+    exec(
+        &c,
+        "CREATE TABLE m (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)",
+    )
+    .await;
     for i in 1..=20i64 {
         exec(&c, &format!("INSERT INTO m (id, v) VALUES ({i}, {})", i)).await;
     }
@@ -332,7 +357,11 @@ async fn small_tail_merge_on_read_unions_cold_and_tail() {
 
     // Scan: must be cold (1..20) ∪ tail (21..40) = 40 rows, no flush forced.
     let all = query_rows(&c, "SELECT id FROM m ORDER BY id").await;
-    assert_eq!(all.len(), 40, "merge-on-read must union cold + tail (40 rows)");
+    assert_eq!(
+        all.len(),
+        40,
+        "merge-on-read must union cold + tail (40 rows)"
+    );
     let ids: Vec<i64> = all
         .iter()
         .map(|r| r[0].as_deref().unwrap().parse().unwrap())
@@ -358,7 +387,11 @@ async fn tail_empty_gate_preserves_overlay_suppression() {
     let server = start_server_with_shard().await;
     let c = connect(server.addr, "alice").await;
 
-    exec(&c, "CREATE TABLE d (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").await;
+    exec(
+        &c,
+        "CREATE TABLE d (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)",
+    )
+    .await;
     for i in 1..=8i64 {
         exec(&c, &format!("INSERT INTO d (id, v) VALUES ({i}, {})", i)).await;
     }
@@ -390,7 +423,11 @@ async fn ddl_add_column_not_served_from_stale_provider() {
     let server = start_server_with_shard().await;
     let c = connect(server.addr, "alice").await;
 
-    exec(&c, "CREATE TABLE s (id BIGINT PRIMARY KEY, a BIGINT NOT NULL)").await;
+    exec(
+        &c,
+        "CREATE TABLE s (id BIGINT PRIMARY KEY, a BIGINT NOT NULL)",
+    )
+    .await;
     for i in 1..=5i64 {
         exec(&c, &format!("INSERT INTO s (id, a) VALUES ({i}, {})", i)).await;
     }
@@ -424,9 +461,17 @@ async fn cached_provider_reflects_later_fastpath_update() {
     let server = start_server_with_shard().await;
     let c = connect(server.addr, "alice").await;
 
-    exec(&c, "CREATE TABLE u (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").await;
+    exec(
+        &c,
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)",
+    )
+    .await;
     for i in 1..=6i64 {
-        exec(&c, &format!("INSERT INTO u (id, v) VALUES ({i}, {})", i * 10)).await;
+        exec(
+            &c,
+            &format!("INSERT INTO u (id, v) VALUES ({i}, {})", i * 10),
+        )
+        .await;
     }
     // Flush + warm the provider cache.
     assert_eq!(scalar_i64(&c, "SELECT count(*) FROM u").await, 6);
@@ -461,11 +506,23 @@ async fn per_table_invalidation_no_cross_table_leak() {
     let server = start_server_with_shard().await;
     let c = connect(server.addr, "alice").await;
 
-    exec(&c, "CREATE TABLE a (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").await;
-    exec(&c, "CREATE TABLE b (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").await;
+    exec(
+        &c,
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)",
+    )
+    .await;
+    exec(
+        &c,
+        "CREATE TABLE b (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)",
+    )
+    .await;
     for i in 1..=5i64 {
         exec(&c, &format!("INSERT INTO a (id, v) VALUES ({i}, {})", i)).await;
-        exec(&c, &format!("INSERT INTO b (id, v) VALUES ({i}, {})", i * 100)).await;
+        exec(
+            &c,
+            &format!("INSERT INTO b (id, v) VALUES ({i}, {})", i * 100),
+        )
+        .await;
     }
     // Warm both providers (flush + cache fill).
     assert_eq!(scalar_i64(&c, "SELECT count(*) FROM a").await, 5);
@@ -478,7 +535,11 @@ async fn per_table_invalidation_no_cross_table_leak() {
     }
 
     // Table B must be completely unaffected and correct.
-    assert_eq!(scalar_i64(&c, "SELECT count(*) FROM b").await, 5, "B count leaked");
+    assert_eq!(
+        scalar_i64(&c, "SELECT count(*) FROM b").await,
+        5,
+        "B count leaked"
+    );
     let bvals = query_rows(&c, "SELECT id, v FROM b ORDER BY id").await;
     let got: Vec<(i64, i64)> = bvals
         .iter()
@@ -498,7 +559,11 @@ async fn per_table_invalidation_no_cross_table_leak() {
     // And table A itself is correct after the churn (its own invalidation works).
     assert_eq!(scalar_i64(&c, "SELECT count(*) FROM a").await, 40);
     let a40 = query_rows(&c, "SELECT v FROM a WHERE id = 40").await;
-    assert_eq!(a40[0][0].as_deref(), Some("1040"), "A's own UPDATE must be visible");
+    assert_eq!(
+        a40[0][0].as_deref(),
+        Some("1040"),
+        "A's own UPDATE must be visible"
+    );
 
     shutdown(server).await;
 }
@@ -513,11 +578,27 @@ async fn per_table_invalidation_no_cross_project_leak() {
     let alice = connect(server.addr, "alice").await;
     let bob = connect(server.addr, "bob").await;
 
-    exec(&alice, "CREATE TABLE shared (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").await;
-    exec(&bob, "CREATE TABLE shared (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").await;
+    exec(
+        &alice,
+        "CREATE TABLE shared (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)",
+    )
+    .await;
+    exec(
+        &bob,
+        "CREATE TABLE shared (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)",
+    )
+    .await;
     for i in 1..=5i64 {
-        exec(&alice, &format!("INSERT INTO shared (id, v) VALUES ({i}, {})", i)).await;
-        exec(&bob, &format!("INSERT INTO shared (id, v) VALUES ({i}, {})", i * 1000)).await;
+        exec(
+            &alice,
+            &format!("INSERT INTO shared (id, v) VALUES ({i}, {})", i),
+        )
+        .await;
+        exec(
+            &bob,
+            &format!("INSERT INTO shared (id, v) VALUES ({i}, {})", i * 1000),
+        )
+        .await;
     }
     // Warm both.
     assert_eq!(scalar_i64(&alice, "SELECT count(*) FROM shared").await, 5);
@@ -525,11 +606,19 @@ async fn per_table_invalidation_no_cross_project_leak() {
 
     // Alice churns her copy.
     for i in 6..=30i64 {
-        exec(&alice, &format!("INSERT INTO shared (id, v) VALUES ({i}, {})", i)).await;
+        exec(
+            &alice,
+            &format!("INSERT INTO shared (id, v) VALUES ({i}, {})", i),
+        )
+        .await;
     }
 
     // Bob's copy unchanged and isolated.
-    assert_eq!(scalar_i64(&bob, "SELECT count(*) FROM shared").await, 5, "bob count leaked");
+    assert_eq!(
+        scalar_i64(&bob, "SELECT count(*) FROM shared").await,
+        5,
+        "bob count leaked"
+    );
     let bvals = query_rows(&bob, "SELECT id, v FROM shared ORDER BY id").await;
     let got: Vec<(i64, i64)> = bvals
         .iter()
@@ -547,7 +636,11 @@ async fn per_table_invalidation_no_cross_project_leak() {
     );
     // A point read of a PK that only exists in alice's copy must MISS for bob.
     let miss = query_rows(&bob, "SELECT v FROM shared WHERE id = 20").await;
-    assert_eq!(miss.len(), 0, "bob must not see alice's id=20 (cross-project leak)");
+    assert_eq!(
+        miss.len(),
+        0,
+        "bob must not see alice's id=20 (cross-project leak)"
+    );
 
     // Alice's churn is correct on her side.
     assert_eq!(scalar_i64(&alice, "SELECT count(*) FROM shared").await, 30);
@@ -571,7 +664,11 @@ async fn timing_mixed_rw_8r_4w_print_only() {
     .await;
     // Seed a cold base so reads have real files.
     for i in 1..=500i64 {
-        exec(&setup, &format!("INSERT INTO mix (id, v) VALUES ({i}, {})", i)).await;
+        exec(
+            &setup,
+            &format!("INSERT INTO mix (id, v) VALUES ({i}, {})", i),
+        )
+        .await;
     }
     let _ = scalar_i64(&setup, "SELECT count(*) FROM mix").await; // flush
 
@@ -639,7 +736,11 @@ async fn timing_16_session_readonly_print_only() {
     )
     .await;
     for i in 1..=1000i64 {
-        exec(&setup, &format!("INSERT INTO ro (id, v) VALUES ({i}, {})", i)).await;
+        exec(
+            &setup,
+            &format!("INSERT INTO ro (id, v) VALUES ({i}, {})", i),
+        )
+        .await;
     }
     // Flush so the tail is empty (the tail-empty fast-gate is the win here).
     assert_eq!(scalar_i64(&setup, "SELECT count(*) FROM ro").await, 1000);

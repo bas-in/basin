@@ -229,7 +229,11 @@ async fn secondary_probe_skips_non_matching_files() {
 
     exec_ok(&sess, "CREATE TABLE k (id BIGINT, owner BIGINT)").await;
     for i in 0..1_000i64 {
-        exec_ok(&sess, &format!("INSERT INTO k (id, owner) VALUES ({i}, {i})")).await;
+        exec_ok(
+            &sess,
+            &format!("INSERT INTO k (id, owner) VALUES ({i}, {i})"),
+        )
+        .await;
     }
     shard.flush_to_parquet().await.unwrap();
     exec_ok(&sess, "CREATE INDEX k_owner_idx ON k (owner)").await;
@@ -238,7 +242,10 @@ async fn secondary_probe_skips_non_matching_files() {
     // for a key in one file should let the probe skip the others.
     let live = live_file_paths(&eng, &project, &table).await;
     let before = eng.secondary_index_skipped_count();
-    assert_eq!(count_rows(&sess, "SELECT id FROM k WHERE owner = 7").await, 1);
+    assert_eq!(
+        count_rows(&sess, "SELECT id FROM k WHERE owner = 7").await,
+        1
+    );
     let after = eng.secondary_index_skipped_count();
 
     if live.len() > 1 {

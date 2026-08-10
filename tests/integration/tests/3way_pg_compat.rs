@@ -121,7 +121,11 @@ fn build_corpus(ns: &str) -> Vec<Shape> {
     let mut s: Vec<Shape> = Vec::new();
 
     // ── basic SELECT / literals ──────────────────────────────────────────────
-    s.push(Shape::new("select_one_int", "basic_select", "SELECT 1::int"));
+    s.push(Shape::new(
+        "select_one_int",
+        "basic_select",
+        "SELECT 1::int",
+    ));
     s.push(Shape::new(
         "select_text_literal",
         "basic_select",
@@ -814,19 +818,22 @@ async fn three_way_pg_compat() {
     let neon_url = env::var(NEON_URL_ENV).ok();
     let supabase_url = env::var(SUPABASE_URL_ENV).ok();
 
-    let (basin_url, neon_url, supabase_url) =
-        match (basin_url.as_deref(), neon_url.as_deref(), supabase_url.as_deref()) {
-            (Some(b), Some(n), Some(s)) if !b.is_empty() && !n.is_empty() && !s.is_empty() => {
-                (b.to_owned(), n.to_owned(), s.to_owned())
-            }
-            _ => {
-                println!(
-                    "skip: set BASIN_3WAY_*_URL for 3-way compat run \
+    let (basin_url, neon_url, supabase_url) = match (
+        basin_url.as_deref(),
+        neon_url.as_deref(),
+        supabase_url.as_deref(),
+    ) {
+        (Some(b), Some(n), Some(s)) if !b.is_empty() && !n.is_empty() && !s.is_empty() => {
+            (b.to_owned(), n.to_owned(), s.to_owned())
+        }
+        _ => {
+            println!(
+                "skip: set BASIN_3WAY_*_URL for 3-way compat run \
                      (need {BASIN_URL_ENV}, {NEON_URL_ENV}, {SUPABASE_URL_ENV})"
-                );
-                return;
-            }
-        };
+            );
+            return;
+        }
+    };
 
     println!("=== 3-way pg-compat differential ===");
     println!("  Basin    : (BASIN_3WAY_BASIN_URL set)");
@@ -1001,8 +1008,9 @@ async fn three_way_pg_compat() {
 /// Connect with a 15s timeout so a misconfigured DSN cannot hang CI.
 async fn connect(url: &str, label: &str) -> Result<Client, String> {
     let fut = async {
-        let (client, connection) =
-            tokio_postgres::connect(url, NoTls).await.map_err(|e| e.to_string())?;
+        let (client, connection) = tokio_postgres::connect(url, NoTls)
+            .await
+            .map_err(|e| e.to_string())?;
         // Spawn the connection driver. If it returns an error we just log.
         let driver_label = label.to_owned();
         tokio::spawn(async move {
@@ -1033,6 +1041,10 @@ fn corpus_is_non_empty() {
     for sh in &corpus {
         assert!(!sh.sql.trim().is_empty(), "shape {} has empty SQL", sh.name);
         assert!(!sh.name.is_empty(), "shape with empty name");
-        assert!(!sh.category.is_empty(), "shape {} missing category", sh.name);
+        assert!(
+            !sh.category.is_empty(),
+            "shape {} missing category",
+            sh.name
+        );
     }
 }

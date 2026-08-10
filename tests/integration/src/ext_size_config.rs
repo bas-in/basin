@@ -129,7 +129,10 @@ mod tests {
 
     #[test]
     fn parse_sizes_basic() {
-        assert_eq!(parse_sizes("10000,100000,1000000"), vec![10_000, 100_000, 1_000_000]);
+        assert_eq!(
+            parse_sizes("10000,100000,1000000"),
+            vec![10_000, 100_000, 1_000_000]
+        );
         assert_eq!(parse_sizes(" 100000 , 10000 "), vec![10_000, 100_000]);
         assert_eq!(parse_sizes("100000,100000"), vec![100_000]);
         assert_eq!(parse_sizes(""), DEFAULT_SIZES.to_vec());
@@ -148,8 +151,14 @@ mod tests {
 
     #[test]
     fn suffixing() {
-        assert_eq!(size_suffixed_filename("ext_bench_fts.json", "100k"), "ext_bench_fts_100k.json");
-        assert_eq!(size_suffixed_filename("ext_bench_vector.json", "128d_100k"), "ext_bench_vector_128d_100k.json");
+        assert_eq!(
+            size_suffixed_filename("ext_bench_fts.json", "100k"),
+            "ext_bench_fts_100k.json"
+        );
+        assert_eq!(
+            size_suffixed_filename("ext_bench_vector.json", "128d_100k"),
+            "ext_bench_vector_128d_100k.json"
+        );
         assert_eq!(size_suffixed_filename("noext", "1m"), "noext_1m");
     }
 }

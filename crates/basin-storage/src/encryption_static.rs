@@ -116,9 +116,11 @@ impl StaticKeyEncryption {
         let cipher = Aes256Gcm::new(key);
         let nonce = Nonce::from_slice(nonce_bytes);
 
-        cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|_| BasinError::storage("static-key unwrap: authentication failed (wrong root key or tampered sidecar)"))
+        cipher.decrypt(nonce, ciphertext).map_err(|_| {
+            BasinError::storage(
+                "static-key unwrap: authentication failed (wrong root key or tampered sidecar)",
+            )
+        })
     }
 }
 
@@ -250,7 +252,10 @@ mod tests {
         assert_eq!(plaintext_key.len(), 32, "data key must be 32 bytes");
 
         let recovered = provider.unwrap_key(&project, &wrapped).await.unwrap();
-        assert_eq!(plaintext_key, recovered, "round-trip must reproduce data key");
+        assert_eq!(
+            plaintext_key, recovered,
+            "round-trip must reproduce data key"
+        );
     }
 
     #[tokio::test]
@@ -318,8 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn static_key_is_object_safe_and_send_sync() {
-        let provider: Arc<dyn EncryptionProvider> =
-            Arc::new(StaticKeyEncryption::new(test_key()));
+        let provider: Arc<dyn EncryptionProvider> = Arc::new(StaticKeyEncryption::new(test_key()));
         let project = ProjectId::new();
         let (_, _) = provider.wrap_key(&project).await.unwrap();
     }
@@ -344,8 +348,7 @@ mod tests {
 
         // 3. Verify the ciphertext is NOT the plaintext (i.e., encrypted).
         assert_ne!(
-            &ciphertext,
-            original_plaintext,
+            &ciphertext, original_plaintext,
             "ciphertext must differ from plaintext"
         );
         assert!(
@@ -448,7 +451,10 @@ mod tests {
         let result = EnvKeyEncryption::from_env();
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("32 bytes"), "error should mention 32 bytes: {msg}");
+        assert!(
+            msg.contains("32 bytes"),
+            "error should mention 32 bytes: {msg}"
+        );
         std::env::remove_var(EnvKeyEncryption::ENV_VAR);
     }
 }

@@ -87,7 +87,9 @@ impl ObjectStore for StripeRouterStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        self.store_for(location).put_opts(location, payload, opts).await
+        self.store_for(location)
+            .put_opts(location, payload, opts)
+            .await
     }
 
     async fn put_multipart_opts(
@@ -95,7 +97,9 @@ impl ObjectStore for StripeRouterStore {
         location: &ObjectPath,
         opts: PutMultipartOpts,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        self.store_for(location).put_multipart_opts(location, opts).await
+        self.store_for(location)
+            .put_multipart_opts(location, opts)
+            .await
     }
 
     async fn get_opts(
@@ -124,12 +128,10 @@ impl ObjectStore for StripeRouterStore {
                 let storage = storage.clone();
                 match loc {
                     Ok(loc) => {
-                        let store =
-                            crate::reader::store_for_data_file(&storage, &project, &loc);
+                        let store = crate::reader::store_for_data_file(&storage, &project, &loc);
                         // Delegate to the resolved store's own delete_stream
                         // with this single path (keeps per-store gating).
-                        let single =
-                            futures::stream::once(async move { Ok(loc) }).boxed();
+                        let single = futures::stream::once(async move { Ok(loc) }).boxed();
                         store.delete_stream(single)
                     }
                     Err(e) => futures::stream::once(async move { Err(e) }).boxed(),

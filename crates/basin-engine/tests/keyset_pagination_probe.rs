@@ -102,7 +102,11 @@ async fn seed_events(sess: &ProjectSession, n: i64) {
             id += stripes;
         }
         if !first {
-            exec(sess, &format!("INSERT INTO events (id, amount) VALUES {vals}")).await;
+            exec(
+                sess,
+                &format!("INSERT INTO events (id, amount) VALUES {vals}"),
+            )
+            .await;
         }
     }
 }
@@ -161,7 +165,10 @@ async fn keyset_threshold_beyond_max_is_empty() {
         "SELECT id, amount FROM events WHERE id > 999999 ORDER BY id LIMIT 50",
     )
     .await;
-    assert!(got.is_empty(), "threshold past max id must yield no rows, got {got:?}");
+    assert!(
+        got.is_empty(),
+        "threshold past max id must yield no rows, got {got:?}"
+    );
 }
 
 #[tokio::test]
@@ -226,9 +233,15 @@ async fn keyset_window_reflects_fast_path_update_overlay() {
     .await;
     let mut want = ground_truth_asc(N, 5000, 50);
     // id=5025 is the 25th row past 5000 (index 24): (5025, 50250) → updated.
-    let pos = want.iter().position(|&(id, _)| id == 5025).expect("5025 in window");
+    let pos = want
+        .iter()
+        .position(|&(id, _)| id == 5025)
+        .expect("5025 in window");
     want[pos] = (5025, 777777);
-    assert_eq!(got, want, "updated row must show new amount in keyset window");
+    assert_eq!(
+        got, want,
+        "updated row must show new amount in keyset window"
+    );
     assert_eq!(got.len(), 50, "window size unchanged by an in-place UPDATE");
 }
 
@@ -262,8 +275,16 @@ async fn keyset_window_excludes_deleted_row_and_backfills() {
         !got.iter().any(|&(id, _)| id == 5025),
         "deleted id 5025 must not appear"
     );
-    assert_eq!(got.len(), 50, "page must backfill to full LIMIT after a delete");
-    assert_eq!(got[49], (5051, 50510), "backfill row 5051 enters at the tail");
+    assert_eq!(
+        got.len(),
+        50,
+        "page must backfill to full LIMIT after a delete"
+    );
+    assert_eq!(
+        got[49],
+        (5051, 50510),
+        "backfill row 5051 enters at the tail"
+    );
 }
 
 #[tokio::test]
@@ -282,7 +303,10 @@ async fn keyset_limit_larger_than_remaining_rows() {
     .await;
     let want = ground_truth_asc(N, 9989, 50);
     assert_eq!(want.len(), 10, "sanity: only 10 rows remain past 9989");
-    assert_eq!(got, want, "limit larger than remaining must return all remaining");
+    assert_eq!(
+        got, want,
+        "limit larger than remaining must return all remaining"
+    );
 }
 
 /// Diagnostic timing probe (ignored by default). Reports p50 keyset-page
@@ -308,9 +332,8 @@ async fn keyset_latency_p50_100k() {
     for i in 0..iters {
         // Vary the threshold so we don't always hit the same warm path.
         let threshold = 1000 + (i as i64 * 17) % 90_000;
-        let sql = format!(
-            "SELECT id, amount FROM events WHERE id > {threshold} ORDER BY id LIMIT 50"
-        );
+        let sql =
+            format!("SELECT id, amount FROM events WHERE id > {threshold} ORDER BY id LIMIT 50");
         let start = std::time::Instant::now();
         let got = id_amount_rows(&sess, &sql).await;
         samples.push(start.elapsed());

@@ -496,8 +496,7 @@ impl PageCache {
     /// `BASIN_STORAGE_PAGE_CACHE_SHARDS` env override.
     pub fn with_shards(cfg: PageCacheConfig, n_shards: usize) -> Self {
         let n_shards = n_shards.max(1);
-        let cap =
-            NonZeroUsize::new(DEFAULT_INDEX_CAPACITY_PER_SHARD).expect("index cap > 0");
+        let cap = NonZeroUsize::new(DEFAULT_INDEX_CAPACITY_PER_SHARD).expect("index cap > 0");
         let shards: Vec<RwLock<PageCacheState>> = (0..n_shards)
             .map(|_| {
                 RwLock::new(PageCacheState {
@@ -1000,8 +999,7 @@ mod tests {
         let entry_size = probe.get_array_memory_size() as u64;
         // Budget = 1.5× one entry. Inserting 3 entries forces 2 of
         // them to age out before we're done.
-        let cache =
-            PageCache::with_shards(PageCacheConfig::new(entry_size + entry_size / 2), 1);
+        let cache = PageCache::with_shards(PageCacheConfig::new(entry_size + entry_size / 2), 1);
 
         let k1 = key("projects/x/tables/t/data/1.parquet", 1, 1);
         let k2 = key("projects/x/tables/t/data/2.parquet", 1, 1);
@@ -1064,9 +1062,9 @@ mod tests {
 
         // Every key we inserted must round-trip via `get`.
         for (i, k) in keys.iter().enumerate() {
-            let got = cache.get(k).unwrap_or_else(|| {
-                panic!("key {i} missed — shard router not deterministic")
-            });
+            let got = cache
+                .get(k)
+                .unwrap_or_else(|| panic!("key {i} missed — shard router not deterministic"));
             assert_eq!(got.len(), 1);
         }
         let c = cache.counters();
@@ -1163,8 +1161,7 @@ mod tests {
             let c = Arc::clone(&cache);
             handles.push(std::thread::spawn(move || {
                 for i in 0..500u64 {
-                    let path =
-                        format!("projects/x/tables/t/data/churn_{}.parquet", i % 16);
+                    let path = format!("projects/x/tables/t/data/churn_{}.parquet", i % 16);
                     let k = CacheKey {
                         path: ObjectPath::from(path.as_str()),
                         projection_hash: i,

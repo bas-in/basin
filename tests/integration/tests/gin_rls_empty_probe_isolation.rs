@@ -99,7 +99,9 @@ async fn ids(sess: &ProjectSession, sql: &str) -> Vec<i64> {
         Ok(ExecResult::Rows { batches, .. }) => {
             let mut out = Vec::new();
             for b in &batches {
-                let Ok(idx) = b.schema().index_of("id") else { continue };
+                let Ok(idx) = b.schema().index_of("id") else {
+                    continue;
+                };
                 if let Some(a) = b.column(idx).as_any().downcast_ref::<Int64Array>() {
                     for i in 0..a.len() {
                         if !a.is_null(i) {
@@ -123,8 +125,13 @@ async fn owners(sess: &ProjectSession, sql: &str) -> Vec<String> {
         Ok(ExecResult::Rows { batches, .. }) => {
             let mut out = Vec::new();
             for b in &batches {
-                let Some(col) = b.column_by_name("owner") else { continue };
-                let arr = col.as_any().downcast_ref::<StringArray>().expect("owner utf8");
+                let Some(col) = b.column_by_name("owner") else {
+                    continue;
+                };
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("owner utf8");
                 for i in 0..arr.len() {
                     if !arr.is_null(i) {
                         out.push(arr.value(i).to_string());
@@ -475,8 +482,16 @@ async fn gin_at_gt_under_rls_after_payload_rewrite_never_leaks() {
 
     // ghost tag: still the correct empty for both principals.
     let q_ghost = r#"SELECT id FROM docs WHERE payload @> '{"tag":"ghost_tag"}'"#;
-    assert_eq!(ids(&alice, q_ghost).await, Vec::<i64>::new(), "ghost empty for alice");
-    assert_eq!(ids(&bob, q_ghost).await, Vec::<i64>::new(), "ghost empty for bob");
+    assert_eq!(
+        ids(&alice, q_ghost).await,
+        Vec::<i64>::new(),
+        "ghost empty for alice"
+    );
+    assert_eq!(
+        ids(&bob, q_ghost).await,
+        Vec::<i64>::new(),
+        "ghost empty for bob"
+    );
 
     println!("[gap#1] GIN @> under RLS after payload rewrite: no leak, correct rows ✓");
 }

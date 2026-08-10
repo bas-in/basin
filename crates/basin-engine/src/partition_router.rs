@@ -300,7 +300,9 @@ mod tests {
     #[test]
     fn non_self_peers_excludes_self_and_is_empty_when_local_only() {
         // Local-only (unset / single peer): no fan-out targets.
-        assert!(PartitionRouter::parse("", "node-a").non_self_peers().is_empty());
+        assert!(PartitionRouter::parse("", "node-a")
+            .non_self_peers()
+            .is_empty());
         assert!(PartitionRouter::parse("http://a:5434", "http://a:5434")
             .non_self_peers()
             .is_empty());

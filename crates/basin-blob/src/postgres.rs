@@ -206,8 +206,7 @@ impl PostgresBlobCatalog {
         let public: bool = row.get("public");
         let file_size_limit: Option<i64> = row.get("file_size_limit");
         let allowed_mime_types_json: serde_json::Value = row.get("allowed_mime_types");
-        let allowed_mime_types: Vec<String> =
-            serde_json::from_value(allowed_mime_types_json)?;
+        let allowed_mime_types: Vec<String> = serde_json::from_value(allowed_mime_types_json)?;
         Ok(Bucket {
             id: BucketId(id),
             name,
@@ -278,11 +277,7 @@ impl BlobCatalog for PostgresBlobCatalog {
         Ok(())
     }
 
-    async fn get_bucket_by_name(
-        &self,
-        project: &ProjectId,
-        name: &str,
-    ) -> Result<Option<Bucket>> {
+    async fn get_bucket_by_name(&self, project: &ProjectId, name: &str) -> Result<Option<Bucket>> {
         let sch = &self.schema;
         let client = self.client().await?;
         let row = client
@@ -406,7 +401,9 @@ impl BlobCatalog for PostgresBlobCatalog {
             Some(p) => {
                 let pattern = format!(
                     "{}%",
-                    p.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+                    p.replace('\\', "\\\\")
+                        .replace('%', "\\%")
+                        .replace('_', "\\_")
                 );
                 client
                     .query(
@@ -445,11 +442,7 @@ impl BlobCatalog for PostgresBlobCatalog {
         Ok(out)
     }
 
-    async fn delete_bucket_by_name(
-        &self,
-        project: &ProjectId,
-        name: &str,
-    ) -> Result<Vec<String>> {
+    async fn delete_bucket_by_name(&self, project: &ProjectId, name: &str) -> Result<Vec<String>> {
         let sch = &self.schema;
         let project_str = project.to_string();
         let mut client = self.client().await?;
@@ -665,7 +658,10 @@ mod pg_tests {
 
         // Bytes are present before delete.
         let key = store.object_key(&project, "docs", "a/one.txt").unwrap();
-        assert!(obj_store.get(&key).await.is_ok(), "bytes present pre-delete");
+        assert!(
+            obj_store.get(&key).await.is_ok(),
+            "bytes present pre-delete"
+        );
 
         // Delete the bucket → both objects purged.
         let purged = store

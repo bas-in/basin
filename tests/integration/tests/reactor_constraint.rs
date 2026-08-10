@@ -108,10 +108,7 @@ async fn cap_at_100_rejects_101st_insert() {
     .unwrap();
 
     // Verify 100 rows are present.
-    let res = sess
-        .execute("SELECT COUNT(*) AS n FROM t")
-        .await
-        .unwrap();
+    let res = sess.execute("SELECT COUNT(*) AS n FROM t").await.unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         assert_eq!(col_i64(&batches, "n"), vec![100]);
     } else {
@@ -131,12 +128,13 @@ async fn cap_at_100_rejects_101st_insert() {
     );
 
     // Source mutation must have rolled back — still exactly 100 rows.
-    let res = sess
-        .execute("SELECT COUNT(*) AS n FROM t")
-        .await
-        .unwrap();
+    let res = sess.execute("SELECT COUNT(*) AS n FROM t").await.unwrap();
     if let ExecResult::Rows { batches, .. } = res {
-        assert_eq!(col_i64(&batches, "n"), vec![100], "rollback must leave 100 rows");
+        assert_eq!(
+            col_i64(&batches, "n"),
+            vec![100],
+            "rollback must leave 100 rows"
+        );
     } else {
         panic!("expected Rows");
     }
@@ -162,11 +160,9 @@ async fn cap_at_100_allows_inserts_under_cap() {
         .unwrap();
 
     // Attach constraint first (0 rows, all future inserts checked).
-    sess.execute(
-        "ALTER TABLE t REACT ON INSERT CONSTRAINT ((SELECT COUNT(*) FROM t) < 100)",
-    )
-    .await
-    .unwrap();
+    sess.execute("ALTER TABLE t REACT ON INSERT CONSTRAINT ((SELECT COUNT(*) FROM t) < 100)")
+        .await
+        .unwrap();
 
     // Insert 5 rows individually — all well under the cap.
     for i in 0i64..5 {
@@ -175,10 +171,7 @@ async fn cap_at_100_allows_inserts_under_cap() {
             .unwrap_or_else(|e| panic!("INSERT #{i} failed: {e}"));
     }
 
-    let res = sess
-        .execute("SELECT COUNT(*) AS n FROM t")
-        .await
-        .unwrap();
+    let res = sess.execute("SELECT COUNT(*) AS n FROM t").await.unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         assert_eq!(
             col_i64(&batches, "n"),
@@ -196,10 +189,7 @@ async fn cap_at_100_allows_inserts_under_cap() {
         .await
         .expect("bulk insert of 90 rows to reach 95 total must pass under cap");
 
-    let res = sess
-        .execute("SELECT COUNT(*) AS n FROM t")
-        .await
-        .unwrap();
+    let res = sess.execute("SELECT COUNT(*) AS n FROM t").await.unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         assert_eq!(
             col_i64(&batches, "n"),
@@ -361,10 +351,7 @@ async fn drop_reactor_removes_constraint() {
     sess.execute("INSERT INTO t VALUES (2)").await.unwrap();
     sess.execute("INSERT INTO t VALUES (3)").await.unwrap();
 
-    let res = sess
-        .execute("SELECT COUNT(*) AS n FROM t")
-        .await
-        .unwrap();
+    let res = sess.execute("SELECT COUNT(*) AS n FROM t").await.unwrap();
     if let ExecResult::Rows { batches, .. } = res {
         assert_eq!(total_rows(&batches), 1);
         assert_eq!(col_i64(&batches, "n"), vec![3]);

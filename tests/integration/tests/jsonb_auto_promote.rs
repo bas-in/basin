@@ -66,12 +66,7 @@ async fn seed_table(sess: &basin_engine::ProjectSession, table: &str) {
 
 /// Run `SELECT payload->>'<key>' FROM <table>` exactly N times and return
 /// the results so the compiler doesn't optimise away the calls.
-async fn run_extract_queries(
-    sess: &basin_engine::ProjectSession,
-    table: &str,
-    key: &str,
-    n: u64,
-) {
+async fn run_extract_queries(sess: &basin_engine::ProjectSession, table: &str, key: &str, n: u64) {
     let sql = format!("SELECT payload->>'{}' FROM {}", key, table);
     for _ in 0..n {
         let res = sess.execute(&sql).await.unwrap();
@@ -255,5 +250,8 @@ async fn promotion_fires_exactly_once() {
         .iter()
         .filter(|p| p.source_col == "payload" && p.json_key == "color")
         .count();
-    assert_eq!(count, 1, "promote_jsonb_path should be called exactly once per path");
+    assert_eq!(
+        count, 1,
+        "promote_jsonb_path should be called exactly once per path"
+    );
 }

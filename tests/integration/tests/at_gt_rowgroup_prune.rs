@@ -25,10 +25,10 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use basin_common::{PartitionKey, ProjectId, TableName};
 use basin_storage::{
     FileFormat, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig, WriteOptions,
 };
-use basin_common::{PartitionKey, ProjectId, TableName};
 use futures::StreamExt;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
@@ -134,7 +134,10 @@ async fn row_group_selection_none_is_byte_identical_to_default() {
         snap.row_groups_scanned, snap.row_groups_considered,
         "no allowlist means every row-group is scanned"
     );
-    assert!(snap.row_groups_considered >= 4, "expected >=4 row-groups, got {snap:?}");
+    assert!(
+        snap.row_groups_considered >= 4,
+        "expected >=4 row-groups, got {snap:?}"
+    );
 }
 
 #[tokio::test]
@@ -197,20 +200,10 @@ async fn row_group_selection_unsummarised_file_is_unknown_fallback() {
         row_group_selection: Some(sel),
         ..Default::default()
     };
-    let n_summarised = read_total_rows(
-        &storage,
-        &project,
-        vec![summarised.clone()],
-        opts.clone(),
-    )
-    .await;
-    let n_unsummarised = read_total_rows(
-        &storage,
-        &project,
-        vec![unsummarised.clone()],
-        opts,
-    )
-    .await;
+    let n_summarised =
+        read_total_rows(&storage, &project, vec![summarised.clone()], opts.clone()).await;
+    let n_unsummarised =
+        read_total_rows(&storage, &project, vec![unsummarised.clone()], opts).await;
     assert_eq!(n_summarised, 100, "summarised file restricted to RG 0");
     assert_eq!(
         n_unsummarised, 400,
@@ -257,7 +250,10 @@ async fn row_group_selection_still_applies_user_predicate() {
             found += 1;
         }
     }
-    assert_eq!(found, 1, "predicate over selected row-groups must return exactly one row");
+    assert_eq!(
+        found, 1,
+        "predicate over selected row-groups must return exactly one row"
+    );
 }
 
 #[tokio::test]

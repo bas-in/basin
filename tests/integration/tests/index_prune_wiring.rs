@@ -186,7 +186,11 @@ async fn containment_end_to_end_correct() {
 
     // `@> {"role":"admin"}` → rows 1,3.
     assert_eq!(
-        ids(&sess, r#"SELECT id FROM docs WHERE payload @> '{"role":"admin"}'"#).await,
+        ids(
+            &sess,
+            r#"SELECT id FROM docs WHERE payload @> '{"role":"admin"}'"#
+        )
+        .await,
         vec![1, 3],
         "@> role=admin must return exactly rows 1,3"
     );
@@ -204,12 +208,20 @@ async fn containment_end_to_end_correct() {
 
     // Absent key → 0 rows.
     assert_eq!(
-        ids(&sess, r#"SELECT id FROM docs WHERE payload @> '{"role":"ghost"}'"#).await,
+        ids(
+            &sess,
+            r#"SELECT id FROM docs WHERE payload @> '{"role":"ghost"}'"#
+        )
+        .await,
         Vec::<i64>::new(),
         "absent value must return 0 rows"
     );
     assert_eq!(
-        ids(&sess, r#"SELECT id FROM docs WHERE payload @> '{"missing":"x"}'"#).await,
+        ids(
+            &sess,
+            r#"SELECT id FROM docs WHERE payload @> '{"missing":"x"}'"#
+        )
+        .await,
         Vec::<i64>::new(),
         "absent key must return 0 rows"
     );
@@ -230,9 +242,30 @@ fn rowgroup_prune_narrows_and_is_sound() {
 
     // Three row-groups; only rg1 holds role=admin.  We feed the registry the
     // SAME structure-keyed atoms the engine's extract_terms produces.
-    reg.index_row(&project, &table, "payload", &gin_ops_terms(&[("role", "user")]), file, 0);
-    reg.index_row(&project, &table, "payload", &gin_ops_terms(&[("role", "admin")]), file, 1);
-    reg.index_row(&project, &table, "payload", &gin_ops_terms(&[("role", "guest")]), file, 2);
+    reg.index_row(
+        &project,
+        &table,
+        "payload",
+        &gin_ops_terms(&[("role", "user")]),
+        file,
+        0,
+    );
+    reg.index_row(
+        &project,
+        &table,
+        "payload",
+        &gin_ops_terms(&[("role", "admin")]),
+        file,
+        1,
+    );
+    reg.index_row(
+        &project,
+        &table,
+        "payload",
+        &gin_ops_terms(&[("role", "guest")]),
+        file,
+        2,
+    );
     reg.mark_file_indexed(&project, &table, "payload", file);
 
     // Probe terms extracted from the `@> {"role":"admin"}` needle (structure).
@@ -256,7 +289,13 @@ fn rowgroup_prune_narrows_and_is_sound() {
 
     // Unsummarised file → Unknown (caller keeps file-granular behaviour).
     assert_eq!(
-        reg.rowgroups_maybe_containing(&project, &table, "payload", "never_indexed.parquet", &needle_terms),
+        reg.rowgroups_maybe_containing(
+            &project,
+            &table,
+            "payload",
+            "never_indexed.parquet",
+            &needle_terms
+        ),
         RowGroupProbe::Unknown,
         "unsummarised file must read as Unknown (no false negative)"
     );
@@ -313,7 +352,11 @@ async fn like_end_to_end_correct() {
     );
     // Case-insensitive suffix: includes uppercase row 5.
     assert_eq!(
-        ids(&sess, "SELECT id FROM emails WHERE addr ILIKE '%@gmail.com'").await,
+        ids(
+            &sess,
+            "SELECT id FROM emails WHERE addr ILIKE '%@gmail.com'"
+        )
+        .await,
         vec![2, 3, 5],
         "ILIKE folds case"
     );
@@ -369,9 +412,17 @@ fn trigram_prune_superset_then_recheck_is_exact() {
     };
 
     assert_eq!(run("bob%", false), vec![2], "prefix");
-    assert_eq!(run("%@gmail.com", false), vec![2, 3], "suffix case-sensitive");
+    assert_eq!(
+        run("%@gmail.com", false),
+        vec![2, 3],
+        "suffix case-sensitive"
+    );
     assert_eq!(run("%example%", false), vec![1, 4], "middle");
-    assert_eq!(run("%@gmail.com", true), vec![2, 3, 5], "ILIKE case-insensitive");
+    assert_eq!(
+        run("%@gmail.com", true),
+        vec![2, 3, 5],
+        "ILIKE case-insensitive"
+    );
     assert_eq!(run("%zzzqqq%", false), Vec::<u64>::new(), "no-match → 0");
     // Short pattern: trigram prune cannot help, but re-check still correct.
     assert_eq!(
@@ -383,12 +434,19 @@ fn trigram_prune_superset_then_recheck_is_exact() {
         matches!(index.candidates("%a%", false), Candidates::All),
         "short pattern → All (scan everything)"
     );
-    assert_eq!(run("%@%", false), vec![1, 2, 3, 4, 5], "short pattern scans all");
+    assert_eq!(
+        run("%@%", false),
+        vec![1, 2, 3, 4, 5],
+        "short pattern scans all"
+    );
 
     // The prune must actually narrow for a selective pattern: the suffix
     // `@gmail.com` candidate set must exclude the example.com/org rows.
     if let Candidates::Some(s) = index.candidates("%@gmail.com", false) {
-        assert!(!s.contains(&1), "example.com must be pruned out (no @gmail trigrams)");
+        assert!(
+            !s.contains(&1),
+            "example.com must be pruned out (no @gmail trigrams)"
+        );
         assert!(!s.contains(&4), "example.org must be pruned out");
         assert!(s.len() < rows.len(), "prune must skip some rows: {s:?}");
     } else {
@@ -446,7 +504,11 @@ async fn gin_rowgroup_pruned_table_returns_correct_rows() {
 
     // Basic containment — should return only row 1.
     assert_eq!(
-        ids(&sess, r#"SELECT id FROM events WHERE data @> '{"type":"click"}'"#).await,
+        ids(
+            &sess,
+            r#"SELECT id FROM events WHERE data @> '{"type":"click"}'"#
+        )
+        .await,
         vec![1],
         "@> type=click must return only id=1"
     );
@@ -464,14 +526,22 @@ async fn gin_rowgroup_pruned_table_returns_correct_rows() {
 
     // All rows have a different user — key absent everywhere.
     assert_eq!(
-        ids(&sess, r#"SELECT id FROM events WHERE data @> '{"user":"ghost"}'"#).await,
+        ids(
+            &sess,
+            r#"SELECT id FROM events WHERE data @> '{"user":"ghost"}'"#
+        )
+        .await,
         Vec::<i64>::new(),
         "absent user must return 0 rows"
     );
 
     // Every row has a `user` key — this should return all three.
     assert_eq!(
-        ids(&sess, r#"SELECT id FROM events WHERE data @> '{"type":"view"}'"#).await,
+        ids(
+            &sess,
+            r#"SELECT id FROM events WHERE data @> '{"type":"view"}'"#
+        )
+        .await,
         vec![2],
         "@> type=view must return only id=2"
     );
@@ -525,19 +595,31 @@ async fn gin_rowgroup_prune_multi_row_group_no_false_negative() {
     // would skip row-groups 1 and 2 — dropping id=530. This assertion fails
     // loudly in that case.
     assert_eq!(
-        ids(&sess, r#"SELECT id FROM big WHERE payload @> '{"kind":"needle"}'"#).await,
+        ids(
+            &sess,
+            r#"SELECT id FROM big WHERE payload @> '{"kind":"needle"}'"#
+        )
+        .await,
         vec![530],
         "@> must find the needle in row-group 2 — multi-row-group prune must \
          not produce a false negative"
     );
 
     // Sanity: the common key matches every row across all three row-groups.
-    let all = ids(&sess, r#"SELECT id FROM big WHERE payload @> '{"kind":"filler"}'"#).await;
+    let all = ids(
+        &sess,
+        r#"SELECT id FROM big WHERE payload @> '{"kind":"filler"}'"#,
+    )
+    .await;
     assert_eq!(all.len(), 599, "filler must match the other 599 rows");
 
     // Absent key across all row-groups → 0 rows.
     assert_eq!(
-        ids(&sess, r#"SELECT id FROM big WHERE payload @> '{"kind":"ghost"}'"#).await,
+        ids(
+            &sess,
+            r#"SELECT id FROM big WHERE payload @> '{"kind":"ghost"}'"#
+        )
+        .await,
         Vec::<i64>::new(),
         "absent key must return 0 rows even across multiple row-groups"
     );

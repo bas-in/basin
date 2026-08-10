@@ -237,7 +237,10 @@ fn benchmark_data_path(id: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
-        .map(|root| root.join("benchmark/data").join(format!("viability_{id}.json")))
+        .map(|root| {
+            root.join("benchmark/data")
+                .join(format!("viability_{id}.json"))
+        })
         .expect("repo root from CARGO_MANIFEST_DIR")
 }
 
@@ -313,12 +316,8 @@ async fn run_slt_file(path: &Path) -> (u32, u32, Vec<CaseFailure>) {
         // halt / control / sleep / etc. — running them is fine but they
         // don't move the pass-rate denominator.
         let (line, sql, is_case): (u32, String, bool) = match &record {
-            sqllogictest::Record::Statement { loc, sql, .. } => {
-                (loc.line(), sql.clone(), true)
-            }
-            sqllogictest::Record::Query { loc, sql, .. } => {
-                (loc.line(), sql.clone(), true)
-            }
+            sqllogictest::Record::Statement { loc, sql, .. } => (loc.line(), sql.clone(), true),
+            sqllogictest::Record::Query { loc, sql, .. } => (loc.line(), sql.clone(), true),
             _ => (0, String::new(), false),
         };
         let result = runner.run_async(record).await;
@@ -426,8 +425,7 @@ async fn pg_compat_sqllogictest_suite() {
     let mut all_failures: Vec<CaseFailure> = Vec::new();
 
     for file in &files {
-        let (p, f, failures): (u32, u32, Vec<CaseFailure>) =
-            Box::pin(run_slt_file(file)).await;
+        let (p, f, failures): (u32, u32, Vec<CaseFailure>) = Box::pin(run_slt_file(file)).await;
         println!(
             "  {}: {} passed, {} failed",
             file.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
@@ -470,4 +468,3 @@ async fn pg_compat_sqllogictest_suite() {
         "SLT pass rate {pct:.1}% < threshold {PASS_THRESHOLD_PCT:.1}% ({total_passed}/{total})"
     );
 }
-

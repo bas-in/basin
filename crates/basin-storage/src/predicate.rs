@@ -81,7 +81,9 @@ fn null_to_false(arr: BooleanArray) -> BooleanArray {
     let (values, nulls) = arr.into_parts();
     // `values & validity`: a slot is true only where it compared true AND was
     // non-null. Then the result carries no null buffer.
-    let validity = nulls.expect("null_count > 0 implies a null buffer").into_inner();
+    let validity = nulls
+        .expect("null_count > 0 implies a null buffer")
+        .into_inner();
     BooleanArray::new(&values & &validity, None)
 }
 
@@ -95,9 +97,8 @@ pub fn evaluate(
 ) -> Result<arrow_array::BooleanArray> {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{
-        Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, UInt64Type,
-        TimestampMicrosecondType, TimestampNanosecondType,
-        TimestampMillisecondType, TimestampSecondType,
+        Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, TimestampMicrosecondType,
+        TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt64Type,
     };
     use arrow_array::Array;
     use arrow_array::BooleanArray;
@@ -240,65 +241,101 @@ pub fn evaluate(
         // Arrow's TimestampMicrosecondType stores raw i64 µs; comparing an
         // Int64 scalar directly gives the correct result.
         (Predicate::Eq(_, _), ScalarValue::Int64(v))
-            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Microsecond, _)) =>
+            if matches!(
+                col.data_type(),
+                Dt::Timestamp(arrow_schema::TimeUnit::Microsecond, _)
+            ) =>
         {
             cmp_narrow_int_as_i64!(TimestampMicrosecondType, *v, ==)
         }
         (Predicate::Gt(_, _), ScalarValue::Int64(v))
-            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Microsecond, _)) =>
+            if matches!(
+                col.data_type(),
+                Dt::Timestamp(arrow_schema::TimeUnit::Microsecond, _)
+            ) =>
         {
             cmp_narrow_int_as_i64!(TimestampMicrosecondType, *v, >)
         }
         (Predicate::Lt(_, _), ScalarValue::Int64(v))
-            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Microsecond, _)) =>
+            if matches!(
+                col.data_type(),
+                Dt::Timestamp(arrow_schema::TimeUnit::Microsecond, _)
+            ) =>
         {
             cmp_narrow_int_as_i64!(TimestampMicrosecondType, *v, <)
         }
         // Timestamp(Nanosecond) column vs Int64 scalar (ns since epoch).
         (Predicate::Eq(_, _), ScalarValue::Int64(v))
-            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Nanosecond, _)) =>
+            if matches!(
+                col.data_type(),
+                Dt::Timestamp(arrow_schema::TimeUnit::Nanosecond, _)
+            ) =>
         {
             cmp_narrow_int_as_i64!(TimestampNanosecondType, *v, ==)
         }
         (Predicate::Gt(_, _), ScalarValue::Int64(v))
-            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Nanosecond, _)) =>
+            if matches!(
+                col.data_type(),
+                Dt::Timestamp(arrow_schema::TimeUnit::Nanosecond, _)
+            ) =>
         {
             cmp_narrow_int_as_i64!(TimestampNanosecondType, *v, >)
         }
         (Predicate::Lt(_, _), ScalarValue::Int64(v))
-            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Nanosecond, _)) =>
+            if matches!(
+                col.data_type(),
+                Dt::Timestamp(arrow_schema::TimeUnit::Nanosecond, _)
+            ) =>
         {
             cmp_narrow_int_as_i64!(TimestampNanosecondType, *v, <)
         }
         // Timestamp(Millisecond) column vs Int64 scalar (ms since epoch).
         (Predicate::Eq(_, _), ScalarValue::Int64(v))
-            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Millisecond, _)) =>
+            if matches!(
+                col.data_type(),
+                Dt::Timestamp(arrow_schema::TimeUnit::Millisecond, _)
+            ) =>
         {
             cmp_narrow_int_as_i64!(TimestampMillisecondType, *v, ==)
         }
         (Predicate::Gt(_, _), ScalarValue::Int64(v))
-            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Millisecond, _)) =>
+            if matches!(
+                col.data_type(),
+                Dt::Timestamp(arrow_schema::TimeUnit::Millisecond, _)
+            ) =>
         {
             cmp_narrow_int_as_i64!(TimestampMillisecondType, *v, >)
         }
         (Predicate::Lt(_, _), ScalarValue::Int64(v))
-            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Millisecond, _)) =>
+            if matches!(
+                col.data_type(),
+                Dt::Timestamp(arrow_schema::TimeUnit::Millisecond, _)
+            ) =>
         {
             cmp_narrow_int_as_i64!(TimestampMillisecondType, *v, <)
         }
         // Timestamp(Second) column vs Int64 scalar (s since epoch).
         (Predicate::Eq(_, _), ScalarValue::Int64(v))
-            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Second, _)) =>
+            if matches!(
+                col.data_type(),
+                Dt::Timestamp(arrow_schema::TimeUnit::Second, _)
+            ) =>
         {
             cmp_narrow_int_as_i64!(TimestampSecondType, *v, ==)
         }
         (Predicate::Gt(_, _), ScalarValue::Int64(v))
-            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Second, _)) =>
+            if matches!(
+                col.data_type(),
+                Dt::Timestamp(arrow_schema::TimeUnit::Second, _)
+            ) =>
         {
             cmp_narrow_int_as_i64!(TimestampSecondType, *v, >)
         }
         (Predicate::Lt(_, _), ScalarValue::Int64(v))
-            if matches!(col.data_type(), Dt::Timestamp(arrow_schema::TimeUnit::Second, _)) =>
+            if matches!(
+                col.data_type(),
+                Dt::Timestamp(arrow_schema::TimeUnit::Second, _)
+            ) =>
         {
             cmp_narrow_int_as_i64!(TimestampSecondType, *v, <)
         }
@@ -556,9 +593,7 @@ fn predicate_value(p: &Predicate) -> ScalarValue {
         // StartsWith / InInt64 are dispatched before this helper is consulted
         // (see `evaluate`). Returning a sentinel keeps the function total.
         Predicate::StartsWith { prefix, .. } => ScalarValue::Utf8(prefix.clone()),
-        Predicate::InInt64(_, keys) => {
-            ScalarValue::Int64(keys.first().copied().unwrap_or(0))
-        }
+        Predicate::InInt64(_, keys) => ScalarValue::Int64(keys.first().copied().unwrap_or(0)),
     }
 }
 
@@ -725,17 +760,13 @@ fn coerce_utf8_scalar_for_column(
     let coerced: ScalarValue = match col_type {
         Dt::Int8 | Dt::Int16 | Dt::Int32 | Dt::Int64 => {
             let n: i64 = s.trim().parse().map_err(|_| {
-                BasinError::storage(format!(
-                    "invalid input syntax for type integer: {s:?}"
-                ))
+                BasinError::storage(format!("invalid input syntax for type integer: {s:?}"))
             })?;
             ScalarValue::Int64(n)
         }
         Dt::UInt8 | Dt::UInt16 | Dt::UInt32 | Dt::UInt64 => {
             let n: u64 = s.trim().parse().map_err(|_| {
-                BasinError::storage(format!(
-                    "invalid input syntax for type integer: {s:?}"
-                ))
+                BasinError::storage(format!("invalid input syntax for type integer: {s:?}"))
             })?;
             ScalarValue::UInt64(n)
         }
@@ -1379,7 +1410,9 @@ fn parse_ts_str_to_us(s: &str) -> i64 {
         }
     }
     // Expand trailing +HH or -HH (3 chars, no colon).
-    let maybe_tz = norm[10..].rfind('+').map(|p| p + 10)
+    let maybe_tz = norm[10..]
+        .rfind('+')
+        .map(|p| p + 10)
         .or_else(|| norm[10..].rfind('-').map(|p| p + 10));
     if let Some(pos) = maybe_tz {
         let suffix = &norm[pos..];
@@ -1529,16 +1562,24 @@ mod compound_tests {
     #[test]
     fn utf8_literal_vs_int_column_coerces_no_panic() {
         // Eq: '1' against Int64 id column.
-        let pred = CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Utf8("1".into())));
+        let pred =
+            CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Utf8("1".into())));
         let mask = evaluate_compound(&small_batch(), &pred).unwrap();
         // ids: 1,2,NULL,4,5 → only the first row (id=1) matches.
         assert_eq!(
             collect_mask(&mask),
-            vec![Some(true), Some(false), Some(false), Some(false), Some(false)]
+            vec![
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false)
+            ]
         );
 
         // Gt: id > '1' (string) → coerced to int8.
-        let pred = CompoundPredicate::Atom(Predicate::Gt("id".into(), ScalarValue::Utf8("1".into())));
+        let pred =
+            CompoundPredicate::Atom(Predicate::Gt("id".into(), ScalarValue::Utf8("1".into())));
         let mask = evaluate_compound(&small_batch(), &pred).unwrap();
         assert_eq!(
             collect_mask(&mask),
@@ -1546,7 +1587,8 @@ mod compound_tests {
         );
 
         // Lt: id < '5' (string) → coerced to int8.
-        let pred = CompoundPredicate::Atom(Predicate::Lt("id".into(), ScalarValue::Utf8("5".into())));
+        let pred =
+            CompoundPredicate::Atom(Predicate::Lt("id".into(), ScalarValue::Utf8("5".into())));
         let mask = evaluate_compound(&small_batch(), &pred).unwrap();
         assert_eq!(
             collect_mask(&mask),
@@ -1555,16 +1597,24 @@ mod compound_tests {
 
         // A non-numeric string against an int column is a typed error, never
         // a panic (PG: "invalid input syntax for type integer").
-        let pred = CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Utf8("abc".into())));
+        let pred =
+            CompoundPredicate::Atom(Predicate::Eq("id".into(), ScalarValue::Utf8("abc".into())));
         assert!(evaluate_compound(&small_batch(), &pred).is_err());
 
         // The Utf8-column path is unaffected: '1' against the name column
         // still compares as a string.
-        let pred = CompoundPredicate::Atom(Predicate::Eq("name".into(), ScalarValue::Utf8("a".into())));
+        let pred =
+            CompoundPredicate::Atom(Predicate::Eq("name".into(), ScalarValue::Utf8("a".into())));
         let mask = evaluate_compound(&small_batch(), &pred).unwrap();
         assert_eq!(
             collect_mask(&mask),
-            vec![Some(true), Some(false), Some(false), Some(false), Some(false)]
+            vec![
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false)
+            ]
         );
     }
 
@@ -1581,12 +1631,7 @@ mod compound_tests {
             DataType::LargeUtf8,
             true,
         )]));
-        let names = LargeStringArray::from(vec![
-            Some("alpha"),
-            Some("beta"),
-            None,
-            Some("gamma"),
-        ]);
+        let names = LargeStringArray::from(vec![Some("alpha"), Some("beta"), None, Some("gamma")]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(names)]).unwrap();
 
         // Eq
@@ -1617,12 +1662,7 @@ mod compound_tests {
             DataType::Utf8View,
             true,
         )]));
-        let names = StringViewArray::from(vec![
-            Some("alpha"),
-            Some("beta"),
-            None,
-            Some("gamma"),
-        ]);
+        let names = StringViewArray::from(vec![Some("alpha"), Some("beta"), None, Some("gamma")]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(names)]).unwrap();
 
         let pred = Predicate::Eq("name".into(), ScalarValue::Utf8("gamma".into()));
@@ -1735,13 +1775,21 @@ mod compound_tests {
         let b = BooleanArray::from(vec![Some(true), Some(false), None]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(f), Arc::new(b)]).unwrap();
 
-        let pred = CompoundPredicate::Atom(Predicate::Eq("f".into(), ScalarValue::Utf8("2.0".into())));
+        let pred =
+            CompoundPredicate::Atom(Predicate::Eq("f".into(), ScalarValue::Utf8("2.0".into())));
         let mask = evaluate_compound(&batch, &pred).unwrap();
-        assert_eq!(collect_mask(&mask), vec![Some(false), Some(true), Some(false)]);
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(false), Some(true), Some(false)]
+        );
 
-        let pred = CompoundPredicate::Atom(Predicate::Eq("b".into(), ScalarValue::Utf8("true".into())));
+        let pred =
+            CompoundPredicate::Atom(Predicate::Eq("b".into(), ScalarValue::Utf8("true".into())));
         let mask = evaluate_compound(&batch, &pred).unwrap();
-        assert_eq!(collect_mask(&mask), vec![Some(true), Some(false), Some(false)]);
+        assert_eq!(
+            collect_mask(&mask),
+            vec![Some(true), Some(false), Some(false)]
+        );
     }
 
     /// Regression for the adjacent unchecked-downcast arms in `predicate.rs`:
@@ -1810,11 +1858,7 @@ mod compound_tests {
         // This was already a guarded arm (Float32-widen). Sanity-check
         // the typed-comparison still works and was not regressed by the
         // fallback-arm rewrite.
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "f",
-            DataType::Float32,
-            true,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float32, true)]));
         let arr = Float32Array::from(vec![Some(1.5_f32), Some(2.5_f32), None]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
         let pred = Predicate::Gt("f".into(), ScalarValue::Float64(2.0));
@@ -1849,11 +1893,7 @@ mod compound_tests {
         );
 
         // Boolean literal vs Boolean column — sanity check the matched arm.
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "b",
-            DataType::Boolean,
-            true,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Boolean, true)]));
         let arr = BooleanArray::from(vec![Some(true), Some(false), None]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
         let pred = Predicate::Eq("b".into(), ScalarValue::Boolean(true));
@@ -2025,14 +2065,9 @@ mod compound_tests {
             .as_bytes();
 
         // Build a FixedSizeBinaryArray: u1, u2, NULL, u3
-        let values: Vec<Option<&[u8]>> = vec![
-            Some(&u1[..]),
-            Some(&u2[..]),
-            None,
-            Some(&u3[..]),
-        ];
-        let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 16)
-            .unwrap();
+        let values: Vec<Option<&[u8]>> = vec![Some(&u1[..]), Some(&u2[..]), None, Some(&u3[..])];
+        let arr =
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 16).unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "id",
@@ -2083,10 +2118,7 @@ mod compound_tests {
     #[test]
     fn uuid_eq_invalid_literal_is_error() {
         let batch = uuid_batch();
-        let pred = Predicate::Eq(
-            "id".into(),
-            ScalarValue::Utf8("not-a-uuid".into()),
-        );
+        let pred = Predicate::Eq("id".into(), ScalarValue::Utf8("not-a-uuid".into()));
         assert!(evaluate(&batch, &pred).is_err());
     }
 
@@ -2326,7 +2358,9 @@ mod in_int64_tests {
         let idx = sorted_in_int64_indices(&col, &keys).expect("int64 column");
         // Reference: plain mask → indices.
         let mask = eval_in_int64(&col, &keys);
-        let want: Vec<u32> = (0..mask.len() as u32).filter(|&i| mask.value(i as usize)).collect();
+        let want: Vec<u32> = (0..mask.len() as u32)
+            .filter(|&i| mask.value(i as usize))
+            .collect();
         assert_eq!(idx, want);
     }
 

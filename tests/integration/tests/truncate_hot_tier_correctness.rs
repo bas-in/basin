@@ -95,7 +95,11 @@ async fn build_engine_with_unflushed_shard() -> (TempDir, TempDir, Engine, Shard
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let shard_probe = shard.clone();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -112,7 +116,11 @@ async fn exec(sess: &ProjectSession, sql: &str) {
 }
 
 async fn count_all(sess: &ProjectSession, table: &str) -> i64 {
-    match sess.execute(&format!("SELECT COUNT(*) FROM {table}")).await.unwrap() {
+    match sess
+        .execute(&format!("SELECT COUNT(*) FROM {table}"))
+        .await
+        .unwrap()
+    {
         ExecResult::Rows { batches, .. } => batches
             .first()
             .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
@@ -133,12 +141,22 @@ async fn row_count(sess: &ProjectSession, sql: &str) -> usize {
 /// probe; `tag` labels the assertion phase.
 async fn assert_empty_all_paths(sess: &ProjectSession, table: &str, where_pk: i64, tag: &str) {
     // 1. Point-PK probe.
-    let n_pk = row_count(sess, &format!("SELECT * FROM {table} WHERE id = {where_pk}")).await;
-    assert_eq!(n_pk, 0, "{tag}: point-PK probe id={where_pk} must be empty; got {n_pk}");
+    let n_pk = row_count(
+        sess,
+        &format!("SELECT * FROM {table} WHERE id = {where_pk}"),
+    )
+    .await;
+    assert_eq!(
+        n_pk, 0,
+        "{tag}: point-PK probe id={where_pk} must be empty; got {n_pk}"
+    );
 
     // 2. A second point-PK probe on a different key (an UPDATE-overlay row).
     let n_pk2 = row_count(sess, &format!("SELECT * FROM {table} WHERE id = 5")).await;
-    assert_eq!(n_pk2, 0, "{tag}: point-PK probe id=5 (overlay) must be empty; got {n_pk2}");
+    assert_eq!(
+        n_pk2, 0,
+        "{tag}: point-PK probe id=5 (overlay) must be empty; got {n_pk2}"
+    );
 
     // 3. Keyset / ORDER BY + LIMIT paging path.
     let n_keyset = row_count(
@@ -146,7 +164,10 @@ async fn assert_empty_all_paths(sess: &ProjectSession, table: &str, where_pk: i6
         &format!("SELECT * FROM {table} WHERE id > 0 ORDER BY id LIMIT 1000"),
     )
     .await;
-    assert_eq!(n_keyset, 0, "{tag}: keyset ORDER BY+LIMIT must be empty; got {n_keyset}");
+    assert_eq!(
+        n_keyset, 0,
+        "{tag}: keyset ORDER BY+LIMIT must be empty; got {n_keyset}"
+    );
 
     // 4. Full scan.
     let n_scan = row_count(sess, &format!("SELECT * FROM {table}")).await;
@@ -169,7 +190,11 @@ async fn truncate_clears_overlay_and_unflushed_tail_no_resurrection() {
     let sess = engine.open_session(project).await.unwrap();
     let table = TableName::new("t").unwrap();
 
-    exec(&sess, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").await;
+    exec(
+        &sess,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)",
+    )
+    .await;
 
     // ── Wave 1: INSERT 10 rows and flush them to COLD via an explicit drain.
     // These become real cold files.
@@ -183,7 +208,10 @@ async fn truncate_clears_overlay_and_unflushed_tail_no_resurrection() {
         }
         exec(&sess, &stmt).await;
     }
-    shard.flush_to_parquet().await.expect("flush wave 1 to cold");
+    shard
+        .flush_to_parquet()
+        .await
+        .expect("flush wave 1 to cold");
 
     // ── (b) Overlay: point-UPDATE id=5 (plants a MemRowValue::Update override)
     // and point-DELETE id=7 (plants a tombstone). With the fastpath envs set and
@@ -194,7 +222,11 @@ async fn truncate_clears_overlay_and_unflushed_tail_no_resurrection() {
     // ── (c) WAL tail: INSERT 3 more rows and DO NOT flush — they stay resident
     // in the shard tail. Confirm the tail is genuinely pending so the test is
     // exercising the (c) vector and not a no-op.
-    exec(&sess, "INSERT INTO t (id, v) VALUES (11, 110), (12, 120), (13, 130)").await;
+    exec(
+        &sess,
+        "INSERT INTO t (id, v) VALUES (11, 110), (12, 120), (13, 130)",
+    )
+    .await;
     assert!(
         shard.has_pending_tail(&project, &table).await,
         "the 3 un-flushed INSERT rows must leave a pending tail before TRUNCATE — \
@@ -202,9 +234,16 @@ async fn truncate_clears_overlay_and_unflushed_tail_no_resurrection() {
     );
 
     // Sanity pre-TRUNCATE: 10 - 1 deleted + 3 tail = 12 rows; id=5 reads 99999.
-    assert_eq!(count_all(&sess, "t").await, 12, "pre-TRUNCATE COUNT(*) must be 12");
+    assert_eq!(
+        count_all(&sess, "t").await,
+        12,
+        "pre-TRUNCATE COUNT(*) must be 12"
+    );
     let v5_pre = row_count(&sess, "SELECT * FROM t WHERE id = 5 AND v = 99999").await;
-    assert_eq!(v5_pre, 1, "pre-TRUNCATE the overlay UPDATE on id=5 must be visible");
+    assert_eq!(
+        v5_pre, 1,
+        "pre-TRUNCATE the overlay UPDATE on id=5 must be visible"
+    );
 
     // ── TRUNCATE: flushes the tail, removes every file, clears the overlay,
     // invalidates the caches.
@@ -230,7 +269,10 @@ async fn truncate_clears_overlay_and_unflushed_tail_no_resurrection() {
     // ── Force a flush + stripe-merge: a tail entry or tombstone the truncate
     // missed would re-materialise here. Must STILL be zero.
     shard.flush_to_parquet().await.expect("post-truncate flush");
-    shard.run_stripe_merge_once().await.expect("post-truncate stripe merge");
+    shard
+        .run_stripe_merge_once()
+        .await
+        .expect("post-truncate stripe merge");
     assert_empty_all_paths(&sess, "t", 5, "post-flush+compact").await;
 
     // ── Re-INSERT must work cleanly and show ONLY the new rows (no resurrected
@@ -249,7 +291,10 @@ async fn truncate_clears_overlay_and_unflushed_tail_no_resurrection() {
     );
     // The old overlay value must be absent.
     let v5_old = row_count(&sess, "SELECT * FROM t WHERE id = 5 AND v = 99999").await;
-    assert_eq!(v5_old, 0, "the pre-TRUNCATE overlay value 99999 must not survive");
+    assert_eq!(
+        v5_old, 0,
+        "the pre-TRUNCATE overlay value 99999 must not survive"
+    );
 
     wal.close().await.unwrap();
     println!("[gap#2] TRUNCATE clears overlay + WAL tail; no resurrection on any read path ✓");

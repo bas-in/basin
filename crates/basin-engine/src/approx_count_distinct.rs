@@ -171,10 +171,7 @@ fn hash_and_insert(arr: &dyn Array, idx: usize, hll: &mut Hll) -> DFResult<()> {
             }
         }
         other => {
-            return exec_err!(
-                "APPROX_COUNT_DISTINCT: unsupported column type {:?}",
-                other
-            );
+            return exec_err!("APPROX_COUNT_DISTINCT: unsupported column type {:?}", other);
         }
     }
     Ok(())
@@ -212,7 +209,10 @@ impl AggregateUDFImpl for ApproxCountDistinctUdaf {
         Ok(DataType::Int64)
     }
 
-    fn accumulator(&self, _args: AccumulatorArgs) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
+    fn accumulator(
+        &self,
+        _args: AccumulatorArgs,
+    ) -> DFResult<Box<dyn datafusion::logical_expr::Accumulator>> {
         Ok(Box::new(ApproxCountDistinctAccumulator::new()))
     }
 
@@ -245,7 +245,9 @@ mod tests {
         let err = (est - n as f64).abs() / n as f64;
         assert!(
             err <= tolerance,
-            "n={n}: estimate={est}, error={:.2} > {:.2}", err * 100.0, tolerance * 100.0
+            "n={n}: estimate={est}, error={:.2} > {:.2}",
+            err * 100.0,
+            tolerance * 100.0
         );
     }
 
@@ -277,7 +279,11 @@ mod tests {
         a.merge(&b);
         let est = a.cardinality() as f64;
         let err = (est - 1000.0).abs() / 1000.0;
-        assert!(err <= 0.05, "merged estimate={est}, error={:.2}", err * 100.0);
+        assert!(
+            err <= 0.05,
+            "merged estimate={est}, error={:.2}",
+            err * 100.0
+        );
     }
 
     #[test]

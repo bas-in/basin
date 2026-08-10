@@ -410,16 +410,23 @@ impl<'a> TypedPathArray<'a> {
                     return Ok(None);
                 }
                 let child = a.value(i);
-                let sa = child.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "{fn_name}: path List element type must be Utf8"
-                    ))
-                })?;
+                let sa = child
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "{fn_name}: path List element type must be Utf8"
+                        ))
+                    })?;
                 Ok(Some(
                     (0..sa.len())
-                        .map(
-                            |j| if sa.is_null(j) { String::new() } else { sa.value(j).to_string() },
-                        )
+                        .map(|j| {
+                            if sa.is_null(j) {
+                                String::new()
+                            } else {
+                                sa.value(j).to_string()
+                            }
+                        })
                         .collect(),
                 ))
             }
@@ -428,16 +435,23 @@ impl<'a> TypedPathArray<'a> {
                     return Ok(None);
                 }
                 let child = a.value(i);
-                let sa = child.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "{fn_name}: path LargeList element type must be Utf8"
-                    ))
-                })?;
+                let sa = child
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "{fn_name}: path LargeList element type must be Utf8"
+                        ))
+                    })?;
                 Ok(Some(
                     (0..sa.len())
-                        .map(
-                            |j| if sa.is_null(j) { String::new() } else { sa.value(j).to_string() },
-                        )
+                        .map(|j| {
+                            if sa.is_null(j) {
+                                String::new()
+                            } else {
+                                sa.value(j).to_string()
+                            }
+                        })
                         .collect(),
                 ))
             }
@@ -479,9 +493,7 @@ impl<'a> TypedBoolFlag<'a> {
                 .downcast_ref::<StringArray>()
                 .map(TypedBoolFlag::Utf8)
                 .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "{fn_name}: {kind} StringArray cast failed"
-                    ))
+                    DataFusionError::Execution(format!("{fn_name}: {kind} StringArray cast failed"))
                 }),
             _ => Ok(TypedBoolFlag::Other),
         }

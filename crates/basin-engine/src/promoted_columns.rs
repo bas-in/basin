@@ -68,7 +68,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, RecordBatch, StringArray};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, RecordBatch, StringArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use basin_catalog::PromotedJsonbPath;
 use basin_common::Result;
@@ -125,7 +127,12 @@ pub(crate) fn materialize_promoted_columns(
     }
 
     let n = batch.num_rows();
-    let mut new_schema_fields: Vec<Field> = batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+    let mut new_schema_fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
     let mut new_columns: Vec<ArrayRef> = batch.columns().to_vec();
 
     for path in paths {
@@ -284,7 +291,9 @@ fn extract_top_level_text_key(bytes: &[u8], key: &str) -> Option<String> {
 
         skip_ws(b, &mut p);
         match b.get(p) {
-            Some(&b',') => { p += 1; }
+            Some(&b',') => {
+                p += 1;
+            }
             Some(&b'}') => break,
             _ => return None,
         }
@@ -305,9 +314,10 @@ fn raw_slice_to_promoted_text(v: &[u8]) -> Option<String> {
         Some(&b'"') => {
             let mut q = p;
             let inner = scan_string(v, &mut q).ok()??;
-            Some(decode_json_string(inner).unwrap_or_else(|| {
-                String::from_utf8_lossy(inner).into_owned()
-            }))
+            Some(
+                decode_json_string(inner)
+                    .unwrap_or_else(|| String::from_utf8_lossy(inner).into_owned()),
+            )
         }
         Some(&b'n') if v[p..].starts_with(b"null") => None,
         None => None,
@@ -353,7 +363,9 @@ fn scan_string<'a>(b: &'a [u8], p: &mut usize) -> Result<Option<&'a [u8]>, ()> {
                 }
                 *p += 1;
             }
-            _ => { *p += 1; }
+            _ => {
+                *p += 1;
+            }
         }
     }
     Err(())
@@ -385,26 +397,57 @@ fn decode_json_string(raw: &[u8]) -> Option<String> {
             out.push_str(std::str::from_utf8(&raw[ch_start..i]).ok()?);
         } else {
             i += 1;
-            if i >= raw.len() { return None; }
+            if i >= raw.len() {
+                return None;
+            }
             match raw[i] {
-                b'"' => { out.push('"'); i += 1; }
-                b'\\' => { out.push('\\'); i += 1; }
-                b'/' => { out.push('/'); i += 1; }
-                b'b' => { out.push('\x08'); i += 1; }
-                b'f' => { out.push('\x0C'); i += 1; }
-                b'n' => { out.push('\n'); i += 1; }
-                b'r' => { out.push('\r'); i += 1; }
-                b't' => { out.push('\t'); i += 1; }
+                b'"' => {
+                    out.push('"');
+                    i += 1;
+                }
+                b'\\' => {
+                    out.push('\\');
+                    i += 1;
+                }
+                b'/' => {
+                    out.push('/');
+                    i += 1;
+                }
+                b'b' => {
+                    out.push('\x08');
+                    i += 1;
+                }
+                b'f' => {
+                    out.push('\x0C');
+                    i += 1;
+                }
+                b'n' => {
+                    out.push('\n');
+                    i += 1;
+                }
+                b'r' => {
+                    out.push('\r');
+                    i += 1;
+                }
+                b't' => {
+                    out.push('\t');
+                    i += 1;
+                }
                 b'u' => {
                     // \uXXXX — minimal 4-hex-digit decode.
-                    if i + 4 >= raw.len() { return None; }
+                    if i + 4 >= raw.len() {
+                        return None;
+                    }
                     let hex = std::str::from_utf8(&raw[i + 1..i + 5]).ok()?;
                     let codepoint = u32::from_str_radix(hex, 16).ok()?;
                     let ch = char::from_u32(codepoint)?;
                     out.push(ch);
                     i += 5;
                 }
-                _ => { out.push(raw[i] as char); i += 1; }
+                _ => {
+                    out.push(raw[i] as char);
+                    i += 1;
+                }
             }
         }
     }
@@ -416,21 +459,49 @@ fn decode_json_string(raw: &[u8]) -> Option<String> {
 fn skip_value(b: &[u8], p: &mut usize) -> std::result::Result<(), ()> {
     skip_ws(b, p);
     match b.get(*p) {
-        Some(&b'"') => { scan_string(b, p).map_err(|_| ())?; Ok(()) }
+        Some(&b'"') => {
+            scan_string(b, p).map_err(|_| ())?;
+            Ok(())
+        }
         Some(&b'{') => skip_object(b, p),
         Some(&b'[') => skip_array(b, p),
-        Some(&b't') => { // true
-            if b[*p..].starts_with(b"true") { *p += 4; Ok(()) } else { Err(()) }
+        Some(&b't') => {
+            // true
+            if b[*p..].starts_with(b"true") {
+                *p += 4;
+                Ok(())
+            } else {
+                Err(())
+            }
         }
-        Some(&b'f') => { // false
-            if b[*p..].starts_with(b"false") { *p += 5; Ok(()) } else { Err(()) }
+        Some(&b'f') => {
+            // false
+            if b[*p..].starts_with(b"false") {
+                *p += 5;
+                Ok(())
+            } else {
+                Err(())
+            }
         }
-        Some(&b'n') => { // null
-            if b[*p..].starts_with(b"null") { *p += 4; Ok(()) } else { Err(()) }
+        Some(&b'n') => {
+            // null
+            if b[*p..].starts_with(b"null") {
+                *p += 4;
+                Ok(())
+            } else {
+                Err(())
+            }
         }
         Some(&b'-') | Some(b'0'..=b'9') => {
             *p += 1;
-            while *p < b.len() && (b[*p].is_ascii_digit() || b[*p] == b'.' || b[*p] == b'e' || b[*p] == b'E' || b[*p] == b'+' || b[*p] == b'-') {
+            while *p < b.len()
+                && (b[*p].is_ascii_digit()
+                    || b[*p] == b'.'
+                    || b[*p] == b'e'
+                    || b[*p] == b'E'
+                    || b[*p] == b'+'
+                    || b[*p] == b'-')
+            {
                 *p += 1;
             }
             Ok(())
@@ -440,37 +511,59 @@ fn skip_value(b: &[u8], p: &mut usize) -> std::result::Result<(), ()> {
 }
 
 fn skip_object(b: &[u8], p: &mut usize) -> std::result::Result<(), ()> {
-    if b.get(*p) != Some(&b'{') { return Err(()); }
+    if b.get(*p) != Some(&b'{') {
+        return Err(());
+    }
     *p += 1;
     skip_ws(b, p);
-    if b.get(*p) == Some(&b'}') { *p += 1; return Ok(()); }
+    if b.get(*p) == Some(&b'}') {
+        *p += 1;
+        return Ok(());
+    }
     loop {
         skip_ws(b, p);
         scan_string(b, p).map_err(|_| ())?;
         skip_ws(b, p);
-        if b.get(*p) != Some(&b':') { return Err(()); }
+        if b.get(*p) != Some(&b':') {
+            return Err(());
+        }
         *p += 1;
         skip_value(b, p)?;
         skip_ws(b, p);
         match b.get(*p) {
-            Some(&b',') => { *p += 1; }
-            Some(&b'}') => { *p += 1; return Ok(()); }
+            Some(&b',') => {
+                *p += 1;
+            }
+            Some(&b'}') => {
+                *p += 1;
+                return Ok(());
+            }
             _ => return Err(()),
         }
     }
 }
 
 fn skip_array(b: &[u8], p: &mut usize) -> std::result::Result<(), ()> {
-    if b.get(*p) != Some(&b'[') { return Err(()); }
+    if b.get(*p) != Some(&b'[') {
+        return Err(());
+    }
     *p += 1;
     skip_ws(b, p);
-    if b.get(*p) == Some(&b']') { *p += 1; return Ok(()); }
+    if b.get(*p) == Some(&b']') {
+        *p += 1;
+        return Ok(());
+    }
     loop {
         skip_value(b, p)?;
         skip_ws(b, p);
         match b.get(*p) {
-            Some(&b',') => { *p += 1; }
-            Some(&b']') => { *p += 1; return Ok(()); }
+            Some(&b',') => {
+                *p += 1;
+            }
+            Some(&b']') => {
+                *p += 1;
+                return Ok(());
+            }
             _ => return Err(()),
         }
     }
@@ -609,8 +702,7 @@ mod tests {
             "SELECT COUNT(*) FROM events WHERE json_get_text(payload, 'category') = 'purchase'";
         let got = rewrite_promoted_columns(sql, &paths);
         assert_eq!(
-            got,
-            "SELECT COUNT(*) FROM events WHERE __promoted$payload$category = 'purchase'",
+            got, "SELECT COUNT(*) FROM events WHERE __promoted$payload$category = 'purchase'",
             "WHERE-position equality must rewrite to the shadow column"
         );
     }
@@ -669,10 +761,14 @@ mod tests {
             json_key: "category".into(),
         }];
         // 'device' is not promoted — must stay as UDF call.
-        let sql = "SELECT json_get_text(payload, 'category'), json_get_text(payload, 'device') FROM t";
+        let sql =
+            "SELECT json_get_text(payload, 'category'), json_get_text(payload, 'device') FROM t";
         let got = rewrite_promoted_columns(sql, &paths);
         assert!(got.contains("__promoted$payload$category"), "got: {got}");
-        assert!(got.contains("json_get_text(payload, 'device')"), "got: {got}");
+        assert!(
+            got.contains("json_get_text(payload, 'device')"),
+            "got: {got}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -681,13 +777,12 @@ mod tests {
 
     fn make_jsonb_batch(jsons: &[Option<&str>]) -> RecordBatch {
         use arrow_schema::Fields;
-        let arr: LargeBinaryArray = jsons
-            .iter()
-            .map(|opt| opt.map(|s| s.as_bytes()))
-            .collect();
-        let schema = Arc::new(Schema::new(Fields::from(vec![
-            Field::new("payload", DataType::LargeBinary, true),
-        ])));
+        let arr: LargeBinaryArray = jsons.iter().map(|opt| opt.map(|s| s.as_bytes())).collect();
+        let schema = Arc::new(Schema::new(Fields::from(vec![Field::new(
+            "payload",
+            DataType::LargeBinary,
+            true,
+        )])));
         RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
     }
 
@@ -774,11 +869,12 @@ mod tests {
     #[test]
     fn materialize_missing_source_col_all_null() {
         use arrow_schema::Fields;
-        let schema = Arc::new(Schema::new(Fields::from(vec![
-            Field::new("other", DataType::Utf8, true),
-        ])));
-        let other_col: Arc<dyn Array> =
-            Arc::new(StringArray::from(vec![Some("x")]));
+        let schema = Arc::new(Schema::new(Fields::from(vec![Field::new(
+            "other",
+            DataType::Utf8,
+            true,
+        )])));
+        let other_col: Arc<dyn Array> = Arc::new(StringArray::from(vec![Some("x")]));
         let batch = RecordBatch::try_new(schema, vec![other_col]).unwrap();
         let paths = vec![PromotedJsonbPath {
             source_col: "payload".into(),

@@ -102,9 +102,7 @@ async fn build_engine_with_shard() -> (
     let storage_dir = TempDir::new().unwrap();
     let wal_dir = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
-        object_store: Arc::new(
-            LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
-        ),
+        object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
         root_prefix: None,
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
@@ -112,9 +110,7 @@ async fn build_engine_with_shard() -> (
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let wal: Arc<dyn Wal> = Arc::new(
         LocalWal::open(WalConfig {
-            object_store: Arc::new(
-                LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap(),
-            ),
+            object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
@@ -123,7 +119,11 @@ async fn build_engine_with_shard() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -158,7 +158,11 @@ async fn build_engine_with_unflushed_shard() -> (TempDir, TempDir, Engine, Shard
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     // Deliberately do NOT call `shard.spawn_background()` — the tail must stay
     // resident so the read-your-writes gate is the only thing that can flush it.
     let shard_probe = shard.clone();
@@ -424,7 +428,9 @@ async fn tombstone_survives_compaction() {
     // Seed rows.
     let mut stmt = "INSERT INTO tsc (id, v) VALUES ".to_string();
     for k in 1i64..=100 {
-        if k > 1 { stmt.push(','); }
+        if k > 1 {
+            stmt.push(',');
+        }
         stmt.push_str(&format!("({k}, {})", k * 10));
     }
     exec(&sess, &stmt).await;

@@ -117,7 +117,10 @@ impl BlobSigningSecret {
     ///
     /// Panics if `new_key` is empty.
     pub fn rotate(&self, new_key: &[u8]) {
-        assert!(!new_key.is_empty(), "BlobSigningSecret::rotate: key must not be empty");
+        assert!(
+            !new_key.is_empty(),
+            "BlobSigningSecret::rotate: key must not be empty"
+        );
         let mut guard = self.inner.write().expect("BlobSigningSecret lock poisoned");
         guard.clear();
         guard.extend_from_slice(new_key);
@@ -127,13 +130,7 @@ impl BlobSigningSecret {
     /// `(project, bucket, path, expires_unix_secs)` tuple.
     ///
     /// Returns the raw MAC bytes (32 bytes for SHA-256).
-    pub fn compute_mac(
-        &self,
-        project: &str,
-        bucket: &str,
-        path: &str,
-        expires: i64,
-    ) -> Vec<u8> {
+    pub fn compute_mac(&self, project: &str, bucket: &str, path: &str, expires: i64) -> Vec<u8> {
         let guard = self.inner.read().expect("BlobSigningSecret lock poisoned");
         Self::hmac_inner(&guard, project, bucket, path, expires)
     }
@@ -168,8 +165,7 @@ impl BlobSigningSecret {
     // -----------------------------------------------------------------------
 
     fn hmac_inner(key: &[u8], project: &str, bucket: &str, path: &str, expires: i64) -> Vec<u8> {
-        let mut mac =
-            HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
         mac.update(project.as_bytes());
         mac.update(b"\n");
         mac.update(bucket.as_bytes());

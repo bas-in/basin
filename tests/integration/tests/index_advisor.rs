@@ -16,9 +16,7 @@ use std::time::{Duration, Instant};
 
 use basin_catalog::InMemoryCatalog;
 use basin_common::{ProjectId, TableName};
-use basin_engine::index_advisor::{
-    self, auto_index_name, AUTO_INDEX_MIN_HITS,
-};
+use basin_engine::index_advisor::{self, auto_index_name, AUTO_INDEX_MIN_HITS};
 use basin_engine::{Engine, EngineConfig, ExecResult, ProjectSession};
 use basin_storage::{Predicate, ScalarValue};
 use basin_wal::{LocalWal, Wal, WalConfig};
@@ -284,10 +282,7 @@ async fn preexisting_index_no_duplicate() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let meta = load_meta(&eng, &project, &table).await;
-    assert!(
-        has_index(&meta, "my_user_idx"),
-        "user index must remain"
-    );
+    assert!(has_index(&meta, "my_user_idx"), "user index must remain");
     assert!(
         !has_index(&meta, &auto_index_name(&table, "user_id")),
         "advisor must not create a duplicate auto index when one already covers the column"
@@ -367,7 +362,10 @@ async fn unsupported_type_never_fires() {
     // Feed many Eq predicates on the Float32 column directly to the observer.
     let meta = load_meta(&eng, &project, &table).await;
     for _ in 0..(AUTO_INDEX_MIN_HITS + 5) {
-        let preds = vec![Predicate::Eq("score".to_string(), ScalarValue::Float64(1.0))];
+        let preds = vec![Predicate::Eq(
+            "score".to_string(),
+            ScalarValue::Float64(1.0),
+        )];
         index_advisor::observe_eq_predicates(&sess, &table, &meta, &preds);
     }
     tokio::time::sleep(Duration::from_millis(150)).await;

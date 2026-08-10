@@ -319,13 +319,12 @@ mod tests {
         // Any password works — this is exactly why we keep it out of the
         // stack when empty.
         assert_eq!(
-            r.resolve_credentials("alice", "wrong-password").await.unwrap(),
+            r.resolve_credentials("alice", "wrong-password")
+                .await
+                .unwrap(),
             t
         );
-        assert_eq!(
-            r.resolve_credentials("alice", "").await.unwrap(),
-            t
-        );
+        assert_eq!(r.resolve_credentials("alice", "").await.unwrap(), t);
     }
 
     #[tokio::test]

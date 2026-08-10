@@ -1151,8 +1151,10 @@ async fn run_shape(client: &Client, shape: &Shape) -> Result<ShapeOutcome, Strin
     } else {
         let boxed: Vec<Box<dyn ToSql + Sync + Send>> =
             shape.params.iter().map(|p| p.to_boxed()).collect();
-        let refs: Vec<&(dyn ToSql + Sync)> =
-            boxed.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
+        let refs: Vec<&(dyn ToSql + Sync)> = boxed
+            .iter()
+            .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+            .collect();
         client.execute(shape.sql, &refs[..]).await.map(|_| ())
     };
     classify_shape_result(result)
@@ -1239,11 +1241,7 @@ struct OrmCompatReport {
     total_regression: usize,
 }
 
-async fn run_orm_section(
-    client: &Client,
-    orm: &str,
-    shapes: &[Shape],
-) -> OrmSection {
+async fn run_orm_section(client: &Client, orm: &str, shapes: &[Shape]) -> OrmSection {
     let mut shape_results = Vec::new();
     let mut ok = 0usize;
     let mut typed = 0usize;
@@ -1441,50 +1439,72 @@ async fn orm_compat_corpus() {
     // takes) is exercised end-to-end.
     let drizzle: &[Shape] = &[
         // 1. Basic SELECT with WHERE equality + LIMIT.
-        Shape::raw(r#"SELECT "users"."id", "users"."email" FROM "users" WHERE "users"."email" = 'alice@example.com' LIMIT 1"#),
+        Shape::raw(
+            r#"SELECT "users"."id", "users"."email" FROM "users" WHERE "users"."email" = 'alice@example.com' LIMIT 1"#,
+        ),
         // 2. Parameterised SELECT — $1 bound via extended protocol.
         Shape::with(
             r#"SELECT "users"."id", "users"."email" FROM "users" WHERE "users"."email" = $1 LIMIT 1"#,
             &[ParamValue::Text("alice@example.com")],
         ),
         // 3. INSERT with RETURNING.
-        Shape::raw(r#"INSERT INTO "users" ("id","email","created_at") VALUES (3,'carol@example.com',NOW()) RETURNING "id""#),
+        Shape::raw(
+            r#"INSERT INTO "users" ("id","email","created_at") VALUES (3,'carol@example.com',NOW()) RETURNING "id""#,
+        ),
         // 4. UPDATE … SET … WHERE … RETURNING *.
-        Shape::raw(r#"UPDATE "users" SET "email" = 'alice2@example.com', "updated_at" = NOW() WHERE "id" = 1 RETURNING *"#),
+        Shape::raw(
+            r#"UPDATE "users" SET "email" = 'alice2@example.com', "updated_at" = NOW() WHERE "id" = 1 RETURNING *"#,
+        ),
         // 5. DELETE … WHERE id = ANY($1::int[]) — Drizzle bulk-delete pattern.
         Shape::with(
             r#"DELETE FROM "users" WHERE "id" = ANY($1::int[])"#,
             &[ParamValue::Int4Array(&[100, 101, 102])],
         ),
         // 6. Correlated scalar subquery — order count per user.
-        Shape::raw(r#"SELECT "users"."id","users"."email",
+        Shape::raw(
+            r#"SELECT "users"."id","users"."email",
                (SELECT count(*) FROM "orders" WHERE "orders"."user_id" = "users"."id") AS "order_count"
-           FROM "users""#),
+           FROM "users""#,
+        ),
         // 7. SELECT with ORDER BY + LIMIT + OFFSET.
-        Shape::raw(r#"SELECT "users"."id","users"."email","users"."created_at"
-           FROM "users" ORDER BY "users"."created_at" DESC LIMIT 10 OFFSET 0"#),
+        Shape::raw(
+            r#"SELECT "users"."id","users"."email","users"."created_at"
+           FROM "users" ORDER BY "users"."created_at" DESC LIMIT 10 OFFSET 0"#,
+        ),
         // 8. INNER JOIN.
-        Shape::raw(r#"SELECT "users"."id","users"."email","orders"."id" AS "order_id","orders"."status"
+        Shape::raw(
+            r#"SELECT "users"."id","users"."email","orders"."id" AS "order_id","orders"."status"
            FROM "users"
            INNER JOIN "orders" ON "orders"."user_id" = "users"."id"
-           WHERE "orders"."status" = 'completed'"#),
+           WHERE "orders"."status" = 'completed'"#,
+        ),
         // 9. IN clause (literal list).
-        Shape::raw(r#"SELECT "users"."id","users"."email" FROM "users" WHERE "users"."id" IN (1,2)"#),
+        Shape::raw(
+            r#"SELECT "users"."id","users"."email" FROM "users" WHERE "users"."id" IN (1,2)"#,
+        ),
         // 10. COUNT(*) aggregation.
         Shape::raw(r#"SELECT count(*) AS "count" FROM "users""#),
         // 11. ON CONFLICT DO NOTHING.
-        Shape::raw(r#"INSERT INTO "users" ("id","email") VALUES (99,'dup@example.com') ON CONFLICT DO NOTHING"#),
+        Shape::raw(
+            r#"INSERT INTO "users" ("id","email") VALUES (99,'dup@example.com') ON CONFLICT DO NOTHING"#,
+        ),
         // 12. IS NULL predicate.
-        Shape::raw(r#"SELECT "users"."id","users"."email" FROM "users" WHERE "users"."name" IS NULL"#),
+        Shape::raw(
+            r#"SELECT "users"."id","users"."email" FROM "users" WHERE "users"."name" IS NULL"#,
+        ),
         // 13. BETWEEN range.
-        Shape::raw(r#"SELECT "orders"."id","orders"."total" FROM "orders" WHERE "orders"."total" BETWEEN 10.0 AND 100.0"#),
+        Shape::raw(
+            r#"SELECT "orders"."id","orders"."total" FROM "orders" WHERE "orders"."total" BETWEEN 10.0 AND 100.0"#,
+        ),
         // 14. Aliased subquery in FROM (Drizzle join helper).
-        Shape::raw(r#"SELECT u.id, u.email, sub.order_count
+        Shape::raw(
+            r#"SELECT u.id, u.email, sub.order_count
            FROM "users" u
            JOIN (
                SELECT "user_id", count(*) AS order_count
                FROM "orders" GROUP BY "user_id"
-           ) sub ON sub."user_id" = u.id"#),
+           ) sub ON sub."user_id" = u.id"#,
+        ),
         // ── EXPANSION (#94, +10 real-world Drizzle shapes) ─────────────────
         // Sourced from drizzle-orm/src/pg-core query-builder tests
         // (github.com/drizzle-team/drizzle-orm) and the `examples/` apps
@@ -1493,20 +1513,26 @@ async fn orm_compat_corpus() {
         // 15. Drizzle `.values([...])` multi-row INSERT — every batch insert
         //     (`db.insert(users).values([...])`) emits this exact shape with
         //     parenthesised value tuples.
-        Shape::raw(r#"INSERT INTO "users" ("id","email","name") VALUES (50,'m1@example.com','M1'),(51,'m2@example.com','M2'),(52,'m3@example.com','M3') ON CONFLICT DO NOTHING"#),
+        Shape::raw(
+            r#"INSERT INTO "users" ("id","email","name") VALUES (50,'m1@example.com','M1'),(51,'m2@example.com','M2'),(52,'m3@example.com','M3') ON CONFLICT DO NOTHING"#,
+        ),
         // 16. Drizzle `.onConflictDoUpdate({ target: ..., set: { ... } })`
         //     with `sql\`excluded.<col>\`` — the upsert flow used by every
         //     "save or update" pattern in the README.
-        Shape::raw(r#"INSERT INTO "users" ("id","email","name") VALUES (60,'up@example.com','U')
-           ON CONFLICT ("id") DO UPDATE SET "email" = excluded."email", "name" = excluded."name""#),
+        Shape::raw(
+            r#"INSERT INTO "users" ("id","email","name") VALUES (60,'up@example.com','U')
+           ON CONFLICT ("id") DO UPDATE SET "email" = excluded."email", "name" = excluded."name""#,
+        ),
         // 17. Drizzle relational-query `.findMany({ with: { orders: true } })`
         //     emits a json-built nested object via `json_build_array` /
         //     `coalesce(jsonb_agg(...), '[]')`.  Real shape captured from
         //     drizzle-orm/src/pg-core/query-builders/select.ts tests.
-        Shape::raw(r#"SELECT "users"."id","users"."email",
+        Shape::raw(
+            r#"SELECT "users"."id","users"."email",
                coalesce(json_agg(json_build_object('id',"orders"."id",'status',"orders"."status")), '[]'::json) AS "orders"
            FROM "users" LEFT JOIN "orders" ON "orders"."user_id" = "users"."id"
-           GROUP BY "users"."id","users"."email""#),
+           GROUP BY "users"."id","users"."email""#,
+        ),
         // 18. Drizzle `sql\`${col}::text\`` cast helper — every type-coerced
         //     filter (e.g. comparing a bigint id against a text query-string).
         Shape::with(
@@ -1515,23 +1541,31 @@ async fn orm_compat_corpus() {
         ),
         // 19. Drizzle `.for('update')` row-level lock — Postgres dialect emits
         //     `FOR UPDATE` after `LIMIT`.
-        Shape::raw(r#"SELECT "users"."id","users"."email" FROM "users" WHERE "users"."id" = 1 LIMIT 1 FOR UPDATE"#),
+        Shape::raw(
+            r#"SELECT "users"."id","users"."email" FROM "users" WHERE "users"."id" = 1 LIMIT 1 FOR UPDATE"#,
+        ),
         // 20. Drizzle `.for('share')` shared row lock variant.
         Shape::raw(r#"SELECT "users"."id" FROM "users" WHERE "users"."id" = 1 FOR SHARE"#),
         // 21. Drizzle `with(...)` CTE — `db.with(sq).select().from(sq)` emits
         //     a single-CTE `WITH ... SELECT` shape.
-        Shape::raw(r#"WITH "user_orders" AS (
+        Shape::raw(
+            r#"WITH "user_orders" AS (
                SELECT "user_id", count(*) AS "cnt" FROM "orders" GROUP BY "user_id"
            )
            SELECT u."id", u."email", uo."cnt"
-           FROM "users" u LEFT JOIN "user_orders" uo ON uo."user_id" = u."id""#),
+           FROM "users" u LEFT JOIN "user_orders" uo ON uo."user_id" = u."id""#,
+        ),
         // 22. Drizzle `union` set-op composer — `db.select().from(a).union(db.select().from(b))`.
-        Shape::raw(r#"SELECT "id" FROM "users" UNION SELECT "user_id" AS "id" FROM "orders" ORDER BY "id""#),
+        Shape::raw(
+            r#"SELECT "id" FROM "users" UNION SELECT "user_id" AS "id" FROM "orders" ORDER BY "id""#,
+        ),
         // 23. Drizzle window-function helper — `sql\`row_number() OVER (PARTITION BY ${col} ORDER BY ${col})\``
         //     emitted by the `windowFunctions` examples in the README.
-        Shape::raw(r#"SELECT "id","user_id","total",
+        Shape::raw(
+            r#"SELECT "id","user_id","total",
                row_number() OVER (PARTITION BY "user_id" ORDER BY "total" DESC) AS "rn"
-           FROM "orders""#),
+           FROM "orders""#,
+        ),
         // 24. Drizzle cursor-based pagination — `gt(col, cursor)` + `orderBy`
         //     + `limit` (the Neon/Vercel infinite-scroll pattern).
         Shape::with(
@@ -1551,37 +1585,53 @@ async fn orm_compat_corpus() {
     // information_schema.columns — both return typed errors, not panics.
     let prisma: &[Shape] = &[
         // 1. Schema introspection — information_schema.columns probe.
-        Shape::raw(r#"SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'User'"#),
+        Shape::raw(
+            r#"SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'User'"#,
+        ),
         // 2. findUnique — PK equality.
-        Shape::raw(r#"SELECT "User"."id","User"."email","User"."name","User"."createdAt" FROM "User" WHERE "User"."id" = 1 LIMIT 1"#),
+        Shape::raw(
+            r#"SELECT "User"."id","User"."email","User"."name","User"."createdAt" FROM "User" WHERE "User"."id" = 1 LIMIT 1"#,
+        ),
         // 3. findMany — no predicates.
-        Shape::raw(r#"SELECT "User"."id","User"."email","User"."name","User"."createdAt" FROM "User""#),
+        Shape::raw(
+            r#"SELECT "User"."id","User"."email","User"."name","User"."createdAt" FROM "User""#,
+        ),
         // 4. count query.
         Shape::raw(r#"SELECT count(*) FROM "Order""#),
         // 5. json_agg relation hydration (correlated subquery).
-        Shape::raw(r#"SELECT "User"."id","User"."email",
+        Shape::raw(
+            r#"SELECT "User"."id","User"."email",
                (SELECT json_agg(o.*) FROM "Order" o WHERE o."userId" = "User"."id") AS "orders"
-           FROM "User""#),
+           FROM "User""#,
+        ),
         // 6. pg_get_serial_sequence probe — KNOWN UNSUPPORTED.
         //    Prisma calls this to find the sequence for auto-increment columns.
         //    Basin does not wire up pg_get_serial_sequence; returns typed error.
         Shape::raw(r#"SELECT pg_get_serial_sequence('"User"', 'id')"#),
         // 7. CREATE TABLE IF NOT EXISTS with camelCase columns.
-        Shape::raw(r#"CREATE TABLE IF NOT EXISTS "Profile" (
+        Shape::raw(
+            r#"CREATE TABLE IF NOT EXISTS "Profile" (
                "id"     BIGINT NOT NULL,
                "bio"    TEXT,
                "userId" BIGINT NOT NULL,
                PRIMARY KEY ("id")
-           )"#),
+           )"#,
+        ),
         // 8. Upsert — INSERT … ON CONFLICT … DO UPDATE … RETURNING.
-        Shape::raw(r#"INSERT INTO "User" ("id","email","name")
+        Shape::raw(
+            r#"INSERT INTO "User" ("id","email","name")
            VALUES (5,'eve@example.com','Eve')
            ON CONFLICT ("id") DO UPDATE SET "email" = EXCLUDED."email"
-           RETURNING "id","email""#),
+           RETURNING "id","email""#,
+        ),
         // 9. Relation count — COUNT with GROUP BY.
-        Shape::raw(r#"SELECT "userId", count(*) AS "_count" FROM "Order" GROUP BY "userId" ORDER BY "userId""#),
+        Shape::raw(
+            r#"SELECT "userId", count(*) AS "_count" FROM "Order" GROUP BY "userId" ORDER BY "userId""#,
+        ),
         // 10. pg_class probe — KNOWN UNSUPPORTED (catalog not fully exposed).
-        Shape::raw(r#"SELECT relname, relkind FROM pg_class WHERE relname = 'User' AND relkind = 'r'"#),
+        Shape::raw(
+            r#"SELECT relname, relkind FROM pg_class WHERE relname = 'User' AND relkind = 'r'"#,
+        ),
         // 11. DELETE by PK.
         Shape::raw(r#"DELETE FROM "User" WHERE "id" = 999 RETURNING "id""#),
         // ── EXPANSION (#94, +10 real-world Prisma shapes) ──────────────────
@@ -1598,19 +1648,29 @@ async fn orm_compat_corpus() {
         //     `simple_query` with literal values to keep the corpus
         //     regression-free while still exercising the schema-qualified
         //     planner path.
-        Shape::raw(r#"SELECT "public"."User"."id","public"."User"."email" FROM "public"."User" WHERE "public"."User"."id" = 1 LIMIT 1 OFFSET 0"#),
+        Shape::raw(
+            r#"SELECT "public"."User"."id","public"."User"."email" FROM "public"."User" WHERE "public"."User"."id" = 1 LIMIT 1 OFFSET 0"#,
+        ),
         // 13. Prisma `create({ data: ... })` — single-row INSERT with
         //     RETURNING * (Prisma always selects every column back).
-        Shape::raw(r#"INSERT INTO "public"."User" ("id","email","name") VALUES (200,'p1@example.com','P1') RETURNING "public"."User"."id","public"."User"."email","public"."User"."name","public"."User"."createdAt""#),
+        Shape::raw(
+            r#"INSERT INTO "public"."User" ("id","email","name") VALUES (200,'p1@example.com','P1') RETURNING "public"."User"."id","public"."User"."email","public"."User"."name","public"."User"."createdAt""#,
+        ),
         // 14. Prisma `update({ where, data })` — UPDATE with RETURNING.
         //     Literal-bound twin of the parameterised form (see shape 12 note
         //     on the schema-qualified ParameterDescription gap).
-        Shape::raw(r#"UPDATE "public"."User" SET "name" = 'AliceUpdated' WHERE "public"."User"."id" = 1 RETURNING "public"."User"."id","public"."User"."email","public"."User"."name""#),
+        Shape::raw(
+            r#"UPDATE "public"."User" SET "name" = 'AliceUpdated' WHERE "public"."User"."id" = 1 RETURNING "public"."User"."id","public"."User"."email","public"."User"."name""#,
+        ),
         // 15. Prisma `delete({ where })` — DELETE with RETURNING (literal).
-        Shape::raw(r#"DELETE FROM "public"."User" WHERE "public"."User"."id" = 998 RETURNING "public"."User"."id","public"."User"."email""#),
+        Shape::raw(
+            r#"DELETE FROM "public"."User" WHERE "public"."User"."id" = 998 RETURNING "public"."User"."id","public"."User"."email""#,
+        ),
         // 16. Prisma `findMany({ orderBy: { createdAt: 'desc' } })` —
         //     paginated read with default ORDER BY + LIMIT + OFFSET (literal).
-        Shape::raw(r#"SELECT "public"."User"."id","public"."User"."email","public"."User"."name","public"."User"."createdAt" FROM "public"."User" ORDER BY "public"."User"."createdAt" DESC LIMIT 20 OFFSET 0"#),
+        Shape::raw(
+            r#"SELECT "public"."User"."id","public"."User"."email","public"."User"."name","public"."User"."createdAt" FROM "public"."User" ORDER BY "public"."User"."createdAt" DESC LIMIT 20 OFFSET 0"#,
+        ),
         // 17. Prisma transaction `$transaction([...])` — explicit SAVEPOINT
         //     for nested-transaction emulation.  Emitted verbatim by
         //     query-engine/connectors/sql-query-connector/src/database/transaction.rs.
@@ -1635,18 +1695,17 @@ async fn orm_compat_corpus() {
         //     pg_attribute / pg_namespace / pg_class joined together
         //     (`prisma migrate diff` baseline).  Verbatim from
         //     migration-engine/connectors/sql-schema-describer/src/postgres.rs.
-        Shape::raw(r#"SELECT att.attname AS column_name, pg_catalog.format_type(att.atttypid, att.atttypmod) AS data_type
+        Shape::raw(
+            r#"SELECT att.attname AS column_name, pg_catalog.format_type(att.atttypid, att.atttypmod) AS data_type
            FROM pg_catalog.pg_attribute att
            JOIN pg_catalog.pg_class cls ON cls.oid = att.attrelid
            JOIN pg_catalog.pg_namespace nsp ON nsp.oid = cls.relnamespace
            WHERE nsp.nspname = 'public' AND cls.relname = 'User' AND att.attnum > 0 AND NOT att.attisdropped
-           ORDER BY att.attnum"#),
+           ORDER BY att.attnum"#,
+        ),
         // 21. Prisma raw-SQL escape hatch — `$queryRaw\`SELECT ... ::int\``
         //     emits Postgres-flavoured `::int` / `::text` casts directly.
-        Shape::with(
-            r#"SELECT $1::int4 AS "value""#,
-            &[ParamValue::I32(42)],
-        ),
+        Shape::with(r#"SELECT $1::int4 AS "value""#, &[ParamValue::I32(42)]),
         // ── NEW SHAPE CLASS: nested-write transaction ──────────────────────
         // 22. Prisma nested write — `prisma.user.create({ data: { ...,
         //     orders: { create: [...] } } })` runs as one transaction: BEGIN,
@@ -1654,7 +1713,9 @@ async fn orm_compat_corpus() {
         //     (each referencing the parent's id), COMMIT. One simple_query
         //     batch models the exact statement sequence on the wire
         //     (query-engine/connectors/sql-query-connector write.rs).
-        Shape::raw(r#"BEGIN; INSERT INTO "public"."User" ("id","email","name") VALUES (400,'nested@example.com','Nested') RETURNING "public"."User"."id"; INSERT INTO "public"."Order" ("id","userId","status","total") VALUES (40,400,'new',10.00) RETURNING "public"."Order"."id"; INSERT INTO "public"."Order" ("id","userId","status","total") VALUES (41,400,'new',12.50) RETURNING "public"."Order"."id"; COMMIT;"#),
+        Shape::raw(
+            r#"BEGIN; INSERT INTO "public"."User" ("id","email","name") VALUES (400,'nested@example.com','Nested') RETURNING "public"."User"."id"; INSERT INTO "public"."Order" ("id","userId","status","total") VALUES (40,400,'new',10.00) RETURNING "public"."Order"."id"; INSERT INTO "public"."Order" ("id","userId","status","total") VALUES (41,400,'new',12.50) RETURNING "public"."Order"."id"; COMMIT;"#,
+        ),
         // 23. Session-state guard for shape 22 (mirrors sqlx shape 19): if
         //     the nested-write batch aborts mid-transaction, this ROLLBACK
         //     clears the aborted state so later sections aren't poisoned.
@@ -1680,8 +1741,10 @@ async fn orm_compat_corpus() {
             &[ParamValue::I64(1)],
         ),
         // 2. INSERT … RETURNING.
-        Shape::raw(r#"INSERT INTO "users" (id, email, name, created_at)
-           VALUES (4,'dave@example.com','Dave',NOW()) RETURNING id, email"#),
+        Shape::raw(
+            r#"INSERT INTO "users" (id, email, name, created_at)
+           VALUES (4,'dave@example.com','Dave',NOW()) RETURNING id, email"#,
+        ),
         // 3. UPDATE.
         Shape::raw(r#"UPDATE "users" SET name = 'David' WHERE id = 4"#),
         // 4. DELETE.
@@ -1756,7 +1819,9 @@ async fn orm_compat_corpus() {
         Shape::raw(r#"SELECT id FROM "users" WHERE name IS NOT NULL"#),
         // 17. sqlx UNION ALL composition — appended-tables pattern in
         //     `sqlx/tests/postgres/postgres.rs` union test fixtures.
-        Shape::raw(r#"SELECT id, 'user' AS kind FROM "users" UNION ALL SELECT id, 'order' AS kind FROM "orders" ORDER BY id"#),
+        Shape::raw(
+            r#"SELECT id, 'user' AS kind FROM "users" UNION ALL SELECT id, 'order' AS kind FROM "orders" ORDER BY id"#,
+        ),
         // 18. sqlx connection-setup probe — `SET TIME ZONE 'UTC'` is one of
         //     the first statements sqlx-postgres issues after authentication.
         Shape::raw(r#"SET TIME ZONE 'UTC'"#),
@@ -1794,22 +1859,28 @@ async fn orm_compat_corpus() {
         // 1. SELECT columns explicitly.
         Shape::raw(r#"SELECT id, title, body, user_id FROM posts WHERE id = 1"#),
         // 2. INSERT … RETURNING — Diesel uses this for identity columns.
-        Shape::raw(r#"INSERT INTO posts (id, title, body, user_id)
-           VALUES (3,'Third Post','New content',1) RETURNING id, title"#),
+        Shape::raw(
+            r#"INSERT INTO posts (id, title, body, user_id)
+           VALUES (3,'Third Post','New content',1) RETURNING id, title"#,
+        ),
         // 3. UPDATE with RETURNING.
         Shape::raw(r#"UPDATE posts SET title = 'Updated Title' WHERE id = 1 RETURNING id, title"#),
         // 4. DELETE by primary key.
         Shape::raw(r#"DELETE FROM posts WHERE id = 999"#),
         // 5. SELECT with JOIN.
-        Shape::raw(r#"SELECT posts.id, posts.title, posts.body, posts.user_id
+        Shape::raw(
+            r#"SELECT posts.id, posts.title, posts.body, posts.user_id
            FROM posts
            INNER JOIN "users" ON posts.user_id = "users"."id"
-           WHERE "users"."email" = 'alice@example.com'"#),
+           WHERE "users"."email" = 'alice@example.com'"#,
+        ),
         // 6. pg_catalog.pg_tables probe — Diesel migration check.
         //    KNOWN POTENTIALLY UNSUPPORTED: Basin may not expose pg_tables.
         Shape::raw(r#"SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public'"#),
         // 7. ORDER BY + LIMIT (pagination).
-        Shape::raw(r#"SELECT id, title, body, user_id FROM posts ORDER BY id ASC LIMIT 10 OFFSET 0"#),
+        Shape::raw(
+            r#"SELECT id, title, body, user_id FROM posts ORDER BY id ASC LIMIT 10 OFFSET 0"#,
+        ),
         // 8. COUNT aggregate.
         Shape::raw(r#"SELECT count(*) FROM posts WHERE user_id = 1"#),
         // ── EXPANSION (#94, +10 real-world Diesel shapes) ──────────────────
@@ -1820,10 +1891,14 @@ async fn orm_compat_corpus() {
         // 9. Diesel `.filter(...).first(conn)` — generated SELECT always
         //    aliases every column with the table-prefixed form because
         //    Diesel projects through its `Queryable` trait.
-        Shape::raw(r#"SELECT "posts"."id", "posts"."title", "posts"."body", "posts"."user_id" FROM "posts" WHERE ("posts"."user_id" = 1) ORDER BY "posts"."id" ASC LIMIT 1"#),
+        Shape::raw(
+            r#"SELECT "posts"."id", "posts"."title", "posts"."body", "posts"."user_id" FROM "posts" WHERE ("posts"."user_id" = 1) ORDER BY "posts"."id" ASC LIMIT 1"#,
+        ),
         // 10. Diesel `insert_into(...).values(&[...])` multi-row — verbatim
         //     `INSERT INTO ... VALUES (...), (...)` (no UNION-ALL trick).
-        Shape::raw(r#"INSERT INTO "posts" ("id", "title", "body", "user_id") VALUES (101, 'p1', 'b1', 1), (102, 'p2', 'b2', 2)"#),
+        Shape::raw(
+            r#"INSERT INTO "posts" ("id", "title", "body", "user_id") VALUES (101, 'p1', 'b1', 1), (102, 'p2', 'b2', 2)"#,
+        ),
         // 11. Diesel `update(posts).set((title.eq(...), body.eq(...))).execute(conn)`
         //     — tuple-of-AssignmentTargets SET clause.
         Shape::with(
@@ -1836,22 +1911,34 @@ async fn orm_compat_corpus() {
         ),
         // 12. Diesel `.for_update()` row lock — `posts::table.filter(...).for_update().load(conn)`
         //     appends `FOR UPDATE` and skips the GROUP BY clause.
-        Shape::raw(r#"SELECT "posts"."id", "posts"."title" FROM "posts" WHERE ("posts"."id" = 1) FOR UPDATE"#),
+        Shape::raw(
+            r#"SELECT "posts"."id", "posts"."title" FROM "posts" WHERE ("posts"."id" = 1) FOR UPDATE"#,
+        ),
         // 13. Diesel `.for_no_key_update().skip_locked()` — modern queue
         //     pattern documented in diesel_cli/migrations RFC.
-        Shape::raw(r#"SELECT "posts"."id" FROM "posts" WHERE ("posts"."user_id" = 1) ORDER BY "posts"."id" ASC LIMIT 1 FOR NO KEY UPDATE SKIP LOCKED"#),
+        Shape::raw(
+            r#"SELECT "posts"."id" FROM "posts" WHERE ("posts"."user_id" = 1) ORDER BY "posts"."id" ASC LIMIT 1 FOR NO KEY UPDATE SKIP LOCKED"#,
+        ),
         // 14. Diesel `.on_conflict(...).do_update().set(...)` upsert — the
         //     standard `upsert` documented in diesel.rs/guides/all-about-updates.
         Shape::with(
             r#"INSERT INTO "posts" ("id", "title", "user_id") VALUES ($1, $2, $3) ON CONFLICT ("id") DO UPDATE SET "title" = EXCLUDED."title""#,
-            &[ParamValue::I64(1), ParamValue::Text("Upserted"), ParamValue::I64(1)],
+            &[
+                ParamValue::I64(1),
+                ParamValue::Text("Upserted"),
+                ParamValue::I64(1),
+            ],
         ),
         // 15. Diesel `posts::table.inner_join(users::table)` — the join is
         //     emitted with explicit ON-clause column references.
-        Shape::raw(r#"SELECT "posts"."id", "posts"."title", "users"."email" FROM "posts" INNER JOIN "users" ON "users"."id" = "posts"."user_id" WHERE ("users"."email" = 'alice@example.com')"#),
+        Shape::raw(
+            r#"SELECT "posts"."id", "posts"."title", "users"."email" FROM "posts" INNER JOIN "users" ON "users"."id" = "posts"."user_id" WHERE ("users"."email" = 'alice@example.com')"#,
+        ),
         // 16. Diesel `.group_by(...).select((col, count_star()))` — aggregate
         //     with explicit GROUP BY, the `aggregations` example in the book.
-        Shape::raw(r#"SELECT "posts"."user_id", COUNT(*) FROM "posts" GROUP BY "posts"."user_id" ORDER BY "posts"."user_id" ASC"#),
+        Shape::raw(
+            r#"SELECT "posts"."user_id", COUNT(*) FROM "posts" GROUP BY "posts"."user_id" ORDER BY "posts"."user_id" ASC"#,
+        ),
         // 17. Diesel `delete(...).filter(...).returning(...)` — returning
         //     variant added in Diesel 2.x.
         Shape::with(
@@ -1872,7 +1959,9 @@ async fn orm_compat_corpus() {
         //     `__diesel_schema_migrations` (the canonical migration tracker
         //     table).  Always preceded by the bootstrap in shape 18, exactly
         //     as the real harness orders them.
-        Shape::raw(r#"SELECT "__diesel_schema_migrations"."version", "__diesel_schema_migrations"."run_on" FROM "__diesel_schema_migrations" ORDER BY "__diesel_schema_migrations"."version" DESC"#),
+        Shape::raw(
+            r#"SELECT "__diesel_schema_migrations"."version", "__diesel_schema_migrations"."run_on" FROM "__diesel_schema_migrations" ORDER BY "__diesel_schema_migrations"."version" DESC"#,
+        ),
         // 20. Diesel records an applied migration version in the tracker —
         //     `INSERT INTO __diesel_schema_migrations (version) VALUES ($1)`.
         Shape::with(
@@ -1894,14 +1983,18 @@ async fn orm_compat_corpus() {
     // included to catch parse regressions.
     let typeorm: &[Shape] = &[
         // 1. findOne with camelCase aliases.
-        Shape::raw(r#"SELECT "users"."id" AS "users_id","users"."email" AS "users_email","users"."name" AS "users_name"
-           FROM "users" WHERE "users"."id" = 1 LIMIT 1"#),
+        Shape::raw(
+            r#"SELECT "users"."id" AS "users_id","users"."email" AS "users_email","users"."name" AS "users_name"
+           FROM "users" WHERE "users"."id" = 1 LIMIT 1"#,
+        ),
         // 2. LEFT JOIN with ON + WHERE chain.
-        Shape::raw(r#"SELECT "users"."id" AS "users_id","users"."email" AS "users_email",
+        Shape::raw(
+            r#"SELECT "users"."id" AS "users_id","users"."email" AS "users_email",
                   "orders"."id" AS "orders_id","orders"."status" AS "orders_status"
            FROM "users"
            LEFT JOIN "orders" ON "orders"."user_id" = "users"."id"
-           WHERE "orders"."status" = 'completed'"#),
+           WHERE "orders"."status" = 'completed'"#,
+        ),
         // 3. COUNT with alias.
         Shape::raw(r#"SELECT count("users"."id") AS "cnt" FROM "users""#),
         // 4. Parameterised query — $1 bound via extended protocol.
@@ -1915,7 +2008,9 @@ async fn orm_compat_corpus() {
             &[ParamValue::I64(999)],
         ),
         // 6. INSERT with RETURNING.
-        Shape::raw(r#"INSERT INTO "orders" ("id","user_id","status","total") VALUES (20,1,'new',5.00) RETURNING "id""#),
+        Shape::raw(
+            r#"INSERT INTO "orders" ("id","user_id","status","total") VALUES (20,1,'new',5.00) RETURNING "id""#,
+        ),
         // ── EXPANSION (#94, +10 real-world TypeORM shapes) ─────────────────
         // Sourced from typeorm/typeorm `test/functional/query-builder/`
         // SQL-string assertions and the TypeORM logger output
@@ -1925,9 +2020,11 @@ async fn orm_compat_corpus() {
         //    relation-loader emits LEFT JOIN with every column dual-aliased
         //    (table_col + camelCase property).  Verbatim shape verified by
         //    test/functional/relations/eager-relations.
-        Shape::raw(r#"SELECT "users"."id" AS "users_id", "users"."email" AS "users_email", "orders"."id" AS "orders_id", "orders"."user_id" AS "orders_userId", "orders"."status" AS "orders_status"
+        Shape::raw(
+            r#"SELECT "users"."id" AS "users_id", "users"."email" AS "users_email", "orders"."id" AS "orders_id", "orders"."user_id" AS "orders_userId", "orders"."status" AS "orders_status"
            FROM "users" "users"
-           LEFT JOIN "orders" "orders" ON "orders"."user_id" = "users"."id""#),
+           LEFT JOIN "orders" "orders" ON "orders"."user_id" = "users"."id""#,
+        ),
         // 8. TypeORM `createQueryBuilder().where("id IN (:...ids)", { ids: [1,2,3] })`
         //    — the spread-IN syntax expands to `IN ($1, $2, $3)` (positional).
         Shape::with(
@@ -1936,11 +2033,15 @@ async fn orm_compat_corpus() {
         ),
         // 9. TypeORM `.insert().values([...]).returning(['id']).execute()` —
         //    multi-row INSERT with explicit RETURNING list.
-        Shape::raw(r#"INSERT INTO "users" ("id", "email", "name") VALUES (310, 't1@example.com', 'T1'), (311, 't2@example.com', 'T2') RETURNING "id""#),
+        Shape::raw(
+            r#"INSERT INTO "users" ("id", "email", "name") VALUES (310, 't1@example.com', 'T1'), (311, 't2@example.com', 'T2') RETURNING "id""#,
+        ),
         // 10. TypeORM `.upsert([{ id, ... }], ['id'])` — Postgres dialect
         //     emits `ON CONFLICT (col) DO UPDATE SET col = EXCLUDED.col`.
-        Shape::raw(r#"INSERT INTO "users" ("id", "email", "name") VALUES (320, 'ts@example.com', 'TS')
-           ON CONFLICT ("id") DO UPDATE SET "email" = EXCLUDED."email", "name" = EXCLUDED."name""#),
+        Shape::raw(
+            r#"INSERT INTO "users" ("id", "email", "name") VALUES (320, 'ts@example.com', 'TS')
+           ON CONFLICT ("id") DO UPDATE SET "email" = EXCLUDED."email", "name" = EXCLUDED."name""#,
+        ),
         // 11. TypeORM `.update().set({ ... }).where("id = :id", { id: 1 })`
         //     — named-parameter replacement re-emits as `$1`.
         Shape::with(
@@ -1949,15 +2050,21 @@ async fn orm_compat_corpus() {
         ),
         // 12. TypeORM `.softDelete()` — sets `deletedAt = NOW()` on the
         //     soft-delete column rather than DELETE-ing.
-        Shape::raw(r#"UPDATE "users" SET "updated_at" = NOW() WHERE "id" = 1 AND "updated_at" IS NOT NULL"#),
+        Shape::raw(
+            r#"UPDATE "users" SET "updated_at" = NOW() WHERE "id" = 1 AND "updated_at" IS NOT NULL"#,
+        ),
         // 13. TypeORM `.createQueryBuilder().select('user.id', 'id').addSelect('COUNT(*)', 'cnt').groupBy('user.id')`
         //     — explicit GROUP BY with column aliases.
-        Shape::raw(r#"SELECT "user"."id" AS "id", COUNT(*) AS "cnt" FROM "users" "user" GROUP BY "user"."id" ORDER BY "user"."id" ASC"#),
+        Shape::raw(
+            r#"SELECT "user"."id" AS "id", COUNT(*) AS "cnt" FROM "users" "user" GROUP BY "user"."id" ORDER BY "user"."id" ASC"#,
+        ),
         // 14. TypeORM `.createQueryBuilder().subQuery()` — nested subquery
         //     joined as a derived table (the `getMany()` pattern used for
         //     pagination over a sub-counted result).
-        Shape::raw(r#"SELECT "outer"."id", "outer"."email"
-           FROM (SELECT "users"."id" AS "id", "users"."email" AS "email" FROM "users" "users" WHERE "users"."id" > 0 LIMIT 25 OFFSET 0) "outer""#),
+        Shape::raw(
+            r#"SELECT "outer"."id", "outer"."email"
+           FROM (SELECT "users"."id" AS "id", "users"."email" AS "email" FROM "users" "users" WHERE "users"."id" > 0 LIMIT 25 OFFSET 0) "outer""#,
+        ),
         // 15. TypeORM `.findAndCount()` — emits two queries; the COUNT half
         //     uses the same WHERE but projects `COUNT(DISTINCT "user"."id")`.
         Shape::with(
@@ -1968,7 +2075,9 @@ async fn orm_compat_corpus() {
         //     MigrationExecutor creates `migrations` before ever querying it
         //     (PostgresQueryRunner.createTable emits exactly this DDL, named
         //     PK constraint included).
-        Shape::raw(r#"CREATE TABLE "migrations" ("id" SERIAL NOT NULL, "timestamp" bigint NOT NULL, "name" character varying NOT NULL, CONSTRAINT "PK_8c82d7f526340ab734260ea46be" PRIMARY KEY ("id"))"#),
+        Shape::raw(
+            r#"CREATE TABLE "migrations" ("id" SERIAL NOT NULL, "timestamp" bigint NOT NULL, "name" character varying NOT NULL, CONSTRAINT "PK_8c82d7f526340ab734260ea46be" PRIMARY KEY ("id"))"#,
+        ),
         // 17. TypeORM MigrationExecutor.loadExecutedMigrations — queries the
         //     tracker it just created, newest first.
         Shape::raw(r#"SELECT * FROM "migrations" ORDER BY "id" DESC"#),
@@ -1979,10 +2088,14 @@ async fn orm_compat_corpus() {
         //     from the joined set through the "distinctAlias" derived table
         //     (the shape every `getMany()`-with-take emits), then re-fetches
         //     the joined rows for those ids.
-        Shape::raw(r#"SELECT DISTINCT "distinctAlias"."users_id" AS "ids_users_id" FROM (SELECT "users"."id" AS "users_id", "users"."email" AS "users_email", "orders"."id" AS "orders_id", "orders"."status" AS "orders_status" FROM "users" "users" LEFT JOIN "orders" "orders" ON "orders"."user_id" = "users"."id") "distinctAlias" ORDER BY "ids_users_id" ASC LIMIT 25"#),
+        Shape::raw(
+            r#"SELECT DISTINCT "distinctAlias"."users_id" AS "ids_users_id" FROM (SELECT "users"."id" AS "users_id", "users"."email" AS "users_email", "orders"."id" AS "orders_id", "orders"."status" AS "orders_status" FROM "users" "users" LEFT JOIN "orders" "orders" ON "orders"."user_id" = "users"."id") "distinctAlias" ORDER BY "ids_users_id" ASC LIMIT 25"#,
+        ),
         // 19. …and the second half: the re-fetch of the joined rows for the
         //     ids page (literal IN-list — TypeORM interpolates the id page).
-        Shape::raw(r#"SELECT "users"."id" AS "users_id", "users"."email" AS "users_email", "orders"."id" AS "orders_id", "orders"."status" AS "orders_status" FROM "users" "users" LEFT JOIN "orders" "orders" ON "orders"."user_id" = "users"."id" WHERE "users"."id" IN (1, 2) ORDER BY "users"."id" ASC"#),
+        Shape::raw(
+            r#"SELECT "users"."id" AS "users_id", "users"."email" AS "users_email", "orders"."id" AS "orders_id", "orders"."status" AS "orders_status" FROM "users" "users" LEFT JOIN "orders" "orders" ON "orders"."user_id" = "users"."id" WHERE "users"."id" IN (1, 2) ORDER BY "users"."id" ASC"#,
+        ),
     ];
 
     println!("\n=== TypeORM / FUTURE ({} shapes) ===", typeorm.len());
@@ -2007,27 +2120,37 @@ async fn orm_compat_corpus() {
         Shape::raw(r#"SET TIME ZONE 'UTC'"#),
         // 3. MigrationRecorder.has_table() — Django introspection's
         //    get_table_list probe (postgresql/introspection.py, verbatim).
-        Shape::raw(r#"SELECT c.relname,
+        Shape::raw(
+            r#"SELECT c.relname,
                CASE WHEN c.relkind IN ('m', 'v') THEN 'v' ELSE 't' END
            FROM pg_catalog.pg_class c
            LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
            WHERE c.relkind IN ('f', 'm', 'p', 'r', 'v')
                AND n.nspname NOT IN ('pg_catalog', 'pg_toast')
-               AND pg_catalog.pg_table_is_visible(c.oid)"#),
+               AND pg_catalog.pg_table_is_visible(c.oid)"#,
+        ),
         // 4. MigrationRecorder.ensure_schema() — django_migrations is created
         //    FIRST, before any version query (create-first, exactly like the
         //    Diesel / TypeORM tracker bootstraps above). Verbatim Django 3.2
         //    emission (serial PK; 4.1+ switches to GENERATED … AS IDENTITY).
-        Shape::raw(r#"CREATE TABLE "django_migrations" ("id" serial NOT NULL PRIMARY KEY, "app" varchar(255) NOT NULL, "name" varchar(255) NOT NULL, "applied" timestamp with time zone NOT NULL)"#),
+        Shape::raw(
+            r#"CREATE TABLE "django_migrations" ("id" serial NOT NULL PRIMARY KEY, "app" varchar(255) NOT NULL, "name" varchar(255) NOT NULL, "applied" timestamp with time zone NOT NULL)"#,
+        ),
         // 5. MigrationRecorder.applied_migrations() — full read of the
         //    tracker it just created.
-        Shape::raw(r#"SELECT "django_migrations"."id", "django_migrations"."app", "django_migrations"."name", "django_migrations"."applied" FROM "django_migrations""#),
+        Shape::raw(
+            r#"SELECT "django_migrations"."id", "django_migrations"."app", "django_migrations"."name", "django_migrations"."applied" FROM "django_migrations""#,
+        ),
         // 6. MigrationRecorder.record_applied() — psycopg2 interpolates the
         //    datetime param as a quoted ISO literal with a ::timestamptz cast.
-        Shape::raw(r#"INSERT INTO "django_migrations" ("app", "name", "applied") VALUES ('myapp', '0001_initial', '2024-01-01T00:00:00+00:00'::timestamptz)"#),
+        Shape::raw(
+            r#"INSERT INTO "django_migrations" ("app", "name", "applied") VALUES ('myapp', '0001_initial', '2024-01-01T00:00:00+00:00'::timestamptz)"#,
+        ),
         // 7. contenttypes bootstrap — django_content_type DDL from the
         //    contenttypes app's 0001_initial migration.
-        Shape::raw(r#"CREATE TABLE "django_content_type" ("id" serial NOT NULL PRIMARY KEY, "app_label" varchar(100) NOT NULL, "model" varchar(100) NOT NULL)"#),
+        Shape::raw(
+            r#"CREATE TABLE "django_content_type" ("id" serial NOT NULL PRIMARY KEY, "app_label" varchar(100) NOT NULL, "model" varchar(100) NOT NULL)"#,
+        ),
         // 8. …followed by the separate unique-together constraint Django's
         //    schema editor emits as ALTER TABLE. Executes OK: the engine
         //    backfill-validates the existing rows (distinct scan), registers
@@ -2035,32 +2158,48 @@ async fn orm_compat_corpus() {
         //    INSERTs enforce it through the same machinery as a CREATE-time
         //    `UNIQUE (cols)` (see alter_table_std.rs
         //    `add_unique_constraint_registers_and_enforces`).
-        Shape::raw(r#"ALTER TABLE "django_content_type" ADD CONSTRAINT "django_content_type_app_label_model_76bd3d3b_uniq" UNIQUE ("app_label", "model")"#),
+        Shape::raw(
+            r#"ALTER TABLE "django_content_type" ADD CONSTRAINT "django_content_type_app_label_model_76bd3d3b_uniq" UNIQUE ("app_label", "model")"#,
+        ),
         // 9. ContentType.objects.get_for_model() cache fill — the content
         //    type lookup virtually every Django app issues on first request.
-        Shape::raw(r#"SELECT "django_content_type"."id", "django_content_type"."app_label", "django_content_type"."model" FROM "django_content_type" WHERE ("django_content_type"."app_label" = 'myapp' AND "django_content_type"."model" = 'question')"#),
+        Shape::raw(
+            r#"SELECT "django_content_type"."id", "django_content_type"."app_label", "django_content_type"."model" FROM "django_content_type" WHERE ("django_content_type"."app_label" = 'myapp' AND "django_content_type"."model" = 'question')"#,
+        ),
         // 10. ContentType creation — Django hydrates the serial PK through
         //     RETURNING.
-        Shape::raw(r#"INSERT INTO "django_content_type" ("app_label", "model") VALUES ('myapp', 'question') RETURNING "django_content_type"."id""#),
+        Shape::raw(
+            r#"INSERT INTO "django_content_type" ("app_label", "model") VALUES ('myapp', 'question') RETURNING "django_content_type"."id""#,
+        ),
         // ── savepoint-per-atomic CRUD ──────────────────────────────────────
         // 11. transaction.atomic() — psycopg2 (autocommit off) sends BEGIN;
         //     each *nested* atomic block is SAVEPOINT/RELEASE with Django's
         //     `s<thread_id>_x<n>` naming. One simple_query batch models the
         //     statement sequence on the wire (same convention as the Prisma
         //     SAVEPOINT shape above).
-        Shape::raw(r#"BEGIN; SAVEPOINT "s140234567890_x1"; INSERT INTO "django_content_type" ("app_label", "model") VALUES ('myapp', 'choice') RETURNING "django_content_type"."id"; RELEASE SAVEPOINT "s140234567890_x1"; COMMIT;"#),
+        Shape::raw(
+            r#"BEGIN; SAVEPOINT "s140234567890_x1"; INSERT INTO "django_content_type" ("app_label", "model") VALUES ('myapp', 'choice') RETURNING "django_content_type"."id"; RELEASE SAVEPOINT "s140234567890_x1"; COMMIT;"#,
+        ),
         // 12. Nested atomic with inner failure recovery — the inner block
         //     rolls back to its savepoint, the outer continues and commits
         //     (the get_or_create / IntegrityError-retry pattern).
-        Shape::raw(r#"BEGIN; SAVEPOINT "s140234567890_x2"; SAVEPOINT "s140234567890_x3"; ROLLBACK TO SAVEPOINT "s140234567890_x3"; UPDATE "django_content_type" SET "model" = 'choice2' WHERE "django_content_type"."id" = 2; RELEASE SAVEPOINT "s140234567890_x2"; COMMIT;"#),
+        Shape::raw(
+            r#"BEGIN; SAVEPOINT "s140234567890_x2"; SAVEPOINT "s140234567890_x3"; ROLLBACK TO SAVEPOINT "s140234567890_x3"; UPDATE "django_content_type" SET "model" = 'choice2' WHERE "django_content_type"."id" = 2; RELEASE SAVEPOINT "s140234567890_x2"; COMMIT;"#,
+        ),
         // 13. select_for_update() — the classic Django locking read; only
         //     legal inside atomic, so wrapped in BEGIN/COMMIT exactly as the
         //     backend orders it.
-        Shape::raw(r#"BEGIN; SELECT "django_migrations"."id", "django_migrations"."app", "django_migrations"."name" FROM "django_migrations" WHERE "django_migrations"."app" = 'myapp' FOR UPDATE; COMMIT;"#),
+        Shape::raw(
+            r#"BEGIN; SELECT "django_migrations"."id", "django_migrations"."app", "django_migrations"."name" FROM "django_migrations" WHERE "django_migrations"."app" = 'myapp' FOR UPDATE; COMMIT;"#,
+        ),
         // 14. QuerySet `__in` filter + ORDER BY — the list-view read.
-        Shape::raw(r#"SELECT "django_content_type"."id", "django_content_type"."model" FROM "django_content_type" WHERE "django_content_type"."id" IN (1, 2, 3) ORDER BY "django_content_type"."id" ASC"#),
+        Shape::raw(
+            r#"SELECT "django_content_type"."id", "django_content_type"."model" FROM "django_content_type" WHERE "django_content_type"."id" IN (1, 2, 3) ORDER BY "django_content_type"."id" ASC"#,
+        ),
         // 15. QuerySet.delete() — the collector deletes by PK IN-list.
-        Shape::raw(r#"DELETE FROM "django_content_type" WHERE "django_content_type"."id" IN (999)"#),
+        Shape::raw(
+            r#"DELETE FROM "django_content_type" WHERE "django_content_type"."id" IN (999)"#,
+        ),
         // 16. Session-state guard (mirrors sqlx shape 19): clears any
         //     aborted-tx state a failed batch in 11–13 could leave behind so
         //     the GORM section is not cascade-poisoned.
@@ -2092,7 +2231,9 @@ async fn orm_compat_corpus() {
         ),
         // 3. AutoMigrate CREATE TABLE — gorm quotes every identifier, maps
         //    the uint ID to bigserial, and inlines the PK clause.
-        Shape::raw(r#"CREATE TABLE IF NOT EXISTS "products" ("id" bigserial,"code" text,"price" bigint,PRIMARY KEY ("id"))"#),
+        Shape::raw(
+            r#"CREATE TABLE IF NOT EXISTS "products" ("id" bigserial,"code" text,"price" bigint,PRIMARY KEY ("id"))"#,
+        ),
         // 4. AutoMigrate column probe — HasColumn before each ALTER ADD
         //    (migrator.go HasColumn, verbatim).
         Shape::with(
@@ -2106,7 +2247,11 @@ async fn orm_compat_corpus() {
         //    the auto PK back into the struct).
         Shape::with(
             r#"INSERT INTO "products" ("code","price","stock") VALUES ($1,$2,$3) RETURNING "id""#,
-            &[ParamValue::Text("D42"), ParamValue::I64(100), ParamValue::I64(10)],
+            &[
+                ParamValue::Text("D42"),
+                ParamValue::I64(100),
+                ParamValue::I64(10),
+            ],
         ),
         // ── batch insert ───────────────────────────────────────────────────
         // 7. db.Create(&[]Product{...}) — one multi-VALUES INSERT with
@@ -2145,7 +2290,11 @@ async fn orm_compat_corpus() {
         //     from a struct (non-zero fields only).
         Shape::with(
             r#"UPDATE "products" SET "code"=$1,"price"=$2 WHERE "id" = $3"#,
-            &[ParamValue::Text("D43"), ParamValue::I64(150), ParamValue::I64(1)],
+            &[
+                ParamValue::Text("D43"),
+                ParamValue::I64(150),
+                ParamValue::I64(1),
+            ],
         ),
         // 12. db.Delete(&product, id) — hard delete (no gorm.DeletedAt on
         //     the quickstart-variant model).
@@ -2159,7 +2308,11 @@ async fn orm_compat_corpus() {
         //     gorm's documented upsert emission.
         Shape::with(
             r#"INSERT INTO "products" ("code","price","stock") VALUES ($1,$2,$3) ON CONFLICT ("id") DO UPDATE SET "code"="excluded"."code","price"="excluded"."price","stock"="excluded"."stock" RETURNING "id""#,
-            &[ParamValue::Text("U1"), ParamValue::I64(77), ParamValue::I64(7)],
+            &[
+                ParamValue::Text("U1"),
+                ParamValue::I64(77),
+                ParamValue::I64(7),
+            ],
         ),
     ];
 

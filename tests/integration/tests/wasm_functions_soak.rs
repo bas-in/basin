@@ -61,8 +61,8 @@
 
 #![allow(clippy::print_stdout)]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use basin_common::ProjectId;
@@ -130,12 +130,10 @@ async fn soak_100_projects_short_variant_invariants_hold() {
 
     // Per-project peak in-flight tracker. Each tenant has its own counter
     // bumped by every closure entry / decremented on exit.
-    let peak_in_flight: Arc<Vec<AtomicUsize>> = Arc::new(
-        (0..PROJECT_COUNT).map(|_| AtomicUsize::new(0)).collect(),
-    );
-    let live_in_flight: Arc<Vec<AtomicUsize>> = Arc::new(
-        (0..PROJECT_COUNT).map(|_| AtomicUsize::new(0)).collect(),
-    );
+    let peak_in_flight: Arc<Vec<AtomicUsize>> =
+        Arc::new((0..PROJECT_COUNT).map(|_| AtomicUsize::new(0)).collect());
+    let live_in_flight: Arc<Vec<AtomicUsize>> =
+        Arc::new((0..PROJECT_COUNT).map(|_| AtomicUsize::new(0)).collect());
 
     let started = Instant::now();
     let mut handles = Vec::with_capacity(PROJECT_COUNT * INVOCATIONS_PER_PROJECT);
@@ -285,7 +283,9 @@ async fn soak_noisy_neighbor_quiet_p99_holds() {
     // Bar: the bench-harness analogue uses 5×. The Wasm-side caps are
     // engineered to keep the noisy tenant within their own slice, so the
     // quiet tenant should be comfortably under this.
-    let bar = baseline_p99.saturating_mul(5).max(Duration::from_millis(20));
+    let bar = baseline_p99
+        .saturating_mul(5)
+        .max(Duration::from_millis(20));
     assert!(
         under_load_p99 <= bar,
         "quiet-tenant p99 degraded past 5x baseline under noisy load: \
@@ -369,18 +369,13 @@ async fn long_variant_1h_no_growth() {
             }));
         }
         for h in handles {
-            let _ = h
-                .await
-                .expect("join")
-                .expect("invocation");
+            let _ = h.await.expect("join").expect("invocation");
         }
         iter += 1;
 
         if last_log.elapsed() >= Duration::from_secs(5 * 60) {
             let cache_len = gov.project_semaphore_cache_len();
-            println!(
-                "long soak: iter={iter} sem_cache_len={cache_len} (cap {SEMAPHORE_LRU_CAP})"
-            );
+            println!("long soak: iter={iter} sem_cache_len={cache_len} (cap {SEMAPHORE_LRU_CAP})");
             assert!(
                 cache_len <= SEMAPHORE_LRU_CAP,
                 "long-soak semaphore LRU grew past cap: {cache_len} > {SEMAPHORE_LRU_CAP}"

@@ -61,9 +61,7 @@ pub mod runner;
 pub mod sample;
 pub mod workload;
 
-pub use config::{
-    BenchConfig, EngineFlags, StorageBackend, WorkloadKnobs,
-};
+pub use config::{BenchConfig, EngineFlags, StorageBackend, WorkloadKnobs};
 pub use harness::BenchHarness;
 pub use profiles::{BenchProfile, BenchShape, ShapeKind};
 pub use runner::BenchSuite;

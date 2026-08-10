@@ -126,12 +126,7 @@ impl SlotRegistry {
 
     /// Push pending frames for a slot. Called by the change-event integration
     /// when a mutation completes for a project/table that has ≥1 active slot.
-    pub fn push_frames(
-        &self,
-        project: &ProjectId,
-        slot_name: &str,
-        frames: Vec<PendingFrame>,
-    ) {
+    pub fn push_frames(&self, project: &ProjectId, slot_name: &str, frames: Vec<PendingFrame>) {
         let mut guard = self.inner.lock().expect("SlotRegistry lock poisoned");
         if let Some(project_slots) = guard.get_mut(project) {
             if let Some(slot) = project_slots.get_mut(slot_name) {
@@ -142,11 +137,7 @@ impl SlotRegistry {
 
     /// Push frames to every slot for a project. Called after each committed
     /// transaction so all consumers see the change.
-    pub fn push_frames_all_slots(
-        &self,
-        project: &ProjectId,
-        frames: Vec<PendingFrame>,
-    ) {
+    pub fn push_frames_all_slots(&self, project: &ProjectId, frames: Vec<PendingFrame>) {
         if frames.is_empty() {
             return;
         }

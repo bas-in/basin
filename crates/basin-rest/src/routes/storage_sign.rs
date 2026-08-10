@@ -102,9 +102,9 @@ pub(crate) async fn sign_object(
     let claims = authorize(&state, &headers).await?;
     let project = claims.project_id;
 
-    let req = body
-        .map(|Json(r)| r)
-        .unwrap_or_else(|| SignRequest { expires_in: default_ttl_secs() });
+    let req = body.map(|Json(r)| r).unwrap_or_else(|| SignRequest {
+        expires_in: default_ttl_secs(),
+    });
     let expires_in = req.expires_in.min(MAX_TTL_SECS).max(1);
 
     let now = Utc::now();
@@ -113,7 +113,9 @@ pub(crate) async fn sign_object(
         .ok_or_else(|| ApiError::internal("timestamp overflow"))?;
 
     let project_str = project.to_string();
-    let mac_bytes = state.blob_signing_secret.compute_mac(&project_str, &bucket, &path, expires_ts);
+    let mac_bytes = state
+        .blob_signing_secret
+        .compute_mac(&project_str, &bucket, &path, expires_ts);
     let token_hex = hex::encode(&mac_bytes);
 
     // Build the signed URL. The project ID is embedded in the path so the
@@ -159,10 +161,13 @@ pub(crate) async fn download_signed_object(
     }
 
     // Verify MAC — constant-time via BlobSigningSecret (P2-1).
-    let provided = hex::decode(&q.token)
-        .map_err(|_| ApiError::forbidden("invalid token encoding"))?;
+    let provided =
+        hex::decode(&q.token).map_err(|_| ApiError::forbidden("invalid token encoding"))?;
 
-    if !state.blob_signing_secret.verify_mac(&project_str, &bucket, &path, q.expires, &provided) {
+    if !state
+        .blob_signing_secret
+        .verify_mac(&project_str, &bucket, &path, q.expires, &provided)
+    {
         return Err(ApiError::forbidden("invalid or tampered signed URL"));
     }
 

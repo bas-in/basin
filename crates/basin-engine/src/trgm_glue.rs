@@ -68,18 +68,13 @@ use datafusion::prelude::SessionContext;
 /// Register all `pg_trgm`-equivalent scalar UDFs on `ctx`.  Idempotent.
 /// Called from [`crate::session::build_stateless_udf_cache`].
 pub(crate) fn register_trgm_udfs(ctx: &SessionContext) {
-    let two_text = Signature::exact(
-        vec![DataType::Utf8, DataType::Utf8],
-        Volatility::Immutable,
-    );
+    let two_text = Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable);
     let one_text = Signature::exact(vec![DataType::Utf8], Volatility::Immutable);
 
     ctx.register_udf(ScalarUDF::from(SimilarityUdf {
         sig: two_text.clone(),
     }));
-    ctx.register_udf(ScalarUDF::from(WordSimilarityUdf {
-        sig: two_text,
-    }));
+    ctx.register_udf(ScalarUDF::from(WordSimilarityUdf { sig: two_text }));
     ctx.register_udf(ScalarUDF::from(ShowTrgmUdf { sig: one_text }));
 }
 
@@ -246,9 +241,7 @@ impl ScalarUDFImpl for ShowTrgmUdf {
             value_arr,
             Some(nulls.into()),
         )
-        .map_err(|e| {
-            datafusion::common::DataFusionError::Execution(format!("show_trgm: {e}"))
-        })?;
+        .map_err(|e| datafusion::common::DataFusionError::Execution(format!("show_trgm: {e}")))?;
         Ok(ColumnarValue::Array(Arc::new(list)))
     }
 }
@@ -281,10 +274,7 @@ fn columnar_to_strings(cv: &ColumnarValue, n: usize) -> DFResult<Vec<Option<Stri
                     })
                     .collect())
             } else {
-                exec_err!(
-                    "trgm UDF: expected Utf8 array, got {:?}",
-                    arr.data_type()
-                )
+                exec_err!("trgm UDF: expected Utf8 array, got {:?}", arr.data_type())
             }
         }
     }
@@ -369,8 +359,7 @@ fn rewrite_trgm_op_once(sql: &str, op: &str, threshold: &str, kind: TrgmOp) -> S
         // similarity() call). A bare column `%` a string literal is the
         // canonical trgm form, so a single string-literal operand is sufficient
         // and necessary to opt into the rewrite.
-        if matches!(kind, TrgmOp::Similarity)
-            && !(is_string_literal(lhs) || is_string_literal(rhs))
+        if matches!(kind, TrgmOp::Similarity) && !(is_string_literal(lhs) || is_string_literal(rhs))
         {
             // Not a provable-text `%` → leave it for sqlparser/DataFusion to
             // handle as modulo. Skip past this occurrence (recurse on the tail)
@@ -545,10 +534,7 @@ fn trgm_extract_left(s: &str, end: usize) -> (usize, usize) {
                 i -= 1;
             }
             // Skip the type name.
-            while i > 0
-                && (bytes[i - 1].is_ascii_alphanumeric()
-                    || bytes[i - 1] == b'_')
-            {
+            while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
                 i -= 1;
             }
         }
@@ -608,18 +594,14 @@ fn trgm_extract_right(s: &str, start: usize) -> (usize, usize) {
         // Consume any trailing `::type` cast.
         if i + 2 <= bytes.len() && bytes[i] == b':' && bytes[i + 1] == b':' {
             i += 2;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
         }
     } else {
         // Identifier / number run.
         while i < bytes.len()
-            && (bytes[i].is_ascii_alphanumeric()
-                || bytes[i] == b'_'
-                || bytes[i] == b'.')
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.')
         {
             i += 1;
         }
@@ -665,7 +647,7 @@ mod tests {
     use super::*;
     use basin_trgm::{DEFAULT_SIMILARITY_THRESHOLD, DEFAULT_WORD_SIMILARITY_THRESHOLD};
 
-    const T: f32 = DEFAULT_SIMILARITY_THRESHOLD;      // 0.3
+    const T: f32 = DEFAULT_SIMILARITY_THRESHOLD; // 0.3
     const WT: f32 = DEFAULT_WORD_SIMILARITY_THRESHOLD; // 0.6
 
     // Helper: run rewrite with default thresholds.
@@ -689,7 +671,10 @@ mod tests {
         let out = rw("SELECT 7 % 3");
         // Must not be touched — both operands are numeric.
         assert!(out.contains("7 % 3"), "modulo was corrupted: {out}");
-        assert!(!out.contains("similarity"), "modulo was rewritten as similarity: {out}");
+        assert!(
+            !out.contains("similarity"),
+            "modulo was rewritten as similarity: {out}"
+        );
     }
 
     #[test]
@@ -706,7 +691,10 @@ mod tests {
         // numeric" gate misfired here, turning `a % b` into a type-error
         // similarity() call. The gate now requires a provable-text operand.
         let out = rw("SELECT * FROM t WHERE a % b = 0");
-        assert!(out.contains("a % b = 0"), "integer-column modulo corrupted: {out}");
+        assert!(
+            out.contains("a % b = 0"),
+            "integer-column modulo corrupted: {out}"
+        );
         assert!(
             !out.contains("similarity"),
             "integer-column modulo wrongly rewritten as similarity: {out}"
@@ -718,23 +706,38 @@ mod tests {
         // `col % <int literal>` (e.g. partition key bucketing) stays modulo —
         // no string operand.
         let out = rw("SELECT * FROM t WHERE id % 4 = 1");
-        assert!(out.contains("id % 4 = 1"), "column-modulo-literal corrupted: {out}");
-        assert!(!out.contains("similarity"), "column-modulo-literal rewritten: {out}");
+        assert!(
+            out.contains("id % 4 = 1"),
+            "column-modulo-literal corrupted: {out}"
+        );
+        assert!(
+            !out.contains("similarity"),
+            "column-modulo-literal rewritten: {out}"
+        );
     }
 
     #[test]
     fn percent_string_literal_either_side_rewrites() {
         // A single string-literal operand on EITHER side opts into the rewrite.
         let lhs = rw("SELECT * FROM t WHERE 'bar' % col");
-        assert!(lhs.contains("similarity('bar', col) >= 0.3"), "lhs literal: {lhs}");
+        assert!(
+            lhs.contains("similarity('bar', col) >= 0.3"),
+            "lhs literal: {lhs}"
+        );
         let rhs = rw("SELECT * FROM t WHERE col % 'foo'");
-        assert!(rhs.contains("similarity(col, 'foo') >= 0.3"), "rhs literal: {rhs}");
+        assert!(
+            rhs.contains("similarity(col, 'foo') >= 0.3"),
+            "rhs literal: {rhs}"
+        );
     }
 
     #[test]
     fn percent_inside_string_literal_left_alone() {
         let out = rw("SELECT '50%'");
-        assert_eq!(out, "SELECT '50%'", "percent inside string was corrupted: {out}");
+        assert_eq!(
+            out, "SELECT '50%'",
+            "percent inside string was corrupted: {out}"
+        );
     }
 
     // ── word_similarity <% ────────────────────────────────────────────────────
@@ -753,7 +756,10 @@ mod tests {
         // A query with both `<%` and `%` in different positions.
         let out = rw("SELECT 7 % 3 FROM t WHERE col <% 'foo'");
         // `<%` should rewrite; `7 % 3` should NOT.
-        assert!(out.contains("word_similarity(col, 'foo') >= 0.6"), "got: {out}");
+        assert!(
+            out.contains("word_similarity(col, 'foo') >= 0.6"),
+            "got: {out}"
+        );
         assert!(out.contains("7 % 3"), "modulo corrupted: {out}");
     }
 
@@ -819,7 +825,10 @@ mod tests {
         assert!(pos.is_some());
         let p = pos.unwrap();
         // The outer `%` is after the closing `'` of `'50%'`.
-        assert!(p > s.find("'50%'").unwrap() + 4, "found op inside string at pos {p}");
+        assert!(
+            p > s.find("'50%'").unwrap() + 4,
+            "found op inside string at pos {p}"
+        );
     }
 
     #[test]
@@ -829,6 +838,9 @@ mod tests {
         assert!(pos.is_some());
         let p = pos.unwrap();
         // The outer `<->` is past the double-quoted identifier.
-        assert!(p > 14, "found op inside double-quoted identifier at pos {p}");
+        assert!(
+            p > 14,
+            "found op inside double-quoted identifier at pos {p}"
+        );
     }
 }

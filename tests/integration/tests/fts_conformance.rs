@@ -170,10 +170,7 @@ async fn single_bool(sess: &basin_engine::ProjectSession, sql: &str) -> bool {
     }
 }
 
-async fn single_bool_nullable(
-    sess: &basin_engine::ProjectSession,
-    sql: &str,
-) -> Option<bool> {
+async fn single_bool_nullable(sess: &basin_engine::ProjectSession, sql: &str) -> Option<bool> {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().unwrap_or_else(|| panic!("no batch: {sql}"));
@@ -183,7 +180,11 @@ async fn single_bool_nullable(
                 .downcast_ref::<BooleanArray>()
                 .unwrap_or_else(|| panic!("expected Boolean: {sql}"));
             assert!(arr.len() >= 1, "no rows from: {sql}");
-            if arr.is_null(0) { None } else { Some(arr.value(0)) }
+            if arr.is_null(0) {
+                None
+            } else {
+                Some(arr.value(0))
+            }
         }
         Ok(other) => panic!("non-rows for {sql}: {other:?}"),
         Err(e) => panic!("error for {sql}: {e}"),
@@ -355,11 +356,7 @@ async fn tsvector_duplicate_positions_collapsed() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let got = single_string(
-        &sess,
-        "SELECT to_tsvector('english', 'fox fox fox')",
-    )
-    .await;
+    let got = single_string(&sess, "SELECT to_tsvector('english', 'fox fox fox')").await;
     // 'fox' → stem 'fox' (not changed by English stemmer); positions 1,2,3.
     assert_eq!(
         got, "'fox':1,2,3",
@@ -379,11 +376,7 @@ async fn tsvector_simple_config_no_stemming_no_stopwords() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let got = single_string(
-        &sess,
-        "SELECT to_tsvector('simple', 'the quick fox')",
-    )
-    .await;
+    let got = single_string(&sess, "SELECT to_tsvector('simple', 'the quick fox')").await;
     // Sorted: fox:3, quick:2, the:1.
     assert_eq!(
         got, "'fox':3 'quick':2 'the':1",
@@ -391,11 +384,7 @@ async fn tsvector_simple_config_no_stemming_no_stopwords() {
     );
 
     // With simple config, 'running' is NOT stemmed.
-    let plain = single_string(
-        &sess,
-        "SELECT to_tsvector('simple', 'running')",
-    )
-    .await;
+    let plain = single_string(&sess, "SELECT to_tsvector('simple', 'running')").await;
     assert_eq!(
         plain, "'running':1",
         "simple config must NOT stem 'running'; got={plain:?}"
@@ -440,7 +429,10 @@ async fn at_at_negative_miss() {
         "SELECT to_tsvector('hello world') @@ to_tsquery('rust')",
     )
     .await;
-    assert!(!r, "@@ negative: 'rust' absent from vector must NOT match (stub regression)");
+    assert!(
+        !r,
+        "@@ negative: 'rust' absent from vector must NOT match (stub regression)"
+    );
     println!("[fts @@] negative miss ✓");
 }
 
@@ -541,7 +533,10 @@ async fn at_at_not_present_term() {
         "SELECT to_tsvector('hello world') @@ to_tsquery('!hello')",
     )
     .await;
-    assert!(!r, "@@ NOT present-term: !hello with 'hello' present → false");
+    assert!(
+        !r,
+        "@@ NOT present-term: !hello with 'hello' present → false"
+    );
     println!("[fts @@] NOT present-term ✓");
 }
 
@@ -578,7 +573,10 @@ async fn at_at_phrase_out_of_order() {
         "SELECT to_tsvector('english', 'the quick brown fox') @@ to_tsquery('quick <-> fox')",
     )
     .await;
-    assert!(!r, "phrase <->: quick and fox are 2 apart, not adjacent → false");
+    assert!(
+        !r,
+        "phrase <->: quick and fox are 2 apart, not adjacent → false"
+    );
     println!("[fts @@] phrase out-of-order ✓");
 }
 
@@ -596,7 +594,10 @@ async fn at_at_phrase_custom_distance() {
         "SELECT to_tsvector('english', 'the quick brown fox') @@ to_tsquery('quick <2> fox')",
     )
     .await;
-    assert!(r, "phrase <2>: quick(2) and fox(4) are exactly 2 apart → true");
+    assert!(
+        r,
+        "phrase <2>: quick(2) and fox(4) are exactly 2 apart → true"
+    );
     println!("[fts @@] phrase custom distance <2> ✓");
 }
 
@@ -609,7 +610,11 @@ async fn at_at_where_clause_filter() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE fdocs (id BIGINT NOT NULL, ts TSVECTOR)").await;
+    exec(
+        &sess,
+        "CREATE TABLE fdocs (id BIGINT NOT NULL, ts TSVECTOR)",
+    )
+    .await;
     exec(
         &sess,
         "INSERT INTO fdocs VALUES
@@ -640,7 +645,11 @@ async fn at_at_select_expression() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE sexpr (id BIGINT NOT NULL, ts TSVECTOR)").await;
+    exec(
+        &sess,
+        "CREATE TABLE sexpr (id BIGINT NOT NULL, ts TSVECTOR)",
+    )
+    .await;
     exec(
         &sess,
         "INSERT INTO sexpr VALUES (1, to_tsvector('english', 'cat and dog'))",
@@ -652,7 +661,10 @@ async fn at_at_select_expression() {
         "SELECT ts @@ to_tsquery('english', 'cat') FROM sexpr WHERE id = 1",
     )
     .await;
-    assert!(r, "@@ in SELECT list for row containing 'cat' must return true");
+    assert!(
+        r,
+        "@@ in SELECT list for row containing 'cat' must return true"
+    );
 
     let r2 = single_bool(
         &sess,
@@ -696,18 +708,18 @@ async fn at_at_null_tsquery() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE nullq (id BIGINT, ts TSVECTOR, q TSQUERY)").await;
+    exec(
+        &sess,
+        "CREATE TABLE nullq (id BIGINT, ts TSVECTOR, q TSQUERY)",
+    )
+    .await;
     exec(
         &sess,
         "INSERT INTO nullq VALUES (1, to_tsvector('hello world'), NULL)",
     )
     .await;
 
-    let result = single_bool_nullable(
-        &sess,
-        "SELECT ts @@ q FROM nullq WHERE id = 1",
-    )
-    .await;
+    let result = single_bool_nullable(&sess, "SELECT ts @@ q FROM nullq WHERE id = 1").await;
     assert_eq!(
         result, None,
         "tsvector @@ NULL tsquery must return NULL; got={result:?}"
@@ -726,11 +738,7 @@ async fn at_at_empty_tsquery() {
 
     // An empty string passed to to_tsquery returns the empty string ''.
     // '' as a tsquery matches nothing.
-    let r = single_bool(
-        &sess,
-        "SELECT to_tsvector('hello world') @@ to_tsquery('')",
-    )
-    .await;
+    let r = single_bool(&sess, "SELECT to_tsvector('hello world') @@ to_tsquery('')").await;
     assert!(!r, "empty tsquery must not match anything; got={r}");
     println!("[fts @@] empty tsquery → false ✓");
 }
@@ -748,11 +756,7 @@ async fn plainto_tsquery_and_join() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let got = single_string(
-        &sess,
-        "SELECT plainto_tsquery('english', 'the quick fox')",
-    )
-    .await;
+    let got = single_string(&sess, "SELECT plainto_tsquery('english', 'the quick fox')").await;
     assert_eq!(
         got, "'quick' & 'fox'",
         "plainto_tsquery must AND-join non-stopword terms; got={got:?}"
@@ -776,11 +780,7 @@ async fn phraseto_tsquery_phrase_join() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let got = single_string(
-        &sess,
-        "SELECT phraseto_tsquery('english', 'quick fox')",
-    )
-    .await;
+    let got = single_string(&sess, "SELECT phraseto_tsquery('english', 'quick fox')").await;
     assert_eq!(
         got, "'quick' <-> 'fox'",
         "phraseto_tsquery must phrase-join with <->; got={got:?}"
@@ -818,11 +818,7 @@ async fn websearch_to_tsquery_treated_as_plainto() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    let got = single_string(
-        &sess,
-        "SELECT websearch_to_tsquery('english', 'quick fox')",
-    )
-    .await;
+    let got = single_string(&sess, "SELECT websearch_to_tsquery('english', 'quick fox')").await;
     // Basin documents websearch_to_tsquery as best-effort plainto (AND join).
     assert_eq!(
         got, "'quick' & 'fox'",
@@ -1005,7 +1001,10 @@ async fn ts_rank_cd_non_negative() {
         "SELECT ts_rank_cd(to_tsvector('english', 'cat climbs'), to_tsquery('english', 'dog'))",
     ] {
         let s = single_f32(&sess, sql).await;
-        assert!(s >= 0.0, "ts_rank_cd must be non-negative; got={s} for {sql}");
+        assert!(
+            s >= 0.0,
+            "ts_rank_cd must be non-negative; got={s} for {sql}"
+        );
     }
     println!("[fts ts_rank_cd] non-negative ✓");
 }
@@ -1070,7 +1069,10 @@ async fn ts_rank_cd_zero_for_no_match() {
             to_tsquery('english', 'elephant'))",
     )
     .await;
-    assert_eq!(s, 0.0, "ts_rank_cd must be 0 when query doesn't match; got={s}");
+    assert_eq!(
+        s, 0.0,
+        "ts_rank_cd must be 0 when query doesn't match; got={s}"
+    );
     println!("[fts ts_rank_cd] zero-for-no-match ✓");
 }
 
@@ -1242,9 +1244,7 @@ async fn ts_rank_cd_phrase_proximity_sensitive() {
         adj > far,
         "CD phrase-proximity: adjacent cover (len 2) must rank above far cover (len 7); adj={adj}, far={far}"
     );
-    println!(
-        "[fts ts_rank_cd] phrase-proximity: adj={adj} > far={far} ✓"
-    );
+    println!("[fts ts_rank_cd] phrase-proximity: adj={adj} > far={far} ✓");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1361,9 +1361,7 @@ async fn ts_headline_window_selection() {
     let body = "one two three four five six seven eight fox nine ten eleven twelve thirteen \
                 fourteen fifteen sixteen seventeen wolf nineteen twenty twentyone twentytwo \
                 twentythree twentyfour twentyfive twentysix twentyseven twentyeight";
-    let sql = format!(
-        "SELECT ts_headline('{body}', to_tsquery('fox'), 'MaxWords=10, MinWords=5')"
-    );
+    let sql = format!("SELECT ts_headline('{body}', to_tsquery('fox'), 'MaxWords=10, MinWords=5')");
     let got = single_string(&sess, &sql).await;
 
     // The matched term must be highlighted.
@@ -1575,7 +1573,11 @@ async fn tsvector_length_counts_lexemes() {
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .expect("Int32");
-            assert_eq!(arr.value(0), 3, "tsvector_length: 3 distinct lexemes expected");
+            assert_eq!(
+                arr.value(0),
+                3,
+                "tsvector_length: 3 distinct lexemes expected"
+            );
         }
         other => panic!("unexpected: {other:?}"),
     }
@@ -1594,7 +1596,8 @@ async fn tsvector_length_counts_lexemes() {
                 .expect("Int32");
             // 'the' and 'a' removed → 3 lexemes: quick, brown, fox.
             assert_eq!(
-                arr.value(0), 3,
+                arr.value(0),
+                3,
                 "tsvector_length after stopword removal: expected 3"
             );
         }
@@ -1619,8 +1622,16 @@ async fn tsvector_length_counts_lexemes() {
 // same row ids.
 
 async fn seed_two_tables(sess: &basin_engine::ProjectSession) {
-    exec(sess, "CREATE TABLE scan_docs (id BIGINT NOT NULL, ts TSVECTOR)").await;
-    exec(sess, "CREATE TABLE gin_docs  (id BIGINT NOT NULL, ts TSVECTOR)").await;
+    exec(
+        sess,
+        "CREATE TABLE scan_docs (id BIGINT NOT NULL, ts TSVECTOR)",
+    )
+    .await;
+    exec(
+        sess,
+        "CREATE TABLE gin_docs  (id BIGINT NOT NULL, ts TSVECTOR)",
+    )
+    .await;
     exec(sess, "CREATE INDEX gin_docs_ts ON gin_docs USING gin (ts)").await;
 
     let inserts = [
@@ -1631,13 +1642,9 @@ async fn seed_two_tables(sess: &basin_engine::ProjectSession) {
         (5, "running marathon in the rain"),
     ];
     for (id, text) in &inserts {
-        let sql = format!(
-            "INSERT INTO scan_docs VALUES ({id}, to_tsvector('english', '{text}'))"
-        );
+        let sql = format!("INSERT INTO scan_docs VALUES ({id}, to_tsvector('english', '{text}'))");
         exec(sess, &sql).await;
-        let sql2 = format!(
-            "INSERT INTO gin_docs VALUES ({id}, to_tsvector('english', '{text}'))"
-        );
+        let sql2 = format!("INSERT INTO gin_docs VALUES ({id}, to_tsvector('english', '{text}'))");
         exec(sess, &sql2).await;
     }
 }
@@ -1654,16 +1661,12 @@ async fn gin_index_scan_agrees_with_table_scan() {
     for query in &["fox", "dog", "run", "cat & dog", "fox | cat", "!dog"] {
         let scan = sorted_ids(
             &sess,
-            &format!(
-                "SELECT id FROM scan_docs WHERE ts @@ to_tsquery('english', '{query}')"
-            ),
+            &format!("SELECT id FROM scan_docs WHERE ts @@ to_tsquery('english', '{query}')"),
         )
         .await;
         let gin = sorted_ids(
             &sess,
-            &format!(
-                "SELECT id FROM gin_docs WHERE ts @@ to_tsquery('english', '{query}')"
-            ),
+            &format!("SELECT id FROM gin_docs WHERE ts @@ to_tsquery('english', '{query}')"),
         )
         .await;
         assert_eq!(
@@ -1684,12 +1687,28 @@ async fn gin_or_not_and_merged() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE or_sep (id BIGINT NOT NULL, ts TSVECTOR)").await;
+    exec(
+        &sess,
+        "CREATE TABLE or_sep (id BIGINT NOT NULL, ts TSVECTOR)",
+    )
+    .await;
     exec(&sess, "CREATE INDEX or_sep_gin ON or_sep USING gin (ts)").await;
     // Each row holds exactly one of the two query terms in separate files.
-    exec(&sess, "INSERT INTO or_sep VALUES (1, to_tsvector('english', 'cat climbs'))").await;
-    exec(&sess, "INSERT INTO or_sep VALUES (2, to_tsvector('english', 'dog barks'))").await;
-    exec(&sess, "INSERT INTO or_sep VALUES (3, to_tsvector('english', 'fish swims'))").await;
+    exec(
+        &sess,
+        "INSERT INTO or_sep VALUES (1, to_tsvector('english', 'cat climbs'))",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO or_sep VALUES (2, to_tsvector('english', 'dog barks'))",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO or_sep VALUES (3, to_tsvector('english', 'fish swims'))",
+    )
+    .await;
 
     let ids = sorted_ids(
         &sess,
@@ -1714,10 +1733,22 @@ async fn gin_not_declines_to_full_scan() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE not_sep (id BIGINT NOT NULL, ts TSVECTOR)").await;
+    exec(
+        &sess,
+        "CREATE TABLE not_sep (id BIGINT NOT NULL, ts TSVECTOR)",
+    )
+    .await;
     exec(&sess, "CREATE INDEX not_sep_gin ON not_sep USING gin (ts)").await;
-    exec(&sess, "INSERT INTO not_sep VALUES (1, to_tsvector('english', 'cat climbs'))").await;
-    exec(&sess, "INSERT INTO not_sep VALUES (2, to_tsvector('english', 'cat dog'))").await;
+    exec(
+        &sess,
+        "INSERT INTO not_sep VALUES (1, to_tsvector('english', 'cat climbs'))",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO not_sep VALUES (2, to_tsvector('english', 'cat dog'))",
+    )
+    .await;
 
     // 'cat & !dog': row 1 has cat but no dog → match; row 2 has both → no match.
     let ids = sorted_ids(
@@ -1742,14 +1773,30 @@ async fn gin_phrase_prunes_positionally_reevaluates() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE ph_sep (id BIGINT NOT NULL, ts TSVECTOR)").await;
+    exec(
+        &sess,
+        "CREATE TABLE ph_sep (id BIGINT NOT NULL, ts TSVECTOR)",
+    )
+    .await;
     exec(&sess, "CREATE INDEX ph_sep_gin ON ph_sep USING gin (ts)").await;
     // Row 1: 'fox quick' (wrong order).
-    exec(&sess, "INSERT INTO ph_sep VALUES (1, to_tsvector('english', 'fox quick'))").await;
+    exec(
+        &sess,
+        "INSERT INTO ph_sep VALUES (1, to_tsvector('english', 'fox quick'))",
+    )
+    .await;
     // Row 2: 'quick fox' (right order, adjacent).
-    exec(&sess, "INSERT INTO ph_sep VALUES (2, to_tsvector('english', 'quick fox'))").await;
+    exec(
+        &sess,
+        "INSERT INTO ph_sep VALUES (2, to_tsvector('english', 'quick fox'))",
+    )
+    .await;
     // Row 3: 'quick snail' (only 'quick', not 'fox').
-    exec(&sess, "INSERT INTO ph_sep VALUES (3, to_tsvector('english', 'quick snail'))").await;
+    exec(
+        &sess,
+        "INSERT INTO ph_sep VALUES (3, to_tsvector('english', 'quick snail'))",
+    )
+    .await;
 
     // 'quick <-> fox': only row 2 has quick immediately before fox.
     let ids = sorted_ids(

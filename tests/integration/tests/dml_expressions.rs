@@ -411,10 +411,7 @@ async fn where_int_col_eq_string_literal_coerces_not_panics() {
     assert_eq!(names, vec!["x".to_string()]);
 
     // DELETE: int column = string literal.
-    let res = sess
-        .execute("DELETE FROM t WHERE id = '2'")
-        .await
-        .unwrap();
+    let res = sess.execute("DELETE FROM t WHERE id = '2'").await.unwrap();
     assert_eq!(tag(res), "DELETE 1");
     let remaining = int64_col(
         sess.execute("SELECT id FROM t ORDER BY id").await.unwrap(),

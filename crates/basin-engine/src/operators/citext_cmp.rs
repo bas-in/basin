@@ -60,15 +60,25 @@ pub struct CitextEqUdf {
 
 impl CitextEqUdf {
     pub fn new() -> Self {
-        Self { signature: text_text_bool_sig() }
+        Self {
+            signature: text_text_bool_sig(),
+        }
     }
 }
 
 impl ScalarUDFImpl for CitextEqUdf {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn name(&self) -> &str { "citext_eq" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "citext_eq"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         apply_binary_bool(&args.args, |a, b| citext_eq(a, b))
     }
@@ -82,15 +92,25 @@ pub struct CitextNeUdf {
 
 impl CitextNeUdf {
     pub fn new() -> Self {
-        Self { signature: text_text_bool_sig() }
+        Self {
+            signature: text_text_bool_sig(),
+        }
     }
 }
 
 impl ScalarUDFImpl for CitextNeUdf {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn name(&self) -> &str { "citext_ne" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "citext_ne"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         apply_binary_bool(&args.args, |a, b| !citext_eq(a, b))
     }
@@ -104,15 +124,25 @@ pub struct CitextLtUdf {
 
 impl CitextLtUdf {
     pub fn new() -> Self {
-        Self { signature: text_text_bool_sig() }
+        Self {
+            signature: text_text_bool_sig(),
+        }
     }
 }
 
 impl ScalarUDFImpl for CitextLtUdf {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn name(&self) -> &str { "citext_lt" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "citext_lt"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         use std::cmp::Ordering;
         apply_binary_bool(&args.args, |a, b| citext_cmp(a, b) == Ordering::Less)
@@ -127,15 +157,25 @@ pub struct CitextLeUdf {
 
 impl CitextLeUdf {
     pub fn new() -> Self {
-        Self { signature: text_text_bool_sig() }
+        Self {
+            signature: text_text_bool_sig(),
+        }
     }
 }
 
 impl ScalarUDFImpl for CitextLeUdf {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn name(&self) -> &str { "citext_le" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "citext_le"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         use std::cmp::Ordering;
         apply_binary_bool(&args.args, |a, b| {
@@ -152,15 +192,25 @@ pub struct CitextGtUdf {
 
 impl CitextGtUdf {
     pub fn new() -> Self {
-        Self { signature: text_text_bool_sig() }
+        Self {
+            signature: text_text_bool_sig(),
+        }
     }
 }
 
 impl ScalarUDFImpl for CitextGtUdf {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn name(&self) -> &str { "citext_gt" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "citext_gt"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         use std::cmp::Ordering;
         apply_binary_bool(&args.args, |a, b| citext_cmp(a, b) == Ordering::Greater)
@@ -175,15 +225,25 @@ pub struct CitextGeUdf {
 
 impl CitextGeUdf {
     pub fn new() -> Self {
-        Self { signature: text_text_bool_sig() }
+        Self {
+            signature: text_text_bool_sig(),
+        }
     }
 }
 
 impl ScalarUDFImpl for CitextGeUdf {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn name(&self) -> &str { "citext_ge" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "citext_ge"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         use std::cmp::Ordering;
         apply_binary_bool(&args.args, |a, b| {
@@ -200,15 +260,25 @@ pub struct CitextLikeUdf {
 
 impl CitextLikeUdf {
     pub fn new() -> Self {
-        Self { signature: text_text_bool_sig() }
+        Self {
+            signature: text_text_bool_sig(),
+        }
     }
 }
 
 impl ScalarUDFImpl for CitextLikeUdf {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn name(&self) -> &str { "citext_like" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "citext_like"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         apply_binary_bool(&args.args, |a, b| citext_like(a, b))
     }

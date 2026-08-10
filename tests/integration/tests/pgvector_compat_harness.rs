@@ -140,14 +140,14 @@ async fn pgvector_type_round_trip() {
     // ── Build a deterministic 384-dim vector literal ─────────────────────────
     // Values chosen so the round-trip is easy to verify: component i = i/1000.0
     // (all distinct, all representable as f32 without precision loss).
-    let components: Vec<String> = (0..DIM).map(|i| format!("{:.4}", i as f32 / 1000.0)).collect();
+    let components: Vec<String> = (0..DIM)
+        .map(|i| format!("{:.4}", i as f32 / 1000.0))
+        .collect();
     let vector_literal = format!("[{}]", components.join(","));
 
     // ── INSERT ───────────────────────────────────────────────────────────────
     // pgvector INSERT syntax: single-quoted bracket notation.
-    let insert_sql = format!(
-        "INSERT INTO items (embedding) VALUES ('{vector_literal}')"
-    );
+    let insert_sql = format!("INSERT INTO items (embedding) VALUES ('{vector_literal}')");
     sess.execute(&insert_sql)
         .await
         .expect("INSERT into items (vector literal)");
@@ -166,9 +166,7 @@ async fn pgvector_type_round_trip() {
     // After 5.26.B, the engine must cast the stored value back to text correctly.
     let repr_count = row_count(
         &sess,
-        &format!(
-            "SELECT embedding FROM items WHERE embedding::text = '{vector_literal}'"
-        ),
+        &format!("SELECT embedding FROM items WHERE embedding::text = '{vector_literal}'"),
     )
     .await;
     assert_eq!(
@@ -180,9 +178,7 @@ async fn pgvector_type_round_trip() {
     // Verify dimensionality: vector_dims() is the pgvector catalog function.
     let dim_count = row_count(
         &sess,
-        &format!(
-            "SELECT embedding FROM items WHERE vector_dims(embedding) = {DIM}"
-        ),
+        &format!("SELECT embedding FROM items WHERE vector_dims(embedding) = {DIM}"),
     )
     .await;
     assert_eq!(
@@ -246,11 +242,9 @@ async fn pgvector_op_l2_distance() {
     .expect("CREATE TABLE l2_vecs");
 
     // ── Insert two reference vectors ──────────────────────────────────────────
-    sess.execute(
-        "INSERT INTO l2_vecs (embedding) VALUES ('[1.0,0.0,0.0]'), ('[0.0,1.0,0.0]')",
-    )
-    .await
-    .expect("INSERT l2_vecs reference vectors");
+    sess.execute("INSERT INTO l2_vecs (embedding) VALUES ('[1.0,0.0,0.0]'), ('[0.0,1.0,0.0]')")
+        .await
+        .expect("INSERT l2_vecs reference vectors");
 
     // ── Test 1: distance between the two stored vectors via ORDER BY <-> ──────
     // pgvector canonical nearest-neighbour query shape.

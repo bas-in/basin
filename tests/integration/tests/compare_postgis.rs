@@ -50,9 +50,7 @@ use std::time::Instant;
 use arrow_array::{Array, Int64Array};
 use basin_common::ProjectId;
 use basin_engine::ExecResult;
-use basin_integration_tests::benchmark::{
-    report_postgres_compare, CompareMetric, WhichWins,
-};
+use basin_integration_tests::benchmark::{report_postgres_compare, CompareMetric, WhichWins};
 
 #[path = "compare_postgres_common.rs"]
 mod common;
@@ -202,9 +200,7 @@ fn basin_count(res: ExecResult) -> i64 {
 /// Count the rows returned by a basin SELECT (for S4, the id-list shape).
 fn basin_row_count(res: ExecResult) -> i64 {
     match res {
-        ExecResult::Rows { batches, .. } => {
-            batches.iter().map(|b| b.num_rows() as i64).sum()
-        }
+        ExecResult::Rows { batches, .. } => batches.iter().map(|b| b.num_rows() as i64).sum(),
         ExecResult::Empty { .. } => 0,
     }
 }
@@ -308,9 +304,7 @@ async fn compare_postgis() {
             if k > 0 {
                 vals.push(',');
             }
-            vals.push_str(&format!(
-                "({id}, ST_SetSRID(ST_MakePoint({x},{y}),4326))"
-            ));
+            vals.push_str(&format!("({id}, ST_SetSRID(ST_MakePoint({x},{y}),4326))"));
         }
         pg.simple_query(&format!(
             "INSERT INTO {schema}.pts (id, geom) VALUES {vals}"
@@ -396,9 +390,7 @@ async fn compare_postgis() {
         r.get::<usize, i64>(0)
     };
     let basin_s1_count = basin_count(sess.execute(&s1_basin_sql).await.expect("basin s1 count"));
-    println!(
-        "[compare_postgis] S1 count guard: pg={pg_s1_count} basin={basin_s1_count}"
-    );
+    println!("[compare_postgis] S1 count guard: pg={pg_s1_count} basin={basin_s1_count}");
     let count_match = pg_s1_count == basin_s1_count;
     assert!(
         pg_s1_count > 0,
@@ -424,8 +416,7 @@ async fn compare_postgis() {
          WHERE ST_DWithin(geom, ST_MakePoint({QUERY_X},{QUERY_Y}), {RADIUS_M})"
     );
     // Sanity: S4 returns the same number of rows as the S1 count.
-    let basin_s4_rows =
-        basin_row_count(sess.execute(&s4_basin_sql).await.expect("basin s4"));
+    let basin_s4_rows = basin_row_count(sess.execute(&s4_basin_sql).await.expect("basin s4"));
     assert_eq!(
         basin_s4_rows, basin_s1_count,
         "S4 row count {basin_s4_rows} != S1 count {basin_s1_count}"
@@ -473,8 +464,7 @@ async fn compare_postgis() {
             .expect("pg s2 count");
         r.get::<usize, i64>(0)
     };
-    let basin_s2_count =
-        basin_count(sess.execute(&s2_basin_sql).await.expect("basin s2 count"));
+    let basin_s2_count = basin_count(sess.execute(&s2_basin_sql).await.expect("basin s2 count"));
     println!(
         "[compare_postgis] S2 bbox count: pg(&&)={pg_s2_count} basin(&&→__basin_bbox_contains_point)={basin_s2_count} \
          (identical native idiom; basin: R-tree row-group prune + single-decode residual UDF)"
@@ -519,7 +509,11 @@ async fn compare_postgis() {
                 let mut out = Vec::new();
                 for b in &batches {
                     let idx = b.schema().index_of("id").expect("id col");
-                    let a = b.column(idx).as_any().downcast_ref::<Int64Array>().expect("id i64");
+                    let a = b
+                        .column(idx)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id i64");
                     for i in 0..a.len() {
                         out.push(a.value(i));
                     }
@@ -562,11 +556,21 @@ async fn compare_postgis() {
          {:<18}{:>12.3}ms{:>12.3}ms\n\
          {:<18}{:>12.3}ms{:>12.3}ms\n\
          S1 count-match: {} | S2 count-match: {} | S3 KNN set-match: {}\n",
-        "shape", "basin", "postgis",
-        "S1 radius count", s1_basin, s1_pg,
-        "S4 radius id-list", s4_basin, s4_pg,
-        "S2 bbox count", s2_basin, s2_pg,
-        "S3 KNN id-list", s3_basin, s3_pg,
+        "shape",
+        "basin",
+        "postgis",
+        "S1 radius count",
+        s1_basin,
+        s1_pg,
+        "S4 radius id-list",
+        s4_basin,
+        s4_pg,
+        "S2 bbox count",
+        s2_basin,
+        s2_pg,
+        "S3 KNN id-list",
+        s3_basin,
+        s3_pg,
         if count_match { "PASS" } else { "FAIL" },
         if s2_count_match { "PASS" } else { "FAIL" },
         if s3_set_match { "PASS" } else { "FAIL" },

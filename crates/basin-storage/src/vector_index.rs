@@ -63,7 +63,9 @@ pub(crate) async fn build_indexes_for_batch(
         // `ef_construction` build param (if any).
         let ef_construction = indexes
             .iter()
-            .filter(|idx| idx.access_method == "hnsw" && idx.columns.iter().any(|c| c == field.name()))
+            .filter(|idx| {
+                idx.access_method == "hnsw" && idx.columns.iter().any(|c| c == field.name())
+            })
             .find_map(|idx| idx.opclass.as_deref().and_then(decode_ef_construction));
         let array = batch
             .column(col_idx)
@@ -85,8 +87,8 @@ pub(crate) async fn build_indexes_for_batch(
                     field.name()
                 ))
             })?;
-        let mut builder = HnswIndexBuilder::new(Distance::L2, dim)
-            .with_ef_construction(ef_construction);
+        let mut builder =
+            HnswIndexBuilder::new(Distance::L2, dim).with_ef_construction(ef_construction);
         for row_idx in 0..array.len() {
             if array.is_null(row_idx) {
                 continue;

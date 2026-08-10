@@ -209,11 +209,7 @@ async fn vector_literal_roundtrip_3dim() {
     let (engine, _dir) = make_engine();
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(
-        &sess,
-        "CREATE TABLE v3 (id BIGINT NOT NULL, v vector(3))",
-    )
-    .await;
+    exec(&sess, "CREATE TABLE v3 (id BIGINT NOT NULL, v vector(3))").await;
     exec(&sess, "INSERT INTO v3 VALUES (1, '[1.0, 2.0, 3.0]')").await;
 
     // The stored value must be selectable as TEXT (via ::text cast).
@@ -224,7 +220,10 @@ async fn vector_literal_roundtrip_3dim() {
     );
 
     // vector_dims must agree with the declared dimensionality.
-    match sess.execute("SELECT vector_dims(v) FROM v3 WHERE id = 1").await {
+    match sess
+        .execute("SELECT vector_dims(v) FROM v3 WHERE id = 1")
+        .await
+    {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().expect("batch");
             let arr = b
@@ -232,7 +231,12 @@ async fn vector_literal_roundtrip_3dim() {
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .expect("Int32Array for vector_dims");
-            assert_eq!(arr.value(0), 3, "vector_dims must return 3; got={}", arr.value(0));
+            assert_eq!(
+                arr.value(0),
+                3,
+                "vector_dims must return 3; got={}",
+                arr.value(0)
+            );
         }
         other => panic!("unexpected: {other:?}"),
     }
@@ -251,15 +255,18 @@ async fn vector_literal_whitespace_forms_accepted() {
 
     for (id, lit) in &[
         (1i64, "[ 1.0 , 2.0 ]"),
-        (2,    "[1.0,2.0]"),
-        (3,    "[ 1.0,2.0]"),
-        (4,    "[1.0 ,2.0 ]"),
+        (2, "[1.0,2.0]"),
+        (3, "[ 1.0,2.0]"),
+        (4, "[1.0 ,2.0 ]"),
     ] {
         exec(&sess, &format!("INSERT INTO vws VALUES ({id}, '{lit}')")).await;
     }
 
     let n = row_count(&sess, "SELECT id FROM vws").await;
-    assert_eq!(n, 4, "All 4 whitespace-variant literals must be accepted; n={n}");
+    assert_eq!(
+        n, 4,
+        "All 4 whitespace-variant literals must be accepted; n={n}"
+    );
     println!("[vec literal] whitespace forms ✓");
 }
 
@@ -312,14 +319,23 @@ async fn vector_literal_1536_dim_roundtrip() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     const DIM: usize = 1536;
-    let components: Vec<String> = (0..DIM).map(|i| format!("{:.6}", i as f32 / DIM as f32)).collect();
+    let components: Vec<String> = (0..DIM)
+        .map(|i| format!("{:.6}", i as f32 / DIM as f32))
+        .collect();
     let lit = format!("[{}]", components.join(","));
 
-    exec(&sess, &format!("CREATE TABLE v1536 (id BIGINT, v vector({DIM}))")).await;
+    exec(
+        &sess,
+        &format!("CREATE TABLE v1536 (id BIGINT, v vector({DIM}))"),
+    )
+    .await;
     exec(&sess, &format!("INSERT INTO v1536 VALUES (1, '{lit}')")).await;
 
     // vector_dims must report 1536.
-    match sess.execute("SELECT vector_dims(v) FROM v1536 WHERE id = 1").await {
+    match sess
+        .execute("SELECT vector_dims(v) FROM v1536 WHERE id = 1")
+        .await
+    {
         Ok(ExecResult::Rows { batches, .. }) => {
             let b = batches.first().expect("batch");
             let arr = b
@@ -328,7 +344,8 @@ async fn vector_literal_1536_dim_roundtrip() {
                 .downcast_ref::<Int32Array>()
                 .expect("Int32Array");
             assert_eq!(
-                arr.value(0), DIM as i32,
+                arr.value(0),
+                DIM as i32,
                 "1536-dim vector: vector_dims must be {DIM}; got={}",
                 arr.value(0)
             );
@@ -380,10 +397,7 @@ async fn dimension_mismatch_errors() {
     let r = sess
         .execute("SELECT l2_distance(v, '[1.0, 2.0]') FROM vdim WHERE id = 1")
         .await;
-    assert!(
-        r.is_err(),
-        "dimension mismatch must error; got={r:?}"
-    );
+    assert!(r.is_err(), "dimension mismatch must error; got={r:?}");
     println!("[vec dim-mismatch] error ✓");
 }
 
@@ -400,11 +414,21 @@ async fn vector_dims_correct_for_multiple_sizes() {
 
     for dim in &[1usize, 3, 8, 64, 384] {
         let tbl = format!("vdims_{dim}");
-        exec(&sess, &format!("CREATE TABLE {tbl} (id BIGINT, v vector({dim}))")).await;
-        let zeros = std::iter::repeat("0.0").take(*dim).collect::<Vec<_>>().join(",");
+        exec(
+            &sess,
+            &format!("CREATE TABLE {tbl} (id BIGINT, v vector({dim}))"),
+        )
+        .await;
+        let zeros = std::iter::repeat("0.0")
+            .take(*dim)
+            .collect::<Vec<_>>()
+            .join(",");
         exec(&sess, &format!("INSERT INTO {tbl} VALUES (1, '[{zeros}]')")).await;
 
-        match sess.execute(&format!("SELECT vector_dims(v) FROM {tbl} WHERE id = 1")).await {
+        match sess
+            .execute(&format!("SELECT vector_dims(v) FROM {tbl} WHERE id = 1"))
+            .await
+        {
             Ok(ExecResult::Rows { batches, .. }) => {
                 let b = batches.first().expect("batch");
                 let arr = b
@@ -413,7 +437,8 @@ async fn vector_dims_correct_for_multiple_sizes() {
                     .downcast_ref::<Int32Array>()
                     .expect("Int32Array");
                 assert_eq!(
-                    arr.value(0), *dim as i32,
+                    arr.value(0),
+                    *dim as i32,
                     "vector_dims for dim={dim}: expected {dim}, got={}",
                     arr.value(0)
                 );
@@ -438,7 +463,11 @@ async fn vector_norm_known_values() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE vnorm (id BIGINT, v vector(2))").await;
-    exec(&sess, "INSERT INTO vnorm VALUES (1, '[3.0, 4.0]'), (2, '[0.0, 0.0]'), (3, '[1.0, 0.0]')").await;
+    exec(
+        &sess,
+        "INSERT INTO vnorm VALUES (1, '[3.0, 4.0]'), (2, '[0.0, 0.0]'), (3, '[1.0, 0.0]')",
+    )
+    .await;
 
     // [3, 4]: norm = sqrt(9 + 16) = 5.
     let n1 = single_f64(&sess, "SELECT vector_norm(v) FROM vnorm WHERE id = 1").await;
@@ -514,10 +543,17 @@ async fn l2_distance_unit_axes() {
         "SELECT v <-> '[1.0,0.0,0.0]' FROM l2tbl WHERE id = 1",
     )
     .await;
-    assert!(zero.abs() < EPS, "<->: identical vector distance must be 0; got={zero}");
+    assert!(
+        zero.abs() < EPS,
+        "<->: identical vector distance must be 0; got={zero}"
+    );
 
     // [3,4,0] <-> [0,0,0] = 5 (Pythagorean).
-    exec(&sess, "INSERT INTO l2tbl VALUES (3, '[3.0,4.0,0.0]'), (4, '[0.0,0.0,0.0]')").await;
+    exec(
+        &sess,
+        "INSERT INTO l2tbl VALUES (3, '[3.0,4.0,0.0]'), (4, '[0.0,0.0,0.0]')",
+    )
+    .await;
     let five = single_f64(
         &sess,
         "SELECT v <-> '[0.0,0.0,0.0]' FROM l2tbl WHERE id = 3",
@@ -681,11 +717,7 @@ async fn operator_function_equivalence_l2() {
 
     for id in &[1i64, 2] {
         let q = "'[0.1,0.2,0.3,0.4]'";
-        let op = single_f64(
-            &sess,
-            &format!("SELECT v <-> {q} FROM veq WHERE id = {id}"),
-        )
-        .await;
+        let op = single_f64(&sess, &format!("SELECT v <-> {q} FROM veq WHERE id = {id}")).await;
         let fn_ = single_f64(
             &sess,
             &format!("SELECT l2_distance(v, {q}) FROM veq WHERE id = {id}"),
@@ -707,7 +739,11 @@ async fn operator_function_equivalence_cosine() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE veq_cos (id BIGINT, v vector(2))").await;
-    exec(&sess, "INSERT INTO veq_cos VALUES (1, '[1.0,0.0]'), (2, '[0.6,0.8]')").await;
+    exec(
+        &sess,
+        "INSERT INTO veq_cos VALUES (1, '[1.0,0.0]'), (2, '[0.6,0.8]')",
+    )
+    .await;
 
     for id in &[1i64, 2] {
         let q = "'[1.0,1.0]'";
@@ -739,7 +775,11 @@ async fn operator_function_equivalence_dot() {
     exec(&sess, "CREATE TABLE veq_dot (id BIGINT, v vector(3))").await;
     exec(&sess, "INSERT INTO veq_dot VALUES (1, '[2.0,3.0,4.0]')").await;
 
-    let op = single_f64(&sess, "SELECT v <#> '[1.0,1.0,1.0]' FROM veq_dot WHERE id = 1").await;
+    let op = single_f64(
+        &sess,
+        "SELECT v <#> '[1.0,1.0,1.0]' FROM veq_dot WHERE id = 1",
+    )
+    .await;
     let fn_ = single_f64(
         &sess,
         "SELECT (0.0 - dot_product(v, '[1.0,1.0,1.0]')) FROM veq_dot WHERE id = 1",
@@ -775,7 +815,11 @@ async fn order_by_l2_limit_k_returns_exact_nearest() {
     let (engine, _dir) = make_engine();
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE knn2d (id BIGINT NOT NULL, v vector(2))").await;
+    exec(
+        &sess,
+        "CREATE TABLE knn2d (id BIGINT NOT NULL, v vector(2))",
+    )
+    .await;
     exec(
         &sess,
         "INSERT INTO knn2d VALUES \
@@ -856,7 +900,11 @@ async fn order_by_cosine_returns_correct_order() {
     let (engine, _dir) = make_engine();
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE cos2d (id BIGINT NOT NULL, v vector(2))").await;
+    exec(
+        &sess,
+        "CREATE TABLE cos2d (id BIGINT NOT NULL, v vector(2))",
+    )
+    .await;
     exec(
         &sess,
         "INSERT INTO cos2d VALUES \
@@ -889,7 +937,11 @@ async fn order_by_cosine_returns_correct_order() {
                         .flatten()
                 })
                 .collect();
-            assert_eq!(ids.len(), 4, "cosine ORDER BY must return 4 rows; got={ids:?}");
+            assert_eq!(
+                ids.len(),
+                4,
+                "cosine ORDER BY must return 4 rows; got={ids:?}"
+            );
             assert_eq!(
                 ids.first(),
                 Some(&3),
@@ -931,7 +983,10 @@ async fn hnsw_ddl_all_opclasses_accepted() {
              USING hnsw (embedding vector_l2_ops)",
         )
         .await;
-    assert!(r1.is_ok(), "USING hnsw (vector_l2_ops) must be accepted; got={r1:?}");
+    assert!(
+        r1.is_ok(),
+        "USING hnsw (vector_l2_ops) must be accepted; got={r1:?}"
+    );
 
     // vector_cosine_ops
     let r2 = sess
@@ -940,7 +995,10 @@ async fn hnsw_ddl_all_opclasses_accepted() {
              USING hnsw (embedding vector_cosine_ops)",
         )
         .await;
-    assert!(r2.is_ok(), "USING hnsw (vector_cosine_ops) must be accepted; got={r2:?}");
+    assert!(
+        r2.is_ok(),
+        "USING hnsw (vector_cosine_ops) must be accepted; got={r2:?}"
+    );
 
     // vector_ip_ops
     let r3 = sess
@@ -949,7 +1007,10 @@ async fn hnsw_ddl_all_opclasses_accepted() {
              USING hnsw (embedding vector_ip_ops)",
         )
         .await;
-    assert!(r3.is_ok(), "USING hnsw (vector_ip_ops) must be accepted; got={r3:?}");
+    assert!(
+        r3.is_ok(),
+        "USING hnsw (vector_ip_ops) must be accepted; got={r3:?}"
+    );
 
     // WITH storage parameters.
     let r4 = sess
@@ -1057,27 +1118,25 @@ async fn hnsw_index_backed_vs_brute_force_equality() {
     // Brute-force top-k.
     let bf_ids = sorted_ids(
         &sess,
-        &format!(
-            "SELECT id FROM bf_tbl ORDER BY v <-> '{query}' LIMIT {k}"
-        ),
+        &format!("SELECT id FROM bf_tbl ORDER BY v <-> '{query}' LIMIT {k}"),
     )
     .await;
 
     // Index-backed top-k (planner may route through HNSW).
     let idx_ids = sorted_ids(
         &sess,
-        &format!(
-            "SELECT id FROM idx_tbl ORDER BY v <-> '{query}' LIMIT {k}"
-        ),
+        &format!("SELECT id FROM idx_tbl ORDER BY v <-> '{query}' LIMIT {k}"),
     )
     .await;
 
     assert_eq!(
-        bf_ids.len(), k,
+        bf_ids.len(),
+        k,
         "Brute-force must return {k} results; got={bf_ids:?}"
     );
     assert_eq!(
-        idx_ids.len(), k,
+        idx_ids.len(),
+        k,
         "Index-backed must return {k} results; got={idx_ids:?}"
     );
     assert_eq!(
@@ -1085,9 +1144,7 @@ async fn hnsw_index_backed_vs_brute_force_equality() {
         "HNSW vs brute-force MUST agree on 10-row exact dataset; \
          bf={bf_ids:?} idx={idx_ids:?}"
     );
-    println!(
-        "[vec HNSW vs BF] exact equality on 10 rows, k={k}: {bf_ids:?} ✓"
-    );
+    println!("[vec HNSW vs BF] exact equality on 10 rows, k={k}: {bf_ids:?} ✓");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1223,11 +1280,7 @@ async fn vector_arrow_vector_with_bracket_literals_rewrites_correctly() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Both sides are bracket-format vector literals; must rewrite to l2_distance.
-    let dist = single_f64(
-        &sess,
-        "SELECT '[3.0,4.0]' <-> '[0.0,0.0]'",
-    )
-    .await;
+    let dist = single_f64(&sess, "SELECT '[3.0,4.0]' <-> '[0.0,0.0]'").await;
     assert!(
         approx_eq(dist, 5.0),
         "bracket-literal <-> bracket-literal must be rewritten to l2_distance; \
@@ -1253,7 +1306,11 @@ async fn distance_threshold_in_where_filters_rows() {
     let (engine, _dir) = make_engine();
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE thresh (id BIGINT NOT NULL, v vector(2))").await;
+    exec(
+        &sess,
+        "CREATE TABLE thresh (id BIGINT NOT NULL, v vector(2))",
+    )
+    .await;
     exec(
         &sess,
         "INSERT INTO thresh VALUES \
@@ -1310,7 +1367,11 @@ async fn prisma_cast_suffix_in_order_by() {
     let (engine, _dir) = make_engine();
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE prisma_tbl (id BIGINT PRIMARY KEY, embedding vector(3))").await;
+    exec(
+        &sess,
+        "CREATE TABLE prisma_tbl (id BIGINT PRIMARY KEY, embedding vector(3))",
+    )
+    .await;
     exec(
         &sess,
         "INSERT INTO prisma_tbl VALUES \
@@ -1328,7 +1389,10 @@ async fn prisma_cast_suffix_in_order_by() {
          LIMIT 3 OFFSET 0",
     )
     .await;
-    assert_eq!(n, 3, "Prisma ORDER BY ::vector must return all 3 rows; n={n}");
+    assert_eq!(
+        n, 3,
+        "Prisma ORDER BY ::vector must return all 3 rows; n={n}"
+    );
     println!("[vec ::vector Prisma] ORDER BY + ::vector ✓");
 }
 
@@ -1362,7 +1426,10 @@ async fn orm_sqlalchemy_shapes_work_end_to_end() {
              WITH (m = 16, ef_construction = 64)",
         )
         .await;
-    assert!(hnsw.is_ok(), "SQLAlchemy HNSW DDL must be accepted; got={hnsw:?}");
+    assert!(
+        hnsw.is_ok(),
+        "SQLAlchemy HNSW DDL must be accepted; got={hnsw:?}"
+    );
 
     exec(
         &sess,
@@ -1472,7 +1539,10 @@ async fn ivfflat_ddl_all_opclasses_accepted_and_persisted() {
                  USING ivfflat (embedding {opclass}) WITH (lists = 4)"
             ))
             .await;
-        assert!(r.is_ok(), "USING ivfflat ({opclass}) WITH (lists) must be accepted; got={r:?}");
+        assert!(
+            r.is_ok(),
+            "USING ivfflat ({opclass}) WITH (lists) must be accepted; got={r:?}"
+        );
     }
 
     // All three must appear in pg_indexes.
@@ -1496,8 +1566,16 @@ async fn ivfflat_index_backed_vs_brute_force_equality() {
     let (engine, _dir) = make_engine();
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE ivf_bf (id BIGINT NOT NULL, v vector(4))").await;
-    exec(&sess, "CREATE TABLE ivf_idx (id BIGINT NOT NULL, v vector(4))").await;
+    exec(
+        &sess,
+        "CREATE TABLE ivf_bf (id BIGINT NOT NULL, v vector(4))",
+    )
+    .await;
+    exec(
+        &sess,
+        "CREATE TABLE ivf_idx (id BIGINT NOT NULL, v vector(4))",
+    )
+    .await;
     exec(
         &sess,
         "CREATE INDEX ivf_idx_ann ON ivf_idx \
@@ -1535,8 +1613,16 @@ async fn ivfflat_index_backed_vs_brute_force_equality() {
     )
     .await;
 
-    assert_eq!(bf_ids.len(), k, "brute force must return {k}; got={bf_ids:?}");
-    assert_eq!(idx_ids.len(), k, "ivfflat-routed must return {k}; got={idx_ids:?}");
+    assert_eq!(
+        bf_ids.len(),
+        k,
+        "brute force must return {k}; got={bf_ids:?}"
+    );
+    assert_eq!(
+        idx_ids.len(),
+        k,
+        "ivfflat-routed must return {k}; got={idx_ids:?}"
+    );
     assert_eq!(
         bf_ids, idx_ids,
         "IVFFlat vs brute force must agree on 10-row exact set; bf={bf_ids:?} idx={idx_ids:?}"
@@ -1574,7 +1660,10 @@ async fn vector_avg_elementwise_mean() {
         "SELECT l2_distance(vector_avg(v), '[4.0,8.0]') FROM vavg",
     )
     .await;
-    assert!(d.abs() < EPS, "vector_avg must equal [4,8]; l2 to [4,8] = {d}");
+    assert!(
+        d.abs() < EPS,
+        "vector_avg must equal [4,8]; l2 to [4,8] = {d}"
+    );
     println!("[vec vector_avg] element-wise mean = [4,8] ✓");
 }
 
@@ -1598,7 +1687,10 @@ async fn vector_avg_ignores_nulls() {
         "SELECT l2_distance(vector_avg(v), '[2.0,2.0]') FROM vavg_n",
     )
     .await;
-    assert!(d.abs() < EPS, "vector_avg must skip NULLs → [2,2]; l2 to [2,2] = {d}");
+    assert!(
+        d.abs() < EPS,
+        "vector_avg must skip NULLs → [2,2]; l2 to [2,2] = {d}"
+    );
     println!("[vec vector_avg] NULLs ignored → [2,2] ✓");
 }
 
@@ -1706,7 +1798,10 @@ async fn halfvec_roundtrip_and_distance() {
     exec(&sess, "INSERT INTO hv VALUES (1, '[3.0,4.0,0.0]')").await;
 
     // vector_dims works on a halfvec column.
-    match sess.execute("SELECT vector_dims(h) FROM hv WHERE id = 1").await {
+    match sess
+        .execute("SELECT vector_dims(h) FROM hv WHERE id = 1")
+        .await
+    {
         Ok(ExecResult::Rows { batches, .. }) => {
             let arr = batches
                 .first()
@@ -1721,9 +1816,18 @@ async fn halfvec_roundtrip_and_distance() {
     }
 
     // Distance ops work on halfvec: l2([3,4,0], [0,0,0]) = 5.
-    let d = single_f64(&sess, "SELECT l2_distance(h, '[0.0,0.0,0.0]') FROM hv WHERE id = 1").await;
-    assert!(approx_eq(d, 5.0), "halfvec l2_distance must be 5.0; got={d}");
-    println!("[vec halfvec] f32-backed round-trip + distance ✓ (precision note: no f16 truncation)");
+    let d = single_f64(
+        &sess,
+        "SELECT l2_distance(h, '[0.0,0.0,0.0]') FROM hv WHERE id = 1",
+    )
+    .await;
+    assert!(
+        approx_eq(d, 5.0),
+        "halfvec l2_distance must be 5.0; got={d}"
+    );
+    println!(
+        "[vec halfvec] f32-backed round-trip + distance ✓ (precision note: no f16 truncation)"
+    );
 }
 
 /// `sparsevec(N)` is a typed 0A000 (feature_not_supported) — not a silent

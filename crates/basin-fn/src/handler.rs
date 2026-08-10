@@ -27,8 +27,8 @@
 
 use std::sync::Arc;
 
-use wasmtime::{Engine, Store};
 use wasmtime::component::Component;
+use wasmtime::{Engine, Store};
 
 use basin_common::ids::ProjectId;
 
@@ -148,7 +148,12 @@ impl HandlerHarness {
         // the trait impls live in `crate::host` and are world-agnostic.
         crate::host::add_host_to_linker(&mut linker)?;
 
-        Ok(Self { engine, component, linker, governance })
+        Ok(Self {
+            engine,
+            component,
+            linker,
+            governance,
+        })
     }
 
     /// Whether the harness was built with [`Self::with_governance`].
@@ -185,7 +190,8 @@ impl HandlerHarness {
             body: req.body,
         };
 
-        let bindings = BasinFunctionsHandler::instantiate(&mut store, &self.component, &self.linker)?;
+        let bindings =
+            BasinFunctionsHandler::instantiate(&mut store, &self.component, &self.linker)?;
         let res = bindings.call_handle(&mut store, &wit_req)?;
 
         Ok(Self::lift_response(res))
@@ -215,15 +221,11 @@ impl HandlerHarness {
         let gov_inner = gov.clone();
         gov.invoke_with_caps(project, move || {
             let call_ctx = FunctionCallContext::new(ctx);
-            let host = FunctionHost::with_limiter(
-                call_ctx,
-                MemoryLimiter::new(caps.memory_max_bytes),
-            );
+            let host =
+                FunctionHost::with_limiter(call_ctx, MemoryLimiter::new(caps.memory_max_bytes));
             let mut store = Store::new(&me.engine, host);
-            gov_inner.prepare_store_with_limiter(
-                &mut store,
-                |h: &mut FunctionHost| h.limiter_mut(),
-            );
+            gov_inner
+                .prepare_store_with_limiter(&mut store, |h: &mut FunctionHost| h.limiter_mut());
 
             let wit_req = WitRequest {
                 method: req.method,
@@ -241,9 +243,7 @@ impl HandlerHarness {
 
     /// Shared response lift used by both [`Self::handle`] and
     /// [`Self::handle_with`].
-    fn lift_response(
-        res: Result<basin::functions::handler::Response, String>,
-    ) -> HandlerResponse {
+    fn lift_response(res: Result<basin::functions::handler::Response, String>) -> HandlerResponse {
         match res {
             Ok(r) => HandlerResponse {
                 status: r.status,

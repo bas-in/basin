@@ -53,7 +53,11 @@ fn engine_in(dir: &TempDir) -> Engine {
         page_cache: None,
     });
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
-    Engine::new(EngineConfig { storage, catalog, shard: None })
+    Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    })
 }
 
 async fn exec(sess: &ProjectSession, sql: &str) {
@@ -149,7 +153,11 @@ async fn seed(dir: &TempDir, with_index: bool) -> (Engine, ProjectSession, Proje
 async fn oracle_ids(needle: &str) -> Vec<i64> {
     let dir = TempDir::new().unwrap();
     let (_eng, sess, _p) = seed(&dir, false).await;
-    ids_for(&sess, &format!("SELECT id FROM docs WHERE payload @> '{needle}'")).await
+    ids_for(
+        &sess,
+        &format!("SELECT id FROM docs WHERE payload @> '{needle}'"),
+    )
+    .await
 }
 
 /// Run the same `@>` query against the indexed table with the row tier ON, and
@@ -159,13 +167,21 @@ async fn assert_row_tier_matches_oracle(needle: &str) {
     let on = with_row_tier("1", async {
         let dir = TempDir::new().unwrap();
         let (_eng, sess, _p) = seed(&dir, true).await;
-        ids_for(&sess, &format!("SELECT id FROM docs WHERE payload @> '{needle}'")).await
+        ids_for(
+            &sess,
+            &format!("SELECT id FROM docs WHERE payload @> '{needle}'"),
+        )
+        .await
     })
     .await;
     let off = with_row_tier("0", async {
         let dir = TempDir::new().unwrap();
         let (_eng, sess, _p) = seed(&dir, true).await;
-        ids_for(&sess, &format!("SELECT id FROM docs WHERE payload @> '{needle}'")).await
+        ids_for(
+            &sess,
+            &format!("SELECT id FROM docs WHERE payload @> '{needle}'"),
+        )
+        .await
     })
     .await;
     assert_eq!(
@@ -176,7 +192,10 @@ async fn assert_row_tier_matches_oracle(needle: &str) {
         off, oracle,
         "row-tier OFF must equal full-scan oracle for needle {needle}"
     );
-    assert_eq!(on, off, "row-tier ON must equal row-tier OFF for needle {needle}");
+    assert_eq!(
+        on, off,
+        "row-tier ON must equal row-tier OFF for needle {needle}"
+    );
 }
 
 #[tokio::test]
@@ -234,7 +253,11 @@ async fn overlay_present_row_tier_declines_but_stays_correct() {
             "UPDATE docs SET payload = '{\"tag\":\"t\",\"id\":3,\"kind\":\"rare\",\"flipped\":true}' WHERE id = 3",
         )
         .await;
-        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"flipped\":true}'").await
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload @> '{\"flipped\":true}'",
+        )
+        .await
     };
     let indexed_after = with_row_tier("1", async {
         let dir = TempDir::new().unwrap();

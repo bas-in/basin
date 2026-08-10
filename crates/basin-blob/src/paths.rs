@@ -119,7 +119,9 @@ mod tests {
         let key = blob_key(None, &project, "avatars", "alice/photo.png").unwrap();
         let s = key.as_ref();
         assert!(
-            s.starts_with(&format!("projects/{project}/storage/avatars/alice/photo.png")),
+            s.starts_with(&format!(
+                "projects/{project}/storage/avatars/alice/photo.png"
+            )),
             "unexpected key: {s}"
         );
     }
@@ -171,10 +173,7 @@ mod tests {
     fn project_storage_prefix_layout() {
         let project = ProjectId::new();
         let prefix = project_storage_prefix(None, &project);
-        assert_eq!(
-            prefix.as_ref(),
-            format!("projects/{project}/storage")
-        );
+        assert_eq!(prefix.as_ref(), format!("projects/{project}/storage"));
     }
 
     #[test]

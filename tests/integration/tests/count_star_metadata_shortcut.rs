@@ -238,11 +238,17 @@ async fn count_star_after_update_and_delete_uses_shortcut() {
     let _ = count_star(&sess, "ev").await;
 
     exec(&sess, "UPDATE ev SET v = 7 WHERE id = 42").await;
-    let res = sess.execute("DELETE FROM ev WHERE id IN (1, 2, 3, 4, 5)").await.unwrap();
+    let res = sess
+        .execute("DELETE FROM ev WHERE id IN (1, 2, 3, 4, 5)")
+        .await
+        .unwrap();
     assert!(matches!(res, ExecResult::Empty { .. }));
 
     let (n, ms) = timed_count(&sess, "ev").await;
-    assert_eq!(n, 9_995, "COUNT(*) = 10000 − 5 deleted (update is count-neutral)");
+    assert_eq!(
+        n, 9_995,
+        "COUNT(*) = 10000 − 5 deleted (update is count-neutral)"
+    );
     assert!(
         ms < 50.0,
         "COUNT(*) under a combined update+tombstone overlay took {ms:.2} ms — \
@@ -275,14 +281,24 @@ async fn max_with_tombstone_declines_shortcut_and_is_correct() {
     seed(&sess, "ev", 100).await; // seed sets id 1..=100, v = id
 
     // Delete the top ids so MAX(id) must drop if tombstones are honored.
-    sess.execute("DELETE FROM ev WHERE id IN (99, 100)").await.unwrap();
+    sess.execute("DELETE FROM ev WHERE id IN (99, 100)")
+        .await
+        .unwrap();
 
     let res = sess.execute("SELECT MAX(id) FROM ev").await.unwrap();
     match res {
         ExecResult::Rows { batches, .. } => {
             use arrow_array::Int64Array;
-            let v = batches[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
-            assert_eq!(v, 98, "MAX(id) must reflect the deleted top rows (scan, not stale metadata)");
+            let v = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0);
+            assert_eq!(
+                v, 98,
+                "MAX(id) must reflect the deleted top rows (scan, not stale metadata)"
+            );
         }
         other => panic!("expected Rows, got {other:?}"),
     }

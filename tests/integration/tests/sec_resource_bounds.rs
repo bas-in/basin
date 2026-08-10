@@ -54,7 +54,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -90,9 +94,7 @@ async fn statement_timeout_cancels_recursive_cte() {
     let t0 = Instant::now();
     let outcome = tokio::time::timeout(Duration::from_secs(10), sess.execute(sql)).await;
     let elapsed = t0.elapsed();
-    println!(
-        "[sec_resource_bounds] runaway RCTE: outcome={outcome:?} elapsed={elapsed:?}"
-    );
+    println!("[sec_resource_bounds] runaway RCTE: outcome={outcome:?} elapsed={elapsed:?}");
 
     match outcome {
         Err(_) => panic!(
@@ -118,9 +120,7 @@ async fn statement_timeout_cancels_recursive_cte() {
                     "SECURITY: runaway RCTE returned BasinError::Internal: {msg} — \
                      expected typed timeout / cost / feature error"
                 ),
-                _ => println!(
-                    "[sec_resource_bounds] runaway RCTE returned typed error: {e}"
-                ),
+                _ => println!("[sec_resource_bounds] runaway RCTE returned typed error: {e}"),
             }
         }
     }
@@ -161,9 +161,7 @@ async fn huge_groupby_does_not_panic() {
     )
     .await;
     let elapsed = t0.elapsed();
-    println!(
-        "[sec_resource_bounds] groupby 100K groups: outcome={r:?} elapsed={elapsed:?}"
-    );
+    println!("[sec_resource_bounds] groupby 100K groups: outcome={r:?} elapsed={elapsed:?}");
 
     match r {
         Err(_) => panic!(
@@ -183,12 +181,10 @@ async fn huge_groupby_does_not_panic() {
         Ok(Ok(ExecResult::Empty { .. })) => {}
         Ok(Err(e)) => match e {
             BasinError::QueryCostExceeded(_) | BasinError::QueryCanceled(_) => {}
-            BasinError::Internal(msg) => panic!(
-                "SECURITY: huge GROUP BY returned BasinError::Internal: {msg}"
-            ),
-            other => println!(
-                "[sec_resource_bounds] huge GROUP BY typed err: {other}"
-            ),
+            BasinError::Internal(msg) => {
+                panic!("SECURITY: huge GROUP BY returned BasinError::Internal: {msg}")
+            }
+            other => println!("[sec_resource_bounds] huge GROUP BY typed err: {other}"),
         },
     }
 }
@@ -255,9 +251,7 @@ async fn concurrent_queries_dont_starve_other_project() {
             joins.push(tokio::spawn(async move {
                 let sa = eng.open_session(pa_inner).await.unwrap();
                 // Wide scan with aggregate.
-                let _ = sa
-                    .execute("SELECT count(*) FROM big WHERE v > 0")
-                    .await;
+                let _ = sa.execute("SELECT count(*) FROM big WHERE v > 0").await;
             }));
         }
         for j in joins {

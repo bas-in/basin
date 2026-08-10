@@ -263,10 +263,7 @@ async fn delete_where_id_any_int_array_param() {
     // here to keep the gate honest.
     let ids: Vec<i64> = vec![1, 3];
     let n = client
-        .execute(
-            "DELETE FROM users WHERE id = ANY($1)",
-            &[&ids],
-        )
+        .execute("DELETE FROM users WHERE id = ANY($1)", &[&ids])
         .await
         .expect("DELETE WHERE id = ANY($1) (bigint[])");
     assert_eq!(n, 2, "exactly ids {{1,3}} deleted");
@@ -291,9 +288,7 @@ async fn delete_where_id_any_int4_array_cast_param() {
     let client = connect(server.addr).await;
     // Use INT (int4) so the cast actually narrows.
     client
-        .simple_query(
-            "CREATE TABLE small (id INT NOT NULL, label TEXT NOT NULL)",
-        )
+        .simple_query("CREATE TABLE small (id INT NOT NULL, label TEXT NOT NULL)")
         .await
         .expect("CREATE TABLE small");
     client
@@ -303,10 +298,7 @@ async fn delete_where_id_any_int4_array_cast_param() {
 
     let ids: Vec<i32> = vec![1, 3];
     let n = client
-        .execute(
-            "DELETE FROM small WHERE id = ANY($1::int[])",
-            &[&ids],
-        )
+        .execute("DELETE FROM small WHERE id = ANY($1::int[])", &[&ids])
         .await
         .expect("DELETE WHERE id = ANY($1::int[]) (Drizzle's verbatim shape)");
     assert_eq!(n, 2, "two rows deleted");

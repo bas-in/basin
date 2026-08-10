@@ -113,7 +113,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage: storage.clone(),
@@ -312,7 +316,9 @@ async fn run_fleet(n_projects: usize) {
     shard.run_stripe_merge_once().await.unwrap();
     let settle_s = settle_started.elapsed().as_secs_f64();
     let setup_s = setup_started.elapsed().as_secs_f64();
-    eprintln!("[fleet-scale] setup {setup_s:.1}s (settle {settle_s:.1}s); background loop stays ALIVE");
+    eprintln!(
+        "[fleet-scale] setup {setup_s:.1}s (settle {settle_s:.1}s); background loop stays ALIVE"
+    );
 
     // ── Phase A: victim baseline, no noisy load ──────────────────────────────
     eprintln!("[fleet-scale] phase A: victim baseline ({queries} rounds x {n_victims} victims)");
@@ -453,7 +459,11 @@ async fn run_fleet(n_projects: usize) {
     println!(
         "[fleet-scale] projects={n_projects} victim p99 degradation: point {point_p99_ratio:.2}x, \
          keyset {keyset_p99_ratio:.2}x (informational bar <{BAR_P99_RATIO}x) {}",
-        if pass { "PASS" } else { "FAIL (recorded — compare the ratio across tiers to see WHERE isolation broke)" }
+        if pass {
+            "PASS"
+        } else {
+            "FAIL (recorded — compare the ratio across tiers to see WHERE isolation broke)"
+        }
     );
 
     // ── Artifact ─────────────────────────────────────────────────────────────

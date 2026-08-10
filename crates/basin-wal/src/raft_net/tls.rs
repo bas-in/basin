@@ -157,7 +157,6 @@ fn env_opt(key: &str) -> Option<String> {
 }
 
 fn read_pem(path: &str, key: &str) -> Result<Vec<u8>> {
-    std::fs::read(path).map_err(|e| {
-        BasinError::wal(format!("raft mTLS: read {key} from '{path}': {e}"))
-    })
+    std::fs::read(path)
+        .map_err(|e| BasinError::wal(format!("raft mTLS: read {key} from '{path}': {e}")))
 }

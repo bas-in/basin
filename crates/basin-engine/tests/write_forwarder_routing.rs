@@ -28,8 +28,7 @@ use async_trait::async_trait;
 use basin_common::{BasinError, ProjectId, Result};
 use basin_engine::region::{ForwardContext, WriteForwarder};
 use basin_engine::write_forwarder::{
-    CeilingAccounting, ForwardClient, ForwardMode, ForwardRoute, PeerRegistry,
-    RegionWriteForwarder,
+    CeilingAccounting, ForwardClient, ForwardMode, ForwardRoute, PeerRegistry, RegionWriteForwarder,
 };
 use basin_engine::ExecResult;
 
@@ -74,9 +73,15 @@ impl ForwardClient for NoopClient {
 #[tokio::test]
 async fn off_mode_non_home_write_is_wrong_region() {
     let f = fwd(ForwardMode::Off, "");
-    match f.forward_write(ctx("fra", "jnb", "INSERT INTO t VALUES (1)")).await {
+    match f
+        .forward_write(ctx("fra", "jnb", "INSERT INTO t VALUES (1)"))
+        .await
+    {
         Err(BasinError::WrongRegion(msg)) => {
-            assert!(msg.contains("fra") && msg.contains("jnb"), "names both regions");
+            assert!(
+                msg.contains("fra") && msg.contains("jnb"),
+                "names both regions"
+            );
         }
         other => panic!("off mode must be WrongRegion, got {other:?}"),
     }
@@ -98,7 +103,10 @@ async fn fly_replay_non_home_write_yields_replay_directive() {
     match f.forward_write(ctx("fra", "jnb", "UPDATE t SET a=1")).await {
         Err(BasinError::ForwardReplay { home_region, token }) => {
             assert_eq!(home_region, "fra", "replay targets the home region");
-            assert!(token.starts_with("jnb-"), "token carries the originating region");
+            assert!(
+                token.starts_with("jnb-"),
+                "token carries the originating region"
+            );
         }
         other => panic!("fly-replay must be ForwardReplay, got {other:?}"),
     }
@@ -134,7 +142,9 @@ async fn http_forward_routes_to_correct_peer() {
             sql: &str,
         ) -> Result<ExecResult> {
             *self.0.lock().unwrap() = Some(format!("{base_url}|{sql}"));
-            Ok(ExecResult::Empty { tag: "UPDATE 1".into() })
+            Ok(ExecResult::Empty {
+                tag: "UPDATE 1".into(),
+            })
         }
     }
     let rec = Arc::new(Recorder(Mutex::new(None)));
@@ -160,10 +170,16 @@ async fn http_forward_routes_to_correct_peer() {
 #[tokio::test]
 async fn http_forward_unknown_region_is_typed_error() {
     let f = fwd(ForwardMode::HttpForward, "fra@h-fra:5432"); // NoopClient panics if called
-    match f.forward_write(ctx("sin", "jnb", "INSERT INTO t VALUES (1)")).await {
+    match f
+        .forward_write(ctx("sin", "jnb", "INSERT INTO t VALUES (1)"))
+        .await
+    {
         Err(BasinError::WrongRegion(msg)) => {
             assert!(msg.contains("sin"), "names the unrouteable region");
-            assert!(msg.contains("BASIN_REGION_PEERS"), "points at the missing config");
+            assert!(
+                msg.contains("BASIN_REGION_PEERS"),
+                "points at the missing config"
+            );
         }
         other => panic!("unknown peer must be a typed WrongRegion, got {other:?}"),
     }
@@ -187,7 +203,10 @@ fn home_equals_local_is_a_gate_responsibility_not_the_forwarders() {
     let r = f.route(ProjectId::new(), "jnb", "jnb", "jnb-0").unwrap();
     assert_eq!(
         r,
-        ForwardRoute::Replay { home_region: "jnb".into(), token: "jnb-0".into() },
+        ForwardRoute::Replay {
+            home_region: "jnb".into(),
+            token: "jnb-0".into()
+        },
         "self-target is detectable (gate short-circuits before this in practice)"
     );
 }

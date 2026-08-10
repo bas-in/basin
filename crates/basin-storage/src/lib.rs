@@ -15,19 +15,19 @@
 pub mod backends;
 pub mod bucket_pool;
 mod concurrency;
-pub mod index;
 mod data_file;
 mod disk_cache;
 pub mod encryption;
 pub mod encryption_static;
+pub mod index;
 #[cfg(any(test, feature = "test-helpers"))]
 mod latency_store;
 mod metadata_cache;
 mod page_cache;
 mod paths;
 mod predicate;
-mod retry_store;
 mod reader;
+mod retry_store;
 mod scheduler;
 mod stripe_router_store;
 mod tier;
@@ -48,6 +48,7 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::sync::Semaphore;
 
 pub use basin_catalog::ProjectStorageConfig;
+pub use concurrency::with_background_io;
 pub use data_file::{ColumnStats, DataFile};
 pub use disk_cache::{DiskCacheConfig, DiskCacheCounters, DiskCachedStore};
 pub use encryption::{EncryptionProvider, WrappedKey};
@@ -59,7 +60,6 @@ pub use predicate::{
     evaluate as evaluate_predicate, evaluate_compound, evaluate_compound_for_pruning,
     CompoundPredicate, Predicate, PruneOutcome, ScalarValue,
 };
-pub use concurrency::with_background_io;
 pub use scheduler::{ProjectIoStats, Scheduler, DEFAULT_GLOBAL_BUDGET};
 pub use tier::Tier;
 pub use vector_index::{vector_index_segment_key_for_data_file, VectorHit};
@@ -269,7 +269,10 @@ pub fn resolve_project_state_ttl_secs() -> Option<u64> {
     match std::env::var("BASIN_STORAGE_PROJECT_STATE_TTL_SECS") {
         Ok(v) => {
             let trimmed = v.trim();
-            if matches!(trimmed.to_ascii_lowercase().as_str(), "0" | "off" | "disabled") {
+            if matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "0" | "off" | "disabled"
+            ) {
                 None
             } else if let Ok(n) = trimmed.parse::<u64>() {
                 Some(n)
@@ -899,7 +902,12 @@ impl Storage {
         // exact key space the storage layer writes — instead of a root-less
         // `projects/{project}/…` that would never match real data when a root
         // prefix (e.g. `mn5`) is configured.
-        pool.set_default_root_prefix(self.inner.root_prefix.as_ref().map(|p| p.as_ref().to_string()));
+        pool.set_default_root_prefix(
+            self.inner
+                .root_prefix
+                .as_ref()
+                .map(|p| p.as_ref().to_string()),
+        );
         let _ = self.inner.bucket_pool.set(pool);
     }
 
@@ -1745,7 +1753,8 @@ impl Storage {
         batch: &RecordBatch,
         opts: &WriteOptions,
     ) -> Result<DataFile> {
-        let df = writer::write_batch_with_options(self, project, table, partition, batch, opts).await?;
+        let df =
+            writer::write_batch_with_options(self, project, table, partition, batch, opts).await?;
         // A file EXISTS the moment it is written, but it is not in the catalog
         // until its commit lands. `pk_candidate_files` sources the PK check from
         // the catalog (zero RPCs) instead of a per-batch LIST, so it needs this
@@ -1772,7 +1781,6 @@ impl Storage {
             entry.insert(OVERFLOW_SENTINEL.to_string(), df.clone());
         }
     }
-
 
     /// The files this process wrote that the catalog has not yet reported live.
     fn uncommitted_files_for(&self, project: &ProjectId, table: &TableName) -> Vec<DataFile> {
@@ -2031,7 +2039,11 @@ impl Storage {
         let built = reader::list_data_files_with_stats(self, project, table).await?;
         if let Some(e) = epoch {
             let mut map = self.inner.list_stats_memo.lock().expect("memo poisoned");
-            memo_insert_bounded(&mut map, (*project, table.clone()), (e, Arc::new(built.clone())));
+            memo_insert_bounded(
+                &mut map,
+                (*project, table.clone()),
+                (e, Arc::new(built.clone())),
+            );
         }
         Ok(built)
     }
@@ -2246,8 +2258,7 @@ impl Storage {
                 // Key by the recovered partition id; per-partition groups are a
                 // safe over-partitioning (one bucket may hold several
                 // partitions, but each group still targets the correct bucket).
-                let key = paths::partition_id_from_data_file_key(p.as_ref())
-                    .unwrap_or_default();
+                let key = paths::partition_id_from_data_file_key(p.as_ref()).unwrap_or_default();
                 by_partition_slot.entry(key).or_default().push(p.clone());
             }
             for (_pid, group) in by_partition_slot {
@@ -2872,9 +2883,9 @@ mod tests {
         // Advance halfway through the TTL: nothing should be stale yet.
         super::set_project_state_now_secs(2000 + super::DEFAULT_PROJECT_STATE_TTL_SECS / 2);
         let _ = s.project_semaphore(&warm); // bump warm
-        // Advance the rest of the way past TTL relative to the initial
-        // insert (2000). `cold` is now stale (last_touched=2000),
-        // `warm` is still fresh (last_touched=2000+ttl/2).
+                                            // Advance the rest of the way past TTL relative to the initial
+                                            // insert (2000). `cold` is now stale (last_touched=2000),
+                                            // `warm` is still fresh (last_touched=2000+ttl/2).
         super::set_project_state_now_secs(2000 + super::DEFAULT_PROJECT_STATE_TTL_SECS + 1);
         // Trigger sweep via a new insert.
         let _ = s.project_semaphore(&ProjectId::new());
@@ -3335,7 +3346,10 @@ mod tests {
             let catalog0 = Arc::new(InMemoryCatalog::new());
             s0.attach_catalog(catalog0.clone());
             catalog0.create_namespace(&project).await.unwrap();
-            catalog0.create_table(&project, &table, &small_schema()).await.unwrap();
+            catalog0
+                .create_table(&project, &table, &small_schema())
+                .await
+                .unwrap();
             s0.write_batch(&project, &table, &part, &small_batch(0, 3, "old-"))
                 .await
                 .unwrap();
@@ -3345,7 +3359,10 @@ mod tests {
         let catalog = Arc::new(InMemoryCatalog::new());
         s.attach_catalog(catalog.clone());
         catalog.create_namespace(&project).await.unwrap();
-        catalog.create_table(&project, &table, &small_schema()).await.unwrap();
+        catalog
+            .create_table(&project, &table, &small_schema())
+            .await
+            .unwrap();
 
         // Warm the candidate set FIRST, so the one-time orphan LIST is already
         // taken. Only the uncommitted-write tracking can cover a file written
@@ -3437,7 +3454,10 @@ mod tests {
             listed.len(),
             2,
             "lister must enumerate the object store, not the catalog: {:?}",
-            listed.iter().map(|f| f.path.to_string()).collect::<Vec<_>>()
+            listed
+                .iter()
+                .map(|f| f.path.to_string())
+                .collect::<Vec<_>>()
         );
         assert!(
             !listed.iter().any(|f| f.path.as_ref() == ghost),
@@ -3492,7 +3512,11 @@ mod tests {
             .await
             .unwrap();
         let after_a = s.catalog_data_files(&project, &table).await.unwrap();
-        assert_eq!(after_a.len(), 1, "memo warm: one file after the first append");
+        assert_eq!(
+            after_a.len(),
+            1,
+            "memo warm: one file after the first append"
+        );
         // A repeat call at the SAME epoch is a hit and returns the same set.
         let hit = s.catalog_data_files(&project, &table).await.unwrap();
         assert_eq!(hit.len(), 1, "same-epoch repeat must still be correct");
@@ -3532,10 +3556,7 @@ mod tests {
         }
 
         fn set_meta(&self, project: ProjectId, meta: basin_catalog::ProjectMetadata) {
-            self.project_meta
-                .lock()
-                .unwrap()
-                .insert(project, meta);
+            self.project_meta.lock().unwrap().insert(project, meta);
         }
 
         fn was_dropped(&self, project: &ProjectId) -> bool {
@@ -3545,24 +3566,79 @@ mod tests {
 
     #[async_trait::async_trait]
     impl basin_catalog::Catalog for ByoCatalog {
-        async fn create_namespace(&self, _p: &ProjectId) -> basin_common::Result<()> { Ok(()) }
+        async fn create_namespace(&self, _p: &ProjectId) -> basin_common::Result<()> {
+            Ok(())
+        }
         async fn drop_namespace(&self, p: &ProjectId) -> basin_common::Result<()> {
             self.dropped.lock().unwrap().push(*p);
             Ok(())
         }
-        async fn create_table(&self, _p: &ProjectId, _t: &TableName, _schema: &arrow_schema::Schema) -> basin_common::Result<basin_catalog::TableMetadata> { unimplemented!() }
-        async fn load_table(&self, _p: &ProjectId, _t: &TableName) -> basin_common::Result<basin_catalog::TableMetadata> { unimplemented!() }
-        async fn drop_table(&self, _p: &ProjectId, _t: &TableName) -> basin_common::Result<()> { Ok(()) }
-        async fn list_tables(&self, _p: &ProjectId) -> basin_common::Result<Vec<TableName>> { Ok(vec![]) }
-        async fn append_data_files(&self, _p: &ProjectId, _t: &TableName, _exp: basin_catalog::SnapshotId, _files: Vec<basin_catalog::DataFileRef>) -> basin_common::Result<basin_catalog::TableMetadata> { unimplemented!() }
-        async fn replace_data_files(&self, _p: &ProjectId, _t: &TableName, _exp: basin_catalog::SnapshotId, _removed: Vec<String>, _added: Vec<basin_catalog::DataFileRef>) -> basin_common::Result<basin_catalog::TableMetadata> { unimplemented!() }
-        async fn list_snapshots(&self, _p: &ProjectId, _t: &TableName) -> basin_common::Result<Vec<basin_catalog::Snapshot>> { Ok(vec![]) }
-        async fn set_partition_spec(&self, _p: &ProjectId, _t: &TableName, _spec: basin_catalog::PartitionSpec) -> basin_common::Result<()> { Ok(()) }
-        async fn list_project_data_files(&self, _p: &ProjectId) -> basin_common::Result<Vec<basin_catalog::DataFileRef>> {
+        async fn create_table(
+            &self,
+            _p: &ProjectId,
+            _t: &TableName,
+            _schema: &arrow_schema::Schema,
+        ) -> basin_common::Result<basin_catalog::TableMetadata> {
+            unimplemented!()
+        }
+        async fn load_table(
+            &self,
+            _p: &ProjectId,
+            _t: &TableName,
+        ) -> basin_common::Result<basin_catalog::TableMetadata> {
+            unimplemented!()
+        }
+        async fn drop_table(&self, _p: &ProjectId, _t: &TableName) -> basin_common::Result<()> {
+            Ok(())
+        }
+        async fn list_tables(&self, _p: &ProjectId) -> basin_common::Result<Vec<TableName>> {
+            Ok(vec![])
+        }
+        async fn append_data_files(
+            &self,
+            _p: &ProjectId,
+            _t: &TableName,
+            _exp: basin_catalog::SnapshotId,
+            _files: Vec<basin_catalog::DataFileRef>,
+        ) -> basin_common::Result<basin_catalog::TableMetadata> {
+            unimplemented!()
+        }
+        async fn replace_data_files(
+            &self,
+            _p: &ProjectId,
+            _t: &TableName,
+            _exp: basin_catalog::SnapshotId,
+            _removed: Vec<String>,
+            _added: Vec<basin_catalog::DataFileRef>,
+        ) -> basin_common::Result<basin_catalog::TableMetadata> {
+            unimplemented!()
+        }
+        async fn list_snapshots(
+            &self,
+            _p: &ProjectId,
+            _t: &TableName,
+        ) -> basin_common::Result<Vec<basin_catalog::Snapshot>> {
+            Ok(vec![])
+        }
+        async fn set_partition_spec(
+            &self,
+            _p: &ProjectId,
+            _t: &TableName,
+            _spec: basin_catalog::PartitionSpec,
+        ) -> basin_common::Result<()> {
+            Ok(())
+        }
+        async fn list_project_data_files(
+            &self,
+            _p: &ProjectId,
+        ) -> basin_common::Result<Vec<basin_catalog::DataFileRef>> {
             // Return empty list so delete_project fast-paths to an empty bulk delete.
             Ok(vec![])
         }
-        async fn get_project_metadata(&self, p: &ProjectId) -> basin_common::Result<basin_catalog::ProjectMetadata> {
+        async fn get_project_metadata(
+            &self,
+            p: &ProjectId,
+        ) -> basin_common::Result<basin_catalog::ProjectMetadata> {
             Ok(self
                 .project_meta
                 .lock()
@@ -3634,13 +3710,14 @@ mod tests {
             use futures::StreamExt;
             let counter = self.deletes.clone();
             let inner = self.inner.clone();
-            let counted: BoxStream<'static, object_store::Result<ObjectPath>> =
-                locations.map(move |r| {
+            let counted: BoxStream<'static, object_store::Result<ObjectPath>> = locations
+                .map(move |r| {
                     if r.is_ok() {
                         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     r
-                }).boxed();
+                })
+                .boxed();
             inner.delete_stream(counted)
         }
         fn list(
@@ -3688,7 +3765,10 @@ mod tests {
             .unwrap();
 
         // Because the spy's inner InMemory received the PUT we can read it back.
-        let stream = s.read(&project, &table, ReadOptions::default()).await.unwrap();
+        let stream = s
+            .read(&project, &table, ReadOptions::default())
+            .await
+            .unwrap();
         let batches: Vec<_> = stream.collect::<Vec<_>>().await;
         let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
         assert_eq!(total, 5, "expected 5 rows read back from BYO store");
@@ -3736,10 +3816,16 @@ mod tests {
             .unwrap();
 
         // Reading back works (shared store has the data).
-        let stream = s.read(&project, &table, ReadOptions::default()).await.unwrap();
+        let stream = s
+            .read(&project, &table, ReadOptions::default())
+            .await
+            .unwrap();
         let batches: Vec<_> = stream.collect::<Vec<_>>().await;
         let total: usize = batches.iter().map(|b| b.as_ref().unwrap().num_rows()).sum();
-        assert_eq!(total, 3, "expected 3 rows from shared store after deregister");
+        assert_eq!(
+            total, 3,
+            "expected 3 rows from shared store after deregister"
+        );
     }
 
     /// T-051: `delete_project_byo_aware` must NOT issue any DELETE to the BYO
@@ -3785,7 +3871,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(deleted, 0, "BYO deletion must return 0 (no objects removed)");
+        assert_eq!(
+            deleted, 0,
+            "BYO deletion must return 0 (no objects removed)"
+        );
         assert_eq!(
             spy.delete_count(),
             deletes_before,
@@ -3826,7 +3915,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(deleted >= 2, "at least the 2 data files must be deleted; got {deleted}");
+        assert!(
+            deleted >= 2,
+            "at least the 2 data files must be deleted; got {deleted}"
+        );
         assert!(
             catalog.was_dropped(&project),
             "catalog namespace must be dropped"

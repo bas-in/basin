@@ -169,19 +169,17 @@ pub async fn time_exec(client: &tokio_postgres::Client, sql: &str) -> Result<Dur
 }
 
 /// Measure wall time of a query and return its first column of first row as f64.
-pub async fn time_query_f64(
-    client: &tokio_postgres::Client,
-    sql: &str,
-) -> Result<(f64, Duration)> {
+pub async fn time_query_f64(client: &tokio_postgres::Client, sql: &str) -> Result<(f64, Duration)> {
     let t0 = Instant::now();
     let row = client
         .query_one(sql, &[])
         .await
         .with_context(|| format!("query_one: {}", &sql[..sql.len().min(80)]))?;
     let elapsed = t0.elapsed();
-    let val: f64 = row.try_get::<_, i64>(0).map(|v| v as f64).unwrap_or_else(|_| {
-        row.try_get::<_, f64>(0).unwrap_or(0.0)
-    });
+    let val: f64 = row
+        .try_get::<_, i64>(0)
+        .map(|v| v as f64)
+        .unwrap_or_else(|_| row.try_get::<_, f64>(0).unwrap_or(0.0));
     Ok((val, elapsed))
 }
 

@@ -118,12 +118,7 @@ fn registry_has_tombstone(
 
 /// True iff the registry entry for `(project, table)` holds an `Update`
 /// for `pk`.
-fn registry_has_update(
-    engine: &Engine,
-    project: &ProjectId,
-    table: &TableName,
-    pk: i64,
-) -> bool {
+fn registry_has_update(engine: &Engine, project: &ProjectId, table: &TableName, pk: i64) -> bool {
     let Some(entry) = engine.memtable_registry().get(project, table) else {
         return false;
     };
@@ -148,11 +143,7 @@ async fn seed(sess: &ProjectSession, table: &str, n: i64) {
         .map(|k| format!("({k}, {})", k * 10))
         .collect::<Vec<_>>()
         .join(",");
-    exec(
-        sess,
-        &format!("INSERT INTO {table} (id, v) VALUES {vals}"),
-    )
-    .await;
+    exec(sess, &format!("INSERT INTO {table} (id, v) VALUES {vals}")).await;
 }
 
 /// `SELECT COUNT(*) FROM t` → i64.
@@ -351,7 +342,11 @@ async fn gate_returning_update_plain_fast_expression_slow() {
         "expression RETURNING must NOT take the fastpath"
     );
     let v2 = fetch_v(&sess, "t", 2).await;
-    assert_eq!(v2, Some(7), "expression-RETURNING UPDATE must apply the value");
+    assert_eq!(
+        v2,
+        Some(7),
+        "expression-RETURNING UPDATE must apply the value"
+    );
 
     let batches = match res {
         ExecResult::Rows { batches, .. } => batches,
@@ -385,7 +380,11 @@ async fn gate_multi_col_pk_delete_goes_slow() {
     )
     .await;
     for k in 1i64..=5 {
-        exec(&sess, &format!("INSERT INTO mc (a, b, v) VALUES ({k}, {k}, {})", k * 10)).await;
+        exec(
+            &sess,
+            &format!("INSERT INTO mc (a, b, v) VALUES ({k}, {k}, {})", k * 10),
+        )
+        .await;
     }
 
     exec(&sess, "DELETE FROM mc WHERE a = 2 AND b = 2").await;
@@ -407,7 +406,10 @@ async fn gate_multi_col_pk_delete_goes_slow() {
 
     // Functional: the row is gone.
     let n = count_all(&sess, "mc").await;
-    assert_eq!(n, 4, "DELETE on multi-col PK must remove the row; count={n}");
+    assert_eq!(
+        n, 4,
+        "DELETE on multi-col PK must remove the row; count={n}"
+    );
 }
 
 /// Table with composite PK — UPDATE must go slow.
@@ -428,7 +430,11 @@ async fn gate_multi_col_pk_update_goes_slow() {
     )
     .await;
     for k in 1i64..=5 {
-        exec(&sess, &format!("INSERT INTO mc (a, b, v) VALUES ({k}, {k}, {})", k * 10)).await;
+        exec(
+            &sess,
+            &format!("INSERT INTO mc (a, b, v) VALUES ({k}, {k}, {})", k * 10),
+        )
+        .await;
     }
 
     exec(&sess, "UPDATE mc SET v = 9999 WHERE a = 3 AND b = 3").await;
@@ -613,7 +619,11 @@ async fn gate_soft_delete_column_update_goes_slow() {
     );
 
     let v = fetch_v(&sess, "t", 2).await;
-    assert_eq!(v, Some(8888), "UPDATE on soft-delete table must still apply");
+    assert_eq!(
+        v,
+        Some(8888),
+        "UPDATE on soft-delete table must still apply"
+    );
 }
 
 // ── Gate 6: audit_table ───────────────────────────────────────────────────────
@@ -743,7 +753,10 @@ async fn gate_update_reactor_delete_goes_slow() {
     );
 
     let n = count_all(&sess, "t").await;
-    assert_eq!(n, 4, "DELETE with reactor must still remove the row; count={n}");
+    assert_eq!(
+        n, 4,
+        "DELETE with reactor must still remove the row; count={n}"
+    );
 }
 
 /// Table with an UPDATE reactor → UPDATE fastpath skipped.
@@ -783,7 +796,11 @@ async fn gate_update_reactor_update_goes_slow() {
     );
 
     let v = fetch_v(&sess, "t", 3).await;
-    assert_eq!(v, Some(6666), "UPDATE with reactor must still apply the value");
+    assert_eq!(
+        v,
+        Some(6666),
+        "UPDATE with reactor must still apply the value"
+    );
 }
 
 /// DML-flags cache self-heal: a fast-path UPDATE warms the per-session
@@ -965,7 +982,11 @@ async fn gate_predicate_not_pk_eq_update_large_set_goes_cold() {
 
     // Functional: the 70 matched rows were rewritten (cold path), the rest are
     // untouched.
-    assert_eq!(fetch_v(&sess, "t", 70).await, Some(0), "id=70 rewritten via cold CoW");
+    assert_eq!(
+        fetch_v(&sess, "t", 70).await,
+        Some(0),
+        "id=70 rewritten via cold CoW"
+    );
     assert_eq!(fetch_v(&sess, "t", 71).await, Some(710), "id=71 untouched");
     assert_eq!(count_all(&sess, "t").await, 100, "COUNT stable");
 }

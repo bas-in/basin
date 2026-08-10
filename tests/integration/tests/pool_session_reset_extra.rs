@@ -238,7 +238,9 @@ async fn discard_all_sql_resets_search_path() {
 
     let leased = pool.acquire(project, None).await.unwrap();
     let s = leased.session();
-    s.execute("SET search_path = 'discard_sentinel'").await.unwrap();
+    s.execute("SET search_path = 'discard_sentinel'")
+        .await
+        .unwrap();
     s.execute("DISCARD ALL").await.unwrap();
     let shown = s.execute("SHOW search_path").await.unwrap();
     assert!(

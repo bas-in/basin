@@ -822,11 +822,9 @@ async fn groups_1_preceding_current_row() {
     s.execute("CREATE TABLE scores (id BIGINT NOT NULL, score BIGINT NOT NULL)")
         .await
         .unwrap();
-    s.execute(
-        "INSERT INTO scores VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)",
-    )
-    .await
-    .unwrap();
+    s.execute("INSERT INTO scores VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)")
+        .await
+        .unwrap();
 
     let res = s
         .execute(
@@ -867,11 +865,9 @@ async fn groups_unbounded_preceding_current_row() {
     s.execute("CREATE TABLE scores2 (id BIGINT NOT NULL, score BIGINT NOT NULL)")
         .await
         .unwrap();
-    s.execute(
-        "INSERT INTO scores2 VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)",
-    )
-    .await
-    .unwrap();
+    s.execute("INSERT INTO scores2 VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)")
+        .await
+        .unwrap();
 
     let res = s
         .execute(

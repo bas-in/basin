@@ -263,7 +263,9 @@ async fn add_unique_constraint_unnamed_synthesises_pg_name() {
     sess.execute("INSERT INTO t (id, email) VALUES (1, NULL), (2, NULL)")
         .await
         .unwrap();
-    sess.execute("ALTER TABLE t ADD UNIQUE (email)").await.unwrap();
+    sess.execute("ALTER TABLE t ADD UNIQUE (email)")
+        .await
+        .unwrap();
     let meta = eng
         .config()
         .catalog
@@ -296,7 +298,9 @@ async fn add_unique_constraint_unknown_column_errors_and_drop_removes() {
     sess.execute("ALTER TABLE t ADD CONSTRAINT u UNIQUE (email)")
         .await
         .unwrap();
-    sess.execute("ALTER TABLE t DROP CONSTRAINT u").await.unwrap();
+    sess.execute("ALTER TABLE t DROP CONSTRAINT u")
+        .await
+        .unwrap();
     let meta = eng
         .config()
         .catalog

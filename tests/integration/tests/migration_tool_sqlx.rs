@@ -111,8 +111,8 @@ fn sqlx_available() -> bool {
 
 /// Absolute path to the sqlx fixture directory.
 fn fixture_dir() -> PathBuf {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR must be set by cargo test");
+    let manifest =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by cargo test");
     PathBuf::from(manifest)
         .join("fixtures")
         .join("migration-tool-scaffold")
@@ -125,7 +125,11 @@ fn fixture_dir() -> PathBuf {
 /// the fixture directory.
 ///
 /// Returns `(stdout, stderr, success)`.
-fn run_sqlx_migrate(database_url: &str, source_dir: &PathBuf, args: &[&str]) -> (String, String, bool) {
+fn run_sqlx_migrate(
+    database_url: &str,
+    source_dir: &PathBuf,
+    args: &[&str],
+) -> (String, String, bool) {
     let output = Command::new("sqlx")
         .arg("migrate")
         .args(args)
@@ -182,9 +186,7 @@ async fn sqlx_migrate_run_revert() {
     let port = server.addr.port();
     let user = &server.project_slug;
 
-    println!(
-        "[sqlx] Basin in-process server at 127.0.0.1:{port}, user={user}"
-    );
+    println!("[sqlx] Basin in-process server at 127.0.0.1:{port}, user={user}");
 
     // ── Locate fixture directory ───────────────────────────────────────────────
     let source_dir = fixture_dir();
@@ -196,9 +198,7 @@ async fn sqlx_migrate_run_revert() {
 
     // sqlx-cli uses postgres:// DSN via DATABASE_URL.
     // sslmode=disable is required because the in-process Basin server has no TLS.
-    let db_url = format!(
-        "postgres://{user}:ignored@127.0.0.1:{port}/basin?sslmode=disable"
-    );
+    let db_url = format!("postgres://{user}:ignored@127.0.0.1:{port}/basin?sslmode=disable");
 
     // ── (a) sqlx migrate run ──────────────────────────────────────────────────
     //
@@ -211,8 +211,7 @@ async fn sqlx_migrate_run_revert() {
     //
     // We capture output and print it regardless so CI logs show the exact
     // error when Basin rejects a statement.
-    let (stdout_run, stderr_run, success_run) =
-        run_sqlx_migrate(&db_url, &source_dir, &["run"]);
+    let (stdout_run, stderr_run, success_run) = run_sqlx_migrate(&db_url, &source_dir, &["run"]);
     println!("[sqlx migrate run stdout]\n{stdout_run}");
     if !stderr_run.is_empty() {
         eprintln!("[sqlx migrate run stderr]\n{stderr_run}");

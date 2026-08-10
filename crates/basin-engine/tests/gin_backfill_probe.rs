@@ -95,7 +95,11 @@ async fn gin_create_index_backfills_preexisting_shard_files() {
             }
             values.push_str(&format!("({id}, '{{\"kind\":\"{kind}\"}}')"));
         }
-        exec_ok(&sess, &format!("INSERT INTO docs (id, body) VALUES {values}")).await;
+        exec_ok(
+            &sess,
+            &format!("INSERT INTO docs (id, body) VALUES {values}"),
+        )
+        .await;
     }
 
     // Flush the shard tail into cold-tier files BEFORE the index exists. This
@@ -117,7 +121,10 @@ async fn gin_create_index_backfills_preexisting_shard_files() {
         .iter()
         .map(|f| f.path.to_string())
         .collect();
-    assert!(!live_before.is_empty(), "must have flushed at least one file");
+    assert!(
+        !live_before.is_empty(),
+        "must have flushed at least one file"
+    );
     let rg = eng.gin_rowgroup_registry_for_test();
     let any_sealed_before = live_before
         .iter()
@@ -156,7 +163,10 @@ async fn gin_create_index_backfills_preexisting_shard_files() {
         "SELECT id FROM docs WHERE body @> '{\"kind\":\"a\"}'",
     )
     .await;
-    assert_eq!(matches, 5_000, "@> must return all matching rows post-backfill");
+    assert_eq!(
+        matches, 5_000,
+        "@> must return all matching rows post-backfill"
+    );
 }
 
 /// A query for a value that exists in only some files still returns correct

@@ -87,9 +87,9 @@ async fn ids(sess: &ProjectSession, table: &str) -> Vec<i32> {
     let mut out = Vec::new();
     for b in &batches {
         if let Some(arr) = b.column_by_name("id").and_then(|c| {
-            c.as_any().downcast_ref::<Int32Array>().map(|a| {
-                (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
-            })
+            c.as_any()
+                .downcast_ref::<Int32Array>()
+                .map(|a| (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>())
         }) {
             out.extend(arr);
         }
@@ -114,7 +114,11 @@ async fn htap_insert_commit_visible() {
     }
     exec(&sess, "COMMIT").await;
 
-    assert_eq!(count_rows(&sess, "t").await, 100, "all 100 rows must be visible after COMMIT");
+    assert_eq!(
+        count_rows(&sess, "t").await,
+        100,
+        "all 100 rows must be visible after COMMIT"
+    );
 }
 
 /// INSERT 50 rows then ROLLBACK.  A subsequent SELECT must see 0 rows.
@@ -131,7 +135,11 @@ async fn htap_insert_rollback_invisible() {
     }
     exec(&sess, "ROLLBACK").await;
 
-    assert_eq!(count_rows(&sess, "t").await, 0, "ROLLBACK must leave 0 rows visible");
+    assert_eq!(
+        count_rows(&sess, "t").await,
+        0,
+        "ROLLBACK must leave 0 rows visible"
+    );
 }
 
 /// BEGIN + insert 30 rows.  The same session must see 30 rows during the open
@@ -155,7 +163,11 @@ async fn htap_in_tx_visibility_same_session() {
         "same-session SELECT count(*) must see 30 uncommitted rows"
     );
     exec(&sess, "COMMIT").await;
-    assert_eq!(count_rows(&sess, "t").await, 30, "after COMMIT must still see 30 rows");
+    assert_eq!(
+        count_rows(&sess, "t").await,
+        30,
+        "after COMMIT must still see 30 rows"
+    );
 }
 
 /// Cross-session isolation: a second session opened for a DIFFERENT project
@@ -247,7 +259,11 @@ async fn htap_budget_enforcement_hard_cap() {
 
     // Fill the project up to the hard cap.
     let outcome = reg.try_reserve_bytes(&proj, cap_bytes);
-    assert_ne!(outcome, ReservationOutcome::HardCapReached, "first reservation must succeed");
+    assert_ne!(
+        outcome,
+        ReservationOutcome::HardCapReached,
+        "first reservation must succeed"
+    );
 
     // The next byte must hit the hard cap.
     assert_eq!(
@@ -316,8 +332,14 @@ async fn htap_multi_project_largest_project() {
     // Evict the largest; verify its project counter is reset.
     let largest = reg.largest_project().expect("must have a largest project");
     let bytes_before = reg.project_bytes(&largest);
-    assert_eq!(bytes_before, per_project, "largest project must have per_project bytes");
+    assert_eq!(
+        bytes_before, per_project,
+        "largest project must have per_project bytes"
+    );
     reg.remove_project(&largest);
     let bytes_after = reg.project_bytes(&largest);
-    assert_eq!(bytes_after, 0, "remove_project must reset the project's byte counter");
+    assert_eq!(
+        bytes_after, 0,
+        "remove_project must reset the project's byte counter"
+    );
 }

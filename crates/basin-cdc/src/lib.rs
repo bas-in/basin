@@ -77,13 +77,13 @@ use basin_storage::Storage;
 use tokio::sync::Mutex;
 
 pub use gc::{run_once as gc_run_once, spawn_retention_gc, RetentionGc};
-pub use kafka::{
-    build_records, mint_sink_id, partition_key_bytes, spawn_kafka_dispatcher,
-    spawn_kafka_supervisor_with_producer, KafkaConfig, KafkaDispatcher, KafkaProducer,
-    KafkaRecord, KafkaSupervisor,
-};
 #[cfg(feature = "cdc-kafka")]
 pub use kafka::spawn_kafka_supervisor;
+pub use kafka::{
+    build_records, mint_sink_id, partition_key_bytes, spawn_kafka_dispatcher,
+    spawn_kafka_supervisor_with_producer, KafkaConfig, KafkaDispatcher, KafkaProducer, KafkaRecord,
+    KafkaSupervisor,
+};
 pub use live::{LiveRegistry, LIVE_CHANNEL_CAPACITY};
 pub use record::{CdcRecord, CdcSseFrame};
 pub use ring::{CdcIndex, ProjectRing, SEGMENT_MAX_BYTES, SEGMENT_MAX_RECORDS};
@@ -131,7 +131,9 @@ impl CdcConfig {
     /// maximum of 7 days.
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
-        if let Some(h) = std::env::var(RETENTION_HOURS_ENV).ok().and_then(|s| s.parse::<u64>().ok())
+        if let Some(h) = std::env::var(RETENTION_HOURS_ENV)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
         {
             let h = h.clamp(1, MAX_RETENTION_HOURS);
             cfg.retention = Duration::from_secs(h * 3600);
@@ -314,7 +316,9 @@ impl ChangeEventSink for CdcRingWriter {
             let mut bufs = self.buffers.lock().await;
             let buf = bufs.entry(event.project).or_default();
             // Estimate encoded size cheaply (record + newline framing).
-            let est = serde_json::to_vec(rec.as_ref()).map(|b| b.len() + 1).unwrap_or(256);
+            let est = serde_json::to_vec(rec.as_ref())
+                .map(|b| b.len() + 1)
+                .unwrap_or(256);
             buf.pending.push((*rec).clone());
             buf.pending_bytes += est;
             buf.pending.len() >= SEGMENT_MAX_RECORDS || buf.pending_bytes >= SEGMENT_MAX_BYTES
@@ -478,7 +482,9 @@ mod tests {
 
         // The cross-project sweep discovers both rings via the cdc/ prefix and
         // prunes each project's stale segment.
-        let deleted = crate::gc_run_once(&w, Duration::from_secs(3600)).await.unwrap();
+        let deleted = crate::gc_run_once(&w, Duration::from_secs(3600))
+            .await
+            .unwrap();
         assert_eq!(deleted, 2, "one stale segment pruned per project");
 
         for project in [a, b] {

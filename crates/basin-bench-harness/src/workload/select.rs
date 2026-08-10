@@ -64,10 +64,7 @@ pub async fn point_select(
         let s = samples.clone();
         set.spawn(async move {
             let mut rng = StdRng::seed_from_u64(DEFAULT_SEED ^ tid as u64);
-            let session = engine
-                .open_session(project)
-                .await
-                .expect("open session");
+            let session = engine.open_session(project).await.expect("open session");
             let mut errors: u64 = 0;
             let mut count: u64 = 0;
             for _ in 0..per_task {

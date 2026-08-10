@@ -57,65 +57,122 @@ pub(crate) fn rewrite_net_schema_functions(sql: &str) -> String {
 }
 
 #[derive(Debug)]
-struct NetHttpGetUdf { signature: Signature }
-impl PartialEq for NetHttpGetUdf { fn eq(&self, _o: &Self) -> bool { true } }
+struct NetHttpGetUdf {
+    signature: Signature,
+}
+impl PartialEq for NetHttpGetUdf {
+    fn eq(&self, _o: &Self) -> bool {
+        true
+    }
+}
 impl Eq for NetHttpGetUdf {}
-impl std::hash::Hash for NetHttpGetUdf { fn hash<H: std::hash::Hasher>(&self, _s: &mut H) {} }
+impl std::hash::Hash for NetHttpGetUdf {
+    fn hash<H: std::hash::Hasher>(&self, _s: &mut H) {}
+}
 impl ScalarUDFImpl for NetHttpGetUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "net_http_get" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "net_http_get"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let ScalarFunctionArgs { args, number_rows, .. } = args;
+        let ScalarFunctionArgs {
+            args, number_rows, ..
+        } = args;
         if args.len() != 1 {
-            return Err(DataFusionError::Execution(format!("net_http_get expects 1 arg, got {}", args.len())));
+            return Err(DataFusionError::Execution(format!(
+                "net_http_get expects 1 arg, got {}",
+                args.len()
+            )));
         }
         let url = net_scalar_utf8_req(&args[0], "url")?;
         let body = http_get_blocking(&url)?;
         let rows: Vec<Option<&str>> = vec![body.as_deref(); number_rows];
-        Ok(ColumnarValue::Array(Arc::new(StringArray::from(rows)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(StringArray::from(rows)) as ArrayRef
+        ))
     }
 }
 
 #[derive(Debug)]
-struct NetHttpPostUdf { signature: Signature }
-impl PartialEq for NetHttpPostUdf { fn eq(&self, _o: &Self) -> bool { true } }
+struct NetHttpPostUdf {
+    signature: Signature,
+}
+impl PartialEq for NetHttpPostUdf {
+    fn eq(&self, _o: &Self) -> bool {
+        true
+    }
+}
 impl Eq for NetHttpPostUdf {}
-impl std::hash::Hash for NetHttpPostUdf { fn hash<H: std::hash::Hasher>(&self, _s: &mut H) {} }
+impl std::hash::Hash for NetHttpPostUdf {
+    fn hash<H: std::hash::Hasher>(&self, _s: &mut H) {}
+}
 impl ScalarUDFImpl for NetHttpPostUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "net_http_post" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "net_http_post"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let ScalarFunctionArgs { args, number_rows, .. } = args;
+        let ScalarFunctionArgs {
+            args, number_rows, ..
+        } = args;
         if args.len() < 2 || args.len() > 3 {
-            return Err(DataFusionError::Execution(format!("net_http_post expects 2-3 args, got {}", args.len())));
+            return Err(DataFusionError::Execution(format!(
+                "net_http_post expects 2-3 args, got {}",
+                args.len()
+            )));
         }
         let url = net_scalar_utf8_req(&args[0], "url")?;
         let body = net_scalar_utf8_opt(&args[1], "body")?.unwrap_or_default();
         let ct = if args.len() == 3 {
-            net_scalar_utf8_opt(&args[2], "content_type")?.unwrap_or_else(|| "application/json".to_string())
-        } else { "application/json".to_string() };
+            net_scalar_utf8_opt(&args[2], "content_type")?
+                .unwrap_or_else(|| "application/json".to_string())
+        } else {
+            "application/json".to_string()
+        };
         let resp = http_post_blocking(&url, body, &ct)?;
         let rows: Vec<Option<&str>> = vec![resp.as_deref(); number_rows];
-        Ok(ColumnarValue::Array(Arc::new(StringArray::from(rows)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(StringArray::from(rows)) as ArrayRef
+        ))
     }
 }
 
 fn timeout_dur() -> Duration {
-    Duration::from_secs(std::env::var("BASIN_NET_TIMEOUT_SECS").ok()
-        .and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_TIMEOUT_SECS))
+    Duration::from_secs(
+        std::env::var("BASIN_NET_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_TIMEOUT_SECS),
+    )
 }
 fn max_body_bytes() -> usize {
-    std::env::var("BASIN_NET_MAX_BODY_BYTES").ok()
-        .and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_MAX_BODY_BYTES)
+    std::env::var("BASIN_NET_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_BODY_BYTES)
 }
 fn check_allow() -> DFResult<()> {
     if std::env::var("BASIN_NET_ALLOW_ANY_HOST").as_deref() != Ok("1") {
         return Err(DataFusionError::Execution(
-            "net UDFs: set BASIN_NET_ALLOW_ANY_HOST=1 to enable outbound HTTP (dev/test only).".into()));
+            "net UDFs: set BASIN_NET_ALLOW_ANY_HOST=1 to enable outbound HTTP (dev/test only)."
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -125,13 +182,26 @@ fn http_get_blocking(url: &str) -> DFResult<Option<String>> {
     let url = url.to_string();
     let (timeout, cap) = (timeout_dur(), max_body_bytes());
     tokio::runtime::Handle::current().block_on(async move {
-        let c = reqwest::Client::builder().timeout(timeout).user_agent("basin-net/0.1").build()
+        let c = reqwest::Client::builder()
+            .timeout(timeout)
+            .user_agent("basin-net/0.1")
+            .build()
             .map_err(|e| DataFusionError::Execution(format!("net_http_get: {e}")))?;
-        let resp = c.get(&url).send().await
+        let resp = c
+            .get(&url)
+            .send()
+            .await
             .map_err(|e| DataFusionError::Execution(format!("net_http_get: {e}")))?;
-        let bytes = resp.bytes().await
+        let bytes = resp
+            .bytes()
+            .await
             .map_err(|e| DataFusionError::Execution(format!("net_http_get body: {e}")))?;
-        if bytes.len() > cap { return Err(DataFusionError::Execution(format!("net_http_get: body {} > cap {cap}", bytes.len()))); }
+        if bytes.len() > cap {
+            return Err(DataFusionError::Execution(format!(
+                "net_http_get: body {} > cap {cap}",
+                bytes.len()
+            )));
+        }
         Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     })
 }
@@ -142,13 +212,28 @@ fn http_post_blocking(url: &str, body: String, content_type: &str) -> DFResult<O
     let ct = content_type.to_string();
     let (timeout, cap) = (timeout_dur(), max_body_bytes());
     tokio::runtime::Handle::current().block_on(async move {
-        let c = reqwest::Client::builder().timeout(timeout).user_agent("basin-net/0.1").build()
+        let c = reqwest::Client::builder()
+            .timeout(timeout)
+            .user_agent("basin-net/0.1")
+            .build()
             .map_err(|e| DataFusionError::Execution(format!("net_http_post: {e}")))?;
-        let resp = c.post(&url).header("content-type", &ct).body(body).send().await
+        let resp = c
+            .post(&url)
+            .header("content-type", &ct)
+            .body(body)
+            .send()
+            .await
             .map_err(|e| DataFusionError::Execution(format!("net_http_post: {e}")))?;
-        let bytes = resp.bytes().await
+        let bytes = resp
+            .bytes()
+            .await
             .map_err(|e| DataFusionError::Execution(format!("net_http_post body: {e}")))?;
-        if bytes.len() > cap { return Err(DataFusionError::Execution(format!("net_http_post: body {} > cap {cap}", bytes.len()))); }
+        if bytes.len() > cap {
+            return Err(DataFusionError::Execution(format!(
+                "net_http_post: body {} > cap {cap}",
+                bytes.len()
+            )));
+        }
         Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     })
 }
@@ -161,14 +246,23 @@ fn net_scalar_utf8_req(col: &ColumnarValue, name: &str) -> DFResult<String> {
 fn net_scalar_utf8_opt(col: &ColumnarValue, name: &str) -> DFResult<Option<String>> {
     match col {
         ColumnarValue::Scalar(sv) => match sv {
-            ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v) | ScalarValue::Utf8View(v) => Ok(v.clone()),
-            other => Err(DataFusionError::Execution(format!("net arg {name} expected TEXT, got {other:?}"))),
+            ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v) | ScalarValue::Utf8View(v) => {
+                Ok(v.clone())
+            }
+            other => Err(DataFusionError::Execution(format!(
+                "net arg {name} expected TEXT, got {other:?}"
+            ))),
         },
         ColumnarValue::Array(arr) => {
             use datafusion::arrow::array::Array;
-            let arr = arr.as_any().downcast_ref::<StringArray>()
-                .ok_or_else(|| DataFusionError::Execution(format!("net arg {name} expected TEXT array")))?;
-            if arr.is_null(0) { Ok(None) } else { Ok(Some(arr.value(0).to_string())) }
+            let arr = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                DataFusionError::Execution(format!("net arg {name} expected TEXT array"))
+            })?;
+            if arr.is_null(0) {
+                Ok(None)
+            } else {
+                Ok(Some(arr.value(0).to_string()))
+            }
         }
     }
 }
@@ -178,22 +272,32 @@ mod tests {
     use super::*;
     #[test]
     fn rewrite_net_http_get() {
-        assert_eq!(rewrite_net_schema_functions("SELECT net.http_get('https://example.com')"),
-            "SELECT net_http_get('https://example.com')");
+        assert_eq!(
+            rewrite_net_schema_functions("SELECT net.http_get('https://example.com')"),
+            "SELECT net_http_get('https://example.com')"
+        );
     }
     #[test]
     fn rewrite_net_http_post() {
-        assert_eq!(rewrite_net_schema_functions(r#"SELECT net.http_post('https://example.com', '{"k":1}')"#),
-            r#"SELECT net_http_post('https://example.com', '{"k":1}')"#);
+        assert_eq!(
+            rewrite_net_schema_functions(
+                r#"SELECT net.http_post('https://example.com', '{"k":1}')"#
+            ),
+            r#"SELECT net_http_post('https://example.com', '{"k":1}')"#
+        );
     }
     #[test]
     fn rewrite_net_case_insensitive() {
-        assert_eq!(rewrite_net_schema_functions("SELECT NET.HTTP_GET('https://example.com')"),
-            "SELECT net_http_get('https://example.com')");
+        assert_eq!(
+            rewrite_net_schema_functions("SELECT NET.HTTP_GET('https://example.com')"),
+            "SELECT net_http_get('https://example.com')"
+        );
     }
     #[test]
     fn rewrite_net_leaves_non_matching() {
-        assert_eq!(rewrite_net_schema_functions("SELECT my_net.http_get('https://example.com')"),
-            "SELECT my_net.http_get('https://example.com')");
+        assert_eq!(
+            rewrite_net_schema_functions("SELECT my_net.http_get('https://example.com')"),
+            "SELECT my_net.http_get('https://example.com')"
+        );
     }
 }

@@ -63,10 +63,7 @@ async fn rollback_suppresses_100_inserts_implicit_commit_emits_50() {
 
     wal.flush().await.unwrap();
 
-    let events = wal
-        .read_events(&project, &part, Lsn::ZERO)
-        .await
-        .unwrap();
+    let events = wal.read_events(&project, &part, Lsn::ZERO).await.unwrap();
 
     // Sanity-check raw event counts before replay.
     let begin_count = events
@@ -129,9 +126,7 @@ async fn interleaved_txs_rollback_a_emits_b1_and_b2() {
     wal.append(&project, &part, Bytes::from("B1"))
         .await
         .unwrap();
-    wal.append_tx_rollback(&project, &part, tx_a)
-        .await
-        .unwrap();
+    wal.append_tx_rollback(&project, &part, tx_a).await.unwrap();
     wal.append(&project, &part, Bytes::from("B2"))
         .await
         .unwrap();
@@ -139,10 +134,7 @@ async fn interleaved_txs_rollback_a_emits_b1_and_b2() {
 
     wal.flush().await.unwrap();
 
-    let events = wal
-        .read_events(&project, &part, Lsn::ZERO)
-        .await
-        .unwrap();
+    let events = wal.read_events(&project, &part, Lsn::ZERO).await.unwrap();
 
     let cfg = WalReplayConfig::default();
     let committed = replay_wal(events, &cfg);
@@ -189,10 +181,7 @@ async fn legacy_entries_without_markers_replay_verbatim() {
     }
     wal.flush().await.unwrap();
 
-    let events = wal
-        .read_events(&project, &part, Lsn::ZERO)
-        .await
-        .unwrap();
+    let events = wal.read_events(&project, &part, Lsn::ZERO).await.unwrap();
 
     // No markers in this WAL.
     let marker_count = events
@@ -231,13 +220,16 @@ async fn suppress_false_emits_all_entries_including_rolled_back() {
 
     wal.flush().await.unwrap();
 
-    let events = wal
-        .read_events(&project, &part, Lsn::ZERO)
-        .await
-        .unwrap();
+    let events = wal.read_events(&project, &part, Lsn::ZERO).await.unwrap();
 
     // With suppression ON, the 10 rolled-back entries are discarded.
-    let suppress_on = replay_wal(events.clone(), &WalReplayConfig { suppress_rolled_back: true, require_explicit_commit: true });
+    let suppress_on = replay_wal(
+        events.clone(),
+        &WalReplayConfig {
+            suppress_rolled_back: true,
+            require_explicit_commit: true,
+        },
+    );
     assert_eq!(
         suppress_on.len(),
         0,
@@ -245,7 +237,13 @@ async fn suppress_false_emits_all_entries_including_rolled_back() {
     );
 
     // With suppression OFF, all 10 entries are emitted regardless.
-    let suppress_off = replay_wal(events, &WalReplayConfig { suppress_rolled_back: false, require_explicit_commit: false });
+    let suppress_off = replay_wal(
+        events,
+        &WalReplayConfig {
+            suppress_rolled_back: false,
+            require_explicit_commit: false,
+        },
+    );
     assert_eq!(
         suppress_off.len(),
         10,
@@ -284,10 +282,7 @@ async fn roundtrip_flush_then_reread_events() {
 
     // Reopen and replay.
     let wal2 = LocalWal::open(local_cfg(&dir)).await.unwrap();
-    let events = wal2
-        .read_events(&project, &part, Lsn::ZERO)
-        .await
-        .unwrap();
+    let events = wal2.read_events(&project, &part, Lsn::ZERO).await.unwrap();
     let committed = replay_wal(events, &WalReplayConfig::default());
 
     // The 5 rolled-back entries are gone; only the 3 outside the tx survive.

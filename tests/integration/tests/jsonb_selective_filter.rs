@@ -170,8 +170,16 @@ async fn selective_filter_limits_udf_work() {
     let texts = rows_as_text(&res);
     // Correctness: 5 rows back, all decoded categories (no NULLs given the
     // seed pattern).
-    assert_eq!(texts.len(), 5, "expected 5 rows, got {}: {texts:?}", texts.len());
-    assert!(texts.iter().all(|t| t.is_some()), "no NULLs expected: {texts:?}");
+    assert_eq!(
+        texts.len(),
+        5,
+        "expected 5 rows, got {}: {texts:?}",
+        texts.len()
+    );
+    assert!(
+        texts.iter().all(|t| t.is_some()),
+        "no NULLs expected: {texts:?}"
+    );
 
     // Latency: the UDF should run on at most ~9 rows.  A 750 ms ceiling on
     // a 50k-row table is comfortably loose for debug builds: the broken

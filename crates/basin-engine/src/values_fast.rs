@@ -1402,8 +1402,8 @@ mod tests {
     #[test]
     fn quote_escaping() {
         let s = Schema::new(vec![Field::new("b", DataType::Utf8, true)]);
-        let b = scan("INSERT INTO t (b) VALUES ('it''s'),('a''''b')", &s, &[0])
-            .expect("should parse");
+        let b =
+            scan("INSERT INTO t (b) VALUES ('it''s'),('a''''b')", &s, &[0]).expect("should parse");
         let strs = b[0]
             .column(0)
             .as_any()
@@ -1446,11 +1446,7 @@ mod tests {
         let r = &b[0];
         let i = r.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(i.value(0), -5);
-        let f = r
-            .column(1)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
+        let f = r.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(f.value(0), -1.5);
         assert_eq!(f.value(1), 2500.0);
         assert_eq!(f.value(2), 0.01);
@@ -1489,13 +1485,23 @@ mod tests {
     #[test]
     fn reject_cast() {
         let s = schema_iib();
-        assert!(scan("INSERT INTO t (a,b,c) VALUES (1::int,'x',TRUE)", &s, &[0, 1, 2]).is_none());
+        assert!(scan(
+            "INSERT INTO t (a,b,c) VALUES (1::int,'x',TRUE)",
+            &s,
+            &[0, 1, 2]
+        )
+        .is_none());
     }
 
     #[test]
     fn reject_function_call() {
         let s = schema_iib();
-        assert!(scan("INSERT INTO t (a,b,c) VALUES (now(),'x',TRUE)", &s, &[0, 1, 2]).is_none());
+        assert!(scan(
+            "INSERT INTO t (a,b,c) VALUES (now(),'x',TRUE)",
+            &s,
+            &[0, 1, 2]
+        )
+        .is_none());
     }
 
     #[test]
@@ -1525,7 +1531,12 @@ mod tests {
     #[test]
     fn reject_too_many_values() {
         let s = schema_iib();
-        assert!(scan("INSERT INTO t (a,b,c) VALUES (1,'x',TRUE,9)", &s, &[0, 1, 2]).is_none());
+        assert!(scan(
+            "INSERT INTO t (a,b,c) VALUES (1,'x',TRUE,9)",
+            &s,
+            &[0, 1, 2]
+        )
+        .is_none());
     }
 
     #[test]
@@ -1699,7 +1710,12 @@ mod tests {
         let s = Schema::new(vec![Field::new("b", DataType::Utf8, true)]);
         assert!(scan("INSERT INTO t (b) VALUES ('x'::text)", &s, &[0]).is_none());
         assert!(scan("INSERT INTO t (b) VALUES ('{}'::jsonb)", &s, &[0]).is_none());
-        assert!(scan("INSERT INTO t (b) VALUES ('2020-01-01'::timestamp)", &s, &[0]).is_none());
+        assert!(scan(
+            "INSERT INTO t (b) VALUES ('2020-01-01'::timestamp)",
+            &s,
+            &[0]
+        )
+        .is_none());
     }
 
     #[test]
@@ -1747,9 +1763,12 @@ mod tests {
             &[0]
         )
         .is_none());
-        assert!(
-            scan("INSERT INTO t (ts) VALUES ('2020-01-01'::timestamp(3))", &ts, &[0]).is_none()
-        );
+        assert!(scan(
+            "INSERT INTO t (ts) VALUES ('2020-01-01'::timestamp(3))",
+            &ts,
+            &[0]
+        )
+        .is_none());
     }
 
     #[test]
@@ -1757,8 +1776,12 @@ mod tests {
         // The Cow fast path for plain strings must survive the suffix-cast
         // probe: a string followed directly by `,` / `)` parses unchanged.
         let s = Schema::new(vec![Field::new("b", DataType::Utf8, true)]);
-        let b = scan("INSERT INTO t (b) VALUES ('plain'),('also plain')", &s, &[0])
-            .expect("should parse");
+        let b = scan(
+            "INSERT INTO t (b) VALUES ('plain'),('also plain')",
+            &s,
+            &[0],
+        )
+        .expect("should parse");
         let strs = b[0]
             .column(0)
             .as_any()
@@ -1786,8 +1809,14 @@ mod tests {
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
-        assert_eq!(arr.value(0), crate::dml::parse_timestamp_string("2020-01-01T00:00:00Z").unwrap());
-        assert_eq!(arr.value(1), crate::dml::parse_timestamp_string("2021-06-15 12:30:00").unwrap());
+        assert_eq!(
+            arr.value(0),
+            crate::dml::parse_timestamp_string("2020-01-01T00:00:00Z").unwrap()
+        );
+        assert_eq!(
+            arr.value(1),
+            crate::dml::parse_timestamp_string("2021-06-15 12:30:00").unwrap()
+        );
         assert_eq!(arr.value(2), 1_000_000);
         assert!(arr.is_null(3));
     }
@@ -1806,8 +1835,12 @@ mod tests {
     fn timestamp_tz_carried_into_array_type() {
         let dt = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
         let s = Schema::new(vec![Field::new("ts", dt.clone(), true)]);
-        let b = scan("INSERT INTO t (ts) VALUES ('2020-01-01T00:00:00Z')", &s, &[0])
-            .expect("should parse");
+        let b = scan(
+            "INSERT INTO t (ts) VALUES ('2020-01-01T00:00:00Z')",
+            &s,
+            &[0],
+        )
+        .expect("should parse");
         assert_eq!(b[0].column(0).data_type(), &dt);
     }
 
@@ -1901,20 +1934,14 @@ mod tests {
         // Not an INSERT at all.
         assert!(classify_tail("SELECT 1").is_none());
         // CTE prefix.
-        assert!(classify_tail(
-            "WITH x AS (SELECT 1) INSERT INTO t VALUES (1)"
-        )
-        .is_none());
+        assert!(classify_tail("WITH x AS (SELECT 1) INSERT INTO t VALUES (1)").is_none());
         // INSERT…SELECT (no VALUES after the column list).
         assert!(classify_tail("INSERT INTO t (a) SELECT a FROM s").is_none());
         assert!(classify_tail("INSERT INTO t SELECT * FROM s").is_none());
         // DEFAULT VALUES.
         assert!(classify_tail("INSERT INTO t DEFAULT VALUES").is_none());
         // OVERRIDING clause between column list and VALUES.
-        assert!(classify_tail(
-            "INSERT INTO t (a) OVERRIDING SYSTEM VALUE VALUES (1)"
-        )
-        .is_none());
+        assert!(classify_tail("INSERT INTO t (a) OVERRIDING SYSTEM VALUE VALUES (1)").is_none());
         // Table alias.
         assert!(classify_tail("INSERT INTO t AS x (a) VALUES (1)").is_none());
         // Three-part name.
@@ -1966,11 +1993,7 @@ mod tests {
         let strs = r.column(1).as_any().downcast_ref::<StringArray>().unwrap();
         assert!(strs.is_null(0));
         assert!(strs.is_null(1));
-        let c = r
-            .column(2)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap();
+        let c = r.column(2).as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(c.value(0));
         assert!(!c.value(1));
     }
@@ -1992,11 +2015,7 @@ mod tests {
         assert_eq!(a.value(0), 7);
         let strs = r.column(1).as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(strs.value(0), "hi");
-        let c = r
-            .column(2)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap();
+        let c = r.column(2).as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(c.value(0));
     }
 
@@ -2051,7 +2070,11 @@ mod tests {
         for tz in [None, Some(Arc::<str>::from("UTC"))] {
             let s = Schema::new(vec![
                 Field::new("id", DataType::Int64, true),
-                Field::new("at", DataType::Timestamp(TimeUnit::Microsecond, tz.clone()), true),
+                Field::new(
+                    "at",
+                    DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
+                    true,
+                ),
             ]);
             let cols = vec!["id".to_string(), "at".to_string()];
             let rows = vec![vec![0usize, 1]];
@@ -2116,13 +2139,10 @@ mod tests {
         .is_none());
         // NULL into NOT NULL column → decline.
         let strict = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
-        assert!(try_bind_insert_batch(
-            &strict,
-            &["a".to_string()],
-            &[vec![0usize]],
-            &[SP::Null],
-        )
-        .is_none());
+        assert!(
+            try_bind_insert_batch(&strict, &["a".to_string()], &[vec![0usize]], &[SP::Null],)
+                .is_none()
+        );
         // Param index out of range → decline.
         assert!(try_bind_insert_batch(&s, &cols, &rows, &[SP::Int8(1)]).is_none());
         // Non-finite float → decline.
@@ -2141,13 +2161,10 @@ mod tests {
         use crate::prepared::ScalarParam as SP;
         let s = schema_iib();
         // Unknown column name → decline (schema may have drifted since Parse).
-        assert!(try_bind_insert_batch(
-            &s,
-            &["nope".to_string()],
-            &[vec![0usize]],
-            &[SP::Int8(1)],
-        )
-        .is_none());
+        assert!(
+            try_bind_insert_batch(&s, &["nope".to_string()], &[vec![0usize]], &[SP::Int8(1)],)
+                .is_none()
+        );
         // Duplicate target column → decline (slow path's canonical error).
         assert!(try_bind_insert_batch(
             &s,

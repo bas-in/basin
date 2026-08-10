@@ -145,7 +145,6 @@ fn btrblocks_builder_for(mode: EncodingMode) -> BtrBlocksCompressorBuilder {
     }
 }
 
-
 /// Per-column min/max/null-count computed directly from the **in-memory
 /// Arrow batch** being written — the same source Parquet's
 /// `extract_column_stats(&bytes, batch)` uses. This is the WRITE path:
@@ -303,8 +302,11 @@ pub(crate) async fn footer_meta_from_store(
     // `ObjectStoreReadAt` is not `Clone`, so use `open(Arc<dyn VortexReadAt>)`
     // (the Arc IS Clone) rather than `open_read(R: ... + Clone)`. Both drive
     // the identical tail-range `read_footer` path.
-    let reader: Arc<dyn VortexReadAt> =
-        Arc::new(ObjectStoreReadAt::new(store, path.clone(), session().handle()));
+    let reader: Arc<dyn VortexReadAt> = Arc::new(ObjectStoreReadAt::new(
+        store,
+        path.clone(),
+        session().handle(),
+    ));
     let vf = session()
         .open_options()
         .with_file_size(file_size)
@@ -389,10 +391,7 @@ fn stats_from_vortex_file(
             _ => (None, None, None),
         };
 
-        if null_count.is_some()
-            || min_bytes.is_some()
-            || max_bytes.is_some()
-            || sum_bytes.is_some()
+        if null_count.is_some() || min_bytes.is_some() || max_bytes.is_some() || sum_bytes.is_some()
         {
             out.insert(
                 name.clone(),
@@ -447,7 +446,17 @@ pub(crate) async fn decode(
     // fallback path can reuse the same backing allocation.
     let has_filter = filter.is_some();
     let pushed = projection.is_some() || has_filter;
-    match decode_inner(bytes.clone(), schema.clone(), projection, filter, None, None, 0).await {
+    match decode_inner(
+        bytes.clone(),
+        schema.clone(),
+        projection,
+        filter,
+        None,
+        None,
+        0,
+    )
+    .await
+    {
         Ok(b) => Ok((b, has_filter)),
         Err(_) if pushed => decode_inner(bytes, schema, None, None, None, None, 0)
             .await
@@ -488,9 +497,7 @@ pub(crate) fn infer_arrow_schema(
             .open_options()
             .with_footer(footer)
             .open_buffer(bytes.clone())
-            .map_err(|e| {
-                BasinError::storage(format!("vortex: open_buffer (cached footer): {e}"))
-            })?
+            .map_err(|e| BasinError::storage(format!("vortex: open_buffer (cached footer): {e}")))?
     } else {
         let vf = session()
             .open_options()
@@ -639,7 +646,10 @@ async fn decode_inner(
             // ALTER ADD COLUMN) both fail execute_record_batch's field-count
             // check. Decode the name-intersection in catalog order; the read
             // layers above null-fill logical columns the file pre-dates.
-            if phys_field_count.map(|c| c != s.fields().len()).unwrap_or(false) {
+            if phys_field_count
+                .map(|c| c != s.fields().len())
+                .unwrap_or(false)
+            {
                 let names: Vec<String> = s
                     .fields()
                     .iter()
@@ -675,8 +685,7 @@ async fn decode_inner(
     // The conversion target must mirror the EFFECTIVE projection handed to
     // the scan builder (post physical-intersection), not the caller's raw
     // request — the produced struct has exactly the intersected columns.
-    let effective_proj: Option<&Vec<String>> =
-        projection_phys.as_ref().or(derived_proj.as_ref());
+    let effective_proj: Option<&Vec<String>> = projection_phys.as_ref().or(derived_proj.as_ref());
     if let Some(cols) = effective_proj {
         if !cols.is_empty() {
             let names: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
@@ -708,11 +717,14 @@ async fn decode_inner(
             if all_present {
                 Arc::new(Schema::new(fields))
             } else {
-                Arc::new(normalize_view_types_schema(&sb.dtype().map_err(|e| {
-                    BasinError::storage(format!("vortex: projected dtype: {e}"))
-                })?.to_arrow_schema().map_err(|e| {
-                    BasinError::storage(format!("vortex: projected to_arrow_schema: {e}"))
-                })?))
+                Arc::new(normalize_view_types_schema(
+                    &sb.dtype()
+                        .map_err(|e| BasinError::storage(format!("vortex: projected dtype: {e}")))?
+                        .to_arrow_schema()
+                        .map_err(|e| {
+                            BasinError::storage(format!("vortex: projected to_arrow_schema: {e}"))
+                        })?,
+                ))
             }
         }
         (Some(_), None) => Arc::new(normalize_view_types_schema(
@@ -744,9 +756,7 @@ async fn decode_inner(
             chunk.map_err(|e| BasinError::storage(format!("vortex: scan chunk: {e}")))?;
         let rb = chunk
             .execute_record_batch(arrow_schema.as_ref(), &mut ctx)
-            .map_err(|e| {
-                BasinError::storage(format!("vortex: execute_record_batch: {e}"))
-            })?;
+            .map_err(|e| BasinError::storage(format!("vortex: execute_record_batch: {e}")))?;
         batches.push(rb);
     }
 
@@ -1057,7 +1067,9 @@ mod tests {
         // 500 distinct labels → dictionary/FSST would normally win the search;
         // Fast skips that search but must still round-trip exactly.
         let label = StringArray::from(
-            (0..N).map(|i| format!("label_{}", i % 500)).collect::<Vec<_>>(),
+            (0..N)
+                .map(|i| format!("label_{}", i % 500))
+                .collect::<Vec<_>>(),
         );
         let measure = Float64Array::from((0..N).map(|i| (i as f64) * 0.25).collect::<Vec<_>>());
         let original = RecordBatch::try_new(
@@ -1085,8 +1097,14 @@ mod tests {
             .expect("encode fast");
         let fast_elapsed = t_fast.elapsed();
 
-        assert!(!fast_bytes.is_empty(), "Fast mode must produce a non-empty blob");
-        assert!(!best_bytes.is_empty(), "Best mode must produce a non-empty blob");
+        assert!(
+            !fast_bytes.is_empty(),
+            "Fast mode must produce a non-empty blob"
+        );
+        assert!(
+            !best_bytes.is_empty(),
+            "Best mode must produce a non-empty blob"
+        );
 
         // Fast must skip the expensive per-column search, so it should not be
         // materially slower than Best. Allow a 25% slack for scheduler / cache
@@ -1098,18 +1116,22 @@ mod tests {
         );
 
         // Round-trip: Fast-encoded bytes decode back to the exact input.
-        let (decoded, _) =
-            decode(bytes::Bytes::from(fast_bytes), Some(schema.clone()), None, None)
-                .await
-                .expect("decode fast blob");
+        let (decoded, _) = decode(
+            bytes::Bytes::from(fast_bytes),
+            Some(schema.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect("decode fast blob");
         let total_rows: usize = decoded.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, N, "Fast round-trip must preserve every row");
 
         // Concatenate the decoded chunks (Fast widens row blocks → may be
         // multi-chunk) and compare column-for-column with the original.
         let decoded_refs: Vec<&RecordBatch> = decoded.iter().collect();
-        let merged = arrow::compute::concat_batches(&schema, decoded_refs)
-            .expect("concat decoded chunks");
+        let merged =
+            arrow::compute::concat_batches(&schema, decoded_refs).expect("concat decoded chunks");
 
         let g_id = merged
             .column(0)
@@ -1133,7 +1155,10 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        assert_eq!(g_label, o_label, "Utf8 column must round-trip under Fast mode");
+        assert_eq!(
+            g_label, o_label,
+            "Utf8 column must round-trip under Fast mode"
+        );
 
         let g_measure = merged
             .column(2)
@@ -1185,15 +1210,24 @@ mod tests {
         ]));
         let id = Int64Array::from((0i64..N as i64).collect::<Vec<_>>());
         let sku = StringArray::from(
-            (0..N).map(|i| format!("SKU-{:06}", i % 4000)).collect::<Vec<_>>(),
+            (0..N)
+                .map(|i| format!("SKU-{:06}", i % 4000))
+                .collect::<Vec<_>>(),
         );
         let amount = Float64Array::from((0..N).map(|i| (i as f64) * 1.37).collect::<Vec<_>>());
         let region = StringArray::from(
-            (0..N).map(|i| ["us-east", "us-west", "eu", "ap"][i % 4].to_string()).collect::<Vec<_>>(),
+            (0..N)
+                .map(|i| ["us-east", "us-west", "eu", "ap"][i % 4].to_string())
+                .collect::<Vec<_>>(),
         );
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(id), Arc::new(sku), Arc::new(amount), Arc::new(region)],
+            vec![
+                Arc::new(id),
+                Arc::new(sku),
+                Arc::new(amount),
+                Arc::new(region),
+            ],
         )
         .expect("build compaction-sized batch");
 
@@ -1427,10 +1461,14 @@ mod tests {
     async fn pushed_eq_ids(bytes: &bytes::Bytes, schema: &Arc<Schema>, target: i64) -> Vec<i64> {
         use vortex_array::expr::{col, eq, lit};
         let filter = eq(col("id"), lit(target));
-        let (batches, used_filter) = decode(bytes.clone(), Some(schema.clone()), None, Some(filter))
-            .await
-            .expect("pushed-filter decode");
-        assert!(used_filter, "decode must report the filter was used (no fallback)");
+        let (batches, used_filter) =
+            decode(bytes.clone(), Some(schema.clone()), None, Some(filter))
+                .await
+                .expect("pushed-filter decode");
+        assert!(
+            used_filter,
+            "decode must report the filter was used (no fallback)"
+        );
         ids_of(&batches)
     }
 
@@ -1447,8 +1485,15 @@ mod tests {
             let mut want = reference_eq_ids(&bytes, &schema, target).await;
             got.sort_unstable();
             want.sort_unstable();
-            assert_eq!(want, vec![target], "reference must isolate exactly the target");
-            assert_eq!(got, want, "pushed Eq row set must equal Arrow-filtered reference (target={target})");
+            assert_eq!(
+                want,
+                vec![target],
+                "reference must isolate exactly the target"
+            );
+            assert_eq!(
+                got, want,
+                "pushed Eq row set must equal Arrow-filtered reference (target={target})"
+            );
         }
     }
 
@@ -1487,18 +1532,36 @@ mod tests {
         let cache = crate::vortex_footer_cache::VortexFooterCache::new(8);
 
         // Warm the footer cache off the intact file, and sanity-check the good path.
-        let (good, _) =
-            decode_with_cache(full.clone(), Some(schema.clone()), None, None, Some(&cache), &path, size)
-                .await
-                .expect("intact file decodes");
+        let (good, _) = decode_with_cache(
+            full.clone(),
+            Some(schema.clone()),
+            None,
+            None,
+            Some(&cache),
+            &path,
+            size,
+        )
+        .await
+        .expect("intact file decodes");
         let n: usize = good.iter().map(|b| b.num_rows()).sum();
         assert_eq!(n, 4000, "intact decode must return every row");
-        assert!(cache.get(&path, size).is_some(), "footer must now be cached");
+        assert!(
+            cache.get(&path, size).is_some(),
+            "footer must now be cached"
+        );
 
         // Same path, same declared size — but a SHORT body. Every truncation
         // must either fail loudly or return the file in full. What it must
         // never do is hand back a short row set as `Ok`.
-        for cut in [0usize, 64, 512, 4096, full.len() / 8, full.len() / 4, full.len() / 2] {
+        for cut in [
+            0usize,
+            64,
+            512,
+            4096,
+            full.len() / 8,
+            full.len() / 4,
+            full.len() / 2,
+        ] {
             let truncated = full.slice(0..cut.min(full.len()));
             let res = decode_with_cache(
                 truncated,
@@ -1536,8 +1599,15 @@ mod tests {
 
         let got = pushed_eq_ids(&bytes, &schema, target).await;
         let want = reference_eq_ids(&bytes, &schema, target).await;
-        assert_eq!(want, vec![target], "reference must isolate the (NULL-name) target");
-        assert_eq!(got, want, "pushed Eq must match exactly even when payload column is NULL");
+        assert_eq!(
+            want,
+            vec![target],
+            "reference must isolate the (NULL-name) target"
+        );
+        assert_eq!(
+            got, want,
+            "pushed Eq must match exactly even when payload column is NULL"
+        );
     }
 
     /// Multiple matching rows for the same key: the pushed decode must return
@@ -1555,7 +1625,10 @@ mod tests {
         let expected_count = ids.iter().filter(|&&v| v == 7).count();
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(Int64Array::from(ids)), Arc::new(Float64Array::from(vals))],
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Float64Array::from(vals)),
+            ],
         )
         .expect("build repeated-key batch");
         let bytes = bytes::Bytes::from(encode(&batch, Some(256)).await.expect("encode"));
@@ -1564,7 +1637,11 @@ mod tests {
         let mut want = reference_eq_ids(&bytes, &schema, 7).await;
         got.sort_unstable();
         want.sort_unstable();
-        assert_eq!(want.len(), expected_count, "reference must find every duplicate");
+        assert_eq!(
+            want.len(),
+            expected_count,
+            "reference must find every duplicate"
+        );
         assert_eq!(got, want, "pushed Eq must return every matching row");
     }
 
@@ -1612,7 +1689,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(matched, vec![target.to_string()], "string-PK Eq must isolate exactly one row via Arrow post-filter");
+        assert_eq!(
+            matched,
+            vec![target.to_string()],
+            "string-PK Eq must isolate exactly one row via Arrow post-filter"
+        );
     }
 
     /// `infer_arrow_schema` recovers the physical column types from the file
@@ -1625,8 +1706,16 @@ mod tests {
         let bytes = bytes::Bytes::from(encode(&batch, Some(16)).await.expect("encode"));
 
         let inferred = infer_arrow_schema(&bytes, None, None, 0).expect("infer schema");
-        let names: Vec<&str> = inferred.fields().iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, vec!["id", "name", "val"], "names recovered from footer");
+        let names: Vec<&str> = inferred
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["id", "name", "val"],
+            "names recovered from footer"
+        );
         assert_eq!(
             inferred.field_with_name("id").unwrap().data_type(),
             &DataType::Int64,

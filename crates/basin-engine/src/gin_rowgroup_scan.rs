@@ -58,8 +58,7 @@ use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use futures::StreamExt;
@@ -355,9 +354,7 @@ impl ExecutionPlan for GinRowGroupScanExec {
                 .await;
             match result {
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(DataFusionError::External(Box::new(e))))
-                        .await;
+                    let _ = tx.send(Err(DataFusionError::External(Box::new(e)))).await;
                 }
                 Ok(mut inner) => {
                     while let Some(item) = inner.next().await {
@@ -391,6 +388,9 @@ impl ExecutionPlan for GinRowGroupScanExec {
         });
 
         let stream = futures::stream::poll_fn(move |cx| rx.poll_recv(cx));
-        Ok(Box::pin(RecordBatchStreamAdapter::new(output_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
     }
 }

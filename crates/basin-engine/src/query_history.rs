@@ -121,10 +121,7 @@ impl QueryHistory {
             return None;
         }
 
-        let (best_tuple, &best_count) = hist
-            .counts
-            .iter()
-            .max_by_key(|(_, &c)| c)?;
+        let (best_tuple, &best_count) = hist.counts.iter().max_by_key(|(_, &c)| c)?;
 
         let fraction = best_count as f64 / hist.total_queries as f64;
         if fraction < TOP_FRACTION_THRESHOLD {
@@ -147,10 +144,7 @@ impl QueryHistory {
 
         // Fast path: read lock only — avoid write lock when window is fresh.
         {
-            let guard = self
-                .inner
-                .read()
-                .expect("query_history read lock poisoned");
+            let guard = self.inner.read().expect("query_history read lock poisoned");
             if let Some(hist) = guard.get(&key) {
                 if !hist.is_stale() {
                     return;
@@ -389,10 +383,7 @@ mod tests {
             hist.record_group_by(&p, &t, vec!["region".into(), "month".into()]);
         }
         let pattern = hist.top_pattern(&p, &t).unwrap();
-        assert_eq!(
-            pattern,
-            vec!["month".to_string(), "region".to_string()]
-        );
+        assert_eq!(pattern, vec!["month".to_string(), "region".to_string()]);
     }
 
     /// Window reset clears counts and total_queries.

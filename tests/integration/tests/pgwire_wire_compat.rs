@@ -887,7 +887,8 @@ async fn error_envelope_undefined_function() {
     assert_eq!(dbe.severity(), "ERROR", "severity must be 'ERROR'");
     let code = dbe.code().code();
     assert_eq!(
-        code, "42883",
+        code,
+        "42883",
         "missing function must raise SQLSTATE 42883 (undefined_function), got: {code:?} ({:?})",
         dbe.message()
     );
@@ -926,7 +927,8 @@ async fn error_envelope_undefined_column() {
     assert_eq!(dbe.severity(), "ERROR", "severity must be 'ERROR'");
     let code = dbe.code().code();
     assert_eq!(
-        code, "42703",
+        code,
+        "42703",
         "missing column must raise SQLSTATE 42703 (undefined_column), got: {code:?} ({:?})",
         dbe.message()
     );
@@ -1450,7 +1452,10 @@ async fn binary_result_numeric() {
     let ids: Vec<i64> = rows.iter().map(|r| r.get::<_, i64>(0)).collect();
     assert_eq!(ids, vec![1, 2, 3, 4, 5], "ids must be [1,2,3,4,5]");
 
-    println!("[binary_result_numeric] ok: {} rows, OID=1700 confirmed", rows.len());
+    println!(
+        "[binary_result_numeric] ok: {} rows, OID=1700 confirmed",
+        rows.len()
+    );
 }
 
 /// Binary NUMERIC param decode — INSERT with a binary-encoded NUMERIC bind

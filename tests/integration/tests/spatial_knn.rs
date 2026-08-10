@@ -58,7 +58,11 @@ fn build_batch(points: &[(i64, f64, f64)]) -> RecordBatch {
         let bytes = basin_geo::encode_point(&basin_geo::Point::new(*x, *y));
         geom_b.append_value(bytes).unwrap();
     }
-    RecordBatch::try_new(points_schema(), vec![Arc::new(ids), Arc::new(geom_b.finish())]).unwrap()
+    RecordBatch::try_new(
+        points_schema(),
+        vec![Arc::new(ids), Arc::new(geom_b.finish())],
+    )
+    .unwrap()
 }
 
 /// Seed a `points` table with the given rows + a GIST index + R-tree sidecar,
@@ -82,7 +86,10 @@ async fn seed_points_engine(points: &[(i64, f64, f64)]) -> (Engine, ProjectId) {
     let col_name = "geom";
 
     catalog.create_namespace(&project).await.unwrap();
-    catalog.create_table(&project, &table, &points_schema()).await.unwrap();
+    catalog
+        .create_table(&project, &table, &points_schema())
+        .await
+        .unwrap();
 
     let batch = build_batch(points);
     let opts = WriteOptions {
@@ -131,7 +138,10 @@ async fn seed_points_engine(points: &[(i64, f64, f64)]) -> (Engine, ProjectId) {
         use object_store::ObjectStoreExt;
         storage
             .project_object_store(&project)
-            .put(&sidecar_key, object_store::PutPayload::from_bytes(bytes::Bytes::from(bytes)))
+            .put(
+                &sidecar_key,
+                object_store::PutPayload::from_bytes(bytes::Bytes::from(bytes)),
+            )
             .await
             .expect("write sidecar");
     }
@@ -160,7 +170,10 @@ async fn seed_points_engine(points: &[(i64, f64, f64)]) -> (Engine, ProjectId) {
 /// Run a SELECT and return the `id` column values in result order.
 async fn select_ids(engine: &Engine, project: ProjectId, sql: &str) -> Vec<i64> {
     let sess = engine.open_session(project).await.unwrap();
-    let res = sess.execute(sql).await.unwrap_or_else(|e| panic!("execute({sql:?}): {e:?}"));
+    let res = sess
+        .execute(sql)
+        .await
+        .unwrap_or_else(|e| panic!("execute({sql:?}): {e:?}"));
     let batches = match res {
         ExecResult::Rows { batches, .. } => batches,
         ExecResult::Empty { .. } => Vec::new(),
@@ -168,7 +181,11 @@ async fn select_ids(engine: &Engine, project: ProjectId, sql: &str) -> Vec<i64> 
     let mut out = Vec::new();
     for b in &batches {
         let idx = b.schema().index_of("id").expect("id column present");
-        let arr = b.column(idx).as_any().downcast_ref::<Int64Array>().expect("id is Int64");
+        let arr = b
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id is Int64");
         for i in 0..arr.len() {
             out.push(arr.value(i));
         }
@@ -205,7 +222,11 @@ async fn knn_returns_k_nearest_in_order() {
 
     // Hand-computed Haversine order from (0,0): id3 (0.05,0.05) < id0 (0.1,0.1)
     // < id1 (0.2,0.2) < id2 (0.3,0.3) < id6 (0.5,0.4) < id8 (0,0.8) < ...
-    assert_eq!(ids, vec![3, 0, 1, 2], "k-nearest ids in ascending distance: {ids:?}");
+    assert_eq!(
+        ids,
+        vec![3, 0, 1, 2],
+        "k-nearest ids in ascending distance: {ids:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -241,8 +262,14 @@ async fn knn_overfetch_rerank_beats_l2() {
     let d_lon = basin_geo::haversine_meters(&q, &basin_geo::Point::new(3.0, 80.0));
     let l2_lat = (0.0_f64).hypot(1.6);
     let l2_lon = (3.0_f64).hypot(0.0);
-    assert!(l2_lat < l2_lon, "premise: id100 is L2-degree nearer ({l2_lat} < {l2_lon})");
-    assert!(d_lon < d_lat, "premise: id200 is Haversine nearer ({d_lon} < {d_lat})");
+    assert!(
+        l2_lat < l2_lon,
+        "premise: id100 is L2-degree nearer ({l2_lat} < {l2_lon})"
+    );
+    assert!(
+        d_lon < d_lat,
+        "premise: id200 is Haversine nearer ({d_lon} < {d_lat})"
+    );
 
     let ids = select_ids(
         &engine,
@@ -276,8 +303,9 @@ async fn knn_overfetch_rerank_beats_l2() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn knn_limit_exact() {
     // 10 rows, LIMIT 3 → exactly 3 rows back.
-    let pts: Vec<(i64, f64, f64)> =
-        (0..10).map(|i| (i, i as f64 * 0.1, i as f64 * 0.1)).collect();
+    let pts: Vec<(i64, f64, f64)> = (0..10)
+        .map(|i| (i, i as f64 * 0.1, i as f64 * 0.1))
+        .collect();
     let (engine, project) = seed_points_engine(&pts).await;
 
     let ids = select_ids(
@@ -321,9 +349,15 @@ async fn knn_does_not_hijack_pgvector() {
     sess.execute("CREATE TABLE vecs (id BIGINT, embedding vector(3))")
         .await
         .expect("create vector table");
-    sess.execute("INSERT INTO vecs VALUES (1, '[0.0, 0.0, 0.0]')").await.expect("insert 1");
-    sess.execute("INSERT INTO vecs VALUES (2, '[1.0, 0.0, 0.0]')").await.expect("insert 2");
-    sess.execute("INSERT INTO vecs VALUES (3, '[5.0, 5.0, 5.0]')").await.expect("insert 3");
+    sess.execute("INSERT INTO vecs VALUES (1, '[0.0, 0.0, 0.0]')")
+        .await
+        .expect("insert 1");
+    sess.execute("INSERT INTO vecs VALUES (2, '[1.0, 0.0, 0.0]')")
+        .await
+        .expect("insert 2");
+    sess.execute("INSERT INTO vecs VALUES (3, '[5.0, 5.0, 5.0]')")
+        .await
+        .expect("insert 3");
 
     let ids = select_ids(
         &engine,
@@ -335,5 +369,9 @@ async fn knn_does_not_hijack_pgvector() {
     // id3 is far. If the spatial recognizer had hijacked this, the POINT
     // decode would have failed / the query would error — instead it routes to
     // the vector path and returns the correct top-2.
-    assert_eq!(ids, vec![1, 2], "pgvector <-> path must be unaffected: {ids:?}");
+    assert_eq!(
+        ids,
+        vec![1, 2],
+        "pgvector <-> path must be unaffected: {ids:?}"
+    );
 }

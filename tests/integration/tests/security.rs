@@ -808,7 +808,9 @@ fn audit_p0_3_inbound_webhook_signature_shape_locked() {
     // would still verify because we hex::decode both sides, but the
     // documented shape is lowercase. Catch a drift.
     assert!(
-        hexed.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        hexed
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
         "hex must be lowercase as documented",
     );
 }
@@ -849,8 +851,7 @@ fn audit_p1_1_ws_subscribe_filter_actually_filters() {
     use chrono::Utc;
 
     // Compile the predicate once at subscribe time (mirrors `ws.rs` wiring).
-    let filter = Filter::new("NEW.status = 'paid'")
-        .expect("SECURITY P1-1: filter must compile");
+    let filter = Filter::new("NEW.status = 'paid'").expect("SECURITY P1-1: filter must compile");
 
     // A `draft` row must NOT pass the predicate — it would be information
     // disclosure if it did (the subscriber declared it only wanted `paid`).
@@ -901,7 +902,9 @@ fn audit_p1_1_ws_subscribe_filter_actually_filters() {
         let key = ChannelKey::new(project, TableName::new("orders").unwrap());
 
         let filter_paid = Filter::new("NEW.status = 'paid'").unwrap();
-        let mut rx = sink.registry().subscribe_filtered(key.clone(), Some(filter_paid));
+        let mut rx = sink
+            .registry()
+            .subscribe_filtered(key.clone(), Some(filter_paid));
 
         // Publish the non-matching draft event through the sink.
         let draft = ChangeEvent {
@@ -960,9 +963,7 @@ fn audit_p1_2_presence_track_rejects_forged_client_id() {
 /// rejected before the broadcast fanout amplifies it.
 #[test]
 fn audit_p1_2_presence_metadata_size_rejected_over_cap() {
-    use basin_realtime::presence::{
-        validate_metadata_size, PresenceRejection, MAX_METADATA_BYTES,
-    };
+    use basin_realtime::presence::{validate_metadata_size, PresenceRejection, MAX_METADATA_BYTES};
 
     // Under the cap: ok.
     let small = serde_json::json!({"hi": "there"});
@@ -1054,8 +1055,8 @@ fn audit_p1_4_recovery_code_hash_format_documented() {
 /// store). If Postgres is unreachable the test prints a skip note and returns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audit_p1_5_admin_rotate_other_project_rejected() {
-    use basin_auth::{AuthConfig, AuthService, SmtpConfig, SmtpTls, StubMailer};
     use basin_auth::jwt::JwtKeys;
+    use basin_auth::{AuthConfig, AuthService, SmtpConfig, SmtpTls, StubMailer};
 
     const PG_URL: &str = "host=127.0.0.1 port=5432 user=pc dbname=postgres";
 
@@ -1067,7 +1068,9 @@ async fn audit_p1_5_admin_rotate_other_project_rejected() {
     .await;
     let pg_alive = match pg_ok {
         Ok(Ok((_c, conn))) => {
-            tokio::spawn(async move { let _ = conn.await; });
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
             true
         }
         _ => false,
@@ -1129,10 +1132,15 @@ async fn audit_p1_5_admin_rotate_other_project_rejected() {
             let rt = tokio::runtime::Handle::try_current();
             if let Ok(handle) = rt {
                 handle.spawn(async move {
-                    if let Ok((client, conn)) =
-                        tokio_postgres::connect("host=127.0.0.1 port=5432 user=pc dbname=postgres", NoTls).await
+                    if let Ok((client, conn)) = tokio_postgres::connect(
+                        "host=127.0.0.1 port=5432 user=pc dbname=postgres",
+                        NoTls,
+                    )
+                    .await
                     {
-                        tokio::spawn(async move { let _ = conn.await; });
+                        tokio::spawn(async move {
+                            let _ = conn.await;
+                        });
                         let _ = client
                             .execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"), &[])
                             .await;
@@ -1153,12 +1161,13 @@ async fn audit_p1_5_admin_rotate_other_project_rejected() {
         page_cache: None,
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    let engine = Engine::new(EngineConfig { storage, catalog, shard: None });
-    let rest_cfg = basin_rest::RestConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        engine,
-        auth.clone(),
-    );
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    });
+    let rest_cfg =
+        basin_rest::RestConfig::new("127.0.0.1:0".parse().unwrap(), engine, auth.clone());
     let rest = basin_rest::RestService::new(rest_cfg)
         .run_until_bound()
         .await
@@ -1449,7 +1458,9 @@ fn audit_p2_3_oauth_state_cache_expires() {
     let cache3 = OAuthStateCache::new();
     let state_hash3 = hex::encode(Sha256::digest(b"single-use.xyz"));
     cache3.insert_state_sync(&state_hash3, &project, "github", "pkce-single", "/cb");
-    cache3.consume_state_sync(&state_hash3).expect("first consume ok");
+    cache3
+        .consume_state_sync(&state_hash3)
+        .expect("first consume ok");
     assert!(
         cache3.consume_state_sync(&state_hash3).is_err(),
         "SECURITY P2-3: state entry must only be consumable once"
@@ -1576,9 +1587,7 @@ async fn audit_p2_5_reserved_schema_create_table_rejected() {
                     "SECURITY P2-5: PermissionDenied message must mention schema {schema:?}, got: {msg}"
                 );
             }
-            other => panic!(
-                "SECURITY P2-5: expected PermissionDenied for {schema}, got {other:?}"
-            ),
+            other => panic!("SECURITY P2-5: expected PermissionDenied for {schema}, got {other:?}"),
         }
     }
 
@@ -1824,7 +1833,7 @@ fn audit_cross_project_fuzz_pointer_intact() {
 fn sec_p1_33_anon_read_public_bucket_rls_off_permitted() {
     use basin_blob::rls::{check_object_access, CallerCtx, ObjectPolicyCommand};
     use basin_blob::store::InMemoryBlobCatalog;
-    use basin_blob::{Bucket, BucketId, Object, BlobStore};
+    use basin_blob::{BlobStore, Bucket, BucketId, Object};
     use basin_common::ProjectId;
     use object_store::memory::InMemory;
     use serde_json::Value;
@@ -1870,7 +1879,10 @@ fn sec_p1_33_anon_read_public_bucket_rls_off_permitted() {
     );
     // Confirm `bucket` variable is used (avoid dead-code lint, and document
     // that the caller is expected to check bucket.public before this point).
-    assert!(!bucket.public, "new Bucket is private by default — public flag set by the server");
+    assert!(
+        !bucket.public,
+        "new Bucket is private by default — public flag set by the server"
+    );
     println!("[security::sec_p1_33] (a) anon read, RLS off → permitted PASS");
 }
 
@@ -1888,7 +1900,7 @@ fn sec_p1_33_anon_read_private_bucket_via_alias_denied() {
     // Simulate the `download_public_object` handler's first gate:
     // `if !bucket_meta.public { return 401 }`.
     let mut private_bucket = Bucket::new("classified");
-    private_bucket.public = false;  // default, but explicit for clarity
+    private_bucket.public = false; // default, but explicit for clarity
 
     // The invariant: the alias path returns Err (401-equivalent) before ever
     // fetching the object when the bucket is private.
@@ -1954,8 +1966,12 @@ fn sec_p1_33_alias_path_cannot_bypass_signed_url_verification() {
     );
 
     let caller = CallerCtx::anonymous();
-    let (rls_enabled, applicable) =
-        rls_store.applicable(&project, "objects", ObjectPolicyCommand::Select, &caller.role);
+    let (rls_enabled, applicable) = rls_store.applicable(
+        &project,
+        "objects",
+        ObjectPolicyCommand::Select,
+        &caller.role,
+    );
 
     let obj = Object::new(
         BucketId::new(),
@@ -1968,7 +1984,13 @@ fn sec_p1_33_alias_path_cannot_bypass_signed_url_verification() {
     );
 
     // With the fix: RLS is on, no applicable policy for `anon` → deny.
-    let result = check_object_access(rls_enabled, &applicable, &obj, &caller, ObjectPolicyCommand::Select);
+    let result = check_object_access(
+        rls_enabled,
+        &applicable,
+        &obj,
+        &caller,
+        ObjectPolicyCommand::Select,
+    );
     assert!(
         result.is_err(),
         "SECURITY 6.SEC.P1 (c): public bucket with auth-only RLS policy MUST deny \
@@ -2033,9 +2055,7 @@ async fn rls_update_delete_enforced() {
         .await
         .unwrap();
     admin
-        .execute(
-            "CREATE POLICY p ON orders FOR ALL TO PUBLIC USING (owner_id = current_user)",
-        )
+        .execute("CREATE POLICY p ON orders FOR ALL TO PUBLIC USING (owner_id = current_user)")
         .await
         .unwrap();
 
@@ -2048,7 +2068,9 @@ async fn rls_update_delete_enforced() {
             // UPDATE errored — that is also acceptable (deny-all under RLS).
             // We still need to verify bob's row is untouched below.
             println!("[rls_update_delete] UPDATE returned err (acceptable): {e}");
-            basin_engine::ExecResult::Empty { tag: "UPDATE 0".into() }
+            basin_engine::ExecResult::Empty {
+                tag: "UPDATE 0".into(),
+            }
         });
 
     // Bob's row must still have amount = 200. Use bob's session so the RLS
@@ -2077,7 +2099,9 @@ async fn rls_update_delete_enforced() {
         .await
         .unwrap_or_else(|e| {
             println!("[rls_update_delete] DELETE returned err (acceptable): {e}");
-            basin_engine::ExecResult::Empty { tag: "DELETE 0".into() }
+            basin_engine::ExecResult::Empty {
+                tag: "DELETE 0".into(),
+            }
         });
 
     // Bob's row must still exist. Use bob's session for the same reason.

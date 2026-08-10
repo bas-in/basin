@@ -323,9 +323,7 @@ impl LeaseAwareShardMap {
                     // Lost the race — someone else just acquired. One
                     // more owner_of probe; if still nothing (rare TOCTOU
                     // gap), degrade to hash.
-                    if let Ok(Some((holder, _))) =
-                        registry.owner_of(project, partition_id).await
-                    {
+                    if let Ok(Some((holder, _))) = registry.owner_of(project, partition_id).await {
                         if let Some(idx) = self.endpoint_index_for(&holder) {
                             return idx;
                         }
@@ -596,8 +594,7 @@ mod tests {
     #[tokio::test]
     async fn no_registry_collapses_to_legacy_shard_for() {
         let inner = ShardMap::new(endpoints(4));
-        let lease_map =
-            LeaseAwareShardMap::with_defaults(inner.clone(), None, "127.0.0.1:5500");
+        let lease_map = LeaseAwareShardMap::with_defaults(inner.clone(), None, "127.0.0.1:5500");
         let project = ProjectId::new();
         let expected = inner.shard_for(&project).to_owned();
         // Default partition.
@@ -645,8 +642,7 @@ mod tests {
             .await
             .unwrap();
         // We are endpoint[0]. owner_for should report endpoint[2].
-        let lease_map =
-            LeaseAwareShardMap::with_defaults(inner, Some(registry), eps[0].clone());
+        let lease_map = LeaseAwareShardMap::with_defaults(inner, Some(registry), eps[0].clone());
         assert_eq!(lease_map.owner_for(&project, "_default").await, eps[2]);
     }
 
@@ -740,8 +736,14 @@ mod tests {
 
     #[test]
     fn parse_lease_cache_ttl_env_defaults() {
-        assert_eq!(parse_lease_cache_ttl_env(None).unwrap(), DEFAULT_LEASE_CACHE_TTL);
-        assert_eq!(parse_lease_cache_ttl_env(Some("")).unwrap(), DEFAULT_LEASE_CACHE_TTL);
+        assert_eq!(
+            parse_lease_cache_ttl_env(None).unwrap(),
+            DEFAULT_LEASE_CACHE_TTL
+        );
+        assert_eq!(
+            parse_lease_cache_ttl_env(Some("")).unwrap(),
+            DEFAULT_LEASE_CACHE_TTL
+        );
         assert_eq!(
             parse_lease_cache_ttl_env(Some("  ")).unwrap(),
             DEFAULT_LEASE_CACHE_TTL

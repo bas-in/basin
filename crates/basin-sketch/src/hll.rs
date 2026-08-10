@@ -141,11 +141,7 @@ impl Hll {
         let alpha_m = 0.7213 / (1.0 + 1.079 / HLL_M as f64);
         let m = HLL_M as f64;
 
-        let raw_sum: f64 = self
-            .regs
-            .iter()
-            .map(|&r| 2.0f64.powi(-(r as i32)))
-            .sum();
+        let raw_sum: f64 = self.regs.iter().map(|&r| 2.0f64.powi(-(r as i32))).sum();
         let e = alpha_m * m * m / raw_sum;
 
         // Small-range correction (linear counting)
@@ -226,7 +222,11 @@ mod tests {
         a.merge(&b);
         let est = a.cardinality() as f64;
         let err = (est - 1000.0).abs() / 1000.0;
-        assert!(err <= 0.05, "merged estimate={est}, error={:.2}", err * 100.0);
+        assert!(
+            err <= 0.05,
+            "merged estimate={est}, error={:.2}",
+            err * 100.0
+        );
     }
 
     #[test]

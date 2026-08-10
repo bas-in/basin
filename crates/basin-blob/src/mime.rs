@@ -58,7 +58,11 @@ struct Magic {
 
 impl Magic {
     const fn new(offset: usize, magic: &'static [u8], mime: &'static str) -> Self {
-        Self { offset, magic, mime }
+        Self {
+            offset,
+            magic,
+            mime,
+        }
     }
 }
 
@@ -70,11 +74,11 @@ static MAGIC: &[Magic] = &[
     Magic::new(0, b"\xff\xd8\xff", "image/jpeg"),
     Magic::new(0, b"GIF87a", "image/gif"),
     Magic::new(0, b"GIF89a", "image/gif"),
-    Magic::new(0, b"RIFF", "image/webp"),   // checked further below
+    Magic::new(0, b"RIFF", "image/webp"), // checked further below
     Magic::new(0, b"BM", "image/bmp"),
     Magic::new(0, b"\x00\x00\x01\x00", "image/x-icon"),
     Magic::new(0, b"\x00\x00\x02\x00", "image/x-icon"),
-    Magic::new(4, b"ftyp", "video/mp4"),    // ISO base media; refined below
+    Magic::new(4, b"ftyp", "video/mp4"), // ISO base media; refined below
     Magic::new(0, b"\x1f\x8b", "application/gzip"),
     Magic::new(0, b"PK\x03\x04", "application/zip"),
     Magic::new(0, b"PK\x05\x06", "application/zip"),
@@ -223,7 +227,7 @@ fn looks_like_text(data: &[u8]) -> bool {
     for &b in probe {
         match b {
             0x09 | 0x0a | 0x0d => {} // tab, LF, CR — OK
-            0x20..=0x7e => {}         // printable ASCII — OK
+            0x20..=0x7e => {}        // printable ASCII — OK
             _ => return false,
         }
     }
@@ -431,18 +435,12 @@ mod tests {
 
     #[test]
     fn detects_html_doctype() {
-        assert_eq!(
-            s(b"<!DOCTYPE html>\n<html>"),
-            "text/html"
-        );
+        assert_eq!(s(b"<!DOCTYPE html>\n<html>"), "text/html");
     }
 
     #[test]
     fn detects_html_doctype_uppercase() {
-        assert_eq!(
-            s(b"<!DOCTYPE HTML>\n<HTML>"),
-            "text/html"
-        );
+        assert_eq!(s(b"<!DOCTYPE HTML>\n<HTML>"), "text/html");
     }
 
     #[test]
@@ -473,7 +471,10 @@ mod tests {
 
     #[test]
     fn detects_xml() {
-        assert_eq!(s(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><root>"), "application/xml");
+        assert_eq!(
+            s(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><root>"),
+            "application/xml"
+        );
     }
 
     #[test]

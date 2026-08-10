@@ -48,9 +48,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use basin_catalog::{
-    validate_cdc_webhook, Catalog as _, CdcWebhookDef, CdcWebhookError,
-};
+use basin_catalog::{validate_cdc_webhook, Catalog as _, CdcWebhookDef, CdcWebhookError};
 use basin_common::ProjectId;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -125,9 +123,11 @@ pub(crate) async fn register_webhook(
             .map(|o| o.trim().to_ascii_lowercase())
             .collect::<Vec<_>>()
     });
-    let tables = req
-        .tables
-        .map(|v| v.into_iter().map(|t| t.trim().to_string()).collect::<Vec<_>>());
+    let tables = req.tables.map(|v| {
+        v.into_iter()
+            .map(|t| t.trim().to_string())
+            .collect::<Vec<_>>()
+    });
 
     let id = basin_cdc::mint_webhook_id();
     let secret = basin_cdc::mint_secret_hex();

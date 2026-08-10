@@ -713,9 +713,7 @@ impl<'a> Scanner<'a> {
                 .as_bytes()
                 .first()
                 .is_some_and(|&b| b.is_ascii_alphabetic() || b == b'_');
-            let body_ok = out
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            let body_ok = out.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
             if !(head_ok && body_ok) {
                 return None;
             }
@@ -1133,9 +1131,10 @@ fn scalar_to_copy_cell(
         // same naive-UTC ISO-8601 cell the decoder produced before the typed
         // variant existed, so the CSV ingest path parses it unchanged.
         ScalarParam::Timestamptz(us) => {
-            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(us).ok_or_else(
-                || format!("COPY BINARY: timestamptz out of range (column \"{col}\")"),
-            )?;
+            let dt =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_micros(us).ok_or_else(|| {
+                    format!("COPY BINARY: timestamptz out of range (column \"{col}\")")
+                })?;
             Some(dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
         }
         ScalarParam::Bytea(bytes) => {
@@ -1178,9 +1177,8 @@ async fn process_buffered_binary_rows<S: Session + ?Sized>(
             }
             Ok(None) => {
                 if final_chunk {
-                    state.error = Some(
-                        "COPY BINARY: stream ended before a complete PGCOPY header".into(),
-                    );
+                    state.error =
+                        Some("COPY BINARY: stream ended before a complete PGCOPY header".into());
                     state.buffer.clear();
                 }
                 return;
@@ -1281,7 +1279,11 @@ async fn flush_pending_rows<S: Session + ?Sized>(state: &mut CopyInState, sessio
             fallback_insert_rows(state, session, rows).await;
         }
         Err(e) => {
-            state.error = Some(format!("COPY batch (rows {}–{}): {e}", state.row_count + 1, state.row_count + n));
+            state.error = Some(format!(
+                "COPY batch (rows {}–{}): {e}",
+                state.row_count + 1,
+                state.row_count + n
+            ));
         }
     }
 }
@@ -1618,8 +1620,8 @@ pub(crate) async fn copy_to_csv_payload<S: Session + ?Sized>(
             )));
         }
     };
-    let column_indices = resolve_column_indices(&schema, column_list)
-        .map_err(basin_common::BasinError::Internal)?;
+    let column_indices =
+        resolve_column_indices(&schema, column_list).map_err(basin_common::BasinError::Internal)?;
     let header = if with_header {
         let mut row = String::new();
         for (i, &idx) in column_indices.iter().enumerate() {
@@ -1694,7 +1696,12 @@ fn binary_payload_from_batches(
                     schema.field(idx),
                     &mut buf,
                 )
-                .map_err(|e| format!("COPY BINARY: encode column {:?}: {e}", schema.field(idx).name()))?;
+                .map_err(|e| {
+                    format!(
+                        "COPY BINARY: encode column {:?}: {e}",
+                        schema.field(idx).name()
+                    )
+                })?;
             }
             chunks.push(buf.split().to_vec());
             row_count += 1;
@@ -1743,8 +1750,8 @@ async fn copy_to_binary_payload<S: Session + ?Sized>(
             )));
         }
     };
-    let column_indices = resolve_column_indices(&schema, column_list)
-        .map_err(basin_common::BasinError::Internal)?;
+    let column_indices =
+        resolve_column_indices(&schema, column_list).map_err(basin_common::BasinError::Internal)?;
     binary_payload_from_batches(&schema, &batches, &column_indices)
         .map_err(basin_common::BasinError::FeatureNotSupported)
 }
@@ -1935,8 +1942,7 @@ pub(crate) async fn copy_query_to_stdout_messages<S: Session + ?Sized>(
     };
     let (chunks, row_count, n_cols) = match opts.format {
         CopyFormat::Csv => {
-            let payload = match copy_query_to_csv_payload(session, query, with_header, opts).await
-            {
+            let payload = match copy_query_to_csv_payload(session, query, with_header, opts).await {
                 Ok(p) => p,
                 Err(e) => return error_messages(&e),
             };
@@ -2387,8 +2393,8 @@ mod tests {
 
     #[test]
     fn parse_copy_accepts_quoted_column_list() {
-        let cmd = parse_copy(r#"COPY "users" ("id", "Email_2") TO STDOUT WITH (FORMAT CSV)"#)
-            .unwrap();
+        let cmd =
+            parse_copy(r#"COPY "users" ("id", "Email_2") TO STDOUT WITH (FORMAT CSV)"#).unwrap();
         assert_eq!(
             cmd,
             Some(CopyCommand::To {
@@ -2483,18 +2489,24 @@ mod tests {
     #[test]
     fn parse_copy_rejects_binary_with_csv_only_options() {
         for (sql, opt) in [
-            ("COPY t FROM STDIN WITH (FORMAT BINARY, HEADER true)", "HEADER"),
-            ("COPY t FROM STDIN WITH (FORMAT BINARY, DELIMITER '|')", "DELIMITER"),
+            (
+                "COPY t FROM STDIN WITH (FORMAT BINARY, HEADER true)",
+                "HEADER",
+            ),
+            (
+                "COPY t FROM STDIN WITH (FORMAT BINARY, DELIMITER '|')",
+                "DELIMITER",
+            ),
             (r"COPY t FROM STDIN WITH (FORMAT BINARY, NULL '\N')", "NULL"),
             ("COPY t TO STDOUT WITH (FORMAT BINARY, QUOTE '\"')", "QUOTE"),
             // FORMAT after the conflicting option must still be caught.
-            ("COPY t FROM STDIN WITH (DELIMITER '|', FORMAT BINARY)", "DELIMITER"),
+            (
+                "COPY t FROM STDIN WITH (DELIMITER '|', FORMAT BINARY)",
+                "DELIMITER",
+            ),
         ] {
             let e = parse_copy(sql).unwrap_err();
-            assert!(
-                e.contains(opt) && e.contains("BINARY"),
-                "{sql}: got {e}"
-            );
+            assert!(e.contains(opt) && e.contains("BINARY"), "{sql}: got {e}");
         }
     }
 
@@ -2541,11 +2553,15 @@ mod tests {
     fn parse_binary_header_rejects_bad_signature_and_flags() {
         let mut bad_sig = binary_header_bytes(b"");
         bad_sig[0] = b'X';
-        assert!(parse_binary_header(&bad_sig).unwrap_err().contains("signature"));
+        assert!(parse_binary_header(&bad_sig)
+            .unwrap_err()
+            .contains("signature"));
 
         let mut bad_flags = binary_header_bytes(b"");
         bad_flags[11..15].copy_from_slice(&0x0001_0000u32.to_be_bytes()); // OID bit
-        assert!(parse_binary_header(&bad_flags).unwrap_err().contains("flags"));
+        assert!(parse_binary_header(&bad_flags)
+            .unwrap_err()
+            .contains("flags"));
 
         // Low 16 flag bits must be ignored per the spec.
         let mut soft_flags = binary_header_bytes(b"");
@@ -2582,7 +2598,10 @@ mod tests {
         // Every strict prefix is NeedMore (chunk boundaries are arbitrary).
         for cut in 0..tuple.len() {
             assert!(
-                matches!(parse_binary_record(&tuple[..cut], 2).unwrap(), BinaryRecord::NeedMore),
+                matches!(
+                    parse_binary_record(&tuple[..cut], 2).unwrap(),
+                    BinaryRecord::NeedMore
+                ),
                 "cut at {cut}"
             );
         }
@@ -2631,10 +2650,7 @@ mod tests {
 
         let vec_field = Field::new(
             "emb",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                3,
-            ),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 3),
             true,
         );
         let e = validate_binary_copy_columns(std::iter::once(&vec_field)).unwrap_err();
@@ -2658,8 +2674,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let (chunks, rows) =
-            binary_payload_from_batches(&schema, &[batch], &[0, 1, 2]).unwrap();
+        let (chunks, rows) = binary_payload_from_batches(&schema, &[batch], &[0, 1, 2]).unwrap();
         assert_eq!(rows, 2);
         assert_eq!(chunks.len(), 4); // header + 2 tuples + trailer
         assert_eq!(parse_binary_header(&chunks[0]).unwrap(), Some(19));

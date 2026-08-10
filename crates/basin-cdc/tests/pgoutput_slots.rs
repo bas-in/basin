@@ -49,7 +49,13 @@ fn wal2json_transaction_change_array_in_commit_order() {
             Some(json!({"id": 1, "total": 9.99})),
             Some(json!({"id": 1, "total": 19.99})),
         ),
-        rec(3, 12, "orders", Some(json!({"id": 1, "total": 19.99})), None),
+        rec(
+            3,
+            12,
+            "orders",
+            Some(json!({"id": 1, "total": 19.99})),
+            None,
+        ),
     ];
     let v = serde_json::to_value(encode_transaction(&recs)).unwrap();
     let arr = v["change"].as_array().unwrap();
@@ -72,8 +78,14 @@ fn wal2json_transaction_change_array_in_commit_order() {
 fn wal2json_v2_streaming_frames_bracket_a_commit() {
     // A streaming consumer sees B, then one action per row, then C.
     let b = serde_json::to_value(Wal2JsonTxn::begin()).unwrap();
-    let i = serde_json::to_value(Wal2JsonTxn::row(&rec(1, 1, "t", None, Some(json!({"id": 1})))))
-        .unwrap();
+    let i = serde_json::to_value(Wal2JsonTxn::row(&rec(
+        1,
+        1,
+        "t",
+        None,
+        Some(json!({"id": 1})),
+    )))
+    .unwrap();
     let c = serde_json::to_value(Wal2JsonTxn::commit()).unwrap();
     assert_eq!(b["action"], "B");
     assert_eq!(i["action"], "I");
@@ -227,7 +239,10 @@ async fn slot_isolation_across_projects_in_memory() {
     .await
     .unwrap();
     assert_eq!(cat.list_cdc_slots(&a).await.len(), 1);
-    assert!(cat.list_cdc_slots(&b).await.is_empty(), "B never sees A's slot");
+    assert!(
+        cat.list_cdc_slots(&b).await.is_empty(),
+        "B never sees A's slot"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +261,10 @@ const PG_URL: &str = "host=127.0.0.1 port=5432 user=pc dbname=postgres";
 async fn slot_round_trip_postgres_backend_if_available() {
     use basin_catalog::PostgresCatalog;
 
-    let schema = format!("cdc_slot_test_{}", ulid::Ulid::new().to_string().to_lowercase());
+    let schema = format!(
+        "cdc_slot_test_{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    );
     let cat = match tokio::time::timeout(
         std::time::Duration::from_secs(2),
         PostgresCatalog::connect_with_schema(PG_URL, &schema),
@@ -297,8 +315,14 @@ async fn slot_round_trip_postgres_backend_if_available() {
 // must use identical wire tokens so a CREATE_REPLICATION_SLOT round-trips).
 #[test]
 fn output_plugin_and_slot_plugin_tokens_agree() {
-    assert_eq!(OutputPlugin::Pgoutput.as_str(), SlotPlugin::Pgoutput.as_str());
-    assert_eq!(OutputPlugin::Wal2json.as_str(), SlotPlugin::Wal2json.as_str());
+    assert_eq!(
+        OutputPlugin::Pgoutput.as_str(),
+        SlotPlugin::Pgoutput.as_str()
+    );
+    assert_eq!(
+        OutputPlugin::Wal2json.as_str(),
+        SlotPlugin::Wal2json.as_str()
+    );
     assert_eq!(
         ReplicationSlot::new("s", ProjectId::new(), OutputPlugin::Pgoutput)
             .plugin

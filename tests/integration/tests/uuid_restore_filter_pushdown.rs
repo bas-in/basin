@@ -220,9 +220,7 @@ async fn uuid_restore_passes_filter_to_cold_scan() {
     let plan = explain_text(&sess, sql).await;
 
     let restore_line = line_of(&plan, "UuidDecimal256RestoreExec").unwrap_or_else(|| {
-        panic!(
-            "UuidDecimal256RestoreExec missing — cold UUID wrap inactive; plan:\n{plan}"
-        )
+        panic!("UuidDecimal256RestoreExec missing — cold UUID wrap inactive; plan:\n{plan}")
     });
 
     // Slice the plan ABOVE the restore exec. With the pushdown fix there

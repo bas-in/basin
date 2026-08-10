@@ -6,7 +6,7 @@
 use arrow_array::{Array, BooleanArray, Int64Array, StringArray};
 use basin_catalog::{
     info_schema::{CancelBackendRegistry, InfoSchemaQuery},
-    InMemoryCatalog, Catalog,
+    Catalog, InMemoryCatalog,
 };
 use basin_common::ProjectId;
 
@@ -22,7 +22,11 @@ async fn pg_ts_config_returns_two_rows() {
 
     let batch = InfoSchemaQuery::pg_ts_config(&cat, &p).await.unwrap();
 
-    assert_eq!(batch.num_rows(), 2, "must emit exactly 2 configs (english + simple)");
+    assert_eq!(
+        batch.num_rows(),
+        2,
+        "must emit exactly 2 configs (english + simple)"
+    );
 }
 
 #[tokio::test]
@@ -55,7 +59,10 @@ async fn pg_ts_config_schema_columns_correct() {
 
     // Must have exactly 5 columns matching PG's pg_ts_config layout.
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    assert_eq!(names, ["oid", "cfgname", "cfgnamespace", "cfgowner", "cfgparser"]);
+    assert_eq!(
+        names,
+        ["oid", "cfgname", "cfgnamespace", "cfgowner", "cfgparser"]
+    );
 }
 
 #[tokio::test]
@@ -128,8 +135,16 @@ async fn pg_ts_config_oids_are_stable_across_calls() {
     let batch1 = InfoSchemaQuery::pg_ts_config(&cat, &p).await.unwrap();
     let batch2 = InfoSchemaQuery::pg_ts_config(&cat, &p).await.unwrap();
 
-    let oids1 = batch1.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let oids2 = batch2.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let oids1 = batch1
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let oids2 = batch2
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
 
     let v1: Vec<i64> = (0..oids1.len()).map(|i| oids1.value(i)).collect();
     let v2: Vec<i64> = (0..oids2.len()).map(|i| oids2.value(i)).collect();
@@ -150,8 +165,18 @@ async fn pg_ts_config_cross_project_cfgnamespace_differs() {
     let b1 = InfoSchemaQuery::pg_ts_config(&cat, &p1).await.unwrap();
     let b2 = InfoSchemaQuery::pg_ts_config(&cat, &p2).await.unwrap();
 
-    let ns1 = b1.column(2).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
-    let ns2 = b2.column(2).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+    let ns1 = b1
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let ns2 = b2
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
 
     assert_ne!(ns1, ns2, "cfgnamespace must differ between projects");
 }
@@ -234,12 +259,20 @@ fn cancel_backend_idempotent_double_cancel() {
 
     // First cancel → true.
     let b1 = InfoSchemaQuery::pg_cancel_backend(&registry, &p, 5).unwrap();
-    let r1 = b1.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+    let r1 = b1
+        .column(0)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
     assert!(r1.value(0));
 
     // Second cancel → still true (flag already set, pid still present).
     let b2 = InfoSchemaQuery::pg_cancel_backend(&registry, &p, 5).unwrap();
-    let r2 = b2.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+    let r2 = b2
+        .column(0)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
     assert!(r2.value(0));
 }
 
@@ -278,7 +311,10 @@ fn pg_cancel_backend_proc_row_oid_is_stable() {
     let p = ProjectId::new();
     let row1 = InfoSchemaQuery::pg_cancel_backend_proc_row(&p);
     let row2 = InfoSchemaQuery::pg_cancel_backend_proc_row(&p);
-    assert_eq!(row1.oid, row2.oid, "proc row oid must be stable across calls");
+    assert_eq!(
+        row1.oid, row2.oid,
+        "proc row oid must be stable across calls"
+    );
 }
 
 #[test]
@@ -300,5 +336,8 @@ fn cancel_backend_registry_is_cheap_to_clone() {
     // Visible through clone.
     assert!(!reg2.is_cancelled(11));
     reg2.cancel(11);
-    assert!(reg1.is_cancelled(11), "cancel through clone must be visible on original");
+    assert!(
+        reg1.is_cancelled(11),
+        "cancel through clone must be visible on original"
+    );
 }

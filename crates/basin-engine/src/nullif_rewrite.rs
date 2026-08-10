@@ -21,9 +21,12 @@
 //! Bare NULLIF calls outside an `IS [NOT] NULL` wrapper are left
 //! untouched and handled by DataFusion as a residual filter.
 
-use datafusion::common::{Result, tree_node::{Transformed, TreeNode}};
+use datafusion::common::{
+    tree_node::{Transformed, TreeNode},
+    Result,
+};
 use datafusion::logical_expr::{Expr, LogicalPlan};
-use datafusion::optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder};
+use datafusion::optimizer::{optimizer::ApplyOrder, OptimizerConfig, OptimizerRule};
 
 /// Rewrites `NULLIF(a, b) IS NOT NULL` to `a IS NOT NULL AND a != b`,
 /// and `NULLIF(a, b) IS NULL` to `a IS NULL OR a = b`.
@@ -100,7 +103,6 @@ fn rewrite_nullif_is_null_expr(expr: Expr) -> Result<Transformed<Expr>> {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::Result;
     use datafusion::functions::core::nullif as make_nullif_udf;
@@ -108,6 +110,7 @@ mod tests {
     use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
     use datafusion::logical_expr::{col, lit, Expr, Filter, LogicalPlan, LogicalPlanBuilder};
     use datafusion::optimizer::OptimizerContext;
+    use std::sync::Arc;
 
     fn schema_k() -> Arc<LogicalTableSource> {
         let schema = Arc::new(Schema::new(vec![

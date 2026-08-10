@@ -221,8 +221,7 @@ async fn pg_tooling_sees_real_schema_membership() {
         .unwrap();
 
     // Also a regular public table.
-    let public_orders =
-        QualifiedTableName::in_public(TableName::new("orders").unwrap());
+    let public_orders = QualifiedTableName::in_public(TableName::new("orders").unwrap());
     catalog
         .create_table_qualified(&project, &public_orders, Arc::new(minimal_arrow_schema()))
         .await
@@ -344,10 +343,7 @@ async fn pg_tooling_sees_real_schema_membership() {
 
     // ── information_schema.schemata includes all reserved schemas ───────────
     let rows = client
-        .query(
-            "SELECT schema_name FROM information_schema.schemata",
-            &[],
-        )
+        .query("SELECT schema_name FROM information_schema.schemata", &[])
         .await
         .expect("information_schema.schemata query");
 
@@ -412,9 +408,7 @@ async fn qualified_reserved_schema_reads_bind_correctly() {
 
     // Create a plain `users` table and insert two rows.
     client
-        .simple_query(
-            "CREATE TABLE users (id BIGINT NOT NULL, name TEXT NOT NULL)",
-        )
+        .simple_query("CREATE TABLE users (id BIGINT NOT NULL, name TEXT NOT NULL)")
         .await
         .expect("CREATE TABLE users");
     client
@@ -428,7 +422,11 @@ async fn qualified_reserved_schema_reads_bind_correctly() {
         .await
         .expect("unqualified count");
     let data = rows_of(&msgs);
-    assert_eq!(data[0][0].as_deref(), Some("2"), "expected 2 rows unqualified");
+    assert_eq!(
+        data[0][0].as_deref(),
+        Some("2"),
+        "expected 2 rows unqualified"
+    );
 
     // Verify auth-qualified count — must return the same 2 rows.
     // `auth.` is stripped by the engine before DataFusion planning,
@@ -511,7 +509,9 @@ impl Drop for SchemaGuard {
                     Ok(Ok(pair)) => pair,
                     _ => return,
                 };
-                let _driver = tokio::spawn(async move { let _ = conn.await; });
+                let _driver = tokio::spawn(async move {
+                    let _ = conn.await;
+                });
                 let _ = client
                     .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
                     .await;
@@ -562,7 +562,13 @@ fn engine_in(dir: &TempDir) -> Engine {
 }
 
 /// Spin up a REST + auth server; returns `None` when Postgres is unavailable.
-async fn try_serve_rls() -> Option<(RunningRest, RestService, AuthService, StubMailer, SchemaGuard)> {
+async fn try_serve_rls() -> Option<(
+    RunningRest,
+    RestService,
+    AuthService,
+    StubMailer,
+    SchemaGuard,
+)> {
     let schema = unique_schema();
     let cfg = auth_cfg(&schema);
     let mailer = StubMailer::new(cfg.smtp.from_email.clone());
@@ -715,7 +721,8 @@ async fn rls_on_storage_objects_scopes_after_schema_move() {
     )
     .await;
     assert_eq!(
-        r.status, 201,
+        r.status,
+        201,
         "create bucket: {}",
         String::from_utf8_lossy(&r.body)
     );
@@ -745,7 +752,12 @@ async fn rls_on_storage_objects_scopes_after_schema_move() {
         Some(b"alice-content"),
     )
     .await;
-    assert_eq!(r.status, 200, "alice upload: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "alice upload: {}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     // Bob uploads.
     let r = raw(
@@ -759,7 +771,12 @@ async fn rls_on_storage_objects_scopes_after_schema_move() {
         Some(b"bob-content"),
     )
     .await;
-    assert_eq!(r.status, 200, "bob upload: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "bob upload: {}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     // List — alice sees only her object.
     let list_body = serde_json::to_vec(&json!({})).unwrap();
@@ -815,7 +832,11 @@ async fn rls_on_storage_objects_scopes_after_schema_move() {
         None,
     )
     .await;
-    assert_eq!(r.status, 403, "alice must not download bob's object; got {}", r.status);
+    assert_eq!(
+        r.status, 403,
+        "alice must not download bob's object; got {}",
+        r.status
+    );
 
     // Cross-access denied: bob cannot download alice.txt.
     let r = raw(
@@ -826,7 +847,11 @@ async fn rls_on_storage_objects_scopes_after_schema_move() {
         None,
     )
     .await;
-    assert_eq!(r.status, 403, "bob must not download alice's object; got {}", r.status);
+    assert_eq!(
+        r.status, 403,
+        "bob must not download alice's object; got {}",
+        r.status
+    );
 
     println!("[schema_e2e] assertion 3 PASS: RLS on storage.objects scopes correctly");
 }
@@ -870,12 +895,12 @@ async fn user_create_schema_aliases_to_public() {
         .await
         .expect("SELECT * FROM t (bare)");
     let data = rows_of(&msgs);
-    assert_eq!(data.len(), 1, "bare 't' must find the row inserted via myapp.t");
     assert_eq!(
-        data[0][0].as_deref(),
-        Some("1"),
-        "row id must be 1"
+        data.len(),
+        1,
+        "bare 't' must find the row inserted via myapp.t"
     );
+    assert_eq!(data[0][0].as_deref(), Some("1"), "row id must be 1");
 
     // Step 5: SELECT via public-qualified name — same table.
     let msgs = client
@@ -883,11 +908,7 @@ async fn user_create_schema_aliases_to_public() {
         .await
         .expect("SELECT * FROM public.t");
     let pub_data = rows_of(&msgs);
-    assert_eq!(
-        pub_data.len(),
-        1,
-        "public.t must also find the row"
-    );
+    assert_eq!(pub_data.len(), 1, "public.t must also find the row");
 
     // Step 6: SELECT via the user schema qualifier again — must still work.
     let msgs = client
@@ -974,7 +995,11 @@ async fn search_path_honored() {
         .await
         .expect("SELECT count(*) FROM pub_x after alias insert");
     let data = rows_of(&msgs);
-    assert_eq!(data[0][0].as_deref(), Some("2"), "expected 2 rows after alias insert");
+    assert_eq!(
+        data[0][0].as_deref(),
+        Some("2"),
+        "expected 2 rows after alias insert"
+    );
 
     // Reset search_path to default and verify it still works.
     client
@@ -1027,7 +1052,11 @@ async fn cross_project_isolation_preserved() {
         TableName::new("accounts").unwrap(),
     );
     catalog
-        .create_table_qualified(&project_b, &auth_accounts_b, Arc::new(minimal_arrow_schema()))
+        .create_table_qualified(
+            &project_b,
+            &auth_accounts_b,
+            Arc::new(minimal_arrow_schema()),
+        )
         .await
         .unwrap();
 
@@ -1076,7 +1105,9 @@ async fn cross_project_isolation_preserved() {
     let (alice, conn_a) = tokio_postgres::connect(&alice_str, NoTls)
         .await
         .expect("alice connect");
-    tokio::spawn(async move { let _ = conn_a.await; });
+    tokio::spawn(async move {
+        let _ = conn_a.await;
+    });
 
     // Connect as bob (project B).
     let bob_str = format!(
@@ -1087,7 +1118,9 @@ async fn cross_project_isolation_preserved() {
     let (bob, conn_b) = tokio_postgres::connect(&bob_str, NoTls)
         .await
         .expect("bob connect");
-    tokio::spawn(async move { let _ = conn_b.await; });
+    tokio::spawn(async move {
+        let _ = conn_b.await;
+    });
 
     // Alice queries information_schema.tables — must see users but NOT accounts.
     let alice_rows = alice

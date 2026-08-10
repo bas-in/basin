@@ -100,9 +100,11 @@ async fn excluded_basic_hits_counter() {
     let (_dir, eng) = open_engine().await;
     let sess = session(&eng).await;
 
-    sess.execute("CREATE TABLE accts (email TEXT NOT NULL, hits BIGINT NOT NULL, PRIMARY KEY (email))")
-        .await
-        .unwrap();
+    sess.execute(
+        "CREATE TABLE accts (email TEXT NOT NULL, hits BIGINT NOT NULL, PRIMARY KEY (email))",
+    )
+    .await
+    .unwrap();
 
     // First insert — no conflict.
     sess.execute("INSERT INTO accts (email, hits) VALUES ('u@x.com', 1) ON CONFLICT (email) DO UPDATE SET hits = EXCLUDED.hits")
@@ -127,7 +129,9 @@ async fn excluded_lowercase_qualifier() {
     sess.execute("CREATE TABLE cnt (k TEXT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO cnt VALUES ('a', 1)").await.unwrap();
+    sess.execute("INSERT INTO cnt VALUES ('a', 1)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO cnt VALUES ('a', 99) ON CONFLICT (k) DO UPDATE SET v = excluded.v")
         .await
         .unwrap();
@@ -167,7 +171,9 @@ async fn excluded_full_row_replace() {
     sess.execute("CREATE TABLE things (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL, val BIGINT NOT NULL)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO things VALUES (1, 'old', 100)").await.unwrap();
+    sess.execute("INSERT INTO things VALUES (1, 'old', 100)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO things VALUES (1, 'new', 200) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, val = EXCLUDED.val")
         .await
         .unwrap();
@@ -189,7 +195,9 @@ async fn excluded_multi_row_per_row_mapping() {
         .unwrap();
 
     // Seed rows 1 and 3 only; rows 2 and 4 do not exist yet.
-    sess.execute("INSERT INTO kv VALUES (1, 10), (3, 30)").await.unwrap();
+    sess.execute("INSERT INTO kv VALUES (1, 10), (3, 30)")
+        .await
+        .unwrap();
 
     // Multi-row upsert: rows 1 and 3 conflict; rows 2 and 4 are fresh.
     // Each conflicting row must pick up its OWN proposed value.
@@ -219,7 +227,9 @@ async fn excluded_arithmetic_mixed_refs() {
     sess.execute("CREATE TABLE scores (k BIGINT NOT NULL PRIMARY KEY, n BIGINT NOT NULL)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO scores VALUES (1, 5)").await.unwrap();
+    sess.execute("INSERT INTO scores VALUES (1, 5)")
+        .await
+        .unwrap();
     // n = existing(5) + proposed(3) = 8.
     sess.execute("INSERT INTO scores (k, n) VALUES (1, 3) ON CONFLICT (k) DO UPDATE SET n = scores.n + EXCLUDED.n")
         .await
@@ -241,7 +251,9 @@ async fn excluded_do_update_where_skips_non_matching() {
     sess.execute("CREATE TABLE guarded (k BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO guarded VALUES (1, 100)").await.unwrap();
+    sess.execute("INSERT INTO guarded VALUES (1, 100)")
+        .await
+        .unwrap();
 
     // Proposed value 0 fails `EXCLUDED.v > 0` → existing row unchanged.
     sess.execute(
@@ -280,16 +292,22 @@ async fn excluded_drizzle_corpus_shape() {
     sess.execute(r#"CREATE TABLE "users" ("id" BIGINT NOT NULL PRIMARY KEY, "email" TEXT NOT NULL, "name" TEXT)"#)
         .await
         .unwrap();
-    sess.execute(r#"INSERT INTO "users" ("id","email","name") VALUES (60,'orig@example.com','Orig')"#)
-        .await
-        .unwrap();
+    sess.execute(
+        r#"INSERT INTO "users" ("id","email","name") VALUES (60,'orig@example.com','Orig')"#,
+    )
+    .await
+    .unwrap();
 
     // Drizzle emits lowercase `excluded` with a quoted column name.
     sess.execute(r#"INSERT INTO "users" ("id","email","name") VALUES (60,'up@example.com','U') ON CONFLICT ("id") DO UPDATE SET "email" = excluded."email", "name" = excluded."name""#)
         .await
         .unwrap();
 
-    let batches = rows_of(&sess, r#"SELECT "email", "name" FROM "users" WHERE "id" = 60"#).await;
+    let batches = rows_of(
+        &sess,
+        r#"SELECT "email", "name" FROM "users" WHERE "id" = 60"#,
+    )
+    .await;
     assert_eq!(col_string(&batches, "email"), vec!["up@example.com"]);
     assert_eq!(col_string(&batches, "name"), vec!["U"]);
 }
@@ -313,7 +331,11 @@ async fn excluded_prisma_corpus_shape() {
         .await
         .unwrap();
 
-    let batches = rows_of(&sess, r#"SELECT "email", "name" FROM "User" WHERE "id" = 1"#).await;
+    let batches = rows_of(
+        &sess,
+        r#"SELECT "email", "name" FROM "User" WHERE "id" = 1"#,
+    )
+    .await;
     assert_eq!(col_string(&batches, "email"), vec!["b@x.com"]);
     assert_eq!(col_string(&batches, "name"), vec!["B"]);
 }
@@ -361,7 +383,11 @@ async fn excluded_gorm_corpus_shape() {
         .await
         .unwrap();
 
-    let batches = rows_of(&sess, r#"SELECT "code", "price", "stock" FROM "products" WHERE "id" = 1"#).await;
+    let batches = rows_of(
+        &sess,
+        r#"SELECT "code", "price", "stock" FROM "products" WHERE "id" = 1"#,
+    )
+    .await;
     assert_eq!(col_string(&batches, "code"), vec!["B"]);
     assert_eq!(col_i64(&batches, "price"), vec![20]);
     assert_eq!(col_i64(&batches, "stock"), vec![200]);
@@ -377,7 +403,9 @@ async fn excluded_cast_expression() {
     sess.execute("CREATE TABLE items (id BIGINT NOT NULL PRIMARY KEY, code TEXT NOT NULL)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO items VALUES (1, 'old')").await.unwrap();
+    sess.execute("INSERT INTO items VALUES (1, 'old')")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO items VALUES (1, 'new') ON CONFLICT (id) DO UPDATE SET code = CAST(EXCLUDED.code AS TEXT)")
         .await
         .unwrap();
@@ -396,7 +424,9 @@ async fn excluded_coalesce_function() {
     sess.execute("CREATE TABLE ppl (id BIGINT NOT NULL PRIMARY KEY, name TEXT)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO ppl VALUES (1, 'Alice')").await.unwrap();
+    sess.execute("INSERT INTO ppl VALUES (1, 'Alice')")
+        .await
+        .unwrap();
 
     // Proposed name is NULL → COALESCE picks the existing name.
     sess.execute("INSERT INTO ppl (id, name) VALUES (1, NULL) ON CONFLICT (id) DO UPDATE SET name = COALESCE(EXCLUDED.name, name)")
@@ -424,7 +454,9 @@ async fn excluded_do_update_where_is_not_null() {
     sess.execute("CREATE TABLE nullable_vals (id BIGINT NOT NULL PRIMARY KEY, val TEXT)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO nullable_vals VALUES (1, 'keep-me')").await.unwrap();
+    sess.execute("INSERT INTO nullable_vals VALUES (1, 'keep-me')")
+        .await
+        .unwrap();
 
     // Proposed NULL fails IS NOT NULL predicate → existing value kept.
     sess.execute(
@@ -460,7 +492,9 @@ async fn excluded_multi_row_do_update_where_falls_to_per_row() {
     sess.execute("CREATE TABLE filtered (k BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
         .await
         .unwrap();
-    sess.execute("INSERT INTO filtered VALUES (1, 100), (2, 200), (3, 300)").await.unwrap();
+    sess.execute("INSERT INTO filtered VALUES (1, 100), (2, 200), (3, 300)")
+        .await
+        .unwrap();
 
     // Multi-row upsert with a DO UPDATE WHERE clause.
     // - Row (1, 0): conflict, but 0 > 50 is false → v stays 100.

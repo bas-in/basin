@@ -42,8 +42,8 @@
 //! [`DEFAULT_PER_PROJECT_BUDGET_BYTES`] (16 MiB) if the variable is absent /
 //! invalid.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use basin_common::ProjectId;
 use dashmap::DashMap;
@@ -66,7 +66,9 @@ pub enum BudgetError {
 impl std::fmt::Display for BudgetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BudgetError::BufferFull => f.write_str("BUFFER_FULL: per-project realtime budget exhausted"),
+            BudgetError::BufferFull => {
+                f.write_str("BUFFER_FULL: per-project realtime budget exhausted")
+            }
         }
     }
 }
@@ -129,11 +131,11 @@ impl ProjectBudget {
     /// reserved anything).
     fn release(&self, size: u64) {
         // Saturating sub prevents underflow if a bug causes double-release.
-        self.bytes_in_flight.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-            |v| Some(v.saturating_sub(size)),
-        ).ok();
+        self.bytes_in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(size))
+            })
+            .ok();
     }
 
     /// Current in-flight bytes (snapshot; may be stale by the time caller
@@ -229,11 +231,7 @@ impl BudgetTracker {
     /// per-partition allotment; with N replicas the project total is
     /// `N × slice`, so the cap *is* the project-wide budget the operator
     /// configured (no multi-instance bypass).
-    pub fn try_reserve(
-        &self,
-        project: ProjectId,
-        size: u64,
-    ) -> Result<BudgetGuard, BudgetError> {
+    pub fn try_reserve(&self, project: ProjectId, size: u64) -> Result<BudgetGuard, BudgetError> {
         let effective_cap = self.effective_cap(project);
         let budget = self
             .inner
@@ -371,11 +369,15 @@ mod tests {
         let project = ProjectId::new();
 
         // First reservation fits (500 ≤ 1000).
-        let guard1 = tracker.try_reserve(project, 500).expect("first reserve must succeed");
+        let guard1 = tracker
+            .try_reserve(project, 500)
+            .expect("first reserve must succeed");
         assert_eq!(tracker.bytes_in_flight(project), 500);
 
         // Second reservation (500 more = 1000 ≤ 1000) fits exactly.
-        let guard2 = tracker.try_reserve(project, 500).expect("second reserve must succeed");
+        let guard2 = tracker
+            .try_reserve(project, 500)
+            .expect("second reserve must succeed");
         assert_eq!(tracker.bytes_in_flight(project), 1_000);
 
         // Third reservation would exceed the cap → BUFFER_FULL.
@@ -402,7 +404,9 @@ mod tests {
         assert_eq!(tracker.bytes_in_flight(project), 0);
 
         // After release the full cap is available again.
-        let _guard2 = tracker.try_reserve(project, 100).expect("must fit after release");
+        let _guard2 = tracker
+            .try_reserve(project, 100)
+            .expect("must fit after release");
     }
 
     /// BUFFER_FULL for one project does not affect another project.
@@ -414,10 +418,15 @@ mod tests {
 
         // Fill p1.
         let _g1 = tracker.try_reserve(p1, 500).expect("p1 first must fit");
-        assert_eq!(tracker.try_reserve(p1, 1).unwrap_err(), BudgetError::BufferFull);
+        assert_eq!(
+            tracker.try_reserve(p1, 1).unwrap_err(),
+            BudgetError::BufferFull
+        );
 
         // p2 is completely unaffected.
-        let _g2 = tracker.try_reserve(p2, 500).expect("p2 must not be affected by p1 overflow");
+        let _g2 = tracker
+            .try_reserve(p2, 500)
+            .expect("p2 must not be affected by p1 overflow");
         assert_eq!(tracker.bytes_in_flight(p2), 500);
     }
 
@@ -425,7 +434,10 @@ mod tests {
     #[test]
     fn buffer_full_display() {
         let msg = BudgetError::BufferFull.to_string();
-        assert!(msg.contains("BUFFER_FULL"), "display must contain BUFFER_FULL");
+        assert!(
+            msg.contains("BUFFER_FULL"),
+            "display must contain BUFFER_FULL"
+        );
     }
 
     /// Lazy allocation: a project that never publishes has no entry.
@@ -502,10 +514,7 @@ mod tests {
                             Ok(guard) => {
                                 // Assert in-flight never exceeds cap.
                                 let inflight = t.bytes_in_flight(project);
-                                assert!(
-                                    inflight <= cap,
-                                    "in-flight {inflight} exceeded cap {cap}"
-                                );
+                                assert!(inflight <= cap, "in-flight {inflight} exceeded cap {cap}");
                                 drop(guard);
                             }
                             Err(BudgetError::BufferFull) => {

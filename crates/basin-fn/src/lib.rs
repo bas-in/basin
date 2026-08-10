@@ -33,29 +33,29 @@
 pub const WIT_BASIN_FN: &str = include_str!("../wit/basin-fn.wit");
 
 #[cfg(feature = "component-model")]
+pub mod engine;
+#[cfg(feature = "component-model")]
+pub mod governance;
+#[cfg(feature = "component-model")]
+pub mod handler;
+#[cfg(feature = "component-model")]
 pub mod harness;
 #[cfg(feature = "component-model")]
 pub mod host;
 #[cfg(feature = "component-model")]
-pub mod engine;
-#[cfg(feature = "component-model")]
-pub mod handler;
-#[cfg(feature = "component-model")]
-pub mod governance;
-#[cfg(feature = "component-model")]
 pub mod runtime;
 
+#[cfg(feature = "component-model")]
+pub use engine::{
+    FnHttpRequest, FnHttpResponse, HttpSend, MockHttpClient, MockSecretStore, QueryExecutor,
+    SecretStore, StubSecretStore,
+};
+#[cfg(feature = "component-model")]
+pub use handler::{FunctionStore, HandlerHarness, HandlerRequest, HandlerResponse};
 #[cfg(feature = "component-model")]
 pub use harness::ComponentHarness;
 #[cfg(feature = "component-model")]
 pub use host::{FunctionCallContext, FunctionHost};
-#[cfg(feature = "component-model")]
-pub use engine::{
-    FnHttpRequest, FnHttpResponse, HttpSend, MockHttpClient,
-    MockSecretStore, QueryExecutor, SecretStore, StubSecretStore,
-};
-#[cfg(feature = "component-model")]
-pub use handler::{FunctionStore, HandlerHarness, HandlerRequest, HandlerResponse};
 
 /// Re-export of the generated WIT bindings for use in integration tests.
 /// Consumers use `basin_fn::harness_bindings::basin::functions::{query, …}`.

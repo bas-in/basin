@@ -152,12 +152,18 @@ impl DataFileStatsCache {
     }
 
     pub fn get(&self, path: &ObjectPath, size: u64) -> Option<CachedDataFileStats> {
-        let mut g = self.inner.lock().expect("DataFileStatsCache mutex poisoned");
+        let mut g = self
+            .inner
+            .lock()
+            .expect("DataFileStatsCache mutex poisoned");
         g.get(&(path.clone(), size)).cloned()
     }
 
     pub fn insert(&self, path: ObjectPath, size: u64, v: CachedDataFileStats) {
-        let mut g = self.inner.lock().expect("DataFileStatsCache mutex poisoned");
+        let mut g = self
+            .inner
+            .lock()
+            .expect("DataFileStatsCache mutex poisoned");
         g.put((path, size), v);
     }
 }

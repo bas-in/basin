@@ -320,9 +320,7 @@ impl BudgetCoordinator for InMemoryBudgetCoordinator {
             .insert(partition_id.to_string(), (holder.to_string(), delta));
         let n = entry.partitions.len();
         let slice = Self::compute_slice(&entry.budget, n);
-        entry
-            .slices
-            .insert(partition_id.to_string(), slice.clone());
+        entry.slices.insert(partition_id.to_string(), slice.clone());
         Ok(slice)
     }
 
@@ -355,11 +353,7 @@ impl BudgetCoordinator for InMemoryBudgetCoordinator {
             .get(partition_id)
             .map(|(_, d)| d.clone())
             .unwrap_or_default();
-        let current_slice = entry
-            .slices
-            .get(partition_id)
-            .cloned()
-            .unwrap_or_default();
+        let current_slice = entry.slices.get(partition_id).cloned().unwrap_or_default();
         Ok(Some(UsageSnapshot {
             last_delta,
             current_slice,
@@ -517,12 +511,7 @@ impl SliceGate {
         }
         let counter = self.counter_for(project, cap).await;
         // Lazy initialise the counter to the slice on first sighting.
-        let _ = counter.compare_exchange(
-            SLICE_UNSET,
-            slice,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
+        let _ = counter.compare_exchange(SLICE_UNSET, slice, Ordering::AcqRel, Ordering::Relaxed);
         // CAS-loop decrement; refuse if it would underflow.
         let mut current = counter.load(Ordering::Relaxed);
         loop {
@@ -533,12 +522,8 @@ impl SliceGate {
                 return Err(());
             }
             let next = current - count;
-            match counter.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
+            match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed)
+            {
                 Ok(_) => return Ok(()),
                 Err(actual) => current = actual,
             }
@@ -716,7 +701,9 @@ mod tests {
             .unwrap();
 
         // One slice gate per replica, one partition per replica.
-        let gates: Vec<SliceGate> = (0..3).map(|_| SliceGate::new(SliceBudgetView::new())).collect();
+        let gates: Vec<SliceGate> = (0..3)
+            .map(|_| SliceGate::new(SliceBudgetView::new()))
+            .collect();
         // First heartbeat round registers each partition. Slices the first
         // few replicas receive are stale (the coordinator hadn't seen the
         // later partitions yet). Acceptable per ADR 0023 — the over-cap
@@ -725,12 +712,7 @@ mod tests {
         for round in 0..2 {
             for (i, gate) in gates.iter().enumerate() {
                 let slice = coord
-                    .push_heartbeat(
-                        &p,
-                        &format!("p-{i}"),
-                        &format!("r-{i}"),
-                        UsageDelta::zero(),
-                    )
+                    .push_heartbeat(&p, &format!("p-{i}"), &format!("r-{i}"), UsageDelta::zero())
                     .await
                     .unwrap();
                 for cap in CapKind::ALL {

@@ -47,7 +47,13 @@ const BATCH_SIZE: i64 = 2_000;
 const ROW_BLOCK: i64 = 2_048;
 
 const CATEGORIES: &[&str] = &["purchase", "refund", "view"];
-const REGIONS: &[&str] = &["us-east-1", "us-west-2", "eu-west-1", "ap-south-1", "sa-east-1"];
+const REGIONS: &[&str] = &[
+    "us-east-1",
+    "us-west-2",
+    "eu-west-1",
+    "ap-south-1",
+    "sa-east-1",
+];
 
 async fn build() -> (
     TempDir,
@@ -77,7 +83,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.clone().spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -216,9 +226,7 @@ async fn viability_jsonb_posting() {
         &basin_common::TableName::new("t_idx").unwrap(),
         "payload",
     );
-    println!(
-        "[VIABILITY JSONB POSTING] registry entries for t_idx.payload: {n_entries}"
-    );
+    println!("[VIABILITY JSONB POSTING] registry entries for t_idx.payload: {n_entries}");
     assert!(
         n_entries > 0,
         "posting registry must be populated by compactor (got 0 entries)"

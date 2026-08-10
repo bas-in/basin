@@ -39,7 +39,13 @@ use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::TempDir;
 
-async fn build() -> (TempDir, TempDir, Engine, basin_shard::ShardBackgroundHandle, Arc<dyn Wal>) {
+async fn build() -> (
+    TempDir,
+    TempDir,
+    Engine,
+    basin_shard::ShardBackgroundHandle,
+    Arc<dyn Wal>,
+) {
     let sd = TempDir::new().unwrap();
     let wd = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
@@ -60,7 +66,11 @@ async fn build() -> (TempDir, TempDir, Engine, basin_shard::ShardBackgroundHandl
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,

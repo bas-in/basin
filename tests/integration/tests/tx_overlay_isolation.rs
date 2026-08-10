@@ -241,7 +241,11 @@ async fn other_session_delete_does_not_hide_row_in_open_tx() {
 
         // Post-COMMIT the pin is released: A sees the deletion.
         assert_eq!(val_at(&a, "t", 2).await, None, "post-COMMIT row 2 is gone");
-        assert_eq!(count_rows(&a, "t").await, 4, "post-COMMIT count reflects DELETE");
+        assert_eq!(
+            count_rows(&a, "t").await,
+            4,
+            "post-COMMIT count reflects DELETE"
+        );
     })
     .await;
 }
@@ -301,7 +305,11 @@ async fn repeat_read_count_stable_under_concurrent_fastpath_dml() {
 
         // B fires a burst of auto-commit fast-path UPDATEs AND DELETEs.
         for id in 1..=5i64 {
-            exec(&b, &format!("UPDATE t SET val = val + 1000 WHERE id = {id}")).await;
+            exec(
+                &b,
+                &format!("UPDATE t SET val = val + 1000 WHERE id = {id}"),
+            )
+            .await;
         }
         for id in 6..=8i64 {
             exec(&b, &format!("DELETE FROM t WHERE id = {id}")).await;
@@ -320,17 +328,37 @@ async fn repeat_read_count_stable_under_concurrent_fastpath_dml() {
             let c = count_rows(&a, "t").await;
             assert_eq!(c, c1, "A's in-tx count must stay {c1}; saw {c}");
             // The updated rows must still show their pre-snapshot value for A.
-            assert_eq!(val_at(&a, "t", 1).await, Some(10), "row 1 stale-stable for A");
+            assert_eq!(
+                val_at(&a, "t", 1).await,
+                Some(10),
+                "row 1 stale-stable for A"
+            );
             // A deleted-by-B row must still be visible to A.
-            assert_eq!(val_at(&a, "t", 6).await, Some(60), "row 6 must survive for A");
+            assert_eq!(
+                val_at(&a, "t", 6).await,
+                Some(60),
+                "row 6 must survive for A"
+            );
         }
 
         exec(&a, "COMMIT").await;
 
         // Post-COMMIT A sees the full effect of B's overlay writes.
-        assert_eq!(count_rows(&a, "t").await, 17, "post-COMMIT count reflects deletes");
-        assert_eq!(val_at(&a, "t", 1).await, Some(1010), "post-COMMIT sees B's update");
-        assert_eq!(val_at(&a, "t", 6).await, None, "post-COMMIT sees B's delete");
+        assert_eq!(
+            count_rows(&a, "t").await,
+            17,
+            "post-COMMIT count reflects deletes"
+        );
+        assert_eq!(
+            val_at(&a, "t", 1).await,
+            Some(1010),
+            "post-COMMIT sees B's update"
+        );
+        assert_eq!(
+            val_at(&a, "t", 6).await,
+            None,
+            "post-COMMIT sees B's delete"
+        );
     })
     .await;
 }

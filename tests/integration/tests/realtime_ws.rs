@@ -145,10 +145,7 @@ async fn spawn_server() -> Option<ServerAddrs> {
     let ws_addr = ws_probe.local_addr().ok()?;
     drop(ws_probe);
 
-    let auth_schema = format!(
-        "basin_ws_test_{}",
-        Ulid::new().to_string().to_lowercase()
-    );
+    let auth_schema = format!("basin_ws_test_{}", Ulid::new().to_string().to_lowercase());
 
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.env("BASIN_BIND", pg_addr.to_string())
@@ -314,8 +311,11 @@ async fn obtain_jwt(
     }
 
     // 2. Bypass SMTP: mark all users in the schema as verified.
-    let Ok(Ok((client, conn))) =
-        tokio::time::timeout(Duration::from_secs(5), tokio_postgres::connect(PG_URL, NoTls)).await
+    let Ok(Ok((client, conn))) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(PG_URL, NoTls),
+    )
+    .await
     else {
         return None;
     };
@@ -368,11 +368,7 @@ async fn obtain_jwt(
 ///
 /// The returned `TcpStream` is in raw mode — callers send/receive raw WS
 /// frames using the minimal helpers below.
-async fn ws_connect(
-    addr: std::net::SocketAddr,
-    path: &str,
-    jwt: &str,
-) -> Option<TcpStream> {
+async fn ws_connect(addr: std::net::SocketAddr, path: &str, jwt: &str) -> Option<TcpStream> {
     let mut sock = TcpStream::connect(addr).await.ok()?;
 
     // Build the upgrade request.
@@ -432,7 +428,10 @@ async fn ws_send_text(sock: &mut TcpStream, text: &str) -> bool {
     // FIN=1, opcode=0x01 (text).
     frame.push(0x81);
     // MASK=1, 7-bit payload length (payload must be < 126 for simplicity).
-    assert!(payload.len() < 126, "test helper only supports short frames");
+    assert!(
+        payload.len() < 126,
+        "test helper only supports short frames"
+    );
     frame.push(0x80 | payload.len() as u8);
     // Masking key.
     frame.extend_from_slice(&mask);
@@ -572,7 +571,10 @@ async fn ws_multi_subscribe_and_unsubscribe() {
 
     // --- Subscribe to `orders` ---
     let sub_orders = r#"{"type":"subscribe","table":"orders"}"#;
-    assert!(ws_send_text(&mut sock, sub_orders).await, "send subscribe orders");
+    assert!(
+        ws_send_text(&mut sock, sub_orders).await,
+        "send subscribe orders"
+    );
 
     let frames = ws_collect_text_frames(&mut sock, Duration::from_secs(5), |v| {
         v.get("type").and_then(|t| t.as_str()) == Some("subscribed")
@@ -583,11 +585,17 @@ async fn ws_multi_subscribe_and_unsubscribe() {
     let subscribed_orders = frames
         .iter()
         .any(|v| v["type"] == "subscribed" && v["table"] == "orders");
-    assert!(subscribed_orders, "expected subscribed ack for orders; got: {frames:?}");
+    assert!(
+        subscribed_orders,
+        "expected subscribed ack for orders; got: {frames:?}"
+    );
 
     // --- Subscribe to `users` ---
     let sub_users = r#"{"type":"subscribe","table":"users"}"#;
-    assert!(ws_send_text(&mut sock, sub_users).await, "send subscribe users");
+    assert!(
+        ws_send_text(&mut sock, sub_users).await,
+        "send subscribe users"
+    );
 
     let frames2 = ws_collect_text_frames(&mut sock, Duration::from_secs(5), |v| {
         v.get("type").and_then(|t| t.as_str()) == Some("subscribed")
@@ -598,11 +606,17 @@ async fn ws_multi_subscribe_and_unsubscribe() {
     let subscribed_users = frames2
         .iter()
         .any(|v| v["type"] == "subscribed" && v["table"] == "users");
-    assert!(subscribed_users, "expected subscribed ack for users; got: {frames2:?}");
+    assert!(
+        subscribed_users,
+        "expected subscribed ack for users; got: {frames2:?}"
+    );
 
     // --- Unsubscribe from `orders` (connection stays open) ---
     let unsub_orders = r#"{"type":"unsubscribe","table":"orders"}"#;
-    assert!(ws_send_text(&mut sock, unsub_orders).await, "send unsubscribe orders");
+    assert!(
+        ws_send_text(&mut sock, unsub_orders).await,
+        "send unsubscribe orders"
+    );
 
     let frames3 = ws_collect_text_frames(&mut sock, Duration::from_secs(5), |v| {
         v.get("type").and_then(|t| t.as_str()) == Some("unsubscribed")
@@ -804,7 +818,11 @@ async fn ws_client_ping_gets_pong() {
     let _ = sock.flush().await;
 
     // Expect a pong frame (opcode 0x0a) within 2 seconds.
-    let result = tokio::time::timeout(Duration::from_secs(2), ws_recv_frame(&mut sock, Duration::from_secs(2))).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        ws_recv_frame(&mut sock, Duration::from_secs(2)),
+    )
+    .await;
 
     match result {
         Ok(Some((opcode, _))) if opcode == 0x0a => {
@@ -854,7 +872,10 @@ async fn ws_rls_subscriber_connects_successfully() {
         return;
     }
     // Connection established = gate passes.
-    assert!(result.is_some(), "valid JWT should get 101 Switching Protocols");
+    assert!(
+        result.is_some(),
+        "valid JWT should get 101 Switching Protocols"
+    );
 }
 
 /// Smoke: connect, subscribe to a table, verify subscribe ack JSON structure.

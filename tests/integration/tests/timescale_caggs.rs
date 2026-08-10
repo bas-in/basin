@@ -87,7 +87,10 @@ async fn bucket_rows(sess: &basin_engine::ProjectSession, sql: &str) -> Vec<(i64
                     if bucket.is_null(i) {
                         continue;
                     }
-                    out.push((bucket.value(i), if agg.is_null(i) { 0 } else { agg.value(i) }));
+                    out.push((
+                        bucket.value(i),
+                        if agg.is_null(i) { 0 } else { agg.value(i) },
+                    ));
                 }
             }
             out.sort_unstable();
@@ -180,7 +183,11 @@ async fn cagg_matches_direct_agg() {
     let sess = seed_hypertable(&engine).await;
     exec(&sess, CREATE_CAGG).await;
 
-    let cagg = bucket_rows(&sess, "SELECT bucket, total FROM metrics_hourly ORDER BY bucket").await;
+    let cagg = bucket_rows(
+        &sess,
+        "SELECT bucket, total FROM metrics_hourly ORDER BY bucket",
+    )
+    .await;
     let direct = bucket_rows(
         &sess,
         "SELECT time_bucket('1 hour', ts) AS bucket, sum(val) AS total \
@@ -306,7 +313,11 @@ async fn cagg_add_policy_and_run() {
         .iter()
         .find(|(b, _)| *b == hour_us(2024, 1, 15, 11))
         .map(|(_, v)| *v);
-    assert_eq!(h11, Some(15), "policy run should re-aggregate hour 11 (9+6)");
+    assert_eq!(
+        h11,
+        Some(15),
+        "policy run should re-aggregate hour 11 (9+6)"
+    );
 }
 
 /// Reading a cagg serves the materialised store (a regular table SELECT).
@@ -362,7 +373,10 @@ async fn cagg_drop_chunks_preserves_rows() {
         "SELECT * FROM metrics WHERE ts < TIMESTAMPTZ '2024-01-15 12:00:00+00'",
     )
     .await;
-    assert_eq!(src_early, 0, "drop_chunks should have removed early source rows");
+    assert_eq!(
+        src_early, 0,
+        "drop_chunks should have removed early source rows"
+    );
 
     // ...but the cagg keeps every materialised bucket.
     let after = bucket_rows(&sess, "SELECT bucket, total FROM metrics_hourly").await;
@@ -417,6 +431,10 @@ async fn cagg_differential_handcomputed() {
         (hour_us(2024, 1, 15, 11), 4 + 5),
         (hour_us(2024, 1, 15, 12), 4),
     ];
-    let got = bucket_rows(&sess, "SELECT bucket, total FROM metrics_hourly ORDER BY bucket").await;
+    let got = bucket_rows(
+        &sess,
+        "SELECT bucket, total FROM metrics_hourly ORDER BY bucket",
+    )
+    .await;
     assert_eq!(got, expected, "hand-computed bucket grid mismatch");
 }

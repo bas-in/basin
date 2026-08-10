@@ -96,7 +96,10 @@ async fn ssrf_ip_literal_ipv6_loopback_denied() {
     // The allowlist's host_str for `[::1]` is `[::1]`; allowlist that exact
     // form so we prove the IP-class check still fires.
     client.allow_host(&project, "[::1]").await;
-    let err = client.http_get(&project, "http://[::1]/").await.unwrap_err();
+    let err = client
+        .http_get(&project, "http://[::1]/")
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, HttpError::IpLiteralDenied(_)),
         "IPv6 loopback slipped through: {err:?}"
@@ -205,7 +208,10 @@ async fn ssrf_url_with_user_password_rejected() {
         .http_get(&project, "http://user:pass@evil.com/")
         .await
         .unwrap_err();
-    assert!(matches!(err, HttpError::UriUserinfoNotAllowed), "got {err:?}");
+    assert!(
+        matches!(err, HttpError::UriUserinfoNotAllowed),
+        "got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -221,7 +227,10 @@ async fn ssrf_confused_deputy_userinfo_rejected() {
         .http_get(&project, "http://allowed.com@evil.com/")
         .await
         .unwrap_err();
-    assert!(matches!(err, HttpError::UriUserinfoNotAllowed), "got {err:?}");
+    assert!(
+        matches!(err, HttpError::UriUserinfoNotAllowed),
+        "got {err:?}"
+    );
 }
 
 // --- DNS rebinding TOCTOU ---------------------------------------------------
@@ -244,9 +253,7 @@ async fn ssrf_dns_rebinding_attacker_resolves_to_loopback() {
     let client = fresh_client();
     let project = ProjectId::new();
     client.allow_host(&project, "127.0.0.1.nip.io").await;
-    let result = client
-        .http_get(&project, "http://127.0.0.1.nip.io/")
-        .await;
+    let result = client.http_get(&project, "http://127.0.0.1.nip.io/").await;
     match result {
         Ok(resp) => panic!(
             "DNS-rebinding to loopback connected anyway: status={} body_len={}",
@@ -289,18 +296,18 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[test]
 fn denied_ipv4_classes_are_exhaustive() {
     let denied: &[Ipv4Addr] = &[
-        Ipv4Addr::new(127, 0, 0, 1),     // loopback
-        Ipv4Addr::new(10, 0, 0, 1),      // RFC1918 10/8
-        Ipv4Addr::new(172, 16, 0, 1),    // RFC1918 172.16/12
-        Ipv4Addr::new(192, 168, 1, 1),   // RFC1918 192.168/16
+        Ipv4Addr::new(127, 0, 0, 1),       // loopback
+        Ipv4Addr::new(10, 0, 0, 1),        // RFC1918 10/8
+        Ipv4Addr::new(172, 16, 0, 1),      // RFC1918 172.16/12
+        Ipv4Addr::new(192, 168, 1, 1),     // RFC1918 192.168/16
         Ipv4Addr::new(169, 254, 169, 254), // AWS IMDS
-        Ipv4Addr::new(169, 254, 1, 1),   // link-local 169.254/16
-        Ipv4Addr::new(224, 0, 0, 1),     // multicast
+        Ipv4Addr::new(169, 254, 1, 1),     // link-local 169.254/16
+        Ipv4Addr::new(224, 0, 0, 1),       // multicast
         Ipv4Addr::new(255, 255, 255, 255), // broadcast
-        Ipv4Addr::new(0, 0, 0, 0),       // unspecified
-        Ipv4Addr::new(0, 1, 2, 3),       // 0/8 — "this network"
-        Ipv4Addr::new(100, 64, 0, 1),    // CGNAT 100.64/10
-        Ipv4Addr::new(192, 0, 2, 1),     // TEST-NET-1 documentation
+        Ipv4Addr::new(0, 0, 0, 0),         // unspecified
+        Ipv4Addr::new(0, 1, 2, 3),         // 0/8 — "this network"
+        Ipv4Addr::new(100, 64, 0, 1),      // CGNAT 100.64/10
+        Ipv4Addr::new(192, 0, 2, 1),       // TEST-NET-1 documentation
     ];
     for ip in denied {
         assert!(is_denied_ip(IpAddr::V4(*ip)), "expected denied: {ip}");
@@ -313,16 +320,16 @@ fn denied_ipv4_classes_are_exhaustive() {
 #[test]
 fn denied_ipv6_classes_are_exhaustive() {
     let denied: &[Ipv6Addr] = &[
-        Ipv6Addr::LOCALHOST,                                  // ::1
-        Ipv6Addr::UNSPECIFIED,                                // ::
-        "fc00::1".parse().unwrap(),                           // unique-local
-        "fd00::1".parse().unwrap(),                           // unique-local
-        "fe80::1".parse().unwrap(),                           // link-local
-        "ff02::1".parse().unwrap(),                           // multicast
-        "::ffff:127.0.0.1".parse().unwrap(),                  // ipv4-mapped loopback
-        "::ffff:10.0.0.1".parse().unwrap(),                   // ipv4-mapped RFC1918
-        "::ffff:169.254.169.254".parse().unwrap(),            // ipv4-mapped IMDS
-        "fd00:ec2::254".parse().unwrap(),                     // AWS IMDSv2 v6
+        Ipv6Addr::LOCALHOST,                       // ::1
+        Ipv6Addr::UNSPECIFIED,                     // ::
+        "fc00::1".parse().unwrap(),                // unique-local
+        "fd00::1".parse().unwrap(),                // unique-local
+        "fe80::1".parse().unwrap(),                // link-local
+        "ff02::1".parse().unwrap(),                // multicast
+        "::ffff:127.0.0.1".parse().unwrap(),       // ipv4-mapped loopback
+        "::ffff:10.0.0.1".parse().unwrap(),        // ipv4-mapped RFC1918
+        "::ffff:169.254.169.254".parse().unwrap(), // ipv4-mapped IMDS
+        "fd00:ec2::254".parse().unwrap(),          // AWS IMDSv2 v6
     ];
     for ip in denied {
         assert!(is_denied_ip(IpAddr::V6(*ip)), "expected denied: {ip}");

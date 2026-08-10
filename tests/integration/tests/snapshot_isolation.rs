@@ -103,7 +103,11 @@ async fn open_engine_with_shard() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -158,7 +162,10 @@ async fn two_session_snapshot_stable_count_in_memory() {
     // B commits a new row (auto-commit) — advances the catalog head.
     b.execute("INSERT INTO t VALUES (4)").await.unwrap();
     let b_sees = count(&b, "SELECT COUNT(*) FROM t").await;
-    assert_eq!(b_sees, 4, "B (auto-commit) must see its own committed row; saw {b_sees}");
+    assert_eq!(
+        b_sees, 4,
+        "B (auto-commit) must see its own committed row; saw {b_sees}"
+    );
 
     // A's second read MUST still be the pinned snapshot value.
     let second = count(&a, "SELECT COUNT(*) FROM t").await;
@@ -172,7 +179,10 @@ async fn two_session_snapshot_stable_count_in_memory() {
 
     // After COMMIT the snapshot pin is released: A now sees B's row too.
     let after = count(&a, "SELECT COUNT(*) FROM t").await;
-    assert_eq!(after, 4, "post-COMMIT A must see the live head (4 rows); saw {after}");
+    assert_eq!(
+        after, 4,
+        "post-COMMIT A must see the live head (4 rows); saw {after}"
+    );
 }
 
 /// Same shape on the shard+WAL engine — the configuration the bench harness
@@ -313,17 +323,25 @@ async fn snapshot_stable_after_prior_hot_update_overlay_shard() {
         .unwrap();
     let mut stmt = String::from("INSERT INTO rstress (id, v, note) VALUES ");
     for i in 0..300i64 {
-        if i > 0 { stmt.push(','); }
+        if i > 0 {
+            stmt.push(',');
+        }
         stmt.push_str(&format!("({i}, {i}, NULL)"));
     }
     a.execute(&stmt).await.unwrap();
 
     // Read fan-out then a hot-tier UPDATE (leaves Update overlay entries).
-    let _ = a.execute("SELECT id, v FROM rstress WHERE id BETWEEN 0 AND 9").await.unwrap();
+    let _ = a
+        .execute("SELECT id, v FROM rstress WHERE id BETWEEN 0 AND 9")
+        .await
+        .unwrap();
     for k in 0..3 {
-        a.execute(&format!("UPDATE rstress SET v = v + {} WHERE id < 50", k + 1))
-            .await
-            .unwrap();
+        a.execute(&format!(
+            "UPDATE rstress SET v = v + {} WHERE id < 50",
+            k + 1
+        ))
+        .await
+        .unwrap();
     }
 
     a.execute("BEGIN").await.unwrap();
@@ -333,6 +351,9 @@ async fn snapshot_stable_after_prior_hot_update_overlay_shard() {
         .await
         .unwrap();
     let c2 = count(&a, "SELECT COUNT(*) FROM rstress").await;
-    assert_eq!(c2, c1, "A's second in-tx count must equal first (snapshot stable); saw {c2} vs {c1}");
+    assert_eq!(
+        c2, c1,
+        "A's second in-tx count must equal first (snapshot stable); saw {c2} vs {c1}"
+    );
     a.execute("COMMIT").await.unwrap();
 }

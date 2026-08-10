@@ -51,7 +51,10 @@ mod common;
 use common::{build_basin_engine, median, try_connect, SchemaGuard};
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn write_artifact(file: &str, value: &serde_json::Value) {
@@ -97,8 +100,16 @@ const VOCAB: usize = 2000;
 
 fn word(i: usize) -> String {
     let roots = [
-        "database", "query", "index", "table", "column", "row", "schema",
-        "transaction", "storage", "cache",
+        "database",
+        "query",
+        "index",
+        "table",
+        "column",
+        "row",
+        "schema",
+        "transaction",
+        "storage",
+        "cache",
     ];
     let root = roots[i % roots.len()];
     format!("{root}{}", i / roots.len())
@@ -142,10 +153,15 @@ async fn basin_p50(
 }
 
 async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f64> {
-    let _ = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await;
+    let _ = pg
+        .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+        .await;
     let mut s = Vec::with_capacity(n);
     for _ in 0..n {
-        if let Ok(rs) = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await {
+        if let Ok(rs) = pg
+            .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+            .await
+        {
             for m in &rs {
                 if let SimpleQueryMessage::Row(r) = m {
                     if let Some(line) = r.get(0) {
@@ -162,7 +178,11 @@ async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f6
             }
         }
     }
-    if s.is_empty() { None } else { Some(median(&s)) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(median(&s))
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -174,10 +194,16 @@ async fn ext_bench_fts() {
 
     // ── Basin setup + F1 ingest cost ─────────────────────────────────────────
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
-    sess.execute("CREATE TABLE articles (id BIGINT NOT NULL PRIMARY KEY, body TEXT NOT NULL, tsv TSVECTOR)")
+    let sess = instance
+        .engine
+        .open_session(instance.project)
         .await
         .unwrap();
+    sess.execute(
+        "CREATE TABLE articles (id BIGINT NOT NULL PRIMARY KEY, body TEXT NOT NULL, tsv TSVECTOR)",
+    )
+    .await
+    .unwrap();
 
     let batch = 5_000usize;
     let mut off = 0usize;
@@ -207,27 +233,46 @@ async fn ext_bench_fts() {
         bg.shutdown().await;
     }
     let basin_ingest_s = ingest_start.elapsed().as_secs_f64();
-    let basin_ingest_rate = if basin_ingest_s > 0.0 { rows as f64 / basin_ingest_s } else { 0.0 };
+    let basin_ingest_rate = if basin_ingest_s > 0.0 {
+        rows as f64 / basin_ingest_s
+    } else {
+        0.0
+    };
     eprintln!("[ext_bench_fts] basin seed+tsvector complete in {basin_ingest_s:.2}s (tsv_build_ok={tsv_build_ok})");
 
     let basin_gin_ddl_ok = sess
         .execute("CREATE INDEX articles_tsv_gin ON articles USING GIN (tsv)")
         .await
         .is_ok();
-    eprintln!("[ext_bench_fts] basin GIN DDL: {}", if basin_gin_ddl_ok { "ok" } else { "not wired (gap)" });
+    eprintln!(
+        "[ext_bench_fts] basin GIN DDL: {}",
+        if basin_gin_ddl_ok {
+            "ok"
+        } else {
+            "not wired (gap)"
+        }
+    );
 
     // Basin shapes use the materialised tsv column if it built, else inline.
-    let tcol = if tsv_build_ok { "tsv".to_string() } else { "to_tsvector('english', body)".to_string() };
+    let tcol = if tsv_build_ok {
+        "tsv".to_string()
+    } else {
+        "to_tsvector('english', body)".to_string()
+    };
 
     let f2_sql = format!("SELECT id FROM articles WHERE {tcol} @@ to_tsquery('english', '{TERM}')");
-    let f3_sql = format!("SELECT id FROM articles WHERE {tcol} @@ to_tsquery('english', '{AND_Q}')");
+    let f3_sql =
+        format!("SELECT id FROM articles WHERE {tcol} @@ to_tsquery('english', '{AND_Q}')");
     let f4_sql = format!("SELECT id FROM articles WHERE {tcol} @@ to_tsquery('english', '{OR_Q}')");
-    let f5_sql = format!("SELECT id FROM articles WHERE {tcol} @@ to_tsquery('english', '{PHRASE_Q}')");
+    let f5_sql =
+        format!("SELECT id FROM articles WHERE {tcol} @@ to_tsquery('english', '{PHRASE_Q}')");
     let f6_sql = format!(
         "SELECT id, ts_rank({tcol}, to_tsquery('english', '{TERM}')) AS rank FROM articles \
          WHERE {tcol} @@ to_tsquery('english', '{TERM}') ORDER BY rank DESC LIMIT 10"
     );
-    let f7_sql = format!("SELECT id FROM articles WHERE {tcol} @@ websearch_to_tsquery('english', '{WEB_Q}')");
+    let f7_sql = format!(
+        "SELECT id FROM articles WHERE {tcol} @@ websearch_to_tsquery('english', '{WEB_Q}')"
+    );
     let f8_sql = format!(
         "SELECT ts_headline('english', body, to_tsquery('english', '{TERM}')) FROM articles \
          WHERE {tcol} @@ to_tsquery('english', '{TERM}') LIMIT 50"
@@ -263,11 +308,18 @@ async fn ext_bench_fts() {
         pg_available = true;
         let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
         let schema = format!("basin_ext_fts_{suffix}");
-        let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-        pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.ok();
+        let _guard = SchemaGuard {
+            schema: schema.clone(),
+            conn_str: cs,
+        };
+        pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .ok();
         pg.simple_query("SET work_mem = '16MB'").await.ok();
         // FTS is core PG (no extension needed) but probe symmetric to the family.
-        let _ = pg.simple_query("CREATE EXTENSION IF NOT EXISTS unaccent").await;
+        let _ = pg
+            .simple_query("CREATE EXTENSION IF NOT EXISTS unaccent")
+            .await;
 
         pg.simple_query(&format!(
             "CREATE TABLE {schema}.articles (id BIGINT PRIMARY KEY, body TEXT NOT NULL, tsv TSVECTOR)"
@@ -285,23 +337,77 @@ async fn ext_bench_fts() {
                 let body = body_for(k).replace('\'', "''");
                 v.push_str(&format!("({k},'{body}')"));
             }
-            pg.simple_query(&format!("INSERT INTO {schema}.articles (id, body) VALUES {v}")).await.ok();
+            pg.simple_query(&format!(
+                "INSERT INTO {schema}.articles (id, body) VALUES {v}"
+            ))
+            .await
+            .ok();
             po = hi;
         }
-        pg.simple_query(&format!("UPDATE {schema}.articles SET tsv = to_tsvector('english', body)")).await.ok();
+        pg.simple_query(&format!(
+            "UPDATE {schema}.articles SET tsv = to_tsvector('english', body)"
+        ))
+        .await
+        .ok();
         let pg_s = pg_start.elapsed().as_secs_f64();
-        pg_ingest_rate = if pg_s > 0.0 { Some(rows as f64 / pg_s) } else { None };
-        pg.simple_query(&format!("CREATE INDEX articles_tsv_gin ON {schema}.articles USING GIN (tsv)")).await.ok();
-        pg.simple_query(&format!("ANALYZE {schema}.articles")).await.ok();
+        pg_ingest_rate = if pg_s > 0.0 {
+            Some(rows as f64 / pg_s)
+        } else {
+            None
+        };
+        pg.simple_query(&format!(
+            "CREATE INDEX articles_tsv_gin ON {schema}.articles USING GIN (tsv)"
+        ))
+        .await
+        .ok();
+        pg.simple_query(&format!("ANALYZE {schema}.articles"))
+            .await
+            .ok();
 
-        pg_f2_rows = pg.simple_query(&format!(
-            "SELECT id FROM {schema}.articles WHERE tsv @@ to_tsquery('english', '{TERM}')"
-        )).await.map(|rs| rs.iter().filter(|m| matches!(m, SimpleQueryMessage::Row(_))).count()).unwrap_or(0);
+        pg_f2_rows = pg
+            .simple_query(&format!(
+                "SELECT id FROM {schema}.articles WHERE tsv @@ to_tsquery('english', '{TERM}')"
+            ))
+            .await
+            .map(|rs| {
+                rs.iter()
+                    .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
+                    .count()
+            })
+            .unwrap_or(0);
 
-        pg_f2 = pg_p50(&pg, &format!("SELECT id FROM {schema}.articles WHERE tsv @@ to_tsquery('english', '{TERM}')"), samples).await;
-        pg_f3 = pg_p50(&pg, &format!("SELECT id FROM {schema}.articles WHERE tsv @@ to_tsquery('english', '{AND_Q}')"), samples).await;
-        pg_f4 = pg_p50(&pg, &format!("SELECT id FROM {schema}.articles WHERE tsv @@ to_tsquery('english', '{OR_Q}')"), samples).await;
-        pg_f5 = pg_p50(&pg, &format!("SELECT id FROM {schema}.articles WHERE tsv @@ to_tsquery('english', '{PHRASE_Q}')"), samples).await;
+        pg_f2 = pg_p50(
+            &pg,
+            &format!(
+                "SELECT id FROM {schema}.articles WHERE tsv @@ to_tsquery('english', '{TERM}')"
+            ),
+            samples,
+        )
+        .await;
+        pg_f3 = pg_p50(
+            &pg,
+            &format!(
+                "SELECT id FROM {schema}.articles WHERE tsv @@ to_tsquery('english', '{AND_Q}')"
+            ),
+            samples,
+        )
+        .await;
+        pg_f4 = pg_p50(
+            &pg,
+            &format!(
+                "SELECT id FROM {schema}.articles WHERE tsv @@ to_tsquery('english', '{OR_Q}')"
+            ),
+            samples,
+        )
+        .await;
+        pg_f5 = pg_p50(
+            &pg,
+            &format!(
+                "SELECT id FROM {schema}.articles WHERE tsv @@ to_tsquery('english', '{PHRASE_Q}')"
+            ),
+            samples,
+        )
+        .await;
         pg_f6 = pg_p50(&pg, &format!(
             "SELECT id, ts_rank(tsv, to_tsquery('english', '{TERM}')) AS rank FROM {schema}.articles \
              WHERE tsv @@ to_tsquery('english', '{TERM}') ORDER BY rank DESC LIMIT 10"), samples).await;
@@ -310,7 +416,9 @@ async fn ext_bench_fts() {
             "SELECT ts_headline('english', body, to_tsquery('english', '{TERM}')) FROM {schema}.articles \
              WHERE tsv @@ to_tsquery('english', '{TERM}') LIMIT 50"), samples).await;
 
-        let _ = pg.simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+        let _ = pg
+            .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await;
         std::mem::forget(_guard);
     } else {
         eprintln!("[ext_bench_fts] PG unavailable — Basin-only card");
@@ -326,46 +434,52 @@ async fn ext_bench_fts() {
         }
     }
 
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("ext_bench_fts.json", &json!({
-        "card": "ext_bench_fts",
-        "family": "fts",
-        "generated_at": format!("@{ts}"),
-        "pg_available": pg_available,
-        "basin_gin_ddl_ok": basin_gin_ddl_ok,
-        "basin_tsv_column_built": tsv_build_ok,
-        "config": { "rows": rows, "samples": samples, "vocab_size": VOCAB },
-        "ingest": {
-            "label": "F1: to_tsvector ingest rate (rows/s, includes tsv build)",
-            "basin_rows_per_s": basin_ingest_rate,
-            "pg_rows_per_s": pg_ingest_rate,
-        },
-        "shapes": [
-            { "label": "F2: @@ single-term", "basin_p50_ms": opt_ms(f2_b), "pg_p50_ms": opt_ms(pg_f2),
-              "basin_over_pg": ratio(f2_b, pg_f2), "basin_rows": f2_rows, "pg_rows": pg_f2_rows,
-              "basin_uses_gin": basin_gin_ddl_ok, "pg_uses_gin": pg_available },
-            { "label": "F3: @@ multi-term AND", "basin_p50_ms": opt_ms(f3_b), "pg_p50_ms": opt_ms(pg_f3),
-              "basin_over_pg": ratio(f3_b, pg_f3), "basin_rows": f3_rows },
-            { "label": "F4: @@ multi-term OR", "basin_p50_ms": opt_ms(f4_b), "pg_p50_ms": opt_ms(pg_f4),
-              "basin_over_pg": ratio(f4_b, pg_f4), "basin_rows": f4_rows },
-            { "label": "F5: @@ phrase (<->)", "basin_p50_ms": opt_ms(f5_b), "pg_p50_ms": opt_ms(pg_f5),
-              "basin_over_pg": ratio(f5_b, pg_f5) },
-            { "label": "F6: @@ + ts_rank ORDER BY LIMIT 10 (search page)", "basin_p50_ms": opt_ms(f6_b),
-              "pg_p50_ms": opt_ms(pg_f6), "basin_over_pg": ratio(f6_b, pg_f6), "basin_rows": f6_rows },
-            { "label": "F7: websearch_to_tsquery e2e", "basin_p50_ms": opt_ms(f7_b), "pg_p50_ms": opt_ms(pg_f7),
-              "basin_over_pg": ratio(f7_b, pg_f7), "basin_rows": f7_rows },
-            { "label": "F8: ts_headline projection (LIMIT 50)", "basin_p50_ms": opt_ms(f8_b),
-              "pg_p50_ms": opt_ms(pg_f8), "basin_over_pg": ratio(f8_b, pg_f8) },
-        ],
-        "note": if basin_gin_ddl_ok {
-            "Basin accepted GIN DDL on the tsv column; PG uses its GIN index. Both \
-             engines answer @@ over a materialised tsvector column."
-        } else {
-            "Basin GIN DDL not wired; Basin uses a sequential tsvector scan (over the \
-             materialised tsv column if built, else inline to_tsvector). PG uses GIN. \
-             The timing gap is expected and recorded honestly."
-        },
-    }));
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "ext_bench_fts.json",
+        &json!({
+            "card": "ext_bench_fts",
+            "family": "fts",
+            "generated_at": format!("@{ts}"),
+            "pg_available": pg_available,
+            "basin_gin_ddl_ok": basin_gin_ddl_ok,
+            "basin_tsv_column_built": tsv_build_ok,
+            "config": { "rows": rows, "samples": samples, "vocab_size": VOCAB },
+            "ingest": {
+                "label": "F1: to_tsvector ingest rate (rows/s, includes tsv build)",
+                "basin_rows_per_s": basin_ingest_rate,
+                "pg_rows_per_s": pg_ingest_rate,
+            },
+            "shapes": [
+                { "label": "F2: @@ single-term", "basin_p50_ms": opt_ms(f2_b), "pg_p50_ms": opt_ms(pg_f2),
+                  "basin_over_pg": ratio(f2_b, pg_f2), "basin_rows": f2_rows, "pg_rows": pg_f2_rows,
+                  "basin_uses_gin": basin_gin_ddl_ok, "pg_uses_gin": pg_available },
+                { "label": "F3: @@ multi-term AND", "basin_p50_ms": opt_ms(f3_b), "pg_p50_ms": opt_ms(pg_f3),
+                  "basin_over_pg": ratio(f3_b, pg_f3), "basin_rows": f3_rows },
+                { "label": "F4: @@ multi-term OR", "basin_p50_ms": opt_ms(f4_b), "pg_p50_ms": opt_ms(pg_f4),
+                  "basin_over_pg": ratio(f4_b, pg_f4), "basin_rows": f4_rows },
+                { "label": "F5: @@ phrase (<->)", "basin_p50_ms": opt_ms(f5_b), "pg_p50_ms": opt_ms(pg_f5),
+                  "basin_over_pg": ratio(f5_b, pg_f5) },
+                { "label": "F6: @@ + ts_rank ORDER BY LIMIT 10 (search page)", "basin_p50_ms": opt_ms(f6_b),
+                  "pg_p50_ms": opt_ms(pg_f6), "basin_over_pg": ratio(f6_b, pg_f6), "basin_rows": f6_rows },
+                { "label": "F7: websearch_to_tsquery e2e", "basin_p50_ms": opt_ms(f7_b), "pg_p50_ms": opt_ms(pg_f7),
+                  "basin_over_pg": ratio(f7_b, pg_f7), "basin_rows": f7_rows },
+                { "label": "F8: ts_headline projection (LIMIT 50)", "basin_p50_ms": opt_ms(f8_b),
+                  "pg_p50_ms": opt_ms(pg_f8), "basin_over_pg": ratio(f8_b, pg_f8) },
+            ],
+            "note": if basin_gin_ddl_ok {
+                "Basin accepted GIN DDL on the tsv column; PG uses its GIN index. Both \
+                 engines answer @@ over a materialised tsvector column."
+            } else {
+                "Basin GIN DDL not wired; Basin uses a sequential tsvector scan (over the \
+                 materialised tsv column if built, else inline to_tsvector). PG uses GIN. \
+                 The timing gap is expected and recorded honestly."
+            },
+        }),
+    );
 
     instance.wal.close().await.unwrap();
 }

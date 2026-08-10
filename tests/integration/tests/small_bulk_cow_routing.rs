@@ -258,7 +258,11 @@ async fn payload_for_id(sess: &ProjectSession, table: &str, id: i64) -> Value {
 /// nothing, so both must be UNCHANGED across it; a cold CoW UPDATE runs
 /// `commit_replace` (new snapshot, replacement file paths), so both change.
 /// This is the "zero replacement files" detector.
-async fn cold_tier_state(eng: &Engine, project: &ProjectId, table: &TableName) -> (u64, Vec<String>) {
+async fn cold_tier_state(
+    eng: &Engine,
+    project: &ProjectId,
+    table: &TableName,
+) -> (u64, Vec<String>) {
     let meta = eng
         .config()
         .catalog
@@ -308,7 +312,11 @@ async fn seed_events(sess: &ProjectSession, table: &str, n: i64) {
         .map(|k| format!(r#"({k}, '{{"category":"c","score":{k}}}')"#))
         .collect::<Vec<_>>()
         .join(",");
-    exec(sess, &format!("INSERT INTO {table} (id, payload) VALUES {vals}")).await;
+    exec(
+        sess,
+        &format!("INSERT INTO {table} (id, payload) VALUES {vals}"),
+    )
+    .await;
 }
 
 /// `(id BIGINT PRIMARY KEY, v BIGINT NOT NULL, status TEXT NOT NULL)` with `n`
@@ -370,14 +378,26 @@ async fn jsonb_set_pk_range_routes_fast_path() {
     // Values correct on matched rows, untouched elsewhere.
     for pk in 1..=10 {
         let doc = payload_for_id(&sess, "events", pk).await;
-        assert_eq!(doc["score"], serde_json::json!(999), "id={pk} score rewritten");
-        assert_eq!(doc["category"], serde_json::json!("c"), "category preserved");
+        assert_eq!(
+            doc["score"],
+            serde_json::json!(999),
+            "id={pk} score rewritten"
+        );
+        assert_eq!(
+            doc["category"],
+            serde_json::json!("c"),
+            "category preserved"
+        );
     }
     let untouched = payload_for_id(&sess, "events", 11).await;
     assert_eq!(untouched["score"], serde_json::json!(11), "id=11 untouched");
 
     // COUNT stable — UPDATE never changes cardinality.
-    assert_eq!(count_all(&sess, "events").await, 50, "COUNT stable after UPDATE");
+    assert_eq!(
+        count_all(&sess, "events").await,
+        50,
+        "COUNT stable after UPDATE"
+    );
 }
 
 // ── 2. CASE conditional over a PK range ─────────────────────────────────────
@@ -408,10 +428,19 @@ async fn case_conditional_pk_range_routes_fast_path() {
     );
 
     // id=5 has v=50 → not > 50 → 'lo'; id=6 has v=60 → 'hi'.
-    assert_eq!(fetch_text(&sess, "t", "status", 5).await.as_deref(), Some("lo"));
-    assert_eq!(fetch_text(&sess, "t", "status", 6).await.as_deref(), Some("hi"));
+    assert_eq!(
+        fetch_text(&sess, "t", "status", 5).await.as_deref(),
+        Some("lo")
+    );
+    assert_eq!(
+        fetch_text(&sess, "t", "status", 6).await.as_deref(),
+        Some("hi")
+    );
     // id=10 outside WHERE → untouched.
-    assert_eq!(fetch_text(&sess, "t", "status", 10).await.as_deref(), Some("old"));
+    assert_eq!(
+        fetch_text(&sess, "t", "status", 10).await.as_deref(),
+        Some("old")
+    );
     assert_eq!(count_all(&sess, "t").await, 30, "COUNT stable");
 }
 
@@ -434,7 +463,11 @@ async fn non_pk_predicate_routes_via_probe() {
     // Mark 5 rows (id 3,6,9,12,15) with status='flag' via the existing fast
     // path (single-row PK-eq), then bulk-update by the non-PK predicate.
     for pk in [3, 6, 9, 12, 15] {
-        exec(&sess, &format!("UPDATE t SET status = 'flag' WHERE id = {pk}")).await;
+        exec(
+            &sess,
+            &format!("UPDATE t SET status = 'flag' WHERE id = {pk}"),
+        )
+        .await;
     }
 
     exec(&sess, "UPDATE t SET v = 7777 WHERE status = 'flag'").await;
@@ -445,10 +478,18 @@ async fn non_pk_predicate_routes_via_probe() {
             registry_has_update(&eng, &project, &table, pk),
             "id={pk} must have an overlay Update after non-PK probe UPDATE"
         );
-        assert_eq!(fetch_i64(&sess, "t", "v", pk).await, Some(7777), "id={pk} v rewritten");
+        assert_eq!(
+            fetch_i64(&sess, "t", "v", pk).await,
+            Some(7777),
+            "id={pk} v rewritten"
+        );
     }
     // A non-flagged row keeps its seeded value.
-    assert_eq!(fetch_i64(&sess, "t", "v", 4).await, Some(40), "id=4 untouched");
+    assert_eq!(
+        fetch_i64(&sess, "t", "v", 4).await,
+        Some(40),
+        "id=4 untouched"
+    );
     assert_eq!(count_all(&sess, "t").await, 30, "COUNT stable");
 }
 
@@ -488,9 +529,21 @@ async fn over_cap_falls_to_cold() {
     );
 
     // Values still correct via the cold rewrite.
-    assert_eq!(fetch_i64(&sess, "t", "v", 1).await, Some(1), "id=1 rewritten by cold path");
-    assert_eq!(fetch_i64(&sess, "t", "v", 65).await, Some(1), "id=65 rewritten by cold path");
-    assert_eq!(fetch_i64(&sess, "t", "v", 66).await, Some(660), "id=66 untouched");
+    assert_eq!(
+        fetch_i64(&sess, "t", "v", 1).await,
+        Some(1),
+        "id=1 rewritten by cold path"
+    );
+    assert_eq!(
+        fetch_i64(&sess, "t", "v", 65).await,
+        Some(1),
+        "id=65 rewritten by cold path"
+    );
+    assert_eq!(
+        fetch_i64(&sess, "t", "v", 66).await,
+        Some(660),
+        "id=66 untouched"
+    );
     assert_eq!(count_all(&sess, "t").await, 200, "COUNT stable");
 
     restore_env("BASIN_DELTA_UPDATE_MAX_KEYS", prev);
@@ -519,8 +572,16 @@ async fn exactly_cap_routes_fast_path() {
         64,
         "exactly cap (64) matches must take the fast path"
     );
-    assert_eq!(fetch_i64(&sess, "t", "v", 64).await, Some(2), "id=64 rewritten via overlay");
-    assert_eq!(fetch_i64(&sess, "t", "v", 65).await, Some(650), "id=65 untouched");
+    assert_eq!(
+        fetch_i64(&sess, "t", "v", 64).await,
+        Some(2),
+        "id=64 rewritten via overlay"
+    );
+    assert_eq!(
+        fetch_i64(&sess, "t", "v", 65).await,
+        Some(650),
+        "id=65 untouched"
+    );
 
     restore_env("BASIN_DELTA_UPDATE_MAX_KEYS", prev);
 }
@@ -542,7 +603,10 @@ async fn mixed_with_prior_overlay_accumulates() {
 
     // First: single-row overlay UPDATE sets id=3.v = 1000.
     exec(&sess, "UPDATE t SET v = 1000 WHERE id = 3").await;
-    assert!(registry_has_update(&eng, &project, &table, 3), "prior overlay present");
+    assert!(
+        registry_has_update(&eng, &project, &table, 3),
+        "prior overlay present"
+    );
 
     // Then: a multi-key range RMW `v = v + 1` over id < 6. id=3 must read the
     // OVERLAY value (1000), not the stale cold base (30), → 1001.
@@ -554,7 +618,11 @@ async fn mixed_with_prior_overlay_accumulates() {
         "range RMW must accumulate on the prior overlay value (1000 + 1)"
     );
     // A row not previously overlaid reads the cold base: id=1 → 10 + 1 = 11.
-    assert_eq!(fetch_i64(&sess, "t", "v", 1).await, Some(11), "id=1 cold base + 1");
+    assert_eq!(
+        fetch_i64(&sess, "t", "v", 1).await,
+        Some(11),
+        "id=1 cold base + 1"
+    );
     assert_eq!(count_all(&sess, "t").await, 20, "COUNT stable");
 }
 
@@ -587,8 +655,16 @@ async fn jsonb_set_missing_path_routes_fast_path() {
     );
     for pk in 2..=5 {
         let doc = payload_for_id(&sess, "events", pk).await;
-        assert_eq!(doc["tier"], serde_json::json!("gold"), "id={pk} tier created");
-        assert_eq!(doc["score"], serde_json::json!(pk), "id={pk} score preserved");
+        assert_eq!(
+            doc["tier"],
+            serde_json::json!("gold"),
+            "id={pk} tier created"
+        );
+        assert_eq!(
+            doc["score"],
+            serde_json::json!(pk),
+            "id={pk} score preserved"
+        );
     }
     // Outside the range: no `tier` key.
     let untouched = payload_for_id(&sess, "events", 6).await;
@@ -694,7 +770,11 @@ async fn coalesce_function_routes_fast_path() {
         3,
         "coalesce(...) is allowlisted; small-range UPDATE must take the fast path"
     );
-    assert_eq!(fetch_i64(&sess, "t", "v", 1).await, Some(11), "coalesce(10,0)+1 = 11");
+    assert_eq!(
+        fetch_i64(&sess, "t", "v", 1).await,
+        Some(11),
+        "coalesce(10,0)+1 = 11"
+    );
 }
 
 // ── 9. Raised cap: 200-key UPDATE routes delta with zero replacement files ──
@@ -730,9 +810,21 @@ async fn two_hundred_keys_route_delta_zero_replacement_files() {
 
     // RMW correctness across the whole range + the boundary.
     assert_eq!(fetch_i64(&sess, "t", "v", 1).await, Some(11), "10 + 1");
-    assert_eq!(fetch_i64(&sess, "t", "v", 137).await, Some(1371), "1370 + 1");
-    assert_eq!(fetch_i64(&sess, "t", "v", 200).await, Some(2001), "2000 + 1");
-    assert_eq!(fetch_i64(&sess, "t", "v", 201).await, Some(2010), "id=201 untouched");
+    assert_eq!(
+        fetch_i64(&sess, "t", "v", 137).await,
+        Some(1371),
+        "1370 + 1"
+    );
+    assert_eq!(
+        fetch_i64(&sess, "t", "v", 200).await,
+        Some(2001),
+        "2000 + 1"
+    );
+    assert_eq!(
+        fetch_i64(&sess, "t", "v", 201).await,
+        Some(2010),
+        "id=201 untouched"
+    );
     assert_eq!(count_all(&sess, "t").await, 300, "COUNT stable");
 }
 
@@ -787,9 +879,21 @@ async fn hard_cap_exhausted_falls_cold() {
     );
 
     // Result correct via the cold rewrite.
-    assert_eq!(fetch_i64(&sess, "t", "v", 1).await, Some(11), "10 + 1 via cold path");
-    assert_eq!(fetch_i64(&sess, "t", "v", 50).await, Some(501), "500 + 1 via cold path");
-    assert_eq!(fetch_i64(&sess, "t", "v", 51).await, Some(510), "id=51 untouched");
+    assert_eq!(
+        fetch_i64(&sess, "t", "v", 1).await,
+        Some(11),
+        "10 + 1 via cold path"
+    );
+    assert_eq!(
+        fetch_i64(&sess, "t", "v", 50).await,
+        Some(501),
+        "500 + 1 via cold path"
+    );
+    assert_eq!(
+        fetch_i64(&sess, "t", "v", 51).await,
+        Some(510),
+        "id=51 untouched"
+    );
     assert_eq!(count_all(&sess, "t").await, 200, "COUNT stable");
 
     // Hygiene: hand the synthetic reservation back.
@@ -911,7 +1015,11 @@ async fn no_where_over_cap_falls_to_cold() {
     let after = cold_tier_state(&eng, &project, &table).await;
     assert_ne!(before, after, "cold CoW must commit replacement files");
     for pk in [1, 15, 30] {
-        assert_eq!(fetch_i64(&sess, "t", "v", pk).await, Some(1), "id={pk} rewritten");
+        assert_eq!(
+            fetch_i64(&sess, "t", "v", pk).await,
+            Some(1),
+            "id={pk} rewritten"
+        );
     }
     assert_eq!(count_all(&sess, "t").await, 30, "COUNT stable");
 

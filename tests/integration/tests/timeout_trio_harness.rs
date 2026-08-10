@@ -177,7 +177,10 @@ async fn lock_timeout_fires_and_returns_55P03() {
         .expect("INSERT seed row");
 
     // ── Transaction A: acquire row lock and hold it ───────────────────────────
-    client_a.execute("BEGIN", &[]).await.expect("client_a: BEGIN");
+    client_a
+        .execute("BEGIN", &[])
+        .await
+        .expect("client_a: BEGIN");
     client_a
         .execute("UPDATE locks_test SET val = 1 WHERE id = 1", &[])
         .await
@@ -189,7 +192,10 @@ async fn lock_timeout_fires_and_returns_55P03() {
         .execute("SET lock_timeout = '100ms'", &[])
         .await
         .expect("client_b: SET lock_timeout");
-    client_b.execute("BEGIN", &[]).await.expect("client_b: BEGIN");
+    client_b
+        .execute("BEGIN", &[])
+        .await
+        .expect("client_b: BEGIN");
 
     let t0 = Instant::now();
     let result = client_b
@@ -270,12 +276,12 @@ async fn idle_in_transaction_session_timeout_closes_session() {
     let client = connect(server.addr).await;
 
     // ── Open transaction and set the idle-in-transaction timeout ─────────────
-    client.execute("BEGIN", &[]).await.expect("idle_in_txn: BEGIN");
     client
-        .execute(
-            "SET idle_in_transaction_session_timeout = '500ms'",
-            &[],
-        )
+        .execute("BEGIN", &[])
+        .await
+        .expect("idle_in_txn: BEGIN");
+    client
+        .execute("SET idle_in_transaction_session_timeout = '500ms'", &[])
         .await
         .expect("idle_in_txn: SET idle_in_transaction_session_timeout");
 
@@ -289,10 +295,7 @@ async fn idle_in_transaction_session_timeout_closes_session() {
 
     // ── Next query must fail — session was terminated by the reaper ───────────
     let result = client.execute("SELECT 1", &[]).await;
-    println!(
-        "[5.28.A idle_in_txn] post-idle SELECT result: {:?}",
-        result
-    );
+    println!("[5.28.A idle_in_txn] post-idle SELECT result: {:?}", result);
 
     assert!(
         result.is_err(),
@@ -461,9 +464,7 @@ async fn statement_timeout_already_works_per_6_P0_A() {
          (statement_timeout=100ms). elapsed={elapsed:?}"
     );
 
-    println!(
-        "[5.28.A canary] PASSED — SQLSTATE 57014 received within {elapsed:?}"
-    );
+    println!("[5.28.A canary] PASSED — SQLSTATE 57014 received within {elapsed:?}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

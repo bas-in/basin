@@ -67,7 +67,12 @@ pub const START_REPLICATION_WIRING: &str =
 /// Is the pgwire replication command path enabled?
 pub fn replication_enabled() -> bool {
     std::env::var(REPLICATION_ENABLED_ENV)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -104,8 +109,14 @@ fn normalise(sql: &str) -> &str {
 /// quoted: `CREATE_REPLICATION_SLOT "my_slot" LOGICAL pgoutput`).
 fn unquote(s: &str) -> String {
     let t = s.trim();
-    let t = t.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(t);
-    let t = t.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')).unwrap_or(t);
+    let t = t
+        .strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .unwrap_or(t);
+    let t = t
+        .strip_prefix('\'')
+        .and_then(|x| x.strip_suffix('\''))
+        .unwrap_or(t);
     t.to_string()
 }
 
@@ -195,15 +206,7 @@ const FORMAT_CODE_TEXT: i16 = 0;
 
 /// A single text-format field descriptor for a replication-command result row.
 fn text_field(name: &str, ty: Type) -> FieldDescription {
-    FieldDescription::new(
-        name.to_string(),
-        0,
-        0,
-        ty.oid(),
-        -1,
-        -1,
-        FORMAT_CODE_TEXT,
-    )
+    FieldDescription::new(name.to_string(), 0, 0, ty.oid(), -1, -1, FORMAT_CODE_TEXT)
 }
 
 /// Encode a one-row text-format result: a `RowDescription`, one `DataRow`, and
@@ -310,10 +313,8 @@ mod tests {
 
     #[test]
     fn parses_create_slot_pgoutput() {
-        let cmd = parse_replication_command(
-            "CREATE_REPLICATION_SLOT debezium LOGICAL pgoutput",
-        )
-        .unwrap();
+        let cmd =
+            parse_replication_command("CREATE_REPLICATION_SLOT debezium LOGICAL pgoutput").unwrap();
         assert_eq!(
             cmd,
             ReplicationCommand::CreateSlot {
@@ -407,10 +408,7 @@ mod tests {
         assert_eq!(msgs.len(), 4);
         assert!(matches!(msgs[0], PgWireBackendMessage::RowDescription(_)));
         assert!(matches!(msgs[1], PgWireBackendMessage::DataRow(_)));
-        assert!(matches!(
-            msgs[3],
-            PgWireBackendMessage::ReadyForQuery(_)
-        ));
+        assert!(matches!(msgs[3], PgWireBackendMessage::ReadyForQuery(_)));
     }
 
     #[test]

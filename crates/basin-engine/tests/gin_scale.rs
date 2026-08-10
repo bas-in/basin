@@ -158,7 +158,11 @@ async fn gin_tiny_budget_eviction_never_wrong() {
                 wrote += 1;
             }
             if wrote > 0 {
-                exec_ok(&sess, &format!("INSERT INTO docs (id, body) VALUES {values}")).await;
+                exec_ok(
+                    &sess,
+                    &format!("INSERT INTO docs (id, body) VALUES {values}"),
+                )
+                .await;
             }
         }
         shard.flush_to_parquet().await.unwrap();

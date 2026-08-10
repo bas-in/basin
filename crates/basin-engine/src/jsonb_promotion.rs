@@ -386,8 +386,14 @@ mod tests {
         let sql =
             "SELECT json_get_text(payload, 'device'), json_get_text(payload, 'version') FROM t";
         let got = extract_json_path_accesses(sql);
-        assert!(got.contains(&("payload".to_string(), "device".to_string())), "got: {got:?}");
-        assert!(got.contains(&("payload".to_string(), "version".to_string())), "got: {got:?}");
+        assert!(
+            got.contains(&("payload".to_string(), "device".to_string())),
+            "got: {got:?}"
+        );
+        assert!(
+            got.contains(&("payload".to_string(), "version".to_string())),
+            "got: {got:?}"
+        );
         assert_eq!(got.len(), 2);
     }
 
@@ -418,7 +424,10 @@ mod tests {
         // because its first arg is not a bare column followed by ','.
         // Verify we don't extract garbage.
         for (col, _key) in &got {
-            assert!(!col.contains('('), "extracted a function-call as col name: {col}");
+            assert!(
+                !col.contains('('),
+                "extracted a function-call as col name: {col}"
+            );
         }
     }
 
@@ -488,10 +497,7 @@ mod tests {
         // Drive to threshold.
         let mut triggered = 0u32;
         for _ in 0..AUTO_PROMOTE_MIN_HITS * 3 {
-            if registry
-                .record_hit(&p, &t, "body", "status")
-                .is_some()
-            {
+            if registry.record_hit(&p, &t, "body", "status").is_some() {
                 triggered += 1;
             }
         }

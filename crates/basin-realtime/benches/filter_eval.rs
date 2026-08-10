@@ -70,5 +70,10 @@ fn bench_is_null(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_simple_eq, bench_and_composition, bench_is_null);
+criterion_group!(
+    benches,
+    bench_simple_eq,
+    bench_and_composition,
+    bench_is_null
+);
 criterion_main!(benches);

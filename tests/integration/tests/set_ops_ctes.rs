@@ -472,11 +472,9 @@ async fn cte_recursive_feeding_update() {
     let engine = engine_in(&dir);
     let s = engine.open_session(ProjectId::new()).await.unwrap();
 
-    s.execute(
-        "CREATE TABLE nodes (id BIGINT NOT NULL, flagged BOOLEAN NOT NULL DEFAULT FALSE)",
-    )
-    .await
-    .unwrap();
+    s.execute("CREATE TABLE nodes (id BIGINT NOT NULL, flagged BOOLEAN NOT NULL DEFAULT FALSE)")
+        .await
+        .unwrap();
     s.execute("INSERT INTO nodes (id) VALUES (1),(2),(3),(4),(5),(6)")
         .await
         .unwrap();
@@ -536,7 +534,8 @@ async fn cte_materialized_hint() {
         .await
         .unwrap();
 
-    let sql = "WITH src AS MATERIALIZED (SELECT n FROM nums WHERE n >= 20) SELECT n FROM src ORDER BY n";
+    let sql =
+        "WITH src AS MATERIALIZED (SELECT n FROM nums WHERE n >= 20) SELECT n FROM src ORDER BY n";
     let result = s.execute(sql).await;
     // AS MATERIALIZED is now parsed and treated as a normal CTE.
     match result {

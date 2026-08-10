@@ -136,7 +136,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage: storage.clone(),
@@ -430,7 +434,11 @@ async fn run_tier(rows: i64, batch: i64, samples: usize) {
 
     // ── 2. Selective range filter — exact result + pruning stats ─────────────
     {
-        let window: i64 = if rows >= 4_000 { 1_000 } else { (rows / 4).max(1) };
+        let window: i64 = if rows >= 4_000 {
+            1_000
+        } else {
+            (rows / 4).max(1)
+        };
         let step = (rows / (2 * samples as i64).max(1)).max(1);
         let _ = probe(format!(
             "SELECT id, v FROM t WHERE id BETWEEN {} AND {} ORDER BY id",
@@ -599,9 +607,11 @@ async fn run_tier(rows: i64, batch: i64, samples: usize) {
             let lo = (base + (s as i64) * slice).min(rows - slice);
             let hi = lo + slice - 1;
             let started = Instant::now();
-            sess.execute(&format!("UPDATE t SET v = v + 1 WHERE id BETWEEN {lo} AND {hi}"))
-                .await
-                .unwrap();
+            sess.execute(&format!(
+                "UPDATE t SET v = v + 1 WHERE id BETWEEN {lo} AND {hi}"
+            ))
+            .await
+            .unwrap();
             wall.push(started.elapsed().as_secs_f64() * 1000.0);
         }
         // Correctness: v started equal to id; the first slice's anchor row must

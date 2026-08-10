@@ -100,11 +100,7 @@ fn decode_numeric_body_to_string(bytes_with_prefix: &[u8]) -> String {
     let body = &bytes_with_prefix[4..4 + body_len];
 
     const HEADER_LEN: usize = 8;
-    assert!(
-        body.len() >= HEADER_LEN,
-        "body too short: {}",
-        body.len()
-    );
+    assert!(body.len() >= HEADER_LEN, "body too short: {}", body.len());
     let ndigits = u16::from_be_bytes([body[0], body[1]]);
     let weight = i16::from_be_bytes([body[2], body[3]]);
     let sign = u16::from_be_bytes([body[4], body[5]]);
@@ -236,7 +232,10 @@ fn pin_neg_123_45() {
     assert_eq!(weight, 0, "-123.45: weight");
     assert_eq!(ndigits, 2, "-123.45: ndigits");
     assert_eq!(digits[0], 123, "-123.45: integer group");
-    assert_eq!(digits[1], 4500, "-123.45: fractional group (45 padded to 4500)");
+    assert_eq!(
+        digits[1], 4500,
+        "-123.45: fractional group (45 padded to 4500)"
+    );
     let v = pg_numeric_to_f64(weight, sign, &digits);
     assert!(
         (v - (-123.45)).abs() < 1e-8,
@@ -346,10 +345,7 @@ fn pin_high_dscale_fractional() {
     assert_eq!(ndigits, 1);
     assert_eq!(digits[0], 1, "0.00000001: digit group");
     let v = pg_numeric_to_f64(weight, sign, &digits);
-    assert!(
-        (v - 1e-8).abs() < 1e-16,
-        "0.00000001: reconstructed = {v}"
-    );
+    assert!((v - 1e-8).abs() < 1e-16, "0.00000001: reconstructed = {v}");
 }
 
 /// Negative fractional (no integer part): -0.5
@@ -460,10 +456,7 @@ fn round_trip_small_fraction() {
     let bytes = encode_numeric_binary_bytes(raw, 38, 4);
     let got = decode_numeric_body_to_string(&bytes);
     let want = arrow_decimal_text(raw, 38, 4);
-    assert_eq!(
-        got, want,
-        "round-trip 0.0001: got={got:?} want={want:?}"
-    );
+    assert_eq!(got, want, "round-trip 0.0001: got={got:?} want={want:?}");
 }
 
 #[test]
@@ -473,10 +466,7 @@ fn round_trip_scale_zero_large() {
     let bytes = encode_numeric_binary_bytes(raw, 38, 0);
     let got = decode_numeric_body_to_string(&bytes);
     let want = arrow_decimal_text(raw, 38, 0);
-    assert_eq!(
-        got, want,
-        "round-trip large int: got={got:?} want={want:?}"
-    );
+    assert_eq!(got, want, "round-trip large int: got={got:?} want={want:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +499,11 @@ fn text_path_unchanged_numeric() {
     let data = &rows[0].data;
     let len = i32::from_be_bytes(data[0..4].try_into().unwrap());
     assert_eq!(len as usize, expected_text.len(), "text body length");
-    assert_eq!(&data[4..4 + expected_text.len()], expected_text, "text body");
+    assert_eq!(
+        &data[4..4 + expected_text.len()],
+        expected_text,
+        "text body"
+    );
 }
 
 /// Text encoding with scale=0 produces no decimal point.
@@ -554,8 +548,7 @@ fn format_code_zero_emits_text() {
     let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
 
     let text_rows = encode_batches_text_for_test(&schema, &[batch.clone()]);
-    let fmt0_rows =
-        encode_batches_with_formats_for_test(&schema, &[batch], &[0]).unwrap();
+    let fmt0_rows = encode_batches_with_formats_for_test(&schema, &[batch], &[0]).unwrap();
 
     assert_eq!(
         text_rows[0].data, fmt0_rows[0].data,
@@ -581,8 +574,7 @@ fn format_code_one_emits_binary() {
     let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
 
     let text_rows = encode_batches_text_for_test(&schema, &[batch.clone()]);
-    let bin_rows =
-        encode_batches_with_formats_for_test(&schema, &[batch], &[1]).unwrap();
+    let bin_rows = encode_batches_with_formats_for_test(&schema, &[batch], &[1]).unwrap();
 
     // Binary must be different from text.
     assert_ne!(
@@ -619,11 +611,7 @@ fn per_column_format_codes_mixed() {
         Field::new("text_col", DataType::Decimal128(10, 2), false),
         Field::new("bin_col", DataType::Decimal128(10, 3), false),
     ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(arr0), Arc::new(arr1)],
-    )
-    .unwrap();
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr0), Arc::new(arr1)]).unwrap();
 
     let rows = encode_batches_with_formats_for_test(&schema, &[batch], &[0, 1]).unwrap();
     let data = &rows[0].data;
@@ -642,9 +630,7 @@ fn per_column_format_codes_mixed() {
         "col 1 binary body must be >= 8 bytes, got {len1}"
     );
     // dscale at offset (off1 + 4 + 6) must be 3 (matching scale).
-    let dscale1 = u16::from_be_bytes(
-        data[off1 + 10..off1 + 12].try_into().unwrap(),
-    );
+    let dscale1 = u16::from_be_bytes(data[off1 + 10..off1 + 12].try_into().unwrap());
     assert_eq!(dscale1, 3, "col 1 binary dscale must be 3");
 }
 
@@ -663,11 +649,7 @@ fn single_binary_format_code_applies_to_all_columns() {
         Field::new("a", DataType::Decimal128(10, 2), false),
         Field::new("b", DataType::Decimal128(10, 0), false),
     ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(arr0), Arc::new(arr1)],
-    )
-    .unwrap();
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr0), Arc::new(arr1)]).unwrap();
 
     // Single format code 1 → all columns binary.
     let rows = encode_batches_with_formats_for_test(&schema, &[batch], &[1]).unwrap();
@@ -703,8 +685,7 @@ fn empty_format_codes_defaults_to_text() {
     let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
 
     let text_rows = encode_batches_text_for_test(&schema, &[batch.clone()]);
-    let default_rows =
-        encode_batches_with_formats_for_test(&schema, &[batch], &[]).unwrap();
+    let default_rows = encode_batches_with_formats_for_test(&schema, &[batch], &[]).unwrap();
 
     assert_eq!(
         text_rows[0].data, default_rows[0].data,

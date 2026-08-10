@@ -125,9 +125,7 @@ fn render_get_response(
         // Compute next_cursor the same way the JSON path does, but surface it
         // in a response header instead of the body.
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-        let next_cursor: Option<String> = if want_wrapped
-            && row_count as u64 >= effective_limit
-        {
+        let next_cursor: Option<String> = if want_wrapped && row_count as u64 >= effective_limit {
             // Reconstruct a JSON Value of the rows only to reuse `last_id`.
             // We only need the last row's `id`, so this is a single-row lookup.
             last_id_from_batches(&schema, &batches).map(encode_cursor)

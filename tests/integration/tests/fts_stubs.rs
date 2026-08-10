@@ -308,7 +308,10 @@ async fn tsvector_match_returns_false() {
     assert_eq!(col.data_type(), &DataType::Boolean);
     let bools = col.as_any().downcast_ref::<BooleanArray>().unwrap();
     // Phase 6.X: tsvector_match now does real matching. 'fox' IS in the vector.
-    assert!(bools.value(0), "tsvector_match should return true when term is present");
+    assert!(
+        bools.value(0),
+        "tsvector_match should return true when term is present"
+    );
 }
 
 // ---------------------------------------------------------------------------

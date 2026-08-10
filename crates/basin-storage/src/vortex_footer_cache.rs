@@ -60,20 +60,14 @@ impl VortexFooterCache {
     /// Returns `None` on a cache miss. Bumps the entry to the front of the LRU
     /// on a hit.
     pub fn get(&self, path: &ObjectPath, size_bytes: u64) -> Option<Footer> {
-        let mut g = self
-            .inner
-            .lock()
-            .expect("VortexFooterCache mutex poisoned");
+        let mut g = self.inner.lock().expect("VortexFooterCache mutex poisoned");
         g.get(&(path.clone(), size_bytes)).cloned()
     }
 
     /// Insert a parsed [`Footer`] keyed by `(path, size_bytes)`. Evicts the
     /// least-recently-used entry if at capacity.
     pub fn insert(&self, path: ObjectPath, size_bytes: u64, footer: Footer) {
-        let mut g = self
-            .inner
-            .lock()
-            .expect("VortexFooterCache mutex poisoned");
+        let mut g = self.inner.lock().expect("VortexFooterCache mutex poisoned");
         g.put((path, size_bytes), footer);
     }
 }

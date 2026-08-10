@@ -193,9 +193,7 @@ async fn cdc_create_replication_slot() {
 
     // ── Drop the slot and verify it disappears ────────────────────────────────
     // pg_drop_replication_slot must remove the slot from the catalog.
-    let drop_result = sess
-        .execute("SELECT pg_drop_replication_slot('s1')")
-        .await;
+    let drop_result = sess.execute("SELECT pg_drop_replication_slot('s1')").await;
     println!("[5.21.A slot] pg_drop_replication_slot result: {drop_result:?}");
 
     assert!(
@@ -298,17 +296,13 @@ async fn cdc_pgoutput_frame_emission() {
     );
 
     // ── Record the LSN before the INSERT ─────────────────────────────────────
-    let lsn_before = sess
-        .execute("SELECT pg_current_wal_lsn()")
-        .await;
+    let lsn_before = sess.execute("SELECT pg_current_wal_lsn()").await;
     println!("[5.21.A frames] LSN before INSERT: {lsn_before:?}");
 
     // ── INSERT a single row ───────────────────────────────────────────────────
-    sess.execute(
-        "INSERT INTO cdc_events (id, payload) VALUES (1, 'hello CDC')",
-    )
-    .await
-    .expect("INSERT cdc_events row 1");
+    sess.execute("INSERT INTO cdc_events (id, payload) VALUES (1, 'hello CDC')")
+        .await
+        .expect("INSERT cdc_events row 1");
     println!("[5.21.A frames] row inserted");
 
     // ── Consume the logical stream for this slot ──────────────────────────────
@@ -412,11 +406,9 @@ async fn cdc_lsn_management_and_retention() {
     let sess = engine.open_session(project).await.unwrap();
 
     // ── Setup: table + slot ───────────────────────────────────────────────────
-    sess.execute(
-        "CREATE TABLE lsn_test (id BIGINT NOT NULL, val TEXT NOT NULL)",
-    )
-    .await
-    .expect("CREATE TABLE lsn_test");
+    sess.execute("CREATE TABLE lsn_test (id BIGINT NOT NULL, val TEXT NOT NULL)")
+        .await
+        .expect("CREATE TABLE lsn_test");
 
     sess.execute("CREATE PUBLICATION lsn_pub FOR TABLE lsn_test")
         .await
@@ -463,9 +455,7 @@ async fn cdc_lsn_management_and_retention() {
         // We cannot compare PG_LSN values as integers here without a custom
         // type parser — instead we assert the row is non-empty (non-NULL LSN).
         let lsn_rows = match lsn_after.unwrap() {
-            ExecResult::Rows { batches, .. } => {
-                batches.iter().map(|b| b.num_rows()).sum::<usize>()
-            }
+            ExecResult::Rows { batches, .. } => batches.iter().map(|b| b.num_rows()).sum::<usize>(),
             ExecResult::Empty { .. } => 0,
         };
         assert_eq!(
@@ -530,9 +520,7 @@ async fn cdc_lsn_management_and_retention() {
         .execute("SELECT pg_drop_replication_slot('lsn_slot')")
         .await;
 
-    println!(
-        "[5.21.A lsn] PASSED — LSN monotonicity + retention cleanup verified"
-    );
+    println!("[5.21.A lsn] PASSED — LSN monotonicity + retention cleanup verified");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -637,9 +625,7 @@ async fn cdc_publication_ddl() {
     //   CREATE PUBLICATION region_pub FOR TABLE pub_orders WHERE (region = 'EU')
     // Only rows matching the filter are replicated.
     let create_filtered_pub = sess
-        .execute(
-            "CREATE PUBLICATION region_pub FOR TABLE pub_orders WHERE (region = 'EU')",
-        )
+        .execute("CREATE PUBLICATION region_pub FOR TABLE pub_orders WHERE (region = 'EU')")
         .await;
     println!("[5.21.A pub] CREATE PUBLICATION region_pub (filtered): {create_filtered_pub:?}");
     assert!(
@@ -675,9 +661,7 @@ async fn cdc_publication_ddl() {
     println!("[5.21.A pub] orders_pub covers 2 tables after ALTER ✓");
 
     // ── DROP PUBLICATION ──────────────────────────────────────────────────────
-    let drop_pub = sess
-        .execute("DROP PUBLICATION orders_pub")
-        .await;
+    let drop_pub = sess.execute("DROP PUBLICATION orders_pub").await;
     println!("[5.21.A pub] DROP PUBLICATION orders_pub: {drop_pub:?}");
     assert!(
         drop_pub.is_ok(),
@@ -698,9 +682,7 @@ async fn cdc_publication_ddl() {
     );
     println!("[5.21.A pub] orders_pub removed from pg_publication after DROP ✓");
 
-    println!(
-        "[5.21.A pub] PASSED — CREATE/ALTER/DROP PUBLICATION + row-filter + catalog views"
-    );
+    println!("[5.21.A pub] PASSED — CREATE/ALTER/DROP PUBLICATION + row-filter + catalog views");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -802,10 +784,14 @@ async fn cdc_debezium_e2e() {
     let connectors_url = format!("{debezium_url}/connectors");
     let (reg_code, reg_body) = curl(&[
         "-s",
-        "-w", "\n%{http_code}",
-        "-X", "POST",
-        "-H", "Content-Type: application/json",
-        "-d", &connector_json,
+        "-w",
+        "\n%{http_code}",
+        "-X",
+        "POST",
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        &connector_json,
         &connectors_url,
     ]);
     println!("[5.21.A debezium] connector registration code={reg_code} body={reg_body}");
@@ -816,7 +802,9 @@ async fn cdc_debezium_e2e() {
         "DEBEZIUM E2E: curl POST /connectors must exit 0. Closed by 5.21.F. \
          curl_exit={reg_code}"
     );
-    let http_status: u16 = reg_body.lines().last()
+    let http_status: u16 = reg_body
+        .lines()
+        .last()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
     assert!(
@@ -882,9 +870,7 @@ async fn cdc_debezium_e2e() {
 
     // Poll Debezium's /offsets endpoint for up to 30 s to confirm a change
     // event was consumed (LSN offset advanced → non-trivial body containing "lsn").
-    let offset_url = format!(
-        "{debezium_url}/connectors/basin-cdc-test-connector/offsets"
-    );
+    let offset_url = format!("{debezium_url}/connectors/basin-cdc-test-connector/offsets");
     let mut event_received = false;
     let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline2 {
@@ -907,7 +893,9 @@ async fn cdc_debezium_e2e() {
     // ── Cleanup ───────────────────────────────────────────────────────────────
     let _ = curl(&["-s", "-o", "/dev/null", "-X", "DELETE", &connector_url]);
 
-    println!("[5.21.A debezium] PASSED — Debezium e2e: connector connected + change event consumed");
+    println!(
+        "[5.21.A debezium] PASSED — Debezium e2e: connector connected + change event consumed"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -995,10 +983,14 @@ async fn cdc_fivetran_e2e() {
     let test_url = format!("{fivetran_url}/test");
     let (test_code, test_body) = curl(&[
         "-s",
-        "-w", "\n%{http_code}",
-        "-X", "POST",
-        "-H", "Content-Type: application/json",
-        "-d", &fivetran_config,
+        "-w",
+        "\n%{http_code}",
+        "-X",
+        "POST",
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        &fivetran_config,
         &test_url,
     ]);
     println!("[5.21.A fivetran] test-connection code={test_code} body={test_body}");
@@ -1008,7 +1000,9 @@ async fn cdc_fivetran_e2e() {
         "FIVETRAN E2E: curl POST /test must exit 0. Closed by 5.21.G. \
          curl_exit={test_code}"
     );
-    let test_http: u16 = test_body.lines().last()
+    let test_http: u16 = test_body
+        .lines()
+        .last()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
     assert!(
@@ -1053,22 +1047,26 @@ async fn cdc_fivetran_e2e() {
     let sync_url = format!("{fivetran_url}/sync");
     let (sync_code, sync_body) = curl(&[
         "-s",
-        "-w", "\n%{http_code}",
-        "-X", "POST",
-        "-H", "Content-Type: application/json",
-        "-d", &fivetran_config,
+        "-w",
+        "\n%{http_code}",
+        "-X",
+        "POST",
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        &fivetran_config,
         &sync_url,
     ]);
-    println!(
-        "[5.21.A fivetran] sync code={sync_code}  body={sync_body}"
-    );
+    println!("[5.21.A fivetran] sync code={sync_code}  body={sync_body}");
 
     assert!(
         sync_code == 0,
         "FIVETRAN E2E: curl POST /sync must exit 0. Closed by 5.21.G. \
          curl_exit={sync_code}"
     );
-    let sync_http: u16 = sync_body.lines().last()
+    let sync_http: u16 = sync_body
+        .lines()
+        .last()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
     assert!(
@@ -1169,9 +1167,7 @@ async fn cdc_replay_retention_soak() {
         let take = BATCH_SIZE.min(TOTAL_ROWS - written);
         let mut values = Vec::with_capacity(take);
         for i in written..(written + take) {
-            values.push(format!(
-                "({i}, {batch_id}, 'soak-row-{i}')"
-            ));
+            values.push(format!("({i}, {batch_id}, 'soak-row-{i}')"));
         }
         sess.execute(&format!(
             "INSERT INTO soak_events VALUES {}",

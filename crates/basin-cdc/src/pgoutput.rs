@@ -173,7 +173,13 @@ fn text_value(v: &Value) -> Vec<u8> {
     match v {
         Value::String(s) => s.clone().into_bytes(),
         Value::Null => Vec::new(), // never called for null (NULL uses 'n')
-        Value::Bool(b) => if *b { b"t".to_vec() } else { b"f".to_vec() },
+        Value::Bool(b) => {
+            if *b {
+                b"t".to_vec()
+            } else {
+                b"f".to_vec()
+            }
+        }
         Value::Number(n) => n.to_string().into_bytes(),
         other => serde_json::to_vec(other).unwrap_or_default(),
     }
@@ -560,7 +566,10 @@ mod tests {
         // Canonical X/Y shape.
         assert!(text.contains('/'));
         assert_eq!(parse_lsn("0/0"), Some(0));
-        assert_eq!(parse_lsn("16/B374D848"), Some((0x16u64 << 32) | 0xB374_D848));
+        assert_eq!(
+            parse_lsn("16/B374D848"),
+            Some((0x16u64 << 32) | 0xB374_D848)
+        );
         assert_eq!(parse_lsn("nonsense"), None);
     }
 
@@ -729,8 +738,14 @@ mod tests {
 
     #[test]
     fn output_plugin_round_trips() {
-        assert_eq!(OutputPlugin::parse("pgoutput"), Some(OutputPlugin::Pgoutput));
-        assert_eq!(OutputPlugin::parse("WAL2JSON"), Some(OutputPlugin::Wal2json));
+        assert_eq!(
+            OutputPlugin::parse("pgoutput"),
+            Some(OutputPlugin::Pgoutput)
+        );
+        assert_eq!(
+            OutputPlugin::parse("WAL2JSON"),
+            Some(OutputPlugin::Wal2json)
+        );
         assert_eq!(OutputPlugin::parse("bogus"), None);
         assert_eq!(OutputPlugin::Pgoutput.as_str(), "pgoutput");
     }

@@ -19,11 +19,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::common::{Result, tree_node::{Transformed, TreeNode}};
-use datafusion::logical_expr::{
-    Expr, Filter, LogicalPlan, Projection,
-    logical_plan::Union,
+use datafusion::common::{
+    tree_node::{Transformed, TreeNode},
+    Result,
 };
+use datafusion::logical_expr::{logical_plan::Union, Expr, Filter, LogicalPlan, Projection};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -128,7 +128,10 @@ fn try_collapse(union: Union) -> Result<Transformed<LogicalPlan>> {
             Some(info) => infos.push(info),
             None => {
                 // Cannot collapse — return original unchanged.
-                return Ok(Transformed::no(LogicalPlan::Union(Union { inputs, schema })));
+                return Ok(Transformed::no(LogicalPlan::Union(Union {
+                    inputs,
+                    schema,
+                })));
             }
         }
     }
@@ -142,7 +145,10 @@ fn try_collapse(union: Union) -> Result<Transformed<LogicalPlan>> {
     // Check that at least one group has ≥ 2 branches.
     let any_collapsible = groups.values().any(|v| v.len() >= 2);
     if !any_collapsible {
-        return Ok(Transformed::no(LogicalPlan::Union(Union { inputs, schema })));
+        return Ok(Transformed::no(LogicalPlan::Union(Union {
+            inputs,
+            schema,
+        })));
     }
 
     // Verify that branches sharing a table have identical output schemas.
@@ -153,7 +159,10 @@ fn try_collapse(union: Union) -> Result<Transformed<LogicalPlan>> {
         let first_schema = inputs[indices[0]].schema();
         for &idx in &indices[1..] {
             if inputs[idx].schema() != first_schema {
-                return Ok(Transformed::no(LogicalPlan::Union(Union { inputs, schema })));
+                return Ok(Transformed::no(LogicalPlan::Union(Union {
+                    inputs,
+                    schema,
+                })));
             }
         }
     }
@@ -193,12 +202,10 @@ fn try_collapse(union: Union) -> Result<Transformed<LogicalPlan>> {
         // twice. Collapsing would return them once. This is the RLS bug:
         // `SELECT t FROM tbl UNION ALL SELECT t FROM tbl` with identical RLS
         // filters on both arms must return 2 rows, not 1.
-        let all_predicates_identical = predicates.windows(2).all(|w| {
-            match (&w[0], &w[1]) {
-                (Some(a), Some(b)) => format!("{a:?}") == format!("{b:?}"),
-                (None, None) => true,
-                _ => false,
-            }
+        let all_predicates_identical = predicates.windows(2).all(|w| match (&w[0], &w[1]) {
+            (Some(a), Some(b)) => format!("{a:?}") == format!("{b:?}"),
+            (None, None) => true,
+            _ => false,
         });
         if all_predicates_identical {
             // Skip collapsing this group — leave the branches as-is.
@@ -276,8 +283,7 @@ fn try_collapse(union: Union) -> Result<Transformed<LogicalPlan>> {
 
     // If we collapsed everything to a single input, unwrap the Union entirely.
     if new_inputs.len() == 1 {
-        let plan = Arc::try_unwrap(new_inputs.remove(0))
-            .unwrap_or_else(|arc| (*arc).clone());
+        let plan = Arc::try_unwrap(new_inputs.remove(0)).unwrap_or_else(|arc| (*arc).clone());
         return Ok(Transformed::yes(plan));
     }
 
@@ -319,10 +325,8 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::Column;
     use datafusion::logical_expr::{
-        lit,
-        logical_plan::builder::LogicalTableSource,
-        Expr, LogicalPlanBuilder, Operator,
-        expr::BinaryExpr,
+        expr::BinaryExpr, lit, logical_plan::builder::LogicalTableSource, Expr, LogicalPlanBuilder,
+        Operator,
     };
     use datafusion::optimizer::{OptimizerContext, OptimizerRule};
 
@@ -412,9 +416,7 @@ mod tests {
         let scan_t1 = make_scan("t1", vec![("id", DataType::Int64)]);
         let scan_t2 = make_scan("t2", vec![("id", DataType::Int64)]);
 
-        let union_plan = LogicalPlanBuilder::from(scan_t1)
-            .union(scan_t2)?
-            .build()?;
+        let union_plan = LogicalPlanBuilder::from(scan_t1).union(scan_t2)?.build()?;
 
         let rule = UnionScanCollapse;
         let config = OptimizerContext::new();

@@ -579,9 +579,7 @@ pub(crate) fn substitute_auth_functions(expr: &str, auth: &crate::AuthContext) -
         }
         // Read a dotted identifier chain (e.g. `auth.uid`).
         let start = i;
-        while i < bytes.len()
-            && (is_ident_part(bytes[i] as char) || bytes[i] == b'.')
-        {
+        while i < bytes.len() && (is_ident_part(bytes[i] as char) || bytes[i] == b'.') {
             i += 1;
         }
         let tok = &expr[start..i];
@@ -786,9 +784,9 @@ pub(crate) async fn enforce_with_check(
     // distinction a table with only a FOR SELECT policy would incorrectly
     // deny all INSERTs.
     let combined: String = if preds.is_empty() {
-        let has_relevant_policy = policies.iter().any(|p| {
-            matches!(p.command, PolicyCommand::All) || p.command == kind
-        });
+        let has_relevant_policy = policies
+            .iter()
+            .any(|p| matches!(p.command, PolicyCommand::All) || p.command == kind);
         if !policies.is_empty() && !has_relevant_policy {
             // Policies exist, but none target this operation — nothing to
             // enforce; allow the write.

@@ -467,13 +467,12 @@ fn render(p: &ScalarParam) -> String {
         // unreachable via the wire decoders (they validate); saturate
         // rather than panic.
         ScalarParam::Timestamptz(us) => {
-            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(*us).unwrap_or(
-                if *us < 0 {
+            let dt =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_micros(*us).unwrap_or(if *us < 0 {
                     chrono::DateTime::<chrono::Utc>::MIN_UTC
                 } else {
                     chrono::DateTime::<chrono::Utc>::MAX_UTC
-                },
-            );
+                });
             format!("'{}'::timestamptz", dt.format("%Y-%m-%d %H:%M:%S%.6f+00"))
         }
         ScalarParam::Bytea(bytes) => {

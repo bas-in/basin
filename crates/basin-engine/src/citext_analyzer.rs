@@ -36,14 +36,13 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, DFSchema};
 use datafusion::common::Result as DFResult;
+use datafusion::common::{Column, DFSchema};
 use datafusion::logical_expr::{
-    BinaryExpr, Expr, Like, LogicalPlan, Operator,
-    logical_plan::{Filter, Sort},
-    expr::Sort as SortExpr,
     expr::Alias,
-    Cast, TryCast,
+    expr::Sort as SortExpr,
+    logical_plan::{Filter, Sort},
+    BinaryExpr, Cast, Expr, Like, LogicalPlan, Operator, TryCast,
 };
 use datafusion::optimizer::AnalyzerRule;
 
@@ -85,17 +84,12 @@ impl AnalyzerRule for CitextAnalyzerRule {
 fn plan_has_citext_column(plan: &LogicalPlan) -> bool {
     let mut found = false;
     let _ = plan.apply(|node| {
-        if node
-            .schema()
-            .fields()
-            .iter()
-            .any(|f| {
-                f.metadata()
-                    .get(crate::types::BASIN_TYPE_KEY)
-                    .map(|v| v == crate::types::BASIN_TYPE_CITEXT)
-                    .unwrap_or(false)
-            })
-        {
+        if node.schema().fields().iter().any(|f| {
+            f.metadata()
+                .get(crate::types::BASIN_TYPE_KEY)
+                .map(|v| v == crate::types::BASIN_TYPE_CITEXT)
+                .unwrap_or(false)
+        }) {
             found = true;
             return Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop);
         }
@@ -115,10 +109,7 @@ fn rewrite_plan_node(plan: LogicalPlan) -> DFResult<Transformed<LogicalPlan>> {
             let input_schema = filter.input.schema();
             let new_pred = rewrite_expr(filter.predicate, input_schema)?;
             let did_change = new_pred.transformed;
-            let new_filter = LogicalPlan::Filter(Filter::try_new(
-                new_pred.data,
-                filter.input,
-            )?);
+            let new_filter = LogicalPlan::Filter(Filter::try_new(new_pred.data, filter.input)?);
             if did_change {
                 Ok(Transformed::yes(new_filter))
             } else {
@@ -293,22 +284,19 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::config::ConfigOptions;
-    use datafusion::logical_expr::{
-        BinaryExpr, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator,
-        col, lit,
-    };
     use datafusion::logical_expr::logical_plan::LogicalTableSource;
+    use datafusion::logical_expr::{
+        col, lit, BinaryExpr, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator,
+    };
     use datafusion::optimizer::AnalyzerRule;
 
-    use crate::types::{BASIN_TYPE_CITEXT, BASIN_TYPE_KEY};
     use super::CitextAnalyzerRule;
+    use crate::types::{BASIN_TYPE_CITEXT, BASIN_TYPE_KEY};
 
     fn mixed_schema() -> Arc<Schema> {
-        let citext_field = Field::new("email", DataType::Utf8, true)
-            .with_metadata(HashMap::from([(
-                BASIN_TYPE_KEY.to_string(),
-                BASIN_TYPE_CITEXT.to_string(),
-            )]));
+        let citext_field = Field::new("email", DataType::Utf8, true).with_metadata(HashMap::from(
+            [(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_CITEXT.to_string())],
+        ));
         Arc::new(Schema::new(vec![
             citext_field,
             Field::new("name", DataType::Utf8, true), // plain text, no marker

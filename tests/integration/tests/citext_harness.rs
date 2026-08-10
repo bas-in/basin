@@ -133,12 +133,10 @@ async fn citext_type_round_trip() {
     // ── DDL: citext column ─────────────────────────────────────────────────────
     // Expected after 5.30.B: `citext` is accepted as a column type.
     // Currently RED: unknown type error.
-    sess.execute("CREATE TABLE u (email citext)")
-        .await
-        .expect(
-            "CITEXT ROUND-TRIP: CREATE TABLE u (email citext) must succeed. \
+    sess.execute("CREATE TABLE u (email citext)").await.expect(
+        "CITEXT ROUND-TRIP: CREATE TABLE u (email citext) must succeed. \
              Closed by 5.30.B.",
-        );
+    );
 
     // ── INSERT with mixed-case value ───────────────────────────────────────────
     sess.execute("INSERT INTO u VALUES ('Foo@Bar.com')")
@@ -205,14 +203,8 @@ async fn citext_case_insensitive_comparison() {
     // ── Equality: 'ABC'::citext = 'abc'::citext must be TRUE ──────────────────
     // PG citext uses a case-insensitive collation for =; this is the headline
     // property of the type.
-    let eq_result = scalar_bool(
-        &sess,
-        "SELECT 'ABC'::citext = 'abc'::citext",
-    )
-    .await;
-    println!(
-        "[5.30.A comparison] 'ABC'::citext = 'abc'::citext → {eq_result} (expected true)"
-    );
+    let eq_result = scalar_bool(&sess, "SELECT 'ABC'::citext = 'abc'::citext").await;
+    println!("[5.30.A comparison] 'ABC'::citext = 'abc'::citext → {eq_result} (expected true)");
     assert!(
         eq_result,
         "CITEXT COMPARISON: 'ABC'::citext = 'abc'::citext must be TRUE. \
@@ -232,11 +224,7 @@ async fn citext_case_insensitive_comparison() {
 
     // Expected case-insensitive alphabetic order: apple, Banana, Cherry.
     // A case-sensitive sort would produce: Banana, Cherry, apple (uppercase first).
-    let n = row_count(
-        &sess,
-        "SELECT w FROM words ORDER BY w",
-    )
-    .await;
+    let n = row_count(&sess, "SELECT w FROM words ORDER BY w").await;
     assert_eq!(
         n, 3,
         "CITEXT COMPARISON: ORDER BY must return all 3 rows. got={n}"
@@ -244,9 +232,7 @@ async fn citext_case_insensitive_comparison() {
 
     // Verify the first row in ORDER BY is 'apple' (case-insensitive ordering).
     let first = scalar_text(&sess, "SELECT w FROM words ORDER BY w LIMIT 1").await;
-    println!(
-        "[5.30.A comparison] ORDER BY first row: {first:?} (expected 'apple')"
-    );
+    println!("[5.30.A comparison] ORDER BY first row: {first:?} (expected 'apple')");
     assert_eq!(
         first.to_lowercase(),
         "apple",
@@ -258,23 +244,15 @@ async fn citext_case_insensitive_comparison() {
     // Verify '<' operator: 'ABC'::citext < 'def'::citext must be TRUE.
     // (In case-sensitive ASCII ordering 'A' < 'd' anyway, but the key check is
     // 'abc'::citext < 'ABC'::citext is FALSE and 'ABC'::citext = 'abc'::citext.)
-    let lt_result = scalar_bool(
-        &sess,
-        "SELECT 'abc'::citext < 'def'::citext",
-    )
-    .await;
-    println!(
-        "[5.30.A comparison] 'abc'::citext < 'def'::citext → {lt_result} (expected true)"
-    );
+    let lt_result = scalar_bool(&sess, "SELECT 'abc'::citext < 'def'::citext").await;
+    println!("[5.30.A comparison] 'abc'::citext < 'def'::citext → {lt_result} (expected true)");
     assert!(
         lt_result,
         "CITEXT COMPARISON: 'abc'::citext < 'def'::citext must be TRUE \
          (case-insensitive ordering: a < d). Closed by 5.30.C."
     );
 
-    println!(
-        "[5.30.A comparison] PASSED — citext equality and ordering are case-insensitive"
-    );
+    println!("[5.30.A comparison] PASSED — citext equality and ordering are case-insensitive");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -375,9 +353,7 @@ async fn citext_unique_constraint_case_insensitive() {
          INSERT was rejected. got={count}. Closed by 5.30.D."
     );
 
-    println!(
-        "[5.30.A unique] PASSED — 'foo@x.com' correctly rejected as duplicate of 'FOO@X.COM'"
-    );
+    println!("[5.30.A unique] PASSED — 'foo@x.com' correctly rejected as duplicate of 'FOO@X.COM'");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -451,9 +427,7 @@ async fn citext_orm_compat() {
     );
 
     let prisma_idx = sess
-        .execute(
-            r#"CREATE UNIQUE INDEX "prisma_user_email_key" ON "prisma_user" ("email")"#,
-        )
+        .execute(r#"CREATE UNIQUE INDEX "prisma_user_email_key" ON "prisma_user" ("email")"#)
         .await;
     println!("[5.30.A orm] Prisma UNIQUE INDEX on citext: {prisma_idx:?}");
     assert!(
@@ -464,13 +438,9 @@ async fn citext_orm_compat() {
     );
 
     // Prisma INSERT (literal; Prisma uses $1 params via pgwire in practice)
-    sess.execute(
-        r#"INSERT INTO "prisma_user" ("email") VALUES ('Alice@Example.com')"#,
-    )
-    .await
-    .expect(
-        "ORM COMPAT (Prisma): INSERT citext value must succeed. Closed by 5.30.B.",
-    );
+    sess.execute(r#"INSERT INTO "prisma_user" ("email") VALUES ('Alice@Example.com')"#)
+        .await
+        .expect("ORM COMPAT (Prisma): INSERT citext value must succeed. Closed by 5.30.B.");
 
     // Prisma findUnique: SELECT WHERE email = $1 (case-insensitive match)
     // Prisma maps `@db.Citext` lookups as plain equality — citext handles the rest.
@@ -485,15 +455,11 @@ async fn citext_orm_compat() {
          'Alice@Example.com' via citext case-insensitive equality. \
          got={prisma_rows}. Closed by 5.30.C."
     );
-    println!(
-        "[5.30.A orm] Prisma citext lookup: matched {prisma_rows} row (expected 1)"
-    );
+    println!("[5.30.A orm] Prisma citext lookup: matched {prisma_rows} row (expected 1)");
 
     // Prisma duplicate detection: inserting 'ALICE@EXAMPLE.COM' must be rejected.
     let prisma_dup = sess
-        .execute(
-            r#"INSERT INTO "prisma_user" ("email") VALUES ('ALICE@EXAMPLE.COM')"#,
-        )
+        .execute(r#"INSERT INTO "prisma_user" ("email") VALUES ('ALICE@EXAMPLE.COM')"#)
         .await;
     assert!(
         prisma_dup.is_err(),
@@ -624,9 +590,7 @@ async fn citext_orm_compat() {
          'eve@example.org' via citext equality. \
          got={sqlx_cast_rows}. Closed by 5.30.C."
     );
-    println!(
-        "[5.30.A orm] sqlx ::citext cast lookup: matched {sqlx_cast_rows} row (expected 1)"
-    );
+    println!("[5.30.A orm] sqlx ::citext cast lookup: matched {sqlx_cast_rows} row (expected 1)");
 
     // Total row count sanity: 2 rows in sqlx_logins.
     let total = row_count(&sess, r#"SELECT "id" FROM "sqlx_logins""#).await;

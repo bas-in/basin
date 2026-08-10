@@ -19,7 +19,9 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use basin_common::{PartitionKey, ProjectId, TableName};
-use basin_storage::{FileFormat, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig, WriteOptions};
+use basin_storage::{
+    FileFormat, Predicate, ReadOptions, ScalarValue, Storage, StorageConfig, WriteOptions,
+};
 use futures::stream::StreamExt;
 use object_store::memory::InMemory;
 
@@ -33,8 +35,9 @@ fn schema() -> Arc<Schema> {
 /// Build a batch with `len` rows whose `id` runs `[start, start + len)`.
 fn build_batch(start: i64, len: usize) -> RecordBatch {
     let ids: Int64Array = (start..start + len as i64).collect();
-    let payloads: Vec<String> =
-        (0..len).map(|i| format!("p-{:06}", start + i as i64)).collect();
+    let payloads: Vec<String> = (0..len)
+        .map(|i| format!("p-{:06}", start + i as i64))
+        .collect();
     let payload_arr: StringArray = payloads.iter().map(|s| Some(s.as_str())).collect();
     RecordBatch::try_new(schema(), vec![Arc::new(ids), Arc::new(payload_arr)]).unwrap()
 }
@@ -201,20 +204,14 @@ async fn page_index_prunes_within_row_group() {
     let opts_full = ReadOptions::default();
     counters.reset();
 
-    let all_ids =
-        read_ids_with_schema(&storage, &project, vec![path.clone()], opts_full).await;
+    let all_ids = read_ids_with_schema(&storage, &project, vec![path.clone()], opts_full).await;
 
     let snap_full = counters.snapshot();
 
-    assert_eq!(
-        all_ids.len(),
-        total_rows,
-        "full scan must return all rows"
-    );
+    assert_eq!(all_ids.len(), total_rows, "full scan must return all rows");
     // No filters → no page selection built → counter stays 0.
     assert_eq!(
-        snap_full.rows_selected_by_page_index,
-        0,
+        snap_full.rows_selected_by_page_index, 0,
         "no-predicate read must not set rows_selected_by_page_index"
     );
 }
@@ -233,13 +230,7 @@ async fn page_index_keeps_all_pages_when_predicate_spans_full_range() {
 
     let total_rows: usize = 10_000;
     let path = write_multi_page_file(
-        &storage,
-        &project,
-        &table,
-        &part,
-        total_rows,
-        total_rows,
-        512,
+        &storage, &project, &table, &part, total_rows, total_rows, 512,
     )
     .await;
 

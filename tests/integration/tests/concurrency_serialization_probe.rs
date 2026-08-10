@@ -33,7 +33,14 @@ use basin_wal::{LocalWal, Wal, WalConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
-async fn build() -> (TempDir, TempDir, Engine, Shard, basin_shard::ShardBackgroundHandle, Arc<dyn Wal>) {
+async fn build() -> (
+    TempDir,
+    TempDir,
+    Engine,
+    Shard,
+    basin_shard::ShardBackgroundHandle,
+    Arc<dyn Wal>,
+) {
     let sd = TempDir::new().unwrap();
     let wd = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
@@ -54,7 +61,11 @@ async fn build() -> (TempDir, TempDir, Engine, Shard, basin_shard::ShardBackgrou
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -111,7 +122,11 @@ async fn concurrency_serialization_probe() {
             if k > id {
                 stmt.push(',');
             }
-            stmt.push_str(&format!("({k},{},{},'pending',{k})", k % 1000, k as f64 * 0.5));
+            stmt.push_str(&format!(
+                "({k},{},{},'pending',{k})",
+                k % 1000,
+                k as f64 * 0.5
+            ));
         }
         sess.execute(&stmt).await.unwrap();
         id = hi;
@@ -151,12 +166,13 @@ async fn concurrency_serialization_probe() {
     let _ = warm.execute(&pid(50)).await.unwrap();
     for &nsess in &[2usize, 4, 8, 16] {
         let wall = concurrent_wall(&engine, project, nsess, move |idx, s| async move {
-            let _ = s.execute(&format!(
-                "SELECT id, user_id, amount FROM events WHERE id = {}",
-                (idx as i64) * 13 + 7
-            ))
-            .await
-            .unwrap();
+            let _ = s
+                .execute(&format!(
+                    "SELECT id, user_id, amount FROM events WHERE id = {}",
+                    (idx as i64) * 13 + 7
+                ))
+                .await
+                .unwrap();
         })
         .await;
         let sf = wall / single_ms.max(1e-9);
@@ -202,12 +218,16 @@ async fn concurrency_serialization_probe() {
     // old row first. Time both on cold rows on the SAME table.
     let upd_literal = {
         let t = Instant::now();
-        let _ = sess.execute("UPDATE events SET status = 'x' WHERE id = 5").await;
+        let _ = sess
+            .execute("UPDATE events SET status = 'x' WHERE id = 5")
+            .await;
         t.elapsed().as_secs_f64() * 1000.0
     };
     let upd_rmw = {
         let t = Instant::now();
-        let _ = sess.execute("UPDATE events SET amount = amount + 1.0 WHERE id = 6").await;
+        let _ = sess
+            .execute("UPDATE events SET amount = amount + 1.0 WHERE id = 6")
+            .await;
         t.elapsed().as_secs_f64() * 1000.0
     };
     println!(
@@ -216,7 +236,9 @@ async fn concurrency_serialization_probe() {
     );
     let single_upd = upd_rmw;
     let contended_wall = concurrent_wall(&engine, project, 2, move |_idx, s| async move {
-        let _ = s.execute("UPDATE events SET amount = amount + 1.0 WHERE id = 9").await;
+        let _ = s
+            .execute("UPDATE events SET amount = amount + 1.0 WHERE id = 9")
+            .await;
     })
     .await;
     println!(

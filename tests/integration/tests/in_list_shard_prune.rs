@@ -42,9 +42,7 @@ async fn build_shard_engine() -> (
     let storage_dir = TempDir::new().unwrap();
     let wal_dir = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
-        object_store: Arc::new(
-            LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap(),
-        ),
+        object_store: Arc::new(LocalFileSystem::new_with_prefix(storage_dir.path()).unwrap()),
         root_prefix: None,
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
@@ -52,9 +50,7 @@ async fn build_shard_engine() -> (
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
     let wal: Arc<dyn Wal> = Arc::new(
         LocalWal::open(WalConfig {
-            object_store: Arc::new(
-                LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap(),
-            ),
+            object_store: Arc::new(LocalFileSystem::new_with_prefix(wal_dir.path()).unwrap()),
             root_prefix: None,
             flush_interval: Duration::from_millis(50),
             flush_max_bytes: 1024 * 1024,
@@ -63,7 +59,11 @@ async fn build_shard_engine() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -78,11 +78,7 @@ async fn build_shard_engine() -> (
 /// `column_stats`).  This is the real production path.
 ///
 /// Returns the number of rows inserted.
-async fn seed_via_sql_insert(
-    sess: &basin_engine::ProjectSession,
-    n: i64,
-    batch_size: i64,
-) -> i64 {
+async fn seed_via_sql_insert(sess: &basin_engine::ProjectSession, n: i64, batch_size: i64) -> i64 {
     let mut id = 0i64;
     while id < n {
         let hi = (id + batch_size).min(n);
@@ -109,11 +105,9 @@ async fn in_list_on_shard_written_table_row_group_prunes() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     // Simple 2-column table — no JSONB, no extra complexity.
-    sess.execute(
-        "CREATE TABLE events (id BIGINT NOT NULL PRIMARY KEY, amount DOUBLE PRECISION)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE events (id BIGINT NOT NULL PRIMARY KEY, amount DOUBLE PRECISION)")
+        .await
+        .unwrap();
 
     // Seed 200k rows (20 batches of 10k) via SQL INSERT through the shard.
     // IDs are sequential 0..200k so the data is naturally sorted by id.
@@ -158,10 +152,7 @@ async fn in_list_on_shard_written_table_row_group_prunes() {
 
     // Query 2: full scan (no WHERE) to establish a reference timing.
     let t_full0 = Instant::now();
-    let full = sess
-        .execute("SELECT id, amount FROM events")
-        .await
-        .unwrap();
+    let full = sess.execute("SELECT id, amount FROM events").await.unwrap();
     let full_elapsed = t_full0.elapsed();
     let full_rows: usize = match full {
         ExecResult::Rows { batches, .. } => batches.iter().map(|b| b.num_rows()).sum(),
@@ -195,8 +186,7 @@ async fn in_list_on_shard_written_table_row_group_prunes() {
 
     // Query 3: verify result correctness — all returned ids must be in the
     // queried set and the values must match.
-    let expected_ids: std::collections::BTreeSet<i64> =
-        (0..100i64).map(|k| k * 7 + 1).collect();
+    let expected_ids: std::collections::BTreeSet<i64> = (0..100i64).map(|k| k * 7 + 1).collect();
     let res = sess.execute(&in_list_sql).await.unwrap();
     let mut returned_ids: Vec<i64> = match res {
         ExecResult::Rows { batches, .. } => {
@@ -234,11 +224,9 @@ async fn in_list_out_of_range_on_shard_written_table_returns_empty_fast() {
     let (_sd, _wd, engine, bg, wal) = build_shard_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute(
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, val DOUBLE PRECISION)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, val DOUBLE PRECISION)")
+        .await
+        .unwrap();
 
     // Insert 50k rows (ids 0..50000).
     let n = 50_000i64;
@@ -248,7 +236,9 @@ async fn in_list_out_of_range_on_shard_written_table_returns_empty_fast() {
         let mut stmt = String::with_capacity((hi - id) as usize * 30);
         stmt.push_str("INSERT INTO t VALUES ");
         for k in id..hi {
-            if k > id { stmt.push(','); }
+            if k > id {
+                stmt.push(',');
+            }
             stmt.push_str(&format!("({k}, {})", k as f64));
         }
         sess.execute(&stmt).await.unwrap();
@@ -256,7 +246,10 @@ async fn in_list_out_of_range_on_shard_written_table_returns_empty_fast() {
     }
 
     // All IN-list values are above max_id → all row-groups pruned.
-    let in_ids: String = (0..50i64).map(|k| (100_000 + k * 7).to_string()).collect::<Vec<_>>().join(",");
+    let in_ids: String = (0..50i64)
+        .map(|k| (100_000 + k * 7).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!("SELECT id FROM t WHERE id IN ({in_ids})");
 
     // Warm up.

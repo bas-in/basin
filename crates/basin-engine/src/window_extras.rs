@@ -476,7 +476,8 @@ mod tests {
 
     #[test]
     fn groups_frame_passes_through_unchanged() {
-        let sql = "SELECT SUM(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t";
+        let sql =
+            "SELECT SUM(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t";
         assert_eq!(
             rewrite_ignore_nulls_in_args(sql),
             sql,

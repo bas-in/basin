@@ -1472,7 +1472,12 @@ async fn signout_is_idempotent() {
         Some(body.as_bytes()),
     )
     .await;
-    assert_eq!(r.status, 200, "first signout: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "first signout: {}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     // Second sign-out with the same token — must also succeed.
     let r = http_request(
@@ -1483,7 +1488,12 @@ async fn signout_is_idempotent() {
         Some(body.as_bytes()),
     )
     .await;
-    assert_eq!(r.status, 200, "second signout: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        200,
+        "second signout: {}",
+        String::from_utf8_lossy(&r.body)
+    );
     assert_eq!(r.json()["ok"], true);
 
     let _ = running.shutdown.send(());
@@ -1929,9 +1939,7 @@ async fn oauth_authorize_route_mounted() {
     let r = http_request(
         addr,
         "GET",
-        &format!(
-            "/auth/v1/oauth/google/authorize?project_id={project}&redirect_to="
-        ),
+        &format!("/auth/v1/oauth/google/authorize?project_id={project}&redirect_to="),
         &[],
         None,
     )
@@ -2001,7 +2009,8 @@ async fn mfa_enroll_unauthenticated_401() {
     )
     .await;
     assert_eq!(
-        r.status, 401,
+        r.status,
+        401,
         "POST /auth/v1/factors without bearer must be 401; got {}; body: {}",
         r.status,
         String::from_utf8_lossy(&r.body)
@@ -2146,12 +2155,16 @@ async fn mfa_list_authenticated_returns_empty_array() {
         addr,
         "GET",
         "/auth/v1/factors",
-        &[(&format!("Authorization"), &format!("Bearer {}", tokens.access_token))],
+        &[(
+            &format!("Authorization"),
+            &format!("Bearer {}", tokens.access_token),
+        )],
         None,
     )
     .await;
     assert_eq!(
-        r.status, 200,
+        r.status,
+        200,
         "GET /auth/v1/factors with valid JWT must be 200; body: {}",
         String::from_utf8_lossy(&r.body)
     );
@@ -2160,11 +2173,7 @@ async fn mfa_list_authenticated_returns_empty_array() {
         body.is_array(),
         "GET /auth/v1/factors must return a JSON array"
     );
-    assert_eq!(
-        body.as_array().unwrap().len(),
-        0,
-        "new user has no factors"
-    );
+    assert_eq!(body.as_array().unwrap().len(), 0, "new user has no factors");
 
     let _ = running.shutdown.send(());
 }
@@ -2195,7 +2204,8 @@ async fn mfa_list_returns_enrolled_factor() {
     )
     .await;
     assert_eq!(
-        enroll_r.status, 201,
+        enroll_r.status,
+        201,
         "POST /auth/v1/factors must be 201; body: {}",
         String::from_utf8_lossy(&enroll_r.body)
     );
@@ -2214,7 +2224,8 @@ async fn mfa_list_returns_enrolled_factor() {
     )
     .await;
     assert_eq!(
-        list_r.status, 200,
+        list_r.status,
+        200,
         "GET /auth/v1/factors must be 200; body: {}",
         String::from_utf8_lossy(&list_r.body)
     );
@@ -2289,14 +2300,7 @@ async fn invocations_and_versions_routes_registered() {
     );
     assert_eq!(r.status, 401, "unauthenticated invocations must return 401");
 
-    let r2 = http_request(
-        addr,
-        "GET",
-        "/admin/v1/functions/myfn/versions",
-        &[],
-        None,
-    )
-    .await;
+    let r2 = http_request(addr, "GET", "/admin/v1/functions/myfn/versions", &[], None).await;
     assert_ne!(r2.status, 404, "versions route must be registered");
     assert_eq!(r2.status, 401, "unauthenticated versions must return 401");
 
@@ -2343,8 +2347,12 @@ async fn function_version_history_roundtrip() {
     let project = ProjectId::new();
     let name = "versioned_fn";
 
-    let _ = reg.put_test(project, name.to_string(), b"v1".to_vec()).await;
-    let _ = reg.put_test(project, name.to_string(), b"v2".to_vec()).await;
+    let _ = reg
+        .put_test(project, name.to_string(), b"v1".to_vec())
+        .await;
+    let _ = reg
+        .put_test(project, name.to_string(), b"v2".to_vec())
+        .await;
 
     let versions = reg.versions(&project, name).await;
     assert_eq!(versions.len(), 2, "two version entries in history");
@@ -2363,8 +2371,12 @@ async fn function_rollback_roundtrip() {
     let project = ProjectId::new();
     let name = "rollback_fn";
 
-    let _ = reg.put_test(project, name.to_string(), b"v1".to_vec()).await;
-    let _ = reg.put_test(project, name.to_string(), b"v2".to_vec()).await;
+    let _ = reg
+        .put_test(project, name.to_string(), b"v1".to_vec())
+        .await;
+    let _ = reg
+        .put_test(project, name.to_string(), b"v2".to_vec())
+        .await;
 
     let rolled = reg.rollback(project, name, 1).await.expect("rollback ok");
     assert_eq!(rolled, 1);
@@ -2384,7 +2396,9 @@ async fn function_rollback_unknown_version_errors() {
     let project = ProjectId::new();
     let name = "fn";
 
-    let _ = reg.put_test(project, name.to_string(), b"v1".to_vec()).await;
+    let _ = reg
+        .put_test(project, name.to_string(), b"v1".to_vec())
+        .await;
     let err = reg.rollback(project, name, 99).await;
     assert!(err.is_err(), "rollback to unknown version must return Err");
 }
@@ -2407,7 +2421,7 @@ fn fn_persist_catalog_def(
     name: &str,
     wasm_b64: &str,
 ) -> basin_catalog::SqlFunctionDef {
-    use basin_catalog::{SqlFunctionLanguage, SqlReturnType, SqlArgType};
+    use basin_catalog::{SqlArgType, SqlFunctionLanguage, SqlReturnType};
     basin_catalog::SqlFunctionDef {
         project,
         name: name.to_string(),
@@ -2423,10 +2437,10 @@ fn fn_persist_catalog_def(
 /// Test 1: deploy writes to catalog.
 #[tokio::test]
 async fn fn_persist_deploy_writes_catalog() {
-    use basin_catalog::{InMemoryCatalog, SqlFunctionLanguage};
-    use basin_common::ProjectId;
     use crate::routes::admin_functions::FunctionRegistry;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use basin_catalog::{InMemoryCatalog, SqlFunctionLanguage};
+    use basin_common::ProjectId;
 
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
     let project = ProjectId::new();
@@ -2439,23 +2453,30 @@ async fn fn_persist_deploy_writes_catalog() {
         .expect("catalog upsert must succeed");
 
     let reg = FunctionRegistry::new();
-    reg.put_test(project, name.to_string(), B64.decode(wasm_b64.as_bytes()).unwrap())
-        .await;
+    reg.put_test(
+        project,
+        name.to_string(),
+        B64.decode(wasm_b64.as_bytes()).unwrap(),
+    )
+    .await;
 
     let all = catalog.list_sql_functions(&project).await;
     assert_eq!(all.len(), 1, "catalog should have 1 function");
     assert_eq!(all[0].name, name);
     assert!(matches!(all[0].language, SqlFunctionLanguage::Wasm));
-    assert!(reg.exists(&project, name).await, "registry should know function");
+    assert!(
+        reg.exists(&project, name).await,
+        "registry should know function"
+    );
 }
 
 /// Test 2: restart simulation — new registry, catalog is truth.
 #[tokio::test]
 async fn fn_persist_restart_simulation() {
-    use basin_catalog::{InMemoryCatalog, SqlFunctionLanguage};
-    use basin_common::ProjectId;
     use crate::routes::admin_functions::FunctionRegistry;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use basin_catalog::{InMemoryCatalog, SqlFunctionLanguage};
+    use basin_common::ProjectId;
 
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
     let project = ProjectId::new();
@@ -2468,7 +2489,11 @@ async fn fn_persist_restart_simulation() {
         .expect("catalog upsert");
     let old_reg = FunctionRegistry::new();
     old_reg
-        .put_test(project, name.to_string(), B64.decode(wasm_b64.as_bytes()).unwrap())
+        .put_test(
+            project,
+            name.to_string(),
+            B64.decode(wasm_b64.as_bytes()).unwrap(),
+        )
         .await;
 
     // Restart: brand-new registry — catalog still has the entry.
@@ -2502,8 +2527,8 @@ async fn fn_persist_restart_simulation() {
 /// Test 3: deploy-persist-failure invariant — registry unchanged without upsert.
 #[tokio::test]
 async fn fn_persist_no_catalog_upsert_registry_unchanged() {
-    use basin_common::ProjectId;
     use crate::routes::admin_functions::FunctionRegistry;
+    use basin_common::ProjectId;
 
     let reg = FunctionRegistry::new();
     let project = ProjectId::new();
@@ -2519,10 +2544,10 @@ async fn fn_persist_no_catalog_upsert_registry_unchanged() {
 /// Test 4: delete removes from both catalog and cache.
 #[tokio::test]
 async fn fn_persist_delete_removes_catalog_and_cache() {
-    use basin_catalog::InMemoryCatalog;
-    use basin_common::ProjectId;
     use crate::routes::admin_functions::FunctionRegistry;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use basin_catalog::InMemoryCatalog;
+    use basin_common::ProjectId;
 
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
     let project = ProjectId::new();
@@ -2534,19 +2559,29 @@ async fn fn_persist_delete_removes_catalog_and_cache() {
         .await
         .expect("upsert");
     let reg = FunctionRegistry::new();
-    reg.put_test(project, name.to_string(), B64.decode(wasm_b64.as_bytes()).unwrap())
-        .await;
+    reg.put_test(
+        project,
+        name.to_string(),
+        B64.decode(wasm_b64.as_bytes()).unwrap(),
+    )
+    .await;
 
     // Both have it.
     assert!(reg.exists(&project, name).await);
     assert!(catalog.lookup_sql_function(&project, name).await.is_some());
 
     // Delete: catalog first, then registry.
-    catalog.drop_sql_function(&project, name).await.expect("drop catalog");
+    catalog
+        .drop_sql_function(&project, name)
+        .await
+        .expect("drop catalog");
     reg.remove_from_cache_test(&project, name).await;
 
     // Neither should have it.
-    assert!(!reg.exists(&project, name).await, "registry should be empty");
+    assert!(
+        !reg.exists(&project, name).await,
+        "registry should be empty"
+    );
     assert!(
         catalog.lookup_sql_function(&project, name).await.is_none(),
         "catalog should be empty"
@@ -2569,7 +2604,11 @@ async fn fn_persist_cross_project_isolation() {
     let name = "shared_name";
 
     catalog
-        .register_sql_function(fn_persist_catalog_def(project_a, name, &fn_persist_fake_wasm_b64(b"a")))
+        .register_sql_function(fn_persist_catalog_def(
+            project_a,
+            name,
+            &fn_persist_fake_wasm_b64(b"a"),
+        ))
         .await
         .expect("upsert A");
 
@@ -2579,7 +2618,10 @@ async fn fn_persist_cross_project_isolation() {
 
     // Project B sees nothing.
     let b_fns = catalog.list_sql_functions(&project_b).await;
-    assert!(b_fns.is_empty(), "project B must not see project A functions");
+    assert!(
+        b_fns.is_empty(),
+        "project B must not see project A functions"
+    );
 
     // Lookup by name in B returns None.
     let lookup_b = catalog.lookup_sql_function(&project_b, name).await;
@@ -2622,7 +2664,10 @@ async fn snapshot_and_restore_routes_return_401_not_404() {
         restore.status, 404,
         "restore route must be registered (got 404 instead of 401)"
     );
-    assert_eq!(restore.status, 401, "unauthenticated restore must return 401");
+    assert_eq!(
+        restore.status, 401,
+        "unauthenticated restore must return 401"
+    );
 
     let _ = running.shutdown.send(());
 }

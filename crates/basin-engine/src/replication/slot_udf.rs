@@ -91,8 +91,9 @@ pub(crate) async fn exec_create_replication_slot(
     ]));
     let slot_col: ArrayRef = Arc::new(StringArray::from(vec![name.as_str()]));
     let lsn_col: ArrayRef = Arc::new(StringArray::from(vec![lsn_to_pgtext(lsn).as_str()]));
-    let batch = RecordBatch::try_new(schema.clone(), vec![slot_col, lsn_col])
-        .map_err(|e| BasinError::internal(format!("build pg_create_logical_replication_slot row: {e}")))?;
+    let batch = RecordBatch::try_new(schema.clone(), vec![slot_col, lsn_col]).map_err(|e| {
+        BasinError::internal(format!("build pg_create_logical_replication_slot row: {e}"))
+    })?;
     Ok(ExecResult::Rows {
         schema,
         batches: vec![batch],
@@ -263,10 +264,14 @@ fn build_exec_plan(
     df_schema: DfSchemaRef,
     projection: Option<&Vec<usize>>,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
-    let df_batch =
-        crate::convert::batch_ws_to_df(ws_batch).map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let df_batch = crate::convert::batch_ws_to_df(ws_batch)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let partitions = vec![vec![df_batch]];
-    Ok(MemorySourceConfig::try_new_exec(&partitions, df_schema, projection.cloned())?)
+    Ok(MemorySourceConfig::try_new_exec(
+        &partitions,
+        df_schema,
+        projection.cloned(),
+    )?)
 }
 
 /// A DataFusion `TableProvider` for the `pg_replication_slots` catalog view.
@@ -284,9 +289,7 @@ impl PgReplicationSlotsProvider {
         let ws_schema = repl_slots_ws_schema();
         let df_schema = crate::convert::schema_ws_to_df(ws_schema.as_ref())
             .map(Arc::new)
-            .unwrap_or_else(|_| {
-                Arc::new(ws_schema.as_ref().clone())
-            });
+            .unwrap_or_else(|_| Arc::new(ws_schema.as_ref().clone()));
         Self {
             registry,
             project,
@@ -304,8 +307,10 @@ impl PgReplicationSlotsProvider {
             .collect();
         let plugins: Vec<Option<&str>> =
             snapshots.iter().map(|s| Some(s.plugin.as_str())).collect();
-        let slot_types: Vec<Option<&str>> =
-            snapshots.iter().map(|s| Some(s.slot_type.as_str())).collect();
+        let slot_types: Vec<Option<&str>> = snapshots
+            .iter()
+            .map(|s| Some(s.slot_type.as_str()))
+            .collect();
         let actives: Vec<Option<bool>> = snapshots.iter().map(|s| Some(s.active)).collect();
         let restart_lsns: Vec<String> = snapshots
             .iter()
@@ -487,11 +492,9 @@ impl PgPublicationTablesProvider {
 
     fn build_ws_batch(&self) -> Result<RecordBatch> {
         let pairs = self.registry.list_publication_tables(&self.project);
-        let pubnames: Vec<Option<&str>> =
-            pairs.iter().map(|(p, _)| Some(p.as_str())).collect();
+        let pubnames: Vec<Option<&str>> = pairs.iter().map(|(p, _)| Some(p.as_str())).collect();
         let schemas: Vec<Option<&str>> = pairs.iter().map(|_| Some("public")).collect();
-        let tablenames: Vec<Option<&str>> =
-            pairs.iter().map(|(_, t)| Some(t.as_str())).collect();
+        let tablenames: Vec<Option<&str>> = pairs.iter().map(|(_, t)| Some(t.as_str())).collect();
 
         let pubname_col: ArrayRef = Arc::new(StringArray::from(pubnames));
         let schema_col: ArrayRef = Arc::new(StringArray::from(schemas));

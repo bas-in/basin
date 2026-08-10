@@ -118,7 +118,9 @@ fn largest_project_identifies_the_heavier_project() {
     assert_eq!(reg.project_bytes(&proj_a), a_bytes);
     assert_eq!(reg.project_bytes(&proj_b), b_bytes);
 
-    let largest = reg.largest_project().expect("largest_project must return Some");
+    let largest = reg
+        .largest_project()
+        .expect("largest_project must return Some");
     assert_eq!(
         largest, proj_b,
         "largest_project must return the project with more bytes (B = 150 MiB)"
@@ -285,7 +287,11 @@ fn budget_scheduler_limit_caps_candidates() {
     let candidates = sched
         .pick_flush_candidates(&projects, 3)
         .expect("must be under pressure");
-    assert_eq!(candidates.len(), 3, "limit=3 must cap result to 3 candidates");
+    assert_eq!(
+        candidates.len(),
+        3,
+        "limit=3 must cap result to 3 candidates"
+    );
 }
 
 // ── test 11: GlobalPressureScheduler — exactly at threshold is NOT active ─────
@@ -329,7 +335,7 @@ fn budget_scheduler_integrates_with_registry() {
     reg.try_reserve_bytes(&proj_a, 10 * 1024 * 1024); // 10 MiB
     reg.try_reserve_bytes(&proj_b, 30 * 1024 * 1024); // 30 MiB
     reg.try_reserve_bytes(&proj_c, 15 * 1024 * 1024); // 15 MiB
-    // Total = 55 MiB > 50 MiB threshold.
+                                                      // Total = 55 MiB > 50 MiB threshold.
 
     let pairs: Vec<(ProjectId, u64)> = [proj_a, proj_b, proj_c]
         .iter()

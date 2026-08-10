@@ -29,7 +29,11 @@ fn engine_in(dir: &TempDir) -> Engine {
         page_cache: None,
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    Engine::new(EngineConfig { storage, catalog, shard: None })
+    Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    })
 }
 
 async fn exec(sess: &ProjectSession, sql: &str) {
@@ -62,8 +66,9 @@ async fn ids_for(sess: &ProjectSession, sql: &str) -> Vec<i64> {
 }
 
 fn name_for(i: i64) -> String {
-    const FIRST: &[&str] =
-        &["alice", "alyce", "bob", "carol", "dave", "erin", "frank", "grace"];
+    const FIRST: &[&str] = &[
+        "alice", "alyce", "bob", "carol", "dave", "erin", "frank", "grace",
+    ];
     const LAST: &[&str] = &["smith", "smyth", "jones", "brown", "taylor"];
     let first = FIRST[(i as usize) % FIRST.len()];
     let last = LAST[((i as usize) / FIRST.len()) % LAST.len()];
@@ -90,11 +95,19 @@ async fn seed(dir: &TempDir, with_index: bool) -> (Engine, ProjectSession, Proje
             let nm = name_for(i).replace('\'', "''");
             vals.push(format!("({i}, '{nm}')"));
         }
-        exec(&sess, &format!("INSERT INTO people (id, name) VALUES {}", vals.join(", "))).await;
+        exec(
+            &sess,
+            &format!("INSERT INTO people (id, name) VALUES {}", vals.join(", ")),
+        )
+        .await;
         off = hi;
     }
     if with_index {
-        exec(&sess, "CREATE INDEX people_trgm ON people USING gin (name gin_trgm_ops)").await;
+        exec(
+            &sess,
+            "CREATE INDEX people_trgm ON people USING gin (name gin_trgm_ops)",
+        )
+        .await;
     }
     (eng, sess, project)
 }
@@ -121,9 +134,16 @@ async fn budget_pressure_eviction_matches_oracle() {
         "tiny budget must trigger posting-list eviction"
     );
 
-    for tail in ["name % 'smith'", "name % 'zephyrine'", "name % 'alyce smyth'"] {
+    for tail in [
+        "name % 'smith'",
+        "name % 'zephyrine'",
+        "name % 'alyce smyth'",
+    ] {
         let got = ids_for(&sess, &format!("SELECT id FROM people WHERE {tail}")).await;
         let oracle = oracle_ids(tail).await;
-        assert_eq!(got, oracle, "budget-evicted `{tail}` must equal full-scan oracle");
+        assert_eq!(
+            got, oracle,
+            "budget-evicted `{tail}` must equal full-scan oracle"
+        );
     }
 }

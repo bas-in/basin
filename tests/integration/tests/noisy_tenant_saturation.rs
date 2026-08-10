@@ -100,7 +100,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage: storage.clone(),
@@ -187,7 +191,10 @@ async fn measure_victim(
             .unwrap();
         keyset_ms.push(started.elapsed().as_secs_f64() * 1000.0);
         if assert_hits {
-            assert!(rows_in(&res) >= 1, "victim keyset page must return rows: cursor={cursor}");
+            assert!(
+                rows_in(&res) >= 1,
+                "victim keyset page must return rows: cursor={cursor}"
+            );
         }
     }
     (point_ms, keyset_ms)
@@ -416,7 +423,11 @@ async fn saturation_default() {
     println!(
         "[saturation] victim p99 under one adversarial tenant: point {point_p99_ratio:.2}x, \
          keyset {keyset_p99_ratio:.2}x (informational bar <{BAR_P99_RATIO}x) {}",
-        if pass { "PASS" } else { "FAIL (recorded — one tenant should not starve another if isolation holds)" }
+        if pass {
+            "PASS"
+        } else {
+            "FAIL (recorded — one tenant should not starve another if isolation holds)"
+        }
     );
 
     // ── Artifact ─────────────────────────────────────────────────────────────
@@ -470,7 +481,10 @@ async fn saturation_default() {
             "passed": pass,
         },
     });
-    write_artifact(&format!("noisy_tenant_saturation_{conns}conns.json"), &artifact);
+    write_artifact(
+        &format!("noisy_tenant_saturation_{conns}conns.json"),
+        &artifact,
+    );
 
     println!(
         "[saturation] conns={conns} secs={secs}: worst victim p99 ratio {worst_ratio:.2}x \

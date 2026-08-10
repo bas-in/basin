@@ -243,7 +243,12 @@ async fn admin_byo_bucket_requires_admin_token() {
         body.as_bytes(),
     )
     .await;
-    assert_eq!(r.status, 401, "no-auth body: {}", String::from_utf8_lossy(&r.body));
+    assert_eq!(
+        r.status,
+        401,
+        "no-auth body: {}",
+        String::from_utf8_lossy(&r.body)
+    );
 
     // 2. Non-admin JWT → 401 (route returns Unauthenticated for is_admin=false,
     //    mirroring the other /admin/v1/* routes' contract).
@@ -259,7 +264,8 @@ async fn admin_byo_bucket_requires_admin_token() {
     )
     .await;
     assert_eq!(
-        r.status, 401,
+        r.status,
+        401,
         "user-jwt should be rejected, got {} body: {}",
         r.status,
         String::from_utf8_lossy(&r.body)
@@ -299,7 +305,9 @@ async fn admin_byo_bucket_registers_successfully() {
         .get_project_metadata(&project)
         .await
         .expect("get_project_metadata");
-    let cfg = meta.byo_bucket.expect("byo_bucket should be Some after register");
+    let cfg = meta
+        .byo_bucket
+        .expect("byo_bucket should be Some after register");
     assert_eq!(cfg.bucket, "bucket-a");
     assert_eq!(cfg.region, "us-east-1");
     assert_eq!(cfg.access_key_id, "AKIAFAKE");
@@ -345,7 +353,8 @@ async fn admin_byo_bucket_idempotent_re_registration() {
     )
     .await;
     assert_eq!(
-        r2.status, 204,
+        r2.status,
+        204,
         "re-register should also 204, got {} body: {}",
         r2.status,
         String::from_utf8_lossy(&r2.body)
@@ -407,7 +416,8 @@ async fn admin_byo_bucket_rejects_bad_body() {
     )
     .await;
     assert_eq!(
-        r.status, 400,
+        r.status,
+        400,
         "empty bucket should 400, got {} body: {}",
         r.status,
         String::from_utf8_lossy(&r.body)

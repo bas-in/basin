@@ -116,7 +116,8 @@ impl IntervalTree {
             return;
         }
         self.sorted.append(&mut self.pending);
-        self.sorted.sort_by(|a, b| a.lo.partial_cmp(&b.lo).unwrap_or(std::cmp::Ordering::Equal));
+        self.sorted
+            .sort_by(|a, b| a.lo.partial_cmp(&b.lo).unwrap_or(std::cmp::Ordering::Equal));
         // Compute running max_hi from right to left.
         let n = self.sorted.len();
         self.max_hi = vec![f64::NEG_INFINITY; n];
@@ -275,8 +276,15 @@ impl IntervalRegistry {
         table: &TableName,
         col: &str,
     ) -> Arc<Mutex<IntervalTree>> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
-        let mut map = self.inner.lock().expect("IntervalRegistry outer lock poisoned");
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
+        let mut map = self
+            .inner
+            .lock()
+            .expect("IntervalRegistry outer lock poisoned");
         map.entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(IntervalTree::new())))
             .clone()
@@ -288,8 +296,15 @@ impl IntervalRegistry {
         table: &TableName,
         col: &str,
     ) -> Option<Arc<Mutex<IntervalTree>>> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
-        let map = self.inner.lock().expect("IntervalRegistry outer lock poisoned");
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
+        let map = self
+            .inner
+            .lock()
+            .expect("IntervalRegistry outer lock poisoned");
         map.get(&key).cloned()
     }
 
@@ -375,19 +390,17 @@ impl IntervalRegistry {
     /// Also removes `file_path` from the indexed-files completeness set so
     /// future probes do not erroneously claim full coverage after this file
     /// is gone.
-    pub fn remove_file(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-        col: &str,
-        file_path: &str,
-    ) {
+    pub fn remove_file(&self, project: &ProjectId, table: &TableName, col: &str, file_path: &str) {
         if let Some(arc) = self.get(project, table, col) {
             let mut tree = arc.lock().expect("IntervalTree lock poisoned");
             tree.remove_file(file_path);
         }
         // Remove from completeness tracking.
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         if let Ok(mut map) = self.indexed_files.lock() {
             if let Some(set) = map.get_mut(&key) {
                 set.remove(file_path);
@@ -406,7 +419,11 @@ impl IntervalRegistry {
         col: &str,
         file_path: &str,
     ) {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         if let Ok(mut map) = self.indexed_files.lock() {
             map.entry(key).or_default().insert(file_path.to_string());
         }
@@ -429,7 +446,11 @@ impl IntervalRegistry {
         table: &TableName,
         col: &str,
     ) -> HashSet<String> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         if let Ok(map) = self.indexed_files.lock() {
             map.get(&key).cloned().unwrap_or_default()
         } else {
@@ -438,15 +459,13 @@ impl IntervalRegistry {
     }
 
     /// Return the total number of indexed entries for a `(project, table, col)`.
-    pub fn total_entries(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-        col: &str,
-    ) -> usize {
+    pub fn total_entries(&self, project: &ProjectId, table: &TableName, col: &str) -> usize {
         match self.get(project, table, col) {
             None => 0,
-            Some(arc) => arc.lock().expect("IntervalTree lock poisoned").total_entries(),
+            Some(arc) => arc
+                .lock()
+                .expect("IntervalTree lock poisoned")
+                .total_entries(),
         }
     }
 }
@@ -466,7 +485,12 @@ mod tests {
     fn make_tree(intervals: &[(f64, f64, &str)]) -> IntervalTree {
         let mut tree = IntervalTree::new();
         for &(lo, hi, file) in intervals {
-            tree.insert(IntervalEntry { lo, hi, file_path: file.to_string(), row_group: 0 });
+            tree.insert(IntervalEntry {
+                lo,
+                hi,
+                file_path: file.to_string(),
+                row_group: 0,
+            });
         }
         tree.rebuild();
         tree
@@ -480,7 +504,10 @@ mod tests {
         let result = tree.probe_contains_point(5.0);
         match result {
             ProbeResult::FileCandidates(files) => {
-                assert!(files.contains("f1.parquet"), "expected f1.parquet: {files:?}");
+                assert!(
+                    files.contains("f1.parquet"),
+                    "expected f1.parquet: {files:?}"
+                );
             }
             other => panic!("expected FileCandidates, got {other:?}"),
         }
@@ -510,15 +537,18 @@ mod tests {
 
     #[test]
     fn point_probe_multiple_files() {
-        let mut tree = make_tree(&[
-            (1.0, 10.0, "f1.parquet"),
-            (5.0, 15.0, "f2.parquet"),
-        ]);
+        let mut tree = make_tree(&[(1.0, 10.0, "f1.parquet"), (5.0, 15.0, "f2.parquet")]);
         let result = tree.probe_contains_point(7.0);
         match result {
             ProbeResult::FileCandidates(files) => {
-                assert!(files.contains("f1.parquet"), "f1 must be a candidate: {files:?}");
-                assert!(files.contains("f2.parquet"), "f2 must be a candidate: {files:?}");
+                assert!(
+                    files.contains("f1.parquet"),
+                    "f1 must be a candidate: {files:?}"
+                );
+                assert!(
+                    files.contains("f2.parquet"),
+                    "f2 must be a candidate: {files:?}"
+                );
             }
             other => panic!("expected FileCandidates, got {other:?}"),
         }
@@ -533,8 +563,14 @@ mod tests {
         let result = tree.probe_overlaps(&query);
         match result {
             ProbeResult::FileCandidates(files) => {
-                assert!(files.contains("f1.parquet"), "f1 overlaps [3,8) at [3,5): {files:?}");
-                assert!(files.contains("f2.parquet"), "f2 overlaps [3,8) at [7,8): {files:?}");
+                assert!(
+                    files.contains("f1.parquet"),
+                    "f1 overlaps [3,8) at [3,5): {files:?}"
+                );
+                assert!(
+                    files.contains("f2.parquet"),
+                    "f2 overlaps [3,8) at [7,8): {files:?}"
+                );
             }
             other => panic!("expected FileCandidates, got {other:?}"),
         }
@@ -570,7 +606,10 @@ mod tests {
         match result {
             ProbeResult::Empty => {} // f1 gone, f2 starts at 5 so point 3 has no match
             ProbeResult::FileCandidates(files) => {
-                assert!(!files.contains("f1.parquet"), "f1 should be removed: {files:?}");
+                assert!(
+                    !files.contains("f1.parquet"),
+                    "f1 should be removed: {files:?}"
+                );
             }
             ProbeResult::NoIndex => {} // also acceptable if tree is now empty
         }
@@ -606,7 +645,10 @@ mod tests {
         let result = reg.probe_contains_point(&proj, &tbl, "r", 5.0);
         match result {
             ProbeResult::FileCandidates(files) => {
-                assert!(files.contains("f1.parquet"), "expected f1.parquet: {files:?}");
+                assert!(
+                    files.contains("f1.parquet"),
+                    "expected f1.parquet: {files:?}"
+                );
             }
             other => panic!("expected FileCandidates, got {other:?}"),
         }
@@ -618,7 +660,14 @@ mod tests {
         let proj = ProjectId::new();
         let tbl = TableName::new("t").unwrap();
 
-        reg.index_row(&proj, &tbl, "r1", r#"{"l":1,"u":10,"li":true,"ui":false}"#, "f1.parquet", 0);
+        reg.index_row(
+            &proj,
+            &tbl,
+            "r1",
+            r#"{"l":1,"u":10,"li":true,"ui":false}"#,
+            "f1.parquet",
+            0,
+        );
 
         // Probe on a different column — should return NoIndex.
         let result = reg.probe_contains_point(&proj, &tbl, "r2", 5.0);
@@ -631,8 +680,22 @@ mod tests {
         let proj = ProjectId::new();
         let tbl = TableName::new("t").unwrap();
 
-        reg.index_row(&proj, &tbl, "r", r#"{"l":1,"u":5,"li":true,"ui":false}"#, "f1.parquet", 0);
-        reg.index_row(&proj, &tbl, "r", r#"{"l":6,"u":10,"li":true,"ui":false}"#, "f1.parquet", 1);
+        reg.index_row(
+            &proj,
+            &tbl,
+            "r",
+            r#"{"l":1,"u":5,"li":true,"ui":false}"#,
+            "f1.parquet",
+            0,
+        );
+        reg.index_row(
+            &proj,
+            &tbl,
+            "r",
+            r#"{"l":6,"u":10,"li":true,"ui":false}"#,
+            "f1.parquet",
+            1,
+        );
         assert_eq!(reg.total_entries(&proj, &tbl, "r"), 2);
     }
 
@@ -645,7 +708,12 @@ mod tests {
             let lo = (i * 10) as f64;
             let hi = lo + 10.0;
             let file = format!("chunk_{}.parquet", i / 1000);
-            tree.insert(IntervalEntry { lo, hi, file_path: file, row_group: (i % 1000) as u32 });
+            tree.insert(IntervalEntry {
+                lo,
+                hi,
+                file_path: file,
+                row_group: (i % 1000) as u32,
+            });
         }
         tree.rebuild();
 

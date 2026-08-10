@@ -27,9 +27,7 @@ use basin_engine::ExecResult;
 #[path = "compare_postgres_common.rs"]
 mod common;
 
-use common::{
-    build_basin_engine, median, run_full_compare, try_connect, BasinFormat, SchemaGuard,
-};
+use common::{build_basin_engine, median, run_full_compare, try_connect, BasinFormat, SchemaGuard};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scaling_5_compare_postgres() {
@@ -185,10 +183,7 @@ async fn perf_smoke_pg_10k() {
             other => panic!("expected rows, got {other:?}"),
         }
     }
-    async fn timed(
-        sess: &basin_engine::ProjectSession,
-        sql: String,
-    ) -> (f64, Vec<Vec<i64>>) {
+    async fn timed(sess: &basin_engine::ProjectSession, sql: String) -> (f64, Vec<Vec<i64>>) {
         let rows = basin_i64s(sess, &sql).await; // warm + result snapshot
         let mut samples = Vec::with_capacity(3);
         for _ in 0..3 {

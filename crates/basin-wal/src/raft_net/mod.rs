@@ -50,10 +50,10 @@ pub mod peers;
 pub mod server;
 pub mod tls;
 
-pub use client::{TonicNetworkFactory, TonicNetworkConfig};
+pub use client::{TonicNetworkConfig, TonicNetworkFactory};
 pub use peers::{PeerRegistry, StaticPeers};
 pub use server::{
-    raft_bind_addr_from_env, serve_raft, serve_raft_on_listener,
-    serve_raft_on_listener_with_tls, serve_raft_with_tls, RaftTransportService,
+    raft_bind_addr_from_env, serve_raft, serve_raft_on_listener, serve_raft_on_listener_with_tls,
+    serve_raft_with_tls, RaftTransportService,
 };
 pub use tls::{RaftTlsConfig, DEFAULT_RAFT_TLS_DOMAIN};

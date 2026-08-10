@@ -41,9 +41,7 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use basin_catalog::{Catalog, InMemoryCatalog};
 use basin_common::{PartitionKey, ProjectId, TableName};
-use basin_storage::{
-    FileFormat, Predicate, ReadOptions, Storage, StorageConfig, WriteOptions,
-};
+use basin_storage::{FileFormat, Predicate, ReadOptions, Storage, StorageConfig, WriteOptions};
 use futures::stream::{BoxStream, StreamExt};
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
@@ -421,8 +419,13 @@ async fn starts_with_prunes_whole_files_by_catalog_stats() {
     // (a relative bound is robust to per-backend footer/HEAD accounting,
     // unlike a brittle absolute count).
     counting.reset();
-    let base_rows =
-        count_rows(storage.read(&project, &table, ReadOptions::default()).await.unwrap()).await;
+    let base_rows = count_rows(
+        storage
+            .read(&project, &table, ReadOptions::default())
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(base_rows, 200, "baseline must read all four files");
     let baseline_io = counting.total_body_io();
 

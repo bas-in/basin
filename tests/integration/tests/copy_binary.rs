@@ -130,7 +130,10 @@ async fn copy_out_bytes(client: &Client, sql: &str) -> Vec<u8> {
 /// Send `payload` through `COPY … FROM STDIN` and return the reported row
 /// count.
 async fn copy_in_bytes(client: &Client, sql: &str, payload: Vec<u8>) -> u64 {
-    let sink = client.copy_in::<_, Bytes>(sql).await.expect("copy_in start");
+    let sink = client
+        .copy_in::<_, Bytes>(sql)
+        .await
+        .expect("copy_in start");
     futures::pin_mut!(sink);
     sink.send(Bytes::from(payload)).await.expect("send");
     sink.as_mut().finish().await.expect("finish")

@@ -43,7 +43,10 @@ use common::{build_basin_engine, median, try_connect, SchemaGuard};
 const EPOCH: i64 = 1_700_000_000;
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn write_artifact(file: &str, value: &serde_json::Value) {
@@ -60,7 +63,10 @@ fn write_artifact(file: &str, value: &serde_json::Value) {
     if let Ok(bytes) = serde_json::to_vec_pretty(value) {
         let _ = std::fs::write(&tmp, &bytes);
         let _ = std::fs::rename(&tmp, &path);
-        eprintln!("[ext_bench_timescale_ext] artifact written: {}", path.display());
+        eprintln!(
+            "[ext_bench_timescale_ext] artifact written: {}",
+            path.display()
+        );
     }
 }
 
@@ -126,10 +132,15 @@ async fn basin_p50(sess: &basin_engine::ProjectSession, sql: &str, n: usize) -> 
 }
 
 async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f64> {
-    let _ = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await;
+    let _ = pg
+        .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+        .await;
     let mut s = Vec::with_capacity(n);
     for _ in 0..n {
-        if let Ok(rs) = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await {
+        if let Ok(rs) = pg
+            .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+            .await
+        {
             for m in &rs {
                 if let SimpleQueryMessage::Row(r) = m {
                     if let Some(line) = r.get(0) {
@@ -146,7 +157,11 @@ async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f6
             }
         }
     }
-    if s.is_empty() { None } else { Some(median(&s)) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(median(&s))
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -157,7 +172,11 @@ async fn ext_bench_timescale_ext() {
     eprintln!("[ext_bench_timescale_ext] config: rows={rows} samples={samples}");
 
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     seed_basin_series(&sess, "metrics", rows).await;
     instance.shard.flush_to_parquet().await.unwrap();
     if let Some(bg) = instance.bg.take() {
@@ -172,7 +191,12 @@ async fn ext_bench_timescale_ext() {
         FROM metrics GROUP BY b, device ORDER BY b, device";
 
     let tse1_b = basin_p50(&sess, tse1_sql, samples).await;
-    let tse1_sup = sess.execute(tse1_sql).await.map(|r| rows_of(&r)).unwrap_or(0) > 0;
+    let tse1_sup = sess
+        .execute(tse1_sql)
+        .await
+        .map(|r| rows_of(&r))
+        .unwrap_or(0)
+        > 0;
     let tse2_b = basin_p50(&sess, tse2_sql, samples).await;
     let tse2_sup = tse2_b.is_some();
 
@@ -195,8 +219,13 @@ async fn ext_bench_timescale_ext() {
             .is_ok();
         let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
         let schema = format!("basin_ext_tsx_{suffix}");
-        let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-        pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.ok();
+        let _guard = SchemaGuard {
+            schema: schema.clone(),
+            conn_str: cs,
+        };
+        pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .ok();
         pg.simple_query("SET work_mem = '64MB'").await.ok();
         pg.simple_query(&format!(
             "CREATE TABLE {schema}.metrics (id BIGINT, ts TIMESTAMPTZ NOT NULL, device BIGINT NOT NULL, value DOUBLE PRECISION NOT NULL)"
@@ -215,48 +244,70 @@ async fn ext_bench_timescale_ext() {
                 let value = (k % 1000) as f64 * 0.5;
                 v.push_str(&format!("({k}, to_timestamp({ts}), {device}, {value})"));
             }
-            pg.simple_query(&format!("INSERT INTO {schema}.metrics VALUES {v}")).await.ok();
+            pg.simple_query(&format!("INSERT INTO {schema}.metrics VALUES {v}"))
+                .await
+                .ok();
             off = hi;
         }
-        pg.simple_query(&format!("CREATE INDEX metrics_dev_ts ON {schema}.metrics (device, ts DESC)")).await.ok();
-        pg.simple_query(&format!("ANALYZE {schema}.metrics")).await.ok();
+        pg.simple_query(&format!(
+            "CREATE INDEX metrics_dev_ts ON {schema}.metrics (device, ts DESC)"
+        ))
+        .await
+        .ok();
+        pg.simple_query(&format!("ANALYZE {schema}.metrics"))
+            .await
+            .ok();
 
         pg_tse1 = pg_p50(&pg, &format!(
             "SELECT DISTINCT ON (device) device, ts, value FROM {schema}.metrics ORDER BY device, ts DESC"), samples).await;
         // gapfill needs the extension; only attempt when timescaledb loaded.
         if ts_ext_available {
-            pg_tse2 = pg_p50(&pg, &format!(
-                "SELECT time_bucket_gapfill('1 hour', ts) AS b, device, locf(avg(value)) AS v \
-                 FROM {schema}.metrics GROUP BY b, device ORDER BY b, device"), samples).await;
+            pg_tse2 = pg_p50(
+                &pg,
+                &format!(
+                    "SELECT time_bucket_gapfill('1 hour', ts) AS b, device, locf(avg(value)) AS v \
+                 FROM {schema}.metrics GROUP BY b, device ORDER BY b, device"
+                ),
+                samples,
+            )
+            .await;
         }
 
-        let _ = pg.simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+        let _ = pg
+            .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await;
         std::mem::forget(_guard);
     } else {
         eprintln!("[ext_bench_timescale_ext] PG unavailable — Basin-only card");
     }
 
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("ext_bench_timescale_ext.json", &json!({
-        "card": "ext_bench_timescale_ext",
-        "family": "timescaledb",
-        "generated_at": format!("@{ts}"),
-        "pg_available": pg_available,
-        "pg_extension_available": ts_ext_available,
-        "config": { "rows": rows, "samples": samples },
-        "shapes": [
-            { "label": "TSE1: latest-value-per-series (DISTINCT ON device, ts DESC)",
-              "basin_supported": tse1_sup, "basin_p50_ms": opt_ms(tse1_b), "pg_p50_ms": opt_ms(pg_tse1),
-              "basin_over_pg": ratio(tse1_b, pg_tse1) },
-            { "label": "TSE2: time_bucket_gapfill + locf (sparse-series gap-fill) at scale",
-              "basin_supported": tse2_sup, "basin_p50_ms": opt_ms(tse2_b), "pg_p50_ms": opt_ms(pg_tse2),
-              "basin_over_pg": ratio(tse2_b, pg_tse2) },
-        ],
-        "note": "Coverage-expansion card for TimescaleDB: latest-value-per-series (DISTINCT \
-                 ON, the realtime 'current reading per device' tile — distinct from the base \
-                 card's first/last aggregate) and time_bucket_gapfill+locf at scale (probed; \
-                 records basin_supported:false + a PG-only timing if Basin can't plan it). \
-                 cagg-query-vs-raw and compression-ratio are deferred to a post-merge \
-                 expansion once continuous aggregates + compression land.",
-    }));
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "ext_bench_timescale_ext.json",
+        &json!({
+            "card": "ext_bench_timescale_ext",
+            "family": "timescaledb",
+            "generated_at": format!("@{ts}"),
+            "pg_available": pg_available,
+            "pg_extension_available": ts_ext_available,
+            "config": { "rows": rows, "samples": samples },
+            "shapes": [
+                { "label": "TSE1: latest-value-per-series (DISTINCT ON device, ts DESC)",
+                  "basin_supported": tse1_sup, "basin_p50_ms": opt_ms(tse1_b), "pg_p50_ms": opt_ms(pg_tse1),
+                  "basin_over_pg": ratio(tse1_b, pg_tse1) },
+                { "label": "TSE2: time_bucket_gapfill + locf (sparse-series gap-fill) at scale",
+                  "basin_supported": tse2_sup, "basin_p50_ms": opt_ms(tse2_b), "pg_p50_ms": opt_ms(pg_tse2),
+                  "basin_over_pg": ratio(tse2_b, pg_tse2) },
+            ],
+            "note": "Coverage-expansion card for TimescaleDB: latest-value-per-series (DISTINCT \
+                     ON, the realtime 'current reading per device' tile — distinct from the base \
+                     card's first/last aggregate) and time_bucket_gapfill+locf at scale (probed; \
+                     records basin_supported:false + a PG-only timing if Basin can't plan it). \
+                     cagg-query-vs-raw and compression-ratio are deferred to a post-merge \
+                     expansion once continuous aggregates + compression land.",
+        }),
+    );
 }

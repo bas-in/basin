@@ -138,7 +138,11 @@ impl RowKeyBuilder {
 
     /// Append a nullable column.  `None` → `0x00` sentinel (sorts first).
     /// `Some(f)` → `0x01` sentinel followed by the value encoding from `f`.
-    pub fn append_nullable<F>(mut self, v: Option<F>, encode: impl FnOnce(Self, F) -> Self) -> Self {
+    pub fn append_nullable<F>(
+        mut self,
+        v: Option<F>,
+        encode: impl FnOnce(Self, F) -> Self,
+    ) -> Self {
         match v {
             None => {
                 self.buf.push(0x00);
@@ -188,7 +192,10 @@ mod tests {
     #[test]
     fn i64_negative_values_sort_correctly() {
         let cases: &[i64] = &[-1_000, -1, 0, 1, 1_000];
-        let keys: Vec<_> = cases.iter().map(|&v| RowKey::builder().append_i64(v).finish()).collect();
+        let keys: Vec<_> = cases
+            .iter()
+            .map(|&v| RowKey::builder().append_i64(v).finish())
+            .collect();
         for w in keys.windows(2) {
             assert!(w[0] < w[1], "{:?} should be < {:?}", w[0], w[1]);
         }
@@ -228,7 +235,10 @@ mod tests {
         let some_key = RowKey::builder()
             .append_nullable(Some(i64::MIN), |b, v| b.append_i64(v))
             .finish();
-        assert!(null_key < some_key, "NULL must sort before any non-NULL value");
+        assert!(
+            null_key < some_key,
+            "NULL must sort before any non-NULL value"
+        );
     }
 
     #[test]

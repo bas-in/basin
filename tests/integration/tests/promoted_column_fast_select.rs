@@ -35,8 +35,15 @@ use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
 /// Build a shard + engine pair backed by a temp local filesystem.
-async fn open_shard_engine() -> (TempDir, TempDir, Arc<dyn Wal>, Storage, Shard, Engine, ProjectId)
-{
+async fn open_shard_engine() -> (
+    TempDir,
+    TempDir,
+    Arc<dyn Wal>,
+    Storage,
+    Shard,
+    Engine,
+    ProjectId,
+) {
     let storage_dir = TempDir::new().unwrap();
     let wal_dir = TempDir::new().unwrap();
 
@@ -59,7 +66,11 @@ async fn open_shard_engine() -> (TempDir, TempDir, Arc<dyn Wal>, Storage, Shard,
         .unwrap(),
     );
 
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let engine = Engine::new(EngineConfig {
         storage: storage.clone(),
         catalog: catalog.clone(),
@@ -180,11 +191,16 @@ async fn promoted_fast_select_parity_and_routing() {
 
     // Same query with a simple WHERE predicate on a real column also fast-paths.
     let before2 = engine.promoted_fast_select_count();
-    let filtered =
-        query_id_string_col(&sess, "SELECT id, payload->>'event_type' FROM events WHERE id = 1")
-            .await;
+    let filtered = query_id_string_col(
+        &sess,
+        "SELECT id, payload->>'event_type' FROM events WHERE id = 1",
+    )
+    .await;
     let after2 = engine.promoted_fast_select_count();
-    assert!(after2 > before2, "filtered promoted `->>` should also fast-path");
+    assert!(
+        after2 > before2,
+        "filtered promoted `->>` should also fast-path"
+    );
     assert_eq!(filtered, vec![Some("login".to_string())]);
 
     wal.close().await.unwrap();
@@ -242,10 +258,21 @@ async fn promoted_fast_select_mixed_files_guard() {
     // Sanity: confirm the file set is genuinely MIXED — at least one file lacks
     // the shadow column in its catalog `column_stats`, at least one has it.
     let shadow = "__promoted$payload$event_type";
-    let meta = engine.config().catalog.load_table(&project, &table).await.unwrap();
+    let meta = engine
+        .config()
+        .catalog
+        .load_table(&project, &table)
+        .await
+        .unwrap();
     let files = meta.live_data_files();
-    let with = files.iter().filter(|f| f.column_stats.contains_key(shadow)).count();
-    let without = files.iter().filter(|f| !f.column_stats.contains_key(shadow)).count();
+    let with = files
+        .iter()
+        .filter(|f| f.column_stats.contains_key(shadow))
+        .count();
+    let without = files
+        .iter()
+        .filter(|f| !f.column_stats.contains_key(shadow))
+        .count();
     assert!(
         with >= 1 && without >= 1,
         "test requires a MIXED file set: with_shadow={with}, without_shadow={without}, \
@@ -254,15 +281,19 @@ async fn promoted_fast_select_mixed_files_guard() {
     );
     // Belt-and-braces: list_data_files agrees there are ≥2 files.
     let raw_files = storage.list_data_files(&project, &table).await.unwrap();
-    assert!(raw_files.len() >= 2, "expected ≥2 files, got {}", raw_files.len());
+    assert!(
+        raw_files.len() >= 2,
+        "expected ≥2 files, got {}",
+        raw_files.len()
+    );
 
     // Expected answer over ALL rows (== json_get_text from the payloads).
     let expected = vec![
         Some("login".to_string()),
-        None,                          // row 2: absent key
+        None, // row 2: absent key
         Some("signup".to_string()),
         Some("purchase".to_string()),
-        None,                          // row 5: JSON null
+        None, // row 5: JSON null
         Some("99".to_string()),
     ];
 
@@ -295,7 +326,10 @@ async fn promoted_fast_select_mixed_files_guard() {
         .run_promoted_column_backfill_sweep(&project, &table)
         .await
         .unwrap();
-    assert!(rewritten >= 1, "backfill sweep should rewrite ≥1 file, got {rewritten}");
+    assert!(
+        rewritten >= 1,
+        "backfill sweep should rewrite ≥1 file, got {rewritten}"
+    );
 
     let before3 = engine.promoted_fast_select_count();
     let promoted_after_backfill =
@@ -449,9 +483,11 @@ async fn promoted_where_equality_parity_and_routing() {
     shard.flush_to_parquet().await.unwrap();
 
     // Unrewritten twin first (cat_plain is never promoted → UDF path).
-    let twin_eq =
-        scalar_i64(&sess, "SELECT COUNT(*) FROM events WHERE payload->>'cat_plain' = 'alpha'")
-            .await;
+    let twin_eq = scalar_i64(
+        &sess,
+        "SELECT COUNT(*) FROM events WHERE payload->>'cat_plain' = 'alpha'",
+    )
+    .await;
     assert_eq!(twin_eq, 3, "twin sanity: three 'alpha' rows");
 
     // Promoted form: must be REWRITTEN to the shadow column and served by the
@@ -475,9 +511,11 @@ async fn promoted_where_equality_parity_and_routing() {
 
     // IS NULL parity: missing key (id 7) + JSON null (id 6) + NULL payload
     // (id 8) — three rows on BOTH forms.
-    let twin_null =
-        scalar_i64(&sess, "SELECT COUNT(*) FROM events WHERE payload->>'cat_plain' IS NULL")
-            .await;
+    let twin_null = scalar_i64(
+        &sess,
+        "SELECT COUNT(*) FROM events WHERE payload->>'cat_plain' IS NULL",
+    )
+    .await;
     let promoted_null = scalar_i64(
         &sess,
         "SELECT COUNT(*) FROM events WHERE payload->>'cat_promoted' IS NULL",
@@ -614,10 +652,15 @@ async fn promoted_where_equality_survives_dirty_overlay() {
         "SELECT COUNT(*) FROM events WHERE payload->>'cat_promoted' = 'alpha'",
     )
     .await;
-    let twin_alpha =
-        scalar_i64(&sess, "SELECT COUNT(*) FROM events WHERE payload->>'cat_plain' = 'alpha'")
-            .await;
-    assert_eq!(twin_alpha, 1, "post-UPDATE twin sanity: one 'alpha' row left");
+    let twin_alpha = scalar_i64(
+        &sess,
+        "SELECT COUNT(*) FROM events WHERE payload->>'cat_plain' = 'alpha'",
+    )
+    .await;
+    assert_eq!(
+        twin_alpha, 1,
+        "post-UPDATE twin sanity: one 'alpha' row left"
+    );
     assert_eq!(
         promoted_alpha, twin_alpha,
         "promoted WHERE-equality must see the overlay write (no stale shadow read, no \
@@ -629,11 +672,16 @@ async fn promoted_where_equality_survives_dirty_overlay() {
         "SELECT COUNT(*) FROM events WHERE payload->>'cat_promoted' = 'beta'",
     )
     .await;
-    let twin_beta =
-        scalar_i64(&sess, "SELECT COUNT(*) FROM events WHERE payload->>'cat_plain' = 'beta'")
-            .await;
+    let twin_beta = scalar_i64(
+        &sess,
+        "SELECT COUNT(*) FROM events WHERE payload->>'cat_plain' = 'beta'",
+    )
+    .await;
     assert_eq!(twin_beta, 2, "post-UPDATE twin sanity: two 'beta' rows");
-    assert_eq!(promoted_beta, twin_beta, "promoted/beta count must match the twin");
+    assert_eq!(
+        promoted_beta, twin_beta,
+        "promoted/beta count must match the twin"
+    );
 
     wal.close().await.unwrap();
 }
@@ -677,7 +725,10 @@ async fn promoted_where_equality_declines_on_pending_tail() {
     )
     .await;
     let after = engine.promoted_fast_select_count();
-    assert_eq!(with_tail, 4, "fresh tail row must be visible (3 seeded + 1 new)");
+    assert_eq!(
+        with_tail, 4,
+        "fresh tail row must be visible (3 seeded + 1 new)"
+    );
     assert_eq!(
         after, before,
         "with un-flushed tail rows the promoted rewrite must DECLINE \
@@ -725,14 +776,22 @@ async fn promoted_eq_prunes_files_after_backfill_sweep() {
         let rows: Vec<String> = (0..10)
             .map(|i| format!(r#"({}, '{{"category":"{cat}"}}')"#, base + i))
             .collect();
-        sess.execute(&format!("INSERT INTO events (id, payload) VALUES {}", rows.join(", ")))
-            .await
-            .unwrap();
+        sess.execute(&format!(
+            "INSERT INTO events (id, payload) VALUES {}",
+            rows.join(", ")
+        ))
+        .await
+        .unwrap();
         shard.flush_to_parquet().await.unwrap();
     }
 
     let table = TableName::new("events").unwrap();
-    let meta = engine.config().catalog.load_table(&project, &table).await.unwrap();
+    let meta = engine
+        .config()
+        .catalog
+        .load_table(&project, &table)
+        .await
+        .unwrap();
     let n_files = meta.live_data_files().len();
     assert!(n_files >= 3, "expected ≥3 live files, got {n_files}");
 
@@ -745,9 +804,11 @@ async fn promoted_eq_prunes_files_after_backfill_sweep() {
         .await
         .unwrap();
     let before_udf = engine.promoted_fast_select_count();
-    let pre_sweep =
-        scalar_i64(&sess, "SELECT COUNT(*) FROM events WHERE payload->>'category' = 'gamma'")
-            .await;
+    let pre_sweep = scalar_i64(
+        &sess,
+        "SELECT COUNT(*) FROM events WHERE payload->>'category' = 'gamma'",
+    )
+    .await;
     assert_eq!(pre_sweep, 10, "pre-sweep UDF count");
     assert_eq!(
         engine.promoted_fast_select_count(),
@@ -760,10 +821,18 @@ async fn promoted_eq_prunes_files_after_backfill_sweep() {
         .run_promoted_column_backfill_sweep(&project, &table)
         .await
         .unwrap();
-    assert!(rewritten >= 3, "sweep should rewrite all pre-promotion files, got {rewritten}");
+    assert!(
+        rewritten >= 3,
+        "sweep should rewrite all pre-promotion files, got {rewritten}"
+    );
 
     let shadow = "__promoted$payload$category";
-    let meta = engine.config().catalog.load_table(&project, &table).await.unwrap();
+    let meta = engine
+        .config()
+        .catalog
+        .load_table(&project, &table)
+        .await
+        .unwrap();
     for f in meta.live_data_files() {
         assert!(
             f.column_stats.contains_key(shadow),
@@ -782,9 +851,11 @@ async fn promoted_eq_prunes_files_after_backfill_sweep() {
     // file; stats/bloom on the shadow column must rule the other files out.
     let counters_before = storage.read_counters().snapshot();
     let fast_before = engine.promoted_fast_select_count();
-    let post_sweep =
-        scalar_i64(&sess, "SELECT COUNT(*) FROM events WHERE payload->>'category' = 'gamma'")
-            .await;
+    let post_sweep = scalar_i64(
+        &sess,
+        "SELECT COUNT(*) FROM events WHERE payload->>'category' = 'gamma'",
+    )
+    .await;
     let fast_after = engine.promoted_fast_select_count();
     let delta = storage.read_counters().snapshot().delta(&counters_before);
 

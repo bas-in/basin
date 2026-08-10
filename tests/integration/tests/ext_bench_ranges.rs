@@ -42,7 +42,10 @@ mod common;
 use common::{build_basin_engine, median, try_connect, SchemaGuard};
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn write_artifact(file: &str, value: &serde_json::Value) {
@@ -118,10 +121,15 @@ async fn basin_p50(sess: &basin_engine::ProjectSession, sql: &str, n: usize) -> 
 }
 
 async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f64> {
-    let _ = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await;
+    let _ = pg
+        .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+        .await;
     let mut s = Vec::with_capacity(n);
     for _ in 0..n {
-        if let Ok(rs) = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await {
+        if let Ok(rs) = pg
+            .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+            .await
+        {
             for m in &rs {
                 if let SimpleQueryMessage::Row(r) = m {
                     if let Some(line) = r.get(0) {
@@ -138,11 +146,18 @@ async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f6
             }
         }
     }
-    if s.is_empty() { None } else { Some(median(&s)) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(median(&s))
+    }
 }
 
 async fn pg_count(pg: &tokio_postgres::Client, sql: &str) -> i64 {
-    pg.query_one(sql, &[]).await.map(|r| r.get::<usize, i64>(0)).unwrap_or(-1)
+    pg.query_one(sql, &[])
+        .await
+        .map(|r| r.get::<usize, i64>(0))
+        .unwrap_or(-1)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -155,7 +170,11 @@ async fn ext_bench_ranges() {
 
     // ── Basin: R1 ingest ──────────────────────────────────────────────────────
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     sess.execute("CREATE TABLE bookings (id BIGINT NOT NULL, r int4range NOT NULL)")
         .await
         .unwrap();
@@ -182,7 +201,11 @@ async fn ext_bench_ranges() {
         bg.shutdown().await;
     }
     let basin_ingest_s = ingest_start.elapsed().as_secs_f64();
-    let basin_ingest_rate = if basin_ingest_s > 0.0 { rows as f64 / basin_ingest_s } else { 0.0 };
+    let basin_ingest_rate = if basin_ingest_s > 0.0 {
+        rows as f64 / basin_ingest_s
+    } else {
+        0.0
+    };
 
     // Small JOIN twin table — booking-conflict shape (a.r && b.r).
     let join_ok_basin = sess
@@ -207,7 +230,9 @@ async fn ext_bench_ranges() {
             jo = hi;
         }
     }
-    eprintln!("[ext_bench_ranges] basin ingest {basin_ingest_rate:.0} rows/s, join_table={join_ok_basin}");
+    eprintln!(
+        "[ext_bench_ranges] basin ingest {basin_ingest_rate:.0} rows/s, join_table={join_ok_basin}"
+    );
 
     // ── Basin shapes ──────────────────────────────────────────────────────────
     // Narrow probe range — overlaps a small fraction.
@@ -220,11 +245,23 @@ async fn ext_bench_ranges() {
     let r5_sql = "SELECT count(*) FROM requests req JOIN bookings bk ON req.r && bk.r";
 
     let r2_b = basin_p50(&sess, r2_sql, samples).await;
-    let r2_count = sess.execute(r2_sql).await.map(|r| basin_count(&r)).unwrap_or(-1);
+    let r2_count = sess
+        .execute(r2_sql)
+        .await
+        .map(|r| basin_count(&r))
+        .unwrap_or(-1);
     let r3_b = basin_p50(&sess, r3_sql, samples).await;
-    let r3_count = sess.execute(r3_sql).await.map(|r| basin_count(&r)).unwrap_or(-1);
+    let r3_count = sess
+        .execute(r3_sql)
+        .await
+        .map(|r| basin_count(&r))
+        .unwrap_or(-1);
     let r4_b = basin_p50(&sess, r4_sql, samples).await;
-    let r4_count = sess.execute(r4_sql).await.map(|r| basin_count(&r)).unwrap_or(-1);
+    let r4_count = sess
+        .execute(r4_sql)
+        .await
+        .map(|r| basin_count(&r))
+        .unwrap_or(-1);
 
     let r5_b = if join_ok_basin {
         basin_p50(&sess, r5_sql, samples.min(7)).await
@@ -233,7 +270,10 @@ async fn ext_bench_ranges() {
     };
     let r5_supported = r5_b.is_some();
     let r5_count = if r5_supported {
-        sess.execute(r5_sql).await.map(|r| basin_count(&r)).unwrap_or(-1)
+        sess.execute(r5_sql)
+            .await
+            .map(|r| basin_count(&r))
+            .unwrap_or(-1)
     } else {
         -1
     };
@@ -256,12 +296,25 @@ async fn ext_bench_ranges() {
         pg_available = true;
         let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
         let schema = format!("basin_ext_rng_{suffix}");
-        let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-        pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.ok();
+        let _guard = SchemaGuard {
+            schema: schema.clone(),
+            conn_str: cs,
+        };
+        pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .ok();
         pg.simple_query("SET work_mem = '16MB'").await.ok();
 
-        pg.simple_query(&format!("CREATE TABLE {schema}.bookings (id BIGINT, r int4range NOT NULL)")).await.ok();
-        pg.simple_query(&format!("CREATE TABLE {schema}.requests (id BIGINT, r int4range NOT NULL)")).await.ok();
+        pg.simple_query(&format!(
+            "CREATE TABLE {schema}.bookings (id BIGINT, r int4range NOT NULL)"
+        ))
+        .await
+        .ok();
+        pg.simple_query(&format!(
+            "CREATE TABLE {schema}.requests (id BIGINT, r int4range NOT NULL)"
+        ))
+        .await
+        .ok();
 
         let pgstart = Instant::now();
         let mut po = 0usize;
@@ -275,11 +328,17 @@ async fn ext_bench_ranges() {
                 let (lo, up) = range_of(k);
                 v.push_str(&format!("({k}, int4range({lo}, {up}))"));
             }
-            pg.simple_query(&format!("INSERT INTO {schema}.bookings VALUES {v}")).await.ok();
+            pg.simple_query(&format!("INSERT INTO {schema}.bookings VALUES {v}"))
+                .await
+                .ok();
             po = hi;
         }
         let pg_s = pgstart.elapsed().as_secs_f64();
-        pg_ingest_rate = if pg_s > 0.0 { Some(rows as f64 / pg_s) } else { None };
+        pg_ingest_rate = if pg_s > 0.0 {
+            Some(rows as f64 / pg_s)
+        } else {
+            None
+        };
 
         let mut jo = 0usize;
         while jo < join_n {
@@ -292,27 +351,64 @@ async fn ext_bench_ranges() {
                 let (lo, up) = range_of(k * 3 + 7);
                 v.push_str(&format!("({k}, int4range({lo}, {up}))"));
             }
-            pg.simple_query(&format!("INSERT INTO {schema}.requests VALUES {v}")).await.ok();
+            pg.simple_query(&format!("INSERT INTO {schema}.requests VALUES {v}"))
+                .await
+                .ok();
             jo = hi;
         }
         // PG GiST index on the range column makes && index-backed (the honest
         // PG-best comparator); a SP-GiST/GiST range index is the standard idiom.
-        pg.simple_query(&format!("CREATE INDEX bookings_r_gist ON {schema}.bookings USING gist (r)")).await.ok();
-        pg.simple_query(&format!("ANALYZE {schema}.bookings")).await.ok();
-        pg.simple_query(&format!("ANALYZE {schema}.requests")).await.ok();
+        pg.simple_query(&format!(
+            "CREATE INDEX bookings_r_gist ON {schema}.bookings USING gist (r)"
+        ))
+        .await
+        .ok();
+        pg.simple_query(&format!("ANALYZE {schema}.bookings"))
+            .await
+            .ok();
+        pg.simple_query(&format!("ANALYZE {schema}.requests"))
+            .await
+            .ok();
 
-        pg_r2_count = pg_count(&pg, &format!("SELECT count(*)::bigint FROM {schema}.bookings WHERE r && int4range(100, 110)")).await;
-        pg_r4_count = pg_count(&pg, &format!("SELECT count(*)::bigint FROM {schema}.bookings WHERE r @> 250")).await;
+        pg_r2_count = pg_count(
+            &pg,
+            &format!(
+                "SELECT count(*)::bigint FROM {schema}.bookings WHERE r && int4range(100, 110)"
+            ),
+        )
+        .await;
+        pg_r4_count = pg_count(
+            &pg,
+            &format!("SELECT count(*)::bigint FROM {schema}.bookings WHERE r @> 250"),
+        )
+        .await;
         pg_r5_count = pg_count(&pg, &format!(
             "SELECT count(*)::bigint FROM {schema}.requests req JOIN {schema}.bookings bk ON req.r && bk.r")).await;
 
-        pg_r2 = pg_p50(&pg, &format!("SELECT count(*) FROM {schema}.bookings WHERE r && int4range(100, 110)"), samples).await;
-        pg_r3 = pg_p50(&pg, &format!("SELECT count(*) FROM {schema}.bookings WHERE r && int4range(0, 5000)"), samples).await;
-        pg_r4 = pg_p50(&pg, &format!("SELECT count(*) FROM {schema}.bookings WHERE r @> 250"), samples).await;
+        pg_r2 = pg_p50(
+            &pg,
+            &format!("SELECT count(*) FROM {schema}.bookings WHERE r && int4range(100, 110)"),
+            samples,
+        )
+        .await;
+        pg_r3 = pg_p50(
+            &pg,
+            &format!("SELECT count(*) FROM {schema}.bookings WHERE r && int4range(0, 5000)"),
+            samples,
+        )
+        .await;
+        pg_r4 = pg_p50(
+            &pg,
+            &format!("SELECT count(*) FROM {schema}.bookings WHERE r @> 250"),
+            samples,
+        )
+        .await;
         pg_r5 = pg_p50(&pg, &format!(
             "SELECT count(*) FROM {schema}.requests req JOIN {schema}.bookings bk ON req.r && bk.r"), samples.min(7)).await;
 
-        let _ = pg.simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+        let _ = pg
+            .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await;
         std::mem::forget(_guard);
     } else {
         eprintln!("[ext_bench_ranges] PG unavailable — Basin-only card");
@@ -321,44 +417,59 @@ async fn ext_bench_ranges() {
     // ── Correctness cross-check ───────────────────────────────────────────────
     if pg_available {
         if r2_count >= 0 && pg_r2_count >= 0 {
-            assert_eq!(r2_count, pg_r2_count, "R2 && narrow count mismatch: basin {r2_count} != pg {pg_r2_count}");
+            assert_eq!(
+                r2_count, pg_r2_count,
+                "R2 && narrow count mismatch: basin {r2_count} != pg {pg_r2_count}"
+            );
         }
         if r4_count >= 0 && pg_r4_count >= 0 {
-            assert_eq!(r4_count, pg_r4_count, "R4 @> elem count mismatch: basin {r4_count} != pg {pg_r4_count}");
+            assert_eq!(
+                r4_count, pg_r4_count,
+                "R4 @> elem count mismatch: basin {r4_count} != pg {pg_r4_count}"
+            );
         }
         if r5_supported && r5_count >= 0 && pg_r5_count >= 0 {
-            assert_eq!(r5_count, pg_r5_count, "R5 booking-conflict JOIN count mismatch: basin {r5_count} != pg {pg_r5_count}");
+            assert_eq!(
+                r5_count, pg_r5_count,
+                "R5 booking-conflict JOIN count mismatch: basin {r5_count} != pg {pg_r5_count}"
+            );
         }
     }
 
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("ext_bench_ranges.json", &json!({
-        "card": "ext_bench_ranges",
-        "family": "range_types",
-        "generated_at": format!("@{ts}"),
-        "pg_available": pg_available,
-        "pg_extension_available": pg_available,
-        "config": { "rows": rows, "samples": samples, "join_n": join_n },
-        "ingest": {
-            "label": "R1: int4range ingest rate (rows/s, canonicalization folded in)",
-            "basin_rows_per_s": basin_ingest_rate,
-            "pg_rows_per_s": pg_ingest_rate,
-        },
-        "shapes": [
-            { "label": "R2: && overlap — narrow probe", "basin_p50_ms": opt_ms(r2_b), "pg_p50_ms": opt_ms(pg_r2),
-              "basin_over_pg": ratio(r2_b, pg_r2), "basin_hits": r2_count, "pg_hits": pg_r2_count },
-            { "label": "R3: && overlap — wide probe", "basin_p50_ms": opt_ms(r3_b), "pg_p50_ms": opt_ms(pg_r3),
-              "basin_over_pg": ratio(r3_b, pg_r3), "basin_hits": r3_count },
-            { "label": "R4: @> element containment", "basin_p50_ms": opt_ms(r4_b), "pg_p50_ms": opt_ms(pg_r4),
-              "basin_over_pg": ratio(r4_b, pg_r4), "basin_hits": r4_count, "pg_hits": pg_r4_count },
-            { "label": "R5: range JOIN a.r && b.r (booking-conflict)", "basin_supported": r5_supported,
-              "basin_p50_ms": opt_ms(r5_b), "pg_p50_ms": opt_ms(pg_r5), "basin_over_pg": ratio(r5_b, pg_r5),
-              "basin_hits": r5_count, "pg_hits": pg_r5_count },
-        ],
-        "note": "Range types are built into PostgreSQL (no extension). PG uses a GiST range \
-                 index for &&; Basin scans sequentially. Overlap/containment/join counts are \
-                 hard-asserted equal across engines. The range JOIN (a.r && b.r) is probed \
-                 at small N — if Basin cannot plan a cross-column range-overlap join it \
-                 records basin_supported:false and a PG-only timing (the card never fails).",
-    }));
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "ext_bench_ranges.json",
+        &json!({
+            "card": "ext_bench_ranges",
+            "family": "range_types",
+            "generated_at": format!("@{ts}"),
+            "pg_available": pg_available,
+            "pg_extension_available": pg_available,
+            "config": { "rows": rows, "samples": samples, "join_n": join_n },
+            "ingest": {
+                "label": "R1: int4range ingest rate (rows/s, canonicalization folded in)",
+                "basin_rows_per_s": basin_ingest_rate,
+                "pg_rows_per_s": pg_ingest_rate,
+            },
+            "shapes": [
+                { "label": "R2: && overlap — narrow probe", "basin_p50_ms": opt_ms(r2_b), "pg_p50_ms": opt_ms(pg_r2),
+                  "basin_over_pg": ratio(r2_b, pg_r2), "basin_hits": r2_count, "pg_hits": pg_r2_count },
+                { "label": "R3: && overlap — wide probe", "basin_p50_ms": opt_ms(r3_b), "pg_p50_ms": opt_ms(pg_r3),
+                  "basin_over_pg": ratio(r3_b, pg_r3), "basin_hits": r3_count },
+                { "label": "R4: @> element containment", "basin_p50_ms": opt_ms(r4_b), "pg_p50_ms": opt_ms(pg_r4),
+                  "basin_over_pg": ratio(r4_b, pg_r4), "basin_hits": r4_count, "pg_hits": pg_r4_count },
+                { "label": "R5: range JOIN a.r && b.r (booking-conflict)", "basin_supported": r5_supported,
+                  "basin_p50_ms": opt_ms(r5_b), "pg_p50_ms": opt_ms(pg_r5), "basin_over_pg": ratio(r5_b, pg_r5),
+                  "basin_hits": r5_count, "pg_hits": pg_r5_count },
+            ],
+            "note": "Range types are built into PostgreSQL (no extension). PG uses a GiST range \
+                     index for &&; Basin scans sequentially. Overlap/containment/join counts are \
+                     hard-asserted equal across engines. The range JOIN (a.r && b.r) is probed \
+                     at small N — if Basin cannot plan a cross-column range-overlap join it \
+                     records basin_supported:false and a PG-only timing (the card never fails).",
+        }),
+    );
 }

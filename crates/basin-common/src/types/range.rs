@@ -57,7 +57,10 @@ impl RangeSubtype {
     /// Whether this sub-type has a discrete (integer) element domain.
     /// Discrete ranges are canonicalized to the half-open `[lo, hi)` form.
     pub fn is_discrete(self) -> bool {
-        matches!(self, RangeSubtype::Int4 | RangeSubtype::Int8 | RangeSubtype::Date)
+        matches!(
+            self,
+            RangeSubtype::Int4 | RangeSubtype::Int8 | RangeSubtype::Date
+        )
     }
 }
 
@@ -128,7 +131,13 @@ impl RangeValue {
 
     /// Construct a finite range from its components.
     pub fn new(lower: Bound, upper: Bound, lower_inc: bool, upper_inc: bool) -> Self {
-        RangeValue { lower, upper, lower_inc, upper_inc, empty: false }
+        RangeValue {
+            lower,
+            upper,
+            lower_inc,
+            upper_inc,
+            empty: false,
+        }
     }
 
     /// Serialize to the Basin JSON storage format.
@@ -163,7 +172,13 @@ impl RangeValue {
         let upper = json_value_to_bound(v.get("u")?);
         let lower_inc = v.get("li").and_then(|b| b.as_bool()).unwrap_or(true);
         let upper_inc = v.get("ui").and_then(|b| b.as_bool()).unwrap_or(false);
-        Some(RangeValue { lower, upper, lower_inc, upper_inc, empty: false })
+        Some(RangeValue {
+            lower,
+            upper,
+            lower_inc,
+            upper_inc,
+            empty: false,
+        })
     }
 
     /// Parse from the PG text representation `[lo,hi)` / `(lo,hi]` / `empty`.
@@ -210,7 +225,13 @@ impl RangeValue {
         } else {
             Bound::Finite(hi_str.to_string())
         };
-        Some(RangeValue { lower, upper, lower_inc, upper_inc, empty: false })
+        Some(RangeValue {
+            lower,
+            upper,
+            lower_inc,
+            upper_inc,
+            empty: false,
+        })
     }
 
     /// Canonicalize this range for a given sub-type.
@@ -633,15 +654,23 @@ mod tests {
     #[test]
     fn semantic_eq_after_canonicalize() {
         // [1,9]::int4range = [1,10)::int4range after canonicalization.
-        let a = RangeValue::from_pg_text("[1,9]").unwrap().canonicalize(RangeSubtype::Int4);
-        let b = RangeValue::from_pg_text("[1,10)").unwrap().canonicalize(RangeSubtype::Int4);
+        let a = RangeValue::from_pg_text("[1,9]")
+            .unwrap()
+            .canonicalize(RangeSubtype::Int4);
+        let b = RangeValue::from_pg_text("[1,10)")
+            .unwrap()
+            .canonicalize(RangeSubtype::Int4);
         assert!(a.semantic_eq(&b));
     }
 
     #[test]
     fn semantic_eq_different_ranges() {
-        let a = RangeValue::from_pg_text("[1,5)").unwrap().canonicalize(RangeSubtype::Int4);
-        let b = RangeValue::from_pg_text("[1,10)").unwrap().canonicalize(RangeSubtype::Int4);
+        let a = RangeValue::from_pg_text("[1,5)")
+            .unwrap()
+            .canonicalize(RangeSubtype::Int4);
+        let b = RangeValue::from_pg_text("[1,10)")
+            .unwrap()
+            .canonicalize(RangeSubtype::Int4);
         assert!(!a.semantic_eq(&b));
     }
 

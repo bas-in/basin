@@ -51,9 +51,9 @@
 
 use std::sync::Arc;
 
-use datafusion::common::Result;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::Result;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -115,9 +115,7 @@ fn try_elide_sort(plan: Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>
     };
 
     // 2. The window's direct child must be a SortExec.
-    let sort_exec = window_child_arc
-        .as_any()
-        .downcast_ref::<SortExec>()?;
+    let sort_exec = window_child_arc.as_any().downcast_ref::<SortExec>()?;
     let sort_exprs = sort_exec.expr();
 
     // 3. Walk through an optional RepartitionExec to reach the DataSourceExec.
@@ -197,21 +195,21 @@ mod tests {
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::common::config::ConfigOptions;
-    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion::logical_expr::WindowFrame;
+    use datafusion::logical_expr::WindowUDF;
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::sorts::sort::SortExec;
-    use datafusion::physical_plan::windows::{
-        WindowAggExec, WindowUDFExpr, create_udwf_window_expr,
-    };
     use datafusion::physical_plan::windows::StandardWindowExpr;
+    use datafusion::physical_plan::windows::{
+        create_udwf_window_expr, WindowAggExec, WindowUDFExpr,
+    };
+    use datafusion::physical_plan::ExecutionPlanProperties;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_datasource::source::DataSourceExec;
-    use datafusion_physical_expr::LexOrdering;
-    use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_expr::expressions::Column;
+    use datafusion_physical_expr::LexOrdering;
     use datafusion_physical_expr::PhysicalExpr;
-    use datafusion::logical_expr::WindowUDF;
-    use datafusion::logical_expr::WindowFrame;
+    use datafusion_physical_expr::PhysicalSortExpr;
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -280,9 +278,7 @@ mod tests {
             Arc::new(WindowFrame::new(None)),
         )) as Arc<dyn datafusion::physical_plan::WindowExpr>;
 
-        Arc::new(
-            WindowAggExec::try_new(vec![window_expr], input, true).unwrap(),
-        )
+        Arc::new(WindowAggExec::try_new(vec![window_expr], input, true).unwrap())
     }
 
     // -----------------------------------------------------------------------
@@ -377,8 +373,7 @@ mod tests {
         // longer a direct child / grandchild of the SortExec.
         let b_idx = schema.index_of("b").unwrap();
         let b_col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", b_idx));
-        let filter =
-            Arc::new(FilterExec::try_new(b_col, scan).unwrap()) as Arc<dyn ExecutionPlan>;
+        let filter = Arc::new(FilterExec::try_new(b_col, scan).unwrap()) as Arc<dyn ExecutionPlan>;
 
         let sort_ord = LexOrdering::new(vec![id_asc.clone()]).unwrap();
         let sort: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(sort_ord, filter));

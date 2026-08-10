@@ -177,7 +177,11 @@ async fn vercel_postgres_50_concurrent_invocations_0_failures() {
         .args(["-sf", "http://localhost:3000/bench"])
         .output()
         .expect("failed to run curl against /bench");
-    assert!(bench_out.status.success(), "curl /bench failed: {:?}", bench_out.status);
+    assert!(
+        bench_out.status.success(),
+        "curl /bench failed: {:?}",
+        bench_out.status
+    );
 
     let body = String::from_utf8_lossy(&bench_out.stdout);
     let parsed: serde_json::Value =
@@ -191,7 +195,10 @@ async fn vercel_postgres_50_concurrent_invocations_0_failures() {
         ok = parsed["ok"]
     );
 
-    assert_eq!(failures, 0, "expected 0 connection failures, got {failures}");
+    assert_eq!(
+        failures, 0,
+        "expected 0 connection failures, got {failures}"
+    );
     assert!(
         p99_ms <= 100.0,
         "p99 latency {p99_ms:.1} ms exceeds 100 ms budget"
@@ -219,7 +226,10 @@ fn docker_compose_stack_files_exist() {
     let base = manifest.join("docker").join("vercel-postgres-app");
 
     let compose = base.join("docker-compose.yml");
-    assert!(compose.exists(), "docker-compose.yml not found at {compose:?}");
+    assert!(
+        compose.exists(),
+        "docker-compose.yml not found at {compose:?}"
+    );
 
     let app_js = base.join("app").join("app.js");
     assert!(app_js.exists(), "app.js not found at {app_js:?}");
@@ -228,7 +238,10 @@ fn docker_compose_stack_files_exist() {
     assert!(pkg.exists(), "package.json not found at {pkg:?}");
 
     let dockerfile = base.join("Dockerfile");
-    assert!(dockerfile.exists(), "Dockerfile not found at {dockerfile:?}");
+    assert!(
+        dockerfile.exists(),
+        "Dockerfile not found at {dockerfile:?}"
+    );
 
     println!("docker_compose_stack_files_exist: all files present at {base:?}");
 }

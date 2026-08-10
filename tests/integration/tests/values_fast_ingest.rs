@@ -399,7 +399,11 @@ async fn equivalence_subset_columns() {
         .unwrap();
 
     let m = select(&sess, "SELECT id, a, b FROM multi ORDER BY id").await;
-    assert_eq!(col_str(&m, "a"), vec![None, None], "omitted col must be NULL");
+    assert_eq!(
+        col_str(&m, "a"),
+        vec![None, None],
+        "omitted col must be NULL"
+    );
     assert_eq!(
         col_str(&m, "b"),
         vec![Some("x".to_string()), Some("y".to_string())]
@@ -514,9 +518,21 @@ async fn equivalence_benchmark_schema_10k_with_jsonb() {
     assert_eq!(total_rows(&m), n);
     assert_eq!(total_rows(&c), n);
     assert_eq!(col_i64(&m, "id"), col_i64(&c, "id"), "id mismatch");
-    assert_eq!(col_i64(&m, "user_id"), col_i64(&c, "user_id"), "user_id mismatch");
-    assert_eq!(col_f64(&m, "amount"), col_f64(&c, "amount"), "amount mismatch");
-    assert_eq!(col_str(&m, "status"), col_str(&c, "status"), "status mismatch");
+    assert_eq!(
+        col_i64(&m, "user_id"),
+        col_i64(&c, "user_id"),
+        "user_id mismatch"
+    );
+    assert_eq!(
+        col_f64(&m, "amount"),
+        col_f64(&c, "amount"),
+        "amount mismatch"
+    );
+    assert_eq!(
+        col_str(&m, "status"),
+        col_str(&c, "status"),
+        "status mismatch"
+    );
     assert_eq!(
         col_i64(&m, "created_at"),
         col_i64(&c, "created_at"),
@@ -540,7 +556,10 @@ async fn equivalence_benchmark_schema_10k_with_jsonb() {
     let a = row5_str.find("\"a\"").unwrap();
     let m_ = row5_str.find("\"m\"").unwrap();
     let z = row5_str.find("\"z\"").unwrap();
-    assert!(a < m_ && m_ < z, "canonical key order a<m<z, got {row5_str}");
+    assert!(
+        a < m_ && m_ < z,
+        "canonical key order a<m<z, got {row5_str}"
+    );
 }
 
 /// The published benchmark's exact literal shape: every JSONB payload carries
@@ -634,7 +653,11 @@ async fn equivalence_benchmark_jsonb_suffix_cast_10k() {
     assert_eq!(total_rows(&m), n);
     assert_eq!(total_rows(&c), n);
     assert_eq!(col_i64(&m, "id"), col_i64(&c, "id"), "id mismatch");
-    assert_eq!(col_str(&m, "status"), col_str(&c, "status"), "status mismatch");
+    assert_eq!(
+        col_str(&m, "status"),
+        col_str(&c, "status"),
+        "status mismatch"
+    );
     // The load-bearing assertion: a `::jsonb`-suffixed literal through the
     // fast path must store byte-identical canonical JSONB to the uncast
     // slow-path control.
@@ -652,7 +675,10 @@ async fn equivalence_benchmark_jsonb_suffix_cast_10k() {
     let a = row5_str.find("\"a\"").unwrap();
     let m_ = row5_str.find("\"m\"").unwrap();
     let z = row5_str.find("\"z\"").unwrap();
-    assert!(a < m_ && m_ < z, "canonical key order a<m<z, got {row5_str}");
+    assert!(
+        a < m_ && m_ < z,
+        "canonical key order a<m<z, got {row5_str}"
+    );
 }
 
 /// Invalid JSON in a JSONB column: the multi-row statement must error, and the
@@ -706,9 +732,7 @@ async fn equivalence_timestamp_column() {
     let (_dir, eng) = open_engine().await;
     let sess = session(&eng).await;
 
-    let ddl = |t: &str| {
-        format!("CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, ts TIMESTAMP)")
-    };
+    let ddl = |t: &str| format!("CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, ts TIMESTAMP)");
     sess.execute(&ddl("multi")).await.unwrap();
     sess.execute(&ddl("control")).await.unwrap();
 
@@ -765,11 +789,9 @@ async fn fallback_function_in_values() {
     sess.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, u UUID NOT NULL)")
         .await
         .unwrap();
-    sess.execute(
-        "INSERT INTO t (id, u) VALUES (1, gen_random_uuid()), (2, gen_random_uuid())",
-    )
-    .await
-    .unwrap();
+    sess.execute("INSERT INTO t (id, u) VALUES (1, gen_random_uuid()), (2, gen_random_uuid())")
+        .await
+        .unwrap();
     let r = select(&sess, "SELECT id FROM t ORDER BY id").await;
     assert_eq!(col_i64(&r, "id"), vec![Some(1), Some(2)]);
     // Both UUIDs landed and are distinct.
@@ -869,9 +891,11 @@ async fn fallback_mismatched_cast_date_column() {
     .await
     .unwrap();
     // … and the same data uncast as the control (also slow path).
-    sess.execute("INSERT INTO control (id, d) VALUES (1, '2020-01-01'), (2, '1999-12-31'), (3, NULL)")
-        .await
-        .unwrap();
+    sess.execute(
+        "INSERT INTO control (id, d) VALUES (1, '2020-01-01'), (2, '1999-12-31'), (3, NULL)",
+    )
+    .await
+    .unwrap();
 
     let m = select(&sess, "SELECT id, d FROM multi ORDER BY id").await;
     let c = select(&sess, "SELECT id, d FROM control ORDER BY id").await;
@@ -1143,7 +1167,10 @@ async fn pk_violation_still_raised() {
     let err2 = sess
         .execute("INSERT INTO t (id, s) VALUES (3, 'x'), (3, 'y')")
         .await;
-    assert!(err2.is_err(), "in-batch duplicate PK must raise, got {err2:?}");
+    assert!(
+        err2.is_err(),
+        "in-batch duplicate PK must raise, got {err2:?}"
+    );
 }
 
 #[tokio::test]
@@ -1316,7 +1343,10 @@ async fn prepared_literal_10k_equals_simple_path() {
     assert_eq!(col_f64(&a, "val"), col_f64(&b, "val"));
     assert_eq!(col_str(&a, "name"), col_str(&b, "name"));
     assert_eq!(col_bool(&a, "flag"), col_bool(&b, "flag"));
-    assert_eq!(col_jsonb_bytes(&a, "payload"), col_jsonb_bytes(&b, "payload"));
+    assert_eq!(
+        col_jsonb_bytes(&a, "payload"),
+        col_jsonb_bytes(&b, "payload")
+    );
 
     // Re-Executing the same prepared literal statement re-inserts the same
     // rows — which must hit the PK constraint, exactly like re-sending the
@@ -1374,7 +1404,9 @@ async fn prepared_param_inserts_equal_simple_inserts() {
 
     // Prepared path: prepare ONCE, bind+execute per row with typed params.
     let (handle, _schema) = sess
-        .prepare("INSERT INTO prepared_p (id, name, score, ok, doc, ts) VALUES ($1, $2, $3, $4, $5, $6)")
+        .prepare(
+            "INSERT INTO prepared_p (id, name, score, ok, doc, ts) VALUES ($1, $2, $3, $4, $5, $6)",
+        )
         .await
         .unwrap();
     for i in 0..n {
@@ -1497,7 +1529,10 @@ async fn prepared_param_declines_still_work() {
         .unwrap();
     for (id, v) in [(1i64, "a"), (1, "b"), (2, "c")] {
         let bound = sess
-            .bind(&h_up, vec![ScalarParam::Int8(id), ScalarParam::Text(v.into())])
+            .bind(
+                &h_up,
+                vec![ScalarParam::Int8(id), ScalarParam::Text(v.into())],
+            )
             .await
             .unwrap();
         sess.execute_bound(bound).await.unwrap();
@@ -1552,11 +1587,9 @@ async fn prepared_param_declines_still_work() {
     assert_eq!(col_i64(&r, "c"), vec![Some(3)]);
 
     // ── Identity column: server-side fill must still run ────────────────────
-    sess.execute(
-        "CREATE TABLE ident (id BIGINT GENERATED ALWAYS AS IDENTITY, name TEXT NOT NULL)",
-    )
-    .await
-    .unwrap();
+    sess.execute("CREATE TABLE ident (id BIGINT GENERATED ALWAYS AS IDENTITY, name TEXT NOT NULL)")
+        .await
+        .unwrap();
     let (h_id, _) = sess
         .prepare("INSERT INTO ident (name) VALUES ($1)")
         .await

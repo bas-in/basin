@@ -99,8 +99,7 @@ async fn connect(addr: SocketAddr) -> tokio_postgres::Client {
 }
 
 const ROWS: i64 = 1000;
-const DDL: &str =
-    "CREATE TABLE %TABLE% (
+const DDL: &str = "CREATE TABLE %TABLE% (
         id       BIGINT NOT NULL PRIMARY KEY,
         user_id  BIGINT,
         amount   DOUBLE PRECISION,
@@ -115,27 +114,51 @@ const DDL: &str =
 // ---------------------------------------------------------------------------
 
 fn user_id(k: i64) -> Option<i64> {
-    if k % 7 == 0 { None } else { Some(k % 500) }
+    if k % 7 == 0 {
+        None
+    } else {
+        Some(k % 500)
+    }
 }
 
 fn amount(k: i64) -> Option<f64> {
-    if k % 11 == 0 { None } else { Some(k as f64 * 0.25) }
+    if k % 11 == 0 {
+        None
+    } else {
+        Some(k as f64 * 0.25)
+    }
 }
 
 fn label(k: i64) -> Option<String> {
-    if k % 13 == 0 { None } else { Some(format!("label-{}", k % 100)) }
+    if k % 13 == 0 {
+        None
+    } else {
+        Some(format!("label-{}", k % 100))
+    }
 }
 
 fn score(k: i64) -> Option<i32> {
-    if k % 17 == 0 { None } else { Some((k % 1000) as i32) }
+    if k % 17 == 0 {
+        None
+    } else {
+        Some((k % 1000) as i32)
+    }
 }
 
 fn active(k: i64) -> Option<bool> {
-    if k % 19 == 0 { None } else { Some(k % 2 == 0) }
+    if k % 19 == 0 {
+        None
+    } else {
+        Some(k % 2 == 0)
+    }
 }
 
 fn ratio(k: i64) -> Option<f32> {
-    if k % 23 == 0 { None } else { Some((k as f32) * 0.01) }
+    if k % 23 == 0 {
+        None
+    } else {
+        Some((k as f32) * 0.01)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,13 +268,13 @@ async fn copy_and_insert_produce_identical_rows() {
             None => String::new(),
             Some(v) => format!("{v}"),
         };
-        csv.push_str(&format!("{k},{uid_s},{amt_s},{lbl_s},{sc_s},{act_s},{rat_s}\n"));
+        csv.push_str(&format!(
+            "{k},{uid_s},{amt_s},{lbl_s},{sc_s},{act_s},{rat_s}\n"
+        ));
     }
 
     let sink = client
-        .copy_in::<_, Bytes>(
-            "COPY t_copy FROM STDIN WITH (FORMAT CSV, NULL '')",
-        )
+        .copy_in::<_, Bytes>("COPY t_copy FROM STDIN WITH (FORMAT CSV, NULL '')")
         .await
         .expect("copy_in start");
     futures::pin_mut!(sink);
@@ -262,10 +285,7 @@ async fn copy_and_insert_produce_identical_rows() {
     assert_eq!(n, ROWS as u64, "COPY CommandComplete tag count");
 
     // ---- Read both tables ---------------------------------------------------
-    async fn read_table(
-        client: &tokio_postgres::Client,
-        table: &str,
-    ) -> HashMap<i64, Row> {
+    async fn read_table(client: &tokio_postgres::Client, table: &str) -> HashMap<i64, Row> {
         let rows = client
             .query(
                 &format!(
@@ -343,5 +363,8 @@ async fn copy_and_insert_produce_identical_rows() {
         }
     }
 
-    assert_eq!(mismatches, 0, "{mismatches} row(s) differed between INSERT and COPY");
+    assert_eq!(
+        mismatches, 0,
+        "{mismatches} row(s) differed between INSERT and COPY"
+    );
 }

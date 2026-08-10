@@ -822,9 +822,7 @@ impl Wal for LocalWal {
         partition: &PartitionKey,
         tx_id: u64,
     ) -> Result<Lsn> {
-        self.inner
-            .append_tx_commit(project, partition, tx_id)
-            .await
+        self.inner.append_tx_commit(project, partition, tx_id).await
     }
 
     async fn append_handoff_marker(
@@ -983,14 +981,14 @@ mod segment;
 mod state;
 
 pub use fsync::{DurablePut, FsyncOnPut, FsyncOnPutAll};
-pub use raft_wal::{
-    BasinRaftItem, BasinRaftRequest, BasinRaftResponse, ClusterRole, ClusterStatus,
-    DurabilityBackend, LocalDurability, RaftDurability, RaftWal, RaftWalConfig, SimCluster, WalMode,
-};
 #[cfg(feature = "raft-net")]
 pub use raft_net::{
-    raft_bind_addr_from_env, serve_raft, serve_raft_on_listener,
-    serve_raft_on_listener_with_tls, serve_raft_with_tls, PeerRegistry, RaftTlsConfig,
-    RaftTransportService, StaticPeers, TonicNetworkConfig, TonicNetworkFactory,
-    DEFAULT_RAFT_TLS_DOMAIN,
+    raft_bind_addr_from_env, serve_raft, serve_raft_on_listener, serve_raft_on_listener_with_tls,
+    serve_raft_with_tls, PeerRegistry, RaftTlsConfig, RaftTransportService, StaticPeers,
+    TonicNetworkConfig, TonicNetworkFactory, DEFAULT_RAFT_TLS_DOMAIN,
+};
+pub use raft_wal::{
+    BasinRaftItem, BasinRaftRequest, BasinRaftResponse, ClusterRole, ClusterStatus,
+    DurabilityBackend, LocalDurability, RaftDurability, RaftWal, RaftWalConfig, SimCluster,
+    WalMode,
 };

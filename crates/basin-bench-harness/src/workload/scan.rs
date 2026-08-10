@@ -23,11 +23,7 @@ pub struct ScanOutcome {
 /// primitive — fan-out is configured by the profile by issuing the same
 /// shape across multiple `project_idx` values in parallel (so per-project
 /// IO permits actually fire).
-pub async fn scan(
-    h: &BenchHarness,
-    cfg: &BenchConfig,
-    project_idx: usize,
-) -> Result<ScanOutcome> {
+pub async fn scan(h: &BenchHarness, cfg: &BenchConfig, project_idx: usize) -> Result<ScanOutcome> {
     let project = h
         .projects
         .get(project_idx)

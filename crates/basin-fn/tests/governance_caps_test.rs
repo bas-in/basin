@@ -135,8 +135,8 @@ async fn cpu_cap_kills_spinner() {
     // we need the governance's engine to drive the ticks. Build the harness
     // with that engine explicitly via the closure passed to invoke_with_caps.
     let engine = gov.engine().clone();
-    let component = wasmtime::component::Component::new(&engine, &wasm)
-        .expect("component compiles");
+    let component =
+        wasmtime::component::Component::new(&engine, &wasm).expect("component compiles");
     let component = Arc::new(component);
 
     let project = ProjectId::new();
@@ -162,8 +162,7 @@ async fn cpu_cap_kills_spinner() {
                 // Instantiating + calling `run` must trap once the epoch
                 // counter passes the deadline.
                 let instance = linker.instantiate(&mut store, &component)?;
-                let run = instance
-                    .get_typed_func::<(), (Option<String>,)>(&mut store, "run")?;
+                let run = instance.get_typed_func::<(), (Option<String>,)>(&mut store, "run")?;
                 run.call(&mut store, ())?;
                 Ok(())
             }
@@ -202,9 +201,8 @@ async fn memory_cap_kills_grow_past_cap() {
     let gov = FunctionGovernance::new(caps);
     let engine = gov.engine().clone();
     let wasm = wat::parse_str(MEMORY_HOG_WAT).expect("WAT memory_hog parses");
-    let component = Arc::new(
-        wasmtime::component::Component::new(&engine, &wasm).expect("component compiles"),
-    );
+    let component =
+        Arc::new(wasmtime::component::Component::new(&engine, &wasm).expect("component compiles"));
 
     let project = ProjectId::new();
 
@@ -224,8 +222,7 @@ async fn memory_cap_kills_grow_past_cap() {
                     wasmtime::component::Linker::new(&engine);
                 basin_fn::host::add_host_to_linker(&mut linker)?;
                 let instance = linker.instantiate(&mut store, &component)?;
-                let run = instance
-                    .get_typed_func::<(), (Option<String>,)>(&mut store, "run")?;
+                let run = instance.get_typed_func::<(), (Option<String>,)>(&mut store, "run")?;
                 run.call(&mut store, ())?;
                 Ok(())
             }
@@ -352,8 +349,7 @@ async fn component_harness_run_with_cpu_cap_kills_spinner() {
     let gov = FunctionGovernance::new(caps);
 
     let wasm = wat::parse_str(SPINNER_WAT).expect("WAT spinner parses");
-    let harness =
-        Arc::new(ComponentHarness::with_governance(&wasm, gov.clone()).expect("compile"));
+    let harness = Arc::new(ComponentHarness::with_governance(&wasm, gov.clone()).expect("compile"));
     assert!(harness.has_governance(), "with_governance must attach caps");
 
     let project = ProjectId::new();
@@ -366,7 +362,9 @@ async fn component_harness_run_with_cpu_cap_kills_spinner() {
 
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("interrupt") || msg.contains("trap") || msg.contains("epoch")
+        msg.contains("interrupt")
+            || msg.contains("trap")
+            || msg.contains("epoch")
             || msg.contains("wall-clock"),
         "expected epoch/trap/wall-clock interrupt, got: {msg}"
     );
@@ -523,8 +521,7 @@ async fn component_harness_run_with_bumps_cpu_micros_per_project() {
     let wasm = wat::parse_str(NOOP_COMPONENT_WAT).expect("noop component WAT parses");
     let registry = Arc::new(ProjectCounterRegistry::new());
 
-    let mut harness =
-        ComponentHarness::with_governance(&wasm, gov.clone()).expect("compile");
+    let mut harness = ComponentHarness::with_governance(&wasm, gov.clone()).expect("compile");
     harness.attach_project_counters(registry.clone());
     let harness = Arc::new(harness);
 
@@ -560,6 +557,7 @@ async fn component_harness_run_with_bumps_cpu_micros_per_project() {
     assert!(
         snap_a.cpu_micros_total > snap_b.cpu_micros_total,
         "A({} micros) should exceed B({} micros) after 3x more invocations",
-        snap_a.cpu_micros_total, snap_b.cpu_micros_total,
+        snap_a.cpu_micros_total,
+        snap_b.cpu_micros_total,
     );
 }

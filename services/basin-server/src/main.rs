@@ -351,7 +351,10 @@ fn log_config_overrides() {
     if n == 0 {
         tracing::info!("config: all watched perf/durability tunables at code defaults");
     } else {
-        tracing::warn!(overrides = n, "config: {n} off-default tunable(s) in effect (see warnings above)");
+        tracing::warn!(
+            overrides = n,
+            "config: {n} off-default tunable(s) in effect (see warnings above)"
+        );
     }
 }
 
@@ -363,8 +366,7 @@ async fn run() -> Result<()> {
     // the main runtime even when every worker is blocked. No-op unless
     // BASIN_DEBUG_PORT is set. The thread is detached for the whole process
     // lifetime — it must stay alive THROUGH a wedged graceful drain.
-    if let Some(h) =
-        crate::debug_listener::spawn_debug_listener(tokio::runtime::Handle::current())
+    if let Some(h) = crate::debug_listener::spawn_debug_listener(tokio::runtime::Handle::current())
     {
         std::mem::forget(h);
     }
@@ -871,7 +873,9 @@ async fn run() -> Result<()> {
             );
         }
         let client = basin_engine::write_forwarder::HttpPartitionForwardClient::with_secret(
-            forward_secret.clone().expect("forward_secret is Some in this branch"),
+            forward_secret
+                .clone()
+                .expect("forward_secret is Some in this branch"),
         );
         engine.attach_partition_forward_client(std::sync::Arc::new(client));
         forward_transport_installed = true;
@@ -901,9 +905,8 @@ async fn run() -> Result<()> {
         let static_peers = std::env::var("BASIN_SHARD_PEERS").ok();
         let fly_app = std::env::var("FLY_APP_NAME").ok();
         let fly_machine = std::env::var("FLY_MACHINE_ID").ok();
-        let rest_port = shard_discovery::rest_port_from_bind(
-            std::env::var("BASIN_REST_BIND").ok().as_deref(),
-        );
+        let rest_port =
+            shard_discovery::rest_port_from_bind(std::env::var("BASIN_REST_BIND").ok().as_deref());
         let discovery_on = shard_discovery::discovery_enabled(
             static_peers.as_deref(),
             fly_app.as_deref(),
@@ -1256,10 +1259,10 @@ async fn run() -> Result<()> {
         // block is a documented seam. When wiring it, gate on
         // `if let Some(ref raft) = raft_wal { svc.with_cluster_status(raft.clone()); }`.
         let _ = &raft_wal; // keep the handle live for the seam above + shutdown.
-        // Feature 2: co-mount realtime SSE + WS on the REST port when both
-        // features are compiled in and an auth service is available. The
-        // standalone BASIN_REALTIME_BIND / BASIN_REALTIME_WS_BIND ports are
-        // still started below for clients that prefer dedicated ports.
+                           // Feature 2: co-mount realtime SSE + WS on the REST port when both
+                           // features are compiled in and an auth service is available. The
+                           // standalone BASIN_REALTIME_BIND / BASIN_REALTIME_WS_BIND ports are
+                           // still started below for clients that prefer dedicated ports.
         #[cfg(feature = "realtime")]
         svc.attach_realtime(basin_rest::RealtimeCoMount {
             registry: realtime_sink.registry().clone(),
@@ -1292,27 +1295,25 @@ async fn run() -> Result<()> {
     // The `sse_serve` function is self-contained inside `basin-realtime`:
     // `basin-server` never imports `axum` directly.
     #[cfg(feature = "realtime")]
-    let _realtime_handle: Option<tokio::task::JoinHandle<()>> =
-        if let Some(ref auth) = auth_service {
-            let realtime_bind: std::net::SocketAddr = std::env::var("BASIN_REALTIME_BIND")
-                .unwrap_or_else(|_| "127.0.0.1:5435".to_string())
-                .parse()
-                .context("BASIN_REALTIME_BIND must be host:port")?;
-            let handle = basin_realtime::sse_serve(
-                realtime_bind,
-                realtime_sink.registry().clone(),
-                auth.clone(),
-            )
-            .await
-            .with_context(|| format!("basin-realtime bind {realtime_bind} failed"))?;
-            tracing::info!(bind = %realtime_bind, "basin-realtime SSE listener is accept-ready");
-            Some(handle)
-        } else {
-            tracing::info!(
-                "basin-realtime: SSE listener not started (requires BASIN_AUTH_ENABLED=1)"
-            );
-            None
-        };
+    let _realtime_handle: Option<tokio::task::JoinHandle<()>> = if let Some(ref auth) = auth_service
+    {
+        let realtime_bind: std::net::SocketAddr = std::env::var("BASIN_REALTIME_BIND")
+            .unwrap_or_else(|_| "127.0.0.1:5435".to_string())
+            .parse()
+            .context("BASIN_REALTIME_BIND must be host:port")?;
+        let handle = basin_realtime::sse_serve(
+            realtime_bind,
+            realtime_sink.registry().clone(),
+            auth.clone(),
+        )
+        .await
+        .with_context(|| format!("basin-realtime bind {realtime_bind} failed"))?;
+        tracing::info!(bind = %realtime_bind, "basin-realtime SSE listener is accept-ready");
+        Some(handle)
+    } else {
+        tracing::info!("basin-realtime: SSE listener not started (requires BASIN_AUTH_ENABLED=1)");
+        None
+    };
     #[cfg(not(feature = "realtime"))]
     let _realtime_handle: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -1325,27 +1326,23 @@ async fn run() -> Result<()> {
     // `ws_serve` is self-contained inside `basin-realtime`; `basin-server`
     // never imports `axum` or `tokio-tungstenite` directly.
     #[cfg(feature = "realtime")]
-    let _realtime_ws_handle: Option<tokio::task::JoinHandle<()>> =
-        if let Some(ref auth) = auth_service {
-            let ws_bind: std::net::SocketAddr = std::env::var("BASIN_REALTIME_WS_BIND")
-                .unwrap_or_else(|_| "127.0.0.1:5436".to_string())
-                .parse()
-                .context("BASIN_REALTIME_WS_BIND must be host:port")?;
-            let handle = basin_realtime::ws_serve(
-                ws_bind,
-                realtime_sink.registry().clone(),
-                auth.clone(),
-            )
-            .await
-            .with_context(|| format!("basin-realtime WS bind {ws_bind} failed"))?;
-            tracing::info!(bind = %ws_bind, "basin-realtime WS listener is accept-ready");
-            Some(handle)
-        } else {
-            tracing::info!(
-                "basin-realtime: WS listener not started (requires BASIN_AUTH_ENABLED=1)"
-            );
-            None
-        };
+    let _realtime_ws_handle: Option<tokio::task::JoinHandle<()>> = if let Some(ref auth) =
+        auth_service
+    {
+        let ws_bind: std::net::SocketAddr = std::env::var("BASIN_REALTIME_WS_BIND")
+            .unwrap_or_else(|_| "127.0.0.1:5436".to_string())
+            .parse()
+            .context("BASIN_REALTIME_WS_BIND must be host:port")?;
+        let handle =
+            basin_realtime::ws_serve(ws_bind, realtime_sink.registry().clone(), auth.clone())
+                .await
+                .with_context(|| format!("basin-realtime WS bind {ws_bind} failed"))?;
+        tracing::info!(bind = %ws_bind, "basin-realtime WS listener is accept-ready");
+        Some(handle)
+    } else {
+        tracing::info!("basin-realtime: WS listener not started (requires BASIN_AUTH_ENABLED=1)");
+        None
+    };
     #[cfg(not(feature = "realtime"))]
     let _realtime_ws_handle: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -1565,8 +1562,8 @@ async fn build_raft_wal(cfg: &Cfg) -> Result<basin_wal::RaftWal> {
         );
         // Optional mutual TLS (BASIN_RAFT_TLS_CERT/KEY/CA). All-or-none: a
         // partial config is a startup error (no silent plaintext fallback).
-        let tls = basin_wal::RaftTlsConfig::from_env()
-            .map_err(|e| anyhow!("raft mTLS config: {e}"))?;
+        let tls =
+            basin_wal::RaftTlsConfig::from_env().map_err(|e| anyhow!("raft mTLS config: {e}"))?;
         let mut factory = basin_wal::TonicNetworkFactory::with_shared(
             peers,
             basin_wal::TonicNetworkConfig::from_env(),
@@ -1750,9 +1747,8 @@ impl Cfg {
         let explicit_replica_id = std::env::var("BASIN_REPLICA_ID").ok();
         let fly_machine_id = std::env::var("FLY_MACHINE_ID").ok();
         let fly_app_name = std::env::var("FLY_APP_NAME").ok();
-        let rest_port = shard_discovery::rest_port_from_bind(
-            std::env::var("BASIN_REST_BIND").ok().as_deref(),
-        );
+        let rest_port =
+            shard_discovery::rest_port_from_bind(std::env::var("BASIN_REST_BIND").ok().as_deref());
         let replica_id = shard_discovery::derive_replica_id(
             explicit_replica_id.as_deref(),
             fly_machine_id.as_deref(),
@@ -1865,14 +1861,17 @@ fn parse_raft_env() -> Result<RaftCfg> {
         return Err(anyhow!("BASIN_RAFT_BIND must not be empty"));
     }
 
-    let peers_raw = std::env::var("BASIN_RAFT_PEERS").map_err(|_| {
-        anyhow!("BASIN_WAL_MODE=raft requires BASIN_RAFT_PEERS (id@host:port,...)")
-    })?;
+    let peers_raw = std::env::var("BASIN_RAFT_PEERS")
+        .map_err(|_| anyhow!("BASIN_WAL_MODE=raft requires BASIN_RAFT_PEERS (id@host:port,...)"))?;
     let mut peers = Vec::new();
-    for entry in peers_raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (id_str, addr) = entry.split_once('@').ok_or_else(|| {
-            anyhow!("bad BASIN_RAFT_PEERS entry {entry:?} (want id@host:port)")
-        })?;
+    for entry in peers_raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let (id_str, addr) = entry
+            .split_once('@')
+            .ok_or_else(|| anyhow!("bad BASIN_RAFT_PEERS entry {entry:?} (want id@host:port)"))?;
         let id: u64 = id_str
             .trim()
             .parse()
@@ -2135,9 +2134,7 @@ impl basin_storage::bucket_pool::BucketResolver for S3BucketResolver {
             // every subsequent compaction PUT fails with "error sending request"
             // so the tail never promotes and count(*) stalls below the row total.
             .with_retry(basin_storage::backends::s3_compatible::tuned_retry_config())
-            .with_client_options(
-                basin_storage::backends::s3_compatible::tuned_client_options(),
-            )
+            .with_client_options(basin_storage::backends::s3_compatible::tuned_client_options())
             .build()
             .map_err(|e| {
                 basin_common::BasinError::storage(format!(

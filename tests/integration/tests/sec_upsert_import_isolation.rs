@@ -30,8 +30,8 @@ use basin_shard::{Shard, ShardConfig};
 use basin_storage::{Storage, StorageConfig};
 use basin_wal::{LocalWal, Wal, WalConfig};
 use object_store::local::LocalFileSystem;
-use uuid::Uuid;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 #[allow(clippy::type_complexity)]
 async fn build() -> (
@@ -62,7 +62,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -158,7 +162,11 @@ async fn upsert_respects_rls_owner_policy() {
 
     // A sees only its own row.
     assert_eq!(read_v(&sess_a, 1).await, Some(10), "A sees its own row");
-    assert_eq!(read_v(&sess_a, 2).await, None, "A cannot see B's row under RLS");
+    assert_eq!(
+        read_v(&sess_a, 2).await,
+        None,
+        "A cannot see B's row under RLS"
+    );
 
     // ATTACK: A upserts on B's primary key, trying to overwrite B's value.
     // The conflicting row (id=2) is hidden from A by the policy, so the upsert
@@ -257,9 +265,7 @@ async fn import_shaped_bulk_write_cannot_cross_projects() {
     );
     // (b) B cannot see it in information_schema.
     let b_info = sb
-        .execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_name = 'imported'",
-        )
+        .execute("SELECT table_name FROM information_schema.tables WHERE table_name = 'imported'")
         .await
         .unwrap();
     assert_eq!(

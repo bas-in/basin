@@ -215,7 +215,9 @@ pub struct TrigramRowGroupRegistry {
 impl TrigramRowGroupRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
-        Self { inner: Mutex::new(HashMap::new()) }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
     }
 
     fn get_or_create(
@@ -224,9 +226,18 @@ impl TrigramRowGroupRegistry {
         table: &TableName,
         col: &str,
     ) -> Arc<Mutex<HashMap<String, FileSummaries>>> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
-        let mut map = self.inner.lock().expect("TrigramRowGroupRegistry outer lock poisoned");
-        map.entry(key).or_insert_with(|| Arc::new(Mutex::new(HashMap::new()))).clone()
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
+        let mut map = self
+            .inner
+            .lock()
+            .expect("TrigramRowGroupRegistry outer lock poisoned");
+        map.entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+            .clone()
     }
 
     fn get(
@@ -235,8 +246,15 @@ impl TrigramRowGroupRegistry {
         table: &TableName,
         col: &str,
     ) -> Option<Arc<Mutex<HashMap<String, FileSummaries>>>> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
-        let map = self.inner.lock().expect("TrigramRowGroupRegistry outer lock poisoned");
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
+        let map = self
+            .inner
+            .lock()
+            .expect("TrigramRowGroupRegistry outer lock poisoned");
         map.get(&key).cloned()
     }
 
@@ -262,7 +280,9 @@ impl TrigramRowGroupRegistry {
             return;
         }
         let arc = self.get_or_create(project, table, col);
-        let mut files = arc.lock().expect("TrigramRowGroup file table lock poisoned");
+        let mut files = arc
+            .lock()
+            .expect("TrigramRowGroup file table lock poisoned");
         let fs = files.entry(file_path.to_string()).or_default();
         // Indexing a new row into an already-sealed file is a logic error
         // (files are immutable). Defensively re-open it so we don't silently
@@ -287,7 +307,9 @@ impl TrigramRowGroupRegistry {
         file_path: &str,
     ) {
         if let Some(arc) = self.get(project, table, col) {
-            let mut files = arc.lock().expect("TrigramRowGroup file table lock poisoned");
+            let mut files = arc
+                .lock()
+                .expect("TrigramRowGroup file table lock poisoned");
             if let Some(fs) = files.get_mut(file_path) {
                 for summary in fs.by_rg.values_mut() {
                     summary.seal();
@@ -332,7 +354,9 @@ impl TrigramRowGroupRegistry {
             Some(a) => a,
             None => return RowGroupProbe::Unknown,
         };
-        let files = arc.lock().expect("TrigramRowGroup file table lock poisoned");
+        let files = arc
+            .lock()
+            .expect("TrigramRowGroup file table lock poisoned");
         let fs = match files.get(file_path) {
             Some(fs) if fs.sealed => fs,
             // Not summarised, or sealing has not completed: conservative
@@ -373,8 +397,8 @@ impl TrigramRowGroupRegistry {
     ) -> HashMap<String, Vec<RowGroupId>> {
         let mut out = HashMap::new();
         for f in files {
-            if let RowGroupProbe::RowGroups(rgs) = self
-                .rowgroups_maybe_containing_trigrams(project, table, col, f, trigrams)
+            if let RowGroupProbe::RowGroups(rgs) =
+                self.rowgroups_maybe_containing_trigrams(project, table, col, f, trigrams)
             {
                 out.insert(f.clone(), rgs);
             }
@@ -385,15 +409,11 @@ impl TrigramRowGroupRegistry {
     /// Drop all summaries for `file_path` (called on compaction / deletion)
     /// so probes never return stale row-groups for a file that no longer
     /// exists.
-    pub fn remove_file(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-        col: &str,
-        file_path: &str,
-    ) {
+    pub fn remove_file(&self, project: &ProjectId, table: &TableName, col: &str, file_path: &str) {
         if let Some(arc) = self.get(project, table, col) {
-            let mut files = arc.lock().expect("TrigramRowGroup file table lock poisoned");
+            let mut files = arc
+                .lock()
+                .expect("TrigramRowGroup file table lock poisoned");
             files.remove(file_path);
         }
     }
@@ -459,9 +479,7 @@ mod tests {
         reg.seal_file_indexed(&proj, &tbl, "doc", file);
 
         // Pattern trigrams for "kilo".
-        let probe = reg.rowgroups_maybe_containing_trigrams(
-            &proj, &tbl, "doc", file, &tg("kilo"),
-        );
+        let probe = reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &tg("kilo"));
         match probe {
             RowGroupProbe::RowGroups(rgs) => {
                 // rg=2 must survive; the others have no "kil" / "ilo" windows.
@@ -469,7 +487,11 @@ mod tests {
                 // With short fixed text per rg the bloom is unlikely to fp,
                 // but the strict assertion is: never false-negative AND fewer
                 // than total (pruning happens).
-                assert!(rgs.len() < 4, "expected sub-file pruning, kept {} of 4", rgs.len());
+                assert!(
+                    rgs.len() < 4,
+                    "expected sub-file pruning, kept {} of 4",
+                    rgs.len()
+                );
             }
             other => panic!("expected RowGroups, got {other:?}"),
         }
@@ -489,12 +511,14 @@ mod tests {
         }
         reg.seal_file_indexed(&proj, &tbl, "doc", file);
 
-        let probe = reg.rowgroups_maybe_containing_trigrams(
-            &proj, &tbl, "doc", file, &tg("zulu"),
-        );
+        let probe = reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &tg("zulu"));
         match probe {
             RowGroupProbe::RowGroups(rgs) => {
-                assert_eq!(rgs, vec![0, 1, 2, 3], "every rg should survive, got {rgs:?}");
+                assert_eq!(
+                    rgs,
+                    vec![0, 1, 2, 3],
+                    "every rg should survive, got {rgs:?}"
+                );
             }
             other => panic!("expected RowGroups, got {other:?}"),
         }
@@ -512,12 +536,13 @@ mod tests {
         reg.seal_file_indexed(&proj, &tbl, "doc", file);
 
         // "qqqq" trigrams ("qqq") cannot be present.
-        let probe = reg.rowgroups_maybe_containing_trigrams(
-            &proj, &tbl, "doc", file, &tg("qqqq"),
-        );
+        let probe = reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &tg("qqqq"));
         match probe {
             RowGroupProbe::RowGroups(rgs) => {
-                assert!(rgs.is_empty(), "absent trigram must prune whole file, got {rgs:?}");
+                assert!(
+                    rgs.is_empty(),
+                    "absent trigram must prune whole file, got {rgs:?}"
+                );
             }
             other => panic!("expected RowGroups (empty), got {other:?}"),
         }
@@ -531,7 +556,11 @@ mod tests {
         let (proj, tbl) = proj_tbl();
         // Never indexed → Unknown (caller falls back; never false negative).
         let probe = reg.rowgroups_maybe_containing_trigrams(
-            &proj, &tbl, "doc", "ghost.parquet", &tg("alpha"),
+            &proj,
+            &tbl,
+            "doc",
+            "ghost.parquet",
+            &tg("alpha"),
         );
         assert_eq!(probe, RowGroupProbe::Unknown);
     }
@@ -544,9 +573,7 @@ mod tests {
         // Indexed but NOT sealed yet → Unknown (mid-write safety, matches
         // the gin_rowgroup pattern).
         reg.index_row(&proj, &tbl, "doc", file, 0, "alpha apple");
-        let probe = reg.rowgroups_maybe_containing_trigrams(
-            &proj, &tbl, "doc", file, &tg("alpha"),
-        );
+        let probe = reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &tg("alpha"));
         assert_eq!(probe, RowGroupProbe::Unknown);
     }
 
@@ -558,9 +585,7 @@ mod tests {
         reg.index_row(&proj, &tbl, "doc", file, 0, "alpha apple");
         reg.seal_file_indexed(&proj, &tbl, "doc", file);
         // Pattern yielded no trigrams (e.g. "%a%" — too short).
-        let probe = reg.rowgroups_maybe_containing_trigrams(
-            &proj, &tbl, "doc", file, &[],
-        );
+        let probe = reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &[]);
         assert_eq!(probe, RowGroupProbe::Unknown);
     }
 
@@ -578,9 +603,7 @@ mod tests {
 
         // Case-sensitive LIKE 'ALPHA%' → trigrams ALP, LPH, PHA (uppercase).
         let upper = tg("ALPHA");
-        let probe_upper = reg.rowgroups_maybe_containing_trigrams(
-            &proj, &tbl, "doc", file, &upper,
-        );
+        let probe_upper = reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &upper);
         match probe_upper {
             RowGroupProbe::RowGroups(rgs) => assert!(rgs.contains(&0)),
             other => panic!("expected RowGroups, got {other:?}"),
@@ -589,9 +612,7 @@ mod tests {
         // ILIKE 'alpha%' → trigrams alp, lph, pha (lowercase). Same bloom
         // must hit because we stored lowercased windows too.
         let lower = tg("alpha");
-        let probe_lower = reg.rowgroups_maybe_containing_trigrams(
-            &proj, &tbl, "doc", file, &lower,
-        );
+        let probe_lower = reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &lower);
         match probe_lower {
             RowGroupProbe::RowGroups(rgs) => assert!(rgs.contains(&0)),
             other => panic!("expected RowGroups, got {other:?}"),
@@ -611,10 +632,12 @@ mod tests {
 
         reg.remove_file(&proj, &tbl, "doc", file);
         assert!(!reg.is_file_indexed(&proj, &tbl, "doc", file));
-        let probe = reg.rowgroups_maybe_containing_trigrams(
-            &proj, &tbl, "doc", file, &tg("alpha"),
+        let probe = reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &tg("alpha"));
+        assert_eq!(
+            probe,
+            RowGroupProbe::Unknown,
+            "removed file must read as Unknown"
         );
-        assert_eq!(probe, RowGroupProbe::Unknown, "removed file must read as Unknown");
     }
 
     // ── multi-file convenience ────────────────────────────────────────────
@@ -638,16 +661,19 @@ mod tests {
             "f2.parquet".to_string(),
             "f3.parquet".to_string(),
         ];
-        let map = reg.rowgroups_maybe_containing_trigrams_multi(
-            &proj, &tbl, "doc", &files, &tg("kilo"),
-        );
+        let map =
+            reg.rowgroups_maybe_containing_trigrams_multi(&proj, &tbl, "doc", &files, &tg("kilo"));
 
         // f1 must keep rg0 (and only rg0 — rg1 has no "kil" / "ilo").
         let f1 = map.get("f1.parquet").expect("f1 must be present");
         assert!(f1.contains(&0), "f1 keeps rg0, got {f1:?}");
         assert!(!f1.contains(&1), "f1 prunes rg1, got {f1:?}");
         // f2 fully prunable.
-        assert_eq!(map.get("f2.parquet"), Some(&Vec::<RowGroupId>::new()), "f2 fully prunable");
+        assert_eq!(
+            map.get("f2.parquet"),
+            Some(&Vec::<RowGroupId>::new()),
+            "f2 fully prunable"
+        );
         // f3 unknown → omitted.
         assert!(!map.contains_key("f3.parquet"), "f3 unknown → omitted");
     }
@@ -662,7 +688,11 @@ mod tests {
         reg.seal_file_indexed(&proj, &tbl, "title", "f1.parquet");
         // Probe a different column → Unknown.
         let probe = reg.rowgroups_maybe_containing_trigrams(
-            &proj, &tbl, "body", "f1.parquet", &tg("alpha"),
+            &proj,
+            &tbl,
+            "body",
+            "f1.parquet",
+            &tg("alpha"),
         );
         assert_eq!(probe, RowGroupProbe::Unknown);
     }
@@ -685,12 +715,14 @@ mod tests {
         reg.seal_file_indexed(&proj, &tbl, "doc", file);
 
         // Probe for "uniform_042" — only rg=42 has this exact substring.
-        let probe = reg.rowgroups_maybe_containing_trigrams(
-            &proj, &tbl, "doc", file, &tg("uniform_042"),
-        );
+        let probe =
+            reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &tg("uniform_042"));
         match probe {
             RowGroupProbe::RowGroups(rgs) => {
-                assert!(rgs.contains(&42), "uniform_042 must keep rg 42 (no false negative), got {rgs:?}");
+                assert!(
+                    rgs.contains(&42),
+                    "uniform_042 must keep rg 42 (no false negative), got {rgs:?}"
+                );
                 // With 1% FPP × ~9 trigram conjuncts the expected survivors
                 // are far below 64. Require strictly fewer than the whole
                 // file (proves sub-file pruning works at scale).

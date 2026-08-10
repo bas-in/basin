@@ -54,7 +54,6 @@ impl Node {
         let _ = self.wal.close().await; // raft.shutdown()
         self.server.abort();
     }
-
 }
 
 impl Drop for Node {
@@ -187,7 +186,9 @@ async fn bind_retry(addr: SocketAddr) -> TcpListener {
             Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
         }
     }
-    TcpListener::bind(addr).await.expect("rebind killed node addr")
+    TcpListener::bind(addr)
+        .await
+        .expect("rebind killed node addr")
 }
 
 fn basic_node(n: &Node) -> BasicNode {
@@ -340,13 +341,24 @@ async fn cluster_survives_node_kill_and_catches_up_on_restart() {
 
     // Commit some entries while all 3 are up.
     for i in 0..3u8 {
-        commit_anywhere(&nodes, &proj, &part, Bytes::from(vec![i; 8]), Duration::from_secs(10)).await;
+        commit_anywhere(
+            &nodes,
+            &proj,
+            &part,
+            Bytes::from(vec![i; 8]),
+            Duration::from_secs(10),
+        )
+        .await;
     }
 
     // Kill a FOLLOWER (not the current leader): shut its raft down + drop its
     // server, modelling a process crash. 2/3 quorum remains.
     let leader_id = leader_of(&nodes).await.unwrap();
-    let victim_id = nodes.iter().map(|n| n.id).find(|id| *id != leader_id).unwrap();
+    let victim_id = nodes
+        .iter()
+        .map(|n| n.id)
+        .find(|id| *id != leader_id)
+        .unwrap();
     node_by_id(&nodes, victim_id).kill().await;
 
     // Cluster keeps committing with the 2 survivors. Commit through whoever
@@ -401,7 +413,11 @@ async fn bound_but_unresponsive_peer_times_out_and_cluster_progresses() {
     let part = partition("p");
 
     let leader_id = leader_of(&nodes).await.unwrap();
-    let victim_id = nodes.iter().map(|n| n.id).find(|id| *id != leader_id).unwrap();
+    let victim_id = nodes
+        .iter()
+        .map(|n| n.id)
+        .find(|id| *id != leader_id)
+        .unwrap();
 
     // Fully stop the victim (raft + server) so it neither answers nor
     // campaigns, then plant a BLACK HOLE at its address: a listener that

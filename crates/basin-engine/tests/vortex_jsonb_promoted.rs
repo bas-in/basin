@@ -51,11 +51,7 @@ async fn exec_ok(sess: &ProjectSession, sql: &str) {
         .unwrap_or_else(|e| panic!("SQL failed [{sql}]: {e}"));
 }
 
-async fn rows_col_strings(
-    sess: &ProjectSession,
-    sql: &str,
-    col: &str,
-) -> Vec<Option<String>> {
+async fn rows_col_strings(sess: &ProjectSession, sql: &str, col: &str) -> Vec<Option<String>> {
     let batches = match sess.execute(sql).await.unwrap() {
         ExecResult::Rows { batches, .. } => batches,
         other => panic!("expected rows for [{sql}], got {other:?}"),
@@ -130,7 +126,11 @@ async fn promoted_jsonb_survives_delete_cow_on_vortex() {
 
     // Create table and promote the JSONB path BEFORE the first INSERT so
     // all new files carry the shadow column from the start.
-    exec_ok(&sess, "CREATE TABLE events (id BIGINT PRIMARY KEY, payload JSONB)").await;
+    exec_ok(
+        &sess,
+        "CREATE TABLE events (id BIGINT PRIMARY KEY, payload JSONB)",
+    )
+    .await;
     catalog
         .promote_jsonb_path(&project, &table_name, "payload", "category")
         .await
@@ -188,7 +188,11 @@ async fn promoted_jsonb_survives_delete_cow_on_vortex() {
     .await;
     assert_eq!(
         after_udf,
-        vec![Some("books".into()), Some("movies".into()), Some("music".into())],
+        vec![
+            Some("books".into()),
+            Some("movies".into()),
+            Some("music".into())
+        ],
         "UDF path must return correct values after DELETE CoW rewrite"
     );
 }
@@ -202,7 +206,11 @@ async fn promoted_jsonb_survives_update_cow_on_vortex() {
     let project = sess.project();
     let table_name = TableName::new("events").unwrap();
 
-    exec_ok(&sess, "CREATE TABLE events (id BIGINT PRIMARY KEY, payload JSONB)").await;
+    exec_ok(
+        &sess,
+        "CREATE TABLE events (id BIGINT PRIMARY KEY, payload JSONB)",
+    )
+    .await;
     catalog
         .promote_jsonb_path(&project, &table_name, "payload", "category")
         .await
@@ -224,7 +232,11 @@ async fn promoted_jsonb_survives_update_cow_on_vortex() {
     );
 
     // UPDATE one row — forces a CoW rewrite of the cold Vortex file.
-    exec_ok(&sess, "UPDATE events SET payload = '{\"category\":\"tech\"}' WHERE id = 1").await;
+    exec_ok(
+        &sess,
+        "UPDATE events SET payload = '{\"category\":\"tech\"}' WHERE id = 1",
+    )
+    .await;
 
     // The promoted shadow column in the replacement file must reflect the
     // UPDATED value for row 1 and the original values for rows 2 and 3.
@@ -236,7 +248,11 @@ async fn promoted_jsonb_survives_update_cow_on_vortex() {
     .await;
     assert_eq!(
         after_udf,
-        vec![Some("tech".into()), Some("movies".into()), Some("music".into())],
+        vec![
+            Some("tech".into()),
+            Some("movies".into()),
+            Some("music".into())
+        ],
         "UDF path must return correct values after UPDATE CoW rewrite"
     );
 }

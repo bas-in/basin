@@ -62,9 +62,7 @@ async fn count(sess: &basin_engine::ProjectSession, sql: &str) -> i64 {
             let col = b.column(0);
             col.as_any()
                 .downcast_ref::<Int64Array>()
-                .unwrap_or_else(|| {
-                    panic!("not Int64 for: {sql} (type={:?})", col.data_type())
-                })
+                .unwrap_or_else(|| panic!("not Int64 for: {sql} (type={:?})", col.data_type()))
                 .value(0)
         }
         Ok(other) => panic!("expected Rows for: {sql}, got {other:?}"),
@@ -139,7 +137,7 @@ async fn view_over_multiple_tables_refreshes_each_underlying_table() {
 
     run(&sess, "INSERT INTO t4 (id) VALUES (100), (200)").await; // t4: 3 rows
     run(&sess, "INSERT INTO t5 (id) VALUES (300)").await; // t5: 2 rows
-    // Reached via v_join -> {t4, t5}; cross-product = 3 * 2 = 6.
+                                                          // Reached via v_join -> {t4, t5}; cross-product = 3 * 2 = 6.
     assert_eq!(count(&sess, "SELECT count(*) FROM v_join").await, 6);
 }
 

@@ -402,7 +402,9 @@ mod catalog_limit_provider_tests {
         let cat = Arc::new(InMemoryCatalog::new());
         let p = CatalogConnectionLimitProvider::new(cat.clone());
         let project = ProjectId::new();
-        cat.set_project_max_connections(&project, 250).await.unwrap();
+        cat.set_project_max_connections(&project, 250)
+            .await
+            .unwrap();
         assert_eq!(p.limit_for(project).await, Some(250));
     }
 
@@ -423,9 +425,9 @@ mod catalog_limit_provider_tests {
         let mut handles = Vec::new();
         for _ in 0..N {
             let lim = limiter.clone();
-            handles.push(tokio::spawn(async move {
-                lim.try_admit(project).await.ok()
-            }));
+            handles.push(tokio::spawn(
+                async move { lim.try_admit(project).await.ok() },
+            ));
         }
         let guards: Vec<Option<ConnectionGuard>> = futures::future::join_all(handles)
             .await
@@ -434,9 +436,16 @@ mod catalog_limit_provider_tests {
             .collect();
         let admitted = guards.iter().filter(|g| g.is_some()).count() as u32;
         let refused = guards.iter().filter(|g| g.is_none()).count() as u32;
-        assert_eq!(admitted, K, "exactly K connections admitted under the ceiling");
+        assert_eq!(
+            admitted, K,
+            "exactly K connections admitted under the ceiling"
+        );
         assert_eq!(refused, N - K, "the rest refused");
-        assert_eq!(limiter.live_count(project), K, "live count == admitted guards");
+        assert_eq!(
+            limiter.live_count(project),
+            K,
+            "live count == admitted guards"
+        );
         // Guards drop here, freeing all slots.
         drop(guards);
         assert_eq!(limiter.live_count(project), 0);

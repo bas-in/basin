@@ -761,7 +761,10 @@ pub(crate) fn schema_and_constraints_from_columns(
                     None => format!("{table_name}_{}_fkey", local_cols[0]),
                 };
                 let initially_deferred = characteristics.as_ref().is_some_and(|c| {
-                    matches!(c.initially, Some(sqlparser::ast::DeferrableInitial::Deferred))
+                    matches!(
+                        c.initially,
+                        Some(sqlparser::ast::DeferrableInitial::Deferred)
+                    )
                 });
                 if !degraded {
                     extracted.foreign_keys.push(ForeignKeyDef {
@@ -1847,9 +1850,7 @@ fn file_format_from_with_body(inside: &str) -> Option<basin_catalog::TableFileFo
 /// Only the *first* top-level `WITH (...)` group is consulted; string
 /// literals / quoted identifiers / comments are skipped so a spoofed
 /// `basin.row_block_size` buried in a literal can't bypass validation.
-pub fn parse_create_table_row_block_size(
-    sql: &str,
-) -> basin_common::Result<Option<u32>> {
+pub fn parse_create_table_row_block_size(sql: &str) -> basin_common::Result<Option<u32>> {
     let bytes = sql.as_bytes();
     let mut i = 0usize;
 
@@ -1955,9 +1956,7 @@ fn row_block_size_from_with_body(inside: &str) -> basin_common::Result<Option<u3
 ///
 /// Returns `None` when the key is absent, `Some(true)` for `'true'` / `true`,
 /// `Some(false)` for `'false'` / `false`. Rejects other values.
-pub fn parse_create_table_adaptive_sort_override(
-    sql: &str,
-) -> basin_common::Result<Option<bool>> {
+pub fn parse_create_table_adaptive_sort_override(sql: &str) -> basin_common::Result<Option<bool>> {
     let bytes = sql.as_bytes();
     let mut i = 0usize;
 
@@ -2049,7 +2048,6 @@ fn adaptive_sort_override_from_with_body(inside: &str) -> basin_common::Result<O
     }
     Ok(None)
 }
-
 
 /// Strip a single layer of surrounding `'...'` or `"..."` quoting from a
 /// WITH-option token, collapsing the doubled-quote escape. A bare
@@ -2673,9 +2671,7 @@ pub(crate) fn parse_exclusion_sentinel(predicate: &str) -> Option<ExcludeConstra
 /// behaviour).
 ///
 /// Non-`CREATE TABLE` statements are returned unchanged with an empty vec.
-pub(crate) fn extract_exclude_using_gist(
-    sql: &str,
-) -> (String, Vec<ExcludeConstraintSpec>) {
+pub(crate) fn extract_exclude_using_gist(sql: &str) -> (String, Vec<ExcludeConstraintSpec>) {
     let leading = sql.trim_start();
     if !leading
         .get(..6)
@@ -3080,7 +3076,8 @@ mod sort_by_tests {
 
     #[test]
     fn combined_with_file_format() {
-        let sql = "CREATE TABLE foo (id BIGINT) WITH (basin.sort_by='id', basin.file_format='vortex')";
+        let sql =
+            "CREATE TABLE foo (id BIGINT) WITH (basin.sort_by='id', basin.file_format='vortex')";
         assert_eq!(
             parse_create_table_sort_by(sql),
             Some(vec!["id".to_string()])

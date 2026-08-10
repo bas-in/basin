@@ -258,14 +258,14 @@ async fn lateral_order_by_limit_window_rewrite() {
     let sess = open_session(&engine).await;
 
     exec_ok(&sess, "CREATE TABLE t (id INT NOT NULL)").await;
-    exec_ok(&sess, "CREATE TABLE scores (t_id INT NOT NULL, score INT NOT NULL)").await;
-    exec_ok(&sess, "INSERT INTO t VALUES (1), (2), (3)").await;
-    // t=1 has two scores (10, 20); t=2 has one score (5); t=3 has none.
     exec_ok(
         &sess,
-        "INSERT INTO scores VALUES (1, 10), (1, 20), (2, 5)",
+        "CREATE TABLE scores (t_id INT NOT NULL, score INT NOT NULL)",
     )
     .await;
+    exec_ok(&sess, "INSERT INTO t VALUES (1), (2), (3)").await;
+    // t=1 has two scores (10, 20); t=2 has one score (5); t=3 has none.
+    exec_ok(&sess, "INSERT INTO scores VALUES (1, 10), (1, 20), (2, 5)").await;
 
     // Ask for the highest score per parent (LEFT JOIN preserves t=3 with NULL).
     let batches = exec_ok(
@@ -316,14 +316,14 @@ async fn lateral_order_by_limit_comma_join() {
     let sess = open_session(&engine).await;
 
     exec_ok(&sess, "CREATE TABLE t (id INT NOT NULL)").await;
-    exec_ok(&sess, "CREATE TABLE scores (t_id INT NOT NULL, score INT NOT NULL)").await;
-    exec_ok(&sess, "INSERT INTO t VALUES (1), (2), (3)").await;
-    // t=1 has two scores; t=2 has one; t=3 has none.
     exec_ok(
         &sess,
-        "INSERT INTO scores VALUES (1, 10), (1, 20), (2, 5)",
+        "CREATE TABLE scores (t_id INT NOT NULL, score INT NOT NULL)",
     )
     .await;
+    exec_ok(&sess, "INSERT INTO t VALUES (1), (2), (3)").await;
+    // t=1 has two scores; t=2 has one; t=3 has none.
+    exec_ok(&sess, "INSERT INTO scores VALUES (1, 10), (1, 20), (2, 5)").await;
 
     let batches = exec_ok(
         &sess,
@@ -447,18 +447,10 @@ async fn lateral_cross_join_aggregate() {
     let sess = open_session(&engine).await;
 
     exec_ok(&sess, "CREATE TABLE parents (id INT NOT NULL)").await;
-    exec_ok(
-        &sess,
-        "CREATE TABLE children (parent_id INT NOT NULL)",
-    )
-    .await;
+    exec_ok(&sess, "CREATE TABLE children (parent_id INT NOT NULL)").await;
     exec_ok(&sess, "INSERT INTO parents VALUES (1), (2), (3)").await;
     // parent=1 has 2 children; parent=2 has 1; parent=3 has none.
-    exec_ok(
-        &sess,
-        "INSERT INTO children VALUES (1), (1), (2)",
-    )
-    .await;
+    exec_ok(&sess, "INSERT INTO children VALUES (1), (1), (2)").await;
 
     let batches = exec_ok(
         &sess,
@@ -526,11 +518,7 @@ async fn lateral_multi_table_child_aggregate() {
     // parent=1 → order 10 (2 items) + order 11 (1 item) = 3 total items
     // parent=2 → order 12 (1 item)
     // parent=3 → no orders
-    exec_ok(
-        &sess,
-        "INSERT INTO orders VALUES (10, 1), (11, 1), (12, 2)",
-    )
-    .await;
+    exec_ok(&sess, "INSERT INTO orders VALUES (10, 1), (11, 1), (12, 2)").await;
     exec_ok(
         &sess,
         "INSERT INTO items VALUES (10, 1), (10, 2), (11, 3), (12, 4)",

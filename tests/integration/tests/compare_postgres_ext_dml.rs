@@ -125,7 +125,11 @@ async fn ext_dml_shapes() {
     // quiescing Basin's compactor while PG vacuums would be asymmetric. The
     // reseed cost itself is always outside the timed window.
     let instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     sess.execute(
         "CREATE TABLE scratch (\
             id BIGINT NOT NULL PRIMARY KEY, \
@@ -179,8 +183,14 @@ async fn ext_dml_shapes() {
     // Reseed scratch (truncate-equivalent: DELETE all then bulk INSERT). We use
     // DELETE because TRUNCATE semantics differ; the reseed cost is excluded
     // from the timed window (only the shape statement is timed).
-    async fn reseed_basin(sess: &basin_engine::ProjectSession, rows: i64, tuple: &dyn Fn(i64) -> String) {
-        sess.execute("DELETE FROM scratch").await.expect("basin reseed clear");
+    async fn reseed_basin(
+        sess: &basin_engine::ProjectSession,
+        rows: i64,
+        tuple: &dyn Fn(i64) -> String,
+    ) {
+        sess.execute("DELETE FROM scratch")
+            .await
+            .expect("basin reseed clear");
         let batch = 10_000i64;
         let mut id = 0i64;
         while id < rows {

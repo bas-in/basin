@@ -39,7 +39,10 @@ mod common;
 use common::{build_basin_engine, median, try_connect, SchemaGuard};
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn write_artifact(file: &str, value: &serde_json::Value) {
@@ -94,8 +97,8 @@ fn basin_count(res: &ExecResult) -> i64 {
 /// Same name distribution as ext_bench_trgm.rs (shared seed).
 fn name_for(i: usize) -> String {
     const FIRST: &[&str] = &[
-        "alice", "alyce", "bob", "carol", "dave", "erin", "frank", "grace",
-        "heidi", "ivan", "judy", "mallory", "olivia", "peggy", "trent", "victor",
+        "alice", "alyce", "bob", "carol", "dave", "erin", "frank", "grace", "heidi", "ivan",
+        "judy", "mallory", "olivia", "peggy", "trent", "victor",
     ];
     const LAST: &[&str] = &[
         "smith", "smyth", "jones", "brown", "taylor", "wilson", "davies", "evans",
@@ -130,10 +133,15 @@ async fn basin_p50(sess: &basin_engine::ProjectSession, sql: &str, n: usize) -> 
 }
 
 async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f64> {
-    let _ = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await;
+    let _ = pg
+        .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+        .await;
     let mut s = Vec::with_capacity(n);
     for _ in 0..n {
-        if let Ok(rs) = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await {
+        if let Ok(rs) = pg
+            .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+            .await
+        {
             for m in &rs {
                 if let SimpleQueryMessage::Row(r) = m {
                     if let Some(line) = r.get(0) {
@@ -150,11 +158,18 @@ async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f6
             }
         }
     }
-    if s.is_empty() { None } else { Some(median(&s)) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(median(&s))
+    }
 }
 
 async fn pg_count(pg: &tokio_postgres::Client, sql: &str) -> i64 {
-    pg.query_one(sql, &[]).await.map(|r| r.get::<usize, i64>(0)).unwrap_or(-1)
+    pg.query_one(sql, &[])
+        .await
+        .map(|r| r.get::<usize, i64>(0))
+        .unwrap_or(-1)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -165,7 +180,11 @@ async fn ext_bench_trgm_ext() {
     eprintln!("[ext_bench_trgm_ext] config: rows={rows} samples={samples}");
 
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     sess.execute("CREATE TABLE people (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
         .await
         .unwrap();
@@ -198,10 +217,15 @@ async fn ext_bench_trgm_ext() {
 
     // TE1: ILIKE substring. TE2: autocomplete prefix top-N.
     let te1_sql = format!("SELECT count(*) FROM people WHERE name ILIKE '{ILIKE_SUBSTR}'");
-    let te2_sql = format!("SELECT id FROM people WHERE name ILIKE '{PREFIX}' ORDER BY name LIMIT 10");
+    let te2_sql =
+        format!("SELECT id FROM people WHERE name ILIKE '{PREFIX}' ORDER BY name LIMIT 10");
 
     let te1_b = basin_p50(&sess, &te1_sql, samples).await;
-    let te1_count = sess.execute(&te1_sql).await.map(|r| basin_count(&r)).unwrap_or(-1);
+    let te1_count = sess
+        .execute(&te1_sql)
+        .await
+        .map(|r| basin_count(&r))
+        .unwrap_or(-1);
     let te2_b = basin_p50(&sess, &te2_sql, samples).await;
     let te2_sup = sess.execute(&te2_sql).await.is_ok();
 
@@ -225,8 +249,13 @@ async fn ext_bench_trgm_ext() {
             pg_available = true;
             let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
             let schema = format!("basin_ext_trgmx_{suffix}");
-            let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-            pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.ok();
+            let _guard = SchemaGuard {
+                schema: schema.clone(),
+                conn_str: cs,
+            };
+            pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+                .await
+                .ok();
             pg.simple_query(&format!(
                 "CREATE TABLE {schema}.people (id BIGINT PRIMARY KEY, name TEXT NOT NULL)"
             ))
@@ -243,19 +272,34 @@ async fn ext_bench_trgm_ext() {
                     let nm = name_for(k).replace('\'', "''");
                     v.push_str(&format!("({k},'{nm}')"));
                 }
-                pg.simple_query(&format!("INSERT INTO {schema}.people VALUES {v}")).await.ok();
+                pg.simple_query(&format!("INSERT INTO {schema}.people VALUES {v}"))
+                    .await
+                    .ok();
                 po = hi;
             }
             // gin_trgm_ops accelerates ILIKE substring; also a btree on lower(name)
             // is irrelevant for mid-string, so only the trgm GIN is the honest comparator.
-            pg.simple_query(&format!("CREATE INDEX people_trgm_gin ON {schema}.people USING gin (name gin_trgm_ops)")).await.ok();
-            pg.simple_query(&format!("ANALYZE {schema}.people")).await.ok();
+            pg.simple_query(&format!(
+                "CREATE INDEX people_trgm_gin ON {schema}.people USING gin (name gin_trgm_ops)"
+            ))
+            .await
+            .ok();
+            pg.simple_query(&format!("ANALYZE {schema}.people"))
+                .await
+                .ok();
 
             pg_te1_count = pg_count(&pg, &format!("SELECT count(*)::bigint FROM {schema}.people WHERE name ILIKE '{ILIKE_SUBSTR}'")).await;
-            pg_te1 = pg_p50(&pg, &format!("SELECT count(*) FROM {schema}.people WHERE name ILIKE '{ILIKE_SUBSTR}'"), samples).await;
+            pg_te1 = pg_p50(
+                &pg,
+                &format!("SELECT count(*) FROM {schema}.people WHERE name ILIKE '{ILIKE_SUBSTR}'"),
+                samples,
+            )
+            .await;
             pg_te2 = pg_p50(&pg, &format!("SELECT id FROM {schema}.people WHERE name ILIKE '{PREFIX}' ORDER BY name LIMIT 10"), samples).await;
 
-            let _ = pg.simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+            let _ = pg
+                .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                .await;
             std::mem::forget(_guard);
         } else {
             eprintln!("[ext_bench_trgm_ext] PG lacks pg_trgm — Basin-only card");
@@ -266,30 +310,39 @@ async fn ext_bench_trgm_ext() {
 
     // Correctness cross-check on the ILIKE count.
     if pg_available && te1_count >= 0 && pg_te1_count >= 0 {
-        assert_eq!(te1_count, pg_te1_count, "TE1 ILIKE count mismatch: basin {te1_count} != pg {pg_te1_count}");
+        assert_eq!(
+            te1_count, pg_te1_count,
+            "TE1 ILIKE count mismatch: basin {te1_count} != pg {pg_te1_count}"
+        );
     }
 
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("ext_bench_trgm_ext.json", &json!({
-        "card": "ext_bench_trgm_ext",
-        "family": "pg_trgm",
-        "generated_at": format!("@{ts}"),
-        "pg_available": pg_available,
-        "pg_extension_available": pg_available,
-        "basin_index_built": basin_index_built,
-        "config": { "rows": rows, "samples": samples },
-        "shapes": [
-            { "label": "TE1: ILIKE '%substr%' (trgm-GIN-accelerated substring search)",
-              "basin_p50_ms": opt_ms(te1_b), "pg_p50_ms": opt_ms(pg_te1), "basin_over_pg": ratio(te1_b, pg_te1),
-              "basin_hits": te1_count, "pg_hits": pg_te1_count },
-            { "label": "TE2: autocomplete prefix top-N (ILIKE 'pre%' ORDER BY name LIMIT 10)",
-              "basin_supported": te2_sup, "basin_p50_ms": opt_ms(te2_b), "pg_p50_ms": opt_ms(pg_te2),
-              "basin_over_pg": ratio(te2_b, pg_te2) },
-        ],
-        "note": "Coverage-expansion card for pg_trgm: ILIKE '%substr%' (the #1 production \
-                 use of pg_trgm — index-backed mid-string search, which the base card does \
-                 not measure) and an autocomplete prefix top-N. PG gets a gin_trgm_ops index; \
-                 Basin records whether its own gin_trgm_ops index was built. The ILIKE count \
-                 is hard-asserted equal across engines when PG is available.",
-    }));
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "ext_bench_trgm_ext.json",
+        &json!({
+            "card": "ext_bench_trgm_ext",
+            "family": "pg_trgm",
+            "generated_at": format!("@{ts}"),
+            "pg_available": pg_available,
+            "pg_extension_available": pg_available,
+            "basin_index_built": basin_index_built,
+            "config": { "rows": rows, "samples": samples },
+            "shapes": [
+                { "label": "TE1: ILIKE '%substr%' (trgm-GIN-accelerated substring search)",
+                  "basin_p50_ms": opt_ms(te1_b), "pg_p50_ms": opt_ms(pg_te1), "basin_over_pg": ratio(te1_b, pg_te1),
+                  "basin_hits": te1_count, "pg_hits": pg_te1_count },
+                { "label": "TE2: autocomplete prefix top-N (ILIKE 'pre%' ORDER BY name LIMIT 10)",
+                  "basin_supported": te2_sup, "basin_p50_ms": opt_ms(te2_b), "pg_p50_ms": opt_ms(pg_te2),
+                  "basin_over_pg": ratio(te2_b, pg_te2) },
+            ],
+            "note": "Coverage-expansion card for pg_trgm: ILIKE '%substr%' (the #1 production \
+                     use of pg_trgm — index-backed mid-string search, which the base card does \
+                     not measure) and an autocomplete prefix top-N. PG gets a gin_trgm_ops index; \
+                     Basin records whether its own gin_trgm_ops index was built. The ILIKE count \
+                     is hard-asserted equal across engines when PG is available.",
+        }),
+    );
 }

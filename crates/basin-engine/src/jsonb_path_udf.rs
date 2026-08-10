@@ -1918,7 +1918,9 @@ mod perf_bench {
         // SLOW: pre-optimization shape — per-row downcast + String alloc.
         let t0 = Instant::now();
         for i in 0..N {
-            let doc = extract_jsonb_value_from_array(&doc_arr, i, "b").unwrap().unwrap();
+            let doc = extract_jsonb_value_from_array(&doc_arr, i, "b")
+                .unwrap()
+                .unwrap();
             let p = extract_string_from_array(&path_arr, i).unwrap();
             let steps = parse_jsonpath(&p).unwrap();
             let matches = jsonpath_eval(&doc, &steps);

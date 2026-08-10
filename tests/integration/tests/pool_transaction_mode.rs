@@ -118,9 +118,13 @@ async fn cursor_not_visible_after_commit() {
     {
         let leased = pool.acquire(project, None).await.unwrap();
         let s = leased.session();
-        s.execute("CREATE TABLE nums (id BIGINT NOT NULL)").await.unwrap();
+        s.execute("CREATE TABLE nums (id BIGINT NOT NULL)")
+            .await
+            .unwrap();
         for i in 0i64..5 {
-            s.execute(&format!("INSERT INTO nums VALUES ({i})")).await.unwrap();
+            s.execute(&format!("INSERT INTO nums VALUES ({i})"))
+                .await
+                .unwrap();
         }
     }
 
@@ -130,7 +134,9 @@ async fn cursor_not_visible_after_commit() {
         let s = leased.session();
         s.execute("BEGIN").await.unwrap();
         // cursor name is stable across the two checkouts so we can probe it.
-        s.execute("DECLARE probe_cur CURSOR FOR SELECT id FROM nums").await.unwrap();
+        s.execute("DECLARE probe_cur CURSOR FOR SELECT id FROM nums")
+            .await
+            .unwrap();
         let fetched = s.execute("FETCH 1 FROM probe_cur").await.unwrap();
         assert_eq!(row_count(&fetched), 1, "FETCH should return one row");
         s.execute("COMMIT").await.unwrap();
@@ -185,8 +191,12 @@ async fn soak_1000_clients_10_connection_pool() {
     {
         let leased = pool.acquire(project, None).await.unwrap();
         let s = leased.session();
-        s.execute("CREATE TABLE counters (n BIGINT NOT NULL)").await.unwrap();
-        s.execute("INSERT INTO counters VALUES (1), (2), (3)").await.unwrap();
+        s.execute("CREATE TABLE counters (n BIGINT NOT NULL)")
+            .await
+            .unwrap();
+        s.execute("INSERT INTO counters VALUES (1), (2), (3)")
+            .await
+            .unwrap();
     }
 
     // Spawn 1 000 concurrent short-lived "logical clients". Each opens a
@@ -205,7 +215,10 @@ async fn soak_1000_clients_10_connection_pool() {
             ))
             .await
             .unwrap();
-            let fetched = s.execute(&format!("FETCH 1 FROM {cur_name}")).await.unwrap();
+            let fetched = s
+                .execute(&format!("FETCH 1 FROM {cur_name}"))
+                .await
+                .unwrap();
             assert_eq!(
                 row_count(&fetched),
                 1,

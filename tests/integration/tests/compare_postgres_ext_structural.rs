@@ -140,7 +140,11 @@ async fn ext_structural_shapes() {
 
     // ── Basin seed ──────────────────────────────────────────────────────────
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     sess.execute(
         "CREATE TABLE events (\
             id BIGINT NOT NULL PRIMARY KEY, \

@@ -12,11 +12,11 @@
 //! takes > 30s. Run with:
 //!   `cargo test -p basin-realtime budget_fuzz -- --ignored`
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use basin_common::{ChangeEvent, ChangeOp, ProjectId, TableName};
-use basin_realtime::{BudgetError, BudgetGuard, BudgetTracker, estimate_event_size};
+use basin_realtime::{estimate_event_size, BudgetError, BudgetGuard, BudgetTracker};
 use chrono::Utc;
 use tokio::runtime::Runtime;
 

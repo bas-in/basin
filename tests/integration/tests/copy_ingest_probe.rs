@@ -31,7 +31,13 @@ use basin_wal::{LocalWal, Wal, WalConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
-async fn build() -> (TempDir, TempDir, Engine, basin_shard::ShardBackgroundHandle, Arc<dyn Wal>) {
+async fn build() -> (
+    TempDir,
+    TempDir,
+    Engine,
+    basin_shard::ShardBackgroundHandle,
+    Arc<dyn Wal>,
+) {
     let sd = TempDir::new().unwrap();
     let wd = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
@@ -52,9 +58,17 @@ async fn build() -> (TempDir, TempDir, Engine, basin_shard::ShardBackgroundHandl
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
-    let engine = Engine::new(EngineConfig { storage, catalog, shard: Some(shard) });
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: Some(shard),
+    });
     (sd, wd, engine, bg, wal)
 }
 
@@ -66,11 +80,7 @@ fn events_schema() -> Arc<Schema> {
         Field::new("amount", DataType::Float64, true),
         Field::new("status", DataType::Utf8, true),
         Field::new("created_at", DataType::Int64, true),
-        Field::new(
-            "payload",
-            DataType::LargeBinary,
-            true,
-        ),
+        Field::new("payload", DataType::LargeBinary, true),
     ]))
 }
 
@@ -97,7 +107,12 @@ async fn measure_insert(engine: &Engine, rows: i64) -> f64 {
             }
             let payload = format!(
                 r#"{{"category":"cat{}","device":{{"os":"ios","version":"1.{}"}},"tags":[{},{},{}],"metadata":{{"score":{}}}}}"#,
-                k % 20, k % 9, k % 3, k % 5, k % 7, k % 100
+                k % 20,
+                k % 9,
+                k % 3,
+                k % 5,
+                k % 7,
+                k % 100
             );
             stmt.push_str(&format!(
                 "({k}, {}, {}, 'pending', {k}, '{payload}'::jsonb)",
@@ -131,7 +146,12 @@ async fn measure_copy(engine: &Engine, rows: i64) -> f64 {
         for k in id..hi {
             let payload = format!(
                 r#"{{"category":"cat{}","device":{{"os":"ios","version":"1.{}"}},"tags":[{},{},{}],"metadata":{{"score":{}}}}}"#,
-                k % 20, k % 9, k % 3, k % 5, k % 7, k % 100
+                k % 20,
+                k % 9,
+                k % 3,
+                k % 5,
+                k % 7,
+                k % 100
             );
             csv_rows.push(vec![
                 Some(k.to_string()),
@@ -172,9 +192,7 @@ async fn copy_vs_insert_200k() {
          INSERT VALUES : {:8.1}ms  ({:.1}µs/row) [baseline ~57µs/row]\n  \
          COPY fast-path: {:8.1}ms  ({:.1}µs/row)\n  \
          Speedup       : {:.1}×",
-        insert_ms, insert_us_per_row,
-        copy_ms, copy_us_per_row,
-        speedup
+        insert_ms, insert_us_per_row, copy_ms, copy_us_per_row, speedup
     );
 
     // The COPY path should be at least 3× faster than INSERT VALUES.

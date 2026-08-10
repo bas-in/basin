@@ -29,9 +29,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
-};
+use arrow_array::{Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use basin_catalog::InMemoryCatalog;
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
@@ -110,12 +108,18 @@ async fn fetch(sess: &basin_engine::ProjectSession, sql: &str, has_group: bool) 
             }));
             let agg = b.column(agg_idx);
             if let Some(ia) = agg.as_any().downcast_ref::<Int64Array>() {
-                out.agg_i
-                    .push(if ia.is_null(row) { None } else { Some(ia.value(row)) });
+                out.agg_i.push(if ia.is_null(row) {
+                    None
+                } else {
+                    Some(ia.value(row))
+                });
                 out.agg_f.push(None);
             } else if let Some(fa) = agg.as_any().downcast_ref::<Float64Array>() {
-                out.agg_f
-                    .push(if fa.is_null(row) { None } else { Some(fa.value(row)) });
+                out.agg_f.push(if fa.is_null(row) {
+                    None
+                } else {
+                    Some(fa.value(row))
+                });
                 out.agg_i.push(None);
             } else {
                 out.agg_i.push(None);
@@ -166,7 +170,9 @@ async fn gapfill_grid_completeness() {
     .await;
 
     assert_eq!(rows.bucket_us.len(), 5, "expected 5 grid buckets");
-    let expect_buckets: Vec<i64> = (0..5).map(|h| us("2024-01-01 00:00:00") + h * HOUR_US).collect();
+    let expect_buckets: Vec<i64> = (0..5)
+        .map(|h| us("2024-01-01 00:00:00") + h * HOUR_US)
+        .collect();
     assert_eq!(rows.bucket_us, expect_buckets, "grid buckets exact");
     // 00:00 → 1, 03:00 → 5, others NULL.
     assert_eq!(rows.agg_i, vec![Some(1), None, None, Some(5), None]);
@@ -207,8 +213,16 @@ async fn gapfill_null_fill_for_missing() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE gn (ts TIMESTAMPTZ, v DOUBLE PRECISION)").await;
-    exec(&sess, "INSERT INTO gn VALUES ('2024-01-01 02:00:00+00', 2.5)").await;
+    exec(
+        &sess,
+        "CREATE TABLE gn (ts TIMESTAMPTZ, v DOUBLE PRECISION)",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO gn VALUES ('2024-01-01 02:00:00+00', 2.5)",
+    )
+    .await;
 
     let rows = fetch(
         &sess,
@@ -256,7 +270,10 @@ async fn gapfill_locf_carry() {
 
     assert_eq!(rows.bucket_us.len(), 5);
     // 00→10, 01→carry 10, 02→20, 03→carry 20, 04→carry 20.
-    assert_eq!(rows.agg_i, vec![Some(10), Some(10), Some(20), Some(20), Some(20)]);
+    assert_eq!(
+        rows.agg_i,
+        vec![Some(10), Some(10), Some(20), Some(20), Some(20)]
+    );
     println!("[gapfill locf] carry-forward 10,10,20,20,20 ✓");
 }
 
@@ -270,7 +287,11 @@ async fn gapfill_locf_leading_nulls_stay() {
 
     exec(&sess, "CREATE TABLE gll (ts TIMESTAMPTZ, v BIGINT)").await;
     // First value only at 02:00 — buckets 00:00, 01:00 have no prior obs.
-    exec(&sess, "INSERT INTO gll VALUES ('2024-01-01 02:00:00+00', 99)").await;
+    exec(
+        &sess,
+        "INSERT INTO gll VALUES ('2024-01-01 02:00:00+00', 99)",
+    )
+    .await;
 
     let rows = fetch(
         &sess,
@@ -379,7 +400,11 @@ async fn gapfill_locf_without_gapfill_errors() {
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
     exec(&sess, "CREATE TABLE glw (ts TIMESTAMPTZ, v BIGINT)").await;
-    exec(&sess, "INSERT INTO glw VALUES ('2024-01-01 00:00:00+00', 1)").await;
+    exec(
+        &sess,
+        "INSERT INTO glw VALUES ('2024-01-01 00:00:00+00', 1)",
+    )
+    .await;
 
     let err = sess
         .execute("SELECT time_bucket('1 hour', ts) AS b, locf(SUM(v)) FROM glw GROUP BY b")
@@ -401,8 +426,16 @@ async fn gapfill_interpolate_without_gapfill_errors() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE gi_ng (ts TIMESTAMPTZ, v DOUBLE PRECISION)").await;
-    exec(&sess, "INSERT INTO gi_ng VALUES ('2024-01-01 00:00:00+00', 1.0)").await;
+    exec(
+        &sess,
+        "CREATE TABLE gi_ng (ts TIMESTAMPTZ, v DOUBLE PRECISION)",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO gi_ng VALUES ('2024-01-01 00:00:00+00', 1.0)",
+    )
+    .await;
 
     // interpolate() used without time_bucket_gapfill → error.
     let err = sess
@@ -440,7 +473,11 @@ async fn gapfill_interpolate_mid_gap_linear() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE ginterp (ts TIMESTAMPTZ, v DOUBLE PRECISION)").await;
+    exec(
+        &sess,
+        "CREATE TABLE ginterp (ts TIMESTAMPTZ, v DOUBLE PRECISION)",
+    )
+    .await;
     exec(
         &sess,
         "INSERT INTO ginterp VALUES
@@ -499,10 +536,18 @@ async fn gapfill_interpolate_leading_trailing_null() {
     let engine = build_engine(&dir);
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE ginterp2 (ts TIMESTAMPTZ, v DOUBLE PRECISION)").await;
+    exec(
+        &sess,
+        "CREATE TABLE ginterp2 (ts TIMESTAMPTZ, v DOUBLE PRECISION)",
+    )
+    .await;
     // Only bucket 02:00 has a value — both the leading and trailing gaps have
     // no surrounding value on one side.
-    exec(&sess, "INSERT INTO ginterp2 VALUES ('2024-01-01 02:00:00+00', 50.0)").await;
+    exec(
+        &sess,
+        "INSERT INTO ginterp2 VALUES ('2024-01-01 02:00:00+00', 50.0)",
+    )
+    .await;
 
     let rows = fetch(
         &sess,
@@ -550,18 +595,26 @@ async fn gapfill_interpolate_and_locf_same_query() {
     .await;
 
     // col a → interpolate; col b → locf.
-    let batches = match sess.execute(
-        "SELECT time_bucket_gapfill('1 hour', ts) AS bkt, \
+    let batches = match sess
+        .execute(
+            "SELECT time_bucket_gapfill('1 hour', ts) AS bkt, \
          interpolate(AVG(a)) AS ia, locf(AVG(b)) AS lb \
          FROM ginterp3 WHERE ts BETWEEN TIMESTAMP '2024-01-01 00:00:00' \
-         AND TIMESTAMP '2024-01-01 02:00:00' GROUP BY bkt ORDER BY bkt"
-    ).await {
+         AND TIMESTAMP '2024-01-01 02:00:00' GROUP BY bkt ORDER BY bkt",
+        )
+        .await
+    {
         Ok(basin_engine::ExecResult::Rows { batches, .. }) => batches,
         other => panic!("unexpected: {other:?}"),
     };
 
     // 3 buckets: 00, 01, 02.
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>().iter().sum();
+    let total_rows: usize = batches
+        .iter()
+        .map(|b| b.num_rows())
+        .collect::<Vec<_>>()
+        .iter()
+        .sum();
     assert_eq!(total_rows, 3, "expected 3 rows");
 
     // Extract the interpolate(AVG(a)) column (index 1) and locf(AVG(b)) column (index 2).
@@ -571,15 +624,30 @@ async fn gapfill_interpolate_and_locf_same_query() {
         let ia = b.column(1).as_any().downcast_ref::<Float64Array>();
         let lb = b.column(2).as_any().downcast_ref::<Float64Array>();
         for row in 0..b.num_rows() {
-            ia_vals.push(ia.and_then(|a| if a.is_null(row) { None } else { Some(a.value(row)) }));
-            lb_vals.push(lb.and_then(|a| if a.is_null(row) { None } else { Some(a.value(row)) }));
+            ia_vals.push(ia.and_then(|a| {
+                if a.is_null(row) {
+                    None
+                } else {
+                    Some(a.value(row))
+                }
+            }));
+            lb_vals.push(lb.and_then(|a| {
+                if a.is_null(row) {
+                    None
+                } else {
+                    Some(a.value(row))
+                }
+            }));
         }
     }
 
     // interpolate(AVG(a)): 0.0 at 00, 10.0 at 01 (mid-point), 20.0 at 02.
     assert_eq!(ia_vals[0], Some(0.0), "ia bucket 00:00 = 0.0");
     let ia1 = ia_vals[1].expect("ia bucket 01:00 must be interpolated");
-    assert!((ia1 - 10.0).abs() < 1e-6, "ia bucket 01:00 ≈ 10.0, got {ia1}");
+    assert!(
+        (ia1 - 10.0).abs() < 1e-6,
+        "ia bucket 01:00 ≈ 10.0, got {ia1}"
+    );
     assert_eq!(ia_vals[2], Some(20.0), "ia bucket 02:00 = 20.0");
 
     // locf(AVG(b)): 100.0 at 00, carry 100.0 at 01, 200.0 at 02.
@@ -620,7 +688,11 @@ async fn gapfill_order_by_bucket() {
     )
     .await;
     for w in rows.bucket_us.windows(2) {
-        assert!(w[0] < w[1], "buckets must be strictly increasing: {:?}", rows.bucket_us);
+        assert!(
+            w[0] < w[1],
+            "buckets must be strictly increasing: {:?}",
+            rows.bucket_us
+        );
     }
     assert_eq!(rows.bucket_us.len(), 4);
     println!("[gapfill order-by] monotonic grid ✓");
@@ -648,7 +720,10 @@ async fn gapfill_empty_input_single_series() {
     .await;
     // Single-series empty input still fills the [00,02] grid with NULLs.
     assert_eq!(rows.bucket_us.len(), 3);
-    assert!(rows.agg_i.iter().all(|v| v.is_none()), "all NULL on empty input");
+    assert!(
+        rows.agg_i.iter().all(|v| v.is_none()),
+        "all NULL on empty input"
+    );
     println!("[gapfill empty] full grid, all NULL ✓");
 }
 
@@ -687,6 +762,9 @@ async fn gapfill_differential_handcomputed() {
     let expect_buckets: Vec<i64> = (0..5).map(|i| base + i * q).collect();
     assert_eq!(rows.bucket_us, expect_buckets, "15-min grid exact");
     // 10:05→bucket 10:00 (100); 10:38→bucket 10:30 (200); 11:00→bucket 11:00 (300).
-    assert_eq!(rows.agg_i, vec![Some(100), None, Some(200), None, Some(300)]);
+    assert_eq!(
+        rows.agg_i,
+        vec![Some(100), None, Some(200), None, Some(300)]
+    );
     println!("[gapfill differential] 15-min grid matches hand-computed ✓");
 }

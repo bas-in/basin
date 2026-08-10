@@ -200,7 +200,11 @@ fn compact_value(v: &serde_json::Value) -> String {
         serde_json::Value::Null => "null".to_string(),
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
             let s = v.to_string();
-            if s.len() > 200 { s[..200].to_string() } else { s }
+            if s.len() > 200 {
+                s[..200].to_string()
+            } else {
+                s
+            }
         }
     }
 }
@@ -287,8 +291,15 @@ impl JsonbPostingRegistry {
         table: &TableName,
         col: &str,
     ) -> Arc<Mutex<AtomPostingList>> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
-        let mut map = self.inner.lock().expect("JsonbPostingRegistry outer lock poisoned");
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
+        let mut map = self
+            .inner
+            .lock()
+            .expect("JsonbPostingRegistry outer lock poisoned");
         map.entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(AtomPostingList::new())))
             .clone()
@@ -300,8 +311,15 @@ impl JsonbPostingRegistry {
         table: &TableName,
         col: &str,
     ) -> Option<Arc<Mutex<AtomPostingList>>> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
-        let map = self.inner.lock().expect("JsonbPostingRegistry outer lock poisoned");
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
+        let map = self
+            .inner
+            .lock()
+            .expect("JsonbPostingRegistry outer lock poisoned");
         map.get(&key).cloned()
     }
 
@@ -321,7 +339,10 @@ impl JsonbPostingRegistry {
         }
         let arc = self.get_or_create(project, table, col);
         let mut list = arc.lock().expect("AtomPostingList lock poisoned");
-        let entry = JsonbPostingEntry { file_path: file_path.to_string(), row_group };
+        let entry = JsonbPostingEntry {
+            file_path: file_path.to_string(),
+            row_group,
+        };
         for atom in atoms {
             if list.insert(atom.clone(), entry.clone()) {
                 // Budget exhausted: the file is now over-budget.  Subsequent
@@ -348,7 +369,10 @@ impl JsonbPostingRegistry {
     ) {
         use arrow_array::Array;
         let col_arr = batch.column(col_idx);
-        let Some(arr) = col_arr.as_any().downcast_ref::<arrow_array::LargeBinaryArray>() else {
+        let Some(arr) = col_arr
+            .as_any()
+            .downcast_ref::<arrow_array::LargeBinaryArray>()
+        else {
             return;
         };
         let rg_size = row_group_size.max(1);
@@ -443,8 +467,11 @@ impl JsonbPostingRegistry {
         };
         let mut merged: HashMap<String, HashSet<u32>> = first;
         for next in iter {
-            let kept_keys: Vec<String> =
-                merged.keys().filter(|k| next.contains_key(*k)).cloned().collect();
+            let kept_keys: Vec<String> = merged
+                .keys()
+                .filter(|k| next.contains_key(*k))
+                .cloned()
+                .collect();
             let mut new_merged: HashMap<String, HashSet<u32>> =
                 HashMap::with_capacity(kept_keys.len());
             for k in kept_keys {
@@ -477,18 +504,16 @@ impl JsonbPostingRegistry {
         JsonbProbeResult::FileRowGroups(out)
     }
 
-    pub fn remove_file(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-        col: &str,
-        file_path: &str,
-    ) {
+    pub fn remove_file(&self, project: &ProjectId, table: &TableName, col: &str, file_path: &str) {
         if let Some(arc) = self.get(project, table, col) {
             let mut list = arc.lock().expect("AtomPostingList lock poisoned");
             list.remove_file(file_path);
         }
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         if let Ok(mut map) = self.indexed_files.lock() {
             if let Some(set) = map.get_mut(&key) {
                 set.remove(file_path);
@@ -503,7 +528,11 @@ impl JsonbPostingRegistry {
         col: &str,
         file_path: &str,
     ) {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         if let Ok(mut map) = self.indexed_files.lock() {
             map.entry(key).or_default().insert(file_path.to_string());
         }
@@ -516,7 +545,11 @@ impl JsonbPostingRegistry {
         col: &str,
         file_path: &str,
     ) -> bool {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         if let Ok(map) = self.indexed_files.lock() {
             map.get(&key).is_some_and(|s| s.contains(file_path))
         } else {
@@ -554,7 +587,11 @@ impl JsonbPostingRegistry {
         table: &TableName,
         col: &str,
     ) -> HashSet<String> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         if let Ok(map) = self.indexed_files.lock() {
             map.get(&key).cloned().unwrap_or_default()
         } else {
@@ -564,15 +601,14 @@ impl JsonbPostingRegistry {
 
     /// Total posting entries for `(project, table, col)`.  Primarily for
     /// tests and diagnostics.
-    pub fn total_entries(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-        col: &str,
-    ) -> usize {
+    pub fn total_entries(&self, project: &ProjectId, table: &TableName, col: &str) -> usize {
         match self.get(project, table, col) {
             None => 0,
-            Some(arc) => arc.lock().expect("AtomPostingList lock poisoned").total_count,
+            Some(arc) => {
+                arc.lock()
+                    .expect("AtomPostingList lock poisoned")
+                    .total_count
+            }
         }
     }
 
@@ -661,11 +697,7 @@ struct SidecarPayload {
 
 /// Build the prefix at which all JSONB posting-list sidecars for a given
 /// `(project, table, column)` live.
-pub fn column_posting_prefix(
-    project: &ProjectId,
-    table: &TableName,
-    column: &str,
-) -> ObjectPath {
+pub fn column_posting_prefix(project: &ProjectId, table: &TableName, column: &str) -> ObjectPath {
     let mut p = ObjectPath::from(crate::paths::PROJECTS_SEGMENT);
     p = p.child(project.as_prefix());
     p = p.child("tables");
@@ -738,8 +770,7 @@ fn strip_jsonb_version_tag(stored: &[u8]) -> &[u8] {
                 if p + 2 > stored.len() {
                     return stored;
                 }
-                let kl = u16::from_le_bytes(stored[p..p + 2].try_into().unwrap_or([0; 2]))
-                    as usize;
+                let kl = u16::from_le_bytes(stored[p..p + 2].try_into().unwrap_or([0; 2])) as usize;
                 p += 2 + kl + 4 + 4;
                 if p > stored.len() {
                     return stored;
@@ -856,14 +887,20 @@ mod tests {
         let tbl = TableName::new("docs").unwrap();
         // f1: category in rg 0; region in rg 1.  Need both → union {0, 1}.
         reg.index_row(
-            &proj, &tbl, "payload",
+            &proj,
+            &tbl,
+            "payload",
             &extract_atoms(&json!({"category": "purchase"})),
-            "f1.parquet", 0,
+            "f1.parquet",
+            0,
         );
         reg.index_row(
-            &proj, &tbl, "payload",
+            &proj,
+            &tbl,
+            "payload",
             &extract_atoms(&json!({"region": "us-east-1"})),
-            "f1.parquet", 1,
+            "f1.parquet",
+            1,
         );
         reg.mark_file_indexed(&proj, &tbl, "payload", "f1.parquet");
 
@@ -871,7 +908,11 @@ mod tests {
         match reg.probe(&proj, &tbl, "payload", &needle) {
             JsonbProbeResult::FileRowGroups(m) => {
                 let rgs = m.get("f1.parquet").expect("f1 missing");
-                assert_eq!(rgs, &vec![0u32, 1u32], "row-groups should be union: {rgs:?}");
+                assert_eq!(
+                    rgs,
+                    &vec![0u32, 1u32],
+                    "row-groups should be union: {rgs:?}"
+                );
             }
             other => panic!("expected FileRowGroups, got {other:?}"),
         }
@@ -883,15 +924,21 @@ mod tests {
         let proj = ProjectId::new();
         let tbl = TableName::new("docs").unwrap();
         reg.index_row(
-            &proj, &tbl, "payload",
+            &proj,
+            &tbl,
+            "payload",
             &extract_atoms(&json!({"category": "purchase"})),
-            "f1.parquet", 0,
+            "f1.parquet",
+            0,
         );
         reg.mark_file_indexed(&proj, &tbl, "payload", "f1.parquet");
         reg.index_row(
-            &proj, &tbl, "payload",
+            &proj,
+            &tbl,
+            "payload",
             &extract_atoms(&json!({"region": "us-east-1"})),
-            "f2.parquet", 0,
+            "f2.parquet",
+            0,
         );
         reg.mark_file_indexed(&proj, &tbl, "payload", "f2.parquet");
 
@@ -1039,7 +1086,10 @@ mod tests {
         let proj = ProjectId::new();
         let tbl = TableName::new("docs").unwrap();
         let ulid = Ulid::new();
-        let file = format!("projects/{}/tables/docs/part=a/{ulid}.parquet", proj.as_prefix());
+        let file = format!(
+            "projects/{}/tables/docs/part=a/{ulid}.parquet",
+            proj.as_prefix()
+        );
         let key = posting_sidecar_key_for_data_file(&proj, &tbl, "payload", &file)
             .expect("key derivation");
         let s = key.to_string();

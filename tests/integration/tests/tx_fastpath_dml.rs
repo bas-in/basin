@@ -148,7 +148,11 @@ async fn all_rows(sess: &ProjectSession, table: &str) -> Vec<(i64, i64)> {
 }
 
 async fn count_rows(sess: &ProjectSession, table: &str) -> i64 {
-    match sess.execute(&format!("SELECT count(*) FROM {table}")).await.unwrap() {
+    match sess
+        .execute(&format!("SELECT count(*) FROM {table}"))
+        .await
+        .unwrap()
+    {
         ExecResult::Rows { batches, .. } => int_value(batches[0].column(0), 0),
         other => panic!("expected rows from count(*), got {other:?}"),
     }
@@ -156,9 +160,17 @@ async fn count_rows(sess: &ProjectSession, table: &str) -> i64 {
 
 /// Seed `(id INT PRIMARY KEY, val INT)` with rows `(i, i*10)`, COMMITTED cold.
 async fn seed(sess: &ProjectSession, table: &str, n: i64) {
-    exec(sess, &format!("CREATE TABLE {table} (id INT PRIMARY KEY, val INT)")).await;
+    exec(
+        sess,
+        &format!("CREATE TABLE {table} (id INT PRIMARY KEY, val INT)"),
+    )
+    .await;
     for i in 1..=n {
-        exec(sess, &format!("INSERT INTO {table} (id, val) VALUES ({i}, {})", i * 10)).await;
+        exec(
+            sess,
+            &format!("INSERT INTO {table} (id, val) VALUES ({i}, {})", i * 10),
+        )
+        .await;
     }
 }
 
@@ -317,7 +329,11 @@ async fn update_then_delete_in_tx_row_gone_post_commit() {
         assert_eq!(val_at(&sess, "t", 3).await, None);
         exec(&sess, "COMMIT").await;
 
-        assert_eq!(val_at(&sess, "t", 3).await, None, "row must be gone post-COMMIT");
+        assert_eq!(
+            val_at(&sess, "t", 3).await,
+            None,
+            "row must be gone post-COMMIT"
+        );
         assert_eq!(count_rows(&sess, "t").await, 4, "exactly one row removed");
     })
     .await;
@@ -335,7 +351,11 @@ async fn delete_then_rollback_row_alive() {
         seed(&sess, "t", 5).await;
         exec(&sess, "BEGIN").await;
         exec(&sess, "DELETE FROM t WHERE id = 2").await;
-        assert_eq!(val_at(&sess, "t", 2).await, None, "in-tx the delete is visible");
+        assert_eq!(
+            val_at(&sess, "t", 2).await,
+            None,
+            "in-tx the delete is visible"
+        );
         exec(&sess, "ROLLBACK").await;
 
         assert_eq!(

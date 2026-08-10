@@ -105,12 +105,12 @@ pub const DEFAULT_REGRESSION_THRESHOLD: f64 = 1.3;
 /// Bucket i contains row counts in [BUCKET_THRESHOLDS[i-1], BUCKET_THRESHOLDS[i]).
 /// Bucket 0 catches everything below the first threshold.
 const BUCKET_THRESHOLDS: [u64; 7] = [
-    1_000,        // bucket 0 → 1: 1 k rows
-    10_000,       // bucket 1 → 2: 10 k rows
-    100_000,      // bucket 2 → 3: 100 k rows
-    1_000_000,    // bucket 3 → 4: 1 M rows
-    10_000_000,   // bucket 4 → 5: 10 M rows
-    100_000_000,  // bucket 5 → 6: 100 M rows
+    1_000,         // bucket 0 → 1: 1 k rows
+    10_000,        // bucket 1 → 2: 10 k rows
+    100_000,       // bucket 2 → 3: 100 k rows
+    1_000_000,     // bucket 3 → 4: 1 M rows
+    10_000_000,    // bucket 4 → 5: 10 M rows
+    100_000_000,   // bucket 5 → 6: 100 M rows
     1_000_000_000, // bucket 6 → 7: 1 B rows
 ];
 
@@ -201,14 +201,14 @@ fn make_latency_hist() -> Histogram<u64> {
 impl ShapeStats {
     fn new() -> Self {
         let latency_ns = make_latency_hist();
-        let rows_scanned =
-            Histogram::<u64>::new_with_bounds(1, COUNT_MAX, HDR_SIGFIG).expect("rows_scanned histogram");
-        let files_opened =
-            Histogram::<u64>::new_with_bounds(1, COUNT_MAX, HDR_SIGFIG).expect("files_opened histogram");
-        let bytes_decoded =
-            Histogram::<u64>::new_with_bounds(1, COUNT_MAX, HDR_SIGFIG).expect("bytes_decoded histogram");
-        let cache_hits =
-            Histogram::<u64>::new_with_bounds(1, COUNT_MAX, HDR_SIGFIG).expect("cache_hits histogram");
+        let rows_scanned = Histogram::<u64>::new_with_bounds(1, COUNT_MAX, HDR_SIGFIG)
+            .expect("rows_scanned histogram");
+        let files_opened = Histogram::<u64>::new_with_bounds(1, COUNT_MAX, HDR_SIGFIG)
+            .expect("files_opened histogram");
+        let bytes_decoded = Histogram::<u64>::new_with_bounds(1, COUNT_MAX, HDR_SIGFIG)
+            .expect("bytes_decoded histogram");
+        let cache_hits = Histogram::<u64>::new_with_bounds(1, COUNT_MAX, HDR_SIGFIG)
+            .expect("cache_hits histogram");
 
         // Build per-bucket latency histograms.  We use array::from_fn for a
         // clean initialisation without unsafe.
@@ -234,9 +234,7 @@ impl ShapeStats {
     /// With 8 per-bucket histograms + 5 global histograms = 13 latency-sized
     /// + 4 count-sized histograms → ≈ 16 KiB per shape.
     pub fn mem_bytes(&self) -> usize {
-        let hist_bytes = |h: &Histogram<u64>| {
-            h.len() as usize * std::mem::size_of::<u64>()
-        };
+        let hist_bytes = |h: &Histogram<u64>| h.len() as usize * std::mem::size_of::<u64>();
         let global = hist_bytes(&self.latency_ns)
             + hist_bytes(&self.rows_scanned)
             + hist_bytes(&self.files_opened)
@@ -320,28 +318,19 @@ impl ProjectStats {
     fn observe(&mut self, table: &TableName, hash: QueryShapeHash, metrics: &QueryMetrics) {
         let key = (table.clone(), hash);
         // `get_or_insert` promotes the key to MRU and returns a mutable ref.
-        let entry = self
-            .shapes
-            .get_or_insert_mut(key, ShapeStats::new);
+        let entry = self.shapes.get_or_insert_mut(key, ShapeStats::new);
         entry.record(metrics);
     }
 
     /// Rough memory footprint of all shapes currently tracked for this project.
     pub fn mem_bytes(&self) -> usize {
-        self.shapes
-            .iter()
-            .map(|(_, s)| s.mem_bytes())
-            .sum()
+        self.shapes.iter().map(|(_, s)| s.mem_bytes()).sum()
     }
 
     /// Scan all shapes for table `table_name` and return those whose p99
     /// latency grows by more than `threshold` between any two adjacent
     /// populated scale buckets.
-    fn top_regressions(
-        &self,
-        table_name: &TableName,
-        threshold: f64,
-    ) -> Vec<RegressionAlert> {
+    fn top_regressions(&self, table_name: &TableName, threshold: f64) -> Vec<RegressionAlert> {
         let mut alerts = Vec::new();
         for ((tbl, hash), stats) in self.shapes.iter() {
             if tbl != table_name {
@@ -403,9 +392,9 @@ impl QueryStatRegistry {
     pub fn new() -> Self {
         Self {
             projects: Arc::new(DashMap::new()),
-            regression_threshold: Arc::new(std::sync::atomic::AtomicU64::new(
-                f64::to_bits(DEFAULT_REGRESSION_THRESHOLD),
-            )),
+            regression_threshold: Arc::new(std::sync::atomic::AtomicU64::new(f64::to_bits(
+                DEFAULT_REGRESSION_THRESHOLD,
+            ))),
         }
     }
 
@@ -497,11 +486,7 @@ impl QueryStatRegistry {
     /// appears first.
     ///
     /// Returns an empty `Vec` when the project/table has no observations.
-    pub fn top_regressions(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-    ) -> Vec<RegressionAlert> {
+    pub fn top_regressions(&self, project: &ProjectId, table: &TableName) -> Vec<RegressionAlert> {
         let Some(arc) = self.projects.get(project).map(|r| r.clone()) else {
             return Vec::new();
         };
@@ -509,7 +494,11 @@ impl QueryStatRegistry {
         let guard = arc.lock().expect("ProjectStats Mutex poisoned");
         let mut alerts = guard.top_regressions(table, threshold);
         // Sort worst regression first.
-        alerts.sort_by(|a, b| b.p99_ratio.partial_cmp(&a.p99_ratio).unwrap_or(std::cmp::Ordering::Equal));
+        alerts.sort_by(|a, b| {
+            b.p99_ratio
+                .partial_cmp(&a.p99_ratio)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         alerts
     }
 
@@ -680,22 +669,13 @@ mod tests {
                 found = true;
                 // p50 should be near 1_000 ns.
                 let p50 = stats.latency_ns.value_at_quantile(0.50);
-                assert!(
-                    p50 >= 900 && p50 <= 1_100,
-                    "p50 = {p50}; expected ~1_000"
-                );
+                assert!(p50 >= 900 && p50 <= 1_100, "p50 = {p50}; expected ~1_000");
                 // p99 should be near 1_000 ns (99 out of 100 are 1_000 ns).
                 let p99 = stats.latency_ns.value_at_quantile(0.99);
-                assert!(
-                    p99 >= 900 && p99 <= 1_100,
-                    "p99 = {p99}; expected ~1_000"
-                );
+                assert!(p99 >= 900 && p99 <= 1_100, "p99 = {p99}; expected ~1_000");
                 // p100 should be near 1_000_000 ns (the outlier).
                 let p100 = stats.latency_ns.value_at_quantile(1.0);
-                assert!(
-                    p100 >= 900_000,
-                    "p100 = {p100}; expected ~1_000_000"
-                );
+                assert!(p100 >= 900_000, "p100 = {p100}; expected ~1_000_000");
                 assert_eq!(stats.total_observations, 100);
             }
         });
@@ -878,9 +858,11 @@ mod tests {
         // Observe 100 times at each scale point to get stable p99.
         for _ in 0..100 {
             reg.observe(
-                &p, &t, h,
+                &p,
+                &t,
+                h,
                 &QueryMetrics {
-                    latency_ns: 1_000_000, // 1 ms
+                    latency_ns: 1_000_000,  // 1 ms
                     table_row_count: 5_000, // bucket 1
                     ..Default::default()
                 },
@@ -888,9 +870,11 @@ mod tests {
         }
         for _ in 0..100 {
             reg.observe(
-                &p, &t, h,
+                &p,
+                &t,
+                h,
                 &QueryMetrics {
-                    latency_ns: 5_000_000, // 5 ms
+                    latency_ns: 5_000_000,   // 5 ms
                     table_row_count: 50_000, // bucket 2
                     ..Default::default()
                 },
@@ -898,9 +882,11 @@ mod tests {
         }
         for _ in 0..100 {
             reg.observe(
-                &p, &t, h,
+                &p,
+                &t,
+                h,
                 &QueryMetrics {
-                    latency_ns: 50_000_000, // 50 ms
+                    latency_ns: 50_000_000,   // 50 ms
                     table_row_count: 500_000, // bucket 3
                     ..Default::default()
                 },
@@ -912,7 +898,10 @@ mod tests {
             !alerts.is_empty(),
             "expected at least one regression alert; got none"
         );
-        let alert = alerts.iter().find(|a| a.shape == h).expect("shape h not in alerts");
+        let alert = alerts
+            .iter()
+            .find(|a| a.shape == h)
+            .expect("shape h not in alerts");
         assert!(
             alert.p99_ratio > 1.3,
             "p99_ratio = {}; expected > 1.3",
@@ -932,7 +921,9 @@ mod tests {
         for &row_count in &[5_000u64, 50_000u64, 500_000u64] {
             for _ in 0..100 {
                 reg.observe(
-                    &p, &t, h,
+                    &p,
+                    &t,
+                    h,
                     &QueryMetrics {
                         latency_ns: 1_000_000, // always 1 ms
                         table_row_count: row_count,

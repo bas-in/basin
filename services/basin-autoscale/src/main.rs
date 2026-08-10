@@ -57,7 +57,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use basin_autoscale::{ScaleDecision, Scaler, ScalerConfig, ProjectSnapshot};
+use basin_autoscale::{ProjectSnapshot, ScaleDecision, Scaler, ScalerConfig};
 use basin_common::ProjectId;
 use clap::Parser;
 use tracing::{info, warn};
@@ -112,11 +112,7 @@ struct Args {
 
     /// Consecutive hot (or cool) ticks required before a split (or merge).
     /// Env: BASIN_AUTOSCALE_HYSTERESIS_WINDOW (default 3).
-    #[arg(
-        long,
-        default_value = "3",
-        env = "BASIN_AUTOSCALE_HYSTERESIS_WINDOW"
-    )]
+    #[arg(long, default_value = "3", env = "BASIN_AUTOSCALE_HYSTERESIS_WINDOW")]
     hysteresis_window: u32,
 
     /// Minimum number of shards per project.
@@ -131,11 +127,7 @@ struct Args {
 
     /// Cooldown in seconds between successive split/merge actions for the
     /// same project. Env: BASIN_AUTOSCALE_COOLDOWN_SECS (default 300).
-    #[arg(
-        long,
-        default_value = "300",
-        env = "BASIN_AUTOSCALE_COOLDOWN_SECS"
-    )]
+    #[arg(long, default_value = "300", env = "BASIN_AUTOSCALE_COOLDOWN_SECS")]
     cooldown_secs: u64,
 
     /// basin-catalog Postgres DSN. Only needed in catalog-poll mode.
@@ -367,8 +359,7 @@ fn exec_cli_action(subcommand: &str, project_id: &str) {
         Ok(out) if out.status.success() => {
             info!(
                 subcommand,
-                project_id,
-                "basin-cli admin {} succeeded", subcommand,
+                project_id, "basin-cli admin {} succeeded", subcommand,
             );
         }
         Ok(out) => {

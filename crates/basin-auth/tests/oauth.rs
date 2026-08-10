@@ -185,8 +185,7 @@ fn apple_jwt_verifies_under_public_key_and_claims_are_correct() {
         .expect("build_apple_client_secret_jwt should succeed");
 
     // Decode and verify the header separately to check kid + alg.
-    let header: Header =
-        jsonwebtoken::decode_header(&jwt).expect("JWT header should be decodable");
+    let header: Header = jsonwebtoken::decode_header(&jwt).expect("JWT header should be decodable");
     assert_eq!(header.alg, Algorithm::ES256, "alg must be ES256");
     assert_eq!(
         header.kid.as_deref(),

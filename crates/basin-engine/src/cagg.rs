@@ -410,12 +410,8 @@ async fn refresh_window(
         } = kept_res
         {
             if existing_schema.fields() == new_schema.fields() {
-                let kept = filter_outside_window(
-                    &existing_batches,
-                    &info.bucket_alias,
-                    start,
-                    end,
-                )?;
+                let kept =
+                    filter_outside_window(&existing_batches, &info.bucket_alias, start, end)?;
                 all_batches.extend(kept);
             }
         }
@@ -538,7 +534,11 @@ fn rewrite_for_window(
     };
     let select = match query.body.as_mut() {
         SetExpr::Select(s) => s.as_mut(),
-        _ => return Err(BasinError::internal("cagg window: set-op SELECT not supported")),
+        _ => {
+            return Err(BasinError::internal(
+                "cagg window: set-op SELECT not supported",
+            ))
+        }
     };
     if select.from.len() != 1 || !select.from[0].joins.is_empty() {
         return Err(BasinError::internal("cagg window: multi-table / JOIN FROM"));
@@ -546,7 +546,11 @@ fn rewrite_for_window(
     let table_ref = &mut select.from[0].relation;
     let table_name = match table_ref {
         TableFactor::Table { name, .. } => name.to_string(),
-        _ => return Err(BasinError::internal("cagg window: derived FROM not supported")),
+        _ => {
+            return Err(BasinError::internal(
+                "cagg window: derived FROM not supported",
+            ))
+        }
     };
 
     let mut preds: Vec<String> = Vec::new();

@@ -62,7 +62,10 @@ mod common;
 use common::{build_basin_engine, median, try_connect, SchemaGuard};
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Atomic write to `benchmark/data/<file>` — a SEPARATE artifact family from
@@ -131,12 +134,11 @@ fn basin_rows(res: &ExecResult) -> usize {
 /// selectivity spread for T2/T3.
 fn name_for(i: usize) -> String {
     const FIRST: &[&str] = &[
-        "alice", "alyce", "bob", "carol", "dave", "erin", "frank", "grace",
-        "heidi", "ivan", "judy", "mallory", "olivia", "peggy", "trent", "victor",
+        "alice", "alyce", "bob", "carol", "dave", "erin", "frank", "grace", "heidi", "ivan",
+        "judy", "mallory", "olivia", "peggy", "trent", "victor",
     ];
     const LAST: &[&str] = &[
-        "smith", "smyth", "jones", "brown", "taylor", "wilson", "davies",
-        "evans",
+        "smith", "smyth", "jones", "brown", "taylor", "wilson", "davies", "evans",
     ];
     let first = FIRST[i % FIRST.len()];
     let last = LAST[(i / FIRST.len()) % LAST.len()];
@@ -161,7 +163,11 @@ async fn ext_bench_trgm() {
 
     // ── Basin setup ──────────────────────────────────────────────────────────
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     sess.execute("CREATE TABLE people (id BIGINT NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
         .await
         .unwrap();
@@ -217,8 +223,7 @@ async fn ext_bench_trgm() {
     let t1_sql = "SELECT count(*) FROM people WHERE similarity(name, 'alice smith') > 0.0";
     let t2_sql = format!("SELECT count(*) FROM people WHERE name % '{RARE_NEEDLE}'");
     let t3_sql = format!("SELECT count(*) FROM people WHERE name % '{COMMON_NEEDLE}'");
-    let t4_sql =
-        format!("SELECT id FROM people ORDER BY name <-> 'alyce smyth' LIMIT 10");
+    let t4_sql = format!("SELECT id FROM people ORDER BY name <-> 'alyce smyth' LIMIT 10");
     let t5_sql = format!("SELECT count(*) FROM people WHERE name <% '{WORD_NEEDLE}'");
 
     // A small generic timed-median runner that tolerates an unsupported shape.
@@ -256,14 +261,20 @@ async fn ext_bench_trgm() {
     let t5_count = t5_res.as_ref().map(basin_count).unwrap_or(0);
 
     // T6 — threshold GUC sweep: at 0.3 (default) vs 0.6, on the common needle.
-    sess.execute("SET pg_trgm.similarity_threshold = 0.3").await.ok();
+    sess.execute("SET pg_trgm.similarity_threshold = 0.3")
+        .await
+        .ok();
     let (t6_lo_b, t6_lo_res) = basin_p50(&sess, &t3_sql, samples).await;
     let t6_lo_count = t6_lo_res.as_ref().map(basin_count).unwrap_or(0);
-    sess.execute("SET pg_trgm.similarity_threshold = 0.6").await.ok();
+    sess.execute("SET pg_trgm.similarity_threshold = 0.6")
+        .await
+        .ok();
     let (t6_hi_b, t6_hi_res) = basin_p50(&sess, &t3_sql, samples).await;
     let t6_hi_count = t6_hi_res.as_ref().map(basin_count).unwrap_or(0);
     // restore
-    sess.execute("SET pg_trgm.similarity_threshold = 0.3").await.ok();
+    sess.execute("SET pg_trgm.similarity_threshold = 0.3")
+        .await
+        .ok();
 
     println!(
         "[ext_bench_trgm] Basin: T1={:?} T2(rare={t2_count})={:?} T3(common={t3_count})={:?} \
@@ -287,23 +298,35 @@ async fn ext_bench_trgm() {
         pg_available = true;
         let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
         let schema = format!("basin_ext_trgm_{suffix}");
-        let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-        pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.ok();
+        let _guard = SchemaGuard {
+            schema: schema.clone(),
+            conn_str: cs,
+        };
+        pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .ok();
         pg.simple_query("SET work_mem = '16MB'").await.ok();
 
         pg_ext_ok = pg
             .simple_query("CREATE EXTENSION IF NOT EXISTS pg_trgm")
             .await
             .is_ok();
-        eprintln!("[ext_bench_trgm] PG pg_trgm extension: {}", if pg_ext_ok { "ok" } else { "UNAVAILABLE" });
+        eprintln!(
+            "[ext_bench_trgm] PG pg_trgm extension: {}",
+            if pg_ext_ok { "ok" } else { "UNAVAILABLE" }
+        );
 
         // Indexed table + un-indexed twin, same data.
         pg.simple_query(&format!(
             "CREATE TABLE {schema}.people_idx (id BIGINT PRIMARY KEY, name TEXT NOT NULL)"
-        )).await.ok();
+        ))
+        .await
+        .ok();
         pg.simple_query(&format!(
             "CREATE TABLE {schema}.people_scan (id BIGINT PRIMARY KEY, name TEXT NOT NULL)"
-        )).await.ok();
+        ))
+        .await
+        .ok();
 
         let mut po = 0usize;
         while po < rows {
@@ -316,25 +339,40 @@ async fn ext_bench_trgm() {
                 let nm = name_for(k).replace('\'', "''");
                 v.push_str(&format!("({k},'{nm}')"));
             }
-            pg.simple_query(&format!("INSERT INTO {schema}.people_idx VALUES {v}")).await.ok();
-            pg.simple_query(&format!("INSERT INTO {schema}.people_scan VALUES {v}")).await.ok();
+            pg.simple_query(&format!("INSERT INTO {schema}.people_idx VALUES {v}"))
+                .await
+                .ok();
+            pg.simple_query(&format!("INSERT INTO {schema}.people_scan VALUES {v}"))
+                .await
+                .ok();
             po = hi;
         }
 
         if pg_ext_ok {
             pg.simple_query(&format!(
                 "CREATE INDEX people_trgm_gin ON {schema}.people_idx USING gin (name gin_trgm_ops)"
-            )).await.ok();
+            ))
+            .await
+            .ok();
         }
-        pg.simple_query(&format!("ANALYZE {schema}.people_idx")).await.ok();
-        pg.simple_query(&format!("ANALYZE {schema}.people_scan")).await.ok();
+        pg.simple_query(&format!("ANALYZE {schema}.people_idx"))
+            .await
+            .ok();
+        pg.simple_query(&format!("ANALYZE {schema}.people_scan"))
+            .await
+            .ok();
 
         // Median over `samples` EXPLAIN ANALYZE runs.
         async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f64> {
-            let _ = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await;
+            let _ = pg
+                .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+                .await;
             let mut s = Vec::with_capacity(n);
             for _ in 0..n {
-                if let Ok(rs) = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await {
+                if let Ok(rs) = pg
+                    .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+                    .await
+                {
                     for m in &rs {
                         if let SimpleQueryMessage::Row(r) = m {
                             if let Some(line) = r.get(0) {
@@ -351,11 +389,18 @@ async fn ext_bench_trgm() {
                     }
                 }
             }
-            if s.is_empty() { None } else { Some(median(&s)) }
+            if s.is_empty() {
+                None
+            } else {
+                Some(median(&s))
+            }
         }
 
         async fn pg_count(pg: &tokio_postgres::Client, sql: &str) -> i64 {
-            pg.query_one(sql, &[]).await.map(|r| r.get::<usize, i64>(0)).unwrap_or(0)
+            pg.query_one(sql, &[])
+                .await
+                .map(|r| r.get::<usize, i64>(0))
+                .unwrap_or(0)
         }
 
         if pg_ext_ok {
@@ -363,8 +408,13 @@ async fn ext_bench_trgm() {
             pg.simple_query("SELECT set_limit(0.3)").await.ok();
 
             // Counts (correctness reference) from the indexed table.
-            pg_t2_count = pg_count(&pg,
-                &format!("SELECT count(*)::bigint FROM {schema}.people_idx WHERE name % '{RARE_NEEDLE}'")).await;
+            pg_t2_count = pg_count(
+                &pg,
+                &format!(
+                    "SELECT count(*)::bigint FROM {schema}.people_idx WHERE name % '{RARE_NEEDLE}'"
+                ),
+            )
+            .await;
             pg_t3_count = pg_count(&pg,
                 &format!("SELECT count(*)::bigint FROM {schema}.people_idx WHERE name % '{COMMON_NEEDLE}'")).await;
 
@@ -375,13 +425,33 @@ async fn ext_bench_trgm() {
 
             // T2 rare % — indexed and scan.
             pg_t2 = (
-                pg_p50(&pg, &format!("SELECT id FROM {schema}.people_idx WHERE name % '{RARE_NEEDLE}'"), samples).await,
-                pg_p50(&pg, &format!("SELECT id FROM {schema}.people_scan WHERE name % '{RARE_NEEDLE}'"), samples).await,
+                pg_p50(
+                    &pg,
+                    &format!("SELECT id FROM {schema}.people_idx WHERE name % '{RARE_NEEDLE}'"),
+                    samples,
+                )
+                .await,
+                pg_p50(
+                    &pg,
+                    &format!("SELECT id FROM {schema}.people_scan WHERE name % '{RARE_NEEDLE}'"),
+                    samples,
+                )
+                .await,
             );
             // T3 common % — indexed and scan.
             pg_t3 = (
-                pg_p50(&pg, &format!("SELECT id FROM {schema}.people_idx WHERE name % '{COMMON_NEEDLE}'"), samples).await,
-                pg_p50(&pg, &format!("SELECT id FROM {schema}.people_scan WHERE name % '{COMMON_NEEDLE}'"), samples).await,
+                pg_p50(
+                    &pg,
+                    &format!("SELECT id FROM {schema}.people_idx WHERE name % '{COMMON_NEEDLE}'"),
+                    samples,
+                )
+                .await,
+                pg_p50(
+                    &pg,
+                    &format!("SELECT id FROM {schema}.people_scan WHERE name % '{COMMON_NEEDLE}'"),
+                    samples,
+                )
+                .await,
             );
             // T4 nearest-name <-> (gin_trgm_ops supports <-> ordering with the index).
             pg_t4 = (
@@ -390,12 +460,24 @@ async fn ext_bench_trgm() {
             );
             // T5 word-similarity <%.
             pg_t5 = (
-                pg_p50(&pg, &format!("SELECT id FROM {schema}.people_idx WHERE name <% '{WORD_NEEDLE}'"), samples).await,
-                pg_p50(&pg, &format!("SELECT id FROM {schema}.people_scan WHERE name <% '{WORD_NEEDLE}'"), samples).await,
+                pg_p50(
+                    &pg,
+                    &format!("SELECT id FROM {schema}.people_idx WHERE name <% '{WORD_NEEDLE}'"),
+                    samples,
+                )
+                .await,
+                pg_p50(
+                    &pg,
+                    &format!("SELECT id FROM {schema}.people_scan WHERE name <% '{WORD_NEEDLE}'"),
+                    samples,
+                )
+                .await,
             );
         }
 
-        let _ = pg.simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+        let _ = pg
+            .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await;
         std::mem::forget(_guard);
     } else {
         eprintln!("[ext_bench_trgm] PG unavailable — Basin-only card");
@@ -418,85 +500,91 @@ async fn ext_bench_trgm() {
     }
 
     // ── Emit artifact ────────────────────────────────────────────────────────
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("ext_bench_trgm.json", &json!({
-        "card": "ext_bench_trgm",
-        "family": "pg_trgm",
-        "generated_at": format!("@{ts}"),
-        "pg_available": pg_available,
-        "pg_extension_available": pg_ext_ok,
-        "basin_uses_index": basin_uses_index,
-        "config": {
-            "rows": rows,
-            "samples": samples,
-            "rare_needle": RARE_NEEDLE,
-            "common_needle": COMMON_NEEDLE,
-            "word_needle": WORD_NEEDLE,
-        },
-        "shapes": [
-            {
-                "label": "T1: similarity() projection over N strings",
-                "basin_p50_ms": opt_ms(t1_b),
-                "pg_p50_ms": opt_ms(pg_t1),
-                "basin_over_pg": ratio(t1_b, pg_t1),
-                "basin_match_count": t1_count,
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "ext_bench_trgm.json",
+        &json!({
+            "card": "ext_bench_trgm",
+            "family": "pg_trgm",
+            "generated_at": format!("@{ts}"),
+            "pg_available": pg_available,
+            "pg_extension_available": pg_ext_ok,
+            "basin_uses_index": basin_uses_index,
+            "config": {
+                "rows": rows,
+                "samples": samples,
+                "rare_needle": RARE_NEEDLE,
+                "common_needle": COMMON_NEEDLE,
+                "word_needle": WORD_NEEDLE,
             },
-            {
-                "label": "T2: % filter — rare needle (low selectivity)",
-                "basin_p50_ms": opt_ms(t2_b),
-                "basin_uses_index": basin_uses_index,
-                "pg_gin_p50_ms": opt_ms(pg_t2.0),
-                "pg_scan_p50_ms": opt_ms(pg_t2.1),
-                "basin_over_pg_gin": ratio(t2_b, pg_t2.0),
-                "basin_over_pg_scan": ratio(t2_b, pg_t2.1),
-                "basin_hits": t2_count,
-                "pg_hits": pg_t2_count,
-            },
-            {
-                "label": "T3: % filter — common needle (high selectivity)",
-                "basin_p50_ms": opt_ms(t3_b),
-                "basin_uses_index": basin_uses_index,
-                "pg_gin_p50_ms": opt_ms(pg_t3.0),
-                "pg_scan_p50_ms": opt_ms(pg_t3.1),
-                "basin_over_pg_gin": ratio(t3_b, pg_t3.0),
-                "basin_over_pg_scan": ratio(t3_b, pg_t3.1),
-                "basin_hits": t3_count,
-                "pg_hits": pg_t3_count,
-            },
-            {
-                "label": "T4: <-> ORDER BY LIMIT 10 (nearest-name search)",
-                "basin_p50_ms": opt_ms(t4_b),
-                "pg_gin_p50_ms": opt_ms(pg_t4.0),
-                "pg_scan_p50_ms": opt_ms(pg_t4.1),
-                "basin_over_pg_gin": ratio(t4_b, pg_t4.0),
-                "basin_over_pg_scan": ratio(t4_b, pg_t4.1),
-                "basin_rows": t4_rows,
-            },
-            {
-                "label": "T5: word_similarity <% filter",
-                "basin_p50_ms": opt_ms(t5_b),
-                "pg_gin_p50_ms": opt_ms(pg_t5.0),
-                "pg_scan_p50_ms": opt_ms(pg_t5.1),
-                "basin_over_pg_gin": ratio(t5_b, pg_t5.0),
-                "basin_over_pg_scan": ratio(t5_b, pg_t5.1),
-                "basin_hits": t5_count,
-            },
-            {
-                "label": "T6: threshold-GUC sweep effect on % (Basin-only)",
-                "basin_thresh_0_3_p50_ms": opt_ms(t6_lo_b),
-                "basin_thresh_0_3_hits": t6_lo_count,
-                "basin_thresh_0_6_p50_ms": opt_ms(t6_hi_b),
-                "basin_thresh_0_6_hits": t6_hi_count,
-            },
-        ],
-        "note": "Basin builds a gin_trgm_ops trigram GIN index; the % filter shapes \
-                 (T2/T3) are index-backed (per-shape basin_uses_index reflects the \
-                 runtime-probed posting registry). <-> ORDER BY (T4) and <% (T5) stay \
-                 sequential scans on Basin. PG numbers are reported both WITH a \
-                 gin_trgm_ops index and WITHOUT it (sequential scan) so the artifact \
-                 carries the indexed head-to-head AND the apples-to-apples scan \
-                 comparison.",
-    }));
+            "shapes": [
+                {
+                    "label": "T1: similarity() projection over N strings",
+                    "basin_p50_ms": opt_ms(t1_b),
+                    "pg_p50_ms": opt_ms(pg_t1),
+                    "basin_over_pg": ratio(t1_b, pg_t1),
+                    "basin_match_count": t1_count,
+                },
+                {
+                    "label": "T2: % filter — rare needle (low selectivity)",
+                    "basin_p50_ms": opt_ms(t2_b),
+                    "basin_uses_index": basin_uses_index,
+                    "pg_gin_p50_ms": opt_ms(pg_t2.0),
+                    "pg_scan_p50_ms": opt_ms(pg_t2.1),
+                    "basin_over_pg_gin": ratio(t2_b, pg_t2.0),
+                    "basin_over_pg_scan": ratio(t2_b, pg_t2.1),
+                    "basin_hits": t2_count,
+                    "pg_hits": pg_t2_count,
+                },
+                {
+                    "label": "T3: % filter — common needle (high selectivity)",
+                    "basin_p50_ms": opt_ms(t3_b),
+                    "basin_uses_index": basin_uses_index,
+                    "pg_gin_p50_ms": opt_ms(pg_t3.0),
+                    "pg_scan_p50_ms": opt_ms(pg_t3.1),
+                    "basin_over_pg_gin": ratio(t3_b, pg_t3.0),
+                    "basin_over_pg_scan": ratio(t3_b, pg_t3.1),
+                    "basin_hits": t3_count,
+                    "pg_hits": pg_t3_count,
+                },
+                {
+                    "label": "T4: <-> ORDER BY LIMIT 10 (nearest-name search)",
+                    "basin_p50_ms": opt_ms(t4_b),
+                    "pg_gin_p50_ms": opt_ms(pg_t4.0),
+                    "pg_scan_p50_ms": opt_ms(pg_t4.1),
+                    "basin_over_pg_gin": ratio(t4_b, pg_t4.0),
+                    "basin_over_pg_scan": ratio(t4_b, pg_t4.1),
+                    "basin_rows": t4_rows,
+                },
+                {
+                    "label": "T5: word_similarity <% filter",
+                    "basin_p50_ms": opt_ms(t5_b),
+                    "pg_gin_p50_ms": opt_ms(pg_t5.0),
+                    "pg_scan_p50_ms": opt_ms(pg_t5.1),
+                    "basin_over_pg_gin": ratio(t5_b, pg_t5.0),
+                    "basin_over_pg_scan": ratio(t5_b, pg_t5.1),
+                    "basin_hits": t5_count,
+                },
+                {
+                    "label": "T6: threshold-GUC sweep effect on % (Basin-only)",
+                    "basin_thresh_0_3_p50_ms": opt_ms(t6_lo_b),
+                    "basin_thresh_0_3_hits": t6_lo_count,
+                    "basin_thresh_0_6_p50_ms": opt_ms(t6_hi_b),
+                    "basin_thresh_0_6_hits": t6_hi_count,
+                },
+            ],
+            "note": "Basin builds a gin_trgm_ops trigram GIN index; the % filter shapes \
+                     (T2/T3) are index-backed (per-shape basin_uses_index reflects the \
+                     runtime-probed posting registry). <-> ORDER BY (T4) and <% (T5) stay \
+                     sequential scans on Basin. PG numbers are reported both WITH a \
+                     gin_trgm_ops index and WITHOUT it (sequential scan) so the artifact \
+                     carries the indexed head-to-head AND the apples-to-apples scan \
+                     comparison.",
+        }),
+    );
 
     instance.wal.close().await.unwrap();
 }

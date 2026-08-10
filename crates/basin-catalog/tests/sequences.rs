@@ -294,6 +294,9 @@ async fn advance_sequence_floor_never_regresses() {
 async fn advance_sequence_floor_missing_is_not_found() {
     let cat = InMemoryCatalog::new();
     let t = ProjectId::new();
-    let err = cat.advance_sequence_floor(&t, "missing", 5).await.unwrap_err();
+    let err = cat
+        .advance_sequence_floor(&t, "missing", 5)
+        .await
+        .unwrap_err();
     assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
 }

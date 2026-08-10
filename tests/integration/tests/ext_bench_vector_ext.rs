@@ -37,11 +37,14 @@ use tokio_postgres::SimpleQueryMessage;
 #[path = "compare_postgres_common.rs"]
 mod common;
 
-use common::{build_basin_engine, median, try_connect, SchemaGuard};
 use basin_common::ProjectId;
+use common::{build_basin_engine, median, try_connect, SchemaGuard};
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn write_artifact(file: &str, value: &serde_json::Value) {
@@ -58,7 +61,10 @@ fn write_artifact(file: &str, value: &serde_json::Value) {
     if let Ok(bytes) = serde_json::to_vec_pretty(value) {
         let _ = std::fs::write(&tmp, &bytes);
         let _ = std::fs::rename(&tmp, &path);
-        eprintln!("[ext_bench_vector_ext] artifact written: {}", path.display());
+        eprintln!(
+            "[ext_bench_vector_ext] artifact written: {}",
+            path.display()
+        );
     }
 }
 
@@ -129,10 +135,15 @@ async fn basin_p50(sess: &basin_engine::ProjectSession, sql: &str, n: usize) -> 
 }
 
 async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f64> {
-    let _ = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await;
+    let _ = pg
+        .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+        .await;
     let mut s = Vec::with_capacity(n);
     for _ in 0..n {
-        if let Ok(rs) = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await {
+        if let Ok(rs) = pg
+            .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+            .await
+        {
             for m in &rs {
                 if let SimpleQueryMessage::Row(r) = m {
                     if let Some(line) = r.get(0) {
@@ -149,7 +160,11 @@ async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f6
             }
         }
     }
-    if s.is_empty() { None } else { Some(median(&s)) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(median(&s))
+    }
 }
 
 async fn seed_vectors(sess: &basin_engine::ProjectSession, table: &str, rows: usize, dim: usize) {
@@ -187,7 +202,11 @@ async fn ext_bench_vector_ext() {
     eprintln!("[ext_bench_vector_ext] config: rows={rows} dim={dim} samples={samples}");
 
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
     seed_vectors(&sess, "docs", rows, dim).await;
     instance.shard.flush_to_parquet().await.unwrap();
     if let Some(bg) = instance.bg.take() {
@@ -200,17 +219,28 @@ async fn ext_bench_vector_ext() {
     let ve1_sql = format!("SELECT id FROM docs ORDER BY embedding <=> '{q}' LIMIT {k}");
     let ve2_sql = format!("SELECT id FROM docs ORDER BY embedding <#> '{q}' LIMIT {k}");
     // ~20% selectivity (one of five categories) and ~2% (a rarer literal id band).
-    let ve3_wide_sql =
-        format!("SELECT id FROM docs WHERE category = 'news' ORDER BY embedding <=> '{q}' LIMIT {k}");
+    let ve3_wide_sql = format!(
+        "SELECT id FROM docs WHERE category = 'news' ORDER BY embedding <=> '{q}' LIMIT {k}"
+    );
     let ve3_narrow_sql = format!(
         "SELECT id FROM docs WHERE category = 'news' AND id < {} ORDER BY embedding <=> '{q}' LIMIT {k}",
         rows / 50
     );
 
     let ve1_b = basin_p50(&sess, &ve1_sql, samples).await;
-    let ve1_sup = sess.execute(&ve1_sql).await.map(|r| rows_of(&r)).unwrap_or(0) > 0;
+    let ve1_sup = sess
+        .execute(&ve1_sql)
+        .await
+        .map(|r| rows_of(&r))
+        .unwrap_or(0)
+        > 0;
     let ve2_b = basin_p50(&sess, &ve2_sql, samples).await;
-    let ve2_sup = sess.execute(&ve2_sql).await.map(|r| rows_of(&r)).unwrap_or(0) > 0;
+    let ve2_sup = sess
+        .execute(&ve2_sql)
+        .await
+        .map(|r| rows_of(&r))
+        .unwrap_or(0)
+        > 0;
     let ve3w_b = basin_p50(&sess, &ve3_wide_sql, samples).await;
     let ve3n_b = basin_p50(&sess, &ve3_narrow_sql, samples).await;
 
@@ -234,8 +264,13 @@ async fn ext_bench_vector_ext() {
             pg_available = true;
             let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
             let schema = format!("basin_ext_vecx_{suffix}");
-            let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-            pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.ok();
+            let _guard = SchemaGuard {
+                schema: schema.clone(),
+                conn_str: cs,
+            };
+            pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+                .await
+                .ok();
             pg.simple_query(&format!(
                 "CREATE TABLE {schema}.docs (id BIGINT, category TEXT, embedding vector({dim}))"
             ))
@@ -255,17 +290,33 @@ async fn ext_bench_vector_ext() {
                     let cat = CATEGORIES[kk % CATEGORIES.len()];
                     v.push_str(&format!("({kk}, '{cat}', '{}')", vector_lit(&vec)));
                 }
-                pg.simple_query(&format!("INSERT INTO {schema}.docs VALUES {v}")).await.ok();
+                pg.simple_query(&format!("INSERT INTO {schema}.docs VALUES {v}"))
+                    .await
+                    .ok();
                 off = hi;
             }
-            pg.simple_query(&format!("ANALYZE {schema}.docs")).await.ok();
+            pg.simple_query(&format!("ANALYZE {schema}.docs"))
+                .await
+                .ok();
 
-            pg_ve1 = pg_p50(&pg, &format!("SELECT id FROM {schema}.docs ORDER BY embedding <=> '{q}' LIMIT {k}"), samples).await;
-            pg_ve2 = pg_p50(&pg, &format!("SELECT id FROM {schema}.docs ORDER BY embedding <#> '{q}' LIMIT {k}"), samples).await;
+            pg_ve1 = pg_p50(
+                &pg,
+                &format!("SELECT id FROM {schema}.docs ORDER BY embedding <=> '{q}' LIMIT {k}"),
+                samples,
+            )
+            .await;
+            pg_ve2 = pg_p50(
+                &pg,
+                &format!("SELECT id FROM {schema}.docs ORDER BY embedding <#> '{q}' LIMIT {k}"),
+                samples,
+            )
+            .await;
             pg_ve3w = pg_p50(&pg, &format!("SELECT id FROM {schema}.docs WHERE category = 'news' ORDER BY embedding <=> '{q}' LIMIT {k}"), samples).await;
             pg_ve3n = pg_p50(&pg, &format!("SELECT id FROM {schema}.docs WHERE category = 'news' AND id < {} ORDER BY embedding <=> '{q}' LIMIT {k}", rows / 50), samples).await;
 
-            let _ = pg.simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+            let _ = pg
+                .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                .await;
             std::mem::forget(_guard);
         } else {
             eprintln!("[ext_bench_vector_ext] PG lacks pgvector — Basin-only card");
@@ -274,30 +325,36 @@ async fn ext_bench_vector_ext() {
         eprintln!("[ext_bench_vector_ext] PG unavailable — Basin-only card");
     }
 
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("ext_bench_vector_ext.json", &json!({
-        "card": "ext_bench_vector_ext",
-        "family": "pgvector",
-        "generated_at": format!("@{ts}"),
-        "pg_available": pg_available,
-        "pg_extension_available": pg_available,
-        "config": { "rows": rows, "dim": dim, "samples": samples, "k": k },
-        "shapes": [
-            { "label": "VE1: cosine <=> ORDER BY LIMIT k (normalized-embedding metric)",
-              "basin_supported": ve1_sup, "basin_p50_ms": opt_ms(ve1_b), "pg_p50_ms": opt_ms(pg_ve1),
-              "basin_over_pg": ratio(ve1_b, pg_ve1) },
-            { "label": "VE2: inner-product <#> ORDER BY LIMIT k (dot-product retrieval)",
-              "basin_supported": ve2_sup, "basin_p50_ms": opt_ms(ve2_b), "pg_p50_ms": opt_ms(pg_ve2),
-              "basin_over_pg": ratio(ve2_b, pg_ve2) },
-            { "label": "VE3a: filtered-ANN wide (~20% category=news) cosine kNN",
-              "basin_p50_ms": opt_ms(ve3w_b), "pg_p50_ms": opt_ms(pg_ve3w), "basin_over_pg": ratio(ve3w_b, pg_ve3w) },
-            { "label": "VE3b: filtered-ANN narrow (~2%) cosine kNN — pre/post-filter cliff",
-              "basin_p50_ms": opt_ms(ve3n_b), "pg_p50_ms": opt_ms(pg_ve3n), "basin_over_pg": ratio(ve3n_b, pg_ve3n) },
-        ],
-        "note": "Coverage-expansion card for the pgvector family: cosine (<=>) and \
-                 inner-product (<#>) metrics — the dominant real metric for normalized \
-                 embeddings, which the base L2-only card undercovers — plus a filtered-ANN \
-                 selectivity sweep (the pre/post-filter cliff). The ivfflat-vs-hnsw-vs-brute \
-                 crossover is deferred to a post-merge expansion once the ivfflat feature lands.",
-    }));
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "ext_bench_vector_ext.json",
+        &json!({
+            "card": "ext_bench_vector_ext",
+            "family": "pgvector",
+            "generated_at": format!("@{ts}"),
+            "pg_available": pg_available,
+            "pg_extension_available": pg_available,
+            "config": { "rows": rows, "dim": dim, "samples": samples, "k": k },
+            "shapes": [
+                { "label": "VE1: cosine <=> ORDER BY LIMIT k (normalized-embedding metric)",
+                  "basin_supported": ve1_sup, "basin_p50_ms": opt_ms(ve1_b), "pg_p50_ms": opt_ms(pg_ve1),
+                  "basin_over_pg": ratio(ve1_b, pg_ve1) },
+                { "label": "VE2: inner-product <#> ORDER BY LIMIT k (dot-product retrieval)",
+                  "basin_supported": ve2_sup, "basin_p50_ms": opt_ms(ve2_b), "pg_p50_ms": opt_ms(pg_ve2),
+                  "basin_over_pg": ratio(ve2_b, pg_ve2) },
+                { "label": "VE3a: filtered-ANN wide (~20% category=news) cosine kNN",
+                  "basin_p50_ms": opt_ms(ve3w_b), "pg_p50_ms": opt_ms(pg_ve3w), "basin_over_pg": ratio(ve3w_b, pg_ve3w) },
+                { "label": "VE3b: filtered-ANN narrow (~2%) cosine kNN — pre/post-filter cliff",
+                  "basin_p50_ms": opt_ms(ve3n_b), "pg_p50_ms": opt_ms(pg_ve3n), "basin_over_pg": ratio(ve3n_b, pg_ve3n) },
+            ],
+            "note": "Coverage-expansion card for the pgvector family: cosine (<=>) and \
+                     inner-product (<#>) metrics — the dominant real metric for normalized \
+                     embeddings, which the base L2-only card undercovers — plus a filtered-ANN \
+                     selectivity sweep (the pre/post-filter cliff). The ivfflat-vs-hnsw-vs-brute \
+                     crossover is deferred to a post-merge expansion once the ivfflat feature lands.",
+        }),
+    );
 }

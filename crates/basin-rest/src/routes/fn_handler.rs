@@ -190,7 +190,11 @@ pub(crate) async fn any_fn_handler(
     // dropped — the same rule axum uses for `HeaderValue::to_str` failures.
     let fwd_headers: Vec<(String, String)> = headers
         .iter()
-        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_owned(), s.to_owned())))
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|s| (k.as_str().to_owned(), s.to_owned()))
+        })
         .collect();
 
     let req = InvokeRequest {
@@ -212,7 +216,9 @@ pub(crate) async fn any_fn_handler(
         Err(msg) => {
             tracing::warn!(name = %name, project = %claims.project_id, err = %msg,
                 "function invocation failed");
-            Err(ApiError::internal(format!("function invocation failed: {msg}")))
+            Err(ApiError::internal(format!(
+                "function invocation failed: {msg}"
+            )))
         }
     }
 }
@@ -224,12 +230,15 @@ pub(crate) async fn any_fn_handler(
 /// - Headers with invalid byte sequences are dropped silently — the function
 ///   sent something that doesn't fit HTTP, we don't propagate the breakage.
 fn render_invoke_response(resp: InvokeResponse) -> Response {
-    let status = StatusCode::from_u16(resp.status)
-        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut headers = HeaderMap::with_capacity(resp.headers.len());
     for (k, v) in resp.headers {
-        let Ok(name) = HeaderName::try_from(k.as_str()) else { continue };
-        let Ok(value) = HeaderValue::try_from(v.as_str()) else { continue };
+        let Ok(name) = HeaderName::try_from(k.as_str()) else {
+            continue;
+        };
+        let Ok(value) = HeaderValue::try_from(v.as_str()) else {
+            continue;
+        };
         headers.insert(name, value);
     }
     (status, headers, resp.body).into_response()

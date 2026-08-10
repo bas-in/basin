@@ -239,10 +239,7 @@ mod tests {
         let reg = LockRegistry::new();
         let project = ProjectId::new();
 
-        let h1 = reg.acquire(
-            &project,
-            LockEntry::virtualxid_lock(1, "1/1"),
-        );
+        let h1 = reg.acquire(&project, LockEntry::virtualxid_lock(1, "1/1"));
         let h2 = reg.acquire(
             &project,
             LockEntry::relation_lock(1, 10, 20, "orders", "ExclusiveLock"),

@@ -44,15 +44,13 @@ use basin_cdc::CdcSseState;
 use crate::errors::ApiError;
 use crate::routes::{
     admin as admin_routes, admin_backups as admin_backups_routes,
-    admin_branches as admin_branches_routes,
-    admin_functions as admin_fn_routes,
+    admin_branches as admin_branches_routes, admin_functions as admin_fn_routes,
     admin_projects as admin_projects_routes, auth as auth_routes, data as data_routes,
     fn_handler as fn_handler_routes, inbound as inbound_routes,
     internal_forward as internal_forward_routes,
     internal_partition_forward as internal_partition_forward_routes,
-    internal_tail_drain as internal_tail_drain_routes,
-    openapi as openapi_routes, rpc as rpc_routes,
-    storage as storage_routes, storage_sign as storage_sign_routes,
+    internal_tail_drain as internal_tail_drain_routes, openapi as openapi_routes,
+    rpc as rpc_routes, storage as storage_routes, storage_sign as storage_sign_routes,
 };
 use crate::RestConfig;
 
@@ -203,9 +201,7 @@ impl Inner {
         // P2-1: seed the blob signing secret from the JWT secret. This
         // gives a non-trivial initial key without requiring a new config
         // field. The key is immediately rotatable via the admin endpoint.
-        let blob_signing_secret = Arc::new(BlobSigningSecret::new(
-            cfg.auth.signing_secret(),
-        ));
+        let blob_signing_secret = Arc::new(BlobSigningSecret::new(cfg.auth.signing_secret()));
 
         Self {
             rate_limiter: basin_auth::rate_limit::PerKey::per_minute(rate, "rest_per_project"),
@@ -264,26 +260,22 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
     // state-type gymnastics. The routers are built here (before `inner` is
     // moved into `.with_state(inner)`) so we can borrow from `inner.realtime`.
     #[cfg(feature = "realtime")]
-    let realtime_sse: Option<Router> = inner.realtime.as_ref().map(|rt| {
-        match &rt.replay_rings {
-            Some(rings) => basin_realtime::sse_router_with_rings(
-                rt.registry.clone(),
-                rt.auth.clone(),
-                rings.clone(),
-            ),
-            None => basin_realtime::sse_router(rt.registry.clone(), rt.auth.clone()),
-        }
+    let realtime_sse: Option<Router> = inner.realtime.as_ref().map(|rt| match &rt.replay_rings {
+        Some(rings) => basin_realtime::sse_router_with_rings(
+            rt.registry.clone(),
+            rt.auth.clone(),
+            rings.clone(),
+        ),
+        None => basin_realtime::sse_router(rt.registry.clone(), rt.auth.clone()),
     });
     #[cfg(feature = "realtime")]
-    let realtime_ws: Option<Router> = inner.realtime.as_ref().map(|rt| {
-        match &rt.replay_rings {
-            Some(rings) => basin_realtime::ws_router_with_rings(
-                rt.registry.clone(),
-                rt.auth.clone(),
-                rings.clone(),
-            ),
-            None => basin_realtime::ws_router(rt.registry.clone(), rt.auth.clone()),
-        }
+    let realtime_ws: Option<Router> = inner.realtime.as_ref().map(|rt| match &rt.replay_rings {
+        Some(rings) => basin_realtime::ws_router_with_rings(
+            rt.registry.clone(),
+            rt.auth.clone(),
+            rings.clone(),
+        ),
+        None => basin_realtime::ws_router(rt.registry.clone(), rt.auth.clone()),
     });
 
     // ADR 0028 Phase 1: build the durable CDC SSE sub-router (own State, like
@@ -461,10 +453,7 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
             "/admin/v1/functions/deploy",
             post(admin_fn_routes::deploy_function),
         )
-        .route(
-            "/admin/v1/functions",
-            get(admin_fn_routes::list_functions),
-        )
+        .route("/admin/v1/functions", get(admin_fn_routes::list_functions))
         .route(
             "/admin/v1/functions/:name",
             axum::routing::delete(admin_fn_routes::delete_function),
@@ -498,14 +487,10 @@ pub(crate) fn router(inner: Arc<Inner>) -> Router {
         // TODO 5.17.B-featuregate: wrap in #[cfg(feature = "storage")] once
         //      ADR 0018 adds the `storage` Cargo feature to basin-server.
         //      For now mounted unconditionally alongside the REST + auth routes.
-        .route(
-            "/storage/v1/bucket",
-            post(storage_routes::create_bucket),
-        )
+        .route("/storage/v1/bucket", post(storage_routes::create_bucket))
         .route(
             "/storage/v1/bucket/:name",
-            get(storage_routes::get_bucket)
-                .delete(storage_routes::delete_bucket),
+            get(storage_routes::get_bucket).delete(storage_routes::delete_bucket),
         )
         // Public (no JWT) — must be registered before the wildcard :bucket
         // route so axum's router matches the literal `public` segment first.

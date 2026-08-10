@@ -104,13 +104,19 @@ impl SessionReaperRegistry {
             state: Arc::downgrade(&state),
             reaped: reaped.clone(),
         };
-        self.inner.lock().expect("registry lock poisoned").insert(id, entry);
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .insert(id, entry);
         (id, reaped)
     }
 
     /// Remove a session from the registry (called when the session is dropped).
     pub fn deregister(&self, id: u64) {
-        self.inner.lock().expect("registry lock poisoned").remove(&id);
+        self.inner
+            .lock()
+            .expect("registry lock poisoned")
+            .remove(&id);
     }
 
     /// Run one reaper sweep. For every registered session whose state is still
@@ -194,9 +200,7 @@ impl ReaperHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{
-        set_session_idle_in_transaction_timeout, touch_last_active, tx_begin,
-    };
+    use crate::session::{set_session_idle_in_transaction_timeout, touch_last_active, tx_begin};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;

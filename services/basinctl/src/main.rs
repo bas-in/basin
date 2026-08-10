@@ -5,9 +5,9 @@
 //! string is taken from `--url`, else `BASIN_URL`, else (for `ping`) the
 //! positional argument. See `services/basinctl/README.md` for examples.
 
+mod r#fn;
 mod import;
 mod translate;
-mod r#fn;
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -585,7 +585,9 @@ mod tests {
     fn fn_new_parses() {
         let cli = parse(&["basinctl", "fn", "new", "hello"]);
         match cli.cmd {
-            Cmd::Fn { cmd: r#fn::FnCmd::New { name, lang } } => {
+            Cmd::Fn {
+                cmd: r#fn::FnCmd::New { name, lang },
+            } => {
                 assert_eq!(name, "hello");
                 assert_eq!(lang, "rust");
             }
@@ -598,7 +600,9 @@ mod tests {
         // The --lang flag is free-form; validation is at runtime.
         let cli = parse(&["basinctl", "fn", "new", "hello", "--lang", "js"]);
         match cli.cmd {
-            Cmd::Fn { cmd: r#fn::FnCmd::New { lang, .. } } => {
+            Cmd::Fn {
+                cmd: r#fn::FnCmd::New { lang, .. },
+            } => {
                 assert_eq!(lang, "js");
             }
             other => panic!("expected Fn::New, got {other:?}"),
@@ -609,7 +613,9 @@ mod tests {
     fn fn_build_defaults_to_cwd() {
         let cli = parse(&["basinctl", "fn", "build"]);
         match cli.cmd {
-            Cmd::Fn { cmd: r#fn::FnCmd::Build { path } } => {
+            Cmd::Fn {
+                cmd: r#fn::FnCmd::Build { path },
+            } => {
                 assert_eq!(path, None);
             }
             other => panic!("expected Fn::Build, got {other:?}"),
@@ -620,7 +626,9 @@ mod tests {
     fn fn_build_with_path() {
         let cli = parse(&["basinctl", "fn", "build", "./my_fn"]);
         match cli.cmd {
-            Cmd::Fn { cmd: r#fn::FnCmd::Build { path } } => {
+            Cmd::Fn {
+                cmd: r#fn::FnCmd::Build { path },
+            } => {
                 assert_eq!(path, Some(std::path::PathBuf::from("./my_fn")));
             }
             other => panic!("expected Fn::Build, got {other:?}"),

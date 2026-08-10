@@ -97,11 +97,7 @@ pub trait BlobCatalog: Send + Sync + 'static {
     async fn insert_bucket(&self, project: &ProjectId, bucket: Bucket) -> Result<()>;
 
     /// Retrieve a bucket by name.
-    async fn get_bucket_by_name(
-        &self,
-        project: &ProjectId,
-        name: &str,
-    ) -> Result<Option<Bucket>>;
+    async fn get_bucket_by_name(&self, project: &ProjectId, name: &str) -> Result<Option<Bucket>>;
 
     // --- Object operations ---
 
@@ -140,11 +136,7 @@ pub trait BlobCatalog: Send + Sync + 'static {
     /// from `object_store` (closing the #54 P0 leak where DELETE bucket left
     /// orphaned blobs behind).  Returns an empty `Vec` if the bucket had no
     /// objects; returns [`BlobError::BucketNotFound`] if the bucket is absent.
-    async fn delete_bucket_by_name(
-        &self,
-        project: &ProjectId,
-        name: &str,
-    ) -> Result<Vec<String>>;
+    async fn delete_bucket_by_name(&self, project: &ProjectId, name: &str) -> Result<Vec<String>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -162,11 +154,7 @@ impl BlobCatalog for Arc<dyn BlobCatalog> {
         (**self).insert_bucket(project, bucket).await
     }
 
-    async fn get_bucket_by_name(
-        &self,
-        project: &ProjectId,
-        name: &str,
-    ) -> Result<Option<Bucket>> {
+    async fn get_bucket_by_name(&self, project: &ProjectId, name: &str) -> Result<Option<Bucket>> {
         (**self).get_bucket_by_name(project, name).await
     }
 
@@ -205,11 +193,7 @@ impl BlobCatalog for Arc<dyn BlobCatalog> {
             .await
     }
 
-    async fn delete_bucket_by_name(
-        &self,
-        project: &ProjectId,
-        name: &str,
-    ) -> Result<Vec<String>> {
+    async fn delete_bucket_by_name(&self, project: &ProjectId, name: &str) -> Result<Vec<String>> {
         (**self).delete_bucket_by_name(project, name).await
     }
 }
@@ -252,11 +236,7 @@ impl BlobCatalog for InMemoryBlobCatalog {
         Ok(())
     }
 
-    async fn get_bucket_by_name(
-        &self,
-        project: &ProjectId,
-        name: &str,
-    ) -> Result<Option<Bucket>> {
+    async fn get_bucket_by_name(&self, project: &ProjectId, name: &str) -> Result<Option<Bucket>> {
         let key = (project.to_string(), name.to_string());
         Ok(self.buckets.read().await.get(&key).cloned())
     }
@@ -277,11 +257,7 @@ impl BlobCatalog for InMemoryBlobCatalog {
         bucket_id: BucketId,
         path: &str,
     ) -> Result<Option<Object>> {
-        let key = (
-            project.to_string(),
-            bucket_id.to_string(),
-            path.to_string(),
-        );
+        let key = (project.to_string(), bucket_id.to_string(), path.to_string());
         Ok(self.objects.read().await.get(&key).cloned())
     }
 
@@ -291,11 +267,7 @@ impl BlobCatalog for InMemoryBlobCatalog {
         bucket_id: BucketId,
         path: &str,
     ) -> Result<bool> {
-        let key = (
-            project.to_string(),
-            bucket_id.to_string(),
-            path.to_string(),
-        );
+        let key = (project.to_string(), bucket_id.to_string(), path.to_string());
         Ok(self.objects.write().await.remove(&key).is_some())
     }
 
@@ -322,11 +294,7 @@ impl BlobCatalog for InMemoryBlobCatalog {
         Ok(results)
     }
 
-    async fn delete_bucket_by_name(
-        &self,
-        project: &ProjectId,
-        name: &str,
-    ) -> Result<Vec<String>> {
+    async fn delete_bucket_by_name(&self, project: &ProjectId, name: &str) -> Result<Vec<String>> {
         let project_str = project.to_string();
         // Remove the bucket row first so we can recover its id.
         let bucket = {
@@ -833,10 +801,7 @@ mod tests {
     async fn get_bucket_not_found() {
         let store = make_store();
         let project = ProjectId::new();
-        let err = store
-            .get_bucket(&project, "nonexistent")
-            .await
-            .unwrap_err();
+        let err = store.get_bucket(&project, "nonexistent").await.unwrap_err();
         assert!(matches!(err, BlobError::BucketNotFound(_)));
     }
 
@@ -1138,7 +1103,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(registry.snapshot(&project).unwrap().bytes_written_total, 256);
+        assert_eq!(
+            registry.snapshot(&project).unwrap().bytes_written_total,
+            256
+        );
 
         store
             .delete_object(&project, "b", "file.bin")
@@ -1157,14 +1125,8 @@ mod tests {
         let p1 = ProjectId::new();
         let p2 = ProjectId::new();
 
-        store
-            .create_bucket(&p1, Bucket::new("b"))
-            .await
-            .unwrap();
-        store
-            .create_bucket(&p2, Bucket::new("b"))
-            .await
-            .unwrap();
+        store.create_bucket(&p1, Bucket::new("b")).await.unwrap();
+        store.create_bucket(&p2, Bucket::new("b")).await.unwrap();
 
         store
             .put_object(

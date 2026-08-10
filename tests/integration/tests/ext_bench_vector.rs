@@ -56,7 +56,10 @@ mod common;
 use common::{build_basin_engine, median, try_connect, SchemaGuard};
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn write_artifact(file: &str, value: &serde_json::Value) {
@@ -162,10 +165,15 @@ async fn basin_p50(sess: &basin_engine::ProjectSession, sql: &str, n: usize) -> 
 }
 
 async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f64> {
-    let _ = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await;
+    let _ = pg
+        .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+        .await;
     let mut s = Vec::with_capacity(n);
     for _ in 0..n {
-        if let Ok(rs) = pg.simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}")).await {
+        if let Ok(rs) = pg
+            .simple_query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {inner}"))
+            .await
+        {
             for m in &rs {
                 if let SimpleQueryMessage::Row(r) = m {
                     if let Some(line) = r.get(0) {
@@ -182,7 +190,11 @@ async fn pg_p50(pg: &tokio_postgres::Client, inner: &str, n: usize) -> Option<f6
             }
         }
     }
-    if s.is_empty() { None } else { Some(median(&s)) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(median(&s))
+    }
 }
 
 /// Seed a `vector(dim)` table with `rows` deterministic embeddings + a category
@@ -199,7 +211,9 @@ async fn seed_vectors(
     } else {
         format!("(id BIGINT NOT NULL, embedding vector({dim}))")
     };
-    sess.execute(&format!("CREATE TABLE {table} {cols}")).await.unwrap();
+    sess.execute(&format!("CREATE TABLE {table} {cols}"))
+        .await
+        .unwrap();
 
     // Bigger dims → smaller batch to keep the INSERT statement size sane.
     let batch = if dim >= 1024 { 1_000 } else { 4_000 };
@@ -240,17 +254,28 @@ async fn ext_bench_vector() {
 
     // ── Basin: main 128d table (V1 ingest) ───────────────────────────────────
     let mut instance = build_basin_engine().await;
-    let sess = instance.engine.open_session(instance.project).await.unwrap();
+    let sess = instance
+        .engine
+        .open_session(instance.project)
+        .await
+        .unwrap();
 
     let v1_ingest_s = seed_vectors(&sess, "docs", rows, dim, true).await;
-    let v1_rate = if v1_ingest_s > 0.0 { rows as f64 / v1_ingest_s } else { 0.0 };
+    let v1_rate = if v1_ingest_s > 0.0 {
+        rows as f64 / v1_ingest_s
+    } else {
+        0.0
+    };
 
     // Register the HNSW index BEFORE flush (the flush builds the sidecar).
     let hnsw_ddl_ok = sess
         .execute("CREATE INDEX docs_emb_hnsw ON docs USING hnsw (embedding vector_l2_ops) WITH (m = 16, ef_construction = 64)")
         .await
         .is_ok();
-    eprintln!("[ext_bench_vector] HNSW DDL: {}", if hnsw_ddl_ok { "ok" } else { "rejected" });
+    eprintln!(
+        "[ext_bench_vector] HNSW DDL: {}",
+        if hnsw_ddl_ok { "ok" } else { "rejected" }
+    );
 
     // V4: HNSW build time == the flush that constructs the sidecar.
     let build_start = Instant::now();
@@ -259,14 +284,17 @@ async fn ext_bench_vector() {
     if let Some(bg) = instance.bg.take() {
         bg.shutdown().await;
     }
-    eprintln!("[ext_bench_vector] V1 ingest {v1_rate:.0} rows/s; HNSW/flush build {hnsw_build_s:.2}s");
+    eprintln!(
+        "[ext_bench_vector] V1 ingest {v1_rate:.0} rows/s; HNSW/flush build {hnsw_build_s:.2}s"
+    );
 
     let table = TableName::new("docs").unwrap();
     let query = det_vec(424_242, dim);
     let qlit = vector_lit(&query);
 
     // ── V3: brute-force <-> ORDER BY LIMIT 10 ─────────────────────────────────
-    let brute_sql = format!("SELECT id FROM docs ORDER BY l2_distance(embedding, '{qlit}') LIMIT {k}");
+    let brute_sql =
+        format!("SELECT id FROM docs ORDER BY l2_distance(embedding, '{qlit}') LIMIT {k}");
     let v3_brute = basin_p50(&sess, &brute_sql, samples).await;
     let brute_ids: Vec<i64> = {
         let res = sess.execute(&brute_sql).await.expect("basin brute knn");
@@ -278,18 +306,24 @@ async fn ext_bench_vector() {
     let mut hnsw_ids: Vec<i64> = Vec::new();
     {
         // warm
-        let _ = sess.vector_search(&table, "embedding", query.clone(), k, Distance::L2).await;
+        let _ = sess
+            .vector_search(&table, "embedding", query.clone(), k, Distance::L2)
+            .await;
         let mut s = Vec::with_capacity(samples);
         let mut ok = true;
         for _ in 0..samples {
             let t = Instant::now();
-            match sess.vector_search(&table, "embedding", query.clone(), k, Distance::L2).await {
+            match sess
+                .vector_search(&table, "embedding", query.clone(), k, Distance::L2)
+                .await
+            {
                 Ok(batches) => {
                     s.push(t.elapsed().as_secs_f64() * 1000.0);
                     if hnsw_ids.is_empty() {
                         for b in &batches {
                             if let Ok(idx) = b.schema().index_of("id") {
-                                if let Some(a) = b.column(idx).as_any().downcast_ref::<Int64Array>() {
+                                if let Some(a) = b.column(idx).as_any().downcast_ref::<Int64Array>()
+                                {
                                     for i in 0..a.len() {
                                         hnsw_ids.push(a.value(i));
                                     }
@@ -331,7 +365,11 @@ async fn ext_bench_vector() {
         "SELECT id FROM docs WHERE category = 'news' ORDER BY l2_distance(embedding, '{qlit}') LIMIT {k}"
     );
     let v6 = basin_p50(&sess, &v6_sql, samples).await;
-    let v6_rows = sess.execute(&v6_sql).await.map(|r| rows_of(&r)).unwrap_or(0);
+    let v6_rows = sess
+        .execute(&v6_sql)
+        .await
+        .map(|r| rows_of(&r))
+        .unwrap_or(0);
 
     // ── V7: distance-threshold WHERE ──────────────────────────────────────────
     let v7_sql = format!("SELECT count(*) FROM docs WHERE l2_distance(embedding, '{qlit}') < 5.0");
@@ -345,13 +383,19 @@ async fn ext_bench_vector() {
         let mut big = build_basin_engine().await;
         let bsess = big.engine.open_session(big.project).await.unwrap();
         let v2_ingest_s = seed_vectors(&bsess, "big", bigdim_rows, bigdim, false).await;
-        v2_rate = if v2_ingest_s > 0.0 { bigdim_rows as f64 / v2_ingest_s } else { 0.0 };
+        v2_rate = if v2_ingest_s > 0.0 {
+            bigdim_rows as f64 / v2_ingest_s
+        } else {
+            0.0
+        };
         big.shard.flush_to_parquet().await.unwrap();
         if let Some(bg) = big.bg.take() {
             bg.shutdown().await;
         }
         big.wal.close().await.unwrap();
-        eprintln!("[ext_bench_vector] V2 big-dim ingest {v2_rate:.0} rows/s ({bigdim}d x {bigdim_rows})");
+        eprintln!(
+            "[ext_bench_vector] V2 big-dim ingest {v2_rate:.0} rows/s ({bigdim}d x {bigdim_rows})"
+        );
     }
 
     // ── PG twin (pgvector hnsw) ───────────────────────────────────────────────
@@ -365,12 +409,25 @@ async fn ext_bench_vector() {
         pg_available = true;
         let suffix = ProjectId::new().as_ulid().to_string().to_lowercase();
         let schema = format!("basin_ext_vec_{suffix}");
-        let _guard = SchemaGuard { schema: schema.clone(), conn_str: cs };
-        pg.simple_query(&format!("CREATE SCHEMA {schema}")).await.ok();
-        pg.simple_query("SET maintenance_work_mem = '256MB'").await.ok();
+        let _guard = SchemaGuard {
+            schema: schema.clone(),
+            conn_str: cs,
+        };
+        pg.simple_query(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .ok();
+        pg.simple_query("SET maintenance_work_mem = '256MB'")
+            .await
+            .ok();
 
-        pg_ext_ok = pg.simple_query("CREATE EXTENSION IF NOT EXISTS vector").await.is_ok();
-        eprintln!("[ext_bench_vector] PG pgvector: {}", if pg_ext_ok { "ok" } else { "UNAVAILABLE" });
+        pg_ext_ok = pg
+            .simple_query("CREATE EXTENSION IF NOT EXISTS vector")
+            .await
+            .is_ok();
+        eprintln!(
+            "[ext_bench_vector] PG pgvector: {}",
+            if pg_ext_ok { "ok" } else { "UNAVAILABLE" }
+        );
 
         if pg_ext_ok {
             pg.simple_query(&format!(
@@ -396,74 +453,96 @@ async fn ext_bench_vector() {
                 off = hi;
             }
             let pg_s = pgstart.elapsed().as_secs_f64();
-            pg_ingest_rate = if pg_s > 0.0 { Some(rows as f64 / pg_s) } else { None };
+            pg_ingest_rate = if pg_s > 0.0 {
+                Some(rows as f64 / pg_s)
+            } else {
+                None
+            };
 
             let bstart = Instant::now();
             pg.simple_query(&format!(
                 "CREATE INDEX docs_emb_hnsw ON {schema}.docs USING hnsw (embedding vector_l2_ops) WITH (m = 16, ef_construction = 64)"
             )).await.expect("pg hnsw build");
             pg_hnsw_build_s = Some(bstart.elapsed().as_secs_f64());
-            pg.simple_query(&format!("ANALYZE {schema}.docs")).await.ok();
+            pg.simple_query(&format!("ANALYZE {schema}.docs"))
+                .await
+                .ok();
 
-            pg_v3 = pg_p50(&pg, &format!(
-                "SELECT id FROM {schema}.docs ORDER BY embedding <-> '{qlit}' LIMIT {k}"), samples).await;
+            pg_v3 = pg_p50(
+                &pg,
+                &format!("SELECT id FROM {schema}.docs ORDER BY embedding <-> '{qlit}' LIMIT {k}"),
+                samples,
+            )
+            .await;
             // V5 = same shape but the index is active; pgvector serves <-> via hnsw.
             pg_v5 = pg_v3;
             pg_v6 = pg_p50(&pg, &format!(
                 "SELECT id FROM {schema}.docs WHERE category = 'news' ORDER BY embedding <-> '{qlit}' LIMIT {k}"), samples).await;
-            pg_v7 = pg_p50(&pg, &format!(
-                "SELECT count(*) FROM {schema}.docs WHERE embedding <-> '{qlit}' < 5.0"), samples).await;
+            pg_v7 = pg_p50(
+                &pg,
+                &format!("SELECT count(*) FROM {schema}.docs WHERE embedding <-> '{qlit}' < 5.0"),
+                samples,
+            )
+            .await;
         }
 
-        let _ = pg.simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
+        let _ = pg
+            .simple_query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .await;
         std::mem::forget(_guard);
     } else {
         eprintln!("[ext_bench_vector] PG unavailable — Basin-only card");
     }
 
     // ── Emit artifact ────────────────────────────────────────────────────────
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    write_artifact("ext_bench_vector.json", &json!({
-        "card": "ext_bench_vector",
-        "family": "pgvector",
-        "generated_at": format!("@{ts}"),
-        "pg_available": pg_available,
-        "pg_extension_available": pg_ext_ok,
-        "basin_hnsw_ddl_ok": hnsw_ddl_ok,
-        "config": {
-            "rows": rows, "dim": dim, "bigdim": bigdim, "bigdim_rows": bigdim_rows,
-            "samples": samples, "k": k, "hnsw_m": 16, "hnsw_ef_construction": 64,
-        },
-        "ingest": [
-            { "label": "V1: ingest 100k x 128d (rows/s)", "basin_rows_per_s": v1_rate, "pg_rows_per_s": pg_ingest_rate },
-            { "label": "V2: ingest 1536d (rows/s, OpenAI width)", "basin_rows_per_s": v2_rate, "pg_rows_per_s": serde_json::Value::Null },
-        ],
-        "build": {
-            "label": "V4: HNSW build time (s, 128d)",
-            "basin_build_s": hnsw_build_s,
-            "pg_build_s": pg_hnsw_build_s,
-        },
-        "correctness": {
-            "label": "recall@10 (HNSW vs brute-force, same data)",
-            "basin_recall_at_10": if recall_at_10.is_finite() { json!(recall_at_10) } else { serde_json::Value::Null },
-            "brute_ids": brute_ids,
-            "hnsw_ids": hnsw_ids,
-        },
-        "shapes": [
-            { "label": "V3: brute-force <-> ORDER BY LIMIT 10", "basin_p50_ms": opt_ms(v3_brute),
-              "pg_p50_ms": opt_ms(pg_v3), "basin_over_pg": ratio(v3_brute, pg_v3) },
-            { "label": "V5: HNSW-backed kNN latency (LIMIT 10)", "basin_p50_ms": opt_ms(v5_hnsw),
-              "pg_p50_ms": opt_ms(pg_v5), "basin_over_pg": ratio(v5_hnsw, pg_v5),
-              "basin_uses_hnsw": hnsw_ddl_ok && v5_hnsw.is_some(), "pg_uses_hnsw": pg_ext_ok },
-            { "label": "V6: filtered kNN (WHERE category= AND ORDER BY <->)", "basin_p50_ms": opt_ms(v6),
-              "pg_p50_ms": opt_ms(pg_v6), "basin_over_pg": ratio(v6, pg_v6), "basin_rows": v6_rows },
-            { "label": "V7: distance-threshold WHERE (l2_distance < r)", "basin_p50_ms": opt_ms(v7),
-              "pg_p50_ms": opt_ms(pg_v7), "basin_over_pg": ratio(v7, pg_v7) },
-        ],
-        "note": "recall@10 is a correctness metric — HNSW top-10 vs brute-force top-10 on \
-                 identical data. Basin HNSW build time is measured as the flush that \
-                 constructs the sidecar (the real deployment hook). V5 uses the \
-                 programmatic vector_search HNSW path; V3 is the brute-force SQL <-> scan. \
-                 PG numbers (when pgvector is installable) use a vector_l2_ops hnsw index.",
-    }));
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_artifact(
+        "ext_bench_vector.json",
+        &json!({
+            "card": "ext_bench_vector",
+            "family": "pgvector",
+            "generated_at": format!("@{ts}"),
+            "pg_available": pg_available,
+            "pg_extension_available": pg_ext_ok,
+            "basin_hnsw_ddl_ok": hnsw_ddl_ok,
+            "config": {
+                "rows": rows, "dim": dim, "bigdim": bigdim, "bigdim_rows": bigdim_rows,
+                "samples": samples, "k": k, "hnsw_m": 16, "hnsw_ef_construction": 64,
+            },
+            "ingest": [
+                { "label": "V1: ingest 100k x 128d (rows/s)", "basin_rows_per_s": v1_rate, "pg_rows_per_s": pg_ingest_rate },
+                { "label": "V2: ingest 1536d (rows/s, OpenAI width)", "basin_rows_per_s": v2_rate, "pg_rows_per_s": serde_json::Value::Null },
+            ],
+            "build": {
+                "label": "V4: HNSW build time (s, 128d)",
+                "basin_build_s": hnsw_build_s,
+                "pg_build_s": pg_hnsw_build_s,
+            },
+            "correctness": {
+                "label": "recall@10 (HNSW vs brute-force, same data)",
+                "basin_recall_at_10": if recall_at_10.is_finite() { json!(recall_at_10) } else { serde_json::Value::Null },
+                "brute_ids": brute_ids,
+                "hnsw_ids": hnsw_ids,
+            },
+            "shapes": [
+                { "label": "V3: brute-force <-> ORDER BY LIMIT 10", "basin_p50_ms": opt_ms(v3_brute),
+                  "pg_p50_ms": opt_ms(pg_v3), "basin_over_pg": ratio(v3_brute, pg_v3) },
+                { "label": "V5: HNSW-backed kNN latency (LIMIT 10)", "basin_p50_ms": opt_ms(v5_hnsw),
+                  "pg_p50_ms": opt_ms(pg_v5), "basin_over_pg": ratio(v5_hnsw, pg_v5),
+                  "basin_uses_hnsw": hnsw_ddl_ok && v5_hnsw.is_some(), "pg_uses_hnsw": pg_ext_ok },
+                { "label": "V6: filtered kNN (WHERE category= AND ORDER BY <->)", "basin_p50_ms": opt_ms(v6),
+                  "pg_p50_ms": opt_ms(pg_v6), "basin_over_pg": ratio(v6, pg_v6), "basin_rows": v6_rows },
+                { "label": "V7: distance-threshold WHERE (l2_distance < r)", "basin_p50_ms": opt_ms(v7),
+                  "pg_p50_ms": opt_ms(pg_v7), "basin_over_pg": ratio(v7, pg_v7) },
+            ],
+            "note": "recall@10 is a correctness metric — HNSW top-10 vs brute-force top-10 on \
+                     identical data. Basin HNSW build time is measured as the flush that \
+                     constructs the sidecar (the real deployment hook). V5 uses the \
+                     programmatic vector_search HNSW path; V3 is the brute-force SQL <-> scan. \
+                     PG numbers (when pgvector is installable) use a vector_l2_ops hnsw index.",
+        }),
+    );
 }

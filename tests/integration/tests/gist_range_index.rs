@@ -59,7 +59,11 @@ fn make_engine() -> (Engine, TempDir) {
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let catalog: Arc<dyn basin_catalog::Catalog> = Arc::new(InMemoryCatalog::new());
-    let engine = Engine::new(EngineConfig { storage, catalog, shard: None });
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    });
     (engine, dir)
 }
 
@@ -120,17 +124,26 @@ fn overlaps(a: (i64, i64), b: (i64, i64)) -> bool {
 
 /// Brute-force expected id set for `r && [lo,hi)`.
 fn expect_overlaps(rows: &[Row], q: (i64, i64)) -> Vec<i64> {
-    rows.iter().filter(|r| overlaps((r.lo, r.hi), q)).map(|r| r.id).collect()
+    rows.iter()
+        .filter(|r| overlaps((r.lo, r.hi), q))
+        .map(|r| r.id)
+        .collect()
 }
 
 /// Brute-force expected id set for `r @> point`.
 fn expect_contains_elem(rows: &[Row], p: i64) -> Vec<i64> {
-    rows.iter().filter(|r| r.lo <= p && p < r.hi).map(|r| r.id).collect()
+    rows.iter()
+        .filter(|r| r.lo <= p && p < r.hi)
+        .map(|r| r.id)
+        .collect()
 }
 
 /// Brute-force expected id set for `r <@ [lo,hi)` (row range contained by literal).
 fn expect_contained_by(rows: &[Row], q: (i64, i64)) -> Vec<i64> {
-    rows.iter().filter(|r| q.0 <= r.lo && r.hi <= q.1).map(|r| r.id).collect()
+    rows.iter()
+        .filter(|r| q.0 <= r.lo && r.hi <= q.1)
+        .map(|r| r.id)
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -145,7 +158,10 @@ async fn make_slots(sess: &basin_engine::ProjectSession, rows: &[Row]) {
     for r in rows {
         exec_ok(
             sess,
-            &format!("INSERT INTO slots (id, r) VALUES ({}, '[{},{})')", r.id, r.lo, r.hi),
+            &format!(
+                "INSERT INTO slots (id, r) VALUES ({}, '[{},{})')",
+                r.id, r.lo, r.hi
+            ),
         )
         .await;
     }
@@ -153,12 +169,36 @@ async fn make_slots(sess: &basin_engine::ProjectSession, rows: &[Row]) {
 
 fn sample_rows() -> Vec<Row> {
     vec![
-        Row { id: 1, lo: 0, hi: 10 },
-        Row { id: 2, lo: 20, hi: 30 },
-        Row { id: 3, lo: 40, hi: 50 },
-        Row { id: 4, lo: 5, hi: 25 },  // overlaps 1 and 2
-        Row { id: 5, lo: 100, hi: 200 },
-        Row { id: 6, lo: 45, hi: 60 }, // overlaps 3
+        Row {
+            id: 1,
+            lo: 0,
+            hi: 10,
+        },
+        Row {
+            id: 2,
+            lo: 20,
+            hi: 30,
+        },
+        Row {
+            id: 3,
+            lo: 40,
+            hi: 50,
+        },
+        Row {
+            id: 4,
+            lo: 5,
+            hi: 25,
+        }, // overlaps 1 and 2
+        Row {
+            id: 5,
+            lo: 100,
+            hi: 200,
+        },
+        Row {
+            id: 6,
+            lo: 45,
+            hi: 60,
+        }, // overlaps 3
     ]
 }
 
@@ -174,7 +214,11 @@ async fn differential_overlaps_narrow_wide_empty() {
     let q = (22, 23);
     assert_eq!(
         ids(&sess, "SELECT id FROM slots WHERE r && '[22,23)'").await,
-        { let mut e = expect_overlaps(&rows, q); e.sort_unstable(); e },
+        {
+            let mut e = expect_overlaps(&rows, q);
+            e.sort_unstable();
+            e
+        },
         "&& narrow [22,23) must equal brute-force scan",
     );
 
@@ -182,7 +226,11 @@ async fn differential_overlaps_narrow_wide_empty() {
     let q = (0, 1000);
     assert_eq!(
         ids(&sess, "SELECT id FROM slots WHERE r && '[0,1000)'").await,
-        { let mut e = expect_overlaps(&rows, q); e.sort_unstable(); e },
+        {
+            let mut e = expect_overlaps(&rows, q);
+            e.sort_unstable();
+            e
+        },
         "&& wide [0,1000) must equal brute-force scan (all rows)",
     );
 
@@ -215,7 +263,11 @@ async fn differential_contains_elem() {
     make_slots(&sess, &rows).await;
 
     for p in [5i64, 9, 10, 25, 45, 199, 200, 75] {
-        let expect = { let mut e = expect_contains_elem(&rows, p); e.sort_unstable(); e };
+        let expect = {
+            let mut e = expect_contains_elem(&rows, p);
+            e.sort_unstable();
+            e
+        };
         // `r @> <int>` element containment.
         let got = ids(&sess, &format!("SELECT id FROM slots WHERE r @> {p}")).await;
         assert_eq!(got, expect, "@> {p} must equal brute-force scan");
@@ -233,13 +285,21 @@ async fn differential_contained_by() {
     make_slots(&sess, &rows).await;
 
     for q in [(0i64, 35i64), (0, 1000), (0, 5), (40, 60)] {
-        let expect = { let mut e = expect_contained_by(&rows, q); e.sort_unstable(); e };
+        let expect = {
+            let mut e = expect_contained_by(&rows, q);
+            e.sort_unstable();
+            e
+        };
         let got = ids(
             &sess,
             &format!("SELECT id FROM slots WHERE r <@ '[{},{})'", q.0, q.1),
         )
         .await;
-        assert_eq!(got, expect, "<@ [{},{}) must equal brute-force scan", q.0, q.1);
+        assert_eq!(
+            got, expect,
+            "<@ [{},{}) must equal brute-force scan",
+            q.0, q.1
+        );
     }
 
     println!("[gist diff] <@ contained-by narrow/wide == scan ✓");
@@ -302,7 +362,11 @@ async fn differential_overlay_decline_still_correct() {
     make_slots(&sess, &rows).await;
 
     let q = (22, 23);
-    let expect = { let mut e = expect_overlaps(&rows, q); e.sort_unstable(); e };
+    let expect = {
+        let mut e = expect_overlaps(&rows, q);
+        e.sort_unstable();
+        e
+    };
 
     // Outside any tx: the probe MAY engage; result equals the brute-force scan.
     assert_eq!(
@@ -380,20 +444,32 @@ fn engagement_empty_vs_candidates() {
 
     // Point in a gap → Empty (decisive prune of every file).
     assert!(
-        matches!(reg.probe_contains_point(&proj, &tbl, "r", 15.0), ProbeResult::Empty),
+        matches!(
+            reg.probe_contains_point(&proj, &tbl, "r", 15.0),
+            ProbeResult::Empty
+        ),
         "point 15 in gap must short-circuit Empty",
     );
     // Point inside f1 → only f1 is a candidate.
     match reg.probe_contains_point(&proj, &tbl, "r", 5.0) {
         ProbeResult::FileCandidates(files) => {
-            assert!(files.contains("f1.parquet"), "f1 must be a candidate: {files:?}");
-            assert!(!files.contains("f2.parquet"), "f2 must be pruned: {files:?}");
+            assert!(
+                files.contains("f1.parquet"),
+                "f1 must be a candidate: {files:?}"
+            );
+            assert!(
+                !files.contains("f2.parquet"),
+                "f2 must be pruned: {files:?}"
+            );
         }
         other => panic!("expected FileCandidates, got {other:?}"),
     }
     // Overlap probe over the gap [12,18) → Empty.
     assert!(
-        matches!(reg.probe_overlaps(&proj, &tbl, "r", &iv(12.0, 18.0)), ProbeResult::Empty),
+        matches!(
+            reg.probe_overlaps(&proj, &tbl, "r", &iv(12.0, 18.0)),
+            ProbeResult::Empty
+        ),
         "overlap [12,18) in gap must short-circuit Empty",
     );
 
@@ -421,13 +497,19 @@ fn engagement_compaction_remove_file() {
     // f1 must no longer be a candidate, and is no longer "covered".
     match reg.probe_contains_point(&proj, &tbl, "r", 7.0) {
         ProbeResult::FileCandidates(files) => {
-            assert!(!files.contains("f1.parquet"), "f1 must be gone after compaction: {files:?}");
+            assert!(
+                !files.contains("f1.parquet"),
+                "f1 must be gone after compaction: {files:?}"
+            );
             assert!(files.contains("f2.parquet"), "f2 still holds 7: {files:?}");
         }
         other => panic!("expected FileCandidates, got {other:?}"),
     }
     let covered = reg.indexed_files_for(&proj, &tbl, "r");
-    assert!(!covered.contains("f1.parquet"), "removed file must drop from completeness set");
+    assert!(
+        !covered.contains("f1.parquet"),
+        "removed file must drop from completeness set"
+    );
     assert!(covered.contains("f2.parquet"));
 
     println!("[gist engage] compaction remove_file prunes + uncovers ✓");
@@ -463,7 +545,10 @@ fn engagement_post_flush_superset_sound() {
         ProbeResult::FileCandidates(files) => {
             // Superset soundness: every true-overlap file is a candidate.
             for f in &expect_files {
-                assert!(files.contains(f), "candidate set missing true-overlap file {f}");
+                assert!(
+                    files.contains(f),
+                    "candidate set missing true-overlap file {f}"
+                );
             }
         }
         ProbeResult::Empty => assert!(expect_files.is_empty(), "Empty but model had overlaps"),
@@ -485,14 +570,20 @@ fn engagement_budget_degrade_to_scan() {
 
     // Probe before any insert → NoIndex (full scan).
     assert!(
-        matches!(reg.probe_contains_point(&proj, &tbl, "r", 5.0), ProbeResult::NoIndex),
+        matches!(
+            reg.probe_contains_point(&proj, &tbl, "r", 5.0),
+            ProbeResult::NoIndex
+        ),
         "un-indexed column must read NoIndex",
     );
 
     reg.index_row(&proj, &tbl, "r", "[0,10)", "f1.parquet", 0);
     reg.mark_file_indexed(&proj, &tbl, "r", "f1.parquet");
     assert!(
-        matches!(reg.probe_contains_point(&proj, &tbl, "r", 5.0), ProbeResult::FileCandidates(_)),
+        matches!(
+            reg.probe_contains_point(&proj, &tbl, "r", 5.0),
+            ProbeResult::FileCandidates(_)
+        ),
         "after index, point 5 must be a candidate",
     );
 
@@ -522,7 +613,10 @@ fn engagement_budget_degrade_to_scan() {
 fn engagement_empty_and_infinite_ranges_skipped() {
     // Empty range → no interval.
     let empty = RangeValue::from_pg_text("empty").unwrap();
-    assert!(IndexInterval::from_range(&empty).is_none(), "empty range must not index");
+    assert!(
+        IndexInterval::from_range(&empty).is_none(),
+        "empty range must not index"
+    );
 
     // Degenerate [5,5) → empty → no interval.
     let degenerate = RangeValue::from_pg_text("[5,5)").unwrap();

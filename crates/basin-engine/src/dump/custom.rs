@@ -160,8 +160,12 @@ pub(crate) async fn dump(
     let ts_unix = Utc::now().timestamp();
 
     let mut flags = 0u8;
-    if opts.schema { flags |= FLAG_HAS_SCHEMA; }
-    if opts.data { flags |= FLAG_HAS_DATA; }
+    if opts.schema {
+        flags |= FLAG_HAS_SCHEMA;
+    }
+    if opts.data {
+        flags |= FLAG_HAS_DATA;
+    }
 
     let mut header = [0u8; HEADER_SIZE];
     let mut w = io::Cursor::new(&mut header[..]);
@@ -295,8 +299,7 @@ pub(crate) async fn restore(
         let ddl_len = u64::from_be_bytes(archive[pos + 8..pos + 16].try_into().unwrap()) as usize;
         let data_offset =
             u64::from_be_bytes(archive[pos + 16..pos + 24].try_into().unwrap()) as usize;
-        let data_len =
-            u64::from_be_bytes(archive[pos + 24..pos + 32].try_into().unwrap()) as usize;
+        let data_len = u64::from_be_bytes(archive[pos + 24..pos + 32].try_into().unwrap()) as usize;
         pos += 32;
 
         entries.push(TocEntry {
@@ -368,10 +371,10 @@ pub(crate) async fn restore(
 
 /// Emit a `CREATE TABLE` SQL statement into `out`.
 fn emit_create_table_sql(out: &mut String, meta: &TableMetadata) {
-    use std::fmt::Write;
     use crate::types::{
         BASIN_COLUMN_DEFAULT, BASIN_GENERATED_AS, BASIN_IDENTITY, BASIN_IDENTITY_ALWAYS,
     };
+    use std::fmt::Write;
 
     let tname = quote_ident(meta.table.as_str());
     writeln!(out, "CREATE TABLE {tname} (").unwrap();
@@ -482,8 +485,8 @@ fn plain_inserts(
     // Since we can't call plain::emit_inserts (it's not pub), we replicate
     // the minimal logic here using the shared cell encoder from plain.
 
-    use std::fmt::Write as FmtWrite;
     use crate::types::{BASIN_TYPE_JSONB, BASIN_TYPE_KEY, BASIN_TYPE_UUID};
+    use std::fmt::Write as FmtWrite;
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     if total_rows == 0 {
@@ -518,11 +521,21 @@ fn plain_inserts(
                 // Use the encode_cell function from plain module via a pub(crate) re-export.
                 // Since encode_cell is not pub, we inline a call via the plain module's
                 // encode_cell through a thin wrapper.
-                let val = encode_cell_wrapper(col.as_ref(), r, field.as_ref(), jsonb_cols[c], uuid_cols[c]);
+                let val = encode_cell_wrapper(
+                    col.as_ref(),
+                    r,
+                    field.as_ref(),
+                    jsonb_cols[c],
+                    uuid_cols[c],
+                );
                 row_vals.push(val);
             }
-            writeln!(out, "INSERT INTO {tname} ({cols_str}) VALUES ({});", row_vals.join(", "))
-                .unwrap();
+            writeln!(
+                out,
+                "INSERT INTO {tname} ({cols_str}) VALUES ({});",
+                row_vals.join(", ")
+            )
+            .unwrap();
         }
     }
     writeln!(out).unwrap();
@@ -559,7 +572,11 @@ fn encode_cell_wrapper(
 
     match col.data_type() {
         DataType::Boolean => {
-            if col.as_boolean().value(idx) { "TRUE".to_string() } else { "FALSE".to_string() }
+            if col.as_boolean().value(idx) {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
         }
         DataType::Int8 => format!("{}", col.as_primitive::<Int8Type>().value(idx)),
         DataType::Int16 => format!("{}", col.as_primitive::<Int16Type>().value(idx)),
@@ -641,7 +658,10 @@ fn encode_cell_wrapper(
                 TimeUnit::Microsecond => raw,
                 TimeUnit::Nanosecond => raw / 1_000,
             };
-            let dt = Utc.timestamp_micros(unix_micros).single().unwrap_or_default();
+            let dt = Utc
+                .timestamp_micros(unix_micros)
+                .single()
+                .unwrap_or_default();
             if tz.is_some() {
                 format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S%.6f+00"))
             } else {
@@ -675,10 +695,20 @@ fn encode_cell_wrapper(
                 .downcast_ref::<arrow_array::ListArray>()
                 .expect("ListArray");
             let elem_arr = list_arr.value(idx);
-            let is_j = elem_field.metadata().get(crate::types::BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(crate::types::BASIN_TYPE_JSONB);
-            let is_u = elem_field.metadata().get(crate::types::BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(crate::types::BASIN_TYPE_UUID);
+            let is_j = elem_field
+                .metadata()
+                .get(crate::types::BASIN_TYPE_KEY)
+                .map(|s| s.as_str())
+                == Some(crate::types::BASIN_TYPE_JSONB);
+            let is_u = elem_field
+                .metadata()
+                .get(crate::types::BASIN_TYPE_KEY)
+                .map(|s| s.as_str())
+                == Some(crate::types::BASIN_TYPE_UUID);
             let n = elem_arr.len();
-            let parts: Vec<String> = (0..n).map(|i| encode_cell_wrapper(elem_arr.as_ref(), i, elem_field.as_ref(), is_j, is_u)).collect();
+            let parts: Vec<String> = (0..n)
+                .map(|i| encode_cell_wrapper(elem_arr.as_ref(), i, elem_field.as_ref(), is_j, is_u))
+                .collect();
             format!("ARRAY[{}]", parts.join(", "))
         }
         DataType::LargeList(elem_field) => {
@@ -687,10 +717,20 @@ fn encode_cell_wrapper(
                 .downcast_ref::<arrow_array::LargeListArray>()
                 .expect("LargeListArray");
             let elem_arr = list_arr.value(idx);
-            let is_j = elem_field.metadata().get(crate::types::BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(crate::types::BASIN_TYPE_JSONB);
-            let is_u = elem_field.metadata().get(crate::types::BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(crate::types::BASIN_TYPE_UUID);
+            let is_j = elem_field
+                .metadata()
+                .get(crate::types::BASIN_TYPE_KEY)
+                .map(|s| s.as_str())
+                == Some(crate::types::BASIN_TYPE_JSONB);
+            let is_u = elem_field
+                .metadata()
+                .get(crate::types::BASIN_TYPE_KEY)
+                .map(|s| s.as_str())
+                == Some(crate::types::BASIN_TYPE_UUID);
             let n = elem_arr.len();
-            let parts: Vec<String> = (0..n).map(|i| encode_cell_wrapper(elem_arr.as_ref(), i, elem_field.as_ref(), is_j, is_u)).collect();
+            let parts: Vec<String> = (0..n)
+                .map(|i| encode_cell_wrapper(elem_arr.as_ref(), i, elem_field.as_ref(), is_j, is_u))
+                .collect();
             format!("ARRAY[{}]", parts.join(", "))
         }
         _ => {

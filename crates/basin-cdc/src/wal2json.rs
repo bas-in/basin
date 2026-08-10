@@ -179,7 +179,11 @@ pub fn encode_change(rec: &CdcRecord) -> Wal2JsonChange {
     let (columnnames, columntypes, columnvalues) = if rec.op == 3 {
         (Vec::new(), Vec::new(), Vec::new())
     } else {
-        (after_cols.columnnames, after_cols.columntypes, after_cols.columnvalues)
+        (
+            after_cols.columnnames,
+            after_cols.columntypes,
+            after_cols.columnvalues,
+        )
     };
 
     Wal2JsonChange {
@@ -381,7 +385,10 @@ mod tests {
         let v = serde_json::to_value(encode_change(&r)).unwrap();
         assert_eq!(v["kind"], "delete");
         // No new image for a delete.
-        assert!(v.get("columnnames").is_none(), "delete has no column arrays");
+        assert!(
+            v.get("columnnames").is_none(),
+            "delete has no column arrays"
+        );
         assert!(v.get("columnvalues").is_none());
         // Identity in oldkeys.
         assert_eq!(v["oldkeys"]["keyvalues"], json!([1, "alice"]));
@@ -423,25 +430,18 @@ mod tests {
     #[test]
     fn v2_row_actions_and_identity() {
         // INSERT → action I, columns, no identity.
-        let ins = serde_json::to_value(Wal2JsonTxn::row(&rec(
-            1,
-            1,
-            None,
-            Some(json!({"id": 7})),
-        )))
-        .unwrap();
+        let ins = serde_json::to_value(Wal2JsonTxn::row(&rec(1, 1, None, Some(json!({"id": 7})))))
+            .unwrap();
         assert_eq!(ins["action"], "I");
-        assert_eq!(ins["columns"], json!([{"name":"id","type":"numeric","value":7}]));
+        assert_eq!(
+            ins["columns"],
+            json!([{"name":"id","type":"numeric","value":7}])
+        );
         assert!(ins.get("identity").is_none());
 
         // DELETE → action D, no columns, identity from before.
-        let del = serde_json::to_value(Wal2JsonTxn::row(&rec(
-            3,
-            2,
-            Some(json!({"id": 7})),
-            None,
-        )))
-        .unwrap();
+        let del = serde_json::to_value(Wal2JsonTxn::row(&rec(3, 2, Some(json!({"id": 7})), None)))
+            .unwrap();
         assert_eq!(del["action"], "D");
         assert!(del.get("columns").is_none(), "delete v2 carries no columns");
         assert_eq!(

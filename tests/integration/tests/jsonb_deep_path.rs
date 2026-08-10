@@ -70,10 +70,22 @@ async fn seed_events(sess: &basin_engine::ProjectSession) {
     // id 4 — click    / android / 3.1.4
     // id 5 — purchase with NO device key (deep-path null-safety probe)
     let rows = [
-        (1, r#"{"category":"purchase","device":{"os":"ios","version":"1.2.3"},"metadata":{"score":10.0}}"#),
-        (2, r#"{"category":"signup","device":{"os":"android","version":"2.0.1"},"metadata":{"score":20.0}}"#),
-        (3, r#"{"category":"purchase","device":{"os":"ios","version":"1.5.0"},"metadata":{"score":30.0}}"#),
-        (4, r#"{"category":"click","device":{"os":"android","version":"3.1.4"},"metadata":{"score":40.0}}"#),
+        (
+            1,
+            r#"{"category":"purchase","device":{"os":"ios","version":"1.2.3"},"metadata":{"score":10.0}}"#,
+        ),
+        (
+            2,
+            r#"{"category":"signup","device":{"os":"android","version":"2.0.1"},"metadata":{"score":20.0}}"#,
+        ),
+        (
+            3,
+            r#"{"category":"purchase","device":{"os":"ios","version":"1.5.0"},"metadata":{"score":30.0}}"#,
+        ),
+        (
+            4,
+            r#"{"category":"click","device":{"os":"android","version":"3.1.4"},"metadata":{"score":40.0}}"#,
+        ),
         (5, r#"{"category":"purchase","metadata":{"score":50.0}}"#),
     ];
     for (id, payload) in rows {
@@ -126,10 +138,7 @@ async fn text_by_id(
 /// Collect `(text_key, count)` pairs from a `SELECT key, COUNT(*) ... GROUP BY`
 /// across all result batches. NULL keys are stored under the empty-string key
 /// is avoided — we panic if a NULL key appears since the seed has none.
-async fn group_counts(
-    sess: &basin_engine::ProjectSession,
-    sql: &str,
-) -> HashMap<String, i64> {
+async fn group_counts(sess: &basin_engine::ProjectSession, sql: &str) -> HashMap<String, i64> {
     let batches = match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => batches,
         Ok(other) => panic!("non-rows result for: {sql}\n  got: {other:?}"),
@@ -187,10 +196,26 @@ async fn deep_path_chained_arrow_returns_nested_value() {
     )
     .await;
 
-    assert_eq!(got.get(&1), Some(&Some("1.2.3".to_string())), "id=1 version");
-    assert_eq!(got.get(&2), Some(&Some("2.0.1".to_string())), "id=2 version");
-    assert_eq!(got.get(&3), Some(&Some("1.5.0".to_string())), "id=3 version");
-    assert_eq!(got.get(&4), Some(&Some("3.1.4".to_string())), "id=4 version");
+    assert_eq!(
+        got.get(&1),
+        Some(&Some("1.2.3".to_string())),
+        "id=1 version"
+    );
+    assert_eq!(
+        got.get(&2),
+        Some(&Some("2.0.1".to_string())),
+        "id=2 version"
+    );
+    assert_eq!(
+        got.get(&3),
+        Some(&Some("1.5.0".to_string())),
+        "id=3 version"
+    );
+    assert_eq!(
+        got.get(&4),
+        Some(&Some("3.1.4".to_string())),
+        "id=4 version"
+    );
     // id=5 has no `device` key → NULL, not an error.
     assert_eq!(got.get(&5), Some(&None), "id=5 missing device → NULL");
 }
@@ -267,7 +292,11 @@ async fn group_by_jsonb_extract_counts() {
     assert_eq!(counts.get("purchase"), Some(&3), "purchase group count");
     assert_eq!(counts.get("signup"), Some(&1), "signup group count");
     assert_eq!(counts.get("click"), Some(&1), "click group count");
-    assert_eq!(counts.len(), 3, "exactly three distinct categories: {counts:?}");
+    assert_eq!(
+        counts.len(),
+        3,
+        "exactly three distinct categories: {counts:?}"
+    );
 }
 
 /// The exact bench filter+agg shape (#36): GROUP BY ordinal 1 with a SUM over a

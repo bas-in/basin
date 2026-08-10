@@ -23,7 +23,13 @@ use basin_wal::{LocalWal, Wal, WalConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
-async fn build() -> (TempDir, TempDir, Engine, basin_shard::ShardBackgroundHandle, Arc<dyn Wal>) {
+async fn build() -> (
+    TempDir,
+    TempDir,
+    Engine,
+    basin_shard::ShardBackgroundHandle,
+    Arc<dyn Wal>,
+) {
     let sd = TempDir::new().unwrap();
     let wd = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
@@ -44,9 +50,17 @@ async fn build() -> (TempDir, TempDir, Engine, basin_shard::ShardBackgroundHandl
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
-    let engine = Engine::new(EngineConfig { storage, catalog, shard: Some(shard) });
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: Some(shard),
+    });
     (sd, wd, engine, bg, wal)
 }
 
@@ -73,7 +87,13 @@ async fn point_query_file_scaling() {
             match sess.execute("SELECT COUNT(*) FROM events").await.unwrap() {
                 ExecResult::Rows { batches, .. } => batches
                     .first()
-                    .map(|b| b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0))
+                    .map(|b| {
+                        b.column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .value(0)
+                    })
                     .unwrap_or(0),
                 _ => 0,
             }
@@ -92,7 +112,12 @@ async fn point_query_file_scaling() {
                 // payload_for() shape (nested object + array).
                 let payload = format!(
                     r#"{{"category":"cat{}","device":{{"os":"ios","version":"1.{}"}},"tags":[{},{},{}],"metadata":{{"score":{}}}}}"#,
-                    k % 20, k % 9, k % 3, k % 5, k % 7, k % 100
+                    k % 20,
+                    k % 9,
+                    k % 3,
+                    k % 5,
+                    k % 7,
+                    k % 100
                 );
                 stmt.push_str(&format!(
                     "({k}, {}, {}, 'pending', {k}, '{payload}'::jsonb)",
@@ -126,10 +151,15 @@ async fn point_query_file_scaling() {
                 .unwrap();
             times.push(t0.elapsed().as_secs_f64() * 1000.0);
             let rows = match res {
-                ExecResult::Rows { batches, .. } => batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                ExecResult::Rows { batches, .. } => {
+                    batches.iter().map(|b| b.num_rows()).sum::<usize>()
+                }
                 _ => 0,
             };
-            assert_eq!(rows, 1, "point query must return exactly 1 row at scale {scale}");
+            assert_eq!(
+                rows, 1,
+                "point query must return exactly 1 row at scale {scale}"
+            );
         }
         let after_skips = engine.blooms_skipped_count();
         // Raw order (NOT sorted) — sample[0] is the first timed call after the

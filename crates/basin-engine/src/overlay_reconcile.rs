@@ -177,7 +177,14 @@ pub(crate) fn spawn(inner: Weak<EngineInner>) {
                 return;
             };
             let engine = crate::Engine { inner: strong };
-            run_tick(&engine, bytes_threshold, age_threshold, count_threshold, quantum).await;
+            run_tick(
+                &engine,
+                bytes_threshold,
+                age_threshold,
+                count_threshold,
+                quantum,
+            )
+            .await;
         }
     });
 }

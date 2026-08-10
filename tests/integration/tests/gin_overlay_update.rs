@@ -246,7 +246,11 @@ async fn payload_text(sess: &ProjectSession, table: &str, id: i64) -> String {
 /// re-registration paths are armed too).
 async fn seed_gin_table(sess: &ProjectSession) {
     seed_docs_rows(sess).await;
-    exec(sess, "CREATE INDEX docs_payload_gin ON docs USING gin (payload)").await;
+    exec(
+        sess,
+        "CREATE INDEX docs_payload_gin ON docs USING gin (payload)",
+    )
+    .await;
 }
 
 /// The two-file seed WITHOUT the index — for the CREATE-INDEX-over-overlay
@@ -341,7 +345,9 @@ async fn plant_update_override(
         writer.finish().expect("IPC finish");
         buf
     };
-    let entry = eng.memtable_registry().get_or_create(*project, table.clone());
+    let entry = eng
+        .memtable_registry()
+        .get_or_create(*project, table.clone());
     entry.memtable.insert(
         basin_hottier::RowKey::builder().append_i64(id).finish(),
         basin_hottier::MemRowValue::update(bytes, 0),
@@ -368,7 +374,11 @@ async fn gin_update_jsonb_set_routes_overlay_and_serves_containment() {
     // Sanity: needle matches nothing while the terms are file-disjoint, and
     // the freshly backfilled index is complete.
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'"
+        )
+        .await,
         Vec::<i64>::new(),
         "no row matches the cross-file needle before the UPDATE"
     );
@@ -407,7 +417,11 @@ async fn gin_update_jsonb_set_routes_overlay_and_serves_containment() {
     // returned while the override is live (guard #1 vetoes the Empty
     // short-circuit; guard #2 keeps the overlay-aware provider registered).
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'"
+        )
+        .await,
         vec![1],
         "post-SET document must be visible to @> DURING the overlay window"
     );
@@ -435,12 +449,19 @@ async fn gin_update_jsonb_set_routes_overlay_and_serves_containment() {
     // replacement file: completeness restored → the Empty short-circuit and
     // the posting prune path re-engage instead of full-scanning forever.
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'"
+        )
+        .await,
         vec![1],
         "post-drain @> read must still see the updated document"
     );
     let doc = payload_text(&sess, "docs", 1).await;
-    assert!(doc.contains("\"b\":2"), "post-drain point read regressed: {doc}");
+    assert!(
+        doc.contains("\"b\":2"),
+        "post-drain point read regressed: {doc}"
+    );
     assert!(
         gin_completeness_holds(&eng, &project, &table, "payload").await,
         "materialize must re-register the replacement file in the GIN \
@@ -450,7 +471,11 @@ async fn gin_update_jsonb_set_routes_overlay_and_serves_containment() {
     // With completeness restored and the overlay empty, a no-match cross-file
     // needle is once again servable by the (re-armed) Empty short-circuit.
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"zz\":9}'").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"zz\":9}'"
+        )
+        .await,
         Vec::<i64>::new()
     );
 }
@@ -623,7 +648,11 @@ async fn gin_plus_btree_mixed_table_routes_overlay_and_serves_reads() {
     // Overlay-window correctness (both guards engaged): the cross-file needle
     // still finds the row.
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'"
+        )
+        .await,
         vec![1]
     );
 
@@ -636,7 +665,11 @@ async fn gin_plus_btree_mixed_table_routes_overlay_and_serves_reads() {
         "the drain must settle the overlay"
     );
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'"
+        )
+        .await,
         vec![1],
         "containment read must stay correct after the drain"
     );
@@ -680,7 +713,11 @@ async fn jsonb_set_update_overlay_equivalent_to_cold_forced_twin() {
         }
         exec(&sess, &stmt).await;
     }
-    exec(&sess, "CREATE INDEX ev_gin_payload_gin ON ev_gin USING gin (payload)").await;
+    exec(
+        &sess,
+        "CREATE INDEX ev_gin_payload_gin ON ev_gin USING gin (payload)",
+    )
+    .await;
 
     // The benchmark statement on both tables: GIN table with the fast path
     // ON (overlay), index-free twin with the fast path OFF (cold-forced).
@@ -730,7 +767,11 @@ async fn jsonb_set_update_overlay_equivalent_to_cold_forced_twin() {
     );
     // Spot-check the mutation actually happened on both.
     assert!(gin_rows[5].1.contains("\"score\":99"), "{}", gin_rows[5].1);
-    assert!(gin_rows[20].1.contains("\"score\":20"), "{}", gin_rows[20].1);
+    assert!(
+        gin_rows[20].1.contains("\"score\":20"),
+        "{}",
+        gin_rows[20].1
+    );
 }
 
 /// CREATE-INDEX-OVER-OVERLAY (blocker #3, DDL half): an overlay planted
@@ -767,7 +808,11 @@ async fn create_index_over_live_overlay_settles_overlay_and_serves_containment()
     );
 
     // CREATE INDEX must settle the overlay BEFORE backfilling.
-    exec(&sess, "CREATE INDEX docs_payload_gin ON docs USING gin (payload)").await;
+    exec(
+        &sess,
+        "CREATE INDEX docs_payload_gin ON docs USING gin (payload)",
+    )
+    .await;
     assert_eq!(
         overlay_pending(&eng, &project, &table),
         0,
@@ -778,7 +823,11 @@ async fn create_index_over_live_overlay_settles_overlay_and_serves_containment()
     // The settled+indexed row must be served by the adversarial needle
     // immediately — this is the Empty-short-circuit trap shape.
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'"
+        )
+        .await,
         vec![1],
         "index built over settled data must serve the cross-file needle"
     );
@@ -820,7 +869,11 @@ async fn live_overlay_blocks_containment_empty_short_circuit() {
     // Sanity: with NO overlay the Empty short-circuit is trustworthy
     // (registries are complete post-backfill) and returns zero rows.
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'"
+        )
+        .await,
         Vec::<i64>::new()
     );
 
@@ -840,7 +893,11 @@ async fn live_overlay_blocks_containment_empty_short_circuit() {
     // The Empty probe shape must now fall through to the overlay-aware scan
     // and return the override row.
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'"
+        )
+        .await,
         vec![1],
         "live overlay must veto the posting-probe Empty short-circuit"
     );
@@ -861,7 +918,11 @@ async fn live_overlay_blocks_containment_empty_short_circuit() {
     let cnt = batches
         .iter()
         .find(|b| b.num_rows() > 0)
-        .and_then(|b| b.column(0).as_any().downcast_ref::<arrow_array::Int64Array>())
+        .and_then(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+        })
         .map(|a| a.value(0))
         .expect("count(*) must return one Int64 row");
     assert_eq!(cnt, 1, "aggregate over the overlay row must count it");
@@ -881,7 +942,11 @@ async fn live_overlay_blocks_key_exists_empty_short_circuit() {
 
     // Sanity: no row holds both keys; the Empty short-circuit is trustworthy.
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload ?& array['a', 'b']").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload ?& array['a', 'b']"
+        )
+        .await,
         Vec::<i64>::new()
     );
 
@@ -897,7 +962,11 @@ async fn live_overlay_blocks_key_exists_empty_short_circuit() {
     assert!(overlay_pending(&eng, &project, &table) > 0);
 
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload ?& array['a', 'b']").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload ?& array['a', 'b']"
+        )
+        .await,
         vec![1],
         "live overlay must veto the ?& Empty short-circuit"
     );
@@ -990,9 +1059,16 @@ async fn overlay_drain_reindexes_gin_registry_and_reengages_pruning() {
         .await;
     })
     .await;
-    assert!(update_count(&eng, &project, &table) > 0, "overlay must be live");
+    assert!(
+        update_count(&eng, &project, &table) > 0,
+        "overlay must be live"
+    );
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'"
+        )
+        .await,
         vec![1],
         "pre-drain: the overlay guards serve the override row"
     );
@@ -1021,12 +1097,20 @@ async fn overlay_drain_reindexes_gin_registry_and_reengages_pruning() {
     // and the replacement indexed, the probe now yields real candidates and
     // the scan returns the materialized row.
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"b\":2}'"
+        )
+        .await,
         vec![1],
         "post-drain: the rebuilt postings must serve the materialized row"
     );
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload ?& array['a', 'b']").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload ?& array['a', 'b']"
+        )
+        .await,
         vec![1],
         "post-drain ?& must serve the materialized row"
     );
@@ -1045,7 +1129,11 @@ async fn overlay_drain_reindexes_gin_registry_and_reengages_pruning() {
     // A needle that matches nothing must be (correctly) empty through the
     // re-armed short-circuit.
     assert_eq!(
-        ids_for(&sess, "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"zz\":9}'").await,
+        ids_for(
+            &sess,
+            "SELECT id FROM docs WHERE payload @> '{\"a\":1,\"zz\":9}'"
+        )
+        .await,
         Vec::<i64>::new()
     );
 }

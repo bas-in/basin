@@ -60,9 +60,10 @@ pub fn length_geographic(g: &Geometry<f64>) -> f64 {
 /// PostGIS `ST_Perimeter`: 0 for non-areal, perimeter for polygons.
 pub fn perimeter_planar(g: &Geometry<f64>) -> f64 {
     match g {
-        Geometry::Polygon(_) | Geometry::MultiPolygon(_) | Geometry::Rect(_) | Geometry::Triangle(_) => {
-            length_planar(g)
-        }
+        Geometry::Polygon(_)
+        | Geometry::MultiPolygon(_)
+        | Geometry::Rect(_)
+        | Geometry::Triangle(_) => length_planar(g),
         Geometry::GeometryCollection(gc) => gc.0.iter().map(perimeter_planar).sum(),
         _ => 0.0,
     }
@@ -70,9 +71,10 @@ pub fn perimeter_planar(g: &Geometry<f64>) -> f64 {
 
 pub fn perimeter_geographic(g: &Geometry<f64>) -> f64 {
     match g {
-        Geometry::Polygon(_) | Geometry::MultiPolygon(_) | Geometry::Rect(_) | Geometry::Triangle(_) => {
-            length_geographic(g)
-        }
+        Geometry::Polygon(_)
+        | Geometry::MultiPolygon(_)
+        | Geometry::Rect(_)
+        | Geometry::Triangle(_) => length_geographic(g),
         Geometry::GeometryCollection(gc) => gc.0.iter().map(perimeter_geographic).sum(),
         _ => 0.0,
     }
@@ -89,8 +91,7 @@ fn linestring_len_planar(ls: &LineString<f64>) -> f64 {
 }
 
 fn linestring_len_geo(ls: &LineString<f64>) -> f64 {
-    ls.0
-        .windows(2)
+    ls.0.windows(2)
         .map(|w| haversine_meters(&bp(&w[0]), &bp(&w[1])))
         .sum()
 }

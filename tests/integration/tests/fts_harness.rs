@@ -180,11 +180,9 @@ async fn fts_type_round_trip() {
     .expect("INSERT tsvector row (regular text)");
 
     // Edge case: empty document → empty tsvector `''` in PG.
-    sess.execute(
-        "INSERT INTO docs (id, body) VALUES (2, to_tsvector('english', ''))",
-    )
-    .await
-    .expect("INSERT tsvector row (empty document)");
+    sess.execute("INSERT INTO docs (id, body) VALUES (2, to_tsvector('english', ''))")
+        .await
+        .expect("INSERT tsvector row (empty document)");
 
     // Edge case: unicode content.
     sess.execute(
@@ -365,11 +363,9 @@ async fn fts_query_at_at_matches() {
 
     // ── Table scan with @@ filter ─────────────────────────────────────────
     // Seed a small table; @@ in WHERE clause must filter correctly.
-    sess.execute(
-        "CREATE TABLE fts_match_docs (id INT, ts TSVECTOR)",
-    )
-    .await
-    .expect("CREATE TABLE fts_match_docs");
+    sess.execute("CREATE TABLE fts_match_docs (id INT, ts TSVECTOR)")
+        .await
+        .expect("CREATE TABLE fts_match_docs");
 
     sess.execute(
         "INSERT INTO fts_match_docs VALUES \
@@ -449,33 +445,18 @@ async fn fts_stemming_golden_file() {
     // Verified against: PostgreSQL 16.3, english dictionary, default config.
     let golden: &[(&str, &str)] = &[
         // Basic prose: stop-words removed, terms sorted + positioned.
-        (
-            "a quick brown fox",
-            "'brown':3 'fox':4 'quick':2",
-        ),
+        ("a quick brown fox", "'brown':3 'fox':4 'quick':2"),
         // Plural stemming: 'runs' → 'run', 'jumps' → 'jump'.
-        (
-            "the fox runs and jumps",
-            "'fox':2 'jump':5 'run':3",
-        ),
+        ("the fox runs and jumps", "'fox':2 'jump':5 'run':3"),
         // Irregular verb stemming: 'running' → 'run'.
-        (
-            "running runs ran",
-            "'ran':3 'run':1,2",
-        ),
+        ("running runs ran", "'ran':3 'run':1,2"),
         // Stop-words only → empty tsvector.
-        (
-            "the a an is in at on",
-            "",
-        ),
+        ("the a an is in at on", ""),
         // Possessive: "John's" → 'john'. Basin strips 'John's' → 'john' as
         // one token (the 's suffix is elided without consuming an extra
         // position), so 'book' lands at position 2 (not 3 as in PG where
         // the possessive suffix generates a separate position-consuming token).
-        (
-            "John's book is on the table",
-            "'book':2 'john':1 'tabl':6",
-        ),
+        ("John's book is on the table", "'book':2 'john':1 'tabl':6"),
         // Hyphenated: treated as separate tokens. 'is' is a stopword at pos 4
         // whose position counter is still advanced, so 'great' lands at pos 5.
         (
@@ -483,20 +464,14 @@ async fn fts_stemming_golden_file() {
             "'full':1 'great':5 'search':3 'text':2",
         ),
         // Acronym: uppercase preserved as-is in 'simple' but lowercased in 'english'.
-        (
-            "NASA launched a rocket",
-            "'launch':2 'nasa':1 'rocket':4",
-        ),
+        ("NASA launched a rocket", "'launch':2 'nasa':1 'rocket':4"),
         // Numbers: retained as-is.
         (
             "version 2 released on 2024-01-15",
             "'2':2 '2024-01-15':5 'releas':3 'version':1",
         ),
         // Accented Latin: 'café' → 'café' (English dictionary preserves unicode).
-        (
-            "visit the café today",
-            "'café':3 'today':4 'visit':1",
-        ),
+        ("visit the café today", "'café':3 'today':4 'visit':1"),
         // Long document: stop-words removed, stems sorted.
         (
             "The quick brown fox jumps over the lazy dog",
@@ -507,9 +482,7 @@ async fn fts_stemming_golden_file() {
     // ── Check for optional live PG reference mode ─────────────────────────
     let pg_url = std::env::var("BASIN_FTS_REFERENCE_PG_URL").ok();
     if let Some(ref url) = pg_url {
-        println!(
-            "[5.20.A stemming] Reference PG mode: comparing against {url}"
-        );
+        println!("[5.20.A stemming] Reference PG mode: comparing against {url}");
         // In reference mode we would connect via tokio-postgres and run each
         // to_tsvector() call, then use PG's output as the expected value.
         // This path is exercised manually by the developer; CI uses the
@@ -527,7 +500,10 @@ async fn fts_stemming_golden_file() {
     // ── Drive each golden entry through Basin ─────────────────────────────
     let mut failures = 0usize;
     for (i, (input, expected)) in golden.iter().enumerate() {
-        let sql = format!("SELECT to_tsvector('english', '{}')", input.replace('\'', "''"));
+        let sql = format!(
+            "SELECT to_tsvector('english', '{}')",
+            input.replace('\'', "''")
+        );
         let got = match sess.execute(&sql).await {
             Ok(ExecResult::Rows { batches, .. }) => {
                 let b = batches.first().expect("batch");
@@ -539,9 +515,7 @@ async fn fts_stemming_golden_file() {
                 strings.value(0).to_owned()
             }
             Ok(other) => {
-                println!(
-                    "[5.20.A stemming] [{i}] FAIL: non-rows result for {sql:?}: {other:?}"
-                );
+                println!("[5.20.A stemming] [{i}] FAIL: non-rows result for {sql:?}: {other:?}");
                 failures += 1;
                 continue;
             }
@@ -563,7 +537,8 @@ async fn fts_stemming_golden_file() {
     }
 
     assert_eq!(
-        failures, 0,
+        failures,
+        0,
         "STEMMING GOLDEN-FILE: {failures}/{} entries failed. \
          Closed by 5.20.C (Snowball English stemming + stop-word removal).",
         golden.len()
@@ -681,7 +656,9 @@ async fn fts_ranking_deterministic() {
         "RANKING DETERMINISM: a document with 3× 'fox' must rank >= a document with 1× 'fox'. \
          rank_low={rank_low}, rank_high={rank_high}. Closed by 5.20.D."
     );
-    println!("[5.20.A ranking] relative ordering: rank_high ({rank_high}) >= rank_low ({rank_low}) ✓");
+    println!(
+        "[5.20.A ranking] relative ordering: rank_high ({rank_high}) >= rank_low ({rank_low}) ✓"
+    );
 
     // ── ts_rank_cd also deterministic and non-negative ────────────────────
     let rank_cd_sql = "SELECT ts_rank_cd(\
@@ -831,11 +808,9 @@ async fn fts_orm_compat() {
     .expect("Diesel DDL: CREATE TABLE diesel_posts");
 
     // Diesel migration: ADD COLUMN body_tsv TSVECTOR
-    sess.execute(
-        r#"ALTER TABLE "diesel_posts" ADD COLUMN "body_tsv" TSVECTOR"#,
-    )
-    .await
-    .expect("Diesel DDL: ADD COLUMN body_tsv TSVECTOR");
+    sess.execute(r#"ALTER TABLE "diesel_posts" ADD COLUMN "body_tsv" TSVECTOR"#)
+        .await
+        .expect("Diesel DDL: ADD COLUMN body_tsv TSVECTOR");
 
     // Diesel migration: CREATE INDEX … USING GIN
     let diesel_gin = sess
@@ -895,7 +870,9 @@ async fn fts_orm_compat() {
             );
             println!("[5.20.A orm] Diesel ts_rank ORDER BY: {total} rows ✓");
         }
-        Ok(other) => panic!("ORM COMPAT (Diesel): unexpected result for ts_rank ORDER BY: {other:?}"),
+        Ok(other) => {
+            panic!("ORM COMPAT (Diesel): unexpected result for ts_rank ORDER BY: {other:?}")
+        }
         Err(e) => panic!(
             "ORM COMPAT (Diesel): ts_rank ORDER BY failed. \
              Closed by 5.20.D. error: {e}"
@@ -1102,7 +1079,9 @@ async fn plant_fts_override(
         writer.finish().expect("IPC finish");
         buf
     };
-    let entry = eng.memtable_registry().get_or_create(*project, table.clone());
+    let entry = eng
+        .memtable_registry()
+        .get_or_create(*project, table.clone());
     entry.memtable.insert(
         basin_hottier::RowKey::builder().append_i64(id).finish(),
         basin_hottier::MemRowValue::update(bytes, 0),
@@ -1122,10 +1101,18 @@ async fn fts_gin_stem_consistent_match_and_prune() {
     let project = ProjectId::new();
     let sess = engine.open_session(project).await.unwrap();
 
-    exec(&sess, "CREATE TABLE stem_docs (id BIGINT NOT NULL, body TSVECTOR)").await;
+    exec(
+        &sess,
+        "CREATE TABLE stem_docs (id BIGINT NOT NULL, body TSVECTOR)",
+    )
+    .await;
     // Index FIRST so every inserted file goes through insert-path maintenance
     // and the completeness guard passes (pruning actually armed).
-    exec(&sess, "CREATE INDEX stem_docs_gin ON stem_docs USING gin (body)").await;
+    exec(
+        &sess,
+        "CREATE INDEX stem_docs_gin ON stem_docs USING gin (body)",
+    )
+    .await;
 
     // Three separate INSERTs → three live files.
     exec(
@@ -1195,11 +1182,31 @@ async fn fts_gin_or_query_unions_files() {
     let project = ProjectId::new();
     let sess = engine.open_session(project).await.unwrap();
 
-    exec(&sess, "CREATE TABLE or_docs (id BIGINT NOT NULL, body TSVECTOR)").await;
-    exec(&sess, "CREATE INDEX or_docs_gin ON or_docs USING gin (body)").await;
-    exec(&sess, "INSERT INTO or_docs VALUES (1, to_tsvector('english', 'cat climbs'))").await;
-    exec(&sess, "INSERT INTO or_docs VALUES (2, to_tsvector('english', 'dog barks'))").await;
-    exec(&sess, "INSERT INTO or_docs VALUES (3, to_tsvector('english', 'fish swims'))").await;
+    exec(
+        &sess,
+        "CREATE TABLE or_docs (id BIGINT NOT NULL, body TSVECTOR)",
+    )
+    .await;
+    exec(
+        &sess,
+        "CREATE INDEX or_docs_gin ON or_docs USING gin (body)",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO or_docs VALUES (1, to_tsvector('english', 'cat climbs'))",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO or_docs VALUES (2, to_tsvector('english', 'dog barks'))",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO or_docs VALUES (3, to_tsvector('english', 'fish swims'))",
+    )
+    .await;
 
     assert_eq!(
         ids_for(
@@ -1236,11 +1243,27 @@ async fn fts_gin_not_query_declines_to_sound_scan() {
     let project = ProjectId::new();
     let sess = engine.open_session(project).await.unwrap();
 
-    exec(&sess, "CREATE TABLE not_docs (id BIGINT NOT NULL, body TSVECTOR)").await;
-    exec(&sess, "CREATE INDEX not_docs_gin ON not_docs USING gin (body)").await;
+    exec(
+        &sess,
+        "CREATE TABLE not_docs (id BIGINT NOT NULL, body TSVECTOR)",
+    )
+    .await;
+    exec(
+        &sess,
+        "CREATE INDEX not_docs_gin ON not_docs USING gin (body)",
+    )
+    .await;
     // f1: cat only.  f2: cat AND dog.
-    exec(&sess, "INSERT INTO not_docs VALUES (1, to_tsvector('english', 'cat climbs'))").await;
-    exec(&sess, "INSERT INTO not_docs VALUES (2, to_tsvector('english', 'cat dog'))").await;
+    exec(
+        &sess,
+        "INSERT INTO not_docs VALUES (1, to_tsvector('english', 'cat climbs'))",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO not_docs VALUES (2, to_tsvector('english', 'cat dog'))",
+    )
+    .await;
 
     // 'cat & !dog' matches only id 1 — which lives in a file with NO 'dog'.
     // An AND-merge probe would intersect {cat-files} ∩ {dog-files} = {f2},
@@ -1280,13 +1303,33 @@ async fn fts_gin_phrase_prunes_as_and_reevaluates_positions() {
     let project = ProjectId::new();
     let sess = engine.open_session(project).await.unwrap();
 
-    exec(&sess, "CREATE TABLE ph_docs (id BIGINT NOT NULL, body TSVECTOR)").await;
-    exec(&sess, "CREATE INDEX ph_docs_gin ON ph_docs USING gin (body)").await;
+    exec(
+        &sess,
+        "CREATE TABLE ph_docs (id BIGINT NOT NULL, body TSVECTOR)",
+    )
+    .await;
+    exec(
+        &sess,
+        "CREATE INDEX ph_docs_gin ON ph_docs USING gin (body)",
+    )
+    .await;
     // f1: wrong order ('fox quick').  f2: right order ('quick fox').
     // f3: only one of the lexemes — prunable.
-    exec(&sess, "INSERT INTO ph_docs VALUES (1, to_tsvector('english', 'fox quick'))").await;
-    exec(&sess, "INSERT INTO ph_docs VALUES (2, to_tsvector('english', 'quick fox'))").await;
-    exec(&sess, "INSERT INTO ph_docs VALUES (3, to_tsvector('english', 'quick snail'))").await;
+    exec(
+        &sess,
+        "INSERT INTO ph_docs VALUES (1, to_tsvector('english', 'fox quick'))",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO ph_docs VALUES (2, to_tsvector('english', 'quick fox'))",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO ph_docs VALUES (3, to_tsvector('english', 'quick snail'))",
+    )
+    .await;
 
     assert_eq!(
         ids_for(
@@ -1332,9 +1375,21 @@ async fn fts_gin_live_overlay_blocks_empty_short_circuit_and_prune() {
         "CREATE TABLE ov_docs (id BIGINT NOT NULL PRIMARY KEY, body TSVECTOR)",
     )
     .await;
-    exec(&sess, "CREATE INDEX ov_docs_gin ON ov_docs USING gin (body)").await;
-    exec(&sess, "INSERT INTO ov_docs VALUES (1, to_tsvector('english', 'cat climbs'))").await;
-    exec(&sess, "INSERT INTO ov_docs VALUES (2, to_tsvector('english', 'dog barks'))").await;
+    exec(
+        &sess,
+        "CREATE INDEX ov_docs_gin ON ov_docs USING gin (body)",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO ov_docs VALUES (1, to_tsvector('english', 'cat climbs'))",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO ov_docs VALUES (2, to_tsvector('english', 'dog barks'))",
+    )
+    .await;
 
     // Sanity (no overlay): the lexemes are file-disjoint → Empty probe is
     // trustworthy → zero rows.
@@ -1416,7 +1471,11 @@ async fn fts_gin_create_index_over_overlay_settles_then_serves() {
     );
 
     // CREATE INDEX must settle the overlay before backfilling.
-    exec(&sess, "CREATE INDEX settle_docs_gin ON settle_docs USING gin (body)").await;
+    exec(
+        &sess,
+        "CREATE INDEX settle_docs_gin ON settle_docs USING gin (body)",
+    )
+    .await;
     assert_eq!(
         overlay_pending(&engine, &project, &table),
         0,
@@ -1464,10 +1523,26 @@ async fn fts_gin_incomplete_index_degrades_to_full_scan() {
     let sess = engine.open_session(project).await.unwrap();
     let table = TableName::new("evict_docs").unwrap();
 
-    exec(&sess, "CREATE TABLE evict_docs (id BIGINT NOT NULL, body TSVECTOR)").await;
-    exec(&sess, "CREATE INDEX evict_docs_gin ON evict_docs USING gin (body)").await;
-    exec(&sess, "INSERT INTO evict_docs VALUES (1, to_tsvector('english', 'cat climbs'))").await;
-    exec(&sess, "INSERT INTO evict_docs VALUES (2, to_tsvector('english', 'dog barks'))").await;
+    exec(
+        &sess,
+        "CREATE TABLE evict_docs (id BIGINT NOT NULL, body TSVECTOR)",
+    )
+    .await;
+    exec(
+        &sess,
+        "CREATE INDEX evict_docs_gin ON evict_docs USING gin (body)",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO evict_docs VALUES (1, to_tsvector('english', 'cat climbs'))",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO evict_docs VALUES (2, to_tsvector('english', 'dog barks'))",
+    )
+    .await;
 
     // Sanity: fully indexed → correct answer (possibly pruned).
     assert_eq!(
@@ -1539,11 +1614,31 @@ async fn fts_gin_multi_file_layout_prunes_with_work_counters() {
     let project = ProjectId::new();
     let sess = engine.open_session(project).await.unwrap();
 
-    exec(&sess, "CREATE TABLE wc_docs (id BIGINT NOT NULL, body TSVECTOR)").await;
-    exec(&sess, "CREATE INDEX wc_docs_gin ON wc_docs USING gin (body)").await;
-    exec(&sess, "INSERT INTO wc_docs VALUES (1, to_tsvector('english', 'cat climbs'))").await;
-    exec(&sess, "INSERT INTO wc_docs VALUES (2, to_tsvector('english', 'dog barks'))").await;
-    exec(&sess, "INSERT INTO wc_docs VALUES (3, to_tsvector('english', 'fish swims'))").await;
+    exec(
+        &sess,
+        "CREATE TABLE wc_docs (id BIGINT NOT NULL, body TSVECTOR)",
+    )
+    .await;
+    exec(
+        &sess,
+        "CREATE INDEX wc_docs_gin ON wc_docs USING gin (body)",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO wc_docs VALUES (1, to_tsvector('english', 'cat climbs'))",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO wc_docs VALUES (2, to_tsvector('english', 'dog barks'))",
+    )
+    .await;
+    exec(
+        &sess,
+        "INSERT INTO wc_docs VALUES (3, to_tsvector('english', 'fish swims'))",
+    )
+    .await;
 
     let counters = engine.config().storage.read_counters();
 

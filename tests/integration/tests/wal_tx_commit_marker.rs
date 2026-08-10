@@ -67,10 +67,7 @@ async fn wal_replay_buffers_until_explicit_commit() {
 
     // Re-open (crash recovery path).
     let wal = LocalWal::open(local_cfg(&dir)).await.unwrap();
-    let events = wal
-        .read_events(&project, &part, Lsn::ZERO)
-        .await
-        .unwrap();
+    let events = wal.read_events(&project, &part, Lsn::ZERO).await.unwrap();
 
     // Sanity: we should see Begin + 10 entries, but no Commit.
     let begin_count = events
@@ -144,10 +141,7 @@ async fn wal_replay_honors_explicit_commit() {
     }
 
     let wal = LocalWal::open(local_cfg(&dir)).await.unwrap();
-    let events = wal
-        .read_events(&project, &part, Lsn::ZERO)
-        .await
-        .unwrap();
+    let events = wal.read_events(&project, &part, Lsn::ZERO).await.unwrap();
 
     // Verify the Commit marker round-tripped through the segment format.
     let commit_count = events
@@ -201,10 +195,7 @@ async fn wal_replay_discards_explicit_rollback() {
     }
 
     let wal = LocalWal::open(local_cfg(&dir)).await.unwrap();
-    let events = wal
-        .read_events(&project, &part, Lsn::ZERO)
-        .await
-        .unwrap();
+    let events = wal.read_events(&project, &part, Lsn::ZERO).await.unwrap();
 
     let cfg = WalReplayConfig::default();
     let replayed = replay_wal(events, &cfg);
@@ -245,10 +236,7 @@ async fn wal_replay_auto_commit_unchanged() {
     }
 
     let wal = LocalWal::open(local_cfg(&dir)).await.unwrap();
-    let events = wal
-        .read_events(&project, &part, Lsn::ZERO)
-        .await
-        .unwrap();
+    let events = wal.read_events(&project, &part, Lsn::ZERO).await.unwrap();
 
     // No markers at all in a raw-append segment.
     let marker_count = events
@@ -318,10 +306,7 @@ async fn wal_replay_mixed_explicit_commit_and_auto_commit() {
     }
 
     let wal = LocalWal::open(local_cfg(&dir)).await.unwrap();
-    let events = wal
-        .read_events(&project, &part, Lsn::ZERO)
-        .await
-        .unwrap();
+    let events = wal.read_events(&project, &part, Lsn::ZERO).await.unwrap();
 
     let cfg = WalReplayConfig::default();
     let replayed = replay_wal(events, &cfg);

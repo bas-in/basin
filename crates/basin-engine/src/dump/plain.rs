@@ -80,7 +80,11 @@ pub(crate) async fn dump(
     writeln!(out, "-- Format: plain").unwrap();
     writeln!(out, "-- Basin version: {version}").unwrap();
     writeln!(out, "-- Dump timestamp: {ts}").unwrap();
-    writeln!(out, "-- Note: custom binary format (--format=custom) is NOT").unwrap();
+    writeln!(
+        out,
+        "-- Note: custom binary format (--format=custom) is NOT"
+    )
+    .unwrap();
     writeln!(out, "--   byte-compatible with pg_dump custom format.").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "SET client_encoding = 'UTF8';").unwrap();
@@ -311,7 +315,11 @@ fn emit_inserts(
     }
 
     let tname = quote_ident(table_name);
-    let col_list: Vec<String> = schema.fields().iter().map(|f| quote_ident(f.name())).collect();
+    let col_list: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| quote_ident(f.name()))
+        .collect();
     let cols_str = col_list.join(", ");
 
     let jsonb_cols: Vec<bool> = schema
@@ -328,8 +336,7 @@ fn emit_inserts(
     for batch in batches {
         let n_rows = batch.num_rows();
         for r in 0..n_rows {
-            let mut row_vals: Vec<String> =
-                Vec::with_capacity(schema.fields().len());
+            let mut row_vals: Vec<String> = Vec::with_capacity(schema.fields().len());
             for (c, field) in schema.fields().iter().enumerate() {
                 let col = batch.column(c);
                 let val = encode_cell(col.as_ref(), r, field.as_ref(), jsonb_cols[c], uuid_cols[c]);
@@ -374,7 +381,11 @@ fn encode_cell(
     match col.data_type() {
         DataType::Boolean => {
             let v = col.as_boolean().value(idx);
-            if v { "TRUE".to_string() } else { "FALSE".to_string() }
+            if v {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
         }
         DataType::Int8 => format!("{}", col.as_primitive::<Int8Type>().value(idx)),
         DataType::Int16 => format!("{}", col.as_primitive::<Int16Type>().value(idx)),
@@ -458,15 +469,9 @@ fn encode_cell(
         DataType::Timestamp(unit, tz) => {
             let raw: i64 = match unit {
                 TimeUnit::Second => col.as_primitive::<TimestampSecondType>().value(idx),
-                TimeUnit::Millisecond => {
-                    col.as_primitive::<TimestampMillisecondType>().value(idx)
-                }
-                TimeUnit::Microsecond => {
-                    col.as_primitive::<TimestampMicrosecondType>().value(idx)
-                }
-                TimeUnit::Nanosecond => {
-                    col.as_primitive::<TimestampNanosecondType>().value(idx)
-                }
+                TimeUnit::Millisecond => col.as_primitive::<TimestampMillisecondType>().value(idx),
+                TimeUnit::Microsecond => col.as_primitive::<TimestampMicrosecondType>().value(idx),
+                TimeUnit::Nanosecond => col.as_primitive::<TimestampNanosecondType>().value(idx),
             };
             let unix_micros: i64 = match unit {
                 TimeUnit::Second => raw.saturating_mul(1_000_000),
@@ -474,7 +479,10 @@ fn encode_cell(
                 TimeUnit::Microsecond => raw,
                 TimeUnit::Nanosecond => raw / 1_000,
             };
-            let dt = Utc.timestamp_micros(unix_micros).single().unwrap_or_default();
+            let dt = Utc
+                .timestamp_micros(unix_micros)
+                .single()
+                .unwrap_or_default();
             if tz.is_some() {
                 format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S%.6f+00"))
             } else {
@@ -490,11 +498,8 @@ fn encode_cell(
             format_decimal128(val, *scale as u8)
         }
         DataType::Interval(IntervalUnit::MonthDayNano) => {
-            let v = col
-                .as_primitive::<IntervalMonthDayNanoType>()
-                .value(idx);
-            let (months, days, nanos) =
-                arrow_array::types::IntervalMonthDayNanoType::to_parts(v);
+            let v = col.as_primitive::<IntervalMonthDayNanoType>().value(idx);
+            let (months, days, nanos) = arrow_array::types::IntervalMonthDayNanoType::to_parts(v);
             format!("INTERVAL '{months} months {days} days {nanos} nanoseconds'")
         }
         // List / array types: recurse on element.

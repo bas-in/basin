@@ -34,9 +34,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    Array, GenericListArray, Int32Array, Int64Array, ListArray, StringArray,
-};
+use arrow_array::{Array, GenericListArray, Int32Array, Int64Array, ListArray, StringArray};
 use basin_catalog::InMemoryCatalog;
 use basin_common::ProjectId;
 use basin_engine::{Engine, EngineConfig, ExecResult};
@@ -123,10 +121,7 @@ async fn one_list_first_str(sess: &basin_engine::ProjectSession, sql: &str) -> O
                 return Some(s.value(0).to_string());
             }
             // Generic large list fallback.
-            if let Some(list) = col
-                .as_any()
-                .downcast_ref::<GenericListArray<i64>>()
-            {
+            if let Some(list) = col.as_any().downcast_ref::<GenericListArray<i64>>() {
                 let inner = list.value(0);
                 let s = inner
                     .as_any()
@@ -172,7 +167,10 @@ async fn regexp_match_no_match_is_null() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
     let is_null = one_null(&sess, r"SELECT regexp_match('no digits', '(\d+)')").await;
-    assert!(is_null, "regexp_match with no match must be NULL (PG semantics)");
+    assert!(
+        is_null,
+        "regexp_match with no match must be NULL (PG semantics)"
+    );
 }
 
 /// `substring('hello world', 7, 5)` — 1-indexed three-arg form.

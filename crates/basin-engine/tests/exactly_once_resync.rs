@@ -118,7 +118,11 @@ async fn pk_resync_resend_is_rejected_no_duplicate() {
 
     // Final state: exactly the originally committed rows, no duplicates. The
     // rejected re-send was all-or-nothing (matches PG INSERT statement atomicity).
-    assert_eq!(count(&sess, "events").await, 3, "no duplicate rows admitted");
+    assert_eq!(
+        count(&sess, "events").await,
+        3,
+        "no duplicate rows admitted"
+    );
     assert_eq!(
         distinct_i64(&sess, "SELECT id FROM events", "id").await,
         vec![1, 2, 3],
@@ -140,15 +144,19 @@ async fn on_conflict_do_nothing_resync_is_exactly_once() {
 
     // A retry-safe loader issues ON CONFLICT DO NOTHING so a resync re-send is
     // idempotent rather than an error.
-    sess.execute("INSERT INTO events VALUES (1, 100), (2, 200), (3, 300) ON CONFLICT (id) DO NOTHING")
-        .await
-        .unwrap();
+    sess.execute(
+        "INSERT INTO events VALUES (1, 100), (2, 200), (3, 300) ON CONFLICT (id) DO NOTHING",
+    )
+    .await
+    .unwrap();
 
     // RESYNC: re-send the overlapping batch (2,3 already committed) plus new 4.
     // DO NOTHING drops the already-present keys; 4 is admitted. No error.
-    sess.execute("INSERT INTO events VALUES (2, 200), (3, 300), (4, 400) ON CONFLICT (id) DO NOTHING")
-        .await
-        .unwrap();
+    sess.execute(
+        "INSERT INTO events VALUES (2, 200), (3, 300), (4, 400) ON CONFLICT (id) DO NOTHING",
+    )
+    .await
+    .unwrap();
 
     // A second, fully-overlapping resync (a paranoid client retrying again):
     // every key already present → 0 rows admitted, still no error.
@@ -198,7 +206,11 @@ async fn composite_pk_resync_exactly_once_via_on_conflict() {
     .await
     .unwrap();
 
-    assert_eq!(count(&sess, "readings").await, 3, "composite key exactly-once");
+    assert_eq!(
+        count(&sess, "readings").await,
+        3,
+        "composite key exactly-once"
+    );
 }
 
 // ── Documented limitation: keyless re-send DOES duplicate ───────────────────

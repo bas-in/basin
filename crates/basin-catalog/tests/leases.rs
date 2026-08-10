@@ -118,7 +118,10 @@ async fn steal_on_expiry_in_memory() {
 const PG_URL: &str = "host=127.0.0.1 port=5432 user=pc dbname=postgres";
 
 fn unique_schema() -> String {
-    format!("basin_catalog_test_{}", Ulid::new().to_string().to_lowercase())
+    format!(
+        "basin_catalog_test_{}",
+        Ulid::new().to_string().to_lowercase()
+    )
 }
 
 struct SchemaGuard {
@@ -222,7 +225,10 @@ async fn acquire_renew_steal_release_round_trip_postgres() {
         .await
         .unwrap()
         .expect("regrant after release");
-    assert_eq!(regrant.epoch, 1, "post-release grant is a fresh first-grant");
+    assert_eq!(
+        regrant.epoch, 1,
+        "post-release grant is a fresh first-grant"
+    );
 }
 
 #[tokio::test]

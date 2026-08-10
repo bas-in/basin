@@ -178,7 +178,11 @@ async fn pinned_overlay_version_survives_two_subsequent_overwrites() {
         // B overwrites the SAME key TWICE more, after A pinned.
         exec(&b, "UPDATE t SET val = 200 WHERE id = 3").await;
         exec(&b, "UPDATE t SET val = 300 WHERE id = 3").await;
-        assert_eq!(val_at(&b, "t", 3).await, Some(300), "B sees its latest write");
+        assert_eq!(
+            val_at(&b, "t", 3).await,
+            Some(300),
+            "B sees its latest write"
+        );
 
         // A re-reads: MUST still see val=100. This is the chain payoff — the
         // version A pinned was overwritten twice but is retained, not destroyed.
@@ -354,8 +358,16 @@ async fn in_tx_count_stable_under_overwrite_churn() {
 
         // B churns several rows, each overwritten twice, after A pinned.
         for id in 1..=5 {
-            exec(&b, &format!("UPDATE t SET val = {} WHERE id = {id}", id * 1000)).await;
-            exec(&b, &format!("UPDATE t SET val = {} WHERE id = {id}", id * 2000)).await;
+            exec(
+                &b,
+                &format!("UPDATE t SET val = {} WHERE id = {id}", id * 1000),
+            )
+            .await;
+            exec(
+                &b,
+                &format!("UPDATE t SET val = {} WHERE id = {id}", id * 2000),
+            )
+            .await;
         }
 
         // A's count is unchanged through the churn.

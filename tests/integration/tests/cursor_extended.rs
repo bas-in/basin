@@ -75,8 +75,12 @@ async fn fetch_past_end_returns_zero_rows() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE nums (id BIGINT NOT NULL)").await.unwrap();
-    sess.execute("INSERT INTO nums VALUES (1), (2), (3)").await.unwrap();
+    sess.execute("CREATE TABLE nums (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO nums VALUES (1), (2), (3)")
+        .await
+        .unwrap();
 
     sess.execute("DECLARE c CURSOR FOR SELECT id FROM nums ORDER BY id")
         .await
@@ -88,7 +92,11 @@ async fn fetch_past_end_returns_zero_rows() {
 
     // A further FETCH must return 0 rows, not an error.
     let res = sess.execute("FETCH 5 FROM c").await.unwrap();
-    assert_eq!(row_count(&res), 0, "FETCH past end must return 0 rows, not an error");
+    assert_eq!(
+        row_count(&res),
+        0,
+        "FETCH past end must return 0 rows, not an error"
+    );
 
     sess.execute("CLOSE c").await.unwrap();
 }
@@ -103,8 +111,12 @@ async fn close_all_clears_all_cursors() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE vals (n BIGINT NOT NULL)").await.unwrap();
-    sess.execute("INSERT INTO vals VALUES (1), (2)").await.unwrap();
+    sess.execute("CREATE TABLE vals (n BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO vals VALUES (1), (2)")
+        .await
+        .unwrap();
 
     sess.execute("DECLARE c1 CURSOR FOR SELECT n FROM vals ORDER BY n")
         .await
@@ -162,7 +174,10 @@ async fn fetch_unknown_cursor_is_34000() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    let err = sess.execute("FETCH NEXT FROM ghost_cursor").await.unwrap_err();
+    let err = sess
+        .execute("FETCH NEXT FROM ghost_cursor")
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, BasinError::CursorNotFound(_)),
         "expected CursorNotFound (SQLSTATE 34000), got {err:?}"
@@ -185,8 +200,12 @@ async fn cursor_is_session_scoped_survives_rollback() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE items (id BIGINT NOT NULL)").await.unwrap();
-    sess.execute("INSERT INTO items VALUES (10), (20), (30)").await.unwrap();
+    sess.execute("CREATE TABLE items (id BIGINT NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO items VALUES (10), (20), (30)")
+        .await
+        .unwrap();
 
     // Declare inside an explicit transaction, then roll back.
     sess.execute("BEGIN").await.unwrap();
@@ -216,7 +235,9 @@ async fn declare_with_hold_is_feature_not_supported() {
     let eng = engine_in(&dir);
     let sess = eng.open_session(ProjectId::new()).await.unwrap();
 
-    sess.execute("CREATE TABLE t (n BIGINT NOT NULL)").await.unwrap();
+    sess.execute("CREATE TABLE t (n BIGINT NOT NULL)")
+        .await
+        .unwrap();
     sess.execute("INSERT INTO t VALUES (1)").await.unwrap();
 
     let err = sess
@@ -332,20 +353,36 @@ async fn django_server_side_cursor_shape() {
     assert_empty(&res, "DECLARE");
 
     // chunk_size=2 — first chunk.
-    let res = sess.execute("FETCH 2 FROM _django_curs_1234_5").await.unwrap();
+    let res = sess
+        .execute("FETCH 2 FROM _django_curs_1234_5")
+        .await
+        .unwrap();
     assert_eq!(row_count(&res), 2, "first chunk: 2 rows");
 
     // Second chunk.
-    let res = sess.execute("FETCH 2 FROM _django_curs_1234_5").await.unwrap();
+    let res = sess
+        .execute("FETCH 2 FROM _django_curs_1234_5")
+        .await
+        .unwrap();
     assert_eq!(row_count(&res), 2, "second chunk: 2 rows");
 
     // Third (partial) chunk: only 1 row remains.
-    let res = sess.execute("FETCH 2 FROM _django_curs_1234_5").await.unwrap();
+    let res = sess
+        .execute("FETCH 2 FROM _django_curs_1234_5")
+        .await
+        .unwrap();
     assert_eq!(row_count(&res), 1, "third chunk: 1 remaining row");
 
     // Fourth chunk: exhausted — returns 0 rows.  Django stops here.
-    let res = sess.execute("FETCH 2 FROM _django_curs_1234_5").await.unwrap();
-    assert_eq!(row_count(&res), 0, "fourth chunk: 0 rows (exhausted, not an error)");
+    let res = sess
+        .execute("FETCH 2 FROM _django_curs_1234_5")
+        .await
+        .unwrap();
+    assert_eq!(
+        row_count(&res),
+        0,
+        "fourth chunk: 0 rows (exhausted, not an error)"
+    );
 
     let res = sess.execute("CLOSE _django_curs_1234_5").await.unwrap();
     assert_empty(&res, "CLOSE");

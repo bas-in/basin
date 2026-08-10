@@ -275,7 +275,10 @@ async fn run_orm_section(client: &Client, orm: &str, shapes: &[Shape]) -> OrmSec
             }
             Err(e) => {
                 reg += 1;
-                eprintln!("  [{orm}] REGRESSION: {e} — sql: {}", &sql[..sql.len().min(60)]);
+                eprintln!(
+                    "  [{orm}] REGRESSION: {e} — sql: {}",
+                    &sql[..sql.len().min(60)]
+                );
                 shape_results.push(ShapeResult {
                     sql: sql.to_string(),
                     outcome: "regression".to_string(),
@@ -355,7 +358,8 @@ async fn orm_compat_corpus_ext() {
     // it); if it fails the column falls back to TEXT so dependent shapes still
     // run — but the enum DDL shape is *also* asserted in the Prisma section so
     // the outcome is recorded honestly.
-    let bootstrap_enum = Shape::raw(r#"CREATE TYPE "role_enum" AS ENUM ('USER', 'ADMIN', 'OWNER')"#);
+    let bootstrap_enum =
+        Shape::raw(r#"CREATE TYPE "role_enum" AS ENUM ('USER', 'ADMIN', 'OWNER')"#);
     let enum_ok = matches!(
         run_shape(&client, &bootstrap_enum).await,
         Ok(ShapeOutcome::Ok)
@@ -451,16 +455,24 @@ async fn orm_compat_corpus_ext() {
     // query-compiler output for the corresponding client API calls.
     let prisma: &[Shape] = &[
         // findFirst — `take(1)`; Prisma emits LIMIT 1 OFFSET 0.
-        Shape::raw(r#"SELECT "members"."id","members"."email" FROM "members" ORDER BY "members"."id" ASC LIMIT 1 OFFSET 0"#),
+        Shape::raw(
+            r#"SELECT "members"."id","members"."email" FROM "members" ORDER BY "members"."id" ASC LIMIT 1 OFFSET 0"#,
+        ),
         // findMany with `_count` relation aggregate — Prisma builds the
         // per-parent child count as a correlated scalar subquery.
-        Shape::raw(r#"SELECT "members"."id",
+        Shape::raw(
+            r#"SELECT "members"."id",
                (SELECT COUNT(*) FROM "events" WHERE "events"."member_id" = "members"."id") AS "_count_events"
-           FROM "members" ORDER BY "members"."id""#),
+           FROM "members" ORDER BY "members"."id""#,
+        ),
         // aggregate({ _avg, _sum, _count }) — Prisma `prisma.event.aggregate`.
-        Shape::raw(r#"SELECT COUNT(*) AS "_count", AVG("amount") AS "_avg_amount", SUM("amount") AS "_sum_amount" FROM "events""#),
+        Shape::raw(
+            r#"SELECT COUNT(*) AS "_count", AVG("amount") AS "_avg_amount", SUM("amount") AS "_sum_amount" FROM "events""#,
+        ),
         // groupBy({ by: ['member_id'], _count, _sum }) — Prisma groupBy API.
-        Shape::raw(r#"SELECT "member_id", COUNT(*) AS "_count", SUM("amount") AS "_sum_amount" FROM "events" GROUP BY "member_id" HAVING COUNT(*) > 0 ORDER BY "member_id""#),
+        Shape::raw(
+            r#"SELECT "member_id", COUNT(*) AS "_count", SUM("amount") AS "_sum_amount" FROM "events" GROUP BY "member_id" HAVING COUNT(*) > 0 ORDER BY "member_id""#,
+        ),
         // Json path filter — `where: { meta: { path: ['plan'], equals: 'pro' } }`
         // compiles to a `->>` extraction comparison.
         Shape::raw(r#"SELECT "id" FROM "members" WHERE "meta"->>'plan' = 'pro'"#),
@@ -473,13 +485,17 @@ async fn orm_compat_corpus_ext() {
         Shape::raw(r#"SELECT "id" FROM "members" WHERE "role" IN ('ADMIN','OWNER')"#),
         // createMany({ data: [...], skipDuplicates: true }) — batch INSERT with
         // ON CONFLICT DO NOTHING (Prisma's skipDuplicates lowering).
-        Shape::raw(r#"INSERT INTO "members" ("id","email","role") VALUES (50,'m50@x.com','USER'),(51,'m51@x.com','USER') ON CONFLICT DO NOTHING"#),
+        Shape::raw(
+            r#"INSERT INTO "members" ("id","email","role") VALUES (50,'m50@x.com','USER'),(51,'m51@x.com','USER') ON CONFLICT DO NOTHING"#,
+        ),
         // updateMany({ where, data }) — bulk UPDATE, no RETURNING.
         Shape::raw(r#"UPDATE "members" SET "role" = 'USER' WHERE "role" = 'OWNER'"#),
         // deleteMany({ where: { id: { in: [...] } } }).
         Shape::raw(r#"DELETE FROM "members" WHERE "id" IN (998,999)"#),
         // Soft-delete read — Prisma middleware injects `deleted_at IS NULL`.
-        Shape::raw(r#"SELECT "id","email" FROM "members" WHERE "deleted_at" IS NULL ORDER BY "id""#),
+        Shape::raw(
+            r#"SELECT "id","email" FROM "members" WHERE "deleted_at" IS NULL ORDER BY "id""#,
+        ),
         // Cursor pagination — `cursor: { id }, skip: 1, take: 10`.
         Shape::with(
             r#"SELECT "id","email" FROM "members" WHERE "id" > $1 ORDER BY "id" ASC LIMIT $2 OFFSET $3"#,
@@ -491,8 +507,10 @@ async fn orm_compat_corpus_ext() {
         // interactive transaction (Prisma 5 row-locking preview).
         Shape::raw(r#"SELECT "id","email" FROM "members" WHERE "id" = 1 LIMIT 1 FOR UPDATE"#),
         // upsert with composite unique target — `where: { org_id_user_id: {...} }`.
-        Shape::raw(r#"INSERT INTO "memberships" ("org_id","user_id","level") VALUES (1,1,'admin')
-           ON CONFLICT ("org_id","user_id") DO UPDATE SET "level" = EXCLUDED."level""#),
+        Shape::raw(
+            r#"INSERT INTO "memberships" ("org_id","user_id","level") VALUES (1,1,'admin')
+           ON CONFLICT ("org_id","user_id") DO UPDATE SET "level" = EXCLUDED."level""#,
+        ),
         // $queryRaw escape hatch — typed cast + computed expression.
         // The harness has no Numeric ParamValue variant; inline the multiplier
         // as a typed literal — same convention as orm_compat.rs (which avoids
@@ -513,9 +531,13 @@ async fn orm_compat_corpus_ext() {
         // countDistinct — `db.select({ n: countDistinct(t.role) })`.
         Shape::raw(r#"SELECT COUNT(DISTINCT "role") AS "n" FROM "members""#),
         // groupBy + multiple aggregates — `.groupBy(t.member_id)`.
-        Shape::raw(r#"SELECT "member_id", COUNT(*) AS "c", SUM("amount") AS "s", AVG("amount") AS "a" FROM "events" GROUP BY "member_id" ORDER BY "member_id""#),
+        Shape::raw(
+            r#"SELECT "member_id", COUNT(*) AS "c", SUM("amount") AS "s", AVG("amount") AS "a" FROM "events" GROUP BY "member_id" ORDER BY "member_id""#,
+        ),
         // `.for('update', { skipLocked: true })` — Drizzle PG locking modifier.
-        Shape::raw(r#"SELECT "id" FROM "members" WHERE "role" = 'USER' LIMIT 1 FOR UPDATE SKIP LOCKED"#),
+        Shape::raw(
+            r#"SELECT "id" FROM "members" WHERE "role" = 'USER' LIMIT 1 FOR UPDATE SKIP LOCKED"#,
+        ),
         // `.for('update', { noWait: true })`.
         Shape::raw(r#"SELECT "id" FROM "members" WHERE "id" = 1 FOR UPDATE NOWAIT"#),
         // `.for('share')` shared lock.
@@ -529,7 +551,9 @@ async fn orm_compat_corpus_ext() {
         // array contains `@>` — Drizzle `arrayContains`.
         Shape::raw(r#"SELECT "id" FROM "members" WHERE "tags" @> ARRAY['rust']"#),
         // updateMany-style bulk UPDATE returning the rows (`.returning()`).
-        Shape::raw(r#"UPDATE "members" SET "version" = "version" + 1 WHERE "role" = 'USER' RETURNING "id","version""#),
+        Shape::raw(
+            r#"UPDATE "members" SET "version" = "version" + 1 WHERE "role" = 'USER' RETURNING "id","version""#,
+        ),
         // keyset pagination with composite cursor (created_at, id).
         // Drizzle emits the timestamp as a typed literal; embed it inline so
         // the tokio-postgres harness (which has no Timestamptz ParamValue variant)
@@ -541,7 +565,11 @@ async fn orm_compat_corpus_ext() {
         // optimistic-lock UPDATE — `WHERE id = $1 AND version = $2`.
         Shape::with(
             r#"UPDATE "members" SET "email" = $1, "version" = "version" + 1 WHERE "id" = $2 AND "version" = $3"#,
-            &[ParamValue::Text("a2@x.com"), ParamValue::I64(1), ParamValue::I64(0)],
+            &[
+                ParamValue::Text("a2@x.com"),
+                ParamValue::I64(1),
+                ParamValue::I64(0),
+            ],
         ),
         // Migration breadth — drizzle-kit `ALTER TABLE … ADD COLUMN`.
         Shape::raw(r#"ALTER TABLE "members" ADD COLUMN "nickname" text"#),
@@ -565,41 +593,71 @@ async fn orm_compat_corpus_ext() {
         // .exists() idiom — `SELECT 1 ... LIMIT 1` then truthiness.
         Shape::raw(r#"SELECT (1) AS "a" FROM "members" WHERE "members"."role" = 'ADMIN' LIMIT 1"#),
         // .latest('created_at') — ORDER BY DESC LIMIT 1.
-        Shape::raw(r#"SELECT "members"."id","members"."created_at" FROM "members" ORDER BY "members"."created_at" DESC LIMIT 1"#),
+        Shape::raw(
+            r#"SELECT "members"."id","members"."created_at" FROM "members" ORDER BY "members"."created_at" DESC LIMIT 1"#,
+        ),
         // .first() — ORDER BY pk ASC LIMIT 1.
         Shape::raw(r#"SELECT "members"."id" FROM "members" ORDER BY "members"."id" ASC LIMIT 1"#),
         // .values_list('id', flat=True) — single-column projection.
         Shape::raw(r#"SELECT "members"."id" FROM "members" ORDER BY "members"."id" ASC"#),
         // annotate(Count/Sum/Avg) + values — group annotation.
-        Shape::raw(r#"SELECT "events"."member_id", COUNT("events"."id") AS "n", SUM("events"."amount") AS "total", AVG("events"."amount") AS "avg" FROM "events" GROUP BY "events"."member_id" ORDER BY "events"."member_id" ASC"#),
+        Shape::raw(
+            r#"SELECT "events"."member_id", COUNT("events"."id") AS "n", SUM("events"."amount") AS "total", AVG("events"."amount") AS "avg" FROM "events" GROUP BY "events"."member_id" ORDER BY "events"."member_id" ASC"#,
+        ),
         // .distinct('role') ⇒ DISTINCT ON (Postgres-only Django feature).
-        Shape::raw(r#"SELECT DISTINCT ON ("members"."role") "members"."role","members"."id" FROM "members" ORDER BY "members"."role" ASC, "members"."id" ASC"#),
+        Shape::raw(
+            r#"SELECT DISTINCT ON ("members"."role") "members"."role","members"."id" FROM "members" ORDER BY "members"."role" ASC, "members"."id" ASC"#,
+        ),
         // JSONField __contains — `meta__contains={'plan':'pro'}` ⇒ `@>`.
-        Shape::raw(r#"SELECT "members"."id" FROM "members" WHERE "members"."meta" @> '{"plan": "pro"}'"#),
+        Shape::raw(
+            r#"SELECT "members"."id" FROM "members" WHERE "members"."meta" @> '{"plan": "pro"}'"#,
+        ),
         // JSONField __has_key — `meta__has_key='plan'` ⇒ `?`.
         Shape::raw(r#"SELECT "members"."id" FROM "members" WHERE "members"."meta" ? 'plan'"#),
         // JSONField key transform — `meta__plan='pro'` ⇒ `->> 'plan' = 'pro'`.
-        Shape::raw(r#"SELECT "members"."id" FROM "members" WHERE ("members"."meta" ->> 'plan') = 'pro'"#),
+        Shape::raw(
+            r#"SELECT "members"."id" FROM "members" WHERE ("members"."meta" ->> 'plan') = 'pro'"#,
+        ),
         // ArrayField __contains — `tags__contains=['rust']` ⇒ `@>`.
-        Shape::raw(r#"SELECT "members"."id" FROM "members" WHERE "members"."tags" @> ARRAY['rust']::text[]"#),
+        Shape::raw(
+            r#"SELECT "members"."id" FROM "members" WHERE "members"."tags" @> ARRAY['rust']::text[]"#,
+        ),
         // ArrayField __overlap — `tags__overlap=['go','rust']` ⇒ `&&`.
-        Shape::raw(r#"SELECT "members"."id" FROM "members" WHERE "members"."tags" && ARRAY['go','rust']::text[]"#),
+        Shape::raw(
+            r#"SELECT "members"."id" FROM "members" WHERE "members"."tags" && ARRAY['go','rust']::text[]"#,
+        ),
         // __date filter — `occurred_at__date=...` ⇒ ::date cast comparison.
-        Shape::raw(r#"SELECT "events"."id" FROM "events" WHERE ("events"."occurred_at")::date = '2024-03-01'"#),
+        Shape::raw(
+            r#"SELECT "events"."id" FROM "events" WHERE ("events"."occurred_at")::date = '2024-03-01'"#,
+        ),
         // __year filter — `occurred_at__year=2024` ⇒ EXTRACT comparison.
-        Shape::raw(r#"SELECT "events"."id" FROM "events" WHERE EXTRACT('year' FROM "events"."occurred_at") = 2024"#),
+        Shape::raw(
+            r#"SELECT "events"."id" FROM "events" WHERE EXTRACT('year' FROM "events"."occurred_at") = 2024"#,
+        ),
         // select_for_update() inside atomic — wrapped BEGIN/COMMIT.
-        Shape::raw(r#"BEGIN; SELECT "members"."id" FROM "members" WHERE "members"."id" = 1 FOR UPDATE; COMMIT;"#),
+        Shape::raw(
+            r#"BEGIN; SELECT "members"."id" FROM "members" WHERE "members"."id" = 1 FOR UPDATE; COMMIT;"#,
+        ),
         // select_for_update(skip_locked=True) — Django 1.11+ queue pattern.
-        Shape::raw(r#"BEGIN; SELECT "events"."id" FROM "events" WHERE "events"."kind" = 'purchase' ORDER BY "events"."id" ASC LIMIT 1 FOR UPDATE SKIP LOCKED; COMMIT;"#),
+        Shape::raw(
+            r#"BEGIN; SELECT "events"."id" FROM "events" WHERE "events"."kind" = 'purchase' ORDER BY "events"."id" ASC LIMIT 1 FOR UPDATE SKIP LOCKED; COMMIT;"#,
+        ),
         // select_for_update(nowait=True).
-        Shape::raw(r#"BEGIN; SELECT "members"."id" FROM "members" WHERE "members"."id" = 1 FOR UPDATE NOWAIT; COMMIT;"#),
+        Shape::raw(
+            r#"BEGIN; SELECT "members"."id" FROM "members" WHERE "members"."id" = 1 FOR UPDATE NOWAIT; COMMIT;"#,
+        ),
         // bulk_create(..., ignore_conflicts=True) — INSERT … ON CONFLICT DO NOTHING.
-        Shape::raw(r#"INSERT INTO "members" ("id","email","role") VALUES (60,'d60@x.com','USER'),(61,'d61@x.com','USER') ON CONFLICT DO NOTHING"#),
+        Shape::raw(
+            r#"INSERT INTO "members" ("id","email","role") VALUES (60,'d60@x.com','USER'),(61,'d61@x.com','USER') ON CONFLICT DO NOTHING"#,
+        ),
         // bulk_update — Django emits a CASE-based single UPDATE.
-        Shape::raw(r#"UPDATE "members" SET "version" = CASE WHEN "id" = 1 THEN 5 WHEN "id" = 2 THEN 6 ELSE "version" END WHERE "id" IN (1,2)"#),
+        Shape::raw(
+            r#"UPDATE "members" SET "version" = CASE WHEN "id" = 1 THEN 5 WHEN "id" = 2 THEN 6 ELSE "version" END WHERE "id" IN (1,2)"#,
+        ),
         // F() expression UPDATE — `update(amount=F('amount')+1)`.
-        Shape::raw(r#"UPDATE "events" SET "amount" = ("events"."amount" + 1.00) WHERE "events"."kind" = 'purchase'"#),
+        Shape::raw(
+            r#"UPDATE "events" SET "amount" = ("events"."amount" + 1.00) WHERE "events"."kind" = 'purchase'"#,
+        ),
         // Migration breadth — Django schema editor `RENAME COLUMN`.
         Shape::raw(r#"ALTER TABLE "events" RENAME COLUMN "kind" TO "event_kind""#),
         // …then rename it back so later shapes referencing "kind" still resolve.
@@ -609,7 +667,9 @@ async fn orm_compat_corpus_ext() {
         // Migration breadth — add FK after creation (Django AddField FK).
         // Now supported: ALTER ADD CONSTRAINT FOREIGN KEY registers the FK in
         // catalog metadata (enforcement on subsequent writes; backfill deferred).
-        Shape::raw(r#"ALTER TABLE "event_lines" ADD CONSTRAINT "event_lines_event_fk" FOREIGN KEY ("event_id") REFERENCES "events" ("id")"#),
+        Shape::raw(
+            r#"ALTER TABLE "event_lines" ADD CONSTRAINT "event_lines_event_fk" FOREIGN KEY ("event_id") REFERENCES "events" ("id")"#,
+        ),
         // Session cleanup guard (mirrors orm_compat.rs convention).
         Shape::raw(r#"ROLLBACK"#),
     ];
@@ -631,36 +691,52 @@ async fn orm_compat_corpus_ext() {
         // func.count() scalar — `session.scalar(select(func.count()).select_from(M))`.
         Shape::raw(r#"SELECT count(*) AS "count_1" FROM "members""#),
         // exists() — `select(M).exists()` wrapped in EXISTS.
-        Shape::raw(r#"SELECT EXISTS (SELECT 1 FROM "members" WHERE "members"."role" = 'ADMIN') AS "anon_1""#),
+        Shape::raw(
+            r#"SELECT EXISTS (SELECT 1 FROM "members" WHERE "members"."role" = 'ADMIN') AS "anon_1""#,
+        ),
         // group_by + func aggregates.
-        Shape::raw(r#"SELECT "events"."member_id", count("events"."id") AS "n", sum("events"."amount") AS "s" FROM "events" GROUP BY "events"."member_id" ORDER BY "events"."member_id""#),
+        Shape::raw(
+            r#"SELECT "events"."member_id", count("events"."id") AS "n", sum("events"."amount") AS "s" FROM "events" GROUP BY "events"."member_id" ORDER BY "events"."member_id""#,
+        ),
         // JSONB `[].astext` — `M.meta['plan'].astext == 'pro'` ⇒ `->>`.
         Shape::with(
             r#"SELECT "members"."id" FROM "members" WHERE ("members"."meta" ->> $1) = $2"#,
             &[ParamValue::Text("plan"), ParamValue::Text("pro")],
         ),
         // JSONB `.contains()` ⇒ `@>`.
-        Shape::raw(r#"SELECT "members"."id" FROM "members" WHERE "members"."meta" @> '{"plan": "pro"}'"#),
+        Shape::raw(
+            r#"SELECT "members"."id" FROM "members" WHERE "members"."meta" @> '{"plan": "pro"}'"#,
+        ),
         // JSONB `.has_key()` ⇒ `?`.
         Shape::raw(r#"SELECT "members"."id" FROM "members" WHERE "members"."meta" ? 'plan'"#),
         // ARRAY `.contains()` ⇒ `@>`.
-        Shape::raw(r#"SELECT "members"."id" FROM "members" WHERE "members"."tags" @> ARRAY['rust']"#),
+        Shape::raw(
+            r#"SELECT "members"."id" FROM "members" WHERE "members"."tags" @> ARRAY['rust']"#,
+        ),
         // ARRAY `.overlap()` ⇒ `&&`.
         Shape::raw(r#"SELECT "members"."id" FROM "members" WHERE "members"."tags" && ARRAY['go']"#),
         // selectin eager load — the IN-list second query.
-        Shape::raw(r#"SELECT "events"."id","events"."member_id" FROM "events" WHERE "events"."member_id" IN (1, 2) ORDER BY "events"."member_id""#),
+        Shape::raw(
+            r#"SELECT "events"."id","events"."member_id" FROM "events" WHERE "events"."member_id" IN (1, 2) ORDER BY "events"."member_id""#,
+        ),
         // numeric round-trip — `Numeric(12,2)` column with arithmetic.
-        Shape::raw(r#"SELECT "members"."id", "members"."balance" + 0.01 AS "bal" FROM "members" WHERE "members"."balance" IS NOT NULL"#),
+        Shape::raw(
+            r#"SELECT "members"."id", "members"."balance" + 0.01 AS "bal" FROM "members" WHERE "members"."balance" IS NOT NULL"#,
+        ),
         // date_trunc — `func.date_trunc('month', col)`.
-        Shape::raw(r#"SELECT date_trunc('month', "events"."occurred_at") AS "m", count(*) AS "c" FROM "events" GROUP BY date_trunc('month', "events"."occurred_at") ORDER BY "m""#),
+        Shape::raw(
+            r#"SELECT date_trunc('month', "events"."occurred_at") AS "m", count(*) AS "c" FROM "events" GROUP BY date_trunc('month', "events"."occurred_at") ORDER BY "m""#,
+        ),
         // text() raw escape hatch with named params re-emitted positional.
         Shape::with(
             r#"SELECT "id" FROM "members" WHERE "email" = $1"#,
             &[ParamValue::Text("a@x.com")],
         ),
         // upsert — `insert(M).on_conflict_do_update` (PG dialect, composite).
-        Shape::raw(r#"INSERT INTO "memberships" ("org_id","user_id","level") VALUES (1,2,'lead')
-           ON CONFLICT ("org_id","user_id") DO UPDATE SET "level" = EXCLUDED."level""#),
+        Shape::raw(
+            r#"INSERT INTO "memberships" ("org_id","user_id","level") VALUES (1,2,'lead')
+           ON CONFLICT ("org_id","user_id") DO UPDATE SET "level" = EXCLUDED."level""#,
+        ),
         // Alembic migration breadth — `op.add_column`.
         Shape::raw(r#"ALTER TABLE "members" ADD COLUMN "phone" varchar"#),
         // Alembic `op.alter_column(type_=...)`.
@@ -686,7 +762,9 @@ async fn orm_compat_corpus_ext() {
             &[ParamValue::Text("USER")],
         ),
         // db.Model(&M{}).Group("member_id").Select("member_id, count(*)").
-        Shape::raw(r#"SELECT "member_id", count(*) AS "c", sum("amount") AS "s" FROM "events" GROUP BY "member_id" ORDER BY "member_id""#),
+        Shape::raw(
+            r#"SELECT "member_id", count(*) AS "c", sum("amount") AS "s" FROM "events" GROUP BY "member_id" ORDER BY "member_id""#,
+        ),
         // db.Distinct("role").Find — DISTINCT projection.
         Shape::raw(r#"SELECT DISTINCT "role" FROM "members""#),
         // db.Model(&M{}).Where(...).Count(&n).
@@ -712,7 +790,9 @@ async fn orm_compat_corpus_ext() {
             &[ParamValue::Text("pro")],
         ),
         // gorm.Model soft-delete read — `deleted_at IS NULL` injected.
-        Shape::raw(r#"SELECT * FROM "members" WHERE "members"."deleted_at" IS NULL ORDER BY "members"."id""#),
+        Shape::raw(
+            r#"SELECT * FROM "members" WHERE "members"."deleted_at" IS NULL ORDER BY "members"."id""#,
+        ),
         // gorm soft delete — UPDATE deleted_at = now() (the Delete() emission).
         // GORM pgx binds the timestamp as a typed string over pgx; the harness has
         // no Timestamptz ParamValue variant, so inline the literal with ::timestamptz
@@ -730,12 +810,19 @@ async fn orm_compat_corpus_ext() {
         // composite ON CONFLICT upsert — gorm OnConflict with multiple Columns.
         Shape::with(
             r#"INSERT INTO "memberships" ("org_id","user_id","level") VALUES ($1,$2,$3) ON CONFLICT ("org_id","user_id") DO UPDATE SET "level"="excluded"."level""#,
-            &[ParamValue::I64(1), ParamValue::I64(1), ParamValue::Text("staff")],
+            &[
+                ParamValue::I64(1),
+                ParamValue::I64(1),
+                ParamValue::Text("staff"),
+            ],
         ),
         // AutoMigrate HasIndex probe — gorm queries pg_indexes.
         Shape::with(
             r#"SELECT count(*) FROM pg_indexes WHERE tablename = $1 AND indexname = $2"#,
-            &[ParamValue::Text("members"), ParamValue::Text("idx_members_role")],
+            &[
+                ParamValue::Text("members"),
+                ParamValue::Text("idx_members_role"),
+            ],
         ),
         // AutoMigrate CreateIndex — gorm DDL.
         Shape::raw(r#"CREATE INDEX IF NOT EXISTS "idx_members_role" ON "members" ("role")"#),
@@ -750,35 +837,51 @@ async fn orm_compat_corpus_ext() {
         // .setLock('pessimistic_write') ⇒ `FOR UPDATE`.
         Shape::raw(r#"SELECT "m"."id" AS "m_id" FROM "members" "m" WHERE "m"."id" = 1 FOR UPDATE"#),
         // .setLock('pessimistic_write', undefined, ['m']) + skip-locked.
-        Shape::raw(r#"SELECT "m"."id" AS "m_id" FROM "members" "m" WHERE "m"."role" = 'USER' LIMIT 1 FOR UPDATE SKIP LOCKED"#),
+        Shape::raw(
+            r#"SELECT "m"."id" AS "m_id" FROM "members" "m" WHERE "m"."role" = 'USER' LIMIT 1 FOR UPDATE SKIP LOCKED"#,
+        ),
         // .setLock('pessimistic_read') ⇒ `FOR SHARE`.
         Shape::raw(r#"SELECT "m"."id" AS "m_id" FROM "members" "m" WHERE "m"."id" = 1 FOR SHARE"#),
         // getCount() — wraps the query in COUNT(DISTINCT primary).
         Shape::raw(r#"SELECT COUNT(DISTINCT("m"."id")) AS "cnt" FROM "members" "m""#),
         // .groupBy + addSelect aggregates.
-        Shape::raw(r#"SELECT "e"."member_id" AS "mid", COUNT(*) AS "c", SUM("e"."amount") AS "s" FROM "events" "e" GROUP BY "e"."member_id" ORDER BY "e"."member_id" ASC"#),
+        Shape::raw(
+            r#"SELECT "e"."member_id" AS "mid", COUNT(*) AS "c", SUM("e"."amount") AS "s" FROM "events" "e" GROUP BY "e"."member_id" ORDER BY "e"."member_id" ASC"#,
+        ),
         // .softDelete() ⇒ UPDATE deleted_at = NOW() WHERE … AND deleted_at IS NULL.
-        Shape::raw(r#"UPDATE "members" SET "deleted_at" = NOW() WHERE "id" = 2 AND "deleted_at" IS NULL"#),
+        Shape::raw(
+            r#"UPDATE "members" SET "deleted_at" = NOW() WHERE "id" = 2 AND "deleted_at" IS NULL"#,
+        ),
         // soft-delete-aware read — TypeORM appends `deleted_at IS NULL`.
-        Shape::raw(r#"SELECT "m"."id" AS "m_id" FROM "members" "m" WHERE "m"."deleted_at" IS NULL"#),
+        Shape::raw(
+            r#"SELECT "m"."id" AS "m_id" FROM "members" "m" WHERE "m"."deleted_at" IS NULL"#,
+        ),
         // optimistic @VersionColumn UPDATE — `WHERE id = $1 AND version = $2`.
         Shape::with(
             r#"UPDATE "members" SET "email" = $1, "version" = "version" + 1 WHERE "id" = $2 AND "version" = $3"#,
-            &[ParamValue::Text("a3@x.com"), ParamValue::I64(1), ParamValue::I64(0)],
+            &[
+                ParamValue::Text("a3@x.com"),
+                ParamValue::I64(1),
+                ParamValue::I64(0),
+            ],
         ),
         // .upsert([...], { conflictPaths: ['org_id','user_id'] }) — composite.
-        Shape::raw(r#"INSERT INTO "memberships" ("org_id","user_id","level") VALUES (1,2,'viewer') ON CONFLICT ("org_id","user_id") DO UPDATE SET "level" = EXCLUDED."level""#),
+        Shape::raw(
+            r#"INSERT INTO "memberships" ("org_id","user_id","level") VALUES (1,2,'viewer') ON CONFLICT ("org_id","user_id") DO UPDATE SET "level" = EXCLUDED."level""#,
+        ),
         // keyset pagination over an indexed column.
         Shape::with(
             r#"SELECT "m"."id" AS "m_id" FROM "members" "m" WHERE "m"."id" > $1 ORDER BY "m"."id" ASC LIMIT 5"#,
             &[ParamValue::I64(0)],
         ),
         // depth-3 eager LEFT JOIN chain — members → events → event_lines.
-        Shape::raw(r#"SELECT "m"."id" AS "m_id", "e"."id" AS "e_id", "el"."id" AS "el_id", "el"."label" AS "el_label"
+        Shape::raw(
+            r#"SELECT "m"."id" AS "m_id", "e"."id" AS "e_id", "el"."id" AS "el_id", "el"."label" AS "el_label"
            FROM "members" "m"
            LEFT JOIN "events" "e" ON "e"."member_id" = "m"."id"
            LEFT JOIN "event_lines" "el" ON "el"."event_id" = "e"."id"
-           ORDER BY "m"."id" ASC, "e"."id" ASC, "el"."id" ASC"#),
+           ORDER BY "m"."id" ASC, "e"."id" ASC, "el"."id" ASC"#,
+        ),
         // Migration breadth — TypeORM `ALTER TABLE … RENAME COLUMN`.
         Shape::raw(r#"ALTER TABLE "members" RENAME COLUMN "balance" TO "bal""#),
         // …rename back.
@@ -799,7 +902,9 @@ async fn orm_compat_corpus_ext() {
         // FOR NO KEY UPDATE — lighter lock for the same queue pattern.
         Shape::raw(r#"SELECT id FROM "events" ORDER BY id LIMIT 1 FOR NO KEY UPDATE SKIP LOCKED"#),
         // group_by aggregate via query_as!.
-        Shape::raw(r#"SELECT member_id, COUNT(*) AS n, SUM(amount) AS total FROM "events" GROUP BY member_id ORDER BY member_id"#),
+        Shape::raw(
+            r#"SELECT member_id, COUNT(*) AS n, SUM(amount) AS total FROM "events" GROUP BY member_id ORDER BY member_id"#,
+        ),
         // jsonb path extract bound filter.
         Shape::with(
             r#"SELECT id FROM "members" WHERE meta->>'plan' = $1"#,
@@ -808,9 +913,7 @@ async fn orm_compat_corpus_ext() {
         // numeric round-trip with bound numeric arithmetic.
         // sqlx drives Decimal via its own codec; the harness has no Numeric
         // ParamValue variant, so inline the threshold literal with ::numeric.
-        Shape::raw(
-            r#"SELECT id FROM "members" WHERE balance > 50.0::numeric"#,
-        ),
+        Shape::raw(r#"SELECT id FROM "members" WHERE balance > 50.0::numeric"#),
         // bytea round-trip — sqlx `Vec<u8>` bind.
         Shape::with(
             r#"SELECT $1::bytea AS "blob""#,

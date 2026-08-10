@@ -72,7 +72,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -113,7 +117,16 @@ async fn gin_flood_does_not_evict_other_projects_postings() {
     // Project B: a small, stable set of unique terms (well under the 500 floor).
     for i in 0..20i64 {
         let doc = serde_json::to_vec(&json!({ "owner": "b", "ref": format!("b-{i}") })).unwrap();
-        registry.index_row(&pb, &table, col, opclass, &doc, "b_file.parquet", 0, i as u64);
+        registry.index_row(
+            &pb,
+            &table,
+            col,
+            opclass,
+            &doc,
+            "b_file.parquet",
+            0,
+            i as u64,
+        );
         registry.mark_file_indexed(&pb, &table, col, "b_file.parquet");
     }
     let b_pairs_before = registry.project_pair_count(&pb);
@@ -127,7 +140,16 @@ async fn gin_flood_does_not_evict_other_projects_postings() {
     // its per-project partition, forcing repeated eviction on A's list.
     for i in 0..6000i64 {
         let doc = serde_json::to_vec(&json!({ "owner": "a", "uniq": format!("a-{i}") })).unwrap();
-        registry.index_row(&pa, &table, col, opclass, &doc, "a_file.parquet", 0, i as u64);
+        registry.index_row(
+            &pa,
+            &table,
+            col,
+            opclass,
+            &doc,
+            "a_file.parquet",
+            0,
+            i as u64,
+        );
     }
     assert!(
         registry.has_evicted(&pa, &table, col),
@@ -186,9 +208,11 @@ async fn overlay_reconciler_round_robin_drains_small_project_under_flood() {
     const A_TABLES: usize = 12;
     for t in 0..A_TABLES {
         let name = format!("a_t{t}");
-        sa.execute(&format!("CREATE TABLE {name} (id BIGINT PRIMARY KEY, v BIGINT)"))
-            .await
-            .unwrap();
+        sa.execute(&format!(
+            "CREATE TABLE {name} (id BIGINT PRIMARY KEY, v BIGINT)"
+        ))
+        .await
+        .unwrap();
         sa.execute(&format!("INSERT INTO {name} VALUES (1, 1), (2, 2), (3, 3)"))
             .await
             .unwrap();

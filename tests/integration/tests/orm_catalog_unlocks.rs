@@ -132,7 +132,11 @@ async fn pg_index_emits_pk_and_user_indexes() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT, tenant BIGINT)").await;
+    exec(
+        &sess,
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT, tenant BIGINT)",
+    )
+    .await;
     exec(&sess, "CREATE INDEX users_tenant_idx ON users(tenant)").await;
     exec(&sess, "CREATE UNIQUE INDEX users_email_uq ON users(email)").await;
 
@@ -143,7 +147,11 @@ async fn pg_index_emits_pk_and_user_indexes() {
     )
     .await;
 
-    assert_eq!(data.len(), 3, "expected pkey + 2 user indexes, got {data:?}");
+    assert_eq!(
+        data.len(),
+        3,
+        "expected pkey + 2 user indexes, got {data:?}"
+    );
 
     // Build a name->row lookup by joining indexrelid against pg_class below;
     // first verify the three expected shapes are present by their flags.
@@ -155,7 +163,10 @@ async fn pg_index_emits_pk_and_user_indexes() {
     // Every row must be valid.
     for row in &data {
         assert_eq!(row[valid_i], "true", "indisvalid must be true: {row:?}");
-        assert_eq!(row[natts_i], "1", "all indexes are single-column here: {row:?}");
+        assert_eq!(
+            row[natts_i], "1",
+            "all indexes are single-column here: {row:?}"
+        );
     }
 
     // Exactly one primary, and it is unique.
@@ -177,7 +188,11 @@ async fn pg_index_join_pg_class_resolves_names() {
     let (_dir, engine) = open_engine().await;
     let sess = engine.open_session(ProjectId::new()).await.unwrap();
 
-    exec(&sess, "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT)").await;
+    exec(
+        &sess,
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT)",
+    )
+    .await;
     exec(&sess, "CREATE UNIQUE INDEX users_email_uq ON users(email)").await;
 
     // The classic ORM introspection join: index relation name + parent table
@@ -234,7 +249,11 @@ async fn pg_index_join_pg_attribute_resolves_columns() {
     )
     .await;
 
-    assert_eq!(data.len(), 1, "PK index keys on exactly one column: {data:?}");
+    assert_eq!(
+        data.len(),
+        1,
+        "PK index keys on exactly one column: {data:?}"
+    );
     assert_eq!(data[0][col(&h, "index_name")], "t_pkey");
     assert_eq!(data[0][col(&h, "column_name")], "id");
 }
@@ -320,7 +339,11 @@ async fn pg_type_and_pg_enum_for_user_enum() {
         .iter()
         .map(|r| r[col(&h2, "enumlabel")].as_str())
         .collect();
-    assert_eq!(labels, vec!["sad", "ok", "happy"], "labels in declaration order");
+    assert_eq!(
+        labels,
+        vec!["sad", "ok", "happy"],
+        "labels in declaration order"
+    );
 
     // Sort order is 1-based ascending.
     assert_eq!(data2[0][col(&h2, "enumsortorder")], "1");

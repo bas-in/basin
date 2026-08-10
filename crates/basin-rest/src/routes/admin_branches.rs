@@ -213,11 +213,7 @@ mod tests {
     // Helper: create a table and append one data file so it has a real snapshot.
     // -------------------------------------------------------------------------
 
-    async fn seed_table(
-        cat: &Arc<InMemoryCatalog>,
-        project: &ProjectId,
-        name: &str,
-    ) -> TableName {
+    async fn seed_table(cat: &Arc<InMemoryCatalog>, project: &ProjectId, name: &str) -> TableName {
         let table = TableName::new(name).unwrap();
         let schema = Schema::new(vec![Field::new("v", DataType::Int64, false)]);
         cat.create_table(project, &table, &schema)

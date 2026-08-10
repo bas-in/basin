@@ -60,7 +60,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -92,9 +96,11 @@ async fn delete_latency_probe() {
         let table = format!("t{scale}");
         // Single-column PK so the fast-path DELETE + #204 single-column-PK sort
         // apply.
-        sess.execute(&format!("CREATE TABLE {table} (id BIGINT PRIMARY KEY, v BIGINT)"))
-            .await
-            .unwrap();
+        sess.execute(&format!(
+            "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v BIGINT)"
+        ))
+        .await
+        .unwrap();
         // Seed up to `scale` via the engine INSERT path (NOT raw
         // storage.write_batch) in 10k batches — each batch is a disjoint id
         // range, so after flush it becomes one Parquet file with a tight PK

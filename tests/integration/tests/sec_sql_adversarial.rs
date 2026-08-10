@@ -83,7 +83,11 @@ async fn build() -> (
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
     let engine = Engine::new(EngineConfig {
         storage,
@@ -133,9 +137,7 @@ fn require_typed_classified(e: BasinError, ctx: &str) {
         );
     }
     if matches!(e, BasinError::IsolationViolation(_)) {
-        panic!(
-            "SECURITY: {ctx} produced IsolationViolation: {e}"
-        );
+        panic!("SECURITY: {ctx} produced IsolationViolation: {e}");
     }
 }
 

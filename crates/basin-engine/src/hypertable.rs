@@ -286,11 +286,7 @@ impl HypertableRegistry {
     }
 
     /// Mark a chunk compressed by name (returns `false` if not found).
-    pub(crate) async fn compress_chunk(
-        &self,
-        project: &ProjectId,
-        chunk_name: &str,
-    ) -> bool {
+    pub(crate) async fn compress_chunk(&self, project: &ProjectId, chunk_name: &str) -> bool {
         let Some(arc) = self.inner.get(project).map(|e| e.clone()) else {
             return false;
         };
@@ -304,11 +300,7 @@ impl HypertableRegistry {
     }
 
     /// Return the time column for a hypertable (for INSERT routing).
-    pub(crate) async fn time_column(
-        &self,
-        project: &ProjectId,
-        table: &str,
-    ) -> Option<String> {
+    pub(crate) async fn time_column(&self, project: &ProjectId, table: &str) -> Option<String> {
         let Some(arc) = self.inner.get(project).map(|e| e.clone()) else {
             return None;
         };
@@ -317,11 +309,7 @@ impl HypertableRegistry {
     }
 
     /// Return the retention window in seconds for a hypertable, if set.
-    pub(crate) async fn retention_secs(
-        &self,
-        project: &ProjectId,
-        table: &str,
-    ) -> Option<u64> {
+    pub(crate) async fn retention_secs(&self, project: &ProjectId, table: &str) -> Option<u64> {
         let Some(arc) = self.inner.get(project).map(|e| e.clone()) else {
             return None;
         };
@@ -360,7 +348,11 @@ impl HypertableRegistry {
             return vec![];
         };
         let guard = arc.lock().await;
-        guard.tables.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        guard
+            .tables
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 }
 
@@ -396,15 +388,27 @@ fn parse_interval_secs_fallback(s: &str) -> Option<u64> {
     let mut total: u64 = 0;
     let mut saw = false;
     while i < bytes.len() {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
-        if i >= bytes.len() { break; }
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
         let num_start = i;
-        while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
-        if i == num_start { return None; }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == num_start {
+            return None;
+        }
         let n: u64 = s[num_start..i].parse().ok()?;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
         let unit_start = i;
-        while i < bytes.len() && bytes[i].is_ascii_alphabetic() { i += 1; }
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
         let unit = s[unit_start..i].to_ascii_lowercase();
         let factor: u64 = match unit.as_str() {
             "s" | "sec" | "secs" | "second" | "seconds" => 1,
@@ -417,7 +421,11 @@ fn parse_interval_secs_fallback(s: &str) -> Option<u64> {
         total = total.checked_add(n.checked_mul(factor)?)?;
         saw = true;
     }
-    if saw { Some(total) } else { None }
+    if saw {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 // ─── SQL text matchers ────────────────────────────────────────────────────────
@@ -444,7 +452,8 @@ pub(crate) fn match_create_hypertable(sql: &str) -> Option<(String, String, Stri
         return None;
     }
     // Find the original-case args by locating create_hypertable in the original sql.
-    let orig_start = sql.to_ascii_lowercase().find("create_hypertable")? + "create_hypertable".len();
+    let orig_start =
+        sql.to_ascii_lowercase().find("create_hypertable")? + "create_hypertable".len();
     let original_args = paren_contents(&sql[orig_start..])?;
 
     // Parse comma-separated args (simple: split on commas not inside quotes)
@@ -467,15 +476,22 @@ pub(crate) fn match_create_hypertable(sql: &str) -> Option<(String, String, Stri
 /// Returns `(table_name, interval_text)`.
 pub(crate) fn match_add_retention_policy(sql: &str) -> Option<(String, String)> {
     let lower = sql.trim().to_ascii_lowercase();
-    if !lower.starts_with("select") { return None; }
-    if !lower.contains("add_retention_policy") { return None; }
+    if !lower.starts_with("select") {
+        return None;
+    }
+    if !lower.contains("add_retention_policy") {
+        return None;
+    }
 
-    let start = sql.find("add_retention_policy")
+    let start = sql
+        .find("add_retention_policy")
         .or_else(|| sql.to_ascii_lowercase().find("add_retention_policy"))?
         + "add_retention_policy".len();
     let args = paren_contents(&sql[start..])?;
     let parts = split_args(args);
-    if parts.len() < 2 { return None; }
+    if parts.len() < 2 {
+        return None;
+    }
     let table = strip_quotes(parts[0].trim());
     let rest = parts[1..].join(",");
     let rest_lower = rest.to_ascii_lowercase();
@@ -492,13 +508,19 @@ pub(crate) fn match_add_retention_policy(sql: &str) -> Option<(String, String)> 
 /// `older_than` (the overwhelmingly dominant use-case).
 pub(crate) fn match_drop_chunks(sql: &str) -> Option<(String, DropChunksCutoff)> {
     let lower = sql.trim().to_ascii_lowercase();
-    if !lower.starts_with("select") { return None; }
-    if !lower.contains("drop_chunks") { return None; }
+    if !lower.starts_with("select") {
+        return None;
+    }
+    if !lower.contains("drop_chunks") {
+        return None;
+    }
 
     let start = sql.to_ascii_lowercase().find("drop_chunks")? + "drop_chunks".len();
     let args = paren_contents(&sql[start..])?;
     let parts = split_args(args);
-    if parts.is_empty() { return None; }
+    if parts.is_empty() {
+        return None;
+    }
     let table = strip_quotes(parts[0].trim());
 
     // Look for `older_than => INTERVAL '...'`
@@ -534,15 +556,22 @@ pub(crate) enum DropChunksCutoff {
 /// Match `SELECT run_retention_policy('table')`.
 pub(crate) fn match_run_retention_policy(sql: &str) -> Option<String> {
     let lower = sql.trim().to_ascii_lowercase();
-    if !lower.starts_with("select") { return None; }
-    if !lower.contains("run_retention_policy") { return None; }
+    if !lower.starts_with("select") {
+        return None;
+    }
+    if !lower.contains("run_retention_policy") {
+        return None;
+    }
 
-    let start = sql.find("run_retention_policy")
+    let start = sql
+        .find("run_retention_policy")
         .or_else(|| sql.to_ascii_lowercase().find("run_retention_policy"))?
         + "run_retention_policy".len();
     let args = paren_contents(&sql[start..])?;
     let parts = split_args(args);
-    if parts.is_empty() { return None; }
+    if parts.is_empty() {
+        return None;
+    }
     Some(strip_quotes(parts[0].trim()))
 }
 
@@ -552,8 +581,12 @@ pub(crate) fn match_run_retention_policy(sql: &str) -> Option<String> {
 /// For the subquery form, return a sentinel that the executor recognises.
 pub(crate) fn match_compress_chunk(sql: &str) -> Option<CompressChunkIntent> {
     let lower = sql.trim().to_ascii_lowercase();
-    if !lower.starts_with("select") { return None; }
-    if !lower.contains("compress_chunk") { return None; }
+    if !lower.starts_with("select") {
+        return None;
+    }
+    if !lower.contains("compress_chunk") {
+        return None;
+    }
 
     // Check for the subquery form: compress_chunk(c.chunk_schema || '.' || c.chunk_name)
     // followed by FROM timescaledb_information.chunks
@@ -572,7 +605,9 @@ pub(crate) fn match_compress_chunk(sql: &str) -> Option<CompressChunkIntent> {
     let start = sql.to_ascii_lowercase().find("compress_chunk")? + "compress_chunk".len();
     let args = paren_contents(&sql[start..])?;
     let parts = split_args(args);
-    if parts.is_empty() { return None; }
+    if parts.is_empty() {
+        return None;
+    }
     let raw = strip_quotes(parts[0].trim());
     // strip schema prefix if present
     let chunk_name = raw.split('.').last().unwrap_or(&raw).to_string();
@@ -588,8 +623,13 @@ pub(crate) fn match_alter_table_timescaledb_compress(sql: &str) -> bool {
 /// Intent for a `compress_chunk` call.
 #[derive(Debug)]
 pub(crate) enum CompressChunkIntent {
-    Named { chunk_name: String },
-    AllForTable { hypertable_name: String, before_ts: Option<String> },
+    Named {
+        chunk_name: String,
+    },
+    AllForTable {
+        hypertable_name: String,
+        before_ts: Option<String>,
+    },
     AllUnfiltered,
 }
 
@@ -599,7 +639,9 @@ pub(crate) enum CompressChunkIntent {
 /// with (optional whitespace then) `(`.
 fn paren_contents(s: &str) -> Option<&str> {
     let s = s.trim_start();
-    if !s.starts_with('(') { return None; }
+    if !s.starts_with('(') {
+        return None;
+    }
     let bytes = s.as_bytes();
     let mut depth = 0usize;
     let mut i = 0usize;
@@ -608,10 +650,14 @@ fn paren_contents(s: &str) -> Option<&str> {
         match bytes[i] {
             b'(' => {
                 depth += 1;
-                if depth == 1 { open_pos = Some(i); }
+                if depth == 1 {
+                    open_pos = Some(i);
+                }
             }
             b')' => {
-                if depth == 0 { break; }
+                if depth == 0 {
+                    break;
+                }
                 depth -= 1;
                 if depth == 0 {
                     let start = open_pos? + 1;
@@ -642,10 +688,16 @@ fn split_args(s: &str) -> Vec<&str> {
     while i < bytes.len() {
         match bytes[i] {
             b'(' => depth += 1,
-            b')' => { if depth > 0 { depth -= 1; } }
+            b')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
             b'\'' => {
                 i += 1;
-                while i < bytes.len() && bytes[i] != b'\'' { i += 1; }
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    i += 1;
+                }
             }
             b',' if depth == 0 => {
                 parts.push(&s[start..i]);
@@ -662,9 +714,7 @@ fn split_args(s: &str) -> Vec<&str> {
 /// Strip surrounding single or double quotes from a string.
 fn strip_quotes(s: &str) -> String {
     let s = s.trim();
-    if (s.starts_with('\'') && s.ends_with('\''))
-        || (s.starts_with('"') && s.ends_with('"'))
-    {
+    if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
         s[1..s.len() - 1].to_string()
     } else {
         s.to_string()
@@ -693,7 +743,8 @@ fn extract_interval_from_args(args_lower: &str, args_original: &str) -> Option<S
         if pre_ok && post_ok {
             // Found a standalone `interval` keyword.
             let rest_lower = args_lower[abs_end..].trim_start();
-            let rest_orig = args_original[abs_end..].trim_start_matches(|c: char| c.is_whitespace());
+            let rest_orig =
+                args_original[abs_end..].trim_start_matches(|c: char| c.is_whitespace());
             if rest_lower.starts_with('\'') {
                 let inner_orig = &rest_orig[1..];
                 let end2 = inner_orig.find('\'')?;
@@ -779,7 +830,8 @@ mod tests {
 
     #[test]
     fn parse_create_hypertable_1day() {
-        let sql = "SELECT create_hypertable('metrics', 'ts', chunk_time_interval => INTERVAL '1 day')";
+        let sql =
+            "SELECT create_hypertable('metrics', 'ts', chunk_time_interval => INTERVAL '1 day')";
         let r = match_create_hypertable(sql);
         assert!(r.is_some(), "should match: {sql}");
         let (table, col, iv) = r.unwrap();
@@ -858,9 +910,8 @@ mod tests {
 // Timestamp variant DataFusion uses.
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, StringArray,
-    TimestampMicrosecondArray, TimestampNanosecondArray,
-    TimestampMillisecondArray, TimestampSecondArray,
+    Array, ArrayRef, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::{exec_err, Result as DFResult};
@@ -893,9 +944,15 @@ struct TimeBucketUdf {
 }
 
 impl ScalarUDFImpl for TimeBucketUdf {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn name(&self) -> &str { "time_bucket" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "time_bucket"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
 
     fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
         // Return the same timestamp type as the second argument, falling back
@@ -918,21 +975,31 @@ impl ScalarUDFImpl for TimeBucketUdf {
         // ── arg 0: bucket width as a string literal ───────────────────────
         let width_text = match &args[0] {
             ColumnarValue::Scalar(sv) => sv.to_string(),
-            ColumnarValue::Array(arr) => {
-                arr.as_any()
-                    .downcast_ref::<StringArray>()
-                    .and_then(|a| if a.is_empty() { None } else { Some(a.value(0).to_string()) })
-                    .ok_or_else(|| datafusion::error::DataFusionError::Internal(
+            ColumnarValue::Array(arr) => arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .and_then(|a| {
+                    if a.is_empty() {
+                        None
+                    } else {
+                        Some(a.value(0).to_string())
+                    }
+                })
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Internal(
                         "time_bucket: arg[0] must be a string (bucket width)".into(),
-                    ))?
-            }
+                    )
+                })?,
         };
         // Strip quotes that may arrive when the literal came through a cast
         let width_text = width_text.trim_matches('\'').trim_matches('"');
-        let bw = crate::cv_time_bucket::BucketWidth::from_interval_text(width_text)
-            .ok_or_else(|| datafusion::error::DataFusionError::Internal(
-                format!("time_bucket: unrecognised interval '{width_text}'"),
-            ))?;
+        let bw = crate::cv_time_bucket::BucketWidth::from_interval_text(width_text).ok_or_else(
+            || {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "time_bucket: unrecognised interval '{width_text}'"
+                ))
+            },
+        )?;
 
         // ── arg 2 (optional): origin timestamp or timezone string ──────────
         // We extract this before processing the ts array. If the third arg is
@@ -978,7 +1045,9 @@ impl ScalarUDFImpl for TimeBucketUdf {
             let effective_ns = ns - origin_shift_us * 1_000;
             let secs = effective_ns / 1_000_000_000;
             let nanos = (effective_ns.rem_euclid(1_000_000_000)) as u32;
-            let dt = Utc.timestamp_opt(secs, nanos).single()
+            let dt = Utc
+                .timestamp_opt(secs, nanos)
+                .single()
                 .unwrap_or_else(|| Utc.timestamp_micros(0).unwrap());
             let floored = bw.floor(dt).timestamp_nanos_opt().unwrap_or(0);
             floored + origin_shift_us * 1_000
@@ -994,7 +1063,9 @@ impl ScalarUDFImpl for TimeBucketUdf {
         let floor_s = |s: i64| -> i64 {
             use chrono::TimeZone as _;
             let effective_s = s - origin_shift_us / 1_000_000;
-            let dt = Utc.timestamp_opt(effective_s, 0).single()
+            let dt = Utc
+                .timestamp_opt(effective_s, 0)
+                .single()
                 .unwrap_or_else(|| Utc.timestamp_micros(0).unwrap());
             let floored = bw.floor(dt).timestamp();
             floored + origin_shift_us / 1_000_000
@@ -1002,34 +1073,38 @@ impl ScalarUDFImpl for TimeBucketUdf {
 
         let result: ArrayRef = match ts_array.data_type() {
             DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-                let arr = ts_array.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
-                let out: TimestampMicrosecondArray = arr.iter()
-                    .map(|v| v.map(floor_us))
-                    .collect();
+                let arr = ts_array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                let out: TimestampMicrosecondArray = arr.iter().map(|v| v.map(floor_us)).collect();
                 let out = out.with_timezone_opt(tz.clone());
                 Arc::new(out)
             }
             DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
-                let arr = ts_array.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap();
-                let out: TimestampNanosecondArray = arr.iter()
-                    .map(|v| v.map(floor_ns))
-                    .collect();
+                let arr = ts_array
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap();
+                let out: TimestampNanosecondArray = arr.iter().map(|v| v.map(floor_ns)).collect();
                 let out = out.with_timezone_opt(tz.clone());
                 Arc::new(out)
             }
             DataType::Timestamp(TimeUnit::Millisecond, tz) => {
-                let arr = ts_array.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
-                let out: TimestampMillisecondArray = arr.iter()
-                    .map(|v| v.map(floor_ms))
-                    .collect();
+                let arr = ts_array
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .unwrap();
+                let out: TimestampMillisecondArray = arr.iter().map(|v| v.map(floor_ms)).collect();
                 let out = out.with_timezone_opt(tz.clone());
                 Arc::new(out)
             }
             DataType::Timestamp(TimeUnit::Second, tz) => {
-                let arr = ts_array.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
-                let out: TimestampSecondArray = arr.iter()
-                    .map(|v| v.map(floor_s))
-                    .collect();
+                let arr = ts_array
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .unwrap();
+                let out: TimestampSecondArray = arr.iter().map(|v| v.map(floor_s)).collect();
                 let out = out.with_timezone_opt(tz.clone());
                 Arc::new(out)
             }
@@ -1055,20 +1130,22 @@ impl ScalarUDFImpl for TimeBucketUdf {
 ///
 /// On any error or unsupported type returns `None`.
 fn extract_origin_us(arg: &ColumnarValue) -> Option<i64> {
-    use datafusion::scalar::ScalarValue;
     use datafusion::arrow::datatypes::{DataType, TimeUnit};
+    use datafusion::scalar::ScalarValue;
     let sv = match arg {
         ColumnarValue::Scalar(sv) => sv.clone(),
         ColumnarValue::Array(arr) => {
-            if arr.is_empty() { return None; }
+            if arr.is_empty() {
+                return None;
+            }
             ScalarValue::try_from_array(arr.as_ref(), 0).ok()?
         }
     };
     match sv {
         ScalarValue::TimestampMicrosecond(Some(v), _) => Some(v),
-        ScalarValue::TimestampNanosecond(Some(v), _)  => Some(v / 1_000),
+        ScalarValue::TimestampNanosecond(Some(v), _) => Some(v / 1_000),
         ScalarValue::TimestampMillisecond(Some(v), _) => Some(v * 1_000),
-        ScalarValue::TimestampSecond(Some(v), _)      => Some(v * 1_000_000),
+        ScalarValue::TimestampSecond(Some(v), _) => Some(v * 1_000_000),
         ScalarValue::Int64(Some(v)) => Some(v),
         // String → timezone name: not yet implemented; fall back to epoch grid.
         ScalarValue::Utf8(_) | ScalarValue::LargeUtf8(_) => None,

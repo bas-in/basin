@@ -40,10 +40,7 @@ fn build_engine(dir: &TempDir) -> Engine {
     })
 }
 
-async fn collect(
-    sess: &basin_engine::ProjectSession,
-    sql: &str,
-) -> Vec<arrow_array::RecordBatch> {
+async fn collect(sess: &basin_engine::ProjectSession, sql: &str) -> Vec<arrow_array::RecordBatch> {
     match sess.execute(sql).await {
         Ok(ExecResult::Rows { batches, .. }) => batches,
         Ok(ExecResult::Empty { tag }) => {
@@ -80,7 +77,10 @@ async fn basin_project_usage_shows_own_project_after_writes() {
     .await;
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 1, "basin_project_usage must return exactly one row");
+    assert_eq!(
+        total_rows, 1,
+        "basin_project_usage must return exactly one row"
+    );
 
     let b = &batches[0];
     let pid = b

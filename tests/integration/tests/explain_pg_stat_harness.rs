@@ -214,9 +214,8 @@ async fn explain_point_scan() {
     // After 5.23.B: the plan must reference an index seek, not a sequential
     // scan. Node names emitted by DataFusion include "IndexScan",
     // "BitmapIndexScan", or "Lookup"; PG emits "Index Scan".
-    let has_index_node = plan_text.contains("Index")
-        || plan_text.contains("Lookup")
-        || plan_text.contains("index");
+    let has_index_node =
+        plan_text.contains("Index") || plan_text.contains("Lookup") || plan_text.contains("index");
     assert!(
         has_index_node,
         "SCAN (5.23.A): EXPLAIN ANALYZE on a point lookup (WHERE id = 42) must reference \
@@ -226,9 +225,8 @@ async fn explain_point_scan() {
 
     // The plan must also include actual timing/row-count annotations because
     // ANALYZE was requested (these appear as "actual time=...", "rows=...", etc.).
-    let has_timing = plan_text.contains("actual")
-        || plan_text.contains("time=")
-        || plan_text.contains("rows=");
+    let has_timing =
+        plan_text.contains("actual") || plan_text.contains("time=") || plan_text.contains("rows=");
     assert!(
         has_timing,
         "SCAN (5.23.A): EXPLAIN ANALYZE must include execution timing annotations \
@@ -761,7 +759,9 @@ async fn pg_locks_view_returns_acquired_locks() {
     );
 
     // Clean up the transaction.
-    sess.execute("ROLLBACK").await.expect("ROLLBACK transaction");
+    sess.execute("ROLLBACK")
+        .await
+        .expect("ROLLBACK transaction");
 
     println!("[5.23.A locks] PASSED — pg_locks populated with acquired lock");
 }

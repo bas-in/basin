@@ -43,7 +43,11 @@ fn build_engine_in_dir(dir: &TempDir) -> Engine {
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
     let catalog: Arc<dyn Catalog> = Arc::new(InMemoryCatalog::new());
-    Engine::new(EngineConfig { storage, catalog, shard: None })
+    Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    })
 }
 
 /// Build a second `Engine` sharing the SAME file-system root but with a fresh
@@ -62,7 +66,11 @@ fn build_engine_shared_catalog(dir: &TempDir, catalog: Arc<dyn Catalog>) -> Engi
         disk_cache: basin_integration_tests::cache_defaults::default_test_disk_cache(),
         page_cache: basin_integration_tests::cache_defaults::default_test_page_cache(),
     });
-    Engine::new(EngineConfig { storage, catalog, shard: None })
+    Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: None,
+    })
 }
 
 fn assert_tag(res: ExecResult, tag: &str) {
@@ -101,10 +109,7 @@ fn first_string(res: &ExecResult) -> Option<String> {
                 if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
                     return Some(arr.value(0).to_string());
                 }
-                if let Some(arr) = col
-                    .as_any()
-                    .downcast_ref::<arrow_array::LargeStringArray>()
-                {
+                if let Some(arr) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
                     return Some(arr.value(0).to_string());
                 }
                 return None;
@@ -232,11 +237,9 @@ async fn point_query_skips_files_with_index() {
         ("I004", 400),
         ("J005", 500),
     ] {
-        sess.execute(&format!(
-            "INSERT INTO products VALUES ('{code}', {price})"
-        ))
-        .await
-        .unwrap();
+        sess.execute(&format!("INSERT INTO products VALUES ('{code}', {price})"))
+            .await
+            .unwrap();
     }
 
     // Create index AFTER the inserts so it's built from the catalog data.
@@ -272,9 +275,7 @@ async fn point_query_skips_files_with_index() {
         "secondary index should have skipped at least 1 file (skipped={skipped})"
     );
 
-    println!(
-        "[secondary_index] point_query_skips_files_with_index: skipped {skipped} files"
-    );
+    println!("[secondary_index] point_query_skips_files_with_index: skipped {skipped} files");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -296,9 +297,15 @@ async fn index_maintained_on_insert() {
         .unwrap();
 
     // Insert rows — index should be updated for each file.
-    sess.execute("INSERT INTO events VALUES (1, 'login')").await.unwrap();
-    sess.execute("INSERT INTO events VALUES (2, 'logout')").await.unwrap();
-    sess.execute("INSERT INTO events VALUES (3, 'login')").await.unwrap();
+    sess.execute("INSERT INTO events VALUES (1, 'login')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO events VALUES (2, 'logout')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO events VALUES (3, 'login')")
+        .await
+        .unwrap();
 
     // Query for 'login' — should find 2 rows.
     let res = sess

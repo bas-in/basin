@@ -188,7 +188,9 @@ pub struct GinRowGroupRegistry {
 impl GinRowGroupRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
-        Self { inner: Mutex::new(HashMap::new()) }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
     }
 
     fn get_or_create(
@@ -197,9 +199,18 @@ impl GinRowGroupRegistry {
         table: &TableName,
         col: &str,
     ) -> Arc<Mutex<HashMap<String, FileSummaries>>> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
-        let mut map = self.inner.lock().expect("GinRowGroupRegistry outer lock poisoned");
-        map.entry(key).or_insert_with(|| Arc::new(Mutex::new(HashMap::new()))).clone()
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
+        let mut map = self
+            .inner
+            .lock()
+            .expect("GinRowGroupRegistry outer lock poisoned");
+        map.entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+            .clone()
     }
 
     fn get(
@@ -208,8 +219,15 @@ impl GinRowGroupRegistry {
         table: &TableName,
         col: &str,
     ) -> Option<Arc<Mutex<HashMap<String, FileSummaries>>>> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
-        let map = self.inner.lock().expect("GinRowGroupRegistry outer lock poisoned");
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
+        let map = self
+            .inner
+            .lock()
+            .expect("GinRowGroupRegistry outer lock poisoned");
         map.get(&key).cloned()
     }
 
@@ -348,13 +366,7 @@ impl GinRowGroupRegistry {
 
     /// Drop all summaries for `file_path` (called on compaction / deletion) so
     /// probes never return stale row-groups for a file that no longer exists.
-    pub fn remove_file(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-        col: &str,
-        file_path: &str,
-    ) {
+    pub fn remove_file(&self, project: &ProjectId, table: &TableName, col: &str, file_path: &str) {
         if let Some(arc) = self.get(project, table, col) {
             let mut files = arc.lock().expect("GinRowGroup file table lock poisoned");
             files.remove(file_path);
@@ -418,10 +430,7 @@ pub fn index_batch_jsonb_gin(
         return;
     };
     let col = batch.column(col_idx);
-    let Some(arr) = col
-        .as_any()
-        .downcast_ref::<arrow_array::LargeBinaryArray>()
-    else {
+    let Some(arr) = col.as_any().downcast_ref::<arrow_array::LargeBinaryArray>() else {
         return;
     };
     let rg_size = row_group_size.max(1);
@@ -503,7 +512,11 @@ fn gin_compact_value(v: &serde_json::Value) -> String {
         serde_json::Value::Null => "null".to_string(),
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
             let s = v.to_string();
-            if s.len() > 200 { s[..200].to_string() } else { s }
+            if s.len() > 200 {
+                s[..200].to_string()
+            } else {
+                s
+            }
         }
     }
 }
@@ -600,7 +613,10 @@ mod tests {
         let probe = reg.rowgroups_maybe_containing(&proj, &tbl, "doc", file, &terms(&["zzz"]));
         match probe {
             RowGroupProbe::RowGroups(rgs) => {
-                assert!(rgs.is_empty(), "absent key must prune whole file, got {rgs:?}");
+                assert!(
+                    rgs.is_empty(),
+                    "absent key must prune whole file, got {rgs:?}"
+                );
             }
             other => panic!("expected RowGroups (empty), got {other:?}"),
         }
@@ -684,7 +700,11 @@ mod tests {
         reg.remove_file(&proj, &tbl, "doc", file);
         assert!(!reg.is_file_indexed(&proj, &tbl, "doc", file));
         let probe = reg.rowgroups_maybe_containing(&proj, &tbl, "doc", file, &terms(&["a"]));
-        assert_eq!(probe, RowGroupProbe::Unknown, "removed file must read as Unknown");
+        assert_eq!(
+            probe,
+            RowGroupProbe::Unknown,
+            "removed file must read as Unknown"
+        );
     }
 
     // ── multi-file convenience ───────────────────────────────────────────────
@@ -703,11 +723,20 @@ mod tests {
         reg.mark_file_indexed(&proj, &tbl, "doc", "f2.parquet");
         // f3: never indexed → omitted from the map.
 
-        let files = vec!["f1.parquet".to_string(), "f2.parquet".to_string(), "f3.parquet".to_string()];
-        let map = reg.rowgroups_maybe_containing_multi(&proj, &tbl, "doc", &files, &terms(&["needle"]));
+        let files = vec![
+            "f1.parquet".to_string(),
+            "f2.parquet".to_string(),
+            "f3.parquet".to_string(),
+        ];
+        let map =
+            reg.rowgroups_maybe_containing_multi(&proj, &tbl, "doc", &files, &terms(&["needle"]));
 
         assert_eq!(map.get("f1.parquet"), Some(&vec![0]), "f1 keeps only rg0");
-        assert_eq!(map.get("f2.parquet"), Some(&Vec::<RowGroupId>::new()), "f2 fully prunable");
+        assert_eq!(
+            map.get("f2.parquet"),
+            Some(&Vec::<RowGroupId>::new()),
+            "f2 fully prunable"
+        );
         assert!(!map.contains_key("f3.parquet"), "f3 unknown → omitted");
     }
 
@@ -720,7 +749,8 @@ mod tests {
         reg.index_row(&proj, &tbl, "title", &terms(&["a"]), "f1.parquet", 0);
         reg.mark_file_indexed(&proj, &tbl, "title", "f1.parquet");
         // Probe a different column → Unknown.
-        let probe = reg.rowgroups_maybe_containing(&proj, &tbl, "body", "f1.parquet", &terms(&["a"]));
+        let probe =
+            reg.rowgroups_maybe_containing(&proj, &tbl, "body", "f1.parquet", &terms(&["a"]));
         assert_eq!(probe, RowGroupProbe::Unknown);
     }
 
@@ -735,13 +765,19 @@ mod tests {
         // 64 row-groups; a shared "common" term in all, plus a unique term per rg.
         for rg in 0u32..64 {
             let uniq = format!("uniq_{rg}");
-            reg.index_row(&proj, &tbl, "doc", &terms(&["common", uniq.as_str()]), file, rg);
+            reg.index_row(
+                &proj,
+                &tbl,
+                "doc",
+                &terms(&["common", uniq.as_str()]),
+                file,
+                rg,
+            );
         }
         reg.mark_file_indexed(&proj, &tbl, "doc", file);
 
         // A unique term must select exactly one row-group (modulo bloom FP).
-        let probe =
-            reg.rowgroups_maybe_containing(&proj, &tbl, "doc", file, &terms(&["uniq_42"]));
+        let probe = reg.rowgroups_maybe_containing(&proj, &tbl, "doc", file, &terms(&["uniq_42"]));
         match probe {
             RowGroupProbe::RowGroups(rgs) => {
                 assert!(rgs.contains(&42), "uniq_42 must keep rg 42, got {rgs:?}");

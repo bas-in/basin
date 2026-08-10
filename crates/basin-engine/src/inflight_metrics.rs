@@ -137,11 +137,7 @@ pub struct InflightGuard {
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         self.metrics.inflight.fetch_sub(1, Ordering::Relaxed);
-        let micros = self
-            .started
-            .elapsed()
-            .as_micros()
-            .min(i64::MAX as u128) as i64;
+        let micros = self.started.elapsed().as_micros().min(i64::MAX as u128) as i64;
         self.metrics.record(micros);
     }
 }
@@ -277,7 +273,10 @@ mod tests {
         // With a 0s window the retain on the next read drops the earlier ones.
         std::thread::sleep(std::time::Duration::from_millis(2));
         let snap = m.snapshot();
-        assert_eq!(snap.samples, 0, "0s window prunes everything older than now");
+        assert_eq!(
+            snap.samples, 0,
+            "0s window prunes everything older than now"
+        );
     }
 
     #[test]

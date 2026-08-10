@@ -19,7 +19,13 @@ use basin_wal::{LocalWal, Wal, WalConfig};
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
-async fn build() -> (TempDir, TempDir, Engine, basin_shard::ShardBackgroundHandle, Arc<dyn Wal>) {
+async fn build() -> (
+    TempDir,
+    TempDir,
+    Engine,
+    basin_shard::ShardBackgroundHandle,
+    Arc<dyn Wal>,
+) {
     let sd = TempDir::new().unwrap();
     let wd = TempDir::new().unwrap();
     let storage = Storage::new(StorageConfig {
@@ -40,9 +46,17 @@ async fn build() -> (TempDir, TempDir, Engine, basin_shard::ShardBackgroundHandl
         .await
         .unwrap(),
     );
-    let shard = Shard::new(ShardConfig::new(storage.clone(), catalog.clone(), wal.clone()));
+    let shard = Shard::new(ShardConfig::new(
+        storage.clone(),
+        catalog.clone(),
+        wal.clone(),
+    ));
     let bg = shard.spawn_background();
-    let engine = Engine::new(EngineConfig { storage, catalog, shard: Some(shard) });
+    let engine = Engine::new(EngineConfig {
+        storage,
+        catalog,
+        shard: Some(shard),
+    });
     (sd, wd, engine, bg, wal)
 }
 
@@ -63,15 +77,25 @@ async fn in_list_bench_shape_probe_fires() {
         let mut stmt = String::with_capacity((hi - id) as usize * 60);
         stmt.push_str("INSERT INTO events VALUES ");
         for k in id..hi {
-            if k > id { stmt.push(','); }
-            stmt.push_str(&format!("({k}, {}, {}, 'pending', {k}, '{{\"kind\":\"k{}\"}}')", k % 1000, k as f64 * 0.5, k % 20));
+            if k > id {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!(
+                "({k}, {}, {}, 'pending', {k}, '{{\"kind\":\"k{}\"}}')",
+                k % 1000,
+                k as f64 * 0.5,
+                k % 20
+            ));
         }
         sess.execute(&stmt).await.unwrap();
         id = hi;
     }
 
     // Exact bench IN-list: ids {1,8,15,...,694} — all in the first 10k file.
-    let in_list: String = (0..100i64).map(|k| (k * 7 + 1).to_string()).collect::<Vec<_>>().join(",");
+    let in_list: String = (0..100i64)
+        .map(|k| (k * 7 + 1).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     let q = format!("SELECT id, user_id, amount FROM events WHERE id IN ({in_list})");
 
     // warm
@@ -82,7 +106,10 @@ async fn in_list_bench_shape_probe_fires() {
     let res = sess.execute(&q).await.unwrap();
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     let after = engine.blooms_skipped_count();
-    let rows = match res { ExecResult::Rows { batches, .. } => batches.iter().map(|b| b.num_rows()).sum::<usize>(), _ => 0 };
+    let rows = match res {
+        ExecResult::Rows { batches, .. } => batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        _ => 0,
+    };
 
     let approx_files = n / batch;
     println!("[in-list-diag] n={n} files~{approx_files} rows_returned={rows} time={ms:.2}ms bloom_skips={} (probe fires iff skips>0)", after - before);
@@ -93,7 +120,10 @@ async fn in_list_bench_shape_probe_fires() {
     let b1 = engine.blooms_skipped_count();
     let _ = sess.execute(&q1).await.unwrap();
     let a1 = engine.blooms_skipped_count();
-    println!("[in-list-diag] single-col 'SELECT id' IN-list bloom_skips={}", a1 - b1);
+    println!(
+        "[in-list-diag] single-col 'SELECT id' IN-list bloom_skips={}",
+        a1 - b1
+    );
 
     // CONTROL: single-Eq point query on the SAME shard data. If THIS prunes
     // (skips>0) but IN-list doesn't, the bug is IN-list-specific. If neither
@@ -106,18 +136,26 @@ async fn in_list_bench_shape_probe_fires() {
     let _ = sess.execute(qeq).await.unwrap();
     let eq_ms = teq.elapsed().as_secs_f64() * 1000.0;
     let ae = engine.blooms_skipped_count();
-    println!("[in-list-diag] CONTROL single-Eq 'id = 350': bloom_skips={} time={eq_ms:.2}ms", ae - be);
+    println!(
+        "[in-list-diag] CONTROL single-Eq 'id = 350': bloom_skips={} time={eq_ms:.2}ms",
+        ae - be
+    );
 
     // Does the multi-col IN-list even reach the fast path? Check EXPLAIN.
-    if let Ok(ExecResult::Rows { batches, .. }) =
-        sess.execute(&format!("EXPLAIN {q}")).await
-    {
+    if let Ok(ExecResult::Rows { batches, .. }) = sess.execute(&format!("EXPLAIN {q}")).await {
         use arrow_array::{Array, StringArray};
         for b in &batches {
             if let Ok(idx) = b.schema().index_of("QUERY PLAN") {
                 if let Some(a) = b.column(idx).as_any().downcast_ref::<StringArray>() {
-                    let plan: String = (0..a.len()).filter(|i| !a.is_null(*i)).map(|i| a.value(i)).collect::<Vec<_>>().join(" | ");
-                    println!("[in-list-diag] IN-list EXPLAIN (first 300): {}", &plan.chars().take(300).collect::<String>());
+                    let plan: String = (0..a.len())
+                        .filter(|i| !a.is_null(*i))
+                        .map(|i| a.value(i))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    println!(
+                        "[in-list-diag] IN-list EXPLAIN (first 300): {}",
+                        &plan.chars().take(300).collect::<String>()
+                    );
                 }
             }
         }

@@ -191,12 +191,13 @@ fn candidates_leading_wildcard_suffix() {
     // '%@gmail.com' — the canonical case. ILIKE catches mixed-case rows.
     let idx = build_idx();
     assert_superset(&idx, CORPUS, "%@gmail.com", true);
-    let cands = idx
-        .candidates("%@gmail.com", true)
-        .resolve(idx.universe());
+    let cands = idx.candidates("%@gmail.com", true).resolve(idx.universe());
     // True ILIKE matches: rows 1,2,4,5,12 (mixed case, exact suffix).
     for r in [1u64, 2, 4, 5, 12] {
-        assert!(cands.contains(&r), "row {r} should be a candidate: {cands:?}");
+        assert!(
+            cands.contains(&r),
+            "row {r} should be a candidate: {cands:?}"
+        );
     }
     // yahoo / hotmail / proton / gmail.org / judy are not matches; the
     // index should prune at least the clearly-distinct ones.
@@ -213,7 +214,10 @@ fn candidates_middle_wildcard() {
     let cands = idx.candidates("%@gmail%", true).resolve(idx.universe());
     // Rows containing "@gmail" (case-insensitive): 1,2,4,5,7,9,12.
     for r in [1u64, 2, 4, 5, 7, 9, 12] {
-        assert!(cands.contains(&r), "row {r} should be a candidate: {cands:?}");
+        assert!(
+            cands.contains(&r),
+            "row {r} should be a candidate: {cands:?}"
+        );
     }
     assert!(!cands.contains(&3));
     assert!(!cands.contains(&6));
@@ -236,9 +240,7 @@ fn candidates_exact_no_wildcards() {
 fn candidates_case_insensitivity() {
     // ILIKE must catch dave@GMAIL.COM and Eve@Gmail.Com for '%@gmail.com'.
     let idx = build_idx();
-    let ci = idx
-        .candidates("%@gmail.com", true)
-        .resolve(idx.universe());
+    let ci = idx.candidates("%@gmail.com", true).resolve(idx.universe());
     assert!(ci.contains(&4), "ILIKE should catch uppercase GMAIL.COM");
     assert!(ci.contains(&5), "ILIKE should catch mixed-case Gmail.Com");
 }
@@ -325,9 +327,7 @@ fn candidates_actually_prunes_not_just_all() {
 #[test]
 fn remove_drops_row_from_candidates() {
     let mut idx = build_idx();
-    let before = idx
-        .candidates("%@gmail.com", true)
-        .resolve(idx.universe());
+    let before = idx.candidates("%@gmail.com", true).resolve(idx.universe());
     assert!(before.contains(&1));
     idx.remove(1);
     let after = idx.candidates("%@gmail.com", true).resolve(idx.universe());

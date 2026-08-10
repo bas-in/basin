@@ -91,20 +91,20 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         // (invalid_column_reference — "there is no unique or exclusion
         // constraint matching the ON CONFLICT specification").
         BasinError::AmbiguousConflictTarget(_) => ("ERROR", "42P10"), // invalid_column_reference
-        BasinError::CommitConflict(_) => ("ERROR", "40001"), // serialization_failure
-        BasinError::QueryCostExceeded(_) => ("ERROR", "54000"), // program_limit_exceeded
-        BasinError::QueryCanceled(_) => ("ERROR", "57014"),     // query_canceled
-        BasinError::FeatureNotSupported(_) => ("ERROR", "0A000"), // feature_not_supported
+        BasinError::CommitConflict(_) => ("ERROR", "40001"),          // serialization_failure
+        BasinError::QueryCostExceeded(_) => ("ERROR", "54000"),       // program_limit_exceeded
+        BasinError::QueryCanceled(_) => ("ERROR", "57014"),           // query_canceled
+        BasinError::FeatureNotSupported(_) => ("ERROR", "0A000"),     // feature_not_supported
         // MERGE matched the same target row from two source rows. PostgreSQL
         // raises 21000 (cardinality_violation) with the message
         // "MERGE command cannot affect row a second time".
         BasinError::CardinalityViolation(_) => ("ERROR", "21000"), // cardinality_violation
-        BasinError::UniqueViolation(_) => ("ERROR", "23505"), // unique_violation
-        BasinError::CheckViolation(_) => ("ERROR", "23514"), // check_violation
-        BasinError::ForeignKeyViolation(_) => ("ERROR", "23503"), // foreign_key_violation
-        BasinError::RlsViolation(_) => ("ERROR", "42501"), // insufficient_privilege (RLS)
-        BasinError::PermissionDenied(_) => ("ERROR", "42501"), // insufficient_privilege
-        BasinError::StringTooLong(_) => ("ERROR", "22001"), // string_data_right_truncation
+        BasinError::UniqueViolation(_) => ("ERROR", "23505"),      // unique_violation
+        BasinError::CheckViolation(_) => ("ERROR", "23514"),       // check_violation
+        BasinError::ForeignKeyViolation(_) => ("ERROR", "23503"),  // foreign_key_violation
+        BasinError::RlsViolation(_) => ("ERROR", "42501"),         // insufficient_privilege (RLS)
+        BasinError::PermissionDenied(_) => ("ERROR", "42501"),     // insufficient_privilege
+        BasinError::StringTooLong(_) => ("ERROR", "22001"),        // string_data_right_truncation
         // Phase 6.X.C (ADR 0023): voluntary lease handoff in progress —
         // retryable (same SQLSTATE class as commit conflict, since the
         // caller should retry from a fresh route + re-resolved owner).
@@ -194,7 +194,10 @@ mod tests {
         assert_eq!(er.fields[1], (b'C', "42P01".to_owned()));
         assert_eq!(
             er.fields[2],
-            (b'M', "relation \"django_migrations\" does not exist".to_owned())
+            (
+                b'M',
+                "relation \"django_migrations\" does not exist".to_owned()
+            )
         );
     }
 
@@ -270,7 +273,9 @@ mod tests {
         // Advisory-lock deadlock detection must surface as SQLSTATE 40P01
         // (deadlock_detected) — the exact code PostgreSQL raises — so drivers
         // map it to the dedicated DeadlockDetected exception class.
-        let er = error_response(&BasinError::deadlock_detected("advisory lock cycle on key 7"));
+        let er = error_response(&BasinError::deadlock_detected(
+            "advisory lock cycle on key 7",
+        ));
         assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
         assert_eq!(er.fields[1], (b'C', "40P01".to_owned()));
         assert!(er.fields[2].1.contains("deadlock detected"));

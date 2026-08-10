@@ -180,7 +180,10 @@ impl IndexAdvisorRegistry {
     /// concurrently see exactly one `true`.
     fn record_hit(&self, project: &ProjectId, table: &TableName, col: &str) -> bool {
         let key = (*project, table.clone());
-        let mut guard = self.inner.write().expect("index_advisor write lock poisoned");
+        let mut guard = self
+            .inner
+            .write()
+            .expect("index_advisor write lock poisoned");
         let table_counts = guard.entry(key).or_default();
         let entry = table_counts.entry(col.to_string()).or_default();
 

@@ -13,9 +13,7 @@
 //! data-specific value.
 
 use basin_common::{ProjectId, TableName};
-use basin_storage::index::trigram_rowgroup::{
-    RowGroupProbe, Trigram, TrigramRowGroupRegistry,
-};
+use basin_storage::index::trigram_rowgroup::{RowGroupProbe, Trigram, TrigramRowGroupRegistry};
 
 /// Build the case-preserved trigram windows of `s` — the same shape
 /// `basin_engine::index_probe::trigrams_for_pattern` returns for a
@@ -45,15 +43,17 @@ fn substring_present_in_one_row_group_returns_just_that_rg() {
     reg.index_row(&proj, &tbl, "doc", file, 3, "delta donut dynamo");
     reg.seal_file_indexed(&proj, &tbl, "doc", file);
 
-    let probe = reg.rowgroups_maybe_containing_trigrams(
-        &proj, &tbl, "doc", file, &tg("kilo"),
-    );
+    let probe = reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &tg("kilo"));
     match probe {
         RowGroupProbe::RowGroups(rgs) => {
             // No false negative: rg=2 must be in.
             assert!(rgs.contains(&2), "rg 2 must survive, got {rgs:?}");
             // Pruning happened: at least one of {0,1,3} was skipped.
-            assert!(rgs.len() < 4, "expected sub-file pruning, kept {} of 4", rgs.len());
+            assert!(
+                rgs.len() < 4,
+                "expected sub-file pruning, kept {} of 4",
+                rgs.len()
+            );
         }
         other => panic!("expected RowGroups, got {other:?}"),
     }
@@ -73,9 +73,7 @@ fn substring_in_every_row_group_returns_all() {
     }
     reg.seal_file_indexed(&proj, &tbl, "doc", file);
 
-    let probe = reg.rowgroups_maybe_containing_trigrams(
-        &proj, &tbl, "doc", file, &tg("zulu"),
-    );
+    let probe = reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &tg("zulu"));
     match probe {
         RowGroupProbe::RowGroups(rgs) => {
             assert_eq!(rgs, vec![0, 1, 2, 3], "all rgs should survive, got {rgs:?}");
@@ -96,12 +94,13 @@ fn absent_pattern_returns_empty() {
     reg.index_row(&proj, &tbl, "doc", file, 1, "bravo banana");
     reg.seal_file_indexed(&proj, &tbl, "doc", file);
 
-    let probe = reg.rowgroups_maybe_containing_trigrams(
-        &proj, &tbl, "doc", file, &tg("qxzqxz"),
-    );
+    let probe = reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &tg("qxzqxz"));
     match probe {
         RowGroupProbe::RowGroups(rgs) => {
-            assert!(rgs.is_empty(), "absent pattern must prune whole file, got {rgs:?}");
+            assert!(
+                rgs.is_empty(),
+                "absent pattern must prune whole file, got {rgs:?}"
+            );
         }
         other => panic!("expected RowGroups (empty), got {other:?}"),
     }
@@ -120,9 +119,7 @@ fn pre_seal_returns_unknown() {
     // Index a row but do NOT seal.
     reg.index_row(&proj, &tbl, "doc", file, 0, "alpha apple");
 
-    let probe = reg.rowgroups_maybe_containing_trigrams(
-        &proj, &tbl, "doc", file, &tg("alpha"),
-    );
+    let probe = reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &tg("alpha"));
     assert_eq!(probe, RowGroupProbe::Unknown);
 }
 
@@ -137,17 +134,14 @@ fn many_row_groups_at_scale_yields_strict_subset() {
     let file = "big.parquet";
 
     for rg in 0..N {
-        let row = format!(
-            "common shared body uniform_{rg:03} mike november oscar"
-        );
+        let row = format!("common shared body uniform_{rg:03} mike november oscar");
         reg.index_row(&proj, &tbl, "doc", file, rg, &row);
     }
     reg.seal_file_indexed(&proj, &tbl, "doc", file);
 
     // "uniform_042" appears in only rg=42.
-    let probe = reg.rowgroups_maybe_containing_trigrams(
-        &proj, &tbl, "doc", file, &tg("uniform_042"),
-    );
+    let probe =
+        reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &tg("uniform_042"));
     match probe {
         RowGroupProbe::RowGroups(rgs) => {
             assert!(rgs.contains(&42), "rg 42 must survive, got {rgs:?}");
@@ -177,13 +171,17 @@ fn ilike_lowercased_trigrams_hit_mixed_case_storage() {
     reg.seal_file_indexed(&proj, &tbl, "doc", file);
 
     // ILIKE 'alpha%' produces lowercase trigrams.
-    let probe = reg.rowgroups_maybe_containing_trigrams(
-        &proj, &tbl, "doc", file, &tg("alpha"),
-    );
+    let probe = reg.rowgroups_maybe_containing_trigrams(&proj, &tbl, "doc", file, &tg("alpha"));
     match probe {
         RowGroupProbe::RowGroups(rgs) => {
-            assert!(rgs.contains(&0), "rg 0 must survive (lowercased windows stored), got {rgs:?}");
-            assert!(!rgs.contains(&1), "rg 1 has no alpha — should be pruned, got {rgs:?}");
+            assert!(
+                rgs.contains(&0),
+                "rg 0 must survive (lowercased windows stored), got {rgs:?}"
+            );
+            assert!(
+                !rgs.contains(&1),
+                "rg 1 has no alpha — should be pruned, got {rgs:?}"
+            );
         }
         other => panic!("expected RowGroups, got {other:?}"),
     }

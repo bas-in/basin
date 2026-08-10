@@ -1073,7 +1073,7 @@ impl ScalarUDFImpl for RangeRelationalUdf {
                         // If A is +inf upper, false (it extends to +inf).
                         // If B is +inf upper, true (A can't exceed +inf).
                         match (a_hi, b_hi) {
-                            (None, _) => Some(false), // A extends to +inf
+                            (None, _) => Some(false),      // A extends to +inf
                             (Some(_), None) => Some(true), // B extends to +inf → A can't exceed
                             (Some(ah), Some(bh)) => {
                                 if ah < bh {
@@ -1093,7 +1093,7 @@ impl ScalarUDFImpl for RangeRelationalUdf {
                         // If A is -inf lower, false (it extends to -inf).
                         // If B is -inf lower, true (A can't be less than -inf).
                         match (a_lo, b_lo) {
-                            (None, _) => Some(false), // A extends to -inf
+                            (None, _) => Some(false),      // A extends to -inf
                             (Some(_), None) => Some(true), // B extends to -inf → A lower >= -inf
                             (Some(al), Some(bl)) => {
                                 if al > bl {
@@ -1145,12 +1145,20 @@ impl std::fmt::Debug for RangeEqUdf {
 }
 
 impl ScalarUDFImpl for RangeEqUdf {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { "range_eq" }
-    fn signature(&self) -> &Signature { &self.sig }
-    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> { Ok(DataType::Boolean) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "range_eq"
+    }
+    fn signature(&self) -> &Signature {
+        &self.sig
+    }
+    fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        use basin_common::types::range::{RangeValue, RangeSubtype};
+        use basin_common::types::range::{RangeSubtype, RangeValue};
 
         let n = args.number_rows;
         let a_strs = columnar_to_strings(&args.args[0], n)?;
@@ -1205,8 +1213,8 @@ fn parse_subtype(s: &str) -> basin_common::types::range::RangeSubtype {
     match s.to_ascii_lowercase().as_str() {
         "int4range" => RangeSubtype::Int4,
         "int8range" => RangeSubtype::Int8,
-        "numrange"  => RangeSubtype::Num,
-        "tsrange"   => RangeSubtype::Ts,
+        "numrange" => RangeSubtype::Num,
+        "tsrange" => RangeSubtype::Ts,
         "tstzrange" => RangeSubtype::Tstz,
         "daterange" => RangeSubtype::Date,
         _ => RangeSubtype::Num, // conservative: treat unknown as continuous
@@ -2039,7 +2047,7 @@ pub(crate) fn rewrite_range_equality(sql: &str) -> String {
                 // Find the opening quote of the string literal.
                 let lit_end = before.len(); // position of closing quote in `before`
                 let lit_content_end = lit_end - 1; // strip closing quote
-                // Scan backward for opening quote.
+                                                   // Scan backward for opening quote.
                 let Some(lit_open) = before[..lit_content_end].rfind('\'') else {
                     search_from = cast_end;
                     continue;
@@ -2077,7 +2085,7 @@ pub(crate) fn rewrite_range_equality(sql: &str) -> String {
                     continue;
                 }
                 let after_lit2 = &inner2[close2 + 1..]; // after closing quote of lit2
-                // Look for `::rangetype` after lit2.
+                                                        // Look for `::rangetype` after lit2.
                 let after_lit2_lower = after_lit2.to_ascii_lowercase();
                 let mut rhs_type: &str = kw; // default to same subtype as LHS
                 let rhs_cast_len;
@@ -2108,13 +2116,13 @@ pub(crate) fn rewrite_range_equality(sql: &str) -> String {
                 // Compute the full span to replace:
                 // from lit_open (start of `'lhs_text'`) to
                 // cast_end + (offset of eq) + 1 + len(eq_suffix up to rhs_cast_end)
-                let overall_start = lit_open;  // position in `result`
-                // The `=` is at: cast_end + (len of whitespace) + 0
+                let overall_start = lit_open; // position in `result`
+                                              // The `=` is at: cast_end + (len of whitespace) + 0
                 let after_trim_len = result[cast_end..].len() - after.len(); // whitespace before `=`
                 let eq_pos_in_result = cast_end + after_trim_len + 1; // after `=`
                 let eq_suffix_start_in_result =
                     eq_pos_in_result + (after.len() - after.trim_start().len()); // skip ws after `=`
-                // position of second lit opening quote in result:
+                                                                                 // position of second lit opening quote in result:
                 let lit2_open_in_result = eq_suffix_start_in_result; // eq_suffix starts with `'`
                 let lit2_close_in_result = lit2_open_in_result + 1 + close2; // closing `'`
                 let overall_end = lit2_close_in_result + 1 + rhs_cast_len; // include `::type` if present
@@ -2124,9 +2132,7 @@ pub(crate) fn rewrite_range_equality(sql: &str) -> String {
                     continue;
                 }
 
-                let replacement = format!(
-                    "range_eq('{lit_text}', '{lit2_text}', '{rhs_type}')"
-                );
+                let replacement = format!("range_eq('{lit_text}', '{lit2_text}', '{rhs_type}')");
                 result.replace_range(overall_start..overall_end, &replacement);
                 found = true;
                 continue 'outer;
@@ -2193,11 +2199,11 @@ pub(crate) fn rewrite_range_operators(sql: &str) -> String {
         // Arithmetic operators: only rewrite when both operands look like
         // range constructors (heuristic), so we don't rewrite plain numeric
         // `a + b`, `a * b`, `a - b` expressions.
-        ("+", "__range_plus"),  // placeholder
-        ("*", "__range_star"),  // placeholder
+        ("+", "__range_plus"), // placeholder
+        ("*", "__range_star"), // placeholder
         ("-", "__range_minus"), // placeholder
-        // Range equality is handled by rewrite_range_equality() which runs
-        // before this function, so we don't need a `=` entry here.
+                               // Range equality is handled by rewrite_range_equality() which runs
+                               // before this function, so we don't need a `=` entry here.
     ];
     let mut s = sql.to_string();
     for &(op, func) in ops {
@@ -2391,19 +2397,22 @@ fn find_closing_quote(s: &str) -> usize {
     s.len()
 }
 
-
 /// Return `true` if `expr` is a plain numeric literal (integer or decimal).
 /// Used to detect `col @> 5` patterns where `col` is a range-typed column.
 fn looks_like_numeric(expr: &str) -> bool {
     let s = expr.trim();
-    if s.is_empty() { return false; }
+    if s.is_empty() {
+        return false;
+    }
     // Optional leading minus.
     let s = if s.starts_with('-') { &s[1..] } else { s };
     // Must be all digits with at most one `.`
     let mut has_dot = false;
     for &b in s.as_bytes() {
         if b == b'.' {
-            if has_dot { return false; }
+            if has_dot {
+                return false;
+            }
             has_dot = true;
         } else if !b.is_ascii_digit() {
             return false;
@@ -2416,9 +2425,14 @@ fn looks_like_numeric(expr: &str) -> bool {
 /// Identifiers are alphanumeric + underscore, may be quoted with `"`.
 fn looks_like_identifier(expr: &str) -> bool {
     let s = expr.trim();
-    if s.is_empty() { return false; }
-    if s.starts_with('"') && s.ends_with('"') { return true; }
-    s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+    if s.is_empty() {
+        return false;
+    }
+    if s.starts_with('"') && s.ends_with('"') {
+        return true;
+    }
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
 }
 
 /// Return `true` if `expr` looks like a multirange constructor call.
@@ -2512,14 +2526,14 @@ fn range_extract_left(s: &str, end: usize) -> (usize, usize) {
         // consume the `::` and then try to capture a preceding string literal.
         if i >= 2 && bytes[i - 1] == b':' && bytes[i - 2] == b':' {
             i -= 2; // skip `::`
-            // Skip whitespace before `::`.
+                    // Skip whitespace before `::`.
             while i > 0 && bytes[i - 1].is_ascii_whitespace() {
                 i -= 1;
             }
             // If we have a closing quote, walk back through the string literal.
             if i > 0 && bytes[i - 1] == b'\'' {
                 i -= 1; // consume closing `'`
-                // Walk backward through the string content (handle `''` escapes).
+                        // Walk backward through the string content (handle `''` escapes).
                 while i > 0 {
                     if bytes[i - 1] == b'\'' {
                         // Check for `''` escape: peek two positions back.

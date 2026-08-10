@@ -42,11 +42,13 @@ pub mod retry_queue;
 pub mod sse;
 pub mod ws;
 
+pub use budget::{
+    estimate_event_size, BudgetError, BudgetGuard, BudgetTracker, DEFAULT_PER_PROJECT_BUDGET_BYTES,
+};
 pub use filter::Filter;
-pub use budget::{BudgetError, BudgetGuard, BudgetTracker, DEFAULT_PER_PROJECT_BUDGET_BYTES, estimate_event_size};
 pub use presence::{
-    ChannelName, ClientId, PresenceConfig, PresenceEntry, PresenceEvent, PresenceMeta,
-    PresenceRegistry, serialize_presence_diff, serialize_presence_state,
+    serialize_presence_diff, serialize_presence_state, ChannelName, ClientId, PresenceConfig,
+    PresenceEntry, PresenceEvent, PresenceMeta, PresenceRegistry,
 };
 pub use retry_queue::{
     DrainOutcome, ReplayRingRegistry, DEFAULT_RING_CAPACITY as DEFAULT_REPLAY_RING_CAPACITY,
@@ -142,11 +144,7 @@ impl ChannelRegistry {
     /// match are silently discarded at receive time, so the transport layer
     /// (`sse.rs`, `ws.rs`) never sees them. When `filter` is `None` the
     /// behaviour is identical to [`Self::subscribe`].
-    pub fn subscribe_filtered(
-        &self,
-        key: ChannelKey,
-        filter: Option<Filter>,
-    ) -> FilteredReceiver {
+    pub fn subscribe_filtered(&self, key: ChannelKey, filter: Option<Filter>) -> FilteredReceiver {
         let rx = self.subscribe(key);
         FilteredReceiver { rx, filter }
     }
@@ -228,7 +226,10 @@ impl FilteredReceiver {
     /// Construct a [`FilteredReceiver`] directly from a raw broadcast receiver
     /// and an optional filter. Useful in tests that create channels manually
     /// without going through [`ChannelRegistry::subscribe_filtered`].
-    pub fn from_receiver(rx: broadcast::Receiver<Arc<ChangeEvent>>, filter: Option<Filter>) -> Self {
+    pub fn from_receiver(
+        rx: broadcast::Receiver<Arc<ChangeEvent>>,
+        filter: Option<Filter>,
+    ) -> Self {
         Self { rx, filter }
     }
 
@@ -238,9 +239,7 @@ impl FilteredReceiver {
     /// Returns `Err` on lag (ring-buffer overflow) or channel close, matching
     /// [`broadcast::Receiver::recv`] semantics. If predicate evaluation fails
     /// for an event (unsupported expression) that event is skipped (fail-closed).
-    pub async fn recv(
-        &mut self,
-    ) -> Result<Arc<ChangeEvent>, broadcast::error::RecvError> {
+    pub async fn recv(&mut self) -> Result<Arc<ChangeEvent>, broadcast::error::RecvError> {
         loop {
             let event = self.rx.recv().await?;
             match &self.filter {
@@ -267,9 +266,7 @@ impl FilteredReceiver {
     /// Try to receive without blocking. Returns `Err(TryRecvError::Empty)` if
     /// no matching event is immediately available (including if all buffered
     /// events are filtered out).
-    pub fn try_recv(
-        &mut self,
-    ) -> Result<Arc<ChangeEvent>, broadcast::error::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<Arc<ChangeEvent>, broadcast::error::TryRecvError> {
         loop {
             let event = self.rx.try_recv()?;
             match &self.filter {
@@ -458,9 +455,7 @@ impl ChangeEventSink for RealtimeSink {
                 if let Some(retry_log) = &self.retry_log {
                     // Use a stable sentinel subscription-id for the realtime
                     // overflow path (distinct from webhook subscription ids).
-                    let sub_id = basin_webhooks::WebhookSubscriptionId(
-                        uuid::Uuid::nil(),
-                    );
+                    let sub_id = basin_webhooks::WebhookSubscriptionId(uuid::Uuid::nil());
                     let envelope = basin_webhooks::WebhookEnvelope::from_event(sub_id, event);
                     // Fire-and-forget: enqueue error is non-fatal (post-commit).
                     if let Err(e) = retry_log.enqueue_new(sub_id, event.project, envelope).await {
@@ -581,10 +576,7 @@ impl ReplayCursor {
 /// let ws_router = basin_realtime::ws_router(registry.clone(), auth.clone());
 /// app = app.merge(ws_router);
 /// ```
-pub fn ws_router(
-    registry: ChannelRegistry,
-    auth: Arc<basin_auth::AuthService>,
-) -> axum::Router {
+pub fn ws_router(registry: ChannelRegistry, auth: Arc<basin_auth::AuthService>) -> axum::Router {
     ws::router(registry, auth)
 }
 
@@ -598,7 +590,12 @@ pub fn ws_router_with_rings(
     auth: Arc<basin_auth::AuthService>,
     replay_rings: ReplayRingRegistry,
 ) -> axum::Router {
-    ws::router_with_state(registry, auth, presence::PresenceRegistry::default(), replay_rings)
+    ws::router_with_state(
+        registry,
+        auth,
+        presence::PresenceRegistry::default(),
+        replay_rings,
+    )
 }
 
 /// Bind a standalone HTTP server for the WS endpoint on `bind_addr` and
@@ -623,10 +620,7 @@ pub async fn ws_serve(
 /// let sse_router = basin_realtime::sse_router(registry.clone(), auth.clone());
 /// app = app.merge(sse_router);
 /// ```
-pub fn sse_router(
-    registry: ChannelRegistry,
-    auth: Arc<basin_auth::AuthService>,
-) -> axum::Router {
+pub fn sse_router(registry: ChannelRegistry, auth: Arc<basin_auth::AuthService>) -> axum::Router {
     sse::router(registry, auth)
 }
 
@@ -761,7 +755,12 @@ mod tests {
 
     // ---- filter integration tests (Phase 5.11.R5) -------------------------
 
-    fn make_event_with_status(project: ProjectId, table: &str, seq: u64, status: &str) -> ChangeEvent {
+    fn make_event_with_status(
+        project: ProjectId,
+        table: &str,
+        seq: u64,
+        status: &str,
+    ) -> ChangeEvent {
         ChangeEvent {
             project,
             table: TableName::new(table).unwrap(),
@@ -783,7 +782,9 @@ mod tests {
         let key = ChannelKey::new(project, TableName::new("orders").unwrap());
 
         let filter = Filter::new("NEW.status = 'paid'").unwrap();
-        let mut rx = sink.registry().subscribe_filtered(key.clone(), Some(filter));
+        let mut rx = sink
+            .registry()
+            .subscribe_filtered(key.clone(), Some(filter));
 
         // Publish a non-matching event (pending) then a matching one (paid).
         let pending = make_event_with_status(project, "orders", 1, "pending");
@@ -809,8 +810,12 @@ mod tests {
 
         let mut rx = sink.registry().subscribe_filtered(key.clone(), None);
 
-        sink.publish(&make_event_with_status(project, "orders", 1, "pending")).await.unwrap();
-        sink.publish(&make_event_with_status(project, "orders", 2, "paid")).await.unwrap();
+        sink.publish(&make_event_with_status(project, "orders", 1, "pending"))
+            .await
+            .unwrap();
+        sink.publish(&make_event_with_status(project, "orders", 2, "paid"))
+            .await
+            .unwrap();
 
         assert_eq!(rx.try_recv().unwrap().seq, 1);
         assert_eq!(rx.try_recv().unwrap().seq, 2);
@@ -827,11 +832,19 @@ mod tests {
         let f_paid = Filter::new("NEW.status = 'paid'").unwrap();
         let f_pending = Filter::new("NEW.status = 'pending'").unwrap();
 
-        let mut rx_paid = sink.registry().subscribe_filtered(key.clone(), Some(f_paid));
-        let mut rx_pending = sink.registry().subscribe_filtered(key.clone(), Some(f_pending));
+        let mut rx_paid = sink
+            .registry()
+            .subscribe_filtered(key.clone(), Some(f_paid));
+        let mut rx_pending = sink
+            .registry()
+            .subscribe_filtered(key.clone(), Some(f_pending));
 
-        sink.publish(&make_event_with_status(project, "orders", 1, "pending")).await.unwrap();
-        sink.publish(&make_event_with_status(project, "orders", 2, "paid")).await.unwrap();
+        sink.publish(&make_event_with_status(project, "orders", 1, "pending"))
+            .await
+            .unwrap();
+        sink.publish(&make_event_with_status(project, "orders", 2, "paid"))
+            .await
+            .unwrap();
 
         // paid subscriber sees seq=2 only
         let p = rx_paid.try_recv().unwrap();

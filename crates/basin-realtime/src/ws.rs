@@ -260,19 +260,13 @@ enum ClientMsg {
     /// ```json
     /// {"type":"presence_untrack","channel":"room:1","client_id":"c1"}
     /// ```
-    PresenceUntrack {
-        channel: String,
-        client_id: String,
-    },
+    PresenceUntrack { channel: String, client_id: String },
     /// Refresh the heartbeat for `(channel, client_id)`.
     ///
     /// ```json
     /// {"type":"heartbeat","channel":"room:1","client_id":"c1"}
     /// ```
-    Heartbeat {
-        channel: String,
-        client_id: String,
-    },
+    Heartbeat { channel: String, client_id: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -479,7 +473,15 @@ pub async fn ws_handler(
 
     // --- 4. Upgrade to WebSocket -------------------------------------------
     ws_upgrade.on_upgrade(move |socket| {
-        handle_ws(socket, project_id, user_id, roles, registry, presence, replay_rings)
+        handle_ws(
+            socket,
+            project_id,
+            user_id,
+            roles,
+            registry,
+            presence,
+            replay_rings,
+        )
     })
 }
 
@@ -938,8 +940,7 @@ async fn handle_client_msg(
             if !presence_handles.contains_key(&channel) {
                 let pres_rx = presence.subscribe(*project_id, &channel);
                 let pres_tx_clone = pres_tx.clone();
-                let handle =
-                    tokio::spawn(presence_forwarder_task(pres_rx, pres_tx_clone));
+                let handle = tokio::spawn(presence_forwarder_task(pres_rx, pres_tx_clone));
                 presence_handles.insert(channel.clone(), handle);
             }
 
@@ -1196,7 +1197,11 @@ mod tests {
         let text = r#"{"type":"subscribe","table":"orders","filter":"NEW.status = 'paid'"}"#;
         let msg: ClientMsg = serde_json::from_str(text).expect("parse");
         match msg {
-            ClientMsg::Subscribe { table, filter, last_event_id } => {
+            ClientMsg::Subscribe {
+                table,
+                filter,
+                last_event_id,
+            } => {
                 assert_eq!(table, "orders");
                 assert_eq!(filter.as_deref(), Some("NEW.status = 'paid'"));
                 assert!(last_event_id.is_none());
@@ -1219,7 +1224,11 @@ mod tests {
         let text = r#"{"type":"subscribe","table":"orders","last_event_id":42}"#;
         let msg: ClientMsg = serde_json::from_str(text).expect("parse");
         match msg {
-            ClientMsg::Subscribe { table, filter: _, last_event_id } => {
+            ClientMsg::Subscribe {
+                table,
+                filter: _,
+                last_event_id,
+            } => {
                 assert_eq!(table, "orders");
                 assert_eq!(last_event_id, Some(42));
             }
@@ -1231,8 +1240,7 @@ mod tests {
 
     #[test]
     fn parse_presence_track_msg() {
-        let text =
-            r#"{"type":"presence_track","channel":"room:1","client_id":"c1","metadata":{"name":"Alice"}}"#;
+        let text = r#"{"type":"presence_track","channel":"room:1","client_id":"c1","metadata":{"name":"Alice"}}"#;
         let msg: ClientMsg = serde_json::from_str(text).expect("parse");
         match msg {
             ClientMsg::PresenceTrack {
@@ -1262,10 +1270,8 @@ mod tests {
     fn parse_heartbeat_msg() {
         let text = r#"{"type":"heartbeat","channel":"room:1","client_id":"c1"}"#;
         let msg: ClientMsg = serde_json::from_str(text).expect("parse");
-        assert!(
-            matches!(msg, ClientMsg::Heartbeat { channel, client_id }
-                if channel == "room:1" && client_id == "c1")
-        );
+        assert!(matches!(msg, ClientMsg::Heartbeat { channel, client_id }
+                if channel == "room:1" && client_id == "c1"));
     }
 
     // --- Token extraction --------------------------------------------------
@@ -1273,10 +1279,7 @@ mod tests {
     #[test]
     fn extract_token_from_bearer_header() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            "Bearer mytoken123".parse().unwrap(),
-        );
+        headers.insert(AUTHORIZATION, "Bearer mytoken123".parse().unwrap());
         assert_eq!(extract_token(&headers).as_deref(), Some("mytoken123"));
     }
 

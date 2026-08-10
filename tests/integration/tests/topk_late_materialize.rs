@@ -189,8 +189,7 @@ async fn seed_events(
     while i <= n {
         let lo = i;
         let hi = (i + chunk - 1).min(n);
-        let mut stmt =
-            String::from("INSERT INTO events (id, amount, status, label) VALUES ");
+        let mut stmt = String::from("INSERT INTO events (id, amount, status, label) VALUES ");
         let mut first = true;
         for k in lo..=hi {
             if !first {
@@ -224,12 +223,7 @@ async fn seed_events(
 ///
 /// Both runs use the SAME engine + data; only the cap env differs. The disabled
 /// run is the ground truth (existing decode-everything / DataFusion path).
-async fn differential(
-    eng: &Engine,
-    sess: &ProjectSession,
-    sql: &str,
-    expect_fast: bool,
-) {
+async fn differential(eng: &Engine, sess: &ProjectSession, sql: &str, expect_fast: bool) {
     // Disabled (ground truth) FIRST so the warm cache state is identical for the
     // enabled run (and so an accidental engagement on the truth run is caught).
     let truth = {
@@ -251,7 +245,10 @@ async fn differential(
         "fast-path result diverged from ground truth for {sql:?}\n fast={got:?}\n truth={truth:?}"
     );
     if expect_fast {
-        assert_eq!(delta, 1, "expected top-K fast path to fire once for {sql:?}");
+        assert_eq!(
+            delta, 1,
+            "expected top-K fast path to fire once for {sql:?}"
+        );
     } else {
         assert_eq!(delta, 0, "expected NO top-K fast path for {sql:?}");
     }
@@ -468,8 +465,16 @@ async fn topk_overlay_decline_uses_new_value() {
     // SECOND row (id=2000) to the runner-up region, so both must surface with
     // their NEW values. Tombstone id=3000's pre-update neighbour to also prove
     // a deleted row never wins.
-    exec(&sess, "UPDATE events SET amount = 9999999.0 WHERE id = 3000").await;
-    exec(&sess, "UPDATE events SET amount = 9999998.0 WHERE id = 2000").await;
+    exec(
+        &sess,
+        "UPDATE events SET amount = 9999999.0 WHERE id = 3000",
+    )
+    .await;
+    exec(
+        &sess,
+        "UPDATE events SET amount = 9999998.0 WHERE id = 2000",
+    )
+    .await;
     exec(&sess, "DELETE FROM events WHERE id = 4000").await;
 
     // With an overlay live the branch declines, so we expect NO engagement —
@@ -485,7 +490,10 @@ async fn topk_overlay_decline_uses_new_value() {
         before,
         "branch must decline while a live overlay is present"
     );
-    assert_eq!(rows[0].id, 3000, "updated row uses its NEW (winning) amount");
+    assert_eq!(
+        rows[0].id, 3000,
+        "updated row uses its NEW (winning) amount"
+    );
     assert_eq!(rows[1].id, 2000, "second updated row uses its NEW amount");
     assert!(
         rows.iter().all(|r| r.id != 4000),

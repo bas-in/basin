@@ -42,7 +42,7 @@ pub const DEFAULT_CURSOR_MAX_ROWS: usize = 10_000;
 pub fn cursor_max_rows() -> Option<usize> {
     match std::env::var("BASIN_CURSOR_MAX_ROWS").ok().as_deref() {
         Some(s) => match s.trim().parse::<usize>() {
-            Ok(0) => None,  // 0 = unlimited
+            Ok(0) => None, // 0 = unlimited
             Ok(n) => Some(n),
             Err(_) => Some(DEFAULT_CURSOR_MAX_ROWS),
         },
@@ -410,9 +410,7 @@ pub(crate) fn match_move_sql(sql: &str) -> Option<MoveIntent> {
 ///
 /// Returns a [`MoveIntent`] with the cursor name and the corresponding
 /// [`CursorDirection`].
-pub(crate) fn match_move_sql_ast(
-    stmt: &pg_query::protobuf::FetchStmt,
-) -> Result<MoveIntent> {
+pub(crate) fn match_move_sql_ast(stmt: &pg_query::protobuf::FetchStmt) -> Result<MoveIntent> {
     use pg_query::protobuf::FetchDirection;
 
     let cursor_name = stmt.portalname.clone();
@@ -422,7 +420,8 @@ pub(crate) fn match_move_sql_ast(
         ));
     }
 
-    let direction = FetchDirection::try_from(stmt.direction).unwrap_or(FetchDirection::FetchForward);
+    let direction =
+        FetchDirection::try_from(stmt.direction).unwrap_or(FetchDirection::FetchForward);
     let n = stmt.how_many;
     let i64_max = i64::MAX;
 

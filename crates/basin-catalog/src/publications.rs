@@ -78,7 +78,10 @@ impl PublicationRegistry {
         all_tables: bool,
         tables: Vec<PublicationTable>,
     ) -> Result<(), String> {
-        let mut guard = self.inner.lock().expect("PublicationRegistry lock poisoned");
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("PublicationRegistry lock poisoned");
         let project_pubs = guard.entry(*project).or_default();
         if project_pubs.contains_key(pubname) {
             return Err(format!("publication \"{pubname}\" already exists"));
@@ -104,7 +107,10 @@ impl PublicationRegistry {
         table_name: &str,
         row_filter: Option<String>,
     ) -> Result<(), String> {
-        let mut guard = self.inner.lock().expect("PublicationRegistry lock poisoned");
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("PublicationRegistry lock poisoned");
         let project_pubs = guard
             .get_mut(project)
             .ok_or_else(|| format!("publication \"{pubname}\" does not exist"))?;
@@ -122,12 +128,11 @@ impl PublicationRegistry {
     }
 
     /// Drop an existing publication. Returns an error if it doesn't exist.
-    pub fn drop_publication(
-        &self,
-        project: &ProjectId,
-        pubname: &str,
-    ) -> Result<(), String> {
-        let mut guard = self.inner.lock().expect("PublicationRegistry lock poisoned");
+    pub fn drop_publication(&self, project: &ProjectId, pubname: &str) -> Result<(), String> {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("PublicationRegistry lock poisoned");
         let project_pubs = guard
             .get_mut(project)
             .ok_or_else(|| format!("publication \"{pubname}\" does not exist"))?;
@@ -139,7 +144,10 @@ impl PublicationRegistry {
 
     /// List all publications for a project (for `pg_publication` view).
     pub fn list_publications(&self, project: &ProjectId) -> Vec<Publication> {
-        let guard = self.inner.lock().expect("PublicationRegistry lock poisoned");
+        let guard = self
+            .inner
+            .lock()
+            .expect("PublicationRegistry lock poisoned");
         let Some(project_pubs) = guard.get(project) else {
             return Vec::new();
         };
@@ -148,7 +156,10 @@ impl PublicationRegistry {
 
     /// List all (pubname, tablename) pairs for a project (for `pg_publication_tables` view).
     pub fn list_publication_tables(&self, project: &ProjectId) -> Vec<(String, String)> {
-        let guard = self.inner.lock().expect("PublicationRegistry lock poisoned");
+        let guard = self
+            .inner
+            .lock()
+            .expect("PublicationRegistry lock poisoned");
         let Some(project_pubs) = guard.get(project) else {
             return Vec::new();
         };
@@ -167,7 +178,10 @@ impl PublicationRegistry {
         project: &ProjectId,
         table_name: &str,
     ) -> Vec<String> {
-        let guard = self.inner.lock().expect("PublicationRegistry lock poisoned");
+        let guard = self
+            .inner
+            .lock()
+            .expect("PublicationRegistry lock poisoned");
         let Some(project_pubs) = guard.get(project) else {
             return Vec::new();
         };

@@ -311,7 +311,10 @@ async fn int_equality_out_of_domain_is_empty_with_minimal_gets() {
     assert!(got.is_empty(), "out-of-domain equality returns no rows");
 
     let touched = tracking.touched_data_files();
-    eprintln!("int_eq_oob: touched {} data files (of {FILES})", touched.len());
+    eprintln!(
+        "int_eq_oob: touched {} data files (of {FILES})",
+        touched.len()
+    );
     assert!(
         touched.is_empty(),
         "an out-of-domain equality must touch no data files, got {:?}",
@@ -342,8 +345,12 @@ async fn bloom_definite_negative_prunes_inside_minmax_gap() {
     )
     .await
     .unwrap();
-    sess.execute("INSERT INTO t VALUES (0, 'a'), (500, 'a')").await.unwrap();
-    sess.execute("INSERT INTO t VALUES (1000, 'b'), (1500, 'b')").await.unwrap();
+    sess.execute("INSERT INTO t VALUES (0, 'a'), (500, 'a')")
+        .await
+        .unwrap();
+    sess.execute("INSERT INTO t VALUES (1000, 'b'), (1500, 'b')")
+        .await
+        .unwrap();
 
     let table = basin_common::TableName::new("t").unwrap();
     let listed = engine
@@ -395,7 +402,11 @@ async fn bloom_non_negative_keeps_file_and_result_is_exact() {
     // A present value: bloom says "maybe", min/max says "maybe" → file kept,
     // row returned. (Proves we don't over-prune on a bloom "maybe".)
     let present = select_ids(&sess, "SELECT id + 0 FROM t WHERE id = 333").await;
-    assert_eq!(present, vec![333], "present value must be returned (no over-prune)");
+    assert_eq!(
+        present,
+        vec![333],
+        "present value must be returned (no over-prune)"
+    );
 
     // The SAME query under the opt-out flag returns the identical result —
     // pruning is answer-invariant regardless of bloom outcomes.
@@ -454,7 +465,11 @@ async fn string_equality_and_range_prune_lexicographically() {
     // String equality: 'melon' is only in the m-file. Other 2 pruned.
     tracking.reset();
     let got = select_strs(&sess, "SELECT name || '' FROM s WHERE name = 'melon'").await;
-    assert_eq!(got, vec!["melon".to_string()], "string equality returns exact row");
+    assert_eq!(
+        got,
+        vec!["melon".to_string()],
+        "string equality returns exact row"
+    );
     let touched = tracking.touched_data_files();
     eprintln!("str_eq: touched {} data files (of 3)", touched.len());
     assert!(
@@ -467,10 +482,18 @@ async fn string_equality_and_range_prune_lexicographically() {
     // String range: name >= 'n' AND name < 'zz' overlaps only the z-file
     // (the m-file's max 'mulberry' < 'n'; the a-file is far below).
     tracking.reset();
-    let zr = select_strs(&sess, "SELECT name || '' FROM s WHERE name >= 'n' AND name < 'zz'").await;
+    let zr = select_strs(
+        &sess,
+        "SELECT name || '' FROM s WHERE name >= 'n' AND name < 'zz'",
+    )
+    .await;
     assert_eq!(
         zr,
-        vec!["zebra".to_string(), "zinnia".to_string(), "zucchini".to_string()],
+        vec![
+            "zebra".to_string(),
+            "zinnia".to_string(),
+            "zucchini".to_string()
+        ],
         "string range returns exactly the z-band"
     );
     let touched = tracking.touched_data_files();
@@ -518,13 +541,20 @@ async fn equality_over_all_files_reads_all_when_value_present_everywhere() {
     .unwrap();
     for k in 0..FILES {
         // Each file: tag=7 for every row, distinct ids.
-        sess.execute(&format!("INSERT INTO u VALUES (7, {}), (7, {})", k * 2, k * 2 + 1))
-            .await
-            .unwrap();
+        sess.execute(&format!(
+            "INSERT INTO u VALUES (7, {}), (7, {})",
+            k * 2,
+            k * 2 + 1
+        ))
+        .await
+        .unwrap();
     }
 
     // tag = 7 is present in every file → all files must be read, result exact.
-    let res = sess.execute("SELECT id + 0 FROM u WHERE tag = 7").await.unwrap();
+    let res = sess
+        .execute("SELECT id + 0 FROM u WHERE tag = 7")
+        .await
+        .unwrap();
     let mut ids = Vec::new();
     if let ExecResult::Rows { batches, .. } = res {
         for b in batches {
@@ -538,5 +568,8 @@ async fn equality_over_all_files_reads_all_when_value_present_everywhere() {
     }
     ids.sort_unstable();
     let expected: Vec<i64> = (0..(FILES * 2)).collect();
-    assert_eq!(ids, expected, "equality present in all files must return every row");
+    assert_eq!(
+        ids, expected,
+        "equality present in all files must return every row"
+    );
 }

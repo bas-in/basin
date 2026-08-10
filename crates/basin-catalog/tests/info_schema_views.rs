@@ -339,7 +339,10 @@ async fn pg_namespace_all_reserved_schemas() {
     let oids = col_i64(&batch, "oid");
     let owners = col_i64(&batch, "nspowner");
     for i in 0..batch.num_rows() {
-        assert!(oids.value(i) > 0, "namespace oid must be a positive FNV hash");
+        assert!(
+            oids.value(i) > 0,
+            "namespace oid must be a positive FNV hash"
+        );
         assert_eq!(owners.value(i), 0);
     }
 }

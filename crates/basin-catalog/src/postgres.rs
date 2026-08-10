@@ -727,9 +727,9 @@ impl Catalog for PostgresCatalog {
                 &[&project_str, &schema_str],
             )
             .await
-            .map_err(|e| BasinError::catalog(format!(
-                "create_namespace seed schema {schema_str}: {e}"
-            )))?;
+            .map_err(|e| {
+                BasinError::catalog(format!("create_namespace seed schema {schema_str}: {e}"))
+            })?;
         }
         tx.commit()
             .await
@@ -982,8 +982,8 @@ impl Catalog for PostgresCatalog {
                 .map_err(|e| BasinError::catalog(format!("deserialise indexes: {e}")))?,
             None => Vec::new(),
         };
-        let row_block_size: Option<u32> = row_block_size_pg
-            .and_then(|v| if v > 0 { u32::try_from(v).ok() } else { None });
+        let row_block_size: Option<u32> =
+            row_block_size_pg.and_then(|v| if v > 0 { u32::try_from(v).ok() } else { None });
 
         let snapshots = fetch_snapshots(&client, sch, &project_str, "public", &table_str).await?;
         Ok(TableMetadata {
@@ -2241,9 +2241,7 @@ impl Catalog for PostgresCatalog {
             .await
             .map_err(|e| BasinError::catalog(format!("fork_to_project src lookup: {e}")))?;
         if src_row.is_none() {
-            return Err(BasinError::not_found(format!(
-                "{src_project}/{src_table}"
-            )));
+            return Err(BasinError::not_found(format!("{src_project}/{src_table}")));
         }
 
         // 2. Copy the table row into dst_project / dst_table.
@@ -3669,7 +3667,9 @@ impl Catalog for PostgresCatalog {
                 &[&project_str, &schema_name_str],
             )
             .await
-            .map_err(|e| BasinError::catalog(format!("seed reserved schema {schema_name_str}: {e}")))?;
+            .map_err(|e| {
+                BasinError::catalog(format!("seed reserved schema {schema_name_str}: {e}"))
+            })?;
         } else {
             let schema_exists = tx
                 .query_opt(
@@ -3894,8 +3894,8 @@ impl Catalog for PostgresCatalog {
                 .map_err(|e| BasinError::catalog(format!("deserialise indexes: {e}")))?,
             None => Vec::new(),
         };
-        let row_block_size: Option<u32> = row_block_size_pg
-            .and_then(|v| if v > 0 { u32::try_from(v).ok() } else { None });
+        let row_block_size: Option<u32> =
+            row_block_size_pg.and_then(|v| if v > 0 { u32::try_from(v).ok() } else { None });
 
         let snapshots =
             fetch_snapshots(&client, sch, &project_str, schema_name_str, &table_str).await?;
@@ -4312,11 +4312,7 @@ impl Catalog for PostgresCatalog {
     }
 
     #[instrument(skip(self, meta), fields(project = %project))]
-    async fn set_project_metadata(
-        &self,
-        project: &ProjectId,
-        meta: ProjectMetadata,
-    ) -> Result<()> {
+    async fn set_project_metadata(&self, project: &ProjectId, meta: ProjectMetadata) -> Result<()> {
         let sch = &self.schema;
         let client = self.client().await?;
         let meta_json = serde_json::to_value(&meta)
@@ -5122,12 +5118,7 @@ impl crate::leases::LeaseRegistry for PostgresCatalog {
     }
 
     #[instrument(skip(self), fields(project = %project, partition = %partition_id, holder = %holder))]
-    async fn release(
-        &self,
-        project: &ProjectId,
-        partition_id: &str,
-        holder: &str,
-    ) -> Result<bool> {
+    async fn release(&self, project: &ProjectId, partition_id: &str, holder: &str) -> Result<bool> {
         let sch = &self.schema;
         let client = self.client().await?;
         let n = client
@@ -6192,7 +6183,10 @@ mod tests {
         cat.advance_sequence_floor(&t, "s", 1000).await.unwrap();
         assert_eq!(cat.nextval(&t, "s").await.unwrap(), 1001);
         // Missing sequence is NotFound.
-        let err = cat.advance_sequence_floor(&t, "missing", 5).await.unwrap_err();
+        let err = cat
+            .advance_sequence_floor(&t, "missing", 5)
+            .await
+            .unwrap_err();
         assert!(matches!(err, BasinError::NotFound(_)), "got {err:?}");
     }
 

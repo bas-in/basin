@@ -60,7 +60,11 @@ fn approx_eq(a: f32, b: f32) -> bool {
 
 fn t(s: &str) -> Trigram {
     let b = s.as_bytes();
-    assert_eq!(b.len(), 3, "test helper: trigram literal must be exactly 3 bytes: {s:?}");
+    assert_eq!(
+        b.len(),
+        3,
+        "test helper: trigram literal must be exactly 3 bytes: {s:?}"
+    );
     [b[0], b[1], b[2]]
 }
 
@@ -73,7 +77,10 @@ fn t(s: &str) -> Trigram {
 #[test]
 fn trgm_empty_string_yields_empty_set() {
     let got = extract("");
-    assert!(got.is_empty(), "expected no trigrams for empty string, got {got:?}");
+    assert!(
+        got.is_empty(),
+        "expected no trigrams for empty string, got {got:?}"
+    );
 }
 
 /// Whitespace-only string has no alphanumeric runs → no trigrams.
@@ -89,9 +96,16 @@ fn trgm_whitespace_only_yields_empty_set() {
 #[test]
 fn trgm_single_char_word_two_trigrams() {
     let got = extract("a");
-    assert_eq!(got.len(), 2, "single-char word must yield exactly 2 trigrams, got {got:?}");
+    assert_eq!(
+        got.len(),
+        2,
+        "single-char word must yield exactly 2 trigrams, got {got:?}"
+    );
     assert!(got.contains(&t("  a")), "missing leading-pad trigram '  a'");
-    assert!(got.contains(&t(" a ")), "missing trailing-pad trigram ' a '");
+    assert!(
+        got.contains(&t(" a ")),
+        "missing trailing-pad trigram ' a '"
+    );
 }
 
 /// Two-char word `"ab"` → padded `"  ab "` → windows `"  a"`, `" ab"`, `"ab "`.
@@ -99,7 +113,11 @@ fn trgm_single_char_word_two_trigrams() {
 #[test]
 fn trgm_two_char_word_three_trigrams() {
     let got = extract("ab");
-    assert_eq!(got.len(), 3, "two-char word must yield 3 trigrams, got {got:?}");
+    assert_eq!(
+        got.len(),
+        3,
+        "two-char word must yield 3 trigrams, got {got:?}"
+    );
     assert!(got.contains(&t("  a")));
     assert!(got.contains(&t(" ab")));
     assert!(got.contains(&t("ab ")));
@@ -120,7 +138,11 @@ fn trgm_three_char_word_four_trigrams() {
 /// PG: `SELECT show_trgm('CAT') = show_trgm('cat'); => t`
 #[test]
 fn trgm_case_folds_to_lowercase() {
-    assert_eq!(extract("CAT"), extract("cat"), "CAT vs cat: trigram sets must be identical");
+    assert_eq!(
+        extract("CAT"),
+        extract("cat"),
+        "CAT vs cat: trigram sets must be identical"
+    );
     assert_eq!(extract("ALICE"), extract("alice"), "ALICE vs alice");
     assert_eq!(extract("CaT"), extract("cat"), "mixed-case CaT vs cat");
 }
@@ -184,10 +206,16 @@ fn trgm_multi_word_two_independent_word_sets() {
     let both = extract("alice smith");
     // Every trigram from "alice" and "smith" must appear in "alice smith".
     for tg in &alice_only {
-        assert!(both.contains(tg), "trigram from 'alice' missing in 'alice smith': {tg:?}");
+        assert!(
+            both.contains(tg),
+            "trigram from 'alice' missing in 'alice smith': {tg:?}"
+        );
     }
     for tg in &smith_only {
-        assert!(both.contains(tg), "trigram from 'smith' missing in 'alice smith': {tg:?}");
+        assert!(
+            both.contains(tg),
+            "trigram from 'smith' missing in 'alice smith': {tg:?}"
+        );
     }
     // The combined set is the union (deduped), so its size is:
     // |alice| + |smith| - |alice ∩ smith|. For these particular strings there
@@ -337,7 +365,10 @@ fn similarity_typo_pair_above_default_threshold() {
         "typo pair 'alice smith'/'alyce smyth': got {s}, must exceed \
          PG default similarity_threshold 0.3"
     );
-    assert!(s < 1.0, "typo pair must not score 1.0 (strings are not identical)");
+    assert!(
+        s < 1.0,
+        "typo pair must not score 1.0 (strings are not identical)"
+    );
 }
 
 /// Unrelated pair must score well below the PG default threshold.
@@ -502,7 +533,10 @@ fn word_similarity_beats_similarity_on_long_haystack() {
 #[test]
 fn word_similarity_no_match_scores_low() {
     let s = word_similarity("xyz", "alice smith");
-    assert!(s < 0.2, "word_similarity('xyz','alice smith'): got {s}, expected < 0.2");
+    assert!(
+        s < 0.2,
+        "word_similarity('xyz','alice smith'): got {s}, expected < 0.2"
+    );
 }
 
 /// Output is always in [0.0, 1.0].
@@ -560,7 +594,10 @@ fn word_similarity_single_word_haystack_equals_similarity() {
 #[test]
 fn similarity_night_vs_nacht_in_open_unit_interval() {
     let s = similarity("night", "nacht");
-    assert!(s > 0.0 && s < 1.0, "similarity('night','nacht'): got {s}, expected in (0,1)");
+    assert!(
+        s > 0.0 && s < 1.0,
+        "similarity('night','nacht'): got {s}, expected in (0,1)"
+    );
 }
 
 /// "cat" vs "concatenate": short word vs long word containing it.

@@ -475,9 +475,9 @@ fn eval_files(node: &TsqNode, list: &LexemePostingList) -> FileEval {
         TsqNode::Term(t) => match list.probe_lexeme(t) {
             // Never indexed (or evicted): cannot bound this term's matches.
             None => FileEval::Unknown,
-            Some(entries) => FileEval::Files(
-                entries.iter().map(|e| e.file_path.to_string()).collect(),
-            ),
+            Some(entries) => {
+                FileEval::Files(entries.iter().map(|e| e.file_path.to_string()).collect())
+            }
         },
         // A row matching `!a` may contain none of the indexed lexemes; the
         // posting list cannot bound it.
@@ -625,8 +625,10 @@ impl LexemePostingList {
     /// un-mark them in the completeness map.
     fn evict_oldest(&mut self) -> HashSet<String> {
         let evict_count = (self.insert_order.len() / 4).max(1);
-        let to_evict: Vec<String> =
-            self.insert_order.drain(..evict_count.min(self.insert_order.len())).collect();
+        let to_evict: Vec<String> = self
+            .insert_order
+            .drain(..evict_count.min(self.insert_order.len()))
+            .collect();
         let mut affected_files: HashSet<String> = HashSet::new();
         for k in &to_evict {
             if let Some(set) = self.entries.remove(k) {
@@ -712,8 +714,15 @@ impl GinTsvectorRegistry {
         table: &TableName,
         col: &str,
     ) -> Arc<Mutex<LexemePostingList>> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
-        let mut map = self.inner.lock().expect("GinTsvectorRegistry outer lock poisoned");
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
+        let mut map = self
+            .inner
+            .lock()
+            .expect("GinTsvectorRegistry outer lock poisoned");
         map.entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(LexemePostingList::new())))
             .clone()
@@ -725,8 +734,15 @@ impl GinTsvectorRegistry {
         table: &TableName,
         col: &str,
     ) -> Option<Arc<Mutex<LexemePostingList>>> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
-        let map = self.inner.lock().expect("GinTsvectorRegistry outer lock poisoned");
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
+        let map = self
+            .inner
+            .lock()
+            .expect("GinTsvectorRegistry outer lock poisoned");
         map.get(&key).cloned()
     }
 
@@ -756,7 +772,11 @@ impl GinTsvectorRegistry {
         let arc = self.get_or_create(project, table, col);
         let mut list = arc.lock().expect("LexemePostingList lock poisoned");
         let interned = list.intern_file(file_path);
-        let entry = TsvPostingEntry { file_path: interned, row_group, row };
+        let entry = TsvPostingEntry {
+            file_path: interned,
+            row_group,
+            row,
+        };
         let mut affected_files: HashSet<String> = HashSet::new();
         for lexeme in lexemes {
             affected_files.extend(list.insert(lexeme, entry.clone()));
@@ -895,20 +915,17 @@ impl GinTsvectorRegistry {
     /// Also removes `file_path` from the indexed-files completeness set so
     /// future probes do not erroneously claim full coverage after this file
     /// is gone.
-    pub fn remove_file(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-        col: &str,
-        file_path: &str,
-    ) {
+    pub fn remove_file(&self, project: &ProjectId, table: &TableName, col: &str, file_path: &str) {
         if let Some(arc) = self.get(project, table, col) {
             let mut list = arc.lock().expect("LexemePostingList lock poisoned");
             list.remove_file(file_path);
             // Remove from completeness tracking while the list lock is held
             // (same ordering as eviction in `index_row`).
-            let key =
-                RegKey { project: *project, table: table.clone(), col: col.to_string() };
+            let key = RegKey {
+                project: *project,
+                table: table.clone(),
+                col: col.to_string(),
+            };
             if let Ok(mut map) = self.indexed_files.lock() {
                 if let Some(set) = map.get_mut(&key) {
                     set.remove(file_path);
@@ -916,8 +933,11 @@ impl GinTsvectorRegistry {
             }
             drop(list);
         } else {
-            let key =
-                RegKey { project: *project, table: table.clone(), col: col.to_string() };
+            let key = RegKey {
+                project: *project,
+                table: table.clone(),
+                col: col.to_string(),
+            };
             if let Ok(mut map) = self.indexed_files.lock() {
                 if let Some(set) = map.get_mut(&key) {
                     set.remove(file_path);
@@ -938,7 +958,11 @@ impl GinTsvectorRegistry {
         col: &str,
         file_path: &str,
     ) {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         if let Ok(mut map) = self.indexed_files.lock() {
             map.entry(key).or_default().insert(file_path.to_string());
         }
@@ -962,7 +986,11 @@ impl GinTsvectorRegistry {
         table: &TableName,
         col: &str,
     ) -> HashSet<String> {
-        let key = RegKey { project: *project, table: table.clone(), col: col.to_string() };
+        let key = RegKey {
+            project: *project,
+            table: table.clone(),
+            col: col.to_string(),
+        };
         if let Ok(map) = self.indexed_files.lock() {
             map.get(&key).cloned().unwrap_or_default()
         } else {
@@ -973,16 +1001,13 @@ impl GinTsvectorRegistry {
     /// Return the total number of posting entries for `(project, table, col)`.
     ///
     /// Primarily used in tests and diagnostics.
-    pub fn total_entries(
-        &self,
-        project: &ProjectId,
-        table: &TableName,
-        col: &str,
-    ) -> usize {
+    pub fn total_entries(&self, project: &ProjectId, table: &TableName, col: &str) -> usize {
         match self.get(project, table, col) {
             None => 0,
             Some(arc) => {
-                arc.lock().expect("LexemePostingList lock poisoned").total_count
+                arc.lock()
+                    .expect("LexemePostingList lock poisoned")
+                    .total_count
             }
         }
     }
@@ -1085,11 +1110,17 @@ mod tests {
         use TsqNode::*;
         assert_eq!(
             parse_tsquery("'cat' & 'dog'"),
-            Some(And(Box::new(Term("cat".into())), Box::new(Term("dog".into()))))
+            Some(And(
+                Box::new(Term("cat".into())),
+                Box::new(Term("dog".into()))
+            ))
         );
         assert_eq!(
             parse_tsquery("'cat' | 'dog'"),
-            Some(Or(Box::new(Term("cat".into())), Box::new(Term("dog".into()))))
+            Some(Or(
+                Box::new(Term("cat".into())),
+                Box::new(Term("dog".into()))
+            ))
         );
         assert_eq!(
             parse_tsquery("!'dog'"),
@@ -1097,11 +1128,17 @@ mod tests {
         );
         assert_eq!(
             parse_tsquery("'quick' <-> 'brown'"),
-            Some(Phrase(Box::new(Term("quick".into())), Box::new(Term("brown".into()))))
+            Some(Phrase(
+                Box::new(Term("quick".into())),
+                Box::new(Term("brown".into()))
+            ))
         );
         assert_eq!(
             parse_tsquery("'quick' <2> 'fox'"),
-            Some(Phrase(Box::new(Term("quick".into())), Box::new(Term("fox".into()))))
+            Some(Phrase(
+                Box::new(Term("quick".into())),
+                Box::new(Term("fox".into()))
+            ))
         );
         // Precedence: | binds loosest.
         assert_eq!(
@@ -1154,7 +1191,10 @@ mod tests {
         let result = reg.probe_query(&proj, &tbl, "body", "'cat'");
         match result {
             TsvProbeResult::FileCandidates(files) => {
-                assert!(files.contains("f1.parquet"), "expected f1.parquet, got {files:?}");
+                assert!(
+                    files.contains("f1.parquet"),
+                    "expected f1.parquet, got {files:?}"
+                );
             }
             other => panic!("expected FileCandidates, got {other:?}"),
         }
@@ -1177,8 +1217,14 @@ mod tests {
         let result = reg.probe_query(&proj, &tbl, "body", "'cat' & 'dog'");
         match result {
             TsvProbeResult::FileCandidates(files) => {
-                assert!(files.contains("f1.parquet"), "f1 must be a candidate: {files:?}");
-                assert!(!files.contains("f2.parquet"), "f2 must be excluded: {files:?}");
+                assert!(
+                    files.contains("f1.parquet"),
+                    "f1 must be a candidate: {files:?}"
+                );
+                assert!(
+                    !files.contains("f2.parquet"),
+                    "f2 must be excluded: {files:?}"
+                );
             }
             other => panic!("expected FileCandidates, got {other:?}"),
         }
@@ -1360,7 +1406,10 @@ mod tests {
         let result = reg.probe_query(&proj, &tbl, "body", "'cat' & 'dog'");
         match result {
             TsvProbeResult::FileCandidates(files) => {
-                assert!(files.contains("f1.parquet"), "f1 must be a candidate: {files:?}");
+                assert!(
+                    files.contains("f1.parquet"),
+                    "f1 must be a candidate: {files:?}"
+                );
             }
             other => panic!("expected FileCandidates, got {other:?}"),
         }
@@ -1388,7 +1437,8 @@ mod tests {
         );
         // Completeness set no longer claims coverage of the removed file.
         assert!(
-            !reg.indexed_files_for(&proj, &tbl, "body").contains("f1.parquet"),
+            !reg.indexed_files_for(&proj, &tbl, "body")
+                .contains("f1.parquet"),
             "remove_file must un-mark the file in the completeness set"
         );
     }
@@ -1402,11 +1452,19 @@ mod tests {
         let f2 = list.intern_file("f2.parquet");
         list.insert(
             "old_lexeme".into(),
-            TsvPostingEntry { file_path: f1.clone(), row_group: 0, row: 0 },
+            TsvPostingEntry {
+                file_path: f1.clone(),
+                row_group: 0,
+                row: 0,
+            },
         );
         list.insert(
             "new_lexeme".into(),
-            TsvPostingEntry { file_path: f2.clone(), row_group: 0, row: 0 },
+            TsvPostingEntry {
+                file_path: f2.clone(),
+                row_group: 0,
+                row: 0,
+            },
         );
         assert_eq!(list.total_count, 2);
 
@@ -1425,11 +1483,22 @@ mod tests {
     fn duplicate_insert_does_not_inflate_count() {
         let mut list = LexemePostingList::new();
         let f1 = list.intern_file("f1.parquet");
-        let e = TsvPostingEntry { file_path: f1, row_group: 0, row: 0 };
+        let e = TsvPostingEntry {
+            file_path: f1,
+            row_group: 0,
+            row: 0,
+        };
         list.insert("cat".into(), e.clone());
         list.insert("cat".into(), e);
-        assert_eq!(list.total_count, 1, "duplicate (lexeme, entry) must not double-count");
-        assert_eq!(list.insert_order.len(), 1, "lexeme must appear once in insert order");
+        assert_eq!(
+            list.total_count, 1,
+            "duplicate (lexeme, entry) must not double-count"
+        );
+        assert_eq!(
+            list.insert_order.len(),
+            1,
+            "lexeme must appear once in insert order"
+        );
     }
 
     // ── GinTsvectorRegistry: total_entries ───────────────────────────────────
@@ -1441,7 +1510,15 @@ mod tests {
         let tbl = TableName::new("docs").unwrap();
 
         // Three lexemes → three posting entries.
-        reg.index_row(&proj, &tbl, "body", "'cat':1 'dog':2 'run':3", "f1.parquet", 0, 0);
+        reg.index_row(
+            &proj,
+            &tbl,
+            "body",
+            "'cat':1 'dog':2 'run':3",
+            "f1.parquet",
+            0,
+            0,
+        );
         assert_eq!(reg.total_entries(&proj, &tbl, "body"), 3);
 
         // Same lexeme in a different file → one more posting entry for each lexeme.
@@ -1478,8 +1555,7 @@ mod tests {
         // f2: "cat" only — must be excluded by the AND-merge below.
         reg.index_row(&proj, &tbl, "body", "'cat':1", "f2.parquet", 5, 0);
 
-        let result =
-            reg.probe_query_with_row_groups(&proj, &tbl, "body", "'cat' & 'dog'");
+        let result = reg.probe_query_with_row_groups(&proj, &tbl, "body", "'cat' & 'dog'");
         match result {
             TsvProbeRowGroupResult::FileRowGroups(map) => {
                 // Only f1 satisfies both lexemes (file-level AND).
@@ -1504,8 +1580,7 @@ mod tests {
         reg.index_row(&proj, &tbl, "body", "'dog':1", "f1.parquet", 3, 0);
         reg.index_row(&proj, &tbl, "body", "'dog':1", "f2.parquet", 1, 0);
 
-        let result =
-            reg.probe_query_with_row_groups(&proj, &tbl, "body", "'cat' | 'dog'");
+        let result = reg.probe_query_with_row_groups(&proj, &tbl, "body", "'cat' | 'dog'");
         match result {
             TsvProbeRowGroupResult::FileRowGroups(map) => {
                 assert_eq!(
@@ -1542,7 +1617,10 @@ mod tests {
         // Probing for "common" should return FileCandidates (every chunk file).
         let result = reg.probe_query(&proj, &tbl, "body", "'common'");
         assert!(
-            matches!(result, TsvProbeResult::FileCandidates(_) | TsvProbeResult::NoIndex),
+            matches!(
+                result,
+                TsvProbeResult::FileCandidates(_) | TsvProbeResult::NoIndex
+            ),
             "smoke probe returned unexpected {result:?}"
         );
     }

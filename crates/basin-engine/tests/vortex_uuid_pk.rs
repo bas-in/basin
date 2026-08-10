@@ -130,7 +130,10 @@ async fn uuid_pk_dedup_across_cold_vortex_file() {
     // Both rows should be readable.
     let batches = rows(&sess, "SELECT id, label FROM items ORDER BY label").await;
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total, 2, "both rows must be present after two distinct INSERTs");
+    assert_eq!(
+        total, 2,
+        "both rows must be present after two distinct INSERTs"
+    );
 
     // Duplicate INSERT of uuid_a must produce UniqueViolation.
     let err = sess

@@ -350,7 +350,9 @@ mod tests {
         let mut diff_last = good.clone().into_bytes();
         let last = diff_last.len() - 1;
         diff_last[last] = if diff_last[last] == b'a' { b'b' } else { b'a' };
-        assert!(verify_signature(&secret, body, std::str::from_utf8(&diff_first).unwrap()).is_err());
+        assert!(
+            verify_signature(&secret, body, std::str::from_utf8(&diff_first).unwrap()).is_err()
+        );
         assert!(verify_signature(&secret, body, std::str::from_utf8(&diff_last).unwrap()).is_err());
         // Sanity: the unmodified MAC must still verify.
         assert!(verify_signature(&secret, body, &good).is_ok());
