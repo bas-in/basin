@@ -90,6 +90,20 @@ impl Wal for NoTruncateWal {
         Ok(())
     }
 
+    // Delegated, like everything except `truncate`. This test freezes the WAL
+    // in its pre-truncate state; it does not model a lost WAL stream, so the
+    // cold-init LSN floor has to behave exactly as the real backend's does.
+    async fn ensure_next_lsn_at_least(
+        &self,
+        project: &ProjectId,
+        partition: &PartitionKey,
+        min_lsn: Lsn,
+    ) -> Result<()> {
+        self.inner
+            .ensure_next_lsn_at_least(project, partition, min_lsn)
+            .await
+    }
+
     async fn close(&self) -> Result<()> {
         self.inner.close().await
     }
