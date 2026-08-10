@@ -96,7 +96,7 @@ build/publish CI — Dockerfile + workflows exist), 5.32 (sample-app `npm` CI).
 **E. Cross-repo (separate git repos, separate Cargo targets — zero contention):**
 - `/Users/pc/code/basin-cli` — `TASKS.md`; ~5 tasks landed this session
   (dump/restore, gen-watch, cwd-fallback, projects tests). HTTP-API-client CLI.
-- `/Users/pc/code/basin-cloud` — `TASKS.md`, T-127..T-144 (paired UI) + T-15x
+- the private cloud repo — `TASKS.md`, T-127..T-144 (paired UI) + T-15x
   backend; ~5 landed (T-154/155/156/157/158). Vite+React SPA + Axum `backend-rs`.
 
 ---
@@ -118,8 +118,8 @@ build/publish CI — Dockerfile + workflows exist), 5.32 (sample-app `npm` CI).
 `basin-engine` (hub files: `executor.rs`, `session.rs`, `types.rs`, `lib.rs`,
 `index_probe.rs`). **Run ONE basin-engine-source-modifying agent per wave.** Pair
 it with: a different-crate agent (basin-pool/shard/storage/catalog), new-file
-agents (tests/docs/CI), and/or **sibling-repo agents** (basin-cli, basin-cloud —
-fully isolated, the best parallelism). To run >1 engine agent, give each a STRICT
+agents (tests/docs/CI), and/or **sibling-repo agents** (basin-cli, the cloud
+repo — fully isolated, the best parallelism). To run >1 engine agent, give each a STRICT
 disjoint file scope and tell it which files NOT to touch (worked this session for
 advisory/perf/pg_sleep).
 

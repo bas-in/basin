@@ -25,7 +25,7 @@ marker on that section).
 Rules:
 - Each item names a clear deliverable, a measurable acceptance bar, and
   the user / market signal it unblocks.
-- "Cloud-private" items belong in the private basin-cloud repo, not in
+- "Cloud-private" items belong in the private cloud repo, not in
   OSS docs — they are referenced here only as queue items.
 - "Strategic" items inform OSS roadmap but are written as engineering
   tasks, not marketing claims.
@@ -177,11 +177,11 @@ makes evals stick.
    anonKey)`, same RLS UX, same realtime channel shape, same env vars.
    **Acceptance:** the public Supabase quickstart tutorial works against
    a Basin instance with only the URL changed.
-7. **basin-cloud live and quoting real $/tenant/mo** — the cloud surface
+7. **A managed Basin live and quoting real $/tenant/mo** — the cloud surface
    has to exist publicly before "Supabase that scales to 10k tenants
    without bankrupting you" lands. (Cloud-private — referenced here so
    the perf wave knows what it's downstream of, but the work belongs in
-   the basin-cloud repo.)
+   the private cloud repo.)
 8. **Pick what we concede explicitly** — Basin's ADR 0019 skips Edge
    Functions; that decision should be the first paragraph of the README's
    "vs Supabase" section, not buried in the matrix. Right now the
@@ -335,6 +335,6 @@ Backend selection at runtime via `BASIN_ACCELERATOR_BACKEND={cpu,cuda,rocm,metal
   they don't belong in the current perf wave.
 - Items are removed when they land or get re-scoped to a real ADR / task.
 - `decisions.md` is the session-log; this file is the next-up queue.
-- This file is OSS-safe: cloud-private items (basin-cloud architecture,
+- This file is OSS-safe: cloud-private items (control-plane architecture,
   customer-specific deals) are referenced abstractly here and live in
   the private repo.
