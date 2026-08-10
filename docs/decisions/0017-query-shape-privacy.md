@@ -2,7 +2,7 @@
 title: "ADR 0017 — Query-shape stats: privacy + cross-process stability"
 nav_section: decisions
 sidebar_position: 17
-summary: "Phase 5.16 exports per-query-shape stats from OSS basin to an external analytics collector for cross-customer analytics. Privacy invariants, hash-function stability, and template anonymisation rules live here."
+summary: "Phase 5.16 exports per-query-shape stats from OSS basin to an external collector for cross-customer analytics. Privacy invariants, hash stability, and template anonymisation rules live here."
 tags: [observability, privacy, security]
 ---
 

@@ -2,7 +2,7 @@
 title: "Phase 0 customer interview script — wedge validation"
 nav_section: meta
 sidebar_position: 40
-summary: "5-10 founder interviews to validate the Basin wedge (multi-project Postgres-compat HTAP) before committing 3-6 months to a hosted product. Question bank, facilitation guide, scoring rubric, pivot triggers."
+summary: "5-10 founder interviews to validate the Basin wedge (multi-project Postgres-compat HTAP) before committing 3-6 months to a hosted product. Question bank, facilitation guide, scoring rubric."
 ---
 
 # Phase 0 customer interview script — wedge validation
