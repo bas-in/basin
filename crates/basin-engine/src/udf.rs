@@ -5438,11 +5438,33 @@ fn rewrite_binary_op_skip_arrays(sql: &str, op: &str, func: &str) -> String {
 //     same seed + same data + same scan order, evaluated from a fresh
 //     session = identical sample.
 //   The integration / differential tests honour this by opening a fresh
-//   session per probed query. KNOWN GAP: two sampled queries in one
-//   long-lived session share the counter, so the second is not guaranteed
-//   to reproduce the first — REPEATABLE's contract is per-statement and
-//   basin's RNG plumbing has no per-statement reset hook from inside a
-//   nullary UDF. Non-seeded variants are intentionally volatile.
+//   session per probed query.
+//
+//   "Same scan order" is a REAL precondition, not a formality: the draw a
+//   row receives is decided by the counter, so it depends on the order
+//   batches reach the UDF. A fanned-out scan advances that counter from
+//   several threads at once and the order becomes scheduler-dependent, which
+//   made the sample differ on every run. `exec_select` therefore pins
+//   target_partitions to 1 whenever the statement calls a seeded variant
+//   (see `sql_has_seeded_tablesample`), which is what establishes the
+//   precondition rather than assuming it.
+//
+//   KNOWN GAP: two sampled queries in one long-lived session share the
+//   counter, so the second is not guaranteed to reproduce the first —
+//   REPEATABLE's contract is per-statement and basin's RNG plumbing has no
+//   per-statement reset hook from inside a nullary UDF.
+//
+//   KNOWN GAP: because the draw is keyed on evaluation order rather than on
+//   row identity, the sample is stable only while the physical layout is.
+//   Compaction, or any rewrite that changes file order or batch boundaries,
+//   re-shuffles which row draws which value even though the logical rows are
+//   unchanged. Postgres keys its sample on physical tuple position, so it is
+//   stable under the same conditions and no more. Making this independent of
+//   layout would mean keying the draw on a row identity supplied as a UDF
+//   argument, which needs a catalog-aware rewrite and a defined answer for
+//   tables with no primary key.
+//
+//   Non-seeded variants are intentionally volatile.
 //
 // p == 0 -> keeps nothing; p == 100 -> keeps everything (handled by the
 // threshold comparison directly). Out-of-range p is rejected earlier, in
@@ -5469,6 +5491,26 @@ fn splitmix64(state: &mut u64) -> u64 {
 fn u64_to_unit_f64(x: u64) -> f64 {
     // Top 53 bits -> exact f64 mantissa precision.
     ((x >> 11) as f64) * (1.0_f64 / ((1u64 << 53) as f64))
+}
+
+/// Names of the two seeded (REPEATABLE) sampling UDFs. Their draw comes from
+/// a per-session counter advanced once per evaluated batch, so the value a
+/// given row draws depends on the ORDER in which batches reach the UDF.
+pub(crate) const SEEDED_TABLESAMPLE_UDFS: [&str; 2] = [
+    "basin_tablesample_keep_seeded",
+    "basin_tablesample_block_keep_seeded",
+];
+
+/// True when `sql` (post-rewrite) calls a seeded TABLESAMPLE UDF — i.e. the
+/// statement carried a `REPEATABLE(seed)` clause.
+///
+/// `exec_select` uses this to pin the scan to a single partition. See
+/// [`SEEDED_TABLESAMPLE_UDFS`]: the seeded draw is keyed on evaluation order,
+/// and a fanned-out scan consumes that counter from several threads at once,
+/// so the same seed over the same data produced a different sample on every
+/// run. REPEATABLE exists precisely to rule that out.
+pub(crate) fn sql_has_seeded_tablesample(sql: &str) -> bool {
+    SEEDED_TABLESAMPLE_UDFS.iter().any(|f| sql.contains(f))
 }
 
 /// Register the four TABLESAMPLE sampling UDFs on `ctx`. Registered per

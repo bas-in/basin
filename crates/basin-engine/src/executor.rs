@@ -10932,7 +10932,27 @@ pub(crate) async fn exec_select(
     // The TargetPartitionsGuard restores the session value to 1 on drop, covering
     // both the success path and any early-return via `?`.
     let _tp_guard: Option<TargetPartitionsGuard<'_>> = {
-        let new_tp = crate::session::target_partitions_for_bulk_scan(max_single_table_files);
+        // TABLESAMPLE ... REPEATABLE(seed) forces a single partition.
+        //
+        // The seeded sampling UDFs take each draw from a per-session counter
+        // advanced once per evaluated batch, so which draw a row receives is a
+        // function of the ORDER in which batches reach the UDF. With the scan
+        // fanned out, several threads call `fetch_add` concurrently and that
+        // order is whatever the scheduler happens to produce — the same seed
+        // over the same data returned a different sample on every run, the one
+        // thing REPEATABLE is specified to prevent. Parallelism only engages
+        // above MIN_FILES_FOR_PARALLEL_SCAN files, so small tables looked
+        // correct and hid it.
+        //
+        // A single partition makes the batch order deterministic, which is the
+        // guarantee Postgres gives: the same sample for a given seed as long
+        // as the data has not changed. The cost is scan parallelism, and only
+        // for queries that actually asked for REPEATABLE.
+        let new_tp = if crate::udf::sql_has_seeded_tablesample(sql) {
+            1
+        } else {
+            crate::session::target_partitions_for_bulk_scan(max_single_table_files)
+        };
         let (restore_partitions, restore_repart_agg, restore_repart_joins, restore_repart_windows) = {
             let state_ref = sess.ctx.state_ref();
             let state = state_ref.read();
