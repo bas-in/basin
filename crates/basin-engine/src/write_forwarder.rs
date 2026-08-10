@@ -5,8 +5,8 @@
 //! cloud-side layer that is compiled INTO the engine binary: it cannot live in
 //! the managed control plane, which does not depend on `basin-engine` and sits
 //! off the data path entirely. The region model it implements is specified in
-//! `docs/decisions/0009-multi-region-architecture.md`.
-//! It is registered once at engine startup via
+//! `docs/decisions/0009-multi-region-architecture.md`. It is registered once
+//! at engine startup via
 //! [`crate::Engine::attach_write_forwarder`], gated on `BASIN_WRITE_FORWARD_MODE`.
 //!
 //! # The two forwarding strategies
