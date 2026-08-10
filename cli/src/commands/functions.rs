@@ -23,7 +23,7 @@
 //!   GET    /v1/projects/:ref/functions/:name/logs tail invocation logs
 //!   DELETE /v1/projects/:ref/functions/:name      delete a function
 //!
-//! Routes are verified against basin-cloud
+//! Routes are verified against the control plane
 //! `backend-rs/src/handlers/project_functions.rs` (routes() fn, 2026-05-22).
 //! The W2 invoke path (`ANY /fn/v1/:name`) is a separate data-plane surface;
 //! `FN_BASE` here is the cloud control-plane surface.

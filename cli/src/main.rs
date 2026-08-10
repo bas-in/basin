@@ -1,4 +1,4 @@
-//! Command basin is the basin-cloud CLI.
+//! Command basin is the Basin control-plane CLI.
 //!
 //! Modeled on `gh` / `flyctl` / `supabase`. Subcommand dispatch is a
 //! flat table at the top level; each `commands/*.rs` file owns one

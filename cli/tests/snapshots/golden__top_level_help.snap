@@ -2,7 +2,7 @@
 source: tests/golden.rs
 expression: stdout
 ---
-basin — manage basin-cloud projects from the terminal.
+basin — manage Basin projects from the terminal.
 
 USAGE
   basin [global flags] <command> [args]

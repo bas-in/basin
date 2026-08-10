@@ -30,7 +30,7 @@ pub fn cmd_help(g: &GlobalFlags, args: &[String]) -> CliResult<()> {
 
 /// print_top_level_help renders the summary every subcommand inherits.
 pub fn print_top_level_help<W: Write>(w: &mut W) {
-    let _ = writeln!(w, "basin — manage basin-cloud projects from the terminal.");
+    let _ = writeln!(w, "basin — manage Basin projects from the terminal.");
     let _ = writeln!(w);
     let _ = writeln!(w, "USAGE");
     let _ = writeln!(w, "  basin [global flags] <command> [args]");

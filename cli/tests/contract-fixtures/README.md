@@ -11,5 +11,5 @@ To add a fixture: drop a new `*.json` file, capture the request shape from
 `src/commands/<name>.rs` (or a real cloud call), and re-run the test — no
 Rust edits needed.
 
-Record-mode (auto-generating fixtures from a live `basin-cloud`) is the
+Record-mode (auto-generating fixtures from a live control plane) is the
 gated follow-up half of TASKS 363.

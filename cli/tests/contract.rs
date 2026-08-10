@@ -3,7 +3,7 @@
 //! Each fixture under tests/contract-fixtures/*.json describes a sequence of
 //! HTTP request/response pairs the CLI is expected to issue. Replay-mode
 //! validates the CLI still talks the expected protocol; record-mode (future
-//! work, gated on a live basin-cloud) would generate fresh fixtures.
+//! work, gated on a live control plane) would generate fresh fixtures.
 //!
 //! Run: `cargo test --test contract`
 
