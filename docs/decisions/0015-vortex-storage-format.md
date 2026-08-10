@@ -273,7 +273,7 @@ while keeping Parquet as the default for the read-compat the wedge depends on.
   here; harness `benchmark/vortex_compare`, commit `5e21d13`
 - [`WEDGE.md`](../../WEDGE.md) — item 8, Phase 5.12.C: "Vortex as opt-in
   storage format (ADR 0015)"
-- [`TASK.md`](../../TASK.md) — Phase 5.12 SmithDB-inspired storage
+- [`TASK.md`](../TASK.md) — Phase 5.12 SmithDB-inspired storage
   optimizations
 - [`crates/basin-storage/src/vortex_format.rs`](../../crates/basin-storage/src/vortex_format.rs)
   — `VortexFormat` (`vortex-datafusion` 0.70) implementing the DataFusion 53

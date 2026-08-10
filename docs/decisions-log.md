@@ -1,3 +1,10 @@
+---
+title: "Development decisions log"
+nav_section: decisions
+sidebar_position: 1
+summary: "Append-only engineering log, newest first. Records decisions taken during development that are not already captured by an ADR, the build plan, or a commit message."
+---
+
 # Autonomous-loop decisions log
 
 Entries are appended in reverse-chronological order (newest at top). Each
@@ -946,7 +953,7 @@ security theater. Must fix before any beta; ~4–5 eng-days for all P0 + 4/5 P1.
 ## 2026-05-20 — Schemas: user-defined WON'T-DO, system schemas made real (ADR 0022)
 
 Decided after an architecture discussion. Full rationale in
-[ADR 0022](./docs/decisions/0022-system-schema-namespacing.md).
+[ADR 0022](./decisions/0022-system-schema-namespacing.md).
 
 **SQL schemas' original purpose** (SQL-92): a namespace of objects *owned by a
 single authorization identifier* — i.e. a per-user private namespace inside one
@@ -1205,7 +1212,7 @@ match impl, or add the variant + emit it. Queueing for Wave 4 alongside
 5.16.A.
 
 **Artifacts policy.** Agents must not write to `.claude/`. The autonomous
-loop persists nothing to disk except commits + this decisions.md.
+loop persists nothing to disk except commits + this log.
 
 ---
 

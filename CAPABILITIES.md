@@ -6,7 +6,7 @@ workload, this is the right page to read first.
 
 Cross-references: [`docs/V0_1_SCOPE.md`](./docs/V0_1_SCOPE.md) is the
 v0.1 cut-off (what ships in v0.1, what's parked, unparking triggers),
-[`TASK.md`](./TASK.md) is the full Phase 0–7 core-DB build plan,
+[`TASK.md`](./docs/TASK.md) is the full Phase 0–7 core-DB build plan,
 [`WEDGE.md`](./WEDGE.md) is the prioritized next-six-months slice,
 [`docs/deployment.md`](./docs/deployment.md) is the production deployment
 architecture guide, [`docs/decisions/`](./docs/decisions/) records every

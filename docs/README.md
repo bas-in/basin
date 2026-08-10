@@ -66,6 +66,7 @@ unified nav tree; GitHub renders it for humans browsing `docs/`.
 ## Architecture decisions (ADRs)
 
 - [ADR index](decisions/README.md)
+- [Development decisions log](decisions-log.md) — Append-only engineering log, newest first. Records decisions taken during development that are not already captured by an ADR, the build plan, or a commit message.
 - [ADR 0001 — Single-region only (superseded in part)](decisions/0001-single-region-only.md) — ADR 0001: Single-region only (superseded in part). See body for status, context, decision, consequences.
 - [ADR 0002 — No Postgres extensions](decisions/0002-no-postgres-extensions.md) — ADR 0002: No Postgres extensions. See body for status, context, decision, consequences.
 - [ADR 0003 — Native vector search](decisions/0003-native-vector-search.md) — ADR 0003: Native vector search. See body for status, context, decision, consequences.
@@ -108,6 +109,8 @@ unified nav tree; GitHub renders it for humans browsing `docs/`.
 
 - [Frontmatter spec for Basin OSS docs](frontmatter-spec.md) — YAML frontmatter contract every markdown file under docs/ obeys, so the docs site can fetch and render the whole OSS doc set.
 - [Phase 5.14 remaining + 5.16 — wave decomposition (2026-05-19)](roadmap/2026-05-19-decomposition.md) — Five-wave execution plan for Phase 5.14 HTAP + Phase 5.16 Query Insights, decomposed into file-disjoint sonnet-agent-ready specs by an opus decomposer on 2026-05-19.
+- [Build task list — Phases 0-7](TASK.md) — The full phased build plan for the core open-source database: pgwire, SQL, storage, catalog, query engine, multi-project, extensions, auth and REST.
+- [Release signing template](release-signing-template.md) — The release-integrity contract implemented by the release workflow and scripts/verify.sh. A template to copy into a sibling repo, not a shared dependency.
 - [basin-cli v0.1 design spec](basin-cli-design.md) — Historical design spec for the basin CLI. Superseded by the shipped implementation in cli/ — kept for the rationale, not as a description of the code.
 - [basin-js v0.1 design spec](basin-js-design.md) — Forward-spec for basin-js — TypeScript client SDK. Supabase-shaped API; talks pgwire/REST/WebSocket directly to a Basin engine. MIT-licensed.
 - [WebSocket subscriptions — design spec](websocket-subscription-design.md) — Forward-spec for basin-rest /realtime/v1/subscribe. Tails the change-event primitive (ADR 0012); emits JSON over a multiplexed single-socket protocol. Realtime parity with Supabase.
@@ -126,7 +129,6 @@ These live at the repo root, not under `docs/`:
 - [`../CAPABILITIES.md`](../CAPABILITIES.md) — capability matrix (shipped, in-progress, planned, off-roadmap)
 - [`../CHANGELOG.md`](../CHANGELOG.md) — release-by-release shipped changes
 - [`../WEDGE.md`](../WEDGE.md) — six-month prioritised roadmap
-- [`../TASK.md`](../TASK.md) — full Phase 0–7 build plan, agent-decomposed
 - [`../CONTRIBUTING.md`](../CONTRIBUTING.md) — contribution guide
 
 ---

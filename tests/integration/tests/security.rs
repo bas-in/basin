@@ -1540,7 +1540,7 @@ fn audit_p2_4_mime_sniff_overrides_client_header() {
 /// **Superseded by 5.18.C (commit 140bfe7)**: reserved-schema DDL is
 /// system-internal only.  ALL user SQL (admin or not) targeting a reserved
 /// schema is rejected SQLSTATE 42501 / `BasinError::PermissionDenied` via
-/// `guard_reserved_schema_for_user_ddl` in the engine. See decisions.md
+/// `guard_reserved_schema_for_user_ddl` in the engine. See docs/decisions-log.md
 /// 2026-05-22 entry and `crates/basin-engine/tests/reserved_schema_ddl_guard.rs`
 /// for the full test matrix.
 ///

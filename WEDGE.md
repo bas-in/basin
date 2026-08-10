@@ -6,7 +6,7 @@ ship a multi-project SaaS on it." All directly serve the wedge customer
 
 This is **not** a plan to beat Neon at Postgres-app workloads or Turso at
 the edge. The brief is explicit: stay in the wedge until paying customers
-ask for adjacent expansion. See [`TASK.md`](./TASK.md) for the full Phase
+ask for adjacent expansion. See [`TASK.md`](./docs/TASK.md) for the full Phase
 0–7 build plan; this file is the prioritized next-six-months slice.
 
 Legend: `[ ]` open · `[~]` in progress · `[x]` done · `[-]` deferred
@@ -33,7 +33,7 @@ still maturing.
 
 Three additional crates landed alongside the wedge by founder direction
 and now ship as part of the open-source bundle (Phase 5.10 in
-[`TASK.md`](./TASK.md)): `basin-auth` (identity, ADR 0005), `basin-rest`
+[`TASK.md`](./docs/TASK.md)): `basin-auth` (identity, ADR 0005), `basin-rest`
 (PostgREST equivalent, ADR 0006), `basin-pool` (per-project connection
 pool, ADR 0007). All three are wired into `basin-server` behind opt-in
 env vars; defaults preserve the original PoC behaviour.
@@ -60,7 +60,7 @@ open-source repo only; hosted-cloud product lives in a separate repo):**
 6. ~~Phase 5.11.A — expanded built-in function catalogue~~ — **shipped** (date/time, string, math, coalesce, aggregate; recursive-CTE + window verification pass).
 7. ~~Phase 5.11.D — `CREATE MATERIALIZED VIEW` SQL surface~~ — **shipped** (CV DDL + `REFRESH MATERIALIZED VIEW` + `DROP MATERIALIZED VIEW`).
 8. **B1 per-project secondary indexes** — biggest remaining point-query win. ~8 weeks. *Note (2026-05-19):* partially subsumed by Phase 5.14.A catalog blooms + 5.14.C hot tier for the OLTP `point_eq` shape; reassess scope once 5.14 lands.
-9. **Phase 5.12 — Storage perf & Vortex** — **shipped** (50 perf commits in #161/#162; Vortex default 2026-05-18 per [ADR 0015](./docs/decisions/0015-vortex-storage-format.md); 88-shape `vortex_vs_parquet_smoke` battery green). Full Phase 5.12.A through 5.12.O ship-list in [TASK.md](./TASK.md) Phase 5.12.
+9. **Phase 5.12 — Storage perf & Vortex** — **shipped** (50 perf commits in #161/#162; Vortex default 2026-05-18 per [ADR 0015](./docs/decisions/0015-vortex-storage-format.md); 88-shape `vortex_vs_parquet_smoke` battery green). Full Phase 5.12.A through 5.12.O ship-list in [TASK.md](./docs/TASK.md) Phase 5.12.
 10. ~~Phase 5.11.B — triggers via PL/pgSQL~~ — **superseded by [ADR 0012](./docs/decisions/0012-change-event-primitive.md) — see Phase 5.11.C reactors instead.** The change-event primitive (declarative lifecycle + SQL-bodied reactors) covers ~95% of trigger use cases without committing to a PL/pgSQL parser / interpreter. Already shipped in Phase 5.11.B (declarative lifecycle) and Phase 5.11.C (reactors).
 11. ~~Phase 5.11.C — PL/pgSQL stored procedures (subset)~~ — **superseded by [ADR 0012](./docs/decisions/0012-change-event-primitive.md) — see Phase 5.11.C reactors instead.** Basin's procedure surface is `LANGUAGE sql` (planning-time inlining) + `CALL` procedures (multi-statement bodies), already shipped in Phase 5.11.D/E/F. PL/pgSQL with `IF`/`LOOP`/variables / `EXCEPTION` blocks / cursor-driven loops is explicit non-goal per ADR 0012.
 12. **Phase 6 — production hardening** (multi-region read replicas, cross-shard 2PC, point-in-time restore extensions, branching/forking GC) — multi-month. Cloud-platform items (BYO-bucket, BYO-key, Stripe billing) live in the separate hosted-cloud repo.

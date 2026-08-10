@@ -22,7 +22,7 @@ projects, but each pinned project still resolves to exactly one endpoint.
 
 Two layers above are missing today:
 
-- **No transactions yet, even single-shard.** [`TASK.md`](../../TASK.md)
+- **No transactions yet, even single-shard.** [`TASK.md`](../TASK.md)
   Phase 4: "Single-shard transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) —
   deferred." The wedge customer's audit-log workload doesn't need them
   for correctness (every `INSERT` is its own committed Iceberg snapshot;
@@ -311,7 +311,7 @@ the *implementation* that's hard, not the running.
   — the per-connection upstream forwarder.
 - [`crates/basin-engine/src/executor.rs`](../../crates/basin-engine/src/executor.rs)
   — where the planning-time rejection lives.
-- [`TASK.md`](../../TASK.md) Phase 4 (single-shard transactions
+- [`TASK.md`](../TASK.md) Phase 4 (single-shard transactions
   deferred) and Phase 6 (this ADR's open box).
 - [`CAPABILITIES.md`](../../CAPABILITIES.md) "Cross-shard query merging"
   row — how the router's read-side fan-out compares to what this ADR

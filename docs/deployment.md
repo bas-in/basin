@@ -304,7 +304,7 @@ Spanner-class engineering. ADR 0001 documents the deferral and the trigger.
 Three legitimate reasons (none "by default"):
 
 1. **Whale project** — one customer with 100× the load of others. **Pin them to their own shard owner with bigger compute.** Same bucket, different in-memory shard. Cheap because storage is shared.
-2. **Compliance customer** — needs BYO-bucket or BYO-key (Phase 6, [TASK.md](../TASK.md)). They get their own bucket; data never touches Basin's bucket. Same Basin process, different storage backend per session.
+2. **Compliance customer** — needs BYO-bucket or BYO-key (Phase 6, [TASK.md](./TASK.md)). They get their own bucket; data never touches Basin's bucket. Same Basin process, different storage backend per session.
 3. **Region-restricted** — solved by per-region cluster, not per-customer instance. Customer picks region at signup.
 
 If a sales lead asks for "dedicated Postgres instance" → educate them on Basin's structural isolation, then offer (1) or (2) at premium pricing.
@@ -463,5 +463,5 @@ Pre-restart: empty result set. Post-restart: the 8 tables from
 - [ADR 0023 — Leases and partition routing](./decisions/0023-leases-and-partition-routing.md)
 - [`runbooks/failover.md`](./runbooks/failover.md) — raft-mode 3-node walkthrough, leader-loss behavior, procedures
 - [`runbooks/durability.md`](./runbooks/durability.md) — WAL mode durability ladder
-- [`TASK.md`](../TASK.md) — Phase 6 production hardening checklist
+- [`TASK.md`](./TASK.md) — Phase 6 production hardening checklist
 - [`CAPABILITIES.md`](../CAPABILITIES.md) — what's shipped vs deferred

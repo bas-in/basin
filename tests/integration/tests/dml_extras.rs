@@ -358,7 +358,7 @@ async fn insert_returning_star_multiple_rows() {
 
 // ─── 6. Hot-tier DELETE fast path ───────────────────────────────────────────
 //
-// Pin the new bulk-DELETE-WHERE-IN write-amp fix (decisions.md 2026-05-23):
+// Pin the new bulk-DELETE-WHERE-IN write-amp fix (docs/decisions-log.md 2026-05-23):
 // `DELETE FROM pk_table WHERE pk IN (…)` writes tombstones to the
 // MemTableRegistry instead of doing a copy-on-write Parquet rewrite.
 

@@ -42,7 +42,7 @@ storage format since 2026-05-18, ADR 0015) currently has no encoder for
 from being written to Vortex.
 
 Three workaround paths exist (see also the 2026-05-21 chat with the
-maintainer, captured in `decisions.md`):
+maintainer, captured in [`decisions-log.md`](../decisions-log.md)):
 
 **(a) Upstream a `FixedSizeBinary(N)` encoder to vortex-data/vortex.**
 Cleanest long-term, but 2-4 weeks of upstream lag at minimum (PR review,
@@ -191,5 +191,5 @@ translation per the steady-state plan above.
 - Task #40 — Engine bug clusters from #39 triage — C1 (this ADR's
   scope) and C4 (its prerequisite) both originate from the post-Phase-6.X
   cargo-test triage.
-- `decisions.md` 2026-05-21 entries for the triage and the cluster
+- [`decisions-log.md`](../decisions-log.md) 2026-05-21 entries for the triage and the cluster
   breakdown.

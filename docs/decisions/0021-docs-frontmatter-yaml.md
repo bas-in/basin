@@ -11,7 +11,7 @@ tags: [docs, meta, tooling]
 - **Status:** Accepted (2026-05-20) — locks the format that Phase 5.15.B (migration) and 5.15.C (top-level index) build against.
 - **Tags:** docs, meta, tooling
 - **Supersedes:** none
-- **Cross-references:** [`docs/frontmatter-spec.md`](../frontmatter-spec.md) — the normative field-by-field schema; Phase 5.15 spec in [`../TASK.md`](../../TASK.md)
+- **Cross-references:** [`docs/frontmatter-spec.md`](../frontmatter-spec.md) — the normative field-by-field schema; Phase 5.15 spec in [`../TASK.md`](../TASK.md)
 
 ## Context
 

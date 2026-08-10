@@ -109,7 +109,7 @@ The release job then, in order:
 5. **Prepends the verification snippet** to the release notes.
 
 If any of those steps fails, nothing is published. Do not "unblock" a release by
-removing a step — see `RELEASE-TEMPLATE.md` for what the contract is and why.
+removing a step — see [`docs/release-signing-template.md`](./docs/release-signing-template.md) for what the contract is and why.
 
 Per-asset `.tar.gz.sha256` sidecars are still produced by the build job and
 published, but `SHA256SUMS` is the manifest verification uses. A per-asset digest

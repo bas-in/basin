@@ -1,3 +1,10 @@
+---
+title: "Build task list — Phases 0-7"
+nav_section: meta
+sidebar_position: 11
+summary: "The full phased build plan for the core open-source database: pgwire, SQL, storage, catalog, query engine, multi-project, extensions, auth and REST."
+---
+
 # Basin — Build Task List
 
 Bucket-native, multi-project, Postgres-compatible database. Phased build per the
@@ -12,7 +19,7 @@ clone the repo. Hosted-product / control-plane / enterprise-auth
 extensions are out of scope for this OSS roadmap.
 
 **Postgres-extension equivalents we ship natively** (not via upstream
-`.so` loading — see [ADR 0002](./docs/decisions/0002-no-postgres-extensions.md)):
+`.so` loading — see [ADR 0002](./decisions/0002-no-postgres-extensions.md)):
 
 | Postgres extension | Basin crate | Section | v0.1 status |
 |---|---|---|---|
@@ -289,7 +296,7 @@ the corresponding `ScalarUDF`s.
 Driver: dependent customer needs PostGIS-shape workloads to perform
 at scale. v0.1 (above) is Rust-API correctness only — no SQL surface,
 no spatial index, no polygon ops, no PROJ. Design doc:
-[`docs/postgis-rtree-design.md`](./docs/postgis-rtree-design.md).
+[`docs/postgis-rtree-design.md`](./postgis-rtree-design.md).
 
 Five-wave ladder (Option B from §9 of the design doc — substrate +
 pushdown bundled separately because the substrate pieces are
@@ -574,7 +581,7 @@ Requires `BASIN_AUTH_ENABLED=1` per ADR.
 
 ## Phase 5.11 — Modern SaaS toolkit: SQL functions, declarative lifecycle, sink trait (~12-15 weeks committed)
 
-**Wedge call: new SaaS only.** See [ADR 0012](./docs/decisions/0012-change-event-primitive.md).
+**Wedge call: new SaaS only.** See [ADR 0012](./decisions/0012-change-event-primitive.md).
 Basin is the database new SaaS apps get *built on*, not where legacy PG
 schemas migrate. This phase ships user-defined functions, declarative
 lifecycle columns, expanded built-ins, enums, and a forward-compatible
@@ -917,7 +924,7 @@ PostgREST-style HTTP RPC surface over catalog UDFs. Tracked via ADR 0019.
 #### Phase 5.11.W — Wasm functions: JS/TS authoring (~6-8 weeks)
 
 The committed answer to "do you have edge functions?" per
-[ADR 0019](./docs/decisions/0019-declarative-baas-surface.md)'s
+[ADR 0019](./decisions/0019-declarative-baas-surface.md)'s
 "V8 never; WebAssembly is the function runtime" decision. Devs author
 in TypeScript; the toolchain compiles to a Wasm component (Javy /
 ComponentizeJS) at deploy time; it runs on the **already-shipped**
@@ -1014,9 +1021,9 @@ now block on host calls).
       `basin-bench-harness::profiles::noisy_neighbor`). A 1-hour
       `#[ignore]` long variant is documented inline for releases.
       Short variant 2/2 green; long variant ignored in CI.
-- [x] Docs: [`docs/functions.md`](./docs/functions.md) — authoring,
+- [x] Docs: [`docs/functions.md`](./functions.md) — authoring,
       host ABI, deploy, limits; explicit "this is Wasm, not V8" note
-      linking [ADR 0019](./docs/decisions/0019-declarative-baas-surface.md).
+      linking [ADR 0019](./decisions/0019-declarative-baas-surface.md).
       `BASIN_FN_*` cap matrix + audit cross-refs included.
 
 ### Tier 4 — `crates/basin-realtime` (~10-12 weeks)
@@ -1264,7 +1271,7 @@ same `object_store` the engine uses; signed URLs are HMAC over
 
 Make the system namespaces real reserved schemas; user-defined schemas stay
 flat-aliased to `public` (projects own project-membership). See
-[ADR 0022](./docs/decisions/0022-system-schema-namespacing.md). Sequencing:
+[ADR 0022](./decisions/0022-system-schema-namespacing.md). Sequencing:
 **A → B**, **A → C**, **D after A**, **E last**. 5.18.A must run SOLO in
 basin-catalog (no other catalog agent concurrent).
 
@@ -2187,7 +2194,7 @@ named slice green.
 
 ## Phase 5.12 — Storage perf & Vortex (PR #161 / #162) — **shipped**
 
-See [ADR 0015](./docs/decisions/0015-vortex-storage-format.md). Vortex
+See [ADR 0015](./decisions/0015-vortex-storage-format.md). Vortex
 opted-in 2026-05-11, flipped to default 2026-05-18 with the correctness
 prerequisites done. ~50 perf commits landed across #161 + #162. The
 88-shape `vortex_vs_parquet_smoke` battery characterizes the win
@@ -2277,7 +2284,7 @@ point-lookup latency (≈0.65×) and `ORDER BY … LIMIT` (≈0.38×).
 
 ## Phase 5.13 — pg_query parser migration (ADR 0014)
 
-See [ADR 0014](./docs/decisions/0014-pg-query-as-canonical-parser.md).
+See [ADR 0014](./decisions/0014-pg-query-as-canonical-parser.md).
 Three migration phases; Phase 1 in flight, Phase 2 starting, Phase 3
 gated on Phase 2 completion.
 
@@ -2332,7 +2339,7 @@ Privacy invariant: literals are stripped at the LogicalPlan layer before
 anything is persisted or exported.  Plan-shape hash is over operator tree
 + column refs + literal type slots, never literal values.
 
-Privacy and anonymisation model: [ADR 0017](./docs/decisions/0017-query-shape-privacy.md).
+Privacy and anonymisation model: [ADR 0017](./decisions/0017-query-shape-privacy.md).
 
 - [x] **5.16.A** Plan-shape canonical hash (shipped `33ae73f`; 6 unit tests pass; xxh3_64 seeded with `basin_sketch::QUERY_SHAPE_SEED`; LITERAL_SLOT + DataType erasure proves cross-process stability).  **Locked decision
       (2026-05-19) per ADR 0017:** use `xxhash-rust` crate's
@@ -2581,7 +2588,7 @@ HLL, ≤1% t-digest) honoured on the differential harness.
 ### 5.14.C — Row-format hot buffer for HTAP (~8 weeks engineering — the architectural moat)
 
 The architectural commitment.  Full design spec in
-[ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md).
+[ADR 0016](./decisions/0016-htap-hot-tier-architecture.md).
 LSM-style memtable for recent writes (row-formatted, PK-indexed,
 `parking_lot::RwLock<BTreeMap<RowKey, MemRowValue>>` per
 `(project_id, table_name)`).  Flushed to Vortex on size / age /
@@ -2698,7 +2705,7 @@ single-row UPDATE p99 ≤ 5 ms; 10k-project fuzz fits in 4 GB heap; 0
 differential rows vs Vortex-only baseline.
 
 **Total effort:** ~8 engineer-weeks.  Open risks and out-of-scope
-items documented in [ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md).
+items documented in [ADR 0016](./decisions/0016-htap-hot-tier-architecture.md).
 
 ### 5.14.D — Adaptive write-time multi-sort + catalog-aware WindowExec (~6 weeks combined, no deps)
 
@@ -2900,7 +2907,7 @@ Real integration assertions landed `0f40541` in `tests/integration/tests/securit
 The architectural commitment that fixes hot-project pinning AND multi-instance
 cap bypass in one shape. Driven by the noisy-neighbor audit
 (`docs/audits/2026-05-21-noisy-neighbor-fairness.md`, 4 P0 / 6 P1 / 5 P2-P3).
-Full design in [ADR 0023](./docs/decisions/0023-leases-and-partition-routing.md).
+Full design in [ADR 0023](./decisions/0023-leases-and-partition-routing.md).
 
 **Why TOP PRIORITY:** every per-project cap in OSS today (REST QPS, pgwire QPS,
 HTAP memtable bytes, realtime `BUFFER_FULL`, Wasm semaphore, basin-net
@@ -3129,7 +3136,7 @@ tests + 3 UUID tests = 10 ignores removed in one wave.
       `cargo build -p basin-server --no-default-features` (minimal) verified clean.
 - [ ] Multi-region: regional WAL + S3 cross-region replication
 - [x] Catalog replication strategy chosen and documented — strategy
-      chosen in [ADR 0010](./docs/decisions/0010-catalog-replication.md)
+      chosen in [ADR 0010](./decisions/0010-catalog-replication.md)
       (single-writer global Postgres + regional read replicas via PG
       logical replication); v0.1 ships single-node Postgres catalog;
       cross-region read-replica replication is v0.2 work tracked in
@@ -3198,7 +3205,7 @@ tests + 3 UUID tests = 10 ignores removed in one wave.
 The original 2026-05-12 production-benchmark gap list is largely closed.
 Everything tracked here is the **honest live set**; the canonical
 per-syntax matrix is auto-generated from tests and lives at
-[`docs/sql-support.md`](./docs/sql-support.md) — that is the source of
+[`docs/sql-support.md`](./sql-support.md) — that is the source of
 truth, this list is the human-readable summary.
 
 **Shipped since 2026-05-12 (struck from the gap list):**
@@ -3267,7 +3274,7 @@ truth, this list is the human-readable summary.
   version that adds `WindowFrame.exclusion`. Documented as a limitation, not a v0.1 blocker.
 - [ ] `EXCLUDE USING gist` — not on roadmap (geo-index dependency).
 
-**Live coverage:** see [`docs/sql-support.md`](./docs/sql-support.md) for the
+**Live coverage:** see [`docs/sql-support.md`](./sql-support.md) for the
 full per-fragment matrix (latest test expansion to 697 fragments via commit
 `39d51bb`).
 

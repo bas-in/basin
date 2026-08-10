@@ -5,7 +5,7 @@
 # COPIED FROM vul-os/ephor per its RELEASE-TEMPLATE.md — a template, not a shared
 # dependency, and deliberately not factored into anything. It has no imports,
 # no sourced helpers and no sibling scripts: `curl` and one of `sha256sum` /
-# `shasum` are the whole runtime. See RELEASE-TEMPLATE.md for what to change.
+# `shasum` are the whole runtime. See docs/release-signing-template.md for what to change.
 #
 # WHAT IT IS FOR
 # ──────────────

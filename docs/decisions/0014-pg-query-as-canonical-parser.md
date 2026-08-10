@@ -161,7 +161,7 @@ as parse frontend, own the AST-to-plan translation, avoid forking PG.
 
 ## References
 
-- [`TASK.md`](../../TASK.md) — Phase 5 / WEDGE item 4: pg_query migration
+- [`TASK.md`](../TASK.md) — Phase 5 / WEDGE item 4: pg_query migration
 - [`WEDGE.md`](../../WEDGE.md) — item 4: "pg_query migration (ADR 0014)"
 - [`CAPABILITIES.md`](../../CAPABILITIES.md) — SQL surface table; "Parser:
   libpg_query" row tracks Phase 1 status

@@ -264,7 +264,7 @@ or PostgreSQL-style MVCC, add a version chain then; not now.
 ## Decomposition (Phase 5.14.C sub-items)
 
 Six PR-sized sub-items, total ~8 engineer-weeks. Detailed file
-scopes + acceptance gates in [`TASK.md`](../../TASK.md) Phase 5.14.C.
+scopes + acceptance gates in [`TASK.md`](../TASK.md) Phase 5.14.C.
 
 | Sub-item | What | Depends on | ~Effort |
 |---|---|---|---|

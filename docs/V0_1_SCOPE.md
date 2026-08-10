@@ -12,7 +12,7 @@ for what ships in v0.1 vs what's parked. The companion docs are
 [`README.md`](../README.md) (positioning), [`CAPABILITIES.md`](../CAPABILITIES.md)
 (feature matrix), [`WEDGE.md`](../WEDGE.md) (wedge-deepening roadmap),
 [`benchmark/BENCHMARKS.md`](../benchmark/BENCHMARKS.md) (full numbers), and
-[`decisions.md`](../decisions.md) (wave-by-wave engineering log).
+[`decisions-log.md`](./decisions-log.md) (wave-by-wave engineering log).
 
 > Audience: maintainers, contributors, and review agents. Anyone proposing
 > new work should be able to map the work to one bullet under "Required for
@@ -295,7 +295,7 @@ when v0.1 ships; **not promises**.
   prioritized slice)
 - [`benchmark/BENCHMARKS.md`](../benchmark/BENCHMARKS.md) — full per-shape
   numbers
-- [`decisions.md`](../decisions.md) — wave-by-wave engineering log
+- [`decisions-log.md`](./decisions-log.md) — wave-by-wave engineering log
 - [`docs/decisions/`](./decisions/) — ADRs (0001 through 0026)
 - [`docs/sql-support.md`](./sql-support.md) — fine-grained per-syntax
   matrix from automated tests

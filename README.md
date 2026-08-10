@@ -379,7 +379,7 @@ The full capability matrix (with what's planned and what's deferred): [`CAPABILI
 | **6.x** | SQL long-tail (still pending) | **planned** — `search_path` semantics, server-side `PREPARE/EXECUTE` over text protocol edge cases, `DO` blocks, exotic types (`BIT` / `OID` / `REGCLASS`), array column DDL types, `sparsevec`, 3-D geometry, real multi-machine raft deployment docs |
 | **7** | Launch | gated on Phase 0 |
 
-Six-month wedge slice: [`WEDGE.md`](./WEDGE.md). Full plan: [`TASK.md`](./TASK.md). Decision log: [`docs/decisions/`](./docs/decisions/).
+Six-month wedge slice: [`WEDGE.md`](./WEDGE.md). Full plan: [`TASK.md`](./docs/TASK.md). Decision log: [`docs/decisions/`](./docs/decisions/).
 
 ---
 

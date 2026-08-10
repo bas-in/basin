@@ -1,3 +1,10 @@
+---
+title: "Release signing template"
+nav_section: meta
+sidebar_position: 12
+summary: "The release-integrity contract implemented by the release workflow and scripts/verify.sh. A template to copy into a sibling repo, not a shared dependency."
+---
+
 # Release signing — the contract Basin's release job implements
 
 > **Provenance:** this file and `scripts/verify.sh` were copied from

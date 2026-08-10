@@ -126,4 +126,4 @@ The only operations that genuinely **block on lock acquisition** in Basin are:
 - `crates/basin-shard/src/lock_wait.rs` (5.28.B bounded-wait primitive),
   `crates/basin-shard/src/lock_registry.rs` (5.23.D), `crates/basin-engine/src/
   advisory_lock.rs`, `crates/basin-router/src/error.rs` (55P03 / 40001 mapping).
-- `decisions.md` 2026-05-22 entries for the 5.28 timeout work.
+- [`decisions-log.md`](../decisions-log.md) 2026-05-22 entries for the 5.28 timeout work.

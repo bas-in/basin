@@ -12,7 +12,7 @@ repos `basin-js`, `basin-cli`) MUST begin with a YAML frontmatter block.
 The block lets the docs site build-time-fetch every product's docs and
 render them in a unified nav tree without per-file overrides.
 
-This spec is Phase 5.15.A — see [`../TASK.md`](../TASK.md) Phase 5.15.
+This spec is Phase 5.15.A — see [`TASK.md`](./TASK.md) Phase 5.15.
 
 ## Schema
 

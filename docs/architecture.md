@@ -9,7 +9,7 @@ summary: "Four-layer design: router, shard owners, WAL service, storage. Referen
 
 This document describes how Basin is put together. It is the design reference
 that the code is built against. For the phased build plan see
-[`../TASK.md`](../TASK.md).
+[`TASK.md`](./TASK.md).
 
 > Integrating from app code? See [`basin-js`](https://github.com/vul-os/basin/tree/main/sdks/js)
 > (engine-direct TypeScript SDK). Running and operating a fleet? See
@@ -576,5 +576,5 @@ explicitly *not*:
 
 ## See also
 
-- [`../TASK.md`](../TASK.md) — phased build plan and current status.
+- [`TASK.md`](./TASK.md) — phased build plan and current status.
 - [`../README.md`](../README.md) — repo layout and build commands.
