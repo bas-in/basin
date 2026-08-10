@@ -8247,6 +8247,25 @@ fn parse_compound_predicate(
 ) -> Result<CompoundPredicate> {
     match expr {
         Expr::Nested(inner) => parse_compound_predicate(inner, schema, table_name),
+        // Bare boolean literals. `WHERE true` / `WHERE false` are legal SQL,
+        // and RLS composes a policy's USING expression into the statement's
+        // WHERE — so the canonical permissive policy `USING (true)` (the form
+        // the Postgres docs themselves use) turns every UPDATE/DELETE on an
+        // RLS-enabled table into `<user pred> AND true`, which used to fail
+        // with "WHERE clause not representable in v0.1: true".
+        //
+        // No new storage atom is needed. `evaluate_compound` and
+        // `evaluate_compound_for_pruning` both already define the empty AND as
+        // vacuously true and the empty OR as vacuously false, so the identity
+        // element of each combinator IS the representation of the literal.
+        Expr::Value(ValueWithSpan {
+            value: Value::Boolean(b),
+            ..
+        }) => Ok(if *b {
+            CompoundPredicate::And(Vec::new())
+        } else {
+            CompoundPredicate::Or(Vec::new())
+        }),
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => Ok(CompoundPredicate::And(vec![
                 parse_compound_predicate(left, schema, table_name)?,
@@ -9428,6 +9447,48 @@ mod tests {
         match pred {
             CompoundPredicate::Atom(Predicate::Eq(col, _)) => assert_eq!(col, "id"),
             other => panic!("expected Atom(Eq(…)), got {other:?}"),
+        }
+    }
+
+    /// `WHERE true` / `WHERE false` — reached in practice through the RLS
+    /// composition of a `USING (true)` policy into an UPDATE/DELETE WHERE.
+    ///
+    /// Asserts the parse AND that the chosen representation really evaluates
+    /// the way the literal must: the empty AND selects every row, the empty
+    /// OR selects none. The identity-element encoding is only correct because
+    /// `evaluate_compound` defines those two cases, so the test pins the
+    /// evaluated mask rather than just the parsed shape.
+    #[test]
+    fn parse_compound_predicate_accepts_boolean_literals() {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        for (lit, expect_all) in [(true, true), (false, false)] {
+            let expr = Expr::Value(ValueWithSpan {
+                value: Value::Boolean(lit),
+                span: sqlparser::tokenizer::Span::empty(),
+            });
+            let pred = parse_compound_predicate(&expr, schema.as_ref(), "t")
+                .unwrap_or_else(|e| panic!("WHERE {lit} must parse, got {e:?}"));
+            let mask = basin_storage::evaluate_compound(&batch, &pred)
+                .expect("boolean literal predicate must evaluate");
+            assert_eq!(mask.len(), 3);
+            for r in 0..3 {
+                assert!(!mask.is_null(r), "WHERE {lit} must not yield UNKNOWN");
+                assert_eq!(
+                    mask.value(r),
+                    expect_all,
+                    "WHERE {lit} must select {} rows",
+                    if expect_all { "all" } else { "no" }
+                );
+            }
         }
     }
 
