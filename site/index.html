@@ -259,6 +259,8 @@ code{font-family:var(--font-mono);font-size:.92em}
 .t-str{color:var(--moss)}
 .t-com{color:rgb(var(--paper-rgb)/.34)}
 .t-out{color:rgb(var(--paper-rgb)/.66)}
+.t-fn{color:var(--basin-teal-3)}
+.t-num{color:var(--clay)}
 .hero-side-caption{
   margin-top:var(--space-3);font-family:var(--font-mono);font-size:.6875rem;
   color:rgb(var(--paper-rgb)/.4);letter-spacing:var(--tracking-mono-wide);
@@ -638,6 +640,59 @@ code{font-family:var(--font-mono);font-size:.92em}
   font-size:.8125rem;line-height:var(--lh-loose);color:rgb(var(--paper-rgb)/.5);
 }
 .feat-caveat code,.feat-blurb code{color:var(--basin-teal-3);overflow-wrap:anywhere}
+
+/* ── Figure: the client rail ──────────────────────────────────────── */
+.rail{margin-top:var(--space-9);display:grid;gap:0}
+.rail-row{display:grid;grid-template-columns:78px minmax(0,1fr);gap:var(--space-5);align-items:start}
+.rail-cap{
+  font-size:.625rem;letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;
+  color:rgb(var(--paper-rgb)/.36);padding-top:var(--space-4);
+}
+.rail-chips{display:flex;flex-wrap:wrap;gap:var(--space-3)}
+.rail-chips li{
+  border:var(--hairline-paper);border-radius:var(--radius-2);padding:8px 12px;
+  font-size:.8125rem;color:rgb(var(--paper-rgb)/.8);line-height:1.3;min-width:0;
+}
+.rail-chips b{
+  display:block;font-family:var(--font-mono);font-size:.625rem;font-weight:var(--weight-regular);
+  color:rgb(var(--paper-rgb)/.4);margin-top:3px;overflow-wrap:anywhere;
+}
+.rail-join{
+  display:grid;grid-template-columns:78px minmax(0,1fr);gap:var(--space-5);
+  height:34px;align-items:stretch;
+}
+.rail-join span:last-child{
+  border-left:1px solid rgb(var(--basin-teal-rgb)/.55);margin-left:22px;
+}
+.rail-protos{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--space-5)}
+.rail-proto{padding:var(--space-5);min-width:0}
+.rail-proto h3,.rail-binary h3{
+  font-size:1rem;font-weight:var(--weight-bold);
+  display:flex;align-items:baseline;gap:var(--space-3);flex-wrap:wrap;
+}
+.rail-proto h3 em,.rail-binary h3 em{
+  font-style:normal;font-family:var(--font-mono);font-size:.6875rem;
+  color:var(--basin-teal-3);font-weight:var(--weight-regular);
+}
+.rail-proto p,.rail-binary p{margin-top:var(--space-3);font-size:.875rem;line-height:var(--lh-loose);color:rgb(var(--paper-rgb)/.6)}
+.rail-proto code,.rail-binary code{color:var(--basin-teal-3);overflow-wrap:anywhere}
+.rail-binary{display:flex;gap:var(--space-5);align-items:flex-start;padding:var(--space-6);min-width:0}
+.rail-mark{width:44px;height:44px;border-radius:10px;flex:0 0 auto}
+@media(max-width:760px){
+  .rail-row,.rail-join{grid-template-columns:minmax(0,1fr)}
+  .rail-cap{padding-top:0}
+  .rail-join{height:26px}
+  .rail-join span:last-child{margin-left:20px}
+  .rail-protos{grid-template-columns:minmax(0,1fr)}
+}
+
+/* ── SDK code samples ─────────────────────────────────────────────── */
+.sdk-samples{
+  margin-top:clamp(32px,4vw,var(--space-10));
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:var(--space-5);
+}
+.sdk-samples .codeblock{min-width:0}
+.sdk-samples .codeblock-body{font-size:.75rem;line-height:1.85}
 
 /* ── Final CTA — the status plate ─────────────────────────────────── */
 .cta{position:relative;overflow:hidden;background:var(--ink-2)}
@@ -1355,6 +1410,147 @@ code{font-family:var(--font-mono);font-size:.92em}
         control plane. Fine-grained status for every row lives in
         <a href="https://github.com/vul-os/basin/blob/main/CAPABILITIES.md">CAPABILITIES.md</a>.
       </p>
+    </div>
+  </section>
+
+  <!-- ── SDKs ───────────────────────────────────────────────────── -->
+  <section id="sdks" class="section section-ink-2" aria-labelledby="sdk-h2">
+    <div class="container">
+      <div class="section-head reveal">
+        <span class="eyebrow">Clients · ten languages, no broker</span>
+        <h2 id="sdk-h2" class="display">Every SDK talks to the engine itself.</h2>
+        <p>
+          There is no gateway in the middle and no account to create. Each client speaks
+          pgwire for SQL and the engine's own HTTP surface for everything else, straight at
+          a <code>basin-server</code> you started. Point one at
+          <code>http://localhost:5434</code> and it behaves exactly as it would against a
+          box in a rack.
+        </p>
+      </div>
+
+      <!-- Figure 5 · fan-in. Ten clients, two protocols, one process. -->
+      <div class="rail reveal">
+        <div class="rail-row rail-clients">
+          <span class="rail-cap mono">clients</span>
+          <ul class="rail-chips">
+            <li>TypeScript<b>@bas-in/basin-js</b></li>
+            <li>Python<b>basin-sdk</b></li>
+            <li>Go<b>sdks/go</b></li>
+            <li>Rust<b>basin-sdk</b></li>
+            <li>Java<b>Basin</b></li>
+            <li>Ruby<b>basin-sdk</b></li>
+            <li>C#<b>.NET</b></li>
+            <li>PHP<b>basin/basin-php</b></li>
+            <li>Dart<b>basin_sdk</b></li>
+            <li>Swift<b>Basin</b></li>
+          </ul>
+        </div>
+
+        <div class="rail-join" aria-hidden="true"><span></span><span></span></div>
+
+        <div class="rail-row rail-protocols">
+          <span class="rail-cap mono">protocols</span>
+          <div class="rail-protos">
+            <div class="rail-proto plate">
+              <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+              <h3>pgwire v3<em>:5433</em></h3>
+              <p>Simple and extended query, TLS, <code>COPY</code>, prepared statements with
+                 binary JSONB / UUID / BYTEA / ARRAY. Any Postgres driver works here, SDK or not.</p>
+            </div>
+            <div class="rail-proto plate">
+              <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+              <h3>HTTP<em>:5434</em></h3>
+              <p><code>/rest/v1</code> tables and RPC, <code>/auth/v1</code>,
+                 <code>/storage/v1</code>, <code>/realtime/v1</code> and
+                 <code>/cdc/v1</code>. JSON by default; Arrow IPC streaming when you ask for it.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="rail-join" aria-hidden="true"><span></span><span></span></div>
+
+        <div class="rail-row rail-engine">
+          <span class="rail-cap mono">engine</span>
+          <div class="rail-binary plate">
+            <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+            <svg viewBox="0 0 128 128" class="rail-mark" aria-hidden="true"><use href="#basin-mark"/></svg>
+            <div>
+              <h3>basin-server</h3>
+              <p>One process. Router, shard owner, WAL, auth, REST, realtime, blob, vector,
+                 cron and the WASM runtime are crates inside it, not services beside it.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="fig-cap reveal">
+        Fig. 5 — <strong>no broker in the path.</strong> The TypeScript, Python, Go and Rust
+        clients also carry realtime; all ten carry auth, query, REST, storage and functions.
+      </p>
+
+      <div class="sdk-samples reveal">
+        <div class="codeblock">
+          <div class="codeblock-head">
+            <span class="codeblock-file mono">app.ts</span>
+            <span class="codeblock-tag">TypeScript</span>
+          </div>
+          <div class="codeblock-body">
+<span class="l"><span class="t-kw">import</span> { createClient } <span class="t-kw">from</span> <span class="t-str">"@bas-in/basin-js"</span>;</span>
+<span class="l"> </span>
+<span class="l"><span class="t-kw">const</span> basin = <span class="t-fn">createClient</span>(</span>
+<span class="l">  <span class="t-str">"http://localhost:5434"</span>, apiKey);</span>
+<span class="l"> </span>
+<span class="l"><span class="t-kw">const</span> { data } = <span class="t-kw">await</span> basin</span>
+<span class="l">  .<span class="t-fn">from</span>(<span class="t-str">"events"</span>).<span class="t-fn">select</span>(<span class="t-str">"*"</span>)</span>
+<span class="l">  .<span class="t-fn">eq</span>(<span class="t-str">"kind"</span>, <span class="t-str">"signup"</span>).<span class="t-fn">limit</span>(<span class="t-num">50</span>);</span>
+<span class="l"> </span>
+<span class="l"><span class="t-com">// streams NDJSON, never buffers</span></span>
+<span class="l"><span class="t-kw">for await</span> (<span class="t-kw">const</span> row <span class="t-kw">of</span> basin</span>
+<span class="l">  .<span class="t-fn">from</span>(<span class="t-str">"events"</span>).<span class="t-fn">select</span>().<span class="t-fn">stream</span>()) …</span>
+          </div>
+        </div>
+
+        <div class="codeblock">
+          <div class="codeblock-head">
+            <span class="codeblock-file mono">app.py</span>
+            <span class="codeblock-tag">Python</span>
+          </div>
+          <div class="codeblock-body">
+<span class="l"><span class="t-kw">from</span> basin <span class="t-kw">import</span> create_client</span>
+<span class="l"> </span>
+<span class="l">client = <span class="t-fn">create_client</span>(</span>
+<span class="l">    <span class="t-str">"http://localhost:5434"</span>, api_key)</span>
+<span class="l"> </span>
+<span class="l">res = <span class="t-kw">await</span> client.<span class="t-fn">from_</span>(<span class="t-str">"events"</span>) \</span>
+<span class="l">    .<span class="t-fn">select</span>(<span class="t-str">"*"</span>).<span class="t-fn">eq</span>(<span class="t-str">"kind"</span>, <span class="t-str">"signup"</span>) \</span>
+<span class="l">    .<span class="t-fn">limit</span>(<span class="t-num">50</span>)</span>
+<span class="l"> </span>
+<span class="l"><span class="t-com"># cursor pagination, transparent</span></span>
+<span class="l"><span class="t-kw">async for</span> row <span class="t-kw">in</span> client.<span class="t-fn">from_</span>(<span class="t-str">"events"</span>) \</span>
+<span class="l">        .<span class="t-fn">select</span>().<span class="t-fn">paginate</span>(): …</span>
+          </div>
+        </div>
+
+        <div class="codeblock">
+          <div class="codeblock-head">
+            <span class="codeblock-file mono">main.go</span>
+            <span class="codeblock-tag">Go</span>
+          </div>
+          <div class="codeblock-body">
+<span class="l"><span class="t-kw">import</span> basin <span class="t-str">"github.com/vul-os/basin/sdks/go"</span></span>
+<span class="l"> </span>
+<span class="l">client := basin.<span class="t-fn">New</span>(</span>
+<span class="l">    <span class="t-str">"http://localhost:5434"</span>,</span>
+<span class="l">    apiKey,</span>
+<span class="l">    basin.<span class="t-fn">WithProjectID</span>(projectID),</span>
+<span class="l">)</span>
+<span class="l"> </span>
+<span class="l">sess, err := client.Auth.<span class="t-fn">SignIn</span>(ctx,</span>
+<span class="l">    <span class="t-str">"alice@example.com"</span>, password, <span class="t-str">""</span>)</span>
+<span class="l"> </span>
+<span class="l"><span class="t-com">// Arrow IPC via arrow-go/v18</span></span>
+          </div>
+        </div>
+      </div>
     </div>
   </section>
 
