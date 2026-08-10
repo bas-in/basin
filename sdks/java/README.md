@@ -74,7 +74,7 @@ import io.basin.sdk.BasinClient;
 import io.basin.sdk.QueryResult;
 import io.basin.sdk.Session;
 
-// BASIN_URL points at a deployed basin-engine — NOT basin-cloud.
+// BASIN_URL points at a deployed basin-engine — NOT the control plane.
 // Mint BASIN_API_KEY at https://basin.run/app/project/<ref>/api-keys
 BasinClient client = BasinClient.builder()
     .url(System.getenv("BASIN_URL"))       // e.g. https://basin-engine.fly.dev
@@ -128,7 +128,7 @@ call `.join()` for blocking.
 
 [Basin Cloud](https://basin.run) is the **control plane** — dashboard, billing,
 project management, and the place you mint the API key. Once you have a URL and
-key, basin-cloud is **off the data path**: every `auth.*`, `table(...)`, and
+key, the control plane is **off the data path**: every `auth.*`, `table(...)`, and
 `storage.*` call lands on `basin-engine` directly. The engine is open source and
 deployable anywhere via `cargo run -p basin-server`.
 

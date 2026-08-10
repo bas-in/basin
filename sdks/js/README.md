@@ -66,7 +66,7 @@ behaves identically to talking to the managed cloud.
 ```ts
 import { createClient } from "@bas-in/basin-js";
 
-// BASIN_URL points at a deployed basin-engine — NOT basin-cloud.
+// BASIN_URL points at a deployed basin-engine — NOT the control plane.
 // Mint BASIN_ANON_KEY at https://basin.run/app/project/<ref>/api-keys
 const basin = createClient(
   process.env.BASIN_URL!,        // e.g. https://basin-engine.fly.dev
@@ -92,12 +92,11 @@ const { data, error } = await basin
 
 [Basin Cloud](https://basin.run) is the **control plane** — dashboard,
 billing, project management, and the place you mint the anon-key JWT
-that the SDK ships to the engine. Once you have a URL + key,
-basin-cloud is **off the data path**: every `basin.auth.*` and
+that the SDK ships to the engine. Once you have a URL + key, the
+control plane is **off the data path**: every `basin.auth.*` and
 `basin.from(...)` call lands on `basin-engine` directly. The engine
-is open source and deployable to Fly with `./deploy.sh -t engine`
-from the `basin-cloud` repo root, or runnable locally via
-`cargo run -p basin-server`.
+is open source — deploy it from this repo's `Dockerfile`, or run it
+locally with `cargo run -p basin-server`.
 
 Engine routes: `/auth/v1/{signup,signin,refresh,verify-email,
 reset-password,request-password-reset,magic-link,magic-link/consume,

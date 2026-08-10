@@ -31,7 +31,7 @@ Requires .NET 8 or later.
 ```csharp
 using Basin;
 
-// BASIN_URL points at a deployed basin-engine — not basin-cloud.
+// BASIN_URL points at a deployed basin-engine — not the control plane.
 // Mint your API key at https://basin.run/app/project/<ref>/api-keys
 using var client = new BasinClient.Builder()
     .WithUrl("https://your-project.basin.run")
@@ -57,11 +57,11 @@ foreach (var row in result.Rows)
 
 [Basin Cloud](https://basin.run) is the control plane — dashboard, billing,
 project management, and the place you mint the anon-key JWT that the SDK
-forwards to the engine. Once you have a URL + key, basin-cloud is **off the
-data path**: every `client.Auth.*`, `client.Table(…)`, and `client.Realtime.*`
-call lands on `basin-engine` directly. The engine is open source and
-deployable to Fly with `./deploy.sh -t engine` from the `basin-cloud` repo
-root, or runnable locally via `cargo run -p basin-server`.
+forwards to the engine. Once you have a URL + key, the control plane is **off
+the data path**: every `client.Auth.*`, `client.Table(…)`, and `client.Realtime.*`
+call lands on `basin-engine` directly. The engine is open source — deploy it
+from this repo's `Dockerfile`, or run it locally with
+`cargo run -p basin-server`.
 
 Engine routes the SDK covers: `/auth/v1/{signup,signin,signout,refresh,
 verify-email,reset-password,request-password-reset,magic-link,
