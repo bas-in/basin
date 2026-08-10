@@ -59,9 +59,14 @@ The key files:
 
 ## Metrics
 
-Storage metrics are exposed via the `/metrics` endpoint and the
-`/v1/admin/project_counters` endpoint. The names below are the OTLP /
-Prometheus convention.
+> **Status — read before wiring a dashboard.** Basin does not serve a
+> Prometheus scrape endpoint today. The names below are the planned
+> OTLP / Prometheus-convention names; the engine emits structured `tracing`
+> records that become OTLP metrics when an OpenTelemetry layer is attached
+> (`BASIN_OTLP_ENDPOINT`, default `http://localhost:4318`). The only HTTP
+> metrics route that exists is `GET /metrics/inflight`, which returns a small
+> JSON in-flight/latency snapshot. Treat every `curl .../metrics` recipe on
+> this page as the intended shape, not a working command.
 
 ### Page cache
 
@@ -96,7 +101,7 @@ and increase `BASIN_DISK_CACHE_MAX_BYTES`.
 
 The scheduler tracks per-project I/O pressure. These are surfaced via
 `Storage::project_stats()` (consumed by basin-engine's noisy-project
-detector) and via the `/v1/admin/project_counters` endpoint.
+detector) and via the `/admin/v1/usage` endpoint.
 
 | field | what it tells you |
 |---|---|
@@ -193,7 +198,7 @@ others' entries).
 
 1. Check `basin_page_cache_current_bytes`. If it is at the configured cap,
    the budget is too small.
-2. Identify the top-volume project via `/v1/admin/project_counters` — look for
+2. Identify the top-volume project via `/admin/v1/usage` — look for
    `ops_total` or `bytes_read_total` outliers.
 3. Either increase `BASIN_PAGE_CACHE_MAX_BYTES` and restart, or reduce the
    whale project's query rate (per-project QPS cap via `basin_budget_over_cap_seconds_total{cap=rest_qps}`).

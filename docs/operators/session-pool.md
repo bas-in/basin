@@ -72,8 +72,16 @@ Key source files:
 
 ## Metrics
 
-The pool exposes counters via `SessionPool::stats()`, which is consumed by
-the server's `/metrics` endpoint and the `/v1/admin/pool/stats` endpoint.
+The pool exposes counters via `SessionPool::stats()`.
+
+> **Status — read before wiring a dashboard.** Basin does not serve a
+> Prometheus scrape endpoint today. The names below are the planned
+> OTLP / Prometheus-convention names; the engine emits structured `tracing`
+> records that become OTLP metrics when an OpenTelemetry layer is attached
+> (`BASIN_OTLP_ENDPOINT`, default `http://localhost:4318`). The only HTTP
+> metrics route that exists is `GET /metrics/inflight`, which returns a small
+> JSON in-flight/latency snapshot. Treat every `curl .../metrics` recipe on
+> this page as the intended shape, not a working command.
 
 | field | type | what it tells you |
 |---|---|---|
@@ -218,6 +226,7 @@ has idle sessions it can sacrifice.
 
 1. Identify the high-occupancy project from the admin endpoint:
    ```bash
+   # NOTE: this admin route is not implemented yet.
    curl -s http://localhost:8080/v1/admin/pool/stats | jq '.per_project | sort_by(-.sessions) | .[0:5]'
    ```
 2. If the project is legitimately busy, increase `per_project_cap`.
@@ -235,7 +244,7 @@ has idle sessions it can sacrifice.
 # Metrics endpoint
 curl -s http://localhost:9090/metrics | grep basin_pool_
 
-# Admin endpoint (if wired in basin-server)
+# Admin endpoint — NOT implemented yet; shown as the intended shape.
 curl -s http://localhost:8080/v1/admin/pool/stats | jq .
 ```
 

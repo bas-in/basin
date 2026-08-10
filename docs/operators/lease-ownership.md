@@ -63,9 +63,16 @@ Read the full architectural rationale in
 
 ## Observability — the dashboard cards
 
-Every replica exports the following metrics (Phase 6.X.F). All names are
-the OTLP / Prometheus convention; your OTLP exporter ships them to
-your monitoring stack via the standard `/metrics` scrape.
+Every replica is intended to export the following metrics (Phase 6.X.F).
+
+> **Status — read before wiring a dashboard.** Basin does not serve a
+> Prometheus scrape endpoint today. The names below are the planned
+> OTLP / Prometheus-convention names; the engine emits structured `tracing`
+> records that become OTLP metrics when an OpenTelemetry layer is attached
+> (`BASIN_OTLP_ENDPOINT`, default `http://localhost:4318`). The only HTTP
+> metrics route that exists is `GET /metrics/inflight`, which returns a small
+> JSON in-flight/latency snapshot. Treat every `curl .../metrics` recipe on
+> this page as the intended shape, not a working command.
 
 | metric | type | dimensions | what it tells you |
 |---|---|---|---|
@@ -118,7 +125,7 @@ partition rather than a hot replica):
 
 ```sql
 -- Requires the per-(project, partition) byte-counter snapshot from
--- ProjectCounterRegistry, exposed via the `/v1/admin/project_counters`
+-- ProjectCounterRegistry, exposed via the `/admin/v1/usage`
 -- endpoint or by joining against the change-event stream.
 SELECT
     project_id,
@@ -190,7 +197,7 @@ A project is a whale candidate when **all** of:
 ```sql
 -- Requires basin-engine's per-project counter snapshot. Persisted to the
 -- `basin_admin.project_counters_snapshot` table by the periodic exporter
--- (Phase 5.16). For an on-the-wire query, hit the `/v1/admin/project_counters`
+-- (Phase 5.16). For an on-the-wire query, hit the `/admin/v1/usage`
 -- endpoint instead; this SQL form is for the durable-snapshot case.
 SELECT
     project_id,

@@ -244,7 +244,7 @@ blocking pool capacity.
 curl -s http://localhost:9090/metrics | grep basin_fn_concurrency_in_flight
 ```
 
-Or via the admin endpoint:
+Or via the admin endpoint (NOT implemented yet — intended shape):
 
 ```bash
 curl -s http://localhost:8080/v1/admin/fn/in-flight | jq .

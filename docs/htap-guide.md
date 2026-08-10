@@ -206,9 +206,16 @@ ORDER BY p99_exec_ms DESC
 LIMIT 20;
 ```
 
-### Prometheus metrics
+### Metrics
 
-Basin exposes the following metrics on the `/metrics` endpoint:
+> **Status — read before wiring a dashboard.** Basin does not serve a
+> Prometheus scrape endpoint today. The names below are the planned
+> OTLP / Prometheus-convention names; the engine emits structured `tracing`
+> records that become OTLP metrics when an OpenTelemetry layer is attached
+> (`BASIN_OTLP_ENDPOINT`, default `http://localhost:4318`). The only HTTP
+> metrics route that exists is `GET /metrics/inflight`, which returns a small
+> JSON in-flight/latency snapshot. Treat every `curl .../metrics` recipe on
+> this page as the intended shape, not a working command.
 
 | Metric | Description |
 |---|---|
