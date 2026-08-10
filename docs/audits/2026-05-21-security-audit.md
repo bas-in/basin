@@ -346,8 +346,8 @@ no comparison between `claims.project_id` and the path `project_id`.
 
 The doc at `admin.rs:1-6` admits "the wedge customer's control-plane
 mints one such token at deploy time" — i.e. the deployment model is
-single-project control plane. In a multi-project deployment (basin-cloud),
-that single admin token shouldn't reach across projects.
+single-project control plane. In a multi-project deployment, that single
+admin token shouldn't reach across projects.
 
 **Mitigation:** Require either (a) `is_admin = true && claims.project_id == path_project_id`, or (b) a separate `is_super_admin` claim for the cross-project control-plane case, with the basic `is_admin` capped to own-project.
 

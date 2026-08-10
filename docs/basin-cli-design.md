@@ -29,8 +29,8 @@ summary: "Historical design spec for the basin CLI. Superseded by the shipped im
 ## 1. Purpose and scope
 
 `basin-cli` is the **operator and developer daily-driver** for Basin. Its
-audience is the engineer who has a Basin project (self-hosted or on
-basin-cloud) and wants to interact with it from a terminal — authenticate,
+audience is the engineer who has a Basin project (self-hosted or managed)
+and wants to interact with it from a terminal — authenticate,
 inspect and manage projects, run SQL, drive schema migrations, and surface
 query-performance insights without leaving their shell.
 
@@ -279,10 +279,10 @@ CI, and the ability to issue sub-tokens for other team members. Depends on
 basin-auth's role hierarchy being fleshed out beyond the flat `roles[]` claim.
 
 **Audit log access.** `basin audit tail <project>` and `basin audit export
-<project> --since <timestamp>`. Depends on the basin-cloud audit pipeline
-(Phase 5.16 cloud-side companion items in
-the cloud repo's own roadmap — `docs/basin-cloud-roadmap.md` was removed from
-this repo in `39fb9f64`, since a cloud roadmap does not belong in the OSS tree).
+<project> --since <timestamp>`. Depends on a control-plane audit pipeline
+(the Phase 5.16 cloud-side companion items, which are out of scope for this
+repo — the cloud roadmap was removed from this tree in `39fb9f64`, since a
+cloud roadmap does not belong in the OSS tree).
 
 **IDE plugins.** VSCode extension and JetBrains plugin that wrap basin-cli
 commands behind a GUI. These are separate projects; basin-cli's `--json` output

@@ -286,8 +286,7 @@ With 4 parallel agent slots, wall-clock for the full plan is
 ## Out of scope
 
 - ADR 0017 amendments for new privacy regulations
-- 5.16.E – 5.16.H (basin-cloud repo; spec'd in
-  `docs/basin-cloud-roadmap.md`)
+- 5.16.E – 5.16.H (cloud-side; spec'd outside this repo)
 - Phase 5.7.B1 per-project secondary indexes — deferred until
   Phase 5.14.A / C land and the residual point-query gap is
   measured (already noted in WEDGE.md)

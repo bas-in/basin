@@ -38,8 +38,8 @@ transport selection adapts to runtime availability.
   already exists.
 - A bundled backend — basin-js does not embed or vendor the Basin engine.
   It connects to a running engine over HTTP or WebSocket.
-- basin-cloud glue — basin-js talks directly to a Basin engine endpoint.
-  If that endpoint is hosted by basin-cloud, fine; the SDK doesn't care.
+- Control-plane glue — basin-js talks directly to a Basin engine endpoint.
+  If that endpoint is managed for you, fine; the SDK doesn't care.
 
 ---
 

@@ -110,7 +110,7 @@ Real-cloud (S3-compatible store / Tigris) numbers: [`benchmark/index_real.html`]
 
 ## Cost math at scale
 
-The per-project all-in cost on basin-cloud, for a typical 100 MB / project /
+The per-project all-in cost on a managed Basin, for a typical 100 MB / project /
 month workload with modest query traffic, lands around **$0.10–$0.20 per
 project per month**. That's the headline number that makes 10,000-project
 workloads feasible:
@@ -123,7 +123,7 @@ At 10,000 active projects with this profile: **~$1,500/mo total**. Per-project c
 
 | Platform | Per-project floor | 10,000 active projects (this profile) |
 |---|---|---|
-| **Basin (basin-cloud)** | O(bytes stored) — ~$0.10–$0.20 | **~$1,500/mo** |
+| **Basin (managed)** | O(bytes stored) — ~$0.10–$0.20 | **~$1,500/mo** |
 | Supabase Pro | $25/mo/project minimum | $250,000/mo (if 10k projects could even be provisioned) |
 | Neon Launch | $19/mo/project minimum | $190,000/mo |
 | Nile (Postgres-on-tenant) | Tier-based active-project + storage charges (verify against the current Nile pricing page) | Worth measuring head-to-head — Nile is the direct competitor on the multi-project pitch, so the right comparison is **projects × $/mo × p99 latency on a realistic SaaS shape**, not just storage cost. Published numbers should come from a real benchmark, not a calculator. |
@@ -182,7 +182,7 @@ by that suite during 5.6 development and fixed before the release tag.
 Enterprise customers can bring their own object store (S3 in their AWS
 account) and their own KMS:
 
-- **BYO-bucket**: basin-cloud runs the compute Fly Machines but never holds
+- **BYO-bucket**: the managed service runs the compute Fly Machines but never holds
   the bucket credentials; you grant Basin's IAM role the minimum needed
   permissions on your bucket. Egress, replication, lifecycle policies all
   stay in your control.
