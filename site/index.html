@@ -535,18 +535,57 @@ code{font-family:var(--font-mono);font-size:max(12px,.92em)}
 }
 
 /* ── Figure: the basin cross-section + prefix tree ────────────────── */
+/* The drawing pairs with the key, so those two share a row and the key example
+   runs the full width underneath. Hanging the tree off the right column
+   instead made that column twice the drawing's height, and a centred drawing
+   then floated in ~460px of dead space at 1440. */
 .bowl-fig{
   display:grid;grid-template-columns:minmax(0,0.95fr) minmax(0,1.05fr);
   gap:clamp(24px,3.5vw,var(--space-10));align-items:center;margin-top:var(--space-9);
 }
-.bowl-art{min-width:0}
-.bowl-art svg{width:100%;height:auto}
+.bowl-fig .prefix-tree{grid-column:1/-1}
+.bowl-art{min-width:0;position:relative;container-type:inline-size}
+.bowl-art svg{width:100%;height:auto;display:block}
+/* Depth pins. The key used to bind to the drawing by colour alone, and colour
+   alone is not a binding a reader can follow: nothing told you which stripe
+   was wal/. Number the strata in the drawing and repeat the number in the key,
+   so the correspondence survives a colour-blind reader and the 860px
+   breakpoint where the two columns stop being side by side.
+   Each pin sits on the lowest point of its own stroke — measured off the live
+   SVG, not guessed — and the percentages hold at every width because the svg
+   keeps its viewBox aspect. */
+.stratum-pin{
+  position:absolute;left:50%;transform:translate(-50%,-50%);
+  display:grid;place-items:center;
+  width:clamp(21px,5.7cqi,28px);height:clamp(21px,5.7cqi,28px);
+  border-radius:50%;background:var(--paper);color:var(--ink);
+  font-family:var(--font-mono);font-weight:var(--weight-bold);
+  font-size:clamp(12px,2.9cqi,14px);line-height:1;
+}
 .bowl-side{min-width:0}
-.strata-key{display:grid;gap:var(--space-4);margin-bottom:var(--space-6)}
-.strata-key li{display:grid;grid-template-columns:auto minmax(0,1fr);gap:var(--space-4);align-items:start}
-.strata-swatch{width:22px;height:5px;border-radius:3px;margin-top:8px}
-.strata-key b{display:block;font-family:var(--font-mono);font-size:.8125rem;color:var(--paper);font-weight:var(--weight-medium);word-break:break-word}
-.strata-key span{display:block;font-size:.875rem;color:rgb(var(--paper-rgb)/.56);line-height:var(--lh-loose);margin-top:2px}
+.strata-key{list-style:none;margin:0 0 var(--space-6);padding:0;display:grid;gap:0}
+.strata-key li{
+  display:grid;grid-template-columns:1.5em 12px minmax(0,1fr);
+  column-gap:var(--space-3);align-items:stretch;
+}
+/* Number, colour and label share one font and one top padding, so the numeral
+   sits on the label's cap line by construction rather than by a nudge. The old
+   22x5 dash carried margin-top:8px against a 19.5px line box and floated 8.3px
+   above the cap centre it was meant to mark — that was the misalignment. */
+.strata-n,.strata-text b{font-family:var(--font-mono);font-size:.8125rem;line-height:1.5}
+.strata-n{
+  padding-top:var(--space-3);text-align:right;font-style:normal;
+  color:rgb(var(--paper-rgb)/.7);font-weight:var(--weight-medium);
+  font-variant-numeric:tabular-nums;
+}
+/* The four blocks abut, so the key is itself a section through the prefix,
+   stacked in the drawing's order. */
+.strata-band{background:var(--band)}
+.strata-key li:first-child .strata-band{border-radius:5px 5px 0 0}
+.strata-key li:last-child .strata-band{border-radius:0 0 5px 5px}
+.strata-text{display:block;padding:var(--space-3) 0 var(--space-4)}
+.strata-text b{display:block;color:var(--paper);font-weight:var(--weight-medium);word-break:break-word}
+.strata-text>span{display:block;font-size:.875rem;color:rgb(var(--paper-rgb)/.56);line-height:var(--lh-loose);margin-top:2px}
 .prefix-tree{
   border:var(--hairline-paper);border-left:2px solid var(--basin-teal);
   background:rgb(var(--ink-rgb)/.55);padding:var(--space-4) var(--space-5);
@@ -1132,9 +1171,10 @@ code.nb{white-space:nowrap;overflow-wrap:normal}
                are decoration on the tile become the storage layout here. -->
           <svg viewBox="0 0 420 292" role="img" aria-labelledby="bowl-title bowl-desc">
             <title id="bowl-title">A project prefix, in cross-section</title>
-            <desc id="bowl-desc">The Basin bowl cut open: four strata inside it, from
-              columnar data files at the top down through Iceberg metadata, archived WAL
-              segments, and snapshot and branch references at the floor.</desc>
+            <desc id="bowl-desc">The Basin bowl cut open: four strata inside it, numbered
+              one to four from the top down and matching the numbered key beside it —
+              columnar data files at the top, then Iceberg metadata, then archived WAL
+              segments, then snapshot and branch references at the floor.</desc>
             <defs>
               <clipPath id="bowl-clip">
                 <path d="M58 76 L58 148 a152 116 0 0 0 304 0 L362 76 Z"/>
@@ -1157,27 +1197,38 @@ code.nb{white-space:nowrap;overflow-wrap:normal}
             <path d="M58 76 L58 148 a152 116 0 0 0 304 0 L362 76" fill="none" stroke="#FAF7F0"
                   stroke-width="7" stroke-linecap="round" stroke-linejoin="round" opacity=".92"/>
           </svg>
+          <!-- Pinned to the lowest point of each stroke: 148, 186, 222 and 252
+               of the 292-unit viewBox. -->
+          <span class="stratum-pin" style="top:50.685%" aria-hidden="true">1</span>
+          <span class="stratum-pin" style="top:63.699%" aria-hidden="true">2</span>
+          <span class="stratum-pin" style="top:76.027%" aria-hidden="true">3</span>
+          <span class="stratum-pin" style="top:86.301%" aria-hidden="true">4</span>
         </div>
         <div class="bowl-side">
-          <ul class="strata-key">
-            <li>
-              <span class="strata-swatch" style="background:#00A8B0" aria-hidden="true"></span>
-              <span><b>tables/{name}/data/…</b><span>Vortex columnar files, date-partitioned. Parquet is opt-in per table.</span></span>
+          <ol class="strata-key">
+            <li style="--band:#00A8B0">
+              <span class="strata-n" aria-hidden="true">1</span>
+              <span class="strata-band" aria-hidden="true"></span>
+              <span class="strata-text"><b>tables/{name}/data/…</b><span>Vortex columnar files, date-partitioned. Parquet is opt-in per table.</span></span>
             </li>
-            <li>
-              <span class="strata-swatch" style="background:#4F858A" aria-hidden="true"></span>
-              <span><b>tables/{name}/metadata/</b><span>Iceberg metadata and manifests, served over a Lakekeeper-compatible REST catalog.</span></span>
+            <li style="--band:#4F858A">
+              <span class="strata-n" aria-hidden="true">2</span>
+              <span class="strata-band" aria-hidden="true"></span>
+              <span class="strata-text"><b>tables/{name}/metadata/</b><span>Iceberg metadata and manifests, served over a Lakekeeper-compatible REST catalog.</span></span>
             </li>
-            <li>
-              <span class="strata-swatch" style="background:#C4732B" aria-hidden="true"></span>
-              <span><b>wal/{partition}/</b><span>Archived WAL segments, flushed from the Raft group in ~200&nbsp;ms batches.</span></span>
+            <li style="--band:#C4732B">
+              <span class="strata-n" aria-hidden="true">3</span>
+              <span class="strata-band" aria-hidden="true"></span>
+              <span class="strata-text"><b>wal/{partition}/</b><span>Archived WAL segments, flushed from the Raft group in ~200&nbsp;ms batches.</span></span>
             </li>
-            <li>
-              <span class="strata-swatch" style="background:#8FB59B" aria-hidden="true"></span>
-              <span><b>snapshots/ · branches/</b><span>Point-in-time references and copy-on-write branches — metadata only, no data copy.</span></span>
+            <li style="--band:#8FB59B">
+              <span class="strata-n" aria-hidden="true">4</span>
+              <span class="strata-band" aria-hidden="true"></span>
+              <span class="strata-text"><b>snapshots/ · branches/</b><span>Point-in-time references and copy-on-write branches — metadata only, no data copy.</span></span>
             </li>
-          </ul>
-          <div class="prefix-tree">
+          </ol>
+        </div>
+        <div class="prefix-tree">
 <span class="l"><span class="t-com"># the prefix is the unit of IAM, billing and branching</span></span>
 <span class="l"><span class="t-key">/projects/alice/</span>tables/events/data/2026/06/11/01J…parquet</span>
 <span class="l"><span class="t-key">/projects/bob/</span>  tables/events/data/2026/06/11/01J…parquet</span>
@@ -1185,7 +1236,6 @@ code.nb{white-space:nowrap;overflow-wrap:normal}
 <span class="l"><span class="t-com"># basin-storage refuses any key outside the caller's prefix</span></span>
 <span class="l"><span class="t-com"># at the API boundary — not at the call sites.</span></span>
 <span class="l">alice reads <span class="t-key">/projects/bob/…</span> <span class="t-deny">→ refused</span></span>
-          </div>
         </div>
       </div>
       <p class="fig-cap reveal">
