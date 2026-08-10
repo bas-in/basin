@@ -12,8 +12,10 @@
 #     -volume.max=50 &
 #   echo "s3.bucket.create -name basin-test" | weed shell
 #
-# `-volume.port=8082` overrides the SeaweedFS volume default of 8080 so
-# it doesn't collide with basin-cloud's HTTP listener on the same port.
+# `-volume.port=8082` overrides the SeaweedFS volume default of 8080. That
+# port is where the control-plane dev server listens, and is the busiest
+# default on a dev box generally — leaving SeaweedFS on it means the volume
+# server and whatever else you have running fight over the same socket.
 
 [s3]
 bucket = "basin-test"

@@ -4,10 +4,10 @@
  * and exposes the `auth`, `from()`, and `storage` namespaces.
  *
  * Engine-direct architecture: the SDK talks DIRECTLY to basin-engine
- * (the OSS Rust data plane), not through basin-cloud. basin-cloud is
- * the control plane (orgs / projects / billing / dashboard); the
- * engine is the data plane. Every method here targets basin-engine's
- * route surface (`/auth/v1/*`, `/rest/v1/:table`, etc.).
+ * (the OSS Rust data plane), not through a control plane. A control
+ * plane handles orgs / projects / billing / dashboard; the engine is
+ * the data plane. Every method here targets basin-engine's route
+ * surface (`/auth/v1/*`, `/rest/v1/:table`, etc.).
  *
  * This file is the only place that owns the cross-namespace `fetch`
  * helper. Each namespace receives a thin adapter rather than reaching
@@ -119,21 +119,22 @@ export interface BasinClient {
 /**
  * Construct a Basin client.
  *
- * The SDK speaks DIRECTLY to basin-engine — basin-cloud is the
- * control plane (dashboard / billing / org-management) and never
- * appears in the SDK's request path.
+ * The SDK speaks DIRECTLY to basin-engine. The control plane handles
+ * dashboard / billing / org-management and never appears in the SDK's
+ * request path.
  *
  * @param engineURL — basin engine HTTP base URL. Could be the
  *                    cloud-managed regional endpoint
  *                    `https://<region>.basin.run`, or a self-hosted
  *                    engine such as `http://localhost:5434`
- *                    (`cargo run -p basin-server`). NOT a basin-cloud
- *                    control-plane URL. Self-hosters don't need a
- *                    separate Postgres — basin-auth's catalog lives on
- *                    the engine itself over loopback pgwire as of
- *                    2026-05-11.
+ *                    (`cargo run -p basin-server`). NOT a control-plane
+ *                    URL — the managed control plane answers on
+ *                    `api.basin.run`, and pointing the SDK there will
+ *                    not work. Self-hosters don't need a separate
+ *                    Postgres — basin-auth's catalog lives on the engine
+ *                    itself over loopback pgwire as of 2026-05-11.
  * @param anonKey   — public anon API key. Format: `basin_{tenant_id}_{base64}`.
- *                    Minted by basin-cloud's dashboard at
+ *                    Minted by the control plane's dashboard at
  *                    `/app/project/:ref/api-keys`, signed with a key
  *                    basin-engine trusts. Rotated via the dashboard; safe
  *                    to ship to browsers. The SDK forwards this opaquely

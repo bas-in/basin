@@ -203,8 +203,8 @@ start_seaweed() {
     mkdir -p "${SEAWEED_DATA_DIR}"
     log "starting SeaweedFS S3 gateway on ${SEAWEED_S3_ADDR} (data: ${SEAWEED_DATA_DIR}) ..."
     # -volume.port overrides the SeaweedFS default of 8080 so it never
-    # collides with basin-cloud's HTTP listener (documented in
-    # .basin-test.seaweedfs.toml).
+    # collides with the control-plane dev server, or anything else holding
+    # that very common port (documented in .basin-test.seaweedfs.toml).
     nohup weed server \
         -s3 \
         -ip=127.0.0.1 \

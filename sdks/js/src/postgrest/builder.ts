@@ -5,7 +5,7 @@
  * Shape mirrors @supabase/postgrest-js so app code that does
  * `supabase.from('t').select('*').eq('a', 1)` ports directly.
  *
- * The SDK calls basin-engine DIRECTLY (no basin-cloud hop). The engine
+ * The SDK calls basin-engine DIRECTLY (no control-plane hop). The engine
  * speaks the PostgREST dialect at `/rest/v1/:table`:
  *  - GET    /rest/v1/{table}    — select
  *  - POST   /rest/v1/{table}    — insert / upsert

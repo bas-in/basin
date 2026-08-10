@@ -5,7 +5,7 @@
 # WHY
 # ───
 # Nothing checked this, and the tree had accumulated sixteen dead links —
-# including four pointing at `docs/basin-cloud-roadmap.md`, which had been
+# including four pointing at a cloud-roadmap doc under `docs/` that had been
 # deleted one commit earlier, and three at `gen_types_map.go` / `cmd_gen.go`,
 # files that stopped existing when the CLI was rewritten from Go to Rust. Two
 # more pointed at ADR filenames that were never right (`0008-io-scheduler.md`,

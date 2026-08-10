@@ -1,8 +1,8 @@
 /**
  * Auth types — mirror basin-auth's `/auth/v1/*` envelopes (served by the
  * basin engine itself; as of 2026-05-11 basin-auth's catalog lives on
- * the engine via loopback pgwire, not on basin-cloud or an external
- * Postgres).
+ * the engine via loopback pgwire, not on a control plane and not on an
+ * external Postgres).
  *
  * ── SQL session functions ──────────────────────────────────────────────
  *

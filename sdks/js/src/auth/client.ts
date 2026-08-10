@@ -1,14 +1,14 @@
 /**
  * AuthClient — owns the session lifecycle. Talks DIRECTLY to
- * basin-engine's `/auth/v1/*` route surface — basin-cloud is the
- * control plane (orgs / projects / billing / dashboard), basin-engine
- * is the data plane, and the SDK only ever speaks to the engine.
+ * basin-engine's `/auth/v1/*` route surface. A control plane handles
+ * orgs / projects / billing / dashboard, basin-engine is the data
+ * plane, and the SDK only ever speaks to the engine.
  *
  * Architecture (as of 2026-05-11): the `/auth/v1/*` surface is served by
  * basin-auth (open-source Rust). basin-auth's catalog — users, tenants,
  * sessions, MFA factors, magic-link nonces — now lives on basin engine
  * itself via loopback pgwire (`postgres://basin_auth@127.0.0.1:5433/basin`),
- * not on basin-cloud and not on an external Postgres. The SDK's HTTP
+ * not on a control plane and not on an external Postgres. The SDK's HTTP
  * shape is unchanged; self-hosters need only run basin.
  *
  * The engine routes (verified against basin/crates/basin-rest/src/server.rs):
@@ -930,8 +930,8 @@ export class AuthClient {
    *  - the session already expired (delta would be ≤ 0)
    *  - the buffered delta lands past the 32-bit setTimeout ceiling
    *    (~24.8 days); the access token's lifetime is on the order of
-   *    minutes-to-an-hour in basin-cloud today, so this only matters
-   *    if the cloud ever issues multi-week ATs.
+   *    minutes-to-an-hour on the managed cloud today, so this only
+   *    matters if an issuer ever mints multi-week access tokens.
    */
   #scheduleAutoRefresh(session: AuthSession): void {
     this.#clearAutoRefresh();
@@ -951,7 +951,7 @@ export class AuthClient {
     const ms = deltaSec * 1000;
     // setTimeout's max delay is INT32_MAX (~24.8 days). Beyond that
     // the timer fires immediately; skip scheduling in that case —
-    // not a real-world basin-cloud configuration.
+    // not a real-world token lifetime for any issuer we target.
     if (ms > 0x7fffffff) return;
     this.#refreshTimer = setTimeout(() => {
       this.#refreshTimer = null;
@@ -970,9 +970,11 @@ export class AuthClient {
 // ── module-level helpers (pure, testable) ──────────────────────────
 
 /**
- * The shape the cloud emits on a successful login (inside the
- * `{data, error}` envelope): {user, session, org?}. Mirror of
- * basin-cloud's `handlers.loginResponse`.
+ * The shape the server emits on a successful login (inside the
+ * `{data, error}` envelope): {user, session, org?}. Mirror of the
+ * engine's `POST /auth/v1/signin` response
+ * (`crates/basin-rest/src/routes/auth.rs`); the managed control plane's
+ * own login endpoint returns the same envelope.
  */
 interface CloudLoginPayload {
   user?: {
@@ -1053,7 +1055,7 @@ async function unwrapAuthBody(res: Response): Promise<ParsedAuthResp> {
 }
 
 /**
- * Map basin-cloud's `{user, session}` payload onto the SDK's flatter
+ * Map the server's `{user, session}` payload onto the SDK's flatter
  * AuthSession shape. Returns null when required fields are missing.
  * Side-effect-free; called from signInWithPassword + signUp +
  * refreshSession (future firings).

@@ -2,9 +2,10 @@
  * @bas-in/basin-js — isomorphic client for the Basin platform.
  *
  * Engine-direct: the SDK talks DIRECTLY to basin-engine (the OSS Rust
- * data plane) — never through basin-cloud. basin-cloud is the control
- * plane (orgs / projects / billing / dashboard); the engine is the
- * data plane. Point `createClient` at your engine URL (e.g.
+ * data plane) and never through a control plane. The control plane —
+ * whether the managed cloud's or your own — handles orgs, projects,
+ * billing and the dashboard, and is not on the request path for any
+ * call in this SDK. Point `createClient` at your engine URL (e.g.
  * `https://basin-engine.fly.dev`, or `http://localhost:5434` for
  * `cargo run -p basin-server`).
  *
