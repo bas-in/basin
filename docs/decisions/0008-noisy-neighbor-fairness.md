@@ -77,7 +77,7 @@ MinIO server saturation (~8–12 concurrent reads). On a backend with effectivel
 unbounded server-side concurrency, the per-project Semaphore floor +
 `target_partitions=1` is sufficient — quiet's p99 stays within 1.3× of
 baseline even while a noisy project runs 4 concurrent 1M-row scans.
-Tigris is the basin-cloud production backend.
+Tigris is the managed-deployment production backend.
 
 The test was run over HTTP/1.1 (no h2 multiplex). HTTP/1.1 worked anyway
 because the bottleneck was never client-side multiplexing; it was server-side

@@ -108,7 +108,7 @@ Large-file resumable uploads via the TUS protocol are a fast-follow
 
 ## OSS / cloud split
 
-| Concern | OSS (`basin-blob`) | basin-cloud |
+| Concern | OSS (`basin-blob`) | Managed control plane |
 |---|---|---|
 | Buckets + objects model + RLS | ✅ | — |
 | Upload / download / list / delete HTTP routes | ✅ | — |

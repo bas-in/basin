@@ -2,7 +2,7 @@
 title: "ADR 0018 — Subsystem feature flags + minimal-build target"
 nav_section: decisions
 sidebar_position: 18
-summary: "Gate optional subsystems behind Cargo features so OSS users can ship a minimal pgwire-only binary; basin-cloud and the default OSS build keep the full feature set."
+summary: "Gate optional subsystems behind Cargo features so OSS users can ship a minimal pgwire-only binary; managed deployments and the default OSS build keep the full feature set."
 tags: [build, packaging, oss]
 ---
 
@@ -154,7 +154,7 @@ arbitrary subsets are on their own.
    minimal-features build doesn't fully solve this (server still
    has a tokio runtime + listen sockets); a true library would
    need a separate target.
-2. basin-cloud benchmarks show a meaningful latency or throughput
+2. Managed-deployment benchmarks show a meaningful latency or throughput
    win from running `basin-rest` or `basin-realtime` as a separate
    proxy process. The trait-shaped design (ADR 0012) means this is
    a refactor of the deployment topology, not the engine.

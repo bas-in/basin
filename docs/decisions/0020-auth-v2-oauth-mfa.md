@@ -106,7 +106,7 @@ No hand-rolled crypto. RustCrypto + established crates:
 
 ## OSS / cloud split
 
-| Concern | OSS (`basin-auth`) | basin-cloud |
+| Concern | OSS (`basin-auth`) | Managed control plane |
 |---|---|---|
 | OAuth flow (authorize/callback/PKCE/linking) | ✅ | — |
 | Provider config storage (encrypted) | ✅ | — |

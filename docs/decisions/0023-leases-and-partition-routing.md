@@ -206,7 +206,7 @@ the audit's single-instance P0s while the bigger work proceeds.
   job at lower cost.
 - A separate budget service — the catalog Postgres is the only coordinator.
 - Cross-project budget aggregation — caps are per-project; org rollups happen
-  in basin-cloud, not basin OSS.
+  in the control plane above this repo, not in basin OSS.
 - Project migration daemon (auto-rebalance heuristics) — for v1, ops trigger
   rebalance manually; auto comes when a real customer needs it.
 
@@ -219,5 +219,5 @@ the audit's single-instance P0s while the bigger work proceeds.
 - Strengthens [ADR 0016 (HTAP hot-tier)](./0016-htap-hot-tier-architecture.md)
   — the memtable's `(project, table)` keying is already correct; only the
   ownership-of-the-replica question moves.
-- Unblocks the new overage pricing's per-replica cap correctness (basin-cloud
-  commit `acb2f7c`); see basin TASK.md task #15 (BLOCKER metering).
+- Unblocks the new overage pricing's per-replica cap correctness; see basin
+  TASK.md task #15 (BLOCKER metering).

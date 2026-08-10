@@ -2,13 +2,13 @@
 title: "ADR 0017 — Query-shape stats: privacy + cross-process stability"
 nav_section: decisions
 sidebar_position: 17
-summary: "Phase 5.16 exports per-query-shape stats from OSS basin to basin-cloud for cross-customer analytics. Privacy invariants, hash-function stability, and template anonymisation rules live here."
+summary: "Phase 5.16 exports per-query-shape stats from OSS basin to an external analytics collector for cross-customer analytics. Privacy invariants, hash-function stability, and template anonymisation rules live here."
 tags: [observability, privacy, security]
 ---
 
 # 0017 — Query-shape stats: privacy + cross-process stability
 
-- **Status:** Accepted (2026-05-19) — implementation Phase 5.16.A–D (OSS) and 5.16.E–H (basin-cloud), see [TASK.md](../../TASK.md) Phase 5.16; the cloud-side items live in the cloud repo's own roadmap.
+- **Status:** Accepted (2026-05-19) — implementation Phase 5.16.A–D (OSS), see [TASK.md](../../TASK.md) Phase 5.16; the cloud-side items (5.16.E–H) are out of scope for this repo.
 - **Tags:** observability, privacy, security, htap
 - **Supersedes:** none
 - **Cross-references:** [ADR 0013 (auth per-project schema)](./0013-auth-per-project-schema.md), [ADR 0016 (HTAP hot tier)](./0016-htap-hot-tier-architecture.md)
@@ -18,7 +18,7 @@ tags: [observability, privacy, security]
 Phase 5.16 introduces per-query-shape telemetry: every executed query
 gets a canonical plan-shape hash, then `QueryStatRegistry` aggregates
 per-shape p50/p95/p99 latency, rows scanned, files opened, bytes
-decoded.  These records flow over OTLP to basin-cloud, which renders
+decoded.  These records flow over OTLP to a collector outside this repo, which renders
 per-customer "Query Insights" UI and Basin-engineer-only anonymised
 cross-project aggregates.
 
@@ -76,7 +76,7 @@ the plan walk reaches the hash sink.  This is the bedrock invariant —
 without it, every other privacy guarantee unravels.
 
 **Layer 2 — Per-customer OTLP export (OSS → cloud, single project view).**
-The basin-cloud Query Insights UI for a customer shows that customer
+The Query Insights UI for a customer shows that customer
 their own real schema names: `customers.email_hash`, `orders.amount`.
 This is correct: a customer must be able to read shape templates to
 act on them.  Exported record carries:
@@ -92,7 +92,7 @@ project scoping is enforced at the cloud ingest pipeline by the
 
 **Layer 3 — Cross-project aggregates (Basin engineers only).**
 For roadmap evidence ("X % of customers run shape Y at > 100 GB table
-size") basin-cloud surfaces aggregate views to Basin engineers.  These:
+size") the collector surfaces aggregate views to Basin engineers.  These:
 
 - Use the 64-bit hash + an **anonymised template** with table / column
   names replaced by positional placeholders (`t1`, `t1.c0`, `t1.c1`,
@@ -128,7 +128,7 @@ size") basin-cloud surfaces aggregate views to Basin engineers.  These:
 OSS basin reads `BASIN_QUERY_STATS_EXPORT_DISABLED=1` to suppress all
 OTLP export.  `QueryStatRegistry` continues to populate in-process
 (needed for `basin_stat_statements` SQL view).  Self-hosted users who
-do not connect to basin-cloud get the local SQL view with zero
+do not connect a collector get the local SQL view with zero
 external traffic.
 
 ## Alternatives considered
