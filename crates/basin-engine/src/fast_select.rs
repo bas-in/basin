@@ -5164,10 +5164,39 @@ fn topk_project_batches(
                     .project(&idxs)
                     .map_err(|e| BasinError::internal(format!("topk project schema: {e}")))?,
             );
+            // Resolve each requested column by NAME in the batch's own schema.
+            //
+            // `idxs` above are positions in the CATALOG schema; they are valid
+            // for building the declared output schema and nothing else. The
+            // phase-2 batches are laid out in `phase2_projection` order — which
+            // is `plan.read_cols`, sorted ALPHABETICALLY by `parse_projection`,
+            // plus any PK / sort column appended for the re-sort. Catalog
+            // positions do not address that layout. `SELECT id, amount` built
+            // catalog indices `[0, 1]` and applied them to an `(amount, id)`
+            // batch, so the output carried the amount column labelled `id` and
+            // vice versa — values silently swapped between two same-typed
+            // columns, and unrelated or out-of-range columns once an appended
+            // sort/PK column widened the read set past the user's list. The
+            // slow-path projection rebuild already resolves by name; match it.
             let projected: Vec<RecordBatch> = batches
                 .into_iter()
                 .map(|b| {
-                    b.project(&idxs)
+                    let batch_idxs: Result<Vec<usize>> = items
+                        .iter()
+                        .map(|item| {
+                            let ProjectionItem::Column(c) = item else {
+                                return Err(BasinError::internal(
+                                    "topk computed projection should have declined".to_string(),
+                                ));
+                            };
+                            b.schema().index_of(c).map_err(|_| {
+                                BasinError::InvalidSchema(format!(
+                                    "topk project batch: missing column {c}"
+                                ))
+                            })
+                        })
+                        .collect();
+                    b.project(&batch_idxs?)
                         .map_err(|e| BasinError::internal(format!("topk project batch: {e}")))
                 })
                 .collect::<Result<Vec<_>>>()?;
