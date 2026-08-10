@@ -362,10 +362,25 @@ code{font-family:var(--font-mono);font-size:max(12px,.92em)}
 
 /* ── Benchmarks ───────────────────────────────────────────────────── */
 .bench-table{width:100%;border-collapse:collapse;font-size:.875rem}
-.bench-table caption{
-  text-align:left;font-family:var(--font-mono);font-size:.6875rem;
+/* The table is the *same* figure seen a second way, so it is ruled off from
+   Fig. 4's caption and given a label in a different type register — a tracked
+   uppercase micro-kicker, never more running mono prose. Two mono paragraphs
+   of near-equal size stacked with no rule between them read as one run-on
+   block, which is exactly what this section used to do.
+
+   The label lives OUTSIDE .bench-scroll and names the table via
+   aria-labelledby: a <caption> is laid out at the table's width, so on a phone
+   it was clipped by the scroller instead of wrapping. */
+.bench-table-block{margin-top:var(--space-8);border-top:var(--hairline-strong);padding-top:var(--space-5)}
+.bench-cap{
+  font-family:var(--font-mono);font-size:.75rem;
   letter-spacing:var(--tracking-mono-wide);color:rgb(var(--paper-rgb)/.4);
-  padding-bottom:var(--space-4);
+  line-height:var(--lh-loose);max-width:74ch;margin-bottom:var(--space-5);
+}
+.bench-cap b{
+  display:block;font-size:.6875rem;font-weight:var(--weight-medium);
+  letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;
+  color:var(--basin-teal-3);margin-bottom:2px;
 }
 .bench-table th{
   text-align:left;font-family:var(--font-mono);font-size:.625rem;
@@ -442,6 +457,9 @@ code{font-family:var(--font-mono);font-size:max(12px,.92em)}
   margin-top:var(--space-4);font-family:var(--font-mono);font-size:.8125rem;
   letter-spacing:var(--tracking-mono-wide);color:rgb(var(--paper-rgb)/.42);
   line-height:var(--lh-loose);
+  /* Mono at full container width sets a 170-character line. `ch` is exact in a
+     monospace face, so this is a literal measure cap, not an approximation. */
+  max-width:70ch;
 }
 .fig-cap strong{color:rgb(var(--paper-rgb)/.72);font-weight:var(--weight-medium)}
 
@@ -1834,13 +1852,17 @@ code.nb{white-space:nowrap;overflow-wrap:normal}
       </p>
       <p class="fig-cap reveal">
         Fig. 4 — <strong>17 shapes from the 2026-06-11 integrity run.</strong> Across the
-        ~100 ms-shapes on this card Basin is faster on 51 and Postgres on 54. The full
-        table, including the shapes that land at parity, is below.
+        ~100 ms-shapes on this card Basin is faster on 51 and Postgres on 54.
       </p>
 
-      <div class="bench-scroll reveal">
-        <table class="bench-table">
-          <caption>Basin (Vortex) vs Postgres 18 · 1M rows, LocalFS, single idle box</caption>
+      <div class="bench-table-block reveal">
+        <p class="bench-cap" id="bench-cap">
+          <b>Table view of Fig. 4</b>
+          Basin (Vortex) vs Postgres 18 · 1M rows, LocalFS, single idle box —
+          the headline shapes plus the ones that land at parity.
+        </p>
+        <div class="bench-scroll">
+        <table class="bench-table" aria-labelledby="bench-cap">
           <thead>
             <tr><th scope="col">Workload</th><th scope="col">Basin</th><th scope="col">Postgres 18</th><th scope="col">Verdict</th></tr>
           </thead>
@@ -1859,6 +1881,7 @@ code.nb{white-space:nowrap;overflow-wrap:normal}
             <tr><td>On-disk bytes (1M rows, LocalFS)</td><td>321 MB</td><td>306 MB</td><td class="verdict verdict-loss">~5% larger</td></tr>
           </tbody>
         </table>
+        </div>
       </div>
 
       <p class="bench-note reveal">
