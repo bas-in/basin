@@ -14,7 +14,7 @@ that the code is built against. For the phased build plan see
 > Integrating from app code? See [`basin-js`](https://github.com/vul-os/basin/tree/main/sdks/js)
 > (engine-direct TypeScript SDK). Running and operating a fleet? See
 > [`basin-cli`](https://github.com/vul-os/basin/tree/main/cli) and
-> [`basin-cloud`](https://github.com/vul-os/basin-cloud).
+> [`deployment.md`](./deployment.md).
 
 Basin is a bucket-native, multi-project, Postgres-compatible database. The whole
 system is organized around four ideas:

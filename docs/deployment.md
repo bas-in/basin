@@ -14,10 +14,10 @@ How to actually run Basin in production. Companion to [`architecture.md`](./arch
 This doc is the practical "where do I put the bytes and which Fly/AWS region" guide.
 
 > For ops on a managed fleet, see [`basin-cli`](https://github.com/vul-os/basin/tree/main/cli)
-> (`basin login`, `basin projects list`, `basin sql run`) and
-> [`basin-cloud`](https://github.com/vul-os/basin-cloud) (control plane,
-> per-project Fly Machine orchestration). For app-side integration against a
-> deployed engine, see [`basin-js`](https://github.com/vul-os/basin/tree/main/sdks/js).
+> (`basin login`, `basin projects list`, `basin sql run`). Control-plane
+> concerns — org/project management, per-project Fly Machine orchestration —
+> sit above this repo and are out of scope here. For app-side integration
+> against a deployed engine, see [`basin-js`](https://github.com/vul-os/basin/tree/main/sdks/js).
 
 ---
 
