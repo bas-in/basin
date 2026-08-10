@@ -1255,7 +1255,7 @@ same `object_store` the engine uses; signed URLs are HMAC over
 - [ ] TUS protocol for large-file resumable uploads. Not v1; ship after
       A-E land and a real large-file use case appears.
 
-> Cloud-side (basin-cloud repo): quota enforcement, billing on
+> Cloud-side (private cloud repo): quota enforcement, billing on
 > bytes-stored + egress, CDN in front of public reads, image transforms
 > (resize/optimize — post-v1, possibly a WASM UDF). Per ADR 0021's
 > OSS/cloud split.
@@ -2155,7 +2155,7 @@ named slice green.
       walkthrough: `npm install @bas-in/basin-js`, sign up, create
       project, schema (a few tables with RLS), auth signup +
       signin, CRUD query from a tiny React/Vite frontend, first
-      deployment to basin-cloud. Files: `docs/tutorial.md`.
+      deployment to a managed Basin. Files: `docs/tutorial.md`.
       Acceptance: closes the **tutorial steps execute** slice of
       5.32.A; engineer completes in ≤ 20 min on a clean machine.
 - [x] **5.32.C — `examples/saas-starter/` — multi-tenant SaaS
@@ -2320,7 +2320,7 @@ We need our own, with two properties Postgres doesn't have:
    bucket so we surface shapes whose p99 grows monotonically with data.
    (This is the pattern the `point_eq` 0.94 → 0.85 → 0.49 release smoke
    exposed for Phase 5.14.A blooms.)
-2. **Anonymised cross-customer aggregates** in basin-cloud — Basin engineers
+2. **Anonymised cross-customer aggregates** in the cloud repo — Basin engineers
    see "X% of customers run shape Y at >100GB table size" without seeing any
    specific customer's data.  Drives roadmap evidence, not guesswork.
 
@@ -2384,7 +2384,7 @@ Privacy and anonymisation model: [ADR 0017](./docs/decisions/0017-query-shape-pr
       OTLP export at 1k QPS does not block the query hot path.
       Estimate: ~1 week. Depends on 5.16.B + 5.16.C.
 
-Sub-items 5.16.E – 5.16.H live in the basin-cloud repo
+Sub-items 5.16.E – 5.16.H live in the private cloud repo
 (tracked in the cloud repo's own roadmap
 Phase 5.16-cloud):
 
@@ -2402,25 +2402,25 @@ re-export (in-memory only — restart loses pre-restart history, design choice);
 
 **Total OSS effort:** ~4 weeks.
 
-## Phase 5.15 — Unified docs platform (OSS-side shipped; cloud-side at basin-cloud)
+## Phase 5.15 — Unified docs platform (OSS-side shipped; cloud-side in the cloud repo)
 
 **Why first.** Contributor and customer onboarding both go through documentation.
 Today docs sit in three places (`README.md`, `CAPABILITIES.md`, `docs/*.md` in
 this repo) with no rendered surface. As OSS surface grows (future `basin-js`,
-`basin-cli`) and `basin-cloud` ships its own admin docs, we need a single
+`basin-cli`) and the cloud webapp ships its own admin docs, we need a single
 rendered site that pulls each product's markdown into a unified UI without
 forcing contributors to leave their own repo.
 
 **Architecture.** Each OSS repo keeps its `docs/` as standard markdown with
-YAML frontmatter. `basin-cloud`'s webapp runs `npm run dev:docs` (or its CI
+YAML frontmatter. The cloud webapp runs `npm run dev:docs` (or its CI
 equivalent) which build-time-fetches each OSS repo via `git clone --depth=1`,
-copies `docs/` into `basin-cloud/webapp/content/oss/<product>/`, and renders
-the union via Docusaurus or Mintlify. `basin-cloud` keeps its own
+copies `docs/` into the webapp's `content/oss/<product>/`, and renders
+the union via Docusaurus or Mintlify. The cloud webapp keeps its own
 cloud-specific docs under `content/cloud/`, separate from imported OSS
 content. Pin by git tag for versioned docs per OSS release.
 
 Eight items, ordered for incremental shipping. Items 5.15.A–5.15.D land in
-this OSS repo; 5.15.E–5.15.I land in `basin-cloud` (separate repo).
+this OSS repo; 5.15.E–5.15.I land in the cloud repo (separate, private).
 
 - [x] **5.15.A** Frontmatter spec (shipped `a3f7a26`; ADR 0021 records
       the YAML-vs-MDX-vs-TOML rationale; spec + ADR + README cross-ref).
@@ -2432,22 +2432,22 @@ this OSS repo; 5.15.E–5.15.I land in `basin-cloud` (separate repo).
       regenerates from frontmatter; `docs-index` CI job blocks drift).
 - [x] **5.15.D** Stub repository skeletons for `basin-js` and
       `basin-cli` — even before either ships code, set up their
-      `docs/` folder with placeholder frontmatter so basin-cloud's
+      `docs/` folder with placeholder frontmatter so the cloud
       fetcher has a target. Files: separate repos (not this one).
       Acceptance gate: each repo's `docs/` has at least a
-      `getting-started.md` with valid frontmatter; basin-cloud's
+      `getting-started.md` with valid frontmatter; the cloud
       fetcher can pull both without 404.
-- [x] **5.15.E** `basin-cloud` webapp: in-house markdown renderer
+- [x] **5.15.E** Cloud webapp: in-house markdown renderer
       (`src/pages/MdDocs.jsx` + `src/lib/docs/*.js`) — Docusaurus/Mintlify
       rejected in favour of a small custom renderer the cloud SPA owns
       end-to-end. Verified: webapp renders OSS+cloud docs from
       `src/content/docs/` and `webapp/content/`.
-- [x] **5.15.F** `basin-cloud` webapp: `npm run docs:sync` script
+- [x] **5.15.F** Cloud webapp: `npm run docs:sync` script
       (`scripts/sync-docs.mjs`) — build-time fetch of each OSS repo's
       `docs/` into `src/content/docs/<product>/` and `webapp/content/oss/`.
       Wired into `predev`/`prebuild` so a fresh checkout + `npm run dev`
       pulls and renders everything.
-- [x] **5.15.G** `basin-cloud` webapp: cloud-only docs namespace under
+- [x] **5.15.G** Cloud webapp: cloud-only docs namespace under
       `src/pages/docs/cloud/` (`Billing.jsx`, `ByoBucket.jsx`,
       `ByoKms.jsx`, …) + `webapp/content/cloud/` — render at
       `/docs/cloud/*` without colliding with imported OSS content.
@@ -2455,7 +2455,7 @@ this OSS repo; 5.15.E–5.15.I land in `basin-cloud` (separate repo).
       → canonical URL via `src/lib/docs/remarkCrossLinks.js` (remark
       plugin in the in-house pipeline). Covered by `docs.test.jsx`.
 - [x] **5.15.I** CI sync — `.github/workflows/docs-rebuild.yml` in
-      basin-cloud rebuilds on push; per-OSS-repo
+      the cloud repo rebuilds on push; per-OSS-repo
       `notify-cloud-docs.yml` hooks fire the rebuild. Nightly cron
       fallback configured.
 
@@ -2906,7 +2906,7 @@ Full design in [ADR 0023](./docs/decisions/0023-leases-and-partition-routing.md)
 HTAP memtable bytes, realtime `BUFFER_FULL`, Wasm semaphore, basin-net
 outbound) is per-process — a project on N replicas gets `N×` the cap they
 should. Hot projects pin one replica at 100% while siblings idle. The new
-basin-cloud overage prices (`acb2f7c`: storage $0.010/GB-mo, compute
+Cloud-side overage prices (`acb2f7c`: storage $0.010/GB-mo, compute
 $0.018/CPU-hr) cannot bill correctly until this is fixed. Blocks any
 multi-replica production deployment.
 
@@ -3067,7 +3067,7 @@ Sequencing: **A → B**, **A → D**, **B → C**, **A–D → E + F**.
 > consensus (Postgres CAS is sufficient); distributed counters on the hot
 > path (heartbeat reconciliation does the job at lower cost); separate
 > budget service (catalog Postgres is the only coordinator); cross-project
-> budget aggregation (caps are per-project; org rollups are basin-cloud);
+> budget aggregation (caps are per-project; org rollups are cloud-side);
 > auto-rebalance heuristics (ops trigger manually for v1; auto when a real
 > customer needs it). All recorded in ADR 0023.
 
@@ -3163,7 +3163,7 @@ tests + 3 UUID tests = 10 ignores removed in one wave.
       54000; multi-FROM / JOIN / sub-query / explicit-LIMIT pass through
       unchecked. v0.2 will use A4 catalog `ColumnStats` for selectivity-
       aware estimates on multi-table shapes.)
-- [x] Per-project + per-query + per-shard + per-WAL telemetry — `basin_common::ProjectCounterRegistry` aggregates ops/bytes_read/bytes_written/errors + ring-window p99 latency per project; `Engine::project_counters(&ProjectId) -> ProjectCountersSnapshot` exposes a cheap snapshot. Storage writer/reader and WAL append are wired to bump per-project byte counters; engine `ProjectSession::execute` bumps op + latency + error. **Billing-meter audit (#15, `docs/audits/2026-05-21-billing-meter-gap.md`) closed engine-side:** blocker 1/3 + 2/3 (Class-A/B op counts) shipped in `8bd64b5`; blocker 3/3 (`cpu_micros_total` aggregating engine query elapsed + Wasm `ComponentHarness::run_with` elapsed) shipped this commit — the engine now meters every cost dimension the 2026-05-21 reprice priced. Only the basin-cloud time-integrated GB-month sampler (cloud-side, hole #1/#2) remains.
+- [x] Per-project + per-query + per-shard + per-WAL telemetry — `basin_common::ProjectCounterRegistry` aggregates ops/bytes_read/bytes_written/errors + ring-window p99 latency per project; `Engine::project_counters(&ProjectId) -> ProjectCountersSnapshot` exposes a cheap snapshot. Storage writer/reader and WAL append are wired to bump per-project byte counters; engine `ProjectSession::execute` bumps op + latency + error. **Billing-meter audit (#15, `docs/audits/2026-05-21-billing-meter-gap.md`) closed engine-side:** blocker 1/3 + 2/3 (Class-A/B op counts) shipped in `8bd64b5`; blocker 3/3 (`cpu_micros_total` aggregating engine query elapsed + Wasm `ComponentHarness::run_with` elapsed) shipped this commit — the engine now meters every cost dimension the 2026-05-21 reprice priced. Only the time-integrated GB-month sampler (cloud-side, hole #1/#2) remains.
 - [x] BYO-key envelope-encryption hooks — `EncryptionProvider` trait shipped in `basin-storage::encryption`; `Storage::attach_encryption_provider` is the additive opt-in (default `None` = byte-for-byte plaintext path). Writer envelope-encrypts the Parquet body with a fresh per-file AES-256-GCM data key and persists the wrapped key as a `<path>.wrapped` sidecar; reader transparently unwraps. Reference adapter ships in `basin-storage::encryption_static`: `StaticKeyEncryption` (caller-supplied 32-byte root key) + `EnvKeyEncryption` (`BASIN_ROOT_KEY` env var) — both use AES-256-GCM key-wrapping, dep-light (reuses workspace `aes-gcm` + `rand`), fully testable offline. 86 existing tests green; 15 new adapter tests cover round-trip, wrong-key auth failure, tampered sidecar rejection, and default (no-adapter) path unchanged.
 
 > Hosted-product hardening items (BYO-bucket, Stripe billing,
