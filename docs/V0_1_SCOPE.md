@@ -104,8 +104,7 @@ without a commit hash are not yet done.
     landed; verify the rest of the corpus
 
 ### Dogfooding
-- [ ] basin-cloud catalog runs on Basin itself. Cloud control plane
-      currently uses Neon — this is the highest-visibility credibility gap
+- [ ] The control-plane catalog runs on Basin itself. It currently uses Neon — this is the highest-visibility credibility gap
       and is a v0.1 gate.
 
 ### Wasm UDFs
@@ -174,7 +173,7 @@ Each entry: name + brief rationale + the unparked-when condition.
 | `basin-cron` | Scheduled jobs in SQL. Use external scheduler (cron-on-fly, GH Actions, etc.) for now. SQL surface already shipped (`a091c04`); no new investment. | A wedge customer asks AND pays. |
 | `basin-net` | `net.http_*`. Use an external functions service (Cloudflare Worker, Lambda, etc.) for now. SQL surface already shipped (`a091c04`); no new investment. | A wedge customer asks AND pays. |
 | `basin-fn` (Wasm) | Keep #90's text/bytea/JSONB surface as-is once landed. **No further investment** in Component Model migration, SDK polish, or new examples. | Component Model becomes a wedge-customer ask. |
-| `basin-autoscale` | Stays a planned feature per the autoscale memory note, but no v0.1 perf investment beyond what's already merged. | basin-cloud reaches scale where manual scaling hurts. |
+| `basin-autoscale` | Stays a planned feature per the autoscale memory note, but no v0.1 perf investment beyond what's already merged. | A managed deployment reaches scale where manual scaling hurts. |
 | `basin-webhooks` | Outbound webhooks layer. Use basin-realtime + a customer-side worker pattern for v0.1. | A wedge customer asks AND pays. |
 
 ### Features to freeze (no new investment for v0.1)

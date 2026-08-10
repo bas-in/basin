@@ -17,7 +17,7 @@ about 15 minutes. You will:
 4. Sign up a user and sign in to get a JWT (basin-auth).
 5. Run CRUD over psql and the REST API (basin-rest).
 6. Wire a tiny React/Vite component to query Basin from the browser.
-7. Learn the first-deployment path to basin-cloud.
+7. Learn the first-deployment path to a managed Basin.
 
 Follow the steps in order — later sections use what earlier ones set up.
 
@@ -559,13 +559,13 @@ migrations, see [`examples/saas-starter/`](../examples/saas-starter/).
 
 ---
 
-## 7. First deployment to basin-cloud
+## 7. First deployment to a managed Basin
 
-> **Forward-spec note:** basin-cloud and basin-cli are not yet publicly
-> available. This section describes the intended path; the self-hosted
-> Docker setup above is the working path today.
+> **Forward-spec note:** the managed service and basin-cli are not yet
+> publicly available. This section describes the intended path; the
+> self-hosted Docker setup above is the working path today.
 
-When basin-cloud launches, the deployment flow will be:
+When the managed service launches, the deployment flow will be:
 
 ```sh
 # Install basin-cli (Go binary, Sigstore-signed release artefacts).
@@ -578,7 +578,7 @@ basin projects connect my-app          # prints the postgres:// URL for psql / .
 Point your app at the cloud engine URL — everything else (psql, REST,
 basin-js) works identically because the wire protocol is the same.
 
-For production self-hosting today (before basin-cloud launches), see
+For production self-hosting today (before the managed service launches), see
 [`docs/deployment.md`](./deployment.md) for the full env-var reference,
 S3/Tigris object storage configuration, and durable catalog setup with
 `BASIN_CATALOG=postgres://...`.

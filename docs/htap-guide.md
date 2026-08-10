@@ -219,9 +219,9 @@ Basin exposes the following metrics on the `/metrics` endpoint:
 
 A `hot_hit_ratio` below 0.5 on an OLTP workload usually means the memtable cap is too small for the write rate — rows are flushing to Vortex before subsequent reads arrive. Increase `memtable_table_cap` or `memtable_hard_cap`.
 
-### Query Insights (basin-cloud managed customers)
+### Query Insights (managed customers)
 
-The basin-cloud console includes a Query Insights UI that surfaces hot-tier vs cold-tier execution breakdowns per query, memtable pressure over time, and flush event timelines. Available on all managed plans; not available for self-hosted deployments.
+The managed console includes a Query Insights UI that surfaces hot-tier vs cold-tier execution breakdowns per query, memtable pressure over time, and flush event timelines. Available on all managed plans; not available for self-hosted deployments.
 
 ---
 
