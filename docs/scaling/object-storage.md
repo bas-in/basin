@@ -67,7 +67,7 @@ The three most common cloud backends have materially different pricing curves:
 | Class B (read)  | $0.0004 / 1k               | $0.005 / 1M            |
 | Data ingress    | $0.00                      | $0.00                  |
 
-The basin-cloud managed service runs on **Fly.io + Tigris**. Tigris is Fly's
+The managed deployment target is **Fly.io + Tigris**. Tigris is Fly's
 native S3-compatible store; traffic between Fly Machines and Tigris does not
 egress to the public internet, keeping latency low and egress cost zero for
 intra-Fly traffic.
@@ -82,7 +82,7 @@ and development setups.
 All S3-compatible endpoints (Tigris, AWS S3, MinIO, etc.) use the same
 `AmazonS3Builder` under the hood. Examples:
 
-**Tigris** (basin-cloud default):
+**Tigris** (managed-deployment default):
 
     endpoint: https://fly.storage.tigris.dev
     region:   auto
@@ -134,7 +134,7 @@ There is no breaking migration. All existing backends keep working.
 |-------------------------|------------------------------------------|------------------------|
 | `local` (default)       | `object_store::local::LocalFileSystem`   | today's behaviour      |
 | `s3`                    | `AmazonS3` with `us-east-1` (or env)     | classic AWS S3         |
-| `tigris`                | `AmazonS3` with `auto` + Tigris endpoint | Fly-native; basin-cloud default |
+| `tigris`                | `AmazonS3` with `auto` + Tigris endpoint | Fly-native; managed-deployment default |
 | `memory` (tests)        | `object_store::memory::InMemory`         | unchanged              |
 
 The catalog stores object keys verbatim. If you ever do want to migrate
@@ -228,6 +228,6 @@ store is only the eventual flush target.
   bucket level — pin per-project? Likely yes for compliance, deferred.
 - Signed URLs for direct-from-edge reads (so the SDK could skip the
   engine entirely on big Parquet downloads). All three backends support
-  presigned URLs via the S3 API; this is a basin-cloud surface, not basin-engine.
+  presigned URLs via the S3 API; this is a control-plane surface, not basin-engine.
 - Per-project credentials. Currently one bucket-wide key; per-project scoping
   would require provider-specific IAM/token APIs — out of scope for v0.1.

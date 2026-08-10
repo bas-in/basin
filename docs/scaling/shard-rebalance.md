@@ -281,8 +281,8 @@ and another is cold, **move whole shards** between machines.
 
 ### Six-step move
 
-Each step assumes Fly Machines + an S3-compatible object store (Tigris in
-basin-cloud; any backend for self-hosted). The shard is currently on
+Each step assumes Fly Machines + an S3-compatible object store (Tigris on
+the managed deployment; any backend for self-hosted). The shard is currently on
 machine `M_src`, moving to `M_tgt`. The bucket is shared.
 
 1. **Snapshot to object store** — already done by the running compactor; the

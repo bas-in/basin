@@ -64,7 +64,7 @@ Read the full architectural rationale in
 ## Observability — the dashboard cards
 
 Every replica exports the following metrics (Phase 6.X.F). All names are
-the OTLP / Prometheus convention; the basin-cloud exporter ships them to
+the OTLP / Prometheus convention; your OTLP exporter ships them to
 your monitoring stack via the standard `/metrics` scrape.
 
 | metric | type | dimensions | what it tells you |

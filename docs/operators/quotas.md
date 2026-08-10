@@ -31,7 +31,7 @@ Columns:
 | `snapshot_at`         | TIMESTAMPTZ | `now()` at scan time                                     |
 
 Counters are monotonically increasing for the lifetime of the engine process
-(a restart resets them; the basin-cloud aggregator reconciles across
+(a restart resets them; an external aggregator reconciles across
 restarts).
 
 ## How operators read it
@@ -53,7 +53,7 @@ hard ceiling, no automatic suspension, no `SQLSTATE 53400`-on-overage. The
 view is purely an observability surface. Enforcement lives outside the
 engine; the expected pattern is:
 
-1. A cron job (typically in basin-cloud) opens a session per project on a
+1. A cron job (typically in your control plane) opens a session per project on a
    fixed cadence (every 30s–5min).
 2. It reads `basin_project_usage` for that project.
 3. If the project is over budget, the cron takes action: drop the project's
@@ -82,7 +82,7 @@ WHERE cpu_seconds_total > 3600;  -- > 1 CPU-hour
 ## Caveats
 
 - **Per-process counters.** Counters are reset on engine restart. For
-  long-window billing, the basin-cloud aggregator persists scrapes — do not
+  long-window billing, an external aggregator persists scrapes — do not
   rely on the engine's in-process state for billing-grade durability.
 - **No back-fill on restart.** If the engine restarts mid-period, the
   counters start at zero again; the meter should compare deltas between
