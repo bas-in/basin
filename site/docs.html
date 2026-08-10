@@ -503,6 +503,17 @@ dl.defs dd{margin:0;font-size:.9062rem;color:var(--fg-2);line-height:1.65;min-wi
 .vulos-home { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 9px; flex: 0 0 auto; opacity: .72; transition: opacity .15s ease, transform .15s ease; }
 .vulos-home:hover, .vulos-home:focus-visible { opacity: 1; transform: translateY(-1px); }
 .vulos-home img { display: block; width: 22px; height: 22px; border-radius: 6px; }
+/* The Vulos mark is a flat #2E383A stencil drawn for paper; on ink it measures
+   about 1.3:1. Unlike index.html, this page has a paper ground, so the
+   correction is applied to the ink base and undone on paper. Ordered, not
+   specificity-ranked: this file's own note above says a media query adds zero
+   specificity, so the light override must follow the base rule and the explicit
+   dark override must follow that. */
+.vulos-home img { filter: brightness(0) invert(1); }
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]) .vulos-home img { filter: none; }
+}
+[data-theme="dark"] .vulos-home img { filter: brightness(0) invert(1); }
 </style>
 </head>
 <body>

@@ -816,6 +816,14 @@ code.nb{white-space:nowrap;overflow-wrap:normal}
   .vulos-foot { display: inline-flex; align-items: center; gap: 9px; font-size: 13.5px; line-height: 1.45; text-decoration: none; color: inherit; opacity: .85; transition: opacity .15s ease; }
   .vulos-foot:hover { opacity: 1; text-decoration: none; }
   .vulos-foot img { display: block; width: 18px; height: 18px; border-radius: 5px; flex: 0 0 auto; }
+  /* The shared Vulos mark is a single flat #2E383A on transparency — drawn for
+     paper. On this page's ink it measures about 1.3:1: a smudge, not a dimmed
+     logo. brightness(0) invert(1) recolours a single-colour stencil losslessly,
+     counters included. Unconditional here because this landing has no light
+     theme — no data-theme, no prefers-color-scheme block, no toggle. docs.html
+     DOES have one and scopes the same correction; the two pages differ. */
+  .vulos-home img,
+  .vulos-foot img { filter: brightness(0) invert(1); }
 </style>
 </head>
 <body>
