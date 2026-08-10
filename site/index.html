@@ -140,7 +140,18 @@ code{font-family:var(--font-mono);font-size:max(12px,.92em)}
 .nav{display:flex;align-items:center;gap:var(--space-6);height:64px}
 @media(max-width:1180px){.nav-links{gap:var(--space-4)}}
 .brand{display:flex;align-items:center;gap:10px;font-family:var(--font-display);font-weight:var(--weight-black);font-size:1.125rem;letter-spacing:var(--tracking-tighter)}
-.brand svg{width:30px;height:30px;border-radius:7px}
+.brand svg{width:30px;height:30px;border-radius:7px;flex:0 0 auto}
+/* The mark is a solid square tile, so the lockup only reads as one object when
+   the tile's centre meets the wordmark's CAP-HEIGHT centre. Centring on the
+   line box instead — which is what align-items:center does to a bare text node —
+   hangs the tile 2.3px high, because the line box carries the font's descender
+   and leading below the caps. Measured, and exactly the "logo not aligned to
+   the text" complaint. Wrap the word so it has a box, kill the leading, and
+   trim the box down to cap-top/baseline where the browser can. */
+.brand-word{display:block;line-height:1}
+@supports (text-box: trim-both cap alphabetic){
+  .brand-word{text-box:trim-both cap alphabetic}
+}
 .mark-sprite{position:absolute;width:0;height:0;overflow:hidden}
 .nav-spacer{flex:1}
 .nav-links{display:flex;align-items:center;gap:var(--space-6)}
@@ -857,7 +868,7 @@ code.nb{white-space:nowrap;overflow-wrap:normal}
   <div class="container-wide nav">
     <a class="brand" href="./index.html">
       <svg viewBox="0 0 128 128" aria-hidden="true"><use href="#basin-mark"/></svg>
-      Basin
+      <span class="brand-word">Basin</span>
     </a>
     <div class="nav-spacer"></div>
     <nav class="nav-links">
@@ -2108,7 +2119,7 @@ code.nb{white-space:nowrap;overflow-wrap:normal}
       <div class="footer-brand">
         <a class="brand" href="./index.html">
           <svg viewBox="0 0 128 128" aria-hidden="true"><use href="#basin-mark"/></svg>
-          Basin
+          <span class="brand-word">Basin</span>
         </a>
         <p>
           Bucket-native, multi-tenant Postgres alternative, self-hostable on any
