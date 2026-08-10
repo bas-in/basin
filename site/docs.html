@@ -320,13 +320,21 @@ section.doc p{color:var(--fg-2);font-size:1rem;line-height:1.75;max-width:70ch;m
 section.doc p:last-child{margin-bottom:0}
 section.doc p code,section.doc li code,td code,th code{
   background:var(--bg-inset);border:1px solid var(--line);border-radius:var(--radius-2);
-  padding:1px 5px;color:var(--accent-2);overflow-wrap:anywhere;
+  padding:1px 5px;color:var(--accent-2);white-space:nowrap;
 }
-/* Opt-out, same shape index.html uses: a short token that reads as a
-   rendering bug when split. Blanket nowrap is the wrong default here — the
-   prose carries whole shell commands and connection URLs inline, and with
-   html/body at overflow-x:clip an unbreakable one is cut off, not scrolled. */
-code.nb{white-space:nowrap;overflow-wrap:normal}
+/* nowrap is right for the ~400 inline chips that hold a single identifier —
+   these are bordered chips, so a break at the hyphen in `basin-net` renders
+   as two chips and reads as a bug (index.html hit the same thing on
+   `#![forbid(unsafe_code)]` and added code.nb for it).
+   It is wrong for the handful that carry a whole shell command, log line or
+   connection URL: those cannot fit a 320px column, and because html/body are
+   overflow-x:clip they do not scroll — they are cut off at the edge. CSS has
+   no length predicate, so the long ones are marked at the call site. */
+/* Selector must mirror the rule above, not just `code.wrap` — that is
+   specificity (0,1,1) and loses to `section.doc p code` at (0,1,2). */
+section.doc p code.wrap,section.doc li code.wrap,td code.wrap,th code.wrap{
+  white-space:normal;overflow-wrap:anywhere;
+}
 section.doc a.link{color:var(--accent);text-decoration:underline;text-underline-offset:3px;text-decoration-thickness:1px;text-decoration-color:var(--accent-soft)}
 section.doc a.link:hover{text-decoration-color:currentColor}
 section.doc strong{color:var(--fg);font-weight:var(--weight-semibold)}
@@ -726,14 +734,14 @@ docker run --rm \
   </div>
   <p>
     You are ready when the log prints
-    <code>INFO basin_server: pgwire listener is accept-ready bind=0.0.0.0:5432</code>.
+    <code class="wrap">INFO basin_server: pgwire listener is accept-ready bind=0.0.0.0:5432</code>.
     The image ships a healthcheck (<code>nc -z 127.0.0.1 5432</code>) on a ten-second interval.
     The release workflow publishes <code>ghcr.io/vul-os/basin-server</code> on every
     <code>v*</code> tag.
   </p>
   <div class="note">
     <span class="lbl">Port already taken</span>
-    <p>Postgres probably owns 5432 on your machine. Remap the host side and leave the container alone: <code>docker run --rm -p 5433:5432 -v basin-data:/var/basin --name basin basin-server</code>.</p>
+    <p>Postgres probably owns 5432 on your machine. Remap the host side and leave the container alone: <code class="wrap">docker run --rm -p 5433:5432 -v basin-data:/var/basin --name basin basin-server</code>.</p>
   </div>
 
   <h3>From source</h3>
@@ -794,9 +802,9 @@ psql -h 127.0.0.1 -p 5433 -U alice</code></pre>
   <p>
     With <code>basin-auth</code> enabled, <code>POST /admin/v1/projects</code> mints a project
     and returns a connection URL of the form
-    <code>postgres://&lt;user&gt;:&lt;password&gt;@host:5433/&lt;db&gt;</code>. The username is
+    <code class="wrap">postgres://&lt;user&gt;:&lt;password&gt;@host:5433/&lt;db&gt;</code>. The username is
     the project ULID plus a short suffix, so the project identity is carried by the credential
-    itself. Rotation is <code>POST /admin/v1/projects/{user}/rotate</code>, and the old password
+    itself. Rotation is <code class="wrap">POST /admin/v1/projects/{user}/rotate</code>, and the old password
     stops working immediately. A bad password fails with SQLSTATE <code>28P01</code>, exactly
     as Postgres would.
   </p>
@@ -959,7 +967,7 @@ ORDER  BY n DESC;</code></pre>
   <div class="note">
     <span class="lbl">ORM reality check</span>
     <p>
-      <code>tests/integration/tests/orm_smoke.rs</code> drives seven query patterns that real
+      <code class="wrap">tests/integration/tests/orm_smoke.rs</code> drives seven query patterns that real
       ORMs emit through the extended-query protocol — multi-row parameterised inserts, a cached
       prepared statement over 100 bind/execute cycles, mixed-type predicates, NULL round-trips,
       parameterised <code>LIMIT</code>, quote-bearing text, and <code>BYTEA</code> round-trips.
@@ -1027,7 +1035,7 @@ ORDER  BY rank DESC;</code></pre>
   <span class="eyebrow">09 · row visibility</span>
   <h2>Row-Level Security</h2>
   <p>
-    <code>ALTER TABLE … ENABLE ROW LEVEL SECURITY</code> and <code>CREATE POLICY</code> behave as
+    <code class="wrap">ALTER TABLE … ENABLE ROW LEVEL SECURITY</code> and <code>CREATE POLICY</code> behave as
     they do in Postgres, with the predicate injected at the logical-plan layer rather than
     filtered after the fact. <code>auth.uid()</code>, <code>auth.role()</code> and
     <code>auth.jwt()</code> are SQL session functions populated from the verified JWT at
@@ -1050,7 +1058,7 @@ CREATE POLICY "own rows" ON notes FOR ALL USING (owner_id = auth.uid());</code><
   <div class="note">
     <span class="lbl">How it is tested</span>
     <p>
-      <code>tests/integration/tests/security.rs</code> runs 1,000-iteration cross-project fuzzes
+      <code class="wrap">tests/integration/tests/security.rs</code> runs 1,000-iteration cross-project fuzzes
       plus four explicit bypass shapes including UNION and CTE constructions. A P0 RLS bypass via
       UNION + CTE was found by that suite during development and fixed before the release tag —
       which is the argument for the suite existing, not an argument that the surface is
@@ -1364,7 +1372,7 @@ ws.onmessage = (m) =&gt; console.log(JSON.parse(m.data));</code></pre>
   <ul class="bullets">
     <li><strong>Buckets</strong> — create, get, delete; deleting a bucket purges orphaned objects.</li>
     <li><strong>Objects</strong> — upload with server-side MIME sniffing, download, prefix list with paging, single delete and bulk delete by prefix.</li>
-    <li><strong>Public fast path</strong> — <code>GET /storage/v1/object/public/:project/:bucket/*path</code> serves objects in public buckets with no JWT.</li>
+    <li><strong>Public fast path</strong> — <code class="wrap">GET /storage/v1/object/public/:project/:bucket/*path</code> serves objects in public buckets with no JWT.</li>
     <li><strong>Signed URLs</strong> — HMAC-SHA256 over <code>(project, bucket, path, expiry)</code>, constant-time verification, and independent signing-key rotation that invalidates outstanding tokens.</li>
     <li><strong>Per-object RLS</strong> — owner / role / true / false predicates with Postgres permissive OR-merge semantics, enforced on both download and list.</li>
     <li><strong>Quota accounting</strong> — a per-project <code>bytes_written_total</code> counter, incremented on upload and decremented on delete.</li>
