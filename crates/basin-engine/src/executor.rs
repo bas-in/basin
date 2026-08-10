@@ -834,6 +834,40 @@ pub(crate) fn needs_rewrite_pipeline(sql: &str) -> bool {
     KEYWORD_MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// Pre-screen for the enum ordinal-ordering rewrite
+/// ([`crate::enum_ordinal::rewrite_enum_ordering`]) — the one pass that has
+/// to run even when [`needs_rewrite_pipeline`] returns `false`.
+///
+/// Why this exists: the enum rewrite fires on *ordering positions* —
+/// `ORDER BY`, the range comparisons `<`/`>`/`<=`/`>=`, and `BETWEEN`. Of
+/// those, only `<=` happens to be in `needs_rewrite_pipeline`'s marker set,
+/// so a query as plain as
+///
+/// ```sql
+/// SELECT status FROM t ORDER BY status
+/// ```
+///
+/// carries no marker at all, skipped the whole pipeline, and therefore never
+/// reached the enum rewrite — sorting the labels lexicographically instead of
+/// by declared ordinal. That is exactly the "false-negative silently produces
+/// wrong results" case `needs_rewrite_pipeline`'s contract warns about.
+///
+/// It is kept separate from `needs_rewrite_pipeline` rather than folded into
+/// it on purpose. Adding `ORDER BY` / `<` / `>` there would drag every sorted
+/// or range-scanned query through all ~40 passes for the sake of one of them.
+/// This screen instead lets the caller run just the enum pass, which parses
+/// once and bails before any catalog hop unless the statement really is a
+/// single-table query with an enum-typed column in an ordering position.
+fn needs_enum_ordering_rewrite(sql: &str) -> bool {
+    // `<`/`>` as bare bytes cover `<`, `>`, `<=`, `>=` (and harmlessly
+    // re-trigger on `<>`, which the rewrite ignores).
+    if sql.as_bytes().iter().any(|&b| matches!(b, b'<' | b'>')) {
+        return true;
+    }
+    let lower = sql.to_ascii_lowercase();
+    lower.contains("order by") || lower.contains("between")
+}
+
 /// Runs the full ~40-pass string-rewrite pipeline.  Only invoked when
 /// `needs_rewrite_pipeline` says at least one pass might fire.
 async fn run_full_rewrite_pipeline(sess: &ProjectSession, sql: &str) -> Result<String> {
@@ -2526,6 +2560,19 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
     let rewrite_pipeline_owned: String;
     let sql: &str = if needs_rewrite_pipeline(sql) {
         rewrite_pipeline_owned = run_full_rewrite_pipeline(sess, sql).await?;
+        rewrite_pipeline_owned.as_str()
+    } else if needs_enum_ordering_rewrite(sql) {
+        // The enum ordinal rewrite fires on ordering positions (ORDER BY,
+        // `<`/`>`/`<=`/`>=`, BETWEEN), which are almost all invisible to the
+        // marker set above. Run just that pass so enum columns sort and
+        // range-compare in declaration order (PG semantics) rather than
+        // lexicographically. See `needs_enum_ordering_rewrite`.
+        rewrite_pipeline_owned = crate::enum_ordinal::rewrite_enum_ordering(
+            &sess.engine.config().catalog,
+            &sess.project,
+            sql,
+        )
+        .await?;
         rewrite_pipeline_owned.as_str()
     } else {
         sql
@@ -16970,7 +17017,38 @@ mod lock_timeout_guc_tests {
 
 #[cfg(test)]
 mod rewrite_pipeline_prescreen_tests {
-    use super::needs_rewrite_pipeline;
+    use super::{needs_enum_ordering_rewrite, needs_rewrite_pipeline};
+
+    /// The enum ordinal rewrite must be reachable for the ordering shapes it
+    /// handles even though `needs_rewrite_pipeline` sees no marker in them.
+    /// These four are precisely the queries that used to sort enum labels
+    /// alphabetically because the pass was never invoked.
+    #[test]
+    fn enum_ordering_screen_catches_marker_free_ordering_queries() {
+        for sql in [
+            "SELECT status FROM t ORDER BY status",
+            "SELECT status FROM t ORDER BY status DESC",
+            "SELECT status FROM t WHERE status > 'pending'",
+            "SELECT status FROM t WHERE status BETWEEN 'paid' AND 'shipped'",
+        ] {
+            assert!(
+                !needs_rewrite_pipeline(sql),
+                "precondition: {sql} carries no pipeline marker"
+            );
+            assert!(
+                needs_enum_ordering_rewrite(sql),
+                "enum ordering screen must fire on: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn enum_ordering_screen_skips_equality_point_query() {
+        // Equality needs no ordinal compare, so the screen leaves the
+        // point-query fast path alone.
+        assert!(!needs_enum_ordering_rewrite("SELECT id FROM t WHERE id = 5"));
+        assert!(!needs_enum_ordering_rewrite("SELECT 1"));
+    }
 
     #[test]
     fn needs_rewrite_pipeline_skips_trivial_select() {
