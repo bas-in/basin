@@ -80,7 +80,7 @@ uuid.workspace = true
 # independently of the tokio scheduler; serde derives the query params.
 axum.workspace = true
 serde.workspace = true
-pprof = { version = "0.13", features = ["flamegraph"] }
+pprof = { version = "0.15", features = ["flamegraph"] }
 
 [dev-dependencies]
 tempfile.workspace = true

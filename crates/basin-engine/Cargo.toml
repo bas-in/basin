@@ -95,7 +95,7 @@ bitflags = "2"
 pg_query.workspace = true
 # Phase 5.11.J: LANGUAGE wasm UDFs. wasmtime provides the WASM runtime with
 # sandboxing (epoch-based CPU caps + linear-memory limits) by construction.
-wasmtime = { version = "44", default-features = true }
+wasmtime = { version = "47", default-features = true }
 # Phase 5.16.B: per-shape HDR histograms.
 # hdrhistogram — low-overhead latency/count histograms with bounded memory.
 hdrhistogram = "7"

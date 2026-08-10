@@ -37,8 +37,8 @@ basin-catalog = { workspace = true, optional = true }
 # wasmtime-wasi provides WASI P2 types (ResourceTable, WasiCtx) used by
 # the component linker. `p2` feature enables Preview 2 only; we don't
 # need the legacy P1 (`p1` = dep:wiggle) for function components.
-wasmtime      = { version = "44", default-features = true, features = ["component-model", "async"], optional = true }
-wasmtime-wasi = { version = "44", default-features = false, features = ["p2"], optional = true }
+wasmtime      = { version = "47", default-features = true, features = ["component-model", "async"], optional = true }
+wasmtime-wasi = { version = "47", default-features = false, features = ["p2"], optional = true }
 
 tracing    = { workspace = true, optional = true }
 thiserror  = { workspace = true, optional = true }

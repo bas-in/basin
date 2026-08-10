@@ -3,7 +3,7 @@
 # Builder : rust:${RUST_VERSION}-slim-bookworm
 #           RUST_VERSION must be >= the workspace `rust-version` in Cargo.toml,
 #           which is the *resolved graph's* floor, not a preference: cranelift
-#           0.131 (via wasmtime, via basin-fn) declares rust-version 1.92 and
+#           0.134 (via wasmtime 47, via basin-fn) declares rust-version 1.94 and
 #           vortex-error 0.71 declares 1.91, and cargo hard-errors below either.
 #           This was pinned at 1.85 while the lockfile needed 1.92, so every
 #           Docker Smoke run failed with
@@ -29,7 +29,7 @@
 #                                           set to "basin=*" to match smoke PGUSER=basin
 
 # ─── Stage 1: builder ────────────────────────────────────────────────────────
-ARG RUST_VERSION=1.92
+ARG RUST_VERSION=1.94
 FROM rust:${RUST_VERSION}-slim-bookworm AS builder
 
 # Native build deps:

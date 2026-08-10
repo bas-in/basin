@@ -510,9 +510,9 @@ for the `cosign verify-blob` invocation.
 
 ## Build and test
 
-Minimum supported Rust version is **1.92** — not a preference, but the floor
-the resolved dependency graph imposes (cranelift 0.131 via wasmtime declares
-1.92; vortex-error 0.71 declares 1.91), and `cargo` hard-errors below it. CI's
+Minimum supported Rust version is **1.94** — not a preference, but the floor
+the resolved dependency graph imposes (cranelift 0.134 via wasmtime 47 declares
+1.94; vortex-error 0.71 declares 1.91), and `cargo` hard-errors below it. CI's
 `msrv floor` job recomputes that from `cargo metadata` and fails if
 `rust-version` drifts below it.
 

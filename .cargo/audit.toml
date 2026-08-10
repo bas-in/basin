@@ -1,0 +1,87 @@
+# cargo-audit configuration.
+#
+# READ THIS BEFORE ADDING AN ENTRY.
+#
+# An `ignore` here is a permanent, silent suppression: cargo-audit matches on
+# advisory ID alone, with no version or dependency-path scoping. So the moment
+# an ID is listed, a FUTURE occurrence of that same advisory — in a crate we
+# pull in directly, in a path that is genuinely reachable — is suppressed too,
+# and nothing goes red. That is precisely the shape of gate this repo keeps
+# finding: one that prints PASS while looking at nothing.
+#
+# So the bar for an entry is:
+#   1. The vulnerable crate is a TRANSITIVE dep we do not name ourselves, and
+#   2. NO published version of any crate between us and it resolves the
+#      advisory — verified against the crates.io index, not assumed, and
+#   3. The entry records what upstream release would clear it, so a future
+#      reader can re-test the claim in one command rather than re-deriving it.
+#
+# If a `cargo update` or a direct-dependency bump clears an advisory, do that
+# instead. Seventeen of the twenty-two findings on this lockfile were cleared
+# that way (a plain `cargo update`, plus pprof 0.13 -> 0.15 and wasmtime 44 ->
+# 47); only the five below survived, and only because upstream has not shipped
+# a fix we can reach.
+#
+# Note that an ignored advisory is suppressed from `cargo audit` output
+# ENTIRELY — it is not printed and not counted, so the log gives no hint that
+# this file exists. To re-test whether an entry is still needed, run the audit
+# against a tree with this file moved aside:
+#
+#   mv .cargo/audit.toml /tmp/ && cargo audit ; mv /tmp/audit.toml .cargo/
+#
+# Anything that no longer appears there should be deleted from the list below.
+
+[advisories]
+ignore = [
+    # ── quick-xml ────────────────────────────────────────────────────────────
+    # RUSTSEC-2026-0194  quadratic run time checking a start tag for duplicate
+    #                    attribute names                          (7.5 high)
+    # RUSTSEC-2026-0195  unbounded namespace-declaration allocation in
+    #                    `NsReader`                               (7.5 high)
+    #
+    # Both fixed in quick-xml 0.41.0. Two separate chains hold us below it, and
+    # neither has a reachable fix:
+    #
+    #   quick-xml 0.39.4 <- object_store 0.13.2 <- datafusion 53.1.0
+    #     object_store 0.14.1 is the first release requiring quick-xml ^0.41,
+    #     but NO datafusion release accepts it — 54.1.0, the newest, still
+    #     requires object_store ^0.13.2, which requires quick-xml ^0.39. Since
+    #     0.39 -> 0.41 is a breaking bump for a 0.x crate, cargo cannot resolve
+    #     across it. Clears when datafusion ships against object_store 0.14.
+    #
+    #   quick-xml 0.26.0 <- inferno 0.11.21 <- pprof 0.15.0
+    #     inferno 0.12.7+ moved to quick-xml ^0.41, but pprof still requires
+    #     inferno ^0.11 as of 0.15.0 (its newest). pprof/flamegraph backs the
+    #     localhost-only /debug/threads SVG endpoint, so dropping the feature
+    #     would delete working forensics rather than fix anything.
+    #     Clears when pprof moves to inferno 0.12.
+    #
+    # Exposure: the object_store path parses XML list/error responses from the
+    # configured S3/GCS endpoint — i.e. from the operator's own object store,
+    # not from end-user input. The inferno path renders profiles this process
+    # generated about itself, over a loopback-bound listener. Both advisories
+    # are denial-of-service, not memory unsafety.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+
+    # ── rkyv ─────────────────────────────────────────────────────────────────
+    # RUSTSEC-2026-0235  insufficient archive validation -> out-of-bounds reads
+    #                    in archives containing Rc/Arc
+    #
+    # Fixed in rkyv 0.8.17. We already resolve rkyv 0.8.18 for the crates that
+    # actually use it; the flagged 0.7.46 arrives as an OPTIONAL dependency of
+    # rust_decimal 1.42.1 (its newest release), reached via byte-unit <-
+    # openraft 0.9.24.
+    #
+    # That optional dep is never feature-activated in this workspace, so
+    # rkyv 0.7 is never compiled into any artifact we ship. cargo-audit reads
+    # Cargo.lock, which lists optional dependencies whether or not a feature
+    # turns them on, so it reports a crate that is not in the build. Confirm:
+    #
+    #   cargo tree -i rkyv@0.7.46 --workspace -e all --target all
+    #   -> "warning: nothing to print."   (it is in no activated feature graph)
+    #
+    # If that command ever prints a tree, this entry is no longer true and must
+    # come out. Clears outright when rust_decimal moves to rkyv 0.8.
+    "RUSTSEC-2026-0235",
+]
