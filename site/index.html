@@ -432,7 +432,15 @@ code{font-family:var(--font-mono);font-size:max(12px,.92em)}
   line-height:1.75;overflow-x:auto;color:rgb(var(--paper-rgb)/.86);
 }
 .qs-code .l{white-space:pre;display:block}
-.qs-code .t-com{color:rgb(var(--paper-rgb)/.34)}
+/* Both Quickstart blocks are tokenised by hand in the same idiom as every
+   other code block on this page — .t-kw / .t-fn / .t-str / .t-out / .t-com,
+   defined once near the hero terminal. This landing loads no highlighter
+   (highlight.min.js is vendored for docs.html only), so class="language-bash"
+   here would render plain while *looking* highlighted in the source.
+   The comment colour is lifted above the global .t-com: this block sets
+   12.5px mono on --ink, where paper/.34 measures 2.96:1. paper/.5 is 5.06:1
+   and still reads as the quietest thing in the block. */
+.qs-code .t-com{color:rgb(var(--paper-rgb)/.5)}
 
 /* ─────────────────────────────────────────────────────────────────────
    FIGURES
@@ -1988,25 +1996,34 @@ code.nb{white-space:nowrap;overflow-wrap:normal}
       <div class="qs-grid">
         <div class="qs-step reveal">
           <h3>Docker — under five minutes</h3>
-          <p>No Rust toolchain. pgwire comes up and <code>psql</code> connects.</p>
+          <p>
+            No Rust toolchain. The image sets <code>BASIN_BIND=0.0.0.0:5432</code>, so pgwire
+            listens on <code>:5432</code> inside the container and <code>psql</code> connects on
+            whatever you map it to.
+          </p>
           <div class="qs-code">
-<span class="l">docker run --rm \</span>
-<span class="l">  -p 5432:5432 \</span>
-<span class="l">  -v basin-data:/var/basin \</span>
-<span class="l">  --name basin \</span>
-<span class="l">  basin-server</span>
+<span class="l"><span class="t-com"># pgwire on :5432 in the image</span></span>
+<span class="l"><span class="t-kw">docker</span> <span class="t-fn">run</span> <span class="t-out">--rm</span> \</span>
+<span class="l">  <span class="t-out">-p</span> <span class="t-str">5432:5432</span> \</span>
+<span class="l">  <span class="t-out">-v</span> <span class="t-str">basin-data:/var/basin</span> \</span>
+<span class="l">  <span class="t-out">--name</span> <span class="t-str">basin</span> \</span>
+<span class="l">  <span class="t-str">basin-server</span></span>
           </div>
         </div>
         <div class="qs-step reveal">
           <h3>From source</h3>
-          <p>Durable WAL and Vortex columnar files under your data dir; in-memory catalog for fast iteration.</p>
+          <p>
+            Durable WAL and Vortex columnar files under your data dir; in-memory catalog for fast
+            iteration. Built from source the default bind is <code>127.0.0.1:5433</code> — not
+            <code>5432</code>; only the container image overrides it.
+          </p>
           <div class="qs-code">
 <span class="l"><span class="t-com"># pgwire on 127.0.0.1:5433</span></span>
-<span class="l">BASIN_DATA_DIR=/tmp/basin \</span>
-<span class="l">  cargo run -p basin-server</span>
+<span class="l"><span class="t-kw">BASIN_DATA_DIR</span>=<span class="t-str">/tmp/basin</span> \</span>
+<span class="l">  <span class="t-kw">cargo</span> <span class="t-fn">run</span> <span class="t-out">-p</span> <span class="t-str">basin-server</span></span>
 <span class="l"> </span>
 <span class="l"><span class="t-com"># then, from anywhere:</span></span>
-<span class="l">psql postgres://localhost:5433</span>
+<span class="l"><span class="t-kw">psql</span> <span class="t-str">postgres://localhost:5433</span></span>
           </div>
         </div>
       </div>
