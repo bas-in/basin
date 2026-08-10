@@ -138,6 +138,7 @@ code{font-family:var(--font-mono);font-size:.92em}
   border-bottom:var(--hairline-paper);
 }
 .nav{display:flex;align-items:center;gap:var(--space-6);height:64px}
+@media(max-width:1180px){.nav-links{gap:var(--space-4)}}
 .brand{display:flex;align-items:center;gap:10px;font-family:var(--font-display);font-weight:var(--weight-black);font-size:1.125rem;letter-spacing:var(--tracking-tighter)}
 .brand svg{width:30px;height:30px;border-radius:7px}
 .mark-sprite{position:absolute;width:0;height:0;overflow:hidden}
@@ -186,11 +187,11 @@ code{font-family:var(--font-mono);font-size:.92em}
   grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);
   gap:clamp(28px,3.5vw,56px);align-items:start;
 }
-.hero-copy{min-width:0;max-width:620px}
+.hero-copy{min-width:0;max-width:660px}
 .hero-eyebrow{margin-top:var(--space-2);margin-bottom:var(--space-5);display:flex;align-items:center;gap:var(--space-4);flex-wrap:wrap}
 .hero-mark{width:48px;height:48px;border-radius:11px;flex:0 0 auto}
 .hero-title{
-  font-size:clamp(36px,5.6vw,76px);line-height:.98;
+  font-size:clamp(34px,4.6vw,62px);line-height:1.0;
   letter-spacing:var(--tracking-tighter);font-weight:var(--weight-black);
   display:flex;flex-direction:column;gap:2px;margin-bottom:var(--space-4);
 }
@@ -816,7 +817,9 @@ code{font-family:var(--font-mono);font-size:.92em}
     <div class="nav-spacer"></div>
     <nav class="nav-links">
       <a href="#architecture">Architecture</a>
-      <a href="#compat">Postgres compatibility</a>
+      <a href="#batteries">Batteries</a>
+      <a href="#sdks">SDKs</a>
+      <a href="#compat">Compatibility</a>
       <a href="#benchmarks">Benchmarks</a>
       <a href="#compare">Compare</a>
       <a href="./docs.html">Docs</a>
@@ -954,10 +957,14 @@ code{font-family:var(--font-mono);font-size:.92em}
       <ul class="ships-list">
         <li>pgwire v3</li>
         <li>Row-Level Security</li>
-        <li>Vector search (HNSW)</li>
-        <li>Iceberg catalog</li>
+        <li>Vector search (HNSW + IVF)</li>
+        <li>Iceberg REST catalog</li>
         <li>REST + Auth</li>
+        <li>Realtime SSE + WS</li>
+        <li>Blob storage</li>
         <li>Wasm functions</li>
+        <li>CDC ring + webhooks</li>
+        <li>Cron + HTTP from SQL</li>
         <li>HTAP hot tier</li>
       </ul>
     </div>
@@ -1494,7 +1501,8 @@ code{font-family:var(--font-mono);font-size:.92em}
             <span class="codeblock-tag">TypeScript</span>
           </div>
           <div class="codeblock-body">
-<span class="l"><span class="t-kw">import</span> { createClient } <span class="t-kw">from</span> <span class="t-str">"@bas-in/basin-js"</span>;</span>
+<span class="l"><span class="t-kw">import</span> { createClient }</span>
+<span class="l">  <span class="t-kw">from</span> <span class="t-str">"@bas-in/basin-js"</span>;</span>
 <span class="l"> </span>
 <span class="l"><span class="t-kw">const</span> basin = <span class="t-fn">createClient</span>(</span>
 <span class="l">  <span class="t-str">"http://localhost:5434"</span>, apiKey);</span>
@@ -1536,7 +1544,8 @@ code{font-family:var(--font-mono);font-size:.92em}
             <span class="codeblock-tag">Go</span>
           </div>
           <div class="codeblock-body">
-<span class="l"><span class="t-kw">import</span> basin <span class="t-str">"github.com/vul-os/basin/sdks/go"</span></span>
+<span class="l"><span class="t-kw">import</span> basin</span>
+<span class="l">  <span class="t-str">"github.com/vul-os/basin/sdks/go"</span></span>
 <span class="l"> </span>
 <span class="l">client := basin.<span class="t-fn">New</span>(</span>
 <span class="l">    <span class="t-str">"http://localhost:5434"</span>,</span>
