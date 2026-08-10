@@ -9,11 +9,11 @@ isn't already captured in TASK.md, an ADR, or a commit message.
 ## 2026-05-22 — Cross-repo completion campaign: all 5 repos audited, fixed, built, tested green
 
 Per the owner's "everything complete, deeply implemented, deep testing" directive, ran a full
-audit → fix → build → test campaign across **basin / basin-cloud / basin-cli / basin-js / basin-py**
+audit → fix → build → test campaign across **basin / the cloud repo / basin-cli / basin-js / basin-py**
 with many parallel sonnet agents. Outcome (STAGE 1 build + STAGE 2 local tests both green):
 
 **Audits (read-only, multi-agent):** cli, js, py each; basin (impl-core + impl-services + dedicated
-security); basin-cloud (impl + dedicated security). Engine core verified genuinely solid (point-query,
+security); the cloud repo (impl + dedicated security). Engine core verified genuinely solid (point-query,
 pushdown, JSONB/FTS/vector/GIST indexes + completeness guard, RLS, real transactions/SAVEPOINT, CV,
 hypertables). Recurring theme: roadmap drift (shipped-but-unticked AND ticked-but-unwired) + stale
 audit docstrings (some "gaps" were already done).
@@ -32,13 +32,13 @@ audit docstrings (some "gaps" were already done).
   ticked but Noop invoker, never wired); realtime SSE/WS co-mount on the REST port (`045c700` — was
   separate-port only → SDK/CLI 404); dump REST endpoint (`29515a9`); function invocations/versions/
   rollback (`fe67ca3`); pg_cancel_backend real cancellation 57014 (`6b577da`).
-- **basin-cloud:** P0 project provisioning (RegisterProject/ProvisionProjectPgwire were TODO →
+- **Cloud repo:** P0 project provisioning (RegisterProject/ProvisionProjectPgwire were TODO →
   API-created projects had no creds) (`12bbfc5`); analytics-ingest authz, OIDC open-redirect, webhook
   token redaction, **real SAML XML-DSig** via pure-Rust `bergshamra` (`7a54b14`/`5f9eb2b`/`3adab80`/
   `92b706d`); P2 Deps wirings (`f091995`); index_advisor/function_mocks confirmed wired (`23ebd2d` etc).
 - **In-house analytics** (Neon control-plane, NOT dogfooded): ingestion + GeoLite2-offline + 0009
   migration + rollups + query API + realtime SSE + dashboard; raw IP never persisted (compile-time).
-- **In-house docs renderer** (basin-cloud SPA, react-markdown, multi-repo sync + override layer).
+- **In-house docs renderer** (cloud SPA, react-markdown, multi-repo sync + override layer).
 
 **STAGE 2 local tests ALL GREEN:** basin capstone (lib+bins) 0-fail; integration sweep exit=0 (orm 20,
 postgrest 9, security 41, noop 42, jsonb/fts/range/pgvector/hypertable/citext); perf gates
@@ -47,7 +47,7 @@ postgrest 9, security 41, noop 42, jsonb/fts/range/pgvector/hypertable/citext); 
 **Genuinely NOT done (by nature, not omission):** Phase-0 customer/business; multi-region + cross-shard
 2PC (ADR-deferred large infra); SAML post-verify session issuance (in flight); the 3-way Neon/Supabase/
 Basin comparative benchmark (STAGE 3, needs the dev deploy). Throwaway dev `.env` secrets left as-is
-per owner. Uncommitted stray WIP left untouched (basin-cli `config_cmd.rs` +289, basin-cloud SQL-editor,
+per owner. Uncommitted stray WIP left untouched (basin-cli `config_cmd.rs` +289, cloud SQL-editor,
 ROADMAP cross-ref edits) — flagged to owner, 1 cli test fails only in that uncommitted code.
 
 ## 2026-05-22 — 5.18.C completed (user reversed the defer): system tables on reserved schemas, security-safe
@@ -83,7 +83,7 @@ jsonb_index_harness 3/0 (1 perf-gate ignored), noop 42/0, `cargo build --workspa
 - Multi-region, cross-shard 2PC, TUS resumable uploads — v0.2+ architectural.
 - Open beta / GA / bug bounty / per-phase security review / partner onboarding — process gates.
 - EXCLUDE USING gist — explicitly off-roadmap.
-- 5.15.E–I (basin-cloud docs-site) — **user-gated**: needs a Docusaurus-vs-Mintlify decision + repo/CI/secrets.
+- 5.15.E–I (cloud docs-site) — **user-gated**: needs a Docusaurus-vs-Mintlify decision + repo/CI/secrets.
 
 `[~]` partials are correctly deferred: external-tool harnesses (CI-only), 5.18.C (needs engine CREATE SCHEMA,
 v0.2), catalog replication / PITR / CoW branching (v0.2), P2 security integration-test assertions (fixes
@@ -324,7 +324,7 @@ test is the safety net that catches it.
   (yields, though full preemption needs DataFusion async-UDF). 1178 engine tests.
 - Sibling repos advanced in parallel (isolated, zero contention): basin-cli
   `c7d5a94` (Tier-8 cwd fallback for sql/logs/secrets/snapshots, 1070 tests);
-  basin-cloud `40022d0` T-154, `515d3dd` T-157 (GCP-KMS JWT), `0d70a3a` T-155.
+  cloud repo `40022d0` T-154, `515d3dd` T-157 (GCP-KMS JWT), `0d70a3a` T-155.
 
 ### STOP-CONDITION ASSESSMENT (per the loop's own criterion)
 Phases 5.18–5.32 are now substantially complete (impl slices landed + coherence-gated
@@ -352,7 +352,7 @@ scan path). Everything cleanly parallelizable has been done.
 
 Cadence that works under engine-serialization + disk limits: ONE engine agent on a
 whole phase (shared tree) + ONE agent in an isolated sibling repo (basin-cli /
-basin-cloud — separate git + Cargo target, zero contention). Each wave
+the cloud repo — separate git + Cargo target, zero contention). Each wave
 coherence-gated (`cargo build --workspace` + targeted regression sweep) green.
 
 - **5.22 pg_dump:** `5938e5f` engine plain (`pg_dump -F p`) + custom (`-F c`,
@@ -378,7 +378,7 @@ coherence-gated (`cargo build --workspace` + targeted regression sweep) green.
   evaluate` panicked comparing `Timestamp` columns vs `Int64`(µs) / `Utf8`(PG ts
   string) scalars — now handles all 4 time units + a `parse_ts_str_to_us` read-path
   helper. (Agent strayed into basin-storage for this necessary fix; no collision.)
-  Cloud sibling: `40022d0` in **basin-cloud** — T-154 wire `thresholds_crossed`
+  Cloud sibling: `40022d0` in the **cloud repo** — T-154 wire `thresholds_crossed`
   into `check_and_alert` (Vite/React SPA + Axum backend-rs; 1036 backend tests green).
 
 **Net:** ~25 boxes closed across these waves; basin TASK.md down to ~73 open + 14
@@ -1422,7 +1422,7 @@ In flight: #88 (read-path tombstone) + #104 (LISTEN/NOTIFY).
 - Volume was at 21 GB free / 926 GB total. basin/target alone was 485 GB.
 - Killed D (#110) + F (#112) agents mid-build, wiped:
   - basin/target: 485 GB
-  - basin-cloud/backend-rs/target: 74 GB
+  - cloud repo backend-rs/target: 74 GB
   - basin-cli/target: 8 GB
   - basin/benchmark/vortex_compare/target: 1.1 GB
   - Old .claude session dirs (preserved current + memory): ~60 MB
