@@ -20,7 +20,7 @@
   <a href="https://github.com/vul-os/basin/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/vul-os/basin/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://github.com/vul-os/basin/releases"><img alt="latest release" src="https://img.shields.io/github/v/release/vul-os/basin?include_prereleases&style=flat-square"></a>
   <a href="./CHANGELOG.md"><img alt="changelog" src="https://img.shields.io/badge/changelog-keep--a--changelog-blue?style=flat-square"></a>
-  <a href="./WEDGE.md"><img alt="status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square"></a>
+  <a href="./ROADMAP.md"><img alt="status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square"></a>
   <a href="./benchmark/BENCHMARKS.md"><img alt="honest benchmarks" src="https://img.shields.io/badge/benchmarks-honest_wins_and_losses-blue?style=flat-square"></a>
   <a href="./benchmark/RESULTS_localfs.md"><img alt="vs Postgres: 27x less RAM/conn" src="https://img.shields.io/badge/vs_postgres-27%C3%97_less_RAM%2Fconn-blue?style=flat-square"></a>
   <a href="./benchmark/RESULTS_seaweedfs.md"><img alt="vs Postgres: 102x smaller on disk (real S3, 100k)" src="https://img.shields.io/badge/vs_postgres-102%C3%97_smaller_on_disk_(S3)-blue?style=flat-square"></a>
@@ -355,31 +355,11 @@ The full capability matrix (with what's planned and what's deferred): [`CAPABILI
 
 ## Status
 
-| Phase | Description | Status |
-|---|---|---|
-| **0** | Validate the wedge — customer interviews, design partners | **open** (the gate; engineering is mature enough to need customer signal next) |
-| **1** | Storage substrate — Vortex (default) / Parquet on object_store, Iceberg-style catalog | **shipped** |
-| **2** | WAL service — sub-5 ms write acks | **v0.1 shipped** (single-node; Raft is v0.2) |
-| **3** | Shard owners — per-project state, eviction, compactor | **v0.1 shipped** (in-process; placement service is v0.2) |
-| **4** | Routers + SQL — pgwire v3, extended query, TLS, COPY, native JSONB / UUID binding | **shipped** — real single-shard transaction semantics (deferred commits, `ROLLBACK` undo, `SAVEPOINT` stack, aborted state) landed; cross-shard 2PC remains v0.2 (ADR 0011) |
-| **4.5** | PostgreSQL SQL-compatibility push — silent-corruption CRITICAL fixes, JSONPath / JSONB-mutating / INET-CIDR / regexp / datetime function families, ARRAY binary wire format (NUMERIC stays text-wire pending v0.2 varlena binary), PG-oracle differential harness (`differential_pg.rs`) | **shipped** — Default config at ~88.5% / ~91.5% non-excluded (863/975); long-tail exotic-DDL parser gaps remain v0.2 |
-| **5** | Analytical path — single DataFusion engine, Vortex/Parquet pushdown + per-file bloom + catalog pruning, continuous pre-aggregation, `APPROX_COUNT_DISTINCT`/`APPROX_PERCENTILE` UDFs | **v0.1 shipped** |
-| **5.0a** | Vortex storage format — ~1.95× smaller than ZSTD Parquet; `aggregate_full` ~15–40× via catalog-stats metadata path; per-file blooms flip `point_eq` from a loss to a win at every scale | **shipped as the DEFAULT** ([ADR 0015](./docs/decisions/0015-vortex-storage-format.md)), zero-regression vs Parquet baseline. Parquet first-class per-table via `WITH (basin.file_format='parquet')`. HTAP hot-tier ([ADR 0016](./docs/decisions/0016-htap-hot-tier-architecture.md)) is Phase 5.14.C — closes the residual OLTP point-read and the UPDATE/DELETE write floor. |
-| **5.14** | Durable Basin moat — per-file catalog blooms (shipped), `APPROX_COUNT_DISTINCT` + `APPROX_PERCENTILE` UDFs (shipped), catalog-aware `WindowExec` sort-elision (shipped), **HTAP hot tier on by default (`bed431c`)** — DELETE + UPDATE fast paths default-ON, kill-switch `BASIN_HOTTIER_FASTPATH_DISABLE=1`, merge-on-read via TombstoneFilterExec + UpdateOverlayExec wired in both DataFusion (`HtapUnionTable::scan`) and fast_select paths, gate-matrix locked by 16 tests, C6 differential harness extended with Mode D fastpath-on, TxCommit WAL marker (ADR 0020 §6) emitted explicitly with backward-compat replay. The 3-month investment that is **not** subsumed by upstream Vortex / DataFusion improvements. | **shipped** |
-| **5.15** | Unified docs platform — OSS-repo markdown with YAML frontmatter ([spec](./docs/frontmatter-spec.md)) that a downstream docs site can fetch at build time | **shipped** (5.15.A/B/C, frontmatter spec + 24-doc migration + top-level index + CI gate). The docs *site* that consumes this feed is not part of this repo and is out of scope here |
-| **5.5** | Sharding axes — partitioning, compute sharding, tiered storage | **shipped** |
-| **5.6** | RLS with `CREATE POLICY` (UNION / CTE coverage) | **shipped** |
-| **5.7** | Caches + bloom + A4 catalog stats + B1 secondary B-tree indexes + B2 cluster-by + B3 row-group sizing | **shipped**; the per-row-group GIN-on-tsvector (`@@`, 5.20.E) and GIN-on-jsonb (`@>`) read-path wiring has since shipped too |
-| **5.8** | `pg_cron` + `pg_net` SQL surfaces | **shipped** |
-| **5.9** | Postgres-extension equivalents (basin-geo / -trgm / -cv, JSONB, UUID, pgcrypto) | **shipped** |
-| **5.10** | Identity + REST (basin-auth, basin-rest, OpenAPI, pagination, streaming, API keys, refresh rotation, per-project connection URLs, **`auth.uid()` / `auth.role()` / `auth.jwt()`** session functions) | **shipped** |
-| **5.11** | Multi-schema isolation | **phase A shipped** — `SchemaName`/`QualifiedTableName` types, schema-aware in-memory + Postgres catalog, `basin_schemas` table, `CREATE/DROP SCHEMA` + cross-schema queries with differential coverage. **Phases B–E in progress** — full qualified-name resolution, `search_path` semantics, wider schema-scoped DDL |
-| **5.20–5.30** | Extensions sprint — FTS, ranges, trgm SQL surface + GIN index, Timescale completions, advisory locks + deadlock detection, CDC phases 1–3, multi-node (lease enforcement + raft WAL), schema namespaces, cursors, MERGE INTO, composite ON CONFLICT, 10 SDKs | **shipped** — see CHANGELOG for per-feature detail |
-| **6** | Production hardening | **partial** — telemetry / pooling / rate-limit / cost-rejection / catalog-PITR / fork shipped; `BASIN_LEASE_MODE=required` write-fence + `BASIN_WAL_MODE=raft` quorum WAL shipped; multi-region routing seams (home_region, WrongRegion, WriteForwarder) shipped; per-tier connection ceiling shipped; cross-shard 2PC (ADR 0011) locked architecturally and gated on customer demand |
-| **6.x** | SQL long-tail (still pending) | **planned** — `search_path` semantics, server-side `PREPARE/EXECUTE` over text protocol edge cases, `DO` blocks, exotic types (`BIT` / `OID` / `REGCLASS`), array column DDL types, `sparsevec`, 3-D geometry, real multi-machine raft deployment docs |
-| **7** | Launch | gated on Phase 0 |
-
-Six-month wedge slice: [`WEDGE.md`](./WEDGE.md). Full plan: [`TASK.md`](./docs/TASK.md). Decision log: [`docs/decisions/`](./docs/decisions/).
+Basin is **pre-alpha**; there has been no v0.1 release. The build-phase table,
+what is being worked on before the v0.1 cut, and what is explicitly out of
+scope all live in [`ROADMAP.md`](./ROADMAP.md). The v0.1 cut-off itself —
+required items, shipped items, parked items and the trigger that unparks one —
+is [`docs/V0_1_SCOPE.md`](./docs/V0_1_SCOPE.md).
 
 ---
 

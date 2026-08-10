@@ -1,5 +1,10 @@
 # Basin — wedge-deepening roadmap
 
+> **Superseded by [`ROADMAP.md`](./ROADMAP.md).** This file is the wedge
+> checkpoint as it stood in May 2026 and is kept as a record of what was
+> planned and why, not as current priority. Read `ROADMAP.md` for what works
+> now, what is being worked on before the v0.1 cut, and what is out of scope.
+
 The five things that turn Basin from "interesting PoC" into "developers can
 ship a multi-project SaaS on it." All directly serve the wedge customer
 (multi-project SaaS with audit-log workloads).

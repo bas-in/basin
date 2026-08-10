@@ -128,7 +128,8 @@ These live at the repo root, not under `docs/`:
 - [`../README.md`](../README.md) — project intro and landing page
 - [`../CAPABILITIES.md`](../CAPABILITIES.md) — capability matrix (shipped, in-progress, planned, off-roadmap)
 - [`../CHANGELOG.md`](../CHANGELOG.md) — release-by-release shipped changes
-- [`../WEDGE.md`](../WEDGE.md) — six-month prioritised roadmap
+- [`../ROADMAP.md`](../ROADMAP.md) — what works now, what is next, and what is out of scope
+- [`../WEDGE.md`](../WEDGE.md) — the 2026-05 wedge checkpoint, superseded by ROADMAP.md
 - [`../CONTRIBUTING.md`](../CONTRIBUTING.md) — contribution guide
 
 ---

@@ -9,8 +9,9 @@ summary: "Source of truth for what ships in v0.1 and what is parked: required it
 
 **Status:** Pre-alpha. Target release: TBD. This doc is the source of truth
 for what ships in v0.1 vs what's parked. The companion docs are
-[`README.md`](../README.md) (positioning), [`CAPABILITIES.md`](../CAPABILITIES.md)
-(feature matrix), [`WEDGE.md`](../WEDGE.md) (wedge-deepening roadmap),
+[`README.md`](../README.md) (positioning), [`ROADMAP.md`](../ROADMAP.md)
+(now / next / out of scope), [`CAPABILITIES.md`](../CAPABILITIES.md)
+(feature matrix),
 [`benchmark/BENCHMARKS.md`](../benchmark/BENCHMARKS.md) (full numbers), and
 [`decisions-log.md`](./decisions-log.md) (wave-by-wave engineering log).
 
@@ -291,8 +292,10 @@ when v0.1 ships; **not promises**.
 - [`README.md`](../README.md) — honest perf + IS / IS-NOT positioning
 - [`CAPABILITIES.md`](../CAPABILITIES.md) — full per-feature matrix (✅ /
   🛠 / ◻️ / 🚫)
-- [`WEDGE.md`](../WEDGE.md) — wedge-deepening roadmap (the next-six-months
-  prioritized slice)
+- [`ROADMAP.md`](../ROADMAP.md) — what works now, what is being worked on
+  before the v0.1 cut, and what is explicitly out of scope
+- [`WEDGE.md`](../WEDGE.md) — the 2026-05 wedge checkpoint, superseded by
+  `ROADMAP.md` and kept as a record
 - [`benchmark/BENCHMARKS.md`](../benchmark/BENCHMARKS.md) — full per-shape
   numbers
 - [`decisions-log.md`](./decisions-log.md) — wave-by-wave engineering log

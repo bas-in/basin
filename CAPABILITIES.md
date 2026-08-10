@@ -4,7 +4,8 @@ Honest, public-facing description of what Basin does today, what's planned,
 and what's not on the roadmap. If you're evaluating Basin for a real
 workload, this is the right page to read first.
 
-Cross-references: [`docs/V0_1_SCOPE.md`](./docs/V0_1_SCOPE.md) is the
+Cross-references: [`ROADMAP.md`](./ROADMAP.md) is the short
+now / next / out-of-scope summary, [`docs/V0_1_SCOPE.md`](./docs/V0_1_SCOPE.md) is the
 v0.1 cut-off (what ships in v0.1, what's parked, unparking triggers),
 [`TASK.md`](./docs/TASK.md) is the full Phase 0–7 core-DB build plan,
 [`WEDGE.md`](./WEDGE.md) is the prioritized next-six-months slice,
