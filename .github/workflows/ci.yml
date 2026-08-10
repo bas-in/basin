@@ -95,6 +95,23 @@ jobs:
                    tests/integration/scripts/*.sh; do
             bash -n "$f"
           done
+      # `mktemp -t NAME` is a BSD idiom: on macOS NAME is a *prefix*, on GNU
+      # coreutils it is a TEMPLATE that must end in >=3 X's, so a script written
+      # on a laptop dies on the runner with `too few X's in template`. That is
+      # exactly how four fail-closed harnesses spent days exiting 1 before they
+      # reached the check they exist to run — a red that looked like the check
+      # failing. Portable form: `mktemp "${TMPDIR:-/tmp}/name.XXXXXX"`.
+      - name: Temp files are created portably (no BSD-only `mktemp -t`)
+        run: |
+          set -euo pipefail
+          hits="$(grep -rn -- '-t [^ "]*' --include='*.sh' scripts tests/integration/scripts \
+                    | grep 'mktemp' | grep -v 'XXX' || true)"
+          if [ -n "${hits}" ]; then
+            echo "Non-portable mktemp template — dies on GNU coreutils:" >&2
+            echo "${hits}" >&2
+            exit 1
+          fi
+          echo "ok — every mktemp template carries an XXXXXX placeholder"
       # Lints every script a CI job depends on, not just verify.sh. A gate whose
       # own wrapper has an unquoted expansion or a silently-swallowed pipeline
       # is a gate that can stop gating without anything going red — and four of

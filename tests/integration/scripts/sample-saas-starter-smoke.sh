@@ -62,7 +62,7 @@ npm ci
 # are allowed to be *skipped* (BASIN_SKIP_LIVE_TESTS=1) but never to be
 # *silently absent* — so the summary is captured and inspected.
 log "npm test"
-TEST_LOG="$(mktemp -t saas-starter-smoke-test)"
+TEST_LOG="$(mktemp "${TMPDIR:-/tmp}/saas-starter-smoke-test.XXXXXX")"
 trap 'rm -f "${TEST_LOG}"' EXIT
 
 set +e

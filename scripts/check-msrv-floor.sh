@@ -48,7 +48,7 @@ command -v python3 >/dev/null 2>&1 || {
   exit 1
 }
 
-META_FILE="$(mktemp -t basin-msrv-meta)"
+META_FILE="$(mktemp "${TMPDIR:-/tmp}/basin-msrv-meta.XXXXXX")"
 trap 'rm -f "${META_FILE}"' EXIT
 
 # The python program below arrives on stdin, so the metadata cannot: it goes to

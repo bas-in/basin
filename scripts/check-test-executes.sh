@@ -128,7 +128,7 @@ EOF
 # ── Selftest ────────────────────────────────────────────────────────────────
 selftest() {
   local tmp pass=0 fail=0
-  tmp="$(mktemp -d -t basin-cte-selftest)"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/basin-cte-selftest.XXXXXX")"
   # shellcheck disable=SC2064  # expand tmp now, not at trap time
   trap "rm -rf '${tmp}'" RETURN
 
@@ -214,7 +214,7 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
-OUT="$(mktemp -t basin-check-test-executes)"
+OUT="$(mktemp "${TMPDIR:-/tmp}/basin-check-test-executes.XXXXXX")"
 trap 'rm -f "${OUT}"' EXIT
 
 echo "[check-test-executes] ${LABEL}: cargo test $*"

@@ -59,7 +59,7 @@ cd "$(dirname "$0")/.."
 # tests/integration/tests/pg_dump_harness.rs. Lower this as slices land.
 EXPECTED_DECLINED_SLICES="${EXPECTED_DECLINED_SLICES:-4}"
 
-OUT="$(mktemp -t basin-pgdump-out)"
+OUT="$(mktemp "${TMPDIR:-/tmp}/basin-pgdump-out.XXXXXX")"
 trap 'rm -f "${OUT}"' EXIT
 
 echo "[check-pg-dump-harness] running harness (no --ignored: nothing in it is #[ignore]d)"
