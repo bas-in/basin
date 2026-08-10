@@ -299,7 +299,25 @@ code{font-family:var(--font-mono);font-size:max(12px,.9em);overflow-wrap:anywher
 
 /* ── Content ──────────────────────────────────────────────────────── */
 .main{margin-left:var(--rail);min-width:0}
-.wrap{max-width:920px;margin:0 auto;padding:0 clamp(20px,4.2vw,64px) 96px;min-width:0}
+/* While the rail is fixed the column must not sit against it. Without this the
+   worst case is just above the 1080 breakpoint, where the wrap fills the space
+   and the only thing separating a dense sidebar from body text is the wrap's
+   own padding — 46px at 1100. */
+@media(min-width:1081px){.main{padding-left:clamp(12px,2.4vw,44px)}}
+
+/* One column, one edge. The measure used to live on the paragraph — 70ch
+   inside a 920px box — while tables, code blocks, stat strips and the section
+   rules ran the full 792px content width. The right edge of the content
+   therefore moved depending on which kind of element you were looking at, and
+   every paragraph left ~90px of dead space beside it. A measure cap is right;
+   applying it to some children of a wider container is what makes the column
+   look broken. Put the measure on the container and let everything share it. */
+.wrap{
+  --pad:clamp(20px,4.2vw,64px);
+  --measure:76ch;
+  max-width:calc(var(--measure) + 2*var(--pad));
+  margin:0 auto;padding:0 var(--pad) 96px;min-width:0;
+}
 
 .masthead{padding:clamp(48px,7vw,84px) 0 clamp(28px,3.5vw,40px);border-bottom:1px solid var(--line)}
 .eyebrow{
@@ -308,8 +326,10 @@ code{font-family:var(--font-mono);font-size:max(12px,.9em);overflow-wrap:anywher
   letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;color:var(--accent);
 }
 .eyebrow::before{content:"";width:18px;height:1px;background:currentColor;display:inline-block;flex:0 0 auto}
-.masthead h1{font-size:clamp(34px,5.2vw,56px);margin:16px 0 18px}
-.masthead .lede{color:var(--fg-2);font-size:1.0625rem;line-height:1.7;max-width:62ch}
+/* Sized to the column, not to the viewport: at 56px the title needed 786px and
+   the measure is 766, so it broke with "production" alone on the second line. */
+.masthead h1{font-size:clamp(32px,4.6vw,52px);margin:16px 0 18px}
+.masthead .lede{color:var(--fg-2);font-size:1.0625rem;line-height:1.7}
 .masthead .lede strong{color:var(--fg)}
 
 .quickbar{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
@@ -329,7 +349,7 @@ section.doc h3{
   font-weight:var(--weight-bold);
 }
 section.doc h3:first-of-type{margin-top:26px}
-section.doc p{color:var(--fg-2);font-size:1rem;line-height:1.75;max-width:70ch;margin-bottom:16px}
+section.doc p{color:var(--fg-2);font-size:1rem;line-height:1.75;margin-bottom:16px}
 section.doc p:last-child{margin-bottom:0}
 section.doc p code,section.doc li code,td code,th code{
   background:var(--bg-inset);border:1px solid var(--line);border-radius:var(--radius-2);
@@ -352,7 +372,7 @@ section.doc a.link{color:var(--accent);text-decoration:underline;text-underline-
 section.doc a.link:hover{text-decoration-color:currentColor}
 section.doc strong{color:var(--fg);font-weight:var(--weight-semibold)}
 
-ul.bullets{list-style:none;margin:0 0 18px;max-width:70ch}
+ul.bullets{list-style:none;margin:0 0 18px}
 ul.bullets li{position:relative;padding-left:20px;margin-bottom:9px;color:var(--fg-2);line-height:1.7;font-size:.9688rem}
 ul.bullets li::before{content:"";position:absolute;left:2px;top:.68em;width:7px;height:1px;background:var(--accent)}
 ul.bullets li:last-child{margin-bottom:0}
@@ -417,7 +437,7 @@ td:first-child{color:var(--fg)}
 
 /* ── Callouts ─────────────────────────────────────────────────────── */
 .note{
-  position:relative;padding:15px 18px 15px 19px;margin:0 0 20px;max-width:74ch;
+  position:relative;padding:15px 18px 15px 19px;margin:0 0 20px;
   border-left:2px solid var(--accent);background:var(--accent-soft);
   border-radius:0 var(--radius-3) var(--radius-3) 0;
   font-size:.9062rem;line-height:1.7;color:var(--fg-2);
@@ -483,7 +503,10 @@ dl.defs dd{margin:0;font-size:.9062rem;color:var(--fg-2);line-height:1.65;min-wi
   .rail.open{transform:none;visibility:visible}
   .rail-toggle{display:inline-flex}
   .masthead{padding-top:84px}
-  .wrap{max-width:760px}
+  /* No width step here. The wrap is already sized from the measure, so it is
+     continuous across this breakpoint; the old max-width:760px cut it from 920
+     the instant the rail left the flow and the content snapped 152px narrower
+     exactly where it had just gained 288px of room. */
 }
 @media(max-width:520px){
   body{font-size:15px}
