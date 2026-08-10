@@ -108,7 +108,7 @@ directly) is used when no keychain is detected.
   "default_org": "<org_id>",
   "orgs": {
     "<org_id>": {
-      "url": "https://api.basin.cloud",
+      "url": "https://api.basin.run",
       "email": "operator@example.com",
       "token_expires_at": "<RFC3339>",
       "keychain_key": "basin:<org_id>"   // absent if file-only fallback
