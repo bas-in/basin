@@ -188,3 +188,48 @@ async fn equality_filter_unaffected() {
     assert_eq!(got.len(), 2, "expected 2 paid rows, got {got:?}");
     assert!(got.iter().all(|s| s.as_deref() == Some("paid")));
 }
+
+/// The same ordering guarantee over the EXTENDED (prepared) protocol.
+///
+/// `SELECT status FROM t ORDER BY status` carries no rewrite-pipeline marker
+/// token, so the prepared path judged it "pipeline is a no-op" and dispatched
+/// the parsed AST directly — bypassing the enum ordinal rewrite that the
+/// simple-protocol path applies. Without that accounted for, the three tests
+/// above pass while `prepare` + `bind` + `execute_bound` still sorts
+/// alphabetically: the fix would hold on one protocol and silently not on the
+/// other.
+#[tokio::test]
+async fn order_by_enum_declaration_order_over_prepared_statement() {
+    let dir = TempDir::new().unwrap();
+    let eng = engine_in(&dir);
+    let sess = eng.open_session(ProjectId::new()).await.unwrap();
+
+    sess.execute("CREATE TYPE status AS ENUM ('pending', 'paid', 'shipped', 'cancelled')")
+        .await
+        .unwrap();
+    sess.execute("CREATE TABLE t (id BIGINT NOT NULL, status status NOT NULL)")
+        .await
+        .unwrap();
+    sess.execute(
+        "INSERT INTO t VALUES (3, 'shipped'), (1, 'pending'), (4, 'cancelled'), (2, 'paid')",
+    )
+    .await
+    .unwrap();
+
+    let (handle, _schema) = sess
+        .prepare("SELECT status FROM t ORDER BY status")
+        .await
+        .unwrap();
+    let bound = sess.bind(&handle, Vec::new()).await.unwrap();
+    let res = sess.execute_bound(bound).await.unwrap();
+
+    let got = collect_status_column(res);
+    let expected: Vec<Option<String>> = ["pending", "paid", "shipped", "cancelled"]
+        .iter()
+        .map(|s| Some(s.to_string()))
+        .collect();
+    assert_eq!(
+        got, expected,
+        "prepared ORDER BY enum must follow declaration order, not alphabetical"
+    );
+}

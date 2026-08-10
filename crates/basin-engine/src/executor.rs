@@ -1102,10 +1102,21 @@ async fn run_full_rewrite_pipeline(sess: &ProjectSession, sql: &str) -> Result<S
 /// rewrite (json operators, casts, lateral, …) correctly falls back to text.
 /// Errors conservatively report "not a no-op" (→ fall back).
 pub(crate) async fn rewrite_pipeline_is_noop(sess: &ProjectSession, sql: &str) -> bool {
-    if !needs_rewrite_pipeline(sql) {
+    if !needs_rewrite_pipeline(sql) && !needs_enum_ordering_rewrite(sql) {
         // No marker token at all — the pipeline is definitionally a no-op.
         return true;
     }
+    // The enum screen has to be consulted here too, not just in `execute`.
+    // A template like `SELECT status FROM t ORDER BY status` carries no
+    // pipeline marker, so this used to answer "no-op" and hand the prepared
+    // statement to the AST fast path — which dispatches the parsed AST and
+    // never runs the enum ordinal rewrite. The enum ordering fix would then
+    // hold on the simple protocol and silently not hold on the extended
+    // (prepared) one. Falling through runs the real pipeline — which ends in
+    // `rewrite_enum_ordering` — and compares, so an enum-ordering template is
+    // correctly reported as "not a no-op" and keeps the text route, while a
+    // query the enum pass leaves alone still compares equal and stays
+    // fast-path eligible. This runs once at prepare time, not per bind.
     match run_full_rewrite_pipeline(sess, sql).await {
         Ok(rewritten) => rewritten == sql,
         Err(_) => false,
