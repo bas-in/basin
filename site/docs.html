@@ -279,7 +279,20 @@ code{font-family:var(--font-mono);font-size:max(12px,.9em);overflow-wrap:anywher
   background:var(--bg-panel);color:var(--fg);cursor:pointer;
   font-family:var(--font-mono);font-size:.6875rem;letter-spacing:var(--tracking-mono-wide);
   text-transform:uppercase;box-shadow:var(--shadow);
+  transition:transform var(--dur-base) var(--ease-out),opacity var(--dur-base) var(--ease-out);
 }
+/* The pill is the only chrome that floats over the prose on a phone, and an
+   opaque background does not make it stop covering a line of body text. So it
+   tucks off the top edge the moment the reader scrolls down, and comes back on
+   the first upward scroll. Reading forward — the whole of a 33-section
+   document — nothing is ever underneath it.
+
+   Above the tuck threshold it stays put: .masthead reserves 72–84px of top
+   padding there, which clears the pill's 46–54px bottom edge outright, so the
+   one place it is unconditionally visible is the one place it covers nothing. */
+.rail-toggle.tucked{transform:translateY(calc(-100% - 22px));opacity:0}
+/* Never strand keyboard focus on an off-screen control. */
+.rail-toggle.tucked:focus-visible{transform:none;opacity:1}
 .rail-toggle svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round}
 .scrim{display:none;position:fixed;inset:0;z-index:55;background:rgb(0 0 0/.5);backdrop-filter:blur(2px)}
 .scrim.on{display:block}
@@ -2113,12 +2126,77 @@ bash verify.sh --tag v0.1.9 --attest basin-0.1.9-x86_64-unknown-linux-gnu.tar.gz
     rail.classList.remove('open');
     scrim.classList.remove('on');
     toggle.setAttribute('aria-expanded', 'false');
+    // Escape and the scrim close the drawer without scrolling, so the idle
+    // timer has to be re-armed here or the pill would sit on the prose forever.
+    armIdleTuck();
   }
   function openRail(){
     rail.classList.add('open');
     scrim.classList.add('on');
     toggle.setAttribute('aria-expanded', 'true');
+    toggle.classList.remove('tucked');
   }
+
+  /* The pill tucks off the top edge while the reader moves down the page and
+     returns on the first upward scroll, so no line of body copy is ever sitting
+     under it at rest. TUCK_FLOOR is not cosmetic: above it the masthead's own
+     top padding (72px narrow / 84px wide) still clears the pill's bottom edge
+     (46px / 54px), so the pill can be pinned there without covering the
+     eyebrow. Below it, it goes away. Driven from sync() so it shares the one
+     rAF-throttled scroll handler. */
+  var TUCK_FLOOR = 24;
+  var TUCK_IDLE_MS = 2600;
+  var tuckLastY = window.scrollY;
+  var tuckIdle = null;
+
+  /* Scroll-up alone is not enough. Flick up, stop, and the pill would be
+     sitting on a line of body copy for as long as you read — which is the
+     original complaint, just entered from the other direction. So a reveal
+     away from the top is transient: it survives the gesture and a beat after
+     it, then goes. Held open while the pointer is on it or it has focus, so a
+     reader reaching for it is never chased. */
+  /* Only KEYBOARD focus holds the pill open. A tap also focuses the button, and
+     treating that as "the reader is reaching for it" pinned the pill over the
+     prose for good once the drawer was dismissed with Escape. */
+  function kbFocused(){
+    try { return toggle.matches(':focus-visible'); }
+    catch (e) { return document.activeElement === toggle; }
+  }
+
+  function idleTuck(){
+    tuckIdle = null;
+    if (rail.classList.contains('open') || window.scrollY <= TUCK_FLOOR) return;
+    if (kbFocused() || toggle.matches(':hover')) {
+      tuckIdle = setTimeout(idleTuck, TUCK_IDLE_MS);
+      return;
+    }
+    toggle.classList.add('tucked');
+  }
+
+  function armIdleTuck(){
+    clearTimeout(tuckIdle); tuckIdle = null;
+    if (window.scrollY > TUCK_FLOOR && !toggle.classList.contains('tucked')) {
+      tuckIdle = setTimeout(idleTuck, TUCK_IDLE_MS);
+    }
+  }
+
+  function syncTuck(y){
+    clearTimeout(tuckIdle); tuckIdle = null;
+    if (rail.classList.contains('open')) { tuckLastY = y; return; }
+    if (y <= TUCK_FLOOR)        toggle.classList.remove('tucked');
+    else if (y > tuckLastY + 4) toggle.classList.add('tucked');
+    else if (y < tuckLastY - 4) toggle.classList.remove('tucked');
+    tuckLastY = y;
+    armIdleTuck();
+  }
+
+  // Keyboard focus un-tucks: never leave the keyboard on an off-screen control.
+  toggle.addEventListener('focus', function(){
+    if (!kbFocused()) { armIdleTuck(); return; }
+    toggle.classList.remove('tucked');
+    clearTimeout(tuckIdle); tuckIdle = null;
+  });
+  toggle.addEventListener('blur', armIdleTuck);
   toggle.addEventListener('click', function(){
     rail.classList.contains('open') ? closeRail() : openRail();
   });
@@ -2180,6 +2258,7 @@ bash verify.sh --tag v0.1.9 --attest basin-0.1.9-x86_64-unknown-linux-gnu.tar.gz
 
   function sync(){
     ticking = false;
+    syncTuck(window.scrollY);
 
     var doc = document.documentElement;
     var max = doc.scrollHeight - doc.clientHeight;
