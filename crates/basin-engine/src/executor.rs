@@ -17066,7 +17066,9 @@ mod rewrite_pipeline_prescreen_tests {
     fn enum_ordering_screen_skips_equality_point_query() {
         // Equality needs no ordinal compare, so the screen leaves the
         // point-query fast path alone.
-        assert!(!needs_enum_ordering_rewrite("SELECT id FROM t WHERE id = 5"));
+        assert!(!needs_enum_ordering_rewrite(
+            "SELECT id FROM t WHERE id = 5"
+        ));
         assert!(!needs_enum_ordering_rewrite("SELECT 1"));
     }
 
