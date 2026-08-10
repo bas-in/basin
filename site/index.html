@@ -328,11 +328,19 @@ code{font-family:var(--font-mono);font-size:max(12px,.92em)}
 .code-side p{color:rgb(var(--paper-rgb)/.6);font-size:.9375rem;line-height:var(--lh-loose);margin-bottom:var(--space-5)}
 .code-side{min-width:0}
 .code-side ul{display:flex;flex-direction:column;gap:var(--space-3)}
-.code-side li{overflow-wrap:anywhere;min-width:0}
+/* The tick hangs in the margin rather than sitting in a flex row with the
+   text. As a flex item it was one of several: every inline <code> in the item
+   became a sibling flex item too and collected the 12px gap on both sides, so
+   "same EXPLAIN, same pg_stat_statements" rendered as "same EXPLAIN , same". */
 .code-side li{
-  display:flex;gap:var(--space-3);font-size:.875rem;color:rgb(var(--paper-rgb)/.72);line-height:1.6;
+  position:relative;padding-left:calc(1ch + var(--space-3));
+  overflow-wrap:anywhere;min-width:0;
+  font-size:.875rem;color:rgb(var(--paper-rgb)/.72);line-height:1.6;
 }
-.code-side li::before{content:"✓";color:var(--moss);font-family:var(--font-mono);flex-shrink:0}
+.code-side li::before{
+  content:"✓";position:absolute;left:0;top:0;
+  color:var(--moss);font-family:var(--font-mono);
+}
 .code-side li code{color:var(--sediment-ochre-2)}
 .codeblock{border:var(--hairline);border-radius:var(--radius-3);overflow:hidden;background:var(--ink-2)}
 .codeblock-head{
