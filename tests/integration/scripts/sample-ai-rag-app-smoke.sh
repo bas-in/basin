@@ -85,7 +85,15 @@ fi
 # Ends in `|| true` and is then tested for emptiness: under `set -e` +
 # `pipefail` a grep that matches nothing would kill the script here, before the
 # guard that is supposed to report it.
-SUMMARY="$(grep -E '(^|[[:space:]])Tests:?[[:space:]]' "${TEST_LOG}" | tail -1 || true)"
+#
+# De-coloured first. Both runners emit ANSI by default, and vitest's summary
+# ends `(14)<ESC>[39m` — the reset sequence's own digits defeat the `[^0-9]*$`
+# anchor in the vitest branch below, so a suite that passed 14/14 was reported
+# as "could not parse a test total". Stripping the escapes here rather than
+# widening the pattern keeps the parse working against what the runner means,
+# not against whatever its colour scheme happens to append.
+SUMMARY="$(sed $'s/\033\\[[0-9;]*[A-Za-z]//g' "${TEST_LOG}" \
+             | grep -E '(^|[[:space:]])Tests:?[[:space:]]' | tail -1 || true)"
 if [[ -z "${SUMMARY}" ]]; then
   fail "npm test produced no test-count summary line ('Tests: ...' / 'Tests ...').
   Nothing can be concluded from this run, so it does not pass. Usually a suite
