@@ -517,14 +517,34 @@ async fn flush_watermark_purges_log_and_bounds_it() {
         "watermark purge must shrink the raft log ({bytes_before} -> {bytes_after})",
     );
 
-    // A second, non-advancing watermark is a no-op (idempotent).
+    // A second, non-advancing watermark is a no-op — asserted as the property,
+    // not as the return value.
+    //
+    // `record_flush_watermark` returns the purge FLOOR, and it derives that
+    // floor from `raft.metrics().last_applied` — the applied log index, not the
+    // durable LSN it was handed. So a second call with an unchanged watermark
+    // returns `Some` whenever raft applied anything between the two calls: it
+    // does on a loaded machine and does not on a quiet one. The old
+    // `purged2.is_none()` therefore passed 5/5 in isolation and failed inside a
+    // loaded `--workspace` run, which is the condition CI actually runs under.
+    //
+    // What idempotency promises is that re-recording a watermark neither moves
+    // the durability guarantee nor walks the purge floor backwards. Both hold
+    // whatever raft did in between.
     let purged2 = wal
         .record_flush_watermark(&project, &part, Lsn(150), "cat-1")
         .await
         .unwrap();
-    assert!(
-        purged2.is_none(),
-        "non-advancing watermark does not re-purge"
+    if let (Some(first), Some(second)) = (purged, purged2) {
+        assert!(
+            second >= first,
+            "purge floor must never walk backwards ({first} -> {second})",
+        );
+    }
+    assert_eq!(
+        wal.durable_watermark(&project, &part).await,
+        Lsn(150),
+        "re-recording a non-advancing watermark must not move the guarantee",
     );
 
     wal.close().await.unwrap();
