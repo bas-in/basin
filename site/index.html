@@ -139,7 +139,8 @@ code{font-family:var(--font-mono);font-size:.92em}
 }
 .nav{display:flex;align-items:center;gap:var(--space-6);height:64px}
 .brand{display:flex;align-items:center;gap:10px;font-family:var(--font-display);font-weight:var(--weight-black);font-size:1.125rem;letter-spacing:var(--tracking-tighter)}
-.brand svg{width:26px;height:26px}
+.brand svg{width:30px;height:30px;border-radius:7px}
+.mark-sprite{position:absolute;width:0;height:0;overflow:hidden}
 .nav-spacer{flex:1}
 .nav-links{display:flex;align-items:center;gap:var(--space-6)}
 .nav-links a{
@@ -186,7 +187,8 @@ code{font-family:var(--font-mono);font-size:.92em}
   gap:clamp(28px,3.5vw,56px);align-items:start;
 }
 .hero-copy{min-width:0;max-width:620px}
-.hero-eyebrow{margin-top:var(--space-2);margin-bottom:var(--space-3)}
+.hero-eyebrow{margin-top:var(--space-2);margin-bottom:var(--space-5);display:flex;align-items:center;gap:var(--space-4);flex-wrap:wrap}
+.hero-mark{width:48px;height:48px;border-radius:11px;flex:0 0 auto}
 .hero-title{
   font-size:clamp(36px,5.6vw,76px);line-height:.98;
   letter-spacing:var(--tracking-tighter);font-weight:var(--weight-black);
@@ -286,6 +288,7 @@ code{font-family:var(--font-mono);font-size:.92em}
 
 /* ── Feature grid ─────────────────────────────────────────────────── */
 .grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--space-6)}
+.arch-cards{margin-top:clamp(48px,5vw,var(--space-12))}
 @media(max-width:900px){.grid-3{grid-template-columns:1fr}}
 .card{
   position:relative;padding:var(--space-7);border:var(--hairline);
@@ -408,12 +411,262 @@ code{font-family:var(--font-mono);font-size:.92em}
 .qs-code .l{white-space:pre;display:block}
 .qs-code .t-com{color:rgb(var(--paper-rgb)/.34)}
 
-/* ── Final CTA ────────────────────────────────────────────────────── */
-.cta{position:relative;overflow:hidden;background:var(--ink-2);text-align:center}
-.cta .container{position:relative;z-index:1}
-.cta h2{font-size:clamp(30px,4.4vw,56px);margin-bottom:var(--space-5)}
-.cta p{color:rgb(var(--paper-rgb)/.64);font-size:1.0625rem;line-height:var(--lh-loose);max-width:60ch;margin:0 auto var(--space-8)}
-.cta-actions{display:flex;flex-wrap:wrap;gap:var(--space-3);justify-content:center}
+/* ─────────────────────────────────────────────────────────────────────
+   FIGURES
+
+   Every diagram below is built from real DOM text, not SVG <text>. SVG
+   type does not scale with the reader's font size and shrinks with the
+   viewBox, so a 900-unit-wide drawing renders 6px labels on a 320px
+   phone. Only the pure geometry — the bowl, the dot fields, the plate
+   ticks — is vector; every word is HTML.
+   ───────────────────────────────────────────────────────────────────── */
+
+/* A survey plate: hairline box with corner ticks, the page's signature frame. */
+.plate{position:relative;border:var(--hairline-paper);background:rgb(var(--paper-rgb)/.018)}
+.plate::before,.plate::after,
+.plate>.plate-tick-bl,.plate>.plate-tick-br{
+  content:"";position:absolute;width:10px;height:10px;
+  border:1px solid var(--basin-teal);opacity:.7;pointer-events:none;
+}
+.plate::before{top:-1px;left:-1px;border-right:0;border-bottom:0}
+.plate::after{top:-1px;right:-1px;border-left:0;border-bottom:0}
+.plate>.plate-tick-bl{bottom:-1px;left:-1px;border-right:0;border-top:0}
+.plate>.plate-tick-br{bottom:-1px;right:-1px;border-left:0;border-top:0}
+
+.fig-cap{
+  margin-top:var(--space-4);font-family:var(--font-mono);font-size:.6875rem;
+  letter-spacing:var(--tracking-mono-wide);color:rgb(var(--paper-rgb)/.42);
+  line-height:var(--lh-loose);
+}
+.fig-cap strong{color:rgb(var(--paper-rgb)/.72);font-weight:var(--weight-medium)}
+
+/* ── Figure: the four-layer stack ─────────────────────────────────── */
+.stack{display:grid;gap:0;margin-top:var(--space-9)}
+.stack-node{
+  display:grid;grid-template-columns:52px minmax(0,1fr) auto;
+  gap:var(--space-4);align-items:start;
+  padding:var(--space-5) var(--space-5) var(--space-5) 0;
+}
+.stack-node.plate{padding-left:var(--space-5)}
+.stack-rank{
+  font-family:var(--font-mono);font-size:.6875rem;letter-spacing:var(--tracking-mono-wide);
+  color:var(--basin-teal-3);padding-top:3px;
+}
+.stack-main{min-width:0}
+.stack-main h3{
+  font-size:1.0625rem;font-weight:var(--weight-bold);letter-spacing:var(--tracking-tight);
+  display:flex;flex-wrap:wrap;align-items:baseline;gap:var(--space-3);
+}
+.stack-main h3 em{
+  font-style:normal;font-family:var(--font-mono);font-size:.625rem;
+  letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;
+  color:rgb(var(--paper-rgb)/.44);
+}
+.stack-main p{margin-top:var(--space-3);font-size:.9375rem;line-height:var(--lh-loose);color:rgb(var(--paper-rgb)/.6)}
+.stack-crate{
+  font-family:var(--font-mono);font-size:.6875rem;color:var(--basin-teal-3);
+  border:1px solid rgb(var(--basin-teal-rgb)/.4);border-radius:var(--radius-1);
+  padding:3px 8px;white-space:nowrap;
+}
+.stack-client{
+  display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-3);
+  font-family:var(--font-mono);font-size:.75rem;color:rgb(var(--paper-rgb)/.56);
+  padding-left:calc(52px + var(--space-4) + var(--space-5));
+}
+.stack-client b{color:var(--paper);font-weight:var(--weight-semibold)}
+.stack-link{
+  display:flex;align-items:center;gap:var(--space-3);
+  padding-left:calc(52px + var(--space-4) + var(--space-5));
+  font-family:var(--font-mono);font-size:.6875rem;color:rgb(var(--paper-rgb)/.36);
+}
+.stack-link::before{
+  content:"";width:1px;height:26px;flex:0 0 auto;
+  background:linear-gradient(to bottom,rgb(var(--basin-teal-rgb)/.7),rgb(var(--basin-teal-rgb)/.15));
+}
+@media(max-width:720px){
+  .stack-node{grid-template-columns:minmax(0,1fr);gap:var(--space-3)}
+  .stack-crate{justify-self:start}
+  .stack-client,.stack-link{padding-left:var(--space-5)}
+}
+
+/* ── Figure: the basin cross-section + prefix tree ────────────────── */
+.bowl-fig{
+  display:grid;grid-template-columns:minmax(0,0.95fr) minmax(0,1.05fr);
+  gap:clamp(24px,3.5vw,var(--space-10));align-items:center;margin-top:var(--space-9);
+}
+.bowl-art{min-width:0}
+.bowl-art svg{width:100%;height:auto}
+.bowl-side{min-width:0}
+.strata-key{display:grid;gap:var(--space-4);margin-bottom:var(--space-6)}
+.strata-key li{display:grid;grid-template-columns:auto minmax(0,1fr);gap:var(--space-4);align-items:start}
+.strata-swatch{width:22px;height:5px;border-radius:3px;margin-top:8px}
+.strata-key b{display:block;font-family:var(--font-mono);font-size:.8125rem;color:var(--paper);font-weight:var(--weight-medium);word-break:break-word}
+.strata-key span{display:block;font-size:.875rem;color:rgb(var(--paper-rgb)/.56);line-height:var(--lh-loose);margin-top:2px}
+.prefix-tree{
+  border:var(--hairline-paper);border-left:2px solid var(--basin-teal);
+  background:rgb(var(--ink-rgb)/.55);padding:var(--space-4) var(--space-5);
+  font-family:var(--font-mono);font-size:.75rem;line-height:1.85;
+  color:rgb(var(--paper-rgb)/.8);overflow-x:auto;
+}
+.prefix-tree .l{white-space:pre;display:block}
+.prefix-tree .t-com{color:rgb(var(--paper-rgb)/.34)}
+.prefix-tree .t-key{color:var(--basin-teal-3)}
+.prefix-tree .t-deny{color:var(--sediment-ochre-2)}
+@media(max-width:860px){.bowl-fig{grid-template-columns:minmax(0,1fr)}}
+
+/* ── Figure: connection flood ─────────────────────────────────────── */
+.flood{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--space-6);margin-top:var(--space-8)}
+.flood-panel{padding:var(--space-5);min-width:0}
+.flood-panel h3{
+  font-size:.9375rem;font-weight:var(--weight-bold);display:flex;
+  align-items:baseline;gap:var(--space-3);flex-wrap:wrap;
+}
+.flood-panel h3 em{
+  font-style:normal;font-family:var(--font-mono);font-size:.625rem;
+  letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;color:rgb(var(--paper-rgb)/.42);
+}
+.flood-grid{margin:var(--space-5) 0 var(--space-4);width:100%;height:auto}
+.flood-tally{display:flex;flex-wrap:wrap;gap:var(--space-2) var(--space-5);font-family:var(--font-mono);font-size:.75rem}
+.flood-held{color:#00A8B0}
+.flood-refused{color:rgb(var(--paper-rgb)/.42)}
+.flood-legend{
+  margin-top:var(--space-5);display:flex;flex-wrap:wrap;gap:var(--space-3) var(--space-6);
+  font-family:var(--font-mono);font-size:.6875rem;color:rgb(var(--paper-rgb)/.46);
+}
+.flood-legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:-1px}
+.flood-legend i.is-held{background:#00A8B0}
+.flood-legend i.is-refused{border:1.4px dashed var(--graphite-3)}
+@media(max-width:720px){.flood{grid-template-columns:minmax(0,1fr)}}
+
+/* ── Stat tiles ───────────────────────────────────────────────────── */
+.tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--space-6);margin-top:var(--space-8)}
+.tile{padding:var(--space-6);min-width:0}
+.tile dt{font-family:var(--font-mono);font-size:.625rem;letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;color:rgb(var(--paper-rgb)/.42)}
+.tile dd{
+  margin:var(--space-3) 0 0;font-family:var(--font-display);font-weight:var(--weight-black);
+  font-size:clamp(30px,3.4vw,42px);letter-spacing:var(--tracking-tighter);line-height:1;color:var(--paper);
+}
+.tile dd em{font-style:normal;font-size:.5em;color:var(--basin-teal-3);margin-left:.15em}
+.tile dd.tile-note{margin:var(--space-4) 0 0;font-family:var(--font-body);font-weight:var(--weight-regular);font-size:.875rem;letter-spacing:0;line-height:var(--lh-loose);color:rgb(var(--paper-rgb)/.56)}
+@media(max-width:860px){.tiles{grid-template-columns:minmax(0,1fr)}}
+
+/* ── Figure: diverging speedup bars ───────────────────────────────── */
+/* Diverging encoding: two poles + a neutral parity line at the middle.
+   Colours validated against this surface (#16191F) for lightness band,
+   chroma floor, CVD separation and 3:1 contrast — teal #00A8B0 /
+   ochre #C4732B. Identity is never colour alone: every bar carries its
+   ratio as text and sits on its own labelled row. */
+.bars-title{
+  font-family:var(--font-mono);font-size:.6875rem;font-weight:var(--weight-medium);
+  letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;
+  color:rgb(var(--paper-rgb)/.5);margin-bottom:var(--space-6);
+}
+.bars{margin-top:var(--space-7);display:grid;gap:5px}
+.bars-axis{
+  position:relative;height:22px;
+  display:grid;grid-template-columns:minmax(0,230px) minmax(0,1fr) 4.25rem;
+  gap:var(--space-4);align-items:end;
+}
+.bars-axis-scale{position:relative;height:100%;min-width:0}
+.bars-axis-scale span{
+  position:absolute;bottom:0;transform:translateX(-50%);
+  font-family:var(--font-mono);font-size:.625rem;color:rgb(var(--paper-rgb)/.38);white-space:nowrap;
+}
+.bar-row{
+  display:grid;grid-template-columns:minmax(0,230px) minmax(0,1fr) 4.25rem;
+  gap:var(--space-4);align-items:center;
+}
+.bar-label{
+  min-width:0;font-size:.8125rem;line-height:1.35;color:rgb(var(--paper-rgb)/.72);
+  overflow-wrap:anywhere;
+}
+.bar-track{position:relative;height:22px;min-width:0}
+.bar-track::before{
+  content:"";position:absolute;left:50%;top:0;bottom:0;width:1px;
+  background:rgb(var(--paper-rgb)/.26);
+}
+.bar-fill{position:absolute;top:4px;bottom:4px;width:var(--w);display:block}
+.bar-win .bar-fill{left:50%;background:#00A8B0;border-radius:0 4px 4px 0}
+.bar-loss .bar-fill{right:50%;background:#C4732B;border-radius:4px 0 0 4px}
+.bar-value{
+  font-size:.8125rem;text-align:right;white-space:nowrap;
+  color:rgb(var(--paper-rgb)/.86);font-variant-numeric:tabular-nums;
+}
+.bars-legend{
+  margin-top:var(--space-6);display:flex;flex-wrap:wrap;gap:var(--space-3) var(--space-7);
+  font-size:.8125rem;color:rgb(var(--paper-rgb)/.56);
+}
+.bars-legend i{display:inline-block;width:14px;height:8px;border-radius:2px;margin-right:8px;vertical-align:1px}
+.bars-legend i.is-win{background:#00A8B0}
+.bars-legend i.is-loss{background:#C4732B}
+@media(max-width:760px){
+  .bars-axis{grid-template-columns:minmax(0,1fr) 4.25rem}
+  .bars-axis .bars-axis-spacer{display:none}
+  .bar-row{
+    grid-template-columns:minmax(0,1fr) 4.25rem;
+    grid-template-areas:"label value" "track track";
+    gap:var(--space-2) var(--space-4);padding-block:var(--space-2);
+  }
+  .bar-label{grid-area:label}
+  .bar-value{grid-area:value}
+  .bar-track{grid-area:track}
+}
+
+/* ── Final CTA — the status plate ─────────────────────────────────── */
+.cta{position:relative;overflow:hidden;background:var(--ink-2)}
+.cta .container,.cta .container-wide{position:relative;z-index:1}
+.status-plate{padding:clamp(28px,4vw,var(--space-10))}
+.status-top{
+  display:grid;grid-template-columns:minmax(0,1fr) auto;
+  gap:clamp(24px,4vw,var(--space-10));align-items:center;
+}
+.status-head h2{font-size:clamp(28px,4vw,50px);margin:var(--space-4) 0 var(--space-5)}
+.status-head p{color:rgb(var(--paper-rgb)/.66);font-size:1.0625rem;line-height:var(--lh-loose);max-width:56ch}
+.status-stamp{
+  flex:0 0 auto;transform:rotate(-6deg);
+  border:2px solid rgb(var(--sediment-ochre-rgb)/.85);
+  box-shadow:0 0 0 5px rgb(var(--ink-rgb)/0),0 0 0 6px rgb(var(--sediment-ochre-rgb)/.35);
+  padding:var(--space-4) var(--space-6);text-align:center;
+  color:var(--sediment-ochre-2);background:rgb(var(--sediment-ochre-rgb)/.08);
+}
+.status-stamp b{
+  display:block;font-family:var(--font-display);font-weight:var(--weight-black);
+  font-size:clamp(20px,2.4vw,28px);letter-spacing:.06em;line-height:1;
+}
+.status-stamp span{
+  display:block;margin-top:8px;font-family:var(--font-mono);font-size:.625rem;
+  letter-spacing:var(--tracking-mono-wider);text-transform:uppercase;
+  color:rgb(var(--sediment-ochre-rgb)/.9);
+}
+.status-ledger{
+  margin-top:clamp(28px,3.5vw,var(--space-10));padding-top:var(--space-8);
+  border-top:var(--hairline-paper);
+  display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--space-8);
+}
+.status-col h3{
+  font-family:var(--font-mono);font-size:.625rem;letter-spacing:var(--tracking-mono-wider);
+  text-transform:uppercase;font-weight:var(--weight-medium);margin-bottom:var(--space-4);
+}
+.status-col-ship h3{color:#00A8B0}
+.status-col-open h3{color:var(--sediment-ochre-2)}
+.status-col-never h3{color:rgb(var(--paper-rgb)/.44)}
+.status-col ul{display:grid;gap:var(--space-3)}
+.status-col li{
+  font-size:.875rem;line-height:var(--lh-base);color:rgb(var(--paper-rgb)/.66);
+  padding-left:var(--space-5);position:relative;overflow-wrap:anywhere;
+}
+.status-col li::before{position:absolute;left:0;top:0;font-family:var(--font-mono);font-size:.8125rem}
+.status-col-ship li::before{content:"✓";color:#00A8B0}
+.status-col-open li::before{content:"~";color:var(--sediment-ochre-2)}
+.status-col-never li::before{content:"×";color:rgb(var(--paper-rgb)/.4)}
+.cta-actions{
+  display:flex;flex-wrap:wrap;gap:var(--space-3);
+  margin-top:clamp(28px,3.5vw,var(--space-9));
+}
+@media(max-width:900px){
+  .status-top{grid-template-columns:minmax(0,1fr);justify-items:start}
+  .status-ledger{grid-template-columns:minmax(0,1fr)}
+}
 
 /* ── Footer ───────────────────────────────────────────────────────── */
 .site-footer{background:var(--ink);border-top:var(--hairline-paper);padding-block:var(--space-10) var(--space-9)}
@@ -458,16 +711,24 @@ code{font-family:var(--font-mono);font-size:.92em}
 </head>
 <body>
 
+<!-- The product mark, defined once. Geometry is copied verbatim from
+     brand/logo.svg — the source of truth — so the tile on this page, the
+     favicon and the README badge are the same drawing, not three
+     look-alikes that drift. -->
+<svg class="mark-sprite" width="0" height="0" aria-hidden="true" focusable="false">
+  <symbol id="basin-mark" viewBox="0 0 128 128">
+    <rect width="128" height="128" rx="28" fill="#0E2A2B"/>
+    <ellipse cx="64" cy="40" rx="37" ry="12" fill="none" stroke="#FAF7F0" stroke-width="7"/>
+    <path d="M27 40 L27 68 a37 24 0 0 0 74 0 L101 40" fill="none" stroke="#FAF7F0" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M34 57 a30 10 0 0 0 60 0" fill="none" stroke="#60999E" stroke-width="6" stroke-linecap="round"/>
+    <path d="M40 74 a24 8 0 0 0 48 0" fill="none" stroke="#DE7A63" stroke-width="6" stroke-linecap="round"/>
+  </symbol>
+</svg>
+
 <header class="site-header">
   <div class="container-wide nav">
     <a class="brand" href="./index.html">
-      <svg viewBox="0 0 680 680" aria-hidden="true">
-        <g transform="translate(340,340)" fill="none" stroke="#FAF7F0" stroke-width="52" stroke-linecap="round">
-          <ellipse cx="0" cy="-110" rx="200" ry="44"/>
-          <path d="M -200 -110 Q -200 160, 0 160 Q 200 160, 200 -110"/>
-          <circle cx="0" cy="40" r="34" fill="#3B6F73" stroke="none"/>
-        </g>
-      </svg>
+      <svg viewBox="0 0 128 128" aria-hidden="true"><use href="#basin-mark"/></svg>
       Basin
     </a>
     <div class="nav-spacer"></div>
@@ -514,7 +775,10 @@ code{font-family:var(--font-mono);font-size:.92em}
 
     <div class="hero-grid container-wide">
       <div class="hero-copy">
-        <div class="hero-eyebrow eyebrow"><span>Survey — object-storage stratum</span></div>
+        <div class="hero-eyebrow">
+          <svg class="hero-mark" viewBox="0 0 128 128" role="img" aria-label="Basin"><use href="#basin-mark"/></svg>
+          <span class="eyebrow"><span>Survey — object-storage stratum</span></span>
+        </div>
         <h1 id="hero-h1" class="display hero-title">
           <span class="hero-line-1">A database that lives</span>
           <span class="hero-line-2">on the bucket.</span>
@@ -636,7 +900,161 @@ code{font-family:var(--font-mono);font-size:.92em}
         </p>
       </div>
 
-      <div class="grid-3">
+      <!-- Figure 1 · the four layers, top to bottom on a write. -->
+      <div class="stack reveal">
+        <p class="stack-client">
+          <b>client</b> <span aria-hidden="true">·</span> psql <span aria-hidden="true">·</span> pgx
+          <span aria-hidden="true">·</span> asyncpg <span aria-hidden="true">·</span> Drizzle
+          <span aria-hidden="true">·</span> Prisma <span aria-hidden="true">·</span> sqlx
+          <span aria-hidden="true">·</span> Diesel <span aria-hidden="true">·</span> Django
+          <span aria-hidden="true">·</span> GORM
+        </p>
+        <p class="stack-link">pgwire v3 over TLS</p>
+
+        <div class="stack-node plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <span class="stack-rank mono">L1</span>
+          <div class="stack-main">
+            <h3>Routers <em>stateless</em></h3>
+            <p>
+              pgwire termination, then a parse through <code>libpg_query</code> — the actual
+              PostgreSQL parser, vendored. Typed-AST dispatch sends DDL/DML to a handler or
+              lowers to a DataFusion logical plan. RLS predicates are injected here, before
+              placement lookup decides transactional or analytical.
+            </p>
+          </div>
+          <span class="stack-crate">basin-router</span>
+        </div>
+        <p class="stack-link">gRPC, mTLS, per-project token</p>
+
+        <div class="stack-node plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <span class="stack-rank mono">L2</span>
+          <div class="stack-main">
+            <h3>Shard owners <em>stateful</em></h3>
+            <p>
+              One owner per <code>(project, partition)</code>, holding Arrow state lazily
+              loaded from WAL plus columnar files. Point lookups, range scans and
+              single-shard transactions land here; a background compactor folds them down
+              into the catalog.
+            </p>
+          </div>
+          <span class="stack-crate">basin-shard</span>
+        </div>
+        <p class="stack-link">append keyed by (project, partition)</p>
+
+        <div class="stack-node plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <span class="stack-rank mono">L3</span>
+          <div class="stack-main">
+            <h3>Regional WAL <em>the durability boundary</em></h3>
+            <p>
+              A Raft group commits to local NVMe on quorum and flushes to the bucket in
+              batches every ~200&nbsp;ms. That flush interval is the whole honesty story on
+              write benchmarks: the default acks before fsync, and
+              <code>SET basin.synchronous_commit = on</code> buys group-committed fsync
+              durability instead.
+            </p>
+          </div>
+          <span class="stack-crate">basin-wal</span>
+        </div>
+        <p class="stack-link">one prefix per project, no exceptions</p>
+
+        <div class="stack-node plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <span class="stack-rank mono">L4</span>
+          <div class="stack-main">
+            <h3>Object storage <em>+ Iceberg catalog</em></h3>
+            <p>
+              Vortex-compressed columnar files under <code>/projects/{id}/</code>, a
+              Lakekeeper-compatible Iceberg REST catalog over them, and the WAL segment
+              archive alongside. Analytical queries read this layer directly, without
+              waking a shard owner.
+            </p>
+          </div>
+          <span class="stack-crate">basin-storage</span>
+        </div>
+      </div>
+      <p class="fig-cap reveal">
+        Fig. 1 — <strong>write path, top to bottom.</strong> Reads short-circuit at whichever
+        layer already holds the answer.
+      </p>
+
+      <!-- Figure 2 · what a project prefix actually contains. -->
+      <div class="bowl-fig reveal">
+        <div class="bowl-art">
+          <!-- The mark, in section. Same bowl, cut open, so the strata that
+               are decoration on the tile become the storage layout here. -->
+          <svg viewBox="0 0 460 330" role="img" aria-labelledby="bowl-title bowl-desc">
+            <title id="bowl-title">A project prefix, in cross-section</title>
+            <desc id="bowl-desc">The Basin bowl cut open: four strata inside it, from
+              columnar data files at the top down through Iceberg metadata, archived WAL
+              segments, and snapshot and branch references at the floor.</desc>
+            <defs>
+              <clipPath id="bowl-clip">
+                <path d="M60 84 L60 176 a170 104 0 0 0 340 0 L400 84 Z"/>
+              </clipPath>
+            </defs>
+            <!-- contour ghosts behind the bowl -->
+            <g fill="none" stroke="#FAF7F0" stroke-opacity=".07" stroke-width="1">
+              <ellipse cx="230" cy="84" rx="205" ry="52"/>
+              <ellipse cx="230" cy="84" rx="188" ry="47"/>
+            </g>
+            <!-- strata, clipped to the inside of the bowl -->
+            <g clip-path="url(#bowl-clip)" fill="none" stroke-linecap="round">
+              <path d="M40 128 a190 62 0 0 0 380 0" stroke="#00A8B0" stroke-width="16" opacity=".92"/>
+              <path d="M40 172 a190 58 0 0 0 380 0" stroke="#4F858A" stroke-width="14" opacity=".9"/>
+              <path d="M40 214 a190 52 0 0 0 380 0" stroke="#C4732B" stroke-width="13" opacity=".9"/>
+              <path d="M40 252 a190 44 0 0 0 380 0" stroke="#8FB59B" stroke-width="11" opacity=".85"/>
+            </g>
+            <!-- rim + walls, straight from the mark -->
+            <ellipse cx="230" cy="84" rx="170" ry="52" fill="none" stroke="#FAF7F0" stroke-width="7" opacity=".92"/>
+            <path d="M60 84 L60 176 a170 104 0 0 0 340 0 L400 84" fill="none" stroke="#FAF7F0"
+                  stroke-width="7" stroke-linecap="round" stroke-linejoin="round" opacity=".92"/>
+            <!-- the boundary: nothing crosses out of the prefix -->
+            <g stroke="#DE7A63" stroke-width="2.5" stroke-linecap="round" opacity=".8">
+              <path d="M424 60 L448 84 M448 60 L424 84"/>
+            </g>
+            <path d="M400 72 L420 72" stroke="#DE7A63" stroke-width="2.5" stroke-linecap="round" opacity=".8"/>
+          </svg>
+        </div>
+        <div class="bowl-side">
+          <ul class="strata-key">
+            <li>
+              <span class="strata-swatch" style="background:#00A8B0" aria-hidden="true"></span>
+              <span><b>tables/{name}/data/…</b><span>Vortex columnar files, date-partitioned. Parquet is opt-in per table.</span></span>
+            </li>
+            <li>
+              <span class="strata-swatch" style="background:#4F858A" aria-hidden="true"></span>
+              <span><b>tables/{name}/metadata/</b><span>Iceberg metadata and manifests, served over a Lakekeeper-compatible REST catalog.</span></span>
+            </li>
+            <li>
+              <span class="strata-swatch" style="background:#C4732B" aria-hidden="true"></span>
+              <span><b>wal/{partition}/</b><span>Archived WAL segments, flushed from the Raft group in ~200&nbsp;ms batches.</span></span>
+            </li>
+            <li>
+              <span class="strata-swatch" style="background:#8FB59B" aria-hidden="true"></span>
+              <span><b>snapshots/ · branches/</b><span>Point-in-time references and copy-on-write branches — metadata only, no data copy.</span></span>
+            </li>
+          </ul>
+          <div class="prefix-tree">
+<span class="l"><span class="t-com"># the prefix is the unit of IAM, billing and branching</span></span>
+<span class="l"><span class="t-key">/projects/alice/</span>tables/events/data/2026/06/11/01J…parquet</span>
+<span class="l"><span class="t-key">/projects/bob/</span>  tables/events/data/2026/06/11/01J…parquet</span>
+<span class="l"> </span>
+<span class="l"><span class="t-com"># basin-storage refuses any key outside the caller's prefix</span></span>
+<span class="l"><span class="t-com"># at the API boundary — not at the call sites.</span></span>
+<span class="l">alice reads <span class="t-key">/projects/bob/…</span> <span class="t-deny">→ refused</span></span>
+          </div>
+        </div>
+      </div>
+      <p class="fig-cap reveal">
+        Fig. 2 — <strong>one project, one prefix.</strong> Nothing belonging to project A is
+        ever written under project B's prefix, and the check lives at the
+        <code>basin-storage</code> API boundary rather than in each caller.
+      </p>
+
+      <div class="grid-3 arch-cards">
         <article class="card reveal">
           <span class="card-num mono">01 / prefix</span>
           <h3>Projects are prefixes</h3>
@@ -668,8 +1086,95 @@ code{font-family:var(--font-mono);font-size:.92em}
     </div>
   </section>
 
+  <!-- ── Structural ─────────────────────────────────────────────── -->
+  <section id="structural" class="section section-ink-2" aria-labelledby="struct-h2">
+    <div class="container">
+      <div class="section-head reveal">
+        <span class="eyebrow">Structural · the two that don't move</span>
+        <h2 id="struct-h2" class="display">Some numbers are tuning. These two are arithmetic.</h2>
+        <p>
+          Every other figure on this page is workload-dependent and argued about below.
+          These two fall out of the architecture: a from-scratch tokio server instead of a
+          forking daemon, and a prefix instead of a provisioned database.
+        </p>
+      </div>
+
+      <!-- Figure 3 · the connection flood, drawn. -->
+      <div class="flood reveal">
+        <div class="flood-panel plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <h3>Basin <em>310 KiB / conn</em></h3>
+          <svg class="flood-grid" viewBox="0 0 200 200" role="img"
+               aria-label="Basin under a 1,000-connection flood: all 1,000 connections held, none refused.">
+            <defs>
+              <pattern id="held-a" width="20" height="20" patternUnits="userSpaceOnUse">
+                <circle cx="10" cy="10" r="5" fill="#00A8B0"/>
+              </pattern>
+            </defs>
+            <rect width="200" height="200" fill="url(#held-a)"/>
+          </svg>
+          <p class="flood-tally">
+            <span class="flood-held">1,000 held</span>
+            <span class="flood-refused">0 refused</span>
+          </p>
+        </div>
+        <div class="flood-panel plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <h3>Postgres 18 <em>8,257 KiB / conn</em></h3>
+          <svg class="flood-grid" viewBox="0 0 200 200" role="img"
+               aria-label="Postgres 18 under the same flood: 100 connections held, 900 refused.">
+            <defs>
+              <pattern id="held-b" width="20" height="20" patternUnits="userSpaceOnUse">
+                <circle cx="10" cy="10" r="5" fill="#00A8B0"/>
+              </pattern>
+              <pattern id="open-b" width="20" height="20" patternUnits="userSpaceOnUse">
+                <circle cx="10" cy="10" r="4.2" fill="none" stroke="#828282" stroke-width="1.4" stroke-dasharray="2.2 2.2"/>
+              </pattern>
+            </defs>
+            <rect width="200" height="200" fill="url(#open-b)"/>
+            <rect width="200" height="20" fill="url(#held-b)"/>
+          </svg>
+          <p class="flood-tally">
+            <span class="flood-held">100 held</span>
+            <span class="flood-refused">900 refused</span>
+          </p>
+        </div>
+      </div>
+      <p class="flood-legend reveal">
+        <span><i class="is-held" aria-hidden="true"></i>held — one dot is ten connections</span>
+        <span><i class="is-refused" aria-hidden="true"></i>refused at accept</span>
+      </p>
+      <p class="fig-cap reveal">
+        Fig. 3 — <strong>1,000 concurrent connections, same box.</strong> Measured on the
+        LocalFS <code>server_lifecycle</code> card. This is not a tuning result: it is the
+        difference between an async server and a process-per-connection daemon.
+      </p>
+
+      <dl class="tiles reveal">
+        <div class="tile plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <dt>RAM per held-open connection</dt>
+          <dd>310 <em>KiB</em></dd>
+          <dd class="tile-note">Against Postgres 18's 8,257 KiB on the same card — about 27× cheaper per socket.</dd>
+        </div>
+        <div class="tile plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <dt>RAM per idle project</dt>
+          <dd>2.16 <em>KiB</em></dd>
+          <dd class="tile-note">Measured across 1,000 idle projects. A tenant nobody is using books no connection slot and no heap pages.</dd>
+        </div>
+        <div class="tile plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <dt>Bucket cost per idle project</dt>
+          <dd>$0.10 <em>/mo</em></dd>
+          <dd class="tile-note">At typical SaaS-tail sizes. Cost tracks bytes actually stored, so ten thousand quiet projects stay quiet on the invoice.</dd>
+        </div>
+      </dl>
+    </div>
+  </section>
+
   <!-- ── Code ───────────────────────────────────────────────────── -->
-  <section class="section section-ink-2" aria-labelledby="code-h2">
+  <section class="section section-ink" aria-labelledby="code-h2">
     <div class="container">
       <div class="section-head reveal">
         <span class="eyebrow">Code · psql session</span>
@@ -728,7 +1233,7 @@ code{font-family:var(--font-mono);font-size:.92em}
   </section>
 
   <!-- ── Postgres compatibility ─────────────────────────────────── -->
-  <section id="compat" class="section section-ink" aria-labelledby="compat-h2">
+  <section id="compat" class="section section-ink-2" aria-labelledby="compat-h2">
     <div class="container">
       <div class="section-head reveal">
         <span class="eyebrow">What we do · what we don't</span>
@@ -777,7 +1282,7 @@ code{font-family:var(--font-mono);font-size:.92em}
   </section>
 
   <!-- ── Benchmarks ─────────────────────────────────────────────── -->
-  <section id="benchmarks" class="section section-ink-2" aria-labelledby="bench-h2">
+  <section id="benchmarks" class="section section-ink" aria-labelledby="bench-h2">
     <div class="container">
       <div class="section-head reveal">
         <span class="eyebrow">Benchmarks · wins and losses</span>
@@ -788,6 +1293,157 @@ code{font-family:var(--font-mono);font-size:.92em}
           mutations, and the table says so.
         </p>
       </div>
+
+      <!-- Figure 4 · every ms-shape on the card, as a ratio, on a log axis.
+           Diverging because the quantity has polarity: parity sits at the
+           centre line and the two directions are two different claims. -->
+      <div class="bars reveal" role="group" aria-labelledby="bars-h3">
+        <h3 id="bars-h3" class="bars-title">Ratio against Postgres 18 — 1M rows, LocalFS, log axis</h3>
+        <div class="bars-axis" aria-hidden="true">
+          <span class="bars-axis-spacer"></span>
+          <div class="bars-axis-scale">
+            <span style="left:5.56%">256×</span>
+            <span style="left:16.67%">64×</span>
+            <span style="left:27.78%">16×</span>
+            <span style="left:38.89%">4×</span>
+            <span style="left:50%">parity</span>
+            <span style="left:61.11%">4×</span>
+            <span style="left:72.22%">16×</span>
+            <span style="left:83.33%">64×</span>
+            <span style="left:94.44%">256×</span>
+          </div>
+          <span></span>
+        </div>
+        <div class="bar-row bar-win">
+          <div class="bar-label">LATERAL JOIN (correlated derived table)</div>
+          <div class="bar-track" role="img" aria-label="LATERAL JOIN (correlated derived table): Basin 6.7 ms, Postgres 3,080 ms — 462× faster on Basin">
+            <span class="bar-fill" style="--w:49.18%"></span>
+          </div>
+          <div class="bar-value mono">462×</div>
+        </div>
+        <div class="bar-row bar-win">
+          <div class="bar-label">Star join (events ⋈ users ⋈ categories)</div>
+          <div class="bar-track" role="img" aria-label="Star join (events ⋈ users ⋈ categories): Basin 11.6 ms, Postgres 3,040 ms — 261× faster on Basin">
+            <span class="bar-fill" style="--w:44.60%"></span>
+          </div>
+          <div class="bar-value mono">261×</div>
+        </div>
+        <div class="bar-row bar-win">
+          <div class="bar-label">Correlated subquery in SELECT p50</div>
+          <div class="bar-track" role="img" aria-label="Correlated subquery in SELECT p50: Basin 49 ms, Postgres 5,510 ms — 113× faster on Basin">
+            <span class="bar-fill" style="--w:37.89%"></span>
+          </div>
+          <div class="bar-value mono">113×</div>
+        </div>
+        <div class="bar-row bar-win">
+          <div class="bar-label">Range scan p50 (~1k rows)</div>
+          <div class="bar-track" role="img" aria-label="Range scan p50 (~1k rows): Basin 0.40 ms, Postgres 32 ms — 81× faster on Basin">
+            <span class="bar-fill" style="--w:35.22%"></span>
+          </div>
+          <div class="bar-value mono">81×</div>
+        </div>
+        <div class="bar-row bar-win">
+          <div class="bar-label">WHERE col = ANY(int[])</div>
+          <div class="bar-track" role="img" aria-label="WHERE col = ANY(int[]): Basin 0.60 ms, Postgres 38 ms — 63× faster on Basin">
+            <span class="bar-fill" style="--w:33.21%"></span>
+          </div>
+          <div class="bar-value mono">63×</div>
+        </div>
+        <div class="bar-row bar-win">
+          <div class="bar-label">Selective low-card COUNT</div>
+          <div class="bar-track" role="img" aria-label="Selective low-card COUNT: Basin 0.68 ms, Postgres 34 ms — 51× faster on Basin">
+            <span class="bar-fill" style="--w:31.51%"></span>
+          </div>
+          <div class="bar-value mono">51×</div>
+        </div>
+        <div class="bar-row bar-win">
+          <div class="bar-label">COUNT(DISTINCT user_id) per status p50</div>
+          <div class="bar-track" role="img" aria-label="COUNT(DISTINCT user_id) per status p50: Basin 31 ms, Postgres 913 ms — 30× faster on Basin">
+            <span class="bar-fill" style="--w:27.26%"></span>
+          </div>
+          <div class="bar-value mono">30×</div>
+        </div>
+        <div class="bar-row bar-win">
+          <div class="bar-label">2-table JOIN GROUP BY p50</div>
+          <div class="bar-track" role="img" aria-label="2-table JOIN GROUP BY p50: Basin 28 ms, Postgres 791 ms — 28× faster on Basin">
+            <span class="bar-fill" style="--w:26.71%"></span>
+          </div>
+          <div class="bar-value mono">28×</div>
+        </div>
+        <div class="bar-row bar-win">
+          <div class="bar-label">Large result stream (100k-row drain)</div>
+          <div class="bar-track" role="img" aria-label="Large result stream (100k-row drain): Basin 0.44 ms, Postgres 11.0 ms — 25× faster on Basin">
+            <span class="bar-fill" style="--w:25.80%"></span>
+          </div>
+          <div class="bar-value mono">25×</div>
+        </div>
+        <div class="bar-row bar-win">
+          <div class="bar-label">Bulk INSERT 1,000,000 rows</div>
+          <div class="bar-track" role="img" aria-label="Bulk INSERT 1,000,000 rows: Basin 2,080 ms, Postgres 8,100 ms — 3.9× faster on Basin">
+            <span class="bar-fill" style="--w:10.91%"></span>
+          </div>
+          <div class="bar-value mono">3.9×</div>
+        </div>
+        <div class="bar-row bar-loss">
+          <div class="bar-label">Point query p50 (unindexed PK)</div>
+          <div class="bar-track" role="img" aria-label="Point query p50 (unindexed PK): Basin 0.50 ms, Postgres 0.002 ms — 250× faster on Postgres">
+            <span class="bar-fill" style="--w:44.25%"></span>
+          </div>
+          <div class="bar-value mono">250×</div>
+        </div>
+        <div class="bar-row bar-loss">
+          <div class="bar-label">Single-row UPDATE p50</div>
+          <div class="bar-track" role="img" aria-label="Single-row UPDATE p50: Basin 1.24 ms, Postgres 0.012 ms — 103× faster on Postgres">
+            <span class="bar-fill" style="--w:37.15%"></span>
+          </div>
+          <div class="bar-value mono">103×</div>
+        </div>
+        <div class="bar-row bar-loss">
+          <div class="bar-label">Mixed read-write 8R+4W (600 ops)</div>
+          <div class="bar-track" role="img" aria-label="Mixed read-write 8R+4W (600 ops): Basin 202 ms, Postgres 12 ms — 17× faster on Postgres">
+            <span class="bar-fill" style="--w:22.61%"></span>
+          </div>
+          <div class="bar-value mono">17×</div>
+        </div>
+        <div class="bar-row bar-loss">
+          <div class="bar-label">Concurrent SELECT (16 sessions)</div>
+          <div class="bar-track" role="img" aria-label="Concurrent SELECT (16 sessions): Basin 19 ms, Postgres 2.3 ms — 8.3× faster on Postgres">
+            <span class="bar-fill" style="--w:16.96%"></span>
+          </div>
+          <div class="bar-value mono">8.3×</div>
+        </div>
+        <div class="bar-row bar-loss">
+          <div class="bar-label">COUNT(*) full table p50</div>
+          <div class="bar-track" role="img" aria-label="COUNT(*) full table p50: Basin 95 ms, Postgres 29 ms — 3.3× faster on Postgres">
+            <span class="bar-fill" style="--w:9.57%"></span>
+          </div>
+          <div class="bar-value mono">3.3×</div>
+        </div>
+        <div class="bar-row bar-loss">
+          <div class="bar-label">Deep top-K sort (ORDER BY … LIMIT 1000)</div>
+          <div class="bar-track" role="img" aria-label="Deep top-K sort (ORDER BY … LIMIT 1000): Basin 161 ms, Postgres 53 ms — 3× faster on Postgres">
+            <span class="bar-fill" style="--w:8.81%"></span>
+          </div>
+          <div class="bar-value mono">3×</div>
+        </div>
+        <div class="bar-row bar-loss">
+          <div class="bar-label">Bulk UPDATE (~1/3 of rows)</div>
+          <div class="bar-track" role="img" aria-label="Bulk UPDATE (~1/3 of rows): Basin 9.4 s, Postgres 3.4 s — 2.8× faster on Postgres">
+            <span class="bar-fill" style="--w:8.25%"></span>
+          </div>
+          <div class="bar-value mono">2.8×</div>
+        </div>
+      </div>
+      <p class="bars-legend reveal">
+        <span><i class="is-win" aria-hidden="true"></i>Basin faster</span>
+        <span><i class="is-loss" aria-hidden="true"></i>Postgres faster</span>
+        <span>Bars run out from parity; the axis is log-scaled, so each label is 4× the last.</span>
+      </p>
+      <p class="fig-cap reveal">
+        Fig. 4 — <strong>17 shapes from the 2026-06-11 integrity run.</strong> Across the
+        ~100 ms-shapes on this card Basin is faster on 51 and Postgres on 54. The full
+        table, including the shapes that land at parity, is below.
+      </p>
 
       <div class="bench-scroll reveal">
         <table class="bench-table">
@@ -824,7 +1480,7 @@ code{font-family:var(--font-mono);font-size:.92em}
   </section>
 
   <!-- ── Compare ────────────────────────────────────────────────── -->
-  <section id="compare" class="section section-ink" aria-labelledby="cmp-h2">
+  <section id="compare" class="section section-ink-2" aria-labelledby="cmp-h2">
     <div class="container">
       <div class="section-head reveal">
         <span class="eyebrow">Compare · where each one wins</span>
@@ -891,7 +1547,7 @@ code{font-family:var(--font-mono);font-size:.92em}
   </section>
 
   <!-- ── Quickstart ─────────────────────────────────────────────── -->
-  <section id="quickstart" class="section section-ink-2" aria-labelledby="qs-h2">
+  <section id="quickstart" class="section section-ink" aria-labelledby="qs-h2">
     <div class="container">
       <div class="section-head reveal">
         <span class="eyebrow">Quickstart · self-host</span>
@@ -930,22 +1586,73 @@ code{font-family:var(--font-mono);font-size:.92em}
     </div>
   </section>
 
-  <!-- ── Final CTA ──────────────────────────────────────────────── -->
+  <!-- ── Final CTA — the status plate ───────────────────────────── -->
   <section class="section cta" aria-labelledby="cta-h2">
-    <div class="container-narrow">
-      <h2 id="cta-h2" class="display reveal">Pre-alpha, built in the open.</h2>
-      <p class="reveal">
-        Basin is being built in public — use it today to evaluate the cost shape,
-        prototype multi-tenant patterns, or contribute. The benchmarks publish wins
-        <em>and</em> losses, and the roadmap says what isn't done.
-      </p>
-      <div class="cta-actions reveal">
-        <a class="btn btn-primary" href="https://github.com/vul-os/basin">
-          Read the source <span class="btn-arrow" aria-hidden="true">→</span>
-        </a>
-        <a class="btn btn-outline" href="./docs.html">Documentation</a>
+    <div class="container">
+      <div class="status-plate plate reveal">
+        <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+
+        <div class="status-top">
+          <div class="status-head">
+            <span class="eyebrow">Field status · v0.1 cut</span>
+            <h2 id="cta-h2" class="display">Every number here has a test behind it.</h2>
+            <p>
+              Basin is pre-alpha and publishes like it: the benchmark cards regenerate from
+              integration tests on every push, wins and losses together, and the scope
+              document says what is parked. If you think a card is unfair, the harness is in
+              the repo — open a methodology issue and we will fix it, soften the claim, or
+              show our working.
+            </p>
+          </div>
+          <p class="status-stamp" role="img" aria-label="Status: pre-alpha, public evaluation, v0.1 cut">
+            <b>PRE-ALPHA</b>
+            <span>public eval · v0.1</span>
+          </p>
+        </div>
+
+        <div class="status-ledger">
+          <div class="status-col status-col-ship">
+            <h3>Shipped and on by default</h3>
+            <ul>
+              <li>pgwire v3 — TLS, COPY, extended query, binary JSONB / UUID / BYTEA</li>
+              <li>Row-Level Security, enforced in the plan layer</li>
+              <li>Native <code>vector(N)</code> + HNSW, pgvector-compatible operators</li>
+              <li>Auth, REST and blob storage in the same binary</li>
+              <li>Iceberg REST catalog, snapshots and copy-on-write branches</li>
+              <li>HTAP hot-tier fast paths, with a no-redeploy kill switch</li>
+            </ul>
+          </div>
+          <div class="status-col status-col-open">
+            <h3>Measured, still behind</h3>
+            <ul>
+              <li>Point mutations at 1M rows — 1.24 ms against Postgres's 0.012 ms</li>
+              <li>Mixed read-write concurrency, 8R+4W — 202 ms against 12 ms</li>
+              <li><code>INSERT … SELECT</code> returns an honest typed reject</li>
+              <li>Bulk UPDATE over a third of a table — 2.8× slower</li>
+              <li>Realtime ships complete; some harness slices are still gated</li>
+            </ul>
+          </div>
+          <div class="status-col status-col-never">
+            <h3>Out of scope, deliberately</h3>
+            <ul>
+              <li>PL/pgSQL, PL/Python and PL/Perl stored procedures</li>
+              <li>Loadable <code>.so</code> extensions</li>
+              <li>Logical decoding, replication protocol, CDC</li>
+              <li><code>postgres_fdw</code> and <code>dblink</code> federation</li>
+              <li>Cross-region two-phase commit</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="cta-actions">
+          <a class="btn btn-primary" href="https://github.com/vul-os/basin">
+            Read the source <span class="btn-arrow" aria-hidden="true">→</span>
+          </a>
+          <a class="btn btn-outline" href="./docs.html">Documentation</a>
+          <a class="btn btn-outline" href="https://github.com/vul-os/basin/blob/main/benchmark/BENCHMARKS.md">Benchmark methodology</a>
+        </div>
+        <p class="licence-note">Licensed <strong>Apache-2.0</strong>. Written in Rust, self-hostable on any S3-compatible bucket.</p>
       </div>
-      <p class="reveal licence-note">Licensed <strong>Apache-2.0</strong>. Written in Rust, self-hostable on any S3-compatible bucket.</p>
     </div>
   </section>
 
@@ -956,13 +1663,7 @@ code{font-family:var(--font-mono);font-size:.92em}
     <div class="footer-grid">
       <div class="footer-brand">
         <a class="brand" href="./index.html">
-          <svg viewBox="0 0 680 680" aria-hidden="true">
-            <g transform="translate(340,340)" fill="none" stroke="#FAF7F0" stroke-width="52" stroke-linecap="round">
-              <ellipse cx="0" cy="-110" rx="200" ry="44"/>
-              <path d="M -200 -110 Q -200 160, 0 160 Q 200 160, 200 -110"/>
-              <circle cx="0" cy="40" r="34" fill="#3B6F73" stroke="none"/>
-            </g>
-          </svg>
+          <svg viewBox="0 0 128 128" aria-hidden="true"><use href="#basin-mark"/></svg>
           Basin
         </a>
         <p>
