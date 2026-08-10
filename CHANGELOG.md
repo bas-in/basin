@@ -8,7 +8,151 @@ The pre-1.0 contract: minor versions can break public API; patch versions
 are bug-fix only. Once the engine wedge ships to design partners we
 graduate to 1.0 and the standard SemVer guarantees.
 
-## Unreleased — CI integrity: five green gates that verified nothing now fail closed
+## [Unreleased]
+
+Every wave of work since v0.1.9, newest first. Each line is the entry's own
+headline; the full write-up for each is in the engineering-log section that
+follows, verbatim and unedited.
+
+- CI integrity: five green gates that verified nothing now fail closed
+- Perf: file-merge runs on its own faster cadence so it keeps pace with ingest
+- Perf: file-merge no longer re-reads the whole-table union every tick
+- Fix: `ts_headline` no longer drops trailing punctuation
+- Reliability: a single heavy query can no longer OOM-kill the node
+- Fix: a torn/corrupt table can no longer lock a whole project out, and a DROP can no longer corrupt a same-name recreate
+- Fix (#36): enabling the multi-bucket pool no longer breaks pgwire auth or orphans existing-project data
+- Fix (#36): multi-bucket pool can point at REAL provider buckets (striping works on Tigris)
+- Fix (#17): broadened catalog file prune no longer errors a plain string / `IN` / out-of-domain `WHERE`
+- Multi-bucket pool: online consolidation on scale-down (#37) + exactly-once crash-injection matrix (#38)
+- Docs/tests: per-project pgwire rate limiting (catalog-driven) is shipped, not deferred
+- Low-cardinality GROUP BY fast path extended to SUM / COUNT(col) / AVG
+- Multi-bucket partition striping wired into the hot path (#36, flag-gated, default OFF)
+- Perf: catalog file pruning extended to equality, `IN`, string ranges, and bloom definite-negatives
+- Perf: bounded-staleness metadata-read snapshot cuts `count(*)`/`max` latency under heavy concurrent ingest
+- Perf: heavy-OLAP scans prune non-matching data files from catalog min/max before any object-store GET
+- Fix: DROP TABLE + recreate of the SAME name no longer leaks stale rows into `count(*)`
+- Perf (#26): keyed bulk COPY no longer pays an O(table) constraint cost per chunk
+- Perf: content-addressed baseline-chunk read cache (read latency under heavy ingest)
+- Fix: `count(*)`/`max` no longer blocks behind in-flight compaction during heavy ingest
+- Perf (opt-in): faster compaction encode for ingest-throughput-over-disk-size workloads
+- Fix: read-freshness convergence — drain the residual tail promptly once ingest goes idle
+- Fix (#41): metadata range-aggregate must not over-count files that overlap the boundary or carry inconsistent/partial stats
+- Perf (#27): flat-scale partition baselines — chunked, content-addressed baseline so per-commit PUT bytes no longer grow with table size
+- Fix: exactly-once partition commit under an ambiguous object-store PUT (no more double-counted rows during a 408 storm)
+- Perf: eliminate redundant object-store head-resolution on the compaction commit hot path (per-node ingest throughput)
+- Docs + tests: exactly-once-under-retry contract for COPY/INSERT resync (no behaviour change)
+- Fix: adaptive ingest auto-tuner no longer changes fan-out at runtime (correctness — was double-counting `count(*)`) (`BASIN_AUTOTUNE`, default OFF)
+- Fix: adaptive ingest auto-tuner can no longer drift below the hardware-derived baseline on noisy signals (`BASIN_AUTOTUNE`, default OFF)
+- Add: hardware-aware ingest concurrency auto-tuner with live self-tuning (`BASIN_AUTOTUNE`, default OFF)
+- Fix: dead pgwire connections no longer leak the per-project connection-ceiling slot (#33)
+- Fix: SERIAL/sequence no longer regresses on restart (#15)
+- Multi-bucket storage pool, Stage 2a: single-project partition→bucket striping (routing seam, flag-gated)
+- Multi-bucket storage pool, Stage 1 (foundation, flag-gated)
+- **2026-06-25** — Crash-consistent COPY across nodes: durable-on-forward
+- **2026-06-24** — Crash-consistent COPY: end-of-COPY durable barrier
+- **2026-06-24** — Metadata-only aggregates over an integer range predicate
+- **2026-06-21** — Bound per-partition data-file count: file-merge compaction tier for truly flat ingest
+- **2026-06-21** — Flatten residual ingest-rate decline: per-partition commit no longer unions the whole table
+- **2026-06-21** — Fix S3/Tigris connection-pool exhaustion under sustained writes (tight retry budget)
+- **2026-06-20** — Flat-scale ingest: O(1)-amortized per-partition catalog commits (delta segments + periodic snapshot)
+- **2026-06-20** — Route the ingest hot path through a cheap META-only catalog load (multi-node ingest throughput)
+- **2026-06-20** — Shard the object-store data-file manifest by partition (multi-node ingest scaling)
+- **2026-06-20** — Fix multi-node duplicate rows from at-least-once partition-write forwarding
+- **2026-06-20** — Fix multi-node data loss from lease-stealing reads (basin-shard)
+- **2026-06-20** — Durable, multi-node-safe sequences in the object-store catalog
+- **2026-06-20** — Object-store shared catalog is schema-qualified (ADR 0022)
+- **2026-06-19** — Fly.io self-id derivation + dynamic peer discovery for partition forwarding (#28)
+- **2026-06-19** — Install partition-forward transport + ingest-pressure metrics in the deployed server (#28)
+- **2026-06-19** — Transparent per-partition write forwarding (#28 multi-node bulk ingest)
+- **2026-06-19** — Wire the object-store shared catalog into the deployed engine server
+- **2026-06-19** — Basin-native shared catalog + lease registry on the object store (no external DB)
+- **2026-06-19** — Perf: intra-node horizontal partitioning fans bulk ingest across P compaction lanes
+- **2026-06-19** — Perf: parallel compaction keeps the tail bounded under a high-RTT object store
+- **2026-06-18** — Perf: flatter no-PK bulk-COPY ingest against a high-RTT object store
+- **2026-06-18** — Fix: catalog is a stats cache, not the authoritative file index
+- **2026-06-18** — Perf: flat-cost keyed/PRIMARY-KEY bulk ingest at scale
+- **2026-06-18** — Perf: flat-cost bulk ingest at scale (bounded tail + incremental compaction)
+- **2026-06-18** — Fix: DELETE fast path lost a row count for an absent PK (data-loss correctness)
+- **2026-06-18** — Cold-read: background whole-file prefetch + higher storage scan fan-out
+- **2026-06-18** — Cached libpg_query parse: lower warm per-statement floor
+- **2026-06-18** — Catalog-driven file discovery: zero LIST RPCs on warm scans/writes
+- **2026-06-18** — Multi-region: `http-forward` write transport + receive endpoint (ADR 0009)
+- **2026-06-18** — Observability: `GET /metrics/inflight` exposes in-flight + latency for autoscaling
+- **2026-06-18** — Perf (OLTP): point/small INSERT prunes instead of rebuilding the PK set
+- **2026-06-17** — Perf: keep Vortex footers/zone-maps RAM-resident (cold-read + point-lookup win)
+- **2026-06-17** — Observability: shard tail-pressure warning (bounded-memory signal)
+- **2026-06-17** — Feat: per-project (per-tier) pgwire rate limiting
+- **2026-06-17** — Feat: super-admin cross-project live usage analytics
+- **2026-06-17** — Fix: DROP TABLE purges object-store files (no ghost rows on re-create)
+- **2026-06-17** — Fix (major): pooled sessions now use the fast batched COPY path
+- **2026-06-17** — Dev/test: opt-in plaintext-HTTP S3 endpoints (BASIN_STORAGE_ALLOW_HTTP)
+- **2026-06-17** — Fix: S3/Tigris custom endpoints use path-style (was dropping the bucket → 403)
+- **2026-06-17** — Perf/scale: bounded-memory PRIMARY KEY enforcement on bulk COPY
+- **2026-06-17** — Fix: SUM/MIN/MAX over NUMERIC/FLOAT route to DataFusion (correct type)
+- **2026-06-17** — Engine: shape-matrix test harness + COPY timestamptz + integer SUM/MIN/MAX
+- **2026-06-17** — Perf: O(n) bulk COPY into a PRIMARY KEY table (was O(n²))
+- **2026-06-17** — Fix: bounded-memory COPY (no per-batch Expr blow-up / OOM)
+- **2026-06-17** — Fix: serial sequences resume past recovered data after restart
+- **2026-06-17** — Fix: `COPY` now fills column DEFAULTs (incl. `SERIAL`) for omitted columns
+- **2026-06-17** — Fix: control-plane admin token may administer any project
+- **2026-06-17** — Fix: TCP keepalive + nodelay on accepted pgwire connections
+- **2026-06-15** — Fix: `@@` rewriter no longer mangles SQL comments
+- **2026-06-15** — Docs: correct stale capability claims (binary NUMERIC wire, citext WHERE-fold)
+- **2026-06-15** — Hot-tier DELETE/UPDATE fast path admits single-column B-tree indexes
+- **2026-06-15** — Cloud control-plane: list projects
+- **2026-06-15** — Cloud control-plane: deprovision (DELETE) a project
+- **2026-06-15** — Cloud control-plane: list project tables
+- **2026-06-15** — Cloud control-plane: per-project usage endpoint
+- **2026-06-15** — COUNT(*) stays O(files) after a hot-tier UPDATE/DELETE
+- **2026-06-14** — Multi-array UNNEST in INSERT … SELECT (Django bulk_create)
+- **2026-06-14** — Enum columns advertise their own type OID (Prisma)
+- **2026-06-14** — ORM SQL-shape fixes (Drizzle, SQLAlchemy, Django, gorm)
+- **2026-06-14** — DEFERRABLE INITIALLY DEFERRED foreign keys (ORM migrations)
+- **2026-06-14** — ALTER TABLE ADD CONSTRAINT … FOREIGN KEY (ORM migrations)
+- **2026-06-14** — enum values stamped as a cast INSERT correctly (`'USER'::"Role"`)
+- **2026-06-14** — explicit `DEFAULT` keyword in INSERT values
+- **2026-06-14** — HNSW vector search recall@10 0.60 → 1.00 (ef_search default)
+- **2026-06-14** — array columns render in the PostgreSQL `{…}` text form on the wire
+- **2026-06-14** — INSERT array values in the PostgreSQL curly-brace text form
+- **2026-06-14** — ALTER TABLE ADD COLUMN … DEFAULT v NOT NULL (ORM migrations)
+- **2026-06-14** — system functions in FROM position (`SELECT * FROM current_schema()`)
+- **2026-06-14** — pgwire reports a PG-compatible server_version (ORM connectivity fix)
+- **2026-06-14** — Cold DELETE write-amp: GIN-only tombstone fast path + FK-cascade re-read skip
+- **2026-06-14** — Multi-node raft hardening (mTLS transport, chaos-under-load drills, snapshot catch-up, per-region group routing, deploy harness)
+- **2026-06-14** — Program-wide feature summary (extensions, SQL surface, multi-node, CDC, SDKs, CLI, storage, scale)
+- **2026-06-14** — Point-op latency: bind-direct UPDATE, FK/reactor flag cache, prewarm flag
+- **2026-06-13** — PostGIS general 2-D geometry SQL surface
+- **2026-06-13** — Native IVFFlat, vector_avg aggregate, f32-backed halfvec
+- **2026-06-13** — Change events from hot-tier UPDATE/DELETE fast paths (CDC/realtime)
+- **2026-06-13** — UPDATE … FROM is set-oriented (kill per-row quadratic)
+- **2026-06-12** — Per-project pgwire connection ceiling (#28b)
+- **2026-06-12** — Multi-node: quorum-replicated WAL (`BASIN_WAL_MODE=raft`)
+- **2026-06-12** — SQL compat: ALTER ADD UNIQUE, typed timestamptz binds, 42883/42703
+- **2026-06-11** — FTS: GIN-on-tsvector pruning hardened (5.20.E), to_tsquery stemming
+- **2026-06-11** — COPY: sqlx PgCopyIn shape + binary COPY format
+- **2026-06-12** — compatibility deep-cuts: 42P01, Django/GORM, GIN-overlay unlock, promoted-column fixes
+- **2026-06-11** — integrity benchmark run (provenance: single idle-box session, 1M solo)
+- **2026-06-11** — S4 age-based residency: read-own-insert with zero file opens
+- **2026-06-11** — memtable MVCC version chains; fast VALUES scanner: JSONB + timestamps
+- **2026-06-10** — OLTP scale + correctness wave; HTAP / ORM / extensions roadmap
+- **2026-05-25** — Selective-read pushdown + benchmark fairness
+- **2026-05-21** — Phase 6.X+ wave
+- **2026-05-19** — Strategic checkpoint: durable-Basin-moat plan adopted (Phase 5.14)
+
+## [Unreleased — engineering log since v0.1.9]
+
+The per-wave record behind the index above, newest first. It is a log, not a
+release note: entries are dated or marked unreleased in the form they were
+written, and they are not condensed, because condensing what happened is how
+a changelog stops being a record.
+
+This section is deliberately headed with a bracketed non-version title. The
+release job extracts a release body by capturing from `## [<version>]` to the
+next `## [` line, so this heading bounds the `[Unreleased]` section above and
+keeps a three-month, 279 000-character log out of a GitHub release body — the
+API caps those at 125 000 characters.
+
+### Unreleased — CI integrity: five green gates that verified nothing now fail closed
 
 Five CI checks were passing while executing zero assertions. All five are
 fixed, and each one is now guarded by something that fails when it stops
@@ -97,7 +241,7 @@ verifying.
   assertions are executing for the first time — if any of them is wrong, this
   job is expected to go red, and that red is the finding, not a regression.**
 
-### Found, not fixed — `ci.yml`'s `test` job is RED on `main`: 12 deterministic failures
+#### Found, not fixed — `ci.yml`'s `test` job is RED on `main`: 12 deterministic failures
 
 `cargo test --workspace --exclude basin-integration-tests --no-fail-fast --locked`
 — the exact command `ci.yml` runs — reported **3,090 passed / 11 failed / 16
@@ -144,7 +288,7 @@ The rest, for triage:
 The two CDC ones are delivery-semantics failures on the resume path (one loses
 events, one double-delivers); they reproduce in isolation too.
 
-### Found, not fixed — two more CI gates are RED on `main`, and have been long enough to read as noise
+#### Found, not fixed — two more CI gates are RED on `main`, and have been long enough to read as noise
 
 The audit above was about gates that passed while checking nothing. These are the
 mirror image: gates that check the right thing and have simply been failing.
@@ -188,7 +332,7 @@ exactly so the next session can act rather than re-derive.
   `--all-targets`, and `ci.yml` documents that choice explicitly; `cli.yml` just
   never got it.
 
-### Found, not fixed — ~470 lines of orphaned cold-path tombstone code in basin-engine
+#### Found, not fixed — ~470 lines of orphaned cold-path tombstone code in basin-engine
 
 Recorded here rather than deleted: removing engine code is the owner's call, and
 an audit pass should not guess at intent. The evidence, so the next reader does
@@ -230,7 +374,7 @@ Note that CI cannot catch this class today: `ci.yml`'s clippy job runs
 `cargo clippy --workspace --all-targets` in advisory mode (no `-D warnings`) by
 deliberate, documented choice, so all 78 warnings are non-blocking.
 
-### Fixed — the CLI's documented `cosign verify-blob` could never succeed
+#### Fixed — the CLI's documented `cosign verify-blob` could never succeed
 
 `cli/README.md` told users to verify the signed CLI archives against the
 certificate identity
@@ -254,7 +398,7 @@ identity is corrected in both `cli/README.md` and the `cli-release.yml` comment
 that is the other half of the same instruction, with the SAN's shape spelled out
 so the next rename is caught.
 
-### Fixed — the product site sat outside every link gate, and had a dead link
+#### Fixed — the product site sat outside every link gate, and had a dead link
 
 `site/index.html`'s footer linked "Roadmap" to `ROADMAP.md`, a file that has
 never existed in this repo. Nothing caught it: `check-doc-links.sh` walked only
@@ -273,7 +417,7 @@ zero of them. It matches only text already extracted as a link target
 that is not a link — is not mistaken for one. Verified: 619 relative links and
 54 self-referential GitHub links across 164 markdown and 2 HTML files.
 
-### Fixed — the getting-started tutorial documented two things that are not true
+#### Fixed — the getting-started tutorial documented two things that are not true
 
 Rewriting the tutorial harness to actually run the tutorial surfaced two
 user-facing errors in `docs/tutorial.md`, both in the RLS section a new user hits
@@ -301,7 +445,7 @@ The harness asserts both halves — rows readable before RLS, nothing readable
 after, and an unpoliced table unaffected — so a regression that made RLS fail
 *open* would now be caught by the tutorial's own CI job.
 
-### Fixed — the MSRV claim, and the one gate that was honestly red
+#### Fixed — the MSRV claim, and the one gate that was honestly red
 
 `rust-version` said **1.85** while the lockfile's floor is **1.92**
 (cranelift 0.131 via wasmtime; vortex-error 0.71 needs 1.91). Nothing caught it
@@ -319,7 +463,7 @@ The one place the stale pin *was* honoured was the Dockerfile's
 long enough to read as background noise. The builder now takes a
 `RUST_VERSION` arg (1.92).
 
-### Added — release integrity
+#### Added — release integrity
 
 Releases published per-asset `.sha256` files and nothing else: no manifest, no
 signature, no attestation, and no script a user could run. A per-asset digest
@@ -335,7 +479,7 @@ a sigstore build-provenance attestation minted from the workflow's OIDC identity
 carry the verify snippet, and a `verify-script` CI job runs the refusal matrix
 on every push.
 
-### Fixed — CLI self-update probed a repository that does not exist
+#### Fixed — CLI self-update probed a repository that does not exist
 
 `basin`'s self-update check queried
 `api.github.com/repos/bas-in/basin-cli/releases/latest`. That repo 404s (the CLI
@@ -345,7 +489,7 @@ moved into this monorepo under `cli/`), so every probe collapsed to
 `/releases/latest` would have returned the engine's `v0.1.9` and told a CLI at
 0.1.0 to upgrade to it. Four unit tests pin the endpoint and the tag selection.
 
-### Fixed — docs
+#### Fixed — docs
 
 `docs/` frontmatter validation and the docs-index check were both red (29
 violations: 14 files with no frontmatter, two `nav_section` values outside the
@@ -362,7 +506,7 @@ Sixteen broken relative links fixed, including four pointing at
 versus what shipped — it described a Go, stdlib-only, GoReleaser-signed binary
 in a repo that was never created.
 
-### Removed — dead code
+#### Removed — dead code
 
 - `vortex_format::footer_meta` — zero call sites; superseded by the tail-range
   `footer_meta_from_store`. Its stale `[`footer_meta`]` rustdoc links fixed.
@@ -373,7 +517,7 @@ in a repo that was never created.
 - Five unused imports (`basin-blob` ×2, `basin-storage`, `basin-shard`,
   `basin-e2e-runner`).
 
-## Unreleased — Perf: file-merge runs on its own faster cadence so it keeps pace with ingest
+### Unreleased — Perf: file-merge runs on its own faster cadence so it keeps pace with ingest
 
 The file-count-bounding merge sweep was chained to the 60 s stripe-merge tick —
 it ran at most once a minute, and only after the (potentially long) stripe-merge
@@ -387,7 +531,7 @@ load. The two sweeps still serialise on the same lock (cadence, not new
 concurrency); `BASIN_FILE_MERGE_SECS=0` restores the chained behaviour.
 (`crates/basin-shard/src/lib.rs`, `crates/basin-shard/src/in_process.rs`.)
 
-## Unreleased — Perf: file-merge no longer re-reads the whole-table union every tick
+### Unreleased — Perf: file-merge no longer re-reads the whole-table union every tick
 
 The per-partition file-merge sweep loaded table metadata with `load_table`,
 which materialises the UNIONED live file set across every partition —
@@ -399,7 +543,7 @@ live set, never from this metadata, so it now uses `load_table_meta` (reads only
 the single META manifest chain — O(1) in partition/file count). Stripe-merge is
 unchanged; it legitimately consumes the union. (`crates/basin-shard/src/in_process.rs`.)
 
-## Unreleased — Fix: `ts_headline` no longer drops trailing punctuation
+### Unreleased — Fix: `ts_headline` no longer drops trailing punctuation
 
 `ts_headline('The quick brown fox.', to_tsquery('fox'))` returned
 `The quick brown <b>fox</b>` — the sentence-final period was silently dropped.
@@ -410,7 +554,7 @@ and bodies shorter than MinWords) append it — matching PostgreSQL, which
 preserves original punctuation when the headline reaches the end of the
 document. (`crates/basin-engine/src/fts_udf.rs`.)
 
-## Unreleased — Reliability: a single heavy query can no longer OOM-kill the node
+### Unreleased — Reliability: a single heavy query can no longer OOM-kill the node
 
 A `SELECT count(DISTINCT id)` over a ~557M-row table crashed the whole engine:
 the per-session DataFusion `RuntimeEnv` installed no memory pool, so it inherited
@@ -427,7 +571,7 @@ to disk and complete; non-spillable ones (distinct accumulators) fail cleanly
 with a retryable `ResourcesExhausted` error. Either way the node stays up.
 (`crates/basin-engine/src/lib.rs`, `crates/basin-engine/src/session.rs`.)
 
-## Unreleased — Fix: a torn/corrupt table can no longer lock a whole project out, and a DROP can no longer corrupt a same-name recreate
+### Unreleased — Fix: a torn/corrupt table can no longer lock a whole project out, and a DROP can no longer corrupt a same-name recreate
 
 A perfection test left a dev project unable to accept ANY pgwire connection.
 Rapidly `DROP`-ing then recreating + reloading the SAME table name under heavy
@@ -467,7 +611,7 @@ subtree. The #44 property (recreate-same-name reads empty) and exactly-once /
 CAS / #16 / #27 are all preserved. New regression tests cover both the torn-table
 session-open survival and the purge-vs-recreate race (fail-before / pass-after).
 
-## Unreleased — Fix (#36): enabling the multi-bucket pool no longer breaks pgwire auth or orphans existing-project data
+### Unreleased — Fix (#36): enabling the multi-bucket pool no longer breaks pgwire auth or orphans existing-project data
 
 **Turning `BASIN_BUCKET_POOL` on broke pgwire auth for every project**
 (`FATAL: invalid pgwire credentials`), and silently rerouted any existing
@@ -510,7 +654,7 @@ Fixes (`crates/basin-common/src/ids.rs`, `crates/basin-storage/src/bucket_pool.r
   `crates/basin-storage/tests/bucket_pool_routing.rs`), plus
   `reserved_system_project_is_recognised` in basin-common.
 
-## Unreleased — Fix (#36): multi-bucket pool can point at REAL provider buckets (striping works on Tigris)
+### Unreleased — Fix (#36): multi-bucket pool can point at REAL provider buckets (striping works on Tigris)
 
 **The bucket pool's `choose_one_bucket` registered new pooled
 `BucketRegistryEntry` rows with a GENERATED name and an EMPTY
@@ -545,7 +689,7 @@ to operator-configured REAL buckets, default OFF (byte-identical to before).
   ON. See `docs/multi-bucket-throughput-striping.md` §4.1 + §6.1 for the
   operator runbook.
 
-## Unreleased — Fix (#17): broadened catalog file prune no longer errors a plain string / `IN` / out-of-domain `WHERE`
+### Unreleased — Fix (#17): broadened catalog file prune no longer errors a plain string / `IN` / out-of-domain `WHERE`
 
 **The broadened selective file prune (#17) dropped the ADR 0027 promoted-JSONB
 shadow columns when it re-registered the survivor / empty table, so a query
@@ -583,7 +727,7 @@ a correctness fix, not a perf tweak.
   re-registration used to drop (the exact repro: fails before the fix with the
   missing shadow column, passes after) and all-pruned → empty (not an error).
 
-## Unreleased — Multi-bucket pool: online consolidation on scale-down (#37) + exactly-once crash-injection matrix (#38)
+### Unreleased — Multi-bucket pool: online consolidation on scale-down (#37) + exactly-once crash-injection matrix (#38)
 
 **The bounded multi-bucket storage pool now reclaims sparse/cold buckets via a
 crash-safe, exactly-once online migration of a project's objects from a source
@@ -627,7 +771,7 @@ No default-path behavior change: with `BASIN_BUCKET_POOL` OFF the consolidation
 entry points return immediately and the existing single-bucket routing is
 byte-identical.
 
-## Unreleased — Docs/tests: per-project pgwire rate limiting (catalog-driven) is shipped, not deferred
+### Unreleased — Docs/tests: per-project pgwire rate limiting (catalog-driven) is shipped, not deferred
 
 The per-project (per-tier) pgwire request rate limiter (#18) is fully wired —
 catalog-driven override + global env default, enforced on the simple- and
@@ -647,7 +791,7 @@ cached `Catalog::get_project_rate_limit_qps` override; over-limit → SQLSTATE
   many tasks neither deadlocks nor over-admits, and does not starve another
   project. No behavior change — enforcement and defaults are unchanged.
 
-## Unreleased — Low-cardinality GROUP BY fast path extended to SUM / COUNT(col) / AVG
+### Unreleased — Low-cardinality GROUP BY fast path extended to SUM / COUNT(col) / AVG
 
 **The in-process low-cardinality GROUP BY fast path now answers `SUM(col)`,
 `COUNT(col)`, and `AVG(col)` per group — not just `COUNT(*)`.** Previously a
@@ -685,7 +829,7 @@ Covered by `tests/integration/tests/groupby_low_card_aggs.rs` (Int64 + Float64
 value columns, NULL groups, and a high-cardinality bail that confirms the
 DataFusion scan returns the same values) and `fast_aggregate` unit tests.
 
-## Unreleased — Multi-bucket partition striping wired into the hot path (#36, flag-gated, default OFF)
+### Unreleased — Multi-bucket partition striping wired into the hot path (#36, flag-gated, default OFF)
 
 **The Stage-2a partition→bucket striping seam is now wired end-to-end so it
 functions when `BASIN_BUCKET_POOL` + `BASIN_BUCKET_POOL_STRIPE` are enabled.**
@@ -728,7 +872,7 @@ stripe buckets and assert correct placement, the catalog-on-primary invariant,
 and exact union read-back. Throughput validation against real pooled buckets
 (multi-node) remains the deferred gate — no throughput number is claimed.
 
-## Unreleased — Perf: catalog file pruning extended to equality, `IN`, string ranges, and bloom definite-negatives
+### Unreleased — Perf: catalog file pruning extended to equality, `IN`, string ranges, and bloom definite-negatives
 
 **The catalog-level file prune that already drops data files for an Int64-range
 `WHERE` (so a selective analytic scan never GETs a provably non-matching file)
@@ -765,7 +909,7 @@ prune contract across the storage formats). New test card
 definite-negative prune, a bloom non-negative keep with an exact result, and a
 no-over-prune check.
 
-## Unreleased — Perf: bounded-staleness metadata-read snapshot cuts `count(*)`/`max` latency under heavy concurrent ingest
+### Unreleased — Perf: bounded-staleness metadata-read snapshot cuts `count(*)`/`max` latency under heavy concurrent ingest
 
 **A metadata read (`count(*)`, `min`/`max`, any `load_table`) issued while a
 table is under sustained high-rate ingest no longer re-walks the object store on
@@ -806,7 +950,7 @@ contending with the heavy PUT traffic — repeated per query.
   within the TTL under simulated version churn, a refresh-to-exact after the TTL,
   and exact-every-read on a quiet table and with the cache disabled.
 
-## Unreleased — Perf: heavy-OLAP scans prune non-matching data files from catalog min/max before any object-store GET
+### Unreleased — Perf: heavy-OLAP scans prune non-matching data files from catalog min/max before any object-store GET
 
 **A selective integer-range scan (`WHERE col >= A AND col < B` on an `Int64`
 column) over a large table no longer reads every data file from object storage.**
@@ -838,7 +982,7 @@ HTTP proxy timeout on big tables).
 - Verified by `viability_minmax_file_pruning`: a 2-band query over 10 disjoint
   single-band files GETs at most 2 files and returns the exact rows.
 
-## Unreleased — Fix: DROP TABLE + recreate of the SAME name no longer leaks stale rows into `count(*)`
+### Unreleased — Fix: DROP TABLE + recreate of the SAME name no longer leaks stale rows into `count(*)`
 
 **After `DROP TABLE t` then `CREATE TABLE t` of the same name, a bare `count(*)`
 over-reported rows from the dropped table while a scan correctly saw the empty
@@ -876,7 +1020,7 @@ always correct.
   and the `fresh_named_table_unaffected_by_drop_recreate` control. The first
   three fail before the fix, all pass after.
 
-## Unreleased — Perf (#26): keyed bulk COPY no longer pays an O(table) constraint cost per chunk
+### Unreleased — Perf (#26): keyed bulk COPY no longer pays an O(table) constraint cost per chunk
 
 **Bulk COPY into a table with a single-`BIGINT` PRIMARY KEY slowed super-linearly
 with table size** even though the incremental PK-set cache was supposed to make
@@ -912,7 +1056,7 @@ allocation storm, summing to O(n²/chunk) across a load.
   keys, and the cache holds a single entry extended across chunks (not rebuilt).
   Correctness (dup rejected, fresh key accepted) re-verified on the same path.
 
-## Unreleased — Perf: content-addressed baseline-chunk read cache (read latency under heavy ingest)
+### Unreleased — Perf: content-addressed baseline-chunk read cache (read latency under heavy ingest)
 
 **A read concurrent with sustained ingest re-fetched the same immutable baseline
 chunk objects on every query.** After the non-blocking-read fix above, a bare
@@ -943,7 +1087,7 @@ immutable objects.
   version-keyed `part_cache` cleared between folds (emulating ingest version
   churn), and asserts the second fold issues ZERO baseline-chunk object GETs.
 
-## Unreleased — Fix: `count(*)`/`max` no longer blocks behind in-flight compaction during heavy ingest
+### Unreleased — Fix: `count(*)`/`max` no longer blocks behind in-flight compaction during heavy ingest
 
 **A bare metadata aggregate (`SELECT count(*)`/`max(id)`) issued during a heavy
 sustained COPY could stall for the duration of an in-flight compaction.** The
@@ -981,7 +1125,7 @@ fast once it stops" symptom.
   returns promptly while the blocking `flush_to_parquet` waits, then that the
   count converges exactly after the lock releases.
 
-## Unreleased — Perf (opt-in): faster compaction encode for ingest-throughput-over-disk-size workloads
+### Unreleased — Perf (opt-in): faster compaction encode for ingest-throughput-over-disk-size workloads
 
 **Flag-gated lever for the single-node bulk-COPY ingest CPU ceiling.** Sustained
 single-node bulk-COPY ingest is CPU-bound on the per-batch columnar encode, not
@@ -1014,7 +1158,7 @@ encode.
   opt-in rather than the default. The test asserts a conservative ≥1.2× floor so
   a regression that erases the win fails CI.
 
-## Unreleased — Fix: read-freshness convergence — drain the residual tail promptly once ingest goes idle
+### Unreleased — Fix: read-freshness convergence — drain the residual tail promptly once ingest goes idle
 
 **Correctness/freshness fix for the durable-vs-visible gap after a write burst.**
 A row is made WAL-durable on the write path (the #34 end-of-COPY durable barrier
@@ -1048,7 +1192,7 @@ draining at the compaction cadence after ingest stopped.
   #27 and the CAS semantics are unchanged. Set `BASIN_QUIESCE_COMPACT_SECS=0` to
   disable.
 
-## Unreleased — Fix (#41): metadata range-aggregate must not over-count files that overlap the boundary or carry inconsistent/partial stats
+### Unreleased — Fix (#41): metadata range-aggregate must not over-count files that overlap the boundary or carry inconsistent/partial stats
 
 **Correctness fix for the COUNT/MIN/MAX/SUM-over-an-integer-range fast path.**
 The fast path answers `COUNT(*) … WHERE col >=/>/<=/< lit` from per-file
@@ -1087,7 +1231,7 @@ regression. Regression tests cover fully-contained (counted), fully-outside (0),
 straddle (bail), range-superset (bail), inverted-stats (bail), and a
 multi-row-group Parquet file whose coalesced stats span every row group.
 
-## Unreleased — Perf (#27): flat-scale partition baselines — chunked, content-addressed baseline so per-commit PUT bytes no longer grow with table size
+### Unreleased — Perf (#27): flat-scale partition baselines — chunked, content-addressed baseline so per-commit PUT bytes no longer grow with table size
 
 **Correctness-preserving perf fix.** Sustained single-table ingest decayed as
 the table grew (observed on dev: ~34k → ~18k rows/s on one growing table). The
@@ -1124,7 +1268,7 @@ missing errors clearly rather than silently dropping files. The create-if-absent
 CAS on the segment object remains the sole commit arbiter. Per-commit
 object-store **read** count was already flat and is unchanged.
 
-## Unreleased — Fix: exactly-once partition commit under an ambiguous object-store PUT (no more double-counted rows during a 408 storm)
+### Unreleased — Fix: exactly-once partition commit under an ambiguous object-store PUT (no more double-counted rows during a 408 storm)
 
 **Correctness fix.** Under a sustained object-store (Tigris S3) `408 Request
 Timeout` storm, a heavy ingest could over-report `count(*)` and return duplicate
@@ -1177,7 +1321,7 @@ commit succeeds with the wave's file referenced exactly once (fresh cold-read
 (commit surfaces the timeout → would re-flush), passes after. basin-catalog lib:
 247 pass.
 
-## Unreleased — Perf: eliminate redundant object-store head-resolution on the compaction commit hot path (per-node ingest throughput)
+### Unreleased — Perf: eliminate redundant object-store head-resolution on the compaction commit hot path (per-node ingest throughput)
 
 **Cuts the object-store round trips per conflict-free per-partition commit by
 about half** (~10 sequential GET/HEAD reads → ~5), lifting per-node sustained
@@ -1219,7 +1363,7 @@ count equals exactly the rows committed — no over/under count, no duplicate
 paths, heads converge, no livelock). The existing adversarial CAS / stale-head /
 lost-commit-race gates stay green.
 
-## Unreleased — Docs + tests: exactly-once-under-retry contract for COPY/INSERT resync (no behaviour change)
+### Unreleased — Docs + tests: exactly-once-under-retry contract for COPY/INSERT resync (no behaviour change)
 
 **Clarifies and pins the exactly-once-under-retry guarantee** for the bulk
 ingest path. The durable barrier (#34) made the engine no-LOSS, but a client
@@ -1251,7 +1395,7 @@ keyless blind re-send duplicates). Docs: `docs/architecture.md` §4 gains a
 "Durability vs. exactly-once under retry" subsection; `CAPABILITIES.md` COPY row
 and `docs/import.md` retry-safety note updated. No engine behaviour change.
 
-## Unreleased — Fix: adaptive ingest auto-tuner no longer changes fan-out at runtime (correctness — was double-counting `count(*)`) (`BASIN_AUTOTUNE`, default OFF)
+### Unreleased — Fix: adaptive ingest auto-tuner no longer changes fan-out at runtime (correctness — was double-counting `count(*)`) (`BASIN_AUTOTUNE`, default OFF)
 
 **Correctness fix.** Phase 2 of the auto-tuner adjusted the bulk-ingest
 **fan-out** live (via a runtime override read by `executor::write_batch_fanout`).
@@ -1295,7 +1439,7 @@ written, every id exactly once. Still a provable no-op at the default (the
 controller is constructed only when `BASIN_AUTOTUNE` is on, and no runtime
 override is ever published when off).
 
-## Unreleased — Fix: adaptive ingest auto-tuner can no longer drift below the hardware-derived baseline on noisy signals (`BASIN_AUTOTUNE`, default OFF)
+### Unreleased — Fix: adaptive ingest auto-tuner can no longer drift below the hardware-derived baseline on noisy signals (`BASIN_AUTOTUNE`, default OFF)
 
 **Robustness fix for the live controller.** The committed-rows/s signal is
 noisy at low ingest rates (dev: ~10–17k r/s), and the previous controller
@@ -1326,7 +1470,7 @@ unit tests cover the no-drift-under-noise regression and the clear-sustained-
 win path; the climb/back-off/overload tests still hold. Still a provable no-op
 at the default (controller constructed only when `BASIN_AUTOTUNE` is on).
 
-## Unreleased — Add: hardware-aware ingest concurrency auto-tuner with live self-tuning (`BASIN_AUTOTUNE`, default OFF)
+### Unreleased — Add: hardware-aware ingest concurrency auto-tuner with live self-tuning (`BASIN_AUTOTUNE`, default OFF)
 
 **Perf feature, flag-gated and off by default.** Basin's ingest concurrency
 knobs — shard fan-out (`BASIN_SHARD_PARTITIONS_PER_TABLE`), flush concurrency
@@ -1397,7 +1541,7 @@ constructed, no override is ever published (the runtime atomics stay 0), and
 the two hot-path counters are written but never observed — behavior is
 byte-for-byte today's.
 
-## Unreleased — Fix: dead pgwire connections no longer leak the per-project connection-ceiling slot (#33)
+### Unreleased — Fix: dead pgwire connections no longer leak the per-project connection-ceiling slot (#33)
 
 **Correctness / availability fix.** Each accepted pgwire session holds a
 `ConnectionGuard` that decrements the project's live-connection counter on
@@ -1423,7 +1567,7 @@ dead socket is torn down deterministically (~90s) regardless of host
 `tcp_keepalive_probes`. The guard's decrement is idempotent (saturating, never
 negative, never double-counted).
 
-## Unreleased — Fix: SERIAL/sequence no longer regresses on restart (#15)
+### Unreleased — Fix: SERIAL/sequence no longer regresses on restart (#15)
 
 **Correctness fix.** On restart, the shard reconciles each SERIAL/identity
 sequence against the maximum id recovered from its own durable WAL + storage
@@ -1446,7 +1590,7 @@ recovery can only ever move a sequence forward. Gaps after a crash remain
 acceptable (PG-compatible); regression/duplicates cannot occur. New tests cover
 the no-regression invariant at the catalog and shard-recovery layers.
 
-## Unreleased — Multi-bucket storage pool, Stage 2a: single-project partition→bucket striping (routing seam, flag-gated)
+### Unreleased — Multi-bucket storage pool, Stage 2a: single-project partition→bucket striping (routing seam, flag-gated)
 
 Adds the THROUGHPUT lever to the multi-bucket pool (engine task #36). Stage 1
 isolated projects from each other (one project ↔ one bucket) but did not raise a
@@ -1490,7 +1634,7 @@ entry points, growing/rebalancing a stripe set, and production instantiation in
 
 Config: adds `BASIN_BUCKET_POOL_STRIPE` (default 1 = no striping).
 
-## Unreleased — Multi-bucket storage pool, Stage 1 (foundation, flag-gated)
+### Unreleased — Multi-bucket storage pool, Stage 1 (foundation, flag-gated)
 
 Lays the FOUNDATION for the bounded multi-bucket storage pool (engine task #36):
 many projects share a bounded set of pooled object-store buckets, isolated by the
@@ -1527,7 +1671,7 @@ When ON:
 Config: `BASIN_BUCKET_POOL` (off), `BASIN_BUCKET_POOL_MAX` (8),
 `BASIN_BUCKET_POOL_WATERMARK` (64).
 
-## 2026-06-25 — Crash-consistent COPY across nodes: durable-on-forward
+### 2026-06-25 — Crash-consistent COPY across nodes: durable-on-forward
 
 Extends the end-of-COPY durable barrier (below) to cover FORWARDED partitions in
 a multi-node cluster. In `#28` multi-node bulk ingest, a `COPY` landing on one
@@ -1551,7 +1695,7 @@ node (originator or remote owner) cannot lose an acked row. Gated by the SAME
 both limbs revert to async, symmetric); the forwarded path stays idempotent /
 retry-safe via the existing per-batch `idem_key`.
 
-## 2026-06-24 — Crash-consistent COPY: end-of-COPY durable barrier
+### 2026-06-24 — Crash-consistent COPY: end-of-COPY durable barrier
 
 A single `COPY` buffers its rows into batches that the bulk-ingest fan-out
 round-robins across N partitions, each appended to the WAL async (the default
@@ -1577,7 +1721,7 @@ default; set `0`/`false` to disable). The multi-node limb (a COPY that forwards
 a partition to a remote owner) is closed by the durable-on-forward change dated
 below.
 
-## 2026-06-24 — Metadata-only aggregates over an integer range predicate
+### 2026-06-24 — Metadata-only aggregates over an integer range predicate
 
 `SELECT COUNT(*) / MIN(col) / MAX(col) / SUM(col) FROM t WHERE col >= A AND col < B`
 (a half-open integer range on a single column) is now answered from per-file
@@ -1592,7 +1736,7 @@ nulls in the range column, or lacks stats) bails the whole query to a correct
 full scan. Same answer, no data decode when the range aligns with file
 boundaries.
 
-## 2026-06-21 — Bound per-partition data-file count: file-merge compaction tier for truly flat ingest
+### 2026-06-21 — Bound per-partition data-file count: file-merge compaction tier for truly flat ingest
 
 The previous two ingest-flatness fixes (O(1) delta-segment commits; dropping the
 per-commit whole-table `load_unioned`) left a MILD residual decline (~32k → ~17k
@@ -1637,7 +1781,7 @@ Needs deploy-validation: the file-count bound is proven in-process over an
 InMemory store; the sustained-ingest flatness win must be confirmed against a
 real object store (Tigris) under load before publishing a flat-ingest number.
 
-## 2026-06-21 — Flatten residual ingest-rate decline: per-partition commit no longer unions the whole table
+### 2026-06-21 — Flatten residual ingest-rate decline: per-partition commit no longer unions the whole table
 
 After the O(1) delta-segment commit fix, single-node sustained ingest no longer
 collapsed, but a MILD residual decline remained (~32k r/s early → ~17k by 440M):
@@ -1675,7 +1819,7 @@ data-rewrite compaction tier that bounds the per-partition data-file COUNT
 (merging many small flushed files into fewer larger ones); that is the deeper
 follow-up (#27) and is out of scope for this no-deploy catalog/metadata pass.
 
-## 2026-06-21 — Fix S3/Tigris connection-pool exhaustion under sustained writes (tight retry budget)
+### 2026-06-21 — Fix S3/Tigris connection-pool exhaustion under sustained writes (tight retry budget)
 
 Under sustained high-throughput ingest, compaction flush PUTs to Tigris began
 failing with `Generic S3 error: Error performing PUT ... in 219s/309s/332s,
@@ -1716,7 +1860,7 @@ across the catalog/hottier/shard write paths, so a global PUT gate would be
 invasive and risk deadlocking against the catalog CAS commit path; the
 fast-fail/recycle behaviour above resolves the wedge on its own.
 
-## 2026-06-20 — Flat-scale ingest: O(1)-amortized per-partition catalog commits (delta segments + periodic snapshot)
+### 2026-06-20 — Flat-scale ingest: O(1)-amortized per-partition catalog commits (delta segments + periodic snapshot)
 
 On a live 2-node dev test, multi-node ingest throughput decayed ~48k→31k r/s
 from 10M→155M rows — with the compaction tail bounded (1–6 MiB), zero
@@ -1775,7 +1919,7 @@ correct. The multi-writer / no-contention / union-correctness test
 (`multi_writer_cross_partition_no_contention`) and same-partition OCC test
 still pass.
 
-## 2026-06-20 — Route the ingest hot path through a cheap META-only catalog load (multi-node ingest throughput)
+### 2026-06-20 — Route the ingest hot path through a cheap META-only catalog load (multi-node ingest throughput)
 
 After the per-partition data-file sharding (below), multi-node bulk ingest
 dropped from ~60k r/s to ~12.5k r/s — no CAS contention, no backpressure, pure
@@ -1816,7 +1960,7 @@ Read paths (scans / COUNT / SELECT) keep the full unioned `load_table` — they
 legitimately need the live data-file set. Only the ingest constraint-prep path
 changed.
 
-## 2026-06-20 — Shard the object-store data-file manifest by partition (multi-node ingest scaling)
+### 2026-06-20 — Shard the object-store data-file manifest by partition (multi-node ingest scaling)
 
 A live two-node deploy stalled a bulk `COPY` at ~55M rows with a CAS-contention
 storm in the logs (`commit conflict: …: lost commit race at version 394`,
@@ -1866,7 +2010,7 @@ A table written under the pre-shard single-chain layout is not auto-migrated —
 the object-store catalog requires the new layout (no production data exists in
 it yet, so no migration is needed).
 
-## 2026-06-20 — Fix multi-node duplicate rows from at-least-once partition-write forwarding
+### 2026-06-20 — Fix multi-node duplicate rows from at-least-once partition-write forwarding
 
 A live two-node deploy lost zero rows but produced **duplicates**: a 10,000,000-row
 `COPY` (no PK) acked `COPY 10000000` yet `count(*)` returned 10,520,000 with
@@ -1902,7 +2046,7 @@ transport was "not installed" on every multi-node boot even when the Fly
 discovery path had installed it unconditionally; the install state is now logged
 once, truthfully, after both install paths have run.
 
-## 2026-06-20 — Fix multi-node data loss from lease-stealing reads (basin-shard)
+### 2026-06-20 — Fix multi-node data loss from lease-stealing reads (basin-shard)
 
 A live two-node deploy (`BASIN_LEASE_MODE=required`, object-store catalog,
 partition fan-out) lost exactly one partition's worth of rows: a 200,000-row
@@ -1945,7 +2089,7 @@ Fixes:
 New regression tests in `basin-shard`: `read_does_not_steal_writer_lease`,
 `lost_lease_flushes_tail_before_dropping_state`, `only_lease_holder_compacts`.
 
-## 2026-06-20 — Durable, multi-node-safe sequences in the object-store catalog
+### 2026-06-20 — Durable, multi-node-safe sequences in the object-store catalog
 
 The Basin-native object-store catalog (`BASIN_CATALOG_BACKEND=object_store`)
 now implements the full sequence surface plus the remaining state-bearing
@@ -1980,7 +2124,7 @@ credential insert both depend on sequences).
   `set_/get_project_storage_config` and the bare `fork_table` are implemented.
   All are visible across nodes sharing one store.
 
-## 2026-06-20 — Object-store shared catalog is schema-qualified (ADR 0022)
+### 2026-06-20 — Object-store shared catalog is schema-qualified (ADR 0022)
 
 The Basin-native object-store catalog (`BASIN_CATALOG_BACKEND=object_store`)
 now keys table manifests by `(project, schema, table)` instead of assuming a
@@ -2012,7 +2156,7 @@ object-store backend would have made those `auth` tables collide with / shadow
   the key layout was changed freely (no manifest-version migration code exists
   to update).
 
-## 2026-06-19 — Fly.io self-id derivation + dynamic peer discovery for partition forwarding (#28)
+### 2026-06-19 — Fly.io self-id derivation + dynamic peer discovery for partition forwarding (#28)
 
 Multi-node partition forwarding now works on Fly.io, where (a) all machines in
 an app SHARE env vars (so `BASIN_REPLICA_ID` cannot be a static per-machine
@@ -2055,7 +2199,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   catalog + object-store LIST regardless of which node wrote it. Live data
   rebalance remains out of scope.
 
-## 2026-06-19 — Install partition-forward transport + ingest-pressure metrics in the deployed server (#28)
+### 2026-06-19 — Install partition-forward transport + ingest-pressure metrics in the deployed server (#28)
 
 - **`basin-server` now installs the partition-forward HTTP transport**, so a
   multi-node deploy can actually forward a fan-out batch to the partition's
@@ -2098,7 +2242,7 @@ value) and (b) the machine set changes under autoscaling (so a static
     (basin-shard), `with_ingest_pressure_overlays_three_keys_only` +
     `snapshot_serializes_with_all_eleven_fields` (basin-engine).
 
-## 2026-06-19 — Transparent per-partition write forwarding (#28 multi-node bulk ingest)
+### 2026-06-19 — Transparent per-partition write forwarding (#28 multi-node bulk ingest)
 
 - **A bulk COPY/ingest landing on any node now writes each fan-out partition on
   the node that OWNS it, transparently to the client.** N engine nodes sharing
@@ -2150,7 +2294,7 @@ value) and (b) the machine set changes under autoscaling (so a static
     the object-store catalog (carried gap). The forwarded request is counted
     against the home node's connection ceiling like any HTTP request.
 
-## 2026-06-19 — Wire the object-store shared catalog into the deployed engine server
+### 2026-06-19 — Wire the object-store shared catalog into the deployed engine server
 
 - **`BASIN_CATALOG=object_store` now selects the Basin-native shared catalog +
   writer-lease registry in `basin-server`.** Previously the
@@ -2184,7 +2328,7 @@ value) and (b) the machine set changes under autoscaling (so a static
     schemas are not yet addressable by this backend — schema-qualified manifests
     remain a follow-up.
 
-## 2026-06-19 — Basin-native shared catalog + lease registry on the object store (no external DB)
+### 2026-06-19 — Basin-native shared catalog + lease registry on the object store (no external DB)
 
 - **New `basin_catalog::ObjectStoreCatalog` — a shared, multi-node catalog
   backed entirely by the object store (Tigris/S3), with no external database.**
@@ -2230,7 +2374,7 @@ value) and (b) the machine set changes under autoscaling (so a static
     manifest versions, and the live cloud-server wiring of the env switch are
     out of scope for this wave.
 
-## 2026-06-19 — Perf: intra-node horizontal partitioning fans bulk ingest across P compaction lanes
+### 2026-06-19 — Perf: intra-node horizontal partitioning fans bulk ingest across P compaction lanes
 
 - **A single bulk COPY now fans its batches across `P` shard partitions, so the
   table runs `P` independent compaction lanes instead of one.** Previously every
@@ -2267,7 +2411,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   `P×` it. (`basin-shard/src/in_process.rs`: `max_tail_bytes`, `hard_tail_bytes`,
   `fanout_partitions`.)
 
-## 2026-06-19 — Perf: parallel compaction keeps the tail bounded under a high-RTT object store
+### 2026-06-19 — Perf: parallel compaction keeps the tail bounded under a high-RTT object store
 
 - **Compaction now flushes multiple bounded output files concurrently, so its
   throughput scales with parallel object-store PUT bandwidth instead of
@@ -2306,7 +2450,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   catalog/WAL/storage reconstructs every committed row — no segment dropped
   early). (`basin-shard/src/in_process.rs`.)
 
-## 2026-06-18 — Perf: flatter no-PK bulk-COPY ingest against a high-RTT object store
+### 2026-06-18 — Perf: flatter no-PK bulk-COPY ingest against a high-RTT object store
 
 - **Sustained no-PK bulk-COPY throughput no longer decays as the table grows
   when flushes hit a high-latency object store (e.g. Tigris).** Two compounding
@@ -2339,7 +2483,7 @@ value) and (b) the machine set changes under autoscaling (so a static
     is still hard-capped, and the watermark-before-truncate durability ordering
     is untouched.
 
-## 2026-06-18 — Fix: catalog is a stats cache, not the authoritative file index
+### 2026-06-18 — Fix: catalog is a stats cache, not the authoritative file index
 
 - **Correctness fix — the storage read path and the PRIMARY-KEY duplicate check
   no longer miss on-disk files that the catalog does not track.** A prior change
@@ -2369,7 +2513,7 @@ value) and (b) the machine set changes under autoscaling (so a static
     zone-map/bloom pruning; it pays one LIST per chunk for the authoritative
     file set.
 
-## 2026-06-18 — Perf: flat-cost keyed/PRIMARY-KEY bulk ingest at scale
+### 2026-06-18 — Perf: flat-cost keyed/PRIMARY-KEY bulk ingest at scale
 
 - **Keyed (PRIMARY KEY) bulk ingest now stays roughly flat in per-chunk cost as
   a table grows — the per-chunk PK-uniqueness check no longer does work that
@@ -2411,7 +2555,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   exact, a genuine duplicate key is still rejected (`23505` on `t_pkey`), and
   point lookups return the right row.
 
-## 2026-06-18 — Perf: flat-cost bulk ingest at scale (bounded tail + incremental compaction)
+### 2026-06-18 — Perf: flat-cost bulk ingest at scale (bounded tail + incremental compaction)
 
 - **Bulk ingest (COPY / INSERT) now stays roughly flat in per-chunk cost as a
   table grows, and the in-memory tail is bounded — no more OOM / dropped COPY
@@ -2454,7 +2598,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   scale; the in-memory catalog clones the full snapshot chain per call
   (O(files)) which the engine's own catalog storage avoids in production.
 
-## 2026-06-18 — Fix: DELETE fast path lost a row count for an absent PK (data-loss correctness)
+### 2026-06-18 — Fix: DELETE fast path lost a row count for an absent PK (data-loss correctness)
 
 - **`DELETE FROM t WHERE pk = <absent>` no longer reports a phantom deletion or
   corrupts `COUNT(*)`.** The hot-tier DELETE fast path (single-column-PK
@@ -2484,7 +2628,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   oracle. Correctness over speed — the fast path stays a point-probe (O(matching
   files), not a full scan).
 
-## 2026-06-18 — Cold-read: background whole-file prefetch + higher storage scan fan-out
+### 2026-06-18 — Cold-read: background whole-file prefetch + higher storage scan fan-out
 
 - **Disk-cache whole-file prefetch moved off the cold critical path.** The
   speculative whole-file promotion (LEVER 3) — which warms a small file's whole
@@ -2514,7 +2658,7 @@ value) and (b) the machine set changes under autoscaling (so a static
 - General across any cold scan of any table; not benchmark-shaped. No change
   to query results, the warm path, or default durability behaviour.
 
-## 2026-06-18 — Cached libpg_query parse: lower warm per-statement floor
+### 2026-06-18 — Cached libpg_query parse: lower warm per-statement floor
 
 - The libpg_query parse that runs at the top of every statement
   (`pg_ast::parse`, the C-library PostgreSQL grammar reduction +
@@ -2537,7 +2681,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   prepared-statement semantics, or the extended-query path. Measured locally
   on a LocalFS engine driving a warmed `id = $1` point lookup.
 
-## 2026-06-18 — Catalog-driven file discovery: zero LIST RPCs on warm scans/writes
+### 2026-06-18 — Catalog-driven file discovery: zero LIST RPCs on warm scans/writes
 
 - `Storage::list_data_files` (and through it `list_data_files_with_stats`) and
   the storage-layer `read()` file-discovery path now serve the table's live
@@ -2560,7 +2704,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   catalog-known (schema-less callers, integration tests), so behaviour for
   those paths is unchanged.
 
-## 2026-06-18 — Multi-region: `http-forward` write transport + receive endpoint (ADR 0009)
+### 2026-06-18 — Multi-region: `http-forward` write transport + receive endpoint (ADR 0009)
 
 - `BASIN_WRITE_FORWARD_MODE=http-forward` now actually forwards a non-home
   auto-commit write to the project's home region over Fly 6PN HTTP and returns
@@ -2585,7 +2729,7 @@ value) and (b) the machine set changes under autoscaling (so a static
 - `fly-replay` and `off` modes are unchanged; unset/empty mode or a missing
   secret/peers behaves identically to before.
 
-## 2026-06-18 — Observability: `GET /metrics/inflight` exposes in-flight + latency for autoscaling
+### 2026-06-18 — Observability: `GET /metrics/inflight` exposes in-flight + latency for autoscaling
 
 - New REST route `GET /metrics/inflight` returns a small JSON snapshot of
   engine-wide load: `inflight` (concurrency gauge of statements executing now),
@@ -2600,7 +2744,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   `execute_bound`) — one wrap per statement, no double-count. One atomic inc/dec +
   one mutex push per query; polled once per scrape.
 
-## 2026-06-18 — Perf (OLTP): point/small INSERT prunes instead of rebuilding the PK set
+### 2026-06-18 — Perf (OLTP): point/small INSERT prunes instead of rebuilding the PK set
 
 - Single-row INSERT was ~200 ms+ because `enforce_pk_on_insert` on a sub-threshold
   table used the cached-set path, which rebuilds/re-reads the existing PK set —
@@ -2616,7 +2760,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   Correctness preserved (bloom false-positives only cause a needless read;
   false-negatives are impossible) — verified by tests/pk_streaming.rs.
 
-## 2026-06-17 — Perf: keep Vortex footers/zone-maps RAM-resident (cold-read + point-lookup win)
+### 2026-06-17 — Perf: keep Vortex footers/zone-maps RAM-resident (cold-read + point-lookup win)
 
 - The Vortex footer cache was capped at 512 entries (LRU) while the Parquet meta
   cache holds 16k — so a many-file table re-fetched footers from the object store
@@ -2628,7 +2772,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   single-file open is served from cache). Page cache is bumped per-deployment via
   `BASIN_PAGE_CACHE_MAX_BYTES` (engine default stays conservative for small OSS boxes).
 
-## 2026-06-17 — Observability: shard tail-pressure warning (bounded-memory signal)
+### 2026-06-17 — Observability: shard tail-pressure warning (bounded-memory signal)
 
 - A 10M-row wide COPY OOM-killed a 2 GB engine: the shard's in-memory tail
   (uncompacted batches) grows with ingest rate and, for wide rows, outran the
@@ -2641,7 +2785,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   to let the per-partition handle invoke the shard compactor — tracked as a
   follow-up. Interim mitigation: 8 GB dev boxes.
 
-## 2026-06-17 — Feat: per-project (per-tier) pgwire rate limiting
+### 2026-06-17 — Feat: per-project (per-tier) pgwire rate limiting
 
 - The pgwire request rate limiter was per-project-keyed but with a single
   GLOBAL quota (`BASIN_PGWIRE_RATE_LIMIT_QPS`) — every project got the same cap,
@@ -2658,7 +2802,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   a project without an override is unaffected (one project's cap cannot starve
   another) — the per-project noisy-neighbor guard at the request-rate dimension.
 
-## 2026-06-17 — Feat: super-admin cross-project live usage analytics
+### 2026-06-17 — Feat: super-admin cross-project live usage analytics
 
 - New `GET /admin/v1/usage` (admin-global, `require_admin` only): per-project
   live usage across ALL projects on the engine instance — ops, bytes r/w,
@@ -2669,7 +2813,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   read-only. The control plane fans this out across engine instances for a
   fleet-wide dashboard.
 
-## 2026-06-17 — Fix: DROP TABLE purges object-store files (no ghost rows on re-create)
+### 2026-06-17 — Fix: DROP TABLE purges object-store files (no ghost rows on re-create)
 
 - `DROP TABLE` dropped the catalog row, hot-tier overlay, and shard tail but
   **left the table's cold data files in object storage**. A later
@@ -2683,7 +2827,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   compaction is still writing under the prefix). Verified: COPY 50k → DROP →
   re-CREATE same name → COPY 50k yields exactly 50k rows, no ghost duplicate.
 
-## 2026-06-17 — Fix (major): pooled sessions now use the fast batched COPY path
+### 2026-06-17 — Fix (major): pooled sessions now use the fast batched COPY path
 
 - `PooledSessionWrapper` (the session the pgwire router uses whenever
   `BASIN_POOL_ENABLED=1` — the default dev/prod config) did not override
@@ -2701,7 +2845,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   session (same delegation as every other `Session` method). COPY now takes the
   batched fast path under the pool. No-PK and PK COPY both ~2M+ rows/s locally.
 
-## 2026-06-17 — Dev/test: opt-in plaintext-HTTP S3 endpoints (BASIN_STORAGE_ALLOW_HTTP)
+### 2026-06-17 — Dev/test: opt-in plaintext-HTTP S3 endpoints (BASIN_STORAGE_ALLOW_HTTP)
 
 - The S3-compatible backend hard-rejected non-HTTPS endpoints, which blocked
   pointing the engine at a local MinIO/RustFS dev server over `http://127.0.0.1`.
@@ -2710,7 +2854,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   credentials never traverse plaintext. Enables local S3-path reproduction/tests
   without TLS certs.
 
-## 2026-06-17 — Fix: S3/Tigris custom endpoints use path-style (was dropping the bucket → 403)
+### 2026-06-17 — Fix: S3/Tigris custom endpoints use path-style (was dropping the bucket → 403)
 
 - The S3-compatible storage backend forced virtual-hosted-style requests for all
   providers. With a custom endpoint that has no per-bucket subdomain (Tigris's
@@ -2726,7 +2870,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   the dev engine actually ran on Tigris (it had silently defaulted to local
   storage because `BASIN_STORAGE_BACKEND` was unset).
 
-## 2026-06-17 — Perf/scale: bounded-memory PRIMARY KEY enforcement on bulk COPY
+### 2026-06-17 — Perf/scale: bounded-memory PRIMARY KEY enforcement on bulk COPY
 
 - `enforce_pk_on_insert` previously materialized the **entire** existing PK set
   in RAM (a `HashSet` of every key in the table) to detect collisions — `O(rows)`
@@ -2752,7 +2896,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   (clean load passes, cross-file + intra-batch dups rejected, no false positives);
   the shape-matrix harness confirms all shapes green on both paths.
 
-## 2026-06-17 — Fix: SUM/MIN/MAX over NUMERIC/FLOAT route to DataFusion (correct type)
+### 2026-06-17 — Fix: SUM/MIN/MAX over NUMERIC/FLOAT route to DataFusion (correct type)
 
 - The integer fast-aggregate path accumulates in i64; a SUM/MIN/MAX over a
   NUMERIC/FLOAT column previously errored "column is not Int64". The fast-SELECT
@@ -2761,7 +2905,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   output type. Integer aggregates keep the fast path. (Found by the shape-matrix
   harness — all shapes now green.)
 
-## 2026-06-17 — Engine: shape-matrix test harness + COPY timestamptz + integer SUM/MIN/MAX
+### 2026-06-17 — Engine: shape-matrix test harness + COPY timestamptz + integer SUM/MIN/MAX
 
 - **New** `crates/basin-engine/tests/shape_matrix.rs`: a fast, in-process,
   scalable engine bench over a matrix of table shapes (narrow/wide, PK/no-PK,
@@ -2778,7 +2922,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   Postgres) instead of erroring "column is not Int64". (NUMERIC/FLOAT in this
   fast path are still pending — tracked by the shape-matrix harness.)
 
-## 2026-06-17 — Perf: O(n) bulk COPY into a PRIMARY KEY table (was O(n²))
+### 2026-06-17 — Perf: O(n) bulk COPY into a PRIMARY KEY table (was O(n²))
 
 - COPY into a table with a PRIMARY KEY was pathologically slow (<~25 rows/s on
   an object-store backend) because every committed chunk added a data file and
@@ -2791,7 +2935,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   unchanged: cached-subset ∪ new-files = full scan; compaction (files replaced)
   falls back to a full rebuild; tombstone-active paths still bypass the cache.
 
-## 2026-06-17 — Fix: bounded-memory COPY (no per-batch Expr blow-up / OOM)
+### 2026-06-17 — Fix: bounded-memory COPY (no per-batch Expr blow-up / OOM)
 
 - `copy_ingest::apply_column_defaults_to_batch` materialised `n_rows × n_cols`
   sqlparser `Expr` values for **every** column-list COPY — even when all columns
@@ -2802,7 +2946,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   skip the allocation entirely (the dominant COPY shape). Correctness is
   identical — that path previously spliced the supplied columns straight back.
 
-## 2026-06-17 — Fix: serial sequences resume past recovered data after restart
+### 2026-06-17 — Fix: serial sequences resume past recovered data after restart
 
 - On restart the engine recovers committed rows from its durable WAL + object
   store, but the in-memory catalog's SERIAL/identity sequence cursor reset to
@@ -2815,7 +2959,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   so the sequence resumes exactly where the durable data left off. Recovered
   entirely from Basin's own WAL/storage; no external dependency.
 
-## 2026-06-17 — Fix: `COPY` now fills column DEFAULTs (incl. `SERIAL`) for omitted columns
+### 2026-06-17 — Fix: `COPY` now fills column DEFAULTs (incl. `SERIAL`) for omitted columns
 
 - A column-list `COPY t (a, b) FROM …` that omitted a `NOT NULL` column backed
   by a `DEFAULT`/`SERIAL`/`BIGSERIAL` wrongly failed with
@@ -2832,7 +2976,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   pre-validation; authoritative NOT-NULL + DEFAULT enforcement is the engine
   ingest path's job (it fills defaults or raises a genuine null violation).
 
-## 2026-06-17 — Fix: control-plane admin token may administer any project
+### 2026-06-17 — Fix: control-plane admin token may administer any project
 
 - `/admin/v1/projects/:id/{max-connections,placement,snapshot,restore,fork}`
   gated on the JWT's `project_id` matching the path project exactly, so the
@@ -2843,7 +2987,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   project — security-neutral, since such a token is already all-powerful via the
   unscoped provisioning route.
 
-## 2026-06-17 — Fix: TCP keepalive + nodelay on accepted pgwire connections
+### 2026-06-17 — Fix: TCP keepalive + nodelay on accepted pgwire connections
 
 - A freshly-accepted pgwire socket now gets `SO_KEEPALIVE` (30s idle / 10s
   interval) and `TCP_NODELAY`. Keepalive stops an L4 proxy in front of the
@@ -2852,7 +2996,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   a session exchanges. Best-effort — a platform that rejects an option leaves
   the socket usable.
 
-## 2026-06-15 — Fix: `@@` rewriter no longer mangles SQL comments
+### 2026-06-15 — Fix: `@@` rewriter no longer mangles SQL comments
 
 - The jsonb-path `@@` text-rewriter (`rewrite_binary_op_to_fn` in
   `jsonb_path_udf.rs`) skipped string literals + quoted identifiers but **not**
@@ -2863,7 +3007,7 @@ value) and (b) the machine set changes under autoscaling (so a static
 - Un-ignores `fts_at_at::at_at_inside_line_comment_is_ignored` (now a green
   regression guard).
 
-## 2026-06-15 — Docs: correct stale capability claims (binary NUMERIC wire, citext WHERE-fold)
+### 2026-06-15 — Docs: correct stale capability claims (binary NUMERIC wire, citext WHERE-fold)
 
 - `CAPABILITIES.md` no longer advertises two already-shipped features as deferred:
   - **Binary `NUMERIC` wire encoding** is implemented (`encode_numeric_binary`,
@@ -2874,7 +3018,7 @@ value) and (b) the machine set changes under autoscaling (so a static
     caveat was stale. (End-to-end harness remains `#[ignore]`-gated.)
 - Doc-only sync verified against current code; no behaviour change.
 
-## 2026-06-15 — Hot-tier DELETE/UPDATE fast path admits single-column B-tree indexes
+### 2026-06-15 — Hot-tier DELETE/UPDATE fast path admits single-column B-tree indexes
 
 - DELETE/UPDATE **by PK** on a table whose secondary indexes are all GIN or
   **single-column B-tree** now routes to the hot-tier overlay fast path
@@ -2893,7 +3037,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   spanning a rewritten row, a surviving same-file row, and an untouched file —
   `tests/integration/tests/btree_overlay_delete.rs`.
 
-## 2026-06-15 — Cloud control-plane: list projects
+### 2026-06-15 — Cloud control-plane: list projects
 
 - **`GET /admin/v1/projects`** enumerates all provisioned project ids (distinct
   `project_id` over the credential store, new `AuthStore::list_projects` +
@@ -2901,7 +3045,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   scoped). Dashboard table-stakes — there was previously no way to enumerate
   projects over HTTP. Pinned by `admin_list_projects_enumerates`.
 
-## 2026-06-15 — Cloud control-plane: deprovision (DELETE) a project
+### 2026-06-15 — Cloud control-plane: deprovision (DELETE) a project
 
 - **`DELETE /admin/v1/projects/:id`** fully deprovisions a project: deletes its
   object-store bytes (`Storage::delete_project`), drops its catalog rows —
@@ -2913,13 +3057,13 @@ value) and (b) the machine set changes under autoscaling (so a static
   `admin_delete_project_deprovisions` (provision → credentials present → delete →
   credentials gone, against the live PG-backed harness).
 
-## 2026-06-15 — Cloud control-plane: list project tables
+### 2026-06-15 — Cloud control-plane: list project tables
 
 - **`GET /admin/v1/projects/:id/tables`** returns a project's table names as
   JSON (`catalog.list_tables`) — a control-plane schema browser. Admin-scoped,
   read-only. Pinned by `admin_project_tables_lists_tables`.
 
-## 2026-06-15 — Cloud control-plane: per-project usage endpoint
+### 2026-06-15 — Cloud control-plane: per-project usage endpoint
 
 - **`GET /admin/v1/projects/:id/usage`** returns a project's cumulative
   billing-dimension counters as JSON — `ops_total`, `bytes_read/written_total`,
@@ -2931,7 +3075,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   exposing already-built engine/catalog capabilities. Pinned by
   `admin_functions_control.rs::admin_project_usage_returns_counters`.
 
-## 2026-06-15 — COUNT(*) stays O(files) after a hot-tier UPDATE/DELETE
+### 2026-06-15 — COUNT(*) stays O(files) after a hot-tier UPDATE/DELETE
 
 - **`SELECT COUNT(*)` no longer falls back to a full table scan when the table
   has a live hot-tier overlay** (a fast-path UPDATE or DELETE earlier in the
@@ -2947,7 +3091,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   `count_star_metadata_shortcut.rs` (delete-adjusts, combined update+delete,
   and a MAX-with-tombstone decline-and-correct test).
 
-## 2026-06-14 — Multi-array UNNEST in INSERT … SELECT (Django bulk_create)
+### 2026-06-14 — Multi-array UNNEST in INSERT … SELECT (Django bulk_create)
 
 - **`INSERT INTO t (…) SELECT * FROM UNNEST((ARRAY[…])::T1[], (ARRAY[…])::T2[])`
   now inserts the zipped rows.** This parallel multi-array `UNNEST` (Postgres
@@ -2962,7 +3106,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   with the INSERT-SELECT RETURNING fix, the full `bulk_create` shape works
   end-to-end. Pinned by `pg_operators` unit tests + `orm_sql_shapes.rs`.
 
-## 2026-06-14 — Enum columns advertise their own type OID (Prisma)
+### 2026-06-14 — Enum columns advertise their own type OID (Prisma)
 
 - **A user-enum result column now advertises the enum's own Postgres type OID in
   `RowDescription` instead of TEXT (25).** Prisma / node-pg map columns to their
@@ -2978,7 +3122,7 @@ value) and (b) the machine set changes under autoscaling (so a static
   TEXT (unchanged). Pinned by `field_description_surfaces_enum_oid_from_metadata`
   (router) and `enum_column_select_carries_oid_metadata` (engine).
 
-## 2026-06-14 — ORM SQL-shape fixes (Drizzle, SQLAlchemy, Django, gorm)
+### 2026-06-14 — ORM SQL-shape fixes (Drizzle, SQLAlchemy, Django, gorm)
 
 - **Array `&&` overlap with a parenthesized/cast operand** now rewrites to
   `arrays_overlap(...)` instead of being mangled by the range-operator rewriter.
@@ -3026,7 +3170,7 @@ wire-protocol fix, a router unit test:
   previously misread binary `int8` bytes as text and failed `strconv.ParseInt`;
   any binary-format result column over the extended protocol was affected.
 
-## 2026-06-14 — DEFERRABLE INITIALLY DEFERRED foreign keys (ORM migrations)
+### 2026-06-14 — DEFERRABLE INITIALLY DEFERRED foreign keys (ORM migrations)
 
 - **`FOREIGN KEY … DEFERRABLE INITIALLY DEFERRED` is now accepted and treated as
   deferred.** Postgres validates such FKs at `COMMIT`, not at the statement, so a
@@ -3041,7 +3185,7 @@ wire-protocol fix, a router unit test:
   skip per-row enforcement while **immediate FKs are still enforced**. Commit-time
   validation of deferred FKs remains future work and is documented as such.
 
-## 2026-06-14 — ALTER TABLE ADD CONSTRAINT … FOREIGN KEY (ORM migrations)
+### 2026-06-14 — ALTER TABLE ADD CONSTRAINT … FOREIGN KEY (ORM migrations)
 
 - **`ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY …` is now accepted and enforced.**
   ORMs create tables first and wire up foreign keys in a follow-up `ALTER`
@@ -3057,7 +3201,7 @@ wire-protocol fix, a router unit test:
   `crates/basin-engine/src/alter.rs`; covered by
   `type_ddl::alter_add_foreign_key_registers_and_enforces`.
 
-## 2026-06-14 — enum values stamped as a cast INSERT correctly (`'USER'::"Role"`)
+### 2026-06-14 — enum values stamped as a cast INSERT correctly (`'USER'::"Role"`)
 
 - **Cast-wrapped string literals coerce for enum / text columns.** ORMs (Django
   et al.) stamp enum INSERT values as an explicit cast — `'USER'::"Role"`
@@ -3069,7 +3213,7 @@ wire-protocol fix, a router unit test:
   `crates/basin-engine/src/dml.rs` (`coerce_string_ref`); covered by
   `type_ddl::enum_insert_with_cast_label`.
 
-## 2026-06-14 — explicit `DEFAULT` keyword in INSERT values
+### 2026-06-14 — explicit `DEFAULT` keyword in INSERT values
 
 - **`INSERT INTO t (…, c) VALUES (…, DEFAULT)` applies the column default.** The
   bare `DEFAULT` keyword in a value position was rejected by the value coercers
@@ -3080,7 +3224,7 @@ wire-protocol fix, a router unit test:
   `crates/basin-engine/src/executor.rs`; covered by
   `coverage_txn_schema::insert_explicit_default_keyword_applies_column_default`.
 
-## 2026-06-14 — HNSW vector search recall@10 0.60 → 1.00 (ef_search default)
+### 2026-06-14 — HNSW vector search recall@10 0.60 → 1.00 (ef_search default)
 
 - **Vector ANN search now sets a usable query-time `ef_search`.** The HNSW index
   left `instant-distance`'s default `ef_search` (100), which measured
@@ -3092,7 +3236,7 @@ wire-protocol fix, a router unit test:
   `HnswIndexBuilder::with_ef_search`. Source: `crates/basin-vector/src/index.rs`;
   measured by `ext_bench_vector`.
 
-## 2026-06-14 — array columns render in the PostgreSQL `{…}` text form on the wire
+### 2026-06-14 — array columns render in the PostgreSQL `{…}` text form on the wire
 
 - **Reading an array column returns PG array text `{a,b}` / `{}`.** A `List` /
   `LargeList` / `FixedSizeList` result column previously fell through to a Debug
@@ -3105,7 +3249,7 @@ wire-protocol fix, a router unit test:
   Source: `crates/basin-router/src/types.rs` (`render_cell` / `format_pg_array_text`);
   covered by `types::tests::pg_array_text_formatting`.
 
-## 2026-06-14 — INSERT array values in the PostgreSQL curly-brace text form
+### 2026-06-14 — INSERT array values in the PostgreSQL curly-brace text form
 
 - **`'{a,b}'::T[]` / `'{}'::T[]` array literals INSERT into array columns.**
   Drivers (Django ArrayField, libpq array output) emit the PostgreSQL
@@ -3119,7 +3263,7 @@ wire-protocol fix, a router unit test:
   string array). Source: `crates/basin-engine/src/{dml,pg_operators}.rs`; covered
   by `array_fns::insert_pg_curly_array_literals` + `dml::tests::pg_array_literal_parses_all_forms`.
 
-## 2026-06-14 — ALTER TABLE ADD COLUMN … DEFAULT v NOT NULL (ORM migrations)
+### 2026-06-14 — ALTER TABLE ADD COLUMN … DEFAULT v NOT NULL (ORM migrations)
 
 - **`ALTER TABLE ADD COLUMN … DEFAULT v NOT NULL` is now allowed.** The canonical
   Django/Rails migration shape (`ADD COLUMN version INTEGER DEFAULT 0 NOT NULL`)
@@ -3138,7 +3282,7 @@ wire-protocol fix, a router unit test:
   work, matching PG. Source: `crates/basin-engine/src/dml.rs` (`coerce_i64` /
   `coerce_f64`). Covered by `schema_alter_add_column_not_null_with_default_allowed`.
 
-## 2026-06-14 — system functions in FROM position (`SELECT * FROM current_schema()`)
+### 2026-06-14 — system functions in FROM position (`SELECT * FROM current_schema()`)
 
 - **`SELECT * FROM current_schema()` / `current_database()` / `version()` resolve.**
   Drivers (typeorm's `PostgresQueryRunner` connect) call these nullary system
@@ -3151,7 +3295,7 @@ wire-protocol fix, a router unit test:
   Source: `crates/basin-engine/src/pg_operators.rs` (`rewrite_system_fn_from_table`);
   covered by `orm_driver_connect.rs`.
 
-## 2026-06-14 — pgwire reports a PG-compatible server_version (ORM connectivity fix)
+### 2026-06-14 — pgwire reports a PG-compatible server_version (ORM connectivity fix)
 
 - **Startup `server_version` is now a real PostgreSQL version ("15.0").**
   pgwire's `DefaultServerParameterProvider` defaults `server_version` to its OWN
@@ -3200,7 +3344,7 @@ wire-protocol fix, a router unit test:
   `()` calls, so `count(*)` / `max(x)` are unchanged. Source:
   `crates/basin-engine/src/executor.rs`.
 
-## 2026-06-14 — Cold DELETE write-amp: GIN-only tombstone fast path + FK-cascade re-read skip
+### 2026-06-14 — Cold DELETE write-amp: GIN-only tombstone fast path + FK-cascade re-read skip
 
 - **GIN-only tables now take the DELETE tombstone fast path.** A DELETE on a
   table whose only secondary index is `USING gin` (jsonb containment / tsvector
@@ -3235,7 +3379,7 @@ wire-protocol fix, a router unit test:
   Matching Postgres's in-place delete there needs overlay-aware btree/GIST
   maintenance (tracked).
 
-## 2026-06-14 — Multi-node raft hardening (mTLS transport, chaos-under-load drills, snapshot catch-up, per-region group routing, deploy harness)
+### 2026-06-14 — Multi-node raft hardening (mTLS transport, chaos-under-load drills, snapshot catch-up, per-region group routing, deploy harness)
 
 - **Mutual TLS for the raft transport (`BASIN_RAFT_TLS_CERT/KEY/CA`).** The
   tonic transport now runs over rustls with mutual authentication when the
@@ -3274,13 +3418,13 @@ wire-protocol fix, a router unit test:
   survived). `docs/runbooks/failover.md` gains the mTLS setup, the new drills,
   and the harness pointer; `docs/deployment.md` documents the mTLS env matrix.
 
-## 2026-06-14 — Program-wide feature summary (extensions, SQL surface, multi-node, CDC, SDKs, CLI, storage, scale)
+### 2026-06-14 — Program-wide feature summary (extensions, SQL surface, multi-node, CDC, SDKs, CLI, storage, scale)
 
 This entry summarises the capabilities that landed across the current program
 and are now on main. Per-commit detail lives in the individual dated entries
 that follow. Grouped by area.
 
-### Extensions
+#### Extensions
 
 - **`pg_trgm` — full SQL surface + GIN trigram index.** `similarity`, `word_similarity`, `show_trgm` registered as DataFusion UDFs. Operators: `%` (similarity threshold), `<%` (word-similarity threshold), `<->` (distance). GUC overrides via `SET pg_trgm.similarity_threshold` / `SET pg_trgm.word_similarity_threshold`. GIN trigram index (`CREATE INDEX … USING gin (col gin_trgm_ops)`): in-RAM posting list seeded at INSERT + CREATE INDEX backfill; `%` probes prune to candidate files using the conservative shared-trigram bound, then re-evaluate `similarity()` on survivors. Differential correctness pinned against unindexed twin: `trgm_gin_index.rs`. SQL conformance: `trgm_sql_conformance.rs`.
 
@@ -3298,7 +3442,7 @@ that follow. Grouped by area.
 
 - **Advisory locks + deadlock detection.** `pg_advisory_lock`/`pg_advisory_unlock`/`pg_advisory_unlock_all`/`pg_try_advisory_lock` (session-scoped); xact-scoped variants auto-released at COMMIT/ROLLBACK. Reentrancy (N locks need N unlocks). Project isolation. Wait-for-graph deadlock detector — ABBA cycles broken promptly with SQLSTATE 40P01. Lock-wait timeout → SQLSTATE 55P03. Disconnect releases all held session locks. ORM tooling compatibility (Prisma, sqlx, Diesel, golang-migrate). Pinned: `advisory_locks.rs`.
 
-### SQL surface
+#### SQL surface
 
 - **`MERGE INTO` (Postgres 15+).** Each WHEN action compiled to INSERT/UPDATE/DELETE through the normal pipeline. Actions: WHEN MATCHED THEN UPDATE/DELETE/DO NOTHING, WHEN NOT MATCHED THEN INSERT. First-match-wins. Duplicate-target SQLSTATE 21000. Atomicity (failing action rolls back the whole MERGE). RLS enforced on every action. VALUES and SELECT-subquery sources. Command tag `MERGE N`. Pinned: `merge_into.rs`.
 
@@ -3310,7 +3454,7 @@ that follow. Grouped by area.
 
 - **Schema namespaces (phase A).** `CREATE SCHEMA` / `DROP SCHEMA` / `CREATE SCHEMA IF NOT EXISTS`. Qualified `schema.table` names in DML/DDL. Schema-aware in-memory + Postgres catalog. `basin_schemas` table. Cross-schema queries with differential coverage. `search_path` semantics and wider schema-scoped DDL in phases B–E. Pinned: `schema_namespaces.rs` + `schema_ddl.rs` + `schema_e2e.rs`.
 
-### Multi-node
+#### Multi-node
 
 - **`BASIN_LEASE_MODE=required` write-fence.** Catalog CAS + shard heartbeat writer-lease. Happy path: acquire → heartbeat renew (not a regrant) → writes flow. Fencing: lost lease → in-flight and fresh handles refuse writes (`BasinError::LeaseNotHeld`); reads continue; replica recovers by re-acquiring at a higher epoch. Writes refused under a foreign lease (reads unaffected). Off mode: pre-existing CommitConflict behaviour unchanged. Pinned: `lease_mode_required.rs` + `lease_failure_paths.rs` + `lease_handoff.rs`.
 
@@ -3320,7 +3464,7 @@ that follow. Grouped by area.
 
 - **Per-project connection ceiling.** Hard ceiling enforced at pgwire startup (SQLSTATE 53300). `CatalogConnectionLimitProvider` reads from catalog; fail-closed (no stored ceiling → 25, Free tier). Admin API `POST /admin/v1/projects/:id/max-connections`. RAII guard; lowering never kills existing connections.
 
-### CDC
+#### CDC
 
 - **Durable CDC ring (Phase 1).** `basin-cdc::CdcRingWriter` as a post-commit `ChangeEventSink`. Every committed mutation (including HTAP hot-tier UPDATE/DELETE fast paths and in-tx mutations drained at COMMIT) appended to a per-project append-only ring on object storage. Committed-only, commit-ordered (`seq` monotonic). Size/time-window batching. Retention window (`BASIN_CDC_RETENTION_HOURS`, default 24h, max 168h). `cursor_expired` frame on stale consumer.
 
@@ -3330,28 +3474,28 @@ that follow. Grouped by area.
 
 - **Kafka/Redpanda push sink (Phase 3).** `basin-cdc::kafka` delivery worker draining the CDC ring into a Kafka/Redpanda topic.
 
-### SDKs
+#### SDKs
 
 - **10 client SDKs in `sdk/`.** `basin-js` (TypeScript/Node/Bun/Deno/CF Workers; realtime SSE + WebSocket; Arrow IPC), `basin-python` (async + sync; realtime via websockets extra; Arrow IPC via pyarrow extra), `basin-go` (Arrow IPC via arrow-go/v18), `basin-java`, `basin-rust`, `basin-ruby`, `basin-dotnet`, `basin-php`, `basin-dart`, `basin-swift`. All engine-direct (pgwire + REST); no cloud intermediary required.
 
-### CLI
+#### CLI
 
 - **`basin-cli` (`bas-in/basin-cli`, Go).** `basin login`, `basin projects list`, `basin sql run`, `basin dev` local-stack launcher. Release artefacts Sigstore-signed. Talks to basin-cloud `/v1/*` API.
 
-### Storage
+#### Storage
 
 - **Vortex is the default** (since 2026-05-18, commits ≤ 3787db0). Zero regression vs Parquet baseline. Catalog-persisted file stats (`column_stats` on every committed `DataFileRef`). Whole-file stats pruning (`Storage::read_paths` skips LIST + footer fetch when catalog stats prove the predicate prunes the file). Per-file bloom filters in `DataFileRef.bloom_filters`. `FileMetadataCache` + `VortexFooterCache` eliminate per-iteration footer re-parse.
 
 - **S3 cold-path levers.** `BASIN_STORAGE_BACKEND=s3|tigris`. NVMe disk cache (LRU; cold S3 fetches → warm SSD reads). Parquet page cache (LRU RecordBatches). HTTP/2 toggle for S3 client.
 
-### Scale benchmarks
+#### Scale benchmarks
 
 - **Fleet-scale isolation ladder** (`multi_project_fleet_scale.rs`): per-project isolation gates at 50 / 500 / 5000 projects with proportional noisy load. Victim p99 ratio pinned flat as fleet grows.
 - **1B-row write soak** (hypertable soak gate in `hypertable_harness.rs`, gated for provisioned hardware).
 - **Noisy-tenant fairness** (`noisy_neighbor_harness.rs`): per-project GIN posting budget partition + PkRowCache waterline + reconciler round-robin.
 - **Extension benchmark suites**: `ext_bench_vector.rs`, `ext_bench_postgis.rs`, `ext_bench_trgm.rs`, `ext_bench_timescale.rs`, `ext_bench_fts.rs`, `ext_bench_ranges.rs` (+ `_ext` variants for size-ladder sidecars) generate `benchmark/data/*.json` for the dashboard.
 
-### Honest gaps recorded
+#### Honest gaps recorded
 
 The following items from the "what landed this program" brief are **partial or absent** on main at time of writing, and are noted honestly:
 
@@ -3363,9 +3507,9 @@ The following items from the "what landed this program" brief are **partial or a
 - **`search_path` semantics** (schema namespace phases B–E): phase A (CREATE SCHEMA + cross-schema qualified names) is live; unqualified resolution across schemas is deferred.
 - **`array column DDL types`** (`TEXT[]`, `INT[]` in CREATE TABLE): not yet wired through the Arrow schema bridge; `ARRAY[…]` expressions and array functions work on existing columns.
 - **gen-types (SDK codegen)**: not found in `sdk/` at time of writing; omitted from SDK listing.
-## 2026-06-14 — Point-op latency: bind-direct UPDATE, FK/reactor flag cache, prewarm flag
+### 2026-06-14 — Point-op latency: bind-direct UPDATE, FK/reactor flag cache, prewarm flag
 
-### Changed
+#### Changed
 
 - **Bind-direct UPDATE.** A prepared `UPDATE t SET col = $N WHERE pk = $M`
   whose template triggers no string-rewrite pipeline now binds the AST-fast
@@ -3387,7 +3531,7 @@ The following items from the "what landed this program" brief are **partial or a
   eager clear covers within-statement visibility on the epoch-0 backends. The
   cached verdict is identical to the inline calls'.
 
-### Added
+#### Added
 
 - **`BASIN_PREWARM_PROVIDERS` (default off).** When set to `1`, the first cold
   table-meta load in a session fires a fire-and-forget task that reads the
@@ -3396,9 +3540,9 @@ The following items from the "what landed this program" brief are **partial or a
   warm path is unaffected). At most one warm per (session, table); a no-op when
   the flag is unset. Covered by a structural cold-vs-warm test (not wall-clock).
 
-## 2026-06-13 — PostGIS general 2-D geometry SQL surface
+### 2026-06-13 — PostGIS general 2-D geometry SQL surface
 
-### Added
+#### Added
 
 - **General 2-D geometry types in SQL.** `LINESTRING`, `POLYGON` (with holes),
   `MULTIPOINT`, `MULTILINESTRING`, `MULTIPOLYGON`, and `GEOMETRYCOLLECTION` are
@@ -3420,7 +3564,7 @@ The following items from the "what landed this program" brief are **partial or a
   exact point-in-polygon and segment-intersection truth cases, NULL/empty
   handling, invalid-WKB typed errors). 58 tests, 0 ignored.
 
-### Fixed
+#### Fixed
 
 - `ST_AsGeoJSON` emitted object keys alphabetically (`coordinates` before
   `type`) on the general path because the geometry was round-tripped through a
@@ -3433,9 +3577,9 @@ The following items from the "what landed this program" brief are **partial or a
   default integer width) with a coercion error; both now accept `Int32` and
   `Int64`, mirroring `ST_SetSRID` / `ST_Transform`.
 
-## 2026-06-13 — Native IVFFlat, vector_avg aggregate, f32-backed halfvec
+### 2026-06-13 — Native IVFFlat, vector_avg aggregate, f32-backed halfvec
 
-### Added
+#### Added
 
 - **Native IVFFlat vector index.** `basin-vector::IvfFlatIndex` implements a
   real coarse quantiser: deterministic Lloyd k-means partitions vectors into
@@ -3464,9 +3608,9 @@ The following items from the "what landed this program" brief are **partial or a
   segment size) is deferred to avoid a storage-format break. `sparsevec(N)`
   remains a typed `0A000` (no silent dense coercion).
 
-## 2026-06-13 — Change events from hot-tier UPDATE/DELETE fast paths (CDC/realtime)
+### 2026-06-13 — Change events from hot-tier UPDATE/DELETE fast paths (CDC/realtime)
 
-### Fixed
+#### Fixed
 
 - **Hot-tier UPDATE/DELETE fast paths now dispatch change events.** The
   point-mutation fast paths (`hot_tier_update_by_pk`, `hot_tier_delete_by_pk`)
@@ -3484,9 +3628,9 @@ The following items from the "what landed this program" brief are **partial or a
   `UPDATE … FROM` join columns, and consumes no event sequence numbers — the
   1M-row UPDATE benchmarks are unaffected.
 
-## 2026-06-13 — UPDATE … FROM is set-oriented (kill per-row quadratic)
+### 2026-06-13 — UPDATE … FROM is set-oriented (kill per-row quadratic)
 
-### Changed
+#### Changed
 
 - **`UPDATE … FROM` is now set-oriented and scale-invariant in target table
   size.** It previously ran the join SELECT once, then issued a full
@@ -3505,9 +3649,9 @@ The following items from the "what landed this program" brief are **partial or a
   `DELETE … USING` over a GIN-indexed table at 10k and 100k rows to
   `t(100k)/t(10k) ≤ 3`.
 
-## 2026-06-12 — Per-project pgwire connection ceiling (#28b)
+### 2026-06-12 — Per-project pgwire connection ceiling (#28b)
 
-### Added
+#### Added
 
 - **Per-project pgwire connection ceiling.** A hard ceiling on simultaneously
   open pgwire connections per project, enforced at the pgwire startup handler:
@@ -3523,9 +3667,9 @@ The following items from the "what landed this program" brief are **partial or a
   once live >= ceiling (a RAII guard decrements the live count on
   disconnect/drop).
 
-## 2026-06-12 — Multi-node: quorum-replicated WAL (`BASIN_WAL_MODE=raft`)
+### 2026-06-12 — Multi-node: quorum-replicated WAL (`BASIN_WAL_MODE=raft`)
 
-### Added
+#### Added
 
 - **Cross-process raft transport over tonic/gRPC (`raft-net` feature).** With
   the `raft-net` feature built (`cargo build -p basin-server --features
@@ -3569,9 +3713,9 @@ The following items from the "what landed this program" brief are **partial or a
   refuse-to-start error. Cluster status (node id, role, term, commit index,
   peers) is logged at startup via `RaftWal::cluster_status`.
 
-## 2026-06-12 — SQL compat: ALTER ADD UNIQUE, typed timestamptz binds, 42883/42703
+### 2026-06-12 — SQL compat: ALTER ADD UNIQUE, typed timestamptz binds, 42883/42703
 
-### Added
+#### Added
 
 - **`ALTER TABLE … ADD CONSTRAINT <name> UNIQUE (cols)`** — the post-hoc
   multi-column UNIQUE addition Django's schema editor emits for
@@ -3591,7 +3735,7 @@ The following items from the "what landed this program" brief are **partial or a
   literal through the bind-direct INSERT fast path, the AST substitution,
   and the text route — microsecond-lossless on all three.
 
-### Fixed
+#### Fixed
 
 - **Missing-function / missing-column SQLSTATEs** — planning errors for an
   unknown function now surface as 42883 (`function <name> does not exist`)
@@ -3600,9 +3744,9 @@ The following items from the "what landed this program" brief are **partial or a
   missing-relation seam (psycopg/asyncpg raise their dedicated
   `UndefinedFunction` / `UndefinedColumn` classes on these codes).
 
-## 2026-06-11 — FTS: GIN-on-tsvector pruning hardened (5.20.E), to_tsquery stemming
+### 2026-06-11 — FTS: GIN-on-tsvector pruning hardened (5.20.E), to_tsquery stemming
 
-### Added
+#### Added
 
 - **GIN-on-tsvector CREATE INDEX backfill** — `CREATE INDEX … USING gin
   (tsvector_col)` now backfills the FTS lexeme posting list over
@@ -3623,7 +3767,7 @@ The following items from the "what landed this program" brief are **partial or a
   read-counter test pinning that a 3-file layout reads ≤ 1 file when pruned
   and all 3 on the unprunable shape.
 
-### Fixed
+#### Fixed
 
 - **Structural tsquery probe (wrong-results class)** — the FTS posting-list
   probe previously AND-merged every lexeme atom regardless of the query's
@@ -3646,9 +3790,9 @@ The following items from the "what landed this program" brief are **partial or a
   files holding the real (unstemmed) matches; the config argument is now
   threaded through, and non-literal configs decline to a full scan.
 
-## 2026-06-11 — COPY: sqlx PgCopyIn shape + binary COPY format
+### 2026-06-11 — COPY: sqlx PgCopyIn shape + binary COPY format
 
-### Added
+#### Added
 
 - **Binary COPY** — `COPY … FROM STDIN / TO STDOUT WITH (FORMAT BINARY)`
   implements the PG binary COPY format (19-byte `PGCOPY` header, per-tuple
@@ -3674,7 +3818,7 @@ The following items from the "what landed this program" brief are **partial or a
   path (previously errored; fractional timestamps are what binary COPY-IN
   decodes to).
 
-## 2026-06-12 — compatibility deep-cuts: 42P01, Django/GORM, GIN-overlay unlock, promoted-column fixes
+### 2026-06-12 — compatibility deep-cuts: 42P01, Django/GORM, GIN-overlay unlock, promoted-column fixes
 
 - **Missing tables answer 42P01** (`a49b51f`): ORM migration harnesses
   branch on undefined_table to bootstrap their tracker tables; the exact
@@ -3696,7 +3840,7 @@ The following items from the "what landed this program" brief are **partial or a
   sweep dropped PK blooms from every swept file while never blooming the
   shadow column. Program correctness tally: eighteen.
 
-## 2026-06-11 — integrity benchmark run (provenance: single idle-box session, 1M solo)
+### 2026-06-11 — integrity benchmark run (provenance: single idle-box session, 1M solo)
 
 All Postgres-compare cards (10k / 100k / 1M), the ORM corpus card, and the
 real-S3 (SeaweedFS) cards were regenerated in one evening session on an
@@ -3741,7 +3885,7 @@ CAPABILITIES numbers are rewritten verbatim from these JSONs.
   vs 1.9 s (20×); on the scale-up card point-query p50 stays bounded as
   data grows (0.89 ms at 10k → 1.8 ms at 1M, 2.0× growth over 100× data).
 
-## 2026-06-11 — S4 age-based residency: read-own-insert with zero file opens
+### 2026-06-11 — S4 age-based residency: read-own-insert with zero file opens
 
 - **Fixed: warm point reads collapsed ~30× by the unfiltered-decode cache**
   (`6bb462a`, `259a145`): two compounding defects, found via a scaling
@@ -3936,7 +4080,7 @@ CAPABILITIES numbers are rewritten verbatim from these JSONs.
   and the promoted shadow-column fast path engages with clean-only residency
   instead of falling back to DataFusion.
 
-## 2026-06-11 — memtable MVCC version chains; fast VALUES scanner: JSONB + timestamps
+### 2026-06-11 — memtable MVCC version chains; fast VALUES scanner: JSONB + timestamps
 
 - **MVCC version chains in the memtable** (`8d9fc2d`): hot-tier entries keep
   oldest-first version chains instead of latest-only. A pinned snapshot read
@@ -3997,7 +4141,7 @@ CAPABILITIES numbers are rewritten verbatim from these JSONs.
   production behavior is unchanged; the residency read path (read-own-
   insert with zero file opens) lands next.
 
-## 2026-06-10 — OLTP scale + correctness wave; HTAP / ORM / extensions roadmap
+### 2026-06-10 — OLTP scale + correctness wave; HTAP / ORM / extensions roadmap
 
 Two work waves landed since `origin/main`: (1) OLTP scale fixes + correctness
 hardening that cut single-row write/read latency to ms-class at 1M rows, and
@@ -4006,7 +4150,7 @@ measured locally; the 1M LocalFS card runs on a shared box and is
 timing-sensitive — the structural cards (RAM/conn, disk, idle cost) and the
 real-S3 (SeaweedFS) card are the load-bearing comparison.
 
-### Engine — transactions and MVCC
+#### Engine — transactions and MVCC
 - **Snapshot-stable reads inside explicit transactions** (`530ec82`): repeated
   SELECTs of the same data inside one transaction return the same answer even as
   other sessions commit.
@@ -4021,7 +4165,7 @@ real-S3 (SeaweedFS) card are the load-bearing comparison.
   probe MISS now falls through to the pruned cold read instead of being treated
   as "definitely empty" (an auto-built index could previously hide a live row).
 
-### Engine — OLTP fast paths (always-on)
+#### Engine — OLTP fast paths (always-on)
 - Fast paths flipped **always-on** — removed `BASIN_PK_ROW_CACHE` +
   `BASIN_FAST_BULK_INSERT` opt-ins (`c2cdf60`, #203).
 - RMW `SET col = <expr>` fast path; overlay point-read correctness fix
@@ -4039,7 +4183,7 @@ real-S3 (SeaweedFS) card are the load-bearing comparison.
   ~1.4 ms; UPSERT ~0.6 ms; RMW ~11 ms/op; point-join ~2.8–4.6 ms; keyset
   ~5–18 ms; `SELECT … FOR UPDATE` + UPDATE ~21 ms.
 
-### Engine — correctness
+#### Engine — correctness
 - Schema evolution: pre-ALTER files now read, aggregate, and update correctly
   (`8ebb764`).
 - Promoted GIN/JSONB shadow-column reads + in-tx pin safety — 4 differential GAP
@@ -4049,28 +4193,28 @@ real-S3 (SeaweedFS) card are the load-bearing comparison.
   (`4daefdc`); multi-row `INSERT … ON CONFLICT DO UPDATE` (`501a757`);
   Binary/LargeBinary normalized at overlay and rewrite boundaries (`b3eb863`).
 
-### ORM compatibility — introspection complete
+#### ORM compatibility — introspection complete
 - `pg_index` populated; `pg_sequence` and `pg_enum` added (`30ea4f3`) — ORM
   startup/migration introspection now resolves for Prisma, Drizzle, SQLAlchemy,
   ActiveRecord, sqlx, Django, Hibernate. Wire-level ORM flow gate added
   (`b746552`). Corpus now **96/99 (97%)**: Drizzle 100%, Prisma 100%, sqlx 95%,
   Diesel 95%, TypeORM 94%.
 
-### Prepared statements
+#### Prepared statements
 - Execute bound statements without re-parsing (`333861b`); infer parameter types
   through UDF argument positions (`38d7d0e`).
 
-### Vector / pgvector compat
+#### Vector / pgvector compat
 - HNSW `WITH (m, ef_construction)` build params + opclass-matched index routing
   (`d5d99d4`) — a cosine-built index is not used for an L2 query.
 
-### PostGIS / geo
+#### PostGIS / geo
 - `ST_AsGeoJSON` / `ST_GeomFromGeoJSON` + constructor-expression INSERTs
   (`41639b8`); R-tree row-exact envelope candidates (`a250891`); single-decode
   residual for `&&` overlap (`dd26766`). `ST_DWithin` ~1.7× faster than PostGIS
   GIST; `&&` count + KNN still trail GIST by ~150×.
 
-### Storage / read path
+#### Storage / read path
 - Auto-index advisor + sorted-PK skip for IN-lists (`c953d83`); exact O(log n)
   IN-list zone prune (`ce67b8a`); push Utf8 equality into Vortex + minimal
   aggregate read set (`5c2dbdd`); stats-prune catalog-less reads + cached Vortex
@@ -4079,14 +4223,14 @@ real-S3 (SeaweedFS) card are the load-bearing comparison.
   shared unfiltered decode across point lookups of a file (`12de75f`).
 - WAL: payload clone + clock read moved outside the partition lock (`25b2df1`).
 
-### Test infrastructure
+#### Test infrastructure
 - Scale-invariant **work-counter** CI gates (`1b76c7d`): per-query
   `files_opened` / `rows_decoded` / `bytes_fetched` counters with design-derived
   bounds at 100k, plus `file_count_scaling.rs` asserting `files_opened` stays
   constant as file count grows — these gate indefinite scaling on *work*, not
   wall-clock.
 
-### Known gaps recorded this wave
+#### Known gaps recorded this wave
 - FK `ON DELETE CASCADE` multi-level recursion and `DELETE … WHERE id BETWEEN`
   on a scratch table (`basin: unsupported` in the differential bench).
 - Read-own-insert costs one O(1) tail flush+read until the row tier lands.
@@ -4094,9 +4238,9 @@ real-S3 (SeaweedFS) card are the load-bearing comparison.
   catalog-commit path.
 - `hottier_differential` ordering-only divergences on a few merge-on-read shapes.
 
-## 2026-05-25 — Selective-read pushdown + benchmark fairness
+### 2026-05-25 — Selective-read pushdown + benchmark fairness
 
-### Engine — filter pushdown through the merge-on-read path
+#### Engine — filter pushdown through the merge-on-read path
 - `TombstoneFilterExec` now implements DataFusion's physical filter-pushdown API
   as a transparent passthrough (`gather_filters_for_pushdown` /
   `handle_child_pushdown_result`). Tombstone suppression commutes with a row
@@ -4118,7 +4262,7 @@ real-S3 (SeaweedFS) card are the load-bearing comparison.
 - Parquet page-index `RowSelection` prunes within a surviving row group
   (sub-row-group pruning for point/IN probes on Parquet tables) (`d3bda33`).
 
-### Benchmark harness — steady-state fairness
+#### Benchmark harness — steady-state fairness
 - Small-sample suites now take a symmetric untimed warm-up before timing on
   BOTH engines, and `median()` returns a true median (averages the two middle
   values for even N) instead of the upper element. The prior combination
@@ -4128,9 +4272,9 @@ real-S3 (SeaweedFS) card are the load-bearing comparison.
   ~23 ms cold artefact. The JSONB steady-state suite awaits the async
   auto-promotion before sweeping so it can't lose the race (`1320d0a`).
 
-## 2026-05-21 — Phase 6.X+ wave
+### 2026-05-21 — Phase 6.X+ wave
 
-### Phase 6.X — Lease-based ownership (ADR 0023)
+#### Phase 6.X — Lease-based ownership (ADR 0023)
 - Lease table, `LeaseRegistry`, heartbeat, and WAL epoch fence establish the
   ownership primitive for partition routing (`acf7929`).
 - Partition-level routing via `LeaseRegistry` wired into the router accept path
@@ -4147,7 +4291,7 @@ real-S3 (SeaweedFS) card are the load-bearing comparison.
   network partition, budget-coordinator unreach, handoff-mid-write atomicity
   (`dcad853`).
 
-### Phase 6.SEC — Security P0/P1
+#### Phase 6.SEC — Security P0/P1
 - Real TOTP replay protection + WebAuthn signature verification close
   beta-blocker P0 items (`94a2e14`).
 - OAuth auto-link now requires a verified email and a `(provider, sub)` identity
@@ -4160,14 +4304,14 @@ real-S3 (SeaweedFS) card are the load-bearing comparison.
 - 17 audit-driven regression tests for shipped P0/P1 fixes; remaining P2s
   marked `#[ignore]` with rationale (`1fc84dd`).
 
-### Phase 6.P0 — Production hardening
+#### Phase 6.P0 — Production hardening
 - Statement-level wall-clock timeout → SQLSTATE 57014 (`efda53e`).
 - Catalog `deadpool-postgres` connection pool replaces `Mutex<Client>`,
   eliminating the noisy-neighbor connection bottleneck (`8977fa6`).
 - Wasm function runtime: governance wired into the real entrypoint, epoch
   ticker, dedicated runtime, semaphore LRU (`e3b0feb`).
 
-### Cloud-side gates
+#### Cloud-side gates
 - 12 OAuth providers added: Microsoft, GitLab, Slack, Discord, Apple,
   Twitter/X, Bitbucket, Notion, Spotify, Twitch, LinkedIn, Figma (`b87c9ee`).
 - BYO bucket support + per-project Class-A/B usage counters (`d620281`,
@@ -4175,7 +4319,7 @@ real-S3 (SeaweedFS) card are the load-bearing comparison.
 - `basin-autoscale` crate and daemon (T-096) (`246b678`).
 - Per-subscriber realtime budget cap enforced (`7003e76`).
 
-### Engine bug fixes
+#### Engine bug fixes
 - `RETURNS TABLE` parsed correctly from sqlparser 0.53+ `DataType::Table` shape
   (`235c1f8`).
 - UNION ALL scan-collapse skipped when all branch predicates are identical
@@ -4185,7 +4329,7 @@ real-S3 (SeaweedFS) card are the load-bearing comparison.
   (`ebac48d`).
 - Secondary-index helper `first_string` skips empty batches (`29e2263`).
 
-### Test infrastructure
+#### Test infrastructure
 - Noisy-neighbor + fairness permanent regression harness (#22) (`31bc2a7`).
 - `sql_syntax_fuzz` — graceful-handling assertions across 119 broad SQL shapes
   (`4705544`).
@@ -4193,14 +4337,14 @@ real-S3 (SeaweedFS) card are the load-bearing comparison.
   (`b832961`).
 - Lease failure-path hardening suite (Phase 6.X.E) (`dcad853`).
 
-### Documentation
+#### Documentation
 - Operator runbooks for storage, realtime, wasm-functions, session-pool
   (`5f98af0`).
 - ADR 0024 + Phase 6.TR plan: UUID-as-Decimal128 storage encoding (workaround
   for Vortex `FixedSizeBinary` gap) (`a79e710`).
 - ADR 0023 leases + partition routing (`073e4aa`).
 
-### Known limitations
+#### Known limitations
 - **Secondary-index point-query returns wrong row** — `create_index_roundtrip_point_query`
   and 24 related binaries are `#[ignore]`'d pending resolution of the #40
   cluster (indexed-lookup bug, not blocked on infra).
@@ -4215,7 +4359,7 @@ real-S3 (SeaweedFS) card are the load-bearing comparison.
 - **Performance regression test** — `viability_perf_stack` `#[ignore]`'d with
   measured data: root cause identified but fix not yet landed.
 
-## [Unreleased]
+### 2026-05-19 — Strategic checkpoint: durable-Basin-moat plan adopted (Phase 5.14)
 
 Strategic checkpoint 2026-05-19: durable-Basin-moat plan adopted (TASK.md
 Phase 5.14). Phase 5.12 perf + storage work, Phase 5.13 pg_query parser
@@ -4223,7 +4367,7 @@ migration, multi-schema isolation phases A.1/A.2/A.3, real transaction
 semantics, and 88-shape Vortex⇆Parquet smoke battery all landed since
 v0.1.3.
 
-### Added — Storage (ADR 0015)
+#### Added — Storage (ADR 0015)
 - **Vortex storage default since 2026-05-18** ([ADR 0015](./docs/decisions/0015-vortex-storage-format.md)).
   Opted-in 2026-05-11, default-flipped after correctness prerequisites
   shipped (self-describing decode, view-type normalisation, catalog-stats
@@ -4249,7 +4393,7 @@ v0.1.3.
   correctness regression. The catalog-stats prune is byte-identical to the
   footer-stats prune (differential-tested in `read_stats_pruning`).
 
-### Added — Performance fast paths (#161, #162)
+#### Added — Performance fast paths (#161, #162)
 - **Metadata-only aggregate fast path (~30-40×)** — bare COUNT/SUM/MIN/MAX
   answered from catalog `column_stats` + Vortex footer; bypasses
   DataFusion entirely.
@@ -4282,7 +4426,7 @@ v0.1.3.
 - **Scan concurrency = 8 on Vortex ListingTable** — recovers parallel
   scan on multi-file Vortex tables.
 
-### Added — DDL options
+#### Added — DDL options
 - **`basin.file_format`** per-table option — `CREATE TABLE … WITH
   (basin.file_format = 'vortex' \| 'parquet')`. Vortex is the default
   since 2026-05-18; Parquet remains first-class selectable per ADR 0015.
@@ -4293,7 +4437,7 @@ v0.1.3.
 - **`basin.row_block_size`** per-table option — per-table chunk
   granularity; tunes point-heavy vs scan-heavy shapes.
 
-### Added — Parser (ADR 0014)
+#### Added — Parser (ADR 0014)
 - **pg_query canonical front-end (Phase 1)** — `pg_query` 6.x vendored;
   `crates/basin-engine/src/pg_ast.rs` ships `parse`, `ParseTree`,
   `stmt_kind`, `StmtKind`, `reject_unsupported`. Every statement parses
@@ -4305,14 +4449,14 @@ v0.1.3.
   `DECLARE CURSOR`, `LOCK`, `VACUUM`, `CLUSTER`, `ANALYZE`,
   `CREATE EXTENSION`, `CREATE TRIGGER` all return clean 0A000.
 
-### Added — Schema / multi-schema isolation (#116)
+#### Added — Schema / multi-schema isolation (#116)
 - **A.1: `SchemaName` + `QualifiedTableName` types in `basin-common`** (#117).
 - **A.2: `QualifiedTableName` API + `InMemoryCatalog` schema-aware impl** (#118).
 - **A.3: `PostgresCatalog` schema-aware impl + `basin_schemas` table** (#119).
 - **+12 multi-schema differential cases** covering `CREATE SCHEMA` /
   `DROP SCHEMA` / cross-schema queries (#146).
 
-### Added — Transactions
+#### Added — Transactions
 - **Real `BEGIN`/`COMMIT`/`ROLLBACK` + `SAVEPOINT` semantics** (#92,
   completes #83): commits deferred while in-transaction, ROLLBACK undoes,
   SAVEPOINT stack supported, aborted-state recovery. Driver-implicit
@@ -4323,7 +4467,7 @@ v0.1.3.
 - **Scalar subquery in `UPDATE SET`** (#106); `UPDATE … WHERE id IN
   (SELECT …)` restored after #66 regressed it (#76).
 
-### Added — Wire protocol
+#### Added — Wire protocol
 - **Real `NUMERIC` binary wire format** — varlena base-10000 encoding
   (#141); previously was sending text bytes through the binary slot.
 - **Real `ARRAY` binary wire format** — PG list-element encoding (#144);
@@ -4333,7 +4477,7 @@ v0.1.3.
   (#73).
 - **Reject multi-statement extended `Parse`** per PG spec (#68).
 
-### Added — DML / DDL completeness
+#### Added — DML / DDL completeness
 - **`DROP TABLE`** + **`IF NOT EXISTS` on CREATE TABLE** (#49).
 - **`INSERT … ON CONFLICT DO NOTHING`** — single-column conflict-target
   match suppresses UNIQUE violation (#75).
@@ -4370,7 +4514,7 @@ v0.1.3.
 - **dynamic per-project `max_connections`** enforced at pgwire (no
   commercial coupling; commit `9385474`).
 
-### Added — Testing
+#### Added — Testing
 - **PG-oracle differential test harness** (25 initial cases, #129).
 - **+33 PG-compat differential cases** — extended params, COPY,
   sequences, RECURSIVE, LATERAL, strings, arrays, NULLS, txn, CAST (#143).
@@ -4394,7 +4538,7 @@ v0.1.3.
 - **Coverage for error paths, transactions, and schema evolution**
   (commit `d129b0e`).
 
-### Added — Auth (already in [Unreleased] but kept here for completeness)
+#### Added — Auth (already in [Unreleased] but kept here for completeness)
 - `auth.uid()`, `auth.role()`, `auth.jwt()` SQL session functions — Supabase-compatible;
   usable in RLS policies (`CREATE POLICY … USING (owner_id = auth.uid())`). Both
   `auth.uid()` and `auth_uid()` spellings work.
@@ -4407,7 +4551,7 @@ v0.1.3.
   `EngineAuthStore` (default) for in-process Basin storage. Zero external dependencies
   for open source deployments.
 
-### Added — SQL-compat lift (already in [Unreleased])
+#### Added — SQL-compat lift (already in [Unreleased])
 - **SQL-compat lift: ~75% → 97.2% fragment coverage.** 423 of 435
   non-design-excluded fragments now pass end-to-end (490 total; 55 are
   explicit design-exclusions). Key work shipped in this cycle:
@@ -4425,7 +4569,7 @@ v0.1.3.
   `EXCLUDE`), `JSON_AGG(t)` whole-row, `EXCLUDE USING gist`.
   See [`docs/sql-support.md`](./docs/sql-support.md).
 
-### Changed
+#### Changed
 - Basin-server startup order: auth initialises before pgwire (eliminates `DeferredAuthResolver`
   and `wait_for_pgwire_accept` polling loop).
 - `BASIN_AUTH_CATALOG_DSN` is now an optional external Postgres override rather than the
@@ -4444,14 +4588,14 @@ v0.1.3.
   per-cell `String` allocs eliminated on the text encoding path
   (commit `af790e3`).
 
-### Removed
+#### Removed
 - **`basin-cloud` / `basin-billing` crates** out of OSS repo — hosted
   product items moved to a separate (closed-source) `basin-cloud` repo.
   The OSS engine ships `EncryptionProvider` / `BillingProvider`-shaped
   traits; external callers wire their own adapters. `CLOUD_ROADMAP.md`
   removed.
 
-### Migration
+#### Migration
 - Existing `pgwire_user` credentials in the old `project_<hex>` format are automatically
   rotated to the new `{project_id}_{hex}` format on first startup after upgrade.
 - Existing tables without a recorded `basin.file_format` continue to read
