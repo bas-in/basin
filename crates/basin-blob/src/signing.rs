@@ -103,7 +103,7 @@ impl BlobSigningSecret {
     /// After this call:
     /// - All **new** tokens are minted with `new_key`.
     /// - All **old** tokens (minted with the previous key) will fail
-    ///   [`verify_mac`].
+    ///   [`Self::verify_mac`].
     ///
     /// This is the rotation hook.  Callers are responsible for ensuring that
     /// no in-flight signed-URL requests are in the middle of a verify call

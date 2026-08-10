@@ -12,11 +12,12 @@
 //! - `MULTIPOLYGON`
 //! - `GEOMETRYCOLLECTION` (recursive)
 //!
-//! The in-memory model is [`geo_types::Geometry`] (re-exported by the `geo`
+//! The in-memory model is [`geo::geometry::Geometry`] (re-exported by the `geo`
 //! crate already in the workspace), so the planar algorithms — centroid,
 //! bounding rect, point-in-polygon — come from `geo` directly and Basin
 //! does not hand-roll them. Measures that must be WGS84-correct (length /
-//! area / perimeter) reuse the spherical math in [`crate::lib`].
+//! area / perimeter) reuse the spherical math in [`crate::haversine_meters`]
+//! and [`crate::polygon_area_m2`].
 //!
 //! ## Wire formats
 //!

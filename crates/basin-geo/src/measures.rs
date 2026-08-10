@@ -1,4 +1,4 @@
-//! Geometric measures and predicates over [`geo_types::Geometry`].
+//! Geometric measures and predicates over [`geo::geometry::Geometry`].
 //!
 //! Two metric regimes, matching PostGIS's GEOMETRY vs GEOGRAPHY split:
 //!

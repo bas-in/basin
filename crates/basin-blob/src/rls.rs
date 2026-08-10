@@ -31,7 +31,7 @@
 //!
 //! When the bucket's `public` flag is `true`, read (SELECT) policies are
 //! bypassed entirely. The caller must check `bucket.public` before calling
-//! [`ObjectRlsStore::check_select`].
+//! [`check_object_access`].
 
 use std::collections::HashMap;
 use std::sync::RwLock;
