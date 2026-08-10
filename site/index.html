@@ -643,6 +643,9 @@ code{font-family:var(--font-mono);font-size:max(12px,.92em)}
   font-size:.8125rem;line-height:var(--lh-loose);color:rgb(var(--paper-rgb)/.5);
 }
 .feat-caveat code,.feat-blurb code{color:var(--basin-teal-3);overflow-wrap:anywhere}
+/* A short token that must not be broken: "#[ignore]" split after the # and
+   read as a stray hash followed by a bracket. */
+code.nb{white-space:nowrap;overflow-wrap:normal}
 
 /* ── Figure: the client rail ──────────────────────────────────────── */
 .rail{margin-top:var(--space-9);display:grid;gap:0}
@@ -1306,7 +1309,7 @@ code{font-family:var(--font-mono);font-size:max(12px,.92em)}
           </header>
           <h3>Realtime</h3>
           <p class="feat-blurb">Row-change streams over SSE at <code>/realtime/v1/sse/:project/:table</code> and a multiplexed WebSocket at <code>/realtime/v1/ws/:project</code>.</p>
-          <p class="feat-caveat">Fed by the hot-tier UPDATE/DELETE fast paths as well as cold writes; in-transaction changes drain in order at COMMIT and are dropped on ROLLBACK. Per-project memory budget with isolated back-pressure. Implementation complete — some integration-harness slices are still <code>#[ignore]</code>-gated.</p>
+          <p class="feat-caveat">Fed by the hot-tier UPDATE/DELETE fast paths as well as cold writes; in-transaction changes drain in order at COMMIT and are dropped on ROLLBACK. Per-project memory budget with isolated back-pressure. Implementation complete — some integration-harness slices are still <code class="nb">#[ignore]</code>-gated.</p>
         </article>
         <article class="feat plate">
           <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
