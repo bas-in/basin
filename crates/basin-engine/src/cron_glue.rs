@@ -314,7 +314,11 @@ async fn cron_unschedule_impl(engine: &Engine, project: &ProjectId, name: &str) 
             let mut found: Option<i64> = None;
             'outer: for b in &batches {
                 if let Some(arr) = b.column_by_name("jobid").and_then(|c| c.as_any().downcast_ref::<ArrowI64>()) {
-                    for i in 0..arr.len() { found = Some(arr.value(i)); break 'outer; }
+                    // First row of the first batch that carries the column wins;
+                    // jobname is unique so there is at most one match anyway. An
+                    // empty batch falls through to the next one rather than
+                    // ending the search.
+                    if !arr.is_empty() { found = Some(arr.value(0)); break 'outer; }
                 }
             }
             found.ok_or_else(|| format!("job {name:?} not found"))?

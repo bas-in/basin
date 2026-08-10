@@ -259,7 +259,7 @@ async fn equivalence_mixed_types() {
         "(2, 0, 2.5e3, 'it''s a, (test)', FALSE)",
         "(3, 2147483647, 1E-2, 'héllo wörld', TRUE)",
         "(4, NULL, NULL, NULL, NULL)",
-        "(5, -2147483648, 3.14159, 'commas,,,and ''quotes''', FALSE)",
+        "(5, -2147483648, 1.23456, 'commas,,,and ''quotes''', FALSE)",
         "(6, 42, 0.0, '', TRUE)",
     ];
 
@@ -306,7 +306,7 @@ async fn equivalence_mixed_types() {
             Some(2500.0),
             Some(0.01),
             None,
-            Some(3.14159),
+            Some(1.23456),
             Some(0.0),
         ]
     );

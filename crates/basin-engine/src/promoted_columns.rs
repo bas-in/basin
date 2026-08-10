@@ -374,11 +374,11 @@ fn decode_json_string(raw: &[u8]) -> Option<String> {
             // Multi-byte UTF-8 passes through.
             let ch_start = i;
             i += 1;
-            while i < raw.len() && raw[i] & 0x80 != 0 && raw[i] & 0xC0 != 0x80 {
-                // This is not a valid UTF-8 continuation; back to normal.
-                break;
-            }
-            // Extend past all continuation bytes.
+            // Extend past all continuation bytes. (A loop that tested for a
+            // high-bit-set non-continuation byte and then unconditionally
+            // `break`ed used to sit here; it never advanced `i` and had no
+            // other effect, and the scan below already stops on exactly that
+            // byte, so it was doing nothing.)
             while i < raw.len() && raw[i] & 0xC0 == 0x80 {
                 i += 1;
             }
