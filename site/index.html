@@ -1074,37 +1074,32 @@ code{font-family:var(--font-mono);font-size:.92em}
         <div class="bowl-art">
           <!-- The mark, in section. Same bowl, cut open, so the strata that
                are decoration on the tile become the storage layout here. -->
-          <svg viewBox="0 0 460 330" role="img" aria-labelledby="bowl-title bowl-desc">
+          <svg viewBox="0 0 420 330" role="img" aria-labelledby="bowl-title bowl-desc">
             <title id="bowl-title">A project prefix, in cross-section</title>
             <desc id="bowl-desc">The Basin bowl cut open: four strata inside it, from
               columnar data files at the top down through Iceberg metadata, archived WAL
               segments, and snapshot and branch references at the floor.</desc>
             <defs>
               <clipPath id="bowl-clip">
-                <path d="M60 84 L60 176 a170 104 0 0 0 340 0 L400 84 Z"/>
+                <path d="M58 76 L58 148 a152 116 0 0 0 304 0 L362 76 Z"/>
               </clipPath>
             </defs>
-            <!-- contour ghosts behind the bowl -->
+            <!-- contour ghosts, the survey sheet showing through -->
             <g fill="none" stroke="#FAF7F0" stroke-opacity=".07" stroke-width="1">
-              <ellipse cx="230" cy="84" rx="205" ry="52"/>
-              <ellipse cx="230" cy="84" rx="188" ry="47"/>
+              <ellipse cx="210" cy="76" rx="186" ry="54"/>
+              <ellipse cx="210" cy="76" rx="169" ry="49"/>
             </g>
             <!-- strata, clipped to the inside of the bowl -->
-            <g clip-path="url(#bowl-clip)" fill="none" stroke-linecap="round">
-              <path d="M40 128 a190 62 0 0 0 380 0" stroke="#00A8B0" stroke-width="16" opacity=".92"/>
-              <path d="M40 172 a190 58 0 0 0 380 0" stroke="#4F858A" stroke-width="14" opacity=".9"/>
-              <path d="M40 214 a190 52 0 0 0 380 0" stroke="#C4732B" stroke-width="13" opacity=".9"/>
-              <path d="M40 252 a190 44 0 0 0 380 0" stroke="#8FB59B" stroke-width="11" opacity=".85"/>
+            <g clip-path="url(#bowl-clip)" fill="none">
+              <path d="M40 118 a170 30 0 0 0 340 0" stroke="#00A8B0" stroke-width="15"/>
+              <path d="M40 158 a170 28 0 0 0 340 0" stroke="#4F858A" stroke-width="14"/>
+              <path d="M40 196 a170 26 0 0 0 340 0" stroke="#C4732B" stroke-width="13"/>
+              <path d="M40 230 a170 22 0 0 0 340 0" stroke="#8FB59B" stroke-width="12"/>
             </g>
             <!-- rim + walls, straight from the mark -->
-            <ellipse cx="230" cy="84" rx="170" ry="52" fill="none" stroke="#FAF7F0" stroke-width="7" opacity=".92"/>
-            <path d="M60 84 L60 176 a170 104 0 0 0 340 0 L400 84" fill="none" stroke="#FAF7F0"
+            <ellipse cx="210" cy="76" rx="152" ry="44" fill="none" stroke="#FAF7F0" stroke-width="7" opacity=".92"/>
+            <path d="M58 76 L58 148 a152 116 0 0 0 304 0 L362 76" fill="none" stroke="#FAF7F0"
                   stroke-width="7" stroke-linecap="round" stroke-linejoin="round" opacity=".92"/>
-            <!-- the boundary: nothing crosses out of the prefix -->
-            <g stroke="#DE7A63" stroke-width="2.5" stroke-linecap="round" opacity=".8">
-              <path d="M424 60 L448 84 M448 60 L424 84"/>
-            </g>
-            <path d="M400 72 L420 72" stroke="#DE7A63" stroke-width="2.5" stroke-linecap="round" opacity=".8"/>
           </svg>
         </div>
         <div class="bowl-side">
