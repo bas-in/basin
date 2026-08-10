@@ -97,7 +97,7 @@ lines = [
     'title: "Basin documentation index"',
     "nav_section: overview",
     "sidebar_position: 0",
-    'summary: "Top-level navigation for Basin\'s OSS documentation. Both for humans browsing on GitHub and for basin-cloud\'s build-time fetcher."',
+    'summary: "Top-level navigation for Basin\'s OSS documentation. Both for humans browsing on GitHub and for a downstream docs site fetching this tree at build time."',
     "---",
     "",
     "# Basin documentation",
@@ -105,7 +105,7 @@ lines = [
     "Navigation root for the Basin OSS repo. Every file is organised by",
     "`nav_section` declared in its YAML frontmatter",
     "(see [`frontmatter-spec.md`](./frontmatter-spec.md)).",
-    "basin-cloud's build-time fetcher uses this index to assemble the",
+    "A downstream docs site can fetch this index at build time to assemble a",
     "unified nav tree; GitHub renders it for humans browsing `docs/`.",
     "",
 ]
