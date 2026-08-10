@@ -603,6 +603,7 @@ dl.defs dd{margin:0;font-size:.9062rem;color:var(--fg-2);line-height:1.65;min-wi
     <a href="#deployment">Deployment</a>
     <a href="#observability">Observability</a>
     <a href="#benchmarks">Benchmarks</a>
+    <a href="#methodology">Benchmark methodology</a>
 
     <div class="grp">Reference</div>
     <a href="#crates">Crate map</a>
@@ -1912,16 +1913,213 @@ bash verify.sh --tag v0.1.9 --attest basin-0.1.9-x86_64-unknown-linux-gnu.tar.gz
     100k rows, and 102× smaller on the real-S3 card. A single number from any of these tables,
     quoted without its scale and its card, is misinformation.
   </p>
+  <p>
+    The method behind every one of these numbers — the workload, the storage configs, how a
+    latency figure is estimated, and why the losses are on the page at all — is the
+    <a class="link" href="#methodology">next section</a>.
+  </p>
+</section>
+
+<section class="doc" id="methodology">
+  <span class="eyebrow">31 · how the numbers are made</span>
+  <h2>Benchmark methodology</h2>
+  <p>
+    Everything on the <a class="link" href="#benchmarks">Benchmarks</a> section and in the
+    headline block on the landing page comes out of the harness in this repository. This section
+    is the method itself, not a pointer to it. The long-form document
+    (<code>benchmark/BENCHMARKS.md</code>) carries the full result tables; the numbers there are
+    regenerated from test reports and the file says so in its own header — <em>do not edit by
+    hand</em>.
+  </p>
+
+  <h3>Workload shape</h3>
+  <p>
+    One table, one row shape, across every config — 1,000,000 synthetic audit-log rows, with
+    10 M-row variants where a card says so:
+  </p>
+  <div class="codeblock" data-cap="benchmark/BENCHMARKS.md">
+    <pre><code class="language-plaintext">id          UUID
+project_id  UUID
+action      TEXT
+created_at  TIMESTAMPTZ
+payload     TEXT</code></pre>
+  </div>
+  <dl class="defs">
+    <div>
+      <dt>Data</dt>
+      <dd>
+        Rows come from a fixed-seed PRNG, so a run is repeatable — and so real-world data
+        distributions will produce different numbers.
+      </dd>
+    </div>
+    <div>
+      <dt>Columnar layout</dt>
+      <dd>Default row-group size 65,536 rows, ZSTD-1 compression.</dd>
+    </div>
+    <div>
+      <dt>Index policy</dt>
+      <dd>
+        <strong>Neither Basin nor Postgres has a B-tree index on <code>id</code>.</strong> Basin's
+        point-query speed comes from predicate pushdown plus bloom filters, not a B-tree. The
+        results are substrate comparisons, not a claim that Basin replaces Postgres for every
+        workload.
+      </dd>
+    </div>
+    <div>
+      <dt>Baseline</dt>
+      <dd>Postgres 18, local, <strong>default config</strong> — no tuning of <code>shared_buffers</code>, <code>work_mem</code> or anything else. A tuned Postgres would close some gaps.</dd>
+    </div>
+  </dl>
+
+  <h3>Three storage configurations</h3>
+  <p>
+    Every claim is scoped to one of three configs. A number quoted without its config is not a
+    number.
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th scope="col">Config</th><th scope="col">Slug</th><th scope="col">What it measures</th></tr></thead>
+      <tbody>
+        <tr><td>LocalFS</td><td><code>localfs</code></td><td>Pure architectural numbers — no network, no storage concurrency limits. Fastest and most stable.</td></tr>
+        <tr><td>Real S3-compatible</td><td><code>real</code></td><td>Tigris / AWS S3 / Cloudflare R2 / Backblaze B2. Numbers customers will actually experience.</td></tr>
+        <tr><td>SeaweedFS</td><td><code>seaweedfs</code></td><td>Self-hosted S3 gateway; a high-concurrent-read proxy — see the regime warning below.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>How a latency number is estimated</h3>
+  <p>
+    There is one shared benchmark core, the <code>basin-bench-harness</code> crate. It owns engine
+    and storage startup, project and table seeding, latency sampling, threshold checking and JSON
+    sidecar emission. A profile is a <code>BenchConfig</code> builder plus a list of shapes, so
+    swapping Parquet for Vortex is a config edit rather than a new test file.
+  </p>
+  <dl class="defs">
+    <div>
+      <dt>Percentiles, never means</dt>
+      <dd>
+        Samples land in an HDR histogram (<code>hdrhistogram</code>, bounds 1&nbsp;µs to 60&nbsp;s,
+        three significant figures) and the reported figures are read off as quantiles —
+        <code>p50</code>, <code>p95</code>, <code>p99</code>, <code>p99.9</code>. A mean would let
+        one stall or one cold object fetch move a headline; the median will not. Sorting the full
+        sample vector per shape would also be O(N log N), which is why the histogram is the
+        storage rather than an array.
+      </dd>
+    </div>
+    <div>
+      <dt>Cold is the claimed number</dt>
+      <dd>
+        Every latency bar is measured <strong>cold</strong> — caches empty at the start of the
+        run. Warm p50/p99 are reported alongside as corroboration but are never the primary
+        claimed number.
+      </dd>
+    </div>
+    <div>
+      <dt>Warm-up is discarded where it exists</dt>
+      <dd>
+        The standalone speed suite under <code>benchmark/speed/</code> runs
+        <code>SPEED_WARMUP</code> iterations (default 100) and throws them away before timing
+        <code>SPEED_ITERATIONS</code> (default 1,000).
+      </dd>
+    </div>
+    <div>
+      <dt>Nothing is typed in by hand</dt>
+      <dd>
+        Each dashboard reads <code>&lt;data_dir&gt;/results.js</code>, regenerated from the
+        per-test JSON reports after a run, with a plain-text companion at
+        <code>RESULTS_&lt;slug&gt;.md</code>. A test that has not been run renders as
+        "not yet run" rather than as a blank or a stale value.
+      </dd>
+    </div>
+  </dl>
+  <div class="codeblock" data-cap="benchmark/BENCHMARKS.md">
+    <pre><code class="language-bash"># LocalFS — fast, no cloud credentials needed
+cargo test -p basin-integration-tests --tests -- --nocapture
+python3 benchmark/bundle.py
+open benchmark/index_localfs.html
+
+# Real S3-compatible backend: fill in credentials first
+cp .basin-test.toml.example .basin-test.toml
+cargo test -p basin-integration-tests --tests -- --nocapture
+python3 benchmark/bundle.py --dir data_real
+
+# One harness profile, Markdown summary on stdout
+scripts/run-bench.sh vortex-vs-parquet</code></pre>
+  </div>
+
+  <h3>Why the losses are published</h3>
+  <p>
+    A benchmark page that only contains wins is an advertisement with a table in it. The shape of
+    where Basin loses is the part that tells you whether it fits your workload, so the losses are
+    published on the same cards as the wins and the caveats are stated by the project itself:
+  </p>
+  <ul class="bullets">
+    <li>
+      <strong>Basin is Postgres-compatible, not Postgres.</strong> The pgwire protocol, SQL
+      surface and driver compatibility are genuine, but the execution engine is DataFusion /
+      DuckDB over columnar files, not the Postgres planner over a heap. Row-level UPDATE/DELETE
+      hotspots, heavy JOIN fan-out and B-tree range scans on non-clustered data will be faster on
+      Postgres.
+    </li>
+    <li>
+      <strong>An indexed Postgres beats the baseline shown.</strong> The point-query results use
+      predicate pushdown and bloom filters against an <em>unindexed</em> Postgres. Add the index
+      and Postgres wins that shape.
+    </li>
+    <li>
+      <strong>Project deletion crosses over.</strong> At 100 files per project Basin is faster
+      (4.64 ms vs 5.91 ms); at 1,000 files it is slower (34.09 ms vs 6.15 ms) and at 5,000 files
+      much slower (170.31 ms vs 2.26 ms), because every file has to be individually deleted from
+      the object store while Postgres does one <code>DROP SCHEMA CASCADE</code>.
+    </li>
+    <li>
+      <strong>The analytical engine is LocalFS-only in v0.1.</strong> The DuckDB analytical
+      routing path needs a local filesystem root, so those cards read 0× on the real-S3
+      dashboard. Real-S3 analytical benchmarks are v0.2 work.
+    </li>
+    <li>
+      <strong>On-disk size is not a one-way result.</strong> Basin is 12.5× smaller than Postgres
+      on the 1 M-row LocalFS card and 5% <em>larger</em> on the users-plus-events card in the
+      section above. Both are on the page.
+    </li>
+  </ul>
+
+  <div class="note warn">
+    <span class="lbl">The SeaweedFS cards are not a cloud claim</span>
+    <p>
+      The <code>data_seaweedfs</code> dashboard runs Basin against a local SeaweedFS S3 gateway —
+      roughly 1 ms/op round trip, no injected latency — versus an <em>unindexed</em> Postgres. It
+      is a loopback structural-bug detector, not a cloud latency proxy. A headline like "point
+      query 4× faster" on that card reflects that regime only: against an <em>indexed</em>
+      Postgres the same point query is far slower, because a remote object GET loses to a
+      buffer-cache B-tree probe. The cache-stack speedup bar is regime-aware for the same reason —
+      on loopback the uncached baseline is already ~4 ms, so there is almost no latency left for
+      the disk, page and bloom layers to compress.
+    </p>
+    <p>
+      The honest cloud framing is <strong>Basin on Tigris, at real object-store round-trip time,
+      versus Postgres on EBS <em>with</em> its index</strong>. Reproduce that regime with the
+      <code class="wrap">.basin-test.tigris-realistic.toml</code> profile, which injects about 9 ms/op through
+      a <code>LatencyStore</code>. Loopback SeaweedFS numbers should not be quoted as cloud
+      performance.
+    </p>
+  </div>
+
   <div class="cards">
     <a class="card" href="https://github.com/vul-os/basin/blob/main/benchmark/BENCHMARKS.md">
-      <h4>Methodology</h4>
-      <p>How the numbers are produced, the robust estimator, and why losses are published.</p>
+      <h4>Full result tables</h4>
+      <p>The long-form document: storage and compression, point-query latency, connection scaling and RAM, lifecycle operations.</p>
       <span class="path">benchmark/BENCHMARKS.md</span>
     </a>
     <a class="card" href="https://github.com/vul-os/basin/blob/main/benchmark/RESULTS_localfs.md">
       <h4>LocalFS results</h4>
-      <p>The per-scale matrix at 10k, 100k and 1M rows.</p>
+      <p>The auto-generated per-scale matrix at 10k, 100k and 1M rows.</p>
       <span class="path">benchmark/RESULTS_localfs.md</span>
+    </a>
+    <a class="card" href="https://github.com/vul-os/basin/tree/main/benchmark">
+      <h4>The harness</h4>
+      <p>Dashboards, bundler, the speed suite and the three-way cloud comparison runner.</p>
+      <span class="path">benchmark/</span>
     </a>
   </div>
 </section>
@@ -1929,7 +2127,7 @@ bash verify.sh --tag v0.1.9 --attest basin-0.1.9-x86_64-unknown-linux-gnu.tar.gz
 <!-- ══ REFERENCE ════════════════════════════════════════════════════ -->
 
 <section class="doc" id="crates">
-  <span class="eyebrow">31 · the map</span>
+  <span class="eyebrow">32 · the map</span>
   <h2>Crate map</h2>
   <p>
     Twenty-seven crates under <code>crates/</code> plus four services under
@@ -1976,7 +2174,7 @@ bash verify.sh --tag v0.1.9 --attest basin-0.1.9-x86_64-unknown-linux-gnu.tar.gz
 </section>
 
 <section class="doc" id="decisions">
-  <span class="eyebrow">32 · why</span>
+  <span class="eyebrow">33 · why</span>
   <h2>Design decisions</h2>
   <p>
     Twenty-nine numbered ADRs record the arguments, including the ones that closed doors. Each
@@ -2023,7 +2221,7 @@ bash verify.sh --tag v0.1.9 --attest basin-0.1.9-x86_64-unknown-linux-gnu.tar.gz
 </section>
 
 <section class="doc" id="contributing">
-  <span class="eyebrow">33 · joining in</span>
+  <span class="eyebrow">34 · joining in</span>
   <h2>Contributing</h2>
   <p>
     Open an issue before a pull request that adds new surface area. The ADRs exist so that scope
