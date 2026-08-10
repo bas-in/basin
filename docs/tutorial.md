@@ -228,9 +228,31 @@ SELECT id, user_id, title FROM notes ORDER BY created_at;
 
 ## 4. Auth: sign up and sign in
 
-`basin-auth` and `basin-rest` are enabled by default in the Docker image
-(they ship in the OSS bundle). They listen on the same port as pgwire and
-share the HTTP path prefix `/auth/v1/` and `/rest/v1/` respectively.
+`basin-auth` and `basin-rest` ship in the OSS bundle but are **off by
+default** — `BASIN_AUTH_ENABLED` and `BASIN_REST_ENABLED` both default to
+`0`, and `BASIN_REST_ENABLED=1` requires `BASIN_AUTH_ENABLED=1` (ADR 0006:
+a REST stack without auth is the largest data-leak class we know how to
+create). The quickstart container in section 1 does **not** set either, so
+restart it with them on before working through this section:
+
+```sh
+docker run --rm \
+  -p 5432:5432 \
+  -p 5434:5434 \
+  -e BASIN_AUTH_ENABLED=1 \
+  -e BASIN_REST_ENABLED=1 \
+  -e BASIN_REST_BIND=0.0.0.0:5434 \
+  -v basin-data:/var/basin \
+  --name basin \
+  basin-server
+```
+
+(`BASIN_REST_BIND=0.0.0.0:5434` is what makes the listener reachable from
+outside the container; the default `127.0.0.1:5434` is container-local.)
+
+REST and auth share one HTTP listener on its **own** port — `BASIN_REST_BIND`,
+default `127.0.0.1:5434` — not the pgwire port. The path prefixes are
+`/auth/v1/` and `/rest/v1/`.
 
 > **SMTP note:** basin-auth requires SMTP configuration to send email
 > verification and password-reset links. In the default Docker dev setup,
@@ -241,7 +263,7 @@ share the HTTP path prefix `/auth/v1/` and `/rest/v1/` respectively.
 ### Sign up
 
 ```sh
-curl -s -X POST http://127.0.0.1:5432/auth/v1/signup \
+curl -s -X POST http://127.0.0.1:5434/auth/v1/signup \
   -H "Content-Type: application/json" \
   -d '{"email":"alice@example.com","password":"hunter2hunter2"}' \
   | jq .
@@ -269,7 +291,7 @@ the access token via `POST /auth/v1/refresh`.
 ### Sign in
 
 ```sh
-JWT=$(curl -s -X POST http://127.0.0.1:5432/auth/v1/signin \
+JWT=$(curl -s -X POST http://127.0.0.1:5434/auth/v1/signin \
   -H "Content-Type: application/json" \
   -d '{"email":"alice@example.com","password":"hunter2hunter2"}' \
   | jq -r .access_token)
@@ -337,7 +359,7 @@ authentication credential.
 **Read notes (RLS-filtered to Alice's rows):**
 
 ```sh
-curl -s "http://127.0.0.1:5432/rest/v1/notes" \
+curl -s "http://127.0.0.1:5434/rest/v1/notes" \
   -H "Authorization: Bearer $JWT" \
   | jq .
 ```
@@ -349,7 +371,7 @@ no `WHERE user_id = ?` in the application code.
 
 ```sh
 # Only the title column, ordered newest first.
-curl -s "http://127.0.0.1:5432/rest/v1/notes?select=id,title&order=created_at.desc" \
+curl -s "http://127.0.0.1:5434/rest/v1/notes?select=id,title&order=created_at.desc" \
   -H "Authorization: Bearer $JWT" \
   | jq .
 ```
@@ -357,7 +379,7 @@ curl -s "http://127.0.0.1:5432/rest/v1/notes?select=id,title&order=created_at.de
 **Insert a new note:**
 
 ```sh
-curl -s -X POST "http://127.0.0.1:5432/rest/v1/notes" \
+curl -s -X POST "http://127.0.0.1:5434/rest/v1/notes" \
   -H "Authorization: Bearer $JWT" \
   -H "Content-Type: application/json" \
   -H "Prefer: return=representation" \
@@ -371,7 +393,7 @@ including the server-generated `id` and `created_at`.
 **Update a note** (replace `<note-id>` with an `id` from above):
 
 ```sh
-curl -s -X PATCH "http://127.0.0.1:5432/rest/v1/notes?id=eq.<note-id>" \
+curl -s -X PATCH "http://127.0.0.1:5434/rest/v1/notes?id=eq.<note-id>" \
   -H "Authorization: Bearer $JWT" \
   -H "Content-Type: application/json" \
   -H "Prefer: return=representation" \
@@ -382,7 +404,7 @@ curl -s -X PATCH "http://127.0.0.1:5432/rest/v1/notes?id=eq.<note-id>" \
 **Delete a note:**
 
 ```sh
-curl -s -X DELETE "http://127.0.0.1:5432/rest/v1/notes?id=eq.<note-id>" \
+curl -s -X DELETE "http://127.0.0.1:5434/rest/v1/notes?id=eq.<note-id>" \
   -H "Authorization: Bearer $JWT" \
   | jq .
 ```
@@ -568,8 +590,8 @@ migrations, see [`examples/saas-starter/`](../examples/saas-starter/).
 When the managed service launches, the deployment flow will be:
 
 ```sh
-# Install basin-cli (Go binary, Sigstore-signed release artefacts).
-# The bas-in/basin-cli repository will publish pre-built binaries.
+# Install basin-cli (Rust binary, Sigstore-signed release artefacts).
+# Built from this repo's cli/ directory; releases publish pre-built binaries.
 basin login                            # OAuth/JWT flow, stores credential in OS keychain
 basin projects create my-app           # provisions a Basin engine on Fly Machines
 basin projects connect my-app          # prints the postgres:// URL for psql / .env

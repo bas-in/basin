@@ -124,7 +124,7 @@ SELECT COUNT(*) FROM smoke;
 ## 4. Using basin-cli
 
 [`basin-cli`](https://github.com/vul-os/basin/tree/main/cli) is a separate operator
-daily-driver CLI (Go, Apache-2.0). It talks to a control plane, not directly
+daily-driver CLI (Rust, Apache-2.0). It talks to a control plane, not directly
 to a standalone `basin-server` container. For local development,
 `psql` and any Postgres-compatible driver are the easiest path.
 

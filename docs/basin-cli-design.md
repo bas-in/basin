@@ -253,13 +253,13 @@ release.
 **Distribution channels:**
 
 - **GitHub Releases** — all binaries + signatures; primary source of truth.
-- **Homebrew tap** (`bas-in/homebrew-basin`) — `brew install vul-os/basin/basin`. The tap formula is auto-updated by GoReleaser's `brews:` block.
-- **apt repo** — `.deb` packages built by GoReleaser's `nfpms:` block; hosted on a GitHub Pages–backed apt repo under `bas-in/apt`.
-- **`go install`** — `go install github.com/vul-os/basin/tree/main/cli/cmd/basin@latest` for Go developers who prefer source builds.
+- **Homebrew tap** (`bas-in/homebrew-basin`) — `brew install vul-os/basin/basin`.
+- **apt repo** — `.deb` packages hosted on a GitHub Pages–backed apt repo under `bas-in/apt`.
+- **`cargo install`** — `cargo install --git https://github.com/vul-os/basin --bin basin` for developers who prefer source builds.
 
 The Homebrew tap and apt repo are the recommended installation paths for
-end-users. `go install` is for contributors and CI environments with a Go
-toolchain already present.
+end-users. `cargo install` is for contributors and CI environments with a
+Rust toolchain already present.
 
 Verification instructions are included in the release notes for every tag:
 
