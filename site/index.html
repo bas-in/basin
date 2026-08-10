@@ -612,6 +612,33 @@ code{font-family:var(--font-mono);font-size:.92em}
   .bar-track{grid-area:track}
 }
 
+/* ── Feature grid — the batteries ─────────────────────────────────── */
+.feat-grid{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,290px),1fr));
+  gap:var(--space-5);margin-top:var(--space-9);
+}
+.feat{padding:var(--space-6);min-width:0;display:flex;flex-direction:column}
+.feat-head{display:flex;align-items:center;gap:var(--space-3);margin-bottom:var(--space-5)}
+.feat-icon{width:32px;height:32px;flex:0 0 auto;color:var(--paper);opacity:.9}
+.feat-code{
+  font-size:.625rem;letter-spacing:var(--tracking-mono-wider);
+  color:rgb(var(--paper-rgb)/.34);margin-left:auto;
+}
+.feat-pill{
+  font-family:var(--font-mono);font-size:.5625rem;letter-spacing:var(--tracking-mono-wider);
+  text-transform:uppercase;padding:3px 7px;border-radius:var(--radius-pill);
+  border:1px solid currentColor;white-space:nowrap;
+}
+.feat-pill-ship{color:var(--moss)}
+.feat-pill-part{color:var(--sediment-ochre-2)}
+.feat h3{font-size:1.125rem;font-weight:var(--weight-bold);margin-bottom:var(--space-3)}
+.feat-blurb{font-size:.9375rem;line-height:var(--lh-loose);color:rgb(var(--paper-rgb)/.72)}
+.feat-caveat{
+  margin-top:var(--space-4);padding-top:var(--space-4);border-top:var(--hairline-paper);
+  font-size:.8125rem;line-height:var(--lh-loose);color:rgb(var(--paper-rgb)/.5);
+}
+.feat-caveat code,.feat-blurb code{color:var(--basin-teal-3);overflow-wrap:anywhere}
+
 /* ── Final CTA — the status plate ─────────────────────────────────── */
 .cta{position:relative;overflow:hidden;background:var(--ink-2)}
 .cta .container,.cta .container-wide{position:relative;z-index:1}
@@ -1170,6 +1197,164 @@ code{font-family:var(--font-mono);font-size:.92em}
           <dd class="tile-note">At typical SaaS-tail sizes. Cost tracks bytes actually stored, so ten thousand quiet projects stay quiet on the invoice.</dd>
         </div>
       </dl>
+    </div>
+  </section>
+
+  <!-- ── Batteries ──────────────────────────────────────────────── -->
+  <section id="batteries" class="section section-ink" aria-labelledby="bat-h2">
+    <div class="container-wide">
+      <div class="section-head reveal">
+        <span class="eyebrow">Batteries · one binary</span>
+        <h2 id="bat-h2" class="display">The rest of the stack is already in the process.</h2>
+        <p>
+          Auth, an HTTP API, realtime, blob storage, vector search, sandboxed functions,
+          change capture, cron and the geo and text-search extension equivalents are not
+          sidecars you deploy next to Basin. They are crates inside the same binary,
+          reading the same catalog, enforcing the same RLS. Each tile carries the caveat
+          that comes with it.
+        </p>
+      </div>
+
+      <div class="feat-grid reveal">
+        <article class="feat plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <header class="feat-head">
+            <svg class="feat-icon" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M10 14 V11 a6 6 0 0 1 12 0 V14"/><rect x="6" y="14" width="20" height="13" rx="1.5"/><circle cx="16" cy="19.5" r="1.7" stroke="#60999E"/><path d="M16 21.2 V24" stroke="#60999E"/></g></svg>
+            <span class="feat-code mono">F-01</span>
+            <span class="feat-pill feat-pill-ship">shipped</span>
+          </header>
+          <h3>Auth</h3>
+          <p class="feat-blurb">Signup, sign-in, magic link, password reset, email verify, JWT plus refresh, and API keys — issued and verified in-process.</p>
+          <p class="feat-caveat">Auth tables live in each project's own storage under the <code>basin_auth</code> schema. <code>auth.uid()</code>, <code>auth.role()</code> and <code>auth.jwt()</code> read from the JWT at connection open and work inside RLS policies.</p>
+        </article>
+        <article class="feat plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <header class="feat-head">
+            <svg class="feat-icon" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="8" width="11" height="17" rx="1"/><path d="M3 13 H14 M3 18.5 H14" opacity=".5"/><path d="M16.5 16.5 H25" stroke="#60999E"/><path d="M22.5 13.5 L25.5 16.5 L22.5 19.5" stroke="#60999E"/><path d="M28 10 q2 0 2 2.5 t2 4 q-2 1.5 -2 4 t-2 2.5" transform="translate(-1,0)" opacity=".75"/></g></svg>
+            <span class="feat-code mono">F-02</span>
+            <span class="feat-pill feat-pill-ship">shipped</span>
+          </header>
+          <h3>REST API</h3>
+          <p class="feat-blurb">A PostgREST-compatible HTTP surface generated from your schema: <code>GET</code>/<code>POST</code>/<code>PATCH</code>/<code>DELETE</code> on <code>/rest/v1/&lt;table&gt;</code>.</p>
+          <p class="feat-caveat">Bearer-JWT auth, RLS enforced on the same plans pgwire uses, and an RPC mount at <code>POST /rest/v1/rpc/:fn</code> that invokes <code>LANGUAGE sql</code> and <code>LANGUAGE wasm</code> functions over HTTP.</p>
+        </article>
+        <article class="feat plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <header class="feat-head">
+            <svg class="feat-icon" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2 17 H7 L9.5 9.5 L13 24 L16 13 L19 20 L22 17 H30"/><circle cx="9.5" cy="9.5" r="1.5" fill="#60999E" stroke="#60999E"/><circle cx="16" cy="13" r="1.5" fill="#60999E" stroke="#60999E"/><circle cx="22" cy="17" r="1.5" fill="#60999E" stroke="#60999E"/></g></svg>
+            <span class="feat-code mono">F-03</span>
+            <span class="feat-pill feat-pill-part">harness-gated</span>
+          </header>
+          <h3>Realtime</h3>
+          <p class="feat-blurb">Row-change streams over SSE at <code>/realtime/v1/sse/:project/:table</code> and a multiplexed WebSocket at <code>/realtime/v1/ws/:project</code>.</p>
+          <p class="feat-caveat">Fed by the hot-tier UPDATE/DELETE fast paths as well as cold writes; in-transaction changes drain in order at COMMIT and are dropped on ROLLBACK. Per-project memory budget with isolated back-pressure. Implementation complete — some integration-harness slices are still <code>#[ignore]</code>-gated.</p>
+        </article>
+        <article class="feat plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <header class="feat-head">
+            <svg class="feat-icon" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8 a10 3 0 0 1 20 0 v6 a10 3 0 0 1 -20 0 Z"/><path d="M6 14 v6 a10 3 0 0 0 20 0 v-6" opacity=".7"/><path d="M6 20 v4 a10 3 0 0 0 20 0 v-4" stroke="#60999E"/></g></svg>
+            <span class="feat-code mono">F-04</span>
+            <span class="feat-pill feat-pill-ship">v1 shipped</span>
+          </header>
+          <h3>Blob storage</h3>
+          <p class="feat-blurb">Catalog-backed object storage beside your rows: bucket CRUD, upload, download, list, and single or bulk delete under <code>/storage/v1/</code>.</p>
+          <p class="feat-caveat">Signed URLs are HMAC-SHA256 over <code>(project, bucket, path, expiry)</code> with constant-time verify and independent key rotation; per-object RLS and per-project byte counters included. HEAD, COPY and resumable multipart are deferred to v1.1.</p>
+        </article>
+        <article class="feat plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <header class="feat-head">
+            <svg class="feat-icon" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="9" r="1.1"/><circle cx="12.5" cy="6.5" r="1.1"/><circle cx="24" cy="8.5" r="1.1"/><circle cx="26" cy="15" r="1.1"/><circle cx="6" cy="17" r="1.1"/><circle cx="9" cy="25" r="1.1"/><circle cx="20" cy="26" r="1.1"/><circle cx="26" cy="23" r="1.1"/><circle cx="16" cy="16" r="6.5" stroke-dasharray="2.4 2.4"/><circle cx="16" cy="16" r="1.8" fill="#60999E" stroke="#60999E"/></g></svg>
+            <span class="feat-code mono">F-05</span>
+            <span class="feat-pill feat-pill-ship">shipped</span>
+          </header>
+          <h3>Vector search</h3>
+          <p class="feat-blurb">Native <code>vector(N)</code> and <code>halfvec(N)</code> columns with <code>&lt;-&gt;</code>, <code>&lt;#&gt;</code> and <code>&lt;=&gt;</code> operators. No extension to install.</p>
+          <p class="feat-caveat">HNSW and IVF-flat indexes, both accepting pgvector-style build params. The planner routes <code>ORDER BY x &lt;-&gt; $1 LIMIT k</code> to the index fast path only when the index opclass matches the operator, and falls back to brute force rather than answer wrongly.</p>
+        </article>
+        <article class="feat plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <header class="feat-head">
+            <svg class="feat-icon" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="7" width="22" height="18" rx="1.5"/><path d="M5 12 H27" opacity=".6"/><circle cx="7.6" cy="9.5" r=".7" fill="currentColor"/><circle cx="10" cy="9.5" r=".7" fill="currentColor"/><path d="M9 15.5 L12.5 18.5 L9 21.5"/><path d="M15 21.5 H22" stroke="#60999E"/></g></svg>
+            <span class="feat-code mono">F-06</span>
+            <span class="feat-pill feat-pill-ship">shipped</span>
+          </header>
+          <h3>WASM functions</h3>
+          <p class="feat-blurb"><code>CREATE FUNCTION … LANGUAGE wasm</code>, running on Wasmtime with an epoch-interrupted CPU deadline and a memory cap per call.</p>
+          <p class="feat-caveat"><code>i32</code>/<code>i64</code>/<code>f64</code> natively, plus <code>text</code>/<code>bytea</code>/<code>timestamptz</code> across a <code>basin_alloc</code>/<code>basin_dealloc</code> <code>(ptr,len)</code> ABI; JSONB rides the text path. Invocation is per row — a first-class <code>jsonb</code> argument type and vectorized calls are deferred.</p>
+        </article>
+        <article class="feat plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <header class="feat-head">
+            <svg class="feat-icon" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="16" r="8"/><path d="M12 8 v3.5 M12 20.5 v3.5 M4 16 h3.5 M16.5 16 H20" opacity=".5"/><circle cx="12" cy="16" r="2.2" fill="#60999E" stroke="#60999E"/><path d="M22 11 h7 M22 16 h7 M22 21 h7" stroke="#60999E" opacity=".85"/></g></svg>
+            <span class="feat-code mono">F-07</span>
+            <span class="feat-pill feat-pill-ship">shipped</span>
+          </header>
+          <h3>Change data capture</h3>
+          <p class="feat-blurb">A durable, commit-ordered ring on object storage: every committed mutation, hot-tier fast paths included, appended per project.</p>
+          <p class="feat-caveat">Resumable SSE cursor at <code>/cdc/v1/sse/:project</code>, a disk-backed webhook queue with exponential backoff, dead-letter file and SHA-256 idempotency keys, and a Kafka/Redpanda drain. Logical decoding is deliberately not the shape here.</p>
+        </article>
+        <article class="feat plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <header class="feat-head">
+            <svg class="feat-icon" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="13" cy="16" r="9"/><path d="M13 10.5 V16 L17 18.5"/><path d="M23 8 h6 v6" stroke="#60999E"/><path d="M29 8 L21.5 15.5" stroke="#60999E"/></g></svg>
+            <span class="feat-code mono">F-08</span>
+            <span class="feat-pill feat-pill-ship">shipped</span>
+          </header>
+          <h3>Cron &amp; HTTP from SQL</h3>
+          <p class="feat-blurb"><code>cron.schedule()</code>, <code>cron.unschedule()</code> and the <code>cron.job</code> / <code>cron.job_run_details</code> tables — <code>pg_cron</code> semantics, no extension.</p>
+          <p class="feat-caveat"><code>net.http_get</code> / <code>net.http_post</code> cover the <code>pg_net</code> shape behind a per-project URL allowlist that denies by default, a 10&nbsp;req/s limit, a 10&nbsp;MiB body cap and a 30&nbsp;s timeout.</p>
+        </article>
+        <article class="feat plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <header class="feat-head">
+            <svg class="feat-icon" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M16 28 s7-8.5 7-13.5 a7 7 0 1 0 -14 0 C9 19.5 16 28 16 28 Z"/><circle cx="16" cy="14" r="2.6" stroke="#60999E"/><path d="M4 6 h5 M4 6 v5 M28 6 h-5 M28 6 v5" opacity=".55"/></g></svg>
+            <span class="feat-code mono">F-09</span>
+            <span class="feat-pill feat-pill-part">subset</span>
+          </header>
+          <h3>Geospatial</h3>
+          <p class="feat-blurb"><code>basin-geo</code> ships the 2-D geometry codecs, measures and exact predicates — WKB, EWKB, WKT and GeoJSON in and out.</p>
+          <p class="feat-caveat"><code>POINT</code> is a native column type and the only R-tree-indexed one: <code>ST_DWithin</code> measures ~1.7× faster than PostGIS GIST and ~28× faster than an unindexed scan at 1M rows. <code>&amp;&amp;</code> bbox counts and KNN still trail GIST badly, and constructive ops like <code>ST_Union</code> are not supported.</p>
+        </article>
+        <article class="feat plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <header class="feat-head">
+            <svg class="feat-icon" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4 L28 10 L16 16 L4 10 Z"/><path d="M4 16 L16 22 L28 16" opacity=".7"/><path d="M4 22 L16 28 L28 22" stroke="#60999E"/></g></svg>
+            <span class="feat-code mono">F-10</span>
+            <span class="feat-pill feat-pill-ship">shipped</span>
+          </header>
+          <h3>Iceberg REST catalog</h3>
+          <p class="feat-blurb">A Lakekeeper-compatible catalog over the same files: list namespaces and tables, load, create, commit and drop.</p>
+          <p class="feat-caveat">Commit maps Iceberg requirements onto the engine's own optimistic concurrency. Unmapped commit actions return a structured 501 rather than pretending; <code>register-table</code> and overwrite-style commits are v0.2.</p>
+        </article>
+        <article class="feat plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <header class="feat-head">
+            <svg class="feat-icon" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M4 26 H29"/><path d="M4 26 V6" opacity=".55"/><rect x="7" y="18" width="4" height="8"/><rect x="13" y="13" width="4" height="13"/><rect x="19" y="20" width="4" height="6"/><rect x="25" y="10" width="4" height="16" stroke="#60999E"/></g></svg>
+            <span class="feat-code mono">F-11</span>
+            <span class="feat-pill feat-pill-ship">shipped</span>
+          </header>
+          <h3>Time series</h3>
+          <p class="feat-blurb">Continuous aggregates and hypertables in the TimescaleDB shape: <code>create_hypertable</code>, <code>time_bucket</code>, <code>first()</code>/<code>last()</code>, retention policies.</p>
+          <p class="feat-caveat">Refresh is incremental for the <code>date_trunc</code> / <code>time_bucket</code> GROUP BY shape — only rows past the watermark plus the last partial bucket are re-aggregated. Bodies with no detectable bucket fall back to a full re-run.</p>
+        </article>
+        <article class="feat plate">
+          <span class="plate-tick-bl" aria-hidden="true"></span><span class="plate-tick-br" aria-hidden="true"></span>
+          <header class="feat-head">
+            <svg class="feat-icon" viewBox="0 0 32 32" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9 H20 M4 15 H16 M4 21 H12" opacity=".65"/><circle cx="21" cy="19" r="6" stroke="#60999E"/><path d="M25.5 23.5 L29 27" stroke="#60999E"/></g></svg>
+            <span class="feat-code mono">F-12</span>
+            <span class="feat-pill feat-pill-ship">shipped</span>
+          </header>
+          <h3>Text search</h3>
+          <p class="feat-blurb"><code>similarity()</code>, <code>word_similarity()</code> and the <code>%</code>, <code>&lt;%</code>, <code>&lt;-&gt;</code> operators, with the same GUC thresholds <code>pg_trgm</code> uses.</p>
+          <p class="feat-caveat">A GIN trigram index prunes to candidate files using a conservative shared-trigram bound, then re-evaluates <code>similarity()</code> on the survivors. Correctness is pinned differentially against an unindexed twin.</p>
+        </article>
+      </div>
+
+      <p class="fig-cap reveal">
+        Nothing above needs <code>CREATE EXTENSION</code>, a second container, or a managed
+        control plane. Fine-grained status for every row lives in
+        <a href="https://github.com/vul-os/basin/blob/main/CAPABILITIES.md">CAPABILITIES.md</a>.
+      </p>
     </div>
   </section>
 
