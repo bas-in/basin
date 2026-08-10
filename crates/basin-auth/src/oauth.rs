@@ -2,7 +2,8 @@
 //!
 //! Implements the authorization-code flow with PKCE for three preset providers
 //! (Google, GitHub, Apple) and a generic OIDC config path. All flows are
-//! OSS-only; basin-cloud only adds the provider-registration UI.
+//! implemented here in the OSS engine; a managed control plane adds nothing to
+//! the protocol, only a provider-registration UI on top.
 //!
 //! ## Flow
 //!

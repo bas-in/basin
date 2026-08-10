@@ -13,7 +13,7 @@
 //! The hash is seeded with `basin_sketch::QUERY_SHAPE_SEED` — a fixed constant
 //! documented in ADR 0017.  **Do not change that constant.** It is the join key
 //! across the entire OSS → cloud → cross-project aggregate pipeline; rotating it
-//! invalidates every historical shape record in basin-cloud.
+//! invalidates every shape record already collected downstream.
 //!
 //! The hash is 64 bits and computed with `xxh3_64_with_seed`, which is
 //! deterministic across platforms and Rust versions given identical byte inputs.

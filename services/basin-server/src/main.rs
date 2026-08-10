@@ -1794,9 +1794,8 @@ impl Cfg {
         // default `resolve_credentials` impl drops the password slot).
         // Combined with a public pgwire listener, that silently turned any
         // basin-server into an open relay for `user=alice`. Empty default
-        // closes the hole; operators (and dev scripts like
-        // `basin-cloud/scripts/local-engine.sh`) that need the static map
-        // still set `BASIN_PROJECTS` explicitly.
+        // closes the hole; operators and cloud-side bootstrap scripts that
+        // need the static map still set `BASIN_PROJECTS` explicitly.
         let raw = std::env::var("BASIN_PROJECTS").unwrap_or_default();
         let mut projects = Vec::new();
         for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {

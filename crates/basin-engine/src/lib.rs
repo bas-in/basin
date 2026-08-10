@@ -1828,7 +1828,7 @@ impl ProjectSession {
         tc.record_latency_ms(elapsed_ms);
         // Aggregate CPU time per project for billing. The p99 latency ring
         // above is a sliding-window SLO signal; this sum is the monotonic
-        // billing meter consumed by basin-cloud
+        // billing meter a cloud-side aggregator consumes
         // (`docs/audits/2026-05-21-billing-meter-gap.md` hole #6/#7).
         // Saturate at u64::MAX defensively; one query is never going to come
         // close, but the cast must be total.
@@ -4535,7 +4535,7 @@ mod tests {
         assert_eq!(sums, vec![20, 20, 60, 60, 70], "GROUPS 1 PRECEDING sums");
     }
 
-    /// `cpu_micros_total` (the basin-cloud
+    /// `cpu_micros_total` (the cloud-side
     /// `COMPUTE_OVERAGE_USD_PER_CPU_SECOND` meter) must aggregate every
     /// session-side `execute` and stay isolated per project.
     /// `docs/audits/2026-05-21-billing-meter-gap.md` hole #6/#7 closure.

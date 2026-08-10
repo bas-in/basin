@@ -196,7 +196,7 @@ pub enum Provider {
     S3,
     /// Tigris (Fly's globally distributed S3-compatible store, provisioned
     /// via `fly storage create`). Region is `auto`; endpoint defaults to
-    /// `https://fly.storage.tigris.dev`. This is the basin-cloud default.
+    /// `https://fly.storage.tigris.dev`. This is what the managed cloud runs on.
     Tigris,
 }
 

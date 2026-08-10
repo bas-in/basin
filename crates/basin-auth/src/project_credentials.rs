@@ -281,8 +281,9 @@ pub(crate) async fn list_legacy(inner: &Inner) -> Result<Vec<(ProjectId, String)
 /// 4. Deletes the old credential row (only after the insert succeeds).
 ///
 /// Returns `(new_pgwire_user, plaintext_password)`. The plaintext password
-/// is returned so the caller (e.g. basin-cloud's startup migration job) can
-/// update the corresponding row in cloud's `project_pgwire_credentials` table.
+/// is returned so the caller — e.g. a managed control plane's startup
+/// migration job — can update its own `project_pgwire_credentials` row to
+/// match.
 ///
 /// The function is idempotent with respect to the *old* credential: if the
 /// old row is already gone (migrated by a previous run), it returns a

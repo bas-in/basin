@@ -10,10 +10,11 @@
 //! - **Lazy per dimension.** A `(project, cap)` over-cap pair is allocated
 //!   on first observation; idle projects cost zero. Matches the
 //!   `feedback_multitenant_isolation` rule: per-project cost is `O(bytes)`.
-//! - **Snapshot-shaped.** Consumers (basin-cloud OTLP exporter, the
-//!   ops `/metrics` endpoint, dashboards) pull a plain-data snapshot. No
-//!   exporter is wired into this crate — the same surface trivially maps
-//!   to OTLP/Prometheus once the basin-cloud aggregator does so.
+//! - **Snapshot-shaped.** Consumers — an external OTLP collector, an
+//!   operator's dashboard, the managed control plane's aggregator — pull a
+//!   plain-data snapshot. No exporter is wired into this crate, and nothing
+//!   in this tree serves these counters over HTTP; the same surface maps
+//!   trivially onto OTLP/Prometheus once a collector is attached.
 //!
 //! ## Metric inventory
 //!
@@ -236,8 +237,16 @@ pub struct ReplicaLeaseSnapshot {
 
 /// Process-wide lease + budget observability registry. Cheap to clone via
 /// [`Arc`]. Each replica wires one in through [`crate`]'s sibling
-/// `basin-shard` so the heartbeat loop site can bump counters; the
-/// `/metrics` endpoint (and basin-cloud's exporter) read [`Self::snapshot`].
+/// `basin-shard` so the heartbeat loop site can bump counters; readers pull
+/// plain-data snapshots via [`Self::snapshot_replicas`] and
+/// [`Self::snapshot_over_cap`].
+///
+/// Nothing in this tree serves these over HTTP. The server's only metrics
+/// route is `GET /metrics/inflight`, which returns JSON from
+/// `basin_engine::inflight_metrics` — a different set of counters. Telemetry
+/// otherwise leaves the process as structured tracing spans over OTLP, so
+/// reaching these numbers means an external collector snapshotting them
+/// in-process.
 #[derive(Debug, Default)]
 pub struct LeaseMetrics {
     /// Per-replica state. Keyed by replica id so a multi-replica test

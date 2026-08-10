@@ -1,8 +1,9 @@
 //! Provider-registration unit tests for the cloud-broker OAuth catalog
 //! (T-015 / T-033 / T-036). Lives as an external integration test (not
-//! `#[cfg(test)] mod tests`) so the public surface that `basin-cloud`'s
-//! `BasinAuthProvider` consumes — `preset()` and `PRESET_PROVIDER_NAMES`
-//! — is exercised through the published API.
+//! `#[cfg(test)] mod tests`) so the public surface an out-of-tree consumer
+//! sees — `preset()` and `PRESET_PROVIDER_NAMES`, which a control plane's
+//! provider-registration UI drives — is exercised through the published API
+//! rather than from inside the crate.
 //!
 //! Also contains tests for the Apple ES256 JWT `client_secret` signer
 //! (closes #54 P0 Apple OAuth).

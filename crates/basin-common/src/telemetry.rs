@@ -78,8 +78,8 @@ const LATENCY_RING_SIZE: usize = 128;
 /// Class-A / Class-B op counts mirror the Tigris / S3 billing dimensions:
 /// `class_a_ops_total` covers state-changing requests (PUT, multipart-complete,
 /// COPY, DELETE) and `class_b_ops_total` covers read requests (GET, HEAD,
-/// LIST). These two are the unit-of-billing for the basin-cloud overage
-/// pricing audit (`docs/audits/2026-05-21-billing-meter-gap.md`); keep them
+/// LIST). These two are the unit-of-billing for the cloud-side overage
+/// pricing meter (`docs/audits/2026-05-21-billing-meter-gap.md`); keep them
 /// monotonic and project-scoped so the meter can be aggregated by project
 /// without per-request log scraping.
 #[derive(Debug)]
@@ -96,7 +96,7 @@ pub struct ProjectCounters {
     /// Cumulative CPU time spent on this project's behalf, in microseconds.
     /// Monotonic. Bumped by the engine's query exec-completion site
     /// (`crates/basin-engine/src/lib.rs`) and by the Wasm function runtime
-    /// (`crates/basin-fn/src/harness.rs`) so the basin-cloud billing
+    /// (`crates/basin-fn/src/harness.rs`) so a cloud-side billing
     /// aggregator can sum a single counter per project for the
     /// `COMPUTE_OVERAGE_USD_PER_CPU_SECOND` SKU
     /// (`docs/audits/2026-05-21-billing-meter-gap.md` hole #6/#7/#12).
@@ -244,14 +244,14 @@ pub struct ProjectCountersSnapshot {
     pub bytes_read_total: u64,
     pub bytes_written_total: u64,
     /// Cumulative Class-A op count (PUT / multipart-complete / COPY /
-    /// DELETE) — the basin-cloud billing dimension for write requests.
+    /// DELETE) — the cloud-side billing dimension for write requests.
     pub class_a_ops_total: u64,
-    /// Cumulative Class-B op count (GET / HEAD / LIST) — the basin-cloud
+    /// Cumulative Class-B op count (GET / HEAD / LIST) — the cloud-side
     /// billing dimension for read requests.
     pub class_b_ops_total: u64,
     /// Cumulative CPU time on the project's behalf, in microseconds. Aggregates
     /// query exec time (engine) and Wasm function wall-clock (basin-fn). Used
-    /// by basin-cloud to bill `COMPUTE_OVERAGE_USD_PER_CPU_SECOND`.
+    /// cloud-side to bill `COMPUTE_OVERAGE_USD_PER_CPU_SECOND`.
     pub cpu_micros_total: u64,
     pub errors_total: u64,
     pub latency_p99_ms_estimate: u32,

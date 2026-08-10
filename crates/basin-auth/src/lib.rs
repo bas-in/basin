@@ -501,7 +501,7 @@ impl AuthService {
     ///
     /// Returns `(new_pgwire_user, plaintext_password)`. The caller is
     /// responsible for propagating the new credential to any downstream store
-    /// (e.g. basin-cloud's `project_pgwire_credentials` table).
+    /// (e.g. a managed control plane's own `project_pgwire_credentials` table).
     pub async fn migrate_legacy_credential(
         &self,
         project: &ProjectId,

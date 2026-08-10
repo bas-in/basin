@@ -110,7 +110,7 @@ fn bg_io_semaphore() -> &'static Semaphore {
 /// Optionally carries a per-project [`ProjectCounters`] handle. When
 /// present, every forwarded RPC bumps the corresponding Class-A
 /// (state-changing: PUT, multipart-complete, COPY, DELETE) or Class-B
-/// (read: GET, HEAD, LIST) op counter, feeding the basin-cloud billing
+/// (read: GET, HEAD, LIST) op counter, feeding the cloud-side billing
 /// meter per the `2026-05-21-billing-meter-gap.md` audit. Counter bumps
 /// happen *after* the inner RPC succeeds so failed/rejected ops aren't
 /// billed (errors go through `record_error` on the counters at higher

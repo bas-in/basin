@@ -115,7 +115,7 @@ pub(crate) async fn provision_project(
 }
 
 /// `GET /admin/v1/projects/{project_id}/usage` — return the project's cumulative
-/// usage counters (the basin-cloud billing dimensions): total ops, bytes
+/// usage counters (the cloud-side billing dimensions): total ops, bytes
 /// read/written, Class-A/Class-B object-store ops, CPU micros, errors, and a p99
 /// latency estimate. Read-only; admin-scoped. Returns zeros for a project that
 /// has not yet done any work.

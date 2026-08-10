@@ -64,8 +64,9 @@ pub struct AuthConfig {
     pub email_enabled: bool,
     /// Host:port that goes into the per-project `postgres://...` connection
     /// URL handed back from `AuthService::provision_project_db`. Set to the
-    /// public-facing pgwire endpoint (e.g. `db.basin.cloud:5432`). For
-    /// local development the default is `127.0.0.1:5433`.
+    /// public-facing pgwire endpoint (the managed cloud uses
+    /// `db.basin.run:5432`, matching the `basin.run` domain the CLI defaults
+    /// to). For local development the default is `127.0.0.1:5433`.
     pub pgwire_public_host: String,
 }
 

@@ -4,8 +4,8 @@
 //! # Design
 //!
 //! This view is the SQL surface for the metering counters maintained in
-//! [`basin_common::ProjectCounterRegistry`]. Operators (and basin-cloud's
-//! external quota cron) can `SELECT * FROM basin_project_usage` to read
+//! [`basin_common::ProjectCounterRegistry`]. Operators — and any cloud-side
+//! quota cron — can `SELECT * FROM basin_project_usage` to read
 //! the calling project's current counter values without any meter scrape.
 //!
 //! ## Scoping

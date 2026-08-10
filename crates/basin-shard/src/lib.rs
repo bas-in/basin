@@ -265,10 +265,11 @@ impl ShardConfig {
     }
 
     /// Phase 6.X.F — attach the observability sink. The lease event sites
-    /// then bump counters on `lease_metrics`; consumers (basin-cloud
-    /// exporter, `/metrics` endpoint) snapshot via
-    /// [`basin_common::LeaseMetrics::snapshot_replicas`]. Optional —
-    /// shards without a metrics handle behave identically.
+    /// then bump counters on `lease_metrics`; an in-process consumer — a
+    /// cloud-side or operator-run OTLP collector — snapshots via
+    /// [`basin_common::LeaseMetrics::snapshot_replicas`]. Nothing in this tree
+    /// serves these over HTTP. Optional — shards without a metrics handle
+    /// behave identically.
     pub fn with_lease_metrics(mut self, metrics: Arc<basin_common::LeaseMetrics>) -> Self {
         self.lease_metrics = Some(metrics);
         self

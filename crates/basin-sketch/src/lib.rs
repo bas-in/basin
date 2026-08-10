@@ -26,10 +26,10 @@ pub mod tdigest;
 /// `BASIN_QUERY_SHAPE_SEED` — fixed 64-bit seed for the xxh3_64 hash
 /// used by `QueryShape` (Phase 5.16.A).  Not a sketch, but lives here
 /// because it is a project-wide constant referenced by both
-/// `basin-engine` (recording) and (later) `basin-cloud` ingest
-/// (correlation).  Documented in ADR 0017.
+/// `basin-engine` (recording) and, downstream, any cloud-side ingest that
+/// correlates shapes across projects.  Documented in ADR 0017.
 ///
 /// **Do not rotate.**  This seed is the join key across the entire
 /// OSS → cloud → cross-project aggregate pipeline.  Changing it
-/// invalidates every historical shape record in basin-cloud.
+/// invalidates every shape record already collected downstream.
 pub const QUERY_SHAPE_SEED: u64 = 0xBA51_4145_7E11_5A95;

@@ -2,10 +2,11 @@
 //!
 //! The OSS engine ships the [`crate::region::WriteForwarder`] *trait* plus the
 //! fail-loud `WrongRegion` default and NO network code. This module is the
-//! cloud-private layer that is compiled INTO the engine binary (it cannot live
-//! in the basin-cloud control-plane process, which does not depend on
-//! `basin-engine` and is off the data path — see `basin-cloud/HANDOFF.md` and
-//! `docs/scaling-multi-region.md`). It is registered once at engine startup via
+//! cloud-side layer that is compiled INTO the engine binary: it cannot live in
+//! the managed control plane, which does not depend on `basin-engine` and sits
+//! off the data path entirely. The region model it implements is specified in
+//! `docs/decisions/0009-multi-region-architecture.md`.
+//! It is registered once at engine startup via
 //! [`crate::Engine::attach_write_forwarder`], gated on `BASIN_WRITE_FORWARD_MODE`.
 //!
 //! # The two forwarding strategies

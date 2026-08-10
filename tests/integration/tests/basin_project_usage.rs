@@ -6,7 +6,7 @@
 //! 1. A session in project A sees exactly one row — its own.
 //! 2. After a write workload, `bytes_written_total` > 0.
 //! 3. A freshly opened project B's session sees its own row, NOT project A's
-//!    counters (cross-project isolation — the safety guarantee basin-cloud's
+//!    counters (cross-project isolation — the safety guarantee any cloud-side
 //!    billing aggregator relies on).
 //!
 //! Mirrors the per-project-scoping convention of `pg_stat_activity` /
