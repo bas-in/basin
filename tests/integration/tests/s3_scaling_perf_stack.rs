@@ -303,7 +303,7 @@ async fn s3_scaling_perf_stack() {
     // no injection) the uncached baseline is already ~4 ms, so caching can't
     // compress it 3× — there's almost no latency to remove. Loopback is the
     // "structural-bug detector" profile, not a latency proxy
-    // (see .basin-test.seaweedfs.toml), so require ≥3× only in the latency-
+    // (see testing/basin-test.seaweedfs.toml), so require ≥3× only in the latency-
     // bearing regime; on loopback assert the invariant loopback CAN show: the
     // cache stack must not REGRESS p50 (≥0.8× allowing noise) with p99 bounded.
     let latency_regime = cfg.latency_inject().is_some();

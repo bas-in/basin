@@ -1,5 +1,5 @@
 # Basin integration-test config — local MinIO over HTTPS with HTTP/2.
-# Use with: BASIN_TEST_CONFIG=./.basin-test.https.toml cargo test ...
+# Use with: BASIN_TEST_CONFIG=./testing/basin-test.https.toml cargo test ...
 #
 # Setup:
 #   BASIN_LOCAL_S3_TLS=1 ./benchmark/start_local_s3.sh --bg

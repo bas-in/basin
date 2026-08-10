@@ -6,7 +6,7 @@
 //! `BASIN_BENCH_STORE=local` (default) — build a `LocalFileSystem`-backed engine,
 //!   write artifacts to `benchmark/data/<name>.json`.
 //! `BASIN_BENCH_STORE=s3` — build an S3-backed engine using the config from
-//!   `.basin-test.seaweedfs.toml` (same lookup order as `BasinTestConfig::load()`),
+//!   `testing/basin-test.seaweedfs.toml` (same lookup order as `BasinTestConfig::load()`),
 //!   write artifacts to `benchmark/data_seaweedfs/<name>.json`.
 //!
 //! When `local` is active, both functions (`build_ext_engine`, `ext_artifact_dir`)
@@ -98,7 +98,7 @@ pub fn ext_artifact_dir() -> PathBuf {
 ///
 /// * `local` (default) — `LocalFileSystem` under a fresh tempdir, identical to
 ///   the existing `build_basin_engine()` in `compare_postgres_common.rs`.
-/// * `s3` — uses the `[s3]` section from `.basin-test.seaweedfs.toml` (or
+/// * `s3` — uses the `[s3]` section from `testing/basin-test.seaweedfs.toml` (or
 ///   `BASIN_TEST_CONFIG`); panics with a clear message when no config is found
 ///   so the runner can gate on seaweed availability.
 pub async fn build_ext_engine() -> ExtBasinInstance {
@@ -172,7 +172,7 @@ async fn build_ext_engine_s3() -> ExtBasinInstance {
         .unwrap_or_else(|| {
             panic!(
                 "BASIN_BENCH_STORE=s3 but no [s3] section in test config. \
-                 Set BASIN_TEST_CONFIG=./.basin-test.seaweedfs.toml or add an [s3] section."
+                 Set BASIN_TEST_CONFIG=./testing/basin-test.seaweedfs.toml or add an [s3] section."
             )
         });
 

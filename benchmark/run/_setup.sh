@@ -25,9 +25,9 @@
 # ----------------------------------------------------------------------------
 # Three test-config TOMLs cover the realism / cost spectrum:
 #
-#   .basin-test.toml                  — pure LocalFS  (~0 ms/op,  fastest CI gate)
-#   .basin-test.seaweedfs.toml        — SeaweedFS LB  (~1 ms/op,  structural-bug detector)
-#   .basin-test.tigris-realistic.toml — LB + 9 ms     (~10 ms/op, Tigris same-region proxy)
+#   .basin-test.toml                         — pure LocalFS  (~0 ms/op,  fastest CI gate)
+#   testing/basin-test.seaweedfs.toml        — SeaweedFS LB  (~1 ms/op,  structural-bug detector)
+#   testing/basin-test.tigris-realistic.toml — LB + 9 ms     (~10 ms/op, Tigris same-region proxy)
 #
 # The tigris-realistic profile uses the SAME SeaweedFS gateway this script
 # already launches; the only difference is `[latency_inject]` in its TOML,
@@ -37,7 +37,7 @@
 #
 # Switch via BASIN_TEST_CONFIG (or SEAWEED_TEST_CONFIG below):
 #
-#   BASIN_TEST_CONFIG=./.basin-test.tigris-realistic.toml \
+#   BASIN_TEST_CONFIG=./testing/basin-test.tigris-realistic.toml \
 #     cargo test -p basin-integration-tests --test <bench> -- --ignored --nocapture
 #
 # Loopback SeaweedFS stays as the default `SEAWEED_TEST_CONFIG` because it's
@@ -54,9 +54,9 @@ SEAWEED_S3_ADDR="${SEAWEED_S3_ADDR:-127.0.0.1:8333}"
 SEAWEED_S3_PORT="${SEAWEED_S3_ADDR##*:}"
 SEAWEED_VOLUME_PORT="${SEAWEED_VOLUME_PORT:-8082}"
 SEAWEED_DATA_DIR="${SEAWEED_DATA_DIR:-${REPO_ROOT}/.basin-seaweedfs-data}"
-SEAWEED_S3_CONFIG="${SEAWEED_S3_CONFIG:-${REPO_ROOT}/.basin-seaweedfs-s3.json}"
+SEAWEED_S3_CONFIG="${SEAWEED_S3_CONFIG:-${REPO_ROOT}/testing/seaweedfs-s3.json}"
 SEAWEED_BUCKET="${SEAWEED_BUCKET:-basin-test}"
-SEAWEED_TEST_CONFIG="${SEAWEED_TEST_CONFIG:-${REPO_ROOT}/.basin-test.seaweedfs.toml}"
+SEAWEED_TEST_CONFIG="${SEAWEED_TEST_CONFIG:-${REPO_ROOT}/testing/basin-test.seaweedfs.toml}"
 SEAWEED_LOG="${SEAWEED_LOG:-${REPO_ROOT}/.basin-seaweedfs-bench.log}"
 SEAWEED_PID_FILE="${SEAWEED_PID_FILE:-${REPO_ROOT}/.basin-seaweedfs-bench.pid}"
 
@@ -204,7 +204,7 @@ start_seaweed() {
     log "starting SeaweedFS S3 gateway on ${SEAWEED_S3_ADDR} (data: ${SEAWEED_DATA_DIR}) ..."
     # -volume.port overrides the SeaweedFS default of 8080 so it never
     # collides with the control-plane dev server, or anything else holding
-    # that very common port (documented in .basin-test.seaweedfs.toml).
+    # that very common port (documented in testing/basin-test.seaweedfs.toml).
     nohup weed server \
         -s3 \
         -ip=127.0.0.1 \

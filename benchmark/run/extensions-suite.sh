@@ -82,7 +82,7 @@
 # ## Store selection (S3 / SeaweedFS mode)
 #
 # Set STORE=seaweedfs to run all cards against the local SeaweedFS-backed
-# object store (reads config from .basin-test.seaweedfs.toml) and route
+# object store (reads config from testing/basin-test.seaweedfs.toml) and route
 # size-suffixed artifacts to benchmark/data_seaweedfs/. Requires SeaweedFS to
 # be running on 127.0.0.1:8333.
 #
@@ -103,7 +103,7 @@ REPO_ROOT="$(cd "${BENCH_DIR}/.." && pwd)"
 STORE="${STORE:-local}"
 if [[ "${STORE}" == "seaweedfs" ]]; then
   export BASIN_BENCH_STORE=s3
-  export BASIN_TEST_CONFIG="${BASIN_TEST_CONFIG:-${REPO_ROOT}/.basin-test.seaweedfs.toml}"
+  export BASIN_TEST_CONFIG="${BASIN_TEST_CONFIG:-${REPO_ROOT}/testing/basin-test.seaweedfs.toml}"
   DATA_DIR="${BENCH_DIR}/data_seaweedfs"
 else
   export BASIN_BENCH_STORE=local

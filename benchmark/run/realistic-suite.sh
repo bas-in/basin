@@ -11,7 +11,7 @@
 # to benchmark/data_seaweedfs/. Set the env var before invoking:
 #
 #   BASIN_BENCH_STORE=s3 \
-#   BASIN_TEST_CONFIG=./.basin-test.seaweedfs.toml \
+#   BASIN_TEST_CONFIG=./testing/basin-test.seaweedfs.toml \
 #     ./benchmark/run/realistic-suite.sh
 #
 # Check SeaweedFS is up first:  nc -z 127.0.0.1 8333

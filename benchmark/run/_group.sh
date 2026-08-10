@@ -58,7 +58,7 @@ if [[ "${config}" == "seaweedfs" ]]; then
   # point the test-config loader at the SeaweedFS .toml.
   env_prefix+=(
     "BASIN_BENCHMARK_DIR=benchmark/${data_dir}"
-    "BASIN_TEST_CONFIG=${SEAWEED_TEST_CONFIG:-${BENCH_REPO_ROOT}/.basin-test.seaweedfs.toml}"
+    "BASIN_TEST_CONFIG=${SEAWEED_TEST_CONFIG:-${BENCH_REPO_ROOT}/testing/basin-test.seaweedfs.toml}"
   )
 fi
 

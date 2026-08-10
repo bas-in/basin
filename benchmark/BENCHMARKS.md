@@ -197,7 +197,7 @@ advertised structural advantage on typical SaaS project sizes.
   already ~4 ms, so there is almost no latency for the disk/page/bloom stack to
   compress, and the ≥3× bar only applies in a latency-bearing regime. The
   honest cloud framing is **Basin on Tigris (real object-store RTT) vs Postgres
-  on EBS, *with* its index** — run the `.basin-test.tigris-realistic.toml`
+  on EBS, *with* its index** — run the `testing/basin-test.tigris-realistic.toml`
   profile (a `LatencyStore` injecting ~9 ms/op) to reproduce that regime; the
   loopback SeaweedFS numbers should not be quoted as cloud performance.
 - **Best-effort Postgres calibration.** Postgres is run with default config
@@ -231,7 +231,7 @@ open benchmark/index_localfs.html
 
 ```sh
 # Copy and fill in your credentials
-cp .basin-test.toml.example .basin-test.toml
+cp testing/basin-test.example.toml .basin-test.toml
 # Run the cloud-backed suite
 cargo test -p basin-integration-tests --tests -- --nocapture
 python3 benchmark/bundle.py --dir data_real
@@ -243,7 +243,7 @@ open benchmark/index_real.html
 ```sh
 # Start a local SeaweedFS gateway (requires Docker)
 bash benchmark/start_local_s3.sh
-cp .basin-test.seaweedfs.toml.example .basin-test.seaweedfs.toml
+export BASIN_TEST_CONFIG=./testing/basin-test.seaweedfs.toml
 cargo test -p basin-integration-tests --tests -- --nocapture
 python3 benchmark/bundle.py --dir data_seaweedfs
 open benchmark/index_seaweedfs.html

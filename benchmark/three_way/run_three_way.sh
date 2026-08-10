@@ -152,7 +152,7 @@ run_sql_file_with_subs() {
 #   2. ./.basin-three-way.toml         (relative to the script's repo root)
 #   3. else: pure env-var path
 #
-# Expected TOML shape (mirrors .basin-three-way.example.toml):
+# Expected TOML shape (mirrors testing/basin-three-way.example.toml):
 #   [endpoints]
 #   neon         = "postgres://..."
 #   supabase     = "postgres://..."
@@ -225,7 +225,7 @@ if [[ ${#MISSING_VARS[@]} -gt 0 ]]; then
     log "Set all four values before running.  Two options:"
     log ""
     log "  Option A — TOML config (preferred, persists across runs):"
-    log "    cp .basin-three-way.example.toml .basin-three-way.toml"
+    log "    cp testing/basin-three-way.example.toml .basin-three-way.toml"
     log "    \$EDITOR .basin-three-way.toml   # fill in the three DSNs"
     log "    ./benchmark/three_way/run_three_way.sh"
     log ""

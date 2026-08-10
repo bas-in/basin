@@ -135,7 +135,7 @@ before any connection is made.
 
 ```sh
 # Option A — TOML config (recommended):
-cp .basin-three-way.example.toml .basin-three-way.toml
+cp testing/basin-three-way.example.toml .basin-three-way.toml
 $EDITOR .basin-three-way.toml   # fill in three DSNs
 ./benchmark/three_way/run_three_way.sh
 

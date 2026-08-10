@@ -64,7 +64,7 @@ by inter-region latency and are not a fair comparison.
 **Option A — TOML config (recommended, persists across runs):**
 
 ```sh
-cp .basin-three-way.example.toml .basin-three-way.toml
+cp testing/basin-three-way.example.toml .basin-three-way.toml
 $EDITOR .basin-three-way.toml   # fill in the three DSNs
 ```
 
@@ -107,7 +107,7 @@ at a one-off endpoint via `NEON_DATABASE_URL=... ./run_three_way.sh` without
 editing the file.
 
 **Never** commit `.basin-three-way.toml` — it contains live credentials.
-Only `.basin-three-way.example.toml` (placeholder values) is committed.
+Only `testing/basin-three-way.example.toml` (placeholder values) is committed.
 The harness does NOT read `.env` / `.env.*` files of any kind.
 
 ### Step 3 — dry run (recommended first)

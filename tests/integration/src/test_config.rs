@@ -18,7 +18,7 @@
 //!
 //! The file contains live cloud credentials. It is gitignored at the repo
 //! root. The committable example template lives at
-//! `.basin-test.example.toml` and contains no real values.
+//! `testing/basin-test.example.toml` and contains no real values.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -156,7 +156,7 @@ impl BasinTestConfig {
             Some(c) => Some(c),
             None => {
                 println!(
-                    "[skip] {test_name}: [s3] not in test config; copy .basin-test.example.toml to .basin-test.toml and fill in to run"
+                    "[skip] {test_name}: [s3] not in test config; copy testing/basin-test.example.toml to .basin-test.toml and fill in to run"
                 );
                 None
             }

@@ -2,7 +2,7 @@
 # latency to approximate same-region Tigris RTT.
 #
 # Use with:
-#   BASIN_TEST_CONFIG=./.basin-test.tigris-realistic.toml \
+#   BASIN_TEST_CONFIG=./testing/basin-test.tigris-realistic.toml \
 #     cargo test -p basin-integration-tests --test <bench> -- --ignored --nocapture
 #
 # Why this exists
@@ -18,9 +18,9 @@
 #
 # Three-tier bench profile model
 # ------------------------------
-#   .basin-test.toml                    — pure LocalFS (~0ms/op, fastest CI gate)
-#   .basin-test.seaweedfs.toml          — SeaweedFS loopback (~1ms/op, structural-bug detector)
-#   .basin-test.tigris-realistic.toml   — SeaweedFS + 9ms inject = ~10ms/op (Tigris same-region proxy)
+#   .basin-test.toml                         — pure LocalFS (~0ms/op, fastest CI gate)
+#   testing/basin-test.seaweedfs.toml        — SeaweedFS loopback (~1ms/op, structural-bug detector)
+#   testing/basin-test.tigris-realistic.toml — SeaweedFS + 9ms inject = ~10ms/op (Tigris same-region proxy)
 #
 # The 9 ms inject is calibrated against the empirical Fly-machine-to-Tigris
 # same-region p50 of 5–15 ms — loopback contributes the residual ~1 ms.
