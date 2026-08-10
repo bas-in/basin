@@ -66,7 +66,23 @@ COPY tests/ tests/
 
 # Build the release binary. Package name and [[bin]] name are both "basin-server"
 # (verified in services/basin-server/Cargo.toml).
-RUN cargo build --release -p basin-server
+#
+# Debug info is dropped HERE rather than in Cargo.toml's `[profile.release]`,
+# which sets `debug = 1` workspace-wide. That setting is deliberate — its own
+# comment notes that changing it globally cold-rebuilds the whole DataFusion
+# tree and cools every sccache entry — so the shared profile stays untouched
+# and the override is scoped to this build, which compiles from scratch in a
+# clean container anyway and gains nothing from those caches.
+#
+# Without this the DWARF line tables ride into the runtime stage inside the
+# binary: the first image that ever built came out at 1532 MB against the
+# workflow's 100 MB gate, nearly all of it debug info. `strip = symbols`
+# additionally drops the symbol table, mirroring what
+# `[profile.release.package.basin-integration-tests]` already does for the
+# same reason.
+RUN CARGO_PROFILE_RELEASE_DEBUG=0 \
+    CARGO_PROFILE_RELEASE_STRIP=symbols \
+    cargo build --release -p basin-server
 
 # ─── Stage 2: runtime ────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
