@@ -78,6 +78,57 @@ async fn list_keys(store: &Arc<dyn ObjectStore>) -> Vec<String> {
     out
 }
 
+/// Assert that `routed` is the PRIMARY store, by the observable property that
+/// actually matters: an object written through `routed` is readable from the
+/// raw `primary` backing store, i.e. the bytes land in the primary bucket.
+///
+/// Deliberately NOT a pointer-identity (`Arc::as_ptr`) check. `Storage::new`
+/// wraps the configured store before handing it to the pool as the default
+/// store — unconditionally in a `RetryingStore`, and additionally in a
+/// `DiskCachedStore` when a disk cache is configured — so the pool legitimately
+/// returns an equivalent-but-distinct `Arc`. That wrapping is desirable: a
+/// primary-pinned project SHOULD inherit the same retry/cache stack as every
+/// other reader. What the pin guarantees is the routing DESTINATION, not the
+/// allocation, so the destination is what is asserted here.
+///
+/// This still discriminates the failure it is guarding: if a pinned project
+/// were striped to pool buckets, or if a [`PRIMARY_PIN_BUCKET_ID`] assignment
+/// were resolved through the bucket resolver instead of falling back to the
+/// default store, `routed` would be some other store entirely and the probe
+/// object would never appear in `primary`.
+async fn assert_routes_to_primary(
+    routed: &Arc<dyn ObjectStore>,
+    primary: &Arc<dyn ObjectStore>,
+    what: &str,
+) {
+    let probe = object_store::path::Path::from(format!("__route_probe__/{}", ProjectId::new()));
+    routed
+        .put(
+            &probe,
+            object_store::PutPayload::from_static(b"routed-here"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{what}: probe write through the routed store failed: {e}"));
+    let got = primary
+        .get(&probe)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{what}: the routed store is NOT the primary store — a probe written \
+                 through it is absent from the primary backing store ({e})"
+            )
+        })
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        &got[..],
+        b"routed-here",
+        "{what}: probe bytes read back from primary differ"
+    );
+    primary.delete(&probe).await.unwrap();
+}
+
 /// Strip the random `{ulid}.vortex` filename, leaving the deterministic key
 /// prefix (`projects/{p}/tables/{t}/data/{part}/yyyy/mm/dd/`). The filename is
 /// a per-write ULID, so two byte-identical routings still differ in the last
@@ -1508,11 +1559,12 @@ async fn existing_primary_project_is_pinned_new_project_stripes() {
     let routed = pool
         .routed_store(&existing)
         .expect("pinned project has a warmed route");
-    assert_eq!(
-        Arc::as_ptr(&routed) as *const (),
-        Arc::as_ptr(&primary) as *const (),
-        "pinned project must route to the primary store"
-    );
+    assert_routes_to_primary(
+        &routed,
+        &primary,
+        "pinned project must route to the primary store",
+    )
+    .await;
 
     // A genuinely-new project (no pre-pool primary data) DOES stripe to pool buckets.
     let fresh = ProjectId::new();
@@ -1607,11 +1659,12 @@ async fn primary_pin_is_stable_across_restart() {
     let routed = pool
         .routed_store(&existing)
         .expect("re-warmed pinned route");
-    assert_eq!(
-        Arc::as_ptr(&routed) as *const (),
-        Arc::as_ptr(&primary) as *const (),
-        "pinned project must re-resolve to primary after restart"
-    );
+    assert_routes_to_primary(
+        &routed,
+        &primary,
+        "pinned project must re-resolve to primary after restart",
+    )
+    .await;
 }
 
 /// REGRESSION GATE (live bug, dev v142): the safe-enable probe must honour the
@@ -1694,11 +1747,12 @@ async fn existing_project_with_root_prefix_is_pinned_not_striped() {
     assert_eq!(a.stripe, vec![PRIMARY_PIN_BUCKET_ID.to_string()]);
     // It routes to the primary store (its real data) and never resolves a pool bucket.
     let routed = pool.routed_store(&existing).expect("pinned route warmed");
-    assert_eq!(
-        Arc::as_ptr(&routed) as *const (),
-        Arc::as_ptr(&primary) as *const (),
-        "pinned existing project must route to the primary store"
-    );
+    assert_routes_to_primary(
+        &routed,
+        &primary,
+        "pinned existing project must route to the primary store",
+    )
+    .await;
     assert!(
         resolver.stores.lock().unwrap().is_empty(),
         "no pool bucket may be resolved for a pinned existing project"
