@@ -192,6 +192,15 @@ async fn seed_object(
 /// One project submits 100 ops sequentially; the scheduler must not
 /// inflate completion time beyond ~2× the bare per-op cost. Validates
 /// the EDF wiring is overhead-free in the steady state.
+///
+/// The baseline is MEASURED, not computed from `per_op`. A
+/// `tokio::time::sleep(2ms)` does not cost 2ms: timer granularity plus wake
+/// latency put the real floor at roughly twice that, so the old
+/// `per_op * 100 * 2` bound was really asserting "the tokio timer is accurate",
+/// which it is not, and the test failed at ~420ms against a 400ms limit on an
+/// idle machine. Timing the same ops straight at the slow store cancels timer
+/// granularity and machine load out of both sides, leaving the scheduler's own
+/// overhead as the only thing under test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_project_no_starvation() {
     let per_op = Duration::from_millis(2);
@@ -200,19 +209,32 @@ async fn single_project_no_starvation() {
     let project = ProjectId::new();
     let path = seed_object(&storage, &project, "f", 64).await;
 
+    // Baseline: 100 ops with no `Storage` wrapper and no scheduler in the path.
+    // `head` resolves to `SlowStore::get_opts` here exactly as it does through
+    // the scheduled store, so both loops pay one identical sleep per op.
+    let raw: Arc<dyn ObjectStore> = slow.clone();
+    let started = Instant::now();
+    for _ in 0..100 {
+        let _ = raw.head(&path).await.expect("baseline head");
+    }
+    let baseline = started.elapsed();
+
+    // The same 100 ops through the EDF-scheduled per-project store.
     let store = storage.project_object_store(&project);
     let started = Instant::now();
     for _ in 0..100 {
         let _ = store.head(&path).await.expect("head");
     }
-    let elapsed = started.elapsed();
-    // Bound: 100 sequential ops × 2ms each = 200ms baseline. The
-    // scheduler can add bookkeeping overhead but not double the cost.
+    let scheduled = started.elapsed();
+
+    // The scheduler may add bookkeeping but must not double the cost of the
+    // work it schedules.
     assert!(
-        elapsed < per_op * 100 * 2,
-        "single-project overhead: {:?} > 2× ({:?})",
-        elapsed,
-        per_op * 100 * 2
+        scheduled < baseline * 2,
+        "single-project scheduler overhead: {:?} vs measured baseline {:?} (limit 2× = {:?})",
+        scheduled,
+        baseline,
+        baseline * 2
     );
 }
 
