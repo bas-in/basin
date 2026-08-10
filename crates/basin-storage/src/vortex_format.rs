@@ -1176,22 +1176,35 @@ mod tests {
         );
     }
 
-    /// Micro-benchmark for the `BASIN_SHARD_COMPACTION_FAST_ENCODE` lever:
-    /// quantify the per-batch encode-cost delta between the compaction default
-    /// (`Best`, full BtrBlocks search) and the opt-in `Fast` cascade on a
-    /// realistically wide, compaction-sized merged batch.
+    /// Regression gate for the `BASIN_SHARD_COMPACTION_FAST_ENCODE` lever: the
+    /// `Fast` cascade must remain genuinely distinct from the compaction
+    /// default (`Best`, full BtrBlocks search) on a realistically wide,
+    /// compaction-sized merged batch.
     ///
-    /// This is the work that dominates a CPU-bound single node's sustained
-    /// bulk-COPY ingest (COPY rows are encoded exactly once, in compaction).
-    /// The lever cannot add parallelism on a saturated box — it makes each
-    /// core's encode CHEAPER. This test demonstrates that the cheaper encode
-    /// is real and measurable, and asserts a conservative lower bound on the
-    /// speedup so a regression that silently erases the win fails CI.
+    /// This used to assert a wall-clock speedup of `>= 1.2x`. That threshold
+    /// sat inside the run-to-run noise on a shared machine — four consecutive
+    /// runs measured 1.03x, 1.17x, 1.25x, 1.40x — so it was a coin flip living
+    /// in the correctness suite rather than a regression gate. Widening the
+    /// threshold would only move the coin flip somewhere else.
     ///
-    /// Conservative gate: `Fast` must be at least 1.2× faster than `Best` on
-    /// this batch. The #92 design claims ~3-4×; we assert only 1.2× so the
-    /// test is stable on a loaded CI box while still failing if the cascade
-    /// distinction is lost. The measured ratio is printed for the curious.
+    /// Mechanically, the lever is the `exclude_schemes([..])` call in
+    /// [`btrblocks_builder_for`]: nine dictionary / RLE / FSST / Pco schemes
+    /// whose per-column sample-and-search is exactly what costs `Best` its
+    /// time (plus a larger `FAST_DEFAULT_ROW_BLOCK_SIZE`). Skipping that search
+    /// has a deterministic, directly observable consequence — the output is no
+    /// longer compressed by those schemes, so it gets dramatically bigger. On
+    /// this batch `Fast`'s blob is ~27x `Best`'s, on every run, with no
+    /// measurable variance.
+    ///
+    /// So the size ratio is what is asserted. It witnesses the same regression
+    /// the timing check was aiming at — if `Fast` silently collapsed back into
+    /// `Best`, the ratio would fall to ~1.0 — but it measures the WORK rather
+    /// than the clock, so it is stable on a loaded CI box.
+    ///
+    /// It also makes visible the trade the speed-only assertion hid: `Fast`
+    /// buys roughly 1.2x encode speed at the cost of ~27x larger output. That
+    /// is the more interesting dimension of this lever, and the one a future
+    /// tuner needs to see. Timings are still printed, but they gate nothing.
     #[tokio::test]
     async fn compaction_fast_encode_is_materially_cheaper() {
         use std::time::Instant;
@@ -1236,48 +1249,50 @@ mod tests {
             .await
             .expect("warm encode");
 
-        // Best-of-3 each, to damp scheduler noise on a loaded box.
-        let mut best = std::time::Duration::MAX;
-        let mut best_bytes_len = 0usize;
-        for _ in 0..3 {
-            let t = Instant::now();
-            let b = encode_with_mode(&batch, None, EncodingMode::Best)
-                .await
-                .expect("encode best");
-            best = best.min(t.elapsed());
-            best_bytes_len = b.len();
-        }
-        let mut fast = std::time::Duration::MAX;
-        let mut fast_bytes_len = 0usize;
-        for _ in 0..3 {
-            let t = Instant::now();
-            let b = encode_with_mode(&batch, None, EncodingMode::Fast)
-                .await
-                .expect("encode fast");
-            fast = fast.min(t.elapsed());
-            fast_bytes_len = b.len();
-        }
+        // One encode each. Timings are observability only, so there is no
+        // best-of-N: the assertion below does not read them.
+        let t = Instant::now();
+        let best_bytes_len = encode_with_mode(&batch, None, EncodingMode::Best)
+            .await
+            .expect("encode best")
+            .len();
+        let best = t.elapsed();
+        let t = Instant::now();
+        let fast_bytes_len = encode_with_mode(&batch, None, EncodingMode::Fast)
+            .await
+            .expect("encode fast")
+            .len();
+        let fast = t.elapsed();
 
-        let ratio = best.as_secs_f64() / fast.as_secs_f64();
+        // Sanity: guard against a degenerate empty-blob false positive, which
+        // would otherwise make the size ratio meaningless. Round-trip
+        // correctness is covered by `fast_mode_round_trips_and_is_not_slower`.
+        assert!(
+            best_bytes_len > 0 && fast_bytes_len > 0,
+            "both modes must produce non-empty output \
+             (Best={best_bytes_len} B, Fast={fast_bytes_len} B)"
+        );
+
+        let size_ratio = fast_bytes_len as f64 / best_bytes_len as f64;
         eprintln!(
             "compaction encode {N} rows: Best={best:?} ({best_bytes_len} B) \
-             Fast={fast:?} ({fast_bytes_len} B) speedup={ratio:.2}x \
-             size_ratio={:.2}x",
-            fast_bytes_len as f64 / best_bytes_len as f64
+             Fast={fast:?} ({fast_bytes_len} B) size_ratio={size_ratio:.2}x \
+             speedup={:.2}x (timings are observability, not asserted)",
+            best.as_secs_f64() / fast.as_secs_f64()
         );
 
+        // Deterministic gate. Measured ~26.9x with no run-to-run variance; a
+        // collapse of Fast back into Best would land at ~1.0x. The 5x floor is
+        // far from both, so this discriminates without a timing coin flip.
         assert!(
-            ratio >= 1.2,
-            "Fast compaction encode should be >=1.2x faster than Best on a \
-             search-heavy batch (got {ratio:.2}x: Best={best:?}, Fast={fast:?}); \
-             if this regressed, the BASIN_SHARD_COMPACTION_FAST_ENCODE lever no \
-             longer buys a measurable ingest-throughput win"
+            size_ratio >= 5.0,
+            "Fast compaction encode must skip the search-based schemes that \
+             make Best expensive, which shows up as materially larger output \
+             (got {size_ratio:.2}x, expected >=5x: Best={best_bytes_len} B, \
+             Fast={fast_bytes_len} B); a ratio near 1.0x means the \
+             BASIN_SHARD_COMPACTION_FAST_ENCODE cascade distinction was lost \
+             and the lever no longer does anything"
         );
-
-        // Sanity: both produce non-empty, decodable output (correctness is
-        // covered in depth by `fast_mode_round_trips_and_is_not_slower`; here
-        // we just guard against a degenerate empty-blob false positive).
-        assert!(best_bytes_len > 0 && fast_bytes_len > 0);
     }
 
     /// Self-describing decode: with `schema = None` the Arrow schema is
