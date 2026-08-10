@@ -48,6 +48,7 @@ jobs:
   saas-starter-smoke:
     name: SaaS Starter smoke (build + unit; live RLS slices skipped)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -69,6 +70,7 @@ jobs:
   ai-rag-app-smoke:
     name: AI RAG App smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout

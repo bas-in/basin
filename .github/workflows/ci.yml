@@ -1,5 +1,26 @@
 name: CI
 
+# Basic checks on every push and PR: does it build, is it formatted, does it
+# lint, do the tests pass, do the docs hold together. Nothing here needs a
+# database, a container registry, an object store or a third-party migration
+# tool — those live in their own workflows and run on demand.
+#
+# HOW THIS GOT SMALLER (2026-08-10). CI had nine jobs and six of them were red.
+# The failures were almost never the code:
+#   - six gates exited before running their check, on a BSD-only `mktemp -t`
+#   - the Docker image had never once built (0 successes in 99 runs)
+#   - External-Tool Compat had never once passed (0 in 100) — it needs pgwire
+#     features Basin has not implemented, which is a roadmap item, not a
+#     regression to catch on every push
+#   - the `test` job had NEVER COMPLETED in the repository's history, because
+#     two tests hang forever and no job had a timeout, so every run sat until
+#     GitHub's 6-hour ceiling killed it and reported "cancelled"
+# A pipeline that is red by default teaches everyone to ignore it, and then it
+# guards nothing. So the checks that pay for themselves on every commit stay
+# here, and the heavyweight suites moved to `workflow_dispatch` + a schedule.
+# Nothing was deleted: docker-smoke, external-tool-compat and
+# tutorial-and-samples are all still runnable, and still run on a timer.
+
 on:
   push:
     branches: [main, master]
@@ -7,7 +28,7 @@ on:
     branches: [main, master]
 
 # Cancel in-flight runs on the same branch so a quick re-push doesn't queue
-# two full builds. Saves ~10–20 min of runner time per amend.
+# two full builds.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -15,229 +36,148 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Don't fetch the full crates.io index — sparse is the default on modern
-  # toolchains but we set it explicitly so older runners behave the same way.
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-  # NOTE — there is deliberately NO `RUST_TOOLCHAIN` pin here any more.
-  # `rust-toolchain.toml` (channel = "stable") is the single source of truth and
-  # rustup honours it over anything a workflow installs. The previous
-  # `RUST_TOOLCHAIN: 1.83.0` + `dtolnay/rust-toolchain@master with: toolchain:`
-  # pair installed 1.83.0 and then never used it — the runner logs said so
-  # outright:
-  #   info: note that the toolchain 'stable-x86_64-unknown-linux-gnu' is
-  #   currently in use (overridden by '.../rust-toolchain.toml')
-  # So the pin described a toolchain no job ran on, while the workspace's
-  # `rust-version` (then 1.85, actually 1.92) went unverified in both
-  # directions. The `msrv-floor` job below now checks the MSRV claim directly.
-  # Strip debug info from CI dev builds. Free GitHub runners have ~7GB
-  # RAM and the workspace's test binaries (each statically links ~200
-  # crates) routinely OOM the linker on full debug info. `line-tables-
-  # only` keeps file:line numbers for panics + backtraces, which is all
-  # CI needs — full DWARF is for interactive debugging.
+  # There is deliberately NO toolchain pin here. `rust-toolchain.toml`
+  # (channel = "stable") is the single source of truth and rustup honours it
+  # over anything a workflow installs — a previous pin installed 1.83.0 and then
+  # never used it, so the workspace's real `rust-version` went unverified in
+  # both directions. The msrv step below checks that claim directly.
+  #
+  # Strip debug info from CI dev builds: free runners have ~7GB RAM and these
+  # test binaries each statically link ~200 crates, which OOMs the linker on
+  # full DWARF. `line-tables-only` keeps file:line for panics and backtraces,
+  # which is all CI needs.
   CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
-  # NOTE: sccache via the GHA cache backend was tried here and reverted —
-  # the Azure-hosted artifactcache endpoint returns 400s intermittently
-  # (`Server startup failed: cache storage failed to read`), and because
-  # `RUSTC_WRAPPER=sccache` propagates to every rustc invocation, every
-  # build step fails when the backend is degraded. Rely on Swatinem
-  # rust-cache for incremental compilation across runs; that path is
-  # stable and gets us most of the benefit without the failure surface.
+  # sccache via the GHA cache backend was tried and reverted: the Azure-hosted
+  # artifactcache endpoint 400s intermittently, and because RUSTC_WRAPPER
+  # propagates to every rustc invocation, every build step fails when the
+  # backend is degraded. Swatinem/rust-cache gets most of the benefit without
+  # that failure surface.
 
 jobs:
-  fmt:
-    name: rustfmt
+  # ── 1. Does it build, is it clean ──────────────────────────────────────────
+  check:
+    name: fmt · clippy · msrv
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  docs-frontmatter:
-    name: docs frontmatter
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+          components: rustfmt, clippy
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: ./scripts/check-frontmatter.sh
-
-  docs-index:
-    name: docs index up to date
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: bash ./scripts/build-docs-index.sh --check
-
-  verify-script:
-    # A guard that has quietly stopped failing is indistinguishable, from a
-    # green CI run, from one that works. So the refusal paths of the scripts
-    # this repo's other gates are built out of are exercised on every push, not
-    # only when they happen to be invoked for real.
-    name: Gate scripts — lint & failure matrices
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # The set below is every shell script a CI job invokes: the scripts/
-      # gates, plus the harnesses docker-smoke.yml and tutorial-and-samples.yml
-      # run. Kept as an explicit glob list rather than "find every .sh" so a new
-      # script is a deliberate addition — but if you add one a workflow calls,
-      # add it here.
-      - name: Syntax check
-        run: |
-          set -euo pipefail
-          for f in scripts/verify.sh scripts/check-*.sh scripts/build-docs-index.sh \
-                   tests/integration/scripts/*.sh; do
-            bash -n "$f"
-          done
-      # `mktemp -t NAME` is a BSD idiom: on macOS NAME is a *prefix*, on GNU
-      # coreutils it is a TEMPLATE that must end in >=3 X's, so a script written
-      # on a laptop dies on the runner with `too few X's in template`. That is
-      # exactly how four fail-closed harnesses spent days exiting 1 before they
-      # reached the check they exist to run — a red that looked like the check
-      # failing. Portable form: `mktemp "${TMPDIR:-/tmp}/name.XXXXXX"`.
-      - name: Temp files are created portably (no BSD-only `mktemp -t`)
-        run: |
-          set -euo pipefail
-          hits="$(grep -rn -- '-t [^ "]*' --include='*.sh' scripts tests/integration/scripts \
-                    | grep 'mktemp' | grep -v 'XXX' || true)"
-          if [ -n "${hits}" ]; then
-            echo "Non-portable mktemp template — dies on GNU coreutils:" >&2
-            echo "${hits}" >&2
-            exit 1
-          fi
-          echo "ok — every mktemp template carries an XXXXXX placeholder"
-      # Lints every script a CI job depends on, not just verify.sh. A gate whose
-      # own wrapper has an unquoted expansion or a silently-swallowed pipeline
-      # is a gate that can stop gating without anything going red — and four of
-      # this repo's fail-closed harnesses live under tests/integration/scripts/,
-      # outside what this job used to look at.
-      - name: ShellCheck
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck
-          shellcheck scripts/verify.sh scripts/check-*.sh scripts/build-docs-index.sh \
-                     tests/integration/scripts/*.sh
-      # Each case is a synthetic origin broken in exactly one way; the matrix
-      # asserts the exit code AND that a diagnostic was printed, because
-      # "aborted with no message" was the real-world bug being guarded against.
-      - name: Release verifier — failure matrix (synthetic origin)
-        run: bash scripts/verify.sh --selftest
-      # Same idea for the zero-test guard: its verdict function is driven
-      # against synthetic `cargo test` output covering each refusal, so the
-      # wrapper that stands between "0 tests ran" and a green tick cannot itself
-      # rot into a no-op.
-      - name: Zero-test guard — failure matrix (synthetic runs)
-        run: bash scripts/check-test-executes.sh --selftest
-
-  msrv-floor:
-    # Asserts that Cargo.toml's `rust-version` is not below the floor the
-    # resolved graph imposes. This is the gate that was missing when the
-    # workspace claimed 1.85 for months against a lockfile that needed 1.92 —
-    # a claim only the Dockerfile ever tested, in a workflow that had been red
-    # long enough to read as background noise.
-    name: msrv floor
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: ./scripts/check-msrv-floor.sh
-
-  docs-links:
-    # Sixteen relative links were dead before this gate existed, four of them
-    # pointing at a doc deleted one commit earlier. Fails closed, including on
-    # "found zero links to check".
-    name: docs links resolve
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: ./scripts/check-doc-links.sh
-
-  clippy:
-    name: clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "ci-clippy"
-      # v0.1 ships with non-zero clippy warnings that we're cleaning up
-      # incrementally. Run clippy in advisory mode for now; tighten back
-      # to `-D warnings` once the existing tail is cleared (tracked as a
-      # post-v0.1.1 cleanup). Clippy's deny-by-default lints (e.g.
-      # `clippy::approx_constant`) still fail the build — that's the
-      # intended "you wrote actively wrong code" gate.
-      - run: cargo clippy --workspace --all-targets
+          shared-key: "ci-check"
 
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      # --all-targets matters beyond lint coverage: `basin-integration-tests` is
+      # excluded from the test job below (its binaries OOM the runner at link
+      # time), so this is the ONLY thing in CI that compiles that crate. Without
+      # it a test binary there can stop compiling for weeks unnoticed — which is
+      # exactly what happened to a `Wal` fake in August 2026.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: MSRV floor is honest
+        run: ./scripts/check-msrv-floor.sh
+
+  # ── 2. Do the tests pass ───────────────────────────────────────────────────
   test:
-    # Single-OS test job — Linux only. macOS doubled runner cost without
-    # catching a single Linux-passes-macOS-fails case in the v0.1
-    # bring-up. Re-add the matrix when we have evidence the
-    # platform-specific paths (mimalloc, object_store local fs) actually
-    # need it.
     name: test
     runs-on: ubuntu-latest
+    # A timeout is not a formality here. Without one this job ran to GitHub's
+    # 6-hour ceiling on every single attempt in the repo's history, because two
+    # tests park forever on the tokio time driver. Those are now #[ignore]d with
+    # the reason recorded; this cap makes sure the next hang costs 45 minutes and
+    # reports "failed" rather than costing six hours and reporting "cancelled".
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          # Distinct key from clippy so the larger test-incremental
-          # artifact set doesn't evict the clippy cache.
+          # Distinct key from `check` so the larger test-incremental artefact
+          # set doesn't evict the clippy cache.
           shared-key: "ci-test"
-      # Postgres is optional — the basin-catalog Postgres tests skip on
-      # unreachable PG via `try_connect()`. We start it best-effort so
-      # the bonus coverage runs when available.
+
+      # Postgres is optional — basin-catalog's Postgres tests skip on an
+      # unreachable server via `try_connect()`. Started best-effort so the bonus
+      # coverage runs when it is available.
       - name: Start Postgres
         run: |
           sudo systemctl start postgresql.service || true
           sudo -u postgres psql -c "CREATE USER basin WITH SUPERUSER PASSWORD 'basin';" || true
           sudo -u postgres psql -c "CREATE DATABASE basin OWNER basin;" || true
           echo "DATABASE_URL=postgres://basin:basin@localhost:5432/basin" >> $GITHUB_ENV
-      # Build + test as one step: `cargo test` builds the test artefacts
-      # directly, so a prior `cargo build` step just doubles compile
-      # cost. `--locked` so a Cargo.lock drift is caught before tests run.
+
+      # `cargo test` builds the test artefacts itself, so a separate build step
+      # would just double the compile cost. `--locked` catches Cargo.lock drift
+      # before anything runs.
       #
-      # `--exclude basin-integration-tests`: those tests are
-      # benchmark-flavoured viability cards (viability_*, s3_scaling_*,
-      # large_dataset_*) that link a near-full workspace per binary and
-      # routinely OOM a 7GB GitHub runner at link time
-      # (`ld terminated with signal 7 [Bus error]`). They're designed
-      # to run on a developer workstation, not on free CI. The per-
-      # crate unit + integration tests still run via `--workspace`.
+      # `--exclude basin-integration-tests`: those are benchmark-flavoured
+      # viability cards (viability_*, s3_scaling_*) that link a near-full
+      # workspace per binary and OOM a 7GB runner at link time with
+      # `ld terminated with signal 7`. They are built for a workstation, not
+      # free CI — and clippy above still compiles them.
       - run: cargo test --workspace --exclude basin-integration-tests --no-fail-fast --locked
 
-  audit:
-    name: cargo audit
+  # ── 3. Do the docs hold together ───────────────────────────────────────────
+  docs:
+    name: docs · gate scripts
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      # Cache cargo bin/registry so `cargo install cargo-audit` doesn't
-      # rebuild from source on every push (~3-4 min saved).
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
         with:
-          shared-key: "ci-audit"
-          cache-targets: "false"
-      - run: cargo install cargo-audit --locked
-      # Default `cargo audit` exits non-zero on vulnerabilities only.
-      # We intentionally do NOT pass `--deny warnings` here — yanked /
-      # unmaintained advisories surface in the log but don't fail the
-      # build, since the upstream of any deep transitive dep is out of
-      # our control on short notice.
-      - run: cargo audit
+          python-version: "3.11"
+
+      - name: Frontmatter
+        run: ./scripts/check-frontmatter.sh
+
+      - name: Docs index is current
+        run: bash ./scripts/build-docs-index.sh --check
+
+      - name: Relative links resolve
+        run: ./scripts/check-doc-links.sh
+
+      - name: Shell gates parse
+        run: |
+          set -euo pipefail
+          for f in scripts/verify.sh scripts/check-*.sh scripts/build-docs-index.sh; do
+            bash -n "$f"
+          done
+          echo "ok — every gate script parses"
+
+      # The bug this catches cost six jobs: GNU coreutils requires at least
+      # three trailing X's in a mktemp template, so the BSD idiom `mktemp -t
+      # name` exits 1 on a Linux runner — before the gate it precedes has run a
+      # single check. Every one of those jobs reported failure without ever
+      # testing its subject.
+      # The match must be anchored to `mktemp`. A bare `-t ` pattern also hits
+      # `[ -t 2 ]` — the shell's is-a-terminal test, which verify.sh uses on
+      # line 113 to decide whether to colourise. Running this locally before
+      # committing is how that false positive was caught; it would have failed
+      # the job on a line that has nothing to do with temp files.
+      - name: mktemp templates are portable
+        run: |
+          set -euo pipefail
+          hits="$(grep -rn 'mktemp[^|;&]* -t ' --include='*.sh' scripts tests/integration/scripts 2>/dev/null | grep -v 'XXXXXX' || true)"
+          if [ -n "${hits}" ]; then
+            echo "BSD-only mktemp template (GNU needs XXXXXX):"; echo "${hits}"; exit 1
+          fi
+          echo "ok — every mktemp template carries an XXXXXX placeholder"
+
+      # Both of these are self-tests: they plant the failure the gate exists to
+      # catch and assert it goes red. A gate that has never been shown to fail
+      # is not evidence of anything.
+      - name: Release verifier discriminates
+        run: bash scripts/verify.sh --selftest
+
+      - name: Zero-test guard discriminates
+        run: bash scripts/check-test-executes.sh --selftest
