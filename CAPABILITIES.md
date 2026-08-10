@@ -236,7 +236,7 @@ wall-clock numbers.
 
 ### Performance residuals (won't chase further)
 
-These are shapes where Vortex underperforms Parquet by single-digit-percent-to-30% in the smoke matrix. Documented here as known limitations with concrete workarounds. Further engineer-time invested in chasing these would return marginal customer value compared with the surface pivot (basin-cli, basin-js, WebSocket subscriptions, basin-cloud webapp).
+These are shapes where Vortex underperforms Parquet by single-digit-percent-to-30% in the smoke matrix. Documented here as known limitations with concrete workarounds. Further engineer-time invested in chasing these would return marginal customer value compared with the surface pivot (basin-cli, basin-js, WebSocket subscriptions, the managed console).
 
 | Shape | Ratio (parquet_ms / vortex_ms) | Root cause | Workaround |
 |---|---|---|---|
