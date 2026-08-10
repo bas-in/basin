@@ -2,7 +2,7 @@
 title: "Basin documentation index"
 nav_section: overview
 sidebar_position: 0
-summary: "Top-level navigation for Basin's OSS documentation. Both for humans browsing on GitHub and for basin-cloud's build-time fetcher."
+summary: "Top-level navigation for Basin's OSS documentation. Both for humans browsing on GitHub and for a downstream docs site fetching this tree at build time."
 ---
 
 # Basin documentation
@@ -10,7 +10,7 @@ summary: "Top-level navigation for Basin's OSS documentation. Both for humans br
 Navigation root for the Basin OSS repo. Every file is organised by
 `nav_section` declared in its YAML frontmatter
 (see [`frontmatter-spec.md`](./frontmatter-spec.md)).
-basin-cloud's build-time fetcher uses this index to assemble the
+A downstream docs site can fetch this index at build time to assemble a
 unified nav tree; GitHub renders it for humans browsing `docs/`.
 
 ## Overview
@@ -82,8 +82,8 @@ unified nav tree; GitHub renders it for humans browsing `docs/`.
 - [ADR 0014 — pg_query as canonical parser](decisions/0014-pg-query-as-canonical-parser.md) — ADR 0014: pg_query as canonical parser. See body for status, context, decision, consequences.
 - [ADR 0015 — Vortex storage format (default)](decisions/0015-vortex-storage-format.md) — ADR 0015: Vortex storage format (default). See body for status, context, decision, consequences.
 - [ADR 0016 — HTAP hot tier architecture](decisions/0016-htap-hot-tier-architecture.md) — Row-format LSM-style memtable for recent writes, in a new basin-hottier crate. Closes the OLTP gap (point_eq, single-row UPDATE) without sacrificing OLAP wins on Vortex.
-- [ADR 0017 — Query-shape stats: privacy + cross-process stability](decisions/0017-query-shape-privacy.md) — Phase 5.16 exports per-query-shape stats from OSS basin to basin-cloud for cross-customer analytics. Privacy invariants, hash-function stability, and template anonymisation rules live here.
-- [ADR 0018 — Subsystem feature flags + minimal-build target](decisions/0018-subsystem-feature-flags.md) — Gate optional subsystems behind Cargo features so OSS users can ship a minimal pgwire-only binary; basin-cloud and the default OSS build keep the full feature set.
+- [ADR 0017 — Query-shape stats: privacy + cross-process stability](decisions/0017-query-shape-privacy.md) — Phase 5.16 exports per-query-shape stats from OSS basin to an external analytics collector for cross-customer analytics. Privacy invariants, hash-function stability, and template anonymisation rules live here.
+- [ADR 0018 — Subsystem feature flags + minimal-build target](decisions/0018-subsystem-feature-flags.md) — Gate optional subsystems behind Cargo features so OSS users can ship a minimal pgwire-only binary; managed deployments and the default OSS build keep the full feature set.
 - [ADR 0019 — Declarative BaaS surface: inbound webhooks + RPC mount](decisions/0019-declarative-baas-surface.md) — Two declarative primitives — CREATE INBOUND WEBHOOK and POST /rpc/<fn> — cover ~95% of edge-function use cases as SQL, with no V8/Deno runtime or language sandbox.
 - [ADR 0020 — Auth v2: OAuth providers + MFA](decisions/0020-auth-v2-oauth-mfa.md) — Lifts ADR 0005's deferral: OSS basin-auth ships OAuth2/OIDC (provider presets plus generic config) and MFA (TOTP and WebAuthn/passkeys) with an AAL claim in the JWT. No new cloud-only primitives.
 - [ADR 0020 — WAL transaction markers + replay suppression](decisions/0020-wal-transaction-markers.md) — WAL adopts explicit Begin/Commit/Rollback markers for HTAP memtable integration. Replay discards entries inside rolled-back or crash-interrupted transactions. Pre-marker WAL files replay identically.
@@ -111,7 +111,7 @@ unified nav tree; GitHub renders it for humans browsing `docs/`.
 - [basin-cli v0.1 design spec](basin-cli-design.md) — Historical design spec for the basin CLI. Superseded by the shipped implementation in cli/ — kept for the rationale, not as a description of the code.
 - [basin-js v0.1 design spec](basin-js-design.md) — Forward-spec for basin-js — TypeScript client SDK. Supabase-shaped API; talks pgwire/REST/WebSocket directly to a Basin engine. MIT-licensed.
 - [WebSocket subscriptions — design spec](websocket-subscription-design.md) — Forward-spec for basin-rest /realtime/v1/subscribe. Tails the change-event primitive (ADR 0012); emits JSON over a multiplexed single-socket protocol. Realtime parity with Supabase.
-- [Phase 0 customer interview script — wedge validation](customer-interview-script.md) — 5-10 founder interviews to validate the Basin wedge (multi-project Postgres-compat HTAP) before committing 3-6 months to basin-cloud. Question bank, facilitation guide, scoring rubric, pivot triggers.
+- [Phase 0 customer interview script — wedge validation](customer-interview-script.md) — 5-10 founder interviews to validate the Basin wedge (multi-project Postgres-compat HTAP) before committing 3-6 months to a hosted product. Question bank, facilitation guide, scoring rubric, pivot triggers.
 - [SDK toolchain coverage and local validation status](sdk-toolchains.md) — Which SDK toolchains are installed locally versus validated only in CI, and what that means for how each SDK change is reviewed.
 - [Security audit — 2026-05-21](audits/2026-05-21-security-audit.md) — Read-only security audit of crates/ and services/basin-server at main: findings, severities and follow-ups.
 - [Wasm functions — performance, governance and adversarial audit (2026-05-21)](audits/2026-05-21-wasm-functions-perf-security.md) — Read-only audit of crates/basin-fn: sandbox escape surface, resource governance, scheduling fairness and performance findings.

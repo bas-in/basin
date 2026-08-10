@@ -2,7 +2,7 @@
 title: "Phase 0 customer interview script — wedge validation"
 nav_section: meta
 sidebar_position: 40
-summary: "5-10 founder interviews to validate the Basin wedge (multi-project Postgres-compat HTAP) before committing 3-6 months to basin-cloud. Question bank, facilitation guide, scoring rubric, pivot triggers."
+summary: "5-10 founder interviews to validate the Basin wedge (multi-project Postgres-compat HTAP) before committing 3-6 months to a hosted product. Question bank, facilitation guide, scoring rubric, pivot triggers."
 ---
 
 # Phase 0 customer interview script — wedge validation
@@ -13,7 +13,7 @@ The canonical failure mode for a platform-shift product is shipping into a marke
 
 Basin has strong technical evidence: Vortex storage is 2–30x faster than Parquet on typical SaaS analytical shapes; the multi-project isolation primitives (per-project shard owners, eviction, memory budgets) are architecturally sound; ADR 0016's HTAP hot tier closes the write-latency gap that used to make columnar engines awkward for transactional workloads. The substrate is real.
 
-What we do not have is strong customer evidence. We don't know which segment feels the pain most acutely, which specific workload justifies a DB migration, which switching costs are prohibitive, or what willingness-to-pay looks like when the ask is real money rather than a hobbyist side project. Five to ten 45-minute interviews with the right people will either confirm the wedge or surface the pivot before we spend three to six months building basin-cloud on a faulty premise. Running these interviews is the cheapest insurance available.
+What we do not have is strong customer evidence. We don't know which segment feels the pain most acutely, which specific workload justifies a DB migration, which switching costs are prohibitive, or what willingness-to-pay looks like when the ask is real money rather than a hobbyist side project. Five to ten 45-minute interviews with the right people will either confirm the wedge or surface the pivot before we spend three to six months building a hosted product on a faulty premise. Running these interviews is the cheapest insurance available.
 
 ---
 
@@ -183,8 +183,8 @@ Evaluate after every five interviews; don't wait until all ten are done.
 
 | Outcome | Action |
 |---|---|
-| 6 or more interviews scoring **15 or higher** | Wedge validated. Proceed with the current plan — basin-cloud, beta access, ICP targeting multi-project SaaS at 1k–100k projects. |
-| 3–5 interviews scoring **15 or higher** | Wedge plausible but ICP is too broad or sourcing missed the right cohort. Narrow the ICP (e.g., restrict to 5k–50k projects, or focus on a specific vertical like billing platforms) and run a second round of 5 interviews before committing to basin-cloud. |
+| 6 or more interviews scoring **15 or higher** | Wedge validated. Proceed with the current plan — hosted product, beta access, ICP targeting multi-project SaaS at 1k–100k projects. |
+| 3–5 interviews scoring **15 or higher** | Wedge plausible but ICP is too broad or sourcing missed the right cohort. Narrow the ICP (e.g., restrict to 5k–50k projects, or focus on a specific vertical like billing platforms) and run a second round of 5 interviews before committing to a hosted product. |
 | Fewer than 3 scoring **15 or higher** | Wedge invalid in current form. Pivot triggered. Review the pattern in low scores — is it missing pain, low switching willingness, or Postgres-compat irrelevance? That pattern determines the direction of the pivot. |
 
 A score of 15 is not arbitrary: it requires pain to be genuinely present (≥3), Postgres-compat to matter (≥3), cost to be a concern (≥4), and some expressed willingness to try (≥5) — or similar combinations that add up to a real buyer, not a polite nod.
