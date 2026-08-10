@@ -173,7 +173,12 @@ a{color:inherit;text-decoration:none}
 h1,h2,h3,h4{margin:0;font-family:var(--font-display);letter-spacing:var(--tracking-tighter);line-height:1.12}
 p{margin:0}
 ul,ol{margin:0;padding:0}
-code{font-family:var(--font-mono);font-size:.9em}
+/* .9em alone lands under the 12px legibility floor inside any small parent
+   (.card p is 13px, so its inline code computed to 11.7px); max() keeps the
+   relative scale everywhere it is already legal and clamps only where it is
+   not. overflow-wrap: html/body are overflow-x:clip, so an unbreakable inline
+   token does not scroll the page — it is silently CUT OFF at the viewport. */
+code{font-family:var(--font-mono);font-size:max(12px,.9em);overflow-wrap:anywhere}
 :focus-visible{outline:none;box-shadow:var(--focus-ring);border-radius:var(--radius-2)}
 
 /* ── Reading progress ─────────────────────────────────────────────── */
@@ -339,7 +344,7 @@ ul.bullets li:last-child{margin-bottom:0}
   font-family:var(--font-mono);font-size:.5625rem;letter-spacing:var(--tracking-mono-wider);
   text-transform:uppercase;color:rgb(250 247 240/.45);
 }
-.codeblock .cap{font-family:var(--font-mono);font-size:.625rem;color:rgb(250 247 240/.34);letter-spacing:.02em;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.codeblock .cap{font-family:var(--font-mono);font-size:max(12px,.75rem);color:rgb(250 247 240/.34);letter-spacing:.02em;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .codeblock .bar .spacer{flex:1}
 .copy{
   border:1px solid rgb(250 247 240/.14);background:transparent;color:rgb(250 247 240/.5);
@@ -412,7 +417,7 @@ td:first-child{color:var(--fg)}
 .card h4{font-size:.9375rem;margin-bottom:5px;letter-spacing:var(--tracking-tight)}
 .card p{font-size:.8125rem;color:var(--fg-3);line-height:1.6;margin:0}
 .card .path{
-  display:block;margin-top:9px;font-family:var(--font-mono);font-size:.625rem;
+  display:block;margin-top:9px;font-family:var(--font-mono);font-size:max(12px,.75rem);
   color:var(--accent);letter-spacing:var(--tracking-mono-wide);overflow-wrap:anywhere;
 }
 
