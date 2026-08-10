@@ -48,6 +48,18 @@ WORKDIR /build
 # Copy the full workspace. The dependency layer is warm for incremental CI
 # builds via Docker BuildKit cache (--cache-from type=gha in the workflow).
 COPY Cargo.toml Cargo.lock ./
+# .cargo/config.toml is NOT optional here. It carries
+# `rustflags = ["--cfg", "tokio_unstable"]`, and services/basin-server's
+# debug_listener.rs calls four tokio RuntimeMetrics methods that exist only
+# under that cfg (num_blocking_threads, num_idle_blocking_threads,
+# spawned_tasks_count, blocking_queue_depth). Omitting it from the build
+# context is why this image had never once built:
+#   error[E0599]: no method named `num_blocking_threads` found for struct
+#                 `RuntimeMetrics` in the current scope
+# Reproduce the old failure from a checkout with
+# `RUSTFLAGS="" cargo check -p basin-server`, which overrides the config's
+# rustflags the same way an absent config file does.
+COPY .cargo/ .cargo/
 COPY crates/ crates/
 COPY services/ services/
 COPY tests/ tests/
