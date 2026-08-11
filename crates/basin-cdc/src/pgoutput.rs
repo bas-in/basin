@@ -36,7 +36,7 @@
 //! `ChangeEvent` does not carry an LSN at that seam — see `record.rs`).
 //!
 //! So we define a **synthetic LSN** that is a pure, monotonic function of
-//! `seq`: [`seq_to_lsn`]. We map `seq` into the high bits of the 64-bit LSN so
+//! `seq`: [`seq_to_lsn`](crate::pgoutput::seq_to_lsn). We map `seq` into the high bits of the 64-bit LSN so
 //! a per-row LSN never collides and is trivially monotone in `seq`:
 //!
 //! ```text
@@ -55,7 +55,7 @@
 //! "Basin LSNs are synthetic, monotone in commit order, and not comparable to a
 //! real Postgres cluster's LSNs."
 //!
-//! Reverse: [`lsn_to_seq`] recovers the `seq` (the high bits) from an LSN a
+//! Reverse: [`lsn_to_seq`](crate::pgoutput::lsn_to_seq) recovers the `seq` (the high bits) from an LSN a
 //! consumer acked in its Standby Status Update, so the ring cursor advances to
 //! `replay_after(lsn_to_seq(acked_lsn))`.
 //!
@@ -65,7 +65,7 @@
 //! or NULL (`'n'`) (we do not emit binary-format `'b'` columns — text is always
 //! valid and is what `wal2json`-style consumers tolerate). The column **type
 //! OID** in the Relation message is derived best-effort from the JSON value's
-//! runtime kind ([`pg_type_oid`]); a consumer needing exact source typmod must
+//! runtime kind ([`pg_type_oid`](crate::pgoutput::pg_type_oid)); a consumer needing exact source typmod must
 //! reconcile against its own schema, the same documented limitation the ADR
 //! notes for the JSON `before`/`after` projection.
 

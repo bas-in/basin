@@ -22,9 +22,9 @@
 //! a single `{"change": [...]}` object (one object per `XLogData` callback);
 //! it does NOT emit standalone `{"action":"B"}` / `{"action":"C"}` markers —
 //! those belong to format-version 2 (`include-transaction`/streaming mode),
-//! which we model separately via [`Wal2JsonTxn::begin`] / [`Wal2JsonTxn::commit`]
-//! for the v2 streaming shape. The default ([`encode_change`] +
-//! [`encode_transaction`]) is v1: a commit's rows are one `change` array.
+//! which we model separately via [`Wal2JsonTxn::begin`](crate::wal2json::Wal2JsonTxn::begin) / [`Wal2JsonTxn::commit`](crate::wal2json::Wal2JsonTxn::commit)
+//! for the v2 streaming shape. The default ([`encode_change`](crate::wal2json::encode_change) +
+//! [`encode_transaction`](crate::wal2json::encode_transaction)) is v1: a commit's rows are one `change` array.
 //!
 //! # Type fidelity (honest)
 //!
@@ -34,7 +34,7 @@
 //! (`columntypes: ["integer", "text", ...]`). Basin's `ChangeEvent` does not
 //! carry per-column SQL type metadata at the post-commit hook, so we derive a
 //! best-effort wal2json type token from the JSON value's runtime kind
-//! ([`json_type_token`]) — `"numeric"` for numbers, `"boolean"` for bools,
+//! ([`json_type_token`](crate::wal2json::json_type_token)) — `"numeric"` for numbers, `"boolean"` for bools,
 //! `"text"` for strings, `"json"` for nested objects/arrays, `"text"` for null.
 //! This is a documented deviation: a consumer that relies on exact Postgres
 //! OID/typmod fidelity must use the Phase 5 `pgoutput` path, which carries the

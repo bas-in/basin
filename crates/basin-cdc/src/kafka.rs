@@ -307,7 +307,8 @@ pub fn spawn_kafka_supervisor(
     spawn_kafka_supervisor_with_producer(writer, catalog, cfg, producer)
 }
 
-/// As [`spawn_kafka_supervisor`] but with an injected producer (tests, and the
+/// As `spawn_kafka_supervisor` (which only exists with the `cdc-kafka`
+/// feature) but with an injected producer (tests, and the
 /// always-available entry point regardless of the `cdc-kafka` feature). On each
 /// tick it lists projects with a CDC ring and ensures one per-project
 /// dispatcher is running.
