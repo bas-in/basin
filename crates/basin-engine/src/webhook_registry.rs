@@ -75,7 +75,7 @@ pub struct WebhookSubscription {
     /// [`WebhookRegistry::DEFAULT_MAX_RETRIES`] (16).
     pub max_retries: u32,
     /// Manual pause flag. Auto-pause flips this on after sustained
-    /// failures (see [`WebhookConfig::auto_pause_after`]).
+    /// failures (see `basin-webhooks`'s `WebhookConfig::auto_pause_after`).
     pub paused: bool,
 }
 
@@ -137,7 +137,7 @@ impl WebhookRegistry {
 
     /// Register a subscription, accepting a non-`None` `when_predicate`.
     /// The SQL surface (`ALTER TABLE ... SUBSCRIBE WEBHOOK ... WHERE (...)`)
-    /// uses this entry point; the [`crate::WebhookSink`] evaluates the
+    /// uses this entry point; `basin-webhooks`'s `WebhookSink` evaluates the
     /// predicate against each [`basin_common::ChangeEvent`]'s `before` /
     /// `after` JSON payloads at delivery time. Predicate text is
     /// validated by the caller (sqlparser at registration time);

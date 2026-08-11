@@ -41,9 +41,9 @@
 //!
 //! # Multiplex implementation
 //!
-//! Each connection owns a [`ConnState`] that holds a
-//! `HashMap<TableName, broadcast::Receiver<Arc<ChangeEvent>>>`. A
-//! `tokio::select!` loop races:
+//! Each connection keeps its live subscriptions in a connection-local
+//! `HashMap<TableName, tokio::task::JoinHandle<()>>` — one forwarder task per
+//! subscribed table. A `tokio::select!` loop races:
 //!
 //! 1. Incoming WS frames (control messages from the client).
 //! 2. Events arriving on any active subscription channel.

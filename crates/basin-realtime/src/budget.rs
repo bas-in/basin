@@ -5,7 +5,7 @@
 //! Per the `feedback_multitenant_isolation` rule: **per-project cost is
 //! O(bytes-in-flight), not O(active_subscribers)**. The implementation uses:
 //!
-//! - A single shared `tokio::sync::broadcast` cluster (the [`ChannelRegistry`]
+//! - A single shared `tokio::sync::broadcast` cluster (the [`ChannelRegistry`](crate::ChannelRegistry)
 //!   in `lib.rs`) for all projects — no per-project channel.
 //! - A [`DashMap<ProjectId, ProjectBudget>`] lazily allocating one
 //!   [`ProjectBudget`] per project *that has actually published an event*.

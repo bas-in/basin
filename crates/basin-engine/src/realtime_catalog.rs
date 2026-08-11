@@ -16,7 +16,7 @@
 //!
 //! | Table | Source | Access |
 //! |-------|--------|--------|
-//! | `channels` | [`NotifyRegistry`] (LISTEN/NOTIFY) + optional [`RealtimeChannelSource`] (broadcast) | Direct (engine holds NotifyRegistry) + trait object |
+//! | `channels` | `NotifyRegistry` (LISTEN/NOTIFY) + optional [`RealtimeChannelSource`] (broadcast) | Direct (engine holds NotifyRegistry) + trait object |
 //! | `stats` | [`RealtimeChannelSource`] (budget) | Optional trait object |
 //!
 //! ## `RealtimeChannelSource` trait
@@ -24,7 +24,7 @@
 //! `basin-engine` cannot depend on `basin-realtime` (that would create a
 //! dependency cycle through `basin-webhooks`). The trait is the seam: callers
 //! that wire up the realtime sink (e.g. `basin-rest`, `basin-server`) also call
-//! [`Engine::attach_realtime_source`] with an implementation that wraps
+//! [`Engine::attach_realtime_source`](crate::Engine::attach_realtime_source) with an implementation that wraps
 //! `ChannelRegistry` + `BudgetTracker`. When not attached both providers still
 //! return valid (empty) rows — `channels` shows only LISTEN/NOTIFY channels and
 //! `stats` shows zeroes.
@@ -186,7 +186,7 @@ fn stats_schema() -> Schema {
 ///
 /// On every `scan()` it unions:
 /// 1. Broadcast (table-change) channels from the optional [`RealtimeChannelSource`].
-/// 2. SQL LISTEN/NOTIFY channels from the engine's [`NotifyRegistry`].
+/// 2. SQL LISTEN/NOTIFY channels from the engine's `NotifyRegistry`.
 ///
 /// Both sets are scoped to the session's `project`.
 pub struct RealtimeChannelsProvider {

@@ -479,7 +479,7 @@ impl PresenceRegistry {
         evicted
     }
 
-    /// Spawn a background Tokio task that calls [`evict_stale`] at
+    /// Spawn a background Tokio task that calls [`evict_stale`](Self::evict_stale) at
     /// `config.eviction_interval`. Drop the returned handle to stop the task.
     pub fn start_eviction_task(&self) -> tokio::task::JoinHandle<()> {
         let registry = self.clone();

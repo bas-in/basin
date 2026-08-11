@@ -68,7 +68,7 @@
 //! ## Isolation
 //!
 //! All per-project state — allowlist, rate-limit bucket, response table — is
-//! keyed on [`ProjectId`]. Project A's allowlist edit cannot affect B's
+//! keyed on [`ProjectId`](basin_common::ProjectId). Project A's allowlist edit cannot affect B's
 //! requests; A's response rows are only visible inside A's session (the same
 //! catalog-level namespace boundary the rest of the engine relies on).
 

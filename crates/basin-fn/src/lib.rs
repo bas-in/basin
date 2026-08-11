@@ -17,7 +17,7 @@
 //! * WIT definitions live in `crates/basin-fn/wit/basin-fn.wit`.
 //! * `wasmtime::component::bindgen!` generates host-side Rust traits from the WIT.
 //! * [`FunctionHost`] implements those traits and is threaded into the
-//!   component [`Linker`].
+//!   component [`Linker`](wasmtime::component::Linker).
 //! * [`ComponentHarness`] instantiates a component, wires the four imports,
 //!   and calls the exported `run` entrypoint.
 //!

@@ -24,14 +24,14 @@
 //!
 //! # Peer list + self-identity
 //!
-//! [`PartitionRouter`] is built from `BASIN_SHARD_PEERS` (comma-separated REST
+//! [`PartitionRouter`](crate::partition_router::PartitionRouter) is built from `BASIN_SHARD_PEERS` (comma-separated REST
 //! base URLs, e.g. `http://m1.vm.app.internal:5434,http://m2...:5434`,
 //! INCLUDING this node) plus this node's id (`BASIN_REPLICA_ID`, which on the
 //! dev deploy is set to this node's own peer URL). The desired owner of a
 //! partition is `peers[ fnv1a(project, partition_id) % peers.len() ]`.
 //!
 //! **Back-compat is load-bearing:** unset / single-entry `BASIN_SHARD_PEERS`
-//! makes [`PartitionRouter::desired_owner`] always return self, so
+//! makes [`PartitionRouter::desired_owner`](crate::partition_router::PartitionRouter::desired_owner) always return self, so
 //! `write_batch_fanout` takes the existing local path byte-for-byte. The router
 //! is only consulted when a multi-peer list is configured.
 

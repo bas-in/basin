@@ -259,7 +259,7 @@ impl Resolve for RebindingGuardedResolver {
     }
 }
 
-/// Static knobs read from the environment. Cloned into [`HttpClient`] at
+/// Static knobs read from the environment. Cloned into [`HttpClient`](crate::HttpClient) at
 /// construction time so a mid-process env mutation can't change behaviour
 /// from underneath an in-flight request.
 #[derive(Clone, Debug)]
