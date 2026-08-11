@@ -86,6 +86,15 @@ jobs:
       - name: MSRV floor is honest
         run: ./scripts/check-msrv-floor.sh
 
+      # rustdoc warnings are reader-facing bugs, not style: an unresolved
+      # `[`Foo`]` renders as plain text, so the reader gets no navigation AND no
+      # signal that the target is wrong. The workspace carried 77 of those, plus
+      # 73 links into private items (which rustdoc refuses to emit, same blank
+      # result), until 2026-08-11. `-D warnings` is what keeps the count at zero;
+      # plant a bad link locally and this step exits 101.
+      - name: rustdoc links resolve
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+
   # ── 2. Do the tests pass ───────────────────────────────────────────────────
   test:
     name: test
