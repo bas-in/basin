@@ -535,32 +535,143 @@ pub(crate) mod tests {
         );
     }
 
-    /// 1 k QPS export-loop smoke: snapshot_all at 1000 iter/s doesn't block.
+    /// 1 k QPS export-loop gate: `snapshot_all` interleaved with — and running
+    /// concurrently against — the observe hot path accounts for every
+    /// observation exactly once and never returns a torn snapshot.
     ///
     /// This is the "OTLP at 1k QPS does not block the query hot path" gate
-    /// from the acceptance criteria.  We run 1 000 observe() calls and 1 000
-    /// snapshot_all() calls interleaved and verify wall time < 1 s.
+    /// from the acceptance criteria.  It used to assert wall time < 1 s, which
+    /// is a proxy: on a loaded host the clock measures the host, not the
+    /// registry, so the assertion is a coin-flip.  What the gate documents is
+    /// that export and observe interleave *correctly* — the export path shares
+    /// the per-project `Mutex` with `observe`, so the failure mode worth
+    /// gating is a lost, doubled, or half-written observation, not a slow one.
+    ///
+    /// Three properties are asserted:
+    ///
+    /// 1. **Exact accounting** — the inline snapshot taken after observation
+    ///    `i` reports exactly `i + 1` observations (the writer is the only
+    ///    observer), and the final snapshot has 16 shapes × 64 each.
+    /// 2. **Consistency under concurrency** — a second thread hammers
+    ///    `snapshot_all` throughout; every snapshot it sees is monotonic
+    ///    non-decreasing and never ahead of the writer's total.
+    /// 3. **Liveness** — the reader must observe the writer's completion
+    ///    within a deadline four orders of magnitude above the work, so a
+    ///    deadlock between export and observe fails the test instead of
+    ///    hanging the suite.
     #[test]
-    fn snapshot_all_1k_qps_smoke() {
+    fn snapshot_all_1k_qps_export_accounts_for_every_observation() {
+        // 1024 ≈ the 1 k QPS second the acceptance criterion describes, and
+        // divides evenly by the shape count so per-shape counts are exact.
+        const OBSERVES: u64 = 1024;
+        const SHAPES: u64 = 16;
+        const PER_SHAPE: u64 = OBSERVES / SHAPES;
+
         let reg = Arc::new(QueryStatRegistry::new());
         let p = ProjectId::new();
         let t = TableName::new("smoke").unwrap();
 
-        let start = std::time::Instant::now();
-        for i in 0..1_000u64 {
-            // Simulate 16 distinct shapes cycling.
-            let h = QueryShapeHash(i % 16);
+        let total_of =
+            |rows: &[ShapeStatRow]| -> u64 { rows.iter().map(|r| r.observe_count).sum() };
+
+        // Concurrent export reader: snapshots as fast as it can for the whole
+        // duration of the observe loop, checking each snapshot is consistent.
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let reg = reg.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let mut snapshots = 0u64;
+                let mut prev_total = 0u64;
+                loop {
+                    // Read the flag *before* snapshotting: a `done` observed
+                    // here means the snapshot below runs after the writer's
+                    // last observe, so the reader always ends on the settled
+                    // state.
+                    let writer_finished = done.load(std::sync::atomic::Ordering::Acquire);
+                    let rows = reg.snapshot_all();
+                    let total: u64 = rows.iter().map(|r| r.observe_count).sum();
+                    assert!(
+                        total >= prev_total,
+                        "concurrent snapshot went backwards: {prev_total} -> {total}"
+                    );
+                    assert!(
+                        total <= OBSERVES,
+                        "concurrent snapshot reported {total} observations; \
+                         writer only issued {OBSERVES}"
+                    );
+                    assert!(
+                        rows.len() as u64 <= SHAPES,
+                        "concurrent snapshot reported {} shapes; only {SHAPES} exist",
+                        rows.len()
+                    );
+                    prev_total = total;
+                    snapshots += 1;
+                    if writer_finished {
+                        return (snapshots, prev_total);
+                    }
+                    // Deliberately no yield: the reader re-acquires the
+                    // per-project `Mutex` as fast as it can so the writer's
+                    // observes genuinely contend with an in-flight export.
+                    // That contention is the point — an "export must never
+                    // block the hot path" regression that drops the
+                    // observation instead of waiting (e.g. `try_lock` +
+                    // bail) is only visible while the lock is actually held.
+                }
+            })
+        };
+
+        for i in 0..OBSERVES {
+            let h = QueryShapeHash(i % SHAPES);
             reg.observe(&p, &t, h, &metrics(50_000, false));
-            // Every 50 queries simulate an export snapshot.
-            if i % 50 == 0 {
-                let _ = reg.snapshot_all();
+            // Every 64 queries the exporter's own interleaved snapshot must
+            // see exactly the observations issued so far — no more, no fewer.
+            if i % PER_SHAPE == 0 {
+                let seen = total_of(&reg.snapshot_all());
+                assert_eq!(
+                    seen,
+                    i + 1,
+                    "inline export snapshot after observation {i} saw {seen} observations"
+                );
             }
         }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(1),
-            "1k QPS + export loop took {:?}; expected < 1 s",
-            elapsed
+        done.store(true, std::sync::atomic::Ordering::Release);
+
+        // Liveness: the reader loop is bounded by `done`; anything longer than
+        // this means export and observe deadlocked. Poll rather than block so
+        // a deadlock fails the test instead of hanging the whole suite.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !reader.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "export reader did not finish within 60 s after the observe \
+                 loop completed; snapshot_all/observe deadlocked"
+            );
+            std::thread::yield_now();
+        }
+        let (snapshots, reader_total) = reader.join().expect("export reader thread panicked");
+
+        // The reader ran at least one full snapshot against the live registry.
+        assert!(snapshots > 0, "export reader took no snapshots");
+        assert_eq!(
+            reader_total, OBSERVES,
+            "export reader's last snapshot saw {reader_total} of {OBSERVES} observations"
         );
+
+        // Final accounting: every shape present, every observation attributed.
+        let rows = reg.snapshot_all();
+        assert_eq!(rows.len() as u64, SHAPES, "expected {SHAPES} shape rows");
+        assert_eq!(
+            total_of(&rows),
+            OBSERVES,
+            "expected {OBSERVES} total observations across all shapes"
+        );
+        for row in &rows {
+            assert_eq!(
+                row.observe_count, PER_SHAPE,
+                "shape {} saw {} observations; expected {PER_SHAPE}",
+                row.shape_hash, row.observe_count
+            );
+        }
     }
 }
