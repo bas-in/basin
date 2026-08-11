@@ -4527,50 +4527,111 @@ mod tests {
     /// `COMPUTE_OVERAGE_USD_PER_CPU_SECOND` meter) must aggregate every
     /// session-side `execute` and stay isolated per project.
     /// `docs/audits/2026-05-21-billing-meter-gap.md` hole #6/#7 closure.
+    ///
+    /// The property is **per-project attribution**: a project's meter moves
+    /// when and only when that project does work. This used to be checked by
+    /// running 5 queries on A, 1 on B, and asserting `A > B` — a proxy, and a
+    /// poor one: on a loaded host a single query on B can out-cost five on A,
+    /// so the assertion was a coin-flip rather than a statement about
+    /// attribution. The checks below compare each project's meter against
+    /// *its own* earlier value across a known amount of work, so no
+    /// cross-project timing comparison is involved:
+    ///
+    /// * a project that has executed nothing is not metered at all;
+    /// * a project's meter advances across its own queries;
+    /// * a project's meter is byte-for-byte unchanged across another
+    ///   project's queries, in both directions;
+    /// * ops are attributed exactly, one per `execute`.
     #[tokio::test]
     async fn cpu_micros_total_aggregates_per_project() {
         let dir = TempDir::new().unwrap();
         let eng = engine_in(&dir);
         let a = ProjectId::new();
         let b = ProjectId::new();
+        // Never opened, never queried — must never be billed.
+        let idle = ProjectId::new();
 
         let sa = eng.open_session(a).await.unwrap();
-        // Force several non-zero-elapsed queries on project A.
-        let n_queries = 5;
+        let sb = eng.open_session(b).await.unwrap();
+
+        // Opening a session is not itself billable work.
+        assert_eq!(
+            eng.project_counters(&a).cpu_micros_total,
+            0,
+            "open_session billed CPU to A before it ran a query"
+        );
+
+        // ── A runs one query ────────────────────────────────────────────
+        sa.execute("SELECT 1").await.unwrap();
+        let a1 = eng.project_counters(&a);
+        assert_eq!(a1.ops_total, 1, "expected exactly 1 op on A");
+        // A real plan+execute is tens of microseconds; the meter records
+        // whole microseconds, so any attributed query moves it off zero.
+        assert!(
+            a1.cpu_micros_total > 0,
+            "A's meter did not move across its own query"
+        );
+
+        // B has done nothing yet, so A's query must not have been billed to
+        // it — and an unqueried project must not be metered at all.
+        let b0 = eng.project_counters(&b);
+        assert_eq!(
+            b0.cpu_micros_total, 0,
+            "A's query leaked {} micros into B, which has run nothing",
+            b0.cpu_micros_total
+        );
+        assert_eq!(b0.ops_total, 0, "A's query leaked an op into B");
+
+        // ── B runs one query: A must not move ───────────────────────────
+        sb.execute("SELECT 1").await.unwrap();
+        let a2 = eng.project_counters(&a);
+        let b1 = eng.project_counters(&b);
+        assert_eq!(
+            a2.cpu_micros_total,
+            a1.cpu_micros_total,
+            "B's query leaked {} micros into A",
+            a2.cpu_micros_total - a1.cpu_micros_total
+        );
+        assert_eq!(a2.ops_total, a1.ops_total, "B's query leaked an op into A");
+        assert!(
+            b1.cpu_micros_total > 0,
+            "B's meter did not move across its own query"
+        );
+        assert_eq!(b1.ops_total, 1, "expected exactly 1 op on B");
+
+        // ── A runs N more: A grows by its own work, B stays put ─────────
+        let n_queries = 4u64;
         for _ in 0..n_queries {
             sa.execute("SELECT 1").await.unwrap();
         }
+        let a3 = eng.project_counters(&a);
+        let b2 = eng.project_counters(&b);
+        assert!(
+            a3.cpu_micros_total > a2.cpu_micros_total,
+            "A's meter stuck at {} micros across {n_queries} more of its own queries",
+            a2.cpu_micros_total
+        );
+        assert_eq!(
+            a3.ops_total,
+            a2.ops_total + n_queries,
+            "expected exactly one op per execute on A"
+        );
+        assert_eq!(
+            b2.cpu_micros_total,
+            b1.cpu_micros_total,
+            "A's {n_queries} queries leaked {} micros into B",
+            b2.cpu_micros_total - b1.cpu_micros_total
+        );
+        assert_eq!(b2.ops_total, b1.ops_total, "A's queries leaked ops into B");
 
-        let sb = eng.open_session(b).await.unwrap();
-        sb.execute("SELECT 1").await.unwrap();
-
-        let snap_a = eng.project_counters(&a);
-        let snap_b = eng.project_counters(&b);
-
-        // A executed N+1 ops (open_session may not count, but execute does).
-        assert!(
-            snap_a.ops_total >= n_queries,
-            "expected at least {n_queries} ops on A, saw {}",
-            snap_a.ops_total
+        // ── A project that never ran anything is never billed ───────────
+        let idle_snap = eng.project_counters(&idle);
+        assert_eq!(
+            idle_snap.cpu_micros_total, 0,
+            "an idle project was billed {} micros",
+            idle_snap.cpu_micros_total
         );
-        // Each query takes nonzero microseconds; aggregate must be > 0.
-        assert!(
-            snap_a.cpu_micros_total > 0,
-            "expected nonzero cpu_micros for A, saw 0"
-        );
-        // Cross-project isolation: B's CPU does not leak into A.
-        // B ran 1 query — its counter is positive but strictly less than A's
-        // (which ran N=5). Use a generous floor to stay stable on fast hosts.
-        assert!(
-            snap_b.cpu_micros_total > 0,
-            "expected nonzero cpu_micros for B, saw 0"
-        );
-        assert!(
-            snap_a.cpu_micros_total > snap_b.cpu_micros_total,
-            "A({} micros) should exceed B({} micros) after {n_queries}x more work",
-            snap_a.cpu_micros_total,
-            snap_b.cpu_micros_total,
-        );
+        assert_eq!(idle_snap.ops_total, 0, "an idle project was billed ops");
     }
 
     // ─── Phase 5.22.B/C — dump round-trip tests ───────────────────────────
