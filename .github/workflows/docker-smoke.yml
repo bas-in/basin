@@ -25,6 +25,11 @@ on:
   push:
     branches: [main, master]
   workflow_dispatch:
+  # Weekly, so the arm64 leg that is too slow to emulate on every push still
+  # gets exercised. Without this the matrix expression below would quietly mean
+  # "arm64 is never built", which is not what dropping it from push is for.
+  schedule:
+    - cron: "0 4 * * 1"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -43,9 +48,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - linux/amd64
-          - linux/arm64
+        # amd64 on every push; arm64 only when asked for or on the weekly run.
+        #
+        # arm64 has no native runner here, so buildx builds it under QEMU
+        # emulation — and a full release build of this workspace does not fit in
+        # an hour that way. Measured 2026-08-11: the arm64 leg was CANCELLED at
+        # the 60-minute cap while amd64 finished its build in 43. Emulated arm64
+        # was costing an hour of runner time per push to produce no verdict at
+        # all, which is worse than not running it: a job that always ends
+        # "cancelled" trains everyone to skip the whole workflow.
+        #
+        # It still runs — see the schedule and workflow_dispatch above — so an
+        # arm64-only break is caught within the week rather than never. Give this
+        # a native arm64 runner and it belongs back on every push.
+        platform: ${{ github.event_name == 'push' && fromJSON('["linux/amd64"]') || fromJSON('["linux/amd64","linux/arm64"]') }}
 
     steps:
       - name: Checkout
