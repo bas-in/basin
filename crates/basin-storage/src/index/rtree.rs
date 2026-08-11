@@ -1,6 +1,6 @@
 //! Phase PG-Wave-α — R-tree spatial index segment format.
 //!
-//! Mirrors [`gin_rowgroup`] in structure but stores per-row-group spatial
+//! Mirrors [`gin_rowgroup`](super::gin_rowgroup) in structure but stores per-row-group spatial
 //! envelopes instead of GIN bloom filters. The sidecar layout follows the
 //! HNSW vector index: one `.rtree` file per `(table, column, data file)`
 //! at `projects/{p}/tables/{t}/index/{col}.rtree/{ulid}.rtree`. The
@@ -21,7 +21,7 @@
 //! pushdown — `RTreePrunedTable` + `apply_rtree_pruning_for_query` —
 //! lands in PG-Wave-β (#139). Until then the compactor populates the
 //! sidecar but no read path consumes it. Same shape as how
-//! [`gin_rowgroup`] shipped on the storage side ahead of the engine
+//! [`gin_rowgroup`](super::gin_rowgroup) shipped on the storage side ahead of the engine
 //! probe wiring.
 
 use std::sync::Arc;

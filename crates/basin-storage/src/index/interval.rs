@@ -22,8 +22,8 @@
 //! The index is a *conservative superset*: it may return false positives (files
 //! that look like candidates but whose rows don't actually match), but it never
 //! returns false negatives. Every candidate file returned by
-//! [`IntervalIndex::probe_contains_point`] or
-//! [`IntervalIndex::probe_overlaps`] must be re-evaluated by the full
+//! [`IntervalRegistry::probe_contains_point`] or
+//! [`IntervalRegistry::probe_overlaps`] must be re-evaluated by the full
 //! DataFusion predicate at the storage read layer.
 //!
 //! # Engine-probe wiring (Phase 5.24.D)
@@ -410,7 +410,7 @@ impl IntervalRegistry {
 
     /// Record that `file_path` has been fully indexed for `(project, table,
     /// col)`. Called immediately after all rows in a new file have been passed
-    /// to [`index_row`]. This is the write side of the completeness guard: a
+    /// to [`index_row`](Self::index_row). This is the write side of the completeness guard: a
     /// file that appears here is safe to use as a prune boundary.
     pub fn mark_file_indexed(
         &self,

@@ -1500,7 +1500,7 @@ impl Storage {
 
     /// Internal accessor: returns the wrapped project-scoped store as a
     /// concrete `Arc<dyn ObjectStore>`, identical to
-    /// [`project_object_store`] but at `pub(crate)` visibility for the
+    /// [`project_object_store`](Self::project_object_store) but at `pub(crate)` visibility for the
     /// reader / writer / vector-index modules.
     pub(crate) fn project_store(&self, project: &ProjectId) -> Arc<dyn ObjectStore> {
         self.project_object_store(project)
@@ -1542,12 +1542,12 @@ impl Storage {
     ///
     /// No-op equivalence: when no pool is attached, the flag is OFF, the
     /// project's stripe width is 1, or the stripe isn't warmed, this returns
-    /// exactly [`project_object_store`] — byte-identical single-bucket routing.
+    /// exactly [`project_object_store`](Self::project_object_store) — byte-identical single-bucket routing.
     /// A non-default route only happens when striping is ON *and* the project
     /// has a multi-bucket stripe warmed in the pool's cache.
     ///
     /// BYO overrides still win (a BYO project is never pool-striped) — checked
-    /// first, exactly as in [`project_object_store`].
+    /// first, exactly as in [`project_object_store`](Self::project_object_store).
     pub fn partition_object_store(
         &self,
         project: &ProjectId,
@@ -1585,7 +1585,7 @@ impl Storage {
 
     /// #36 (Stage 2a) — the full stripe of project-scoped stores a table's
     /// union read must LIST across. Each stripe bucket's store is wrapped in a
-    /// [`concurrency::ProjectScopedStore`] exactly like [`project_object_store`]
+    /// [`concurrency::ProjectScopedStore`] exactly like [`project_object_store`](Self::project_object_store)
     /// so per-project fairness/billing is unchanged regardless of stripe width.
     ///
     /// No-op equivalence: a BYO project, or no pool / flag-OFF / width-1 /
@@ -1665,11 +1665,11 @@ impl Storage {
     }
 
     /// #36 (Stage 2a) — the object store the DataFusion scan should register
-    /// under `basin://engine/` for `project`. When [`should_stripe_scan`]
+    /// under `basin://engine/` for `project`. When [`should_stripe_scan`](Self::should_stripe_scan)
     /// holds, this is a [`stripe_router_store::StripeRouterStore`] that
     /// re-derives each file's partition→bucket at I/O time (Scheme C) and
     /// unions LISTs across the stripe; otherwise it is exactly
-    /// [`project_object_store`] (today's behaviour, byte-identical).
+    /// [`project_object_store`](Self::project_object_store) (today's behaviour, byte-identical).
     pub fn scan_object_store(&self, project: &ProjectId) -> Arc<dyn ObjectStore> {
         if self.should_stripe_scan(project) {
             Arc::new(stripe_router_store::StripeRouterStore::new(
@@ -1743,7 +1743,7 @@ impl Storage {
     /// knobs (bloom-filter columns, row-group size). Used by callers that
     /// have read [`basin_catalog::TableMetadata::bloom_filter_columns`] and
     /// want the writer to materialise bloom filters in the Parquet footer.
-    /// All defaults preserve the legacy [`write_batch`] behaviour exactly.
+    /// All defaults preserve the legacy [`write_batch`](Self::write_batch) behaviour exactly.
     #[tracing::instrument(skip(self, batch, opts), fields(project=%project, table=%table, partition=%partition, rows=batch.num_rows(), bloom_cols=opts.bloom_filter_columns.len()))]
     pub async fn write_batch_with_options(
         &self,
@@ -2073,11 +2073,11 @@ impl Storage {
         reader::read_paths(self, project, paths, opts).await
     }
 
-    /// Like [`read_paths`] but accepts a `catalog_schema` for callers that
+    /// Like [`read_paths`](Self::read_paths) but accepts a `catalog_schema` for callers that
     /// already hold the table schema. The Vortex filter-pushdown skip
     /// optimisation (avoiding the Arrow post-filter pass when all predicates
     /// were type-safe-pushed into the Vortex scan) requires the schema to
-    /// verify column types. Passing `None` is identical to [`read_paths`].
+    /// verify column types. Passing `None` is identical to [`read_paths`](Self::read_paths).
     #[tracing::instrument(skip(self, paths, opts, catalog_schema), fields(project=%project, n_paths=paths.len()))]
     pub async fn read_paths_with_schema(
         &self,
@@ -2094,7 +2094,7 @@ impl Storage {
     /// table-wide [`read`](Self::read) would force us to merge all files
     /// regardless of pruning.
     ///
-    /// `path` must be a path returned by a prior [`list_data_files`]
+    /// `path` must be a path returned by a prior [`list_data_files`](Self::list_data_files)
     /// against the same project; passing a foreign path is the caller's
     /// bug (we only enforce project isolation at the listing/path-key
     /// boundary, not on a raw `read_file`). The `project` argument is
@@ -2109,7 +2109,7 @@ impl Storage {
         reader::read_file(self, project, path).await
     }
 
-    /// Like [`read_file`] but threads a [`ReadOptions`] through so callers
+    /// Like [`read_file`](Self::read_file) but threads a [`ReadOptions`] through so callers
     /// can push down a column projection (and any other read option). The
     /// constraint enforcers (PK / UNIQUE / FK / EXCLUSION) use this with a
     /// `projection` set to only the constraint column(s), which skips JSONB

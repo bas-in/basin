@@ -326,7 +326,7 @@ impl TrigramRowGroupRegistry {
     ///
     /// * [`RowGroupProbe::Unknown`] — the file is not summarised (or not yet
     ///   sealed). Caller falls back to file-granular pruning / full scan.
-    /// * [`RowGroupProbe::RowGroups(rgs)`] — `rgs` is the ascending list of
+    /// * [`RowGroupProbe::RowGroups(rgs)`](RowGroupProbe::RowGroups) — `rgs` is the ascending list of
     ///   surviving row-groups. An empty `rgs` means the whole file is
     ///   prunable.
     ///

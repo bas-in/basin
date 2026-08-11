@@ -29,7 +29,7 @@
 //! Assignment picks the least-loaded pooled bucket where "load" is the count
 //! of projects assigned to each bucket (cheap, derived from the persisted
 //! assignments). The richer sustained-PUT-rate / bytes-per-second signal noted
-//! in the design doc would plug in at [`BucketPool::choose_bucket`] — see the
+//! in the design doc would plug in at `BucketPool::choose_one_bucket` — see the
 //! comment there.
 
 use std::collections::HashMap;
@@ -935,7 +935,7 @@ pub enum CrashPoint {
 
 /// A simulated crash, surfaced as a distinct error so callers/tests can tell a
 /// crash-injection from a real failure. The migration intent is intact in the
-/// catalog; the next [`run_migration`] resumes it.
+/// catalog; the next [`run_migration`](BucketPool::run_migration) resumes it.
 #[derive(Debug)]
 pub struct SimulatedCrash(pub MigrationPhase);
 
