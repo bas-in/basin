@@ -9,7 +9,8 @@
 <h1 align="center">Basin</h1>
 
 <p align="center">
-  <strong>Bucket-native, multi-tenant Postgres alternative.</strong>
+  <strong>Serverless Postgres on your own bucket.</strong><br>
+  <sub>Bucket-native, multi-tenant, self-hosted — the architecture, not a hosted plan.</sub>
 </p>
 
 <p align="center">
@@ -29,10 +30,15 @@
   <a href="./LICENSE"><img alt="license: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-lightgrey?style=flat-square"></a>
 </p>
 
-RAM-per-connection is ~30× cheaper than Postgres. Projects are S3 prefixes,
-not databases — operator cost is O(bytes active), not O(projects
-provisioned). One binary, pgwire on the front, Vortex-compressed columnar
-files on any S3-compatible bucket on the back.
+**Serverless** describes the shape, not a subscription. Compute and storage
+are separated, the routers are stateless, and a project is an S3 prefix rather
+than a provisioned instance — so operator cost is O(bytes active), not
+O(projects provisioned). You run the binary yourself; there is no managed tier
+to buy and nothing here runs it for you.
+
+RAM-per-connection is ~30× cheaper than Postgres. One binary, pgwire on the
+front, Vortex-compressed columnar files on any S3-compatible bucket on the
+back.
 
 > **Pre-alpha — public eval.** Basin is being built in the open. Use it
 > today to evaluate cost economics, prototype multi-tenant patterns, or
