@@ -73,15 +73,28 @@ jobs:
           cache-to: type=gha,mode=max
 
       # ── Size assertion (amd64 only — arm64 can't be loaded on ubuntu-latest) ──
-      - name: Assert image ≤ 100 MB
+      #
+      # The budget is 400 MB, measured, not aspirational. It used to be 100 MB,
+      # which this image could never have met: the RELEASE TARBALL for this same
+      # target is 101.8 MB *compressed*, so the binaries alone exceed the old
+      # limit before debian:bookworm-slim's ~75 MB base is counted. The gate had
+      # never run — the image had never built, 0 successes in 99 runs — so
+      # nothing ever tested the number against reality.
+      #
+      # 400 leaves real headroom over the current 325 MB while still catching
+      # the regression that actually happened: with debug = 1 inherited from
+      # [profile.release], the first image that ever built came out at 1532 MB.
+      # Raise this only with a measurement and a reason in the commit.
+      - name: Assert image size budget
         if: matrix.platform == 'linux/amd64'
         run: |
+          BUDGET_MB=400
           SIZE_BYTES=$(docker image inspect "$IMAGE_NAME:ci" \
             --format '{{.Size}}')
           SIZE_MB=$(( SIZE_BYTES / 1024 / 1024 ))
-          echo "Image size: ${SIZE_MB} MB"
-          if (( SIZE_MB > 100 )); then
-            echo "ERROR: image exceeds 100 MB limit (got ${SIZE_MB} MB)"
+          echo "Image size: ${SIZE_MB} MB (budget ${BUDGET_MB} MB)"
+          if (( SIZE_MB > BUDGET_MB )); then
+            echo "ERROR: image exceeds ${BUDGET_MB} MB budget (got ${SIZE_MB} MB)"
             exit 1
           fi
 
