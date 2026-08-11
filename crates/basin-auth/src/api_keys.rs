@@ -2,7 +2,8 @@
 //!
 //! An API key is an opaque, server-issued bearer credential. Unlike a JWT
 //! it has no embedded claims: every request resolves the owning project +
-//! user via a DB lookup against [`schema::api_keys`]. Keys are returned
+//! user via a DB lookup against the `auth.api_keys` table
+//! (physical name resolved by [`crate::schema`]). Keys are returned
 //! once at issuance time and are bcrypt-hashed at rest; a database leak
 //! does not directly leak usable credentials.
 //!

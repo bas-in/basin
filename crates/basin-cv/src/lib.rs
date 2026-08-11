@@ -91,7 +91,7 @@
 //!
 //! ## Isolation
 //!
-//! Per-project CV state is keyed on [`ProjectId`] inside [`CvStore`]'s
+//! Per-project CV state is keyed on [`ProjectId`](basin_common::ProjectId) inside [`CvStore`]'s
 //! catalog. Project A's `register_cv` cannot affect B's CVs; A's
 //! refresh tick never reads or writes B's data files. Documented and
 //! tested by `tests/unit_test_isolation.rs`.

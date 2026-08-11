@@ -711,7 +711,7 @@ impl<C: BlobCatalog> BlobStore<C> {
     /// Enable or disable RLS on `storage.objects` for `project`.
     ///
     /// When enabled, subsequent list / get / delete calls that receive a
-    /// [`CallerCtx`] will enforce the registered policies.
+    /// [`CallerCtx`](crate::CallerCtx) will enforce the registered policies.
     pub fn set_objects_rls_enabled(&self, project: &ProjectId, enabled: bool) {
         self.rls.set_enabled(project, "objects", enabled);
     }

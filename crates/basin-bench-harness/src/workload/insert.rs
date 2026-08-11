@@ -23,7 +23,7 @@ pub struct InsertOutcome {
     pub rows_written: u64,
 }
 
-/// Append `cfg.workload.table_rows` additional rows to project[project_idx]'s
+/// Append `cfg.workload.table_rows` additional rows to `project[project_idx]`'s
 /// `events` table, batched 10k at a time. Each batch's wall-clock is one
 /// histogram sample so the bar can assert on per-batch p99.
 pub async fn bulk_insert(

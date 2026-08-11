@@ -1,4 +1,4 @@
-//! Full-scan workload — `SELECT COUNT(*) FROM events` on project[project_idx].
+//! Full-scan workload — `SELECT COUNT(*) FROM events` on `project[project_idx]`.
 //!
 //! The scan is the load-bearing "your column store actually compresses and
 //! scans" measurement; it complements [`super::point_select`] by stressing

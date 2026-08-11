@@ -112,7 +112,7 @@ pub enum RaftGroupTarget {
 /// [`local_region`]:
 ///
 /// * `None` (unpinned/legacy) or `Some(home) == local_region()` ⇒ [`RaftGroupTarget::Local`],
-/// * `Some(home) != local_region()` ⇒ [`RaftGroupTarget::Remote(home)`].
+/// * `Some(home) != local_region()` ⇒ [`RaftGroupTarget::Remote(home)`](RaftGroupTarget::Remote).
 ///
 /// This makes the per-region-group ownership explicit and testable in isolation
 /// (the cross-region hop itself is hardware-bound — two real regional clusters

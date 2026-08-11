@@ -24,10 +24,10 @@
 //! | `auth.identities`             | `{schema}_identities`                       |
 //! | `auth.oauth_states`           | `{schema}_oauth_states`                     |
 //!
-//! **Back-compat**: [`legacy_table_prefix`] maps a canonical table name
+//! **Back-compat**: [`legacy_suffix_for`] maps a canonical table name
 //! (e.g. `"users"`) to the legacy flat-prefix form so callers can fall back
 //! to the old physical name when the canonical `auth.<table>` entry is absent.
-//! [`canonical_table_name`] maps the reverse direction.
+//! [`canonical_auth_table_name`] maps the reverse direction.
 //!
 //! Mirrors the `PostgresCatalog` migration pattern: idempotent
 //! `CREATE TABLE IF NOT EXISTS` statements. Tests use a unique schema-prefix

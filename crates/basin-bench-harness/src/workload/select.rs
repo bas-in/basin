@@ -3,7 +3,7 @@
 //!
 //! Uses [`BenchHarness::engine`] directly (i.e. the in-process executor,
 //! not pgwire). This keeps the harness target-agnostic; profiles that want
-//! to measure the pgwire path can wrap a [`tokio_postgres::Client`] on
+//! to measure the pgwire path can wrap a `tokio_postgres::Client` on
 //! top of `basin-server` but that's outside this crate's scope.
 
 use std::sync::Arc;

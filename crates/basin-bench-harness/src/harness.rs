@@ -73,8 +73,8 @@ pub fn build_batch(schema: &Arc<Schema>, start: i64, len: usize) -> RecordBatch 
 }
 
 impl BenchHarness {
-    /// Build the harness. Provisions [`BenchConfig::workload.project_count`]
-    /// projects, each with one `events` table of [`BenchConfig::workload.table_rows`].
+    /// Build the harness. Provisions [`BenchConfig::workload`]`.project_count`
+    /// projects, each with one `events` table of `workload.table_rows` rows.
     ///
     /// Non-LocalFS backends are currently rejected — wiring AWS / Tigris /
     /// SeaweedFS requires env vars + credentials that this crate intentionally

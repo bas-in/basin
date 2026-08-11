@@ -202,7 +202,7 @@ pub enum BasinError {
     ///
     /// The message names BOTH regions — `project homed in <home>, but this is
     /// region <local>` — so a region-aware client or pooler can reconnect to
-    /// the home-region endpoint. When a [`WriteForwarder`] is registered the
+    /// the home-region endpoint. When a `WriteForwarder` is registered the
     /// engine forwards the write to the home region instead of raising this;
     /// the bare error is the no-forwarder fail-loud default (ADR 0009: "fails
     /// loudly with a typed error rather than forwarding" when forwarding is
