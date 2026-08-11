@@ -2018,7 +2018,7 @@ fn parse_catalog_env() -> Result<CatalogBackend> {
     ))
 }
 
-/// #36 (Stage 2a) — production [`BucketResolver`]: maps a registry
+/// #36 (Stage 2a) — production [`BucketResolver`](basin_storage::bucket_pool::BucketResolver): maps a registry
 /// `bucket_id`/entry to a real S3-compatible `ObjectStore`, mirroring the
 /// BYO-bucket S3 construction in
 /// `basin_storage::Storage::build_byo_object_store_from_config_with_secret`.

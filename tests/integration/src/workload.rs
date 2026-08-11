@@ -77,7 +77,7 @@ impl WorkloadConfig {
         }
     }
 
-    /// Same as [`default_for_point_query`] but with a caller-supplied
+    /// Same as [`default_for_point_query`](Self::default_for_point_query) but with a caller-supplied
     /// seed. Useful when two cards in the same suite want statistically
     /// independent query streams.
     pub const fn with_seed(seed: u64) -> Self {
@@ -120,7 +120,7 @@ impl LatencyDistribution {
     ///
     /// Uses nearest-rank percentile: the kth percentile is the smallest
     /// sample whose rank exceeds k% of the data. For p99 over 1000
-    /// samples this picks sample[990] of the sorted vector. We pick
+    /// samples this picks `sample[990]` of the sorted vector. We pick
     /// nearest-rank rather than interpolated so two implementations of
     /// "p99" don't disagree on the dashboard depending on which crate
     /// emitted them.

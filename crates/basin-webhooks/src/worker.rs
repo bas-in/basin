@@ -72,7 +72,7 @@ pub enum AttemptOutcome {
     },
 }
 
-/// Driver loop. Hold one in the process; [`Self::run`] spawns the timer,
+/// Driver loop. Hold one in the process; [`Self::spawn`] drives the timer loop,
 /// or call [`Self::tick`] directly from a test for determinism.
 #[derive(Clone)]
 pub struct WebhookWorker {

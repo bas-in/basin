@@ -59,7 +59,7 @@
 //!   engine's expression machinery, which is part of the SQL surface
 //!   work.
 //! - A `webhook_dead_letters` SQL view. Dead letters are enumerable via
-//!   [`WebhookRegistry::list_dead_letters`] today; the view is added when
+//!   [`RetryQueue::list_dead_letters`] today; the view is added when
 //!   the SQL surface lands.
 
 #![forbid(unsafe_code)]

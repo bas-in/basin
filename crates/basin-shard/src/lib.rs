@@ -584,7 +584,7 @@ impl Shard {
     /// The shard owner is the natural choice of driver because it already
     /// has the per-project residency map; reusing it avoids a parallel
     /// "list of resident projects" structure inside `basin-cv`. The actual
-    /// refresh logic lives in [`basin_cv::CvRefresher`] — this method
+    /// refresh logic lives in `basin_cv::CvRefresher` — this method
     /// just walks the resident project set, calls the supplied
     /// [`CvRefreshDriver`] once per project, and sums the resulting
     /// `refreshed` counts.

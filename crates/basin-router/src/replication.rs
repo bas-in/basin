@@ -22,11 +22,11 @@
 //! the one that requires switching the connection into **CopyBoth streaming
 //! mode** — a protocol mode the framework's `SimpleQueryHandler` path does not
 //! model — so it is recognised here and the streaming loop is the documented
-//! remaining wiring (see [`START_REPLICATION_WIRING`]).
+//! remaining wiring (see [`START_REPLICATION_WIRING`](crate::replication::START_REPLICATION_WIRING)).
 //!
 //! # Flagged, off by default
 //!
-//! The whole path is gated on [`replication_enabled`] (env
+//! The whole path is gated on [`replication_enabled`](crate::replication::replication_enabled) (env
 //! `BASIN_PGWIRE_REPLICATION`, default off). When disabled, a replication
 //! command falls through to the normal SQL path (which rejects it as a syntax
 //! error, exactly as a non-replication PG connection would). When enabled, the

@@ -229,7 +229,7 @@ impl RestService {
     }
 
     /// Bind, listen, accept until the process is killed. Mirrors
-    /// [`basin_router::run`].
+    /// `basin_router::run`.
     pub async fn run(self) -> Result<()> {
         let bound = self.run_until_bound().await?;
         match bound.join.await {
@@ -320,7 +320,7 @@ impl RestService {
     }
 
     /// Bind synchronously (so callers can read `local_addr`), then spawn the
-    /// server on a background task. Mirrors [`basin_router::run_until_bound`].
+    /// server on a background task. Mirrors `basin_router::run_until_bound`.
     pub async fn run_until_bound(self) -> Result<RunningRest> {
         let listener = TcpListener::bind(self.inner.cfg.bind_addr)
             .await

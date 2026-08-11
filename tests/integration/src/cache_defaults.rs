@@ -39,7 +39,7 @@ pub const DEFAULT_TEST_PAGE_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 /// `Some(DiskCacheConfig)` rooted at a fresh per-call tempdir. The
 /// tempdir is leaked (its path persists until the test process exits)
 /// so callers can drop the returned value without it being reaped
-/// out from under the [`Storage`] that holds the cache.
+/// out from under the [`Storage`](basin_storage::Storage) that holds the cache.
 pub fn default_test_disk_cache() -> Option<DiskCacheConfig> {
     let dir = TempDir::new().expect("create disk-cache tempdir");
     let path = dir.keep();

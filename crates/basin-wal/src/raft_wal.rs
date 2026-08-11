@@ -306,8 +306,8 @@ pub trait RaftNetworkChoiceMarker {}
 
 /// Shared registry of every `Raft` handle in the simulated cluster.
 ///
-/// The `RaftNetworkFactory` returned by [`SimCluster::factory`] looks up the
-/// target's `Raft` handle in this registry and dispatches RPCs in-process.
+/// The in-process `SimNetworkFactory` that [`RaftWal::new`] injects looks up
+/// the target's `Raft` handle in this registry and dispatches RPCs in-process.
 /// This is the load-bearing trick that lets us validate consensus without
 /// a wire protocol — every node's `append_entries` / `vote` / `snapshot`
 /// goes via direct method call.
@@ -509,7 +509,7 @@ impl RaftWal {
     /// share one [`SimCluster`] across every node so RPC dispatch resolves.
     ///
     /// Cross-process deployments call [`Self::new_with_network`] with a
-    /// [`crate::raft_net::TonicNetworkFactory`] instead.
+    /// `TonicNetworkFactory` (the `raft-net` feature) instead.
     pub async fn new(config: RaftWalConfig) -> Result<Self> {
         // Default path: the in-process simulation network. The factory needs
         // the resolved `SimCluster` Arc, so build it here, then hand it to the
@@ -535,7 +535,7 @@ impl RaftWal {
     ///
     /// [`new`](Self::new) is the in-process-simulation convenience wrapper;
     /// cross-process deployments call this directly with a
-    /// [`crate::raft_net::TonicNetworkFactory`]. The returned `RaftWal` still
+    /// `TonicNetworkFactory` (the `raft-net` feature). The returned `RaftWal` still
     /// carries a [`SimCluster`] handle (the [`cluster`](Self::cluster)
     /// accessor) for test ergonomics; with a real network factory that
     /// cluster is simply unused for dispatch.
@@ -648,7 +648,7 @@ impl RaftWal {
 
     /// Underlying raft handle. Exposed so multi-node tests can drive
     /// elections / membership, and so the network layer can hand it to the
-    /// tonic [`crate::raft_net::RaftTransportService`].
+    /// tonic `RaftTransportService` (the `raft-net` feature).
     pub fn raft(&self) -> &RaftHandle {
         &self.raft
     }

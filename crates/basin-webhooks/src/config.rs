@@ -25,9 +25,10 @@ pub struct WebhookConfig {
     /// A subscription whose oldest still-unflushed failing delivery has
     /// been retrying for longer than this is auto-paused. Default 24h.
     pub auto_pause_after: Duration,
-    /// Tick interval for [`WebhookWorker::run`]. The worker wakes on
-    /// this period and processes any due entries; smaller values reduce
-    /// delivery latency at the cost of CPU.
+    /// Tick interval for the loop that
+    /// [`WebhookWorker::spawn`](crate::WebhookWorker::spawn) drives. The
+    /// worker wakes on this period and processes any due entries; smaller
+    /// values reduce delivery latency at the cost of CPU.
     pub worker_tick: Duration,
 }
 
