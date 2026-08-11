@@ -15,7 +15,11 @@
 //! - Filter to the calling project's tables at query-construction time;
 //!   never materialise cross-project rows.
 //!
-//! Oid-hashing scheme: see [`stable_oid`].
+//! Oid-hashing scheme: every synthetic OID is an FNV-1a hash of a
+//! project-scoped key, folded into a positive `i64` by
+//! `fnv1a_64_to_positive_i64` — see its callers `table_oid`, `index_oid`,
+//! `catalog_table_oid`, `namespace_oid_for` and friends at the bottom of
+//! this module.
 
 use std::sync::Arc;
 
@@ -252,7 +256,7 @@ impl InfoSchemaQuery {
     /// Schema for `pg_catalog.pg_attribute` rows.
     ///
     /// One row per (table, column) belonging to the calling project.
-    /// `attrelid` shares its hashing scheme with [`pg_class.oid`] so a
+    /// `attrelid` shares its hashing scheme with `pg_class.oid` so a
     /// JOIN between the two tables is direct.
     ///
     /// | column         | type    | notes                                   |
@@ -652,7 +656,7 @@ impl InfoSchemaQuery {
     ///   * the implicit PRIMARY KEY index (`<table>_pkey`, `indisprimary =
     ///     true`, `indisunique = true`) for every table that declares a PK;
     ///   * one row per user-declared `CREATE INDEX` in
-    ///     [`TableMetadata::indexes`].
+    ///     [`TableMetadata::indexes`](crate::TableMetadata::indexes).
     ///
     /// `indexrelid` is a stable OID derived by [`index_oid`] and is also the
     /// OID of the matching `pg_class` row (relkind `'i'`) so the standard ORM
@@ -4297,7 +4301,7 @@ impl InfoSchemaQuery {
     /// up a config by its PG OID still resolve correctly.
     ///
     /// `cfgnamespace` points at the `"pg_catalog"` namespace oid (per-project
-    /// FNV-1a hash, consistent with [`pg_type`] which does the same).
+    /// FNV-1a hash, consistent with [`pg_type`](Self::pg_type) which does the same).
     /// `cfgowner` is the project's role oid (same value as `pg_authid.oid`).
     /// `cfgparser` is `3722` — PG's well-known OID for the built-in default
     /// text-search parser.

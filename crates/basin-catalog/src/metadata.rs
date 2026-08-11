@@ -647,8 +647,8 @@ impl TableMetadata {
     /// Compute the **complete live data-file set** at `current_snapshot` by
     /// replaying the snapshot chain from the genesis snapshot forward.
     ///
-    /// Each [`SnapshotOperation::Append`] adds its `data_files` to the live
-    /// set; each [`SnapshotOperation::Replace`] removes the paths recorded in
+    /// Each [`SnapshotOperation::Append`](crate::SnapshotOperation::Append) adds its `data_files` to the live
+    /// set; each [`SnapshotOperation::Replace`](crate::SnapshotOperation::Replace) removes the paths recorded in
     /// `removed_paths` and adds the replacement `data_files`. Genesis snapshots
     /// contribute nothing (they have no files by construction).
     ///

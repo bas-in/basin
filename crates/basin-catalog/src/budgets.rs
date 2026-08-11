@@ -164,7 +164,7 @@ impl ProjectBudget {
 
 /// What the coordinator hands back to a single `(project, partition)`
 /// leaseholder on the next heartbeat. The leaseholder writes this into its
-/// [`SliceBudgetMap`] and every cap consumer reads from there on the hot
+/// [`SliceBudgetView`] and every cap consumer reads from there on the hot
 /// path.
 #[derive(Clone, Debug, Default)]
 pub struct SliceBudget {
@@ -256,7 +256,7 @@ struct InMemoryProjectState {
     /// holder's first push.
     partitions: HashMap<String, (String, UsageDelta)>,
     /// Last-handed-back slice per partition; mirrors what the leaseholder's
-    /// [`SliceBudgetMap`] currently shows.
+    /// [`SliceBudgetView`] currently shows.
     slices: HashMap<String, SliceBudget>,
 }
 
@@ -362,7 +362,7 @@ impl BudgetCoordinator for InMemoryBudgetCoordinator {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SliceBudgetMap — the local hot-path view a cap consumer reads
+// SliceBudgetView — the local hot-path view a cap consumer reads
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Cheap-to-clone, lock-free view of "what slice does my leaseholder think

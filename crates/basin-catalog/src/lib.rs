@@ -1039,7 +1039,7 @@ pub trait Catalog: Send + Sync {
     /// `Some(n)` makes the next write group rows in chunks of `n`;
     /// `None` (the default) restores the writer-global default. The
     /// engine consults this on every INSERT and passes the value via
-    /// [`basin_storage::WriteOptions::max_row_group_size`]. Default impl
+    /// `basin_storage::WriteOptions::max_row_group_size`. Default impl
     /// is a no-op so the stub `RestCatalog` and any future backends stay
     /// buildable; the in-memory and Postgres implementations override
     /// this. See `tests/integration/tests/viability_row_group_sizing.rs`.
@@ -1053,7 +1053,7 @@ pub trait Catalog: Send + Sync {
         Ok(())
     }
 
-    /// Replace the table's Arrow [`Schema`]. Used by `ALTER TABLE … ADD
+    /// Replace the table's Arrow [`Schema`](arrow_schema::Schema). Used by `ALTER TABLE … ADD
     /// COLUMN` (and any future evolutionary DDL — DROP COLUMN, type
     /// widening, etc.). The catalog records the new schema; existing data
     /// files keep their original Parquet schemas and the reader handles the

@@ -26,7 +26,7 @@ use basin_common::ProjectId;
 use serde::{Deserialize, Serialize};
 
 /// The output plugin a slot streams with. Mirrors
-/// [`basin_cdc::pgoutput::OutputPlugin`] but lives here so the catalog has no
+/// `basin_cdc::pgoutput::OutputPlugin` but lives here so the catalog has no
 /// dependency on basin-cdc (basin-cdc depends on basin-catalog, not the
 /// reverse). The wire token is `pgoutput` / `wal2json`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

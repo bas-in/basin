@@ -41,7 +41,7 @@ pub enum SqlFunctionLanguage {
     /// a base64-encoded Wasm **component** (component-model format),
     /// compiled client-side from JS by ComponentizeJS / Javy. The engine
     /// stores the compiled bytes verbatim; invocation flows through
-    /// `basin-fn`'s [`ComponentHarness`] rather than the bare-module
+    /// `basin-fn`'s `ComponentHarness` rather than the bare-module
     /// scalar-UDF path used by `Wasm`. JavaScript functions are
     /// **request-style** (not DataFusion scalar UDFs) — see
     /// `basin-fn::runtime::FunctionRuntime`.

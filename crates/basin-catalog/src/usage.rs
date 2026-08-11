@@ -5,7 +5,7 @@
 //! `ProjectCounters` is a plain-data snapshot of the per-project atomic counters
 //! kept by [`basin_common::telemetry::ProjectCounterRegistry`]. The snapshot is
 //! collected at the call site (no locking here) and written to the catalog's
-//! `project_usage_periods` table once per hour by [`spawn_usage_snapshot_task`].
+//! `project_usage_periods` table once per hour by [`spawn_usage_snapshot_task`](crate::usage::spawn_usage_snapshot_task).
 //!
 //! ## Table schema (`project_usage_periods`)
 //!
@@ -26,7 +26,7 @@
 //!
 //! ## OTLP export
 //!
-//! [`spawn_usage_otlp_exporter`] emits structured `tracing::info!` records via
+//! The snapshot task also emits structured `tracing::info!` records via
 //! the `basin.project.usage` target. When `tracing-opentelemetry` is attached
 //! these become OTLP metric events; plain `fmt` subscribers log them as INFO
 //! lines useful for self-hosted debugging without a collector.
@@ -38,7 +38,7 @@
 //!
 //! A project is considered "active" in an hourly window if its `ops_total`
 //! counter advanced since the previous snapshot. The per-project last-seen
-//! watermark is tracked in memory by [`UsageSnapshotState`]; it is not persisted
+//! watermark is tracked in memory by `UsageSnapshotState`; it is not persisted
 //! so a restart re-attributes the first post-restart hour as active regardless
 //! (conservative; the cloud-side roll-up deduplicates by `period_start`).
 

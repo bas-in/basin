@@ -21,7 +21,7 @@
 //! ### Table metadata as a versioned manifest log
 //!
 //! Per `(project, schema, table)` the full table state is serialised as a JSON
-//! [`TableManifest`] at a monotonically-versioned key:
+//! `TableManifest` at a monotonically-versioned key:
 //!
 //! ```text
 //!   {root}{project}/{schema}/{table}/v{N:020}.json   # immutable manifest, N = catalog version
@@ -34,7 +34,7 @@
 //! - A commit loads version `N`, applies the mutation to build manifest `N+1`,
 //!   and `put_opts(v{N+1}, …, PutMode::Create)`. If the store says
 //!   `AlreadyExists`, another node already wrote `N+1`: reload and either retry
-//!   transparently (idempotent DDL) or surface [`BasinError::CommitConflict`]
+//!   transparently (idempotent DDL) or surface [`BasinError::CommitConflict`](basin_common::BasinError::CommitConflict)
 //!   (append/replace — the engine already retries on that error).
 //! - Old version objects are **never deleted**: they are the history (enabling
 //!   time-travel) and let a reader mid-commit keep reading a consistent older
