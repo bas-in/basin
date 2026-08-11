@@ -115,11 +115,32 @@ jobs:
           fi
 
       # ── Quick-start smoke: bring up Basin, wait for pgwire, run round-trip ──
+      # Both containers share a user-defined network and talk by container name.
+      #
+      # This used to publish the port with `-p` and have the psql sidecar reach
+      # it over `--network host` at 127.0.0.1. That failed, and failed in the
+      # most misleading way available: the server was healthy the whole time —
+      # its own log reads `pgwire listener is accept-ready bind=0.0.0.0:5432`
+      # six seconds BEFORE the first connection attempt — while the sidecar
+      # retried for the full 60 s and reported "Basin did not become ready".
+      # The message blamed the server for a reachability problem between two
+      # containers.
+      #
+      # A user-defined network removes the host from the path entirely: docker's
+      # embedded DNS resolves `basin-smoke` to the container, so nothing depends
+      # on host port publishing or on what loopback means inside a
+      # host-networked container. The port is still published for anyone
+      # debugging the run from the runner itself.
+      - name: Create smoke network
+        if: matrix.platform == 'linux/amd64'
+        run: docker network create basin-smoke-net
+
       - name: Start Basin container
         if: matrix.platform == 'linux/amd64'
         run: |
           docker run -d \
             --name basin-smoke \
+            --network basin-smoke-net \
             -p "$BASIN_PORT:$BASIN_PORT" \
             "$IMAGE_NAME:ci"
 
@@ -127,9 +148,9 @@ jobs:
         if: matrix.platform == 'linux/amd64'
         run: |
           docker run --rm \
-            --network host \
+            --network basin-smoke-net \
             -v "${{ github.workspace }}/tests/integration/scripts/docker-smoke.sh:/smoke.sh:ro" \
-            -e PGHOST=127.0.0.1 \
+            -e PGHOST=basin-smoke \
             -e PGPORT=${{ env.BASIN_PORT }} \
             -e PGUSER=basin \
             -e PGDATABASE=basin \
@@ -144,9 +165,9 @@ jobs:
         if: matrix.platform == 'linux/amd64'
         run: |
           docker run --rm \
-            --network host \
+            --network basin-smoke-net \
             -v "${{ github.workspace }}:/repo:ro" \
-            -e PGHOST=127.0.0.1 \
+            -e PGHOST=basin-smoke \
             -e PGPORT=${{ env.BASIN_PORT }} \
             -e PGUSER=basin \
             -e PGDATABASE=basin \
@@ -159,4 +180,8 @@ jobs:
 
       - name: Stop Basin container
         if: always() && matrix.platform == 'linux/amd64'
-        run: docker rm -f basin-smoke || true
+        run: |
+          docker rm -f basin-smoke || true
+          # The network holds a reference to the container, so it must go after
+          # it — and with || true, because a failed run may never have made it.
+          docker network rm basin-smoke-net || true
