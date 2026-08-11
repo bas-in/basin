@@ -606,7 +606,7 @@ impl ProjectIndexRegistry {
 /// the registry through the [`basin_shard::SecondaryIndexSink`] trait. The
 /// shard passes primitive `(key, file, row_group, row)` tuples — exactly the
 /// fields of [`IndexLocation`] — which we reassemble here. The `key`/`row_group`
-/// semantics match [`extract_entries_from_batch`] (the engine-side INSERT-path
+/// semantics match `extract_entries_from_batch` (the engine-side INSERT-path
 /// extractor) so locations registered by the compactor are probe-compatible
 /// with locations registered on the direct-INSERT path.
 impl basin_shard::SecondaryIndexSink for ProjectIndexRegistry {

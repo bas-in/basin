@@ -9,7 +9,7 @@
 //!        EXECUTE <single_sql_statement>;
 //!    ```
 //!    SQL-bodied reactor (5.11.C) — body runs through the existing
-//!    [`Catalog::register_reactor`](basin_catalog::Catalog::register_reactor)
+//!    [`Catalog::register_reactor`]
 //!    API and is dispatched by `ReactorSink` on every matching mutation.
 //!
 //! 2. ```sql

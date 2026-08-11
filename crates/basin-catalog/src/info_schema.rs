@@ -658,10 +658,10 @@ impl InfoSchemaQuery {
     ///   * one row per user-declared `CREATE INDEX` in
     ///     [`TableMetadata::indexes`](crate::TableMetadata::indexes).
     ///
-    /// `indexrelid` is a stable OID derived by [`index_oid`] and is also the
+    /// `indexrelid` is a stable OID derived by `index_oid` and is also the
     /// OID of the matching `pg_class` row (relkind `'i'`) so the standard ORM
     /// introspection JOIN `pg_index.indexrelid = pg_class.oid` resolves.
-    /// `indrelid` reuses the parent table's [`table_oid`].
+    /// `indrelid` reuses the parent table's `table_oid`.
     ///
     /// | column        | type     | notes                                       |
     /// |---------------|----------|---------------------------------------------|
@@ -1522,7 +1522,7 @@ impl InfoSchemaQuery {
         ]))
     }
 
-    /// Build `pg_catalog.pg_type`. Row set is the static [`BASIN_PG_TYPES`]
+    /// Build `pg_catalog.pg_type`. Row set is the static `BASIN_PG_TYPES`
     /// table; `typnamespace` is hashed per-project against the
     /// `"pg_catalog"` schema so a JOIN against `pg_namespace` works the
     /// same way as `pg_class.relnamespace` / `pg_proc.pronamespace`.
@@ -1530,7 +1530,7 @@ impl InfoSchemaQuery {
     /// [`Catalog::list_enum_types`] so ORMs that resolve a column's
     /// `pg_attribute.atttypid` against `pg_type` and then JOIN `pg_enum`
     /// see the enum and its labels. Built-in rows come first (stable OIDs),
-    /// enum rows follow (per-project [`enum_type_oid`] hashes, namespace
+    /// enum rows follow (per-project `enum_type_oid` hashes, namespace
     /// `public`).
     pub async fn pg_type(catalog: &dyn Catalog, project: &ProjectId) -> Result<RecordBatch> {
         let enums = catalog.list_enum_types(project).await;
@@ -3206,7 +3206,7 @@ impl InfoSchemaQuery {
     /// Schema for `pg_catalog.pg_sequence` rows. One row per project sequence.
     ///
     /// `seqrelid` matches the sequence's `pg_class` (relkind `'S'`) oid via
-    /// [`sequence_oid`] so ORMs can join `pg_sequence.seqrelid = pg_class.oid`.
+    /// `sequence_oid` so ORMs can join `pg_sequence.seqrelid = pg_class.oid`.
     /// `seqtypid` is always int8 (OID 20) — Basin sequences are 64-bit.
     ///
     /// | column        | type   | notes                                  |
@@ -3279,7 +3279,7 @@ impl InfoSchemaQuery {
 
     /// Schema for `pg_catalog.pg_enum` rows. One row per (enum type, label).
     ///
-    /// `enumtypid` matches the enum's `pg_type.oid` via [`enum_type_oid`] so
+    /// `enumtypid` matches the enum's `pg_type.oid` via `enum_type_oid` so
     /// ORMs can join `pg_enum.enumtypid = pg_type.oid`. `enumsortorder` is the
     /// 1-based float position PG assigns (labels stored in declaration order).
     ///

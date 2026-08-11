@@ -29,7 +29,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 enum Cmd {
-    /// Connect and run `SELECT 1`. Prints "OK in <ms>".
+    /// Connect and run `SELECT 1`. Prints `OK in <ms>`.
     Ping {
         /// Optional connection string positional override.
         url: Option<String>,

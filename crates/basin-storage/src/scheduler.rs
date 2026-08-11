@@ -88,7 +88,7 @@ pub fn default_global_budget() -> usize {
 
 /// Back-compat constant retained for the small number of callers (mostly
 /// tests) that opted into the historical floor explicitly. New code
-/// should call [`default_global_budget`].
+/// should call `default_global_budget`.
 pub const DEFAULT_GLOBAL_BUDGET: usize = 4;
 
 /// Deadlines per priority class. High wins the heap by ~200x.

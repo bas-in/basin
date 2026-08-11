@@ -575,7 +575,7 @@ pub(crate) fn densify(
             }
             // Patch the column in `arrays[ac]`.
             let col_dt = schema.field(ac).data_type().clone();
-            let (tz_ref) = match schema.field(bucket_idx).data_type() {
+            let tz_ref = match schema.field(bucket_idx).data_type() {
                 DataType::Timestamp(_, z) => z.clone(),
                 _ => None,
             };

@@ -83,7 +83,7 @@ fn generate_password() -> String {
 /// format, which does not embed the project ULID and therefore requires a DB
 /// lookup to resolve the project. Credentials in this format must be migrated
 /// to the new `{26-char-ulid}_{hex}` format via
-/// [`migrate_legacy_credential`] before the self-routing path can be used.
+/// `migrate_legacy_credential` before the self-routing path can be used.
 ///
 /// The check is deliberately conservative: only strings that start with
 /// `"project_"` AND are shorter than 20 chars are treated as legacy (the old

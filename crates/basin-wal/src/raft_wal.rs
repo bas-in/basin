@@ -498,7 +498,7 @@ impl fmt::Debug for RaftWal {
 
 impl RaftWal {
     /// Bring up a raft node with the given config, using the in-process
-    /// [`SimNetworkFactory`].
+    /// `SimNetworkFactory`.
     ///
     /// Storage opens (or creates) `config.data_dir` and replays any
     /// persisted raft log / vote / snapshot — a node that restarts against
@@ -730,7 +730,7 @@ impl RaftWal {
     /// storage and recorded a `catalog_snapshot_id` for it. This:
     ///
     /// 1. stamps the durable watermark into the replicated state machine
-    ///    (the [`crate::raft_storage::ManifestPointer`] — a pointer to the
+    ///    (the `crate::raft_storage::ManifestPointer` — a pointer to the
     ///    S3/catalog-anchored data, not a copy of it),
     /// 2. triggers a raft snapshot so the watermark + log index are captured
     ///    in `get_current_snapshot` (and installable on followers), and
@@ -897,7 +897,7 @@ impl RaftWal {
 /// - `Raft`: durability = quorum replication. WAL append batches are proposed
 ///   to raft ([`RaftWal::propose_batch`]); `durable_lsn` advances on the raft
 ///   commit index instead of on a local fsync watermark. The local fsync still
-///   happens — as part of the raft log append in [`crate::raft_storage`].
+///   happens — as part of the raft log append in `crate::raft_storage`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WalMode {
     /// Local group-commit fsync durability. Byte-identical to v0.1.

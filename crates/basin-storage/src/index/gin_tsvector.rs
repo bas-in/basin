@@ -51,7 +51,7 @@
 //! # Storage / eviction / budget story
 //!
 //! The posting list lives entirely in RAM.  The registry caps each per-column
-//! posting list at [`DEFAULT_POSTING_BUDGET`] total entries (operator-tunable
+//! posting list at `DEFAULT_POSTING_BUDGET` total entries (operator-tunable
 //! via `BASIN_GIN_POSTING_BUDGET`, the same knob the JSONB GIN registry
 //! reads); oldest lexemes are evicted in 25%-of-current-lexemes batches when
 //! the cap is exceeded.  On engine restart the registry starts empty and
@@ -675,7 +675,7 @@ struct RegKey {
 
 /// Process-wide GIN posting-list registry for `tsvector` columns.
 ///
-/// One [`LexemePostingList`] per `(project, table, col)`.  Concurrent access
+/// One `LexemePostingList` per `(project, table, col)`.  Concurrent access
 /// is serialised by a per-posting-list `Mutex`, with the outer `Mutex` only
 /// held briefly to look up or insert the `Arc`.
 ///

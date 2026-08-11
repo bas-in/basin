@@ -227,7 +227,7 @@ pub fn encode_batches_text_for_test(
 /// `tls` is optional. When `Some`, the listener answers `'S'` to a Postgres
 /// `SSLRequest` and wraps the socket with the supplied acceptor before the
 /// regular pgwire startup; `None` answers `'N'` and stays plaintext, which
-/// matches pre-TLS behaviour byte-for-byte. See [`tls`] module docs.
+/// matches pre-TLS behaviour byte-for-byte. See `tls` module docs.
 pub struct ServerConfig {
     pub bind_addr: SocketAddr,
     pub engine: basin_engine::Engine,

@@ -59,7 +59,7 @@
 //! * **not** be a primary-key column (the PK already has its own fast path; a
 //!   redundant secondary index would only add write amplification),
 //! * have an **indexable** Arrow type — exactly the types the secondary-index
-//!   extractor ([`crate::secondary_index::extract_entries_from_batch`])
+//!   extractor (`crate::secondary_index::extract_entries_from_batch`)
 //!   supports: `Int64`, `UInt64`, `Float64`, `Utf8`, `LargeUtf8`, `Boolean`.
 //!   Observing an unsupported type would let the counter cross the threshold
 //!   and fire a `CREATE INDEX` whose backfill silently extracts nothing, so we
@@ -153,7 +153,7 @@ type TableColCounts = HashMap<String, ColEntry>;
 /// Process-wide auto-index access tracker.
 ///
 /// Cheap to create (a `RwLock`-guarded `HashMap`). Constructed once inside
-/// [`crate::EngineInner`] and shared via `Arc`.
+/// `crate::EngineInner` and shared via `Arc`.
 pub struct IndexAdvisorRegistry {
     inner: RwLock<HashMap<(ProjectId, TableName), TableColCounts>>,
 }

@@ -48,7 +48,7 @@ pub(crate) fn connection_limit_reached_response() -> ErrorResponse {
 /// signal, return the value of the Fly `fly-replay` response header that the
 /// edge should emit (`region=<home_region>;...`), so Fly re-fires the request
 /// against the project's home region. Returns `None` for any other error (the
-/// caller then renders a normal `ErrorResponse` via [`error_response`]).
+/// caller then renders a normal `ErrorResponse` via `error_response`).
 ///
 /// The directive carries the replay TOKEN in the `instance`-style state field
 /// so the home region (and Fly's own loop detection) can observe it; the

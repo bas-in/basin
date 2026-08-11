@@ -20,7 +20,7 @@
 //! [`BenchConfig`] (storage backend, engine flags, workload knobs), builds
 //! the engine + storage, and exposes a small set of workload primitives
 //! ([`workload::point_select`], [`workload::bulk_insert`],
-//! [`workload::scan`], [`workload::wasm_invoke`], …) that record latencies
+//! [`workload::scan`](fn@workload::scan), [`workload::wasm_invoke`], …) that record latencies
 //! into an [`hdrhistogram::Histogram`] and emit a JSON sidecar matching the
 //! shape already consumed by `benchmark/index_*.html` and `bundle.py`.
 //!

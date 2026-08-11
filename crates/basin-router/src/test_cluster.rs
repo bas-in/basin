@@ -44,7 +44,7 @@ use crate::{run_until_bound, RunningServer, ServerConfig};
 /// cluster).
 ///
 /// Each shard wraps the cluster-wide [`DynamicProjectResolver`] in a
-/// [`CountingResolver`] so the test can read back, per-shard:
+/// `CountingResolver` so the test can read back, per-shard:
 ///
 /// - total connection count
 /// - per-project connection count
@@ -176,7 +176,7 @@ impl ProjectResolver for DynamicProjectResolver {
     }
 }
 
-/// Per-shard statistics. Incremented atomically in [`CountingResolver`]
+/// Per-shard statistics. Incremented atomically in `CountingResolver`
 /// every time a connection authenticates against the shard.
 #[derive(Default)]
 pub struct ShardStats {

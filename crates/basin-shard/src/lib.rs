@@ -358,7 +358,7 @@ pub struct TailPressure {
     /// this across the fleet, so it must be a per-partition max, not an average.
     pub max_partition_tail_bytes: i64,
     /// Most recent COMPLETE one-second ingest rate (rows/sec) on this node, from
-    /// the rolling [`in_process`] ingest counter. Maps to the autoscaler's
+    /// the rolling `in_process` ingest counter. Maps to the autoscaler's
     /// `ingest_rows_per_sec`. 0 when the node is idle (the last full second saw
     /// no writes).
     pub ingest_rows_per_sec: i64,
@@ -413,7 +413,7 @@ impl Shard {
     /// / `SELECT` touches every partition and must not fence the true owner).
     /// The handle reads the resident tail this node owns plus the shared
     /// flushed files; it never steals the writer lease. See
-    /// [`ShardImpl::get_for_read`].
+    /// `ShardImpl::get_for_read`.
     pub async fn get_for_read(
         &self,
         project: &ProjectId,
@@ -514,7 +514,7 @@ impl Shard {
 
     /// Read-freshness drain for the metadata-aggregate fast path
     /// (`count(*)`/`max`) that does NOT block behind an in-flight write-path
-    /// compaction. See [`ShardImpl::flush_to_parquet_for_read`]. Use this on
+    /// compaction. See `ShardImpl::flush_to_parquet_for_read`. Use this on
     /// the read path; `flush_to_parquet` (blocking, full-tail drain) remains
     /// the write/quiesce drain.
     pub async fn flush_to_parquet_for_read(&self) -> Result<()> {
@@ -720,7 +720,7 @@ impl Shard {
     /// This is the no-flush correctness signal a read path uses to decide
     /// whether cold-file-only guarantees are authoritative.  It never lists
     /// or scans object storage and never drains the tail — it only inspects
-    /// the resident per-partition tail maps. See [`ShardImpl::has_pending_tail`].
+    /// the resident per-partition tail maps. See `ShardImpl::has_pending_tail`.
     pub async fn has_pending_tail(&self, project: &ProjectId, table: &TableName) -> bool {
         self.inner.has_pending_tail(project, table).await
     }
@@ -733,7 +733,7 @@ impl Shard {
     /// per-partition tail maps. The read path uses it to decide whether a
     /// small pending tail can be merged on-read (via the shard's own
     /// tail-merging `ProjectHandle::read`) instead of paying a synchronous
-    /// flush. See [`ShardImpl::pending_tail_rows`].
+    /// flush. See `ShardImpl::pending_tail_rows`.
     pub async fn pending_tail_rows(&self, project: &ProjectId, table: &TableName) -> usize {
         self.inner.pending_tail_rows(project, table).await
     }
@@ -746,7 +746,7 @@ impl Shard {
     /// already spans every stripe partition's flushed data, and this merges
     /// the still-resident tail of `s1`, `s2`, … (not only `default_key()`), so
     /// read-own-write holds for striped multi-row INSERTs. See
-    /// [`ShardImpl::read_table_merging_tails`].
+    /// `ShardImpl::read_table_merging_tails`.
     pub async fn read_table_merging_tails(
         &self,
         project: &ProjectId,

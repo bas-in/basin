@@ -247,7 +247,7 @@ fn rls_permits(event: &ChangeEvent, subscriber_user_id: &str, subscriber_roles: 
 /// Streams change events as SSE to the caller. Enforces:
 /// 1. JWT auth (identical to basin-rest / ADR 0006).
 /// 2. Cross-project isolation: `claims.project_id` must equal `:project`.
-/// 3. RLS filtering via [`rls_permits`].
+/// 3. RLS filtering via `rls_permits`.
 /// 4. Replay of missed events when `Last-Event-ID` header is present.
 /// 5. Heartbeat every 15 s via axum's [`KeepAlive`].
 #[axum::debug_handler]

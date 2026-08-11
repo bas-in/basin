@@ -29,7 +29,7 @@
 //! [`BasinStatStatementsProvider`] is a DataFusion [`TableProvider`] that
 //! materialises the current registry snapshot into an Arrow `RecordBatch` on
 //! every `scan()`.  It is registered under the `public` schema by
-//! [`register_basin_stat_statements`] so
+//! `register_basin_stat_statements` so
 //!
 //! ```sql
 //! SELECT * FROM basin_stat_statements;

@@ -20,7 +20,7 @@
 //! - TEXT / CSV format; any single-character delimiter (resolved by caller).
 //! - All Arrow column types that `batch_from_rows` handles: Int16/32/64,
 //!   Float32/64, Boolean, Timestamp(µs), Binary, LargeBinary (JSONB),
-//!   FixedSizeBinary(16) (UUID), FixedSizeList<f32> (vector), Decimal128,
+//!   FixedSizeBinary(16) (UUID), `FixedSizeList<f32>` (vector), Decimal128,
 //!   Utf8 (TEXT, VARCHAR, INET, CIDR, MACADDR, BIT, VARBIT, TSVECTOR, TSQUERY).
 //! - Full-width COPY (no column list, or column list == all columns):
 //!   zero-overhead for the common case.

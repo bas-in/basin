@@ -4,7 +4,7 @@
 //! per-trigram posting list mapping trigram → row-ids. Search extracts
 //! the query trigrams, looks each up in the inverted index, accumulates
 //! per-candidate hit counts, and computes the same Jaccard score that
-//! [`crate::similarity`] returns — over the candidate set only, not the
+//! [`crate::similarity`](fn@crate::similarity) returns — over the candidate set only, not the
 //! full corpus.
 //!
 //! ## Correctness invariant

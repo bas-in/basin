@@ -22,7 +22,7 @@
 //! semantics are monotonic-or-saturating; gauges read the current value;
 //! histograms ship as (count, sum) plus a fixed-size sample ring so p99 is
 //! approximable. Production deployments wanting full HDR histograms can
-//! swap [`LatencyRing`] without changing the public API (same trick as
+//! swap `LatencyRing` without changing the public API (same trick as
 //! [`crate::telemetry::ProjectCounters`]).
 //!
 //! | metric (OTLP)                              | type      | dims            |
@@ -218,7 +218,7 @@ struct ReplicaLeaseCounters {
     heartbeat_lag_ms: Mutex<LatencyRing>,
 }
 
-/// Plain-data snapshot of [`ReplicaLeaseCounters`]. Cheap to clone and ship
+/// Plain-data snapshot of `ReplicaLeaseCounters`. Cheap to clone and ship
 /// over the wire. Each `result` label is its own counter to keep the API
 /// flat — exporters fan them back into `result={acquired|stolen|failed}`
 /// per OTLP convention.

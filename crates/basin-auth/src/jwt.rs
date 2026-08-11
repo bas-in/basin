@@ -327,7 +327,7 @@ impl JwtKeys {
     /// In addition to the checks performed by `jsonwebtoken` (signature, `exp`,
     /// `nbf`), this method enforces `iat` validity:
     /// - `iat` must be present in the token.
-    /// - `iat` must not be more than [`IAT_MAX_SKEW_SECS`] seconds in the
+    /// - `iat` must not be more than `IAT_MAX_SKEW_SECS` seconds in the
     ///   future; a token issued with `iat = year 3000` is rejected here.
     ///
     /// If a `previous_decoding` key is present (grace-window rotation), tokens

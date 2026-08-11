@@ -37,7 +37,7 @@ use vortex_file::Footer;
 /// cache is disabled (legacy / test behaviour). When `Some`, `decode_inner`
 /// probes it before calling `open_buffer` and populates it on miss.
 ///
-/// Internal locking mirrors [`crate::metadata_cache::ParquetMetaCache`]: a
+/// Internal locking mirrors `crate::metadata_cache::ParquetMetaCache`: a
 /// `Mutex<LruCache<...>>` that is only held for nanoseconds per access. The
 /// pessimistic case for the `lru` crate is O(1) per get/put because it is a
 /// doubly-linked hash map; the mutex contention window is exactly that tiny

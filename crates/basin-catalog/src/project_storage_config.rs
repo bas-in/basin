@@ -24,9 +24,9 @@ pub struct ProjectStorageConfig {
     /// External KMS reference. Format is provider-specific and opaque to
     /// basin-storage — typically a fully-qualified CMK identifier the
     /// caller's `EncryptionProvider` impl knows how to resolve. Examples:
-    ///   "arn:aws:kms:us-east-1:123456789012:key/abcd-..."
-    ///   "projects/my-project/locations/us/keyRings/r/cryptoKeys/k"
-    ///   "https://my-vault.vault.azure.net/keys/key-name/version"
+    ///   `"arn:aws:kms:us-east-1:123456789012:key/abcd-..."`
+    ///   `"projects/my-project/locations/us/keyRings/r/cryptoKeys/k"`
+    ///   `"https://my-vault.vault.azure.net/keys/key-name/version"`
     /// `None` = default (no per-project KMS routing; provider falls back to
     /// its global default behaviour).
     pub kms_key_ref: Option<String>,

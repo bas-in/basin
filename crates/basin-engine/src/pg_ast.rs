@@ -8,7 +8,7 @@
 //!
 //! Phase 5.13.C: the `BASIN_PG_QUERY` env-gate has been removed. libpg_query
 //! now unconditionally parses every incoming statement at the top of
-//! [`crate::executor::execute`]; unsupported kinds are rejected with
+//! `crate::executor::execute`; unsupported kinds are rejected with
 //! SQLSTATE 0A000 before sqlparser sees them, and all textual prescreens
 //! have been migrated to typed AST matches (Phase 5.13.B). sqlparser
 //! remains only for DML/DDL that needs its AST downstream.
@@ -436,8 +436,8 @@ pub(crate) fn check_parse_depth(sql: &str) -> Result<()> {
 /// ADR 0014 lands a dedicated `BasinError::Parse` variant Phase 2 will
 /// switch over.
 ///
-/// A recursion-depth guard ([`check_parse_depth`]) is applied before handing
-/// the SQL to libpg_query. Queries with more than [`MAX_PARSE_DEPTH`] nested
+/// A recursion-depth guard (`check_parse_depth`) is applied before handing
+/// the SQL to libpg_query. Queries with more than `MAX_PARSE_DEPTH` nested
 /// parentheses are rejected with a clean parse error rather than overflowing
 /// the stack (remote DoS protection, SQLSTATE 42601).
 pub fn parse(sql: &str) -> Result<ParseTree> {

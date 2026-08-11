@@ -89,7 +89,7 @@ impl HnswIndexBuilder {
     }
 
     /// Set the query-time `ef_search` (candidate-list size). Larger → higher
-    /// recall, higher latency. `None` applies [`DEFAULT_EF_SEARCH`].
+    /// recall, higher latency. `None` applies `DEFAULT_EF_SEARCH`.
     pub fn with_ef_search(mut self, ef_search: Option<usize>) -> Self {
         self.ef_search = ef_search;
         self

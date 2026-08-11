@@ -881,7 +881,7 @@ impl Engine {
 
     /// O(1) lookup: is `project`'s recent query rate above the noisy
     /// threshold? Returns `false` for projects we've never seen. See
-    /// [`crate::noisy_detector`] for the threshold and decay constants.
+    /// `crate::noisy_detector` for the threshold and decay constants.
     ///
     /// This is a *hint* the engine consumes when constructing a session
     /// (to downshift `target_partitions`); it is also intended to be read
@@ -1755,7 +1755,7 @@ impl ProjectSession {
     ///   4. **LISTEN subscriptions** (`UNLISTEN *`) — drop every subscription
     ///      and any transaction-buffered NOTIFY payloads.
     ///   5. **Session GUCs** (`RESET ALL`) — every settable GUC back to its
-    ///      process default via [`crate::session::SessionState::reset_gucs`]
+    ///      process default via `crate::session::SessionState::reset_gucs`
     ///      (search_path, statement_timeout, lock_timeout,
     ///      idle_in_transaction_session_timeout, basin.synchronous_commit,
     ///      pg_trgm thresholds, …).

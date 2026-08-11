@@ -29,7 +29,7 @@
 //!
 //! ## Correctness contract
 //!
-//! The shadow column is written by [`materialize_promoted_columns`] using
+//! The shadow column is written by `materialize_promoted_columns` using
 //! exactly the same extraction logic as `json_get_text`/`raw_get_key`:
 //!
 //! * Top-level object key lookup via `RawJson::member` (scan-order, last-wins

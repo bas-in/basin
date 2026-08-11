@@ -61,7 +61,7 @@ tokio::task_local! {
     static BACKGROUND_IO: bool;
 }
 
-/// Run `f` with its object-store RPCs marked background (see [`BACKGROUND_IO`]).
+/// Run `f` with its object-store RPCs marked background (see `BACKGROUND_IO`).
 /// Wrap compaction / merge work in this so its I/O yields to live ingest and
 /// ingest throughput stays flat as a table grows.
 pub async fn with_background_io<F>(f: F) -> F::Output

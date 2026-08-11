@@ -5,10 +5,10 @@
 //! Three functions and one debug helper that together cover the bulk of
 //! production `pg_trgm` use (typo tolerance, autocomplete, dedup):
 //!
-//! - [`similarity`] — `pg_trgm.similarity(a, b) -> real`. Jaccard index
+//! - [`similarity`](fn@similarity) — `pg_trgm.similarity(a, b) -> real`. Jaccard index
 //!   over trigram sets, in `[0.0, 1.0]`.
 //! - [`word_similarity`] — `pg_trgm.word_similarity(a, b) -> real`. Best
-//!   per-word match (see module docs in [`similarity`] for the exact
+//!   per-word match (see module docs in [`similarity`](mod@similarity) for the exact
 //!   definition vs. Postgres).
 //! - [`show_trgm`] — `pg_trgm.show_trgm(t) -> text[]`. Debug helper:
 //!   returns the trigram set as a `Vec<String>` so test cards can print

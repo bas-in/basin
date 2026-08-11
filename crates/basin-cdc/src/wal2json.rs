@@ -133,7 +133,7 @@ pub struct Wal2JsonChange {
     pub oldkeys: Option<OldKeysJson>,
 }
 
-/// Public mirror of [`OldKeys`] so [`Wal2JsonChange`] can carry it in its
+/// Public mirror of `OldKeys` so [`Wal2JsonChange`] can carry it in its
 /// public field while keeping the parallel-array construction private.
 #[derive(Serialize)]
 pub struct OldKeysJson {

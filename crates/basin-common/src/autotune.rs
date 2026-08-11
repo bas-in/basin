@@ -575,12 +575,12 @@ const SUSTAIN_TICKS: u32 = 2;
 /// three mechanisms, all keyed off a *smoothed* (EWMA) throughput:
 ///
 /// 1. **Smoothing.** Decisions use an EWMA of committed-rows/s
-///    ([`EWMA_ALPHA`]), not raw consecutive samples, so per-tick jitter does
+///    (`EWMA_ALPHA`), not raw consecutive samples, so per-tick jitter does
 ///    not register as a trend.
 /// 2. **Clear-margin, sustained gate to move.** The controller steps *away*
 ///    from its current fan-out only when the smoothed throughput beats the
-///    best-seen-at-the-current-fanout by [`CLEAR_MARGIN`] for at least
-///    [`SUSTAIN_TICKS`] consecutive evaluations. A move that does not clearly,
+///    best-seen-at-the-current-fanout by `CLEAR_MARGIN` for at least
+///    `SUSTAIN_TICKS` consecutive evaluations. A move that does not clearly,
 ///    repeatably help is not taken (and an explored move that fails to pay off
 ///    is unwound by mechanism 3).
 /// 3. **Anchor to the derived baseline.** The controller remembers the derived

@@ -11,12 +11,12 @@
 //! project's writer lease and hot tier; only it can serve a write or a
 //! strongly-consistent read. This module enforces that:
 //!
-//! * [`region_write_gate`] / [`region_write_gate_insert`] — run on the WRITE
+//! * `region_write_gate` / `region_write_gate_insert` — run on the WRITE
 //!   path. For a project homed elsewhere they either delegate to a registered
 //!   [`WriteForwarder`] (the home region executes the statement and returns its
 //!   result) or, with no forwarder, raise [`BasinError::WrongRegion`] — the
 //!   fail-loud default ADR 0009 specifies for forwarding-disabled deployments.
-//! * [`region_read_guard`] — run on the READ path. `basin.read_tier = 'primary'`
+//! * `region_read_guard` — run on the READ path. `basin.read_tier = 'primary'`
 //!   (the default) requires the home region (only it has the live tail);
 //!   `'lagging'` is allowed anywhere (it reads flushed, S3-replicated cold
 //!   data and accepts staleness).

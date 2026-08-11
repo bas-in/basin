@@ -60,8 +60,8 @@ pub struct DropInboundWebhookIntent {
     pub if_exists: bool,
 }
 
-/// Recognise `CREATE INBOUND WEBHOOK <name> [WITH SECRET '<hex>'] EXECUTE
-/// <body>`. Returns the parsed intent on a match, `None` when the
+/// Recognise `CREATE INBOUND WEBHOOK <name> [WITH SECRET '<hex>'] EXECUTE <body>`.
+/// Returns the parsed intent on a match, `None` when the
 /// statement is something else, or `Err` on a malformed match.
 pub fn match_create_inbound_webhook(sql: &str) -> Result<Option<CreateInboundWebhookIntent>> {
     let trimmed = sql.trim().trim_end_matches(';').trim();

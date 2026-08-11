@@ -185,7 +185,7 @@ impl LiveCounts {
 
 /// Decrements the per-project live-connection counter on drop.
 ///
-/// Returned by [`LiveCounts::try_increment`] on success. Must be kept alive
+/// Returned by `LiveCounts::try_increment` on success. Must be kept alive
 /// for the full lifetime of the connection; dropping it (or letting it be
 /// cancelled) decrements the count.
 pub struct ConnectionGuard {

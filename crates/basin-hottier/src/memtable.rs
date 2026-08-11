@@ -7,7 +7,7 @@
 //!
 //! # MVCC version chains (S4 row tier)
 //!
-//! Each key maps to a [`MemEntry`] holding a small **version chain** rather than
+//! Each key maps to a `MemEntry` holding a small **version chain** rather than
 //! a single value: the newest version inline, older versions in an overflow
 //! `Vec` (empty — no allocation — for a never-overwritten key). Overwriting a
 //! key *pushes* a new newest version and demotes the prior one into the chain

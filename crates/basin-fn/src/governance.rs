@@ -83,7 +83,7 @@ const EPOCH_TICK_MS: u64 = 100;
 #[derive(Clone, Debug)]
 pub struct FunctionCaps {
     /// Max epoch ticks per invocation. The epoch increments every
-    /// [`EPOCH_TICK_MS`] (≈ 100 ms), so a value of 50 ≈ 5 s of CPU before
+    /// `EPOCH_TICK_MS` (≈ 100 ms), so a value of 50 ≈ 5 s of CPU before
     /// the trap fires.
     pub cpu_ticks: u64,
     /// Max linear-memory bytes the guest may allocate.

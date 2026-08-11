@@ -8,7 +8,7 @@
 //! 1. **`BASIN_QUERY_COST_LIMIT_ROWS` off**: a noisy project runs an unbounded
 //!    cartesian self-join; quiet projects observe their p99 climb past the
 //!    5x bar. Currently records the gap; the fix is in W6's scope.
-//! 2. **Catalog Postgres = single Mutex<Client>**: every noisy project DDL
+//! 2. **Catalog Postgres = single `Mutex<Client>`**: every noisy project DDL
 //!    contends with every quiet project `load_table`. We surface the
 //!    contention by issuing N parallel `CREATE INDEX` against the noisy
 //!    project while the quiet projects point-query.

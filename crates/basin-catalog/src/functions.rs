@@ -113,7 +113,7 @@ pub struct SqlFunctionDef {
     /// `CREATE OR REPLACE FUNCTION` so callers can detect a redeploy
     /// (e.g. CDN invalidation, stale-component eviction in the runtime
     /// registry). Starts at `1`; historic serialised payloads that
-    /// pre-date this field deserialise to `1` via [`default_one`] (so a
+    /// pre-date this field deserialise to `1` via `default_one` (so a
     /// migrated row looks like a fresh first registration rather than a
     /// nonsensical version `0`).
     #[serde(default = "default_one")]

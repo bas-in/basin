@@ -116,9 +116,10 @@ impl FileFormat {
     }
 }
 
-/// Knobs for [`write_batch_with_options`]. All defaults preserve the legacy
-/// behaviour exactly, so callers that don't care about bloom filters can
-/// keep using [`write_batch`] without churn.
+/// Knobs for [`Storage::write_batch_with_options`](crate::Storage::write_batch_with_options).
+/// All defaults preserve the legacy behaviour exactly, so callers that don't
+/// care about bloom filters can keep using
+/// [`Storage::write_batch`](crate::Storage::write_batch) without churn.
 #[derive(Clone, Debug, Default)]
 pub struct WriteOptions {
     /// On-disk format for this write. Default is [`FileFormat::Vortex`]
@@ -175,7 +176,7 @@ pub struct WriteOptions {
 }
 
 /// Vortex encode cascade selector (#92). Consumed by
-/// [`crate::vortex_format::encode_with_mode`]; `basin_engine` selects it via
+/// `crate::vortex_format::encode_with_mode`; `basin_engine` selects it via
 /// [`WriteOptions::encoding_mode`] (always `Fast` for non-tx direct INSERT,
 /// `Best` for in-tx INSERT, compaction, and hot-tier flush).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

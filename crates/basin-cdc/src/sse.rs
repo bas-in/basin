@@ -337,7 +337,7 @@ pub async fn cdc_stream_handler(
 ///
 /// Identical auth / cross-project isolation / replay-then-live / cursor-gap
 /// machinery as [`cdc_stream_handler`]; only the per-record frame differs
-/// ([`wal2json_frame_for`]). A `wal2json`-shaped consumer parses each `data:`
+/// (`wal2json_frame_for`). A `wal2json`-shaped consumer parses each `data:`
 /// frame as one `{"action":"I|U|D", ...}` object.
 #[axum::debug_handler]
 pub async fn cdc_wal2json_handler(

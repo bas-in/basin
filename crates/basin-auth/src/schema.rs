@@ -186,7 +186,7 @@ pub(crate) fn validate_schema_ident(s: &str) -> Result<()> {
 
 /// Run every `CREATE TABLE IF NOT EXISTS` statement. Safe to call
 /// repeatedly; the prefix is validated before interpolation by
-/// [`validate_schema_ident`].
+/// `validate_schema_ident`.
 ///
 /// The `schema` argument is *not* emitted as a Postgres schema (basin
 /// engine doesn't support `CREATE SCHEMA`); instead it becomes the prefix

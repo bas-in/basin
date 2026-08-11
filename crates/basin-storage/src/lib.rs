@@ -286,7 +286,7 @@ pub fn resolve_project_state_ttl_secs() -> Option<u64> {
 
 /// Resolve the scheduler's global RPC budget. `BASIN_STORAGE_GLOBAL_BUDGET`,
 /// when present and parseable to a nonzero `usize`, overrides the default
-/// computed by [`scheduler::default_global_budget`].
+/// computed by `scheduler::default_global_budget`.
 pub fn resolve_global_budget() -> usize {
     if let Ok(v) = std::env::var("BASIN_STORAGE_GLOBAL_BUDGET") {
         if let Ok(n) = v.parse::<usize>() {
@@ -576,7 +576,7 @@ fn memo_insert_bounded<V>(
     map.insert(key, val);
 }
 
-/// Best-effort counters for the read path. See [`Inner::read_counters`].
+/// Best-effort counters for the read path. See `Inner::read_counters`.
 #[derive(Debug, Default)]
 pub struct ReadCounters {
     pub row_groups_considered: AtomicU64,
@@ -727,7 +727,7 @@ const DEFAULT_PARQUET_META_CACHE_CAP: usize = 131_072;
 
 /// Resolve the Parquet footer cache capacity, honoring
 /// `BASIN_STORAGE_PARQUET_META_CACHE_CAP` when present and parseable to a
-/// positive `usize`. Falls back to [`DEFAULT_PARQUET_META_CACHE_CAP`].
+/// positive `usize`. Falls back to `DEFAULT_PARQUET_META_CACHE_CAP`.
 pub fn resolve_parquet_meta_cache_cap() -> usize {
     if let Ok(v) = std::env::var("BASIN_STORAGE_PARQUET_META_CACHE_CAP") {
         if let Ok(n) = v.parse::<usize>() {
@@ -763,7 +763,7 @@ const DEFAULT_VORTEX_FOOTER_CACHE_CAP: usize = 131_072;
 
 /// Resolve the Vortex footer cache capacity, honoring
 /// `BASIN_STORAGE_VORTEX_FOOTER_CACHE_CAP` when present and parseable to a
-/// positive `usize`. Falls back to [`DEFAULT_VORTEX_FOOTER_CACHE_CAP`].
+/// positive `usize`. Falls back to `DEFAULT_VORTEX_FOOTER_CACHE_CAP`.
 pub fn resolve_vortex_footer_cache_cap() -> usize {
     if let Ok(v) = std::env::var("BASIN_STORAGE_VORTEX_FOOTER_CACHE_CAP") {
         if let Ok(n) = v.parse::<usize>() {
@@ -789,7 +789,7 @@ const DEFAULT_DATA_FILE_STATS_CACHE_CAP: usize = 131_072;
 
 /// Resolve the per-file data-file stats cache capacity, honoring
 /// `BASIN_STORAGE_DATA_FILE_STATS_CACHE_CAP` when present and parseable to a
-/// positive `usize`. Falls back to [`DEFAULT_DATA_FILE_STATS_CACHE_CAP`].
+/// positive `usize`. Falls back to `DEFAULT_DATA_FILE_STATS_CACHE_CAP`.
 pub fn resolve_data_file_stats_cache_cap() -> usize {
     if let Ok(v) = std::env::var("BASIN_STORAGE_DATA_FILE_STATS_CACHE_CAP") {
         if let Ok(n) = v.parse::<usize>() {
@@ -1638,7 +1638,7 @@ impl Storage {
     }
 
     /// #36 (Stage 2a) — whether the DataFusion scan path should register the
-    /// striping-aware [`stripe_router_store::StripeRouterStore`] for `project`
+    /// striping-aware `stripe_router_store::StripeRouterStore` for `project`
     /// instead of the plain single store. True ONLY when the pool is enabled
     /// AND the project has a warmed stripe wider than one bucket AND it is not
     /// a BYO project. Every other case keeps today's single-store registration
@@ -1666,7 +1666,7 @@ impl Storage {
 
     /// #36 (Stage 2a) — the object store the DataFusion scan should register
     /// under `basin://engine/` for `project`. When [`should_stripe_scan`](Self::should_stripe_scan)
-    /// holds, this is a [`stripe_router_store::StripeRouterStore`] that
+    /// holds, this is a `stripe_router_store::StripeRouterStore` that
     /// re-derives each file's partition→bucket at I/O time (Scheme C) and
     /// unions LISTs across the stripe; otherwise it is exactly
     /// [`project_object_store`](Self::project_object_store) (today's behaviour, byte-identical).
@@ -1950,7 +1950,7 @@ impl Storage {
     /// records zero files.
     ///
     /// This is a STATS/bloom ENRICHMENT primitive, not an authoritative file
-    /// index — see [`catalog_live_data_files`](Self::catalog_live_data_files)
+    /// index — see `catalog_live_data_files`
     /// for why the catalog cannot stand in for the object-store LIST when
     /// determining which files EXIST. The streaming PRIMARY-KEY enforcement
     /// (`constraints::enforce_pk_on_insert`) LISTs for the authoritative file

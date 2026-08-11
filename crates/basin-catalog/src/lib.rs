@@ -1917,7 +1917,7 @@ pub trait Catalog: Send + Sync {
     /// [`basin_common::BasinError::Catalog`] when the name collides
     /// with an existing enum / domain for the same project, and
     /// [`basin_common::BasinError::InvalidSchema`] when the label
-    /// list fails [`enums::validate_new`]. Default impl returns
+    /// list fails `enums::validate_new`. Default impl returns
     /// `Internal("not implemented")` so non-default backends opt in
     /// explicitly.
     async fn register_enum_type(&self, def: EnumTypeDef) -> Result<()> {

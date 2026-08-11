@@ -52,7 +52,7 @@
 //!
 //! # Memory budget
 //!
-//! Per-file posting count is capped at [`DEFAULT_POSTING_BUDGET`] entries
+//! Per-file posting count is capped at `DEFAULT_POSTING_BUDGET` entries
 //! (env-tunable via `BASIN_GIN_POSTING_BUDGET`, shared with the FTS
 //! registry).  On overflow the file is marked un-indexed and falls back
 //! to the bloom registry (which is registered separately by the existing
@@ -268,7 +268,7 @@ struct RegKey {
 
 /// Process-wide JSONB containment posting-list registry.
 ///
-/// One [`AtomPostingList`] per `(project, table, col)`.  Mirrors the
+/// One `AtomPostingList` per `(project, table, col)`.  Mirrors the
 /// concurrency layout of [`super::gin_tsvector::GinTsvectorRegistry`]: an
 /// outer mutex over the registry map plus a per-column mutex over the
 /// posting list itself.

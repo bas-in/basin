@@ -57,7 +57,7 @@ pub struct SequenceDef {
     /// call hits the catalog state. `>1` lets the implementation hand out
     /// `cache_size` values from in-memory and refill in one catalog step.
     pub cache_size: u64,
-    /// `false` (the default) errors with [`SequenceError::Exhausted`] when
+    /// `false` (the default) errors with `SequenceError::Exhausted` when
     /// the next value would cross `max_value` (positive step) or `min_value`
     /// (negative step). `true` wraps to the other end.
     pub cycle: bool,

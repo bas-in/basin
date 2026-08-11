@@ -75,7 +75,7 @@ type TablePathCounts = HashMap<(String, String), PathEntry>;
 /// Process-wide JSONB path access tracker.
 ///
 /// Cheap to create (a `RwLock`-guarded `HashMap`).  Intended to be
-/// constructed once inside [`crate::EngineInner`] and shared via `Arc`.
+/// constructed once inside `crate::EngineInner` and shared via `Arc`.
 pub struct JsonbPromotionRegistry {
     inner: RwLock<HashMap<(ProjectId, TableName), TablePathCounts>>,
 }

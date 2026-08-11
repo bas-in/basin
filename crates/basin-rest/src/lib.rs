@@ -60,7 +60,7 @@
 //! `/rest/v1/<table>` or POST `/rest/v1/rpc/:fn` receive an Arrow IPC stream
 //! instead of JSON. The schema is preserved exactly (no JSON round-trip losses
 //! for i64 extremes, timestamps, or binary types). Pagination state is in
-//! response headers — see [`arrow_ipc`] for the header contract.
+//! response headers — see `arrow_ipc` for the header contract.
 //!
 //! ## What's not implemented yet
 //!

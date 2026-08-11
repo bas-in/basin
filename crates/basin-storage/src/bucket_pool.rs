@@ -362,7 +362,7 @@ impl BucketPool {
     }
 
     /// Register the storage layer's configured root key prefix (e.g. `mn5`) so
-    /// the [`Self::has_primary_data`] probe lists `{root}/projects/{project}/…`
+    /// the `Self::has_primary_data` probe lists `{root}/projects/{project}/…`
     /// — the key space the storage layer actually writes — instead of a
     /// root-less `projects/{project}/…` that would never match real data when a
     /// root prefix is configured. The storage layer calls this when the pool is

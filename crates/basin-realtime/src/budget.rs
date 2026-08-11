@@ -8,16 +8,16 @@
 //! - A single shared `tokio::sync::broadcast` cluster (the [`ChannelRegistry`](crate::ChannelRegistry)
 //!   in `lib.rs`) for all projects — no per-project channel.
 //! - A [`DashMap<ProjectId, ProjectBudget>`] lazily allocating one
-//!   [`ProjectBudget`] per project *that has actually published an event*.
+//!   `ProjectBudget` per project *that has actually published an event*.
 //!   Idle projects pay zero.
-//! - Each [`ProjectBudget`] holds a single `AtomicU64` (`bytes_in_flight`) and
+//! - Each `ProjectBudget` holds a single `AtomicU64` (`bytes_in_flight`) and
 //!   a `hard_cap: u64`. No semaphore pool; no per-subscriber allocation.
 //!
 //! # Hot path
 //!
 //! `BudgetTracker::try_reserve(project, size)` does:
 //!
-//! 1. Lazy-insert a [`ProjectBudget`] into the `DashMap` if absent
+//! 1. Lazy-insert a `ProjectBudget` into the `DashMap` if absent
 //!    (one-shot allocation per new project, amortised O(1)).
 //! 2. CAS loop on `bytes_in_flight`: add `size` if the result stays ≤
 //!    `hard_cap`; otherwise return `Err(BudgetError::BufferFull)`.

@@ -12,7 +12,7 @@
 //! ## Mounting
 //!
 //! ```ignore
-//! let catalog: Arc<dyn basin_catalog::Catalog> = …;
+//! let catalog: Arc<dyn basin_catalog::Catalog> = todo!();
 //! let app = axum::Router::new()
 //!     .nest("/iceberg", basin_iceberg_rest::router(catalog));
 //! ```
