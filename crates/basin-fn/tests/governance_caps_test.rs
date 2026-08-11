@@ -503,6 +503,29 @@ const NOOP_COMPONENT_WAT: &str = r#"
 /// when a `ProjectCounterRegistry` is attached, `ComponentHarness::run_with`
 /// bumps `cpu_micros_total` for the invoking project and keeps cross-project
 /// counts isolated.
+///
+/// The property is **per-project attribution**: a project's meter moves when,
+/// and only when, that project invokes. This used to be checked by running 3
+/// invocations on A, 1 on B, and asserting `A > B` — a proxy, and a poor one:
+/// on a loaded host a single invocation on B can out-cost three on A (the
+/// meter spans the per-project semaphore wait), so the assertion was a
+/// coin-flip about the host rather than a statement about attribution. Every
+/// check below compares a project's meter against *its own* earlier value, so
+/// no cross-project timing comparison remains:
+///
+/// * a project that has invoked nothing is not metered at all — it is not
+///   even registered, so `snapshot` is `None`;
+/// * a project's meter moves off zero across its own invocations;
+/// * a project's meter is byte-for-byte unchanged across another project's
+///   invocations, in **both** directions.
+///
+/// The surviving inequalities are one-sided under load: host noise can only
+/// grow a project's own meter, never shrink it, and a single invocation
+/// cannot bill 0 micros because the metered span covers a cross-runtime
+/// round-trip plus a wasmtime instantiation. There is no op count to pin here
+/// — unlike the engine's `Session::execute`, `run_with` records micros only
+/// and never calls `record_op` — so exactness comes from the unchanged-across-
+/// the-other-project checks instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn component_harness_run_with_bumps_cpu_micros_per_project() {
     use basin_common::telemetry::ProjectCounterRegistry;
@@ -527,8 +550,20 @@ async fn component_harness_run_with_bumps_cpu_micros_per_project() {
 
     let a = ProjectId::new();
     let b = ProjectId::new();
+    // Never invoked, on purpose: must never be billed.
+    let idle = ProjectId::new();
 
-    // Three calls on A, one on B.
+    // Nothing has run: no project is metered.
+    assert!(
+        registry.snapshot(&a).is_none(),
+        "A was metered before invoking anything"
+    );
+    assert!(
+        registry.snapshot(&b).is_none(),
+        "B was metered before invoking anything"
+    );
+
+    // ── A invokes three times ───────────────────────────────────────────
     for _ in 0..3 {
         let res = harness
             .run_with(a, InvocationContext::mock())
@@ -536,28 +571,66 @@ async fn component_harness_run_with_bumps_cpu_micros_per_project() {
             .expect("noop guest returns None");
         assert!(res.is_none());
     }
+    let a1 = registry
+        .snapshot(&a)
+        .expect("A is metered after its own invocations");
+    assert!(
+        a1.cpu_micros_total > 0,
+        "A's meter did not move across its own 3 invocations"
+    );
+
+    // B has invoked nothing, so A's work must not have been billed to it.
+    assert!(
+        registry.snapshot(&b).is_none(),
+        "A's invocations leaked {:?} into B, which has invoked nothing",
+        registry.snapshot(&b)
+    );
+
+    // ── B invokes once: A's meter must not move ─────────────────────────
     harness
         .run_with(b, InvocationContext::mock())
         .await
         .expect("noop guest returns None on B");
-
-    let snap_a = registry.snapshot(&a).expect("A has snapshot");
-    let snap_b = registry.snapshot(&b).expect("B has snapshot");
-
-    assert!(
-        snap_a.cpu_micros_total > 0,
-        "A's cpu_micros must be non-zero after 3 invocations"
+    let a2 = registry.snapshot(&a).expect("A is still metered");
+    assert_eq!(
+        a2.cpu_micros_total,
+        a1.cpu_micros_total,
+        "B's invocation leaked {} micros into A",
+        a2.cpu_micros_total - a1.cpu_micros_total
     );
+    let b1 = registry
+        .snapshot(&b)
+        .expect("B is metered after its own invocation");
     assert!(
-        snap_b.cpu_micros_total > 0,
-        "B's cpu_micros must be non-zero after 1 invocation"
+        b1.cpu_micros_total > 0,
+        "B's meter did not move across its own invocation"
     );
-    // Isolation: A ran 3x as much work as B, so its meter must exceed B's.
-    // (Generous comparison - wall-clock noise can shrink the gap below 3x.)
+
+    // ── A invokes twice more: A grows by its own work, B stays put ──────
+    for _ in 0..2 {
+        harness
+            .run_with(a, InvocationContext::mock())
+            .await
+            .expect("noop guest returns None");
+    }
+    let a3 = registry.snapshot(&a).expect("A is still metered");
+    let b2 = registry.snapshot(&b).expect("B is still metered");
     assert!(
-        snap_a.cpu_micros_total > snap_b.cpu_micros_total,
-        "A({} micros) should exceed B({} micros) after 3x more invocations",
-        snap_a.cpu_micros_total,
-        snap_b.cpu_micros_total,
+        a3.cpu_micros_total > a2.cpu_micros_total,
+        "A's meter stuck at {} micros across 2 more of its own invocations",
+        a2.cpu_micros_total
+    );
+    assert_eq!(
+        b2.cpu_micros_total,
+        b1.cpu_micros_total,
+        "A's later invocations leaked {} micros into B",
+        b2.cpu_micros_total - b1.cpu_micros_total
+    );
+
+    // A project that never invoked anything is never billed.
+    assert!(
+        registry.snapshot(&idle).is_none(),
+        "an idle project was billed {:?}",
+        registry.snapshot(&idle)
     );
 }
