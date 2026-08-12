@@ -1276,8 +1276,14 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "arrow-select",
+ "basin-common",
  "basin-pgtype",
  "basin-plan",
+ "basin-storage",
+ "futures",
+ "object_store",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

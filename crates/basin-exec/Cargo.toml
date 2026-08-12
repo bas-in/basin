@@ -11,12 +11,24 @@ publish.workspace = true
 # vectorised primitives. That distinction is why the layer is ~10k lines rather
 # than DataFusion's 57k (docs/migration/df-removal/03-physical-operators.md).
 #
-# No DataFusion. No storage yet: the scan operator takes batches from a trait so
-# operators can be tested without object storage.
+# No DataFusion. The scan operator takes batches from a trait (`BatchSource`)
+# so every operator except `storage_source` can be tested without object
+# storage. `storage_source` is the one module allowed to depend on
+# `basin-storage` (plus the tokio/futures plumbing needed to drive its async
+# read path) — see that module's docs for why the dependency is confined
+# there instead of leaking into `scan.rs` or `build.rs`.
 [dependencies]
 basin-pgtype = { workspace = true }
 basin-plan = { workspace = true }
+basin-common = { workspace = true }
+basin-storage = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+object_store = { workspace = true }
+tempfile = { workspace = true }
