@@ -229,3 +229,85 @@ expressions, (c) `numeric` rounding, (d) `timestamp(n)`. See §2.1.
 ## 6. Prioritized fidelity gap table
 
 ## 7. Open questions
+
+## 8. Tests that pinned non-Postgres behaviour
+
+A test that asserts behaviour Postgres does not have is worse than a missing
+test. A missing test *permits* a fix; a wrong test *forbids* one — it converts a
+fidelity gap into a defended invariant, and any engine work built against it
+inherits the defect. This section is the running record of every such site found
+in the suite, what it claimed, what Postgres actually does, and where it now
+stands.
+
+**Verification method.** Every "what Postgres does" row below was confirmed
+against a live server, not from memory:
+
+```
+PostgreSQL 18.2 (Homebrew) on aarch64-apple-darwin24.6.0
+```
+
+Doc citations accompany each rule. Where Basin's engine genuinely disagrees, the
+corrected test is left asserting *Postgres* semantics and marked `#[ignore]`
+with a reason pointing back here. The assertion is never weakened to match the
+engine, and the engine is not changed to chase the test — the point of the
+exercise is to convert a hidden wrong behaviour into a visible, tracked gap.
+
+### 8.1 Reference: the rounding rules, as measured
+
+Float-to-integer and numeric-to-integer casts **both round** — neither
+truncates — but they round *differently*, and conflating them is its own bug:
+
+| Input | `::float8 → bigint` | `::numeric → bigint` |
+|-------|--------------------:|---------------------:|
+| `3.9`  | `4`  | `4`  |
+| `-2.7` | `-3` | `-3` |
+| `0.5`  | `0`  | `1`  |
+| `1.5`  | `2`  | `2`  |
+| `2.5`  | `2`  | `3`  |
+| `-0.5` | `0`  | `-1` |
+| `-1.5` | `-2` | `-2` |
+
+- **float → int: round half to even** (banker's rounding). `0.5 → 0`,
+  `2.5 → 2`. This follows the C library's `rint()`, which honours the current
+  IEEE-754 rounding mode; that mode is round-half-to-even by default.
+- **numeric → int: round half away from zero**. `0.5 → 1`, `2.5 → 3`,
+  `-0.5 → -1`. `numeric` is a decimal type and does not go through `rint()`.
+
+The two agree on every input whose fraction is not exactly `.5`, which is why
+the distinction is easy to miss and easy to get wrong in a shared cast path.
+
+Source: PostgreSQL docs, [§8.1 Numeric Types][pg-numeric] — "When rounding
+values, the `numeric` type rounds ties away from zero, while (on most machines)
+the `real` and `double precision` types round ties to the nearest even number."
+
+[pg-numeric]: https://www.postgresql.org/docs/18/datatype-numeric.html
+
+Neither rule is truncation. `trunc()`, `floor()`, and `ceil()` are the explicit
+functions for that, and a cast is not a call to any of them.
+
+### 8.2 Sites found
+
+_(table filled in as the sweep proceeds; see §8.3 for the running log)_
+
+### 8.3 Sweep log
+
+- Live-Postgres reference table for the sweep (all measured on PG 18.2):
+  - **Integer overflow** — `9223372036854775807::bigint + 1` → `ERROR: bigint
+    out of range`. Out-of-range float→int casts likewise:
+    `CAST(1e20::float8 AS bigint)` → `ERROR: bigint out of range`. Postgres
+    *errors*; Arrow's native arithmetic and cast kernels may wrap or saturate
+    silently.
+  - **Division by zero** — `SELECT 1/0` → `ERROR: division by zero`. Not NULL,
+    not infinity.
+  - **Empty-input aggregates** — over zero rows, `sum()` is NULL, `avg()` is
+    NULL, and only `count()` is `0`.
+  - **NaN ordering** — Postgres sorts `NaN` as **larger than all other float
+    values**, including `Infinity`, and treats `NaN = NaN` as **true** for
+    sort/index purposes. `0.0 = -0.0` is also true.
+  - **Default NULL ordering** — `ORDER BY x` puts NULLs **last**; `ORDER BY x
+    DESC` puts them **first**. (NULLs sort as if larger than everything.)
+  - **varchar over-length** — an explicit cast `'abcdef'::varchar(3)`
+    *truncates* to `abc`, but storing an over-length value into a `varchar(3)`
+    *column* → `ERROR: value too long for type character varying(3)`. The two
+    paths genuinely differ; a test asserting one must not be read as licensing
+    the other.

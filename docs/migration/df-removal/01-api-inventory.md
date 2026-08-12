@@ -685,7 +685,7 @@ either a correctness bug (dropped filters) or a silent 10× regression.
 |---|---:|---|---|---|
 | `datasource::MemTable` (+ `::memory::MemTable`) | 10 + 7 | `session.rs:43`, `prepared.rs:2607`, `executor.rs:13134`, `type_ddl.rs:492`, `generated_cols.rs:103`, `rls.rs:821` | In-memory table for synthetic results, generated-column evaluation, RLS WITH CHECK, DML-CTE describe | MECHANICAL |
 | `datasource::memory::MemorySourceConfig` | 6 + 2 (`datafusion_datasource::memory`) | `query_stats_export.rs:73`, `info_schema_provider.rs:56`, `project_usage_view.rs:51` | Backing source for catalog/system views | MECHANICAL |
-| `datasource::listing::{ListingTable, ListingTableConfig, ListingOptions, ListingTableUrl}` | 4 | `session.rs:40`, built at `session.rs:3227-3244`, `session.rs:3796-3813` | **The primary table registration path** — object-store file listing + Parquet/Vortex scan | **HARD** |
+| `datasource::listing::{ListingTable, ListingTableConfig, ListingOptions, ListingTableUrl}` | 4 | `session.rs:40`, built at `session.rs:3227-3244`, `session.rs:3796-3813` | **The primary table registration path** — object-store file listing + Vortex/Parquet scan | **HARD** |
 | `ListingOptions::with_file_sort_order` | (2 call sites) | `session.rs:3229`, `session.rs:3799` (helper `build_file_sort_order` at `session.rs:3124`) | Declares `basin.sort_by` as the file's natural ordering | **LOAD-BEARING** — this is the input that makes §8's two sort-elision rules fire |
 | `datasource::file_format::FileFormat` | 2 | `session.rs:39`, `vortex_listing_format.rs:66` | Format abstraction — 1 impl at `vortex_listing_format.rs:136` | **HARD** |
 | `datasource::file_format::parquet::ParquetFormat` | 1 | `session.rs:38`, used `session.rs:3094` | Default cold-tier format | **HARD** (see §11.2) |
@@ -915,7 +915,7 @@ needs the built-in node set plus a UDF-call node.
 | `execution::SessionStateDefaults` | 1 | `session.rs:46`, used `session.rs:2766-2770` | `default_table_factories`, `default_file_formats`, `default_expr_planners`, `default_window_functions`, `default_table_functions` | **LOAD-BEARING** (see §11) |
 | `execution::config::SessionConfig` | 1 + 1 inline `::new()` | `session.rs:6865`, `session.rs:2700` | `set_str("datafusion.execution.listing_table_ignore_subdirectory","false")` + `with_target_partitions(1)` (`session.rs:2701-2705`) | MECHANICAL |
 | `execution::runtime_env::RuntimeEnvBuilder` | 1 | `session.rs:45`, used `session.rs:2749-2757` | Per-session runtime: metadata cache + memory pool | MECHANICAL |
-| `execution::cache::cache_manager::CacheManagerConfig` | 2 | `session.rs:44`, `lib.rs:52` | Parquet/Vortex **footer metadata cache** | **LOAD-BEARING** |
+| `execution::cache::cache_manager::CacheManagerConfig` | 2 | `session.rs:44`, `lib.rs:52` | Vortex/Parquet **footer metadata cache** | **LOAD-BEARING** |
 | `execution::cache::cache_manager::FileMetadataCache` | 1 | `lib.rs:52`, constructed `lib.rs:188-190` | Process-wide cache handle, survives session recycling | **LOAD-BEARING** |
 | `execution::cache::DefaultFilesMetadataCache` | 1 | `lib.rs:53` | Size + last_modified validated LRU. Doc at `lib.rs:185-190`: "the dominant cost behind scale regressions at 100k rows / 50 files" | **LOAD-BEARING** |
 | `execution::memory_pool::MemoryPool` | 2 inline | `lib.rs:195`, `lib.rs:521` | Bounded process-wide query memory | **LOAD-BEARING** |

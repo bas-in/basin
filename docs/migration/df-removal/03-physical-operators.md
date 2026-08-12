@@ -353,7 +353,7 @@ answers *for the v1 cut* under the §4 no-spill recommendation.
 
 | Operator | Needed? | Evidence | Est. LOC | Notes |
 |---|---|---|---:|---|
-| **Scan / DataSource** (Parquet + Vortex, file-group fan-out) | **Yes** | executor.rs:10930–11000; `target_partitions_for_bulk_scan` session.rs:303 | 900 | Only operator that is ever multi-partition. Projection + predicate pushdown + row-group selection must survive. |
+| **Scan / DataSource** (Vortex + Parquet, file-group fan-out) | **Yes** | executor.rs:10930–11000; `target_partitions_for_bulk_scan` session.rs:303 | 900 | Only operator that is ever multi-partition. Projection + predicate pushdown + row-group selection must survive. |
 | Row-group-pruned scans (GIN / R-tree / JSONB posting / tombstone-cold) | **Yes — port, not build** | `gin_rowgroup_scan.rs`, `rtree_rowgroup_scan.rs`, `jsonb_posting_scan.rs`, `tombstone_cold_scan.rs` (1425 LOC today) | 250 | Mechanical re-target onto the new trait. Shape the trait to keep this small. |
 | Overlay execs (`TombstoneFilterExec`, `UpdateOverlayExec`, UUID/Point restore) | **Yes — port** | `hot_tombstone.rs:403,544`; `vortex_listing_format.rs:863,991` | 200 | Same: re-target existing 2.7 kLOC. |
 | **Filter** | Yes | universal | 150 | `arrow::compute::filter_record_batch` + selectivity-adaptive batch coalescing. |
