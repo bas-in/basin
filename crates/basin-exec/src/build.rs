@@ -37,6 +37,7 @@ use crate::cte::{CteBuffer, ProjectSet};
 use crate::dml::{ConflictAction, Delete, Insert, MemoryRowSink, RowSink, Update};
 use crate::join::HashJoin;
 use crate::lateral::{InnerFactory, LateralJoin};
+use crate::limit::Limit;
 use crate::operator::{ExecError, Operator};
 use crate::project::{Filter, Project};
 use crate::recursive::{RecursiveCte, RecursiveTermFactory};
@@ -398,21 +399,40 @@ fn build_inner(
             if *with_ties {
                 return Err(BuildError::Unsupported("FETCH … WITH TIES".into()));
             }
-            if skip.is_some() {
-                return Err(BuildError::Unsupported("OFFSET".into()));
-            }
             let fetch = fetch.as_ref().map(|e| bind_outer(e, outer)).transpose()?;
-            let k = match &fetch {
-                Some(e) => const_usize(e)
-                    .ok_or_else(|| BuildError::Unsupported("non-constant LIMIT".into()))?,
-                None => return build_inner(input, tables, dml, budget, ctes, outer),
+            let skip_n = match skip.as_ref().map(|e| bind_outer(e, outer)).transpose()? {
+                Some(e) => Some(
+                    const_usize(&e)
+                        .ok_or_else(|| BuildError::Unsupported("non-constant OFFSET".into()))?,
+                ),
+                None => None,
             };
-            if let LogicalPlan::Sort { input: si, keys } = input.as_ref() {
-                let child = build_inner(si, tables, dml, budget, ctes, outer)?;
-                let keys = bind_sort_keys(keys, outer)?;
-                Ok(Box::new(TopK::new(child, sort_keys(&keys)?, k)))
-            } else {
-                Err(BuildError::Unsupported("LIMIT without ORDER BY".into()))
+            let fetch_n = match &fetch {
+                Some(e) => Some(
+                    const_usize(e)
+                        .ok_or_else(|| BuildError::Unsupported("non-constant LIMIT".into()))?,
+                ),
+                None => None,
+            };
+            if fetch_n.is_none() && skip_n.is_none() {
+                return build_inner(input, tables, dml, budget, ctes, outer);
+            }
+
+            // `ORDER BY … LIMIT` with no offset fuses into a bounded heap, which
+            // is what makes the published numbers for that shape depend on early
+            // termination rather than a full sort. Every other combination —
+            // including an offset, which the heap cannot express — becomes a
+            // streaming Limit over whatever the input already is.
+            match (input.as_ref(), skip_n, fetch_n) {
+                (LogicalPlan::Sort { input: si, keys }, None, Some(k)) => {
+                    let child = build_inner(si, tables, dml, budget, ctes, outer)?;
+                    let keys = bind_sort_keys(keys, outer)?;
+                    Ok(Box::new(TopK::new(child, sort_keys(&keys)?, k)))
+                }
+                _ => {
+                    let child = build_inner(input, tables, dml, budget, ctes, outer)?;
+                    Ok(Box::new(Limit::new(child, skip_n.unwrap_or(0), fetch_n)))
+                }
             }
         }
 

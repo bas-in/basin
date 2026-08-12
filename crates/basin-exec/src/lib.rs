@@ -36,6 +36,7 @@ pub mod dml;
 pub mod eval;
 pub mod join;
 pub mod lateral;
+pub mod limit;
 pub mod operator;
 pub mod project;
 pub mod recursive;
