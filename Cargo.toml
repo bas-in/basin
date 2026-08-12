@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/basin-common",
     "crates/basin-pgtype",
+    "crates/basin-pgcatalog",
     "crates/basin-plan",
     "crates/basin-exec",
     "crates/basin-storage",
@@ -58,6 +59,12 @@ basin-common = { path = "crates/basin-common" }
 # and every UDF signature agree on. Leaf crate — arrow-schema only, no
 # DataFusion, no storage. First increment of ADR 0030.
 basin-pgtype = { path = "crates/basin-pgtype" }
+# pg_catalog as real relations — a SystemView trait that can push predicates
+# into the catalog query, rather than the DataFusion `TableProvider` shims
+# that materialize a whole relation and filter afterward. Depends on
+# basin-pgtype only (plus arrow-array/arrow-schema); no DataFusion, no
+# storage, no tokio. ADR 0030, docs/migration/df-removal/11-pg-catalog-fidelity.md.
+basin-pgcatalog = { path = "crates/basin-pgcatalog" }
 # The owned logical IR: Expr + LogicalPlan, lowered from pg_query and handed
 # to the optimizer. No DataFusion, no storage, no tokio — a plan must be
 # describable without reference to how it runs. ADR 0030.

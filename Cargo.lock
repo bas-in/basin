@@ -1455,6 +1455,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "basin-pgcatalog"
+version = "0.1.10"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "basin-pgtype",
+]
+
+[[package]]
 name = "basin-pgtype"
 version = "0.1.10"
 dependencies = [

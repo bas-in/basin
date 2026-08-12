@@ -1,0 +1,20 @@
+[package]
+name = "basin-pgcatalog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# pg_catalog as real relations, not `TableProvider` shims. The point of this
+# crate is a shape that can push a predicate into the catalog query instead of
+# materializing a whole relation and filtering afterward — see
+# docs/migration/df-removal/11-pg-catalog-fidelity.md §1. Deliberately
+# minimal: basin-pgtype for the OID/type tables, arrow-array/arrow-schema for
+# the RecordBatch every relation returns. No DataFusion, no basin-storage, no
+# tokio — a catalog relation must be describable without reference to how or
+# where it runs.
+[dependencies]
+basin-pgtype = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
