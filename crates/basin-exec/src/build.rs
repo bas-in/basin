@@ -32,6 +32,7 @@ use crate::project::{Filter, Project};
 use crate::scan::{BatchSource, Scan};
 use crate::setop::{Distinct, Empty, SetOp, Values};
 use crate::sort::{Sort, SortKey, TopK};
+use crate::window::{OrderKey, WindowAgg, WindowFunc, WindowSpec};
 
 /// Why a plan could not be turned into operators.
 #[derive(Debug, Clone, PartialEq)]
@@ -346,6 +347,28 @@ pub fn build_with_budget(
             Ok(Box::new(SetOp::new(l, r, *op, *all, budget)?))
         }
 
+        // Every window expression in one node shares a PARTITION BY / ORDER BY,
+        // because the planner groups them that way — one operator per distinct
+        // window, not per expression. The operator requires its input already
+        // sorted by those keys and never re-sorts, so an unsorted input is a
+        // planner bug it will not paper over.
+        LogicalPlan::Window { input, windows } => {
+            let child = build_with_budget(input, tables, budget)?;
+            let (partition_by, order_by) = window_keys(windows)?;
+            let specs = windows
+                .iter()
+                .enumerate()
+                .map(|(i, w)| window_spec(w, &format!("window{i}")))
+                .collect::<Result<Vec<_>, BuildError>>()?;
+            Ok(Box::new(WindowAgg::new(
+                child,
+                partition_by,
+                order_by,
+                specs,
+                budget,
+            )?))
+        }
+
         other => Err(BuildError::Unsupported(plan_kind(other).to_string())),
     }
 }
@@ -477,6 +500,196 @@ fn agg_spec(e: &Expr, alias: &str) -> Result<AggregateSpec, BuildError> {
     }
 }
 
+/// Postgres OIDs for the window functions, from `pg_proc` on a live server.
+///
+/// Ranking and offset functions are true window functions with their own
+/// OIDs; sum/count/min/max/avg are ordinary aggregates used in a window
+/// context and reuse the aggregate OIDs, which is why this falls through to
+/// the aggregate mapping rather than duplicating it.
+fn window_func_of(oid: u32) -> Option<WindowFunc> {
+    Some(match oid {
+        3100 => WindowFunc::RowNumber,
+        3101 => WindowFunc::Rank,
+        3102 => WindowFunc::DenseRank,
+        3106 => WindowFunc::Lag,
+        3108 => WindowFunc::Lead,
+        3110 => WindowFunc::FirstValue,
+        3111 => WindowFunc::LastValue,
+        3112 => WindowFunc::NthValue,
+        2803 => WindowFunc::CountStar,
+        2107 | 2108 | 2111 | 2114 => WindowFunc::Sum,
+        2115 | 2116 | 2120 | 2130 => WindowFunc::Max,
+        2131 | 2132 | 2136 | 2146 => WindowFunc::Min,
+        2100 | 2101 | 2103 | 2105 => WindowFunc::Avg,
+        _ => return None,
+    })
+}
+
+/// The PARTITION BY / ORDER BY shared by every window expression in one node.
+///
+/// They must agree: the operator sorts nothing and computes one partitioning,
+/// so two windows with different keys in one node would silently produce wrong
+/// answers for one of them. Disagreement is reported rather than resolved.
+fn window_keys(windows: &[Expr]) -> Result<(Vec<usize>, Vec<OrderKey>), BuildError> {
+    let mut part: Option<Vec<usize>> = None;
+    let mut ord: Option<Vec<OrderKey>> = None;
+    for w in windows {
+        let Expr::Window {
+            partition_by,
+            order_by,
+            ..
+        } = w
+        else {
+            return Err(BuildError::Unsupported(
+                "non-window expression in a window list".into(),
+            ));
+        };
+        let p = partition_by
+            .iter()
+            .map(|e| column_index(e).ok_or(BuildError::NonColumnKey("PARTITION BY")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let o = order_by
+            .iter()
+            .map(|k| {
+                Ok(OrderKey {
+                    column: column_index(&k.expr)
+                        .ok_or(BuildError::NonColumnKey("window ORDER BY"))?,
+                    descending: k.descending,
+                    nulls_first: k.nulls_first,
+                })
+            })
+            .collect::<Result<Vec<_>, BuildError>>()?;
+        if let Some(prev) = &part {
+            if *prev != p {
+                return Err(BuildError::Unsupported(
+                    "window expressions with differing PARTITION BY in one node".into(),
+                ));
+            }
+        }
+        if let Some(prev) = &ord {
+            let same = prev.len() == o.len()
+                && prev
+                    .iter()
+                    .zip(&o)
+                    .all(|(a, b)| a.column == b.column && a.descending == b.descending);
+            if !same {
+                return Err(BuildError::Unsupported(
+                    "window expressions with differing ORDER BY in one node".into(),
+                ));
+            }
+        }
+        part = Some(p);
+        ord = Some(o);
+    }
+    Ok((part.unwrap_or_default(), ord.unwrap_or_default()))
+}
+
+fn window_spec(e: &Expr, alias: &str) -> Result<WindowSpec, BuildError> {
+    let Expr::Window {
+        func, args, frame, ..
+    } = e
+    else {
+        return Err(BuildError::Unsupported(
+            "non-window expression in a window list".into(),
+        ));
+    };
+    let mut f = window_func_of(func.0.get()).ok_or_else(|| {
+        BuildError::Unsupported(format!("window function with OID {}", func.0.get()))
+    })?;
+    // count(x) counts non-null values; count(*) counts rows. Same OID split as
+    // the aggregate path, and the same consequence if conflated.
+    let arg_col = match args.first() {
+        None => None,
+        Some(a) => {
+            if f == WindowFunc::CountStar {
+                f = WindowFunc::Count;
+            }
+            Some(column_index(a).ok_or(BuildError::NonColumnKey("window argument"))?)
+        }
+    };
+    let offset_col = match args.get(1) {
+        None => None,
+        Some(a) => Some(column_index(a).ok_or(BuildError::NonColumnKey("window offset"))?),
+    };
+    let default_col = match args.get(2) {
+        None => None,
+        Some(a) => Some(column_index(a).ok_or(BuildError::NonColumnKey("window default"))?),
+    };
+    Ok(WindowSpec {
+        func: f,
+        arg_col,
+        offset_col,
+        default_col,
+        nth_col: if f == WindowFunc::NthValue {
+            offset_col
+        } else {
+            None
+        },
+        frame: frame_of(frame)?,
+        alias: alias.to_string(),
+    })
+}
+
+/// Carry the plan's frame across. `None` means the SQL had no explicit frame,
+/// which the operator resolves to Postgres's default — NOT "the whole
+/// partition". With an ORDER BY the default is RANGE UNBOUNDED PRECEDING TO
+/// CURRENT ROW, which is why `last_value(x) OVER (ORDER BY y)` returns the
+/// current row's value rather than the partition's last.
+fn frame_of(f: &basin_plan::WindowFrame) -> Result<Option<crate::window::WindowFrame>, BuildError> {
+    use crate::window::{FrameBound as XB, FrameUnits as XU, WindowFrame as XF};
+    use basin_plan::{FrameBound as PB, FrameUnits as PU};
+
+    let units = match f.units {
+        PU::Rows => XU::Rows,
+        PU::Range => XU::Range,
+        PU::Groups => XU::Groups,
+    };
+
+    // A frame offset is a plan-time constant here, matching how sort keys are
+    // resolved rather than evaluated. ROWS and GROUPS count rows and peer
+    // groups; RANGE's offset is in the ORDER BY column's own unit, so an
+    // INTERVAL bound against a timestamp is not representable as an f64 and is
+    // refused rather than silently coerced into a wrong window.
+    let bound = |b: &PB| -> Result<XB, BuildError> {
+        Ok(match b {
+            PB::UnboundedPreceding => XB::UnboundedPreceding,
+            PB::CurrentRow => XB::CurrentRow,
+            PB::UnboundedFollowing => XB::UnboundedFollowing,
+            PB::Preceding(e) => XB::Preceding(offset_of(e, units)?),
+            PB::Following(e) => XB::Following(offset_of(e, units)?),
+        })
+    };
+
+    Ok(Some(XF {
+        units,
+        start: bound(&f.start)?,
+        end: bound(&f.end)?,
+    }))
+}
+
+fn offset_of(
+    e: &Expr,
+    units: crate::window::FrameUnits,
+) -> Result<crate::window::FrameOffset, BuildError> {
+    use crate::window::{FrameOffset, FrameUnits};
+    let n = match e {
+        Expr::Literal(basin_plan::Datum::Int64(v), _) if *v >= 0 => *v as f64,
+        Expr::Literal(basin_plan::Datum::Int32(v), _) if *v >= 0 => *v as f64,
+        Expr::Literal(basin_plan::Datum::Float64(v), _) if *v >= 0.0 => *v,
+        _ => {
+            return Err(BuildError::Unsupported(
+                "window frame offset must be a non-negative constant (INTERVAL bounds not yet \
+                 representable)"
+                    .into(),
+            ))
+        }
+    };
+    Ok(match units {
+        FrameUnits::Rows | FrameUnits::Groups => FrameOffset::Count(n as u64),
+        FrameUnits::Range => FrameOffset::Range(n),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,18 +809,19 @@ mod tests {
     /// instead of errors.
     #[test]
     fn an_unbuildable_plan_names_the_construct() {
-        // Window functions are genuinely unimplemented — Basin has no window
-        // code at all, in either engine. (DISTINCT used to be the example here
-        // and now builds, which is the outcome this test is meant to have.)
-        let plan = LogicalPlan::Window {
-            input: Box::new(scan_plan(vec![ColId(0)], vec![])),
-            windows: vec![],
+        // This test exists to go stale. DISTINCT was the example, then window
+        // functions; both build now. CTEs are the current frontier — when this
+        // fails again, that is the good outcome and the next unimplemented
+        // shape takes its place.
+        let plan = LogicalPlan::CteRef {
+            name: basin_plan::CteId(0),
+            schema: vec![("x".into(), basin_pgtype::PgType::INT8)],
         };
         let err = match build(&plan, &resolver()) {
             Err(e) => e,
-            Ok(_) => panic!("window functions have no operator yet and must not build"),
+            Ok(_) => panic!("CTEs have no operator yet and must not build"),
         };
-        assert_eq!(err, BuildError::Unsupported("window function".into()));
+        assert_eq!(err, BuildError::Unsupported("CTE reference".into()));
     }
 
     #[test]
