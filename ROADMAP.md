@@ -85,6 +85,45 @@ nothing and the ones that are still red.
 
 ---
 
+## In flight — the owned query engine (ADR 0030)
+
+Basin is replacing DataFusion with its own query engine. This is a large,
+long-running programme on `feat/own-engine-remove-datafusion`, recorded here so
+it is visible rather than discovered.
+
+**Why**, in one line: the ceiling DataFusion imposes stopped being about speed
+and became about Postgres fidelity — a 9,546-line string-rewriting layer in
+front of the planner, `pg_catalog` faked through `TableProvider` shims,
+set-returning functions that cannot exist, DML that cannot be a relation, and
+RLS the fast paths can bypass. Full reasoning and the kill criteria are in
+[ADR 0030](./docs/decisions/0030-own-query-engine-remove-datafusion.md); the
+subsystem surveys are in [`docs/migration/df-removal/`](./docs/migration/df-removal/).
+
+**Size**, measured rather than guessed: ~104k LOC including tests, roughly
+18–30 engineer-months. Optimizer and physical layer came in cheaper than first
+estimated; the function library came in three times more expensive.
+
+**Where it actually is** — around 7% of the engine, with the scaffolding done:
+
+| Piece | State |
+|---|---|
+| Migration map, 16 sections | done |
+| Conformance oracle running in CI | done — gates regressions against a recorded baseline |
+| `basin-pgtype` — Postgres types, typmods, casts, operators | done |
+| `basin-plan` — IR, lowering from `pg_query`, schema inference, `EXPLAIN` | done |
+| Optimizer — projection pruning, filter pushdown, fixpoint driver | partial |
+| `basin-exec` — scan, filter, project, aggregate, join, sort, set ops, window, CTE, SRF | partial |
+| Reads real Vortex and Parquet files | done |
+| **A client query reaching the owned engine** | **not yet** |
+| `WITH RECURSIVE`, DML, LATERAL, 249 UDFs, `pg_catalog` relations | not started |
+
+**Nothing here changes what Basin does today.** DataFusion is removed last, so
+the branch stays green at every commit and the final change is one line of
+`Cargo.toml`. The governing metric is the fallback rate once queries can route
+to the owned path: DataFusion comes out when it reaches zero, not on a date.
+
+---
+
 ## After v0.1 — likely, not promised
 
 Documented ideas with an obvious pull, listed so they are not lost. None of
