@@ -33,6 +33,8 @@ pub mod aggregate;
 pub mod eval;
 pub mod join;
 pub mod operator;
+pub mod project;
+pub mod scan;
 pub mod sort;
 
 pub use operator::{ExecError, Operator};
