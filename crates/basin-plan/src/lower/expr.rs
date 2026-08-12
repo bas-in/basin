@@ -33,11 +33,15 @@
 //! `"OR"`, `"NOT"` that never collide with a real `pg_operator.oprname` (all of
 //! which are made of punctuation).
 
-use basin_pgtype::PgType;
-use pg_query::protobuf::{node::Node as NodeEnum, AConst, AExpr, AExprKind, BoolExpr, BoolExprType, Node};
+use basin_pgtype::{oid, typmod, PgType};
+use pg_query::protobuf::{
+    node::Node as NodeEnum, AConst, AExpr, AExprKind, BoolExpr, BoolExprType, FuncCall, Node,
+    SubLink, TypeName,
+};
 
-use crate::expr::{ColumnRef, Datum, Expr, OpId};
+use crate::expr::{ColumnRef, Datum, Expr, FuncId, OpId, SortKey, SubqueryKind, Subscript};
 use crate::lower::LowerError;
+use crate::LogicalPlan;
 
 // ─── Resolver seams ──────────────────────────────────────────────────────
 
@@ -62,12 +66,51 @@ pub trait OperatorResolver {
     fn resolve(&self, name: &str, left: Option<PgType>, right: PgType) -> Option<OpId>;
 }
 
+/// Which of `pg_proc`'s call shapes a resolved function name is. Postgres
+/// itself determines this from `pg_proc.prokind`, not from call-site syntax
+/// alone — `sum(x)` and `upper(x)` are indistinguishable at the parse-tree
+/// level without a catalog to say which one is an aggregate. A real
+/// `FunctionResolver` reports it; a mock can hardcode it per test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FuncKind {
+    Scalar,
+    Aggregate,
+    /// A dedicated window function (`rank()`, `row_number()`, ...). Any
+    /// `Aggregate` can also appear with `OVER` — that case is driven by the
+    /// presence of the `OVER` clause, not by this variant.
+    Window,
+    SetReturning,
+}
+
+/// Resolves a (possibly schema-qualified) function name and argument types
+/// to a `pg_proc` entry, the same shape of problem as [`OperatorResolver`]
+/// and for the same reason: `pg_proc` does not exist yet either, and
+/// matching function names as strings is exactly what `pg_operators.rs`
+/// does today for functions it special-cases.
+pub trait FunctionResolver {
+    fn resolve(&self, name: &[String], args: &[PgType]) -> Option<(FuncId, FuncKind)>;
+}
+
+/// Lowers a subquery's body (a `SelectStmt` node) to a [`LogicalPlan`].
+///
+/// Full `SELECT` lowering (`lower::select`) is a separate, larger increment
+/// than scalar-expression lowering and does not exist yet. A trait — rather
+/// than lowering subqueries inline in this file — is what keeps this module
+/// testable today (a mock can return a fixed `LogicalPlan::Values` or an
+/// `Unsupported` error) and lets the real implementation plug in later
+/// without this file changing.
+pub trait SubqueryLowerer {
+    fn lower(&self, subselect: &Node) -> Result<LogicalPlan, LowerError>;
+}
+
 /// Everything a scalar-expression lowering pass needs that isn't yet a real
 /// catalog. Bundled into one struct purely for call-site ergonomics — each
 /// field is exactly one of the trait seams documented above.
 pub struct LowerCtx<'a> {
     pub columns: &'a dyn ColumnResolver,
     pub operators: &'a dyn OperatorResolver,
+    pub functions: &'a dyn FunctionResolver,
+    pub subqueries: &'a dyn SubqueryLowerer,
 }
 
 /// Lower one `pg_query` expression node into an [`Expr`].
@@ -85,6 +128,13 @@ pub fn lower_expr(node: &Node, ctx: &LowerCtx) -> Result<Expr, LowerError> {
         Some(NodeEnum::BooleanTest(bt)) => lower_boolean_test(bt, ctx),
         Some(NodeEnum::CaseExpr(ce)) => lower_case_expr(ce, ctx),
         Some(NodeEnum::CoalesceExpr(coa)) => lower_coalesce_expr(coa, ctx),
+        Some(NodeEnum::TypeCast(tc)) => lower_type_cast(tc, ctx),
+        Some(NodeEnum::FuncCall(fc)) => lower_func_call(fc, ctx),
+        Some(NodeEnum::SubLink(sl)) => lower_sub_link(sl, ctx),
+        Some(NodeEnum::AArrayExpr(arr)) => lower_array_expr(arr, ctx),
+        Some(NodeEnum::RowExpr(re)) => lower_row_expr(re, ctx),
+        Some(NodeEnum::AIndirection(ai)) => lower_a_indirection(ai, ctx),
+        Some(NodeEnum::ParamRef(pr)) => lower_param_ref(pr),
         Some(other) => Err(LowerError::Unsupported(format!(
             "{} is not yet lowered",
             node_kind_name(other)
@@ -94,22 +144,17 @@ pub fn lower_expr(node: &Node, ctx: &LowerCtx) -> Result<Expr, LowerError> {
 }
 
 /// A short, human-readable name for an expression node kind, used only for
-/// precise `Unsupported` messages. Covers the kinds this module's scope
-/// names explicitly plus a handful of common others; anything else falls
-/// back to a generic label rather than failing to compile an error message.
+/// precise `Unsupported` messages. Covers a handful of common kinds outside
+/// this module's scope; anything else falls back to a generic label rather
+/// than failing to compile an error message.
 fn node_kind_name(n: &NodeEnum) -> &'static str {
     match n {
-        NodeEnum::FuncCall(_) => "a function call",
-        NodeEnum::TypeCast(_) => "an explicit cast",
-        NodeEnum::SubLink(_) => "a subquery expression",
-        NodeEnum::AArrayExpr(_) => "an ARRAY[...] literal",
-        NodeEnum::RowExpr(_) => "a ROW(...) literal",
-        NodeEnum::AIndirection(_) => "a subscript or field-access expression",
-        NodeEnum::ParamRef(_) => "a bind parameter",
         NodeEnum::MinMaxExpr(_) => "GREATEST/LEAST",
         NodeEnum::SqlvalueFunction(_) => "a SQL value function (CURRENT_DATE and friends)",
         NodeEnum::GroupingFunc(_) => "GROUPING(...)",
         NodeEnum::WindowDef(_) => "a window definition",
+        NodeEnum::SubPlan(_) => "an already-planned subquery",
+        NodeEnum::RowCompareExpr(_) => "a row-comparison expression",
         _ => "this expression node kind",
     }
 }
@@ -247,10 +292,76 @@ fn lower_a_expr(ae: &AExpr, ctx: &LowerCtx) -> Result<Expr, LowerError> {
         AExprKind::AexprDistinct | AExprKind::AexprNotDistinct => {
             lower_aexpr_distinct(ae, ctx, kind)
         }
+        AExprKind::AexprOpAny | AExprKind::AexprOpAll => lower_aexpr_any_all(ae, ctx, kind),
         _ => Err(LowerError::Unsupported(format!(
             "A_Expr kind {kind:?} is not yet lowered"
         ))),
     }
+}
+
+/// `x op ANY(array_expr)` / `x op ALL(array_expr)`.
+///
+/// Confirmed against a live parse: `x = ANY(subquery)` never reaches this
+/// function — Postgres represents that as a `SubLink` (`sub_link_type =
+/// ANY_SUBLINK`, non-empty `oper_name`) directly, handled by
+/// [`lower_sub_link`]. `AEXPR_OP_ANY`/`AEXPR_OP_ALL` is exactly and only the
+/// array-expression form, `x = ANY(ARRAY[...])`.
+///
+/// A literal array can be materialized as a one-column [`LogicalPlan::Values`]
+/// relation without any catalog, which is what lets this reuse the same
+/// `Expr::Subquery` shape a real subquery uses rather than inventing a
+/// separate "scalar array op" IR node. An array-typed expression that is
+/// *not* a literal (a column, a function call) cannot be materialized this
+/// way at lowering time, so that case is `Unsupported` rather than guessed.
+fn lower_aexpr_any_all(ae: &AExpr, ctx: &LowerCtx, kind: AExprKind) -> Result<Expr, LowerError> {
+    let name = operator_name(&ae.name)?;
+    let lhs_node = ae
+        .lexpr
+        .as_deref()
+        .ok_or(LowerError::Malformed("ANY/ALL with no left operand"))?;
+    let rhs_node = ae
+        .rexpr
+        .as_deref()
+        .ok_or(LowerError::Malformed("ANY/ALL with no right operand"))?;
+    let lhs = lower_expr(lhs_node, ctx)?;
+
+    let Some(NodeEnum::AArrayExpr(arr)) = rhs_node.node.as_ref() else {
+        return Err(LowerError::Unsupported(
+            "ANY/ALL over a non-literal-array expression is not yet lowered".into(),
+        ));
+    };
+    let elements = arr
+        .elements
+        .iter()
+        .map(|n| lower_expr(n, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    let elem_ty = elements
+        .first()
+        .map(best_effort_type)
+        .unwrap_or(PgType::UNKNOWN);
+    let op = ctx
+        .operators
+        .resolve(&name, Some(best_effort_type(&lhs)), elem_ty)
+        .ok_or_else(|| {
+            LowerError::NoMatchingOperator(format!(
+                "no operator `{name}` for ANY/ALL over element type {elem_ty:?}"
+            ))
+        })?;
+    let rows = elements.into_iter().map(|e| vec![e]).collect();
+    let subplan = Box::new(LogicalPlan::Values {
+        rows,
+        schema: vec![("value".to_string(), elem_ty)],
+    });
+    let sub_kind = if kind == AExprKind::AexprOpAny {
+        SubqueryKind::Any(op)
+    } else {
+        SubqueryKind::All(op)
+    };
+    Ok(Expr::Subquery {
+        kind: sub_kind,
+        subplan,
+        operand: Some(Box::new(lhs)),
+    })
 }
 
 /// Lower both sides of a binary `A_Expr` (everything below `AEXPR_OP` is
@@ -293,7 +404,11 @@ fn lower_aexpr_in(ae: &AExpr, ctx: &LowerCtx) -> Result<Expr, LowerError> {
     let negated = match name.as_str() {
         "=" => false,
         "<>" => true,
-        _ => return Err(LowerError::Malformed("AEXPR_IN with unexpected operator name")),
+        _ => {
+            return Err(LowerError::Malformed(
+                "AEXPR_IN with unexpected operator name",
+            ))
+        }
     };
     let lhs_node = ae
         .lexpr
@@ -401,9 +516,7 @@ fn lower_aexpr_between(ae: &AExpr, ctx: &LowerCtx, kind: AExprKind) -> Result<Ex
     let arg = lower_expr(lhs_node, ctx)?;
     let mut bounds = lower_list_items(rhs_node, ctx)?;
     if bounds.len() != 2 {
-        return Err(LowerError::Malformed(
-            "BETWEEN with other than two bounds",
-        ));
+        return Err(LowerError::Malformed("BETWEEN with other than two bounds"));
     }
     let high = bounds.pop().expect("checked len == 2");
     let low = bounds.pop().expect("checked len == 2");
@@ -473,6 +586,43 @@ fn lower_bool_expr(be: &BoolExpr, ctx: &LowerCtx) -> Result<Expr, LowerError> {
                 return Err(LowerError::Malformed("NOT with other than one argument"));
             }
             let arg = args.pop().expect("checked len == 1");
+
+            // `x NOT IN (subquery)` and the explicit `NOT (x IN (subquery))`
+            // are literally the same parse tree in Postgres — both arrive as
+            // a BoolExpr(NOT) wrapping a SubLink shaped like `= ANY`/IN (see
+            // `lower_sub_link`) — so there is no parse-tree-level way to
+            // special-case only one spelling, and no need to: rewriting
+            // *either* spelling's `Subquery{In/Exists}` into
+            // `Subquery{NotIn/NotExists}` here is what lets the optimizer
+            // plan a real anti-join with correct NULL semantics instead of a
+            // semi-join plus a bolted-on boolean NOT (see the doc comment on
+            // `SubqueryKind::NotIn`).
+            match arg {
+                Expr::Subquery {
+                    kind: SubqueryKind::In,
+                    subplan,
+                    operand,
+                } => {
+                    return Ok(Expr::Subquery {
+                        kind: SubqueryKind::NotIn,
+                        subplan,
+                        operand,
+                    })
+                }
+                Expr::Subquery {
+                    kind: SubqueryKind::Exists,
+                    subplan,
+                    operand,
+                } => {
+                    return Ok(Expr::Subquery {
+                        kind: SubqueryKind::NotExists,
+                        subplan,
+                        operand,
+                    })
+                }
+                _ => {}
+            }
+
             let op = resolve_op(ctx, "NOT", None, &arg)?;
             Ok(Expr::Unary {
                 op,
@@ -510,10 +660,7 @@ fn lower_bool_expr(be: &BoolExpr, ctx: &LowerCtx) -> Result<Expr, LowerError> {
 
 // ─── NullTest / BooleanTest ──────────────────────────────────────────────
 
-fn lower_null_test(
-    nt: &pg_query::protobuf::NullTest,
-    ctx: &LowerCtx,
-) -> Result<Expr, LowerError> {
+fn lower_null_test(nt: &pg_query::protobuf::NullTest, ctx: &LowerCtx) -> Result<Expr, LowerError> {
     use pg_query::protobuf::NullTestType;
 
     if nt.argisrow {
@@ -526,13 +673,10 @@ fn lower_null_test(
         .as_deref()
         .ok_or(LowerError::Malformed("NullTest with no argument"))?;
     let arg = lower_expr(arg_node, ctx)?;
-    let negated = match NullTestType::try_from(nt.nulltesttype).unwrap_or(NullTestType::Undefined)
-    {
+    let negated = match NullTestType::try_from(nt.nulltesttype).unwrap_or(NullTestType::Undefined) {
         NullTestType::IsNull => false,
         NullTestType::IsNotNull => true,
-        NullTestType::Undefined => {
-            return Err(LowerError::Malformed("NullTest with unknown type"))
-        }
+        NullTestType::Undefined => return Err(LowerError::Malformed("NullTest with unknown type")),
     };
     Ok(Expr::IsNull {
         arg: Box::new(arg),
@@ -578,10 +722,7 @@ fn lower_boolean_test(
 /// `Expr::Case` keeps `operand` as its own field precisely so that expansion
 /// (which needs an `=` resolved per branch's type) is deferred rather than
 /// done here without a real operator/type context per branch.
-fn lower_case_expr(
-    ce: &pg_query::protobuf::CaseExpr,
-    ctx: &LowerCtx,
-) -> Result<Expr, LowerError> {
+fn lower_case_expr(ce: &pg_query::protobuf::CaseExpr, ctx: &LowerCtx) -> Result<Expr, LowerError> {
     let operand = ce
         .arg
         .as_deref()
@@ -638,6 +779,529 @@ fn lower_coalesce_expr(
     Ok(Expr::Coalesce(args))
 }
 
+// ─── TypeCast ─────────────────────────────────────────────────────────────
+
+/// `x::t` / `CAST(x AS t)`.
+///
+/// Both spellings arrive as the same `TypeCast` node — Postgres has no
+/// separate AST shape for `CAST(...)` sugar. The cast is always `Explicit`:
+/// the context that licenses it (`basin_pgtype::cast::CastKind`) is trivially
+/// "the user wrote a cast", not something that needs a `pg_cast` lookup —
+/// `pg_cast.castcontext` governs whether a cast may happen *implicitly*, and
+/// an explicit `::`/`CAST` always self-licenses regardless of what that table
+/// says.
+fn lower_type_cast(tc: &pg_query::protobuf::TypeCast, ctx: &LowerCtx) -> Result<Expr, LowerError> {
+    let arg_node = tc
+        .arg
+        .as_deref()
+        .ok_or(LowerError::Malformed("TypeCast with no argument"))?;
+    let type_name = tc
+        .type_name
+        .as_ref()
+        .ok_or(LowerError::Malformed("TypeCast with no target type"))?;
+    let arg = lower_expr(arg_node, ctx)?;
+    let to = resolve_type_name(type_name)?;
+    Ok(Expr::Cast {
+        arg: Box::new(arg),
+        to,
+        kind: basin_pgtype::cast::CastKind::Explicit,
+    })
+}
+
+/// Resolve a `TypeName` node to a [`PgType`], covering the builtin
+/// `pg_catalog` scalar types plus their array forms and typmods.
+///
+/// This is deliberately a fixed table of built-in names, not a catalog
+/// lookup — Postgres itself resolves these names syntactically for its own
+/// builtins (`gram.y`'s `SimpleTypename` productions), and a real
+/// catalog would only be needed for `CREATE TYPE`-defined names, which
+/// return `Unsupported` here.
+fn resolve_type_name(tn: &TypeName) -> Result<PgType, LowerError> {
+    if tn.setof || tn.pct_type {
+        return Err(LowerError::Unsupported(
+            "SETOF / %TYPE type references are not yet lowered".into(),
+        ));
+    }
+    let parts = string_list(&tn.names)?;
+    let name = parts
+        .last()
+        .ok_or(LowerError::Malformed("TypeName with no name parts"))?;
+
+    let base_oid = match name.as_str() {
+        "bool" => oid::BOOL,
+        "int2" | "smallint" => oid::INT2,
+        "int4" | "int" | "integer" => oid::INT4,
+        "int8" | "bigint" => oid::INT8,
+        "float4" | "real" => oid::FLOAT4,
+        "float8" | "double precision" => oid::FLOAT8,
+        "text" => oid::TEXT,
+        "varchar" | "character varying" => oid::VARCHAR,
+        "bpchar" | "char" | "character" => oid::BPCHAR,
+        "name" => oid::NAME,
+        "bytea" => oid::BYTEA,
+        "date" => oid::DATE,
+        "time" => oid::TIME,
+        "timestamp" => oid::TIMESTAMP,
+        "timestamptz" | "timestamp with time zone" => oid::TIMESTAMPTZ,
+        "timetz" | "time with time zone" => oid::TIMETZ,
+        "interval" => oid::INTERVAL,
+        "numeric" | "decimal" => oid::NUMERIC,
+        "uuid" => oid::UUID,
+        "json" => oid::JSON,
+        "jsonb" => oid::JSONB,
+        "oid" => oid::OID,
+        "xml" => oid::XML,
+        other => {
+            return Err(LowerError::Unsupported(format!(
+                "unknown or user-defined cast target type `{other}`"
+            )))
+        }
+    };
+
+    let base = match (base_oid, tn.typmods.as_slice()) {
+        (oid::VARCHAR, [n]) | (oid::BPCHAR, [n]) => {
+            PgType::with_typmod(base_oid, typmod::encode_varlena_len(typmod_int(n)?))
+        }
+        (oid::NUMERIC, [p]) => {
+            PgType::with_typmod(base_oid, typmod::encode_numeric(typmod_int(p)?, 0))
+        }
+        (oid::NUMERIC, [p, s]) => PgType::with_typmod(
+            base_oid,
+            typmod::encode_numeric(typmod_int(p)?, typmod_int(s)?),
+        ),
+        (oid::TIME, [p]) | (oid::TIMESTAMP, [p]) | (oid::TIMESTAMPTZ, [p]) | (oid::TIMETZ, [p]) => {
+            PgType::with_typmod(base_oid, typmod::encode_time_precision(typmod_int(p)?))
+        }
+        _ => PgType::new(base_oid),
+    };
+
+    if tn.array_bounds.is_empty() {
+        return Ok(base);
+    }
+    let array_oid = oid::array_of(base.oid)
+        .ok_or_else(|| LowerError::Unsupported(format!("no array type known for `{name}[]`")))?;
+    // Postgres's own array typmod applies to the *element* type, and Basin's
+    // `physical()` mapping (`basin_pgtype::physical`) derives the array's
+    // physical shape from the element `PgType` it wraps, not from a typmod on
+    // the array oid itself — so the element's typmod is preserved here and
+    // the array wrapper carries none of its own.
+    Ok(PgType::with_typmod(array_oid, base.typmod))
+}
+
+/// Extract an `i32` from a typmod list entry, which Postgres always
+/// represents as an `A_Const` integer.
+fn typmod_int(node: &Node) -> Result<i32, LowerError> {
+    match node.node.as_ref() {
+        Some(NodeEnum::AConst(ac)) => match ac.val.as_ref() {
+            Some(pg_query::protobuf::a_const::Val::Ival(i)) => Ok(i.ival),
+            _ => Err(LowerError::Malformed("type modifier is not an integer")),
+        },
+        _ => Err(LowerError::Malformed("type modifier is not a constant")),
+    }
+}
+
+/// Lower a `Vec<Node>` of `String` nodes (a dotted name list — function
+/// names, operator names, type names) to `Vec<String>`.
+fn string_list(nodes: &[Node]) -> Result<Vec<String>, LowerError> {
+    nodes
+        .iter()
+        .map(|n| match n.node.as_ref() {
+            Some(NodeEnum::String(s)) => Ok(s.sval.clone()),
+            _ => Err(LowerError::Malformed(
+                "expected a name, found a non-string node",
+            )),
+        })
+        .collect()
+}
+
+// ─── FuncCall ─────────────────────────────────────────────────────────────
+
+/// `name(args...)`, in any of its scalar / aggregate / window / set-returning
+/// shapes.
+///
+/// The shape is chosen from, in priority order: the presence of an `OVER`
+/// clause (always a window call, whatever the underlying function is); the
+/// presence of aggregate-only syntax (`DISTINCT`, `FILTER`, `WITHIN GROUP`,
+/// or a bare `*` argument, none of which are legal on anything but an
+/// aggregate); and finally the [`FuncKind`] the resolver itself reports for
+/// an unmarked plain call like `sum(x)`, which is otherwise indistinguishable
+/// from `upper(x)` at the parse-tree level.
+fn lower_func_call(fc: &FuncCall, ctx: &LowerCtx) -> Result<Expr, LowerError> {
+    let name = string_list(&fc.funcname)?;
+    let args = fc
+        .args
+        .iter()
+        .map(|n| lower_expr(n, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    let arg_types: Vec<PgType> = args.iter().map(best_effort_type).collect();
+
+    let (func, kind) = ctx.functions.resolve(&name, &arg_types).ok_or_else(|| {
+        LowerError::NoMatchingOperator(format!(
+            "no function `{}` for argument types {arg_types:?}",
+            name.join(".")
+        ))
+    })?;
+
+    let has_agg_only_syntax =
+        fc.agg_distinct || fc.agg_filter.is_some() || fc.agg_within_group || fc.agg_star;
+
+    if let Some(over) = fc.over.as_deref() {
+        if fc.agg_distinct || fc.agg_filter.is_some() {
+            return Err(LowerError::Unsupported(
+                "DISTINCT or FILTER combined with OVER cannot be represented yet".into(),
+            ));
+        }
+        let (partition_by, order_by, frame) = lower_window_def(over, ctx)?;
+        return Ok(Expr::Window {
+            func,
+            args,
+            partition_by,
+            order_by,
+            frame,
+        });
+    }
+
+    if has_agg_only_syntax || kind == FuncKind::Aggregate {
+        let filter = fc
+            .agg_filter
+            .as_deref()
+            .map(|n| lower_expr(n, ctx))
+            .transpose()?
+            .map(Box::new);
+        let order_by = fc
+            .agg_order
+            .iter()
+            .map(|n| lower_sort_by(n, ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Expr::Aggregate {
+            func,
+            args,
+            distinct: fc.agg_distinct,
+            filter,
+            order_by,
+        });
+    }
+
+    if kind == FuncKind::SetReturning {
+        return Ok(Expr::SetReturning { func, args });
+    }
+
+    Ok(Expr::ScalarFn { func, args })
+}
+
+/// Lower a window definition's `PARTITION BY`, `ORDER BY`, and frame clause.
+fn lower_window_def(
+    w: &pg_query::protobuf::WindowDef,
+    ctx: &LowerCtx,
+) -> Result<(Vec<Expr>, Vec<SortKey>, crate::expr::WindowFrame), LowerError> {
+    if !w.refname.is_empty() {
+        return Err(LowerError::Unsupported(
+            "OVER referencing a named WINDOW clause is not yet lowered".into(),
+        ));
+    }
+    let partition_by = w
+        .partition_clause
+        .iter()
+        .map(|n| lower_expr(n, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    let order_by = w
+        .order_clause
+        .iter()
+        .map(|n| lower_sort_by(n, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    let frame = lower_frame(w, ctx)?;
+    Ok((partition_by, order_by, frame))
+}
+
+// Postgres's `WindowDef.frameOptions` bit flags (`nodes/parsenodes.h`).
+// Reproduced here rather than imported because pg_query exposes the raw
+// `i32` with no typed accessor.
+const FRAMEOPTION_RANGE: i32 = 0x0002;
+const FRAMEOPTION_ROWS: i32 = 0x0004;
+const FRAMEOPTION_GROUPS: i32 = 0x0008;
+const FRAMEOPTION_START_UNBOUNDED_PRECEDING: i32 = 0x0020;
+const FRAMEOPTION_END_UNBOUNDED_FOLLOWING: i32 = 0x0100;
+const FRAMEOPTION_START_CURRENT_ROW: i32 = 0x0200;
+const FRAMEOPTION_END_CURRENT_ROW: i32 = 0x0400;
+const FRAMEOPTION_START_OFFSET_PRECEDING: i32 = 0x0800;
+const FRAMEOPTION_END_OFFSET_PRECEDING: i32 = 0x1000;
+const FRAMEOPTION_START_OFFSET_FOLLOWING: i32 = 0x2000;
+const FRAMEOPTION_END_OFFSET_FOLLOWING: i32 = 0x4000;
+const FRAMEOPTION_EXCLUDE_CURRENT_ROW: i32 = 0x8000;
+const FRAMEOPTION_EXCLUDE_GROUP: i32 = 0x10000;
+const FRAMEOPTION_EXCLUDE_TIES: i32 = 0x20000;
+
+fn lower_frame(
+    w: &pg_query::protobuf::WindowDef,
+    ctx: &LowerCtx,
+) -> Result<crate::expr::WindowFrame, LowerError> {
+    use crate::expr::{FrameBound, FrameUnits, WindowFrame};
+
+    let opts = w.frame_options;
+    if opts
+        & (FRAMEOPTION_EXCLUDE_CURRENT_ROW | FRAMEOPTION_EXCLUDE_GROUP | FRAMEOPTION_EXCLUDE_TIES)
+        != 0
+    {
+        return Err(LowerError::Unsupported(
+            "window frame EXCLUDE clauses are not yet lowered".into(),
+        ));
+    }
+
+    let units = if opts & FRAMEOPTION_ROWS != 0 {
+        FrameUnits::Rows
+    } else if opts & FRAMEOPTION_GROUPS != 0 {
+        FrameUnits::Groups
+    } else if opts & FRAMEOPTION_RANGE != 0 {
+        FrameUnits::Range
+    } else {
+        return Err(LowerError::Malformed(
+            "window frame has neither ROWS, RANGE, nor GROUPS set",
+        ));
+    };
+
+    let start = if opts & FRAMEOPTION_START_UNBOUNDED_PRECEDING != 0 {
+        FrameBound::UnboundedPreceding
+    } else if opts & FRAMEOPTION_START_CURRENT_ROW != 0 {
+        FrameBound::CurrentRow
+    } else if opts & FRAMEOPTION_START_OFFSET_PRECEDING != 0 {
+        FrameBound::Preceding(Box::new(lower_expr(
+            w.start_offset
+                .as_deref()
+                .ok_or(LowerError::Malformed("frame start with no offset"))?,
+            ctx,
+        )?))
+    } else if opts & FRAMEOPTION_START_OFFSET_FOLLOWING != 0 {
+        FrameBound::Following(Box::new(lower_expr(
+            w.start_offset
+                .as_deref()
+                .ok_or(LowerError::Malformed("frame start with no offset"))?,
+            ctx,
+        )?))
+    } else {
+        return Err(LowerError::Malformed("window frame has no start bound"));
+    };
+
+    let end = if opts & FRAMEOPTION_END_UNBOUNDED_FOLLOWING != 0 {
+        FrameBound::UnboundedFollowing
+    } else if opts & FRAMEOPTION_END_CURRENT_ROW != 0 {
+        FrameBound::CurrentRow
+    } else if opts & FRAMEOPTION_END_OFFSET_PRECEDING != 0 {
+        FrameBound::Preceding(Box::new(lower_expr(
+            w.end_offset
+                .as_deref()
+                .ok_or(LowerError::Malformed("frame end with no offset"))?,
+            ctx,
+        )?))
+    } else if opts & FRAMEOPTION_END_OFFSET_FOLLOWING != 0 {
+        FrameBound::Following(Box::new(lower_expr(
+            w.end_offset
+                .as_deref()
+                .ok_or(LowerError::Malformed("frame end with no offset"))?,
+            ctx,
+        )?))
+    } else {
+        return Err(LowerError::Malformed("window frame has no end bound"));
+    };
+
+    Ok(WindowFrame { units, start, end })
+}
+
+/// Lower one `ORDER BY` key (used by plain `ORDER BY`, aggregate `ORDER BY`,
+/// and window `ORDER BY`). Resolves Postgres's direction-dependent default
+/// null placement (`NULLS LAST` for `ASC`, `NULLS FIRST` for `DESC`) so the
+/// result is always explicit.
+fn lower_sort_by(node: &Node, ctx: &LowerCtx) -> Result<SortKey, LowerError> {
+    use pg_query::protobuf::{SortByDir, SortByNulls};
+
+    let Some(NodeEnum::SortBy(sb)) = node.node.as_ref() else {
+        return Err(LowerError::Malformed("expected a SortBy node"));
+    };
+    let expr_node = sb
+        .node
+        .as_deref()
+        .ok_or(LowerError::Malformed("SortBy with no expression"))?;
+    let expr = lower_expr(expr_node, ctx)?;
+
+    let descending = match SortByDir::try_from(sb.sortby_dir).unwrap_or(SortByDir::Undefined) {
+        SortByDir::Undefined | SortByDir::SortbyDefault | SortByDir::SortbyAsc => false,
+        SortByDir::SortbyDesc => true,
+        SortByDir::SortbyUsing => {
+            return Err(LowerError::Unsupported(
+                "ORDER BY ... USING <custom operator> is not yet lowered".into(),
+            ))
+        }
+    };
+    let nulls_first = match SortByNulls::try_from(sb.sortby_nulls).unwrap_or(SortByNulls::Undefined)
+    {
+        SortByNulls::Undefined | SortByNulls::SortbyNullsDefault => descending,
+        SortByNulls::SortbyNullsFirst => true,
+        SortByNulls::SortbyNullsLast => false,
+    };
+
+    Ok(SortKey {
+        expr,
+        descending,
+        nulls_first,
+    })
+}
+
+// ─── SubLink (subquery expressions) ──────────────────────────────────────
+
+/// `EXISTS (...)`, `(SELECT ...)`, `x IN (...)`, `x op ANY/ALL (...)` — every
+/// shape where the subquery is the whole right-hand side rather than a
+/// literal array (see [`lower_aexpr_any_all`] for that case).
+fn lower_sub_link(sl: &SubLink, ctx: &LowerCtx) -> Result<Expr, LowerError> {
+    use pg_query::protobuf::SubLinkType;
+
+    let subselect = sl
+        .subselect
+        .as_deref()
+        .ok_or(LowerError::Malformed("SubLink with no subquery body"))?;
+    let operand = sl
+        .testexpr
+        .as_deref()
+        .map(|n| lower_expr(n, ctx))
+        .transpose()?
+        .map(Box::new);
+
+    let kind = SubLinkType::try_from(sl.sub_link_type).unwrap_or(SubLinkType::Undefined);
+    let sub_kind = match kind {
+        SubLinkType::ExistsSublink => SubqueryKind::Exists,
+        SubLinkType::ExprSublink => SubqueryKind::Scalar,
+        SubLinkType::AnySublink | SubLinkType::AllSublink => {
+            // An empty `oper_name` is Postgres's own marker for plain `IN`
+            // (as opposed to `= ANY`, which spells out `"="`) — confirmed
+            // against a live parse of `x IN (SELECT ...)` (`oper_name: []`)
+            // vs. `x = ANY (SELECT ...)` (`oper_name: ["="]"`).
+            if sl.oper_name.is_empty() {
+                SubqueryKind::In
+            } else {
+                let name = operator_name(&sl.oper_name)?;
+                let lhs_ty = operand.as_deref().map(best_effort_type);
+                let op = ctx
+                    .operators
+                    .resolve(&name, lhs_ty, PgType::UNKNOWN)
+                    .ok_or_else(|| {
+                        LowerError::NoMatchingOperator(format!(
+                            "no operator `{name}` for {kind:?} over an unresolved subquery row type"
+                        ))
+                    })?;
+                if kind == SubLinkType::AnySublink {
+                    SubqueryKind::Any(op)
+                } else {
+                    SubqueryKind::All(op)
+                }
+            }
+        }
+        _ => {
+            return Err(LowerError::Unsupported(format!(
+                "{kind:?} subqueries are not yet lowered"
+            )))
+        }
+    };
+
+    let subplan = Box::new(ctx.subqueries.lower(subselect)?);
+    Ok(Expr::Subquery {
+        kind: sub_kind,
+        subplan,
+        operand,
+    })
+}
+
+// ─── Arrays / rows / subscripts ──────────────────────────────────────────
+
+fn lower_array_expr(
+    arr: &pg_query::protobuf::AArrayExpr,
+    ctx: &LowerCtx,
+) -> Result<Expr, LowerError> {
+    let elements = arr
+        .elements
+        .iter()
+        .map(|n| lower_expr(n, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Expr::ArrayLit(elements))
+}
+
+fn lower_row_expr(re: &pg_query::protobuf::RowExpr, ctx: &LowerCtx) -> Result<Expr, LowerError> {
+    let args = re
+        .args
+        .iter()
+        .map(|n| lower_expr(n, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Expr::RowLit(args))
+}
+
+/// `a[i]`, `a[i:j]`, and chains of either. `(composite).field` access shares
+/// this same `A_Indirection` node (a `String` item instead of `A_Indices`);
+/// resolving a field name to a position requires a composite-type catalog
+/// that does not exist yet, so that shape is `Unsupported` rather than
+/// guessed.
+fn lower_a_indirection(
+    ai: &pg_query::protobuf::AIndirection,
+    ctx: &LowerCtx,
+) -> Result<Expr, LowerError> {
+    let arg_node = ai
+        .arg
+        .as_deref()
+        .ok_or(LowerError::Malformed("A_Indirection with no argument"))?;
+    let arg = lower_expr(arg_node, ctx)?;
+
+    let mut indices = Vec::with_capacity(ai.indirection.len());
+    for item in &ai.indirection {
+        match item.node.as_ref() {
+            Some(NodeEnum::AIndices(idx)) => {
+                if idx.is_slice {
+                    let lower = idx
+                        .lidx
+                        .as_deref()
+                        .map(|n| lower_expr(n, ctx))
+                        .transpose()?;
+                    let upper = idx
+                        .uidx
+                        .as_deref()
+                        .map(|n| lower_expr(n, ctx))
+                        .transpose()?;
+                    indices.push(Subscript::Slice { lower, upper });
+                } else {
+                    let idx_node = idx
+                        .uidx
+                        .as_deref()
+                        .ok_or(LowerError::Malformed("index subscript with no value"))?;
+                    indices.push(Subscript::Index(lower_expr(idx_node, ctx)?));
+                }
+            }
+            Some(NodeEnum::String(_)) => return Err(LowerError::Unsupported(
+                "composite field access (`(expr).field`) is not yet lowered — needs a type catalog"
+                    .into(),
+            )),
+            _ => {
+                return Err(LowerError::Malformed(
+                    "indirection item is neither a subscript nor a field name",
+                ))
+            }
+        }
+    }
+    Ok(Expr::Subscript {
+        arg: Box::new(arg),
+        indices,
+    })
+}
+
+// ─── ParamRef ─────────────────────────────────────────────────────────────
+
+/// `$1`. The type is left `unknown` — inferring a parameter's type from its
+/// usage context (`Describe` before any value arrives) is a later increment,
+/// not something this file can do without seeing the whole statement.
+fn lower_param_ref(pr: &pg_query::protobuf::ParamRef) -> Result<Expr, LowerError> {
+    if pr.number < 1 {
+        return Err(LowerError::Malformed("parameter index must be >= 1"));
+    }
+    Ok(Expr::Parameter {
+        index: pr.number as u16,
+        ty: PgType::UNKNOWN,
+    })
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -686,8 +1350,47 @@ mod tests {
 
     use basin_pgtype::Oid;
 
+    /// A function resolver covering just the names the tests below need,
+    /// classified the same way a real `pg_proc`-backed resolver would have
+    /// to: by name, since call-site syntax alone cannot tell `sum(x)` from
+    /// `upper(x)`.
+    struct MockFunctions;
+
+    impl FunctionResolver for MockFunctions {
+        fn resolve(&self, name: &[String], _args: &[PgType]) -> Option<(FuncId, FuncKind)> {
+            match name.last().map(String::as_str) {
+                Some("upper") => Some((FuncId(Oid(871)), FuncKind::Scalar)),
+                Some("sum") => Some((FuncId(Oid(2108)), FuncKind::Aggregate)),
+                Some("count") => Some((FuncId(Oid(2147)), FuncKind::Aggregate)),
+                Some("rank") => Some((FuncId(Oid(3100)), FuncKind::Window)),
+                Some("generate_series") => Some((FuncId(Oid(1066)), FuncKind::SetReturning)),
+                _ => None,
+            }
+        }
+    }
+
+    /// A subquery lowerer that always succeeds with a one-column
+    /// placeholder relation — full `SELECT` lowering doesn't exist yet
+    /// (`lower::select` is a separate increment), so this is what stands in
+    /// for it in these tests, exactly as the module docs describe.
+    struct MockSubqueries;
+
+    impl SubqueryLowerer for MockSubqueries {
+        fn lower(&self, _subselect: &Node) -> Result<LogicalPlan, LowerError> {
+            Ok(LogicalPlan::Empty {
+                produce_one_row: false,
+                schema: vec![("value".to_string(), PgType::INT4)],
+            })
+        }
+    }
+
     fn ctx<'a>(columns: &'a MockColumns, operators: &'a CatalogOperators) -> LowerCtx<'a> {
-        LowerCtx { columns, operators }
+        LowerCtx {
+            columns,
+            operators,
+            functions: &MockFunctions,
+            subqueries: &MockSubqueries,
+        }
     }
 
     fn cols() -> MockColumns {
@@ -992,19 +1695,29 @@ mod tests {
 
     #[test]
     fn an_unhandled_node_kind_is_unsupported_with_a_precise_message() {
-        // FuncCall lands in a later stage; still unhandled at this point in
-        // the file's incremental build-out.
+        // GREATEST/LEAST get their own dedicated `MinMaxExpr` node in
+        // Postgres's grammar (not a `FuncCall`) and are out of this file's
+        // scope entirely.
+        let node = parse_expr("GREATEST(a, b)");
+        let c = cols();
+        let o = CatalogOperators;
+        let err = lower_expr(&node, &ctx(&c, &o)).expect_err("MinMaxExpr not yet lowered");
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(
+            msg.contains("GREATEST"),
+            "message should name the construct: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_function_name_is_a_no_matching_operator_error() {
         let node = parse_expr("foo(a)");
         let c = cols();
         let o = CatalogOperators;
-        let err = lower_expr(&node, &ctx(&c, &o)).expect_err("FuncCall not yet lowered");
-        let LowerError::Unsupported(msg) = err else {
-            panic!("expected Unsupported");
-        };
-        assert!(
-            msg.contains("function call"),
-            "message should name the construct: {msg}"
-        );
+        let err = lower_expr(&node, &ctx(&c, &o)).expect_err("`foo` is not in MockFunctions");
+        assert!(matches!(err, LowerError::NoMatchingOperator(_)));
     }
 
     // --- CaseExpr / CoalesceExpr ------------------------------------------------
@@ -1043,10 +1756,7 @@ mod tests {
         let c = cols();
         let o = CatalogOperators;
         let e = lower_expr(&node, &ctx(&c, &o)).expect("lower failed");
-        let Expr::Case {
-            operand, whens, ..
-        } = e
-        else {
+        let Expr::Case { operand, whens, .. } = e else {
             panic!("expected Case");
         };
         assert_eq!(
@@ -1110,12 +1820,9 @@ mod tests {
         assert!(negated, "`x NOT IN (...)` must set InList.negated");
 
         // `NOT (x IN (...))`: Unary(NOT) wrapping an InList with negated: false.
-        let not_wrapping_in =
-            lower_expr(&where_expr("NOT (a IN (1, 2))"), &ctx(&c, &o)).unwrap();
+        let not_wrapping_in = lower_expr(&where_expr("NOT (a IN (1, 2))"), &ctx(&c, &o)).unwrap();
         let Expr::Unary { arg, .. } = not_wrapping_in else {
-            panic!(
-                "expected Unary(NOT) for `NOT(IN)`, got {not_wrapping_in:?}"
-            );
+            panic!("expected Unary(NOT) for `NOT(IN)`, got {not_wrapping_in:?}");
         };
         let Expr::InList { negated, .. } = *arg else {
             panic!("expected the NOT to wrap an InList");
@@ -1221,11 +1928,7 @@ mod tests {
         assert_eq!(*low, Expr::Literal(Datum::Int32(1), PgType::INT4));
         assert_eq!(*high, Expr::Literal(Datum::Int32(10), PgType::INT4));
 
-        let e = lower_expr(
-            &where_expr("a BETWEEN SYMMETRIC 1 AND 10"),
-            &ctx(&c, &o),
-        )
-        .unwrap();
+        let e = lower_expr(&where_expr("a BETWEEN SYMMETRIC 1 AND 10"), &ctx(&c, &o)).unwrap();
         let Expr::Between { symmetric, .. } = e else {
             panic!("expected Between");
         };
@@ -1259,14 +1962,331 @@ mod tests {
         };
         assert!(!negated);
 
-        let e = lower_expr(
-            &where_expr("a IS NOT DISTINCT FROM b"),
-            &ctx(&c, &o),
-        )
-        .unwrap();
+        let e = lower_expr(&where_expr("a IS NOT DISTINCT FROM b"), &ctx(&c, &o)).unwrap();
         let Expr::DistinctFrom { negated, .. } = e else {
             panic!("expected DistinctFrom");
         };
         assert!(negated);
+    }
+
+    // --- TypeCast --------------------------------------------------------------
+
+    #[test]
+    fn explicit_cast_lowers_target_type_and_kind() {
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&parse_expr("a::int4"), &ctx(&c, &o)).unwrap();
+        let Expr::Cast { to, kind, .. } = e else {
+            panic!("expected Cast");
+        };
+        assert_eq!(to, PgType::INT4);
+        assert_eq!(kind, basin_pgtype::cast::CastKind::Explicit);
+    }
+
+    #[test]
+    fn cast_with_typmod_preserves_length() {
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&parse_expr("a::varchar(10)"), &ctx(&c, &o)).unwrap();
+        let Expr::Cast { to, .. } = e else {
+            panic!("expected Cast");
+        };
+        assert_eq!(to, PgType::varchar(10));
+    }
+
+    #[test]
+    fn cast_to_array_type_wraps_the_element_oid() {
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&parse_expr("a::int4[]"), &ctx(&c, &o)).unwrap();
+        let Expr::Cast { to, .. } = e else {
+            panic!("expected Cast");
+        };
+        assert_eq!(to, PgType::new(oid::INT4_ARRAY));
+    }
+
+    #[test]
+    fn cast_to_an_unknown_type_name_is_unsupported() {
+        let c = cols();
+        let o = CatalogOperators;
+        let err = lower_expr(&parse_expr("a::frobnicator"), &ctx(&c, &o)).expect_err("no such type");
+        assert!(matches!(err, LowerError::Unsupported(_)));
+    }
+
+    // --- FuncCall ----------------------------------------------------------------
+
+    #[test]
+    fn plain_call_resolves_via_the_function_resolvers_reported_kind() {
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&parse_expr("upper(a)"), &ctx(&c, &o)).unwrap();
+        assert!(matches!(e, Expr::ScalarFn { .. }), "got {e:?}");
+
+        let e = lower_expr(&parse_expr("sum(a)"), &ctx(&c, &o)).unwrap();
+        assert!(matches!(e, Expr::Aggregate { .. }), "got {e:?}");
+    }
+
+    #[test]
+    fn count_star_lowers_with_empty_args() {
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&parse_expr("count(*)"), &ctx(&c, &o)).unwrap();
+        let Expr::Aggregate { args, .. } = e else {
+            panic!("expected Aggregate");
+        };
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn aggregate_distinct_filter_and_order_by_are_captured() {
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(
+            &parse_expr("sum(a) FILTER (WHERE b IS NOT NULL)"),
+            &ctx(&c, &o),
+        )
+        .unwrap();
+        let Expr::Aggregate { distinct, filter, .. } = e else {
+            panic!("expected Aggregate");
+        };
+        assert!(!distinct);
+        assert!(filter.is_some());
+
+        let e = lower_expr(&parse_expr("sum(DISTINCT a)"), &ctx(&c, &o)).unwrap();
+        let Expr::Aggregate { distinct, .. } = e else {
+            panic!("expected Aggregate");
+        };
+        assert!(distinct);
+    }
+
+    #[test]
+    fn window_call_captures_partition_order_and_frame() {
+        let c = cols();
+        let o = CatalogOperators;
+        let node = parse_expr(
+            "rank() OVER (PARTITION BY a ORDER BY b ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+        );
+        let e = lower_expr(&node, &ctx(&c, &o)).expect("lower failed");
+        let Expr::Window {
+            partition_by,
+            order_by,
+            frame,
+            ..
+        } = e
+        else {
+            panic!("expected Window, got {e:?}");
+        };
+        assert_eq!(partition_by.len(), 1);
+        assert_eq!(order_by.len(), 1);
+        assert_eq!(frame.units, crate::expr::FrameUnits::Rows);
+        assert!(matches!(frame.start, crate::expr::FrameBound::Preceding(_)));
+        assert!(matches!(frame.end, crate::expr::FrameBound::CurrentRow));
+    }
+
+    #[test]
+    fn set_returning_function_lowers_to_set_returning() {
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&parse_expr("generate_series(1, 10)"), &ctx(&c, &o)).unwrap();
+        assert!(matches!(e, Expr::SetReturning { .. }), "got {e:?}");
+    }
+
+    // --- SubLink -------------------------------------------------------------
+
+    #[test]
+    fn exists_and_scalar_subquery_lower_through_the_subquery_lowerer() {
+        let c = cols();
+        let o = CatalogOperators;
+
+        let e = lower_expr(&where_expr("EXISTS (SELECT 1)"), &ctx(&c, &o)).unwrap();
+        assert!(matches!(
+            e,
+            Expr::Subquery {
+                kind: SubqueryKind::Exists,
+                ..
+            }
+        ));
+
+        let e = lower_expr(&parse_expr("(SELECT 1)"), &ctx(&c, &o)).unwrap();
+        assert!(matches!(
+            e,
+            Expr::Subquery {
+                kind: SubqueryKind::Scalar,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn in_subquery_lowers_to_subqueryin_and_not_in_subquery_rewrites_to_notin() {
+        let c = cols();
+        let o = CatalogOperators;
+
+        let e = lower_expr(&where_expr("a IN (SELECT b FROM t)"), &ctx(&c, &o)).unwrap();
+        assert!(matches!(
+            e,
+            Expr::Subquery {
+                kind: SubqueryKind::In,
+                ..
+            }
+        ));
+
+        // `x NOT IN (subquery)` and `NOT (x IN (subquery))` share one parse
+        // tree (BoolExpr(NOT) wrapping the same SubLink) — both must rewrite
+        // to the dedicated `NotIn` shape rather than a generic boolean NOT,
+        // per the special case in `lower_bool_expr`.
+        let e = lower_expr(
+            &where_expr("a NOT IN (SELECT b FROM t)"),
+            &ctx(&c, &o),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                e,
+                Expr::Subquery {
+                    kind: SubqueryKind::NotIn,
+                    ..
+                }
+            ),
+            "got {e:?}"
+        );
+
+        let e = lower_expr(
+            &where_expr("NOT (a IN (SELECT b FROM t))"),
+            &ctx(&c, &o),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                e,
+                Expr::Subquery {
+                    kind: SubqueryKind::NotIn,
+                    ..
+                }
+            ),
+            "got {e:?}"
+        );
+    }
+
+    #[test]
+    fn any_all_subquery_resolve_an_operator() {
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&where_expr("a = ANY (SELECT b FROM t)"), &ctx(&c, &o)).unwrap();
+        assert!(matches!(
+            e,
+            Expr::Subquery {
+                kind: SubqueryKind::Any(_),
+                ..
+            }
+        ));
+
+        let e = lower_expr(&where_expr("a > ALL (SELECT b FROM t)"), &ctx(&c, &o)).unwrap();
+        assert!(matches!(
+            e,
+            Expr::Subquery {
+                kind: SubqueryKind::All(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn any_all_over_a_literal_array_builds_a_values_subplan() {
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&where_expr("a = ANY(ARRAY[1, 2, 3])"), &ctx(&c, &o)).unwrap();
+        let Expr::Subquery {
+            kind, subplan, operand, ..
+        } = e
+        else {
+            panic!("expected Subquery");
+        };
+        assert!(matches!(kind, SubqueryKind::Any(_)));
+        assert!(operand.is_some());
+        assert!(matches!(*subplan, LogicalPlan::Values { .. }));
+    }
+
+    #[test]
+    fn any_over_a_non_literal_array_is_unsupported() {
+        let c = cols();
+        let o = CatalogOperators;
+        let err = lower_expr(&where_expr("a = ANY(b)"), &ctx(&c, &o))
+            .expect_err("non-literal array ANY is not yet lowered");
+        assert!(matches!(err, LowerError::Unsupported(_)));
+    }
+
+    // --- Arrays / rows / subscripts -------------------------------------------
+
+    #[test]
+    fn array_literal_lowers_every_element() {
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&parse_expr("ARRAY[1, 2, 3]"), &ctx(&c, &o)).unwrap();
+        let Expr::ArrayLit(elems) = e else {
+            panic!("expected ArrayLit");
+        };
+        assert_eq!(elems.len(), 3);
+    }
+
+    #[test]
+    fn row_literal_lowers_every_field() {
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&parse_expr("ROW(1, 2)"), &ctx(&c, &o)).unwrap();
+        let Expr::RowLit(fields) = e else {
+            panic!("expected RowLit");
+        };
+        assert_eq!(fields.len(), 2);
+    }
+
+    #[test]
+    fn index_and_slice_subscripts_lower_correctly() {
+        let c = cols();
+        let o = CatalogOperators;
+
+        let e = lower_expr(&parse_expr("a[1]"), &ctx(&c, &o)).unwrap();
+        let Expr::Subscript { indices, .. } = e else {
+            panic!("expected Subscript");
+        };
+        assert_eq!(indices.len(), 1);
+        assert!(matches!(indices[0], Subscript::Index(_)));
+
+        let e = lower_expr(&parse_expr("a[1:2]"), &ctx(&c, &o)).unwrap();
+        let Expr::Subscript { indices, .. } = e else {
+            panic!("expected Subscript");
+        };
+        assert!(matches!(
+            indices[0],
+            Subscript::Slice {
+                lower: Some(_),
+                upper: Some(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn composite_field_access_is_unsupported() {
+        let c = cols();
+        let o = CatalogOperators;
+        let err = lower_expr(&parse_expr("(ROW(1, 2)).f1"), &ctx(&c, &o))
+            .expect_err("field access needs a type catalog");
+        assert!(matches!(err, LowerError::Unsupported(_)));
+    }
+
+    // --- ParamRef ------------------------------------------------------------
+
+    #[test]
+    fn bind_parameter_lowers_with_unknown_type() {
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&parse_expr("$1"), &ctx(&c, &o)).unwrap();
+        assert_eq!(
+            e,
+            Expr::Parameter {
+                index: 1,
+                ty: PgType::UNKNOWN
+            }
+        );
     }
 }
