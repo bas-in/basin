@@ -321,16 +321,21 @@ fn lower_select_stmt(stmt: &SelectStmt, res: &Resolvers) -> Result<LogicalPlan, 
         return lower_set_op(stmt, op_kind, res);
     }
 
-    if !stmt.distinct_clause.is_empty() {
-        // Postgres's own parse-tree convention: plain `DISTINCT` puts a
-        // single empty placeholder node in this list; `DISTINCT ON (...)`
-        // puts the real expressions.
-        let is_on = stmt.distinct_clause.iter().any(|n| n.node.is_some());
-        return Err(LowerError::Unsupported(if is_on {
-            "DISTINCT ON is not yet lowered".into()
-        } else {
-            "SELECT DISTINCT is not yet lowered".into()
-        }));
+    // Postgres's own parse-tree convention: plain `DISTINCT` puts a single
+    // EMPTY placeholder node in this list, while `DISTINCT ON (...)` puts the
+    // real expressions. Distinguishing them by node emptiness rather than by
+    // list length is what Postgres's own gram.y does.
+    //
+    // `DISTINCT ON` stays unsupported: it keeps the FIRST row per key group in
+    // the input's current order, which is only deterministic when an ORDER BY
+    // agrees with the ON list. Lowering it without checking that agreement
+    // would produce a plan whose answer depends on scan order — a wrong answer
+    // that changes between runs, which is worse than an honest refusal.
+    let is_distinct = !stmt.distinct_clause.is_empty();
+    if is_distinct && stmt.distinct_clause.iter().any(|n| n.node.is_some()) {
+        return Err(LowerError::Unsupported(
+            "DISTINCT ON is not yet lowered".into(),
+        ));
     }
 
     if !stmt.values_lists.is_empty() {
@@ -413,7 +418,7 @@ fn lower_select_stmt(stmt: &SelectStmt, res: &Resolvers) -> Result<LogicalPlan, 
             input: Box::new(sorted),
             exprs: target,
         };
-        apply_limit(projected, stmt, res)
+        apply_limit(apply_distinct(projected, is_distinct), stmt, res)
     } else {
         let order_keys = stmt
             .sort_clause
@@ -432,7 +437,24 @@ fn lower_select_stmt(stmt: &SelectStmt, res: &Resolvers) -> Result<LogicalPlan, 
             input: Box::new(sorted),
             exprs: raw_target,
         };
-        apply_limit(projected, stmt, res)
+        apply_limit(apply_distinct(projected, is_distinct), stmt, res)
+    }
+}
+
+/// Wrap `plan` in `DISTINCT` when the statement asked for it.
+///
+/// Position matters. `DISTINCT` applies to the SELECT LIST, so it sits ABOVE
+/// the projection and BELOW the limit: `SELECT DISTINCT x ... LIMIT 5` means
+/// five distinct rows, not the distinct rows of the first five. Putting the
+/// limit underneath would silently return fewer rows than the query asked for.
+fn apply_distinct(plan: LogicalPlan, is_distinct: bool) -> LogicalPlan {
+    if is_distinct {
+        LogicalPlan::Distinct {
+            input: Box::new(plan),
+            on: None,
+        }
+    } else {
+        plan
     }
 }
 
@@ -1954,12 +1976,35 @@ mod tests {
     }
 
     #[test]
-    fn plain_distinct_is_unsupported_with_a_precise_message() {
-        let err = lower("SELECT DISTINCT a FROM t").unwrap_err();
-        let LowerError::Unsupported(msg) = err else {
-            panic!("expected Unsupported, got {err:?}");
+    fn plain_distinct_lowers_to_a_distinct_node_above_the_projection() {
+        let plan = lower("SELECT DISTINCT a FROM t").expect("plain DISTINCT lowers");
+        let LogicalPlan::Distinct { input, on } = plan else {
+            panic!("expected Distinct at the top, got {plan:?}");
         };
-        assert!(msg.contains("DISTINCT"), "message should be precise: {msg}");
+        assert!(on.is_none(), "plain DISTINCT has no ON list");
+        // DISTINCT applies to the SELECT LIST, so it must sit ABOVE the
+        // projection. Below it, the deduplication would run against the input's
+        // full width and `SELECT DISTINCT a` would return one row per distinct
+        // (a, b, c) rather than per distinct a.
+        assert!(
+            matches!(*input, LogicalPlan::Project { .. }),
+            "Distinct must wrap the projection, not sit under it: {input:?}"
+        );
+    }
+
+    /// `SELECT DISTINCT x ... LIMIT 5` means five DISTINCT rows, not the
+    /// distinct rows of the first five. Getting the order wrong returns fewer
+    /// rows than the query asked for, silently.
+    #[test]
+    fn distinct_sits_below_the_limit_not_above_it() {
+        let plan = lower("SELECT DISTINCT a FROM t LIMIT 5").expect("lowers");
+        let LogicalPlan::Limit { input, .. } = plan else {
+            panic!("expected Limit outermost, got {plan:?}");
+        };
+        assert!(
+            matches!(*input, LogicalPlan::Distinct { .. }),
+            "Limit must be applied AFTER dedup: {input:?}"
+        );
     }
 
     #[test]
