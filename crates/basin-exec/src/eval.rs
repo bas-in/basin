@@ -380,6 +380,12 @@ fn eval_binary(
 
     let l = eval(lhs, batch)?;
     let r = eval(rhs, batch)?;
+    // Arrow's comparison and arithmetic kernels require both sides to have the
+    // SAME type; Postgres does not. `bigint_col > 2` is ordinary SQL — the
+    // literal is int4, the column int8, and Postgres widens implicitly. Without
+    // this the kernel rejects the pair and the whole query falls back, which is
+    // an enormous share of real statements.
+    let (l, r) = unify_numeric(l, r)?;
 
     match name {
         "=" => Ok(Arc::new(cmp::eq(&l, &r).map_err(|e| map_arrow(e, "="))?)),
@@ -404,6 +410,43 @@ fn eval_binary(
             op.0.get()
         ))),
     }
+}
+
+/// Widen a mismatched numeric pair to a common type, the way Postgres's
+/// implicit coercions do before an operator is applied.
+///
+/// Only widening is performed, and only within the numeric family: int16 to
+/// int32 to int64 to float32 to float64. That direction is always
+/// value-preserving. NARROWING IS NOT DONE — Postgres treats those casts as
+/// assignment-only rather than implicit precisely because they can lose value,
+/// and silently narrowing here would turn a comparison into a wrong answer.
+/// A pair this cannot unify is left alone so the kernel reports the mismatch.
+fn unify_numeric(l: ArrayRef, r: ArrayRef) -> Result<(ArrayRef, ArrayRef), ExecError> {
+    use arrow_schema::DataType as DT;
+    /// Rank within the widening chain. `None` means "not part of it", which
+    /// includes decimals — those carry precision and scale that a rank cannot
+    /// express, so they are deliberately excluded rather than approximated.
+    fn rank(dt: &DT) -> Option<u8> {
+        Some(match dt {
+            DT::Int8 | DT::Int16 => 1,
+            DT::Int32 => 2,
+            DT::Int64 => 3,
+            DT::Float32 => 4,
+            DT::Float64 => 5,
+            _ => return None,
+        })
+    }
+    let (lt, rt) = (l.data_type().clone(), r.data_type().clone());
+    if lt == rt {
+        return Ok((l, r));
+    }
+    let (Some(lr), Some(rr)) = (rank(&lt), rank(&rt)) else {
+        return Ok((l, r));
+    };
+    let target = if lr >= rr { lt } else { rt };
+    let l = cast::cast(&l, &target).map_err(|e| map_arrow(e, "implicit widening"))?;
+    let r = cast::cast(&r, &target).map_err(|e| map_arrow(e, "implicit widening"))?;
+    Ok((l, r))
 }
 
 /// `lhs / rhs`. See the module docs' point 2: arrow's integer division
@@ -2374,5 +2417,77 @@ mod tests {
         let expr = sf(OID_STRPOS, vec![lit_text("hello"), lit_text("xyz")]);
         let result = eval(&expr, &one_row()).unwrap();
         assert_eq!(i32_array(&result).value(0), 0);
+    }
+    /// Postgres widens implicitly before comparing; arrow's kernels demand
+    /// identical types. `bigint_col > 2` is ordinary SQL — the literal is int4
+    /// and the column int8 — and without widening the kernel rejects the pair,
+    /// so the entire query falls back. This was found by a bridge test, not by
+    /// a unit test, which is why it survived until the owned engine ran real
+    /// queries.
+    #[test]
+    fn a_bigint_column_compares_against_an_int4_literal() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1i64, 5, 9]))],
+        )
+        .unwrap();
+        let e = Expr::Binary {
+            op: OpId(basin_pgtype::Oid(521)), // int4 >
+            lhs: Box::new(Expr::Column(basin_plan::ColumnRef {
+                relation: 0,
+                index: 0,
+                name: "n".into(),
+            })),
+            rhs: Box::new(Expr::Literal(
+                basin_plan::Datum::Int32(4),
+                basin_pgtype::PgType::INT4,
+            )),
+        };
+        let out = eval(&e, &batch).unwrap();
+        let b = out
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap();
+        assert_eq!(
+            (b.value(0), b.value(1), b.value(2)),
+            (false, true, true),
+            "int8 vs int4 must widen, not error"
+        );
+    }
+
+    /// Widening only. Postgres makes narrowing casts assignment-only rather
+    /// than implicit precisely because they can lose value, so a float8 column
+    /// compared to an int must widen the INT, never truncate the float — the
+    /// latter would silently change which rows match.
+    #[test]
+    fn widening_goes_toward_the_wider_type_never_the_narrower() {
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Float64Array::from(vec![2.5f64]))],
+        )
+        .unwrap();
+        let e = Expr::Binary {
+            op: OpId(basin_pgtype::Oid(521)),
+            lhs: Box::new(Expr::Column(basin_plan::ColumnRef {
+                relation: 0,
+                index: 0,
+                name: "f".into(),
+            })),
+            rhs: Box::new(Expr::Literal(
+                basin_plan::Datum::Int32(2),
+                basin_pgtype::PgType::INT4,
+            )),
+        };
+        let out = eval(&e, &batch).unwrap();
+        let b = out
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap();
+        assert!(
+            b.value(0),
+            "2.5 > 2 is true; truncating 2.5 to 2 would make it false"
+        );
     }
 }
