@@ -1469,6 +1469,7 @@ version = "0.1.10"
 dependencies = [
  "arrow-schema",
  "basin-pgtype",
+ "pg_query",
 ]
 
 [[package]]

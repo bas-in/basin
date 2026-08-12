@@ -14,3 +14,9 @@ publish.workspace = true
 [dependencies]
 basin-pgtype = { workspace = true }
 arrow-schema = { workspace = true }
+# Real PostgreSQL parser (libpg_query), used by `lower` to turn a pg_query
+# parse tree into this crate's `Expr`/`LogicalPlan`. See
+# docs/decisions/0030-own-query-engine-remove-datafusion.md — this is the
+# dependency that replaces basin-engine's 9,546-line string-rewriting
+# `pg_operators.rs`.
+pg_query = { workspace = true }
