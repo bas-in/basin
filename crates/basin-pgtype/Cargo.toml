@@ -1,0 +1,16 @@
+[package]
+name = "basin-pgtype"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Deliberately minimal. This crate is the thing 249 UDFs, the catalog, the wire
+# protocol and the planner all have to agree on, so it sits at the bottom of the
+# dependency graph and stays there. `arrow-schema` is the only dependency
+# because the physical mapping has to name Arrow types; nothing here needs Arrow
+# *data*, and nothing here may depend on basin-engine, DataFusion, or storage.
+# See docs/migration/df-removal/08-ir-design.md §1.
+[dependencies]
+arrow-schema = { workspace = true }

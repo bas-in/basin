@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/basin-common",
+    "crates/basin-pgtype",
     "crates/basin-storage",
     "crates/basin-catalog",
     "crates/basin-engine",
@@ -51,6 +52,10 @@ publish = false
 [workspace.dependencies]
 # Internal
 basin-common = { path = "crates/basin-common" }
+# Postgres type system: the logical types the planner, catalog, wire protocol
+# and every UDF signature agree on. Leaf crate — arrow-schema only, no
+# DataFusion, no storage. First increment of ADR 0030.
+basin-pgtype = { path = "crates/basin-pgtype" }
 basin-fn = { path = "crates/basin-fn" }
 basin-storage = { path = "crates/basin-storage" }
 basin-catalog = { path = "crates/basin-catalog" }
