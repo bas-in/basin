@@ -29,7 +29,10 @@
 //! [`ExecError::OutOfMemory`] preserves that. Real disk spill is deliberately
 //! deferred; see `docs/migration/df-removal/08-ir-design.md` §7.
 
+pub mod aggregate;
 pub mod eval;
+pub mod join;
 pub mod operator;
+pub mod sort;
 
 pub use operator::{ExecError, Operator};
