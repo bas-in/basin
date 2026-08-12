@@ -30,6 +30,7 @@ use crate::join::HashJoin;
 use crate::operator::{ExecError, Operator};
 use crate::project::{Filter, Project};
 use crate::scan::{BatchSource, Scan};
+use crate::setop::{Distinct, Empty, SetOp, Values};
 use crate::sort::{Sort, SortKey, TopK};
 
 /// Why a plan could not be turned into operators.
@@ -234,6 +235,52 @@ pub fn build_with_budget(
                 rk.push(column_index(b).ok_or(BuildError::NonColumnKey("join"))?);
             }
             Ok(Box::new(HashJoin::new(l, r, *kind, lk, rk, budget)))
+        }
+
+        LogicalPlan::Values { rows, schema } => {
+            let names: Vec<String> = schema.iter().map(|(n, _)| n.clone()).collect();
+            Ok(Box::new(Values::new(rows.clone(), names)?))
+        }
+
+        LogicalPlan::Empty {
+            produce_one_row,
+            schema,
+        } => {
+            let fields = schema
+                .iter()
+                .map(|(n, t)| {
+                    basin_pgtype::physical(*t)
+                        .map(|dt| arrow_schema::Field::new(n, dt, true))
+                        .map_err(|e| BuildError::Unsupported(e.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let arrow_schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
+            Ok(Box::new(Empty::new(arrow_schema, *produce_one_row)))
+        }
+
+        LogicalPlan::Distinct { input, on } => {
+            let child = build_with_budget(input, tables, budget)?;
+            match on {
+                None => Ok(Box::new(Distinct::new(child, budget))),
+                Some(exprs) => {
+                    let cols = exprs
+                        .iter()
+                        .map(|e| column_index(e).ok_or(BuildError::NonColumnKey("DISTINCT ON")))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(Box::new(Distinct::new_on(child, cols, budget)))
+                }
+            }
+        }
+
+        LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } => {
+            let l = build_with_budget(left, tables, budget)?;
+            let r = build_with_budget(right, tables, budget)?;
+            Ok(Box::new(SetOp::new(l, r, *op, *all, budget)?))
         }
 
         other => Err(BuildError::Unsupported(plan_kind(other).to_string())),
@@ -486,15 +533,18 @@ mod tests {
     /// instead of errors.
     #[test]
     fn an_unbuildable_plan_names_the_construct() {
-        let plan = LogicalPlan::Distinct {
+        // Window functions are genuinely unimplemented — Basin has no window
+        // code at all, in either engine. (DISTINCT used to be the example here
+        // and now builds, which is the outcome this test is meant to have.)
+        let plan = LogicalPlan::Window {
             input: Box::new(scan_plan(vec![ColId(0)], vec![])),
-            on: None,
+            windows: vec![],
         };
         let err = match build(&plan, &resolver()) {
             Err(e) => e,
-            Ok(_) => panic!("DISTINCT has no operator yet and must not build"),
+            Ok(_) => panic!("window functions have no operator yet and must not build"),
         };
-        assert_eq!(err, BuildError::Unsupported("DISTINCT".into()));
+        assert_eq!(err, BuildError::Unsupported("window function".into()));
     }
 
     #[test]

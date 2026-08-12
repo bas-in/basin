@@ -36,6 +36,7 @@ pub mod join;
 pub mod operator;
 pub mod project;
 pub mod scan;
+pub mod setop;
 pub mod sort;
 
 pub use operator::{ExecError, Operator};
