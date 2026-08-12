@@ -208,8 +208,15 @@ pub enum LogicalPlan {
 
     /// Expands set-returning functions in a target list.
     ///
-    /// Multiple SRFs in one list expand to the least common multiple of their
-    /// row counts, with shorter ones cycling — Postgres's rule since 10.
+    /// Multiple SRFs in one list run in LOCKSTEP to the LONGEST, with shorter
+    /// ones padded with NULL — Postgres's rule since 10.
+    /// `SELECT generate_series(1,2), generate_series(1,3)` yields three rows.
+    ///
+    /// It is emphatically NOT the least common multiple with shorter ones
+    /// cycling; that was the pre-10 behaviour and is what most references, and
+    /// most recollections, still describe. This comment said the wrong thing
+    /// until 2026-08-12, having been written from memory; the operator in
+    /// `basin-exec` was correct because its author checked a live server.
     ProjectSet {
         input: Box<LogicalPlan>,
         srfs: Vec<Expr>,
