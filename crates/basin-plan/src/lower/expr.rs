@@ -2009,7 +2009,8 @@ mod tests {
     fn cast_to_an_unknown_type_name_is_unsupported() {
         let c = cols();
         let o = CatalogOperators;
-        let err = lower_expr(&parse_expr("a::frobnicator"), &ctx(&c, &o)).expect_err("no such type");
+        let err =
+            lower_expr(&parse_expr("a::frobnicator"), &ctx(&c, &o)).expect_err("no such type");
         assert!(matches!(err, LowerError::Unsupported(_)));
     }
 
@@ -2046,7 +2047,10 @@ mod tests {
             &ctx(&c, &o),
         )
         .unwrap();
-        let Expr::Aggregate { distinct, filter, .. } = e else {
+        let Expr::Aggregate {
+            distinct, filter, ..
+        } = e
+        else {
             panic!("expected Aggregate");
         };
         assert!(!distinct);
@@ -2135,11 +2139,7 @@ mod tests {
         // tree (BoolExpr(NOT) wrapping the same SubLink) — both must rewrite
         // to the dedicated `NotIn` shape rather than a generic boolean NOT,
         // per the special case in `lower_bool_expr`.
-        let e = lower_expr(
-            &where_expr("a NOT IN (SELECT b FROM t)"),
-            &ctx(&c, &o),
-        )
-        .unwrap();
+        let e = lower_expr(&where_expr("a NOT IN (SELECT b FROM t)"), &ctx(&c, &o)).unwrap();
         assert!(
             matches!(
                 e,
@@ -2151,11 +2151,7 @@ mod tests {
             "got {e:?}"
         );
 
-        let e = lower_expr(
-            &where_expr("NOT (a IN (SELECT b FROM t))"),
-            &ctx(&c, &o),
-        )
-        .unwrap();
+        let e = lower_expr(&where_expr("NOT (a IN (SELECT b FROM t))"), &ctx(&c, &o)).unwrap();
         assert!(
             matches!(
                 e,
@@ -2197,7 +2193,10 @@ mod tests {
         let o = CatalogOperators;
         let e = lower_expr(&where_expr("a = ANY(ARRAY[1, 2, 3])"), &ctx(&c, &o)).unwrap();
         let Expr::Subquery {
-            kind, subplan, operand, ..
+            kind,
+            subplan,
+            operand,
+            ..
         } = e
         else {
             panic!("expected Subquery");
