@@ -6705,6 +6705,23 @@ pub(crate) fn rewrite_vector_col_text_cast(sql: &str) -> String {
                     break;
                 }
             }
+            // If the token is itself immediately preceded by `::`, it is not
+            // a column reference at all — it's the *type name* of a prior
+            // cast (e.g. the `int4` in `42::int4::text`), and the backward
+            // scan cannot otherwise distinguish "identifier" from "type name
+            // that happens to look like an identifier".  Treat this case the
+            // same as a keyword literal: pass through untouched rather than
+            // wrapping the type name in `vector_to_text(...)`, which would
+            // produce the syntactically invalid `42::vector_to_text(int4)`.
+            //
+            // This is a narrow patch, not a structural fix: the real fix is
+            // to stop doing identifier detection by scanning raw SQL text at
+            // all and instead apply this rewrite after lowering to an IR
+            // that already distinguishes "column reference" from "type name"
+            // as separate node kinds — see ADR 0030, which is why this whole
+            // file is being retired rather than grown further.
+            let preceded_by_cast_marker =
+                id_start >= 2 && &out_bytes[id_start - 2..id_start] == b"::";
             let ident_len = ident_end - id_start;
             // Only rewrite when the token is a valid SQL identifier: must
             // start with a letter or underscore (not a digit).  `1::text`
@@ -6732,7 +6749,7 @@ pub(crate) fn rewrite_vector_col_text_cast(sql: &str) -> String {
                 ident_str.to_ascii_uppercase().as_str(),
                 "NULL" | "TRUE" | "FALSE" | "UNKNOWN"
             );
-            if is_ident && !is_keyword_literal {
+            if is_ident && !is_keyword_literal && !preceded_by_cast_marker {
                 // Wrap the identifier: `IDENT::text` → `vector_to_text(IDENT)`.
                 let ident = ident_str.to_string();
                 out.truncate(id_start);
@@ -9542,5 +9559,43 @@ mod tests {
             !map.contains_key("WHERE") && !map.contains_key("where"),
             "must not treat keyword as alias: {map:?}"
         );
+    }
+
+    // ── `expr::text` → `vector_to_text(expr)` rewriter ─────────────────────
+
+    #[test]
+    fn vector_col_text_cast_does_not_mistake_a_prior_type_name_for_a_column() {
+        // `42::int4::text`: the token immediately before the final `::text`
+        // is `int4`, the *type name* of the preceding cast, not a column
+        // reference. Wrapping it produces the syntactically invalid
+        // `42::vector_to_text(int4)`, which sqlparser rejects as an
+        // unsupported type (this was C9 in the differential baseline).
+        let sql = "SELECT 42::int4::text";
+        let out = rewrite_vector_col_text_cast(sql);
+        assert_eq!(out, sql, "double cast must pass through unrewritten");
+        assert!(
+            !out.contains("vector_to_text"),
+            "must not wrap a type name in vector_to_text: {out}"
+        );
+    }
+
+    #[test]
+    fn vector_col_text_cast_still_rewrites_a_real_column_reference() {
+        // The case this rewriter exists for: a bare column identifier
+        // directly before `::text` is still rewritten so pgvector-style
+        // `embedding::text` keeps working.
+        let sql = "SELECT embedding::text FROM t";
+        let out = rewrite_vector_col_text_cast(sql);
+        assert_eq!(out, "SELECT vector_to_text(embedding) FROM t");
+    }
+
+    #[test]
+    fn vector_col_text_cast_handles_a_column_cast_chain() {
+        // `col::int4::text` — same mechanism as the numeric-literal case:
+        // `int4` is a type name from the prior cast, not `col` itself, so
+        // it must not be wrapped either.
+        let sql = "SELECT col::int4::text FROM t";
+        let out = rewrite_vector_col_text_cast(sql);
+        assert_eq!(out, sql);
     }
 }

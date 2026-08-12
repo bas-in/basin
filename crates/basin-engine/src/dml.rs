@@ -872,7 +872,7 @@ fn build_int64_not_null(rows: &[Vec<Expr>], col_idx: usize, col_name: &str) -> R
         match coerce_i64(&row[col_idx])? {
             Some(v) => values.push(v),
             None => {
-                return Err(BasinError::InvalidSchema(format!(
+                return Err(BasinError::not_null_violation(format!(
                     "NULL inserted into NOT NULL column {col_name}"
                 )));
             }
@@ -910,7 +910,7 @@ fn build_utf8_not_null(rows: &[Vec<Expr>], col_idx: usize, col_name: &str) -> Re
         match coerce_string_ref(&row[col_idx])? {
             Some(v) => values.push(v),
             None => {
-                return Err(BasinError::InvalidSchema(format!(
+                return Err(BasinError::not_null_violation(format!(
                     "NULL inserted into NOT NULL column {col_name}"
                 )));
             }
@@ -943,7 +943,7 @@ fn build_bool_not_null(rows: &[Vec<Expr>], col_idx: usize, col_name: &str) -> Re
         match coerce_bool(&row[col_idx])? {
             Some(v) => values.push(v),
             None => {
-                return Err(BasinError::InvalidSchema(format!(
+                return Err(BasinError::not_null_violation(format!(
                     "NULL inserted into NOT NULL column {col_name}"
                 )));
             }
@@ -976,7 +976,7 @@ fn build_f64_not_null(rows: &[Vec<Expr>], col_idx: usize, col_name: &str) -> Res
         match coerce_f64(&row[col_idx])? {
             Some(v) => values.push(v),
             None => {
-                return Err(BasinError::InvalidSchema(format!(
+                return Err(BasinError::not_null_violation(format!(
                     "NULL inserted into NOT NULL column {col_name}"
                 )));
             }
@@ -2457,7 +2457,7 @@ fn object_keys_sorted(map: &serde_json::Map<String, serde_json::Value>) -> bool 
 
 pub(crate) fn check_null_allowed(field: &arrow_schema::Field) -> Result<()> {
     if !field.is_nullable() {
-        return Err(BasinError::InvalidSchema(format!(
+        return Err(BasinError::not_null_violation(format!(
             "NULL inserted into NOT NULL column {}",
             field.name()
         )));
@@ -3720,9 +3720,15 @@ mod tests {
         let rows = rows_from_sql(&sql);
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let err = batch_from_rows(schema, &rows).unwrap_err();
+        // Updated with the SQLSTATE fix: this used to surface as
+        // InvalidSchema, which the router mapped into class 42 (syntax /
+        // access rule violation). Postgres raises 23502, class 23 (integrity
+        // constraint violation). The distinction is not cosmetic — a driver
+        // that retries on constraint violations but not on syntax errors
+        // behaved wrongly against Basin.
         assert!(
-            matches!(err, BasinError::InvalidSchema(_)),
-            "expected InvalidSchema, got {err:?}"
+            matches!(err, BasinError::NotNullViolation(_)),
+            "expected NotNullViolation (SQLSTATE 23502), got {err:?}"
         );
     }
 
@@ -3762,6 +3768,46 @@ mod tests {
         assert!(
             msg.contains("not-a-date") && msg.contains("column d"),
             "error must name the literal and the column: {msg}"
+        );
+    }
+
+    /// A NULL written to a NOT NULL column must raise `BasinError::
+    /// NotNullViolation` (SQLSTATE 23502 once mapped by the router), not
+    /// `InvalidSchema` (42601, `syntax_error`). Differential-baseline C7:
+    /// `INSERT INTO t VALUES (NULL)` against a NOT NULL column previously
+    /// tagged this with the wrong SQLSTATE class entirely — 42 (syntax) is
+    /// not the constraint-violation class (23) PostgreSQL uses for exactly
+    /// this condition.
+    #[test]
+    fn not_null_violation_uses_dedicated_variant_not_invalid_schema() {
+        let rows = rows_from_sql("INSERT INTO t (id) VALUES (NULL)");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let err = batch_from_rows(schema, &rows).unwrap_err();
+        assert!(
+            matches!(err, BasinError::NotNullViolation(_)),
+            "expected NotNullViolation, got {err:?}"
+        );
+        assert!(
+            !matches!(err, BasinError::InvalidSchema(_)),
+            "must not collapse into the generic syntax-error variant"
+        );
+        assert!(
+            err.to_string().contains("NOT NULL column id"),
+            "error must name the offending column: {err}"
+        );
+    }
+
+    /// Same check via the bulk (non-per-row-builder) path: a whole-column
+    /// `NOT NULL` build with an all-non-null Int64 column must still take
+    /// the dedicated `NotNullViolation` variant when a NULL slips through,
+    /// not `InvalidSchema`.
+    #[test]
+    fn check_null_allowed_uses_dedicated_variant() {
+        let field = Field::new("id", DataType::Int64, false);
+        let err = check_null_allowed(&field).unwrap_err();
+        assert!(
+            matches!(err, BasinError::NotNullViolation(_)),
+            "expected NotNullViolation, got {err:?}"
         );
     }
 }

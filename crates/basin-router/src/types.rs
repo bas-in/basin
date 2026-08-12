@@ -100,6 +100,25 @@ fn field_is_uuid(f: &Field) -> bool {
     f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
 }
 
+/// Whether the cell at `idx` in `col` is SQL NULL.
+///
+/// `Array::is_null` alone is not enough: it consults the array's *physical*
+/// null bitmap (`Array::nulls()`), and Arrow's `NullArray` — the array type
+/// used for an untyped `NULL` literal or a `void`-returning function result
+/// (`DataType::Null`) — deliberately carries no bitmap at all (`nulls()`
+/// returns `None`, `null_count()` reports `0`) even though every logical
+/// value in it is null; see `arrow_array::NullArray`'s own doc example,
+/// which asserts `null_count() == 0` and `logical_null_count() == len`. A
+/// bare `col.is_null(idx)` therefore reports `false` for every row of a
+/// `DataType::Null` column, so callers that only check `is_null` before
+/// falling into their real-type match fall through to the generic text
+/// fallback instead of emitting a wire NULL. Every `DataType::Null` value is
+/// unconditionally NULL, so that case is special-cased here rather than
+/// relying on Arrow's physical bitmap.
+pub(crate) fn is_null_cell(col: &dyn Array, idx: usize) -> bool {
+    matches!(col.data_type(), DataType::Null) || col.is_null(idx)
+}
+
 /// Convert an Arrow schema to a pgwire `RowDescription`. Field names are
 /// preserved verbatim. Type OIDs come from `arrow_to_pg_type`.
 pub(crate) fn row_description(schema: &Schema) -> RowDescription {
@@ -421,7 +440,7 @@ fn encode_value_binary(
     is_jsonb: bool,
     is_uuid: bool,
 ) -> Result<()> {
-    if col.is_null(idx) {
+    if is_null_cell(col, idx) {
         buf.put_i32(-1);
         return Ok(());
     }
@@ -835,7 +854,7 @@ fn oid_for_arrow_type(dt: &DataType) -> u32 {
 /// Supports the same scalar types as `encode_value_binary`; exotic types fall
 /// back to a text encoding (same lenient policy as the outer scalar path).
 fn encode_element_binary(elem_array: &dyn Array, j: usize, buf: &mut BytesMut) {
-    if elem_array.is_null(j) {
+    if is_null_cell(elem_array, j) {
         buf.put_i32(-1);
         return;
     }
@@ -1015,7 +1034,7 @@ fn encode_value(
     is_uuid: bool,
     sf: &mut StackFmt,
 ) {
-    if col.is_null(idx) {
+    if is_null_cell(col, idx) {
         buf.put_i32(-1);
         return;
     }
@@ -1292,7 +1311,7 @@ fn format_pg_array_text(elems: &dyn Array) -> String {
         if i > 0 {
             s.push(',');
         }
-        if elems.is_null(i) {
+        if is_null_cell(elems, i) {
             s.push_str("NULL");
             continue;
         }
@@ -1574,6 +1593,46 @@ mod tests {
         assert_eq!(&row1.data[0..4], &1i32.to_be_bytes());
         assert_eq!(row1.data[4], b'2');
         assert_eq!(&row1.data[5..9], &(-1i32).to_be_bytes());
+    }
+
+    #[test]
+    fn null_array_column_encodes_as_wire_null_not_debug_text() {
+        // Regression test for the "Null@0" divergence: a `DataType::Null`
+        // column (Arrow's `NullArray`, used for a bare `SELECT NULL` or a
+        // void-returning function result) must encode as a real wire NULL
+        // (-1 length prefix, no body) rather than falling through to the
+        // Debug-format catch-all in `render_cell` and emitting the literal
+        // text "Null@0". `NullArray::is_null` reports `false` for every
+        // index (it has no physical null bitmap), so this exercises
+        // `is_null_cell`'s `DataType::Null` special case specifically.
+        use arrow_array::NullArray;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "?column?",
+            DataType::Null,
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(NullArray::new(1))]).unwrap();
+        let rows = encode_batches(&schema, &[batch]);
+        assert_eq!(rows.len(), 1);
+        // Whole cell body must be exactly the 4-byte -1 length prefix: no
+        // "Null@0" (or any other) text payload following it.
+        assert_eq!(rows[0].data.len(), 4);
+        assert_eq!(&rows[0].data[..], &(-1i32).to_be_bytes());
+    }
+
+    #[test]
+    fn is_null_cell_treats_null_datatype_as_always_null() {
+        use arrow_array::NullArray;
+        let n = NullArray::new(3);
+        // Sanity-check the documented Arrow quirk this helper works around:
+        // the bare `Array::is_null` does NOT report true for `NullArray`.
+        assert!(!n.is_null(0));
+        // But every logical value in a `DataType::Null` array is NULL, and
+        // `is_null_cell` must say so for every in-bounds index.
+        for i in 0..3 {
+            assert!(is_null_cell(&n, i));
+        }
     }
 
     #[test]

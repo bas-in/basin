@@ -102,9 +102,15 @@ fn classify(err: &BasinError) -> (&'static str, &'static str) {
         BasinError::UniqueViolation(_) => ("ERROR", "23505"),      // unique_violation
         BasinError::CheckViolation(_) => ("ERROR", "23514"),       // check_violation
         BasinError::ForeignKeyViolation(_) => ("ERROR", "23503"),  // foreign_key_violation
-        BasinError::RlsViolation(_) => ("ERROR", "42501"),         // insufficient_privilege (RLS)
-        BasinError::PermissionDenied(_) => ("ERROR", "42501"),     // insufficient_privilege
-        BasinError::StringTooLong(_) => ("ERROR", "22001"),        // string_data_right_truncation
+        // NULL written to a NOT NULL column. PostgreSQL raises 23502
+        // (not_null_violation) — same integrity-constraint-violation class
+        // (23xxx) as unique/check/foreign-key above. Previously collapsed
+        // into InvalidSchema's 42601 (syntax_error), which is the wrong
+        // class entirely: the statement is syntactically valid.
+        BasinError::NotNullViolation(_) => ("ERROR", "23502"), // not_null_violation
+        BasinError::RlsViolation(_) => ("ERROR", "42501"),     // insufficient_privilege (RLS)
+        BasinError::PermissionDenied(_) => ("ERROR", "42501"), // insufficient_privilege
+        BasinError::StringTooLong(_) => ("ERROR", "22001"),    // string_data_right_truncation
         // Phase 6.X.C (ADR 0023): voluntary lease handoff in progress —
         // retryable (same SQLSTATE class as commit conflict, since the
         // caller should retry from a fresh route + re-resolved owner).
@@ -325,6 +331,20 @@ mod tests {
         assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
         assert_eq!(er.fields[1], (b'C', "08006".to_owned()));
         assert!(er.fields[2].1.contains("fra"), "names the home region");
+    }
+
+    #[test]
+    fn classifies_not_null_violation() {
+        // A NULL written to a NOT NULL column must surface as SQLSTATE
+        // 23502 (not_null_violation) — the exact code PostgreSQL raises —
+        // not 42601 (syntax_error), which InvalidSchema previously
+        // collapsed it into.
+        let er = error_response(&BasinError::not_null_violation(
+            "NULL inserted into NOT NULL column id",
+        ));
+        assert_eq!(er.fields[0], (b'S', "ERROR".to_owned()));
+        assert_eq!(er.fields[1], (b'C', "23502".to_owned()));
+        assert!(er.fields[2].1.contains("NOT NULL column id"));
     }
 
     #[test]

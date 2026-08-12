@@ -104,6 +104,20 @@ pub enum BasinError {
     #[error("{0}")]
     ForeignKeyViolation(String),
 
+    /// NOT NULL constraint violation: a NULL value was written to a column
+    /// declared `NOT NULL`. Router maps to SQLSTATE `23502`
+    /// (`not_null_violation`) — the exact code PostgreSQL raises for `null
+    /// value in column "..." violates not-null constraint`. Previously this
+    /// collapsed into [`Self::InvalidSchema`] (`42601`, `syntax_error`),
+    /// which is wrong: the statement is syntactically fine and Basin's own
+    /// constraint check correctly detects the violation, it was just tagged
+    /// with the wrong SQLSTATE class (`42` = syntax/access error, not `23`
+    /// = integrity constraint violation, the same class as
+    /// [`Self::UniqueViolation`] / [`Self::CheckViolation`] /
+    /// [`Self::ForeignKeyViolation`]).
+    #[error("{0}")]
+    NotNullViolation(String),
+
     /// Row-level-security policy violation: an INSERT/UPDATE produced a
     /// row that fails an applicable policy's WITH CHECK (or USING when no
     /// WITH CHECK is declared) expression. Router maps to SQLSTATE
@@ -352,6 +366,11 @@ impl BasinError {
     }
     pub fn feature_not_supported(msg: impl Into<String>) -> Self {
         Self::FeatureNotSupported(msg.into())
+    }
+    /// Typed constructor for a NOT NULL constraint violation. Produces
+    /// SQLSTATE `23502` (`not_null_violation`), matching PostgreSQL.
+    pub fn not_null_violation(msg: impl Into<String>) -> Self {
+        Self::NotNullViolation(msg.into())
     }
     pub fn query_canceled(msg: impl Into<String>) -> Self {
         Self::QueryCanceled(msg.into())

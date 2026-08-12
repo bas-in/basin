@@ -2033,7 +2033,7 @@ fn csv_encode_into(v: &str, out: &mut String, delimiter: char, quote: char) {
 /// piggy-back on the existing text-format renderers in `crate::types` for
 /// consistency with the simple-query SELECT path.
 fn render_csv_cell(col: &dyn arrow_array::Array, idx: usize, field: &Field) -> String {
-    if col.is_null(idx) {
+    if crate::types::is_null_cell(col, idx) {
         // CSV NULL = empty unquoted by default in Postgres CSV mode.
         return String::new();
     }
