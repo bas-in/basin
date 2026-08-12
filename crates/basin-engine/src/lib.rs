@@ -111,6 +111,19 @@ pub(crate) struct EngineInner {
     /// pg_plan path (ADR 0014 Phase 1+). Tests assert this advances when
     /// they expect the new routing to engage.
     pub(crate) pg_plan_routing_count: AtomicU64,
+    /// Counter bumped every time a SELECT is served end to end by the owned
+    /// query pipeline (`basin-plan` + `basin-exec`), behind
+    /// `BASIN_OWNED_ENGINE`. See `owned_engine` module docs: the ratio of
+    /// this counter to [`EngineInner::owned_engine_fallback_count`] is the
+    /// migration's governing metric — DataFusion is retired when the
+    /// fallback count reaches (and stays at) zero, not on a calendar date.
+    pub(crate) owned_engine_served_count: AtomicU64,
+    /// Counter bumped every time the owned-engine bridge was attempted
+    /// (flag on, single-statement SELECT) but declined to serve the query —
+    /// an ineligible table, an unsupported construct, or any lowering /
+    /// build / execution error — and control fell through to the unchanged
+    /// DataFusion path instead. See [`EngineInner::owned_engine_served_count`].
+    pub(crate) owned_engine_fallback_count: AtomicU64,
     /// Cumulative number of data files skipped by the bloom-filter probe in
     /// `fast_select`. Incremented once per file where the bloom proves the
     /// Eq-predicate value is definitely absent. Used by integration tests to
@@ -547,6 +560,8 @@ impl Engine {
             cfg,
             vector_routing_count: AtomicU64::new(0),
             pg_plan_routing_count: AtomicU64::new(0),
+            owned_engine_served_count: AtomicU64::new(0),
+            owned_engine_fallback_count: AtomicU64::new(0),
             blooms_skipped: AtomicU64::new(0),
             promoted_fast_select_count: AtomicU64::new(0),
             trgm_knn_routing_count: AtomicU64::new(0),
@@ -1410,6 +1425,42 @@ impl Engine {
         self.inner.pg_plan_routing_count.load(Ordering::Relaxed)
     }
 
+    /// Crate-private hook bumped by `owned_engine::try_execute` each time a
+    /// SELECT is served end to end by the owned query pipeline.
+    pub(crate) fn note_owned_engine_served(&self) {
+        self.inner
+            .owned_engine_served_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative count of SELECTs served by the owned query pipeline
+    /// (`basin-plan` + `basin-exec`) behind `BASIN_OWNED_ENGINE` since this
+    /// `Engine` was built. Exposed for integration tests, and for the
+    /// migration's own governing metric alongside
+    /// [`Engine::owned_engine_fallback_count`] — see `owned_engine`'s module
+    /// docs.
+    pub fn owned_engine_served_count(&self) -> u64 {
+        self.inner.owned_engine_served_count.load(Ordering::Relaxed)
+    }
+
+    /// Crate-private hook bumped by `owned_engine::try_execute` each time
+    /// the owned-engine bridge was attempted but declined to serve the
+    /// query, falling through to DataFusion instead.
+    pub(crate) fn note_owned_engine_fallback(&self) {
+        self.inner
+            .owned_engine_fallback_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative count of SELECTs the owned-engine bridge attempted but
+    /// fell back to DataFusion for, since this `Engine` was built. See
+    /// [`Engine::owned_engine_served_count`].
+    pub fn owned_engine_fallback_count(&self) -> u64 {
+        self.inner
+            .owned_engine_fallback_count
+            .load(Ordering::Relaxed)
+    }
+
     /// Open a session bound to `project`. The catalog namespace is created on
     /// demand if it does not yet exist.
     ///
@@ -2212,6 +2263,10 @@ pub mod noop_accept;
 mod notify_registry;
 mod nullif_rewrite;
 pub(crate) mod operators;
+/// Bridges a real client SELECT into the owned query pipeline
+/// (`basin-plan` + `basin-exec`) behind the `BASIN_OWNED_ENGINE` env flag
+/// (default OFF). See the module's own docs for the full rationale.
+mod owned_engine;
 pub mod overlay_reconcile;
 /// #28 two-engine integration test for transparent per-partition write
 /// forwarding (compiled only under `cfg(test)`).

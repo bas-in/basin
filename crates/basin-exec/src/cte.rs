@@ -1428,13 +1428,20 @@ mod tests {
     }
 
     // Item 9: unnest explodes elements in order.
-    // KNOWN FAILING — the assertion is right and the implementation is wrong.
-    // `ProjectSet::schema()` reports the LIST type for an unnest column where
-    // it must report the ELEMENT type; `resolve_srf` computes the element type
-    // correctly, so the schema is being built from the wrong place. Ignored
-    // rather than weakened: the test states the behaviour Postgres has, and
-    // deleting or relaxing it would hide the bug instead of recording it.
-    #[ignore = "ProjectSet::schema reports the list type, not the element type"]
+    //
+    // Previously ignored on a misdiagnosis: the note claimed
+    // `ProjectSet::schema()` reported the LIST type where it should report
+    // the ELEMENT type. `resolve_srf`'s `Unnest` arm was never the culprit —
+    // it always computed the element type correctly (verified by the very
+    // next field). Field 0 here is `arr`, the PASSTHROUGH of the input
+    // column `ProjectSet::new` always clones ahead of any appended SRF
+    // field (see `project_set_schema_appends_srf_columns_after_input_columns`
+    // and the mixed generate_series/unnest
+    // `project_set_generate_series_and_unnest_together_run_in_lockstep`,
+    // both already passing on that ordering) — of course it is the LIST
+    // type; that is the passthrough column's real type, unrelated to
+    // unnest. `e`, the actual unnest output, is field 1, and reports
+    // `Int32` correctly. The test was checking the wrong column.
     #[test]
     fn project_set_unnest_explodes_array_elements_in_order() {
         let schema = list_schema("arr");
@@ -1442,19 +1449,17 @@ mod tests {
         let input = Feed::boxed(schema, vec![batch]);
         let srfs = vec![(unnest_expr(col(0, "arr")), "e".to_string())];
         let mut ps = ProjectSet::new(input, srfs).unwrap();
-        assert_eq!(ps.schema().field(0).data_type(), &DataType::Int32);
+        assert_eq!(ps.schema().field(1).data_type(), &DataType::Int32);
         let out = ps.next_batch().unwrap().unwrap();
-        assert_eq!(col_i32(&out, 0), vec![Some(10), Some(20), Some(30)]);
+        assert_eq!(col_i32(&out, 1), vec![Some(10), Some(20), Some(30)]);
     }
 
     // Item 9: NULL elements inside the array survive unnest.
-    // KNOWN FAILING — the assertion is right and the implementation is wrong.
-    // `ProjectSet::schema()` reports the LIST type for an unnest column where
-    // it must report the ELEMENT type; `resolve_srf` computes the element type
-    // correctly, so the schema is being built from the wrong place. Ignored
-    // rather than weakened: the test states the behaviour Postgres has, and
-    // deleting or relaxing it would hide the bug instead of recording it.
-    #[ignore = "ProjectSet::schema reports the list type, not the element type"]
+    //
+    // Same misdiagnosis as the sibling test above: column 0 of the output
+    // is the passthrough `arr` (a `List<Int32>`), not the unnest result —
+    // `col_i32` panicked trying to downcast it to `Int32Array`. The unnest
+    // output `e` is column 1.
     #[test]
     fn project_set_unnest_preserves_null_elements() {
         let schema = list_schema("arr");
@@ -1463,7 +1468,7 @@ mod tests {
         let srfs = vec![(unnest_expr(col(0, "arr")), "e".to_string())];
         let mut ps = ProjectSet::new(input, srfs).unwrap();
         let out = ps.next_batch().unwrap().unwrap();
-        assert_eq!(col_i32(&out, 0), vec![Some(1), None, Some(3)]);
+        assert_eq!(col_i32(&out, 1), vec![Some(1), None, Some(3)]);
     }
 
     // Item 9: unnest(NULL::int[]) is zero rows.

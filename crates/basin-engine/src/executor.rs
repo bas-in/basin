@@ -2040,6 +2040,18 @@ pub(crate) async fn execute(sess: &ProjectSession, sql: &str) -> Result<ExecResu
             // pass. Gated before any SELECT fast path or exec_select runs.
             if matches!(kind, crate::pg_ast::StmtKind::Select) {
                 crate::region::region_read_guard(sess).await?;
+
+                // Owned-engine bridge (behind `BASIN_OWNED_ENGINE`, default
+                // OFF — see `owned_engine` module docs). Attempted for every
+                // single-statement SELECT once the flag is on; `try_execute`
+                // itself is a no-op (returns `None` immediately) when the
+                // flag is off, and falls back to the unchanged path below on
+                // any ineligibility or lowering/build/exec error, so this
+                // call changes nothing about today's behaviour by default.
+                let node = tree.stmts().next().expect("kinds[0] implies stmts[0]");
+                if let Some(result) = crate::owned_engine::try_execute(sess, node).await {
+                    return Ok(result);
+                }
             }
 
             if let Some(result) = crate::noop_accept::try_accept_as_noop(kind, sql) {

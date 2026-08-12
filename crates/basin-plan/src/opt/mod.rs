@@ -6,6 +6,9 @@
 //! genuine fixpoints rather than single-pass results — so the driver is
 //! required in the first increment, not a later refinement.
 
+pub mod decorrelate;
+pub mod limit;
+pub mod simplify;
 pub mod driver;
 pub mod projection;
 pub mod pushdown;

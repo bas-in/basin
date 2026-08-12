@@ -11,6 +11,17 @@ basin-common.workspace = true
 basin-storage.workspace = true
 basin-catalog.workspace = true
 basin-vector.workspace = true
+# Owned query pipeline (docs/decisions/0030-own-query-engine-remove-datafusion.md).
+# `owned_engine.rs` bridges real client SELECTs into `basin-plan` lowering +
+# `basin-exec` operators, behind the `BASIN_OWNED_ENGINE` env flag (default
+# OFF). Not used anywhere else in this crate yet.
+basin-plan.workspace = true
+basin-exec.workspace = true
+# PgType constructors/oids for the owned-engine bridge's catalog-backed
+# resolvers (`owned_engine.rs`) — mapping a real table's Arrow schema to the
+# PgType-carrying `basin_plan::Schema`, and building a real `OperatorResolver`
+# from `basin_pgtype::operator::resolve`.
+basin-pgtype.workspace = true
 # PostGIS-shape spatial layer. Engine depends on basin-geo for:
 # - POINT column physical type (`FixedSizeBinary(POINT_WKB_LEN)`)
 # - ST_MakePoint / ST_X / ST_Y / ST_Distance / ST_DWithin / ST_AsText etc.
