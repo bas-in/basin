@@ -37,8 +37,13 @@
 //!    known operand already decides the answer (`NULL AND FALSE = FALSE`).
 //! 4. **`IS DISTINCT FROM`.** `arrow_ord::cmp` ships `distinct`/`not_distinct`
 //!    kernels that already implement Postgres's null-safe equality exactly
-//!    (never NULL, two NULLs are NOT DISTINCT) — no extra work needed beyond
-//!    picking them over `eq`/`neq`.
+//!    (never NULL, two NULLs are NOT DISTINCT) — the semantics need no extra
+//!    work beyond picking them over `eq`/`neq`. The *operands* still do:
+//!    `distinct`/`not_distinct` reject a mismatched-type pair exactly like
+//!    `eq` does, so [`eval_distinct_from`] runs its operands through the same
+//!    [`eval_operand_pair`] widening/untyped-literal resolution `eval_binary`
+//!    uses for `=`/`<`/etc., or `bigint_col IS DISTINCT FROM 4` would fall
+//!    back the same way an unwidened `>` would.
 //! 5. **Boolean tests.** No arrow kernel answers "is this exactly TRUE"
 //!    versus "is this not exactly TRUE" — that distinction (`NULL IS NOT
 //!    TRUE` is `true`, `NULL = TRUE` is NULL) is specific to Postgres's
@@ -120,7 +125,9 @@
 
 use std::sync::Arc;
 
-use arrow::compute::kernels::{arity, boolean, cast, cmp, comparison, numeric, zip};
+use arrow::compute::kernels::{
+    arity, boolean, cast, cmp, comparison, concat_elements, numeric, zip,
+};
 use arrow_array::{
     new_null_array,
     types::{Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type},
@@ -431,6 +438,62 @@ fn eval_binary(
         ))
     })?;
 
+    let (l, r) = eval_operand_pair(lhs, rhs, batch)?;
+
+    match name {
+        "=" => Ok(Arc::new(cmp::eq(&l, &r).map_err(|e| map_arrow(e, "="))?)),
+        "<>" => Ok(Arc::new(cmp::neq(&l, &r).map_err(|e| map_arrow(e, "<>"))?)),
+        "<" => Ok(Arc::new(cmp::lt(&l, &r).map_err(|e| map_arrow(e, "<"))?)),
+        "<=" => Ok(Arc::new(
+            cmp::lt_eq(&l, &r).map_err(|e| map_arrow(e, "<="))?,
+        )),
+        ">" => Ok(Arc::new(cmp::gt(&l, &r).map_err(|e| map_arrow(e, ">"))?)),
+        ">=" => Ok(Arc::new(
+            cmp::gt_eq(&l, &r).map_err(|e| map_arrow(e, ">="))?,
+        )),
+        // `add`/`sub`/`mul` are arrow's *checked* kernels — they already
+        // error on overflow instead of wrapping. See the module docs' point 1.
+        "+" => numeric::add(&l, &r).map_err(|e| map_arrow(e, "integer addition")),
+        "-" => numeric::sub(&l, &r).map_err(|e| map_arrow(e, "integer subtraction")),
+        "*" => numeric::mul(&l, &r).map_err(|e| map_arrow(e, "integer multiplication")),
+        "/" => eval_div(&l, &r),
+        "%" => numeric::rem(&l, &r).map_err(|e| map_arrow(e, "modulo")),
+        // `text || text` (oid 654). An ordinary strict operator: unlike
+        // `concat()` (see [`eval_concat`]), `||` is NOT special about NULL —
+        // it yields NULL if EITHER side is NULL, the same as `+` would for
+        // numbers. `concat_elements_utf8`'s own doc example
+        // (`["a","b"] + [None,"c"] = [None,"bc"]`) already unions the two
+        // null buffers, which is exactly that strictness — no extra
+        // NULL-handling needed here beyond picking this kernel over a
+        // hand-rolled loop. Verified against a live PostgreSQL 18:
+        // `SELECT 'a' || NULL || 'b'` is NULL, while
+        // `SELECT concat('a', NULL, 'b')` is `'ab'`.
+        "||" => {
+            let l = downcast_array::<StringArray>(&l, "text")?;
+            let r = downcast_array::<StringArray>(&r, "text")?;
+            Ok(Arc::new(
+                concat_elements::concat_elements_utf8(l, r).map_err(|e| map_arrow(e, "||"))?,
+            ))
+        }
+        other => Err(ExecError::Internal(format!(
+            "operator '{other}' (oid {}) is not implemented in eval yet",
+            op.0.get()
+        ))),
+    }
+}
+
+/// Resolve `lhs`/`rhs` into a pair of arrays ready for a binary arrow kernel:
+/// untyped literals materialised from whichever side does have a type, then
+/// numeric widening applied. Shared by every binary node that hands its two
+/// operands straight to an arrow comparison/arithmetic kernel — [`eval_binary`]
+/// and [`eval_distinct_from`] today — rather than duplicated at each call
+/// site, since both need exactly the same fix for exactly the same reason
+/// (arrow's kernels demand identical types on both sides; Postgres does not).
+fn eval_operand_pair(
+    lhs: &Expr,
+    rhs: &Expr,
+    batch: &RecordBatch,
+) -> Result<(ArrayRef, ArrayRef), ExecError> {
     // Postgres resolves an UNTYPED literal from the other operand: in
     // `SELECT 'x' = col`, the literal is `unknown` until the column types it.
     // Lowering marks such literals `PgType::UNKNOWN` (oid 705) faithfully, and
@@ -460,31 +523,7 @@ fn eval_binary(
     // literal is int4, the column int8, and Postgres widens implicitly. Without
     // this the kernel rejects the pair and the whole query falls back, which is
     // an enormous share of real statements.
-    let (l, r) = unify_numeric(l, r)?;
-
-    match name {
-        "=" => Ok(Arc::new(cmp::eq(&l, &r).map_err(|e| map_arrow(e, "="))?)),
-        "<>" => Ok(Arc::new(cmp::neq(&l, &r).map_err(|e| map_arrow(e, "<>"))?)),
-        "<" => Ok(Arc::new(cmp::lt(&l, &r).map_err(|e| map_arrow(e, "<"))?)),
-        "<=" => Ok(Arc::new(
-            cmp::lt_eq(&l, &r).map_err(|e| map_arrow(e, "<="))?,
-        )),
-        ">" => Ok(Arc::new(cmp::gt(&l, &r).map_err(|e| map_arrow(e, ">"))?)),
-        ">=" => Ok(Arc::new(
-            cmp::gt_eq(&l, &r).map_err(|e| map_arrow(e, ">="))?,
-        )),
-        // `add`/`sub`/`mul` are arrow's *checked* kernels — they already
-        // error on overflow instead of wrapping. See the module docs' point 1.
-        "+" => numeric::add(&l, &r).map_err(|e| map_arrow(e, "integer addition")),
-        "-" => numeric::sub(&l, &r).map_err(|e| map_arrow(e, "integer subtraction")),
-        "*" => numeric::mul(&l, &r).map_err(|e| map_arrow(e, "integer multiplication")),
-        "/" => eval_div(&l, &r),
-        "%" => numeric::rem(&l, &r).map_err(|e| map_arrow(e, "modulo")),
-        other => Err(ExecError::Internal(format!(
-            "operator '{other}' (oid {}) is not implemented in eval yet",
-            op.0.get()
-        ))),
-    }
+    unify_numeric(l, r)
 }
 
 /// Widen a mismatched numeric pair to a common type, the way Postgres's
@@ -687,15 +726,21 @@ fn eval_bool_test(a: &BooleanArray, test: BoolTest) -> BooleanArray {
 
 /// `IS [NOT] DISTINCT FROM`. `cmp::distinct`/`cmp::not_distinct` already are
 /// Postgres's null-safe equality exactly — never NULL, two NULLs are NOT
-/// DISTINCT — so this is a direct pass-through, not a semantic gap to close.
+/// DISTINCT — so the *semantics* are not a gap to close. The *shape* of the
+/// operands is: like every other arrow comparison kernel, `distinct`/
+/// `not_distinct` reject a pair of different types outright, so
+/// `bigint_col IS DISTINCT FROM 4` (int4 literal against an int8 column) or
+/// `col IS DISTINCT FROM 'x'` (an untyped literal) needs exactly the same
+/// resolution `=`/`<`/etc. get in [`eval_binary`] — see [`eval_operand_pair`].
+/// Skipping that here would silently make every such query fall back, the
+/// same failure mode the module docs describe for plain comparisons.
 fn eval_distinct_from(
     lhs: &Expr,
     rhs: &Expr,
     negated: bool,
     batch: &RecordBatch,
 ) -> Result<ArrayRef, ExecError> {
-    let l = eval(lhs, batch)?;
-    let r = eval(rhs, batch)?;
+    let (l, r) = eval_operand_pair(lhs, rhs, batch)?;
     let result = if negated {
         cmp::not_distinct(&l, &r)
     } else {
@@ -1758,6 +1803,48 @@ mod tests {
         assert!(arr.value(0), "NULL IS DISTINCT FROM 1 must be TRUE");
     }
 
+    /// The shape a real query produces: a bigint column against an int4
+    /// literal, and an untyped literal — the same mismatch
+    /// `a_bigint_column_compares_against_an_int4_literal` pins for `>`.
+    /// `cmp::distinct` rejects mismatched types exactly like `cmp::eq` does,
+    /// so `IS DISTINCT FROM` needs the same untyped-literal/widening
+    /// treatment or it silently falls back on every such query.
+    #[test]
+    fn distinct_from_widens_a_bigint_column_against_an_int4_literal() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(vec![
+                Some(4i64),
+                Some(5),
+            ]))],
+        )
+        .unwrap();
+        let expr = Expr::DistinctFrom {
+            lhs: Box::new(col(0, "n")),
+            rhs: Box::new(lit_i32(4)),
+            negated: false,
+        };
+        let result = eval(&expr, &batch).unwrap();
+        let arr = bool_array(&result);
+        assert!(!arr.value(0), "4 IS DISTINCT FROM 4 must be FALSE");
+        assert!(arr.value(1), "5 IS DISTINCT FROM 4 must be TRUE");
+    }
+
+    #[test]
+    fn distinct_from_resolves_an_untyped_literal_from_the_column_side() {
+        let batch = batch_str1("s", vec![Some("hi"), Some("bye")]);
+        let expr = Expr::DistinctFrom {
+            lhs: Box::new(col(0, "s")),
+            rhs: Box::new(Expr::Literal(Datum::Utf8("hi".into()), PgType::UNKNOWN)),
+            negated: false,
+        };
+        let result = eval(&expr, &batch).unwrap();
+        let arr = bool_array(&result);
+        assert!(!arr.value(0), "'hi' IS DISTINCT FROM 'hi' must be FALSE");
+        assert!(arr.value(1), "'bye' IS DISTINCT FROM 'hi' must be TRUE");
+    }
+
     // ── 5. BoolTest on NULL ──────────────────────────────────────────────
     #[test]
     fn null_is_not_true_is_true() {
@@ -2416,6 +2503,93 @@ mod tests {
         let arr = str_array(&result);
         assert!(!arr.is_null(0));
         assert_eq!(arr.value(0), "");
+    }
+
+    // ─── || (string concatenation, oid 654) ─────────────────────────────
+
+    /// The contrast the module docs (and the `concat` tests above) already
+    /// call out, pinned from the `||` side this time: `||` is an ordinary
+    /// strict operator, so a NULL ANYWHERE in the chain makes the whole
+    /// result NULL — the opposite of `concat`, which skips NULLs. Verified
+    /// live against PostgreSQL 18: `SELECT 'a' || NULL || 'b'` is NULL.
+    #[test]
+    fn double_pipe_yields_null_if_either_operand_is_null_unlike_concat() {
+        let expr = Expr::Binary {
+            op: op(654), // text ||
+            lhs: Box::new(lit_text("a")),
+            rhs: Box::new(lit_text_null()),
+        };
+        let result = eval(&expr, &one_row()).unwrap();
+        let arr = str_array(&result);
+        assert!(
+            arr.is_null(0),
+            "'a' || NULL must be NULL — concat() is the one that skips nulls, \
+             not ||"
+        );
+    }
+
+    #[test]
+    fn double_pipe_concatenates_non_null_operands() {
+        let expr = Expr::Binary {
+            op: op(654),
+            lhs: Box::new(lit_text("foo")),
+            rhs: Box::new(lit_text("bar")),
+        };
+        let result = eval(&expr, &one_row()).unwrap();
+        assert_eq!(str_array(&result).value(0), "foobar");
+    }
+
+    /// A shape a real query produces: an untyped literal on one side, e.g.
+    /// `col || 'x'` where the planner left the literal as `unknown` because
+    /// `||` resolves it from the column. Mirrors
+    /// `an_untyped_literal_takes_its_type_from_the_other_operand` above but
+    /// for `||` specifically, since the untyped-literal path in
+    /// `eval_binary` runs generically for every operator, not just the
+    /// comparison ones exercised elsewhere.
+    #[test]
+    fn double_pipe_resolves_an_untyped_literal_from_the_column_side() {
+        let batch = batch_str1("s", vec![Some("hi"), None]);
+        let expr = Expr::Binary {
+            op: op(654),
+            lhs: Box::new(col(0, "s")),
+            rhs: Box::new(Expr::Literal(Datum::Utf8("!".into()), PgType::UNKNOWN)),
+        };
+        let result = eval(&expr, &batch).unwrap();
+        let arr = str_array(&result);
+        assert_eq!(arr.value(0), "hi!");
+        assert!(
+            arr.is_null(1),
+            "a NULL column operand must still make the whole concatenation NULL"
+        );
+    }
+
+    /// Column-vs-column, one NULL row among non-NULL ones — the shape an
+    /// actual `a || b` over a table produces, as opposed to the
+    /// all-literals cases above.
+    #[test]
+    fn double_pipe_over_columns_is_null_only_on_the_null_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("x"), Some("y"), None])),
+                Arc::new(StringArray::from(vec![Some("1"), None, Some("2")])),
+            ],
+        )
+        .unwrap();
+        let expr = Expr::Binary {
+            op: op(654),
+            lhs: Box::new(col(0, "a")),
+            rhs: Box::new(col(1, "b")),
+        };
+        let result = eval(&expr, &batch).unwrap();
+        let arr = str_array(&result);
+        assert_eq!(arr.value(0), "x1");
+        assert!(arr.is_null(1));
+        assert!(arr.is_null(2));
     }
 
     // ─── trim / ltrim / rtrim ───────────────────────────────────────────
