@@ -361,6 +361,34 @@ Nothing that isn't recoverable, but three behaviours must be re-homed:
 | Bloom filters | `parquet::bloom_filter::Sbbf`, `get_row_group_column_bloom_filter`, `bloom_filter_offset` | :1949–:2037 |
 | In-memory reads | bytes-backed `AsyncFileReader` (bypasses the footer cache) | :2209–:2237 |
 
+### `datafusion-datasource-parquet` 53.1.0, module by module
+
+The crate is 11 662 LOC across 14 files (tests inline, so the non-test figure is
+roughly 7 100). Mapping each module to its Basin counterpart shows how little of
+it is actually load-bearing here — Basin has independently reimplemented the
+pruning and filtering modules, and the remainder is DataFusion-shaped glue that
+has no meaning outside DataFusion:
+
+| Module | LOC | What it does | Basin equivalent |
+|---|---|---|---|
+| `opener.rs` | 2 018 | `FileOpener`: per-file open → stream | `reader.rs` open + stream path — **owned** |
+| `file_format.rs` | 1 995 | `FileFormat` impl, schema inference, sink | N/A — Basin's catalog is authoritative for schema; **not needed** |
+| `row_group_filter.rs` | 1 800 | Row-group pruning from stats + bloom | `predicate.rs:1056` `evaluate_compound_for_pruning` + `reader.rs:1949` `prune_with_bloom_filters` — **owned, and Basin reads Parquet bloom filters, which this module does only when explicitly enabled** |
+| `row_filter.rs` | 1 158 | `PhysicalExpr` → `RowFilter` conversion | `reader.rs:1859–1939` `ArrowPredicateFn` → `RowFilter` — **owned** (simpler: Basin starts from `Predicate`, not `PhysicalExpr`) |
+| `sort.rs` | 1 022 | Sort-order inference / merge for sorted files | Partly — `global_sort_order` + `ReadOptions::sorted_by` (`lib.rs:356`) drive the sorted-key skip; **gap** for multi-file sorted merge |
+| `source.rs` | 920 | `FileSource`/`DataSourceExec` wiring | N/A — DataFusion plumbing; **deleted, not ported** |
+| `metadata.rs` | 808 | Footer/metadata cache | `metadata_cache.rs`, `vortex_footer_cache.rs` — **owned** |
+| `access_plan.rs` | 558 | Row-group + row-selection access plan | `ReadOptions::{row_group_selection,row_selection}` (`lib.rs:335,347`) — **owned, and finer-grained** (per-file maps, not per-scan) |
+| `page_filter.rs` | 533 | Page-index → `RowSelection` | `reader.rs:2250–2431` — **owned** |
+| `reader.rs` | 363 | `AsyncFileReader` factory | `ParquetObjectReader` + Basin's caches/scheduler — **owned** |
+| `metrics.rs` | 210 | Scan metrics | Basin has its own counters (`row_groups_pruned_by_bloom`, `reader.rs:2010`) — **owned** |
+
+Net: of the ~7 100 non-test LOC, roughly 3 500 (`file_format.rs` + `source.rs` +
+`opener.rs` glue) is DataFusion-interface code with no analogue to build, and
+almost all of the remaining pruning/filtering logic already exists in
+`basin-storage`. The genuine gaps are multi-file sorted merge and cross-file
+limit pushdown.
+
 ### What DataFusion's Parquet datasource adds that Basin would have to rebuild
 
 | DF feature | Basin status |
