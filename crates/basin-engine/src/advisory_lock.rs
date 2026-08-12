@@ -169,17 +169,42 @@ use std::time::Duration;
 use std::any::Any;
 
 use datafusion::arrow::array::{Array, ArrayRef, BooleanArray};
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::Result as DFResult;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
-    Volatility,
+    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 
 use basin_common::BasinError;
+
+/// Build the return `Field` for a PG `void`-returning function
+/// (`pg_advisory_lock`, `pg_advisory_unlock_all`). Real Postgres's `void`
+/// output function (`void_out`) renders the value as an EMPTY STRING, and
+/// `SELECT pg_advisory_lock(...) IS NULL` is `false` on live PG 18.2 — `void`
+/// is a concrete, non-null value, not SQL NULL. Modelling it as
+/// `DataType::Null` (this module's original choice; see the doc comment
+/// above) made every such result collapse into a real wire NULL, which
+/// diverges from Postgres on both counts. `Utf8("")` with the `BASIN_TYPE
+/// = VOID` marker reproduces the empty-string wire text exactly and lets
+/// `basin-router` advertise OID 2278 (`void`) instead of guessing TEXT.
+fn void_return_field(name: &str) -> FieldRef {
+    let mut meta = HashMap::new();
+    meta.insert(
+        crate::types::BASIN_TYPE_KEY.to_string(),
+        crate::types::BASIN_TYPE_VOID.to_string(),
+    );
+    Arc::new(Field::new(name, DataType::Utf8, false).with_metadata(meta))
+}
+
+/// The `void` scalar itself: a real (non-null) empty string, matching PG's
+/// `void_out`. See [`void_return_field`].
+fn void_scalar() -> ScalarValue {
+    ScalarValue::Utf8(Some(String::new()))
+}
 
 /// Retry cadence for the blocking variants. 2 ms gives low latency for the
 /// common case (held for < 10 ms) while not hammering the CPU on long waits.
@@ -966,11 +991,12 @@ impl ScalarUDFImpl for TryAdvisoryLockUdf {
 }
 
 // ---------------------------------------------------------------------------
-// UDF: pg_advisory_lock / pg_advisory_xact_lock  -> void (NULL)
+// UDF: pg_advisory_lock / pg_advisory_xact_lock  -> void
 //
 // Blocking variant: waits until the lock is free or the effective timeout
 // elapses. On timeout: returns SQLSTATE 55P03 via DataFusionError::External
 // wrapping BasinError::LockNotAvailable (the router maps this to "55P03").
+// `void` is real Postgres, not NULL -- see `void_return_field`.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -1005,8 +1031,13 @@ impl ScalarUDFImpl for AdvisoryLockUdf {
         &self.signature
     }
     fn return_type(&self, _a: &[DataType]) -> DFResult<DataType> {
-        // PG `pg_advisory_lock` returns void; Basin surfaces void as NULL.
-        Ok(DataType::Null)
+        // Superseded by `return_field_from_args` below (DataFusion never
+        // calls this once that's implemented), but kept truthful rather than
+        // `unimplemented!()` per `ScalarUDFImpl::return_type`'s own doc note.
+        Ok(DataType::Utf8)
+    }
+    fn return_field_from_args(&self, _args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(void_return_field(&self.name))
     }
     #[allow(deprecated)]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1018,7 +1049,7 @@ impl ScalarUDFImpl for AdvisoryLockUdf {
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
             }
         }
-        Ok(ColumnarValue::Scalar(ScalarValue::Null))
+        Ok(ColumnarValue::Scalar(void_scalar()))
     }
 }
 
@@ -1070,7 +1101,7 @@ impl ScalarUDFImpl for AdvisoryUnlockUdf {
 }
 
 // ---------------------------------------------------------------------------
-// UDF: pg_advisory_unlock_all  -> void (NULL)
+// UDF: pg_advisory_unlock_all  -> void
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -1100,12 +1131,17 @@ impl ScalarUDFImpl for AdvisoryUnlockAllUdf {
         &self.signature
     }
     fn return_type(&self, _a: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Null)
+        // Superseded by `return_field_from_args` below; see the comment on
+        // `AdvisoryLockUdf::return_type` for why this stays truthful anyway.
+        Ok(DataType::Utf8)
+    }
+    fn return_field_from_args(&self, _args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        Ok(void_return_field("pg_advisory_unlock_all"))
     }
     #[allow(deprecated)]
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         self.locks.unlock_all_session();
-        Ok(ColumnarValue::Scalar(ScalarValue::Null))
+        Ok(ColumnarValue::Scalar(void_scalar()))
     }
 }
 
@@ -1173,6 +1209,89 @@ mod tests {
         s.project_ns
             .store(ns as u64, std::sync::atomic::Ordering::Relaxed);
         s
+    }
+
+    // ── `void` wire representation (C2 differential cluster) ───────────────
+    //
+    // Real Postgres: `SELECT pg_advisory_lock(k) IS NULL` is `false` on live
+    // PG 18.2 -- `void` is a concrete, non-null value whose text
+    // representation (`void_out`) is an empty string, not SQL NULL. Basin
+    // previously modelled `void` as `DataType::Null` / `ScalarValue::Null`,
+    // which made these results collapse into a real wire NULL (`CellMismatch:
+    // basin "Null@0", pg ""` in the differential baseline). These tests pin
+    // the fix at the UDF layer, independent of `basin-router`'s wire encoder.
+
+    fn cfg() -> Arc<datafusion::config::ConfigOptions> {
+        Arc::new(datafusion::config::ConfigOptions::default())
+    }
+
+    #[test]
+    fn void_scalar_is_not_null() {
+        let v = void_scalar();
+        assert!(!v.is_null(), "PG void is a real value, not SQL NULL");
+        assert_eq!(v, ScalarValue::Utf8(Some(String::new())));
+    }
+
+    #[test]
+    fn void_return_field_carries_the_void_marker_on_a_non_null_utf8_field() {
+        let f = void_return_field("pg_advisory_lock");
+        assert_eq!(f.data_type(), &DataType::Utf8);
+        assert!(!f.is_nullable());
+        assert_eq!(
+            f.metadata()
+                .get(crate::types::BASIN_TYPE_KEY)
+                .map(|s| s.as_str()),
+            Some(crate::types::BASIN_TYPE_VOID)
+        );
+    }
+
+    #[test]
+    fn advisory_lock_udf_invoke_returns_empty_string_not_null() {
+        let locks = Arc::new(AdvisorySessionLocks::new());
+        let udf = AdvisoryLockUdf {
+            name: "pg_advisory_lock".into(),
+            xact: false,
+            locks,
+            signature: advisory_signature(),
+        };
+        let key = ScalarValue::Int64(Some(0x1380_dead_i64));
+        let args = ScalarFunctionArgs {
+            args: vec![ColumnarValue::Scalar(key)],
+            arg_fields: vec![Arc::new(Field::new("k", DataType::Int64, false))],
+            number_rows: 1,
+            return_field: void_return_field("pg_advisory_lock"),
+            config_options: cfg(),
+        };
+        #[allow(deprecated)]
+        let out = udf.invoke_with_args(args).unwrap();
+        let ColumnarValue::Scalar(v) = out else {
+            panic!("expected a scalar result")
+        };
+        assert!(!v.is_null(), "void must not encode as SQL NULL");
+        assert_eq!(v, ScalarValue::Utf8(Some(String::new())));
+    }
+
+    #[test]
+    fn advisory_unlock_all_udf_invoke_returns_empty_string_not_null() {
+        let locks = Arc::new(AdvisorySessionLocks::new());
+        let udf = AdvisoryUnlockAllUdf {
+            locks,
+            signature: Signature::nullary(Volatility::Volatile),
+        };
+        let args = ScalarFunctionArgs {
+            args: vec![],
+            arg_fields: vec![],
+            number_rows: 1,
+            return_field: void_return_field("pg_advisory_unlock_all"),
+            config_options: cfg(),
+        };
+        #[allow(deprecated)]
+        let out = udf.invoke_with_args(args).unwrap();
+        let ColumnarValue::Scalar(v) = out else {
+            panic!("expected a scalar result")
+        };
+        assert!(!v.is_null(), "void must not encode as SQL NULL");
+        assert_eq!(v, ScalarValue::Utf8(Some(String::new())));
     }
 
     #[test]

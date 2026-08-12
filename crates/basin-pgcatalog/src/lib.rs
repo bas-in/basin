@@ -32,14 +32,21 @@
 //! `docs/migration/df-removal/11-pg-catalog-fidelity.md` §2 because the owned
 //! planner needs exactly this data to resolve operators, casts and functions
 //! by argument type — making the resolution table `pg_catalog` itself costs
-//! almost nothing beyond compatibility. Everything else in the ~65-relation
-//! surface — `pg_attribute`, `pg_index`, `pg_constraint`, the
+//! almost nothing beyond compatibility. [`pg_attribute`] and [`pg_attrdef`]
+//! are also complete, chosen next per doc 11's call-out that they are the
+//! largest user-visible win for the least code: `pg_attribute.atttypmod` is
+//! what ORM introspection (Prisma, Drizzle, SQLAlchemy, ActiveRecord) reads
+//! column widths from, and `pg_attrdef` is what `pg_dump` needs to avoid
+//! losing every column `DEFAULT` on a round trip. Everything else in the
+//! ~65-relation surface — `pg_index`, `pg_constraint`, the
 //! `information_schema` views, and wiring a real `basin-catalog` backend for
 //! [`CatalogSource`] — is a follow-up increment, not attempted here.
 
 pub mod catalog_source;
 pub mod error;
 pub mod mock;
+pub mod pg_attrdef;
+pub mod pg_attribute;
 pub mod pg_cast;
 pub mod pg_class;
 pub mod pg_namespace;

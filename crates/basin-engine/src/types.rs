@@ -27,6 +27,14 @@ pub const BASIN_TYPE_TSVECTOR: &str = "TSVECTOR";
 /// Logical type marker for `TSQUERY` columns. Same physical type (`Utf8`);
 /// same purpose as `BASIN_TYPE_TSVECTOR`.
 pub const BASIN_TYPE_TSQUERY: &str = "TSQUERY";
+/// Logical type marker for PG `void` — the return type of a function with
+/// no meaningful result (`pg_advisory_lock`, `pg_advisory_unlock_all`, ...).
+/// `void`'s wire text representation is an EMPTY STRING, not SQL NULL
+/// (`SELECT pg_advisory_lock(...) IS NULL` is `false` on real Postgres) —
+/// confirmed live against PG 18.2. The physical Arrow type is `Utf8` holding
+/// `""`; this marker tells the pgwire encoder to advertise OID 2278 (`void`)
+/// instead of TEXT's OID 25.
+pub const BASIN_TYPE_VOID: &str = "VOID";
 
 // ── Network types ─────────────────────────────────────────────────────────────
 /// `INET` — IPv4/IPv6 host address with optional /prefix. Stored as `Utf8`.

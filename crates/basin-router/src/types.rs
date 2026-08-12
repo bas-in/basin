@@ -49,6 +49,14 @@ const BASIN_TYPE_JSONB: &str = "JSONB";
 /// own OID is advertised in `RowDescription` instead of TEXT (25).
 const BASIN_ENUM_OID_KEY: &str = "BASIN_ENUM_OID";
 const BASIN_TYPE_UUID: &str = "UUID";
+/// Marks a column as PG `void` — the return type of `pg_advisory_lock` and
+/// friends. Must match `basin_engine::types::BASIN_TYPE_VOID`; duplicated
+/// here for the same dependency-cycle reason as the constants above. `void`'s
+/// wire text representation is an EMPTY STRING (confirmed live against PG
+/// 18.2: `SELECT pg_advisory_lock(...) IS NULL` is `false`), never SQL NULL —
+/// so this marker must NOT be treated as a nullness signal anywhere, only as
+/// an OID-selection hint.
+const BASIN_TYPE_VOID: &str = "VOID";
 
 /// A tiny `fmt::Write` adaptor that formats values into a fixed-size stack
 /// buffer, avoiding any heap allocation for numeric-to-text rendering.
@@ -98,6 +106,10 @@ fn field_is_jsonb(f: &Field) -> bool {
 
 fn field_is_uuid(f: &Field) -> bool {
     f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_UUID)
+}
+
+fn field_is_void(f: &Field) -> bool {
+    f.metadata().get(BASIN_TYPE_KEY).map(|s| s.as_str()) == Some(BASIN_TYPE_VOID)
 }
 
 /// Whether the cell at `idx` in `col` is SQL NULL.
@@ -195,6 +207,9 @@ pub(crate) fn arrow_to_pg_type_field(f: &Field) -> Type {
     }
     if field_is_uuid(f) {
         return Type::UUID;
+    }
+    if field_is_void(f) {
+        return Type::VOID;
     }
     arrow_to_pg_type(f.data_type())
 }
@@ -1633,6 +1648,44 @@ mod tests {
         for i in 0..3 {
             assert!(is_null_cell(&n, i));
         }
+    }
+
+    #[test]
+    fn void_marked_field_advertises_void_oid_not_text() {
+        // C2 (advisory-lock half): `pg_advisory_lock` et al. carry the
+        // `BASIN_TYPE=VOID` metadata marker (see
+        // `basin_engine::advisory_lock::void_return_field`) on a `Utf8`
+        // field. `RowDescription` must advertise PG's real `void` OID
+        // (2278), not TEXT (25).
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_VOID.to_string());
+        let f = Field::new("pg_advisory_lock", DataType::Utf8, false).with_metadata(meta);
+        assert_eq!(arrow_to_pg_type_field(&f), Type::VOID);
+    }
+
+    #[test]
+    fn void_value_encodes_as_empty_string_not_wire_null() {
+        // The other half of the same bug: a `void` result must round-trip as
+        // a real (zero-length) value, not a `-1`-length NULL. Live PG 18.2:
+        // `SELECT pg_advisory_lock(k) IS NULL` is `false`.
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(BASIN_TYPE_KEY.to_string(), BASIN_TYPE_VOID.to_string());
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "pg_advisory_lock",
+            DataType::Utf8,
+            false,
+        )
+        .with_metadata(meta)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::StringArray::from(vec![""]))],
+        )
+        .unwrap();
+        let rows = encode_batches(&schema, &[batch]);
+        assert_eq!(rows.len(), 1);
+        // 4-byte length prefix of 0 (empty string), no -1 (NULL), no body.
+        assert_eq!(rows[0].data.len(), 4);
+        assert_eq!(&rows[0].data[..], &0i32.to_be_bytes());
     }
 
     #[test]

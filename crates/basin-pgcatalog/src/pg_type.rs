@@ -507,6 +507,14 @@ static TYPES: &[TypeRow] = &[
     ),
 ];
 
+/// The `typlen` a builtin's own `pg_type` row reports, for callers (namely
+/// [`crate::pg_attribute`]) that need to copy it into `pg_attribute.attlen`
+/// the way real Postgres does at column-creation time. `None` for an oid
+/// [`TYPES`] has no row for.
+pub(crate) fn typlen(oid: Oid) -> Option<i16> {
+    TYPES.iter().find(|r| r.oid == oid).map(|r| r.typlen)
+}
+
 /// `pg_catalog.pg_type`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PgType;

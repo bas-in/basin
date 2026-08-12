@@ -6,7 +6,9 @@
 //! and [`crate::pg_namespace`].
 
 use crate::{
-    catalog_source::{ColumnInfo, ConstraintInfo, IndexInfo, NamespaceInfo, TableInfo},
+    catalog_source::{
+        ColumnDefaultInfo, ColumnInfo, ConstraintInfo, IndexInfo, NamespaceInfo, TableInfo,
+    },
     CatalogSource, Oid,
 };
 
@@ -17,6 +19,7 @@ pub struct MockCatalog {
     namespaces: Vec<NamespaceInfo>,
     tables: Vec<TableInfo>,
     columns: Vec<ColumnInfo>,
+    defaults: Vec<ColumnDefaultInfo>,
     indexes: Vec<IndexInfo>,
     constraints: Vec<ConstraintInfo>,
 }
@@ -38,6 +41,11 @@ impl MockCatalog {
 
     pub fn with_column(mut self, column: ColumnInfo) -> Self {
         self.columns.push(column);
+        self
+    }
+
+    pub fn with_default(mut self, default: ColumnDefaultInfo) -> Self {
+        self.defaults.push(default);
         self
     }
 
@@ -65,6 +73,14 @@ impl CatalogSource for MockCatalog {
         self.columns
             .iter()
             .filter(|c| c.table_oid == table_oid)
+            .cloned()
+            .collect()
+    }
+
+    fn column_defaults(&self, table_oid: Oid) -> Vec<ColumnDefaultInfo> {
+        self.defaults
+            .iter()
+            .filter(|d| d.table_oid == table_oid)
             .cloned()
             .collect()
     }
@@ -100,6 +116,10 @@ mod tests {
                 attnum: 1,
                 type_oid: Oid(23),
                 not_null: true,
+                atttypmod: -1,
+                attisdropped: false,
+                attidentity: None,
+                attgenerated: None,
             })
             .with_column(ColumnInfo {
                 table_oid: Oid(200),
@@ -107,6 +127,10 @@ mod tests {
                 attnum: 1,
                 type_oid: Oid(25),
                 not_null: false,
+                atttypmod: -1,
+                attisdropped: false,
+                attidentity: None,
+                attgenerated: None,
             });
 
         let cols = catalog.columns(Oid(100));

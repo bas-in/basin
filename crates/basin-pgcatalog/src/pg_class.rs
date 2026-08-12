@@ -162,6 +162,10 @@ mod tests {
                 attnum: 1,
                 type_oid: Oid(23),
                 not_null: true,
+                atttypmod: -1,
+                attisdropped: false,
+                attidentity: None,
+                attgenerated: None,
             })
             .with_column(ColumnInfo {
                 table_oid: Oid(16385),
@@ -169,6 +173,10 @@ mod tests {
                 attnum: 2,
                 type_oid: Oid(25),
                 not_null: false,
+                atttypmod: -1,
+                attisdropped: false,
+                attidentity: None,
+                attgenerated: None,
             })
             .with_index(IndexInfo {
                 oid: Oid(16389),
