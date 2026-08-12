@@ -32,6 +32,7 @@
 
 pub mod cast;
 pub mod oid;
+pub mod operator;
 pub mod typmod;
 
 pub use oid::Oid;
