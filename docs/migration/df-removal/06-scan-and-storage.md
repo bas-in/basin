@@ -1,125 +1,476 @@
 ---
-title: "DF removal — scan and storage layer"
-nav_section: migration
-sidebar_position: 6
-summary: "Resolves the Vortex blocker: basin-storage already reads Vortex directly, with no DataFusion involvement. The vortex-datafusion coupling is confined to one engine-side ListingTable wrapper that the migration deletes rather than replaces."
-tags: [migration, query-engine, storage, vortex]
+title: "DF removal 06 — scan and storage integration"
+nav_section: architecture
+sidebar_position: 60
+summary: "Inventory of every TableProvider, custom scan path, and Vortex/Parquet coupling that DataFusion removal must rebuild — and the verdict that neither read path is a blocker."
+tags: [storage, datafusion-removal, migration, vortex, parquet]
 ---
 
-# 06 — Scan and storage layer
+# DF removal 06 — scan and storage integration
 
-Part of the [ADR 0030](../../decisions/0030-own-query-engine-remove-datafusion.md)
-migration map. **Status: partial** — the Vortex blocker question is resolved
-below; the Parquet and statistics sections are still outstanding.
+- **Status:** Survey complete (2026-08-12), branch `feat/own-engine-remove-datafusion`
+- **Scope:** the layer where DataFusion 53 meets Basin's object storage —
+  `TableProvider`s, the custom scan paths, the Vortex `FileFormat` adapter, and
+  the statistics/pruning split.
+- **Verdict up front:** the **Vortex read path is NOT a blocker**. Basin already
+  reads Vortex through the plain `vortex-*` crates with projection and filter
+  pushdown, with zero DataFusion involved. The Parquet read path is likewise
+  already DataFusion-free. See [§3](#3-vortex-coupling) and [§4](#4-parquet-coupling).
 
-## The blocker question
+---
 
-ADR 0030 recorded this as an open negative consequence:
+## 0. Executive summary
 
-> **Vortex coupling.** `vortex-datafusion` 0.71 implements DataFusion's
-> `FileFormat` trait. Removing DataFusion means reading Vortex through the base
-> `vortex` crate directly. This is being assessed as a potential blocker.
+Basin runs **two parallel read stacks** today:
 
-The framing came from [ADR 0015](../../decisions/0015-vortex-storage-format.md),
-which describes the read path as going through `vortex-datafusion`'s
-`VortexFormat`:
+| Stack | Entry point | DataFusion? | Used by |
+|---|---|---|---|
+| **Basin-native** | `basin_storage::Storage::read*` + `ReadOptions` (`crates/basin-storage/src/lib.rs:325`) | **No** | `fast_select`, `fast_aggregate`, all four pruned `TableProvider`s, the cold-tombstone scan, hot-tier flush/merge |
+| **DataFusion `ListingTable`** | `session::refresh_table` → `ListingTable` + `ParquetFormat`/`BasinVortexFormat` | Yes | the general SQL path (joins, group-by, window, sort) |
 
-> Reads go through `vortex-datafusion` 0.70's `VortexFormat`, which implements
-> the DataFusion 53 `FileFormat` trait — the same trait the Parquet path
-> implements.
+The migration does not need to *invent* an object-storage scan layer — it needs
+to **delete the second stack and route the planner at the first one**. The
+Basin-native stack is already the more capable of the two on pruning: it owns
+catalog min/max pruning, Parquet bloom-filter pruning, page-index row selection,
+per-row-group allowlists, and per-row offset allowlists. DataFusion contributes
+*no* pruning code to Basin at all — `PruningPredicate` / `PruningStatistics`
+have **zero** call sites in the workspace.
 
-**That description is now out of date.** The code has moved on since ADR 0015
-was written, and the migration is much better positioned than the ADR implies.
+The real cost is concentrated in three places:
 
-## Finding: there are two Vortex read paths, and only one uses DataFusion
+1. **~70 metadata `TableProvider`s** (`pg_catalog` / `information_schema`)
+   that must be re-hosted on whatever catalog interface the new engine exposes.
+   These are mechanical — each builds one in-memory `RecordBatch`.
+2. **The `ListingTable` registration path** in `session.rs` (~65 DataFusion
+   datasource call sites) which must become "planner asks the catalog for a file
+   list, hands it to `Storage`".
+3. **`vortex_listing_format.rs`** (1 184 LOC) — the `vortex-datafusion` wrapper.
+   This is deleted outright, not ported; its two useful behaviours (the ADR-0024
+   UUID `Decimal256(39,0)` ⇄ `FixedSizeBinary(16)` inverse and the POINT
+   `FixedSizeBinary(21)` inverse) already exist in `basin-storage`'s reader.
 
-### Path A — `basin-storage`, direct, no DataFusion
+---
 
-`crates/basin-storage/Cargo.toml` (lines 54–60) depends only on base Vortex
-crates. **`vortex-datafusion` is not among them:**
+## 1. `TableProvider` inventory
 
-```toml
-vortex-array   = "0.71"
-vortex-file    = { version = "0.71", features = ["zstd"] }
-vortex-btrblocks = { version = "0.71", features = ["zstd", "pco"] }
-vortex-session = "0.71"
-vortex-io      = { version = "0.71", features = ["tokio", "object_store"] }
-vortex-layout  = "0.71"
-vortex-buffer  = "0.71"
+209 textual references across `crates/`, resolving to **43 explicit `impl`
+blocks plus 47 macro-generated ones ≈ 89 concrete providers**. All live in
+`crates/basin-engine`. Every one of them implements only `as_any` / `schema` /
+`table_type` / `scan`; **only three** implement `supports_filters_pushdown`
+(`session.rs:4098`, `hot_tombstone.rs:1263`, `tombstone_cold_scan.rs:213`) and
+**none** implements `statistics()`.
+
+### 1a. Category A — pure catalog/metadata views (in-memory `RecordBatch`)
+
+These call a `basin-catalog` query, build one Arrow batch, and return a
+`MemorySourceConfig::try_new_exec`. They never touch object storage.
+
+| File (absolute) | Providers | Notes |
+|---|---|---|
+| `/Users/pc/code/vulos/basin/crates/basin-engine/src/info_schema_provider.rs` | **~70** | 23 hand-written (`InfoSchemaTablesProvider` :105, `InfoSchemaColumnsProvider` :246, `PgAttributeProvider` :368, `PgNamespaceProvider` :442, `PgClassProvider` :524, `PgProcProvider` :592, `RoutinesProvider` :659, `PgIndexProvider` :727, `PgConstraintProvider` :793, `InfoSchemaViewsProvider` :860, `PgViewsProvider` :925, `InfoSchemaSchemataProvider` :997, `TableConstraintsProvider` :1082, `KeyColumnUsageProvider` :1148, `ReferentialConstraintsProvider` :1214, `PgTypeProvider` :1282, `PgDependProvider` :1348, `PgAuthidProvider` :1415, `PgStatActivityLiveProvider` :1844, `PgLocksLiveProvider` :1988) **plus 47** generated by the `simple_provider!` macro at :1486 (invocations :1524–:1795, e.g. `PgEnumProvider`, `DomainsProvider`). 2 568 LOC total. |
+| `/Users/pc/code/vulos/basin/crates/basin-engine/src/hypertable_provider.rs` | `ChunksProvider` :128, `HypertablesProvider` :210 | Also the workspace's only `impl SchemaProvider` (`TimescaleInfoSchema` :260). 288 LOC. |
+| `/Users/pc/code/vulos/basin/crates/basin-engine/src/realtime_catalog.rs` | `RealtimeChannelsProvider` :226, `RealtimeStatsProvider` :330 | Registered into a `MemorySchemaProvider` at :420. 701 LOC. |
+| `/Users/pc/code/vulos/basin/crates/basin-engine/src/replication/slot_udf.rs` | `PgReplicationSlotsProvider` :354, `PgPublicationProvider` :438, `PgPublicationTablesProvider` :512 | 653 LOC. |
+| `/Users/pc/code/vulos/basin/crates/basin-engine/src/query_stats_export.rs` | `BasinStatStatementsProvider` :246 | `pg_stat_statements`. 677 LOC. |
+| `/Users/pc/code/vulos/basin/crates/basin-engine/src/project_usage_view.rs` | `BasinProjectUsageProvider` :116 | 266 LOC. |
+| `/Users/pc/code/vulos/basin/crates/basin-engine/src/notify_registry.rs` | `PgListeningChannelsTable` :295 | 390 LOC. |
+
+**Registration:** `session.rs:2870` calls
+`info_schema_provider::register_info_schema_providers` (defined at
+`info_schema_provider.rs:2096`), which builds two `MemorySchemaProvider`s —
+`information_schema` at :2121 and `pg_catalog` at :2135 — and issues 136
+`register_table` calls. `session.rs:2918` then calls `register_cdc_providers`
+(:2448). Timescale views get a third schema at `session.rs:2895–2899`.
+
+**Migration shape:** none of these need a `TableProvider` at all in the new
+engine. They are `fn(catalog, project) -> RecordBatch`. The work is defining one
+Basin-native `SystemView` trait and mechanically rewriting ~89 `scan()` bodies.
+
+### 1b. Category B — pruning/scan wrappers over real data
+
+These are the interesting ones: they *already* drive `basin_storage::Storage`
+directly and use DataFusion only as the plumbing that carries the batches
+upward.
+
+| Provider | File:line | What it does | DF surface used |
+|---|---|---|---|
+| `GinRowGroupPrunedTable` | `gin_rowgroup_scan.rs:162` | Scans a candidate file list with a per-file row-group allowlist **and** per-file absolute row-offset allowlist, from the JSONB/FTS GIN registries. Builds `ReadOptions { row_group_selection, row_selection, .. }` at :197. | custom `GinRowGroupScanExec` (:298) |
+| `RTreePrunedTable` | `rtree_rowgroup_scan.rs:133` | Same shape for PostGIS R-tree row-group pruning. | custom `RTreeScanExec` (:262) |
+| `JsonbPostingPrunedTable` | `jsonb_posting_scan.rs:93` | Posting-list-driven prune for JSONB containment. | custom `JsonbPostingScanExec` (:206) |
+| `TombstoneColdTable` | `tombstone_cold_scan.rs:110` | Cold read that suppresses hot-tier tombstoned keys. Implements `supports_filters_pushdown` (:213). | custom `TombstoneColdScanExec` (:296) |
+| `TombstoneFilteringTable` | `hot_tombstone.rs:1137` | Wraps an inner provider; implements `supports_filters_pushdown` (:1263). | `TombstoneFilterExec` (:403), `UpdateOverlayExec` (:544) |
+
+All five construct `basin_storage::ReadOptions` and call `Storage`. **The scan
+logic survives DF removal verbatim**; only the `TableProvider`/`ExecutionPlan`
+shells are thrown away.
+
+### 1c. Category C — table-valued (set-returning) functions
+
+| Provider | File:line |
+|---|---|
+| `JsonbEachTable` / `JsonbArrayElementsTable` / `JsonbObjectKeysTable` / `JsonToRecordsetTable` | `jsonb_udf.rs:5808 / :5891 / :5975 / :6160` |
+| `JsonbPathQueryTable` | `jsonb_path_udf.rs:1514` |
+
+These become the new engine's SRF node. They are pure Arrow transforms.
+
+### 1d. Category D — HTAP union
+
+`HtapUnionTable` (`session.rs:3923`) unions a cold provider with a hot `MemTable`
+half, applying (a) the process-wide tombstone registry, (b) the transaction's
+own uncommitted UPDATE/DELETE overlay, and (c) an MVCC `hot_seq_watermark` so
+another session's post-snapshot writes are filtered out. It implements
+`supports_filters_pushdown` (:4098). This is the single most semantically dense
+provider in the repo — read-your-own-writes, snapshot isolation, and
+merge-on-read all land here — and it must be reproduced faithfully as a plan
+node in the new engine.
+
+### 1e. Custom `ExecutionPlan` impls (8 total)
+
+`RTreeScanExec` (`rtree_rowgroup_scan.rs:262`), `GinRowGroupScanExec`
+(`gin_rowgroup_scan.rs:298`), `TombstoneFilterExec` (`hot_tombstone.rs:403`),
+`UpdateOverlayExec` (`hot_tombstone.rs:544`), `JsonbPostingScanExec`
+(`jsonb_posting_scan.rs:206`), `UuidDecimal256RestoreExec`
+(`vortex_listing_format.rs:863`), `PointFsbRestoreExec`
+(`vortex_listing_format.rs:991`), `TombstoneColdScanExec`
+(`tombstone_cold_scan.rs:296`).
+
+Six are Basin logic in a DF costume. The two in `vortex_listing_format.rs` exist
+**only** to undo the on-disk type disguises that `vortex-datafusion` cannot see
+through — and `basin-storage`'s own reader already applies the same inverses on
+the native path, so both are deleted with the file.
+
+---
+
+## 2. The custom scan paths
+
+### 2a. `register_pruned_listing_table` — `session.rs:4897`
+
+> "Re-register `table_name` as a `ListingTable` whose `table_paths` is a
+> per-file URL list of `paths`. **This bypasses DataFusion's directory scan
+> entirely**, so no footer GET is issued for files we already proved
+> irrelevant."
+
+Mechanics:
+
+1. `listing_file_format(meta.file_format)` (`session.rs:3091`) picks
+   `ParquetFormat::default()` + `.parquet`, or `BasinVortexFormat` wrapping
+   `vortex_datafusion::VortexFormat::new_with_options` + `.vortex`.
+2. Each surviving path is turned into a `ListingTableUrl` under a synthetic
+   `BASIN_URL_BASE` scheme (paths come from `Storage::list_data_files`, already
+   root-prefix-qualified — the code explicitly warns against re-prefixing).
+3. `ListingTableConfig::new_with_multi_paths(urls)` +
+   `.with_listing_options(...)` + `.with_schema(df_schema)` → `ListingTable`,
+   then `deregister_table` + `register_table` on the bare table reference.
+4. `global_sort_order` becomes `ListingOptions::with_file_sort_order`.
+
+Two hard invariants worth carrying forward: the schema handed in **must** be the
+same extended schema `refresh_table` registered (base catalog schema + ADR-0027
+promoted-JSONB shadow columns), or DataFusion's `type_coercion` analyzer fails;
+and the sibling `register_empty_table` (`session.rs:4869`) serves a
+provably-empty result as a zero-row `MemTable` with **zero object-store GETs**.
+
+**What replacing it requires:** nothing conceptually — the new engine's scan node
+takes a `Vec<path>` plus a schema. The `ListingTableUrl` round-trip, the
+synthetic URL scheme, the deregister/re-register dance, and the schema-identity
+constraint all *disappear*. This is a simplification, not a port.
+
+### 2b. `apply_gin_pruning_for_query` — `session.rs:~5244`
+
+> "Register a custom provider that drives Basin's native storage reader with
+> `row_group_selection` and/or `row_selection` set, **bypassing DataFusion's
+> ListingTable / ParquetExec path entirely**."
+
+The decision ladder:
+
+1. GIN row-tier probe → `RowSelectionPlan { row_offsets, prunable }`; provably
+   empty files are dropped from the candidate set.
+2. `rowgroup_prune_for_containment` against the per-row-group bloom registry →
+   an optional per-file surviving-row-group map.
+3. If **either** map is non-empty → register `GinRowGroupPrunedTable`, which
+   calls `Storage` directly with both maps in `ReadOptions`.
+4. Otherwise → fall back to `register_pruned_listing_table_if_narrowed`
+   (`session.rs:5300`), which only re-registers when the survivor set is a
+   *strict* subset (avoiding a pointless deregister round-trip).
+
+Correctness contract, stated in the code and worth preserving verbatim: both
+maps are **conservative supersets** (bloom false positives and raw-byte
+containment are fine), files absent from a map are read in full, and the
+`jsonb_contains` UDF re-checks every emitted row. There are no false negatives
+by construction.
+
+**What replacing it requires:** this path is already the target architecture.
+Delete the `TableProvider`/`ExecutionPlan` shell; keep `index_probe` (6 411 LOC),
+keep `ReadOptions`, keep `Storage`.
+
+### 2c. Total DataFusion datasource surface
+
+`ListingTable*` / `PartitionedFile` / `FileScanConfig*` / `DataSourceExec` /
+`ParquetSource` / `ParquetFormat` / `FileFormat` / `ObjectStoreUrl` /
+`register_object_store` / `MemTable::` references, by file:
+
+| File | Sites |
+|---|---|
+| `crates/basin-engine/src/session.rs` | 65 |
+| `crates/basin-hottier/src/memtable.rs` | 64 |
+| `crates/basin-engine/src/vortex_listing_format.rs` | 25 |
+| `crates/basin-engine/src/catalog_window_exec.rs` | 23 |
+| `crates/basin-engine/src/executor.rs` | 14 |
+| `crates/basin-engine/src/sort_streaming_limit.rs` | 13 |
+| remainder (13 files) | ≤ 4 each |
+
+`basin-hottier`'s 64 are almost all `MemTable::` (the hot tier stores Arrow IPC
+and wraps it in a `MemTable` for the union) — cheap to replace with a plain
+batch-list scan node.
+
+### 2d. `crates/basin-storage/src/vortex_format.rs` — **correction to the brief**
+
+This file does **not** implement DataFusion's `FileFormat` trait. It has **zero**
+`datafusion` references, and `crates/basin-storage/Cargo.toml` has **no
+datafusion dependency at all**. It is 1 748 LOC of pure Arrow ⇄ Vortex codec:
+
+- `encode_with_mode` (:81) — `RecordBatch` → Vortex bytes via a BtrBlocks
+  cascade, with `EncodingMode::Best` (full per-column sampling search) vs
+  `Fast` (structure-preserving schemes only, wider 32 768-row blocks).
+- `column_stats_from_batch` (:157) — write-side min/max/null-count computed from
+  the **in-memory batch**, deliberately *not* by re-opening the encoded blob
+  (doing so doubled insert latency). Emits Basin's `ColumnStats` byte contract so
+  catalog pruning treats Vortex and Parquet identically.
+- `footer_meta_from_store` (:291) — tail-range-only footer read
+  (`MAX_POSTSCRIPT_SIZE + EOF_SIZE`, ~64 KiB, then bounded `NeedMoreData` ranges)
+  returning `(row_count, column_stats)` without fetching data.
+- `decode` / `decode_with_cache` / `decode_inner` (:435 / :523 / :553) — the
+  scan path, detailed in §3.
+- A process-wide `VortexSession` built once (:34).
+
+The actual `FileFormat` impl is **`crates/basin-engine/src/vortex_listing_format.rs:136`**
+(`BasinVortexFormat`, 1 184 LOC), which wraps `vortex_datafusion::VortexFormat`
+to (a) patch `Statistics.total_byte_size` from `Precision::Absent` to
+`Precision::Inexact(object.size)` so `join_selection` stops mis-planning
+byte-skewed joins, and (b) apply the ADR-0024 UUID and POINT type inverses.
+`Precision::` / `ColumnStatistics` appear **29 times in this file and once in
+`session.rs` — nowhere else in the workspace.**
+
+---
+
+## 3. Vortex coupling {#3-vortex-coupling}
+
+### 3a. Dependency facts
+
+`crates/basin-engine/Cargo.toml` depends on `vortex-datafusion = "0.71"` (line
+46) and `vortex = "0.71"` (line 50), plus `datafusion-datasource`,
+`datafusion-physical-expr`, `datafusion-physical-plan`, `datafusion-session` — all
+`= "53"`, all pulled in *solely* to satisfy `vortex_listing_format.rs`'s
+`FileFormat` impl (the Cargo.toml comments say exactly this).
+
+`crates/basin-storage/Cargo.toml` depends on `vortex-array`, `vortex-file`
+(feature `zstd`), `vortex-btrblocks`, `vortex-session`, `vortex-io` (features
+`tokio`, `object_store`), `vortex-layout`, `vortex-buffer` — **all 0.71, none
+datafusion-aware.**
+
+### 3b. Can Basin read Vortex without `vortex-datafusion`?
+
+**Yes — and it already does, in production, on the fast paths.**
+`crates/basin-storage/src/vortex_format.rs::decode_inner` is the proof. The API
+chain, all from the base crates:
+
+```
+session().open_options()               // vortex_file::OpenOptionsSessionExt
+    .with_footer(cached_footer)        // skip the flatbuffer re-parse
+    .open_buffer(bytes)                // -> VortexFile
+    .scan()                            // -> ScanBuilder<ArrayRef>
+    .with_projection(select(names, root()))   // vortex_array::expr
+    .with_some_filter(Some(expr))             // vortex_array::expr::Expression
+    // -> RecordBatch per Vortex chunk
 ```
 
-`crates/basin-storage/src/vortex_format.rs` uses these directly and already
-implements everything a scan needs, without a DataFusion trait in sight:
+The relevant upstream surface (verified in
+`~/.cargo/registry/src/index.crates.io-*/vortex-*-0.71.0/`):
 
-| Capability | Implementation | Location |
+| Need | API | Crate |
 |---|---|---|
-| Write / encode | `BtrBlocksCompressorBuilder`, `from_arrow` | `vortex_format.rs:19–20, 87–111` |
-| Open file / footer | `vortex_file::VortexFile`, `open_buffer` | `vortex_format.rs:24, 315, 500` |
-| Object-store reads | `vortex_io::object_store::ObjectStoreReadAt`, `VortexReadAt` | `vortex_format.rs:299–300` |
-| File statistics | `stats_from_vortex_file`, `vortex_array::expr::stats::Stat` | `vortex_format.rs:323–330` |
-| Projection + filter | `reader::vortex_project_and_filter`, `vortex_array::expr::Expression` | `vortex_format.rs:426, 439` |
-| Footer caching | `crate::vortex_footer_cache::VortexFooterCache` | `vortex_format.rs:486` |
+| Open from object storage | `VortexOpenOptions::open_object_store` (`vortex-file/src/open.rs:331`), `ObjectStoreReadAt` implementing `VortexReadAt` (`vortex-io/src/object_store/read_at.rs:82`) | `vortex-file` + `vortex-io` (feature `object_store`) |
+| Open from bytes / path | `open_buffer` (:175), `open_path` (:163), `open_read` (:205) | `vortex-file` |
+| Row count / schema / stats | `VortexFile::row_count()` (:63), `dtype()` (:68), `file_stats() -> Option<&FileStatistics>` (:75), `footer()` (:58) | `vortex-file` |
+| Scan | `VortexFile::scan() -> ScanBuilder<ArrayRef>` (:116) | `vortex-file` / `vortex-layout` |
+| Projection | `ScanBuilder::with_projection(Expression)` (`vortex-layout/src/scan/scan_builder.rs:136`) | `vortex-layout` |
+| Predicate pushdown | `with_filter` / `with_some_filter` (:126/:131) | `vortex-layout` |
+| Limit / row range / row indices / selection | `with_limit` (:202), `with_row_range` (:150), `with_row_indices` (:160), `with_selection` (:155) | `vortex-layout` |
+| Parallelism | `with_concurrency` (:181), `with_split_by` (:170), `splits()` (`file.rs:186`) | `vortex-layout` / `vortex-file` |
+| File-level pruning | `VortexFile::can_prune(&Expression) -> bool` (`file.rs:128`), `extract_relevant_file_stats_as_struct_row` (`vortex-file/src/pruning.rs:27`) | `vortex-file` |
+| Streaming | `into_array_stream()` (:105), `into_stream()` (:316), `into_array_iter()` (:112) | `vortex-layout` |
+| Arrow out | `DType::to_arrow_schema()` (`vortex-array/src/dtype/arrow.rs:232`), `ArrowSession::execute_arrow` (`arrow/session.rs:422`), then `RecordBatch::from(arrow.as_struct().clone())` | `vortex-array` |
+| Arrow in | `from_arrow_record_batch` (`arrow/session.rs:390`), `FromArrowArray` | `vortex-array` |
 
-This is a complete, DataFusion-free Vortex reader — including predicate
-filtering and its own footer cache — and it is already in production use.
+Cross-check: `vortex-datafusion`'s `VortexOpener::open`
+(`persistent/opener.rs:107–455`, 1 408 LOC) reaches for **exactly this same
+`ScanBuilder`**. Everything else in that 7 448-LOC crate is DataFusion-side
+adaptation Basin will not need — `convert/exprs.rs` (1 008 LOC) translating
+`PhysicalExpr` → `vortex::Expression`, `convert/schema.rs` (423), `persistent/
+format.rs` (708, the `FileFormat` impl), `persistent/source.rs` (572, the
+`FileSource`), plus `FilePruner`, `PhysicalExprAdapterFactory`, and
+`FileMetadataCache` glue.
 
-### Path B — `basin-engine`, via DataFusion's ListingTable
+Basin does not need the expression translator, because Basin's predicates are
+already `basin_storage::Predicate`, not `PhysicalExpr` — a `Predicate →
+vortex::Expression` mapping is a far smaller problem than DF's, and a partial
+version of it already exists (`decode` takes
+`Option<vortex_array::expr::Expression>` today).
 
-`crates/basin-engine/Cargo.toml:46` declares `vortex-datafusion = "0.71"`,
-consumed at:
+**Conclusion: `vortex-datafusion` is a leaf dependency that can be dropped in the
+same commit that deletes `vortex_listing_format.rs`. It is not on the critical
+path.**
 
-- `crates/basin-engine/src/session.rs:3110` — constructs
-  `vortex_datafusion::VortexFormat::new_with_options(...)`
-- `crates/basin-engine/src/vortex_listing_format.rs` — a 1,100+ line Basin-local
-  wrapper whose own header says it exists to "patch `total_byte_size`" on the
-  inner `VortexFormat`
+### 3c. What Basin loses when `BasinVortexFormat` goes
 
-Path B exists only to present Vortex files to DataFusion's `ListingTable`
-machinery. It is an adapter to DataFusion, not a Vortex capability.
+Nothing that isn't recoverable, but three behaviours must be re-homed:
 
-## Consequence for the migration
+1. **UUID `Decimal256(39,0)` → `FixedSizeBinary(16)` inverse.** Vortex 0.71 has
+   no `FixedSizeBinary(N)` encoder, so ADR-0024 UUIDs are stored as
+   `Decimal256(39,0)`. `basin-storage`'s reader has its own copies of the
+   `BASIN_TYPE=UUID` marker handling — confirm parity before deleting.
+2. **POINT `FixedSizeBinary(21)` inverse** (`BASIN_TYPE=POINT`, `LargeBinary` on
+   disk, surfaced as `BinaryView` by the Vortex scan layer). Same story.
+3. **`total_byte_size` for join planning.** The new engine's cost model must take
+   byte size from the catalog's file sizes (which Basin already has via
+   `ObjectMeta::size` in `DataFileRef`) rather than from Vortex per-column stats.
+   This is strictly better than the current patch-over-`Absent` workaround.
 
-**The Vortex read path is not a blocker, and it does not need to be rebuilt.**
+---
 
-Removing DataFusion means:
+## 4. Parquet coupling {#4-parquet-coupling}
 
-1. **Delete** `crates/basin-engine/src/vortex_listing_format.rs` outright. It is
-   pure DataFusion-adapter code — a wrapper around a `FileFormat` impl,
-   patching a field DataFusion's planner reads. With no DataFusion planner,
-   nothing consumes it.
-2. **Delete** the `vortex-datafusion` dependency from
-   `crates/basin-engine/Cargo.toml:46`, and the `session.rs:3110` construction
-   site.
-3. **Route all Vortex scans through Path A**, the `basin-storage` reader that
-   already works. The owned physical scan operator calls
-   `vortex_project_and_filter` directly.
+**Confirmed: the Parquet read path is already driven directly, with no
+`datafusion-datasource-parquet` anywhere.** `crates/basin-storage/src/reader.rs`
+(6 143 LOC) uses arrow-rs `parquet` 58 first-hand:
 
-This is a **deletion, not a reimplementation** — one of the few places in this
-migration where removing DataFusion strictly reduces the code Basin maintains
-with no replacement cost. It also removes a leg of the arrow 58 / DataFusion 53
-/ vortex 0.71 version lockstep that both ADR 0015 and the root `Cargo.toml`
-flag as an ongoing upgrade tax: after this, Vortex needs to track arrow, not
-arrow *and* DataFusion.
+| Capability | API used | reader.rs line |
+|---|---|---|
+| Async object-store reads | `ParquetObjectReader::new(store, path).with_file_size(size)` | :521, :1789, :1806 |
+| Footer / metadata load | `ArrowReaderMetadata::load_async`, `ParquetMetaData` | :524, :529, :651 |
+| Page index | `ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional)` | :203, :1786, :2232 |
+| Stream builder | `ParquetRecordBatchStreamBuilder::new_with_metadata` | :1793, :1818, :2237 |
+| Projection mask | `ProjectionMask::roots(parquet_schema, [col_idx])` | :1879 |
+| Predicate → row filter | `ArrowPredicateFn` → `RowFilter::new(predicates)` | :1859–:1939 |
+| Row-group selection | `with_row_groups` | :2441 |
+| Page-level row selection | `RowSelection::from(selectors)` built from per-page min/max | :2281–:2431 |
+| Row-tier allowlist → selection | GIN offsets → `RowSelection` in `with_row_groups` coordinate space | :2435–:2451 |
+| Bloom filters | `parquet::bloom_filter::Sbbf`, `get_row_group_column_bloom_filter`, `bloom_filter_offset` | :1949–:2037 |
+| In-memory reads | bytes-backed `AsyncFileReader` (bypasses the footer cache) | :2209–:2237 |
 
-### One caveat, stated honestly
+### What DataFusion's Parquet datasource adds that Basin would have to rebuild
 
-Path A's `vortex_project_and_filter` is proven for the predicate shapes
-`basin-storage` currently drives through it. Whether it covers the full filter
-surface Path B's DataFusion pushdown handles has **not** been verified here —
-that is a coverage question for the physical-scan work, and it may require
-extending Path A's expression translation. ADR 0015 also notes that Vortex
-pushdown is type-gated (Vortex panics uncatchably on a mixed-DType compare), so
-that guard must be preserved in whichever path survives. The claim proven above
-is narrower and sufficient: **no Vortex capability is lost by removing
-DataFusion**, because the direct reader already exists.
+| DF feature | Basin status |
+|---|---|
+| Row-group pruning from min/max | **Already owned** — `evaluate_compound_for_pruning` (`predicate.rs:1056`), `prune_atom` (:1131), `prune_starts_with` (:1325), `prune_starts_with_row_group` (`reader.rs:2124`) |
+| Predicate pushdown into `RowFilter` | **Already owned** — `reader.rs:1859` |
+| Projection masks | **Already owned** — `reader.rs:1879` |
+| Bloom-filter pruning | **Already owned**, and *richer* than DF's (DF does not read Parquet bloom filters by default) |
+| Page-index `RowSelection` | **Already owned** — `reader.rs:2250–2431` |
+| Async buffered / coalesced reads | Partly rebuilt: Basin has `page_cache.rs`, `metadata_cache.rs`, `disk_cache.rs`, `scheduler.rs`, `bucket_pool.rs`, `retry_store.rs`, `stripe_router_store.rs`. DF's request-coalescing heuristics are the one genuine gap — measure before porting. |
+| Parallel file/row-group partitioning | **Gap.** `target_partitions_for_bulk_scan` (`session.rs:303`) currently hands the fan-out decision to DF. The new engine needs its own file→task scheduler. |
+| Schema evolution / adapter (missing & reordered columns) | **Partly owned** — the reader's projection assembler null-fills columns a file pre-dates; `decode_inner` does the same for Vortex. Needs consolidating into one place. |
+| Limit pushdown across files | **Gap** — `ReadOptions::limit` is per-read, not a cross-file early-exit. |
 
-## Still outstanding in this document
+---
 
-- Parquet: confirm the read path drives `parquet` (arrow-rs 58) directly and
-  enumerate what `datafusion-datasource-parquet` (7,140 non-test LOC) adds that
-  must be rebuilt — row-group pruning, predicate-to-row-filter conversion,
-  projection masks, async buffered reads.
-- `TableProvider` inventory (~209 references) and the custom scan bypasses at
-  `session.rs:4886` and `:5244`.
-- Statistics and pruning: what Basin already owns (catalog stats, bloom filters
-  in `fast_select.rs`) versus what comes from `datafusion-pruning` (2,115 LOC).
+## 5. Statistics and pruning: who owns what
+
+**Basin owns essentially all of it.** Grepping the workspace for
+`PruningPredicate`, `datafusion_pruning`, `PruningStatistics`, and
+`physical_optimizer::pruning` returns **zero hits**. DataFusion statistics types
+(`Precision::`, `ColumnStatistics`) appear only in `vortex_listing_format.rs`
+(29) and `session.rs` (1).
+
+### Basin-owned — survives DF removal untouched
+
+| Asset | Location |
+|---|---|
+| `ColumnStats` (min/max/null-count, 8-byte LE i64/f64 contract) | `crates/basin-catalog/src/metadata.rs:218`; re-exported as `basin_storage::ColumnStats` (`data_file.rs`) |
+| `DataFileRef.column_stats` — per-file stats in the catalog | `crates/basin-catalog/src/metadata.rs:245,256` |
+| File-level prune evaluator | `crates/basin-storage/src/predicate.rs:1056` `evaluate_compound_for_pruning` → `PruneOutcome` (2 422 LOC file) |
+| Parquet bloom-filter row-group prune | `crates/basin-storage/src/reader.rs:1949` `prune_with_bloom_filters` |
+| Per-row-group GIN bloom summaries | `crates/basin-storage/src/index/gin_rowgroup.rs` |
+| Trigram row-group index | `crates/basin-storage/src/index/trigram_rowgroup.rs` |
+| JSONB posting lists | `crates/basin-storage/src/index/jsonb_posting.rs` |
+| R-tree (PostGIS) | `crates/basin-storage/src/index/rtree.rs` |
+| tsvector GIN, citext btree, interval index | `crates/basin-storage/src/index/{gin_tsvector,btree_citext,interval}.rs` |
+| Vortex zone-map pruning | native (`ScanBuilder::with_filter`, `VortexFile::can_prune`) |
+| Vortex file stats → `ColumnStats` | `crates/basin-storage/src/vortex_format.rs:291,319` |
+| Probe orchestration | `crates/basin-engine/src/index_probe.rs` (6 411 LOC) |
+| Point-query fast path | `crates/basin-engine/src/fast_select.rs` (6 523 LOC) — "bypass DataFusion entirely and read directly through `basin_storage::Storage`"; imports `bloom_from_bytes`, `evaluate_compound_for_pruning`, `CompoundPredicate`, `PruneOutcome` |
+| Metadata-only aggregates | `crates/basin-engine/src/fast_aggregate.rs` (2 205 LOC) |
+| HLL / t-digest sketches | `crates/basin-sketch` |
+
+### DF-provided — must be rebuilt
+
+| Asset | Where it leaks in |
+|---|---|
+| `Statistics` / `Precision` / `ColumnStatistics` as the planner's cost currency | `vortex_listing_format.rs` (29 sites), `session.rs` (1) |
+| `join_selection` / `supports_collect_by_thresholds` byte-size heuristics | consume the above |
+| Cardinality estimation for join ordering | entirely DF's today; Basin has row counts + `ColumnStats` but no estimator |
+
+The migration should define a Basin `TableStats { rows, bytes, per_column: ColumnStats }`
+sourced from `DataFileRef` — which the catalog already stores — and feed the new
+cost model from it. This removes the `Precision::Absent` workaround by
+construction.
+
+---
+
+## 6. Component table
+
+| Component | Current DF dependency | Can we do it directly? | Est. LOC | Blocking risks |
+|---|---|---|---|---|
+| Parquet file read (projection, row filter, row groups, row selection, bloom, page index) | **None** — arrow-rs `parquet` 58 direct | **Already done** | 0 new (6 143 exist) | None |
+| Vortex file read (projection + filter pushdown, footer cache, tail-range stats) | **None** on the native path (`basin-storage`) | **Already done** | 0 new (1 748 exist) | None |
+| Vortex via `ListingTable` (`BasinVortexFormat` + `vortex-datafusion`) | `FileFormat`, `FileSource`, `DataSourceExec`, `datafusion-datasource/-physical-expr/-physical-plan/-session` | **Delete, don't port** — native path supersedes it | −1 184 | Must re-home the UUID `Decimal256(39,0)` and POINT `FSB(21)` inverses and verify parity with the reader's copies |
+| `ListingTable` registration + per-file URL prune (`register_pruned_listing_table`) | `ListingTable`, `ListingOptions`, `ListingTableConfig`, `ListingTableUrl` | **Yes** — pass a `Vec<path>` to the scan node | ~200 (net −400) | Synthetic `BASIN_URL_BASE` scheme and object-store registration must be unwound in one go; `global_sort_order` → file-sort-order must survive |
+| `register_empty_table` zero-GET path | `MemTable` | Yes | ~30 | Must keep the exact extended schema (base + ADR-0027 promoted JSONB) or downstream typing breaks |
+| Pruned scan providers (GIN row-group, R-tree, JSONB posting, cold tombstone) | `TableProvider` + `ExecutionPlan` shells only | **Yes** — internals already call `Storage` | ~400 shell rewrite | Preserve the conservative-superset contract: absent-from-map ⇒ read in full; UDF re-checks every row |
+| `HtapUnionTable` (cold ∪ hot, tombstones, tx overlay, MVCC watermark) | `TableProvider`, `supports_filters_pushdown`, `MemTable` | Yes, as a native union node | ~600 | **Highest correctness risk in the migration.** Read-your-own-writes, snapshot isolation via `hot_seq_watermark`, and merge-on-read all intersect here |
+| `TombstoneFilterExec` / `UpdateOverlayExec` | `ExecutionPlan` | Yes | ~300 | Ordering vs. the union node must be preserved exactly |
+| ~70 `pg_catalog` / `information_schema` providers | `TableProvider` + `MemorySourceConfig` + `MemorySchemaProvider` | **Yes** — they are `fn(catalog) -> RecordBatch` | ~800 mechanical (2 568 touched) | Volume, not difficulty. ORM compat suites (`docs/orm-compat.md`) are the regression gate |
+| Timescale / realtime / CDC / replication / usage / stat_statements views | same | Yes | ~300 | `TimescaleInfoSchema` is the only `SchemaProvider` impl — needs a namespace hook |
+| JSONB / JSON table-valued functions (5) | `TableProvider` | Yes — SRF node | ~250 | Lateral-join semantics must match PG |
+| Hot-tier `MemTable` wrapping | `MemTable` (64 sites in `basin-hottier`) | Yes — batch-list scan node | ~200 | Arrow IPC decode path already exists |
+| File-level min/max pruning | **None** (`evaluate_compound_for_pruning`) | Already done | 0 | None |
+| Bloom-filter pruning (Parquet native + Basin sidecar registries) | **None** | Already done | 0 | None |
+| Zone-map pruning (Vortex) | **None** — `ScanBuilder::with_filter` / `can_prune` | Already done | 0 | None |
+| Predicate → `vortex::Expression` translation | `vortex-datafusion::convert::exprs` (1 008 LOC) for the DF path only | Yes — `basin_storage::Predicate` → `Expression` is much smaller; partial version exists | ~300 | Type-gating: literal/column dtype mismatch must fall back to full decode, never change results (the existing `decode` retry contract) |
+| Planner cost statistics (`Statistics`/`Precision`) | `datafusion-common` | Yes — source from `DataFileRef` | ~250 | Join-ordering quality regression if the new estimator is naive; `inner_join@100k` is the known-sensitive benchmark |
+| Scan parallelism / file fan-out | DF `target_partitions` (`session.rs:303`) | Yes | ~300 | Genuinely new code; the current 8-way `scan_concurrency` for Vortex is tuned empirically |
+| Async read coalescing / buffering | DF datasource heuristics | Partly — Basin has page/metadata/disk caches, scheduler, bucket pool | ~200 | Only real perf unknown. Measure against DF before investing |
+| Cross-file limit pushdown | DF | Not yet | ~150 | `ReadOptions::limit` is per-read today |
+
+**Rough total:** ~4 300 LOC of new/rewritten code, against ~2 000 LOC deleted
+outright (`vortex_listing_format.rs` + the `ListingTable` plumbing) and ~16 000
+LOC of storage-side scan code that carries over unchanged.
+
+---
+
+## 7. Recommended sequencing
+
+1. **Delete `vortex_listing_format.rs` and `vortex-datafusion` first.** It is the
+   only thing pinning `datafusion-datasource`, `datafusion-physical-expr`,
+   `datafusion-physical-plan`, and `datafusion-session` as *direct* dependencies,
+   and the native Vortex path already covers its function. Gate on the
+   Vortex ⇆ Parquet differential harness plus UUID/POINT round-trip tests.
+2. **Route `TableFileFormat::Vortex` through `basin-storage`'s native decode**
+   for the general SQL path, so both formats share one reader.
+3. **Replace `ListingTable` with a native file-list scan node.** `ReadOptions`
+   is already the right contract.
+4. **Port the five pruned providers** — shell-only work.
+5. **Port `HtapUnionTable`** — schedule the most review time here.
+6. **Bulk-convert the ~70 metadata views** — mechanical, high volume,
+   ORM-compat-suite gated.
+7. **Build the cost/statistics model from `DataFileRef`** last, once the scan
+   layer is stable, and re-baseline `inner_join@100k`.
+
+## 8. Open questions
+
+- Does `basin-storage`'s reader apply the ADR-0024 UUID and POINT inverses on
+  *every* path `BasinVortexFormat` covered, or only on the fast paths? Verify
+  before step 1.
+- What is DF's request-coalescing actually worth on Basin's object-store
+  latency profile? Measure before rebuilding it.
+- `basin-hottier`'s 64 `MemTable` sites: is a batch-list scan node enough, or
+  does anything depend on `MemTable`'s partitioning behaviour?

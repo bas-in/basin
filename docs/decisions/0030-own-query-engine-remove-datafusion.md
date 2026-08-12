@@ -166,6 +166,29 @@ passes tests at every commit; the final commit in the sequence is the
   form an executable conformance spec for current behaviour. Because DataFusion
   is deleted last, a differential harness can run both engines and diff results
   during the entire migration.
+
+  > **Amended 2026-08-12, same day, before any engine work.** The claim above is
+  > materially overstated and is corrected here rather than left standing.
+  > `.github/workflows/ci.yml:136` runs
+  > `cargo test --workspace --exclude basin-integration-tests` — **every one of
+  > the 383 integration test files is excluded from the PR gate**, on the
+  > recorded grounds that their binaries OOM the runner at link time
+  > (`ci.yml:79`). The differential-vs-Postgres oracle covers **23 shapes**, and
+  > there is exactly **one** `.slt` file
+  > (`tests/integration/sqllogictest-suites/basic.slt`).
+  >
+  > So the conformance spec exists as code but **does not run automatically**,
+  > and the part that directly compares Basin against Postgres is a fraction of
+  > the LOC figure. Semantic drift — this ADR's highest-severity risk — is
+  > currently guarded by an instrument that no PR trips.
+  >
+  > **This makes the oracle a prerequisite, not a mitigation.** Phase 0 of the
+  > migration is building it: get the integration suite running in CI (or a
+  > nightly gate if the OOM constraint is real), and widen the differential
+  > oracle well beyond 23 shapes. No engine code should be written before that
+  > lands. See
+  > [`docs/migration/df-removal/10-risk-and-phases.md`](../migration/df-removal/10-risk-and-phases.md).
+
 - Fallback rate — the share of queries the owned engine cannot yet execute — is
   the governing metric. DataFusion is removed when it reaches zero, not on a
   date.

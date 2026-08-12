@@ -1,0 +1,961 @@
+---
+title: "DataFusion API inventory"
+nav_section: architecture
+sidebar_position: 90
+summary: "Authoritative inventory of every DataFusion 53 API surface basin-engine depends on, split into arrow-rs re-exports (no work) and real DataFusion surface, with a replacement-difficulty rating per item."
+tags: [query-engine, migration, technical-debt]
+---
+
+# DataFusion 53 removal — API inventory
+
+- **Status:** Authoritative inventory. Input to the `feat/own-engine-remove-datafusion` migration plan.
+- **Scope:** Every DataFusion API surface reachable from `crates/` and `services/`.
+- **Method:** `grep -rn "datafusion" crates services --include="*.rs"` (1016 matching
+  lines, 69 files) plus a brace-expanding parser over every `use` statement, plus
+  `Cargo.toml` / `Cargo.lock` dependency audit.
+- **Counting convention:** "refs" = raw grep lines (the 1016 figure). "symbol sites"
+  = brace-expanded `use` entries (1283) plus inline fully-qualified paths (389).
+  Both are given where they differ materially.
+
+---
+
+## 0. Executive summary of the numbers
+
+| Bucket | Refs | Share | Real work? |
+|---|---:|---:|---|
+| `datafusion::arrow::*` — **pure arrow-rs re-export** | **279** | 27.5% | **No.** Path rename only. |
+| `datafusion::{common,error,scalar,config}` — datafusion-common | 277 | 27.3% | Mostly TRIVIAL/MECHANICAL |
+| `datafusion::logical_expr` — datafusion-expr | 154 | 15.2% | Mixed; the UDF trait is MECHANICAL, the plan IR is HARD |
+| `datafusion::prelude` — facade (`SessionContext`, `DataFrame`) | 58 | 5.7% | LOAD-BEARING (fronts datafusion-sql + planner) |
+| `datafusion::physical_plan` + `datafusion_physical_plan` | 65 | 6.4% | HARD / LOAD-BEARING |
+| `datafusion::catalog` — datafusion-catalog | 45 | 4.4% | MECHANICAL |
+| `datafusion::datasource` + `datafusion_datasource` | 49 | 4.8% | HARD |
+| `datafusion::execution` — datafusion-execution | 18 | 1.8% | Mixed; memory pool is LOAD-BEARING |
+| `datafusion::optimizer` + `::physical_optimizer` | 14 | 1.4% | Interface only; the *rules behind it* are LOAD-BEARING |
+| `datafusion::physical_expr` + `datafusion_physical_expr` | 22 | 2.2% | MECHANICAL |
+| `datafusion::functions*` (explicit imports) | 7 | 0.7% | TRIVIAL to re-point; see §11 for the implicit surface |
+| `vortex_datafusion` | 8 | 0.8% | **None — deletable.** basin-storage reads Vortex directly (§7) |
+| Comments / string literals / test names | ~20 | 2.0% | None |
+
+**Headline:** 279 of 1016 refs (27.5%) are `datafusion::arrow::*`, which is a
+re-export of the workspace's own `arrow` crate. **These are not work.** See §1 —
+the proof that they are the same Rust type is in `Cargo.lock`, and the codebase
+already documents it at `crates/basin-engine/src/convert.rs:704-706`.
+
+The *real* DataFusion surface is ~737 refs, and it is heavily concentrated:
+247 scalar UDFs that implement a 4-method trait account for most of the raw
+line count but almost none of the algorithmic difficulty. The genuine risk is
+in five places — §12 ranks them.
+
+**Every DataFusion reference outside `crates/basin-engine` is a comment or a
+test name.** `basin-storage`, `basin-catalog`, `basin-shard`, `basin-auth`,
+`services/*` have zero compile-time DataFusion dependency:
+
+- `crates/basin-storage/src/predicate.rs:3` — doc comment explaining why
+  basin-storage deliberately defines its own `Predicate` enum instead of
+  reusing `datafusion::Expr`.
+- `crates/basin-bench-harness/src/profiles/vortex_vs_parquet.rs:7` — comment.
+- `crates/basin-engine/src/fast_select.rs:6262` — test function name.
+- `crates/basin-engine/src/pg_operators.rs:6510`,
+  `crates/basin-engine/src/schema_ddl.rs:554` — comments about the
+  `datafusion.public.<table>` default catalog namespace.
+- `crates/basin-engine/src/window_extras.rs:8` — comment.
+
+The blast radius is exactly one crate.
+
+---
+
+## 1. RE-EXPORTS OF ARROW-RS — **NOT WORK** (279 refs, 27.5%)
+
+### 1.1 Proof that this is a re-export, not a vendored copy
+
+`Cargo.lock` contains exactly one `arrow` entry: **`arrow 58.4.0`**
+(`Cargo.lock:281-283`). `datafusion-common 53.1.0` depends on that same
+`arrow` entry. The workspace pins `arrow = "58"` (`Cargo.toml:96`) and
+`crates/basin-engine/Cargo.toml:36-39` takes `arrow`, `arrow-array`,
+`arrow-schema`, `arrow-select` directly.
+
+Therefore `datafusion::arrow::array::StringArray` **is** `arrow::array::StringArray`
+— the same Rust type, same `TypeId`, same monomorphisation. The codebase already
+states this, at `crates/basin-engine/src/convert.rs:704-706`:
+
+> "Everything else is structurally identical between the two 'sides' (which
+> resolve to the same arrow-array 58.x crate, so the types are literally the
+> same Rust type)."
+
+**Migration action for all of §1: a `sed`-grade path rewrite**
+`datafusion::arrow::` → `arrow::`. Zero semantic change, zero design decisions.
+Difficulty: **TRIVIAL** for every item below without exception.
+
+### 1.2 `datafusion::arrow::datatypes` (109 symbol sites in this subtree)
+
+| Symbol | Sites | Top locations | Used for |
+|---|---:|---|---|
+| `DataType` | 41 + 3 inline | `hypertable.rs:916`, `hypertable.rs:1133`, `is_distinct_rewrite.rs:286` | Every UDF `return_type()` and `Signature::exact` arg list |
+| `Field` | 30 + 2 | `is_distinct_rewrite.rs:286`, `approx_count_distinct.rs:25`, `query_stats_export.rs:70` | Schema construction for synthetic tables + UDAF state fields |
+| `Schema` | 14 | `is_distinct_rewrite.rs:286`, `query_stats_export.rs:70`, `jsonb_udf.rs:5775` | `MemTable` / `TableProvider` schemas |
+| `TimeUnit` | 11 + 5 | `hypertable.rs:916`, `pg_agg_udf.rs:3357`, `convert.rs:1463` | Timestamp/Duration dispatch in datetime UDFs |
+| `SchemaRef` | 5 + 3 aliased + 1 inline | `query_stats_export.rs:70`, `info_schema_provider.rs:54`, `hypertable_provider.rs:38` | `TableProvider::schema()` return |
+| `FieldRef` | 3 + 5 inline | `approx_count_distinct.rs:25`, `pg_agg_udf.rs:70`, `pg_agg_udf.rs:149` | `return_field_from_args` + UDAF `state_fields` |
+| `IntervalUnit` | 3 + 1 aliased | `interval_tz_udf.rs:66`, `udf.rs:36`, `convert.rs:35` | Interval arithmetic dispatch |
+| `Fields` | 2 | `pg_agg_udf.rs:70`, `pg_agg_udf.rs:1325` | `StructArray` schema for ordered `array_agg` state |
+| `Int32Type` / `Int64Type` / `Float64Type` | 2 / 1 / 2 | `jsonb_modify_udf.rs:968`, `cancel_udf.rs:124`, `udf.rs:725` | Generic `PrimitiveArray<T>` params |
+| `DataType::*` glob | 2 | `approx_count_distinct.rs:107`, `approx_percentile.rs:122` | Wide dispatch match in approx aggregates |
+| Aliased forms (`as DfSchema`, `as DfDataType`, `as DfField`, `as DfTimeUnit`, `as DfIntervalUnit`, `as dfa`, `as df_schema`) | 15 | `convert.rs:32-36`, `convert.rs:1651`, `prepared.rs:2606` | Cross-"version" naming in `convert.rs` (now vestigial — see §1.5) |
+
+### 1.3 `datafusion::arrow::array` (the bulk of the 279)
+
+Concrete Arrow array and builder types. **All TRIVIAL.** Grouped for brevity;
+every one is a `use` path rename.
+
+| Group | Symbols | Sites | Representative locations |
+|---|---|---:|---|
+| Core traits/aliases | `Array` (28 + 3 inline + 3 `as _`), `ArrayRef` (27), `PrimitiveArray` (1 + 1 aliased), `new_empty_array` (1) | ~64 | `hypertable.rs:912`, `approx_count_distinct.rs:24`, `jsonb_udf.rs:31`, `convert.rs:33`, `cancel_udf.rs:123`, `pg_agg_udf.rs:63` |
+| String / binary | `StringArray` (32 + 1 inline + 3 aliased), `LargeStringArray` (1 + 7 inline), `StringViewArray` (2 + 6 inline + 1 aliased), `BinaryArray` (6), `LargeBinaryArray` (8 + 6 inline), `BinaryViewArray` (2 + 3 inline + 1 aliased), `FixedSizeBinaryArray` (1) | ~79 | `hypertable.rs:912`, `jsonb_udf.rs:31`, `jsonb_path_udf.rs:49`, `jsonb_path_udf.rs:1039`, `string_more_udf.rs:55`, `udf.rs:30`, `convert.rs:1719` |
+| Integer / float | `Int64Array` (18 + 5 inline + 3 aliased), `Int32Array` (12 + 2 inline), `Int16Array` (4), `Int8Array` (3), `UInt64Array` (3 + 1 inline + 1 aliased), `UInt32Array` (3 + 2 inline), `UInt16Array` (2), `UInt8Array` (2), `Float64Array` (13 + 2 inline), `Float32Array` (7) | ~83 | `approx_count_distinct.rs:101`, `pg_agg_udf.rs:1464`, `advisory_lock.rs:855-867`, `pg_catalog_udf.rs:732-737`, `json_build_udf.rs:120`, `range_udf.rs:458` |
+| Boolean | `BooleanArray` (17 + 1 aliased) | 18 | `approx_count_distinct.rs:101`, `query_stats_export.rs:69`, `pg_agg_udf.rs:2140` |
+| Temporal | `TimestampMicrosecondArray` (9 + 1 aliased), `TimestampNanosecondArray` (6 + 1 inline), `TimestampMillisecondArray` (5 + 1 aliased), `TimestampSecondArray` (5 + 1 aliased), `Date32Array` (4), `Date64Array` (1), `Time64MicrosecondArray` / `Time64NanosecondArray` (1 each), `Duration{Second,Milli,Micro,Nano}Array` (1 each), `IntervalMonthDayNanoArray` (3), `IntervalDayTimeArray` (2), `IntervalYearMonthArray` (2) | ~44 | `hypertable.rs:912`, `interval_tz_udf.rs:63`, `interval_tz_udf.rs:247`, `datetime_more_udf.rs:333`, `convert.rs:1013-1016`, `convert.rs:1236-1239`, `convert.rs:1351-1352` |
+| Nested | `ListArray` (12), `LargeListArray` (3), `FixedSizeListArray` (1), `StructArray` (2) | 18 | `jsonb_udf.rs:5415`, `jsonb_udf.rs:5720`, `pg_agg_udf.rs:63`, `pg_agg_udf.rs:1324`, `udf.rs:30` |
+| Builders | `StringBuilder` (2), `Int32Builder`, `Int64Builder`, `Date32Builder` (2), `BooleanBuilder`, `Float32Builder`, `ListBuilder`, `FixedSizeListBuilder`, `StringDictionaryBuilder`, `NullBufferBuilder`, `TimestampMicrosecondBuilder` (1 + 3 inline) | ~17 | `jsonb_modify_udf.rs:964`, `udf.rs:30`, `udf.rs:550`, `udf.rs:5476`, `datetime_extras.rs:32`, `pg_scalar_aliases.rs:44`, `datetime_more_udf.rs:972` |
+| `types::` submodule | `IntervalMonthDayNano` (3), `Timestamp{Second,Milli,Micro,Nano}Type`, `Duration{Second,Milli,Micro,Nano}Type` | ~12 | `interval_tz_udf.rs:62`, `udf.rs:29`, `convert.rs:398`, `convert.rs:523`, `convert.rs:1681` |
+| Glob / macro forms | `array::*` (3), `array::$cast` (macro expansion, 1), `array as df_array` (1) | 5 | `pg_agg_udf.rs:342`, `pg_agg_udf.rs:449`, `interval_tz_udf.rs:682`, `convert.rs:32` |
+| `RecordBatch` (both `::array::` and `::record_batch::` paths) | 8 + 5 inline + 3 aliased + `try_new` (4) + `new_empty` (1) | ~21 | `query_stats_export.rs:71`, `jsonb_udf.rs:5776`, `executor.rs:13167`, `executor.rs:7511`, `hypertable_provider.rs:122`, `convert.rs:1681` |
+
+### 1.4 `datafusion::arrow::{buffer, compute}`
+
+| Symbol | Sites | Locations | Used for | Difficulty |
+|---|---:|---|---|---|
+| `buffer::OffsetBuffer` | 4 + 2 inline | `pg_agg_udf.rs:67`, `trgm_glue.rs:55`, `string_dt_udf.rs:42`, `convert.rs:627` | List offset construction | TRIVIAL |
+| `buffer::NullBuffer` | 1 + 4 inline | `pg_agg_udf.rs:67`, `pg_agg_udf.rs:1366`, `convert.rs:633`, `convert.rs:673` | Null mask construction | TRIVIAL |
+| `buffer::ScalarBuffer` | 1 + 2 inline | `pg_agg_udf.rs:67`, `convert.rs:628`, `convert.rs:669` | Raw value buffer | TRIVIAL |
+| `compute::cast` | 2 + 7 inline | `inet_udf.rs:237`, `datetime_more_udf.rs:644`, `string_more_udf.rs:160`, `string_dt_udf.rs:598` | Type coercion inside UDFs | TRIVIAL |
+| `compute::concat` | 1 | `pg_agg_udf.rs:68` | Merge accumulator partials | TRIVIAL |
+| `compute::concat_batches` | 1 inline | `executor.rs:7516` | Collect result batches | TRIVIAL |
+| `compute::take` | 1 | `pg_agg_udf.rs:68` | Reorder for `array_agg … ORDER BY` | TRIVIAL |
+| `compute::lexsort_to_indices` | 1 | `pg_agg_udf.rs:68` | Sort key computation for ordered `array_agg` | TRIVIAL |
+| `compute::interleave` | 1 inline | `pg_agg_udf.rs:1026` | Groups-accumulator emit | TRIVIAL |
+| `compute::{SortColumn, SortOptions}` | 2 | `pg_agg_udf.rs:68` | `lexsort_to_indices` args | TRIVIAL |
+
+### 1.5 Special case — `crates/basin-engine/src/convert.rs` is now dead weight
+
+`convert.rs` (39 refs, 1800+ LOC) describes itself at lines 1-14 as
+"Cross-arrow-version glue" bridging "the workspace's pinned Arrow crates (v54)"
+against "the DataFusion 44 ecosystem … still on Arrow v53". **That comment is
+stale by two major versions on both sides.** The lockfile has one Arrow (58.4.0)
+and DataFusion is 53.1.0.
+
+What the file actually still does (`convert.rs:707-717`, `739-760`) is
+**layout normalisation**, not version bridging: it rewrites `LargeUtf8` →
+`Utf8`, `Utf8View` → `Utf8`, `BinaryView` → `Binary`, recursively through
+`List`/`LargeList`/`FixedSizeList`. Everything else takes the zero-copy fast
+path at `convert.rs:741-744` (`if !batch_needs_conversion(batch) { return Ok(batch.clone()) }`).
+
+- The `Df*`/`ws_*` type aliasing (`convert.rs:20-36`) is **TRIVIAL** to delete.
+- The `LargeUtf8`/`*View` normalisation is **MECHANICAL but must be preserved**:
+  it exists because DataFusion's planner and its string functions emit those
+  types, and `basin-storage` does not accept them. **A Basin-owned planner that
+  simply never produces `Utf8View`/`LargeUtf8` deletes this file outright** —
+  roughly 1800 LOC of removable surface. Flag it in the plan as a deletion, not
+  a port.
+
+---
+
+## 2. `datafusion-common` (277 refs — via `::common`, `::error`, `::scalar`, `::config`)
+
+### 2.1 Error types — 191 refs
+
+| Symbol | Sites | Top locations | Used for | Difficulty |
+|---|---:|---|---|---|
+| `common::Result as DFResult` | 35 | `hypertable.rs:917`, `rtree_rowgroup_scan.rs:55`, `approx_count_distinct.rs:26` | Return type of every trait method Basin implements | TRIVIAL — `type Result<T> = std::result::Result<T, BasinDfError>` |
+| `error::DataFusionError::Execution` | 53 inline | `range_udf.rs:389`, `range_udf.rs:1685`, `range_udf.rs:1690` | Raising runtime errors from UDF bodies | TRIVIAL |
+| `error::DataFusionError` | 17 + 2 inline | `rtree_rowgroup_scan.rs:56`, `query_stats_export.rs:75`, `executor.rs:10541` | Error type in signatures + PG SQLSTATE mapping | TRIVIAL |
+| `common::exec_err!` | 19 + 1 inline | `hypertable.rs:917`, `approx_count_distinct.rs:26`, `jsonb_udf.rs:37` | Macro shorthand for the above | TRIVIAL |
+| `common::DataFusionError` | 11 | `jsonb_udf.rs:37`, `jsonb_path_udf.rs:53`, `json_build_udf.rs:34` | Same type, different facade path | TRIVIAL |
+| `common::DataFusionError::Execution` | 18 inline | `approx_count_distinct.rs:82`, `trgm_glue.rs:244`, `udf.rs:1583` | As above | TRIVIAL |
+| `common::Result` | 8 + 3 inline | `is_distinct_rewrite.rs:101`, `nullif_rewrite.rs:24`, `any_all_rewrite.rs:272` | Optimizer-rule return type | TRIVIAL |
+| `error::Result as DfResult` / `as DFResult` | 6 + 2 + 4 inline | `query_stats_export.rs:75`, `inet_udf.rs:38`, `session.rs:3942` | Alias variants | TRIVIAL |
+| `error::DataFusionError::Plan` | 5 inline | `rls.rs:424`, `rls.rs:430`, `notify_registry.rs:277` | Planning-stage errors | TRIVIAL |
+| `error::DataFusionError::Internal` | 4 + 3 inline | `hypertable.rs:989`, `operators/citext_cmp.rs:312`, `vortex_listing_format.rs:720` | Invariant violations | TRIVIAL |
+| `common::DataFusionError::ArrowError` | 5 inline | `vortex_listing_format.rs:744`, `vortex_listing_format.rs:807`, `hot_tombstone.rs:726` | Wrapping `arrow::error::ArrowError` | TRIVIAL |
+| `common::plan_err!` | 3 | `jsonb_udf.rs:5779`, `jsonb_path_udf.rs:53`, `pg_agg_udf.rs:72` | Macro shorthand | TRIVIAL |
+
+**Hidden constraint (MECHANICAL, easy to miss):** `crates/basin-engine/src/executor.rs:10530-10614`
+(`map_df_plan_error`) **parses DataFusion's error message strings** to derive PG
+SQLSTATEs. It matches four exact substrings — `table '…' not found` → 42P01,
+`Invalid function '…'` → 42883, `table function '…' not found` → 42883,
+`No field named …` / `column '…' not found` → 42703. The doc comment at
+`executor.rs:10521-10528` notes that ORM migration flows (Diesel, TypeORM,
+Django) branch on 42P01 specifically. **The replacement engine must emit typed
+errors carrying SQLSTATE directly**; this string-matching layer should be
+deleted, not ported. Missing this silently breaks every ORM's
+"tracker table missing → create it" flow.
+
+### 2.2 `ScalarValue` — 71 refs
+
+`datafusion::scalar::ScalarValue` (18 imports + 1 aliased at `wasm_udf.rs:724`)
+and `datafusion::common::ScalarValue` (3 imports) are the same type.
+
+Variants actually constructed or matched, project-wide:
+
+| Variant | Occurrences | Representative locations |
+|---|---:|---|
+| `Int64` | 217 | `range_udf.rs:432`, `wasm_udf.rs:755`, `advisory_lock.rs` |
+| `Utf8` | 132 | `range_udf.rs:427`, `inet_udf.rs:241`, `wasm_udf.rs:1135` |
+| `Float64` | 66 | `range_udf.rs:434`, `wasm_udf.rs:776`, `udf.rs:6192`, `geo_glue.rs:3641` |
+| `Int32` | 52 | `range_udf.rs:431`, `wasm_udf.rs:754` |
+| `Boolean` | 29 | widespread |
+| `UInt64` | 27 | widespread |
+| `List` | 17 | `pg_agg_udf.rs` (array_agg state) |
+| `LargeUtf8` | 14 | `range_udf.rs:428`, `inet_udf.rs:242`, `trgm_glue.rs:260` |
+| `Float32` | 13 | `range_udf.rs:433`, `wasm_udf.rs:779` |
+| `TimestampMicrosecond` | 9 | `wasm_udf.rs:791`, `wasm_udf.rs:1165` |
+| `Int8`/`Int16`/`UInt8`/`UInt16`/`UInt32` | 8/8/7/7/7 | `range_udf.rs:429-430`, `approx_percentile.rs:118` |
+| `FixedSizeBinary` | 7 | UUID handling (ADR-0024) |
+| `Timestamp{Second,Milli,Nano}` | 5 each | `wasm_udf.rs`, `interval_tz_udf.rs` |
+| `Binary` | 5 | `wasm_udf.rs:1150` |
+| `Null` | 6 | widespread |
+| `Utf8View` | 3 | string UDFs |
+| `LargeBinary` | 2, `Date32` 2, `Decimal128` 1 | `range_udf.rs:435` |
+
+Associated functions used: `try_from_array` (14, e.g. `wasm_udf.rs:659`),
+`try_from` (8), `iter_to_array` (6), `new_list` (3), `new_list_from_iter` (3),
+`new_null_list` (3).
+
+**Difficulty: MECHANICAL.** ~28 variants plus 6 helper constructors. This is a
+tagged union over Arrow scalars — a couple of days of mechanical work, and Basin
+already owns a parallel type (`basin_storage::ScalarValue`, used at
+`fast_select.rs:28-31`) that could be widened instead of a fresh definition.
+Watch `iter_to_array` and `try_from_array` — those carry real null/type-promotion
+semantics.
+
+### 2.3 `common::tree_node` — 21 refs
+
+| Symbol | Sites | Top locations | Used for | Difficulty |
+|---|---:|---|---|---|
+| `tree_node::Transformed` | 10 | `is_distinct_rewrite.rs:101`, `citext_analyzer.rs:38`, `nullif_rewrite.rs:24` | Rewrite-result wrapper (`::yes` / `::no`) driving fixpoint iteration | MECHANICAL |
+| `tree_node::TreeNode` | 9 | `is_distinct_rewrite.rs:101`, `citext_analyzer.rs:38`, `nullif_rewrite.rs:24` | `transform_up`, `map_expressions`, `apply`, `transform_up_with_subqueries` | MECHANICAL |
+| `tree_node::TreeNodeRecursion::{Stop,Continue}` | 2 inline | `citext_analyzer.rs:94`, `citext_analyzer.rs:96` | Early-exit on the citext pre-scan | TRIVIAL |
+| `tree_node::TreeNode::transform_up` | 1 inline | `rls.rs:376` | RLS predicate injection | MECHANICAL |
+
+`Transformed`/`TreeNode` is a generic bottom-up/top-down rewriting framework.
+Basin needs it because five modules are written against it. Reimplementing it
+over a Basin-owned plan IR is straightforward — the interesting part is
+`transform_up_with_subqueries` (used at `any_all_rewrite.rs:209`), which must
+descend into subquery plans, not just the operator tree.
+
+### 2.4 Remaining datafusion-common items
+
+| Symbol | Sites | Top locations | Used for | Difficulty |
+|---|---:|---|---|---|
+| `config::ConfigOptions` (via `::config`) | 8 + 6 inline `::default()` + 1 | `range_udf.rs:2623`, `string_more_udf.rs:761`, `pg_catalog_udf.rs:1068`, `json_build_udf.rs:521`, `geo_glue.rs:3036` | Constructing `ScalarFunctionArgs { config_options, .. }` in UDF unit tests — almost entirely test-only | TRIVIAL |
+| `common::config::ConfigOptions` | 7 | `citext_analyzer.rs:37`, `citext_analyzer.rs:286`, `vortex_listing_format.rs:62` | `AnalyzerRule::analyze` / `FileFormat` parameter | TRIVIAL |
+| `common::Column` | 6 + 9 `Expr::Column` | `is_distinct_rewrite.rs:101`, `citext_analyzer.rs:40`, `union_scan_collapse.rs:326` | Qualified column reference (relation + name) | MECHANICAL |
+| `common::DFSchema` | 1 | `citext_analyzer.rs:40` | Qualified logical schema for type probing | MECHANICAL |
+| `common::TableReference` | 1 (used widely as `tref()`) | `session.rs:37` | 3-part `catalog.schema.table` naming | MECHANICAL |
+| `common::Statistics` | 2 | `vortex_listing_format.rs:65`, `vortex_listing_format.rs:1092` | `FileFormat::infer_stats` return | HARD (see §7) |
+| `common::stats::Precision` | 2 | `vortex_listing_format.rs:63`, `vortex_listing_format.rs:1091` | `Exact`/`Inexact`/`Absent` three-valued statistics | **LOAD-BEARING** (see §7) |
+| `common::Spans::new` | 2 inline | `any_all_rewrite.rs:261`, `any_all_rewrite.rs:408` | Source-span metadata on synthesised `Subquery` nodes | TRIVIAL |
+
+---
+
+## 3. `datafusion-expr` (`datafusion::logical_expr`, 154 refs)
+
+This module splits cleanly into two halves with very different difficulty.
+
+### 3.1 The UDF trait surface — high volume, low difficulty
+
+**247 `impl ScalarUDFImpl` blocks** across 25 files
+(`jsonb_udf.rs` 49, `geo_glue.rs` 34, `udf.rs` 27, `pg_scalar_aliases.rs` 17,
+`range_udf.rs` 15, `string_dt_udf.rs` 14, `pg_catalog_udf.rs` 13, `fts_udf.rs` 13,
+`datetime_more_udf.rs` 8, `operators/citext_cmp.rs` 7, `interval_tz_udf.rs` 7,
+`datetime_extras.rs` 7, `string_more_udf.rs` 5, `jsonb_modify_udf.rs` 5,
+`seq_udf.rs` 4, `advisory_lock.rs` 4, `trgm_glue.rs` 3, `jsonb_path_udf.rs` 3,
+`net_glue.rs` 2, `json_build_udf.rs` 2, `cron_glue.rs` 2, `wasm_udf.rs` 1,
+`regex_udf.rs` 1, `hypertable.rs` 1, `cancel_udf.rs` 1).
+
+**The critical finding: the trait surface Basin actually uses is 4 methods wide.**
+Counted project-wide:
+
+| Method | Impls | Method | Impls |
+|---|---:|---|---:|
+| `fn as_any` | 311 | `fn simplify` | **0** |
+| `fn name` | 283 | `fn short_circuits` | **0** |
+| `fn signature` | 262 | `fn coerce_types` | **0** |
+| `fn return_type` | 260 | `fn is_nullable` | **0** |
+| `fn invoke_with_args` | 247 | `fn documentation` | **0** |
+| `fn return_field_from_args` | 4 | `fn aliases` | 1 |
+
+Basin overrides **none** of the hard optional hooks. `ScalarUDFImpl` for Basin's
+purposes is:
+
+```
+trait ScalarUDFImpl {
+    fn as_any(&self) -> &dyn Any;
+    fn name(&self) -> &str;
+    fn signature(&self) -> &Signature;
+    fn return_type(&self, args: &[DataType]) -> Result<DataType>;
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue>;
+}
+```
+
+| Symbol | Import sites | Top locations | Used for | Difficulty |
+|---|---:|---|---|---|
+| `Signature` | 35 + 4 inline | `hypertable.rs:918`, `approx_count_distinct.rs:27`, `jsonb_udf.rs:38`, `prepared.rs:1073` | Argument-type declaration + PG-compat overload resolution | **HARD** (see below) |
+| `Volatility` | 35 | `hypertable.rs:918`, `approx_count_distinct.rs:27`, `jsonb_udf.rs:38` | `Immutable` 230 / `Volatile` 34 / `Stable` 24 — gates constant folding and CSE | MECHANICAL |
+| `ColumnarValue` | 32 + 2 inline | `hypertable.rs:918`, `jsonb_udf.rs:38`, `seq_udf.rs:38` | `Array` (411 sites) / `Scalar` (103 sites) — the UDF calling convention | MECHANICAL |
+| `ScalarUDFImpl` | 29 + 2 inline | `hypertable.rs:918`, `jsonb_udf.rs:38`, `inet_udf.rs:49` | The trait itself | MECHANICAL |
+| `ScalarFunctionArgs` | 28 + 4 inline | `hypertable.rs:918`, `jsonb_udf.rs:38`, `inet_udf.rs:64` | `{ args, number_rows, return_field, config_options }` | MECHANICAL |
+| `TypeSignature` | 28 | `jsonb_udf.rs:38`, `prepared.rs:1186`, `prepared.rs:2884` | See table below | **HARD** |
+| `ScalarUDF` | 25 + 2 inline | `hypertable.rs:918`, `jsonb_udf.rs:38`, `lib.rs:69` | The `Arc`-wrapped registry handle | MECHANICAL |
+| `ReturnFieldArgs` | 1 | `geo_glue.rs:101` | Metadata-aware return type (BASIN_TYPE sidecar) | MECHANICAL |
+
+**`Signature` / `TypeSignature` is the HARD item in this section**, and it is a
+narrow one. Constructor usage, project-wide:
+
+| Constructor | Uses | Variant | Uses |
+|---|---:|---|---:|
+| `Signature::one_of` | 155 | `TypeSignature::Exact` | 336 |
+| `Signature::exact` | 59 | `TypeSignature::Any` | 34 |
+| `Signature::any` | 42 | `TypeSignature::UserDefined` | 1 |
+| `Signature::nullary` | 19 | `TypeSignature::Uniform` | 1 |
+| `Signature::variadic_any` | 11 | `TypeSignature::OneOf` | 1 |
+| `Signature::new` | 3 | | |
+
+So the replacement needs exactly five signature shapes:
+`exact(Vec<DataType>)`, `one_of(Vec<TypeSignature>)`, `any(n)`, `nullary()`,
+`variadic_any()`. **But the resolution algorithm behind them is the hard part**:
+DataFusion's overload selection has to pick among 336 `Exact` alternatives with
+implicit coercion, and getting it wrong changes which of two `jsonb_*` overloads
+fires. Budget real time here.
+
+**Second-order dependency (easy to overlook):** `crates/basin-engine/src/prepared.rs:1181-1231`
+**reads `Signature.type_signature` back out** to infer prepared-statement
+parameter types for the PG wire protocol Describe message. It handles
+`TypeSignature::Exact` (`prepared.rs:1194`), `Uniform` (`prepared.rs:1198-1200`),
+and `OneOf` (`prepared.rs:1206-1209`), widening within the signed-int / float
+families (`prepared.rs:1226`, `prepared.rs:1229`) to mirror PG's `unknown`
+coercion. The motivating case is documented at `prepared.rs:1077-1080`:
+`SELECT pg_try_advisory_lock($1)` must describe `$1` as `bigint`, or strict
+drivers refuse to Bind. **`Signature` must therefore be an introspectable data
+structure, not an opaque closure.**
+
+### 3.2 The aggregate surface — 11 UDAFs, 9 accumulators
+
+| Symbol | Import sites | Top locations | Used for | Difficulty |
+|---|---:|---|---|---|
+| `Accumulator` | 5 + 19 inline | `pg_agg_udf.rs:1326`, `pg_agg_udf.rs:1465`, `approx_count_distinct.rs:50` | Row-at-a-time aggregate state (`update_batch`/`merge_batch`/`evaluate`/`state`) | MECHANICAL |
+| `AggregateUDFImpl` | 4 | `approx_count_distinct.rs:27`, `pg_agg_udf.rs:74`, `udf.rs:553` | UDAF trait — 11 impls | MECHANICAL |
+| `AggregateUDF` | 4 + 1 inline | `approx_count_distinct.rs:27`, `pg_agg_udf.rs:2963`, `lib.rs:70` | Registry handle | MECHANICAL |
+| `function::AccumulatorArgs` | 4 | `approx_count_distinct.rs:27`, `pg_agg_udf.rs:74`, `udf.rs:552` | Accumulator construction context (ORDER BY exprs, schema, DISTINCT flag) | MECHANICAL |
+| `function::StateFieldsArgs` | 4 | `approx_count_distinct.rs:27`, `pg_agg_udf.rs:74`, `udf.rs:552` | Partial-aggregate state schema | MECHANICAL |
+| `GroupsAccumulator` | 1 + 1 inline | `pg_agg_udf.rs:74`, `pg_agg_udf.rs:580` | **Vectorised** grouped aggregation — 1 impl at `pg_agg_udf.rs:1030` | **LOAD-BEARING** |
+| `EmitTo` | 1 | `pg_agg_udf.rs:74` | `GroupsAccumulator` emit protocol (`All` / `First(n)`) | MECHANICAL |
+| `utils::AggregateOrderSensitivity` | 1 inline | `pg_agg_udf.rs:547` | Declares `array_agg` order-sensitivity so the planner preserves input order | MECHANICAL |
+
+Full impl list — `impl AggregateUDFImpl`: `udf.rs:573`, `approx_count_distinct.rs:195`,
+`pg_agg_udf.rs:115` / `:235` / `:520` / `:2467` / `:2752` / `:3041` / `:3091`,
+`approx_percentile.rs:172` / `:268`.
+`impl Accumulator`: `approx_count_distinct.rs:50`, `approx_percentile.rs:45`,
+`pg_agg_udf.rs:163` / `:281` / `:745` / `:2635` / `:2803` / `:3212`, `udf.rs:674`.
+`impl GroupsAccumulator`: `pg_agg_udf.rs:1030`.
+
+**`GroupsAccumulator` is rated LOAD-BEARING** because it is the *vectorised*
+path — one accumulator instance handling all groups with a group-index array,
+versus one `Accumulator` boxed per group. `OrderedArrayAggGroupsAccumulator`
+(`pg_agg_udf.rs:1030`, with `create_groups_accumulator` at `pg_agg_udf.rs` and
+`interleave` at `pg_agg_udf.rs:1026`) exists specifically so that
+`array_agg(x ORDER BY y) GROUP BY k` does not allocate per group. Dropping to
+the scalar path would be a visible regression on grouped-aggregate benchmarks.
+Only 1 impl, but it must exist on day one.
+
+### 3.3 The logical plan IR — low volume, high difficulty
+
+| Symbol | Import sites | Top locations | Used for | Difficulty |
+|---|---:|---|---|---|
+| `Expr` | 23 + 15 inline | `rtree_rowgroup_scan.rs:58`, `is_distinct_rewrite.rs:107`, `session.rs:3940` | The logical expression IR | **HARD** |
+| `LogicalPlan` | 15 + 2 inline | `is_distinct_rewrite.rs:107`, `prepared.rs:2536`, `executor.rs:11203` | The logical operator IR | **HARD** |
+| `LogicalPlanBuilder` | 10 | `is_distinct_rewrite.rs:107`, `citext_analyzer.rs:288`, `pg_plan.rs` | Fluent plan construction (`scan`/`filter`/`project`/`sort`/`limit`/`aggregate`/`build`) | MECHANICAL |
+| `Operator` | 8 | `is_distinct_rewrite.rs:107`, `citext_analyzer.rs:41`, `any_all_rewrite.rs` | Binary operator enum | MECHANICAL |
+| `TableType` | 12 + 2 inline + 1 (`::datasource`) | `rtree_rowgroup_scan.rs:58`, `query_stats_export.rs:76`, `info_schema_provider.rs:59` | `Base` / `View` / `Temporary` on `TableProvider` | TRIVIAL |
+| `Filter` | 6 + 1 (`logical_plan::Filter`) | `is_distinct_rewrite.rs:289`, `citext_analyzer.rs:288`, `nullif_rewrite.rs:111` | Filter node construct/destructure (`Filter::try_new`, `citext_analyzer.rs:112`) | MECHANICAL |
+| `col` (`logical_expr` + `prelude`) | 5 + 1 | `is_distinct_rewrite.rs:107`, `session.rs:47`, `pg_plan.rs:15` | Column-ref helper | TRIVIAL |
+| `lit` (`logical_expr` + `prelude`) | 5 + 1 | `citext_analyzer.rs:288`, `nullif_rewrite.rs:111`, `pg_plan.rs:15` | Literal helper | TRIVIAL |
+| `BinaryExpr` (+ `expr::BinaryExpr`) | 5 + 3 + 14 inline | `is_distinct_rewrite.rs:107`, `citext_analyzer.rs:41`, `any_all_rewrite.rs:44` | Binary comparison rewriting | MECHANICAL |
+| `logical_plan::builder::LogicalTableSource` (+ `logical_plan::` path) | 4 + 1 | `is_distinct_rewrite.rs:288`, `nullif_rewrite.rs:110`, `union_scan_collapse.rs:327` | Schema-only table source — **test scaffolding only** | TRIVIAL |
+| `TableProviderFilterPushDown as Pd` (+ inline) | 3 + 3 inline | `session.rs:4103`, `tombstone_cold_scan.rs:217`, `hot_tombstone.rs:1267` | `Unsupported`/`Inexact`/`Exact` predicate pushdown contract | **LOAD-BEARING** (see §6) |
+| `SortExpr` (+ `expr::Sort as SortExpr`) | 2 + 1 + 1 inline | `session.rs:47`, `query_shape.rs:28`, `citext_analyzer.rs:41` | Sort key with asc/nulls-first | MECHANICAL |
+| `expr::{SetComparison, SetQuantifier}` | 2 + 2 + 15 inline | `any_all_rewrite.rs:44`, `any_all_rewrite.rs:233` | `x > ANY(subquery)` / `< ALL` IR | MECHANICAL |
+| `expr_rewriter::{normalize_cols, normalize_sorts}` | 2 | `is_distinct_rewrite.rs:106` | Resolve unqualified cols against input schema before building `Aggregate` | MECHANICAL |
+| `Aggregate` / `Distinct` / `DistinctOn` | 1 each | `is_distinct_rewrite.rs:107` | `Aggregate::try_new` (`:214`), `Distinct::On` match (`:140`) | MECHANICAL |
+| `expr::Alias` | 1 | `citext_analyzer.rs:41` | Alias unwrap during type probing | TRIVIAL |
+| `Cast` / `TryCast` / `Like` | 1 each | `citext_analyzer.rs:41` | Cast unwrap + LIKE rewrite for citext | MECHANICAL |
+| `logical_plan::Sort` | 1 | `citext_analyzer.rs:41` | Sort node rebuild (`citext_analyzer.rs:141-152`) | MECHANICAL |
+| `logical_plan::Union` / `Projection` | 1 each | `union_scan_collapse.rs:26` | Union-branch collapse | MECHANICAL |
+| `expr::Case` | 1 + inline | `any_all_rewrite.rs:44`, `any_all_rewrite.rs:174-182` | CASE for PG-correct ALL-with-NULL semantics | MECHANICAL |
+| `expr_fn::scalar_subquery` | 1 | `any_all_rewrite.rs:44`, used `:156` | Wrap the min/max aggregate as a scalar subquery | MECHANICAL |
+| `expr::ScalarFunction` | 1 + 4 inline | `nullif_rewrite.rs:109`, `nullif_rewrite.rs:62` | Match `nullif(a,b)` calls | MECHANICAL |
+| `expr::AggregateFunction` | 1 + 5 inline | `query_shape.rs:27`, `query_shape.rs:181` | Shape hashing | TRIVIAL |
+| `JoinType` | 1 | `query_shape.rs:28` | Shape hashing | TRIVIAL |
+| `logical_plan::Subquery` | 3 inline | `any_all_rewrite.rs:257`, `:258`, `:405` | Correlation check via `outer_ref_columns` | MECHANICAL |
+| `WindowFrame` / `WindowUDF` | 1 each | `catalog_window_exec.rs:198`, `:199` | Test-only window construction | TRIVIAL |
+
+**`LogicalPlan` variants Basin matches on** (from
+`crates/basin-engine/src/query_shape.rs:334-360`, which carries a **stable
+discriminant table over all 25 variants** — a hard compatibility constraint,
+since the shape hash is persisted and cross-process-stable per
+`query_shape.rs:41`):
+
+`Filter` (18), `TableScan` (12), `Union` (8), `Aggregate` (7), `Sort` (6),
+`Projection` (6), `Distinct` (6), `Limit` (3), `Join` (3), `Window` (2),
+`Explain` (2), then one apiece: `Values`, `Unnest`, `SubqueryAlias`, `Subquery`,
+`Statement`, `Repartition`, `RecursiveQuery`, `Extension`, `EmptyRelation`,
+`Dml`, `DescribeTable`, `Ddl`, `Copy`, `Analyze`.
+
+**`Expr` variants Basin matches on** (restricted to the DF-plan files, excluding
+sqlparser's identically-named `Expr`): `SetComparison` (15), `BinaryExpr` (14),
+`Column` (9), `Case` (5), `AggregateFunction` (5), `ScalarFunction` (4),
+`Like` (4), `Cast` (4), `TryCast` (3), `ScalarSubquery` (3), `Literal` (3),
+`InList` (3), `Between` (3), `Alias` (3), `Star`, `SimilarTo`,
+`OuterReferenceColumn`, `Not`, `Negative`, `IsNull`/`IsNotNull`/`IsTrue`/
+`IsFalse`/`IsUnknown`/`IsNotUnknown`/`IsNotTrue`/`IsNotFalse`, `WindowFunction`,
+`Wildcard`, `Unnest`, `ScalarVariable`, `Placeholder`, `InSubquery`,
+`GroupingSet`, `Exists`. `query_shape.rs:366-403` carries a **stable tag table
+over all 34 `Expr` variants** — same persistence constraint as above.
+
+`Operator` variants used: `Eq` (30), `Lt` (22), `Gt` (22), `GtEq` (20),
+`LtEq` (19), `And` (18), `NotEq` (10), `Or` (9), `Plus`/`Minus`/`Multiply`/
+`Divide`/`Modulo`/`IntegerDivide`, `Not`, `IsDistinctFrom` (4),
+`IsNotDistinctFrom` (4), `StringConcat`, `RegexMatch`/`RegexIMatch`/
+`RegexNotMatch`/`RegexNotIMatch`, `LikeMatch`/`ILikeMatch`/`NotLikeMatch`/
+`NotILikeMatch`, the JSON operator family (`Arrow`, `LongArrow`, `HashArrow`,
+`HashLongArrow`, `HashMinus`, `AtArrow`, `ArrowAt`, `AtQuestion`, `Question`,
+`QuestionAnd`, `QuestionPipe`, `AtAt`), `LtDashGt` (vector distance, 4),
+`Colon`, and the bitwise family. This full operator set must exist in the
+replacement IR — the JSON and vector operators are Basin-specific PG compat.
+
+---
+
+## 4. `datafusion` facade / `datafusion::prelude` (58 refs) — **the biggest hidden dependency**
+
+| Symbol | Import sites | Top locations | Used for | Difficulty |
+|---|---:|---|---|---|
+| `prelude::SessionContext` | 42 + 8 inline + 3 `::new()` | `session.rs:48`, `hypertable.rs:921`, `query_stats_export.rs:345` | The engine handle: registry, catalog, `sql()`, `state()` | **LOAD-BEARING** |
+| `prelude::DataFrame` | 2 + 4 inline | `rls.rs:51`, `lifecycle.rs:22`, `executor.rs:11487` | Plan handle returned by `sql()`; `logical_plan()`, `collect()`, `DataFrame::new` | **LOAD-BEARING** |
+| `prelude::SessionConfig` | 2 | `query_shape.rs:464`, `tests/distinct_on_lowering.rs:359` | Test-side config | TRIVIAL |
+| `prelude::{col, lit}` | 1 each | `pg_plan.rs:15` | Expression helpers | TRIVIAL |
+
+### 4.1 `SessionContext::sql()` — the whole SQL frontend, invisible to grep
+
+**76 call sites of `.sql(` across 15 files**: `executor.rs`, `prepared.rs`,
+`rls.rs`, `dml_mutate.rs`, `generated_cols.rs`, `explain.rs`, `type_ddl.rs`,
+`constraints.rs`, `lifecycle.rs`, `udf.rs`, `regex_udf.rs`, `query_shape.rs`,
+`realtime_catalog.rs`, `project_usage_view.rs`, `query_stats_export.rs`.
+
+The main read path is `crates/basin-engine/src/executor.rs:11184-11189`:
+
+```rust
+let mut df = sess.ctx.sql(sql_for_df).await
+    .map_err(|e| map_df_plan_error("plan", &e))?;
+```
+
+**Every one of these calls pulls in `datafusion-sql` (53.1.0) — the complete
+SQL text → `LogicalPlan` frontend — plus `datafusion-optimizer`'s 27 default
+rules, plus DataFusion's physical planner.** None of that appears in the grep
+output. It is by a wide margin the largest single item in this migration and it
+is entirely implicit.
+
+Note the interaction with ADR-0014: `pg_query` is the canonical *parser*, and
+`crates/basin-engine/src/pg_plan.rs` already translates the pg_query protobuf
+AST directly to a `LogicalPlan` (`pg_plan.rs:94`, gated by `supports_shape` at
+`pg_plan.rs:58`) — but only for the single-table
+`SELECT … WHERE … ORDER BY … LIMIT` shape, falling back to the `ctx.sql()`
+path otherwise. **`pg_plan.rs` is the beachhead for the replacement frontend**;
+the migration is "widen `supports_shape` until the fallback is dead."
+
+There are already two other DataFusion-bypass paths worth reusing:
+`crates/basin-engine/src/fast_select.rs` (6523 LOC, point-query fast path,
+documented at `fast_select.rs:1-19` as "bypass DataFusion entirely") and
+`crates/basin-engine/src/index_probe.rs` (6411 LOC, GIN containment probe).
+Neither has any DataFusion import.
+
+### 4.2 `EXPLAIN` output is DataFusion plan text
+
+`crates/basin-engine/src/explain.rs:1-15` routes PG `EXPLAIN`,
+`EXPLAIN ANALYZE`, `EXPLAIN VERBOSE`, and `EXPLAIN (FORMAT JSON)` straight to
+DataFusion's own plan formatter (`explain.rs:76`, `:86`, `:96`, reading the
+`plan_type`/`plan` columns at `explain.rs:141`, `:145`). Replacement plan text
+will differ. **MECHANICAL, but it is user-visible output** — anything asserting
+on EXPLAIN strings in the test suite will churn.
+
+---
+
+## 5. `datafusion-physical-plan` (`datafusion::physical_plan` 54 + `datafusion_physical_plan` 11 = 65 refs)
+
+**8 `impl ExecutionPlan` blocks**: `rtree_rowgroup_scan.rs:262`,
+`jsonb_posting_scan.rs:206`, `vortex_listing_format.rs:863`,
+`vortex_listing_format.rs:991`, `tombstone_cold_scan.rs:296`,
+`gin_rowgroup_scan.rs:298`, `hot_tombstone.rs:403`, `hot_tombstone.rs:544`.
+Each is paired with an `impl DisplayAs` (same files: `:251`, `:195`, `:857`,
+`:985`, `:284`, `:287`, `:392`, `:533`).
+
+| Symbol | Import sites | Top locations | Used for | Difficulty |
+|---|---:|---|---|---|
+| `ExecutionPlan` | 17 + 3 inline | `rtree_rowgroup_scan.rs:61`, `query_stats_export.rs:77`, `session.rs:3942` | The physical operator trait | **HARD** |
+| `SendableRecordBatchStream` | 5 + 1 (`_physical_plan`) | `rtree_rowgroup_scan.rs:61`, `jsonb_posting_scan.rs:41`, `gin_rowgroup_scan.rs:60` | `Pin<Box<dyn Stream<Item=Result<RecordBatch>> + Send>>` + schema | MECHANICAL |
+| `stream::RecordBatchStreamAdapter` | 5 + 1 | `rtree_rowgroup_scan.rs:60`, `jsonb_posting_scan.rs:40`, `gin_rowgroup_scan.rs:59`, used at `rtree_rowgroup_scan.rs:330`, `gin_rowgroup_scan.rs:391`, `jsonb_posting_scan.rs:267`, `hot_tombstone.rs:480`, `:696`, `tombstone_cold_scan.rs:363` | Attach a schema to a `futures::Stream` | TRIVIAL |
+| `PlanProperties` | 5 + 1 | `rtree_rowgroup_scan.rs:61`, constructed at `rtree_rowgroup_scan.rs:232`, `gin_rowgroup_scan.rs:268`, `jsonb_posting_scan.rs:176`, `tombstone_cold_scan.rs:262`, `hot_tombstone.rs:376`, `:517` | `(EquivalenceProperties, Partitioning, EmissionType, Boundedness)` | MECHANICAL |
+| `DisplayAs` / `DisplayFormatType` | 5 + 5, +1 each | `rtree_rowgroup_scan.rs:61`, `jsonb_posting_scan.rs:41`, `gin_rowgroup_scan.rs:60` | EXPLAIN rendering | TRIVIAL |
+| `ExecutionPlanProperties` | 5 + 1 | `sort_streaming_limit.rs:64`, `sort_streaming_limit.rs:200`, `catalog_window_exec.rs:61` | `output_ordering()` / `output_partitioning()` accessors on `dyn ExecutionPlan` | MECHANICAL |
+| `Partitioning::UnknownPartitioning` | 4 inline + 2 (`_physical_plan::Partitioning`) | `rtree_rowgroup_scan.rs:234`, `jsonb_posting_scan.rs:178`, `gin_rowgroup_scan.rs:270` | All Basin custom scans declare 1 partition | TRIVIAL |
+| `execution_plan::{Boundedness, EmissionType}` | 5 + 5 (`_physical_plan`) | `rtree_rowgroup_scan.rs:64`, `jsonb_posting_scan.rs:44`, `gin_rowgroup_scan.rs:63` | All Basin scans: `Bounded` + `Incremental` | TRIVIAL |
+| `sorts::sort::SortExec` | 4 | `sort_streaming_limit.rs:63`, `:199`, `catalog_window_exec.rs:59` | Pattern-matched via `downcast_ref` at `sort_streaming_limit.rs:124`, `catalog_window_exec.rs:118`; reconstructed at `sort_streaming_limit.rs:148` | **LOAD-BEARING** (§8) |
+| `repartition::RepartitionExec` | 3 | `sort_streaming_limit.rs:62`, `:198`, `catalog_window_exec.rs:58` | Looked through at `sort_streaming_limit.rs:163`, `catalog_window_exec.rs:121` | **LOAD-BEARING** (§8) |
+| `projection::{ProjectionExec, ProjectionExpr}` | 3 + 3 | `session.rs:4046`, `tombstone_cold_scan.rs:199`, `hot_tombstone.rs:1244` | Strip the synthetic PK column after tombstone filtering (`tombstone_cold_scan.rs:201-210`) | MECHANICAL |
+| `coalesce_partitions::CoalescePartitionsExec` | 2 | `sort_streaming_limit.rs:60`, `:196`, constructed `:146` | Force single-partition streaming under OFFSET | **LOAD-BEARING** (§8) |
+| `limit::GlobalLimitExec` | 2 | `sort_streaming_limit.rs:61`, `:197`, matched `:113` | OFFSET+LIMIT detection | **LOAD-BEARING** (§8) |
+| `windows::{WindowAggExec, BoundedWindowAggExec}` | 2 + 1 | `catalog_window_exec.rs:60`, `:203`, matched `:141-144` | Window sort elision | **LOAD-BEARING** (§8) |
+| `windows::{StandardWindowExpr, WindowUDFExpr, create_udwf_window_expr}` | 1 each | `catalog_window_exec.rs:202`, `:203` | Test scaffolding for the elision rule | TRIVIAL |
+| `filter::FilterExec` | 1 | `catalog_window_exec.rs:200` | Test scaffolding | TRIVIAL |
+| `union::UnionExec` | 1 | `session.rs:3946` | HTAP hot+cold union | MECHANICAL |
+| `WindowExpr` | 1 inline | `catalog_window_exec.rs:279` | Test scaffolding | TRIVIAL |
+| `PhysicalExpr` | 1 | `vortex_listing_format.rs:71` | Filter pushdown into Vortex | MECHANICAL |
+| `filter_pushdown::{ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation}` | 5 (`::physical_plan`) + 4 (`_physical_plan`) | `hot_tombstone.rs:39-41`, `vortex_listing_format.rs:82`, used `hot_tombstone.rs:451`, `:460`, `:464`, `:626`, `:653`, `:662` | Dynamic filter pushdown across the tombstone overlays | **HARD** |
+| `physical_plan::collect` | 1 inline | `executor.rs:11335` | **The main execution entry point** | **LOAD-BEARING** |
+| `metrics::ExecutionPlanMetricsSet` | 1 | `vortex_listing_format.rs:85` | Per-operator metrics for EXPLAIN ANALYZE | MECHANICAL |
+| `SortOrderPushdownResult` | 1 | `vortex_listing_format.rs:87` | Sort-order pushdown into the file source | MECHANICAL |
+
+**`ExecutionPlan` is rated HARD not for the trait but for its contract.** The
+replacement must supply: `properties()`, `children()`, `with_new_children()`,
+`execute(partition, TaskContext) -> SendableRecordBatchStream`, plus the
+`filter_pushdown` protocol that `hot_tombstone.rs` participates in. The
+partitioning/ordering/equivalence bookkeeping is what makes physical optimizer
+rules possible at all.
+
+---
+
+## 6. `datafusion-catalog` (45 refs) + `datafusion-datasource` (49 refs)
+
+### 6.1 `datafusion::catalog` — 45 refs
+
+**42 `impl TableProvider` blocks**, dominated by `info_schema_provider.rs` (21):
+`info_schema_provider.rs` 21, `jsonb_udf.rs` 4, `replication/slot_udf.rs` 3,
+`realtime_catalog.rs` 2, `hypertable_provider.rs` 2, and one each in
+`tombstone_cold_scan.rs`, `session.rs`, `rtree_rowgroup_scan.rs`,
+`query_stats_export.rs`, `project_usage_view.rs`, `notify_registry.rs`,
+`jsonb_posting_scan.rs`, `jsonb_path_udf.rs`, `hot_tombstone.rs`,
+`gin_rowgroup_scan.rs`.
+
+| Symbol | Import sites | Top locations | Used for | Difficulty |
+|---|---:|---|---|---|
+| `catalog::TableProvider` (+ `datasource::TableProvider`) | 3 + 7 + 24 inline | `jsonb_udf.rs:5778`, `session.rs:2896`, `rtree_rowgroup_scan.rs:70` | `schema()`, `table_type()`, `scan()`, `supports_filters_pushdown()` | **HARD** |
+| `catalog::Session` | 10 + 6 inline | `query_stats_export.rs:72`, `info_schema_provider.rs:55`, `rtree_rowgroup_scan.rs:148` | The `&dyn Session` handed to `TableProvider::scan` | MECHANICAL |
+| `catalog::SchemaProvider` | 4 | `session.rs:2895`, `info_schema_provider.rs:55`, `realtime_catalog.rs:70` | Namespace of tables — 1 impl at `hypertable_provider.rs:260` | MECHANICAL |
+| `catalog::MemorySchemaProvider` | 3 + 1 inline | `session.rs:2895`, `info_schema_provider.rs:2104`, `realtime_catalog.rs:70` | Built-in in-memory schema | TRIVIAL |
+| `catalog::TableFunctionImpl` | 3 | `jsonb_udf.rs:36`, `jsonb_path_udf.rs:52`, `notify_registry.rs:44` | Set-returning functions — 6 impls: `notify_registry.rs:267`, `jsonb_udf.rs:5832`/`:5915`/`:5999`/`:6184`, `jsonb_path_udf.rs:1548` | MECHANICAL |
+
+`TableProvider::scan` is **HARD** because it is where Basin's whole
+storage-integration story lives: `scan()` receives projection, filters, and
+limit, and Basin's custom providers use that to drive
+`Storage::read_paths_with_schema` with a row-group allowlist. See §8.
+
+`supports_filters_pushdown` returning `TableProviderFilterPushDown::Exact` vs
+`Inexact` vs `Unsupported` (`session.rs:4103`, `tombstone_cold_scan.rs:213-217`,
+`hot_tombstone.rs:1266-1267`) is **LOAD-BEARING**: `Exact` tells the planner to
+*delete* the `FilterExec`, which is what makes predicate pushdown into Parquet
+row-group pruning actually pay off. Getting the three-valued contract wrong is
+either a correctness bug (dropped filters) or a silent 10× regression.
+
+### 6.2 `datafusion::datasource` + `datafusion_datasource` — 49 refs
+
+| Symbol | Import sites | Top locations | Used for | Difficulty |
+|---|---:|---|---|---|
+| `datasource::MemTable` (+ `::memory::MemTable`) | 10 + 7 | `session.rs:43`, `prepared.rs:2607`, `executor.rs:13134`, `type_ddl.rs:492`, `generated_cols.rs:103`, `rls.rs:821` | In-memory table for synthetic results, generated-column evaluation, RLS WITH CHECK, DML-CTE describe | MECHANICAL |
+| `datasource::memory::MemorySourceConfig` | 6 + 2 (`datafusion_datasource::memory`) | `query_stats_export.rs:73`, `info_schema_provider.rs:56`, `project_usage_view.rs:51` | Backing source for catalog/system views | MECHANICAL |
+| `datasource::listing::{ListingTable, ListingTableConfig, ListingOptions, ListingTableUrl}` | 4 | `session.rs:40`, built at `session.rs:3227-3244`, `session.rs:3796-3813` | **The primary table registration path** — object-store file listing + Parquet/Vortex scan | **HARD** |
+| `ListingOptions::with_file_sort_order` | (2 call sites) | `session.rs:3229`, `session.rs:3799` (helper `build_file_sort_order` at `session.rs:3124`) | Declares `basin.sort_by` as the file's natural ordering | **LOAD-BEARING** — this is the input that makes §8's two sort-elision rules fire |
+| `datasource::file_format::FileFormat` | 2 | `session.rs:39`, `vortex_listing_format.rs:66` | Format abstraction — 1 impl at `vortex_listing_format.rs:136` | **HARD** |
+| `datasource::file_format::parquet::ParquetFormat` | 1 | `session.rs:38`, used `session.rs:3094` | Default cold-tier format | **HARD** (see §11.2) |
+| `datasource::provider_as_source` | 1 | `pg_plan.rs:13`, used `pg_plan.rs:151` | Bridge `TableProvider` → `TableSource` for `LogicalPlanBuilder::scan` | TRIVIAL |
+| `datafusion_datasource::source::DataSourceExec` | 5 | `vortex_listing_format.rs:77`, `sort_streaming_limit.rs:65`, `:202`, matched `sort_streaming_limit.rs:160`, `catalog_window_exec.rs` | The leaf scan node both physical rules pattern-match on | **LOAD-BEARING** |
+| `datafusion_datasource::file::FileSource` | 1 | `vortex_listing_format.rs:72` — 1 impl at `vortex_listing_format.rs:405` (`UdfPushdownGuard`) | Guards UDF pushdown into Vortex | HARD |
+| `datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder}` | 2 | `vortex_listing_format.rs:75` | Scan config assembly | MECHANICAL |
+| `datafusion_datasource::file_format::FileMeta` | 1 | `vortex_listing_format.rs:74` | Per-file metadata | TRIVIAL |
+| `datafusion_datasource::file_compression_type::FileCompressionType` | 1 | `vortex_listing_format.rs:73` | `FileFormat` signature | TRIVIAL |
+| `datafusion_datasource::file_sink_config::FileSinkConfig` | 1 | `vortex_listing_format.rs:76` | `FileFormat` write side (unused in practice) | TRIVIAL |
+| `datafusion_datasource::TableSchema` | 1 | `vortex_listing_format.rs:78` | UUID schema swap (ADR-0024) | MECHANICAL |
+| `datafusion_datasource::file_stream::FileOpener` | 1 inline | `vortex_listing_format.rs:413` | Per-file stream opener | MECHANICAL |
+
+---
+
+## 7. `vortex-datafusion` — **not a blocker; it is deletable** (8 refs)
+
+| Symbol | Sites | Locations | Difficulty |
+|---|---:|---|---|
+| `vortex_datafusion::VortexFormat` | 2 | `session.rs:3110`, `vortex_listing_format.rs:1171` | **DELETE** |
+| `vortex_datafusion::VortexTableOptions` | 2 | `session.rs:3112`, `vortex_listing_format.rs:1172` | **DELETE** |
+
+`crates/basin-engine/Cargo.toml:46` pins `vortex-datafusion = "0.71"` with the
+comment "0.71 targets datafusion 53 / arrow 58 = the workspace pins exactly."
+
+**A first reading suggests this is the one dependency the migration cannot
+resolve by rewriting Basin code — `vortex-datafusion` implements
+`FileFormat`/`FileSource` against DataFusion's traits, so it cannot outlive
+them. That reading is wrong, and ADR-0015's description of the read path is
+stale.**
+
+`basin-storage` **already reads Vortex directly and does not depend on
+`vortex-datafusion` at all.** `crates/basin-storage/Cargo.toml:54-60` takes
+`vortex-array`, `vortex-file` (zstd), `vortex-btrblocks` (zstd, pco),
+`vortex-session`, `vortex-io` (tokio, object_store), `vortex-layout`, and
+`vortex-buffer` — the full read stack. The implementation lives in
+`crates/basin-storage/src/vortex_format.rs`,
+`crates/basin-storage/src/vortex_footer_cache.rs` (its own footer cache, not
+DataFusion's), `crates/basin-storage/src/reader.rs`,
+`crates/basin-storage/src/predicate.rs`, and `crates/basin-storage/src/writer.rs`.
+
+`vortex-datafusion` appears in exactly **two** places, both on the DataFusion
+side of the boundary: `session.rs:3110-3112` (constructing the inner
+`VortexFormat` for the `ListingTable` registration path) and
+`vortex_listing_format.rs:1171-1172` (the wrapper's inner delegate).
+
+So the coupling is confined to one engine-side `ListingTable` wrapper whose
+entire reason to exist is patching `total_byte_size` for **DataFusion's**
+planner. **With no DataFusion planner, nothing consumes it.**
+`vortex_listing_format.rs` gets **deleted, not rewritten**, and
+`vortex-datafusion` leaves the tree with its parent. The Vortex read path
+Basin actually ships is untouched.
+
+Two things entangled in `vortex_listing_format.rs` are therefore also deletions
+rather than ports — but each encodes a real requirement that must be re-honoured
+on the Basin-owned scan path:
+
+- **`Statistics.total_byte_size` patching** (`vortex_listing_format.rs:7-25`).
+  `VortexFormat::infer_stats` returns `Precision::Absent` for byte size because
+  `PRUNING_STATS` in vortex-array omits `Stat::UncompressedSizeInBytes`. DataFusion's
+  `join_selection` then falls back to row-count heuristics and mis-plans
+  byte-skewed joins — **an observed 0.54× regression on `inner_join@100k`**.
+  Basin substitutes `Precision::Inexact(object.size)`. The *code* is deletable
+  along with the wrapper, but the *lesson* is not: **a Basin-owned join planner
+  that sizes build/probe sides must have a real byte-size estimate for Vortex
+  files, or it reproduces the same 0.54× regression.** Rating: **LOAD-BEARING
+  requirement, deletable implementation.**
+- **ADR-0024 UUID round-trip** (`vortex_listing_format.rs:26-50`). Vortex 0.71
+  has no `FixedSizeBinary(N)` encoder, so UUIDs land on disk as
+  `Decimal256(39,0)`. `BasinVortexFormat::file_source` swaps the schema going
+  down; `UuidDecimal256RestoreExec` (`vortex_listing_format.rs:863`) converts
+  back on every output batch. `PointFsbRestoreExec`
+  (`vortex_listing_format.rs:991`) does the same for POINT geometry. The two
+  custom `ExecutionPlan` nodes exist purely because the conversion had to be
+  expressed as a DataFusion plan node; on a Basin-owned scan path the same
+  conversion is an ordinary function on the batch stream. Rating: **MECHANICAL
+  once the DataFusion framing is gone** — but the ADR-0024 disguise itself is
+  still real and must be undone somewhere on the read path.
+
+---
+
+## 8. `datafusion-optimizer` (12) + `datafusion-physical-optimizer` (2) — **small interface, load-bearing content**
+
+### 8.1 The trait surface
+
+| Symbol | Import sites | Top locations | Used for | Difficulty |
+|---|---:|---|---|---|
+| `optimizer::OptimizerRule` | 5 + 1 inline | `is_distinct_rewrite.rs:111`, `nullif_rewrite.rs:29`, `union_scan_collapse.rs:27`, `lib.rs:76` | Logical rewrite trait — 4 impls | MECHANICAL |
+| `optimizer::OptimizerConfig` | 4 | `is_distinct_rewrite.rs:111`, `nullif_rewrite.rs:29`, `union_scan_collapse.rs:27` | Rule context (alias generator, options) | TRIVIAL |
+| `optimizer::OptimizerContext` | 3 | `is_distinct_rewrite.rs:292`, `nullif_rewrite.rs:112`, `union_scan_collapse.rs:331` | Test-only concrete config | TRIVIAL |
+| `optimizer::optimizer::ApplyOrder` | 2 | `is_distinct_rewrite.rs:111`, `nullif_rewrite.rs:29` | `BottomUp` traversal declaration | TRIVIAL |
+| `optimizer::AnalyzerRule` | 2 | `citext_analyzer.rs:47`, `citext_analyzer.rs:291` | Pre-optimizer, post-type-coercion rewrite — 1 impl at `citext_analyzer.rs:62` | MECHANICAL |
+| `optimizer::Optimizer::default().rules` | 2 inline | `session.rs:412`, `lib.rs:75` | **Harvests DataFusion's 27 default rules** into `StatelessUdfCache.optimizer_rules` (`lib.rs:74-76`) | **LOAD-BEARING** |
+| `physical_optimizer::PhysicalOptimizerRule` | 2 | `sort_streaming_limit.rs:59`, `catalog_window_exec.rs:57` | Physical rewrite trait — 2 impls | MECHANICAL |
+
+### 8.2 What actually depends on this — the four logical rules
+
+All four are **prepended at position 0** of the rule list
+(`session.rs:2728-2745`), i.e. they must run *before* DataFusion's own rules:
+
+1. **`IsDistinctRewrite`** (`is_distinct_rewrite.rs:125`). Two jobs. (a) Lowers
+   `Expr::BinaryExpr` with `Operator::IsDistinctFrom`/`IsNotDistinctFrom`
+   (`is_distinct_rewrite.rs:250`) into `is_null`/`eq`/`or` combinations
+   (`:264`, `:272`) that are pushdown-friendly. (b) Lowers
+   `LogicalPlan::Distinct(Distinct::On(..))` (`:140`) into
+   `Aggregate::try_new` + `first_value` (`:208`, `:214`) then
+   `LogicalPlanBuilder::from(agg).sort().project().build()` (`:242-245`) —
+   explicitly to beat DataFusion's stock `ReplaceDistinctWithAggregate`.
+   **LOAD-BEARING** (b), MECHANICAL (a).
+2. **`NullifRewrite`** (`nullif_rewrite.rs:40`). `NULLIF(a,b) IS NOT NULL` →
+   `a IS NOT NULL AND a != b` (`nullif_rewrite.rs:79-81`); `IS NULL` →
+   `a IS NULL OR a = b` (`:88-90`). Purpose: **make the predicate pushable into
+   Vortex**. **LOAD-BEARING.**
+3. **`AnyAllToScalarSubquery`** (`any_all_rewrite.rs:196`). Uncorrelated
+   `x > ANY(sub)` / `x < ALL(sub)` → `min`/`max` scalar subquery
+   (`any_all_rewrite.rs:113-116`, `:155-157`), with `Case`-based PG-correct
+   empty-set and NULL semantics (`:174-182`). Documented rationale
+   (`session.rs:2721-2726`): fires **before** DataFusion's
+   `RewriteSetComparison`, so the plan becomes a hash join instead of a
+   `LeftMark` **nested-loop** join. **LOAD-BEARING** — this is a
+   complexity-class change, not a constant factor.
+4. **`UnionScanCollapse`** (`union_scan_collapse.rs:302`).
+   `Union(Filter(Scan t, A), Filter(Scan t, B))` → `Filter(Scan t, A OR B)`
+   (`union_scan_collapse.rs:1-18`), eliminating duplicate file reads.
+   **LOAD-BEARING.**
+
+Plus one analyzer rule, appended via `with_analyzer_rule` (`session.rs:2797-2799`):
+
+5. **`CitextAnalyzerRule`** (`citext_analyzer.rs:62`). Must run **after**
+   TypeCoercion (all schemas resolved). Rewrites comparisons
+   (`citext_analyzer.rs:175-180`), `Like` (`:199-210`), and `Sort` exprs
+   (`:141-152`) on `BASIN_TYPE=CITEXT` columns to `lower()`-folded operands via
+   `datafusion::functions::string::lower()` (`:231-232`). Has a
+   `TreeNodeRecursion::Stop` pre-scan (`:85-97`) so non-citext queries pay
+   nothing. Correctness/feature, not perf: **MECHANICAL**, but it depends on
+   analyzer-vs-optimizer *phase ordering* existing in the replacement.
+
+### 8.3 The two physical rules — both pure benchmark wins
+
+Both are appended **after** all DataFusion default physical rules
+(`session.rs:2779-2795`), so they run once `EnforceDistribution` /
+`EnforceSorting` have finished.
+
+6. **`SortStreamingLimit`** (`sort_streaming_limit.rs:81`). Matches
+   `GlobalLimitExec{skip>0, fetch:Some}` (`:113`) → `SortExec{fetch:Some}`
+   (`:124`) → optional `RepartitionExec` (`:163`) → `DataSourceExec` (`:160`),
+   checks the sort is a prefix of the scan's `output_ordering` via
+   `LexOrdering` (`is_prefix_of`, `:176`), and injects a
+   `CoalescePartitionsExec` (`:146`) + rebuilt `SortExec` (`:148`) so the
+   OFFSET scan streams single-partition. **LOAD-BEARING** — the module doc
+   (`sort_streaming_limit.rs:11-51`) is a benchmark narrative.
+7. **`CatalogWindowExecSortElision`** (`catalog_window_exec.rs:79`). Matches
+   `WindowAggExec`/`BoundedWindowAggExec` (`:141-144`) → `SortExec` (`:118`) →
+   optional `RepartitionExec` (`:121`) → `DataSourceExec`, and **deletes the
+   `SortExec`** (`:135`) when `basin.sort_by` already covers the window's
+   PARTITION BY + ORDER BY. **LOAD-BEARING.**
+
+**Both rules are structural pattern-matches over concrete DataFusion physical
+node types via `downcast_ref`.** They do not survive a plan-IR change in any
+form — they must be rewritten against the new physical IR, and they are where
+two documented benchmark wins live.
+
+### 8.4 The 27 rules Basin inherits for free
+
+`lib.rs:74-76` / `session.rs:412` capture `Optimizer::default().rules` —
+predicate pushdown, projection pushdown, constant folding, subquery decorrelation,
+common-subexpression elimination, join reordering, limit pushdown, and so on.
+Basin's four custom rules ride on top. **This is the second-largest implicit
+item after `datafusion-sql`.**
+
+---
+
+## 9. `datafusion-physical-expr` (`datafusion::physical_expr` 11 + `datafusion_physical_expr` 11 = 22 refs)
+
+| Symbol | Import sites | Top locations | Used for | Difficulty |
+|---|---:|---|---|---|
+| `EquivalenceProperties` | 5 | `rtree_rowgroup_scan.rs:59`, `jsonb_posting_scan.rs:39`, `gin_rowgroup_scan.rs:58`; constructed at `rtree_rowgroup_scan.rs:231`, `gin_rowgroup_scan.rs:267`, `jsonb_posting_scan.rs:175`, `tombstone_cold_scan.rs:261` | Ordering + column-equivalence tracking inside `PlanProperties` | MECHANICAL (Basin only ever calls `::new(schema)` — the empty case) |
+| `LexOrdering` | 1 (`::physical_expr`) + 4 (`_physical_expr`) | `vortex_listing_format.rs:69`, `sort_streaming_limit.rs:66`, `:204`, `catalog_window_exec.rs:63` | Ordered list of sort keys; prefix comparison at `sort_streaming_limit.rs:176` | MECHANICAL |
+| `expressions::Column` | 3 (`::physical_expr`) + 3 (`_physical_expr`) | `session.rs:4045`, `tombstone_cold_scan.rs:198`, `hot_tombstone.rs:1243`, `vortex_listing_format.rs:79` | Physical column reference for the strip-PK `ProjectionExec` | TRIVIAL |
+| `PhysicalSortExpr` | 1 + 2 | `vortex_listing_format.rs:68`, `sort_streaming_limit.rs:205`, `catalog_window_exec.rs:212` | Single sort key (expr + `SortOptions`) | TRIVIAL |
+| `PhysicalExpr` | 1 + 1 + 1 inline | `hot_tombstone.rs:38`, `catalog_window_exec.rs:211`, `pg_agg_udf.rs:2532` | Evaluated physical expression trait | MECHANICAL |
+| `LexRequirement` | 1 | `vortex_listing_format.rs:69` | Required (vs provided) ordering | TRIVIAL |
+| `projection::ProjectionExprs` | 1 | `vortex_listing_format.rs:80` | Projection list on the scan config | TRIVIAL |
+
+**Notable absence:** Basin implements **zero** custom `PhysicalExpr`. Every
+expression Basin adds enters via `ScalarUDFImpl`. That is a meaningful
+simplification for the replacement — the physical expression evaluator only
+needs the built-in node set plus a UDF-call node.
+
+---
+
+## 10. `datafusion-execution` (18 refs)
+
+| Symbol | Import sites | Top locations | Used for | Difficulty |
+|---|---:|---|---|---|
+| `execution::context::TaskContext` | 6 | `rtree_rowgroup_scan.rs:57`, `jsonb_posting_scan.rs:37`, `gin_rowgroup_scan.rs:56` | Per-execution context passed to `ExecutionPlan::execute` (memory pool, runtime, config) | MECHANICAL |
+| `execution::SessionStateBuilder` | 2 + used `session.rs:2764-2801` | `session.rs:46`, `session.rs:6866` | **The single wiring point for the entire engine** — config, runtime, UDFs, optimizer rules, analyzer rules, physical rules | **LOAD-BEARING** |
+| `execution::SessionStateDefaults` | 1 | `session.rs:46`, used `session.rs:2766-2770` | `default_table_factories`, `default_file_formats`, `default_expr_planners`, `default_window_functions`, `default_table_functions` | **LOAD-BEARING** (see §11) |
+| `execution::config::SessionConfig` | 1 + 1 inline `::new()` | `session.rs:6865`, `session.rs:2700` | `set_str("datafusion.execution.listing_table_ignore_subdirectory","false")` + `with_target_partitions(1)` (`session.rs:2701-2705`) | MECHANICAL |
+| `execution::runtime_env::RuntimeEnvBuilder` | 1 | `session.rs:45`, used `session.rs:2749-2757` | Per-session runtime: metadata cache + memory pool | MECHANICAL |
+| `execution::cache::cache_manager::CacheManagerConfig` | 2 | `session.rs:44`, `lib.rs:52` | Parquet/Vortex **footer metadata cache** | **LOAD-BEARING** |
+| `execution::cache::cache_manager::FileMetadataCache` | 1 | `lib.rs:52`, constructed `lib.rs:188-190` | Process-wide cache handle, survives session recycling | **LOAD-BEARING** |
+| `execution::cache::DefaultFilesMetadataCache` | 1 | `lib.rs:53` | Size + last_modified validated LRU. Doc at `lib.rs:185-190`: "the dominant cost behind scale regressions at 100k rows / 50 files" | **LOAD-BEARING** |
+| `execution::memory_pool::MemoryPool` | 2 inline | `lib.rs:195`, `lib.rs:521` | Bounded process-wide query memory | **LOAD-BEARING** |
+| `execution::memory_pool::FairSpillPool::new` | 1 inline | `lib.rs:522` | Doc at `lib.rs:513-520`: without it "one client can crash a shared node"; spillable operators spill, non-spillable fail cleanly with `ResourcesExhausted` | **LOAD-BEARING** |
+| `execution::FunctionRegistry` | 1 | `prepared.rs:1148`, used `prepared.rs:1149` (`sess.ctx.udf(&fn_name)`) | Name → UDF lookup for prepared-statement param inference | MECHANICAL |
+
+**Three separate LOAD-BEARING items hide in this small module**: the file
+metadata cache, the spilling memory pool, and `SessionStateBuilder` as the
+assembly point. Each has an explicit "without this, X breaks" comment in the
+source. The memory pool in particular is a **correctness-under-load** property,
+not a perf tweak — `lib.rs:513-520` states the alternative is OOM-killing a
+shared node.
+
+**Session config knobs Basin actively manipulates** (must exist in the
+replacement, `executor.rs:10513-10519` and `executor.rs:10983-10996`):
+`execution.target_partitions`, `optimizer.repartition_aggregations`,
+`optimizer.repartition_joins`, `optimizer.repartition_windows`. The comment at
+`executor.rs:10986-10993` records a real bug: `repartition_windows=true`
+(DataFusion 53.1's default) "inserts exchange nodes around WindowAggExec
+breaking LAG/LEAD/RANK queries when target_partitions > 1."
+
+---
+
+## 11. `datafusion-functions*` — 7 explicit refs, an enormous implicit surface
+
+### 11.1 Explicit imports
+
+| Symbol | Sites | Location | Used for | Difficulty |
+|---|---:|---|---|---|
+| `functions::core::nullif as make_nullif_udf` | 1 | `nullif_rewrite.rs:108` | Test scaffolding for the rewrite | TRIVIAL |
+| `functions::string::lower` | 1 inline | `citext_analyzer.rs:232` | The citext fold — **production path** | TRIVIAL (Basin has `lower` already) |
+| `functions_aggregate::first_last::first_value` | 1 | `is_distinct_rewrite.rs:105`, used `:208` | DISTINCT ON lowering | MECHANICAL |
+| `functions_aggregate::array_agg::ArrayAgg` | 1 | `pg_agg_udf.rs:73` | Base for `PgArrayAggUdaf` (`pg_agg_udf.rs:520`) | MECHANICAL |
+| `functions_aggregate::min_max::{min, max}` | 2 inline | `any_all_rewrite.rs:152`, `:153` | ANY/ALL → scalar subquery | MECHANICAL |
+| `functions_window::row_number::RowNumber::new` | 1 inline | `catalog_window_exec.rs:264` | Test scaffolding | TRIVIAL |
+
+### 11.2 The implicit surface — **the single most under-counted item in this document**
+
+`crates/basin-engine/src/session.rs:363-366` documents the mechanism plainly:
+
+> "Strategy: register all stateless UDFs into a throwaway `SessionContext`
+> (**which has DataFusion's own built-in functions pre-seeded**). Then extract
+> the populated `scalar_functions` and `aggregate_functions` maps."
+
+`build_stateless_udf_cache()` (`session.rs:364-418`) calls `SessionContext::new()`
+at `session.rs:365`, registers ~25 Basin UDF families on top
+(`session.rs:366-403`), then harvests `state.scalar_functions()` and
+`state.aggregate_functions()` (`session.rs:415-416`). Those maps are handed
+verbatim to `SessionStateBuilder::with_scalar_functions` /
+`with_aggregate_functions` (`session.rs:2775-2777`).
+
+**Consequence: every function in `datafusion-functions`, `datafusion-functions-aggregate`,
+and `datafusion-functions-nested` is live in Basin's SQL surface today and no
+grep will show it.** Concretely, `abs`, `round`, `ceil`, `floor`, `trunc`,
+`power`, `sqrt`, `ln`, `log`, `exp`, the full trig family, `substr`, `trim`,
+`btrim`, `ltrim`, `rtrim`, `replace`, `split_part`, `concat`, `concat_ws`,
+`starts_with`, `ends_with`, `strpos`, `repeat`, `reverse`, `lpad`, `rpad`,
+`ascii`, `chr`, `md5`, `sha224/256/384/512`, `encode`, `decode`,
+`date_trunc`, `date_part`, `date_bin`, `to_timestamp*`, `to_char`,
+`make_date`, `now`, `current_date`, `current_time`, `coalesce`, `nvl`,
+`nullif`, `greatest`, `least`, `arrow_cast`, `arrow_typeof`, plus
+`sum`/`count`/`avg`/`min`/`max`/`stddev`/`var`/`corr`/`covar`/
+`approx_distinct`/`approx_percentile_cont`/`bool_and`/`bool_or`/
+`bit_and`/`bit_or`/`bit_xor`/`string_agg`/`nth_value`, plus the whole
+`array_*` / `list_*` nested family.
+
+Additionally, `session.rs:2766-2770` explicitly pulls in
+`SessionStateDefaults::default_window_functions()` — `row_number`, `rank`,
+`dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`,
+`first_value`, `last_value`, `nth_value` — and
+`default_table_functions()` (`generate_series`, `range`) and
+`default_expr_planners()`.
+
+`crates/basin-engine/src/window_extras.rs:8` confirms Basin leans on this
+deliberately: LAG/LEAD default values are handled "natively via
+`shift_with_default_value()` in `datafusion-functions-window`."
+
+**Rating: LOAD-BEARING (feature-completeness).** This is not algorithmically
+hard — each function is individually MECHANICAL — but it is **several hundred
+functions of surface area** that Basin's SQL compatibility claims currently
+rest on, entirely invisible to the 1016-line grep. **Any estimate that omits
+this is wrong by a large multiple.** It needs its own enumeration document
+before the migration is scoped.
+
+---
+
+## 12. Ranked risk register
+
+| # | Item | Where | Rating | Note |
+|---|---|---|---|---|
+| 1 | `datafusion-sql`: SQL text → `LogicalPlan` | 76 `.sql()` sites, chiefly `executor.rs:11184` | **LOAD-BEARING** | Zero grep visibility. `pg_plan.rs:94` is the existing beachhead. |
+| 2 | DataFusion's built-in function library | `session.rs:365`, `session.rs:2766-2777` | **LOAD-BEARING** | Several hundred functions, zero grep visibility. |
+| 3 | The 27 default optimizer rules | `lib.rs:75`, `session.rs:412` | **LOAD-BEARING** | Predicate/projection pushdown, subquery decorrelation, CSE, join reordering. |
+| 4 | Physical planner + `physical_plan::collect` | `executor.rs:11335` | **LOAD-BEARING** | Partitioning, spilling, streaming execution. |
+| 5 | Join sizing needs a real Vortex byte-size estimate | `vortex_listing_format.rs:7-25` | **LOAD-BEARING** | Not a Vortex *coupling* risk — see §7, `vortex-datafusion` is deletable. The risk is reproducing the documented 0.54× `inner_join@100k` regression if the owned planner sizes joins without byte stats. |
+| 6 | 2 physical optimizer rules | `sort_streaming_limit.rs:81`, `catalog_window_exec.rs:79` | **LOAD-BEARING** | Structural `downcast_ref` matches on DF node types; two documented benchmark wins. |
+| 7 | 4 logical optimizer rules | `is_distinct_rewrite.rs:125`, `nullif_rewrite.rs:40`, `any_all_rewrite.rs:196`, `union_scan_collapse.rs:302` | **LOAD-BEARING** | #3 (ANY/ALL) is a nested-loop → hash-join complexity change. |
+| 8 | `Statistics` / `Precision` feeding `join_selection` | `vortex_listing_format.rs:7-25`, `:1091-1092` | **LOAD-BEARING** | Documented 0.54× regression on `inner_join@100k` when absent. |
+| 9 | `TableProviderFilterPushDown` three-valued contract | `session.rs:4103`, `tombstone_cold_scan.rs:213`, `hot_tombstone.rs:1266` | **LOAD-BEARING** | `Exact` deletes the FilterExec; wrong answer = correctness bug or 10× regression. |
+| 10 | `FairSpillPool` + `FileMetadataCache` | `lib.rs:188-190`, `lib.rs:513-522` | **LOAD-BEARING** | Memory pool is correctness-under-load: OOM-kills a shared node without it. |
+| 11 | `Signature`/`TypeSignature` overload resolution | `prepared.rs:1181-1231`, 336 `Exact` + 155 `one_of` | **HARD** | Must stay introspectable — the PG Describe path reads it back out. |
+| 12 | `ListingTable` + `ListingOptions::with_file_sort_order` | `session.rs:3227-3244`, `:3796-3813`, `:3229`, `:3799` | **HARD** | Primary registration path; the sort-order declaration is what makes #6 fire. |
+| 13 | 8 custom `ExecutionPlan` + 42 `TableProvider` impls | §5, §6.1 | **HARD** | Mechanical individually; the `filter_pushdown` protocol in `hot_tombstone.rs:451-662` is not. |
+| 14 | `GroupsAccumulator` vectorised path | `pg_agg_udf.rs:1030` | **LOAD-BEARING** | One impl, but dropping to scalar `Accumulator` is a visible grouped-agg regression. |
+| 15 | 247 `ScalarUDFImpl` impls | §3.1 | **MECHANICAL** | Biggest line count, smallest risk: 4-method trait, zero optional hooks overridden. |
+| 16 | `ScalarValue` (~28 variants + 6 helpers) | §2.2 | **MECHANICAL** | `basin_storage::ScalarValue` could be widened instead. |
+| 17 | Error-string → SQLSTATE parsing | `executor.rs:10530-10614` | **MECHANICAL** | Delete, don't port. ORMs branch on 42P01. |
+| 18 | `query_shape.rs` stable discriminant tables | `query_shape.rs:334-360`, `:366-403` | **MECHANICAL** | 25 plan tags + 34 expr tags are persisted and cross-process-stable. |
+| 19 | EXPLAIN plan text | `explain.rs:1-15`, `:76-96` | **MECHANICAL** | User-visible output churn. |
+| 20 | `convert.rs` | 1800+ LOC, `convert.rs:1-14`, `:707-760` | **DELETE** | Stale "cross-arrow-version glue"; only survives as `Utf8View`/`LargeUtf8` normalisation, which a Basin-owned planner makes unnecessary. |
+| — | `datafusion::arrow::*` | 279 refs, §1 | **TRIVIAL** | Path rename. Not work. |
+
+---
+
+## 13. Cargo dependency actions
+
+`Cargo.toml:128` — `datafusion = "53"` (workspace). Remove.
+
+`crates/basin-engine/Cargo.toml`:
+- `:42` `datafusion.workspace = true` — remove.
+- `:46` `vortex-datafusion = "0.71"` — remove. Only 2 call sites
+  (`session.rs:3110-3112`, `vortex_listing_format.rs:1171-1172`), both on the
+  DataFusion `ListingTable` path that is itself being deleted. `basin-storage`
+  reads Vortex directly and never touches this crate (§7).
+- `:48` `vortex = "0.71"` — keep (direct Vortex core).
+- `:54` `datafusion-datasource = "53"` — remove (used only by `vortex_listing_format.rs`).
+- `:55` `datafusion-physical-expr = "53"` — remove.
+- `:56` `datafusion-physical-plan = "53"` — remove.
+- `:57` `datafusion-session = "53"` — **already dead.** Grep for
+  `datafusion_session` across `crates/` and `services/` returns zero hits. It
+  can be dropped today, independently of this migration.
+
+No feature flags are set on any `datafusion*` dependency — all take default
+features, which is why the whole `datafusion-functions*` family is present.
+
+31 `datafusion-*` crates are currently in `Cargo.lock`, all at 53.1.0
+(`Cargo.lock`, `datafusion` through `datafusion-sql`). The nine that are direct
+or near-direct dependencies are covered above; the rest (`-common-runtime`,
+`-catalog-listing`, `-datasource-{arrow,csv,json,parquet}`, `-doc`,
+`-expr-common`, `-functions-aggregate-common`, `-functions-window-common`,
+`-macros`, `-physical-expr-adapter`, `-physical-expr-common`, `-pruning`)
+arrive transitively and leave with their parents.
+
+Arrow stays: `arrow 58.4.0` (`Cargo.lock:281-283`), `arrow-array`, `arrow-ipc`,
+`arrow-schema`, `arrow-select`, `parquet` (`Cargo.toml:96-101`).
+
+---
+
+## 14. Files by DataFusion reference count
+
+The 69 files, for migration sequencing. Everything is in `crates/basin-engine/`
+unless noted.
+
+`src/udf.rs` 57 · `src/pg_agg_udf.rs` 55 · `src/geo_glue.rs` 52 ·
+`src/session.rs` 46 · `src/vortex_listing_format.rs` 40 · `src/convert.rs` 39 ·
+`src/wasm_udf.rs` 34 · `src/executor.rs` 33 · `src/jsonb_path_udf.rs` 28 ·
+`src/catalog_window_exec.rs` 27 · `src/range_udf.rs` 24 ·
+`src/pg_scalar_aliases.rs` 24 · `src/sort_streaming_limit.rs` 23 ·
+`src/jsonb_udf.rs` 22 · `src/hot_tombstone.rs` 22 · `src/any_all_rewrite.rs` 19 ·
+`src/string_more_udf.rs` 17 · `src/datetime_more_udf.rs` 17 ·
+`src/tombstone_cold_scan.rs` 16 · `src/prepared.rs` 14 ·
+`src/json_build_udf.rs` 14 · `src/approx_percentile.rs` 14 ·
+`src/realtime_catalog.rs` 13 · `src/pg_plan.rs` 13 · `src/interval_tz_udf.rs` 13 ·
+`src/info_schema_provider.rs` 13 · `src/citext_analyzer.rs` 13 ·
+`src/approx_count_distinct.rs` 13 · `src/rtree_rowgroup_scan.rs` 12 ·
+`src/regex_udf.rs` 12 · `src/project_usage_view.rs` 12 ·
+`src/jsonb_posting_scan.rs` 12 · `src/jsonb_modify_udf.rs` 12 ·
+`src/gin_rowgroup_scan.rs` 12 · `src/fts_udf.rs` 12 · `src/rls.rs` 11 ·
+`src/query_stats_export.rs` 11 · `src/pg_catalog_udf.rs` 11 ·
+`src/hypertable_provider.rs` 11 · `src/advisory_lock.rs` 11 ·
+`src/nullif_rewrite.rs` 10 · `src/lib.rs` 10 · `src/is_distinct_rewrite.rs` 10 ·
+`src/inet_udf.rs` 10 · `src/cron_glue.rs` 10 · `src/trgm_glue.rs` 9 ·
+`src/hypertable.rs` 9 · `src/cancel_udf.rs` 9 · `src/string_dt_udf.rs` 8 ·
+`src/net_glue.rs` 8 · `src/union_scan_collapse.rs` 7 ·
+`src/replication/slot_udf.rs` 7 · `src/query_shape.rs` 7 ·
+`src/notify_registry.rs` 7 · `src/lifecycle.rs` 7 · `src/datetime_extras.rs` 7 ·
+`tests/distinct_on_lowering.rs` 5 · `src/operators/citext_cmp.rs` 4 ·
+`src/seq_udf.rs` 3 · `src/generated_cols.rs` 3 · `src/type_ddl.rs` 2 ·
+`src/dml_mutate.rs` 2 · `src/constraints.rs` 2 · `src/window_extras.rs` 1 ·
+`src/schema_ddl.rs` 1 · `src/pg_operators.rs` 1 · `src/fast_select.rs` 1 ·
+`crates/basin-storage/src/predicate.rs` 1 (comment) ·
+`crates/basin-bench-harness/src/profiles/vortex_vs_parquet.rs` 1 (comment).
+
+Engine crate size for context: **194,345 LOC** across `crates/basin-engine/src`.
+The two largest DataFusion-free files in it are already bypass paths —
+`src/fast_select.rs` (6,523 LOC) and `src/index_probe.rs` (6,411 LOC).
