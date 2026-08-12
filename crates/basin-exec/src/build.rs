@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use basin_plan::{Expr, LogicalPlan, SortKey as PlanSortKey, TableId};
 
 use crate::aggregate::{AggFunc, AggregateSpec, HashAggregate};
+use crate::cte::ProjectSet;
 use crate::join::HashJoin;
 use crate::operator::{ExecError, Operator};
 use crate::project::{Filter, Project};
@@ -367,6 +368,26 @@ pub fn build_with_budget(
                 specs,
                 budget,
             )?))
+        }
+
+        // Set-returning functions in the target list — the shape
+        // `jsonb_udf.rs:16` records as impossible inside DataFusion, which is
+        // why `generate_series` and `unnest` in a SELECT list do not work on
+        // the current engine at all.
+        //
+        // Note the LCM trap: multiple SRFs in one list do NOT produce the least
+        // common multiple of their lengths. Since Postgres 10 they run in
+        // lockstep to the LONGEST, padding the shorter with NULL. The operator
+        // implements the modern rule; this comment exists because the older one
+        // is what most references and most recollections still describe.
+        LogicalPlan::ProjectSet { input, srfs } => {
+            let child = build_with_budget(input, tables, budget)?;
+            let named: Vec<(Expr, String)> = srfs
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (e.clone(), format!("srf{i}")))
+                .collect();
+            Ok(Box::new(ProjectSet::new(child, named)?))
         }
 
         other => Err(BuildError::Unsupported(plan_kind(other).to_string())),
@@ -855,5 +876,35 @@ mod tests {
             Ok(_) => panic!("WITH TIES must be refused, not silently degraded"),
         };
         assert!(matches!(err, BuildError::Unsupported(ref s) if s.contains("WITH TIES")));
+    }
+    /// A set-returning function reaches the operator through the builder.
+    /// `generate_series` in a target list is one of the two shapes that
+    /// motivated replacing DataFusion at all, so this is the first time it is
+    /// reachable from a plan rather than only from a hand-built operator.
+    #[test]
+    fn a_set_returning_function_builds_and_expands() {
+        let plan = LogicalPlan::ProjectSet {
+            input: Box::new(LogicalPlan::Empty {
+                produce_one_row: true,
+                schema: vec![],
+            }),
+            // generate_series(1, 3) — OID 1067 is the two-argument int form,
+            // from pg_proc on a live server.
+            srfs: vec![Expr::SetReturning {
+                func: basin_plan::FuncId(basin_pgtype::Oid(1067)),
+                args: vec![
+                    Expr::Literal(Datum::Int32(1), PgType::INT4),
+                    Expr::Literal(Datum::Int32(3), PgType::INT4),
+                ],
+            }],
+        };
+        let rows: usize = drain(build(&plan, &resolver()).unwrap())
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(
+            rows, 3,
+            "generate_series(1,3) expands one input row to three"
+        );
     }
 }
