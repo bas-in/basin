@@ -216,7 +216,18 @@ async fn error_update_unknown_column_is_error() {
 // ---------------------------------------------------------------------------
 
 /// Integer division by zero in a SELECT must produce an error (not a panic or
-/// silently return NULL). DataFusion surfaces this as an execution error.
+/// silently return NULL).
+///
+/// Postgres raises SQLSTATE 22012 `division_by_zero` unconditionally — it never
+/// returns NULL, never returns Infinity, and never returns a row. Verified on
+/// PG 18.2: `SELECT 1/0` → `ERROR: division by zero`.
+///
+/// This test previously accepted *either* an error or a row containing NULL,
+/// with the note "DataFusion may return a batch with a NULL … Accept either
+/// outcome but document it." That made the test unfalsifiable on the exact axis
+/// it was named for: its doc comment said "must produce an error" while its
+/// body let the NULL-propagation path pass. A test that permits the wrong
+/// answer cannot defend the right one, so the NULL arm is now a failure.
 #[tokio::test]
 async fn error_division_by_zero_in_select() {
     basin_common::telemetry::try_init_for_tests();
@@ -241,10 +252,15 @@ async fn error_division_by_zero_in_select() {
             println!("[error_paths] division by zero error: {msg}");
         }
         Ok(ExecResult::Rows { .. }) => {
-            // DataFusion may return a batch with a NULL for integer div-by-zero
-            // (some builds propagate NULL instead of erroring). Accept either
-            // outcome but document it.
-            println!("[error_paths] division by zero returned rows (NULL propagation path)");
+            // NOT acceptable. Postgres raises 22012 here; returning a row (with
+            // NULL or anything else) is a fidelity gap, not an alternative
+            // reading of the spec. See docs/migration/df-removal/
+            // 12-pg-type-fidelity.md §8.
+            panic!(
+                "division by zero returned rows (NULL-propagation path). \
+                 PG raises SQLSTATE 22012 division_by_zero unconditionally; \
+                 a row is never a correct answer here."
+            );
         }
         Ok(ExecResult::Empty { tag }) => {
             panic!("division by zero yielded Empty({tag}) — unexpected");

@@ -2272,8 +2272,16 @@ async fn diff_txn_savepoint() {
     drop_table(&runner, &t).await;
 }
 
-/// Test 58: CAST matrix — int4→text, text→int4, numeric→int4 truncation.
+/// Test 58: CAST matrix — int4→text, text→int4, numeric→int4 rounding.
 /// Should pass (basic cast behavior).
+///
+/// NOTE: `numeric`→int **rounds**, it does not truncate. This test's comments
+/// previously asserted "3.7 truncates to 3 in PG", which is wrong in both
+/// halves: PG returns `4`, and no integer cast in PG truncates. See
+/// `docs/migration/df-removal/12-pg-type-fidelity.md` §8 for the measured
+/// rules. Because the expectations here come from the live PG oracle rather
+/// than hand-coded literals, the wrong comment did not fail the test — it just
+/// misdocumented the rule for whoever implements the cast path next.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diff_cast_matrix_basic() {
     let server = start_basin_server().await;
@@ -2299,9 +2307,33 @@ async fn diff_cast_matrix_basic() {
         .await
         .unwrap();
 
-    // numeric → int4 (truncation) — 3.7 truncates to 3 in PG.
+    // numeric → int4 ROUNDS, half away from zero. Verified on PG 18.2:
+    //   3.7 → 4, 0.5 → 1, 1.5 → 2, 2.5 → 3, -0.5 → -1, -2.5 → -3.
+    // Contrast float8 → int, which rounds half to EVEN (0.5 → 0, 2.5 → 2)
+    // because it goes through the C library's rint(). The two source types
+    // agree on every non-tie input, which is what makes them easy to conflate.
     runner
         .run_assert_match("SELECT 3.7::numeric::int4")
+        .await
+        .unwrap();
+
+    // The exact-tie cases are the ones that actually pin the rule; without
+    // them a truncating implementation passes the 3.7 case only by accident.
+    runner
+        .run_assert_match(
+            "SELECT 0.5::numeric::int4, 1.5::numeric::int4, 2.5::numeric::int4, \
+             (-0.5)::numeric::int4, (-2.5)::numeric::int4",
+        )
+        .await
+        .unwrap();
+
+    // And the float8 counterpart, to keep the half-to-even/half-away-from-zero
+    // distinction visible side by side in one test.
+    runner
+        .run_assert_match(
+            "SELECT 0.5::float8::int4, 1.5::float8::int4, 2.5::float8::int4, \
+             (-0.5)::float8::int4, (-2.5)::float8::int4",
+        )
         .await
         .unwrap();
 }
@@ -2320,11 +2352,17 @@ async fn diff_cast_int8_to_int4_overflow() {
     };
 
     // 2^31 = 2147483648 exceeds INT4 max (2147483647).
-    // PG: raises 22003 (numeric_value_out_of_range).
+    // PG: raises 22003. Measured on PG 18.2 with VERBOSITY verbose:
+    //     ERROR:  22003: integer out of range
     // Basin: may wrap silently — KNOWN POTENTIAL DIVERGENCE, no dedicated task yet.
     // If this fails, open a tracking task and cite it here.
+    //
+    // Asserted with run_assert_both_error rather than run_assert_match so the
+    // *error* is the pinned behaviour. run_assert_match would compare whatever
+    // the two sides produced; this states outright that overflow must raise,
+    // and fails with "Basin succeeded but expected an error" if Basin wraps.
     runner
-        .run_assert_match("SELECT 2147483648::int8::int4")
+        .run_assert_both_error("SELECT 2147483648::int8::int4", Some("22003"))
         .await
         .unwrap();
 }

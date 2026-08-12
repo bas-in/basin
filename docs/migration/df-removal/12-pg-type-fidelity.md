@@ -38,7 +38,11 @@ postgres=# SELECT 3.9::int, (-2.7)::int, CAST(3.9 AS bigint);
     4 |   -3 |    4
 ```
 
-Two test sites assert the opposite:
+Two test sites asserted the opposite. **Both are now fixed** — corrected to
+Postgres semantics and marked `#[ignore]`, since Basin does truncate; see
+[§8](#8-tests-that-pinned-non-postgres-behaviour) for the full record. The
+original findings are kept below because the *engine* behaviour they describe is
+still current:
 
 - `tests/integration/tests/pg_type_casts.rs:150-152`
   `assert_eq!(v, 3, "CAST(3.9 AS BIGINT) truncates to 3");`
@@ -287,7 +291,144 @@ functions for that, and a cast is not a call to any of them.
 
 ### 8.2 Sites found
 
-_(table filled in as the sweep proceeds; see §8.3 for the running log)_
+Four sites. Three asserted a rule Postgres does not have; the fourth permitted
+the wrong answer alongside the right one, which is the same defect wearing a
+disguise — a test that accepts either outcome cannot defend the correct one.
+
+| # | Site | Asserted | Postgres actually | State |
+|---|------|----------|-------------------|-------|
+| 1 | `tests/integration/tests/pg_type_casts.rs` — `cast_float_to_integer_truncates` (was line 340) | `3.9 → 3`, `-2.7 → -2`, comment "PG truncates toward zero" | `3.9 → 4`, `-2.7 → -3`; rounds half to **even** | **fixed-and-ignored** |
+| 2 | `tests/integration/tests/pg_type_casts.rs` — `cast_sql_standard_explicit` (was line 150-152) | `CAST(3.9 AS BIGINT) → 3`, comment "truncates to 3" | `4` — bare `3.9` is **`numeric`**, rounds half **away from zero** | **fixed-and-ignored** (split into a new test) |
+| 3 | `tests/integration/tests/differential_pg.rs` — `diff_cast_matrix_basic` (comment at line 2302, title at 2275) | comment "numeric → int4 (truncation) — 3.7 truncates to 3 in PG" | `3.7::numeric::int4 → 4`; rounds half **away from zero** | **fixed** (passes) |
+| 4 | `tests/integration/tests/coverage_errorpaths.rs` — `error_division_by_zero_in_select` (line 221) | accepted *either* an error *or* a row with NULL ("Accept either outcome") | raises SQLSTATE 22012 `division_by_zero`, unconditionally | **fixed** (passes) |
+
+Sites 1 and 2 are in the same file and were the same misconception applied to
+two different source types — which is why fixing them needed the §8.1 rule pair
+rather than one blanket "casts round" edit. Site 1 is a `float8` column
+(half-to-even); site 2 is a bare decimal literal, and `pg_typeof(3.9)` is
+`numeric`, so it takes the half-away-from-zero path. Writing `CAST(3.9 AS
+BIGINT)` and `CAST(3.9::float8 AS BIGINT)` selects different tie rules from the
+same keyword.
+
+#### Site 1 — float→int cast, `pg_type_casts.rs`
+
+Renamed to `cast_float_to_integer_rounds`, since the old name encoded the wrong
+rule and would have kept re-teaching it. The test now asserts PG's values and
+was extended with the exact-tie inputs `0.5, 1.5, 2.5, -0.5`, because the
+original two-value case (`3.9`, `-2.7`) cannot distinguish half-to-even from
+half-away-from-zero at all — only ties can.
+
+Run against the current engine:
+
+```
+left:  [3, -2, 0, 1, 2, 0]     <- Basin (truncation)
+right: [4, -3, 0, 2, 2, 0]     <- PostgreSQL 18.2
+```
+
+**Basin genuinely truncates.** This is the intended outcome of the exercise: a
+hidden wrong behaviour is now a visible, named gap. The test is marked
+`#[ignore]` with a reason pointing here; the assertion still states Postgres
+semantics. It was *not* weakened back to truncation, and the engine was *not*
+changed to chase it. Deleting the `#[ignore]` is the acceptance criterion for
+implementing round-half-to-even in the cast path.
+
+Note that `0.5 → 0` and `-0.5 → 0` agree under both rules, so a test built only
+from those two ties would have passed while the engine was still wrong. The
+`1.5`/`2.5` pair is what carries the proof.
+
+#### Site 2 — decimal literal→int cast, `pg_type_casts.rs`
+
+The wrong assertion sat inside `cast_sql_standard_explicit`, a test whose real
+job is proving that `CAST(x AS type)` *syntax* reaches the planner. Rather than
+`#[ignore]` the whole test and lose that syntax coverage, the rounding
+assertion was split out into a new `cast_numeric_literal_to_integer_rounds`,
+which carries the ties (`0.5 → 1`, `2.5 → 3`, `-2.5 → -3`) and the `#[ignore]`.
+`cast_sql_standard_explicit` keeps its identity-cast check and stays green.
+
+Bundling a fidelity gap into an unrelated test is how gaps become invisible: the
+whole test must then be either ignored (losing the unrelated coverage) or
+weakened (losing the gap). Splitting keeps both honest.
+
+#### Site 3 — numeric→int cast, `differential_pg.rs`
+
+This is the site §8.1's rule pair was needed to catch, and it is instructive
+because **the test passed and still passes**. It is oracle-driven: expectations
+come from a live Postgres over `PG_DIFF_TEST_DSN` via `run_assert_match`, not
+from hand-coded literals. So the wrong claim lived entirely in the comment and
+the test title, where it could never fail — and from there it propagated into
+`07-conformance-tests.md` §G5, which cited this line as authority that
+"only `numeric`→int truncates". A wrong comment on a passing oracle test is a
+particularly durable kind of wrong: nothing mechanical will ever contradict it.
+
+Fixed by correcting the comment and title to the measured rule, and by adding
+the tie cases for `numeric` *and* `float8` side by side in one test, so the
+half-to-even/half-away-from-zero distinction is visible at the point of use
+rather than inferred. The stale citation in `07-conformance-tests.md` §G5 was
+corrected in the same pass.
+
+While in the file, the adjacent `diff_cast_int8_to_int4_overflow` was switched
+from `run_assert_match` to `run_assert_both_error(..., Some("22003"))`. It was
+not asserting anything false, but "compare whatever both sides produced" is
+weaker than the verified rule: PG raises `22003` here
+(`ERROR: 22003: integer out of range`, measured with `VERBOSITY verbose`). The
+stronger form fails loudly with "Basin succeeded but expected an error" if Basin
+wraps silently, which is the self-flagged suspicion in that test's own doc
+comment.
+
+Caveat: every test in this file is DSN-gated — `make_runner` returns `None` and
+the test exits green when `PG_DIFF_TEST_DSN` is unset. These fixes therefore
+improve what the harness *says* and what it checks *when run*, but they are not
+load-bearing in a default `cargo test`.
+
+#### Site 3 — division by zero, `coverage_errorpaths.rs`
+
+The doc comment said the query "must produce an error (not a panic or silently
+return NULL)" while the body's `Ok(ExecResult::Rows { .. })` arm printed a note
+and passed. The test was named for an axis it did not test.
+
+Tightened so the row-returning arm panics. **It passes** — Basin does raise on
+integer division by zero, so the permissive arm was protecting nothing and cost
+a real invariant. No `#[ignore]` needed.
+
+#### Related hazard (not a wrong assertion)
+
+`tests/integration/tests/plan_floor_caches.rs:86` — the `scalar_i64` helper
+coerces a NULL first cell to `0` ("treating a NULL (empty table SUM) as 0").
+This does not *claim* Postgres semantics; the surrounding tests are about plan
+floor caching and the aggregate value is incidental. But it makes a
+`SUM`-over-empty of `0` (wrong) indistinguishable from `NULL` (right), so it
+must not be reused as a semantics oracle. Left as-is deliberately — changing it
+would alter tests unrelated to type fidelity. Recorded here so the next reader
+does not mistake it for a pinned rule.
+
+#### Categories swept clean
+
+Checked and found either correct or simply untested (a gap, not a landmine):
+
+- **Default NULL ordering** — every site states the right rule (ASC → NULLS
+  LAST, DESC → NULLS FIRST): `array_agg_perf_shape.rs:214`,
+  `topk_late_materialize.rs:321`, `pg_agg_udf.rs:1918-1928`,
+  `differential_pg.rs:2172`. `array_agg_perf_shape.rs`'s expectation
+  `{c, NULL, a}` was re-verified against live PG and matches.
+- **Empty-input aggregates** —
+  `where_null_3vl_fold.rs:164 aggregate_under_null_eq_returns_empty_relation_answer`
+  correctly asserts `COUNT(*) = 0` with `MIN`/`MAX`/`SUM` all NULL.
+- **Integer overflow** — no test asserts a wrapped or saturated value. Genuinely
+  untested rather than mis-asserted (survey §G3).
+- **NaN / -0.0 ordering** — no SQL-level `NaN` assertion exists to be wrong; the
+  `gapfill.rs` / `fast_select.rs` hits cited in survey §G4 contain no `NaN`
+  tokens at all. Untested, not mis-asserted.
+- **String truncation** — `crates/basin-engine/src/types.rs:248-288` documents
+  and implements the correct split: 22001 on over-length, with over-length
+  *trailing spaces* truncated rather than raised. Matches PG.
+- **`trunc`/`date_trunc`/`floor`** — the many "truncat" grep hits are the
+  `TRUNCATE` statement or `date_trunc`, where truncation is the correct
+  behaviour. Dismissed on inspection.
+- `viability_pg_compat_funcs.rs:724` asserts
+  `extract(second FROM …'42.5') + 0.5` renders as `43` where PG renders
+  `43.000000` (numeric). That is a type/rendering divergence, and the file's
+  stated policy is to document such divergences rather than coerce them. Noted,
+  not changed — it is a wire-format question for §5, not a rounding rule.
 
 ### 8.3 Sweep log
 

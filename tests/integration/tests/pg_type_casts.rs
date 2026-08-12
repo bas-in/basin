@@ -147,9 +147,59 @@ async fn cast_sql_standard_explicit() {
     let v = select_i64(&s, "SELECT CAST(42 AS BIGINT)").await;
     assert_eq!(v, 42, "CAST(42 AS BIGINT)");
 
-    // float literal → integer (truncating)
+    // The decimal-literal → BIGINT case used to live here, asserting
+    // `CAST(3.9 AS BIGINT) == 3` under the comment "truncates to 3". Postgres
+    // returns 4. It now has its own test — see
+    // `cast_numeric_literal_to_integer_rounds` below — so that this test, which
+    // is about *syntax* reaching the planner, stays green while the rounding
+    // fidelity gap is tracked separately rather than being silently bundled in.
+}
+
+/// `CAST(3.9 AS BIGINT)` — a bare decimal literal is **`numeric`** in Postgres,
+/// not `float8` (`SELECT pg_typeof(3.9)` → `numeric`), so this exercises the
+/// numeric→int cast, which rounds **half away from zero**.
+///
+/// Measured on PG 18.2:
+///
+/// ```text
+/// SELECT CAST(3.9 AS BIGINT);   -- 4
+/// SELECT CAST(0.5 AS BIGINT);   -- 1
+/// SELECT CAST(2.5 AS BIGINT);   -- 3
+/// SELECT CAST(-2.5 AS BIGINT);  -- -3
+/// ```
+///
+/// Contrast `cast_float_to_integer_rounds`, where the source is a genuine
+/// `float8` column and ties go to **even** (`0.5 → 0`, `2.5 → 2`). Same SQL
+/// keyword, two different tie rules, selected by the source type. Neither
+/// truncates. See `docs/migration/df-removal/12-pg-type-fidelity.md` §8.
+///
+/// # Why this is `#[ignore]`d
+///
+/// Basin truncates here too, returning 3 where PG returns 4. Known fidelity
+/// gap, tracked in the doc above. The assertion states Postgres semantics and
+/// must not be weakened back to truncation; remove the `#[ignore]` once the
+/// numeric cast path rounds half away from zero.
+#[tokio::test]
+#[ignore = "Basin truncates numeric->int; PG rounds half away from zero. Known \
+            fidelity gap — see docs/migration/df-removal/12-pg-type-fidelity.md \
+            §8. Do not fix by weakening the assertion."]
+async fn cast_numeric_literal_to_integer_rounds() {
+    let dir = TempDir::new().unwrap();
+    let engine = engine_in(&dir);
+    let s = engine.open_session(ProjectId::new()).await.unwrap();
+
     let v = select_i64(&s, "SELECT CAST(3.9 AS BIGINT)").await;
-    assert_eq!(v, 3, "CAST(3.9 AS BIGINT) truncates to 3");
+    assert_eq!(v, 4, "CAST(3.9 AS BIGINT): PG rounds to 4, does not truncate");
+
+    // Ties: numeric rounds AWAY FROM ZERO (unlike float8, which goes to even).
+    let v = select_i64(&s, "SELECT CAST(0.5 AS BIGINT)").await;
+    assert_eq!(v, 1, "CAST(0.5 AS BIGINT): numeric tie away from zero → 1");
+
+    let v = select_i64(&s, "SELECT CAST(2.5 AS BIGINT)").await;
+    assert_eq!(v, 3, "CAST(2.5 AS BIGINT): numeric tie away from zero → 3");
+
+    let v = select_i64(&s, "SELECT CAST(-2.5 AS BIGINT)").await;
+    assert_eq!(v, -3, "CAST(-2.5 AS BIGINT): numeric tie away from zero → -3");
 }
 
 // ─── x::type — PG shorthand cast ────────────────────────────────────────────
@@ -332,12 +382,51 @@ async fn cast_string_to_date() {
     );
 }
 
-// ─── float → integer truncating cast ────────────────────────────────────────
+// ─── float → integer rounding cast ──────────────────────────────────────────
 
-/// `CAST(score AS BIGINT)` from a FLOAT8 column — truncates toward zero,
-/// matching PG semantics.
+/// `CAST(score AS BIGINT)` from a FLOAT8 column — Postgres **rounds**, it does
+/// not truncate. `3.9 → 4`, `-2.7 → -3`.
+///
+/// The tie rule differs by source type, and the difference is load-bearing:
+///
+/// - `float4`/`float8` → integer rounds **half to even** (banker's rounding),
+///   because the cast goes through the C library's `rint()` under the default
+///   IEEE-754 rounding mode: `0.5 → 0`, `1.5 → 2`, `2.5 → 2`, `-0.5 → 0`.
+/// - `numeric` → integer rounds **half away from zero**, since `numeric` is a
+///   decimal type that never touches `rint()`: `0.5 → 1`, `1.5 → 2`,
+///   `2.5 → 3`, `-0.5 → -1`.
+///
+/// They agree on every input whose fraction is not exactly `.5`, which is what
+/// makes the distinction easy to conflate. Truncation toward zero is `trunc()`,
+/// a separate function — a cast is not a call to it.
+///
+/// Verified against PostgreSQL 18.2; see the docs' §8.1 Numeric Types: "When
+/// rounding values, the `numeric` type rounds ties away from zero, while (on
+/// most machines) the `real` and `double precision` types round ties to the
+/// nearest even number."
+/// <https://www.postgresql.org/docs/18/datatype-numeric.html>
+///
+/// This test previously asserted `3.9 → 3` and `-2.7 → -2` under the comment
+/// "PG truncates toward zero", which pinned behaviour Postgres does not have.
+///
+/// # Why this is `#[ignore]`d
+///
+/// Basin currently **truncates** float→int casts, yielding
+/// `[3, -2, 0, 1, 2, 0]` where Postgres gives `[4, -3, 0, 2, 2, 0]`. That is a
+/// known fidelity gap, tracked in
+/// `docs/migration/df-removal/12-pg-type-fidelity.md` §8.
+///
+/// The assertion is deliberately left stating **Postgres** semantics rather
+/// than Basin's. It is ignored, not weakened: the engine is not to be changed
+/// to chase this test, and the expectation is not to be relaxed back to
+/// truncation. Remove the `#[ignore]` when the cast path implements
+/// round-half-to-even — the test then passes as written and becomes the
+/// regression guard.
 #[tokio::test]
-async fn cast_float_to_integer_truncates() {
+#[ignore = "Basin truncates float->int; PG rounds half-to-even. Known fidelity \
+            gap — see docs/migration/df-removal/12-pg-type-fidelity.md §8. \
+            Do not fix by weakening the assertion."]
+async fn cast_float_to_integer_rounds() {
     let dir = TempDir::new().unwrap();
     let engine = engine_in(&dir);
     let s = engine.open_session(ProjectId::new()).await.unwrap();
@@ -345,9 +434,14 @@ async fn cast_float_to_integer_truncates() {
     s.execute("CREATE TABLE scores (id BIGINT NOT NULL, score DOUBLE PRECISION)")
         .await
         .unwrap();
-    s.execute("INSERT INTO scores VALUES (1, 3.9), (2, -2.7)")
-        .await
-        .unwrap();
+    // Rows 1-2 are the plain rounding cases; rows 3-6 are the exact ties that
+    // distinguish half-to-even (float) from half-away-from-zero (numeric).
+    s.execute(
+        "INSERT INTO scores VALUES \
+         (1, 3.9), (2, -2.7), (3, 0.5), (4, 1.5), (5, 2.5), (6, -0.5)",
+    )
+    .await
+    .unwrap();
 
     let ExecResult::Rows { batches, .. } = s
         .execute("SELECT CAST(score AS BIGINT) FROM scores ORDER BY id")
@@ -367,8 +461,15 @@ async fn cast_float_to_integer_truncates() {
             vals.push(arr.value(i));
         }
     }
-    // PG truncates toward zero: 3.9 → 3, -2.7 → -2.
-    assert_eq!(vals, vec![3, -2], "float-to-int truncates toward zero");
+    // PG rounds, half to even for float sources:
+    //   3.9 → 4, -2.7 → -3, 0.5 → 0, 1.5 → 2, 2.5 → 2, -0.5 → 0.
+    // Truncation would give [3, -2, 0, 1, 2, 0] — note it coincides on 0.5 and
+    // -0.5, so the 1.5/2.5 pair is what actually pins the tie rule.
+    assert_eq!(
+        vals,
+        vec![4, -3, 0, 2, 2, 0],
+        "float-to-int rounds half to even (PG 18.2), it does not truncate"
+    );
 }
 
 // ─── to_number(text, format) ─────────────────────────────────────────────────

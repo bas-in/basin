@@ -373,8 +373,18 @@ SELECT 1.0::float8 / 0.0;       -- PG: ERROR 22012 — not Infinity
 landmine, not a gap. `cast_float_to_integer_truncates` asserts `3.9 → 3` and
 `-2.7 → -2` with the comment "PG truncates toward zero". **Postgres rounds**
 float8→int (half to even): `SELECT 3.9::float8::bigint` returns **4**,
-`(-2.7)::float8::bigint` returns **-3**. Only `numeric`→int truncates
-(correctly pinned at `differential_pg.rs:2301`).
+`(-2.7)::float8::bigint` returns **-3**.
+
+**Correction (verified on PG 18.2):** an earlier revision of this section ended
+"Only `numeric`→int truncates (correctly pinned at `differential_pg.rs:2301`)."
+That is also wrong, and `differential_pg.rs:2301` was *not* pinning it
+correctly — its comment claimed "3.7 truncates to 3 in PG" when
+`SELECT 3.7::numeric::int4` returns **4**. **No integer cast in Postgres
+truncates.** Both source types round; they differ only in the tie rule:
+`float` rounds half to **even** (`0.5 → 0`, `2.5 → 2`), `numeric` rounds half
+**away from zero** (`0.5 → 1`, `2.5 → 3`). Because the two agree on every
+non-tie input, the error survived review in both places. Both sites are now
+fixed; see [12 — PG type fidelity §8](./12-pg-type-fidelity.md).
 
 If the new engine implements PG-correct rounding, this test **fails on a
 correct implementation**. Verify against a live PG and fix the test *before*
