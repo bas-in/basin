@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/basin-common",
     "crates/basin-pgtype",
+    "crates/basin-plan",
     "crates/basin-storage",
     "crates/basin-catalog",
     "crates/basin-engine",
@@ -56,6 +57,10 @@ basin-common = { path = "crates/basin-common" }
 # and every UDF signature agree on. Leaf crate — arrow-schema only, no
 # DataFusion, no storage. First increment of ADR 0030.
 basin-pgtype = { path = "crates/basin-pgtype" }
+# The owned logical IR: Expr + LogicalPlan, lowered from pg_query and handed
+# to the optimizer. No DataFusion, no storage, no tokio — a plan must be
+# describable without reference to how it runs. ADR 0030.
+basin-plan = { path = "crates/basin-plan" }
 basin-fn = { path = "crates/basin-fn" }
 basin-storage = { path = "crates/basin-storage" }
 basin-catalog = { path = "crates/basin-catalog" }

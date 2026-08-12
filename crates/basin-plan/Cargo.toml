@@ -1,0 +1,16 @@
+[package]
+name = "basin-plan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Basin's own logical IR. Deliberately thin on dependencies: the IR must be
+# describable without reference to how it is executed or where the data lives.
+# No DataFusion, no storage, no tokio. `basin-pgtype` supplies the type system;
+# `arrow-schema` is needed only to describe a relation's output schema.
+# See docs/migration/df-removal/08-ir-design.md §1.
+[dependencies]
+basin-pgtype = { workspace = true }
+arrow-schema = { workspace = true }
