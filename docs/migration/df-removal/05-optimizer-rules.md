@@ -2,7 +2,7 @@
 title: "DF removal — optimizer rule dependency map"
 nav_section: migration
 sidebar_position: 5
-summary: "Maps each published benchmark win to the optimizer rule that produces it. The central finding: most of the win table is a columnar-storage result that survives the migration untouched; the optimizer risk is concentrated in the join and subquery shapes."
+summary: "Maps each published benchmark win to the optimizer rule that produces it, verified by rule-by-rule ablation against real DataFusion 53 plans. The optimizer risk is concentrated in the join and subquery shapes, but two universal rules — projection pruning and filter-into-scan — turn out to underwrite the storage wins too."
 tags: [migration, query-engine, optimizer, benchmarks]
 ---
 
