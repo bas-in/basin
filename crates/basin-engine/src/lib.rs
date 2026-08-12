@@ -2263,11 +2263,11 @@ pub mod noop_accept;
 mod notify_registry;
 mod nullif_rewrite;
 pub(crate) mod operators;
+pub mod overlay_reconcile;
 /// Bridges a real client SELECT into the owned query pipeline
 /// (`basin-plan` + `basin-exec`) behind the `BASIN_OWNED_ENGINE` env flag
 /// (default OFF). See the module's own docs for the full rationale.
 mod owned_engine;
-pub mod overlay_reconcile;
 /// #28 two-engine integration test for transparent per-partition write
 /// forwarding (compiled only under `cfg(test)`).
 #[cfg(test)]

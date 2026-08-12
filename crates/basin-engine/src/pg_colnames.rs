@@ -103,7 +103,9 @@ pub(crate) fn pg_style_column_names(schema: &Arc<Schema>, plan: &LogicalPlan) ->
 /// `SELECT` list's per-column expressions.
 fn top_projection_exprs(plan: &LogicalPlan) -> Option<Vec<Expr>> {
     match plan {
-        LogicalPlan::Projection(p) => Some(p.expr.clone()),
+        LogicalPlan::Projection(p) => {
+            Some(resolve_pass_through_aggregate_columns(&p.expr, &p.input))
+        }
         LogicalPlan::Sort(s) => top_projection_exprs(&s.input),
         LogicalPlan::Limit(l) => top_projection_exprs(&l.input),
         LogicalPlan::Distinct(d) => top_projection_exprs(d.input()),
@@ -127,6 +129,61 @@ fn top_projection_exprs(plan: &LogicalPlan) -> Option<Vec<Expr>> {
         }
         _ => None,
     }
+}
+
+/// Undo DataFusion's pass-through `Column` references over a directly-nested
+/// `Aggregate`, so `pg_expr_display_name` sees the real
+/// `Expr::AggregateFunction` it already knows how to name instead of a bare
+/// column name.
+///
+/// The `Aggregate` arm above was written on the assumption that a bare
+/// `SELECT agg(...) FROM t` (no `GROUP BY`) plans straight to
+/// `LogicalPlan::Aggregate` with nothing on top. Verified live against this
+/// plan (`BASIN_DEBUG_PG_COLNAMES=1`): that is false. DataFusion always
+/// wraps it in a `Projection`, so the `Projection` arm above is what
+/// actually fires, and that `Projection`'s own expressions are just a
+/// rename/pass-through of the `Aggregate` child's output columns -- which
+/// come in two shapes:
+///   - `Alias(Column(inner_name), display_name)`, when DataFusion needs to
+///     restore original call text that its own rewrite lost (`COUNT(*)` is
+///     physically `count(Int64(1))`) -- `pg_name_for_projection_item`'s
+///     `bare_call_prefix` heuristic on the alias text already handles this.
+///   - a bare `Column(name)` with **no** `Alias` at all, when the
+///     `Aggregate`'s own field name already equals the wanted display text
+///     (`sum(t.a)`) -- and a plain column reference has no alias text to
+///     pattern-match, so it fell through to `Expr::Column`'s "use the name
+///     verbatim" rule and leaked `sum(t.a)`, arguments and all, onto the
+///     wire.
+///
+/// Text-matching a second heuristic onto the bare `Column`'s name (mirroring
+/// `bare_call_prefix`) would work for `sum(a)` but not `sum(a) FILTER (WHERE
+/// ...)` or `count(DISTINCT a)`, whose rendered text does not end at the
+/// first balanced `)`. Resolving structurally instead -- swap the `Column`
+/// for the real `group_expr`/`aggr_expr` the `Aggregate` computed for that
+/// output field -- fixes all of them at once, because it never re-derives a
+/// name from text; it hands the original expression to the
+/// `Expr::AggregateFunction` arm that already only looks at `func.name()`.
+fn resolve_pass_through_aggregate_columns(exprs: &[Expr], input: &LogicalPlan) -> Vec<Expr> {
+    let LogicalPlan::Aggregate(a) = input else {
+        return exprs.to_vec();
+    };
+    let by_name: std::collections::HashMap<&str, &Expr> = a
+        .schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .zip(a.group_expr.iter().chain(a.aggr_expr.iter()))
+        .collect();
+    exprs
+        .iter()
+        .map(|e| match e {
+            Expr::Column(c) => by_name
+                .get(c.name.as_str())
+                .map(|real| (*real).clone())
+                .unwrap_or_else(|| e.clone()),
+            other => other.clone(),
+        })
+        .collect()
 }
 
 /// Compute the Postgres name for one top-level projection item.
@@ -505,14 +562,16 @@ mod tests {
         );
     }
 
-    // KNOWN FAILING — the assertion is correct, the fix is incomplete.
-    // Postgres names this column "sum"; Basin still emits "sum(t.a)". Both
-    // halves that should make it work are present — `top_projection_exprs`
-    // has an `Aggregate` arm and `pg_expr_display_name` handles
-    // `Expr::AggregateFunction` — so this plan shape reaches neither, and why
-    // has not been traced. Ignored rather than deleted: it states Postgres's
-    // rule, and removing it would lose the only record that this is unfixed.
-    #[ignore = "aggregate column naming incomplete: emits sum(t.a), Postgres says sum"]
+    // Traced live with `BASIN_DEBUG_PG_COLNAMES=1`: the `Aggregate` arm in
+    // `top_projection_exprs` was never reached. `SELECT sum(a) FROM t` plans
+    // to `Projection[Column("sum(t.a)")] -> Aggregate[...]` — DataFusion
+    // always wraps a bare aggregate query in a `Projection`, so the
+    // `Projection` arm fires, and its expr is a bare `Column` (no `Alias`)
+    // because the `Aggregate`'s own field name already equals the wanted
+    // display text. `pg_expr_display_name`'s `Expr::AggregateFunction` arm
+    // was correct all along; it just never got handed an `AggregateFunction`
+    // — `resolve_pass_through_aggregate_columns` now resolves that `Column`
+    // back to the real expression before naming it.
     #[tokio::test]
     async fn aggregate_with_no_wrapping_projection_uses_bare_function_name() {
         // Regression test for C1a: a bare `SELECT agg(...) FROM t` with no

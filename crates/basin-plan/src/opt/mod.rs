@@ -7,10 +7,10 @@
 //! required in the first increment, not a later refinement.
 
 pub mod decorrelate;
-pub mod limit;
-pub mod simplify;
 pub mod driver;
+pub mod limit;
 pub mod projection;
 pub mod pushdown;
+pub mod simplify;
 
 pub use driver::{optimize, OptimizerRule};

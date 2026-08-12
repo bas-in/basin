@@ -84,12 +84,12 @@ use basin_exec::build::{BuildError, ScanPushdown, TableResolver as ExecTableReso
 use basin_exec::operator::ExecError;
 use basin_exec::scan::BatchSource;
 use basin_exec::storage_source::StorageTableResolver;
+use basin_pgtype::{Oid, PgType};
 use basin_plan::lower::expr::{FuncKind, OperatorResolver};
 use basin_plan::lower::select::{lower_select, TableResolver as PlanTableResolver};
 use basin_plan::lower::LowerError;
 use basin_plan::opt::OptimizerRule;
 use basin_plan::{Expr as PlanExpr, FuncId, OpId, Schema as PlanSchema, TableId};
-use basin_pgtype::{Oid, PgType};
 
 use crate::{ExecResult, ProjectSession};
 
@@ -238,7 +238,6 @@ impl CatalogTableResolver {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn register(
         &mut self,
         key: String,
@@ -313,12 +312,10 @@ async fn build_resolver(
                 "row-level security is enabled on this table",
             ));
         }
-        if meta
-            .schema
-            .fields()
-            .iter()
-            .any(|f| f.name().starts_with(crate::promoted_columns::SHADOW_COL_PREFIX))
-        {
+        if meta.schema.fields().iter().any(|f| {
+            f.name()
+                .starts_with(crate::promoted_columns::SHADOW_COL_PREFIX)
+        }) {
             return Err(Fallback::Ineligible(
                 "table carries promoted JSONB shadow columns",
             ));
@@ -328,7 +325,11 @@ async fn build_resolver(
         // DELETE tombstones live in this same registry, not a separate
         // cold-tier mechanism) means the committed cold files this bridge
         // reads are not the whole story for this table.
-        if let Some(entry) = sess.engine.memtable_registry().get(&sess.project, &table_name) {
+        if let Some(entry) = sess
+            .engine
+            .memtable_registry()
+            .get(&sess.project, &table_name)
+        {
             if entry.memtable.total_count() != 0 {
                 return Err(Fallback::Ineligible(
                     "table has pending hot-tier rows or tombstones",
@@ -466,8 +467,7 @@ impl OperatorResolver for RealOperators {
             "NOT" => None,
             _ => {
                 let left_oid = left.map(|t| t.oid);
-                basin_pgtype::operator::resolve(name, left_oid, right.oid)
-                    .map(|sig| OpId(sig.oid))
+                basin_pgtype::operator::resolve(name, left_oid, right.oid).map(|sig| OpId(sig.oid))
             }
         }
     }
