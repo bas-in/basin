@@ -160,6 +160,39 @@ passes tests at every commit; the final commit in the sequence is the
   `FileFormat` trait. Removing DataFusion means reading Vortex through the base
   `vortex` crate directly. This is being assessed as a potential blocker.
 
+  > **Resolved 2026-08-12: not a blocker.** `basin-storage` carries no
+  > DataFusion dependency at all and already reads both formats directly —
+  > Vortex through `open_buffer().scan()` with projection and filter, Parquet
+  > through arrow-rs with row-group, page-index and bloom pruning. The coupling
+  > is confined to `crates/basin-engine/src/vortex_listing_format.rs`, a
+  > 1,184-line adapter that exists to present files to DataFusion's
+  > `ListingTable`. It is **deleted, not ported**, and takes four direct
+  > dependencies with it. Verified three ways: `datafusion-pruning` has zero
+  > call sites, Basin implements `PruningStatistics` nowhere, and the crate
+  > reaches `Cargo.lock` only via DataFusion-side dependents. See
+  > [`06-scan-and-storage.md`](../migration/df-removal/06-scan-and-storage.md).
+
+### Estimates as measured
+
+The sizing above was written before the subsystem surveys. Recording where it
+moved, in both directions, so the number is not quietly re-anchored:
+
+| Component | Original | Measured | Source |
+|---|---|---|---|
+| Optimizer | 8–12k | **4.4–6.7k** | Rule-by-rule ablation against real DataFusion 53 plans ([05](../migration/df-removal/05-optimizer-rules.md)) |
+| Physical layer | 19–30k | **8.5–13k** | Parallelism is never constructed — the guard that raises `target_partitions` also disables repartitioning ([03](../migration/df-removal/03-physical-operators.md)) |
+| Function library | 9–17k | **22–30k** | 215 missing names, 127 required; window functions are entirely greenfield ([04](../migration/df-removal/04-function-gap.md)) |
+| Catalog fidelity | 15–25k | **9–13.5k** | ~65 relations already exist and are real queries, not stubs ([11](../migration/df-removal/11-pg-catalog-fidelity.md)) |
+
+Two corrections worth naming, because both were assumptions rather than
+measurements. The claim that six of thirteen published wins are storage results
+that "survive whatever the optimizer does" is **false**: ablation showed they
+collapse without `optimize_projections` and `push_down_filter`. And the 462×
+LATERAL win is **not** DataFusion's `DecorrelateLateralJoin` — DataFusion never
+decorrelates that query; Basin's own textual rewrite in `pg_operators.rs:3461`
+does, which means it must be ported rather than discarded with the rest of that
+file.
+
 ### Mitigations
 
 - Basin's ~199,530 LOC integration suite plus ~66,583 LOC of in-file unit tests
