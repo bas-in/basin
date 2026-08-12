@@ -25,6 +25,9 @@
 //! separate increments; nothing consumes this crate yet.
 
 pub mod expr;
+pub mod lower;
+pub mod opt;
+pub mod schema;
 
 pub use expr::{
     BoolTest, ColumnRef, Datum, Expr, FrameBound, FrameUnits, FuncId, OpId, SortKey, SubqueryKind,
