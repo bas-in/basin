@@ -24,6 +24,7 @@
 //! Types only. Lowering from `pg_query`, the optimizer, and execution are
 //! separate increments; nothing consumes this crate yet.
 
+pub mod display;
 pub mod expr;
 pub mod lower;
 pub mod opt;
