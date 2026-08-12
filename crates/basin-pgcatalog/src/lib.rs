@@ -49,14 +49,14 @@ pub mod pg_attrdef;
 pub mod pg_attribute;
 pub mod pg_cast;
 pub mod pg_class;
+pub mod pg_constraint;
+pub mod pg_index;
 pub mod pg_namespace;
 pub mod pg_operator;
 pub mod pg_proc;
-pub mod pg_constraint;
-pub mod pg_index;
-pub mod real_source;
 pub mod pg_type;
 pub mod predicate;
+pub mod real_source;
 pub mod system_view;
 
 pub use basin_pgtype::Oid;

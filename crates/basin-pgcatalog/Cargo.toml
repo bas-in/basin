@@ -18,3 +18,17 @@ publish.workspace = true
 basin-pgtype = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+
+# Dev-only: `real_source.rs`'s test suite builds a real `basin-catalog`
+# (backed by a local-filesystem object store in a TempDir) to prove the
+# CatalogSource pushdown contract against real data, not only the mock. Kept
+# out of [dependencies] deliberately: `basin-catalog` unconditionally pulls
+# tokio/tokio-postgres/reqwest, which would defeat the point of this crate
+# staying tokio-free for every non-test consumer. See real_source.rs's module
+# docs for the full reasoning.
+[dev-dependencies]
+basin-catalog = { workspace = true }
+basin-common = { workspace = true }
+object_store = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }

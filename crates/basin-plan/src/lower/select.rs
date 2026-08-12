@@ -20,10 +20,13 @@
 //!
 //! `FROM` (single table, comma-list, explicit `JOIN ... ON`), the `SELECT`
 //! list (including `*` expansion), `WHERE`, `GROUP BY` / `HAVING`,
-//! `ORDER BY`, `LIMIT` / `OFFSET`, `VALUES`, a `FROM`-less `SELECT`, and
-//! `UNION` / `INTERSECT` / `EXCEPT`. Everything else — CTEs, window clauses,
-//! `DISTINCT` / `DISTINCT ON`, `LATERAL`, a subquery or set-returning
-//! function in `FROM`, `NATURAL`/`USING` joins — returns
+//! `ORDER BY`, `LIMIT` / `OFFSET`, `VALUES`, a `FROM`-less `SELECT`,
+//! `UNION` / `INTERSECT` / `EXCEPT`, plain `DISTINCT`, `WITH` / `WITH
+//! RECURSIVE` (see [`lower_with_clause`]), and window functions (`OVER
+//! (...)`, see [`apply_windows`]). Everything else — a named `WINDOW`
+//! clause referenced via `OVER <name>`, `DISTINCT ON`, `LATERAL`, a
+//! subquery or set-returning function in `FROM`, `NATURAL`/`USING` joins, a
+//! CTE's own column-alias list, a data-modifying CTE — returns
 //! [`LowerError::Unsupported`] naming the construct. That is a correct
 //! outcome for this increment, not a bug.
 //!
@@ -77,8 +80,8 @@ use crate::lower::expr::{
 };
 use crate::lower::LowerError;
 use crate::{
-    ColId, ColumnRef, Expr, FrameBound, JoinKind, LogicalPlan, Schema, SetOpKind, SnapshotId,
-    SortKey, TableId, WindowFrame,
+    ColId, ColumnRef, CteId, Expr, FrameBound, JoinKind, LogicalPlan, Schema, SetOpKind,
+    SnapshotId, SortKey, TableId, WindowFrame,
 };
 
 /// Resolves a (possibly schema-qualified) table name to its catalog identity
@@ -108,7 +111,8 @@ pub fn lower_select(
         operators,
         functions,
     };
-    lower_select_stmt(stmt, &res)
+    let (plan, _schema) = lower_select_stmt(stmt, &res)?;
+    Ok(plan)
 }
 
 /// The three resolver seams a statement-level lowering pass needs, bundled
@@ -233,6 +237,25 @@ impl Scope {
         })
     }
 
+    /// The type at a given flat column index, if any — used to give a
+    /// bare-column SELECT list entry its real type in
+    /// [`select_output_schema`] without needing a second, catalog-free type
+    /// inference pass (`crate::schema::expr_type` cannot help here: it
+    /// itself needs an input schema, which for anything rooted at a `Scan`
+    /// is exactly what that module's own docs say it cannot produce without
+    /// a catalog — this `Scope` already carries the real one).
+    fn flat_type(&self, index: u16) -> Option<PgType> {
+        let mut offset = 0u16;
+        for rel in &self.relations {
+            let len = rel.schema.len() as u16;
+            if index < offset + len {
+                return rel.schema.get((index - offset) as usize).map(|(_, ty)| *ty);
+            }
+            offset += len;
+        }
+        None
+    }
+
     /// Every `(name, flat index)` pair `*` or `t.*` expands to.
     fn star_columns(&self, qualifier: Option<&str>) -> Vec<(String, u16)> {
         let mut out = Vec::new();
@@ -294,15 +317,186 @@ impl<'a> LowerCtxOwned<'a> {
 
 // ─── Top-level statement dispatch ──────────────────────────────────────────
 
-fn lower_select_stmt(stmt: &SelectStmt, res: &Resolvers) -> Result<LogicalPlan, LowerError> {
-    if stmt.with_clause.is_some() {
+/// One `WITH`-list entry visible to whatever is being lowered right now — the
+/// statement itself, or a later CTE in the same list. `FROM <name>` resolves
+/// against this (checked before [`TableResolver`], so a CTE shadows a real
+/// table of the same name, matching Postgres) rather than against a second,
+/// bolted-on lookup mechanism.
+#[derive(Debug, Clone)]
+struct CteBinding {
+    name: String,
+    id: CteId,
+    /// The row shape `FROM <name>` puts in scope — the exposed SELECT list's
+    /// aliases, typed best-effort against the body's own `FROM` scope (see
+    /// [`select_output_schema`]; a computed column such as an aggregate or
+    /// window result reports [`PgType::UNKNOWN`] rather than a guess, for the
+    /// same reason `Values`'s schema does).
+    schema: Schema,
+}
+
+/// Lower a top-level (or nested, e.g. a `UNION` arm or a `WITH`-list body)
+/// `SELECT`, with no `WITH`-list of its own currently in scope.
+fn lower_select_stmt(
+    stmt: &SelectStmt,
+    res: &Resolvers,
+) -> Result<(LogicalPlan, Schema), LowerError> {
+    lower_select_stmt_ctx(stmt, res, &[])
+}
+
+/// Lower a `SELECT` with `ctes` — the `WITH`-list entries of the enclosing
+/// statement (and any of its own CTEs already lowered) — visible to its
+/// `FROM` clause. Dispatches to [`lower_with_clause`] when `stmt` carries its
+/// own `WITH`, so a CTE's body may itself start a fresh (nested) `WITH`
+/// without this recursing back into that same `with_clause`.
+fn lower_select_stmt_ctx(
+    stmt: &SelectStmt,
+    res: &Resolvers,
+    ctes: &[CteBinding],
+) -> Result<(LogicalPlan, Schema), LowerError> {
+    match stmt.with_clause.as_ref() {
+        Some(with) => lower_with_clause(with, stmt, res, ctes),
+        None => lower_select_stmt_body(stmt, res, ctes),
+    }
+}
+
+/// Lower a `WITH [RECURSIVE] name AS (body), ... <stmt-without-its-WITH>`.
+///
+/// Each CTE is assigned a [`CteId`] in list order and lowered against every
+/// binding that came before it (a CTE may reference an earlier sibling, not a
+/// later one — the same left-to-right rule Postgres enforces) plus whatever
+/// was already visible from an enclosing `WITH`. The final plan nests one
+/// [`LogicalPlan::Cte`] per entry, innermost (last-defined) first, wrapping
+/// the main query — [`LogicalPlan::Cte::input`] is that nesting's "everything
+/// this CTE (and any later sibling) is visible to".
+fn lower_with_clause(
+    with: &pg_query::protobuf::WithClause,
+    stmt: &SelectStmt,
+    res: &Resolvers,
+    outer_ctes: &[CteBinding],
+) -> Result<(LogicalPlan, Schema), LowerError> {
+    let mut ctes: Vec<CteBinding> = outer_ctes.to_vec();
+    let mut defs: Vec<(CteId, bool, LogicalPlan)> = Vec::with_capacity(with.ctes.len());
+
+    for node in &with.ctes {
+        let Some(NodeEnum::CommonTableExpr(cte)) = node.node.as_ref() else {
+            return Err(LowerError::Malformed(
+                "WITH list entry is not a CommonTableExpr",
+            ));
+        };
+        if !cte.aliascolnames.is_empty() {
+            return Err(LowerError::Unsupported(
+                "a CTE's own column-alias list (WITH x(a, b) AS ...) is not yet lowered".into(),
+            ));
+        }
+        let ctequery = cte
+            .ctequery
+            .as_deref()
+            .ok_or(LowerError::Malformed("CTE with no query"))?;
+        let Some(NodeEnum::SelectStmt(cte_stmt)) = ctequery.node.as_ref() else {
+            return Err(LowerError::Unsupported(
+                "a data-modifying CTE (WITH x AS (INSERT/UPDATE/DELETE ...)) is not yet lowered"
+                    .into(),
+            ));
+        };
+
+        // IDs are assigned densely from `ctes.len()`, so they stay unique
+        // across nested `WITH`s too: `outer_ctes` (if any) already occupies
+        // `0..outer_ctes.len()`, and every push below extends contiguously
+        // from there.
+        let id = CteId(ctes.len() as u16);
+        let (body, schema, recursive) = if with.recursive {
+            lower_recursive_cte(cte_stmt, res, &ctes, id, &cte.ctename)?
+        } else {
+            let (body, schema) = lower_select_stmt_ctx(cte_stmt, res, &ctes)?;
+            (body, schema, false)
+        };
+
+        ctes.push(CteBinding {
+            name: cte.ctename.clone(),
+            id,
+            schema: schema.clone(),
+        });
+        defs.push((id, recursive, body));
+    }
+
+    let (input, input_schema) = lower_select_stmt_body(stmt, res, &ctes)?;
+
+    let plan = defs
+        .into_iter()
+        .rev()
+        .fold(input, |input, (id, recursive, body)| LogicalPlan::Cte {
+            name: id,
+            recursive,
+            body: Box::new(body),
+            input: Box::new(input),
+        });
+    Ok((plan, input_schema))
+}
+
+/// Lower one `WITH RECURSIVE` member. `WITH RECURSIVE` is a property of the
+/// whole `WITH`-list, but Postgres only actually recurses a member that both
+/// is shaped `anchor UNION [ALL] recursive-term` *and* has its recursive
+/// term reference the member's own name — a member that is neither is an
+/// ordinary (non-recursive) CTE that merely sits inside a `WITH RECURSIVE`
+/// block, which is legal SQL and exactly what the non-`Union` branch below
+/// falls back to.
+///
+/// For the `Union` shape, the anchor is lowered first (its schema is what
+/// `basin-exec`'s recursive fixpoint loop feeds back on every iteration —
+/// `build.rs`'s `build_recursive_cte`), then the recursive term is lowered
+/// with `name` bound to a [`CteRef`](LogicalPlan::CteRef) carrying that same
+/// [`CteId`] — this is the one shape where a name resolves to a `CteId` the
+/// enclosing [`LogicalPlan::Cte`] hasn't been built yet to register, which is
+/// sound only because `build_recursive_cte` re-registers that id itself,
+/// once per iteration, before ever building this exact plan.
+fn lower_recursive_cte(
+    stmt: &SelectStmt,
+    res: &Resolvers,
+    ctes: &[CteBinding],
+    id: CteId,
+    name: &str,
+) -> Result<(LogicalPlan, Schema, bool), LowerError> {
+    let op_kind = SetOperation::try_from(stmt.op).unwrap_or(SetOperation::Undefined);
+    if op_kind != SetOperation::SetopUnion {
+        let (body, schema) = lower_select_stmt_ctx(stmt, res, ctes)?;
+        return Ok((body, schema, false));
+    }
+    if !stmt.sort_clause.is_empty() || stmt.limit_count.is_some() || stmt.limit_offset.is_some() {
         return Err(LowerError::Unsupported(
-            "WITH / common table expressions are not yet lowered".into(),
+            "ORDER BY / LIMIT directly on a WITH RECURSIVE member is not yet lowered".into(),
         ));
     }
+    let larg = stmt.larg.as_deref().ok_or(LowerError::Malformed(
+        "WITH RECURSIVE member with no anchor",
+    ))?;
+    let rarg = stmt.rarg.as_deref().ok_or(LowerError::Malformed(
+        "WITH RECURSIVE member with no recursive term",
+    ))?;
+    let (anchor, anchor_schema) = lower_select_stmt_ctx(larg, res, ctes)?;
+    let mut inner = ctes.to_vec();
+    inner.push(CteBinding {
+        name: name.to_string(),
+        id,
+        schema: anchor_schema.clone(),
+    });
+    let (recursive_term, _) = lower_select_stmt_ctx(rarg, res, &inner)?;
+    let body = LogicalPlan::SetOp {
+        left: Box::new(anchor),
+        right: Box::new(recursive_term),
+        op: SetOpKind::Union,
+        all: stmt.all,
+    };
+    Ok((body, anchor_schema, true))
+}
+
+fn lower_select_stmt_body(
+    stmt: &SelectStmt,
+    res: &Resolvers,
+    ctes: &[CteBinding],
+) -> Result<(LogicalPlan, Schema), LowerError> {
     if !stmt.window_clause.is_empty() {
         return Err(LowerError::Unsupported(
-            "WINDOW clauses are not yet lowered".into(),
+            "a named WINDOW clause (referenced via OVER <name>) is not yet lowered".into(),
         ));
     }
     if !stmt.locking_clause.is_empty() {
@@ -318,7 +512,7 @@ fn lower_select_stmt(stmt: &SelectStmt, res: &Resolvers) -> Result<LogicalPlan, 
 
     let op_kind = SetOperation::try_from(stmt.op).unwrap_or(SetOperation::Undefined);
     if op_kind != SetOperation::SetopNone {
-        return lower_set_op(stmt, op_kind, res);
+        return lower_set_op(stmt, op_kind, res, ctes);
     }
 
     // Postgres's own parse-tree convention: plain `DISTINCT` puts a single
@@ -342,7 +536,7 @@ fn lower_select_stmt(stmt: &SelectStmt, res: &Resolvers) -> Result<LogicalPlan, 
         return lower_values(stmt, res);
     }
 
-    let from = build_from_clause(&stmt.from_clause, res)?;
+    let from = build_from_clause(&stmt.from_clause, res, ctes)?;
     let (base_plan, scope) = apply_where(from, stmt, res)?;
 
     let resolver = ScopeResolver(&scope);
@@ -357,19 +551,28 @@ fn lower_select_stmt(stmt: &SelectStmt, res: &Resolvers) -> Result<LogicalPlan, 
         .map(|n| lower_expr(n, &ctx))
         .transpose()?;
 
-    if raw_target.iter().any(|(e, _)| contains_window(e))
-        || having_expr.as_ref().is_some_and(contains_window)
-    {
+    // Postgres permits a window function only in the SELECT list and in
+    // ORDER BY — never in HAVING (checked here; ORDER BY is checked once its
+    // own keys are lowered, below, since a GROUP BY query's ORDER BY isn't
+    // lowered until after the post-aggregation rewrite).
+    if having_expr.as_ref().is_some_and(contains_window) {
         return Err(LowerError::Unsupported(
-            "window functions are not yet lowered".into(),
+            "window functions are not allowed in HAVING".into(),
         ));
     }
+
+    // The CTE-exposed row shape (see `CteBinding::schema`), computed from the
+    // SELECT list exactly as written — before any aggregate/window rewrite
+    // renumbers it — so a bare-column entry's type comes straight from the
+    // real `FROM`-clause schema and everything else best-effort-falls back to
+    // `PgType::UNKNOWN` rather than a guess.
+    let out_schema = select_output_schema(&raw_target, &scope);
 
     let has_agg = !group_exprs.is_empty()
         || having_expr.is_some()
         || raw_target.iter().any(|(e, _)| e.contains_aggregate());
 
-    if has_agg {
+    let plan = if has_agg {
         let mut aggs = Vec::new();
         let target = raw_target
             .into_iter()
@@ -392,7 +595,13 @@ fn lower_select_stmt(stmt: &SelectStmt, res: &Resolvers) -> Result<LogicalPlan, 
                 })
             })
             .collect::<Result<Vec<_>, LowerError>>()?;
+        if sort_keys_contain_window(&order_keys) {
+            return Err(LowerError::Unsupported(
+                "window functions in ORDER BY are not yet lowered".into(),
+            ));
+        }
 
+        let agg_width = group_exprs.len() + aggs.len();
         let agg_plan = LogicalPlan::Aggregate {
             input: Box::new(base_plan),
             group: group_exprs,
@@ -406,11 +615,15 @@ fn lower_select_stmt(stmt: &SelectStmt, res: &Resolvers) -> Result<LogicalPlan, 
             },
             None => agg_plan,
         };
+        // Window functions are computed over the post-WHERE, post-GROUP BY
+        // (and post-HAVING) row set — `windows` sees exactly the rows/columns
+        // `having_applied` produces, per the module docs.
+        let (windowed, target) = apply_windows(having_applied, agg_width, target);
         let sorted = if order_keys.is_empty() {
-            having_applied
+            windowed
         } else {
             LogicalPlan::Sort {
-                input: Box::new(having_applied),
+                input: Box::new(windowed),
                 keys: order_keys,
             }
         };
@@ -418,27 +631,36 @@ fn lower_select_stmt(stmt: &SelectStmt, res: &Resolvers) -> Result<LogicalPlan, 
             input: Box::new(sorted),
             exprs: target,
         };
-        apply_limit(apply_distinct(projected, is_distinct), stmt, res)
+        apply_limit(apply_distinct(projected, is_distinct), stmt, res)?
     } else {
         let order_keys = stmt
             .sort_clause
             .iter()
             .map(|n| lower_sort_by(n, &ctx))
             .collect::<Result<Vec<_>, _>>()?;
+        if sort_keys_contain_window(&order_keys) {
+            return Err(LowerError::Unsupported(
+                "window functions in ORDER BY are not yet lowered".into(),
+            ));
+        }
+
+        let base_width = scope.total_len();
+        let (windowed, target) = apply_windows(base_plan, base_width, raw_target);
         let sorted = if order_keys.is_empty() {
-            base_plan
+            windowed
         } else {
             LogicalPlan::Sort {
-                input: Box::new(base_plan),
+                input: Box::new(windowed),
                 keys: order_keys,
             }
         };
         let projected = LogicalPlan::Project {
             input: Box::new(sorted),
-            exprs: raw_target,
+            exprs: target,
         };
-        apply_limit(apply_distinct(projected, is_distinct), stmt, res)
-    }
+        apply_limit(apply_distinct(projected, is_distinct), stmt, res)?
+    };
+    Ok((plan, out_schema))
 }
 
 /// Wrap `plan` in `DISTINCT` when the statement asked for it.
@@ -462,7 +684,8 @@ fn lower_set_op(
     stmt: &SelectStmt,
     op_kind: SetOperation,
     res: &Resolvers,
-) -> Result<LogicalPlan, LowerError> {
+    ctes: &[CteBinding],
+) -> Result<(LogicalPlan, Schema), LowerError> {
     if !stmt.sort_clause.is_empty() || stmt.limit_count.is_some() || stmt.limit_offset.is_some() {
         return Err(LowerError::Unsupported(
             "ORDER BY / LIMIT directly on a UNION/INTERSECT/EXCEPT result is not yet lowered"
@@ -477,23 +700,32 @@ fn lower_set_op(
         .rarg
         .as_deref()
         .ok_or(LowerError::Malformed("set operation with no right arm"))?;
-    let left = lower_select_stmt(larg, res)?;
-    let right = lower_select_stmt(rarg, res)?;
+    let (left, left_schema) = lower_select_stmt_ctx(larg, res, ctes)?;
+    let (right, _right_schema) = lower_select_stmt_ctx(rarg, res, ctes)?;
     let op = match op_kind {
         SetOperation::SetopUnion => SetOpKind::Union,
         SetOperation::SetopIntersect => SetOpKind::Intersect,
         SetOperation::SetopExcept => SetOpKind::Except,
         _ => return Err(LowerError::Malformed("set operation with an unknown op")),
     };
-    Ok(LogicalPlan::SetOp {
-        left: Box::new(left),
-        right: Box::new(right),
-        op,
-        all: stmt.all,
-    })
+    // Postgres always takes the left (leftmost) arm's column names/types for
+    // a set operation's own output — `crate::schema::output_schema`'s
+    // `SetOp` branch documents the same rule; matched here rather than
+    // reused because that module cannot yet resolve a `Scan`'s schema at all
+    // (no catalog — see its own module docs), which every real `FROM` clause
+    // bottoms out at.
+    Ok((
+        LogicalPlan::SetOp {
+            left: Box::new(left),
+            right: Box::new(right),
+            op,
+            all: stmt.all,
+        },
+        left_schema,
+    ))
 }
 
-fn lower_values(stmt: &SelectStmt, res: &Resolvers) -> Result<LogicalPlan, LowerError> {
+fn lower_values(stmt: &SelectStmt, res: &Resolvers) -> Result<(LogicalPlan, Schema), LowerError> {
     let scope = Scope::empty();
     let resolver = ScopeResolver(&scope);
     let lctx = expr_ctx(res, &resolver);
@@ -532,7 +764,15 @@ fn lower_values(stmt: &SelectStmt, res: &Resolvers) -> Result<LogicalPlan, Lower
             (format!("column{}", i + 1), ty)
         })
         .collect();
-    apply_limit(LogicalPlan::Values { rows, schema }, stmt, res)
+    let plan = apply_limit(
+        LogicalPlan::Values {
+            rows,
+            schema: schema.clone(),
+        },
+        stmt,
+        res,
+    )?;
+    Ok((plan, schema))
 }
 
 fn apply_limit(
@@ -587,14 +827,18 @@ struct FromBuilt {
     top_join_left_len: Option<usize>,
 }
 
-fn build_from_clause(items: &[Node], res: &Resolvers) -> Result<Option<FromBuilt>, LowerError> {
+fn build_from_clause(
+    items: &[Node],
+    res: &Resolvers,
+    ctes: &[CteBinding],
+) -> Result<Option<FromBuilt>, LowerError> {
     let mut iter = items.iter();
     let Some(first) = iter.next() else {
         return Ok(None);
     };
-    let mut acc = build_from_item(first, res)?;
+    let mut acc = build_from_item(first, res, ctes)?;
     for item in iter {
-        let rhs = build_from_item(item, res)?;
+        let rhs = build_from_item(item, res, ctes)?;
         let left_len = acc.scope.total_len();
         let plan = LogicalPlan::Join {
             left: Box::new(acc.plan),
@@ -613,10 +857,14 @@ fn build_from_clause(items: &[Node], res: &Resolvers) -> Result<Option<FromBuilt
     Ok(Some(acc))
 }
 
-fn build_from_item(item: &Node, res: &Resolvers) -> Result<FromBuilt, LowerError> {
+fn build_from_item(
+    item: &Node,
+    res: &Resolvers,
+    ctes: &[CteBinding],
+) -> Result<FromBuilt, LowerError> {
     match item.node.as_ref() {
-        Some(NodeEnum::RangeVar(rv)) => build_range_var(rv, res),
-        Some(NodeEnum::JoinExpr(je)) => build_join_expr(je, res),
+        Some(NodeEnum::RangeVar(rv)) => build_range_var(rv, res, ctes),
+        Some(NodeEnum::JoinExpr(je)) => build_join_expr(je, res, ctes),
         Some(NodeEnum::RangeSubselect(_)) => Err(LowerError::Unsupported(
             "a subquery in FROM is not yet lowered".into(),
         )),
@@ -633,7 +881,33 @@ fn build_from_item(item: &Node, res: &Resolvers) -> Result<FromBuilt, LowerError
 fn build_range_var(
     rv: &pg_query::protobuf::RangeVar,
     res: &Resolvers,
+    ctes: &[CteBinding],
 ) -> Result<FromBuilt, LowerError> {
+    // A CTE shadows a real table of the same (unqualified) name, matching
+    // Postgres — checked first, and only for an unqualified name, since a
+    // CTE never lives in a schema. The most recently defined binding with
+    // this name wins, which only matters for `WITH RECURSIVE`'s own
+    // self-reference (`lower_recursive_cte` pushes a same-named binding on
+    // top of whatever an outer `WITH` already carries).
+    if rv.schemaname.is_empty() {
+        if let Some(cte) = ctes.iter().rev().find(|c| c.name == rv.relname) {
+            let qualifier = rv
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .unwrap_or_else(|| rv.relname.clone());
+            let plan = LogicalPlan::CteRef {
+                name: cte.id,
+                schema: cte.schema.clone(),
+            };
+            let scope = Scope::single(qualifier, cte.schema.clone());
+            return Ok(FromBuilt {
+                plan,
+                scope,
+                top_join_left_len: None,
+            });
+        }
+    }
     let mut parts = Vec::new();
     if !rv.schemaname.is_empty() {
         parts.push(rv.schemaname.clone());
@@ -670,6 +944,7 @@ fn build_range_var(
 fn build_join_expr(
     je: &pg_query::protobuf::JoinExpr,
     res: &Resolvers,
+    ctes: &[CteBinding],
 ) -> Result<FromBuilt, LowerError> {
     if je.is_natural {
         return Err(LowerError::Unsupported(
@@ -702,8 +977,8 @@ fn build_join_expr(
         .rarg
         .as_deref()
         .ok_or(LowerError::Malformed("JOIN with no right side"))?;
-    let left = build_from_item(larg, res)?;
-    let right = build_from_item(rarg, res)?;
+    let left = build_from_item(larg, res, ctes)?;
+    let right = build_from_item(rarg, res, ctes)?;
     let left_len = left.scope.total_len();
     let scope = left.scope.concat(right.scope);
     let total_len = scope.total_len();
@@ -822,6 +1097,11 @@ fn apply_where(
                         "aggregate functions are not allowed in WHERE".into(),
                     ));
                 }
+                if contains_window(&e) {
+                    return Err(LowerError::Unsupported(
+                        "window functions are not allowed in WHERE".into(),
+                    ));
+                }
                 exprs.push(e);
             }
             let predicate = and_together(exprs, res.operators)?
@@ -860,6 +1140,11 @@ fn split_equijoin_conjuncts(
         if e.contains_aggregate() {
             return Err(LowerError::Unsupported(
                 "aggregate functions are not allowed in a join condition".into(),
+            ));
+        }
+        if contains_window(&e) {
+            return Err(LowerError::Unsupported(
+                "window functions are not allowed in a join condition".into(),
             ));
         }
         if is_raw_equality(conjunct) {
@@ -966,7 +1251,13 @@ fn lower_group_by(group_clause: &[Node], ctx: &LowerCtx) -> Result<Vec<Expr>, Lo
                     "ROLLUP / CUBE / GROUPING SETS are not yet lowered".into(),
                 ));
             }
-            lower_expr(n, ctx)
+            let e = lower_expr(n, ctx)?;
+            if contains_window(&e) {
+                return Err(LowerError::Unsupported(
+                    "window functions are not allowed in GROUP BY".into(),
+                ));
+            }
+            Ok(e)
         })
         .collect()
 }
@@ -1058,6 +1349,188 @@ fn default_alias(expr: &Expr) -> String {
     }
 }
 
+/// The row shape a `SELECT` list exposes to whatever references it by name —
+/// used to build a [`CteBinding`]. Computed straight from `target` (as
+/// written, before any aggregate/window rewrite touches it) and `scope` (the
+/// real `FROM`-clause schema), so a bare-column entry gets its exact type and
+/// everything else best-effort-falls back to [`PgType::UNKNOWN`] the same way
+/// [`lower_values`]'s own schema does — see [`Scope::flat_type`]'s docs for
+/// why this doesn't reuse `crate::schema`'s inference instead.
+fn select_output_schema(target: &[(Expr, String)], scope: &Scope) -> Schema {
+    target
+        .iter()
+        .map(|(e, alias)| (alias.clone(), best_effort_column_type(e, scope)))
+        .collect()
+}
+
+fn best_effort_column_type(e: &Expr, scope: &Scope) -> PgType {
+    match e {
+        Expr::Column(cr) => scope.flat_type(cr.index).unwrap_or(PgType::UNKNOWN),
+        _ => best_effort_type(e),
+    }
+}
+
+// ─── WINDOW ─────────────────────────────────────────────────────────────────
+
+/// Collect every distinct (by structural equality) `Expr::Window` used
+/// anywhere inside `expr`, in first-encounter order — the window analogue of
+/// how [`rewrite_post_agg`] allocates an `Expr::Aggregate` a slot. A found
+/// window is treated as a leaf (its own children are not walked into):
+/// Postgres rejects a window call nested inside another window call's
+/// PARTITION BY/ORDER BY/args at parse analysis, so there is never a second,
+/// deeper one to find, and stopping here keeps this the mirror image of
+/// [`rewrite_post_window`], which must also stop there.
+fn collect_windows(expr: &Expr, out: &mut Vec<Expr>) {
+    if matches!(expr, Expr::Window { .. }) {
+        if !out.contains(expr) {
+            out.push(expr.clone());
+        }
+        return;
+    }
+    expr.for_each_child(&mut |c| collect_windows(c, out));
+}
+
+/// Replace every `Expr::Window` inside `expr` with a `Column` reference into
+/// the [`LogicalPlan::Window`] node(s) [`stack_windows`] built for `flat`, at
+/// `base_width + <its position in flat>` — `base_width` is `input`'s own
+/// width (see `apply_windows`), and every stacked `Window` node appends its
+/// columns after that in `flat`'s order, so this offset is correct
+/// regardless of which physical node actually computes a given window.
+fn rewrite_post_window(expr: &Expr, base_width: usize, flat: &[Expr]) -> Expr {
+    try_transform(expr, &mut |e| {
+        if matches!(e, Expr::Window { .. }) {
+            let pos = flat
+                .iter()
+                .position(|w| w == e)
+                .expect("every Expr::Window was collected into `flat` before this rewrite ran");
+            return Some(Ok(Expr::Column(ColumnRef {
+                relation: 0,
+                index: (base_width + pos) as u16,
+                name: "?column?".to_string(),
+            })));
+        }
+        None
+    })
+    .expect("rewrite_post_window's callback never returns Err")
+}
+
+/// Group `windows` (already deduplicated by [`collect_windows`]) by shared
+/// PARTITION BY/ORDER BY, preserving the order each distinct spec was first
+/// seen and each window's relative order within its group.
+/// `basin-exec/src/build.rs`'s `window_keys` requires every expression inside
+/// one `LogicalPlan::Window` node to agree on both (the operator computes one
+/// partitioning per node, so disagreement would silently mis-window one of
+/// them) — this grouping is what decides which windows share a node and
+/// which get their own.
+fn group_by_window_spec(windows: Vec<Expr>) -> Vec<Vec<Expr>> {
+    let mut groups: Vec<Vec<Expr>> = Vec::new();
+    for w in windows {
+        let Expr::Window {
+            partition_by,
+            order_by,
+            ..
+        } = &w
+        else {
+            unreachable!("collect_windows only ever collects Expr::Window");
+        };
+        let existing = groups.iter_mut().find(|g| {
+            let Expr::Window {
+                partition_by: p2,
+                order_by: o2,
+                ..
+            } = &g[0]
+            else {
+                unreachable!("collect_windows only ever collects Expr::Window");
+            };
+            p2 == partition_by && o2 == order_by
+        });
+        match existing {
+            Some(g) => g.push(w),
+            None => groups.push(vec![w]),
+        }
+    }
+    groups
+}
+
+/// Stack one `Sort` + [`LogicalPlan::Window`] pair per distinct spec in
+/// `groups` above `input`. The `Sort` exists because `basin-exec/src/window.rs`
+/// says, prominently, that `WindowAgg` never sorts its own input and expects
+/// it already ordered by PARTITION BY then ORDER BY — omitting this produces
+/// a plan that runs and returns a plausible-looking wrong answer rather than
+/// an error, exactly the failure mode that module's docs call out. Groups
+/// are stacked (each on top of the last) rather than run side by side because
+/// each needs its OWN sort order, which a single shared input could not
+/// satisfy for more than one group at a time.
+fn stack_windows(input: LogicalPlan, groups: Vec<Vec<Expr>>) -> LogicalPlan {
+    let mut plan = input;
+    for group in groups {
+        let Expr::Window {
+            partition_by,
+            order_by,
+            ..
+        } = &group[0]
+        else {
+            unreachable!("collect_windows only ever collects Expr::Window");
+        };
+        // PARTITION BY has no ASC/DESC of its own in SQL — any order that
+        // keeps one partition's rows contiguous is correct, so a fixed
+        // ascending/nulls-last convention is used here.
+        let mut keys: Vec<SortKey> = partition_by
+            .iter()
+            .map(|e| SortKey {
+                expr: e.clone(),
+                descending: false,
+                nulls_first: false,
+            })
+            .collect();
+        keys.extend(order_by.iter().cloned());
+        plan = LogicalPlan::Sort {
+            input: Box::new(plan),
+            keys,
+        };
+        plan = LogicalPlan::Window {
+            input: Box::new(plan),
+            windows: group,
+        };
+    }
+    plan
+}
+
+/// Extract every window-function call inside `target`'s expressions into one
+/// or more `Sort` + [`LogicalPlan::Window`] pairs stacked above `input` (see
+/// [`stack_windows`]), and rewrite `target` to reference their output columns
+/// instead of carrying `Expr::Window` directly. `input`'s own width
+/// (`base_width`) is where the appended window columns start — the module
+/// docs on `LogicalPlan::Window`'s position (between the input and the
+/// projection) is what fixes `input` here to `base_plan` (no `GROUP BY`) or
+/// the post-`HAVING` aggregate output (`GROUP BY` present), never anything
+/// already carrying the query's own final `ORDER BY`/`Project`.
+fn apply_windows(
+    input: LogicalPlan,
+    base_width: usize,
+    target: Vec<(Expr, String)>,
+) -> (LogicalPlan, Vec<(Expr, String)>) {
+    let mut collected = Vec::new();
+    for (e, _) in &target {
+        collect_windows(e, &mut collected);
+    }
+    if collected.is_empty() {
+        return (input, target);
+    }
+    let groups = group_by_window_spec(collected);
+    let flat: Vec<Expr> = groups.iter().flatten().cloned().collect();
+    let plan = stack_windows(input, groups);
+    let target = target
+        .into_iter()
+        .map(|(e, alias)| (rewrite_post_window(&e, base_width, &flat), alias))
+        .collect();
+    (plan, target)
+}
+
+fn sort_keys_contain_window(keys: &[SortKey]) -> bool {
+    keys.iter().any(|k| contains_window(&k.expr))
+}
+
 // ─── Aggregate output rewriting ────────────────────────────────────────────
 
 /// Rewrite `expr` (lowered against the pre-aggregation scope) to reference
@@ -1092,11 +1565,17 @@ fn rewrite_post_agg(expr: &Expr, group: &[Expr], aggs: &mut Vec<Expr>) -> Result
                 cr.name
             ))));
         }
-        if matches!(e, Expr::Window { .. }) {
-            return Some(Err(LowerError::Unsupported(
-                "window functions are not yet lowered".into(),
-            )));
-        }
+        // `Expr::Window` is deliberately NOT special-cased here (unlike
+        // `Expr::Aggregate` above): a window function's own PARTITION
+        // BY/ORDER BY/args are computed over the post-aggregation row set
+        // too (`SELECT a, rank() OVER (PARTITION BY a) FROM t GROUP BY a` —
+        // the window's `a` must resolve to the SAME group-key column the
+        // rest of the SELECT list does), so returning `None` here lets the
+        // default recursion below walk into its children and apply this same
+        // rewrite to each, exactly like any other compound expression.
+        // `apply_windows` (called once this whole rewrite is done) is what
+        // extracts the now-rewritten `Expr::Window` nodes themselves into a
+        // `LogicalPlan::Window`.
         None
     })
 }
@@ -1946,22 +2425,279 @@ mod tests {
         assert_eq!(op, SetOpKind::Except);
     }
 
-    // --- Unsupported constructs ------------------------------------------------
+    // --- 10: Window functions -> Window (+ inserted Sort), between input and Project ---
 
     #[test]
-    fn a_cte_is_unsupported() {
-        let err = lower("WITH x AS (SELECT 1 AS a) SELECT a FROM x").unwrap_err();
+    fn window_sits_between_the_input_and_the_projection_with_an_inserted_sort() {
+        let plan =
+            lower("SELECT id, rank() OVER (PARTITION BY a ORDER BY b) FROM t").expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(exprs[0], (col(0, "id"), "id".to_string()));
+        // `t` is 3 columns wide (id, a, b); the window's output column is
+        // appended right after it.
+        assert_eq!(exprs[1].0, col(3, "?column?"));
+
+        let LogicalPlan::Window { input, windows } = *input else {
+            panic!("expected Window directly under Project, got {input:?}");
+        };
+        assert_eq!(windows.len(), 1);
+        let Expr::Window {
+            func,
+            partition_by,
+            order_by,
+            ..
+        } = &windows[0]
+        else {
+            panic!("expected an Expr::Window, got {:?}", windows[0]);
+        };
+        assert_eq!(*func, crate::FuncId(Oid(3100)));
+        assert_eq!(*partition_by, vec![col(1, "a")]);
+        assert_eq!(order_by.len(), 1);
+        assert_eq!(order_by[0].expr, col(2, "b"));
+
+        // The operator never sorts its own input (`basin-exec/src/window.rs`),
+        // so the planner must insert one: PARTITION BY keys first, then
+        // ORDER BY keys, immediately beneath the Window node.
+        let LogicalPlan::Sort { input, keys } = *input else {
+            panic!("expected an inserted Sort directly under Window, got {input:?}");
+        };
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].expr, col(1, "a"));
+        assert_eq!(keys[1].expr, col(2, "b"));
+        assert!(matches!(*input, LogicalPlan::Scan { .. }));
+    }
+
+    #[test]
+    fn window_calls_with_differing_specs_get_their_own_stacked_window_nodes() {
+        // `window_keys` in `basin-exec/src/build.rs` rejects two window
+        // expressions with disagreeing PARTITION BY/ORDER BY inside one
+        // `LogicalPlan::Window` node, so calls with different specs must land
+        // in separate, stacked nodes rather than one shared node.
+        let plan = lower(
+            "SELECT rank() OVER (PARTITION BY a ORDER BY b), \
+                    rank() OVER (PARTITION BY b ORDER BY a) FROM t",
+        )
+        .expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(exprs[0].0, col(3, "?column?"));
+        assert_eq!(exprs[1].0, col(4, "?column?"));
+
+        let LogicalPlan::Window { input, windows } = *input else {
+            panic!("expected an outer Window node");
+        };
+        assert_eq!(windows.len(), 1, "differing specs must not share a node");
+        let LogicalPlan::Sort { input, keys } = *input else {
+            panic!("expected a Sort under the outer Window");
+        };
+        assert_eq!(keys[0].expr, col(2, "b"));
+        assert_eq!(keys[1].expr, col(1, "a"));
+
+        let LogicalPlan::Window { input, windows } = *input else {
+            panic!("expected an inner Window node");
+        };
+        assert_eq!(windows.len(), 1);
+        let LogicalPlan::Sort { input, keys } = *input else {
+            panic!("expected a Sort under the inner Window");
+        };
+        assert_eq!(keys[0].expr, col(1, "a"));
+        assert_eq!(keys[1].expr, col(2, "b"));
+        assert!(matches!(*input, LogicalPlan::Scan { .. }));
+    }
+
+    #[test]
+    fn window_over_grouped_rows_sits_above_the_aggregate_below_the_projection() {
+        let plan = lower("SELECT a, sum(id), rank() OVER (PARTITION BY a) FROM t GROUP BY a")
+            .expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project");
+        };
+        // group.len()==1, aggs.len()==1 -> the window's own column lands at 2.
+        assert_eq!(exprs[2].0, col(2, "?column?"));
+
+        let LogicalPlan::Window { input, .. } = *input else {
+            panic!("expected Window above the Aggregate");
+        };
+        let LogicalPlan::Sort { input, keys } = *input else {
+            panic!("expected the inserted Sort under Window");
+        };
+        // PARTITION BY a resolves against the Aggregate's OWN output (group
+        // key position 0), not the pre-aggregation scope's index 1 — window
+        // functions see the post-GROUP BY row set.
+        assert_eq!(keys[0].expr, col(0, "a"));
+        assert!(matches!(*input, LogicalPlan::Aggregate { .. }));
+    }
+
+    #[test]
+    fn a_window_function_in_having_is_rejected_with_a_precise_message() {
+        let err = lower("SELECT a, sum(id) FROM t GROUP BY a HAVING rank() OVER (ORDER BY a) > 1")
+            .unwrap_err();
         let LowerError::Unsupported(msg) = err else {
             panic!("expected Unsupported, got {err:?}");
         };
-        assert!(msg.to_lowercase().contains("with") || msg.to_lowercase().contains("cte"));
+        assert!(
+            msg.contains("HAVING"),
+            "message should mention HAVING: {msg}"
+        );
     }
 
     #[test]
-    fn a_window_function_is_unsupported() {
-        let err = lower("SELECT rank() OVER (ORDER BY a) FROM t").unwrap_err();
+    fn a_window_function_in_where_is_rejected_with_a_precise_message() {
+        let err = lower("SELECT id FROM t WHERE rank() OVER (ORDER BY a) > 1").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains("WHERE"), "message should mention WHERE: {msg}");
+    }
+
+    #[test]
+    fn a_named_window_clause_is_unsupported() {
+        let err = lower("SELECT rank() OVER w FROM t WINDOW w AS (ORDER BY a)").unwrap_err();
         assert!(matches!(err, LowerError::Unsupported(_)));
     }
+
+    // --- 11: WITH / CTE -> Cte / CteRef -------------------------------------
+
+    #[test]
+    fn a_cte_lowers_to_cte_wrapping_a_cteref() {
+        let plan = lower("WITH x AS (SELECT id, a FROM t) SELECT a FROM x").expect("lowers");
+        let LogicalPlan::Cte {
+            name,
+            recursive,
+            body,
+            input,
+        } = plan
+        else {
+            panic!("expected Cte at the top");
+        };
+        assert_eq!(name, CteId(0));
+        assert!(!recursive);
+        assert!(matches!(*body, LogicalPlan::Project { .. }));
+
+        let LogicalPlan::Project { input, exprs } = *input else {
+            panic!("expected the outer SELECT's own Project under Cte");
+        };
+        // x's exposed schema is (id, a); "a" is flat index 1.
+        assert_eq!(exprs[0].0, col(1, "a"));
+        let LogicalPlan::CteRef { name, schema } = *input else {
+            panic!("expected FROM x to resolve to a CteRef, got {input:?}");
+        };
+        assert_eq!(name, CteId(0));
+        assert_eq!(
+            schema,
+            vec![
+                ("id".to_string(), PgType::INT4),
+                ("a".to_string(), PgType::INT4),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cte_referenced_twice_resolves_to_the_same_cte_id() {
+        let plan = lower(
+            "WITH x AS (SELECT id, a FROM t) \
+             SELECT x1.a FROM x AS x1 JOIN x AS x2 ON x1.id = x2.id",
+        )
+        .expect("lowers");
+        let LogicalPlan::Cte { name, input, .. } = plan else {
+            panic!("expected Cte at the top");
+        };
+        assert_eq!(name, CteId(0));
+
+        let LogicalPlan::Project { input, .. } = *input else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Join { left, right, .. } = *input else {
+            panic!("expected Join");
+        };
+        let LogicalPlan::CteRef { name: left_id, .. } = *left else {
+            panic!("expected a CteRef on the join's left, got {left:?}");
+        };
+        let LogicalPlan::CteRef { name: right_id, .. } = *right else {
+            panic!("expected a CteRef on the join's right, got {right:?}");
+        };
+        assert_eq!(left_id, CteId(0));
+        assert_eq!(
+            right_id,
+            CteId(0),
+            "both references to `x` must resolve to the SAME CteId"
+        );
+    }
+
+    #[test]
+    fn a_recursive_cte_sets_the_recursive_flag() {
+        let plan = lower(
+            "WITH RECURSIVE x AS (\
+                SELECT 1 AS n \
+                UNION ALL \
+                SELECT n + 1 FROM x WHERE n < 5\
+             ) SELECT n FROM x",
+        )
+        .expect("lowers");
+        let LogicalPlan::Cte {
+            name,
+            recursive,
+            body,
+            ..
+        } = plan
+        else {
+            panic!("expected Cte at the top");
+        };
+        assert_eq!(name, CteId(0));
+        assert!(recursive, "WITH RECURSIVE must set the flag");
+
+        let LogicalPlan::SetOp {
+            left,
+            right,
+            op,
+            all,
+        } = *body
+        else {
+            panic!("expected the recursive body to be a UNION of anchor and recursive term");
+        };
+        assert_eq!(op, SetOpKind::Union);
+        assert!(all);
+        assert!(matches!(*left, LogicalPlan::Project { .. }), "anchor");
+
+        let LogicalPlan::Project { input, .. } = *right else {
+            panic!("expected a Project for the recursive term");
+        };
+        let LogicalPlan::Filter { input, .. } = *input else {
+            panic!("expected the recursive term's WHERE n < 5");
+        };
+        let LogicalPlan::CteRef { name: ref_id, .. } = *input else {
+            panic!("expected the recursive term's FROM x to resolve to a CteRef");
+        };
+        assert_eq!(
+            ref_id,
+            CteId(0),
+            "the recursive term must reference the SAME id as the Cte it's nested inside"
+        );
+    }
+
+    #[test]
+    fn a_ctes_own_column_alias_list_is_unsupported() {
+        let err = lower("WITH x(n) AS (SELECT 1) SELECT n FROM x").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(
+            msg.to_lowercase().contains("column"),
+            "message should be precise: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_data_modifying_cte_is_unsupported() {
+        let err = lower("WITH x AS (INSERT INTO t (id) VALUES (1) RETURNING id) SELECT id FROM x")
+            .unwrap_err();
+        assert!(matches!(err, LowerError::Unsupported(_)));
+    }
+
+    // --- Unsupported constructs ------------------------------------------------
 
     #[test]
     fn distinct_on_is_unsupported_with_a_precise_message() {

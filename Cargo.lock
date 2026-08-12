@@ -1460,7 +1460,12 @@ version = "0.1.10"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "basin-catalog",
+ "basin-common",
  "basin-pgtype",
+ "object_store",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
