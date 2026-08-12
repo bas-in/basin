@@ -1,0 +1,532 @@
+//! Turning a [`LogicalPlan`] into a tree of [`Operator`]s.
+//!
+//! This is the join between the two halves of the owned engine. Everything up
+//! to here produces or consumes plans; everything below here moves batches.
+//! Without it the operators are a pile of correct components that cannot run a
+//! query, which is exactly what they were until this module existed.
+//!
+//! # What a table is, here
+//!
+//! The builder does not know about object storage, Vortex or Parquet. It asks a
+//! [`TableResolver`] for a [`BatchSource`] and gets batches back. That keeps
+//! `basin-exec` free of a storage dependency, lets an entire plan be executed
+//! against in-memory tables in a unit test, and means the real storage layer
+//! plugs in by implementing one trait rather than by editing this file.
+//!
+//! # What is not built yet
+//!
+//! [`LogicalPlan`] has more variants than there are operators. Anything without
+//! one returns [`BuildError::Unsupported`] naming the construct. That is a
+//! deliberate, visible gap rather than a silent fallback — a planner that
+//! quietly does something else when it meets an unimplemented node produces
+//! wrong answers instead of errors.
+
+use std::collections::HashMap;
+
+use basin_plan::{Expr, LogicalPlan, SortKey as PlanSortKey, TableId};
+
+use crate::aggregate::{AggFunc, AggregateSpec, HashAggregate};
+use crate::join::HashJoin;
+use crate::operator::{ExecError, Operator};
+use crate::project::{Filter, Project};
+use crate::scan::{BatchSource, Scan};
+use crate::sort::{Sort, SortKey, TopK};
+
+/// Why a plan could not be turned into operators.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BuildError {
+    /// A plan shape with no operator behind it yet.
+    Unsupported(String),
+    /// A table the resolver does not know.
+    UnknownTable(TableId),
+    /// A sort or group key that is not a plain column reference. Physical
+    /// operators key on column positions, so anything else has to be
+    /// materialised by a `Project` below them first — a job for the optimizer,
+    /// not for this builder to improvise.
+    NonColumnKey(&'static str),
+    /// Building the operator itself failed.
+    Exec(ExecError),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::Unsupported(what) => write!(f, "not yet executable: {what}"),
+            BuildError::UnknownTable(t) => write!(f, "unknown table {t:?}"),
+            BuildError::NonColumnKey(w) => {
+                write!(f, "{w} key must be a column reference at this stage")
+            }
+            BuildError::Exec(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {}
+
+impl From<ExecError> for BuildError {
+    fn from(e: ExecError) -> Self {
+        BuildError::Exec(e)
+    }
+}
+
+/// Supplies the batches behind a table.
+///
+/// One method, so the storage layer implements exactly this and nothing else.
+pub trait TableResolver {
+    fn open(&self, table: TableId) -> Option<Box<dyn BatchSource>>;
+}
+
+/// A resolver backed by in-memory sources, for tests and for executing against
+/// literal relations.
+#[derive(Default)]
+pub struct MemTableResolver {
+    tables: HashMap<u32, Vec<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>)>>,
+}
+
+impl MemTableResolver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(
+        &mut self,
+        table: TableId,
+        schema: arrow_schema::SchemaRef,
+        batches: Vec<arrow_array::RecordBatch>,
+    ) {
+        self.tables.insert(table.0, vec![(schema, batches)]);
+    }
+}
+
+impl TableResolver for MemTableResolver {
+    fn open(&self, table: TableId) -> Option<Box<dyn BatchSource>> {
+        let (schema, batches) = self.tables.get(&table.0)?.first()?;
+        Some(Box::new(crate::scan::VecBatchSource::new(
+            schema.clone(),
+            batches.clone(),
+        )))
+    }
+}
+
+/// Default memory budget for a buffering operator, in bytes.
+///
+/// Deliberately a constant here rather than a policy: the real budget is a
+/// per-query slice of the bounded pool that already exists in the engine, and
+/// wiring that through is a separate increment. Picking a number and hiding it
+/// would be worse than picking one and saying so.
+pub const DEFAULT_OPERATOR_BUDGET: usize = 256 * 1024 * 1024;
+
+/// Build an operator tree for `plan`.
+pub fn build(
+    plan: &LogicalPlan,
+    tables: &dyn TableResolver,
+) -> Result<Box<dyn Operator>, BuildError> {
+    build_with_budget(plan, tables, DEFAULT_OPERATOR_BUDGET)
+}
+
+/// Build an operator tree with an explicit memory budget for buffering
+/// operators.
+pub fn build_with_budget(
+    plan: &LogicalPlan,
+    tables: &dyn TableResolver,
+    budget: usize,
+) -> Result<Box<dyn Operator>, BuildError> {
+    match plan {
+        LogicalPlan::Scan {
+            table,
+            projection,
+            filters,
+            ..
+        } => {
+            let source = tables
+                .open(*table)
+                .ok_or(BuildError::UnknownTable(*table))?;
+            let cols: Vec<usize> = projection.iter().map(|c| c.0 as usize).collect();
+            Ok(Box::new(Scan::new(source, cols, filters.clone())?))
+        }
+
+        LogicalPlan::Filter { input, predicate } => {
+            let child = build_with_budget(input, tables, budget)?;
+            Ok(Box::new(Filter::new(child, predicate.clone())))
+        }
+
+        LogicalPlan::Project { input, exprs } => {
+            let child = build_with_budget(input, tables, budget)?;
+            Ok(Box::new(Project::new(child, exprs.clone())?))
+        }
+
+        // `Limit` with a fetch and a sorted input is the top-K shape. Basin's
+        // published ORDER BY … LIMIT numbers depend on early termination, so
+        // recognising it here rather than sorting everything and truncating is
+        // load-bearing, not a micro-optimisation.
+        LogicalPlan::Limit {
+            input,
+            skip,
+            fetch,
+            with_ties,
+        } => {
+            if *with_ties {
+                return Err(BuildError::Unsupported("FETCH … WITH TIES".into()));
+            }
+            if skip.is_some() {
+                return Err(BuildError::Unsupported("OFFSET".into()));
+            }
+            let k = match fetch {
+                Some(e) => const_usize(e)
+                    .ok_or_else(|| BuildError::Unsupported("non-constant LIMIT".into()))?,
+                None => return build_with_budget(input, tables, budget),
+            };
+            if let LogicalPlan::Sort { input: si, keys } = input.as_ref() {
+                let child = build_with_budget(si, tables, budget)?;
+                Ok(Box::new(TopK::new(child, sort_keys(keys)?, k)))
+            } else {
+                Err(BuildError::Unsupported("LIMIT without ORDER BY".into()))
+            }
+        }
+
+        LogicalPlan::Sort { input, keys } => {
+            let child = build_with_budget(input, tables, budget)?;
+            Ok(Box::new(Sort::new(child, sort_keys(keys)?, budget)))
+        }
+
+        LogicalPlan::Aggregate {
+            input,
+            group,
+            aggs,
+            grouping_sets,
+        } => {
+            if grouping_sets.is_some() {
+                return Err(BuildError::Unsupported(
+                    "GROUPING SETS / ROLLUP / CUBE".into(),
+                ));
+            }
+            let child = build_with_budget(input, tables, budget)?;
+            let group_cols = group
+                .iter()
+                .map(|e| column_index(e).ok_or(BuildError::NonColumnKey("GROUP BY")))
+                .collect::<Result<Vec<_>, _>>()?;
+            let specs = aggs
+                .iter()
+                .enumerate()
+                .map(|(i, a)| agg_spec(a, &format!("agg{i}")))
+                .collect::<Result<Vec<_>, BuildError>>()?;
+            Ok(Box::new(HashAggregate::new(
+                child, group_cols, specs, budget,
+            )?))
+        }
+
+        LogicalPlan::Join {
+            left,
+            right,
+            kind,
+            on,
+            filter,
+        } => {
+            if filter.is_some() {
+                return Err(BuildError::Unsupported("non-equi join condition".into()));
+            }
+            let l = build_with_budget(left, tables, budget)?;
+            let r = build_with_budget(right, tables, budget)?;
+            let mut lk = Vec::with_capacity(on.len());
+            let mut rk = Vec::with_capacity(on.len());
+            for (a, b) in on {
+                lk.push(column_index(a).ok_or(BuildError::NonColumnKey("join"))?);
+                rk.push(column_index(b).ok_or(BuildError::NonColumnKey("join"))?);
+            }
+            Ok(Box::new(HashJoin::new(l, r, *kind, lk, rk, budget)))
+        }
+
+        other => Err(BuildError::Unsupported(plan_kind(other).to_string())),
+    }
+}
+
+/// A short, stable name for a plan variant, for error messages.
+fn plan_kind(plan: &LogicalPlan) -> &'static str {
+    match plan {
+        LogicalPlan::Scan { .. } => "Scan",
+        LogicalPlan::Values { .. } => "VALUES",
+        LogicalPlan::Empty { .. } => "empty relation",
+        LogicalPlan::Project { .. } => "Project",
+        LogicalPlan::Filter { .. } => "Filter",
+        LogicalPlan::Aggregate { .. } => "Aggregate",
+        LogicalPlan::Sort { .. } => "Sort",
+        LogicalPlan::Limit { .. } => "Limit",
+        LogicalPlan::Join { .. } => "Join",
+        LogicalPlan::LateralJoin { .. } => "LATERAL join",
+        LogicalPlan::SetOp { .. } => "UNION / INTERSECT / EXCEPT",
+        LogicalPlan::Distinct { .. } => "DISTINCT",
+        LogicalPlan::Window { .. } => "window function",
+        LogicalPlan::ProjectSet { .. } => "set-returning function",
+        LogicalPlan::Cte { .. } => "CTE",
+        LogicalPlan::CteRef { .. } => "CTE reference",
+        LogicalPlan::Insert { .. } => "INSERT",
+        LogicalPlan::Update { .. } => "UPDATE",
+        LogicalPlan::Delete { .. } => "DELETE",
+    }
+}
+
+/// The column position an expression refers to, if it is a plain column.
+fn column_index(e: &Expr) -> Option<usize> {
+    match e {
+        Expr::Column(c) => Some(c.index as usize),
+        _ => None,
+    }
+}
+
+/// A constant non-negative integer, for `LIMIT`.
+fn const_usize(e: &Expr) -> Option<usize> {
+    match e {
+        Expr::Literal(basin_plan::Datum::Int64(v), _) if *v >= 0 => Some(*v as usize),
+        Expr::Literal(basin_plan::Datum::Int32(v), _) if *v >= 0 => Some(*v as usize),
+        _ => None,
+    }
+}
+
+fn sort_keys(keys: &[PlanSortKey]) -> Result<Vec<SortKey>, BuildError> {
+    keys.iter()
+        .map(|k| {
+            Ok(SortKey {
+                column: column_index(&k.expr).ok_or(BuildError::NonColumnKey("ORDER BY"))?,
+                descending: k.descending,
+                nulls_first: k.nulls_first,
+            })
+        })
+        .collect()
+}
+
+/// Map a Postgres aggregate function OID to the physical accumulator.
+///
+/// These are real `pg_proc` OIDs, read from a live PostgreSQL 18 rather than
+/// invented — `count(*)` is 2803, and each of sum/min/max/avg has a distinct
+/// OID per input type because Postgres resolves aggregates by signature. The
+/// physical layer only cares which accumulator to run, so many OIDs collapse to
+/// one variant here; the type-specific behaviour lives in the accumulator.
+fn agg_func_of(oid: u32) -> Option<AggFunc> {
+    Some(match oid {
+        2803 => AggFunc::CountStar,
+        2107 | 2108 | 2111 | 2114 => AggFunc::Sum,
+        2115 | 2116 | 2120 | 2130 => AggFunc::Max,
+        2131 | 2132 | 2136 | 2146 => AggFunc::Min,
+        2100 | 2101 | 2103 | 2105 => AggFunc::Avg,
+        _ => return None,
+    })
+}
+
+/// Translate a logical aggregate into the physical operator's spec.
+///
+/// The physical aggregate keys on column positions rather than expressions —
+/// an argument more complex than a column reference has to be materialised by a
+/// `Project` beneath the aggregate. That is the optimizer's job, so an
+/// unexpected shape is reported rather than improvised around.
+fn agg_spec(e: &Expr, alias: &str) -> Result<AggregateSpec, BuildError> {
+    match e {
+        Expr::Aggregate {
+            func,
+            args,
+            distinct,
+            filter,
+            order_by,
+        } => {
+            if !order_by.is_empty() {
+                return Err(BuildError::Unsupported(
+                    "ORDER BY inside an aggregate".into(),
+                ));
+            }
+            let mut f = agg_func_of(func.0.get()).ok_or_else(|| {
+                BuildError::Unsupported(format!("aggregate function with OID {}", func.0.get()))
+            })?;
+            let input_col = match args.first() {
+                None => None,
+                Some(a) => {
+                    // `count(x)` counts non-null values; `count(*)` counts
+                    // rows. They share no OID, but a Count with an argument
+                    // must not be run as CountStar or nulls would be counted.
+                    if f == AggFunc::CountStar {
+                        f = AggFunc::Count;
+                    }
+                    Some(column_index(a).ok_or(BuildError::NonColumnKey("aggregate"))?)
+                }
+            };
+            let filter_col = match filter {
+                None => None,
+                Some(x) => {
+                    Some(column_index(x).ok_or(BuildError::NonColumnKey("aggregate FILTER"))?)
+                }
+            };
+            Ok(AggregateSpec {
+                func: f,
+                input_col,
+                distinct: *distinct,
+                filter_col,
+                alias: alias.to_string(),
+            })
+        }
+        _ => Err(BuildError::Unsupported(
+            "non-aggregate expression in an aggregate list".into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use basin_pgtype::PgType;
+    use basin_plan::{ColId, ColumnRef, Datum, SnapshotId};
+    use std::sync::Arc;
+
+    fn table() -> (Arc<Schema>, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("v", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40])),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    fn resolver() -> MemTableResolver {
+        let (schema, batch) = table();
+        let mut r = MemTableResolver::new();
+        r.insert(TableId(1), schema, vec![batch]);
+        r
+    }
+
+    fn col(i: u16, name: &str) -> Expr {
+        Expr::Column(ColumnRef {
+            relation: 0,
+            index: i,
+            name: name.into(),
+        })
+    }
+
+    fn scan_plan(projection: Vec<ColId>, filters: Vec<Expr>) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: TableId(1),
+            projection,
+            filters,
+            snapshot: SnapshotId(0),
+        }
+    }
+
+    fn drain(mut op: Box<dyn Operator>) -> Vec<RecordBatch> {
+        let mut out = Vec::new();
+        while let Some(b) = op.next_batch().unwrap() {
+            out.push(b);
+        }
+        out
+    }
+
+    /// The whole point of this module: a plan becomes operators and produces
+    /// rows. Before this existed, every operator was individually correct and
+    /// no query could run.
+    #[test]
+    fn a_scan_plan_executes_end_to_end() {
+        let batches =
+            drain(build(&scan_plan(vec![ColId(0), ColId(1)], vec![]), &resolver()).unwrap());
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 4);
+        assert_eq!(batches[0].num_columns(), 2);
+    }
+
+    /// Filter over scan — the predicate reaches the evaluator through the
+    /// operator tree, which is the seam this module exists to close.
+    #[test]
+    fn filter_over_scan_executes_and_reduces_rows() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+            // id > 2 — OID 521 is int4 '>', verified against pg_operator.
+            predicate: Expr::Binary {
+                op: basin_plan::OpId(basin_pgtype::Oid(521)),
+                lhs: Box::new(col(0, "id")),
+                rhs: Box::new(Expr::Literal(Datum::Int32(2), PgType::INT4)),
+            },
+        };
+        let rows: usize = drain(build(&plan, &resolver()).unwrap())
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 2, "ids 3 and 4 survive `id > 2`");
+    }
+
+    /// `ORDER BY … LIMIT` must become TopK, not a full Sort followed by a
+    /// truncation. Basin's published numbers for this shape depend on early
+    /// termination, so the recognition is load-bearing.
+    #[test]
+    fn order_by_limit_becomes_top_k() {
+        let plan = LogicalPlan::Limit {
+            input: Box::new(LogicalPlan::Sort {
+                input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+                keys: vec![PlanSortKey {
+                    expr: col(0, "id"),
+                    descending: true,
+                    nulls_first: false,
+                }],
+            }),
+            skip: None,
+            fetch: Some(Expr::Literal(Datum::Int64(2), PgType::INT8)),
+            with_ties: false,
+        };
+        let rows: usize = drain(build(&plan, &resolver()).unwrap())
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 2);
+    }
+
+    /// An unimplemented plan shape must say so by name rather than silently
+    /// doing something else. A builder that guesses produces wrong answers
+    /// instead of errors.
+    #[test]
+    fn an_unbuildable_plan_names_the_construct() {
+        let plan = LogicalPlan::Distinct {
+            input: Box::new(scan_plan(vec![ColId(0)], vec![])),
+            on: None,
+        };
+        let err = match build(&plan, &resolver()) {
+            Err(e) => e,
+            Ok(_) => panic!("DISTINCT has no operator yet and must not build"),
+        };
+        assert_eq!(err, BuildError::Unsupported("DISTINCT".into()));
+    }
+
+    #[test]
+    fn an_unknown_table_is_reported_not_papered_over() {
+        let plan = LogicalPlan::Scan {
+            table: TableId(999),
+            projection: vec![ColId(0)],
+            filters: vec![],
+            snapshot: SnapshotId(0),
+        };
+        let err = match build(&plan, &resolver()) {
+            Err(e) => e,
+            Ok(_) => panic!("an unknown table must not build"),
+        };
+        assert_eq!(err, BuildError::UnknownTable(TableId(999)));
+    }
+
+    /// `WITH TIES` currently degrades to `ONLY` in the DataFusion path
+    /// (select_advanced.rs:455), silently returning fewer rows than Postgres.
+    /// The owned builder refuses instead — an error beats a wrong row count.
+    #[test]
+    fn with_ties_is_refused_rather_than_silently_degraded() {
+        let plan = LogicalPlan::Limit {
+            input: Box::new(scan_plan(vec![ColId(0)], vec![])),
+            skip: None,
+            fetch: Some(Expr::Literal(Datum::Int64(1), PgType::INT8)),
+            with_ties: true,
+        };
+        let err = match build(&plan, &resolver()) {
+            Err(e) => e,
+            Ok(_) => panic!("WITH TIES must be refused, not silently degraded"),
+        };
+        assert!(matches!(err, BuildError::Unsupported(ref s) if s.contains("WITH TIES")));
+    }
+}

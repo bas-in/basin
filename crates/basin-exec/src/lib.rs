@@ -30,6 +30,7 @@
 //! deferred; see `docs/migration/df-removal/08-ir-design.md` §7.
 
 pub mod aggregate;
+pub mod build;
 pub mod eval;
 pub mod join;
 pub mod operator;
