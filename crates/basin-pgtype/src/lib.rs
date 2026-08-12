@@ -249,6 +249,85 @@ pub fn physical(ty: PgType) -> Result<DataType, PhysicalError> {
     })
 }
 
+/// Map an Arrow physical [`DataType`] back to the [`PgType`] that produces
+/// it — the reverse of [`physical`].
+///
+/// # This is necessarily lossy — read before calling
+///
+/// [`physical`] is many-to-one by design (its own doc comment says so):
+/// `text`, `varchar(n)`, `bpchar(n)`, `name`, `"char"` and `xml` all collapse
+/// to [`DataType::Utf8`], and both `json` and `varlena`-style opaque bytes
+/// collapse to [`DataType::Binary`] alongside `jsonb`. Going backwards from a
+/// bare `DataType` cannot recover which of those the value actually was —
+/// that information lived in the [`PgType`] that produced it and is gone by
+/// the time only a `DataType` remains.
+///
+/// This function therefore returns one **canonical** choice per physical
+/// shape — `Utf8` always maps back to [`PgType::TEXT`], `Binary` always maps
+/// back to [`PgType::BYTEA`] — not "the" original type, because there isn't
+/// one to recover. A caller that has catalog knowledge of what a column was
+/// actually declared as (from a `Field`'s metadata, a planner-tracked
+/// `PgType`, or `pg_attribute`) **must** prefer that over this function; this
+/// exists for the case — chiefly, the wire protocol needing *some*
+/// `RowDescription` type oid for a column whose only remaining information is
+/// its Arrow type — where no better source is available.
+///
+/// `typmod` is always [`typmod::UNSPECIFIED`] on the result: a bare
+/// `DataType` carries no length/precision-and-scale beyond what `numeric`'s
+/// own `Decimal128(p, s)` already encodes (which this function does thread
+/// through — see below), so there is nothing to decode a `varchar(n)` or
+/// `bpchar(n)` typmod from.
+///
+/// Arrays recurse through their element type and re-wrap with
+/// [`oid::array_of`]; an element type this function cannot map, or one with
+/// no builtin array OID, makes the whole array `None` rather than guessing.
+/// Anything [`physical`] never produces (`FixedSizeList`, `Struct`,
+/// `Decimal256`, ...) is also `None`.
+pub fn logical_type(dt: &DataType) -> Option<PgType> {
+    Some(match dt {
+        DataType::Boolean => PgType::BOOL,
+        DataType::Int16 => PgType::INT2,
+        DataType::Int32 => PgType::INT4,
+        DataType::Int64 => PgType::INT8,
+        // The inverse of `physical`'s `oid::OID => DataType::UInt32` arm.
+        DataType::UInt32 => PgType::new(oid::OID),
+        DataType::Float32 => PgType::FLOAT4,
+        DataType::Float64 => PgType::FLOAT8,
+
+        // Canonical choice among text/varchar/bpchar/name/char/xml — see the
+        // doc comment above.
+        DataType::Utf8 => PgType::TEXT,
+        // Canonical choice among bytea/jsonb — see the doc comment above.
+        // (`json`, unlike `jsonb`, is `DataType::Utf8` in `physical` and so
+        // is already covered by the `Utf8` arm, not this one.)
+        DataType::Binary => PgType::BYTEA,
+
+        DataType::FixedSizeBinary(16) => PgType::UUID,
+
+        DataType::Date32 => PgType::DATE,
+        DataType::Time64(TimeUnit::Microsecond) => PgType::new(oid::TIME),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => PgType::TIMESTAMP,
+        // Any timezone-bearing timestamp maps back to timestamptz — the zone
+        // string itself is display, not data, exactly as `physical`'s own doc
+        // comment notes for the forward direction.
+        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => PgType::TIMESTAMPTZ,
+        DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano) => PgType::new(oid::INTERVAL),
+
+        // Decimal128 threads its precision/scale through as a real typmod —
+        // unlike every other arm, this one is not lossy, because `physical`
+        // itself is the one thing here with no plainer alternative to fall
+        // back to.
+        DataType::Decimal128(p, s) => PgType::numeric(*p as i32, *s as i32),
+
+        DataType::List(field) => {
+            let elem = logical_type(field.data_type())?;
+            PgType::new(oid::array_of(elem.oid)?)
+        }
+
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +432,120 @@ mod tests {
         // The planner passes these by value. If someone adds a String or an
         // Arc, this catches it.
         assert_eq!(std::mem::size_of::<PgType>(), 8);
+    }
+
+    /// The straightforward scalar cases round-trip through `physical` and
+    /// back to the type that produced them — no collapsing happens for types
+    /// `physical` maps one-to-one.
+    #[test]
+    fn scalar_types_round_trip_through_physical_and_logical_type() {
+        for t in [
+            PgType::BOOL,
+            PgType::INT2,
+            PgType::INT4,
+            PgType::INT8,
+            PgType::FLOAT4,
+            PgType::FLOAT8,
+            PgType::DATE,
+            PgType::TIMESTAMP,
+            PgType::UUID,
+        ] {
+            let dt = physical(t).unwrap();
+            assert_eq!(
+                logical_type(&dt),
+                Some(t),
+                "{t:?} -> {dt:?} did not round trip"
+            );
+        }
+    }
+
+    /// `oid` is `UInt32` at the physical layer specifically so a high OID
+    /// does not read back negative — `logical_type` must reverse that arm
+    /// too, not just the signed integer widths.
+    #[test]
+    fn oid_round_trips_through_uint32() {
+        let ty = PgType::new(oid::OID);
+        assert_eq!(physical(ty).unwrap(), DataType::UInt32);
+        assert_eq!(logical_type(&DataType::UInt32), Some(ty));
+    }
+
+    /// `Utf8` is genuinely ambiguous — `text`, `varchar(n)`, `bpchar(n)` and
+    /// `name` all produce it (see `string_types_share_one_physical_form...`
+    /// above). `logical_type` must resolve this to the documented canonical
+    /// choice (`text`) rather than, say, whichever of those happened to be
+    /// tried last, and must NOT claim to recover `varchar`/`name` — a caller
+    /// that assumed it could would silently mis-describe a `name` column
+    /// (e.g. in `pg_catalog`) as plain `text`.
+    #[test]
+    fn utf8_maps_back_to_the_canonical_text_not_varchar_or_name() {
+        assert_eq!(logical_type(&DataType::Utf8), Some(PgType::TEXT));
+        // Losing the varchar length is the documented, accepted lossiness —
+        // pin it explicitly so a future "fix" isn't attempted by surprise.
+        assert_ne!(logical_type(&DataType::Utf8), Some(PgType::varchar(10)));
+    }
+
+    /// `Binary` is the same ambiguity as `Utf8`, between `bytea` and `jsonb`
+    /// — the canonical choice is `bytea`, and a caller must not assume
+    /// `logical_type` can recover that a `Binary` column was actually
+    /// `jsonb`.
+    #[test]
+    fn binary_maps_back_to_the_canonical_bytea_not_jsonb() {
+        assert_eq!(physical(PgType::JSONB).unwrap(), DataType::Binary);
+        assert_eq!(logical_type(&DataType::Binary), Some(PgType::BYTEA));
+        assert_ne!(logical_type(&DataType::Binary), Some(PgType::JSONB));
+    }
+
+    /// `timestamptz`'s physical zone is always rendered as `"UTC"` by
+    /// `physical` (the zone is display, not data — see its doc comment), but
+    /// `logical_type` must recognize ANY zone-bearing `Timestamp` as
+    /// `timestamptz`, not only the exact `"UTC"` string, since the zone is
+    /// not what makes it a timestamptz.
+    #[test]
+    fn any_timezone_bearing_timestamp_is_timestamptz() {
+        assert_eq!(
+            logical_type(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("+05:00".into())
+            )),
+            Some(PgType::TIMESTAMPTZ)
+        );
+        assert_eq!(
+            logical_type(&DataType::Timestamp(TimeUnit::Microsecond, None)),
+            Some(PgType::TIMESTAMP)
+        );
+    }
+
+    /// `numeric(p, s)` is the one case that is NOT lossy — `Decimal128`
+    /// carries its own precision and scale, so the round trip through
+    /// `logical_type` must recover the exact `numeric(p, s)`, typmod
+    /// included, not just "some numeric".
+    #[test]
+    fn decimal128_round_trips_precision_and_scale_exactly() {
+        let ty = PgType::numeric(12, 3);
+        let dt = physical(ty).unwrap();
+        assert_eq!(dt, DataType::Decimal128(12, 3));
+        assert_eq!(logical_type(&dt), Some(ty));
+    }
+
+    /// Arrays recurse through the element type and re-wrap with
+    /// `oid::array_of`, so `int4[]` round-trips to `int4[]`, not to a bare
+    /// `int4` or to `None`.
+    #[test]
+    fn arrays_round_trip_through_their_element_type() {
+        let ty = PgType::new(oid::INT4_ARRAY);
+        let dt = physical(ty).unwrap();
+        assert_eq!(logical_type(&dt), Some(ty));
+    }
+
+    /// A physical shape `physical` never produces (`Decimal256`, `Struct`,
+    /// ...) has no logical type to report — `None`, not a guess.
+    #[test]
+    fn unrepresentable_physical_types_return_none() {
+        assert_eq!(logical_type(&DataType::Decimal256(20, 2)), None);
+        assert_eq!(
+            logical_type(&DataType::FixedSizeBinary(4)),
+            None,
+            "only 16-byte FixedSizeBinary (uuid) is a known logical type"
+        );
     }
 }

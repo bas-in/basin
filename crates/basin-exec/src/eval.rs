@@ -1953,4 +1953,426 @@ mod tests {
         };
         assert!(matches!(eval(&expr, &batch), Err(ExecError::Internal(_))));
     }
+
+    // ─── NOT ─────────────────────────────────────────────────────────────
+    //
+    // `NOT` has no `pg_operator` row (it is `BoolExpr`, not `OpExpr` — see the
+    // module docs), so it is reached through the local `NOT_OP` sentinel in
+    // `eval_unary` rather than `catalog_op_name`.
+
+    #[test]
+    fn not_negates_true_and_false() {
+        let batch = batch_bool2(
+            vec![Some(true), Some(false)],
+            vec![Some(false), Some(false)],
+        );
+        let expr = Expr::Unary {
+            op: NOT_OP,
+            arg: Box::new(col(0, "a")),
+        };
+        let result = eval(&expr, &batch).unwrap();
+        let arr = bool_array(&result);
+        assert!(!(arr.value(0)), "NOT TRUE must be FALSE");
+        assert!(arr.value(1), "NOT FALSE must be TRUE");
+    }
+
+    /// `boolean::not` copies the null buffer across rather than manufacturing
+    /// a value — `NOT NULL` must stay NULL, not become TRUE (the wrong answer
+    /// a naive `!value` over the unmasked bit could produce).
+    #[test]
+    fn not_of_null_is_null() {
+        let batch = batch_bool2(vec![None], vec![Some(true)]);
+        let expr = Expr::Unary {
+            op: NOT_OP,
+            arg: Box::new(col(0, "a")),
+        };
+        let result = eval(&expr, &batch).unwrap();
+        let arr = bool_array(&result);
+        assert!(arr.is_null(0), "NOT NULL must be NULL, not TRUE or FALSE");
+    }
+
+    // ─── Scalar functions: dispatch, and the fallback signal ──────────────
+
+    #[test]
+    fn scalar_fn_of_an_unknown_oid_is_internal_so_the_bridge_can_fall_back() {
+        let expr = sf(999_999, vec![lit_text("x")]);
+        let err = eval(&expr, &one_row()).unwrap_err();
+        assert!(
+            matches!(err, ExecError::Internal(_)),
+            "an unrecognized function oid must be Internal, not a panic or a wrong \
+             value, so the bridge above this crate can fall back to DataFusion instead \
+             of guessing"
+        );
+    }
+
+    /// Requirement 4: a scalar function applied to a NULL argument returns
+    /// NULL — pinned on `lower`, representative of every function in
+    /// [`eval_scalar_fn`] except `concat`, whose whole point (requirement 3)
+    /// is that it is the one exception.
+    #[test]
+    fn scalar_function_of_null_returns_null() {
+        let expr = sf(OID_LOWER, vec![lit_text_null()]);
+        let result = eval(&expr, &one_row()).unwrap();
+        let arr = str_array(&result);
+        assert!(
+            arr.is_null(0),
+            "lower(NULL) must be NULL — a scalar function that special-cased NULL \
+             into a value (e.g. an empty string) would be wrong for every function \
+             here except concat"
+        );
+    }
+
+    // ─── lower / upper ──────────────────────────────────────────────────
+
+    #[test]
+    fn lower_and_upper_change_case() {
+        let lower = eval(&sf(OID_LOWER, vec![lit_text("HeLLo")]), &one_row()).unwrap();
+        assert_eq!(str_array(&lower).value(0), "hello");
+        let upper = eval(&sf(OID_UPPER, vec![lit_text("HeLLo")]), &one_row()).unwrap();
+        assert_eq!(str_array(&upper).value(0), "HELLO");
+    }
+
+    /// `text_unary` (shared by `lower`/`upper`/the one-argument trims) must
+    /// operate row-by-row over a real multi-row column, not just a
+    /// single-literal broadcast — and a NULL row must stay NULL rather than
+    /// becoming, say, an empty string.
+    #[test]
+    fn lower_operates_row_by_row_over_a_column_and_preserves_nulls() {
+        let batch = batch_str1("s", vec![Some("AB"), None, Some("Cd")]);
+        let result = eval(&sf(OID_LOWER, vec![col(0, "s")]), &batch).unwrap();
+        let arr = str_array(&result);
+        assert_eq!(arr.value(0), "ab");
+        assert!(arr.is_null(1), "a NULL row must stay NULL, not become \"\"");
+        assert_eq!(arr.value(2), "cd");
+    }
+
+    // ─── length: requirement 2 ──────────────────────────────────────────
+
+    /// Requirement 2: `length(text)` counts characters, not bytes.
+    /// `'héllo'` is 6 bytes (`é` is a 2-byte UTF-8 sequence) but 5 characters
+    /// — verified live against PostgreSQL 18 (`length('héllo') = 5`,
+    /// `octet_length('héllo') = 6`). Using arrow's own byte-length `length`
+    /// kernel here would have wrongly reported 6.
+    #[test]
+    fn length_counts_characters_not_bytes() {
+        let expr = sf(OID_LENGTH_TEXT, vec![lit_text("héllo")]);
+        let result = eval(&expr, &one_row()).unwrap();
+        assert_eq!(
+            i32_array(&result).value(0),
+            5,
+            "length('héllo') must be 5 (characters); 6 would be the byte count \
+             ('é' is 2 bytes in UTF-8), the wrong answer arrow's byte-length \
+             kernel would give"
+        );
+    }
+
+    // ─── substr: requirement 1 ──────────────────────────────────────────
+
+    /// Requirement 1: `substr`'s `start` is 1-based, and a `start` below 1
+    /// clamps rather than erroring. Verified live against PostgreSQL 18:
+    /// `substr('hello', -3, 5) = 'h'` — NOT an error, and NOT `'hello'`
+    /// (which is what treating a negative start as "count from the end,
+    /// clamped to 0" would wrongly produce).
+    #[test]
+    fn substr_clamps_a_too_low_start_instead_of_erroring() {
+        let expr = sf(
+            OID_SUBSTR_3,
+            vec![lit_text("hello"), lit_i32(-3), lit_i32(5)],
+        );
+        let result = eval(&expr, &one_row()).unwrap();
+        assert_eq!(
+            str_array(&result).value(0),
+            "h",
+            "substr('hello', -3, 5) must clamp to 'h', not error and not return \
+             'hello'"
+        );
+    }
+
+    /// The two-argument form (`substr(text, start)`, no explicit length)
+    /// clamps the same way and reads to the end of the string. Verified live:
+    /// `substr('hello', 2) = 'ello'`.
+    #[test]
+    fn substr_two_arg_form_reads_to_the_end() {
+        let expr = sf(OID_SUBSTR_2, vec![lit_text("hello"), lit_i32(2)]);
+        let result = eval(&expr, &one_row()).unwrap();
+        assert_eq!(str_array(&result).value(0), "ello");
+    }
+
+    /// `start = 0` is also below 1 and clamps the same way. Verified live:
+    /// `substr('hello', 0, 3) = 'he'` — the characters "before" position 1
+    /// still count against `length`, they are just not part of the output.
+    #[test]
+    fn substr_zero_start_clamps_and_still_consumes_length() {
+        let expr = sf(
+            OID_SUBSTR_3,
+            vec![lit_text("hello"), lit_i32(0), lit_i32(3)],
+        );
+        let result = eval(&expr, &one_row()).unwrap();
+        assert_eq!(str_array(&result).value(0), "he");
+    }
+
+    #[test]
+    fn substr_negative_length_is_a_hard_error() {
+        let expr = sf(
+            OID_SUBSTR_3,
+            vec![lit_text("hello"), lit_i32(1), lit_i32(-1)],
+        );
+        let err = eval(&expr, &one_row()).unwrap_err();
+        assert!(
+            matches!(err, ExecError::TypeMismatch(_)),
+            "a negative length must error (unlike a too-low start, which clamps), \
+             got {err:?}"
+        );
+    }
+
+    // ─── abs ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn abs_negates_negative_integers() {
+        let expr = sf(OID_ABS_INT4, vec![lit_i32(-5)]);
+        let result = eval(&expr, &one_row()).unwrap();
+        assert_eq!(i32_array(&result).value(0), 5);
+    }
+
+    /// `abs(i32::MIN)` has no representable positive counterpart in `i32` —
+    /// this must error (`ExecError::Overflow`), not silently wrap back to
+    /// `i32::MIN` the way an unchecked `.wrapping_abs()` would.
+    #[test]
+    fn abs_int_min_overflows_rather_than_wrapping() {
+        let expr = sf(OID_ABS_INT4, vec![lit_i32(i32::MIN)]);
+        let err = eval(&expr, &one_row()).unwrap_err();
+        assert!(matches!(err, ExecError::Overflow(_)));
+    }
+
+    #[test]
+    fn abs_float_handles_negative_values() {
+        let batch = batch_f64(vec![Some(-3.5)]);
+        let expr = sf(OID_ABS_FLOAT8, vec![col(0, "x")]);
+        let result = eval(&expr, &batch).unwrap();
+        assert_eq!(
+            result
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            3.5
+        );
+    }
+
+    #[test]
+    fn abs_numeric_preserves_precision_and_scale() {
+        let batch = decimal_batch("x", vec![Some(-550)], 10, 2); // -5.50
+        let expr = sf(OID_ABS_NUMERIC, vec![col(0, "x")]);
+        let result = eval(&expr, &batch).unwrap();
+        let arr = decimal_array(&result);
+        assert_eq!(arr.value(0), 550);
+        assert_eq!((arr.precision(), arr.scale()), (10, 2));
+    }
+
+    // ─── round: requirement 5 ───────────────────────────────────────────
+
+    /// Requirement 5: `round(numeric)` rounds half away from zero. Verified
+    /// live against PostgreSQL 18: `round(2.5::numeric) = 3`,
+    /// `round(-2.5::numeric) = -3`. This is the OPPOSITE tie-breaking
+    /// direction from `round(double precision)`, which rounds half to even
+    /// (`round(2.5::float8) = 2`) — conflating the two is the exact mistake
+    /// requirement 5 exists to catch.
+    #[test]
+    fn round_numeric_rounds_half_away_from_zero() {
+        let positive = decimal_batch("x", vec![Some(25)], 3, 1); // 2.5
+        let result = eval(&sf(OID_ROUND_NUMERIC, vec![col(0, "x")]), &positive).unwrap();
+        assert_eq!(
+            decimal_array(&result).value(0),
+            30, // 3.0 at scale 1
+            "round(2.5::numeric) must be 3, not 2 (round-half-to-even would give 2)"
+        );
+
+        let negative = decimal_batch("x", vec![Some(-25)], 3, 1); // -2.5
+        let result = eval(&sf(OID_ROUND_NUMERIC, vec![col(0, "x")]), &negative).unwrap();
+        assert_eq!(
+            decimal_array(&result).value(0),
+            -30, // -3.0 at scale 1
+            "round(-2.5::numeric) must be -3, away from zero in the negative direction too"
+        );
+    }
+
+    /// The float8 contrast requirement 5 warns against conflating with the
+    /// numeric case above: `round(double precision)` rounds half to even.
+    /// Verified live: `round(2.5::float8) = 2`, `round(-2.5::float8) = -2`.
+    #[test]
+    fn round_float8_rounds_half_to_even_unlike_numeric() {
+        let batch = batch_f64(vec![Some(2.5), Some(-2.5), Some(0.5)]);
+        let result = eval(&sf(OID_ROUND_FLOAT8, vec![col(0, "x")]), &batch).unwrap();
+        let arr = result.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(
+            arr.value(0),
+            2.0,
+            "round(2.5::float8) must be 2 (half to even)"
+        );
+        assert_eq!(arr.value(1), -2.0, "round(-2.5::float8) must be -2");
+        assert_eq!(arr.value(2), 0.0, "round(0.5::float8) must be 0");
+    }
+
+    #[test]
+    fn round_numeric_with_explicit_ndigits() {
+        let batch = decimal_batch("x", vec![Some(12345)], 6, 3); // 12.345
+        let ndigits = batch_i32("n", vec![Some(1)]);
+        let combined_schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Decimal128(6, 3), true),
+            Field::new("n", DataType::Int32, true),
+        ]));
+        let combined = RecordBatch::try_new(
+            combined_schema,
+            vec![batch.column(0).clone(), ndigits.column(0).clone()],
+        )
+        .unwrap();
+        let expr = sf(OID_ROUND_NUMERIC_N, vec![col(0, "x"), col(1, "n")]);
+        let result = eval(&expr, &combined).unwrap();
+        assert_eq!(decimal_array(&result).value(0), 12300); // 12.300 at scale 3
+    }
+
+    // ─── ceil / floor ───────────────────────────────────────────────────
+
+    /// Verified live against PostgreSQL 18: `ceil(-4.1::numeric) = -4`.
+    #[test]
+    fn ceil_numeric_rounds_toward_positive_infinity() {
+        let batch = decimal_batch("x", vec![Some(-41)], 3, 1); // -4.1
+        let result = eval(&sf(OID_CEIL_NUMERIC, vec![col(0, "x")]), &batch).unwrap();
+        assert_eq!(decimal_array(&result).value(0), -40); // -4.0
+    }
+
+    /// Verified live against PostgreSQL 18: `floor(-4.1::numeric) = -5`.
+    #[test]
+    fn floor_numeric_rounds_toward_negative_infinity() {
+        let batch = decimal_batch("x", vec![Some(-41)], 3, 1); // -4.1
+        let result = eval(&sf(OID_FLOOR_NUMERIC, vec![col(0, "x")]), &batch).unwrap();
+        assert_eq!(decimal_array(&result).value(0), -50); // -5.0
+    }
+
+    #[test]
+    fn ceil_and_floor_float8() {
+        let batch = batch_f64(vec![Some(4.1)]);
+        let c = eval(&sf(OID_CEIL_FLOAT8, vec![col(0, "x")]), &batch).unwrap();
+        let f = eval(&sf(OID_FLOOR_FLOAT8, vec![col(0, "x")]), &batch).unwrap();
+        assert_eq!(
+            c.as_any().downcast_ref::<Float64Array>().unwrap().value(0),
+            5.0
+        );
+        assert_eq!(
+            f.as_any().downcast_ref::<Float64Array>().unwrap().value(0),
+            4.0
+        );
+    }
+
+    // ─── concat: requirement 3 ──────────────────────────────────────────
+
+    /// Requirement 3: `concat` IGNORES NULL arguments — unlike `||`, which
+    /// is an ordinary strict operator and yields NULL if either side is
+    /// NULL. Verified live against PostgreSQL 18: `concat('a', NULL, 'b') =
+    /// 'ab'`, while `('a' || NULL || 'b') IS NULL` is true. Easy to
+    /// conflate; this test pins `concat`'s side specifically.
+    #[test]
+    fn concat_skips_null_arguments_instead_of_propagating() {
+        let expr = sf(
+            OID_CONCAT,
+            vec![lit_text("a"), lit_text_null(), lit_text("b")],
+        );
+        let result = eval(&expr, &one_row()).unwrap();
+        let arr = str_array(&result);
+        assert!(!arr.is_null(0), "concat must never itself return NULL");
+        assert_eq!(
+            arr.value(0),
+            "ab",
+            "concat('a', NULL, 'b') must skip the NULL and produce 'ab' — \
+             propagating it (the way '||' does) would be the wrong answer here"
+        );
+    }
+
+    /// `concat(NULL, NULL)` is `''`, not NULL — pinned separately from the
+    /// mixed case above because "skips nulls" and "never returns null even if
+    /// EVERY argument is null" are two different claims.
+    #[test]
+    fn concat_of_all_null_arguments_is_empty_string_not_null() {
+        let expr = sf(OID_CONCAT, vec![lit_text_null(), lit_text_null()]);
+        let result = eval(&expr, &one_row()).unwrap();
+        let arr = str_array(&result);
+        assert!(!arr.is_null(0));
+        assert_eq!(arr.value(0), "");
+    }
+
+    // ─── trim / ltrim / rtrim ───────────────────────────────────────────
+
+    /// The one-argument trim forms strip only the ASCII space character, not
+    /// every Unicode whitespace character Rust's `str::trim()` would strip.
+    /// Verified live against PostgreSQL 18: `btrim(E'\t hi \t')` comes back
+    /// completely UNCHANGED — the outermost characters are tabs, not spaces,
+    /// so there is nothing to trim from either end even though there are
+    /// spaces just inside them. `str::trim()` would have eaten the tabs (and
+    /// then the spaces behind them), which is exactly the wrong answer this
+    /// pins against.
+    #[test]
+    fn btrim_one_arg_strips_only_ascii_space_not_tabs() {
+        let expr = sf(OID_BTRIM_1, vec![lit_text("\t hi \t")]);
+        let result = eval(&expr, &one_row()).unwrap();
+        assert_eq!(
+            str_array(&result).value(0),
+            "\t hi \t",
+            "btrim's default set is exactly ' ' — since the outermost characters \
+             are tabs, not spaces, nothing at all should be trimmed"
+        );
+    }
+
+    #[test]
+    fn ltrim_and_rtrim_one_arg_strip_only_their_own_side() {
+        let l = eval(&sf(OID_LTRIM_1, vec![lit_text("  hi  ")]), &one_row()).unwrap();
+        assert_eq!(str_array(&l).value(0), "hi  ");
+        let r = eval(&sf(OID_RTRIM_1, vec![lit_text("  hi  ")]), &one_row()).unwrap();
+        assert_eq!(str_array(&r).value(0), "  hi");
+    }
+
+    /// The two-argument forms trim any character present in the second
+    /// argument, treated as a character set, not as a literal substring to
+    /// strip once from each end.
+    #[test]
+    fn btrim_two_arg_strips_any_character_in_the_given_set() {
+        let expr = sf(OID_BTRIM_2, vec![lit_text("xxhixx"), lit_text("x")]);
+        let result = eval(&expr, &one_row()).unwrap();
+        assert_eq!(str_array(&result).value(0), "hi");
+    }
+
+    // ─── replace ────────────────────────────────────────────────────────
+
+    #[test]
+    fn replace_substitutes_every_occurrence() {
+        let expr = sf(
+            OID_REPLACE,
+            vec![lit_text("ababab"), lit_text("ab"), lit_text("X")],
+        );
+        let result = eval(&expr, &one_row()).unwrap();
+        assert_eq!(str_array(&result).value(0), "XXX");
+    }
+
+    // ─── strpos ─────────────────────────────────────────────────────────
+
+    /// Verified live against PostgreSQL 18: `strpos('héllo', 'llo') = 3` —
+    /// the 2-byte `é` still counts as one character, so a byte-offset answer
+    /// (which would be 4) is the wrong answer this test rules out.
+    #[test]
+    fn strpos_is_a_character_position_not_a_byte_offset() {
+        let expr = sf(OID_STRPOS, vec![lit_text("héllo"), lit_text("llo")]);
+        let result = eval(&expr, &one_row()).unwrap();
+        assert_eq!(
+            i32_array(&result).value(0),
+            3,
+            "strpos must count characters ('é' is one character, not the two \
+             bytes it takes in UTF-8)"
+        );
+    }
+
+    #[test]
+    fn strpos_of_a_non_match_is_zero() {
+        let expr = sf(OID_STRPOS, vec![lit_text("hello"), lit_text("xyz")]);
+        let result = eval(&expr, &one_row()).unwrap();
+        assert_eq!(i32_array(&result).value(0), 0);
+    }
 }
