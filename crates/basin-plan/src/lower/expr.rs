@@ -254,7 +254,7 @@ fn operator_name(name_nodes: &[Node]) -> Result<String, LowerError> {
 /// resolves as `unknown` and the `OperatorResolver` must cope with that, the
 /// same way Postgres's own operator resolution copes with an `unknown`-typed
 /// operand (deferring to the other side, or to a default).
-fn best_effort_type(e: &Expr) -> PgType {
+pub(crate) fn best_effort_type(e: &Expr) -> PgType {
     match e {
         Expr::Literal(_, ty) | Expr::Parameter { ty, .. } => *ty,
         Expr::Cast { to, .. } => *to,
@@ -1110,7 +1110,7 @@ fn lower_frame(
 /// and window `ORDER BY`). Resolves Postgres's direction-dependent default
 /// null placement (`NULLS LAST` for `ASC`, `NULLS FIRST` for `DESC`) so the
 /// result is always explicit.
-fn lower_sort_by(node: &Node, ctx: &LowerCtx) -> Result<SortKey, LowerError> {
+pub(crate) fn lower_sort_by(node: &Node, ctx: &LowerCtx) -> Result<SortKey, LowerError> {
     use pg_query::protobuf::{SortByDir, SortByNulls};
 
     let Some(NodeEnum::SortBy(sb)) = node.node.as_ref() else {
