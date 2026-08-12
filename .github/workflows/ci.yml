@@ -135,6 +135,60 @@ jobs:
       # free CI — and clippy above still compiles them.
       - run: cargo test --workspace --exclude basin-integration-tests --no-fail-fast --locked
 
+  # ── 2b. Does Basin still answer like Postgres ──────────────────────────────
+  #
+  # `differential_pg` runs ~79 queries against BOTH Basin and a live PostgreSQL
+  # and compares the results cell by cell. It is the only oracle in the repo
+  # that can catch a wrong answer rather than a slow one, and until now it has
+  # never run in CI: the job above excludes `basin-integration-tests` wholesale,
+  # so nothing set `PG_DIFF_TEST_DSN` and every differential test returned early
+  # and reported green.
+  #
+  # This job runs that ONE test binary rather than the package, which sidesteps
+  # the link-time OOM that motivated the exclusion — that is 383 binaries each
+  # linking a near-full workspace, not one.
+  #
+  # It matters most for ADR 0030: the owned query engine is being written to
+  # replace DataFusion, and semantic drift is the highest-severity risk in that
+  # migration. This is the instrument that detects it.
+  conformance:
+    name: conformance · differential vs Postgres
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-conformance"
+
+      - name: Start Postgres
+        run: |
+          sudo systemctl start postgresql.service
+          sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD 'postgres';"
+          sudo -u postgres psql -c "CREATE DATABASE basin_diff OWNER postgres;"
+          echo "PG_DIFF_TEST_DSN=postgres://postgres:postgres@127.0.0.1:5432/basin_diff" >> $GITHUB_ENV
+
+      # FAIL CLOSED. Every differential test returns early — and passes — when
+      # the DSN is unset or unreachable, so a broken Postgres would produce a
+      # green check that compared nothing. `check-test-executes.sh` cannot catch
+      # this one: the tests do execute and do report `ok`, they just assert
+      # nothing. So connectivity is asserted here, before the run, where an
+      # unreachable server is a job failure rather than a silent skip.
+      - name: Postgres is actually reachable
+        run: |
+          set -euo pipefail
+          psql "$PG_DIFF_TEST_DSN" -tAc "select 1" > /dev/null
+          echo "oracle reachable: $(psql "$PG_DIFF_TEST_DSN" -tAc 'select version()')"
+
+      # --release because the differential suite seeds and queries real tables;
+      # a debug build spends the timeout compiling and scanning rather than
+      # comparing.
+      - name: Differential vs Postgres
+        run: |
+          bash scripts/check-test-executes.sh "ADR 0030 differential oracle" -- \
+            -p basin-integration-tests --test differential_pg --release --locked
+
   # ── 3. Do the docs hold together ───────────────────────────────────────────
   docs:
     name: docs · gate scripts
