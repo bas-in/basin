@@ -30,6 +30,7 @@
 //! engine, deliberately built as a leaf so it can be written and tested
 //! without touching the running query path.
 
+pub mod cast;
 pub mod oid;
 pub mod typmod;
 
