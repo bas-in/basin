@@ -346,6 +346,64 @@ impl TableResolver for StorageTableResolver {
     }
 }
 
+/// Translate a planner predicate into a `basin-storage` one, if it is a shape
+/// storage can prune on.
+///
+/// Deliberately narrow. `basin_storage::Predicate` covers equality, ordered
+/// comparison, anchored prefix and integer membership — the shapes that map
+/// onto file statistics, zone maps and bloom filters. Anything else returns
+/// `None` and the scan evaluates it Arrow-side, which is always correct and
+/// only costs I/O.
+///
+/// Column names come from `schema`, because a `ColumnRef` carries an index into
+/// the table and storage predicates are keyed by name.
+///
+/// The operator OIDs are Postgres's own, read from `pg_operator` on a live
+/// server rather than remembered: 96/410/416 are `=` for int4/int8/int8-int4,
+/// 521/413 are `>`, 97/412 are `<`. Getting one wrong here would push the
+/// wrong predicate into storage and silently return wrong rows, so they are
+/// spelled out rather than computed.
+fn expr_to_predicate(
+    e: &basin_plan::Expr,
+    schema: &arrow_schema::Schema,
+) -> Option<basin_storage::Predicate> {
+    use basin_plan::{Datum, Expr};
+    use basin_storage::{Predicate, ScalarValue};
+
+    let Expr::Binary { op, lhs, rhs } = e else {
+        return None;
+    };
+    // Only `column OP literal`. The commuted form would need each operator's
+    // negation, which is a table this does not have yet.
+    let Expr::Column(c) = lhs.as_ref() else {
+        return None;
+    };
+    let Expr::Literal(d, _) = rhs.as_ref() else {
+        return None;
+    };
+    let name = schema.fields().get(c.index as usize)?.name().clone();
+
+    let scalar = match d {
+        Datum::Int16(v) => ScalarValue::Int64(*v as i64),
+        Datum::Int32(v) => ScalarValue::Int64(*v as i64),
+        Datum::Int64(v) => ScalarValue::Int64(*v),
+        Datum::Float32(v) => ScalarValue::Float64(*v as f64),
+        Datum::Float64(v) => ScalarValue::Float64(*v),
+        Datum::Utf8(v) => ScalarValue::Utf8(v.clone()),
+        Datum::Bool(v) => ScalarValue::Boolean(*v),
+        // NULL never compares true in SQL, and a storage predicate has no way
+        // to say so — leave it for the Arrow-side evaluator.
+        Datum::Null | Datum::Bytes(_) => return None,
+    };
+
+    match op.0.get() {
+        96 | 410 | 416 | 15 | 532 | 533 => Some(Predicate::Eq(name, scalar)),
+        521 | 413 | 419 | 762 | 1756 => Some(Predicate::Gt(name, scalar)),
+        97 | 412 | 418 | 761 | 1754 => Some(Predicate::Lt(name, scalar)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,63 +910,5 @@ mod tests {
             calls, 3,
             "three files means three next_batch calls to drain them"
         );
-    }
-}
-
-/// Translate a planner predicate into a `basin-storage` one, if it is a shape
-/// storage can prune on.
-///
-/// Deliberately narrow. `basin_storage::Predicate` covers equality, ordered
-/// comparison, anchored prefix and integer membership — the shapes that map
-/// onto file statistics, zone maps and bloom filters. Anything else returns
-/// `None` and the scan evaluates it Arrow-side, which is always correct and
-/// only costs I/O.
-///
-/// Column names come from `schema`, because a `ColumnRef` carries an index into
-/// the table and storage predicates are keyed by name.
-///
-/// The operator OIDs are Postgres's own, read from `pg_operator` on a live
-/// server rather than remembered: 96/410/416 are `=` for int4/int8/int8-int4,
-/// 521/413 are `>`, 97/412 are `<`. Getting one wrong here would push the
-/// wrong predicate into storage and silently return wrong rows, so they are
-/// spelled out rather than computed.
-fn expr_to_predicate(
-    e: &basin_plan::Expr,
-    schema: &arrow_schema::Schema,
-) -> Option<basin_storage::Predicate> {
-    use basin_plan::{Datum, Expr};
-    use basin_storage::{Predicate, ScalarValue};
-
-    let Expr::Binary { op, lhs, rhs } = e else {
-        return None;
-    };
-    // Only `column OP literal`. The commuted form would need each operator's
-    // negation, which is a table this does not have yet.
-    let Expr::Column(c) = lhs.as_ref() else {
-        return None;
-    };
-    let Expr::Literal(d, _) = rhs.as_ref() else {
-        return None;
-    };
-    let name = schema.fields().get(c.index as usize)?.name().clone();
-
-    let scalar = match d {
-        Datum::Int16(v) => ScalarValue::Int64(*v as i64),
-        Datum::Int32(v) => ScalarValue::Int64(*v as i64),
-        Datum::Int64(v) => ScalarValue::Int64(*v),
-        Datum::Float32(v) => ScalarValue::Float64(*v as f64),
-        Datum::Float64(v) => ScalarValue::Float64(*v),
-        Datum::Utf8(v) => ScalarValue::Utf8(v.clone()),
-        Datum::Bool(v) => ScalarValue::Boolean(*v),
-        // NULL never compares true in SQL, and a storage predicate has no way
-        // to say so — leave it for the Arrow-side evaluator.
-        Datum::Null | Datum::Bytes(_) => return None,
-    };
-
-    match op.0.get() {
-        96 | 410 | 416 | 15 | 532 | 533 => Some(Predicate::Eq(name, scalar)),
-        521 | 413 | 419 | 762 | 1756 => Some(Predicate::Gt(name, scalar)),
-        97 | 412 | 418 | 761 | 1754 => Some(Predicate::Lt(name, scalar)),
-        _ => None,
     }
 }
