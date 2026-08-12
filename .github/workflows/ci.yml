@@ -184,10 +184,12 @@ jobs:
       # --release because the differential suite seeds and queries real tables;
       # a debug build spends the timeout compiling and scanning rather than
       # comparing.
+      # Gates REGRESSIONS, not perfection. Basin diverges from Postgres on a
+      # known set of shapes recorded in tests/integration/differential-baseline.txt;
+      # a new divergence fails the build, and so does a baseline entry that has
+      # started passing, because a baseline nobody prunes becomes an excuse list.
       - name: Differential vs Postgres
-        run: |
-          bash scripts/check-test-executes.sh "ADR 0030 differential oracle" -- \
-            -p basin-integration-tests --test differential_pg --release --locked
+        run: bash scripts/check-differential.sh
 
   # ── 3. Do the docs hold together ───────────────────────────────────────────
   docs:

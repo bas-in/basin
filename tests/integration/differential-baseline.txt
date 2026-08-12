@@ -1,0 +1,47 @@
+# Known divergences from PostgreSQL, as measured by tests/integration/tests/differential_pg.rs
+# against a live server. Checked by scripts/check-differential.sh in the CI `conformance` job.
+#
+# EVERY LINE HERE IS A BUG, not an accepted behaviour. Basin aims for Postgres
+# compatibility; each entry is a query shape where it currently answers
+# differently. The file exists so the gate can catch REGRESSIONS while these are
+# burned down — not to make them permanent.
+#
+# THE LIST MUST ONLY EVER SHRINK. The gate fails if an entry starts passing,
+# because a baseline nobody prunes rots into an excuse list. Fixing a divergence
+# and removing its line are one change, not two.
+#
+# Lines beginning with `!` are KNOWN-FLAKY: they pass or fail depending on run
+# order, so they are excluded from both directions of the check. Prefer fixing
+# or #[ignore]-ing them over leaving them declared here.
+#
+# Baseline captured 2026-08-12 after the column-naming fix (7131b8b5), which
+# took the count from 41 to 28. Root-cause breakdown: docs/migration/df-removal/16-differential-baseline.md
+diff_advisory_blocking_lock_uncontended
+diff_advisory_xact_lock_releases_on_commit
+diff_agg_filter_plain
+diff_array_containment_operators
+diff_cast_int8_to_int4_overflow
+diff_cast_matrix_basic
+diff_cross_schema_qualified_insert
+diff_cross_schema_update_only_target_schema
+diff_drop_schema_with_tables_restrict_errors
+diff_error_division_by_zero
+diff_error_not_null_violation
+diff_jsonb_array_elements_literal_srf
+diff_jsonb_arrow_op
+diff_jsonb_double_arrow_op
+diff_jsonb_each_srf
+diff_jsonb_path_op
+diff_lateral_basic
+diff_lateral_generate_series
+diff_lateral_left_join
+diff_sanity_select_null
+diff_schema_isolation_multi_schema
+diff_serial_nextval_currval
+diff_serial_setval
+diff_str_format_and_position
+diff_txn_rollback
+diff_type_date_interval_arithmetic
+diff_type_text_to_int_implicit_cast_errors
+diff_window_percentile_disc
+!diff_advisory_two_int4_form  # advisory locks are session-scoped; fails or passes with test order
