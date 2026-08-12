@@ -79,13 +79,13 @@ use std::sync::Arc;
 
 use arrow::compute::kernels::{boolean, cast, cmp, comparison, numeric, zip};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, new_null_array,
+    new_null_array, Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow_schema::{ArrowError, DataType};
 
+use basin_pgtype::{physical, Oid, PgType};
 use basin_plan::{BoolTest, ColumnRef, Datum as PlanDatum, Expr, OpId};
-use basin_pgtype::{Oid, PgType, physical};
 
 use crate::ExecError;
 
@@ -121,16 +121,8 @@ pub fn eval(expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef, ExecError> {
             let a = require_bool(&a)?;
             Ok(Arc::new(eval_bool_test(a, *test)))
         }
-        Expr::DistinctFrom {
-            lhs,
-            rhs,
-            negated,
-        } => eval_distinct_from(lhs, rhs, *negated, batch),
-        Expr::InList {
-            arg,
-            list,
-            negated,
-        } => eval_in_list(arg, list, *negated, batch),
+        Expr::DistinctFrom { lhs, rhs, negated } => eval_distinct_from(lhs, rhs, *negated, batch),
+        Expr::InList { arg, list, negated } => eval_in_list(arg, list, *negated, batch),
         Expr::Between {
             arg,
             low,
@@ -559,7 +551,8 @@ fn eval_between(
     let ge_low = cmp::gt_eq(&x, &low_v).map_err(|e| map_arrow(e, "BETWEEN"))?;
     let le_high = cmp::lt_eq(&x, &high_v).map_err(|e| map_arrow(e, "BETWEEN"))?;
     let base = if symmetric {
-        let ascending = boolean::and_kleene(&ge_low, &le_high).map_err(|e| map_arrow(e, "BETWEEN"))?;
+        let ascending =
+            boolean::and_kleene(&ge_low, &le_high).map_err(|e| map_arrow(e, "BETWEEN"))?;
         let ge_high = cmp::gt_eq(&x, &high_v).map_err(|e| map_arrow(e, "BETWEEN"))?;
         let le_low = cmp::lt_eq(&x, &low_v).map_err(|e| map_arrow(e, "BETWEEN"))?;
         let descending =
@@ -623,12 +616,15 @@ fn catalog_op_name(op: OpId) -> Option<&'static str> {
 }
 
 fn require_bool(array: &ArrayRef) -> Result<&BooleanArray, ExecError> {
-    array.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
-        ExecError::TypeMismatch(format!(
-            "expected a boolean array, found {:?}",
-            array.data_type()
-        ))
-    })
+    array
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| {
+            ExecError::TypeMismatch(format!(
+                "expected a boolean array, found {:?}",
+                array.data_type()
+            ))
+        })
 }
 
 /// Translate an arrow kernel failure into an [`ExecError`]. `op` names the
@@ -651,7 +647,6 @@ mod tests {
     use super::*;
     use arrow_array::{Array, Int32Array, Int64Array as I64, RecordBatch};
     use arrow_schema::{Field, Schema};
-    use basin_pgtype::oid;
     use basin_plan::{ColumnRef, Datum, FuncId, SubqueryKind};
 
     fn batch_i32(name: &str, values: Vec<Option<i32>>) -> RecordBatch {
@@ -666,7 +661,10 @@ mod tests {
         ]));
         RecordBatch::try_new(
             schema,
-            vec![Arc::new(BooleanArray::from(a)), Arc::new(BooleanArray::from(b))],
+            vec![
+                Arc::new(BooleanArray::from(a)),
+                Arc::new(BooleanArray::from(b)),
+            ],
         )
         .unwrap()
     }
@@ -753,11 +751,9 @@ mod tests {
     #[test]
     fn float_division_by_zero_errors_rather_than_returning_infinity() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, true)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Float64Array::from(vec![Some(1.0)]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![Some(1.0)]))])
+                .unwrap();
         let expr = Expr::Binary {
             op: op(593), // float8 /
             lhs: Box::new(col(0, "x")),
@@ -782,9 +778,8 @@ mod tests {
         };
         let result = eval(&expr, &batch).unwrap();
         let arr = bool_array(&result);
-        assert_eq!(
-            arr.value(0),
-            false,
+        assert!(
+            !(arr.value(0)),
             "NULL AND FALSE must be FALSE — the plain (non-Kleene) `and` kernel \
              would have produced NULL here"
         );
@@ -801,9 +796,8 @@ mod tests {
         };
         let result = eval(&expr, &batch).unwrap();
         let arr = bool_array(&result);
-        assert_eq!(
+        assert!(
             arr.value(0),
-            true,
             "NULL OR TRUE must be TRUE — the plain `or` kernel would have produced NULL"
         );
         assert!(!arr.is_null(0));
@@ -824,9 +818,8 @@ mod tests {
             !arr.is_null(0),
             "IS DISTINCT FROM must never itself return NULL"
         );
-        assert_eq!(
-            arr.value(0),
-            false,
+        assert!(
+            !(arr.value(0)),
             "NULL IS DISTINCT FROM NULL must be FALSE — plain `<>` would have \
              produced NULL instead"
         );
@@ -843,11 +836,7 @@ mod tests {
         let result = eval(&expr, &batch).unwrap();
         let arr = bool_array(&result);
         assert!(!arr.is_null(0));
-        assert_eq!(
-            arr.value(0),
-            true,
-            "NULL IS DISTINCT FROM 1 must be TRUE"
-        );
+        assert!(arr.value(0), "NULL IS DISTINCT FROM 1 must be TRUE");
     }
 
     // ── 5. BoolTest on NULL ──────────────────────────────────────────────
@@ -861,9 +850,8 @@ mod tests {
         let result = eval(&expr, &batch).unwrap();
         let arr = bool_array(&result);
         assert!(!arr.is_null(0), "IS NOT TRUE never itself returns NULL");
-        assert_eq!(
+        assert!(
             arr.value(0),
-            true,
             "NULL IS NOT TRUE must be TRUE — confusing this with `<> TRUE` (which \
              is NULL) is the classic mistake here"
         );
@@ -879,7 +867,7 @@ mod tests {
         let result = eval(&expr, &batch).unwrap();
         let arr = bool_array(&result);
         assert!(!arr.is_null(0));
-        assert_eq!(arr.value(0), false, "NULL IS TRUE must be FALSE, not NULL");
+        assert!(!(arr.value(0)), "NULL IS TRUE must be FALSE, not NULL");
     }
 
     // ── 6. IN with a NULL in the list ────────────────────────────────────
@@ -915,7 +903,7 @@ mod tests {
         let result = eval(&expr, &batch).unwrap();
         let arr = bool_array(&result);
         assert!(!arr.is_null(0));
-        assert_eq!(arr.value(0), true, "1 IN (1, NULL) must be TRUE");
+        assert!(arr.value(0), "1 IN (1, NULL) must be TRUE");
     }
 
     // ── Supporting coverage for the rest of the required surface ────────
@@ -956,10 +944,7 @@ mod tests {
         let batch = batch_i32("x", vec![Some(0)]);
         let expr = Expr::Case {
             operand: None,
-            whens: vec![(
-                Expr::Literal(Datum::Null, PgType::BOOL),
-                lit_i32(1),
-            )],
+            whens: vec![(Expr::Literal(Datum::Null, PgType::BOOL), lit_i32(1))],
             else_: Some(Box::new(lit_i32(2))),
         };
         let result = eval(&expr, &batch).unwrap();
@@ -971,10 +956,7 @@ mod tests {
         let batch = batch_i32("x", vec![Some(2)]);
         let expr = Expr::Case {
             operand: Some(Box::new(col(0, "x"))),
-            whens: vec![
-                (lit_i32(1), lit_i32(100)),
-                (lit_i32(2), lit_i32(200)),
-            ],
+            whens: vec![(lit_i32(1), lit_i32(100)), (lit_i32(2), lit_i32(200))],
             else_: Some(Box::new(lit_i32(0))),
         };
         let result = eval(&expr, &batch).unwrap();
@@ -1001,9 +983,9 @@ mod tests {
         };
         let result = eval(&expr, &batch).unwrap();
         let arr = bool_array(&result);
-        assert_eq!(arr.value(0), true, "lower bound is inclusive");
-        assert_eq!(arr.value(1), true, "upper bound is inclusive");
-        assert_eq!(arr.value(2), false);
+        assert!(arr.value(0), "lower bound is inclusive");
+        assert!(arr.value(1), "upper bound is inclusive");
+        assert!(!(arr.value(2)));
     }
 
     #[test]
@@ -1017,9 +999,8 @@ mod tests {
             negated: false,
         };
         let result = eval(&expr, &batch).unwrap();
-        assert_eq!(
+        assert!(
             bool_array(&result).value(0),
-            true,
             "BETWEEN SYMMETRIC must try both orderings of the bounds"
         );
     }
@@ -1045,8 +1026,8 @@ mod tests {
         };
         let result = eval(&expr, &batch).unwrap();
         let arr = bool_array(&result);
-        assert_eq!(arr.value(0), true);
-        assert_eq!(arr.value(1), false);
+        assert!(arr.value(0));
+        assert!(!(arr.value(1)));
     }
 
     #[test]
@@ -1071,10 +1052,7 @@ mod tests {
             case_insensitive: false,
             negated: false,
         };
-        assert!(matches!(
-            eval(&expr, &batch),
-            Err(ExecError::Internal(_))
-        ));
+        assert!(matches!(eval(&expr, &batch), Err(ExecError::Internal(_))));
     }
 
     #[test]
@@ -1089,8 +1067,8 @@ mod tests {
         )
         .unwrap();
         let arr = bool_array(&is_null);
-        assert_eq!(arr.value(0), true);
-        assert_eq!(arr.value(1), false);
+        assert!(arr.value(0));
+        assert!(!(arr.value(1)));
         assert_eq!(arr.null_count(), 0);
     }
 
@@ -1169,9 +1147,6 @@ mod tests {
             lhs: Box::new(col(0, "x")),
             rhs: Box::new(lit_i32(1)),
         };
-        assert!(matches!(
-            eval(&expr, &batch),
-            Err(ExecError::Internal(_))
-        ));
+        assert!(matches!(eval(&expr, &batch), Err(ExecError::Internal(_))));
     }
 }

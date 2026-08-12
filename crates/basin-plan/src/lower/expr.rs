@@ -1006,4 +1006,267 @@ mod tests {
             "message should name the construct: {msg}"
         );
     }
+
+    // --- CaseExpr / CoalesceExpr ------------------------------------------------
+
+    #[test]
+    fn searched_case_lowers_whens_and_else() {
+        let node = parse_expr("CASE WHEN a IS NULL THEN id ELSE b END");
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&node, &ctx(&c, &o)).expect("lower failed");
+        let Expr::Case {
+            operand,
+            whens,
+            else_,
+        } = e
+        else {
+            panic!("expected Case");
+        };
+        assert!(operand.is_none(), "searched CASE has no operand");
+        assert_eq!(whens.len(), 1);
+        assert!(matches!(whens[0].0, Expr::IsNull { .. }));
+        assert_eq!(
+            whens[0].1,
+            Expr::Column(ColumnRef {
+                relation: 0,
+                index: 0,
+                name: "id".into()
+            })
+        );
+        assert!(else_.is_some());
+    }
+
+    #[test]
+    fn simple_case_keeps_operand_separate_from_when_values() {
+        let node = parse_expr("CASE a WHEN 1 THEN id END");
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&node, &ctx(&c, &o)).expect("lower failed");
+        let Expr::Case {
+            operand, whens, ..
+        } = e
+        else {
+            panic!("expected Case");
+        };
+        assert_eq!(
+            *operand.expect("simple CASE has an operand"),
+            Expr::Column(ColumnRef {
+                relation: 0,
+                index: 1,
+                name: "a".into()
+            })
+        );
+        // The WHEN value is the raw literal `1`, not an already-expanded
+        // `a = 1` equality — expansion is deferred past this file.
+        assert_eq!(whens[0].0, Expr::Literal(Datum::Int32(1), PgType::INT4));
+    }
+
+    #[test]
+    fn coalesce_lowers_every_argument() {
+        let node = parse_expr("COALESCE(a, b, id)");
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&node, &ctx(&c, &o)).expect("lower failed");
+        let Expr::Coalesce(args) = e else {
+            panic!("expected Coalesce");
+        };
+        assert_eq!(args.len(), 3);
+    }
+
+    // --- IN / NOT IN -------------------------------------------------------------
+
+    #[test]
+    fn in_list_lowers_with_negated_false() {
+        let node = where_expr("a IN (1, 2, 3)");
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&node, &ctx(&c, &o)).expect("lower failed");
+        let Expr::InList { list, negated, .. } = e else {
+            panic!("expected InList");
+        };
+        assert!(!negated);
+        assert_eq!(list.len(), 3);
+    }
+
+    /// The test the task calls out explicitly: `x NOT IN (...)` and
+    /// `NOT (x IN (...))` must lower to different shapes, because Postgres
+    /// itself gives them different parse trees (`AEXPR_IN` with operator
+    /// name `"<>"` vs. a `BoolExpr` wrapping `AEXPR_IN` with `"="`), and
+    /// collapsing them would be exactly the kind of fidelity bug this
+    /// lowering pass exists to avoid — `NOT (x IN (...))` and `x NOT IN
+    /// (...)` agree on every ordinary row but diverge when the list contains
+    /// a NULL and `x` matches none of the non-NULL entries.
+    #[test]
+    fn not_in_is_distinguishable_from_not_wrapping_in() {
+        let c = cols();
+        let o = CatalogOperators;
+
+        // `x NOT IN (...)`: one InList node, negated: true.
+        let not_in = lower_expr(&where_expr("a NOT IN (1, 2)"), &ctx(&c, &o)).unwrap();
+        let Expr::InList { negated, .. } = not_in else {
+            panic!("expected InList for `NOT IN`, got {not_in:?}");
+        };
+        assert!(negated, "`x NOT IN (...)` must set InList.negated");
+
+        // `NOT (x IN (...))`: Unary(NOT) wrapping an InList with negated: false.
+        let not_wrapping_in =
+            lower_expr(&where_expr("NOT (a IN (1, 2))"), &ctx(&c, &o)).unwrap();
+        let Expr::Unary { arg, .. } = not_wrapping_in else {
+            panic!(
+                "expected Unary(NOT) for `NOT(IN)`, got {not_wrapping_in:?}"
+            );
+        };
+        let Expr::InList { negated, .. } = *arg else {
+            panic!("expected the NOT to wrap an InList");
+        };
+        assert!(
+            !negated,
+            "the inner IN must NOT itself be negated — the NOT is a separate node"
+        );
+    }
+
+    // --- LIKE / ILIKE --------------------------------------------------------
+
+    #[test]
+    fn like_lowers_without_escape() {
+        let node = where_expr("a LIKE 'foo%'");
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&node, &ctx(&c, &o)).expect("lower failed");
+        let Expr::Like {
+            escape,
+            case_insensitive,
+            negated,
+            ..
+        } = e
+        else {
+            panic!("expected Like");
+        };
+        assert!(escape.is_none());
+        assert!(!case_insensitive);
+        assert!(!negated);
+    }
+
+    #[test]
+    fn like_escape_splits_pattern_and_escape() {
+        let node = where_expr(r"a LIKE 'foo\%' ESCAPE '\'");
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&node, &ctx(&c, &o)).expect("lower failed");
+        let Expr::Like {
+            pattern, escape, ..
+        } = e
+        else {
+            panic!("expected Like");
+        };
+        assert!(matches!(*pattern, Expr::Literal(Datum::Utf8(_), _)));
+        let escape = escape.expect("ESCAPE clause must be captured");
+        assert!(matches!(*escape, Expr::Literal(Datum::Utf8(_), _)));
+    }
+
+    #[test]
+    fn not_like_and_ilike_set_negated_and_case_insensitive() {
+        let c = cols();
+        let o = CatalogOperators;
+
+        let e = lower_expr(&where_expr("a NOT LIKE 'x'"), &ctx(&c, &o)).unwrap();
+        let Expr::Like {
+            negated,
+            case_insensitive,
+            ..
+        } = e
+        else {
+            panic!("expected Like");
+        };
+        assert!(negated);
+        assert!(!case_insensitive);
+
+        let e = lower_expr(&where_expr("a ILIKE 'x'"), &ctx(&c, &o)).unwrap();
+        let Expr::Like {
+            negated,
+            case_insensitive,
+            ..
+        } = e
+        else {
+            panic!("expected Like");
+        };
+        assert!(!negated);
+        assert!(case_insensitive);
+    }
+
+    // --- BETWEEN -------------------------------------------------------------
+
+    /// The test the task calls out explicitly: `BETWEEN SYMMETRIC` must set
+    /// `symmetric: true` (order of bounds doesn't matter), distinct from
+    /// plain `BETWEEN`.
+    #[test]
+    fn between_symmetric_sets_the_symmetric_flag() {
+        let c = cols();
+        let o = CatalogOperators;
+
+        let e = lower_expr(&where_expr("a BETWEEN 1 AND 10"), &ctx(&c, &o)).unwrap();
+        let Expr::Between {
+            symmetric,
+            negated,
+            low,
+            high,
+            ..
+        } = e
+        else {
+            panic!("expected Between");
+        };
+        assert!(!symmetric);
+        assert!(!negated);
+        assert_eq!(*low, Expr::Literal(Datum::Int32(1), PgType::INT4));
+        assert_eq!(*high, Expr::Literal(Datum::Int32(10), PgType::INT4));
+
+        let e = lower_expr(
+            &where_expr("a BETWEEN SYMMETRIC 1 AND 10"),
+            &ctx(&c, &o),
+        )
+        .unwrap();
+        let Expr::Between { symmetric, .. } = e else {
+            panic!("expected Between");
+        };
+        assert!(symmetric, "BETWEEN SYMMETRIC must set symmetric: true");
+
+        let e = lower_expr(
+            &where_expr("a NOT BETWEEN SYMMETRIC 1 AND 10"),
+            &ctx(&c, &o),
+        )
+        .unwrap();
+        let Expr::Between {
+            symmetric, negated, ..
+        } = e
+        else {
+            panic!("expected Between");
+        };
+        assert!(symmetric);
+        assert!(negated);
+    }
+
+    // --- IS [NOT] DISTINCT FROM -----------------------------------------------
+
+    #[test]
+    fn distinct_from_and_not_distinct_from_set_negated_correctly() {
+        let c = cols();
+        let o = CatalogOperators;
+
+        let e = lower_expr(&where_expr("a IS DISTINCT FROM b"), &ctx(&c, &o)).unwrap();
+        let Expr::DistinctFrom { negated, .. } = e else {
+            panic!("expected DistinctFrom");
+        };
+        assert!(!negated);
+
+        let e = lower_expr(
+            &where_expr("a IS NOT DISTINCT FROM b"),
+            &ctx(&c, &o),
+        )
+        .unwrap();
+        let Expr::DistinctFrom { negated, .. } = e else {
+            panic!("expected DistinctFrom");
+        };
+        assert!(negated);
+    }
 }

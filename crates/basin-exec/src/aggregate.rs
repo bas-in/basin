@@ -55,8 +55,8 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, Float64Type, Int16Type, Int32Type, Int64Type};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, RecordBatch, StringArray,
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
@@ -140,7 +140,10 @@ fn require_input_col(spec: &AggregateSpec) -> Result<usize, ExecError> {
 /// output `Field`. Reaching a `TypeMismatch` here is a planner bug — see
 /// `ExecError::TypeMismatch`'s doc comment — because the planner is supposed
 /// to have already checked, e.g., that `sum()`'s argument is numeric.
-fn resolve_aggregate(spec: AggregateSpec, input_schema: &Schema) -> Result<(ResolvedAgg, Field), ExecError> {
+fn resolve_aggregate(
+    spec: AggregateSpec,
+    input_schema: &Schema,
+) -> Result<(ResolvedAgg, Field), ExecError> {
     match spec.func {
         AggFunc::CountStar => {
             if spec.input_col.is_some() {
@@ -171,8 +174,9 @@ fn resolve_aggregate(spec: AggregateSpec, input_schema: &Schema) -> Result<(Reso
         AggFunc::Sum => {
             let col = require_input_col(&spec)?;
             let dt = input_schema.field(col).data_type();
-            let num_kind = num_kind_of(dt)
-                .ok_or_else(|| ExecError::TypeMismatch(format!("sum() over non-numeric column {dt:?}")))?;
+            let num_kind = num_kind_of(dt).ok_or_else(|| {
+                ExecError::TypeMismatch(format!("sum() over non-numeric column {dt:?}"))
+            })?;
             // Postgres widens sum(int2)/sum(int4) to bigint and sum(int8) to
             // numeric (unbounded). We widen everything integer to i64 and
             // raise `ExecError::Overflow` past that — see item 5 in this
@@ -189,8 +193,9 @@ fn resolve_aggregate(spec: AggregateSpec, input_schema: &Schema) -> Result<(Reso
         AggFunc::Avg => {
             let col = require_input_col(&spec)?;
             let dt = input_schema.field(col).data_type();
-            let num_kind = num_kind_of(dt)
-                .ok_or_else(|| ExecError::TypeMismatch(format!("avg() over non-numeric column {dt:?}")))?;
+            let num_kind = num_kind_of(dt).ok_or_else(|| {
+                ExecError::TypeMismatch(format!("avg() over non-numeric column {dt:?}"))
+            })?;
             // FIDELITY GAP, documented rather than hidden: Postgres
             // avg(smallint|integer|bigint) returns NUMERIC and avg(numeric)
             // stays NUMERIC — arbitrary precision, no rounding. basin-exec
@@ -302,7 +307,9 @@ fn extract_cell(array: &ArrayRef, row: usize) -> Result<Option<CellValue>, ExecE
         DataType::Int16 => CellValue::Int64(array.as_primitive::<Int16Type>().value(row) as i64),
         DataType::Int32 => CellValue::Int64(array.as_primitive::<Int32Type>().value(row) as i64),
         DataType::Int64 => CellValue::Int64(array.as_primitive::<Int64Type>().value(row)),
-        DataType::Float32 => CellValue::Float64(array.as_primitive::<Float32Type>().value(row) as f64),
+        DataType::Float32 => {
+            CellValue::Float64(array.as_primitive::<Float32Type>().value(row) as f64)
+        }
         DataType::Float64 => CellValue::Float64(array.as_primitive::<Float64Type>().value(row)),
         DataType::Boolean => CellValue::Bool(array.as_boolean().value(row)),
         DataType::Utf8 => CellValue::Utf8(array.as_string::<i32>().value(row).to_string()),
@@ -350,7 +357,10 @@ enum AccState {
     Max(Option<CellValue>),
     /// `sum` and `count` of non-null values, divided at `finalize()`. See
     /// the FIDELITY GAP note in [`resolve_aggregate`] for `Avg`.
-    Avg { sum: f64, count: i64 },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
 }
 
 impl AccState {
@@ -491,8 +501,14 @@ impl AccState {
     }
 }
 
-fn kernel_extreme(cur: &mut Option<CellValue>, arr: &ArrayRef, want_min: bool) -> Result<(), ExecError> {
-    use arrow::compute::kernels::aggregate::{max, max_boolean, max_string, min, min_boolean, min_string};
+fn kernel_extreme(
+    cur: &mut Option<CellValue>,
+    arr: &ArrayRef,
+    want_min: bool,
+) -> Result<(), ExecError> {
+    use arrow::compute::kernels::aggregate::{
+        max, max_boolean, max_string, min, min_boolean, min_string,
+    };
 
     let candidate: Option<CellValue> = match arr.data_type() {
         DataType::Int16 => {
@@ -517,15 +533,30 @@ fn kernel_extreme(cur: &mut Option<CellValue>, arr: &ArrayRef, want_min: bool) -
         }
         DataType::Boolean => {
             let a = arr.as_boolean();
-            (if want_min { min_boolean(a) } else { max_boolean(a) }).map(CellValue::Bool)
+            (if want_min {
+                min_boolean(a)
+            } else {
+                max_boolean(a)
+            })
+            .map(CellValue::Bool)
         }
         DataType::Utf8 => {
             let a = arr.as_string::<i32>();
-            (if want_min { min_string(a) } else { max_string(a) }).map(|s| CellValue::Utf8(s.to_string()))
+            (if want_min {
+                min_string(a)
+            } else {
+                max_string(a)
+            })
+            .map(|s| CellValue::Utf8(s.to_string()))
         }
         DataType::LargeUtf8 => {
             let a = arr.as_string::<i64>();
-            (if want_min { min_string(a) } else { max_string(a) }).map(|s| CellValue::Utf8(s.to_string()))
+            (if want_min {
+                min_string(a)
+            } else {
+                max_string(a)
+            })
+            .map(|s| CellValue::Utf8(s.to_string()))
         }
         other => {
             return Err(ExecError::TypeMismatch(format!(
@@ -543,7 +574,10 @@ fn kernel_extreme(cur: &mut Option<CellValue>, arr: &ArrayRef, want_min: bool) -
 /// width. Safe because every value in `values` originated from a column of
 /// that same family (group keys and `MIN`/`MAX` never widen; see the
 /// [`CellValue`] doc comment).
-fn build_typed_array(dtype: &DataType, values: &[Option<CellValue>]) -> Result<ArrayRef, ExecError> {
+fn build_typed_array(
+    dtype: &DataType,
+    values: &[Option<CellValue>],
+) -> Result<ArrayRef, ExecError> {
     fn as_i64(v: &Option<CellValue>) -> Option<i64> {
         match v {
             Some(CellValue::Int64(i)) => Some(*i),
@@ -558,17 +592,30 @@ fn build_typed_array(dtype: &DataType, values: &[Option<CellValue>]) -> Result<A
     }
 
     Ok(match dtype {
-        DataType::Int16 => {
-            Arc::new(Int16Array::from(values.iter().map(|v| as_i64(v).map(|i| i as i16)).collect::<Vec<_>>())) as ArrayRef
-        }
-        DataType::Int32 => {
-            Arc::new(Int32Array::from(values.iter().map(|v| as_i64(v).map(|i| i as i32)).collect::<Vec<_>>())) as ArrayRef
-        }
-        DataType::Int64 => Arc::new(Int64Array::from(values.iter().map(as_i64).collect::<Vec<_>>())) as ArrayRef,
-        DataType::Float32 => Arc::new(Float32Array::from(
-            values.iter().map(|v| as_f64(v).map(|f| f as f32)).collect::<Vec<_>>(),
+        DataType::Int16 => Arc::new(Int16Array::from(
+            values
+                .iter()
+                .map(|v| as_i64(v).map(|i| i as i16))
+                .collect::<Vec<_>>(),
         )) as ArrayRef,
-        DataType::Float64 => Arc::new(Float64Array::from(values.iter().map(as_f64).collect::<Vec<_>>())) as ArrayRef,
+        DataType::Int32 => Arc::new(Int32Array::from(
+            values
+                .iter()
+                .map(|v| as_i64(v).map(|i| i as i32))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef,
+        DataType::Int64 => Arc::new(Int64Array::from(
+            values.iter().map(as_i64).collect::<Vec<_>>(),
+        )) as ArrayRef,
+        DataType::Float32 => Arc::new(Float32Array::from(
+            values
+                .iter()
+                .map(|v| as_f64(v).map(|f| f as f32))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef,
+        DataType::Float64 => Arc::new(Float64Array::from(
+            values.iter().map(as_f64).collect::<Vec<_>>(),
+        )) as ArrayRef,
         DataType::Boolean => Arc::new(BooleanArray::from(
             values
                 .iter()
@@ -703,10 +750,13 @@ impl HashAggregate {
         let mut arrays = Vec::with_capacity(n);
         for (i, acc) in accs.iter().enumerate() {
             let dtype = self.agg_output_dtype(i);
-            arrays.push(build_typed_array(&dtype, std::slice::from_ref(&acc.finalize()))?);
+            arrays.push(build_typed_array(
+                &dtype,
+                std::slice::from_ref(&acc.finalize()),
+            )?);
         }
-        let batch =
-            RecordBatch::try_new(self.schema.clone(), arrays).map_err(|e| ExecError::Internal(e.to_string()))?;
+        let batch = RecordBatch::try_new(self.schema.clone(), arrays)
+            .map_err(|e| ExecError::Internal(e.to_string()))?;
         Ok(vec![batch])
     }
 
@@ -718,7 +768,8 @@ impl HashAggregate {
         distinct: &mut Option<HashSet<HashKey>>,
     ) -> Result<(), ExecError> {
         let agg = &self.aggregates[i];
-        let mask: Option<&BooleanArray> = agg.spec.filter_col.map(|fc| batch.column(fc).as_boolean());
+        let mask: Option<&BooleanArray> =
+            agg.spec.filter_col.map(|fc| batch.column(fc).as_boolean());
 
         if agg.spec.func == AggFunc::CountStar {
             let n = match mask {
@@ -738,9 +789,8 @@ impl HashAggregate {
         // group (there is only one group here, so this is moot for grouping
         // but not for the aggregate's result).
         let filtered: ArrayRef = match mask {
-            Some(m) => {
-                arrow::compute::kernels::filter::filter(raw.as_ref(), m).map_err(|e| ExecError::Internal(e.to_string()))?
-            }
+            Some(m) => arrow::compute::kernels::filter::filter(raw.as_ref(), m)
+                .map_err(|e| ExecError::Internal(e.to_string()))?,
             None => raw.clone(),
         };
 
@@ -778,7 +828,8 @@ impl HashAggregate {
                 Some(b) => b,
                 None => break,
             };
-            let group_cols: Vec<&ArrayRef> = self.group_cols.iter().map(|&c| batch.column(c)).collect();
+            let group_cols: Vec<&ArrayRef> =
+                self.group_cols.iter().map(|&c| batch.column(c)).collect();
             let filter_cols: Vec<Option<&BooleanArray>> = self
                 .aggregates
                 .iter()
@@ -848,9 +899,9 @@ impl HashAggregate {
                             continue; // DISTINCT ignores NULLs, like the aggregate itself
                         }
                         let key = HashKey::from(&val);
-                        let seen = distinct_seen[gid][i]
-                            .as_mut()
-                            .expect("distinct flag on the spec implies a seen-set was allocated above");
+                        let seen = distinct_seen[gid][i].as_mut().expect(
+                            "distinct flag on the spec implies a seen-set was allocated above",
+                        );
                         if !seen.insert(key.clone()) {
                             continue;
                         }
@@ -869,18 +920,23 @@ impl HashAggregate {
             let mut arrays = Vec::with_capacity(self.group_cols.len() + self.aggregates.len());
             for j in 0..self.group_cols.len() {
                 let dtype = self.schema.field(j).data_type().clone();
-                let col_values: Vec<Option<CellValue>> =
-                    group_values[start..end].iter().map(|row| row[j].clone()).collect();
+                let col_values: Vec<Option<CellValue>> = group_values[start..end]
+                    .iter()
+                    .map(|row| row[j].clone())
+                    .collect();
                 arrays.push(build_typed_array(&dtype, &col_values)?);
             }
             for i in 0..self.aggregates.len() {
                 let dtype = self.agg_output_dtype(i);
-                let col_values: Vec<Option<CellValue>> =
-                    accs[start..end].iter().map(|row| row[i].finalize()).collect();
+                let col_values: Vec<Option<CellValue>> = accs[start..end]
+                    .iter()
+                    .map(|row| row[i].finalize())
+                    .collect();
                 arrays.push(build_typed_array(&dtype, &col_values)?);
             }
             batches.push(
-                RecordBatch::try_new(self.schema.clone(), arrays).map_err(|e| ExecError::Internal(e.to_string()))?,
+                RecordBatch::try_new(self.schema.clone(), arrays)
+                    .map_err(|e| ExecError::Internal(e.to_string()))?,
             );
             start = end;
         }
@@ -928,7 +984,7 @@ mod tests {
     }
 
     impl VecOperator {
-        fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Box<dyn Operator> {
+        fn boxed(schema: SchemaRef, batches: Vec<RecordBatch>) -> Box<dyn Operator> {
             Box::new(VecOperator {
                 schema,
                 batches: batches.into(),
@@ -980,13 +1036,25 @@ mod tests {
     #[test]
     fn sum_of_empty_input_is_null_not_zero() {
         let schema = schema_1int("x");
-        let input = VecOperator::new(schema.clone(), vec![]);
+        let input = VecOperator::boxed(schema.clone(), vec![]);
         let mut agg = HashAggregate::new(input, vec![], vec![sum_spec(0)], usize::MAX).unwrap();
 
         let batch = agg.next_batch().unwrap().unwrap();
-        assert_eq!(batch.num_rows(), 1, "ungrouped aggregate always emits one row");
-        let sums = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        assert!(sums.is_null(0), "SUM() over zero rows must be NULL, got {:?}", sums.value(0));
+        assert_eq!(
+            batch.num_rows(),
+            1,
+            "ungrouped aggregate always emits one row"
+        );
+        let sums = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(
+            sums.is_null(0),
+            "SUM() over zero rows must be NULL, got {:?}",
+            sums.value(0)
+        );
         assert!(agg.next_batch().unwrap().is_none());
     }
 
@@ -996,11 +1064,16 @@ mod tests {
     #[test]
     fn count_of_empty_input_is_zero_not_null() {
         let schema = schema_1int("x");
-        let input = VecOperator::new(schema.clone(), vec![]);
-        let mut agg = HashAggregate::new(input, vec![], vec![count_star_spec()], usize::MAX).unwrap();
+        let input = VecOperator::boxed(schema.clone(), vec![]);
+        let mut agg =
+            HashAggregate::new(input, vec![], vec![count_star_spec()], usize::MAX).unwrap();
 
         let batch = agg.next_batch().unwrap().unwrap();
-        let counts = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let counts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert!(!counts.is_null(0), "COUNT(*) must never be NULL");
         assert_eq!(counts.value(0), 0, "COUNT(*) over zero rows must be 0");
     }
@@ -1014,7 +1087,7 @@ mod tests {
     fn nulls_are_ignored_by_value_aggregates_but_counted_by_count_star() {
         let schema = schema_1int("x");
         let batch = int_batch(&schema, vec![Some(1), None, Some(3), None]);
-        let input = VecOperator::new(schema.clone(), vec![batch]);
+        let input = VecOperator::boxed(schema.clone(), vec![batch]);
         let specs = vec![
             count_star_spec(),
             AggregateSpec {
@@ -1032,9 +1105,21 @@ mod tests {
         let count_star = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let count_expr = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         let sum = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(count_star.value(0), 4, "count(*) must count the NULL rows too");
-        assert_eq!(count_expr.value(0), 2, "count(x) must count only the two non-null rows");
-        assert_eq!(sum.value(0), 4, "sum(x) must ignore the NULLs (1 + 3), not treat them as 0");
+        assert_eq!(
+            count_star.value(0),
+            4,
+            "count(*) must count the NULL rows too"
+        );
+        assert_eq!(
+            count_expr.value(0),
+            2,
+            "count(x) must count only the two non-null rows"
+        );
+        assert_eq!(
+            sum.value(0),
+            4,
+            "sum(x) must ignore the NULLs (1 + 3), not treat them as 0"
+        );
     }
 
     // Item 3: NULL is a valid GROUP BY key, and all NULLs collapse into one
@@ -1056,23 +1141,35 @@ mod tests {
             ],
         )
         .unwrap();
-        let input = VecOperator::new(group_schema, vec![batch]);
+        let input = VecOperator::boxed(group_schema, vec![batch]);
         let mut agg = HashAggregate::new(input, vec![0], vec![sum_spec(1)], usize::MAX).unwrap();
         let out = agg.next_batch().unwrap().unwrap();
 
-        assert_eq!(out.num_rows(), 2, "NULL keys must collapse into exactly one extra group, not vanish or fan out");
+        assert_eq!(
+            out.num_rows(),
+            2,
+            "NULL keys must collapse into exactly one extra group, not vanish or fan out"
+        );
         let groups = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let sums = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         let mut seen: Vec<(Option<i64>, i64)> = (0..out.num_rows())
             .map(|i| {
                 (
-                    if groups.is_null(i) { None } else { Some(groups.value(i)) },
+                    if groups.is_null(i) {
+                        None
+                    } else {
+                        Some(groups.value(i))
+                    },
                     sums.value(i),
                 )
             })
             .collect();
         seen.sort_by_key(|(g, _)| *g);
-        assert_eq!(seen, vec![(None, 110), (Some(1), 40)], "NULL group must sum 20+40+50, key 1 must sum 10+30");
+        assert_eq!(
+            seen,
+            vec![(None, 110), (Some(1), 40)],
+            "NULL group must sum 20+40+50, key 1 must sum 10+30"
+        );
     }
 
     // Item 4: AVG(integer) in Postgres returns NUMERIC (arbitrary precision).
@@ -1086,7 +1183,7 @@ mod tests {
     fn avg_of_integers_returns_float_a_documented_fidelity_gap() {
         let schema = schema_1int("x");
         let batch = int_batch(&schema, vec![Some(1), Some(2)]);
-        let input = VecOperator::new(schema.clone(), vec![batch]);
+        let input = VecOperator::boxed(schema.clone(), vec![batch]);
         let specs = vec![AggregateSpec {
             func: AggFunc::Avg,
             input_col: Some(0),
@@ -1097,11 +1194,19 @@ mod tests {
         let mut agg = HashAggregate::new(input, vec![], specs, usize::MAX).unwrap();
         assert_eq!(agg.schema().field(0).data_type(), &DataType::Float64);
         let out = agg.next_batch().unwrap().unwrap();
-        let avg = out.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+        let avg = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         // The true Postgres answer, 1.5, happens to be exact in f64 too —
         // this only demonstrates the common case works, not that basin-exec
         // matches Postgres bit-for-bit on precision. See the doc comment.
-        assert_eq!(avg.value(0), 1.5, "avg(integer) is NUMERIC in Postgres, DOUBLE PRECISION here — value must still be 1.5");
+        assert_eq!(
+            avg.value(0),
+            1.5,
+            "avg(integer) is NUMERIC in Postgres, DOUBLE PRECISION here — value must still be 1.5"
+        );
     }
 
     // Item 5: integer SUM overflow must be a hard error, matching Postgres's
@@ -1112,10 +1217,14 @@ mod tests {
     fn integer_sum_overflow_errors_instead_of_wrapping() {
         let schema = schema_1int("x");
         let batch = int_batch(&schema, vec![Some(i64::MAX), Some(1)]);
-        let input = VecOperator::new(schema.clone(), vec![batch]);
+        let input = VecOperator::boxed(schema.clone(), vec![batch]);
         let mut agg = HashAggregate::new(input, vec![], vec![sum_spec(0)], usize::MAX).unwrap();
         let err = agg.next_batch().unwrap_err();
-        assert_eq!(err, ExecError::Overflow("bigint"), "overflow must be reported, not wrapped into a bogus negative sum");
+        assert_eq!(
+            err,
+            ExecError::Overflow("bigint"),
+            "overflow must be reported, not wrapped into a bogus negative sum"
+        );
     }
 
     // Overflow must also be caught when it happens across group boundaries
@@ -1136,7 +1245,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let input = VecOperator::new(group_schema, vec![batch]);
+        let input = VecOperator::boxed(group_schema, vec![batch]);
         let mut agg = HashAggregate::new(input, vec![0], vec![sum_spec(1)], usize::MAX).unwrap();
         let err = agg.next_batch().unwrap_err();
         assert_eq!(err, ExecError::Overflow("bigint"));
@@ -1149,7 +1258,7 @@ mod tests {
         let schema = schema_1int("x");
         let b1 = int_batch(&schema, vec![Some(1), Some(2), Some(1), None]);
         let b2 = int_batch(&schema, vec![Some(2), Some(3), None]);
-        let input = VecOperator::new(schema.clone(), vec![b1, b2]);
+        let input = VecOperator::boxed(schema.clone(), vec![b1, b2]);
         let specs = vec![AggregateSpec {
             func: AggFunc::Count,
             input_col: Some(0),
@@ -1177,11 +1286,16 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
-                Arc::new(BooleanArray::from(vec![Some(true), Some(false), Some(true), None])),
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                    None,
+                ])),
             ],
         )
         .unwrap();
-        let input = VecOperator::new(schema, vec![batch]);
+        let input = VecOperator::boxed(schema, vec![batch]);
         let specs = vec![
             AggregateSpec {
                 func: AggFunc::Sum,
@@ -1231,7 +1345,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let input = VecOperator::new(schema, vec![b1, b2]);
+        let input = VecOperator::boxed(schema, vec![b1, b2]);
         let specs = vec![
             sum_spec(1),
             AggregateSpec {
@@ -1260,20 +1374,39 @@ mod tests {
         let out = agg.next_batch().unwrap().unwrap();
         assert_eq!(out.num_rows(), 2);
 
-        let groups = out.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let groups = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         let sums = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         let mins = out.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
         let maxs = out.column(3).as_any().downcast_ref::<Int32Array>().unwrap();
-        let avgs = out.column(4).as_any().downcast_ref::<Float64Array>().unwrap();
+        let avgs = out
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
 
         let mut rows: Vec<(String, i64, i32, i32, f64)> = (0..out.num_rows())
-            .map(|i| (groups.value(i).to_string(), sums.value(i), mins.value(i), maxs.value(i), avgs.value(i)))
+            .map(|i| {
+                (
+                    groups.value(i).to_string(),
+                    sums.value(i),
+                    mins.value(i),
+                    maxs.value(i),
+                    avgs.value(i),
+                )
+            })
             .collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         // group "a": 10, 20, 30 (spans both batches); group "b": 1, 5.
         assert_eq!(rows[0], ("a".to_string(), 60, 10, 30, 20.0));
         assert_eq!(rows[1], ("b".to_string(), 6, 1, 5, 3.0));
-        assert!(agg.next_batch().unwrap().is_none(), "operator must be exhausted after its one output batch");
+        assert!(
+            agg.next_batch().unwrap().is_none(),
+            "operator must be exhausted after its one output batch"
+        );
     }
 
     // GROUP BY over zero input rows produces zero output rows — unlike the
@@ -1284,7 +1417,7 @@ mod tests {
             Field::new("g", DataType::Int64, true),
             Field::new("x", DataType::Int64, true),
         ]));
-        let input = VecOperator::new(group_schema.clone(), vec![]);
+        let input = VecOperator::boxed(group_schema.clone(), vec![]);
         let mut agg = HashAggregate::new(input, vec![0], vec![sum_spec(1)], usize::MAX).unwrap();
         assert!(agg.next_batch().unwrap().is_none());
     }
@@ -1308,10 +1441,13 @@ mod tests {
             ],
         )
         .unwrap();
-        let input = VecOperator::new(group_schema, vec![batch]);
+        let input = VecOperator::boxed(group_schema, vec![batch]);
         let mut agg = HashAggregate::new(input, vec![0], vec![sum_spec(1)], 8).unwrap();
         let err = agg.next_batch().unwrap_err();
-        assert!(matches!(err, ExecError::OutOfMemory { .. }), "expected OutOfMemory, got {err:?}");
+        assert!(
+            matches!(err, ExecError::OutOfMemory { .. }),
+            "expected OutOfMemory, got {err:?}"
+        );
     }
 
     // A rejection of a malformed spec (count(*) carrying an input column) at
@@ -1320,7 +1456,7 @@ mod tests {
     #[test]
     fn count_star_with_an_input_column_is_rejected_at_construction() {
         let schema = schema_1int("x");
-        let input = VecOperator::new(schema, vec![]);
+        let input = VecOperator::boxed(schema, vec![]);
         let bad = AggregateSpec {
             func: AggFunc::CountStar,
             input_col: Some(0),
@@ -1328,7 +1464,9 @@ mod tests {
             filter_col: None,
             alias: "n".into(),
         };
-        let err = HashAggregate::new(input, vec![], vec![bad], usize::MAX).err().unwrap();
+        let err = HashAggregate::new(input, vec![], vec![bad], usize::MAX)
+            .err()
+            .unwrap();
         assert!(matches!(err, ExecError::TypeMismatch(_)));
     }
 }

@@ -92,7 +92,17 @@ fn normalize_for_sort(array: &ArrayRef) -> ArrayRef {
                 .expect("DataType::Float64 column backed by Float64Array");
             let normalized: Float64Array = arr
                 .iter()
-                .map(|v| v.map(|x| if x.is_nan() { f64::NAN } else if x == 0.0 { 0.0 } else { x }))
+                .map(|v| {
+                    v.map(|x| {
+                        if x.is_nan() {
+                            f64::NAN
+                        } else if x == 0.0 {
+                            0.0
+                        } else {
+                            x
+                        }
+                    })
+                })
                 .collect();
             Arc::new(normalized)
         }
@@ -103,7 +113,17 @@ fn normalize_for_sort(array: &ArrayRef) -> ArrayRef {
                 .expect("DataType::Float32 column backed by Float32Array");
             let normalized: Float32Array = arr
                 .iter()
-                .map(|v| v.map(|x| if x.is_nan() { f32::NAN } else if x == 0.0 { 0.0 } else { x }))
+                .map(|v| {
+                    v.map(|x| {
+                        if x.is_nan() {
+                            f32::NAN
+                        } else if x == 0.0 {
+                            0.0
+                        } else {
+                            x
+                        }
+                    })
+                })
                 .collect();
             Arc::new(normalized)
         }
@@ -141,7 +161,10 @@ fn sort_columns_with_tiebreak(
 }
 
 /// Reorder every column of `batch` by `indices`.
-fn take_batch(batch: &RecordBatch, indices: &arrow_array::UInt32Array) -> Result<RecordBatch, ExecError> {
+fn take_batch(
+    batch: &RecordBatch,
+    indices: &arrow_array::UInt32Array,
+) -> Result<RecordBatch, ExecError> {
     let columns: Vec<ArrayRef> = batch
         .columns()
         .iter()
@@ -311,8 +334,7 @@ impl TopK {
 
         let (combined, mut combined_seq) = match self.best.take() {
             Some(best) => {
-                let combined =
-                    concat_batches(&self.schema, [&best, &batch]).map_err(arrow_err)?;
+                let combined = concat_batches(&self.schema, [&best, &batch]).map_err(arrow_err)?;
                 let mut seq = std::mem::take(&mut self.best_seq);
                 seq.extend(fresh_seq);
                 (combined, seq)
@@ -422,7 +444,11 @@ mod tests {
         RecordBatch::try_new(int32_schema(), vec![Arc::new(Int32Array::from(values))]).unwrap()
     }
 
-    fn sort_int32_column(rows: Vec<Option<i32>>, descending: bool, nulls_first: bool) -> Vec<Option<i32>> {
+    fn sort_int32_column(
+        rows: Vec<Option<i32>>,
+        descending: bool,
+        nulls_first: bool,
+    ) -> Vec<Option<i32>> {
         let schema = int32_schema();
         let child = Box::new(Feed::new(schema, vec![int32_batch(rows)]));
         let keys = vec![SortKey {
@@ -477,7 +503,10 @@ mod tests {
         // DESC, NULLS LAST (an explicit override) — wrong answer this
         // prevents: the operator conflating "descending" with "nulls
         // first" and ignoring the explicit override.
-        assert_eq!(sort_int32_column(rows, true, false), vec![Some(2), Some(1), None]);
+        assert_eq!(
+            sort_int32_column(rows, true, false),
+            vec![Some(2), Some(1), None]
+        );
     }
 
     // Requirement 2: Postgres defines NaN as the largest float value,
@@ -489,9 +518,17 @@ mod tests {
     #[test]
     fn nan_sorts_as_the_largest_float_regardless_of_sign_bit() {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)]));
-        let rows: Vec<Option<f64>> = vec![Some(1.0), Some(f64::INFINITY), Some(-f64::NAN), Some(f64::NAN)];
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Float64Array::from(rows))]).unwrap();
+        let rows: Vec<Option<f64>> = vec![
+            Some(1.0),
+            Some(f64::INFINITY),
+            Some(-f64::NAN),
+            Some(f64::NAN),
+        ];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Float64Array::from(rows))],
+        )
+        .unwrap();
         let child = Box::new(Feed::new(schema, vec![batch]));
         let keys = vec![SortKey {
             column: 0,
@@ -532,8 +569,11 @@ mod tests {
         // the tie-break (original arrival order) must keep them in that
         // relative order rather than a sign-bit comparison reordering them.
         let rows = vec![5.0_f64, -0.0, 0.0];
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Float64Array::from(rows))]).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Float64Array::from(rows))],
+        )
+        .unwrap();
         let child = Box::new(Feed::new(schema, vec![batch]));
         let keys = vec![SortKey {
             column: 0,
