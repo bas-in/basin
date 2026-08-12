@@ -2528,6 +2528,10 @@ async fn probe_schema(sess: &ProjectSession, sql: &str) -> Result<Vec<Field>> {
     }
 
     let mut primary_table: Option<TableName> = None;
+    // Captured so the Postgres-style column-naming pass below (mirrors
+    // `exec_select`) can inspect the planned expressions once we're back out
+    // of the `match` — the `Ok` arm's `logical: DataFrame` doesn't outlive it.
+    let mut plan_for_naming: Option<datafusion::logical_expr::LogicalPlan> = None;
     let ws_schema = match plan_result {
         Ok(logical) => {
             // Capture the single scanned table (if any) for enum-OID
@@ -2547,6 +2551,7 @@ async fn probe_schema(sess: &ProjectSession, sql: &str) -> Result<Vec<Field>> {
             if let Some(t) = first_scan(logical.logical_plan()) {
                 primary_table = TableName::new(t).ok();
             }
+            plan_for_naming = Some(logical.logical_plan().clone());
             let df_schema = logical.schema().inner().clone();
             Arc::new(crate::convert::schema_df_to_ws(df_schema.as_ref())?)
         }
@@ -2571,6 +2576,18 @@ async fn probe_schema(sess: &ProjectSession, sql: &str) -> Result<Vec<Field>> {
     // TEXT. This is required for drivers that use the Describe-time RowDescription
     // to choose the correct wire deserializer (tokio-postgres, psycopg3, etc.).
     let ws_schema = crate::executor::annotate_json_agg_columns(&ws_schema, probe_sql);
+    // Postgres-style column naming (mirrors `exec_select`): extended-protocol
+    // clients (ORMs, asyncpg, node-pg) commonly Describe a prepared statement
+    // before ever Executing it, so the Describe-time RowDescription needs the
+    // same `?column?` / bare-function-name / column-name rule as the
+    // Execute-time one, or a client that caches column positions by name from
+    // Describe would key its rows wrong. Best-effort: only applies when
+    // direct planning succeeded above (the DML-CTE probe path below has its
+    // own already-correct RETURNING-column names).
+    let ws_schema = match &plan_for_naming {
+        Some(plan) => crate::pg_colnames::pg_style_column_names(&ws_schema, plan),
+        None => ws_schema,
+    };
     // Reattach user-enum type OIDs: DataFusion strips field metadata (same
     // problem json_agg has), so the Describe-time RowDescription would advertise
     // TEXT (25) for an enum column and extended-protocol clients (prisma/

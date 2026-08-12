@@ -2223,6 +2223,7 @@ pub mod partition_router;
 mod pg_agg_udf;
 pub mod pg_ast;
 mod pg_catalog_udf;
+mod pg_colnames;
 mod pg_operators;
 pub mod pg_plan;
 mod pg_scalar_aliases;

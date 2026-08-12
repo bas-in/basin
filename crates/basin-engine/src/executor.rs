@@ -93,6 +93,7 @@ use crate::fast_select::{execute_simple_select, match_simple_select};
 use crate::lifecycle::{
     extract_create_table_lifecycle, extract_select_include_deleted, CreateTableLifecycle,
 };
+use crate::pg_colnames;
 use crate::session::{refresh_table, refresh_table_counted};
 use crate::{ExecResult, ProjectSession};
 use basin_catalog::PartitionSpec;
@@ -11181,11 +11182,39 @@ pub(crate) async fn exec_select(
         json_agg_rewritten.as_str()
     };
 
-    let mut df = sess
-        .ctx
-        .sql(sql_for_df)
-        .await
-        .map_err(|e| map_df_plan_error("plan", &e))?;
+    // Postgres allows a result set to have duplicate, unaliased column names
+    // (`SELECT f(5), f(5)` -> two columns both named "f"); DataFusion's
+    // `Projection` node refuses to plan that ("Projections require unique
+    // expression names"). Retry once with every top-level select-list item
+    // pinned to a distinct synthetic alias so the planner accepts the plan,
+    // and recover Postgres's own (possibly duplicate) names straight from
+    // the original SQL text once the retried query has actually run --
+    // DataFusion's opinion of the name is discarded entirely for such
+    // queries. See `pg_colnames` module docs for the full rationale.
+    let mut dedup_sources: Option<Vec<pg_colnames::PgColNameSource>> = None;
+    let mut df = match sess.ctx.sql(sql_for_df).await {
+        Ok(df) => df,
+        Err(e) => {
+            if e.to_string()
+                .contains(pg_colnames::UNIQUE_PROJECTION_NAMES_ERROR)
+            {
+                match pg_colnames::dedupe_select_list_for_planning(sql_for_df) {
+                    Some((deduped, sources)) => {
+                        let retried = sess
+                            .ctx
+                            .sql(&deduped)
+                            .await
+                            .map_err(|e2| map_df_plan_error("plan", &e2))?;
+                        dedup_sources = Some(sources);
+                        retried
+                    }
+                    None => return Err(map_df_plan_error("plan", &e)),
+                }
+            } else {
+                return Err(map_df_plan_error("plan", &e));
+            }
+        }
+    };
 
     // Phase 5.16.B: compute query-shape hash and record it in the per-shape
     // HDR histogram registry.  The hash was computed-and-discarded in 5.16.A;
@@ -11241,7 +11270,21 @@ pub(crate) async fn exec_select(
     let ws_schema = {
         let raw = Arc::new(schema_df_to_ws(df_schema.as_ref())?);
         let annotated = annotate_json_agg_columns(&raw, sql_for_df);
-        pg_style_nullary_fn_column_names(&annotated)
+        match &dedup_sources {
+            // Duplicate-name retry path: DataFusion's field names are the
+            // synthetic `__basin_pgname_N` aliases we injected, not anything
+            // Postgres-shaped. Discard them and stamp on the names computed
+            // straight from the original (pre-rewrite) SQL text instead.
+            Some(sources) => {
+                let names = pg_colnames::pg_names_for_select_list(sources, &annotated);
+                pg_colnames::rename_fields(&annotated, &names)
+            }
+            // Normal path: rename from the actual planned expressions.
+            None => {
+                let renamed = pg_colnames::pg_style_column_names(&annotated, df.logical_plan());
+                pg_style_nullary_fn_column_names(&renamed)
+            }
+        }
     };
     // Reattach user-enum type OIDs: DataFusion strips field metadata, so a
     // result column sourced from an enum column comes back as bare Utf8 and the
