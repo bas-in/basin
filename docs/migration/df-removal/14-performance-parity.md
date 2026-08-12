@@ -37,6 +37,52 @@ Diagnoses, each testable:
   question is whether those branches *engage* at 1M or silently fall through to
   a full scan. Instrument first: if the counters are zero on the 1M card, this is
   a routing bug worth ~0 LOC of new algorithm.
+
+### Found: the keyset zone-map prune is all-or-nothing across files
+
+`fast_select.rs:3395-3423` builds `keyset_zone_maps`, the per-file `[min, max]`
+map that lets the keyset branch open candidate files in ascending-min order and
+**short-circuit once the page is provably complete**. The loop is:
+
+```rust
+for f in &live_files {
+    match (mn, mx) {
+        (Some(mn), Some(mx)) => { m.insert(...); }
+        _ => { complete = false; break; }      // ← one bad file kills it
+    }
+}
+complete.then_some(m)
+```
+
+A **single** live file lacking a decodable Int64 min/max sets `complete = false`
+and discards the entire map. The code's own comment states the consequence: the
+branch "then keeps the existing open-all-candidates behaviour, which is always
+correct." Correct, and O(table).
+
+**Why this shows up only at scale.** `insert_batch_for` issues one batch at 10k
+but ~100 INSERT statements at 1M, so the 10k card has essentially one data file
+and the 1M card has many. Every additional file is an independent chance to miss
+a statistic — and missing one forfeits the optimization for *all* of them. A
+per-file failure probability that is negligible at one file approaches certainty
+across dozens.
+
+**The fix is local and strictly better: degrade per-file, not globally.** Files
+that have stats keep their `[min, max]` and stay in the ascending-min
+short-circuit; files that lack stats are simply treated as always-candidate and
+opened unconditionally. That is never worse than today's behaviour on any input,
+and on the 1M card it should recover most of the 335×. Estimated at tens of
+lines, not hundreds.
+
+Two things to verify before treating this as *the* cause rather than *a* cause:
+
+1. Confirm empirically that some 1M-card file genuinely lacks Int64 min/max for
+   the `id` column — the mechanism is proven, its occurrence is **UNVERIFIED**.
+2. Check whether the bare-`LIMIT` path (`unordered_limit_target`,
+   `fast_select.rs:2711`) has an analogous all-or-nothing guard. Its 870×
+   degradation has the same signature and may share the root cause.
+
+Neither depends on the DataFusion migration, and both are worth fixing on `main`
+independently of it.
 - **Deep top-K** is described as a "whole-table wide-decode floor", but
   `topk_late_fast_select_count` (`lib.rs:146-150`) exists precisely to decode
   only the sort key first and materialize the wide columns for the surviving
