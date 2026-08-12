@@ -56,19 +56,55 @@
 //! Postgres never defines two competing implicit paths from the same input
 //! types to the same operator name — first-match and best-match agree.
 //!
-//! Cross-type comparisons and arithmetic (`int4 = int8`, `int2 + int4`, …) are
-//! deliberately *not* tabulated as their own rows, even though Postgres has
-//! real operator OIDs for many of them (`int4 = int8` is oid 416, not a cast
-//! of one side). This table has one row per operator name per matching
-//! argument type, and leans on [`resolve`]'s implicit-coercion fallback via
-//! [`crate::cast`] to reach the cross-type cases — `int4 = int8` resolves by
-//! widening the `int4` to `int8` and matching the `int8 = int8` row (oid 410).
-//! This is a real, admitted divergence from Postgres's own plan (which would
-//! pick oid 416 directly) but produces the same boolean answer, and keeping a
-//! single coercion path is far less error-prone than tabulating the full
-//! matrix. If Basin ever needs to report the *specific* cross-type operator
-//! oid Postgres would have chosen (`pg_operator` introspection, `EXPLAIN`
-//! parity), that is a follow-up, not a change to this rule.
+//! Cross-type comparisons and arithmetic (`int4 = int8`, `int2 + int4`, …)
+//! *are* tabulated as their own rows below, because Postgres really does mint
+//! a separate operator oid for many of these pairs — `int4 = int8` is oid 15,
+//! not a cast of one side onto the other (its mirror image, `int8 = int4`, is
+//! the *different* oid 416 — easy to get backwards, and initially gotten
+//! backwards in this module, without checking a live server). Confirmed live
+//! with the query at the top of this module restricted to `lt.typname <>
+//! rt.typname` and to `int2`/`int4`/`int8`/`float4`/`float8`/`numeric`:
+//!
+//! ```sql
+//! SELECT o.oid, o.oprname, lt.typname, rt.typname, rest.typname
+//!   FROM pg_operator o
+//!   JOIN pg_type lt ON lt.oid = o.oprleft
+//!   JOIN pg_type rt ON rt.oid = o.oprright
+//!   JOIN pg_type rest ON rest.oid = o.oprresult
+//!  WHERE o.oprnamespace = 11
+//!    AND lt.typname <> rt.typname
+//!    AND lt.typname IN ('int2','int4','int8','float4','float8','numeric')
+//!    AND rt.typname IN ('int2','int4','int8','float4','float8','numeric')
+//!  ORDER BY o.oprname, o.oid;
+//! ```
+//!
+//! Run live, for the ten operators covered here (`= <> < <= > >= + - * /`)
+//! this returns cross-type rows only *within* the integer family (`int2` ×
+//! `int4`, `int2` × `int8`, `int4` × `int8`, both directions) and *within*
+//! the float family (`float4` × `float8`) — 80 rows in total (48 comparison,
+//! 32 arithmetic), all tabulated below. The same unfiltered query also
+//! surfaces `<<`/`>>` bit-shift rows sharing these integer types (e.g. oid
+//! 1878, `int2 << int4`); those are out of scope for this module (comparison
+//! and arithmetic only, per the module docs above) and are not included.
+//!
+//! It returns **no** rows pairing `numeric` with any other type, and **no**
+//! rows pairing an integer type with a float type (`int4 = float8` and
+//! friends are absent). Postgres itself has no native operator for those
+//! pairs and reaches them only by implicitly casting one side — exactly
+//! [`resolve`]'s coercion fallback via [`crate::cast`], which this table
+//! still leans on for every pair not listed above. `int4 = float8` resolves
+//! this way, by widening the int4 to float8 and landing on the `float8 =
+//! float8` row. `numeric` mixed with an integer type also falls back this
+//! way, but — because [`resolve`]'s fallback is first-match, not
+//! best-match, and every integer type implicitly reaches `float4` while
+//! `numeric` only reaches `int2`/`int4`/`int8` via an *assignment* (not
+//! implicit) cast — it lands on `float4 = float4`, not `numeric = numeric`,
+//! same as it did before this table grew any cross-type rows. That is a
+//! preexisting quirk of the fallback's tie-breaking, not something this
+//! change introduces or is scoped to fix; the coercion tests below pin the
+//! current (surprising but unchanged) behavior rather than paper over it.
+//! None of this is a gap to close later by tabulating more rows — there is
+//! no such native Postgres row to copy for `numeric` mixed with anything.
 //!
 //! # Array and JSONB path operators are genuinely polymorphic
 //!
@@ -162,9 +198,10 @@ pub static OPERATORS: &[OperatorSig] = &[
     // ─── Comparison ─────────────────────────────────────────────────────────
     //
     // `=`, `<>`, `<`, `<=`, `>`, `>=`, one row per type, always returning
-    // `bool`. Cross-type comparisons (`int4 = int8`) are handled by
-    // `resolve`'s implicit-coercion fallback rather than tabulated — see the
-    // module docs.
+    // `bool`. The real cross-type rows Postgres has among int2/int4/int8 and
+    // float4/float8 are tabulated separately below, after this block — see
+    // the module docs for the query that found them and why `numeric` and
+    // int/float pairs are not among them.
     OperatorSig::binary(91, "=", oid::BOOL, oid::BOOL, oid::BOOL),
     OperatorSig::binary(85, "<>", oid::BOOL, oid::BOOL, oid::BOOL),
     OperatorSig::binary(58, "<", oid::BOOL, oid::BOOL, oid::BOOL),
@@ -237,11 +274,68 @@ pub static OPERATORS: &[OperatorSig] = &[
     OperatorSig::binary(2976, "<=", oid::UUID, oid::UUID, oid::BOOL),
     OperatorSig::binary(2975, ">", oid::UUID, oid::UUID, oid::BOOL),
     OperatorSig::binary(2977, ">=", oid::UUID, oid::UUID, oid::BOOL),
+    // ─── Cross-type comparison ──────────────────────────────────────────────
+    //
+    // Real Postgres OIDs for `int2`/`int4`/`int8` compared pairwise, and
+    // `float4` compared with `float8` — see the module docs for the query
+    // that produced these and why `numeric` and int/float pairs are not
+    // among them (Postgres has no such native rows; those still resolve via
+    // `resolve`'s coercion fallback).
+    OperatorSig::binary(532, "=", oid::INT2, oid::INT4, oid::BOOL),
+    OperatorSig::binary(533, "=", oid::INT4, oid::INT2, oid::BOOL),
+    OperatorSig::binary(1862, "=", oid::INT2, oid::INT8, oid::BOOL),
+    OperatorSig::binary(1868, "=", oid::INT8, oid::INT2, oid::BOOL),
+    OperatorSig::binary(15, "=", oid::INT4, oid::INT8, oid::BOOL),
+    OperatorSig::binary(416, "=", oid::INT8, oid::INT4, oid::BOOL),
+    OperatorSig::binary(1120, "=", oid::FLOAT4, oid::FLOAT8, oid::BOOL),
+    OperatorSig::binary(1130, "=", oid::FLOAT8, oid::FLOAT4, oid::BOOL),
+    OperatorSig::binary(538, "<>", oid::INT2, oid::INT4, oid::BOOL),
+    OperatorSig::binary(539, "<>", oid::INT4, oid::INT2, oid::BOOL),
+    OperatorSig::binary(1863, "<>", oid::INT2, oid::INT8, oid::BOOL),
+    OperatorSig::binary(1869, "<>", oid::INT8, oid::INT2, oid::BOOL),
+    OperatorSig::binary(36, "<>", oid::INT4, oid::INT8, oid::BOOL),
+    OperatorSig::binary(417, "<>", oid::INT8, oid::INT4, oid::BOOL),
+    OperatorSig::binary(1121, "<>", oid::FLOAT4, oid::FLOAT8, oid::BOOL),
+    OperatorSig::binary(1131, "<>", oid::FLOAT8, oid::FLOAT4, oid::BOOL),
+    OperatorSig::binary(534, "<", oid::INT2, oid::INT4, oid::BOOL),
+    OperatorSig::binary(535, "<", oid::INT4, oid::INT2, oid::BOOL),
+    OperatorSig::binary(1864, "<", oid::INT2, oid::INT8, oid::BOOL),
+    OperatorSig::binary(1870, "<", oid::INT8, oid::INT2, oid::BOOL),
+    OperatorSig::binary(37, "<", oid::INT4, oid::INT8, oid::BOOL),
+    OperatorSig::binary(418, "<", oid::INT8, oid::INT4, oid::BOOL),
+    OperatorSig::binary(1122, "<", oid::FLOAT4, oid::FLOAT8, oid::BOOL),
+    OperatorSig::binary(1132, "<", oid::FLOAT8, oid::FLOAT4, oid::BOOL),
+    OperatorSig::binary(540, "<=", oid::INT2, oid::INT4, oid::BOOL),
+    OperatorSig::binary(541, "<=", oid::INT4, oid::INT2, oid::BOOL),
+    OperatorSig::binary(1866, "<=", oid::INT2, oid::INT8, oid::BOOL),
+    OperatorSig::binary(1872, "<=", oid::INT8, oid::INT2, oid::BOOL),
+    OperatorSig::binary(80, "<=", oid::INT4, oid::INT8, oid::BOOL),
+    OperatorSig::binary(420, "<=", oid::INT8, oid::INT4, oid::BOOL),
+    OperatorSig::binary(1124, "<=", oid::FLOAT4, oid::FLOAT8, oid::BOOL),
+    OperatorSig::binary(1134, "<=", oid::FLOAT8, oid::FLOAT4, oid::BOOL),
+    OperatorSig::binary(536, ">", oid::INT2, oid::INT4, oid::BOOL),
+    OperatorSig::binary(537, ">", oid::INT4, oid::INT2, oid::BOOL),
+    OperatorSig::binary(1865, ">", oid::INT2, oid::INT8, oid::BOOL),
+    OperatorSig::binary(1871, ">", oid::INT8, oid::INT2, oid::BOOL),
+    OperatorSig::binary(76, ">", oid::INT4, oid::INT8, oid::BOOL),
+    OperatorSig::binary(419, ">", oid::INT8, oid::INT4, oid::BOOL),
+    OperatorSig::binary(1123, ">", oid::FLOAT4, oid::FLOAT8, oid::BOOL),
+    OperatorSig::binary(1133, ">", oid::FLOAT8, oid::FLOAT4, oid::BOOL),
+    OperatorSig::binary(542, ">=", oid::INT2, oid::INT4, oid::BOOL),
+    OperatorSig::binary(543, ">=", oid::INT4, oid::INT2, oid::BOOL),
+    OperatorSig::binary(1867, ">=", oid::INT2, oid::INT8, oid::BOOL),
+    OperatorSig::binary(1873, ">=", oid::INT8, oid::INT2, oid::BOOL),
+    OperatorSig::binary(82, ">=", oid::INT4, oid::INT8, oid::BOOL),
+    OperatorSig::binary(430, ">=", oid::INT8, oid::INT4, oid::BOOL),
+    OperatorSig::binary(1125, ">=", oid::FLOAT4, oid::FLOAT8, oid::BOOL),
+    OperatorSig::binary(1135, ">=", oid::FLOAT8, oid::FLOAT4, oid::BOOL),
     // ─── Arithmetic ─────────────────────────────────────────────────────────
     //
     // `+ - * /` for every numeric type; `%` (modulo) only for the integer
     // types and numeric — Postgres has no float modulo operator at all, which
-    // is why there is no float4/float8 row here (not an omission).
+    // is why there is no float4/float8 row here (not an omission). The real
+    // cross-type rows Postgres has among int2/int4/int8/float4/float8 are
+    // tabulated separately below, after this block — see the module docs.
     OperatorSig::binary(550, "+", oid::INT2, oid::INT2, oid::INT2),
     OperatorSig::binary(554, "-", oid::INT2, oid::INT2, oid::INT2),
     OperatorSig::binary(526, "*", oid::INT2, oid::INT2, oid::INT2),
@@ -270,6 +364,43 @@ pub static OPERATORS: &[OperatorSig] = &[
     OperatorSig::binary(1760, "*", oid::NUMERIC, oid::NUMERIC, oid::NUMERIC),
     OperatorSig::binary(1761, "/", oid::NUMERIC, oid::NUMERIC, oid::NUMERIC),
     OperatorSig::binary(1762, "%", oid::NUMERIC, oid::NUMERIC, oid::NUMERIC),
+    // ─── Cross-type arithmetic ──────────────────────────────────────────────
+    //
+    // Result type follows Postgres's own promotion: the wider of the two
+    // operand types, confirmed per-row against the live catalog (see the
+    // module docs for the query).
+    OperatorSig::binary(552, "+", oid::INT2, oid::INT4, oid::INT4),
+    OperatorSig::binary(553, "+", oid::INT4, oid::INT2, oid::INT4),
+    OperatorSig::binary(822, "+", oid::INT2, oid::INT8, oid::INT8),
+    OperatorSig::binary(818, "+", oid::INT8, oid::INT2, oid::INT8),
+    OperatorSig::binary(692, "+", oid::INT4, oid::INT8, oid::INT8),
+    OperatorSig::binary(688, "+", oid::INT8, oid::INT4, oid::INT8),
+    OperatorSig::binary(1116, "+", oid::FLOAT4, oid::FLOAT8, oid::FLOAT8),
+    OperatorSig::binary(1126, "+", oid::FLOAT8, oid::FLOAT4, oid::FLOAT8),
+    OperatorSig::binary(556, "-", oid::INT2, oid::INT4, oid::INT4),
+    OperatorSig::binary(557, "-", oid::INT4, oid::INT2, oid::INT4),
+    OperatorSig::binary(823, "-", oid::INT2, oid::INT8, oid::INT8),
+    OperatorSig::binary(819, "-", oid::INT8, oid::INT2, oid::INT8),
+    OperatorSig::binary(693, "-", oid::INT4, oid::INT8, oid::INT8),
+    OperatorSig::binary(689, "-", oid::INT8, oid::INT4, oid::INT8),
+    OperatorSig::binary(1117, "-", oid::FLOAT4, oid::FLOAT8, oid::FLOAT8),
+    OperatorSig::binary(1127, "-", oid::FLOAT8, oid::FLOAT4, oid::FLOAT8),
+    OperatorSig::binary(544, "*", oid::INT2, oid::INT4, oid::INT4),
+    OperatorSig::binary(545, "*", oid::INT4, oid::INT2, oid::INT4),
+    OperatorSig::binary(824, "*", oid::INT2, oid::INT8, oid::INT8),
+    OperatorSig::binary(820, "*", oid::INT8, oid::INT2, oid::INT8),
+    OperatorSig::binary(694, "*", oid::INT4, oid::INT8, oid::INT8),
+    OperatorSig::binary(690, "*", oid::INT8, oid::INT4, oid::INT8),
+    OperatorSig::binary(1119, "*", oid::FLOAT4, oid::FLOAT8, oid::FLOAT8),
+    OperatorSig::binary(1129, "*", oid::FLOAT8, oid::FLOAT4, oid::FLOAT8),
+    OperatorSig::binary(546, "/", oid::INT2, oid::INT4, oid::INT4),
+    OperatorSig::binary(547, "/", oid::INT4, oid::INT2, oid::INT4),
+    OperatorSig::binary(825, "/", oid::INT2, oid::INT8, oid::INT8),
+    OperatorSig::binary(821, "/", oid::INT8, oid::INT2, oid::INT8),
+    OperatorSig::binary(695, "/", oid::INT4, oid::INT8, oid::INT8),
+    OperatorSig::binary(691, "/", oid::INT8, oid::INT4, oid::INT8),
+    OperatorSig::binary(1118, "/", oid::FLOAT4, oid::FLOAT8, oid::FLOAT8),
+    OperatorSig::binary(1128, "/", oid::FLOAT8, oid::FLOAT4, oid::FLOAT8),
     // Unary minus (`oprkind = 'l'`, prefix). Exercises the `left: None`
     // half of `OperatorSig` — negation is Postgres's only common builtin
     // prefix operator over these types.
@@ -380,17 +511,85 @@ mod tests {
         assert_eq!(op.result, oid::BOOL);
     }
 
-    /// `int4 = int8` has no row of its own in this table (see the module
-    /// docs on why cross-type rows are not tabulated); it must still resolve,
-    /// by implicitly widening the int4 side to int8 and landing on the
-    /// `int8 = int8` row.
+    /// `int4 = int8` has its own real row now (oid 15, confirmed live — see
+    /// the module docs; oid 416 is the *reverse* pair, `int8 = int4`, easy
+    /// to get backwards without checking a live server), and must resolve to
+    /// *that* exact row rather than by implicitly widening the int4 side
+    /// onto the `int8 = int8` row (oid 410). Landing on 410 would still
+    /// produce the right boolean answer but the wrong plan, exactly the
+    /// divergence from Postgres this table now closes.
     #[test]
-    fn cross_type_comparison_resolves_via_implicit_widening() {
-        let op =
-            resolve("=", Some(oid::INT4), oid::INT8).expect("int4 = int8 must resolve by widening");
-        assert_eq!(op.oid, Oid(410), "should land on the int8 = int8 row");
-        assert_eq!(op.left, Some(oid::INT8));
+    fn cross_type_comparison_resolves_to_its_own_real_oid() {
+        let op = resolve("=", Some(oid::INT4), oid::INT8).expect("int4 = int8 must resolve");
+        assert_eq!(op.oid, Oid(15), "must be int4 = int8's own oid, not int8 = int8 (410) nor the reverse pair int8 = int4 (416)");
+        assert_eq!(op.left, Some(oid::INT4));
         assert_eq!(op.right, oid::INT8);
+        assert_eq!(op.result, oid::BOOL);
+
+        let reverse = resolve("=", Some(oid::INT8), oid::INT4).expect("int8 = int4 must resolve");
+        assert_eq!(
+            reverse.oid,
+            Oid(416),
+            "the reverse pair has its own distinct oid"
+        );
+    }
+
+    /// Every new cross-type row's declared result type matches what the live
+    /// server reports for that exact oid (see the module docs for the
+    /// query): comparisons always `bool`, arithmetic the wider operand type.
+    #[test]
+    fn cross_type_rows_have_the_servers_result_type() {
+        // Comparison: always bool, both directions.
+        assert_eq!(
+            resolve("=", Some(oid::INT2), oid::INT4).unwrap().result,
+            oid::BOOL
+        );
+        assert_eq!(
+            resolve("<", Some(oid::FLOAT8), oid::FLOAT4).unwrap().result,
+            oid::BOOL
+        );
+        // Arithmetic: result widens to the bigger operand type, per row,
+        // matching the live catalog exactly (not just "some numeric type").
+        let int2_plus_int8 = resolve("+", Some(oid::INT2), oid::INT8).unwrap();
+        assert_eq!(int2_plus_int8.oid, Oid(822));
+        assert_eq!(int2_plus_int8.result, oid::INT8);
+
+        let int8_times_int4 = resolve("*", Some(oid::INT8), oid::INT4).unwrap();
+        assert_eq!(int8_times_int4.oid, Oid(690));
+        assert_eq!(int8_times_int4.result, oid::INT8);
+
+        let float4_div_float8 = resolve("/", Some(oid::FLOAT4), oid::FLOAT8).unwrap();
+        assert_eq!(float4_div_float8.oid, Oid(1118));
+        assert_eq!(float4_div_float8.result, oid::FLOAT8);
+
+        let int4_minus_int2 = resolve("-", Some(oid::INT4), oid::INT2).unwrap();
+        assert_eq!(int4_minus_int2.oid, Oid(557));
+        assert_eq!(int4_minus_int2.result, oid::INT4);
+    }
+
+    /// `numeric` and int/float pairs have no native cross-type row in
+    /// Postgres (confirmed live — see the module docs), so these must still
+    /// resolve via `resolve`'s implicit-coercion fallback exactly as before
+    /// this table grew the int2/int4/int8/float4/float8 rows above. This
+    /// guards against the fallback silently breaking for the pairs that
+    /// still depend on it.
+    #[test]
+    fn untabulated_cross_type_pairs_still_resolve_via_coercion_fallback() {
+        let numeric_eq_float8 =
+            resolve("=", Some(oid::NUMERIC), oid::FLOAT8).expect("numeric = float8 must resolve");
+        assert_eq!(
+            numeric_eq_float8.oid,
+            Oid(670),
+            "must land on the float8 = float8 row by widening"
+        );
+
+        let int4_plus_float8 =
+            resolve("+", Some(oid::INT4), oid::FLOAT8).expect("int4 + float8 must resolve");
+        assert_eq!(
+            int4_plus_float8.oid,
+            Oid(591),
+            "must land on the float8 + float8 row by widening"
+        );
     }
 
     /// `text = int4` has no implicit path in either direction — text only
@@ -515,6 +714,22 @@ mod tests {
     #[test]
     fn unknown_operator_name_does_not_resolve() {
         assert_eq!(resolve("<=>", Some(oid::INT4), oid::INT4), None);
+    }
+
+    /// Pins the total row count so an accidental deletion (or an accidental
+    /// duplicate) shows up as a failing test rather than silently shrinking
+    /// (or bloating) the table. 131 pre-existing rows plus the 80 cross-type
+    /// rows this change added (48 comparison + 32 arithmetic, across
+    /// int2/int4/int8/float4/float8 — see the module docs) is 211. If this
+    /// legitimately changes, recount by hand against the module docs before
+    /// updating the number here.
+    #[test]
+    fn total_operator_row_count_is_pinned() {
+        assert_eq!(
+            OPERATORS.len(),
+            211,
+            "row count changed — update this pin only after confirming the new rows against a live server"
+        );
     }
 
     /// Every row's declared result is a real, representable type — guards
