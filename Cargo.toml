@@ -4,6 +4,7 @@ members = [
     "crates/basin-common",
     "crates/basin-pgtype",
     "crates/basin-plan",
+    "crates/basin-exec",
     "crates/basin-storage",
     "crates/basin-catalog",
     "crates/basin-engine",
@@ -61,6 +62,9 @@ basin-pgtype = { path = "crates/basin-pgtype" }
 # to the optimizer. No DataFusion, no storage, no tokio — a plan must be
 # describable without reference to how it runs. ADR 0030.
 basin-plan = { path = "crates/basin-plan" }
+# Physical execution. Orchestration over arrow kernels — arrow supplies the
+# vectorised primitives, so this layer is plan nodes, not compute. ADR 0030.
+basin-exec = { path = "crates/basin-exec" }
 basin-fn = { path = "crates/basin-fn" }
 basin-storage = { path = "crates/basin-storage" }
 basin-catalog = { path = "crates/basin-catalog" }

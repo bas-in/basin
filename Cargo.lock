@@ -1269,6 +1269,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "basin-exec"
+version = "0.1.10"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "arrow-select",
+ "basin-pgtype",
+ "basin-plan",
+]
+
+[[package]]
 name = "basin-fn"
 version = "0.1.10"
 dependencies = [
