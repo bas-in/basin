@@ -16,9 +16,18 @@
 #
 # Baseline captured 2026-08-12 after the column-naming fix (7131b8b5), which
 # took the count from 41 to 28. Root-cause breakdown: docs/migration/df-removal/16-differential-baseline.md
+#
+# 2026-08-12: fixing `pg_colnames::resolve_pass_through_aggregate_columns`
+# (bare `SELECT agg(...) FROM t` naming, C1a) plus two unrelated fixes already
+# landed on this branch took 28 down to 24: diff_agg_filter_plain and
+# diff_window_percentile_disc (both C1a -- percentile_disc WITHIN GROUP is an
+# ordered-set aggregate, so it went through the same Aggregate-input
+# Projection shape as sum(a)) closed with the naming fix; diff_sanity_select_null
+# and diff_error_not_null_violation closed independently. diff_txn_rollback
+# (also C1a per the cluster doc) is still failing -- not the same shape;
+# undiagnosed, left in the baseline.
 diff_advisory_blocking_lock_uncontended
 diff_advisory_xact_lock_releases_on_commit
-diff_agg_filter_plain
 diff_array_containment_operators
 diff_cast_int8_to_int4_overflow
 diff_cast_matrix_basic
@@ -26,7 +35,6 @@ diff_cross_schema_qualified_insert
 diff_cross_schema_update_only_target_schema
 diff_drop_schema_with_tables_restrict_errors
 diff_error_division_by_zero
-diff_error_not_null_violation
 diff_jsonb_array_elements_literal_srf
 diff_jsonb_arrow_op
 diff_jsonb_double_arrow_op
@@ -35,7 +43,6 @@ diff_jsonb_path_op
 diff_lateral_basic
 diff_lateral_generate_series
 diff_lateral_left_join
-diff_sanity_select_null
 diff_schema_isolation_multi_schema
 diff_serial_nextval_currval
 diff_serial_setval
@@ -43,5 +50,4 @@ diff_str_format_and_position
 diff_txn_rollback
 diff_type_date_interval_arithmetic
 diff_type_text_to_int_implicit_cast_errors
-diff_window_percentile_disc
 !diff_advisory_two_int4_form  # advisory locks are session-scoped; fails or passes with test order

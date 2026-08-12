@@ -21,19 +21,42 @@
 //! quietly does something else when it meets an unimplemented node produces
 //! wrong answers instead of errors.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::Arc;
 
-use basin_plan::{Expr, LogicalPlan, SortKey as PlanSortKey, TableId};
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
+
+use basin_pgtype::PgType;
+use basin_plan::{ColId, CteId, Expr, LogicalPlan, OnConflict, SortKey as PlanSortKey, TableId};
 
 use crate::aggregate::{AggFunc, AggregateSpec, HashAggregate};
-use crate::cte::ProjectSet;
+use crate::cte::{CteBuffer, ProjectSet};
+use crate::dml::{ConflictAction, Delete, Insert, MemoryRowSink, RowSink, Update};
 use crate::join::HashJoin;
+use crate::lateral::{InnerFactory, LateralJoin};
 use crate::operator::{ExecError, Operator};
 use crate::project::{Filter, Project};
+use crate::recursive::{RecursiveCte, RecursiveTermFactory};
 use crate::scan::{BatchSource, Scan};
 use crate::setop::{Distinct, Empty, SetOp, Values};
 use crate::sort::{Sort, SortKey, TopK};
 use crate::window::{OrderKey, WindowAgg, WindowFunc, WindowSpec};
+
+/// The current outer row a correlated rebuild is bound to — `Some` only
+/// while [`build_inner`] is constructing a `LateralJoin`'s inner side (once
+/// per outer row) or a `WITH RECURSIVE` recursive term (once per
+/// iteration); `None` everywhere else, including the entire ordinary build
+/// path. See [`bind_outer`].
+type Outer<'a> = Option<(&'a RecordBatch, usize)>;
+
+/// Every [`CteBuffer`] registered so far in this build, shared (not copied)
+/// into the `'static` closures a `LateralJoin`/`RecursiveCte` factory
+/// captures — see [`SnapshotResolver`]'s doc comment for why those closures
+/// cannot simply borrow anything from the top-level call instead.
+type CteRegistry = Rc<RefCell<HashMap<CteId, CteBuffer>>>;
 
 /// Why a plan could not be turned into operators.
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +65,13 @@ pub enum BuildError {
     Unsupported(String),
     /// A table the resolver does not know.
     UnknownTable(TableId),
+    /// A `CteRef` naming a `CteId` no enclosing `Cte` node registered. This
+    /// is a planner bug, not a user error — every `CteRef` a correct
+    /// planner emits is inside the scope of the `Cte` that defines it — and
+    /// it is reported rather than built as an empty relation precisely
+    /// because an empty relation would look like a valid, if surprising,
+    /// answer instead of the broken plan it actually is.
+    UnknownCte(CteId),
     /// A sort or group key that is not a plain column reference. Physical
     /// operators key on column positions, so anything else has to be
     /// materialised by a `Project` below them first — a job for the optimizer,
@@ -56,6 +86,10 @@ impl std::fmt::Display for BuildError {
         match self {
             BuildError::Unsupported(what) => write!(f, "not yet executable: {what}"),
             BuildError::UnknownTable(t) => write!(f, "unknown table {t:?}"),
+            BuildError::UnknownCte(id) => write!(
+                f,
+                "CTE reference to {id:?}, which nothing registered — a planner bug"
+            ),
             BuildError::NonColumnKey(w) => {
                 write!(f, "{w} key must be a column reference at this stage")
             }
@@ -158,6 +192,91 @@ impl TableResolver for MemTableResolver {
     }
 }
 
+/// Where `INSERT`/`UPDATE`/`DELETE` write. The write-side mirror of
+/// [`TableResolver`]: `build.rs` asks for a [`RowSink`] and stays free of a
+/// storage dependency the same way the read side does via `BatchSource`.
+///
+/// Unlike a `Scan`'s projection, a write has no partial-column shape to
+/// negotiate — `RowSink::insert`'s contract already fixes the batch as the
+/// *full* write schema (see `dml.rs`'s module docs) — so this trait hands
+/// back that schema and the row-identity columns within it (what
+/// `UPDATE`/`DELETE` match on, and `INSERT ... ON CONFLICT`'s default
+/// target when the statement does not name one) alongside the sink itself,
+/// rather than asking for them piecemeal the way `TableResolver::open`
+/// negotiates a projection.
+pub trait DmlResolver {
+    /// Open a sink for `table`, together with its full write schema (every
+    /// column, in table-column order) and the positions within it that
+    /// uniquely identify a row.
+    fn open(&self, table: TableId) -> Option<(Box<dyn RowSink>, SchemaRef, Vec<usize>)>;
+}
+
+/// A [`RowSink`] that writes through a shared, `Rc`-backed
+/// [`MemoryRowSink`], so a [`MemDmlResolver`]'s caller can keep its own
+/// handle to inspect what was written after a build+execute — `RowSink`
+/// itself is consumed by value into the operator tree, so nothing else can
+/// reach it there. Not `Rc<RefCell<MemoryRowSink>>` implementing `RowSink`
+/// directly, because `RowSink`'s methods take `&mut self` and `Rc` alone
+/// does not give interior mutability.
+struct SharedMemoryRowSink(Rc<RefCell<MemoryRowSink>>);
+
+impl RowSink for SharedMemoryRowSink {
+    fn insert(&mut self, batch: &RecordBatch) -> Result<u64, ExecError> {
+        self.0.borrow_mut().insert(batch)
+    }
+
+    fn delete(&mut self, keys: &RecordBatch) -> Result<u64, ExecError> {
+        self.0.borrow_mut().delete(keys)
+    }
+}
+
+/// One registered table's write-side state, as [`MemDmlResolver`] tracks it.
+type MemDmlTable = (Rc<RefCell<MemoryRowSink>>, SchemaRef, Vec<usize>);
+
+/// A [`DmlResolver`] backed by in-memory [`MemoryRowSink`]s, for tests —
+/// the write-side counterpart of [`MemTableResolver`].
+#[derive(Default)]
+pub struct MemDmlResolver {
+    tables: HashMap<u32, MemDmlTable>,
+}
+
+impl MemDmlResolver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `table` as writable, with `key_cols` (positions within
+    /// `schema`) as its uniqueness key. Returns a handle the caller can use
+    /// to inspect the sink's contents after running a built plan — see
+    /// [`SharedMemoryRowSink`]'s doc comment for why a plain `RowSink`
+    /// cannot serve that purpose once it has been handed to `Insert`.
+    pub fn insert_table(
+        &mut self,
+        table: TableId,
+        schema: SchemaRef,
+        key_cols: Vec<usize>,
+    ) -> Rc<RefCell<MemoryRowSink>> {
+        let sink = Rc::new(RefCell::new(MemoryRowSink::new(
+            schema.clone(),
+            key_cols.clone(),
+        )));
+        self.tables
+            .insert(table.0, (Rc::clone(&sink), schema, key_cols));
+        sink
+    }
+}
+
+impl DmlResolver for MemDmlResolver {
+    fn open(&self, table: TableId) -> Option<(Box<dyn RowSink>, SchemaRef, Vec<usize>)> {
+        let (sink, schema, key_cols) = self.tables.get(&table.0)?;
+        Some((
+            Box::new(SharedMemoryRowSink(Rc::clone(sink))),
+            schema.clone(),
+            key_cols.clone(),
+        ))
+    }
+}
+
 /// Default memory budget for a buffering operator, in bytes.
 ///
 /// Deliberately a constant here rather than a policy: the real budget is a
@@ -166,7 +285,11 @@ impl TableResolver for MemTableResolver {
 /// would be worse than picking one and saying so.
 pub const DEFAULT_OPERATOR_BUDGET: usize = 256 * 1024 * 1024;
 
-/// Build an operator tree for `plan`.
+/// Build an operator tree for `plan`. No `INSERT`/`UPDATE`/`DELETE` in
+/// `plan` can build through this entry point — see [`build_with_dml`] — so
+/// this signature never changes shape no matter what else this module
+/// learns to build; existing callers are never asked for more than a
+/// [`TableResolver`].
 pub fn build(
     plan: &LogicalPlan,
     tables: &dyn TableResolver,
@@ -175,11 +298,44 @@ pub fn build(
 }
 
 /// Build an operator tree with an explicit memory budget for buffering
-/// operators.
+/// operators. Like [`build`], data-modifying statements are refused — see
+/// [`build_with_dml`].
 pub fn build_with_budget(
     plan: &LogicalPlan,
     tables: &dyn TableResolver,
     budget: usize,
+) -> Result<Box<dyn Operator>, BuildError> {
+    let ctes: CteRegistry = Rc::new(RefCell::new(HashMap::new()));
+    build_inner(plan, tables, None, budget, &ctes, None)
+}
+
+/// Build an operator tree that may contain `INSERT`/`UPDATE`/`DELETE`,
+/// resolving their write side through `dml`. A separate entry point rather
+/// than a new parameter on [`build`]/[`build_with_budget`]: those two stay
+/// exactly as they were before DML existed, so nothing that already calls
+/// them needs to acquire a write resolver it does not use.
+pub fn build_with_dml(
+    plan: &LogicalPlan,
+    tables: &dyn TableResolver,
+    dml: &dyn DmlResolver,
+    budget: usize,
+) -> Result<Box<dyn Operator>, BuildError> {
+    let ctes: CteRegistry = Rc::new(RefCell::new(HashMap::new()));
+    build_inner(plan, tables, Some(dml), budget, &ctes, None)
+}
+
+/// The actual recursive builder. `ctes` is threaded (not created fresh per
+/// call) so a `CteRef` anywhere under the plan — including inside a
+/// `LateralJoin`'s inner side or a `WITH RECURSIVE` recursive term's
+/// rebuilt subplan — can see every `Cte` registered by an ancestor. `outer`
+/// is `None` for the entire ordinary build; see [`Outer`].
+fn build_inner(
+    plan: &LogicalPlan,
+    tables: &dyn TableResolver,
+    dml: Option<&dyn DmlResolver>,
+    budget: usize,
+    ctes: &CteRegistry,
+    outer: Outer<'_>,
 ) -> Result<Box<dyn Operator>, BuildError> {
     match plan {
         LogicalPlan::Scan {
@@ -189,8 +345,12 @@ pub fn build_with_budget(
             ..
         } => {
             let cols: Vec<usize> = projection.iter().map(|c| c.0 as usize).collect();
+            let filters: Vec<Expr> = filters
+                .iter()
+                .map(|f| bind_outer(f, outer))
+                .collect::<Result<_, _>>()?;
             let (source, pushed) = tables
-                .open(*table, &cols, filters)
+                .open(*table, &cols, &filters)
                 .ok_or(BuildError::UnknownTable(*table))?;
 
             // Whatever the source declined, the scan still does. When the
@@ -206,19 +366,23 @@ pub fn build_with_budget(
             let scan_filters = if pushed.filters_applied {
                 Vec::new()
             } else {
-                filters.clone()
+                filters
             };
             Ok(Box::new(Scan::new(source, scan_cols, scan_filters)?))
         }
 
         LogicalPlan::Filter { input, predicate } => {
-            let child = build_with_budget(input, tables, budget)?;
-            Ok(Box::new(Filter::new(child, predicate.clone())))
+            let child = build_inner(input, tables, dml, budget, ctes, outer)?;
+            Ok(Box::new(Filter::new(child, bind_outer(predicate, outer)?)))
         }
 
         LogicalPlan::Project { input, exprs } => {
-            let child = build_with_budget(input, tables, budget)?;
-            Ok(Box::new(Project::new(child, exprs.clone())?))
+            let child = build_inner(input, tables, dml, budget, ctes, outer)?;
+            let exprs: Vec<(Expr, String)> = exprs
+                .iter()
+                .map(|(e, n)| Ok((bind_outer(e, outer)?, n.clone())))
+                .collect::<Result<_, BuildError>>()?;
+            Ok(Box::new(Project::new(child, exprs)?))
         }
 
         // `Limit` with a fetch and a sorted input is the top-K shape. Basin's
@@ -237,22 +401,25 @@ pub fn build_with_budget(
             if skip.is_some() {
                 return Err(BuildError::Unsupported("OFFSET".into()));
             }
-            let k = match fetch {
+            let fetch = fetch.as_ref().map(|e| bind_outer(e, outer)).transpose()?;
+            let k = match &fetch {
                 Some(e) => const_usize(e)
                     .ok_or_else(|| BuildError::Unsupported("non-constant LIMIT".into()))?,
-                None => return build_with_budget(input, tables, budget),
+                None => return build_inner(input, tables, dml, budget, ctes, outer),
             };
             if let LogicalPlan::Sort { input: si, keys } = input.as_ref() {
-                let child = build_with_budget(si, tables, budget)?;
-                Ok(Box::new(TopK::new(child, sort_keys(keys)?, k)))
+                let child = build_inner(si, tables, dml, budget, ctes, outer)?;
+                let keys = bind_sort_keys(keys, outer)?;
+                Ok(Box::new(TopK::new(child, sort_keys(&keys)?, k)))
             } else {
                 Err(BuildError::Unsupported("LIMIT without ORDER BY".into()))
             }
         }
 
         LogicalPlan::Sort { input, keys } => {
-            let child = build_with_budget(input, tables, budget)?;
-            Ok(Box::new(Sort::new(child, sort_keys(keys)?, budget)))
+            let child = build_inner(input, tables, dml, budget, ctes, outer)?;
+            let keys = bind_sort_keys(keys, outer)?;
+            Ok(Box::new(Sort::new(child, sort_keys(&keys)?, budget)))
         }
 
         LogicalPlan::Aggregate {
@@ -266,11 +433,19 @@ pub fn build_with_budget(
                     "GROUPING SETS / ROLLUP / CUBE".into(),
                 ));
             }
-            let child = build_with_budget(input, tables, budget)?;
+            let child = build_inner(input, tables, dml, budget, ctes, outer)?;
+            let group: Vec<Expr> = group
+                .iter()
+                .map(|e| bind_outer(e, outer))
+                .collect::<Result<_, _>>()?;
             let group_cols = group
                 .iter()
                 .map(|e| column_index(e).ok_or(BuildError::NonColumnKey("GROUP BY")))
                 .collect::<Result<Vec<_>, _>>()?;
+            let aggs: Vec<Expr> = aggs
+                .iter()
+                .map(|e| bind_outer(e, outer))
+                .collect::<Result<_, _>>()?;
             let specs = aggs
                 .iter()
                 .enumerate()
@@ -291,20 +466,109 @@ pub fn build_with_budget(
             if filter.is_some() {
                 return Err(BuildError::Unsupported("non-equi join condition".into()));
             }
-            let l = build_with_budget(left, tables, budget)?;
-            let r = build_with_budget(right, tables, budget)?;
+            let l = build_inner(left, tables, dml, budget, ctes, outer)?;
+            let r = build_inner(right, tables, dml, budget, ctes, outer)?;
             let mut lk = Vec::with_capacity(on.len());
             let mut rk = Vec::with_capacity(on.len());
             for (a, b) in on {
-                lk.push(column_index(a).ok_or(BuildError::NonColumnKey("join"))?);
-                rk.push(column_index(b).ok_or(BuildError::NonColumnKey("join"))?);
+                let a = bind_outer(a, outer)?;
+                let b = bind_outer(b, outer)?;
+                lk.push(column_index(&a).ok_or(BuildError::NonColumnKey("join"))?);
+                rk.push(column_index(&b).ok_or(BuildError::NonColumnKey("join"))?);
             }
             Ok(Box::new(HashJoin::new(l, r, *kind, lk, rk, budget)))
         }
 
+        // `LATERAL` — the inner side is rebuilt fresh per outer row via a
+        // factory, because its predicates may reference the outer row's own
+        // columns. See `lateral.rs`'s module docs for why a factory rather
+        // than a fixed operator, and [`bind_outer`]/[`SnapshotResolver`] for
+        // how this builder resolves the correlation and satisfies the
+        // factory's `'static` bound.
+        LogicalPlan::LateralJoin {
+            outer: outer_plan,
+            inner,
+            kind,
+        } => {
+            if !matches!(
+                kind,
+                basin_plan::JoinKind::Inner
+                    | basin_plan::JoinKind::Cross
+                    | basin_plan::JoinKind::Left
+            ) {
+                return Err(BuildError::Unsupported(format!(
+                    "LATERAL join of kind {kind:?}"
+                )));
+            }
+            if inner.is_mutating() {
+                return Err(BuildError::Unsupported(
+                    "data-modifying statement inside a LATERAL subquery".into(),
+                ));
+            }
+            let outer_op = build_inner(outer_plan, tables, dml, budget, ctes, outer)?;
+
+            let inner_plan = inner.as_ref().clone();
+            let mut snapshot = SnapshotResolver::default();
+            snapshot_scans(&inner_plan, tables, &mut snapshot)?;
+            let snapshot = Rc::new(snapshot);
+
+            // The inner side's schema is needed up front (the operator's own
+            // output schema depends on it) but no real outer row exists yet.
+            // A single all-NULL probe row gives every `OUTER_REF` column a
+            // literal of the right TYPE (derived from the outer schema's
+            // Arrow type, independent of the value) without needing one —
+            // see `outer_literal`'s NULL handling.
+            let outer_schema = outer_op.schema();
+            let probe_cols: Vec<arrow_array::ArrayRef> = outer_schema
+                .fields()
+                .iter()
+                .map(|f| arrow_array::new_null_array(f.data_type(), 1))
+                .collect();
+            let probe_batch = RecordBatch::try_new(Arc::clone(&outer_schema), probe_cols)
+                .map_err(|e| BuildError::Exec(ExecError::Internal(e.to_string())))?;
+            let inner_schema = build_inner(
+                &inner_plan,
+                snapshot.as_ref(),
+                None,
+                budget,
+                ctes,
+                Some((&probe_batch, 0)),
+            )?
+            .schema();
+
+            let snapshot_for_factory = Rc::clone(&snapshot);
+            let ctes_for_factory = Rc::clone(ctes);
+            let inner_plan_for_factory = inner_plan.clone();
+            let make_inner: InnerFactory = Box::new(move |row_batch: &RecordBatch, idx: usize| {
+                build_inner(
+                    &inner_plan_for_factory,
+                    snapshot_for_factory.as_ref(),
+                    None,
+                    budget,
+                    &ctes_for_factory,
+                    Some((row_batch, idx)),
+                )
+                .map_err(build_error_to_exec)
+            });
+            Ok(Box::new(LateralJoin::new(
+                outer_op,
+                inner_schema,
+                make_inner,
+                *kind,
+            )))
+        }
+
         LogicalPlan::Values { rows, schema } => {
             let names: Vec<String> = schema.iter().map(|(n, _)| n.clone()).collect();
-            Ok(Box::new(Values::new(rows.clone(), names)?))
+            let rows: Vec<Vec<Expr>> = rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|e| bind_outer(e, outer))
+                        .collect::<Result<_, _>>()
+                })
+                .collect::<Result<_, BuildError>>()?;
+            Ok(Box::new(Values::new(rows, names)?))
         }
 
         LogicalPlan::Empty {
@@ -324,10 +588,14 @@ pub fn build_with_budget(
         }
 
         LogicalPlan::Distinct { input, on } => {
-            let child = build_with_budget(input, tables, budget)?;
+            let child = build_inner(input, tables, dml, budget, ctes, outer)?;
             match on {
                 None => Ok(Box::new(Distinct::new(child, budget))),
                 Some(exprs) => {
+                    let exprs: Vec<Expr> = exprs
+                        .iter()
+                        .map(|e| bind_outer(e, outer))
+                        .collect::<Result<_, _>>()?;
                     let cols = exprs
                         .iter()
                         .map(|e| column_index(e).ok_or(BuildError::NonColumnKey("DISTINCT ON")))
@@ -343,8 +611,8 @@ pub fn build_with_budget(
             op,
             all,
         } => {
-            let l = build_with_budget(left, tables, budget)?;
-            let r = build_with_budget(right, tables, budget)?;
+            let l = build_inner(left, tables, dml, budget, ctes, outer)?;
+            let r = build_inner(right, tables, dml, budget, ctes, outer)?;
             Ok(Box::new(SetOp::new(l, r, *op, *all, budget)?))
         }
 
@@ -354,8 +622,12 @@ pub fn build_with_budget(
         // sorted by those keys and never re-sorts, so an unsorted input is a
         // planner bug it will not paper over.
         LogicalPlan::Window { input, windows } => {
-            let child = build_with_budget(input, tables, budget)?;
-            let (partition_by, order_by) = window_keys(windows)?;
+            let child = build_inner(input, tables, dml, budget, ctes, outer)?;
+            let windows: Vec<Expr> = windows
+                .iter()
+                .map(|e| bind_outer(e, outer))
+                .collect::<Result<_, _>>()?;
+            let (partition_by, order_by) = window_keys(&windows)?;
             let specs = windows
                 .iter()
                 .enumerate()
@@ -381,42 +653,762 @@ pub fn build_with_budget(
         // implements the modern rule; this comment exists because the older one
         // is what most references and most recollections still describe.
         LogicalPlan::ProjectSet { input, srfs } => {
-            let child = build_with_budget(input, tables, budget)?;
+            let child = build_inner(input, tables, dml, budget, ctes, outer)?;
             let named: Vec<(Expr, String)> = srfs
                 .iter()
                 .enumerate()
-                .map(|(i, e)| (e.clone(), format!("srf{i}")))
-                .collect();
+                .map(|(i, e)| Ok((bind_outer(e, outer)?, format!("srf{i}"))))
+                .collect::<Result<_, BuildError>>()?;
             Ok(Box::new(ProjectSet::new(child, named)?))
         }
 
-        other => Err(BuildError::Unsupported(plan_kind(other).to_string())),
+        // A `WITH` body is built once into a `CteBuffer` and registered by
+        // `CteId`; every `CteRef` to that id — however many there are —
+        // takes its own `CteReader` off the same buffer (see `cte.rs`'s
+        // module docs on why materialize-once/replay-many is the right
+        // shape, not just a convenient one). `recursive` selects whether the
+        // body is built as an ordinary subplan or as a `RecursiveCte`
+        // fixpoint loop (see `build_recursive_cte`); either way, the RESULT
+        // is wrapped in the same `CteBuffer`, so a recursive CTE referenced
+        // twice also replays in full both times, not just a non-recursive
+        // one.
+        LogicalPlan::Cte {
+            name,
+            recursive,
+            body,
+            input,
+        } => {
+            let body_op: Box<dyn Operator> = if *recursive {
+                build_recursive_cte(*name, body, tables, budget, ctes, outer)?
+            } else {
+                build_inner(body, tables, dml, budget, ctes, outer)?
+            };
+            let buffer = CteBuffer::new(body_op, budget);
+            ctes.borrow_mut().insert(*name, buffer);
+            build_inner(input, tables, dml, budget, ctes, outer)
+        }
+
+        // A planner bug, not a user error, if `name` was never registered —
+        // see `BuildError::UnknownCte`'s doc comment.
+        LogicalPlan::CteRef { name, .. } => {
+            let reader = {
+                let registered = ctes.borrow();
+                let buffer = registered.get(name).ok_or(BuildError::UnknownCte(*name))?;
+                buffer.reader()
+            };
+            Ok(Box::new(reader))
+        }
+
+        LogicalPlan::Insert {
+            table,
+            input,
+            columns: _,
+            on_conflict,
+            returning,
+        } => {
+            let dml_resolver = dml.ok_or_else(|| {
+                BuildError::Unsupported("INSERT (no write resolver configured)".into())
+            })?;
+            let (sink, write_schema, key_cols) = dml_resolver
+                .open(*table)
+                .ok_or(BuildError::UnknownTable(*table))?;
+            let input_op = build_inner(input, tables, dml, budget, ctes, outer)?;
+            if input_op.schema() != write_schema {
+                return Err(BuildError::Unsupported(format!(
+                    "INSERT input schema does not match {table:?}'s write schema — expected \
+                     {write_schema:?}, got {:?} (defaults/column order are assumed already \
+                     resolved upstream, per dml.rs's module docs)",
+                    input_op.schema()
+                )));
+            }
+            let action = bind_on_conflict(on_conflict, &write_schema, &key_cols)?;
+            let want_returning = returning.is_some();
+            let dml_op: Box<dyn Operator> =
+                Box::new(Insert::new(input_op, sink, action, want_returning));
+            wrap_returning(dml_op, returning, outer)
+        }
+
+        // `Update`/`Delete` carry no explicit input plan (unlike `Insert`) —
+        // this builder synthesises `Scan(table) [+ Filter(predicate)]`
+        // itself. `UPDATE … FROM` / `DELETE … USING` are refused rather than
+        // improvised as a cross join with no declared join condition to
+        // narrow it; see the module docs' "What is not built yet" posture.
+        LogicalPlan::Update {
+            table,
+            set,
+            from,
+            predicate,
+            returning,
+            snapshot,
+        } => {
+            if from.is_some() {
+                return Err(BuildError::Unsupported("UPDATE … FROM".into()));
+            }
+            let dml_resolver = dml.ok_or_else(|| {
+                BuildError::Unsupported("UPDATE (no write resolver configured)".into())
+            })?;
+            let (sink, write_schema, key_cols) = dml_resolver
+                .open(*table)
+                .ok_or(BuildError::UnknownTable(*table))?;
+            let n = write_schema.fields().len();
+            let scan = LogicalPlan::Scan {
+                table: *table,
+                projection: (0..n as u16).map(ColId).collect(),
+                filters: Vec::new(),
+                snapshot: *snapshot,
+            };
+            let scanned = build_inner(&scan, tables, dml, budget, ctes, outer)?;
+            let matched: Box<dyn Operator> = match predicate {
+                Some(p) => Box::new(Filter::new(scanned, bind_outer(p, outer)?)),
+                None => scanned,
+            };
+            let mut set_map: HashMap<usize, Expr> = HashMap::new();
+            for (c, e) in set {
+                set_map.insert(c.0 as usize, bind_outer(e, outer)?);
+            }
+            let exprs: Vec<(Expr, String)> = (0..n)
+                .map(|i| {
+                    let name = write_schema.field(i).name().clone();
+                    let e = set_map.remove(&i).unwrap_or_else(|| {
+                        Expr::Column(basin_plan::ColumnRef {
+                            relation: 0,
+                            index: i as u16,
+                            name: name.clone(),
+                        })
+                    });
+                    (e, name)
+                })
+                .collect();
+            let new_rows = Project::new(matched, exprs)?;
+            let want_returning = returning.is_some();
+            let dml_op: Box<dyn Operator> = Box::new(Update::new(
+                Box::new(new_rows),
+                sink,
+                key_cols,
+                want_returning,
+            ));
+            wrap_returning(dml_op, returning, outer)
+        }
+
+        LogicalPlan::Delete {
+            table,
+            using,
+            predicate,
+            returning,
+            snapshot,
+        } => {
+            if using.is_some() {
+                return Err(BuildError::Unsupported("DELETE … USING".into()));
+            }
+            let dml_resolver = dml.ok_or_else(|| {
+                BuildError::Unsupported("DELETE (no write resolver configured)".into())
+            })?;
+            let (sink, write_schema, key_cols) = dml_resolver
+                .open(*table)
+                .ok_or(BuildError::UnknownTable(*table))?;
+            let n = write_schema.fields().len();
+            let scan = LogicalPlan::Scan {
+                table: *table,
+                projection: (0..n as u16).map(ColId).collect(),
+                filters: Vec::new(),
+                snapshot: *snapshot,
+            };
+            let scanned = build_inner(&scan, tables, dml, budget, ctes, outer)?;
+            let matched: Box<dyn Operator> = match predicate {
+                Some(p) => Box::new(Filter::new(scanned, bind_outer(p, outer)?)),
+                None => scanned,
+            };
+            let want_returning = returning.is_some();
+            let dml_op: Box<dyn Operator> =
+                Box::new(Delete::new(matched, sink, key_cols, want_returning));
+            wrap_returning(dml_op, returning, outer)
+        }
     }
 }
 
-/// A short, stable name for a plan variant, for error messages.
-fn plan_kind(plan: &LogicalPlan) -> &'static str {
-    match plan {
-        LogicalPlan::Scan { .. } => "Scan",
-        LogicalPlan::Values { .. } => "VALUES",
-        LogicalPlan::Empty { .. } => "empty relation",
-        LogicalPlan::Project { .. } => "Project",
-        LogicalPlan::Filter { .. } => "Filter",
-        LogicalPlan::Aggregate { .. } => "Aggregate",
-        LogicalPlan::Sort { .. } => "Sort",
-        LogicalPlan::Limit { .. } => "Limit",
-        LogicalPlan::Join { .. } => "Join",
-        LogicalPlan::LateralJoin { .. } => "LATERAL join",
-        LogicalPlan::SetOp { .. } => "UNION / INTERSECT / EXCEPT",
-        LogicalPlan::Distinct { .. } => "DISTINCT",
-        LogicalPlan::Window { .. } => "window function",
-        LogicalPlan::ProjectSet { .. } => "set-returning function",
-        LogicalPlan::Cte { .. } => "CTE",
-        LogicalPlan::CteRef { .. } => "CTE reference",
-        LogicalPlan::Insert { .. } => "INSERT",
-        LogicalPlan::Update { .. } => "UPDATE",
-        LogicalPlan::Delete { .. } => "DELETE",
+/// Translate `Insert`'s `on_conflict` into the physical [`ConflictAction`].
+/// `ON CONFLICT ... WHERE` and a `SET` list narrower than the full row are
+/// refused rather than improvised — see `dml.rs`'s module docs on why
+/// `ConflictAction::DoUpdate` can only mean "replace the row wholesale".
+fn bind_on_conflict(
+    on_conflict: &Option<OnConflict>,
+    write_schema: &SchemaRef,
+    resolver_key_cols: &[usize],
+) -> Result<Option<ConflictAction>, BuildError> {
+    match on_conflict {
+        None => Ok(None),
+        Some(OnConflict::DoNothing { .. }) => Ok(Some(ConflictAction::DoNothing)),
+        Some(OnConflict::DoUpdate {
+            target,
+            set,
+            predicate,
+        }) => {
+            if predicate.is_some() {
+                return Err(BuildError::Unsupported(
+                    "ON CONFLICT ... DO UPDATE ... WHERE".into(),
+                ));
+            }
+            if set.len() != write_schema.fields().len() {
+                return Err(BuildError::Unsupported(
+                    "ON CONFLICT DO UPDATE with a SET list narrower than the full row".into(),
+                ));
+            }
+            let key_cols = if target.is_empty() {
+                resolver_key_cols.to_vec()
+            } else {
+                target.iter().map(|c| c.0 as usize).collect()
+            };
+            Ok(Some(ConflictAction::DoUpdate { key_cols }))
+        }
     }
+}
+
+/// Wrap a DML operator's output with the `RETURNING` projection, if any —
+/// `Insert`/`Update`/`Delete` themselves only gate WHETHER any rows come
+/// out (`want_returning`), always at full row width; picking out (and
+/// computing) the actual `RETURNING` list is this builder's job, the same
+/// way `dml.rs`'s module docs describe "a `Project` to pick out the
+/// `RETURNING` list" sitting above the DML node.
+fn wrap_returning(
+    dml_op: Box<dyn Operator>,
+    returning: &Option<Vec<(Expr, String)>>,
+    outer: Outer<'_>,
+) -> Result<Box<dyn Operator>, BuildError> {
+    match returning {
+        None => Ok(dml_op),
+        Some(ret) => {
+            let exprs: Vec<(Expr, String)> = ret
+                .iter()
+                .map(|(e, n)| Ok((bind_outer(e, outer)?, n.clone())))
+                .collect::<Result<_, BuildError>>()?;
+            Ok(Box::new(Project::new(dml_op, exprs)?))
+        }
+    }
+}
+
+/// Upper bound on `WITH RECURSIVE` iterations — see `recursive.rs`'s module
+/// docs item 4 on why this crate needs one at all (no independent timer to
+/// let `statement_timeout` interrupt a non-terminating recursive term).
+/// Generous rather than tight: a genuinely converging query at this scale
+/// is already well past anything reasonable to run synchronously.
+const DEFAULT_RECURSION_LIMIT: usize = 10_000;
+
+/// Build a `RecursiveCte` for `body`, which must be `anchor UNION [ALL]
+/// recursive_term` — the only shape SQL's `WITH RECURSIVE` has. `dml` is
+/// deliberately not threaded into the recursive term's rebuilds: it runs
+/// inside a `'static` factory closure (see [`SnapshotResolver`]'s doc
+/// comment for why), and a data-modifying statement re-run once per
+/// iteration is refused up front instead, same as `LateralJoin`'s inner
+/// side.
+fn build_recursive_cte(
+    name: CteId,
+    body: &LogicalPlan,
+    tables: &dyn TableResolver,
+    budget: usize,
+    ctes: &CteRegistry,
+    outer: Outer<'_>,
+) -> Result<Box<dyn Operator>, BuildError> {
+    let LogicalPlan::SetOp {
+        left,
+        right,
+        op: basin_plan::SetOpKind::Union,
+        all,
+    } = body
+    else {
+        return Err(BuildError::Unsupported(
+            "WITH RECURSIVE body must be UNION [ALL] of an anchor and a recursive term".into(),
+        ));
+    };
+    if right.is_mutating() {
+        return Err(BuildError::Unsupported(
+            "data-modifying statement inside a WITH RECURSIVE recursive term".into(),
+        ));
+    }
+
+    let anchor_op = build_inner(left, tables, None, budget, ctes, outer)?;
+    let anchor_schema = anchor_op.schema();
+
+    let recursive_plan = right.as_ref().clone();
+    let mut snapshot = SnapshotResolver::default();
+    snapshot_scans(&recursive_plan, tables, &mut snapshot)?;
+    let snapshot = Rc::new(snapshot);
+    let ctes_captured = Rc::clone(ctes);
+    let schema_for_feed = Arc::clone(&anchor_schema);
+    let outer_owned: Option<(RecordBatch, usize)> = outer.map(|(b, i)| (b.clone(), i));
+
+    let recursive_term: RecursiveTermFactory = Box::new(move |working_table: Vec<RecordBatch>| {
+        // Bind `name` — this CTE's own name, as it appears inside its
+        // recursive term — to a plain one-shot replay of ONLY the working
+        // table just finished, never the shared, materialize-once buffer
+        // the enclosing `Cte` node is about to register `name` under (that
+        // buffer does not even exist while this factory runs, and would be
+        // the wrong semantics regardless — recursive.rs's module docs item
+        // 2). Re-inserting on every call is deliberate: each iteration's
+        // working table replaces the previous one under the same key.
+        let feed: Box<dyn Operator> =
+            Box::new(VecFeed::new(Arc::clone(&schema_for_feed), working_table));
+        ctes_captured
+            .borrow_mut()
+            .insert(name, CteBuffer::new(feed, budget));
+        let bound_outer = outer_owned.as_ref().map(|(b, i)| (b, *i));
+        build_inner(
+            &recursive_plan,
+            snapshot.as_ref(),
+            None,
+            budget,
+            &ctes_captured,
+            bound_outer,
+        )
+        .map_err(build_error_to_exec)
+    });
+
+    Ok(Box::new(RecursiveCte::new(
+        anchor_op,
+        recursive_term,
+        *all,
+        budget,
+        DEFAULT_RECURSION_LIMIT,
+    )))
+}
+
+/// A `'static`-safe, one-shot replay of an already-materialized set of
+/// batches — the recursive term's view of "the previous iteration's working
+/// table" (recursive.rs's module docs item 2), and the anchor half of the
+/// `Feed` shape every operator file's own test module defines locally.
+struct VecFeed {
+    schema: SchemaRef,
+    batches: std::collections::VecDeque<RecordBatch>,
+}
+
+impl VecFeed {
+    fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+        Self {
+            schema,
+            batches: batches.into(),
+        }
+    }
+}
+
+impl Operator for VecFeed {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecError> {
+        Ok(self.batches.pop_front())
+    }
+}
+
+/// A fully self-contained (owned, no borrowed lifetime) [`TableResolver`]
+/// covering exactly the `(table, projection)` pairs a subplan's `Scan`
+/// nodes asked for, built once by [`snapshot_scans`] before a
+/// `LateralJoin`'s inner side or a `WITH RECURSIVE` recursive term is
+/// handed to its factory closure.
+///
+/// # Why this exists
+///
+/// `lateral.rs`'s `InnerFactory` and `recursive.rs`'s `RecursiveTermFactory`
+/// are both `Box<dyn FnMut(...) -> ...>` with no lifetime parameter, which
+/// Rust defaults to `'static` for a boxed trait object with none written.
+/// The factory this builder installs has to call [`build_inner`] again on
+/// every invocation — once per outer row, or once per iteration — to
+/// realise the documented "re-lower and re-bind, then build a fresh
+/// physical operator" design (`lateral.rs`'s module docs), which means it
+/// needs a `TableResolver` to hand to that call. The one the top-level
+/// caller passed to [`build_with_budget`]/[`build_with_dml`] is only
+/// `&dyn TableResolver` for the duration of that one call — it cannot
+/// satisfy a `'static` closure no matter how long the referent actually
+/// lives, because the borrow checker has no way to know that from the type
+/// alone. Rather than widen every public entry point's signature to demand
+/// an owned, `'static`-safe handle that ordinary (non-correlated,
+/// non-recursive) queries never need, this builder eagerly drains exactly
+/// the base tables the correlated/recursive subplan touches — ONCE, while
+/// the real resolver is still in scope — into a private, fully owned
+/// snapshot, and gives the closure that instead.
+///
+/// This trades pushdown for the correlated/recursive fallback path only:
+/// every row/iteration rebuilds against the SAME in-memory snapshot rather
+/// than re-querying storage. The always-correct general LATERAL/`WITH
+/// RECURSIVE` path this exists to provide (see `lateral.rs`'s module docs
+/// on the textual rewrite it backstops) was never meant to match the fast
+/// path's I/O profile; only correctness is this path's contract.
+#[derive(Default)]
+struct SnapshotResolver {
+    tables: HashMap<(u32, Vec<usize>), (SchemaRef, Vec<RecordBatch>)>,
+}
+
+impl TableResolver for SnapshotResolver {
+    fn open(
+        &self,
+        table: TableId,
+        projection: &[usize],
+        _filters: &[Expr],
+    ) -> Option<(Box<dyn BatchSource>, ScanPushdown)> {
+        let (schema, batches) = self.tables.get(&(table.0, projection.to_vec()))?;
+        Some((
+            Box::new(crate::scan::VecBatchSource::new(
+                schema.clone(),
+                batches.clone(),
+            )),
+            // The columns stored are EXACTLY the ones requested, in the
+            // requested order — `projection_applied: true` is what tells
+            // the `Scan` arm not to re-index them as if they addressed the
+            // full, un-projected table.
+            ScanPushdown {
+                projection_applied: true,
+                filters_applied: false,
+            },
+        ))
+    }
+}
+
+/// Populate `into` with every `Scan` node's `(table, projection)` reachable
+/// from `plan`, draining each through the real `tables` resolver exactly
+/// once per distinct pair. See [`SnapshotResolver`]'s doc comment.
+fn snapshot_scans(
+    plan: &LogicalPlan,
+    tables: &dyn TableResolver,
+    into: &mut SnapshotResolver,
+) -> Result<(), BuildError> {
+    if let LogicalPlan::Scan {
+        table, projection, ..
+    } = plan
+    {
+        let cols: Vec<usize> = projection.iter().map(|c| c.0 as usize).collect();
+        let key = (table.0, cols.clone());
+        if let std::collections::hash_map::Entry::Vacant(e) = into.tables.entry(key) {
+            let (mut source, _pushed) = tables
+                .open(*table, &cols, &[])
+                .ok_or(BuildError::UnknownTable(*table))?;
+            let schema = source.schema();
+            let mut batches = Vec::new();
+            while let Some(b) = source.next_batch()? {
+                batches.push(b);
+            }
+            e.insert((schema, batches));
+        }
+    }
+    let mut result = Ok(());
+    plan.for_each_input(&mut |child| {
+        if result.is_ok() {
+            result = snapshot_scans(child, tables, into);
+        }
+    });
+    result
+}
+
+fn build_error_to_exec(e: BuildError) -> ExecError {
+    match e {
+        BuildError::Exec(inner) => inner,
+        other => ExecError::Internal(other.to_string()),
+    }
+}
+
+/// Following the correlation convention `basin_plan::opt::decorrelate`
+/// already establishes for correlated subqueries (`ColumnRef::relation ==
+/// 1` marks a reference reaching the enclosing query's row — see that
+/// module's docs), this builder adopts the same rule for
+/// `LogicalPlan::LateralJoin`'s inner side: `Expr` has no dedicated "outer
+/// reference" variant of its own, and a LATERAL subplan's correlation is
+/// structurally the same "0 is my own scope, 1 is the enclosing one"
+/// relationship a join's `on`/`filter` already uses.
+const OUTER_REF: u16 = 1;
+
+/// Bind `expr` to a specific outer row for a `LateralJoin`'s per-row
+/// rebuild or a `WITH RECURSIVE` recursive term's per-iteration rebuild
+/// (module docs: "constant-folding the correlated column references into
+/// literals, then building a fresh physical operator from that"). A no-op
+/// clone when `outer` is `None` — true everywhere except while rebuilding
+/// one of those two shapes.
+fn bind_outer(expr: &Expr, outer: Outer<'_>) -> Result<Expr, BuildError> {
+    match outer {
+        None => Ok(expr.clone()),
+        Some((batch, row)) => bind_outer_rec(expr, batch, row),
+    }
+}
+
+fn bind_sort_keys(keys: &[PlanSortKey], outer: Outer<'_>) -> Result<Vec<PlanSortKey>, BuildError> {
+    keys.iter()
+        .map(|k| {
+            Ok(PlanSortKey {
+                expr: bind_outer(&k.expr, outer)?,
+                descending: k.descending,
+                nulls_first: k.nulls_first,
+            })
+        })
+        .collect()
+}
+
+/// The recursive worker behind [`bind_outer`]. Walks every `Expr` variant —
+/// mirroring `basin_plan::Expr::for_each_child`'s own exhaustive match —
+/// replacing `Column(relation == OUTER_REF)` with the corresponding literal
+/// from `batch`'s row `row`. `Subquery`'s own `subplan` is deliberately left
+/// untouched (its `operand`, which belongs to THIS query level, is not) —
+/// the same "a subquery is a separate query level" rule
+/// `Expr::for_each_child` already states for exactly this reason. Aggregate
+/// and window `ORDER BY` lists are left unbound: a correlated ordering
+/// inside an aggregate/window is a corner this builder does not reach today
+/// — narrower than the general case, not silently wrong, since any
+/// `Column(OUTER_REF)` actually hiding there simply survives into `eval`,
+/// which has no relation-0 column to resolve it against and errors instead
+/// of guessing.
+fn bind_outer_rec(expr: &Expr, batch: &RecordBatch, row: usize) -> Result<Expr, BuildError> {
+    let b = |e: &Expr| -> Result<Box<Expr>, BuildError> {
+        Ok(Box::new(bind_outer_rec(e, batch, row)?))
+    };
+    let v = |es: &[Expr]| -> Result<Vec<Expr>, BuildError> {
+        es.iter().map(|e| bind_outer_rec(e, batch, row)).collect()
+    };
+    let ob = |o: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>, BuildError> {
+        o.as_deref().map(b).transpose()
+    };
+    Ok(match expr {
+        Expr::Column(c) if c.relation == OUTER_REF => {
+            outer_literal(batch.column(c.index as usize).as_ref(), row)?
+        }
+        Expr::Column(_) | Expr::Literal(..) | Expr::Parameter { .. } => expr.clone(),
+        Expr::Unary { op, arg } => Expr::Unary {
+            op: *op,
+            arg: b(arg)?,
+        },
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op: *op,
+            lhs: b(lhs)?,
+            rhs: b(rhs)?,
+        },
+        Expr::Cast { arg, to, kind } => Expr::Cast {
+            arg: b(arg)?,
+            to: *to,
+            kind: *kind,
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => Expr::Case {
+            operand: ob(operand)?,
+            whens: whens
+                .iter()
+                .map(|(w, t)| {
+                    Ok((
+                        bind_outer_rec(w, batch, row)?,
+                        bind_outer_rec(t, batch, row)?,
+                    ))
+                })
+                .collect::<Result<_, BuildError>>()?,
+            else_: ob(else_)?,
+        },
+        Expr::Coalesce(xs) => Expr::Coalesce(v(xs)?),
+        Expr::IsNull { arg, negated } => Expr::IsNull {
+            arg: b(arg)?,
+            negated: *negated,
+        },
+        Expr::BoolTest { arg, test } => Expr::BoolTest {
+            arg: b(arg)?,
+            test: *test,
+        },
+        Expr::DistinctFrom { lhs, rhs, negated } => Expr::DistinctFrom {
+            lhs: b(lhs)?,
+            rhs: b(rhs)?,
+            negated: *negated,
+        },
+        Expr::InList { arg, list, negated } => Expr::InList {
+            arg: b(arg)?,
+            list: v(list)?,
+            negated: *negated,
+        },
+        Expr::Between {
+            arg,
+            low,
+            high,
+            symmetric,
+            negated,
+        } => Expr::Between {
+            arg: b(arg)?,
+            low: b(low)?,
+            high: b(high)?,
+            symmetric: *symmetric,
+            negated: *negated,
+        },
+        Expr::Like {
+            arg,
+            pattern,
+            escape,
+            case_insensitive,
+            negated,
+        } => Expr::Like {
+            arg: b(arg)?,
+            pattern: b(pattern)?,
+            escape: ob(escape)?,
+            case_insensitive: *case_insensitive,
+            negated: *negated,
+        },
+        Expr::ScalarFn { func, args } => Expr::ScalarFn {
+            func: *func,
+            args: v(args)?,
+        },
+        Expr::Aggregate {
+            func,
+            args,
+            distinct,
+            filter,
+            order_by,
+        } => Expr::Aggregate {
+            func: *func,
+            args: v(args)?,
+            distinct: *distinct,
+            filter: ob(filter)?,
+            order_by: order_by.clone(),
+        },
+        Expr::Window {
+            func,
+            args,
+            partition_by,
+            order_by,
+            frame,
+        } => Expr::Window {
+            func: *func,
+            args: v(args)?,
+            partition_by: v(partition_by)?,
+            order_by: order_by.clone(),
+            frame: frame.clone(),
+        },
+        Expr::SetReturning { func, args } => Expr::SetReturning {
+            func: *func,
+            args: v(args)?,
+        },
+        Expr::Subquery {
+            kind,
+            subplan,
+            operand,
+        } => Expr::Subquery {
+            kind: *kind,
+            subplan: subplan.clone(),
+            operand: ob(operand)?,
+        },
+        Expr::ArrayLit(xs) => Expr::ArrayLit(v(xs)?),
+        Expr::RowLit(xs) => Expr::RowLit(v(xs)?),
+        Expr::Subscript { arg, indices } => Expr::Subscript {
+            arg: b(arg)?,
+            indices: indices
+                .iter()
+                .map(|s| {
+                    Ok(match s {
+                        basin_plan::Subscript::Index(e) => {
+                            basin_plan::Subscript::Index(bind_outer_rec(e, batch, row)?)
+                        }
+                        basin_plan::Subscript::Slice { lower, upper } => {
+                            basin_plan::Subscript::Slice {
+                                lower: lower
+                                    .as_ref()
+                                    .map(|e| bind_outer_rec(e, batch, row))
+                                    .transpose()?,
+                                upper: upper
+                                    .as_ref()
+                                    .map(|e| bind_outer_rec(e, batch, row))
+                                    .transpose()?,
+                            }
+                        }
+                    })
+                })
+                .collect::<Result<_, BuildError>>()?,
+        },
+        Expr::FieldSelect { arg, field } => Expr::FieldSelect {
+            arg: b(arg)?,
+            field: *field,
+        },
+    })
+}
+
+/// Read one value out of an Arrow array as an [`Expr::Literal`]. Only the
+/// handful of primitive types a `LateralJoin`'s correlated columns are
+/// expected to be built from — matching [`pg_type_for_arrow`]'s coverage —
+/// are supported; anything else is refused rather than guessed at.
+fn outer_literal(col: &dyn arrow_array::Array, row: usize) -> Result<Expr, BuildError> {
+    use arrow_array::{
+        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, StringArray,
+    };
+    use basin_plan::Datum;
+
+    let ty = pg_type_for_arrow(col.data_type())?;
+    if col.is_null(row) {
+        return Ok(Expr::Literal(Datum::Null, ty));
+    }
+    let datum = match col.data_type() {
+        arrow_schema::DataType::Boolean => Datum::Bool(
+            col.as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(row),
+        ),
+        arrow_schema::DataType::Int16 => Datum::Int16(
+            col.as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap()
+                .value(row),
+        ),
+        arrow_schema::DataType::Int32 => Datum::Int32(
+            col.as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(row),
+        ),
+        arrow_schema::DataType::Int64 => Datum::Int64(
+            col.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row),
+        ),
+        arrow_schema::DataType::Float32 => Datum::Float32(
+            col.as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(row),
+        ),
+        arrow_schema::DataType::Float64 => Datum::Float64(
+            col.as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row),
+        ),
+        arrow_schema::DataType::Utf8 => Datum::Utf8(
+            col.as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        ),
+        other => {
+            return Err(BuildError::Unsupported(format!(
+                "LATERAL outer reference of Arrow type {other:?}"
+            )))
+        }
+    };
+    Ok(Expr::Literal(datum, ty))
+}
+
+/// The [`PgType`] whose [`basin_pgtype::physical`] round-trips to `dt` —
+/// the reverse of the direction `eval.rs`'s `eval_literal` normally needs,
+/// required here because an outer row's column only carries an Arrow type,
+/// and the literal replacing it must carry a `PgType` that maps back to
+/// that exact Arrow type or `eval` will build the wrong kind of array for
+/// it.
+fn pg_type_for_arrow(dt: &arrow_schema::DataType) -> Result<PgType, BuildError> {
+    use arrow_schema::DataType;
+    Ok(match dt {
+        DataType::Boolean => PgType::BOOL,
+        DataType::Int16 => PgType::INT2,
+        DataType::Int32 => PgType::INT4,
+        DataType::Int64 => PgType::INT8,
+        DataType::Float32 => PgType::FLOAT4,
+        DataType::Float64 => PgType::FLOAT8,
+        DataType::Utf8 => PgType::TEXT,
+        other => {
+            return Err(BuildError::Unsupported(format!(
+                "LATERAL outer reference of Arrow type {other:?}"
+            )))
+        }
+    })
 }
 
 /// The column position an expression refers to, if it is a plain column.
@@ -714,7 +1706,7 @@ fn offset_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use basin_pgtype::PgType;
     use basin_plan::{ColId, ColumnRef, Datum, SnapshotId};
@@ -831,18 +1823,24 @@ mod tests {
     #[test]
     fn an_unbuildable_plan_names_the_construct() {
         // This test exists to go stale. DISTINCT was the example, then window
-        // functions; both build now. CTEs are the current frontier — when this
-        // fails again, that is the good outcome and the next unimplemented
-        // shape takes its place.
-        let plan = LogicalPlan::CteRef {
-            name: basin_plan::CteId(0),
-            schema: vec![("x".into(), basin_pgtype::PgType::INT8)],
+        // functions, then CTEs — all three build now (and so do LATERAL,
+        // WITH RECURSIVE, and INSERT/UPDATE/DELETE). GROUPING SETS / ROLLUP /
+        // CUBE is the current frontier — when this fails again, that is the
+        // good outcome and the next unimplemented shape takes its place.
+        let plan = LogicalPlan::Aggregate {
+            input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+            group: vec![col(0, "id")],
+            aggs: vec![],
+            grouping_sets: Some(basin_plan::GroupingSets(vec![vec![0]])),
         };
         let err = match build(&plan, &resolver()) {
             Err(e) => e,
-            Ok(_) => panic!("CTEs have no operator yet and must not build"),
+            Ok(_) => panic!("GROUPING SETS has no operator yet and must not build"),
         };
-        assert_eq!(err, BuildError::Unsupported("CTE reference".into()));
+        assert_eq!(
+            err,
+            BuildError::Unsupported("GROUPING SETS / ROLLUP / CUBE".into())
+        );
     }
 
     #[test]
@@ -906,5 +1904,420 @@ mod tests {
             rows, 3,
             "generate_series(1,3) expands one input row to three"
         );
+    }
+
+    // ── CTE ──────────────────────────────────────────────────────────────
+
+    /// A `WITH x AS (...) SELECT * FROM x` plan reaches the
+    /// `CteBuffer`/`CteReader` operators through the builder — the whole
+    /// point of wiring `LogicalPlan::Cte`/`CteRef` at all.
+    #[test]
+    fn a_non_recursive_cte_executes_end_to_end() {
+        let plan = LogicalPlan::Cte {
+            name: basin_plan::CteId(0),
+            recursive: false,
+            body: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+            input: Box::new(LogicalPlan::CteRef {
+                name: basin_plan::CteId(0),
+                schema: vec![
+                    ("id".into(), basin_pgtype::PgType::INT4),
+                    ("v".into(), basin_pgtype::PgType::INT4),
+                ],
+            }),
+        };
+        let rows: usize = drain(build(&plan, &resolver()).unwrap())
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 4);
+    }
+
+    /// A CTE referenced TWICE must return the FULL result both times — a
+    /// replay that drained the body on the first reference would silently
+    /// leave the second with zero rows. `cte.rs`'s own
+    /// `cte_referenced_twice_returns_full_results_both_times` proves this
+    /// one layer down (`CteBuffer`/`CteReader` directly); this proves the
+    /// BUILDER actually wires two `CteRef`s to two independent
+    /// `CteReader`s off one `CteBuffer`, rather than, say, re-running the
+    /// body twice (which would also pass a row-count check but violate the
+    /// "materialize once" contract `cte.rs`'s module docs describe).
+    #[test]
+    fn a_cte_referenced_twice_via_the_builder_returns_full_results_both_times() {
+        let cte_ref = || LogicalPlan::CteRef {
+            name: basin_plan::CteId(0),
+            schema: vec![
+                ("id".into(), basin_pgtype::PgType::INT4),
+                ("v".into(), basin_pgtype::PgType::INT4),
+            ],
+        };
+        let plan = LogicalPlan::Cte {
+            name: basin_plan::CteId(0),
+            recursive: false,
+            body: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+            input: Box::new(LogicalPlan::SetOp {
+                left: Box::new(cte_ref()),
+                right: Box::new(cte_ref()),
+                op: basin_plan::SetOpKind::Union,
+                all: true,
+            }),
+        };
+        let rows: usize = drain(build(&plan, &resolver()).unwrap())
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(
+            rows, 8,
+            "4 rows from each of the two references to the same CTE, not 4+0"
+        );
+    }
+
+    /// A `CteRef` to a `CteId` nothing registered is a planner bug, not a
+    /// user error, and must be REPORTED — not silently built as an empty
+    /// relation, which would look like a valid (if surprising) answer
+    /// instead of the broken plan it actually is.
+    #[test]
+    fn an_unregistered_cte_ref_is_reported_not_emptied() {
+        let plan = LogicalPlan::CteRef {
+            name: basin_plan::CteId(7),
+            schema: vec![("x".into(), basin_pgtype::PgType::INT8)],
+        };
+        let err = match build(&plan, &resolver()) {
+            Err(e) => e,
+            Ok(_) => panic!("an unregistered CteRef must not silently build as empty"),
+        };
+        assert_eq!(err, BuildError::UnknownCte(basin_plan::CteId(7)));
+    }
+
+    // ── WITH RECURSIVE ──────────────────────────────────────────────────
+
+    /// `WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE
+    /// n < 5) SELECT n FROM t` — the classic bounded counter (verified live
+    /// against Postgres in `recursive.rs`'s module docs), reaching
+    /// `RecursiveCte` through the builder for the first time. Previously
+    /// this operator was only exercised directly, with no planner path to
+    /// it at all.
+    #[test]
+    fn with_recursive_bounded_counter_executes_end_to_end() {
+        let cte_ref = LogicalPlan::CteRef {
+            name: basin_plan::CteId(0),
+            schema: vec![("n".into(), PgType::INT4)],
+        };
+        let anchor = LogicalPlan::Values {
+            rows: vec![vec![Expr::Literal(Datum::Int32(1), PgType::INT4)]],
+            schema: vec![("n".into(), PgType::INT4)],
+        };
+        let recursive_term = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(cte_ref.clone()),
+                // n < 5 — OID 97 is int4 '<', verified against pg_operator.
+                predicate: Expr::Binary {
+                    op: basin_plan::OpId(basin_pgtype::Oid(97)),
+                    lhs: Box::new(col(0, "n")),
+                    rhs: Box::new(Expr::Literal(Datum::Int32(5), PgType::INT4)),
+                },
+            }),
+            exprs: vec![(
+                // n + 1 — OID 551 is int4 '+'.
+                Expr::Binary {
+                    op: basin_plan::OpId(basin_pgtype::Oid(551)),
+                    lhs: Box::new(col(0, "n")),
+                    rhs: Box::new(Expr::Literal(Datum::Int32(1), PgType::INT4)),
+                },
+                "n".into(),
+            )],
+        };
+        let plan = LogicalPlan::Cte {
+            name: basin_plan::CteId(0),
+            recursive: true,
+            body: Box::new(LogicalPlan::SetOp {
+                left: Box::new(anchor),
+                right: Box::new(recursive_term),
+                op: basin_plan::SetOpKind::Union,
+                all: true,
+            }),
+            input: Box::new(cte_ref),
+        };
+        let batches = drain(build(&plan, &resolver()).unwrap());
+        let mut values: Vec<i32> = batches.iter().flat_map(|b| col_i32(b, 0)).collect();
+        values.sort();
+        assert_eq!(values, vec![1, 2, 3, 4, 5]);
+    }
+
+    fn col_i32(batch: &RecordBatch, i: usize) -> Vec<i32> {
+        batch
+            .column(i)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect()
+    }
+
+    // ── LATERAL ──────────────────────────────────────────────────────────
+
+    fn two_table_resolver() -> MemTableResolver {
+        let mut r = MemTableResolver::new();
+        let outer_schema = Arc::new(Schema::new(vec![Field::new("o", DataType::Int32, true)]));
+        let outer_batch = RecordBatch::try_new(
+            outer_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        r.insert(TableId(1), outer_schema, vec![outer_batch]);
+
+        let inner_schema = Arc::new(Schema::new(vec![
+            Field::new("fk", DataType::Int32, true),
+            Field::new("v", DataType::Int32, true),
+        ]));
+        let inner_batch = RecordBatch::try_new(
+            inner_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 3])),
+                Arc::new(Int32Array::from(vec![100, 101, 300])),
+            ],
+        )
+        .unwrap();
+        r.insert(TableId(2), inner_schema, vec![inner_batch]);
+        r
+    }
+
+    /// `SELECT * FROM o CROSS JOIN LATERAL (SELECT * FROM t2 WHERE t2.fk =
+    /// o.o)` — the correlated fallback path `LateralJoin` exists for,
+    /// reached through the builder for the first time. `o`=2 has no
+    /// matching `t2` rows and must be dropped entirely (Inner LATERAL
+    /// semantics — see `lateral.rs`'s own
+    /// `inner_lateral_drops_outer_row_with_zero_inner_rows`); `o`=1
+    /// multiplies into two rows, `o`=3 into one.
+    #[test]
+    fn a_lateral_join_executes_end_to_end_with_correlation() {
+        let outer_plan = LogicalPlan::Scan {
+            table: TableId(1),
+            projection: vec![ColId(0)],
+            filters: vec![],
+            snapshot: SnapshotId(0),
+        };
+        let inner_plan = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Scan {
+                table: TableId(2),
+                projection: vec![ColId(0), ColId(1)],
+                filters: vec![],
+                snapshot: SnapshotId(0),
+            }),
+            // t2.fk = o.o — OID 96 is int4 '='. `relation: 1` marks the
+            // outer reference — see `OUTER_REF`.
+            predicate: Expr::Binary {
+                op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                lhs: Box::new(col(0, "fk")),
+                rhs: Box::new(Expr::Column(ColumnRef {
+                    relation: 1,
+                    index: 0,
+                    name: "o".into(),
+                })),
+            },
+        };
+        let plan = LogicalPlan::LateralJoin {
+            outer: Box::new(outer_plan),
+            inner: Box::new(inner_plan),
+            kind: basin_plan::JoinKind::Inner,
+        };
+        let batches = drain(build(&plan, &two_table_resolver()).unwrap());
+        let mut pairs: Vec<(i32, i32)> = batches
+            .iter()
+            .flat_map(|b| {
+                let o = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .clone();
+                let fk = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .clone();
+                (0..b.num_rows()).map(move |i| (o.value(i), fk.value(i)))
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![(1, 1), (1, 1), (3, 3)],
+            "o=2 has no matching t2 rows and is dropped under Inner LATERAL"
+        );
+    }
+
+    // ── DML ──────────────────────────────────────────────────────────────
+
+    fn dml_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("val", DataType::Utf8, true),
+        ]))
+    }
+
+    /// `INSERT INTO t (id, val) VALUES (...) RETURNING id, val` reaches the
+    /// `Insert` operator through the builder for the first time —
+    /// previously it was only exercised directly in `dml.rs`, with no
+    /// planner path to it.
+    #[test]
+    fn an_insert_executes_end_to_end_with_returning() {
+        let schema = dml_schema();
+        let mut dml = MemDmlResolver::new();
+        let sink = dml.insert_table(TableId(1), schema.clone(), vec![0]);
+
+        let plan = LogicalPlan::Insert {
+            table: TableId(1),
+            input: Box::new(LogicalPlan::Values {
+                rows: vec![
+                    vec![
+                        Expr::Literal(Datum::Int64(1), PgType::INT8),
+                        Expr::Literal(Datum::Utf8("a".into()), PgType::TEXT),
+                    ],
+                    vec![
+                        Expr::Literal(Datum::Int64(2), PgType::INT8),
+                        Expr::Literal(Datum::Utf8("b".into()), PgType::TEXT),
+                    ],
+                ],
+                schema: vec![("id".into(), PgType::INT8), ("val".into(), PgType::TEXT)],
+            }),
+            columns: vec![ColId(0), ColId(1)],
+            on_conflict: None,
+            returning: Some(vec![
+                (col(0, "id"), "id".into()),
+                (col(1, "val"), "val".into()),
+            ]),
+        };
+        let batches =
+            drain(build_with_dml(&plan, &resolver(), &dml, DEFAULT_OPERATOR_BUDGET).unwrap());
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "RETURNING yields both inserted rows");
+        assert_eq!(sink.borrow().len(), 2);
+    }
+
+    /// `INSERT` reached through the STABLE, 2-argument `build()` (no write
+    /// resolver available) must be refused cleanly, not panic or silently
+    /// drop the write — `build()`'s signature never changed to require a
+    /// `DmlResolver` every caller would otherwise have to acquire.
+    #[test]
+    fn insert_via_build_without_a_write_resolver_is_refused() {
+        let plan = LogicalPlan::Insert {
+            table: TableId(1),
+            input: Box::new(LogicalPlan::Values {
+                rows: vec![],
+                schema: vec![("id".into(), PgType::INT8)],
+            }),
+            columns: vec![ColId(0)],
+            on_conflict: None,
+            returning: None,
+        };
+        let err = match build(&plan, &resolver()) {
+            Err(e) => e,
+            Ok(_) => panic!("INSERT must not build without a write resolver"),
+        };
+        assert!(matches!(err, BuildError::Unsupported(ref s) if s.contains("INSERT")));
+    }
+
+    /// `UPDATE t SET val = 'new' WHERE id = 1 RETURNING id, val` — `Update`
+    /// carries no explicit input plan (unlike `Insert`), so this proves the
+    /// builder's own `Scan(table) + Filter(predicate) + Project(new
+    /// values)` synthesis, not just the `Update` operator underneath it.
+    #[test]
+    fn an_update_executes_end_to_end_with_returning() {
+        let schema = dml_schema();
+        let existing = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["old1", "old2"])),
+            ],
+        )
+        .unwrap();
+
+        // The scan side (what UPDATE reads to find rows to change) and the
+        // write side (what it writes through) are two independent mocks
+        // here, the same way `TableResolver`/`DmlResolver` are two
+        // independent traits — pre-populate both consistently, as a real
+        // Storage-backed pair already would agree by construction.
+        let mut tables = MemTableResolver::new();
+        tables.insert(TableId(1), schema.clone(), vec![existing.clone()]);
+        let mut dml = MemDmlResolver::new();
+        let sink = dml.insert_table(TableId(1), schema.clone(), vec![0]);
+        sink.borrow_mut().insert(&existing).unwrap();
+
+        let plan = LogicalPlan::Update {
+            table: TableId(1),
+            set: vec![(
+                ColId(1),
+                Expr::Literal(Datum::Utf8("new".into()), PgType::TEXT),
+            )],
+            from: None,
+            // id = 1 — OID 410 is int8 '='.
+            predicate: Some(Expr::Binary {
+                op: basin_plan::OpId(basin_pgtype::Oid(410)),
+                lhs: Box::new(col(0, "id")),
+                rhs: Box::new(Expr::Literal(Datum::Int64(1), PgType::INT8)),
+            }),
+            returning: Some(vec![
+                (col(0, "id"), "id".into()),
+                (col(1, "val"), "val".into()),
+            ]),
+            snapshot: SnapshotId(0),
+        };
+        let batches = drain(build_with_dml(&plan, &tables, &dml, DEFAULT_OPERATOR_BUDGET).unwrap());
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1, "only id=1 matched the predicate");
+        let vals: Vec<String> = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|v| v.unwrap().to_string())
+            .collect();
+        assert_eq!(vals, vec!["new"]);
+        assert_eq!(
+            sink.borrow().len(),
+            2,
+            "id=2 untouched, id=1 rewritten in place"
+        );
+    }
+
+    /// `DELETE FROM t WHERE id = 2 RETURNING id` — same "no explicit
+    /// input" synthesis as `UPDATE`, minus the new-value `Project`.
+    #[test]
+    fn a_delete_executes_end_to_end_with_returning() {
+        let schema = dml_schema();
+        let existing = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        let mut tables = MemTableResolver::new();
+        tables.insert(TableId(1), schema.clone(), vec![existing.clone()]);
+        let mut dml = MemDmlResolver::new();
+        let sink = dml.insert_table(TableId(1), schema.clone(), vec![0]);
+        sink.borrow_mut().insert(&existing).unwrap();
+
+        let plan = LogicalPlan::Delete {
+            table: TableId(1),
+            using: None,
+            // id = 2 — OID 410 is int8 '='.
+            predicate: Some(Expr::Binary {
+                op: basin_plan::OpId(basin_pgtype::Oid(410)),
+                lhs: Box::new(col(0, "id")),
+                rhs: Box::new(Expr::Literal(Datum::Int64(2), PgType::INT8)),
+            }),
+            returning: Some(vec![(col(0, "id"), "id".into())]),
+            snapshot: SnapshotId(0),
+        };
+        let batches = drain(build_with_dml(&plan, &tables, &dml, DEFAULT_OPERATOR_BUDGET).unwrap());
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1);
+        assert_eq!(sink.borrow().len(), 1, "id=2 removed, id=1 remains");
     }
 }

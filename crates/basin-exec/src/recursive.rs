@@ -693,14 +693,30 @@ mod tests {
 
     // ── Item 2: the recursive term sees only the PREVIOUS working table ──
 
-    // KNOWN FAILING — the assertion is correct, the implementation is not.
-    // A missing `working_set.push` was found and fixed (it counted rows
-    // without keeping them, so the recursive term got an empty table and the
-    // recursion stopped after the anchor, looking like correct termination).
-    // These two still fail, so at least one more accounting error remains in
-    // the working-table handoff. Ignored rather than weakened: they state the
-    // fixpoint semantics Postgres has.
-    #[ignore = "working-table handoff still loses rows between iterations"]
+    // The implementation was correct; the test's expected invocation count
+    // was not. A missing `working_set.push` was found and fixed elsewhere
+    // (it counted rows without keeping them, so the recursive term got an
+    // empty table and the recursion stopped after the anchor, looking like
+    // correct termination) — after that fix this test still failed, but the
+    // trace it printed (`[[1],[2],[3],[4]]`) is exactly what standard
+    // fixpoint evaluation produces: discovering the working table is finally
+    // empty REQUIRES invoking the recursive term one more time on the last
+    // non-empty working table and observing it yields nothing. Verified live
+    // against PostgreSQL 18.2 with a volatile marker function substituted for
+    // `r.node` in the recursive term's `WHERE` clause, over this exact
+    // `edges` graph:
+    // ```sql
+    // WITH RECURSIVE reach(node) AS (
+    //   SELECT 1
+    //   UNION
+    //   SELECT e.dst FROM edges e JOIN reach r ON e.src = r.node
+    //                              WHERE mark(r.node) -- logs (n, order)
+    // )
+    // SELECT node FROM reach ORDER BY node;
+    // -- log: (1,1), (2,2), (3,3), (4,4) -- four rounds, each fed exactly the
+    // -- single node the PREVIOUS round emitted, node 3 included. The old
+    // -- expectation `[[1],[2],[4]]` silently skipped node 3's own round.
+    // ```
     #[test]
     fn recursive_term_sees_only_the_previous_iterations_working_table_not_the_accumulated_result() {
         let edges: &[(i32, i32)] = &[(1, 2), (2, 3), (3, 1), (3, 4)];
@@ -736,33 +752,50 @@ mod tests {
 
         // Iteration 1 must see ONLY {1} (the anchor's output), never {1}
         // plus anything derived later. Iteration 2 must see ONLY {2} — not
-        // {1,2} — and iteration 3 must see ONLY {4} — not {1,2,4} or any
-        // other accumulation. If this operator instead fed the recursive
-        // term the FULL accumulated result so far, every entry below would
-        // be a growing superset instead of exactly one node.
+        // {1,2}. Iteration 3 must see ONLY {3} — not {1,2,3}. And iteration 4
+        // must see ONLY {4} — not {1,2,3,4} — and is invoked at all only
+        // because a working table (namely {4}) still needs to be tried
+        // before the empty result that ends the recursion can be observed.
+        // If this operator instead fed the recursive term the FULL
+        // accumulated result so far, every entry below would be a growing
+        // superset instead of exactly one node.
         assert_eq!(
             *seen_working_tables.borrow(),
-            vec![vec![1], vec![2], vec![4]],
+            vec![vec![1], vec![2], vec![3], vec![4]],
             "each invocation must see ONLY the immediately preceding iteration's rows"
         );
     }
 
     // ── Item 3: termination is an empty working set, not a fixed count ──
 
-    // KNOWN FAILING — the assertion is correct, the implementation is not.
-    // A missing `working_set.push` was found and fixed (it counted rows
-    // without keeping them, so the recursive term got an empty table and the
-    // recursion stopped after the anchor, looking like correct termination).
-    // These two still fail, so at least one more accounting error remains in
-    // the working-table handoff. Ignored rather than weakened: they state the
-    // fixpoint semantics Postgres has.
-    #[ignore = "working-table handoff still loses rows between iterations"]
+    // The implementation was correct; the test's expected iteration count
+    // was not. This test previously expected termination after 2 recursive-
+    // term invocations, but discovering the working table is finally empty
+    // REQUIRES invoking the recursive term one more time on the last
+    // non-empty working table ({3}) and observing it produces nothing — that
+    // is a 3rd invocation, not a stray extra one. Verified live against
+    // PostgreSQL 18.2 with a volatile marker function wrapped around `n` in
+    // the recursive term's `WHERE` clause:
+    // ```sql
+    // WITH RECURSIVE t(n) AS (
+    //   SELECT 1
+    //   UNION ALL
+    //   SELECT n+1 FROM t WHERE mark(n) < 3 -- mark() logs (n, order)
+    // )
+    // SELECT n FROM t ORDER BY n;
+    // -- log: (1,1), (2,2), (3,3) -- three rounds. The old expectation of 2
+    // -- rounds skipped the round that runs on {3} and discovers it's < 3
+    // -- is false, which is exactly what proves the working set went empty.
+    // ```
     #[test]
     fn termination_is_an_empty_working_set_not_a_fixed_iteration_count() {
-        // A recursive term that converges after exactly 2 iterations
-        // (n=1 -> n=2 -> n=3, then n=3 fails `n < 3` and produces nothing).
-        // The cap is set far higher (100) to prove termination happens
-        // because the working set went empty, not because a cap was hit.
+        // A recursive term that converges after exactly 3 invocations:
+        // n=1 -> n=2 (invocation 1), n=2 -> n=3 (invocation 2), then
+        // invocation 3 is handed {3}, finds `3 < 3` false, and produces
+        // nothing — that 3rd invocation is what discovers the working table
+        // is finally empty. The cap is set far higher (100) to prove
+        // termination happens because the working set went empty, not
+        // because a cap was hit.
         let schema = schema_1i32("n");
         let anchor = Feed::boxed(schema.clone(), vec![batch_i32(&schema, vec![Some(1)])]);
         let s = schema.clone();
@@ -786,9 +819,10 @@ mod tests {
         assert_eq!(out, vec![1, 2, 3]);
         assert_eq!(
             *iterations_run.borrow(),
-            2,
-            "must stop the moment the working set is empty (after deriving 2, then 3), \
-             not continue toward the 100-iteration cap"
+            3,
+            "must stop the moment the working set is empty (after deriving 2, then 3, then \
+             invoking once more on {{3}} to discover it produces nothing), not continue \
+             toward the 100-iteration cap"
         );
     }
 
