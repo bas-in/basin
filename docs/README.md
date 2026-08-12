@@ -97,7 +97,7 @@ unified nav tree; GitHub renders it for humans browsing `docs/`.
 - [ADR 0026 — lock_timeout / 55P03 under Basin's optimistic concurrency (no row-lock manager)](decisions/0026-lock-timeout-optimistic-concurrency.md) — Row writes stay optimistic and copy-on-write: conflicts surface at commit as SQLSTATE 40001, never as a row-lock block. lock_timeout governs only advisory and table/DDL locks, which do block.
 - [ADR 0027 — Binary / columnar JSONB representation (faster scalar extraction)](decisions/0027-binary-jsonb-encoding.md) — JSONB extraction is 100-2200x slower than PostgreSQL at 1M rows: JSONB is stored as JSON text and re-walked per row. Decides the hybrid binary-blob + promoted-columns fix and its first increment.
 - [ADR 0028 — CDC bridge: commit-path capture, WAL-resumable streams, phased sinks](decisions/0028-cdc-bridge.md) — Picks the CDC capture seam (post-commit ChangeEventSink, not WAL tail), locks the LSN-cursor resumability model, and sequences five shippable phases from webhook-stream to pgoutput wire compat.
-- [ADR 0029 — What Basin shares with the VulOS substrate, and what it deliberately does not](decisions/0029-substrate-and-suite-convergence.md) — Basin adopts the suite's release-verification pattern and nothing else. No HLC, no CRDT, no cryptographic node identity, no capability tokens — each absence a design consequence, not a gap.
+- [ADR 0029 — Distributed-systems primitives Basin deliberately does not carry](decisions/0029-substrate-and-suite-convergence.md) — Basin adopts verifiable release distribution and nothing else. No HLC, no CRDT, no cryptographic node identity, no capability tokens — each absence a design consequence, not a gap.
 
 ## Reference
 

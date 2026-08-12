@@ -116,7 +116,7 @@ jobs:
       # else: no manifest, no signature, no attestation, and no script a user
       # could run. A per-asset digest fetched from the same origin as the asset
       # proves only that the origin is self-consistent. Pattern adopted from
-      # vul-os/ephor's RELEASE-TEMPLATE.md.
+      # the release-verification template.
       - name: Emit SHA256SUMS
         run: |
           set -euo pipefail

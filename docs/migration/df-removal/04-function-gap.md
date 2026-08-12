@@ -123,7 +123,7 @@ conversion/system (58).
 A sweep of ~11,300 SQL fragments across 469 test files in `tests/` and
 `testing/` finds **358 distinct SQL functions actually called**, ~4,050 call
 sites. The breadth file is
-`/Users/pc/code/vulos/basin/tests/integration/tests/pg_scalar_fn_inventory.rs`.
+`tests/integration/tests/pg_scalar_fn_inventory.rs`.
 Heaviest DF-provided names by call count: `count` (660), `sum` (155),
 `avg` (28), `coalesce` (26), `max` (25), `array_agg` (19), `min` (15),
 `cardinality` (15), `date_trunc` (15), `lag` (15), `substring` (15),

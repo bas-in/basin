@@ -8,7 +8,7 @@ summary: "The release-integrity contract implemented by the release workflow and
 # Release signing — the contract Basin's release job implements
 
 > **Provenance:** this file and `scripts/verify.sh` were copied from
-> [`vul-os/ephor`](https://github.com/vul-os/ephor) per its own
+> an upstream release-verification template per its own
 > `RELEASE-TEMPLATE.md`. They are a **matched pair** and a **template, not a
 > shared dependency** — nothing imports them, and nothing should. Kept here so
 > the contract travels with the code that implements it.
@@ -30,7 +30,7 @@ were copied files. Copy it.
    ```sh
    DEFAULT_REPO="vul-os/basin"     # already set for this repo
    ```
-   Nothing else is Ephor-specific. `MANIFEST="SHA256SUMS"` only changes if you
+   Nothing else is template-specific. `MANIFEST="SHA256SUMS"` only changes if you
    already publish a differently-named manifest.
 
 2. **The `release` job** — three things (all already done here):

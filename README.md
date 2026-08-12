@@ -14,10 +14,6 @@
 </p>
 
 <p align="center">
-  <sub><img src="docs/assets/vulos-logo.png" height="14" alt="VulOS"> Part of <strong><a href="https://vulos.org">VulOS</a></strong> — the open, self-hostable web OS &amp; app suite. Runs standalone, or as an app hosted by the Vulos OS.</sub>
-</p>
-
-<p align="center">
   <a href="https://github.com/vul-os/basin/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/vul-os/basin/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://github.com/vul-os/basin/releases"><img alt="latest release" src="https://img.shields.io/github/v/release/vul-os/basin?include_prereleases&style=flat-square"></a>
   <a href="./CHANGELOG.md"><img alt="changelog" src="https://img.shields.io/badge/changelog-keep--a--changelog-blue?style=flat-square"></a>

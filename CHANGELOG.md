@@ -403,7 +403,7 @@ so the next rename is caught.
 `site/index.html`'s footer linked "Roadmap" to `ROADMAP.md`, a file that has
 never existed in this repo. Nothing caught it: `check-doc-links.sh` walked only
 `.md` files and skipped absolute URLs, and `site/*.html` — served from
-vulos.org, so it cannot use relative paths — reaches repo content exclusively
+an external docs host, so it cannot use relative paths — reaches repo content exclusively
 through absolute `https://github.com/vul-os/basin/blob/main/<path>` URLs. That
 whole class was external in form and internal in fact, and unchecked.
 
@@ -470,7 +470,7 @@ signature, no attestation, and no script a user could run. A per-asset digest
 served from the same origin as the asset proves only that the origin is
 self-consistent.
 
-Adopting `vul-os/ephor`'s release template: the release job now emits a
+Adopting a verifiable-release template: the release job now emits a
 `SHA256SUMS` covering every staged asset (refusing to publish an empty or
 under-covering manifest), verifies it with the same `scripts/verify.sh` users
 run, proves that verifier still refuses 24 kinds of broken release, and attaches

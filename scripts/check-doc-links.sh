@@ -25,7 +25,7 @@
 # outage, which is a worse trade than not checking them.
 #
 # THE ONE EXCEPTION — self-referential GitHub links. `site/index.html` and
-# `site/docs.html` cannot use relative paths (they are served from vulos.org,
+# `site/docs.html` cannot use relative paths (they are served from an external docs host,
 # not from the repo), so every doc they link to is an absolute
 # `https://github.com/vul-os/basin/blob/main/<path>` URL. Those are external in
 # form but internal in fact: the path after `main/` is a path in THIS checkout,
