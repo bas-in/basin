@@ -39,5 +39,6 @@ pub mod scan;
 pub mod setop;
 pub mod sort;
 pub mod storage_source;
+pub mod window;
 
 pub use operator::{ExecError, Operator};

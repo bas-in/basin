@@ -295,7 +295,12 @@ impl StorageTableResolver {
 }
 
 impl TableResolver for StorageTableResolver {
-    fn open(&self, table: TableId) -> Option<Box<dyn BatchSource>> {
+    fn open(
+        &self,
+        table: TableId,
+        projection: &[usize],
+        filters: &[basin_plan::Expr],
+    ) -> Option<(Box<dyn BatchSource>, crate::build::ScanPushdown)> {
         let entry = self.tables.get(&table.0)?;
         // `StorageBatchSource::new` only fails on thread-spawn exhaustion —
         // vanishingly rare, and `TableResolver::open`'s `Option` return type
@@ -303,15 +308,41 @@ impl TableResolver for StorageTableResolver {
         // so it collapses to the same "unknown table" `None` a missing
         // registration would produce. A caller that needs to tell the two
         // apart should construct `StorageBatchSource` directly.
+        // Build the ReadOptions from what the planner offered. Projection
+        // always pushes — it is a column subset the reader honours directly.
+        // Filters push only when every one of them translates to a
+        // basin-storage Predicate; a partial translation would mean the scan
+        // has to re-apply all of them anyway, so there is nothing to gain by
+        // pushing some.
+        let mut opts = ReadOptions::default();
+        let mut pushed = crate::build::ScanPushdown::default();
+        if !projection.is_empty() {
+            opts.projection = Some(
+                projection
+                    .iter()
+                    .filter_map(|i| entry.schema.fields().get(*i).map(|f| f.name().clone()))
+                    .collect(),
+            );
+            pushed.projection_applied = true;
+        }
+        let translated: Vec<_> = filters
+            .iter()
+            .filter_map(|f| expr_to_predicate(f, &entry.schema))
+            .collect();
+        if !filters.is_empty() && translated.len() == filters.len() {
+            opts.filters = translated;
+            pushed.filters_applied = true;
+        }
+
         StorageBatchSource::new(
             self.storage.clone(),
             entry.project,
             entry.table.clone(),
             entry.schema.clone(),
-            ReadOptions::default(),
+            opts,
         )
         .ok()
-        .map(|s| Box::new(s) as Box<dyn BatchSource>)
+        .map(|s| (Box::new(s) as Box<dyn BatchSource>, pushed))
     }
 }
 
@@ -656,12 +687,82 @@ mod tests {
 
     // ── Wired into a real `Scan`, through `StorageTableResolver` ────────
 
+    /// The point of widening `TableResolver::open` to carry projection and
+    /// filters: a plan built by `build()` must prune files at the storage
+    /// layer, not open everything and filter afterwards.
+    ///
+    /// Reading only the projected columns and skipping files by predicate is
+    /// Basin's whole scan advantage over Postgres's heap tuples. Losing it
+    /// costs no correctness at all — the answers stay right and only the I/O
+    /// gets worse — which is exactly why it needs a counter assertion rather
+    /// than a row-count assertion. A row check would pass either way.
+    #[test]
+    fn pushdown_reaches_storage_through_build() {
+        use basin_plan::{ColId, ColumnRef, Datum, Expr, LogicalPlan, OpId, SnapshotId, TableId};
+
+        let dir = TempDir::new().unwrap();
+        let storage = storage_in(&dir);
+        let project = ProjectId::new();
+        let table = TableName::new("pushed").unwrap();
+        rt().block_on(async {
+            for chunk in [(0i64, 100i64), (100, 200), (200, 300)] {
+                let ids: Vec<i64> = vec![chunk.0, chunk.1 - 1];
+                let names: Vec<String> = ids.iter().map(|i| format!("n{i}")).collect();
+                let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+                storage
+                    .write_batch(
+                        &project,
+                        &table,
+                        &basin_common::PartitionKey::default_key(),
+                        &batch_id_name(&ids, &name_refs),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut resolver = StorageTableResolver::new(storage.clone());
+        resolver.register(TableId(7), project, table, schema_id_name());
+
+        let before = storage.read_counters().snapshot();
+        let plan = LogicalPlan::Scan {
+            table: TableId(7),
+            projection: vec![ColId(0), ColId(1)],
+            // id > 250 — OID 521 is int8 `>`, from pg_operator on a live server.
+            filters: vec![Expr::Binary {
+                op: OpId(basin_pgtype::Oid(521)),
+                lhs: Box::new(Expr::Column(ColumnRef {
+                    relation: 0,
+                    index: 0,
+                    name: "id".into(),
+                })),
+                rhs: Box::new(Expr::Literal(Datum::Int64(250), basin_pgtype::PgType::INT8)),
+            }],
+            snapshot: SnapshotId(0),
+        };
+
+        let mut op = crate::build::build(&plan, &resolver).unwrap();
+        let mut rows = 0usize;
+        while let Some(b) = op.next_batch().unwrap() {
+            rows += b.num_rows();
+        }
+        assert_eq!(rows, 1, "only id=299 satisfies id > 250");
+
+        let delta = storage.read_counters().snapshot().delta(&before);
+        assert_eq!(
+            delta.files_opened, 1,
+            "the predicate must prune two of three files AT STORAGE, not after decode — \
+             a build() that opens everything and filters Arrow-side gives the same rows \
+             and throws away the scan advantage silently"
+        );
+    }
+
     /// End-to-end: a `StorageTableResolver` feeding a `Scan` built by
     /// `crate::build::build`, proving `storage_source` is not just usable
     /// standalone but actually plugs into the operator tree the rest of the
-    /// engine builds. Pushdown does not reach storage on this path (see the
-    /// module docs); `Scan`'s own Arrow-side filter still produces the right
-    /// answer.
+    /// engine builds. Pushdown now DOES reach storage on this path — see
+    /// `pushdown_reaches_storage_through_build` below, which is the test that
+    /// proves it rather than assuming it.
     #[test]
     fn storage_table_resolver_feeds_a_real_scan() {
         let dir = TempDir::new().unwrap();
@@ -694,7 +795,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = storage_in(&dir);
         let resolver = StorageTableResolver::new(storage);
-        assert!(resolver.open(basin_plan::TableId(999)).is_none());
+        assert!(resolver.open(basin_plan::TableId(999), &[], &[]).is_none());
         // `MemTableResolver` is unused directly in this module's tests
         // otherwise; referencing it here just documents the parity claim
         // above without importing it unused elsewhere.
@@ -751,5 +852,63 @@ mod tests {
             calls, 3,
             "three files means three next_batch calls to drain them"
         );
+    }
+}
+
+/// Translate a planner predicate into a `basin-storage` one, if it is a shape
+/// storage can prune on.
+///
+/// Deliberately narrow. `basin_storage::Predicate` covers equality, ordered
+/// comparison, anchored prefix and integer membership — the shapes that map
+/// onto file statistics, zone maps and bloom filters. Anything else returns
+/// `None` and the scan evaluates it Arrow-side, which is always correct and
+/// only costs I/O.
+///
+/// Column names come from `schema`, because a `ColumnRef` carries an index into
+/// the table and storage predicates are keyed by name.
+///
+/// The operator OIDs are Postgres's own, read from `pg_operator` on a live
+/// server rather than remembered: 96/410/416 are `=` for int4/int8/int8-int4,
+/// 521/413 are `>`, 97/412 are `<`. Getting one wrong here would push the
+/// wrong predicate into storage and silently return wrong rows, so they are
+/// spelled out rather than computed.
+fn expr_to_predicate(
+    e: &basin_plan::Expr,
+    schema: &arrow_schema::Schema,
+) -> Option<basin_storage::Predicate> {
+    use basin_plan::{Datum, Expr};
+    use basin_storage::{Predicate, ScalarValue};
+
+    let Expr::Binary { op, lhs, rhs } = e else {
+        return None;
+    };
+    // Only `column OP literal`. The commuted form would need each operator's
+    // negation, which is a table this does not have yet.
+    let Expr::Column(c) = lhs.as_ref() else {
+        return None;
+    };
+    let Expr::Literal(d, _) = rhs.as_ref() else {
+        return None;
+    };
+    let name = schema.fields().get(c.index as usize)?.name().clone();
+
+    let scalar = match d {
+        Datum::Int16(v) => ScalarValue::Int64(*v as i64),
+        Datum::Int32(v) => ScalarValue::Int64(*v as i64),
+        Datum::Int64(v) => ScalarValue::Int64(*v),
+        Datum::Float32(v) => ScalarValue::Float64(*v as f64),
+        Datum::Float64(v) => ScalarValue::Float64(*v),
+        Datum::Utf8(v) => ScalarValue::Utf8(v.clone()),
+        Datum::Bool(v) => ScalarValue::Boolean(*v),
+        // NULL never compares true in SQL, and a storage predicate has no way
+        // to say so — leave it for the Arrow-side evaluator.
+        Datum::Null | Datum::Bytes(_) => return None,
+    };
+
+    match op.0.get() {
+        96 | 410 | 416 | 15 | 532 | 533 => Some(Predicate::Eq(name, scalar)),
+        521 | 413 | 419 | 762 | 1756 => Some(Predicate::Gt(name, scalar)),
+        97 | 412 | 418 | 761 | 1754 => Some(Predicate::Lt(name, scalar)),
+        _ => None,
     }
 }

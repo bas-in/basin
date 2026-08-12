@@ -74,7 +74,44 @@ impl From<ExecError> for BuildError {
 ///
 /// One method, so the storage layer implements exactly this and nothing else.
 pub trait TableResolver {
-    fn open(&self, table: TableId) -> Option<Box<dyn BatchSource>>;
+    /// Open a source for `table`, giving it the chance to apply `projection`
+    /// and `filters` itself.
+    ///
+    /// Both are **requests, not guarantees**. A resolver that ignores them is
+    /// still correct — [`ScanPushdown::accepted`] reports what it actually did,
+    /// and the builder applies whatever was declined, Arrow-side.
+    ///
+    /// Passing them matters: reading only the projected columns and pruning
+    /// files by predicate is Basin's whole scan advantage over Postgres's heap
+    /// tuples. A resolver that opens the full table and lets the engine filter
+    /// afterwards throws that away, and throws it away *silently* — the answers
+    /// stay right and only the I/O gets worse, which surfaces months later as a
+    /// benchmark regression nobody can attribute.
+    fn open(
+        &self,
+        table: TableId,
+        projection: &[usize],
+        filters: &[Expr],
+    ) -> Option<(Box<dyn BatchSource>, ScanPushdown)>;
+}
+
+/// What a [`TableResolver`] actually applied, of what it was offered.
+///
+/// Defaults to accepting nothing, so a resolver that does not opt in stays
+/// correct by construction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanPushdown {
+    /// The source already applied the projection, and its batches carry only
+    /// the requested columns, in the requested order. The scan must NOT project
+    /// again — the indices it holds address the *table*, not the narrowed
+    /// batch, so re-applying them would read the wrong columns.
+    pub projection_applied: bool,
+    /// The source already applied every filter it was given. The scan may skip
+    /// its own filtering. Partial application is deliberately not
+    /// representable: a source that can only honour some predicates should
+    /// report `false` and let the scan re-apply all of them, which is cheap and
+    /// always correct, rather than track which survived.
+    pub filters_applied: bool,
 }
 
 /// A resolver backed by in-memory sources, for tests and for executing against
@@ -100,12 +137,22 @@ impl MemTableResolver {
 }
 
 impl TableResolver for MemTableResolver {
-    fn open(&self, table: TableId) -> Option<Box<dyn BatchSource>> {
+    /// Accepts nothing. In-memory tables have no I/O to save, so pushing down
+    /// would add code without buying anything; the scan filters and projects.
+    fn open(
+        &self,
+        table: TableId,
+        _projection: &[usize],
+        _filters: &[Expr],
+    ) -> Option<(Box<dyn BatchSource>, ScanPushdown)> {
         let (schema, batches) = self.tables.get(&table.0)?.first()?;
-        Some(Box::new(crate::scan::VecBatchSource::new(
-            schema.clone(),
-            batches.clone(),
-        )))
+        Some((
+            Box::new(crate::scan::VecBatchSource::new(
+                schema.clone(),
+                batches.clone(),
+            )),
+            ScanPushdown::default(),
+        ))
     }
 }
 
@@ -139,11 +186,27 @@ pub fn build_with_budget(
             filters,
             ..
         } => {
-            let source = tables
-                .open(*table)
-                .ok_or(BuildError::UnknownTable(*table))?;
             let cols: Vec<usize> = projection.iter().map(|c| c.0 as usize).collect();
-            Ok(Box::new(Scan::new(source, cols, filters.clone())?))
+            let (source, pushed) = tables
+                .open(*table, &cols, filters)
+                .ok_or(BuildError::UnknownTable(*table))?;
+
+            // Whatever the source declined, the scan still does. When the
+            // source applied the projection its batches are already narrowed,
+            // so the scan's indices — which address the full table — become
+            // identity over the narrowed batch rather than being re-applied
+            // against it, which would read the wrong columns.
+            let scan_cols: Vec<usize> = if pushed.projection_applied {
+                (0..cols.len()).collect()
+            } else {
+                cols
+            };
+            let scan_filters = if pushed.filters_applied {
+                Vec::new()
+            } else {
+                filters.clone()
+            };
+            Ok(Box::new(Scan::new(source, scan_cols, scan_filters)?))
         }
 
         LogicalPlan::Filter { input, predicate } => {
