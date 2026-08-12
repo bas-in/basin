@@ -1,12 +1,16 @@
 ---
 title: "DF removal 06 — scan and storage integration"
-nav_section: architecture
-sidebar_position: 60
-summary: "Inventory of every TableProvider, custom scan path, and Vortex/Parquet coupling that DataFusion removal must rebuild — and the verdict that neither read path is a blocker."
-tags: [storage, datafusion-removal, migration, vortex, parquet]
+nav_section: migration
+sidebar_position: 6
+summary: "DF removal 06: every TableProvider, custom scan path, and Vortex/Parquet coupling the migration must rebuild — and the verdict that neither read path is a blocker, because both already run DataFusion-free."
+tags: [migration, query-engine, storage, vortex, parquet]
 ---
 
 # DF removal 06 — scan and storage integration
+
+Part of the [ADR 0030](../../decisions/0030-own-query-engine-remove-datafusion.md)
+migration map. Supersedes the partial first pass, which resolved the Vortex
+blocker but left Parquet and statistics outstanding; both are covered here.
 
 - **Status:** Survey complete (2026-08-12), branch `feat/own-engine-remove-datafusion`
 - **Scope:** the layer where DataFusion 53 meets Basin's object storage —
@@ -375,11 +379,24 @@ Nothing that isn't recoverable, but three behaviours must be re-homed:
 
 ## 5. Statistics and pruning: who owns what
 
-**Basin owns essentially all of it.** Grepping the workspace for
-`PruningPredicate`, `datafusion_pruning`, `PruningStatistics`, and
-`physical_optimizer::pruning` returns **zero hits**. DataFusion statistics types
-(`Precision::`, `ColumnStatistics`) appear only in `vortex_listing_format.rs`
-(29) and `session.rs` (1).
+**Basin owns essentially all of it.** This claim is load-bearing for the whole
+estimate, so it was verified three ways:
+
+1. `grep -rn "PruningPredicate\|PruningStatistics\|datafusion_pruning\|datafusion-pruning" crates/ services/ tests/`
+   returns **0 hits** — no extension filter, no path exclusions.
+2. Basin therefore implements `PruningStatistics` **nowhere**: it does not even
+   borrow DataFusion's predicate evaluator while supplying its own statistics.
+   The pruning decision is made in Basin code, on Basin's `ColumnStats`, before
+   a file is opened.
+3. `datafusion-pruning` *is* present in `Cargo.lock`, but only ever as a
+   transitive dependency of `datafusion-datasource-parquet`,
+   `datafusion-physical-optimizer`, and `vortex-datafusion` (Cargo.lock:3106,
+   3419, 9519). All three leave with DataFusion, so the crate exits the graph on
+   its own — nothing has to be replaced when it goes.
+
+DataFusion statistics types (`Precision::`, `ColumnStatistics`) appear only in
+`vortex_listing_format.rs` (29 sites) and `session.rs` (1) — i.e. only in the
+adapter layer being deleted, never in Basin's own pruning logic.
 
 ### Basin-owned — survives DF removal untouched
 
