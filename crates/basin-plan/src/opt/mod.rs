@@ -36,12 +36,15 @@ use crate::LogicalPlan;
 /// the joins that produced, and before projection pruning, so the predicates it
 /// lands in a scan count toward what that scan must read.
 ///
-/// `SimplifyExpressions` is absent because it is not written yet. That is a gap
-/// rather than a choice — the ablation found it foundational, since later rules
-/// assume simplified predicates and an unfolded `BETWEEN` or `CAST` cannot
-/// become a storage `Predicate`. Its slot is first when it lands.
+/// `SimplifyExpressions` runs first, for the reason the ablation gave: later
+/// rules assume simplified predicates, and predicate quality decides whether
+/// filter pushdown can produce a storage `Predicate` at all.
 pub fn default_rules() -> Vec<Box<dyn OptimizerRule>> {
     vec![
+        // Foundational: every rule after this assumes simplified predicates,
+        // and an unfolded CAST or unexpanded BETWEEN cannot become a storage
+        // Predicate, so a filter that would have pruned files silently does not.
+        Box::new(simplify::SimplifyExpressions),
         Box::new(decorrelate::Decorrelate),
         Box::new(pushdown::FilterPushdown),
         Box::new(limit::LimitPushdown),
