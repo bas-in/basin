@@ -31,6 +31,7 @@
 
 pub mod aggregate;
 pub mod build;
+pub mod cte;
 pub mod eval;
 pub mod join;
 pub mod operator;
