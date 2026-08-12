@@ -288,6 +288,59 @@ fn eval_column(col: &ColumnRef, batch: &RecordBatch) -> Result<ArrayRef, ExecErr
 /// `Decimal128`, `uuid`, `jsonb` and array literals all need their own
 /// builders and are not implemented yet — that is a real gap, called out
 /// with `Internal` rather than silently producing the wrong type.
+/// Is this an untyped literal — one lowering left as `unknown` because
+/// Postgres resolves it from context rather than from the token?
+fn is_unknown_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Literal(_, ty) if ty.is_unknown())
+}
+
+/// Materialise an untyped literal at a type taken from its context.
+///
+/// This is Postgres's rule, applied where the information exists. A
+/// non-literal, or a literal that already has a type, falls through to the
+/// ordinary path — this never overrides a type the planner did establish.
+fn eval_untyped_literal(
+    e: &Expr,
+    target: &arrow_schema::DataType,
+    len: usize,
+) -> Result<ArrayRef, ExecError> {
+    let Expr::Literal(datum, _) = e else {
+        return Err(ExecError::Internal(
+            "eval_untyped_literal called on a non-literal — a caller bug".into(),
+        ));
+    };
+    if matches!(datum, PlanDatum::Null) {
+        return Ok(new_null_array(target, len));
+    }
+    // Build the literal as text — which is what an unquoted SQL literal is
+    // before resolution — then cast into the target. That routes every
+    // conversion through arrow's cast kernel rather than duplicating a parser
+    // per type, and a value the target cannot represent errors rather than
+    // silently becoming NULL.
+    let text = match datum {
+        PlanDatum::Utf8(v) => v.clone(),
+        PlanDatum::Int16(v) => v.to_string(),
+        PlanDatum::Int32(v) => v.to_string(),
+        PlanDatum::Int64(v) => v.to_string(),
+        PlanDatum::Float32(v) => v.to_string(),
+        PlanDatum::Float64(v) => v.to_string(),
+        PlanDatum::Bool(v) => v.to_string(),
+        PlanDatum::Bytes(_) | PlanDatum::Null => {
+            return Err(ExecError::TypeMismatch(
+                "an untyped literal cannot be binary".into(),
+            ))
+        }
+    };
+    if *target == arrow_schema::DataType::Utf8 {
+        return Ok(Arc::new(arrow_array::StringArray::from(vec![
+            text.as_str();
+            len
+        ])));
+    }
+    let as_text: ArrayRef = Arc::new(arrow_array::StringArray::from(vec![text.as_str(); len]));
+    cast::cast(&as_text, target).map_err(|e| map_arrow(e, "resolving an untyped literal"))
+}
+
 fn eval_literal(datum: &PlanDatum, ty: PgType, len: usize) -> Result<ArrayRef, ExecError> {
     let arrow_ty = physical(ty).map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
 
@@ -378,8 +431,30 @@ fn eval_binary(
         ))
     })?;
 
-    let l = eval(lhs, batch)?;
-    let r = eval(rhs, batch)?;
+    // Postgres resolves an UNTYPED literal from the other operand: in
+    // `SELECT 'x' = col`, the literal is `unknown` until the column types it.
+    // Lowering marks such literals `PgType::UNKNOWN` (oid 705) faithfully, and
+    // nothing resolved them, so `physical()` correctly refused and the query
+    // fell back. Both types are known here, so this is where it costs nothing:
+    // evaluate the typed side first, then materialise the literal at its type.
+    let (l, r) = match (is_unknown_literal(lhs), is_unknown_literal(rhs)) {
+        (true, false) => {
+            let r = eval(rhs, batch)?;
+            let l = eval_untyped_literal(lhs, r.data_type(), batch.num_rows())?;
+            (l, r)
+        }
+        (false, true) => {
+            let l = eval(lhs, batch)?;
+            let r = eval_untyped_literal(rhs, l.data_type(), batch.num_rows())?;
+            (l, r)
+        }
+        // Both untyped is `'a' = 'b'`, which Postgres resolves to text.
+        (true, true) => (
+            eval_untyped_literal(lhs, &arrow_schema::DataType::Utf8, batch.num_rows())?,
+            eval_untyped_literal(rhs, &arrow_schema::DataType::Utf8, batch.num_rows())?,
+        ),
+        (false, false) => (eval(lhs, batch)?, eval(rhs, batch)?),
+    };
     // Arrow's comparison and arithmetic kernels require both sides to have the
     // SAME type; Postgres does not. `bigint_col > 2` is ordinary SQL — the
     // literal is int4, the column int8, and Postgres widens implicitly. Without
@@ -2489,5 +2564,63 @@ mod tests {
             b.value(0),
             "2.5 > 2 is true; truncating 2.5 to 2 would make it false"
         );
+    }
+    /// Postgres resolves an untyped literal from its context: in
+    /// `SELECT 'x' = col`, the literal is `unknown` until the column types it.
+    /// Lowering marks these faithfully and nothing resolved them, so
+    /// `physical()` refused and every such query fell back.
+    #[test]
+    fn an_untyped_literal_takes_its_type_from_the_other_operand() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1i64, 42]))],
+        )
+        .unwrap();
+        // `n = '42'` — the literal is unknown, and the column makes it int8.
+        let e = Expr::Binary {
+            op: OpId(basin_pgtype::Oid(96)), // int4 =
+            lhs: Box::new(Expr::Column(basin_plan::ColumnRef {
+                relation: 0,
+                index: 0,
+                name: "n".into(),
+            })),
+            rhs: Box::new(Expr::Literal(
+                basin_plan::Datum::Utf8("42".into()),
+                basin_pgtype::PgType::UNKNOWN,
+            )),
+        };
+        let out = eval(&e, &batch).unwrap();
+        let b = out
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .unwrap();
+        assert_eq!((b.value(0), b.value(1)), (false, true));
+    }
+
+    /// An untyped NULL resolves to the other side's type and stays NULL rather
+    /// than becoming a value.
+    #[test]
+    fn an_untyped_null_resolves_without_becoming_a_value() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(vec![7i64]))],
+        )
+        .unwrap();
+        let e = Expr::Binary {
+            op: OpId(basin_pgtype::Oid(96)),
+            lhs: Box::new(Expr::Column(basin_plan::ColumnRef {
+                relation: 0,
+                index: 0,
+                name: "n".into(),
+            })),
+            rhs: Box::new(Expr::Literal(
+                basin_plan::Datum::Null,
+                basin_pgtype::PgType::UNKNOWN,
+            )),
+        };
+        let out = eval(&e, &batch).unwrap();
+        assert!(out.is_null(0), "n = NULL is NULL, never true");
     }
 }
