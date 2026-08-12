@@ -46,6 +46,37 @@
 //! B-tree, GIN, R-tree, trigram): those are consulted only to prune files
 //! before decode, never to change which rows a query returns.
 //!
+//! # Reporting why, not just how many
+//!
+//! [`crate::Engine::owned_engine_served_count`]/[`crate::Engine::owned_engine_fallback_count`]
+//! say *how far* this migration has gotten; they cannot say what to build
+//! next. [`Fallback::reason_kind`] buckets every decline into one of
+//! [`FallbackReasonKind`]'s five categories — an ineligible table, a
+//! construct neither lowering nor building implements yet, some other
+//! lowering failure, some other build failure, or a runtime execution error
+//! — and [`crate::Engine::owned_engine_fallback_reason_counts`] exposes the tally.
+//! `Unsupported` is the one to watch: it is exactly "resolved fine, but
+//! nothing downstream builds it yet", which is a to-do list, not noise.
+//!
+//! # Resolving against the real catalogs, safely
+//!
+//! [`RealOperators`] and [`RealFunctions`] resolve against
+//! `basin_pgtype::operator::resolve` and `basin_pgtype::func::resolve` — the
+//! real `pg_operator`/`pg_proc` tables — rather than a hand-picked handful of
+//! names, so a construct is only ever unreachable because lowering/building
+//! don't implement it yet, not because this bridge under-resolved it first.
+//! This is safe to do broadly, not just for the names `basin-exec::eval`
+//! happens to implement: every one of that crate's scalar-function and
+//! aggregate paths downcasts the real Arrow array it receives to a concrete
+//! type before touching it, so resolving to an oid whose declared argument
+//! type doesn't match what a column actually holds fails loudly
+//! (`ExecError::TypeMismatch`/`Internal`) rather than computing a wrong
+//! value — the same "any error still falls back" guarantee the rest of this
+//! module leans on. `count`/`sum`/`avg`/`min`/`max` are the one deliberate
+//! exception: see [`RealFunctions`] for why they stay pinned to a single
+//! representative oid per name instead of the argument-typed one
+//! `basin_pgtype::func::resolve` would pick.
+//!
 //! # Table resolution: real catalog, minted `TableId`s, no async in `lower_select`
 //!
 //! [`basin_plan::lower::select::TableResolver::resolve_table`] and
@@ -88,7 +119,6 @@ use basin_pgtype::{Oid, PgType};
 use basin_plan::lower::expr::{FuncKind, OperatorResolver};
 use basin_plan::lower::select::{lower_select, TableResolver as PlanTableResolver};
 use basin_plan::lower::LowerError;
-use basin_plan::opt::OptimizerRule;
 use basin_plan::{Expr as PlanExpr, FuncId, OpId, Schema as PlanSchema, TableId};
 
 use crate::{ExecResult, ProjectSession};
@@ -124,10 +154,9 @@ pub(crate) async fn try_execute(sess: &ProjectSession, stmt_node: &Node) -> Opti
     // hot-tier footprint yet (e.g. a fresh `CREATE TABLE` + `INSERT` still
     // inside the same `BEGIN`).
     if crate::session::tx_is_active(&sess.state) {
-        sess.engine.note_owned_engine_fallback();
-        tracing::debug!(
-            target: "basin_engine::owned_engine",
-            "owned engine fell back to DataFusion: inside an explicit transaction"
+        record_fallback(
+            sess,
+            &Fallback::Ineligible("inside an explicit transaction"),
         );
         return None;
     }
@@ -139,15 +168,27 @@ pub(crate) async fn try_execute(sess: &ProjectSession, stmt_node: &Node) -> Opti
             Some(result)
         }
         Err(reason) => {
-            sess.engine.note_owned_engine_fallback();
-            tracing::debug!(
-                target: "basin_engine::owned_engine",
-                reason = %reason,
-                "owned engine fell back to DataFusion"
-            );
+            record_fallback(sess, &reason);
             None
         }
     }
+}
+
+/// Bump both the flat fallback counter and `reason`'s bucket in the
+/// per-reason histogram, and log the reason at debug — the single place
+/// every non-served path (the transaction guard included) funnels through,
+/// so the two counters can never drift apart and every decline is logged
+/// exactly once. See the module docs' "Reporting why, not just how many".
+fn record_fallback(sess: &ProjectSession, reason: &Fallback) {
+    sess.engine.note_owned_engine_fallback();
+    sess.engine
+        .note_owned_engine_fallback_reason(reason.reason_kind());
+    tracing::debug!(
+        target: "basin_engine::owned_engine",
+        reason = %reason,
+        category = ?reason.reason_kind(),
+        "owned engine fell back to DataFusion"
+    );
 }
 
 /// Why the owned path did not serve the statement. Distinct from a single
@@ -176,6 +217,151 @@ impl std::fmt::Display for Fallback {
     }
 }
 
+impl Fallback {
+    /// Which histogram bucket this decline is filed under. See the module
+    /// docs' "Reporting why, not just how many".
+    ///
+    /// `LowerError::Unsupported`/`NoMatchingOperator` and
+    /// `BuildError::Unsupported` all collapse to
+    /// [`FallbackReasonKind::Unsupported`] deliberately, not just the literal
+    /// `Unsupported` variants: a `NoMatchingOperator` from this bridge's own
+    /// widened resolvers (see [`RealOperators`]/[`RealFunctions`]) means
+    /// "the real `pg_operator`/`pg_proc` catalog has no such entry", which is
+    /// exactly as actionable — and exactly as much "go build this" rather
+    /// than "something is broken" — as an explicit `Unsupported`. Everything
+    /// else in `LowerError`/`BuildError` (`UnknownName`, `Malformed`,
+    /// `UnknownTable`, `UnknownCte`, `NonColumnKey`) reflects a real failure
+    /// worth its own bucket instead.
+    fn reason_kind(&self) -> FallbackReasonKind {
+        match self {
+            Fallback::Ineligible(_) => FallbackReasonKind::Ineligible,
+            Fallback::Lower(LowerError::Unsupported(_) | LowerError::NoMatchingOperator(_)) => {
+                FallbackReasonKind::Unsupported
+            }
+            Fallback::Lower(_) => FallbackReasonKind::LoweringError,
+            Fallback::Build(BuildError::Unsupported(_)) => FallbackReasonKind::Unsupported,
+            Fallback::Build(BuildError::Exec(_)) => FallbackReasonKind::ExecError,
+            Fallback::Build(_) => FallbackReasonKind::BuildError,
+            Fallback::Exec(_) => FallbackReasonKind::ExecError,
+        }
+    }
+}
+
+/// The coarse bucket a [`Fallback`] is filed under for
+/// [`crate::Engine::owned_engine_fallback_reason_counts`]. Five categories
+/// rather than one string per error message: a message is precise but
+/// uncountable (every `NoMatchingOperator` names different argument types),
+/// while this is coarse enough to sum, trend, and alert on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackReasonKind {
+    /// A per-table safety gate declined before lowering ever ran — RLS, a
+    /// pending hot-tier/tombstone footprint, a view, promoted JSONB shadow
+    /// columns, a name that isn't a valid/known table, or (see
+    /// [`try_execute`]) an in-progress transaction. See [`build_resolver`].
+    Ineligible,
+    /// Lowering or building reached a construct neither implements yet —
+    /// `LowerError::Unsupported`, `LowerError::NoMatchingOperator`, or
+    /// `BuildError::Unsupported`. The one bucket that is a to-do list: an
+    /// entry here names precisely what the owned pipeline should grow next.
+    Unsupported,
+    /// Lowering failed for a reason other than "not supported yet" —
+    /// `LowerError::UnknownName` (a name [`build_resolver`] didn't
+    /// prefetch, e.g. one hidden behind a subquery — see the module docs)
+    /// or `LowerError::Malformed` (a parse-tree shape assumption broken).
+    LoweringError,
+    /// Building the physical plan failed for a reason other than "not
+    /// supported yet" — an unknown `TableId`/`CteId` or a sort/group key
+    /// that isn't a plain column, both of which point at a planner/bridge
+    /// bug rather than an unimplemented construct.
+    BuildError,
+    /// The physical plan built but erroring while it ran —
+    /// `ExecError`, including one already wrapped inside
+    /// `BuildError::Exec`. Covers, among other things, a resolved function
+    /// or operator oid `basin-exec::eval` does not implement yet, or a
+    /// resolved-but-mismatched argument type (see [`RealFunctions`]'s docs
+    /// on why that is safe rather than a wrong-answer risk).
+    ExecError,
+}
+
+/// Per-reason tally behind
+/// [`crate::Engine::owned_engine_fallback_reason_counts`]. One `AtomicU64`
+/// per [`FallbackReasonKind`] bucket, `Relaxed` throughout — this is an
+/// approximate operational counter like every other one in this crate (see
+/// `secondary_index::IndexSkipCounter`, `pk_row_cache::PkRowCacheCounters`),
+/// not a consistency-critical value.
+#[derive(Debug, Default)]
+pub(crate) struct FallbackReasonCounters {
+    ineligible: std::sync::atomic::AtomicU64,
+    unsupported: std::sync::atomic::AtomicU64,
+    lowering_error: std::sync::atomic::AtomicU64,
+    build_error: std::sync::atomic::AtomicU64,
+    exec_error: std::sync::atomic::AtomicU64,
+}
+
+impl FallbackReasonCounters {
+    pub(crate) const fn new() -> Self {
+        Self {
+            ineligible: std::sync::atomic::AtomicU64::new(0),
+            unsupported: std::sync::atomic::AtomicU64::new(0),
+            lowering_error: std::sync::atomic::AtomicU64::new(0),
+            build_error: std::sync::atomic::AtomicU64::new(0),
+            exec_error: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn record(&self, kind: FallbackReasonKind) {
+        let counter = match kind {
+            FallbackReasonKind::Ineligible => &self.ineligible,
+            FallbackReasonKind::Unsupported => &self.unsupported,
+            FallbackReasonKind::LoweringError => &self.lowering_error,
+            FallbackReasonKind::BuildError => &self.build_error,
+            FallbackReasonKind::ExecError => &self.exec_error,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> FallbackReasonCountersSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        FallbackReasonCountersSnapshot {
+            ineligible: self.ineligible.load(Relaxed),
+            unsupported: self.unsupported.load(Relaxed),
+            lowering_error: self.lowering_error.load(Relaxed),
+            build_error: self.build_error.load(Relaxed),
+            exec_error: self.exec_error.load(Relaxed),
+        }
+    }
+}
+
+/// A point-in-time, plain-`u64` snapshot of [`FallbackReasonCounters`] —
+/// see [`crate::Engine::owned_engine_fallback_reason_counts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FallbackReasonCountersSnapshot {
+    /// See [`FallbackReasonKind::Ineligible`].
+    pub ineligible: u64,
+    /// See [`FallbackReasonKind::Unsupported`].
+    pub unsupported: u64,
+    /// See [`FallbackReasonKind::LoweringError`].
+    pub lowering_error: u64,
+    /// See [`FallbackReasonKind::BuildError`].
+    pub build_error: u64,
+    /// See [`FallbackReasonKind::ExecError`].
+    pub exec_error: u64,
+}
+
+impl FallbackReasonCountersSnapshot {
+    /// Sum of every bucket. Equal to [`crate::Engine::owned_engine_fallback_count`]
+    /// at any point no attempt is concurrently in flight — a test pins this
+    /// invariant so the histogram can never silently drift from the total
+    /// count it is supposed to add up to.
+    pub fn total(&self) -> u64 {
+        self.ineligible
+            + self.unsupported
+            + self.lowering_error
+            + self.build_error
+            + self.exec_error
+    }
+}
+
 async fn try_execute_inner(
     sess: &ProjectSession,
     stmt_node: &Node,
@@ -185,11 +371,15 @@ async fn try_execute_inner(
     let plan = lower_select(stmt_node, &resolver, &RealOperators, &RealFunctions)
         .map_err(Fallback::Lower)?;
 
-    let rules: [&dyn OptimizerRule; 2] = [
-        &basin_plan::opt::pushdown::FilterPushdown,
-        &basin_plan::opt::projection::ProjectionPruning,
-    ];
-    let (plan, _passes) = basin_plan::opt::optimize(plan, &rules);
+    // `optimize_default` is the full assembled pipeline — decorrelation,
+    // filter pushdown, limit pushdown and projection pruning, run to a
+    // fixpoint (see `basin_plan::opt`'s module docs for why the order
+    // matters) — not the two-rule hand-picked subset this bridge used to
+    // call directly. Every lowered plan that reaches this point goes
+    // through every rule basin-plan has, not just the two that happened to
+    // be wired up first.
+    let (plan, passes) = basin_plan::opt::optimize_default(plan);
+    sess.engine.note_owned_engine_optimizer_passes(passes);
 
     let mut op = basin_exec::build::build(&plan, &resolver).map_err(Fallback::Build)?;
 
@@ -443,28 +633,33 @@ fn pgtype_of(field: &Field) -> PgType {
 // ─── Operators / functions ─────────────────────────────────────────────
 
 /// The real `pg_operator` table (`basin_pgtype::operator::resolve`), plus
-/// the synthetic `AND`/`OR` sentinels `basin-exec::eval` and
+/// the synthetic `AND`/`OR`/`NOT` sentinels `basin-exec::eval` and
 /// `basin-plan::opt::pushdown` already agree on (see those modules' docs:
-/// `AND`/`OR` have no `pg_operator` row because Postgres parses them as a
-/// `BoolExpr`, not an `OpExpr`). `NOT` is deliberately left unresolved
-/// (`None`) rather than given a third sentinel: `basin-exec::eval::eval_unary`
-/// does not implement a `NOT` case at all today, so resolving it here would
-/// only move the inevitable fallback from a clean `LowerError` at lowering
-/// time to a `ExecError::Internal` after a wasted build.
+/// none of the three has a `pg_operator` row, because Postgres parses them
+/// as a `BoolExpr`, not an `OpExpr`). All three are resolved: `eval_unary`
+/// implements `NOT` now (see [`NOT_OP`]), so there is no wasted-build reason
+/// left to leave it unresolved.
 struct RealOperators;
 
-/// Same sentinel values as `basin_exec::eval::{AND_OP, OR_OP}` and
+/// Same sentinel values as `basin_exec::eval::{AND_OP, OR_OP, NOT_OP}` and
 /// `basin_plan::opt::pushdown::AND_OP` — the largest real `pg_operator` oid
-/// is in the low thousands, so `u32::MAX` / `u32::MAX - 1` cannot alias one.
+/// is in the low thousands, so `u32::MAX` / `u32::MAX - 1` / `u32::MAX - 2`
+/// cannot alias one.
 const AND_OP: OpId = OpId(Oid(u32::MAX));
 const OR_OP: OpId = OpId(Oid(u32::MAX - 1));
+/// `basin_exec::eval::eval_unary` has implemented `NOT` (`arrow`'s
+/// `boolean::not`, which already gives `NOT NULL = NULL` for free) since
+/// this resolver was first written — that comment describing `NOT` as
+/// deliberately unresolved is stale; this is exactly the widening the task
+/// that added it called out by name.
+const NOT_OP: OpId = OpId(Oid(u32::MAX - 2));
 
 impl OperatorResolver for RealOperators {
     fn resolve(&self, name: &str, left: Option<PgType>, right: PgType) -> Option<OpId> {
         match name {
             "AND" => Some(AND_OP),
             "OR" => Some(OR_OP),
-            "NOT" => None,
+            "NOT" => Some(NOT_OP),
             _ => {
                 let left_oid = left.map(|t| t.oid);
                 basin_pgtype::operator::resolve(name, left_oid, right.oid).map(|sig| OpId(sig.oid))
@@ -473,32 +668,420 @@ impl OperatorResolver for RealOperators {
     }
 }
 
-/// A hand-written, deliberately small function table — there is no `pg_proc`
-/// catalog anywhere in the workspace yet (`lower/expr.rs`'s own module docs:
-/// "A column catalog and a function catalog (`pg_proc`) are not built yet").
-/// Scoped to exactly the aggregates `basin-exec/src/build.rs`'s
-/// `agg_func_of` implements (`sum`/`count`/`avg`/`min`/`max`) — a scalar
-/// function name is deliberately left unresolved (`None`) rather than
-/// resolved-then-failed: `basin-exec::eval` has no `Expr::ScalarFn` case at
-/// all yet (see that module's docs), so resolving one here would only move
-/// the inevitable fallback later, past a wasted lower+build.
+/// Resolves against the real `pg_proc` table (`basin_pgtype::func::resolve`,
+/// ~95 rows covering string/math/date-time/aggregate/window/set-returning
+/// functions), with one deliberate, narrow exception: see the `count` /
+/// `sum` / `avg` / `min` / `max` special case below.
 ///
-/// The OIDs are real `pg_proc` values (matching `agg_func_of`'s own
-/// comment: read from a live PostgreSQL 18, not invented); Postgres itself
-/// has one OID per input-type overload, and `agg_func_of` already collapses
-/// every overload of one function name to the same accumulator, so any one
-/// representative OID per name is sufficient here.
+/// Everything else — scalar functions (`lower`, `substr`, `abs`, `round`,
+/// ...), `array_agg`/`string_agg`, window functions (`row_number`, `lag`,
+/// ...) and set-returning functions (`generate_series`, `unnest`) — resolves
+/// through the real catalog. Resolving one is not a promise that it runs
+/// end to end: `basin-exec::eval`/`build.rs` only implement a subset (see
+/// the module docs on why resolving the rest anyway is still safe), and
+/// `basin-plan/src/lower/select.rs` still rejects any window function in a
+/// target list outright (`contains_window`) regardless of what resolves —
+/// but a `LowerError`/`BuildError`/`ExecError` past this point is exactly
+/// the "any error falls back" contract the rest of this module already
+/// relies on, now with an accurate reason attached (see
+/// [`Fallback::reason_kind`]) instead of a blanket "no such function".
 struct RealFunctions;
 
+/// `count`/`sum`/`avg`/`min`/`max` stay pinned to one representative
+/// `pg_proc` oid per name — the same behaviour this resolver had before it
+/// was widened — rather than the argument-typed oid `basin_pgtype::func`
+/// would pick. This is deliberate, not an oversight: `basin-exec/src/build.rs`'s
+/// `agg_func_of` only recognises a handful of oids per name (int4/int8/
+/// float8/numeric widths, roughly), missing real rows `basin_pgtype::func`
+/// *does* have (`sum(int2)`, `min(text)`, `min(timestamptz)`, `avg(interval)`,
+/// ...). `aggregate.rs`'s physical accumulators dispatch on the *actual*
+/// input column's Arrow type at build time (see `AggFunc::Min`/`Max`/`Sum`/
+/// `Avg` in `basin-exec/src/aggregate.rs`), not on the resolved oid beyond
+/// picking which accumulator family to use — so one representative oid per
+/// name is exactly as capable as the type-correct one would be, and strictly
+/// more capable than `agg_func_of`'s own narrower oid list. Widening this to
+/// the argument-typed oid would only ever *lose* coverage (e.g. `sum(int2)`
+/// would resolve to a real oid `agg_func_of` doesn't recognise and fall back,
+/// where today it is served). `count(x)` follows the same reasoning: its
+/// real oid (2147, distinct from `count(*)`'s 2803 — see
+/// `basin_pgtype::func`'s own module docs on why those must never collapse)
+/// is not one `agg_func_of` recognises either, so this reports 2803 for
+/// both and lets `agg_spec`'s own `args.first()` check recover the
+/// `Count`/`CountStar` distinction, exactly as it already does.
+const AGGREGATE_REPRESENTATIVE_OID: &[(&str, u32)] = &[
+    ("count", 2803),
+    ("sum", 2108),
+    ("avg", 2101),
+    ("min", 2132),
+    ("max", 2116),
+];
+
 impl basin_plan::lower::expr::FunctionResolver for RealFunctions {
-    fn resolve(&self, name: &[String], _args: &[PgType]) -> Option<(FuncId, FuncKind)> {
-        match name.last().map(String::as_str) {
-            Some("count") => Some((FuncId(Oid(2803)), FuncKind::Aggregate)),
-            Some("sum") => Some((FuncId(Oid(2108)), FuncKind::Aggregate)),
-            Some("avg") => Some((FuncId(Oid(2101)), FuncKind::Aggregate)),
-            Some("min") => Some((FuncId(Oid(2132)), FuncKind::Aggregate)),
-            Some("max") => Some((FuncId(Oid(2116)), FuncKind::Aggregate)),
-            _ => None,
+    fn resolve(&self, name: &[String], args: &[PgType]) -> Option<(FuncId, FuncKind)> {
+        let name = name.last()?.as_str();
+
+        if let Some((_, oid)) = AGGREGATE_REPRESENTATIVE_OID
+            .iter()
+            .find(|(n, _)| *n == name)
+        {
+            return Some((FuncId(Oid(*oid)), FuncKind::Aggregate));
         }
+
+        let arg_oids: Vec<basin_pgtype::Oid> = args.iter().map(|t| t.oid).collect();
+        let sig = basin_pgtype::func::resolve(name, &arg_oids)?;
+        Some((FuncId(sig.oid), map_func_kind(sig.kind)))
+    }
+}
+
+/// `basin_pgtype::func::FuncKind` -> `basin_plan::lower::expr::FuncKind`:
+/// the same four cases, defined in two crates because `basin-pgtype` (the
+/// catalog) and `basin-plan` (the resolver seam it plugs into) don't depend
+/// on each other — see those crates' own docs on the trait-seam pattern this
+/// mirrors for [`OperatorResolver`].
+fn map_func_kind(kind: basin_pgtype::func::FuncKind) -> FuncKind {
+    match kind {
+        basin_pgtype::func::FuncKind::Scalar => FuncKind::Scalar,
+        basin_pgtype::func::FuncKind::Aggregate => FuncKind::Aggregate,
+        basin_pgtype::func::FuncKind::Window => FuncKind::Window,
+        basin_pgtype::func::FuncKind::SetReturning => FuncKind::SetReturning,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use basin_plan::lower::expr::FunctionResolver;
+    use basin_plan::LogicalPlan;
+
+    // ── Fallback::reason_kind ────────────────────────────────────────────
+
+    #[test]
+    fn unsupported_bucket_covers_both_lower_and_build_unsupported_and_no_matching_operator() {
+        assert_eq!(
+            Fallback::Lower(LowerError::Unsupported("x".into())).reason_kind(),
+            FallbackReasonKind::Unsupported
+        );
+        assert_eq!(
+            Fallback::Lower(LowerError::NoMatchingOperator("x".into())).reason_kind(),
+            FallbackReasonKind::Unsupported,
+            "a resolver miss is exactly as actionable as an explicit Unsupported \
+             — see reason_kind's doc comment"
+        );
+        assert_eq!(
+            Fallback::Build(BuildError::Unsupported("x".into())).reason_kind(),
+            FallbackReasonKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn every_other_fallback_variant_lands_in_its_own_bucket() {
+        assert_eq!(
+            Fallback::Ineligible("x").reason_kind(),
+            FallbackReasonKind::Ineligible
+        );
+        assert_eq!(
+            Fallback::Lower(LowerError::UnknownName("x".into())).reason_kind(),
+            FallbackReasonKind::LoweringError
+        );
+        assert_eq!(
+            Fallback::Lower(LowerError::Malformed("x")).reason_kind(),
+            FallbackReasonKind::LoweringError
+        );
+        assert_eq!(
+            Fallback::Build(BuildError::UnknownTable(TableId(1))).reason_kind(),
+            FallbackReasonKind::BuildError
+        );
+        assert_eq!(
+            Fallback::Build(BuildError::NonColumnKey("x")).reason_kind(),
+            FallbackReasonKind::BuildError
+        );
+        assert_eq!(
+            Fallback::Build(BuildError::Exec(ExecError::Cancelled)).reason_kind(),
+            FallbackReasonKind::ExecError,
+            "a BuildError wrapping an ExecError must file under ExecError, not BuildError"
+        );
+        assert_eq!(
+            Fallback::Exec(ExecError::Cancelled).reason_kind(),
+            FallbackReasonKind::ExecError
+        );
+    }
+
+    // ── FallbackReasonCounters ───────────────────────────────────────────
+
+    #[test]
+    fn counters_snapshot_matches_what_was_recorded_and_totals_correctly() {
+        let counters = FallbackReasonCounters::new();
+        counters.record(FallbackReasonKind::Ineligible);
+        counters.record(FallbackReasonKind::Unsupported);
+        counters.record(FallbackReasonKind::Unsupported);
+        counters.record(FallbackReasonKind::LoweringError);
+        counters.record(FallbackReasonKind::BuildError);
+        counters.record(FallbackReasonKind::ExecError);
+
+        let snap = counters.snapshot();
+        assert_eq!(snap.ineligible, 1);
+        assert_eq!(snap.unsupported, 2);
+        assert_eq!(snap.lowering_error, 1);
+        assert_eq!(snap.build_error, 1);
+        assert_eq!(snap.exec_error, 1);
+        assert_eq!(
+            snap.total(),
+            6,
+            "total() must equal the number of record() calls"
+        );
+    }
+
+    #[test]
+    fn fresh_counters_snapshot_to_all_zero() {
+        let snap = FallbackReasonCounters::new().snapshot();
+        assert_eq!(snap, FallbackReasonCountersSnapshot::default());
+        assert_eq!(snap.total(), 0);
+    }
+
+    // ── RealOperators ─────────────────────────────────────────────────────
+
+    #[test]
+    fn not_resolves_to_its_own_sentinel_distinct_from_and_and_or() {
+        let resolved = RealOperators.resolve("NOT", None, PgType::BOOL);
+        assert_eq!(
+            resolved,
+            Some(NOT_OP),
+            "NOT must resolve now — eval_unary implements it"
+        );
+        assert_ne!(NOT_OP, AND_OP);
+        assert_ne!(NOT_OP, OR_OP);
+    }
+
+    #[test]
+    fn and_or_still_resolve_to_their_original_sentinels() {
+        assert_eq!(
+            RealOperators.resolve("AND", None, PgType::BOOL),
+            Some(AND_OP)
+        );
+        assert_eq!(RealOperators.resolve("OR", None, PgType::BOOL), Some(OR_OP));
+    }
+
+    #[test]
+    fn a_real_pg_operator_still_resolves_through_the_catalog() {
+        // `>` over two int4s — exercises the fallthrough to
+        // `basin_pgtype::operator::resolve`, unchanged by this widening.
+        let resolved = RealOperators.resolve(">", Some(PgType::INT4), PgType::INT4);
+        assert!(resolved.is_some());
+        assert_ne!(resolved, Some(AND_OP));
+        assert_ne!(resolved, Some(NOT_OP));
+    }
+
+    // ── RealFunctions ────────────────────────────────────────────────────
+
+    #[test]
+    fn scalar_functions_beyond_the_original_five_aggregates_now_resolve() {
+        let (id, kind) = RealFunctions
+            .resolve(&["lower".to_string()], &[PgType::TEXT])
+            .expect("lower(text) must resolve against the real pg_proc table");
+        assert_eq!(kind, FuncKind::Scalar);
+        assert_eq!(id, FuncId(Oid(870)));
+
+        let (id, kind) = RealFunctions
+            .resolve(&["abs".to_string()], &[PgType::INT4])
+            .expect("abs(int4) must resolve");
+        assert_eq!(kind, FuncKind::Scalar);
+        assert_eq!(id, FuncId(Oid(1397)));
+    }
+
+    #[test]
+    fn window_and_set_returning_functions_now_resolve_with_the_right_kind() {
+        let (_, kind) = RealFunctions
+            .resolve(&["row_number".to_string()], &[])
+            .expect("row_number() must resolve");
+        assert_eq!(kind, FuncKind::Window);
+
+        let (_, kind) = RealFunctions
+            .resolve(
+                &["generate_series".to_string()],
+                &[PgType::INT4, PgType::INT4],
+            )
+            .expect("generate_series(int4, int4) must resolve");
+        assert_eq!(kind, FuncKind::SetReturning);
+    }
+
+    #[test]
+    fn unknown_function_name_still_fails_to_resolve() {
+        assert!(RealFunctions
+            .resolve(&["frobnicate".to_string()], &[PgType::TEXT])
+            .is_none());
+    }
+
+    #[test]
+    fn count_star_and_count_of_a_column_resolve_to_the_same_representative_oid() {
+        // Real `pg_proc` gives these two different oids (2803 vs 2147) — see
+        // `basin_pgtype::func`'s own module docs on why they must never
+        // collapse there. This resolver deliberately does collapse them, to
+        // match what `basin-exec::build::agg_func_of` actually recognises —
+        // see `AGGREGATE_REPRESENTATIVE_OID`'s doc comment.
+        let (star, _) = RealFunctions.resolve(&["count".to_string()], &[]).unwrap();
+        let (of_col, _) = RealFunctions
+            .resolve(&["count".to_string()], &[PgType::INT4])
+            .unwrap();
+        assert_eq!(star, FuncId(Oid(2803)));
+        assert_eq!(of_col, FuncId(Oid(2803)));
+    }
+
+    #[test]
+    fn min_max_sum_avg_resolve_regardless_of_argument_type() {
+        // `min(text)`/`min(timestamptz)` etc. have no row in
+        // `basin_pgtype::func`'s table that `agg_func_of` recognises — the
+        // representative-oid pin is what keeps these servable at all.
+        for (name, oid, ty) in [
+            ("min", 2132u32, PgType::TEXT),
+            ("max", 2116, PgType::TIMESTAMPTZ),
+            ("sum", 2108, PgType::INT2),
+            ("avg", 2101, PgType::new(basin_pgtype::oid::INTERVAL)),
+        ] {
+            let (id, kind) = RealFunctions
+                .resolve(&[name.to_string()], &[ty])
+                .unwrap_or_else(|| panic!("{name} must resolve regardless of argument type"));
+            assert_eq!(
+                id,
+                FuncId(Oid(oid)),
+                "{name} must stay pinned to its representative oid"
+            );
+            assert_eq!(kind, FuncKind::Aggregate);
+        }
+    }
+
+    // ── optimize_default is actually wired between lowering and build ──────
+    //
+    // These exercise exactly `try_execute_inner`'s own lowering call
+    // (`lower_select` with this bridge's own `RealOperators`/`RealFunctions`)
+    // followed by `basin_plan::opt::optimize_default` — the same two calls
+    // in the same order — without needing a real catalog/storage session,
+    // since neither depends on one. A test that only checked the returned
+    // rows would pass whether or not `optimize_default` ever ran (the rules
+    // are answer-preserving by design); these instead pin the *shape* of the
+    // plan the optimizer hands to `basin_exec::build::build`.
+
+    /// A table resolver over an in-memory schema, standing in for
+    /// [`CatalogTableResolver`] — that type needs a real `basin_storage::Storage`
+    /// it has no use for here, since these tests never reach `basin-exec`.
+    struct PlanOnlyTables(HashMap<String, (TableId, PlanSchema)>);
+
+    impl PlanTableResolver for PlanOnlyTables {
+        fn resolve_table(&self, name: &[String]) -> Option<(TableId, PlanSchema)> {
+            let last = name.last()?;
+            self.0.get(last).cloned()
+        }
+    }
+
+    fn lower_over_t(sql: &str) -> basin_plan::LogicalPlan {
+        let schema: PlanSchema = [
+            ("id".to_string(), PgType::INT8),
+            ("name".to_string(), PgType::TEXT),
+            ("extra".to_string(), PgType::TEXT),
+        ]
+        .into_iter()
+        .collect();
+        let mut tables = HashMap::new();
+        tables.insert("t".to_string(), (TableId(1), schema));
+        let resolver = PlanOnlyTables(tables);
+
+        let result = pg_query::parse(sql).expect("parse failed");
+        let raw = result.protobuf.stmts.first().expect("no stmt").clone();
+        let node = *raw.stmt.expect("no stmt node");
+        lower_select(&node, &resolver, &RealOperators, &RealFunctions).expect("lower failed")
+    }
+
+    /// Before optimization, lowering always scans every column of `t` (see
+    /// `select.rs`'s `build_range_var`) and leaves the `WHERE` predicate
+    /// sitting in its own `Filter` node above the `Scan` — `Scan::filters`
+    /// starts empty no matter what the query's `WHERE` clause says.
+    #[test]
+    fn lowering_alone_leaves_a_full_projection_and_an_unpushed_filter() {
+        let plan = lower_over_t("SELECT id FROM t WHERE id > 2");
+        let LogicalPlan::Project { input, .. } = &plan else {
+            panic!("expected Project at the top, got {plan:?}");
+        };
+        let LogicalPlan::Filter { input, .. } = input.as_ref() else {
+            panic!("expected an un-pushed Filter under Project, got {input:?}");
+        };
+        let LogicalPlan::Scan {
+            projection,
+            filters,
+            ..
+        } = input.as_ref()
+        else {
+            panic!("expected Scan under Filter");
+        };
+        assert_eq!(
+            projection.len(),
+            3,
+            "lowering scans every column of t (id, name, extra) before optimizing"
+        );
+        assert!(
+            filters.is_empty(),
+            "lowering never puts a WHERE predicate into Scan::filters itself"
+        );
+    }
+
+    /// The behavior this whole task is about: `optimize_default`, called
+    /// exactly the way `try_execute_inner` now calls it, must (a) push `id >
+    /// 2` all the way into `Scan::filters` — eliminating the `Filter` node
+    /// entirely — and (b) prune `Scan::projection` down to just `id`, the
+    /// only column either the output or the predicate references, dropping
+    /// `name` and `extra`. Before this bridge called `optimize_default`
+    /// (previously it called nothing, then a hand-picked 2-rule subset),
+    /// every scan through this path read all 3 columns and filtered
+    /// Arrow-side after decode; this test would fail against that plan.
+    #[test]
+    fn optimize_default_prunes_the_projection_and_pushes_the_filter_into_the_scan() {
+        let plan = lower_over_t("SELECT id FROM t WHERE id > 2");
+        let (optimized, passes) = basin_plan::opt::optimize_default(plan);
+
+        assert!(
+            passes > 0,
+            "this plan has a filter to push and two unused columns to prune — \
+             the pipeline must have made at least one productive pass"
+        );
+
+        let LogicalPlan::Project { input, exprs } = &optimized else {
+            panic!("expected Project to survive at the top, got {optimized:?}");
+        };
+        assert_eq!(exprs.len(), 1, "the output list is still just `id`");
+        let LogicalPlan::Scan {
+            projection,
+            filters,
+            ..
+        } = input.as_ref()
+        else {
+            panic!(
+                "expected a bare Scan directly under Project — filter pushdown should have \
+                 eaten the Filter node entirely, got {input:?}"
+            );
+        };
+        assert_eq!(
+            projection.len(),
+            1,
+            "projection pruning must narrow the scan to just `id`, got {projection:?}"
+        );
+        assert_eq!(
+            filters.len(),
+            1,
+            "the `id > 2` predicate must have been pushed into the scan, got {filters:?}"
+        );
+    }
+
+    /// The inverse control: a query with nothing to prune or push (every
+    /// column used, no predicate at all) must converge in zero passes. This
+    /// is what the task's counters would show as "the rules are firing on
+    /// nothing" if it happened on real queries that *do* have work to do —
+    /// pinning it here on a query that genuinely has none is what makes the
+    /// non-zero pass count above meaningful rather than a driver artifact.
+    #[test]
+    fn optimize_default_converges_in_zero_passes_on_an_already_minimal_query() {
+        let plan = lower_over_t("SELECT id, name, extra FROM t");
+        let (_optimized, passes) = basin_plan::opt::optimize_default(plan);
+        assert_eq!(
+            passes, 0,
+            "a full-projection, no-filter query has nothing for any rule to do"
+        );
     }
 }

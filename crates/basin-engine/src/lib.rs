@@ -124,6 +124,32 @@ pub(crate) struct EngineInner {
     /// build / execution error — and control fell through to the unchanged
     /// DataFusion path instead. See [`EngineInner::owned_engine_served_count`].
     pub(crate) owned_engine_fallback_count: AtomicU64,
+    /// Per-reason breakdown of [`EngineInner::owned_engine_fallback_count`] —
+    /// see `owned_engine`'s module docs, "Reporting why, not just how many",
+    /// and [`Engine::owned_engine_fallback_reason_counts`].
+    pub(crate) owned_engine_fallback_reasons: crate::owned_engine::FallbackReasonCounters,
+    /// Sum, across every plan the owned-engine bridge has run through
+    /// `basin_plan::opt::optimize_default`, of the number of *productive*
+    /// passes the fixpoint driver made (see `basin_plan::opt::driver`) —
+    /// bumped whether or not the plan went on to be served or fell back at
+    /// build/exec. Divided by [`EngineInner::owned_engine_optimizer_plans_count`]
+    /// this is the mean passes per plan; on its own, a total that stays at 0
+    /// while plans keep flowing through would mean the rule set is firing on
+    /// nothing.
+    pub(crate) owned_engine_optimizer_passes_total: AtomicU64,
+    /// Number of plans `optimize_default` has run to a fixpoint, regardless
+    /// of pass count — the denominator for
+    /// [`EngineInner::owned_engine_optimizer_passes_total`], and (together
+    /// with [`EngineInner::owned_engine_optimizer_zero_pass_count`]) what
+    /// turns "total passes" into "how often does optimization do nothing."
+    pub(crate) owned_engine_optimizer_plans_count: AtomicU64,
+    /// Of [`EngineInner::owned_engine_optimizer_plans_count`], how many
+    /// converged in zero passes — every rule declined to change the plan at
+    /// all. A healthy pipeline sees this stay well below the total: zero
+    /// passes on most real queries would mean the four assembled rules
+    /// (decorrelation, filter pushdown, limit pushdown, projection pruning)
+    /// are not actually matching the shapes lowering produces.
+    pub(crate) owned_engine_optimizer_zero_pass_count: AtomicU64,
     /// Cumulative number of data files skipped by the bloom-filter probe in
     /// `fast_select`. Incremented once per file where the bloom proves the
     /// Eq-predicate value is definitely absent. Used by integration tests to
@@ -562,6 +588,10 @@ impl Engine {
             pg_plan_routing_count: AtomicU64::new(0),
             owned_engine_served_count: AtomicU64::new(0),
             owned_engine_fallback_count: AtomicU64::new(0),
+            owned_engine_fallback_reasons: crate::owned_engine::FallbackReasonCounters::new(),
+            owned_engine_optimizer_passes_total: AtomicU64::new(0),
+            owned_engine_optimizer_plans_count: AtomicU64::new(0),
+            owned_engine_optimizer_zero_pass_count: AtomicU64::new(0),
             blooms_skipped: AtomicU64::new(0),
             promoted_fast_select_count: AtomicU64::new(0),
             trgm_knn_routing_count: AtomicU64::new(0),
@@ -1461,6 +1491,75 @@ impl Engine {
             .load(Ordering::Relaxed)
     }
 
+    /// Crate-private hook bumped by `owned_engine::record_fallback` alongside
+    /// [`Engine::note_owned_engine_fallback`], filing the decline under its
+    /// [`owned_engine::FallbackReasonKind`] bucket.
+    pub(crate) fn note_owned_engine_fallback_reason(
+        &self,
+        reason: crate::owned_engine::FallbackReasonKind,
+    ) {
+        self.inner.owned_engine_fallback_reasons.record(reason);
+    }
+
+    /// A breakdown of [`Engine::owned_engine_fallback_count`] by *why* the
+    /// owned-engine bridge declined to serve each query — an ineligible
+    /// table, a construct nothing downstream implements yet, some other
+    /// lowering/build failure, or a runtime execution error. The sum of
+    /// every field equals `owned_engine_fallback_count()` at any point no
+    /// attempt is concurrently in flight. See `owned_engine`'s module docs,
+    /// "Reporting why, not just how many": the served/fallback ratio says
+    /// how far this migration has gotten, this histogram says what to build
+    /// next.
+    pub fn owned_engine_fallback_reason_counts(&self) -> FallbackReasonCountersSnapshot {
+        self.inner.owned_engine_fallback_reasons.snapshot()
+    }
+
+    /// Crate-private hook bumped by `owned_engine::try_execute_inner` every
+    /// time `basin_plan::opt::optimize_default` finishes running on a
+    /// lowered plan — regardless of whether that plan goes on to be served
+    /// or falls back at build/exec. `passes` is the productive-pass count
+    /// `optimize_default` returns.
+    pub(crate) fn note_owned_engine_optimizer_passes(&self, passes: usize) {
+        self.inner
+            .owned_engine_optimizer_passes_total
+            .fetch_add(passes as u64, Ordering::Relaxed);
+        self.inner
+            .owned_engine_optimizer_plans_count
+            .fetch_add(1, Ordering::Relaxed);
+        if passes == 0 {
+            self.inner
+                .owned_engine_optimizer_zero_pass_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Sum of productive optimizer passes across every plan the owned-engine
+    /// bridge has run through `optimize_default` since this `Engine` was
+    /// built. See [`EngineInner::owned_engine_optimizer_passes_total`].
+    pub fn owned_engine_optimizer_passes_total(&self) -> u64 {
+        self.inner
+            .owned_engine_optimizer_passes_total
+            .load(Ordering::Relaxed)
+    }
+
+    /// Number of plans the owned-engine bridge has run through
+    /// `optimize_default` since this `Engine` was built — the denominator
+    /// for [`Engine::owned_engine_optimizer_passes_total`].
+    pub fn owned_engine_optimizer_plans_count(&self) -> u64 {
+        self.inner
+            .owned_engine_optimizer_plans_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// Of [`Engine::owned_engine_optimizer_plans_count`], how many converged
+    /// in zero passes — every rule declined to change the plan. See
+    /// [`EngineInner::owned_engine_optimizer_zero_pass_count`].
+    pub fn owned_engine_optimizer_zero_pass_count(&self) -> u64 {
+        self.inner
+            .owned_engine_optimizer_zero_pass_count
+            .load(Ordering::Relaxed)
+    }
+
     /// Open a session bound to `project`. The catalog namespace is created on
     /// demand if it does not yet exist.
     ///
@@ -2168,6 +2267,7 @@ impl Drop for ProjectSession {
     }
 }
 
+pub use crate::owned_engine::FallbackReasonCountersSnapshot;
 pub use crate::pk_row_cache::PkRowCacheCountersSnapshot;
 pub use crate::prepared::{BoundStatement, ScalarParam, StatementHandle, StatementSchema};
 pub use crate::region::{ForwardContext, WriteForwarder};
