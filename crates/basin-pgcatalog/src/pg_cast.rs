@@ -1,0 +1,497 @@
+//! `pg_catalog.pg_cast`, a view over `basin-pgtype`'s own cast matrix.
+//!
+//! Like [`crate::pg_type`] and [`crate::pg_operator`], this needs no
+//! [`CatalogSource`]: every builtin cast Basin knows about is already encoded
+//! in `crates/basin-pgtype/src/cast.rs`'s `cast_kind`, whose own module docs
+//! record the live PostgreSQL 18 `pg_cast` join used to verify it. This
+//! relation reports that same cast matrix under `pg_cast`'s column names.
+//!
+//! # Why this table, not a private map
+//!
+//! `docs/migration/df-removal/11-pg-catalog-fidelity.md` §2 ranks `pg_cast`
+//! alongside `pg_operator` as priority 1, for the same reason: the owned
+//! planner must decide whether an implicit/assignment/explicit coercion is
+//! legal by consulting *some* table, and `basin_pgtype::cast` already is that
+//! table internally. Exposing it as `pg_catalog.pg_cast` costs this file and
+//! delivers `\dC` / driver introspection for free.
+//!
+//! # Where the row list comes from, and what is deliberately not derived
+//!
+//! `cast_kind`'s internal `builtin_pg_cast` match table is private and has no
+//! `castmethod` column — Postgres's cast matrix carries a fact `cast_kind`
+//! never needed: *how* the conversion runs (`'f'` a real function, `'b'`
+//! binary-coercible with no function at all, `'i'` via the types' own I/O
+//! routines). [`CAST_ROWS`] below is therefore this module's own static list
+//! of `(source, target, castmethod)` triples — the exact pair set
+//! `cast.rs`'s `builtin_pg_cast` covers, re-declared here because that table
+//! is private, plus the one new fact it doesn't carry. `castcontext` is
+//! **not** re-declared: every row calls the real, public
+//! [`basin_pgtype::cast::cast_kind`] at scan time and reports whatever it
+//! returns, so `pg_cast.castcontext` can never drift from the function the
+//! planner itself calls to decide coercion legality. A test
+//! ([`tests::every_row_agrees_with_cast_kind`]) pins that no row here names a
+//! pair `cast_kind` disagrees with.
+//!
+//! `castmethod` was checked against a live PostgreSQL 18, pair by pair:
+//!
+//! ```sql
+//! SELECT s.typname, t.typname, c.castfunc, c.castcontext, c.castmethod
+//!   FROM pg_cast c
+//!   JOIN pg_type s ON s.oid = c.castsource
+//!   JOIN pg_type t ON t.oid = c.casttarget
+//!  WHERE s.typname IN (<every builtin scalar type name>)
+//!    AND t.typname IN (<same set>)
+//!  ORDER BY s.typname, t.typname;
+//! ```
+//!
+//! Re-run it, filtered to the pairs in [`CAST_ROWS`], before editing the
+//! table. Most rows are `'f'`; a handful are binary-coercible (`int4 <->
+//! oid`, and `text`/`varchar`/`bpchar` cross-casts among themselves — real
+//! `pg_cast` rows, not the I/O fallback, despite all being string types), and
+//! `json <-> jsonb` is `'i'`, confirmed live.
+//!
+//! # What is deliberately absent — three separate gaps, stated honestly
+//!
+//! 1. **The string I/O fallback is not tabulated, matching `cast.rs`.**
+//!    `cast_kind`'s own docs explain that most types reach a string type on
+//!    assignment (and a string type reaches most types on explicit cast) via
+//!    Postgres's I/O-function fallback rather than a real `pg_cast` row —
+//!    `int4 -> text`, `uuid -> text`, `numeric -> text` have **no row** in a
+//!    real `pg_cast` either (confirmed live: zero rows returned for
+//!    `castsource = 'int4'::regtype AND casttarget = 'text'::regtype`). This
+//!    relation correctly has no row for those pairs, matching the real
+//!    server. One real exception exists and is *not* reproduced here: `bool
+//!    -> text` (oid confirmed live) has a genuine dedicated `pg_cast` row in
+//!    Postgres (`castfunc = text(boolean)`, context `'a'`) rather than using
+//!    the fallback — `cast.rs` still gets `bool -> text`'s *context* right via
+//!    the fallback path, so nothing is observably wrong, but this relation
+//!    will report zero rows for that pair where a real server reports one.
+//! 2. **`castfunc` is always `0`.** Real Postgres's `castfunc` names the
+//!    `pg_proc` row implementing a `'f'`-method cast (e.g. `int2 -> int4` is
+//!    function oid 313). Basin executes these conversions directly in Rust,
+//!    not through a `pg_proc`-registered function, so there is no real oid to
+//!    report; `0` is what a real server also reports for `'b'`/`'i'`-method
+//!    rows, but a real server's `'f'`-method rows are never `0`. A client
+//!    that resolves `castfunc` to a function name for one of this relation's
+//!    `'f'` rows will find nothing.
+//! 3. **Row coverage mirrors `cast.rs`'s own scope**, not all 269 rows a real
+//!    PostgreSQL 18 `pg_cast` has (`SELECT count(*) FROM pg_cast`, confirmed
+//!    live). `cast.rs`'s own docs describe its scope as the builtin scalar
+//!    cast matrix; array-to-array and `unknown` coercions are real, correct
+//!    answers from `cast_kind` but are not `pg_cast` rows in real Postgres
+//!    either (arrays inherit their element cast, `unknown` is resolved before
+//!    `pg_cast` is ever consulted — see `cast.rs`'s module docs), so their
+//!    absence here matches the server, not just `cast.rs`.
+
+use std::sync::Arc;
+
+use arrow_array::{RecordBatch, StringArray, UInt32Array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use basin_pgtype::{cast::cast_kind, oid, Oid};
+
+use crate::{
+    catalog_source::CatalogSource,
+    error::Error,
+    predicate::{Predicate, Value},
+};
+
+/// `(castsource, casttarget, castmethod)`. `castcontext` is deliberately not
+/// a field here — see the module docs on why it is derived from
+/// [`cast_kind`] at scan time instead of duplicated by hand.
+type CastPair = (Oid, Oid, char);
+
+/// The builtin `pg_cast` rows this relation reports. Mirrors exactly the pair
+/// set `basin_pgtype::cast`'s private `builtin_pg_cast` table covers — see the
+/// module docs for the live query used to check every `castmethod`.
+static CAST_ROWS: &[CastPair] = &[
+    // ─── The numeric tower ──────────────────────────────────────────────────
+    (oid::INT2, oid::INT4, 'f'),
+    (oid::INT2, oid::INT8, 'f'),
+    (oid::INT2, oid::FLOAT4, 'f'),
+    (oid::INT2, oid::FLOAT8, 'f'),
+    (oid::INT2, oid::NUMERIC, 'f'),
+    (oid::INT4, oid::INT8, 'f'),
+    (oid::INT4, oid::FLOAT4, 'f'),
+    (oid::INT4, oid::FLOAT8, 'f'),
+    (oid::INT4, oid::NUMERIC, 'f'),
+    (oid::INT4, oid::INT2, 'f'),
+    (oid::INT8, oid::FLOAT4, 'f'),
+    (oid::INT8, oid::FLOAT8, 'f'),
+    (oid::INT8, oid::NUMERIC, 'f'),
+    (oid::INT8, oid::INT2, 'f'),
+    (oid::INT8, oid::INT4, 'f'),
+    (oid::FLOAT4, oid::FLOAT8, 'f'),
+    (oid::FLOAT4, oid::INT2, 'f'),
+    (oid::FLOAT4, oid::INT4, 'f'),
+    (oid::FLOAT4, oid::INT8, 'f'),
+    (oid::FLOAT4, oid::NUMERIC, 'f'),
+    (oid::FLOAT8, oid::FLOAT4, 'f'),
+    (oid::FLOAT8, oid::INT2, 'f'),
+    (oid::FLOAT8, oid::INT4, 'f'),
+    (oid::FLOAT8, oid::INT8, 'f'),
+    (oid::FLOAT8, oid::NUMERIC, 'f'),
+    (oid::NUMERIC, oid::FLOAT4, 'f'),
+    (oid::NUMERIC, oid::FLOAT8, 'f'),
+    (oid::NUMERIC, oid::INT2, 'f'),
+    (oid::NUMERIC, oid::INT4, 'f'),
+    (oid::NUMERIC, oid::INT8, 'f'),
+    // ─── oid ────────────────────────────────────────────────────────────────
+    //
+    // int4 <-> oid are binary-coercible (no function at all) in both
+    // directions; int2 -> oid and oid -> int8 still run a real function.
+    // Confirmed live — this asymmetry is real, not a copy-paste.
+    (oid::INT2, oid::OID, 'f'),
+    (oid::INT4, oid::OID, 'b'),
+    (oid::INT8, oid::OID, 'f'),
+    (oid::OID, oid::INT4, 'b'),
+    (oid::OID, oid::INT8, 'f'),
+    // ─── bool ───────────────────────────────────────────────────────────────
+    (oid::BOOL, oid::INT4, 'f'),
+    (oid::INT4, oid::BOOL, 'f'),
+    // ─── bytea ──────────────────────────────────────────────────────────────
+    (oid::INT2, oid::BYTEA, 'f'),
+    (oid::INT4, oid::BYTEA, 'f'),
+    (oid::INT8, oid::BYTEA, 'f'),
+    (oid::BYTEA, oid::INT2, 'f'),
+    (oid::BYTEA, oid::INT4, 'f'),
+    (oid::BYTEA, oid::INT8, 'f'),
+    // ─── string <-> string ──────────────────────────────────────────────────
+    //
+    // text/varchar and text/bpchar are binary-coercible; bpchar -> text/
+    // varchar runs a real function that strips blank padding. Confirmed live
+    // — this is the one place `castmethod` alone (not `castcontext`) exposes
+    // an asymmetry `cast.rs`'s `CastKind` cannot represent.
+    (oid::TEXT, oid::VARCHAR, 'b'),
+    (oid::TEXT, oid::BPCHAR, 'b'),
+    (oid::VARCHAR, oid::TEXT, 'b'),
+    (oid::VARCHAR, oid::BPCHAR, 'b'),
+    (oid::BPCHAR, oid::TEXT, 'f'),
+    (oid::BPCHAR, oid::VARCHAR, 'f'),
+    // ─── name ───────────────────────────────────────────────────────────────
+    (oid::NAME, oid::TEXT, 'f'),
+    (oid::TEXT, oid::NAME, 'f'),
+    (oid::VARCHAR, oid::NAME, 'f'),
+    (oid::BPCHAR, oid::NAME, 'f'),
+    // ─── "char" ─────────────────────────────────────────────────────────────
+    (oid::CHAR, oid::TEXT, 'f'),
+    (oid::INT4, oid::CHAR, 'f'),
+    // ─── date / time ────────────────────────────────────────────────────────
+    (oid::DATE, oid::TIMESTAMP, 'f'),
+    (oid::DATE, oid::TIMESTAMPTZ, 'f'),
+    (oid::TIMESTAMP, oid::TIMESTAMPTZ, 'f'),
+    (oid::TIMESTAMPTZ, oid::TIMESTAMP, 'f'),
+    (oid::TIMESTAMP, oid::DATE, 'f'),
+    (oid::TIMESTAMPTZ, oid::DATE, 'f'),
+    (oid::TIMESTAMP, oid::TIME, 'f'),
+    (oid::TIMESTAMPTZ, oid::TIME, 'f'),
+    (oid::TIMESTAMPTZ, oid::TIMETZ, 'f'),
+    (oid::TIME, oid::INTERVAL, 'f'),
+    (oid::INTERVAL, oid::TIME, 'f'),
+    (oid::TIME, oid::TIMETZ, 'f'),
+    (oid::TIMETZ, oid::TIME, 'f'),
+    // ─── json ───────────────────────────────────────────────────────────────
+    //
+    // json <-> jsonb runs through each type's own I/O routines, not a
+    // dedicated function — the only 'i'-method pair in this table.
+    (oid::JSON, oid::JSONB, 'i'),
+    (oid::JSONB, oid::JSON, 'i'),
+    (oid::JSONB, oid::BOOL, 'f'),
+    (oid::JSONB, oid::INT2, 'f'),
+    (oid::JSONB, oid::INT4, 'f'),
+    (oid::JSONB, oid::INT8, 'f'),
+    (oid::JSONB, oid::FLOAT4, 'f'),
+    (oid::JSONB, oid::FLOAT8, 'f'),
+    (oid::JSONB, oid::NUMERIC, 'f'),
+];
+
+/// One resolved `pg_cast` row: a [`CastPair`] plus the `castcontext`
+/// [`cast_kind`] reports for it.
+struct CastRow {
+    source: Oid,
+    target: Oid,
+    castcontext: char,
+    castmethod: char,
+}
+
+fn resolved_rows() -> Vec<CastRow> {
+    CAST_ROWS
+        .iter()
+        .map(|&(source, target, castmethod)| {
+            let castcontext = cast_kind(source, target)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "pg_cast row ({source}, {target}) has no cast_kind — CAST_ROWS and \
+                         cast.rs's builtin_pg_cast have drifted apart"
+                    )
+                })
+                .as_char();
+            CastRow {
+                source,
+                target,
+                castcontext,
+                castmethod,
+            }
+        })
+        .collect()
+}
+
+/// This row's value for `column`, or `None` if `column` is not one of this
+/// relation's columns.
+fn value(row: &CastRow, column: &str) -> Option<Value> {
+    Some(match column {
+        "castsource" => Value::Oid(row.source),
+        "casttarget" => Value::Oid(row.target),
+        "castfunc" => Value::Oid(Oid::INVALID),
+        "castcontext" => Value::Text(row.castcontext.to_string()),
+        "castmethod" => Value::Text(row.castmethod.to_string()),
+        _ => return None,
+    })
+}
+
+/// `pg_catalog.pg_cast`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PgCast;
+
+impl PgCast {
+    fn arrow_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("castsource", DataType::UInt32, false),
+            Field::new("casttarget", DataType::UInt32, false),
+            Field::new("castfunc", DataType::UInt32, false),
+            Field::new("castcontext", DataType::Utf8, false),
+            Field::new("castmethod", DataType::Utf8, false),
+        ]))
+    }
+}
+
+impl crate::SystemView for PgCast {
+    fn name(&self) -> &str {
+        "pg_cast"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Self::arrow_schema()
+    }
+
+    fn scan(
+        &self,
+        _catalog: &dyn CatalogSource,
+        pushed: &[Predicate],
+    ) -> Result<RecordBatch, Error> {
+        let schema = Self::arrow_schema();
+        for p in pushed {
+            if !schema.fields().iter().any(|f| f.name() == p.column()) {
+                return Err(Error::UnknownColumn {
+                    relation: "pg_cast",
+                    column: p.column().to_string(),
+                });
+            }
+        }
+
+        let rows: Vec<CastRow> = resolved_rows()
+            .into_iter()
+            .filter(|r| {
+                pushed
+                    .iter()
+                    .all(|p| p.matches(value(r, p.column()).as_ref()))
+            })
+            .collect();
+
+        let sources: UInt32Array = rows.iter().map(|r| r.source.get()).collect();
+        let targets: UInt32Array = rows.iter().map(|r| r.target.get()).collect();
+        let funcs: UInt32Array = rows.iter().map(|_| Oid::INVALID.get()).collect();
+        let contexts: StringArray = rows
+            .iter()
+            .map(|r| Some(r.castcontext.to_string()))
+            .collect();
+        let methods: StringArray = rows
+            .iter()
+            .map(|r| Some(r.castmethod.to_string()))
+            .collect();
+
+        Ok(RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(sources),
+                Arc::new(targets),
+                Arc::new(funcs),
+                Arc::new(contexts),
+                Arc::new(methods),
+            ],
+        )?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::Array;
+
+    use super::*;
+    use crate::{mock::MockCatalog, SystemView};
+
+    fn col_u32(batch: &RecordBatch, name: &str) -> Vec<u32> {
+        batch
+            .column(batch.schema().index_of(name).unwrap())
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
+    fn col_str(batch: &RecordBatch, name: &str) -> Vec<String> {
+        batch
+            .column(batch.schema().index_of(name).unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect()
+    }
+
+    fn row_for(batch: &RecordBatch, source: u32, target: u32) -> usize {
+        let sources = col_u32(batch, "castsource");
+        let targets = col_u32(batch, "casttarget");
+        sources
+            .iter()
+            .zip(targets.iter())
+            .position(|(&s, &t)| s == source && t == target)
+            .unwrap_or_else(|| panic!("no pg_cast row for {source} -> {target}"))
+    }
+
+    #[test]
+    fn name_is_pg_cast() {
+        assert_eq!(PgCast.name(), "pg_cast");
+    }
+
+    #[test]
+    fn schema_matches_the_documented_column_set() {
+        let schema = PgCast.schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "castsource",
+                "casttarget",
+                "castfunc",
+                "castcontext",
+                "castmethod",
+            ]
+        );
+    }
+
+    /// No two rows in [`CAST_ROWS`] disagree with what `cast_kind` itself
+    /// says, and every row's `cast_kind` call actually succeeds — pins that
+    /// [`resolved_rows`] never silently drops a row via its `unwrap_or_else`
+    /// panic path, and that `pg_cast.castcontext` cannot drift from the
+    /// function the planner calls to decide coercion legality.
+    #[test]
+    fn every_row_agrees_with_cast_kind() {
+        for &(source, target, _) in CAST_ROWS {
+            let kind = cast_kind(source, target)
+                .unwrap_or_else(|| panic!("{source} -> {target} has no cast_kind"));
+            let batch = PgCast.scan(&MockCatalog::new(), &[]).unwrap();
+            let i = row_for(&batch, source.get(), target.get());
+            assert_eq!(
+                col_str(&batch, "castcontext")[i],
+                kind.as_char().to_string()
+            );
+        }
+    }
+
+    /// The three `castcontext` categories `cast.rs`'s module docs describe
+    /// all actually appear: implicit widening, assignment-only narrowing, and
+    /// explicit-only conversion.
+    #[test]
+    fn castcontext_covers_all_three_categories() {
+        let batch = PgCast.scan(&MockCatalog::new(), &[]).unwrap();
+
+        // int2 -> int4: implicit widening.
+        let i = row_for(&batch, oid::INT2.get(), oid::INT4.get());
+        assert_eq!(col_str(&batch, "castcontext")[i], "i");
+
+        // int8 -> int4: assignment-only narrowing.
+        let i = row_for(&batch, oid::INT8.get(), oid::INT4.get());
+        assert_eq!(col_str(&batch, "castcontext")[i], "a");
+
+        // int4 -> bool: explicit-only.
+        let i = row_for(&batch, oid::INT4.get(), oid::BOOL.get());
+        assert_eq!(col_str(&batch, "castcontext")[i], "e");
+    }
+
+    /// `int4 <-> oid` are binary-coercible in real Postgres — no cast
+    /// function at all — while `int2 -> oid` still runs one. Confirmed live;
+    /// pins that `castmethod` is not just a constant `'f'` for every row.
+    #[test]
+    fn castmethod_distinguishes_binary_coercible_from_function_casts() {
+        let batch = PgCast.scan(&MockCatalog::new(), &[]).unwrap();
+
+        let i = row_for(&batch, oid::INT4.get(), oid::OID.get());
+        assert_eq!(col_str(&batch, "castmethod")[i], "b");
+
+        let i = row_for(&batch, oid::INT2.get(), oid::OID.get());
+        assert_eq!(col_str(&batch, "castmethod")[i], "f");
+
+        let i = row_for(&batch, oid::JSON.get(), oid::JSONB.get());
+        assert_eq!(col_str(&batch, "castmethod")[i], "i");
+    }
+
+    /// The entire point of this crate: a predicate on `castsource` AND
+    /// `casttarget` together narrows to exactly one row, mirroring
+    /// `(castsource, casttarget)` being a real unique constraint.
+    #[test]
+    fn pushed_predicates_on_source_and_target_narrow_to_one_row() {
+        let full = PgCast.scan(&MockCatalog::new(), &[]).unwrap();
+        assert!(full.num_rows() > 1, "sanity: pg_cast has more than one row");
+
+        let filtered = PgCast
+            .scan(
+                &MockCatalog::new(),
+                &[
+                    Predicate::eq("castsource", oid::INT2),
+                    Predicate::eq("casttarget", oid::INT4),
+                ],
+            )
+            .unwrap();
+        assert_eq!(filtered.num_rows(), 1);
+        assert_eq!(col_str(&filtered, "castcontext"), vec!["i".to_string()]);
+    }
+
+    /// `castfunc` is always `0` — a documented gap, not a bug. See the module
+    /// docs on why Basin has no real `pg_proc` oid to report here.
+    #[test]
+    fn castfunc_is_always_zero() {
+        let batch = PgCast.scan(&MockCatalog::new(), &[]).unwrap();
+        for f in col_u32(&batch, "castfunc") {
+            assert_eq!(f, 0);
+        }
+    }
+
+    /// A predicate matching nothing returns zero rows, not everything.
+    #[test]
+    fn pushed_predicate_matching_nothing_returns_empty() {
+        let filtered = PgCast
+            .scan(
+                &MockCatalog::new(),
+                &[Predicate::eq("castsource", Oid(999_999))],
+            )
+            .unwrap();
+        assert_eq!(filtered.num_rows(), 0);
+    }
+
+    /// A predicate naming a column this relation does not have is an error.
+    #[test]
+    fn predicate_on_unknown_column_is_an_error() {
+        let err = PgCast
+            .scan(&MockCatalog::new(), &[Predicate::eq("nope", 1i64)])
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::UnknownColumn {
+                relation: "pg_cast",
+                column: "nope".to_string(),
+            }
+        );
+    }
+}

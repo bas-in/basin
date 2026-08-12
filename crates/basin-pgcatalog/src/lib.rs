@@ -26,16 +26,25 @@
 //! since it is fully determined by `basin-pgtype`'s own OID table.
 //! [`pg_namespace`] and [`pg_class`] are implemented against the [`mock`]
 //! [`CatalogSource`], proving the shape against something other than
-//! `pg_type`'s static data. Everything else in the ~65-relation surface —
-//! `pg_attribute`, `pg_index`, `pg_constraint`, `pg_operator`, `pg_cast`, the
+//! `pg_type`'s static data. [`pg_operator`], [`pg_cast`] and [`pg_proc`] are
+//! also complete and, like `pg_type`, need no catalog: each is a view over
+//! `basin-pgtype`'s own operator/cast/function tables, chosen first per
+//! `docs/migration/df-removal/11-pg-catalog-fidelity.md` §2 because the owned
+//! planner needs exactly this data to resolve operators, casts and functions
+//! by argument type — making the resolution table `pg_catalog` itself costs
+//! almost nothing beyond compatibility. Everything else in the ~65-relation
+//! surface — `pg_attribute`, `pg_index`, `pg_constraint`, the
 //! `information_schema` views, and wiring a real `basin-catalog` backend for
 //! [`CatalogSource`] — is a follow-up increment, not attempted here.
 
 pub mod catalog_source;
 pub mod error;
 pub mod mock;
+pub mod pg_cast;
 pub mod pg_class;
 pub mod pg_namespace;
+pub mod pg_operator;
+pub mod pg_proc;
 pub mod pg_type;
 pub mod predicate;
 pub mod system_view;
