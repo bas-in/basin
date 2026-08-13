@@ -103,6 +103,27 @@ pub fn lower_select(
     operators: &dyn OperatorResolver,
     functions: &dyn FunctionResolver,
 ) -> Result<LogicalPlan, LowerError> {
+    lower_select_with_outer(node, tables, operators, functions, None)
+}
+
+/// [`lower_select`]'s real body, plus the one seam that entry point cannot
+/// expose without breaking every existing caller's signature: `outer`, the
+/// enclosing query's own column resolver, non-`None` only when this is a
+/// recursive call lowering a subquery's body (see [`SelectSubqueries::lower`]).
+///
+/// This is what lets a correlated reference (`WHERE EXISTS (SELECT 1 FROM u
+/// WHERE u.id = t.id)`'s `t.id`, unresolvable against the subquery's own
+/// `FROM u`) resolve against the enclosing query's scope instead of failing
+/// with [`LowerError::UnknownName`] — see [`ScopeResolver`] and [`OUTER_REF`]
+/// for how the resulting reference is tagged so `opt::decorrelate` can later
+/// tell it apart from an ordinary, local one.
+fn lower_select_with_outer(
+    node: &Node,
+    tables: &dyn TableResolver,
+    operators: &dyn OperatorResolver,
+    functions: &dyn FunctionResolver,
+    outer: Option<&dyn ColumnResolver>,
+) -> Result<LogicalPlan, LowerError> {
     let Some(NodeEnum::SelectStmt(stmt)) = node.node.as_ref() else {
         return Err(LowerError::Malformed("expected a SelectStmt node"));
     };
@@ -110,10 +131,22 @@ pub fn lower_select(
         tables,
         operators,
         functions,
+        outer,
     };
     let (plan, _schema) = lower_select_stmt(stmt, &res)?;
     Ok(plan)
 }
+
+/// Within a subquery lowered by [`SelectSubqueries::lower`], the
+/// [`ColumnRef::relation`] value that marks a reference reaching into the
+/// enclosing query's current row rather than the subquery's own `FROM`.
+/// `opt::decorrelate` defines and documents this exact same convention
+/// (`OUTER_REF`, also `1`) for the plan shapes it rewrites — this is the
+/// producing side of that convention, not a second one; see that module's
+/// "A convention this file invents" for the full rationale, and note that
+/// module's own docs (as of when this constant was added) call out that no
+/// real lowering path constructed this shape yet — this is that path.
+const OUTER_REF: u16 = 1;
 
 /// The three resolver seams a statement-level lowering pass needs, bundled
 /// for call-site ergonomics — the statement-level analogue of `lower::expr`'s
@@ -124,31 +157,52 @@ struct Resolvers<'a> {
     tables: &'a dyn TableResolver,
     operators: &'a dyn OperatorResolver,
     functions: &'a dyn FunctionResolver,
+    /// The enclosing query's own column resolver, when this `Resolvers` is
+    /// lowering a subquery's body — `None` at the top level. Threaded
+    /// through so [`ScopeResolver`] can fall back to it (see that type) and
+    /// so [`Resolvers::subqueries`] can hand the *current* clause's resolver
+    /// down as the next nesting level's `outer`.
+    outer: Option<&'a dyn ColumnResolver>,
 }
 
 impl<'a> Resolvers<'a> {
-    fn subqueries(&self) -> SelectSubqueries<'a> {
+    /// `columns` is the calling clause's own resolver (its `Scope`, wrapped
+    /// — already falling back to `self.outer` itself, if any) — handed to a
+    /// nested subquery as *its* `outer`, one level further in. This is the
+    /// single seam that turns a fixed, statement-wide `outer` into the
+    /// correctly-nested chain a multiply-nested correlated subquery needs.
+    fn subqueries(&self, columns: &'a dyn ColumnResolver) -> SelectSubqueries<'a> {
         SelectSubqueries {
             tables: self.tables,
             operators: self.operators,
             functions: self.functions,
+            outer: columns,
         }
     }
 }
 
 /// Lowers a nested `SELECT` (scalar subquery, `EXISTS`, `IN`, ...) by
-/// recursing back into [`lower_select`] with the same resolvers — this is
-/// what makes `lower::expr`'s `SubqueryLowerer` seam real rather than a mock,
-/// for anything that reaches this crate through a full statement.
+/// recursing back into [`lower_select_with_outer`] with the same resolvers
+/// plus `outer` (the enclosing clause's own resolver) — this is what makes
+/// `lower::expr`'s `SubqueryLowerer` seam real rather than a mock, for
+/// anything that reaches this crate through a full statement, and what lets
+/// a correlated reference inside the subquery resolve at all.
 struct SelectSubqueries<'a> {
     tables: &'a dyn TableResolver,
     operators: &'a dyn OperatorResolver,
     functions: &'a dyn FunctionResolver,
+    outer: &'a dyn ColumnResolver,
 }
 
 impl<'a> SubqueryLowerer for SelectSubqueries<'a> {
     fn lower(&self, subselect: &Node) -> Result<LogicalPlan, LowerError> {
-        lower_select(subselect, self.tables, self.operators, self.functions)
+        lower_select_with_outer(
+            subselect,
+            self.tables,
+            self.operators,
+            self.functions,
+            Some(self.outer),
+        )
     }
 }
 
@@ -277,17 +331,47 @@ impl Scope {
 /// `lower::expr::lower_expr` resolve columns against whatever the `FROM`
 /// clause put in scope, reusing that module's resolution entirely rather
 /// than inventing a second column-resolution mechanism.
-struct ScopeResolver<'a>(&'a Scope);
+///
+/// `outer`, when present, is tried only after `scope` itself has already
+/// failed to resolve the name — an inner name always shadows an outer one of
+/// the same spelling, exactly as Postgres resolves a correlated reference.
+/// A hit through `outer` is re-tagged [`OUTER_REF`] rather than returned
+/// as-is: whatever relation `outer` itself used is an artifact of *its own*
+/// scope (`0` for an ordinary local column, or already `OUTER_REF` if
+/// `outer` itself fell through to a further-enclosing query), and from this
+/// subquery's point of view every one of those is equally "reaches outside
+/// my own `FROM`" — the one bit `opt::decorrelate`'s convention has room to
+/// express. See that module's docs for why a deeper chain collapsing to the
+/// same tag is an accepted, pre-existing limit of the convention rather than
+/// a bug introduced here.
+struct ScopeResolver<'a> {
+    scope: &'a Scope,
+    outer: Option<&'a dyn ColumnResolver>,
+}
+
+impl<'a> ScopeResolver<'a> {
+    fn new(scope: &'a Scope, outer: Option<&'a dyn ColumnResolver>) -> Self {
+        Self { scope, outer }
+    }
+}
 
 impl ColumnResolver for ScopeResolver<'_> {
     fn resolve(&self, parts: &[String]) -> Option<ColumnRef> {
-        self.0.resolve(parts)
+        if let Some(cr) = self.scope.resolve(parts) {
+            return Some(cr);
+        }
+        let cr = self.outer?.resolve(parts)?;
+        Some(ColumnRef {
+            relation: OUTER_REF,
+            index: cr.index,
+            name: cr.name,
+        })
     }
 }
 
 fn expr_ctx<'a>(res: &'a Resolvers<'a>, columns: &'a dyn ColumnResolver) -> LowerCtxOwned<'a> {
     LowerCtxOwned {
-        subqueries: res.subqueries(),
+        subqueries: res.subqueries(columns),
         columns,
         operators: res.operators,
         functions: res.functions,
@@ -539,7 +623,7 @@ fn lower_select_stmt_body(
     let from = build_from_clause(&stmt.from_clause, res, ctes)?;
     let (base_plan, scope) = apply_where(from, stmt, res)?;
 
-    let resolver = ScopeResolver(&scope);
+    let resolver = ScopeResolver::new(&scope, res.outer);
     let lctx = expr_ctx(res, &resolver);
     let ctx = lctx.ctx();
 
@@ -601,6 +685,7 @@ fn lower_select_stmt_body(
             ));
         }
 
+        let base_plan = materialize_agg_inputs(base_plan, &scope, &mut aggs);
         let agg_width = group_exprs.len() + aggs.len();
         let agg_plan = LogicalPlan::Aggregate {
             input: Box::new(base_plan),
@@ -727,7 +812,7 @@ fn lower_set_op(
 
 fn lower_values(stmt: &SelectStmt, res: &Resolvers) -> Result<(LogicalPlan, Schema), LowerError> {
     let scope = Scope::empty();
-    let resolver = ScopeResolver(&scope);
+    let resolver = ScopeResolver::new(&scope, res.outer);
     let lctx = expr_ctx(res, &resolver);
     let ctx = lctx.ctx();
 
@@ -787,7 +872,7 @@ fn apply_limit(
     // itself rejects that at parse analysis — so an empty scope is correct
     // here, not merely convenient.
     let scope = Scope::empty();
-    let resolver = ScopeResolver(&scope);
+    let resolver = ScopeResolver::new(&scope, res.outer);
     let lctx = expr_ctx(res, &resolver);
     let ctx = lctx.ctx();
 
@@ -983,7 +1068,7 @@ fn build_join_expr(
     let scope = left.scope.concat(right.scope);
     let total_len = scope.total_len();
 
-    let resolver = ScopeResolver(&scope);
+    let resolver = ScopeResolver::new(&scope, res.outer);
     let lctx = expr_ctx(res, &resolver);
     let ctx = lctx.ctx();
 
@@ -1043,7 +1128,7 @@ fn apply_where(
         return Ok((plan, scope));
     };
 
-    let resolver = ScopeResolver(&scope);
+    let resolver = ScopeResolver::new(&scope, res.outer);
     let lctx = expr_ctx(res, &resolver);
     let ctx = lctx.ctx();
 
@@ -1531,6 +1616,80 @@ fn sort_keys_contain_window(keys: &[SortKey]) -> bool {
     keys.iter().any(|k| contains_window(&k.expr))
 }
 
+// ─── Aggregate input materialization ───────────────────────────────────────
+
+/// Materialize any non-column `Expr::Aggregate` argument or `FILTER (WHERE
+/// …)` predicate into a `Project` inserted directly under the `Aggregate`,
+/// rewriting `aggs` in place to reference the new column instead.
+///
+/// `basin-exec/src/build.rs`'s `agg_spec` requires both a bare `sum(amt)`'s
+/// `args[0]` and a `FILTER`'s predicate to already be a plain `Expr::Column`
+/// into the `Aggregate` node's own `input` — `column_index(...).ok_or(
+/// BuildError::NonColumnKey(...))`, and `basin-exec/src/aggregate.rs`'s own
+/// module docs confirm this is deliberate: "`FILTER (WHERE …)` predicates
+/// are all pre-resolved to column positions." A bare-column argument
+/// (`sum(amt)`) and no `FILTER` already satisfy that trivially, which is why
+/// this was never needed until now; `sum(amt) FILTER (WHERE id > 1)`'s
+/// predicate is a full comparison, not a column, and `sum(a + b)`'s argument
+/// has the exact same shape of problem. Both get the same fix a `GROUP BY`
+/// key's own position already gets post-aggregation ([`rewrite_post_agg`]):
+/// compute it below, reference it by position above.
+///
+/// Only inserts the `Project` when at least one aggregate actually needs
+/// it — the common "every arg and filter is already a column" case costs
+/// nothing extra and returns `input` unchanged.
+fn materialize_agg_inputs(input: LogicalPlan, scope: &Scope, aggs: &mut [Expr]) -> LogicalPlan {
+    let base_width = scope.total_len();
+    let mut extra: Vec<(Expr, String)> = Vec::new();
+    let mut next_index = base_width as u16;
+
+    let mut materialize = |e: &mut Expr| {
+        if matches!(e, Expr::Column(_)) {
+            return;
+        }
+        let alias = default_alias(e);
+        extra.push((e.clone(), alias.clone()));
+        *e = Expr::Column(ColumnRef {
+            relation: 0,
+            index: next_index,
+            name: alias,
+        });
+        next_index += 1;
+    };
+
+    for agg in aggs.iter_mut() {
+        let Expr::Aggregate { args, filter, .. } = agg else {
+            continue;
+        };
+        for a in args.iter_mut() {
+            materialize(a);
+        }
+        if let Some(f) = filter.as_deref_mut() {
+            materialize(f);
+        }
+    }
+
+    if extra.is_empty() {
+        return input;
+    }
+
+    let identity = scope.star_columns(None).into_iter().map(|(name, index)| {
+        (
+            Expr::Column(ColumnRef {
+                relation: 0,
+                index,
+                name: name.clone(),
+            }),
+            name,
+        )
+    });
+
+    LogicalPlan::Project {
+        input: Box::new(input),
+        exprs: identity.chain(extra).collect(),
+    }
+}
+
 // ─── Aggregate output rewriting ────────────────────────────────────────────
 
 /// Rewrite `expr` (lowered against the pre-aggregation scope) to reference
@@ -1841,7 +2000,7 @@ fn transform_frame(
 mod tests {
     use super::*;
     use crate::expr::Datum;
-    use crate::SnapshotId;
+    use crate::{SnapshotId, SubqueryKind};
     use basin_pgtype::Oid;
     use std::collections::HashMap;
 
@@ -2054,6 +2213,85 @@ mod tests {
         assert!(msg.contains("WHERE"), "message should mention WHERE: {msg}");
     }
 
+    #[test]
+    fn a_correlated_exists_subquery_resolves_the_outer_reference() {
+        // `u.t_id` resolves against the subquery's own `FROM u`; `t.id` does
+        // not (only "u" is in scope there) and must fall through to the
+        // enclosing query's own scope instead of `LowerError::UnknownName`,
+        // tagged `OUTER_REF` per `opt::decorrelate`'s documented convention
+        // — see `ScopeResolver` and `SelectSubqueries::lower`.
+        let plan =
+            lower("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id)").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Filter { predicate, .. } = *input else {
+            panic!("expected Filter under Project");
+        };
+        let Expr::Subquery {
+            kind,
+            subplan,
+            operand,
+        } = predicate
+        else {
+            panic!("expected a Subquery predicate, got {predicate:?}");
+        };
+        assert_eq!(kind, SubqueryKind::Exists);
+        assert!(operand.is_none());
+
+        let LogicalPlan::Project { input, .. } = *subplan else {
+            panic!("expected a Project (the subquery's own SELECT list)");
+        };
+        let LogicalPlan::Filter { input, predicate } = *input else {
+            panic!("expected Filter under the subquery's own Project");
+        };
+        let Expr::Binary { lhs, rhs, .. } = predicate else {
+            panic!("expected a Binary predicate");
+        };
+        // `u.t_id`: local to the subquery's own scope (u: id, t_id, c).
+        assert_eq!(*lhs, col(1, "t_id"));
+        // `t.id`: the enclosing query's own scope (t: id, a, b), reached
+        // through `ScopeResolver`'s `outer` fallback and tagged OUTER_REF.
+        assert_eq!(
+            *rhs,
+            Expr::Column(ColumnRef {
+                relation: OUTER_REF,
+                index: 0,
+                name: "id".to_string(),
+            })
+        );
+        assert!(matches!(*input, LogicalPlan::Scan { .. }));
+    }
+
+    #[test]
+    fn an_uncorrelated_exists_subquery_still_lowers_with_no_outer_reference() {
+        // No column in the subquery's WHERE reaches outside its own FROM —
+        // `ScopeResolver`'s `outer` fallback must never fire when the local
+        // scope already resolves the name.
+        let plan =
+            lower("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = u.id)").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Filter { predicate, .. } = *input else {
+            panic!("expected Filter under Project");
+        };
+        let Expr::Subquery { subplan, .. } = predicate else {
+            panic!("expected a Subquery predicate, got {predicate:?}");
+        };
+        let LogicalPlan::Project { input, .. } = *subplan else {
+            panic!("expected a Project (the subquery's own SELECT list)");
+        };
+        let LogicalPlan::Filter { predicate, .. } = *input else {
+            panic!("expected Filter under the subquery's own Project");
+        };
+        let Expr::Binary { lhs, rhs, .. } = predicate else {
+            panic!("expected a Binary predicate");
+        };
+        assert_eq!(*lhs, col(1, "t_id"));
+        assert_eq!(*rhs, col(0, "id"));
+    }
+
     // --- 4: GROUP BY / HAVING -> Aggregate + Filter -------------------------
 
     #[test]
@@ -2125,6 +2363,72 @@ mod tests {
             aggs.len(),
             1,
             "HAVING's sum(id) must reuse the SELECT list's aggregate slot, not add a second one"
+        );
+    }
+
+    #[test]
+    fn aggregate_filter_materializes_the_predicate_into_a_project_below() {
+        // `basin-exec/src/build.rs`'s `agg_spec` requires `Expr::Aggregate`'s
+        // `filter` to already be a bare `Expr::Column` into the `Aggregate`
+        // node's own input — see `materialize_agg_inputs`'s doc comment.
+        // `id > 1` is not a column, so it must be computed in a `Project`
+        // inserted between the scan and the `Aggregate`, and the aggregate's
+        // `filter` must end up pointing at that new column.
+        let plan = lower("SELECT sum(a) FILTER (WHERE id > 1) FROM t").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Aggregate { input, aggs, .. } = *input else {
+            panic!("expected Aggregate");
+        };
+        assert_eq!(aggs.len(), 1);
+        let Expr::Aggregate { args, filter, .. } = &aggs[0] else {
+            panic!("expected an Aggregate call");
+        };
+        // `a` was already a bare column — untouched, still index 1 (t's own
+        // schema: id, a, b).
+        assert_eq!(args[0], col(1, "a"));
+        // The FILTER predicate is now a reference to the materialized
+        // column appended after t's own 3 columns (id, a, b), at index 3.
+        let filter = filter.as_deref().expect("FILTER must still be present");
+        assert_eq!(*filter, col(3, "?column?"));
+
+        let LogicalPlan::Project { input: scan, exprs } = *input else {
+            panic!("expected a materializing Project directly under the Aggregate");
+        };
+        assert!(matches!(*scan, LogicalPlan::Scan { .. }));
+        // t's own 3 columns pass through unchanged, plus the materialized
+        // `id > 1` as a 4th.
+        assert_eq!(exprs.len(), 4);
+        assert_eq!(exprs[0], (col(0, "id"), "id".to_string()));
+        assert_eq!(exprs[1], (col(1, "a"), "a".to_string()));
+        assert_eq!(exprs[2], (col(2, "b"), "b".to_string()));
+        let Expr::Binary { lhs, rhs, .. } = &exprs[3].0 else {
+            panic!("expected the materialized FILTER predicate");
+        };
+        assert_eq!(**lhs, col(0, "id"));
+        assert_eq!(**rhs, int_lit(1));
+    }
+
+    #[test]
+    fn an_ordinary_aggregate_needs_no_materializing_project() {
+        // The common case — every arg and filter already a bare column (no
+        // FILTER at all here) — must cost nothing extra: no `Project`
+        // inserted between the scan and the `Aggregate`. Already covered by
+        // `group_by_and_a_bare_aggregate_build_an_aggregate_node`'s own
+        // `matches!(*input, LogicalPlan::Scan { .. })` assertion; this test
+        // names that property directly against `materialize_agg_inputs`.
+        let plan = lower("SELECT count(id) FROM t").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Aggregate { input, .. } = *input else {
+            panic!("expected Aggregate");
+        };
+        assert!(
+            matches!(*input, LogicalPlan::Scan { .. }),
+            "an aggregate with no non-column args/filter must not get a \
+             materializing Project — got {input:?}"
         );
     }
 
