@@ -123,10 +123,13 @@
 //! scope is threaded into the subquery unchanged, so `WHERE id IN (SELECT
 //! ... FROM cte)` still excludes `cte` instead of asking the catalog for a
 //! table by that name — which would turn a servable query into an
-//! `Ineligible` fallback, strictly worse than not walking at all. And a
-//! subquery in `FROM` (`RangeSubselect`, LATERAL included) is still not
-//! walked: `lower/select.rs` rejects that shape as `Unsupported` regardless,
-//! so collecting its tables could only downgrade a clean verdict.
+//! `Ineligible` fallback, strictly worse than not walking at all. A subquery
+//! in `FROM` (`RangeSubselect`, LATERAL included) IS walked, and the same CTE
+//! scope is threaded into it. That reverses an earlier decision, correctly:
+//! while `lower/select.rs` refused a subquery in `FROM` as `Unsupported`,
+//! collecting its tables could only downgrade a clean verdict — but it now
+//! lowers derived tables through the full `SELECT` surface, so leaving them
+//! unwalked strands the inner `FROM` at `UnknownName` instead.
 //!
 //! `basin_plan::TableId` has no catalog-side counterpart (see
 //! `basin-catalog`'s `TableMetadata`, keyed only by `(ProjectId,
@@ -1372,9 +1375,9 @@ fn collect_tables_stmt(stmt: &SelectStmt, cte_scope: &HashSet<String>, out: &mut
 /// sending it to the catalog as a table that does not exist.
 ///
 /// Anything unlisted falls to `_ => {}` on the same terms as the rest of this
-/// module: under-collecting costs a fallback, never a wrong answer. Note the
-/// absence of `RangeSubselect` — a subquery in `FROM` is reached through
-/// [`collect_from_item`], which deliberately does not walk it (see there).
+/// module: under-collecting costs a fallback, never a wrong answer. A subquery
+/// in `FROM` is not reached from here — it is a `RangeSubselect`, handled by
+/// [`collect_from_item`], which walks it.
 fn collect_expr(node: &Node, cte_scope: &HashSet<String>, out: &mut Vec<Vec<String>>) {
     match node.node.as_ref() {
         // The whole reason this function exists.
@@ -1534,6 +1537,30 @@ fn collect_from_item(item: &Node, cte_scope: &HashSet<String>, out: &mut Vec<Vec
             }
             // `ON` is an ordinary expression, and can hold a `SubLink`.
             collect_opt_expr(je.quals.as_deref(), cte_scope, out);
+        }
+        // A derived table — `FROM (SELECT ...) s`. Walked as of the commit
+        // that added this arm, and NOT before: `basin-plan` used to refuse a
+        // subquery in `FROM` outright, so prefetching its tables would have
+        // converted a clean `Unsupported` into a possible `Ineligible` and
+        // made the histogram worse. `lower/select.rs::build_range_subselect`
+        // now lowers the body through the full `SELECT` surface, so the inner
+        // `FROM` needs its tables prefetched like any other.
+        //
+        // `cte_scope` is threaded unchanged, for the same reason
+        // `collect_expr` threads it into a `SubLink`: a derived table sees
+        // exactly the CTE names its enclosing level sees, so
+        // `FROM (SELECT ... FROM cte) s` keeps excluding `cte` rather than
+        // sending it to the catalog as a table that does not exist.
+        //
+        // LATERAL is the same `RangeSubselect` node with `lateral` set; it is
+        // walked identically, since a correlated reference resolves against
+        // the outer scope and never names a new table.
+        Some(NodeEnum::RangeSubselect(rs)) => {
+            if let Some(NodeEnum::SelectStmt(inner)) =
+                rs.subquery.as_deref().and_then(|n| n.node.as_ref())
+            {
+                collect_tables_stmt(inner, cte_scope, out);
+            }
         }
         _ => {}
     }
@@ -2189,18 +2216,47 @@ mod tests {
     /// A subquery in `FROM` stays unwalked on purpose — `lower/select.rs`
     /// rejects that shape as `Unsupported` whatever this collects, and
     /// collecting its tables could only turn that clean verdict into an
-    /// `Ineligible` one. Pinned so the omission reads as a decision.
+    /// `Ineligible` one.
+    ///
+    /// THAT IS NO LONGER TRUE. `lower/select.rs::build_range_subselect` now
+    /// lowers a derived table's body through the full `SELECT` surface, so
+    /// leaving it unwalked strands the inner `FROM` at `UnknownName` — the
+    /// refusal became a capability, and the omission that used to be a
+    /// decision became a bug. These replace the test that pinned it.
     #[test]
-    fn a_subquery_in_from_is_still_not_walked() {
-        assert!(
-            collected("SELECT s.tid FROM (SELECT tid FROM u) s").is_empty(),
-            "RangeSubselect must stay outside this walk"
+    fn a_subquery_in_from_is_walked() {
+        let names = collected("SELECT s.tid FROM (SELECT tid FROM u) s");
+        assert_eq!(
+            names,
+            vec!["u".to_string()],
+            "a derived table's inner FROM must be prefetched, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_lateral_subquery_in_from_is_walked() {
+        let names = collected(
+            "SELECT t.id FROM t, LATERAL (SELECT tid FROM u WHERE u.tid = t.id) s",
         );
         assert!(
-            collected("SELECT t.id FROM t, LATERAL (SELECT tid FROM u WHERE u.tid = t.id) s")
-                .iter()
-                .all(|n| n != "u"),
-            "LATERAL is the same RangeSubselect shape and stays outside it too"
+            names.contains(&"u".to_string()) && names.contains(&"t".to_string()),
+            "LATERAL is the same RangeSubselect shape and is walked identically, got {names:?}"
+        );
+    }
+
+    /// The CTE trap, in the derived-table position rather than the `SubLink`
+    /// one: `cte_scope` must be threaded through `RangeSubselect` too, or a
+    /// derived table reading a CTE sends that name to the catalog and turns a
+    /// servable query into `Ineligible` — the exact failure the old omission
+    /// was protecting against, now handled rather than avoided.
+    #[test]
+    fn a_derived_table_reading_a_cte_does_not_collect_the_cte_name() {
+        let names =
+            collected("WITH c AS (SELECT tid FROM u) SELECT s.tid FROM (SELECT tid FROM c) s");
+        assert_eq!(
+            names,
+            vec!["u".to_string()],
+            "`c` inside the derived table is the CTE, not a catalog table, got {names:?}"
         );
     }
 
