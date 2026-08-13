@@ -226,6 +226,31 @@ pub struct SequenceInfo {
     pub cycle: bool,
 }
 
+/// One row of `pg_inherits` — one child relation's inheritance or partition
+/// parent.
+///
+/// Real Postgres uses this same relation for classical `INHERITS`
+/// (`CREATE TABLE child () INHERITS (parent)`) and for partitioning
+/// (`CREATE TABLE child PARTITION OF parent FOR VALUES ...`) — confirmed
+/// live against PostgreSQL 18.2: a plain-inherited child and a partition both
+/// populate a row here of the identical shape (`inhrelid`, `inhparent`,
+/// `inhseqno`, `inhdetachpending`). Nothing in a `pg_inherits` row itself
+/// says which case produced it; only a join back to `pg_class.relkind`
+/// (`'p'` marks a partitioned *parent*) distinguishes them. See
+/// [`crate::pg_inherits`]'s module docs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InheritanceInfo {
+    /// `pg_inherits.inhrelid` — the child relation.
+    pub child_oid: Oid,
+    /// `pg_inherits.inhparent` — one of the child's parents.
+    pub parent_oid: Oid,
+    /// `pg_inherits.inhseqno` — this parent's 1-based position among the
+    /// child's parents. Always `1` for a partition (which has exactly one
+    /// parent); classical `INHERITS` supports multiple parents, numbered in
+    /// the order the `INHERITS (...)` clause lists them.
+    pub seqno: i32,
+}
+
 /// What a [`crate::SystemView`] needs from the underlying catalog.
 ///
 /// Every method returns owned data rather than borrowing, since the source
@@ -257,4 +282,11 @@ pub trait CatalogSource {
     /// Postgres's sequence-owned-by-column link lives in `pg_depend`, which
     /// this trait does not model — see [`crate::pg_depend`]'s module docs).
     fn sequences(&self) -> Vec<SequenceInfo>;
+    /// The `pg_inherits` rows naming `table_oid` as the child (`inhrelid`) —
+    /// its inheritance or partition parent(s), in `inhseqno` order. Not
+    /// every table has one; most have none. Table-scoped like
+    /// [`Self::indexes`]/[`Self::constraints`], since (unlike
+    /// [`Self::enum_types`]/[`Self::sequences`]) a `pg_inherits` row always
+    /// belongs to exactly one child relation.
+    fn inheritance(&self, table_oid: Oid) -> Vec<InheritanceInfo>;
 }

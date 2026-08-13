@@ -55,6 +55,7 @@ pub mod pg_depend;
 pub mod pg_description;
 pub mod pg_enum;
 pub mod pg_index;
+pub mod pg_inherits;
 pub mod pg_namespace;
 pub mod pg_operator;
 pub mod pg_proc;

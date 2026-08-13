@@ -339,4 +339,43 @@ mod tests {
     fn name_is_pg_attrdef() {
         assert_eq!(PgAttrDef.name(), "pg_attrdef");
     }
+
+    /// Pins the exact column order, names, types and nullability against a
+    /// live PostgreSQL 18.2's `pg_attribute` for `pg_catalog.pg_attrdef`:
+    ///
+    /// ```sql
+    /// SELECT attname, atttypid::regtype, attnum, attnotnull
+    ///   FROM pg_attribute
+    ///  WHERE attrelid = 'pg_catalog.pg_attrdef'::regclass AND attnum > 0
+    ///  ORDER BY attnum;
+    ///
+    ///  attname |   atttypid   | attnum | attnotnull
+    /// ---------+--------------+--------+------------
+    ///  oid     | oid          |      1 | t
+    ///  adrelid | oid          |      2 | t
+    ///  adnum   | smallint     |      3 | t
+    ///  adbin   | pg_node_tree |      4 | t
+    /// ```
+    ///
+    /// `adbin` is `Utf8` here rather than `pg_node_tree`-shaped — a
+    /// deliberate, documented deviation (source text instead of a
+    /// `nodeToString` blob), not a positional bug.
+    #[test]
+    fn schema_matches_live_postgres_18_2_column_order() {
+        let schema = PgAttrDef.schema();
+        let got: Vec<(&str, DataType, bool)> = schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().as_str(), f.data_type().clone(), f.is_nullable()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("oid", DataType::UInt32, false),
+                ("adrelid", DataType::UInt32, false),
+                ("adnum", DataType::Int16, false),
+                ("adbin", DataType::Utf8, false),
+            ]
+        );
+    }
 }

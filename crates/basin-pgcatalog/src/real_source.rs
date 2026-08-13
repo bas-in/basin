@@ -64,7 +64,7 @@ use basin_pgtype::{oid, typmod};
 use crate::{
     catalog_source::{
         CatalogSource, ColumnDefaultInfo, ColumnInfo, CommentInfo, ConstraintInfo, EnumTypeInfo,
-        IndexInfo, NamespaceInfo, SequenceInfo, TableInfo,
+        IndexInfo, InheritanceInfo, NamespaceInfo, SequenceInfo, TableInfo,
     },
     Oid,
 };
@@ -396,6 +396,22 @@ impl CatalogSource for RealCatalogSource {
     fn comments(&self, _table_oid: Oid) -> Vec<CommentInfo> {
         Vec::new()
     }
+
+    /// Always empty, for the same reason as [`Self::enum_types`] and
+    /// [`Self::sequences`]: `RealCatalogSource` is built from
+    /// [`basin_catalog::TableMetadata`] plus an Arrow schema per table, and
+    /// neither records an inheritance or partition parent — Basin has no
+    /// `INHERITS`/`PARTITION OF` support upstream of this module to read a
+    /// parent relationship from. An Arrow `Schema` describes one table's own
+    /// columns; it has no notion of another table being its parent.
+    ///
+    /// Returning empty is the honest answer rather than the convenient one —
+    /// same reasoning as the two methods above: fabricating a parent
+    /// relationship (e.g. from a naming convention) would hand a caller a
+    /// hierarchy that looks authoritative and is not.
+    fn inheritance(&self, _table_oid: Oid) -> Vec<InheritanceInfo> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -642,6 +658,26 @@ mod tests {
         assert!(source.indexes(Oid(1)).is_empty());
         assert!(source.constraints(Oid(1)).is_empty());
         assert!(source.comments(Oid(1)).is_empty());
+        assert!(source.inheritance(Oid(1)).is_empty());
+    }
+
+    /// `inheritance` is always empty — no upstream source of a parent
+    /// relationship yet. See [`RealCatalogSource::inheritance`]'s doc
+    /// comment.
+    #[test]
+    fn inheritance_is_always_empty_until_partitioning_or_inherits_persists_something() {
+        let oid = Oid(16385);
+        let source = RealCatalogSource::new().with_table(
+            TableInfo {
+                oid,
+                name: "widgets".to_string(),
+                namespace: Oid(16384),
+                owner: Oid(10),
+                kind: RelKind::OrdinaryTable,
+            },
+            schema(vec![Field::new("id", DataType::Int32, false)]),
+        );
+        assert!(source.inheritance(oid).is_empty());
     }
 
     /// `comments` is always empty — `COMMENT ON` has no storage upstream of

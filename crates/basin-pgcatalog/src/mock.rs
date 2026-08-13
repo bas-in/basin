@@ -8,7 +8,7 @@
 use crate::{
     catalog_source::{
         ColumnDefaultInfo, ColumnInfo, CommentInfo, ConstraintInfo, EnumTypeInfo, IndexInfo,
-        NamespaceInfo, SequenceInfo, TableInfo,
+        InheritanceInfo, NamespaceInfo, SequenceInfo, TableInfo,
     },
     CatalogSource, Oid,
 };
@@ -26,6 +26,7 @@ pub struct MockCatalog {
     comments: Vec<(Oid, CommentInfo)>,
     enum_types: Vec<EnumTypeInfo>,
     sequences: Vec<SequenceInfo>,
+    inheritance: Vec<InheritanceInfo>,
 }
 
 impl MockCatalog {
@@ -77,6 +78,13 @@ impl MockCatalog {
 
     pub fn with_sequence(mut self, sequence: SequenceInfo) -> Self {
         self.sequences.push(sequence);
+        self
+    }
+
+    /// Register one `pg_inherits` row — `inheritance.child_oid` names the
+    /// child relation, matching [`CatalogSource::inheritance`]'s scoping.
+    pub fn with_inheritance(mut self, inheritance: InheritanceInfo) -> Self {
+        self.inheritance.push(inheritance);
         self
     }
 }
@@ -136,6 +144,14 @@ impl CatalogSource for MockCatalog {
 
     fn sequences(&self) -> Vec<SequenceInfo> {
         self.sequences.clone()
+    }
+
+    fn inheritance(&self, table_oid: Oid) -> Vec<InheritanceInfo> {
+        self.inheritance
+            .iter()
+            .filter(|i| i.child_oid == table_oid)
+            .cloned()
+            .collect()
     }
 }
 
