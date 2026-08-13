@@ -66,6 +66,24 @@
 //!   renumbering. `Expr::Subquery::operand` — the part of the expression that
 //!   belongs to *this* query level, e.g. the `x` in `x IN (SELECT …)` — is
 //!   traversed and renumbered like any other child expression.
+//! - **A plan containing a CORRELATED subquery is left alone entirely** —
+//!   the whole plan, not just the node holding it. This is the one item in
+//!   this list that *was* a correctness gap, and it is the same gap the
+//!   `LateralJoin` bullet above describes, reached through an expression
+//!   instead of a plan node. A correlated subplan reads its enclosing level's
+//!   row through `ColumnRef { relation: 1 }` (`opt::decorrelate`'s `OUTER_REF`
+//!   convention), and because the bullet above means this rule never looks
+//!   inside a subplan, those reads count toward nothing: pruning would drop
+//!   the very column the correlation reads, or shift it, and the physical
+//!   layer would then read whatever column landed at that position — a wrong
+//!   answer, not an error. Measured directly, before this guard existed:
+//!   `SELECT a, (SELECT count(*) FROM t x WHERE x.id = t.id) FROM t` pruned
+//!   the outer scan to `[a]` while the correlation still said "outer column
+//!   0", which is `t.id` in the unpruned scope and `a` in the pruned one.
+//!   [`decorrelate::contains_correlated_subquery`](super::decorrelate::contains_correlated_subquery)
+//!   is the check, applied once at the rule's entry point; making the
+//!   correlation visible to `required`/renumbering instead (so these plans
+//!   could still be pruned) is a real improvement this rule does not attempt.
 //! - **DML (`Insert`/`Update`/`Delete`) and CTE bodies are left alone.** A
 //!   `Cte`'s `input` (the query that consumes it) is pruned normally, but its
 //!   `body` is not: a CTE can be referenced multiple times, and pruning the
@@ -74,10 +92,12 @@
 //!   do. DML's `RETURNING` list and `columns`/target alignment add their own
 //!   bookkeeping this rule does not attempt yet.
 //!
-//! None of these are correctness gaps — a node this rule declines to touch
-//! is returned exactly as given. They are missed optimizations, not wrong
-//! answers, which is the trade this file is explicit about making wherever a
-//! trade was necessary.
+//! None of these are correctness gaps *now* — a node this rule declines to
+//! touch is returned exactly as given. They are missed optimizations, not
+//! wrong answers, which is the trade this file is explicit about making
+//! wherever a trade was necessary. The correlated-subquery bullet earns that
+//! sentence rather than assuming it: it was a wrong answer until the guard
+//! named there was added.
 
 use std::collections::BTreeSet;
 
@@ -97,6 +117,14 @@ impl OptimizerRule for ProjectionPruning {
     }
 
     fn rewrite(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+        // A correlated subquery anywhere in this plan turns every renumbering
+        // below into a wrong answer, so the whole plan is left alone. See
+        // "Correlated subqueries" in the module docs for the reasoning; the
+        // cost is a missed optimization on one query shape, and the
+        // alternative is a query silently reading the wrong column.
+        if super::decorrelate::contains_correlated_subquery(plan) {
+            return None;
+        }
         // At the root there is no parent to ask what's needed, so — absent a
         // `Project` trimming the result — every column the plan currently
         // produces is required. `prune` on any non-root node with this same
@@ -969,6 +997,95 @@ mod tests {
 
     fn optimize(plan: &LogicalPlan) -> Option<LogicalPlan> {
         ProjectionPruning.rewrite(plan)
+    }
+
+    /// `ColumnRef { relation: 1 }` inside a subplan: `opt::decorrelate`'s
+    /// `OUTER_REF`, a read of the ENCLOSING query's row.
+    fn outer_col(index: u16) -> Expr {
+        Expr::Column(ColumnRef {
+            relation: 1,
+            index,
+            name: format!("o{index}"),
+        })
+    }
+
+    /// A correlated subquery's reads of the enclosing row are invisible to
+    /// this rule (it never descends into a subplan), so pruning the scan
+    /// under it would drop or renumber the very column the correlation
+    /// reads — and the physical layer, addressing by position, would then
+    /// read whatever landed there. Nothing about the answer would look
+    /// wrong: same row count, same types, different values.
+    ///
+    /// The plan below is `SELECT c1, (SELECT ... WHERE inner.c0 = outer.c0)
+    /// FROM t`: only column 1 is read locally, so without the guard column 0
+    /// is pruned away and "outer column 0" starts meaning `c1`.
+    #[test]
+    fn a_plan_with_a_correlated_subquery_is_not_pruned_at_all() {
+        let subplan = LogicalPlan::Filter {
+            input: Box::new(scan(vec![ColId(10), ColId(20)])),
+            predicate: Expr::Binary {
+                op: OpId(Oid(96)),
+                lhs: Box::new(col(0)),
+                rhs: Box::new(outer_col(0)),
+            },
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan(vec![ColId(10), ColId(20)])),
+            exprs: vec![
+                (col(1), "c1".into()),
+                (
+                    Expr::Subquery {
+                        kind: crate::SubqueryKind::Scalar,
+                        subplan: Box::new(subplan),
+                        operand: None,
+                    },
+                    "s".into(),
+                ),
+            ],
+        };
+        assert_eq!(
+            optimize(&plan),
+            None,
+            "a correlated plan is returned untouched — pruning column 0 out \
+             of the outer scan would silently repoint the correlation"
+        );
+    }
+
+    /// The guard is about CORRELATION, not about subqueries: an
+    /// uncorrelated subquery's subplan reads nothing of the enclosing row,
+    /// so the enclosing scan prunes exactly as it would without it.
+    #[test]
+    fn an_uncorrelated_subquery_does_not_block_pruning() {
+        let subplan = LogicalPlan::Filter {
+            input: Box::new(scan(vec![ColId(10)])),
+            predicate: Expr::Binary {
+                op: OpId(Oid(96)),
+                lhs: Box::new(col(0)),
+                rhs: Box::new(Expr::Literal(Datum::Int32(1), PgType::INT4)),
+            },
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan(vec![ColId(10), ColId(20)])),
+            exprs: vec![
+                (col(1), "c1".into()),
+                (
+                    Expr::Subquery {
+                        kind: crate::SubqueryKind::Scalar,
+                        subplan: Box::new(subplan),
+                        operand: None,
+                    },
+                    "s".into(),
+                ),
+            ],
+        };
+        let optimized = optimize(&plan).expect("column 10 is unread here and should be pruned");
+        let LogicalPlan::Project { input, .. } = &optimized else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Scan { projection, .. } = input.as_ref() else {
+            panic!("expected Scan");
+        };
+        assert_eq!(projection, &vec![ColId(20)]);
     }
 
     /// The headline behavior: a `Project` that only reads column 0 must

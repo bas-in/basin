@@ -995,6 +995,64 @@ fn references_outer(e: &Expr) -> bool {
     e.any(&mut |x| matches!(x, Expr::Column(c) if c.relation == OUTER_REF))
 }
 
+/// Whether `subplan` — a subquery's body — reads any column of the query
+/// level that ENCLOSES it, i.e. whether that subquery is correlated.
+///
+/// The plan-level counterpart of [`references_outer`], and the single
+/// definition of "correlated" under this module's [`OUTER_REF`] convention
+/// for everyone outside it: `basin_exec::build` needs exactly this question
+/// answered before it decides whether a scalar subquery can be evaluated
+/// once for the whole statement or has to be evaluated per outer row, and a
+/// second, separately-maintained copy of the convention in the physical
+/// layer is precisely how the two would drift apart.
+///
+/// Descends the plan tree (a correlated reference can sit in any node's
+/// expressions, not only the top `Filter`'s predicate) but not into a nested
+/// [`Expr::Subquery`]'s own `subplan` — [`Expr::any`] stops there, so an
+/// `OUTER_REF` one level further down, which belongs to THAT subquery's
+/// enclosing level rather than this one, is correctly not attributed here.
+pub fn references_outer_row(subplan: &LogicalPlan) -> bool {
+    let mut found = false;
+    subplan.for_each_expr(&mut |e| found |= references_outer(e));
+    if found {
+        return true;
+    }
+    subplan.for_each_input(&mut |child| found |= references_outer_row(child));
+    found
+}
+
+/// Whether `plan` contains, at any depth and inside any expression, a
+/// subquery that is correlated to its own enclosing level — including
+/// subqueries nested inside another subquery's `subplan`, which
+/// [`references_outer_row`] deliberately does not look at.
+///
+/// Used by [`super::projection`] to leave such a plan's column numbering
+/// alone: that rule cannot see a correlated reference (a subplan is a
+/// separate query level it never descends into), so renumbering the
+/// enclosing scan under one would silently invalidate it.
+pub fn contains_correlated_subquery(plan: &LogicalPlan) -> bool {
+    fn expr_has(e: &Expr) -> bool {
+        let mut found = false;
+        // `Expr::any` stops at a subquery boundary, so this inspects each
+        // subquery it finds directly and then recurses through its subplan
+        // to reach any further-nested ones.
+        e.any(&mut |x| {
+            if let Expr::Subquery { subplan, .. } = x {
+                found |= references_outer_row(subplan) || contains_correlated_subquery(subplan);
+            }
+            false
+        });
+        found
+    }
+    let mut found = false;
+    plan.for_each_expr(&mut |e| found |= expr_has(e));
+    if found {
+        return true;
+    }
+    plan.for_each_input(&mut |child| found |= contains_correlated_subquery(child));
+    found
+}
+
 /// Whether `e` references [`LOCAL_REF`] anywhere — the subquery's own,
 /// non-correlated columns.
 fn references_local(e: &Expr) -> bool {

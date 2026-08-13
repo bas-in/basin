@@ -333,6 +333,133 @@ impl LogicalPlan {
             }
         }
     }
+
+    /// Apply `f` to each expression **this node itself owns** — not its
+    /// children's, and not a subquery's `subplan` (an [`Expr::Subquery`] is
+    /// handed to `f` whole; whether to descend into its separate query level
+    /// is the caller's decision, exactly as [`Expr::for_each_child`] already
+    /// leaves it).
+    ///
+    /// The complement of [`for_each_input`](Self::for_each_input): that one
+    /// walks the plan tree, this one walks a single node's expression
+    /// payload, and the two together reach every `Expr` in a plan. Written as
+    /// an exhaustive match for the same reason `for_each_input` is — a
+    /// variant added later and left off this list is a compile error rather
+    /// than an expression that silently stops being visited.
+    pub fn for_each_expr(&self, f: &mut impl FnMut(&Expr)) {
+        match self {
+            LogicalPlan::Scan { filters, .. } => {
+                for e in filters {
+                    f(e);
+                }
+            }
+            LogicalPlan::Values { rows, .. } => {
+                for row in rows {
+                    for e in row {
+                        f(e);
+                    }
+                }
+            }
+            LogicalPlan::Empty { .. }
+            | LogicalPlan::CteRef { .. }
+            | LogicalPlan::Cte { .. }
+            | LogicalPlan::LateralJoin { .. }
+            | LogicalPlan::SetOp { .. } => {}
+            LogicalPlan::Project { exprs, .. } => {
+                for (e, _) in exprs {
+                    f(e);
+                }
+            }
+            LogicalPlan::Filter { predicate, .. } => f(predicate),
+            LogicalPlan::Aggregate { group, aggs, .. } => {
+                for e in group.iter().chain(aggs) {
+                    f(e);
+                }
+            }
+            LogicalPlan::Sort { keys, .. } => {
+                for k in keys {
+                    f(&k.expr);
+                }
+            }
+            LogicalPlan::Limit { skip, fetch, .. } => {
+                for e in skip.iter().chain(fetch.iter()) {
+                    f(e);
+                }
+            }
+            LogicalPlan::Join { on, filter, .. } => {
+                for (l, r) in on {
+                    f(l);
+                    f(r);
+                }
+                if let Some(e) = filter {
+                    f(e);
+                }
+            }
+            LogicalPlan::Distinct { on, .. } => {
+                for e in on.iter().flatten() {
+                    f(e);
+                }
+            }
+            LogicalPlan::Window { windows, .. } => {
+                for e in windows {
+                    f(e);
+                }
+            }
+            LogicalPlan::ProjectSet { srfs, .. } => {
+                for e in srfs {
+                    f(e);
+                }
+            }
+            LogicalPlan::Insert {
+                on_conflict,
+                returning,
+                ..
+            } => {
+                match on_conflict {
+                    Some(OnConflict::DoUpdate { set, predicate, .. }) => {
+                        for (_, e) in set {
+                            f(e);
+                        }
+                        if let Some(e) = predicate {
+                            f(e);
+                        }
+                    }
+                    Some(OnConflict::DoNothing { .. }) | None => {}
+                }
+                for (e, _) in returning.iter().flatten() {
+                    f(e);
+                }
+            }
+            LogicalPlan::Update {
+                set,
+                predicate,
+                returning,
+                ..
+            } => {
+                for (_, e) in set {
+                    f(e);
+                }
+                if let Some(e) = predicate {
+                    f(e);
+                }
+                for (e, _) in returning.iter().flatten() {
+                    f(e);
+                }
+            }
+            LogicalPlan::Delete {
+                predicate,
+                returning,
+                ..
+            } => {
+                if let Some(e) = predicate {
+                    f(e);
+                }
+                for (e, _) in returning.iter().flatten() {
+                    f(e);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

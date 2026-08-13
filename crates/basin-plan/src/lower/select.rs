@@ -697,9 +697,9 @@ fn lower_select_stmt_body(
     // real expressions. Distinguishing them by node emptiness rather than by
     // list length is what Postgres's own gram.y does.
     let is_distinct = !stmt.distinct_clause.is_empty();
-    let distinct_on_raw: Option<&[Node]> =
-        (is_distinct && stmt.distinct_clause.iter().any(|n| n.node.is_some()))
-            .then_some(stmt.distinct_clause.as_slice());
+    let distinct_on_raw: Option<&[Node]> = (is_distinct
+        && stmt.distinct_clause.iter().any(|n| n.node.is_some()))
+    .then_some(stmt.distinct_clause.as_slice());
 
     if !stmt.values_lists.is_empty() {
         return lower_values(stmt, res);
@@ -799,9 +799,7 @@ fn lower_select_stmt_body(
 
         let target = raw_target
             .iter()
-            .map(|(e, alias)| {
-                Ok((rewrite_post_agg(e, &group_exprs, &mut aggs)?, alias.clone()))
-            })
+            .map(|(e, alias)| Ok((rewrite_post_agg(e, &group_exprs, &mut aggs)?, alias.clone())))
             .collect::<Result<Vec<_>, LowerError>>()?;
         let having = having_expr
             .map(|e| rewrite_post_agg(&e, &group_exprs, &mut aggs))
@@ -914,8 +912,7 @@ fn lower_select_stmt_body(
                 && on.iter().zip(order_keys.iter()).all(|(o, k)| *o == k.expr);
             if !order_keys.is_empty() && !leading_matches {
                 return Err(LowerError::Unsupported(
-                    "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
-                        .into(),
+                    "SELECT DISTINCT ON expressions must match initial ORDER BY expressions".into(),
                 ));
             }
         }
@@ -1380,9 +1377,7 @@ fn build_range_subselect(
     res: &Resolvers,
 ) -> Result<FromBuilt, LowerError> {
     if rs.lateral {
-        return Err(LowerError::Unsupported(
-            "LATERAL is not yet lowered".into(),
-        ));
+        return Err(LowerError::Unsupported("LATERAL is not yet lowered".into()));
     }
     let stmt = match rs.subquery.as_deref().and_then(|n| n.node.as_ref()) {
         Some(NodeEnum::SelectStmt(s)) => s,
@@ -3402,8 +3397,8 @@ mod tests {
     /// whether the query has a `GROUP BY`.
     #[test]
     fn order_by_after_aggregation_materializes_a_non_column_expression() {
-        let plan = lower("SELECT a, count(id) FROM t GROUP BY a ORDER BY count(id) + 1")
-            .expect("lowers");
+        let plan =
+            lower("SELECT a, count(id) FROM t GROUP BY a ORDER BY count(id) + 1").expect("lowers");
         let LogicalPlan::Project { input, .. } = plan else {
             panic!("expected Project");
         };
@@ -3799,7 +3794,8 @@ mod tests {
     /// ... and the RIGHT arm's alias is not in scope at all.
     #[test]
     fn union_order_by_a_right_arm_alias_does_not_resolve() {
-        let err = lower("SELECT a AS k FROM t UNION SELECT t_id AS j FROM u ORDER BY j").unwrap_err();
+        let err =
+            lower("SELECT a AS k FROM t UNION SELECT t_id AS j FROM u ORDER BY j").unwrap_err();
         let LowerError::UnknownName(msg) = err else {
             panic!("expected UnknownName, got {err:?}");
         };
@@ -3948,10 +3944,9 @@ mod tests {
     /// are still the LEFTMOST arm's.
     #[test]
     fn order_by_on_a_chained_set_op_resolves_against_the_leftmost_arm() {
-        let plan = lower(
-            "SELECT a FROM t UNION SELECT t_id FROM u UNION SELECT id FROM t ORDER BY a",
-        )
-        .unwrap();
+        let plan =
+            lower("SELECT a FROM t UNION SELECT t_id FROM u UNION SELECT id FROM t ORDER BY a")
+                .unwrap();
         let LogicalPlan::Sort { input, keys } = plan else {
             panic!("expected Sort, got {plan:?}");
         };
@@ -4615,8 +4610,8 @@ mod tests {
     /// mishandled.
     #[test]
     fn distinct_on_combined_with_group_by_is_unsupported() {
-        let err = lower("SELECT DISTINCT ON (a) a, sum(id) FROM t GROUP BY a ORDER BY a")
-            .unwrap_err();
+        let err =
+            lower("SELECT DISTINCT ON (a) a, sum(id) FROM t GROUP BY a ORDER BY a").unwrap_err();
         let LowerError::Unsupported(msg) = err else {
             panic!("expected Unsupported, got {err:?}");
         };
@@ -4766,10 +4761,8 @@ mod tests {
     /// column offsets that a `VALUES`-only query never would.
     #[test]
     fn a_values_list_in_from_joins_against_a_real_table() {
-        let plan = lower(
-            "SELECT t.id, s.x FROM t JOIN (VALUES (1), (2)) AS s(x) ON t.id = s.x",
-        )
-        .expect("lowers");
+        let plan = lower("SELECT t.id, s.x FROM t JOIN (VALUES (1), (2)) AS s(x) ON t.id = s.x")
+            .expect("lowers");
         let LogicalPlan::Project { input, .. } = plan else {
             panic!("expected Project, got {plan:?}");
         };
@@ -4778,5 +4771,92 @@ mod tests {
         };
         assert_eq!(on.len(), 1);
         assert!(matches!(*right, LogicalPlan::Values { .. }));
+    }
+
+    // --- A correlated subquery in the SELECT list, end to end -------------
+    //
+    // `opt::decorrelate` scopes all four of its transforms to a subquery
+    // sitting in a `Filter` predicate and says so ("a subquery anywhere else
+    // (a `Project` target list, ...) is left untouched"). Something
+    // downstream nevertheless assumed the opposite: `basin_exec::build`'s
+    // `materialize_scalar_subquery` carried a doc comment asserting that
+    // decorrelation GUARANTEED no correlated subquery could reach it, and
+    // evaluated every scalar subquery once for the whole statement on the
+    // strength of that. The result was a silently wrong answer, and these two
+    // tests pin down the two plan-level facts the physical layer now relies
+    // on instead of on that assumption.
+
+    /// After the FULL default pipeline, a correlated scalar subquery in the
+    /// target list is still a correlated scalar subquery: nothing turned it
+    /// into a join, and its `OUTER_REF` reference is intact. A physical layer
+    /// that assumes otherwise produces wrong values, not errors.
+    #[test]
+    fn optimization_leaves_a_target_list_correlated_subquery_correlated() {
+        let plan = lower("SELECT id, (SELECT count(*) FROM t x WHERE x.id = t.id) FROM t").unwrap();
+        let (opt, _passes) = crate::opt::optimize_default(plan);
+        let LogicalPlan::Project { exprs, .. } = &opt else {
+            panic!("expected a Project at the root, got {opt:?}");
+        };
+        let Expr::Subquery { kind, subplan, .. } = &exprs[1].0 else {
+            panic!("expected the target list's second entry to still be a subquery");
+        };
+        assert_eq!(*kind, SubqueryKind::Scalar);
+        assert!(
+            crate::opt::decorrelate::references_outer_row(subplan),
+            "the subquery still reads the enclosing row — decorrelation did              not (and documents that it does not) reach a Project target list"
+        );
+    }
+
+    /// And the column that correlation reads is still there to be read.
+    /// `SELECT a, (SELECT ... WHERE x.id = t.id) FROM t` needs only `a`
+    /// locally, so projection pruning used to shrink the outer scan to
+    /// `[a]` — while the subquery went on saying "outer column 0", which was
+    /// `t.id` before the pruning and `a` after it. Measured, not theorised:
+    /// that is what the optimizer produced before `ProjectionPruning` learned
+    /// to leave correlated plans alone.
+    #[test]
+    fn projection_pruning_keeps_the_column_a_correlated_subquery_reads() {
+        let plan = lower("SELECT a, (SELECT count(*) FROM t x WHERE x.id = t.id) FROM t").unwrap();
+        let (opt, _passes) = crate::opt::optimize_default(plan);
+        let LogicalPlan::Project { input, exprs } = &opt else {
+            panic!("expected a Project at the root, got {opt:?}");
+        };
+        let LogicalPlan::Scan { projection, .. } = input.as_ref() else {
+            panic!("expected a Scan under the Project, got {input:?}");
+        };
+        assert!(
+            projection.contains(&ColId(0)),
+            "the outer scan must still read t.id (ColId(0)) — the correlated \
+             subquery reads it by position; got {projection:?}"
+        );
+        // And the position it reads by is still t.id's own: the subquery
+        // says outer column 0, and `id` is column 0 of the scan's output.
+        assert_eq!(projection[0], ColId(0));
+        let Expr::Subquery { subplan, .. } = &exprs[1].0 else {
+            panic!("expected a subquery in the target list");
+        };
+        let mut outer_indices = Vec::new();
+        collect_outer_indices(subplan, &mut outer_indices);
+        assert_eq!(
+            outer_indices,
+            vec![0],
+            "the correlation reads outer column 0, which is where t.id is"
+        );
+    }
+
+    /// Every `ColumnRef { relation: 1 }` index reachable in `plan`'s own
+    /// expressions — the outer-row positions a correlated subplan reads.
+    fn collect_outer_indices(plan: &LogicalPlan, out: &mut Vec<u16>) {
+        plan.for_each_expr(&mut |e| {
+            e.any(&mut |x| {
+                if let Expr::Column(c) = x {
+                    if c.relation == 1 {
+                        out.push(c.index);
+                    }
+                }
+                false
+            });
+        });
+        plan.for_each_input(&mut |c| collect_outer_indices(c, out));
     }
 }

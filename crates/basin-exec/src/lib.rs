@@ -31,6 +31,7 @@
 
 pub mod aggregate;
 pub mod build;
+pub mod correlated;
 pub mod cte;
 pub mod dml;
 pub mod eval;

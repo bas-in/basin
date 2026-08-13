@@ -30,9 +30,11 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 
 use basin_pgtype::PgType;
+use basin_plan::opt::decorrelate::{contains_correlated_subquery, references_outer_row};
 use basin_plan::{ColId, CteId, Expr, LogicalPlan, OnConflict, SortKey as PlanSortKey, TableId};
 
 use crate::aggregate::{AggFunc, AggregateSpec, HashAggregate};
+use crate::correlated::{CorrelatedScalar, CorrelatedSubquery};
 use crate::cte::{CteBuffer, ProjectSet};
 use crate::dml::{ConflictAction, Delete, Insert, MemoryRowSink, RowSink, Update};
 use crate::join::HashJoin;
@@ -389,20 +391,73 @@ fn build_inner(
             Ok(Box::new(Scan::new(source, scan_cols, scan_filters)?))
         }
 
+        // `Filter` and `Project` are the two nodes that can host a per-row
+        // correlated scalar subquery (see [`CorrSink`]): each binds its
+        // expressions with a sink, and if anything landed in it, the child
+        // gains a `CorrelatedScalar` underneath supplying one column per
+        // subquery. Every other node refuses a correlated scalar subquery
+        // rather than evaluating it once and pretending — `bind_outer`.
         LogicalPlan::Filter { input, predicate } => {
             let child = build_inner(input, tables, dml, budget, ctes, outer)?;
-            Ok(Box::new(Filter::new(
-                child,
-                bind_outer(predicate, outer, tables, dml, budget, ctes)?,
-            )))
+            let child_schema = child.schema();
+            let sink = CorrSink {
+                base_width: child_schema.fields().len() as u16,
+                subplans: RefCell::new(Vec::new()),
+            };
+            let predicate =
+                bind_outer_collecting(predicate, outer, &sink, tables, dml, budget, ctes)?;
+            let subplans = sink.subplans.into_inner();
+            if subplans.is_empty() {
+                return Ok(Box::new(Filter::new(child, predicate)));
+            }
+            // A `Filter` must not change its input's schema, so the columns
+            // the subqueries added are projected back off above it — the
+            // predicate has already been rewritten to read them, and
+            // nothing above this node knows they existed.
+            let width = child_schema.fields().len();
+            let child =
+                build_correlated_scalars(child, subplans, width as u16, tables, budget, ctes)?;
+            let filtered: Box<dyn Operator> = Box::new(Filter::new(child, predicate));
+            let trim: Vec<(Expr, String)> = child_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    (
+                        Expr::Column(basin_plan::ColumnRef {
+                            relation: 0,
+                            index: i as u16,
+                            name: f.name().clone(),
+                        }),
+                        f.name().clone(),
+                    )
+                })
+                .collect();
+            Ok(Box::new(Project::new(filtered, trim)?))
         }
 
         LogicalPlan::Project { input, exprs } => {
             let child = build_inner(input, tables, dml, budget, ctes, outer)?;
+            let base_width = child.schema().fields().len() as u16;
+            let sink = CorrSink {
+                base_width,
+                subplans: RefCell::new(Vec::new()),
+            };
             let exprs: Vec<(Expr, String)> = exprs
                 .iter()
-                .map(|(e, n)| Ok((bind_outer(e, outer, tables, dml, budget, ctes)?, n.clone())))
+                .map(|(e, n)| {
+                    Ok((
+                        bind_outer_collecting(e, outer, &sink, tables, dml, budget, ctes)?,
+                        n.clone(),
+                    ))
+                })
                 .collect::<Result<_, BuildError>>()?;
+            let subplans = sink.subplans.into_inner();
+            let child = if subplans.is_empty() {
+                child
+            } else {
+                build_correlated_scalars(child, subplans, base_width, tables, budget, ctes)?
+            };
             Ok(Box::new(Project::new(child, exprs)?))
         }
 
@@ -1195,6 +1250,29 @@ fn snapshot_scans(
             e.insert((schema, batches));
         }
     }
+    // A subquery inside one of this node's expressions is a separate query
+    // level, but its scans are still scans, and the per-row rebuild will
+    // resolve them against this same snapshot — so they have to be in it.
+    // `for_each_input` cannot reach them (a subplan hangs off an `Expr`, not
+    // off the plan tree), which is why this second walk exists.
+    //
+    // Cloned rather than borrowed: `Expr::any`'s visitor sees each node
+    // under a higher-ranked lifetime that cannot outlive the closure, and a
+    // subplan clone at build time is cheap next to the scan it is about to
+    // drain.
+    let mut nested: Vec<LogicalPlan> = Vec::new();
+    plan.for_each_expr(&mut |e| {
+        e.any(&mut |x| {
+            if let Expr::Subquery { subplan, .. } = x {
+                nested.push(subplan.as_ref().clone());
+            }
+            false
+        });
+    });
+    for subplan in &nested {
+        snapshot_scans(subplan, tables, into)?;
+    }
+
     let mut result = Ok(());
     plan.for_each_input(&mut |child| {
         if result.is_ok() {
@@ -1221,6 +1299,22 @@ fn build_error_to_exec(e: BuildError) -> ExecError {
 /// relationship a join's `on`/`filter` already uses.
 const OUTER_REF: u16 = 1;
 
+/// Where a correlated scalar subquery goes when the node being built can
+/// evaluate one per row: [`bind_outer_rec`] replaces the subquery expression
+/// with a reference to a column that does not exist yet, and pushes its
+/// `subplan` here for the caller to turn into a [`CorrelatedScalar`] under
+/// the node. `base_width` is that operator's input width, so the `k`th
+/// subquery collected lands at output position `base_width + k` — the same
+/// position the `Column` left behind names.
+///
+/// A `RefCell` rather than a `&mut Vec` because [`bind_outer_rec`]'s
+/// traversal hands the same sink to several closures at once, which a
+/// mutable borrow cannot express.
+struct CorrSink {
+    base_width: u16,
+    subplans: RefCell<Vec<LogicalPlan>>,
+}
+
 /// Bind `expr` to a specific outer row for a `LateralJoin`'s per-row
 /// rebuild or a `WITH RECURSIVE` recursive term's per-iteration rebuild
 /// (module docs: "constant-folding the correlated column references into
@@ -1232,6 +1326,12 @@ const OUTER_REF: u16 = 1;
 /// `None`: that used to mean "nothing to do", but a plain, non-LATERAL
 /// `SELECT ... WHERE x = (SELECT ...)` reaches this exact path with `outer:
 /// None` and still has a subquery to fold.
+///
+/// This entry point cannot evaluate a *correlated* scalar subquery, and
+/// says so: one surviving the walk is [`BuildError::Unsupported`], never a
+/// value folded in as if the correlation were not there. Only a caller that
+/// has somewhere to put a per-row evaluation — [`bind_outer_collecting`]'s
+/// callers, `Project` and `Filter` — can accept one.
 fn bind_outer(
     expr: &Expr,
     outer: Outer<'_>,
@@ -1240,7 +1340,22 @@ fn bind_outer(
     budget: usize,
     ctes: &CteRegistry,
 ) -> Result<Expr, BuildError> {
-    bind_outer_rec(expr, outer, tables, dml, budget, ctes)
+    bind_outer_rec(expr, outer, None, tables, dml, budget, ctes)
+}
+
+/// [`bind_outer`] for the two nodes that can host a per-row evaluation:
+/// every correlated scalar subquery found is pushed into `sink` and replaced
+/// by a reference to the column [`CorrelatedScalar`] will produce for it.
+fn bind_outer_collecting(
+    expr: &Expr,
+    outer: Outer<'_>,
+    sink: &CorrSink,
+    tables: &dyn TableResolver,
+    dml: Option<&dyn DmlResolver>,
+    budget: usize,
+    ctes: &CteRegistry,
+) -> Result<Expr, BuildError> {
+    bind_outer_rec(expr, outer, Some(sink), tables, dml, budget, ctes)
 }
 
 fn bind_sort_keys(
@@ -1269,24 +1384,29 @@ fn bind_sort_keys(
 ///
 /// 1. Replacing `Column(relation == OUTER_REF)` with the corresponding
 ///    literal from `outer`'s row, when `outer` is `Some`.
-/// 2. Replacing an uncorrelated scalar subquery (`Subquery { kind: Scalar,
-///    operand: None, .. }`) with its once-evaluated result — see
-///    [`materialize_scalar_subquery`]. This runs regardless of `outer`.
+/// 2. Resolving a scalar subquery (`Subquery { kind: Scalar, operand: None,
+///    .. }`), by one of two routes depending on whether it is correlated —
+///    see the Subquery arm below. This runs regardless of `outer`.
 ///
 /// `Subquery`'s own `subplan` is otherwise left untouched by (1) — its
 /// `operand`, which belongs to THIS query level, is not — the same "a
 /// subquery is a separate query level" rule `Expr::for_each_child` already
 /// states for exactly this reason; (2) is the one deliberate exception,
-/// because materializing IS building and running that separate query
-/// level, once, right here. Aggregate and window `ORDER BY` lists are left
-/// unbound by (1): a correlated ordering inside an aggregate/window is a
-/// corner this builder does not reach today — narrower than the general
-/// case, not silently wrong, since any `Column(OUTER_REF)` actually hiding
-/// there simply survives into `eval`, which has no relation-0 column to
-/// resolve it against and errors instead of guessing.
+/// because resolving one IS building and running that separate query level.
+///
+/// Aggregate and window `ORDER BY` lists are left unbound by (1): a
+/// correlated ordering inside an aggregate/window is a corner this builder
+/// does not reach today. That is narrower than the general case rather than
+/// silently wrong only because [`crate::eval`] refuses a `Column` whose
+/// `relation` is not 0 — it reads column *positions*, and until that refusal
+/// existed an unbound `OUTER_REF` was read as the local column at the same
+/// index, which is a wrong answer wearing the right shape. This comment
+/// claimed eval already errored before that was true; it is true now, and
+/// `eval_column` is where.
 fn bind_outer_rec(
     expr: &Expr,
     outer: Outer<'_>,
+    corr: Option<&CorrSink>,
     tables: &dyn TableResolver,
     dml: Option<&dyn DmlResolver>,
     budget: usize,
@@ -1294,12 +1414,12 @@ fn bind_outer_rec(
 ) -> Result<Expr, BuildError> {
     let b = |e: &Expr| -> Result<Box<Expr>, BuildError> {
         Ok(Box::new(bind_outer_rec(
-            e, outer, tables, dml, budget, ctes,
+            e, outer, corr, tables, dml, budget, ctes,
         )?))
     };
     let v = |es: &[Expr]| -> Result<Vec<Expr>, BuildError> {
         es.iter()
-            .map(|e| bind_outer_rec(e, outer, tables, dml, budget, ctes))
+            .map(|e| bind_outer_rec(e, outer, corr, tables, dml, budget, ctes))
             .collect()
     };
     let ob = |o: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>, BuildError> {
@@ -1335,8 +1455,8 @@ fn bind_outer_rec(
                 .iter()
                 .map(|(w, t)| {
                     Ok((
-                        bind_outer_rec(w, outer, tables, dml, budget, ctes)?,
-                        bind_outer_rec(t, outer, tables, dml, budget, ctes)?,
+                        bind_outer_rec(w, outer, corr, tables, dml, budget, ctes)?,
+                        bind_outer_rec(t, outer, corr, tables, dml, budget, ctes)?,
                     ))
                 })
                 .collect::<Result<_, BuildError>>()?,
@@ -1428,7 +1548,53 @@ fn bind_outer_rec(
         } => {
             let operand = ob(operand)?;
             if *kind == basin_plan::SubqueryKind::Scalar && operand.is_none() {
-                materialize_scalar_subquery(subplan, tables, dml, budget, ctes)?
+                // A correlated subquery ANYWHERE inside `subplan` is refused
+                // before either route below is chosen, correlated outer
+                // subquery or not. `OUTER_REF` says "outside my own FROM"
+                // and nothing more: lowering collapses one level up and two
+                // levels up onto the same tag, and documents the collapse
+                // (`lower/select.rs`'s `ScopeResolver`). So a correlated
+                // subquery two levels down may be reaching for this
+                // subquery's row or for the row of the query holding it, and
+                // whichever this builder picked it would be right by luck.
+                // Refusing costs a fallback on a rare shape; guessing costs
+                // a wrong answer on it.
+                if contains_correlated_subquery(subplan) {
+                    return Err(BuildError::Unsupported(
+                        "correlated subquery nested inside another subquery".into(),
+                    ));
+                }
+                // The fork this whole file used to get wrong. An
+                // UNCORRELATED scalar subquery is a constant for the
+                // statement and is folded once. A CORRELATED one is a
+                // different value for every row and cannot be folded at
+                // all — it goes to the sink, if the node being built has
+                // one, and is otherwise refused outright.
+                if !references_outer_row(subplan) {
+                    materialize_scalar_subquery(subplan, tables, dml, budget, ctes)?
+                } else {
+                    let sink = match corr {
+                        // `outer.is_some()` means we are already inside a
+                        // per-row rebuild (a LATERAL inner side, a
+                        // recursive term, or another correlated subquery),
+                        // where the same tag collapse applies to THIS
+                        // subquery's own correlation.
+                        Some(sink) if outer.is_none() => sink,
+                        _ => {
+                            return Err(BuildError::Unsupported(
+                                "correlated scalar subquery in this position".into(),
+                            ))
+                        }
+                    };
+                    let mut collected = sink.subplans.borrow_mut();
+                    let index = sink.base_width + collected.len() as u16;
+                    collected.push(subplan.as_ref().clone());
+                    Expr::Column(basin_plan::ColumnRef {
+                        relation: 0,
+                        index,
+                        name: format!("?correlated{index}?"),
+                    })
+                }
             } else {
                 Expr::Subquery {
                     kind: *kind,
@@ -1446,17 +1612,21 @@ fn bind_outer_rec(
                 .map(|s| {
                     Ok(match s {
                         basin_plan::Subscript::Index(e) => basin_plan::Subscript::Index(
-                            bind_outer_rec(e, outer, tables, dml, budget, ctes)?,
+                            bind_outer_rec(e, outer, corr, tables, dml, budget, ctes)?,
                         ),
                         basin_plan::Subscript::Slice { lower, upper } => {
                             basin_plan::Subscript::Slice {
                                 lower: lower
                                     .as_ref()
-                                    .map(|e| bind_outer_rec(e, outer, tables, dml, budget, ctes))
+                                    .map(|e| {
+                                        bind_outer_rec(e, outer, corr, tables, dml, budget, ctes)
+                                    })
                                     .transpose()?,
                                 upper: upper
                                     .as_ref()
-                                    .map(|e| bind_outer_rec(e, outer, tables, dml, budget, ctes))
+                                    .map(|e| {
+                                        bind_outer_rec(e, outer, corr, tables, dml, budget, ctes)
+                                    })
                                     .transpose()?,
                             }
                         }
@@ -1475,16 +1645,31 @@ fn bind_outer_rec(
 /// single-column result into a `Literal` — Postgres's InitPlan: a subquery
 /// with no correlated reference to the enclosing query is evaluated once
 /// per statement, not once per row (the only version worth having, since
-/// nothing about its result can vary row to row). Reached only for
-/// `Expr::Subquery { kind: Scalar, operand: None, .. }` (see
-/// [`bind_outer_rec`]) — `basin_plan::opt::decorrelate` guarantees `subplan`
-/// carries no `Column(relation == OUTER_REF)` by the time a plan reaches
-/// this builder still shaped as `Expr::Subquery`: a correlated scalar
-/// subquery it CAN decorrelate becomes a join instead, and anything it
-/// declines to decorrelate has no correlation predicate to lean on in the
-/// first place (see that module's docs). So this always builds with
-/// `outer: None`, and any subquery nested inside `subplan` gets the exact
-/// same one-shot treatment when `build_inner` reaches it in turn.
+/// nothing about its result can vary row to row).
+///
+/// # `subplan` is uncorrelated, and here is what enforces that
+///
+/// This comment used to assert that `basin_plan::opt::decorrelate`
+/// guaranteed no `Column(relation == OUTER_REF)` could reach here — "a
+/// correlated scalar subquery it CAN decorrelate becomes a join, and
+/// anything it declines has no correlation predicate to lean on." **That
+/// was false**, and it made `SELECT id, (SELECT count(*) FROM t x WHERE
+/// x.id = t.id) FROM t` answer `3, 3, 3` where Postgres answers `1, 1, 1`:
+/// decorrelation's own docs scope all four of its transforms to a subquery
+/// sitting in a `Filter` predicate and say a `Project` target list is left
+/// untouched, so a correlated subquery in a `SELECT` list arrived here
+/// still correlated and its correlation was silently dropped by building
+/// with `outer: None`.
+///
+/// The guarantee now holds because [`bind_outer_rec`]'s `Subquery` arm — the
+/// only caller — tests it directly with
+/// [`basin_plan::opt::decorrelate::references_outer_row`] before calling
+/// here, and routes a correlated subplan to a per-row
+/// [`CorrelatedScalar`] (or refuses it) instead. That is the enforcement
+/// point; this function assumes nothing on its own behalf beyond it, which
+/// is why it can still build with `outer: None` and why any subquery nested
+/// inside `subplan` gets the exact same one-shot treatment when
+/// `build_inner` reaches it in turn.
 ///
 /// Two Postgres rules for a scalar subquery, both enforced here: zero rows
 /// is `NULL` — not an error, and not an empty result for the query this
@@ -1522,6 +1707,88 @@ fn materialize_scalar_subquery(
         }
     }
     Ok(result.unwrap_or(Expr::Literal(basin_plan::Datum::Null, ty)))
+}
+
+/// The uncorrelated case's opposite number: wrap `child` in a
+/// [`CorrelatedScalar`] that evaluates each collected `subplan` once per
+/// row, appending one column each at positions `base_width..`.
+///
+/// The per-row factory is built exactly the way [`LogicalPlan::LateralJoin`]'s
+/// is — a [`SnapshotResolver`] to satisfy the `'static` closure, a
+/// single all-NULL probe row to learn the subquery's output type before any
+/// real row exists — because it is the same problem: a plan that has to be
+/// rebuilt against a row that does not exist yet at build time. See
+/// [`SnapshotResolver`]'s docs for what that trades away (pushdown, on this
+/// path only).
+fn build_correlated_scalars(
+    child: Box<dyn Operator>,
+    subplans: Vec<LogicalPlan>,
+    base_width: u16,
+    tables: &dyn TableResolver,
+    budget: usize,
+    ctes: &CteRegistry,
+) -> Result<Box<dyn Operator>, BuildError> {
+    let child_schema = child.schema();
+    let probe_cols: Vec<arrow_array::ArrayRef> = child_schema
+        .fields()
+        .iter()
+        .map(|f| arrow_array::new_null_array(f.data_type(), 1))
+        .collect();
+    let probe = RecordBatch::try_new(Arc::clone(&child_schema), probe_cols)
+        .map_err(|e| BuildError::Exec(ExecError::Internal(e.to_string())))?;
+
+    let mut subqueries = Vec::with_capacity(subplans.len());
+    for (k, subplan) in subplans.into_iter().enumerate() {
+        if subplan.is_mutating() {
+            return Err(BuildError::Unsupported(
+                "data-modifying statement inside a scalar subquery".into(),
+            ));
+        }
+        let mut snapshot = SnapshotResolver::default();
+        snapshot_scans(&subplan, tables, &mut snapshot)?;
+        let snapshot = Rc::new(snapshot);
+
+        let schema = build_inner(
+            &subplan,
+            snapshot.as_ref(),
+            None,
+            budget,
+            ctes,
+            Some((&probe, 0)),
+        )?
+        .schema();
+        if schema.fields().len() != 1 {
+            return Err(BuildError::Exec(ExecError::Internal(format!(
+                "scalar subquery must return exactly one column, got {} — a planner bug",
+                schema.fields().len()
+            ))));
+        }
+        let data_type = schema.field(0).data_type().clone();
+
+        let snapshot_for_factory = Rc::clone(&snapshot);
+        let ctes_for_factory = Rc::clone(ctes);
+        let plan_for_factory = subplan;
+        let factory: InnerFactory = Box::new(move |row_batch: &RecordBatch, idx: usize| {
+            build_inner(
+                &plan_for_factory,
+                snapshot_for_factory.as_ref(),
+                None,
+                budget,
+                &ctes_for_factory,
+                Some((row_batch, idx)),
+            )
+            .map_err(build_error_to_exec)
+        });
+        subqueries.push(CorrelatedSubquery {
+            factory,
+            data_type,
+            // Matches the name `bind_outer_rec` gave the `Column` that
+            // reads this position, so a schema dump and an expression dump
+            // agree with each other.
+            name: format!("?correlated{}?", base_width as usize + k),
+        });
+    }
+    Ok(Box::new(CorrelatedScalar::new(child, subqueries)))
 }
 
 /// Read one value out of an Arrow array as an [`Expr::Literal`]. Shared by
@@ -2892,6 +3159,606 @@ mod tests {
             matches!(err, BuildError::Exec(ExecError::CardinalityViolation(_))),
             "got {err:?}, expected a CardinalityViolation"
         );
+    }
+
+    // ── CORRELATED scalar subqueries ─────────────────────────────────────
+    //
+    // Everything above this line is an UNCORRELATED scalar subquery: one
+    // value for the whole statement. These are the correlated ones, which
+    // have a different value per row and which this builder answered wrongly
+    // — not slowly, not with an error, but with plausible values — until
+    // `CorrelatedScalar` existed. Every test here asserts VALUES: the bug
+    // produced the right row count, the right column count and the right
+    // types, so anything less than a value check passes on the broken build.
+
+    /// `ColumnRef { relation: 1 }` inside the subplan — `opt::decorrelate`'s
+    /// `OUTER_REF`, one column of the row this subquery is being evaluated
+    /// for.
+    fn outer_col(i: u16, name: &str) -> Expr {
+        Expr::Column(ColumnRef {
+            relation: OUTER_REF,
+            index: i,
+            name: name.into(),
+        })
+    }
+
+    /// `(SELECT count(*) FROM t x WHERE x.id = <outer>.id)` — the reported
+    /// bug's own subquery. OID 96 is int4 `=`; 2803 is `count(*)`.
+    fn correlated_count_subplan() -> LogicalPlan {
+        LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+                predicate: Expr::Binary {
+                    op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                    lhs: Box::new(col(0, "id")),
+                    rhs: Box::new(outer_col(0, "id")),
+                },
+            }),
+            group: vec![],
+            aggs: vec![Expr::Aggregate {
+                func: basin_plan::FuncId(basin_pgtype::Oid(2803)),
+                args: vec![],
+                distinct: false,
+                filter: None,
+                order_by: vec![],
+            }],
+            grouping_sets: None,
+        }
+    }
+
+    fn i64_column(batches: &[RecordBatch], idx: usize) -> Vec<Option<i64>> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                b.column(idx)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("int8 column")
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// THE BUG. `SELECT id, (SELECT count(*) FROM t x WHERE x.id = t.id)
+    /// FROM t` over `id = 1,2,3,4` is `1,1,1,1` — each row's subquery counts
+    /// only its own matching row. Before `CorrelatedScalar`,
+    /// `materialize_scalar_subquery` ran the subplan once with `outer: None`,
+    /// the unbound `OUTER_REF` was read as the LOCAL column at the same
+    /// index (`x.id = x.id`, always true), and every row got `4` — the full
+    /// table count, four times, with exactly the right shape.
+    #[test]
+    fn a_correlated_count_in_the_target_list_counts_per_row_not_per_statement() {
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan_plan(vec![ColId(0)], vec![])),
+            exprs: vec![
+                (col(0, "id"), "id".into()),
+                (
+                    Expr::Subquery {
+                        kind: basin_plan::SubqueryKind::Scalar,
+                        subplan: Box::new(correlated_count_subplan()),
+                        operand: None,
+                    },
+                    "c".into(),
+                ),
+            ],
+        };
+        let batches = drain(build(&plan, &resolver()).unwrap());
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 4);
+        assert_eq!(
+            i64_column(&batches, 1),
+            vec![Some(1), Some(1), Some(1), Some(1)],
+            "each row counts only the rows correlated to it — 4,4,4,4 is the \
+             pre-fix wrong answer"
+        );
+    }
+
+    /// The same shape with a subquery that returns a DIFFERENT value per row
+    /// rather than the same one four times, so a fix that merely evaluated
+    /// the subquery per row but bound the correlation to the wrong row (or
+    /// to a fixed row) cannot pass either: `(SELECT x.v FROM t x WHERE x.id =
+    /// t.id)` is `10, 20, 30, 40`.
+    #[test]
+    fn a_correlated_scalar_in_the_target_list_gets_a_different_value_per_row() {
+        let subplan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+                predicate: Expr::Binary {
+                    op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                    lhs: Box::new(col(0, "id")),
+                    rhs: Box::new(outer_col(0, "id")),
+                },
+            }),
+            exprs: vec![(col(1, "v"), "v".into())],
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan_plan(vec![ColId(0)], vec![])),
+            exprs: vec![
+                (col(0, "id"), "id".into()),
+                (
+                    Expr::Subquery {
+                        kind: basin_plan::SubqueryKind::Scalar,
+                        subplan: Box::new(subplan),
+                        operand: None,
+                    },
+                    "v".into(),
+                ),
+            ],
+        };
+        let batches = drain(build(&plan, &resolver()).unwrap());
+        let vs: Vec<Option<i32>> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(vs, vec![Some(10), Some(20), Some(30), Some(40)]);
+    }
+
+    /// Postgres's NULL rule, per row: a row whose correlated subquery
+    /// matches nothing gets NULL and is still returned. `x.id = t.id + 100`
+    /// matches for no row here (OID 551 is int4 `+`), so the column is all
+    /// NULL and all four rows survive — checked against PostgreSQL 18.2,
+    /// which answers exactly that.
+    #[test]
+    fn a_correlated_subquery_matching_no_rows_is_null_for_that_row() {
+        let subplan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+                predicate: Expr::Binary {
+                    op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                    lhs: Box::new(col(0, "id")),
+                    rhs: Box::new(Expr::Binary {
+                        op: basin_plan::OpId(basin_pgtype::Oid(551)),
+                        lhs: Box::new(outer_col(0, "id")),
+                        rhs: Box::new(Expr::Literal(Datum::Int32(100), PgType::INT4)),
+                    }),
+                },
+            }),
+            exprs: vec![(col(1, "v"), "v".into())],
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan_plan(vec![ColId(0)], vec![])),
+            exprs: vec![
+                (col(0, "id"), "id".into()),
+                (
+                    Expr::Subquery {
+                        kind: basin_plan::SubqueryKind::Scalar,
+                        subplan: Box::new(subplan),
+                        operand: None,
+                    },
+                    "v".into(),
+                ),
+            ],
+        };
+        let batches = drain(build(&plan, &resolver()).unwrap());
+        let vs: Vec<Option<i32>> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(vs, vec![None, None, None, None], "no match is NULL, not 0");
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            4,
+            "and the outer row is kept, not dropped"
+        );
+    }
+
+    /// A correlated subquery matching MORE than one row is Postgres's
+    /// SQLSTATE 21000, raised at execution (the rows before the offending
+    /// one may already have been emitted) rather than at build time — the
+    /// uncorrelated case can be refused during build because it runs there,
+    /// this one cannot. Live PostgreSQL 18.2 on the same shape:
+    /// `ERROR: more than one row returned by a subquery used as an
+    /// expression`.
+    #[test]
+    fn a_correlated_subquery_returning_two_rows_is_a_cardinality_violation() {
+        // `x.id > t.id` matches 3 rows for id=1 — no equality, no unique
+        // key, exactly the shape `opt::decorrelate` refuses to turn into a
+        // join for this very reason (its trap 3).
+        let subplan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+                predicate: Expr::Binary {
+                    op: basin_plan::OpId(basin_pgtype::Oid(97)),
+                    lhs: Box::new(outer_col(0, "id")),
+                    rhs: Box::new(col(0, "id")),
+                },
+            }),
+            exprs: vec![(col(1, "v"), "v".into())],
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan_plan(vec![ColId(0)], vec![])),
+            exprs: vec![(
+                Expr::Subquery {
+                    kind: basin_plan::SubqueryKind::Scalar,
+                    subplan: Box::new(subplan),
+                    operand: None,
+                },
+                "v".into(),
+            )],
+        };
+        let mut op = build(&plan, &resolver()).expect("builds — the violation is a runtime one");
+        match op.next_batch() {
+            Err(ExecError::CardinalityViolation(m)) => assert_eq!(
+                m, "more than one row returned by a subquery used as an expression",
+                "PostgreSQL 18.2's own wording for this error"
+            ),
+            other => panic!("expected a cardinality violation, got {other:?}"),
+        }
+    }
+
+    /// An UNCORRELATED scalar subquery in the target list must still be
+    /// folded once and reused — the fix narrows what gets materialized, and
+    /// this is the half that must not change. `(SELECT max(id) FROM t)` is
+    /// 4 for every row.
+    #[test]
+    fn an_uncorrelated_scalar_in_the_target_list_still_folds_to_one_value() {
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan_plan(vec![ColId(0)], vec![])),
+            exprs: vec![
+                (col(0, "id"), "id".into()),
+                (
+                    Expr::Subquery {
+                        kind: basin_plan::SubqueryKind::Scalar,
+                        subplan: Box::new(max_id_subplan()),
+                        operand: None,
+                    },
+                    "m".into(),
+                ),
+            ],
+        };
+        let built = build(&plan, &resolver()).unwrap();
+        let batches = drain(built);
+        let ms: Vec<Option<i32>> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(ms, vec![Some(4), Some(4), Some(4), Some(4)]);
+    }
+
+    /// `WHERE` position, where `opt::decorrelate` leaves a correlated scalar
+    /// subquery it cannot prove caps at one row (its trap 3). The same
+    /// per-row evaluation applies, and the `Filter` must still hand its
+    /// caller its INPUT's schema — the column `CorrelatedScalar` appended is
+    /// projected back off above it. `t.v = (SELECT x.v FROM t x WHERE x.id =
+    /// t.id)` is true for every row.
+    #[test]
+    fn a_correlated_scalar_in_a_where_clause_is_evaluated_per_row() {
+        let subplan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+                predicate: Expr::Binary {
+                    op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                    lhs: Box::new(col(0, "id")),
+                    rhs: Box::new(outer_col(0, "id")),
+                },
+            }),
+            exprs: vec![(col(1, "v"), "v".into())],
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+            predicate: Expr::Binary {
+                op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                lhs: Box::new(col(1, "v")),
+                rhs: Box::new(Expr::Subquery {
+                    kind: basin_plan::SubqueryKind::Scalar,
+                    subplan: Box::new(subplan),
+                    operand: None,
+                }),
+            },
+        };
+        let built = build(&plan, &resolver()).unwrap();
+        assert_eq!(
+            built
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            vec!["id", "v"],
+            "a Filter never widens its input's schema, subquery or not"
+        );
+        let batches = drain(built);
+        let ids: Vec<Option<i32>> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some(1), Some(2), Some(3), Some(4)],
+            "every row's own v equals its own correlated subquery's v"
+        );
+    }
+
+    /// Inside a `CASE` branch in the target list — one of the positions
+    /// `opt::decorrelate` names as out of its reach. Nothing special is
+    /// needed for it (the sink is threaded through every `Expr` variant, not
+    /// through a list of blessed ones), and that is worth pinning down:
+    /// `CASE WHEN id < 3 THEN (SELECT x.v FROM t x WHERE x.id = t.id) ELSE
+    /// -1 END` is `10, 20, -1, -1`. Note the subquery is evaluated for every
+    /// row, including the rows whose branch discards it — Basin's `Project`
+    /// evaluates both arms of a `CASE` and selects, so a subquery whose
+    /// per-row evaluation ERRORS would error on rows Postgres never
+    /// evaluates it for. That is a pre-existing property of `CASE` here, not
+    /// something this operator introduces, and it is not exercised by this
+    /// test.
+    #[test]
+    fn a_correlated_scalar_inside_a_case_branch_is_evaluated_per_row() {
+        let subplan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+                predicate: Expr::Binary {
+                    op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                    lhs: Box::new(col(0, "id")),
+                    rhs: Box::new(outer_col(0, "id")),
+                },
+            }),
+            exprs: vec![(col(1, "v"), "v".into())],
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan_plan(vec![ColId(0)], vec![])),
+            exprs: vec![(
+                Expr::Case {
+                    operand: None,
+                    whens: vec![(
+                        Expr::Binary {
+                            // int4 <
+                            op: basin_plan::OpId(basin_pgtype::Oid(97)),
+                            lhs: Box::new(col(0, "id")),
+                            rhs: Box::new(Expr::Literal(Datum::Int32(3), PgType::INT4)),
+                        },
+                        Expr::Subquery {
+                            kind: basin_plan::SubqueryKind::Scalar,
+                            subplan: Box::new(subplan),
+                            operand: None,
+                        },
+                    )],
+                    else_: Some(Box::new(Expr::Literal(Datum::Int32(-1), PgType::INT4))),
+                },
+                "v".into(),
+            )],
+        };
+        let batches = drain(build(&plan, &resolver()).unwrap());
+        let vs: Vec<Option<i32>> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(vs, vec![Some(10), Some(20), Some(-1), Some(-1)]);
+    }
+
+    /// A correlated scalar subquery in a position with nowhere to hang a
+    /// per-row evaluation is REFUSED, not folded once. `Sort` is such a
+    /// position; the refusal is a `BuildError`, which the engine bridge
+    /// turns into a fallback — a clean "this engine cannot serve it",
+    /// which is worth strictly more than a plausible wrong answer.
+    #[test]
+    fn a_correlated_scalar_somewhere_unsupported_is_refused_not_folded() {
+        let plan = LogicalPlan::Sort {
+            input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+            keys: vec![PlanSortKey {
+                expr: Expr::Subquery {
+                    kind: basin_plan::SubqueryKind::Scalar,
+                    subplan: Box::new(correlated_count_subplan()),
+                    operand: None,
+                },
+                descending: false,
+                nulls_first: false,
+            }],
+        };
+        let err = match build(&plan, &resolver()) {
+            Err(e) => e,
+            Ok(_) => panic!("a correlated scalar subquery in a Sort key must be refused"),
+        };
+        assert_eq!(
+            err,
+            BuildError::Unsupported("correlated scalar subquery in this position".into())
+        );
+    }
+
+    /// Two levels of correlation are refused rather than guessed at:
+    /// lowering tags "one level up" and "two levels up" with the same
+    /// `OUTER_REF`, so a subquery correlated inside a correlated subquery
+    /// cannot be resolved to a specific row. See `lower/select.rs`'s
+    /// `ScopeResolver`, which documents the collapse.
+    #[test]
+    fn correlation_nested_inside_correlation_is_refused() {
+        let inner = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+                predicate: Expr::Binary {
+                    op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                    lhs: Box::new(col(0, "id")),
+                    rhs: Box::new(outer_col(0, "id")),
+                },
+            }),
+            exprs: vec![(col(1, "v"), "v".into())],
+        };
+        // The OUTER subquery is correlated too, and its target list holds
+        // the inner correlated one.
+        let outer_sub = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+                predicate: Expr::Binary {
+                    op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                    lhs: Box::new(col(0, "id")),
+                    rhs: Box::new(outer_col(0, "id")),
+                },
+            }),
+            exprs: vec![(
+                Expr::Subquery {
+                    kind: basin_plan::SubqueryKind::Scalar,
+                    subplan: Box::new(inner),
+                    operand: None,
+                },
+                "v".into(),
+            )],
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan_plan(vec![ColId(0)], vec![])),
+            exprs: vec![(
+                Expr::Subquery {
+                    kind: basin_plan::SubqueryKind::Scalar,
+                    subplan: Box::new(outer_sub),
+                    operand: None,
+                },
+                "v".into(),
+            )],
+        };
+        let err = match build(&plan, &resolver()) {
+            Err(e) => e,
+            Ok(_) => panic!("two levels of correlation must be refused"),
+        };
+        assert_eq!(
+            err,
+            BuildError::Unsupported("correlated subquery nested inside another subquery".into())
+        );
+    }
+
+    /// The same refusal from the other direction, and the reason it cannot
+    /// be narrowed to "correlated subquery inside a CORRELATED subquery":
+    /// here the middle subquery is UNCORRELATED (it would be folded once for
+    /// the statement) and the innermost one is correlated — to the middle
+    /// level, or to the outermost, with nothing in the plan able to say
+    /// which. Folding the middle would carry the ambiguity inside; the
+    /// refusal is what stops that.
+    #[test]
+    fn correlation_inside_an_uncorrelated_subquery_is_refused_too() {
+        let inner = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+                predicate: Expr::Binary {
+                    op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                    lhs: Box::new(col(0, "id")),
+                    rhs: Box::new(outer_col(0, "id")),
+                },
+            }),
+            exprs: vec![(col(1, "v"), "v".into())],
+        };
+        let middle = LogicalPlan::Project {
+            // No `OUTER_REF` of its own — this subquery is uncorrelated.
+            input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+            exprs: vec![(
+                Expr::Subquery {
+                    kind: basin_plan::SubqueryKind::Scalar,
+                    subplan: Box::new(inner),
+                    operand: None,
+                },
+                "v".into(),
+            )],
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan_plan(vec![ColId(0)], vec![])),
+            exprs: vec![(
+                Expr::Subquery {
+                    kind: basin_plan::SubqueryKind::Scalar,
+                    subplan: Box::new(middle),
+                    operand: None,
+                },
+                "v".into(),
+            )],
+        };
+        let err = match build(&plan, &resolver()) {
+            Err(e) => e,
+            Ok(_) => panic!("an ambiguous nested correlation must be refused"),
+        };
+        assert_eq!(
+            err,
+            BuildError::Unsupported("correlated subquery nested inside another subquery".into())
+        );
+    }
+
+    /// An UNCORRELATED subquery nested inside a correlated one is fine — it
+    /// folds once per per-row rebuild, and the tables it scans are in the
+    /// snapshot the factory resolves against (which is why `snapshot_scans`
+    /// walks expressions as well as plan children). `(SELECT x.v FROM t x
+    /// WHERE x.id = t.id AND x.id <= (SELECT max(id) FROM t))` is every
+    /// row's own `v`, since `max(id)` is 4.
+    #[test]
+    fn an_uncorrelated_subquery_nested_inside_a_correlated_one_still_resolves() {
+        let subplan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+                predicate: Expr::Binary {
+                    // AND — `eval`'s own conjunction operator id.
+                    op: basin_plan::OpId(basin_pgtype::Oid(u32::MAX)),
+                    lhs: Box::new(Expr::Binary {
+                        op: basin_plan::OpId(basin_pgtype::Oid(96)),
+                        lhs: Box::new(col(0, "id")),
+                        rhs: Box::new(outer_col(0, "id")),
+                    }),
+                    rhs: Box::new(Expr::Binary {
+                        // int4 <=
+                        op: basin_plan::OpId(basin_pgtype::Oid(523)),
+                        lhs: Box::new(col(0, "id")),
+                        rhs: Box::new(Expr::Subquery {
+                            kind: basin_plan::SubqueryKind::Scalar,
+                            subplan: Box::new(max_id_subplan()),
+                            operand: None,
+                        }),
+                    }),
+                },
+            }),
+            exprs: vec![(col(1, "v"), "v".into())],
+        };
+        let plan = LogicalPlan::Project {
+            input: Box::new(scan_plan(vec![ColId(0)], vec![])),
+            exprs: vec![(
+                Expr::Subquery {
+                    kind: basin_plan::SubqueryKind::Scalar,
+                    subplan: Box::new(subplan),
+                    operand: None,
+                },
+                "v".into(),
+            )],
+        };
+        let batches = drain(build(&plan, &resolver()).unwrap());
+        let vs: Vec<Option<i32>> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(vs, vec![Some(10), Some(20), Some(30), Some(40)]);
     }
 
     // ── CTE ──────────────────────────────────────────────────────────────

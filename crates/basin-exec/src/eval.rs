@@ -395,7 +395,29 @@ pub fn eval(expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef, ExecError> {
     }
 }
 
+/// Read a column out of the batch by position.
+///
+/// `ColumnRef::relation` must be 0 — "my own input" — because a position is
+/// all this function has: there is exactly one batch here, and no second
+/// relation to resolve anything against. A non-zero `relation` means either
+/// `opt::decorrelate`'s `OUTER_REF` (a correlated reference to an enclosing
+/// query's row, which `build.rs` binds to a literal or evaluates per row
+/// before eval ever sees it) or a join's right side (which `join.rs`'s
+/// `flatten_filter` rewrites to a flat relation-0 position before eval ever
+/// sees it). Either one arriving here unresolved is a bug in the layer
+/// above — and, until this check existed, a silent one: the index was read
+/// against the local batch regardless, so a correlated `x.id = outer.id`
+/// evaluated as `x.id = x.id` and every row matched. That is a wrong
+/// answer with the right shape, which is the worst kind, so it is refused
+/// rather than guessed at.
 fn eval_column(col: &ColumnRef, batch: &RecordBatch) -> Result<ArrayRef, ExecError> {
+    if col.relation != 0 {
+        return Err(ExecError::Internal(format!(
+            "column {}.{} ('{}') reaches outside this operator's input — a correlated or \
+             join-side reference that should have been resolved before scalar eval",
+            col.relation, col.index, col.name
+        )));
+    }
     let idx = col.index as usize;
     batch.columns().get(idx).cloned().ok_or_else(|| {
         ExecError::Internal(format!(
