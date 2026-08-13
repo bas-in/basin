@@ -10,13 +10,13 @@ use std::collections::BTreeMap;
 
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, FixedSizeBinaryBuilder, Float32Builder,
-    Float64Builder, Int16Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, ListBuilder,
-    StringBuilder, TimestampMicrosecondBuilder,
+    Float64Builder, Int16Builder, Int32Builder, Int64Builder, IntervalMonthDayNanoBuilder,
+    LargeBinaryBuilder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::types::{Float32Type, IntervalMonthDayNano};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, IntervalMonthDayNanoArray, RecordBatch, StringArray,
+    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, IntervalUnit, Schema, TimeUnit};
 use basin_catalog::PartitionSpec;
@@ -24,8 +24,8 @@ use basin_common::{BasinError, PartitionKey, Result};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use sqlparser::ast::ValueWithSpan;
 use sqlparser::ast::{
-    DataType as SqlDataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, TypedString,
-    UnaryOperator, Value,
+    DataType as SqlDataType, DateTimeField, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    Interval as SqlInterval, TypedString, UnaryOperator, Value,
 };
 
 use crate::types::{
@@ -360,6 +360,29 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
                 }
                 Arc::new(b.finish())
             }
+            DataType::Interval(IntervalUnit::MonthDayNano) => {
+                // PG `interval` literal coercion. Postgres keeps months, days
+                // and microseconds in THREE SEPARATE fields and deliberately
+                // does not normalise between them: `INTERVAL '1 day'` is not
+                // stored as `INTERVAL '24 hours'`, and the difference survives
+                // storage and display (it collapses only at comparison time,
+                // where a day is *defined* as 24 hours). Arrow's
+                // `Interval(MonthDayNano)` has exactly those three fields, so
+                // the mapping is field-for-field rather than a reduction to a
+                // single duration — which is why `coerce_interval` never
+                // flattens days into hours or months into days.
+                let mut b = IntervalMonthDayNanoBuilder::with_capacity(rows.len());
+                for row in rows {
+                    match coerce_interval(&row[col_idx], field.name())? {
+                        Some(v) => b.append_value(v),
+                        None => {
+                            check_null_allowed(field)?;
+                            b.append_null();
+                        }
+                    }
+                }
+                Arc::new(b.finish())
+            }
             DataType::Binary => {
                 let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 16);
                 for row in rows {
@@ -531,23 +554,6 @@ pub(crate) fn batch_from_rows(schema: Arc<Schema>, rows: &[Vec<Expr>]) -> Result
             // less common element types (JSONB, TIMESTAMPTZ, UUID, ...) are
             // also out of scope for this pass.
             DataType::List(child) => build_list_column(rows, col_idx, field, child)?,
-            // PG `INTERVAL` → Arrow `Interval(MonthDayNano)`. See
-            // `coerce_interval`: `CREATE TABLE ... iv INTERVAL` has always
-            // been accepted, but until this arm existed no row could ever be
-            // written into such a column.
-            DataType::Interval(IntervalUnit::MonthDayNano) => {
-                let mut values: Vec<Option<IntervalMonthDayNano>> = Vec::with_capacity(rows.len());
-                for row in rows {
-                    match coerce_interval(&row[col_idx], field.name())? {
-                        Some(v) => values.push(Some(v)),
-                        None => {
-                            check_null_allowed(field)?;
-                            values.push(None);
-                        }
-                    }
-                }
-                Arc::new(IntervalMonthDayNanoArray::from(values))
-            }
             other => {
                 return Err(BasinError::InvalidSchema(format!(
                     "unsupported Arrow column type for INSERT: {other:?}"
@@ -2625,259 +2631,6 @@ fn coerce_decimal128(expr: &Expr, precision: u8, scale: i8, col: &str) -> Result
     Ok(Some(if negated { -parsed } else { parsed }))
 }
 
-/// Coerce one row's cell expression for an `INTERVAL` column into Arrow's
-/// `IntervalMonthDayNano`.
-///
-/// Before this existed, an `INTERVAL` column could be declared by
-/// `CREATE TABLE` (`types::arrow_data_type` lowers it) but never written to:
-/// every INSERT reached the catch-all arm below and failed with
-/// "unsupported Arrow column type for INSERT: Interval(MonthDayNano)". The
-/// column type was reachable and the values were not.
-///
-/// Accepts the surface forms sqlparser produces for a PG interval literal:
-/// `INTERVAL '1 day 2 hours'` (an `Expr::Interval` with no leading field),
-/// `INTERVAL '2' HOUR` (a leading field naming the unit for a bare number),
-/// a plain string literal (`'1 day'`, for `INSERT ... VALUES ('1 day')`
-/// against an interval column — PG accepts the implicit cast), and a cast
-/// (`'1 day'::interval`).
-///
-/// NOT SUFFICIENT ON ITS OWN, and worth knowing before assuming interval
-/// columns work: the row still cannot reach disk. NEITHER storage format
-/// can encode `Interval(MonthDayNano)` today — vortex 0.71's `from_arrow`
-/// reports "Array encoding not implemented for Arrow data type
-/// Interval(MonthDayNano)", and arrow-rs's Parquet writer reports "NYI:
-/// Attempting to write an Arrow interval type MonthDayNano to parquet".
-/// Both are upstream. This function removes the first of the two blockers
-/// (and stops the failure being reported against the wrong layer); giving
-/// intervals an on-disk representation — most plausibly an `Int64` of
-/// microseconds plus months/days, behind the ADR-0024 `BASIN_TYPE` sidecar
-/// the other synthetic types already use — is the remaining half.
-fn coerce_interval(expr: &Expr, col: &str) -> Result<Option<IntervalMonthDayNano>> {
-    let (negated, inner) = peel_unary(expr);
-    let flip = |iv: IntervalMonthDayNano| {
-        if negated {
-            IntervalMonthDayNano::new(-iv.months, -iv.days, -iv.nanoseconds)
-        } else {
-            iv
-        }
-    };
-    match inner {
-        Expr::Value(ValueWithSpan {
-            value: Value::Null, ..
-        }) if !negated => Ok(None),
-        Expr::Cast { expr: ce, .. } => Ok(coerce_interval(ce.as_ref(), col)?.map(flip)),
-        Expr::TypedString(TypedString { value, .. }) => {
-            let text = value.clone().into_string().ok_or_else(|| {
-                BasinError::InvalidSchema(format!(
-                    "expected INTERVAL literal text for column {col}"
-                ))
-            })?;
-            parse_pg_interval(&text)
-                .map(|iv| Some(flip(iv)))
-                .ok_or_else(|| bad_interval(&text, col))
-        }
-        Expr::Interval(iv) => {
-            // `INTERVAL '2' HOUR` names its unit outside the string; splice
-            // it back in so one parser handles both spellings.
-            let text = interval_literal_text(iv.value.as_ref(), col)?;
-            let text = match &iv.leading_field {
-                Some(field) if !text.chars().any(|c| c.is_ascii_alphabetic()) => {
-                    format!("{text} {field}")
-                }
-                _ => text,
-            };
-            parse_pg_interval(&text)
-                .map(|parsed| Some(flip(parsed)))
-                .ok_or_else(|| bad_interval(&text, col))
-        }
-        Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
-            ..
-        }) => parse_pg_interval(s)
-            .map(|iv| Some(flip(iv)))
-            .ok_or_else(|| bad_interval(s, col)),
-        other => Err(BasinError::InvalidSchema(format!(
-            "expected INTERVAL literal for column {col}, got {other}"
-        ))),
-    }
-}
-
-fn bad_interval(text: &str, col: &str) -> BasinError {
-    BasinError::InvalidSchema(format!(
-        "bad INTERVAL literal {text:?} for column {col}"
-    ))
-}
-
-/// The string inside an `Expr::Interval`'s value slot.
-fn interval_literal_text(value: &Expr, col: &str) -> Result<String> {
-    match value {
-        Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
-            ..
-        }) => Ok(s.clone()),
-        Expr::Value(ValueWithSpan {
-            value: Value::Number(n, _),
-            ..
-        }) => Ok(n.clone()),
-        other => Err(BasinError::InvalidSchema(format!(
-            "expected INTERVAL literal for column {col}, got {other}"
-        ))),
-    }
-}
-
-/// Parse PostgreSQL's `postgres`-style interval text into Arrow's
-/// month/day/nanosecond triple.
-///
-/// Months, days and sub-day time are kept SEPARATE rather than normalised
-/// into one another, because Postgres keeps them separate: `1 month` is not
-/// 30 days (adding it to `2024-01-31` lands on `2024-02-29`) and `1 day` is
-/// not 24 hours across a DST boundary. Arrow's `MonthDayNano` layout exists
-/// for exactly this reason, so the parser preserves the distinction the
-/// literal made.
-///
-/// Handles a sequence of `<number> <unit>` pairs (`1 day 2 hours`,
-/// `-3 days`, `1 year 6 mons`), an `HH:MM:SS[.fff]` clock component
-/// (`3 days 04:05:06`, or bare `04:05:06`), a bare number (seconds, so
-/// `'0'` works), and a trailing `ago` (negates the whole interval, as PG
-/// does). Returns `None` for anything it does not recognise, so the caller
-/// reports a bad literal rather than silently storing a wrong duration.
-/// ISO-8601 (`P1DT2H`) is deliberately not accepted — PG's own default
-/// output style is the one above, and guessing at a second grammar is how a
-/// parser starts accepting things it should reject.
-fn parse_pg_interval(text: &str) -> Option<IntervalMonthDayNano> {
-    const NANOS_PER_SEC: i128 = 1_000_000_000;
-    let mut months: i128 = 0;
-    let mut days: i128 = 0;
-    let mut nanos: i128 = 0;
-
-    let lowered = text.trim().to_ascii_lowercase();
-    if lowered.is_empty() {
-        return None;
-    }
-    // `@ 1 day` is PG's own `sql_standard`-adjacent output prefix.
-    let body = lowered.strip_prefix('@').unwrap_or(&lowered).trim();
-    let (body, ago) = match body.strip_suffix(" ago") {
-        Some(rest) => (rest.trim(), true),
-        None => (body, false),
-    };
-    if body.is_empty() {
-        return None;
-    }
-
-    let mut tokens = body.split_whitespace().peekable();
-    let mut saw_any = false;
-    while let Some(token) = tokens.next() {
-        // A clock component carries its own units.
-        if token.contains(':') {
-            let (h, m, s) = parse_clock(token)?;
-            let sign = if h < 0.0 || m < 0.0 || s < 0.0 { -1.0 } else { 1.0 };
-            let _ = sign;
-            nanos += (h * 3600.0 * NANOS_PER_SEC as f64) as i128;
-            nanos += (m * 60.0 * NANOS_PER_SEC as f64) as i128;
-            nanos += (s * NANOS_PER_SEC as f64) as i128;
-            saw_any = true;
-            continue;
-        }
-        // `1day` (no space) is legal PG; split the number from the unit.
-        let split = token
-            .find(|c: char| c.is_ascii_alphabetic())
-            .filter(|i| *i > 0);
-        let (number_text, inline_unit) = match split {
-            Some(i) => (&token[..i], Some(&token[i..])),
-            None => (token, None),
-        };
-        let value: f64 = number_text.parse().ok()?;
-        saw_any = true;
-        let unit = match inline_unit {
-            Some(u) => u,
-            None => match tokens.peek() {
-                Some(next) if next.chars().all(|c| c.is_ascii_alphabetic()) => {
-                    let u = *next;
-                    tokens.next();
-                    u
-                }
-                // A bare number with no unit is seconds, which is what makes
-                // `INTERVAL '0'` (a real shape in the corpus) parse.
-                _ => "seconds",
-            },
-        };
-        // Fractions spill into the next-smaller unit the way PG's do: a
-        // fractional month becomes days at 30/month, a fractional day
-        // becomes clock time at 24h/day.
-        let whole = value.trunc();
-        let frac = value - whole;
-        match unit.trim_end_matches(',') {
-            "millennium" | "millennia" | "millenniums" => months += (value * 12_000.0) as i128,
-            "century" | "centuries" => months += (value * 1_200.0) as i128,
-            "decade" | "decades" | "dec" | "decs" => months += (value * 120.0) as i128,
-            "year" | "years" | "y" | "yr" | "yrs" => months += (value * 12.0) as i128,
-            "month" | "months" | "mon" | "mons" => {
-                months += whole as i128;
-                days += (frac * 30.0) as i128;
-            }
-            "week" | "weeks" | "w" => {
-                let total_days = value * 7.0;
-                days += total_days.trunc() as i128;
-                nanos += ((total_days - total_days.trunc()) * 86_400.0 * NANOS_PER_SEC as f64)
-                    as i128;
-            }
-            "day" | "days" | "d" => {
-                days += whole as i128;
-                nanos += (frac * 86_400.0 * NANOS_PER_SEC as f64) as i128;
-            }
-            "hour" | "hours" | "h" | "hr" | "hrs" => {
-                nanos += (value * 3_600.0 * NANOS_PER_SEC as f64) as i128
-            }
-            "minute" | "minutes" | "min" | "mins" | "m" => {
-                nanos += (value * 60.0 * NANOS_PER_SEC as f64) as i128
-            }
-            "second" | "seconds" | "sec" | "secs" | "s" => {
-                nanos += (value * NANOS_PER_SEC as f64) as i128
-            }
-            "millisecond" | "milliseconds" | "ms" | "msec" | "msecs" => {
-                nanos += (value * 1_000_000.0) as i128
-            }
-            "microsecond" | "microseconds" | "us" | "usec" | "usecs" => {
-                nanos += (value * 1_000.0) as i128
-            }
-            _ => return None,
-        }
-    }
-    if !saw_any {
-        return None;
-    }
-    if ago {
-        months = -months;
-        days = -days;
-        nanos = -nanos;
-    }
-    Some(IntervalMonthDayNano::new(
-        i32::try_from(months).ok()?,
-        i32::try_from(days).ok()?,
-        i64::try_from(nanos).ok()?,
-    ))
-}
-
-/// `[+-]HH:MM[:SS[.fff]]` → (hours, minutes, seconds), each carrying the
-/// component's own sign so a leading `-` negates the whole clock.
-fn parse_clock(token: &str) -> Option<(f64, f64, f64)> {
-    let (negative, rest) = match token.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, token.strip_prefix('+').unwrap_or(token)),
-    };
-    let mut parts = rest.split(':');
-    let h: f64 = parts.next()?.parse().ok()?;
-    let m: f64 = parts.next()?.parse().ok()?;
-    let s: f64 = match parts.next() {
-        Some(s) => s.parse().ok()?,
-        None => 0.0,
-    };
-    if parts.next().is_some() || h < 0.0 || m < 0.0 || s < 0.0 {
-        return None;
-    }
-    Some(if negative { (-h, -m, -s) } else { (h, m, s) })
-}
-
 /// Parse a base-10 decimal text into an i128 scaled by `10^target_scale`,
 /// rejecting values whose digit count exceeds `precision`.
 ///
@@ -3429,6 +3182,505 @@ pub(crate) fn parse_date32_string(s: &str, col: &str) -> Result<i32> {
     })
 }
 
+// ─── INTERVAL ───────────────────────────────────────────────────────────────
+//
+// Postgres's `interval` is a TRIPLE — months, days, microseconds — kept apart
+// on purpose, because a day is not always 24 hours and a month is not always
+// 30 days once a time zone or a calendar is involved. Nothing below ever
+// collapses one field into another. Every case here was read off live
+// PostgreSQL 18.2 rather than recalled:
+//
+//   INTERVAL '1 day 2 hours'   -> 1 day 02:00:00     (days stay days)
+//   INTERVAL '-3 days'         -> -3 days
+//   INTERVAL '0'               -> 00:00:00           (bare number = seconds)
+//   INTERVAL '1.5 months'      -> 1 mon 15 days      (a fraction spills DOWN)
+//   INTERVAL '1.5 weeks'       -> 10 days 12:00:00
+//   INTERVAL '1 day -2 hours'  -> 1 day -02:00:00    (sign is per token)
+//   INTERVAL '1 2:00:00'       -> 1 day 02:00:00     (SQL day-time form)
+//   INTERVAL '1-2'             -> 1 year 2 mons      (SQL year-month form)
+//   INTERVAL '1 day ago'       -> -1 days
+//   INTERVAL '1.5' HOUR        -> 01:00:00           (a qualifier TRUNCATES)
+//   INTERVAL '1 day 2 hours' YEAR -> 00:00:00        (…all the way down)
+//
+// Arrow's `Interval(MonthDayNano)` is the same triple, so the mapping is
+// field-for-field. The single narrowing is PG's i64 MICROseconds into Arrow's
+// i64 NANOseconds, which costs three orders of magnitude of range (~292 years
+// rather than ~292 000). That is checked below, not wrapped.
+
+/// Microseconds in one day — used only where a *fraction* of a day has to be
+/// expressed as time, never to convert whole days.
+const MICROS_PER_DAY: i128 = 86_400_000_000;
+
+/// Postgres's `DAYS_PER_MONTH` (`datetime.h`), used only to spill a
+/// *fractional* month into days. Whole months are never converted.
+const DAYS_PER_MONTH: i128 = 30;
+
+/// Which interval field a unit word lands in, and how many of that field's
+/// base units one of it is worth. The three variants are the three Postgres
+/// fields — there is deliberately no single "duration" variant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IvUnit {
+    Months(i128),
+    Days(i128),
+    Micros(i128),
+}
+
+/// The running months/days/microseconds triple.
+#[derive(Clone, Copy, Default, Debug)]
+struct IvAcc {
+    months: i128,
+    days: i128,
+    micros: i128,
+}
+
+impl IvAcc {
+    fn negate(&mut self) {
+        self.months = -self.months;
+        self.days = -self.days;
+        self.micros = -self.micros;
+    }
+}
+
+/// Postgres's interval unit vocabulary, including the abbreviations — all
+/// confirmed against 18.2 (`'1 m'` is a MINUTE, `'1 mon'` is a month, `'1 c'`
+/// is a century).
+fn interval_unit_from_word(w: &str) -> Option<IvUnit> {
+    Some(match w {
+        "us" | "usec" | "usecs" | "usecond" | "useconds" | "microsecond" | "microseconds" => {
+            IvUnit::Micros(1)
+        }
+        "ms" | "msec" | "msecs" | "millisecond" | "milliseconds" => IvUnit::Micros(1_000),
+        "s" | "sec" | "secs" | "second" | "seconds" => IvUnit::Micros(1_000_000),
+        "m" | "min" | "mins" | "minute" | "minutes" => IvUnit::Micros(60_000_000),
+        "h" | "hr" | "hrs" | "hour" | "hours" => IvUnit::Micros(3_600_000_000),
+        "d" | "day" | "days" => IvUnit::Days(1),
+        "w" | "week" | "weeks" => IvUnit::Days(7),
+        "mon" | "mons" | "month" | "months" => IvUnit::Months(1),
+        "y" | "yr" | "yrs" | "year" | "years" => IvUnit::Months(12),
+        "dec" | "decade" | "decades" => IvUnit::Months(120),
+        "c" | "cent" | "century" | "centuries" => IvUnit::Months(1_200),
+        "mil" | "mils" | "millennium" | "millennia" | "millenniums" => IvUnit::Months(12_000),
+        _ => return None,
+    })
+}
+
+/// The same mapping for a trailing SQL qualifier — the `DAY` in
+/// `INTERVAL '10' DAY`.
+fn interval_unit_from_field(f: &DateTimeField) -> Option<IvUnit> {
+    Some(match f {
+        DateTimeField::Millennium | DateTimeField::Millenium => IvUnit::Months(12_000),
+        DateTimeField::Century => IvUnit::Months(1_200),
+        DateTimeField::Decade => IvUnit::Months(120),
+        DateTimeField::Year | DateTimeField::Years => IvUnit::Months(12),
+        DateTimeField::Month | DateTimeField::Months => IvUnit::Months(1),
+        DateTimeField::Week(_) | DateTimeField::Weeks => IvUnit::Days(7),
+        DateTimeField::Day | DateTimeField::Days => IvUnit::Days(1),
+        DateTimeField::Hour | DateTimeField::Hours => IvUnit::Micros(3_600_000_000),
+        DateTimeField::Minute | DateTimeField::Minutes => IvUnit::Micros(60_000_000),
+        DateTimeField::Second | DateTimeField::Seconds => IvUnit::Micros(1_000_000),
+        DateTimeField::Millisecond | DateTimeField::Milliseconds => IvUnit::Micros(1_000),
+        DateTimeField::Microsecond | DateTimeField::Microseconds => IvUnit::Micros(1),
+        _ => return None,
+    })
+}
+
+/// One lexeme of an interval literal.
+#[derive(Clone, Debug)]
+enum IvTok {
+    /// A signed number, split so the common all-integer case never touches
+    /// floating point: `frac` is in `[0, 1)` and carries no sign of its own.
+    Num { neg: bool, int_part: i128, frac: f64 },
+    /// `HH:MM[:SS[.f]]`, already reduced to signed microseconds.
+    Time(i128),
+    /// SQL-standard `Y-M`, already reduced to signed months.
+    YearMonth(i128),
+    Word(String),
+}
+
+/// Split an interval literal into [`IvTok`]s. `@` (Postgres's traditional
+/// ornamental prefix) and commas are noise and are skipped.
+fn scan_interval(s: &str, col: &str) -> Result<Vec<IvTok>> {
+    let bad = |what: &str| {
+        BasinError::InvalidSchema(format!(
+            "invalid INTERVAL literal {s:?} for column {col}: {what}"
+        ))
+    };
+    let ch: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    let mut out: Vec<IvTok> = Vec::new();
+    // Read a run of ASCII digits starting at `i`, advancing it.
+    let digits = |i: &mut usize| -> String {
+        let start = *i;
+        while *i < ch.len() && ch[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        ch[start..*i].iter().collect()
+    };
+    while i < ch.len() {
+        let c = ch[i];
+        if c.is_whitespace() || c == ',' || c == '@' {
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() {
+            let start = i;
+            while i < ch.len() && ch[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            out.push(IvTok::Word(
+                ch[start..i].iter().collect::<String>().to_ascii_lowercase(),
+            ));
+            continue;
+        }
+        if !(c == '+' || c == '-' || c == '.' || c.is_ascii_digit()) {
+            return Err(bad(&format!("unexpected character {c:?}")));
+        }
+        let neg = c == '-';
+        if c == '+' || c == '-' {
+            i += 1;
+        }
+        let int_str = digits(&mut i);
+        let mut frac_str = String::new();
+        if i < ch.len() && ch[i] == '.' {
+            i += 1;
+            frac_str = digits(&mut i);
+        }
+        if int_str.is_empty() && frac_str.is_empty() {
+            return Err(bad("expected a number"));
+        }
+        let int_part: i128 = if int_str.is_empty() {
+            0
+        } else {
+            int_str.parse().map_err(|_| bad("number out of range"))?
+        };
+
+        // `HH:MM[:SS[.f]]` — a whole time-of-day run, sign applying to all of
+        // it. Only reachable when no fraction was consumed above, since
+        // `1.5:30` is not a thing.
+        if frac_str.is_empty() && i < ch.len() && ch[i] == ':' {
+            i += 1;
+            let min_str = digits(&mut i);
+            if min_str.is_empty() {
+                return Err(bad("expected minutes after ':'"));
+            }
+            let mins: i128 = min_str.parse().map_err(|_| bad("minutes out of range"))?;
+            let mut micros = int_part * 3_600_000_000 + mins * 60_000_000;
+            if i < ch.len() && ch[i] == ':' {
+                i += 1;
+                let sec_str = digits(&mut i);
+                if sec_str.is_empty() {
+                    return Err(bad("expected seconds after ':'"));
+                }
+                let secs: i128 = sec_str.parse().map_err(|_| bad("seconds out of range"))?;
+                micros += secs * 1_000_000;
+                if i < ch.len() && ch[i] == '.' {
+                    i += 1;
+                    let f = digits(&mut i);
+                    let frac: f64 = format!("0.{f}")
+                        .parse()
+                        .map_err(|_| bad("fractional seconds out of range"))?;
+                    micros += (frac * 1_000_000.0).round() as i128;
+                }
+            }
+            out.push(IvTok::Time(if neg { -micros } else { micros }));
+            continue;
+        }
+
+        // SQL-standard `Y-M`. The sign belongs to both halves — verified:
+        // `INTERVAL '-1-2'` is `-1 years -2 mons`.
+        if frac_str.is_empty()
+            && i + 1 < ch.len()
+            && ch[i] == '-'
+            && ch[i + 1].is_ascii_digit()
+            && !int_str.is_empty()
+        {
+            i += 1;
+            let mon_str = digits(&mut i);
+            let mons: i128 = mon_str.parse().map_err(|_| bad("months out of range"))?;
+            let months = int_part * 12 + mons;
+            out.push(IvTok::YearMonth(if neg { -months } else { months }));
+            continue;
+        }
+
+        let frac: f64 = if frac_str.is_empty() {
+            0.0
+        } else {
+            format!("0.{frac_str}")
+                .parse()
+                .map_err(|_| bad("fraction out of range"))?
+        };
+        out.push(IvTok::Num {
+            neg,
+            int_part,
+            frac,
+        });
+    }
+    Ok(out)
+}
+
+/// Add one `number × unit` term to the triple.
+///
+/// A fraction spills into the next field DOWN and no further than Postgres
+/// takes it: a fractional year becomes months, a fractional month becomes
+/// days (at 30 days/month) then microseconds, a fractional day becomes
+/// microseconds. Whole fields never move.
+fn apply_interval_term(acc: &mut IvAcc, neg: bool, int_part: i128, frac: f64, unit: IvUnit) {
+    let (mut months, mut days, mut micros) = (0i128, 0i128, 0i128);
+    match unit {
+        IvUnit::Months(mult) => {
+            months += int_part * mult;
+            if frac != 0.0 {
+                let fm = frac * mult as f64;
+                let whole = fm.trunc();
+                months += whole as i128;
+                let rem_days = (fm - whole) * DAYS_PER_MONTH as f64;
+                let whole_days = rem_days.trunc();
+                days += whole_days as i128;
+                micros += ((rem_days - whole_days) * MICROS_PER_DAY as f64).round() as i128;
+            }
+        }
+        IvUnit::Days(mult) => {
+            days += int_part * mult;
+            if frac != 0.0 {
+                let fd = frac * mult as f64;
+                let whole = fd.trunc();
+                days += whole as i128;
+                micros += ((fd - whole) * MICROS_PER_DAY as f64).round() as i128;
+            }
+        }
+        IvUnit::Micros(mult) => {
+            micros += int_part * mult;
+            if frac != 0.0 {
+                micros += (frac * mult as f64).round() as i128;
+            }
+        }
+    }
+    if neg {
+        months = -months;
+        days = -days;
+        micros = -micros;
+    }
+    acc.months += months;
+    acc.days += days;
+    acc.micros += micros;
+}
+
+/// Apply a SQL field qualifier's TRUNCATION, which is separate from its role
+/// as the default unit. `INTERVAL '1 day 2 hours' YEAR` is `00:00:00` on
+/// live 18.2 — the qualifier discards everything below its own field.
+/// `SECOND` is the exception: it keeps full microsecond precision.
+fn truncate_interval_to_field(acc: &mut IvAcc, unit: IvUnit) {
+    match unit {
+        IvUnit::Months(mult) if mult >= 12 => {
+            acc.months = (acc.months / mult) * mult;
+            acc.days = 0;
+            acc.micros = 0;
+        }
+        IvUnit::Months(_) => {
+            acc.days = 0;
+            acc.micros = 0;
+        }
+        IvUnit::Days(_) => acc.micros = 0,
+        IvUnit::Micros(mult) if mult > 1_000_000 => acc.micros = (acc.micros / mult) * mult,
+        IvUnit::Micros(_) => {}
+    }
+}
+
+/// Parse a Postgres interval literal into the Arrow month/day/nano triple.
+///
+/// `qualifier` is the trailing SQL field (`INTERVAL '10' DAY`); it supplies
+/// the unit for any bare number AND truncates the result. With no qualifier a
+/// bare number means SECONDS, matching `INTERVAL '0'` = `00:00:00`.
+fn parse_interval_string(
+    s: &str,
+    col: &str,
+    qualifier: Option<IvUnit>,
+) -> Result<IntervalMonthDayNano> {
+    let toks = scan_interval(s, col)?;
+    if toks.is_empty() {
+        return Err(BasinError::InvalidSchema(format!(
+            "invalid INTERVAL literal {s:?} for column {col}: empty"
+        )));
+    }
+    let mut acc = IvAcc::default();
+    let mut ago = false;
+    let mut idx = 0usize;
+    while idx < toks.len() {
+        match &toks[idx] {
+            IvTok::Word(w) if w == "ago" => {
+                ago = true;
+                idx += 1;
+            }
+            IvTok::Word(w) => {
+                return Err(BasinError::InvalidSchema(format!(
+                    "invalid INTERVAL literal {s:?} for column {col}: unknown unit {w:?}"
+                )));
+            }
+            IvTok::Time(micros) => {
+                acc.micros += micros;
+                idx += 1;
+            }
+            IvTok::YearMonth(months) => {
+                acc.months += months;
+                idx += 1;
+            }
+            IvTok::Num {
+                neg,
+                int_part,
+                frac,
+            } => {
+                let (neg, int_part, frac) = (*neg, *int_part, *frac);
+                let unit = match toks.get(idx + 1) {
+                    Some(IvTok::Word(w)) if w != "ago" => {
+                        let u = interval_unit_from_word(w).ok_or_else(|| {
+                            BasinError::InvalidSchema(format!(
+                                "invalid INTERVAL literal {s:?} for column {col}: unknown unit {w:?}"
+                            ))
+                        })?;
+                        idx += 1;
+                        u
+                    }
+                    // SQL-standard day-time form: a bare number in front of a
+                    // `HH:MM:SS` run is DAYS, not seconds. `INTERVAL '1 2:00:00'`
+                    // is `1 day 02:00:00` on 18.2.
+                    Some(IvTok::Time(_)) => IvUnit::Days(1),
+                    _ => qualifier.unwrap_or(IvUnit::Micros(1_000_000)),
+                };
+                apply_interval_term(&mut acc, neg, int_part, frac, unit);
+                idx += 1;
+            }
+        }
+    }
+    if ago {
+        acc.negate();
+    }
+    if let Some(q) = qualifier {
+        truncate_interval_to_field(&mut acc, q);
+    }
+
+    let oor = || {
+        BasinError::InvalidSchema(format!(
+            "INTERVAL literal {s:?} out of range for column {col}"
+        ))
+    };
+    let months = i32::try_from(acc.months).map_err(|_| oor())?;
+    let days = i32::try_from(acc.days).map_err(|_| oor())?;
+    // Postgres stores microseconds; Arrow stores nanoseconds. The ×1000 is
+    // where an interval Postgres would accept can stop fitting, so it is
+    // checked rather than allowed to wrap.
+    let nanos = acc
+        .micros
+        .checked_mul(1_000)
+        .ok_or_else(oor)
+        .and_then(|n| i64::try_from(n).map_err(|_| oor()))?;
+    Ok(IntervalMonthDayNano::new(months, days, nanos))
+}
+
+/// Pull the literal text out of an `INTERVAL <value>` payload. `NULL` yields
+/// `Ok(None)`; a bare number is accepted as its own text so `INTERVAL 5 DAY`
+/// spellings still reach the parser.
+fn interval_literal_text(expr: &Expr, col: &str) -> Result<Option<String>> {
+    match expr {
+        Expr::Value(ValueWithSpan { value, .. }) => match value {
+            Value::SingleQuotedString(s)
+            | Value::DoubleQuotedString(s)
+            | Value::EscapedStringLiteral(s)
+            | Value::NationalStringLiteral(s) => Ok(Some(s.clone())),
+            Value::Number(n, _) => Ok(Some(n.clone())),
+            Value::Null => Ok(None),
+            other => Err(BasinError::InvalidSchema(format!(
+                "expected INTERVAL literal for column {col}, got {other:?}"
+            ))),
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } => Ok(interval_literal_text(inner, col)?.map(|s| format!("-{s}"))),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr: inner,
+        } => interval_literal_text(inner, col),
+        other => Err(BasinError::InvalidSchema(format!(
+            "expected INTERVAL literal for column {col}, got {other}"
+        ))),
+    }
+}
+
+/// Decode a SQL literal into Arrow's month/day/nano interval triple.
+/// `Ok(None)` on NULL.
+///
+/// Accepts every spelling sqlparser produces for an interval cell:
+/// `INTERVAL '…'`, `INTERVAL '…' DAY`, `'…'::INTERVAL`, the typed-string form
+/// `INTERVAL '…'` when the parser surfaces it as such, a bare string literal
+/// (an untyped `'1 day'` landing in an interval column), and `- INTERVAL '…'`.
+fn coerce_interval(expr: &Expr, col: &str) -> Result<Option<IntervalMonthDayNano>> {
+    match expr {
+        Expr::Interval(SqlInterval {
+            value,
+            leading_field,
+            ..
+        }) => {
+            let Some(text) = interval_literal_text(value, col)? else {
+                return Ok(None);
+            };
+            let qualifier = match leading_field {
+                Some(f) => Some(interval_unit_from_field(f).ok_or_else(|| {
+                    BasinError::InvalidSchema(format!(
+                        "unsupported INTERVAL field qualifier {f} for column {col}"
+                    ))
+                })?),
+                None => None,
+            };
+            parse_interval_string(&text, col, qualifier).map(Some)
+        }
+        // `- INTERVAL '3 days'` negates all three fields at once, which is
+        // NOT the same as `INTERVAL '-3 days'` only when other fields are
+        // present — hence negating the whole triple rather than re-parsing.
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } => Ok(coerce_interval(inner, col)?.map(|iv| {
+            IntervalMonthDayNano::new(-iv.months, -iv.days, -iv.nanoseconds)
+        })),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr: inner,
+        } => coerce_interval(inner, col),
+        // `'1 day'::INTERVAL` — sqlparser surfaces the cast, and the inner
+        // expression is what carries the text.
+        Expr::Cast { expr: inner, .. } => coerce_interval(inner, col),
+        Expr::TypedString(TypedString {
+            data_type: SqlDataType::Interval { .. },
+            value: ValueWithSpan { value: v, .. },
+            ..
+        }) => match v {
+            Value::SingleQuotedString(s)
+            | Value::DoubleQuotedString(s)
+            | Value::EscapedStringLiteral(s)
+            | Value::NationalStringLiteral(s) => parse_interval_string(s, col, None).map(Some),
+            Value::Null => Ok(None),
+            other => Err(BasinError::InvalidSchema(format!(
+                "expected string-valued INTERVAL literal for column {col}, got {other:?}"
+            ))),
+        },
+        Expr::Value(ValueWithSpan {
+            value: Value::Null, ..
+        }) => Ok(None),
+        Expr::Value(ValueWithSpan { value, .. }) => match value {
+            Value::SingleQuotedString(s)
+            | Value::DoubleQuotedString(s)
+            | Value::EscapedStringLiteral(s)
+            | Value::NationalStringLiteral(s) => parse_interval_string(s, col, None).map(Some),
+            other => Err(BasinError::InvalidSchema(format!(
+                "expected INTERVAL literal for column {col}, got {other:?}"
+            ))),
+        },
+        other => Err(BasinError::InvalidSchema(format!(
+            "expected INTERVAL literal for column {col}, got {other}"
+        ))),
+    }
+}
+
 fn coerce_bool(expr: &Expr) -> Result<Option<bool>> {
     match expr {
         Expr::Value(ValueWithSpan {
@@ -3710,79 +3962,6 @@ mod tests {
     use sqlparser::ast::{Insert, SetExpr, Statement};
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
-
-    // ── INTERVAL literal parsing ────────────────────────────────────────
-    //
-    // Every expectation below was checked against a live PostgreSQL 18.2:
-    // `SELECT extract(month from i) ...` on the same literal.
-
-    fn iv(text: &str) -> (i32, i32, i64) {
-        let parsed = parse_pg_interval(text).unwrap_or_else(|| panic!("{text:?} did not parse"));
-        (parsed.months, parsed.days, parsed.nanoseconds)
-    }
-
-    const H: i64 = 3_600_000_000_000;
-    const MIN: i64 = 60_000_000_000;
-    const SEC: i64 = 1_000_000_000;
-
-    #[test]
-    fn interval_keeps_months_days_and_time_separate() {
-        // The whole point of MonthDayNano: `1 month` must NOT become 30 days
-        // and `1 day` must NOT become 24 hours, because PG's date arithmetic
-        // treats them differently.
-        assert_eq!(iv("1 month"), (1, 0, 0));
-        assert_eq!(iv("1 day"), (0, 1, 0));
-        assert_eq!(iv("24 hours"), (0, 0, 24 * H));
-        assert_eq!(iv("1 year"), (12, 0, 0));
-    }
-
-    #[test]
-    fn interval_parses_the_shapes_the_probe_corpus_uses() {
-        assert_eq!(iv("1 day 2 hours"), (0, 1, 2 * H));
-        assert_eq!(iv("-3 days"), (0, -3, 0));
-        // A bare number is seconds, so `INTERVAL '0'` is the zero interval
-        // rather than a parse failure.
-        assert_eq!(iv("0"), (0, 0, 0));
-        assert_eq!(iv("1 hour"), (0, 0, H));
-        assert_eq!(iv("10 days"), (0, 10, 0));
-        assert_eq!(iv("2 hours"), (0, 0, 2 * H));
-    }
-
-    #[test]
-    fn interval_accepts_abbreviations_clock_form_and_ago() {
-        assert_eq!(iv("1 year 6 mons"), (18, 0, 0));
-        assert_eq!(iv("2 hrs 30 mins"), (0, 0, 2 * H + 30 * MIN));
-        assert_eq!(iv("1 week"), (0, 7, 0));
-        assert_eq!(iv("04:05:06"), (0, 0, 4 * H + 5 * MIN + 6 * SEC));
-        assert_eq!(iv("3 days 04:05:06"), (0, 3, 4 * H + 5 * MIN + 6 * SEC));
-        assert_eq!(iv("-04:05:06"), (0, 0, -(4 * H + 5 * MIN + 6 * SEC)));
-        // PG's own `@ 1 day ago` output form.
-        assert_eq!(iv("@ 1 day ago"), (0, -1, 0));
-        assert_eq!(iv("1day"), (0, 1, 0));
-    }
-
-    #[test]
-    fn interval_spills_fractions_into_the_next_smaller_unit_like_pg() {
-        // PG: `INTERVAL '1.5 days'` is `1 day 12:00:00`, not `1.5 days`.
-        assert_eq!(iv("1.5 days"), (0, 1, 12 * H));
-        // PG: `INTERVAL '1.5 months'` is `1 mon 15 days`.
-        assert_eq!(iv("1.5 months"), (1, 15, 0));
-        assert_eq!(iv("0.5 hours"), (0, 0, 30 * MIN));
-    }
-
-    #[test]
-    fn interval_rejects_rather_than_guesses() {
-        for bad in ["", "   ", "banana", "1 fortnight", "1 day banana", "ago"] {
-            assert!(
-                parse_pg_interval(bad).is_none(),
-                "{bad:?} must be reported as a bad literal, not silently \
-                 stored as some other duration"
-            );
-        }
-        // ISO-8601 is deliberately out of scope — it must fail loudly rather
-        // than be half-parsed as `P1DT2H` → some number of seconds.
-        assert!(parse_pg_interval("P1DT2H").is_none());
-    }
 
     #[test]
     fn pg_array_literal_parses_all_forms() {
@@ -4111,6 +4290,276 @@ mod tests {
         assert!(
             msg.contains("not-a-date") && msg.contains("column d"),
             "error must name the literal and the column: {msg}"
+        );
+    }
+
+    /// Build an INTERVAL column from an `INSERT ... VALUES` list and return
+    /// the resulting Arrow array, so the tests below read as
+    /// literal-in / `(months, days, nanos)`-out.
+    fn interval_col(values_sql: &str) -> arrow_array::IntervalMonthDayNanoArray {
+        let rows = rows_from_sql(&format!("INSERT INTO t (iv) VALUES {values_sql}"));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "iv",
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            true,
+        )]));
+        let batch = batch_from_rows(schema, &rows).unwrap();
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::IntervalMonthDayNanoArray>()
+            .unwrap()
+            .clone()
+    }
+
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    /// The three cells the fallback-histogram fixture writes, plus NULL.
+    /// Postgres 18.2, verified live:
+    ///   INTERVAL '1 day 2 hours' -> 1 day 02:00:00   (NOT 26 hours)
+    ///   INTERVAL '-3 days'       -> -3 days
+    ///   INTERVAL '0'             -> 00:00:00
+    #[test]
+    fn interval_values_coercion_round_trip() {
+        let arr = interval_col(
+            "(INTERVAL '1 day 2 hours'), (INTERVAL '-3 days'), (INTERVAL '0'), (NULL)",
+        );
+        assert_eq!(
+            arr.value(0),
+            IntervalMonthDayNano::new(0, 1, 2 * NS_PER_HOUR),
+            "a day must stay in the DAY field, not be folded into 26 hours"
+        );
+        assert_eq!(arr.value(1), IntervalMonthDayNano::new(0, -3, 0));
+        assert_eq!(arr.value(2), IntervalMonthDayNano::new(0, 0, 0));
+        assert!(arr.is_null(3), "NULL interval cell must be null");
+    }
+
+    /// The three fields are independent, exactly as Postgres keeps them:
+    /// `INTERVAL '1 day'` and `INTERVAL '24 hours'` are DIFFERENT stored
+    /// values even though they compare equal.
+    #[test]
+    fn interval_day_is_not_normalised_into_hours() {
+        let arr = interval_col("(INTERVAL '1 day'), (INTERVAL '24 hours'), (INTERVAL '1 month'), (INTERVAL '30 days')");
+        assert_eq!(arr.value(0), IntervalMonthDayNano::new(0, 1, 0));
+        assert_eq!(arr.value(1), IntervalMonthDayNano::new(0, 0, 24 * NS_PER_HOUR));
+        assert_ne!(arr.value(0), arr.value(1));
+        assert_eq!(arr.value(2), IntervalMonthDayNano::new(1, 0, 0));
+        assert_eq!(arr.value(3), IntervalMonthDayNano::new(0, 30, 0));
+        assert_ne!(arr.value(2), arr.value(3));
+    }
+
+    /// Every one of these was read off live PostgreSQL 18.2 before being
+    /// written down — the display string is in the comment beside each.
+    #[test]
+    fn interval_literal_forms_match_postgres() {
+        let cases: &[(&str, IntervalMonthDayNano)] = &[
+            // 1 year 6 mons
+            ("INTERVAL '1.5 years'", IntervalMonthDayNano::new(18, 0, 0)),
+            // 1 mon 15 days — a fractional month spills into days at 30/month
+            ("INTERVAL '1.5 months'", IntervalMonthDayNano::new(1, 15, 0)),
+            // 10 days 12:00:00
+            (
+                "INTERVAL '1.5 weeks'",
+                IntervalMonthDayNano::new(0, 10, 12 * NS_PER_HOUR),
+            ),
+            // 1 day 12:00:00
+            (
+                "INTERVAL '1.5 days'",
+                IntervalMonthDayNano::new(0, 1, 12 * NS_PER_HOUR),
+            ),
+            // 00:30:00
+            (
+                "INTERVAL '0.5 hours'",
+                IntervalMonthDayNano::new(0, 0, NS_PER_HOUR / 2),
+            ),
+            // 00:01:15
+            (
+                "INTERVAL '1.25 minutes'",
+                IntervalMonthDayNano::new(0, 0, 75_000_000_000),
+            ),
+            // 1 day -02:00:00 — the sign belongs to the token, not the literal
+            (
+                "INTERVAL '1 day -2 hours'",
+                IntervalMonthDayNano::new(0, 1, -2 * NS_PER_HOUR),
+            ),
+            // -1 days +02:00:00
+            (
+                "INTERVAL '-1 day 2 hours'",
+                IntervalMonthDayNano::new(0, -1, 2 * NS_PER_HOUR),
+            ),
+            // -01:30:45 — a leading sign on HH:MM:SS covers the whole run
+            (
+                "INTERVAL '-01:30:45'",
+                IntervalMonthDayNano::new(0, 0, -(5445_i64 * 1_000_000_000)),
+            ),
+            // 01:30:00
+            (
+                "INTERVAL '1:30'",
+                IntervalMonthDayNano::new(0, 0, 5400_i64 * 1_000_000_000),
+            ),
+            // 1 day 02:00:00 — SQL day-time form: a bare number before a
+            // HH:MM:SS run is DAYS, not seconds
+            (
+                "INTERVAL '1 2:00:00'",
+                IntervalMonthDayNano::new(0, 1, 2 * NS_PER_HOUR),
+            ),
+            // 1 year 2 mons — SQL year-month form
+            ("INTERVAL '1-2'", IntervalMonthDayNano::new(14, 0, 0)),
+            // -1 years -2 mons
+            ("INTERVAL '-1-2'", IntervalMonthDayNano::new(-14, 0, 0)),
+            // -1 days
+            ("INTERVAL '1 day ago'", IntervalMonthDayNano::new(0, -1, 0)),
+            // 2 days — the ornamental `@` prefix
+            ("INTERVAL '@ 2 days'", IntervalMonthDayNano::new(0, 2, 0)),
+            // 1 day — no space between number and unit
+            ("INTERVAL '1day'", IntervalMonthDayNano::new(0, 1, 0)),
+            // 00:00:05 — a bare number with no unit is SECONDS
+            (
+                "INTERVAL '5'",
+                IntervalMonthDayNano::new(0, 0, 5_000_000_000),
+            ),
+            // 2 days 03:04:05.123456
+            (
+                "INTERVAL '2 days 03:04:05.123456'",
+                IntervalMonthDayNano::new(0, 2, 11_045_123_456_000),
+            ),
+            // 30 years / 200 years / 1000 years
+            ("INTERVAL '3 decades'", IntervalMonthDayNano::new(360, 0, 0)),
+            (
+                "INTERVAL '2 centuries'",
+                IntervalMonthDayNano::new(2400, 0, 0),
+            ),
+            (
+                "INTERVAL '1 millennium'",
+                IntervalMonthDayNano::new(12000, 0, 0),
+            ),
+            // 00:00:00.5 / 00:00:00.0015
+            (
+                "INTERVAL '500 ms'",
+                IntervalMonthDayNano::new(0, 0, 500_000_000),
+            ),
+            (
+                "INTERVAL '1500 us'",
+                IntervalMonthDayNano::new(0, 0, 1_500_000),
+            ),
+            // 00:01:00 — a bare `m` is a MINUTE on a live server, not a month
+            (
+                "INTERVAL '1 m'",
+                IntervalMonthDayNano::new(0, 0, 60_000_000_000),
+            ),
+            ("INTERVAL '1 mon'", IntervalMonthDayNano::new(1, 0, 0)),
+            // '1 day 02:00:00' via the cast spelling rather than the keyword
+            (
+                "'1 day 2 hours'::INTERVAL",
+                IntervalMonthDayNano::new(0, 1, 2 * NS_PER_HOUR),
+            ),
+        ];
+        for (sql, want) in cases {
+            let arr = interval_col(&format!("({sql})"));
+            assert_eq!(arr.value(0), *want, "{sql}");
+        }
+    }
+
+    /// A trailing SQL field qualifier both supplies the default unit AND
+    /// truncates, which is easy to get half-right. Live 18.2:
+    ///   INTERVAL '10' DAY            -> 10 days
+    ///   INTERVAL '1.5' HOUR          -> 01:00:00     (truncated, not 01:30)
+    ///   INTERVAL '90.7' MINUTE       -> 01:30:00
+    ///   INTERVAL '1.5' YEAR          -> 1 year
+    ///   INTERVAL '1 day 2 hours' YEAR -> 00:00:00
+    #[test]
+    fn interval_field_qualifier_supplies_unit_and_truncates() {
+        let cases: &[(&str, IntervalMonthDayNano)] = &[
+            ("INTERVAL '10' DAY", IntervalMonthDayNano::new(0, 10, 0)),
+            ("INTERVAL '1.5' HOUR", IntervalMonthDayNano::new(0, 0, NS_PER_HOUR)),
+            (
+                "INTERVAL '90.7' MINUTE",
+                IntervalMonthDayNano::new(0, 0, 5400_i64 * 1_000_000_000),
+            ),
+            ("INTERVAL '1.5' YEAR", IntervalMonthDayNano::new(12, 0, 0)),
+            ("INTERVAL '1.5' MONTH", IntervalMonthDayNano::new(1, 0, 0)),
+            ("INTERVAL '1.5' DAY", IntervalMonthDayNano::new(0, 1, 0)),
+            (
+                "INTERVAL '1 day 2 hours' YEAR",
+                IntervalMonthDayNano::new(0, 0, 0),
+            ),
+            (
+                "INTERVAL '1 day 2 hours' DAY",
+                IntervalMonthDayNano::new(0, 1, 0),
+            ),
+            (
+                "INTERVAL '1 day 2 hours' HOUR",
+                IntervalMonthDayNano::new(0, 1, 2 * NS_PER_HOUR),
+            ),
+            // SECOND is the one field that does NOT truncate — full
+            // microsecond precision survives.
+            (
+                "INTERVAL '1.234567' SECOND",
+                IntervalMonthDayNano::new(0, 0, 1_234_567_000),
+            ),
+        ];
+        for (sql, want) in cases {
+            let arr = interval_col(&format!("({sql})"));
+            assert_eq!(arr.value(0), *want, "{sql}");
+        }
+    }
+
+    /// A NULL interval into a NOT NULL column is a constraint violation, and
+    /// an unparseable literal is an InvalidSchema error that names the column
+    /// and the offending text.
+    #[test]
+    fn interval_null_and_invalid_literal_handling() {
+        let rows = rows_from_sql("INSERT INTO t (iv) VALUES (NULL)");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "iv",
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            false,
+        )]));
+        let err = batch_from_rows(schema, &rows).unwrap_err();
+        assert!(
+            matches!(err, BasinError::NotNullViolation(_)),
+            "expected NotNullViolation, got {err:?}"
+        );
+
+        let rows = rows_from_sql("INSERT INTO t (iv) VALUES (INTERVAL '3 fortnights')");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "iv",
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            true,
+        )]));
+        let err = batch_from_rows(schema, &rows).unwrap_err();
+        assert!(
+            matches!(err, BasinError::InvalidSchema(_)),
+            "expected InvalidSchema, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fortnights") && msg.contains("column iv"),
+            "error must name the offending unit and the column: {msg}"
+        );
+    }
+
+    /// Postgres stores microseconds, Arrow stores nanoseconds — a ×1000
+    /// narrowing that costs three orders of magnitude of range. An interval
+    /// a live server accepts but Arrow cannot hold must error, not wrap
+    /// silently into a small negative duration.
+    #[test]
+    fn interval_beyond_arrow_nanosecond_range_errors() {
+        // 100 000 000 days is a valid Postgres interval (verified live) but
+        // only if it stays in the DAY field; as hours it exceeds i64 nanos.
+        let arr = interval_col("(INTERVAL '100000000 days')");
+        assert_eq!(arr.value(0), IntervalMonthDayNano::new(0, 100_000_000, 0));
+
+        let rows = rows_from_sql("INSERT INTO t (iv) VALUES (INTERVAL '100000000000 hours')");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "iv",
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            true,
+        )]));
+        let err = batch_from_rows(schema, &rows).unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "expected an out-of-range error, got {err}"
         );
     }
 
