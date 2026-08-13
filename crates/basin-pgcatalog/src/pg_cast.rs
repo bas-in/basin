@@ -95,118 +95,138 @@ use crate::{
     predicate::{Predicate, Value},
 };
 
-/// `(castsource, casttarget, castmethod)`. `castcontext` is deliberately not
-/// a field here — see the module docs on why it is derived from
+/// `(castsource, casttarget, oid, castmethod)`. `castcontext` is deliberately
+/// not a field here — see the module docs on why it is derived from
 /// [`cast_kind`] at scan time instead of duplicated by hand.
-type CastPair = (Oid, Oid, char);
+///
+/// `oid` is `pg_cast`'s own row oid (real `attnum` 1, ahead of
+/// `castsource`) — live-verified per pair below rather than assigned by this
+/// crate, the same reasoning [`crate::pg_am`] gives for its handler oids:
+/// `pg_cast` rows have no explicit oid in Postgres's bootstrap data, so
+/// `genbki` auto-numbers them deterministically from the fixed order its own
+/// `pg_cast.dat` lists them in — the same number on every standard
+/// PostgreSQL 18.2 build, not a value this crate invented.
+type CastPair = (Oid, Oid, Oid, char);
 
 /// The builtin `pg_cast` rows this relation reports. Mirrors exactly the pair
 /// set `basin_pgtype::cast`'s private `builtin_pg_cast` table covers — see the
-/// module docs for the live query used to check every `castmethod`.
+/// module docs for the live query used to check every `castmethod`. The `oid`
+/// field (third of the tuple) was checked with:
+///
+/// ```sql
+/// SELECT s.typname, t.typname, c.oid
+///   FROM pg_cast c
+///   JOIN pg_type s ON s.oid = c.castsource
+///   JOIN pg_type t ON t.oid = c.casttarget
+///  WHERE s.typname IN (<every builtin scalar type name>)
+///    AND t.typname IN (<same set>)
+///  ORDER BY s.typname, t.typname;
+/// ```
 static CAST_ROWS: &[CastPair] = &[
     // ─── The numeric tower ──────────────────────────────────────────────────
-    (oid::INT2, oid::INT4, 'f'),
-    (oid::INT2, oid::INT8, 'f'),
-    (oid::INT2, oid::FLOAT4, 'f'),
-    (oid::INT2, oid::FLOAT8, 'f'),
-    (oid::INT2, oid::NUMERIC, 'f'),
-    (oid::INT4, oid::INT8, 'f'),
-    (oid::INT4, oid::FLOAT4, 'f'),
-    (oid::INT4, oid::FLOAT8, 'f'),
-    (oid::INT4, oid::NUMERIC, 'f'),
-    (oid::INT4, oid::INT2, 'f'),
-    (oid::INT8, oid::FLOAT4, 'f'),
-    (oid::INT8, oid::FLOAT8, 'f'),
-    (oid::INT8, oid::NUMERIC, 'f'),
-    (oid::INT8, oid::INT2, 'f'),
-    (oid::INT8, oid::INT4, 'f'),
-    (oid::FLOAT4, oid::FLOAT8, 'f'),
-    (oid::FLOAT4, oid::INT2, 'f'),
-    (oid::FLOAT4, oid::INT4, 'f'),
-    (oid::FLOAT4, oid::INT8, 'f'),
-    (oid::FLOAT4, oid::NUMERIC, 'f'),
-    (oid::FLOAT8, oid::FLOAT4, 'f'),
-    (oid::FLOAT8, oid::INT2, 'f'),
-    (oid::FLOAT8, oid::INT4, 'f'),
-    (oid::FLOAT8, oid::INT8, 'f'),
-    (oid::FLOAT8, oid::NUMERIC, 'f'),
-    (oid::NUMERIC, oid::FLOAT4, 'f'),
-    (oid::NUMERIC, oid::FLOAT8, 'f'),
-    (oid::NUMERIC, oid::INT2, 'f'),
-    (oid::NUMERIC, oid::INT4, 'f'),
-    (oid::NUMERIC, oid::INT8, 'f'),
+    (oid::INT2, oid::INT4, Oid(10006), 'f'),
+    (oid::INT2, oid::INT8, Oid(10005), 'f'),
+    (oid::INT2, oid::FLOAT4, Oid(10007), 'f'),
+    (oid::INT2, oid::FLOAT8, Oid(10008), 'f'),
+    (oid::INT2, oid::NUMERIC, Oid(10009), 'f'),
+    (oid::INT4, oid::INT8, Oid(10010), 'f'),
+    (oid::INT4, oid::FLOAT4, Oid(10012), 'f'),
+    (oid::INT4, oid::FLOAT8, Oid(10013), 'f'),
+    (oid::INT4, oid::NUMERIC, Oid(10014), 'f'),
+    (oid::INT4, oid::INT2, Oid(10011), 'f'),
+    (oid::INT8, oid::FLOAT4, Oid(10002), 'f'),
+    (oid::INT8, oid::FLOAT8, Oid(10003), 'f'),
+    (oid::INT8, oid::NUMERIC, Oid(10004), 'f'),
+    (oid::INT8, oid::INT2, Oid(10000), 'f'),
+    (oid::INT8, oid::INT4, Oid(10001), 'f'),
+    (oid::FLOAT4, oid::FLOAT8, Oid(10018), 'f'),
+    (oid::FLOAT4, oid::INT2, Oid(10016), 'f'),
+    (oid::FLOAT4, oid::INT4, Oid(10017), 'f'),
+    (oid::FLOAT4, oid::INT8, Oid(10015), 'f'),
+    (oid::FLOAT4, oid::NUMERIC, Oid(10019), 'f'),
+    (oid::FLOAT8, oid::FLOAT4, Oid(10023), 'f'),
+    (oid::FLOAT8, oid::INT2, Oid(10021), 'f'),
+    (oid::FLOAT8, oid::INT4, Oid(10022), 'f'),
+    (oid::FLOAT8, oid::INT8, Oid(10020), 'f'),
+    (oid::FLOAT8, oid::NUMERIC, Oid(10024), 'f'),
+    (oid::NUMERIC, oid::FLOAT4, Oid(10028), 'f'),
+    (oid::NUMERIC, oid::FLOAT8, Oid(10029), 'f'),
+    (oid::NUMERIC, oid::INT2, Oid(10026), 'f'),
+    (oid::NUMERIC, oid::INT4, Oid(10027), 'f'),
+    (oid::NUMERIC, oid::INT8, Oid(10025), 'f'),
     // ─── oid ────────────────────────────────────────────────────────────────
     //
     // int4 <-> oid are binary-coercible (no function at all) in both
     // directions; int2 -> oid and oid -> int8 still run a real function.
     // Confirmed live — this asymmetry is real, not a copy-paste.
-    (oid::INT2, oid::OID, 'f'),
-    (oid::INT4, oid::OID, 'b'),
-    (oid::INT8, oid::OID, 'f'),
-    (oid::OID, oid::INT4, 'b'),
-    (oid::OID, oid::INT8, 'f'),
+    (oid::INT2, oid::OID, Oid(10038), 'f'),
+    (oid::INT4, oid::OID, Oid(10039), 'b'),
+    (oid::INT8, oid::OID, Oid(10037), 'f'),
+    (oid::OID, oid::INT4, Oid(10041), 'b'),
+    (oid::OID, oid::INT8, Oid(10040), 'f'),
     // ─── bool ───────────────────────────────────────────────────────────────
-    (oid::BOOL, oid::INT4, 'f'),
-    (oid::INT4, oid::BOOL, 'f'),
+    (oid::BOOL, oid::INT4, Oid(10035), 'f'),
+    (oid::INT4, oid::BOOL, Oid(10034), 'f'),
     // ─── bytea ──────────────────────────────────────────────────────────────
-    (oid::INT2, oid::BYTEA, 'f'),
-    (oid::INT4, oid::BYTEA, 'f'),
-    (oid::INT8, oid::BYTEA, 'f'),
-    (oid::BYTEA, oid::INT2, 'f'),
-    (oid::BYTEA, oid::INT4, 'f'),
-    (oid::BYTEA, oid::INT8, 'f'),
+    (oid::INT2, oid::BYTEA, Oid(10143), 'f'),
+    (oid::INT4, oid::BYTEA, Oid(10144), 'f'),
+    (oid::INT8, oid::BYTEA, Oid(10145), 'f'),
+    (oid::BYTEA, oid::INT2, Oid(10146), 'f'),
+    (oid::BYTEA, oid::INT4, Oid(10147), 'f'),
+    (oid::BYTEA, oid::INT8, Oid(10148), 'f'),
     // ─── string <-> string ──────────────────────────────────────────────────
     //
     // text/varchar and text/bpchar are binary-coercible; bpchar -> text/
     // varchar runs a real function that strips blank padding. Confirmed live
     // — this is the one place `castmethod` alone (not `castcontext`) exposes
     // an asymmetry `cast.rs`'s `CastKind` cannot represent.
-    (oid::TEXT, oid::VARCHAR, 'b'),
-    (oid::TEXT, oid::BPCHAR, 'b'),
-    (oid::VARCHAR, oid::TEXT, 'b'),
-    (oid::VARCHAR, oid::BPCHAR, 'b'),
-    (oid::BPCHAR, oid::TEXT, 'f'),
-    (oid::BPCHAR, oid::VARCHAR, 'f'),
+    (oid::TEXT, oid::VARCHAR, Oid(10126), 'b'),
+    (oid::TEXT, oid::BPCHAR, Oid(10125), 'b'),
+    (oid::VARCHAR, oid::TEXT, Oid(10129), 'b'),
+    (oid::VARCHAR, oid::BPCHAR, Oid(10130), 'b'),
+    (oid::BPCHAR, oid::TEXT, Oid(10127), 'f'),
+    (oid::BPCHAR, oid::VARCHAR, Oid(10128), 'f'),
     // ─── name ───────────────────────────────────────────────────────────────
-    (oid::NAME, oid::TEXT, 'f'),
-    (oid::TEXT, oid::NAME, 'f'),
-    (oid::VARCHAR, oid::NAME, 'f'),
-    (oid::BPCHAR, oid::NAME, 'f'),
+    (oid::NAME, oid::TEXT, Oid(10134), 'f'),
+    (oid::TEXT, oid::NAME, Oid(10140), 'f'),
+    (oid::VARCHAR, oid::NAME, Oid(10142), 'f'),
+    (oid::BPCHAR, oid::NAME, Oid(10141), 'f'),
     // ─── "char" ─────────────────────────────────────────────────────────────
-    (oid::CHAR, oid::TEXT, 'f'),
-    (oid::INT4, oid::CHAR, 'f'),
+    (oid::CHAR, oid::TEXT, Oid(10131), 'f'),
+    (oid::INT4, oid::CHAR, Oid(10150), 'f'),
     // ─── date / time ────────────────────────────────────────────────────────
-    (oid::DATE, oid::TIMESTAMP, 'f'),
-    (oid::DATE, oid::TIMESTAMPTZ, 'f'),
-    (oid::TIMESTAMP, oid::TIMESTAMPTZ, 'f'),
-    (oid::TIMESTAMPTZ, oid::TIMESTAMP, 'f'),
-    (oid::TIMESTAMP, oid::DATE, 'f'),
-    (oid::TIMESTAMPTZ, oid::DATE, 'f'),
-    (oid::TIMESTAMP, oid::TIME, 'f'),
-    (oid::TIMESTAMPTZ, oid::TIME, 'f'),
-    (oid::TIMESTAMPTZ, oid::TIMETZ, 'f'),
-    (oid::TIME, oid::INTERVAL, 'f'),
-    (oid::INTERVAL, oid::TIME, 'f'),
-    (oid::TIME, oid::TIMETZ, 'f'),
-    (oid::TIMETZ, oid::TIME, 'f'),
+    (oid::DATE, oid::TIMESTAMP, Oid(10158), 'f'),
+    (oid::DATE, oid::TIMESTAMPTZ, Oid(10159), 'f'),
+    (oid::TIMESTAMP, oid::TIMESTAMPTZ, Oid(10164), 'f'),
+    (oid::TIMESTAMPTZ, oid::TIMESTAMP, Oid(10167), 'f'),
+    (oid::TIMESTAMP, oid::DATE, Oid(10162), 'f'),
+    (oid::TIMESTAMPTZ, oid::DATE, Oid(10165), 'f'),
+    (oid::TIMESTAMP, oid::TIME, Oid(10163), 'f'),
+    (oid::TIMESTAMPTZ, oid::TIME, Oid(10166), 'f'),
+    (oid::TIMESTAMPTZ, oid::TIMETZ, Oid(10168), 'f'),
+    (oid::TIME, oid::INTERVAL, Oid(10160), 'f'),
+    (oid::INTERVAL, oid::TIME, Oid(10169), 'f'),
+    (oid::TIME, oid::TIMETZ, Oid(10161), 'f'),
+    (oid::TIMETZ, oid::TIME, Oid(10170), 'f'),
     // ─── json ───────────────────────────────────────────────────────────────
     //
     // json <-> jsonb runs through each type's own I/O routines, not a
     // dedicated function — the only 'i'-method pair in this table.
-    (oid::JSON, oid::JSONB, 'i'),
-    (oid::JSONB, oid::JSON, 'i'),
-    (oid::JSONB, oid::BOOL, 'f'),
-    (oid::JSONB, oid::INT2, 'f'),
-    (oid::JSONB, oid::INT4, 'f'),
-    (oid::JSONB, oid::INT8, 'f'),
-    (oid::JSONB, oid::FLOAT4, 'f'),
-    (oid::JSONB, oid::FLOAT8, 'f'),
-    (oid::JSONB, oid::NUMERIC, 'f'),
+    (oid::JSON, oid::JSONB, Oid(10220), 'i'),
+    (oid::JSONB, oid::JSON, Oid(10221), 'i'),
+    (oid::JSONB, oid::BOOL, Oid(10222), 'f'),
+    (oid::JSONB, oid::INT2, Oid(10224), 'f'),
+    (oid::JSONB, oid::INT4, Oid(10225), 'f'),
+    (oid::JSONB, oid::INT8, Oid(10226), 'f'),
+    (oid::JSONB, oid::FLOAT4, Oid(10227), 'f'),
+    (oid::JSONB, oid::FLOAT8, Oid(10228), 'f'),
+    (oid::JSONB, oid::NUMERIC, Oid(10223), 'f'),
 ];
 
 /// One resolved `pg_cast` row: a [`CastPair`] plus the `castcontext`
 /// [`cast_kind`] reports for it.
 struct CastRow {
+    oid: Oid,
     source: Oid,
     target: Oid,
     castcontext: char,
@@ -216,7 +236,7 @@ struct CastRow {
 fn resolved_rows() -> Vec<CastRow> {
     CAST_ROWS
         .iter()
-        .map(|&(source, target, castmethod)| {
+        .map(|&(source, target, oid, castmethod)| {
             let castcontext = cast_kind(source, target)
                 .unwrap_or_else(|| {
                     panic!(
@@ -226,6 +246,7 @@ fn resolved_rows() -> Vec<CastRow> {
                 })
                 .as_char();
             CastRow {
+                oid,
                 source,
                 target,
                 castcontext,
@@ -239,6 +260,7 @@ fn resolved_rows() -> Vec<CastRow> {
 /// relation's columns.
 fn value(row: &CastRow, column: &str) -> Option<Value> {
     Some(match column {
+        "oid" => Value::Oid(row.oid),
         "castsource" => Value::Oid(row.source),
         "casttarget" => Value::Oid(row.target),
         "castfunc" => Value::Oid(Oid::INVALID),
@@ -255,6 +277,7 @@ pub struct PgCast;
 impl PgCast {
     fn arrow_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
+            Field::new("oid", DataType::UInt32, false),
             Field::new("castsource", DataType::UInt32, false),
             Field::new("casttarget", DataType::UInt32, false),
             Field::new("castfunc", DataType::UInt32, false),
@@ -297,6 +320,7 @@ impl crate::SystemView for PgCast {
             })
             .collect();
 
+        let oids: UInt32Array = rows.iter().map(|r| r.oid.get()).collect();
         let sources: UInt32Array = rows.iter().map(|r| r.source.get()).collect();
         let targets: UInt32Array = rows.iter().map(|r| r.target.get()).collect();
         let funcs: UInt32Array = rows.iter().map(|_| Oid::INVALID.get()).collect();
@@ -312,6 +336,7 @@ impl crate::SystemView for PgCast {
         Ok(RecordBatch::try_new(
             schema,
             vec![
+                Arc::new(oids),
                 Arc::new(sources),
                 Arc::new(targets),
                 Arc::new(funcs),
@@ -372,6 +397,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "oid",
                 "castsource",
                 "casttarget",
                 "castfunc",
@@ -381,6 +407,43 @@ mod tests {
         );
     }
 
+    /// Pins that `oid` (real `attnum` 1) is not nullable and comes before
+    /// every other column — a future edit cannot silently drop it back to
+    /// the wrong position the way this relation previously had it missing
+    /// entirely. See module docs on where the live oids come from.
+    #[test]
+    fn schema_matches_live_postgres_column_layout() {
+        let schema = PgCast.schema();
+        let got: Vec<(&str, bool)> = schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().as_str(), f.is_nullable()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("oid", false),
+                ("castsource", false),
+                ("casttarget", false),
+                ("castfunc", false),
+                ("castcontext", false),
+                ("castmethod", false),
+            ]
+        );
+    }
+
+    /// Every row's `oid` is nonzero and unique — real `pg_cast.oid` is a
+    /// primary key, and `Oid::INVALID` (`0`) would collide with `castfunc`'s
+    /// documented always-zero placeholder if `oid` were ever left unset.
+    #[test]
+    fn every_row_has_a_unique_nonzero_oid() {
+        let batch = PgCast.scan(&MockCatalog::new(), &[]).unwrap();
+        let oids = col_u32(&batch, "oid");
+        assert!(oids.iter().all(|&o| o != 0));
+        let unique: std::collections::HashSet<u32> = oids.iter().copied().collect();
+        assert_eq!(unique.len(), oids.len());
+    }
+
     /// No two rows in [`CAST_ROWS`] disagree with what `cast_kind` itself
     /// says, and every row's `cast_kind` call actually succeeds — pins that
     /// [`resolved_rows`] never silently drops a row via its `unwrap_or_else`
@@ -388,7 +451,7 @@ mod tests {
     /// function the planner calls to decide coercion legality.
     #[test]
     fn every_row_agrees_with_cast_kind() {
-        for &(source, target, _) in CAST_ROWS {
+        for &(source, target, _, _) in CAST_ROWS {
             let kind = cast_kind(source, target)
                 .unwrap_or_else(|| panic!("{source} -> {target} has no cast_kind"));
             let batch = PgCast.scan(&MockCatalog::new(), &[]).unwrap();

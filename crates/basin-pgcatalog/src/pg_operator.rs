@@ -38,6 +38,78 @@
 //! `oprnamespace` is always [`crate::PG_CATALOG_NAMESPACE`] — every operator
 //! this crate knows about is a builtin.
 //!
+//! # Column audit against live PostgreSQL 18.2 (see crate-level task docs)
+//!
+//! ```sql
+//! SELECT attname, atttypid::regtype, attnum, attnotnull FROM pg_attribute
+//! WHERE attrelid = 'pg_catalog.pg_operator'::regclass AND attnum > 0
+//! ORDER BY attnum;
+//! ```
+//!
+//! reports **15** columns; this relation previously implemented 7 of them,
+//! and — same defect found in every sibling relation audited so far —
+//! `oprkind` (real attnum 5) was placed *last*, after `oprleft`/`oprright`/
+//! `oprresult` (real attnums 8/9/10), rather than before them. Fixed here.
+//! The remaining columns, in real `attnum` order:
+//!
+//! - `oprowner` (attnum 4, `oid`, `NOT NULL`): the operator's owning role.
+//!   `OperatorSig` has no owner field, but every row this crate can produce
+//!   is a builtin, and real Postgres reports `oprowner = 10` (the bootstrap
+//!   superuser) for all of them — confirmed by querying every oid this
+//!   crate's `OPERATORS` table contains:
+//!
+//!   ```sql
+//!   SELECT DISTINCT oprowner FROM pg_operator WHERE oid IN (<all 298 oids
+//!   OPERATORS covers>);  -- 10, and only 10
+//!   ```
+//!
+//!   Added as a literal `10` for every row, per this crate's placeholder
+//!   convention (see [`crate::pg_index`]'s boolean defaults).
+//! - `oprcanmerge`, `oprcanhash` (attnums 6, 7, both `boolean`, `NOT NULL`):
+//!   whether the operator is merge-/hash-joinable. Unlike `oprowner` these
+//!   are not uniform across every row, but the rule that predicts them
+//!   *was* checked against every oid `OPERATORS` covers, not assumed: every
+//!   `=` operator is `(true, true)` **except** the six cross-type
+//!   date/timestamp/timestamptz equality oids (2347, 2360, 2373, 2386, 2536,
+//!   2542), which are `(true, false)` — those compare values that don't
+//!   share a single hash domain. Every non-`=` operator is `(false,
+//!   false)`. Confirmed live:
+//!
+//!   ```sql
+//!   SELECT oprname, oprcanmerge, oprcanhash, count(*)
+//!     FROM pg_operator WHERE oid IN (<all 298 oids>) GROUP BY 1,2,3;
+//!   -- every non-'=' row: f,f. '=' rows: 25× t,t and 6× t,f (the cross-type
+//!   -- date/timestamp/timestamptz pairs above).
+//!   ```
+//!
+//!   Implemented as a small lookup over that exact 6-oid exception set, not
+//!   a guess.
+//! - `oprcom`, `oprnegate` (attnums 11, 12, `oid`, `NOT NULL`), `oprcode`,
+//!   `oprrest`, `oprjoin` (attnums 13–15, `regproc`, `NOT NULL`): the
+//!   operator's commutator, negator, and implementing/restriction/join
+//!   functions. **Not added.** `OperatorSig` carries none of this — it is
+//!   genuinely per-operator data (a commutator oid, a negator oid, a
+//!   function name), not a value with one Postgres-correct default the way
+//!   `oprowner` has. A `0` placeholder would be actively wrong far more
+//!   often than not: checked against every oid `OPERATORS` covers,
+//!   `oprcode` is **never** `0` in a real server (every operator has an
+//!   implementing function, by construction), and `oprcom`/`oprnegate`/
+//!   `oprrest`/`oprjoin` are nonzero for a clear majority (231/298, 191/298,
+//!   199/298, 199/298 respectively) — a uniform `0` would misreport most
+//!   rows as having no commutator/negator/estimator when most of them do.
+//!   Per this crate's task docs: a missing column with no *correct* default
+//!   is omitted, not filled with a plausible-looking placeholder — see
+//!   [`crate::pg_index`]'s treatment of `indcollation`/`indclass` for the
+//!   precedent.
+//!
+//!   The consequence is worth stating plainly, same as that precedent: this
+//!   relation stops at `oprresult` (real attnum 10) and does not reach
+//!   `oprcom`/`oprnegate`/`oprcode`/`oprrest`/`oprjoin` (real attnums
+//!   11–15) at all. A reader going by NAME is fine; a positional reader
+//!   expecting 15 columns gets 10, not 15 columns where the last five sit
+//!   in the wrong slots — there is no later column in this relation for the
+//!   gap to misalign.
+//!
 //! # `oid` is deduplicated to match a real primary key
 //!
 //! `pg_operator.oid` is a primary key in real Postgres (confirmed live: `"
@@ -71,7 +143,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow_array::{RecordBatch, StringArray, UInt32Array};
+use arrow_array::{BooleanArray, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use basin_pgtype::operator::{OperatorSig, OPERATORS};
 
@@ -81,6 +153,30 @@ use crate::{
     predicate::{Predicate, Value},
 };
 
+/// Every builtin operator this crate knows about is owned by the bootstrap
+/// superuser — confirmed live for every oid `OPERATORS` covers (see module
+/// docs). Not a fabricated guess: there is no other role a builtin operator
+/// could be owned by.
+const BUILTIN_OPERATOR_OWNER: basin_pgtype::Oid = basin_pgtype::Oid(10);
+
+/// The six cross-type date/timestamp/timestamptz equality oids that are
+/// merge-joinable but *not* hash-joinable — see the module docs for the
+/// live query that found exactly this set and nothing else.
+const MERGEABLE_NOT_HASHABLE: [u32; 6] = [2347, 2360, 2373, 2386, 2536, 2542];
+
+/// `(oprcanmerge, oprcanhash)` for this operator — see the module docs for
+/// the live-verified rule this implements.
+fn canmerge_canhash(op: &OperatorSig) -> (bool, bool) {
+    if op.name != "=" {
+        return (false, false);
+    }
+    if MERGEABLE_NOT_HASHABLE.contains(&op.oid.get()) {
+        (true, false)
+    } else {
+        (true, true)
+    }
+}
+
 /// This operator's value for `column`, or `None` if `column` is not one of
 /// this relation's columns.
 fn value(op: &OperatorSig, column: &str) -> Option<Value> {
@@ -88,10 +184,13 @@ fn value(op: &OperatorSig, column: &str) -> Option<Value> {
         "oid" => Value::Oid(op.oid),
         "oprname" => Value::Text(op.name.to_string()),
         "oprnamespace" => Value::Oid(crate::PG_CATALOG_NAMESPACE),
+        "oprowner" => Value::Oid(BUILTIN_OPERATOR_OWNER),
+        "oprkind" => Value::Text(if op.left.is_some() { "b" } else { "l" }.to_string()),
+        "oprcanmerge" => Value::Bool(canmerge_canhash(op).0),
+        "oprcanhash" => Value::Bool(canmerge_canhash(op).1),
         "oprleft" => Value::Oid(op.left.unwrap_or(basin_pgtype::Oid::INVALID)),
         "oprright" => Value::Oid(op.right),
         "oprresult" => Value::Oid(op.result),
-        "oprkind" => Value::Text(if op.left.is_some() { "b" } else { "l" }.to_string()),
         _ => return None,
     })
 }
@@ -114,10 +213,19 @@ impl PgOperator {
             Field::new("oid", DataType::UInt32, false),
             Field::new("oprname", DataType::Utf8, false),
             Field::new("oprnamespace", DataType::UInt32, false),
+            Field::new("oprowner", DataType::UInt32, false),
+            Field::new("oprkind", DataType::Utf8, false),
+            Field::new("oprcanmerge", DataType::Boolean, false),
+            Field::new("oprcanhash", DataType::Boolean, false),
             Field::new("oprleft", DataType::UInt32, false),
             Field::new("oprright", DataType::UInt32, false),
             Field::new("oprresult", DataType::UInt32, false),
-            Field::new("oprkind", DataType::Utf8, false),
+            // `oprcom`, `oprnegate` (oid), `oprcode`, `oprrest`, `oprjoin`
+            // (regproc) — real attnums 11–15 — are omitted. See the module
+            // docs: none of them has a Postgres-correct uniform default, and
+            // `OperatorSig` carries none of this per-operator data. This
+            // relation therefore has 10 columns where a real `pg_operator`
+            // has 15; there is no later column here for the gap to shift.
         ]))
     }
 }
@@ -161,16 +269,21 @@ impl crate::SystemView for PgOperator {
             .iter()
             .map(|_| crate::PG_CATALOG_NAMESPACE.get())
             .collect();
+        // Placeholder — see the module docs for why `10` is the real,
+        // live-verified value for every row, not a guess.
+        let oprowners: UInt32Array = rows.iter().map(|_| BUILTIN_OPERATOR_OWNER.get()).collect();
+        let oprkinds: StringArray = rows
+            .iter()
+            .map(|r| Some(if r.left.is_some() { "b" } else { "l" }))
+            .collect();
+        let oprcanmerges: BooleanArray = rows.iter().map(|r| canmerge_canhash(r).0).collect();
+        let oprcanhashes: BooleanArray = rows.iter().map(|r| canmerge_canhash(r).1).collect();
         let oprlefts: UInt32Array = rows
             .iter()
             .map(|r| r.left.unwrap_or(basin_pgtype::Oid::INVALID).get())
             .collect();
         let oprrights: UInt32Array = rows.iter().map(|r| r.right.get()).collect();
         let oprresults: UInt32Array = rows.iter().map(|r| r.result.get()).collect();
-        let oprkinds: StringArray = rows
-            .iter()
-            .map(|r| Some(if r.left.is_some() { "b" } else { "l" }))
-            .collect();
 
         Ok(RecordBatch::try_new(
             schema,
@@ -178,10 +291,13 @@ impl crate::SystemView for PgOperator {
                 Arc::new(oids),
                 Arc::new(oprnames),
                 Arc::new(oprnamespaces),
+                Arc::new(oprowners),
+                Arc::new(oprkinds),
+                Arc::new(oprcanmerges),
+                Arc::new(oprcanhashes),
                 Arc::new(oprlefts),
                 Arc::new(oprrights),
                 Arc::new(oprresults),
-                Arc::new(oprkinds),
             ],
         )?)
     }
@@ -215,6 +331,17 @@ mod tests {
             .collect()
     }
 
+    fn col_bool(batch: &RecordBatch, name: &str) -> Vec<bool> {
+        batch
+            .column(batch.schema().index_of(name).unwrap())
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .iter()
+            .map(|b| b.unwrap())
+            .collect()
+    }
+
     fn row_for(batch: &RecordBatch, oid: u32) -> usize {
         col_u32(batch, "oid")
             .into_iter()
@@ -227,20 +354,32 @@ mod tests {
         assert_eq!(PgOperator.name(), "pg_operator");
     }
 
+    /// Pins the exact column layout (name, type, order, nullability) against
+    /// live PostgreSQL 18.2's `pg_attribute` for `pg_operator`, so a future
+    /// edit cannot silently reorder, rename, retype or flip nullability on a
+    /// column. `oprcom`/`oprnegate`/`oprcode`/`oprrest`/`oprjoin` (real
+    /// attnums 11-15) are deliberately absent — see the module docs.
     #[test]
-    fn schema_matches_the_documented_column_set() {
+    fn schema_matches_live_postgres_column_layout() {
         let schema = PgOperator.schema();
-        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        let got: Vec<(&str, DataType, bool)> = schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().as_str(), f.data_type().clone(), f.is_nullable()))
+            .collect();
         assert_eq!(
-            names,
+            got,
             vec![
-                "oid",
-                "oprname",
-                "oprnamespace",
-                "oprleft",
-                "oprright",
-                "oprresult",
-                "oprkind",
+                ("oid", DataType::UInt32, false),
+                ("oprname", DataType::Utf8, false),
+                ("oprnamespace", DataType::UInt32, false),
+                ("oprowner", DataType::UInt32, false),
+                ("oprkind", DataType::Utf8, false),
+                ("oprcanmerge", DataType::Boolean, false),
+                ("oprcanhash", DataType::Boolean, false),
+                ("oprleft", DataType::UInt32, false),
+                ("oprright", DataType::UInt32, false),
+                ("oprresult", DataType::UInt32, false),
             ]
         );
     }
@@ -270,6 +409,48 @@ mod tests {
         assert_eq!(col_str(&batch, "oprkind")[i], "l");
         assert_eq!(col_u32(&batch, "oprleft")[i], 0);
         assert_eq!(col_u32(&batch, "oprright")[i], 23);
+    }
+
+    /// Every row is owned by the bootstrap superuser (oid 10) — confirmed
+    /// live for every oid `OPERATORS` covers, per the module docs.
+    #[test]
+    fn every_row_is_owned_by_the_bootstrap_superuser() {
+        let batch = PgOperator.scan(&MockCatalog::new(), &[]).unwrap();
+        for owner in col_u32(&batch, "oprowner") {
+            assert_eq!(owner, 10);
+        }
+    }
+
+    /// `int4 = int4` (oid 96) is a same-type equality: merge- and
+    /// hash-joinable. Confirmed live.
+    #[test]
+    fn same_type_equality_is_mergeable_and_hashable() {
+        let batch = PgOperator.scan(&MockCatalog::new(), &[]).unwrap();
+        let i = row_for(&batch, 96);
+        assert!(col_bool(&batch, "oprcanmerge")[i]);
+        assert!(col_bool(&batch, "oprcanhash")[i]);
+    }
+
+    /// `date = timestamp` (oid 2347) is merge-joinable but NOT
+    /// hash-joinable — the one shape of `=` operator in this table's
+    /// coverage that is not both. Confirmed live; see module docs for the
+    /// full 6-oid exception set this pins.
+    #[test]
+    fn cross_type_date_timestamp_equality_is_mergeable_not_hashable() {
+        let batch = PgOperator.scan(&MockCatalog::new(), &[]).unwrap();
+        let i = row_for(&batch, 2347);
+        assert!(col_bool(&batch, "oprcanmerge")[i]);
+        assert!(!col_bool(&batch, "oprcanhash")[i]);
+    }
+
+    /// A non-`=` operator (`<`, oid 97) is neither merge- nor hash-joinable.
+    /// Confirmed live.
+    #[test]
+    fn non_equality_operator_is_neither_mergeable_nor_hashable() {
+        let batch = PgOperator.scan(&MockCatalog::new(), &[]).unwrap();
+        let i = row_for(&batch, 97);
+        assert!(!col_bool(&batch, "oprcanmerge")[i]);
+        assert!(!col_bool(&batch, "oprcanhash")[i]);
     }
 
     /// The entire point of this crate: a predicate on `oid` must actually
