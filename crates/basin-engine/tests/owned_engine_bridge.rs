@@ -190,10 +190,11 @@ async fn flag_on_serves_a_simple_select_matching_datafusion() {
 }
 
 /// Property 3: a construct outside the owned pipeline's documented scope
-/// (`SELECT DISTINCT` — `basin-plan/src/lower/select.rs` names this
-/// explicitly as `LowerError::Unsupported`) must still produce the correct
-/// answer, via a silent fallback to DataFusion, and record itself as a
-/// fallback rather than a served query or a client-visible error.
+/// (`SELECT DISTINCT ON (...)` — `basin-plan/src/lower/select.rs` names this
+/// explicitly as `LowerError::Unsupported`, distinct from plain `DISTINCT`,
+/// which that same file now lowers) must still produce the correct answer,
+/// via a silent fallback to DataFusion, and record itself as a fallback
+/// rather than a served query or a client-visible error.
 #[tokio::test]
 async fn unsupported_construct_falls_back_instead_of_erroring() {
     let _guard = env_lock();
@@ -209,10 +210,11 @@ async fn unsupported_construct_falls_back_instead_of_erroring() {
     )
     .await;
 
-    // DISTINCT is explicitly unsupported by `lower_select_stmt` today (see
+    // DISTINCT ON is explicitly unsupported by `lower_select_stmt` today (see
     // that function's `stmt.distinct_clause` guard) — must fall back, not
-    // error, and still return the deduplicated rows.
-    let batches = rows(&sess, "SELECT DISTINCT id, name FROM d ORDER BY id").await;
+    // error, and still return the deduplicated rows. (Plain DISTINCT is now
+    // lowered and served, so it no longer exercises this fallback path.)
+    let batches = rows(&sess, "SELECT DISTINCT ON (id) id, name FROM d ORDER BY id").await;
     let got = flatten_id_name(&batches);
     assert_eq!(
         got,
@@ -231,7 +233,7 @@ async fn unsupported_construct_falls_back_instead_of_erroring() {
         "the fallback counter is exactly the one that should move here"
     );
 
-    // DISTINCT is a construct nothing downstream implements yet
+    // DISTINCT ON is a construct nothing downstream implements yet
     // (`LowerError::Unsupported`), not an ineligible table or a genuine
     // error — it must land in exactly the `unsupported` bucket, and the
     // histogram must still sum to the flat fallback count.
