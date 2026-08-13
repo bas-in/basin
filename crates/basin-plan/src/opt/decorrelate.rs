@@ -172,14 +172,37 @@
 //!   is left as an un-decorrelated subquery, exactly as
 //!   `push_down_filter`'s own module docs describe `Sort`/`Distinct` as "left
 //!   for a later increment" barriers rather than guessed through.
-//! - **Equijoin extraction into `Join::on`** does not happen here. Every join
-//!   this file builds puts its condition in `Join::filter` and leaves `on`
-//!   empty (Nested Loop rather than Hash — see `display.rs`'s `method`
-//!   selection) except for transform 4, which needs concrete grouping
-//!   expressions anyway and builds `on` directly from them. Splitting a
-//!   general `Join::filter` equality into `on` is `extract_equijoin_predicate`'s
-//!   job — a separate **MUST** rule in the ablation doc's build order, not
-//!   part of this one.
+//! - **Equijoin extraction into `Join::on`** happens for every transform that
+//!   builds a `Join`, not only transform 4. `basin-exec`'s physical builder
+//!   (`build.rs`) refuses to build *any* `Join` whose `filter` is non-empty —
+//!   there is no post-join residual-predicate evaluation path there — so a
+//!   correlation predicate left entirely in `filter` makes the join
+//!   unbuildable and the whole query silently falls back to DataFusion
+//!   despite this rule's rewrite having "succeeded" on the logical plan.
+//!   [`split_join_conjuncts`] is this file's version of
+//!   `extract_equijoin_predicate` — the separate **MUST** rule the ablation
+//!   doc lists for ordinary joins — applied to a decorrelated join's own
+//!   condition instead of a `WHERE`-clause; see that function's own docs for
+//!   why it cannot just delegate to `lower/select.rs`'s
+//!   `split_equijoin_conjuncts`, which solves the same problem for a
+//!   differently-addressed input.
+//! - **A correlation predicate that reaches through a `Project`/`Aggregate`
+//!   into a column that node's own output does not carry** would, if used
+//!   as-is, address the wrong column of `residual`'s actual built output (or
+//!   go safely out of range) once `residual` sits directly on one side of
+//!   the new `Join` — [`strip_correlation`] itself returns `corr` addressed
+//!   against whatever schema sits *below* that node, not the node's own,
+//!   because [`decorrelate_scalar`] (the one caller that never uses
+//!   `residual` as-is) needs exactly that raw addressing. Every other
+//!   caller — [`decorrelate_exists_like`], [`decorrelate_in`] — runs the
+//!   result through [`rebase_onto_residual`] first, which is the fix for
+//!   this rather than a documented gap: see its own docs for the mechanism,
+//!   why widening a `Project` is safe and widening an `Aggregate`'s `group`
+//!   is not, and
+//!   `correlated_in_where_the_subquery_selects_a_different_column_than_it_correlates_on`
+//!   / `correlated_exists_over_select_1_resolves_the_correlation_not_the_literal`
+//!   for the wrong-answer this closes (confirmed failing against the code
+//!   without this step before it was added).
 //! - **A `NOT (EXISTS (...))`/`NOT (x IN (...))` spelling** (as opposed to the
 //!   `NotExists`/`NotIn` variants) is not specially unwrapped. `lower_bool_expr`
 //!   (`lower/expr.rs`) already collapses *either* spelling into
@@ -461,12 +484,19 @@ fn decorrelate_exists_like(
 ) -> Option<LogicalPlan> {
     let normalized = rewrite_node(subplan);
     let (residual, corr) = strip_correlation(&normalized)?;
+    // `residual` becomes the new join's right side verbatim below, so
+    // `corr`'s column indices must address `residual`'s own actual output —
+    // not whatever schema sits below a `Project`/`Aggregate` it may be
+    // wrapped in. See [`rebase_onto_residual`]'s docs for why this is a
+    // separate step rather than something `strip_correlation` itself does.
+    let (residual, corr) = rebase_onto_residual(&residual, corr)?;
+    let (on, filter) = split_join_conjuncts(swap_relations(&corr));
     Some(LogicalPlan::Join {
         left: Box::new(base.clone()),
         right: Box::new(residual),
         kind,
-        on: vec![],
-        filter: Some(swap_relations(&corr)),
+        on,
+        filter,
     })
 }
 
@@ -480,10 +510,21 @@ fn decorrelate_in(
     let (residual, corr) = strip_correlation(&normalized)?;
     // A subquery on the right of IN produces exactly one column by SQL
     // grammar; this file only decorrelates when it can prove that
-    // structurally (see `is_single_column`) rather than assume it.
+    // structurally (see `is_single_column`) rather than assume it. Checked
+    // here, against the *pre-rebase* residual — [`rebase_onto_residual`]
+    // below may widen a `Project` with an extra trailing column for the
+    // correlation's own benefit, and that widening must not itself make an
+    // otherwise-plain single-column `IN` refuse.
     if !is_single_column(&residual) {
         return None;
     }
+    // `residual` becomes the new join's right side verbatim below, so
+    // `corr`'s column indices must address `residual`'s own actual output —
+    // see [`rebase_onto_residual`]'s docs. `value_col`'s hardcoded index 0
+    // stays valid across this call because widening only ever *appends*
+    // trailing columns; it never moves the subquery's own already-checked
+    // sole output column away from index 0.
+    let (residual, corr) = rebase_onto_residual(&residual, corr)?;
 
     let corr_filter = swap_relations(&corr);
     // The residual's sole output column, from the new join's right side.
@@ -497,13 +538,107 @@ fn decorrelate_in(
         lhs: Box::new(operand.clone()),
         rhs: Box::new(value_col),
     };
+    // `operand` was resolved against `base` directly (never touched by
+    // `swap_relations`), so it already carries `LOCAL_REF` (0) — the same
+    // "new join's left" tag `swap_relations` gives the correlation
+    // predicate's former `OUTER_REF` side. `value_col` was built with
+    // `relation: 1` directly, for the same reason on the right. Both are
+    // already addressed the way `split_join_conjuncts` expects, with no
+    // separate swap of `membership` needed.
+    let (on, filter) = split_join_conjuncts(and(corr_filter, membership));
     Some(LogicalPlan::Join {
         left: Box::new(base.clone()),
         right: Box::new(residual),
         kind: JoinKind::LeftSemi,
-        on: vec![],
-        filter: Some(and(corr_filter, membership)),
+        on,
+        filter,
     })
+}
+
+/// Split a decorrelated join's condition into `Join::on` (hash-joinable)
+/// and a residual `Join::filter`, so transforms 1–3 stop handing
+/// `basin-exec`'s physical builder a join it categorically refuses to build
+/// (`build.rs`: "non-equi join condition" — there is no post-join residual
+/// evaluation path there) — see "What this file does not do" in the module
+/// docs for the full story of why an unsplit filter silently degrades every
+/// correlated `EXISTS`/`IN` query to a DataFusion fallback.
+///
+/// `pred` must already be addressed the way [`swap_relations`] leaves a
+/// correlation predicate — relation `0` is the new join's left input,
+/// `1` its right — the same left/right convention `Join::filter` uses
+/// everywhere else in this crate (see [`super::pushdown`]'s
+/// `touches_relation`/`rebase_right`, which this mirrors: a predicate
+/// confirmed to touch only one side keeps its column indices completely
+/// unchanged, because that side's indices are already scoped to that side's
+/// own schema — there is no flat concatenated offset to subtract). This is
+/// *not* [`lower::select::split_equijoin_conjuncts`](crate::lower::select),
+/// even though the two solve the same problem: that function splits a raw
+/// `WHERE`-clause conjunct addressed as one flat index range over
+/// `left ++ right` (so it must subtract `left_len` to rebase the right
+/// side — see its own `rebase_columns` call), which is simply the wrong
+/// shape of input for a predicate already carrying per-side relation tags.
+/// Reusing its *approach* — walk top-level `AND` conjuncts, keep only a
+/// provably single-sided equality, leave everything else as a residual
+/// filter — is what this function does instead of calling it.
+fn split_join_conjuncts(pred: Expr) -> (Vec<(Expr, Expr)>, Option<Expr>) {
+    let mut on = Vec::new();
+    let mut leftover = Vec::new();
+    for conjunct in split_conjunction(pred) {
+        if let Expr::Binary { op, lhs, rhs } = &conjunct {
+            if is_equality(*op) {
+                match (side_of(lhs), side_of(rhs)) {
+                    (Some(0), Some(1)) => {
+                        on.push(((**lhs).clone(), (**rhs).clone()));
+                        continue;
+                    }
+                    (Some(1), Some(0)) => {
+                        on.push(((**rhs).clone(), (**lhs).clone()));
+                        continue;
+                    }
+                    // Mixed (references both sides), or neither (a bare
+                    // literal) — not a hash-joinable key on either side, so
+                    // it must stay a residual check, not silently be
+                    // dropped or misfiled.
+                    _ => {}
+                }
+            }
+        }
+        leftover.push(conjunct);
+    }
+    (on, conjunction(leftover))
+}
+
+/// Which single side of an already-swapped decorrelated join condition
+/// `expr` addresses — `Some(0)` (only [`LOCAL_REF`], the new join's left),
+/// `Some(1)` (only [`OUTER_REF`], the new join's right), or `None` if it
+/// mixes both or references neither (e.g. a bare literal — must not count
+/// as belonging to either side, the same refusal `lower/select.rs`'s
+/// `side_range` makes for the same reason: `x = 5` must never be folded
+/// into `Join::on`). Reuses [`references_local`]/[`references_outer`]
+/// exactly as written for [`strip_correlation`]'s pre-swap use — both just
+/// test a raw relation-tag value, which is equally correct read post-swap,
+/// where the *meaning* of relation `0`/`1` has flipped but the tag values
+/// themselves (`0`/`1`) have not.
+fn side_of(expr: &Expr) -> Option<u16> {
+    match (references_local(expr), references_outer(expr)) {
+        (true, false) => Some(LOCAL_REF),
+        (false, true) => Some(OUTER_REF),
+        _ => None,
+    }
+}
+
+/// Whether `op` is an equality [`split_join_conjuncts`] may fold into
+/// `Join::on`: a real `pg_operator` row named `"="`, or [`IN_EQ_OP`] — the
+/// placeholder for the equality `IN` implies (see "A convention this file
+/// invents" in the module docs). Any other operator (`>`, `<>`, ...) must
+/// stay a residual `filter` check — folding a non-equality into `on` would
+/// hand `basin-exec`'s hash join a key comparison it does not perform (a
+/// hash join only ever tests equality).
+fn is_equality(op: OpId) -> bool {
+    op == IN_EQ_OP
+        || basin_pgtype::operator::OPERATORS
+            .iter()
+            .any(|sig| sig.oid == op.0 && sig.name == "=")
 }
 
 /// Transform 4 entry point: recognize `<scalar subquery> op <expr>` or
@@ -698,6 +833,158 @@ fn strip_correlation(plan: &LogicalPlan) -> Option<(LogicalPlan, Expr)> {
 
         _ => None,
     }
+}
+
+/// Rebase `corr`'s [`LOCAL_REF`] column references from "whatever schema sits
+/// below `residual`'s `Project`/`Aggregate` wrappers" (what [`strip_correlation`]
+/// leaves them addressed against — correct only for [`decorrelate_scalar`],
+/// which never uses `residual` itself, only its `input`) onto **`residual`'s
+/// own actual output** — required by every other transform, which puts
+/// `residual` directly on one side of the new `Join`.
+///
+/// Without this, a `corr` reference to a column the wrapping `Project`/
+/// `Aggregate` does not happen to expose at that exact output position
+/// either goes out of range (caught safely: `basin-exec`'s `HashJoin::new`
+/// bounds-checks every key and reports a `BuildError`, the same
+/// DataFusion-fallback outcome as before this file split `filter` into
+/// `on`/`filter` at all) or — the dangerous case, and the *common* one, not
+/// an edge case — stays in range and silently names a *different* column,
+/// joining on the wrong data with no error at all. Confirmed both ways by
+/// `correlated_in_where_the_subquery_selects_a_different_column_than_it_correlates_on`
+/// and `correlated_exists_over_select_1_resolves_the_correlation_not_the_literal`.
+///
+/// - `Project`: [`rebase_corr_through_project`] reuses an existing output
+///   column when the correlation already happens to select it, and appends a
+///   new trailing one otherwise. Appending is safe here specifically because
+///   every caller of this function only ever builds [`JoinKind::LeftSemi`]/
+///   [`JoinKind::LeftAnti`] — confirmed against `schema.rs`'s `join_schema`
+///   (`LeftSemi | LeftAnti => Ok(left_schema)`, the right side never
+///   contributes to the output) and `basin-exec`'s `join_output_schema`
+///   (`LeftSemi | LeftAnti => Arc::clone(left)`, the same fact enforced at
+///   execution time) — so an extra column on `residual`'s output can never
+///   reach a query's actual result, in the logical plan or the physical one.
+/// - `Aggregate`: [`rebase_corr_through_aggregate`] may only *reuse* an
+///   existing grouping key, never invent one — appending to `group` would
+///   change what the query groups by, silently changing which rows survive
+///   the aggregation, not merely which column reports a value (unlike
+///   `Project`, where an extra passthrough column changes nothing
+///   observable). A correlation column that is not already a grouping key
+///   makes this function refuse (`None`), which correctly falls all the way
+///   back through `decorrelate_exists_like`/`decorrelate_in` to leaving the
+///   subquery exactly as it was — see `correlated_..._under_an_aggregate_...`
+///   below for both the reuse and the refusal case.
+fn rebase_onto_residual(residual: &LogicalPlan, corr: Expr) -> Option<(LogicalPlan, Expr)> {
+    match residual {
+        LogicalPlan::Project { input, exprs } => {
+            let (new_input, corr) = rebase_onto_residual(input, corr)?;
+            let mut new_exprs = exprs.clone();
+            let corr = rebase_corr_through_project(&corr, &mut new_exprs);
+            Some((
+                LogicalPlan::Project {
+                    input: Box::new(new_input),
+                    exprs: new_exprs,
+                },
+                corr,
+            ))
+        }
+
+        LogicalPlan::Aggregate {
+            input,
+            group,
+            aggs,
+            grouping_sets,
+        } => {
+            let (new_input, corr) = rebase_onto_residual(input, corr)?;
+            let corr = rebase_corr_through_aggregate(&corr, group)?;
+            Some((
+                LogicalPlan::Aggregate {
+                    input: Box::new(new_input),
+                    group: group.clone(),
+                    aggs: aggs.clone(),
+                    grouping_sets: grouping_sets.clone(),
+                },
+                corr,
+            ))
+        }
+
+        // `Filter`/`Scan`/anything else `strip_correlation` can produce here
+        // is schema-transparent — `corr`'s indices already address it
+        // correctly, exactly the schema they were built against.
+        other => Some((other.clone(), corr)),
+    }
+}
+
+/// Rewrite every [`LOCAL_REF`] column `corr` references so it addresses
+/// `exprs` (a `Project`'s own output list) instead of `exprs`'s input —
+/// reusing the matching output position if the exact same input column is
+/// already projected, appending a new trailing `(column, name)` entry
+/// otherwise. [`OUTER_REF`] references pass through untouched: they are
+/// [`swap_relations`]'s job, later.
+fn rebase_corr_through_project(corr: &Expr, exprs: &mut Vec<(Expr, String)>) -> Expr {
+    map_columns(corr, &mut |c| {
+        if c.relation != LOCAL_REF {
+            return Expr::Column(c.clone());
+        }
+        let index = match exprs
+            .iter()
+            .position(|(e, _)| matches!(e, Expr::Column(ec) if ec.relation == c.relation && ec.index == c.index))
+        {
+            Some(pos) => pos as u16,
+            None => {
+                exprs.push((Expr::Column(c.clone()), c.name.clone()));
+                (exprs.len() - 1) as u16
+            }
+        };
+        Expr::Column(ColumnRef {
+            relation: LOCAL_REF,
+            index,
+            name: c.name.clone(),
+        })
+    })
+}
+
+/// Rewrite every [`LOCAL_REF`] column `corr` references so it addresses
+/// `group` (an `Aggregate`'s own grouping keys, which occupy its output's
+/// leading positions — see `decorrelate_scalar`'s own comment on
+/// `crate::schema::output_schema`'s Aggregate case) instead of `group`'s
+/// input. Returns `None` — refusing outright, the whole predicate, not a
+/// partial rewrite — the moment any referenced column is not already one of
+/// `group`'s own expressions: seeing a value in the aggregate's output that
+/// is not there today would mean inventing a new grouping key, which is not
+/// this function's call to make (see [`rebase_onto_residual`]'s docs).
+fn rebase_corr_through_aggregate(corr: &Expr, group: &[Expr]) -> Option<Expr> {
+    fn group_position(group: &[Expr], col: &ColumnRef) -> Option<usize> {
+        group
+            .iter()
+            .position(|g| matches!(g, Expr::Column(gc) if gc.relation == col.relation && gc.index == col.index))
+    }
+
+    let mut locals = Vec::new();
+    corr.any(&mut |e| {
+        if let Expr::Column(c) = e {
+            if c.relation == LOCAL_REF {
+                locals.push(c.clone());
+            }
+        }
+        false // never short-circuit: every reference must be checked.
+    });
+    for c in &locals {
+        group_position(group, c)?;
+    }
+
+    Some(map_columns(corr, &mut |c| {
+        if c.relation != LOCAL_REF {
+            return Expr::Column(c.clone());
+        }
+        let index = group_position(group, c).expect(
+            "checked above: every LOCAL_REF column in `corr` has a matching entry in `group`",
+        ) as u16;
+        Expr::Column(ColumnRef {
+            relation: LOCAL_REF,
+            index,
+            name: c.name.clone(),
+        })
+    }))
 }
 
 /// Whether `e` references [`OUTER_REF`] anywhere. Built on [`Expr::any`],
@@ -1098,23 +1385,36 @@ mod tests {
             "the correlation Filter must be stripped, leaving the bare scan"
         );
         assert_eq!(kind, JoinKind::LeftSemi);
-        assert!(on.is_empty());
-        // relation 0 = outer (was OUTER_REF inside the subplan), relation 1 =
-        // the new right side (was LOCAL_REF inside the subplan) — a clean
-        // swap. Names are carried through unchanged by the swap.
-        let expected = eq(
-            Expr::Column(ColumnRef {
-                relation: 1,
-                index: 0,
-                name: "c0".to_string(),
-            }),
-            Expr::Column(ColumnRef {
-                relation: 0,
-                index: 0,
-                name: "outer0".to_string(),
-            }),
+        // A plain correlated equality must become a hash-joinable `on` pair,
+        // not sit in `filter` — `basin-exec`'s physical builder rejects any
+        // `Join` whose `filter` is non-empty outright, so an unsplit
+        // correlation predicate here would make this EXISTS unbuildable
+        // (see `split_join_conjuncts`'s module-doc entry for the full
+        // story). `on.0` is indexed against the left input's own schema,
+        // `on.1` against the right's — both starting at 0, not a flat index
+        // into the concatenated schema — so relation 0 (left/outer) and
+        // relation 1 (right/residual) carried alongside them here are
+        // redundant with tuple position but kept for the same reason
+        // `decorrelate_scalar`'s own `on` construction keeps them.
+        assert_eq!(
+            on,
+            vec![(
+                Expr::Column(ColumnRef {
+                    relation: 0,
+                    index: 0,
+                    name: "outer0".to_string(),
+                }),
+                Expr::Column(ColumnRef {
+                    relation: 1,
+                    index: 0,
+                    name: "c0".to_string(),
+                }),
+            )]
         );
-        assert_eq!(filter, Some(expected));
+        assert!(
+            filter.is_none(),
+            "the whole correlation predicate folded into `on`; nothing should be left over"
+        );
     }
 
     // ── Transform 2: NOT EXISTS ────────────────────────────────────────
@@ -1163,22 +1463,362 @@ mod tests {
             panic!("expected a Join, got {rewritten:?}");
         };
         assert_eq!(kind, JoinKind::LeftSemi);
-        assert!(on.is_empty());
 
+        // Both the correlation predicate and the `IN` membership check it
+        // was combined with are plain equalities addressing exactly one
+        // side each, so both fold into `on` — same reasoning as
+        // `correlated_exists_becomes_left_semi_join`, applied twice.
         let value_col = Expr::Column(ColumnRef {
             relation: 1,
             index: 0,
             name: "in_value".to_string(),
         });
-        // The correlation predicate, swapped: relation 1 = the residual's own
-        // scope (was LOCAL_REF inside the subplan), relation 0 = the new
-        // join's left/outer side (was OUTER_REF). Names are carried through
-        // unchanged.
-        let corr_swapped = eq(
+        assert_eq!(
+            on,
+            vec![
+                (
+                    Expr::Column(ColumnRef {
+                        relation: 0,
+                        index: 0,
+                        name: "outer0".to_string(),
+                    }),
+                    Expr::Column(ColumnRef {
+                        relation: 1,
+                        index: 1,
+                        name: "c1".to_string(),
+                    }),
+                ),
+                (x, value_col),
+            ]
+        );
+        assert!(filter.is_none());
+    }
+
+    /// The same shape as `correlated_in_becomes_left_semi_with_extra_join_condition`
+    /// but with the residual left as a bare single-column scan (no `Project`
+    /// renaming it) — isolates the `on`/`filter` split itself from
+    /// `strip_correlation`'s separate, known limitation with a correlation
+    /// column that a `Project` above it does not carry (see "What this file
+    /// does not do" in the module docs), so this test's per-side indices are
+    /// unambiguously checkable against the actual join inputs.
+    #[test]
+    fn correlated_in_with_no_intervening_project_has_non_empty_on_and_empty_filter() {
+        // WHERE x IN (SELECT v FROM t WHERE t.v = outer.b)
+        let subplan = LogicalPlan::Filter {
+            input: Box::new(scan(2, vec![ColId(0)])),
+            predicate: eq(col(0), outer_col(0)),
+        };
+        let x = col(0);
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan(1, vec![ColId(0)])),
+            predicate: in_subquery(x.clone(), subplan),
+        };
+
+        let rewritten = Decorrelate.rewrite(&plan).expect("must decorrelate");
+        let LogicalPlan::Join {
+            left,
+            right,
+            kind,
+            on,
+            filter,
+        } = rewritten
+        else {
+            panic!("expected a Join, got {rewritten:?}");
+        };
+        assert_eq!(*left, scan(1, vec![ColId(0)]));
+        assert_eq!(*right, scan(2, vec![ColId(0)]));
+        assert_eq!(kind, JoinKind::LeftSemi);
+        assert_eq!(
+            on,
+            vec![
+                (
+                    Expr::Column(ColumnRef {
+                        relation: 0,
+                        index: 0,
+                        name: "outer0".to_string(),
+                    }),
+                    Expr::Column(ColumnRef {
+                        relation: 1,
+                        index: 0,
+                        name: "c0".to_string(),
+                    }),
+                ),
+                (
+                    x,
+                    Expr::Column(ColumnRef {
+                        relation: 1,
+                        index: 0,
+                        name: "in_value".to_string(),
+                    }),
+                ),
+            ]
+        );
+        assert!(filter.is_none());
+    }
+
+    /// SCRATCH VERIFICATION (coordinator's mechanism check, run against the
+    /// pre-rebase code before the fix below existed): `SELECT * FROM t WHERE
+    /// t.id IN (SELECT u.val FROM u WHERE u.owner = t.id)`. The subquery's
+    /// `SELECT` list (`val`) does not contain the correlation column
+    /// (`owner`) at all — the common shape, not an edge case, for a
+    /// correlated `IN`.
+    #[test]
+    fn correlated_in_where_the_subquery_selects_a_different_column_than_it_correlates_on() {
+        let owner = Expr::Column(ColumnRef {
+            relation: LOCAL_REF,
+            index: 0,
+            name: "owner".to_string(),
+        });
+        let val = Expr::Column(ColumnRef {
+            relation: LOCAL_REF,
+            index: 1,
+            name: "val".to_string(),
+        });
+        let subplan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan(2, vec![ColId(0), ColId(1)])),
+                predicate: eq(owner, outer_col(0)),
+            }),
+            exprs: vec![(val, "val".to_string())],
+        };
+        let x = col(0); // t.id
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan(1, vec![ColId(0)])),
+            predicate: in_subquery(x, subplan),
+        };
+
+        let rewritten = Decorrelate.rewrite(&plan).expect("must decorrelate");
+        let LogicalPlan::Join { right, on, .. } = rewritten else {
+            panic!("expected a Join");
+        };
+        let LogicalPlan::Project { exprs, .. } = right.as_ref() else {
+            panic!("expected the residual to still be the Project, got {right:?}");
+        };
+        // The correlation's `on` pair is the one whose left side is the
+        // outer reference (relation 0) — distinguishes it from the `IN`
+        // membership pair, whose left side is `x`/`t.id`.
+        let corr_pair = on
+            .iter()
+            .find(|(l, _)| matches!(l, Expr::Column(c) if c.name == "outer0"))
+            .expect("the correlation must still be present as an on pair");
+        let Expr::Column(right_col) = &corr_pair.1 else {
+            panic!("expected the correlation's right side to be a column");
+        };
+        let resolved_name = &exprs
+            .get(right_col.index as usize)
+            .expect("index must be in range for the residual's actual output")
+            .1;
+        assert_eq!(
+            resolved_name, "owner",
+            "the correlation `owner = t.id` must resolve to the owner column of the \
+             residual's actual built output, not whatever else happens to sit at that index \
+             (index {} currently names {resolved_name:?})",
+            right_col.index
+        );
+    }
+
+    /// Same mechanism, `EXISTS` flavor: `EXISTS (SELECT 1 FROM u WHERE
+    /// u.owner = t.id)`. The subquery's sole output column is a literal —
+    /// there is no "owner" column in the projected output at all, so the
+    /// correlation cannot be expressed against it without widening.
+    #[test]
+    fn correlated_exists_over_select_1_resolves_the_correlation_not_the_literal() {
+        let owner = Expr::Column(ColumnRef {
+            relation: LOCAL_REF,
+            index: 0,
+            name: "owner".to_string(),
+        });
+        let subplan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan(2, vec![ColId(0)])),
+                predicate: eq(owner, outer_col(0)),
+            }),
+            exprs: vec![(lit(1), "?column?".to_string())],
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan(1, vec![ColId(0)])),
+            predicate: exists(subplan),
+        };
+
+        let rewritten = Decorrelate.rewrite(&plan).expect("must decorrelate");
+        let LogicalPlan::Join { right, on, .. } = rewritten else {
+            panic!("expected a Join");
+        };
+        let LogicalPlan::Project { exprs, .. } = right.as_ref() else {
+            panic!("expected the residual to still be the Project, got {right:?}");
+        };
+        let corr_pair = on
+            .first()
+            .expect("the plain correlated equality must fold into `on`");
+        let Expr::Column(right_col) = &corr_pair.1 else {
+            panic!("expected the correlation's right side to be a column");
+        };
+        let resolved_name = &exprs
+            .get(right_col.index as usize)
+            .expect("index must be in range for the residual's actual output")
+            .1;
+        assert_eq!(
+            resolved_name, "owner",
+            "the correlation must resolve to the owner column, not the literal `1` \
+             (index {} currently names {resolved_name:?})",
+            right_col.index
+        );
+    }
+
+    /// When the correlation column is *also* the column the subquery already
+    /// selects (`x IN (SELECT id FROM t WHERE t.id = outer.y)`), rebasing
+    /// must reuse that existing output position rather than appending a
+    /// second, redundant copy of the same column.
+    #[test]
+    fn a_correlation_column_already_in_the_projection_is_reused_not_appended_twice() {
+        let subplan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan(2, vec![ColId(0)])),
+                predicate: eq(col(0), outer_col(0)),
+            }),
+            exprs: vec![(col(0), "id".to_string())],
+        };
+        let x = col(0);
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan(1, vec![ColId(0)])),
+            predicate: in_subquery(x.clone(), subplan),
+        };
+
+        let rewritten = Decorrelate.rewrite(&plan).expect("must decorrelate");
+        let LogicalPlan::Join { right, on, .. } = rewritten else {
+            panic!("expected a Join");
+        };
+        let LogicalPlan::Project { exprs, .. } = right.as_ref() else {
+            panic!("expected the residual to still be the Project, got {right:?}");
+        };
+        assert_eq!(
+            exprs.len(),
+            1,
+            "the correlation column was already projected; rebasing must not append a \
+             second copy of it — got {exprs:?}"
+        );
+        let corr_pair = on
+            .iter()
+            .find(|(l, _)| matches!(l, Expr::Column(c) if c.name == "outer0"))
+            .expect("the correlation must still be present as an on pair");
+        let Expr::Column(right_col) = &corr_pair.1 else {
+            panic!("expected the correlation's right side to be a column");
+        };
+        assert_eq!(
+            right_col.index, 0,
+            "the correlation must resolve to the existing (sole) projected column"
+        );
+    }
+
+    /// A correlation column that is not one of the subquery's own `GROUP BY`
+    /// keys cannot be expressed against an `Aggregate`'s output at all
+    /// (`owner` does not survive grouping by `dept_id` — it is not a
+    /// per-group scalar). Appending it to `group` the way `Project`
+    /// widening does would silently change the query's grouping and thus
+    /// its results, so this must refuse the whole decorrelation instead —
+    /// the query keeps evaluating the subquery per outer row, correctly.
+    #[test]
+    fn correlated_subquery_under_an_aggregate_where_the_correlation_is_not_a_grouping_key_refuses()
+    {
+        // EXISTS (SELECT 1 FROM t WHERE t.owner = outer.b GROUP BY t.dept_id)
+        let subplan = LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan(2, vec![ColId(0), ColId(1)])), // owner, dept_id
+                predicate: eq(col(0), outer_col(0)),                // correlated on owner
+            }),
+            group: vec![col(1)], // grouped by dept_id — a different column
+            aggs: vec![],
+            grouping_sets: None,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan(1, vec![ColId(0)])),
+            predicate: exists(subplan),
+        };
+
+        assert!(
+            Decorrelate.rewrite(&plan).is_none(),
+            "the correlation column is not a grouping key; this must refuse rather than \
+             invent one by widening `group`"
+        );
+    }
+
+    /// The companion positive case: when the correlation column *is* one of
+    /// the `Aggregate`'s own grouping keys, the correlation rebases onto
+    /// that key's position in the aggregate's output — which is generally a
+    /// *different* index than the column's position in the raw input
+    /// schema (grouping keys are renumbered starting at 0 in `group`'s own
+    /// order, per `crate::schema::output_schema`'s Aggregate case), proving
+    /// this is a real rebase rather than a no-op that happens to look like
+    /// one.
+    #[test]
+    fn correlated_subquery_under_an_aggregate_where_the_correlation_is_the_grouping_key_rebases() {
+        // EXISTS (SELECT 1 FROM t WHERE t.dept_id = outer.b GROUP BY t.dept_id)
+        // `dept_id` is raw input column 1, but the sole grouping key, so it
+        // is the aggregate's own output column 0.
+        let subplan = LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(scan(2, vec![ColId(0), ColId(1)])), // owner, dept_id
+                predicate: eq(col(1), outer_col(0)),                // correlated on dept_id
+            }),
+            group: vec![col(1)],
+            aggs: vec![],
+            grouping_sets: None,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan(1, vec![ColId(0)])),
+            predicate: exists(subplan),
+        };
+
+        let rewritten = Decorrelate.rewrite(&plan).expect("must decorrelate");
+        let LogicalPlan::Join { on, filter, .. } = rewritten else {
+            panic!("expected a Join");
+        };
+        assert!(filter.is_none());
+        let corr_pair = on
+            .first()
+            .expect("the plain correlated equality must fold into `on`");
+        let Expr::Column(right_col) = &corr_pair.1 else {
+            panic!("expected the correlation's right side to be a column");
+        };
+        assert_eq!(
+            right_col.index, 0,
+            "dept_id is raw column 1 but the aggregate's *own output* position 0 (its only \
+             grouping key) — the correlation must resolve to the rebased position, not the \
+             original raw index"
+        );
+    }
+
+    /// A correlation that is not an equality (`>`, here) must never become a
+    /// hash-join key — a hash join only ever tests equality — so it has to
+    /// stay in `filter` even though that means this particular EXISTS still
+    /// cannot be built by `basin-exec` today. `split_join_conjuncts` reports
+    /// this honestly rather than folding it into `on` just to make the join
+    /// buildable with the wrong semantics.
+    #[test]
+    fn a_non_equality_correlation_stays_in_filter_not_on() {
+        // WHERE EXISTS (SELECT ... FROM t WHERE t.a > outer.b)
+        let subplan = LogicalPlan::Filter {
+            input: Box::new(scan(2, vec![ColId(0)])),
+            predicate: gt(col(0), outer_col(0)),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan(1, vec![ColId(0)])),
+            predicate: exists(subplan),
+        };
+
+        let rewritten = Decorrelate.rewrite(&plan).expect("must decorrelate");
+        let LogicalPlan::Join { on, filter, .. } = rewritten else {
+            panic!("expected a Join, got {rewritten:?}");
+        };
+        assert!(
+            on.is_empty(),
+            "a non-equality correlation must never become a join key"
+        );
+        let expected = gt(
             Expr::Column(ColumnRef {
                 relation: 1,
-                index: 1,
-                name: "c1".to_string(),
+                index: 0,
+                name: "c0".to_string(),
             }),
             Expr::Column(ColumnRef {
                 relation: 0,
@@ -1186,12 +1826,62 @@ mod tests {
                 name: "outer0".to_string(),
             }),
         );
-        let membership = Expr::Binary {
-            op: IN_EQ_OP,
-            lhs: Box::new(x),
-            rhs: Box::new(value_col),
+        assert_eq!(filter, Some(expected));
+    }
+
+    /// A correlation predicate with two conjuncts — one a plain equality,
+    /// one not — must split per-conjunct: the equality folds into `on`
+    /// while the other stays behind in `filter` above it, rather than an
+    /// all-or-nothing decision for the whole predicate.
+    #[test]
+    fn a_mixed_correlation_splits_the_equality_into_on_and_leaves_the_rest_in_filter() {
+        // WHERE EXISTS (SELECT ... FROM t WHERE t.a = outer.b AND t.c > outer.d)
+        let subplan = LogicalPlan::Filter {
+            input: Box::new(scan(2, vec![ColId(0), ColId(1)])),
+            predicate: and(eq(col(0), outer_col(0)), gt(col(1), outer_col(1))),
         };
-        assert_eq!(filter, Some(and(corr_swapped, membership)));
+        let plan = LogicalPlan::Filter {
+            input: Box::new(scan(1, vec![ColId(0), ColId(1)])),
+            predicate: exists(subplan),
+        };
+
+        let rewritten = Decorrelate.rewrite(&plan).expect("must decorrelate");
+        let LogicalPlan::Join { on, filter, .. } = rewritten else {
+            panic!("expected a Join, got {rewritten:?}");
+        };
+        assert_eq!(
+            on,
+            vec![(
+                Expr::Column(ColumnRef {
+                    relation: 0,
+                    index: 0,
+                    name: "outer0".to_string(),
+                }),
+                Expr::Column(ColumnRef {
+                    relation: 1,
+                    index: 0,
+                    name: "c0".to_string(),
+                }),
+            )],
+            "the equality conjunct must fold into `on`"
+        );
+        let expected_filter = gt(
+            Expr::Column(ColumnRef {
+                relation: 1,
+                index: 1,
+                name: "c1".to_string(),
+            }),
+            Expr::Column(ColumnRef {
+                relation: 0,
+                index: 1,
+                name: "outer1".to_string(),
+            }),
+        );
+        assert_eq!(
+            filter,
+            Some(expected_filter),
+            "the non-equality conjunct must stay behind in `filter`"
+        );
     }
 
     // ── Trap 1: NOT IN ──────────────────────────────────────────────────
