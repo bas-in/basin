@@ -135,6 +135,7 @@ pub fn lower_expr(node: &Node, ctx: &LowerCtx) -> Result<Expr, LowerError> {
         Some(NodeEnum::RowExpr(re)) => lower_row_expr(re, ctx),
         Some(NodeEnum::AIndirection(ai)) => lower_a_indirection(ai, ctx),
         Some(NodeEnum::ParamRef(pr)) => lower_param_ref(pr),
+        Some(NodeEnum::MinMaxExpr(mm)) => lower_min_max_expr(mm, ctx),
         Some(other) => Err(LowerError::Unsupported(format!(
             "{} is not yet lowered",
             node_kind_name(other)
@@ -149,7 +150,6 @@ pub fn lower_expr(node: &Node, ctx: &LowerCtx) -> Result<Expr, LowerError> {
 /// than failing to compile an error message.
 fn node_kind_name(n: &NodeEnum) -> &'static str {
     match n {
-        NodeEnum::MinMaxExpr(_) => "GREATEST/LEAST",
         NodeEnum::SqlvalueFunction(_) => "a SQL value function (CURRENT_DATE and friends)",
         NodeEnum::GroupingFunc(_) => "GROUPING(...)",
         NodeEnum::WindowDef(_) => "a window definition",
@@ -293,6 +293,7 @@ fn lower_a_expr(ae: &AExpr, ctx: &LowerCtx) -> Result<Expr, LowerError> {
             lower_aexpr_distinct(ae, ctx, kind)
         }
         AExprKind::AexprOpAny | AExprKind::AexprOpAll => lower_aexpr_any_all(ae, ctx, kind),
+        AExprKind::AexprNullif => lower_aexpr_nullif(ae, ctx),
         _ => Err(LowerError::Unsupported(format!(
             "A_Expr kind {kind:?} is not yet lowered"
         ))),
@@ -541,6 +542,54 @@ fn lower_aexpr_distinct(ae: &AExpr, ctx: &LowerCtx, kind: AExprKind) -> Result<E
     })
 }
 
+/// `NULLIF(a, b)`.
+///
+/// Parses as `AEXPR_NULLIF` with `name = ["="]` — confirmed against a live
+/// parse of `NULLIF(id, 1)`, not assumed — i.e. Postgres represents this
+/// using the exact same `=` it would resolve for a plain `a = b`, which is
+/// exactly the trap to get right: the comparison must go through the real
+/// equality operator (so `NULLIF('1'::int, '01'::int)` compares equal, and a
+/// mismatched-type pair like `NULLIF(int8col, 1)` widens the same way
+/// `int8col = 1` does), not a hand-rolled value comparison.
+///
+/// `NULLIF(a, b)` is exactly `CASE WHEN a = b THEN NULL ELSE a END` —
+/// Postgres's own `transformAExprOp`/`makeSimpleAExpr` desugars it to
+/// precisely that internally — so this returns an ordinary `Expr::Case`
+/// rather than a dedicated variant; nothing downstream of lowering needs to
+/// know this used to be spelled `NULLIF`, and `eval.rs`'s existing CASE
+/// evaluation (including its branch-type unification — see
+/// `eval_branches_unified`) already does the right thing with it for free.
+/// This is also what makes the result type come out right with no extra
+/// work: `NULLIF` returns **`a`'s own type**, never a type unified between
+/// `a` and `b` (confirmed against a live PostgreSQL 18:
+/// `pg_typeof(NULLIF(1::int8, 2::int4))` is `bigint`) — which falls out
+/// automatically here because only `a` (never `b`) ever appears in a result
+/// position; `eval_branches_unified` skips the `unknown`-typed `NULL`
+/// branch and settles on `a`'s type as the only concretely-typed one.
+///
+/// `a` is referenced twice below (the comparison, and the `ELSE`), so a
+/// volatile `a` (e.g. a stable-but-not-immutable function call) would be
+/// evaluated twice rather than the once Postgres's own `NullIfExpr` node
+/// guarantees. Documented here rather than hidden, the same way the CASE
+/// short-circuit gap is documented on [`lower_case_expr`] — not a concern
+/// for the column/literal arguments real queries overwhelmingly use.
+fn lower_aexpr_nullif(ae: &AExpr, ctx: &LowerCtx) -> Result<Expr, LowerError> {
+    let (a, b) = lower_binary_operands(ae, ctx)?;
+    let op = resolve_op(ctx, "=", Some(&a), &b)?;
+    Ok(Expr::Case {
+        operand: None,
+        whens: vec![(
+            Expr::Binary {
+                op,
+                lhs: Box::new(a.clone()),
+                rhs: Box::new(b),
+            },
+            Expr::null_unknown(),
+        )],
+        else_: Some(Box::new(a)),
+    })
+}
+
 fn lower_aexpr_op(ae: &AExpr, ctx: &LowerCtx) -> Result<Expr, LowerError> {
     let name = operator_name(&ae.name)?;
     let rhs_node = ae
@@ -777,6 +826,110 @@ fn lower_coalesce_expr(
         .map(|n| lower_expr(n, ctx))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Expr::Coalesce(args))
+}
+
+// ─── MinMaxExpr (GREATEST / LEAST) ────────────────────────────────────────
+
+/// `GREATEST(a1, a2, ...)` / `LEAST(a1, a2, ...)`.
+///
+/// Parses as its own dedicated `MinMaxExpr` node (`op: IS_GREATEST` /
+/// `IS_LEAST`, `minmaxtype` still unset — confirmed against a live parse:
+/// type resolution happens at parse-analysis time, which this crate does
+/// not have a catalog for either), not a `FuncCall` — so this is handled
+/// here rather than through [`FunctionResolver`].
+///
+/// There is no dedicated `Expr` variant for this (see `basin_plan::Expr`'s
+/// module doc on the SQL-surface-driven scope: add one when it earns its
+/// place, not speculatively) — GREATEST/LEAST reduce exactly to a pairwise
+/// fold anyway: `GREATEST(a,b,c) = GREATEST(GREATEST(a,b), c)`. **The trap**
+/// (confirmed against a live PostgreSQL 18: `GREATEST(1, NULL, 3) = 3`,
+/// `GREATEST(NULL, NULL) IS NULL`) is that `GREATEST`/`LEAST` IGNORE NULLs,
+/// unlike almost every other construct in SQL — a NULL argument only
+/// survives to the final answer if EVERY argument was NULL. Each pairwise
+/// step captures exactly that:
+///
+/// ```text
+/// CASE WHEN acc  IS NULL THEN next
+///      WHEN next IS NULL THEN acc
+///      WHEN acc > next   THEN acc      -- `<` for LEAST
+///      ELSE next
+/// END
+/// ```
+///
+/// `>`/`<` is resolved once per pairwise step through the ordinary
+/// `OperatorResolver` seam, exactly like any other comparison — the
+/// mismatched-argument-type widening `eval.rs`'s `eval_binary` already does
+/// for `id > 1` covers `GREATEST(id, 2)` for free, so this does not
+/// duplicate it, and `eval_case`'s branch-type unification
+/// (`eval_branches_unified`) settles what Arrow type the whole expression
+/// comes out as.
+///
+/// `acc` and `next` are each referenced three times in the fold step above,
+/// so an argument that survives N pairwise steps is evaluated up to 3^N
+/// times — cheap for the columns/literals real queries overwhelmingly pass,
+/// wasteful (and, for a volatile argument, outright wrong — same honestly
+/// documented limitation as [`lower_aexpr_nullif`]) for a `GREATEST` over
+/// many arguments. A dedicated `Expr::MinMax` variant evaluated in one pass
+/// would not have either cost, and is the natural next increment if that
+/// turns out to matter in practice.
+fn lower_min_max_expr(
+    mm: &pg_query::protobuf::MinMaxExpr,
+    ctx: &LowerCtx,
+) -> Result<Expr, LowerError> {
+    use pg_query::protobuf::MinMaxOp;
+
+    let is_greatest = match MinMaxOp::try_from(mm.op).unwrap_or(MinMaxOp::Undefined) {
+        MinMaxOp::IsGreatest => true,
+        MinMaxOp::IsLeast => false,
+        MinMaxOp::Undefined => return Err(LowerError::Malformed("MinMaxExpr with unknown op")),
+    };
+    let cmp_name = if is_greatest { ">" } else { "<" };
+
+    let mut args = mm
+        .args
+        .iter()
+        .map(|n| lower_expr(n, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    if args.is_empty() {
+        return Err(LowerError::Malformed(
+            "GREATEST/LEAST with no arguments — the SQL grammar requires at least one",
+        ));
+    }
+
+    let mut iter = args.drain(..);
+    let mut acc = iter.next().expect("checked non-empty above");
+    for next in iter {
+        let op = resolve_op(ctx, cmp_name, Some(&acc), &next)?;
+        acc = Expr::Case {
+            operand: None,
+            whens: vec![
+                (
+                    Expr::IsNull {
+                        arg: Box::new(acc.clone()),
+                        negated: false,
+                    },
+                    next.clone(),
+                ),
+                (
+                    Expr::IsNull {
+                        arg: Box::new(next.clone()),
+                        negated: false,
+                    },
+                    acc.clone(),
+                ),
+                (
+                    Expr::Binary {
+                        op,
+                        lhs: Box::new(acc.clone()),
+                        rhs: Box::new(next.clone()),
+                    },
+                    acc.clone(),
+                ),
+            ],
+            else_: Some(Box::new(next)),
+        };
+    }
+    Ok(acc)
 }
 
 // ─── TypeCast ─────────────────────────────────────────────────────────────
@@ -1399,6 +1552,24 @@ mod tests {
         }
     }
 
+    /// A resolved reference to one of `cols()`'s columns, for asserting the
+    /// exact `Expr` a lowering produced rather than just its shape.
+    fn col(index: u16, name: &str) -> Expr {
+        Expr::Column(ColumnRef {
+            relation: 0,
+            index,
+            name: name.to_string(),
+        })
+    }
+
+    fn col_a() -> Expr {
+        col(1, "a")
+    }
+
+    fn col_b() -> Expr {
+        col(2, "b")
+    }
+
     fn parse_expr(sql: &str) -> Node {
         let stmt_sql = format!("SELECT {sql}");
         let result = pg_query::parse(&stmt_sql).expect("parse failed");
@@ -1695,18 +1866,18 @@ mod tests {
 
     #[test]
     fn an_unhandled_node_kind_is_unsupported_with_a_precise_message() {
-        // GREATEST/LEAST get their own dedicated `MinMaxExpr` node in
-        // Postgres's grammar (not a `FuncCall`) and are out of this file's
-        // scope entirely.
-        let node = parse_expr("GREATEST(a, b)");
+        // `CURRENT_DATE` and friends get their own dedicated
+        // `SqlValueFunction` node in Postgres's grammar and are out of this
+        // file's scope entirely (see `node_kind_name`).
+        let node = parse_expr("CURRENT_DATE");
         let c = cols();
         let o = CatalogOperators;
-        let err = lower_expr(&node, &ctx(&c, &o)).expect_err("MinMaxExpr not yet lowered");
+        let err = lower_expr(&node, &ctx(&c, &o)).expect_err("SqlValueFunction not yet lowered");
         let LowerError::Unsupported(msg) = err else {
             panic!("expected Unsupported, got {err:?}");
         };
         assert!(
-            msg.contains("GREATEST"),
+            msg.contains("SQL value function"),
             "message should name the construct: {msg}"
         );
     }
@@ -2271,6 +2442,179 @@ mod tests {
         let err = lower_expr(&parse_expr("(ROW(1, 2)).f1"), &ctx(&c, &o))
             .expect_err("field access needs a type catalog");
         assert!(matches!(err, LowerError::Unsupported(_)));
+    }
+
+    // --- NULLIF ----------------------------------------------------------------
+
+    #[test]
+    fn nullif_desugars_to_a_case_using_the_real_equality_operator() {
+        let c = cols();
+        let o = CatalogOperators;
+        // The equality operator NULLIF(a, b) must use is exactly the one an
+        // ordinary `a = b` resolves to — comparing against that, rather than
+        // a hardcoded oid, is what proves this without assuming which
+        // `pg_operator` row `CatalogOperators` picks for two same-named mock
+        // columns.
+        let eq_op = match lower_expr(&parse_expr("a = b"), &ctx(&c, &o)).unwrap() {
+            Expr::Binary { op, .. } => op,
+            other => panic!("expected Binary, got {other:?}"),
+        };
+
+        let e = lower_expr(&parse_expr("NULLIF(a, b)"), &ctx(&c, &o)).unwrap();
+        let Expr::Case {
+            operand,
+            whens,
+            else_,
+        } = e
+        else {
+            panic!("expected Case, got {e:?}");
+        };
+        assert!(
+            operand.is_none(),
+            "NULLIF is a searched CASE, not a simple one"
+        );
+        assert_eq!(whens.len(), 1, "NULLIF has exactly one WHEN arm");
+        let (cond, then) = &whens[0];
+        match cond {
+            Expr::Binary { op, lhs, rhs } => {
+                assert_eq!(*op, eq_op);
+                assert_eq!(**lhs, col_a());
+                assert_eq!(**rhs, col_b());
+            }
+            other => panic!("expected the WHEN condition to be `a = b`, got {other:?}"),
+        }
+        assert_eq!(
+            *then,
+            Expr::null_unknown(),
+            "the matched branch is an untyped NULL, resolved to `a`'s type at eval time"
+        );
+        assert_eq!(
+            else_.as_deref(),
+            Some(&col_a()),
+            "the ELSE branch is `a` itself, which is what makes the result NULLIF's own `a`'s type"
+        );
+    }
+
+    #[test]
+    fn nullif_over_incomparable_types_is_no_matching_operator() {
+        // `a` and `b` are both `unknown` under `MockColumns`, so this can
+        // only be exercised with a genuinely incomparable pair — a
+        // string-vs-integer literal `NULLIF`, which has no `=` operator to
+        // resolve, the same way a bare `'x' = 5` would not.
+        let c = cols();
+        let o = CatalogOperators;
+        let err = lower_expr(&parse_expr("NULLIF(true, 1)"), &ctx(&c, &o))
+            .expect_err("bool = int4 has no pg_operator row");
+        assert!(matches!(err, LowerError::NoMatchingOperator(_)));
+    }
+
+    // --- GREATEST / LEAST -------------------------------------------------------
+
+    #[test]
+    fn greatest_desugars_to_a_null_ignoring_case_using_the_real_greater_than_operator() {
+        let c = cols();
+        let o = CatalogOperators;
+        let gt_op = match lower_expr(&parse_expr("a > b"), &ctx(&c, &o)).unwrap() {
+            Expr::Binary { op, .. } => op,
+            other => panic!("expected Binary, got {other:?}"),
+        };
+
+        let e = lower_expr(&parse_expr("GREATEST(a, b)"), &ctx(&c, &o)).unwrap();
+        let Expr::Case {
+            operand,
+            whens,
+            else_,
+        } = e
+        else {
+            panic!("expected Case, got {e:?}");
+        };
+        assert!(operand.is_none());
+        assert_eq!(
+            whens.len(),
+            3,
+            "IS NULL guard on each side, then the comparison"
+        );
+        assert_eq!(
+            whens[0],
+            (
+                Expr::IsNull {
+                    arg: Box::new(col_a()),
+                    negated: false
+                },
+                col_b()
+            ),
+            "a NULL first argument must not win — fall through to b"
+        );
+        assert_eq!(
+            whens[1],
+            (
+                Expr::IsNull {
+                    arg: Box::new(col_b()),
+                    negated: false
+                },
+                col_a()
+            ),
+            "a NULL second argument must not win — fall through to a"
+        );
+        match &whens[2].0 {
+            Expr::Binary { op, lhs, rhs } => {
+                assert_eq!(*op, gt_op, "GREATEST compares with `>`, not `<`");
+                assert_eq!(**lhs, col_a());
+                assert_eq!(**rhs, col_b());
+            }
+            other => panic!("expected `a > b`, got {other:?}"),
+        }
+        assert_eq!(whens[2].1, col_a());
+        assert_eq!(else_.as_deref(), Some(&col_b()));
+    }
+
+    #[test]
+    fn least_uses_less_than_not_greater_than() {
+        let c = cols();
+        let o = CatalogOperators;
+        let lt_op = match lower_expr(&parse_expr("a < b"), &ctx(&c, &o)).unwrap() {
+            Expr::Binary { op, .. } => op,
+            other => panic!("expected Binary, got {other:?}"),
+        };
+        let e = lower_expr(&parse_expr("LEAST(a, b)"), &ctx(&c, &o)).unwrap();
+        let Expr::Case { whens, .. } = e else {
+            panic!("expected Case");
+        };
+        match &whens[2].0 {
+            Expr::Binary { op, .. } => assert_eq!(*op, lt_op),
+            other => panic!("expected a `<` comparison, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn greatest_over_three_arguments_folds_pairwise_left_to_right() {
+        // GREATEST(a, b, id) = GREATEST(GREATEST(a, b), id) — the outermost
+        // node's fold step compares the *previous* CASE (not a bare column)
+        // against `id`.
+        let c = cols();
+        let o = CatalogOperators;
+        let e = lower_expr(&parse_expr("GREATEST(a, b, id)"), &ctx(&c, &o)).unwrap();
+        let Expr::Case { whens, else_, .. } = e else {
+            panic!("expected Case");
+        };
+        // The ELSE of the outer fold step is the third argument, `id`.
+        assert_eq!(
+            else_.as_deref(),
+            Some(&col(0, "id")),
+            "the outer fold's ELSE is the newest argument"
+        );
+        // Its first IS NULL guard's `arg` is the nested GREATEST(a, b), not
+        // a plain column — proof this really is a fold, not three flattened
+        // arguments.
+        match &whens[0].0 {
+            Expr::IsNull { arg, .. } => {
+                assert!(
+                    matches!(**arg, Expr::Case { .. }),
+                    "expected the accumulator from GREATEST(a, b) to be a nested Case, got {arg:?}"
+                );
+            }
+            other => panic!("expected IsNull, got {other:?}"),
+        }
     }
 
     // --- ParamRef ------------------------------------------------------------

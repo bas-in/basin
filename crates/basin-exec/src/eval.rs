@@ -54,6 +54,21 @@
 //!    `or_kleene`/`and_kleene` rather than a dedicated kernel, which is what
 //!    makes `2 IN (1, NULL)` come out NULL instead of FALSE "for free" — it
 //!    falls out of Kleene `OR` the same way `NULL OR FALSE = NULL` does.
+//! 7. **CASE/COALESCE branch typing.** Postgres resolves a CASE's or
+//!    COALESCE's result type once, across every branch together
+//!    (`select_common_type`), not from whichever branch happens to be first
+//!    or happens to run first. [`eval_branches_unified`] is the one place
+//!    that unification happens: an `unknown`-typed branch (a bare
+//!    string/NULL literal) takes whatever type the other branches settle
+//!    on — falling back to `text` if every branch is `unknown`, Postgres's
+//!    own fallback — and mismatched concrete numeric branches widen the same
+//!    way [`unify_numeric`] widens a binary operator's two operands.
+//!    `GREATEST`/`LEAST` (`basin_plan::lower::expr::lower_min_max_expr`)
+//!    desugar to nested `CASE` at lowering time and ride this for free.
+//!    [`eval_case`]'s own doc comment is honest about the one thing this
+//!    file does NOT get right for CASE: no short-circuiting, so a branch
+//!    that only Postgres's laziness protects from erroring (division by the
+//!    guarded-against value, e.g.) can raise here where Postgres would not.
 //!
 //! # What is deliberately absent
 //!
@@ -558,31 +573,44 @@ fn eval_operand_against(
 /// and silently narrowing here would turn a comparison into a wrong answer.
 /// A pair this cannot unify is left alone so the kernel reports the mismatch.
 fn unify_numeric(l: ArrayRef, r: ArrayRef) -> Result<(ArrayRef, ArrayRef), ExecError> {
-    use arrow_schema::DataType as DT;
-    /// Rank within the widening chain. `None` means "not part of it", which
-    /// includes decimals — those carry precision and scale that a rank cannot
-    /// express, so they are deliberately excluded rather than approximated.
-    fn rank(dt: &DT) -> Option<u8> {
-        Some(match dt {
-            DT::Int8 | DT::Int16 => 1,
-            DT::Int32 => 2,
-            DT::Int64 => 3,
-            DT::Float32 => 4,
-            DT::Float64 => 5,
-            _ => return None,
-        })
-    }
     let (lt, rt) = (l.data_type().clone(), r.data_type().clone());
     if lt == rt {
         return Ok((l, r));
     }
-    let (Some(lr), Some(rr)) = (rank(&lt), rank(&rt)) else {
+    let Some(target) = wider_numeric_type(&lt, &rt) else {
         return Ok((l, r));
     };
-    let target = if lr >= rr { lt } else { rt };
     let l = cast::cast(&l, &target).map_err(|e| map_arrow(e, "implicit widening"))?;
     let r = cast::cast(&r, &target).map_err(|e| map_arrow(e, "implicit widening"))?;
     Ok((l, r))
+}
+
+/// Rank within the int16→int32→int64→float32→float64 widening chain
+/// [`unify_numeric`]/[`wider_numeric_type`] widen along. `None` means "not
+/// part of it", which includes decimals — those carry precision and scale
+/// that a rank cannot express, so they are deliberately excluded rather than
+/// approximated.
+fn numeric_rank(dt: &DataType) -> Option<u8> {
+    Some(match dt {
+        DataType::Int8 | DataType::Int16 => 1,
+        DataType::Int32 => 2,
+        DataType::Int64 => 3,
+        DataType::Float32 => 4,
+        DataType::Float64 => 5,
+        _ => return None,
+    })
+}
+
+/// The wider of two Arrow numeric types on [`numeric_rank`]'s ladder, or
+/// `None` if either type isn't on it at all (including when they're already
+/// equal — every caller already special-cases that before asking). Shared by
+/// [`unify_numeric`] (a binary operator's two operands) and
+/// [`eval_branches_unified`] (folded pairwise across however many
+/// CASE/COALESCE branches there are), so the two callers' notion of "the
+/// common numeric type" cannot drift apart.
+fn wider_numeric_type(a: &DataType, b: &DataType) -> Option<DataType> {
+    let (ar, br) = (numeric_rank(a)?, numeric_rank(b)?);
+    Some(if ar >= br { a.clone() } else { b.clone() })
 }
 
 /// `lhs / rhs`. See the module docs' point 2: arrow's integer division
@@ -641,6 +669,21 @@ fn eval_cast(arg: &Expr, to: PgType, batch: &RecordBatch) -> Result<ArrayRef, Ex
 /// falsy where it is `false` *or NULL* — are exactly Postgres's CASE
 /// semantics (an unproven or NULL condition falls through to the next
 /// branch), so no extra NULL-handling is needed here.
+///
+/// **Honest limitation: no short-circuiting.** Postgres evaluates a CASE's
+/// branches lazily — `CASE WHEN x <> 0 THEN 1/x ELSE 0 END` never raises
+/// `division_by_zero` for `x = 0`, because the `1/x` branch simply never
+/// runs for that row. This function evaluates every `THEN`/`ELSE` branch
+/// eagerly, over the *whole* batch, before `zip` ever looks at the
+/// condition — `zip` is what makes the unmatched branches' *values*
+/// invisible in the result, not what makes them not run. For a branch that
+/// can error on some rows regardless of which arm "wins" (division,
+/// `to_date` on a malformed string, ...), this means a CASE that is valid,
+/// working Postgres SQL can raise here where Postgres would not. Fixing
+/// this needs per-branch row masking through `eval` itself (evaluating a
+/// branch only over the subset of rows its condition selects), which is a
+/// larger change than this file's kernel-per-node shape supports today —
+/// documented rather than silently wrong.
 fn eval_case(
     operand: &Option<Box<Expr>>,
     whens: &[(Expr, Expr)],
@@ -663,13 +706,31 @@ fn eval_case(
         None => None,
     };
 
-    let mut acc: Option<ArrayRef> = match else_ {
-        Some(e) => Some(eval(e, batch)?),
-        None => None,
+    // Every result branch (every THEN, plus ELSE if present) is materialized
+    // at one shared Arrow type up front, rather than one at a time as the
+    // fold below walks them — see `eval_branches_unified`'s doc for why a
+    // per-branch approach gets the type wrong.
+    let mut branch_exprs: Vec<&Expr> = whens.iter().map(|(_, then)| then).collect();
+    if let Some(e) = else_.as_deref() {
+        branch_exprs.push(e);
+    }
+    let mut branch_arrays = eval_branches_unified(&branch_exprs, batch)?;
+    let mut acc: Option<ArrayRef> = if else_.is_some() {
+        branch_arrays.pop()
+    } else {
+        None
     };
+    // `branch_arrays` now holds exactly the THEN arrays, aligned index-for-
+    // index with `whens` (ELSE, if any, was just popped off the end).
+    let then_arrays = branch_arrays;
 
-    for (cond_expr, then_expr) in whens.iter().rev() {
-        let then_arr = eval(then_expr, batch)?;
+    for ((cond_expr, _), then_arr) in whens
+        .iter()
+        .zip(then_arrays)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
         let cond_arr: BooleanArray = match &operand_arr {
             Some(o) => {
                 let v = eval(cond_expr, batch)?;
@@ -690,6 +751,71 @@ fn eval_case(
     Ok(acc.expect("loop ran at least once since whens is non-empty"))
 }
 
+/// Materialize every CASE-WHEN-THEN/ELSE branch, or every COALESCE argument,
+/// at one shared Arrow type before they are combined by `zip`/`is_not_null`.
+///
+/// Postgres resolves a CASE's or COALESCE's result type once, across every
+/// branch together (`select_common_type`) — not from whichever branch a
+/// naive left-to-right walk happens to evaluate first. Two things fall out
+/// of doing the same here:
+///
+/// - An `unknown`-typed branch — a bare string/NULL literal Postgres itself
+///   leaves untyped until context supplies one, see [`is_unknown_literal`] —
+///   takes whatever type the *other* branches settle on, the same way
+///   [`eval_operand_pair`] resolves an untyped literal against its sibling
+///   operand for an ordinary binary operator. If EVERY branch is `unknown`
+///   (`CASE WHEN true THEN 'a' ELSE 'b' END`, `COALESCE('a', 'b')`),
+///   Postgres's own fallback is `text` (confirmed against a live PostgreSQL
+///   18: `pg_typeof(CASE WHEN true THEN 'a' ELSE 'b' END)` is `text`) — not
+///   `unknown` itself, which `basin_pgtype::physical` cannot represent at
+///   all (that pseudo-type-705 error is exactly what reaching `eval` with an
+///   un-resolved literal branch used to produce).
+/// - Two branches with *different concrete* types (`CASE WHEN … THEN
+///   int4val ELSE float8val END`) are widened the same way
+///   [`unify_numeric`] widens a binary operator's two operands, folded
+///   pairwise across every concretely-typed branch (via
+///   [`wider_numeric_type`]) so branch *order* cannot silently narrow the
+///   result — the widest branch wins regardless of whether it was written
+///   first or last.
+///
+/// A mismatched *non-numeric* pair of concrete types (not a real query shape
+/// valid SQL produces for a well-typed CASE/COALESCE) is left as the first
+/// one seen; the `cast` kernel reporting that mismatch below is an honest
+/// answer, not a guess.
+fn eval_branches_unified(exprs: &[&Expr], batch: &RecordBatch) -> Result<Vec<ArrayRef>, ExecError> {
+    let len = batch.num_rows();
+
+    let mut typed: Vec<Option<ArrayRef>> = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        typed.push(if is_unknown_literal(e) {
+            None
+        } else {
+            Some(eval(e, batch)?)
+        });
+    }
+
+    let mut target: Option<DataType> = None;
+    for a in typed.iter().flatten() {
+        target = Some(match target {
+            None => a.data_type().clone(),
+            Some(t) => wider_numeric_type(&t, a.data_type()).unwrap_or(t),
+        });
+    }
+    let target = target.unwrap_or(DataType::Utf8);
+
+    typed
+        .into_iter()
+        .zip(exprs.iter())
+        .map(|(a, e)| match a {
+            Some(a) if a.data_type() == &target => Ok(a),
+            Some(a) => {
+                cast::cast(&a, &target).map_err(|err| map_arrow(err, "CASE/COALESCE branch"))
+            }
+            None => eval_untyped_literal(e, &target, len),
+        })
+        .collect()
+}
+
 /// `COALESCE(a, b, c)`: the first non-null value, left to right.
 ///
 /// Note this is *not* `arrow::compute::kernels::coalesce` — that module is
@@ -700,16 +826,25 @@ fn eval_case(
 /// expression, then for each earlier one, take it where it is not null and
 /// fall back to the accumulator otherwise.
 fn eval_coalesce(exprs: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExecError> {
-    let Some((last, rest)) = exprs.split_last() else {
+    if exprs.is_empty() {
         return Err(ExecError::Internal(
             "COALESCE with no arguments — a planner bug, not user error".to_string(),
         ));
-    };
-    let mut acc = eval(last, batch)?;
-    for e in rest.iter().rev() {
-        let v = eval(e, batch)?;
-        let mask = boolean::is_not_null(&v).map_err(|e| map_arrow(e, "COALESCE"))?;
-        acc = zip::zip(&mask, &v, &acc).map_err(|e| map_arrow(e, "COALESCE"))?;
+    }
+    // Every argument is materialized at one shared Arrow type up front — see
+    // `eval_branches_unified`'s doc — rather than one at a time as the fold
+    // below walks them, so e.g. `COALESCE(int4col, int8val)` and
+    // `COALESCE(name, 'none')` (a column and an `unknown`-typed literal) both
+    // widen/resolve correctly regardless of which argument is written first.
+    let arg_refs: Vec<&Expr> = exprs.iter().collect();
+    let arrays = eval_branches_unified(&arg_refs, batch)?;
+    let (last, rest) = arrays
+        .split_last()
+        .expect("checked exprs non-empty above, and arrays has the same length");
+    let mut acc = last.clone();
+    for v in rest.iter().rev() {
+        let mask = boolean::is_not_null(v).map_err(|e| map_arrow(e, "COALESCE"))?;
+        acc = zip::zip(&mask, v, &acc).map_err(|e| map_arrow(e, "COALESCE"))?;
     }
     Ok(acc)
 }
@@ -1654,6 +1789,13 @@ mod tests {
         Expr::Literal(Datum::Null, PgType::TEXT)
     }
 
+    /// A bare string literal, `unknown`-typed exactly as lowering leaves it
+    /// (`lower_a_const`'s `Val::Sval` arm) until something resolves it —
+    /// unlike [`lit_text`], which is already concretely `text`.
+    fn lit_text_unknown(s: &str) -> Expr {
+        Expr::Literal(Datum::Utf8(s.to_string()), PgType::UNKNOWN)
+    }
+
     /// A single-row batch for scalar-function tests whose arguments are all
     /// literals — the batch's own shape does not matter, only its row count.
     fn one_row() -> RecordBatch {
@@ -2018,6 +2160,258 @@ mod tests {
         let expr = Expr::Coalesce(vec![col(0, "x"), lit_i32(9), lit_i32(1)]);
         let result = eval(&expr, &batch).unwrap();
         assert_eq!(i32_array(&result).value(0), 9);
+    }
+
+    #[test]
+    fn coalesce_of_all_nulls_is_null() {
+        let batch = batch_i32("x", vec![None]);
+        let expr = Expr::Coalesce(vec![col(0, "x"), Expr::Literal(Datum::Null, PgType::INT4)]);
+        let result = eval(&expr, &batch).unwrap();
+        assert!(result.is_null(0), "every argument was NULL");
+    }
+
+    /// `COALESCE(name, 'none')`: a column and an `unknown`-typed bare string
+    /// literal — the exact shape that used to fail with "pseudo-type 705 has
+    /// no physical representation" before `eval_branches_unified` existed,
+    /// because `eval`ing an `unknown`-typed literal directly asks
+    /// `basin_pgtype::physical` to represent a pseudo-type. The literal must
+    /// resolve to the column's type (`text`), not error.
+    #[test]
+    fn coalesce_resolves_an_untyped_literal_against_a_typed_column() {
+        let batch = batch_str1("name", vec![None, Some("a")]);
+        let expr = Expr::Coalesce(vec![
+            col(0, "name"),
+            Expr::Literal(Datum::Utf8("none".into()), PgType::UNKNOWN),
+        ]);
+        let result = eval(&expr, &batch).unwrap();
+        let arr = str_array(&result);
+        assert_eq!(arr.value(0), "none");
+        assert_eq!(arr.value(1), "a");
+    }
+
+    // --- CASE: no ELSE, cross-branch typing, and the short-circuit gap --------
+
+    #[test]
+    fn case_with_no_else_is_null_for_an_unmatched_row() {
+        // Confirmed against a live PostgreSQL 18:
+        // `SELECT CASE WHEN false THEN 1 END` is NULL, not an error and not
+        // some other default.
+        let batch = batch_bool2(vec![Some(false)], vec![Some(false)]);
+        let expr = Expr::Case {
+            operand: None,
+            whens: vec![(col(0, "a"), lit_i32(1))],
+            else_: None,
+        };
+        let result = eval(&expr, &batch).unwrap();
+        assert!(result.is_null(0));
+    }
+
+    /// The trap: Postgres resolves a CASE's type across every branch, not
+    /// from the branch written first. `id` (int8) is written second here —
+    /// if the result took the FIRST branch's type (int4), this would either
+    /// lose the high bits of `id` or fail outright.
+    #[test]
+    fn case_result_type_is_the_common_type_of_every_branch_not_just_the_first() {
+        let batch = batch_bool2(vec![Some(true), Some(false)], vec![Some(true), Some(true)]);
+        let big = Expr::Literal(Datum::Int64(5_000_000_000), PgType::INT8);
+        let expr = Expr::Case {
+            operand: None,
+            whens: vec![(col(0, "a"), lit_i32(2))],
+            else_: Some(Box::new(big)),
+        };
+        let result = eval(&expr, &batch).unwrap();
+        assert_eq!(result.data_type(), &DataType::Int64);
+        let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(arr.value(0), 2, "matched branch widened from int4 to int8");
+        assert_eq!(
+            arr.value(1),
+            5_000_000_000,
+            "int8 ELSE branch keeps its own value"
+        );
+    }
+
+    /// `CASE WHEN … THEN 'a' ELSE 'b' END` — every branch is an untyped
+    /// literal, so nothing supplies a concrete type. Confirmed against a
+    /// live PostgreSQL 18: `pg_typeof(CASE WHEN true THEN 'a' ELSE 'b' END)`
+    /// is `text`, Postgres's own fallback for an all-`unknown` input list.
+    #[test]
+    fn case_with_every_branch_unknown_defaults_to_text() {
+        let batch = batch_bool2(vec![Some(true)], vec![Some(true)]);
+        let expr = Expr::Case {
+            operand: None,
+            whens: vec![(col(0, "a"), lit_text_unknown("big"))],
+            else_: Some(Box::new(lit_text_unknown("small"))),
+        };
+        let result = eval(&expr, &batch).unwrap();
+        assert_eq!(result.data_type(), &DataType::Utf8);
+        assert_eq!(str_array(&result).value(0), "big");
+    }
+
+    /// Honest limitation (see `eval_case`'s doc comment): this file
+    /// evaluates every branch eagerly over the whole batch, so a branch that
+    /// only Postgres's short-circuiting protects from erroring CAN raise
+    /// here, even on a row where that branch never "wins". Live PostgreSQL
+    /// 18 runs `SELECT x, CASE WHEN x <> 0 THEN 1/x ELSE 0 END FROM (VALUES
+    /// (0),(2)) AS t(x)` with no error at all (both rows come back `0`) —
+    /// this crate currently cannot match that, and this test pins the gap
+    /// rather than hiding it.
+    #[test]
+    fn case_does_not_short_circuit_and_can_error_on_the_unmatched_branch() {
+        let batch = batch_i32("x", vec![Some(0), Some(2)]);
+        let expr = Expr::Case {
+            operand: None,
+            whens: vec![(
+                Expr::Binary {
+                    op: op(518), // int4 <>
+                    lhs: Box::new(col(0, "x")),
+                    rhs: Box::new(lit_i32(0)),
+                },
+                Expr::Binary {
+                    op: op(528), // int4 /
+                    lhs: Box::new(lit_i32(1)),
+                    rhs: Box::new(col(0, "x")),
+                },
+            )],
+            else_: Some(Box::new(lit_i32(0))),
+        };
+        let err = eval(&expr, &batch).unwrap_err();
+        assert_eq!(
+            err,
+            ExecError::DivisionByZero,
+            "documented gap: real Postgres does not error on this query at all"
+        );
+    }
+
+    // --- NULLIF, as lowering desugars it (see `lower_aexpr_nullif`) -----------
+    //
+    // `NULLIF(a, b)` has no dedicated `Expr` variant; lowering turns it into
+    // `Expr::Case { whens: [(a = b, NULL)], else_: Some(a) }`. These tests
+    // build that exact shape by hand to pin `eval_case`'s behaviour for it
+    // without going through the parser.
+
+    fn nullif_expr(a: Expr, b: Expr, eq_op: OpId) -> Expr {
+        Expr::Case {
+            operand: None,
+            whens: vec![(
+                Expr::Binary {
+                    op: eq_op,
+                    lhs: Box::new(a.clone()),
+                    rhs: Box::new(b),
+                },
+                Expr::null_unknown(),
+            )],
+            else_: Some(Box::new(a)),
+        }
+    }
+
+    #[test]
+    fn nullif_returns_null_when_equal_and_a_otherwise() {
+        let batch = batch_i32("id", vec![Some(1), Some(2)]);
+        let expr = nullif_expr(col(0, "id"), lit_i32(1), op(96)); // int4 =
+        let result = eval(&expr, &batch).unwrap();
+        assert!(result.is_null(0), "NULLIF(1, 1) is NULL");
+        assert_eq!(i32_array(&result).value(1), 2, "NULLIF(2, 1) is 2");
+    }
+
+    /// Confirmed against a live PostgreSQL 18: `pg_typeof(NULLIF(1::int8,
+    /// 2::int4))` is `bigint` — `a`'s own type, never a type unified between
+    /// `a` and `b`. `b` here is int4 while `id` is int8; the result must
+    /// stay int8.
+    #[test]
+    fn nullif_result_type_is_as_own_type_not_a_unified_type() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![Some(7)]))]).unwrap();
+        let expr = nullif_expr(col(0, "id"), lit_i32(1), op(416)); // int8 = int4
+        let result = eval(&expr, &batch).unwrap();
+        assert_eq!(result.data_type(), &DataType::Int64);
+        assert_eq!(
+            result
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            7
+        );
+    }
+
+    // --- GREATEST / LEAST, as lowering desugars them (see `lower_min_max_expr`)
+
+    /// Builds the exact `Expr::Case` `lower_min_max_expr` desugars a
+    /// two-argument `GREATEST`/`LEAST` into: `cmp_op` is `>` for GREATEST,
+    /// `<` for LEAST.
+    fn greatest_or_least_expr(a: Expr, b: Expr, cmp_op: OpId) -> Expr {
+        Expr::Case {
+            operand: None,
+            whens: vec![
+                (
+                    Expr::IsNull {
+                        arg: Box::new(a.clone()),
+                        negated: false,
+                    },
+                    b.clone(),
+                ),
+                (
+                    Expr::IsNull {
+                        arg: Box::new(b.clone()),
+                        negated: false,
+                    },
+                    a.clone(),
+                ),
+                (
+                    Expr::Binary {
+                        op: cmp_op,
+                        lhs: Box::new(a.clone()),
+                        rhs: Box::new(b.clone()),
+                    },
+                    a,
+                ),
+            ],
+            else_: Some(Box::new(b)),
+        }
+    }
+
+    /// Confirmed against a live PostgreSQL 18: `GREATEST(1, NULL) = 1` and
+    /// `LEAST(1, NULL) = 1` — NULL arguments are ignored, not propagated,
+    /// unlike almost every other construct in SQL.
+    #[test]
+    fn greatest_and_least_ignore_a_null_argument() {
+        let batch = batch_i32("x", vec![Some(0)]);
+        let n = Expr::Literal(Datum::Null, PgType::INT4);
+
+        let greatest = greatest_or_least_expr(lit_i32(1), n.clone(), op(521)); // int4 >
+        let result = eval(&greatest, &batch).unwrap();
+        assert_eq!(
+            i32_array(&result).value(0),
+            1,
+            "GREATEST(1, NULL) must be 1, not NULL"
+        );
+
+        let least = greatest_or_least_expr(lit_i32(1), n, op(97)); // int4 <
+        let result = eval(&least, &batch).unwrap();
+        assert_eq!(
+            i32_array(&result).value(0),
+            1,
+            "LEAST(1, NULL) must be 1, not NULL"
+        );
+    }
+
+    #[test]
+    fn greatest_and_least_are_null_only_when_every_argument_is_null() {
+        let batch = batch_i32("x", vec![Some(0)]);
+        let n = || Expr::Literal(Datum::Null, PgType::INT4);
+        let expr = greatest_or_least_expr(n(), n(), op(521)); // int4 >
+        let result = eval(&expr, &batch).unwrap();
+        assert!(result.is_null(0), "GREATEST(NULL, NULL) must be NULL");
+    }
+
+    #[test]
+    fn greatest_picks_the_larger_and_least_the_smaller_of_two_non_null_values() {
+        let batch = batch_i32("x", vec![Some(0)]);
+        let greatest = greatest_or_least_expr(lit_i32(3), lit_i32(7), op(521)); // int4 >
+        assert_eq!(i32_array(&eval(&greatest, &batch).unwrap()).value(0), 7);
+        let least = greatest_or_least_expr(lit_i32(3), lit_i32(7), op(97)); // int4 <
+        assert_eq!(i32_array(&eval(&least, &batch).unwrap()).value(0), 3);
     }
 
     #[test]
