@@ -121,8 +121,8 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use basin_exec::eval::eval;
-use basin_plan::{ColumnRef, Expr, FuncId};
 use basin_pgtype::Oid;
+use basin_plan::{ColumnRef, Expr, FuncId};
 use tokio_postgres::types::ToSql;
 use tokio_postgres::Client;
 
@@ -438,7 +438,12 @@ fn extract_numeric(arr: &ArrayRef) -> Option<Val> {
         .as_any()
         .downcast_ref::<Decimal128Array>()
         .unwrap_or_else(|| panic!("expected a decimal array, got {:?}", arr.data_type()));
-    (!a.is_null(0)).then(|| Val::S(normalize_numeric(&format_decimal(a.value(0), a.scale() as i32))))
+    (!a.is_null(0)).then(|| {
+        Val::S(normalize_numeric(&format_decimal(
+            a.value(0),
+            a.scale() as i32,
+        )))
+    })
 }
 
 fn extract(kind: RetKind, arr: &ArrayRef) -> Option<Val> {
@@ -1030,8 +1035,10 @@ async fn run() -> Result<(), String> {
     ));
 
     if divergences.is_empty() {
-        print_banner("PASS — every call site matched PostgreSQL 18 on value, NULL-ness, and \
-                       error-vs-success");
+        print_banner(
+            "PASS — every call site matched PostgreSQL 18 on value, NULL-ness, and \
+                       error-vs-success",
+        );
         return Ok(());
     }
 

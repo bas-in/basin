@@ -298,7 +298,11 @@ fn scan_filter_matches_none_all_and_one_per_batch_across_batch_boundaries() {
         let values: Vec<Option<i32>> = (0..n as i32).map(Some).collect();
         let batches = chunk_i32(&schema, std::slice::from_ref(&values), BATCH);
         let expected_chunks = if n == 0 { 0 } else { n.div_ceil(BATCH) };
-        assert_eq!(batches.len(), expected_chunks, "n={n}: sanity on chunk count");
+        assert_eq!(
+            batches.len(),
+            expected_chunks,
+            "n={n}: sanity on chunk count"
+        );
 
         // Matches everything: `a >= 0`.
         {
@@ -447,7 +451,8 @@ fn topk_matches_full_sort_truncation_across_k_values_spanning_batch_boundaries()
         "sanity: n=20000 at BATCH=8192 spans 3 batches (8192,8192,3616)"
     );
 
-    let mut full_expected: Vec<(i32, i32)> = (0..n).map(|i| ((i % 1000) as i32, i as i32)).collect();
+    let mut full_expected: Vec<(i32, i32)> =
+        (0..n).map(|i| ((i % 1000) as i32, i as i32)).collect();
     full_expected.sort();
 
     for &k in &[0usize, 1, 8191, 8192, 8193, 16384, 16385, n, n + 5_000] {
@@ -465,7 +470,10 @@ fn topk_matches_full_sort_truncation_across_k_values_spanning_batch_boundaries()
             .map(|(a, b)| (a.unwrap(), b.unwrap()))
             .collect();
         let expected: Vec<(i32, i32)> = full_expected.iter().cloned().take(k).collect();
-        assert_eq!(actual, expected, "k={k}: TopK must match Sort-then-truncate(k)");
+        assert_eq!(
+            actual, expected,
+            "k={k}: TopK must match Sort-then-truncate(k)"
+        );
     }
 }
 
@@ -482,15 +490,15 @@ fn limit_offset_matches_independent_slicing_across_batch_boundaries() {
         let batches = chunk_i32(&schema, std::slice::from_ref(&values), BATCH);
 
         let combos: Vec<(usize, Option<usize>)> = vec![
-            (0, Some(0)),                 // LIMIT 0
+            (0, Some(0)), // LIMIT 0
             (0, Some(1)),
-            (0, None),                    // OFFSET-only
-            (BATCH, Some(1)),             // offset lands exactly on a batch boundary
+            (0, None),        // OFFSET-only
+            (BATCH, Some(1)), // offset lands exactly on a batch boundary
             (BATCH, Some(BATCH)),
-            (BATCH - 1, Some(3)),         // offset lands one row before a boundary
-            (2 * BATCH + 1, Some(5)),     // offset skips whole batches plus a partial one
-            (n, Some(10)),                // offset exactly at the end
-            (0, Some(n + 1_000)),         // fetch larger than the whole input
+            (BATCH - 1, Some(3)),     // offset lands one row before a boundary
+            (2 * BATCH + 1, Some(5)), // offset skips whole batches plus a partial one
+            (n, Some(10)),            // offset exactly at the end
+            (0, Some(n + 1_000)),     // fetch larger than the whole input
         ];
 
         for (skip, fetch) in combos {
@@ -610,7 +618,10 @@ fn hash_aggregate_low_cardinality_spans_many_batches() {
         let out = drain_checked(&mut agg);
 
         if n == 0 {
-            assert!(out.is_empty(), "GROUP BY over zero rows must yield zero groups");
+            assert!(
+                out.is_empty(),
+                "GROUP BY over zero rows must yield zero groups"
+            );
             continue;
         }
 
@@ -655,7 +666,14 @@ fn hash_aggregate_low_cardinality_spans_many_batches() {
             for row in 0..b.num_rows() {
                 actual.insert(
                     gcol[row].unwrap(),
-                    (cs[row].unwrap(), cv[row].unwrap(), sv[row], mn[row], mx[row], av[row]),
+                    (
+                        cs[row].unwrap(),
+                        cv[row].unwrap(),
+                        sv[row],
+                        mn[row],
+                        mx[row],
+                        av[row],
+                    ),
                 );
             }
         }
@@ -892,10 +910,20 @@ fn hash_join_every_kind_across_batch_boundaries_with_null_keys() {
         JoinKind::LeftAnti,
     ] {
         for case in &cases {
-            let left_key_of =
-                |i: usize| if i % 13 == 12 { None } else { Some((i as i32) % MODULUS) };
-            let right_key_of =
-                |i: usize| if i % 17 == 16 { None } else { Some((i as i32) % MODULUS) };
+            let left_key_of = |i: usize| {
+                if i % 13 == 12 {
+                    None
+                } else {
+                    Some((i as i32) % MODULUS)
+                }
+            };
+            let right_key_of = |i: usize| {
+                if i % 17 == 16 {
+                    None
+                } else {
+                    Some((i as i32) % MODULUS)
+                }
+            };
             let (lschema, lbatches, lkeys, lvals) =
                 keyed_batches(case.left_n, left_key_of, 0, case.left_chunk, ("lk", "lv"));
             let (rschema, rbatches, rkeys, rvals) = keyed_batches(
@@ -911,7 +939,10 @@ fn hash_join_every_kind_across_batch_boundaries_with_null_keys() {
             let mut join = HashJoin::new(left, right, kind, vec![0], vec![0], 1 << 32).unwrap();
             let out = drain_checked(&mut join);
 
-            let tag = format!("kind={kind:?} left_n={} right_n={}", case.left_n, case.right_n);
+            let tag = format!(
+                "kind={kind:?} left_n={} right_n={}",
+                case.left_n, case.right_n
+            );
             match kind {
                 JoinKind::LeftSemi | JoinKind::LeftAnti => {
                     let mut actual: Vec<i32> =
@@ -939,10 +970,7 @@ fn hash_join_every_kind_across_batch_boundaries_with_null_keys() {
 
 #[test]
 fn cross_join_row_count_across_batch_boundaries_on_either_side() {
-    let cases = [
-        (20_000usize, 3usize, BATCH, BATCH),
-        (5, 8_193, BATCH, 4096),
-    ];
+    let cases = [(20_000usize, 3usize, BATCH, BATCH), (5, 8_193, BATCH, 4096)];
     for (left_n, right_n, left_chunk, right_chunk) in cases {
         let lschema = schema_i32(&["lv"]);
         let rschema = schema_i32(&["rv"]);
@@ -952,7 +980,8 @@ fn cross_join_row_count_across_batch_boundaries_on_either_side() {
         let rbatches = chunk_i32(&rschema, std::slice::from_ref(&rvals), right_chunk);
         let left = Feed::boxed(lschema, lbatches);
         let right = Feed::boxed(rschema, rbatches);
-        let mut join = HashJoin::new(left, right, JoinKind::Cross, vec![], vec![], 1 << 32).unwrap();
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Cross, vec![], vec![], 1 << 32).unwrap();
         let out = drain_checked(&mut join);
         let total: usize = out.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, left_n * right_n, "left_n={left_n} right_n={right_n}");
@@ -1026,9 +1055,7 @@ fn except_all_and_intersect_all_match_multiset_arithmetic_across_batch_boundarie
     let modulus = 97i32;
     let schema = schema_i32(&["x"]);
     let left: Vec<Option<i32>> = (0..n1).map(|i| Some((i as i32) % modulus)).collect();
-    let right: Vec<Option<i32>> = (0..n2)
-        .map(|i| Some(((i as i32) * 2) % modulus))
-        .collect();
+    let right: Vec<Option<i32>> = (0..n2).map(|i| Some(((i as i32) * 2) % modulus)).collect();
 
     use std::collections::HashMap;
     let mut lcount: HashMap<i32, i64> = HashMap::new();
@@ -1069,7 +1096,12 @@ fn except_all_and_intersect_all_match_multiset_arithmetic_across_batch_boundarie
 // Window functions — a PARTITION spanning a batch boundary
 // ============================================================================
 
-fn window_spec(func: WindowFunc, arg_col: Option<usize>, frame: Option<WindowFrame>, alias: &str) -> WindowSpec {
+fn window_spec(
+    func: WindowFunc,
+    arg_col: Option<usize>,
+    frame: Option<WindowFrame>,
+    alias: &str,
+) -> WindowSpec {
     WindowSpec {
         func,
         arg_col,
@@ -1132,7 +1164,10 @@ fn window_ranking_functions_agree_across_a_partition_spanning_a_batch_boundary()
 
     let schema = schema_i32(&["g", "y"]);
     let batches = chunk_i32(&schema, &[g, y], BATCH);
-    assert!(batches.len() > 1, "sanity: input must span multiple batches");
+    assert!(
+        batches.len() > 1,
+        "sanity: input must span multiple batches"
+    );
 
     let child = Feed::boxed(schema.clone(), batches);
     let windows = vec![
@@ -1304,7 +1339,11 @@ fn window_lag_lead_never_cross_a_partition_boundary_spanning_batches() {
     let mut expected_lead = Vec::with_capacity(n);
     for part_v in &expected_v_by_partition {
         for idx in 0..part_v.len() {
-            expected_lag.push(if idx == 0 { None } else { Some(part_v[idx - 1]) });
+            expected_lag.push(if idx == 0 {
+                None
+            } else {
+                Some(part_v[idx - 1])
+            });
             expected_lead.push(if idx + 1 < part_v.len() {
                 Some(part_v[idx + 1])
             } else {
@@ -1333,7 +1372,10 @@ fn recursive_cte_union_all_iterations_span_multiple_batches() {
     const BRANCH: i64 = 100;
     const MAX_DEPTH: usize = 2; // iter 1: 100 rows; iter 2: 10,000 rows
     let schema = schema_i64(&["id"]);
-    let anchor = Feed::boxed(schema.clone(), vec![batch_i64_single(&schema, vec![Some(0)])]);
+    let anchor = Feed::boxed(
+        schema.clone(),
+        vec![batch_i64_single(&schema, vec![Some(0)])],
+    );
     let depth = Rc::new(RefCell::new(0usize));
     let d = Rc::clone(&depth);
     let s = schema.clone();
@@ -1388,14 +1430,20 @@ fn recursive_cte_union_all_iterations_span_multiple_batches() {
     expected.sort_unstable();
 
     assert_eq!(actual, expected);
-    assert_eq!(actual.len(), 1 + BRANCH as usize + (BRANCH * BRANCH) as usize);
+    assert_eq!(
+        actual.len(),
+        1 + BRANCH as usize + (BRANCH * BRANCH) as usize
+    );
 }
 
 #[test]
 fn recursive_cte_union_dedups_across_iterations_that_each_span_multiple_batches() {
     const MODULUS: i64 = 5_000;
     let schema = schema_i64(&["id"]);
-    let anchor = Feed::boxed(schema.clone(), vec![batch_i64_single(&schema, vec![Some(0)])]);
+    let anchor = Feed::boxed(
+        schema.clone(),
+        vec![batch_i64_single(&schema, vec![Some(0)])],
+    );
     let s = schema.clone();
     let recursive_term: RecursiveTermFactory = Box::new(move |working_table| {
         let mut next: Vec<Option<i64>> = Vec::new();
@@ -1424,7 +1472,10 @@ fn recursive_cte_union_dedups_across_iterations_that_each_span_multiple_batches(
     loop {
         let mut next = Vec::new();
         for &id in &frontier {
-            for cand in [(2 * id + 1).rem_euclid(MODULUS), (2 * id + 2).rem_euclid(MODULUS)] {
+            for cand in [
+                (2 * id + 1).rem_euclid(MODULUS),
+                (2 * id + 2).rem_euclid(MODULUS),
+            ] {
                 if seen.insert(cand) {
                     next.push(cand);
                 }
