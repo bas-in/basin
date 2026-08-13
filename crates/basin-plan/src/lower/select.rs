@@ -1419,7 +1419,7 @@ fn build_from_item(
     match item.node.as_ref() {
         Some(NodeEnum::RangeVar(rv)) => build_range_var(rv, res, ctes),
         Some(NodeEnum::JoinExpr(je)) => build_join_expr(je, res, ctes),
-        Some(NodeEnum::RangeSubselect(rs)) => build_range_subselect(rs, res),
+        Some(NodeEnum::RangeSubselect(rs)) => build_range_subselect(rs, res, ctes),
         Some(NodeEnum::RangeFunction(rf)) => build_range_function(rf, res, left),
         Some(_) => Err(LowerError::Unsupported(
             "this FROM item is not yet lowered".into(),
@@ -1703,13 +1703,30 @@ fn build_range_function(
     })
 }
 
-/// `FROM (subquery) [AS alias [(colnames)]]`. A genuine subquery (anything
-/// with its own `SELECT` list, `WHERE`, etc.) stays unsupported — see the
-/// module docs — but a bare `VALUES` list is a relation too, and `VALUES` is
-/// already fully lowered ([`lower_values`]); the only new work here is
-/// exposing it under the right name(s). Verified live: `SELECT * FROM
-/// (VALUES (1,'a'),(2,'b')) AS v` (and the unaliased `FROM (VALUES ...)`)
-/// both name the columns `column1`, `column2`, … — exactly
+/// `FROM (subquery) [AS alias [(colnames)]]` — a derived table.
+///
+/// The body is lowered by the same [`lower_select_stmt_ctx`] that lowers a
+/// `WITH` entry's body or a `UNION` arm, so a derived table gets the whole
+/// `SELECT` surface (its own `WHERE`, `GROUP BY`, window functions, set
+/// operations, a nested `WITH`) for free rather than a second, narrower
+/// lowering path. Its output schema becomes exactly one [`ScopeRelation`],
+/// which is what makes `x.col` resolve against the alias and the flat column
+/// indices line up with the derived plan's own output.
+///
+/// The enclosing statement's `ctes` are passed straight through: a derived
+/// table may reference a `WITH` entry of the query it sits in (`WITH a AS
+/// (...) SELECT * FROM (SELECT * FROM a) s` runs on a live server).
+///
+/// `res.outer` is likewise passed through unchanged, which is the correct
+/// scope rule and not an oversight: a non-`LATERAL` subquery in `FROM` may
+/// not see the *sibling* `FROM` items of its own query level (that is what
+/// `LATERAL` is for, still refused below), but it may see an enclosing query
+/// LEVEL's columns — and `res.outer` is precisely the latter, since
+/// [`build_from_clause`] never puts a sibling item into it.
+///
+/// A bare `VALUES` list keeps its own short path. Verified live: `SELECT *
+/// FROM (VALUES (1,'a'),(2,'b')) AS v` (and the unaliased `FROM (VALUES
+/// ...)`) both name the columns `column1`, `column2`, … — exactly
 /// [`lower_values`]'s own default — and `AS v(i, s)` overrides those
 /// positionally through the exact same [`apply_column_alias_list`] a CTE's
 /// own column-alias list uses (confirmed live: the arity rule and even the
@@ -1718,6 +1735,7 @@ fn build_range_function(
 fn build_range_subselect(
     rs: &pg_query::protobuf::RangeSubselect,
     res: &Resolvers,
+    ctes: &[CteBinding],
 ) -> Result<FromBuilt, LowerError> {
     if rs.lateral {
         return Err(LowerError::Unsupported("LATERAL is not yet lowered".into()));
@@ -1731,23 +1749,24 @@ fn build_range_subselect(
         }
     };
     let op_kind = SetOperation::try_from(stmt.op).unwrap_or(SetOperation::Undefined);
-    // The exact shape `lower_values` itself lowers: a bare VALUES list, with
-    // no other clause layered on top. `ORDER BY` in particular is excluded
-    // rather than silently dropped — `lower_values` has no wiring for it (it
-    // only ever runs as a top-level statement's own body today, where an
-    // absent `stmt.sort_clause` handler was never exercised), and reaching
-    // it here would silently produce a plan that ignores an `ORDER BY` the
-    // user actually wrote.
-    let is_plain_values = op_kind == SetOperation::SetopNone
-        && !stmt.values_lists.is_empty()
-        && stmt.sort_clause.is_empty()
-        && stmt.with_clause.is_none();
-    if !is_plain_values {
+    // A `VALUES` list carrying its own `ORDER BY` is refused rather than
+    // lowered, and that refusal has to live HERE rather than being left to
+    // `lower_select_stmt_ctx`: that function dispatches a non-empty
+    // `values_lists` straight to `lower_values`, which has no `sort_clause`
+    // wiring and would silently drop an `ORDER BY` the user actually wrote,
+    // answering an ordered question with an unordered relation.
+    //
+    // `LIMIT`/`OFFSET` are deliberately NOT refused alongside it: unlike
+    // `ORDER BY`, `lower_values` does handle them (it ends in `apply_limit`),
+    // so refusing them would give up reach this path already had. Every other
+    // shape goes through the general path below.
+    let is_values = op_kind == SetOperation::SetopNone && !stmt.values_lists.is_empty();
+    if is_values && !stmt.sort_clause.is_empty() {
         return Err(LowerError::Unsupported(
-            "a subquery in FROM is not yet lowered (a bare VALUES list is)".into(),
+            "a VALUES list in FROM with its own ORDER BY is not yet lowered".into(),
         ));
     }
-    let (plan, schema) = lower_values(stmt, res)?;
+    let (plan, schema) = lower_select_stmt_ctx(stmt, res, ctes)?;
     let (qualifier, schema) = match &rs.alias {
         Some(a) if !a.colnames.is_empty() => (
             a.aliasname.clone(),
@@ -5088,13 +5107,251 @@ mod tests {
         );
     }
 
+    // --- Derived tables (subquery in FROM) ----------------------------------
+    //
+    // This shape used to be refused outright, and a test here pinned that
+    // refusal. It is now lowered, so that test became a statement of the
+    // opposite of the truth and was rewritten into the positive assertions
+    // below rather than removed — the refusal it guarded is exactly what the
+    // rest of this section now has to keep honest.
+
+    /// The shape the old refusal test used, now lowering: the derived table's
+    /// own plan is nested under the outer `SELECT`'s projection, and the alias
+    /// puts its SELECT-list name in scope.
     #[test]
-    fn a_subquery_in_from_is_unsupported() {
-        let err = lower("SELECT * FROM (SELECT 1 AS a) sub").unwrap_err();
+    fn a_subquery_in_from_lowers_to_its_own_plan_under_the_outer_projection() {
+        let plan = lower("SELECT * FROM (SELECT 1 AS a) sub").unwrap();
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(exprs, vec![(col(0, "a"), "a".to_string())]);
+        let LogicalPlan::Project { exprs: inner, .. } = *input else {
+            panic!("expected the derived table's own Project");
+        };
+        assert_eq!(inner, vec![(int_lit(1), "a".to_string())]);
+    }
+
+    /// A derived table is a relation like any other: its columns resolve both
+    /// bare and qualified by the alias, and the flat indices are positions in
+    /// the derived plan's OUTPUT, not in the underlying table.
+    #[test]
+    fn a_derived_tables_columns_resolve_by_alias_at_their_output_positions() {
+        // `b` is `t`'s column 2; through the derived table it is column 1,
+        // because the derived SELECT list only exposes two columns.
+        let plan = lower("SELECT sub.b, sub.id FROM (SELECT id, b FROM t WHERE id > 1) AS sub")
+            .unwrap();
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            exprs,
+            vec![
+                (col(1, "b"), "b".to_string()),
+                (col(0, "id"), "id".to_string()),
+            ]
+        );
+        // The derived body kept its own WHERE.
+        let LogicalPlan::Project { input: body, .. } = *input else {
+            panic!("expected the derived table's Project");
+        };
+        assert!(
+            matches!(*body, LogicalPlan::Filter { .. }),
+            "the derived table's own WHERE must survive, got {body:?}"
+        );
+    }
+
+    /// A column the derived table does not expose is out of scope, exactly as
+    /// on a live server (`column "a" does not exist`). Without this the alias
+    /// would be decorative and an inner-scope leak would go unnoticed.
+    #[test]
+    fn a_column_the_derived_table_does_not_expose_does_not_resolve() {
+        let err = lower("SELECT a FROM (SELECT id FROM t) AS sub").unwrap_err();
+        assert!(
+            matches!(err, LowerError::UnknownName(ref n) if n == "a"),
+            "expected UnknownName(\"a\"), got {err:?}"
+        );
+    }
+
+    /// `AS sub(x, y)` renames positionally and HIDES the body's own names —
+    /// the same rule (and the same helper) a CTE's column-alias list uses.
+    #[test]
+    fn a_derived_tables_column_alias_list_renames_positionally() {
+        let plan = lower("SELECT x, y FROM (SELECT id, b FROM t) AS sub(x, y)").unwrap();
+        let LogicalPlan::Project { exprs, .. } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            exprs,
+            vec![
+                (col(0, "x"), "x".to_string()),
+                (col(1, "y"), "y".to_string()),
+            ]
+        );
+        assert!(
+            lower("SELECT id FROM (SELECT id, b FROM t) AS sub(x, y)").is_err(),
+            "an aliased-away name must not still resolve"
+        );
+    }
+
+    /// A derived table may reference an enclosing `WITH` entry — `ctes` is
+    /// threaded into its body rather than dropped at the FROM-item boundary.
+    #[test]
+    fn a_derived_table_can_reference_an_enclosing_cte() {
+        let plan =
+            lower("WITH a AS (SELECT id FROM t) SELECT * FROM (SELECT id FROM a) AS s").unwrap();
+        let LogicalPlan::Cte { input, .. } = plan else {
+            panic!("expected Cte at the root, got {plan:?}");
+        };
+        let mut saw_cte_ref = false;
+        fn walk(p: &LogicalPlan, saw: &mut bool) {
+            if matches!(p, LogicalPlan::CteRef { .. }) {
+                *saw = true;
+            }
+            p.for_each_input(&mut |c| walk(c, saw));
+        }
+        walk(&input, &mut saw_cte_ref);
+        assert!(saw_cte_ref, "the derived table's body must read the CTE");
+    }
+
+    /// A derived table carrying a window function — the shape that motivates
+    /// derived tables at all, since a window result cannot be filtered in the
+    /// same query level that computes it (`WHERE rn = 1` is evaluated before
+    /// `row_number()`; a live server rejects it with "window functions are not
+    /// allowed in WHERE").
+    #[test]
+    fn a_derived_table_may_carry_a_window_function_the_outer_query_filters_on() {
+        let plan =
+            lower("SELECT id FROM (SELECT id, rank() OVER (ORDER BY id) rn FROM t) x WHERE rn = 1")
+                .unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Filter { input, .. } = *input else {
+            panic!("expected the outer WHERE as a Filter, got {input:?}");
+        };
+        let LogicalPlan::Project { input: win, .. } = *input else {
+            panic!("expected the derived table's Project");
+        };
+        assert!(
+            matches!(*win, LogicalPlan::Window { .. }),
+            "the window must be computed inside the derived table, got {win:?}"
+        );
+    }
+
+    /// A derived table joined to a real table: the combined scope must put
+    /// the derived side's columns AFTER the real side's, so the derived
+    /// column's flat index counts the real table's full width first. Getting
+    /// this wrong reads a neighbouring column and returns a plausible wrong
+    /// answer rather than failing, which is why it is asserted by index here
+    /// and not by rendered name.
+    ///
+    /// Row values verified against a live PostgreSQL 18.2 (tables shaped as
+    /// this file's `t`/`u`): `SELECT t.id, s.x FROM t JOIN (SELECT t_id AS x
+    /// FROM u) s ON s.x = t.id` returns `(1,1), (1,1), (2,2)`.
+    #[test]
+    fn a_derived_table_joined_to_a_real_table_keeps_the_scope_offsets_straight() {
+        let plan =
+            lower("SELECT t.id, s.x FROM t JOIN (SELECT t_id AS x FROM u) s ON s.x = t.id")
+                .unwrap();
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project");
+        };
+        // `t` is 3 columns wide, so the derived table's single column `x` is
+        // flat index 3 — not 0, and not 1.
+        assert_eq!(
+            exprs,
+            vec![
+                (col(0, "id"), "id".to_string()),
+                (col(3, "x"), "x".to_string()),
+            ]
+        );
+        let LogicalPlan::Join { on, .. } = *input else {
+            panic!("expected a Join, got {input:?}");
+        };
+        // Inside a Join's `on`, each side is numbered against its OWN
+        // relation, not against the combined scope (the tuple position is
+        // what says which side it is) — the same convention
+        // `split_equijoin_conjuncts` already produces for two real tables.
+        // So the derived table's `x` is index 0 here, its first and only
+        // output column, even though it is flat index 3 above.
+        assert_eq!(on, vec![(col(0, "id"), col(0, "x"))]);
+    }
+
+    /// `SELECT *` across a real table and a derived table expands to the real
+    /// table's columns followed by the derived table's, at their combined flat
+    /// indices. Verified live: the same query returns columns `id, a, b, x`
+    /// in that order.
+    #[test]
+    fn star_expands_across_a_real_table_then_a_derived_one() {
+        let plan =
+            lower("SELECT * FROM t JOIN (SELECT t_id AS x FROM u) s ON s.x = t.id").unwrap();
+        let LogicalPlan::Project { exprs, .. } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(
+            exprs,
+            vec![
+                (col(0, "id"), "id".to_string()),
+                (col(1, "a"), "a".to_string()),
+                (col(2, "b"), "b".to_string()),
+                (col(3, "x"), "x".to_string()),
+            ]
+        );
+    }
+
+    /// A non-`LATERAL` derived table must NOT see its SIBLING `FROM` items —
+    /// that is exactly what `LATERAL` exists to permit, and it is still
+    /// refused (see `a_lateral_subquery_in_from_is_still_unsupported`). This
+    /// falls out of `build_range_subselect` being handed only the enclosing
+    /// query LEVEL's resolver and never the `left` scope
+    /// [`build_range_function`] receives, but it falls out silently, so it is
+    /// pinned here: if it ever regressed, the derived table would resolve a
+    /// sibling column against its own indices and read the wrong column.
+    ///
+    /// Matches a live PostgreSQL 18.2 exactly, which rejects this with
+    /// `invalid reference to FROM-clause entry for table "t"` / "There is an
+    /// entry for table "t", but it cannot be referenced from this part of the
+    /// query."
+    #[test]
+    fn a_non_lateral_derived_table_cannot_see_a_sibling_from_item() {
+        let err = lower("SELECT * FROM t, (SELECT t.id) s").unwrap_err();
+        assert!(
+            matches!(err, LowerError::UnknownName(ref n) if n == "t.id"),
+            "expected the sibling reference not to resolve, got {err:?}"
+        );
+    }
+
+    /// A `VALUES` list in `FROM` still takes the short path, and one carrying
+    /// its own `ORDER BY` is still refused by name rather than silently
+    /// dropping it — `lower_values` has no wiring for that clause, so lowering
+    /// it would produce an unordered answer to an ordered question.
+    #[test]
+    fn a_values_list_in_from_with_its_own_order_by_is_refused_by_name() {
+        let err = lower("SELECT * FROM (VALUES (2),(1) ORDER BY 1) AS v").unwrap_err();
         let LowerError::Unsupported(msg) = err else {
             panic!("expected Unsupported, got {err:?}");
         };
-        assert!(msg.contains("subquery"), "message should be precise: {msg}");
+        assert!(
+            msg.contains("ORDER BY"),
+            "message should name the dropped clause: {msg}"
+        );
+    }
+
+    /// ...but a `VALUES` list with `LIMIT`/`OFFSET` and no `ORDER BY` still
+    /// lowers, because `lower_values` genuinely applies them. This is the
+    /// other half of the refusal above: the guard has to be narrow enough not
+    /// to give up reach this path already had. Verified live on PostgreSQL
+    /// 18.2: `SELECT * FROM (VALUES (1),(2),(3) LIMIT 2) AS v` returns 1, 2.
+    #[test]
+    fn a_values_list_in_from_with_only_a_limit_still_lowers() {
+        let plan = lower("SELECT * FROM (VALUES (1),(2),(3) LIMIT 2) AS v").unwrap();
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        assert!(
+            matches!(*input, LogicalPlan::Limit { .. }),
+            "the VALUES list's own LIMIT must survive, got {input:?}"
+        );
     }
 
     // --- Set-returning functions in FROM ------------------------------------
