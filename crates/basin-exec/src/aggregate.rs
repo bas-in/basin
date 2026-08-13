@@ -37,7 +37,12 @@
 //! operator is expected to have already materialised any non-trivial
 //! aggregate argument (`sum(a + b)`) into its own column. `Expr::Aggregate`
 //! also carries `order_by` for `array_agg(x ORDER BY y)` / `WITHIN GROUP` —
-//! out of scope here, since none of count/sum/min/max/avg are order-sensitive.
+//! still out of scope: `array_agg`/`string_agg` are implemented below, but
+//! only the unordered form. `build.rs`'s `agg_spec` refuses any aggregate
+//! with a non-empty `order_by` (`BuildError::Unsupported("ORDER BY inside
+//! an aggregate")`) before an [`AggregateSpec`] is ever constructed, so this
+//! file never receives — and never has to detect — a silently-reordered
+//! `array_agg`.
 //!
 //! # Memory
 //!
@@ -56,18 +61,23 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, Float64Type, Int16Type, Int32Type, Int64Type};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    ListArray, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::operator::{ExecError, Operator};
 
-/// The six aggregate functions this operator implements.
+/// The eight aggregate functions this operator implements.
 ///
 /// This is deliberately not the full `pg_proc` aggregate surface — no
-/// `array_agg`, `string_agg`, ordered-set aggregates, or `GROUPING SETS` —
-/// see `docs/migration/df-removal/03-physical-operators.md` §3.2 for what
-/// else basin-exec eventually needs; those are separate operators/specs.
+/// ordered-set aggregates or `GROUPING SETS` — see
+/// `docs/migration/df-removal/03-physical-operators.md` §3.2 for what else
+/// basin-exec eventually needs; those are separate operators/specs.
+/// `array_agg`/`string_agg` were the last of the "ordinary" aggregates
+/// missing; both are row-wise only (see the module doc) — a vectorised
+/// group-wise variant was prototyped on `spike/vectorised-aggregate` and
+/// measured at 0.60x the row-wise loop, so it was shelved rather than
+/// merged (`docs/migration/df-removal/17-udf-rehosting.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggFunc {
     /// `count(*)`. Counts rows, including all-null ones — never inspects a
@@ -79,6 +89,25 @@ pub enum AggFunc {
     Min,
     Max,
     Avg,
+    /// `array_agg(expr)`. Unlike every aggregate above, NULLs are *included*
+    /// in the result rather than skipped — see [`AccState::push_array_agg`].
+    /// `ORDER BY` inside the call (`array_agg(x ORDER BY y)`) is real syntax
+    /// but is refused upstream, in `build.rs`'s `agg_spec`, for *every*
+    /// aggregate unconditionally (`if !order_by.is_empty() { return
+    /// Err(BuildError::Unsupported(...)) }`) before an `AggregateSpec` is
+    /// ever constructed — so it can never reach this file silently
+    /// reordered. This variant carries no ordering state because none can
+    /// arrive.
+    ArrayAgg,
+    /// `string_agg(expr, delimiter)`. NULLs are skipped, like `sum`/`avg`.
+    /// The delimiter is a second resolved column position — evaluated per
+    /// row, not a single constant — carried here rather than as a second
+    /// field on [`AggregateSpec`] (whose single `input_col` already covers
+    /// every other aggregate's one argument). Same `ORDER BY` refusal note
+    /// as `ArrayAgg` applies.
+    StringAgg {
+        delim_col: usize,
+    },
 }
 
 /// One aggregate in the SELECT list, already resolved to a column position.
@@ -91,10 +120,14 @@ pub struct AggregateSpec {
     pub func: AggFunc,
     /// Column in the input batch this aggregate reads. Must be `None` for
     /// `CountStar` (it counts rows, not values) and `Some` for every other
-    /// function — enforced in [`HashAggregate::new`].
+    /// function — enforced in [`HashAggregate::new`]. For `StringAgg`, this
+    /// is the value expression; the delimiter lives on `func` itself
+    /// (`AggFunc::StringAgg::delim_col`), not here — see that variant's doc.
     pub input_col: Option<usize>,
-    /// `count(DISTINCT x)`, `sum(DISTINCT x)`, … — Postgres allows `DISTINCT`
-    /// on any of these, not just `count`.
+    /// `count(DISTINCT x)`, `sum(DISTINCT x)`, `array_agg(DISTINCT x)`,
+    /// `string_agg(DISTINCT x, ',')`, … — Postgres allows `DISTINCT` on any
+    /// of these, not just `count`. See [`AccState::push_array_agg`] for why
+    /// `array_agg(DISTINCT x)` needs a different NULL rule than the rest.
     pub distinct: bool,
     /// Column index of a boolean predicate already evaluated for
     /// `FILTER (WHERE …)`. Applies to this aggregate only, not to the row's
@@ -223,6 +256,64 @@ fn resolve_aggregate(
             let field = Field::new(&spec.alias, dt, true);
             Ok((ResolvedAgg { spec, num_kind }, field))
         }
+        AggFunc::ArrayAgg => {
+            let col = require_input_col(&spec)?;
+            let dt = input_schema.field(col).data_type().clone();
+            let supported = num_kind_of(&dt).is_some()
+                || matches!(dt, DataType::Utf8 | DataType::LargeUtf8 | DataType::Boolean);
+            if !supported {
+                return Err(ExecError::TypeMismatch(format!(
+                    "array_agg() over unsupported column type {dt:?}"
+                )));
+            }
+            let num_kind = num_kind_of(&dt).unwrap_or(NumKind::Int);
+            // array_agg preserves the input's exact element type inside the
+            // list, the same as min/max — no widening. Verified against a
+            // live PG 18: `select pg_typeof(array_agg(id))` over an int4
+            // column returns `integer[]`, not `bigint[]`.
+            //
+            // The item field is nullable: array_agg is the one aggregate in
+            // this file that puts NULLs *into* its result rather than
+            // skipping them — `select array_agg(x) from (values
+            // (1),(NULL),(3)) t(x)` on live PG 18 returns `{1,NULL,3}`, a
+            // 3-element array, not `{1,3}`.
+            let item_field = Arc::new(Field::new("item", dt, true));
+            // The list itself is nullable too, but for a different reason:
+            // zero input rows (or, under FILTER, zero passing rows) is NULL,
+            // not `{}` — verified: `select array_agg(id) from t where
+            // false` on live PG 18 returns a blank (NULL), not `{}`. See
+            // [`AccState::push_array_agg`] and the empty-input tests below.
+            let field = Field::new(&spec.alias, DataType::List(item_field), true);
+            Ok((ResolvedAgg { spec, num_kind }, field))
+        }
+        AggFunc::StringAgg { delim_col } => {
+            let col = require_input_col(&spec)?;
+            let dt = input_schema.field(col).data_type().clone();
+            if !matches!(dt, DataType::Utf8 | DataType::LargeUtf8) {
+                return Err(ExecError::TypeMismatch(format!(
+                    "string_agg() over non-text column {dt:?}"
+                )));
+            }
+            let delim_dt = input_schema.field(delim_col).data_type().clone();
+            if !matches!(delim_dt, DataType::Utf8 | DataType::LargeUtf8) {
+                return Err(ExecError::TypeMismatch(format!(
+                    "string_agg() delimiter must be text, got {delim_dt:?}"
+                )));
+            }
+            // Nullable: zero rows, or every value NULL, is NULL — not an
+            // empty string. Verified against live PG 18: `select
+            // string_agg(name, ',') from t where false` and `select
+            // string_agg(name, ',') from t where name is null` both return a
+            // blank (NULL), not `''`.
+            let field = Field::new(&spec.alias, DataType::Utf8, true);
+            Ok((
+                ResolvedAgg {
+                    spec,
+                    num_kind: NumKind::Int, // meaningless for StringAgg; see the field's own doc
+                },
+                field,
+            ))
+        }
     }
 }
 
@@ -232,12 +323,19 @@ fn resolve_aggregate(
 /// `Int64`) — the output-building step in [`build_typed_array`] narrows back
 /// down using the *output* field's declared type, which for `MIN`/`MAX`/group
 /// keys is the original column's exact type.
+///
+/// `List` is not a *per-row* cell — no input column is ever a list here —
+/// it is `array_agg`'s own *finalized* accumulator value, reusing this enum
+/// only so [`AccState::finalize`] and [`build_typed_array`] have one output
+/// shape to handle instead of two. Each element is itself a per-row cell
+/// (`Option` because array_agg includes NULLs).
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
 enum CellValue {
     Int64(i64),
     Float64(f64),
     Utf8(String),
     Bool(bool),
+    List(Vec<Option<CellValue>>),
 }
 
 /// A hashable, `Eq` form of [`CellValue`] (plus `Null`) used for `GROUP BY`
@@ -276,6 +374,11 @@ impl From<&Option<CellValue>> for HashKey {
             }
             Some(CellValue::Utf8(s)) => HashKey::Utf8(s.clone()),
             Some(CellValue::Bool(b)) => HashKey::Bool(*b),
+            Some(CellValue::List(_)) => unreachable!(
+                "HashKey::from only ever sees a per-row cell (GROUP BY key or \
+                 DISTINCT dedup value) — array_agg's own accumulated List is a \
+                 finalized *output*, never fed back through hashing"
+            ),
         }
     }
 }
@@ -361,6 +464,19 @@ enum AccState {
         sum: f64,
         count: i64,
     },
+    /// `array_agg(expr)`. `None` until the first row is accepted (passes
+    /// `FILTER`, and — if `DISTINCT` — is a first-seen value) and stays
+    /// `None` forever if none ever is; `Some(list)` otherwise, where `list`
+    /// may itself contain `None` entries (NULLs are elements, not skipped —
+    /// see [`AccState::push_array_agg`]). The outer `None` is what makes
+    /// zero-rows-accepted finalize to SQL NULL rather than `{}` (item: array
+    /// agg NULL-over-empty).
+    ArrayAgg(Option<Vec<Option<CellValue>>>),
+    /// `string_agg(expr, delimiter)`. `None` until the first *non-null*
+    /// value is accepted and stays `None` forever if none ever is (NULLs
+    /// are skipped entirely, unlike `ArrayAgg` — see
+    /// [`AccState::push_string_agg`]).
+    StringAgg(Option<String>),
 }
 
 impl AccState {
@@ -375,7 +491,83 @@ impl AccState {
             AggFunc::Min => AccState::Min(None),
             AggFunc::Max => AccState::Max(None),
             AggFunc::Avg => AccState::Avg { sum: 0.0, count: 0 },
+            AggFunc::ArrayAgg => AccState::ArrayAgg(None),
+            AggFunc::StringAgg { .. } => AccState::StringAgg(None),
         }
+    }
+
+    /// `array_agg`: append one row's value — NULL included — and return the
+    /// extra heap bytes it costs, for the memory accountant. Never called
+    /// through [`AccState::update_scalar`]: that method's blanket `let
+    /// Some(v) = val else { return Ok(()) }` null-skip is correct for every
+    /// *other* aggregate here but wrong for this one, so `array_agg` gets
+    /// its own row-wise entry point instead (see `update_ungrouped_one` and
+    /// `build_grouped`, the only two call sites). Verified against a live
+    /// PG 18: `select array_agg(x) from (values (1),(NULL),(3)) t(x)` →
+    /// `{1,NULL,3}`, a 3-element array.
+    fn push_array_agg(&mut self, val: Option<CellValue>) -> usize {
+        let AccState::ArrayAgg(list) = self else {
+            unreachable!("push_array_agg is only called for an ArrayAgg accumulator")
+        };
+        let bytes = std::mem::size_of::<Option<CellValue>>() + cell_heap_bytes(&val);
+        list.get_or_insert_with(Vec::new).push(val);
+        bytes
+    }
+
+    /// `string_agg`: append one row's value with its own row's delimiter,
+    /// and return the extra heap bytes it costs. Also never routed through
+    /// `update_scalar` — it needs two per-row values (expr and delimiter),
+    /// not one. Two rules, both verified against a live PG 18:
+    ///
+    /// - A NULL value is skipped entirely — no text, no delimiter, no-op.
+    ///   (`select string_agg(name,',') from t where name is null` → NULL,
+    ///   not `''`; `select string_agg(name,',') from t` — the row where
+    ///   `name` is NULL contributes nothing, e.g. `x,y,z` from 4 rows one of
+    ///   which is NULL, not `x,,y,z`.)
+    /// - A NULL delimiter contributes no separator (not an error, not
+    ///   treated as an empty *value*) — `select string_agg(name, NULL) from
+    ///   t` → `xyz` (concatenated with nothing between). The delimiter used
+    ///   for a given append is the *current* row's delimiter, not the
+    ///   previous row's or a single constant — confirmed with a per-row
+    ///   delimiter column: appending `y` after `x` used `y`'s own row's
+    ///   delimiter, not `x`'s.
+    /// - The delimiter is never emitted before the first accepted value.
+    fn push_string_agg(
+        &mut self,
+        val: &Option<CellValue>,
+        delim: &Option<CellValue>,
+    ) -> Result<usize, ExecError> {
+        let AccState::StringAgg(acc) = self else {
+            unreachable!("push_string_agg is only called for a StringAgg accumulator")
+        };
+        let Some(v) = val else {
+            return Ok(0); // NULL value: skip entirely, per the doc above
+        };
+        let CellValue::Utf8(s) = v else {
+            return Err(ExecError::TypeMismatch(
+                "string_agg(): non-text value reached the accumulator".into(),
+            ));
+        };
+        let delim_str: &str = match delim {
+            Some(CellValue::Utf8(d)) => d.as_str(),
+            Some(_) => {
+                return Err(ExecError::TypeMismatch(
+                    "string_agg(): non-text delimiter reached the accumulator".into(),
+                ));
+            }
+            None => "", // NULL delimiter: no separator, not an error
+        };
+        Ok(match acc {
+            None => {
+                *acc = Some(s.clone());
+                s.len()
+            }
+            Some(buf) => {
+                buf.push_str(delim_str);
+                buf.push_str(s);
+                delim_str.len() + s.len()
+            }
+        })
     }
 
     fn add_count(&mut self, n: i64) {
@@ -428,13 +620,24 @@ impl AccState {
                 *count += 1;
             }
             AccState::CountStar(_) => unreachable!("count(*) never inspects a per-row value"),
+            AccState::ArrayAgg(_) => unreachable!(
+                "array_agg is never routed through update_scalar — see push_array_agg's doc"
+            ),
+            AccState::StringAgg(_) => unreachable!(
+                "string_agg is never routed through update_scalar — see push_string_agg's doc"
+            ),
         }
         Ok(())
     }
 
     /// Batch-at-a-time update via arrow's aggregate kernels — the fast path,
     /// used only when there is no `GROUP BY` and this aggregate is not
-    /// `DISTINCT`. `arr` already has `FILTER (WHERE …)` applied.
+    /// `DISTINCT`. `arr` already has `FILTER (WHERE …)` applied. Never
+    /// called for `array_agg`/`string_agg` — those are always row-wise (see
+    /// the module doc and `update_ungrouped_one`), so no arm here builds a
+    /// list or concatenates text; both would be `unreachable!` too, but
+    /// there is nothing to match on `self` before reaching one, since this
+    /// whole function is skipped for those two functions upstream.
     fn update_kernel(&mut self, arr: &ArrayRef) -> Result<(), ExecError> {
         match self {
             AccState::Count(c) => {
@@ -478,12 +681,19 @@ impl AccState {
             AccState::CountStar(_) => {
                 unreachable!("count(*) takes the row-count fast path in build_ungrouped, never a column kernel")
             }
+            AccState::ArrayAgg(_) | AccState::StringAgg(_) => unreachable!(
+                "array_agg/string_agg are always row-wise (push_array_agg/push_string_agg), \
+                 never dispatched to the arrow-kernel fast path"
+            ),
         }
         Ok(())
     }
 
     /// Produce this accumulator's final value, or `None` for SQL NULL —
-    /// e.g. `sum`/`avg`/`min`/`max` over zero (or all-null) input (item 1).
+    /// e.g. `sum`/`avg`/`min`/`max` over zero (or all-null) input (item 1),
+    /// and — for `array_agg`/`string_agg` — zero rows *accepted* (which,
+    /// under `FILTER`, can happen even for a non-empty `GROUP BY` group; see
+    /// `push_array_agg`/`push_string_agg`'s docs for the live-PG evidence).
     fn finalize(&self) -> Option<CellValue> {
         match self {
             AccState::CountStar(c) | AccState::Count(c) => Some(CellValue::Int64(*c)),
@@ -497,6 +707,8 @@ impl AccState {
                     Some(CellValue::Float64(sum / *count as f64))
                 }
             }
+            AccState::ArrayAgg(list) => list.clone().map(CellValue::List),
+            AccState::StringAgg(s) => s.clone().map(CellValue::Utf8),
         }
     }
 }
@@ -634,6 +846,43 @@ fn build_typed_array(
                 })
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
+        // `array_agg`'s output: one row per group (or the single ungrouped
+        // row), each either NULL (the accumulator saw zero accepted rows —
+        // `values[i]` is `None`, not `Some(CellValue::List(vec![]))`, since
+        // those are different things: NULL vs. `{}`, and this operator only
+        // ever produces the former, matching live PG 18) or a list of
+        // per-row cells, which may themselves be NULL (array_agg includes
+        // NULL elements). Flatten every row's elements into one child array
+        // with `array_agg`'s own [`build_typed_array`] (recursion bottoms
+        // out because element types are never themselves `List`), and record
+        // each row's length as `0` for a NULL row — `OffsetBuffer` only
+        // needs lengths, and a NULL row's `NullBuffer` bit is what actually
+        // marks it absent, not a nonzero-vs-zero length.
+        DataType::List(item_field) => {
+            let mut lengths: Vec<usize> = Vec::with_capacity(values.len());
+            let mut validity: Vec<bool> = Vec::with_capacity(values.len());
+            let mut flat: Vec<Option<CellValue>> = Vec::new();
+            for v in values {
+                match v {
+                    Some(CellValue::List(items)) => {
+                        validity.push(true);
+                        lengths.push(items.len());
+                        flat.extend(items.iter().cloned());
+                    }
+                    _ => {
+                        validity.push(false);
+                        lengths.push(0);
+                    }
+                }
+            }
+            let child = build_typed_array(item_field.data_type(), &flat)?;
+            let offsets = arrow::buffer::OffsetBuffer::<i32>::from_lengths(lengths);
+            let nulls = arrow::buffer::NullBuffer::from(validity);
+            Arc::new(
+                ListArray::try_new(item_field.clone(), offsets, child, Some(nulls))
+                    .map_err(|e| ExecError::Internal(e.to_string()))?,
+            ) as ArrayRef
+        }
         other => {
             return Err(ExecError::Internal(format!(
                 "hash aggregate: cannot build an output column of type {other:?}"
@@ -768,15 +1017,78 @@ impl HashAggregate {
         distinct: &mut Option<HashSet<HashKey>>,
     ) -> Result<(), ExecError> {
         let agg = &self.aggregates[i];
+        let func = agg.spec.func; // `AggFunc` is `Copy`; see the borrow note below
         let mask: Option<&BooleanArray> =
             agg.spec.filter_col.map(|fc| batch.column(fc).as_boolean());
 
-        if agg.spec.func == AggFunc::CountStar {
+        if func == AggFunc::CountStar {
             let n = match mask {
                 Some(m) => m.true_count() as i64,
                 None => batch.num_rows() as i64,
             };
             acc.add_count(n);
+            return Ok(());
+        }
+
+        // array_agg/string_agg are always row-wise, never the arrow-kernel
+        // fast path below: array_agg must keep every row's NULL as an
+        // element (the DISTINCT loop and the kernel path below both drop
+        // NULLs, which is right for every other aggregate but wrong here),
+        // and string_agg reads a *second* column — the delimiter — in
+        // lockstep with the value column, which the single `filtered` array
+        // built below has no room for. `col`/`delim_idx` are extracted from
+        // `agg` up front (not re-read inside the loop) so this immutable
+        // borrow of `self.aggregates[i]` ends before the loop's
+        // `self.bump_memory` calls need `self` mutably.
+        if matches!(func, AggFunc::ArrayAgg | AggFunc::StringAgg { .. }) {
+            let col = agg
+                .spec
+                .input_col
+                .expect("resolved: array_agg/string_agg always carry an input column");
+            let delim_idx = match func {
+                AggFunc::StringAgg { delim_col } => Some(delim_col),
+                _ => None,
+            };
+            let value_col = batch.column(col).clone();
+            let delim_col = delim_idx.map(|d| batch.column(d).clone());
+            let is_array_agg = matches!(func, AggFunc::ArrayAgg);
+
+            for row in 0..batch.num_rows() {
+                if let Some(m) = mask {
+                    if !(m.is_valid(row) && m.value(row)) {
+                        continue;
+                    }
+                }
+                let val = extract_cell(&value_col, row)?;
+                if let Some(seen) = distinct.as_mut() {
+                    // array_agg(DISTINCT x) still keeps one NULL entry if any
+                    // accepted row's value was NULL — verified against a
+                    // live PG 18: `array_agg(distinct id)` over
+                    // `{1,2,1,NULL,2}` → `{1,2,NULL}`. string_agg(DISTINCT
+                    // …) drops NULLs from the dedup set, matching its own
+                    // ignore-nulls rule (verified: `string_agg(distinct
+                    // name, ',')` over `{x,y,x,NULL}` → `'x,y'`).
+                    if val.is_none() && !is_array_agg {
+                        continue;
+                    }
+                    let key = HashKey::from(&val);
+                    if !seen.insert(key.clone()) {
+                        continue;
+                    }
+                    self.bump_memory(hash_key_bytes(&key))?;
+                }
+                if is_array_agg {
+                    let added = acc.push_array_agg(val);
+                    self.bump_memory(added)?;
+                } else {
+                    let delim_val = match &delim_col {
+                        Some(dc) => extract_cell(dc, row)?,
+                        None => None,
+                    };
+                    let added = acc.push_string_agg(&val, &delim_val)?;
+                    self.bump_memory(added)?;
+                }
+            }
             return Ok(());
         }
 
@@ -887,15 +1199,32 @@ impl HashAggregate {
                         }
                     }
                     let agg = &self.aggregates[i];
-                    if agg.spec.func == AggFunc::CountStar {
+                    // Copy everything needed out of `agg` (an immutable
+                    // borrow of `self.aggregates[i]`) before any
+                    // `self.bump_memory` call below, which needs `self`
+                    // mutably — mirrors the same borrow shape
+                    // `update_ungrouped_one` uses for the same reason.
+                    let func = agg.spec.func;
+                    let distinct = agg.spec.distinct;
+                    if func == AggFunc::CountStar {
                         accs[gid][i].add_count(1);
                         continue;
                     }
                     let col = value_cols[i]
                         .expect("resolved: every non-CountStar aggregate carries an input column");
                     let val = extract_cell(col, row)?;
-                    if agg.spec.distinct {
-                        if val.is_none() {
+                    let is_array_agg = matches!(func, AggFunc::ArrayAgg);
+                    let delim_idx = match func {
+                        AggFunc::StringAgg { delim_col } => Some(delim_col),
+                        _ => None,
+                    };
+
+                    if distinct {
+                        // See update_ungrouped_one's identical rule and its
+                        // live-PG citations: array_agg(DISTINCT x) keeps one
+                        // NULL entry, every other DISTINCT aggregate here
+                        // (including string_agg) drops NULLs.
+                        if val.is_none() && !is_array_agg {
                             continue; // DISTINCT ignores NULLs, like the aggregate itself
                         }
                         let key = HashKey::from(&val);
@@ -907,7 +1236,17 @@ impl HashAggregate {
                         }
                         self.bump_memory(hash_key_bytes(&key))?;
                     }
-                    accs[gid][i].update_scalar(&val)?;
+
+                    if is_array_agg {
+                        let added = accs[gid][i].push_array_agg(val);
+                        self.bump_memory(added)?;
+                    } else if let Some(delim_col) = delim_idx {
+                        let delim_val = extract_cell(batch.column(delim_col), row)?;
+                        let added = accs[gid][i].push_string_agg(&val, &delim_val)?;
+                        self.bump_memory(added)?;
+                    } else {
+                        accs[gid][i].update_scalar(&val)?;
+                    }
                 }
             }
         }
@@ -1017,6 +1356,44 @@ mod tests {
             filter_col: None,
             alias: "s".into(),
         }
+    }
+
+    fn array_agg_spec(col: usize, distinct: bool) -> AggregateSpec {
+        AggregateSpec {
+            func: AggFunc::ArrayAgg,
+            input_col: Some(col),
+            distinct,
+            filter_col: None,
+            alias: "aa".into(),
+        }
+    }
+
+    fn string_agg_spec(col: usize, delim_col: usize, distinct: bool) -> AggregateSpec {
+        AggregateSpec {
+            func: AggFunc::StringAgg { delim_col },
+            input_col: Some(col),
+            distinct,
+            filter_col: None,
+            alias: "sa".into(),
+        }
+    }
+
+    /// Pull row `row` of a `LIST<Int64>` output column back out as a plain
+    /// `Vec`, or `None` if the list itself is NULL — the shape tests want to
+    /// assert against, rather than re-deriving arrow array plumbing in every
+    /// test body.
+    fn list_i64_values(arr: &ArrayRef, row: usize) -> Option<Vec<Option<i64>>> {
+        let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
+        if list.is_null(row) {
+            return None;
+        }
+        let elems = list.value(row);
+        let ints = elems.as_any().downcast_ref::<Int64Array>().unwrap();
+        Some(
+            (0..ints.len())
+                .map(|i| (!ints.is_null(i)).then(|| ints.value(i)))
+                .collect(),
+        )
     }
 
     fn count_star_spec() -> AggregateSpec {
@@ -1468,5 +1845,471 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, ExecError::TypeMismatch(_)));
+    }
+
+    // array_agg's defining difference from every other aggregate in this
+    // file: NULLs are elements of the result, not skipped. Verified against
+    // a live PostgreSQL 18.2: `select array_agg(x) from (values
+    // (1),(NULL),(3)) t(x)` -> `{1,NULL,3}`, a 3-element array.
+    #[test]
+    fn array_agg_includes_nulls_ungrouped() {
+        let schema = schema_1int("x");
+        let batch = int_batch(&schema, vec![Some(1), None, Some(3)]);
+        let input = VecOperator::boxed(schema.clone(), vec![batch]);
+        let mut agg =
+            HashAggregate::new(input, vec![], vec![array_agg_spec(0, false)], usize::MAX).unwrap();
+
+        // array_agg's output type is LIST — a different shape from the
+        // scalar output every other aggregate in this file produces.
+        assert!(
+            matches!(agg.schema().field(0).data_type(), DataType::List(_)),
+            "array_agg's resolved output type must be List, got {:?}",
+            agg.schema().field(0).data_type()
+        );
+
+        let out = agg.next_batch().unwrap().unwrap();
+        assert_eq!(
+            out.num_rows(),
+            1,
+            "ungrouped aggregate always emits one row"
+        );
+        assert_eq!(
+            list_i64_values(out.column(0), 0),
+            Some(vec![Some(1), None, Some(3)]),
+            "array_agg must keep the NULL as an element, not drop it"
+        );
+    }
+
+    // The mirror-image rule to sum/avg/min/max's own zero-row NULL (item 1),
+    // but array_agg's is easy to get wrong in the *other* direction: a naive
+    // "no rows accepted" case could plausibly return `{}` (the identity
+    // element for concatenation) instead of NULL. Verified against a live
+    // PostgreSQL 18.2: `select array_agg(id) from t where false` returns a
+    // blank (NULL), not `{}`.
+    #[test]
+    fn array_agg_over_zero_rows_is_null_not_empty_array() {
+        let schema = schema_1int("x");
+        let input = VecOperator::boxed(schema.clone(), vec![]);
+        let mut agg =
+            HashAggregate::new(input, vec![], vec![array_agg_spec(0, false)], usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        assert_eq!(out.num_rows(), 1);
+        let list = out.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(
+            list.is_null(0),
+            "array_agg() over zero rows must be NULL, not an empty array"
+        );
+    }
+
+    // string_agg's NULL rule is the opposite of array_agg's: NULLs are
+    // skipped entirely (no element, no delimiter for that position) — the
+    // same ignore-nulls rule sum/avg/min/max already follow. Also checks
+    // that the delimiter is read per row (not a single constant): row 2's
+    // NULL name contributes nothing, and the delimiter used before
+    // appending a value is that value's *own* row's delimiter. Verified
+    // against a live PostgreSQL 18.2 with the identical 4 rows: `select
+    // string_agg(name, g) from t` (name = x,NULL,y,z; g = a,a,b,b) ->
+    // `xbybz`.
+    #[test]
+    fn string_agg_skips_nulls_and_reads_a_per_row_delimiter() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("delim", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("x"),
+                    None,
+                    Some("y"),
+                    Some("z"),
+                ])),
+                Arc::new(StringArray::from(vec!["a", "a", "b", "b"])),
+            ],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let specs = vec![string_agg_spec(0, 1, false)];
+        let mut agg = HashAggregate::new(input, vec![], specs, usize::MAX).unwrap();
+        assert_eq!(agg.schema().field(0).data_type(), &DataType::Utf8);
+        let out = agg.next_batch().unwrap().unwrap();
+        let s = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(s.value(0), "xbybz");
+    }
+
+    // Zero rows -> NULL, not `''` — verified against a live PostgreSQL
+    // 18.2: `select string_agg(name, ',') from t where false` returns a
+    // blank (NULL).
+    #[test]
+    fn string_agg_over_zero_rows_is_null_not_empty_string() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("delim", DataType::Utf8, true),
+        ]));
+        let input = VecOperator::boxed(schema, vec![]);
+        let specs = vec![string_agg_spec(0, 1, false)];
+        let mut agg = HashAggregate::new(input, vec![], specs, usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        let s = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(
+            s.is_null(0),
+            "string_agg() over zero rows must be NULL, not an empty string"
+        );
+    }
+
+    // Every value NULL (rows exist, but none pass the ignore-nulls filter)
+    // must also be NULL, not `''` — verified against a live PostgreSQL
+    // 18.2: `select string_agg(name, ',') from t where name is null`
+    // returns a blank (NULL).
+    #[test]
+    fn string_agg_all_null_values_is_null() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("delim", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![None::<&str>, None])),
+                Arc::new(StringArray::from(vec![Some(","), Some(",")])),
+            ],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let specs = vec![string_agg_spec(0, 1, false)];
+        let mut agg = HashAggregate::new(input, vec![], specs, usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        let s = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(s.is_null(0));
+    }
+
+    // A NULL delimiter contributes no separator (it is not an error, and it
+    // is not treated as an empty *value*). Verified against a live
+    // PostgreSQL 18.2: `select string_agg(name, NULL) from t` (name =
+    // x,NULL,y,z) -> `xyz` — the three non-null names concatenated with
+    // nothing between them.
+    #[test]
+    fn string_agg_null_delimiter_produces_no_separator() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("delim", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("x"),
+                    None,
+                    Some("y"),
+                    Some("z"),
+                ])),
+                Arc::new(StringArray::from(vec![None::<&str>, None, None, None])),
+            ],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let specs = vec![string_agg_spec(0, 1, false)];
+        let mut agg = HashAggregate::new(input, vec![], specs, usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        let s = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(s.value(0), "xyz");
+    }
+
+    // Grouped path: array_agg must span batches within a group, include
+    // NULLs, and keep each group's own elements separate from its
+    // sibling's.
+    #[test]
+    fn array_agg_grouped_spans_batches_and_keeps_nulls() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Utf8, true),
+            Field::new("x", DataType::Int64, true),
+        ]));
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "a"])),
+                Arc::new(Int64Array::from(vec![Some(1), Some(9), None])),
+            ],
+        )
+        .unwrap();
+        let b2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(Int64Array::from(vec![Some(3)])),
+            ],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema, vec![b1, b2]);
+        let mut agg =
+            HashAggregate::new(input, vec![0], vec![array_agg_spec(1, false)], usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        assert_eq!(out.num_rows(), 2);
+        let groups = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut rows: Vec<(String, Option<Vec<Option<i64>>>)> = (0..out.num_rows())
+            .map(|i| {
+                (
+                    groups.value(i).to_string(),
+                    list_i64_values(out.column(1), i),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        // Insertion order is deterministic in this row-wise implementation
+        // (not a contractual guarantee absent `ORDER BY` — see the module
+        // doc) — pinned here as a regression check, not a claim about SQL
+        // semantics.
+        assert_eq!(
+            rows[0],
+            ("a".to_string(), Some(vec![Some(1), None, Some(3)]))
+        );
+        assert_eq!(rows[1], ("b".to_string(), Some(vec![Some(9)])));
+    }
+
+    // Grouped path: string_agg per group, still skipping NULLs and reading
+    // a per-row delimiter.
+    #[test]
+    fn string_agg_grouped_keeps_groups_separate() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("delim", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "a", "b"])),
+                Arc::new(StringArray::from(vec![
+                    Some("x"),
+                    Some("p"),
+                    None,
+                    Some("q"),
+                ])),
+                Arc::new(StringArray::from(vec!["-", "-", "-", "-"])),
+            ],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let specs = vec![string_agg_spec(1, 2, false)];
+        let mut agg = HashAggregate::new(input, vec![0], specs, usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        assert_eq!(out.num_rows(), 2);
+        let groups = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let sa = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut rows: Vec<(String, String)> = (0..out.num_rows())
+            .map(|i| (groups.value(i).to_string(), sa.value(i).to_string()))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        // group "a": only "x" survives (its second row's name is NULL).
+        assert_eq!(rows[0], ("a".to_string(), "x".to_string()));
+        // group "b": "p" then "q" joined by "-".
+        assert_eq!(rows[1], ("b".to_string(), "p-q".to_string()));
+    }
+
+    // FILTER (WHERE …) applies per-aggregate, not to group membership (see
+    // `filter_clause_applies_per_aggregate_not_to_the_group` above for the
+    // scalar-aggregate version of this rule). For array_agg/string_agg this
+    // has a sharp edge: a group can be non-empty (it exists because a
+    // sibling aggregate, or the group-by column itself, saw rows) while
+    // *this* aggregate's FILTER rejects every one of them — which must
+    // still finalize to NULL, exactly like the true zero-row case.
+    #[test]
+    fn array_agg_and_string_agg_are_null_when_filter_excludes_every_row_in_a_group() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Utf8, true),
+            Field::new("x", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("delim", DataType::Utf8, true),
+            Field::new("keep", DataType::Boolean, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a"])),
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+                Arc::new(StringArray::from(vec![",", ","])),
+                Arc::new(BooleanArray::from(vec![false, false])),
+            ],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let specs = vec![
+            AggregateSpec {
+                func: AggFunc::ArrayAgg,
+                input_col: Some(1),
+                distinct: false,
+                filter_col: Some(4),
+                alias: "aa".into(),
+            },
+            AggregateSpec {
+                func: AggFunc::StringAgg { delim_col: 3 },
+                input_col: Some(2),
+                distinct: false,
+                filter_col: Some(4),
+                alias: "sa".into(),
+            },
+        ];
+        let mut agg = HashAggregate::new(input, vec![0], specs, usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        assert_eq!(out.num_rows(), 1, "the group itself still exists");
+        assert_eq!(
+            list_i64_values(out.column(1), 0),
+            None,
+            "array_agg must be NULL when FILTER rejects every row in the group"
+        );
+        let sa = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(
+            sa.is_null(0),
+            "string_agg must be NULL when FILTER rejects every row in the group"
+        );
+    }
+
+    // array_agg(DISTINCT x) needs a different NULL rule than every other
+    // DISTINCT aggregate in this file: it keeps a single NULL element rather
+    // than dropping NULLs from the dedup set. Verified against a live
+    // PostgreSQL 18.2: `select array_agg(distinct id) from (values
+    // (1),(2),(1),(NULL),(2)) v(id)` -> `{1,2,NULL}`.
+    #[test]
+    fn array_agg_distinct_dedups_but_keeps_one_null() {
+        let schema = schema_1int("x");
+        let batch = int_batch(&schema, vec![Some(1), Some(2), Some(1), None, Some(2)]);
+        let input = VecOperator::boxed(schema.clone(), vec![batch]);
+        let mut agg =
+            HashAggregate::new(input, vec![], vec![array_agg_spec(0, true)], usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        let got = list_i64_values(out.column(0), 0).unwrap();
+        let mut non_null: Vec<i64> = got.iter().flatten().copied().collect();
+        non_null.sort();
+        assert_eq!(
+            non_null,
+            vec![1, 2],
+            "distinct non-null values are {{1, 2}}"
+        );
+        assert_eq!(
+            got.iter().filter(|v| v.is_none()).count(),
+            1,
+            "the NULL must be deduped to exactly one element, not zero (dropped) or two (kept as-is)"
+        );
+    }
+
+    // string_agg(DISTINCT x, delim) dedups on the value and — unlike
+    // array_agg(DISTINCT …) — drops NULLs entirely, matching string_agg's
+    // own non-distinct ignore-nulls rule. Verified against a live
+    // PostgreSQL 18.2: `select string_agg(distinct name, ',') from (values
+    // ('x'),('y'),('x'),(NULL)) v(name)` -> `'x,y'`.
+    #[test]
+    fn string_agg_distinct_dedups_and_still_skips_null() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("delim", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("x"),
+                    Some("y"),
+                    Some("x"),
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![",", ",", ",", ","])),
+            ],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema, vec![batch]);
+        let specs = vec![string_agg_spec(0, 1, true)];
+        let mut agg = HashAggregate::new(input, vec![], specs, usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        let s = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(s.value(0), "x,y");
+    }
+
+    // string_agg() requires text input — enforced at construction, the same
+    // planner-bug-guard posture as `count_star_with_an_input_column_is_rejected_at_construction`.
+    #[test]
+    fn string_agg_over_non_text_column_is_rejected_at_construction() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, true),
+            Field::new("delim", DataType::Utf8, true),
+        ]));
+        let input = VecOperator::boxed(schema, vec![]);
+        let err = HashAggregate::new(
+            input,
+            vec![],
+            vec![string_agg_spec(0, 1, false)],
+            usize::MAX,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, ExecError::TypeMismatch(_)));
+    }
+
+    // `array_agg(x ORDER BY y)` is real Postgres syntax this operator does
+    // not implement (see the module doc and `AggFunc::ArrayAgg`'s doc). It
+    // is refused, not silently reordered — but the refusal lives one layer
+    // up: `AggregateSpec` (this file, owned here) structurally has no
+    // `order_by` field for `ArrayAgg`/`StringAgg` to carry in the first
+    // place, and `build.rs`'s `agg_spec` (which lowers `Expr::Aggregate`
+    // into an `AggregateSpec`) already refuses a non-empty `order_by` on
+    // *every* aggregate function unconditionally, before any
+    // `AggregateSpec` is constructed:
+    //
+    // ```text
+    // if !order_by.is_empty() {
+    //     return Err(BuildError::Unsupported("ORDER BY inside an aggregate".into()));
+    // }
+    // ```
+    //
+    // So there is no runtime case for *this* file to test: an ordered
+    // `array_agg` cannot reach `HashAggregate::new` at all, ordered or
+    // silently reordered. This test pins that `AggregateSpec` construction
+    // for `array_agg` only ever takes `func`/`input_col`/`distinct`/
+    // `filter_col`/`alias` — if a future change added an `order_by` field
+    // here without wiring a refusal, this call site would need updating,
+    // which is the point.
+    #[test]
+    fn array_agg_spec_has_no_order_by_field_to_silently_ignore() {
+        let spec = array_agg_spec(0, false);
+        assert!(matches!(spec.func, AggFunc::ArrayAgg));
+        // If this compiles, `AggregateSpec` has exactly the fields listed
+        // above — Rust's struct-literal field list is itself the assertion.
     }
 }
