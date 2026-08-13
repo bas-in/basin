@@ -1,0 +1,307 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: scale   area: Aggregates@200
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0006
+AREA Aggregates@200
+SQL SELECT count(*) FROM big
+ORDER sorted
+STATUS rows
+COL count(*)	Int64	notnull
+NROWS 1
+ROW 200
+END
+
+QUERY 0007
+AREA Aggregates@200
+SQL SELECT count(*), count(k), count(v) FROM big
+ORDER sorted
+STATUS rows
+COL count(*)	Int64	notnull
+COL count(big.k)	Int64	notnull
+COL count(big.v)	Int64	notnull
+NROWS 1
+ROW 200	189	192
+END
+
+QUERY 0008
+AREA Aggregates@200
+SQL SELECT sum(id), avg(id), min(id), max(id) FROM big
+ORDER sorted
+STATUS rows
+COL sum	Int64	null
+COL avg	Float64	null
+COL min	Int64	null
+COL max	Int64	null
+NROWS 1
+ROW 20100	100.5	1	200
+END
+
+QUERY 0009
+AREA Aggregates@200
+SQL SELECT grp, count(*), sum(v), min(k), max(k) FROM big GROUP BY grp ORDER BY grp
+ORDER as-returned
+STATUS rows
+COL grp	Utf8	null
+COL count	Int64	notnull
+COL sum	Float64	null
+COL min	Int32	null
+COL max	Int32	null
+NROWS 4
+ROW alpha	50	1206.0	0	12
+ROW beta	50	1180.0	0	12
+ROW delta	50	1228.0	0	12
+ROW gamma	50	1204.0	0	12
+END
+
+QUERY 0010
+AREA Aggregates@200
+SQL SELECT count(DISTINCT k) FROM big
+ORDER sorted
+STATUS rows
+COL count	Int64	notnull
+NROWS 1
+ROW 13
+END
+
+QUERY 0011
+AREA Aggregates@200
+SQL SELECT grp, avg(v) FROM big GROUP BY grp HAVING avg(v) > 20 ORDER BY grp
+ORDER as-returned
+STATUS rows
+COL grp	Utf8	null
+COL avg(big.v)	Float64	null
+NROWS 4
+ROW alpha	25.125
+ROW beta	24.583333333333332
+ROW delta	25.583333333333332
+ROW gamma	25.083333333333332
+END
+
+QUERY 0012
+AREA Aggregates@200
+SQL SELECT sum(v) FILTER (WHERE flag) FROM big
+ORDER sorted
+STATUS rows
+COL sum	Float64	null
+NROWS 1
+ROW 1606.5
+END
+
+QUERY 0013
+AREA Aggregates@200
+SQL SELECT stddev_pop(v), var_pop(v) FROM big
+ORDER sorted
+STATUS rows
+COL stddev_pop	Float64	null
+COL var_pop	Float64	null
+NROWS 1
+ROW 14.482804548987279	209.7516276041666
+END
+
+QUERY 0014
+AREA Aggregates@200
+SQL SELECT max(v) - min(v) FROM big
+ORDER sorted
+STATUS rows
+COL ?column?	Float64	null
+NROWS 1
+ROW 49.75
+END
+
+QUERY 0015
+AREA Aggregates@200
+SQL SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v) FROM big
+ORDER sorted
+STATUS rows
+COL percentile_cont	Float64	null
+NROWS 1
+ROW 25.125
+END
+
+QUERY 0016
+AREA Aggregates@200
+SQL SELECT k, count(*) FROM big GROUP BY k ORDER BY k NULLS LAST
+ORDER as-returned
+STATUS rows
+COL k	Int32	null
+COL count	Int64	notnull
+NROWS 14
+ROW 0	15
+ROW 1	15
+ROW 2	15
+ROW 3	14
+ROW 4	14
+ROW 5	14
+ROW 6	14
+ROW 7	15
+ROW 8	15
+ROW 9	15
+ROW 10	14
+ROW 11	15
+ROW 12	14
+ROW \N	11
+END
+
+QUERY 0017
+AREA Aggregates@200
+SQL SELECT grp, bool_and(flag), bool_or(flag) FROM big GROUP BY grp ORDER BY grp
+ORDER as-returned
+STATUS rows
+COL grp	Utf8	null
+COL bool_and	Boolean	null
+COL bool_or	Boolean	null
+NROWS 4
+ROW alpha	false	true
+ROW beta	false	true
+ROW delta	false	true
+ROW gamma	false	true
+END
+
+QUERY 0018
+AREA Aggregates@200
+SQL SELECT sum(CASE WHEN flag THEN 1 ELSE 0 END) FROM big
+ORDER sorted
+STATUS rows
+COL sum	Int64	null
+NROWS 1
+ROW 66
+END
+
+QUERY 0019
+AREA Aggregates@200
+SQL SELECT count(*) FROM big WHERE k IS NULL
+ORDER sorted
+STATUS rows
+COL count(*)	Int64	notnull
+NROWS 1
+ROW 11
+END
+
+QUERY 0020
+AREA Aggregates@200
+SQL SELECT grp, k, count(*) FROM big GROUP BY ROLLUP (grp, k) ORDER BY grp NULLS LAST, k NULLS LAST, 3
+ORDER as-returned
+STATUS rows
+COL ?column?	Utf8	null
+COL count	Int32	null
+COL count	Int64	notnull
+NROWS 61
+ROW alpha	0	3
+ROW alpha	1	4
+ROW alpha	2	4
+ROW alpha	3	3
+ROW alpha	4	4
+ROW alpha	5	4
+ROW alpha	6	4
+ROW alpha	7	4
+ROW alpha	8	3
+ROW alpha	9	4
+ROW alpha	10	4
+ROW alpha	11	3
+ROW alpha	12	4
+ROW alpha	\N	2
+ROW alpha	\N	50
+ROW beta	0	4
+ROW beta	1	4
+ROW beta	2	3
+ROW beta	3	3
+ROW beta	4	4
+ROW beta	5	2
+ROW beta	6	4
+ROW beta	7	4
+ROW beta	8	4
+ROW beta	9	4
+ROW beta	10	3
+ROW beta	11	4
+ROW beta	12	4
+ROW beta	\N	3
+ROW beta	\N	50
+ROW delta	0	4
+ROW delta	1	3
+ROW delta	2	4
+ROW delta	3	4
+ROW delta	4	3
+ROW delta	5	4
+ROW delta	6	2
+ROW delta	7	4
+ROW delta	8	4
+ROW delta	9	3
+ROW delta	10	4
+ROW delta	11	4
+ROW delta	12	4
+ROW delta	\N	3
+ROW delta	\N	50
+ROW gamma	0	4
+ROW gamma	1	4
+ROW gamma	2	4
+ROW gamma	3	4
+ROW gamma	4	3
+ROW gamma	5	4
+ROW gamma	6	4
+ROW gamma	7	3
+ROW gamma	8	4
+ROW gamma	9	4
+ROW gamma	10	3
+ROW gamma	11	4
+ROW gamma	12	2
+ROW gamma	\N	3
+ROW gamma	\N	50
+ROW \N	\N	200
+END
+
+QUERY 0021
+AREA Aggregates@200
+SQL SELECT grp, count(*) FROM big GROUP BY GROUPING SETS ((grp),()) ORDER BY grp NULLS LAST
+ORDER as-returned
+STATUS rows
+COL ?column?	Utf8	null
+COL count	Int64	notnull
+NROWS 5
+ROW alpha	50
+ROW beta	50
+ROW delta	50
+ROW gamma	50
+ROW \N	200
+END
+
+QUERY 0022
+AREA Aggregates@200
+SQL SELECT count(*) FROM (SELECT DISTINCT k, grp FROM big) x
+ORDER sorted
+STATUS rows
+COL count	Int64	notnull
+NROWS 1
+ROW 56
+END
+
+QUERY 0023
+AREA Aggregates@200
+SQL SELECT grp, string_agg(id::TEXT, ',' ORDER BY id) FROM big WHERE id <= 20 GROUP BY grp ORDER BY grp
+ORDER as-returned
+STATUS rows
+COL grp	Utf8	null
+COL string_agg	Utf8	null
+NROWS 4
+ROW alpha	4,8,12,16,20
+ROW beta	1,5,9,13,17
+ROW delta	3,7,11,15,19
+ROW gamma	2,6,10,14,18
+END
+
+QUERY 0024
+AREA Aggregates@200
+SQL SELECT grp, array_agg(id ORDER BY id) FROM big WHERE id <= 12 GROUP BY grp ORDER BY grp
+ORDER as-returned
+STATUS rows
+COL grp	Utf8	null
+COL array_agg	List(Field { data_type: Int64, nullable: true })	null
+NROWS 4
+ROW alpha	[4, 8, 12]
+ROW beta	[1, 5, 9]
+ROW delta	[3, 7, 11]
+ROW gamma	[2, 6, 10]
+END
+

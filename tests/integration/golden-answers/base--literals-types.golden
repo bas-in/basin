@@ -1,0 +1,204 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: base   area: Literals/Types
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0229
+AREA Literals/Types
+SQL SELECT 9223372036854775807::BIGINT
+ORDER sorted
+STATUS rows
+COL int8	Int64	notnull
+NROWS 1
+ROW 9223372036854775807
+END
+
+QUERY 0230
+AREA Literals/Types
+SQL SELECT -9223372036854775807::BIGINT
+ORDER sorted
+STATUS rows
+COL ?column?	Int64	notnull
+NROWS 1
+ROW -9223372036854775807
+END
+
+QUERY 0231
+AREA Literals/Types
+SQL SELECT 2147483647::INTEGER
+ORDER sorted
+STATUS rows
+COL int4	Int32	notnull
+NROWS 1
+ROW 2147483647
+END
+
+QUERY 0232
+AREA Literals/Types
+SQL SELECT 'Infinity'::DOUBLE PRECISION
+ORDER sorted
+STATUS rows
+COL float8	Float64	notnull
+NROWS 1
+ROW inf
+END
+
+QUERY 0233
+AREA Literals/Types
+SQL SELECT '-Infinity'::DOUBLE PRECISION
+ORDER sorted
+STATUS rows
+COL float8	Float64	notnull
+NROWS 1
+ROW -inf
+END
+
+QUERY 0234
+AREA Literals/Types
+SQL SELECT 'NaN'::DOUBLE PRECISION
+ORDER sorted
+STATUS rows
+COL float8	Float64	notnull
+NROWS 1
+ROW NaN
+END
+
+QUERY 0235
+AREA Literals/Types
+SQL SELECT 0.0 = -0.0
+ORDER sorted
+STATUS rows
+COL ?column?	Boolean	notnull
+NROWS 1
+ROW false
+END
+
+QUERY 0236
+AREA Literals/Types
+SQL SELECT true, false, NULL::BOOLEAN
+ORDER sorted
+STATUS rows
+COL ?column?	Boolean	notnull
+COL ?column?	Boolean	notnull
+COL bool	Boolean	null
+NROWS 1
+ROW true	false	\N
+END
+
+QUERY 0237
+AREA Literals/Types
+SQL SELECT s FROM mb WHERE s = 'héllo'
+ORDER sorted
+STATUS rows
+COL s	Utf8	null
+NROWS 1
+ROW héllo
+END
+
+QUERY 0238
+AREA Literals/Types
+SQL SELECT length(s), char_length(s) FROM mb
+ORDER sorted
+STATUS rows
+COL length	Int32	null
+COL char_length	Int32	null
+NROWS 4
+ROW 10	10
+ROW 3	3
+ROW 5	5
+ROW 7	7
+END
+
+QUERY 0239
+AREA Literals/Types
+SQL SELECT upper(s) FROM mb
+ORDER sorted
+STATUS rows
+COL upper	Utf8	null
+NROWS 4
+ROW HÉLLO
+ROW NAÏVE CAFÉ
+ROW 日本語
+ROW 🎉PARTY🎉
+END
+
+QUERY 0240
+AREA Literals/Types
+SQL SELECT n, iv, tz, tags, big, small FROM e
+ORDER sorted
+STATUS rows
+COL n	Decimal128(10, 2)	null
+COL iv	Interval(MonthDayNano)	null
+COL tz	Timestamp(Microsecond, Some("UTC"))	null
+COL tags	List(Field { data_type: Utf8, nullable: true })	null
+COL big	Int64	null
+COL small	Int16	null
+NROWS 3
+ROW -12345.67	-3 days	2024-06-30T23:59:59Z	[]	-9223372036854775807	-32768
+ROW 0.00	0 secs	2024-01-01T00:00:00Z	\N	0	0
+ROW 12345.67	1 days 2 hours	2024-01-15T10:30:00Z	[x, y]	9223372036854775807	32767
+END
+
+QUERY 0241
+AREA Literals/Types
+SQL SELECT n FROM e WHERE tags IS NULL
+ORDER sorted
+STATUS rows
+COL n	Decimal128(10, 2)	null
+NROWS 1
+ROW 0.00
+END
+
+QUERY 0242
+AREA Literals/Types
+SQL SELECT tags[1] FROM e WHERE id = 1
+ORDER sorted
+STATUS rows
+COL array_element	Utf8	null
+NROWS 1
+ROW x
+END
+
+QUERY 0243
+AREA Literals/Types
+SQL SELECT array_length(tags, 1) FROM e WHERE id = 1
+ORDER sorted
+STATUS rows
+COL array_length	UInt64	null
+NROWS 1
+ROW 2
+END
+
+QUERY 0244
+AREA Literals/Types
+SQL SELECT big + 0 FROM e
+ORDER sorted
+STATUS rows
+COL ?column?	Int64	null
+NROWS 3
+ROW -9223372036854775807
+ROW 0
+ROW 9223372036854775807
+END
+
+QUERY 0245
+AREA Literals/Types
+SQL SELECT '2024-01-15'::DATE + 1
+ORDER sorted
+STATUS rows
+COL ?column?	Date32	notnull
+NROWS 1
+ROW 2024-01-16
+END
+
+QUERY 0246
+AREA Literals/Types
+SQL SELECT '{1,2,3}'::INTEGER[]
+ORDER sorted
+STATUS rows
+COL make_array	List(Field { data_type: Int64, nullable: true })	null
+NROWS 1
+ROW [1, 2, 3]
+END
+

@@ -1,0 +1,126 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: base   area: Fixture
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0001
+AREA Fixture
+SQL CREATE TABLE t (id BIGINT NOT NULL, name TEXT, amt DOUBLE PRECISION)
+ORDER sorted
+STATUS tag
+TAG CREATE TABLE
+END
+
+QUERY 0002
+AREA Fixture
+SQL INSERT INTO t VALUES (1,'a',1.5),(2,'b',2.5),(3,'c',3.5)
+ORDER sorted
+STATUS tag
+TAG INSERT 0 3
+END
+
+QUERY 0003
+AREA Fixture
+SQL INSERT INTO t VALUES (100,NULL,NULL)
+ORDER sorted
+STATUS tag
+TAG INSERT 0 1
+END
+
+QUERY 0004
+AREA Fixture
+SQL INSERT INTO t VALUES (101,'a',10.5)
+ORDER sorted
+STATUS tag
+TAG INSERT 0 1
+END
+
+QUERY 0005
+AREA Fixture
+SQL CREATE TABLE u (uid BIGINT NOT NULL, tid BIGINT, tag TEXT, n INTEGER)
+ORDER sorted
+STATUS tag
+TAG CREATE TABLE
+END
+
+QUERY 0006
+AREA Fixture
+SQL INSERT INTO u VALUES (10,1,'x',7),(11,1,'y',8),(12,2,'z',9)
+ORDER sorted
+STATUS tag
+TAG INSERT 0 3
+END
+
+QUERY 0007
+AREA Fixture
+SQL INSERT INTO u VALUES (13,NULL,'w',NULL)
+ORDER sorted
+STATUS tag
+TAG INSERT 0 1
+END
+
+QUERY 0008
+AREA Fixture
+SQL CREATE TABLE d (id BIGINT NOT NULL, day DATE, ts TIMESTAMP, flag BOOLEAN)
+ORDER sorted
+STATUS tag
+TAG CREATE TABLE
+END
+
+QUERY 0009
+AREA Fixture
+SQL INSERT INTO d VALUES (1,'2024-01-15','2024-01-15 10:30:00',true),(2,'2024-06-30','2024-06-30 23:59:59',false)
+ORDER sorted
+STATUS tag
+TAG INSERT 0 2
+END
+
+QUERY 0010
+AREA Fixture
+SQL CREATE TABLE e (id BIGINT NOT NULL, n NUMERIC(10,2), iv INTERVAL, tz TIMESTAMPTZ, tags TEXT[], big BIGINT, small SMALLINT)
+ORDER sorted
+STATUS tag
+TAG CREATE TABLE
+END
+
+QUERY 0011
+AREA Fixture
+SQL INSERT INTO e VALUES (1, 12345.67, INTERVAL '1 day 2 hours', TIMESTAMPTZ '2024-01-15 10:30:00+00', ARRAY['x','y'], 9223372036854775807, 32767), (2, -12345.67, INTERVAL '-3 days', TIMESTAMPTZ '2024-06-30 23:59:59+00', ARRAY[]::TEXT[], -9223372036854775807, -32768), (3, 0.00, INTERVAL '0', TIMESTAMPTZ '2024-01-01 00:00:00+00', NULL, 0, 0)
+ORDER sorted
+STATUS tag
+TAG INSERT 0 3
+END
+
+QUERY 0012
+AREA Fixture
+SQL CREATE TABLE mb (id BIGINT NOT NULL, s TEXT)
+ORDER sorted
+STATUS tag
+TAG CREATE TABLE
+END
+
+QUERY 0013
+AREA Fixture
+SQL INSERT INTO mb VALUES (1,'héllo'), (2,'日本語'), (3,'🎉party🎉'), (4,'naïve café')
+ORDER sorted
+STATUS tag
+TAG INSERT 0 4
+END
+
+QUERY 0014
+AREA Fixture
+SQL CREATE TABLE p (id BIGINT PRIMARY KEY, val INTEGER NOT NULL DEFAULT 0, tag TEXT)
+ORDER sorted
+STATUS tag
+TAG CREATE TABLE
+END
+
+QUERY 0015
+AREA Fixture
+SQL INSERT INTO p VALUES (1,10,'a'),(2,20,'b'),(3,30,'c')
+ORDER sorted
+STATUS tag
+TAG INSERT 0 3
+END
+

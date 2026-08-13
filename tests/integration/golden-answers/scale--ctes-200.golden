@@ -1,0 +1,31 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: scale   area: CTEs@200
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0048
+AREA CTEs@200
+SQL WITH per AS (SELECT grp, sum(v) s FROM big GROUP BY grp) SELECT grp, s FROM per ORDER BY grp
+ORDER as-returned
+STATUS rows
+COL grp	Utf8	null
+COL s	Float64	null
+NROWS 4
+ROW alpha	1206.0
+ROW beta	1180.0
+ROW delta	1228.0
+ROW gamma	1204.0
+END
+
+QUERY 0049
+AREA CTEs@200
+SQL WITH r AS (SELECT id, v FROM big WHERE id <= 20) SELECT count(*), sum(v) FROM r
+ORDER sorted
+STATUS rows
+COL count	Int64	notnull
+COL sum	Float64	null
+NROWS 1
+ROW 20	52.5
+END
+

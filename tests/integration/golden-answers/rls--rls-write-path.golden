@@ -1,0 +1,41 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: rls   area: RLS write path
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0020
+AREA RLS write path
+SQL UPDATE docs SET body = 'edited' WHERE id = 1
+ORDER sorted
+STATUS error
+ERROR new row violates row-level security policy for table "docs"
+END
+
+QUERY 0021
+AREA RLS write path
+SQL UPDATE docs SET body = 'hijacked' WHERE id = 1
+ORDER sorted
+STATUS tag
+TAG UPDATE 0
+END
+
+QUERY 0022
+AREA RLS write path
+SQL DELETE FROM docs WHERE id = 4
+ORDER sorted
+STATUS tag
+TAG DELETE 0
+END
+
+QUERY 0023
+AREA RLS write path
+SQL SELECT id, owner, body FROM docs ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL owner	Utf8	notnull
+COL body	Utf8	null
+NROWS 0
+END
+

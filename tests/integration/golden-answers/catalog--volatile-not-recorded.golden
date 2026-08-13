@@ -1,0 +1,62 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: catalog   area: Volatile (not recorded)
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0020
+AREA Volatile (not recorded)
+SQL SELECT now()
+ORDER sorted
+STATUS excluded
+EXCLUDED volatile: wall-clock value differs on every run
+END
+
+QUERY 0021
+AREA Volatile (not recorded)
+SQL SELECT CURRENT_TIMESTAMP
+ORDER sorted
+STATUS excluded
+EXCLUDED volatile: wall-clock value differs on every run
+END
+
+QUERY 0022
+AREA Volatile (not recorded)
+SQL SELECT random()
+ORDER sorted
+STATUS excluded
+EXCLUDED volatile: RNG output differs on every run
+END
+
+QUERY 0023
+AREA Volatile (not recorded)
+SQL SELECT version()
+ORDER sorted
+STATUS excluded
+EXCLUDED volatile: embeds a build/version string that changes with any release
+END
+
+QUERY 0024
+AREA Volatile (not recorded)
+SQL SELECT current_database()
+ORDER sorted
+STATUS excluded
+EXCLUDED volatile: embeds the per-run project identity
+END
+
+QUERY 0025
+AREA Volatile (not recorded)
+SQL SELECT pg_backend_pid()
+ORDER sorted
+STATUS excluded
+EXCLUDED volatile: per-process value
+END
+
+QUERY 0026
+AREA Volatile (not recorded)
+SQL EXPLAIN SELECT id FROM t WHERE id > 1
+ORDER sorted
+STATUS excluded
+EXCLUDED plan text is engine-internal by construction: the owned engine is a different planner, so a recorded plan would be a guaranteed false failure rather than a changed answer
+END
+

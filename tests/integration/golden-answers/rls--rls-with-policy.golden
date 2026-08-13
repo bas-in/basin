@@ -1,0 +1,115 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: rls   area: RLS with policy
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0010
+AREA RLS with policy
+SQL CREATE POLICY p_owner ON docs FOR ALL TO PUBLIC USING (owner = current_user)
+ORDER sorted
+STATUS tag
+TAG CREATE POLICY
+END
+
+QUERY 0011
+AREA RLS with policy
+SQL SELECT current_user
+ORDER sorted
+STATUS rows
+COL current_user	Utf8	null
+NROWS 1
+ROW anonymous
+END
+
+QUERY 0012
+AREA RLS with policy
+SQL SELECT id, owner FROM docs ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL owner	Utf8	notnull
+NROWS 3
+ROW 1	alice
+ROW 2	alice
+ROW 3	alice
+END
+
+QUERY 0013
+AREA RLS with policy
+SQL SELECT id, owner FROM docs ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL owner	Utf8	notnull
+NROWS 2
+ROW 4	bob
+ROW 5	bob
+END
+
+QUERY 0014
+AREA RLS with policy
+SQL SELECT id, owner FROM docs ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL owner	Utf8	notnull
+NROWS 0
+END
+
+QUERY 0015
+AREA RLS with policy
+SQL SELECT count(*), min(id), max(id) FROM docs
+ORDER sorted
+STATUS rows
+COL count	Int64	notnull
+COL min	Int64	null
+COL max	Int64	null
+NROWS 1
+ROW 3	1	3
+END
+
+QUERY 0016
+AREA RLS with policy
+SQL SELECT owner, count(*) FROM docs GROUP BY owner ORDER BY owner
+ORDER as-returned
+STATUS rows
+COL owner	Utf8	notnull
+COL count	Int64	notnull
+NROWS 1
+ROW alice	3
+END
+
+QUERY 0017
+AREA RLS with policy
+SQL SELECT d.id, d2.owner FROM docs d JOIN docs d2 ON d.id = d2.id ORDER BY d.id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL owner	Utf8	notnull
+NROWS 3
+ROW 1	alice
+ROW 2	alice
+ROW 3	alice
+END
+
+QUERY 0018
+AREA RLS with policy
+SQL SELECT id FROM docs WHERE owner = 'bob' ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 0
+END
+
+QUERY 0019
+AREA RLS with policy
+SQL SELECT id FROM docs WHERE id IN (SELECT id FROM docs) ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 2
+ROW 4
+ROW 5
+END
+

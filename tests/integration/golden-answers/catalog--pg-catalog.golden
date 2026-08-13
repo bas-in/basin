@@ -1,0 +1,149 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: catalog   area: pg_catalog
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0008
+AREA pg_catalog
+SQL SELECT relname FROM pg_class WHERE relname IN ('t','u','p','tv') ORDER BY relname
+ORDER as-returned
+STATUS rows
+COL relname	Utf8	notnull
+NROWS 2
+ROW p
+ROW t
+END
+
+QUERY 0009
+AREA pg_catalog
+SQL SELECT relname, relkind FROM pg_class WHERE relname IN ('t','p','tv') ORDER BY relname
+ORDER as-returned
+STATUS rows
+COL relname	Utf8	notnull
+COL relkind	Utf8	notnull
+NROWS 2
+ROW p	r
+ROW t	r
+END
+
+QUERY 0010
+AREA pg_catalog
+SQL SELECT a.attname, a.attnum, a.attnotnull FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 't' AND a.attnum > 0 ORDER BY a.attnum
+ORDER as-returned
+STATUS rows
+COL attname	Utf8	notnull
+COL attnum	Int16	notnull
+COL attnotnull	Boolean	notnull
+NROWS 3
+ROW id	1	true
+ROW name	2	false
+ROW amt	3	false
+END
+
+QUERY 0011
+AREA pg_catalog
+SQL SELECT typname FROM pg_type WHERE typname IN ('int8','text','bool','float8') ORDER BY typname
+ORDER as-returned
+STATUS rows
+COL typname	Utf8	notnull
+NROWS 4
+ROW bool
+ROW float8
+ROW int8
+ROW text
+END
+
+QUERY 0012
+AREA pg_catalog
+SQL SELECT nspname FROM pg_namespace ORDER BY nspname
+ORDER as-returned
+STATUS rows
+COL nspname	Utf8	notnull
+NROWS 8
+ROW auth
+ROW cron
+ROW information_schema
+ROW net
+ROW pg_catalog
+ROW public
+ROW realtime
+ROW storage
+END
+
+QUERY 0013
+AREA pg_catalog
+SQL SELECT count(*) FROM pg_class WHERE relkind = 'r'
+ORDER sorted
+STATUS rows
+COL count	Int64	notnull
+NROWS 1
+ROW 2
+END
+
+QUERY 0014
+AREA pg_catalog
+SQL SELECT conname, contype FROM pg_constraint ORDER BY conname, contype
+ORDER as-returned
+STATUS rows
+COL conname	Utf8	notnull
+COL contype	Utf8	notnull
+NROWS 4
+ROW p_id_not_null	n
+ROW p_pkey	p
+ROW p_val_not_null	n
+ROW t_id_not_null	n
+END
+
+QUERY 0015
+AREA pg_catalog
+SQL SELECT tablename, indexname FROM pg_indexes ORDER BY tablename, indexname
+ORDER as-returned
+STATUS rows
+COL tablename	Utf8	notnull
+COL indexname	Utf8	notnull
+NROWS 1
+ROW p	p_pkey
+END
+
+QUERY 0016
+AREA pg_catalog
+SQL SELECT current_schema()
+ORDER sorted
+STATUS rows
+COL current_schema	Utf8	null
+NROWS 1
+ROW public
+END
+
+QUERY 0017
+AREA pg_catalog
+SQL SELECT has_table_privilege('t', 'SELECT')
+ORDER sorted
+STATUS rows
+COL has_table_privilege	Boolean	null
+NROWS 1
+ROW true
+END
+
+QUERY 0018
+AREA pg_catalog
+SQL SELECT pg_typeof(1::BIGINT), pg_typeof('x'::TEXT)
+ORDER sorted
+STATUS rows
+COL pg_typeof	Utf8	null
+COL pg_typeof	Utf8	null
+NROWS 1
+ROW unknown	unknown
+END
+
+QUERY 0019
+AREA pg_catalog
+SQL SELECT format_type(oid, NULL) FROM pg_type WHERE typname = 'int8'
+ORDER sorted
+STATUS rows
+COL format_type	Utf8	null
+NROWS 1
+ROW bigint
+END
+

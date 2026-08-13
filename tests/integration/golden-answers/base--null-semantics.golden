@@ -1,0 +1,152 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: base   area: NULL semantics
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0046
+AREA NULL semantics
+SQL SELECT (NULL AND FALSE) IS NULL
+ORDER sorted
+STATUS rows
+COL ?column?	Boolean	notnull
+NROWS 1
+ROW false
+END
+
+QUERY 0047
+AREA NULL semantics
+SQL SELECT (NULL OR TRUE) AS x
+ORDER sorted
+STATUS rows
+COL x	Boolean	null
+NROWS 1
+ROW true
+END
+
+QUERY 0048
+AREA NULL semantics
+SQL SELECT (NOT NULL) IS NULL
+ORDER sorted
+STATUS rows
+COL ?column?	Boolean	notnull
+NROWS 1
+ROW true
+END
+
+QUERY 0049
+AREA NULL semantics
+SQL SELECT NULL = NULL
+ORDER sorted
+STATUS rows
+COL ?column?	Boolean	null
+NROWS 1
+ROW \N
+END
+
+QUERY 0050
+AREA NULL semantics
+SQL SELECT count(*), count(name), count(amt) FROM t
+ORDER sorted
+STATUS rows
+COL count(*)	Int64	notnull
+COL count(t.name)	Int64	notnull
+COL count(t.amt)	Int64	notnull
+NROWS 1
+ROW 5	4	4
+END
+
+QUERY 0051
+AREA NULL semantics
+SQL SELECT sum(amt) FROM t WHERE name IS NULL
+ORDER sorted
+STATUS rows
+COL sum	Float64	null
+NROWS 1
+ROW \N
+END
+
+QUERY 0052
+AREA NULL semantics
+SQL SELECT DISTINCT name FROM t ORDER BY name
+ORDER as-returned
+STATUS rows
+COL name	Utf8	null
+NROWS 4
+ROW a
+ROW b
+ROW c
+ROW \N
+END
+
+QUERY 0053
+AREA NULL semantics
+SQL SELECT name, count(*) FROM t GROUP BY name ORDER BY name NULLS FIRST
+ORDER as-returned
+STATUS rows
+COL name	Utf8	null
+COL count	Int64	notnull
+NROWS 4
+ROW \N	1
+ROW a	2
+ROW b	1
+ROW c	1
+END
+
+QUERY 0054
+AREA NULL semantics
+SQL SELECT id FROM t ORDER BY name NULLS FIRST
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 5
+ROW 100
+ROW 1
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0055
+AREA NULL semantics
+SQL SELECT id FROM t ORDER BY name ASC NULLS FIRST, id DESC
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 5
+ROW 100
+ROW 101
+ROW 1
+ROW 2
+ROW 3
+END
+
+QUERY 0056
+AREA NULL semantics
+SQL SELECT id FROM t WHERE id IN (1, NULL)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 1
+ROW 1
+END
+
+QUERY 0057
+AREA NULL semantics
+SQL SELECT id FROM t WHERE id NOT IN (SELECT tid FROM u)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 0
+END
+
+QUERY 0058
+AREA NULL semantics
+SQL SELECT COALESCE(NULL, NULL, 3)
+ORDER sorted
+STATUS rows
+COL coalesce	Int64	notnull
+NROWS 1
+ROW 3
+END
+

@@ -1,0 +1,110 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: scale   area: Ordering@200
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0036
+AREA Ordering@200
+SQL SELECT id FROM big ORDER BY id OFFSET 150 LIMIT 10
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 10
+ROW 151
+ROW 152
+ROW 153
+ROW 154
+ROW 155
+ROW 156
+ROW 157
+ROW 158
+ROW 159
+ROW 160
+END
+
+QUERY 0037
+AREA Ordering@200
+SQL SELECT id, v FROM big ORDER BY v DESC NULLS LAST, id LIMIT 10
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL v	Float64	null
+NROWS 10
+ROW 200	50.0
+ROW 199	49.75
+ROW 198	49.5
+ROW 197	49.25
+ROW 196	49.0
+ROW 195	48.75
+ROW 194	48.5
+ROW 193	48.25
+ROW 192	48.0
+ROW 191	47.75
+END
+
+QUERY 0038
+AREA Ordering@200
+SQL SELECT DISTINCT ON (grp) grp, id, k FROM big ORDER BY grp, id
+ORDER as-returned
+STATUS rows
+COL grp	Utf8	null
+COL id	Int64	notnull
+COL k	Int32	null
+NROWS 4
+ROW alpha	4	2
+ROW beta	1	7
+ROW delta	3	8
+ROW gamma	2	1
+END
+
+QUERY 0039
+AREA Ordering@200
+SQL SELECT id FROM big ORDER BY k NULLS FIRST, id LIMIT 20
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 20
+ROW 17
+ROW 34
+ROW 51
+ROW 68
+ROW 85
+ROW 102
+ROW 119
+ROW 136
+ROW 153
+ROW 170
+ROW 187
+ROW 13
+ROW 26
+ROW 39
+ROW 52
+ROW 65
+ROW 78
+ROW 91
+ROW 104
+ROW 117
+END
+
+QUERY 0040
+AREA Ordering@200
+SQL SELECT id FROM big ORDER BY grp, id DESC LIMIT 12
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 12
+ROW 200
+ROW 196
+ROW 192
+ROW 188
+ROW 184
+ROW 180
+ROW 176
+ROW 172
+ROW 168
+ROW 164
+ROW 160
+ROW 156
+END
+

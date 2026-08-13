@@ -1,0 +1,30 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: catalog   area: Fixture
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0001
+AREA Fixture
+SQL CREATE TABLE t (id BIGINT NOT NULL, name TEXT, amt DOUBLE PRECISION)
+ORDER sorted
+STATUS tag
+TAG CREATE TABLE
+END
+
+QUERY 0002
+AREA Fixture
+SQL CREATE TABLE p (id BIGINT PRIMARY KEY, val INTEGER NOT NULL DEFAULT 0, tag TEXT)
+ORDER sorted
+STATUS tag
+TAG CREATE TABLE
+END
+
+QUERY 0003
+AREA Fixture
+SQL CREATE VIEW tv AS SELECT id, name FROM t
+ORDER sorted
+STATUS tag
+TAG CREATE VIEW
+END
+

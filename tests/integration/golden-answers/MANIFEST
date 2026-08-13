@@ -1,0 +1,14 @@
+# Basin golden answers — provenance
+#
+# These are the answers the INCUMBENT engine (DataFusion path,
+# BASIN_OWNED_ENGINE unset) gave, recorded so that the question
+# "did the owned engine change an answer Basin used to give?"
+# stays answerable after DataFusion is unlinked.
+#
+recorded_by       golden_answers.rs (tests/integration/tests)
+engine            incumbent (BASIN_OWNED_ENGINE unset)
+commit            fb9cf2113a03f25fa7f8360258787da4147f2e7b
+statements        440
+files             45
+per_suite         {"base": 246, "catalog": 26, "errors": 34, "rls": 25, "scale": 49, "storage": 60}
+per_status        {"error": 32, "excluded": 17, "rows": 330, "tag": 61}

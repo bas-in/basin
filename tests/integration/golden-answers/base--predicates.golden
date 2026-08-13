@@ -1,0 +1,294 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: base   area: Predicates
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0021
+AREA Predicates
+SQL SELECT id FROM t WHERE id > 1
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 4
+ROW 100
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0022
+AREA Predicates
+SQL SELECT id FROM t WHERE name LIKE 'a%'
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 2
+ROW 1
+ROW 101
+END
+
+QUERY 0023
+AREA Predicates
+SQL SELECT id FROM t WHERE id IN (1,2)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 2
+ROW 1
+ROW 2
+END
+
+QUERY 0024
+AREA Predicates
+SQL SELECT id FROM t WHERE amt BETWEEN 1.0 AND 3.0
+ORDER sorted
+STATUS error
+ERROR internal: execute: External error: Failed to read Vortex file: projects/<PROJECT>/tables/t/data/_default/<DATE>/<ULID>.vortex:\n  Reduced array dtype mismatch from ArrayParentReduceRuleAdapter { parent: "vortex_array::arrays::scalar_fn::vtable::ExactScalarFn<vortex_array::scalar_fn::fns::between::Between>", rule: BetweenReduceAdaptor(Constant) }\nFrom:\nvortex.between\nTo:\nvortex.constant
+END
+
+QUERY 0025
+AREA Predicates
+SQL SELECT id FROM t WHERE name IS NOT NULL
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 4
+ROW 1
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0026
+AREA Predicates
+SQL SELECT id FROM t WHERE name IS DISTINCT FROM 'a'
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 3
+ROW 100
+ROW 2
+ROW 3
+END
+
+QUERY 0027
+AREA Predicates
+SQL SELECT id FROM d WHERE flag
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 1
+ROW 1
+END
+
+QUERY 0028
+AREA Predicates
+SQL SELECT id FROM t WHERE id >= 2
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 4
+ROW 100
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0029
+AREA Predicates
+SQL SELECT id FROM t WHERE id != 2
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 4
+ROW 1
+ROW 100
+ROW 101
+ROW 3
+END
+
+QUERY 0030
+AREA Predicates
+SQL SELECT id FROM t WHERE id <> 2
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 4
+ROW 1
+ROW 100
+ROW 101
+ROW 3
+END
+
+QUERY 0031
+AREA Predicates
+SQL SELECT id FROM t WHERE name ILIKE 'A%'
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 2
+ROW 1
+ROW 101
+END
+
+QUERY 0032
+AREA Predicates
+SQL SELECT id FROM t WHERE name NOT LIKE 'a%'
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 2
+ROW 2
+ROW 3
+END
+
+QUERY 0033
+AREA Predicates
+SQL SELECT id FROM t WHERE name NOT ILIKE 'A%'
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 2
+ROW 2
+ROW 3
+END
+
+QUERY 0034
+AREA Predicates
+SQL SELECT id FROM t WHERE id IS NULL
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 0
+END
+
+QUERY 0035
+AREA Predicates
+SQL SELECT id FROM t WHERE name IS NOT DISTINCT FROM 'a'
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 2
+ROW 1
+ROW 101
+END
+
+QUERY 0036
+AREA Predicates
+SQL SELECT id FROM t WHERE id NOT BETWEEN 1 AND 2
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 3
+ROW 100
+ROW 101
+ROW 3
+END
+
+QUERY 0037
+AREA Predicates
+SQL SELECT id FROM t WHERE id > 1 AND name = 'b'
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 1
+ROW 2
+END
+
+QUERY 0038
+AREA Predicates
+SQL SELECT id FROM t WHERE id > 1 OR name = 'a'
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 5
+ROW 1
+ROW 100
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0039
+AREA Predicates
+SQL SELECT id FROM t WHERE NOT (id > 1)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 1
+ROW 1
+END
+
+QUERY 0040
+AREA Predicates
+SQL SELECT id FROM t WHERE id NOT IN (1,2)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 3
+ROW 100
+ROW 101
+ROW 3
+END
+
+QUERY 0041
+AREA Predicates
+SQL SELECT id FROM t WHERE (id > 1 AND name IS NOT NULL) OR id = 1
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 4
+ROW 1
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0042
+AREA Predicates
+SQL SELECT id FROM t WHERE amt > ANY (SELECT amt FROM t WHERE id < 3)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 3
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0043
+AREA Predicates
+SQL SELECT id FROM t WHERE amt > ALL (SELECT amt FROM t WHERE id < 2)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 3
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0044
+AREA Predicates
+SQL SELECT id FROM t WHERE amt = SOME (SELECT amt FROM t)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 4
+ROW 1
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0045
+AREA Predicates
+SQL SELECT id FROM t WHERE id::TEXT LIKE '%2%'
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 1
+ROW 2
+END
+

@@ -1,0 +1,35 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: errors   area: Unsupported
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0032
+AREA Unsupported
+SQL SELECT id FROM t FOR UPDATE
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 3
+ROW 1
+ROW 2
+ROW 3
+END
+
+QUERY 0033
+AREA Unsupported
+SQL SELECT id FROM t LIMIT -1
+ORDER sorted
+CAVEAT row-limited without a top-level ORDER BY: which rows are returned is engine-defined, not SQL-defined
+STATUS error
+ERROR internal: execute: Optimizer rule 'eliminate_limit' failed\ncaused by\nError during planning: LIMIT must be >= 0, '-1' was provided
+END
+
+QUERY 0034
+AREA Unsupported
+SQL SELECT id FROM t TABLESAMPLE BERNOULLI (10)
+ORDER sorted
+STATUS excluded
+EXCLUDED random sampling: BERNOULLI selects a different subset on every run
+END
+

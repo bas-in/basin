@@ -1,0 +1,153 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: base   area: Ordering/Pagination
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0202
+AREA Ordering/Pagination
+SQL SELECT id, name FROM t ORDER BY id LIMIT 2
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL name	Utf8	null
+NROWS 2
+ROW 1	a
+ROW 2	b
+END
+
+QUERY 0203
+AREA Ordering/Pagination
+SQL SELECT id FROM t LIMIT 2 OFFSET 1
+ORDER sorted
+CAVEAT row-limited without a top-level ORDER BY: which rows are returned is engine-defined, not SQL-defined
+STATUS excluded
+EXCLUDED row-limited without a top-level ORDER BY: SQL does not define WHICH rows come back, so any recorded set is an implementation detail
+END
+
+QUERY 0204
+AREA Ordering/Pagination
+SQL SELECT id FROM t ORDER BY amt DESC NULLS LAST
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 5
+ROW 101
+ROW 3
+ROW 2
+ROW 1
+ROW 100
+END
+
+QUERY 0205
+AREA Ordering/Pagination
+SQL SELECT id FROM t ORDER BY amt / 2
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 5
+ROW 1
+ROW 2
+ROW 3
+ROW 101
+ROW 100
+END
+
+QUERY 0206
+AREA Ordering/Pagination
+SQL SELECT DISTINCT ON (tid) tid, n FROM u ORDER BY tid, n
+ORDER as-returned
+STATUS rows
+COL tid	Int64	null
+COL n	Int32	null
+NROWS 3
+ROW 1	7
+ROW 2	9
+ROW \N	\N
+END
+
+QUERY 0207
+AREA Ordering/Pagination
+SQL SELECT id FROM t ORDER BY id DESC, name ASC
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 5
+ROW 101
+ROW 100
+ROW 3
+ROW 2
+ROW 1
+END
+
+QUERY 0208
+AREA Ordering/Pagination
+SQL SELECT id FROM t ORDER BY 1 DESC
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 5
+ROW 101
+ROW 100
+ROW 3
+ROW 2
+ROW 1
+END
+
+QUERY 0209
+AREA Ordering/Pagination
+SQL SELECT id FROM t LIMIT ALL
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 5
+ROW 1
+ROW 100
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0210
+AREA Ordering/Pagination
+SQL SELECT id FROM t OFFSET 1
+ORDER sorted
+CAVEAT row-limited without a top-level ORDER BY: which rows are returned is engine-defined, not SQL-defined
+STATUS excluded
+EXCLUDED row-limited without a top-level ORDER BY: SQL does not define WHICH rows come back, so any recorded set is an implementation detail
+END
+
+QUERY 0211
+AREA Ordering/Pagination
+SQL SELECT id FROM t FETCH FIRST 2 ROWS ONLY
+ORDER sorted
+CAVEAT row-limited without a top-level ORDER BY: which rows are returned is engine-defined, not SQL-defined
+STATUS excluded
+EXCLUDED row-limited without a top-level ORDER BY: SQL does not define WHICH rows come back, so any recorded set is an implementation detail
+END
+
+QUERY 0212
+AREA Ordering/Pagination
+SQL SELECT id FROM t ORDER BY id FETCH FIRST 1 ROW WITH TIES
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 1
+ROW 1
+END
+
+QUERY 0213
+AREA Ordering/Pagination
+SQL SELECT DISTINCT ON (tid, tag) tid, tag, n FROM u ORDER BY tid, tag, n
+ORDER as-returned
+STATUS rows
+COL tid	Int64	null
+COL tag	Utf8	null
+COL n	Int32	null
+NROWS 4
+ROW 1	x	7
+ROW 1	y	8
+ROW 2	z	9
+ROW \N	w	\N
+END
+

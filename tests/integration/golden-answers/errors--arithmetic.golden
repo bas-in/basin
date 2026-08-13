@@ -1,0 +1,34 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: errors   area: Arithmetic
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0017
+AREA Arithmetic
+SQL SELECT 1/0
+ORDER sorted
+STATUS error
+ERROR internal: execute: Arrow error: Divide by zero error
+END
+
+QUERY 0018
+AREA Arithmetic
+SQL SELECT 1.0/0.0
+ORDER sorted
+STATUS rows
+COL ?column?	Float64	notnull
+NROWS 1
+ROW inf
+END
+
+QUERY 0019
+AREA Arithmetic
+SQL SELECT 9223372036854775807::BIGINT + 1
+ORDER sorted
+STATUS rows
+COL ?column?	Int64	notnull
+NROWS 1
+ROW -9223372036854775808
+END
+

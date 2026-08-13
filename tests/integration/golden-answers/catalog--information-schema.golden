@@ -1,0 +1,54 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: catalog   area: information_schema
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0004
+AREA information_schema
+SQL SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name
+ORDER as-returned
+STATUS rows
+COL table_name	Utf8	notnull
+NROWS 2
+ROW p
+ROW t
+END
+
+QUERY 0005
+AREA information_schema
+SQL SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = 't' ORDER BY column_name
+ORDER as-returned
+STATUS rows
+COL column_name	Utf8	notnull
+COL data_type	Utf8	notnull
+COL is_nullable	Utf8	notnull
+NROWS 3
+ROW amt	double precision	YES
+ROW id	bigint	NO
+ROW name	text	YES
+END
+
+QUERY 0006
+AREA information_schema
+SQL SELECT column_name, ordinal_position FROM information_schema.columns WHERE table_name = 'p' ORDER BY ordinal_position
+ORDER as-returned
+STATUS rows
+COL column_name	Utf8	notnull
+COL ordinal_position	Int32	notnull
+NROWS 3
+ROW id	1
+ROW val	2
+ROW tag	3
+END
+
+QUERY 0007
+AREA information_schema
+SQL SELECT count(*) FROM information_schema.columns WHERE table_name = 't'
+ORDER sorted
+STATUS rows
+COL count	Int64	notnull
+NROWS 1
+ROW 3
+END
+

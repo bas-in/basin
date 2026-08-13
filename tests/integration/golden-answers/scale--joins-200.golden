@@ -1,0 +1,60 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: scale   area: Joins@200
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0032
+AREA Joins@200
+SQL SELECT a.grp, count(*) FROM big a JOIN big b ON a.k = b.k GROUP BY a.grp ORDER BY a.grp
+ORDER as-returned
+STATUS rows
+COL grp	Utf8	null
+COL count	Int64	notnull
+NROWS 4
+ROW alpha	697
+ROW beta	685
+ROW delta	684
+ROW gamma	685
+END
+
+QUERY 0033
+AREA Joins@200
+SQL SELECT count(*) FROM big a JOIN big b ON a.k = b.k AND a.id < b.id
+ORDER sorted
+STATUS rows
+COL count	Int64	notnull
+NROWS 1
+ROW 1281
+END
+
+QUERY 0034
+AREA Joins@200
+SQL SELECT count(*) FROM big a LEFT JOIN big b ON a.k = b.k AND b.flag
+ORDER sorted
+STATUS rows
+COL count	Int64	notnull
+NROWS 1
+ROW 929
+END
+
+QUERY 0035
+AREA Joins@200
+SQL SELECT a.id, b.id FROM big a JOIN big b ON b.id = a.id + 100 ORDER BY a.id LIMIT 10
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL id	Int64	notnull
+NROWS 10
+ROW 1	101
+ROW 2	102
+ROW 3	103
+ROW 4	104
+ROW 5	105
+ROW 6	106
+ROW 7	107
+ROW 8	108
+ROW 9	109
+ROW 10	110
+END
+

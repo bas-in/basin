@@ -1,0 +1,317 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: base   area: Aggregates
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0059
+AREA Aggregates
+SQL SELECT count(*) FROM t
+ORDER sorted
+STATUS rows
+COL count(*)	Int64	notnull
+NROWS 1
+ROW 5
+END
+
+QUERY 0060
+AREA Aggregates
+SQL SELECT name, sum(amt) FROM t GROUP BY name
+ORDER sorted
+STATUS rows
+COL name	Utf8	null
+COL sum	Float64	null
+NROWS 4
+ROW \N	\N
+ROW a	12.0
+ROW b	2.5
+ROW c	3.5
+END
+
+QUERY 0061
+AREA Aggregates
+SQL SELECT name, count(*) FROM t GROUP BY name HAVING count(*) > 0
+ORDER sorted
+STATUS rows
+COL name	Utf8	null
+COL count	Int64	notnull
+NROWS 4
+ROW \N	1
+ROW a	2
+ROW b	1
+ROW c	1
+END
+
+QUERY 0062
+AREA Aggregates
+SQL SELECT sum(amt) FILTER (WHERE id > 1) FROM t
+ORDER sorted
+STATUS rows
+COL sum	Float64	null
+NROWS 1
+ROW 16.5
+END
+
+QUERY 0063
+AREA Aggregates
+SQL SELECT min(amt), max(amt), avg(amt) FROM t
+ORDER sorted
+STATUS rows
+COL min	Float64	null
+COL max	Float64	null
+COL avg	Float64	null
+NROWS 1
+ROW 1.5	10.5	4.5
+END
+
+QUERY 0064
+AREA Aggregates
+SQL SELECT count(DISTINCT name) FROM t
+ORDER sorted
+STATUS rows
+COL count	Int64	notnull
+NROWS 1
+ROW 3
+END
+
+QUERY 0065
+AREA Aggregates
+SQL SELECT name, count(*) FROM t GROUP BY name ORDER BY count(*) DESC
+ORDER as-returned
+STATUS excluded
+EXCLUDED ORDER BY is not a total order: three groups tie at count 1, and the tied rows came back as (\\N, b, c) in one process and (b, c, \\N) in another
+END
+
+QUERY 0066
+AREA Aggregates
+SQL SELECT tid, count(*) FROM u GROUP BY tid HAVING count(*) > 1
+ORDER sorted
+STATUS rows
+COL tid	Int64	null
+COL count	Int64	notnull
+NROWS 1
+ROW 1	2
+END
+
+QUERY 0067
+AREA Aggregates
+SQL SELECT string_agg(name, ',') FROM t
+ORDER sorted
+STATUS excluded
+EXCLUDED order-undefined: array_agg/string_agg without ORDER BY inside the aggregate has no SQL-defined element order, so any recorded order is an implementation detail
+END
+
+QUERY 0068
+AREA Aggregates
+SQL SELECT array_agg(id) FROM t
+ORDER sorted
+STATUS excluded
+EXCLUDED order-undefined: array_agg/string_agg without ORDER BY inside the aggregate has no SQL-defined element order, so any recorded order is an implementation detail
+END
+
+QUERY 0069
+AREA Aggregates
+SQL SELECT variance(amt), stddev(amt) FROM t
+ORDER sorted
+STATUS rows
+COL var	Float64	null
+COL stddev	Float64	null
+NROWS 1
+ROW 16.666666666666668	4.08248290463863
+END
+
+QUERY 0070
+AREA Aggregates
+SQL SELECT var_pop(amt), var_samp(amt) FROM t
+ORDER sorted
+STATUS rows
+COL var_pop	Float64	null
+COL var_samp	Float64	null
+NROWS 1
+ROW 12.5	16.666666666666668
+END
+
+QUERY 0071
+AREA Aggregates
+SQL SELECT stddev_pop(amt), stddev_samp(amt) FROM t
+ORDER sorted
+STATUS rows
+COL stddev_pop	Float64	null
+COL stddev_samp	Float64	null
+NROWS 1
+ROW 3.5355339059327378	4.08248290463863
+END
+
+QUERY 0072
+AREA Aggregates
+SQL SELECT bool_and(flag), bool_or(flag) FROM d
+ORDER sorted
+STATUS rows
+COL bool_and	Boolean	null
+COL bool_or	Boolean	null
+NROWS 1
+ROW false	true
+END
+
+QUERY 0073
+AREA Aggregates
+SQL SELECT every(flag) FROM d
+ORDER sorted
+STATUS rows
+COL every	Boolean	null
+NROWS 1
+ROW false
+END
+
+QUERY 0074
+AREA Aggregates
+SQL SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY amt) FROM t
+ORDER sorted
+STATUS rows
+COL percentile_cont	Float64	null
+NROWS 1
+ROW 3.0
+END
+
+QUERY 0075
+AREA Aggregates
+SQL SELECT mode() WITHIN GROUP (ORDER BY name) FROM t
+ORDER sorted
+STATUS rows
+COL mode	Utf8	null
+NROWS 1
+ROW a
+END
+
+QUERY 0076
+AREA Aggregates
+SQL SELECT sum(amt), count(*), avg(amt) FROM t WHERE id > 1000
+ORDER sorted
+STATUS rows
+COL sum	Float64	null
+COL count	Int64	notnull
+COL avg	Float64	null
+NROWS 1
+ROW \N	0	\N
+END
+
+QUERY 0077
+AREA Aggregates
+SQL SELECT max(id) FROM t WHERE id > 1000
+ORDER sorted
+STATUS rows
+COL max(id)	Int64	null
+NROWS 1
+ROW \N
+END
+
+QUERY 0078
+AREA Aggregates
+SQL SELECT count(DISTINCT name) FILTER (WHERE id > 1) FROM t
+ORDER sorted
+STATUS error
+ERROR internal: parse error: sql parser error: Expected: ), found: WHEN at Line: 1, Column: 19
+END
+
+QUERY 0079
+AREA Aggregates
+SQL SELECT tid, tag, count(*) FROM u GROUP BY ROLLUP (tid, tag)
+ORDER sorted
+STATUS rows
+COL ?column?	Int64	null
+COL count	Utf8	null
+COL count	Int64	notnull
+NROWS 8
+ROW 1	\N	2
+ROW 1	x	1
+ROW 1	y	1
+ROW 2	\N	1
+ROW 2	z	1
+ROW \N	\N	1
+ROW \N	\N	4
+ROW \N	w	1
+END
+
+QUERY 0080
+AREA Aggregates
+SQL SELECT tid, count(*) FROM u GROUP BY CUBE (tid)
+ORDER sorted
+STATUS rows
+COL ?column?	Int64	null
+COL count	Int64	notnull
+NROWS 4
+ROW 1	2
+ROW 2	1
+ROW \N	1
+ROW \N	4
+END
+
+QUERY 0081
+AREA Aggregates
+SQL SELECT tid, tag, count(*) FROM u GROUP BY GROUPING SETS ((tid), (tag), ())
+ORDER sorted
+STATUS rows
+COL ?column?	Int64	null
+COL count	Utf8	null
+COL count	Int64	notnull
+NROWS 8
+ROW 1	\N	2
+ROW 2	\N	1
+ROW \N	\N	1
+ROW \N	\N	4
+ROW \N	w	1
+ROW \N	x	1
+ROW \N	y	1
+ROW \N	z	1
+END
+
+QUERY 0082
+AREA Aggregates
+SQL SELECT name, sum(amt) FROM t GROUP BY name HAVING sum(amt) > 1 AND count(*) >= 1
+ORDER sorted
+STATUS rows
+COL name	Utf8	null
+COL sum(t.amt)	Float64	null
+NROWS 3
+ROW a	12.0
+ROW b	2.5
+ROW c	3.5
+END
+
+QUERY 0083
+AREA Aggregates
+SQL SELECT min(name), max(name) FROM t
+ORDER sorted
+STATUS rows
+COL min	Utf8	null
+COL max	Utf8	null
+NROWS 1
+ROW a	c
+END
+
+QUERY 0084
+AREA Aggregates
+SQL SELECT sum(id) FILTER (WHERE amt IS NOT NULL) FROM t
+ORDER sorted
+STATUS rows
+COL sum	Int64	null
+NROWS 1
+ROW 107
+END
+
+QUERY 0085
+AREA Aggregates
+SQL SELECT array_agg(DISTINCT name) FROM t
+ORDER sorted
+STATUS excluded
+EXCLUDED order-undefined: array_agg/string_agg without ORDER BY inside the aggregate has no SQL-defined element order, so any recorded order is an implementation detail
+END
+
+QUERY 0086
+AREA Aggregates
+SQL SELECT string_agg(DISTINCT name, ',') FROM t
+ORDER sorted
+STATUS excluded
+EXCLUDED order-undefined: array_agg/string_agg without ORDER BY inside the aggregate has no SQL-defined element order, so any recorded order is an implementation detail
+END
+

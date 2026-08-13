@@ -1,0 +1,175 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: base   area: Subqueries
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0126
+AREA Subqueries
+SQL SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t u WHERE u.id = t.id)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 5
+ROW 1
+ROW 100
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0127
+AREA Subqueries
+SQL SELECT id FROM t WHERE id = (SELECT max(id) FROM t)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 1
+ROW 101
+END
+
+QUERY 0128
+AREA Subqueries
+SQL SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.tid = t.id)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 3
+ROW 100
+ROW 101
+ROW 3
+END
+
+QUERY 0129
+AREA Subqueries
+SQL SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.id AND u.n > 7)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 2
+ROW 1
+ROW 2
+END
+
+QUERY 0130
+AREA Subqueries
+SQL SELECT id FROM t WHERE id IN (SELECT tid FROM u)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 2
+ROW 1
+ROW 2
+END
+
+QUERY 0131
+AREA Subqueries
+SQL SELECT id FROM t WHERE id NOT IN (SELECT tid FROM u WHERE tid IS NOT NULL)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 3
+ROW 100
+ROW 101
+ROW 3
+END
+
+QUERY 0132
+AREA Subqueries
+SQL SELECT id, (SELECT count(*) FROM u WHERE u.tid = t.id) FROM t
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+COL ?column?	Int64	notnull
+NROWS 5
+ROW 1	2
+ROW 100	0
+ROW 101	0
+ROW 2	1
+ROW 3	0
+END
+
+QUERY 0133
+AREA Subqueries
+SQL SELECT id FROM t WHERE amt > (SELECT avg(amt) FROM t)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 1
+ROW 101
+END
+
+QUERY 0134
+AREA Subqueries
+SQL SELECT id, (SELECT name FROM t t2 WHERE t2.id = t.id + 1) FROM t
+ORDER sorted
+STATUS error
+ERROR internal: execute: Invalid (non-executable) plan after Analyzer\ncaused by\nError during planning: Correlated scalar subquery must be aggregated to return at most one row
+END
+
+QUERY 0135
+AREA Subqueries
+SQL SELECT * FROM (SELECT id, name FROM t WHERE id > 1) AS sub
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+COL name	Utf8	null
+NROWS 4
+ROW 100	\N
+ROW 101	a
+ROW 2	b
+ROW 3	c
+END
+
+QUERY 0136
+AREA Subqueries
+SQL SELECT id FROM t WHERE amt > ALL (SELECT n FROM u WHERE u.tid = t.id)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 0
+END
+
+QUERY 0137
+AREA Subqueries
+SQL SELECT id FROM (SELECT id, row_number() OVER (ORDER BY id) rn FROM t) x WHERE rn = 1
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 1
+ROW 1
+END
+
+QUERY 0138
+AREA Subqueries
+SQL SELECT t.id FROM t WHERE t.id = ANY (SELECT tid FROM u WHERE tid IS NOT NULL)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 2
+ROW 1
+ROW 2
+END
+
+QUERY 0139
+AREA Subqueries
+SQL SELECT (SELECT count(*) FROM t) AS total
+ORDER sorted
+STATUS rows
+COL total	Int64	notnull
+NROWS 1
+ROW 5
+END
+
+QUERY 0140
+AREA Subqueries
+SQL SELECT id FROM t t1 WHERE EXISTS (SELECT 1 FROM t t2 WHERE t2.amt > t1.amt)
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 3
+ROW 1
+ROW 2
+ROW 3
+END
+

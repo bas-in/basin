@@ -1,0 +1,44 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: rls   area: RLS enabled, no policy
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0006
+AREA RLS enabled, no policy
+SQL ALTER TABLE docs ENABLE ROW LEVEL SECURITY
+ORDER sorted
+STATUS tag
+TAG ALTER TABLE
+END
+
+QUERY 0007
+AREA RLS enabled, no policy
+SQL SELECT id, owner FROM docs ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL owner	Utf8	notnull
+NROWS 0
+END
+
+QUERY 0008
+AREA RLS enabled, no policy
+SQL SELECT count(*) FROM docs
+ORDER sorted
+STATUS rows
+COL count	Int64	notnull
+NROWS 1
+ROW 0
+END
+
+QUERY 0009
+AREA RLS enabled, no policy
+SQL SELECT id, owner FROM docs ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL owner	Utf8	notnull
+NROWS 0
+END
+

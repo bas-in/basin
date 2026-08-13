@@ -1,0 +1,46 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: errors   area: Type errors
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0012
+AREA Type errors
+SQL SELECT 'abc'::INTEGER
+ORDER sorted
+STATUS error
+ERROR internal: execute: Optimizer rule 'simplify_expressions' failed\ncaused by\nArrow error: Cast error: Cannot cast string 'abc' to value of Int32 type
+END
+
+QUERY 0013
+AREA Type errors
+SQL SELECT '2024-13-45'::DATE
+ORDER sorted
+STATUS error
+ERROR internal: execute: Optimizer rule 'simplify_expressions' failed\ncaused by\nArrow error: Cast error: Cannot cast string '2024-13-45' to value of Date32 type
+END
+
+QUERY 0014
+AREA Type errors
+SQL SELECT ARRAY[1,2] + 1
+ORDER sorted
+STATUS error
+ERROR internal: plan: Error during planning: Cannot coerce arithmetic expression List(Int64) + Int64 to valid types
+END
+
+QUERY 0015
+AREA Type errors
+SQL SELECT id + name FROM t
+ORDER sorted
+STATUS error
+ERROR internal: plan: Error during planning: Cannot coerce arithmetic expression Int64 + Utf8 to valid types
+END
+
+QUERY 0016
+AREA Type errors
+SQL INSERT INTO t VALUES ('not a number','x',1.0)
+ORDER sorted
+STATUS error
+ERROR invalid schema: invalid input syntax for integer: "not a number": invalid digit found in string
+END
+

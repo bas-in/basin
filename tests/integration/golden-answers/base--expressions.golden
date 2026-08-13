@@ -1,0 +1,509 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: base   area: Expressions
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0162
+AREA Expressions
+SQL SELECT upper(name) FROM t
+ORDER sorted
+STATUS rows
+COL upper	Utf8	null
+NROWS 5
+ROW A
+ROW A
+ROW B
+ROW C
+ROW \N
+END
+
+QUERY 0163
+AREA Expressions
+SQL SELECT name || '!' FROM t
+ORDER sorted
+STATUS rows
+COL ?column?	Utf8	null
+NROWS 5
+ROW \N
+ROW a!
+ROW a!
+ROW b!
+ROW c!
+END
+
+QUERY 0164
+AREA Expressions
+SQL SELECT CASE WHEN id > 1 THEN 'big' ELSE 'small' END FROM t
+ORDER sorted
+STATUS rows
+COL ?column?	Utf8	notnull
+NROWS 5
+ROW big
+ROW big
+ROW big
+ROW big
+ROW small
+END
+
+QUERY 0165
+AREA Expressions
+SQL SELECT COALESCE(name, 'none'), NULLIF(id, 1) FROM t
+ORDER sorted
+STATUS rows
+COL coalesce	Utf8	notnull
+COL nullif	Int64	null
+NROWS 5
+ROW a	101
+ROW a	\N
+ROW b	2
+ROW c	3
+ROW none	100
+END
+
+QUERY 0166
+AREA Expressions
+SQL SELECT GREATEST(id, 2), LEAST(id, 2) FROM t
+ORDER sorted
+STATUS rows
+COL greatest	Int64	null
+COL least	Int64	null
+NROWS 5
+ROW 100	2
+ROW 101	2
+ROW 2	1
+ROW 2	2
+ROW 3	2
+END
+
+QUERY 0167
+AREA Expressions
+SQL SELECT id::TEXT, amt::INTEGER FROM t
+ORDER sorted
+STATUS rows
+COL vector_to_text	Utf8	null
+COL amt	Int32	null
+NROWS 5
+ROW 1	1
+ROW 100	\N
+ROW 101	10
+ROW 2	2
+ROW 3	3
+END
+
+QUERY 0168
+AREA Expressions
+SQL SELECT substring(name FROM 1 FOR 1), length(name), trim(name) FROM t
+ORDER sorted
+STATUS rows
+COL substr	Utf8	null
+COL length	Int32	null
+COL btrim	Utf8	null
+NROWS 5
+ROW \N	\N	\N
+ROW a	1	a
+ROW a	1	a
+ROW b	1	b
+ROW c	1	c
+END
+
+QUERY 0169
+AREA Expressions
+SQL SELECT replace(name, 'a', 'A'), position('a' IN name) FROM t
+ORDER sorted
+STATUS rows
+COL replace	Utf8	null
+COL strpos	Int32	null
+NROWS 5
+ROW A	1
+ROW A	1
+ROW \N	\N
+ROW b	0
+ROW c	0
+END
+
+QUERY 0170
+AREA Expressions
+SQL SELECT extract(YEAR FROM day) FROM d
+ORDER sorted
+STATUS rows
+COL date_part	Int32	null
+NROWS 2
+ROW 2024
+ROW 2024
+END
+
+QUERY 0171
+AREA Expressions
+SQL SELECT date_trunc('month', ts) FROM d
+ORDER sorted
+STATUS rows
+COL date_trunc	Timestamp(Microsecond, None)	null
+NROWS 2
+ROW 2024-01-01T00:00:00
+ROW 2024-06-01T00:00:00
+END
+
+QUERY 0172
+AREA Expressions
+SQL SELECT day + INTERVAL '10 days' FROM d
+ORDER sorted
+STATUS rows
+COL ?column?	Date32	null
+NROWS 2
+ROW 2024-01-25
+ROW 2024-07-10
+END
+
+QUERY 0173
+AREA Expressions
+SQL SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'many' END FROM t
+ORDER sorted
+STATUS rows
+COL ?column?	Utf8	notnull
+NROWS 5
+ROW many
+ROW many
+ROW many
+ROW one
+ROW two
+END
+
+QUERY 0174
+AREA Expressions
+SQL SELECT CASE WHEN id = 1 THEN 'a' WHEN id = 2 THEN 'b' ELSE 'c' END FROM t
+ORDER sorted
+STATUS rows
+COL ?column?	Utf8	notnull
+NROWS 5
+ROW a
+ROW b
+ROW c
+ROW c
+ROW c
+END
+
+QUERY 0175
+AREA Expressions
+SQL SELECT id % 2 FROM t
+ORDER sorted
+STATUS rows
+COL ?column?	Int64	notnull
+NROWS 5
+ROW 0
+ROW 0
+ROW 1
+ROW 1
+ROW 1
+END
+
+QUERY 0176
+AREA Expressions
+SQL SELECT id ^ 2 FROM t
+ORDER sorted
+STATUS rows
+COL ?column?	Int64	notnull
+NROWS 5
+ROW 0
+ROW 1
+ROW 102
+ROW 103
+ROW 3
+END
+
+QUERY 0177
+AREA Expressions
+SQL SELECT amt + id * 2 - 1 FROM t
+ORDER sorted
+STATUS rows
+COL ?column?	Float64	null
+NROWS 5
+ROW 2.5
+ROW 211.5
+ROW 5.5
+ROW 8.5
+ROW \N
+END
+
+QUERY 0178
+AREA Expressions
+SQL SELECT id::FLOAT8 / 2 FROM t
+ORDER sorted
+STATUS rows
+COL ?column?	Float64	notnull
+NROWS 5
+ROW 0.5
+ROW 1.0
+ROW 1.5
+ROW 50.0
+ROW 50.5
+END
+
+QUERY 0179
+AREA Expressions
+SQL SELECT lower(name), upper(name), initcap(name) FROM t
+ORDER sorted
+STATUS rows
+COL lower	Utf8	null
+COL upper	Utf8	null
+COL initcap	Utf8	null
+NROWS 5
+ROW \N	\N	\N
+ROW a	A	A
+ROW a	A	A
+ROW b	B	B
+ROW c	C	C
+END
+
+QUERY 0180
+AREA Expressions
+SQL SELECT lpad(name, 5, '*'), rpad(name, 5, '*') FROM t
+ORDER sorted
+STATUS rows
+COL lpad	Utf8	null
+COL rpad	Utf8	null
+NROWS 5
+ROW ****a	a****
+ROW ****a	a****
+ROW ****b	b****
+ROW ****c	c****
+ROW \N	\N
+END
+
+QUERY 0181
+AREA Expressions
+SQL SELECT split_part('a,b,c', ',', 2)
+ORDER sorted
+STATUS rows
+COL split_part	Utf8	null
+NROWS 1
+ROW b
+END
+
+QUERY 0182
+AREA Expressions
+SQL SELECT left(name, 1), right(name, 1) FROM t
+ORDER sorted
+STATUS rows
+COL left	Utf8	null
+COL right	Utf8	null
+NROWS 5
+ROW \N	\N
+ROW a	a
+ROW a	a
+ROW b	b
+ROW c	c
+END
+
+QUERY 0183
+AREA Expressions
+SQL SELECT repeat(name, 2) FROM t
+ORDER sorted
+STATUS rows
+COL repeat	Utf8	null
+NROWS 5
+ROW \N
+ROW aa
+ROW aa
+ROW bb
+ROW cc
+END
+
+QUERY 0184
+AREA Expressions
+SQL SELECT name ~ '^a' FROM t
+ORDER sorted
+STATUS rows
+COL regexp_like	Boolean	null
+NROWS 5
+ROW \N
+ROW false
+ROW false
+ROW true
+ROW true
+END
+
+QUERY 0185
+AREA Expressions
+SQL SELECT name ~* '^A' FROM t
+ORDER sorted
+STATUS rows
+COL regexp_like	Boolean	null
+NROWS 5
+ROW \N
+ROW false
+ROW false
+ROW true
+ROW true
+END
+
+QUERY 0186
+AREA Expressions
+SQL SELECT name SIMILAR TO 'a%' FROM t
+ORDER sorted
+STATUS rows
+COL ?column?	Boolean	null
+NROWS 5
+ROW \N
+ROW false
+ROW false
+ROW false
+ROW false
+END
+
+QUERY 0187
+AREA Expressions
+SQL SELECT ROW(id, name) FROM t
+ORDER sorted
+STATUS error
+ERROR invalid schema: cannot convert df-arrow type to workspace-arrow: Struct([Field { name: "c0", data_type: Int64, nullable: true }, Field { name: "c1", data_type: Utf8, nullable: true }])
+END
+
+QUERY 0188
+AREA Expressions
+SQL SELECT (id, name) = (1, 'a') FROM t
+ORDER sorted
+STATUS rows
+COL ?column?	Boolean	null
+NROWS 5
+ROW false
+ROW false
+ROW false
+ROW false
+ROW true
+END
+
+QUERY 0189
+AREA Expressions
+SQL SELECT ARRAY[1,2,3]
+ORDER sorted
+STATUS rows
+COL make_array	List(Field { data_type: Int64, nullable: true })	null
+NROWS 1
+ROW [1, 2, 3]
+END
+
+QUERY 0190
+AREA Expressions
+SQL SELECT ARRAY['x','y']
+ORDER sorted
+STATUS rows
+COL make_array	List(Field { data_type: Utf8, nullable: true })	null
+NROWS 1
+ROW [x, y]
+END
+
+QUERY 0191
+AREA Expressions
+SQL SELECT 1 = ANY(ARRAY[1,2,3])
+ORDER sorted
+STATUS rows
+COL ?column?	Boolean	notnull
+NROWS 1
+ROW true
+END
+
+QUERY 0192
+AREA Expressions
+SQL SELECT extract(EPOCH FROM ts) FROM d
+ORDER sorted
+STATUS rows
+COL date_part	Float64	null
+NROWS 2
+ROW 1705314600.0
+ROW 1719791999.0
+END
+
+QUERY 0193
+AREA Expressions
+SQL SELECT extract(DOW FROM day) FROM d
+ORDER sorted
+STATUS rows
+COL date_part	Int32	null
+NROWS 2
+ROW 0
+ROW 1
+END
+
+QUERY 0194
+AREA Expressions
+SQL SELECT date_part('month', day) FROM d
+ORDER sorted
+STATUS rows
+COL date_part	Int32	null
+NROWS 2
+ROW 1
+ROW 6
+END
+
+QUERY 0195
+AREA Expressions
+SQL SELECT age(ts, '2024-01-01'::timestamp) FROM d
+ORDER sorted
+STATUS rows
+COL age	Interval(MonthDayNano)	null
+NROWS 2
+ROW 14 days 10 hours 30 mins
+ROW 5 mons 29 days 23 hours 59 mins 59.000000000 secs
+END
+
+QUERY 0196
+AREA Expressions
+SQL SELECT ts - INTERVAL '1 hour' FROM d
+ORDER sorted
+STATUS rows
+COL ?column?	Timestamp(Microsecond, None)	null
+NROWS 2
+ROW 2024-01-15T09:30:00
+ROW 2024-06-30T22:59:59
+END
+
+QUERY 0197
+AREA Expressions
+SQL SELECT day - INTERVAL '1 day' FROM d
+ORDER sorted
+STATUS rows
+COL ?column?	Date32	null
+NROWS 2
+ROW 2024-01-14
+ROW 2024-06-29
+END
+
+QUERY 0198
+AREA Expressions
+SQL SELECT to_char(day, 'YYYY-MM-DD') FROM d
+ORDER sorted
+STATUS excluded
+EXCLUDED the INCUMBENT has no stable answer: 4 runs of one binary returned '2024-01-15' three times and the format string 'YYYY-MM-DD' once — basin-engine registers two different to_char UDFs under the same name
+END
+
+QUERY 0199
+AREA Expressions
+SQL SELECT CURRENT_DATE = CURRENT_DATE
+ORDER sorted
+STATUS rows
+COL ?column?	Boolean	null
+NROWS 1
+ROW true
+END
+
+QUERY 0200
+AREA Expressions
+SQL SELECT INTERVAL '1 day' + INTERVAL '2 hours'
+ORDER sorted
+STATUS rows
+COL ?column?	Interval(MonthDayNano)	notnull
+NROWS 1
+ROW 1 days 2 hours
+END
+
+QUERY 0201
+AREA Expressions
+SQL SELECT INTERVAL '1 month' > INTERVAL '1 day'
+ORDER sorted
+STATUS rows
+COL ?column?	Boolean	notnull
+NROWS 1
+ROW true
+END
+

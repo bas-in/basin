@@ -1,0 +1,140 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: base   area: CTEs
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0152
+AREA CTEs
+SQL WITH x AS (SELECT id FROM t) SELECT id FROM x
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 5
+ROW 1
+ROW 100
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0153
+AREA CTEs
+SQL WITH a AS (SELECT id FROM t), b AS (SELECT tid FROM u) SELECT a.id FROM a JOIN b ON b.tid = a.id
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 3
+ROW 1
+ROW 1
+ROW 2
+END
+
+QUERY 0154
+AREA CTEs
+SQL WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 5) SELECT n FROM r
+ORDER sorted
+STATUS rows
+COL n	Int64	notnull
+NROWS 5
+ROW 1
+ROW 2
+ROW 3
+ROW 4
+ROW 5
+END
+
+QUERY 0155
+AREA CTEs
+SQL WITH a AS (SELECT id FROM t), b AS (SELECT id FROM a WHERE id > 1) SELECT * FROM b
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 4
+ROW 100
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0156
+AREA CTEs
+SQL WITH x(a, b) AS (SELECT id, name FROM t) SELECT a, b FROM x
+ORDER sorted
+STATUS rows
+COL a	Int64	notnull
+COL b	Utf8	null
+NROWS 5
+ROW 1	a
+ROW 100	\N
+ROW 101	a
+ROW 2	b
+ROW 3	c
+END
+
+QUERY 0157
+AREA CTEs
+SQL WITH a AS (SELECT id FROM t), b AS (SELECT tid AS id FROM u), c AS (SELECT id FROM a UNION SELECT id FROM b) SELECT * FROM c
+ORDER sorted
+STATUS rows
+COL id	Int64	null
+NROWS 6
+ROW 1
+ROW 100
+ROW 101
+ROW 2
+ROW 3
+ROW \N
+END
+
+QUERY 0158
+AREA CTEs
+SQL WITH RECURSIVE r AS (SELECT id, name FROM t WHERE id = 1 UNION ALL SELECT t.id, t.name FROM t JOIN r ON t.id = r.id + 1) SELECT * FROM r
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+COL name	Utf8	null
+NROWS 3
+ROW 1	a
+ROW 2	b
+ROW 3	c
+END
+
+QUERY 0159
+AREA CTEs
+SQL WITH a AS MATERIALIZED (SELECT id FROM t) SELECT * FROM a
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 5
+ROW 1
+ROW 100
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0160
+AREA CTEs
+SQL WITH a AS NOT MATERIALIZED (SELECT id FROM t) SELECT * FROM a
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 5
+ROW 1
+ROW 100
+ROW 101
+ROW 2
+ROW 3
+END
+
+QUERY 0161
+AREA CTEs
+SQL WITH a AS (SELECT id FROM t) SELECT (SELECT count(*) FROM a)
+ORDER sorted
+STATUS rows
+COL ?column?	Int64	notnull
+NROWS 1
+ROW 5
+END
+

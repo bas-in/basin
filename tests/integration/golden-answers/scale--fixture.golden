@@ -1,0 +1,46 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: scale   area: Fixture
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0001
+AREA Fixture
+SQL CREATE TABLE big (id BIGINT NOT NULL, grp TEXT, k INTEGER, v DOUBLE PRECISION, flag BOOLEAN)
+ORDER sorted
+STATUS tag
+TAG CREATE TABLE
+END
+
+QUERY 0002
+AREA Fixture
+SQL INSERT INTO big VALUES (1,'beta',7,0.25,false),(2,'gamma',1,0.50,false),(3,'delta',8,0.75,true),(4,'alpha',2,1.00,false),(5,'beta',9,1.25,false),(6,'gamma',3,1.50,true),(7,'delta',10,1.75,false),(8,'alpha',4,2.00,false),(9,'beta',11,2.25,true),(10,'gamma',5,2.50,false),(11,'delta',12,2.75,false),(12,'alpha',6,3.00,true),(13,'beta',0,3.25,false),(14,'gamma',7,3.50,false),(15,'delta',1,3.75,true),(16,'alpha',8,4.00,false),(17,'beta',NULL,4.25,false),(18,'gamma',9,4.50,true),(19,'delta',3,4.75,false),(20,'alpha',10,5.00,false),(21,'beta',4,5.25,true),(22,'gamma',11,5.50,false),(23,'delta',5,NULL,false),(24,'alpha',12,6.00,true),(25,'beta',6,6.25,false),(26,'gamma',0,6.50,false),(27,'delta',7,6.75,true),(28,'alpha',1,7.00,false),(29,'beta',8,7.25,false),(30,'gamma',2,7.50,true),(31,'delta',9,7.75,false),(32,'alpha',3,8.00,false),(33,'beta',10,8.25,true),(34,'gamma',NULL,8.50,false),(35,'delta',11,8.75,false),(36,'alpha',5,9.00,true),(37,'beta',12,9.25,false),(38,'gamma',6,9.50,false),(39,'delta',0,9.75,true),(40,'alpha',7,10.00,false),(41,'beta',1,10.25,false),(42,'gamma',8,10.50,true),(43,'delta',2,10.75,false),(44,'alpha',9,11.00,false),(45,'beta',3,11.25,true),(46,'gamma',10,NULL,false),(47,'delta',4,11.75,false),(48,'alpha',11,12.00,true),(49,'beta',5,12.25,false),(50,'gamma',12,12.50,false)
+ORDER sorted
+STATUS tag
+TAG INSERT 0 50
+END
+
+QUERY 0003
+AREA Fixture
+SQL INSERT INTO big VALUES (51,'delta',NULL,12.75,true),(52,'alpha',0,13.00,false),(53,'beta',7,13.25,false),(54,'gamma',1,13.50,true),(55,'delta',8,13.75,false),(56,'alpha',2,14.00,false),(57,'beta',9,14.25,true),(58,'gamma',3,14.50,false),(59,'delta',10,14.75,false),(60,'alpha',4,15.00,true),(61,'beta',11,15.25,false),(62,'gamma',5,15.50,false),(63,'delta',12,15.75,true),(64,'alpha',6,16.00,false),(65,'beta',0,16.25,false),(66,'gamma',7,16.50,true),(67,'delta',1,16.75,false),(68,'alpha',NULL,17.00,false),(69,'beta',2,NULL,true),(70,'gamma',9,17.50,false),(71,'delta',3,17.75,false),(72,'alpha',10,18.00,true),(73,'beta',4,18.25,false),(74,'gamma',11,18.50,false),(75,'delta',5,18.75,true),(76,'alpha',12,19.00,false),(77,'beta',6,19.25,false),(78,'gamma',0,19.50,true),(79,'delta',7,19.75,false),(80,'alpha',1,20.00,false),(81,'beta',8,20.25,true),(82,'gamma',2,20.50,false),(83,'delta',9,20.75,false),(84,'alpha',3,21.00,true),(85,'beta',NULL,21.25,false),(86,'gamma',4,21.50,false),(87,'delta',11,21.75,true),(88,'alpha',5,22.00,false),(89,'beta',12,22.25,false),(90,'gamma',6,22.50,true),(91,'delta',0,22.75,false),(92,'alpha',7,NULL,false),(93,'beta',1,23.25,true),(94,'gamma',8,23.50,false),(95,'delta',2,23.75,false),(96,'alpha',9,24.00,true),(97,'beta',3,24.25,false),(98,'gamma',10,24.50,false),(99,'delta',4,24.75,true),(100,'alpha',11,25.00,false)
+ORDER sorted
+STATUS tag
+TAG INSERT 0 50
+END
+
+QUERY 0004
+AREA Fixture
+SQL INSERT INTO big VALUES (101,'beta',5,25.25,false),(102,'gamma',NULL,25.50,true),(103,'delta',6,25.75,false),(104,'alpha',0,26.00,false),(105,'beta',7,26.25,true),(106,'gamma',1,26.50,false),(107,'delta',8,26.75,false),(108,'alpha',2,27.00,true),(109,'beta',9,27.25,false),(110,'gamma',3,27.50,false),(111,'delta',10,27.75,true),(112,'alpha',4,28.00,false),(113,'beta',11,28.25,false),(114,'gamma',5,28.50,true),(115,'delta',12,NULL,false),(116,'alpha',6,29.00,false),(117,'beta',0,29.25,true),(118,'gamma',7,29.50,false),(119,'delta',NULL,29.75,false),(120,'alpha',8,30.00,true),(121,'beta',2,30.25,false),(122,'gamma',9,30.50,false),(123,'delta',3,30.75,true),(124,'alpha',10,31.00,false),(125,'beta',4,31.25,false),(126,'gamma',11,31.50,true),(127,'delta',5,31.75,false),(128,'alpha',12,32.00,false),(129,'beta',6,32.25,true),(130,'gamma',0,32.50,false),(131,'delta',7,32.75,false),(132,'alpha',1,33.00,true),(133,'beta',8,33.25,false),(134,'gamma',2,33.50,false),(135,'delta',9,33.75,true),(136,'alpha',NULL,34.00,false),(137,'beta',10,34.25,false),(138,'gamma',4,NULL,true),(139,'delta',11,34.75,false),(140,'alpha',5,35.00,false),(141,'beta',12,35.25,true),(142,'gamma',6,35.50,false),(143,'delta',0,35.75,false),(144,'alpha',7,36.00,true),(145,'beta',1,36.25,false),(146,'gamma',8,36.50,false),(147,'delta',2,36.75,true),(148,'alpha',9,37.00,false),(149,'beta',3,37.25,false),(150,'gamma',10,37.50,true)
+ORDER sorted
+STATUS tag
+TAG INSERT 0 50
+END
+
+QUERY 0005
+AREA Fixture
+SQL INSERT INTO big VALUES (151,'delta',4,37.75,false),(152,'alpha',11,38.00,false),(153,'beta',NULL,38.25,true),(154,'gamma',12,38.50,false),(155,'delta',6,38.75,false),(156,'alpha',0,39.00,true),(157,'beta',7,39.25,false),(158,'gamma',1,39.50,false),(159,'delta',8,39.75,true),(160,'alpha',2,40.00,false),(161,'beta',9,NULL,false),(162,'gamma',3,40.50,true),(163,'delta',10,40.75,false),(164,'alpha',4,41.00,false),(165,'beta',11,41.25,true),(166,'gamma',5,41.50,false),(167,'delta',12,41.75,false),(168,'alpha',6,42.00,true),(169,'beta',0,42.25,false),(170,'gamma',NULL,42.50,false),(171,'delta',1,42.75,true),(172,'alpha',8,43.00,false),(173,'beta',2,43.25,false),(174,'gamma',9,43.50,true),(175,'delta',3,43.75,false),(176,'alpha',10,44.00,false),(177,'beta',4,44.25,true),(178,'gamma',11,44.50,false),(179,'delta',5,44.75,false),(180,'alpha',12,45.00,true),(181,'beta',6,45.25,false),(182,'gamma',0,45.50,false),(183,'delta',7,45.75,true),(184,'alpha',1,NULL,false),(185,'beta',8,46.25,false),(186,'gamma',2,46.50,true),(187,'delta',NULL,46.75,false),(188,'alpha',3,47.00,false),(189,'beta',10,47.25,true),(190,'gamma',4,47.50,false),(191,'delta',11,47.75,false),(192,'alpha',5,48.00,true),(193,'beta',12,48.25,false),(194,'gamma',6,48.50,false),(195,'delta',0,48.75,true),(196,'alpha',7,49.00,false),(197,'beta',1,49.25,false),(198,'gamma',8,49.50,true),(199,'delta',2,49.75,false),(200,'alpha',9,50.00,false)
+ORDER sorted
+STATUS tag
+TAG INSERT 0 50
+END
+

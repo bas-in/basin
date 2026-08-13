@@ -1,0 +1,156 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: storage   area: Overlay (Parquet)
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0049
+AREA Overlay (Parquet)
+SQL UPDATE pq SET v = v * 2 WHERE id BETWEEN 20 AND 30
+ORDER sorted
+STATUS tag
+TAG UPDATE 11
+END
+
+QUERY 0050
+AREA Overlay (Parquet)
+SQL DELETE FROM pq WHERE id % 10 = 0
+ORDER sorted
+STATUS error
+ERROR invalid schema: WHERE atom must be `<col> OP <literal>`; got id % 10 Eq 0
+END
+
+QUERY 0051
+AREA Overlay (Parquet)
+SQL INSERT INTO pq VALUES (201,'alpha',1,50.25,true),(202,'beta',2,50.50,false)
+ORDER sorted
+STATUS tag
+TAG INSERT 0 2
+END
+
+QUERY 0052
+AREA Overlay (Parquet)
+SQL SELECT count(*) FROM pq
+ORDER sorted
+STATUS rows
+COL count(*)	Int64	notnull
+NROWS 1
+ROW 202
+END
+
+QUERY 0053
+AREA Overlay (Parquet)
+SQL SELECT id, v FROM pq WHERE id BETWEEN 18 AND 32 ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL v	Float64	null
+NROWS 15
+ROW 18	4.5
+ROW 19	4.75
+ROW 20	10.0
+ROW 21	10.5
+ROW 22	11.0
+ROW 23	\N
+ROW 24	12.0
+ROW 25	12.5
+ROW 26	13.0
+ROW 27	13.5
+ROW 28	14.0
+ROW 29	14.5
+ROW 30	15.0
+ROW 31	7.75
+ROW 32	8.0
+END
+
+QUERY 0054
+AREA Overlay (Parquet)
+SQL SELECT id, v FROM pq WHERE id >= 195 ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL v	Float64	null
+NROWS 8
+ROW 195	48.75
+ROW 196	49.0
+ROW 197	49.25
+ROW 198	49.5
+ROW 199	49.75
+ROW 200	50.0
+ROW 201	50.25
+ROW 202	50.5
+END
+
+QUERY 0055
+AREA Overlay (Parquet)
+SQL SELECT sum(v), count(*), count(v) FROM pq
+ORDER sorted
+STATUS rows
+COL sum	Float64	null
+COL count	Int64	notnull
+COL count	Int64	notnull
+NROWS 1
+ROW 4981.75	202	194
+END
+
+QUERY 0056
+AREA Overlay (Parquet)
+SQL SELECT id FROM pq WHERE id = 20
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 1
+ROW 20
+END
+
+QUERY 0057
+AREA Overlay (Parquet)
+SQL SELECT id FROM pq WHERE id = 30
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+NROWS 1
+ROW 30
+END
+
+QUERY 0058
+AREA Overlay (Parquet)
+SQL SELECT grp, count(*) FROM pq GROUP BY grp ORDER BY grp
+ORDER as-returned
+STATUS rows
+COL grp	Utf8	null
+COL count	Int64	notnull
+NROWS 4
+ROW alpha	51
+ROW beta	51
+ROW delta	50
+ROW gamma	50
+END
+
+QUERY 0059
+AREA Overlay (Parquet)
+SQL SELECT count(*) FROM pq WHERE id % 10 = 0
+ORDER sorted
+STATUS rows
+COL count	Int64	notnull
+NROWS 1
+ROW 20
+END
+
+QUERY 0060
+AREA Overlay (Parquet)
+SQL SELECT id, k, v FROM pq ORDER BY id DESC LIMIT 6
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL k	Int32	null
+COL v	Float64	null
+NROWS 6
+ROW 202	2	50.5
+ROW 201	1	50.25
+ROW 200	9	50.0
+ROW 199	2	49.75
+ROW 198	8	49.5
+ROW 197	1	49.25
+END
+

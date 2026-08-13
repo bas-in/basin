@@ -1,0 +1,22 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: rls   area: Fixture
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0001
+AREA Fixture
+SQL CREATE TABLE docs (id BIGINT NOT NULL, owner TEXT NOT NULL, body TEXT)
+ORDER sorted
+STATUS tag
+TAG CREATE TABLE
+END
+
+QUERY 0002
+AREA Fixture
+SQL INSERT INTO docs VALUES (1,'alice','a1'),(2,'alice','a2'),(3,'alice','a3'),(4,'bob','b1'),(5,'bob','b2'),(6,'carol','c1')
+ORDER sorted
+STATUS tag
+TAG INSERT 0 6
+END
+

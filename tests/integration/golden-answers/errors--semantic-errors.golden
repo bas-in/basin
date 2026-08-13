@@ -1,0 +1,46 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: errors   area: Semantic errors
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0024
+AREA Semantic errors
+SQL SELECT id FROM t GROUP BY name
+ORDER sorted
+STATUS error
+ERROR internal: plan: Error during planning: Column in SELECT must be in GROUP BY or an aggregate function: While expanding wildcard, column "t.id" must appear in the GROUP BY clause or must be part of an aggregate function, currently only "t.name" appears in the SELECT clause satisfies this requirement
+END
+
+QUERY 0025
+AREA Semantic errors
+SQL SELECT sum(sum(amt)) FROM t
+ORDER sorted
+STATUS error
+ERROR internal: execute: This feature is not implemented: Physical plan does not support logical expression AggregateFunction(AggregateFunction { func: AggregateUDF { inner: Sum { signature: Signature { type_signature: OneOf([Coercible([Exact { desired_type: Decimal }]), Coercible([Implicit { desired_type: Native(LogicalType(Native(UInt64), UInt64)), implicit_coercion: ImplicitCoercion { allowed_source_types: [Native(LogicalType(Native(UInt8), UInt8)), Native(LogicalType(Native(UInt16), UInt16)), Native(LogicalType(Native(UInt32), UInt32))], default_casted_type: UInt64 } }]), Coercible([Implicit { desired_type: Native(LogicalType(Native(Int64), Int64)), implicit_coercion: ImplicitCoercion { allowed_source_types: [Native(LogicalType(Native(Int8), Int8)), Native(LogicalType(Native(Int16), Int16)), Native(LogicalType(Native(Int32), Int32))], default_casted_type: Int64 } }]), Coercible([Implicit { desired_type: Native(LogicalType(Native(Float64), Float64)), implicit_coercion: ImplicitCoercion { allowed_source_types: [Float], default_casted_type: Float64 } }]), Coercible([Exact { desired_type: Duration }])]), volatility: Immutable, parameter_names: None } } }, params: AggregateFunctionParams { args: [Column(Column { relation: Some(Bare { table: "t" }), name: "amt" })], distinct: false, filter: None, order_by: [], null_treatment: None } })
+END
+
+QUERY 0026
+AREA Semantic errors
+SQL SELECT id FROM t WHERE row_number() OVER () = 1
+ORDER sorted
+STATUS error
+ERROR internal: execute: This feature is not implemented: Physical plan does not support logical expression WindowFunction(WindowFunction { fun: WindowUDF(WindowUDF { inner: RowNumber { signature: Signature { type_signature: Nullary, volatility: Immutable, parameter_names: None } } }), params: WindowFunctionParams { args: [], partition_by: [], order_by: [], window_frame: WindowFrame { units: Rows, start_bound: Preceding(UInt64(NULL)), end_bound: Following(UInt64(NULL)), is_causal: false }, filter: None, null_treatment: None, distinct: false } })
+END
+
+QUERY 0027
+AREA Semantic errors
+SQL SELECT id FROM t JOIN d ON d.id = t.id WHERE id = 1
+ORDER sorted
+STATUS error
+ERROR internal: plan: Schema error: Ambiguous reference to unqualified field id
+END
+
+QUERY 0028
+AREA Semantic errors
+SQL SELECT id FROM t UNION SELECT id, name FROM t
+ORDER sorted
+STATUS error
+ERROR internal: plan: Error during planning: UNION queries have different number of columns
+END
+

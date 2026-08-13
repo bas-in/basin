@@ -1,0 +1,83 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: scale   area: Subqueries@200
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0041
+AREA Subqueries@200
+SQL SELECT id FROM big WHERE id IN (SELECT id FROM big WHERE k = 3) ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 14
+ROW 6
+ROW 19
+ROW 32
+ROW 45
+ROW 58
+ROW 71
+ROW 84
+ROW 97
+ROW 110
+ROW 123
+ROW 149
+ROW 162
+ROW 175
+ROW 188
+END
+
+QUERY 0042
+AREA Subqueries@200
+SQL SELECT id FROM big WHERE v > (SELECT avg(v) FROM big) ORDER BY id LIMIT 15
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 15
+ROW 101
+ROW 102
+ROW 103
+ROW 104
+ROW 105
+ROW 106
+ROW 107
+ROW 108
+ROW 109
+ROW 110
+ROW 111
+ROW 112
+ROW 113
+ROW 114
+ROW 116
+END
+
+QUERY 0043
+AREA Subqueries@200
+SQL SELECT id, (SELECT count(*) FROM big b WHERE b.k = a.k) FROM big a ORDER BY id LIMIT 10
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL ?column?	Int64	notnull
+NROWS 10
+ROW 1	15
+ROW 2	15
+ROW 3	15
+ROW 4	15
+ROW 5	15
+ROW 6	14
+ROW 7	14
+ROW 8	14
+ROW 9	15
+ROW 10	14
+END
+
+QUERY 0044
+AREA Subqueries@200
+SQL SELECT count(*) FROM big a WHERE EXISTS (SELECT 1 FROM big b WHERE b.id = a.id + 1)
+ORDER sorted
+STATUS rows
+COL count	Int64	notnull
+NROWS 1
+ROW 199
+END
+

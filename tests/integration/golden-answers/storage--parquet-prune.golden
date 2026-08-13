@@ -1,0 +1,203 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: storage   area: Parquet prune
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0024
+AREA Parquet prune
+SQL SELECT count(*) FROM pq
+ORDER sorted
+STATUS rows
+COL count(*)	Int64	notnull
+NROWS 1
+ROW 200
+END
+
+QUERY 0025
+AREA Parquet prune
+SQL SELECT id, v FROM pq WHERE id < 25 ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+COL v	Float64	null
+NROWS 24
+ROW 1	0.25
+ROW 2	0.5
+ROW 3	0.75
+ROW 4	1.0
+ROW 5	1.25
+ROW 6	1.5
+ROW 7	1.75
+ROW 8	2.0
+ROW 9	2.25
+ROW 10	2.5
+ROW 11	2.75
+ROW 12	3.0
+ROW 13	3.25
+ROW 14	3.5
+ROW 15	3.75
+ROW 16	4.0
+ROW 17	4.25
+ROW 18	4.5
+ROW 19	4.75
+ROW 20	5.0
+ROW 21	5.25
+ROW 22	5.5
+ROW 23	\N
+ROW 24	6.0
+END
+
+QUERY 0026
+AREA Parquet prune
+SQL SELECT id FROM pq WHERE id BETWEEN 60 AND 70 ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 11
+ROW 60
+ROW 61
+ROW 62
+ROW 63
+ROW 64
+ROW 65
+ROW 66
+ROW 67
+ROW 68
+ROW 69
+ROW 70
+END
+
+QUERY 0027
+AREA Parquet prune
+SQL SELECT id FROM pq WHERE id > 190 ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 10
+ROW 191
+ROW 192
+ROW 193
+ROW 194
+ROW 195
+ROW 196
+ROW 197
+ROW 198
+ROW 199
+ROW 200
+END
+
+QUERY 0028
+AREA Parquet prune
+SQL SELECT id, grp, k FROM pq WHERE id = 137
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+COL grp	Utf8	null
+COL k	Int32	null
+NROWS 1
+ROW 137	beta	10
+END
+
+QUERY 0029
+AREA Parquet prune
+SQL SELECT id FROM pq WHERE id IN (7, 77, 177) ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 3
+ROW 7
+ROW 77
+ROW 177
+END
+
+QUERY 0030
+AREA Parquet prune
+SQL SELECT id FROM pq WHERE id > 10000 ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 0
+END
+
+QUERY 0031
+AREA Parquet prune
+SQL SELECT count(*), min(id), max(id) FROM pq WHERE grp = 'alpha'
+ORDER sorted
+STATUS rows
+COL count(*)	Int64	notnull
+COL min(id)	Int64	null
+COL max(id)	Int64	null
+NROWS 1
+ROW 50	4	200
+END
+
+QUERY 0032
+AREA Parquet prune
+SQL SELECT sum(v) FROM pq WHERE id <= 100
+ORDER sorted
+STATUS rows
+COL sum	Float64	null
+NROWS 1
+ROW 1205.0
+END
+
+QUERY 0033
+AREA Parquet prune
+SQL SELECT id FROM pq WHERE grp > 'c' ORDER BY id LIMIT 10
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 10
+ROW 2
+ROW 3
+ROW 6
+ROW 7
+ROW 10
+ROW 11
+ROW 14
+ROW 15
+ROW 18
+ROW 19
+END
+
+QUERY 0034
+AREA Parquet prune
+SQL SELECT count(*) FROM pq WHERE v IS NULL
+ORDER sorted
+STATUS rows
+COL count(*)	Int64	notnull
+NROWS 1
+ROW 8
+END
+
+QUERY 0035
+AREA Parquet prune
+SQL SELECT count(*) FROM pq WHERE id < 25 AND flag
+ORDER sorted
+STATUS rows
+COL count	Int64	notnull
+NROWS 1
+ROW 8
+END
+
+QUERY 0036
+AREA Parquet prune
+SQL SELECT id FROM pq WHERE id BETWEEN 45 AND 55 ORDER BY id
+ORDER as-returned
+STATUS rows
+COL id	Int64	notnull
+NROWS 11
+ROW 45
+ROW 46
+ROW 47
+ROW 48
+ROW 49
+ROW 50
+ROW 51
+ROW 52
+ROW 53
+ROW 54
+ROW 55
+END
+

@@ -1,0 +1,137 @@
+# Basin golden answers — recorded from the INCUMBENT engine (BASIN_OWNED_ENGINE unset).
+# suite: base   area: DML
+# Do not hand-edit. Regenerate: BASIN_GOLDEN_RECORD=1 cargo test -p basin-integration-tests \
+#   --test golden_answers -- --ignored --nocapture record_golden_answers
+# Rows are sorted unless ORDER is `as-returned`. `\N` is NULL. Cells are tab-separated.
+
+QUERY 0214
+AREA DML
+SQL INSERT INTO t VALUES (4,'d',4.5)
+ORDER sorted
+STATUS tag
+TAG INSERT 0 1
+END
+
+QUERY 0215
+AREA DML
+SQL INSERT INTO t SELECT 5, 'e', 5.5
+ORDER sorted
+STATUS tag
+TAG INSERT 0 1
+END
+
+QUERY 0216
+AREA DML
+SQL UPDATE t SET amt = amt + 1 WHERE id = 1
+ORDER sorted
+STATUS tag
+TAG UPDATE 1
+END
+
+QUERY 0217
+AREA DML
+SQL DELETE FROM t WHERE id = 5
+ORDER sorted
+STATUS tag
+TAG DELETE 1
+END
+
+QUERY 0218
+AREA DML
+SQL INSERT INTO t VALUES (6,'f',6.5) RETURNING id
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+COL name	Utf8	null
+COL amt	Float64	null
+NROWS 1
+ROW 6	f	6.5
+END
+
+QUERY 0219
+AREA DML
+SQL INSERT INTO p VALUES (4,40,'d') ON CONFLICT (id) DO NOTHING
+ORDER sorted
+STATUS tag
+TAG INSERT 0 1
+END
+
+QUERY 0220
+AREA DML
+SQL INSERT INTO p VALUES (1,99,'z') ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val
+ORDER sorted
+STATUS tag
+TAG INSERT 0 1
+END
+
+QUERY 0221
+AREA DML
+SQL UPDATE p SET val = val + 1 WHERE id = 1 RETURNING id, val
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+COL val	Int32	notnull
+NROWS 1
+ROW 1	100
+END
+
+QUERY 0222
+AREA DML
+SQL DELETE FROM p WHERE id = 2 RETURNING *
+ORDER sorted
+STATUS rows
+COL id	Int64	notnull
+COL val	Int32	notnull
+COL tag	Utf8	null
+NROWS 1
+ROW 2	20	b
+END
+
+QUERY 0223
+AREA DML
+SQL UPDATE p SET val = u.n FROM u WHERE p.id = u.tid AND u.n IS NOT NULL
+ORDER sorted
+STATUS tag
+TAG UPDATE 1
+END
+
+QUERY 0224
+AREA DML
+SQL DELETE FROM p USING u WHERE p.id = u.tid AND u.n > 100
+ORDER sorted
+STATUS tag
+TAG DELETE 0
+END
+
+QUERY 0225
+AREA DML
+SQL INSERT INTO p SELECT id, amt::INTEGER, name FROM t WHERE id > 100
+ORDER sorted
+STATUS tag
+TAG INSERT 0 1
+END
+
+QUERY 0226
+AREA DML
+SQL INSERT INTO p (id, tag) VALUES (5, 'e')
+ORDER sorted
+STATUS tag
+TAG INSERT 0 1
+END
+
+QUERY 0227
+AREA DML
+SQL INSERT INTO t (id, name) VALUES (7, 'g')
+ORDER sorted
+STATUS tag
+TAG INSERT 0 1
+END
+
+QUERY 0228
+AREA DML
+SQL UPDATE t SET name = upper(name) WHERE id IN (SELECT tid FROM u)
+ORDER sorted
+STATUS tag
+TAG UPDATE 2
+END
+
