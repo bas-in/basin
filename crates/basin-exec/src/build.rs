@@ -31,9 +31,11 @@ use arrow_schema::SchemaRef;
 
 use basin_pgtype::PgType;
 use basin_plan::opt::decorrelate::{contains_correlated_subquery, references_outer_row};
-use basin_plan::{ColId, CteId, Expr, LogicalPlan, OnConflict, SortKey as PlanSortKey, TableId};
+use basin_plan::{
+    ColId, ColumnRef, CteId, Expr, LogicalPlan, OnConflict, SortKey as PlanSortKey, TableId,
+};
 
-use crate::aggregate::{AggFunc, AggregateSpec, HashAggregate};
+use crate::aggregate::{AggFunc, AggregateSpec, HashAggregate, RegrKind, VarKind};
 use crate::correlated::{CorrelatedScalar, CorrelatedSubquery};
 use crate::cte::{CteBuffer, ProjectSet};
 use crate::dml::{ConflictAction, Delete, Insert, MemoryRowSink, RowSink, Update};
@@ -767,23 +769,28 @@ fn build_inner(
         // planner bug it will not paper over.
         LogicalPlan::Window { input, windows } => {
             let child = build_inner(input, tables, dml, budget, ctes, outer)?;
-            let windows: Vec<Expr> = windows
+            let mut windows: Vec<Expr> = windows
                 .iter()
                 .map(|e| bind_outer(e, outer, tables, dml, budget, ctes))
                 .collect::<Result<_, _>>()?;
             let (partition_by, order_by) = window_keys(&windows)?;
+            let (child, trim) = materialize_window_args(child, &mut windows)?;
             let specs = windows
                 .iter()
                 .enumerate()
                 .map(|(i, w)| window_spec(w, &format!("window{i}")))
                 .collect::<Result<Vec<_>, BuildError>>()?;
-            Ok(Box::new(WindowAgg::new(
+            let agg: Box<dyn Operator> = Box::new(WindowAgg::new(
                 child,
                 partition_by,
                 order_by,
                 specs,
                 budget,
-            )?))
+            )?);
+            match trim {
+                None => Ok(agg),
+                Some(t) => Ok(Box::new(trim_materialized_window_args(agg, t)?)),
+            }
         }
 
         // Set-returning functions in the target list — the shape
@@ -1956,6 +1963,16 @@ fn sort_keys(keys: &[PlanSortKey]) -> Result<Vec<SortKey>, BuildError> {
 /// OID per input type because Postgres resolves aggregates by signature. The
 /// physical layer only cares which accumulator to run, so many OIDs collapse to
 /// one variant here; the type-specific behaviour lives in the accumulator.
+///
+/// `manual_range_patterns` is allowed rather than applied. Clippy is right
+/// that `2148 | 2149 | … | 2153` *is* `2148..=2153`; the point is that the
+/// two say different things to a reader. The enumerated form is a list of
+/// oids that were each read back from `pg_proc` by name; the range asserts
+/// that nothing else was ever assigned inside it, which is a claim about
+/// PostgreSQL's oid allocation that this table has no way to check and that
+/// the next person cannot verify without a server. This file has already
+/// been wrong about exactly that once — see `window_func_of`.
+#[allow(clippy::manual_range_patterns)]
 fn agg_func_of(oid: u32) -> Option<AggFunc> {
     Some(match oid {
         2803 => AggFunc::CountStar,
@@ -1977,6 +1994,124 @@ fn agg_func_of(oid: u32) -> Option<AggFunc> {
         // column per row) is known; `agg_func_of` only sees the OID, not
         // the argument list.
         3538 | 3545 => AggFunc::StringAgg { delim_col: 0 },
+
+        // ─── The variance family ─────────────────────────────────────────
+        //
+        // Six overloads each — int8/int4/int2/float4/float8/numeric, in that
+        // declaration order — and each block happens to be contiguous in
+        // `pg_proc`. They are spelled out one oid at a time anyway, rather
+        // than as `2148..=2153`, for the reason recorded above `lag`/`lead`
+        // in `window_func_of`: a range asserts that nothing else was ever
+        // assigned inside it, which is a claim about oids this table cannot
+        // check. Every oid below was read back individually from a live
+        // PostgreSQL 18.2 with `proname` and `pg_get_function_arguments`.
+        //
+        // `variance` is Postgres's own alias for `var_samp` and `stddev` for
+        // `stddev_samp` — separate oids, separate `pg_proc` rows, identical
+        // accumulator and finalizer. See `VarKind`.
+        2148 | 2149 | 2150 | 2151 | 2152 | 2153 => AggFunc::Variance(VarKind::VarSamp), // variance
+        2641 | 2642 | 2643 | 2644 | 2645 | 2646 => AggFunc::Variance(VarKind::VarSamp), // var_samp
+        2718 | 2719 | 2720 | 2721 | 2722 | 2723 => AggFunc::Variance(VarKind::VarPop),  // var_pop
+        2154 | 2155 | 2156 | 2157 | 2158 | 2159 => AggFunc::Variance(VarKind::StddevSamp), // stddev
+        2712 | 2713 | 2714 | 2715 | 2716 | 2717 => AggFunc::Variance(VarKind::StddevSamp), // stddev_samp
+        2724 | 2725 | 2726 | 2727 | 2728 | 2729 => AggFunc::Variance(VarKind::StddevPop), // stddev_pop
+
+        // ─── Bitwise and boolean ─────────────────────────────────────────
+        //
+        // Four overloads each: int2/int4/int8/bit. The `bit` ones — 2242,
+        // 2243 and 6167 — are deliberately absent: Basin has no `bit` type,
+        // so resolving them here would map a call the rest of the stack
+        // cannot represent. Falling back is the right answer for those.
+        //
+        // Note `bit_xor` is 6164..6166, nowhere near `bit_and`/`bit_or`'s
+        // 2236..2241 — it was added long after them (PG 14). Assuming
+        // adjacency here would have mapped it onto `int2vectorout`'s
+        // neighbourhood.
+        2236 | 2238 | 2240 => AggFunc::BitAnd,
+        2237 | 2239 | 2241 => AggFunc::BitOr,
+        6164 | 6165 | 6166 => AggFunc::BitXor,
+        // 2519 is `every(boolean)` — the SQL-standard spelling of `bool_and`,
+        // a separate `pg_proc` row with the same transition function. Wired
+        // alongside it because the alias relationship is real (checked live:
+        // `every` is `prokind = 'a'`, one boolean argument, oid 2519) and
+        // because leaving it out would make `every(flag)` fall back while
+        // `bool_and(flag)` served, for no reason a user could see. There is
+        // no `every`-shaped `bool_or`; the standard spells that one `some`,
+        // which PostgreSQL does not define as an aggregate at all.
+        2517 | 2519 => AggFunc::BoolAnd,
+        2518 => AggFunc::BoolOr,
+
+        // ─── The two-argument statistical family ─────────────────────────
+        //
+        // One oid each — all take `(float8, float8)`, so there are no
+        // overloads to interleave. Postgres's argument order is `f(Y, X)`,
+        // dependent variable first; the `x_col: 0` placeholder here is
+        // always overwritten in `agg_spec` from `args[1]`, exactly as
+        // `StringAgg`'s `delim_col` is, because `agg_func_of` sees only the
+        // oid and not the argument list.
+        //
+        // The oids run in `pg_proc` order, which is *not* alphabetical and
+        // not grouped by what the function computes: `regr_r2` (2824) sits
+        // between `regr_avgy` and `regr_slope`, and `corr` (2829) after the
+        // two `covar_*`. Each was read back by name from the live server.
+        2818 => AggFunc::Regr {
+            kind: RegrKind::Count,
+            x_col: 0,
+        }, // regr_count
+        2819 => AggFunc::Regr {
+            kind: RegrKind::Sxx,
+            x_col: 0,
+        }, // regr_sxx
+        2820 => AggFunc::Regr {
+            kind: RegrKind::Syy,
+            x_col: 0,
+        }, // regr_syy
+        2821 => AggFunc::Regr {
+            kind: RegrKind::Sxy,
+            x_col: 0,
+        }, // regr_sxy
+        2822 => AggFunc::Regr {
+            kind: RegrKind::AvgX,
+            x_col: 0,
+        }, // regr_avgx
+        2823 => AggFunc::Regr {
+            kind: RegrKind::AvgY,
+            x_col: 0,
+        }, // regr_avgy
+        2824 => AggFunc::Regr {
+            kind: RegrKind::R2,
+            x_col: 0,
+        }, // regr_r2
+        2825 => AggFunc::Regr {
+            kind: RegrKind::Slope,
+            x_col: 0,
+        }, // regr_slope
+        2826 => AggFunc::Regr {
+            kind: RegrKind::Intercept,
+            x_col: 0,
+        }, // regr_intercept
+        2827 => AggFunc::Regr {
+            kind: RegrKind::CovarPop,
+            x_col: 0,
+        }, // covar_pop
+        2828 => AggFunc::Regr {
+            kind: RegrKind::CovarSamp,
+            x_col: 0,
+        }, // covar_samp
+        2829 => AggFunc::Regr {
+            kind: RegrKind::Corr,
+            x_col: 0,
+        }, // corr
+
+        // 3988 `percent_rank(VARIADIC "any" ORDER BY VARIADIC "any")` and
+        // 3990 `cume_dist(...)` are NOT mapped here, and must not be. They
+        // share a name with the window functions wired in `window_func_of`
+        // (3103, 3104) but they are hypothetical-set aggregates: they answer
+        // "where would this hypothetical row rank", taking the probe row as
+        // arguments and a `WITHIN GROUP (ORDER BY …)` clause. Wiring them to
+        // the window implementations would answer a different question with
+        // the same column name. Same reason `percentile_cont` is absent —
+        // ordered-set aggregates have no representation in `AggregateSpec`.
         _ => return None,
     })
 }
@@ -2032,6 +2167,22 @@ fn agg_spec(e: &Expr, alias: &str) -> Result<AggregateSpec, BuildError> {
                     .ok_or(BuildError::NonColumnKey("string_agg delimiter"))?;
                 f = AggFunc::StringAgg { delim_col };
             }
+            // `regr_slope(y, x)` and its eleven relatives read a *second*
+            // column per row, carried on the variant for the same reason
+            // `string_agg`'s delimiter is (`AggFunc::Regr`'s doc). `input_col`
+            // above already holds `args[0]`, which is Y — Postgres puts the
+            // dependent variable first — so the column resolved here is X.
+            // Getting the two the wrong way round is not a fallback but a
+            // wrong answer: `regr_slope` and `regr_avgx` are both defined for
+            // the swapped arguments and both return a different number.
+            if let AggFunc::Regr { kind, .. } = f {
+                let x_expr = args.get(1).ok_or_else(|| {
+                    BuildError::Unsupported("regr_*/corr/covar_* without a second argument".into())
+                })?;
+                let x_col = column_index(x_expr)
+                    .ok_or(BuildError::NonColumnKey("regr_* second argument"))?;
+                f = AggFunc::Regr { kind, x_col };
+            }
             let filter_col = match filter {
                 None => None,
                 Some(x) => {
@@ -2063,6 +2214,29 @@ fn window_func_of(oid: u32) -> Option<WindowFunc> {
         3100 => WindowFunc::RowNumber,
         3101 => WindowFunc::Rank,
         3102 => WindowFunc::DenseRank,
+        // 3103/3104/3105, read back from the live server with `prokind` in
+        // hand: all three are `prokind = 'w'`, true window functions, and
+        // 3103/3104 take no arguments at all.
+        //
+        // `percent_rank` and `cume_dist` have a SECOND spelling in pg_proc —
+        // 3988 and 3990 — which is `prokind = 'a'` with `pg_aggregate.aggkind
+        // = 'h'`: the hypothetical-set aggregates `percent_rank(VARIADIC
+        // "any") WITHIN GROUP (ORDER BY VARIADIC "any")`. Same names, same
+        // return type, entirely different question — they rank a hypothetical
+        // row supplied as an argument against the group, rather than ranking
+        // each actual row within its partition. Mapping them onto these
+        // implementations would produce a plausible float per group and be
+        // wrong; `basin-pgtype` omits them on purpose and pins the omission
+        // with a test, so they cannot arrive here anyway. Recorded because
+        // the adjacency of the names, not of the oids, is the trap.
+        3103 => WindowFunc::PercentRank,
+        3104 => WindowFunc::CumeDist,
+        // `ntile(integer)`'s bucket count rides on the variant rather than in
+        // `WindowSpec::arg_col` — same convention as `AggFunc::StringAgg`'s
+        // `delim_col`, and the operator actively rejects a spec that puts it
+        // in `arg_col`. The placeholder `0` here is always overwritten in
+        // `window_spec`, which is the only place the argument list is visible.
+        3105 => WindowFunc::Ntile { buckets_col: 0 },
         // The oids below are the real ones, dumped from PostgreSQL 18.2:
         //
         //   3106 lag(anyelement)                    3109 lead(anyelement)
@@ -2184,6 +2358,21 @@ fn window_spec(e: &Expr, alias: &str) -> Result<WindowSpec, BuildError> {
             Some(column_index(a).ok_or(BuildError::NonColumnKey("window argument"))?)
         }
     };
+    // `ntile(n)` reads `n` from a resolved column carried on the WindowFunc
+    // variant, not from `arg_col` — `window.rs`'s `resolve_window` returns a
+    // TypeMismatch if `arg_col` is set for an Ntile, so this move is required
+    // rather than cosmetic. The operator reads that column ONCE, at the
+    // partition's first row (verified live against a per-row-varying `n`), so
+    // it is a per-partition constant even though it is materialized per row.
+    let (f, arg_col) = match f {
+        WindowFunc::Ntile { .. } => {
+            let buckets_col = arg_col.ok_or_else(|| {
+                BuildError::Unsupported("ntile() without a bucket-count argument".into())
+            })?;
+            (WindowFunc::Ntile { buckets_col }, None)
+        }
+        other => (other, arg_col),
+    };
     let offset_col = match args.get(1) {
         None => None,
         Some(a) => Some(column_index(a).ok_or(BuildError::NonColumnKey("window offset"))?),
@@ -2205,6 +2394,124 @@ fn window_spec(e: &Expr, alias: &str) -> Result<WindowSpec, BuildError> {
         frame: frame_of(frame)?,
         alias: alias.to_string(),
     })
+}
+
+/// What a materializing `Project` beneath a `WindowAgg` added, and therefore
+/// what has to be taken back off above it — see
+/// [`materialize_window_args`].
+struct WindowArgTrim {
+    /// Width of the `WindowAgg`'s input *before* materialization.
+    base_width: usize,
+    /// How many argument columns were appended.
+    extra: usize,
+    /// How many window functions the node computes.
+    windows: usize,
+}
+
+/// One column of `schema` as a `(Expr::Column, name)` pair for a `Project`.
+fn passthrough(schema: &SchemaRef, index: usize) -> Result<(Expr, String), BuildError> {
+    let name = schema.field(index).name().clone();
+    let index = u16::try_from(index)
+        .map_err(|_| BuildError::Unsupported("projection wider than u16 columns".into()))?;
+    Ok((
+        Expr::Column(ColumnRef {
+            relation: 0,
+            index,
+            name: name.clone(),
+        }),
+        name,
+    ))
+}
+
+/// Materialize any non-column window *argument* into a `Project` beneath the
+/// `WindowAgg`, rewriting `windows` in place to reference the new column.
+///
+/// [`window_spec`] resolves every argument with `column_index(...).ok_or(
+/// NonColumnKey)`, exactly as `agg_spec` does — and for aggregates,
+/// `basin-plan`'s `lower/select.rs::materialize_agg_inputs` already satisfies
+/// that contract by inserting a `Project` under the `Aggregate`. There is no
+/// companion pass for windows, so before this function existed EVERY window
+/// call with a constant argument failed the same way and fell back:
+/// `lag(x, 1)`, `lead(x, 1)`, `nth_value(x, 2)` and `ntile(3)` alike —
+/// measured, not assumed, against a live server through the owned-engine
+/// bridge. Only `lag(x)`/`lead(x)` with the offset omitted entirely ever
+/// reached the operator.
+///
+/// Doing it here rather than in the plan layer keeps the requirement and its
+/// satisfaction in the one file that imposes it. The cost is that the
+/// `Project` widens the operator's input, which would shift the window
+/// outputs' positions — the logical `Window` node's schema is `input columns
+/// ++ one column per window`, and the `Project` above it reads those by
+/// index. [`WindowArgTrim`] carries what
+/// [`trim_materialized_window_args`] needs to restore that layout, so the
+/// widening is invisible to the parent.
+///
+/// Returns `(child, None)` untouched when every argument is already a column,
+/// which is the overwhelmingly common case — a query that works today gets no
+/// extra operator, no extra copy, and no change in nullability from
+/// `Project::new`'s all-nullable output schema.
+fn materialize_window_args(
+    child: Box<dyn Operator>,
+    windows: &mut [Expr],
+) -> Result<(Box<dyn Operator>, Option<WindowArgTrim>), BuildError> {
+    let schema = child.schema();
+    let base_width = schema.fields().len();
+    let mut extra: Vec<(Expr, String)> = Vec::new();
+
+    for w in windows.iter_mut() {
+        let Expr::Window { args, .. } = w else {
+            continue;
+        };
+        for a in args.iter_mut() {
+            if matches!(a, Expr::Column(_)) {
+                continue;
+            }
+            let name = format!("windowarg{}", extra.len());
+            let index = u16::try_from(base_width + extra.len())
+                .map_err(|_| BuildError::Unsupported("projection wider than u16 columns".into()))?;
+            extra.push((a.clone(), name.clone()));
+            *a = Expr::Column(ColumnRef {
+                relation: 0,
+                index,
+                name,
+            });
+        }
+    }
+
+    if extra.is_empty() {
+        return Ok((child, None));
+    }
+
+    let trim = WindowArgTrim {
+        base_width,
+        extra: extra.len(),
+        windows: windows.len(),
+    };
+    let mut exprs = Vec::with_capacity(base_width + extra.len());
+    for i in 0..base_width {
+        exprs.push(passthrough(&schema, i)?);
+    }
+    exprs.extend(extra);
+    Ok((Box::new(Project::new(child, exprs)?), Some(trim)))
+}
+
+/// Drop the columns [`materialize_window_args`] appended, restoring the
+/// `input columns ++ one per window` schema the parent `Project` indexes
+/// into. The window outputs sit *after* the materialized arguments in the
+/// `WindowAgg`'s schema, which is the whole reason this is not a no-op.
+fn trim_materialized_window_args(
+    agg: Box<dyn Operator>,
+    trim: WindowArgTrim,
+) -> Result<Project, BuildError> {
+    let schema = agg.schema();
+    let mut exprs = Vec::with_capacity(trim.base_width + trim.windows);
+    for i in 0..trim.base_width {
+        exprs.push(passthrough(&schema, i)?);
+    }
+    for i in 0..trim.windows {
+        exprs.push(passthrough(&schema, trim.base_width + trim.extra + i)?);
+    }
+    Ok(Project::new(agg, exprs)?)
 }
 
 /// Carry the plan's frame across. `None` means the SQL had no explicit frame,
@@ -2320,6 +2627,225 @@ mod tests {
     fn the_three_argument_lag_and_lead_forms_are_refused_not_silently_truncated() {
         assert_eq!(window_func_of(3108), None);
         assert_eq!(window_func_of(3111), None);
+    }
+
+    /// The variance family, one oid at a time. Read back from a live
+    /// PostgreSQL 18.2 with `proname` and `pg_get_function_arguments`, six
+    /// overloads each in declaration order int8/int4/int2/float4/float8/
+    /// numeric.
+    ///
+    /// `variance` and `stddev` are Postgres's own aliases for `var_samp` and
+    /// `stddev_samp` — DIFFERENT oids, same accumulator and finalizer — so
+    /// the pairs below must land on the same [`VarKind`], and `var_pop`/
+    /// `stddev_pop` must not.
+    #[test]
+    fn variance_family_oids_match_the_real_pg_proc_rows() {
+        for (oid, want) in [
+            // variance(int8/int4/int2/float4/float8/numeric)
+            (2148, VarKind::VarSamp),
+            (2149, VarKind::VarSamp),
+            (2150, VarKind::VarSamp),
+            (2151, VarKind::VarSamp),
+            (2152, VarKind::VarSamp),
+            (2153, VarKind::VarSamp),
+            // var_samp
+            (2641, VarKind::VarSamp),
+            (2646, VarKind::VarSamp),
+            // var_pop
+            (2718, VarKind::VarPop),
+            (2723, VarKind::VarPop),
+            // stddev
+            (2154, VarKind::StddevSamp),
+            (2159, VarKind::StddevSamp),
+            // stddev_samp
+            (2712, VarKind::StddevSamp),
+            (2717, VarKind::StddevSamp),
+            // stddev_pop
+            (2724, VarKind::StddevPop),
+            (2729, VarKind::StddevPop),
+        ] {
+            assert_eq!(agg_func_of(oid), Some(AggFunc::Variance(want)), "oid {oid}");
+        }
+        // The blocks must not have run into each other: one past each end is
+        // either a different function or nothing at all, never the same kind.
+        assert_ne!(agg_func_of(2147), Some(AggFunc::Variance(VarKind::VarSamp)));
+        assert_ne!(
+            agg_func_of(2160),
+            Some(AggFunc::Variance(VarKind::StddevSamp))
+        );
+    }
+
+    /// `bit_xor` is oid 6164..6166 — added in PostgreSQL 14, nowhere near
+    /// `bit_and`/`bit_or`'s 2236..2241. The `bit`-typed fourth overload of
+    /// each (2242, 2243, 6167) is deliberately unmapped: Basin has no `bit`
+    /// type, so falling back is the honest answer rather than running the
+    /// integer accumulator over something that is not an integer.
+    #[test]
+    fn bitwise_and_boolean_aggregate_oids() {
+        for oid in [2236, 2238, 2240] {
+            assert_eq!(agg_func_of(oid), Some(AggFunc::BitAnd), "oid {oid}");
+        }
+        for oid in [2237, 2239, 2241] {
+            assert_eq!(agg_func_of(oid), Some(AggFunc::BitOr), "oid {oid}");
+        }
+        for oid in [6164, 6165, 6166] {
+            assert_eq!(agg_func_of(oid), Some(AggFunc::BitXor), "oid {oid}");
+        }
+        assert_eq!(agg_func_of(2517), Some(AggFunc::BoolAnd));
+        assert_eq!(agg_func_of(2518), Some(AggFunc::BoolOr));
+        // `every(boolean)`, the SQL-standard spelling of `bool_and`.
+        assert_eq!(agg_func_of(2519), Some(AggFunc::BoolAnd));
+        for bit_typed in [2242, 2243, 6167] {
+            assert_eq!(agg_func_of(bit_typed), None, "oid {bit_typed} is bit-typed");
+        }
+    }
+
+    /// The twelve two-argument statistical aggregates. `pg_proc` orders them
+    /// neither alphabetically nor by what they compute — `regr_r2` (2824)
+    /// sits between `regr_avgy` and `regr_slope` — so an off-by-one here maps
+    /// a call onto a function that is *also* defined for the same arguments
+    /// and returns a different number without erroring.
+    #[test]
+    fn regression_family_oids_match_the_real_pg_proc_rows() {
+        for (oid, kind) in [
+            (2818, RegrKind::Count),
+            (2819, RegrKind::Sxx),
+            (2820, RegrKind::Syy),
+            (2821, RegrKind::Sxy),
+            (2822, RegrKind::AvgX),
+            (2823, RegrKind::AvgY),
+            (2824, RegrKind::R2),
+            (2825, RegrKind::Slope),
+            (2826, RegrKind::Intercept),
+            (2827, RegrKind::CovarPop),
+            (2828, RegrKind::CovarSamp),
+            (2829, RegrKind::Corr),
+        ] {
+            assert_eq!(
+                agg_func_of(oid),
+                Some(AggFunc::Regr { kind, x_col: 0 }),
+                "oid {oid}"
+            );
+        }
+    }
+
+    /// `percent_rank`/`cume_dist` exist TWICE in `pg_proc` under the same
+    /// name: 3103/3104 are `prokind = 'w'` window functions, 3988/3990 are
+    /// `prokind = 'a'` hypothetical-set aggregates (`pg_aggregate.aggkind =
+    /// 'h'`) taking the probe row as arguments plus a `WITHIN GROUP` clause.
+    /// Verified live, both directions. Mapping the aggregate spellings onto
+    /// these window implementations would answer a different question under
+    /// the same column name, so both tables must refuse them.
+    #[test]
+    fn the_hypothetical_set_spellings_are_not_the_window_ones() {
+        assert_eq!(window_func_of(3103), Some(WindowFunc::PercentRank));
+        assert_eq!(window_func_of(3104), Some(WindowFunc::CumeDist));
+        assert_eq!(
+            window_func_of(3105),
+            Some(WindowFunc::Ntile { buckets_col: 0 })
+        );
+        for hypothetical in [3988, 3990] {
+            assert_eq!(window_func_of(hypothetical), None, "oid {hypothetical}");
+            assert_eq!(agg_func_of(hypothetical), None, "oid {hypothetical}");
+        }
+    }
+
+    /// The ordered-set aggregates are deliberately not wired to anything:
+    /// they take a `WITHIN GROUP (ORDER BY …)` clause that `AggregateSpec`
+    /// has no representation for, and `agg_spec` refuses a non-empty
+    /// `order_by` unconditionally anyway. Read live: `percentile_cont` is
+    /// 3974/3976/3980/3982, `percentile_disc` 3972/3978, `mode` 3984 — the
+    /// float8 and float8[] forms are NOT adjacent, they interleave with
+    /// `percentile_disc`. Falling back is the right answer for all of them;
+    /// mapping `percentile_cont` onto some two-argument aggregate that
+    /// merely accepts the arity would not be.
+    #[test]
+    fn the_ordered_set_aggregates_are_not_wired_to_anything() {
+        for oid in [3972, 3974, 3976, 3978, 3980, 3982, 3984] {
+            assert_eq!(agg_func_of(oid), None, "oid {oid}");
+        }
+    }
+
+    /// `ntile(3)`'s argument is a LITERAL, and nothing in the plan layer
+    /// materializes non-column window arguments the way
+    /// `materialize_agg_inputs` does for aggregates — so before
+    /// [`materialize_window_args`] this failed `NonColumnKey` and the whole
+    /// query fell back. Measured, live: `ntile(3)`, `lag(x, 1)`,
+    /// `lead(x, 1)` and `nth_value(x, 2)` were all unreachable for that one
+    /// reason.
+    ///
+    /// The assertion that matters as much as the values is the WIDTH. The
+    /// materializing `Project` widens the operator's input, which pushes the
+    /// window outputs to the right; the logical `Window` node's schema is
+    /// `input columns ++ one per window` and the parent `Project` reads those
+    /// by index. If the trim above the `WindowAgg` were missing, the values
+    /// below would still be correct and every caller would read the wrong
+    /// column.
+    ///
+    /// `ntile(3)` over these four rows is `1,1,2,3` — read from a live
+    /// PostgreSQL 18.2, not derived. Buckets are as-equal-as-possible with
+    /// the LARGER ones first, so the extra row lands in bucket 1, not 3.
+    #[test]
+    fn ntile_with_a_literal_argument_builds_and_keeps_the_output_width() {
+        let plan = LogicalPlan::Window {
+            input: Box::new(scan_plan(vec![ColId(0), ColId(1)], vec![])),
+            windows: vec![Expr::Window {
+                func: basin_plan::FuncId(basin_pgtype::Oid(3105)),
+                args: vec![Expr::Literal(Datum::Int32(3), PgType::INT4)],
+                partition_by: vec![],
+                order_by: vec![basin_plan::SortKey {
+                    expr: col(0, "id"),
+                    descending: false,
+                    nulls_first: false,
+                }],
+                frame: basin_plan::WindowFrame {
+                    units: basin_plan::FrameUnits::Range,
+                    start: basin_plan::FrameBound::UnboundedPreceding,
+                    end: basin_plan::FrameBound::CurrentRow,
+                },
+            }],
+        };
+
+        let batches = drain(build(&plan, &resolver()).unwrap());
+        assert_eq!(
+            batches[0].num_columns(),
+            3,
+            "id, v and the one window output — the materialized `3` must not \
+             survive into the node's schema"
+        );
+        let got: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                let a = b.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
+                (0..b.num_rows()).map(|i| a.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(got, vec![1, 1, 2, 3]);
+    }
+
+    /// The gated half of [`materialize_window_args`]: a window whose every
+    /// argument is already a column gets no extra operators at all, so the
+    /// queries that worked before it existed are byte-for-byte unaffected —
+    /// including `Project::new`'s all-nullable output schema, which would
+    /// otherwise be imposed on every windowed query in the system.
+    #[test]
+    fn a_window_whose_arguments_are_all_columns_gets_no_extra_projections() {
+        let mut windows = vec![Expr::Window {
+            func: basin_plan::FuncId(basin_pgtype::Oid(3106)),
+            args: vec![col(1, "v")],
+            partition_by: vec![],
+            order_by: vec![],
+            frame: basin_plan::WindowFrame {
+                units: basin_plan::FrameUnits::Range,
+                start: basin_plan::FrameBound::UnboundedPreceding,
+                end: basin_plan::FrameBound::CurrentRow,
+            },
+        }];
+        let child = build(&scan_plan(vec![ColId(0), ColId(1)], vec![]), &resolver()).unwrap();
+        let before = child.schema();
+        let (child, trim) = materialize_window_args(child, &mut windows).unwrap();
+        assert!(trim.is_none(), "nothing needed materializing");
+        assert_eq!(child.schema(), before, "and nothing was wrapped");
     }
 
     fn table() -> (Arc<Schema>, RecordBatch) {
