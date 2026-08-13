@@ -46,10 +46,25 @@
 //! and set-returning functions. Anything else resolves to `None` today, same
 //! as it would if the name were simply misspelled.
 //!
-//! `ceiling` (the alias for `ceil`), `date_trunc`'s three-argument
-//! (timezone-name) overload, and `age(xid)` (transaction-id wraparound, not a
-//! date/time function despite the name) are real `pg_proc` rows this table
-//! does not include. Not covered wrongly, just not covered yet.
+//! `date_trunc`'s three-argument (timezone-name) overload, and `age(xid)`
+//! (transaction-id wraparound, not a date/time function despite the name)
+//! are real `pg_proc` rows this table does not include. Not covered wrongly,
+//! just not covered yet. Same for `substring(text, text[, text])` (POSIX
+//! regex extraction — a different feature, needs a regex engine),
+//! `trunc(macaddr)`/`trunc(macaddr8)` (network-address functions sharing the
+//! `trunc` name, not math), and the `bytea` overloads of `btrim`/`ltrim`/
+//! `rtrim`/`position` (this table's string family is `text`-only, matching
+//! the scope every other string row here already keeps to).
+//!
+//! `ceiling` — the SQL-standard-named alias of `ceil` — IS covered, as a
+//! genuinely separate `pg_proc` oid per argument type, not folded into
+//! `ceil`'s rows.
+//!
+//! A block of math rows added for `pg_proc`/planner-resolution coverage
+//! (trig, `ln`/`log`/`exp`/`cbrt`, `degrees`/`radians`, `sign`, `trunc`,
+//! `ceiling`, `pi`) has, as of this writing, no backing implementation in
+//! `crates/basin-exec/src/eval.rs` — see that sub-block's own comment for
+//! why resolving them here is still safe today rather than a regression.
 //!
 //! # Polymorphic functions are monomorphized, like the array operators
 //!
@@ -276,6 +291,75 @@ pub static FUNCS: &[FuncSig] = &[
         oid::TEXT,
         FuncKind::Scalar,
     ),
+    // `concat_ws(text, VARIADIC "any") -> text` (oid 3059,
+    // `pg_get_function_identity_arguments` confirms `text, VARIADIC "any"`):
+    // the separator is a real fixed `text` parameter, only the values being
+    // joined are the `"any"`-typed variadic part. Monomorphized at the
+    // three-argument call shape (separator plus two values), the same
+    // convention `concat` uses above — see the module docs.
+    //
+    // Not backed by `crates/basin-exec/src/eval.rs` yet (only `concat`
+    // itself is) — see the "Math — trig/log/exp/power" comment below for why
+    // resolving it here is still safe today.
+    FuncSig::new(
+        3059,
+        "concat_ws",
+        &[oid::TEXT, PSEUDO_ANY, PSEUDO_ANY],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    // `substring(text, int, int)`/`substring(text, int)` (oids 936/937) are
+    // Postgres's SQL-standard-named byte/character-offset substring
+    // functions — confirmed live to have the *same* behaviour as
+    // `substr`/oids 877/883 above but a genuinely different `pg_proc` oid,
+    // not an alias row. `SUBSTRING(x FROM y FOR z)` desugars to this, same as
+    // `substr(x, y, z)` called directly.
+    //
+    // `substring(text, text)`/`substring(text, text, text)` (oids 2073/2074,
+    // POSIX-regex extraction) are deliberately not tabulated — a different
+    // feature (needs a regex engine), not covered wrongly, just not covered
+    // yet.
+    //
+    // Not backed by `eval.rs` yet — see below.
+    FuncSig::new(
+        936,
+        "substring",
+        &[oid::TEXT, oid::INT4, oid::INT4],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        937,
+        "substring",
+        &[oid::TEXT, oid::INT4],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    // `position(text, text) -> int4` (oid 849): same argument order and
+    // semantics as `strpos` above (confirmed live:
+    // `pg_catalog.position('hello', 'lo')` and `strpos('hello', 'lo')` both
+    // return 4) — `POSITION(substring IN string)` desugars to this call, but
+    // it is a genuinely separate `pg_proc` oid from `strpos`, not a rename.
+    //
+    // Not backed by `eval.rs` yet — see below.
+    FuncSig::new(
+        849,
+        "position",
+        &[oid::TEXT, oid::TEXT],
+        oid::INT4,
+        FuncKind::Scalar,
+    ),
+    // `split_part(text, text, int) -> text` (oid 2088): splits the first
+    // argument on the second and returns the `n`-th (1-indexed) field.
+    //
+    // Not backed by `eval.rs` yet — see below.
+    FuncSig::new(
+        2088,
+        "split_part",
+        &[oid::TEXT, oid::TEXT, oid::INT4],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
     // ─── Math ───────────────────────────────────────────────────────────────
     FuncSig::new(1398, "abs", &[oid::INT2], oid::INT2, FuncKind::Scalar),
     FuncSig::new(1397, "abs", &[oid::INT4], oid::INT4, FuncKind::Scalar),
@@ -364,6 +448,129 @@ pub static FUNCS: &[FuncSig] = &[
         oid::NUMERIC,
         FuncKind::Scalar,
     ),
+    // ─── Math — trig, log/exp/power, and friends ───────────────────────────
+    //
+    // `basin-exec::eval` implements NONE of the rows in this sub-block today
+    // (only `abs`/`round`/`ceil`/`floor` above, plus the pre-existing
+    // `sqrt`/`power`/`mod` rows, which were already unbacked before this
+    // sub-block was added — see docs/migration/df-removal/17-udf-rehosting.md).
+    // Resolving them here is still useful, not a regression: when
+    // `owned_engine`'s `RealFunctions::resolve` (`crates/basin-engine/src/
+    // owned_engine.rs`) picks one of these oids and `eval_scalar_fn`'s match
+    // falls through to its `other =>` arm, that `ExecError` is caught by
+    // `try_execute` and turned into a `Fallback::Exec`, which makes the
+    // *whole statement* fall back to DataFusion — not a user-visible error
+    // (see `owned_engine::try_execute`/`Fallback`). The owned-engine bridge
+    // is also behind `BASIN_OWNED_ENGINE`, default OFF. So today, adding
+    // these rows changes nothing observable; it is `pg_proc` catalog/
+    // resolution groundwork for `basin-exec` to grow real implementations
+    // against, per the standing goal of not depending on DataFusion. Do not
+    // read a row's presence here as "this function runs on Basin's own
+    // executor" — check `eval.rs` for that.
+    FuncSig::new(1601, "acos", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(1600, "asin", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(1602, "atan", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(
+        1603,
+        "atan2",
+        &[oid::FLOAT8, oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Scalar,
+    ),
+    // Cube root. Confirmed live: `cbrt(27) = 3`.
+    FuncSig::new(1345, "cbrt", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    // `ceiling` is the SQL-standard-named alias of `ceil` — confirmed live to
+    // be a genuinely separate `pg_proc` oid per argument type (2167/2320),
+    // not the same row under two names.
+    FuncSig::new(
+        2167,
+        "ceiling",
+        &[oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        2320,
+        "ceiling",
+        &[oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(1605, "cos", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    // Radians -> degrees. Confirmed live: `degrees(pi()) = 180`.
+    FuncSig::new(
+        1608,
+        "degrees",
+        &[oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(1347, "exp", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(1732, "exp", &[oid::NUMERIC], oid::NUMERIC, FuncKind::Scalar),
+    // Natural log — distinct from `log`, which is base 10 (one-arg form) or
+    // an explicit base (two-arg numeric form), below.
+    FuncSig::new(1341, "ln", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(1734, "ln", &[oid::NUMERIC], oid::NUMERIC, FuncKind::Scalar),
+    // `log(float8)` is base-10 log; there is no two-argument
+    // `log(float8, float8)` overload in real Postgres — only `numeric` has
+    // an explicit-base form. Confirmed live via the `pg_proc` query: exactly
+    // three `log` rows exist (1340, 1736, 1741), not four.
+    FuncSig::new(1340, "log", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    // `log(b numeric, x numeric)` — base first, then the value. Confirmed
+    // live: `log(2, 8) = 3` (log base 2 of 8), not `log(8, 2)`.
+    FuncSig::new(
+        1736,
+        "log",
+        &[oid::NUMERIC, oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(1741, "log", &[oid::NUMERIC], oid::NUMERIC, FuncKind::Scalar),
+    FuncSig::new(1610, "pi", &[], oid::FLOAT8, FuncKind::Scalar),
+    // Degrees -> radians. Confirmed live: `radians(180) = pi()`.
+    FuncSig::new(
+        1609,
+        "radians",
+        &[oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Scalar,
+    ),
+    // `sign` only has `numeric`/`float8` overloads in real Postgres — no
+    // fixed-width-integer rows the way `abs` has. An integer argument
+    // resolves via [`resolve`]'s implicit-coercion fallback to
+    // `sign(numeric)`. Confirmed live: `sign(-5) = -1`.
+    FuncSig::new(
+        1706,
+        "sign",
+        &[oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(2310, "sign", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(1604, "sin", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(1606, "tan", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    // `trunc` truncates toward zero (unlike `floor`, which always rounds
+    // down) — confirmed live: `trunc(3.7) = 3` but `trunc(-3.7) = -3`, not
+    // `-4`.
+    FuncSig::new(1343, "trunc", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Scalar),
+    FuncSig::new(
+        1709,
+        "trunc",
+        &[oid::NUMERIC, oid::INT4],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        1710,
+        "trunc",
+        &[oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Scalar,
+    ),
+    // `trunc(macaddr)`/`trunc(macaddr8)` (oids 753/4112) are real `pg_proc`
+    // rows under the same name but are network-address functions (zero the
+    // host portion of a MAC address), not math — deliberately not tabulated
+    // here.
     // ─── Date/time ──────────────────────────────────────────────────────────
     FuncSig::new(1299, "now", &[], oid::TIMESTAMPTZ, FuncKind::Scalar),
     FuncSig::new(
@@ -1193,5 +1400,176 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `substring(text, int, int)`/`substring(text, int)` (oids 936/937) are
+    /// a distinct `pg_proc` entry from `substr` (oids 877/883) — same
+    /// behaviour, different real oid, confirmed live — so they must not
+    /// collapse onto `substr`'s rows.
+    #[test]
+    fn substring_is_a_distinct_oid_from_substr() {
+        let sub3 = resolve("substring", &[oid::TEXT, oid::INT4, oid::INT4])
+            .expect("substring(text, int, int) must resolve");
+        let sub2 = resolve("substring", &[oid::TEXT, oid::INT4])
+            .expect("substring(text, int) must resolve");
+        assert_eq!(sub3.oid, Oid(936));
+        assert_eq!(sub2.oid, Oid(937));
+
+        let substr3 = resolve("substr", &[oid::TEXT, oid::INT4, oid::INT4]).unwrap();
+        let substr2 = resolve("substr", &[oid::TEXT, oid::INT4]).unwrap();
+        assert_ne!(sub3.oid, substr3.oid, "substring and substr must not share an oid");
+        assert_ne!(sub2.oid, substr2.oid);
+    }
+
+    /// `position(text, text)` (oid 849) is a real, separate `pg_proc` row
+    /// from `strpos` (oid 868) even though both share the same
+    /// (string, substring) argument order and return the same value —
+    /// confirmed live: `position('hello', 'lo')` and `strpos('hello', 'lo')`
+    /// both return 4.
+    #[test]
+    fn position_is_a_distinct_oid_from_strpos_with_the_same_argument_order() {
+        let position = resolve("position", &[oid::TEXT, oid::TEXT])
+            .expect("position(text, text) must resolve");
+        let strpos = resolve("strpos", &[oid::TEXT, oid::TEXT]).unwrap();
+        assert_eq!(position.oid, Oid(849));
+        assert_ne!(position.oid, strpos.oid);
+        assert_eq!(position.ret, oid::INT4);
+    }
+
+    /// `split_part(text, text, int)` resolves and returns `text`.
+    #[test]
+    fn split_part_resolves() {
+        let f = resolve("split_part", &[oid::TEXT, oid::TEXT, oid::INT4])
+            .expect("split_part(text, text, int) must resolve");
+        assert_eq!(f.oid, Oid(2088));
+        assert_eq!(f.ret, oid::TEXT);
+    }
+
+    /// `concat_ws` is monomorphized at (text, any, any) — the separator slot
+    /// is a real fixed `text` parameter (unlike `concat`'s all-`"any"`
+    /// slots), so a non-text separator must not resolve while the value
+    /// slots still accept heterogeneous types.
+    #[test]
+    fn concat_ws_has_a_fixed_text_separator_and_any_typed_values() {
+        let f = resolve("concat_ws", &[oid::TEXT, oid::TEXT, oid::INT4])
+            .expect("concat_ws(text, text, int4) must resolve");
+        assert_eq!(f.oid, Oid(3059));
+        assert_eq!(f.ret, oid::TEXT);
+    }
+
+    /// `ceiling` is the SQL-standard-named alias of `ceil` — same behaviour,
+    /// but a genuinely different real oid per argument type, confirmed live.
+    /// Must not collapse onto `ceil`'s rows.
+    #[test]
+    fn ceiling_is_a_distinct_oid_per_type_from_ceil() {
+        let ceiling_numeric = resolve("ceiling", &[oid::NUMERIC]).unwrap();
+        let ceiling_float = resolve("ceiling", &[oid::FLOAT8]).unwrap();
+        let ceil_numeric = resolve("ceil", &[oid::NUMERIC]).unwrap();
+        let ceil_float = resolve("ceil", &[oid::FLOAT8]).unwrap();
+        assert_eq!(ceiling_numeric.oid, Oid(2167));
+        assert_eq!(ceiling_float.oid, Oid(2320));
+        assert_ne!(ceiling_numeric.oid, ceil_numeric.oid);
+        assert_ne!(ceiling_float.oid, ceil_float.oid);
+    }
+
+    /// `log` has three real oids, not four: a one-argument `float8` form
+    /// (base 10), a one-argument `numeric` form (base 10), and a two-argument
+    /// `numeric` form with an explicit base — there is no two-argument
+    /// `float8` overload in real Postgres. The two-argument form takes
+    /// `(base, x)`, confirmed live via `log(2, 8) = 3`, not `(x, base)`.
+    #[test]
+    fn log_has_three_oids_base_first_in_the_two_arg_form() {
+        let log_float = resolve("log", &[oid::FLOAT8]).expect("log(float8) must resolve");
+        let log_numeric = resolve("log", &[oid::NUMERIC]).expect("log(numeric) must resolve");
+        let log_base = resolve("log", &[oid::NUMERIC, oid::NUMERIC])
+            .expect("log(numeric, numeric) must resolve");
+        assert_eq!(log_float.oid, Oid(1340));
+        assert_eq!(log_numeric.oid, Oid(1741));
+        assert_eq!(log_base.oid, Oid(1736));
+        assert_ne!(log_float.oid, log_numeric.oid);
+        assert_ne!(log_numeric.oid, log_base.oid);
+        assert_eq!(
+            resolve("log", &[oid::FLOAT8, oid::FLOAT8]),
+            None,
+            "log(float8, float8) is not a real Postgres overload"
+        );
+    }
+
+    /// `ln` (natural log) is a distinct oid per type from `log` (base 10 in
+    /// the one-argument form) — different function, not an alias.
+    #[test]
+    fn ln_is_distinct_from_log() {
+        let ln_float = resolve("ln", &[oid::FLOAT8]).unwrap();
+        let log_float = resolve("log", &[oid::FLOAT8]).unwrap();
+        assert_ne!(ln_float.oid, log_float.oid);
+        assert_eq!(ln_float.oid, Oid(1341));
+    }
+
+    /// `sign` has no fixed-width-integer overloads in real Postgres (unlike
+    /// `abs`) — an `int4` argument must reach `sign(numeric)` via implicit
+    /// widening, the same pattern `avg` uses (see the module docs).
+    #[test]
+    fn sign_has_no_integer_overload_and_widens_via_implicit_cast() {
+        let sign_numeric = resolve("sign", &[oid::NUMERIC]).unwrap();
+        let sign_float = resolve("sign", &[oid::FLOAT8]).unwrap();
+        assert_eq!(sign_numeric.oid, Oid(1706));
+        assert_eq!(sign_float.oid, Oid(2310));
+        assert_ne!(sign_numeric.oid, sign_float.oid);
+
+        let from_int4 = resolve("sign", &[oid::INT4]).expect("sign(int4) must widen to numeric");
+        assert_eq!(from_int4.oid, Oid(1706), "should land on sign(numeric)");
+    }
+
+    /// `trunc` has a `float8` one-argument form plus `numeric` one- and
+    /// two-argument (explicit scale) forms — three different real oids, the
+    /// same "distinct arities, distinct oids" shape `round` already has.
+    #[test]
+    fn trunc_has_distinct_arities_and_a_separate_float_overload() {
+        let numeric_one = resolve("trunc", &[oid::NUMERIC]).unwrap();
+        let numeric_two = resolve("trunc", &[oid::NUMERIC, oid::INT4]).unwrap();
+        let float_one = resolve("trunc", &[oid::FLOAT8]).unwrap();
+        assert_eq!(numeric_one.oid, Oid(1710));
+        assert_eq!(numeric_two.oid, Oid(1709));
+        assert_eq!(float_one.oid, Oid(1343));
+        assert_ne!(numeric_one.oid, float_one.oid);
+    }
+
+    /// `atan2` takes two `float8` arguments — pinning the arity distinguishes
+    /// it from the single-argument `atan`, `asin`, `acos`, `sin`, `cos`,
+    /// `tan` family it sits alongside.
+    #[test]
+    fn atan2_is_the_two_argument_form() {
+        let atan2 = resolve("atan2", &[oid::FLOAT8, oid::FLOAT8]).expect("atan2 must resolve");
+        assert_eq!(atan2.oid, Oid(1603));
+        assert_eq!(atan2.ret, oid::FLOAT8);
+
+        for name in ["atan", "asin", "acos", "sin", "cos", "tan"] {
+            let f = resolve(name, &[oid::FLOAT8])
+                .unwrap_or_else(|| panic!("{name}(float8) must resolve"));
+            assert_eq!(f.kind, FuncKind::Scalar);
+            assert_eq!(f.ret, oid::FLOAT8);
+        }
+    }
+
+    /// `pi()` is niladic, like `now()`.
+    #[test]
+    fn pi_is_niladic() {
+        let pi = resolve("pi", &[]).expect("pi() must resolve");
+        assert_eq!(pi.oid, Oid(1610));
+        assert_eq!(pi.ret, oid::FLOAT8);
+        assert_eq!(resolve("pi", &[oid::FLOAT8]), None);
+    }
+
+    /// `cbrt`, `exp`, `degrees`, `radians` each resolve for `float8`; `exp`
+    /// additionally has a `numeric` overload (`ln` mirrors it).
+    #[test]
+    fn remaining_math_family_rows_resolve() {
+        for name in ["cbrt", "exp", "degrees", "radians"] {
+            resolve(name, &[oid::FLOAT8]).unwrap_or_else(|| panic!("{name}(float8) must resolve"));
+        }
+        let exp_numeric = resolve("exp", &[oid::NUMERIC]).expect("exp(numeric) must resolve");
+        assert_eq!(exp_numeric.oid, Oid(1732));
+        let ln_numeric = resolve("ln", &[oid::NUMERIC]).expect("ln(numeric) must resolve");
+        assert_eq!(ln_numeric.oid, Oid(1734));
     }
 }
