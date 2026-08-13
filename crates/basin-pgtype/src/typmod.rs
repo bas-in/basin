@@ -110,6 +110,104 @@ pub fn decode_time_precision(typmod: i32) -> Option<i32> {
     }
 }
 
+// ─── interval ────────────────────────────────────────────────────────────
+//
+// `interval` is the odd one out in this family: its typmod is not just a
+// precision. Postgres packs it as
+// `INTERVAL_TYPMOD(prec, range) = ((range & 0x7FFF) << 16) | (prec & 0xFFFF)`
+// (see `INTERVAL_TYPMOD` / `INTERVAL_RANGE` / `INTERVAL_PRECISION` in
+// Postgres's `datatype/timestamp.h`).
+//
+// `range` is a bitmask of which fields the declaration restricted (`YEAR TO
+// MONTH`, `DAY TO SECOND`, a single field like `HOUR`, ...); an interval
+// declared with no `... TO ...` clause — including a bare `interval(p)` —
+// gets `INTERVAL_FULL_RANGE`, meaning "no field restriction". `prec` is the
+// fractional-second precision, or -1 (all-ones in the low 16 bits) if
+// unspecified.
+//
+// Verified against live PostgreSQL 18.2:
+//   interval(3)                -> typmod 2147418115 (range=FULL,          prec=3)
+//   interval year to month     -> typmod 458751      (range=YEAR|MONTH,   prec=unspecified)
+//   interval day to second(3)  -> typmod 470286339    (range=DAY..SECOND, prec=3)
+//   interval hour               -> typmod 67174399     (range=HOUR,        prec=unspecified)
+//   interval (bare)             -> typmod -1
+
+// Field bit positions, from Postgres's `datetime.h` `#define`s for the
+// DecodeUnits enum (`MONTH = 1`, `YEAR = 2`, `DAY = 3`, `HOUR = 10`,
+// `MINUTE = 11`, `SECOND = 12`); the range mask for a field is `1 << field`.
+const FIELD_MONTH: i32 = 1 << 1;
+const FIELD_YEAR: i32 = 1 << 2;
+const FIELD_DAY: i32 = 1 << 3;
+const FIELD_HOUR: i32 = 1 << 10;
+const FIELD_MINUTE: i32 = 1 << 11;
+const FIELD_SECOND: i32 = 1 << 12;
+
+/// "No field restriction" — a bare `interval` or `interval(p)` with no `...
+/// TO ...` clause. Postgres calls this `INTERVAL_FULL_RANGE`.
+pub const INTERVAL_RANGE_FULL: i32 = 0x7FFF;
+
+pub const INTERVAL_RANGE_YEAR: i32 = FIELD_YEAR;
+pub const INTERVAL_RANGE_MONTH: i32 = FIELD_MONTH;
+pub const INTERVAL_RANGE_DAY: i32 = FIELD_DAY;
+pub const INTERVAL_RANGE_HOUR: i32 = FIELD_HOUR;
+pub const INTERVAL_RANGE_MINUTE: i32 = FIELD_MINUTE;
+pub const INTERVAL_RANGE_SECOND: i32 = FIELD_SECOND;
+pub const INTERVAL_RANGE_YEAR_TO_MONTH: i32 = FIELD_YEAR | FIELD_MONTH;
+pub const INTERVAL_RANGE_DAY_TO_HOUR: i32 = FIELD_DAY | FIELD_HOUR;
+pub const INTERVAL_RANGE_DAY_TO_MINUTE: i32 = FIELD_DAY | FIELD_HOUR | FIELD_MINUTE;
+pub const INTERVAL_RANGE_DAY_TO_SECOND: i32 = FIELD_DAY | FIELD_HOUR | FIELD_MINUTE | FIELD_SECOND;
+pub const INTERVAL_RANGE_HOUR_TO_MINUTE: i32 = FIELD_HOUR | FIELD_MINUTE;
+pub const INTERVAL_RANGE_HOUR_TO_SECOND: i32 = FIELD_HOUR | FIELD_MINUTE | FIELD_SECOND;
+pub const INTERVAL_RANGE_MINUTE_TO_SECOND: i32 = FIELD_MINUTE | FIELD_SECOND;
+
+/// Encode an `interval` typmod from a field-range mask (one of the
+/// `INTERVAL_RANGE_*` constants above) and an optional fractional-second
+/// precision.
+///
+/// `precision: None`, or `Some(p)` outside `0..=MAX_TIME_PRECISION`, encodes
+/// as "unspecified" — Postgres represents that as -1 sign-extended into the
+/// low 16 bits, not as 0, so it is NOT the same bit pattern as
+/// `precision(0)`.
+///
+/// A bare `interval` column (no parens, no `TO` clause at all) never calls
+/// Postgres's `intervaltypmodin` — like every other type, "no modifier
+/// written" is just the universal typmod sentinel [`UNSPECIFIED`] (-1), a
+/// raw all-ones bit pattern. That is distinct from what the packing formula
+/// below would produce for `(INTERVAL_RANGE_FULL, None)` — `0x7FFF0000 |
+/// 0x0000FFFF = 0x7FFFFFFF`, not `-1` — because `INTERVAL_RANGE_FULL` is
+/// only 15 bits (bit 15 of the range half is always 0), whereas `-1`'s
+/// range half has every bit, including bit 15, set. Both decode to the same
+/// `(range, precision)` tuple, so it is harmless to special-case the
+/// no-restriction/no-precision pair to the sentinel Postgres actually uses.
+pub fn encode_interval(range: i32, precision: Option<i32>) -> i32 {
+    if range & 0x7FFF == INTERVAL_RANGE_FULL && precision.is_none() {
+        return UNSPECIFIED;
+    }
+    let prec_bits = match precision {
+        Some(p) if (0..=MAX_TIME_PRECISION).contains(&p) => p & 0xFFFF,
+        _ => -1i32 & 0xFFFF, // 0xFFFF: "unspecified", per INTERVAL_TYPMOD
+    };
+    ((range & 0x7FFF) << 16) | prec_bits
+}
+
+/// Decode an `interval` typmod into `(range_mask, precision)`.
+///
+/// The low 16 bits are sign-extended back to recover -1 ("unspecified") as
+/// `None` rather than as the small positive precision `65535 & 0xFFFF` would
+/// otherwise imply.
+pub fn decode_interval(typmod: i32) -> (i32, Option<i32>) {
+    let range = (typmod >> 16) & 0x7FFF;
+    // Sign-extend the low 16 bits: shift left into the top of the word, then
+    // arithmetic-shift back down. Rust's `>>` on i32 is arithmetic.
+    let precision = (typmod << 16) >> 16;
+    let precision = if precision == UNSPECIFIED {
+        None
+    } else {
+        Some(precision)
+    };
+    (range, precision)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +271,61 @@ mod tests {
         assert_eq!(encode_time_precision(7), UNSPECIFIED);
         assert_eq!(encode_time_precision(-1), UNSPECIFIED);
         assert_eq!(decode_time_precision(9), None);
+    }
+
+    /// Pinned against live PostgreSQL 18.2's `pg_attribute.atttypmod` for
+    /// columns declared with each interval spelling (see module doc for the
+    /// full `psql` transcript). Unlike time/timestamp, interval's typmod is
+    /// NOT a bare precision — verifying that was the point of this check.
+    #[test]
+    fn interval_typmod_matches_postgres_encoding() {
+        // `interval(3)`: no field restriction, precision 3.
+        assert_eq!(
+            encode_interval(INTERVAL_RANGE_FULL, Some(3)),
+            2_147_418_115
+        );
+        // `interval year to month`: no precision.
+        assert_eq!(
+            encode_interval(INTERVAL_RANGE_YEAR_TO_MONTH, None),
+            458_751
+        );
+        // `interval day to second(3)`.
+        assert_eq!(
+            encode_interval(INTERVAL_RANGE_DAY_TO_SECOND, Some(3)),
+            470_286_339
+        );
+        // `interval hour`: single-field range, no precision.
+        assert_eq!(encode_interval(INTERVAL_RANGE_HOUR, None), 67_174_399);
+        // bare `interval`: no field restriction, no precision.
+        assert_eq!(encode_interval(INTERVAL_RANGE_FULL, None), UNSPECIFIED);
+    }
+
+    #[test]
+    fn interval_typmod_round_trips() {
+        for (range, precision) in [
+            (INTERVAL_RANGE_FULL, Some(3)),
+            (INTERVAL_RANGE_YEAR_TO_MONTH, None),
+            (INTERVAL_RANGE_DAY_TO_SECOND, Some(3)),
+            (INTERVAL_RANGE_HOUR, None),
+            (INTERVAL_RANGE_FULL, None),
+            (INTERVAL_RANGE_MINUTE_TO_SECOND, Some(0)),
+            (INTERVAL_RANGE_DAY_TO_HOUR, Some(6)),
+        ] {
+            let t = encode_interval(range, precision);
+            assert_eq!(
+                decode_interval(t),
+                (range, precision),
+                "interval typmod {t}"
+            );
+        }
+    }
+
+    /// A bare `interval` (typmod -1) must decode identically to the
+    /// general-purpose formula, not via a special case — the whole point of
+    /// `INTERVAL_TYPMOD`'s design is that -1 already means "full range,
+    /// unspecified precision" without special-casing.
+    #[test]
+    fn interval_unspecified_typmod_is_full_range_no_precision() {
+        assert_eq!(decode_interval(UNSPECIFIED), (INTERVAL_RANGE_FULL, None));
     }
 }
