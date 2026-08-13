@@ -274,6 +274,106 @@ pub static OPERATORS: &[OperatorSig] = &[
     OperatorSig::binary(2976, "<=", oid::UUID, oid::UUID, oid::BOOL),
     OperatorSig::binary(2975, ">", oid::UUID, oid::UUID, oid::BOOL),
     OperatorSig::binary(2977, ">=", oid::UUID, oid::UUID, oid::BOOL),
+    // `bpchar` (blank-padded `char(n)`) gets its own comparison oids, unlike
+    // `varchar` — confirmed live: `varchar` has **zero** native operator rows
+    // at all (`SELECT ... WHERE oprleft = 'varchar'::regtype OR oprright =
+    // 'varchar'::regtype` returns nothing), so `varchar = varchar` only ever
+    // resolves through [`resolve`]'s coercion fallback (`VARCHAR -> TEXT` is
+    // implicit, per `crate::cast`) onto the `text = text` row above. That is
+    // not a gap to fill; there is no native row to copy.
+    OperatorSig::binary(1054, "=", oid::BPCHAR, oid::BPCHAR, oid::BOOL),
+    OperatorSig::binary(1057, "<>", oid::BPCHAR, oid::BPCHAR, oid::BOOL),
+    OperatorSig::binary(1058, "<", oid::BPCHAR, oid::BPCHAR, oid::BOOL),
+    OperatorSig::binary(1059, "<=", oid::BPCHAR, oid::BPCHAR, oid::BOOL),
+    OperatorSig::binary(1060, ">", oid::BPCHAR, oid::BPCHAR, oid::BOOL),
+    OperatorSig::binary(1061, ">=", oid::BPCHAR, oid::BPCHAR, oid::BOOL),
+    // `bytea` comparison. Confirmed live alongside `||` (bytea concatenation,
+    // tabulated in the text/pattern-matching section below) and the byte
+    // pattern-match operators `~~`/`!~~`, which are out of scope per the
+    // module docs (comparison and arithmetic only).
+    OperatorSig::binary(1955, "=", oid::BYTEA, oid::BYTEA, oid::BOOL),
+    OperatorSig::binary(1956, "<>", oid::BYTEA, oid::BYTEA, oid::BOOL),
+    OperatorSig::binary(1957, "<", oid::BYTEA, oid::BYTEA, oid::BOOL),
+    OperatorSig::binary(1958, "<=", oid::BYTEA, oid::BYTEA, oid::BOOL),
+    OperatorSig::binary(1959, ">", oid::BYTEA, oid::BYTEA, oid::BOOL),
+    OperatorSig::binary(1960, ">=", oid::BYTEA, oid::BYTEA, oid::BOOL),
+    // `time`, `interval` and `timetz` own-type comparison. Each has real,
+    // distinct oids in the live catalog (checked individually, not inferred
+    // from the `date`/`timestamp`/`timestamptz` pattern above).
+    OperatorSig::binary(1108, "=", oid::TIME, oid::TIME, oid::BOOL),
+    OperatorSig::binary(1109, "<>", oid::TIME, oid::TIME, oid::BOOL),
+    OperatorSig::binary(1110, "<", oid::TIME, oid::TIME, oid::BOOL),
+    OperatorSig::binary(1111, "<=", oid::TIME, oid::TIME, oid::BOOL),
+    OperatorSig::binary(1112, ">", oid::TIME, oid::TIME, oid::BOOL),
+    OperatorSig::binary(1113, ">=", oid::TIME, oid::TIME, oid::BOOL),
+    OperatorSig::binary(1330, "=", oid::INTERVAL, oid::INTERVAL, oid::BOOL),
+    OperatorSig::binary(1331, "<>", oid::INTERVAL, oid::INTERVAL, oid::BOOL),
+    OperatorSig::binary(1332, "<", oid::INTERVAL, oid::INTERVAL, oid::BOOL),
+    OperatorSig::binary(1333, "<=", oid::INTERVAL, oid::INTERVAL, oid::BOOL),
+    OperatorSig::binary(1334, ">", oid::INTERVAL, oid::INTERVAL, oid::BOOL),
+    OperatorSig::binary(1335, ">=", oid::INTERVAL, oid::INTERVAL, oid::BOOL),
+    OperatorSig::binary(1550, "=", oid::TIMETZ, oid::TIMETZ, oid::BOOL),
+    OperatorSig::binary(1551, "<>", oid::TIMETZ, oid::TIMETZ, oid::BOOL),
+    OperatorSig::binary(1552, "<", oid::TIMETZ, oid::TIMETZ, oid::BOOL),
+    OperatorSig::binary(1553, "<=", oid::TIMETZ, oid::TIMETZ, oid::BOOL),
+    OperatorSig::binary(1554, ">", oid::TIMETZ, oid::TIMETZ, oid::BOOL),
+    OperatorSig::binary(1555, ">=", oid::TIMETZ, oid::TIMETZ, oid::BOOL),
+    // ─── Cross-type date/timestamp/timestamptz comparison ──────────────────
+    //
+    // Same asymmetric-oid pattern as the int2/int4/int8/float4/float8 block
+    // below, and just as easy to get backwards: `date = timestamp` (oid 2347)
+    // is NOT the same oid as `timestamp = date` (oid 2373). Confirmed live:
+    //
+    // ```sql
+    // SELECT o.oid, o.oprname, lt.typname, rt.typname, ot.typname
+    //   FROM pg_operator o
+    //   JOIN pg_type lt ON lt.oid = o.oprleft
+    //   JOIN pg_type rt ON rt.oid = o.oprright
+    //   JOIN pg_type ot ON ot.oid = o.oprresult
+    //  WHERE o.oprname IN ('=','<>','<','<=','>','>=')
+    //    AND lt.typname IN ('date','timestamp','timestamptz')
+    //    AND rt.typname IN ('date','timestamp','timestamptz')
+    //    AND lt.typname <> rt.typname
+    //  ORDER BY o.oprname, lt.typname, rt.typname;
+    // ```
+    //
+    // 36 rows: 6 operators × 3 unordered type pairs × 2 directions.
+    OperatorSig::binary(2347, "=", oid::DATE, oid::TIMESTAMP, oid::BOOL),
+    OperatorSig::binary(2373, "=", oid::TIMESTAMP, oid::DATE, oid::BOOL),
+    OperatorSig::binary(2360, "=", oid::DATE, oid::TIMESTAMPTZ, oid::BOOL),
+    OperatorSig::binary(2386, "=", oid::TIMESTAMPTZ, oid::DATE, oid::BOOL),
+    OperatorSig::binary(2536, "=", oid::TIMESTAMP, oid::TIMESTAMPTZ, oid::BOOL),
+    OperatorSig::binary(2542, "=", oid::TIMESTAMPTZ, oid::TIMESTAMP, oid::BOOL),
+    OperatorSig::binary(2350, "<>", oid::DATE, oid::TIMESTAMP, oid::BOOL),
+    OperatorSig::binary(2376, "<>", oid::TIMESTAMP, oid::DATE, oid::BOOL),
+    OperatorSig::binary(2363, "<>", oid::DATE, oid::TIMESTAMPTZ, oid::BOOL),
+    OperatorSig::binary(2389, "<>", oid::TIMESTAMPTZ, oid::DATE, oid::BOOL),
+    OperatorSig::binary(2539, "<>", oid::TIMESTAMP, oid::TIMESTAMPTZ, oid::BOOL),
+    OperatorSig::binary(2545, "<>", oid::TIMESTAMPTZ, oid::TIMESTAMP, oid::BOOL),
+    OperatorSig::binary(2345, "<", oid::DATE, oid::TIMESTAMP, oid::BOOL),
+    OperatorSig::binary(2371, "<", oid::TIMESTAMP, oid::DATE, oid::BOOL),
+    OperatorSig::binary(2358, "<", oid::DATE, oid::TIMESTAMPTZ, oid::BOOL),
+    OperatorSig::binary(2384, "<", oid::TIMESTAMPTZ, oid::DATE, oid::BOOL),
+    OperatorSig::binary(2534, "<", oid::TIMESTAMP, oid::TIMESTAMPTZ, oid::BOOL),
+    OperatorSig::binary(2540, "<", oid::TIMESTAMPTZ, oid::TIMESTAMP, oid::BOOL),
+    OperatorSig::binary(2346, "<=", oid::DATE, oid::TIMESTAMP, oid::BOOL),
+    OperatorSig::binary(2372, "<=", oid::TIMESTAMP, oid::DATE, oid::BOOL),
+    OperatorSig::binary(2359, "<=", oid::DATE, oid::TIMESTAMPTZ, oid::BOOL),
+    OperatorSig::binary(2385, "<=", oid::TIMESTAMPTZ, oid::DATE, oid::BOOL),
+    OperatorSig::binary(2535, "<=", oid::TIMESTAMP, oid::TIMESTAMPTZ, oid::BOOL),
+    OperatorSig::binary(2541, "<=", oid::TIMESTAMPTZ, oid::TIMESTAMP, oid::BOOL),
+    OperatorSig::binary(2349, ">", oid::DATE, oid::TIMESTAMP, oid::BOOL),
+    OperatorSig::binary(2375, ">", oid::TIMESTAMP, oid::DATE, oid::BOOL),
+    OperatorSig::binary(2362, ">", oid::DATE, oid::TIMESTAMPTZ, oid::BOOL),
+    OperatorSig::binary(2388, ">", oid::TIMESTAMPTZ, oid::DATE, oid::BOOL),
+    OperatorSig::binary(2538, ">", oid::TIMESTAMP, oid::TIMESTAMPTZ, oid::BOOL),
+    OperatorSig::binary(2544, ">", oid::TIMESTAMPTZ, oid::TIMESTAMP, oid::BOOL),
+    OperatorSig::binary(2348, ">=", oid::DATE, oid::TIMESTAMP, oid::BOOL),
+    OperatorSig::binary(2374, ">=", oid::TIMESTAMP, oid::DATE, oid::BOOL),
+    OperatorSig::binary(2361, ">=", oid::DATE, oid::TIMESTAMPTZ, oid::BOOL),
+    OperatorSig::binary(2387, ">=", oid::TIMESTAMPTZ, oid::DATE, oid::BOOL),
+    OperatorSig::binary(2537, ">=", oid::TIMESTAMP, oid::TIMESTAMPTZ, oid::BOOL),
+    OperatorSig::binary(2543, ">=", oid::TIMESTAMPTZ, oid::TIMESTAMP, oid::BOOL),
     // ─── Cross-type comparison ──────────────────────────────────────────────
     //
     // Real Postgres OIDs for `int2`/`int4`/`int8` compared pairwise, and
@@ -401,6 +501,47 @@ pub static OPERATORS: &[OperatorSig] = &[
     OperatorSig::binary(691, "/", oid::INT8, oid::INT4, oid::INT8),
     OperatorSig::binary(1118, "/", oid::FLOAT4, oid::FLOAT8, oid::FLOAT8),
     OperatorSig::binary(1128, "/", oid::FLOAT8, oid::FLOAT4, oid::FLOAT8),
+    // ─── Date/time arithmetic ───────────────────────────────────────────────
+    //
+    // Confirmed live by oid, one query rather than one row at a time (see the
+    // `SELECT ... WHERE o.oid IN (...)` form used throughout this module's
+    // development). Two things worth flagging because they are *not* what a
+    // "tidy" table would predict:
+    //
+    //   * `date + interval` and `interval + date` do NOT return `date` — they
+    //     return `timestamp`, because an `interval` can carry a sub-day
+    //     component the `date` type cannot hold. Writing a `date` result type
+    //     here would be a silent precision-losing bug baked into the catalog
+    //     row itself.
+    //   * `date - date` returns `int4` (a day count), not `interval` — the
+    //     one place in this block where subtracting two like-typed values
+    //     does not produce a duration type.
+    //
+    // `time`/`timestamp`/`timestamptz` each follow the more predictable
+    // pattern (`T + interval -> T`, `T - interval -> T`, `T - T -> interval`).
+    OperatorSig::binary(1100, "+", oid::DATE, oid::INT4, oid::DATE),
+    OperatorSig::binary(2555, "+", oid::INT4, oid::DATE, oid::DATE),
+    OperatorSig::binary(1101, "-", oid::DATE, oid::INT4, oid::DATE),
+    OperatorSig::binary(1099, "-", oid::DATE, oid::DATE, oid::INT4),
+    OperatorSig::binary(1076, "+", oid::DATE, oid::INTERVAL, oid::TIMESTAMP),
+    OperatorSig::binary(2551, "+", oid::INTERVAL, oid::DATE, oid::TIMESTAMP),
+    OperatorSig::binary(1077, "-", oid::DATE, oid::INTERVAL, oid::TIMESTAMP),
+    OperatorSig::binary(1800, "+", oid::TIME, oid::INTERVAL, oid::TIME),
+    OperatorSig::binary(1849, "+", oid::INTERVAL, oid::TIME, oid::TIME),
+    OperatorSig::binary(1801, "-", oid::TIME, oid::INTERVAL, oid::TIME),
+    OperatorSig::binary(1399, "-", oid::TIME, oid::TIME, oid::INTERVAL),
+    OperatorSig::binary(2066, "+", oid::TIMESTAMP, oid::INTERVAL, oid::TIMESTAMP),
+    OperatorSig::binary(2553, "+", oid::INTERVAL, oid::TIMESTAMP, oid::TIMESTAMP),
+    OperatorSig::binary(2068, "-", oid::TIMESTAMP, oid::INTERVAL, oid::TIMESTAMP),
+    OperatorSig::binary(2067, "-", oid::TIMESTAMP, oid::TIMESTAMP, oid::INTERVAL),
+    OperatorSig::binary(1327, "+", oid::TIMESTAMPTZ, oid::INTERVAL, oid::TIMESTAMPTZ),
+    OperatorSig::binary(2554, "+", oid::INTERVAL, oid::TIMESTAMPTZ, oid::TIMESTAMPTZ),
+    OperatorSig::binary(1329, "-", oid::TIMESTAMPTZ, oid::INTERVAL, oid::TIMESTAMPTZ),
+    OperatorSig::binary(1328, "-", oid::TIMESTAMPTZ, oid::TIMESTAMPTZ, oid::INTERVAL),
+    OperatorSig::binary(1337, "+", oid::INTERVAL, oid::INTERVAL, oid::INTERVAL),
+    OperatorSig::binary(1338, "-", oid::INTERVAL, oid::INTERVAL, oid::INTERVAL),
+    OperatorSig::binary(1583, "*", oid::INTERVAL, oid::FLOAT8, oid::INTERVAL),
+    OperatorSig::binary(1585, "/", oid::INTERVAL, oid::FLOAT8, oid::INTERVAL),
     // Unary minus (`oprkind = 'l'`, prefix). Exercises the `left: None`
     // half of `OperatorSig` — negation is Postgres's only common builtin
     // prefix operator over these types.
@@ -410,8 +551,12 @@ pub static OPERATORS: &[OperatorSig] = &[
     OperatorSig::prefix(584, "-", oid::FLOAT4, oid::FLOAT4),
     OperatorSig::prefix(585, "-", oid::FLOAT8, oid::FLOAT8),
     OperatorSig::prefix(1751, "-", oid::NUMERIC, oid::NUMERIC),
+    OperatorSig::prefix(1336, "-", oid::INTERVAL, oid::INTERVAL),
     // ─── Text concatenation and pattern matching ───────────────────────────
     OperatorSig::binary(654, "||", oid::TEXT, oid::TEXT, oid::TEXT),
+    // `bytea` concatenation — real oid 2018, confirmed alongside the `bytea`
+    // comparison rows above. Byte-string equivalent of `text || text`.
+    OperatorSig::binary(2018, "||", oid::BYTEA, oid::BYTEA, oid::BYTEA),
     // POSIX regex, case-sensitive / case-insensitive, and negated forms.
     OperatorSig::binary(641, "~", oid::TEXT, oid::TEXT, oid::BOOL),
     OperatorSig::binary(1228, "~*", oid::TEXT, oid::TEXT, oid::BOOL),
@@ -532,6 +677,114 @@ mod tests {
             Oid(416),
             "the reverse pair has its own distinct oid"
         );
+    }
+
+    /// `date = timestamp` (oid 2347) and `timestamp = date` (oid 2373) are
+    /// the same class of trap as `int4 = int8` / `int8 = int4` above, and
+    /// were verified the same way — direct query by oid against a live
+    /// server, not inferred from the int/float pattern. Also covers
+    /// `date`/`timestamptz` and `timestamp`/`timestamptz`, the other two
+    /// asymmetric pairs added in the same pass.
+    #[test]
+    fn date_timestamp_cross_type_comparison_is_asymmetric() {
+        let date_eq_ts = resolve("=", Some(oid::DATE), oid::TIMESTAMP).unwrap();
+        let ts_eq_date = resolve("=", Some(oid::TIMESTAMP), oid::DATE).unwrap();
+        assert_eq!(date_eq_ts.oid, Oid(2347));
+        assert_eq!(ts_eq_date.oid, Oid(2373));
+        assert_ne!(date_eq_ts.oid, ts_eq_date.oid);
+
+        let date_eq_tstz = resolve("=", Some(oid::DATE), oid::TIMESTAMPTZ).unwrap();
+        let tstz_eq_date = resolve("=", Some(oid::TIMESTAMPTZ), oid::DATE).unwrap();
+        assert_eq!(date_eq_tstz.oid, Oid(2360));
+        assert_eq!(tstz_eq_date.oid, Oid(2386));
+        assert_ne!(date_eq_tstz.oid, tstz_eq_date.oid);
+
+        let ts_eq_tstz = resolve("=", Some(oid::TIMESTAMP), oid::TIMESTAMPTZ).unwrap();
+        let tstz_eq_ts = resolve("=", Some(oid::TIMESTAMPTZ), oid::TIMESTAMP).unwrap();
+        assert_eq!(ts_eq_tstz.oid, Oid(2536));
+        assert_eq!(tstz_eq_ts.oid, Oid(2542));
+        assert_ne!(ts_eq_tstz.oid, tstz_eq_ts.oid);
+    }
+
+    /// `date + int4` and `int4 + date` both yield `date` but are two
+    /// different catalog oids (1100 vs 2555) — a pair that would be easy to
+    /// collapse into "one commutative row" without checking the live
+    /// catalog. Same trap, arithmetic flavor rather than comparison.
+    #[test]
+    fn date_plus_int4_is_asymmetric_by_oid() {
+        let date_plus_int = resolve("+", Some(oid::DATE), oid::INT4).unwrap();
+        let int_plus_date = resolve("+", Some(oid::INT4), oid::DATE).unwrap();
+        assert_eq!(date_plus_int.oid, Oid(1100));
+        assert_eq!(int_plus_date.oid, Oid(2555));
+        assert_ne!(date_plus_int.oid, int_plus_date.oid);
+        assert_eq!(date_plus_int.result, oid::DATE);
+        assert_eq!(int_plus_date.result, oid::DATE);
+    }
+
+    /// `date + interval` and `interval + date` are the sharper version of the
+    /// same trap: not only do they carry different oids (1076 vs 2551), the
+    /// result is `timestamp`, not `date` — an `interval` can hold a sub-day
+    /// component a `date` cannot represent, so Postgres widens the result
+    /// type rather than truncating it. A table that "simplified" this to
+    /// `date + interval -> date` would be a silent precision-loss bug.
+    #[test]
+    fn date_plus_interval_widens_to_timestamp_not_date() {
+        let date_plus_iv = resolve("+", Some(oid::DATE), oid::INTERVAL).unwrap();
+        let iv_plus_date = resolve("+", Some(oid::INTERVAL), oid::DATE).unwrap();
+        assert_eq!(date_plus_iv.oid, Oid(1076));
+        assert_eq!(iv_plus_date.oid, Oid(2551));
+        assert_ne!(date_plus_iv.oid, iv_plus_date.oid);
+        assert_eq!(date_plus_iv.result, oid::TIMESTAMP);
+        assert_eq!(iv_plus_date.result, oid::TIMESTAMP);
+    }
+
+    /// `date - date` is the one place in the date/time arithmetic block where
+    /// subtracting two like-typed values does not produce `interval` — it
+    /// produces a plain `int4` day count. `time - time`, `timestamp -
+    /// timestamp` and `timestamptz - timestamptz` all go to `interval`
+    /// instead, so this is the odd one out, not the pattern.
+    #[test]
+    fn date_minus_date_is_int4_not_interval() {
+        let diff = resolve("-", Some(oid::DATE), oid::DATE).unwrap();
+        assert_eq!(diff.oid, Oid(1099));
+        assert_eq!(diff.result, oid::INT4);
+
+        let time_diff = resolve("-", Some(oid::TIME), oid::TIME).unwrap();
+        assert_eq!(time_diff.result, oid::INTERVAL);
+        let ts_diff = resolve("-", Some(oid::TIMESTAMP), oid::TIMESTAMP).unwrap();
+        assert_eq!(ts_diff.result, oid::INTERVAL);
+    }
+
+    /// `bpchar` (`char(n)`) has real comparison oids of its own; `varchar`
+    /// has none at all (confirmed live — see the module docs) and reaches
+    /// comparison only via the coercion fallback onto `text = text`.
+    #[test]
+    fn bpchar_has_its_own_comparison_oid() {
+        let op = resolve("=", Some(oid::BPCHAR), oid::BPCHAR).expect("bpchar = bpchar");
+        assert_eq!(op.oid, Oid(1054));
+        assert_eq!(op.result, oid::BOOL);
+    }
+
+    /// `bytea` comparison and concatenation, previously entirely absent from
+    /// this table.
+    #[test]
+    fn bytea_comparison_and_concat_resolve() {
+        let eq = resolve("=", Some(oid::BYTEA), oid::BYTEA).expect("bytea = bytea");
+        assert_eq!(eq.oid, Oid(1955));
+        assert_eq!(eq.result, oid::BOOL);
+
+        let concat = resolve("||", Some(oid::BYTEA), oid::BYTEA).expect("bytea || bytea");
+        assert_eq!(concat.oid, Oid(2018));
+        assert_eq!(concat.result, oid::BYTEA);
+    }
+
+    /// Unary minus on `interval` — the one prefix operator added in this
+    /// pass, exercising the same `left: None` path as the numeric prefixes.
+    #[test]
+    fn unary_minus_resolves_for_interval() {
+        let neg = resolve("-", None, oid::INTERVAL).expect("unary minus on interval");
+        assert_eq!(neg.oid, Oid(1336));
+        assert_eq!(neg.result, oid::INTERVAL);
     }
 
     /// Every new cross-type row's declared result type matches what the live
@@ -718,16 +971,19 @@ mod tests {
 
     /// Pins the total row count so an accidental deletion (or an accidental
     /// duplicate) shows up as a failing test rather than silently shrinking
-    /// (or bloating) the table. 131 pre-existing rows plus the 80 cross-type
-    /// rows this change added (48 comparison + 32 arithmetic, across
-    /// int2/int4/int8/float4/float8 — see the module docs) is 211. If this
-    /// legitimately changes, recount by hand against the module docs before
-    /// updating the number here.
+    /// (or bloating) the table. 211 pre-existing rows (see the module docs
+    /// for that count's own derivation) plus 91 rows added in a later pass —
+    /// 6 `bpchar` comparisons, 7 `bytea` (6 comparison + `||`), 18 own-type
+    /// comparisons for `time`/`interval`/`timetz`, 36 cross-type
+    /// `date`/`timestamp`/`timestamptz` comparisons, and 24 date/time
+    /// arithmetic rows (including unary minus on `interval`) — is 302. If
+    /// this legitimately changes, recount by hand against a live server
+    /// before updating the number here.
     #[test]
     fn total_operator_row_count_is_pinned() {
         assert_eq!(
             OPERATORS.len(),
-            211,
+            302,
             "row count changed — update this pin only after confirming the new rows against a live server"
         );
     }
