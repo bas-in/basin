@@ -476,6 +476,49 @@ of what's here is fixable on top of DataFusion, cheaply, in the same way
 the last 13 were. The 4 harder cases are real, but they are a much smaller
 slice than "28 divergences" suggests at a glance.
 
+## Status as of the 22-entry baseline
+
+This document was written against a 28-entry baseline. Six of those are now
+closed and the gate is at **22 divergences plus one declared-flaky**
+(`!diff_advisory_two_int4_form`). The ranking below is preserved as written,
+but **its top two recommendations are already done** — read this section
+first.
+
+Closed:
+
+| Was | Cluster | How |
+|---|---|---|
+| #1, #2, #20 | **C2 — `Null@0`** | Entire cluster. The `render_cell` catch-all no longer swallows `DataType::Null`. |
+| #11 | **C7 — NOT NULL SQLSTATE** | `42601` → `23502`. |
+| #3, #28 | **C1a — aggregate naming** | `SUM(x) FILTER (…)` and `percentile_disc` only. |
+
+Still open from C1a: #25 `diff_txn_rollback`, where Basin reports `count(*)`
+and Postgres reports `count`. The `Aggregate` arm landed; this one shape did
+not follow it, and nobody has traced why.
+
+**The cheapest remaining work is not what the table below ranks first.**
+Re-ranked against what is actually left:
+
+| Cluster | Tests | Effort | Why it is now top |
+|---|---:|---|---|
+| **C1b + C1c + C1d + C1a-remnant** | **8** | MEDIUM | All four are the same defect wearing four hats — an expression display name leaking Basin's internal rewrite target instead of Postgres's. `json_get(t.data,Utf8("a"))` for `?column?`, `list_has_all` for `?column?`, `strpos` for `position`, `?column?` for `nextval`, `count(*)` for `count`. One file family, one override table. Eight of twenty-two tests, over a third of the whole gate. |
+| **C5** | 2 | MEDIUM | An `ArrowError`-variant → SQLSTATE table. `XX000` for what should be `22003` and `22012`. Contained and mechanical; the risk is that the two known variants are not the only ones. |
+| **C9** | 1 | LOW | Rank 4 below, exact lines still valid (`pg_operators.rs:6694-6708`), still open. Best per-test cost in the set now that C7 is gone. |
+
+C3 (4), C4 (3), C10 (2), C8 (1) and C6 (1) still require the design decisions
+the original recommendation deferred: schema-keyed catalog, LATERAL physical
+execution, real table-function support, and duplicating part of Postgres's
+coercion table. Nothing about them has changed.
+
+A caution the closed rows earn: C2 was ranked first on "3 tests, LOW effort,
+exact line identified" **and also carried an UNVERIFIED note** saying the
+upstream cause was never traced. It closed anyway. That is not evidence the
+UNVERIFIED notes are cosmetic — it is one instance where the local fix was
+sufficient, and the remaining notes (C1b's plan shape, C1d's `Expr` shape,
+C4b's rewrite defect) are still untraced. The naming cluster above is ranked
+top on yield and shared root cause, not on confidence that the mechanism is
+understood; whoever takes it should expect to trace before patching.
+
 ## Ranked by (tests fixed / effort)
 
 Effort tiers are qualitative (LOW / MEDIUM / HIGH), not LOC estimates —
