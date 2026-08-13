@@ -44,9 +44,10 @@ individual function's logic**, and it is shared by every ENTANGLED entry below.
 | System / misc | ~25 | ~7,482 | 13 | 2 | 15 |
 | Date / time / interval | 26 | ~3,116 | 10 | 14 | 2 |
 | Regex / FTS / trigram | 25 | ~4,454 | 8 | 17 | **0** |
-| **Surveyed total** | **~86** | **~19,317** | **31** | **42** | **18** |
+| Geo / PostGIS | 43 live | ~3,820 | 12 | 45 | 3 |
+| **Surveyed total** | **~129** | **~23,137** | **43** | **87** | **21** |
 
-Not yet surveyed: string, math, JSONB, geo, range.
+Not yet surveyed: string, math, JSONB, range.
 
 The regex/FTS/trigram family is worth singling out: **zero entangled**, across
 4,454 lines including the whole full-text search stack. `tsvector` and `tsquery`
@@ -57,6 +58,34 @@ already speaks raw `ArrayRef`/`RecordBatch` rather than DataFusion's
 `ColumnarValue`, the shell swap is mechanical. `ts_rank_cd`'s sliding-window
 minimal-cover algorithm is the most involved thing in the family and is still
 pure arithmetic.
+
+### Geo: 59 structs behind 43 names, and 16 of them are dead
+
+The geo family was assumed to be ~34 structs. It is **59**, in two
+generations. Thirty-three "wave-α" structs handle POINT only, stored as
+`FixedSizeBinary(21)`, with many bodies degenerate for non-POINT semantics —
+`st_area` returns a constant `0.0`, `st_centroid` is identity, `st_numpoints`
+returns `1`. Twenty-six later general-geometry structs handle real
+LineString/Polygon/Multi* over variable-length WKB.
+
+**Sixteen SQL names are registered twice**, and because `register_udf`
+overwrites by name, the general implementation wins and the wave-α struct is
+unreachable from SQL — while still compiling, and still being unit-tested
+directly by tests that instantiate it by hand. So those tests pass against code
+no query can reach.
+
+The re-hosting target is therefore **43 live names, not 59 structs**, always
+taking the general implementation where a name is shadowed. Porting all 59
+would either duplicate OIDs or silently pick the degenerate POINT-only version
+of a function that currently works properly.
+
+The geometry itself is in excellent shape for the migration: `basin-geo` is a
+pure-Rust crate with zero Arrow and zero DataFusion dependency, and `geo` and
+`proj4rs` are likewise independent. The coupling is only the trait shell — with
+one real exception. `st_srid` and `st_transform` read `BASIN_SRID` out of
+DataFusion's per-call `ScalarFunctionArgs.arg_fields[].metadata()`, and
+`basin-exec`'s evaluator has no equivalent: it sees arrays, not the source
+columns' Field metadata. That is a design question, not a translation.
 
 ## The cheapest win, and the most expensive one
 
