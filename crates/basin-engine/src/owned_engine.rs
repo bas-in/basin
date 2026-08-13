@@ -368,8 +368,20 @@ async fn try_execute_inner(
 ) -> Result<ExecResult, Fallback> {
     let resolver = build_resolver(sess, stmt_node).await?;
 
-    let plan = lower_select(stmt_node, &resolver, &RealOperators, &RealFunctions)
-        .map_err(Fallback::Lower)?;
+    // `lower_dml` has existed in basin-plan the whole time and nothing here
+    // called it, so every INSERT, UPDATE and DELETE fell back regardless of
+    // whether the engine could serve it. DML is lowered as a relation like any
+    // other plan, so everything downstream — optimize, build, execute — is
+    // unchanged; only the entry point differs.
+    let plan = match stmt_node.node.as_ref() {
+        Some(NodeEnum::InsertStmt(_))
+        | Some(NodeEnum::UpdateStmt(_))
+        | Some(NodeEnum::DeleteStmt(_)) => {
+            basin_plan::lower::dml::lower_dml(stmt_node, &resolver, &RealOperators, &RealFunctions)
+        }
+        _ => lower_select(stmt_node, &resolver, &RealOperators, &RealFunctions),
+    }
+    .map_err(Fallback::Lower)?;
 
     // `optimize_default` is the full assembled pipeline — decorrelation,
     // filter pushdown, limit pushdown and projection pruning, run to a
@@ -554,10 +566,61 @@ async fn build_resolver(
 /// the module docs for why subqueries embedded in `WHERE`/`HAVING`/the target
 /// list are deliberately not walked.
 fn collect_tables(node: &Node, out: &mut Vec<Vec<String>>) {
-    let Some(NodeEnum::SelectStmt(stmt)) = node.node.as_ref() else {
-        return;
-    };
-    collect_tables_stmt(stmt, &HashSet::new(), out);
+    let empty = HashSet::new();
+    match node.node.as_ref() {
+        Some(NodeEnum::SelectStmt(stmt)) => collect_tables_stmt(stmt, &empty, out),
+        // DML's target relation has to be prefetched exactly like a FROM
+        // entry, and so does anything it reads: INSERT ... SELECT's source,
+        // UPDATE ... FROM's extra relations, DELETE ... USING's. Without this
+        // the resolver is handed nothing and every INSERT, UPDATE and DELETE
+        // falls back — not because the engine cannot run them (basin-plan has
+        // `lower_dml`) but because the bridge never told it what to load.
+        // The WITH clause is walked FIRST in each arm below, not last. It has
+        // to be: it both contributes tables (the CTE bodies) and establishes
+        // the names that must NOT be collected, so anything walked before it
+        // is walked without knowing what the CTE names are. Collecting the
+        // target and the source first sent the CTE's own name to the resolver
+        // as if it were a table.
+        Some(NodeEnum::InsertStmt(stmt)) => {
+            let mut scope = HashSet::new();
+            if let Some(with) = stmt.with_clause.as_ref() {
+                collect_with_clause(with, &mut scope, out);
+            }
+            if let Some(rel) = stmt.relation.as_ref() {
+                collect_range_var(rel, &scope, out);
+            }
+            if let Some(NodeEnum::SelectStmt(sel)) =
+                stmt.select_stmt.as_deref().and_then(|n| n.node.as_ref())
+            {
+                collect_tables_stmt(sel, &scope, out);
+            }
+        }
+        Some(NodeEnum::UpdateStmt(stmt)) => {
+            let mut scope = HashSet::new();
+            if let Some(with) = stmt.with_clause.as_ref() {
+                collect_with_clause(with, &mut scope, out);
+            }
+            if let Some(rel) = stmt.relation.as_ref() {
+                collect_range_var(rel, &scope, out);
+            }
+            for item in &stmt.from_clause {
+                collect_from_item(item, &scope, out);
+            }
+        }
+        Some(NodeEnum::DeleteStmt(stmt)) => {
+            let mut scope = HashSet::new();
+            if let Some(with) = stmt.with_clause.as_ref() {
+                collect_with_clause(with, &mut scope, out);
+            }
+            if let Some(rel) = stmt.relation.as_ref() {
+                collect_range_var(rel, &scope, out);
+            }
+            for item in &stmt.using_clause {
+                collect_from_item(item, &scope, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// `cte_scope` is the set of (lowercased, unqualified) CTE names visible to
@@ -637,22 +700,32 @@ fn collect_with_clause(with: &WithClause, scope: &mut HashSet<String>, out: &mut
 /// (a subquery or set-returning function in `FROM`) is already
 /// `LowerError::Unsupported` at lowering time regardless of what this
 /// collects, so there is nothing to gain by recognising it here too.
+/// A `RangeVar` is the one shape that names a real relation, and it is reached
+/// from two directions: a `FROM` entry (a `Node`) and DML's target relation (a
+/// bare `RangeVar` field). Shared so the CTE-shadowing rule cannot be applied
+/// in one place and forgotten in the other.
+fn collect_range_var(
+    rv: &pg_query::protobuf::RangeVar,
+    cte_scope: &HashSet<String>,
+    out: &mut Vec<Vec<String>>,
+) {
+    // Only an *unqualified* name can be a CTE reference — Postgres never lets
+    // a schema-qualified name (`public.x`) resolve to a CTE, so `cte_scope` is
+    // not consulted when `schemaname` is set.
+    if rv.schemaname.is_empty() && cte_scope.contains(&rv.relname.to_ascii_lowercase()) {
+        return;
+    }
+    let mut parts = Vec::new();
+    if !rv.schemaname.is_empty() {
+        parts.push(rv.schemaname.clone());
+    }
+    parts.push(rv.relname.clone());
+    out.push(parts);
+}
+
 fn collect_from_item(item: &Node, cte_scope: &HashSet<String>, out: &mut Vec<Vec<String>>) {
     match item.node.as_ref() {
-        Some(NodeEnum::RangeVar(rv)) => {
-            // Only an *unqualified* name can be a CTE reference — Postgres
-            // never lets a schema-qualified name (`public.x`) resolve to a
-            // CTE, so `cte_scope` is not consulted when `schemaname` is set.
-            if rv.schemaname.is_empty() && cte_scope.contains(&rv.relname.to_ascii_lowercase()) {
-                return;
-            }
-            let mut parts = Vec::new();
-            if !rv.schemaname.is_empty() {
-                parts.push(rv.schemaname.clone());
-            }
-            parts.push(rv.relname.clone());
-            out.push(parts);
-        }
+        Some(NodeEnum::RangeVar(rv)) => collect_range_var(rv, cte_scope, out),
         Some(NodeEnum::JoinExpr(je)) => {
             if let Some(l) = je.larg.as_deref() {
                 collect_from_item(l, cte_scope, out);
@@ -1156,9 +1229,55 @@ mod tests {
         let node = *raw.stmt.expect("no stmt node");
         let mut out = Vec::new();
         collect_tables(&node, &mut out);
-        out.into_iter()
-            .map(|parts| parts.join("."))
-            .collect()
+        out.into_iter().map(|parts| parts.join(".")).collect()
+    }
+
+    /// DML collects its TARGET relation, which a `SELECT`-only walk never
+    /// looked at. Until this existed the resolver was handed an empty table
+    /// list for every INSERT/UPDATE/DELETE, so the bridge could not have
+    /// served one even with the executor gate open.
+    #[test]
+    fn dml_collects_its_target_relation() {
+        assert_eq!(collected("INSERT INTO t VALUES (1)"), vec!["t".to_string()]);
+        assert_eq!(
+            collected("UPDATE t SET a = 1 WHERE id = 2"),
+            vec!["t".to_string()]
+        );
+        assert_eq!(
+            collected("DELETE FROM t WHERE id = 2"),
+            vec!["t".to_string()]
+        );
+    }
+
+    /// DML reads as well as writes, and every relation it reads needs
+    /// prefetching too — the source of an `INSERT ... SELECT`, the extra
+    /// relations of `UPDATE ... FROM` and `DELETE ... USING`. Collecting only
+    /// the target would leave the read side unresolvable.
+    #[test]
+    fn dml_collects_the_relations_it_reads_as_well_as_its_target() {
+        assert_eq!(
+            collected("INSERT INTO t SELECT id FROM u"),
+            vec!["t".to_string(), "u".to_string()]
+        );
+        assert_eq!(
+            collected("UPDATE t SET a = u.n FROM u WHERE u.tid = t.id"),
+            vec!["t".to_string(), "u".to_string()]
+        );
+        assert_eq!(
+            collected("DELETE FROM t USING u WHERE u.tid = t.id"),
+            vec!["t".to_string(), "u".to_string()]
+        );
+    }
+
+    /// A CTE name shadows a table for DML exactly as it does for `SELECT`.
+    /// The scoping rule lives in one shared helper precisely so it cannot be
+    /// applied on one path and forgotten on the other.
+    #[test]
+    fn a_dml_source_referencing_a_cte_does_not_collect_the_cte_name() {
+        assert_eq!(
+            collected("WITH x AS (SELECT id FROM u) INSERT INTO t SELECT id FROM x"),
+            vec!["u".to_string(), "t".to_string()]
+        );
     }
 
     #[test]
@@ -1184,9 +1303,8 @@ mod tests {
 
     #[test]
     fn nested_with_inside_a_cte_body_is_walked() {
-        let names = collected(
-            "WITH a AS (WITH b AS (SELECT id FROM t) SELECT id FROM b) SELECT id FROM a",
-        );
+        let names =
+            collected("WITH a AS (WITH b AS (SELECT id FROM t) SELECT id FROM b) SELECT id FROM a");
         assert_eq!(
             names,
             vec!["t".to_string()],
@@ -1197,9 +1315,8 @@ mod tests {
 
     #[test]
     fn a_cte_referencing_an_earlier_cte_does_not_collect_that_earlier_name() {
-        let names = collected(
-            "WITH a AS (SELECT id FROM t), b AS (SELECT id FROM a) SELECT id FROM b",
-        );
+        let names =
+            collected("WITH a AS (SELECT id FROM t), b AS (SELECT id FROM a) SELECT id FROM b");
         assert_eq!(
             names,
             vec!["t".to_string()],
