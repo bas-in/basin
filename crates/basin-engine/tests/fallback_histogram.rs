@@ -97,6 +97,21 @@ async fn fallback_histogram_over_representative_sql() {
             panicked.push(q);
         }
     }
+    // Per-query attribution. The aggregate histogram says WHAT KIND of gaps
+    // remain; this says WHICH query hit which, which is what actually picks the
+    // next piece of work.
+    eprintln!("\n─── per query ───");
+    for q in queries {
+        let before = eng.owned_engine_served_count();
+        let _ = s.execute(q).await;
+        let verdict = if eng.owned_engine_served_count() > before {
+            "served"
+        } else {
+            "FELL BACK"
+        };
+        eprintln!("  {verdict:>9}  {q}");
+    }
+
     if !panicked.is_empty() {
         eprintln!(
             "\nPANICKED (not merely errored) — {} of {total}:",

@@ -755,15 +755,44 @@ fn prune(plan: &LogicalPlan, required: &BTreeSet<u16>) -> (LogicalPlan, Remap, b
                     .collect()
             };
 
+            // Attribute a join condition's columns to their side by POSITION,
+            // not by `ColumnRef::relation`.
+            //
+            // Lowering emits every column with `relation: 0` and a FLAT index
+            // across the concatenated scope — see `Scope::resolve` in
+            // lower/select.rs, which hardcodes `relation: 0` for both qualified
+            // and unqualified lookups. So `collect_columns(expr, 1, ..)` found
+            // nothing, the build side's required set came back empty, and this
+            // rule pruned away the very column the join keys on.
+            //
+            // That is not a cosmetic mismatch: it produced a plan whose join
+            // key indexed a zero-column schema, which arrow answered by
+            // panicking and taking the session down (fixed defensively in
+            // basin-exec's HashJoin, but the cause is here). The `required` set
+            // a few lines above already uses this same flat convention; the
+            // join keys were the one place that did not.
+            // BOTH conventions are live in this codebase and both must work.
+            // A `relation: 1` reference is already attributed to the build
+            // side. A `relation: 0` reference is a flat position, so it belongs
+            // to whichever side its index falls in.
+            let mut collect_both_conventions = |e: &Expr| {
+                collect_columns(e, 1, &mut right_required);
+                let mut flat = BTreeSet::new();
+                collect_columns(e, 0, &mut flat);
+                for p in flat {
+                    if (p as usize) >= left_width {
+                        right_required.insert(p - left_width as u16);
+                    } else {
+                        left_required.insert(p);
+                    }
+                }
+            };
             for (l, r) in on {
-                collect_columns(l, 0, &mut left_required);
-                collect_columns(l, 1, &mut right_required);
-                collect_columns(r, 0, &mut left_required);
-                collect_columns(r, 1, &mut right_required);
+                collect_both_conventions(l);
+                collect_both_conventions(r);
             }
             if let Some(f) = filter {
-                collect_columns(f, 0, &mut left_required);
-                collect_columns(f, 1, &mut right_required);
+                collect_both_conventions(f);
             }
 
             let (new_left, left_remap, left_changed) = prune(left, &left_required);
