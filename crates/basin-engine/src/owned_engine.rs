@@ -108,7 +108,7 @@
 use std::collections::{HashMap, HashSet};
 
 use arrow_schema::{DataType, Field};
-use pg_query::protobuf::{node::Node as NodeEnum, Node, SelectStmt, SetOperation};
+use pg_query::protobuf::{node::Node as NodeEnum, Node, SelectStmt, SetOperation, WithClause};
 
 use basin_common::{ProjectId, TableName};
 use basin_exec::build::{BuildError, ScanPushdown, TableResolver as ExecTableResolver};
@@ -550,28 +550,85 @@ async fn build_resolver(
 
 /// Collect every table name a `SELECT` statement's `FROM` clause(s)
 /// reference, recursing into `UNION`/`INTERSECT`/`EXCEPT` arms exactly the
-/// way `lower_select_stmt` does. See the module docs for why subqueries
-/// embedded in `WHERE`/`HAVING`/the target list are deliberately not walked.
+/// way `lower_select_stmt` does, and into any `WITH` clause's CTE bodies. See
+/// the module docs for why subqueries embedded in `WHERE`/`HAVING`/the target
+/// list are deliberately not walked.
 fn collect_tables(node: &Node, out: &mut Vec<Vec<String>>) {
     let Some(NodeEnum::SelectStmt(stmt)) = node.node.as_ref() else {
         return;
     };
-    collect_tables_stmt(stmt, out);
+    collect_tables_stmt(stmt, &HashSet::new(), out);
 }
 
-fn collect_tables_stmt(stmt: &SelectStmt, out: &mut Vec<Vec<String>>) {
+/// `cte_scope` is the set of (lowercased, unqualified) CTE names visible to
+/// `stmt` — names `lower_select` will resolve against its own CTE
+/// environment rather than the catalog. A bare `FROM x` where `x` is in
+/// scope must not end up in `out`: `build_resolver` would then ask the real
+/// catalog for a table named `x`, which does not exist, turning a query that
+/// `lower_select` can otherwise serve into an `Ineligible` fallback instead.
+fn collect_tables_stmt(stmt: &SelectStmt, cte_scope: &HashSet<String>, out: &mut Vec<Vec<String>>) {
+    let mut scope = cte_scope.clone();
+    if let Some(with) = stmt.with_clause.as_ref() {
+        collect_with_clause(with, &mut scope, out);
+    }
+
     let op_kind = SetOperation::try_from(stmt.op).unwrap_or(SetOperation::Undefined);
     if op_kind != SetOperation::SetopNone {
         if let Some(l) = stmt.larg.as_deref() {
-            collect_tables_stmt(l, out);
+            collect_tables_stmt(l, &scope, out);
         }
         if let Some(r) = stmt.rarg.as_deref() {
-            collect_tables_stmt(r, out);
+            collect_tables_stmt(r, &scope, out);
         }
         return;
     }
     for item in &stmt.from_clause {
-        collect_from_item(item, out);
+        collect_from_item(item, &scope, out);
+    }
+}
+
+/// Walk one `WITH` list, collecting each CTE body's own table references
+/// into `out` and growing `scope` with each CTE's name as it goes — mirrors
+/// `parse_cte.c`'s visibility rules close enough for this bridge's purposes:
+///
+/// * A later CTE (and the statement's own `FROM`) can see every earlier CTE
+///   in the same list — `scope` gains `ctename` only *after* that CTE's own
+///   body has been walked, so an earlier CTE never sees a later one.
+/// * `WITH RECURSIVE` (`with.recursive`, the grammar-level flag set on the
+///   whole list — `pg_query` never populates the per-CTE `cterecursive`,
+///   that is a parse-analysis output this crate never runs) additionally
+///   lets a CTE see its own name while its own body is walked, so `FROM
+///   self` inside a recursive CTE's body is excluded exactly like a
+///   reference to any other CTE, not sent to the catalog as a nonexistent
+///   table.
+///
+/// A nested `WITH` inside a CTE's body (`WITH a AS (WITH b AS (...) SELECT
+/// ...) SELECT ...`) needs no special case here: `collect_tables_stmt`
+/// clones the incoming scope and folds in its own `with_clause` the same way
+/// for every statement it is called on, so recursing into `cte.ctequery`
+/// below already walks it correctly.
+fn collect_with_clause(with: &WithClause, scope: &mut HashSet<String>, out: &mut Vec<Vec<String>>) {
+    for cte_node in &with.ctes {
+        let Some(NodeEnum::CommonTableExpr(cte)) = cte_node.node.as_ref() else {
+            continue;
+        };
+        let name = cte.ctename.to_ascii_lowercase();
+
+        let mut body_scope = scope.clone();
+        if with.recursive {
+            body_scope.insert(name.clone());
+        }
+
+        if let Some(query) = cte.ctequery.as_deref() {
+            if let Some(NodeEnum::SelectStmt(inner)) = query.node.as_ref() {
+                collect_tables_stmt(inner, &body_scope, out);
+            }
+            // A data-modifying CTE body (INSERT/UPDATE/DELETE ... RETURNING)
+            // is not a SelectStmt; nothing to walk, and lowering will reject
+            // it as Unsupported regardless of what this collects.
+        }
+
+        scope.insert(name);
     }
 }
 
@@ -580,9 +637,15 @@ fn collect_tables_stmt(stmt: &SelectStmt, out: &mut Vec<Vec<String>>) {
 /// (a subquery or set-returning function in `FROM`) is already
 /// `LowerError::Unsupported` at lowering time regardless of what this
 /// collects, so there is nothing to gain by recognising it here too.
-fn collect_from_item(item: &Node, out: &mut Vec<Vec<String>>) {
+fn collect_from_item(item: &Node, cte_scope: &HashSet<String>, out: &mut Vec<Vec<String>>) {
     match item.node.as_ref() {
         Some(NodeEnum::RangeVar(rv)) => {
+            // Only an *unqualified* name can be a CTE reference — Postgres
+            // never lets a schema-qualified name (`public.x`) resolve to a
+            // CTE, so `cte_scope` is not consulted when `schemaname` is set.
+            if rv.schemaname.is_empty() && cte_scope.contains(&rv.relname.to_ascii_lowercase()) {
+                return;
+            }
             let mut parts = Vec::new();
             if !rv.schemaname.is_empty() {
                 parts.push(rv.schemaname.clone());
@@ -592,10 +655,10 @@ fn collect_from_item(item: &Node, out: &mut Vec<Vec<String>>) {
         }
         Some(NodeEnum::JoinExpr(je)) => {
             if let Some(l) = je.larg.as_deref() {
-                collect_from_item(l, out);
+                collect_from_item(l, cte_scope, out);
             }
             if let Some(r) = je.rarg.as_deref() {
-                collect_from_item(r, out);
+                collect_from_item(r, cte_scope, out);
             }
         }
         _ => {}
@@ -1082,6 +1145,80 @@ mod tests {
         assert_eq!(
             passes, 0,
             "a full-projection, no-filter query has nothing for any rule to do"
+        );
+    }
+
+    // ── collect_tables / WITH clauses ───────────────────────────────────
+
+    fn collected(sql: &str) -> Vec<String> {
+        let result = pg_query::parse(sql).expect("parse failed");
+        let raw = result.protobuf.stmts.first().expect("no stmt").clone();
+        let node = *raw.stmt.expect("no stmt node");
+        let mut out = Vec::new();
+        collect_tables(&node, &mut out);
+        out.into_iter()
+            .map(|parts| parts.join("."))
+            .collect()
+    }
+
+    #[test]
+    fn cte_body_tables_are_collected() {
+        let names = collected("WITH x AS (SELECT id FROM t) SELECT id FROM x");
+        assert_eq!(
+            names,
+            vec!["t".to_string()],
+            "the table referenced inside the CTE body must be prefetched"
+        );
+    }
+
+    #[test]
+    fn a_bare_reference_to_the_ctes_own_name_is_not_collected_as_a_table() {
+        let names = collected("WITH x AS (SELECT id FROM t) SELECT id FROM x");
+        assert!(
+            !names.iter().any(|n| n == "x"),
+            "`FROM x` in the outer query names the CTE, not a catalog table — \
+             collecting it would send build_resolver looking for a table that \
+             does not exist, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn nested_with_inside_a_cte_body_is_walked() {
+        let names = collected(
+            "WITH a AS (WITH b AS (SELECT id FROM t) SELECT id FROM b) SELECT id FROM a",
+        );
+        assert_eq!(
+            names,
+            vec!["t".to_string()],
+            "the innermost table must surface, and neither CTE name (a or b) should, \
+             got {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_cte_referencing_an_earlier_cte_does_not_collect_that_earlier_name() {
+        let names = collected(
+            "WITH a AS (SELECT id FROM t), b AS (SELECT id FROM a) SELECT id FROM b",
+        );
+        assert_eq!(
+            names,
+            vec!["t".to_string()],
+            "`b`'s body references `a`, an earlier CTE in the same WITH list, not a \
+             table — only `t` (from `a`'s own body) should be collected, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_recursive_cte_referencing_itself_does_not_collect_its_own_name() {
+        let names = collected(
+            "WITH RECURSIVE r AS (SELECT id FROM t UNION ALL SELECT id FROM r) \
+             SELECT id FROM r",
+        );
+        assert_eq!(
+            names,
+            vec!["t".to_string()],
+            "the recursive self-reference `FROM r` inside r's own body must be \
+             excluded, not sent to the catalog as a nonexistent table, got {names:?}"
         );
     }
 }
