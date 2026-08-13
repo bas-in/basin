@@ -32,3 +32,21 @@ futures = { workspace = true }
 [dev-dependencies]
 object_store = { workspace = true }
 tempfile = { workspace = true }
+# `tests/function_equivalence.rs` diffs every scalar function `eval.rs`
+# implements against a live PostgreSQL 18 (PG_DIFF_TEST_DSN, same convention
+# as crates/basin-pgcatalog/tests/catalog_fidelity.rs and
+# crates/basin-engine/tests/differential_pg.rs). Dev-only: a Postgres client
+# must never reach this crate's production dependency graph — `tokio` itself
+# is already a normal dependency (see the module docs above), only the
+# Postgres wire client is confined to dev-dependencies.
+tokio-postgres = { workspace = true }
+
+# `function_equivalence` is `harness = false` for the same reason
+# `catalog_fidelity` is (see that file's module docs): a skip (no
+# PG_DIFF_TEST_DSN) must print an explicit banner every run, not silently
+# look identical to "1 passed" the way libtest's default captured-stdout
+# summary would.
+[[test]]
+name = "function_equivalence"
+path = "tests/function_equivalence.rs"
+harness = false

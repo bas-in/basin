@@ -399,6 +399,29 @@ fn eval_untyped_literal(
 }
 
 fn eval_literal(datum: &PlanDatum, ty: PgType, len: usize) -> Result<ArrayRef, ExecError> {
+    // A literal that reaches here still carrying `unknown` (oid 705) has no
+    // sibling to take a type from — it is not one side of a comparison, not a
+    // CASE branch, not an IN element. Postgres resolves a standalone unknown
+    // literal to TEXT, and so does this.
+    //
+    // Without it, `physical()` refuses the pseudo-type and the whole statement
+    // falls back with "pseudo-type 705 has no physical representation". That
+    // was the single cause of BOTH `string_agg(name, ',')` — the delimiter is a
+    // bare literal — and `SELECT * FROM (VALUES (1,'a'))`, where the string in
+    // a VALUES row has nothing to resolve against either.
+    //
+    // The typed paths already handle their own cases: `eval_operand_pair` for
+    // binary operands, `eval_branches_unified` for CASE and COALESCE, and
+    // `eval_operand_against` for IN. This is the remaining floor for a literal
+    // that reaches evaluation with no context at all — the same rule those
+    // three already fall back to when every candidate is unknown.
+    if ty.is_unknown() {
+        return eval_untyped_literal(
+            &Expr::Literal(datum.clone(), ty),
+            &DataType::Utf8,
+            len,
+        );
+    }
     let arrow_ty = physical(ty).map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
 
     if matches!(datum, PlanDatum::Null) {
@@ -1495,7 +1518,14 @@ fn eval_replace(s: &ArrayRef, from: &ArrayRef, to: &ArrayRef) -> Result<ArrayRef
         .zip(from.iter())
         .zip(to.iter())
         .map(|((s, from), to)| match (s, from, to) {
-            (Some(s), Some(from), Some(to)) => Some(s.replace(from, to)),
+            // An empty `from` is the one case where Rust and Postgres part
+            // ways. `str::replace` treats "" as matching at every character
+            // boundary, so `"hello".replace("", "0")` yields `"0h0e0l0l0o0"`.
+            // PostgreSQL 18 returns the subject unchanged:
+            // `replace('hello world', '', '0') = 'hello world'` (verified
+            // live). Nothing to find means nothing to replace.
+            (Some(s), Some(from), Some(to)) if !from.is_empty() => Some(s.replace(from, to)),
+            (Some(s), Some(_), Some(_)) => Some(s.to_string()),
             _ => None,
         })
         .collect();
@@ -1704,7 +1734,12 @@ fn decimal_round_per_row(arr: &ArrayRef, ndigits: &ArrayRef) -> Result<ArrayRef,
 /// split (see `basin_pgtype::physical`'s module docs) rather than requiring
 /// `eval` to know a target `PgType` it is not given.
 fn decimal_round_value(m: i128, scale: i32, ndigits: i32) -> i128 {
-    let digits_to_drop = scale - ndigits;
+    // `saturating_sub`, not `-`: `ndigits` is caller-supplied SQL, so
+    // `round(n, -2147483648)` would overflow `i32` on the plain subtraction and
+    // panic the whole query in a debug build. Saturating to `i32::MAX` lands on
+    // the `pow10 -> None` arm below, which returns 0 — which is exactly what
+    // PostgreSQL 18 answers for `round(x::numeric, -2147483648)`.
+    let digits_to_drop = scale.saturating_sub(ndigits);
     if digits_to_drop <= 0 {
         // Rounding to at least as many digits as are physically stored is a
         // no-op — there is nothing to drop.
@@ -2037,7 +2072,11 @@ fn decimal_trunc_per_row(arr: &ArrayRef, ndigits: &ArrayRef) -> Result<ArrayRef,
 /// `trunc(-3.14159::numeric, 2) = -3.14` (not `-3.15`, which flooring toward
 /// negative infinity would give), `trunc(12345::numeric, -2) = 12300`.
 fn decimal_trunc_value(m: i128, scale: i32, ndigits: i32) -> i128 {
-    let digits_to_drop = scale - ndigits;
+    // `saturating_sub` for the same reason `decimal_round_value` uses it: a
+    // user-supplied `ndigits` of `i32::MIN` overflows the plain subtraction and
+    // panics the query. Saturating reaches the `pow10 -> None` arm, i.e. 0,
+    // matching PostgreSQL 18's `trunc(x::numeric, -2147483648)`.
+    let digits_to_drop = scale.saturating_sub(ndigits);
     if digits_to_drop <= 0 {
         // Truncating to at least as many digits as are physically stored is
         // a no-op, same reasoning as decimal_round_value's early return.

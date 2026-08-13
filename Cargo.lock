@@ -1287,6 +1287,7 @@ dependencies = [
  "object_store",
  "tempfile",
  "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]
@@ -1466,6 +1467,7 @@ dependencies = [
  "object_store",
  "tempfile",
  "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]
@@ -1473,6 +1475,8 @@ name = "basin-pgtype"
 version = "0.1.10"
 dependencies = [
  "arrow-schema",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]
