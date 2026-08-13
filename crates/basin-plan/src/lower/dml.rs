@@ -620,17 +620,23 @@ fn collect_from_item(
             collect_from_item(larg, tables, out)?;
             collect_from_item(rarg, tables, out)
         }
-        // These node kinds are unreachable in practice: `lower_from_relation`
-        // always calls `select::lower_select` on the very same `items` first,
-        // and that call already rejects every one of these before this
-        // function would ever run. Each arm still names its construct
-        // precisely rather than falling through to a generic message, in
-        // case that call order is ever changed.
+        // `lower_from_relation` always calls `select::lower_select` on the
+        // very same `items` first, so an arm here only ever runs for a shape
+        // that call ACCEPTS — which used to be none of these, and is now the
+        // `RangeFunction` one: `select::build_range_function` lowers
+        // `generate_series`/`unnest` in a `SELECT`'s `FROM`, but this
+        // function is the schema-only half (see [`collect_from_relations`])
+        // and has no `FromBuilt` to read a function relation's name and
+        // column off. So `UPDATE ... FROM generate_series(...)` stays
+        // refused, one layer later than the rest. Each arm names its
+        // construct precisely rather than falling through to a generic
+        // message.
         Some(NodeEnum::RangeSubselect(_)) => Err(LowerError::Unsupported(
             "a subquery in FROM is not yet lowered".into(),
         )),
         Some(NodeEnum::RangeFunction(_)) => Err(LowerError::Unsupported(
-            "a set-returning function in FROM is not yet lowered".into(),
+            "a set-returning function in an UPDATE's FROM / DELETE's USING is not yet lowered"
+                .into(),
         )),
         Some(_) => Err(LowerError::Unsupported(
             "this FROM item is not yet lowered".into(),

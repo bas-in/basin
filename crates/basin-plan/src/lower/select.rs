@@ -32,9 +32,17 @@
 //! `lower_window_def`. A set operation's own trailing `ORDER BY`/`LIMIT`
 //! (which apply to the whole result, under much stricter rules than an
 //! ordinary `SELECT`'s) are lowered by [`lower_set_op`] /
-//! [`lower_set_op_sort_key`]. Everything else — `OVER (w ...)` extending a
-//! named window, `LATERAL`, a genuine subquery (anything but
-//! a bare `VALUES` list) or set-returning function in `FROM`,
+//! [`lower_set_op_sort_key`]. A set-returning function in `FROM` —
+//! `generate_series`/`unnest`, plain or `LATERAL`-correlated, under
+//! PostgreSQL's own output-column naming rule — is lowered by
+//! [`build_range_function`], and a correlated one is combined into a
+//! [`LogicalPlan::LateralJoin`] by [`combine_from_items`] /
+//! [`build_lateral_join_expr`]. Everything else — `OVER (w ...)` extending a
+//! named window, a `LATERAL` *subquery* (as opposed to a `LATERAL`
+//! function), a genuine subquery in `FROM` (anything but a bare `VALUES`
+//! list), `WITH ORDINALITY`, `ROWS FROM (...)`, a self-naming or
+//! composite-returning set-returning function in `FROM` (see
+//! [`SELF_NAMING_SRFS`]),
 //! `NATURAL`/`USING` joins, a data-modifying CTE, `DISTINCT ON` combined with
 //! `GROUP BY`/an aggregate, a set-returning function combined with `GROUP
 //! BY`/an aggregate, or one nested inside another set-returning function's
@@ -1309,6 +1317,76 @@ struct FromBuilt {
     /// so any other join kind carries `None` here even though it is itself a
     /// `LogicalPlan::Join`.
     top_join_left_len: Option<usize>,
+    /// This item's own expressions reference a relation to its LEFT in the
+    /// same `FROM` clause — the defining property of `LATERAL`. Only a
+    /// set-returning function item can report `true` today (see
+    /// [`build_range_function`]); it is what makes the caller combine this
+    /// item with [`LogicalPlan::LateralJoin`] rather than an ordinary
+    /// [`LogicalPlan::Join`], so the inner side is re-evaluated per outer
+    /// row instead of once.
+    correlated: bool,
+}
+
+impl FromBuilt {
+    /// The plain, uncorrelated case: no `WHERE`-foldable join at the root and
+    /// nothing reaching left.
+    fn leaf(plan: LogicalPlan, scope: Scope) -> Self {
+        FromBuilt {
+            plan,
+            scope,
+            top_join_left_len: None,
+            correlated: false,
+        }
+    }
+}
+
+/// Combine an already-built left side with the item to its right.
+///
+/// A comma in `FROM` is a cross join — **unless** the right item reaches back
+/// into the left one, which for a set-returning function needs no `LATERAL`
+/// keyword at all: `FROM t, generate_series(1, t.id) g` and `FROM t, LATERAL
+/// generate_series(1, t.id) g` return the identical four rows on a live
+/// PostgreSQL 18.2 server (`lt(id)` = 1, 3, 0; `id = 0` contributes no row at
+/// all, since `generate_series(1, 0)` is empty and an inner lateral join
+/// drops an outer row whose inner side produced nothing). So the choice is
+/// driven by whether the lowered item actually carries an [`OUTER_REF`], not
+/// by `RangeFunction::lateral`.
+///
+/// [`LogicalPlan::LateralJoin`] is used only when that is the case:
+/// `opt::projection` and `opt::pushdown` both treat it as an opaque barrier
+/// (see their module docs), so an uncorrelated item is worth keeping as an
+/// ordinary `Join` that those rules can still optimize.
+fn combine_from_items(acc: FromBuilt, rhs: FromBuilt) -> FromBuilt {
+    let left_len = acc.scope.total_len();
+    let scope = acc.scope.concat(rhs.scope);
+    if rhs.correlated {
+        return FromBuilt {
+            plan: LogicalPlan::LateralJoin {
+                outer: Box::new(acc.plan),
+                inner: Box::new(rhs.plan),
+                kind: JoinKind::Inner,
+            },
+            scope,
+            // Not a `Join` at the root, so a `WHERE` conjunct has no `on`
+            // list to fold into — `apply_where` builds a plain `Filter`
+            // above the lateral join instead, which is where Postgres
+            // evaluates it too.
+            top_join_left_len: None,
+            correlated: false,
+        };
+    }
+    FromBuilt {
+        plan: LogicalPlan::Join {
+            left: Box::new(acc.plan),
+            right: Box::new(rhs.plan),
+            kind: JoinKind::Cross,
+            on: vec![],
+            filter: None,
+        },
+        scope,
+        top_join_left_len: Some(left_len),
+        correlated: false,
+    }
 }
 
 fn build_from_clause(
@@ -1320,44 +1398,309 @@ fn build_from_clause(
     let Some(first) = iter.next() else {
         return Ok(None);
     };
-    let mut acc = build_from_item(first, res, ctes)?;
+    let mut acc = build_from_item(first, res, ctes, None)?;
     for item in iter {
-        let rhs = build_from_item(item, res, ctes)?;
-        let left_len = acc.scope.total_len();
-        let plan = LogicalPlan::Join {
-            left: Box::new(acc.plan),
-            right: Box::new(rhs.plan),
-            kind: JoinKind::Cross,
-            on: vec![],
-            filter: None,
-        };
-        let scope = acc.scope.concat(rhs.scope);
-        acc = FromBuilt {
-            plan,
-            scope,
-            top_join_left_len: Some(left_len),
-        };
+        let rhs = build_from_item(item, res, ctes, Some(&acc.scope))?;
+        acc = combine_from_items(acc, rhs);
     }
     Ok(Some(acc))
 }
 
+/// `left`, when present, is everything already in scope to this item's LEFT
+/// in the same `FROM` clause — what a `LATERAL` item may reference. It is
+/// `None` for the first item of a `FROM` list (nothing precedes it) and for
+/// a join's own left arm.
 fn build_from_item(
     item: &Node,
     res: &Resolvers,
     ctes: &[CteBinding],
+    left: Option<&Scope>,
 ) -> Result<FromBuilt, LowerError> {
     match item.node.as_ref() {
         Some(NodeEnum::RangeVar(rv)) => build_range_var(rv, res, ctes),
         Some(NodeEnum::JoinExpr(je)) => build_join_expr(je, res, ctes),
         Some(NodeEnum::RangeSubselect(rs)) => build_range_subselect(rs, res),
-        Some(NodeEnum::RangeFunction(_)) => Err(LowerError::Unsupported(
-            "a set-returning function in FROM is not yet lowered".into(),
-        )),
+        Some(NodeEnum::RangeFunction(rf)) => build_range_function(rf, res, left),
         Some(_) => Err(LowerError::Unsupported(
             "this FROM item is not yet lowered".into(),
         )),
         None => Err(LowerError::Malformed("empty FROM item")),
     }
+}
+
+/// Set-returning functions whose FROM-position output column is named by the
+/// function itself — a single NAMED `OUT` parameter, or a composite return
+/// type — rather than by the table alias. `pg_proc.proargnames` is the
+/// discriminator, checked live on PostgreSQL 18.2:
+///
+/// ```text
+/// SELECT proname, proargnames FROM pg_proc WHERE proretset AND proname IN (...);
+///  jsonb_array_elements | {from_json,value}
+///  jsonb_each           | {from_json,key,value}
+///  unnest(tsvector)     | {tsvector,lexeme,positions,weights}
+/// ```
+///
+/// `jsonb_array_elements(...) AS x` still yields a column named `value`, not
+/// `x` — the table alias renames nothing here. [`FuncSig`] carries no
+/// `proargnames` (and no composite attribute list), so Basin cannot produce
+/// that name, and `jsonb_each`-style entries are multi-column relations this
+/// single-column lowering could not represent even if it could name them.
+/// Naming the cases explicitly is what lets the refusal say *why* instead of
+/// falling through to a generic "no such function".
+///
+/// [`FuncSig`]: basin_pgtype::func::FuncSig
+const SELF_NAMING_SRFS: &[&str] = &[
+    "jsonb_array_elements",
+    "jsonb_array_elements_text",
+    "jsonb_each",
+    "jsonb_each_text",
+    "json_array_elements",
+    "json_array_elements_text",
+    "json_each",
+    "json_each_text",
+];
+
+/// Set-returning functions with no `proargnames` at all, whose single output
+/// column is therefore named by the table alias (or, with no alias, by the
+/// function name). Verified live — the `proargnames` column is NULL for
+/// every one of these:
+///
+/// ```text
+/// SELECT * FROM generate_series(1,3);        -- column "generate_series"
+/// SELECT * FROM generate_series(1,3) g;      -- column "g"
+/// SELECT * FROM generate_series(1,3) AS g(i);-- column "i"
+/// SELECT * FROM unnest(ARRAY[10,20]) u;      -- column "u"
+/// ```
+///
+/// An allowlist rather than "anything `basin_pgtype::func` says is
+/// set-returning", so that a future catalog entry for a self-naming or
+/// composite-returning SRF makes [`build_range_function`] refuse rather than
+/// silently name its column after the alias.
+///
+/// `unnest` is on both sides of that line in real Postgres: the `anyarray`
+/// overload (oid 2331, the one `basin_pgtype::func` tabulates) has no
+/// `proargnames`, while a separate `unnest(tsvector)` row returns a
+/// four-column `record` and does. Basin's catalog carries only the former,
+/// so `unnest(some_tsvector)` finds no overload and is refused by
+/// [`builtin_srf_column_type`] rather than reaching this list.
+const ALIAS_NAMED_SRFS: &[&str] = &[
+    "generate_series",
+    "generate_subscripts",
+    "unnest",
+    "jsonb_object_keys",
+    "json_object_keys",
+    "string_to_table",
+];
+
+/// The type of the single column a set-returning function contributes in
+/// `FROM` position, or `None` when Basin's builtin catalog cannot say.
+///
+/// Resolved by name *and* argument types, not by the [`FuncId`] the
+/// [`FunctionResolver`] seam returned, because one `pg_proc` oid can have
+/// several result types: `unnest` is oid 2331 for every array element type,
+/// so the oid alone cannot distinguish `unnest(int[]) -> int4` from
+/// `unnest(text[]) -> text`. The argument types are `best_effort_type`'s, so
+/// a bare column argument reports `unknown` and picks the first
+/// implicitly-coercible overload — the same best-effort resolution
+/// `lower_func_call` itself already performs one step earlier for the oid.
+fn builtin_srf_column_type(name: &str, arg_types: &[PgType]) -> Option<PgType> {
+    if !ALIAS_NAMED_SRFS.contains(&name) {
+        return None;
+    }
+    let arg_oids: Vec<basin_pgtype::Oid> = arg_types.iter().map(|t| t.oid).collect();
+    let sig = basin_pgtype::func::resolve(name, &arg_oids)?;
+    (sig.kind == basin_pgtype::func::FuncKind::SetReturning).then(|| PgType::new(sig.ret))
+}
+
+/// `FROM generate_series(1, 3) [AS g [(i)]]`, including the `LATERAL` form
+/// whose arguments reference a relation to its left.
+///
+/// # The plan shape
+///
+/// A set-returning function in `FROM` is exactly one row of nothing expanded
+/// into a relation, which is what [`LogicalPlan::ProjectSet`] over a
+/// one-row [`LogicalPlan::Empty`] already means — no new IR node is needed.
+/// Correlation is carried by [`OUTER_REF`] columns inside the SRF's own
+/// arguments and combined by [`combine_from_items`] into a
+/// [`LogicalPlan::LateralJoin`]; `basin-exec`'s builder rebuilds the inner
+/// side per outer row and substitutes those columns (`bind_outer`), the same
+/// mechanism a correlated scalar subquery already uses.
+///
+/// # Output column naming
+///
+/// PostgreSQL's rule, in the order it applies (each clause verified live on
+/// PostgreSQL 18.2 — see [`ALIAS_NAMED_SRFS`] and [`SELF_NAMING_SRFS`]):
+///
+/// 1. A column-alias list wins: `AS g(i)` names the column `i`. Positional,
+///    and an over-long list is an error (`table "g" has 1 columns available
+///    but 2 columns specified`) — [`apply_column_alias_list`] is that rule
+///    already, shared with `WITH x(a, b)` and `FROM (VALUES ...) AS v(i, s)`.
+/// 2. Otherwise a single named `OUT` parameter or a composite return type
+///    wins and the table alias renames nothing — refused here, see
+///    [`SELF_NAMING_SRFS`].
+/// 3. Otherwise the table alias names the column, and with no alias the
+///    function name does. The alias is also the qualifier, so `g.i` and
+///    `generate_series.generate_series` both resolve.
+///
+/// # Refused
+///
+/// `WITH ORDINALITY`, `ROWS FROM (...)`, a per-function column definition
+/// list (`AS t(a int)`, which only applies to a `record`-returning function
+/// Basin has none of), a nested set-returning function in the arguments
+/// (which Postgres rejects outright), and a plain non-set-returning function
+/// in `FROM` (`FROM abs(-1)` is legal Postgres and is a one-row relation,
+/// not lowered here). Each returns [`LowerError::Unsupported`] naming the
+/// construct, so the query falls back rather than returning a wrong shape.
+fn build_range_function(
+    rf: &pg_query::protobuf::RangeFunction,
+    res: &Resolvers,
+    left: Option<&Scope>,
+) -> Result<FromBuilt, LowerError> {
+    if rf.ordinality {
+        return Err(LowerError::Unsupported(
+            "WITH ORDINALITY is not yet lowered".into(),
+        ));
+    }
+    if rf.is_rowsfrom {
+        return Err(LowerError::Unsupported(
+            "ROWS FROM (...) in FROM is not yet lowered".into(),
+        ));
+    }
+    if !rf.coldeflist.is_empty() {
+        return Err(LowerError::Unsupported(
+            "a column definition list on a function in FROM is not yet lowered".into(),
+        ));
+    }
+    // `is_rowsfrom` is false, so the parser produced exactly one entry; a
+    // different count would be a parse tree this code has never seen.
+    let [only] = rf.functions.as_slice() else {
+        return Err(LowerError::Malformed(
+            "a function in FROM with no single call",
+        ));
+    };
+    // Each entry is a two-element `List`: the call itself, and that call's
+    // own column definition list (`Node { node: None }` when absent —
+    // confirmed by dumping the parse tree of `SELECT * FROM
+    // generate_series(1,3)`).
+    let Some(NodeEnum::List(l)) = only.node.as_ref() else {
+        return Err(LowerError::Malformed(
+            "a function in FROM is not a (call, coldeflist) pair",
+        ));
+    };
+    let Some(call_node) = l.items.first() else {
+        return Err(LowerError::Malformed("a function in FROM with no call"));
+    };
+    if l.items.iter().skip(1).any(|n| n.node.is_some()) {
+        return Err(LowerError::Unsupported(
+            "a column definition list on a function in FROM is not yet lowered".into(),
+        ));
+    }
+    let Some(NodeEnum::FuncCall(fc)) = call_node.node.as_ref() else {
+        return Err(LowerError::Unsupported(
+            "this FROM item is not yet lowered".into(),
+        ));
+    };
+    let Some(NodeEnum::String(fname)) = fc.funcname.last().and_then(|n| n.node.as_ref()) else {
+        return Err(LowerError::Malformed("function name is not a name"));
+    };
+    let fname = fname.sval.as_str();
+    if SELF_NAMING_SRFS.contains(&fname) {
+        return Err(LowerError::Unsupported(format!(
+            "`{fname}` in FROM names its own output column(s) from its OUT parameters, which is not yet lowered"
+        )));
+    }
+
+    // The arguments resolve against everything to this item's LEFT, and
+    // nothing of its own — a set-returning function contributes no columns
+    // its own arguments could reference. Wrapping an empty scope means every
+    // hit goes through `ScopeResolver`'s `outer` fallback and comes back
+    // tagged `OUTER_REF`, which is exactly the marker
+    // `LogicalPlan::LateralJoin`'s inner side is defined in terms of. With
+    // no left scope, `res.outer` is still consulted directly, so
+    // `SELECT (SELECT sum(g) FROM generate_series(1, t.id) g) FROM t` — legal
+    // and returning one sum per row on a live server — resolves `t.id` as an
+    // ordinary correlated reference into the enclosing query.
+    let own = Scope::empty();
+    let left_resolver;
+    let resolver = match left {
+        Some(s) => {
+            left_resolver = ScopeResolver::new(s, res.outer);
+            ScopeResolver::new(&own, Some(&left_resolver))
+        }
+        None => ScopeResolver::new(&own, res.outer),
+    };
+    let lctx = expr_ctx(res, &resolver);
+    let ctx = lctx.ctx();
+    let expr = lower_expr(call_node, &ctx)?;
+
+    let Expr::SetReturning { args, .. } = &expr else {
+        return Err(LowerError::Unsupported(format!(
+            "`{fname}` in FROM is not a set-returning function, which is not yet lowered"
+        )));
+    };
+    if args.iter().any(|a| a.contains_srf()) {
+        return Err(LowerError::Unsupported(
+            "a set-returning function nested in another one's arguments is not yet lowered".into(),
+        ));
+    }
+    // `unnest(a, b)` is not an ordinary call with two arguments: Postgres
+    // expands it to one column PER argument, in lockstep, padding the
+    // shorter with NULL — verified live, `SELECT * FROM unnest(ARRAY[1,2],
+    // ARRAY['a','b'])` returns two columns both named `unnest`. That is a
+    // multi-column relation this single-column lowering cannot represent, so
+    // it is refused by name rather than falling out of "no such overload".
+    if fname == "unnest" && args.len() > 1 {
+        return Err(LowerError::Unsupported(
+            "multi-argument `unnest(a, b)` in FROM expands to one column per argument and is not yet lowered".into(),
+        ));
+    }
+    let arg_types: Vec<PgType> = args.iter().map(best_effort_type).collect();
+    let ty = builtin_srf_column_type(fname, &arg_types).ok_or_else(|| {
+        LowerError::Unsupported(format!(
+            "a set-returning function in FROM with no single-column entry in Basin's builtin catalog (`{fname}` at these argument types) is not yet lowered"
+        ))
+    })?;
+
+    // A reference reaching left makes this a lateral item. An argument
+    // containing a subquery counts too, conservatively: `Expr::any`
+    // deliberately does not descend into a subquery's own plan (see its
+    // docs), so a correlation hidden inside one would otherwise be missed —
+    // and a `LateralJoin` over an uncorrelated inner side is still correct,
+    // merely unoptimized.
+    let correlated = left.is_some()
+        && expr.any(&mut |e| {
+            matches!(e, Expr::Column(c) if c.relation == OUTER_REF)
+                || matches!(e, Expr::Subquery { .. })
+        });
+
+    let default_name = fname.to_string();
+    let (qualifier, schema) = match &rf.alias {
+        Some(a) if !a.colnames.is_empty() => (
+            a.aliasname.clone(),
+            apply_column_alias_list(
+                vec![(a.aliasname.clone(), ty)],
+                &a.colnames,
+                "table",
+                &a.aliasname,
+            )?,
+        ),
+        Some(a) => (a.aliasname.clone(), vec![(a.aliasname.clone(), ty)]),
+        None => (default_name.clone(), vec![(default_name, ty)]),
+    };
+
+    let plan = LogicalPlan::ProjectSet {
+        input: Box::new(LogicalPlan::Empty {
+            produce_one_row: true,
+            schema: vec![],
+        }),
+        srfs: vec![expr],
+    };
+    Ok(FromBuilt {
+        plan,
+        scope: Scope::single(qualifier, schema),
+        top_join_left_len: None,
+        correlated,
+    })
 }
 
 /// `FROM (subquery) [AS alias [(colnames)]]`. A genuine subquery (anything
@@ -1418,11 +1761,7 @@ fn build_range_subselect(
         // (1,'a'))` (no alias anywhere) runs fine.
         None => (String::new(), schema),
     };
-    Ok(FromBuilt {
-        plan,
-        scope: Scope::single(qualifier, schema),
-        top_join_left_len: None,
-    })
+    Ok(FromBuilt::leaf(plan, Scope::single(qualifier, schema)))
 }
 
 fn build_range_var(
@@ -1448,11 +1787,7 @@ fn build_range_var(
                 schema: cte.schema.clone(),
             };
             let scope = Scope::single(qualifier, cte.schema.clone());
-            return Ok(FromBuilt {
-                plan,
-                scope,
-                top_join_left_len: None,
-            });
+            return Ok(FromBuilt::leaf(plan, scope));
         }
     }
     let mut parts = Vec::new();
@@ -1481,11 +1816,7 @@ fn build_range_var(
         snapshot: SnapshotId(0),
     };
     let scope = Scope::single(qualifier, schema);
-    Ok(FromBuilt {
-        plan,
-        scope,
-        top_join_left_len: None,
-    })
+    Ok(FromBuilt::leaf(plan, scope))
 }
 
 fn build_join_expr(
@@ -1524,8 +1855,13 @@ fn build_join_expr(
         .rarg
         .as_deref()
         .ok_or(LowerError::Malformed("JOIN with no right side"))?;
-    let left = build_from_item(larg, res, ctes)?;
-    let right = build_from_item(rarg, res, ctes)?;
+    let left = build_from_item(larg, res, ctes, None)?;
+    let right = build_from_item(rarg, res, ctes, Some(&left.scope))?;
+
+    if right.correlated {
+        return build_lateral_join_expr(je, kind, left, right);
+    }
+
     let left_len = left.scope.total_len();
     let scope = left.scope.concat(right.scope);
     let total_len = scope.total_len();
@@ -1565,7 +1901,79 @@ fn build_join_expr(
         plan,
         scope,
         top_join_left_len,
+        correlated: false,
     })
+}
+
+/// An explicit `JOIN LATERAL` whose right side reaches into the left —
+/// `t CROSS JOIN LATERAL generate_series(1, t.id) g`, `t LEFT JOIN LATERAL
+/// generate_series(1, t.id) g ON true`.
+///
+/// [`LogicalPlan::LateralJoin`] carries no `on`/`filter` of its own (unlike
+/// [`LogicalPlan::Join`]), which decides what is expressible:
+///
+/// - `CROSS JOIN LATERAL` (no `ON` at all) and `... JOIN LATERAL ... ON true`
+///   become a `LateralJoin` of the corresponding kind. `ON true` is how a
+///   `LEFT JOIN LATERAL` is always written, and it is the form that matters:
+///   verified live, with `lt(id)` = 1, 3, 0, the inner form returns 4 rows
+///   and `LEFT JOIN LATERAL generate_series(1, lt.id) g ON true` returns 5,
+///   keeping `id = 0` with a NULL — the whole reason to write it.
+/// - Any other `ON` condition is refused rather than approximated. For an
+///   inner join a [`LogicalPlan::Filter`] above would be equivalent, but for
+///   an outer one it emphatically is not (a filter runs *after*
+///   null-extension and would delete the very rows the outer join was
+///   written to keep), and refusing one shape while silently rewriting the
+///   other invites exactly that mistake later.
+/// - `RIGHT`/`FULL JOIN LATERAL` is refused; Postgres itself rejects a
+///   lateral reference to the left of a right or full join.
+fn build_lateral_join_expr(
+    je: &pg_query::protobuf::JoinExpr,
+    kind: JoinKind,
+    left: FromBuilt,
+    right: FromBuilt,
+) -> Result<FromBuilt, LowerError> {
+    let scope = left.scope.concat(right.scope);
+    let plan = LogicalPlan::LateralJoin {
+        outer: Box::new(left.plan),
+        inner: Box::new(right.plan),
+        kind: match kind {
+            JoinKind::Inner => JoinKind::Inner,
+            JoinKind::Left => JoinKind::Left,
+            other => {
+                return Err(LowerError::Unsupported(format!(
+                    "a LATERAL right side under a {other:?} join is not yet lowered"
+                )))
+            }
+        },
+    };
+    match je.quals.as_deref() {
+        None => {}
+        Some(q) if is_literal_true(q) => {}
+        Some(_) => {
+            return Err(LowerError::Unsupported(
+                "a JOIN LATERAL with an ON condition other than `true` is not yet lowered".into(),
+            ))
+        }
+    }
+    Ok(FromBuilt {
+        plan,
+        scope,
+        top_join_left_len: None,
+        correlated: false,
+    })
+}
+
+/// Whether a join condition is the literal `TRUE` — the `ON true` that a
+/// `LEFT JOIN LATERAL` is conventionally written with, since SQL requires
+/// *some* condition there and there is nothing to condition on.
+fn is_literal_true(node: &Node) -> bool {
+    let Some(NodeEnum::AConst(c)) = node.node.as_ref() else {
+        return false;
+    };
+    matches!(
+        c.val.as_ref(),
+        Some(pg_query::protobuf::a_const::Val::Boolval(b)) if b.boolval && !c.isnull
+    )
 }
 
 // ─── WHERE ──────────────────────────────────────────────────────────────────
@@ -2923,6 +3331,14 @@ mod tests {
                 Some("upper") => Some((crate::FuncId(Oid(871)), FuncKind::Scalar)),
                 Some("rank") => Some((crate::FuncId(Oid(3100)), FuncKind::Window)),
                 Some("generate_series") => Some((crate::FuncId(Oid(1066)), FuncKind::SetReturning)),
+                // Oid 2331 is `unnest(anyarray)`, the same single oid every
+                // element type shares — which is exactly why
+                // `builtin_srf_column_type` resolves a FROM-position SRF's
+                // result type by name and argument types rather than by this
+                // oid. Deliberately arg-blind here, like every other arm, so
+                // a test can drive the `unnest(a, b)` refusal past this
+                // resolver and into the lowering rule that owns it.
+                Some("unnest") => Some((crate::FuncId(Oid(2331)), FuncKind::SetReturning)),
                 _ => None,
             }
         }
@@ -4653,10 +5069,23 @@ mod tests {
         );
     }
 
+    /// `LATERAL` in `FROM` is no longer refused wholesale — a `LATERAL`
+    /// *function* now lowers (see the `SRF in FROM` section below). What
+    /// stays refused is a `LATERAL` *subquery*, which needs the general
+    /// subquery-in-FROM lowering that does not exist yet, so this test now
+    /// pins that narrower refusal rather than a blanket one — and pins the
+    /// message, so a future change that makes the whole shape work has to
+    /// come here and say so.
     #[test]
-    fn a_lateral_subquery_in_from_is_unsupported() {
+    fn a_lateral_subquery_in_from_is_still_unsupported() {
         let err = lower("SELECT * FROM t, LATERAL (SELECT t.a) sub").unwrap_err();
-        assert!(matches!(err, LowerError::Unsupported(_)));
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(
+            msg.contains("LATERAL"),
+            "message should name the construct: {msg}"
+        );
     }
 
     #[test]
@@ -4666,6 +5095,498 @@ mod tests {
             panic!("expected Unsupported, got {err:?}");
         };
         assert!(msg.contains("subquery"), "message should be precise: {msg}");
+    }
+
+    // --- Set-returning functions in FROM ------------------------------------
+    //
+    // Every row value asserted here was read off a live PostgreSQL 18.2
+    // server (`postgres://…:5432/postgres`), not from memory. The naming
+    // rule these tests pin is the one commit `2f62a334` worked out for the
+    // DataFusion path, implemented natively here:
+    //
+    //   SELECT * FROM generate_series(1,3);          -- column "generate_series"
+    //   SELECT * FROM generate_series(1,3) g;        -- column "g"
+    //   SELECT * FROM generate_series(1,3) AS g(i);  -- column "i"
+    //   SELECT * FROM generate_series(1,3) AS g(i,j);
+    //     ERROR:  table "g" has 1 columns available but 2 columns specified
+    //   SELECT * FROM unnest(ARRAY[10,20]) u;        -- column "u", rows 10, 20
+    //
+    // and with `lt(id)` = 1, 3, 0:
+    //
+    //   SELECT lt.id, g FROM lt, LATERAL generate_series(1, lt.id) g;
+    //     -> (1,1) (3,1) (3,2) (3,3)          -- 4 rows; id=0 drops out
+    //   SELECT lt.id, g FROM lt, generate_series(1, lt.id) g;
+    //     -> identical 4 rows                 -- no LATERAL keyword needed
+    //   SELECT lt.id, g FROM lt LEFT JOIN LATERAL generate_series(1, lt.id) g ON true;
+    //     -> the same 4 plus (0, NULL)        -- 5 rows
+
+    /// The base shape: one row of nothing, expanded. No new IR node — a
+    /// `ProjectSet` over a one-row `Empty` is what "a set-returning function
+    /// IS the relation" already means, and `basin-exec`'s builder already
+    /// runs exactly this plan (`a_set_returning_function_builds_and_expands`).
+    #[test]
+    fn a_set_returning_function_in_from_lowers_to_a_project_set() {
+        let plan = lower("SELECT * FROM generate_series(1, 3)").expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        // Rule 3, no alias: the FUNCTION NAME names the column.
+        assert_eq!(
+            exprs,
+            vec![(col(0, "generate_series"), "generate_series".to_string())]
+        );
+        let LogicalPlan::ProjectSet { input, srfs } = *input else {
+            panic!("expected ProjectSet under Project, got {input:?}");
+        };
+        let [Expr::SetReturning { args, .. }] = srfs.as_slice() else {
+            panic!("expected exactly one SetReturning, got {srfs:?}");
+        };
+        assert_eq!(*args, vec![int_lit(1), int_lit(3)]);
+        assert!(
+            matches!(
+                *input,
+                LogicalPlan::Empty {
+                    produce_one_row: true,
+                    ..
+                }
+            ),
+            "the SRF must expand ONE row, not zero: {input:?}"
+        );
+    }
+
+    /// Rule 3 with an alias: the table alias names the single column, and is
+    /// also the qualifier — `SELECT g.g FROM generate_series(1,3) g` resolves
+    /// on a live server, as does the unaliased
+    /// `SELECT generate_series.generate_series FROM generate_series(1,3)`.
+    #[test]
+    fn a_table_alias_names_the_srf_column_and_qualifies_it() {
+        let plan = lower("SELECT g.g FROM generate_series(1, 3) g").expect("lowers");
+        let LogicalPlan::Project { exprs, .. } = plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        assert_eq!(exprs, vec![(col(0, "g"), "g".to_string())]);
+
+        let plan = lower("SELECT generate_series.generate_series FROM generate_series(1, 3)")
+            .expect("the function name is the qualifier when there is no alias");
+        let LogicalPlan::Project { exprs, .. } = plan else {
+            panic!("expected Project");
+        };
+        assert_eq!(exprs[0].1, "generate_series");
+    }
+
+    /// Rule 1: a column-alias list beats the table alias.
+    #[test]
+    fn a_column_alias_list_wins_over_the_table_alias() {
+        let plan = lower("SELECT i FROM generate_series(1, 3) AS g(i)").expect("lowers");
+        let LogicalPlan::Project { exprs, .. } = plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        assert_eq!(exprs, vec![(col(0, "i"), "i".to_string())]);
+        // …and once renamed, the old name is gone, same as for `WITH x(a)`.
+        assert!(matches!(
+            lower("SELECT g FROM generate_series(1, 3) AS g(i)"),
+            Err(LowerError::UnknownName(_))
+        ));
+    }
+
+    /// An over-long column-alias list is an error, with the same wording a
+    /// live server uses for `FROM (VALUES ...) AS v(...)`:
+    /// `table "g" has 1 columns available but 2 columns specified`.
+    #[test]
+    fn an_over_long_column_alias_list_on_an_srf_is_rejected() {
+        let err = lower("SELECT * FROM generate_series(1, 3) AS g(i, j)").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(
+            msg.contains("table \"g\" has 1 columns available but 2 columns specified"),
+            "message should match the server's: {msg}"
+        );
+    }
+
+    /// The three-argument (explicit step) form and the `int8` overload both
+    /// lower, and the column's TYPE follows the overload — `int4` for the
+    /// plain integer forms, `int8` for the bigint one. The type is what a
+    /// `FROM`-position SRF contributes to an enclosing CTE's schema, so
+    /// getting it from the argument types rather than from the (shared) oid
+    /// is what makes `WITH x AS (SELECT * FROM generate_series(...))` report
+    /// a real type instead of `unknown`.
+    #[test]
+    fn the_step_and_bigint_generate_series_overloads_lower_with_their_own_types() {
+        let plan = lower("WITH x AS (SELECT * FROM generate_series(1, 10, 3)) SELECT * FROM x")
+            .expect("three-argument generate_series lowers");
+        assert_eq!(
+            cte_ref_schema(&plan),
+            vec![("generate_series".to_string(), PgType::INT4)]
+        );
+
+        let plan =
+            lower("WITH x AS (SELECT * FROM generate_series(1::int8, 3::int8)) SELECT * FROM x")
+                .expect("the bigint overload lowers");
+        assert_eq!(
+            cte_ref_schema(&plan),
+            vec![("generate_series".to_string(), PgType::INT8)]
+        );
+    }
+
+    /// `unnest` in `FROM` goes through the identical path — it is a
+    /// set-returning function with no `proargnames`, so it is alias-named
+    /// too.
+    #[test]
+    fn unnest_in_from_lowers_and_is_alias_named() {
+        let plan = lower("SELECT * FROM unnest(ARRAY[10, 20]) u").expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        assert_eq!(exprs, vec![(col(0, "u"), "u".to_string())]);
+        assert!(
+            matches!(*input, LogicalPlan::ProjectSet { .. }),
+            "expected ProjectSet, got {input:?}"
+        );
+    }
+
+    /// An UNCORRELATED function item is a plain cross join, not a lateral
+    /// one: `opt::projection` and `opt::pushdown` both treat
+    /// `LogicalPlan::LateralJoin` as an opaque barrier, so using one where a
+    /// `Join` would do costs every optimization below it for nothing.
+    #[test]
+    fn an_uncorrelated_srf_in_from_is_a_cross_join_not_a_lateral_one() {
+        let plan = lower("SELECT * FROM t, generate_series(1, 3) g").expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        assert_eq!(exprs.len(), 4, "t's three columns plus g");
+        assert_eq!(exprs[3].1, "g");
+        let LogicalPlan::Join { kind, right, .. } = *input else {
+            panic!("expected a plain Join, got {input:?}");
+        };
+        assert_eq!(kind, JoinKind::Cross);
+        assert!(matches!(*right, LogicalPlan::ProjectSet { .. }));
+    }
+
+    /// The valuable case. `FROM t, LATERAL generate_series(1, t.id) g`
+    /// expands per outer row, so the argument must lower to an `OUTER_REF`
+    /// column — the exact marker `basin-exec`'s `bind_outer` substitutes per
+    /// row when it rebuilds a `LateralJoin`'s inner side, the same mechanism
+    /// a correlated scalar subquery already uses.
+    #[test]
+    fn a_correlated_lateral_srf_lowers_to_a_lateral_join() {
+        let plan = lower("SELECT * FROM t, LATERAL generate_series(1, t.id) g").expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        assert_eq!(exprs.len(), 4, "t's three columns plus g");
+        assert_eq!(exprs[3], (col(3, "g"), "g".to_string()));
+
+        let LogicalPlan::LateralJoin { outer, inner, kind } = *input else {
+            panic!("a correlated function item must be a LateralJoin, got {input:?}");
+        };
+        assert_eq!(kind, JoinKind::Inner);
+        assert!(matches!(*outer, LogicalPlan::Scan { .. }));
+        let LogicalPlan::ProjectSet { srfs, .. } = *inner else {
+            panic!("expected ProjectSet as the lateral inner side, got {inner:?}");
+        };
+        let [Expr::SetReturning { args, .. }] = srfs.as_slice() else {
+            panic!("expected one SetReturning, got {srfs:?}");
+        };
+        assert_eq!(
+            args[1],
+            Expr::Column(ColumnRef {
+                relation: OUTER_REF,
+                index: 0,
+                name: "id".into(),
+            }),
+            "t.id must be tagged OUTER_REF and indexed against the OUTER row"
+        );
+    }
+
+    /// The correlation must survive the OPTIMIZER, not just lowering. A
+    /// `LateralJoin`'s inner side reads its outer row by POSITION, so a rule
+    /// that pruned or renumbered the outer scan's projection underneath it
+    /// would leave the `OUTER_REF` pointing at a different column — a wrong
+    /// answer, not an error. `opt::projection` leaves `LateralJoin` alone
+    /// entirely and `opt::pushdown` treats it as a barrier, both by design;
+    /// this pins that the assembled default pipeline actually behaves that
+    /// way for a plan this lowering now produces.
+    #[test]
+    fn optimization_leaves_a_lateral_srfs_correlation_intact() {
+        let plan = lower("SELECT * FROM t, LATERAL generate_series(1, t.id) g").unwrap();
+        let (optimized, _passes) = crate::opt::optimize_default(plan);
+        let LogicalPlan::Project { input, .. } = optimized else {
+            panic!("expected Project, got {optimized:?}");
+        };
+        let LogicalPlan::LateralJoin { outer, inner, .. } = *input else {
+            panic!("the LateralJoin must survive optimization, got {input:?}");
+        };
+        let LogicalPlan::Scan { projection, .. } = *outer else {
+            panic!("expected the outer Scan to survive, got {outer:?}");
+        };
+        assert_eq!(
+            projection,
+            vec![ColId(0), ColId(1), ColId(2)],
+            "pruning t's projection under a LateralJoin would move the column \
+             the correlation reads"
+        );
+        let LogicalPlan::ProjectSet { srfs, .. } = *inner else {
+            panic!("expected ProjectSet, got {inner:?}");
+        };
+        let [Expr::SetReturning { args, .. }] = srfs.as_slice() else {
+            panic!("expected one SetReturning, got {srfs:?}");
+        };
+        assert_eq!(
+            args[1],
+            Expr::Column(ColumnRef {
+                relation: OUTER_REF,
+                index: 0,
+                name: "id".into(),
+            })
+        );
+    }
+
+    /// The `LATERAL` keyword is optional for a function item — Postgres
+    /// treats one as implicitly lateral, and both spellings return the same
+    /// four rows live. So the choice of plan node follows the actual
+    /// correlation, not the keyword.
+    #[test]
+    fn a_function_item_is_implicitly_lateral_without_the_keyword() {
+        let with_keyword = lower("SELECT * FROM t, LATERAL generate_series(1, t.id) g").unwrap();
+        let without = lower("SELECT * FROM t, generate_series(1, t.id) g").unwrap();
+        assert_eq!(with_keyword, without);
+    }
+
+    /// `CROSS JOIN LATERAL` and `LEFT JOIN LATERAL ... ON true` — the two
+    /// explicit-join spellings. The `LEFT` one is the whole reason to write
+    /// an outer lateral join: live, it keeps `id = 0` (whose
+    /// `generate_series(1, 0)` is empty) with a NULL, where the inner form
+    /// drops that row entirely.
+    #[test]
+    fn explicit_join_lateral_lowers_for_cross_and_left() {
+        let plan = lower("SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g")
+            .expect("CROSS JOIN LATERAL lowers");
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::LateralJoin { kind, .. } = *input else {
+            panic!("expected LateralJoin, got {input:?}");
+        };
+        assert_eq!(kind, JoinKind::Inner);
+
+        let plan = lower("SELECT * FROM t LEFT JOIN LATERAL generate_series(1, t.id) g ON true")
+            .expect("LEFT JOIN LATERAL ... ON true lowers");
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::LateralJoin { kind, .. } = *input else {
+            panic!("expected LateralJoin, got {input:?}");
+        };
+        assert_eq!(
+            kind,
+            JoinKind::Left,
+            "an outer lateral join must NOT degrade to an inner one — that silently drops rows"
+        );
+    }
+
+    /// `LogicalPlan::LateralJoin` carries no `on`/`filter`, so a real `ON`
+    /// condition has nowhere to go. Refused rather than approximated with a
+    /// `Filter` above, which would be wrong for an outer join.
+    #[test]
+    fn a_join_lateral_with_a_real_on_condition_is_unsupported() {
+        let err = lower("SELECT * FROM t LEFT JOIN LATERAL generate_series(1, t.id) g ON g > 1")
+            .unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains("ON condition"), "unexpected message: {msg}");
+    }
+
+    /// A `WHERE` clause over a lateral join becomes a plain `Filter` above
+    /// it. It must NOT be folded into a join's `on` list the way
+    /// `FROM a, b WHERE a.x = b.y` is — a `LateralJoin` has no `on` list, and
+    /// the equijoin-extraction path is only wired for `LogicalPlan::Join`.
+    #[test]
+    fn a_where_clause_above_a_lateral_join_stays_a_filter() {
+        let plan = lower("SELECT * FROM t, LATERAL generate_series(1, t.id) g WHERE g > 1")
+            .expect("lowers");
+        let LogicalPlan::Project { input, .. } = plan else {
+            panic!("expected Project");
+        };
+        let LogicalPlan::Filter { input, .. } = *input else {
+            panic!("expected Filter above the lateral join, got {input:?}");
+        };
+        assert!(matches!(*input, LogicalPlan::LateralJoin { .. }));
+    }
+
+    /// With nothing to this item's LEFT, a reference reaching outside is an
+    /// ordinary correlated reference into the ENCLOSING QUERY, not a lateral
+    /// join — `SELECT id, (SELECT sum(g) FROM generate_series(1, lt2.id) g)
+    /// FROM lt2` is legal and returns one sum per row live (1 -> 1, 3 -> 6,
+    /// 0 -> NULL). The subquery machinery already handles that shape; a
+    /// `LateralJoin` here would be a second, wrong answer to the same
+    /// question.
+    #[test]
+    fn an_srf_in_a_subquerys_from_correlates_to_the_outer_query_not_a_lateral_join() {
+        let plan =
+            lower("SELECT (SELECT sum(g) FROM generate_series(1, t.id) g) FROM t").expect("lowers");
+        let LogicalPlan::Project { input, exprs } = plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        assert!(
+            matches!(*input, LogicalPlan::Scan { .. }),
+            "no LateralJoin belongs here: {input:?}"
+        );
+        let Expr::Subquery { subplan, .. } = &exprs[0].0 else {
+            panic!("expected a scalar subquery, got {:?}", exprs[0].0);
+        };
+        let mut found_outer_ref = false;
+        walk_plan(subplan, &mut |p| {
+            p.for_each_expr(&mut |e| {
+                if e.any(&mut |x| matches!(x, Expr::Column(c) if c.relation == OUTER_REF)) {
+                    found_outer_ref = true;
+                }
+            });
+        });
+        assert!(
+            found_outer_ref,
+            "t.id inside the subquery's FROM must be tagged OUTER_REF: {subplan:?}"
+        );
+    }
+
+    // --- SRF in FROM: the honest refusals ------------------------------------
+
+    /// `WITH ORDINALITY` adds a second, bigint column numbering the rows
+    /// (`SELECT * FROM generate_series(1,3) WITH ORDINALITY` returns
+    /// `generate_series | ordinality`). This lowering produces exactly one
+    /// column, so the feature is refused by name rather than silently
+    /// dropped — a dropped `WITH ORDINALITY` is a missing column, which is a
+    /// wrong answer, not a slow one.
+    #[test]
+    fn with_ordinality_is_unsupported() {
+        let err = lower("SELECT * FROM generate_series(1, 3) WITH ORDINALITY").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains("ORDINALITY"), "unexpected message: {msg}");
+    }
+
+    /// `ROWS FROM (a(), b())` runs several functions in lockstep, one column
+    /// each, padding the shorter with NULL — live, `ROWS FROM
+    /// (generate_series(1,2), generate_series(1,3))` returns three rows and
+    /// two columns, the last `(NULL, 3)`.
+    #[test]
+    fn rows_from_is_unsupported() {
+        let err = lower("SELECT * FROM ROWS FROM (generate_series(1, 2), generate_series(1, 3))")
+            .unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains("ROWS FROM"), "unexpected message: {msg}");
+    }
+
+    /// Multi-argument `unnest` is the same multi-column shape by another
+    /// spelling: live, `unnest(ARRAY[1,2], ARRAY['a','b'])` returns two
+    /// columns, both named `unnest`.
+    #[test]
+    fn multi_argument_unnest_in_from_is_unsupported() {
+        let err = lower("SELECT * FROM unnest(ARRAY[1, 2], ARRAY[3, 4])").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains("unnest"), "unexpected message: {msg}");
+    }
+
+    /// Rule 2 — the case Basin's catalog cannot answer. A function with a
+    /// named `OUT` parameter names its own output column and the table alias
+    /// renames NOTHING: `jsonb_array_elements(...) AS x` still yields a
+    /// column called `value` (its `pg_proc.proargnames` is
+    /// `{from_json,value}`). `basin_pgtype::func::FuncSig` carries no
+    /// `proargnames`, so this is refused with a message that says which rule
+    /// it is, rather than being alias-named and quietly wrong.
+    #[test]
+    fn a_self_naming_srf_in_from_is_unsupported() {
+        let err = lower("SELECT * FROM jsonb_array_elements('[1,2]') AS x").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(
+            msg.contains("OUT parameters"),
+            "message should name the rule: {msg}"
+        );
+    }
+
+    /// A plain (non-set-returning) function in `FROM` is legal Postgres —
+    /// `SELECT * FROM abs(-1)` is a one-row relation — and is a different
+    /// lowering (a `Project`, not a `ProjectSet`). Refused rather than run
+    /// through the SRF path.
+    #[test]
+    fn a_non_set_returning_function_in_from_is_unsupported() {
+        let err = lower("SELECT * FROM upper('x')").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(
+            msg.contains("not a set-returning function"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    /// A set-returning function Basin's builtin catalog has no entry for
+    /// cannot be given an output column at all — its arity, its type and
+    /// whether it self-names are all unknown. Refused, so it falls back
+    /// rather than being guessed at.
+    #[test]
+    fn an_unknown_set_returning_function_in_from_is_unsupported() {
+        // `unnest` is in `MockFunctions` (so it resolves to a `FuncId`) but
+        // there is no `unnest()` zero-argument overload in the builtin
+        // catalog, which is what this exercises.
+        let err = lower("SELECT * FROM unnest()").unwrap_err();
+        let LowerError::Unsupported(msg) = err else {
+            panic!("expected Unsupported, got {err:?}");
+        };
+        assert!(msg.contains("builtin catalog"), "unexpected message: {msg}");
+    }
+
+    /// Every `FuncKind::SetReturning` entry in `basin_pgtype::func::FUNCS`
+    /// must be one this file knows the naming rule for. This is the guard
+    /// that keeps [`ALIAS_NAMED_SRFS`] honest as that catalog grows: adding
+    /// `jsonb_array_elements` there would otherwise make `FROM
+    /// jsonb_array_elements(...) AS x` silently name its column `x` instead
+    /// of `value`.
+    #[test]
+    fn every_builtin_srf_has_a_known_from_position_naming_rule() {
+        for sig in basin_pgtype::func::FUNCS
+            .iter()
+            .filter(|f| f.kind == basin_pgtype::func::FuncKind::SetReturning)
+        {
+            assert!(
+                ALIAS_NAMED_SRFS.contains(&sig.name) || SELF_NAMING_SRFS.contains(&sig.name),
+                "`{}` (oid {:?}) is a builtin SRF with no FROM-position naming rule in \
+                 lower/select.rs — check its pg_proc.proargnames on a live server and add it \
+                 to ALIAS_NAMED_SRFS or SELF_NAMING_SRFS",
+                sig.name,
+                sig.oid
+            );
+        }
+    }
+
+    /// Walk `plan` and every plan nested below it, including subquery
+    /// subplans — `LogicalPlan::for_each_input` alone stops at the node's own
+    /// children.
+    fn walk_plan(plan: &LogicalPlan, f: &mut impl FnMut(&LogicalPlan)) {
+        f(plan);
+        plan.for_each_input(&mut |c| walk_plan(c, f));
+    }
+
+    /// The schema a `WITH x AS (...) SELECT * FROM x` plan's `CteRef` exposes
+    /// — how a `FROM`-position column's TYPE becomes observable in a lowered
+    /// plan at all (`lower_select` itself returns only a `LogicalPlan`).
+    fn cte_ref_schema(plan: &LogicalPlan) -> Schema {
+        let mut found = None;
+        walk_plan(plan, &mut |p| {
+            if let LogicalPlan::CteRef { schema, .. } = p {
+                found = Some(schema.clone());
+            }
+        });
+        found.expect("no CteRef in the plan")
     }
 
     // --- VALUES in FROM ------------------------------------------------------
