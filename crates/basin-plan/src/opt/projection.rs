@@ -820,31 +820,65 @@ fn prune(plan: &LogicalPlan, required: &BTreeSet<u16>) -> (LogicalPlan, Remap, b
             let new_on = on
                 .iter()
                 .map(|(l, r)| {
+                    // The two halves of an `on` pair are remapped through
+                    // DIFFERENT tables, because `rebase_columns` leaves the
+                    // right operand tagged `relation: 0` while making its index
+                    // right-relative. Sending both through `left_remap` looks
+                    // symmetric and reads fine, and it is what this did — it
+                    // resolved the right operand's index against the left
+                    // side's table. When the two sides have different widths or
+                    // different pruning, that is either a panic (index not
+                    // marked required) or, worse, an in-range hit on an
+                    // unrelated column.
+                    //
+                    // Collection above was already fixed to attribute `r`'s
+                    // relation-0 index to the right side. This is the other
+                    // half of that same fix, which I left behind: collection
+                    // said "the right side needs column k" and the rewrite then
+                    // looked k up in the left table.
                     let l = apply_remap(&right_remap, &apply_remap(&left_remap, l, 0), 1);
-                    let r = apply_remap(&right_remap, &apply_remap(&left_remap, r, 0), 1);
+                    let r = apply_remap(&right_remap, &apply_remap(&right_remap, r, 0), 1);
                     (l, r)
                 })
                 .collect();
+            // A flat table over the CONCATENATED output: positions below
+            // `left_width` resolve through the left side's remap, the rest
+            // through the right's and then shifted by the pruned left width.
+            //
+            // This is what a join `filter` needs, and it is needed whatever the
+            // join kind — a semi join's filter still reads right-side columns
+            // during the match test even though they never reach the output.
+            // Remapping the filter with `left_remap` alone (which is what this
+            // did) resolves every right-side position against the left side's
+            // table: a panic when the index is not marked required, and a wrong
+            // column when it happens to be.
+            let new_left_width = output_width(&new_left);
+            let flat_remap: Remap = Some(
+                (0..left_width)
+                    .map(|p| match &left_remap {
+                        None => Some(p as u16),
+                        Some(v) => v[p],
+                    })
+                    .chain((0..right_width).map(|p| {
+                        let mapped = match &right_remap {
+                            None => Some(p as u16),
+                            Some(v) => v[p],
+                        };
+                        mapped.map(|y| (new_left_width + y as usize) as u16)
+                    }))
+                    .collect(),
+            );
+
             let new_filter = filter
                 .as_ref()
-                .map(|f| apply_remap(&right_remap, &apply_remap(&left_remap, f, 0), 1));
+                .map(|f| apply_remap(&right_remap, &apply_remap(&flat_remap, f, 0), 1));
 
+            // A semi/anti join outputs only its left side, so what it exposes
+            // upward is the left remap — not the concatenated one above.
             let own_remap = if is_semi_anti {
                 left_remap.clone()
             } else {
-                let new_left_width = output_width(&new_left);
-                let left_part = (0..left_width).map(|p| match &left_remap {
-                    None => Some(p as u16),
-                    Some(v) => v[p],
-                });
-                let right_part = (0..right_width).map(|p| {
-                    let mapped = match &right_remap {
-                        None => Some(p as u16),
-                        Some(v) => v[p],
-                    };
-                    mapped.map(|y| (new_left_width + y as usize) as u16)
-                });
-                Some(left_part.chain(right_part).collect())
+                flat_remap
             };
 
             let new_plan = LogicalPlan::Join {
