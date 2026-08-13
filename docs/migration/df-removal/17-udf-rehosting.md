@@ -14,8 +14,8 @@ migration map. [04](./04-function-gap.md) measured the *size* of this block —
 untouched piece of the migration. This document asks the different question:
 **what kind of work is it?**
 
-**Status: partial.** Six families are inventoried below. JSONB and range are
-not yet surveyed.
+**Status: complete.** All eight families are inventoried below, plus the
+fourth ABSENT category (math) found along the way.
 
 ## The headline: it is not mostly a porting problem
 
@@ -46,10 +46,10 @@ individual function's logic**, and it is shared by every ENTANGLED entry below.
 | Regex / FTS / trigram | 25 | ~4,454 | 8 | 17 | **0** |
 | Geo / PostGIS | 43 live | ~3,820 | 12 | 45 | 3 |
 | String | 19 | ~2,502 | 12 | 7 | 0 |
+| JSONB | 51 live | ~11,628 | 16 | 31 | 4 |
+| Range | 30 live | ~3,155 | 2 | 13 | 0 |
 | Math | **see below** | — | — | — | — |
-| **Surveyed total** | **~148** | **~25,639** | **55** | **94** | **21** |
-
-Not yet surveyed: JSONB, range.
+| **Surveyed total** | **~229** | **~40,422** | **73** | **138** | **25** |
 
 ### Math: the taxonomy has no slot for it, and that is the finding
 
@@ -133,6 +133,168 @@ DataFusion's per-call `ScalarFunctionArgs.arg_fields[].metadata()`, and
 `basin-exec`'s evaluator has no equivalent: it sees arrays, not the source
 columns' Field metadata. That is a design question, not a translation.
 
+### JSONB: 59 structs, two of them shadowed the same way Geo's are
+
+`jsonb_udf.rs` (7,524 lines), `jsonb_path_udf.rs` (1,952), `jsonb_modify_udf.rs`
+(1,395) and `json_build_udf.rs` (757) together register 59 `ScalarUDFImpl`
+structs. Eight are dead on arrival, shadowed the same way the geo family's
+wave-α structs are: `session.rs` calls `register_jsonb_udfs` first, then
+`register_jsonb_path_udfs`, then `register_jsonb_modify_udfs` — and DataFusion's
+`register_udf` replaces by name, so whichever registers last wins.
+
+- `jsonb_modify_udf.rs` re-registers `jsonb_typeof`, `jsonb_pretty`,
+  `jsonb_strip_nulls`, `jsonb_set` and `jsonb_insert` (`session.rs:380`, after
+  `jsonb_udf.rs`'s copies at `session.rs:371`). This one is **intentional and
+  self-documented** — `jsonb_modify_udf.rs:23-25` says so in a doc comment,
+  and its versions genuinely handle the `text[]` path argument better. The
+  five structs left behind in `jsonb_udf.rs` (`JsonbTypeofUdf` at line 1883,
+  `JsonbPrettyUdf` at 1944, `JsonbStripNullsUdf` at 2054, `JsonbSetUdf` at
+  2100, `JsonbInsertUdf` at 2211) are unreachable from SQL and should not be
+  ported.
+- `jsonb_path_udf.rs` re-registers `jsonb_path_query_first`,
+  `jsonb_path_query_array` and `jsonb_path_match` (`session.rs:379`, also
+  after `jsonb_udf.rs`'s copies). This one is **not** documented as
+  intentional shadowing anywhere, and it is the more consequential of the
+  two — see below.
+
+Re-hosting target: **51 live names across the 59 structs**, same rule as
+geo — always take the version that wins the registration race, never the
+one left behind.
+
+### JSONB path functions: the real JSONPath engine only covers three of five entry points
+
+`jsonb_path_udf.rs`'s module doc advertises a real JSONPath subset — `$`,
+`.key`, `[0]`, `[*]`, `.*`, `..key`, and `[?(@.x > 1)]` filters — implemented
+by a genuine recursive-descent parser and evaluator (`parse_jsonpath` /
+`jsonpath_eval`, `jsonb_path_udf.rs:526-928`). But that parser only backs
+three of the five JSONPath entry points PostgreSQL exposes:
+`jsonb_path_query_first`, `jsonb_path_query_array`, and `jsonb_path_match`
+(the `@@` operator). It does **not** back plain `jsonb_path_query` in scalar
+position, and it does not back `jsonb_path_exists` (the `@?` operator) at
+all — `register_jsonb_path_udfs` (`jsonb_path_udf.rs:72-106`) never
+registers either name.
+
+Both of those names fall through to `jsonb_udf.rs`'s original, much weaker
+implementation: `JsonbPathQueryUdf` (line 2619) and `JsonbPathExistsUdf`
+(line 2719) strip the leading `$.` and split what's left on `.` — no `[*]`,
+no filters, no recursive descent, no array-index brackets as anything but
+literal path segments. `jsonb_path_match` on the *jsonb_udf.rs* copy
+(line 2814, dead — shadowed as above) even says so in its own comment:
+`// jsonb_path_match  (alias of jsonb_path_exists for simple paths)`.
+
+`jsonb_path_query` in scalar/SELECT-list position is also missing PostgreSQL's
+row-expansion behavior entirely — it's a genuine SRF there (one output row
+per match), but the scalar stub caps out at one match per input row, same as
+`jsonb_path_query_first`. Confirmed against Postgres 18.2:
+
+```sql
+-- jsonb_path_exists: filter predicate
+SELECT jsonb_path_exists('{"a":[1,2,3]}'::jsonb, '$.a[*] ? (@ > 2)');
+-- Postgres: t.  Basin's live jsonb_path_exists: parse_path("a[*] ? (@ > 2)")
+-- treats the whole filter text as one literal key segment and never finds
+-- it → f.
+
+-- jsonb_path_query: row expansion in scalar position
+SELECT jsonb_path_query('{"a":[1,2,3]}'::jsonb, '$.a[*]');
+-- Postgres: three rows (1, 2, 3).  Basin's live jsonb_path_query strips
+-- '$.' and splits on '.', leaving the single segment "a[*]" which matches no
+-- object key → one row, NULL.
+```
+
+Whoever re-hosts this family should retire `JsonbPathQueryUdf` and
+`JsonbPathExistsUdf` and route both names through `jsonpath_eval` instead —
+otherwise the fuller parser's own module doc becomes misleading: it describes
+capabilities two of the five call sites into it don't have.
+
+### Range: only `range_eq` knows its own subtype, and every other predicate silently mishandles date/timestamp bounds
+
+Range values are stored as JSON text: `{"l":<lower>,"u":<upper>,"li":<bool>,
+"ui":<bool>}` (`range_udf.rs:1-6`). For `int4range`/`int8range`/`numrange`
+the bounds are JSON numbers. For `daterange`/`tsrange`/`tstzrange` they are
+JSON **strings** — `"2024-01-01"`, `"2024-01-01 00:00:00"` — because dates and
+timestamps don't fit in a JSON number.
+
+Every predicate except `range_eq` reads bounds through `range_bound_f64`
+(`range_udf.rs:849-856`), which does
+`fv.as_f64().or_else(|| fv.as_str().and_then(|s| s.parse().ok()))` — a plain
+`f64::from_str` on the bound text. `"2024-01-01".parse::<f64>()` fails
+(multiple hyphens are not valid float syntax), so **every finite date or
+timestamp bound silently becomes
+`None`**, and every one of these functions treats `None` the same as an
+*infinite* bound rather than "couldn't parse":
+
+- `range_overlaps` (`range_udf.rs:778-847`): with both bounds unparseable,
+  `a_ends_before_b` and `b_ends_before_a` both default to `false` (the `_ =>
+  false` arms at lines 826, 837) → the function reports **every pair of
+  date/timestamp ranges as overlapping**, even ones nowhere near each other.
+- `range_contains_range` (`range_udf.rs:873-958`): `i_hi` parses to `None`,
+  which the `(None, _) => false` arm at line 932 treats as "inner extends to
+  +infinity, outer can't contain it" → **always `false`** for date/timestamp
+  containment, even when the inner range is fully inside the outer one.
+- `range_contains_elem` (`range_udf.rs:686-761`): the *element* is also text
+  (`"2024-03-01"`), so `elem_s.parse::<f64>()` fails too and the whole
+  closure short-circuits via `?` → returns **SQL `NULL`** instead of a
+  boolean, for every date/timestamp element test.
+- `range_strictly_left` / `range_strictly_right` / `range_adjacent`
+  (`RangeRelationalUdf`, `range_udf.rs:977-1118`): every `_ => Some(false)`
+  fallback arm fires on the unparseable bound → **always `false`**, so `<<`,
+  `>>` and `-|-` never fire for date/timestamp ranges no matter how the
+  ranges actually relate.
+- `range_merge` / `range_union` / `range_intersection` / `range_diff`
+  (`RangeParts`, `range_udf.rs:1322-1384`): `RangeParts.lo`/`.hi` are
+  `Option<f64>`; a date bound parses to `None`, and `format_range_parts`
+  writes `None` back out as JSON `null` — the storage encoding for
+  **infinity**. A `range_merge` of two ordinary, fully-bounded date ranges
+  silently produces `(-infinity, +infinity)`, discarding the actual dates
+  entirely rather than erroring.
+- `isempty` also reads bounds through `range_bound_f64`
+  (`range_is_empty`, `range_udf.rs:239-257`), so it inherits the same
+  failure — see below.
+
+`range_eq` is the one exception, and the reason is structural, not
+accidental: it's the only predicate the pre-parse rewriter hands a third
+argument, the subtype name (`range_udf.rs:1160-1197`), and it delegates to
+`basin_common::types::range::RangeValue::semantic_eq`, whose `bounds_eq`
+helper (`basin-common/src/types/range.rs:473-485`) falls back to plain
+string comparison when the numeric parse fails. Every other range function
+in `range_udf.rs` has no subtype argument in its signature at all — `isempty`
+is `Signature::exact(vec![DataType::Utf8], ...)`, one argument, no way to
+know discreteness even in principle — and none of them has the string
+fallback either.
+
+Confirmed against Postgres 18.2 (all five diverge from Basin's current
+behavior):
+
+```sql
+SELECT
+  daterange('2024-01-01','2024-06-01') @> '2024-03-01'::date,        -- t (Basin: NULL)
+  daterange('2024-01-01','2024-03-01')
+    && daterange('2024-06-01','2024-08-01'),                          -- f (Basin: t)
+  daterange('2024-01-01','2024-06-01')
+    @> daterange('2024-02-01','2024-03-01'),                          -- t (Basin: f)
+  daterange('2024-01-01','2024-03-01')
+    << daterange('2024-06-01','2024-08-01'),                          -- t (Basin: f)
+  daterange('2024-01-01','2024-03-01')
+    -|- daterange('2024-03-01','2024-06-01');                         -- t (Basin: f)
+```
+
+A second, smaller bug shares the same root cause of "predicates don't know
+their own subtype": `range_is_empty` treats an open range between adjacent
+integers as non-empty, because nothing tells it the type is discrete.
+PostgreSQL canonicalizes `(5,6)::int4range` to `empty` (no integer lies
+strictly between 5 and 6); Basin's `range_is_empty` only checks `lo > hi` or
+`lo == hi` (`range_udf.rs:239-257`), sees `5 < 6`, and reports non-empty.
+Confirmed: `SELECT isempty('(5,6)'::int4range)` is `t` in Postgres 18.2.
+`int4range`/`int8range`/`daterange` are exactly the three subtypes this
+affects, and they're also three of the six range constructors.
+
+`range_udf.rs` has **zero ENTANGLED** functions — no session, no catalog, no
+async, same as regex/FTS — but re-hosting it correctly requires first
+deciding how every predicate learns its subtype, not just `range_eq`. That's
+a smaller version of the session-context problem this document keeps
+surfacing: the missing input isn't DataFusion-shaped, it's "which of six
+range types is this text really".
+
 ## The cheapest win, and the most expensive one
 
 **Cheapest:** the ~17 `pg_catalog` stub functions in `pg_catalog_udf.rs` are
@@ -192,6 +354,38 @@ simplified — wrong.
 Re-hosting these mechanically would carry the wrongness forward under a new
 implementation that looks more trustworthy. Each needs a decision: fix, or
 carry the stub-ness forward with equal prominence.
+
+**Range predicates other than `range_eq` silently mishandle date/timestamp
+bounds.** `range_bound_f64` (`range_udf.rs:849`) parses a bound as `f64`;
+date and timestamp bounds are stored as JSON strings like `"2024-01-01"`,
+which fail that parse and become `None` — indistinguishable from a genuine
+infinite bound to every caller. Confirmed against Postgres 18.2:
+`range_overlaps` (`range_udf.rs:778`) reports **every** pair of
+daterange/tsrange/tstzrange values as overlapping regardless of their actual
+dates; `range_contains_range` (`range_udf.rs:873`) reports **containment
+always false** for the same three subtypes; `range_contains_elem`
+(`range_udf.rs:686`) returns `NULL` instead of a boolean; `range_adjacent` /
+`range_strictly_left` / `range_strictly_right` (`RangeRelationalUdf`,
+`range_udf.rs:977`) are **always false**; `range_merge` / `range_union` /
+`range_intersection` / `range_diff` (`RangeParts`, `range_udf.rs:1322`)
+silently rewrite a finite date bound to `(-infinity, +infinity)` rather than
+erroring. `range_eq` alone is unaffected — it's the only function the
+pre-parse rewriter hands a subtype argument, and its equality helper
+(`basin-common/src/types/range.rs:473`) has a string-comparison fallback
+none of the others do. See "Range" above for the full mechanism and psql
+evidence.
+
+**`jsonb_path_exists` and scalar-position `jsonb_path_query` implement a
+different, much weaker JSONPath than the other three JSONPath functions.**
+`jsonb_path_query_first`, `jsonb_path_query_array` and `jsonb_path_match`
+resolve to `jsonb_path_udf.rs`'s real recursive-descent parser (wildcards,
+filters, recursive descent). `jsonb_path_exists` and plain `jsonb_path_query`
+(`jsonb_udf.rs:2719` and `2619`) are never re-registered by that module, so
+they keep `jsonb_udf.rs`'s original dot-split-only parser: no `[*]`, no
+`[?(...)]` filters, no `..key`, and no SRF row-expansion for `jsonb_path_query`
+in scalar position. Confirmed: `jsonb_path_exists('{"a":[1,2,3]}'::jsonb,
+'$.a[*] ? (@ > 2)')` is `t` in Postgres 18.2, `f` on Basin's live
+implementation. See "JSONB path functions" above.
 
 **The sequence UDFs are a red herring.** `nextval` / `currval` / `setval` /
 `lastval` in `seq_udf.rs` look like ordinary `ScalarUDFImpl`s but are dead-code
