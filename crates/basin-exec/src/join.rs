@@ -216,10 +216,30 @@ impl HashJoin {
         left_keys: Vec<usize>,
         right_keys: Vec<usize>,
         memory_budget: usize,
-    ) -> Self {
+    ) -> Result<Self, ExecError> {
         let left_schema = left.schema();
         let right_schema = right.schema();
         let schema = join_output_schema(&left_schema, &right_schema, kind);
+
+        // Bounds-check before indexing. `right_schema.field(i)` panics on an
+        // out-of-range index, and a panic here aborts the session rather than
+        // returning an error — the bridge's fallback-on-error safety net never
+        // sees an unwind. This fired on `SELECT a.id FROM t a JOIN t b ON
+        // a.id = b.id`, where projection pruning had removed every column from
+        // the build side while the join key still referred to one of them.
+        for (side, keys, schema) in [
+            ("left", &left_keys, &left_schema),
+            ("right", &right_keys, &right_schema),
+        ] {
+            if let Some(&bad) = keys.iter().find(|&&i| i >= schema.fields().len()) {
+                return Err(ExecError::Internal(format!(
+                    "join key index {bad} is out of range for the {side} side's {}-column \
+                     schema — a planner bug: the key survived into the plan while the column \
+                     it names did not",
+                    schema.fields().len()
+                )));
+            }
+        }
 
         let key_fields: Vec<SortField> = right_keys
             .iter()
@@ -228,7 +248,7 @@ impl HashJoin {
         let row_converter =
             RowConverter::new(key_fields).expect("join key columns support row encoding");
 
-        Self {
+        Ok(Self {
             left,
             right,
             kind,
@@ -245,7 +265,7 @@ impl HashJoin {
             right_table: None,
             hash_table: HashMap::new(),
             right_matched: Vec::new(),
-        }
+        })
     }
 
     /// Drain the right child fully, concatenate into one table, and build
@@ -617,7 +637,8 @@ mod tests {
                 ],
             ),
         );
-        let mut join = HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], 1 << 30).unwrap();
         let out = collect_all(&mut join);
         assert_eq!(out.num_rows(), 2);
         assert_eq!(
@@ -642,7 +663,8 @@ mod tests {
             right_schema.clone(),
             int_batch(&right_schema, vec![vec![None, None, Some(1)]]),
         );
-        let mut join = HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], 1 << 30).unwrap();
         let out = collect_all(&mut join);
         // Only the real 1/1 pair should match; every NULL/NULL combination
         // (2 left NULLs x 2 right NULLs = 4 possible spurious rows) must be
@@ -657,7 +679,8 @@ mod tests {
         let schema = int_schema(&["k"]);
         let left = feed_one(schema.clone(), int_batch(&schema, vec![vec![Some(1)]]));
         let right = feed_one(schema.clone(), int_batch(&schema, vec![vec![Some(2)]]));
-        let mut join = HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], 1 << 30).unwrap();
         assert_eq!(collect_all(&mut join).num_rows(), 0);
     }
 
@@ -686,7 +709,8 @@ mod tests {
                 vec![vec![Some(1), Some(1)], vec![Some(10), Some(11)]],
             ),
         );
-        let mut join = HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], 1 << 30).unwrap();
         let out = collect_all(&mut join);
         assert_eq!(
             out.num_rows(),
@@ -711,7 +735,8 @@ mod tests {
             right_schema.clone(),
             int_batch(&right_schema, vec![vec![Some(1)], vec![Some(100)]]),
         );
-        let mut join = HashJoin::new(left, right, JoinKind::Left, vec![0], vec![0], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Left, vec![0], vec![0], 1 << 30).unwrap();
         let out = collect_all(&mut join);
         assert_eq!(out.num_rows(), 2);
         let mut pairs = sorted_pairs(&out, 0, 2);
@@ -731,7 +756,8 @@ mod tests {
             right_schema.clone(),
             int_batch(&right_schema, vec![vec![Some(1), Some(2)]]),
         );
-        let mut join = HashJoin::new(left, right, JoinKind::Right, vec![0], vec![0], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Right, vec![0], vec![0], 1 << 30).unwrap();
         let out = collect_all(&mut join);
         assert_eq!(out.num_rows(), 2);
         // columns: lk, lv, rk
@@ -768,7 +794,8 @@ mod tests {
             right_schema.clone(),
             int_batch(&right_schema, vec![vec![Some(1), Some(3)]]),
         );
-        let mut join = HashJoin::new(left, right, JoinKind::Full, vec![0], vec![0], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Full, vec![0], vec![0], 1 << 30).unwrap();
         let out = collect_all(&mut join);
         assert_eq!(
             out.num_rows(),
@@ -797,7 +824,8 @@ mod tests {
             right_schema.clone(),
             int_batch(&right_schema, vec![vec![Some(3), Some(4)]]),
         );
-        let mut join = HashJoin::new(left, right, JoinKind::Full, vec![0], vec![0], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Full, vec![0], vec![0], 1 << 30).unwrap();
         let out = collect_all(&mut join);
         assert_eq!(out.num_rows(), 4);
     }
@@ -821,7 +849,8 @@ mod tests {
             right_schema.clone(),
             int_batch(&right_schema, vec![vec![Some(1), Some(1), Some(1)]]),
         );
-        let mut join = HashJoin::new(left, right, JoinKind::LeftSemi, vec![0], vec![0], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::LeftSemi, vec![0], vec![0], 1 << 30).unwrap();
         let out = collect_all(&mut join);
         assert_eq!(
             out.num_rows(),
@@ -844,7 +873,8 @@ mod tests {
             right_schema.clone(),
             int_batch(&right_schema, vec![vec![Some(2)]]),
         );
-        let mut join = HashJoin::new(left, right, JoinKind::LeftAnti, vec![0], vec![0], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::LeftAnti, vec![0], vec![0], 1 << 30).unwrap();
         let out = collect_all(&mut join);
         let mut got: Vec<Option<i32>> = col_i32(&out, 0);
         got.sort();
@@ -860,7 +890,7 @@ mod tests {
         for kind in [JoinKind::LeftSemi, JoinKind::LeftAnti] {
             let left = empty_feed(left_schema.clone());
             let right = empty_feed(right_schema.clone());
-            let join = HashJoin::new(left, right, kind, vec![0], vec![0], 1 << 30);
+            let join = HashJoin::new(left, right, kind, vec![0], vec![0], 1 << 30).unwrap();
             assert_eq!(
                 join.schema().fields().len(),
                 2,
@@ -895,7 +925,8 @@ mod tests {
             int_batch(&right_schema, vec![vec![None]]),
         );
 
-        let mut semi = HashJoin::new(left, right, JoinKind::LeftSemi, vec![0], vec![0], 1 << 30);
+        let mut semi =
+            HashJoin::new(left, right, JoinKind::LeftSemi, vec![0], vec![0], 1 << 30).unwrap();
         assert_eq!(collect_all(&mut semi).num_rows(), 0);
 
         let mut anti = HashJoin::new(
@@ -905,7 +936,8 @@ mod tests {
             vec![0],
             vec![0],
             1 << 30,
-        );
+        )
+        .unwrap();
         assert_eq!(collect_all(&mut anti).num_rows(), 1);
     }
 
@@ -923,7 +955,8 @@ mod tests {
             right_schema.clone(),
             int_batch(&right_schema, vec![vec![Some(10), Some(20), Some(30)]]),
         );
-        let mut join = HashJoin::new(left, right, JoinKind::Cross, vec![], vec![], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Cross, vec![], vec![], 1 << 30).unwrap();
         let out = collect_all(&mut join);
         assert_eq!(out.num_rows(), 6, "2 left x 3 right = 6");
     }
@@ -938,7 +971,8 @@ mod tests {
             int_batch(&schema, vec![vec![Some(1), Some(2)]]),
         );
         let right = empty_feed(schema.clone());
-        let mut join = HashJoin::new(left, right, JoinKind::Cross, vec![], vec![], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Cross, vec![], vec![], 1 << 30).unwrap();
         assert_eq!(collect_all(&mut join).num_rows(), 0, "empty right side");
 
         let left = empty_feed(schema.clone());
@@ -946,7 +980,8 @@ mod tests {
             schema.clone(),
             int_batch(&schema, vec![vec![Some(1), Some(2)]]),
         );
-        let mut join = HashJoin::new(left, right, JoinKind::Cross, vec![], vec![], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Cross, vec![], vec![], 1 << 30).unwrap();
         assert_eq!(collect_all(&mut join).num_rows(), 0, "empty left side");
     }
 
@@ -966,7 +1001,7 @@ mod tests {
         ] {
             let left = empty_feed(left_schema.clone());
             let right = empty_feed(right_schema.clone());
-            let mut join = HashJoin::new(left, right, kind, vec![0], vec![0], 1 << 30);
+            let mut join = HashJoin::new(left, right, kind, vec![0], vec![0], 1 << 30).unwrap();
             assert_eq!(
                 collect_all(&mut join).num_rows(),
                 0,
@@ -984,7 +1019,8 @@ mod tests {
             int_batch(&left_schema, vec![vec![Some(1), Some(2)]]),
         );
         let right = empty_feed(right_schema.clone());
-        let mut join = HashJoin::new(left, right, JoinKind::Left, vec![0], vec![0], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Left, vec![0], vec![0], 1 << 30).unwrap();
         let out = collect_all(&mut join);
         assert_eq!(out.num_rows(), 2);
         assert!(col_i32(&out, 1).iter().all(Option::is_none));
@@ -1026,7 +1062,8 @@ mod tests {
             vec![0, 1],
             vec![0, 1],
             1 << 30,
-        );
+        )
+        .unwrap();
         let out = collect_all(&mut join);
         assert_eq!(
             out.num_rows(),
@@ -1060,7 +1097,8 @@ mod tests {
             vec![0, 1],
             vec![0, 1],
             1 << 30,
-        );
+        )
+        .unwrap();
         assert_eq!(
             collect_all(&mut join).num_rows(),
             0,
@@ -1089,7 +1127,8 @@ mod tests {
             right_schema.clone(),
             int_batch(&right_schema, vec![vec![Some(1), Some(2), Some(3)]]),
         );
-        let mut join = HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], 1 << 30).unwrap();
         assert_eq!(collect_all(&mut join).num_rows(), 3);
     }
 
@@ -1103,7 +1142,8 @@ mod tests {
         let right_batch = int_batch(&right_schema, vec![(0..1000).map(Some).collect()]);
         let expected_bytes = right_batch.get_array_memory_size();
         let right = feed_one(right_schema.clone(), right_batch);
-        let mut join = HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], 1 << 30).unwrap();
         assert_eq!(
             join.memory_used(),
             0,
@@ -1121,7 +1161,8 @@ mod tests {
         let right_batch = int_batch(&right_schema, vec![(0..1000).map(Some).collect()]);
         let size = right_batch.get_array_memory_size();
         let right = feed_one(right_schema.clone(), right_batch);
-        let mut join = HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], size - 1);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], size - 1).unwrap();
         let err = join.next_batch().unwrap_err();
         assert!(matches!(err, ExecError::OutOfMemory { .. }), "{err:?}");
     }
@@ -1143,7 +1184,8 @@ mod tests {
             right_schema.clone(),
             int_batch(&right_schema, vec![vec![Some(1)]]),
         );
-        let mut join = HashJoin::new(big_left, right, JoinKind::Inner, vec![0], vec![0], 4096);
+        let mut join =
+            HashJoin::new(big_left, right, JoinKind::Inner, vec![0], vec![0], 4096).unwrap();
         // Should not error; exactly one match (key=1) exists somewhere in
         // the left stream.
         let out = collect_all(&mut join);
@@ -1180,7 +1222,8 @@ mod tests {
         .unwrap();
         let left = feed_one(left_schema, left_batch);
         let right = feed_one(right_schema, right_batch);
-        let mut join = HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], 1 << 30);
+        let mut join =
+            HashJoin::new(left, right, JoinKind::Inner, vec![0], vec![0], 1 << 30).unwrap();
         let out = collect_all(&mut join);
         // "b"/"b" matches; the two NULL keys never match each other.
         assert_eq!(out.num_rows(), 1);

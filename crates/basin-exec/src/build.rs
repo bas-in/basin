@@ -496,7 +496,7 @@ fn build_inner(
                 lk.push(column_index(&a).ok_or(BuildError::NonColumnKey("join"))?);
                 rk.push(column_index(&b).ok_or(BuildError::NonColumnKey("join"))?);
             }
-            Ok(Box::new(HashJoin::new(l, r, *kind, lk, rk, budget)))
+            Ok(Box::new(HashJoin::new(l, r, *kind, lk, rk, budget)?))
         }
 
         // `LATERAL` — the inner side is rebuilt fresh per outer row via a
