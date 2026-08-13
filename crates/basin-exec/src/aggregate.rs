@@ -15,15 +15,23 @@
 //!   `FILTER (WHERE …)` is present, and combined into one running scalar
 //!   across batches. This is the path the doc comment above means by "use
 //!   arrow kernels for the per-batch work".
-//! - **Grouped, or any `DISTINCT` aggregate**: row-wise. There is no public
-//!   vectorised `GroupsAccumulator` we can drive from outside DataFusion, and
-//!   `DISTINCT` needs per-value dedup that no arrow kernel performs for us
-//!   either. `03-physical-operators.md` §3.2 names this split explicitly —
-//!   "a two-tier accumulator design (row-wise accumulator + a vectorised
-//!   group-wise fast path)" — and this operator implements the row-wise tier
-//!   only. The vectorised group-wise tier is future work, not a correctness
-//!   gap: every result below is still exact, just not as fast as it could be
-//!   on a wide `GROUP BY`.
+//! - **Grouped, non-`DISTINCT` aggregates** (`SELECT g, sum(x), avg(x) FROM t
+//!   GROUP BY g`): a two-phase vectorised tier. Phase one resolves each row
+//!   to a group id with one hash-table probe per row (this part is
+//!   irreducibly row-wise — there is no arrow kernel that partitions
+//!   arbitrary multi-column keys into groups for us) and buckets row indices
+//!   by group id as it goes. Phase two, per aggregate, gathers each group's
+//!   rows out of the input column with one `arrow::compute::take` call and
+//!   folds the result into that group's [`AccState`] with [`AccState::
+//!   update_kernel`] — the same arrow-kernel merge the ungrouped path uses,
+//!   just invoked once per *group* instead of once per *batch*. This is the
+//!   "two-tier accumulator design (row-wise accumulator + a vectorised
+//!   group-wise fast path)" `03-physical-operators.md` §3.2 named as future
+//!   work; see this file's benchmark tests for measured before/after numbers.
+//! - **Any `DISTINCT` aggregate, grouped or not**: still row-wise. `DISTINCT`
+//!   needs per-value dedup against a seen-set, and no arrow kernel performs
+//!   that for us — vectorising the gather only helps once you no longer need
+//!   to inspect every value individually.
 //!
 //! # What this operator does not evaluate
 //!
@@ -56,7 +64,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, Float64Type, Int16Type, Int32Type, Int64Type};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    RecordBatch, StringArray, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
@@ -320,6 +328,58 @@ fn extract_cell(array: &ArrayRef, row: usize) -> Result<Option<CellValue>, ExecE
             )));
         }
     }))
+}
+
+/// Same job as `extract_cell` followed by `HashKey::from`, but for the
+/// `GROUP BY` key-resolution hot path specifically: building a [`CellValue`]
+/// per column per row (a `String` allocation for every `Utf8` cell, even on
+/// the millions of rows that turn out to belong to an already-seen group) is
+/// wasted work on a hit, which is the overwhelmingly common case for a
+/// low-cardinality `GROUP BY`. This skips straight to the hashable form; the
+/// [`CellValue`] form is only materialised in [`HashAggregate::build_grouped`]
+/// on the rarer miss path, where a new group is actually being created.
+fn extract_hash_key(array: &ArrayRef, row: usize) -> Result<HashKey, ExecError> {
+    if array.is_null(row) {
+        return Ok(HashKey::Null);
+    }
+    Ok(match array.data_type() {
+        DataType::Int16 => HashKey::Int64(array.as_primitive::<Int16Type>().value(row) as i64),
+        DataType::Int32 => HashKey::Int64(array.as_primitive::<Int32Type>().value(row) as i64),
+        DataType::Int64 => HashKey::Int64(array.as_primitive::<Int64Type>().value(row)),
+        DataType::Float32 => {
+            // Same NaN/-0.0 canonicalisation as `HashKey::from` — two group
+            // keys that are numerically equal (or both NaN) must land in the
+            // same bucket regardless of which path built the key.
+            let f = array.as_primitive::<Float32Type>().value(row) as f64;
+            let canon = if f.is_nan() {
+                f64::NAN
+            } else if f == 0.0 {
+                0.0
+            } else {
+                f
+            };
+            HashKey::Float64Bits(canon.to_bits())
+        }
+        DataType::Float64 => {
+            let f = array.as_primitive::<Float64Type>().value(row);
+            let canon = if f.is_nan() {
+                f64::NAN
+            } else if f == 0.0 {
+                0.0
+            } else {
+                f
+            };
+            HashKey::Float64Bits(canon.to_bits())
+        }
+        DataType::Boolean => HashKey::Bool(array.as_boolean().value(row)),
+        DataType::Utf8 => HashKey::Utf8(array.as_string::<i32>().value(row).to_string()),
+        DataType::LargeUtf8 => HashKey::Utf8(array.as_string::<i64>().value(row).to_string()),
+        other => {
+            return Err(ExecError::TypeMismatch(format!(
+                "hash aggregate: unsupported column type {other:?} (planner should have rejected this)"
+            )));
+        }
+    })
 }
 
 fn update_extreme(cur: &mut Option<CellValue>, v: &CellValue, want_min: bool) {
@@ -841,24 +901,43 @@ impl HashAggregate {
                 .map(|a| a.spec.input_col.map(|c| batch.column(c)))
                 .collect();
 
+            // Phase 1: resolve every row's group id in one pass, bucketing
+            // row indices by group id as we go. This probe is irreducibly
+            // row-wise (there is no arrow kernel that partitions arbitrary,
+            // possibly multi-column, keys for us), but it is the only
+            // row-wise work left — everything downstream operates on whole
+            // buckets, not rows. `key_scratch` is reused across rows and
+            // only cloned into `group_index` on a genuine miss, so a repeat
+            // group (the overwhelmingly common case on a low-cardinality
+            // `GROUP BY`) costs one hash-table probe and a `Vec<u32>` push,
+            // not the two heap allocations (`Vec<CellValue>` +
+            // `Vec<HashKey>`) the row-wise version paid on every single row.
+            let mut buckets: HashMap<usize, Vec<u32>> = HashMap::new();
+            let mut key_scratch: Vec<HashKey> = Vec::with_capacity(group_cols.len());
             for row in 0..batch.num_rows() {
-                let mut key_vals = Vec::with_capacity(group_cols.len());
+                key_scratch.clear();
                 for gc in &group_cols {
-                    key_vals.push(extract_cell(gc, row)?);
+                    key_scratch.push(extract_hash_key(gc, row)?);
                 }
                 // All NULL group-key rows hash and compare equal, so they
                 // collapse into one group here regardless of how many group
                 // columns there are — item 3.
-                let hash_key: Vec<HashKey> = key_vals.iter().map(HashKey::from).collect();
-
-                let gid = match group_index.get(&hash_key) {
+                let gid = match group_index.get(key_scratch.as_slice()) {
                     Some(&id) => id,
                     None => {
+                        // Miss: this is the only point that needs the actual
+                        // (non-hashed) CellValue form, for group_values —
+                        // and the only point that pays a Vec<HashKey> alloc,
+                        // since HashMap must own its key.
+                        let mut key_vals = Vec::with_capacity(group_cols.len());
+                        for gc in &group_cols {
+                            key_vals.push(extract_cell(gc, row)?);
+                        }
                         let id = group_values.len();
                         let key_bytes: usize = key_vals.iter().map(cell_heap_bytes).sum::<usize>()
                             + std::mem::size_of::<HashKey>() * key_vals.len();
                         let acc_bytes = self.aggregates.len() * std::mem::size_of::<AccState>();
-                        group_values.push(key_vals.clone());
+                        group_values.push(key_vals);
                         accs.push(
                             self.aggregates
                                 .iter()
@@ -871,43 +950,89 @@ impl HashAggregate {
                                 .map(|a| a.spec.distinct.then(HashSet::new))
                                 .collect(),
                         );
-                        group_index.insert(hash_key, id);
+                        group_index.insert(key_scratch.clone(), id);
                         self.bump_memory(key_bytes + acc_bytes)?;
                         id
                     }
                 };
+                buckets.entry(gid).or_default().push(row as u32);
+            }
 
-                for i in 0..self.aggregates.len() {
-                    if let Some(mask) = filter_cols[i] {
-                        // NULL in the FILTER predicate excludes the row, the
-                        // same as `WHERE NULL` would.
-                        let pass = mask.is_valid(row) && mask.value(row);
-                        if !pass {
-                            continue;
+            // Phase 2: one arrow-kernel merge per (group, aggregate) instead
+            // of one scalar match per (row, aggregate). `DISTINCT` is the one
+            // exception — no kernel dedups values, so it keeps the row-wise
+            // scalar path, walking each bucket's rows individually.
+            for i in 0..self.aggregates.len() {
+                let agg = &self.aggregates[i];
+                let mask = filter_cols[i];
+
+                if agg.spec.func == AggFunc::CountStar {
+                    for (&gid, rows) in buckets.iter() {
+                        let n = match mask {
+                            // NULL in the FILTER predicate excludes the row,
+                            // the same as `WHERE NULL` would.
+                            Some(m) => rows
+                                .iter()
+                                .filter(|&&r| m.is_valid(r as usize) && m.value(r as usize))
+                                .count() as i64,
+                            None => rows.len() as i64,
+                        };
+                        accs[gid][i].add_count(n);
+                    }
+                    continue;
+                }
+
+                let col = value_cols[i]
+                    .expect("resolved: every non-CountStar aggregate carries an input column");
+
+                if agg.spec.distinct {
+                    for (&gid, rows) in buckets.iter() {
+                        for &r in rows {
+                            let r = r as usize;
+                            if let Some(m) = mask {
+                                if !(m.is_valid(r) && m.value(r)) {
+                                    continue;
+                                }
+                            }
+                            let val = extract_cell(col, r)?;
+                            if val.is_none() {
+                                continue; // DISTINCT ignores NULLs, like the aggregate itself
+                            }
+                            let key = HashKey::from(&val);
+                            let seen = distinct_seen[gid][i].as_mut().expect(
+                                "distinct flag on the spec implies a seen-set was allocated above",
+                            );
+                            if !seen.insert(key.clone()) {
+                                continue;
+                            }
+                            self.bump_memory(hash_key_bytes(&key))?;
+                            accs[gid][i].update_scalar(&val)?;
                         }
                     }
-                    let agg = &self.aggregates[i];
-                    if agg.spec.func == AggFunc::CountStar {
-                        accs[gid][i].add_count(1);
+                    continue;
+                }
+
+                for (&gid, rows) in buckets.iter() {
+                    let idx: Vec<u32> = match mask {
+                        Some(m) => rows
+                            .iter()
+                            .copied()
+                            .filter(|&r| m.is_valid(r as usize) && m.value(r as usize))
+                            .collect(),
+                        None => rows.clone(),
+                    };
+                    if idx.is_empty() {
+                        // Every row in this group failed the FILTER, or the
+                        // batch just doesn't touch this group — either way,
+                        // an empty gather is a no-op the accumulator's merge
+                        // already handles for the multi-batch case, so
+                        // skipping the kernel call here is a pure perf win,
+                        // not a correctness requirement.
                         continue;
                     }
-                    let col = value_cols[i]
-                        .expect("resolved: every non-CountStar aggregate carries an input column");
-                    let val = extract_cell(col, row)?;
-                    if agg.spec.distinct {
-                        if val.is_none() {
-                            continue; // DISTINCT ignores NULLs, like the aggregate itself
-                        }
-                        let key = HashKey::from(&val);
-                        let seen = distinct_seen[gid][i].as_mut().expect(
-                            "distinct flag on the spec implies a seen-set was allocated above",
-                        );
-                        if !seen.insert(key.clone()) {
-                            continue;
-                        }
-                        self.bump_memory(hash_key_bytes(&key))?;
-                    }
-                    accs[gid][i].update_scalar(&val)?;
+                    let gathered = arrow::compute::take(col.as_ref(), &UInt32Array::from(idx), None)
+                        .map_err(|e| ExecError::Internal(e.to_string()))?;
+                    accs[gid][i].update_kernel(&gathered)?;
                 }
             }
         }
@@ -1448,6 +1573,400 @@ mod tests {
             matches!(err, ExecError::OutOfMemory { .. }),
             "expected OutOfMemory, got {err:?}"
         );
+    }
+
+    // --- Vectorised group-wise tier ---
+    //
+    // The tests below exercise the two-phase bucket-then-kernel path in
+    // `build_grouped` (see the module doc comment): phase 1 resolves every
+    // row's group id once and buckets row indices by group; phase 2 gathers
+    // each (group, aggregate) pair with one `arrow::compute::take` and folds
+    // it in with `AccState::update_kernel`, instead of one scalar match per
+    // (row, aggregate). The DISTINCT and CountStar special cases inside that
+    // path are exercised by the existing `count_distinct_dedups_…` and
+    // `filter_clause_applies_…`-style tests above, which already run through
+    // `build_grouped` when given a `GROUP BY`; these add the shapes that
+    // specifically stress the new bucketing/gathering, per the task brief:
+    // many small groups, one huge group, an all-NULL group, and (already
+    // covered above by `grouped_aggregate_over_empty_input_has_no_output_rows`)
+    // empty input.
+
+    // Many small groups: 1000 groups of 5 rows apiece, spread across
+    // multiple batches so buckets have to be rebuilt (and merged into
+    // pre-existing AccState) on every batch, not just accumulated once.
+    #[test]
+    fn many_small_groups_each_aggregate_correctly() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+        ]));
+        let num_groups = 1000i64;
+        let rows_per_group = 5i64;
+        let total = num_groups * rows_per_group;
+
+        // Two batches, interleaved, so no group is confined to one batch.
+        let mut expected: HashMap<i64, (i64, i64)> = HashMap::new(); // gid -> (count, sum)
+        let mk_batch = |lo: i64, hi: i64| {
+            let groups: Vec<i64> = (lo..hi).map(|i| i % num_groups).collect();
+            let values: Vec<i64> = (lo..hi).collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(groups)),
+                    Arc::new(Int64Array::from(values)),
+                ],
+            )
+            .unwrap()
+        };
+        for i in 0..total {
+            let e = expected.entry(i % num_groups).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += i;
+        }
+        let half = total / 2;
+        let input = VecOperator::boxed(schema.clone(), vec![mk_batch(0, half), mk_batch(half, total)]);
+        let specs = vec![count_star_spec(), sum_spec(1)];
+        let mut agg = HashAggregate::new(input, vec![0], specs, usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        assert_eq!(out.num_rows() as i64, num_groups);
+
+        let groups = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let counts = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let sums = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        for row in 0..out.num_rows() {
+            let g = groups.value(row);
+            let (exp_count, exp_sum) = expected[&g];
+            assert_eq!(counts.value(row), exp_count, "group {g} count");
+            assert_eq!(sums.value(row), exp_sum, "group {g} sum");
+        }
+    }
+
+    // One huge group: every row belongs to the same key. This is the shape
+    // that most directly stresses the bucket-then-gather path (one bucket
+    // holding almost the whole batch) as opposed to many tiny buckets.
+    #[test]
+    fn one_huge_group_aggregates_across_every_row() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+        ]));
+        let n = 100_000i64;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![7i64; n as usize])),
+                Arc::new(Int64Array::from((1..=n).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema.clone(), vec![batch]);
+        let specs = vec![
+            count_star_spec(),
+            sum_spec(1),
+            AggregateSpec {
+                func: AggFunc::Min,
+                input_col: Some(1),
+                distinct: false,
+                filter_col: None,
+                alias: "mn".into(),
+            },
+            AggregateSpec {
+                func: AggFunc::Max,
+                input_col: Some(1),
+                distinct: false,
+                filter_col: None,
+                alias: "mx".into(),
+            },
+            AggregateSpec {
+                func: AggFunc::Avg,
+                input_col: Some(1),
+                distinct: false,
+                filter_col: None,
+                alias: "av".into(),
+            },
+        ];
+        let mut agg = HashAggregate::new(input, vec![0], specs, usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        assert_eq!(out.num_rows(), 1, "one key, one group");
+        assert_eq!(
+            out.column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            n
+        );
+        assert_eq!(
+            out.column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            n * (n + 1) / 2
+        );
+        assert_eq!(
+            out.column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        assert_eq!(
+            out.column(4)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            n
+        );
+        assert_eq!(
+            out.column(5)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            (n + 1) as f64 / 2.0
+        );
+    }
+
+    // A group whose aggregated column is entirely NULL must still finalize
+    // sum/min/max/avg as NULL (not, say, 0 from a kernel that silently
+    // treats an all-null slice as an empty-but-present sum) while count(*)
+    // still reports the group's row count and count(x) reports 0 — the
+    // grouped analogue of item 1/2 above, but routed through the new
+    // gather-then-kernel path instead of the ungrouped kernel fast path.
+    #[test]
+    fn group_with_all_null_column_finalizes_null_not_zero() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 1, 2, 2])),
+                Arc::new(Int64Array::from(vec![None, None, None, Some(10), Some(20)])),
+            ],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema.clone(), vec![batch]);
+        let specs = vec![
+            count_star_spec(),
+            AggregateSpec {
+                func: AggFunc::Count,
+                input_col: Some(1),
+                distinct: false,
+                filter_col: None,
+                alias: "c".into(),
+            },
+            sum_spec(1),
+            AggregateSpec {
+                func: AggFunc::Avg,
+                input_col: Some(1),
+                distinct: false,
+                filter_col: None,
+                alias: "av".into(),
+            },
+        ];
+        let mut agg = HashAggregate::new(input, vec![0], specs, usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        assert_eq!(out.num_rows(), 2);
+
+        let groups = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let count_star = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let count_x = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let sums = out.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+        let avgs = out
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        let group1_row = (0..out.num_rows()).find(|&i| groups.value(i) == 1).unwrap();
+        assert_eq!(count_star.value(group1_row), 3, "count(*) sees all 3 rows");
+        assert_eq!(count_x.value(group1_row), 0, "count(x) sees zero non-null values");
+        assert!(sums.is_null(group1_row), "sum over an all-NULL group is NULL, not 0");
+        assert!(avgs.is_null(group1_row), "avg over an all-NULL group is NULL");
+
+        let group2_row = (0..out.num_rows()).find(|&i| groups.value(i) == 2).unwrap();
+        assert_eq!(count_star.value(group2_row), 2);
+        assert_eq!(count_x.value(group2_row), 2);
+        assert_eq!(sums.value(group2_row), 30);
+        assert_eq!(avgs.value(group2_row), 15.0);
+    }
+
+    // FILTER (WHERE …) inside a GROUP BY exercises the idx-filtering step in
+    // the new gather-then-kernel path directly (as opposed to the ungrouped
+    // `filter_clause_applies_…` test above, which never touches buckets at
+    // all): a group where every row fails the filter must produce an empty
+    // gather — a no-op, not a spurious 0 — while a sibling aggregate on the
+    // same group without a filter is unaffected.
+    #[test]
+    fn filter_inside_group_by_leaves_fully_filtered_group_null() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+            Field::new("keep", DataType::Boolean, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 2, 2])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+                Arc::new(BooleanArray::from(vec![false, false, true, false])),
+            ],
+        )
+        .unwrap();
+        let input = VecOperator::boxed(schema.clone(), vec![batch]);
+        let specs = vec![
+            AggregateSpec {
+                func: AggFunc::Sum,
+                input_col: Some(1),
+                distinct: false,
+                filter_col: Some(2),
+                alias: "filtered_sum".into(),
+            },
+            sum_spec(1),
+        ];
+        let mut agg = HashAggregate::new(input, vec![0], specs, usize::MAX).unwrap();
+        let out = agg.next_batch().unwrap().unwrap();
+        assert_eq!(out.num_rows(), 2);
+
+        let groups = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let filtered_sum = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let plain_sum = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+
+        let g1 = (0..out.num_rows()).find(|&i| groups.value(i) == 1).unwrap();
+        assert!(
+            filtered_sum.is_null(g1),
+            "group 1: both rows fail FILTER, so the filtered sum is NULL"
+        );
+        assert_eq!(plain_sum.value(g1), 30, "group 1's unfiltered sibling still sees both rows");
+
+        let g2 = (0..out.num_rows()).find(|&i| groups.value(i) == 2).unwrap();
+        assert_eq!(filtered_sum.value(g2), 30, "group 2: only the first row (30) passes FILTER");
+        assert_eq!(plain_sum.value(g2), 70, "group 2's unfiltered sibling sees both rows (30+40)");
+    }
+
+    // --- Timed before/after: is the vectorised tier actually faster? ---
+    //
+    // `scalar_grouped_sum_count` below is a frozen, faithful copy of the
+    // row-wise-per-aggregate algorithm `build_grouped` used before this
+    // change (one hash-table probe *and* one scalar `AccState::update_scalar`
+    // call per row per aggregate, built on the same CellValue/HashKey/
+    // AccState types the current code still uses) — kept only in this test
+    // module so the "measure it" requirement can be checked against a real
+    // implementation, not a strawman. It is intentionally restricted to
+    // count(*)+sum(int) since that's all the timing test below needs.
+    fn scalar_grouped_sum_count(batch: &RecordBatch) -> Vec<(Option<i64>, i64, Option<i64>)> {
+        let group_col = batch.column(0);
+        let value_col = batch.column(1);
+        let mut group_index: HashMap<Vec<HashKey>, usize> = HashMap::new();
+        let mut group_values: Vec<Vec<Option<CellValue>>> = Vec::new();
+        let mut accs: Vec<(AccState, AccState)> = Vec::new(); // (count_star, sum)
+
+        for row in 0..batch.num_rows() {
+            let key_vals = vec![extract_cell(group_col, row).unwrap()];
+            let hash_key: Vec<HashKey> = key_vals.iter().map(HashKey::from).collect();
+            let gid = match group_index.get(&hash_key) {
+                Some(&id) => id,
+                None => {
+                    let id = group_values.len();
+                    group_values.push(key_vals.clone());
+                    accs.push((
+                        AccState::new(AggFunc::CountStar, NumKind::Int),
+                        AccState::new(AggFunc::Sum, NumKind::Int),
+                    ));
+                    group_index.insert(hash_key, id);
+                    id
+                }
+            };
+            accs[gid].0.add_count(1);
+            let val = extract_cell(value_col, row).unwrap();
+            accs[gid].1.update_scalar(&val).unwrap();
+        }
+
+        group_values
+            .into_iter()
+            .zip(accs)
+            .map(|(gv, (count_acc, sum_acc))| {
+                let g = match &gv[0] {
+                    Some(CellValue::Int64(i)) => Some(*i),
+                    _ => None,
+                };
+                let n = match count_acc.finalize() {
+                    Some(CellValue::Int64(i)) => i,
+                    _ => 0,
+                };
+                let s = match sum_acc.finalize() {
+                    Some(CellValue::Int64(i)) => Some(i),
+                    _ => None,
+                };
+                (g, n, s)
+            })
+            .collect()
+    }
+
+    fn make_group_batch(schema: &SchemaRef, n: i64, cardinality: i64) -> RecordBatch {
+        let groups: Vec<i64> = (0..n).map(|i| i % cardinality).collect();
+        let values: Vec<i64> = (0..n).map(|i| i % 1000).collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(groups)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    // Not a correctness assertion — a timed comparison, run explicitly (see
+    // the doc comment) rather than as part of the default `cargo test`
+    // suite, since a wall-clock number doesn't belong gating CI. Reports the
+    // old row-wise-per-aggregate algorithm against the current vectorised
+    // `HashAggregate::build_grouped` for both a high-cardinality and a
+    // low-cardinality GROUP BY, per the task brief (1M rows / 100k groups
+    // and 1M rows / 10 groups). Run with:
+    //   cargo test -p basin-exec --lib aggregate::tests::vectorised_tier_is_faster -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn vectorised_tier_is_faster_high_and_low_cardinality() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, true),
+            Field::new("x", DataType::Int64, true),
+        ]));
+        for (label, n, cardinality) in [
+            ("high-cardinality: 1,000,000 rows / 100,000 groups", 1_000_000i64, 100_000i64),
+            ("low-cardinality:  1,000,000 rows / 10 groups", 1_000_000i64, 10i64),
+        ] {
+            let batch = make_group_batch(&schema, n, cardinality);
+
+            let start = std::time::Instant::now();
+            let old_result = scalar_grouped_sum_count(&batch);
+            let old_elapsed = start.elapsed();
+
+            let input = VecOperator::boxed(schema.clone(), vec![batch]);
+            let specs = vec![count_star_spec(), sum_spec(1)];
+            let mut agg = HashAggregate::new(input, vec![0], specs, usize::MAX).unwrap();
+            let start = std::time::Instant::now();
+            // Drain. The operator emits its groups in output-sized batches like
+            // every other one here, so pulling a single batch measures the cost
+            // of the first 8192 groups and calls it the whole aggregation —
+            // which is both a wrong timing and a wrong group count.
+            let mut groups = 0usize;
+            while let Some(out) = agg.next_batch().unwrap() {
+                groups += out.num_rows();
+            }
+            let new_elapsed = start.elapsed();
+
+            assert_eq!(groups, old_result.len(), "{label}: same group count");
+
+            println!(
+                "{label}: old(row-wise)={old_elapsed:?}  new(vectorised)={new_elapsed:?}  speedup={:.2}x",
+                old_elapsed.as_secs_f64() / new_elapsed.as_secs_f64()
+            );
+        }
     }
 
     // A rejection of a malformed spec (count(*) carrying an input column) at
