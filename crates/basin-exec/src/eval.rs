@@ -116,7 +116,14 @@
 //!      is deliberately not used here for that reason.
 //!    - `concat` skips NULL arguments rather than propagating them (unlike
 //!      `||`, which is an ordinary strict operator and yields NULL if either
-//!      side is NULL).
+//!      side is NULL). `concat_ws` skips NULL *values* the same way but is
+//!      strict in its *separator* — see [`eval_concat_ws`].
+//!    - `position(a, b)` in functional notation takes `(haystack, needle)` —
+//!      the reverse of the `POSITION(needle IN haystack)` grammar that
+//!      desugars to it. See [`OID_POSITION`].
+//!    - `right(s, i32::MIN)` returns the whole string, not `''`, because
+//!      Postgres's own negation of the argument overflows. Reproduced on
+//!      purpose; see [`pg_right`] before changing it.
 //!    - `btrim`/`ltrim`/`rtrim` with no explicit character set trim only the
 //!      ASCII space character, not Rust's notion of whitespace (tabs and
 //!      newlines are left alone) — see [`trim_with`].
@@ -267,6 +274,19 @@ const OID_UPPER: u32 = 871; // upper(text)
 const OID_LENGTH_TEXT: u32 = 1317; // length(text)
 const OID_SUBSTR_2: u32 = 883; // substr(text, int)
 const OID_SUBSTR_3: u32 = 877; // substr(text, int, int)
+
+// `substring(text, int)`/`substring(text, int, int)` are separate `pg_proc`
+// rows from `substr` above, not aliases of them — `SUBSTRING(x FROM y FOR z)`
+// desugars to these OIDs. Confirmed identical in behaviour on a live
+// PostgreSQL 18 (every value in `orphan_functions.rs`'s battery agrees with
+// `substr`), so they share [`eval_substr`]. The `substring(text, text)` and
+// `substring(text, text, text)` overloads (oids 2073/2074) are POSIX-regex
+// extraction and need a regex engine; they are deliberately absent here and
+// from `basin_pgtype::func::FUNCS`, so they do not resolve at all rather than
+// resolving to a wrong answer. The `bit` (1680/1699) and `bytea` (2012/2013)
+// overloads are likewise absent — Basin has no physical `bit` type.
+const OID_SUBSTRING_2: u32 = 937; // substring(text, int)
+const OID_SUBSTRING_3: u32 = 936; // substring(text, int, int)
 const OID_LEFT: u32 = 3060; // left(text, int)
 const OID_RIGHT: u32 = 3061; // right(text, int)
 const OID_ABS_INT2: u32 = 1398; // abs(smallint)
@@ -283,6 +303,7 @@ const OID_CEIL_FLOAT8: u32 = 2308; // ceil(double precision)
 const OID_FLOOR_NUMERIC: u32 = 1712; // floor(numeric)
 const OID_FLOOR_FLOAT8: u32 = 2309; // floor(double precision)
 const OID_CONCAT: u32 = 3058; // concat(VARIADIC "any")
+const OID_CONCAT_WS: u32 = 3059; // concat_ws(text, VARIADIC "any")
 const OID_BTRIM_1: u32 = 885; // btrim(text) — trim(x)/trim(both from x)
 const OID_BTRIM_2: u32 = 884; // btrim(text, text)
 const OID_LTRIM_1: u32 = 881; // ltrim(text)
@@ -291,6 +312,13 @@ const OID_RTRIM_1: u32 = 882; // rtrim(text)
 const OID_RTRIM_2: u32 = 876; // rtrim(text, text)
 const OID_REPLACE: u32 = 2087; // replace(text, text, text)
 const OID_STRPOS: u32 = 868; // strpos(text, text)
+
+// `position(text, text)` is a distinct `pg_proc` row from `strpos`, with the
+// *same* argument order: `(haystack, needle)`. The `POSITION(needle IN
+// haystack)` grammar reverses them on its way to this OID, so a call written
+// in functional notation reads "backwards" relative to the syntax —
+// `pg_catalog.position('b', 'abc')` is `0`, not `2` (verified live).
+const OID_POSITION: u32 = 849; // position(text, text)
 
 // ─── Math — trig/log/exp/power (see docs/migration/df-removal/19-expires-at-removal.md
 // entry 1: these OIDs already existed in `basin_pgtype::func::FUNCS` as
@@ -1228,8 +1256,8 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch) -> Result<Ar
         OID_UPPER => text_unary(&a(0)?, str::to_uppercase),
         OID_LENGTH_TEXT => text_char_length(&a(0)?),
 
-        OID_SUBSTR_2 => eval_substr(&a(0)?, &a(1)?, None),
-        OID_SUBSTR_3 => {
+        OID_SUBSTR_2 | OID_SUBSTRING_2 => eval_substr(&a(0)?, &a(1)?, None),
+        OID_SUBSTR_3 | OID_SUBSTRING_3 => {
             let text = a(0)?;
             let start = a(1)?;
             let len = a(2)?;
@@ -1265,6 +1293,7 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch) -> Result<Ar
         ))),
 
         OID_CONCAT => eval_concat(args, batch),
+        OID_CONCAT_WS => eval_concat_ws(args, batch),
 
         OID_BTRIM_1 => eval_trim_1(&a(0)?, TrimSide::Both),
         OID_BTRIM_2 => {
@@ -1291,7 +1320,8 @@ fn eval_scalar_fn(func: FuncId, args: &[Expr], batch: &RecordBatch) -> Result<Ar
             let to = a(2)?;
             eval_replace(&s, &from, &to)
         }
-        OID_STRPOS => {
+        // Same implementation, same argument order — see [`OID_POSITION`].
+        OID_STRPOS | OID_POSITION => {
             let s = a(0)?;
             let needle = a(1)?;
             eval_strpos(&s, &needle)
@@ -1495,7 +1525,9 @@ fn pg_substr(s: &str, start: i64, length: Option<i64>) -> String {
 /// with `n < 0` returns everything *except* the last `|n|` characters, and
 /// `right` with `n < 0` returns everything except the first `|n|` — verified
 /// against a live PostgreSQL 18 (`left('hello', -2) = 'hel'`,
-/// `right('hello', -2) = 'llo'`).
+/// `right('hello', -2) = 'llo'`). The two are *not* mirror images at the
+/// extreme, though — see [`pg_right`] for the one argument where Postgres's
+/// own arithmetic overflows and `right` stops behaving like `left`.
 fn eval_left_right(text: &ArrayRef, n: &ArrayRef, is_left: bool) -> Result<ArrayRef, ExecError> {
     let t = downcast_array::<StringArray>(text, "text")?;
     let n = downcast_array::<Int32Array>(n, "integer")?;
@@ -1521,11 +1553,41 @@ fn pg_left(s: &str, n: i32) -> String {
     chars[..take as usize].iter().collect()
 }
 
+/// Postgres's `right` does not compute "how many characters to take" — it
+/// computes "how many characters to SKIP from the front", and then returns
+/// everything after them. For `n >= 0` the skip is `len - n`; for `n < 0` it
+/// is `-n`; either way a negative skip is clamped to zero. Written the
+/// obvious way instead ("take the last `n`") the two forms agree on every
+/// input but one.
+///
+/// **The exception is `n = i32::MIN`, and this function reproduces it on
+/// purpose.** `text_right` negates `n` in a C `int`, and `-(-2147483648)` is
+/// not representable, so the negation wraps back to `-2147483648`; the
+/// clamp then sees a negative skip and skips nothing, returning the WHOLE
+/// string. Verified on a live PostgreSQL 18 — and note the discontinuity, a
+/// single step in the argument flipping the answer completely:
+///
+/// ```text
+/// right('abcdef', -2147483647) = ''          -- skip 2147483647 chars
+/// right('abcdef', -2147483648) = 'abcdef'    -- negation overflowed
+/// ```
+///
+/// This is an upstream integer overflow, not a designed rule, and Basin used
+/// to return `''` for both. Matching it is a deliberate policy decision, not
+/// an oversight: `function_equivalence.rs` is an oracle, and an oracle with a
+/// standing "known intentional divergence" entry teaches everyone reading it
+/// that red is sometimes fine. Six call sites there depend on this. **Do not
+/// "fix" this to return `''` — that reintroduces the divergence.**
+///
+/// `wrapping_neg` is what makes it explicit rather than a debug-build panic:
+/// plain `-n` on `i32::MIN` panics under `overflow-checks`, which is how this
+/// case would otherwise announce itself.
 fn pg_right(s: &str, n: i32) -> String {
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len() as i32;
-    let take = if n >= 0 { n.min(len) } else { (len + n).max(0) };
-    chars[(len - take) as usize..].iter().collect()
+    let skip = if n >= 0 { len - n } else { n.wrapping_neg() };
+    let skip = skip.clamp(0, len);
+    chars[skip as usize..].iter().collect()
 }
 
 /// Which end(s) [`trim_with`] strips from.
@@ -1628,6 +1690,25 @@ fn pg_strpos(s: &str, needle: &str) -> i32 {
     }
 }
 
+/// Evaluate one argument of a `VARIADIC "any"` function and materialize it
+/// as text. `"any"` means the argument arrives at whatever type it was
+/// written as, so arrow's `cast` kernel does the numeric/bool/date rendering
+/// and already-`Utf8` arguments pass through untouched. `what` names the
+/// calling function for the error message only.
+fn eval_as_text(
+    arg: &Expr,
+    batch: &RecordBatch,
+    what: &'static str,
+) -> Result<StringArray, ExecError> {
+    let v = eval(arg, batch)?;
+    let v: ArrayRef = if v.data_type() == &DataType::Utf8 {
+        v
+    } else {
+        Arc::new(cast::cast(&v, &DataType::Utf8).map_err(|e| map_arrow(e, what))?)
+    };
+    Ok(downcast_array::<StringArray>(&v, "text (after the cast to text)")?.clone())
+}
+
 /// `concat(VARIADIC "any")`. Every argument is cast to text (arrow's `cast`
 /// kernel handles the numeric/bool/etc. cases; text arguments pass through
 /// unchanged) and NULL arguments are skipped rather than propagated — the
@@ -1639,13 +1720,7 @@ fn eval_concat(args: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExecError
     let n = batch.num_rows();
     let mut cols: Vec<StringArray> = Vec::with_capacity(args.len());
     for arg in args {
-        let v = eval(arg, batch)?;
-        let v: ArrayRef = if v.data_type() == &DataType::Utf8 {
-            v
-        } else {
-            Arc::new(cast::cast(&v, &DataType::Utf8).map_err(|e| map_arrow(e, "CONCAT"))?)
-        };
-        cols.push(downcast_array::<StringArray>(&v, "text (after CONCAT's cast to text)")?.clone());
+        cols.push(eval_as_text(arg, batch, "CONCAT")?);
     }
     let out: StringArray = (0..n)
         .map(|i| {
@@ -1654,6 +1729,64 @@ fn eval_concat(args: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExecError
                 if col.is_valid(i) {
                     buf.push_str(col.value(i));
                 }
+            }
+            Some(buf)
+        })
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// `concat_ws(text, VARIADIC "any")` — "concatenate with separator". The
+/// first argument is the separator; the rest are the values being joined.
+///
+/// Three behaviours that are each easy to get wrong, all verified against a
+/// live PostgreSQL 18:
+///
+/// ```text
+/// concat_ws('-', NULL, 'b') = 'b'      -- NULL values are SKIPPED …
+/// concat_ws('-', NULL, NULL) = ''      -- … and skipping them all yields ''
+/// concat_ws(NULL, 'a', 'b') = NULL     -- but a NULL SEPARATOR is strict
+/// concat_ws('-', '', 'b')  = '-b'      -- '' is a value, not a NULL
+/// concat_ws('-', 1, true)  = '1-t'     -- non-text values are cast to text
+/// ```
+///
+/// The separator being strict while the values are not is the asymmetry: a
+/// skipped value contributes no separator either, so the separator lands
+/// *between surviving values only* — which is why this cannot be written as
+/// [`eval_concat`] with a separator interleaved up front.
+fn eval_concat_ws(args: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExecError> {
+    let n = batch.num_rows();
+    let sep_expr = args.first().ok_or_else(|| {
+        ExecError::Internal(
+            "concat_ws called with no arguments — it takes a separator plus the values to \
+             join; a planner bug, not user error"
+                .to_string(),
+        )
+    })?;
+    let sep = eval_as_text(sep_expr, batch, "CONCAT_WS")?;
+
+    let mut cols: Vec<StringArray> = Vec::with_capacity(args.len().saturating_sub(1));
+    for arg in &args[1..] {
+        cols.push(eval_as_text(arg, batch, "CONCAT_WS")?);
+    }
+
+    let out: StringArray = (0..n)
+        .map(|i| {
+            if sep.is_null(i) {
+                return None;
+            }
+            let sep = sep.value(i);
+            let mut buf = String::new();
+            let mut first = true;
+            for col in &cols {
+                if col.is_null(i) {
+                    continue;
+                }
+                if !first {
+                    buf.push_str(sep);
+                }
+                buf.push_str(col.value(i));
+                first = false;
             }
             Some(buf)
         })
@@ -3560,6 +3693,187 @@ mod tests {
         );
     }
 
+    // ─── substring (oids 936/937): substr's SQL-standard-named twin ─────
+
+    /// `substring` and `substr` are different `pg_proc` rows, not one row
+    /// with an alias, so a dispatch table that carried only 877/883 would
+    /// leave `SUBSTRING(x FROM y FOR z)` unevaluatable. Each value below was
+    /// read off a live PostgreSQL 18 through the `substring` spelling
+    /// specifically, not assumed from `substr`.
+    #[test]
+    fn substring_matches_substr_on_both_arities() {
+        for (expr, want) in [
+            (
+                sf(
+                    OID_SUBSTRING_3,
+                    vec![lit_text("hello"), lit_i32(-3), lit_i32(5)],
+                ),
+                "h",
+            ),
+            (
+                sf(
+                    OID_SUBSTRING_3,
+                    vec![lit_text("hello"), lit_i32(0), lit_i32(3)],
+                ),
+                "he",
+            ),
+            (
+                sf(OID_SUBSTRING_2, vec![lit_text("hello"), lit_i32(2)]),
+                "ello",
+            ),
+            (
+                sf(
+                    OID_SUBSTRING_3,
+                    vec![lit_text("héllo世界"), lit_i32(6), lit_i32(2)],
+                ),
+                "世界",
+            ),
+        ] {
+            let result = eval(&expr, &one_row()).unwrap();
+            assert_eq!(str_array(&result).value(0), want, "for {expr:?}");
+        }
+    }
+
+    /// A `length` that runs past the end of the string is NOT an error and
+    /// NOT a clamped-to-`length`-characters answer — it simply stops at the
+    /// end. Verified live: `substring('hello', 2, 10) = 'ello'` (4
+    /// characters, not 10), and the same holds at `i32::MAX`:
+    /// `substring('abcdef', 2, 2147483647) = 'bcdef'`. The second case is the
+    /// one that catches an implementation computing `start + length` in
+    /// `i32` — that addition overflows and panics under `overflow-checks`,
+    /// which is why [`pg_substr`] does its arithmetic in `i64`.
+    #[test]
+    fn substring_length_past_the_end_stops_at_the_end_even_at_i32_max() {
+        let expr = sf(
+            OID_SUBSTRING_3,
+            vec![lit_text("hello"), lit_i32(2), lit_i32(10)],
+        );
+        assert_eq!(
+            str_array(&eval(&expr, &one_row()).unwrap()).value(0),
+            "ello"
+        );
+
+        let expr = sf(
+            OID_SUBSTRING_3,
+            vec![lit_text("abcdef"), lit_i32(2), lit_i32(i32::MAX)],
+        );
+        assert_eq!(
+            str_array(&eval(&expr, &one_row()).unwrap()).value(0),
+            "bcdef",
+            "start + length overflows i32 here; the answer is still the rest of \
+             the string"
+        );
+    }
+
+    /// The other end of the same arithmetic. With no `length`, a `start` of
+    /// `i32::MIN` clamps to 1 and returns the WHOLE string; *with* a
+    /// `length`, the end offset (`start + length - 1`) is still far below 1,
+    /// so the answer is `''`. Both verified live:
+    /// `substring('abcdef', -2147483648) = 'abcdef'` but
+    /// `substring('abcdef', -2147483648, 3) = ''`.
+    #[test]
+    fn substring_i32_min_start_clamps_but_still_consumes_the_length() {
+        let two = sf(OID_SUBSTRING_2, vec![lit_text("abcdef"), lit_i32(i32::MIN)]);
+        assert_eq!(
+            str_array(&eval(&two, &one_row()).unwrap()).value(0),
+            "abcdef"
+        );
+
+        let three = sf(
+            OID_SUBSTRING_3,
+            vec![lit_text("abcdef"), lit_i32(i32::MIN), lit_i32(3)],
+        );
+        assert_eq!(
+            str_array(&eval(&three, &one_row()).unwrap()).value(0),
+            "",
+            "the clamped start is 1 but the end offset is still negative, so \
+             nothing is selected"
+        );
+    }
+
+    /// A negative `length` errors under the `substring` spelling too — the
+    /// asymmetry with a negative `start` (which clamps) is a property of the
+    /// function, not of the name it was called by. Verified live:
+    /// `substring('hello', 1, -1)` is `22011 negative substring length not
+    /// allowed`.
+    #[test]
+    fn substring_negative_length_is_a_hard_error() {
+        let expr = sf(
+            OID_SUBSTRING_3,
+            vec![lit_text("hello"), lit_i32(1), lit_i32(-1)],
+        );
+        let err = eval(&expr, &one_row()).unwrap_err();
+        assert!(matches!(err, ExecError::TypeMismatch(_)), "got {err:?}");
+    }
+
+    // ─── left / right ───────────────────────────────────────────────────
+
+    #[test]
+    fn left_and_right_take_from_the_correct_end() {
+        for (expr, want) in [
+            (sf(OID_LEFT, vec![lit_text("abcdef"), lit_i32(2)]), "ab"),
+            (sf(OID_RIGHT, vec![lit_text("abcdef"), lit_i32(2)]), "ef"),
+            // A negative count means "all but the |n| at the other end".
+            (sf(OID_LEFT, vec![lit_text("abcdef"), lit_i32(-2)]), "abcd"),
+            (sf(OID_RIGHT, vec![lit_text("abcdef"), lit_i32(-2)]), "cdef"),
+            // Characters, not bytes: 'héllo世界' is 7 characters.
+            (
+                sf(OID_RIGHT, vec![lit_text("héllo世界"), lit_i32(-6)]),
+                "界",
+            ),
+        ] {
+            let result = eval(&expr, &one_row()).unwrap();
+            assert_eq!(str_array(&result).value(0), want, "for {expr:?}");
+        }
+    }
+
+    /// **This test pins a reproduced PostgreSQL overflow, on purpose.**
+    /// `text_right` negates its argument in a C `int`; `-(-2147483648)` is
+    /// not representable, so the negation wraps and the "skip this many
+    /// characters" count comes out negative, i.e. skip nothing. The result is
+    /// a one-step discontinuity, verified on a live PostgreSQL 18:
+    ///
+    /// ```text
+    /// right('abcdef', -2147483647) = ''
+    /// right('abcdef', -2147483648) = 'abcdef'
+    /// ```
+    ///
+    /// Basin used to return `''` for both, which is arguably the more
+    /// defensible answer — and it was still a divergence, at 6 call sites in
+    /// `crates/basin-exec/tests/function_equivalence.rs`. That suite is an
+    /// oracle: a standing "known intentional divergence" entry in it teaches
+    /// every later reader that a red differential result can be fine, which
+    /// costs more than reproducing one upstream overflow. So this is the
+    /// adopted policy, not an accident. **Do not "fix" the `i32::MIN` case to
+    /// return `''`.**
+    #[test]
+    fn right_reproduces_postgres_int_min_negation_overflow() {
+        let just_above = sf(OID_RIGHT, vec![lit_text("abcdef"), lit_i32(-2147483647)]);
+        assert_eq!(
+            str_array(&eval(&just_above, &one_row()).unwrap()).value(0),
+            "",
+            "skipping 2147483647 characters leaves nothing"
+        );
+
+        let at_min = sf(OID_RIGHT, vec![lit_text("abcdef"), lit_i32(i32::MIN)]);
+        assert_eq!(
+            str_array(&eval(&at_min, &one_row()).unwrap()).value(0),
+            "abcdef",
+            "one step lower, postgres's own negation overflows and it returns the \
+             whole string — reproduced deliberately; see pg_right"
+        );
+    }
+
+    /// `left` does NOT share the overflow: `text_left` adds rather than
+    /// negates, and `len + i32::MIN` is representable. Verified live:
+    /// `left('abcdef', -2147483648) = ''`. Pinned so nobody "makes left
+    /// consistent with right" at the extreme.
+    #[test]
+    fn left_at_i32_min_is_empty_unlike_right() {
+        let expr = sf(OID_LEFT, vec![lit_text("abcdef"), lit_i32(i32::MIN)]);
+        assert_eq!(str_array(&eval(&expr, &one_row()).unwrap()).value(0), "");
+    }
+
     // ─── abs ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -3735,6 +4049,109 @@ mod tests {
         assert_eq!(arr.value(0), "");
     }
 
+    // ─── concat_ws (oid 3059) ───────────────────────────────────────────
+
+    /// The separator lands between *surviving* values only, so skipping a
+    /// NULL skips its separator too. Verified live against PostgreSQL 18:
+    ///
+    /// ```text
+    /// concat_ws('-', 'a', 'b')  = 'a-b'
+    /// concat_ws('-', NULL, 'b') = 'b'      -- not '-b'
+    /// concat_ws('-', 'a', NULL) = 'a'      -- not 'a-'
+    /// concat_ws('-', '', 'b')   = '-b'     -- '' is a VALUE, not a NULL
+    /// ```
+    ///
+    /// The last line is the one that separates "skip NULLs" from "skip empty
+    /// strings": an implementation that skipped `''` would return `'b'` for
+    /// it.
+    #[test]
+    fn concat_ws_skips_null_values_but_not_empty_ones() {
+        for (args, want) in [
+            (vec![lit_text("-"), lit_text("a"), lit_text("b")], "a-b"),
+            (vec![lit_text("-"), lit_text_null(), lit_text("b")], "b"),
+            (vec![lit_text("-"), lit_text("a"), lit_text_null()], "a"),
+            (vec![lit_text("-"), lit_text(""), lit_text("b")], "-b"),
+        ] {
+            let result = eval(&sf(OID_CONCAT_WS, args.clone()), &one_row()).unwrap();
+            let arr = str_array(&result);
+            assert!(
+                !arr.is_null(0),
+                "concat_ws with a non-NULL separator is \
+                                      never NULL — for {args:?}"
+            );
+            assert_eq!(arr.value(0), want, "for {args:?}");
+        }
+    }
+
+    /// The asymmetry that makes `concat_ws` more than "`concat` with a
+    /// separator": the *values* are NULL-skipping, but the *separator* is
+    /// strict. Verified live: `concat_ws(NULL, 'a', 'b')` is NULL, even
+    /// though `concat_ws('-', NULL, NULL)` is `''`.
+    #[test]
+    fn concat_ws_null_separator_makes_the_whole_result_null() {
+        let expr = sf(
+            OID_CONCAT_WS,
+            vec![lit_text_null(), lit_text("a"), lit_text("b")],
+        );
+        let result = eval(&expr, &one_row()).unwrap();
+        assert!(
+            str_array(&result).is_null(0),
+            "a NULL separator is strict — 'ab' or 'a-b' would both be wrong"
+        );
+
+        let all_values_null = sf(
+            OID_CONCAT_WS,
+            vec![lit_text("-"), lit_text_null(), lit_text_null()],
+        );
+        let result = eval(&all_values_null, &one_row()).unwrap();
+        let arr = str_array(&result);
+        assert!(!arr.is_null(0), "NULL VALUES do not make the result NULL");
+        assert_eq!(arr.value(0), "");
+    }
+
+    /// Non-text values are cast to text, the same as `concat`'s. Verified
+    /// live: `concat_ws('-', 1, 2) = '1-2'`.
+    #[test]
+    fn concat_ws_casts_non_text_values() {
+        let expr = sf(OID_CONCAT_WS, vec![lit_text("-"), lit_i32(1), lit_i32(2)]);
+        let result = eval(&expr, &one_row()).unwrap();
+        assert_eq!(str_array(&result).value(0), "1-2");
+    }
+
+    /// Row-by-row over real columns, not just a single-literal broadcast:
+    /// the separator, the skipped values and the NULL-separator row all have
+    /// to be decided per row.
+    #[test]
+    fn concat_ws_operates_row_by_row_over_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sep", DataType::Utf8, true),
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("-"), Some(":"), None])),
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("a")])),
+                Arc::new(StringArray::from(vec![Some("b"), Some("b"), Some("b")])),
+            ],
+        )
+        .unwrap();
+        let expr = sf(OID_CONCAT_WS, vec![col(0, "sep"), col(1, "a"), col(2, "b")]);
+        let result = eval(&expr, &batch).unwrap();
+        let arr = str_array(&result);
+        assert_eq!(arr.value(0), "a-b");
+        assert_eq!(
+            arr.value(1),
+            "b",
+            "the skipped NULL takes its separator with it"
+        );
+        assert!(
+            arr.is_null(2),
+            "row 2's separator is NULL, so row 2 is NULL"
+        );
+    }
+
     // ─── || (string concatenation, oid 654) ─────────────────────────────
 
     /// The contrast the module docs (and the `concat` tests above) already
@@ -3896,6 +4313,58 @@ mod tests {
         let expr = sf(OID_STRPOS, vec![lit_text("hello"), lit_text("xyz")]);
         let result = eval(&expr, &one_row()).unwrap();
         assert_eq!(i32_array(&result).value(0), 0);
+    }
+
+    // ─── position (oid 849) ─────────────────────────────────────────────
+
+    /// **The argument-order trap.** `POSITION(needle IN haystack)` is
+    /// grammar; the `pg_proc` row it desugars to takes `(haystack, needle)`,
+    /// the same order as `strpos`. So a call written in functional notation
+    /// reads backwards relative to the syntax, and both live-server answers
+    /// below are needed to tell a correct implementation from a reversed one
+    /// — a single example would pass either way round:
+    ///
+    /// ```text
+    /// pg_catalog.position('abc', 'b') = 2   -- ('abc' is the haystack)
+    /// pg_catalog.position('b', 'abc') = 0   -- 'abc' does not occur in 'b'
+    /// ```
+    #[test]
+    fn position_takes_haystack_then_needle_not_the_in_syntax_order() {
+        let forwards = sf(OID_POSITION, vec![lit_text("abc"), lit_text("b")]);
+        assert_eq!(i32_array(&eval(&forwards, &one_row()).unwrap()).value(0), 2);
+
+        let reversed = sf(OID_POSITION, vec![lit_text("b"), lit_text("abc")]);
+        assert_eq!(
+            i32_array(&eval(&reversed, &one_row()).unwrap()).value(0),
+            0,
+            "pg_catalog.position('b', 'abc') is 0 — reading the arguments the \
+             POSITION(x IN y) way would wrongly give 2"
+        );
+    }
+
+    /// `position` shares `strpos`'s other two rules, pinned under this OID so
+    /// a future divergence between the two implementations is caught here.
+    /// Verified live: `pg_catalog.position('héllo世界', '世') = 6`
+    /// (characters, not bytes — the byte offset would be 8) and
+    /// `pg_catalog.position('abc', '') = 1` (an empty needle is found at the
+    /// start, not "not found").
+    #[test]
+    fn position_counts_characters_and_finds_the_empty_needle_at_one() {
+        let multibyte = sf(OID_POSITION, vec![lit_text("héllo世界"), lit_text("世")]);
+        assert_eq!(
+            i32_array(&eval(&multibyte, &one_row()).unwrap()).value(0),
+            6
+        );
+
+        let empty = sf(OID_POSITION, vec![lit_text("abc"), lit_text("")]);
+        assert_eq!(i32_array(&eval(&empty, &one_row()).unwrap()).value(0), 1);
+    }
+
+    #[test]
+    fn position_of_a_null_argument_is_null() {
+        let expr = sf(OID_POSITION, vec![lit_text("abc"), lit_text_null()]);
+        let result = eval(&expr, &one_row()).unwrap();
+        assert!(i32_array(&result).is_null(0));
     }
     /// Postgres widens implicitly before comparing; arrow's kernels demand
     /// identical types. `bigint_col > 2` is ordinary SQL — the literal is int4
