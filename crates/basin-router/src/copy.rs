@@ -932,7 +932,16 @@ async fn process_buffered_csv_rows<S: Session + ?Sized>(
         ) {
             Ok(r) => r,
             Err(e) => {
-                state.error = Some(format!("CSV parse error: {e}"));
+                // An error that already carries its own `\0<sqlstate>\0`
+                // prefix (the NUL-byte rejection) propagates verbatim —
+                // wrapping it would bury the prefix mid-string and
+                // `decode_copy_error` would fall back to the default
+                // SQLSTATE, turning PostgreSQL's 22021 into 42601.
+                state.error = Some(if carries_sqlstate(&e) {
+                    e
+                } else {
+                    format!("CSV parse error: {e}")
+                });
                 state.buffer.clear();
                 return;
             }
@@ -1108,8 +1117,18 @@ where
 /// values can never drift apart.
 fn decode_binary_field(bytes: &[u8], field: &Field) -> std::result::Result<Option<String>, String> {
     let ty = crate::types::arrow_to_pg_type_field(field);
-    let scalar = crate::protocol::decode_param_binary(bytes, &ty)
-        .map_err(|e| format!("COPY BINARY: column \"{}\": {e}", field.name()))?;
+    let scalar = crate::protocol::decode_param_binary(bytes, &ty).map_err(|e| match &e {
+        // The NUL rejection is the one decoder error whose SQLSTATE the
+        // client must see (22021, not the COPY default), and PostgreSQL
+        // reports it without a column annotation — so pass it through in the
+        // prefixed form rather than wrapping it. See `nul_byte_copy_error`.
+        pgwire::error::PgWireError::UserError(info)
+            if info.code == crate::protocol::NUL_SQLSTATE =>
+        {
+            nul_byte_copy_error()
+        }
+        _ => format!("COPY BINARY: column \"{}\": {e}", field.name()),
+    })?;
     scalar_to_copy_cell(scalar, field.name())
 }
 
@@ -1391,6 +1410,35 @@ fn split_record(buf: &[u8], final_chunk: bool, quote_char: char) -> Option<(&[u8
     }
 }
 
+/// The COPY-side spelling of the NUL-byte rejection.
+///
+/// COPY data is client bytes in the server encoding, so PostgreSQL verifies it
+/// the same way it verifies a Bind parameter. Measured on PostgreSQL 18.2:
+/// `COPY t FROM STDIN` with `a\0b` in a `text` column answers
+/// `ERROR 22021 invalid byte sequence for encoding "UTF8": 0x00`, while the
+/// hex-escaped `bytea` cell `\x610062` — which *decodes to* a NUL — loads
+/// fine and reads back as three bytes. The escape is text; the raw byte is
+/// not, which is exactly the distinction this guard preserves.
+///
+/// Uses the `"\0<sqlstate>\0<message>"` convention `parse_copy` already uses
+/// for its 42501 errors, so `protocol::decode_copy_error` recovers the
+/// SQLSTATE instead of defaulting it. See `protocol::nul_byte_error` for why
+/// the wire boundary is the right layer for this check at all.
+pub(crate) fn nul_byte_copy_error() -> String {
+    format!(
+        "\x00{}\x00{}",
+        crate::protocol::NUL_SQLSTATE,
+        crate::protocol::NUL_MESSAGE
+    )
+}
+
+/// True if `msg` already carries a `"\0<sqlstate>\0"` prefix, and so must be
+/// propagated verbatim rather than wrapped in a context string that would
+/// bury the prefix mid-message and lose the SQLSTATE.
+pub(crate) fn carries_sqlstate(msg: &str) -> bool {
+    msg.starts_with('\x00') && msg[1..].contains('\x00')
+}
+
 /// Parse a single CSV record's bytes into a vec of fields. Each field is
 /// either `None` (NULL per null_string matching, or unquoted empty cell) or
 /// `Some(String)`.
@@ -1403,9 +1451,10 @@ fn parse_csv_record(
     null_string: &str,
 ) -> std::result::Result<Vec<Option<String>>, String> {
     // Reject NUL outright. Engine's literal renderer would happily embed it
-    // and break the SQL parser on the engine side.
+    // and break the SQL parser on the engine side — and PostgreSQL rejects it
+    // too, since COPY data is encoding-verified like any other client bytes.
     if bytes.contains(&0u8) {
-        return Err("NUL byte in CSV input".into());
+        return Err(nul_byte_copy_error());
     }
     let s = std::str::from_utf8(bytes).map_err(|e| format!("CSV not UTF-8: {e}"))?;
     let mut out: Vec<Option<String>> = Vec::new();
@@ -1519,7 +1568,7 @@ fn build_insert_sql(
             None => sql.push_str("NULL"),
             Some(v) => {
                 if v.contains('\0') {
-                    return Err("NUL byte in CSV value".into());
+                    return Err(nul_byte_copy_error());
                 }
                 render_literal(v, field, &mut sql)?;
             }
@@ -2790,9 +2839,21 @@ mod tests {
 
     #[test]
     fn parse_csv_record_rejects_nul_byte() {
+        // The rejection itself is unchanged; only its wording and SQLSTATE
+        // are, so that COPY reports what PostgreSQL 18.2 reports for the same
+        // input (`ERROR 22021 invalid byte sequence for encoding "UTF8":
+        // 0x00`, measured) rather than an ad-hoc string under XX000. Asserted
+        // exactly, since matching PG verbatim is the point.
         let bytes = vec![b'a', 0u8, b'b'];
         let e = parse_csv_record(&bytes, ',', '"', "").unwrap_err();
-        assert!(e.contains("NUL"), "got: {e}");
+        assert!(carries_sqlstate(&e), "must carry a SQLSTATE prefix: {e:?}");
+        assert_eq!(e, nul_byte_copy_error());
+        assert_eq!(
+            e,
+            format!(
+                "\x0022021\x00invalid byte sequence for encoding \"UTF8\": 0x00"
+            )
+        );
     }
 
     #[test]

@@ -702,10 +702,73 @@ fn decode_param(
     }
 }
 
+/// The SQLSTATE and message PostgreSQL emits for a NUL byte in text.
+///
+/// Measured verbatim against PostgreSQL 18.2 (`server_encoding = UTF8`); see
+/// [`nul_byte_error`] for the full matrix and
+/// `crates/basin-router/tests/nul_byte_rejection.rs` for the assertions.
+pub(crate) const NUL_SQLSTATE: &str = "22021"; // character_not_in_repertoire
+pub(crate) const NUL_MESSAGE: &str = r#"invalid byte sequence for encoding "UTF8": 0x00"#;
+
+/// PostgreSQL's `text` cannot hold a NUL byte, and Arrow's `Utf8` can.
+///
+/// That single mismatch is the whole of the last divergence class between
+/// Basin's scalar functions and PostgreSQL's: `basin-exec`'s
+/// `function_equivalence` battery reports it 101 times across 15 functions
+/// (`concat`, `btrim`, `lower`, `length`, `replace`, …), always in the same
+/// shape — Basin succeeds where PostgreSQL errors. It is one input-domain
+/// defect, not fifteen broken functions, so it is fixed here at the wire
+/// boundary rather than by copying a guard into every scalar function.
+///
+/// PostgreSQL raises this from `pg_client_to_server`, which runs over every
+/// byte string a client sends in the server encoding — *before* the target
+/// type's input function is reached. Measured on PostgreSQL 18.2:
+///
+/// | wire form | declared type | value | result |
+/// |-----------|---------------|-------|--------|
+/// | text      | `text`        | `a\0b` | `ERROR 22021` |
+/// | text      | `int4`        | `4\0 2` | `ERROR 22021` (not `22P02` — the encoding check wins) |
+/// | text      | `bytea`       | raw `a\0b` | `ERROR 22021` |
+/// | text      | `bytea`       | `\x610062` | **ok**, `length = 3` |
+/// | text      | `text[]`      | `{a,b\0c}` | `ERROR 22021` |
+/// | binary    | `text`/`varchar`/`bpchar`/`name`/`unknown` | `a\0b` | `ERROR 22021` |
+/// | binary    | `jsonb`       | `\x01{"a":"x\0y"}` | `ERROR 22021` |
+/// | binary    | `bytea`       | `a\0b` | **ok**, `length = 3` |
+///
+/// The two asymmetries in that table drive where the guard is called:
+///
+/// * In **text** format the check is on the encoding, not the type, so it
+///   goes at the top of [`decode_param_text`] ahead of any type dispatch.
+/// * In **binary** format it is per-type — only the types whose `recv`
+///   function goes through `pq_getmsgtext` reject a NUL. `bytearecv` takes
+///   arbitrary bytes, and over-rejecting there would break every legitimate
+///   binary blob, so the guard is placed arm by arm in
+///   [`decode_param_binary`] and deliberately omitted from `Type::BYTEA`.
+fn nul_byte_error() -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        NUL_SQLSTATE.to_owned(),
+        NUL_MESSAGE.to_owned(),
+    )))
+}
+
+/// `Err(22021)` if `bytes` contains a NUL. See [`nul_byte_error`].
+fn reject_nul_byte(bytes: &[u8]) -> std::result::Result<(), PgWireError> {
+    if bytes.contains(&0u8) {
+        return Err(nul_byte_error());
+    }
+    Ok(())
+}
+
 fn decode_param_text(
     bytes: &[u8],
     declared: &Type,
 ) -> std::result::Result<ScalarParam, PgWireError> {
+    // Before any type dispatch: PostgreSQL verifies the client encoding over
+    // the raw parameter bytes first, so a NUL is rejected whatever the
+    // declared type is — including `bytea`, whose text form carries a NUL as
+    // the escape `\x00` rather than as a raw byte. See `nul_byte_error`.
+    reject_nul_byte(bytes)?;
     let s = std::str::from_utf8(bytes).map_err(|e| {
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".to_owned(),
@@ -1028,8 +1091,17 @@ pub(crate) fn decode_param_binary(
             }
             Ok(ScalarParam::Bool(bytes[0] != 0))
         }
+        // No NUL check here, on purpose: `bytea` holds arbitrary bytes and
+        // PostgreSQL 18.2 accepts a binary `bytea` parameter containing 0x00
+        // (`bytearecv` never converts encodings). See `nul_byte_error`.
         Type::BYTEA => Ok(ScalarParam::Bytea(bytes.to_vec())),
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => {
+            // These are exactly the types whose PostgreSQL `recv` function
+            // goes through `pq_getmsgtext` → `pg_client_to_server`, which
+            // rejects a NUL with 22021. See `nul_byte_error`. This arm is
+            // also where `text[]` elements land: `decode_pg_array_binary`
+            // re-enters `decode_param_binary` per element.
+            reject_nul_byte(bytes)?;
             let s = std::str::from_utf8(bytes).map_err(|e| {
                 PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_owned(),
@@ -1061,6 +1133,10 @@ pub(crate) fn decode_param_binary(
                     ),
                 ))));
             }
+            // `jsonb_recv` also goes through `pq_getmsgtext`, so a NUL
+            // anywhere in the JSON body is 22021 on PostgreSQL 18.2 — checked
+            // on the body only, after the version byte. See `nul_byte_error`.
+            reject_nul_byte(&bytes[1..])?;
             let s = std::str::from_utf8(&bytes[1..]).map_err(|e| {
                 PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_owned(),
@@ -3487,8 +3563,26 @@ impl<S: Session + 'static> CopyHandler for BasinSimpleQueryHandlerSlot<S> {
         // close tag and transition out of CopyInProgress so Sync routes
         // to `on_sync`, which sends ReadyForQuery.
         let msg = if let Some(err) = state.error {
+            // Honour the `"\0<sqlstate>\0<message>"` prefix the COPY error
+            // channel uses (see `copy::nul_byte_copy_error`) instead of
+            // stamping every COPY-in failure `XX000`. Without this the NUL
+            // rejection would reach the client as SQLSTATE XX000 with an
+            // *empty* message — the leading NUL terminates the ErrorResponse
+            // `M` field, which is itself a C string.
+            // Only a prefixed error overrides the SQLSTATE; everything else
+            // keeps this path's historic XX000 default.
+            let (sqlstate, message) = if crate::copy::carries_sqlstate(&err) {
+                decode_copy_error(&err)
+            } else {
+                ("XX000", err.as_str())
+            };
             PgWireBackendMessage::ErrorResponse(
-                pgwire::error::ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), err).into(),
+                pgwire::error::ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    sqlstate.to_owned(),
+                    message.to_owned(),
+                )
+                .into(),
             )
         } else {
             PgWireBackendMessage::CommandComplete(pgwire::messages::response::CommandComplete::new(
@@ -4237,6 +4331,163 @@ mod tests {
             }
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    // ── NUL byte in text (SQLSTATE 22021) ────────────────────────────────
+    //
+    // PostgreSQL's `text` cannot hold a NUL and Arrow's `Utf8` can; see
+    // `nul_byte_error` for the measured PostgreSQL 18.2 matrix these pin, and
+    // `tests/nul_byte_rejection.rs` for the same behaviour end to end over a
+    // real client connection. The arms below are pinned directly because
+    // several of them (`bpchar`, `name`, `unknown`, binary `jsonb`) are not
+    // reachable from the client paths the end-to-end file drives.
+
+    fn assert_nul_rejected(err: PgWireError, what: &str) {
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "22021", "{what}: SQLSTATE");
+                assert_eq!(
+                    info.message, r#"invalid byte sequence for encoding "UTF8": 0x00"#,
+                    "{what}: message must match PostgreSQL 18.2 verbatim"
+                );
+            }
+            other => panic!("{what}: expected UserError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_param_text_rejects_nul_whatever_the_declared_type() {
+        // PostgreSQL verifies the client encoding before type dispatch, so
+        // every one of these is 22021 — including `int4`, which would
+        // otherwise be 22P02, and `bytea`, whose *text* form spells a NUL as
+        // the escape `\x00` rather than as a raw byte. All measured on 18.2.
+        for ty in [
+            Type::TEXT,
+            Type::VARCHAR,
+            Type::BPCHAR,
+            Type::NAME,
+            Type::UNKNOWN,
+            Type::INT4,
+            Type::BOOL,
+            Type::BYTEA,
+            Type::JSONB,
+            Type::TEXT_ARRAY,
+        ] {
+            let err = super::decode_param_text(b"a\0b", &ty)
+                .expect_err("a NUL in a text-format parameter must be rejected");
+            assert_nul_rejected(err, &format!("text-format {}", ty.name()));
+        }
+    }
+
+    #[test]
+    fn decode_param_text_hex_escaped_bytea_nul_is_accepted() {
+        // `\x610062` decodes to `a\0b`. The escape is text, so it is legal;
+        // the raw byte is not. PostgreSQL 18.2 accepts this and reports
+        // length 3.
+        let p = super::decode_param_text(br"\x610062", &Type::BYTEA)
+            .expect("hex-escaped bytea text must be accepted");
+        match p {
+            ScalarParam::Text(s) => assert_eq!(s, r"\x610062"),
+            other => panic!("expected Text passthrough, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_param_binary_rejects_nul_for_text_like_types() {
+        for ty in [
+            Type::TEXT,
+            Type::VARCHAR,
+            Type::BPCHAR,
+            Type::NAME,
+            Type::UNKNOWN,
+        ] {
+            let err = super::decode_param_binary(b"a\0b", &ty)
+                .expect_err("a NUL in a binary text-like parameter must be rejected");
+            assert_nul_rejected(err, &format!("binary {}", ty.name()));
+        }
+    }
+
+    #[test]
+    fn decode_param_binary_rejects_nul_in_jsonb_body() {
+        // Version byte `0x01`, then a JSON body carrying a raw NUL. PG 18.2
+        // answers 22021 here (`jsonb_recv` goes through `pq_getmsgtext`).
+        let mut wire = vec![1u8];
+        wire.extend_from_slice(b"{\"a\":\"x\0y\"}");
+        let err =
+            super::decode_param_binary(&wire, &Type::JSONB).expect_err("NUL in JSONB must error");
+        assert_nul_rejected(err, "binary jsonb");
+    }
+
+    #[test]
+    fn decode_param_binary_bytea_keeps_accepting_nul() {
+        // The over-rejection guard. `bytearecv` takes arbitrary bytes and
+        // PG 18.2 accepts this exact value, so this arm must have no check.
+        let p = super::decode_param_binary(b"a\0b", &Type::BYTEA)
+            .expect("bytea must keep accepting NUL bytes");
+        match p {
+            ScalarParam::Bytea(b) => assert_eq!(b, b"a\0b"),
+            other => panic!("expected Bytea, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_param_binary_text_array_element_nul_is_rejected() {
+        // `decode_pg_array_binary` re-enters `decode_param_binary` per
+        // element, so the element guard is the array guard. Header: ndim=1,
+        // has_nulls=0, elem_oid=25(text), dim_len=2, lbound=1.
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&1i32.to_be_bytes());
+        wire.extend_from_slice(&0i32.to_be_bytes());
+        wire.extend_from_slice(&25u32.to_be_bytes());
+        wire.extend_from_slice(&2i32.to_be_bytes());
+        wire.extend_from_slice(&1i32.to_be_bytes());
+        wire.extend_from_slice(&2i32.to_be_bytes());
+        wire.extend_from_slice(b"ok");
+        wire.extend_from_slice(&3i32.to_be_bytes());
+        wire.extend_from_slice(b"a\0b");
+        let err = super::decode_param_binary(&wire, &Type::TEXT_ARRAY)
+            .expect_err("a NUL in a text[] element must be rejected");
+        assert_nul_rejected(err, "binary text[] element");
+    }
+
+    #[test]
+    fn copy_nul_error_round_trips_its_sqlstate() {
+        // The COPY error channel carries a SQLSTATE as a `"\0<code>\0"`
+        // prefix. That prefix must survive `decode_copy_error`, because the
+        // leading NUL would otherwise terminate the ErrorResponse `M` field
+        // (itself a C string) and the client would see SQLSTATE XX000 with an
+        // empty message — which is exactly what happened before this path
+        // consulted `decode_copy_error` at all.
+        let raw = crate::copy::nul_byte_copy_error();
+        assert!(crate::copy::carries_sqlstate(&raw));
+        let (sqlstate, message) = super::decode_copy_error(&raw);
+        assert_eq!(sqlstate, "22021");
+        assert_eq!(message, r#"invalid byte sequence for encoding "UTF8": 0x00"#);
+
+        // An unprefixed error is left alone so the COPY paths keep their
+        // historic defaults.
+        assert!(!crate::copy::carries_sqlstate("CSV parse error: boom"));
+    }
+
+    #[test]
+    fn decode_param_without_nul_is_unaffected() {
+        // The guard must not disturb ordinary values, multibyte included.
+        assert!(matches!(
+            super::decode_param_text("héllo".as_bytes(), &Type::TEXT),
+            Ok(ScalarParam::Text(_))
+        ));
+        assert!(matches!(
+            super::decode_param_binary("héllo".as_bytes(), &Type::TEXT),
+            Ok(ScalarParam::Text(_))
+        ));
+        assert!(matches!(
+            super::decode_param_text(b"42", &Type::INT4),
+            Ok(ScalarParam::Int4(42))
+        ));
+        assert!(matches!(
+            super::decode_param_binary(b"\x00\x00\x00\x2a", &Type::INT4),
+            Ok(ScalarParam::Int4(42))
+        ));
     }
 
     #[test]
