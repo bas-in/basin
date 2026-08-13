@@ -152,6 +152,27 @@ pub struct ConstraintInfo {
     pub kind: ConstraintKind,
 }
 
+/// One `COMMENT ON TABLE` / `COMMENT ON COLUMN` attached to a table or one of
+/// its columns — [`crate::pg_description`]'s only source.
+///
+/// Real `pg_description` covers every commentable object kind (schema, type,
+/// function, operator, ...) via its `classoid` column; this narrows to the
+/// two kinds `\d` and `pg_dump` actually read off a table (the table itself
+/// and its columns), the same restriction [`crate::pg_attrdef`] makes for
+/// column defaults. See [`crate::pg_description`]'s module docs for why both
+/// still resolve to `classoid = pg_class`'s own oid: a column comment is
+/// filed against the *table's* `pg_class` row with `objsubid` set to the
+/// column's `attnum`, not against a `pg_attribute` row of its own — confirmed
+/// live (see that module's docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentInfo {
+    /// `0` for a comment on the table itself; the column's `attnum` for a
+    /// comment on one of its columns. Matches `pg_description.objsubid`
+    /// exactly.
+    pub objsubid: i32,
+    pub description: String,
+}
+
 /// What a [`crate::SystemView`] needs from the underlying catalog.
 ///
 /// Every method returns owned data rather than borrowing, since the source
@@ -171,4 +192,7 @@ pub trait CatalogSource {
     fn indexes(&self, table_oid: Oid) -> Vec<IndexInfo>;
     /// The constraints defined on one table.
     fn constraints(&self, table_oid: Oid) -> Vec<ConstraintInfo>;
+    /// The comments (`pg_description`) attached to one table and its
+    /// columns. Not every table (or column) has one.
+    fn comments(&self, table_oid: Oid) -> Vec<CommentInfo>;
 }

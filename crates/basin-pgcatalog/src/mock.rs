@@ -7,7 +7,8 @@
 
 use crate::{
     catalog_source::{
-        ColumnDefaultInfo, ColumnInfo, ConstraintInfo, IndexInfo, NamespaceInfo, TableInfo,
+        ColumnDefaultInfo, ColumnInfo, CommentInfo, ConstraintInfo, IndexInfo, NamespaceInfo,
+        TableInfo,
     },
     CatalogSource, Oid,
 };
@@ -22,6 +23,7 @@ pub struct MockCatalog {
     defaults: Vec<ColumnDefaultInfo>,
     indexes: Vec<IndexInfo>,
     constraints: Vec<ConstraintInfo>,
+    comments: Vec<(Oid, CommentInfo)>,
 }
 
 impl MockCatalog {
@@ -56,6 +58,13 @@ impl MockCatalog {
 
     pub fn with_constraint(mut self, constraint: ConstraintInfo) -> Self {
         self.constraints.push(constraint);
+        self
+    }
+
+    /// Attach a comment to `table_oid` (or one of its columns, per
+    /// `comment.objsubid`).
+    pub fn with_comment(mut self, table_oid: Oid, comment: CommentInfo) -> Self {
+        self.comments.push((table_oid, comment));
         self
     }
 }
@@ -98,6 +107,14 @@ impl CatalogSource for MockCatalog {
             .iter()
             .filter(|c| c.table_oid == table_oid)
             .cloned()
+            .collect()
+    }
+
+    fn comments(&self, table_oid: Oid) -> Vec<CommentInfo> {
+        self.comments
+            .iter()
+            .filter(|(t, _)| *t == table_oid)
+            .map(|(_, c)| c.clone())
             .collect()
     }
 }

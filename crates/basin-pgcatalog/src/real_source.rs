@@ -63,8 +63,8 @@ use basin_pgtype::{oid, typmod};
 
 use crate::{
     catalog_source::{
-        CatalogSource, ColumnDefaultInfo, ColumnInfo, ConstraintInfo, IndexInfo, NamespaceInfo,
-        TableInfo,
+        CatalogSource, ColumnDefaultInfo, ColumnInfo, CommentInfo, ConstraintInfo, IndexInfo,
+        NamespaceInfo, TableInfo,
     },
     Oid,
 };
@@ -349,6 +349,19 @@ impl CatalogSource for RealCatalogSource {
             .map(|t| t.constraints.clone())
             .unwrap_or_default()
     }
+
+    /// Always empty. `COMMENT ON TABLE`/`COMMENT ON COLUMN` is parsed but
+    /// deliberately accepted as a silent no-op today — see
+    /// `crates/basin-engine/src/pg_ast.rs`'s `reject_unsupported` test, which
+    /// lists `"COMMENT ON TABLE t IS 'desc'"` among the noop-accepted
+    /// statements — so there is no comment storage anywhere upstream of this
+    /// module for a real table's Arrow schema to carry. Once `COMMENT ON`
+    /// actually persists something (most likely as `Field` metadata, the same
+    /// mechanism [`BASIN_COLUMN_DEFAULT_KEY`] already uses), this method gets
+    /// a real implementation the same way [`Self::column_defaults`] did.
+    fn comments(&self, _table_oid: Oid) -> Vec<CommentInfo> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -594,6 +607,25 @@ mod tests {
         assert!(source.column_defaults(Oid(1)).is_empty());
         assert!(source.indexes(Oid(1)).is_empty());
         assert!(source.constraints(Oid(1)).is_empty());
+        assert!(source.comments(Oid(1)).is_empty());
+    }
+
+    /// `comments` is always empty — `COMMENT ON` has no storage upstream of
+    /// this module yet. See [`RealCatalogSource::comments`]'s doc comment.
+    #[test]
+    fn comments_are_always_empty_until_comment_on_persists_something() {
+        let oid = Oid(16385);
+        let source = RealCatalogSource::new().with_table(
+            TableInfo {
+                oid,
+                name: "widgets".to_string(),
+                namespace: Oid(16384),
+                owner: Oid(10),
+                kind: RelKind::OrdinaryTable,
+            },
+            schema(vec![Field::new("id", DataType::Int32, false)]),
+        );
+        assert!(source.comments(oid).is_empty());
     }
 
     // ---------------------------------------------------------------
