@@ -63,8 +63,8 @@ use basin_pgtype::{oid, typmod};
 
 use crate::{
     catalog_source::{
-        CatalogSource, ColumnDefaultInfo, ColumnInfo, CommentInfo, ConstraintInfo, IndexInfo,
-        NamespaceInfo, TableInfo,
+        CatalogSource, ColumnDefaultInfo, ColumnInfo, CommentInfo, ConstraintInfo, EnumTypeInfo,
+        IndexInfo, NamespaceInfo, SequenceInfo, TableInfo,
     },
     Oid,
 };
@@ -348,6 +348,40 @@ impl CatalogSource for RealCatalogSource {
             .find(|t| t.info.oid == table_oid)
             .map(|t| t.constraints.clone())
             .unwrap_or_default()
+    }
+
+    /// Always empty. `COMMENT ON TABLE`/`COMMENT ON COLUMN` is parsed but
+    /// deliberately accepted as a silent no-op today — see
+    /// `crates/basin-engine/src/pg_ast.rs`'s `reject_unsupported` test, which
+    /// lists `"COMMENT ON TABLE t IS 'desc'"` among the noop-accepted
+    /// statements — so there is no comment storage anywhere upstream of this
+    /// module for a real table's Arrow schema to carry. Once `COMMENT ON`
+    /// actually persists something (most likely as `Field` metadata, the same
+    /// mechanism [`BASIN_COLUMN_DEFAULT_KEY`] already uses), this method gets
+    /// a real implementation the same way [`Self::column_defaults`] did.
+    /// Always empty. `RealCatalogSource` is built from
+    /// [`basin_catalog::TableMetadata`] plus an Arrow schema per table, and
+    /// neither carries enum types: an Arrow schema records a column's physical
+    /// type, not that it was declared as a user-defined enum with an ordered
+    /// label set. There is nowhere upstream to read the labels from.
+    ///
+    /// Returning empty is the honest answer rather than the convenient one.
+    /// `pg_enum` is what a client reads to render an enum column's allowed
+    /// values, and synthesising labels — from a CHECK constraint, say — would
+    /// hand tooling a list that looks authoritative and is not.
+    fn enum_types(&self) -> Vec<EnumTypeInfo> {
+        Vec::new()
+    }
+
+    /// Always empty, for the same reason as [`Self::enum_types`]: a sequence's
+    /// parameters (start, increment, min/max, cycle) live in Basin's sequence
+    /// machinery, not in the table metadata this source is constructed from.
+    ///
+    /// This is the one most worth revisiting first. `SERIAL` columns DO create
+    /// sequences that Basin tracks, so unlike enums the data exists somewhere —
+    /// it is simply not reachable through this trait's inputs today.
+    fn sequences(&self) -> Vec<SequenceInfo> {
+        Vec::new()
     }
 
     /// Always empty. `COMMENT ON TABLE`/`COMMENT ON COLUMN` is parsed but

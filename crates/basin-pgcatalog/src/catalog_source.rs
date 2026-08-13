@@ -173,6 +173,59 @@ pub struct CommentInfo {
     pub description: String,
 }
 
+/// One `CREATE TYPE ... AS ENUM` declaration — [`crate::pg_enum`]'s source.
+///
+/// Mirrors `basin_catalog::enums::EnumTypeDef` (project, name, ordered
+/// `labels`) plus the `oid`/`namespace` a real `pg_type`/`pg_enum` row
+/// needs and `EnumTypeDef` itself does not carry (Basin addresses an enum
+/// type by `(ProjectId, name)`, not by an integer id — see
+/// `crates/basin-catalog/src/enums.rs`'s own module docs). `CatalogSource`
+/// is a plain-data boundary (see [`crate::real_source`]'s module docs), so
+/// this crate does not depend on `basin-catalog` to name that type; a
+/// caller that has one converts it to this shape the same way
+/// [`crate::real_source::RealCatalogSource`] converts already-`.await`-ed
+/// `basin-catalog` data elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumTypeInfo {
+    pub oid: Oid,
+    pub namespace: Oid,
+    pub name: String,
+    /// Ordered labels; the first is Postgres's `enumsortorder = 1`, not
+    /// `0` — confirmed live (see [`crate::pg_enum`]'s module docs).
+    pub labels: Vec<String>,
+}
+
+/// One `CREATE SEQUENCE` (or `SERIAL`-column-owned sequence)'s parameters —
+/// [`crate::pg_sequence`]'s source.
+///
+/// Mirrors `basin_catalog::sequences::SequenceDef` (`start`, `increment`,
+/// `min_value`, `max_value`, `cache_size`, `cycle` — the exact fields
+/// [`crate::pg_sequence`] needs) plus `oid`, which is the sequence's own
+/// `pg_class.oid` (`pg_sequence.seqrelid` in real Postgres — the same row
+/// [`RelKind::Sequence`] already marks in [`TableInfo`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceInfo {
+    /// The sequence's own relation oid — `pg_sequence.seqrelid`, matching a
+    /// [`TableInfo`] row of [`RelKind::Sequence`].
+    pub oid: Oid,
+    /// `pg_sequence.seqtypid` — the data type values are generated as.
+    /// Real Postgres defaults a plain `CREATE SEQUENCE` to `int8` and a
+    /// `SERIAL`/`BIGSERIAL` column's owned sequence to the owning column's
+    /// type (confirmed live: a plain sequence reports `bigint`, a `serial`
+    /// column's owned sequence reports `integer`). `basin_catalog::
+    /// sequences::SequenceDef` does not track column ownership, so this
+    /// crate cannot yet distinguish the two cases; callers should default
+    /// to `basin_pgtype::oid::INT8`, matching the plain-`CREATE SEQUENCE`
+    /// case.
+    pub type_oid: Oid,
+    pub start: i64,
+    pub increment: i64,
+    pub max_value: i64,
+    pub min_value: i64,
+    pub cache_size: i64,
+    pub cycle: bool,
+}
+
 /// What a [`crate::SystemView`] needs from the underlying catalog.
 ///
 /// Every method returns owned data rather than borrowing, since the source
@@ -195,4 +248,13 @@ pub trait CatalogSource {
     /// The comments (`pg_description`) attached to one table and its
     /// columns. Not every table (or column) has one.
     fn comments(&self, table_oid: Oid) -> Vec<CommentInfo>;
+    /// Every `CREATE TYPE ... AS ENUM` declared in the current project
+    /// (`pg_enum`, and eventually `pg_type`'s own enum rows).
+    fn enum_types(&self) -> Vec<EnumTypeInfo>;
+    /// Every sequence's parameters in the current project (`pg_sequence`).
+    /// Not table-scoped, like [`Self::tables`] — a sequence is its own
+    /// relation, not owned by the query in `CatalogSource`'s sense (real
+    /// Postgres's sequence-owned-by-column link lives in `pg_depend`, which
+    /// this trait does not model — see [`crate::pg_depend`]'s module docs).
+    fn sequences(&self) -> Vec<SequenceInfo>;
 }

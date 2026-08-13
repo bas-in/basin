@@ -7,8 +7,8 @@
 
 use crate::{
     catalog_source::{
-        ColumnDefaultInfo, ColumnInfo, CommentInfo, ConstraintInfo, IndexInfo, NamespaceInfo,
-        TableInfo,
+        ColumnDefaultInfo, ColumnInfo, CommentInfo, ConstraintInfo, EnumTypeInfo, IndexInfo,
+        NamespaceInfo, SequenceInfo, TableInfo,
     },
     CatalogSource, Oid,
 };
@@ -24,6 +24,8 @@ pub struct MockCatalog {
     indexes: Vec<IndexInfo>,
     constraints: Vec<ConstraintInfo>,
     comments: Vec<(Oid, CommentInfo)>,
+    enum_types: Vec<EnumTypeInfo>,
+    sequences: Vec<SequenceInfo>,
 }
 
 impl MockCatalog {
@@ -65,6 +67,16 @@ impl MockCatalog {
     /// `comment.objsubid`).
     pub fn with_comment(mut self, table_oid: Oid, comment: CommentInfo) -> Self {
         self.comments.push((table_oid, comment));
+        self
+    }
+
+    pub fn with_enum_type(mut self, enum_type: EnumTypeInfo) -> Self {
+        self.enum_types.push(enum_type);
+        self
+    }
+
+    pub fn with_sequence(mut self, sequence: SequenceInfo) -> Self {
+        self.sequences.push(sequence);
         self
     }
 }
@@ -116,6 +128,14 @@ impl CatalogSource for MockCatalog {
             .filter(|(t, _)| *t == table_oid)
             .map(|(_, c)| c.clone())
             .collect()
+    }
+
+    fn enum_types(&self) -> Vec<EnumTypeInfo> {
+        self.enum_types.clone()
+    }
+
+    fn sequences(&self) -> Vec<SequenceInfo> {
+        self.sequences.clone()
     }
 }
 
