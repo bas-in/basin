@@ -1022,6 +1022,13 @@ async fn run_full_rewrite_pipeline(sess: &ProjectSession, sql: &str) -> Result<S
     // Decorrelate `JOIN LATERAL generate_series(<lo>, <tbl>.<col>)` into a bounded
     // recursive-CTE JOIN.
     let rewritten = crate::pg_operators::rewrite_lateral_generate_series(&rewritten);
+    // Name a FROM-clause SRF's output column the way PostgreSQL does — after
+    // the table alias (`generate_series(1,3) g` ⇒ `g.g`), or after the
+    // function when there is no alias. Runs AFTER the LATERAL decorrelation
+    // above, which turns the correlated shape into a CTE join and applies the
+    // same naming rule itself; whatever that pass leaves as a function call
+    // still needs naming here.
+    let rewritten = crate::pg_operators::rewrite_srf_from_alias_colname(&rewritten);
     // Rewrite `(s1, e1) OVERLAPS (s2, e2)` → `overlaps(s1, e1, s2, e2)`.
     let rewritten = crate::pg_operators::rewrite_overlaps(&rewritten);
     // Rewrite `agg(x) FILTER (WHERE cond)` → `agg(CASE WHEN cond THEN x END)`.

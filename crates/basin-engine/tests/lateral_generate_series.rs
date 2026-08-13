@@ -13,6 +13,14 @@
 //! empty table, id = 0 / NULL edges, the explicit step variant, and — as a
 //! regression guard — that the already-working non-correlated
 //! `generate_series(1, 3)` form is left untouched.
+//!
+//! The expanded column is referenced as `g.g` (and `gs.i` under an `AS gs(i)`
+//! column-alias list) because that is what PostgreSQL names it: a scalar
+//! SRF's output column takes the FROM-item's alias. `g.value` — DataFusion's
+//! own name for it, which these cases used to write — is rejected by a real
+//! server. See `pg_operators::rewrite_srf_from_alias_colname` for the rule
+//! and `tests/differential_pg.rs::diff_srf_output_column_naming` for the
+//! shape-by-shape parity assertions against a live PostgreSQL.
 
 use std::sync::Arc;
 
@@ -91,9 +99,9 @@ async fn cross_join_lateral_per_row_expansion() {
     // 2 → {1,2}, 3 → {1,2,3}.
     let got = pairs(
         &sess,
-        "SELECT t.id, g.value \
+        "SELECT t.id, g.g \
          FROM t CROSS JOIN LATERAL generate_series(1, t.id) g \
-         ORDER BY t.id, g.value",
+         ORDER BY t.id, g.g",
     )
     .await;
     assert_eq!(got, vec![(2, 1), (2, 2), (3, 1), (3, 2), (3, 3)]);
@@ -109,12 +117,13 @@ async fn comma_lateral_with_column_alias_list() {
         .unwrap();
     sess.execute("INSERT INTO t VALUES (1), (4)").await.unwrap();
 
-    // Comma form + `AS gs(i)` column-alias list (we still expose `value`).
+    // Comma form + `AS gs(i)` column-alias list, which — as in PostgreSQL —
+    // names the expanded column `i`.
     let got = pairs(
         &sess,
-        "SELECT t.id, gs.value \
+        "SELECT t.id, gs.i \
          FROM t, LATERAL generate_series(1, t.id) AS gs(i) \
-         ORDER BY t.id, gs.value",
+         ORDER BY t.id, gs.i",
     )
     .await;
     assert_eq!(got, vec![(1, 1), (4, 1), (4, 2), (4, 3), (4, 4)]);
@@ -131,7 +140,7 @@ async fn empty_table_yields_no_rows() {
 
     let n = count_rows(
         &sess,
-        "SELECT t.id, g.value FROM t CROSS JOIN LATERAL generate_series(1, t.id) g",
+        "SELECT t.id, g.g FROM t CROSS JOIN LATERAL generate_series(1, t.id) g",
     )
     .await;
     assert_eq!(n, 0, "empty driving table ⇒ zero expanded rows");
@@ -150,9 +159,9 @@ async fn zero_and_null_ids_contribute_no_rows() {
     // id = 0 ⇒ no rows (1 > 0); id = NULL ⇒ no rows; id = 3 ⇒ {1,2,3}.
     let got = pairs(
         &sess,
-        "SELECT z.id, g.value \
+        "SELECT z.id, g.g \
          FROM z CROSS JOIN LATERAL generate_series(1, z.id) g \
-         ORDER BY z.id, g.value",
+         ORDER BY z.id, g.g",
     )
     .await;
     assert_eq!(got, vec![(3, 1), (3, 2), (3, 3)]);
@@ -171,9 +180,9 @@ async fn explicit_step_one_variant() {
     // 3-arg form with literal step 1 is supported (same as the 2-arg form).
     let got = pairs(
         &sess,
-        "SELECT t.id, g.value \
+        "SELECT t.id, g.g \
          FROM t CROSS JOIN LATERAL generate_series(1, t.id, 1) g \
-         ORDER BY g.value",
+         ORDER BY g.g",
     )
     .await;
     assert_eq!(got, vec![(3, 1), (3, 2), (3, 3)]);
@@ -192,9 +201,9 @@ async fn lower_bound_other_than_one() {
     // generate_series(3, 5) ⇒ {3,4,5}.
     let got = pairs(
         &sess,
-        "SELECT t.id, g.value \
+        "SELECT t.id, g.g \
          FROM t CROSS JOIN LATERAL generate_series(3, t.id) g \
-         ORDER BY g.value",
+         ORDER BY g.g",
     )
     .await;
     assert_eq!(got, vec![(5, 3), (5, 4), (5, 5)]);
@@ -215,10 +224,10 @@ async fn outer_where_and_other_join_preserved() {
     // The outer WHERE must still filter after decorrelation.
     let got = pairs(
         &sess,
-        "SELECT t.id, g.value \
+        "SELECT t.id, g.g \
          FROM t CROSS JOIN LATERAL generate_series(1, t.id) g \
          WHERE t.id >= 3 \
-         ORDER BY t.id, g.value",
+         ORDER BY t.id, g.g",
     )
     .await;
     assert_eq!(
@@ -244,9 +253,9 @@ async fn non_correlated_generate_series_unaffected() {
     // 2 t-rows × series {1,2,3} = 6 rows; series values independent of t.id.
     let got = pairs(
         &sess,
-        "SELECT t.id, g.value \
+        "SELECT t.id, g.g \
          FROM t CROSS JOIN LATERAL generate_series(1, 3) g \
-         ORDER BY t.id, g.value",
+         ORDER BY t.id, g.g",
     )
     .await;
     assert_eq!(
@@ -255,6 +264,6 @@ async fn non_correlated_generate_series_unaffected() {
     );
 
     // Plain (non-LATERAL) generate_series also still works.
-    let n = count_rows(&sess, "SELECT 0, value FROM generate_series(1, 5) g").await;
+    let n = count_rows(&sess, "SELECT 0, g FROM generate_series(1, 5) g").await;
     assert_eq!(n, 5, "bare generate_series(1,5) unaffected");
 }

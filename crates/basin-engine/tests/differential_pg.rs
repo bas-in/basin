@@ -721,6 +721,89 @@ impl DifferentialRunner {
         };
         (basin, pg)
     }
+
+    /// Assert a statement's **output column names** — the thing PostgreSQL's
+    /// FROM-item aliasing rules actually decide — on basin, and, when a DSN
+    /// is set, on real PG too.
+    ///
+    /// `expect` is written from what the live server does (see
+    /// [`diff_srf_output_column_naming`]); asserting it on *both* legs is
+    /// what stops the two sides from silently agreeing on a spelling that no
+    /// PostgreSQL would accept. PG's names come from `PREPARE`'s row
+    /// description, so the check holds for an empty result too.
+    async fn assert_colnames(&self, sql: &str, expect: &[&str]) {
+        use basin_engine::ExecResult;
+        let basin: Vec<String> = match self.sess.execute(sql).await {
+            Ok(ExecResult::Rows { schema, .. }) => {
+                schema.fields().iter().map(|f| f.name().clone()).collect()
+            }
+            other => panic!("expected a result set from {sql:?}, got {other:?}"),
+        };
+        assert_eq!(basin, expect, "basin column names for {sql:?}");
+        assert!(
+            !(dsn_configured() && self.pg.is_none()),
+            "PG leg skipped for {sql:?} despite PG_DIFF_TEST_DSN being set"
+        );
+        if let Some(pg) = &self.pg {
+            let stmt = pg
+                .prepare(sql)
+                .await
+                .unwrap_or_else(|e| panic!("PG prepare failed for {sql:?}: {e}"));
+            let names: Vec<String> = stmt
+                .columns()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect();
+            assert_eq!(names, expect, "real-PG column names for {sql:?}");
+        }
+    }
+
+    /// Assert both backends *reject* a statement. Deliberately weaker than
+    /// [`Self::probe`]'s SQLSTATE comparison: basin surfaces its planner's
+    /// own message for an unknown qualified column rather than PG's 42703
+    /// `undefined_column`, so pinning the code here would assert something
+    /// untrue. What matters for the naming rule — that the spelling PG
+    /// rejects is not quietly accepted by basin — is exactly this.
+    async fn assert_both_reject(&self, sql: &str) {
+        assert!(
+            self.sess.execute(sql).await.is_err(),
+            "basin accepted {sql:?}, which PostgreSQL rejects"
+        );
+        assert!(
+            !(dsn_configured() && self.pg.is_none()),
+            "PG leg skipped for {sql:?} despite PG_DIFF_TEST_DSN being set"
+        );
+        if let Some(pg) = &self.pg {
+            assert!(
+                pg.batch_execute(sql).await.is_err(),
+                "real PG accepted {sql:?}, so this case is asserting the wrong rule"
+            );
+        }
+    }
+}
+
+/// Is a real-PG leg configured for this run? Used only to catch a case that
+/// silently degrades to basin-only.
+fn dsn_configured() -> bool {
+    std::env::var("PG_DIFF_TEST_DSN").is_ok_and(|d| !d.trim().is_empty())
+}
+
+/// Guard for the `Option`-returning runner helpers: `None` means "no DSN",
+/// so a `None` while a DSN *is* configured means the PG leg never ran and
+/// the comparison below it was vacuous — precisely how a wrong expectation
+/// can survive in this file.
+trait PgLegRan<T> {
+    fn expect_pg_ran(self, what: &str) -> Option<T>;
+}
+
+impl<T> PgLegRan<T> for Option<T> {
+    fn expect_pg_ran(self, what: &str) -> Option<T> {
+        assert!(
+            !(dsn_configured() && self.is_none()),
+            "PG leg did not run for {what} despite PG_DIFF_TEST_DSN being set"
+        );
+        self
+    }
 }
 
 /// BEGIN; INSERT; SAVEPOINT; INSERT; ROLLBACK TO SAVEPOINT; COMMIT — the
@@ -955,28 +1038,38 @@ async fn diff_lateral_generate_series_per_row_expansion() {
     r.setup("INSERT INTO t VALUES (2), (3)").await;
 
     // ids {2,3} ⇒ 2 → {1,2}, 3 → {1,2,3}.  Exact ordered set, both engines.
+    //
+    // NOTE the column spelling: `g.g`. PostgreSQL names a scalar SRF's output
+    // column after the FROM-item's table alias, so `g.g` is the *only* way to
+    // reference this column on a real server — `g.value` (DataFusion's own
+    // name, which this case used to send to both legs) is rejected by PG with
+    // `column g.value does not exist`. See `diff_srf_output_column_naming`
+    // for the full rule and every shape of it.
     let (b, p) = r
         .rows_pairs(
-            "SELECT t.id, g.value \
+            "SELECT t.id, g.g \
              FROM t CROSS JOIN LATERAL generate_series(1, t.id) g \
-             ORDER BY t.id, g.value",
+             ORDER BY t.id, g.g",
         )
         .await;
     let expected = vec![(2i64, 1i64), (2, 2), (3, 1), (3, 2), (3, 3)];
     assert_eq!(b, expected, "basin per-row LATERAL expansion wrong");
+    let p = p.expect_pg_ran("LATERAL generate_series rows");
     if let Some(p) = p {
         assert_eq!(b, p, "basin/PG disagree on LATERAL generate_series rows");
     }
 
-    // Comma-LATERAL form with explicit `AS gs(i)` — same expansion.
+    // Comma-LATERAL form with explicit `AS gs(i)` — same expansion, and the
+    // column-alias list (not the table alias) names the column: `gs.i`.
     let (b2, p2) = r
         .rows_pairs(
-            "SELECT t.id, gs.value \
+            "SELECT t.id, gs.i \
              FROM t, LATERAL generate_series(1, t.id) AS gs(i) \
-             ORDER BY t.id, gs.value",
+             ORDER BY t.id, gs.i",
         )
         .await;
     assert_eq!(b2, expected, "basin comma-LATERAL expansion wrong");
+    let p2 = p2.expect_pg_ran("comma-LATERAL rows");
     if let Some(p2) = p2 {
         assert_eq!(b2, p2, "basin/PG disagree on comma-LATERAL rows");
     }
@@ -986,9 +1079,9 @@ async fn diff_lateral_generate_series_per_row_expansion() {
     r.setup("INSERT INTO z VALUES (0), (NULL), (5)").await;
     let (bz, pz) = r
         .rows_pairs(
-            "SELECT z.id, g.value \
+            "SELECT z.id, g.g \
              FROM z CROSS JOIN LATERAL generate_series(1, z.id) g \
-             ORDER BY z.id, g.value",
+             ORDER BY z.id, g.g",
         )
         .await;
     let expected_z = vec![(5i64, 1i64), (5, 2), (5, 3), (5, 4), (5, 5)];
@@ -999,11 +1092,168 @@ async fn diff_lateral_generate_series_per_row_expansion() {
 
     // Regression guard: the non-correlated `generate_series(1, 3)` form is
     // NOT rewritten and still works (cross join, 2 t-rows × 3 series = 6).
-    let (bc, _pc) = r
+    let (bc, pc) = r
         .count_both("SELECT count(*) FROM t CROSS JOIN LATERAL generate_series(1, 3) g")
         .await;
     assert_eq!(
         bc, 6,
         "non-correlated generate_series(1,3) must be unaffected"
     );
+    let pc = pc.expect_pg_ran("non-correlated generate_series count");
+    if let Some(pc) = pc {
+        assert_eq!(bc, pc, "basin/PG disagree on non-correlated row count");
+    }
+}
+
+/// A set-returning function's **output column name** in FROM position.
+///
+/// PostgreSQL's rule is `chooseScalarFunctionAlias`
+/// (`backend/parser/parse_relation.c`), and every expectation below was read
+/// off a live PostgreSQL 18.2 before it was implemented:
+///
+/// | shape                                        | column(s)         |
+/// |----------------------------------------------|-------------------|
+/// | `generate_series(1,3) g`                     | `g`               |
+/// | `generate_series(1,3) AS gs(i)`              | `i`               |
+/// | `generate_series(1,3)` (no alias)            | `generate_series` |
+/// | `… LATERAL generate_series(1,t.id) g`        | `g`               |
+/// | `unnest(ARRAY[…]) u` / no alias / `AS u(x)`  | `u` / `unnest` / `x` |
+/// | `jsonb_array_elements(…) je`                 | `value`           |
+/// | `jsonb_each(…) je` / `AS je(k,v)`            | `key`,`value` / `k`,`v` |
+/// | `jsonb_object_keys(…) k`                     | `k`               |
+///
+/// Three rules produce that table, in priority order: a **column-alias list**
+/// always wins; otherwise a function with a single *named* OUT parameter
+/// (`jsonb_array_elements` ⇒ `value`) or a composite return type
+/// (`jsonb_each` ⇒ `key`,`value`) keeps its own names; otherwise the **table
+/// alias** names the column, and with no alias the **function name** does.
+///
+/// basin used to answer DataFusion's `value` for every `generate_series`
+/// shape and an expression-display string for every `unnest` one — so
+/// `g.value`, which real PostgreSQL rejects, worked, and `g.g`, which is the
+/// only spelling a real client can write, did not.
+///
+/// Two shapes are deliberately absent because basin does not implement them
+/// at all yet — asserting parity would be a lie, and asserting basin's
+/// current answer would pin a wrong one:
+/// - `WITH ORDINALITY` (PG adds a second `ordinality` column; basin answers
+///   `UNNEST with ordinality is not supported yet` / drops it).
+/// - a set-returning function in the **target list**
+///   (`SELECT generate_series(1,3)`: PG expands it to three rows named
+///   `generate_series`, basin returns one row named after the expression).
+#[tokio::test]
+async fn diff_srf_output_column_naming() {
+    let r = DifferentialRunner::new("srf_names").await;
+    r.setup("CREATE TABLE t (id INT NOT NULL)").await;
+    r.setup("INSERT INTO t VALUES (2)").await;
+
+    // ── scalar SRF: the table alias names the column ─────────────────────
+    r.assert_colnames("SELECT * FROM generate_series(1, 3) g", &["g"])
+        .await;
+    r.assert_colnames("SELECT g FROM generate_series(1, 3) g", &["g"])
+        .await;
+    r.assert_colnames("SELECT g.g FROM generate_series(1, 3) g", &["g"])
+        .await;
+    r.assert_colnames("SELECT * FROM generate_series(1, 3) AS gs", &["gs"])
+        .await;
+
+    // ── the column-alias list outranks the table alias ───────────────────
+    r.assert_colnames("SELECT * FROM generate_series(1, 3) AS gs(i)", &["i"])
+        .await;
+    r.assert_colnames("SELECT gs.i FROM generate_series(1, 3) AS gs(i)", &["i"])
+        .await;
+
+    // ── no alias at all: the function names the column ───────────────────
+    r.assert_colnames("SELECT * FROM generate_series(1, 3)", &["generate_series"])
+        .await;
+    r.assert_colnames(
+        "SELECT generate_series FROM generate_series(1, 3)",
+        &["generate_series"],
+    )
+    .await;
+
+    // ── same rules through a LATERAL join ────────────────────────────────
+    r.assert_colnames(
+        "SELECT t.id, g.g FROM t CROSS JOIN LATERAL generate_series(1, t.id) g \
+         ORDER BY t.id, g.g",
+        &["id", "g"],
+    )
+    .await;
+    r.assert_colnames(
+        "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.id) g",
+        &["id", "g"],
+    )
+    .await;
+    r.assert_colnames(
+        "SELECT * FROM t, LATERAL generate_series(1, t.id) AS gs(i)",
+        &["id", "i"],
+    )
+    .await;
+    // Non-correlated LATERAL takes a different path inside basin (no
+    // decorrelation) and must land on the same name.
+    r.assert_colnames(
+        "SELECT * FROM t CROSS JOIN LATERAL generate_series(1, 3) g",
+        &["id", "g"],
+    )
+    .await;
+
+    // ── `unnest` follows the identical rule ──────────────────────────────
+    r.assert_colnames("SELECT * FROM unnest(ARRAY[10, 20]) u", &["u"])
+        .await;
+    r.assert_colnames("SELECT * FROM unnest(ARRAY[10, 20])", &["unnest"])
+        .await;
+    r.assert_colnames("SELECT * FROM unnest(ARRAY[10, 20]) AS u(x)", &["x"])
+        .await;
+
+    // ── a named OUT parameter / composite return beats the alias ─────────
+    // `jsonb_array_elements`'s OUT parameter is named `value`, so the `je`
+    // alias does NOT rename it; `jsonb_each` returns a record whose own
+    // attributes are `key` and `value`.
+    r.assert_colnames(
+        "SELECT * FROM jsonb_array_elements('[1,2]'::jsonb) je",
+        &["value"],
+    )
+    .await;
+    r.assert_colnames(
+        "SELECT * FROM jsonb_array_elements('[1,2]'::jsonb) AS je(v)",
+        &["v"],
+    )
+    .await;
+    r.assert_colnames(
+        "SELECT * FROM jsonb_each('{\"a\":1}'::jsonb) je",
+        &["key", "value"],
+    )
+    .await;
+    r.assert_colnames(
+        "SELECT * FROM jsonb_each('{\"a\":1}'::jsonb) AS je(k, v)",
+        &["k", "v"],
+    )
+    .await;
+    // …but `jsonb_object_keys` has no OUT name, so it is alias-named again.
+    r.assert_colnames(
+        "SELECT * FROM jsonb_object_keys('{\"a\":1}'::jsonb) k",
+        &["k"],
+    )
+    .await;
+    r.assert_colnames(
+        "SELECT * FROM jsonb_object_keys('{\"a\":1}'::jsonb)",
+        &["jsonb_object_keys"],
+    )
+    .await;
+
+    // ── the spellings PostgreSQL rejects must not work on basin either ───
+    // `value` is DataFusion's name, never PostgreSQL's.
+    r.assert_both_reject("SELECT g.value FROM generate_series(1, 3) g")
+        .await;
+    r.assert_both_reject(
+        "SELECT g.value FROM t CROSS JOIN LATERAL generate_series(1, t.id) g",
+    )
+    .await;
+    // The column-alias list replaces the alias-derived name, it doesn't add
+    // to it: `gs.gs` is gone once `AS gs(i)` is written.
+    r.assert_both_reject("SELECT gs.gs FROM generate_series(1, 3) AS gs(i)")
+        .await;
+    // One column available, two names given.
+    r.assert_both_reject("SELECT * FROM generate_series(1, 3) AS gs(i, j)")
+        .await;
 }

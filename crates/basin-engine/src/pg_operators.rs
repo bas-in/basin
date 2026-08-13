@@ -2713,6 +2713,25 @@ pub(crate) fn rewrite_lateral_nested_agg(sql: &str) -> String {
         }
         let sub_alias = s[alias_start..alias_end].to_string();
 
+        // A column-alias list (`… ) s(x)`) renames the subquery's columns.
+        // This rewriter rebuilds the FROM item from scratch — and gives the
+        // emitted subquery an extra join-key column — so it cannot carry that
+        // list through positionally. Left in place, the list is stranded next
+        // to the emitted `ON …` clause and fuses into it (`… ON s.tid =
+        // t.id(x)`, which then parses as a function call). Decline instead,
+        // so the statement fails with the engine's own unsupported-correlated-
+        // LATERAL error rather than a nonsense one.
+        {
+            let mut peek = alias_end;
+            while peek < s.len() && bytes[peek].is_ascii_whitespace() {
+                peek += 1;
+            }
+            if peek < s.len() && bytes[peek] == b'(' {
+                search_from = ljl_end;
+                continue;
+            }
+        }
+
         // For LEFT JOIN LATERAL: require `ON true` after the alias and consume it.
         // For CROSS JOIN LATERAL: no ON clause; replacement ends at alias_end.
         let replace_end = if join_kw == "left join" {
@@ -3019,6 +3038,25 @@ pub(crate) fn rewrite_lateral_correlated_row(sql: &str) -> String {
         }
         let sub_alias = s[alias_start..alias_end].to_string();
 
+        // A column-alias list (`… ) s(x)`) renames the subquery's columns.
+        // This rewriter rebuilds the FROM item from scratch — and gives the
+        // emitted subquery an extra join-key column — so it cannot carry that
+        // list through positionally. Left in place, the list is stranded next
+        // to the emitted `ON …` clause and fuses into it (`… ON s.tid =
+        // t.id(x)`, which then parses as a function call). Decline instead,
+        // so the statement fails with the engine's own unsupported-correlated-
+        // LATERAL error rather than a nonsense one.
+        {
+            let mut peek = alias_end;
+            while peek < s.len() && bytes[peek].is_ascii_whitespace() {
+                peek += 1;
+            }
+            if peek < s.len() && bytes[peek] == b'(' {
+                search_from = lat_end;
+                continue;
+            }
+        }
+
         // For JOIN/LEFT-JOIN forms verify `ON true`.
         let rewrite_end;
         match join_type {
@@ -3175,17 +3213,23 @@ pub(crate) fn rewrite_lateral_correlated_row(sql: &str) -> String {
 /// -- in:
 /// SELECT <proj> FROM t CROSS JOIN LATERAL generate_series(1, t.id) g WHERE …
 /// -- out:
-/// WITH RECURSIVE __basin_gs_<alias>(value) AS (
+/// WITH RECURSIVE __basin_gs_<alias>(<col>) AS (
 ///     SELECT CAST(1 AS BIGINT)
 ///     UNION ALL
-///     SELECT value + 1 FROM __basin_gs_<alias>
-///       WHERE value + 1 <= (SELECT max(t.id) FROM t)
+///     SELECT <col> + 1 FROM __basin_gs_<alias>
+///       WHERE <col> + 1 <= (SELECT max(t.id) FROM t)
 /// )
 /// SELECT <proj> FROM t
 ///   JOIN __basin_gs_<alias> <alias>
-///     ON <alias>.value >= 1 AND <alias>.value <= t.id
+///     ON <alias>.<col> >= 1 AND <alias>.<col> <= t.id
 ///   WHERE …
 /// ```
+///
+/// `<col>` is the PostgreSQL output-column name for the expansion, NOT the
+/// `value` DataFusion's own `generate_series` table function would produce:
+/// the `AS gs(i)` column-alias list when one is written, otherwise the table
+/// alias itself (`… generate_series(1, t.id) g` ⇒ `g.g`). See
+/// [`rewrite_srf_from_alias_colname`] for the rule and where it comes from.
 ///
 /// Each `t`-row pairs with `1 .. t.id` (PG-identical), `t.id <= 0` / NULL yields
 /// zero rows for that row, and an empty `t` yields zero rows overall (the
@@ -3266,7 +3310,8 @@ pub(crate) fn rewrite_lateral_generate_series(sql: &str) -> String {
             return sql.to_string();
         };
         // Parse trailing alias: optional `AS`, then identifier, optional
-        // `(colname)` column list (which we ignore — we always expose `value`).
+        // `(colname)` column list (read below — it, not the table alias,
+        // names the emitted column when present).
         let mut a = close + 1;
         while a < sql.len() && bytes[a].is_ascii_whitespace() {
             a += 1;
@@ -3295,17 +3340,43 @@ pub(crate) fn rewrite_lateral_generate_series(sql: &str) -> String {
     // IMPORTANT: only advance `after_alias` when a column list is actually
     // present — otherwise the whitespace before the next clause (e.g. the
     // space before `ORDER BY`) would be swallowed, fusing two tokens.
+    //
+    // The list, when present, also *names the emitted column* — `AS gs(i)`
+    // exposes `gs.i`, not `gs.<alias>` (`chooseScalarFunctionAlias` is only
+    // consulted for the default; `alias->colnames` overrides it). With no
+    // list, `generate_series` has no named OUT parameter, so the table alias
+    // is the column name.
     let mut after_alias = sr_alias_end;
+    let mut colname = alias.clone();
     {
         let mut peek = sr_alias_end;
         while peek < sql.len() && bytes[peek].is_ascii_whitespace() {
             peek += 1;
         }
         if peek < sql.len() && bytes[peek] == b'(' {
-            match find_matching_close_paren(sql, peek) {
-                Some(c) => after_alias = c + 1,
+            let close = match find_matching_close_paren(sql, peek) {
+                Some(c) => c,
                 None => return sql.to_string(),
+            };
+            after_alias = close + 1;
+            // `generate_series` exposes exactly one column, so PG accepts
+            // exactly one name here (`… has 1 columns available but 2
+            // columns specified` otherwise). Any other arity is left for the
+            // engine to reject — decorrelating it would paper over an error.
+            let names = split_at_depth0_commas(&sql[peek + 1..close]);
+            if names.len() != 1 {
+                return sql.to_string();
             }
+            let name = names[0].trim();
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                // Quoted / non-trivial identifier — honest defer.
+                return sql.to_string();
+            }
+            colname = name.to_string();
         }
     }
 
@@ -3394,15 +3465,351 @@ pub(crate) fn rewrite_lateral_generate_series(sql: &str) -> String {
     // the working set is finite. The per-row range predicate enforces the
     // exact `lo .. tbl.col` window for every outer row (PG semantics).
     let new_sql = format!(
-        "WITH RECURSIVE {cte}(value) AS (\
+        "WITH RECURSIVE {cte}({colname}) AS (\
 SELECT CAST({lo} AS BIGINT) \
 UNION ALL \
-SELECT value + 1 FROM {cte} \
-WHERE value + 1 <= (SELECT max({hi_ref}) FROM {tbl})\
+SELECT {colname} + 1 FROM {cte} \
+WHERE {colname} + 1 <= (SELECT max({hi_ref}) FROM {tbl})\
 ) {prefix} {lead_kw} {cte} {alias} \
-ON {alias}.value >= {lo} AND {alias}.value <= {hi_ref}{suffix}"
+ON {alias}.{colname} >= {lo} AND {alias}.{colname} <= {hi_ref}{suffix}"
     );
     new_sql
+}
+
+// ---------------------------------------------------------------------------
+// FROM-clause SRF output-column naming (`generate_series(1,3) g` ⇒ `g.g`)
+// ---------------------------------------------------------------------------
+
+/// Set-returning functions whose FROM-clause output column PostgreSQL names
+/// after the **table alias**.
+///
+/// The rule is `chooseScalarFunctionAlias` (`backend/parser/parse_relation.c`):
+/// for a function returning a base type (one anonymous column), the column is
+/// named after (1) the function's single *named* OUT parameter if it has one,
+/// else (2) the table alias when the FROM-item has exactly one function, else
+/// (3) the function name. Only functions with no named OUT parameter reach
+/// rule (2) — verified per function against a live PostgreSQL 18.2 by reading
+/// `pg_proc.proargnames`:
+///
+/// | function              | `proargnames`          | `… (1,3) g` names it |
+/// |-----------------------|------------------------|----------------------|
+/// | `generate_series`     | NULL                   | `g`                  |
+/// | `unnest(anyarray)`    | NULL                   | `g`                  |
+/// | `jsonb_object_keys`   | NULL                   | `g`                  |
+/// | `jsonb_path_query`    | `{target,path,vars,silent}` (all IN) | `g`    |
+/// | `jsonb_array_elements`| `{from_json,value}` (OUT `value`)    | `value` |
+/// | `jsonb_each`          | `{from_json,key,value}` (composite)  | `key`,`value` |
+///
+/// The last two rows are exactly why this is a list and not "every SRF": a
+/// named OUT parameter (or a composite/record return type) beats the alias,
+/// and basin's own `jsonb_array_elements` / `jsonb_each` table functions
+/// already emit those PG names, so they must be left alone.
+const ALIAS_NAMED_SRFS: &[&str] = &[
+    "generate_series",
+    "unnest",
+    "jsonb_object_keys",
+    "json_object_keys",
+    "jsonb_path_query",
+];
+
+/// Keywords that may follow a FROM-item and are therefore NOT an implicit
+/// table alias (`FROM generate_series(1,3) WHERE …` has no alias). Only
+/// consulted when the alias was written without `AS`.
+const NOT_AN_IMPLICIT_ALIAS: &[&str] = &[
+    "where", "group", "having", "order", "limit", "offset", "fetch", "union", "intersect",
+    "except", "join", "inner", "left", "right", "full", "cross", "natural", "on", "using",
+    "window", "for", "returning", "values", "select", "from", "and", "or", "not", "tablesample",
+    "lateral", "as", "into", "set", "when", "then", "else", "end", "is", "null", "distinct",
+    "over", "filter", "by", "asc", "desc", "only", "exists", "case", "with",
+];
+
+/// Keywords that close the FROM-item list at the current paren depth, so a
+/// later comma is an expression/argument comma rather than a FROM-list one.
+const CLAUSE_ENDS_FROM_LIST: &[&str] = &[
+    "where", "select", "group", "having", "order", "limit", "offset", "window", "union",
+    "intersect", "except", "returning", "values", "set", "into", "fetch",
+];
+
+/// True when `hay` ends with the whole word `w` (not merely the substring).
+fn ends_with_word(hay: &str, w: &str) -> bool {
+    hay.len() >= w.len()
+        && hay.ends_with(w)
+        && hay[..hay.len() - w.len()]
+            .bytes()
+            .next_back()
+            .is_none_or(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
+}
+
+/// True when the whole word `w` starts at `pos` in the (lowercased) `hay`.
+fn word_at(hay: &str, pos: usize, w: &str) -> bool {
+    hay[pos..].starts_with(w)
+        && hay.as_bytes()
+            .get(pos + w.len())
+            .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+}
+
+/// Give a FROM-clause set-returning function the output-column name
+/// PostgreSQL gives it, by writing the name into an explicit column-alias
+/// list the planner already honours.
+///
+/// ## The bug
+///
+/// DataFusion's `generate_series` table function calls its column `value`, and
+/// an UNNEST table factor calls its column after the display text of the
+/// expression (`UNNEST(make_array(Int64(10),Int64(20)))`). Neither is what
+/// PostgreSQL does: `SELECT * FROM generate_series(1,3) g` produces a column
+/// named **`g`** — the alias names the column — and with no alias at all it is
+/// named after the function (`generate_series`). So `SELECT g.g FROM
+/// generate_series(1,3) g`, which every PostgreSQL client can write, failed
+/// with `column "g.g" does not exist`, while `g.value` — which real
+/// PostgreSQL rejects — worked.
+///
+/// ## The rewrite
+///
+/// An explicit column-alias list *is* already honoured end-to-end (DataFusion
+/// applies `alias.columns` positionally over any relation, table functions
+/// included), so the fix is to write the PG name into one:
+///
+/// ```sql
+/// FROM generate_series(1, 3) g          -- ⇒  FROM generate_series(1, 3) g(g)
+/// FROM generate_series(1, 3)            -- ⇒  FROM generate_series(1, 3) AS "generate_series"("generate_series")
+/// FROM generate_series(1, 3) AS gs(i)   -- ⇒  unchanged (the user's list already wins)
+/// ```
+///
+/// The synthesised no-alias form quotes the function name because `unnest` is
+/// a parser keyword in alias position; the names are all lowercase ASCII, so
+/// quoting is exactly equivalent to writing them bare.
+///
+/// ## Scope (conservative — no-op on anything unhandled)
+///
+/// - Only the functions in [`ALIAS_NAMED_SRFS`]; a function with a named OUT
+///   parameter (`jsonb_array_elements` ⇒ `value`) or a composite return type
+///   (`jsonb_each` ⇒ `key`,`value`) keeps its own names in PostgreSQL too, and
+///   is left untouched.
+/// - Only in FROM-item position: the call must directly follow `FROM`, a
+///   `JOIN`, `LATERAL`, or a comma that is itself inside a FROM-item list.
+///   A *target-list* SRF (`SELECT generate_series(1,3)`) is a different
+///   question — PostgreSQL expands it to one row per element, named after
+///   the function, and basin does not do that expansion at all yet — so it
+///   is deliberately out of this pass's reach rather than half-named by it.
+/// - Never when a column-alias list is already written — that list is the
+///   user's own name and outranks the default.
+/// - `WITH ORDINALITY` → no-op. PostgreSQL adds a second `ordinality` column
+///   there and the alias list must cover both; basin does not produce that
+///   column at all yet, so writing a one-name list would be a lie about a
+///   shape that is already wrong.
+/// - Multi-argument `unnest(a, b)` → no-op. That is the `ROWS FROM`-style
+///   multi-function case (PG rule 3: both columns stay `unnest`), not the
+///   alias-named one. `ROWS FROM (…)` itself is skipped wholesale for the
+///   same reason.
+pub(crate) fn rewrite_srf_from_alias_colname(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    if !ALIAS_NAMED_SRFS.iter().any(|f| lower.contains(f)) {
+        return sql.to_string();
+    }
+    if lower.contains("rows from") {
+        return sql.to_string();
+    }
+
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 32);
+    // `in_from[d]`: is the scan inside the FROM-item list at paren depth `d`?
+    // Only consulted to tell a FROM-list comma from an argument comma.
+    let mut in_from: Vec<bool> = vec![false];
+    let mut i = 0usize;
+
+    while i < sql.len() {
+        let c = bytes[i];
+        // Copy string literals verbatim (with `''` escapes).
+        if c == b'\'' {
+            let start = i;
+            i += 1;
+            while i < sql.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < sql.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        // Copy quoted identifiers verbatim.
+        if c == b'"' {
+            let start = i;
+            i += 1;
+            while i < sql.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i < sql.len() {
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        if c == b'(' {
+            in_from.push(false);
+            out.push('(');
+            i += 1;
+            continue;
+        }
+        if c == b')' {
+            if in_from.len() > 1 {
+                in_from.pop();
+            }
+            out.push(')');
+            i += 1;
+            continue;
+        }
+        // Anything that is not the start of a bare identifier: copy through.
+        let starts_ident = (c.is_ascii_alphabetic() || c == b'_')
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'));
+        if !starts_ident {
+            out.push(c as char);
+            i += 1;
+            continue;
+        }
+        let mut e = i;
+        while e < sql.len() && (bytes[e].is_ascii_alphanumeric() || bytes[e] == b'_') {
+            e += 1;
+        }
+        let word = &lower[i..e];
+        if word == "from" {
+            if let Some(f) = in_from.last_mut() {
+                *f = true;
+            }
+        } else if CLAUSE_ENDS_FROM_LIST.contains(&word) {
+            if let Some(f) = in_from.last_mut() {
+                *f = false;
+            }
+        }
+        if let Some(end) = try_name_srf_call(sql, &lower, i, e, word, *in_from.last().unwrap_or(&false), &mut out)
+        {
+            i = end;
+            continue;
+        }
+        out.push_str(&sql[i..e]);
+        i = e;
+    }
+    out
+}
+
+/// One [`rewrite_srf_from_alias_colname`] candidate: the identifier
+/// `sql[start..end]` (lowercased as `word`). On a fire, appends the rewritten
+/// FROM-item to `out` and returns the offset to resume scanning from; returns
+/// `None` (having appended nothing) when the candidate is not an SRF call in
+/// FROM position, or any of the scope rules decline it.
+fn try_name_srf_call(
+    sql: &str,
+    lower: &str,
+    start: usize,
+    end: usize,
+    word: &str,
+    in_from_list: bool,
+    out: &mut String,
+) -> Option<usize> {
+    if !ALIAS_NAMED_SRFS.contains(&word) {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    // FROM-item position: `FROM f(…)`, `JOIN f(…)`, `LATERAL f(…)`, or
+    // `…, f(…)` where the comma separates FROM items.
+    let pre = lower[..start].trim_end();
+    let lead_ok = ends_with_word(pre, "from")
+        || ends_with_word(pre, "join")
+        || ends_with_word(pre, "lateral")
+        || (pre.ends_with(',') && in_from_list);
+    if !lead_ok {
+        return None;
+    }
+    // It must actually be a call.
+    let mut p = end;
+    while p < sql.len() && bytes[p].is_ascii_whitespace() {
+        p += 1;
+    }
+    if p >= sql.len() || bytes[p] != b'(' {
+        return None;
+    }
+    let close = find_matching_close_paren(sql, p)?;
+    // Multi-argument `unnest` is the multi-function shape — PG leaves both
+    // columns named `unnest`, the alias renames nothing. Split with the
+    // bracket-aware splitter: `unnest(ARRAY[10,20])` is ONE argument, and
+    // the paren-only splitter would read its `[10,20]` as two.
+    if word == "unnest" && split_top_commas_brackets(&sql[p + 1..close]).len() != 1 {
+        return None;
+    }
+
+    // Trailing alias: `[AS] ident [(collist)]`.
+    let mut a = close + 1;
+    while a < sql.len() && bytes[a].is_ascii_whitespace() {
+        a += 1;
+    }
+    // `WITH ORDINALITY` — out of scope (see the fn docs).
+    if a < sql.len() && word_at(lower, a, "with") {
+        return None;
+    }
+    let explicit_as = a < sql.len() && word_at(lower, a, "as");
+    if explicit_as {
+        a += 2;
+        while a < sql.len() && bytes[a].is_ascii_whitespace() {
+            a += 1;
+        }
+    }
+    // The alias token, if there is one, kept verbatim (a quoted alias must be
+    // reproduced quote-for-quote in the column list to name the same column).
+    let alias_tok: Option<(usize, usize)> = if a < sql.len() && bytes[a] == b'"' {
+        let mut q = a + 1;
+        while q < sql.len() && bytes[q] != b'"' {
+            q += 1;
+        }
+        if q >= sql.len() {
+            return None; // unterminated — leave the statement alone
+        }
+        Some((a, q + 1))
+    } else if a < sql.len() && (bytes[a].is_ascii_alphabetic() || bytes[a] == b'_') {
+        let mut q = a;
+        while q < sql.len() && (bytes[q].is_ascii_alphanumeric() || bytes[q] == b'_') {
+            q += 1;
+        }
+        if !explicit_as && NOT_AN_IMPLICIT_ALIAS.contains(&&lower[a..q]) {
+            None
+        } else {
+            Some((a, q))
+        }
+    } else {
+        None
+    };
+
+    match alias_tok {
+        Some((ts, te)) => {
+            // An explicit column-alias list already names the column.
+            let mut peek = te;
+            while peek < sql.len() && bytes[peek].is_ascii_whitespace() {
+                peek += 1;
+            }
+            if peek < sql.len() && bytes[peek] == b'(' {
+                return None;
+            }
+            out.push_str(&sql[start..te]);
+            out.push('(');
+            out.push_str(&sql[ts..te]);
+            out.push(')');
+            Some(te)
+        }
+        None => {
+            if explicit_as {
+                // `AS` with nothing usable after it — malformed; hands off.
+                return None;
+            }
+            out.push_str(&sql[start..=close]);
+            out.push_str(&format!(" AS \"{word}\"(\"{word}\")"));
+            Some(close + 1)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3664,6 +4071,25 @@ pub(crate) fn rewrite_lateral_order_limit(sql: &str) -> String {
             continue;
         }
         let sub_alias = s[alias_start..alias_end].to_string();
+
+        // A column-alias list (`… ) s(x)`) renames the subquery's columns.
+        // This rewriter rebuilds the FROM item from scratch — and gives the
+        // emitted subquery an extra join-key column — so it cannot carry that
+        // list through positionally. Left in place, the list is stranded next
+        // to the emitted `ON …` clause and fuses into it (`… ON s.tid =
+        // t.id(x)`, which then parses as a function call). Decline instead,
+        // so the statement fails with the engine's own unsupported-correlated-
+        // LATERAL error rather than a nonsense one.
+        {
+            let mut peek = alias_end;
+            while peek < s.len() && bytes[peek].is_ascii_whitespace() {
+                peek += 1;
+            }
+            if peek < s.len() && bytes[peek] == b'(' {
+                search_from = lat_end;
+                continue;
+            }
+        }
 
         // For JOIN/LEFT-JOIN forms verify `ON true`.
         let rewrite_end;
@@ -8250,6 +8676,36 @@ mod tests {
     }
 
     #[test]
+    fn correlated_lateral_column_alias_list_declined_by_every_rewriter() {
+        // `… ) s(x)` renames the subquery's columns. None of the correlated
+        // LATERAL rewriters can carry that list into the join they build (the
+        // rebuilt subquery carries an extra join-key column), and leaving it
+        // stranded produced corrupted SQL: the comma form emitted `… ON
+        // s.tid = t.id(x) ORDER BY …`, which parses as a call and fails with
+        // `function t.id does not exist`. All three must decline verbatim.
+        let row_comma = "SELECT t.id, s.x FROM t, LATERAL (SELECT u.v FROM u WHERE u.tid = t.id) s(x) ORDER BY t.id";
+        assert_eq!(rewrite_lateral_correlated_row(row_comma), row_comma);
+        let row_join = "SELECT t.id, s.x FROM t LEFT JOIN LATERAL (SELECT u.v FROM u WHERE u.tid = t.id) s(x) ON true";
+        assert_eq!(rewrite_lateral_correlated_row(row_join), row_join);
+
+        let agg = "SELECT t.id, s.x FROM t LEFT JOIN LATERAL (SELECT count(*) FROM u WHERE u.tid = t.id) s(x) ON true";
+        assert_eq!(rewrite_lateral_nested_agg(agg), agg);
+
+        let toplim = "SELECT t.id, s.x FROM t LEFT JOIN LATERAL (SELECT u.v FROM u WHERE u.tid = t.id ORDER BY u.v LIMIT 1) s(x) ON true";
+        assert_eq!(rewrite_lateral_order_limit(toplim), toplim);
+
+        // The same shapes WITHOUT a column-alias list are still rewritten —
+        // the guard must not disarm the rewriters wholesale.
+        let row_plain = "SELECT t.id, s.v FROM t, LATERAL (SELECT u.v FROM u WHERE u.tid = t.id) s ORDER BY t.id";
+        assert!(
+            !rewrite_lateral_correlated_row(row_plain)
+                .to_ascii_lowercase()
+                .contains("lateral"),
+            "the aliased-but-listless form must still decorrelate"
+        );
+    }
+
+    #[test]
     fn lateral_nested_agg_not_stolen_by_row_rewriter() {
         // The nested-agg ORM shape (all projections are aggregates) must be handled
         // by rewrite_lateral_nested_agg, NOT by rewrite_lateral_correlated_row.
@@ -8952,8 +9408,8 @@ mod tests {
         let lo = out.to_ascii_lowercase();
         assert!(!lo.contains("lateral"), "LATERAL must be removed: {out}");
         assert!(
-            lo.contains("with recursive __basin_gs_g(value)"),
-            "recursive CTE must be emitted: {out}"
+            lo.contains("with recursive __basin_gs_g(g)"),
+            "recursive CTE must be emitted, named after the alias: {out}"
         );
         assert!(lo.contains("union all"), "recursive term required: {out}");
         assert!(
@@ -8965,8 +9421,8 @@ mod tests {
             "plain JOIN required: {out}"
         );
         assert!(
-            lo.contains("g.value >= 1 and g.value <= t.id"),
-            "per-row range predicate required: {out}"
+            lo.contains("g.g >= 1 and g.g <= t.id"),
+            "per-row range predicate required, on the PG column name: {out}"
         );
         assert!(
             lo.contains("select * from t"),
@@ -8976,30 +9432,42 @@ mod tests {
 
     #[test]
     fn lgs_comma_lateral_correlated_rewritten() {
-        let sql = "SELECT t.id, gs.value FROM t, LATERAL generate_series(1, t.n) AS gs";
+        let sql = "SELECT t.id, gs.gs FROM t, LATERAL generate_series(1, t.n) AS gs";
         let out = rlgs(sql);
         let lo = out.to_ascii_lowercase();
         assert!(!lo.contains("lateral"), "comma-LATERAL removed: {out}");
-        assert!(lo.contains("with recursive __basin_gs_gs(value)"), "{out}");
+        assert!(lo.contains("with recursive __basin_gs_gs(gs)"), "{out}");
         assert!(lo.contains("(select max(t.n) from t)"), "{out}");
         assert!(
             lo.contains("join __basin_gs_gs gs"),
             "comma form becomes JOIN: {out}"
         );
-        assert!(lo.contains("gs.value >= 1 and gs.value <= t.n"), "{out}");
+        assert!(lo.contains("gs.gs >= 1 and gs.gs <= t.n"), "{out}");
         // The leading comma must be gone (replaced by JOIN).
         assert!(!out.contains("t, "), "comma join lead-in replaced: {out}");
     }
 
     #[test]
-    fn lgs_column_alias_list_ignored() {
-        // `AS gs(i)` — we still expose `value`; the (i) list is dropped.
+    fn lgs_column_alias_list_names_the_column() {
+        // `AS gs(i)` — PostgreSQL exposes `gs.i`, so the CTE column is `i`,
+        // not the table alias and not DataFusion's `value`.
         let sql = "SELECT t.id, gs.i FROM t, LATERAL generate_series(1, t.n) AS gs(i)";
         let out = rlgs(sql);
         let lo = out.to_ascii_lowercase();
         assert!(!lo.contains("lateral"), "{out}");
+        assert!(lo.contains("with recursive __basin_gs_gs(i)"), "{out}");
         assert!(lo.contains("join __basin_gs_gs gs"), "{out}");
-        assert!(lo.contains("gs.value >= 1 and gs.value <= t.n"), "{out}");
+        assert!(lo.contains("gs.i >= 1 and gs.i <= t.n"), "{out}");
+        assert!(!lo.contains("value"), "the `value` spelling is gone: {out}");
+    }
+
+    #[test]
+    fn lgs_multi_name_column_alias_list_deferred() {
+        // `generate_series` has ONE column; PG rejects a two-name list
+        // (`table "gs" has 1 columns available but 2 columns specified`).
+        // Decorrelating it would hide that error — defer instead.
+        let sql = "SELECT t.id FROM t, LATERAL generate_series(1, t.n) AS gs(i, j)";
+        assert_eq!(rlgs(sql), sql, "over-long column-alias list must defer");
     }
 
     #[test]
@@ -9016,7 +9484,7 @@ mod tests {
         let out = rlgs(sql).to_ascii_lowercase();
         assert!(out.contains("select cast(2 as bigint)"), "seed = lo: {out}");
         assert!(
-            out.contains("g.value >= 2 and g.value <= t.id"),
+            out.contains("g.g >= 2 and g.g <= t.id"),
             "floor = lo literal: {out}"
         );
     }
@@ -9061,10 +9529,10 @@ mod tests {
 
     #[test]
     fn lgs_preserves_outer_where_and_projection() {
-        let sql = "SELECT t.id AS tid, g.value v FROM t CROSS JOIN LATERAL generate_series(1, t.id) g WHERE t.id > 1 ORDER BY t.id";
+        let sql = "SELECT t.id AS tid, g.g v FROM t CROSS JOIN LATERAL generate_series(1, t.id) g WHERE t.id > 1 ORDER BY t.id";
         let out = rlgs(sql);
         assert!(
-            out.contains("t.id AS tid, g.value v"),
+            out.contains("t.id AS tid, g.g v"),
             "projection preserved verbatim: {out}"
         );
         assert!(
@@ -9082,6 +9550,151 @@ mod tests {
             rlgs(sql),
             sql,
             "more than one correlated generate_series LATERAL → defer"
+        );
+    }
+
+    // ── FROM-clause SRF output-column naming ────────────────────────────────
+    //
+    // Every expectation below was read off a live PostgreSQL 18.2 first (see
+    // `rewrite_srf_from_alias_colname`'s docs for the rule and the
+    // `pg_proc.proargnames` evidence behind the function list).
+
+    use super::rewrite_srf_from_alias_colname as srfname;
+
+    #[test]
+    fn srf_table_alias_names_the_column() {
+        // PG: `SELECT * FROM generate_series(1,3) g` ⇒ column `g`.
+        assert_eq!(
+            srfname("SELECT * FROM generate_series(1, 3) g"),
+            "SELECT * FROM generate_series(1, 3) g(g)"
+        );
+        // `AS` form, and the alias is reproduced exactly as written.
+        assert_eq!(
+            srfname("SELECT * FROM generate_series(1, 3) AS gs"),
+            "SELECT * FROM generate_series(1, 3) AS gs(gs)"
+        );
+        // A quoted alias keeps its quotes (and therefore its case).
+        assert_eq!(
+            srfname("SELECT * FROM generate_series(1, 3) AS \"Weird Name\""),
+            "SELECT * FROM generate_series(1, 3) AS \"Weird Name\"(\"Weird Name\")"
+        );
+    }
+
+    #[test]
+    fn srf_no_alias_names_the_column_after_the_function() {
+        // PG: `SELECT * FROM generate_series(1,3)` ⇒ column `generate_series`.
+        assert_eq!(
+            srfname("SELECT * FROM generate_series(1, 3)"),
+            "SELECT * FROM generate_series(1, 3) AS \"generate_series\"(\"generate_series\")"
+        );
+        // A following clause is not an implicit alias.
+        assert_eq!(
+            srfname("SELECT * FROM unnest(ARRAY[1,2]) WHERE true"),
+            "SELECT * FROM unnest(ARRAY[1,2]) AS \"unnest\"(\"unnest\") WHERE true"
+        );
+        // Nor is a following comma / close paren.
+        assert!(srfname("SELECT * FROM generate_series(1, 3), t")
+            .starts_with("SELECT * FROM generate_series(1, 3) AS \"generate_series\""));
+    }
+
+    #[test]
+    fn srf_existing_column_alias_list_wins() {
+        // The user's own list outranks the default — verbatim no-op.
+        for sql in [
+            "SELECT * FROM generate_series(1, 3) AS gs(i)",
+            "SELECT * FROM generate_series(1, 3) gs (i)",
+            "SELECT * FROM unnest(ARRAY[1,2]) AS u(x)",
+        ] {
+            assert_eq!(srfname(sql), sql, "column-alias list must be untouched");
+        }
+    }
+
+    #[test]
+    fn srf_only_in_from_position() {
+        // A target-list SRF is a separate (still-open) question — see the
+        // scope notes on `rewrite_srf_from_alias_colname`. Not this pass.
+        for sql in [
+            "SELECT generate_series(1, 3)",
+            "SELECT a, generate_series(1, 3) FROM t",
+            "SELECT array_length(unnest(a), 1) FROM t",
+            // Argument commas are not FROM-list commas.
+            "SELECT coalesce(a, generate_series(1, 3)) FROM t",
+        ] {
+            assert_eq!(srfname(sql), sql, "not a FROM item: {sql}");
+        }
+    }
+
+    #[test]
+    fn srf_from_list_comma_fires_but_argument_comma_does_not() {
+        assert_eq!(
+            srfname("SELECT * FROM t, generate_series(1, 3) g"),
+            "SELECT * FROM t, generate_series(1, 3) g(g)"
+        );
+        assert_eq!(
+            srfname("SELECT * FROM t JOIN generate_series(1, 3) g ON g.g = t.id"),
+            "SELECT * FROM t JOIN generate_series(1, 3) g(g) ON g.g = t.id"
+        );
+        // Same comma token, inside a WHERE-clause call: untouched.
+        let arg = "SELECT * FROM t WHERE t.id = any_fn(1, generate_series(1, 3))";
+        assert_eq!(srfname(arg), arg);
+    }
+
+    #[test]
+    fn srf_functions_with_their_own_column_names_untouched() {
+        // Named OUT parameter (`value`) and composite return (`key`,`value`)
+        // both beat the alias in PostgreSQL — leave basin's own names alone.
+        for sql in [
+            "SELECT * FROM jsonb_array_elements('[1,2]'::jsonb) je",
+            "SELECT * FROM jsonb_each('{\"a\":1}'::jsonb) je",
+            "SELECT * FROM json_to_recordset('[]'::json) AS x(a int)",
+        ] {
+            assert_eq!(srfname(sql), sql, "own column names: {sql}");
+        }
+    }
+
+    #[test]
+    fn srf_with_ordinality_and_rows_from_deferred() {
+        // Both add columns the one-name list could not describe.
+        for sql in [
+            "SELECT * FROM generate_series(1, 3) WITH ORDINALITY",
+            "SELECT * FROM generate_series(1, 3) WITH ORDINALITY AS o(a, b)",
+            "SELECT * FROM ROWS FROM (generate_series(1, 2), generate_series(5, 6)) AS r",
+        ] {
+            assert_eq!(srfname(sql), sql, "must defer: {sql}");
+        }
+    }
+
+    #[test]
+    fn srf_multi_arg_unnest_deferred_single_arg_fires() {
+        // Multi-argument `unnest` is PG's multi-function shape: both columns
+        // stay named `unnest`, the alias renames nothing.
+        let multi = "SELECT * FROM unnest(ARRAY['a','b'], ARRAY[1,2]) t";
+        assert_eq!(srfname(multi), multi);
+        // …but the array literal's own commas must not be mistaken for
+        // argument commas.
+        assert_eq!(
+            srfname("SELECT * FROM unnest(ARRAY[10,20]) u"),
+            "SELECT * FROM unnest(ARRAY[10,20]) u(u)"
+        );
+    }
+
+    #[test]
+    fn srf_string_literals_are_not_rewritten() {
+        let lit = "SELECT 'FROM generate_series(1,3) x' AS s FROM t";
+        assert_eq!(srfname(lit), lit, "literal text must be untouched");
+    }
+
+    #[test]
+    fn srf_fast_exit_when_no_candidate() {
+        let sql = "SELECT * FROM t JOIN u ON t.id = u.id";
+        assert_eq!(srfname(sql), sql);
+    }
+
+    #[test]
+    fn srf_fires_inside_a_subquery() {
+        assert_eq!(
+            srfname("SELECT * FROM (SELECT * FROM generate_series(1, 2) g) s"),
+            "SELECT * FROM (SELECT * FROM generate_series(1, 2) g(g)) s"
         );
     }
 
