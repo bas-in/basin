@@ -112,10 +112,26 @@
 //! `array_agg(int4) -> int4[]` and `array_agg(text) -> text[]` — that
 //! legitimately carry the same real oid (2335), because that is the oid
 //! Postgres itself resolves to no matter which concrete type is aggregated.
-//! `int4` and `text` are chosen as one representative numeric and one
-//! representative string instantiation; any other concrete type is simply not
-//! covered yet, not covered wrongly. See the module docs on
-//! [`crate::operator::OPERATORS`] for the same rule spelled out for arrays.
+//! Which concrete types get a row is a real coverage decision, not a
+//! formality — an element type with no row is a type the function cannot be
+//! called on. `array_agg` and the five `anyelement` window functions
+//! (`lag`, `lead`, `first_value`, `last_value`, `nth_value`) therefore carry
+//! **five** instantiations each: `int4`, `text`, `int8`, `float8` and
+//! `numeric` — the four numeric widths a column in a real table actually
+//! has, plus one representative string. The `int8` row is load-bearing
+//! rather than aspirational: before it existed, `lag(id)` over a `bigint`
+//! column resolved only because a bare column arrives typed `unknown` and
+//! [`resolve`]'s implicit-coercion pass dropped it into the `int4` row.
+//! Giving columns their real types — which is the correct direction — would
+//! have turned that accident into `None`. `int4` is deliberately still
+//! listed first in each group so the `unknown` path lands exactly where it
+//! did before.
+//!
+//! Every other family here (the `anycompatible` array functions, `unnest`)
+//! remains at the original `int4`/`text` pair; any concrete type without a
+//! row is simply not covered yet, not covered wrongly. See the module docs
+//! on [`crate::operator::OPERATORS`] for the same rule spelled out for
+//! arrays.
 //!
 //! The array family added with the DataFusion-orphan block (`array_append`,
 //! `array_cat`, `array_length`, `array_ndims`, `array_position`,
@@ -412,6 +428,31 @@ pub static FUNCS: &[FuncSig] = &[
         2088,
         "split_part",
         &[oid::TEXT, oid::TEXT, oid::INT4],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    // `left(text, integer) -> text` (oid 3060) and
+    // `right(text, integer) -> text` (oid 3061), both confirmed live against
+    // PostgreSQL 18.2 (`prokind = 'f'`, `prosrc` `text_left`/`text_right`).
+    //
+    // Unlike most of the rows around them these are *not* awaiting an
+    // implementation: `crates/basin-exec/src/eval.rs` has answered both oids
+    // since commit `5fedc616`, including `right`'s `INT_MIN` overflow
+    // behaviour. The implementation was unreachable because these two rows
+    // were missing — [`resolve`] returned `None`, so a call site could never
+    // be lowered to the oid `eval.rs` was already matching on. The row is
+    // what connects them.
+    FuncSig::new(
+        3060,
+        "left",
+        &[oid::TEXT, oid::INT4],
+        oid::TEXT,
+        FuncKind::Scalar,
+    ),
+    FuncSig::new(
+        3061,
+        "right",
+        &[oid::TEXT, oid::INT4],
         oid::TEXT,
         FuncKind::Scalar,
     ),
@@ -872,7 +913,7 @@ pub static FUNCS: &[FuncSig] = &[
         oid::INTERVAL,
         FuncKind::Aggregate,
     ),
-    // `array_agg(anynonarray) -> anyarray`, oid 2335, monomorphized at two
+    // `array_agg(anynonarray) -> anyarray`, oid 2335, monomorphized at five
     // representative element types — see the module docs.
     FuncSig::new(
         2335,
@@ -886,6 +927,27 @@ pub static FUNCS: &[FuncSig] = &[
         "array_agg",
         &[oid::TEXT],
         oid::TEXT_ARRAY,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2335,
+        "array_agg",
+        &[oid::INT8],
+        oid::INT8_ARRAY,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2335,
+        "array_agg",
+        &[oid::FLOAT8],
+        oid::FLOAT8_ARRAY,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2335,
+        "array_agg",
+        &[oid::NUMERIC],
+        oid::NUMERIC_ARRAY,
         FuncKind::Aggregate,
     ),
     FuncSig::new(
@@ -908,10 +970,24 @@ pub static FUNCS: &[FuncSig] = &[
     FuncSig::new(3102, "dense_rank", &[], oid::INT8, FuncKind::Window),
     // `lag`/`lead`/`first_value`/`last_value`/`nth_value` are declared on
     // `anyelement` (`anycompatible` for `lag`/`lead`'s three-argument default
-    // form, not covered here); monomorphized at `int4` and `text` — see the
-    // module docs.
+    // form, not covered here); monomorphized at `int4`, `text`, `int8`,
+    // `float8` and `numeric` — see the module docs.
+    //
+    // The three numeric widths past `int4` are not decoration. Until they
+    // landed, `lag(id)` on a `bigint` column resolved *only* by accident: a
+    // bare column reached [`resolve`] typed `unknown`, missed the exact pass,
+    // and fell into the `int4` row through [`cast_kind`]'s implicit
+    // `unknown -> int4`. Any work that gives a column its real type — which
+    // is the correct direction — turns that accident into a `None` and the
+    // query into a fallback, which is exactly what an attempt at it measured
+    // and then reverted. `int4` stays first in each group so the `unknown`
+    // path keeps landing where it always has; the wider rows are what make
+    // the *typed* path work at all.
     FuncSig::new(3106, "lag", &[oid::INT4], oid::INT4, FuncKind::Window),
     FuncSig::new(3106, "lag", &[oid::TEXT], oid::TEXT, FuncKind::Window),
+    FuncSig::new(3106, "lag", &[oid::INT8], oid::INT8, FuncKind::Window),
+    FuncSig::new(3106, "lag", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Window),
+    FuncSig::new(3106, "lag", &[oid::NUMERIC], oid::NUMERIC, FuncKind::Window),
     FuncSig::new(
         3107,
         "lag",
@@ -924,10 +1000,40 @@ pub static FUNCS: &[FuncSig] = &[
         "lag",
         &[oid::TEXT, oid::INT4],
         oid::TEXT,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
+        3107,
+        "lag",
+        &[oid::INT8, oid::INT4],
+        oid::INT8,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
+        3107,
+        "lag",
+        &[oid::FLOAT8, oid::INT4],
+        oid::FLOAT8,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
+        3107,
+        "lag",
+        &[oid::NUMERIC, oid::INT4],
+        oid::NUMERIC,
         FuncKind::Window,
     ),
     FuncSig::new(3109, "lead", &[oid::INT4], oid::INT4, FuncKind::Window),
     FuncSig::new(3109, "lead", &[oid::TEXT], oid::TEXT, FuncKind::Window),
+    FuncSig::new(3109, "lead", &[oid::INT8], oid::INT8, FuncKind::Window),
+    FuncSig::new(3109, "lead", &[oid::FLOAT8], oid::FLOAT8, FuncKind::Window),
+    FuncSig::new(
+        3109,
+        "lead",
+        &[oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Window,
+    ),
     FuncSig::new(
         3110,
         "lead",
@@ -940,6 +1046,27 @@ pub static FUNCS: &[FuncSig] = &[
         "lead",
         &[oid::TEXT, oid::INT4],
         oid::TEXT,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
+        3110,
+        "lead",
+        &[oid::INT8, oid::INT4],
+        oid::INT8,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
+        3110,
+        "lead",
+        &[oid::FLOAT8, oid::INT4],
+        oid::FLOAT8,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
+        3110,
+        "lead",
+        &[oid::NUMERIC, oid::INT4],
+        oid::NUMERIC,
         FuncKind::Window,
     ),
     FuncSig::new(
@@ -957,6 +1084,27 @@ pub static FUNCS: &[FuncSig] = &[
         FuncKind::Window,
     ),
     FuncSig::new(
+        3112,
+        "first_value",
+        &[oid::INT8],
+        oid::INT8,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
+        3112,
+        "first_value",
+        &[oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
+        3112,
+        "first_value",
+        &[oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
         3113,
         "last_value",
         &[oid::INT4],
@@ -971,6 +1119,27 @@ pub static FUNCS: &[FuncSig] = &[
         FuncKind::Window,
     ),
     FuncSig::new(
+        3113,
+        "last_value",
+        &[oid::INT8],
+        oid::INT8,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
+        3113,
+        "last_value",
+        &[oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
+        3113,
+        "last_value",
+        &[oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
         3114,
         "nth_value",
         &[oid::INT4, oid::INT4],
@@ -982,6 +1151,27 @@ pub static FUNCS: &[FuncSig] = &[
         "nth_value",
         &[oid::TEXT, oid::INT4],
         oid::TEXT,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
+        3114,
+        "nth_value",
+        &[oid::INT8, oid::INT4],
+        oid::INT8,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
+        3114,
+        "nth_value",
+        &[oid::FLOAT8, oid::INT4],
+        oid::FLOAT8,
+        FuncKind::Window,
+    ),
+    FuncSig::new(
+        3114,
+        "nth_value",
+        &[oid::NUMERIC, oid::INT4],
+        oid::NUMERIC,
         FuncKind::Window,
     ),
     // ─── Set-returning ──────────────────────────────────────────────────────
@@ -1547,6 +1737,18 @@ pub static FUNCS: &[FuncSig] = &[
         oid::BOOL,
         FuncKind::Aggregate,
     ),
+    // `every(boolean) -> boolean`, oid 2519: the SQL-standard spelling of
+    // `bool_and`, and a genuinely *separate* `pg_proc` row (confirmed live —
+    // 2517 and 2519 are two distinct oids, both `prokind = 'a'`, both one
+    // `boolean` argument), not an alias resolved to 2517. `bool_or` has no
+    // such twin; SQL never standardised a `some`/`any` aggregate spelling
+    // that Postgres could tabulate, because `ANY` is already a reserved
+    // quantifier.
+    //
+    // `crates/basin-exec/src/build.rs`'s `agg_func_of` already maps 2519 to
+    // the same `AggFunc::BoolAnd` as 2517 (commit `aad32271`); this row is
+    // what lets a call site reach it.
+    FuncSig::new(2519, "every", &[oid::BOOL], oid::BOOL, FuncKind::Aggregate),
     // ─── Aggregates — statistical
     FuncSig::new(
         2829,
@@ -1843,6 +2045,62 @@ pub static FUNCS: &[FuncSig] = &[
         oid::NUMERIC,
         FuncKind::Aggregate,
     ),
+    // `variance` — the historical spelling of `var_samp`, and six real
+    // `pg_proc` oids of its own (2148-2153, confirmed live), not an alias
+    // resolved to `var_samp`'s 2641-2646. Same argument widths, same return
+    // types, same sample-variance answer; a different oid per width, exactly
+    // like `stddev` alongside `stddev_samp` above.
+    //
+    // The return types repeat the surprise the `stddev` block records: the
+    // integer widths all widen to `numeric` while `real` and `double
+    // precision` stay `float8`.
+    //
+    // `crates/basin-exec/src/build.rs`'s `agg_func_of` maps all six to
+    // `AggFunc::Variance(VarKind::VarSamp)` (commit `aad32271`), so these
+    // rows do not merely stop a fallback — they reach an implementation that
+    // is bit-exact with PostgreSQL where the fallback path was not.
+    FuncSig::new(
+        2148,
+        "variance",
+        &[oid::INT8],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2149,
+        "variance",
+        &[oid::INT4],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2150,
+        "variance",
+        &[oid::INT2],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2151,
+        "variance",
+        &[oid::FLOAT4],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2152,
+        "variance",
+        &[oid::FLOAT8],
+        oid::FLOAT8,
+        FuncKind::Aggregate,
+    ),
+    FuncSig::new(
+        2153,
+        "variance",
+        &[oid::NUMERIC],
+        oid::NUMERIC,
+        FuncKind::Aggregate,
+    ),
     // ─── Window
     FuncSig::new(3103, "percent_rank", &[], oid::FLOAT8, FuncKind::Window),
     FuncSig::new(3104, "cume_dist", &[], oid::FLOAT8, FuncKind::Window),
@@ -1851,8 +2109,9 @@ pub static FUNCS: &[FuncSig] = &[
     //
     // Every row in this block is a *monomorphization* of a genuinely
     // polymorphic real `pg_proc` row, at the two representative element types
-    // this module already uses for `array_agg`/`unnest` (`int4` and `text`) —
-    // see the module docs. Postgres mints one physical oid per function, not
+    // `unnest` also uses (`int4` and `text`) — see the module docs. This
+    // family stays at the pair; `array_agg` and the `anyelement` window
+    // functions went wider for a measured reason recorded there. Postgres mints one physical oid per function, not
     // one per element type, so both rows of a pair legitimately carry the same
     // oid. `crates/basin-pgcatalog/src/pg_proc.rs`'s `SignatureOverride`
     // restores the real `anyarray`/`anycompatible`/`anycompatiblearray`
@@ -2983,6 +3242,148 @@ mod tests {
                 assert_eq!(f.name, g.name, "oid {} has two names", f.oid);
                 assert_eq!(f.kind, g.kind, "oid {} has two kinds", f.oid);
             }
+        }
+    }
+
+    // ─── Rows whose implementation landed before the row ────────────────
+
+    /// `left` and `right` are the inverse of the "no implementation yet"
+    /// math block: `crates/basin-exec/src/eval.rs` has answered oids 3060
+    /// and 3061 since commit `5fedc616`, but with no row here [`resolve`]
+    /// returned `None`, so no call site could ever be lowered to them. Both
+    /// oids read off a live PostgreSQL 18.2.
+    #[test]
+    fn left_and_right_resolve_to_their_real_oids() {
+        let left = resolve("left", &[oid::TEXT, oid::INT4]).expect("left(text, int4)");
+        assert_eq!(left.oid, Oid(3060));
+        assert_eq!(left.ret, oid::TEXT);
+        assert_eq!(left.kind, FuncKind::Scalar);
+
+        let right = resolve("right", &[oid::TEXT, oid::INT4]).expect("right(text, int4)");
+        assert_eq!(right.oid, Oid(3061));
+        assert_eq!(right.ret, oid::TEXT);
+        assert_eq!(right.kind, FuncKind::Scalar);
+
+        assert_ne!(left.oid, right.oid);
+    }
+
+    /// `variance` is six real oids of its own, not an alias of `var_samp`'s
+    /// 2641-2646. Pinned individually because resolving `variance(float8)`
+    /// to a `var_samp` oid would be exactly the "same name, different
+    /// function" trap the module docs warn about — and because the six are
+    /// what `crates/basin-exec/src/build.rs` matches on.
+    ///
+    /// The return types are the surprising part and repeat `stddev`'s: the
+    /// three integer widths widen to `numeric`, `float4`/`float8` stay
+    /// `float8`.
+    #[test]
+    fn variance_has_six_oids_distinct_from_var_samp() {
+        let cases: &[(Oid, u32, Oid)] = &[
+            (oid::INT8, 2148, oid::NUMERIC),
+            (oid::INT4, 2149, oid::NUMERIC),
+            (oid::INT2, 2150, oid::NUMERIC),
+            (oid::FLOAT4, 2151, oid::FLOAT8),
+            (oid::FLOAT8, 2152, oid::FLOAT8),
+            (oid::NUMERIC, 2153, oid::NUMERIC),
+        ];
+        for &(arg, want_oid, want_ret) in cases {
+            let f = resolve("variance", &[arg])
+                .unwrap_or_else(|| panic!("variance({arg}) must resolve"));
+            assert_eq!(f.oid, Oid(want_oid), "variance({arg})");
+            assert_eq!(f.ret, want_ret, "variance({arg}) return type");
+            assert_eq!(f.kind, FuncKind::Aggregate);
+
+            let same_width = resolve("var_samp", &[arg]).unwrap();
+            assert_ne!(
+                f.oid, same_width.oid,
+                "variance({arg}) and var_samp({arg}) are different pg_proc rows"
+            );
+            assert_eq!(f.ret, same_width.ret, "but the same answer and type");
+        }
+    }
+
+    /// `every(boolean)` is the SQL-standard spelling of `bool_and` and a
+    /// separate real oid (2519), which `basin-exec` maps onto the same
+    /// accumulator as 2517. `bool_or` has no such twin.
+    #[test]
+    fn every_is_a_separate_oid_from_bool_and() {
+        let every = resolve("every", &[oid::BOOL]).expect("every(bool)");
+        let bool_and = resolve("bool_and", &[oid::BOOL]).unwrap();
+        assert_eq!(every.oid, Oid(2519));
+        assert_eq!(bool_and.oid, Oid(2517));
+        assert_ne!(every.oid, bool_and.oid);
+        assert_eq!(every.ret, oid::BOOL);
+        assert_eq!(every.kind, FuncKind::Aggregate);
+    }
+
+    /// The polymorphic monomorphizations must cover the numeric widths a
+    /// real column actually has, not just `int4`. Before the `int8` rows
+    /// landed, `array_agg(id)`/`lag(id)` over a `bigint` column resolved
+    /// only through the `unknown -> int4` implicit cast a bare column gets;
+    /// the moment a caller supplies the real type, `int4` no longer matches
+    /// and the call becomes unresolvable. Every row still reports the one
+    /// real polymorphic oid.
+    #[test]
+    fn polymorphic_rows_cover_int8_float8_and_numeric() {
+        let one_arg: &[(&str, u32)] = &[
+            ("array_agg", 2335),
+            ("lag", 3106),
+            ("lead", 3109),
+            ("first_value", 3112),
+            ("last_value", 3113),
+        ];
+        for &(name, want_oid) in one_arg {
+            for arg in [oid::INT4, oid::TEXT, oid::INT8, oid::FLOAT8, oid::NUMERIC] {
+                let f =
+                    resolve(name, &[arg]).unwrap_or_else(|| panic!("{name}({arg}) must resolve"));
+                assert_eq!(f.oid, Oid(want_oid), "{name}({arg}) must keep the real oid");
+            }
+        }
+
+        let two_arg: &[(&str, u32)] = &[("lag", 3107), ("lead", 3110), ("nth_value", 3114)];
+        for &(name, want_oid) in two_arg {
+            for arg in [oid::INT4, oid::TEXT, oid::INT8, oid::FLOAT8, oid::NUMERIC] {
+                let f = resolve(name, &[arg, oid::INT4])
+                    .unwrap_or_else(|| panic!("{name}({arg}, int4) must resolve"));
+                assert_eq!(f.oid, Oid(want_oid), "{name}({arg}, int4)");
+            }
+        }
+    }
+
+    /// The element type must follow the argument type, not be pinned to
+    /// `int4[]` — `array_agg(bigint)` returning `int4[]` would be a wrong
+    /// answer about the result's wire type, not merely a narrow one.
+    #[test]
+    fn array_agg_result_element_type_follows_its_argument() {
+        let cases: &[(Oid, Oid)] = &[
+            (oid::INT4, oid::INT4_ARRAY),
+            (oid::TEXT, oid::TEXT_ARRAY),
+            (oid::INT8, oid::INT8_ARRAY),
+            (oid::FLOAT8, oid::FLOAT8_ARRAY),
+            (oid::NUMERIC, oid::NUMERIC_ARRAY),
+        ];
+        for &(arg, want) in cases {
+            let f = resolve("array_agg", &[arg]).unwrap();
+            assert_eq!(f.ret, want, "array_agg({arg})");
+            assert_eq!(oid::element_of(f.ret), Some(arg));
+        }
+    }
+
+    /// The accident the wider rows exist to make unnecessary must keep
+    /// working while it is still load-bearing: a bare column arrives typed
+    /// `unknown`, and `int4` is first in every monomorphized group so the
+    /// implicit-coercion pass still lands there rather than on a row added
+    /// later.
+    #[test]
+    fn unknown_argument_still_lands_on_the_int4_monomorphization() {
+        for name in ["array_agg", "lag", "lead", "first_value", "last_value"] {
+            let f = resolve(name, &[oid::UNKNOWN])
+                .unwrap_or_else(|| panic!("{name}(unknown) must still resolve"));
+            assert_eq!(
+                f.args,
+                &[oid::INT4],
+                "{name}(unknown) must still pick the int4 row"
+            );
         }
     }
 }
