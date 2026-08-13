@@ -526,6 +526,28 @@ fn eval_operand_pair(
     unify_numeric(l, r)
 }
 
+/// [`eval_operand_pair`] for a caller that already holds its left side as an
+/// array — `IN`, whose left operand is evaluated once and then tested against
+/// every list element, so re-deriving it per element would be wasteful as well
+/// as wrong.
+///
+/// The resolution is the same one and must stay the same one. `x IN (1, 2)`
+/// and `x = 1 OR x = 2` are the same query to Postgres; if only the second
+/// spelling widened its literals, the first would fail on the identical data
+/// for no reason a user could see.
+fn eval_operand_against(
+    lhs: ArrayRef,
+    rhs: &Expr,
+    batch: &RecordBatch,
+) -> Result<(ArrayRef, ArrayRef), ExecError> {
+    let r = if is_unknown_literal(rhs) {
+        eval_untyped_literal(rhs, lhs.data_type(), batch.num_rows())?
+    } else {
+        eval(rhs, batch)?
+    };
+    unify_numeric(lhs, r)
+}
+
 /// Widen a mismatched numeric pair to a common type, the way Postgres's
 /// implicit coercions do before an operator is applied.
 ///
@@ -764,13 +786,28 @@ fn eval_in_list(
     negated: bool,
     batch: &RecordBatch,
 ) -> Result<ArrayRef, ExecError> {
-    let x = eval(arg, batch)?;
     let Some((first, rest)) = list.split_first() else {
         return Err(ExecError::Internal(
             "IN with an empty list — a planner bug, not user error (the SQL grammar requires \
              at least one element)"
                 .to_string(),
         ));
+    };
+
+    // The left operand can itself be untyped — `'a' IN (col)` — in which case
+    // the list types it, mirroring how a binary comparison takes its type from
+    // the other side. The first typed element is the source; a list that is
+    // untyped all the way down is text, as Postgres resolves it. This costs one
+    // extra evaluation of a single element in a shape that is nearly always
+    // literals, and only in the rare case where the left side is untyped.
+    let x = if is_unknown_literal(arg) {
+        let target = match list.iter().find(|e| !is_unknown_literal(e)) {
+            Some(typed) => eval(typed, batch)?.data_type().clone(),
+            None => arrow_schema::DataType::Utf8,
+        };
+        eval_untyped_literal(arg, &target, batch.num_rows())?
+    } else {
+        eval(arg, batch)?
     };
 
     let mut acc = eval_in_list_test(&x, first, negated, batch)?;
@@ -792,11 +829,14 @@ fn eval_in_list_test(
     negated: bool,
     batch: &RecordBatch,
 ) -> Result<BooleanArray, ExecError> {
-    let v = eval(item, batch)?;
+    // Resolved per element rather than once for the list: `x IN (1, 'a')` is a
+    // type error in Postgres, but `x IN (1, 2)` where x is bigint is not, and
+    // each element widens against x independently.
+    let (x, v) = eval_operand_against(Arc::clone(x), item, batch)?;
     if negated {
-        cmp::neq(x, &v)
+        cmp::neq(&x, &v)
     } else {
-        cmp::eq(x, &v)
+        cmp::eq(&x, &v)
     }
     .map_err(|e| map_arrow(e, "IN"))
 }
@@ -863,8 +903,11 @@ fn eval_like(
                 .to_string(),
         ));
     }
-    let a = eval(arg, batch)?;
-    let p = eval(pattern, batch)?;
+    // A LIKE pattern is written as a bare literal essentially always, so it
+    // arrives untyped and arrow's kernel — which demands both sides be the same
+    // string type — refused it. `col LIKE 'a%'` is about as ordinary as SQL
+    // gets, and it fell back on every single query.
+    let (a, p) = eval_operand_pair(arg, pattern, batch)?;
     let base = if case_insensitive {
         comparison::ilike(&a, &p)
     } else {
@@ -2059,6 +2102,130 @@ mod tests {
             negated: false,
         };
         assert!(matches!(eval(&expr, &batch), Err(ExecError::Internal(_))));
+    }
+
+    /// A LIKE pattern is written as a bare literal in practically every real
+    /// query, so it reaches the evaluator as `unknown`. Arrow's kernel wants
+    /// both sides to be the same string type and refused it, which sent
+    /// `col LIKE 'a%'` — about as ordinary as SQL gets — back to fallback every
+    /// time. The `PgType::TEXT` spelling above is the one the older tests use
+    /// and is NOT what lowering actually produces.
+    #[test]
+    fn like_resolves_an_untyped_pattern_literal() {
+        let batch = batch_str1("s", vec![Some("hello"), Some("world")]);
+        let expr = Expr::Like {
+            arg: Box::new(col(0, "s")),
+            pattern: Box::new(Expr::Literal(Datum::Utf8("h%".into()), PgType::UNKNOWN)),
+            escape: None,
+            case_insensitive: false,
+            negated: false,
+        };
+        let arr = eval(&expr, &batch).unwrap();
+        let arr = bool_array(&arr);
+        assert!(arr.value(0));
+        assert!(!arr.value(1));
+    }
+
+    #[test]
+    fn ilike_and_not_like_resolve_an_untyped_pattern_too() {
+        let batch = batch_str1("s", vec![Some("HELLO")]);
+        let mk = |ci, neg| Expr::Like {
+            arg: Box::new(col(0, "s")),
+            pattern: Box::new(Expr::Literal(Datum::Utf8("h%".into()), PgType::UNKNOWN)),
+            escape: None,
+            case_insensitive: ci,
+            negated: neg,
+        };
+        assert!(bool_array(&eval(&mk(true, false), &batch).unwrap()).value(0));
+        assert!(!bool_array(&eval(&mk(true, true), &batch).unwrap()).value(0));
+        // Case-sensitive LIKE must NOT match, or the resolution above would be
+        // quietly folding case as well as type.
+        assert!(!bool_array(&eval(&mk(false, false), &batch).unwrap()).value(0));
+    }
+
+    /// `x IN (1, 2)` and `x = 1 OR x = 2` are the same query to Postgres. Only
+    /// the second spelling widened its literals against a bigint column, so the
+    /// first failed on identical data for no reason a user could see.
+    #[test]
+    fn in_list_widens_a_bigint_column_against_int4_literals() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(vec![
+                Some(1i64),
+                Some(3),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let expr = Expr::InList {
+            arg: Box::new(col(0, "n")),
+            list: vec![lit_i32(1), lit_i32(2)],
+            negated: false,
+        };
+        let arr = eval(&expr, &batch).unwrap();
+        let arr = bool_array(&arr);
+        assert!(arr.value(0));
+        assert!(!arr.value(1));
+        // Widening must not disturb three-valued logic: NULL IN (…) is NULL,
+        // never false.
+        assert!(arr.is_null(2));
+    }
+
+    #[test]
+    fn not_in_widens_the_same_way_and_keeps_its_null_semantics() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(vec![
+                Some(1i64),
+                Some(3),
+            ]))],
+        )
+        .unwrap();
+        let expr = Expr::InList {
+            arg: Box::new(col(0, "n")),
+            list: vec![lit_i32(1), lit_i32(2)],
+            negated: true,
+        };
+        let arr = eval(&expr, &batch).unwrap();
+        let arr = bool_array(&arr);
+        assert!(!arr.value(0));
+        assert!(arr.value(1));
+    }
+
+    #[test]
+    fn in_list_resolves_untyped_literals_against_a_text_column() {
+        let batch = batch_str1("s", vec![Some("a"), Some("z")]);
+        let expr = Expr::InList {
+            arg: Box::new(col(0, "s")),
+            list: vec![
+                Expr::Literal(Datum::Utf8("a".into()), PgType::UNKNOWN),
+                Expr::Literal(Datum::Utf8("b".into()), PgType::UNKNOWN),
+            ],
+            negated: false,
+        };
+        let arr = eval(&expr, &batch).unwrap();
+        let arr = bool_array(&arr);
+        assert!(arr.value(0));
+        assert!(!arr.value(1));
+    }
+
+    /// The left operand can itself be untyped — `'a' IN (col)` — and the list
+    /// has to type it, mirroring how a binary comparison takes its type from
+    /// the other side.
+    #[test]
+    fn in_list_types_an_untyped_left_operand_from_the_list() {
+        let batch = batch_str1("s", vec![Some("a"), Some("b")]);
+        let expr = Expr::InList {
+            arg: Box::new(Expr::Literal(Datum::Utf8("a".into()), PgType::UNKNOWN)),
+            list: vec![col(0, "s")],
+            negated: false,
+        };
+        let arr = eval(&expr, &batch).unwrap();
+        let arr = bool_array(&arr);
+        assert!(arr.value(0));
+        assert!(!arr.value(1));
     }
 
     #[test]
