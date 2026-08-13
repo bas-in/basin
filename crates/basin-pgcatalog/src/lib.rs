@@ -22,25 +22,56 @@
 //!
 //! # Status
 //!
-//! First increment. [`pg_type`] is complete — it needs no catalog at all,
-//! since it is fully determined by `basin-pgtype`'s own OID table.
-//! [`pg_namespace`] and [`pg_class`] are implemented against the [`mock`]
-//! [`CatalogSource`], proving the shape against something other than
-//! `pg_type`'s static data. [`pg_operator`], [`pg_cast`] and [`pg_proc`] are
-//! also complete and, like `pg_type`, need no catalog: each is a view over
-//! `basin-pgtype`'s own operator/cast/function tables, chosen first per
-//! `docs/migration/df-removal/11-pg-catalog-fidelity.md` §2 because the owned
+//! Sixteen relations, 228 of the 230 real columns those sixteen have.
+//!
+//! Five of them need no [`CatalogSource`] at all, because their content is
+//! fixed builtin catalog data rather than anything about a particular
+//! database: [`pg_type`], [`pg_am`], and [`pg_operator`]/[`pg_cast`]/
+//! [`pg_proc`] (views over `basin-pgtype`'s own operator/cast/function
+//! tables). Those three were chosen first per
+//! `docs/migration/df-removal/11-pg-catalog-fidelity.md` §2, because the owned
 //! planner needs exactly this data to resolve operators, casts and functions
 //! by argument type — making the resolution table `pg_catalog` itself costs
-//! almost nothing beyond compatibility. [`pg_attribute`] and [`pg_attrdef`]
-//! are also complete, chosen next per doc 11's call-out that they are the
-//! largest user-visible win for the least code: `pg_attribute.atttypmod` is
-//! what ORM introspection (Prisma, Drizzle, SQLAlchemy, ActiveRecord) reads
-//! column widths from, and `pg_attrdef` is what `pg_dump` needs to avoid
-//! losing every column `DEFAULT` on a round trip. Everything else in the
-//! ~65-relation surface — `pg_index`, `pg_constraint`, the
-//! `information_schema` views, and wiring a real `basin-catalog` backend for
-//! [`CatalogSource`] — is a follow-up increment, not attempted here.
+//! almost nothing beyond compatibility.
+//!
+//! The rest are catalog-driven: [`pg_namespace`], [`pg_class`],
+//! [`pg_attribute`], [`pg_attrdef`], [`pg_index`], [`pg_constraint`],
+//! [`pg_description`], [`pg_depend`], [`pg_enum`], [`pg_sequence`] and
+//! [`pg_inherits`]. [`real_source`] wires a real `basin-catalog` behind
+//! [`CatalogSource`]; [`mock`] does the same in memory for tests.
+//!
+//! # How the data is kept honest
+//!
+//! `tests/catalog_fidelity.rs` is the crate's oracle, and it is where the
+//! column counts above come from. Against a live PostgreSQL 18.2 it checks
+//! two things on every run:
+//!
+//! 1. **Shape** — every relation's declared `arrow_schema()` against the
+//!    server's real `pg_attribute`: name, `attnum` order, nullability and
+//!    type. This exists because seven of these relations were once wrong in
+//!    exactly the same way (right columns, wrong positions) and every hand-
+//!    written unit test passed anyway.
+//! 2. **Content** — the five catalog-independent relations' rows, cell by
+//!    cell, against the server's own. The first time that check ran it found
+//!    127 wrong cells across `pg_proc`, `pg_operator` and `pg_cast`,
+//!    including two relations reporting a *monomorphized* signature
+//!    (`lag(integer)`, `integer[] @> integer[]`) under an oid whose real row
+//!    is polymorphic. All are fixed; see each module's docs.
+//!
+//! That oracle is also why several columns whose values Basin has no concept
+//! of are nonetheless reported truthfully rather than omitted: values like
+//! `pg_type.typinput` or `pg_operator.oprcode` are fixed properties of the
+//! *type* or *operator*, assigned by PostgreSQL's own catalog bootstrap and
+//! identical on every installation, so transcribing them is verifiable rather
+//! than invented. Where a column genuinely has neither derivable data nor a
+//! defensible constant, it is left out and the omission documented in the
+//! module — currently exactly two: `pg_index.indclass` (an operator class
+//! needs an access method, which [`catalog_source::IndexInfo`] does not
+//! carry) and `pg_proc.prosqlbody` (a PostgreSQL-internal serialized parse
+//! tree Basin cannot produce or read).
+//!
+//! The `information_schema` views, and the remainder of the ~65-relation
+//! surface, are still a follow-up increment.
 
 pub mod catalog_source;
 pub mod error;

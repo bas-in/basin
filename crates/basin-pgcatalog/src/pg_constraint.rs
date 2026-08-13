@@ -378,10 +378,8 @@ impl crate::SystemView for PgConstraint {
             .collect();
         let conislocals: BooleanArray = rows.iter().map(|_| true).collect();
         let coninhcounts: Int16Array = rows.iter().map(|_| 0i16).collect();
-        let connoinherits: BooleanArray = rows
-            .iter()
-            .map(|r| connoinherit_for(r.info.kind))
-            .collect();
+        let connoinherits: BooleanArray =
+            rows.iter().map(|r| connoinherit_for(r.info.kind)).collect();
         let conperiods: BooleanArray = rows.iter().map(|_| false).collect();
 
         // Always NULL — `ConstraintInfo` supplies no column list or

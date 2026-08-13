@@ -87,17 +87,34 @@
 //!   every key column of a plain `CREATE INDEX` with no `ASC`/`DESC`/`NULLS`
 //!   clause — the only kind of index `IndexInfo` can represent. Added as a
 //!   placeholder `List<Int16>` of zeros, one per `indkey` entry.
-//! - `indcollation`, `indclass` — both `oidvector`, `NOT NULL`: the
-//!   collation and operator class *actually in use* per key column.
-//!   Live-verified these are **not** uniformly defaultable the way the
-//!   booleans above are — `indcollation` was `0` for an `int` column but
-//!   `100` for a `text` column in the same index, and `indclass` is always a
-//!   real, non-zero operator-class oid (`1978` = `int4_ops`, `3126` = a text
-//!   opclass), never `0`. Computing either correctly requires each key
-//!   column's declared type, which `IndexInfo` does not carry. **Not added**
-//!   — a placeholder here would be a fabricated value, not a documented
-//!   default, and this crate's task is explicit that positional readers of
-//!   `indkey`-shaped columns must not be handed plausible-looking noise.
+//! - `indcollation` — `oidvector`, `NOT NULL`: the collation in use per key
+//!   column. Live-verified as *not* uniformly defaultable the way the
+//!   booleans above are — it was `0` for an `int` column but `100` for a
+//!   `text` column in the same index. It is, however, **derivable**: an index
+//!   key with no explicit `COLLATE` uses the column's collation, which for
+//!   every column Basin can describe is its type's own `typcollation`
+//!   (`100` for `text`/`varchar`/`bpchar`, `950` for `name`, `0` for
+//!   everything non-collatable). `scan` therefore looks each key `attnum`'s
+//!   column up through [`CatalogSource::columns`] and reads the collation off
+//!   [`crate::pg_type`], the same path [`crate::pg_attribute`] uses for
+//!   `attcollation` — real data, not a default. A key `attnum` with no
+//!   matching column (which [`IndexInfo`] does not prevent a caller from
+//!   constructing) contributes `0`.
+//! - `indclass` — `oidvector`, `NOT NULL`: the operator class per key column.
+//!   **Not added**, and this is the one relation in the crate where a real
+//!   column is left out for a reason that cannot be closed by transcribing
+//!   fixed Postgres data the way [`crate::pg_operator`]'s `oprcode` and
+//!   [`crate::pg_cast`]'s `castfunc` were. An operator class is a property of
+//!   a *(type, access method)* pair — `int4_ops` (1978) is int4's default
+//!   class **for btree**, and a different one for hash. [`IndexInfo`] carries
+//!   no access method, and this crate's [`crate::pg_class`] reports
+//!   `relam = 0` for every relation precisely because Basin's storage is not
+//!   one of the access methods [`crate::pg_am`] lists. Naming a btree
+//!   operator class here would assert an access method that
+//!   `pg_class.relam` simultaneously denies, and `0` ("no operator class") is
+//!   a value real Postgres never reports for an index. Both options are
+//!   wrong, so neither is taken; closing this needs an access-method concept
+//!   in [`IndexInfo`], not more transcription.
 //! - `indexprs`, `indpred` — both `pg_node_tree`, **nullable**: the parsed
 //!   expressions for an expression index / the predicate for a partial
 //!   index. `IndexInfo` has no notion of either (it only carries key
@@ -118,7 +135,7 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    builder::{Int16Builder, ListBuilder},
+    builder::{Int16Builder, ListBuilder, UInt32Builder},
     BooleanArray, Int16Array, ListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -168,9 +185,9 @@ fn value(idx: &IndexInfo, column: &str) -> Option<Value> {
         // `IndexInfo` has no notion of `ALTER TABLE ... REPLICA IDENTITY
         // USING INDEX`; live-verified `false` for every plain index.
         "indisreplident" => Value::Bool(false),
-        // `indkey` and `indoption` are list columns; no scalar `Value`
-        // represents either, so a predicate naming them is rejected by the
-        // schema check in `scan` rather than reaching here. `indexprs` and
+        // `indkey`, `indcollation` and `indoption` are list columns; no
+        // scalar `Value` represents any of them, so a predicate naming one
+        // never matches. `indexprs` and
         // `indpred` are always `NULL` (see module docs) and likewise have no
         // meaningful scalar predicate value.
         _ => return None,
@@ -184,6 +201,7 @@ pub struct PgIndex;
 impl PgIndex {
     fn arrow_schema() -> SchemaRef {
         let int16_list = || DataType::List(Arc::new(Field::new("item", DataType::Int16, true)));
+        let uint32_list = || DataType::List(Arc::new(Field::new("item", DataType::UInt32, true)));
         Arc::new(Schema::new(vec![
             Field::new("indexrelid", DataType::UInt32, false),
             Field::new("indrelid", DataType::UInt32, false),
@@ -201,20 +219,20 @@ impl PgIndex {
             Field::new("indislive", DataType::Boolean, false),
             Field::new("indisreplident", DataType::Boolean, false),
             Field::new("indkey", int16_list(), false),
-            // `indcollation` (attnum 17) and `indclass` (18), both
-            // `oidvector`, are omitted. `indclass` is the operator class per
-            // key column, which depends on the column's type and the index
-            // access method — `IndexInfo` carries neither, and there is no
-            // default that is right rather than merely plausible.
+            Field::new("indcollation", uint32_list(), false),
+            // `indclass` (attnum 18), `oidvector`, is omitted — see the
+            // module docs: it names an operator class, which is a property of
+            // a (type, access method) pair, and `IndexInfo` has no access
+            // method for this crate to name one against.
             //
             // The consequence is worth stating plainly, because the rest of
-            // this file was just reordered precisely so position is faithful:
-            // omitting two columns means everything after them sits two slots
-            // early. `indoption` is at 17 here and 19 in Postgres. A reader
-            // going by NAME is fine; one going by position is not, and this is
-            // the one place in this relation where that is still true.
-            // Filling them with zeros would fix the arithmetic and lie about
-            // the data, which is the worse of the two.
+            // this file was ordered precisely so position is faithful:
+            // omitting it means everything after it sits one slot early.
+            // `indoption` is at 18 here and 19 in Postgres. A reader going by
+            // NAME is fine; one going by position is not, and this is the one
+            // place in this relation where that is still true. Filling it with
+            // zeros would fix the arithmetic and lie about the data, which is
+            // the worse of the two.
             Field::new("indoption", int16_list(), false),
             Field::new("indexprs", DataType::Utf8, true),
             Field::new("indpred", DataType::Utf8, true),
@@ -277,18 +295,32 @@ impl crate::SystemView for PgIndex {
         let indisreplidents: BooleanArray = rows.iter().map(|_| false).collect();
 
         let mut indkey_builder = ListBuilder::new(Int16Builder::new());
+        let mut indcollation_builder = ListBuilder::new(UInt32Builder::new());
         let mut indoption_builder = ListBuilder::new(Int16Builder::new());
         for r in &rows {
+            // The indexed table's columns, so each key `attnum` can be
+            // resolved to the declared type whose collation the key uses —
+            // see the module docs on `indcollation`.
+            let columns = catalog.columns(r.table_oid);
             for attnum in &r.column_attnums {
                 indkey_builder.values().append_value(*attnum);
+                let collation = columns
+                    .iter()
+                    .find(|c| c.attnum == *attnum)
+                    .and_then(|c| crate::pg_type::attribute_type_info(c.type_oid))
+                    .map(|t| t.attcollation)
+                    .unwrap_or(crate::Oid::INVALID);
+                indcollation_builder.values().append_value(collation.get());
                 // Ascending, nulls-last (`0`) — the only sort option
                 // `IndexInfo` can express; see module docs.
                 indoption_builder.values().append_value(0);
             }
             indkey_builder.append(true);
+            indcollation_builder.append(true);
             indoption_builder.append(true);
         }
         let indkeys: ListArray = indkey_builder.finish();
+        let indcollations: ListArray = indcollation_builder.finish();
         let indoptions: ListArray = indoption_builder.finish();
 
         // `IndexInfo` cannot represent expression indexes or partial-index
@@ -316,6 +348,7 @@ impl crate::SystemView for PgIndex {
                 Arc::new(indislives),
                 Arc::new(indisreplidents),
                 Arc::new(indkeys),
+                Arc::new(indcollations),
                 Arc::new(indoptions),
                 Arc::new(indexprs),
                 Arc::new(indpred),
@@ -334,6 +367,25 @@ mod tests {
         mock::MockCatalog,
         Oid, SystemView,
     };
+
+    /// Every row's value for a `List<UInt32>` column, as plain vectors.
+    fn list_u32(batch: &RecordBatch, name: &str) -> Vec<Vec<u32>> {
+        let list = batch
+            .column(batch.schema().index_of(name).unwrap())
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        (0..list.len())
+            .map(|i| {
+                let v = list.value(i);
+                v.as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
 
     fn col_u32(batch: &RecordBatch, name: &str) -> Vec<u32> {
         batch
@@ -408,6 +460,56 @@ mod tests {
             })
     }
 
+    /// `indcollation` is derived per key column from the indexed column's
+    /// declared type, not defaulted: a `text` key reports `100` (the default
+    /// collation) and an `int4` key reports `0` (not collatable) — the exact
+    /// split a live server shows for a two-column index over one of each.
+    /// See the module docs.
+    #[test]
+    fn indcollation_follows_each_key_columns_type() {
+        use crate::catalog_source::ColumnInfo;
+
+        let column = |attnum: i16, name: &str, type_oid: Oid| ColumnInfo {
+            table_oid: Oid(16385),
+            name: name.to_string(),
+            attnum,
+            type_oid,
+            not_null: false,
+            atttypmod: -1,
+            attisdropped: false,
+            attidentity: None,
+            attgenerated: None,
+        };
+        let catalog = catalog()
+            .with_column(column(1, "id", Oid(23))) // int4
+            .with_column(column(2, "name", Oid(25))) // text
+            .with_column(column(3, "qty", Oid(23))); // int4
+
+        let pkey = PgIndex
+            .scan(&catalog, &[Predicate::eq("indexrelid", Oid(16389))])
+            .unwrap();
+        assert_eq!(list_u32(&pkey, "indcollation"), vec![vec![0]], "int4 key");
+
+        let two = PgIndex
+            .scan(&catalog, &[Predicate::eq("indexrelid", Oid(16391))])
+            .unwrap();
+        assert_eq!(
+            list_u32(&two, "indcollation"),
+            vec![vec![100, 0]],
+            "text key is collatable, int4 key is not"
+        );
+    }
+
+    /// A key `attnum` with no matching column contributes `0` rather than
+    /// panicking — `IndexInfo` does not stop a caller constructing one.
+    #[test]
+    fn indcollation_is_zero_for_a_key_with_no_matching_column() {
+        let batch = PgIndex
+            .scan(&catalog(), &[Predicate::eq("indexrelid", Oid(16391))])
+            .unwrap();
+        assert_eq!(list_u32(&batch, "indcollation"), vec![vec![0, 0]]);
+    }
+
     #[test]
     fn name_is_pg_index() {
         assert_eq!(PgIndex.name(), "pg_index");
@@ -416,7 +518,7 @@ mod tests {
     /// Pins the exact column layout (name, order, nullability) against live
     /// PostgreSQL 18.2's `pg_attribute` for `pg_index`, so a future edit
     /// cannot silently reorder, rename, or flip nullability on a column.
-    /// `indcollation`/`indclass` are deliberately absent — see module docs.
+    /// `indclass` is deliberately absent — see module docs.
     #[test]
     fn schema_matches_live_postgres_column_layout() {
         let schema = PgIndex.schema();
@@ -444,6 +546,7 @@ mod tests {
                 ("indislive", false),
                 ("indisreplident", false),
                 ("indkey", false),
+                ("indcollation", false),
                 ("indoption", false),
                 ("indexprs", true),
                 ("indpred", true),

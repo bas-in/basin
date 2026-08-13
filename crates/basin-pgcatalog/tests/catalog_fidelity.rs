@@ -59,14 +59,23 @@
 //!
 //! # What this harness does NOT check
 //!
-//! Only the *shape* of each relation, plus the row *content* of [`PgType`]
-//! (see [`diff_pg_type_rows`]). The row content of the other
-//! relations whose data is static and hand-transcribed — `pg_am`, `pg_proc`
-//! (a view over `basin-pgtype`'s function table) — is still unverified
-//! against a live server here. `pg_cast` and `pg_operator` are views over
-//! `basin-pgtype`'s cast/operator tables, which `basin-pgtype`'s own
-//! `tests/type_matrix.rs` does check cell-by-cell against live; the
-//! catalog-dependent relations have no static content to check.
+//! The *shape* of every relation, plus the row *content* of all five
+//! relations whose data is static and catalog-independent — `pg_type`,
+//! `pg_am`, `pg_proc`, `pg_operator` and `pg_cast` (see [`diff_static_rows`]).
+//! What is left unchecked here is the row content of the *catalog-dependent*
+//! relations (`pg_class`, `pg_attribute`, `pg_index`, ...), which have no
+//! static content to check: their rows are whatever the `CatalogSource` they
+//! are handed contains, and the values they add on top are covered by each
+//! relation's own unit tests against `MockCatalog`.
+//!
+//! Pointing [`diff_static_rows`] at the last three of those five was not a
+//! formality: on its first run it reported 49 disagreements in `pg_proc`, 9
+//! in `pg_operator` and 69 in `pg_cast`, every one of them a real defect in
+//! hand-maintained data that had passed a by-hand audit. The two that
+//! mattered most were the same bug in two places — `pg_proc` and
+//! `pg_operator` were each reporting a *monomorphized* signature
+//! (`lag(integer)`, `integer[] @> integer[]`) under an oid whose real row is
+//! polymorphic (`lag(anyelement)`, `anyarray @> anyarray`).
 //!
 //! # Skip behavior
 //!
@@ -95,8 +104,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, Int16Array, StringArray, UInt32Array};
-use arrow_schema::{DataType, Field, SchemaRef};
+use arrow_array::{
+    Array, BooleanArray, Float32Array, Int16Array, Int32Array, ListArray, RecordBatch, StringArray,
+    UInt32Array,
+};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use basin_pgcatalog::mock::MockCatalog;
 use basin_pgcatalog::{
     pg_am::PgAm, pg_attrdef::PgAttrDef, pg_attribute::PgAttribute, pg_cast::PgCast,
@@ -147,7 +159,13 @@ fn allowed_arrow_types(pg_type: &str) -> Option<Vec<DataType>> {
         "double precision" => vec![DataType::Float64],
         "oidvector" | "oid[]" => list_of(DataType::UInt32),
         "int2vector" | "smallint[]" => list_of(DataType::Int16),
-        "text[]" | "\"char\"[]" | "aclitem[]" | "name[]" => list_of(DataType::Utf8),
+        // `anyarray` is a pseudo-type: its element type is whatever the row's
+        // other columns say it is (`pg_attribute.attmissingval` takes the
+        // element type of the column's own `atttypid`). Nothing in this crate
+        // ever emits a non-`NULL` value for one, so no element type is ever
+        // materialized; `List<Utf8>` is the same convention the crate uses for
+        // every other array column whose element type is not statically known.
+        "text[]" | "\"char\"[]" | "aclitem[]" | "name[]" | "anyarray" => list_of(DataType::Utf8),
         _ => return None,
     })
 }
@@ -281,144 +299,258 @@ async fn real_columns(client: &tokio_postgres::Client, relname: &str) -> Vec<Rea
         .collect()
 }
 
-/// Diff [`PgType`]'s static row data — not just its column layout — against
-/// the live server, one column at a time, for every OID it reports.
+/// One Arrow cell, rendered the way PostgreSQL's own `::text` cast renders
+/// the corresponding value, so the two can be compared as strings without a
+/// per-column type ladder.
 ///
-/// This is the content-level counterpart to the shape check above. `PgType`'s
-/// `TYPES` table is hand-transcribed static data whose only prior
-/// verification was a by-hand audit, and the single worst bug this project
-/// has found in the type layer (`"char"`'s `typcategory` being read as `'S'`
-/// rather than its real `'Z'`, which invented 37 casts Postgres does not
-/// have) was exactly a wrong value in a hand-transcribed type-property table.
-/// Rows are matched by OID; a row Basin reports for an OID the live server
-/// does not have is a failure, as is any per-column disagreement.
-async fn diff_pg_type_rows(client: &tokio_postgres::Client) -> Result<usize, Vec<String>> {
-    let batch = PgType
-        .scan(&MockCatalog::new(), &[])
-        .expect("PgType::scan with no predicates");
+/// `None` means the cell is SQL `NULL`. The renderings are chosen to match
+/// `psql` / `col::text` exactly: `boolean` prints `true`/`false`, and `real`
+/// prints `1` rather than `1.0` (Rust's `Display` for floats already drops a
+/// zero fraction, same as Postgres).
+///
+/// Postgres has two different textual spellings for the list-shaped columns
+/// these relations use, and this crate represents both as an Arrow `List`, so
+/// the caller says which one applies via `style`: `oidvector`/`int2vector`
+/// (`pg_proc.proargtypes`, `pg_index.indkey`) print space separated (`23 25`),
+/// while a true array type (`oid[]`, `"char"[]`, `text[]`, `aclitem[]`) prints
+/// as an array literal (`{23,25}`). Getting this wrong is not dangerous — it
+/// shows up as a disagreement, which is how it was found — but it is noise,
+/// so it is encoded rather than guessed.
+#[derive(Clone, Copy, PartialEq)]
+enum ListStyle {
+    /// `oidvector` / `int2vector`: `23 25`.
+    Vector,
+    /// A true array type: `{23,25}`.
+    Array,
+}
 
-    let col_u32 = |name: &str| -> Vec<u32> {
-        let idx = batch.schema().index_of(name).expect("column exists");
-        batch
-            .column(idx)
+impl ListStyle {
+    /// The style Postgres uses for a column of type `pg_type`.
+    fn of(pg_type: &str) -> ListStyle {
+        if pg_type.ends_with("[]") {
+            ListStyle::Array
+        } else {
+            ListStyle::Vector
+        }
+    }
+}
+
+fn arrow_cell_text(
+    batch: &RecordBatch,
+    column: &str,
+    row: usize,
+    style: ListStyle,
+) -> Option<String> {
+    let idx = batch
+        .schema()
+        .index_of(column)
+        .unwrap_or_else(|_| panic!("{column} is a column of the batch"));
+    let array = batch.column(idx);
+    if array.is_null(row) {
+        return None;
+    }
+    Some(match array.data_type() {
+        DataType::UInt32 => array
             .as_any()
             .downcast_ref::<UInt32Array>()
-            .unwrap_or_else(|| panic!("{name} is UInt32"))
-            .values()
-            .to_vec()
-    };
-    let col_str = |name: &str| -> Vec<String> {
-        let idx = batch.schema().index_of(name).expect("column exists");
-        let a = batch
-            .column(idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap_or_else(|| panic!("{name} is Utf8"));
-        (0..a.len()).map(|i| a.value(i).to_string()).collect()
-    };
-    let oids = col_u32("oid");
-    let typnamespaces = col_u32("typnamespace");
-    let typelems = col_u32("typelem");
-    let typarrays = col_u32("typarray");
-    let typnames = col_str("typname");
-    let typtypes = col_str("typtype");
-    let typcategories = col_str("typcategory");
-    let typlens = {
-        let idx = batch.schema().index_of("typlen").expect("typlen exists");
-        batch
-            .column(idx)
+            .expect("UInt32")
+            .value(row)
+            .to_string(),
+        DataType::Int16 => array
             .as_any()
             .downcast_ref::<Int16Array>()
-            .expect("typlen is Int16")
-            .values()
-            .to_vec()
-    };
+            .expect("Int16")
+            .value(row)
+            .to_string(),
+        DataType::Int32 => array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32")
+            .value(row)
+            .to_string(),
+        DataType::Boolean => array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("Boolean")
+            .value(row)
+            .to_string(),
+        DataType::Float32 => array
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("Float32")
+            .value(row)
+            .to_string(),
+        DataType::Utf8 => array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8")
+            .value(row)
+            .to_string(),
+        DataType::List(_) => {
+            let list = array.as_any().downcast_ref::<ListArray>().expect("List");
+            let values = list.value(row);
+            let one = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "v",
+                    values.data_type().clone(),
+                    true,
+                )])),
+                vec![values.clone()],
+            )
+            .expect("single-column batch of a list's values");
+            let elements: Vec<String> = (0..values.len())
+                .map(|i| arrow_cell_text(&one, "v", i, style).unwrap_or_else(|| "NULL".to_string()))
+                .collect();
+            match style {
+                ListStyle::Vector => elements.join(" "),
+                ListStyle::Array => format!("{{{}}}", elements.join(",")),
+            }
+        }
+        other => panic!("arrow_cell_text has no rendering for {other:?}"),
+    })
+}
+
+/// Diff one relation's static, hand-transcribed row data — not just its
+/// column layout — against the live server, cell by cell, for every OID it
+/// reports.
+///
+/// This is the content-level counterpart to the shape check above, and it
+/// exists because a hand-transcribed value table is exactly where this
+/// project's worst bugs have lived: the single worst one found in the type
+/// layer (`"char"`'s `typcategory` being read as `'S'` rather than its real
+/// `'Z'`, which invented 37 casts Postgres does not have) was a wrong value
+/// in a hand-transcribed type-property table, and the seven position bugs
+/// that motivated this whole file were found by a check no human audit
+/// replaced.
+///
+/// Rows are matched by `oid`; a row Basin reports for an OID the live server
+/// does not have is a failure, as is any per-column disagreement. Every
+/// column of the relation's declared schema is checked — the caller passes
+/// no column list, precisely so that adding a column to a relation cannot
+/// quietly add an *unchecked* column.
+///
+/// A nullable column Basin always reports `NULL` for is compared exactly like
+/// every other column (Basin `NULL` vs. whatever the server has), so a row
+/// where the server has a real value is reported, not exempted.
+///
+/// `label_column` (`typname`, `proname`, `amname`) is used only to make
+/// failure messages legible.
+async fn diff_static_rows(
+    client: &tokio_postgres::Client,
+    relation: &str,
+    batch: &RecordBatch,
+    real: &[RealColumn],
+    label_column: &str,
+) -> Result<(usize, usize), Vec<String>> {
+    let columns: Vec<String> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+
+    let oid_idx = batch.schema().index_of("oid").expect("oid column");
+    let oids: Vec<u32> = batch
+        .column(oid_idx)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .expect("oid is UInt32")
+        .values()
+        .to_vec();
+    if oids.is_empty() {
+        return Err(vec![format!("{relation}: Basin reports no rows at all")]);
+    }
 
     let oid_list = oids
         .iter()
         .map(|o| o.to_string())
         .collect::<Vec<_>>()
         .join(",");
+    // `regproc::text` renders the *function name* (and `-` for oid 0), not the
+    // oid. This crate represents every `regproc` column as the oid it is at
+    // the storage level (see `pg_cast`'s `castfunc` docs), so ask the server
+    // for the same thing rather than comparing a name to a number.
+    let select = columns
+        .iter()
+        .map(|c| {
+            let is_regproc = real
+                .iter()
+                .any(|rc| rc.name == *c && rc.pg_type == "regproc");
+            if is_regproc {
+                format!("{c}::oid::text")
+            } else {
+                format!("{c}::text")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let rows = client
         .query(
             &format!(
-                "SELECT oid, typname, typnamespace, typlen, typtype::text, typcategory::text, \
-                 typelem, typarray FROM pg_type WHERE oid IN ({oid_list})"
+                "SELECT oid::text, {select} FROM pg_catalog.{relation} WHERE oid IN ({oid_list})"
             ),
             &[],
         )
         .await
-        .expect("querying live pg_type for every OID PgType reports");
+        .unwrap_or_else(|e| panic!("querying live {relation} for every OID Basin reports: {e}"));
 
-    struct LiveType {
-        typname: String,
-        typnamespace: u32,
-        typlen: i16,
-        typtype: String,
-        typcategory: String,
-        typelem: u32,
-        typarray: u32,
-    }
-    let live: HashMap<u32, LiveType> = rows
+    // oid -> the row's cells, in `columns` order, as the server renders them.
+    let live: HashMap<String, Vec<Option<String>>> = rows
         .iter()
         .map(|r| {
+            let cells = (0..columns.len())
+                .map(|i| r.get::<_, Option<String>>(i + 1))
+                .collect();
             (
-                r.get::<_, u32>(0),
-                LiveType {
-                    typname: r.get(1),
-                    typnamespace: r.get(2),
-                    typlen: r.get(3),
-                    typtype: r.get(4),
-                    typcategory: r.get(5),
-                    typelem: r.get(6),
-                    typarray: r.get(7),
-                },
+                r.get::<_, Option<String>>(0).expect("oid is NOT NULL"),
+                cells,
             )
         })
         .collect();
 
+    // The list-rendering style each column needs, read off the real column's
+    // Postgres type rather than guessed — see [`ListStyle`].
+    let styles: Vec<ListStyle> = columns
+        .iter()
+        .map(|c| {
+            real.iter()
+                .find(|rc| rc.name == *c)
+                .map(|rc| ListStyle::of(&rc.pg_type))
+                .unwrap_or(ListStyle::Vector)
+        })
+        .collect();
+
     let mut problems = Vec::new();
-    for i in 0..oids.len() {
-        let oid = oids[i];
-        let Some(lv) = live.get(&oid) else {
+    for (row, oid) in oids.iter().enumerate() {
+        let label =
+            arrow_cell_text(batch, label_column, row, ListStyle::Vector).unwrap_or_default();
+        let Some(live_cells) = live.get(&oid.to_string()) else {
             problems.push(format!(
-                "pg_type oid {oid} ({}): Basin reports a row the live server has no pg_type \
-                 entry for",
-                typnames[i]
+                "{relation} oid {oid} ({label}): Basin reports a row the live server has no \
+                 {relation} entry for"
             ));
             continue;
         };
-        let mut cmp = |col: &str, basin: String, real: String| {
+        for (i, column) in columns.iter().enumerate() {
+            let basin = arrow_cell_text(batch, column, row, styles[i]);
+            let real = live_cells[i].clone();
             if basin != real {
+                let show = |v: &Option<String>| match v {
+                    None => "NULL".to_string(),
+                    Some(s) if s.len() > 80 => format!("{}…({} bytes)", &s[..80], s.len()),
+                    Some(s) => s.clone(),
+                };
                 problems.push(format!(
-                    "pg_type oid {oid} ({}): {col} Basin={basin} live={real}",
-                    typnames[i]
+                    "{relation} oid {oid} ({label}): {column} Basin={} live={}",
+                    show(&basin),
+                    show(&real)
                 ));
             }
-        };
-        cmp("typname", typnames[i].clone(), lv.typname.clone());
-        cmp(
-            "typnamespace",
-            typnamespaces[i].to_string(),
-            lv.typnamespace.to_string(),
-        );
-        cmp("typlen", typlens[i].to_string(), lv.typlen.to_string());
-        cmp("typtype", typtypes[i].clone(), lv.typtype.clone());
-        cmp(
-            "typcategory",
-            typcategories[i].clone(),
-            lv.typcategory.clone(),
-        );
-        cmp("typelem", typelems[i].to_string(), lv.typelem.to_string());
-        cmp(
-            "typarray",
-            typarrays[i].to_string(),
-            lv.typarray.to_string(),
-        );
+        }
     }
 
     if problems.is_empty() {
-        Ok(oids.len())
+        Ok((oids.len(), columns.len()))
     } else {
         Err(problems)
     }
@@ -512,35 +644,86 @@ async fn run() -> Result<(), String> {
         );
     }
 
-    // ---- content check: pg_type's static rows, cell by cell -----------
-    let pg_type_rows = match diff_pg_type_rows(&client).await {
-        Ok(n) => {
-            println!(
-                "pg_type row content: OK — {n} rows x 7 columns \
-                 (typname/typnamespace/typlen/typtype/typcategory/typelem/typarray) \
-                 verified against live pg_type"
-            );
-            n
+    // ---- content check: every static relation's rows, cell by cell ----
+    //
+    // These five relations are the crate's static, catalog-independent value
+    // tables: `pg_type` is `TYPES`, `pg_am` is `ROWS`, and `pg_proc`,
+    // `pg_operator` and `pg_cast` are views over `basin-pgtype`'s
+    // `FUNCS`/`OPERATORS`/`CASTS` tables plus this crate's own per-column
+    // rules. Every other relation's content comes from the catalog and has no
+    // static data to check. Each is scanned against an *empty* catalog
+    // precisely to prove it needs none.
+    let mut content_cells = 0usize;
+    let mut content_summary = Vec::new();
+    let mut content_problems = Vec::new();
+    let empty = MockCatalog::new();
+    let statics: Vec<(&str, RecordBatch, &str)> = vec![
+        (
+            "pg_type",
+            PgType.scan(&empty, &[]).expect("PgType::scan"),
+            "typname",
+        ),
+        (
+            "pg_am",
+            PgAm.scan(&empty, &[]).expect("PgAm::scan"),
+            "amname",
+        ),
+        (
+            "pg_proc",
+            PgProc.scan(&empty, &[]).expect("PgProc::scan"),
+            "proname",
+        ),
+        (
+            "pg_operator",
+            PgOperator.scan(&empty, &[]).expect("PgOperator::scan"),
+            "oprname",
+        ),
+        (
+            "pg_cast",
+            PgCast.scan(&empty, &[]).expect("PgCast::scan"),
+            "castsource",
+        ),
+    ];
+    for (relation, batch, label) in &statics {
+        let real = real_columns(&client, relation).await;
+        match diff_static_rows(&client, relation, batch, &real, label).await {
+            Ok((rows, cols)) => {
+                content_cells += rows * cols;
+                content_summary.push(format!(
+                    "{relation} row content: OK — {rows} rows x {cols} columns verified \
+                     cell-by-cell against live {relation}"
+                ));
+            }
+            Err(problems) => {
+                content_summary.push(format!(
+                    "{relation} row content: **BROKEN** — {} cells",
+                    problems.len()
+                ));
+                content_problems.extend(problems);
+            }
         }
-        Err(problems) => {
-            println!("pg_type row content: **BROKEN** — {} cells", problems.len());
-            return Err(format!(
-                "pg_type row content disagrees with live PostgreSQL in {} places:\n  {}",
-                problems.len(),
-                problems.join("\n  ")
-            ));
-        }
-    };
+    }
+    for line in &content_summary {
+        println!("{line}");
+    }
+    if !content_problems.is_empty() {
+        return Err(format!(
+            "static row content disagrees with live PostgreSQL in {} places:\n  {}",
+            content_problems.len(),
+            content_problems.join("\n  ")
+        ));
+    }
 
     let broken: Vec<&RelationReport> = reports.iter().filter(|r| !r.ok()).collect();
     if broken.is_empty() {
         print_banner(&format!(
             "PASS — {} relations / {} implemented columns checked, all order-correct, no \
-             unknown columns, no nullability mismatches, no type mismatches; plus {} pg_type \
-             rows verified cell-by-cell",
+             unknown columns, no nullability mismatches, no type mismatches; plus {} static \
+             row cells (pg_type, pg_am, pg_proc, pg_operator, pg_cast) verified \
+             cell-by-cell",
             reports.len(),
             reports.iter().map(|r| r.implemented).sum::<usize>(),
-            pg_type_rows,
+            content_cells,
         ));
         return Ok(());
     }

@@ -267,7 +267,10 @@ mod tests {
             .scan(&catalog(), &[Predicate::eq("seqrelid", Oid(27614739))])
             .unwrap();
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(col_u32(&batch, "seqtypid"), vec![basin_pgtype::oid::INT8.get()]);
+        assert_eq!(
+            col_u32(&batch, "seqtypid"),
+            vec![basin_pgtype::oid::INT8.get()]
+        );
         assert_eq!(col_i64(&batch, "seqstart"), vec![5]);
         assert_eq!(col_i64(&batch, "seqincrement"), vec![2]);
         assert_eq!(col_i64(&batch, "seqmax"), vec![1000]);

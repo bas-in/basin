@@ -66,14 +66,22 @@
 //!    the fallback — `cast.rs` still gets `bool -> text`'s *context* right via
 //!    the fallback path, so nothing is observably wrong, but this relation
 //!    will report zero rows for that pair where a real server reports one.
-//! 2. **`castfunc` is always `0`.** Real Postgres's `castfunc` names the
-//!    `pg_proc` row implementing a `'f'`-method cast (e.g. `int2 -> int4` is
-//!    function oid 313). Basin executes these conversions directly in Rust,
-//!    not through a `pg_proc`-registered function, so there is no real oid to
-//!    report; `0` is what a real server also reports for `'b'`/`'i'`-method
-//!    rows, but a real server's `'f'`-method rows are never `0`. A client
-//!    that resolves `castfunc` to a function name for one of this relation's
-//!    `'f'` rows will find nothing.
+//! 2. **`castfunc` is the real function oid**, from [`CASTFUNC`]. It was
+//!    previously always `0`, documented as a gap on the grounds that Basin
+//!    executes these conversions directly in Rust rather than through a
+//!    `pg_proc`-registered function, so there was "no real oid to report".
+//!    That reasoning was wrong in the same way it would have been wrong for
+//!    [`crate::pg_am`]'s `amhandler` or [`crate::pg_type`]'s `typinput`:
+//!    `castfunc` is a property of the *cast*, fixed by Postgres's own catalog
+//!    bootstrap and identical on every installation, not a statement about
+//!    how Basin implements it. `0` is what a real server reports for a
+//!    `'b'`-method (binary-coercible) row and *never* for an `'f'`-method
+//!    row, so the old placeholder was telling clients that 69 of this
+//!    relation's function-based casts had no implementing function at all —
+//!    a claim `catalog_fidelity`'s row oracle flagged the first time it ran
+//!    against `pg_cast`. The oids Basin reports point at `pg_proc` rows
+//!    [`crate::pg_proc`] mostly does not have, which is the same admitted
+//!    gap `pg_am` and `pg_type` already carry and is documented there.
 //! 3. **Row coverage mirrors `cast.rs`'s own scope**, not all 269 rows a real
 //!    PostgreSQL 18 `pg_cast` has (`SELECT count(*) FROM pg_cast`, confirmed
 //!    live). `cast.rs`'s own docs describe its scope as the builtin scalar
@@ -256,6 +264,99 @@ fn resolved_rows() -> Vec<CastRow> {
         .collect()
 }
 
+/// `pg_cast.castfunc` for every function-based (`castmethod = 'f'`) cast this
+/// relation reports, keyed by the cast's own `pg_cast.oid`.
+///
+/// These are real, fixed oids assigned by PostgreSQL's catalog bootstrap
+/// (`genbki`) — the same class of value [`crate::pg_am`]'s `amhandler` and
+/// [`crate::pg_type`]'s `typinput` carry, and identical on every
+/// installation. Every entry was produced by, and is re-verified on every
+/// run against a live server by, `catalog_fidelity`'s `diff_static_rows`.
+///
+/// A cast absent from this table has `castfunc = 0`, which is the real value
+/// for a `'b'`-method (binary-coercible) or `'i'` (inout) row.
+const CASTFUNC: &[(u32, u32)] = &[
+    (10000, 714),  // bigint -> smallint (int2)
+    (10001, 480),  // bigint -> integer (int4)
+    (10002, 652),  // bigint -> real (float4)
+    (10003, 482),  // bigint -> double precision (float8)
+    (10004, 1781), // bigint -> numeric (numeric)
+    (10005, 754),  // smallint -> bigint (int8)
+    (10006, 313),  // smallint -> integer (int4)
+    (10007, 236),  // smallint -> real (float4)
+    (10008, 235),  // smallint -> double precision (float8)
+    (10009, 1782), // smallint -> numeric (numeric)
+    (10010, 481),  // integer -> bigint (int8)
+    (10011, 314),  // integer -> smallint (int2)
+    (10012, 318),  // integer -> real (float4)
+    (10013, 316),  // integer -> double precision (float8)
+    (10014, 1740), // integer -> numeric (numeric)
+    (10015, 653),  // real -> bigint (int8)
+    (10016, 238),  // real -> smallint (int2)
+    (10017, 319),  // real -> integer (int4)
+    (10018, 311),  // real -> double precision (float8)
+    (10019, 1742), // real -> numeric (numeric)
+    (10020, 483),  // double precision -> bigint (int8)
+    (10021, 237),  // double precision -> smallint (int2)
+    (10022, 317),  // double precision -> integer (int4)
+    (10023, 312),  // double precision -> real (float4)
+    (10024, 1743), // double precision -> numeric (numeric)
+    (10025, 1779), // numeric -> bigint (int8)
+    (10026, 1783), // numeric -> smallint (int2)
+    (10027, 1744), // numeric -> integer (int4)
+    (10028, 1745), // numeric -> real (float4)
+    (10029, 1746), // numeric -> double precision (float8)
+    (10034, 2557), // integer -> boolean (bool)
+    (10035, 2558), // boolean -> integer (int4)
+    (10037, 1287), // bigint -> oid (oid)
+    (10038, 313),  // smallint -> oid (int4)
+    (10040, 1288), // oid -> bigint (int8)
+    (10127, 401),  // character -> text (text)
+    (10128, 401),  // character -> character varying (text)
+    (10131, 946),  // "char" -> text (text)
+    (10134, 406),  // name -> text (text)
+    (10140, 407),  // text -> name (name)
+    (10141, 409),  // character -> name (name)
+    (10142, 1400), // character varying -> name (name)
+    (10143, 6367), // smallint -> bytea (bytea)
+    (10144, 6368), // integer -> bytea (bytea)
+    (10145, 6369), // bigint -> bytea (bytea)
+    (10146, 6370), // bytea -> smallint (int2)
+    (10147, 6371), // bytea -> integer (int4)
+    (10148, 6372), // bytea -> bigint (int8)
+    (10150, 78),   // integer -> "char" (char)
+    (10158, 2024), // date -> timestamp without time zone (timestamp)
+    (10159, 1174), // date -> timestamp with time zone (timestamptz)
+    (10160, 1370), // time without time zone -> interval (interval)
+    (10161, 2047), // time without time zone -> time with time zone (timetz)
+    (10162, 2029), // timestamp without time zone -> date (date)
+    (10163, 1316), // timestamp without time zone -> time without time zone (time)
+    (10164, 2028), // timestamp without time zone -> timestamp with time zone (timestamptz)
+    (10165, 1178), // timestamp with time zone -> date (date)
+    (10166, 2019), // timestamp with time zone -> time without time zone (time)
+    (10167, 2027), // timestamp with time zone -> timestamp without time zone (timestamp)
+    (10168, 1388), // timestamp with time zone -> time with time zone (timetz)
+    (10169, 1419), // interval -> time without time zone (time)
+    (10170, 2046), // time with time zone -> time without time zone (time)
+    (10222, 3556), // jsonb -> boolean (bool)
+    (10223, 3449), // jsonb -> numeric (numeric)
+    (10224, 3450), // jsonb -> smallint (int2)
+    (10225, 3451), // jsonb -> integer (int4)
+    (10226, 3452), // jsonb -> bigint (int8)
+    (10227, 3453), // jsonb -> real (float4)
+    (10228, 2580), // jsonb -> double precision (float8)
+];
+
+/// `pg_cast.castfunc` for the cast whose `pg_cast.oid` is `oid` — see
+/// [`CASTFUNC`].
+fn castfunc(oid: Oid) -> Oid {
+    CASTFUNC
+        .iter()
+        .find(|(cast_oid, _)| *cast_oid == oid.get())
+        .map(|(_, func)| Oid(*func))
+        .unwrap_or(Oid::INVALID)
+}
+
 /// This row's value for `column`, or `None` if `column` is not one of this
 /// relation's columns.
 fn value(row: &CastRow, column: &str) -> Option<Value> {
@@ -263,7 +364,7 @@ fn value(row: &CastRow, column: &str) -> Option<Value> {
         "oid" => Value::Oid(row.oid),
         "castsource" => Value::Oid(row.source),
         "casttarget" => Value::Oid(row.target),
-        "castfunc" => Value::Oid(Oid::INVALID),
+        "castfunc" => Value::Oid(castfunc(row.oid)),
         "castcontext" => Value::Text(row.castcontext.to_string()),
         "castmethod" => Value::Text(row.castmethod.to_string()),
         _ => return None,
@@ -323,7 +424,7 @@ impl crate::SystemView for PgCast {
         let oids: UInt32Array = rows.iter().map(|r| r.oid.get()).collect();
         let sources: UInt32Array = rows.iter().map(|r| r.source.get()).collect();
         let targets: UInt32Array = rows.iter().map(|r| r.target.get()).collect();
-        let funcs: UInt32Array = rows.iter().map(|_| Oid::INVALID.get()).collect();
+        let funcs: UInt32Array = rows.iter().map(|r| castfunc(r.oid).get()).collect();
         let contexts: StringArray = rows
             .iter()
             .map(|r| Some(r.castcontext.to_string()))
@@ -433,8 +534,8 @@ mod tests {
     }
 
     /// Every row's `oid` is nonzero and unique — real `pg_cast.oid` is a
-    /// primary key, and `Oid::INVALID` (`0`) would collide with `castfunc`'s
-    /// documented always-zero placeholder if `oid` were ever left unset.
+    /// primary key, and a row left with `Oid::INVALID` (`0`) would be
+    /// indistinguishable from one whose oid was never set.
     #[test]
     fn every_row_has_a_unique_nonzero_oid() {
         let batch = PgCast.scan(&MockCatalog::new(), &[]).unwrap();
@@ -521,14 +622,30 @@ mod tests {
         assert_eq!(col_str(&filtered, "castcontext"), vec!["i".to_string()]);
     }
 
-    /// `castfunc` is always `0` — a documented gap, not a bug. See the module
-    /// docs on why Basin has no real `pg_proc` oid to report here.
+    /// Every `'f'`-method (function-based) cast reports a real, non-zero
+    /// `castfunc`, and every `'b'`/`'i'`-method one reports `0` — exactly
+    /// what a live server does. See the module docs; `catalog_fidelity`
+    /// checks the individual oids against the server.
     #[test]
-    fn castfunc_is_always_zero() {
+    fn castfunc_is_nonzero_exactly_for_function_based_casts() {
         let batch = PgCast.scan(&MockCatalog::new(), &[]).unwrap();
-        for f in col_u32(&batch, "castfunc") {
-            assert_eq!(f, 0);
+        let methods = col_str(&batch, "castmethod");
+        let funcs = col_u32(&batch, "castfunc");
+        assert_eq!(methods.len(), funcs.len());
+        let mut function_based = 0;
+        for (method, func) in methods.iter().zip(&funcs) {
+            if method == "f" {
+                assert_ne!(*func, 0, "an 'f'-method cast must name a function");
+                function_based += 1;
+            } else {
+                assert_eq!(*func, 0, "a '{method}'-method cast has no function");
+            }
         }
+        assert_eq!(
+            function_based,
+            CASTFUNC.len(),
+            "every CASTFUNC entry belongs to a row this relation reports, and              every 'f'-method row has an entry"
+        );
     }
 
     /// A predicate matching nothing returns zero rows, not everything.
