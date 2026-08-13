@@ -401,6 +401,18 @@ pub(crate) async fn list_data_files(
     // (shard-managed) from a partial one (direct writes) — see
     // `tests/read_stats_pruning.rs::list_partial_catalog_stats_falls_back_per_file`.
     //
+    // EXISTENCE, NOT LIVENESS. This function answers "which files are on the
+    // store", which is NOT "which files are the table". A superseded file
+    // (copy-on-write UPDATE/DELETE, compaction, stripe merge) is deliberately
+    // left in place for a window — `basin_shard`'s
+    // `BASIN_SUPERSEDED_DELETE_GRACE_SECS` defaults to 300 s — so in-flight
+    // scans do not 404 (see `DEFAULT_READ_OPEN_MAX_RETRIES`). Inside that
+    // window this returns the superseded file AND its replacement, and a scan
+    // over the result counts every affected row once per copy. A SQL scan must
+    // therefore source its file set from `TableMetadata::live_data_files()`
+    // and read it via `read_paths` / `read_paths_with_schema`, never from
+    // here. See `Storage::catalog_live_data_files` for the full argument.
+    //
     // Backward-compat thin wrapper: drains the streaming variant into a
     // `Vec`. Callers that need to short-circuit on LIMIT should use
     // [`list_data_files_stream`] directly so they don't pay for the cold

@@ -1267,6 +1267,32 @@ impl Storage {
     /// correctness regression (it missed uncataloged on-disk files) and has
     /// been reverted — see `tests/read_stats_pruning.rs::
     /// list_partial_catalog_stats_falls_back_per_file`.
+    ///
+    /// ── The other half of that sentence, which is easy to misread ──
+    ///
+    /// The LIST is authoritative for **existence**. It is NOT authoritative for
+    /// **liveness**, and nothing at this layer is. A file the catalog has
+    /// superseded (copy-on-write UPDATE/DELETE, compaction, stripe merge) stays
+    /// physically present long after it stops being part of the table:
+    /// `basin_engine::dml_mutate::delete_objects_engine` deletes it from a
+    /// detached `tokio::spawn`, and `basin_shard`'s compaction holds it for
+    /// `BASIN_SUPERSEDED_DELETE_GRACE_SECS` — **300 seconds by default** — so
+    /// in-flight scans do not 404. During that window `list_data_files` and
+    /// `read` enumerate BOTH the superseded and the replacement file, and a
+    /// scan over that set returns every affected row once per physically
+    /// present copy.
+    ///
+    /// So a caller that needs the LIVE row set — any SQL scan — must NOT use
+    /// `Storage::read` / `list_data_files`. It must take the file set from
+    /// `TableMetadata::live_data_files()` (the engine holds the catalog and
+    /// knows every one of its own writes is committed before it is visible)
+    /// and read it with [`Storage::read_paths_with_schema`]. That is what the
+    /// DataFusion read path does — `basin_engine::session::refresh_table_inner`
+    /// builds its `ListingTable` over `meta.live_data_files()` for exactly this
+    /// reason (bug #41) — and it is the contract any second engine must meet
+    /// too. The storage layer cannot make that call for them: it cannot tell a
+    /// superseded file from a flushed-but-not-yet-committed one, and guessing
+    /// wrong in the other direction drops freshly written rows.
     pub(crate) async fn catalog_live_data_files(
         &self,
         project: &ProjectId,
